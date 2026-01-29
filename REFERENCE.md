@@ -292,6 +292,8 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 - [DXGI Desktop Duplication](https://docs.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api)
 - [DirectComposition](https://docs.microsoft.com/en-us/windows/win32/directcomp/directcomposition-portal)
 - [ShaderGlass](https://github.com/mausimus/ShaderGlass) - Similar overlay approach
+- [set_maxtml](https://github.com/ledoge/set_maxtml) - MaxTML implementation reference
+- [Free Blue Noise Textures](https://github.com/Calinou/free-blue-noise-textures) - Christoph Peters (CC0)
 - [.cube LUT format](https://resolve.cafe/developers/luts/)
 - [Lilium HDR shaders](https://github.com/EndlesslyFlowering/ReShade_HDR_shaders)
 - Dolby ICtCp Whitepaper v7.1
