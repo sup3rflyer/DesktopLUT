@@ -7,9 +7,9 @@ Transparent overlay applying 3D LUT color correction to the Windows desktop via 
 - Transparent click-through overlay with DirectComposition
 - 3D LUT with tetrahedral interpolation (industry standard)
 - Full HDR/SDR support with automatic mode detection
-- **ICTCP-based HDR pipeline** (Dolby color space for hue-preserving tonemapping)
+- **ICtCp-based HDR pipeline** (Dolby color space for hue-preserving tonemapping)
 - Multi-monitor support with per-monitor LUTs
-- Grayscale correction (ICTCP I-channel for HDR, sqrt-distribution for SDR)
+- Grayscale correction (ICtCp I-channel for HDR, sqrt-distribution for SDR)
 - 2.4 Gamma option for BT.1886 displays (SDR)
 - Primaries/gamut correction with Bradford chromatic adaptation
 - Auto-starts when any correction is enabled

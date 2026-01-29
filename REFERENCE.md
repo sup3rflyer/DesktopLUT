@@ -74,28 +74,28 @@ MaxTmlEnabled=0
 MaxTmlPeak=1000.0
 ```
 
-## HDR Color Pipeline (ICTCP-based)
+## HDR Color Pipeline (ICtCp-based)
 
-HDR processing uses the Dolby ICTCP color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.
+HDR processing uses the Dolby ICtCp color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.
 
 **8-Stage Pipeline:**
 1. **Desktop Gamma**: sRGB EOTF → 2.2 power law (optional toggle)
 2. **BT.709 → Rec.2020**: Standards-derived RGB primary conversion per ITU-R BT.2087
 3. **Primaries Matrix**: Display calibration in linear Rec.2020 (includes Bradford chromatic adaptation)
-4. **Rec.2020 → ICTCP**: LMS (Hunt-Pointer-Estevez) → PQ encode → ICtCp matrix
-5. **ICTCP Processing** (all on I channel, CT/CP unchanged = hue preserved):
+4. **Rec.2020 → ICtCp**: LMS (Hunt-Pointer-Estevez) → PQ encode → ICtCp matrix
+5. **ICtCp Processing** (all on I channel, CT/CP unchanged = hue preserved):
    - Grayscale correction (display calibration - constant)
    - Tonemapping (content preference - dynamic)
    - Blue noise dithering (always on, perceptually uniform)
-6. **ICTCP → PQ RGB**: Inverse transforms for LUT input
+6. **ICtCp → PQ RGB**: Inverse transforms for LUT input
 7. **Apply LUT**: Tetrahedral or trilinear interpolation
 8. **PQ → scRGB**: ST.2084 EOTF → Rec.2020 → BT.709
 
-**Why ICTCP?** (from Dolby whitepaper)
+**Why ICtCp?** (from Dolby whitepaper)
 - I channel correlates r=0.998 with true luminance (vs r=0.819 for Y'CbCr)
 - Max 8° hue deviation vs 23° for Y'CbCr during saturation changes
 - More uniform MacAdam ellipses = better perceptual accuracy
-- 10-bit ICTCP ≈ 11.5-bit Y'CbCr quality
+- 10-bit ICtCp ≈ 11.5-bit Y'CbCr quality
 
 **Processing Order**: Grayscale before tonemap because grayscale is display calibration (constant, measured without tonemap), while tonemapping is content-dependent (user preference).
 
@@ -103,7 +103,7 @@ HDR processing uses the Dolby ICTCP color space for perceptually accurate tonema
 
 Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
 
-### ICTCP Matrix Constants
+### ICtCp Matrix Constants
 
 ```
 Rec.2020 RGB → LMS (Hunt-Pointer-Estevez-derived, Dolby ICtCp variant with 4% crosstalk):
@@ -126,7 +126,7 @@ ICtCp → L'M'S':
 
 ### Performance Cost
 
-ICTCP pipeline adds ~4 matrix multiplies and ~2 PQ cycles (~100 extra ALU ops/pixel). At 4K@144Hz: <1% overhead on modern GPUs.
+ICtCp pipeline adds ~4 matrix multiplies and ~2 PQ cycles (~100 extra ALU ops/pixel). At 4K@144Hz: <1% overhead on modern GPUs.
 
 | Tonemap Curve | pow() ops |
 |---------------|-----------|
@@ -237,7 +237,7 @@ Input → Grayscale → Primaries → 3D LUT → Output
   - Slider N affects patch N in calibration software (ColourSpace, etc.)
   - Applied in signal space before primaries correction
   - Curve values interpolated in sqrt domain for perceptual smoothness
-- **HDR**: ICTCP I-channel correction (evenly spaced in PQ domain)
+- **HDR**: ICtCp I-channel correction (evenly spaced in PQ domain)
   - I channel has r=0.998 correlation with true luminance
   - Applied before tonemapping (display calibration is constant)
   - Peak setting must match ColourSpace target peak for slider alignment
@@ -305,5 +305,5 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 - [ShaderGlass](https://github.com/mausimus/ShaderGlass) - Similar overlay approach
 - [.cube LUT format](https://resolve.cafe/developers/luts/)
 - [Lilium HDR shaders](https://github.com/EndlesslyFlowering/ReShade_HDR_shaders)
-- Dolby ICTCP Whitepaper v7.1
+- Dolby ICtCp Whitepaper v7.1
 - Vandenberg 3D-LUT Paper (SMPTE 2020)
