@@ -1,0 +1,32 @@
+# Build outputs
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# LUT files (large, user-specific calibration files)
+*.cube
+*.txt
+!README*.txt
+
+# Calibration data
+*.csv
+
+# Reference PDFs (copyrighted)
+resources/*.pdf
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Misc
+nul
+*.log

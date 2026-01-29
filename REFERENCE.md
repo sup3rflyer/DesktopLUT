@@ -1,0 +1,270 @@
+# DesktopLUT Reference
+
+Detailed technical reference. For development guidance, see CLAUDE.md.
+
+## Usage
+
+```
+DesktopLUT.exe                    # GUI mode (no arguments)
+DesktopLUT.exe <sdr_lut> [hdr_lut]              # CLI mode - all monitors
+DesktopLUT.exe --monitor <N> <sdr_lut> [hdr_lut] ...  # CLI mode - per-monitor
+```
+
+### Hotkeys (configurable in Settings tab)
+- **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR)
+- **Win+Shift+Z**: Toggle HDR on/off for the focused monitor
+- **Win+Shift+X**: Toggle analysis overlay
+
+Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurable via INI file.
+
+### Examples
+```bash
+DesktopLUT.exe calibration.cube
+DesktopLUT.exe sdr.cube hdr.cube
+DesktopLUT.exe --monitor 0 sdr0.cube hdr0.cube --monitor 1 sdr1.cube
+```
+
+## Settings File (INI)
+
+Settings saved to `DesktopLUT.ini` next to executable:
+
+```ini
+[General]
+DesktopGamma=1
+TetrahedralInterp=1    ; 1 = tetrahedral (default), 0 = trilinear
+ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
+GammaWhitelist=mpv,vlc,mpc-hc64  ; Auto-disable gamma when these apps run
+
+; Hotkey settings (enable/disable and key configuration)
+HotkeyGammaEnabled=1
+HotkeyGammaKey=G
+HotkeyHdrEnabled=1
+HotkeyHdrKey=Z
+HotkeyAnalysisEnabled=1
+HotkeyAnalysisKey=X
+
+; Startup settings
+StartMinimized=0       ; 1 = start minimized to system tray
+; Note: Processing auto-starts if any correction is enabled (LUT, Primaries, Grayscale, 2.4 Gamma, Tonemapping)
+
+[Monitor0]
+SDR=C:\path\to\sdr.cube
+HDR=C:\path\to\hdr.cube
+; SDR color correction
+SDR_PrimariesEnabled=1
+SDR_PrimariesPreset=4      ; 0=sRGB, 1=P3-D65, 2=AdobeRGB, 3=Rec.2020, 4=Custom
+SDR_PrimariesRx=0.680000   ; Custom chromaticity (only when preset=4)
+; ... (Ry,Gx,Gy,Bx,By,Wx,Wy)
+SDR_GrayscaleEnabled=1
+SDR_GrayscalePoints=20     ; 10, 20, or 32
+SDR_GrayscaleData=0.0;0.05;0.10;...;1.0
+SDR_Grayscale24=0          ; 1 = apply 2.4 gamma (BT.1886)
+; HDR color correction
+HDR_GrayscaleEnabled=1
+HDR_GrayscalePoints=20
+HDR_GrayscaleData=0.0;0.05;0.10;...;1.0
+HDR_GrayscalePeak=1400.0   ; Must match ColourSpace target peak
+HDR_TonemapEnabled=1
+HDR_TonemapCurve=0         ; 0=BT.2390, 1=Soft Clip, 2=Reinhard, 3=BT.2446A, 4=Hard Clip
+HDR_TonemapSourcePeak=10000.0
+HDR_TonemapTargetPeak=1000.0
+HDR_TonemapDynamic=0
+MaxTmlEnabled=0
+MaxTmlPeak=1000.0
+```
+
+## HDR Color Pipeline (ICTCP-based)
+
+HDR processing uses the Dolby ICTCP color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.
+
+**8-Stage Pipeline:**
+1. **Desktop Gamma**: sRGB EOTF → 2.2 power law (optional toggle)
+2. **BT.709 → Rec.2020**: ITU-R BT.2087 matrix
+3. **Primaries Matrix**: Display calibration in linear Rec.2020 (includes Bradford chromatic adaptation)
+4. **Rec.2020 → ICTCP**: LMS (Hunt-Pointer-Estevez) → PQ encode → ICtCp matrix
+5. **ICTCP Processing** (all on I channel, CT/CP unchanged = hue preserved):
+   - Grayscale correction (display calibration - constant)
+   - Tonemapping (content preference - dynamic)
+   - Blue noise dithering (always on, perceptually uniform)
+6. **ICTCP → PQ RGB**: Inverse transforms for LUT input
+7. **Apply LUT**: Tetrahedral or trilinear interpolation
+8. **PQ → scRGB**: ST.2084 EOTF → Rec.2020 → BT.709
+
+**Why ICTCP?** (from Dolby whitepaper)
+- I channel correlates r=0.998 with true luminance (vs r=0.819 for Y'CbCr)
+- Max 8° hue deviation vs 23° for Y'CbCr during saturation changes
+- More uniform MacAdam ellipses = better perceptual accuracy
+- 10-bit ICTCP ≈ 11.5-bit Y'CbCr quality
+
+**Processing Order**: Grayscale before tonemap because grayscale is display calibration (constant, measured without tonemap), while tonemapping is content-dependent (user preference).
+
+**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). Only 2 pow() ops to convert peaks to PQ domain. BT.2446A uses linear-space (6 pow() due to complex gamma operations).
+
+Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
+
+## SDR Color Pipeline
+
+```
+Input → Grayscale → 2.4 Gamma → [Primaries: 2.2 Decode → Matrix (with Bradford) → 2.2 Encode] → 3D LUT → Dithering → Output
+```
+
+**Grayscale**: Applied first in sRGB signal space. Uses sqrt distribution matching 2.2 gamma signal levels, so slider N affects patch N in calibration software.
+
+**2.4 Gamma**: Optional transform for BT.1886 displays. Applies `pow(x, 2.4/2.2)` to darken the image, matching the BT.1886 standard used by broadcast monitors. Independent of grayscale correction - can be used alone or combined.
+
+**Primaries Matrix**: Uses gamma 2.2 decode AND encode (not sRGB). This ensures:
+- Identity matrix = zero change (perfect round-trip)
+- Only chromaticity is corrected, gamma curve unchanged
+- Matches display reality (displays decode with ~2.2, not sRGB EOTF)
+- Includes Bradford chromatic adaptation when white points differ
+
+## Primaries Correction
+
+Maps sRGB content to display correctly on wide-gamut monitors. Without correction, wide-gamut displays show oversaturated colors because they interpret sRGB values as their own wider primaries.
+
+**How it works**:
+- Decodes signal with gamma 2.2 (matching actual display behavior)
+- Applies 3x3 matrix to transform sRGB primaries → display primaries
+- Encodes with gamma 2.2 (same as decode = no gamma change)
+- Only chromaticity changes, luminance/gamma curve unchanged
+
+**Bradford Adaptation**: When source and target white points differ by >0.01 in xy, Bradford chromatic adaptation is applied. This is the industry-standard method for white point conversion, transforming the entire color space correctly (not just neutrals). Skipped when white points are similar for pure colorimetric mapping.
+
+**Detect Button**: Uses `GetMonitorPrimariesFromEDID()` which parses actual EDID data from Windows registry (bytes 25-34 contain CIE 1931 xy chromaticity as 10-bit values). Falls back to DXGI if EDID parsing fails. **White point defaults to D65** because most displays have presets (Gamer, Movie, etc.) that already calibrate to D65 internally - using EDID native white would double-correct. For non-D65 displays, manually measure and enter the white point.
+
+**Presets**: sRGB/Rec.709, P3-D65, Adobe RGB, Rec.2020, Custom. Custom values are preserved when switching between presets.
+
+## HDR Gamma Toggle
+
+**HDR content**: Uses PQ EOTF (ST.2084) - an absolute standard defining exact nit values. No gamma ambiguity.
+
+**SDR content in HDR mode**: Windows encodes SDR with sRGB, but SDR content was mastered for 2.2 gamma (the de facto standard for 20+ years). Windows doesn't allow SDR content to use 2.2 EOTF in HDR mode.
+```
+sRGB:      L = ((V + 0.055) / 1.055)^2.4  (with linear toe)
+2.2:       L = V^2.2                       (mastering standard)
+```
+
+The toggle converts sRGB→2.2. Affects both SDR and HDR content, which is why there's a whitelist (auto-disable for specific apps) and a toggle hotkey (Win+Shift+G).
+
+## Windows Tonemapping Control
+
+| Setting | Scope | Purpose |
+|---------|-------|---------|
+| **MaxCLL** (swapchain metadata) | Per-app | "My content peaks at X nits" |
+| **MaxTML** (display config) | System-wide | "My display can handle Y nits" |
+
+DesktopLUT always declares MaxCLL = 10000 nits. Set MaxTML to 10000 to bypass Windows tonemapping entirely.
+
+## LUT Interpolation
+
+| Method | Samples | Description |
+|--------|---------|-------------|
+| **Tetrahedral** (default) | 4 | Divides cube into 6 tetrahedra, industry standard |
+| **Trilinear** | 8 | Hardware-accelerated, faster but less accurate |
+
+**Supported sizes**: 2-128 (typical: 17, 33, 65). Larger sizes rejected to prevent excessive memory use.
+
+## Calibration Workflow
+
+**Recommended approach:** Primaries and grayscale do the heavy lifting, LUT handles residual errors.
+
+**Pipeline order:**
+```
+Input → Grayscale → Primaries → 3D LUT → Output
+```
+
+**Steps:**
+1. Enter your display's native primaries (from spec sheet or measurement)
+2. Adjust grayscale sliders to get gamma tracking close
+3. Profile the display WITH these corrections active
+4. Generate LUT from profile - it only needs to fix remaining errors
+5. Fine-tune primaries/grayscale if needed
+
+**Why this works:**
+- Primaries matrix handles gamut mapping (sRGB → display primaries)
+- Grayscale handles gamma curve
+- LUT only corrects what matrix/curves can't (3D color interactions, per-channel nonlinearities)
+- Because the LUT corrections are small, minor tweaks to primaries/grayscale after the LUT is active won't drastically throw off calibration - the LUT is based on those corrections
+
+**Why not LUT-first:**
+- If you profile raw and create a LUT, then add primaries/grayscale, you're feeding corrected values into a LUT designed for uncorrected input
+- This double-corrects or mis-corrects
+- LUT changes become extreme, making post-LUT tweaks dangerous
+
+## Grayscale Correction
+
+- **SDR**: sqrt distribution matching 2.2 gamma signal levels
+  - Slider N affects patch N in calibration software (ColourSpace, etc.)
+  - Applied in signal space before primaries correction
+  - Curve values interpolated in sqrt domain for perceptual smoothness
+- **HDR**: ICTCP I-channel correction (evenly spaced in PQ domain)
+  - I channel has r=0.998 correlation with true luminance
+  - Applied before tonemapping (display calibration is constant)
+  - Peak setting must match ColourSpace target peak for slider alignment
+  - Content above peak passes through with last point's correction factor
+  - CT/CP (chroma) unchanged = no hue shifts from grayscale correction
+- **Linear interpolation** (both SDR and HDR):
+  - Piecewise linear between control points
+  - Avoids undulations that smoothstep can cause in gradients
+  - Each slider affects only immediate neighbors (predictable)
+
+## Analysis Overlay (Win+Shift+X)
+
+- Luminance: Peak, Min, Min>0, Average nits, APL, %HDR
+- Gamut: Rec.709, P3-D65 only, Rec.2020 only, out-of-gamut
+- HDR histogram: 5 buckets (0-203, 203-1k, 1k-2k, 2k-4k, 4000+ nits)
+- Session MaxCLL/MaxFALL tracking
+
+Implementation: Compute shader samples ~4096 pixels, async readback with 2-frame delay.
+
+## Performance
+
+### Design Philosophy
+Runs 24/7, must be invisible. All operations follow:
+- Offload non-GPU work from render thread via PostMessage
+- Throttle periodic work (device health check every 60 frames)
+- Async GPU readback with double-buffered staging
+- Atomic flags for fast-path mutex skip
+
+### Latency Profile
+| Stage | Latency |
+|-------|---------|
+| DwmFlush (composition sync) | 0-16ms |
+| AcquireNextFrame | <1ms |
+| GPU shader | <0.1ms |
+| Present (tearing enabled) | Immediate |
+| **Processing overhead** | **~1-2ms** |
+
+Full pipeline adds ~1 frame latency (inherent to capture-and-reprocess).
+
+### Memory Bandwidth
+At 4K 48Hz HDR: ~6.4 GB/s (capture read + swapchain write dominate)
+
+## Limitations
+
+1. **Protected content**: DRM shows black (Windows security)
+2. **Animated system UI**: Start menu, notifications not captured
+3. **Secure desktop**: UAC/lock screen temporarily disables overlay (auto-recovers)
+4. **Memory bandwidth**: ~6.4 GB/s at 4K HDR 48Hz
+
+## Why This Exists
+
+Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains via `ddisplay.dll`, making traditional DWM hooking impossible.
+
+| Method | Pros | Cons |
+|--------|------|------|
+| Monitor hardware LUT | Zero latency, HDR | Slow menus, vendor lock-in |
+| ICC profiles | OS-integrated | 1D gamma + 3x3 only |
+| DWM_LUT | Full 3D LUT | Broken on NVIDIA Blackwell |
+| **DesktopLUT** | Full 3D LUT, ~1-2ms latency | Overlay-based |
+
+## References
+
+- [DXGI Desktop Duplication](https://docs.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api)
+- [DirectComposition](https://docs.microsoft.com/en-us/windows/win32/directcomp/directcomposition-portal)
+- [ShaderGlass](https://github.com/mausimus/ShaderGlass) - Similar overlay approach
+- [.cube LUT format](https://resolve.cafe/developers/luts/)
+- [Lilium HDR shaders](https://github.com/EndlesslyFlowering/ReShade_HDR_shaders)
+- **ICTCP_IMPLEMENTATION_NOTES.md** - Detailed ICTCP pipeline design notes
+- Dolby ICTCP Whitepaper v7.1 (`resources/ictcp_dolbywhitepaper_v071.pdf`)
+- Vandenberg 3D-LUT Paper (`resources/jmi-vandenberg-2965022-x.pdf`)

@@ -1,0 +1,5 @@
+// Resource file for DesktopLUT
+#include "resource.h"
+
+// Icon resource - ID 1 is the main application icon
+IDI_APPICON ICON "DesktopLUT.ico"
