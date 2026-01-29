@@ -64,7 +64,7 @@ LUT_3D_SIZE 66
 
 ## Limitations
 
-- ~1 frame capture latency (inherent to Desktop Duplication)
+- ~1 frame visual latency (display only - no input lag)
 - Protected/DRM content shows black (Windows security)
 - Animated system UI (Start menu, notifications) not captured
 

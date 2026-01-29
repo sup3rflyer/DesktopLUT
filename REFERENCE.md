@@ -264,7 +264,7 @@ Runs 24/7, must be invisible. All operations follow:
 | Present (tearing enabled) | Immediate |
 | **Processing overhead** | **~1-2ms** |
 
-Full pipeline adds ~1 frame latency (inherent to capture-and-reprocess).
+Full pipeline adds ~1 frame visual latency (inherent to capture-and-reprocess). This is display latency only - input is unaffected since games/apps render directly to the display; the overlay just shows a color-corrected copy.
 
 ### Memory Bandwidth
 At 4K 60Hz HDR: ~8 GB/s (capture read + swapchain write dominate)
@@ -285,7 +285,7 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 | Monitor hardware LUT | Zero latency, HDR | Limited RGB support, vendor lock-in |
 | ICC profiles | OS-integrated | 1D gamma + 3x3 only |
 | DWM_LUT | Full 3D LUT | Broken on 50-series, Win11 25H2 |
-| **DesktopLUT** | Full 3D LUT, ~1-2ms latency | Overlay-based |
+| **DesktopLUT** | Full 3D LUT, no input lag | ~1 frame visual latency |
 
 ## References
 
