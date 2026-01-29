@@ -1,72 +1,153 @@
 # DesktopLUT
 
-Transparent overlay applying 3D LUT color correction to the Windows desktop via DXGI Desktop Duplication with automatic HDR/SDR detection.
+Apply display calibration to your entire Windows desktop in real-time using 3D LUTs.
+
+## What is this?
+
+DesktopLUT is a transparent overlay that color-corrects everything on your screen. It captures your desktop, applies calibration (3D LUT, grayscale, primaries correction), and displays the corrected image on top. You see the corrected colors while your mouse, keyboard, and apps work normally underneath.
+
+**Why use this instead of...**
+
+| Method | Limitation |
+|--------|------------|
+| Monitor's built-in LUT | Slow menu navigation, limited to hardware capabilities |
+| ICC profiles | Only 1D gamma + 3x3 matrix (no full 3D correction) |
+| GPU driver LUT | Often buggy, resets on driver updates, limited HDR support |
+| DWM_LUT | Broken on NVIDIA RTX 50-series and recent Windows 11 |
+
+DesktopLUT works with any GPU, any monitor, supports full 3D LUTs, and handles both SDR and HDR automatically.
 
 ## Features
 
-- Transparent click-through overlay with DirectComposition
-- 3D LUT with tetrahedral interpolation (industry standard)
-- Full HDR/SDR support with automatic mode detection
-- **ICtCp-based HDR pipeline** (Dolby color space for hue-preserving tonemapping)
-- Multi-monitor support with per-monitor LUTs
-- Grayscale correction (ICtCp I-channel for HDR, sqrt-distribution for SDR)
-- 2.4 Gamma option for BT.1886 displays (SDR)
-- Primaries/gamut correction with Bradford chromatic adaptation
-- Auto-starts when any correction is enabled
-- Tonemapping (BT.2390, Soft Clip, Reinhard, BT.2446A, Hard Clip)
-- Blue noise dithering (HDR, always-on, perceptually uniform)
-- 10-bit SDR output (R10G10B10A2), FP16 scRGB for HDR
-- Low-latency rendering (tearing support, DwmFlush sync)
-- Real-time frame analysis overlay (Win+Shift+X)
-- Supports `.cube` (any size) and eeColor `.txt` (65^3) formats
+- **Full 3D LUT support** - Load calibration LUTs from profiling software (.cube format)
+- **HDR and SDR** - Automatic detection, separate calibration for each mode
+- **Multi-monitor** - Different LUTs and settings per display
+- **Grayscale correction** - Fine-tune gamma tracking with 10/20/32-point curves
+- **Primaries correction** - Fix oversaturated colors on wide-gamut displays
+- **Tonemapping** - Multiple algorithms for HDR content (BT.2390, Reinhard, etc.)
+- **No input lag** - Only adds ~1 frame of visual latency; input goes directly to apps
+- **System tray** - Runs quietly in the background, auto-starts with Windows if configured
 
 ## Requirements
 
 - Windows 10 (build 19041+) or Windows 11
-- DirectX 11 capable GPU (Feature Level 11_0)
-- Visual Studio 2022 (for building)
+- Any DirectX 11 GPU
 
-## Building
+## Getting Started
+
+1. Download or build `DesktopLUT.exe`
+2. Run it - the GUI opens
+3. For each monitor, configure your corrections (see Calibration Guide below)
+4. Click **Start** - the overlay activates
+5. Minimize to system tray for 24/7 operation
+
+## Calibration Guide
+
+This guide walks you through calibrating your display using DesktopLUT. You'll need a colorimeter or spectrophotometer and profiling software (DisplayCAL, ColourSpace, Calman, LightSpace, etc.).
+
+### Understanding the Pipeline
+
+DesktopLUT applies corrections in this order:
+
+```
+Your Content → Grayscale → Primaries → 3D LUT → Your Display
+```
+
+The key insight: **do the heavy lifting with Grayscale and Primaries first**, then use the 3D LUT to fix what's left. This keeps LUT corrections small and stable.
+
+### Step 1: Enter Your Display's Native Primaries
+
+Go to the **SDR Options** tab (or HDR Options for HDR calibration).
+
+1. Enable **Primaries Correction**
+2. Click **Detect** to read your monitor's EDID, or enter values from your display's spec sheet
+3. This tells DesktopLUT how to map sRGB content to your display's actual color gamut
+
+*Why this matters:* Wide-gamut displays show oversaturated colors because they interpret sRGB values using their wider primaries. This correction fixes that.
+
+### Step 2: Adjust Grayscale (Gamma Tracking)
+
+1. Enable **Grayscale Correction**
+2. Choose 10, 20, or 32 control points
+3. Display grayscale test patterns in your profiling software
+4. Adjust sliders until your meter shows the target gamma (usually 2.2 for SDR)
+
+Each slider corresponds to a specific brightness level. Slider N affects patch N in your profiling software.
+
+*Tip:* For SDR, you can also enable **2.4 Gamma** if your workflow requires BT.1886 (broadcast standard).
+
+### Step 3: Profile WITH Corrections Active
+
+This is crucial: **run your profiling software while DesktopLUT is active** with your Primaries and Grayscale corrections enabled.
+
+1. Make sure DesktopLUT is running with your corrections from Steps 1-2
+2. Profile your display using your normal workflow
+3. Generate a 3D LUT (33³ or 65³ recommended)
+4. The LUT will only need to correct residual errors, not the entire response
+
+### Step 4: Load the LUT
+
+1. In the **LUT Options** tab, browse to your generated .cube file
+2. If you calibrate HDR separately, load that LUT in the HDR field
+3. Click **Start** (or it auto-starts if corrections are enabled)
+
+### Step 5: Verify and Fine-Tune
+
+Run verification patches through your profiling software:
+- Target: ΔE < 1 for grayscale, ΔE < 2 for colors
+- If needed, make small adjustments to Primaries or Grayscale sliders
+- Since the LUT corrections are small, minor tweaks won't drastically affect accuracy
+
+### HDR Calibration Notes
+
+- HDR uses the ICtCp color space (Dolby) for accurate luminance handling
+- Set **Grayscale Peak** to match your profiling software's target peak (e.g., 1000 nits)
+- HDR grayscale operates on the I (intensity) channel, preserving hue
+- Tonemapping is optional - configure based on your content preferences
+
+### What NOT to Do
+
+- **Don't profile first, then add corrections** - This creates a LUT designed for uncorrected input, then feeds it corrected input. Double-correction ensues.
+- **Don't make large post-LUT adjustments** - If you need big changes, regenerate the LUT with updated corrections.
+
+## Hotkeys
+
+All hotkeys use **Win+Shift** and are configurable in Settings:
+
+| Hotkey | Action |
+|--------|--------|
+| Win+Shift+G | Toggle gamma mode (sRGB ↔ 2.2 for SDR-in-HDR content) |
+| Win+Shift+Z | Toggle HDR on/off for focused monitor |
+| Win+Shift+X | Toggle analysis overlay (shows peak nits, gamut info, histogram) |
+
+## Supported LUT Formats
+
+- **.cube** - Industry standard (Adobe, Resolve, any size)
+- **.txt** - eeColor format (65³ only)
+
+## Limitations
+
+- **~1 frame visual delay** - Inherent to capture-and-reprocess; input is unaffected
+- **DRM content shows black** - Windows security prevents capturing protected content
+- **Some system UI not captured** - Start menu animations, notification popups
+
+## Building from Source
+
+Requires Visual Studio 2022 with C++ desktop development workload.
 
 ```
 MSBuild DesktopLUT.sln -p:Configuration=Release -p:Platform=x64
 ```
 
-Or open `DesktopLUT.sln` in Visual Studio 2022 and build Release x64.
+Or open `DesktopLUT.sln` in VS2022 and build Release x64.
 
-## Usage
+## Technical Details
 
-Run `DesktopLUT.exe` to launch the GUI. Configure LUTs and color corrections per-monitor.
-
-### Hotkeys (configurable)
-- **Win+Shift+G**: Toggle HDR gamma mode (2.2 boost for SDR content in HDR)
-- **Win+Shift+Z**: Toggle HDR on/off for the focused monitor
-- **Win+Shift+X**: Toggle analysis overlay
-
-## LUT Formats
-
-### .cube (Adobe/Resolve/BMD)
-```
-TITLE "My LUT"
-LUT_3D_SIZE 66
-0.0 0.0 0.0
-0.1 0.05 0.02
-...
-```
-
-### .txt (eeColor 65^3)
-```
-0.0 0.0 0.0
-0.015625 0.0 0.0
-...
-```
-274625 lines of `R G B` values (0.0-1.0 or 0-65535)
-
-## Limitations
-
-- ~1 frame visual latency (display only - no input lag)
-- Protected/DRM content shows black (Windows security)
-- Animated system UI (Start menu, notifications) not captured
+See [REFERENCE.md](REFERENCE.md) for in-depth technical documentation including:
+- Complete color pipeline (ICtCp, PQ, matrix constants)
+- INI file format and all settings
+- Performance characteristics
+- Implementation details
 
 ## License
 
