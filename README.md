@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="DesktopLUT-logo.png" alt="DesktopLUT" width="128">
+</p>
+
 # DesktopLUT
 
 Apply display calibration to your entire Windows desktop in real-time.
