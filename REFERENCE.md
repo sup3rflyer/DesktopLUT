@@ -277,14 +277,14 @@ Runs 24/7, must be invisible. All operations follow:
 Full pipeline adds ~1 frame latency (inherent to capture-and-reprocess).
 
 ### Memory Bandwidth
-At 4K 48Hz HDR: ~6.4 GB/s (capture read + swapchain write dominate)
+At 4K 60Hz HDR: ~8 GB/s (capture read + swapchain write dominate)
 
 ## Limitations
 
 1. **Protected content**: DRM shows black (Windows security)
 2. **Animated system UI**: Start menu, notifications not captured
 3. **Secure desktop**: UAC/lock screen temporarily disables overlay (auto-recovers)
-4. **Memory bandwidth**: ~6.4 GB/s at 4K HDR 48Hz
+4. **Memory bandwidth**: ~8 GB/s at 4K 60Hz HDR
 
 ## Why This Exists
 
@@ -292,9 +292,9 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 
 | Method | Pros | Cons |
 |--------|------|------|
-| Monitor hardware LUT | Zero latency, HDR | Slow menus, vendor lock-in |
+| Monitor hardware LUT | Zero latency, HDR | Limited RGB support, vendor lock-in |
 | ICC profiles | OS-integrated | 1D gamma + 3x3 only |
-| DWM_LUT | Full 3D LUT | Broken on NVIDIA Blackwell |
+| DWM_LUT | Full 3D LUT | Broken on 50-series, Win11 25H2 |
 | **DesktopLUT** | Full 3D LUT, ~1-2ms latency | Overlay-based |
 
 ## References
