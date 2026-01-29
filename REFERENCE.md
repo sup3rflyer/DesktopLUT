@@ -34,6 +34,7 @@ DesktopGamma=1
 TetrahedralInterp=1    ; 1 = tetrahedral (default), 0 = trilinear
 ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
 GammaWhitelist=mpv,vlc,mpc-hc64  ; Auto-disable gamma when these apps run
+; Matching: case-insensitive, executable name only (no path), .exe suffix optional
 
 ; Hotkey settings (enable/disable and key configuration)
 HotkeyGammaEnabled=1
@@ -79,7 +80,7 @@ HDR processing uses the Dolby ICTCP color space for perceptually accurate tonema
 
 **8-Stage Pipeline:**
 1. **Desktop Gamma**: sRGB EOTF → 2.2 power law (optional toggle)
-2. **BT.709 → Rec.2020**: ITU-R BT.2087 matrix
+2. **BT.709 → Rec.2020**: Standards-derived RGB primary conversion per ITU-R BT.2087
 3. **Primaries Matrix**: Display calibration in linear Rec.2020 (includes Bradford chromatic adaptation)
 4. **Rec.2020 → ICTCP**: LMS (Hunt-Pointer-Estevez) → PQ encode → ICtCp matrix
 5. **ICTCP Processing** (all on I channel, CT/CP unchanged = hue preserved):
@@ -98,14 +99,14 @@ HDR processing uses the Dolby ICTCP color space for perceptually accurate tonema
 
 **Processing Order**: Grayscale before tonemap because grayscale is display calibration (constant, measured without tonemap), while tonemapping is content-dependent (user preference).
 
-**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). Only 2 pow() ops to convert peaks to PQ domain. BT.2446A uses linear-space (6 pow() due to complex gamma operations).
+**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). Only 2 pow() ops for peak conversion (curve evaluation uses closed-form math). BT.2446A uses linear-space (6 pow() due to complex gamma operations).
 
 Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
 
 ### ICTCP Matrix Constants
 
 ```
-Rec.2020 RGB → LMS (Hunt-Pointer-Estevez with 4% crosstalk):
+Rec.2020 RGB → LMS (Hunt-Pointer-Estevez-derived, Dolby ICtCp variant with 4% crosstalk):
     1688/4096, 2146/4096,  262/4096    // 0.4121, 0.5239, 0.0640
      683/4096, 2951/4096,  462/4096    // 0.1667, 0.7205, 0.1128
       99/4096,  309/4096, 3688/4096    // 0.0242, 0.0754, 0.9004
@@ -140,7 +141,7 @@ Input → Grayscale → 2.4 Gamma → [Primaries: 2.2 Decode → Matrix (with Br
 
 **Grayscale**: Applied first in sRGB signal space. Uses sqrt distribution matching 2.2 gamma signal levels, so slider N affects patch N in calibration software.
 
-**2.4 Gamma**: Optional transform for BT.1886 displays. Applies `pow(x, 2.4/2.2)` to darken the image, matching the BT.1886 standard used by broadcast monitors. Independent of grayscale correction - can be used alone or combined.
+**2.4 Gamma**: Optional transform for BT.1886 displays. Applies `pow(x, 2.4/2.2)` to darken the image, approximating BT.1886 behavior suitable for displays with near-zero black level. Independent of grayscale correction - can be used alone or combined.
 
 **Primaries Matrix**: Uses gamma 2.2 decode AND encode (not sRGB). This ensures:
 - Identity matrix = zero change (perfect round-trip)
@@ -174,7 +175,7 @@ sRGB:      L = ((V + 0.055) / 1.055)^2.4  (with linear toe)
 2.2:       L = V^2.2                       (mastering standard)
 ```
 
-The toggle converts sRGB→2.2. Affects both SDR and HDR content, which is why there's a whitelist (auto-disable for specific apps) and a toggle hotkey (Win+Shift+G).
+The toggle converts SDR content from sRGB OETF to 2.2 gamma before HDR processing. Affects both SDR and HDR content, which is why there's a whitelist (auto-disable for specific apps) and a toggle hotkey (Win+Shift+G).
 
 ## Windows Tonemapping Control
 
@@ -183,7 +184,7 @@ The toggle converts sRGB→2.2. Affects both SDR and HDR content, which is why t
 | **MaxCLL** (swapchain metadata) | Per-app | "My content peaks at X nits" |
 | **MaxTML** (display config) | System-wide | "My display can handle Y nits" |
 
-DesktopLUT always declares MaxCLL = 10000 nits. Set MaxTML to 10000 to bypass Windows tonemapping entirely.
+DesktopLUT always declares MaxCLL = 10000 nits. Set MaxTML to 10000 to bypass Windows tonemapping entirely. (Behavior may vary by GPU driver.)
 
 ## LUT Interpolation
 
