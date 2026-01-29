@@ -165,4 +165,4 @@ See [REFERENCE.md](REFERENCE.md) for in-depth technical documentation including:
 
 ## License
 
-MIT
+GPL v3 - See [LICENSE](LICENSE)
