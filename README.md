@@ -1,26 +1,20 @@
 # DesktopLUT
 
-Apply display calibration to your entire Windows desktop in real-time using 3D LUTs.
+Apply display calibration to your entire Windows desktop in real-time.
 
 ## What is this?
 
-DesktopLUT is a transparent overlay that color-corrects everything on your screen. It captures your desktop, applies calibration (3D LUT, grayscale, primaries correction), and displays the corrected image on top. You see the corrected colors while your mouse, keyboard, and apps work normally underneath.
+DesktopLUT replaces Windows' limited color management with proper display correction. It's a transparent overlay that captures your desktop, applies color corrections (3D LUT, grayscale, primaries, tonemapping), and displays the result on top. You see corrected colors while your mouse, keyboard, and apps work normally underneath.
 
-**Why use this instead of...**
-
-| Method | Limitation |
-|--------|------------|
-| Monitor's built-in LUT | Slow menu navigation, limited to hardware capabilities |
-| ICC profiles | Only 1D gamma + 3x3 matrix (no full 3D correction) |
-| GPU driver LUT | Often buggy, resets on driver updates, limited HDR support |
-| DWM_LUT | Broken on NVIDIA RTX 50-series and recent Windows 11 |
-
-DesktopLUT works with any GPU, any monitor, supports full 3D LUTs, and handles both SDR and HDR automatically.
+**No calibration hardware?** You can still use DesktopLUT without a colorimeter - enter your display's primaries from its spec sheet, adjust grayscale by eye, or just use the HDR gamma fix. Full calibration with a 3D LUT gives the best results, but isn't required.
 
 ## Features
 
+- **Works without LUT files** - Use primaries correction, grayscale adjustment, and tonemapping standalone
 - **Full 3D LUT support** - Load calibration LUTs from profiling software (.cube format)
-- **HDR and SDR** - Automatic detection, separate calibration for each mode
+- **HDR and SDR** - Automatic detection, separate settings for each mode
+- **Fix washed-out HDR desktop** - Toggle converts SDR content from sRGB to proper 2.2 gamma (Win+Shift+G)
+- **App whitelist** - Auto-disable gamma correction when video players run (mpv, VLC, MPC-HC, etc.)
 - **Multi-monitor** - Different LUTs and settings per display
 - **Grayscale correction** - Fine-tune gamma tracking with 10/20/32-point curves
 - **Primaries correction** - Fix oversaturated colors on wide-gamut displays
@@ -37,13 +31,29 @@ DesktopLUT works with any GPU, any monitor, supports full 3D LUTs, and handles b
 
 1. Download or build `DesktopLUT.exe`
 2. Run it - the GUI opens
-3. For each monitor, configure your corrections (see Calibration Guide below)
-4. Click **Start** - the overlay activates
+3. For each monitor, configure your corrections (see below)
+4. Click **Enable** - the overlay activates
 5. Minimize to system tray for 24/7 operation
+
+### Quick Start (No Calibration Hardware)
+
+If you just want to fix common issues without a colorimeter:
+
+**Washed-out SDR content in HDR mode:**
+1. Go to **Settings** tab, ensure the Gamma hotkey is enabled
+2. Click **Enable**
+3. Press **Win+Shift+G** to toggle - SDR content will look correct
+4. Add video players to the whitelist so they're not affected
+
+**Oversaturated colors on wide-gamut display:**
+1. Go to **SDR Options** tab
+2. Enable **Primaries Correction**
+3. Click **Detect** or select a preset matching your display (P3-D65, Adobe RGB, etc.)
+4. Click **Enable**
 
 ## Calibration Guide
 
-This guide walks you through calibrating your display using DesktopLUT. You'll need a colorimeter or spectrophotometer and profiling software (DisplayCAL, ColourSpace, Calman, LightSpace, etc.).
+For accurate calibration, you'll need a colorimeter or spectrophotometer and profiling software (DisplayCAL, ColourSpace, Calman, LightSpace, etc.).
 
 ### Understanding the Pipeline
 
@@ -89,7 +99,7 @@ This is crucial: **run your profiling software while DesktopLUT is active** with
 
 1. In the **LUT Options** tab, browse to your generated .cube file
 2. If you calibrate HDR separately, load that LUT in the HDR field
-3. Click **Start** (or it auto-starts if corrections are enabled)
+3. Click **Enable** (or it auto-starts if corrections are enabled)
 
 ### Step 5: Verify and Fine-Tune
 
