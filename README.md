@@ -36,22 +36,11 @@ Or open `DesktopLUT.sln` in Visual Studio 2022 and build Release x64.
 
 ## Usage
 
-### GUI Mode (recommended)
-```
-DesktopLUT.exe
-```
-Launch with no arguments for the configuration GUI.
+Run `DesktopLUT.exe` to launch the GUI. Configure LUTs and color corrections per-monitor.
 
-### CLI Mode
-```
-DesktopLUT.exe <sdr_lut> [hdr_lut]              # All monitors
-DesktopLUT.exe --monitor <N> <sdr_lut> [hdr_lut] ...  # Per-monitor
-```
-
-### Hotkeys
+### Hotkeys (configurable)
 - **Win+Shift+G**: Toggle HDR gamma mode (2.2 boost for SDR content in HDR)
-- **Win+Shift+H**: Toggle HDR on/off for the focused monitor
-- **Win+Shift+Q**: Emergency exit
+- **Win+Shift+Z**: Toggle HDR on/off for the focused monitor
 - **Win+Shift+X**: Toggle analysis overlay
 
 ## LUT Formats

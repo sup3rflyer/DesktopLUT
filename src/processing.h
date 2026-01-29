@@ -9,9 +9,6 @@
 // Monitor enumeration callback
 BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam);
 
-// Print command line usage
-void PrintUsage();
-
 // Processing thread function
 void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs);
 

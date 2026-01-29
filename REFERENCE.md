@@ -4,11 +4,7 @@ Detailed technical reference. For development guidance, see CLAUDE.md.
 
 ## Usage
 
-```
-DesktopLUT.exe                    # GUI mode (no arguments)
-DesktopLUT.exe <sdr_lut> [hdr_lut]              # CLI mode - all monitors
-DesktopLUT.exe --monitor <N> <sdr_lut> [hdr_lut] ...  # CLI mode - per-monitor
-```
+Run `DesktopLUT.exe` to launch the GUI. Configure LUTs and color corrections per-monitor in the interface.
 
 ### Hotkeys (configurable in Settings tab)
 - **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR)
@@ -16,13 +12,6 @@ DesktopLUT.exe --monitor <N> <sdr_lut> [hdr_lut] ...  # CLI mode - per-monitor
 - **Win+Shift+X**: Toggle analysis overlay
 
 Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurable via INI file.
-
-### Examples
-```bash
-DesktopLUT.exe calibration.cube
-DesktopLUT.exe sdr.cube hdr.cube
-DesktopLUT.exe --monitor 0 sdr0.cube hdr0.cube --monitor 1 sdr1.cube
-```
 
 ## Settings File (INI)
 

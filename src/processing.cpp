@@ -28,29 +28,6 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) {
     return TRUE;
 }
 
-void PrintUsage() {
-    std::wcout << L"Usage: DesktopLUT.exe <sdr_lut> [hdr_lut]" << std::endl;
-    std::wcout << L"       DesktopLUT.exe --monitor <N> <sdr_lut> [hdr_lut] [--monitor <N> <sdr_lut> [hdr_lut] ...]" << std::endl;
-    std::wcout << std::endl;
-    std::wcout << L"Options:" << std::endl;
-    std::wcout << L"  <sdr_lut>       Required LUT file for SDR mode (.cube or .txt)" << std::endl;
-    std::wcout << L"  [hdr_lut]       Optional separate LUT for HDR mode" << std::endl;
-    std::wcout << L"  --monitor <N>   Apply following LUTs to monitor N (0=primary, 1, 2, ...)" << std::endl;
-    std::wcout << std::endl;
-    std::wcout << L"Examples:" << std::endl;
-    std::wcout << L"  # Single LUT for all monitors:" << std::endl;
-    std::wcout << L"  DesktopLUT.exe calibration.cube" << std::endl;
-    std::wcout << std::endl;
-    std::wcout << L"  # Separate SDR and HDR LUTs for all monitors:" << std::endl;
-    std::wcout << L"  DesktopLUT.exe sdr.cube hdr.cube" << std::endl;
-    std::wcout << std::endl;
-    std::wcout << L"  # Per-monitor LUTs:" << std::endl;
-    std::wcout << L"  DesktopLUT.exe --monitor 0 sdr0.cube hdr0.cube --monitor 1 sdr1.cube" << std::endl;
-    std::wcout << std::endl;
-    std::wcout << L"Hotkeys:" << std::endl;
-    std::wcout << L"  Win+Shift+G     Toggle HDR gamma mode (desktop 2.2 <-> content sRGB)" << std::endl;
-}
-
 ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, bool isHDR) {
     ColorCorrectionData dst;
     dst.primariesEnabled = src.primariesEnabled;
