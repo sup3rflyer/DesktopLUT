@@ -38,7 +38,7 @@ std::vector<MonitorContext> g_monitors;
 // ============================================================================
 
 std::atomic<bool> g_desktopGammaMode{ true };   // Effective gamma state (may be overridden by whitelist)
-std::atomic<bool> g_tetrahedralInterp{ true };  // Default: tetrahedral interpolation
+std::atomic<bool> g_tetrahedralInterp{ false };  // Default: trilinear (tetrahedral opt-in for quality)
 std::atomic<bool> g_running{ true };            // Main loop control
 std::atomic<bool> g_forceReinit{ false };       // Force reinit on next frame
 std::atomic<bool> g_logPeakDetection{ false };  // Debug: log detected peak nits to console

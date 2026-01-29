@@ -20,7 +20,7 @@ Settings saved to `DesktopLUT.ini` next to executable:
 ```ini
 [General]
 DesktopGamma=1
-TetrahedralInterp=1    ; 1 = tetrahedral (default), 0 = trilinear
+TetrahedralInterp=0    ; 0 = trilinear (default), 1 = tetrahedral (higher quality)
 ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
 GammaWhitelist=mpv,vlc,mpc-hc64  ; Auto-disable gamma when these apps run
 ; Matching: case-insensitive, executable name only (no path), .exe suffix optional
@@ -179,8 +179,8 @@ DesktopLUT always declares MaxCLL = 10000 nits. Set MaxTML to 10000 to bypass Wi
 
 | Method | Samples | Description |
 |--------|---------|-------------|
-| **Tetrahedral** (default) | 4 | Divides cube into 6 tetrahedra, industry standard |
-| **Trilinear** | 8 | Hardware-accelerated, faster but less accurate |
+| **Tetrahedral** | 4 | Divides cube into 6 tetrahedra, higher quality (opt-in) |
+| **Trilinear** (default) | 8 | Hardware-accelerated, faster |
 
 **Supported sizes**: 2-128 (typical: 17, 33, 65). Larger sizes rejected to prevent excessive memory use.
 

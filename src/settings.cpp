@@ -318,7 +318,7 @@ void LoadSettings() {
     bool desktopGamma = GetPrivateProfileBool(L"General", L"DesktopGamma", true, iniPath.c_str());
     g_userDesktopGammaMode.store(desktopGamma);
     g_desktopGammaMode.store(desktopGamma);  // Effective starts at user preference
-    g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", true, iniPath.c_str()));
+    g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", false, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
 
