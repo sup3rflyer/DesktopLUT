@@ -24,8 +24,9 @@ ipch/
 # Reference PDFs (copyrighted)
 resources/*.pdf
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code
+.claude/
+CLAUDE.md
 
 # Misc
 nul

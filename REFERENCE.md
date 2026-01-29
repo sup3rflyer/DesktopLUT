@@ -102,6 +102,36 @@ HDR processing uses the Dolby ICTCP color space for perceptually accurate tonema
 
 Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
 
+### ICTCP Matrix Constants
+
+```
+Rec.2020 RGB → LMS (Hunt-Pointer-Estevez with 4% crosstalk):
+    1688/4096, 2146/4096,  262/4096    // 0.4121, 0.5239, 0.0640
+     683/4096, 2951/4096,  462/4096    // 0.1667, 0.7205, 0.1128
+      99/4096,  309/4096, 3688/4096    // 0.0242, 0.0754, 0.9004
+
+L'M'S' → ICtCp:
+    2048/4096,  2048/4096,     0/4096  // I = 0.5*L' + 0.5*M'
+    6610/4096,-13613/4096,  7003/4096  // CT (tritan, yellow-blue)
+   17933/4096,-17390/4096,  -543/4096  // CP (protan, red-green)
+
+ICtCp → L'M'S':
+    1.0,  0.00860904,  0.11102963
+    1.0, -0.00860904, -0.11102963
+    1.0,  0.56003134, -0.32062717
+```
+
+**PQ (ST.2084) constants**: m1=0.1593, m2=78.84, c1=0.8359, c2=18.85, c3=18.69
+
+### Performance Cost
+
+ICTCP pipeline adds ~4 matrix multiplies and ~2 PQ cycles (~100 extra ALU ops/pixel). At 4K@144Hz: <1% overhead on modern GPUs.
+
+| Tonemap Curve | pow() ops |
+|---------------|-----------|
+| BT.2390/SoftClip/Reinhard/HardClip | 2 (peak conversion only) |
+| BT.2446A | 6 (peak + I conversions) |
+
 ## SDR Color Pipeline
 
 ```
@@ -163,6 +193,15 @@ DesktopLUT always declares MaxCLL = 10000 nits. Set MaxTML to 10000 to bypass Wi
 | **Trilinear** | 8 | Hardware-accelerated, faster but less accurate |
 
 **Supported sizes**: 2-128 (typical: 17, 33, 65). Larger sizes rejected to prevent excessive memory use.
+
+**Minimum LUT sizes for JND < 1** (from Vandenberg paper):
+
+| Mode | Trilinear | Tetrahedral |
+|------|-----------|-------------|
+| 10-bit SDR | 41³ | 31³ |
+| 12-bit HDR | 72³ | 55³ |
+
+Typical 65³ LUTs exceed these minimums. Tetrahedral achieves same quality as trilinear with ~25% smaller LUT.
 
 ## Calibration Workflow
 
@@ -265,6 +304,5 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 - [ShaderGlass](https://github.com/mausimus/ShaderGlass) - Similar overlay approach
 - [.cube LUT format](https://resolve.cafe/developers/luts/)
 - [Lilium HDR shaders](https://github.com/EndlesslyFlowering/ReShade_HDR_shaders)
-- **ICTCP_IMPLEMENTATION_NOTES.md** - Detailed ICTCP pipeline design notes
-- Dolby ICTCP Whitepaper v7.1 (`resources/ictcp_dolbywhitepaper_v071.pdf`)
-- Vandenberg 3D-LUT Paper (`resources/jmi-vandenberg-2965022-x.pdf`)
+- Dolby ICTCP Whitepaper v7.1
+- Vandenberg 3D-LUT Paper (SMPTE 2020)
