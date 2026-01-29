@@ -6,7 +6,7 @@ Apply display calibration to your entire Windows desktop in real-time.
 
 DesktopLUT replaces Windows' limited color management with proper display correction. It's a transparent overlay that captures your desktop, applies color corrections (3D LUT, grayscale, primaries, tonemapping), and displays the result on top. You see corrected colors while your mouse, keyboard, and apps work normally underneath.
 
-**No calibration hardware?** You can still use DesktopLUT without a colorimeter - enter your display's primaries from its spec sheet, adjust grayscale by eye, or just use the HDR gamma fix. Full calibration with a 3D LUT gives the best results, but isn't required.
+**No calibration hardware?** You can still use DesktopLUT without a colorimeter - enter your display's primaries from its spec sheet, adjust grayscale by eye, or just use the HDR gamma fix and tonemapping. Full calibration with a 3D LUT gives the best results, but isn't required.
 
 ## Features
 
@@ -14,12 +14,12 @@ DesktopLUT replaces Windows' limited color management with proper display correc
 - **Full 3D LUT support** - Load calibration LUTs from profiling software (.cube format)
 - **HDR and SDR** - Automatic detection, separate settings for each mode
 - **Fix washed-out HDR desktop** - Toggle converts SDR content from sRGB to proper 2.2 gamma (Win+Shift+G)
-- **App whitelist** - Auto-disable gamma correction when video players run (mpv, VLC, MPC-HC, etc.)
+- **App whitelist** - Auto-disable HDR gamma correction when video players or video games run.
 - **Multi-monitor** - Different LUTs and settings per display
-- **Grayscale correction** - Fine-tune gamma tracking with 10/20/32-point curves
+- **Grayscale correction** - Fine-tune gamma/EOTF tracking with 10/20/32-point curves
 - **Primaries correction** - Fix oversaturated colors on wide-gamut displays
 - **Tonemapping** - Multiple algorithms for HDR content (BT.2390, Reinhard, etc.)
-- **No input lag** - Only adds ~1 frame of visual latency; input goes directly to apps
+- **No input lag** - Adds ~1 frame of visual latency; input goes directly to apps
 - **System tray** - Runs quietly in the background, auto-starts with Windows if configured
 
 ## Requirements
@@ -43,7 +43,7 @@ If you just want to fix common issues without a colorimeter:
 1. Go to **Settings** tab, ensure the Gamma hotkey is enabled
 2. Click **Enable**
 3. Press **Win+Shift+G** to toggle - SDR content will look correct
-4. Add video players to the whitelist so they're not affected
+4. Add video players and games to the whitelist so HDR mastered content is not affected
 
 **Oversaturated colors on wide-gamut display:**
 1. Go to **SDR Options** tab
@@ -60,10 +60,13 @@ For accurate calibration, you'll need a colorimeter or spectrophotometer and pro
 DesktopLUT applies corrections in this order:
 
 ```
-Your Content → Grayscale → Primaries → 3D LUT → Your Display
+OS → Grayscale → Primaries → 3D LUT → Your Display
 ```
 
 The key insight: **do the heavy lifting with Grayscale and Primaries first**, then use the 3D LUT to fix what's left. This keeps LUT corrections small and stable.
+
+### (Optional)
+Pre-calibrate with your monitor's OSD settings.
 
 ### Step 1: Enter Your Display's Native Primaries
 
@@ -99,14 +102,14 @@ This is crucial: **run your profiling software while DesktopLUT is active** with
 
 1. In the **LUT Options** tab, browse to your generated .cube file
 2. If you calibrate HDR separately, load that LUT in the HDR field
-3. Click **Enable** (or it auto-starts if corrections are enabled)
+3. Click **Enable**
 
 ### Step 5: Verify and Fine-Tune
 
 Run verification patches through your profiling software:
 - Target: ΔE < 1 for grayscale, ΔE < 2 for colors
-- If needed, make small adjustments to Primaries or Grayscale sliders
-- Since the LUT corrections are small, minor tweaks won't drastically affect accuracy
+- If needed, make small adjustments to Grayscale sliders
+- Since the LUT corrections are hopefully small, minor tweaks won't drastically affect accuracy
 
 ### HDR Calibration Notes
 
@@ -119,6 +122,7 @@ Run verification patches through your profiling software:
 
 - **Don't profile first, then add corrections** - This creates a LUT designed for uncorrected input, then feeds it corrected input. Double-correction ensues.
 - **Don't make large post-LUT adjustments** - If you need big changes, regenerate the LUT with updated corrections.
+- **Don't profile HDR with tonemapping enabled** - Easy to forget.
 
 ## Hotkeys
 
