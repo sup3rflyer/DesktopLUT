@@ -26,6 +26,12 @@ struct AnalysisDisplayData {
     float targetPeak;
     float sessionMaxCLL;
     float sessionMaxFALL;
+    // Tonemap state for TM indicator
+    bool tonemapEnabled;
+    bool tonemapDynamic;
+    float tonemapSourcePeak;   // Static mode: configured source peak
+    float tonemapTargetPeak;   // Target peak (display capability)
+    float detectedPeak;        // Dynamic mode: GPU-detected peak
 };
 static AnalysisDisplayData g_pendingAnalysis = {};
 static std::atomic<bool> g_analysisDataReady{false};
@@ -91,11 +97,36 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     line.find(L"SESSION") != std::wstring::npos ||
                     line.find(L"---") != std::wstring::npos) {
                     SetTextColor(memDC, RGB(180, 180, 180));
+                    DrawText(memDC, line.c_str(), -1, &textRc, DT_LEFT | DT_SINGLELINE);
+                } else if (line.find(L"TM: ~") != std::wstring::npos ||
+                           line.find(L"TM: <") != std::wstring::npos) {
+                    // Line with TM indicator - draw Peak part white, TM part colored
+                    size_t tmPos = line.find(L"TM:");
+                    if (tmPos != std::wstring::npos) {
+                        // Draw first part (Peak) in white
+                        std::wstring peakPart = line.substr(0, tmPos);
+                        SetTextColor(memDC, RGB(255, 255, 255));
+                        DrawText(memDC, peakPart.c_str(), -1, &textRc, DT_LEFT | DT_SINGLELINE);
+
+                        // Calculate width of first part to offset TM part
+                        SIZE textSize;
+                        GetTextExtentPoint32(memDC, peakPart.c_str(), (int)peakPart.length(), &textSize);
+
+                        // Draw TM part in appropriate color
+                        std::wstring tmPart = line.substr(tmPos);
+                        RECT tmRc = textRc;
+                        tmRc.left += textSize.cx;
+                        if (line.find(L"TM: ~") != std::wstring::npos) {
+                            SetTextColor(memDC, RGB(255, 200, 100));  // Yellow - compressing
+                        } else {
+                            SetTextColor(memDC, RGB(100, 255, 100));  // Green - below threshold
+                        }
+                        DrawText(memDC, tmPart.c_str(), -1, &tmRc, DT_LEFT | DT_SINGLELINE);
+                    }
                 } else {
                     SetTextColor(memDC, RGB(255, 255, 255));
+                    DrawText(memDC, line.c_str(), -1, &textRc, DT_LEFT | DT_SINGLELINE);
                 }
-
-                DrawText(memDC, line.c_str(), -1, &textRc, DT_LEFT | DT_SINGLELINE);
                 textRc.top += lineHeight;
             }
 
@@ -127,19 +158,46 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ss << L" ANALYSIS (HDR)\n";
             ss << L"--------------------\n";
             ss << std::fixed << std::setprecision(1);
-            // %HDR = percentage of pixels above SDR range (>203 nits)
             float totalF = (float)data.result.totalPixels;
-            float pctHDR = 0.0f;
-            if (totalF > 0) {
-                pctHDR = (data.result.histogram[1] + data.result.histogram[2] + data.result.histogram[3] + data.result.histogram[4]) / totalF * 100.0f;
+            // Format TM indicator based on tonemap state
+            // Colors: Off=white, <threshold=green, ~compressing=yellow
+            std::wstring tmStr;
+            if (!data.tonemapEnabled) {
+                tmStr = L"Off";
+            } else if (!data.tonemapDynamic) {
+                // Static mode: show source peak, color based on content vs source
+                std::wstringstream tmss;
+                tmss << std::fixed << std::setprecision(0);
+                if (data.result.peakNits > data.tonemapSourcePeak) {
+                    // Content exceeds configured source - clipping (~ prefix, yellow)
+                    tmss << L"~" << data.tonemapSourcePeak;
+                } else {
+                    // Content within range (< prefix, green)
+                    tmss << L"<" << data.tonemapSourcePeak;
+                }
+                tmStr = tmss.str();
+            } else {
+                // Dynamic mode: show detected peak or target threshold
+                std::wstringstream tmss;
+                tmss << std::fixed << std::setprecision(0);
+                if (data.detectedPeak > data.tonemapTargetPeak) {
+                    // Above threshold - compressing (~ prefix, yellow)
+                    tmss << L"~" << data.detectedPeak;
+                } else {
+                    // Below threshold - passing through (< prefix, green)
+                    tmss << L"<" << data.tonemapTargetPeak;
+                }
+                tmStr = tmss.str();
             }
-            ss << L" Peak: " << std::setw(7) << data.result.peakNits << L"  HDR: " << std::setw(5) << pctHDR << L"%\n";
+            ss << L" Peak: " << std::setw(7) << data.result.peakNits << L"  TM: " << tmStr << L"\n";
             // Show Min>0 (if all pixels were black, show 0)
             float minNonZero = (data.result.minNonZeroNits < 99999.0f) ? data.result.minNonZeroNits : 0.0f;
-            ss << L" Avg:  " << std::setw(7) << data.result.avgNits << L"  Min>0:" << std::setw(6) << minNonZero << L"\n";
+            ss << L" Avg:  " << std::setw(7) << data.result.avgNits << L"  Min>0:" << std::setprecision(3) << std::setw(6) << minNonZero << L"\n";
+            ss << std::setprecision(1);
             // APL relative to target peak
             float apl = (data.result.avgNits / data.targetPeak) * 100.0f;
-            ss << L" APL:  " << std::setw(6) << apl << L"%  Min:  " << std::setw(5) << data.result.minNits << L"\n";
+            ss << L" APL:  " << std::setw(6) << apl << L"%  Min:  " << std::setprecision(3) << std::setw(6) << data.result.minNits << L"\n";
+            ss << std::setprecision(1);
             ss << L"\n";
             ss << L" GAMUT\n";
             if (totalF > 0) {
@@ -495,12 +553,17 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     // Store latest result
     ctx->analysisResult = result;
 
-    // Get reference peak for APL calculation
-    // Dynamic mode: use 1000 nits (standard HDR reference)
-    // Static mode: use source peak if set, otherwise 1000 nits
+    // Get tonemap settings for APL calculation and TM indicator
     float referencePeak = 1000.0f;
+    bool tmEnabled = false, tmDynamic = false;
+    float tmSourcePeak = 10000.0f, tmTargetPeak = 1000.0f;
     if (ctx->index < (int)g_gui.activeSettings.size()) {
         const auto& tonemap = g_gui.activeSettings[ctx->index].hdrColorCorrection.tonemap;
+        tmEnabled = tonemap.enabled;
+        tmDynamic = tonemap.dynamicPeak;
+        tmSourcePeak = tonemap.sourcePeakNits;
+        tmTargetPeak = tonemap.targetPeakNits;
+        // Reference peak for APL: static mode uses source peak, dynamic uses 1000 nits
         if (!tonemap.dynamicPeak && tonemap.sourcePeakNits > 0.0f) {
             referencePeak = tonemap.sourcePeakNits;
         }
@@ -512,6 +575,11 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     g_pendingAnalysis.targetPeak = referencePeak;
     g_pendingAnalysis.sessionMaxCLL = ctx->sessionMaxCLL;
     g_pendingAnalysis.sessionMaxFALL = ctx->sessionMaxFALL;
+    g_pendingAnalysis.tonemapEnabled = tmEnabled;
+    g_pendingAnalysis.tonemapDynamic = tmDynamic;
+    g_pendingAnalysis.tonemapSourcePeak = tmSourcePeak;
+    g_pendingAnalysis.tonemapTargetPeak = tmTargetPeak;
+    g_pendingAnalysis.detectedPeak = ctx->detectedPeakNits;
     g_analysisDataReady.store(true);
 
     // Post message to trigger UI update on window's thread

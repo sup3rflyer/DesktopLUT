@@ -283,9 +283,10 @@ struct MonitorContext {
     ID3D11Texture2D* peakTexture = nullptr;           // 1x1 R32_FLOAT for smoothed peak
     ID3D11UnorderedAccessView* peakUAV = nullptr;     // UAV for compute shader write
     ID3D11ShaderResourceView* peakSRV = nullptr;      // SRV for pixel shader read
-    ID3D11Texture2D* peakStagingTexture = nullptr;    // Staging texture for CPU readback (debug only)
+    ID3D11Texture2D* peakStagingTexture = nullptr;    // Staging texture for CPU readback
     int lastPeakCBWidth = 0;                          // Track last written dimensions to avoid redundant CB updates
     int lastPeakCBHeight = 0;
+    float detectedPeakNits = 0.0f;                    // Last detected peak (for analysis overlay)
 
     // Analysis resources (frame statistics overlay)
     ID3D11Buffer* analysisBuffer = nullptr;           // Structured buffer for results

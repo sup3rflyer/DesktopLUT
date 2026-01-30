@@ -863,14 +863,15 @@ void RenderMonitor(MonitorContext* ctx) {
             ID3D11ShaderResourceView* nullSRV = nullptr;
             g_context->CSSetShaderResources(0, 1, &nullSRV);
 
-            // Debug logging of detected peak (INI toggle)
-            if (g_logPeakDetection.load()) {
-                // Throttle logging to once per second per monitor
-                static std::chrono::steady_clock::time_point lastLog[8] = {};
+            // Read detected peak for analysis overlay or debug logging
+            bool needPeakReadback = g_analysisEnabled.load() || g_logPeakDetection.load();
+            if (needPeakReadback) {
+                // Throttle readback to once per second per monitor (analysis has its own display throttle)
+                static std::chrono::steady_clock::time_point lastReadback[8] = {};
                 auto now = std::chrono::steady_clock::now();
                 int idx = ctx->index < 8 ? ctx->index : 0;
 
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLog[idx]).count() >= 1000) {
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReadback[idx]).count() >= 500) {
                     // Create staging texture on first use
                     if (!ctx->peakStagingTexture) {
                         D3D11_TEXTURE2D_DESC stagingDesc = {};
@@ -891,11 +892,14 @@ void RenderMonitor(MonitorContext* ctx) {
                         if (SUCCEEDED(g_context->Map(ctx->peakStagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
                             float peakNits = *((float*)mapped.pData);  // Already in nits from compute shader
                             g_context->Unmap(ctx->peakStagingTexture, 0);
-                            std::cout << "Monitor " << ctx->index << " detected peak: "
-                                      << std::fixed << std::setprecision(1) << peakNits << " nits" << std::endl;
+                            ctx->detectedPeakNits = peakNits;  // Store for analysis overlay
+                            if (g_logPeakDetection.load()) {
+                                std::cout << "Monitor " << ctx->index << " detected peak: "
+                                          << std::fixed << std::setprecision(1) << peakNits << " nits" << std::endl;
+                            }
                         }
                     }
-                    lastLog[idx] = now;
+                    lastReadback[idx] = now;
                 }
             }
         }
