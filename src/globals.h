@@ -120,6 +120,12 @@ extern float g_sdrWhiteNits;
 extern std::chrono::steady_clock::time_point g_lastSuccessfulFrame;
 
 // ============================================================================
+// Display Power State
+// ============================================================================
+
+extern std::atomic<bool> g_displayOff;  // Display is off - skip recovery attempts, wait for wake signal
+
+// ============================================================================
 // GUI State
 // ============================================================================
 

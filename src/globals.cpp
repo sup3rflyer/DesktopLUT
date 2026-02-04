@@ -112,6 +112,12 @@ float g_sdrWhiteNits = 80.0f;
 std::chrono::steady_clock::time_point g_lastSuccessfulFrame;
 
 // ============================================================================
+// Display Power State
+// ============================================================================
+
+std::atomic<bool> g_displayOff{ false };  // Display is off - skip recovery attempts, wait for wake signal
+
+// ============================================================================
 // GUI State
 // ============================================================================
 

@@ -598,6 +598,13 @@ void RenderMonitor(MonitorContext* ctx) {
 
     // If resources are missing (failed reinit), try to recover with backoff
     if (!ctx->duplication) {
+        // If display is off, don't retry - wait for wake signal
+        if (g_displayOff.load()) {
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            Sleep(100);  // Minimal CPU usage while waiting
+            return;
+        }
+
         ctx->consecutiveFailures++;
         // Fast initial retry (50ms), exponential backoff to 5s for prolonged failures
         int backoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
@@ -607,6 +614,9 @@ void RenderMonitor(MonitorContext* ctx) {
             std::cout << "Monitor " << ctx->index << " attempting recovery, attempt "
                       << ctx->consecutiveFailures << "..." << std::endl;
         }
+
+        // Reset watchdog - we're actively trying to recover, not stuck
+        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
         if (InitDesktopDuplication(ctx)) {
             std::cout << "Monitor " << ctx->index << " recovery success" << std::endl;
@@ -648,9 +658,22 @@ void RenderMonitor(MonitorContext* ctx) {
         }
         return;
     } else if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
-        // Desktop duplication lost or other error - hide overlay and retry with backoff
+        // Desktop duplication lost or other error - hide overlay and release duplication
         if (ctx->hwnd && IsWindowVisible(ctx->hwnd)) {
             ShowWindow(ctx->hwnd, SW_HIDE);
+        }
+
+        // Release duplication interface so forceReinit can recreate it cleanly
+        if (ctx->duplication) {
+            ctx->duplication->Release();
+            ctx->duplication = nullptr;
+        }
+
+        // If display is off, don't retry - wait for wake signal to trigger forceReinit
+        if (g_displayOff.load()) {
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            ctx->consecutiveFailures = 0;  // Will start fresh on wake
+            return;
         }
 
         ctx->consecutiveFailures++;
@@ -665,6 +688,9 @@ void RenderMonitor(MonitorContext* ctx) {
             std::cout << "Monitor " << ctx->index << " duplication lost (0x" << std::hex << hr << std::dec
                       << "), attempt " << ctx->consecutiveFailures << "..." << std::endl;
         }
+
+        // Reset watchdog - we're actively trying to recover, not stuck
+        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
         // Try to reinit - never give up, secure desktop can take a while
         if (ReinitDesktopDuplication(ctx)) {
@@ -1184,9 +1210,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // 0 = off, 1 = on, 2 = dimmed
                 if (displayState == 1) {
                     std::cout << "Display waking from sleep, forcing reinit..." << std::endl;
+                    g_displayOff.store(false);
                     g_forceReinit.store(true);
                 } else if (displayState == 0) {
                     std::cout << "Display entering sleep mode" << std::endl;
+                    g_displayOff.store(true);
                     // Reset watchdog to prevent timeout during display sleep
                     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
                 }
