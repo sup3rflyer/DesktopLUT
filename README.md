@@ -148,6 +148,7 @@ All hotkeys use **Win+Shift** and are configurable in Settings:
 - **~1 frame visual delay** - Inherent to capture-and-reprocess; input is unaffected
 - **DRM content shows black** - Windows security prevents capturing protected content
 - **Some system UI not captured** - Start menu animations, notification popups
+- **NVIDIA G-Sync disabled while active** - The overlay window breaks VRR on NVIDIA GPUs ([details](https://github.com/sup3rflyer/DesktopLUT/issues/1)). AMD FreeSync and Intel VRR work normally.
 
 ## Building from Source
 
