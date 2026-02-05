@@ -27,6 +27,7 @@ resources/*.pdf
 # Claude Code
 .claude/
 CLAUDE.md
+VRR_RESEARCH.md
 
 # Misc
 nul
