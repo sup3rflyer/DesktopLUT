@@ -22,8 +22,14 @@ Settings saved to `DesktopLUT.ini` next to executable:
 DesktopGamma=1
 TetrahedralInterp=0    ; 0 = trilinear (default), 1 = tetrahedral (higher quality)
 ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
+ShowFrameTiming=0      ; 1 = show frame timing stats in analysis overlay (developer debug)
 GammaWhitelist=mpv,vlc,mpc-hc64  ; Auto-disable gamma when these apps run
 ; Matching: case-insensitive, executable name only (no path), .exe suffix optional
+
+; Passthrough Mode (hide overlay when specific apps are running)
+VRRWhitelistEnabled=0           ; 1 = enable passthrough mode
+VRRWhitelist=game1,game2        ; Comma-separated list of exe names
+; Use this to disable color correction for games that need VRR (NVIDIA G-Sync)
 
 ; Hotkey settings (enable/disable and key configuration)
 HotkeyGammaEnabled=1
@@ -243,6 +249,9 @@ Input → Grayscale → Primaries → 3D LUT → Output
 - Gamut: Rec.709, P3-D65 only, Rec.2020 only, out-of-gamut
 - HDR histogram: 5 buckets (0-203, 203-1k, 1k-2k, 2k-4k, 4000+ nits)
 - Session MaxCLL/MaxFALL tracking
+- Frame timing (optional, `ShowFrameTiming=1` in INI): FPS, frame times, jitter, sync method
+
+**Frame timing note**: These metrics measure Desktop Duplication frame delivery timing, not actual display presentation. Values fluctuate based on desktop activity and are useful for debugging the render loop, not for assessing VRR behavior or presentation quality.
 
 Implementation: Compute shader samples ~4096 pixels, async readback with 2-frame delay.
 
@@ -325,6 +334,33 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 2. **Animated system UI**: Start menu, notifications not captured
 3. **Secure desktop**: UAC/lock screen temporarily disables overlay (auto-recovers)
 4. **Memory bandwidth**: ~8 GB/s at 4K 60Hz HDR
+
+## VRR (Variable Refresh Rate) Compatibility
+
+| GPU Vendor | VRR Status | Notes |
+|------------|-----------|-------|
+| NVIDIA G-Sync | **Incompatible** | Driver disables VRR with any overlay window |
+| AMD FreeSync | Compatible | Works normally |
+| Intel VRR | Compatible | Works normally |
+
+This is a fundamental NVIDIA driver limitation affecting all external overlay applications (ShaderGlass, Lossless Scaling, Discord overlay, Xbox Game Bar, etc.). No workaround exists.
+
+**For NVIDIA users**:
+1. Enable Windows "Variable refresh rate" setting (Settings > Display > Graphics > Variable refresh rate: On)
+2. Use Passthrough Mode (Settings tab) to auto-hide overlay when specific games are running
+
+See [GitHub Issue #1](https://github.com/sup3rflyer/DesktopLUT/issues/1) for technical details.
+
+### Passthrough Mode
+
+Automatically hides all overlays when specified applications are running. Useful for:
+- Games that need G-Sync/VRR (NVIDIA)
+- Applications where color correction should be disabled
+- Any app where you want the raw display output
+
+**Setup**: Settings tab → Enable "Hide overlay for apps" → Click "Whitelist..." → Enter comma-separated exe names (e.g., `game.exe, launcher.exe`). Matching is case-insensitive, `.exe` extension optional.
+
+**Behavior**: Polls running processes every 500ms. When a whitelisted app is detected, all monitor overlays are hidden. When the app exits, overlays are restored.
 
 ## Why This Exists
 

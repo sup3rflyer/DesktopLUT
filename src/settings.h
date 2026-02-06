@@ -34,3 +34,6 @@ void LoadSettings();
 
 // Parse g_gammaWhitelistRaw into g_gammaWhitelist vector
 void ParseGammaWhitelist();
+
+// Parse g_vrrWhitelistRaw into g_vrrWhitelist vector
+void ParseVrrWhitelist();

@@ -1093,6 +1093,150 @@ void ShowGammaWhitelistDialog(HWND hwndParent) {
     SetForegroundWindow(hwndParent);
 }
 
+// ============================================================================
+// VRR Whitelist Dialog
+// ============================================================================
+
+static HWND g_vrrWhitelistEdit = nullptr;
+
+LRESULT CALLBACK VrrWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE:
+        {
+            int pad = 10;
+            int btnW = 75;
+            int btnH = 26;
+
+            // Info label
+            CreateWindow(L"STATIC",
+                L"Process names to disable overlay for:",
+                WS_CHILD | WS_VISIBLE,
+                pad, pad, 360, 18, hwnd, nullptr, nullptr, nullptr);
+
+            // Multi-line edit box with word wrap for many entries
+            g_vrrWhitelistEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", g_vrrWhitelistRaw.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
+                pad, pad + 22, 360, 80, hwnd, nullptr, nullptr, nullptr);
+
+            // OK and Cancel buttons (owner-draw for rounded style)
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int btnY = rc.bottom - btnH - pad;
+            CreateWindow(L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                rc.right - 2*btnW - 2*pad, btnY, btnW, btnH, hwnd, (HMENU)ID_WHITELIST_OK, nullptr, nullptr);
+            CreateWindow(L"BUTTON", L"Cancel",
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                rc.right - btnW - pad, btnY, btnW, btnH, hwnd, (HMENU)ID_WHITELIST_CANCEL, nullptr, nullptr);
+
+            // Apply main font to all controls
+            if (g_mainFont) {
+                EnumChildWindows(hwnd, [](HWND hwndChild, LPARAM lParam) -> BOOL {
+                    SendMessage(hwndChild, WM_SETFONT, lParam, TRUE);
+                    return TRUE;
+                }, (LPARAM)g_mainFont);
+            }
+        }
+        return 0;
+
+    case WM_DRAWITEM:
+        {
+            LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
+            if (pDIS->CtlType == ODT_BUTTON) {
+                DrawRoundedButton(pDIS);
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_WHITELIST_OK:
+            {
+                // Get text from edit box
+                wchar_t buf[1024] = {};
+                GetWindowText(g_vrrWhitelistEdit, buf, 1024);
+                g_vrrWhitelistRaw = buf;
+                ParseVrrWhitelist();
+                SaveSettings();
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        case ID_WHITELIST_CANCEL:
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        g_vrrWhitelistEdit = nullptr;
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void ShowVrrWhitelistDialog(HWND hwndParent) {
+    // Register window class if needed
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
+        wc.lpfnWndProc = VrrWhitelistProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"DesktopLUT_VrrWhitelist";
+        RegisterClassEx(&wc);
+        registered = true;
+    }
+
+    // Calculate window size
+    int contentW = 380;
+    int contentH = 160;
+
+    RECT rc = { 0, 0, contentW, contentH };
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    int winW = rc.right - rc.left;
+    int winH = rc.bottom - rc.top;
+
+    // Center on parent
+    RECT parentRect;
+    GetWindowRect(hwndParent, &parentRect);
+    int x = parentRect.left + (parentRect.right - parentRect.left - winW) / 2;
+    int y = parentRect.top + (parentRect.bottom - parentRect.top - winH) / 2;
+
+    // Create dialog window
+    HWND hwndDialog = CreateWindowEx(
+        WS_EX_DLGMODALFRAME,
+        L"DesktopLUT_VrrWhitelist",
+        L"Passthrough Whitelist",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, winW, winH,
+        hwndParent, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    if (!hwndDialog) {
+        return;
+    }
+
+    ShowWindow(hwndDialog, SW_SHOW);
+    UpdateWindow(hwndDialog);
+
+    // Modal message loop
+    EnableWindow(hwndParent, FALSE);
+    MSG msg;
+    BOOL bRet;
+    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndDialog)) {
+        if (bRet == -1) break;  // Error occurred
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    EnableWindow(hwndParent, TRUE);
+    SetForegroundWindow(hwndParent);
+}
+
 // Monitor enumeration for GUI
 static BOOL CALLBACK GUIMonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) {
     auto* monitors = reinterpret_cast<std::vector<HMONITOR>*>(lParam);
@@ -1787,7 +1931,42 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         innerY = 8;  // Reset for scroll panel
         HWND panel3 = g_gui.hwndScrollPanel[3];
 
+        // Passthrough Mode group
+        ctrl = CreateWindow(L"BUTTON", L"Passthrough Mode", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 46, panel3, nullptr, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(ctrl);
+
+        g_gui.hwndSettingsVrrWhitelistCheck = CreateWindow(L"BUTTON", L"Hide overlay for apps",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 20, 140, h, panel3, (HMENU)ID_SETTINGS_VRR_WHITELIST_CHECK, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(g_gui.hwndSettingsVrrWhitelistCheck);
+        SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_SETCHECK, g_vrrWhitelistEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        g_gui.hwndSettingsVrrWhitelistBtn = CreateWindow(L"BUTTON", L"Whitelist...",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            innerX + 160, innerY + 18, 70, h, panel3, (HMENU)ID_SETTINGS_VRR_WHITELIST_BTN, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(g_gui.hwndSettingsVrrWhitelistBtn);
+
+        // Startup group
+        innerY += 51;
+        ctrl = CreateWindow(L"BUTTON", L"Startup", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 68, panel3, nullptr, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(ctrl);
+
+        g_gui.hwndSettingsStartMinimized = CreateWindow(L"BUTTON", L"Start minimized to tray",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 20, 160, h, panel3, (HMENU)ID_SETTINGS_START_MINIMIZED, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(g_gui.hwndSettingsStartMinimized);
+        SendMessage(g_gui.hwndSettingsStartMinimized, BM_SETCHECK, g_startMinimized.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        g_gui.hwndSettingsRunAtStartup = CreateWindow(L"BUTTON", L"Run at Windows startup",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 42, 160, h, panel3, (HMENU)ID_SETTINGS_RUN_AT_STARTUP, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(g_gui.hwndSettingsRunAtStartup);
+        SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+
         // Hotkeys group
+        innerY += 73;
         ctrl = CreateWindow(L"BUTTON", L"Hotkeys (Win+Shift+Key)", WS_CHILD | BS_GROUPBOX,
             innerX, innerY, groupW, 90, panel3, nullptr, nullptr, nullptr);
         g_gui.tab3Controls.push_back(ctrl);
@@ -1817,26 +1996,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_gui.tab3Controls.push_back(g_gui.hwndSettingsHotkeyAnalysis);
         SendMessage(g_gui.hwndSettingsHotkeyAnalysis, BM_SETCHECK, g_hotkeyAnalysisEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-        // Startup group
-        innerY += 95;
-        ctrl = CreateWindow(L"BUTTON", L"Startup", WS_CHILD | BS_GROUPBOX,
-            innerX, innerY, groupW, 68, panel3, nullptr, nullptr, nullptr);
-        g_gui.tab3Controls.push_back(ctrl);
-
-        g_gui.hwndSettingsStartMinimized = CreateWindow(L"BUTTON", L"Start minimized to tray",
-            WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 20, 160, h, panel3, (HMENU)ID_SETTINGS_START_MINIMIZED, nullptr, nullptr);
-        g_gui.tab3Controls.push_back(g_gui.hwndSettingsStartMinimized);
-        SendMessage(g_gui.hwndSettingsStartMinimized, BM_SETCHECK, g_startMinimized.load() ? BST_CHECKED : BST_UNCHECKED, 0);
-
-        g_gui.hwndSettingsRunAtStartup = CreateWindow(L"BUTTON", L"Run at Windows startup",
-            WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 42, 160, h, panel3, (HMENU)ID_SETTINGS_RUN_AT_STARTUP, nullptr, nullptr);
-        g_gui.tab3Controls.push_back(g_gui.hwndSettingsRunAtStartup);
-        SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
-
         // Debug group
-        innerY += 73;
+        innerY += 95;
         ctrl = CreateWindow(L"BUTTON", L"Debug", WS_CHILD | BS_GROUPBOX,
             innerX, innerY, groupW, 46, panel3, nullptr, nullptr, nullptr);
         g_gui.tab3Controls.push_back(ctrl);
@@ -1956,6 +2117,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_startMinimized.load() ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessage(g_gui.hwndSettingsConsoleLog, BM_SETCHECK,
             g_consoleEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_SETCHECK,
+            g_vrrWhitelistEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
         if (!monitors.empty()) {
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, 0, 0);
@@ -2704,6 +2867,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 SaveSettings();
             }
+            return 0;
+
+        case ID_SETTINGS_VRR_WHITELIST_CHECK:
+            g_vrrWhitelistEnabled.store(SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveSettings();
+            return 0;
+
+        case ID_SETTINGS_VRR_WHITELIST_BTN:
+            ShowVrrWhitelistDialog(hwnd);
             return 0;
 
         case ID_TRAY_SHOW:

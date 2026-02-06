@@ -150,6 +150,9 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         return;
     }
 
+    // Initialize Compositor Clock API for VRR-aware frame timing
+    InitCompositorClock();
+
     // LUT cache
     std::map<std::wstring, std::pair<std::vector<float>, int>> lutCache;
 

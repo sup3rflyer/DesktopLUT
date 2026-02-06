@@ -17,6 +17,23 @@
 #include <cctype>
 #include <thread>
 
+// Compositor Clock API (Windows 10 1903+) for VRR-aware frame timing
+// Dynamically loaded to maintain compatibility with older Windows
+PFN_DCompositionWaitForCompositorClock g_pfnWaitForCompositorClock = nullptr;
+
+void InitCompositorClock() {
+    HMODULE hDcomp = GetModuleHandleW(L"dcomp.dll");
+    if (hDcomp) {
+        g_pfnWaitForCompositorClock = (PFN_DCompositionWaitForCompositorClock)
+            GetProcAddress(hDcomp, "DCompositionWaitForCompositorClock");
+    }
+    if (g_pfnWaitForCompositorClock) {
+        std::cout << "Compositor Clock API: available" << std::endl;
+    } else {
+        std::cout << "Compositor Clock API: not available (using DwmFlush fallback)" << std::endl;
+    }
+}
+
 // Thread handle for gamma whitelist polling
 static std::thread g_gammaWhitelistThread;
 
@@ -220,6 +237,122 @@ static bool CheckGammaWhitelist() {
     return found;
 }
 
+// Check if any VRR-whitelisted process is running and hide/show overlay accordingly
+static void CheckVrrWhitelist() {
+    // Copy whitelist data under lock for thread-safe access
+    std::vector<std::wstring> localWhitelist;
+    {
+        std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+        localWhitelist = g_vrrWhitelist;
+    }
+
+    // Early exit if feature disabled or whitelist empty
+    if (!g_vrrWhitelistEnabled.load() || localWhitelist.empty()) {
+        if (g_vrrWhitelistActive.load()) {
+            // Was active, now disabled - show overlays again
+            g_vrrWhitelistActive.store(false);
+            {
+                std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+                g_vrrWhitelistMatch.clear();
+            }
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
+                    SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
+                    ShowWindow(ctx.hwnd, SW_SHOWNA);
+                }
+            }
+            std::cout << "VRR whitelist: disabled, showing overlays" << std::endl;
+        }
+        return;
+    }
+
+    // Enumerate running processes
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(pe32);
+
+    bool found = false;
+    std::wstring matchedProcess;
+
+    // Helper: case-insensitive length-limited compare
+    auto matchesPattern = [](const wchar_t* str, size_t strLen, const std::wstring& pattern) -> bool {
+        size_t baseLen = strLen;
+        if (baseLen > 4 && _wcsnicmp(str + baseLen - 4, L".exe", 4) == 0) {
+            baseLen -= 4;
+        }
+        if (baseLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), baseLen) == 0) {
+            return true;
+        }
+        if (strLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), strLen) == 0) {
+            return true;
+        }
+        if (strLen == pattern.size() + 4 && _wcsnicmp(str, pattern.c_str(), pattern.size()) == 0 &&
+            _wcsnicmp(str + pattern.size(), L".exe", 4) == 0) {
+            return true;
+        }
+        return false;
+    };
+
+    if (Process32FirstW(snapshot, &pe32)) {
+        do {
+            const wchar_t* exeName = pe32.szExeFile;
+            size_t exeLen = wcslen(exeName);
+
+            for (const auto& pattern : localWhitelist) {
+                if (matchesPattern(exeName, exeLen, pattern)) {
+                    found = true;
+                    matchedProcess = pe32.szExeFile;
+                    break;
+                }
+            }
+            if (found) break;
+        } while (Process32NextW(snapshot, &pe32));
+    }
+
+    CloseHandle(snapshot);
+
+    // Update state based on result
+    bool wasActive = g_vrrWhitelistActive.load();
+    if (found) {
+        if (!wasActive) {
+            // Just detected whitelisted app - hide overlays
+            g_vrrWhitelistActive.store(true);
+            {
+                std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+                g_vrrWhitelistMatch = matchedProcess;
+            }
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd) {
+                    ShowWindow(ctx.hwnd, SW_HIDE);
+                }
+            }
+            std::wcout << L"VRR whitelist: detected " << matchedProcess << L", hiding overlays" << std::endl;
+        }
+    } else {
+        if (wasActive) {
+            // Whitelisted app exited - show overlays again
+            g_vrrWhitelistActive.store(false);
+            std::wstring exitedProcess;
+            {
+                std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+                exitedProcess = g_vrrWhitelistMatch;
+                g_vrrWhitelistMatch.clear();
+            }
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
+                    SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
+                    ShowWindow(ctx.hwnd, SW_SHOWNA);
+                }
+            }
+            std::wcout << L"VRR whitelist: " << exitedProcess << L" exited, showing overlays" << std::endl;
+        }
+    }
+}
+
 // Dedicated thread function for gamma whitelist polling
 // Runs every 500ms to avoid impacting frame timing
 static void GammaWhitelistThreadFunc() {
@@ -231,6 +364,7 @@ static void GammaWhitelistThreadFunc() {
 
     while (g_gammaWhitelistThreadRunning.load()) {
         CheckGammaWhitelist();
+        CheckVrrWhitelist();
 
         // Sleep in small chunks to allow quick exit on shutdown
         for (int i = 0; i < 10 && g_gammaWhitelistThreadRunning.load(); i++) {
@@ -261,6 +395,13 @@ void StopGammaWhitelistThread() {
         std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
         g_gammaWhitelistMatch.clear();
         g_gammaWhitelistOverrideProcess.clear();
+    }
+
+    // Reset VRR whitelist state
+    g_vrrWhitelistActive.store(false);
+    {
+        std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+        g_vrrWhitelistMatch.clear();
     }
 }
 
@@ -396,7 +537,7 @@ bool CreateSwapChain(MonitorContext* ctx) {
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     if (g_tearingSupported) {
@@ -637,8 +778,14 @@ void RenderMonitor(MonitorContext* ctx) {
 
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // No frame immediately available - sync to DWM then wait
-        DwmFlush();
+        // No frame immediately available - sync to compositor
+        if (g_pfnWaitForCompositorClock) {
+            // Compositor Clock: VRR-aware timing (Windows 10 1903+)
+            g_pfnWaitForCompositorClock(0, nullptr, ctx->frameTimeMs);
+        } else {
+            // Fallback: DwmFlush (not VRR-aware but widely compatible)
+            DwmFlush();
+        }
         hr = ctx->duplication->AcquireNextFrame(ctx->frameTimeMs, &frameInfo, &desktopResource);
     }
 
@@ -649,7 +796,8 @@ void RenderMonitor(MonitorContext* ctx) {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Still need to handle initial visibility even without new frames
         // (window waits to be shown after DirectComposition commit)
-        if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)) {
+        // Skip if VRR whitelist is hiding overlays (passthrough mode)
+        if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd) && !g_vrrWhitelistActive.load()) {
             ctx->framesAfterCommit++;
             if (ctx->framesAfterCommit >= 1) {
                 SetLayeredWindowAttributes(ctx->hwnd, 0, 255, LWA_ALPHA);
@@ -981,6 +1129,21 @@ void RenderMonitor(MonitorContext* ctx) {
     } else {
         // Successful frame - update watchdog timestamp
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+
+        // Track frame timing for analysis overlay
+        if (ctx->lastFrameTime.time_since_epoch().count() > 0) {
+            auto now = std::chrono::steady_clock::now();
+            float frameMs = std::chrono::duration<float, std::milli>(now - ctx->lastFrameTime).count();
+            ctx->lastFrameTime = now;
+
+            // Store in circular buffer
+            ctx->frameTimeHistory[ctx->frameTimeIndex] = frameMs;
+            ctx->frameTimeIndex = (ctx->frameTimeIndex + 1) % 64;
+            if (ctx->frameTimeCount < 64) ctx->frameTimeCount++;
+        } else {
+            ctx->lastFrameTime = std::chrono::steady_clock::now();
+        }
+
         // Two-phase visibility: first commit DirectComposition, then show window on next frame
         // This prevents black flash by ensuring DirectComposition has processed the visual
         if (!ctx->dcompCommitted && g_dcompDevice) {
@@ -989,8 +1152,9 @@ void RenderMonitor(MonitorContext* ctx) {
             g_dcompDevice->Commit();
             ctx->dcompCommitted = true;
             ctx->framesAfterCommit = 0;  // Start counting frames after commit
-        } else if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)) {
+        } else if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd) && !g_vrrWhitelistActive.load()) {
             // Wait one frame after commit for DirectComposition to process, then show
+            // Skip if VRR whitelist is hiding overlays (passthrough mode)
             ctx->framesAfterCommit++;
             if (ctx->framesAfterCommit >= 1) {
                 // Make window opaque and show it now that DirectComposition content is ready
@@ -1078,12 +1242,15 @@ void RenderAll() {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Reapply MaxTML settings (may be lost after sleep/wake)
         ApplyMaxTmlSettings();
+        // Force TOPMOST reassert after wake (z-order most likely disrupted)
+        g_forceTopmostReassert.store(true);
     }
 
     // Periodically reassert TOPMOST to prevent other windows pushing us down
     static auto lastTopmost = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 100) {
+    bool forceReassert = g_forceTopmostReassert.exchange(false);
+    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 2000) {
         for (auto& ctx : g_monitors) {
             if (ctx.hwnd) {
                 SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,

@@ -41,8 +41,10 @@ std::atomic<bool> g_desktopGammaMode{ true };   // Effective gamma state (may be
 std::atomic<bool> g_tetrahedralInterp{ false };  // Default: trilinear (tetrahedral opt-in for quality)
 std::atomic<bool> g_running{ true };            // Main loop control
 std::atomic<bool> g_forceReinit{ false };       // Force reinit on next frame
+std::atomic<bool> g_forceTopmostReassert{ false }; // Force TOPMOST reassert on next frame
 std::atomic<bool> g_logPeakDetection{ false };  // Debug: log detected peak nits to console
 std::atomic<bool> g_consoleEnabled{ false };   // Show console window (GUI mode only, default off)
+std::atomic<bool> g_showFrameTiming{ false };  // Show frame timing in analysis overlay (default off)
 
 // ============================================================================
 // Hotkey Settings
@@ -68,6 +70,17 @@ std::wstring g_gammaWhitelistMatch;                    // Name of matched proces
 std::atomic<bool> g_gammaWhitelistThreadRunning{ false }; // Control flag for whitelist polling thread
 std::atomic<bool> g_gammaWhitelistUserOverride{ false };  // User manually toggled while whitelist was active
 std::wstring g_gammaWhitelistOverrideProcess;             // Process name when user overrode (lowercase)
+
+// ============================================================================
+// VRR Whitelist
+// ============================================================================
+
+std::atomic<bool> g_vrrWhitelistEnabled{ false };        // Feature disabled by default
+std::vector<std::wstring> g_vrrWhitelist;                // Parsed exe names (lowercase)
+std::wstring g_vrrWhitelistRaw;                          // Raw comma-separated string
+std::atomic<bool> g_vrrWhitelistActive{ false };         // A whitelisted process is running (overlay hidden)
+std::wstring g_vrrWhitelistMatch;                        // Name of matched process
+std::mutex g_vrrWhitelistMutex;                          // Protects g_vrrWhitelist, g_vrrWhitelistMatch
 
 // ============================================================================
 // Thread Synchronization

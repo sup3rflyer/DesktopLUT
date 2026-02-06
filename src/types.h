@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <thread>
+#include <chrono>
 
 // ============================================================================
 // Control IDs
@@ -104,6 +105,8 @@
 #define ID_SETTINGS_RUN_AT_STARTUP        405
 #define ID_SETTINGS_CONSOLE_LOG           406
 #define ID_SETTINGS_LOG_PEAK              407
+#define ID_SETTINGS_VRR_WHITELIST_CHECK   408
+#define ID_SETTINGS_VRR_WHITELIST_BTN     409
 
 // Grayscale editor control IDs
 #define ID_GRAYSCALE_OK     5001
@@ -186,6 +189,17 @@ struct AnalysisResult {
     uint32_t pixelsClipBlack = 0;
     uint32_t pixelsClipWhite = 0;
     uint32_t histogram[5] = {0, 0, 0, 0, 0};  // 0-203, 203-1k, 1k-2k, 2k-4k, 4k+ nits
+};
+
+// Frame timing statistics (rolling window)
+struct FrameTimingStats {
+    float currentMs = 0.0f;      // Last frame time
+    float minMs = 0.0f;          // Min in window
+    float maxMs = 0.0f;          // Max in window
+    float avgMs = 0.0f;          // Average in window
+    float varianceMs = 0.0f;     // Variance (jitter indicator)
+    float fps = 0.0f;            // Current FPS (1000/avgMs)
+    bool compositorClockAvailable = false;  // Whether API is available
 };
 
 // Tonemapping curve types (values match shader constants)
@@ -297,6 +311,13 @@ struct MonitorContext {
     float sessionMaxCLL = 0.0f;                       // Session peak tracking
     float sessionMaxFALL = 0.0f;                      // Session average tracking
     AnalysisResult analysisResult = {};               // Latest analysis result for display
+
+    // Frame timing tracking
+    std::chrono::steady_clock::time_point lastFrameTime;
+    float frameTimeHistory[64] = {};   // Rolling window of frame times (ms)
+    int frameTimeIndex = 0;            // Current index in circular buffer
+    int frameTimeCount = 0;            // Number of valid samples (0-64)
+    FrameTimingStats frameTimingStats; // Computed stats for display
 
     // LUT file paths (for reload/info)
     std::wstring sdrLutPath;
@@ -502,6 +523,8 @@ struct GUIState {
     HWND hwndSettingsStartMinimized = nullptr;
     HWND hwndSettingsRunAtStartup = nullptr;
     HWND hwndSettingsConsoleLog = nullptr;
+    HWND hwndSettingsVrrWhitelistCheck = nullptr;
+    HWND hwndSettingsVrrWhitelistBtn = nullptr;
 
     int panelHeight = 0;  // Visible height of scroll panels
 };

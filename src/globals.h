@@ -49,8 +49,10 @@ extern std::atomic<bool> g_desktopGammaMode;   // Effective gamma state (may be 
 extern std::atomic<bool> g_tetrahedralInterp;  // true = tetrahedral, false = trilinear
 extern std::atomic<bool> g_running;            // Main loop control
 extern std::atomic<bool> g_forceReinit;        // Force reinit on next frame
+extern std::atomic<bool> g_forceTopmostReassert; // Force TOPMOST reassert on next frame
 extern std::atomic<bool> g_logPeakDetection;   // Debug: log detected peak nits to console
 extern std::atomic<bool> g_consoleEnabled;     // Show console window (GUI mode only)
+extern std::atomic<bool> g_showFrameTiming;    // Show frame timing in analysis overlay
 
 // ============================================================================
 // Hotkey Settings
@@ -76,6 +78,17 @@ extern std::wstring g_gammaWhitelistMatch;             // Name of the matched pr
 extern std::atomic<bool> g_gammaWhitelistThreadRunning; // Control flag for whitelist polling thread
 extern std::atomic<bool> g_gammaWhitelistUserOverride; // User manually toggled while whitelist was active
 extern std::wstring g_gammaWhitelistOverrideProcess;   // Process name when user overrode - protected by g_gammaWhitelistMutex
+
+// ============================================================================
+// VRR Whitelist (auto-hide overlay when whitelisted apps are running)
+// ============================================================================
+
+extern std::atomic<bool> g_vrrWhitelistEnabled;        // Feature enabled
+extern std::vector<std::wstring> g_vrrWhitelist;       // Parsed exe names (lowercase) - protected by g_vrrWhitelistMutex
+extern std::wstring g_vrrWhitelistRaw;                 // Raw comma-separated string for GUI/persistence
+extern std::atomic<bool> g_vrrWhitelistActive;         // A whitelisted process is currently running (overlay hidden)
+extern std::wstring g_vrrWhitelistMatch;               // Name of the matched process - protected by g_vrrWhitelistMutex
+extern std::mutex g_vrrWhitelistMutex;                 // Protects g_vrrWhitelist, g_vrrWhitelistMatch
 
 // ============================================================================
 // Thread Synchronization

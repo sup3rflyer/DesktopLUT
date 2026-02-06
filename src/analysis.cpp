@@ -4,10 +4,12 @@
 #include "analysis.h"
 #include "globals.h"
 #include "shader.h"
+#include "render.h"
 #include <iostream>
 #include <iomanip>
 #include <sstream>
 #include <atomic>
+#include <cmath>
 
 // Window class name for analysis overlay
 static const wchar_t* g_analysisClassName = L"DesktopLUT_Analysis";
@@ -32,6 +34,8 @@ struct AnalysisDisplayData {
     float tonemapSourcePeak;   // Static mode: configured source peak
     float tonemapTargetPeak;   // Target peak (display capability)
     float detectedPeak;        // Dynamic mode: GPU-detected peak
+    // Frame timing
+    FrameTimingStats frameTiming;
 };
 static AnalysisDisplayData g_pendingAnalysis = {};
 static std::atomic<bool> g_analysisDataReady{false};
@@ -95,6 +99,7 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     line.find(L"HISTOGRAM") != std::wstring::npos ||
                     line.find(L"CLIPPING") != std::wstring::npos ||
                     line.find(L"SESSION") != std::wstring::npos ||
+                    line.find(L"FRAME TIMING") != std::wstring::npos ||
                     line.find(L"---") != std::wstring::npos) {
                     SetTextColor(memDC, RGB(180, 180, 180));
                     DrawText(memDC, line.c_str(), -1, &textRc, DT_LEFT | DT_SINGLELINE);
@@ -219,6 +224,19 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             ss << L" SESSION\n";
             ss << L"   MaxCLL:  " << std::setw(6) << (int)data.sessionMaxCLL << L" nits\n";
             ss << L"   MaxFALL: " << std::setw(6) << (int)data.sessionMaxFALL << L" nits\n";
+            if (g_showFrameTiming.load()) {
+                ss << L"\n";
+                ss << L" FRAME TIMING\n";
+                ss << std::setprecision(1);
+                ss << L"   FPS:   " << std::setw(6) << data.frameTiming.fps << L"\n";
+                ss << std::setprecision(2);
+                ss << L"   Cur:   " << std::setw(6) << data.frameTiming.currentMs << L" ms\n";
+                ss << L"   Avg:   " << std::setw(6) << data.frameTiming.avgMs << L" ms\n";
+                ss << L"   Min:   " << std::setw(6) << data.frameTiming.minMs << L" ms\n";
+                ss << L"   Max:   " << std::setw(6) << data.frameTiming.maxMs << L" ms\n";
+                ss << L"   Jit:   " << std::setw(6) << data.frameTiming.varianceMs << L" ms\n";
+                ss << L"   Sync:  " << (data.frameTiming.compositorClockAvailable ? L"CompClock" : L"DwmFlush") << L"\n";
+            }
         } else {
             ss << L" ANALYSIS (SDR)\n";
             ss << L"--------------------\n";
@@ -246,6 +264,19 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ss << L"   sRGB:  " << std::setw(5) << (data.result.pixelsRec709 / totalF * 100.0f) << L"%\n";
                 ss << L"   Wide:  " << std::setw(5) << ((data.result.pixelsP3Only + data.result.pixelsRec2020Only + data.result.pixelsOutOfGamut) / totalF * 100.0f) << L"%\n";
             }
+            if (g_showFrameTiming.load()) {
+                ss << L"\n";
+                ss << L" FRAME TIMING\n";
+                ss << std::setprecision(1);
+                ss << L"   FPS:   " << std::setw(6) << data.frameTiming.fps << L"\n";
+                ss << std::setprecision(2);
+                ss << L"   Cur:   " << std::setw(6) << data.frameTiming.currentMs << L" ms\n";
+                ss << L"   Avg:   " << std::setw(6) << data.frameTiming.avgMs << L" ms\n";
+                ss << L"   Min:   " << std::setw(6) << data.frameTiming.minMs << L" ms\n";
+                ss << L"   Max:   " << std::setw(6) << data.frameTiming.maxMs << L" ms\n";
+                ss << L"   Jit:   " << std::setw(6) << data.frameTiming.varianceMs << L" ms\n";
+                ss << L"   Sync:  " << (data.frameTiming.compositorClockAvailable ? L"CompClock" : L"DwmFlush") << L"\n";
+            }
         }
 
         // Update window
@@ -258,7 +289,11 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (oldText) free(oldText);
             SetProp(hwnd, L"AnalysisText", textCopy);
 
-            int height = data.isHDR ? 430 : 260;
+            // Window heights depend on frame timing visibility
+            // HDR: 430 base, +160 with frame timing = 590
+            // SDR: 260 base, +160 with frame timing = 420
+            bool showTiming = g_showFrameTiming.load();
+            int height = data.isHDR ? (showTiming ? 590 : 430) : (showTiming ? 420 : 260);
             SetWindowPos(hwnd, nullptr, 0, 0, 260, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             InvalidateRect(hwnd, nullptr, FALSE);  // FALSE = don't erase, prevents flicker
         }
@@ -499,6 +534,42 @@ void DispatchAnalysisCompute(MonitorContext* ctx) {
     }
 }
 
+static void ComputeFrameTimingStats(MonitorContext* ctx) {
+    if (ctx->frameTimeCount == 0) return;
+
+    float sum = 0.0f;
+    float minMs = 1000.0f;
+    float maxMs = 0.0f;
+
+    for (int i = 0; i < ctx->frameTimeCount; i++) {
+        float t = ctx->frameTimeHistory[i];
+        sum += t;
+        if (t < minMs) minMs = t;
+        if (t > maxMs) maxMs = t;
+    }
+
+    float avgMs = sum / ctx->frameTimeCount;
+
+    // Compute variance
+    float varSum = 0.0f;
+    for (int i = 0; i < ctx->frameTimeCount; i++) {
+        float diff = ctx->frameTimeHistory[i] - avgMs;
+        varSum += diff * diff;
+    }
+    float variance = varSum / ctx->frameTimeCount;
+
+    // Current frame time is the most recent
+    int lastIdx = (ctx->frameTimeIndex + 63) % 64;
+    float currentMs = ctx->frameTimeHistory[lastIdx];
+
+    ctx->frameTimingStats.currentMs = currentMs;
+    ctx->frameTimingStats.minMs = minMs;
+    ctx->frameTimingStats.maxMs = maxMs;
+    ctx->frameTimingStats.avgMs = avgMs;
+    ctx->frameTimingStats.varianceMs = sqrtf(variance);  // Std dev
+    ctx->frameTimingStats.fps = (avgMs > 0.0f) ? (1000.0f / avgMs) : 0.0f;
+}
+
 void UpdateAnalysisDisplay(MonitorContext* ctx) {
     if (!g_analysisHwnd || !IsWindowVisible(g_analysisHwnd)) return;
     if (!ctx->analysisStagingBuffer[0] || !ctx->analysisStagingBuffer[1]) return;
@@ -569,6 +640,10 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
         }
     }
 
+    // Compute and pass frame timing stats
+    ComputeFrameTimingStats(ctx);
+    ctx->frameTimingStats.compositorClockAvailable = (g_pfnWaitForCompositorClock != nullptr);
+
     // Queue data for UI thread (offloads formatting from render thread)
     g_pendingAnalysis.result = result;
     g_pendingAnalysis.isHDR = ctx->isHDREnabled;
@@ -580,6 +655,7 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     g_pendingAnalysis.tonemapSourcePeak = tmSourcePeak;
     g_pendingAnalysis.tonemapTargetPeak = tmTargetPeak;
     g_pendingAnalysis.detectedPeak = ctx->detectedPeakNits;
+    g_pendingAnalysis.frameTiming = ctx->frameTimingStats;
     g_analysisDataReady.store(true);
 
     // Post message to trigger UI update on window's thread

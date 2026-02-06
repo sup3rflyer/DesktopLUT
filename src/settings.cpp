@@ -221,14 +221,13 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
 }
 
-// Parse comma-separated whitelist string into vector of lowercase exe names
-void ParseGammaWhitelist() {
-    std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-    g_gammaWhitelist.clear();
-    if (g_gammaWhitelistRaw.empty()) return;
+// Helper to parse comma-separated whitelist into vector of lowercase exe names
+static void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out) {
+    out.clear();
+    if (raw.empty()) return;
 
     std::wstring item;
-    for (wchar_t c : g_gammaWhitelistRaw) {
+    for (wchar_t c : raw) {
         if (c == L',' || c == L';') {
             // Trim whitespace
             size_t start = item.find_first_not_of(L" \t");
@@ -244,7 +243,7 @@ void ParseGammaWhitelist() {
                     trimmed = trimmed.substr(0, trimmed.size() - 4);
                 }
                 if (!trimmed.empty()) {
-                    g_gammaWhitelist.push_back(trimmed);
+                    out.push_back(trimmed);
                 }
             }
             item.clear();
@@ -264,9 +263,20 @@ void ParseGammaWhitelist() {
             trimmed = trimmed.substr(0, trimmed.size() - 4);
         }
         if (!trimmed.empty()) {
-            g_gammaWhitelist.push_back(trimmed);
+            out.push_back(trimmed);
         }
     }
+}
+
+// Parse comma-separated whitelist string into vector of lowercase exe names
+void ParseGammaWhitelist() {
+    std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
+    ParseWhitelistString(g_gammaWhitelistRaw, g_gammaWhitelist);
+}
+
+void ParseVrrWhitelist() {
+    std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+    ParseWhitelistString(g_vrrWhitelistRaw, g_vrrWhitelist);
 }
 
 void SaveSettings() {
@@ -277,7 +287,10 @@ void SaveSettings() {
     WritePrivateProfileBool(L"General", L"TetrahedralInterp", g_tetrahedralInterp.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"LogPeakDetection", g_logPeakDetection.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ConsoleLog", g_consoleEnabled.load(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"ShowFrameTiming", g_showFrameTiming.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"GammaWhitelist", g_gammaWhitelistRaw.c_str(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
+    WritePrivateProfileStringW(L"General", L"VRRWhitelist", g_vrrWhitelistRaw.c_str(), iniPath.c_str());
 
     // Save hotkey settings
     WritePrivateProfileBool(L"General", L"HotkeyGammaEnabled", g_hotkeyGammaEnabled.load(), iniPath.c_str());
@@ -321,12 +334,19 @@ void LoadSettings() {
     g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", false, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
+    g_showFrameTiming.store(GetPrivateProfileBool(L"General", L"ShowFrameTiming", false, iniPath.c_str()));
 
     // Load gamma whitelist
     wchar_t whitelistBuf[1024] = {};
     GetPrivateProfileStringW(L"General", L"GammaWhitelist", L"", whitelistBuf, 1024, iniPath.c_str());
     g_gammaWhitelistRaw = whitelistBuf;
     ParseGammaWhitelist();
+
+    // Load VRR whitelist
+    g_vrrWhitelistEnabled.store(GetPrivateProfileBool(L"General", L"VRRWhitelistEnabled", false, iniPath.c_str()));
+    GetPrivateProfileStringW(L"General", L"VRRWhitelist", L"", whitelistBuf, 1024, iniPath.c_str());
+    g_vrrWhitelistRaw = whitelistBuf;
+    ParseVrrWhitelist();
 
     // Load hotkey settings
     g_hotkeyGammaEnabled.store(GetPrivateProfileBool(L"General", L"HotkeyGammaEnabled", true, iniPath.c_str()));
