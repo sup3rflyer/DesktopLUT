@@ -9,6 +9,7 @@
 #include "analysis.h"
 #include "displayconfig.h"
 #include "processing.h"
+#include "mhc.h"
 #include <dwmapi.h>
 #include <tlhelp32.h>
 #include <iostream>
@@ -735,6 +736,31 @@ bool RecreateSwapchain(MonitorContext* ctx) {
     return true;
 }
 
+// Reapply MHC ICC profiles after HDR/SDR mode switch
+// Windows may not automatically reapply profiles when the color pipeline changes
+static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
+    if (ctx->index >= (int)g_gui.monitorSettings.size()) return;
+    const auto& ms = g_gui.monitorSettings[ctx->index];
+
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(ctx->index, displayInfo)) return;
+
+    // Reassociate profile for current mode (if configured)
+    const auto& mhc = ctx->isHDREnabled ? ms.hdrMHC : ms.sdrMHC;
+    if (mhc.enabled && !mhc.profileName.empty()) {
+        std::wcout << L"Mode switch: reassociating " << (ctx->isHDREnabled ? L"HDR" : L"SDR")
+                   << L" MHC profile '" << mhc.profileName
+                   << L"' for monitor " << ctx->index << std::endl;
+        ReassociateMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
+    }
+
+    // Update MHC flags to match current settings
+    ctx->sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.primariesEnabled;
+    ctx->sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.grayscale.enabled;
+    ctx->hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.primariesEnabled;
+    ctx->hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.grayscale.enabled;
+}
+
 void RenderMonitor(MonitorContext* ctx) {
     // Entry validation - skip if monitor is disabled
     if (!ctx || !ctx->enabled) return;
@@ -860,6 +886,8 @@ void RenderMonitor(MonitorContext* ctx) {
                 RecreateSwapchain(ctx);
                 // Reapply MaxTML settings (may be lost after HDR mode change)
                 ApplyMaxTmlSettings();
+                // Reapply MHC ICC profiles for new mode
+                ReapplyMhcProfilesOnModeSwitch(ctx);
             }
             ctx->wasHDREnabled = ctx->isHDREnabled;
         }
@@ -913,6 +941,8 @@ void RenderMonitor(MonitorContext* ctx) {
             ctx->usePassthrough = !hasApplicableLUT;
             RecreateSwapchain(ctx);
             ApplyMaxTmlSettings();
+            // Reapply MHC ICC profiles for new mode
+            ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
             std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
         }
@@ -953,11 +983,11 @@ void RenderMonitor(MonitorContext* ctx) {
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
         const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
-        // When MHC profile handles primaries/grayscale at GPU scanout, skip those shader stages
+        // When MHC profile handles primaries at GPU scanout, skip shader primaries (avoid double-correction)
+        // Grayscale is NOT suppressed: MHC = base calibration, corrections tab = fine-tuning on top
         bool mhcPrimaries = ctx->isHDREnabled ? ctx->hdrMhcPrimariesActive : ctx->sdrMhcPrimariesActive;
-        bool mhcGrayscale = ctx->isHDREnabled ? ctx->hdrMhcGrayscaleActive : ctx->sdrMhcGrayscaleActive;
         bool shaderPrimaries = cc.primariesEnabled && !mhcPrimaries;
-        bool shaderGrayscale = cc.grayscale.enabled && !mhcGrayscale;
+        bool shaderGrayscale = cc.grayscale.enabled;
         cbData[7] = (shaderPrimaries || shaderGrayscale) ? 1.0f : 0.0f;  // useManualCorrection
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
@@ -988,7 +1018,7 @@ void RenderMonitor(MonitorContext* ctx) {
         cbData[24] = cc.tonemap.sourcePeakNits;  // tonemapSourcePeak
         cbData[25] = cc.tonemap.targetPeakNits;
         cbData[26] = cc.tonemap.dynamicPeak ? 1.0f : 0.0f;  // tonemapDynamic
-        cbData[27] = (cc.grayscale.use24Gamma && !mhcGrayscale) ? 1.0f : 0.0f;  // grayscale24 (skip if MHC handles it)
+        cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24
         // Row 7: Grayscale peak + padding (white balance now handled by Bradford in primaries matrix)
         cbData[28] = cc.grayscale.peakNits;  // grayscalePeakNits (HDR only)
         cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
@@ -1305,9 +1335,9 @@ void RenderAll() {
                     std::cout << "[Render] Applied CC: mon=" << ctx.index
                               << " isHDR=" << update.isHDR
                               << " mhcPrim=" << (ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive : ctx.sdrMhcPrimariesActive)
-                              << " mhcGs=" << (ctx.isHDREnabled ? ctx.hdrMhcGrayscaleActive : ctx.sdrMhcGrayscaleActive)
                               << " primEn=" << update.data.primariesEnabled
                               << " gsEn=" << update.data.grayscale.enabled
+                              << " gsPts=" << update.data.grayscale.pointCount
                               << " clearMhc=" << update.clearMhcFlags
                               << std::endl;
                     matched = true;

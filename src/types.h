@@ -551,6 +551,7 @@ struct GUIState {
     // Tab 2 controls (Corrections)
     std::vector<HWND> tab2Controls;
     std::vector<int> tab2OriginalY;
+    std::vector<int> tab2BaseY;       // HDR layout Y positions (creation time, immutable)
     // Tab 3 controls (Settings)
     std::vector<HWND> tab3Controls;
     std::vector<int> tab3OriginalY;

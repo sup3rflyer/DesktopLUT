@@ -754,7 +754,7 @@ void DrawToggleSwitch(LPDRAWITEMSTRUCT pDIS) {
 }
 
 // Recalculate Corrections tab layout based on SDR/HDR toggle state
-// Shows/hides HDR-only and SDR-only controls, recalculates content height
+// Shows/hides HDR-only and SDR-only controls, reflows positions, recalculates content height
 void RecalcCorrectionsLayout(bool isHDR) {
     // Show/hide SDR-only controls
     for (HWND h : g_gui.sdrOnlyControls) {
@@ -765,13 +765,41 @@ void RecalcCorrectionsLayout(bool isHDR) {
         ShowWindow(h, isHDR ? SW_SHOW : SW_HIDE);
     }
 
-    // Content height: controls remain at creation positions, scroll adjusts
-    // HDR: Desktop Gamma(51) + White Point(51) + Grayscale(80) + Tonemap(80) + MaxTML(63) = 325 + 8
-    // SDR: Desktop Gamma hidden, Tonemap/MaxTML hidden but White Point + Grayscale still at same Y
-    //       Content ends after Grayscale = 8 + 51 + 51 + 80 = 190
-    //       (controls below hidden groups occupy space but are invisible)
-    // Since controls don't reflow, total height is always the full HDR layout height
-    g_gui.contentHeight[2] = 8 + 51 + 51 + 80 + 80 + 63;
+    // Reflow: Desktop Gamma group (first 3 controls: groupbox, checkbox, whitelist button)
+    // is HDR-only. When hidden in SDR, shift all subsequent controls up by its height.
+    const int desktopGammaControls = 3;
+    const int desktopGammaHeight = 51;  // 46px groupbox + 5px spacing
+    int yShift = isHDR ? 0 : -desktopGammaHeight;
+
+    if (g_gui.tab2BaseY.size() == g_gui.tab2OriginalY.size()) {
+        for (size_t i = 0; i < g_gui.tab2OriginalY.size(); i++) {
+            g_gui.tab2OriginalY[i] = g_gui.tab2BaseY[i] + ((int)i >= desktopGammaControls ? yShift : 0);
+        }
+    }
+
+    // Content height based on mode
+    // HDR: Desktop Gamma(51) + White Point(51) + Grayscale(80) + Tonemap(80) + MaxTML(63) + margins
+    // SDR: White Point(51) + Grayscale(80) + margins (no Desktop Gamma, Tonemap, MaxTML)
+    g_gui.contentHeight[2] = isHDR ? (8 + 51 + 51 + 80 + 80 + 63) : (8 + 51 + 80);
+
+    // Reset scroll and reposition all controls
+    g_gui.scrollPos[2] = 0;
+    HWND panel = g_gui.hwndScrollPanel[2];
+
+    if (panel && g_gui.tab2Controls.size() == g_gui.tab2OriginalY.size()) {
+        ShowWindow(panel, SW_HIDE);
+        for (size_t i = 0; i < g_gui.tab2Controls.size(); i++) {
+            RECT rc;
+            GetWindowRect(g_gui.tab2Controls[i], &rc);
+            POINT pt = { rc.left, rc.top };
+            ScreenToClient(panel, &pt);
+            int w = rc.right - rc.left;
+            int h = rc.bottom - rc.top;
+            SetWindowPos(g_gui.tab2Controls[i], nullptr, pt.x, g_gui.tab2OriginalY[i], w, h,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        }
+        ShowWindow(panel, SW_SHOW);
+    }
 
     // Update scroll info
     int maxScroll = max(0, g_gui.contentHeight[2] - g_gui.panelHeight);
@@ -781,10 +809,9 @@ void RecalcCorrectionsLayout(bool isHDR) {
     si.nMin = 0;
     si.nMax = g_gui.contentHeight[2];
     si.nPage = g_gui.panelHeight;
-    si.nPos = min(g_gui.scrollPos[2], maxScroll);
-    g_gui.scrollPos[2] = si.nPos;
-    SetScrollInfo(g_gui.hwndScrollPanel[2], SB_VERT, &si, TRUE);
-    ShowScrollBar(g_gui.hwndScrollPanel[2], SB_VERT, maxScroll > 0);
+    si.nPos = 0;
+    SetScrollInfo(panel, SB_VERT, &si, TRUE);
+    ShowScrollBar(panel, SB_VERT, maxScroll > 0);
 }
 
 bool IsStartupEnabled() {
@@ -3111,6 +3138,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         storeOriginalY(g_gui.tab0Controls, g_gui.tab0OriginalY, g_gui.hwndScrollPanel[0]);
         storeOriginalY(g_gui.tab1Controls, g_gui.tab1OriginalY, g_gui.hwndScrollPanel[1]);
         storeOriginalY(g_gui.tab2Controls, g_gui.tab2OriginalY, g_gui.hwndScrollPanel[2]);
+        g_gui.tab2BaseY = g_gui.tab2OriginalY;  // Immutable copy for reflow calculations
         storeOriginalY(g_gui.tab3Controls, g_gui.tab3OriginalY, g_gui.hwndScrollPanel[3]);
 
         // Set up scroll info for each tab
@@ -3373,6 +3401,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
                 }
+                SaveSettings();
                 UpdateGUIState();
             }
             return 0;
