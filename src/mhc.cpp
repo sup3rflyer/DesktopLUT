@@ -586,7 +586,25 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     const int lutSize = params.isHDR ? 4096 : 1024;
     std::vector<float> lutR(lutSize), lutG(lutSize), lutB(lutSize);
 
-    if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
+    // Resample a correction curve to target size via linear interpolation
+    auto resampleCurve = [](const std::vector<float>& src, float* dst, int dstSize) {
+        for (int j = 0; j < dstSize; j++) {
+            float t = (float)j / (float)(dstSize - 1);
+            float srcIdx = t * (float)(src.size() - 1);
+            int i0 = (int)srcIdx;
+            int i1 = (std::min)(i0 + 1, (int)src.size() - 1);
+            float frac = srcIdx - floorf(srcIdx);
+            dst[j] = std::clamp(src[i0] + (src[i1] - src[i0]) * frac, 0.0f, 1.0f);
+        }
+    };
+
+    if (params.hasPrecomputedCorrection && !params.corrR.empty() && !params.corrG.empty() && !params.corrB.empty()) {
+        // Pre-computed correction curves from 1D .cube: use directly, just resample
+        std::cout << "MHC2: Using pre-computed 1D LUT correction (" << params.corrR.size() << " entries)" << std::endl;
+        resampleCurve(params.corrR, lutR.data(), lutSize);
+        resampleCurve(params.corrG, lutG.data(), lutSize);
+        resampleCurve(params.corrB, lutB.data(), lutSize);
+    } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
         // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
         std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points)" << std::endl;
         if (params.isHDR) {
@@ -1110,8 +1128,9 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
         xyzToXy(rD65, outData.primaries.Rx, outData.primaries.Ry);
         xyzToXy(gD65, outData.primaries.Gx, outData.primaries.Gy);
         xyzToXy(bD65, outData.primaries.Bx, outData.primaries.By);
-        outData.primaries.Wx = 0.3127f;  // D65 white point
-        outData.primaries.Wy = 0.3290f;
+        // White point from sum of un-adapted primaries (native display white)
+        float wXYZ[3] = { rD65[0]+gD65[0]+bD65[0], rD65[1]+gD65[1]+bD65[1], rD65[2]+gD65[2]+bD65[2] };
+        xyzToXy(wXYZ, outData.primaries.Wx, outData.primaries.Wy);
         outData.hasPrimaries = true;
     }
 
@@ -1350,5 +1369,77 @@ bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGr
     }
 
     outGrayscale.enabled = true;
+    return true;
+}
+
+// ============================================================================
+// 1D .cube LUT Loading (per-channel correction curves)
+// ============================================================================
+
+bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vector<float>& outG, std::vector<float>& outB) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::wcerr << L"Failed to open 1D LUT file: " << path << std::endl;
+        return false;
+    }
+
+    int lutSize = 0;
+    std::vector<float> tempR, tempG, tempB;
+    std::string line;
+
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        if (line.find("TITLE") == 0) continue;
+        if (line.find("DOMAIN_MIN") == 0) continue;
+        if (line.find("DOMAIN_MAX") == 0) continue;
+
+        // Must be a 1D LUT
+        if (line.find("LUT_3D_SIZE") == 0) {
+            std::cerr << "Error: File contains a 3D LUT, expected 1D" << std::endl;
+            return false;
+        }
+
+        if (line.find("LUT_1D_SIZE") == 0) {
+            std::istringstream iss(line.substr(11));
+            iss >> lutSize;
+            if (lutSize < 2 || lutSize > 65536) {
+                std::cerr << "Invalid 1D LUT size: " << lutSize << std::endl;
+                return false;
+            }
+            tempR.reserve(lutSize);
+            tempG.reserve(lutSize);
+            tempB.reserve(lutSize);
+            continue;
+        }
+
+        if (line.find("LUT_1D_INPUT_RANGE") == 0) continue;
+
+        // Parse R G B triplets
+        std::istringstream iss(line);
+        float r, g, b;
+        if (iss >> r >> g >> b) {
+            tempR.push_back(r);
+            tempG.push_back(g);
+            tempB.push_back(b);
+        }
+    }
+
+    if (tempR.empty()) {
+        std::cerr << "No 1D LUT data found in file" << std::endl;
+        return false;
+    }
+
+    // If no LUT_1D_SIZE header, infer from data count
+    if (lutSize == 0) lutSize = (int)tempR.size();
+
+    if ((int)tempR.size() != lutSize) {
+        std::cerr << "1D LUT: expected " << lutSize << " entries, got " << tempR.size() << std::endl;
+        return false;
+    }
+
+    outR = std::move(tempR);
+    outG = std::move(tempG);
+    outB = std::move(tempB);
+    std::cout << "Loaded 1D cube LUT: " << lutSize << " entries per channel" << std::endl;
     return true;
 }

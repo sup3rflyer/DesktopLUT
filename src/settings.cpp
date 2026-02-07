@@ -227,6 +227,7 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileBool(section, (p + L"MHCEnabled").c_str(), mhc.enabled, iniPath);
     WritePrivateProfileStringW(section, (p + L"MHCProfilePath").c_str(), mhc.profilePath.c_str(), iniPath);
     WritePrivateProfileStringW(section, (p + L"MHCSourceFile").c_str(), mhc.sourceFilePath.c_str(), iniPath);
+    WritePrivateProfileBool(section, (p + L"MHCSourceIs1DCube").c_str(), mhc.sourceIs1DCube, iniPath);
     WritePrivateProfileBool(section, (p + L"MHCPerChannelTRC").c_str(), mhc.hasPerChannelTRC, iniPath);
 
     // MHC's own primaries settings
@@ -283,6 +284,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     wchar_t srcFile[MAX_PATH] = {};
     GetPrivateProfileStringW(section, (p + L"MHCSourceFile").c_str(), L"", srcFile, MAX_PATH, iniPath);
     mhc.sourceFilePath = srcFile;
+    mhc.sourceIs1DCube = GetPrivateProfileBool(section, (p + L"MHCSourceIs1DCube").c_str(), false, iniPath);
     mhc.hasPerChannelTRC = GetPrivateProfileBool(section, (p + L"MHCPerChannelTRC").c_str(), false, iniPath);
 
     // MHC's own primaries

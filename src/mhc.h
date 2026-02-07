@@ -26,6 +26,11 @@ struct MHC2ProfileParams {
     // Each vector holds the display's measured transfer curve: signal(0-1) → linear(0-1)
     std::vector<float> trcR, trcG, trcB;
     bool hasPerChannelTRC = false;
+
+    // Pre-computed correction curves from 1D .cube (when set, used directly as MHC2 LUT)
+    // Each vector holds signal(0-1) → corrected signal(0-1), already the final correction
+    std::vector<float> corrR, corrG, corrB;
+    bool hasPrecomputedCorrection = false;
 };
 
 // Generate complete ICC v4 profile binary data with MHC2 tag
@@ -106,3 +111,7 @@ bool ExtractGrayscaleFromICC(const ICCProfileData& icc, GrayscaleSettings& outGr
 
 // Extract grayscale from cube LUT neutral axis (R=G=B diagonal)
 bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGrayscale);
+
+// Load a 1D .cube LUT as per-channel correction curves
+// Returns three vectors (R, G, B) with normalized 0-1 correction values
+bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vector<float>& outG, std::vector<float>& outB);

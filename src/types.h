@@ -443,7 +443,8 @@ struct MHCSettings {
     // Source ICC/Cube file path (if set, profile was generated from this file)
     // When non-empty, primaries + TRC come from the file, not manual editors
     std::wstring sourceFilePath;
-    bool hasPerChannelTRC = false;     // True if installed profile uses per-channel TRC from ICC
+    bool sourceIs1DCube = false;       // True if source file is a 1D .cube (per-channel correction)
+    bool hasPerChannelTRC = false;     // True if installed profile uses per-channel TRC from ICC/1D cube
 
     // MHC's own display primaries (detected from EDID or manually entered)
     bool primariesEnabled = false;

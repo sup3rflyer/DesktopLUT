@@ -433,17 +433,30 @@ static bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         }
     }
 
-    // If source file is set, re-read ICC and use per-channel TRC directly
+    // If source file is set, re-read and use per-channel data directly
     if (!mhc.sourceFilePath.empty()) {
-        ICCProfileData icc;
-        if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-            params.hasPerChannelTRC = true;
-            params.trcR = icc.trcR;
-            params.trcG = icc.trcG;
-            params.trcB = icc.trcB;
-            // Grayscale from file TRC is handled by per-channel LUT generation
-            params.grayscaleEnabled = true;
-            params.grayscale.enabled = true;
+        if (mhc.sourceIs1DCube) {
+            // 1D cube: per-channel correction curves used directly as MHC2 LUT
+            std::vector<float> corrR, corrG, corrB;
+            if (Load1DCubeLUT(mhc.sourceFilePath, corrR, corrG, corrB)) {
+                params.hasPrecomputedCorrection = true;
+                params.corrR = std::move(corrR);
+                params.corrG = std::move(corrG);
+                params.corrB = std::move(corrB);
+                params.grayscaleEnabled = true;
+                params.grayscale.enabled = true;
+            }
+        } else {
+            // ICC: per-channel TRC (characterization curves, need inversion)
+            ICCProfileData icc;
+            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+                params.hasPerChannelTRC = true;
+                params.trcR = icc.trcR;
+                params.trcG = icc.trcG;
+                params.trcB = icc.trcB;
+                params.grayscaleEnabled = true;
+                params.grayscale.enabled = true;
+            }
         }
     } else if (mhc.grayscale.enabled) {
         params.grayscaleEnabled = true;
@@ -500,7 +513,7 @@ static bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     mhc.enabled = true;
     mhc.profilePath = profilePath;
     mhc.profileName = profileName;
-    mhc.hasPerChannelTRC = params.hasPerChannelTRC;
+    mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
     UpdateMhcFlagsLive(monitorIndex);
     return true;
 }
@@ -1590,7 +1603,8 @@ struct MhcDialogData {
     ICCProfileData loadedICC;
     bool hasLoadedICC = false;
     std::wstring loadedFilePath;
-    bool loadedFileIsCube = false;
+    bool loadedFileIs1DCube = false;    // 1D .cube (per-channel correction curves)
+    std::vector<float> loaded1DR, loaded1DG, loaded1DB;  // 1D cube correction data
     bool fileLoaded = false;  // True when a file provides the profile data (disables manual controls)
     // Embedded grayscale trackbars
     std::vector<HWND> sliders;
@@ -2023,15 +2037,44 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 for (auto& c : ext) c = towlower(c);
 
                 d->hasLoadedICC = false;
-                d->loadedFileIsCube = false;
+                d->loadedFileIs1DCube = false;
+                d->loaded1DR.clear();
+                d->loaded1DG.clear();
+                d->loaded1DB.clear();
                 d->loadedICC = {};
 
                 if (ext == L".icm" || ext == L".icc") {
                     if (ReadICCProfile(path, d->loadedICC)) {
+                        if (!d->loadedICC.hasPrimaries && !d->loadedICC.hasTRC) {
+                            SetWindowText(d->hwndFilePath, L"");
+                            d->loadedFilePath.clear();
+                            MessageBox(hwnd,
+                                L"ICC profile contains no usable primaries or transfer curves.",
+                                L"Unsupported Profile", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
                         d->hasLoadedICC = true;
+                    } else {
+                        SetWindowText(d->hwndFilePath, L"");
+                        d->loadedFilePath.clear();
+                        MessageBox(hwnd,
+                            L"Failed to read ICC profile. The file may be corrupt or unsupported.",
+                            L"Read Error", MB_OK | MB_ICONERROR);
+                        return 0;
                     }
                 } else if (ext == L".cube") {
-                    d->loadedFileIsCube = true;
+                    // Only 1D cube supported — 3D cubes don't provide per-channel data
+                    if (Load1DCubeLUT(path, d->loaded1DR, d->loaded1DG, d->loaded1DB)) {
+                        d->loadedFileIs1DCube = true;
+                    } else {
+                        SetWindowText(d->hwndFilePath, L"");
+                        d->loadedFilePath.clear();
+                        MessageBox(hwnd,
+                            L"This is a 3D .cube file. Only 1D .cube files (e.g. BMD_4096) are supported for MHC profiles.\n\n"
+                            L"3D .cube files should be loaded in the 3D LUT tab instead.",
+                            L"Unsupported Format", MB_OK | MB_ICONWARNING);
+                        return 0;
+                    }
                 }
 
                 // Auto-populate primaries from loaded file
@@ -2048,14 +2091,50 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
 
                 // Auto-populate grayscale from loaded file
+                // 1D cube: per-channel correction used directly (no grayscale extraction needed)
+                // ICC: per-channel TRC extracted
                 bool gsExtracted = false;
-                if (d->hasLoadedICC && d->loadedICC.hasTRC && !d->loadedFileIsCube) {
+                if (d->loadedFileIs1DCube) {
+                    // 1D cube provides per-channel correction — mark grayscale as handled
+                    gsExtracted = true;
+                } else if (d->hasLoadedICC && d->loadedICC.hasTRC) {
                     gsExtracted = ExtractGrayscaleFromICC(d->loadedICC, d->settings->grayscale, d->isHDR);
-                } else if (d->loadedFileIsCube) {
-                    gsExtracted = ExtractGrayscaleFromCube(d->loadedFilePath, d->settings->grayscale);
                 }
                 if (gsExtracted) {
                     d->settings->grayscale.enabled = true;
+                }
+
+                // Show summary of what was extracted from the file
+                {
+                    std::wstring msg = L"Loaded: ";
+                    // Extract filename only
+                    std::wstring fname = d->loadedFilePath;
+                    size_t sl = fname.find_last_of(L"\\/");
+                    if (sl != std::wstring::npos) fname = fname.substr(sl + 1);
+                    msg += fname + L"\n\nUsing:";
+
+                    if (d->loadedFileIs1DCube) {
+                        int sz = (int)d->loaded1DR.size();
+                        wchar_t buf[64];
+                        swprintf_s(buf, L"\n  TRC R/G/B (%d points per channel)", sz);
+                        msg += buf;
+                    } else if (d->hasLoadedICC) {
+                        if (d->loadedICC.hasPrimaries)
+                            msg += L"\n  Primaries (R/G/B/W chromaticity)";
+                        if (d->loadedICC.hasTRC) {
+                            if (d->loadedICC.hasGamma) {
+                                wchar_t buf[64];
+                                swprintf_s(buf, L"\n  TRC R/G/B (gamma %.2f)", d->loadedICC.gamma);
+                                msg += buf;
+                            } else {
+                                wchar_t buf[64];
+                                swprintf_s(buf, L"\n  TRC R(%d) G(%d) B(%d)",
+                                    (int)d->loadedICC.trcR.size(), (int)d->loadedICC.trcG.size(), (int)d->loadedICC.trcB.size());
+                                msg += buf;
+                            }
+                        }
+                    }
+                    MessageBox(hwnd, msg.c_str(), L"File Import", MB_OK | MB_ICONINFORMATION);
                 }
 
                 // Lock manual controls - file provides the profile data
@@ -2071,7 +2150,10 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             SetWindowText(d->hwndFilePath, L"");
             d->loadedFilePath.clear();
             d->hasLoadedICC = false;
-            d->loadedFileIsCube = false;
+            d->loadedFileIs1DCube = false;
+            d->loaded1DR.clear();
+            d->loaded1DG.clear();
+            d->loaded1DB.clear();
             d->loadedICC = {};
             MhcSetFileLoadedState(d, false);
             if (d->hwndFileClear) ShowWindow(d->hwndFileClear, SW_HIDE);
@@ -2097,11 +2179,13 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 d->settings->grayscale.peakNits = (float)_wtof(buf);
                 if (d->settings->grayscale.peakNits < 100.0f) d->settings->grayscale.peakNits = 100.0f;
             }
-            // Store source file path for per-channel TRC regeneration
+            // Store source file path and type for profile regeneration
             if (d->fileLoaded && !d->loadedFilePath.empty()) {
                 d->settings->sourceFilePath = d->loadedFilePath;
+                d->settings->sourceIs1DCube = d->loadedFileIs1DCube;
             } else {
                 d->settings->sourceFilePath.clear();
+                d->settings->sourceIs1DCube = false;
                 d->settings->hasPerChannelTRC = false;
             }
             // When live previewing, generate + install ICC profile to bake settings
@@ -2331,16 +2415,20 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
     if (!settings.sourceFilePath.empty()) {
         SetWindowText(data.hwndFilePath, settings.sourceFilePath.c_str());
         data.loadedFilePath = settings.sourceFilePath;
-        // Try to re-read ICC data
-        std::wstring ext = settings.sourceFilePath;
-        size_t dot = ext.find_last_of(L'.');
-        if (dot != std::wstring::npos) ext = ext.substr(dot);
-        for (auto& c : ext) c = towlower(c);
-        if (ext == L".icm" || ext == L".icc") {
-            if (ReadICCProfile(settings.sourceFilePath, data.loadedICC))
-                data.hasLoadedICC = true;
-        } else if (ext == L".cube") {
-            data.loadedFileIsCube = true;
+        if (settings.sourceIs1DCube) {
+            // Re-load 1D cube correction data
+            if (Load1DCubeLUT(settings.sourceFilePath, data.loaded1DR, data.loaded1DG, data.loaded1DB))
+                data.loadedFileIs1DCube = true;
+        } else {
+            // Try to re-read ICC data
+            std::wstring ext = settings.sourceFilePath;
+            size_t dot = ext.find_last_of(L'.');
+            if (dot != std::wstring::npos) ext = ext.substr(dot);
+            for (auto& c : ext) c = towlower(c);
+            if (ext == L".icm" || ext == L".icc") {
+                if (ReadICCProfile(settings.sourceFilePath, data.loadedICC))
+                    data.hasLoadedICC = true;
+            }
         }
         MhcSetFileLoadedState(&data, true);
         ShowWindow(data.hwndFileClear, SW_SHOW);
