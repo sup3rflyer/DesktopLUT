@@ -44,7 +44,7 @@ cbuffer LUTParams : register(b0) {
     float tonemapDynamic;
     float grayscale24;     // SDR: apply 2.2->2.4 gamma transform (0 or 1)
     float grayscalePeakNits;   // HDR grayscale peak - must match ColourSpace target peak
-    float _padding;            // Padding for alignment (was whiteBalanceGains, now in primaries matrix via Bradford)
+    float isFP16SDR;           // ACM: FP16 capture with SDR color space (input is linear scRGB)
     float _padding2;
     float _padding3;
     float4 grayscale[8];
@@ -630,6 +630,11 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 R"(
     else {
         float3 input = color.rgb;
+        // ACM (Auto Color Management): FP16 capture of SDR content
+        // Input is linear scRGB - encode to gamma 2.2 so the SDR pipeline works as-is
+        if (isFP16SDR > 0.5) {
+            input = pow(max(input, 0.0), 1.0 / 2.2);
+        }
         // Primaries matrix operates in linear space
         // Decode/encode both use 2.2 to match display reality (no gamma curve change)
         if (useManualCorrection > 0.5) {
@@ -651,6 +656,11 @@ R"(
         float3 corrected;
         if (usePassthrough > 0.5) corrected = input;
         else corrected = SampleLUT(input);
+        // ACM: decode back to linear for FP16 swapchain
+        // Perfectly inverts the encode at the start: pow(pow(x, 1/2.2), 2.2) = x
+        if (isFP16SDR > 0.5) {
+            corrected = pow(max(corrected, 0.0), 2.2);
+        }
         // Dithering
         float2 noiseUV = pos.xy / 64.0;
         float noise = blueNoiseTexture.Sample(wrapSampler, noiseUV);

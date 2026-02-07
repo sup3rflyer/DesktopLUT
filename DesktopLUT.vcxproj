@@ -85,6 +85,7 @@
     <ClCompile Include="src\processing.cpp" />
     <ClCompile Include="src\gui.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
+    <ClCompile Include="src\mhc.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\types.h" />
@@ -101,6 +102,7 @@
     <ClInclude Include="src\processing.h" />
     <ClInclude Include="src\gui.h" />
     <ClInclude Include="src\displayconfig.h" />
+    <ClInclude Include="src\mhc.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resource.rc" />

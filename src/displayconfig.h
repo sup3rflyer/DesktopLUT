@@ -13,6 +13,7 @@ struct DisplayInfo {
     std::wstring devicePath;
     LUID adapterId = {};
     UINT32 targetId = 0;
+    UINT32 sourceId = 0;        // path.sourceInfo.id for ICC profile APIs
     float currentMaxTml = 0.0f;  // Current MaxTML in nits (0 if unknown)
     bool isHdrCapable = false;
 };

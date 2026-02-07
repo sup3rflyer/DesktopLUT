@@ -524,9 +524,9 @@ bool CreateSwapChain(MonitorContext* ctx) {
     }
 
     // Select format based on HDR state
-    // HDR: FP16 scRGB for linear HDR content
-    // SDR: R10G10B10A2 for 10-bit output (reduces banding after LUT)
-    ctx->swapchainFormat = ctx->isHDREnabled ?
+    // HDR / ACM: FP16 scRGB for linear content (ACM needs FP16 for transparent passthrough)
+    // SDR legacy: R10G10B10A2 for 10-bit output (reduces banding after LUT)
+    ctx->swapchainFormat = (ctx->isHDREnabled || ctx->isFP16SDR) ?
         DXGI_FORMAT_R16G16B16A16_FLOAT :
         DXGI_FORMAT_R10G10B10A2_UNORM;
 
@@ -561,9 +561,9 @@ bool CreateSwapChain(MonitorContext* ctx) {
     if (FAILED(hr)) return false;
 
     // Set color space based on HDR state
-    // HDR: scRGB linear (G10 = linear gamma, P709 = BT.709 primaries)
-    // SDR: sRGB (G22 = 2.2 gamma, P709 = BT.709 primaries)
-    ctx->colorSpace = ctx->isHDREnabled ?
+    // HDR / ACM: scRGB linear (G10 = linear gamma, P709 = BT.709 primaries)
+    // SDR legacy: sRGB (G22 = 2.2 gamma, P709 = BT.709 primaries)
+    ctx->colorSpace = (ctx->isHDREnabled || ctx->isFP16SDR) ?
         DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 :
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
@@ -571,8 +571,10 @@ bool CreateSwapChain(MonitorContext* ctx) {
     hr = ctx->swapchain->CheckColorSpaceSupport(ctx->colorSpace, &colorSpaceSupport);
     if (SUCCEEDED(hr) && (colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
         hr = ctx->swapchain->SetColorSpace1(ctx->colorSpace);
+        const char* csName = ctx->isHDREnabled ? "scRGB linear (HDR)" :
+                             ctx->isFP16SDR ? "scRGB linear (ACM SDR)" : "sRGB (SDR)";
         if (SUCCEEDED(hr)) {
-            std::cout << "Monitor " << ctx->index << " color space: " << (ctx->isHDREnabled ? "scRGB linear (HDR)" : "sRGB (SDR)") << std::endl;
+            std::cout << "Monitor " << ctx->index << " color space: " << csName << std::endl;
         }
     } else {
         std::cout << "Warning: Monitor " << ctx->index << " requested color space not supported" << std::endl;
@@ -951,33 +953,45 @@ void RenderMonitor(MonitorContext* ctx) {
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
         const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
-        cbData[7] = (cc.primariesEnabled || cc.grayscale.enabled) ? 1.0f : 0.0f;  // useManualCorrection
+        // When MHC profile handles primaries/grayscale at GPU scanout, skip those shader stages
+        bool mhcPrimaries = ctx->isHDREnabled ? ctx->hdrMhcPrimariesActive : ctx->sdrMhcPrimariesActive;
+        bool mhcGrayscale = ctx->isHDREnabled ? ctx->hdrMhcGrayscaleActive : ctx->sdrMhcGrayscaleActive;
+        bool shaderPrimaries = cc.primariesEnabled && !mhcPrimaries;
+        bool shaderGrayscale = cc.grayscale.enabled && !mhcGrayscale;
+        cbData[7] = (shaderPrimaries || shaderGrayscale) ? 1.0f : 0.0f;  // useManualCorrection
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
-        cbData[9] = cc.grayscale.enabled ? 1.0f : 0.0f;
+        cbData[9] = shaderGrayscale ? 1.0f : 0.0f;
         cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled) ? 1.0f : 0.0f;  // tonemapEnabled
         cbData[11] = (float)static_cast<int>(cc.tonemap.curve);  // tonemapCurve
         // Row 3-5: Primaries matrix (3 rows as float4, w unused)
-        cbData[12] = cc.primariesMatrix[0];
-        cbData[13] = cc.primariesMatrix[1];
-        cbData[14] = cc.primariesMatrix[2];
-        cbData[15] = 0.0f;
-        cbData[16] = cc.primariesMatrix[3];
-        cbData[17] = cc.primariesMatrix[4];
-        cbData[18] = cc.primariesMatrix[5];
-        cbData[19] = 0.0f;
-        cbData[20] = cc.primariesMatrix[6];
-        cbData[21] = cc.primariesMatrix[7];
-        cbData[22] = cc.primariesMatrix[8];
-        cbData[23] = 0.0f;
+        // When MHC handles primaries at GPU scanout, use identity matrix to avoid double-correction
+        if (mhcPrimaries) {
+            cbData[12] = 1.0f; cbData[13] = 0.0f; cbData[14] = 0.0f; cbData[15] = 0.0f;
+            cbData[16] = 0.0f; cbData[17] = 1.0f; cbData[18] = 0.0f; cbData[19] = 0.0f;
+            cbData[20] = 0.0f; cbData[21] = 0.0f; cbData[22] = 1.0f; cbData[23] = 0.0f;
+        } else {
+            cbData[12] = cc.primariesMatrix[0];
+            cbData[13] = cc.primariesMatrix[1];
+            cbData[14] = cc.primariesMatrix[2];
+            cbData[15] = 0.0f;
+            cbData[16] = cc.primariesMatrix[3];
+            cbData[17] = cc.primariesMatrix[4];
+            cbData[18] = cc.primariesMatrix[5];
+            cbData[19] = 0.0f;
+            cbData[20] = cc.primariesMatrix[6];
+            cbData[21] = cc.primariesMatrix[7];
+            cbData[22] = cc.primariesMatrix[8];
+            cbData[23] = 0.0f;
+        }
         // Row 6: Tonemapping parameters
         cbData[24] = cc.tonemap.sourcePeakNits;  // tonemapSourcePeak
         cbData[25] = cc.tonemap.targetPeakNits;
         cbData[26] = cc.tonemap.dynamicPeak ? 1.0f : 0.0f;  // tonemapDynamic
-        cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24 (SDR 2.2->2.4 transform)
+        cbData[27] = (cc.grayscale.use24Gamma && !mhcGrayscale) ? 1.0f : 0.0f;  // grayscale24 (skip if MHC handles it)
         // Row 7: Grayscale peak + padding (white balance now handled by Bradford in primaries matrix)
         cbData[28] = cc.grayscale.peakNits;  // grayscalePeakNits (HDR only)
-        cbData[29] = 0.0f;  // padding
+        cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
         cbData[30] = 0.0f;  // padding
         cbData[31] = 0.0f;  // padding
         // Row 8-15: Grayscale LUT (32 points packed into 8 float4s)
@@ -1272,15 +1286,37 @@ void RenderAll() {
     if (g_hasPendingColorCorrections.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
         for (const auto& update : g_pendingColorCorrections) {
-            if (update.monitorIndex >= 0 && update.monitorIndex < (int)g_monitors.size()) {
-                auto& ctx = g_monitors[update.monitorIndex];
-                if (update.isHDR) {
-                    ctx.hdrColorCorrection = update.data;
-                    // HDR metadata (MaxCLL=10000) is set once at swapchain creation
-                    // and doesn't change based on color correction settings
-                } else {
-                    ctx.sdrColorCorrection = update.data;
+            bool matched = false;
+            // Match by ctx.index (GUI monitor index), not vector position
+            for (auto& ctx : g_monitors) {
+                if (ctx.index == update.monitorIndex) {
+                    if (update.isHDR) {
+                        ctx.hdrColorCorrection = update.data;
+                    } else {
+                        ctx.sdrColorCorrection = update.data;
+                    }
+                    // MHC live preview: clear all suppress flags so shader applies corrections
+                    if (update.clearMhcFlags) {
+                        ctx.sdrMhcPrimariesActive = false;
+                        ctx.sdrMhcGrayscaleActive = false;
+                        ctx.hdrMhcPrimariesActive = false;
+                        ctx.hdrMhcGrayscaleActive = false;
+                    }
+                    std::cout << "[Render] Applied CC: mon=" << ctx.index
+                              << " isHDR=" << update.isHDR
+                              << " mhcPrim=" << (ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive : ctx.sdrMhcPrimariesActive)
+                              << " mhcGs=" << (ctx.isHDREnabled ? ctx.hdrMhcGrayscaleActive : ctx.sdrMhcGrayscaleActive)
+                              << " primEn=" << update.data.primariesEnabled
+                              << " gsEn=" << update.data.grayscale.enabled
+                              << " clearMhc=" << update.clearMhcFlags
+                              << std::endl;
+                    matched = true;
+                    break;
                 }
+            }
+            if (!matched) {
+                std::cout << "[Render] DROPPED CC: mon=" << update.monitorIndex
+                          << " (no matching ctx, g_monitors.size=" << g_monitors.size() << ")" << std::endl;
             }
         }
         g_pendingColorCorrections.clear();

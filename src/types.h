@@ -14,6 +14,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <functional>
 
 // ============================================================================
 // Control IDs
@@ -41,61 +42,42 @@
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
 
-// Tab control and color correction control IDs
+// Tab control
 #define ID_TAB_CONTROL      200
 
-// SDR Options (Tab 1) control IDs
-#define ID_SDR_PRIMARIES_ENABLE 201
-#define ID_SDR_PRIMARIES_PRESET 202
-#define ID_SDR_PRIMARIES_RX     203
-#define ID_SDR_PRIMARIES_RY     204
-#define ID_SDR_PRIMARIES_GX     205
-#define ID_SDR_PRIMARIES_GY     206
-#define ID_SDR_PRIMARIES_BX     207
-#define ID_SDR_PRIMARIES_BY     208
-#define ID_SDR_PRIMARIES_WX     209
-#define ID_SDR_PRIMARIES_WY     210
-#define ID_SDR_GRAYSCALE_ENABLE 211
-#define ID_SDR_GRAYSCALE_10     212
-#define ID_SDR_GRAYSCALE_20     213
-#define ID_SDR_GRAYSCALE_32     214
-#define ID_SDR_GRAYSCALE_EDIT   215
-#define ID_SDR_GRAYSCALE_RESET  216
-#define ID_SDR_GRAYSCALE_24     218
-#define ID_SDR_PRIMARIES_DETECT 217
+// SDR/HDR toggle (main window, between monitor list and tabs)
+#define ID_SDR_HDR_TOGGLE   500
 
-// HDR Options (Tab 2) control IDs
-#define ID_HDR_PRIMARIES_ENABLE 301
-#define ID_HDR_PRIMARIES_PRESET 302
-#define ID_HDR_PRIMARIES_RX     303
-#define ID_HDR_PRIMARIES_RY     304
-#define ID_HDR_PRIMARIES_GX     305
-#define ID_HDR_PRIMARIES_GY     306
-#define ID_HDR_PRIMARIES_BX     307
-#define ID_HDR_PRIMARIES_BY     308
-#define ID_HDR_PRIMARIES_WX     309
-#define ID_HDR_PRIMARIES_WY     310
-#define ID_HDR_GRAYSCALE_ENABLE 311
-#define ID_HDR_GRAYSCALE_10     312
-#define ID_HDR_GRAYSCALE_20     313
-#define ID_HDR_GRAYSCALE_32     314
-#define ID_HDR_GRAYSCALE_EDIT   315
-#define ID_HDR_GRAYSCALE_RESET  316
-#define ID_HDR_GRAYSCALE_PEAK   317
-#define ID_HDR_PRIMARIES_DETECT 318
+// Unified Corrections tab control IDs (repopulated on SDR/HDR toggle)
+#define ID_CORR_PRIMARIES_ENABLE 501
+#define ID_CORR_PRIMARIES_WX     509
+#define ID_CORR_PRIMARIES_WY     510
+#define ID_CORR_GRAYSCALE_ENABLE 512
+#define ID_CORR_GRAYSCALE_10     513
+#define ID_CORR_GRAYSCALE_20     514
+#define ID_CORR_GRAYSCALE_32     515
+#define ID_CORR_GRAYSCALE_EDIT   516
+#define ID_CORR_GRAYSCALE_RESET  517
+#define ID_CORR_GRAYSCALE_24     518  // SDR only: 2.4 gamma checkbox
+#define ID_CORR_GRAYSCALE_PEAK   519  // HDR only: peak nits edit
 
-// HDR Tonemapping control IDs
-#define ID_HDR_TONEMAP_ENABLE   320
-#define ID_HDR_TONEMAP_CURVE    321
-#define ID_HDR_TONEMAP_TARGET   323
-#define ID_HDR_TONEMAP_DYNAMIC  324
-#define ID_HDR_TONEMAP_SOURCE   325
+// HDR Tonemapping control IDs (Corrections tab, HDR only)
+#define ID_CORR_TONEMAP_ENABLE   520
+#define ID_CORR_TONEMAP_CURVE    521
+#define ID_CORR_TONEMAP_TARGET   522
+#define ID_CORR_TONEMAP_SOURCE   523
+#define ID_CORR_TONEMAP_DYNAMIC  524
 
-// MaxTML (Display Peak Luminance) control IDs
-#define ID_HDR_MAXTML_ENABLE    330
-#define ID_HDR_MAXTML_COMBO     331
-#define ID_HDR_MAXTML_EDIT      332
-#define ID_HDR_MAXTML_APPLY     333
+// MaxTML (Display Peak Luminance) control IDs (Corrections tab, HDR only)
+#define ID_CORR_MAXTML_ENABLE    525
+#define ID_CORR_MAXTML_COMBO     526
+#define ID_CORR_MAXTML_EDIT      527
+#define ID_CORR_MAXTML_APPLY     528
+
+// Unified MHC Hardware Calibration control IDs (MHC tab)
+#define ID_MHC_TAB_APPLY    551
+#define ID_MHC_TAB_REMOVE   552
+#define ID_MHC_TAB_EDIT     553
 
 // Settings tab (Tab 3) control IDs
 #define ID_SETTINGS_HOTKEY_GAMMA_CHECK    401
@@ -107,6 +89,34 @@
 #define ID_SETTINGS_LOG_PEAK              407
 #define ID_SETTINGS_VRR_WHITELIST_CHECK   408
 #define ID_SETTINGS_VRR_WHITELIST_BTN     409
+
+// MHC Settings dialog control IDs
+#define ID_MHC_PRIMARIES_ENABLE  7001
+#define ID_MHC_PRIMARIES_PRESET  7002
+#define ID_MHC_PRIMARIES_DETECT  7003
+#define ID_MHC_PRIMARIES_RX      7004
+#define ID_MHC_PRIMARIES_RY      7005
+#define ID_MHC_PRIMARIES_GX      7006
+#define ID_MHC_PRIMARIES_GY      7007
+#define ID_MHC_PRIMARIES_BX      7008
+#define ID_MHC_PRIMARIES_BY      7009
+#define ID_MHC_PRIMARIES_WX      7010
+#define ID_MHC_PRIMARIES_WY      7011
+#define ID_MHC_GRAYSCALE_ENABLE  7012
+#define ID_MHC_GRAYSCALE_10      7013
+#define ID_MHC_GRAYSCALE_20      7014
+#define ID_MHC_GRAYSCALE_32      7015
+#define ID_MHC_GRAYSCALE_EDIT    7016
+#define ID_MHC_GRAYSCALE_RESET   7017
+#define ID_MHC_GRAYSCALE_24      7018
+#define ID_MHC_GRAYSCALE_PEAK    7019
+#define ID_MHC_OK                7020
+#define ID_MHC_CANCEL            7021
+#define ID_MHC_FILE_PATH         7022
+#define ID_MHC_FILE_BROWSE       7023
+// IDs 7024-7025 were Extract buttons (removed)
+// ID 7026 was ID_MHC_GRAYSCALE_STANDARD (removed)
+#define ID_MHC_FILE_CLEAR        7027
 
 // Grayscale editor control IDs
 #define ID_GRAYSCALE_OK     5001
@@ -271,6 +281,7 @@ struct MonitorContext {
     DXGI_FORMAT captureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     bool isHDREnabled = false;
     bool isHDRCapable = false;
+    bool isFP16SDR = false;  // ACM: FP16 capture but SDR color space (input is linear scRGB at 80 nits)
     bool wasHDREnabled = false;  // Track previous HDR state for mode change detection
     float maxDisplayNits = 1000.0f;
 
@@ -336,6 +347,12 @@ struct MonitorContext {
     // Manual color correction settings (separate for SDR and HDR)
     ColorCorrectionData sdrColorCorrection;
     ColorCorrectionData hdrColorCorrection;
+
+    // MHC profile active flags (set during init, skip shader stages when MHC handles them)
+    bool sdrMhcPrimariesActive = false;   // MHC handles SDR primaries at GPU scanout
+    bool sdrMhcGrayscaleActive = false;   // MHC handles SDR grayscale at GPU scanout
+    bool hdrMhcPrimariesActive = false;   // MHC handles HDR primaries at GPU scanout
+    bool hdrMhcGrayscaleActive = false;   // MHC handles HDR grayscale at GPU scanout
 };
 
 // Per-monitor LUT configuration from command line
@@ -357,6 +374,7 @@ struct PendingColorCorrection {
     int monitorIndex;
     bool isHDR;  // true = update HDR settings, false = update SDR settings
     ColorCorrectionData data;
+    bool clearMhcFlags = false;  // When true, render thread clears all MHC suppress flags (for live preview)
 };
 
 // Grayscale correction settings for GUI (uses vector)
@@ -413,6 +431,28 @@ struct ColorCorrectionSettings {
     TonemapSettings tonemap;  // HDR tonemapping (only used in HDR mode)
 };
 
+// MHC profile state (per-monitor, per-mode)
+// MHC is the foundation calibration layer with its own primaries and grayscale,
+// separate from the shader's post-correction primaries.
+struct MHCSettings {
+    bool enabled = false;              // User wants MHC active for this monitor
+    std::wstring profilePath;          // Full path to generated .icm file
+    std::wstring profileName;          // Filename only (for ICC API)
+
+    // Source ICC/Cube file path (if set, profile was generated from this file)
+    // When non-empty, primaries + TRC come from the file, not manual editors
+    std::wstring sourceFilePath;
+    bool hasPerChannelTRC = false;     // True if installed profile uses per-channel TRC from ICC
+
+    // MHC's own display primaries (detected from EDID or manually entered)
+    bool primariesEnabled = false;
+    int primariesPreset = 0;           // Index into g_presetPrimaries (0=sRGB default)
+    DisplayPrimaries customPrimaries = { 0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3127f, 0.3290f, L"Custom" };
+
+    // MHC's own grayscale correction
+    GrayscaleSettings grayscale;
+};
+
 // Per-monitor settings for persistence
 struct MonitorSettings {
     std::wstring sdrPath;
@@ -420,6 +460,8 @@ struct MonitorSettings {
     ColorCorrectionSettings sdrColorCorrection;  // Color correction for SDR mode
     ColorCorrectionSettings hdrColorCorrection;  // Color correction for HDR mode
     MaxTmlSettings maxTml;                       // Display Peak Override settings
+    MHCSettings sdrMHC;                          // MHC profile for SDR mode
+    MHCSettings hdrMHC;                          // MHC profile for HDR mode
 };
 
 // GUI state
@@ -447,69 +489,66 @@ struct GUIState {
     HWND hwndTab = nullptr;
     int currentTab = 0;
 
-    // SDR color correction controls (Tab 1)
-    HWND hwndSdrPrimariesEnable = nullptr;
-    HWND hwndSdrPrimariesPreset = nullptr;
-    HWND hwndSdrPrimariesRx = nullptr;
-    HWND hwndSdrPrimariesRy = nullptr;
-    HWND hwndSdrPrimariesGx = nullptr;
-    HWND hwndSdrPrimariesGy = nullptr;
-    HWND hwndSdrPrimariesBx = nullptr;
-    HWND hwndSdrPrimariesBy = nullptr;
-    HWND hwndSdrPrimariesWx = nullptr;
-    HWND hwndSdrPrimariesWy = nullptr;
-    HWND hwndSdrGrayscaleEnable = nullptr;
-    HWND hwndSdrGrayscale10 = nullptr;
-    HWND hwndSdrGrayscale20 = nullptr;
-    HWND hwndSdrGrayscale32 = nullptr;
-    HWND hwndSdrGrayscale24 = nullptr;
-    HWND hwndSdrGrayscaleEdit = nullptr;
-    HWND hwndSdrGrayscaleReset = nullptr;
+    // SDR/HDR toggle switch (main window, between monitor list and tabs)
+    HWND hwndToggle = nullptr;
+    bool sdrHdrToggleHDR = false;  // false = SDR selected, true = HDR selected
 
-    // HDR color correction controls (Tab 2)
-    HWND hwndHdrPrimariesEnable = nullptr;
-    HWND hwndHdrPrimariesPreset = nullptr;
-    HWND hwndHdrPrimariesRx = nullptr;
-    HWND hwndHdrPrimariesRy = nullptr;
-    HWND hwndHdrPrimariesGx = nullptr;
-    HWND hwndHdrPrimariesGy = nullptr;
-    HWND hwndHdrPrimariesBx = nullptr;
-    HWND hwndHdrPrimariesBy = nullptr;
-    HWND hwndHdrPrimariesWx = nullptr;
-    HWND hwndHdrPrimariesWy = nullptr;
-    HWND hwndHdrGrayscaleEnable = nullptr;
-    HWND hwndHdrGrayscale10 = nullptr;
-    HWND hwndHdrGrayscale20 = nullptr;
-    HWND hwndHdrGrayscale32 = nullptr;
-    HWND hwndHdrGrayscaleEdit = nullptr;
-    HWND hwndHdrGrayscaleReset = nullptr;
-    HWND hwndHdrGrayscalePeak = nullptr;
+    // White Point controls (Corrections tab, repopulated on SDR/HDR toggle)
+    HWND hwndPrimariesEnable = nullptr;
+    HWND hwndPrimariesWx = nullptr;
+    HWND hwndPrimariesWy = nullptr;
+    HWND hwndGrayscaleEnable = nullptr;
+    HWND hwndGrayscale10 = nullptr;
+    HWND hwndGrayscale20 = nullptr;
+    HWND hwndGrayscale32 = nullptr;
+    HWND hwndGrayscale24 = nullptr;        // SDR only: 2.4 gamma checkbox
+    HWND hwndGrayscaleEdit = nullptr;
+    HWND hwndGrayscaleReset = nullptr;
+    HWND hwndGrayscalePeak = nullptr;       // HDR only: peak nits edit
+    HWND hwndGrayscalePeakLabel = nullptr;  // HDR only: "Peak:" label
 
-    // HDR Tonemapping controls (Tab 2)
-    HWND hwndHdrTonemapEnable = nullptr;
-    HWND hwndHdrTonemapCurve = nullptr;
-    HWND hwndHdrTonemapTarget = nullptr;
-    HWND hwndHdrTonemapSource = nullptr;
-    HWND hwndHdrTonemapDynamic = nullptr;
+    // Tonemapping controls (Corrections tab, HDR only)
+    HWND hwndTonemapEnable = nullptr;
+    HWND hwndTonemapCurve = nullptr;
+    HWND hwndTonemapTarget = nullptr;
+    HWND hwndTonemapSource = nullptr;
+    HWND hwndTonemapDynamic = nullptr;
 
-    // MaxTML controls (Tab 2)
-    HWND hwndHdrMaxTmlEnable = nullptr;
-    HWND hwndHdrMaxTmlCombo = nullptr;
-    HWND hwndHdrMaxTmlEdit = nullptr;
-    HWND hwndHdrMaxTmlApply = nullptr;
+    // MaxTML controls (Corrections tab, HDR only)
+    HWND hwndMaxTmlEnable = nullptr;
+    HWND hwndMaxTmlCombo = nullptr;
+    HWND hwndMaxTmlEdit = nullptr;
+    HWND hwndMaxTmlApply = nullptr;
+
+    // Unified MHC Hardware Calibration controls (MHC tab)
+    HWND hwndMhcApply = nullptr;
+    HWND hwndMhcRemove = nullptr;
+    HWND hwndMhcEdit = nullptr;
+    HWND hwndMhcStatus = nullptr;
+    HWND hwndMhcIccCoords[8] = {};  // Read-only RGBW xy boxes (Rx,Ry,Gx,Gy,Bx,By,Wx,Wy)
+    HWND hwndMhcTrcLabel = nullptr;  // "TRC" indicator shown when per-channel TRC active
+
+    // HDR-only controls on Corrections tab (for show/hide + reflow)
+    // Groupbox HWNDs that need show/hide on toggle
+    HWND hwndTonemapGroup = nullptr;
+    HWND hwndMaxTmlGroup = nullptr;
+    // All HDR-only controls (hidden in SDR mode)
+    std::vector<HWND> hdrOnlyControls;
+    // SDR-only controls (hidden in HDR mode)
+    std::vector<HWND> sdrOnlyControls;
 
     // Scrollable panels for each tab
     HWND hwndScrollPanel[4] = { nullptr, nullptr, nullptr, nullptr };
     int scrollPos[4] = { 0, 0, 0, 0 };           // Current scroll position per tab
     int contentHeight[4] = { 0, 0, 0, 0 };       // Total content height per tab
 
-    // Tab 0 controls (LUT Settings - to show/hide)
+    // Tab 0 controls (MHC - to show/hide)
     std::vector<HWND> tab0Controls;
     std::vector<int> tab0OriginalY;   // Original Y positions for scroll
-    // Tab 1 controls (SDR Options)
+    // Tab 1 controls (3D LUT)
     std::vector<HWND> tab1Controls;
     std::vector<int> tab1OriginalY;
-    // Tab 2 controls (HDR Options)
+    // Tab 2 controls (Corrections)
     std::vector<HWND> tab2Controls;
     std::vector<int> tab2OriginalY;
     // Tab 3 controls (Settings)
@@ -541,6 +580,7 @@ struct GrayscaleEditorData {
     bool updatingFromEdit = false;
     bool isHDR = false;      // true if editing HDR grayscale, false for SDR
     float peakNits = 10000.0f;  // HDR peak for label calculation (must match ColourSpace target)
+    std::function<void()> liveUpdateCallback;  // If set, called instead of UpdateColorCorrectionLive
 };
 
 // ============================================================================

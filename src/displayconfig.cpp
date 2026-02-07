@@ -94,6 +94,7 @@ bool EnumerateDisplaysForMaxTml(std::vector<DisplayInfo>& displays) {
         info.devicePath = targetName.monitorDevicePath;
         info.adapterId = path.targetInfo.adapterId;
         info.targetId = path.targetInfo.id;
+        info.sourceId = path.sourceInfo.id;
         info.currentMaxTml = 0.0f;  // Can't easily read current value
         info.isHdrCapable = isHdrCapable;
 

@@ -167,6 +167,21 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         ctx.sdrColorCorrection = config.sdrColorCorrection;
         ctx.hdrColorCorrection = config.hdrColorCorrection;
 
+        // Set MHC profile flags to prevent double-correction
+        // When MHC is active at GPU scanout, shader skips those stages
+        // MHC has its own primaries/grayscale (Layer 1), separate from shader corrections (Layer 3)
+        if (config.monitorIndex < (int)g_gui.monitorSettings.size()) {
+            const auto& ms = g_gui.monitorSettings[config.monitorIndex];
+            ctx.sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
+                && ms.sdrMHC.primariesEnabled;
+            ctx.sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
+                && ms.sdrMHC.grayscale.enabled;
+            ctx.hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
+                && ms.hdrMHC.primariesEnabled;
+            ctx.hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
+                && ms.hdrMHC.grayscale.enabled;
+        }
+
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfo(ctx.monitor, &mi);
         ctx.width = mi.rcMonitor.right - mi.rcMonitor.left;
@@ -507,39 +522,11 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR) {
     g_hasPendingColorCorrections.store(true, std::memory_order_release);
 }
 
-// Helper to compare primaries (DisplayPrimariesData vs DisplayPrimaries)
-static bool PrimariesChanged(const DisplayPrimariesData& a, const DisplayPrimaries& b) {
-    const float eps = 0.0001f;
-    return fabsf(a.Rx - b.Rx) > eps || fabsf(a.Ry - b.Ry) > eps ||
-           fabsf(a.Gx - b.Gx) > eps || fabsf(a.Gy - b.Gy) > eps ||
-           fabsf(a.Bx - b.Bx) > eps || fabsf(a.By - b.By) > eps ||
-           fabsf(a.Wx - b.Wx) > eps || fabsf(a.Wy - b.Wy) > eps;
-}
-
-// Helper to get primaries from edit boxes
-static DisplayPrimariesData GetPrimariesFromEditBoxes(bool isHDR) {
-    DisplayPrimariesData p = {};
+// Helper to get white point from edit boxes
+static void GetWhitePointFromEditBoxes(float& Wx, float& Wy) {
     wchar_t buf[16];
-    if (isHDR) {
-        if (g_gui.hwndHdrPrimariesRx) { GetWindowText(g_gui.hwndHdrPrimariesRx, buf, 16); p.Rx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesRy) { GetWindowText(g_gui.hwndHdrPrimariesRy, buf, 16); p.Ry = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesGx) { GetWindowText(g_gui.hwndHdrPrimariesGx, buf, 16); p.Gx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesGy) { GetWindowText(g_gui.hwndHdrPrimariesGy, buf, 16); p.Gy = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesBx) { GetWindowText(g_gui.hwndHdrPrimariesBx, buf, 16); p.Bx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesBy) { GetWindowText(g_gui.hwndHdrPrimariesBy, buf, 16); p.By = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesWx) { GetWindowText(g_gui.hwndHdrPrimariesWx, buf, 16); p.Wx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesWy) { GetWindowText(g_gui.hwndHdrPrimariesWy, buf, 16); p.Wy = (float)_wtof(buf); }
-    } else {
-        if (g_gui.hwndSdrPrimariesRx) { GetWindowText(g_gui.hwndSdrPrimariesRx, buf, 16); p.Rx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesRy) { GetWindowText(g_gui.hwndSdrPrimariesRy, buf, 16); p.Ry = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesGx) { GetWindowText(g_gui.hwndSdrPrimariesGx, buf, 16); p.Gx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesGy) { GetWindowText(g_gui.hwndSdrPrimariesGy, buf, 16); p.Gy = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesBx) { GetWindowText(g_gui.hwndSdrPrimariesBx, buf, 16); p.Bx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesBy) { GetWindowText(g_gui.hwndSdrPrimariesBy, buf, 16); p.By = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesWx) { GetWindowText(g_gui.hwndSdrPrimariesWx, buf, 16); p.Wx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesWy) { GetWindowText(g_gui.hwndSdrPrimariesWy, buf, 16); p.Wy = (float)_wtof(buf); }
-    }
-    return p;
+    if (g_gui.hwndPrimariesWx) { GetWindowText(g_gui.hwndPrimariesWx, buf, 16); Wx = (float)_wtof(buf); }
+    if (g_gui.hwndPrimariesWy) { GetWindowText(g_gui.hwndPrimariesWy, buf, 16); Wy = (float)_wtof(buf); }
 }
 
 bool SettingsChanged() {
@@ -553,28 +540,16 @@ bool SettingsChanged() {
         }
     }
 
-    // Check if current monitor's custom primaries have changed from active settings
-    // Only check when Custom preset (5) is selected in the dropdown
+    // Check if current monitor's white point has changed from active settings
     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.activeSettings.size()) {
-        // Check SDR primaries only if Custom preset selected
-        if (g_gui.hwndSdrPrimariesPreset) {
-            int sdrPreset = (int)SendMessage(g_gui.hwndSdrPrimariesPreset, CB_GETCURSEL, 0, 0);
-            if (sdrPreset == 5) {  // Custom preset
-                DisplayPrimariesData sdrFromUI = GetPrimariesFromEditBoxes(false);
-                if (PrimariesChanged(sdrFromUI, g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection.customPrimaries)) {
-                    return true;
-                }
-            }
-        }
-        // Check HDR primaries only if Custom preset selected
-        if (g_gui.hwndHdrPrimariesPreset) {
-            int hdrPreset = (int)SendMessage(g_gui.hwndHdrPrimariesPreset, CB_GETCURSEL, 0, 0);
-            if (hdrPreset == 5) {  // Custom preset
-                DisplayPrimariesData hdrFromUI = GetPrimariesFromEditBoxes(true);
-                if (PrimariesChanged(hdrFromUI, g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection.customPrimaries)) {
-                    return true;
-                }
-            }
+        float Wx = 0.3127f, Wy = 0.3290f;
+        GetWhitePointFromEditBoxes(Wx, Wy);
+        bool isHDR = g_gui.sdrHdrToggleHDR;
+        const auto& activeCC = isHDR ? g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection
+                                     : g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection;
+        if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
+            fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
+            return true;
         }
     }
 

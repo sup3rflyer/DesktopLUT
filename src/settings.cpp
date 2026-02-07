@@ -221,6 +221,124 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
 }
 
+void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
+                      const MHCSettings& mhc, const wchar_t* iniPath) {
+    std::wstring p(prefix);
+    WritePrivateProfileBool(section, (p + L"MHCEnabled").c_str(), mhc.enabled, iniPath);
+    WritePrivateProfileStringW(section, (p + L"MHCProfilePath").c_str(), mhc.profilePath.c_str(), iniPath);
+    WritePrivateProfileStringW(section, (p + L"MHCSourceFile").c_str(), mhc.sourceFilePath.c_str(), iniPath);
+    WritePrivateProfileBool(section, (p + L"MHCPerChannelTRC").c_str(), mhc.hasPerChannelTRC, iniPath);
+
+    // MHC's own primaries settings
+    WritePrivateProfileBool(section, (p + L"MHCPrimariesEnabled").c_str(), mhc.primariesEnabled, iniPath);
+    wchar_t presetBuf[8];
+    swprintf_s(presetBuf, L"%d", mhc.primariesPreset);
+    WritePrivateProfileStringW(section, (p + L"MHCPrimariesPreset").c_str(), presetBuf, iniPath);
+    WritePrivateProfileXY(section, (p + L"MHCPrimariesRed").c_str(),
+        mhc.customPrimaries.Rx, mhc.customPrimaries.Ry, iniPath);
+    WritePrivateProfileXY(section, (p + L"MHCPrimariesGreen").c_str(),
+        mhc.customPrimaries.Gx, mhc.customPrimaries.Gy, iniPath);
+    WritePrivateProfileXY(section, (p + L"MHCPrimariesBlue").c_str(),
+        mhc.customPrimaries.Bx, mhc.customPrimaries.By, iniPath);
+    WritePrivateProfileXY(section, (p + L"MHCPrimariesWhite").c_str(),
+        mhc.customPrimaries.Wx, mhc.customPrimaries.Wy, iniPath);
+
+    // MHC's own grayscale settings
+    WritePrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), mhc.grayscale.enabled, iniPath);
+    wchar_t pointsBuf[8];
+    swprintf_s(pointsBuf, L"%d", mhc.grayscale.pointCount);
+    WritePrivateProfileStringW(section, (p + L"MHCGrayscalePoints").c_str(), pointsBuf, iniPath);
+
+    std::wstring grayscaleData;
+    for (size_t j = 0; j < mhc.grayscale.points.size(); j++) {
+        wchar_t val[16];
+        swprintf_s(val, L"%.4f", mhc.grayscale.points[j]);
+        if (j > 0) grayscaleData += L"; ";
+        grayscaleData += val;
+    }
+    WritePrivateProfileStringW(section, (p + L"MHCGrayscaleData").c_str(), grayscaleData.c_str(), iniPath);
+
+    bool isHDR = (p.find(L"HDR") != std::wstring::npos);
+    if (isHDR) {
+        WritePrivateProfileFloat(section, (p + L"MHCGrayscalePeak").c_str(), mhc.grayscale.peakNits, iniPath);
+    } else {
+        WritePrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), mhc.grayscale.use24Gamma, iniPath);
+    }
+}
+
+void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
+                      MHCSettings& mhc, const wchar_t* iniPath) {
+    std::wstring p(prefix);
+    mhc.enabled = GetPrivateProfileBool(section, (p + L"MHCEnabled").c_str(), false, iniPath);
+
+    wchar_t mhcPath[MAX_PATH] = {};
+    GetPrivateProfileStringW(section, (p + L"MHCProfilePath").c_str(), L"", mhcPath, MAX_PATH, iniPath);
+    mhc.profilePath = mhcPath;
+    // Extract filename
+    std::wstring name = mhc.profilePath;
+    size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    mhc.profileName = name;
+
+    wchar_t srcFile[MAX_PATH] = {};
+    GetPrivateProfileStringW(section, (p + L"MHCSourceFile").c_str(), L"", srcFile, MAX_PATH, iniPath);
+    mhc.sourceFilePath = srcFile;
+    mhc.hasPerChannelTRC = GetPrivateProfileBool(section, (p + L"MHCPerChannelTRC").c_str(), false, iniPath);
+
+    // MHC's own primaries
+    mhc.primariesEnabled = GetPrivateProfileBool(section, (p + L"MHCPrimariesEnabled").c_str(), false, iniPath);
+    int preset = GetPrivateProfileIntW(section, (p + L"MHCPrimariesPreset").c_str(), 0, iniPath);
+    mhc.primariesPreset = (preset >= 0 && preset < g_numPresetPrimaries) ? preset : 0;
+
+    if (!GetPrivateProfileXY(section, (p + L"MHCPrimariesRed").c_str(),
+            mhc.customPrimaries.Rx, mhc.customPrimaries.Ry, iniPath)) {
+        mhc.customPrimaries.Rx = 0.6400f; mhc.customPrimaries.Ry = 0.3300f;
+    }
+    if (!GetPrivateProfileXY(section, (p + L"MHCPrimariesGreen").c_str(),
+            mhc.customPrimaries.Gx, mhc.customPrimaries.Gy, iniPath)) {
+        mhc.customPrimaries.Gx = 0.3000f; mhc.customPrimaries.Gy = 0.6000f;
+    }
+    if (!GetPrivateProfileXY(section, (p + L"MHCPrimariesBlue").c_str(),
+            mhc.customPrimaries.Bx, mhc.customPrimaries.By, iniPath)) {
+        mhc.customPrimaries.Bx = 0.1500f; mhc.customPrimaries.By = 0.0600f;
+    }
+    if (!GetPrivateProfileXY(section, (p + L"MHCPrimariesWhite").c_str(),
+            mhc.customPrimaries.Wx, mhc.customPrimaries.Wy, iniPath)) {
+        mhc.customPrimaries.Wx = 0.3127f; mhc.customPrimaries.Wy = 0.3290f;
+    }
+
+    // MHC's own grayscale
+    bool isHDR = (p.find(L"HDR") != std::wstring::npos);
+    mhc.grayscale.enabled = GetPrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), false, iniPath);
+    int points = GetPrivateProfileIntW(section, (p + L"MHCGrayscalePoints").c_str(), 20, iniPath);
+    mhc.grayscale.pointCount = (points == 10 || points == 20 || points == 32) ? points : 20;
+
+    wchar_t grayscaleData[1024] = {};
+    GetPrivateProfileStringW(section, (p + L"MHCGrayscaleData").c_str(), L"", grayscaleData, 1024, iniPath);
+    mhc.grayscale.points.clear();
+    if (grayscaleData[0] != L'\0') {
+        wchar_t* ctx = nullptr;
+        wchar_t* token = wcstok_s(grayscaleData, L";", &ctx);
+        while (token) {
+            while (*token == L' ' || *token == L'\t') token++;
+            mhc.grayscale.points.push_back((float)_wtof(token));
+            token = wcstok_s(nullptr, L";", &ctx);
+        }
+    }
+    if (mhc.grayscale.points.empty() || (int)mhc.grayscale.points.size() != mhc.grayscale.pointCount) {
+        mhc.grayscale.points.resize(mhc.grayscale.pointCount);
+        if (isHDR) mhc.grayscale.initLinearPQ();
+        else mhc.grayscale.initLinear();
+    }
+
+    if (isHDR) {
+        float peakNits = GetPrivateProfileFloat(section, (p + L"MHCGrayscalePeak").c_str(), 10000.0f, iniPath);
+        mhc.grayscale.peakNits = (peakNits >= 100.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
+    } else {
+        mhc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), false, iniPath);
+    }
+}
+
 // Helper to parse comma-separated whitelist into vector of lowercase exe names
 static void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out) {
     out.clear();
@@ -321,6 +439,10 @@ void SaveSettings() {
         // Save MaxTML settings
         WritePrivateProfileBool(section, L"MaxTmlEnabled", g_gui.monitorSettings[i].maxTml.enabled, iniPath.c_str());
         WritePrivateProfileFloat(section, L"MaxTmlPeak", g_gui.monitorSettings[i].maxTml.peakNits, iniPath.c_str());
+
+        // Save MHC settings (with own primaries and grayscale)
+        SaveMHCSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrMHC, iniPath.c_str());
+        SaveMHCSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrMHC, iniPath.c_str());
     }
 }
 
@@ -384,5 +506,9 @@ void LoadSettings() {
         // Load MaxTML settings
         g_gui.monitorSettings[i].maxTml.enabled = GetPrivateProfileBool(section, L"MaxTmlEnabled", false, iniPath.c_str());
         g_gui.monitorSettings[i].maxTml.peakNits = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath.c_str());
+
+        // Load MHC settings (with own primaries and grayscale)
+        LoadMHCSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrMHC, iniPath.c_str());
+        LoadMHCSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrMHC, iniPath.c_str());
     }
 }

@@ -26,7 +26,8 @@ void RemoveTrayIcon();
 void ShowTrayMenu(HWND hwnd);
 
 // Grayscale editor
-void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR);
+void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR,
+                         std::function<void()> liveUpdateCallback = nullptr);
 LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // Gamma whitelist dialog
