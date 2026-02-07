@@ -61,7 +61,8 @@ SamplerState wrapSampler : register(s2);
 float3 ApplyPrimariesMatrix(float3 rgb) {
     if (useManualCorrection < 0.5) return rgb;
     float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-    return mul(mat, rgb);
+    float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+    return mul(mat, rgb) * wbGains;
 }
 )"
 // Part 2: SDR Grayscale correction functions
@@ -638,19 +639,21 @@ R"(
         // STAGE 1-2: Input handling + primaries (mode-dependent)
         // ═══════════════════════════════════════════════════════════════════════
         if (isFP16SDR > 0.5) {
-            // ACM: input is linear scRGB - primaries in native linear
+            // ACM: input is linear scRGB - primaries + white balance in native linear
             if (useManualCorrection > 0.5) {
                 float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-                input = max(mul(mat, input), 0.0);
+                float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+                input = max(mul(mat, input) * wbGains, 0.0);
             }
             // Encode to gamma for shared gamma-space operations
             input = saturate(pow(max(input, 0.0), 1.0 / 2.2));
         } else {
-            // Legacy: input is gamma-encoded, primaries needs decode/encode
+            // Legacy: input is gamma-encoded, primaries + white balance needs decode/encode
             if (useManualCorrection > 0.5) {
                 float3 lin = pow(max(input, 0.0), 2.2);
                 float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-                lin = max(mul(mat, lin), 0.0);
+                float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+                lin = max(mul(mat, lin) * wbGains, 0.0);
                 input = saturate(pow(lin, 1.0 / 2.2));
             }
         }

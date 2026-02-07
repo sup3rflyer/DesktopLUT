@@ -646,30 +646,8 @@ void ApplyPrimariesChange(bool isHDR) {
     if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) {
         return;
     }
-
-    auto& cc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection
-                     : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
-
-    // White point only mode: RGB primaries match content space, only Wx/Wy differs
-    // This produces a pure Bradford chromatic adaptation matrix
-    DisplayPrimariesData displayPrimaries;
-    displayPrimaries.Rx = cc.customPrimaries.Rx;
-    displayPrimaries.Ry = cc.customPrimaries.Ry;
-    displayPrimaries.Gx = cc.customPrimaries.Gx;
-    displayPrimaries.Gy = cc.customPrimaries.Gy;
-    displayPrimaries.Bx = cc.customPrimaries.Bx;
-    displayPrimaries.By = cc.customPrimaries.By;
-    displayPrimaries.Wx = cc.customPrimaries.Wx;
-    displayPrimaries.Wy = cc.customPrimaries.Wy;
-
-    // sRGB primaries (source content space)
-    DisplayPrimariesData srgb = {
-        0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3127f, 0.3290f
-    };
-
-    CalculatePrimariesMatrix(srgb, displayPrimaries, cc.primariesMatrix);
-
-    // Apply live update if running
+    // Primaries matrix and white balance gains are computed in ConvertColorCorrection()
+    // Just trigger the live update with current stored values
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
     }
@@ -3380,6 +3358,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     wchar_t buf[16];
                     GetWindowText(g_gui.hwndPrimariesWx, buf, 16); cc.customPrimaries.Wx = (float)_wtof(buf);
                     GetWindowText(g_gui.hwndPrimariesWy, buf, 16); cc.customPrimaries.Wy = (float)_wtof(buf);
+                    // Auto-enable primaries correction when white point is edited
+                    cc.primariesEnabled = true;
+                    SendMessage(g_gui.hwndPrimariesEnable, BM_SETCHECK, BST_CHECKED, 0);
                     // Ensure RGB primaries are set to content space defaults
                     cc.primariesPreset = g_numPresetPrimaries - 1;
                     const auto& defaults = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];

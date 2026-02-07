@@ -257,7 +257,8 @@ struct ColorCorrectionData {
     bool primariesEnabled = false;
     int primariesPreset = 0;       // Index into preset list
     DisplayPrimariesData customPrimaries = { 0.64f, 0.33f, 0.30f, 0.60f, 0.15f, 0.06f, 0.3127f, 0.329f };
-    float primariesMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };  // Identity by default (includes Bradford adaptation)
+    float primariesMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };  // Gamut mapping matrix (D65 white for both sides)
+    float whiteBalanceGains[3] = { 1.0f, 1.0f, 1.0f };    // Diagonal RGB gains from white point (von Kries)
     GrayscaleData grayscale;
     TonemapData tonemap;  // HDR tonemapping (only used in HDR mode)
 };

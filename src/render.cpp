@@ -983,43 +983,37 @@ void RenderMonitor(MonitorContext* ctx) {
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
         const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
-        // When MHC profile handles primaries at GPU scanout, skip shader primaries (avoid double-correction)
-        // Grayscale is NOT suppressed: MHC = base calibration, corrections tab = fine-tuning on top
-        bool mhcPrimaries = ctx->isHDREnabled ? ctx->hdrMhcPrimariesActive : ctx->sdrMhcPrimariesActive;
-        bool shaderPrimaries = cc.primariesEnabled && !mhcPrimaries;
+        // MHC primaries and shader primaries are independent layers:
+        // MHC = base calibration at GPU scanout (yearly), shader = fine-tuning on top (anytime)
+        // Same principle as grayscale: both layers can be active simultaneously
+        bool shaderPrimaries = cc.primariesEnabled;
         bool shaderGrayscale = cc.grayscale.enabled;
-        cbData[7] = (shaderPrimaries || shaderGrayscale) ? 1.0f : 0.0f;  // useManualCorrection
+        bool shaderWhiteBalance = (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
+        cbData[7] = (shaderPrimaries || shaderGrayscale || shaderWhiteBalance) ? 1.0f : 0.0f;  // useManualCorrection
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
         cbData[9] = shaderGrayscale ? 1.0f : 0.0f;
         cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled) ? 1.0f : 0.0f;  // tonemapEnabled
         cbData[11] = (float)static_cast<int>(cc.tonemap.curve);  // tonemapCurve
-        // Row 3-5: Primaries matrix (3 rows as float4, w unused)
-        // When MHC handles primaries at GPU scanout, use identity matrix to avoid double-correction
-        if (mhcPrimaries) {
-            cbData[12] = 1.0f; cbData[13] = 0.0f; cbData[14] = 0.0f; cbData[15] = 0.0f;
-            cbData[16] = 0.0f; cbData[17] = 1.0f; cbData[18] = 0.0f; cbData[19] = 0.0f;
-            cbData[20] = 0.0f; cbData[21] = 0.0f; cbData[22] = 1.0f; cbData[23] = 0.0f;
-        } else {
-            cbData[12] = cc.primariesMatrix[0];
-            cbData[13] = cc.primariesMatrix[1];
-            cbData[14] = cc.primariesMatrix[2];
-            cbData[15] = 0.0f;
-            cbData[16] = cc.primariesMatrix[3];
-            cbData[17] = cc.primariesMatrix[4];
-            cbData[18] = cc.primariesMatrix[5];
-            cbData[19] = 0.0f;
-            cbData[20] = cc.primariesMatrix[6];
-            cbData[21] = cc.primariesMatrix[7];
-            cbData[22] = cc.primariesMatrix[8];
-            cbData[23] = 0.0f;
-        }
+        // Row 3-5: Primaries matrix (xyz) + white balance gains (w)
+        cbData[12] = cc.primariesMatrix[0];
+        cbData[13] = cc.primariesMatrix[1];
+        cbData[14] = cc.primariesMatrix[2];
+        cbData[15] = cc.whiteBalanceGains[0];  // R gain
+        cbData[16] = cc.primariesMatrix[3];
+        cbData[17] = cc.primariesMatrix[4];
+        cbData[18] = cc.primariesMatrix[5];
+        cbData[19] = cc.whiteBalanceGains[1];  // G gain
+        cbData[20] = cc.primariesMatrix[6];
+        cbData[21] = cc.primariesMatrix[7];
+        cbData[22] = cc.primariesMatrix[8];
+        cbData[23] = cc.whiteBalanceGains[2];  // B gain
         // Row 6: Tonemapping parameters
         cbData[24] = cc.tonemap.sourcePeakNits;  // tonemapSourcePeak
         cbData[25] = cc.tonemap.targetPeakNits;
         cbData[26] = cc.tonemap.dynamicPeak ? 1.0f : 0.0f;  // tonemapDynamic
         cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24
-        // Row 7: Grayscale peak + padding (white balance now handled by Bradford in primaries matrix)
+        // Row 7: Grayscale peak + ACM flag
         cbData[28] = cc.grayscale.peakNits;  // grayscalePeakNits (HDR only)
         cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
         cbData[30] = 0.0f;  // padding

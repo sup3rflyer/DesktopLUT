@@ -41,53 +41,69 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
     dst.customPrimaries.Wx = src.customPrimaries.Wx;
     dst.customPrimaries.Wy = src.customPrimaries.Wy;
 
-    // Calculate primaries matrix if enabled
-    // SDR: sRGB content → display primaries (gamut mapping for uncalibrated displays)
-    // HDR: Rec.2020 → measured display primaries (correction applied in Rec.2020 space)
+    // === Gamut mapping matrix (primaries only, D65 white for both sides) ===
     if (src.primariesEnabled) {
         const DisplayPrimaries& userPrimRef = (src.primariesPreset == g_numPresetPrimaries - 1)
             ? src.customPrimaries : g_presetPrimaries[src.primariesPreset];
 
-        DisplayPrimariesData srcPrim, tgtPrim;
+        // Content space primaries
+        const auto& contentPrim = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];
 
-        // Two-step approach:
-        // 1. Gamut mapping matrix (direction depends on SDR vs HDR)
-        // White point correction is handled by Bradford adaptation in the primaries matrix
+        // Source: content space + D65 white
+        DisplayPrimariesData srcPrim = { contentPrim.Rx, contentPrim.Ry,
+                                         contentPrim.Gx, contentPrim.Gy,
+                                         contentPrim.Bx, contentPrim.By,
+                                         0.3127f, 0.3290f };  // D65
 
-        // Step 1: Gamut mapping with actual white points
-        // Note: CalculatePrimariesMatrix includes Bradford adaptation when white points differ
-        if (isHDR) {
-            // HDR: Rec.2020 → measured display primaries
-            // Applied AFTER BT.709→Rec.2020 conversion in shader, in linear Rec.2020 space
-            // This corrects the signal so the display (with its actual primaries) shows intended colors
-            srcPrim = { g_presetPrimaries[3].Rx, g_presetPrimaries[3].Ry,  // Rec.2020
-                        g_presetPrimaries[3].Gx, g_presetPrimaries[3].Gy,
-                        g_presetPrimaries[3].Bx, g_presetPrimaries[3].By,
-                        g_presetPrimaries[3].Wx, g_presetPrimaries[3].Wy };
-            tgtPrim = { userPrimRef.Rx, userPrimRef.Ry, userPrimRef.Gx, userPrimRef.Gy,
-                        userPrimRef.Bx, userPrimRef.By,
-                        userPrimRef.Wx, userPrimRef.Wy };  // Display's measured primaries
-        } else {
-            // SDR: sRGB → display primaries
-            // Applied in linear sRGB space before LUT
-            srcPrim = { g_presetPrimaries[0].Rx, g_presetPrimaries[0].Ry,  // sRGB
-                        g_presetPrimaries[0].Gx, g_presetPrimaries[0].Gy,
-                        g_presetPrimaries[0].Bx, g_presetPrimaries[0].By,
-                        g_presetPrimaries[0].Wx, g_presetPrimaries[0].Wy };
-            tgtPrim = { userPrimRef.Rx, userPrimRef.Ry, userPrimRef.Gx, userPrimRef.Gy,
-                        userPrimRef.Bx, userPrimRef.By,
-                        userPrimRef.Wx, userPrimRef.Wy };  // Display primaries with ACTUAL white
-        }
+        // Target: display primaries + D65 white (pure gamut mapping, no white shift)
+        DisplayPrimariesData tgtPrim = { userPrimRef.Rx, userPrimRef.Ry,
+                                         userPrimRef.Gx, userPrimRef.Gy,
+                                         userPrimRef.Bx, userPrimRef.By,
+                                         0.3127f, 0.3290f };  // D65
 
         CalculatePrimariesMatrix(srcPrim, tgtPrim, dst.primariesMatrix);
-
-        // White point adaptation is handled by Bradford chromatic adaptation
-        // inside CalculatePrimariesMatrix() - no separate RGB gains needed
     } else {
-        // Identity matrix (no primaries correction)
+        // Identity matrix (no gamut mapping)
         dst.primariesMatrix[0] = 1; dst.primariesMatrix[1] = 0; dst.primariesMatrix[2] = 0;
         dst.primariesMatrix[3] = 0; dst.primariesMatrix[4] = 1; dst.primariesMatrix[5] = 0;
         dst.primariesMatrix[6] = 0; dst.primariesMatrix[7] = 0; dst.primariesMatrix[8] = 1;
+    }
+
+    // === White balance gains (von Kries diagonal, independent of primaries) ===
+    // Compute RGB gains that shift D65 → target white in content space
+    // gains = contentXYZtoRGB * targetWhiteXYZ
+    {
+        float Wx = src.customPrimaries.Wx;
+        float Wy = src.customPrimaries.Wy;
+        if (Wy < 1e-6f) Wy = 1e-6f;
+        bool isD65 = (fabs(Wx - 0.3127f) < 0.001f && fabs(Wy - 0.3290f) < 0.001f);
+        if (isD65) {
+            dst.whiteBalanceGains[0] = 1.0f;
+            dst.whiteBalanceGains[1] = 1.0f;
+            dst.whiteBalanceGains[2] = 1.0f;
+        } else {
+            // Target white in XYZ (Y=1)
+            float tX = Wx / Wy;
+            float tY = 1.0f;
+            float tZ = (1.0f - Wx - Wy) / Wy;
+            // Content space XYZ-to-RGB matrix (sRGB for SDR, Rec.2020 for HDR)
+            // sRGB XYZ→RGB (IEC 61966-2-1)
+            const float srgbXYZtoRGB[9] = {
+                 3.2404542f, -1.5371385f, -0.4985314f,
+                -0.9692660f,  1.8760108f,  0.0415560f,
+                 0.0556434f, -0.2040259f,  1.0572252f
+            };
+            // Rec.2020 XYZ→RGB
+            const float rec2020XYZtoRGB[9] = {
+                 1.7166512f, -0.3556708f, -0.2533663f,
+                -0.6666844f,  1.6164812f,  0.0157685f,
+                 0.0176399f, -0.0427706f,  0.9421031f
+            };
+            const float* m = isHDR ? rec2020XYZtoRGB : srgbXYZtoRGB;
+            dst.whiteBalanceGains[0] = m[0] * tX + m[1] * tY + m[2] * tZ;
+            dst.whiteBalanceGains[1] = m[3] * tX + m[4] * tY + m[5] * tZ;
+            dst.whiteBalanceGains[2] = m[6] * tX + m[7] * tY + m[8] * tZ;
+        }
     }
 
     // Copy grayscale settings
