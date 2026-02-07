@@ -1845,6 +1845,9 @@ static void MhcSetFileLoadedState(MhcDialogData* d, bool loaded) {
 // Push current MHC settings as temporary shader corrections for live preview
 static void MhcPushLivePreview(MhcDialogData* d) {
     if (!d || !d->livePreview) return;
+    // Skip preview when a file (cube/ICC) is loaded - manual controls are locked
+    // and the extracted data isn't suitable for direct shader preview
+    if (d->fileLoaded) return;
 
     // Check if the current display mode matches the edit mode.
     // SDR corrections don't work in the HDR pipeline and vice versa.
@@ -2051,9 +2054,9 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
 
                 // Lock manual controls - file provides the profile data
+                // No live preview for file-loaded state (Apply generates the ICC profile)
                 MhcSetFileLoadedState(d, true);
                 if (d->hwndFileClear) ShowWindow(d->hwndFileClear, SW_SHOW);
-                MhcPushLivePreview(d);
             }
             return 0;
         }
