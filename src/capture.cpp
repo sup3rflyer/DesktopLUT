@@ -4,6 +4,7 @@
 #include "capture.h"
 #include "globals.h"
 #include "render.h"
+#include "displayconfig.h"
 #include <iostream>
 #include <iomanip>
 
@@ -180,62 +181,24 @@ bool ReinitDesktopDuplication(MonitorContext* ctx) {
 }
 
 void DetectHDRCapability(MonitorContext* ctx, IDXGIOutput* output) {
-    // Create a fresh DXGI factory for up-to-date output metadata.
-    // The output from g_device's adapter has stale data after runtime HDR toggles
-    // because Windows HDR state changes don't propagate to existing DXGI objects.
-    IDXGIFactory1* freshFactory = nullptr;
-    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&freshFactory));
-    if (SUCCEEDED(hr)) {
-        IDXGIAdapter* freshAdapter = nullptr;
-        for (UINT a = 0; freshFactory->EnumAdapters(a, &freshAdapter) != DXGI_ERROR_NOT_FOUND; a++) {
-            IDXGIOutput* freshOutput = nullptr;
-            for (UINT o = 0; freshAdapter->EnumOutputs(o, &freshOutput) != DXGI_ERROR_NOT_FOUND; o++) {
-                DXGI_OUTPUT_DESC desc;
-                freshOutput->GetDesc(&desc);
-                if (desc.Monitor == ctx->monitor) {
-                    IDXGIOutput6* output6 = nullptr;
-                    hr = freshOutput->QueryInterface(IID_PPV_ARGS(&output6));
-                    if (SUCCEEDED(hr)) {
-                        DXGI_OUTPUT_DESC1 desc1;
-                        hr = output6->GetDesc1(&desc1);
-                        if (SUCCEEDED(hr)) {
-                            ctx->isHDRCapable = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-                            ctx->maxDisplayNits = desc1.MaxLuminance;
-
-                            std::cout << "Monitor " << ctx->index << " capabilities:" << std::endl;
-                            std::cout << "  Color space: " << (ctx->isHDRCapable ? "HDR (BT.2020 PQ)" : "SDR (sRGB)") << std::endl;
-                            std::cout << "  Max luminance: " << desc1.MaxLuminance << " nits" << std::endl;
-                            std::cout << "  Max full-frame: " << desc1.MaxFullFrameLuminance << " nits" << std::endl;
-                            std::cout << "  Min luminance: " << desc1.MinLuminance << " nits" << std::endl;
-                        }
-                        output6->Release();
-                    }
-                    freshOutput->Release();
-                    freshAdapter->Release();
-                    freshFactory->Release();
-                    return;
-                }
-                freshOutput->Release();
-            }
-            freshAdapter->Release();
-        }
-        freshFactory->Release();
-    }
-
-    // Fallback: use the passed output (may be stale but better than nothing)
-    IDXGIOutput6* output6 = nullptr;
-    hr = output->QueryInterface(IID_PPV_ARGS(&output6));
-    if (FAILED(hr)) return;
-
+    // Use fresh DXGI factory query to get up-to-date output metadata.
+    // Existing DXGI objects from g_device have stale data after runtime HDR toggles.
     DXGI_OUTPUT_DESC1 desc1;
-    hr = output6->GetDesc1(&desc1);
-    output6->Release();
-    if (FAILED(hr)) return;
+    bool fresh = QueryFreshOutputDesc(ctx->monitor, desc1);
+
+    if (!fresh) {
+        // Fallback: use the passed output (may be stale but better than nothing)
+        IDXGIOutput6* output6 = nullptr;
+        if (FAILED(output->QueryInterface(IID_PPV_ARGS(&output6)))) return;
+        HRESULT hr = output6->GetDesc1(&desc1);
+        output6->Release();
+        if (FAILED(hr)) return;
+    }
 
     ctx->isHDRCapable = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
     ctx->maxDisplayNits = desc1.MaxLuminance;
 
-    std::cout << "Monitor " << ctx->index << " capabilities (fallback):" << std::endl;
+    std::cout << "Monitor " << ctx->index << " capabilities:" << std::endl;
     std::cout << "  Color space: " << (ctx->isHDRCapable ? "HDR (BT.2020 PQ)" : "SDR (sRGB)") << std::endl;
     std::cout << "  Max luminance: " << desc1.MaxLuminance << " nits" << std::endl;
     std::cout << "  Max full-frame: " << desc1.MaxFullFrameLuminance << " nits" << std::endl;

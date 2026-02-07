@@ -4,6 +4,7 @@
 #pragma once
 
 #include <windows.h>
+#include <dxgi1_6.h>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,9 @@ bool SetDisplayMaxTml(const DisplayInfo& display, float nits);
 
 // Get display info for a specific monitor index (matches g_monitors order)
 bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo);
+
+// Query fresh DXGI output descriptor for a monitor (creates new factory to avoid stale data)
+bool QueryFreshOutputDesc(HMONITOR hMonitor, DXGI_OUTPUT_DESC1& outDesc);
 
 // Get/set HDR state for a display
 bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled);

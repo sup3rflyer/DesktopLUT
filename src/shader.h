@@ -627,40 +627,53 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     }
 )"
 // Part 6: Main function - SDR path
+// ACM (FP16 scRGB): linear input → primaries in linear → encode gamma → gamma ops → decode linear
+// Legacy (B8G8R8A8): gamma input → primaries (decode/encode) → gamma ops → gamma output
+// Both share gamma-space operations (grayscale, 2.4 gamma, LUT). No unnecessary roundtrips.
 R"(
     else {
         float3 input = color.rgb;
-        // ACM (Auto Color Management): FP16 capture of SDR content
-        // Input is linear scRGB - encode to gamma 2.2 so the SDR pipeline works as-is
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 1-2: Input handling + primaries (mode-dependent)
+        // ═══════════════════════════════════════════════════════════════════════
         if (isFP16SDR > 0.5) {
-            input = pow(max(input, 0.0), 1.0 / 2.2);
+            // ACM: input is linear scRGB - primaries in native linear
+            if (useManualCorrection > 0.5) {
+                float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
+                input = max(mul(mat, input), 0.0);
+            }
+            // Encode to gamma for shared gamma-space operations
+            input = saturate(pow(max(input, 0.0), 1.0 / 2.2));
+        } else {
+            // Legacy: input is gamma-encoded, primaries needs decode/encode
+            if (useManualCorrection > 0.5) {
+                float3 lin = pow(max(input, 0.0), 2.2);
+                float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
+                lin = max(mul(mat, lin), 0.0);
+                input = saturate(pow(lin, 1.0 / 2.2));
+            }
         }
-        // Primaries matrix operates in linear space
-        // Decode/encode both use 2.2 to match display reality (no gamma curve change)
-        if (useManualCorrection > 0.5) {
-            // Decode with gamma 2.2 (matching display's actual EOTF)
-            float3 lin = pow(max(input, 0.0), 2.2);
-            // Apply primaries matrix in linear space
-            // Includes Bradford chromatic adaptation for white point correction
-            float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-            lin = mul(mat, lin);
-            // Clamp to avoid negative values from out-of-gamut colors
-            lin = max(lin, 0.0);
-            // Encode with gamma 2.2 (same as decode = no gamma change)
-            input = pow(lin, 1.0 / 2.2);
-            // Clamp to valid range after matrix
-            input = saturate(input);
-        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 3: Gamma-space corrections (shared by ACM and legacy)
+        // ═══════════════════════════════════════════════════════════════════════
         input = ApplyGrayscaleCorrection(input);
         input = Apply24Gamma(input);
+
         float3 corrected;
         if (usePassthrough > 0.5) corrected = input;
         else corrected = SampleLUT(input);
-        // ACM: decode back to linear for FP16 swapchain
-        // Perfectly inverts the encode at the start: pow(pow(x, 1/2.2), 2.2) = x
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 4: Output conversion
+        // ═══════════════════════════════════════════════════════════════════════
         if (isFP16SDR > 0.5) {
+            // ACM: FP16 swapchain expects linear - gamma decode
             corrected = pow(max(corrected, 0.0), 2.2);
         }
+        // Legacy: R10G10B10A2 + G22 swapchain - already gamma-encoded
+
         // Dithering
         float2 noiseUV = pos.xy / 64.0;
         float noise = blueNoiseTexture.Sample(wrapSampler, noiseUV);
