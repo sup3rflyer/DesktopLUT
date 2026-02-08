@@ -458,6 +458,8 @@ static bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
                 params.grayscale.enabled = true;
             }
         }
+        // Peak nits is display metadata, needed regardless of file type
+        params.peakNits = mhc.grayscale.peakNits;
     } else if (mhc.grayscale.enabled) {
         params.grayscaleEnabled = true;
         params.grayscale.enabled = true;
@@ -545,17 +547,33 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         }
     }
 
-    // If source file is set, re-read ICC and use per-channel TRC directly
+    // If source file is set, re-read and use per-channel data directly
     if (!mhc.sourceFilePath.empty()) {
-        ICCProfileData icc;
-        if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-            params.hasPerChannelTRC = true;
-            params.trcR = icc.trcR;
-            params.trcG = icc.trcG;
-            params.trcB = icc.trcB;
-            params.grayscaleEnabled = true;
-            params.grayscale.enabled = true;
+        if (mhc.sourceIs1DCube) {
+            // 1D cube: per-channel correction curves used directly as MHC2 LUT
+            std::vector<float> corrR, corrG, corrB;
+            if (Load1DCubeLUT(mhc.sourceFilePath, corrR, corrG, corrB)) {
+                params.hasPrecomputedCorrection = true;
+                params.corrR = std::move(corrR);
+                params.corrG = std::move(corrG);
+                params.corrB = std::move(corrB);
+                params.grayscaleEnabled = true;
+                params.grayscale.enabled = true;
+            }
+        } else {
+            // ICC: per-channel TRC (characterization curves, need inversion)
+            ICCProfileData icc;
+            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+                params.hasPerChannelTRC = true;
+                params.trcR = icc.trcR;
+                params.trcG = icc.trcG;
+                params.trcB = icc.trcB;
+                params.grayscaleEnabled = true;
+                params.grayscale.enabled = true;
+            }
         }
+        // Peak nits is display metadata, needed regardless of file type
+        params.peakNits = mhc.grayscale.peakNits;
     } else if (mhc.grayscale.enabled) {
         params.grayscaleEnabled = true;
         params.grayscale.enabled = true;
@@ -1863,7 +1881,7 @@ static void MhcSetFileLoadedState(MhcDialogData* d, bool loaded) {
     if (d->hwndGs10) EnableWindow(d->hwndGs10, gsEnable);
     if (d->hwndGs20) EnableWindow(d->hwndGs20, gsEnable);
     if (d->hwndGs32) EnableWindow(d->hwndGs32, gsEnable);
-    if (d->hwndGsPeak) EnableWindow(d->hwndGsPeak, gsEnable);
+    // Peak nits stays enabled - it's display metadata for HDR, not a grayscale correction
     if (d->hwndGrayscaleReset) EnableWindow(d->hwndGrayscaleReset, gsEnable);
     HWND hwndEdit = GetDlgItem(d->hwndDialog, ID_MHC_GRAYSCALE_EDIT);
     if (hwndEdit) EnableWindow(hwndEdit, gsEnable);
