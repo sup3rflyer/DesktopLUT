@@ -1834,31 +1834,38 @@ static void MhcSaveCustomFromFields(MhcDialogData* d) {
     GetWindowText(d->hwndWy, buf, 16); cp.Wy = (float)_wtof(buf);
 }
 
-// Enable/disable manual controls based on whether a file provides the profile data
+// Enable/disable manual controls based on what data the loaded file provides
+// 1D cube: only provides TRC → lock grayscale, leave primaries unlocked
+// ICC with primaries+TRC: lock both
+// ICC with primaries only: lock primaries, leave grayscale unlocked
+// ICC with TRC only: lock grayscale, leave primaries unlocked
 static void MhcSetFileLoadedState(MhcDialogData* d, bool loaded) {
     d->fileLoaded = loaded;
-    BOOL enable = loaded ? FALSE : TRUE;
-    // Primaries controls
-    if (d->hwndPreset) EnableWindow(d->hwndPreset, enable);
-    // Coordinate fields are already managed by MhcUpdatePrimariesFields for custom vs preset,
-    // but when file is loaded, all should be disabled
-    EnableWindow(d->hwndRx, enable); EnableWindow(d->hwndRy, enable);
-    EnableWindow(d->hwndGx, enable); EnableWindow(d->hwndGy, enable);
-    EnableWindow(d->hwndBx, enable); EnableWindow(d->hwndBy, enable);
-    EnableWindow(d->hwndWx, enable); EnableWindow(d->hwndWy, enable);
-    // Gamma controls
-    if (d->hwndGs10) EnableWindow(d->hwndGs10, enable);
-    if (d->hwndGs20) EnableWindow(d->hwndGs20, enable);
-    if (d->hwndGs32) EnableWindow(d->hwndGs32, enable);
-    if (d->hwndGsPeak) EnableWindow(d->hwndGsPeak, enable);
-    if (d->hwndGrayscaleReset) EnableWindow(d->hwndGrayscaleReset, enable);
-    // Detect button
-    // Find Detect button by control ID
+
+    // Determine what the file provides
+    bool filePrimaries = loaded && d->hasLoadedICC && d->loadedICC.hasPrimaries;
+    bool fileTRC = loaded && (d->loadedFileIs1DCube || (d->hasLoadedICC && d->loadedICC.hasTRC));
+
+    BOOL primEnable = filePrimaries ? FALSE : TRUE;
+    BOOL gsEnable = fileTRC ? FALSE : TRUE;
+
+    // Primaries controls - only lock when file provides primaries
+    if (d->hwndPreset) EnableWindow(d->hwndPreset, primEnable);
+    EnableWindow(d->hwndRx, primEnable); EnableWindow(d->hwndRy, primEnable);
+    EnableWindow(d->hwndGx, primEnable); EnableWindow(d->hwndGy, primEnable);
+    EnableWindow(d->hwndBx, primEnable); EnableWindow(d->hwndBy, primEnable);
+    EnableWindow(d->hwndWx, primEnable); EnableWindow(d->hwndWy, primEnable);
     HWND hwndDetect = GetDlgItem(d->hwndDialog, ID_MHC_PRIMARIES_DETECT);
-    if (hwndDetect) EnableWindow(hwndDetect, enable);
-    // Edit Points button - also disable when file loaded
+    if (hwndDetect) EnableWindow(hwndDetect, primEnable);
+
+    // Gamma controls - only lock when file provides TRC
+    if (d->hwndGs10) EnableWindow(d->hwndGs10, gsEnable);
+    if (d->hwndGs20) EnableWindow(d->hwndGs20, gsEnable);
+    if (d->hwndGs32) EnableWindow(d->hwndGs32, gsEnable);
+    if (d->hwndGsPeak) EnableWindow(d->hwndGsPeak, gsEnable);
+    if (d->hwndGrayscaleReset) EnableWindow(d->hwndGrayscaleReset, gsEnable);
     HWND hwndEdit = GetDlgItem(d->hwndDialog, ID_MHC_GRAYSCALE_EDIT);
-    if (hwndEdit) EnableWindow(hwndEdit, enable);
+    if (hwndEdit) EnableWindow(hwndEdit, gsEnable);
 }
 
 // Push current MHC settings as temporary shader corrections for live preview
@@ -2118,6 +2125,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         wchar_t buf[64];
                         swprintf_s(buf, L"\n  TRC R/G/B (%d points per channel)", sz);
                         msg += buf;
+                        msg += L"\n\nNote: 1D cube files don't contain primaries.\nUse Detect or enter them manually.";
                     } else if (d->hasLoadedICC) {
                         if (d->loadedICC.hasPrimaries)
                             msg += L"\n  Primaries (R/G/B/W chromaticity)";
