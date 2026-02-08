@@ -265,21 +265,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
             continue;
         }
 
-        // Check if we have any HDR processing to do
-        bool hasHdrColorCorrection = ctx.hdrColorCorrection.primariesEnabled ||
-                                     ctx.hdrColorCorrection.grayscale.enabled ||
-                                     ctx.hdrColorCorrection.tonemap.enabled;
-
-        if (ctx.isHDREnabled && !hasHDRLUT && !hasHdrColorCorrection) {
-            SetStatus(L"HDR mode requires HDR LUT or color correction");
-            ReleaseMonitorD3DResources(&ctx);
-            DestroyWindow(ctx.hwnd);
-            continue;
-        }
-
         // Set passthrough mode if no applicable LUT for current mode
+        // Overlay still runs for live color corrections, desktop gamma, MHC profiles, etc.
         if (ctx.isHDREnabled) {
-            ctx.usePassthrough = !hasHDRLUT;
+            ctx.usePassthrough = (ctx.lutSRV_HDR == nullptr && !hasHDRLUT);
         }
 
         if (!CreateSwapChain(&ctx)) {

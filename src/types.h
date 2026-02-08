@@ -134,6 +134,8 @@
 // ============================================================================
 
 const int OSD_TIMER_ID = 100;
+const int HDR_REINIT_TIMER_ID = 101;  // Delayed reinit after hotkey HDR toggle
+const int HDR_REINIT_DELAY_MS = 1000; // Wait for Windows to complete HDR transition
 const int OSD_DURATION_MS = 3000;
 const int WATCHDOG_TIMEOUT_SECONDS = 5;
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear

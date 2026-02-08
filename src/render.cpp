@@ -737,7 +737,11 @@ bool RecreateSwapchain(MonitorContext* ctx) {
 }
 
 // Reapply MHC ICC profiles after HDR/SDR mode switch
-// Windows may not automatically reapply profiles when the color pipeline changes
+// When HDR is toggled programmatically via DisplayConfigSetDeviceInfo, Windows changes
+// the display mode but doesn't refresh its color management pipeline. The previously
+// associated MHC profile for the new mode exists but isn't activated. A simple reassociate
+// is a no-op since Windows already considers it associated. Remove + re-add forces Windows
+// to reprocess the profile and apply it to the active pipeline.
 static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
     if (ctx->index >= (int)g_gui.monitorSettings.size()) return;
     const auto& ms = g_gui.monitorSettings[ctx->index];
@@ -745,12 +749,13 @@ static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
     DisplayInfo displayInfo;
     if (!GetDisplayInfoForMonitor(ctx->index, displayInfo)) return;
 
-    // Reassociate profile for current mode (if configured)
+    // Remove + re-add profile for current mode to force Windows to apply it
     const auto& mhc = ctx->isHDREnabled ? ms.hdrMHC : ms.sdrMHC;
     if (mhc.enabled && !mhc.profileName.empty()) {
-        std::wcout << L"Mode switch: reassociating " << (ctx->isHDREnabled ? L"HDR" : L"SDR")
+        std::wcout << L"Mode switch: reapplying " << (ctx->isHDREnabled ? L"HDR" : L"SDR")
                    << L" MHC profile '" << mhc.profileName
                    << L"' for monitor " << ctx->index << std::endl;
+        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
         ReassociateMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
     }
 
@@ -1417,10 +1422,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (wParam == HOTKEY_HDR_TOGGLE) {
             // Win+Shift+H - toggle HDR on focused monitor
-            ToggleHdrOnFocusedMonitor();
+            if (ToggleHdrOnFocusedMonitor()) {
+                // On ACM displays, HDR→SDR keeps FP16 format so format-change detection
+                // doesn't fire. Schedule a delayed reinit to re-detect HDR state after
+                // Windows completes the transition (no render thread blocking).
+                SetTimer(hwnd, HDR_REINIT_TIMER_ID, HDR_REINIT_DELAY_MS, nullptr);
+            }
         }
         return 0;
     case WM_TIMER:
+        if (wParam == HDR_REINIT_TIMER_ID) {
+            KillTimer(hwnd, HDR_REINIT_TIMER_ID);
+            // Release duplication so render loop re-detects HDR state and reapplies MHC profiles
+            for (auto& ctx : g_monitors) {
+                if (ctx.duplication) {
+                    ctx.duplication->Release();
+                    ctx.duplication = nullptr;
+                }
+                ctx.consecutiveFailures = 0;
+            }
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return 0;
+        }
         HideOSD();
         return 0;
     case WM_POWERBROADCAST:
