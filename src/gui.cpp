@@ -968,12 +968,13 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             // SDR: points store actual output values, targetVal = inputNorm (sqrt distribution)
             float targetVal = data->isHDR ? t : inputNorm;
             float currentVal = data->points[i];
-            // HDR: proportional deviation, SDR: additive deviation
+            // Proportional deviation: slider % = proportional change from target
+            // Consistent for both HDR and SDR, matches MHC grayscale editor
             float deviationPct;
-            if (data->isHDR && targetVal > 0.001f) {
+            if (targetVal > 0.001f) {
                 deviationPct = ((currentVal / targetVal) - 1.0f) * 100.0f;  // Proportional
             } else {
-                deviationPct = (currentVal - targetVal) * 100.0f;  // Additive
+                deviationPct = (currentVal - targetVal) * 100.0f;  // Additive for near-zero
             }
             int sliderVal = (int)(deviationPct * GRAYSCALE_SLIDER_SCALE + 0.5f);
             sliderVal = (std::max)(-maxRange, (std::min)(maxRange, sliderVal));
@@ -1049,12 +1050,12 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     float t = (float)i / (float)(data->pointCount - 1);
                     // HDR uses linear PQ space, SDR uses sqrt distribution
                     float targetVal = data->isHDR ? t : (t * t);
-                    // HDR: proportional deviation, SDR: additive deviation
+                    // Proportional deviation for both HDR and SDR (matches MHC editor)
                     float newVal;
-                    if (data->isHDR && targetVal > 0.001f) {
+                    if (targetVal > 0.001f) {
                         newVal = targetVal * (1.0f + deviationPct / 100.0f);  // Proportional
                     } else {
-                        newVal = targetVal + (deviationPct / 100.0f);  // Additive
+                        newVal = targetVal + (deviationPct / 100.0f);  // Additive for near-zero
                     }
                     data->points[i] = (std::max)(0.0f, (std::min)(1.0f, newVal));
                     // Apply live update
@@ -1089,12 +1090,12 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     float t = (float)editIndex / (float)(data->pointCount - 1);
                     // HDR uses linear PQ space, SDR uses sqrt distribution
                     float targetVal = data->isHDR ? t : (t * t);
-                    // HDR: proportional deviation, SDR: additive deviation
+                    // Proportional deviation for both HDR and SDR (matches MHC editor)
                     float newVal;
-                    if (data->isHDR && targetVal > 0.001f) {
+                    if (targetVal > 0.001f) {
                         newVal = targetVal * (1.0f + deviationPct / 100.0f);
                     } else {
-                        newVal = targetVal + (deviationPct / 100.0f);
+                        newVal = targetVal + (deviationPct / 100.0f);  // Additive for near-zero
                     }
                     data->points[editIndex] = (std::max)(0.0f, (std::min)(1.0f, newVal));
                     if (data->liveUpdateCallback) {
@@ -1120,12 +1121,12 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     float t = (float)i / (float)(data->pointCount - 1);
                     // HDR uses linear PQ space, SDR uses sqrt distribution
                     float targetVal = data->isHDR ? t : (t * t);
-                    // HDR: proportional deviation, SDR: additive deviation
+                    // Proportional deviation for both HDR and SDR (matches MHC editor)
                     float newVal;
-                    if (data->isHDR && targetVal > 0.001f) {
+                    if (targetVal > 0.001f) {
                         newVal = targetVal * (1.0f + deviationPct / 100.0f);
                     } else {
-                        newVal = targetVal + (deviationPct / 100.0f);
+                        newVal = targetVal + (deviationPct / 100.0f);  // Additive for near-zero
                     }
                     data->points[i] = (std::max)(0.0f, (std::min)(1.0f, newVal));
                 }

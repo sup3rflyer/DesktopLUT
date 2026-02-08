@@ -65,8 +65,23 @@ float3 ApplyPrimariesMatrix(float3 rgb) {
     return mul(mat, rgb) * wbGains;
 }
 )"
-// Part 2: SDR Grayscale correction functions
+// Part 2: SDR transfer functions and grayscale correction
 R"(
+// sRGB transfer functions (IEC 61966-2-1)
+// Used by ACM SDR path to match Legacy SDR's native sRGB encoding
+float sRGB_OETF(float L) {
+    return (L <= 0.0031308f) ? (12.92f * L) : (1.055f * pow(L, 1.0f / 2.4f) - 0.055f);
+}
+float sRGB_EOTF(float V) {
+    return (V <= 0.04045f) ? (V / 12.92f) : pow((V + 0.055f) / 1.055f, 2.4f);
+}
+float3 sRGB_OETF3(float3 rgb) {
+    return float3(sRGB_OETF(rgb.r), sRGB_OETF(rgb.g), sRGB_OETF(rgb.b));
+}
+float3 sRGB_EOTF3(float3 rgb) {
+    return float3(sRGB_EOTF(rgb.r), sRGB_EOTF(rgb.g), sRGB_EOTF(rgb.b));
+}
+
 // SDR 2.2->2.4 gamma transform (independent of grayscale correction)
 // For BT.1886 displays that use 2.4 gamma instead of 2.2
 float3 Apply24Gamma(float3 rgb) {
@@ -645,16 +660,18 @@ R"(
                 float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
                 input = max(mul(mat, input) * wbGains, 0.0);
             }
-            // Encode to gamma for shared gamma-space operations
-            input = saturate(pow(max(input, 0.0), 1.0 / 2.2));
+            // Encode to sRGB for shared gamma-space operations
+            // Using proper sRGB OETF (not gamma 2.2) so control points match
+            // Legacy SDR's native sRGB encoding — labels are correct for both paths
+            input = saturate(sRGB_OETF3(max(input, 0.0)));
         } else {
-            // Legacy: input is gamma-encoded, primaries + white balance needs decode/encode
+            // Legacy: input is sRGB-encoded from framebuffer
             if (useManualCorrection > 0.5) {
-                float3 lin = pow(max(input, 0.0), 2.2);
+                float3 lin = sRGB_EOTF3(max(input, 0.0));
                 float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
                 float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
                 lin = max(mul(mat, lin) * wbGains, 0.0);
-                input = saturate(pow(lin, 1.0 / 2.2));
+                input = saturate(sRGB_OETF3(lin));
             }
         }
 
@@ -672,10 +689,10 @@ R"(
         // STAGE 4: Output conversion
         // ═══════════════════════════════════════════════════════════════════════
         if (isFP16SDR > 0.5) {
-            // ACM: FP16 swapchain expects linear - gamma decode
-            corrected = pow(max(corrected, 0.0), 2.2);
+            // ACM: FP16 swapchain expects linear - sRGB decode
+            corrected = sRGB_EOTF3(max(corrected, 0.0));
         }
-        // Legacy: R10G10B10A2 + G22 swapchain - already gamma-encoded
+        // Legacy: R10G10B10A2 + G22 swapchain - already sRGB-encoded
 
         // Dithering
         float2 noiseUV = pos.xy / 64.0;
