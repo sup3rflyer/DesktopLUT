@@ -991,9 +991,12 @@ void RenderMonitor(MonitorContext* ctx) {
         // MHC primaries and shader primaries are independent layers:
         // MHC = base calibration at GPU scanout (yearly), shader = fine-tuning on top (anytime)
         // Same principle as grayscale: both layers can be active simultaneously
-        bool shaderPrimaries = cc.primariesEnabled;
+        bool shaderPrimaries = cc.primariesEnabled;  // White point correction (primaries gamut mapping is MHC-only)
         bool shaderGrayscale = cc.grayscale.enabled;
-        bool shaderWhiteBalance = (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
+        // White balance gains only apply when explicitly enabled — prevents leftover
+        // non-D65 values in INI from silently shifting white point when corrections are off
+        bool shaderWhiteBalance = cc.primariesEnabled &&
+            (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
         cbData[7] = (shaderPrimaries || shaderGrayscale || shaderWhiteBalance) ? 1.0f : 0.0f;  // useManualCorrection
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
