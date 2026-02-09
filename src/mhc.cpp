@@ -1249,6 +1249,21 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
         }
     }
 
+    // Read lumi tag (peak luminance in cd/m²)
+    if (auto* tag = findTag(MakeSig("lumi"))) {
+        if (tag->offset + 20 <= fileSize) {
+            const uint8_t* p = d + tag->offset;
+            if (ReadBE32(p) == MakeSig("XYZ ")) {
+                // Y component = luminance in cd/m²
+                float Y = ReadS15Fixed16(p + 12);
+                if (Y > 0.0f) {
+                    outData.luminance = Y;
+                    outData.hasLuminance = true;
+                }
+            }
+        }
+    }
+
     std::cout << "ICC: Read profile, primaries=" << outData.hasPrimaries
               << " trc=" << outData.hasTRC << std::endl;
     return outData.hasPrimaries || outData.hasTRC;

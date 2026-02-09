@@ -265,6 +265,13 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     } else {
         WritePrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), mhc.grayscale.use24Gamma, iniPath);
     }
+
+    // Metadata for display labels
+    WritePrivateProfileStringW(section, (p + L"MHCMetaPrimaries").c_str(), mhc.metaPrimaries.c_str(), iniPath);
+    WritePrivateProfileStringW(section, (p + L"MHCMetaGamma").c_str(), mhc.metaGamma.c_str(), iniPath);
+    if (isHDR) {
+        WritePrivateProfileFloat(section, (p + L"MHCMetaPeakNits").c_str(), mhc.metaPeakNits, iniPath);
+    }
 }
 
 void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
@@ -338,6 +345,16 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         mhc.grayscale.peakNits = (peakNits >= 100.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
     } else {
         mhc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), false, iniPath);
+    }
+
+    // Metadata for display labels
+    wchar_t metaBuf[256] = {};
+    GetPrivateProfileStringW(section, (p + L"MHCMetaPrimaries").c_str(), L"", metaBuf, 256, iniPath);
+    mhc.metaPrimaries = metaBuf;
+    GetPrivateProfileStringW(section, (p + L"MHCMetaGamma").c_str(), L"", metaBuf, 256, iniPath);
+    mhc.metaGamma = metaBuf;
+    if (isHDR) {
+        mhc.metaPeakNits = GetPrivateProfileFloat(section, (p + L"MHCMetaPeakNits").c_str(), 0.0f, iniPath);
     }
 }
 

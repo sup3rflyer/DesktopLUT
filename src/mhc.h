@@ -99,6 +99,8 @@ struct ICCProfileData {
     bool hasTRC = false;
     float gamma = 0.0f;                   // If single gamma value (curv count=1)
     bool hasGamma = false;
+    float luminance = 0.0f;               // Peak luminance from 'lumi' tag (cd/m²)
+    bool hasLuminance = false;
     std::wstring description;
 };
 

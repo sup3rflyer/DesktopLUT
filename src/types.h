@@ -468,6 +468,12 @@ struct MHCSettings {
 
     // MHC's own grayscale correction
     GrayscaleSettings grayscale;
+
+    // Display metadata for installed profile (computed at Apply time, persisted)
+    std::wstring metaPrimaries;  // "sRGB", "Rec.709", "Custom", "P3-D65", etc.
+    std::wstring metaGamma;      // SDR: "2.2", "2.4 (BT.1886)", "Custom (20pt) + TRC"
+                                 // HDR: "PQ", "20pt-Custom + TRC"
+    float metaPeakNits = 0.0f;   // HDR only, 0 = not set
 };
 
 // Per-monitor settings for persistence
@@ -552,7 +558,7 @@ struct GUIState {
     HWND hwndMhcEdit = nullptr;
     HWND hwndMhcStatus = nullptr;
     HWND hwndMhcIccCoords[8] = {};  // Read-only RGBW xy boxes (Rx,Ry,Gx,Gy,Bx,By,Wx,Wy)
-    HWND hwndMhcTrcLabel = nullptr;  // "TRC" indicator shown when per-channel TRC active
+    HWND hwndMhcMetaLabels[3] = {};  // Primaries, Gamma/EOTF, Peak (replaces hwndMhcTrcLabel)
 
     // HDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndHdrMhcApply = nullptr;
@@ -560,7 +566,7 @@ struct GUIState {
     HWND hwndHdrMhcEdit = nullptr;
     HWND hwndHdrMhcStatus = nullptr;
     HWND hwndHdrMhcIccCoords[8] = {};
-    HWND hwndHdrMhcTrcLabel = nullptr;
+    HWND hwndHdrMhcMetaLabels[3] = {};  // Primaries, Gamma/EOTF, Peak
 
     // Scrollable panels for each tab
     HWND hwndScrollPanel[4] = { nullptr, nullptr, nullptr, nullptr };

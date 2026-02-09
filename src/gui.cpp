@@ -410,6 +410,90 @@ void UpdateMhcFlagsLive(int monitorIndex) {
     }
 }
 
+// Compute metadata strings for display in MHC section labels
+static void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
+    // --- Primaries label ---
+    if (!mhc.primariesEnabled) {
+        mhc.metaPrimaries = isHDR ? L"Rec.2020" : L"sRGB";
+    } else if (mhc.primariesPreset == 0) {
+        // Preset 0 = sRGB/Rec.709
+        if (!isHDR && mhc.grayscale.use24Gamma)
+            mhc.metaPrimaries = L"Rec.709";
+        else
+            mhc.metaPrimaries = L"sRGB";
+    } else if (mhc.primariesPreset < g_numPresetPrimaries - 1) {
+        mhc.metaPrimaries = g_presetPrimaries[mhc.primariesPreset].name;
+    } else {
+        // Custom preset — try to match against known primaries for a nicer label
+        const float tol = 0.005f;
+        bool matched = false;
+        for (int i = 0; i < g_numPresetPrimaries - 1; i++) {
+            const auto& p = g_presetPrimaries[i];
+            if (fabsf(mhc.customPrimaries.Rx - p.Rx) < tol && fabsf(mhc.customPrimaries.Ry - p.Ry) < tol &&
+                fabsf(mhc.customPrimaries.Gx - p.Gx) < tol && fabsf(mhc.customPrimaries.Gy - p.Gy) < tol &&
+                fabsf(mhc.customPrimaries.Bx - p.Bx) < tol && fabsf(mhc.customPrimaries.By - p.By) < tol) {
+                mhc.metaPrimaries = p.name;
+                // Refine sRGB vs Rec.709
+                if (i == 0 && !isHDR && mhc.grayscale.use24Gamma)
+                    mhc.metaPrimaries = L"Rec.709";
+                matched = true;
+                break;
+            }
+        }
+        if (!matched)
+            mhc.metaPrimaries = L"Custom";
+    }
+
+    // --- Gamma/EOTF label ---
+    // Check if grayscale points are manually adjusted from default
+    // (only meaningful when per-channel TRC is NOT present, since TRC overrides grayscale in profile)
+    bool hasAdjustedPoints = false;
+    if (!mhc.hasPerChannelTRC && mhc.grayscale.enabled && !mhc.grayscale.points.empty()) {
+        GrayscaleSettings defaultGs;
+        defaultGs.pointCount = mhc.grayscale.pointCount;
+        if (isHDR) defaultGs.initLinearPQ();
+        else defaultGs.initLinear();
+        for (int i = 0; i < mhc.grayscale.pointCount && i < (int)mhc.grayscale.points.size(); i++) {
+            if (i < (int)defaultGs.points.size() && fabsf(mhc.grayscale.points[i] - defaultGs.points[i]) > 0.001f) {
+                hasAdjustedPoints = true;
+                break;
+            }
+        }
+    }
+
+    std::wstring gammaBase;
+    if (isHDR) {
+        if (hasAdjustedPoints) {
+            wchar_t buf[32];
+            swprintf_s(buf, L"%dpt-Custom", mhc.grayscale.pointCount);
+            gammaBase = buf;
+        } else {
+            gammaBase = L"PQ";
+        }
+    } else {
+        if (hasAdjustedPoints) {
+            wchar_t buf[32];
+            swprintf_s(buf, L"Custom (%dpt)", mhc.grayscale.pointCount);
+            gammaBase = buf;
+        } else if (mhc.grayscale.use24Gamma) {
+            gammaBase = L"2.4 (BT.1886)";
+        } else {
+            gammaBase = L"2.2";
+        }
+    }
+    if (mhc.hasPerChannelTRC) {
+        gammaBase += L" + TRC";
+    }
+    mhc.metaGamma = gammaBase;
+
+    // --- Peak nits (HDR only) ---
+    if (isHDR) {
+        mhc.metaPeakNits = mhc.grayscale.peakNits;
+    } else {
+        mhc.metaPeakNits = 0.0f;
+    }
+}
+
 // Generate, write, and install MHC2 ICC profile from current MHCSettings
 // Updates mhc.enabled/profilePath/profileName on success, calls UpdateMhcFlagsLive
 // Returns true if profile was generated and installed successfully
@@ -668,11 +752,26 @@ void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR) {
             if (coords[i]) SetWindowText(coords[i], L"");
     }
 
-    // Show/hide TRC indicator
-    HWND hwndTrcLabel = isHDR ? g_gui.hwndHdrMhcTrcLabel : g_gui.hwndMhcTrcLabel;
-    if (hwndTrcLabel) {
-        ShowWindow(hwndTrcLabel,
-            (installed && mhc.hasPerChannelTRC) ? SW_SHOW : SW_HIDE);
+    // Show/hide metadata labels
+    HWND* metaLabels = isHDR ? g_gui.hwndHdrMhcMetaLabels : g_gui.hwndMhcMetaLabels;
+    if (installed && !mhc.metaPrimaries.empty()) {
+        std::wstring primText = L"Primaries: " + mhc.metaPrimaries;
+        if (metaLabels[0]) { SetWindowText(metaLabels[0], primText.c_str()); ShowWindow(metaLabels[0], SW_SHOW); }
+    } else {
+        if (metaLabels[0]) { SetWindowText(metaLabels[0], L""); ShowWindow(metaLabels[0], SW_HIDE); }
+    }
+    if (installed && !mhc.metaGamma.empty()) {
+        std::wstring gammaText = L"Gamma: " + mhc.metaGamma;
+        if (metaLabels[1]) { SetWindowText(metaLabels[1], gammaText.c_str()); ShowWindow(metaLabels[1], SW_SHOW); }
+    } else {
+        if (metaLabels[1]) { SetWindowText(metaLabels[1], L""); ShowWindow(metaLabels[1], SW_HIDE); }
+    }
+    if (installed && isHDR && mhc.metaPeakNits > 0.0f) {
+        wchar_t peakBuf[64];
+        swprintf_s(peakBuf, L"Peak: %.0f nits", mhc.metaPeakNits);
+        if (metaLabels[2]) { SetWindowText(metaLabels[2], peakBuf); ShowWindow(metaLabels[2], SW_SHOW); }
+    } else {
+        if (metaLabels[2]) { SetWindowText(metaLabels[2], L""); ShowWindow(metaLabels[2], SW_HIDE); }
     }
 }
 
@@ -2014,6 +2113,8 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         msg += buf;
                         msg += L"\n\nNote: 1D cube files don't contain primaries.\nUse Detect or enter them manually.";
                     } else if (d->hasLoadedICC) {
+                        if (!d->loadedICC.description.empty())
+                            msg += L"\n  Description: " + d->loadedICC.description;
                         if (d->loadedICC.hasPrimaries)
                             msg += L"\n  Primaries (R/G/B/W chromaticity)";
                         if (d->loadedICC.hasTRC) {
@@ -2027,6 +2128,11 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                     (int)d->loadedICC.trcR.size(), (int)d->loadedICC.trcG.size(), (int)d->loadedICC.trcB.size());
                                 msg += buf;
                             }
+                        }
+                        if (d->loadedICC.hasLuminance) {
+                            wchar_t buf[64];
+                            swprintf_s(buf, L"\n  Luminance: %.0f cd/m\u00B2", d->loadedICC.luminance);
+                            msg += buf;
                         }
                     }
                     MessageBox(hwnd, msg.c_str(), L"File Import", MB_OK | MB_ICONINFORMATION);
@@ -2090,6 +2196,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         L"Error", MB_OK | MB_ICONERROR);
                 }
             }
+            ComputeMhcMetadata(*d->settings, d->isHDR);
             DestroyWindow(hwnd);
             return 0;
 
@@ -2660,7 +2767,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Helper lambda to create one MHC section
         auto createMhcSection = [&](const wchar_t* title, int baseY,
             HWND& hApply, HWND& hRemove, HWND& hEdit, HWND& hStatus,
-            HWND* hCoords, HWND& hTrcLabel,
+            HWND* hCoords, HWND* hMetaLabels,
             HMENU idApply, HMENU idRemove, HMENU idEdit)
         {
             ctrl = CreateWindow(L"BUTTON", title, WS_CHILD | BS_GROUPBOX,
@@ -2687,6 +2794,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int cX = innerX + 10;
             int cW = 50;
             int cLabelW = 25;
+            int metaX = cX + 285;  // Metadata labels X position
+            int metaW = groupW - 285 - 20;  // Remaining width
             DWORD editStyle = WS_CHILD | WS_BORDER | ES_READONLY | ES_CENTER | WS_DISABLED;
 
             ctrl = CreateWindow(L"STATIC", L"R:", WS_CHILD, cX, cY + 3, cLabelW, h, panel0, nullptr, nullptr, nullptr);
@@ -2703,6 +2812,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hCoords[3] = CreateWindow(L"EDIT", L"", editStyle, cX + 140 + cLabelW + cW + 5, cY, cW, h, panel0, nullptr, nullptr, nullptr);
             g_gui.tab0Controls.push_back(hCoords[3]);
 
+            // Metadata labels: 3 lines packed within the RGBW box height
+            int metaY = cY + 3;       // Top-aligned with R/G row text
+            int metaLineH = 16;       // Compact line height for text-only labels
+            for (int mi = 0; mi < 3; mi++) {
+                hMetaLabels[mi] = CreateWindow(L"STATIC", L"", WS_CHILD,
+                    metaX, metaY + mi * metaLineH, metaW, metaLineH, panel0, nullptr, nullptr, nullptr);
+                g_gui.tab0Controls.push_back(hMetaLabels[mi]);
+            }
+
             cY += h + 4;
             ctrl = CreateWindow(L"STATIC", L"B:", WS_CHILD, cX, cY + 3, cLabelW, h, panel0, nullptr, nullptr, nullptr);
             g_gui.tab0Controls.push_back(ctrl);
@@ -2717,16 +2835,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_gui.tab0Controls.push_back(hCoords[6]);
             hCoords[7] = CreateWindow(L"EDIT", L"", editStyle, cX + 140 + cLabelW + cW + 5, cY, cW, h, panel0, nullptr, nullptr, nullptr);
             g_gui.tab0Controls.push_back(hCoords[7]);
-
-            hTrcLabel = CreateWindow(L"STATIC", L"+ TRC", WS_CHILD,
-                cX + 140 + cLabelW + cW + 5 + cW + 10, cY + 3, 40, h, panel0, nullptr, nullptr, nullptr);
-            g_gui.tab0Controls.push_back(hTrcLabel);
         };
 
         // SDR Display Calibration section
         createMhcSection(L"SDR Display Calibration", innerY,
             g_gui.hwndMhcApply, g_gui.hwndMhcRemove, g_gui.hwndMhcEdit, g_gui.hwndMhcStatus,
-            g_gui.hwndMhcIccCoords, g_gui.hwndMhcTrcLabel,
+            g_gui.hwndMhcIccCoords, g_gui.hwndMhcMetaLabels,
             (HMENU)ID_MHC_TAB_APPLY, (HMENU)ID_MHC_TAB_REMOVE, (HMENU)ID_MHC_TAB_EDIT);
 
         innerY += 115 + 5;
@@ -2734,7 +2848,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // HDR Display Calibration section
         createMhcSection(L"HDR Display Calibration", innerY,
             g_gui.hwndHdrMhcApply, g_gui.hwndHdrMhcRemove, g_gui.hwndHdrMhcEdit, g_gui.hwndHdrMhcStatus,
-            g_gui.hwndHdrMhcIccCoords, g_gui.hwndHdrMhcTrcLabel,
+            g_gui.hwndHdrMhcIccCoords, g_gui.hwndHdrMhcMetaLabels,
             (HMENU)ID_MHC_HDR_APPLY, (HMENU)ID_MHC_HDR_REMOVE, (HMENU)ID_MHC_HDR_EDIT);
 
         g_gui.contentHeight[0] = innerY + 115 + 8;
@@ -3729,6 +3843,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
 
                 if (GenerateAndInstallMhcProfile(g_gui.currentMonitor, isHDR)) {
+                    auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
+                                      : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
+                    ComputeMhcMetadata(mhc, isHDR);
                     UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
                     SaveSettings();
                     MessageBox(hwnd, L"MHC2 profile installed successfully.\nProfile persists even when overlay is off.",
@@ -3774,6 +3891,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 mhc.profilePath.clear();
                 mhc.profileName.clear();
                 mhc.hasPerChannelTRC = false;
+                mhc.metaPrimaries.clear();
+                mhc.metaGamma.clear();
+                mhc.metaPeakNits = 0.0f;
                 UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
                 UpdateMhcFlagsLive(g_gui.currentMonitor);
                 SaveSettings();
