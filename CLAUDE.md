@@ -217,9 +217,9 @@ scRGB → Desktop Gamma → BT.709→Rec.2020 → Primaries (with Bradford)
 
 **MHC2ProfileParams**: Parameters for profile generation (primaries, grayscale, HDR mode, per-channel TRC from ICC, pre-computed correction from 1D cube)
 
-**MHCSettings**: Per-monitor per-mode MHC state (enabled, profile path/name, source file path, sourceIs1DCube flag, primaries, grayscale)
+**MHCSettings**: Per-monitor per-mode MHC state (enabled, profile path/name, source file path, sourceIs1DCube flag, primaries, grayscale, display metadata: metaPrimaries/metaGamma/metaPeakNits)
 
-**ICCProfileData**: Extracted ICC data (primaries from rXYZ/gXYZ/bXYZ un-adapted via chad, white from R+G+B XYZ sum, per-channel TRC, gamma)
+**ICCProfileData**: Extracted ICC data (primaries from rXYZ/gXYZ/bXYZ un-adapted via chad, white from R+G+B XYZ sum, per-channel TRC, gamma, luminance from lumi tag)
 
 ## Critical Paths
 
@@ -255,7 +255,7 @@ Acquire frame → create capture SRV → update constant buffer → run peak det
 2. **New shader param**: Add to constant buffer in `shader.h` → update `RenderMonitor()` in `render.cpp`
 3. **New hotkey**: Add constant in `types.h` → global in `globals.h/cpp` → `settings.cpp` load/save → `gui.cpp` Settings tab control → register in `processing.cpp` (use `MOD_NOREPEAT`) → handle in `WndProc()` in `render.cpp`
 4. **New recovery scenario**: Handle in `RenderMonitor()` or `RenderAll()` with appropriate backoff
-5. **New MHC feature**: Add to `MHC2ProfileParams` → generation in `mhc.cpp` → GUI controls in MHC tab → settings persistence
+5. **New MHC feature**: Add to `MHC2ProfileParams` → generation in `mhc.cpp` → GUI controls in MHC tab → settings persistence → update `ComputeMhcMetadata()` if metadata labels need updating
 
 ## Known Limitations
 
@@ -269,7 +269,9 @@ Acquire frame → create capture SRV → update constant buffer → run peak det
 
 **MHC Profile Scope**: Matrix (3x3 primaries + white point) + 1D LUT (per-channel gamma). No 3D LUT support — that's what the overlay layer is for.
 
-**MHC File Import**: Edit dialog accepts ICC profiles (.icm/.icc) and 1D .cube files (e.g. BMD_4096). 3D .cube files are rejected with error. Files with no usable data (no primaries, no TRC) are rejected. Import summary popup shows what was extracted. Control locking is granular: ICC with primaries+TRC locks both sections; 1D cube locks only grayscale (primaries/Detect stay enabled since 1D cubes don't contain chromaticity data).
+**MHC File Import**: Edit dialog accepts ICC profiles (.icm/.icc) and 1D .cube files (e.g. BMD_4096). 3D .cube files are rejected with error. Files with no usable data (no primaries, no TRC) are rejected. Import summary popup shows what was extracted (including ICC description and luminance from lumi tag). Control locking is granular: ICC with primaries+TRC locks both sections; 1D cube locks only grayscale (primaries/Detect stay enabled since 1D cubes don't contain chromaticity data).
+
+**MHC Metadata Display**: Each MHC section shows three compact metadata lines to the right of the RGBW coordinate boxes: Primaries (preset name or "Custom", with tolerance matching for ICC imports), Gamma (SDR: "2.2"/"2.4 (BT.1886)"/"Custom (Npt)", HDR: "PQ"/"Npt-Custom", with "+ TRC" suffix), and Peak nits (HDR only). Metadata is computed by `ComputeMhcMetadata()` at Apply/OK time and persisted in INI.
 
 **ICC White Point**: Computed from sum of un-adapted rXYZ+gXYZ+bXYZ (native display white), not hardcoded D65. EDID Detect still defaults to D65 because displays internally correct white to D65 in their default mode — different from ICC which represents measured reality.
 
