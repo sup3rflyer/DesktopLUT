@@ -45,10 +45,7 @@
 // Tab control
 #define ID_TAB_CONTROL      200
 
-// SDR/HDR toggle (main window, between monitor list and tabs)
-#define ID_SDR_HDR_TOGGLE   500
-
-// Unified Corrections tab control IDs (repopulated on SDR/HDR toggle)
+// SDR Corrections tab control IDs
 #define ID_CORR_PRIMARIES_ENABLE 501
 #define ID_CORR_PRIMARIES_WX     509
 #define ID_CORR_PRIMARIES_WY     510
@@ -59,7 +56,18 @@
 #define ID_CORR_GRAYSCALE_EDIT   516
 #define ID_CORR_GRAYSCALE_RESET  517
 #define ID_CORR_GRAYSCALE_24     518  // SDR only: 2.4 gamma checkbox
-#define ID_CORR_GRAYSCALE_PEAK   519  // HDR only: peak nits edit
+
+// HDR Corrections tab control IDs
+#define ID_CORR_HDR_PRIMARIES_ENABLE  601
+#define ID_CORR_HDR_PRIMARIES_WX      602
+#define ID_CORR_HDR_PRIMARIES_WY      603
+#define ID_CORR_HDR_GRAYSCALE_ENABLE  604
+#define ID_CORR_HDR_GRAYSCALE_10      605
+#define ID_CORR_HDR_GRAYSCALE_20      606
+#define ID_CORR_HDR_GRAYSCALE_32      607
+#define ID_CORR_HDR_GRAYSCALE_EDIT    608
+#define ID_CORR_HDR_GRAYSCALE_RESET   609
+#define ID_CORR_HDR_GRAYSCALE_PEAK    610  // HDR only: peak nits edit
 
 // HDR Tonemapping control IDs (Corrections tab, HDR only)
 #define ID_CORR_TONEMAP_ENABLE   520
@@ -74,10 +82,15 @@
 #define ID_CORR_MAXTML_EDIT      527
 #define ID_CORR_MAXTML_APPLY     528
 
-// Unified MHC Hardware Calibration control IDs (MHC tab)
+// SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
 #define ID_MHC_TAB_REMOVE   552
 #define ID_MHC_TAB_EDIT     553
+
+// HDR MHC Hardware Calibration control IDs (MHC tab)
+#define ID_MHC_HDR_APPLY    561
+#define ID_MHC_HDR_REMOVE   562
+#define ID_MHC_HDR_EDIT     563
 
 // Settings tab (Tab 3) control IDs
 #define ID_SETTINGS_HOTKEY_GAMMA_CHECK    401
@@ -493,14 +506,11 @@ struct GUIState {
     HWND hwndTab = nullptr;
     int currentTab = 0;
 
-    // SDR/HDR toggle switch (main window, between monitor list and tabs)
-    HWND hwndToggle = nullptr;
-    bool sdrHdrToggleHDR = false;  // false = SDR selected, true = HDR selected
-
-    // White Point controls (Corrections tab, repopulated on SDR/HDR toggle)
+    // SDR White Point controls (Corrections tab)
     HWND hwndPrimariesEnable = nullptr;
     HWND hwndPrimariesWx = nullptr;
     HWND hwndPrimariesWy = nullptr;
+    // SDR Grayscale controls (Corrections tab)
     HWND hwndGrayscaleEnable = nullptr;
     HWND hwndGrayscale10 = nullptr;
     HWND hwndGrayscale20 = nullptr;
@@ -508,6 +518,18 @@ struct GUIState {
     HWND hwndGrayscale24 = nullptr;        // SDR only: 2.4 gamma checkbox
     HWND hwndGrayscaleEdit = nullptr;
     HWND hwndGrayscaleReset = nullptr;
+
+    // HDR White Point controls (Corrections tab)
+    HWND hwndHdrPrimariesEnable = nullptr;
+    HWND hwndHdrPrimariesWx = nullptr;
+    HWND hwndHdrPrimariesWy = nullptr;
+    // HDR Grayscale controls (Corrections tab)
+    HWND hwndHdrGrayscaleEnable = nullptr;
+    HWND hwndHdrGrayscale10 = nullptr;
+    HWND hwndHdrGrayscale20 = nullptr;
+    HWND hwndHdrGrayscale32 = nullptr;
+    HWND hwndHdrGrayscaleEdit = nullptr;
+    HWND hwndHdrGrayscaleReset = nullptr;
     HWND hwndGrayscalePeak = nullptr;       // HDR only: peak nits edit
     HWND hwndGrayscalePeakLabel = nullptr;  // HDR only: "Peak:" label
 
@@ -524,7 +546,7 @@ struct GUIState {
     HWND hwndMaxTmlEdit = nullptr;
     HWND hwndMaxTmlApply = nullptr;
 
-    // Unified MHC Hardware Calibration controls (MHC tab)
+    // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;
     HWND hwndMhcRemove = nullptr;
     HWND hwndMhcEdit = nullptr;
@@ -532,14 +554,13 @@ struct GUIState {
     HWND hwndMhcIccCoords[8] = {};  // Read-only RGBW xy boxes (Rx,Ry,Gx,Gy,Bx,By,Wx,Wy)
     HWND hwndMhcTrcLabel = nullptr;  // "TRC" indicator shown when per-channel TRC active
 
-    // HDR-only controls on Corrections tab (for show/hide + reflow)
-    // Groupbox HWNDs that need show/hide on toggle
-    HWND hwndTonemapGroup = nullptr;
-    HWND hwndMaxTmlGroup = nullptr;
-    // All HDR-only controls (hidden in SDR mode)
-    std::vector<HWND> hdrOnlyControls;
-    // SDR-only controls (hidden in HDR mode)
-    std::vector<HWND> sdrOnlyControls;
+    // HDR MHC Hardware Calibration controls (MHC tab)
+    HWND hwndHdrMhcApply = nullptr;
+    HWND hwndHdrMhcRemove = nullptr;
+    HWND hwndHdrMhcEdit = nullptr;
+    HWND hwndHdrMhcStatus = nullptr;
+    HWND hwndHdrMhcIccCoords[8] = {};
+    HWND hwndHdrMhcTrcLabel = nullptr;
 
     // Scrollable panels for each tab
     HWND hwndScrollPanel[4] = { nullptr, nullptr, nullptr, nullptr };
@@ -555,7 +576,6 @@ struct GUIState {
     // Tab 2 controls (Corrections)
     std::vector<HWND> tab2Controls;
     std::vector<int> tab2OriginalY;
-    std::vector<int> tab2BaseY;       // HDR layout Y positions (creation time, immutable)
     // Tab 3 controls (Settings)
     std::vector<HWND> tab3Controls;
     std::vector<int> tab3OriginalY;

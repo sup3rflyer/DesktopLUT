@@ -533,10 +533,12 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR) {
 }
 
 // Helper to get white point from edit boxes
-static void GetWhitePointFromEditBoxes(float& Wx, float& Wy) {
+static void GetWhitePointFromEditBoxes(float& Wx, float& Wy, bool isHDR) {
     wchar_t buf[16];
-    if (g_gui.hwndPrimariesWx) { GetWindowText(g_gui.hwndPrimariesWx, buf, 16); Wx = (float)_wtof(buf); }
-    if (g_gui.hwndPrimariesWy) { GetWindowText(g_gui.hwndPrimariesWy, buf, 16); Wy = (float)_wtof(buf); }
+    HWND hwndWx = isHDR ? g_gui.hwndHdrPrimariesWx : g_gui.hwndPrimariesWx;
+    HWND hwndWy = isHDR ? g_gui.hwndHdrPrimariesWy : g_gui.hwndPrimariesWy;
+    if (hwndWx) { GetWindowText(hwndWx, buf, 16); Wx = (float)_wtof(buf); }
+    if (hwndWy) { GetWindowText(hwndWy, buf, 16); Wy = (float)_wtof(buf); }
 }
 
 bool SettingsChanged() {
@@ -550,16 +552,27 @@ bool SettingsChanged() {
         }
     }
 
-    // Check if current monitor's white point has changed from active settings
+    // Check if current monitor's white point has changed from active settings (both SDR and HDR)
     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.activeSettings.size()) {
-        float Wx = 0.3127f, Wy = 0.3290f;
-        GetWhitePointFromEditBoxes(Wx, Wy);
-        bool isHDR = g_gui.sdrHdrToggleHDR;
-        const auto& activeCC = isHDR ? g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection
-                                     : g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection;
-        if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
-            fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
-            return true;
+        // Check SDR white point
+        {
+            float Wx = 0.3127f, Wy = 0.3290f;
+            GetWhitePointFromEditBoxes(Wx, Wy, false);
+            const auto& activeCC = g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection;
+            if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
+                fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
+                return true;
+            }
+        }
+        // Check HDR white point
+        {
+            float Wx = 0.3127f, Wy = 0.3290f;
+            GetWhitePointFromEditBoxes(Wx, Wy, true);
+            const auto& activeCC = g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection;
+            if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
+                fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
+                return true;
+            }
         }
     }
 
