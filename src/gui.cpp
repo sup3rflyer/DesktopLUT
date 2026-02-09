@@ -3831,6 +3831,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
                 }
 
+                // Delete the .icm file from system color directory
+                {
+                    wchar_t sysDir[MAX_PATH];
+                    GetSystemDirectory(sysDir, MAX_PATH);
+                    std::wstring icmPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + mhc.profileName;
+                    if (DeleteFileW(icmPath.c_str())) {
+                        std::wcout << L"MHC: Deleted profile file " << mhc.profileName << std::endl;
+                    }
+                }
+
                 mhc.enabled = false;
                 mhc.profilePath.clear();
                 mhc.profileName.clear();

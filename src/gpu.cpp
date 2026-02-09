@@ -8,6 +8,7 @@
 #include "capture.h"
 #include "render.h"
 #include "processing.h"
+#include "mhc.h"
 #include <d3dcompiler.h>
 #include <iostream>
 
@@ -382,6 +383,8 @@ bool AttemptDeviceRecovery() {
 
     // Reapply MaxTML settings (may be lost after TDR/driver recovery)
     ApplyMaxTmlSettings();
+    // Reapply MHC profiles (may be lost after TDR/driver recovery)
+    ReapplyAllMhcProfiles();
 
     std::cout << "GPU device recovery successful" << std::endl;
     return true;

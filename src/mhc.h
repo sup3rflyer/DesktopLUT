@@ -115,3 +115,15 @@ bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGr
 // Load a 1D .cube LUT as per-channel correction curves
 // Returns three vectors (R, G, B) with normalized 0-1 correction values
 bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vector<float>& outG, std::vector<float>& outB);
+
+// ============================================================================
+// MHC Profile Maintenance
+// ============================================================================
+
+// Clean up orphaned DesktopLUT_*.icm files from system color directory
+// Deletes any files not referenced by current g_gui.monitorSettings
+void CleanupOrphanedMhcProfiles();
+
+// Re-associate all enabled MHC profiles across all monitors (remove + re-add)
+// Ensures profiles are actively applied after sleep/wake, TDR, or app restart
+void ReapplyAllMhcProfiles();

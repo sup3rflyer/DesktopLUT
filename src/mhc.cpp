@@ -12,11 +12,14 @@
 
 #include "mhc.h"
 #include "color.h"
+#include "globals.h"
+#include "displayconfig.h"
 #include <iostream>
 #include <fstream>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <set>
 #include <wincrypt.h>
 
 #pragma comment(lib, "Advapi32.lib")
@@ -1442,4 +1445,73 @@ bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vect
     outB = std::move(tempB);
     std::cout << "Loaded 1D cube LUT: " << lutSize << " entries per channel" << std::endl;
     return true;
+}
+
+// ============================================================================
+// MHC Profile Maintenance
+// ============================================================================
+
+void CleanupOrphanedMhcProfiles() {
+    // Build set of profile names currently referenced by settings
+    std::set<std::wstring> activeProfiles;
+    for (const auto& ms : g_gui.monitorSettings) {
+        if (!ms.sdrMHC.profileName.empty())
+            activeProfiles.insert(ms.sdrMHC.profileName);
+        if (!ms.hdrMHC.profileName.empty())
+            activeProfiles.insert(ms.hdrMHC.profileName);
+    }
+
+    // Scan system color directory for DesktopLUT_*.icm files
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectory(sysDir, MAX_PATH);
+    std::wstring colorDir = std::wstring(sysDir) + L"\\spool\\drivers\\color\\";
+    std::wstring searchPattern = colorDir + L"DesktopLUT_*.icm";
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    int deleted = 0;
+    do {
+        std::wstring fileName = fd.cFileName;
+        if (activeProfiles.find(fileName) == activeProfiles.end()) {
+            std::wstring fullPath = colorDir + fileName;
+            if (DeleteFileW(fullPath.c_str())) {
+                std::wcout << L"MHC cleanup: deleted orphaned " << fileName << std::endl;
+                deleted++;
+            }
+        }
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+    if (deleted > 0) {
+        std::cout << "MHC cleanup: removed " << deleted << " orphaned profile(s)" << std::endl;
+    }
+}
+
+void ReapplyAllMhcProfiles() {
+    if (!IsMHC2ApiAvailable()) return;
+
+    for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
+        const auto& ms = g_gui.monitorSettings[i];
+
+        DisplayInfo displayInfo;
+        if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
+
+        // Reapply SDR profile
+        if (ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) {
+            RemoveMHC2Profile(ms.sdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, false);
+            ReassociateMHC2Profile(ms.sdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, false);
+            std::wcout << L"MHC reapply: SDR profile '" << ms.sdrMHC.profileName
+                       << L"' for monitor " << i << std::endl;
+        }
+
+        // Reapply HDR profile
+        if (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()) {
+            RemoveMHC2Profile(ms.hdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
+            ReassociateMHC2Profile(ms.hdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
+            std::wcout << L"MHC reapply: HDR profile '" << ms.hdrMHC.profileName
+                       << L"' for monitor " << i << std::endl;
+        }
+    }
 }

@@ -891,9 +891,10 @@ void RenderMonitor(MonitorContext* ctx) {
                 RecreateSwapchain(ctx);
                 // Reapply MaxTML settings (may be lost after HDR mode change)
                 ApplyMaxTmlSettings();
-                // Reapply MHC ICC profiles for new mode
-                ReapplyMhcProfilesOnModeSwitch(ctx);
             }
+            // Always reapply MHC profiles after duplication reinit — covers both mode
+            // changes and cases where duplication was lost/recovered without mode change
+            ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
         }
         return;
@@ -946,7 +947,7 @@ void RenderMonitor(MonitorContext* ctx) {
             ctx->usePassthrough = !hasApplicableLUT;
             RecreateSwapchain(ctx);
             ApplyMaxTmlSettings();
-            // Reapply MHC ICC profiles for new mode
+            // Always reapply MHC ICC profiles after duplication reinit
             ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
             std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
@@ -1288,6 +1289,8 @@ void RenderAll() {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Reapply MaxTML settings (may be lost after sleep/wake)
         ApplyMaxTmlSettings();
+        // Reapply MHC profiles (may be silently dropped after sleep/wake)
+        ReapplyAllMhcProfiles();
         // Force TOPMOST reassert after wake (z-order most likely disrupted)
         g_forceTopmostReassert.store(true);
     }

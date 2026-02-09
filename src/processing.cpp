@@ -13,6 +13,7 @@
 #include "gui.h"
 #include "gpu.h"
 #include "displayconfig.h"
+#include "mhc.h"
 #include <objbase.h>
 #include <iostream>
 #include <map>
@@ -305,6 +306,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         ReleaseSharedD3DResources();  // Clean up D3D resources on early exit
         return;
     }
+
+    // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles
+    CleanupOrphanedMhcProfiles();
+    ReapplyAllMhcProfiles();
 
     g_mainHwnd = g_monitors[0].hwnd;
 
