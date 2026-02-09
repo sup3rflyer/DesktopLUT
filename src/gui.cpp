@@ -3948,6 +3948,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case ID_TRAY_STARTUP:
             SetStartupEnabled(!IsStartupEnabled());
+            if (g_gui.hwndSettingsRunAtStartup)
+                SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
             return 0;
         case ID_TRAY_EXIT:
             StopProcessing();
