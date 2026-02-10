@@ -498,13 +498,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Subclass tab control for custom background color
         g_origTabProc = (WNDPROC)SetWindowLongPtr(g_gui.hwndTab, GWLP_WNDPROC, (LONG_PTR)TabSubclassProc);
 
-        // Add tabs: MHC / 3D LUT / Corrections / Settings
+        // Add tabs: I. MHC / II. 3D LUT / III. Corrections / Settings
         TCITEM tie = { TCIF_TEXT };
-        tie.pszText = (LPWSTR)L"MHC";
+        tie.pszText = (LPWSTR)L"I. MHC";
         TabCtrl_InsertItem(g_gui.hwndTab, 0, &tie);
-        tie.pszText = (LPWSTR)L"3D LUT";
+        tie.pszText = (LPWSTR)L"II. 3D LUT";
         TabCtrl_InsertItem(g_gui.hwndTab, 1, &tie);
-        tie.pszText = (LPWSTR)L"Corrections";
+        tie.pszText = (LPWSTR)L"III. Corrections";
         TabCtrl_InsertItem(g_gui.hwndTab, 2, &tie);
         tie.pszText = (LPWSTR)L"Settings";
         TabCtrl_InsertItem(g_gui.hwndTab, 3, &tie);
