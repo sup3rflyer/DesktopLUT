@@ -4,6 +4,7 @@
 #include "render.h"
 #include "globals.h"
 #include "gpu.h"
+#include "color.h"
 #include "capture.h"
 #include "osd.h"
 #include "analysis.h"
@@ -653,7 +654,17 @@ void RenderMonitor(MonitorContext* ctx) {
         return;
     }
 
-    // Update constant buffer with current HDR state, gamma mode, and manual corrections
+    // Check if atomic toggles changed → mark constant buffer dirty
+    bool curGamma = g_desktopGammaMode.load();
+    bool curTetrahedral = g_tetrahedralInterp.load();
+    if (curGamma != ctx->lastDesktopGamma || curTetrahedral != ctx->lastTetrahedralInterp) {
+        ctx->cbDirty = true;
+        ctx->lastDesktopGamma = curGamma;
+        ctx->lastTetrahedralInterp = curTetrahedral;
+    }
+
+    // Update constant buffer only when dirty (avoids Map/Unmap overhead on static frames)
+    if (ctx->cbDirty) {
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = g_context->Map(g_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
@@ -705,16 +716,18 @@ void RenderMonitor(MonitorContext* ctx) {
         // Row 7: Grayscale peak + ACM flag
         cbData[28] = cc.grayscale.peakNits;  // grayscalePeakNits (HDR only)
         cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
-        cbData[30] = 0.0f;  // padding
-        cbData[31] = 0.0f;  // padding
+        cbData[30] = LinearToPQScalar(cc.tonemap.targetPeakNits / 10000.0f);  // pqTargetPeak (precomputed)
+        cbData[31] = LinearToPQScalar((std::max)(cc.grayscale.peakNits, 1.0f) / 10000.0f);  // pqGrayscalePeak (precomputed)
         // Row 8-15: Grayscale LUT (32 points packed into 8 float4s)
         for (int i = 0; i < 32; i++) {
-            cbData[32 + i] = (i < cc.grayscale.pointCount)
+            cbData[32 + i] = (i < cc.grayscale.pointCount && i < 32)
                 ? cc.grayscale.points[i]
                 : ((float)i / 31.0f);  // Linear fallback
         }
         g_context->Unmap(g_constantBuffer, 0);
     }
+    ctx->cbDirty = false;
+    } // end if cbDirty
 
     // Select the appropriate LUT based on HDR mode (no fallback - SDR/HDR LUTs are incompatible)
     // If no applicable LUT, usePassthrough is true and shader skips LUT sampling
@@ -968,6 +981,7 @@ void RenderAll() {
                 ctx.duplication = nullptr;
             }
             ctx.consecutiveFailures = 0;  // Reset backoff
+            ctx.cbDirty = true;           // Force constant buffer refresh
         }
         // Reset watchdog to avoid timeout during recovery
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -983,7 +997,7 @@ void RenderAll() {
     static auto lastTopmost = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     bool forceReassert = g_forceTopmostReassert.exchange(false);
-    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 2000) {
+    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 10000) {
         for (auto& ctx : g_monitors) {
             if (ctx.hwnd) {
                 SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -1021,6 +1035,7 @@ void RenderAll() {
                         ctx.hdrMhcPrimariesActive = false;
                         ctx.hdrMhcGrayscaleActive = false;
                     }
+                    ctx.cbDirty = true;
                     std::cout << "[Render] Applied CC: mon=" << ctx.index
                               << " isHDR=" << update.isHDR
                               << " mhcPrim=" << (ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive : ctx.sdrMhcPrimariesActive)
@@ -1140,6 +1155,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         HideOSD();
         return 0;
+    case WM_WINDOWPOSCHANGING: {
+        // If another window is changing our z-order, trigger TOPMOST reassertion
+        WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (wp && !(wp->flags & SWP_NOZORDER)) {
+            g_forceTopmostReassert.store(true);
+        }
+        break;
+    }
     case WM_POWERBROADCAST:
         // Handle power events for sleep/wake recovery
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {

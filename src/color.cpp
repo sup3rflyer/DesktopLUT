@@ -99,7 +99,11 @@ void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrim
         tgtRZ, tgtGZ, tgtBZ
     };
     float tgtPrimInv[9];
-    matInv(tgtPrim, tgtPrimInv);
+    if (!matInv(tgtPrim, tgtPrimInv)) {
+        std::cerr << "Error: Target primaries matrix is singular (degenerate primaries)" << std::endl;
+        for (int i = 0; i < 9; i++) outMatrix[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        return;
+    }
 
     float tgtS[3] = {
         tgtPrimInv[0] * tgtWX + tgtPrimInv[1] * tgtWY + tgtPrimInv[2] * tgtWZ,

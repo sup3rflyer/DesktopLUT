@@ -88,6 +88,7 @@ std::mutex g_vrrWhitelistMutex;                          // Protects g_vrrWhitel
 
 std::mutex g_gammaWhitelistMutex;  // Protects g_gammaWhitelist, g_gammaWhitelistMatch, g_gammaWhitelistOverrideProcess
 std::mutex g_colorCorrectionMutex;
+std::mutex g_monitorSettingsMutex; // Protects g_gui.monitorSettings (MHC profileName/enabled fields)
 std::vector<PendingColorCorrection> g_pendingColorCorrections;
 std::atomic<bool> g_hasPendingColorCorrections{ false };
 
@@ -95,7 +96,7 @@ std::atomic<bool> g_hasPendingColorCorrections{ false };
 // Global Window Handles
 // ============================================================================
 
-HWND g_mainHwnd = nullptr;
+std::atomic<HWND> g_mainHwnd{ nullptr };
 HWND g_osdHwnd = nullptr;
 HWND g_analysisHwnd = nullptr;
 std::atomic<bool> g_analysisEnabled{ false };

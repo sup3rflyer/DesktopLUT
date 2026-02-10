@@ -370,6 +370,11 @@ struct MonitorContext {
     bool sdrMhcGrayscaleActive = false;   // MHC handles SDR grayscale at GPU scanout
     bool hdrMhcPrimariesActive = false;   // MHC handles HDR primaries at GPU scanout
     bool hdrMhcGrayscaleActive = false;   // MHC handles HDR grayscale at GPU scanout
+
+    // Constant buffer dirty tracking (avoid Map/Unmap every frame)
+    bool cbDirty = true;                     // True when constant buffer needs update
+    bool lastDesktopGamma = true;            // Cached atomic value
+    bool lastTetrahedralInterp = false;      // Cached atomic value
 };
 
 // Per-monitor LUT configuration from command line

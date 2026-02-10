@@ -213,7 +213,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     // Use unique filename each time to bypass Windows profile caching
     static int profileSeq = 0;
     std::wstring profileName = L"DesktopLUT_" + (isHDR ? std::wstring(L"HDR") : std::wstring(L"SDR"))
-        + L"_" + std::to_wstring(GetTickCount()) + L".icm";
+        + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     // Write to temp directory - InstallColorProfileW copies to system color dir
     wchar_t tempDir[MAX_PATH];
@@ -246,10 +246,13 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     GetSystemDirectory(sysDir, MAX_PATH);
     std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
 
-    mhc.enabled = true;
-    mhc.profilePath = profilePath;
-    mhc.profileName = profileName;
-    mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        mhc.enabled = true;
+        mhc.profilePath = profilePath;
+        mhc.profileName = profileName;
+        mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
+    }
     UpdateMhcFlagsLive(monitorIndex);
     return true;
 }
@@ -326,7 +329,7 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
 
     // Unique filename to bypass caching
     std::wstring newProfileName = L"DesktopLUT_" + (isHDR ? std::wstring(L"HDR") : std::wstring(L"SDR"))
-        + L"_" + std::to_wstring(GetTickCount()) + L".icm";
+        + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     wchar_t tempDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tempDir);
@@ -345,16 +348,24 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     if (!WriteMHC2Profile(profileData, tempPath)) return;
 
     if (GetDisplayInfoForMonitor(monitorIndex, displayInfo)) {
-        InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+            std::cerr << "RegenerateMhcIfActive: InstallMHC2Profile failed for monitor "
+                      << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
+            DeleteFileW(tempPath.c_str());
+            return;
+        }
     }
     DeleteFileW(tempPath.c_str());
 
     // Update stored name
     wchar_t sysDir2[MAX_PATH];
     GetSystemDirectory(sysDir2, MAX_PATH);
-    mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
-    mhc.profileName = newProfileName;
-    mhc.hasPerChannelTRC = params.hasPerChannelTRC;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
+        mhc.profileName = newProfileName;
+        mhc.hasPerChannelTRC = params.hasPerChannelTRC;
+    }
     UpdateMhcFlagsLive(monitorIndex);
 }
 
@@ -863,7 +874,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 wchar_t buf[16];
                 GetWindowText(d->hwndGsPeak, buf, 16);
                 d->settings->grayscale.peakNits = (float)_wtof(buf);
-                if (d->settings->grayscale.peakNits < 100.0f) d->settings->grayscale.peakNits = 100.0f;
+                if (d->settings->grayscale.peakNits < 10.0f) d->settings->grayscale.peakNits = 10.0f;
             }
             // Ensure points are initialized
             auto& gs = d->settings->grayscale;
@@ -1055,7 +1066,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 wchar_t buf[16];
                 GetWindowText(d->hwndGsPeak, buf, 16);
                 d->settings->grayscale.peakNits = (float)_wtof(buf);
-                if (d->settings->grayscale.peakNits < 100.0f) d->settings->grayscale.peakNits = 100.0f;
+                if (d->settings->grayscale.peakNits < 10.0f) d->settings->grayscale.peakNits = 10.0f;
             }
             // Store source file path and type for profile regeneration
             if (d->fileLoaded && !d->loadedFilePath.empty()) {

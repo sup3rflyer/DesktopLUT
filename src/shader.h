@@ -45,8 +45,8 @@ cbuffer LUTParams : register(b0) {
     float grayscale24;     // SDR: apply 2.2->2.4 gamma transform (0 or 1)
     float grayscalePeakNits;   // HDR grayscale peak - must match ColourSpace target peak
     float isFP16SDR;           // ACM: FP16 capture with SDR color space (input is linear scRGB)
-    float _padding2;
-    float _padding3;
+    float pqTargetPeak;        // Precomputed PQ of tonemapTargetPeak (avoids per-pixel pow())
+    float pqGrayscalePeak;     // Precomputed PQ of grayscalePeakNits (avoids per-pixel pow())
     float4 grayscale[8];
 };
 
@@ -96,11 +96,12 @@ float3 Apply24Gamma(float3 rgb) {
 // SDR grayscale: sqrt distribution in linear space
 float3 ApplyGrayscaleCorrection(float3 rgb) {
     if (grayscaleEnabled < 0.5) return rgb;
+    float pointCount = max(2.0f, grayscalePoints);
     float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
     // sqrt distribution: index = sqrt(Y) * (N-1), curve stores Y values
-    float idx = sqrt(saturate(Y)) * (grayscalePoints - 1.0f);
+    float idx = sqrt(saturate(Y)) * (pointCount - 1.0f);
     int i0 = (int)floor(idx);
-    int i1 = min(i0 + 1, (int)grayscalePoints - 1);
+    int i1 = min(i0 + 1, (int)pointCount - 1);
     float v0 = grayscale[i0 / 4][i0 % 4];
     float v1 = grayscale[i1 / 4][i1 % 4];
     float t = idx - floor(idx);
@@ -375,23 +376,24 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     // If content already fits display, no tonemapping needed
     if (sourcePeakNits <= tonemapTargetPeak) return ictcp;
 
-    // Convert peaks to PQ domain (2 pow() ops total - much better than 4)
+    // Source peak varies (dynamic detection) - must compute per-pixel
+    // Target peak is precomputed in constant buffer (pqTargetPeak)
     float pqSourcePeak = Linear_to_PQ_scalar(sourcePeakNits / 10000.0f);
-    float pqTargetPeak = Linear_to_PQ_scalar(tonemapTargetPeak / 10000.0f);
+    float pqTgtPeak = pqTargetPeak;  // Precomputed from CPU
 
     // Apply PQ-native curve directly on I channel
     float I_mapped;
     if (tonemapCurve < 0.5f) {
         // BT.2390 EETF - spec-native PQ implementation (ITU-R BT.2390)
-        I_mapped = TonemapBT2390_PQ(I, pqSourcePeak, pqTargetPeak);
+        I_mapped = TonemapBT2390_PQ(I, pqSourcePeak, pqTgtPeak);
     }
     else if (tonemapCurve < 1.5f) {
         // Soft clip - PQ native
-        I_mapped = TonemapSoftClip_PQ(I, pqSourcePeak, pqTargetPeak, tonemapTargetPeak);
+        I_mapped = TonemapSoftClip_PQ(I, pqSourcePeak, pqTgtPeak, tonemapTargetPeak);
     }
     else if (tonemapCurve < 2.5f) {
         // Reinhard - PQ native
-        I_mapped = TonemapReinhard_PQ(I, pqSourcePeak, pqTargetPeak, tonemapTargetPeak);
+        I_mapped = TonemapReinhard_PQ(I, pqSourcePeak, pqTgtPeak, tonemapTargetPeak);
     }
     else if (tonemapCurve < 3.5f) {
         // BT.2446A - linear-space (complex gamma operations don't translate to PQ)
@@ -403,7 +405,7 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     }
     else {
         // Hard clip - trivial PQ native
-        I_mapped = TonemapHardClip_PQ(I, pqTargetPeak);
+        I_mapped = TonemapHardClip_PQ(I, pqTgtPeak);
     }
 
     // Return with CT/CP unchanged - hue and saturation preserved!
@@ -415,13 +417,13 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 // Much more accurate than the old max-channel approximation
 float3 ApplyGrayscaleICtCp(float3 ictcp) {
     if (grayscaleEnabled < 0.5f) return ictcp;
+    float pointCount = max(2.0f, grayscalePoints);
 
     float I = ictcp.x;
     if (I < 1e-6f) return ictcp;
 
-    // Convert grayscalePeakNits to PQ value for scaling
-    // Guard against zero/negative peak (would cause division by zero)
-    float pqPeak = Linear_to_PQ_scalar(max(grayscalePeakNits, 1.0f) / 10000.0f);
+    // Use precomputed PQ peak from constant buffer (avoids per-pixel pow() calls)
+    float pqPeak = pqGrayscalePeak;
 
     float scaledI = I / pqPeak;
     float correctedI;
@@ -429,16 +431,16 @@ float3 ApplyGrayscaleICtCp(float3 ictcp) {
     if (scaledI <= 1.0f) {
         // Within calibration range - linear interpolation
         // No undulations, kinks imperceptible in practice
-        float idx = scaledI * (grayscalePoints - 1.0f);
+        float idx = scaledI * (pointCount - 1.0f);
         int i0 = (int)floor(idx);
-        int i1 = min(i0 + 1, (int)grayscalePoints - 1);
+        int i1 = min(i0 + 1, (int)pointCount - 1);
         float t = idx - floor(idx);
         float v0 = grayscale[i0 / 4][i0 % 4];
         float v1 = grayscale[i1 / 4][i1 % 4];
         correctedI = lerp(v0, v1, t) * pqPeak;
     } else {
         // Above peak - apply same correction factor as last point
-        int lastIdx = (int)grayscalePoints - 1;
+        int lastIdx = (int)pointCount - 1;
         float lastCurveValue = grayscale[lastIdx / 4][lastIdx % 4];
         correctedI = lastCurveValue * I;
     }
@@ -564,7 +566,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // ═══════════════════════════════════════════════════════════════════════
 
         // Primaries correction: adjusts for display's actual vs ideal primaries
-        // Includes Bradford chromatic adaptation for white point correction
+        // Pure gamut mapping (no chromatic adaptation - white point shift via separate gains)
         rec2020 = ApplyPrimariesMatrix(rec2020);
 
         // ═══════════════════════════════════════════════════════════════════════

@@ -1426,7 +1426,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     wchar_t buf[16];
                     GetWindowText(g_gui.hwndTonemapTarget, buf, 16);
                     tm.targetPeakNits = (float)_wtof(buf);
-                    if (tm.targetPeakNits < 100.0f) tm.targetPeakNits = 100.0f;
+                    if (tm.targetPeakNits < 10.0f) tm.targetPeakNits = 10.0f;
                     if (tm.targetPeakNits > 10000.0f) tm.targetPeakNits = 10000.0f;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
@@ -1455,7 +1455,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     wchar_t buf[16];
                     GetWindowText(g_gui.hwndTonemapSource, buf, 16);
                     tm.sourcePeakNits = (float)_wtof(buf);
-                    if (tm.sourcePeakNits < 100.0f) tm.sourcePeakNits = 100.0f;
+                    if (tm.sourcePeakNits < 10.0f) tm.sourcePeakNits = 10.0f;
                     if (tm.sourcePeakNits > 10000.0f) tm.sourcePeakNits = 10000.0f;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
@@ -1814,6 +1814,48 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowWindow(hwnd, SW_HIDE);
         }
         return 0;
+
+    case WM_DISPLAYCHANGE: {
+        // Monitor hotplug: re-enumerate and update if count changed
+        std::vector<HMONITOR> newMonitors;
+        EnumDisplayMonitors(nullptr, nullptr, GUIMonitorEnumProc, reinterpret_cast<LPARAM>(&newMonitors));
+        if (newMonitors.size() != g_gui.monitors.size()) {
+            std::cout << "Display change: monitor count " << g_gui.monitors.size()
+                      << " -> " << newMonitors.size() << std::endl;
+            g_gui.monitors = newMonitors;
+
+            // Resize monitorSettings, preserving existing entries
+            size_t oldSize = g_gui.monitorSettings.size();
+            g_gui.monitorSettings.resize(newMonitors.size());
+
+            // Update monitor names and combo box
+            g_gui.monitorNames.clear();
+            SendMessage(g_gui.hwndMonitorList, CB_RESETCONTENT, 0, 0);
+            for (size_t i = 0; i < newMonitors.size(); i++) {
+                MONITORINFO mi = { sizeof(mi) };
+                GetMonitorInfo(newMonitors[i], &mi);
+                wchar_t name[64];
+                swprintf_s(name, L"Monitor %d (%dx%d)", (int)i + 1,
+                    mi.rcMonitor.right - mi.rcMonitor.left,
+                    mi.rcMonitor.bottom - mi.rcMonitor.top);
+                g_gui.monitorNames.push_back(name);
+                SendMessage(g_gui.hwndMonitorList, CB_ADDSTRING, 0, (LPARAM)name);
+            }
+
+            // Clamp current monitor selection
+            if (g_gui.currentMonitor >= (int)newMonitors.size()) {
+                g_gui.currentMonitor = (int)newMonitors.size() - 1;
+            }
+            if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
+            SendMessage(g_gui.hwndMonitorList, CB_SETCURSEL, g_gui.currentMonitor, 0);
+
+            // Force reinit if processing is running
+            if (g_gui.isRunning) {
+                g_forceReinit.store(true);
+            }
+        }
+        return 0;
+    }
 
     case WM_POWERBROADCAST:
         // Handle power events for sleep/wake recovery (defense in depth with overlay WndProc)

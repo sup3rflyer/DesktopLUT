@@ -164,11 +164,11 @@ static bool CheckGammaWhitelist() {
     if (found) {
         if (!wasActive) {
             // Just detected whitelisted app - disable gamma
-            g_gammaWhitelistActive.store(true);
             {
                 std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
                 g_gammaWhitelistMatch = matchedProcess;
             }
+            g_gammaWhitelistActive.store(true);
             g_desktopGammaMode.store(false);
             std::wcout << L"Gamma whitelist: detected " << matchedProcess << L", disabling desktop gamma" << std::endl;
             ShowOSD(L"Gamma: sRGB");
@@ -303,37 +303,57 @@ static void CheckMhcProfiles() {
     if (g_monitors.empty()) return;
     if (!IsMHC2ApiAvailable()) return;
 
-    int numMonitors = (int)g_gui.monitorSettings.size();
-    for (int i = 0; i < numMonitors; i++) {
-        const auto& ms = g_gui.monitorSettings[i];
+    // Snapshot MHC data under lock to avoid racing with GUI thread writes
+    struct MhcSnapshot {
+        bool sdrEnabled; std::wstring sdrProfileName;
+        bool hdrEnabled; std::wstring hdrProfileName;
+    };
+    std::vector<MhcSnapshot> snapshots;
+    HWND hwndMain;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        int numMonitors = (int)g_gui.monitorSettings.size();
+        snapshots.reserve(numMonitors);
+        for (int i = 0; i < numMonitors; i++) {
+            const auto& ms = g_gui.monitorSettings[i];
+            snapshots.push_back({
+                ms.sdrMHC.enabled, ms.sdrMHC.profileName,
+                ms.hdrMHC.enabled, ms.hdrMHC.profileName
+            });
+        }
+        hwndMain = g_gui.hwndMain;
+    }
+
+    for (int i = 0; i < (int)snapshots.size(); i++) {
+        const auto& snap = snapshots[i];
 
         DisplayInfo displayInfo;
         if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
 
         // Check SDR profile
-        if (ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) {
+        if (snap.sdrEnabled && !snap.sdrProfileName.empty()) {
             std::wstring current = QueryDisplayDefaultProfile(displayInfo.adapterId, displayInfo.sourceId, false);
-            if (!current.empty() && current != ms.sdrMHC.profileName) {
+            if (!current.empty() && current != snap.sdrProfileName) {
                 std::wcout << L"MHC monitor: SDR profile displaced on monitor " << i
-                           << L" (expected '" << ms.sdrMHC.profileName
+                           << L" (expected '" << snap.sdrProfileName
                            << L"', found '" << current << L"'), reapplying" << std::endl;
-                ReassociateMHC2Profile(ms.sdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, false);
-                if (g_gui.hwndMain) {
-                    PostMessage(g_gui.hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, 0);
+                ReassociateMHC2Profile(snap.sdrProfileName, displayInfo.adapterId, displayInfo.sourceId, false);
+                if (hwndMain) {
+                    PostMessage(hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, 0);
                 }
             }
         }
 
         // Check HDR profile
-        if (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()) {
+        if (snap.hdrEnabled && !snap.hdrProfileName.empty()) {
             std::wstring current = QueryDisplayDefaultProfile(displayInfo.adapterId, displayInfo.sourceId, true);
-            if (!current.empty() && current != ms.hdrMHC.profileName) {
+            if (!current.empty() && current != snap.hdrProfileName) {
                 std::wcout << L"MHC monitor: HDR profile displaced on monitor " << i
-                           << L" (expected '" << ms.hdrMHC.profileName
+                           << L" (expected '" << snap.hdrProfileName
                            << L"', found '" << current << L"'), reapplying" << std::endl;
-                ReassociateMHC2Profile(ms.hdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                if (g_gui.hwndMain) {
-                    PostMessage(g_gui.hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, 1);
+                ReassociateMHC2Profile(snap.hdrProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+                if (hwndMain) {
+                    PostMessage(hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, 1);
                 }
             }
         }

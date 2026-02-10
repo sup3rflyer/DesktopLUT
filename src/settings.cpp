@@ -4,6 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include <cwchar>
+#include <iostream>
 
 std::wstring GetIniPath() {
     wchar_t exePath[MAX_PATH];
@@ -192,6 +193,12 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
     // Ensure points vector size matches pointCount, reinitialize if mismatch or empty
     if (cc.grayscale.points.empty() || (int)cc.grayscale.points.size() != cc.grayscale.pointCount) {
+        if (!cc.grayscale.points.empty()) {
+            std::wcerr << L"Warning: " << section << L"/" << p
+                       << L"GrayscaleData has " << cc.grayscale.points.size()
+                       << L" points but GrayscalePoints=" << cc.grayscale.pointCount
+                       << L", reinitializing to linear" << std::endl;
+        }
         cc.grayscale.points.resize(cc.grayscale.pointCount);
         if (isHDR) {
             cc.grayscale.initLinearPQ();
@@ -202,7 +209,7 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     // HDR-specific settings
     if (isHDR) {
         float peakNits = GetPrivateProfileFloat(section, (p + L"GrayscalePeak").c_str(), 10000.0f, iniPath);
-        cc.grayscale.peakNits = (peakNits >= 100.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
+        cc.grayscale.peakNits = (peakNits >= 10.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
     } else {
         cc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"Grayscale24").c_str(), false, iniPath);
     }
@@ -215,8 +222,8 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         cc.tonemap.curve = StringToTonemapCurve(curveBuf);
         float srcPeak = GetPrivateProfileFloat(section, (p + L"TonemapSourcePeak").c_str(), 10000.0f, iniPath);
         float tgtPeak = GetPrivateProfileFloat(section, (p + L"TonemapTargetPeak").c_str(), 1000.0f, iniPath);
-        cc.tonemap.sourcePeakNits = (srcPeak >= 100.0f && srcPeak <= 10000.0f) ? srcPeak : 10000.0f;
-        cc.tonemap.targetPeakNits = (tgtPeak >= 100.0f && tgtPeak <= 10000.0f) ? tgtPeak : 1000.0f;
+        cc.tonemap.sourcePeakNits = (srcPeak >= 10.0f && srcPeak <= 10000.0f) ? srcPeak : 10000.0f;
+        cc.tonemap.targetPeakNits = (tgtPeak >= 10.0f && tgtPeak <= 10000.0f) ? tgtPeak : 1000.0f;
         cc.tonemap.dynamicPeak = GetPrivateProfileBool(section, (p + L"TonemapDynamic").c_str(), false, iniPath);
     }
 }
@@ -335,6 +342,12 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         }
     }
     if (mhc.grayscale.points.empty() || (int)mhc.grayscale.points.size() != mhc.grayscale.pointCount) {
+        if (!mhc.grayscale.points.empty()) {
+            std::wcerr << L"Warning: " << section << L"/" << p
+                       << L"MHCGrayscaleData has " << mhc.grayscale.points.size()
+                       << L" points but MHCGrayscalePoints=" << mhc.grayscale.pointCount
+                       << L", reinitializing to linear" << std::endl;
+        }
         mhc.grayscale.points.resize(mhc.grayscale.pointCount);
         if (isHDR) mhc.grayscale.initLinearPQ();
         else mhc.grayscale.initLinear();
@@ -342,7 +355,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
 
     if (isHDR) {
         float peakNits = GetPrivateProfileFloat(section, (p + L"MHCGrayscalePeak").c_str(), 10000.0f, iniPath);
-        mhc.grayscale.peakNits = (peakNits >= 100.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
+        mhc.grayscale.peakNits = (peakNits >= 10.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
     } else {
         mhc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), false, iniPath);
     }
