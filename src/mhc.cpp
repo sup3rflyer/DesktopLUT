@@ -25,7 +25,7 @@
 #pragma comment(lib, "Advapi32.lib")
 
 // ============================================================================
-// ICC Binary Helpers
+// SECTION: ICC Binary Helpers
 // ============================================================================
 
 // Convert float to ICC s15Fixed16Number (multiply by 65536, round)
@@ -77,7 +77,7 @@ static void PadTo4(std::vector<uint8_t>& buf) {
 }
 
 // ============================================================================
-// ICC Tag Writers
+// SECTION: ICC Tag Writers
 // ============================================================================
 
 // Write XYZ tag (20 bytes: 'XYZ ' + reserved + 3x s15Fixed16)
@@ -140,7 +140,7 @@ static void WriteTextTag(std::vector<uint8_t>& buf, const char* text) {
 }
 
 // ============================================================================
-// MHC2 Tag Writer
+// SECTION: MHC2 Tag Writer
 // ============================================================================
 
 // Write MHC2 tag
@@ -204,7 +204,7 @@ static void WriteMHC2Tag(std::vector<uint8_t>& buf, const float matrix[12],
 }
 
 // ============================================================================
-// Matrix Math Helpers (local copies to avoid exposing color.cpp internals)
+// SECTION: Matrix Math
 // ============================================================================
 
 static void MatMul3(const float a[9], const float b[9], float out[9]) {
@@ -276,7 +276,7 @@ static bool BuildRGBtoXYZ(const DisplayPrimariesData& p, float outMatrix[9]) {
 }
 
 // ============================================================================
-// Standard Color Space Constants
+// SECTION: Color Space Constants
 // ============================================================================
 
 // sRGB / BT.709 primaries (D65)
@@ -303,7 +303,7 @@ static const float g_bradfordD65toD50[9] = {
 };
 
 // ============================================================================
-// MHC2 Matrix Computation
+// SECTION: MHC2 Matrix Computation
 // ============================================================================
 
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
@@ -347,7 +347,7 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
 }
 
 // ============================================================================
-// MHC2 1D LUT Generation
+// SECTION: Transfer Functions
 // ============================================================================
 
 // sRGB EOTF: decode sRGB-encoded value to linear light
@@ -384,6 +384,10 @@ static float PqOETF(float L) {
     float Ym = powf(Y, PQ_m1);
     return powf((PQ_c1 + PQ_c2 * Ym) / (1.0f + PQ_c3 * Ym), PQ_m2);
 }
+
+// ============================================================================
+// SECTION: Grayscale Evaluation
+// ============================================================================
 
 // Evaluate SDR grayscale correction (matches shader's ApplyGrayscaleCorrection)
 // Input/output are linear light values (0-1)
@@ -429,6 +433,10 @@ static float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPe
         return lastVal * pqValue;
     }
 }
+
+// ============================================================================
+// SECTION: 1D LUT Generation
+// ============================================================================
 
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize) {
     for (int j = 0; j < lutSize; j++) {
@@ -476,7 +484,7 @@ void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT,
 }
 
 // ============================================================================
-// Per-channel TRC → MHC2 1D LUT (ICC file import path)
+// SECTION: Per-channel TRC → MHC2 1D LUT (ICC file import path)
 // ============================================================================
 
 // Invert a tabulated TRC: given target linear value, find the signal that produces it.
@@ -528,7 +536,7 @@ void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, i
 }
 
 // ============================================================================
-// MD5 Computation (for ICC profile ID)
+// SECTION: MD5 Hashing
 // ============================================================================
 
 static bool ComputeMD5(const uint8_t* data, size_t size, uint8_t outHash[16]) {
@@ -559,7 +567,7 @@ static bool ComputeMD5(const uint8_t* data, size_t size, uint8_t outHash[16]) {
 }
 
 // ============================================================================
-// ICC v4 Profile Generation
+// SECTION: ICC Profile Generation
 // ============================================================================
 
 bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& outData) {
@@ -858,7 +866,7 @@ bool WriteMHC2Profile(const std::vector<uint8_t>& data, const std::wstring& file
 }
 
 // ============================================================================
-// Profile Installation / Removal
+// SECTION: MSCMS API Loading
 // ============================================================================
 
 // Function pointer types for dynamically loaded ICM APIs
@@ -869,11 +877,15 @@ typedef HRESULT(WINAPI* PFN_ColorProfileAddDisplayAssociation)(
 typedef HRESULT(WINAPI* PFN_ColorProfileRemoveDisplayAssociation)(
     int scope, PCWSTR profileName, LUID adapterId, UINT32 sourceId,
     BOOL dissociateAdvancedColor);
+typedef HRESULT(WINAPI* PFN_ColorProfileGetDisplayDefault)(
+    int scope, LUID targetAdapterID, UINT32 sourceID,
+    int profileType, int profileSubType, LPWSTR* profileName);
 
 static HMODULE g_hMscms = nullptr;
 static PFN_InstallColorProfileW g_pfnInstallColorProfile = nullptr;
 static PFN_ColorProfileAddDisplayAssociation g_pfnAddAssociation = nullptr;
 static PFN_ColorProfileRemoveDisplayAssociation g_pfnRemoveAssociation = nullptr;
+static PFN_ColorProfileGetDisplayDefault g_pfnGetDisplayDefault = nullptr;
 static bool g_mscmsChecked = false;
 
 static void EnsureMscmsLoaded() {
@@ -892,6 +904,8 @@ static void EnsureMscmsLoaded() {
         GetProcAddress(g_hMscms, "ColorProfileAddDisplayAssociation");
     g_pfnRemoveAssociation = (PFN_ColorProfileRemoveDisplayAssociation)
         GetProcAddress(g_hMscms, "ColorProfileRemoveDisplayAssociation");
+    g_pfnGetDisplayDefault = (PFN_ColorProfileGetDisplayDefault)
+        GetProcAddress(g_hMscms, "ColorProfileGetDisplayDefault");
 
     if (g_pfnAddAssociation) {
         std::cout << "MHC2: Color management APIs available" << std::endl;
@@ -904,6 +918,10 @@ bool IsMHC2ApiAvailable() {
     EnsureMscmsLoaded();
     return g_pfnInstallColorProfile && g_pfnAddAssociation && g_pfnRemoveAssociation;
 }
+
+// ============================================================================
+// SECTION: ICC Profile I/O (Install, Remove, Reassociate)
+// ============================================================================
 
 bool InstallMHC2Profile(const std::wstring& profilePath, LUID adapterLuid, UINT32 sourceId, bool isHDR) {
     EnsureMscmsLoaded();
@@ -1014,7 +1032,7 @@ bool ReassociateMHC2Profile(const std::wstring& profileName, LUID adapterLuid, U
 }
 
 // ============================================================================
-// ICC Profile Reader
+// SECTION: ICC Profile Reading
 // ============================================================================
 
 // Read big-endian 32-bit from buffer
@@ -1269,6 +1287,10 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
     return outData.hasPrimaries || outData.hasTRC;
 }
 
+// ============================================================================
+// SECTION: Grayscale Extraction
+// ============================================================================
+
 bool ExtractGrayscaleFromICC(const ICCProfileData& icc, GrayscaleSettings& outGrayscale, bool isHDR) {
     if (!icc.hasTRC) return false;
 
@@ -1325,10 +1347,6 @@ bool ExtractGrayscaleFromICC(const ICCProfileData& icc, GrayscaleSettings& outGr
 
     return true;
 }
-
-// ============================================================================
-// Cube LUT Grayscale Extraction
-// ============================================================================
 
 bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGrayscale) {
     // Load cube file
@@ -1391,7 +1409,7 @@ bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGr
 }
 
 // ============================================================================
-// 1D .cube LUT Loading (per-channel correction curves)
+// SECTION: 1D Cube Loading
 // ============================================================================
 
 bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vector<float>& outG, std::vector<float>& outB) {
@@ -1463,8 +1481,35 @@ bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vect
 }
 
 // ============================================================================
-// MHC Profile Maintenance
+// SECTION: Profile Query & Cleanup
 // ============================================================================
+
+std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool isHDR) {
+    EnsureMscmsLoaded();
+    if (!g_pfnGetDisplayDefault) return L"";
+
+    // profileSubType: 7 = CPST_EXTENDED_DISPLAY_IDENTIFICATION_DATA (SDR default)
+    //                 8 = CPST_ADVANCED_COLOR (HDR default)
+    int subType = isHDR ? 8 : 7;
+
+    LPWSTR profileName = nullptr;
+    HRESULT hr = g_pfnGetDisplayDefault(
+        1,              // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
+        adapterLuid,
+        sourceId,
+        0,              // CPT_ICC
+        subType,
+        &profileName
+    );
+
+    if (FAILED(hr) || !profileName) {
+        return L"";
+    }
+
+    std::wstring result(profileName);
+    LocalFree(profileName);
+    return result;
+}
 
 void CleanupOrphanedMhcProfiles() {
     // Build set of profile names currently referenced by settings

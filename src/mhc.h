@@ -119,6 +119,14 @@ bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGr
 bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vector<float>& outG, std::vector<float>& outB);
 
 // ============================================================================
+// Profile Query (for monitoring)
+// ============================================================================
+
+// Query the current default ICC profile for a display from Windows Color Management
+// Returns the profile filename, or empty string if unavailable
+std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool isHDR);
+
+// ============================================================================
 // MHC Profile Maintenance
 // ============================================================================
 

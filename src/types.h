@@ -35,7 +35,8 @@
 #define ID_TETRAHEDRAL_CHECK 112
 #define ID_GAMMA_WHITELIST_BTN 113
 #define ID_TRAY_ICON        1
-#define WM_TRAYICON         (WM_USER + 1)
+#define WM_TRAYICON              (WM_USER + 1)
+#define WM_MHC_PROFILE_REAPPLIED (WM_USER + 101)
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003

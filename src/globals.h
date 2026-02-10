@@ -139,6 +139,12 @@ extern std::chrono::steady_clock::time_point g_lastSuccessfulFrame;
 extern std::atomic<bool> g_displayOff;  // Display is off - skip recovery attempts, wait for wake signal
 
 // ============================================================================
+// MHC Edit Dialog State
+// ============================================================================
+
+extern std::atomic<bool> g_mhcEditDialogOpen;  // Suppress profile monitoring during edit dialog
+
+// ============================================================================
 // GUI State
 // ============================================================================
 
