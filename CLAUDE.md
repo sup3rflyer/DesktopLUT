@@ -101,7 +101,7 @@ Key APIs:
 - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` prevents feedback loop
 - `ColorProfileAddDisplayAssociation` / `ColorProfileRemoveDisplayAssociation` for MHC ICC management
 
-## Module Structure (~6,000 lines)
+## Module Structure (~14,000 lines)
 
 | Module | Purpose |
 |--------|---------|
@@ -118,8 +118,13 @@ Key APIs:
 | `osd.h/cpp` | On-screen display notifications |
 | `analysis.h/cpp` | Real-time frame analysis overlay |
 | `processing.h/cpp` | Processing thread management |
-| `gui.h/cpp` | Win32 GUI, controls, system tray |
+| `gui.h/cpp` | Win32 GUI core, tabs, system tray, monitor hotplug |
+| `gui_mhc.h/cpp` | MHC tab dialogs, profile generation/installation UI |
+| `gui_grayscale.cpp` | Grayscale correction UI (shared SDR/HDR) |
+| `gui_shared.h/cpp` | Shared GUI helpers (layout, scroll, owner-draw) |
+| `gui_whitelist.h/cpp` | Whitelist edit dialog (gamma, passthrough) |
 | `mhc.h/cpp` | MHC2 ICC profile generation, installation, ICC reading, grayscale extraction |
+| `whitelist.h/cpp` | Process whitelist monitoring (gamma, passthrough, MHC profiles) |
 | `displayconfig.h/cpp` | Windows display config (MaxTML, EDID parsing, primaries detection) |
 
 ## Key Implementation Patterns
@@ -131,16 +136,18 @@ Key APIs:
 - `GRAYSCALE_RANGE = 25`: ±25% deviation range for grayscale sliders
 
 ### Thread Safety
-- Atomics: `g_desktopGammaMode`, `g_tetrahedralInterp`, `g_forceReinit`, `g_userDesktopGammaMode`, `g_hasPendingColorCorrections`, `g_logPeakDetection`, `g_consoleEnabled`, `g_hotkeyGammaEnabled`, `g_hotkeyHdrEnabled`, `g_hotkeyAnalysisEnabled`, `g_startMinimized`
+- Atomics: `g_desktopGammaMode`, `g_tetrahedralInterp`, `g_forceReinit`, `g_userDesktopGammaMode`, `g_hasPendingColorCorrections`, `g_logPeakDetection`, `g_consoleEnabled`, `g_hotkeyGammaEnabled`, `g_hotkeyHdrEnabled`, `g_hotkeyAnalysisEnabled`, `g_startMinimized`, `g_mainHwnd`, `g_forceTopmostReassert`
 - `g_gammaWhitelistMutex`: protects whitelist vector and match strings
+- `g_monitorSettingsMutex`: protects per-monitor MHC settings (profile names, enabled flags) — whitelist thread snapshots under lock
 - `g_colorCorrectionMutex`: protects pending update queue (atomic fast-path skips lock when empty)
 
 ### Error Recovery
 - **TDR/GPU crash**: Detects `DXGI_ERROR_DEVICE_REMOVED`, hides overlays, waits 2s, recreates device
 - **ACCESS_LOST**: Exponential backoff (50ms to 5s), reinit duplication, auto-recovers
 - **Sleep/wake**: `WM_POWERBROADCAST` + `GUID_CONSOLE_DISPLAY_STATE` triggers forced reinit after 500ms
+- **Monitor hotplug**: `WM_DISPLAYCHANGE` re-enumerates monitors, updates combo box, resizes settings, triggers forced reinit
 - **Watchdog**: 5s timeout with no successful frame → hide overlays and exit
-- **Matrix inversion**: Falls back to identity matrix if singular (degenerate primaries)
+- **Matrix inversion**: Falls back to identity matrix if singular (degenerate primaries — both source and target checked)
 - **LUT loading**: Validates size 2-128, catches allocation failures gracefully
 
 ### Black Frame Prevention
@@ -173,7 +180,7 @@ Uses `QueryFreshOutputDesc` (creates fresh DXGI factory each time, avoids stale 
 - Row 2: grayscalePoints, grayscaleEnabled, tonemapEnabled, tonemapCurve
 - Rows 3-5: primaries matrix (3x3, includes Bradford chromatic adaptation)
 - Row 6: tonemapSourcePeak, tonemapTargetPeak, tonemapDynamic, grayscale24
-- Row 7: grayscalePeakNits, padding (3 floats)
+- Row 7: grayscalePeakNits, isFP16SDR, pqTargetPeak, pqGrayscalePeak (precomputed PQ peaks)
 - Rows 8-15: grayscale LUT (32 floats packed into 8 float4s)
 
 **HDR Pipeline (ICtCp-based)**:
@@ -207,7 +214,7 @@ scRGB → Desktop Gamma → BT.709→Rec.2020 → Primaries (with Bradford)
 
 ## Data Structures (types.h)
 
-**MonitorContext**: Per-monitor state (window, swapchain, duplication, LUTs, color correction, analysis resources)
+**MonitorContext**: Per-monitor state (window, swapchain, duplication, LUTs, color correction, analysis resources, constant buffer dirty tracking)
 
 **ColorCorrectionData**: Runtime format (fixed-size grayscale array, calculated matrix)
 
@@ -230,10 +237,10 @@ scRGB → Desktop Gamma → BT.709→Rec.2020 → Primaries (with Bradford)
 `StartProcessing()` → build configs → spawn `ProcessingThreadFunc()` → init D3D → init duplication per monitor → register hotkeys → create OSD → start whitelist thread → render loop
 
 ### Render Loop
-`RenderAll()` → device health check (every 60 frames) → watchdog check → forced reinit check → TOPMOST reassert (every 100ms) → apply pending color corrections → `RenderMonitor()` per monitor
+`RenderAll()` → device health check (every 60 frames) → watchdog check → forced reinit check → TOPMOST reassert (event-driven via WM_WINDOWPOSCHANGING + 10s fallback) → apply pending color corrections → `RenderMonitor()` per monitor
 
 ### RenderMonitor
-Acquire frame → create capture SRV → update constant buffer → run peak detection compute (if dynamic tonemap) → set pipeline state → draw fullscreen triangle → analysis compute (primary only) → present → two-phase visibility handling
+Acquire frame → create capture SRV → update constant buffer (dirty-tracked, skips Map/Unmap when unchanged) → run peak detection compute (if dynamic tonemap) → set pipeline state → draw fullscreen triangle → analysis compute (primary only) → present → two-phase visibility handling
 
 ## GUI Implementation Notes (gui.cpp)
 
@@ -251,7 +258,7 @@ Acquire frame → create capture SRV → update constant buffer → run peak det
 
 ## Adding Features
 
-1. **New setting**: Add to `types.h` structs → `settings.cpp` load/save → `gui.cpp` controls → `processing.cpp` conversion
+1. **New setting**: Add to `types.h` structs → `settings.cpp` load/save → GUI module (`gui.cpp` for Corrections/Settings, `gui_mhc.cpp` for MHC) → `processing.cpp` conversion
 2. **New shader param**: Add to constant buffer in `shader.h` → update `RenderMonitor()` in `render.cpp`
 3. **New hotkey**: Add constant in `types.h` → global in `globals.h/cpp` → `settings.cpp` load/save → `gui.cpp` Settings tab control → register in `processing.cpp` (use `MOD_NOREPEAT`) → handle in `WndProc()` in `render.cpp`
 4. **New recovery scenario**: Handle in `RenderMonitor()` or `RenderAll()` with appropriate backoff

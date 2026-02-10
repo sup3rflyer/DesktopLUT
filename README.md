@@ -50,8 +50,8 @@ If you just want to fix common issues without a colorimeter:
 4. Add video players and games to the whitelist so HDR mastered content is not affected
 
 **Oversaturated colors on wide-gamut display:**
-1. Go to **SDR Options** tab
-2. Enable **Primaries Correction**
+1. Go to **Corrections** tab
+2. Enable **Primaries Correction** in the SDR section
 3. Click **Detect** or select a preset matching your display (P3-D65, Adobe RGB, etc.)
 4. Click **Enable**
 
@@ -74,7 +74,7 @@ Pre-calibrate with your monitor's OSD settings.
 
 ### Step 1: Enter Your Display's Native Primaries
 
-Go to the **SDR Options** tab (or HDR Options for HDR calibration).
+Go to the **Corrections** tab (both SDR and HDR sections are shown simultaneously).
 
 1. Enable **Primaries Correction**
 2. Click **Detect** to read your monitor's EDID, or enter values from your display's spec sheet
@@ -104,7 +104,7 @@ This is crucial: **run your profiling software while DesktopLUT is active** with
 
 ### Step 4: Load the LUT
 
-1. In the **LUT Options** tab, browse to your generated .cube file
+1. In the **3D LUT** tab, browse to your generated .cube file
 2. If you calibrate HDR separately, load that LUT in the HDR field
 3. Click **Enable**
 
