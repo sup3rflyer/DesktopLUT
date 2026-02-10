@@ -196,7 +196,7 @@ Windows and media players apply their own tonemapping, which can conflict with D
 
 Now DesktopLUT is the only tonemapper in the chain, giving you consistent results and your choice of curve.
 
-> **MHC peak nits vs MaxTML:** These serve different purposes. The MHC HDR profile peak controls how grayscale correction points are distributed in PQ space — set it to your display's actual peak for accurate calibration. MaxTML at 10000 is a separate system-level override that tells Windows to skip its tonemapping. If you find that Windows still tonemaps despite MaxTML=10000 (some driver combinations), try setting the MHC peak to 10000 as well — you'll trade some grayscale precision for a guaranteed passthrough.
+> **MHC peak nits:** If you loaded a 1D .cube or ICC file, the peak value only affects profile metadata — the correction curve comes from the file itself, so peak doesn't change the actual correction. If you're using the built-in grayscale editor instead, set peak to your display's actual peak (or your 3D LUT profiling target) — it controls where the 32 correction points are placed in PQ space. MaxTML at 10000 is a separate system-level override that tells Windows to skip its tonemapping.
 
 ## Other HDR Notes
 
