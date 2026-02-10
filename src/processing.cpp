@@ -541,6 +541,9 @@ static void GetWhitePointFromEditBoxes(float& Wx, float& Wy, bool isHDR) {
 }
 
 bool SettingsChanged() {
+    // Only check settings that require a full restart (LUT paths).
+    // Color corrections (primaries, grayscale, tonemapping, white point) are
+    // live-updated via the pending queue and don't need a restart.
     if (g_gui.monitorSettings.size() != g_gui.activeSettings.size()) {
         return true;
     }
@@ -548,57 +551,6 @@ bool SettingsChanged() {
         if (g_gui.monitorSettings[i].sdrPath != g_gui.activeSettings[i].sdrPath ||
             g_gui.monitorSettings[i].hdrPath != g_gui.activeSettings[i].hdrPath) {
             return true;
-        }
-    }
-
-    // Compare per-monitor settings that affect rendering
-    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        const auto& cur = g_gui.monitorSettings[i];
-        const auto& act = g_gui.activeSettings[i];
-
-        // Check SDR color correction
-        if (cur.sdrColorCorrection.primariesEnabled != act.sdrColorCorrection.primariesEnabled ||
-            cur.sdrColorCorrection.primariesPreset != act.sdrColorCorrection.primariesPreset ||
-            cur.sdrColorCorrection.grayscale.enabled != act.sdrColorCorrection.grayscale.enabled ||
-            cur.sdrColorCorrection.grayscale.pointCount != act.sdrColorCorrection.grayscale.pointCount ||
-            fabsf(cur.sdrColorCorrection.customPrimaries.Wx - act.sdrColorCorrection.customPrimaries.Wx) > 0.0001f ||
-            fabsf(cur.sdrColorCorrection.customPrimaries.Wy - act.sdrColorCorrection.customPrimaries.Wy) > 0.0001f) {
-            return true;
-        }
-
-        // Check HDR color correction
-        if (cur.hdrColorCorrection.primariesEnabled != act.hdrColorCorrection.primariesEnabled ||
-            cur.hdrColorCorrection.primariesPreset != act.hdrColorCorrection.primariesPreset ||
-            cur.hdrColorCorrection.grayscale.enabled != act.hdrColorCorrection.grayscale.enabled ||
-            cur.hdrColorCorrection.grayscale.pointCount != act.hdrColorCorrection.grayscale.pointCount ||
-            cur.hdrColorCorrection.tonemap.enabled != act.hdrColorCorrection.tonemap.enabled ||
-            fabsf(cur.hdrColorCorrection.customPrimaries.Wx - act.hdrColorCorrection.customPrimaries.Wx) > 0.0001f ||
-            fabsf(cur.hdrColorCorrection.customPrimaries.Wy - act.hdrColorCorrection.customPrimaries.Wy) > 0.0001f) {
-            return true;
-        }
-    }
-
-    // Check current monitor's white point from edit boxes (may differ from stored settings)
-    if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.activeSettings.size()) {
-        // Check SDR white point
-        {
-            float Wx = 0.3127f, Wy = 0.3290f;
-            GetWhitePointFromEditBoxes(Wx, Wy, false);
-            const auto& activeCC = g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection;
-            if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
-                fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
-                return true;
-            }
-        }
-        // Check HDR white point
-        {
-            float Wx = 0.3127f, Wy = 0.3290f;
-            GetWhitePointFromEditBoxes(Wx, Wy, true);
-            const auto& activeCC = g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection;
-            if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
-                fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
-                return true;
-            }
         }
     }
 

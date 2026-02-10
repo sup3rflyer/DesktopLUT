@@ -39,6 +39,7 @@ void InitCompositorClock() {
 
 // Display power notification handle
 static HPOWERNOTIFY g_displayPowerNotify = nullptr;
+static std::chrono::steady_clock::time_point g_powerNotifyRegisteredTime;
 
 // GUID_CONSOLE_DISPLAY_STATE - notifies when display goes on/off/dimmed
 // {6FE69556-704A-47A0-8F24-C28D936FDA47}
@@ -52,6 +53,7 @@ void RegisterDisplayPowerNotification(HWND hwnd) {
         hwnd, &GUID_CONSOLE_DISPLAY_STATE_LOCAL, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     if (g_displayPowerNotify) {
+        g_powerNotifyRegisteredTime = std::chrono::steady_clock::now();
         std::cout << "Registered for display power state notifications" << std::endl;
     }
 }
@@ -572,6 +574,8 @@ void RenderMonitor(MonitorContext* ctx) {
                 RecreateSwapchain(ctx);
                 // Reapply MaxTML settings (may be lost after HDR mode change)
                 ApplyMaxTmlSettings();
+                // Constant buffer must be refreshed with new HDR state, color corrections, etc.
+                ctx->cbDirty = true;
             }
             // Always reapply MHC profiles after duplication reinit — covers both mode
             // changes and cases where duplication was lost/recovered without mode change
@@ -631,6 +635,7 @@ void RenderMonitor(MonitorContext* ctx) {
             // Always reapply MHC ICC profiles after duplication reinit
             ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
+            ctx->cbDirty = true;
             std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
         }
         return;
@@ -1176,6 +1181,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DWORD displayState = *reinterpret_cast<DWORD*>(pbs->Data);
                 // 0 = off, 1 = on, 2 = dimmed
                 if (displayState == 1) {
+                    // Ignore spurious "display on" notification that fires immediately
+                    // after registering (display is already on at startup)
+                    auto elapsed = std::chrono::steady_clock::now() - g_powerNotifyRegisteredTime;
+                    if (elapsed < std::chrono::seconds(3)) {
+                        std::cout << "Ignoring initial display power notification" << std::endl;
+                        g_displayOff.store(false);
+                        return TRUE;
+                    }
                     std::cout << "Display waking from sleep, forcing reinit..." << std::endl;
                     g_displayOff.store(false);
                     g_forceReinit.store(true);

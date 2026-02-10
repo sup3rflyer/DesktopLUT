@@ -46,6 +46,7 @@ However, the layers stack: each one processes the output of the one before it. I
 
 - Windows 10 21H2+ or Windows 11
 - Any DirectX 11 GPU
+- **Auto Color Management (ACM) recommended** — With ACM on, Windows uses an FP16 DWM pipeline with higher precision. Without it, the legacy 8-bit pipeline is used. Enable in **Settings → Display → Advanced display → Auto Color Management** (Windows 11) or by enabling HDR (Windows 10).
 
 ## Getting Started
 
@@ -97,7 +98,7 @@ This achieves results comparable to Windows Auto Color Management (ACM), with th
 
 ## MHC Display Calibration
 
-The **I. MHC** tab generates ICC profiles that Windows applies at the GPU scanout level — before the desktop is composited. This is the foundation layer of the pipeline.
+The **I. MHC** tab generates ICC profiles that Windows applies at the GPU scanout level — before the desktop is composited. This is the foundation layer of the pipeline. ACM is recommended for the highest precision (see [Requirements](#requirements)).
 
 **Why use MHC?**
 - Zero overhead — no overlay window, no frame capture or processing
