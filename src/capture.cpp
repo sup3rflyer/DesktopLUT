@@ -4,6 +4,7 @@
 #include "capture.h"
 #include "globals.h"
 #include "render.h"
+#include "displayconfig.h"
 #include <iostream>
 #include <iomanip>
 
@@ -115,8 +116,11 @@ done:
     ctx->duplication->GetDesc(&duplDesc);
 
     // Store actual capture format and determine HDR state
+    // FP16 capture can mean true HDR (BT.2020 PQ) or ACM (SDR content in FP16 scRGB)
     ctx->captureFormat = duplDesc.ModeDesc.Format;
-    ctx->isHDREnabled = (ctx->captureFormat == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    bool isFP16 = (ctx->captureFormat == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    ctx->isHDREnabled = isFP16 && ctx->isHDRCapable;
+    ctx->isFP16SDR = isFP16 && !ctx->isHDRCapable;
 
     // Calculate frame time from refresh rate (with 5ms margin for timing tolerance)
     if (duplDesc.ModeDesc.RefreshRate.Numerator > 0) {
@@ -130,7 +134,10 @@ done:
     switch (duplDesc.ModeDesc.Format) {
         case DXGI_FORMAT_B8G8R8A8_UNORM: formatName = "B8G8R8A8_UNORM (8-bit SDR)"; break;
         case DXGI_FORMAT_R10G10B10A2_UNORM: formatName = "R10G10B10A2_UNORM (10-bit SDR)"; break;
-        case DXGI_FORMAT_R16G16B16A16_FLOAT: formatName = "R16G16B16A16_FLOAT (FP16 scRGB HDR)"; break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            formatName = ctx->isHDREnabled ? "R16G16B16A16_FLOAT (FP16 scRGB HDR)"
+                                           : "R16G16B16A16_FLOAT (FP16 scRGB ACM)";
+            break;
     }
 
     double refreshRate = duplDesc.ModeDesc.RefreshRate.Denominator > 0
@@ -174,18 +181,18 @@ bool ReinitDesktopDuplication(MonitorContext* ctx) {
 }
 
 void DetectHDRCapability(MonitorContext* ctx, IDXGIOutput* output) {
-    IDXGIOutput6* output6 = nullptr;
-    HRESULT hr = output->QueryInterface(IID_PPV_ARGS(&output6));
-    if (FAILED(hr)) {
-        return;
-    }
-
+    // Use fresh DXGI factory query to get up-to-date output metadata.
+    // Existing DXGI objects from g_device have stale data after runtime HDR toggles.
     DXGI_OUTPUT_DESC1 desc1;
-    hr = output6->GetDesc1(&desc1);
-    output6->Release();
+    bool fresh = QueryFreshOutputDesc(ctx->monitor, desc1);
 
-    if (FAILED(hr)) {
-        return;
+    if (!fresh) {
+        // Fallback: use the passed output (may be stale but better than nothing)
+        IDXGIOutput6* output6 = nullptr;
+        if (FAILED(output->QueryInterface(IID_PPV_ARGS(&output6)))) return;
+        HRESULT hr = output6->GetDesc1(&desc1);
+        output6->Release();
+        if (FAILED(hr)) return;
     }
 
     ctx->isHDRCapable = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);

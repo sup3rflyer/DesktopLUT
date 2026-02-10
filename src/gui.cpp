@@ -2,12 +2,16 @@
 // Main GUI window and controls
 
 #include "gui.h"
+#include "gui_shared.h"
+#include "gui_mhc.h"
+#include "gui_whitelist.h"
 #include "globals.h"
 #include "settings.h"
 #include "processing.h"
 #include "color.h"
 #include "osd.h"
 #include "displayconfig.h"
+#include "mhc.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -17,240 +21,9 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-// Custom colors for Windows 11-like scheme
-static HBRUSH g_tabBgBrush = nullptr;       // Active tab content: #f9f9f9
-static HBRUSH g_inactiveTabBrush = nullptr; // Inactive tabs: #f3f3f3
-static HFONT g_mainFont = nullptr;          // Main window font
-static HFONT g_grayscaleFont = nullptr;     // Grayscale editor font
-static const COLORREF TAB_BG_COLOR = RGB(0xf9, 0xf9, 0xf9);
-static const COLORREF INACTIVE_TAB_COLOR = RGB(0xf3, 0xf3, 0xf3);
-
-// Note: HDR swapchain metadata (MaxCLL) is always set to 10000 nits
-// MaxTML override controls Windows tonemapping behavior system-wide
-
-// Helper functions for grayscale editor
-// Slider range is ±2500 representing ±25.00% with 0.01 precision
-static const int GRAYSCALE_SLIDER_SCALE = 100;  // Slider units per 1%
-
-static void UpdateEditFromSlider(int index) {
-    auto* data = g_grayscaleEditor;
-    if (!data || data->updatingFromEdit) return;
-
-    data->updatingFromSlider = true;
-    int pos = (int)SendMessage(data->sliders[index], TBM_GETPOS, 0, 0);
-    float deviation = (float)(-pos) / GRAYSCALE_SLIDER_SCALE;  // Negate because trackbar is inverted
-    wchar_t text[16];
-    swprintf_s(text, L"%.2f", deviation);
-    SetWindowText(data->editBoxes[index], text);
-    data->updatingFromSlider = false;
-}
-
-static void UpdateSliderFromEdit(int index) {
-    auto* data = g_grayscaleEditor;
-    if (!data || data->updatingFromSlider) return;
-
-    data->updatingFromEdit = true;
-    wchar_t text[16];
-    GetWindowText(data->editBoxes[index], text, 16);
-    float deviation = (float)_wtof(text);
-    int maxRange = GRAYSCALE_RANGE * GRAYSCALE_SLIDER_SCALE;
-    int sliderVal = (int)(deviation * GRAYSCALE_SLIDER_SCALE + 0.5f);
-    sliderVal = (std::max)(-maxRange, (std::min)(maxRange, sliderVal));
-    SendMessage(data->sliders[index], TBM_SETPOS, TRUE, -sliderVal);
-    data->updatingFromEdit = false;
-}
-
-// Numeric edit box subclass - filters input to only allow valid decimal numbers
-// maxDecimals is stored in dwRefData (set when subclassing)
-// Also handles Enter key to commit and unfocus
-static LRESULT CALLBACK NumericEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
-                                                  UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
-    int maxDecimals = (int)dwRefData;
-
-    // Handle Enter key - commit value and move focus to parent
-    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
-        HWND parent = GetParent(hwnd);
-        if (parent) {
-            SetFocus(parent);  // This triggers EN_KILLFOCUS which commits the value
-        }
-        return 0;  // Don't pass Enter to edit control (would beep)
-    }
-
-    // Handle Escape key - restore original value and unfocus
-    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
-        HWND parent = GetParent(hwnd);
-        if (parent) {
-            SetFocus(parent);
-        }
-        return 0;
-    }
-
-    if (msg == WM_CHAR) {
-        wchar_t ch = (wchar_t)wParam;
-        // Allow control characters (backspace, etc.)
-        if (ch < 32) return DefSubclassProc(hwnd, msg, wParam, lParam);
-
-        // Only allow digits, '.', and '-'
-        if (ch != L'.' && ch != L'-' && (ch < L'0' || ch > L'9')) return 0;
-
-        // Get current text and selection
-        wchar_t text[32] = {};
-        GetWindowText(hwnd, text, 32);
-        DWORD selStart, selEnd;
-        SendMessage(hwnd, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
-
-        // Only allow one '.'
-        if (ch == L'.') {
-            wchar_t* dot = wcschr(text, L'.');
-            if (dot && ((DWORD)(dot - text) < selStart || (DWORD)(dot - text) >= selEnd)) return 0;
-        }
-
-        // Only allow '-' at the start
-        if (ch == L'-') {
-            if (selStart != 0) return 0;
-            if (text[0] == L'-' && selEnd == 0) return 0;
-        }
-
-        // Check decimal places limit
-        if (ch >= L'0' && ch <= L'9') {
-            wchar_t* dot = wcschr(text, L'.');
-            if (dot) {
-                int dotPos = (int)(dot - text);
-                int textLen = (int)wcslen(text);
-                int decimalsAfter = textLen - dotPos - 1 - (int)(selEnd - selStart);
-                // If cursor is after dot, check decimals
-                if ((int)selStart > dotPos && decimalsAfter >= maxDecimals) return 0;
-            }
-        }
-    }
-    else if (msg == WM_PASTE) {
-        if (OpenClipboard(hwnd)) {
-            HANDLE hData = GetClipboardData(CF_UNICODETEXT);
-            if (hData) {
-                wchar_t* clipText = (wchar_t*)GlobalLock(hData);
-                if (clipText) {
-                    // Clean the pasted text: keep only digits, '.', '-'
-                    wchar_t clean[32] = {};
-                    int cleanIdx = 0;
-                    bool hasDot = false;
-                    bool hasNeg = false;
-                    int decimals = 0;
-
-                    for (int i = 0; clipText[i] && cleanIdx < 30; i++) {
-                        wchar_t ch = clipText[i];
-                        if (ch == L'-' && cleanIdx == 0 && !hasNeg) {
-                            clean[cleanIdx++] = ch;
-                            hasNeg = true;
-                        } else if (ch == L'.' && !hasDot) {
-                            clean[cleanIdx++] = ch;
-                            hasDot = true;
-                            decimals = 0;
-                        } else if (ch >= L'0' && ch <= L'9') {
-                            if (hasDot) {
-                                if (decimals < maxDecimals) {
-                                    clean[cleanIdx++] = ch;
-                                    decimals++;
-                                }
-                            } else {
-                                clean[cleanIdx++] = ch;
-                            }
-                        }
-                    }
-                    clean[cleanIdx] = 0;
-
-                    GlobalUnlock(hData);
-                    CloseClipboard();
-
-                    // Replace selection with cleaned text
-                    SendMessage(hwnd, EM_REPLACESEL, TRUE, (LPARAM)clean);
-                    return 0;
-                }
-                GlobalUnlock(hData);
-            }
-            CloseClipboard();
-        }
-        return 0;
-    }
-
-    return DefSubclassProc(hwnd, msg, wParam, lParam);
-}
-
-// Apply numeric validation to an edit control
-static void SetNumericEdit(HWND hwnd, int maxDecimals) {
-    SetWindowSubclass(hwnd, NumericEditSubclassProc, 0, (DWORD_PTR)maxDecimals);
-}
-
-// Helper to set path text - shows just the filename for readability
-static void SetPathText(HWND hwndEdit, const wchar_t* path) {
-    if (!path || !*path) {
-        SetWindowText(hwndEdit, L"");
-        return;
-    }
-    // Extract just the filename
-    const wchar_t* filename = wcsrchr(path, L'\\');
-    if (!filename) filename = wcsrchr(path, L'/');
-    SetWindowText(hwndEdit, filename ? filename + 1 : path);
-}
-
-// Draw a Windows 11-style rounded button
-static void DrawRoundedButton(LPDRAWITEMSTRUCT pDIS) {
-    bool isDisabled = (pDIS->itemState & ODS_DISABLED) != 0;
-    bool isPressed = (pDIS->itemState & ODS_SELECTED) != 0;
-    bool isFocused = (pDIS->itemState & ODS_FOCUS) != 0;
-
-    HDC hdc = pDIS->hDC;
-    RECT rc = pDIS->rcItem;
-
-    // Windows 11 style colors
-    COLORREF bgColor, textColor, borderColor;
-    if (isDisabled) {
-        bgColor = RGB(0xF0, 0xF0, 0xF0);
-        textColor = RGB(0xA0, 0xA0, 0xA0);
-        borderColor = RGB(0xD0, 0xD0, 0xD0);
-    } else if (isPressed) {
-        bgColor = RGB(0xE0, 0xE0, 0xE0);
-        textColor = RGB(0x00, 0x00, 0x00);
-        borderColor = RGB(0x80, 0x80, 0x80);
-    } else {
-        bgColor = RGB(0xFD, 0xFD, 0xFD);
-        textColor = RGB(0x00, 0x00, 0x00);
-        borderColor = RGB(0xC0, 0xC0, 0xC0);
-    }
-
-    // Create rounded rectangle region
-    int radius = 4;
-    HRGN hRgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius * 2, radius * 2);
-
-    // Fill background
-    HBRUSH hBrush = CreateSolidBrush(bgColor);
-    FillRgn(hdc, hRgn, hBrush);
-    DeleteObject(hBrush);
-
-    // Draw border
-    HPEN hPen = CreatePen(PS_SOLID, 1, borderColor);
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius * 2, radius * 2);
-    SelectObject(hdc, hOldBrush);
-    SelectObject(hdc, hOldPen);
-    DeleteObject(hPen);
-
-    // Draw focus rectangle
-    if (isFocused && !isDisabled) {
-        RECT focusRect = rc;
-        InflateRect(&focusRect, -3, -3);
-        DrawFocusRect(hdc, &focusRect);
-    }
-
-    // Draw button text
-    wchar_t text[64];
-    GetWindowText(pDIS->hwndItem, text, 64);
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, textColor);
-    DrawText(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-    DeleteObject(hRgn);
-}
+// ============================================================================
+// SECTION: Utilities
+// ============================================================================
 
 void UpdateGUIState() {
     // Monitor list, browse, clear buttons always enabled (can edit while running)
@@ -289,190 +62,95 @@ bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
     return GetOpenFileName(&ofn) == TRUE;
 }
 
+
 // Update color correction controls to reflect current monitor's settings
+// Populates both SDR and HDR sections simultaneously
 void UpdateColorCorrectionControls() {
     if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) {
         return;
     }
 
     const auto& settings = g_gui.monitorSettings[g_gui.currentMonitor];
-
-    // SDR Primaries
-    SendMessage(g_gui.hwndSdrPrimariesEnable, BM_SETCHECK,
-        settings.sdrColorCorrection.primariesEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndSdrPrimariesPreset, CB_SETCURSEL,
-        settings.sdrColorCorrection.primariesPreset, 0);
-
-    // Update edit boxes to show current preset/custom values
     wchar_t buf[16];
-    int sdrPreset = settings.sdrColorCorrection.primariesPreset;
-    bool sdrCustom = (sdrPreset == g_numPresetPrimaries - 1);
-    float sdrRx, sdrRy, sdrGx, sdrGy, sdrBx, sdrBy, sdrWx, sdrWy;
-    if (sdrCustom) {
-        const auto& cp = settings.sdrColorCorrection.customPrimaries;
-        sdrRx = cp.Rx; sdrRy = cp.Ry; sdrGx = cp.Gx; sdrGy = cp.Gy;
-        sdrBx = cp.Bx; sdrBy = cp.By; sdrWx = cp.Wx; sdrWy = cp.Wy;
-    } else {
-        const auto& p = g_presetPrimaries[sdrPreset];
-        sdrRx = p.Rx; sdrRy = p.Ry; sdrGx = p.Gx; sdrGy = p.Gy;
-        sdrBx = p.Bx; sdrBy = p.By; sdrWx = p.Wx; sdrWy = p.Wy;
-    }
-    swprintf_s(buf, L"%.4f", sdrRx); SetWindowText(g_gui.hwndSdrPrimariesRx, buf);
-    swprintf_s(buf, L"%.4f", sdrRy); SetWindowText(g_gui.hwndSdrPrimariesRy, buf);
-    swprintf_s(buf, L"%.4f", sdrGx); SetWindowText(g_gui.hwndSdrPrimariesGx, buf);
-    swprintf_s(buf, L"%.4f", sdrGy); SetWindowText(g_gui.hwndSdrPrimariesGy, buf);
-    swprintf_s(buf, L"%.4f", sdrBx); SetWindowText(g_gui.hwndSdrPrimariesBx, buf);
-    swprintf_s(buf, L"%.4f", sdrBy); SetWindowText(g_gui.hwndSdrPrimariesBy, buf);
-    swprintf_s(buf, L"%.4f", sdrWx); SetWindowText(g_gui.hwndSdrPrimariesWx, buf);
-    swprintf_s(buf, L"%.4f", sdrWy); SetWindowText(g_gui.hwndSdrPrimariesWy, buf);
 
-    // Enable/disable custom edit boxes based on preset
-    EnableWindow(g_gui.hwndSdrPrimariesRx, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesRy, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesGx, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesGy, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesBx, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesBy, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesWx, sdrCustom);
-    EnableWindow(g_gui.hwndSdrPrimariesWy, sdrCustom);
+    // === SDR section ===
+    const auto& sdrCC = settings.sdrColorCorrection;
 
-    // SDR Grayscale
-    SendMessage(g_gui.hwndSdrGrayscaleEnable, BM_SETCHECK,
-        settings.sdrColorCorrection.grayscale.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndSdrGrayscale10, BM_SETCHECK,
-        settings.sdrColorCorrection.grayscale.pointCount == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndSdrGrayscale20, BM_SETCHECK,
-        settings.sdrColorCorrection.grayscale.pointCount == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndSdrGrayscale32, BM_SETCHECK,
-        settings.sdrColorCorrection.grayscale.pointCount == 32 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndSdrGrayscale24, BM_SETCHECK,
-        settings.sdrColorCorrection.grayscale.use24Gamma ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndPrimariesEnable, BM_SETCHECK,
+        sdrCC.primariesEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    swprintf_s(buf, L"%.4f", sdrCC.customPrimaries.Wx); SetWindowText(g_gui.hwndPrimariesWx, buf);
+    swprintf_s(buf, L"%.4f", sdrCC.customPrimaries.Wy); SetWindowText(g_gui.hwndPrimariesWy, buf);
 
-    // HDR Primaries
+    SendMessage(g_gui.hwndGrayscaleEnable, BM_SETCHECK,
+        sdrCC.grayscale.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndGrayscale10, BM_SETCHECK,
+        sdrCC.grayscale.pointCount == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndGrayscale20, BM_SETCHECK,
+        sdrCC.grayscale.pointCount == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndGrayscale32, BM_SETCHECK,
+        sdrCC.grayscale.pointCount == 32 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndGrayscale24, BM_SETCHECK,
+        sdrCC.grayscale.use24Gamma ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    // === HDR section ===
+    const auto& hdrCC = settings.hdrColorCorrection;
+
     SendMessage(g_gui.hwndHdrPrimariesEnable, BM_SETCHECK,
-        settings.hdrColorCorrection.primariesEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndHdrPrimariesPreset, CB_SETCURSEL,
-        settings.hdrColorCorrection.primariesPreset, 0);
+        hdrCC.primariesEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    swprintf_s(buf, L"%.4f", hdrCC.customPrimaries.Wx); SetWindowText(g_gui.hwndHdrPrimariesWx, buf);
+    swprintf_s(buf, L"%.4f", hdrCC.customPrimaries.Wy); SetWindowText(g_gui.hwndHdrPrimariesWy, buf);
 
-    // Update edit boxes to show current preset/custom values
-    int hdrPreset = settings.hdrColorCorrection.primariesPreset;
-    bool hdrCustom = (hdrPreset == g_numPresetPrimaries - 1);
-    float hdrRx, hdrRy, hdrGx, hdrGy, hdrBx, hdrBy, hdrWx, hdrWy;
-    if (hdrCustom) {
-        const auto& cp = settings.hdrColorCorrection.customPrimaries;
-        hdrRx = cp.Rx; hdrRy = cp.Ry; hdrGx = cp.Gx; hdrGy = cp.Gy;
-        hdrBx = cp.Bx; hdrBy = cp.By; hdrWx = cp.Wx; hdrWy = cp.Wy;
-    } else {
-        const auto& p = g_presetPrimaries[hdrPreset];
-        hdrRx = p.Rx; hdrRy = p.Ry; hdrGx = p.Gx; hdrGy = p.Gy;
-        hdrBx = p.Bx; hdrBy = p.By; hdrWx = p.Wx; hdrWy = p.Wy;
-    }
-    swprintf_s(buf, L"%.4f", hdrRx); SetWindowText(g_gui.hwndHdrPrimariesRx, buf);
-    swprintf_s(buf, L"%.4f", hdrRy); SetWindowText(g_gui.hwndHdrPrimariesRy, buf);
-    swprintf_s(buf, L"%.4f", hdrGx); SetWindowText(g_gui.hwndHdrPrimariesGx, buf);
-    swprintf_s(buf, L"%.4f", hdrGy); SetWindowText(g_gui.hwndHdrPrimariesGy, buf);
-    swprintf_s(buf, L"%.4f", hdrBx); SetWindowText(g_gui.hwndHdrPrimariesBx, buf);
-    swprintf_s(buf, L"%.4f", hdrBy); SetWindowText(g_gui.hwndHdrPrimariesBy, buf);
-    swprintf_s(buf, L"%.4f", hdrWx); SetWindowText(g_gui.hwndHdrPrimariesWx, buf);
-    swprintf_s(buf, L"%.4f", hdrWy); SetWindowText(g_gui.hwndHdrPrimariesWy, buf);
-
-    EnableWindow(g_gui.hwndHdrPrimariesRx, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesRy, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesGx, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesGy, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesBx, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesBy, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesWx, hdrCustom);
-    EnableWindow(g_gui.hwndHdrPrimariesWy, hdrCustom);
-
-    // HDR Grayscale
     SendMessage(g_gui.hwndHdrGrayscaleEnable, BM_SETCHECK,
-        settings.hdrColorCorrection.grayscale.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        hdrCC.grayscale.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrGrayscale10, BM_SETCHECK,
-        settings.hdrColorCorrection.grayscale.pointCount == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
+        hdrCC.grayscale.pointCount == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrGrayscale20, BM_SETCHECK,
-        settings.hdrColorCorrection.grayscale.pointCount == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
+        hdrCC.grayscale.pointCount == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrGrayscale32, BM_SETCHECK,
-        settings.hdrColorCorrection.grayscale.pointCount == 32 ? BST_CHECKED : BST_UNCHECKED, 0);
-    wchar_t gsPeakBuf[16];
-    swprintf_s(gsPeakBuf, L"%.0f", settings.hdrColorCorrection.grayscale.peakNits);
-    SetWindowText(g_gui.hwndHdrGrayscalePeak, gsPeakBuf);
+        hdrCC.grayscale.pointCount == 32 ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    // HDR Tonemapping
-    SendMessage(g_gui.hwndHdrTonemapEnable, BM_SETCHECK,
-        settings.hdrColorCorrection.tonemap.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndHdrTonemapCurve, CB_SETCURSEL,
-        TonemapCurveToDropdownIndex(settings.hdrColorCorrection.tonemap.curve), 0);
+    wchar_t gsPeakBuf[16];
+    swprintf_s(gsPeakBuf, L"%.0f", hdrCC.grayscale.peakNits);
+    SetWindowText(g_gui.hwndGrayscalePeak, gsPeakBuf);
+
+    // Tonemapping (HDR only)
+    SendMessage(g_gui.hwndTonemapEnable, BM_SETCHECK,
+        hdrCC.tonemap.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndTonemapCurve, CB_SETCURSEL,
+        TonemapCurveToDropdownIndex(hdrCC.tonemap.curve), 0);
     wchar_t tonemapBuf[16];
-    swprintf_s(tonemapBuf, L"%.0f", settings.hdrColorCorrection.tonemap.targetPeakNits);
-    SetWindowText(g_gui.hwndHdrTonemapTarget, tonemapBuf);
-    swprintf_s(tonemapBuf, L"%.0f", settings.hdrColorCorrection.tonemap.sourcePeakNits);
-    SetWindowText(g_gui.hwndHdrTonemapSource, tonemapBuf);
-    SendMessage(g_gui.hwndHdrTonemapDynamic, BM_SETCHECK,
-        settings.hdrColorCorrection.tonemap.dynamicPeak ? BST_CHECKED : BST_UNCHECKED, 0);
-    // Disable Source when Dynamic is checked
-    EnableWindow(g_gui.hwndHdrTonemapSource, !settings.hdrColorCorrection.tonemap.dynamicPeak);
+    swprintf_s(tonemapBuf, L"%.0f", hdrCC.tonemap.targetPeakNits);
+    SetWindowText(g_gui.hwndTonemapTarget, tonemapBuf);
+    swprintf_s(tonemapBuf, L"%.0f", hdrCC.tonemap.sourcePeakNits);
+    SetWindowText(g_gui.hwndTonemapSource, tonemapBuf);
+    SendMessage(g_gui.hwndTonemapDynamic, BM_SETCHECK,
+        hdrCC.tonemap.dynamicPeak ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(g_gui.hwndTonemapSource, !hdrCC.tonemap.dynamicPeak);
 
     // MaxTML
-    SendMessage(g_gui.hwndHdrMaxTmlEnable, BM_SETCHECK,
+    SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
         settings.maxTml.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     swprintf_s(tonemapBuf, L"%.0f", settings.maxTml.peakNits);
-    SetWindowText(g_gui.hwndHdrMaxTmlEdit, tonemapBuf);
-    // Select matching preset in combo, or Custom if no match
+    SetWindowText(g_gui.hwndMaxTmlEdit, tonemapBuf);
     float peakNits = settings.maxTml.peakNits;
-    int comboSel = 0;  // Custom by default
+    int comboSel = 0;
     if (peakNits == 400.0f) comboSel = 1;
     else if (peakNits == 600.0f) comboSel = 2;
     else if (peakNits == 1000.0f) comboSel = 3;
     else if (peakNits == 1400.0f) comboSel = 4;
     else if (peakNits == 4000.0f) comboSel = 5;
     else if (peakNits == 10000.0f) comboSel = 6;
-    SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_SETCURSEL, comboSel, 0);
+    SendMessage(g_gui.hwndMaxTmlCombo, CB_SETCURSEL, comboSel, 0);
+
+    // MHC info display (both sections)
+    UpdateMhcInfoDisplay(g_gui.currentMonitor, false);
+    UpdateMhcInfoDisplay(g_gui.currentMonitor, true);
 }
 
-// Helper to recalculate primaries matrix and apply live update
-void ApplyPrimariesChange(bool isHDR) {
-    if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) {
-        return;
-    }
 
-    auto& cc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection
-                     : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
-
-    // Calculate matrix from current primaries (display to sRGB)
-    DisplayPrimariesData displayPrimaries;
-    if (cc.primariesPreset == g_numPresetPrimaries - 1) {
-        // Custom - use custom primaries
-        displayPrimaries.Rx = cc.customPrimaries.Rx;
-        displayPrimaries.Ry = cc.customPrimaries.Ry;
-        displayPrimaries.Gx = cc.customPrimaries.Gx;
-        displayPrimaries.Gy = cc.customPrimaries.Gy;
-        displayPrimaries.Bx = cc.customPrimaries.Bx;
-        displayPrimaries.By = cc.customPrimaries.By;
-        displayPrimaries.Wx = cc.customPrimaries.Wx;
-        displayPrimaries.Wy = cc.customPrimaries.Wy;
-    } else {
-        // Use preset
-        const auto& preset = g_presetPrimaries[cc.primariesPreset];
-        displayPrimaries.Rx = preset.Rx; displayPrimaries.Ry = preset.Ry;
-        displayPrimaries.Gx = preset.Gx; displayPrimaries.Gy = preset.Gy;
-        displayPrimaries.Bx = preset.Bx; displayPrimaries.By = preset.By;
-        displayPrimaries.Wx = preset.Wx; displayPrimaries.Wy = preset.Wy;
-    }
-
-    // sRGB primaries (target for content)
-    DisplayPrimariesData srgb = {
-        0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3127f, 0.3290f
-    };
-
-    CalculatePrimariesMatrix(srgb, displayPrimaries, cc.primariesMatrix);
-
-    // Apply live update if running
-    if (g_gui.isRunning) {
-        UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
-    }
-    UpdateGUIState();
-}
+// ============================================================================
+// SECTION: System Tray
+// ============================================================================
 
 bool IsStartupEnabled() {
     HKEY hKey;
@@ -563,8 +241,8 @@ void ShowTrayMenu(HWND hwnd) {
     HMENU hMenu = CreatePopupMenu();
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(hMenu, g_gui.isRunning ? MF_GRAYED : MF_STRING, ID_TRAY_APPLY, L"Enable");
-    AppendMenu(hMenu, g_gui.isRunning ? MF_STRING : MF_GRAYED, ID_TRAY_STOP, L"Disable");
+    AppendMenu(hMenu, g_gui.isRunning ? MF_GRAYED : MF_STRING, ID_TRAY_APPLY, L"Start");
+    AppendMenu(hMenu, g_gui.isRunning ? MF_STRING : MF_GRAYED, ID_TRAY_STOP, L"Stop");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, IsStartupEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
                ID_TRAY_STARTUP, L"Run at startup");
@@ -576,666 +254,9 @@ void ShowTrayMenu(HWND hwnd) {
     DestroyMenu(hMenu);
 }
 
-LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE: {
-        auto* data = g_grayscaleEditor;
-        if (!data) return -1;
-
-        data->hwndDialog = hwnd;
-
-        int sliderW = 32;
-        int sliderH = 150;
-        int rgbLabelH = 16;   // Code value at top (8-bit SDR, 10-bit HDR)
-        int pctLabelH = 16;   // Input percentage below slider
-        int editH = 20;
-        int pad = 2;
-        int startX = 10;
-        int startY = 10;
-
-        // Calculate pqPeak for HDR label scaling (same formula as shader)
-        float pqPeak = 1.0f;
-        if (data->isHDR && data->peakNits < 10000.0f) {
-            float peakLinear = data->peakNits / 10000.0f;
-            float m1 = 0.1593017578125f, m2 = 78.84375f;
-            float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
-            float peakYm = powf(peakLinear, m1);
-            pqPeak = powf((c1 + c2 * peakYm) / (1.0f + c3 * peakYm), m2);
-        }
-
-        // Create sliders, labels, and edit boxes
-        // SDR: Square root distribution (input = (i/(N-1))^2) for more shadow granularity
-        // HDR: Scaled by peak so labels match ColourSpace target (e.g., 1400 nits)
-        for (int i = 0; i < data->pointCount; i++) {
-            int x = startX + i * (sliderW + pad);
-
-            float t = (float)i / (float)(data->pointCount - 1);
-            // HDR: scale by pqPeak so labels match ColourSpace patch positions
-            // SDR: sqrt distribution for shadow granularity
-            float inputNorm = data->isHDR ? (t * pqPeak) : (t * t);
-
-            // Top label: code value (8-bit for SDR, 10-bit for HDR to match ColourSpace)
-            int codeValue = data->isHDR ? (int)(inputNorm * 1023.0f + 0.5f) : (int)(inputNorm * 255.0f + 0.5f);
-            wchar_t rgbLabel[8];
-            swprintf_s(rgbLabel, L"%d", codeValue);
-            CreateWindow(L"STATIC", rgbLabel, WS_CHILD | WS_VISIBLE | SS_CENTER,
-                x, startY, sliderW, rgbLabelH, hwnd, nullptr, nullptr, nullptr);
-
-            // Vertical trackbar (slider) with tick marks
-            HWND slider = CreateWindow(TRACKBAR_CLASS, nullptr,
-                WS_CHILD | WS_VISIBLE | TBS_VERT | TBS_AUTOTICKS | TBS_BOTH,
-                x, startY + rgbLabelH, sliderW, sliderH,
-                hwnd, (HMENU)(INT_PTR)(ID_GRAYSCALE_SLIDER_BASE + i), nullptr, nullptr);
-
-            // Range: ±2500 (representing ±25.00% with 0.01 precision)
-            int maxRange = GRAYSCALE_RANGE * GRAYSCALE_SLIDER_SCALE;
-            SendMessage(slider, TBM_SETRANGE, TRUE, MAKELONG(-maxRange, maxRange));
-            SendMessage(slider, TBM_SETTICFREQ, GRAYSCALE_SLIDER_SCALE * 5, 0);  // Tick every 5%
-
-            // Calculate current deviation from target
-            // HDR: points store fraction of pqPeak (0-1), targetVal = t
-            // SDR: points store actual output values, targetVal = inputNorm (sqrt distribution)
-            float targetVal = data->isHDR ? t : inputNorm;
-            float currentVal = data->points[i];
-            // HDR: proportional deviation, SDR: additive deviation
-            float deviationPct;
-            if (data->isHDR && targetVal > 0.001f) {
-                deviationPct = ((currentVal / targetVal) - 1.0f) * 100.0f;  // Proportional
-            } else {
-                deviationPct = (currentVal - targetVal) * 100.0f;  // Additive
-            }
-            int sliderVal = (int)(deviationPct * GRAYSCALE_SLIDER_SCALE + 0.5f);
-            sliderVal = (std::max)(-maxRange, (std::min)(maxRange, sliderVal));
-
-            // Trackbar is inverted (top = max), so negate for intuitive up = brighter
-            SendMessage(slider, TBM_SETPOS, TRUE, -sliderVal);
-
-            data->sliders.push_back(slider);
-
-            // Bottom label: percentage of range
-            wchar_t pctLabel[8];
-            int pct = (int)(t * 100.0f + 0.5f);  // Use t (not inputNorm) for consistent 0-100%
-            swprintf_s(pctLabel, L"%d%%", pct);
-            CreateWindow(L"STATIC", pctLabel, WS_CHILD | WS_VISIBLE | SS_CENTER,
-                x, startY + rgbLabelH + sliderH + 2, sliderW, pctLabelH, hwnd, nullptr, nullptr, nullptr);
-
-            // Edit box for manual input (deviation value with 2 decimal places)
-            wchar_t editText[16];
-            swprintf_s(editText, L"%.2f", deviationPct);
-            HWND edit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", editText,
-                WS_CHILD | WS_VISIBLE | ES_CENTER,  // No ES_NUMBER - need decimals and minus
-                x, startY + rgbLabelH + sliderH + pctLabelH + 4, sliderW, editH,
-                hwnd, (HMENU)(INT_PTR)(ID_GRAYSCALE_EDIT_BASE + i), nullptr, nullptr);
-            SetNumericEdit(edit, 2);  // 2 decimal places for grayscale deviation
-            data->editBoxes.push_back(edit);
-        }
-
-        // Calculate dialog width based on point count
-        int dialogContentW = startX * 2 + data->pointCount * (sliderW + pad) + 40;  // Extra for +/- labels
-        int btnY = startY + rgbLabelH + sliderH + pctLabelH + editH + 15;
-
-        // OK and Cancel buttons (owner-drawn for rounded corners)
-        CreateWindow(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            dialogContentW / 2 - 90, btnY, 80, 28, hwnd, (HMENU)ID_GRAYSCALE_OK, nullptr, nullptr);
-        CreateWindow(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            dialogContentW / 2 + 10, btnY, 80, 28, hwnd, (HMENU)ID_GRAYSCALE_CANCEL, nullptr, nullptr);
-
-        // +/- labels at top and bottom of slider area (right side)
-        int sliderTop = startY + rgbLabelH;
-        wchar_t plusLabel[8], minusLabel[8];
-        swprintf_s(plusLabel, L"+%d", GRAYSCALE_RANGE);
-        swprintf_s(minusLabel, L"-%d", GRAYSCALE_RANGE);
-        CreateWindow(L"STATIC", plusLabel, WS_CHILD | WS_VISIBLE | SS_CENTER,
-            dialogContentW - 38, sliderTop + 2, 30, 16, hwnd, nullptr, nullptr, nullptr);
-        CreateWindow(L"STATIC", minusLabel, WS_CHILD | WS_VISIBLE | SS_CENTER,
-            dialogContentW - 38, sliderTop + sliderH - 18, 30, 16, hwnd, nullptr, nullptr, nullptr);
-
-        // Set font for all controls (create once, reuse, cleanup in WM_DESTROY)
-        if (!g_grayscaleFont) {
-            g_grayscaleFont = CreateFont(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        }
-        EnumChildWindows(hwnd, [](HWND hwndChild, LPARAM lParam) -> BOOL {
-            SendMessage(hwndChild, WM_SETFONT, lParam, TRUE);
-            return TRUE;
-        }, (LPARAM)g_grayscaleFont);
-
-        return 0;
-    }
-
-    case WM_VSCROLL: {
-        // Slider moved - update corresponding edit box and apply live
-        HWND sliderHwnd = (HWND)lParam;
-        auto* data = g_grayscaleEditor;
-        if (data) {
-            for (int i = 0; i < data->pointCount; i++) {
-                if (data->sliders[i] == sliderHwnd) {
-                    UpdateEditFromSlider(i);
-                    // Update the points array immediately for live preview
-                    int pos = (int)SendMessage(sliderHwnd, TBM_GETPOS, 0, 0);
-                    float deviationPct = (float)(-pos) / GRAYSCALE_SLIDER_SCALE;  // Negate, convert to %
-                    float t = (float)i / (float)(data->pointCount - 1);
-                    // HDR uses linear PQ space, SDR uses sqrt distribution
-                    float targetVal = data->isHDR ? t : (t * t);
-                    // HDR: proportional deviation, SDR: additive deviation
-                    float newVal;
-                    if (data->isHDR && targetVal > 0.001f) {
-                        newVal = targetVal * (1.0f + deviationPct / 100.0f);  // Proportional
-                    } else {
-                        newVal = targetVal + (deviationPct / 100.0f);  // Additive
-                    }
-                    data->points[i] = (std::max)(0.0f, (std::min)(1.0f, newVal));
-                    // Apply live update
-                    if (g_gui.currentMonitor >= 0) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, data->isHDR);
-                    }
-                    break;
-                }
-            }
-        }
-        return 0;
-    }
-
-    case WM_COMMAND: {
-        WORD code = HIWORD(wParam);
-        WORD id = LOWORD(wParam);
-
-        // Check if it's an edit box losing focus
-        if (code == EN_KILLFOCUS) {
-            auto* data = g_grayscaleEditor;
-            if (data) {
-                int editIndex = id - ID_GRAYSCALE_EDIT_BASE;
-                if (editIndex >= 0 && editIndex < data->pointCount) {
-                    UpdateSliderFromEdit(editIndex);
-                    // Also reformat the text to be within range
-                    UpdateEditFromSlider(editIndex);
-                    // Update point value and apply live
-                    int pos = (int)SendMessage(data->sliders[editIndex], TBM_GETPOS, 0, 0);
-                    float deviationPct = (float)(-pos) / GRAYSCALE_SLIDER_SCALE;
-                    float t = (float)editIndex / (float)(data->pointCount - 1);
-                    // HDR uses linear PQ space, SDR uses sqrt distribution
-                    float targetVal = data->isHDR ? t : (t * t);
-                    // HDR: proportional deviation, SDR: additive deviation
-                    float newVal;
-                    if (data->isHDR && targetVal > 0.001f) {
-                        newVal = targetVal * (1.0f + deviationPct / 100.0f);
-                    } else {
-                        newVal = targetVal + (deviationPct / 100.0f);
-                    }
-                    data->points[editIndex] = (std::max)(0.0f, (std::min)(1.0f, newVal));
-                    if (g_gui.currentMonitor >= 0) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, data->isHDR);
-                    }
-                }
-            }
-            return 0;
-        }
-
-        switch (id) {
-        case ID_GRAYSCALE_OK: {
-            auto* data = g_grayscaleEditor;
-            if (data) {
-                // Read slider values and convert back to absolute values
-                // SDR: sqrt distribution (input = (i/(N-1))^2)
-                // HDR: linear PQ space (input = i/(N-1))
-                for (int i = 0; i < data->pointCount; i++) {
-                    int pos = (int)SendMessage(data->sliders[i], TBM_GETPOS, 0, 0);
-                    float deviationPct = (float)(-pos) / GRAYSCALE_SLIDER_SCALE;
-                    float t = (float)i / (float)(data->pointCount - 1);
-                    // HDR uses linear PQ space, SDR uses sqrt distribution
-                    float targetVal = data->isHDR ? t : (t * t);
-                    // HDR: proportional deviation, SDR: additive deviation
-                    float newVal;
-                    if (data->isHDR && targetVal > 0.001f) {
-                        newVal = targetVal * (1.0f + deviationPct / 100.0f);
-                    } else {
-                        newVal = targetVal + (deviationPct / 100.0f);
-                    }
-                    data->points[i] = (std::max)(0.0f, (std::min)(1.0f, newVal));
-                }
-            }
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        case ID_GRAYSCALE_CANCEL: {
-            // Restore original values
-            auto* data = g_grayscaleEditor;
-            if (data && !data->originalPoints.empty()) {
-                for (int i = 0; i < data->pointCount && i < (int)data->originalPoints.size(); i++) {
-                    data->points[i] = data->originalPoints[i];
-                }
-                // Apply live update to restore original state
-                if (g_gui.currentMonitor >= 0) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, data->isHDR);
-                }
-            }
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        }
-        break;
-    }
-
-    case WM_ERASEBKGND: {
-        // Fill dialog with custom background color
-        HDC hdc = (HDC)wParam;
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        if (!g_tabBgBrush) g_tabBgBrush = CreateSolidBrush(TAB_BG_COLOR);
-        FillRect(hdc, &rc, g_tabBgBrush);
-        return 1;
-    }
-
-    case WM_CTLCOLORSTATIC: {
-        // Match static control backgrounds to dialog
-        HDC hdc = (HDC)wParam;
-        if (!g_tabBgBrush) g_tabBgBrush = CreateSolidBrush(TAB_BG_COLOR);
-        SetBkColor(hdc, TAB_BG_COLOR);
-        return (LRESULT)g_tabBgBrush;
-    }
-
-    case WM_DRAWITEM: {
-        LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
-        if (pDIS->CtlType == ODT_BUTTON) {
-            DrawRoundedButton(pDIS);
-            return TRUE;
-        }
-        break;
-    }
-
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-
-    case WM_DESTROY:
-        g_grayscaleEditor = nullptr;
-        return 0;
-    }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR) {
-    // Ensure points array is initialized
-    if (settings.points.empty() || (int)settings.points.size() != settings.pointCount) {
-        settings.points.resize(settings.pointCount);
-        // HDR uses PQ-space grayscale (evenly spaced), SDR uses sqrt distribution
-        if (isHDR) {
-            settings.initLinearPQ();
-        } else {
-            settings.initLinear();
-        }
-    }
-
-    // Register window class if needed
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
-        wc.lpfnWndProc = GrayscaleEditorProc;
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        wc.lpszClassName = L"DesktopLUT_GrayscaleEditor";
-        RegisterClassEx(&wc);
-        registered = true;
-    }
-
-    // Setup editor data
-    GrayscaleEditorData data;
-    data.pointCount = settings.pointCount;
-    data.points = settings.points.data();
-    data.isHDR = isHDR;
-    data.peakNits = settings.peakNits;  // Pass peak for HDR label calculation
-    // Save original values for Cancel restore
-    data.originalPoints.assign(settings.points.begin(), settings.points.end());
-    g_grayscaleEditor = &data;
-
-    // Calculate window size (must match layout in GrayscaleEditorProc)
-    int sliderW = 32;
-    int sliderH = 150;
-    int rgbLabelH = 16;   // Code value at top (8-bit SDR, 10-bit HDR)
-    int pctLabelH = 16;   // Input percentage below slider
-    int editH = 20;
-    int pad = 2;
-    int btnH = 28;
-    int startY = 10;
-
-    int contentW = 20 + settings.pointCount * (sliderW + pad) + 40;  // Extra for +/- labels
-    int contentH = startY + rgbLabelH + sliderH + pctLabelH + editH + 15 + btnH + 15;
-
-    // Adjust for window chrome
-    RECT rc = { 0, 0, contentW, contentH };
-    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-    int winW = rc.right - rc.left;
-    int winH = rc.bottom - rc.top;
-
-    // Center on parent
-    RECT parentRect;
-    GetWindowRect(hwndParent, &parentRect);
-    int x = parentRect.left + (parentRect.right - parentRect.left - winW) / 2;
-    int y = parentRect.top + (parentRect.bottom - parentRect.top - winH) / 2;
-
-    // Create dialog window
-    HWND hwndEditor = CreateWindowEx(
-        WS_EX_DLGMODALFRAME,
-        L"DesktopLUT_GrayscaleEditor",
-        L"Grayscale Correction",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        x, y, winW, winH,
-        hwndParent, nullptr, GetModuleHandle(nullptr), nullptr);
-
-    if (!hwndEditor) {
-        g_grayscaleEditor = nullptr;
-        return;
-    }
-
-    ShowWindow(hwndEditor, SW_SHOW);
-    UpdateWindow(hwndEditor);
-
-    // Modal message loop
-    EnableWindow(hwndParent, FALSE);
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndEditor)) {
-        if (bRet == -1) break;  // Error occurred
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    EnableWindow(hwndParent, TRUE);
-    SetForegroundWindow(hwndParent);
-
-    // Ensure global pointer is cleared (WM_DESTROY should do this, but be safe)
-    g_grayscaleEditor = nullptr;
-}
-
 // ============================================================================
-// Gamma Whitelist Dialog
+// SECTION: Scroll Panels
 // ============================================================================
-
-static HWND g_whitelistEdit = nullptr;
-
-LRESULT CALLBACK GammaWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        {
-            int pad = 10;
-            int btnW = 75;
-            int btnH = 26;
-
-            // Info label
-            CreateWindow(L"STATIC",
-                L"Process names to auto-disable gamma correction:",
-                WS_CHILD | WS_VISIBLE,
-                pad, pad, 360, 18, hwnd, nullptr, nullptr, nullptr);
-
-            // Multi-line edit box with word wrap for many entries
-            g_whitelistEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", g_gammaWhitelistRaw.c_str(),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
-                pad, pad + 22, 360, 80, hwnd, (HMENU)ID_WHITELIST_EDIT, nullptr, nullptr);
-
-            // OK and Cancel buttons (owner-draw for rounded style)
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            int btnY = rc.bottom - btnH - pad;
-            CreateWindow(L"BUTTON", L"OK",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                rc.right - 2*btnW - 2*pad, btnY, btnW, btnH, hwnd, (HMENU)ID_WHITELIST_OK, nullptr, nullptr);
-            CreateWindow(L"BUTTON", L"Cancel",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                rc.right - btnW - pad, btnY, btnW, btnH, hwnd, (HMENU)ID_WHITELIST_CANCEL, nullptr, nullptr);
-
-            // Apply main font to all controls
-            if (g_mainFont) {
-                EnumChildWindows(hwnd, [](HWND hwndChild, LPARAM lParam) -> BOOL {
-                    SendMessage(hwndChild, WM_SETFONT, lParam, TRUE);
-                    return TRUE;
-                }, (LPARAM)g_mainFont);
-            }
-        }
-        return 0;
-
-    case WM_DRAWITEM:
-        {
-            LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
-            if (pDIS->CtlType == ODT_BUTTON) {
-                DrawRoundedButton(pDIS);
-                return TRUE;
-            }
-        }
-        break;
-
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case ID_WHITELIST_OK:
-            {
-                // Get text from edit box
-                wchar_t buf[1024] = {};
-                GetWindowText(g_whitelistEdit, buf, 1024);
-                g_gammaWhitelistRaw = buf;
-                ParseGammaWhitelist();
-                SaveSettings();
-                DestroyWindow(hwnd);
-            }
-            return 0;
-        case ID_WHITELIST_CANCEL:
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        break;
-
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-
-    case WM_DESTROY:
-        g_whitelistEdit = nullptr;
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-void ShowGammaWhitelistDialog(HWND hwndParent) {
-    // Register window class if needed
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
-        wc.lpfnWndProc = GammaWhitelistProc;
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        wc.lpszClassName = L"DesktopLUT_GammaWhitelist";
-        RegisterClassEx(&wc);
-        registered = true;
-    }
-
-    // Calculate window size
-    int contentW = 380;
-    int contentH = 160;
-
-    RECT rc = { 0, 0, contentW, contentH };
-    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-    int winW = rc.right - rc.left;
-    int winH = rc.bottom - rc.top;
-
-    // Center on parent
-    RECT parentRect;
-    GetWindowRect(hwndParent, &parentRect);
-    int x = parentRect.left + (parentRect.right - parentRect.left - winW) / 2;
-    int y = parentRect.top + (parentRect.bottom - parentRect.top - winH) / 2;
-
-    // Create dialog window
-    HWND hwndDialog = CreateWindowEx(
-        WS_EX_DLGMODALFRAME,
-        L"DesktopLUT_GammaWhitelist",
-        L"Gamma Whitelist",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        x, y, winW, winH,
-        hwndParent, nullptr, GetModuleHandle(nullptr), nullptr);
-
-    if (!hwndDialog) {
-        return;
-    }
-
-    ShowWindow(hwndDialog, SW_SHOW);
-    UpdateWindow(hwndDialog);
-
-    // Modal message loop
-    EnableWindow(hwndParent, FALSE);
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndDialog)) {
-        if (bRet == -1) break;  // Error occurred
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    EnableWindow(hwndParent, TRUE);
-    SetForegroundWindow(hwndParent);
-}
-
-// ============================================================================
-// VRR Whitelist Dialog
-// ============================================================================
-
-static HWND g_vrrWhitelistEdit = nullptr;
-
-LRESULT CALLBACK VrrWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        {
-            int pad = 10;
-            int btnW = 75;
-            int btnH = 26;
-
-            // Info label
-            CreateWindow(L"STATIC",
-                L"Process names to disable overlay for:",
-                WS_CHILD | WS_VISIBLE,
-                pad, pad, 360, 18, hwnd, nullptr, nullptr, nullptr);
-
-            // Multi-line edit box with word wrap for many entries
-            g_vrrWhitelistEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", g_vrrWhitelistRaw.c_str(),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL,
-                pad, pad + 22, 360, 80, hwnd, nullptr, nullptr, nullptr);
-
-            // OK and Cancel buttons (owner-draw for rounded style)
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            int btnY = rc.bottom - btnH - pad;
-            CreateWindow(L"BUTTON", L"OK",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                rc.right - 2*btnW - 2*pad, btnY, btnW, btnH, hwnd, (HMENU)ID_WHITELIST_OK, nullptr, nullptr);
-            CreateWindow(L"BUTTON", L"Cancel",
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                rc.right - btnW - pad, btnY, btnW, btnH, hwnd, (HMENU)ID_WHITELIST_CANCEL, nullptr, nullptr);
-
-            // Apply main font to all controls
-            if (g_mainFont) {
-                EnumChildWindows(hwnd, [](HWND hwndChild, LPARAM lParam) -> BOOL {
-                    SendMessage(hwndChild, WM_SETFONT, lParam, TRUE);
-                    return TRUE;
-                }, (LPARAM)g_mainFont);
-            }
-        }
-        return 0;
-
-    case WM_DRAWITEM:
-        {
-            LPDRAWITEMSTRUCT pDIS = (LPDRAWITEMSTRUCT)lParam;
-            if (pDIS->CtlType == ODT_BUTTON) {
-                DrawRoundedButton(pDIS);
-                return TRUE;
-            }
-        }
-        break;
-
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case ID_WHITELIST_OK:
-            {
-                // Get text from edit box
-                wchar_t buf[1024] = {};
-                GetWindowText(g_vrrWhitelistEdit, buf, 1024);
-                g_vrrWhitelistRaw = buf;
-                ParseVrrWhitelist();
-                SaveSettings();
-                DestroyWindow(hwnd);
-            }
-            return 0;
-        case ID_WHITELIST_CANCEL:
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        break;
-
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-
-    case WM_DESTROY:
-        g_vrrWhitelistEdit = nullptr;
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-void ShowVrrWhitelistDialog(HWND hwndParent) {
-    // Register window class if needed
-    static bool registered = false;
-    if (!registered) {
-        WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
-        wc.lpfnWndProc = VrrWhitelistProc;
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        wc.lpszClassName = L"DesktopLUT_VrrWhitelist";
-        RegisterClassEx(&wc);
-        registered = true;
-    }
-
-    // Calculate window size
-    int contentW = 380;
-    int contentH = 160;
-
-    RECT rc = { 0, 0, contentW, contentH };
-    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
-    int winW = rc.right - rc.left;
-    int winH = rc.bottom - rc.top;
-
-    // Center on parent
-    RECT parentRect;
-    GetWindowRect(hwndParent, &parentRect);
-    int x = parentRect.left + (parentRect.right - parentRect.left - winW) / 2;
-    int y = parentRect.top + (parentRect.bottom - parentRect.top - winH) / 2;
-
-    // Create dialog window
-    HWND hwndDialog = CreateWindowEx(
-        WS_EX_DLGMODALFRAME,
-        L"DesktopLUT_VrrWhitelist",
-        L"Passthrough Whitelist",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        x, y, winW, winH,
-        hwndParent, nullptr, GetModuleHandle(nullptr), nullptr);
-
-    if (!hwndDialog) {
-        return;
-    }
-
-    ShowWindow(hwndDialog, SW_SHOW);
-    UpdateWindow(hwndDialog);
-
-    // Modal message loop
-    EnableWindow(hwndParent, FALSE);
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndDialog)) {
-        if (bRet == -1) break;  // Error occurred
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    EnableWindow(hwndParent, TRUE);
-    SetForegroundWindow(hwndParent);
-}
 
 // Monitor enumeration for GUI
 static BOOL CALLBACK GUIMonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam) {
@@ -1243,9 +264,6 @@ static BOOL CALLBACK GUIMonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM l
     monitors->push_back(hMonitor);
     return TRUE;
 }
-
-// Forward declaration for DrawRoundedButton
-static void DrawRoundedButton(LPDRAWITEMSTRUCT pDIS);
 
 // Scroll panel window procedure
 static LRESULT CALLBACK ScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1392,6 +410,10 @@ static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     return CallWindowProc(g_origTabProc, hwnd, msg, wParam, lParam);
 }
 
+// ============================================================================
+// SECTION: Main Window Procedure
+// ============================================================================
+
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CTLCOLORSTATIC: {
@@ -1404,6 +426,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         for (HWND h : g_gui.tab0Controls) { if (h == hCtrl) { isTabControl = true; break; } }
         if (!isTabControl) for (HWND h : g_gui.tab1Controls) { if (h == hCtrl) { isTabControl = true; break; } }
         if (!isTabControl) for (HWND h : g_gui.tab2Controls) { if (h == hCtrl) { isTabControl = true; break; } }
+        if (!isTabControl) for (HWND h : g_gui.tab3Controls) { if (h == hCtrl) { isTabControl = true; break; } }
 
         if (isTabControl) {
             if (!g_tabBgBrush) g_tabBgBrush = CreateSolidBrush(TAB_BG_COLOR);
@@ -1475,13 +498,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Subclass tab control for custom background color
         g_origTabProc = (WNDPROC)SetWindowLongPtr(g_gui.hwndTab, GWLP_WNDPROC, (LONG_PTR)TabSubclassProc);
 
-        // Add tabs
+        // Add tabs: I. MHC / II. 3D LUT / III. Corrections / Settings
         TCITEM tie = { TCIF_TEXT };
-        tie.pszText = (LPWSTR)L"LUT Options";
+        tie.pszText = (LPWSTR)L"I. MHC";
         TabCtrl_InsertItem(g_gui.hwndTab, 0, &tie);
-        tie.pszText = (LPWSTR)L"SDR Options";
+        tie.pszText = (LPWSTR)L"II. 3D LUT";
         TabCtrl_InsertItem(g_gui.hwndTab, 1, &tie);
-        tie.pszText = (LPWSTR)L"HDR Options";
+        tie.pszText = (LPWSTR)L"III. Corrections";
         TabCtrl_InsertItem(g_gui.hwndTab, 2, &tie);
         tie.pszText = (LPWSTR)L"Settings";
         TabCtrl_InsertItem(g_gui.hwndTab, 3, &tie);
@@ -1512,420 +535,410 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int innerX = 8;  // Starting X inside scroll panel
         int groupW = panelW - 16;  // Width for groupboxes (with padding inside panel)
 
-        // === TAB 0: LUT Options ===
+        // === TAB 0: Display Calibration (SDR + HDR sections) ===
         HWND ctrl;
         HWND panel0 = g_gui.hwndScrollPanel[0];
+
+        // Helper lambda to create one MHC section
+        auto createMhcSection = [&](const wchar_t* title, int baseY,
+            HWND& hApply, HWND& hRemove, HWND& hEdit, HWND& hStatus,
+            HWND* hCoords, HWND* hMetaLabels,
+            HMENU idApply, HMENU idRemove, HMENU idEdit)
+        {
+            ctrl = CreateWindow(L"BUTTON", title, WS_CHILD | BS_GROUPBOX,
+                innerX, baseY, groupW, 115, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(ctrl);
+
+            hApply = CreateWindow(L"BUTTON", L"Apply",
+                WS_CHILD | BS_OWNERDRAW, innerX + 10, baseY + 18, 55, h, panel0, idApply, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hApply);
+
+            hRemove = CreateWindow(L"BUTTON", L"Remove",
+                WS_CHILD | BS_OWNERDRAW, innerX + 70, baseY + 18, 55, h, panel0, idRemove, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hRemove);
+
+            hEdit = CreateWindow(L"BUTTON", L"Edit",
+                WS_CHILD | BS_OWNERDRAW, innerX + 130, baseY + 18, 40, h, panel0, idEdit, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hEdit);
+
+            hStatus = CreateWindow(L"STATIC", L"\x25CB Not installed", WS_CHILD,
+                innerX + 180, baseY + 20, groupW - 190, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hStatus);
+
+            int cY = baseY + 50;
+            int cX = innerX + 10;
+            int cW = 50;
+            int cLabelW = 25;
+            int metaX = cX + 285;  // Metadata labels X position
+            int metaW = groupW - 285 - 20;  // Remaining width
+            DWORD editStyle = WS_CHILD | WS_BORDER | ES_READONLY | ES_CENTER | WS_DISABLED;
+
+            ctrl = CreateWindow(L"STATIC", L"R:", WS_CHILD, cX, cY + 3, cLabelW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(ctrl);
+            hCoords[0] = CreateWindow(L"EDIT", L"", editStyle, cX + cLabelW, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[0]);
+            hCoords[1] = CreateWindow(L"EDIT", L"", editStyle, cX + cLabelW + cW + 5, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[1]);
+
+            ctrl = CreateWindow(L"STATIC", L"G:", WS_CHILD, cX + 140, cY + 3, cLabelW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(ctrl);
+            hCoords[2] = CreateWindow(L"EDIT", L"", editStyle, cX + 140 + cLabelW, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[2]);
+            hCoords[3] = CreateWindow(L"EDIT", L"", editStyle, cX + 140 + cLabelW + cW + 5, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[3]);
+
+            // Metadata labels: 3 lines packed within the RGBW box height
+            int metaY = cY + 3;       // Top-aligned with R/G row text
+            int metaLineH = 16;       // Compact line height for text-only labels
+            for (int mi = 0; mi < 3; mi++) {
+                hMetaLabels[mi] = CreateWindow(L"STATIC", L"", WS_CHILD,
+                    metaX, metaY + mi * metaLineH, metaW, metaLineH, panel0, nullptr, nullptr, nullptr);
+                g_gui.tab0Controls.push_back(hMetaLabels[mi]);
+            }
+
+            cY += h + 4;
+            ctrl = CreateWindow(L"STATIC", L"B:", WS_CHILD, cX, cY + 3, cLabelW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(ctrl);
+            hCoords[4] = CreateWindow(L"EDIT", L"", editStyle, cX + cLabelW, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[4]);
+            hCoords[5] = CreateWindow(L"EDIT", L"", editStyle, cX + cLabelW + cW + 5, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[5]);
+
+            ctrl = CreateWindow(L"STATIC", L"W:", WS_CHILD, cX + 140, cY + 3, cLabelW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(ctrl);
+            hCoords[6] = CreateWindow(L"EDIT", L"", editStyle, cX + 140 + cLabelW, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[6]);
+            hCoords[7] = CreateWindow(L"EDIT", L"", editStyle, cX + 140 + cLabelW + cW + 5, cY, cW, h, panel0, nullptr, nullptr, nullptr);
+            g_gui.tab0Controls.push_back(hCoords[7]);
+        };
+
+        // SDR Display Calibration section
+        createMhcSection(L"SDR Display Calibration", innerY,
+            g_gui.hwndMhcApply, g_gui.hwndMhcRemove, g_gui.hwndMhcEdit, g_gui.hwndMhcStatus,
+            g_gui.hwndMhcIccCoords, g_gui.hwndMhcMetaLabels,
+            (HMENU)ID_MHC_TAB_APPLY, (HMENU)ID_MHC_TAB_REMOVE, (HMENU)ID_MHC_TAB_EDIT);
+
+        innerY += 115 + 5;
+
+        // HDR Display Calibration section
+        createMhcSection(L"HDR Display Calibration", innerY,
+            g_gui.hwndHdrMhcApply, g_gui.hwndHdrMhcRemove, g_gui.hwndHdrMhcEdit, g_gui.hwndHdrMhcStatus,
+            g_gui.hwndHdrMhcIccCoords, g_gui.hwndHdrMhcMetaLabels,
+            (HMENU)ID_MHC_HDR_APPLY, (HMENU)ID_MHC_HDR_REMOVE, (HMENU)ID_MHC_HDR_EDIT);
+
+        g_gui.contentHeight[0] = innerY + 115 + 8;
+
+        // === TAB 1: 3D LUT (file selection) ===
+        innerY = 8;
+        HWND panel1 = g_gui.hwndScrollPanel[1];
 
         // LUT path edit width calculation
         int pathEditW = groupW - labelW - 3 * pad - 2 * btnW;
 
         // SDR LUT
         ctrl = CreateWindow(L"STATIC", L"SDR LUT:", WS_CHILD | WS_VISIBLE,
-            innerX, innerY + 2, labelW, h, panel0, nullptr, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(ctrl);
+            innerX, innerY + 2, labelW, h, panel1, nullptr, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(ctrl);
         g_gui.hwndSdrPath = CreateWindow(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
-            innerX + labelW + pad, innerY, pathEditW, h, panel0, (HMENU)ID_SDR_PATH, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(g_gui.hwndSdrPath);
+            innerX + labelW + pad, innerY, pathEditW, h, panel1, (HMENU)ID_SDR_PATH, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(g_gui.hwndSdrPath);
         ctrl = CreateWindow(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            innerX + labelW + pad + pathEditW + pad, innerY, btnW, h, panel0, (HMENU)ID_SDR_BROWSE, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(ctrl);
+            innerX + labelW + pad + pathEditW + pad, innerY, btnW, h, panel1, (HMENU)ID_SDR_BROWSE, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(ctrl);
         ctrl = CreateWindow(L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            innerX + labelW + pad + pathEditW + pad + btnW + pad, innerY, btnW, h, panel0, (HMENU)ID_SDR_CLEAR, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(ctrl);
+            innerX + labelW + pad + pathEditW + pad + btnW + pad, innerY, btnW, h, panel1, (HMENU)ID_SDR_CLEAR, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(ctrl);
         innerY += h + pad;
 
         // HDR LUT
         ctrl = CreateWindow(L"STATIC", L"HDR LUT:", WS_CHILD | WS_VISIBLE,
-            innerX, innerY + 2, labelW, h, panel0, nullptr, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(ctrl);
+            innerX, innerY + 2, labelW, h, panel1, nullptr, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(ctrl);
         g_gui.hwndHdrPath = CreateWindow(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
-            innerX + labelW + pad, innerY, pathEditW, h, panel0, (HMENU)ID_HDR_PATH, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(g_gui.hwndHdrPath);
+            innerX + labelW + pad, innerY, pathEditW, h, panel1, (HMENU)ID_HDR_PATH, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(g_gui.hwndHdrPath);
         ctrl = CreateWindow(L"BUTTON", L"Browse", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            innerX + labelW + pad + pathEditW + pad, innerY, btnW, h, panel0, (HMENU)ID_HDR_BROWSE, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(ctrl);
+            innerX + labelW + pad + pathEditW + pad, innerY, btnW, h, panel1, (HMENU)ID_HDR_BROWSE, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(ctrl);
         ctrl = CreateWindow(L"BUTTON", L"Clear", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            innerX + labelW + pad + pathEditW + pad + btnW + pad, innerY, btnW, h, panel0, (HMENU)ID_HDR_CLEAR, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(ctrl);
+            innerX + labelW + pad + pathEditW + pad + btnW + pad, innerY, btnW, h, panel1, (HMENU)ID_HDR_CLEAR, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(ctrl);
         innerY += h + pad;
 
         // Tetrahedral interpolation checkbox
         g_gui.hwndTetrahedralCheck = CreateWindow(L"BUTTON", L"Tetrahedral LUT interpolation",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            innerX + labelW + pad, innerY, 250, h, panel0, (HMENU)ID_TETRAHEDRAL_CHECK, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(g_gui.hwndTetrahedralCheck);
+            innerX + labelW + pad, innerY, 250, h, panel1, (HMENU)ID_TETRAHEDRAL_CHECK, nullptr, nullptr);
+        g_gui.tab1Controls.push_back(g_gui.hwndTetrahedralCheck);
         SendMessage(g_gui.hwndTetrahedralCheck, BM_SETCHECK, g_tetrahedralInterp ? BST_CHECKED : BST_UNCHECKED, 0);
-        innerY += h + pad;
 
-        // Gamma checkbox and whitelist button
-        g_gui.hwndGammaCheck = CreateWindow(L"BUTTON", L"Desktop gamma (2.2) - HDR only",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            innerX + labelW + pad, innerY, 200, h, panel0, (HMENU)ID_GAMMA_CHECK, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(g_gui.hwndGammaCheck);
-        SendMessage(g_gui.hwndGammaCheck, BM_SETCHECK, g_userDesktopGammaMode.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+        g_gui.contentHeight[1] = innerY + h + 8;
+
+        // === TAB 2: Corrections (SDR + HDR sections shown simultaneously) ===
+        innerY = 8;
+        HWND panel2 = g_gui.hwndScrollPanel[2];
+        int chromW = 50;
+
+        // --- SDR Corrections section ---
+        ctrl = CreateWindow(L"STATIC", L"SDR Corrections", WS_CHILD | SS_LEFT,
+            innerX, innerY, groupW, 16, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+        innerY += 18;
+
+        // SDR White Point
+        ctrl = CreateWindow(L"BUTTON", L"White Point", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 48, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+
+        g_gui.hwndPrimariesEnable = CreateWindow(L"BUTTON", L"Enable",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_PRIMARIES_ENABLE, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndPrimariesEnable);
+
+        ctrl = CreateWindow(L"STATIC", L"x:", WS_CHILD,
+            innerX + 80, innerY + 20, 14, h, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+        g_gui.hwndPrimariesWx = CreateWindow(L"EDIT", L"0.3127", WS_CHILD | WS_BORDER,
+            innerX + 94, innerY + 18, chromW, h, panel2, (HMENU)ID_CORR_PRIMARIES_WX, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndPrimariesWx);
+
+        ctrl = CreateWindow(L"STATIC", L"y:", WS_CHILD,
+            innerX + 150, innerY + 20, 14, h, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+        g_gui.hwndPrimariesWy = CreateWindow(L"EDIT", L"0.3290", WS_CHILD | WS_BORDER,
+            innerX + 164, innerY + 18, chromW, h, panel2, (HMENU)ID_CORR_PRIMARIES_WY, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndPrimariesWy);
+
+        SetNumericEdit(g_gui.hwndPrimariesWx, 4);
+        SetNumericEdit(g_gui.hwndPrimariesWy, 4);
+
+        // SDR Grayscale
+        innerY += 53;
+        ctrl = CreateWindow(L"BUTTON", L"Grayscale", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 75, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+
+        g_gui.hwndGrayscaleEnable = CreateWindow(L"BUTTON", L"Enable",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_GRAYSCALE_ENABLE, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscaleEnable);
+
+        ctrl = CreateWindow(L"STATIC", L"Points:", WS_CHILD, innerX + 80, innerY + 20, 45, h, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+
+        g_gui.hwndGrayscale10 = CreateWindow(L"BUTTON", L"10", WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP,
+            innerX + 130, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_GRAYSCALE_10, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscale10);
+        g_gui.hwndGrayscale20 = CreateWindow(L"BUTTON", L"20", WS_CHILD | BS_AUTORADIOBUTTON,
+            innerX + 175, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_GRAYSCALE_20, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscale20);
+        g_gui.hwndGrayscale32 = CreateWindow(L"BUTTON", L"32", WS_CHILD | BS_AUTORADIOBUTTON,
+            innerX + 220, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_GRAYSCALE_32, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscale32);
+        SendMessage(g_gui.hwndGrayscale20, BM_SETCHECK, BST_CHECKED, 0);
+
+        g_gui.hwndGrayscaleEdit = CreateWindow(L"BUTTON", L"Edit Points...",
+            WS_CHILD | BS_OWNERDRAW, innerX + 10, innerY + 45, 90, h, panel2, (HMENU)ID_CORR_GRAYSCALE_EDIT, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscaleEdit);
+        g_gui.hwndGrayscaleReset = CreateWindow(L"BUTTON", L"Reset",
+            WS_CHILD | BS_OWNERDRAW, innerX + 110, innerY + 45, 60, h, panel2, (HMENU)ID_CORR_GRAYSCALE_RESET, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscaleReset);
+
+        g_gui.hwndGrayscale24 = CreateWindow(L"BUTTON", L"2.4 Gamma (BT.1886)",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 180, innerY + 47, 150, h, panel2, (HMENU)ID_CORR_GRAYSCALE_24, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscale24);
+
+        // --- HDR Corrections section ---
+        innerY += 85;
+
+        // Separator
+        ctrl = CreateWindow(L"STATIC", L"HDR Corrections", WS_CHILD | SS_LEFT,
+            innerX, innerY, groupW, 16, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+        innerY += 18;
+
+        // Desktop Gamma groupbox (HDR only)
+        ctrl = CreateWindow(L"BUTTON", L"Desktop Gamma", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 48, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+
+        g_gui.hwndGammaCheck = CreateWindow(L"BUTTON", L"sRGB\x2192""2.2 Gamma",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 18, 200, h, panel2, (HMENU)ID_GAMMA_CHECK, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGammaCheck);
+        SendMessage(g_gui.hwndGammaCheck, BM_SETCHECK, g_desktopGammaMode ? BST_CHECKED : BST_UNCHECKED, 0);
 
         g_gui.hwndGammaWhitelistBtn = CreateWindow(L"BUTTON", L"Whitelist...",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            innerX + labelW + pad + 205, innerY, 70, h, panel0, (HMENU)ID_GAMMA_WHITELIST_BTN, nullptr, nullptr);
-        g_gui.tab0Controls.push_back(g_gui.hwndGammaWhitelistBtn);
-        g_gui.contentHeight[0] = innerY + h + 8;  // Track content height
+            WS_CHILD | BS_OWNERDRAW,
+            innerX + 220, innerY + 18, 70, h, panel2, (HMENU)ID_GAMMA_WHITELIST_BTN, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGammaWhitelistBtn);
 
-        // === TAB 1: SDR Color Correction (initially hidden) ===
-        innerY = 8;  // Reset for scroll panel
-        HWND panel1 = g_gui.hwndScrollPanel[1];
-
-        // Primaries group
-        ctrl = CreateWindow(L"BUTTON", L"Display Primaries", WS_CHILD | BS_GROUPBOX,
-            innerX, innerY, groupW, 105, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-
-        g_gui.hwndSdrPrimariesEnable = CreateWindow(L"BUTTON", L"Enable",
-            WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 18, 60, h, panel1, (HMENU)ID_SDR_PRIMARIES_ENABLE, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesEnable);
-
-        ctrl = CreateWindow(L"STATIC", L"Preset:", WS_CHILD,
-            innerX + 80, innerY + 20, 45, h, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-
-        g_gui.hwndSdrPrimariesPreset = CreateWindow(L"COMBOBOX", nullptr,
-            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            innerX + 130, innerY + 18, 150, 150, panel1, (HMENU)ID_SDR_PRIMARIES_PRESET, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesPreset);
-        for (int i = 0; i < g_numPresetPrimaries; i++) {
-            SendMessage(g_gui.hwndSdrPrimariesPreset, CB_ADDSTRING, 0, (LPARAM)g_presetPrimaries[i].name);
-        }
-        SendMessage(g_gui.hwndSdrPrimariesPreset, CB_SETCURSEL, 0, 0);
-
-        ctrl = CreateWindow(L"BUTTON", L"Detect", WS_CHILD | BS_OWNERDRAW,
-            innerX + 285, innerY + 18, 50, h, panel1, (HMENU)ID_SDR_PRIMARIES_DETECT, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-
-        // Chromaticity coordinate inputs (2 rows)
-        int chromY = innerY + 45;
-        int chromX = innerX + 10;
-        int chromW = 50;
-        int chromLabelW = 25;
-
-        ctrl = CreateWindow(L"STATIC", L"R:", WS_CHILD, chromX, chromY + 2, chromLabelW, h, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-        g_gui.hwndSdrPrimariesRx = CreateWindow(L"EDIT", L"0.64", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_RX, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesRx);
-        g_gui.hwndSdrPrimariesRy = CreateWindow(L"EDIT", L"0.33", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW + chromW + 5, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_RY, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesRy);
-
-        ctrl = CreateWindow(L"STATIC", L"G:", WS_CHILD, chromX + 140, chromY + 2, chromLabelW, h, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-        g_gui.hwndSdrPrimariesGx = CreateWindow(L"EDIT", L"0.30", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_GX, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesGx);
-        g_gui.hwndSdrPrimariesGy = CreateWindow(L"EDIT", L"0.60", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW + chromW + 5, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_GY, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesGy);
-
-        chromY += h + 4;
-        ctrl = CreateWindow(L"STATIC", L"B:", WS_CHILD, chromX, chromY + 2, chromLabelW, h, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-        g_gui.hwndSdrPrimariesBx = CreateWindow(L"EDIT", L"0.15", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_BX, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesBx);
-        g_gui.hwndSdrPrimariesBy = CreateWindow(L"EDIT", L"0.06", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW + chromW + 5, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_BY, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesBy);
-
-        ctrl = CreateWindow(L"STATIC", L"W:", WS_CHILD, chromX + 140, chromY + 2, chromLabelW, h, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-        g_gui.hwndSdrPrimariesWx = CreateWindow(L"EDIT", L"0.3127", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_WX, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesWx);
-        g_gui.hwndSdrPrimariesWy = CreateWindow(L"EDIT", L"0.329", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW + chromW + 5, chromY, chromW, h, panel1, (HMENU)ID_SDR_PRIMARIES_WY, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrPrimariesWy);
-
-        // Apply numeric input validation (4 decimal places for coordinates)
-        SetNumericEdit(g_gui.hwndSdrPrimariesRx, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesRy, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesGx, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesGy, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesBx, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesBy, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesWx, 4);
-        SetNumericEdit(g_gui.hwndSdrPrimariesWy, 4);
-
-        // Disable primaries edit boxes by default (only enabled for Custom preset)
-        EnableWindow(g_gui.hwndSdrPrimariesRx, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesRy, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesGx, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesGy, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesBx, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesBy, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesWx, FALSE);
-        EnableWindow(g_gui.hwndSdrPrimariesWy, FALSE);
-
-        // Grayscale group (layout matches HDR Grayscale group)
-        innerY += 110;
-        ctrl = CreateWindow(L"BUTTON", L"Grayscale", WS_CHILD | BS_GROUPBOX,
-            innerX, innerY, groupW, 75, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-
-        g_gui.hwndSdrGrayscaleEnable = CreateWindow(L"BUTTON", L"Enable",
-            WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 18, 60, h, panel1, (HMENU)ID_SDR_GRAYSCALE_ENABLE, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscaleEnable);
-
-        ctrl = CreateWindow(L"STATIC", L"Points:", WS_CHILD, innerX + 80, innerY + 20, 45, h, panel1, nullptr, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(ctrl);
-
-        g_gui.hwndSdrGrayscale10 = CreateWindow(L"BUTTON", L"10", WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP,
-            innerX + 130, innerY + 18, 40, h, panel1, (HMENU)ID_SDR_GRAYSCALE_10, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscale10);
-        g_gui.hwndSdrGrayscale20 = CreateWindow(L"BUTTON", L"20", WS_CHILD | BS_AUTORADIOBUTTON,
-            innerX + 175, innerY + 18, 40, h, panel1, (HMENU)ID_SDR_GRAYSCALE_20, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscale20);
-        g_gui.hwndSdrGrayscale32 = CreateWindow(L"BUTTON", L"32", WS_CHILD | BS_AUTORADIOBUTTON,
-            innerX + 220, innerY + 18, 40, h, panel1, (HMENU)ID_SDR_GRAYSCALE_32, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscale32);
-        SendMessage(g_gui.hwndSdrGrayscale20, BM_SETCHECK, BST_CHECKED, 0);  // Default to 20
-
-        g_gui.hwndSdrGrayscaleEdit = CreateWindow(L"BUTTON", L"Edit Points...",
-            WS_CHILD | BS_OWNERDRAW, innerX + 10, innerY + 45, 90, h, panel1, (HMENU)ID_SDR_GRAYSCALE_EDIT, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscaleEdit);
-        g_gui.hwndSdrGrayscaleReset = CreateWindow(L"BUTTON", L"Reset",
-            WS_CHILD | BS_OWNERDRAW, innerX + 110, innerY + 45, 60, h, panel1, (HMENU)ID_SDR_GRAYSCALE_RESET, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscaleReset);
-
-        // 2.4 Gamma checkbox (independent, below grayscale group)
-        g_gui.hwndSdrGrayscale24 = CreateWindow(L"BUTTON", L"2.4 Gamma",
-            WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 80, 80, h, panel1, (HMENU)ID_SDR_GRAYSCALE_24, nullptr, nullptr);
-        g_gui.tab1Controls.push_back(g_gui.hwndSdrGrayscale24);
-
-        g_gui.contentHeight[1] = innerY + 105 + 8;  // Track content height
-
-        // === TAB 2: HDR Options (initially hidden) ===
-        innerY = 8;  // Reset for scroll panel
-        HWND panel2 = g_gui.hwndScrollPanel[2];
-
-        // HDR Display Primaries group
-        ctrl = CreateWindow(L"BUTTON", L"Display Primaries", WS_CHILD | BS_GROUPBOX,
-            innerX, innerY, groupW, 105, panel2, nullptr, nullptr, nullptr);
+        // HDR White Point
+        innerY += 53;
+        ctrl = CreateWindow(L"BUTTON", L"White Point", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 48, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
         g_gui.hwndHdrPrimariesEnable = CreateWindow(L"BUTTON", L"Enable",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_HDR_PRIMARIES_ENABLE, nullptr, nullptr);
+            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_HDR_PRIMARIES_ENABLE, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesEnable);
 
-        ctrl = CreateWindow(L"STATIC", L"Preset:", WS_CHILD,
-            innerX + 80, innerY + 20, 45, h, panel2, nullptr, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(ctrl);
-
-        g_gui.hwndHdrPrimariesPreset = CreateWindow(L"COMBOBOX", nullptr,
-            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            innerX + 130, innerY + 18, 150, 150, panel2, (HMENU)ID_HDR_PRIMARIES_PRESET, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesPreset);
-        for (int i = 0; i < g_numPresetPrimaries; i++) {
-            SendMessage(g_gui.hwndHdrPrimariesPreset, CB_ADDSTRING, 0, (LPARAM)g_presetPrimaries[i].name);
-        }
-        SendMessage(g_gui.hwndHdrPrimariesPreset, CB_SETCURSEL, 3, 0);  // Default to Rec.2020 for HDR
-
-        ctrl = CreateWindow(L"BUTTON", L"Detect", WS_CHILD | BS_OWNERDRAW,
-            innerX + 285, innerY + 18, 50, h, panel2, (HMENU)ID_HDR_PRIMARIES_DETECT, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(ctrl);
-
-        // HDR Chromaticity coordinate inputs (2 rows)
-        chromY = innerY + 45;
-        chromX = innerX + 10;
-
-        // HDR defaults to Rec.2020 primaries (target for HDR content)
-        ctrl = CreateWindow(L"STATIC", L"R:", WS_CHILD, chromX, chromY + 2, chromLabelW, h, panel2, nullptr, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(ctrl);
-        g_gui.hwndHdrPrimariesRx = CreateWindow(L"EDIT", L"0.708", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_RX, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesRx);
-        g_gui.hwndHdrPrimariesRy = CreateWindow(L"EDIT", L"0.292", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW + chromW + 5, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_RY, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesRy);
-
-        ctrl = CreateWindow(L"STATIC", L"G:", WS_CHILD, chromX + 140, chromY + 2, chromLabelW, h, panel2, nullptr, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(ctrl);
-        g_gui.hwndHdrPrimariesGx = CreateWindow(L"EDIT", L"0.170", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_GX, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesGx);
-        g_gui.hwndHdrPrimariesGy = CreateWindow(L"EDIT", L"0.797", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW + chromW + 5, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_GY, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesGy);
-
-        chromY += h + 4;
-        ctrl = CreateWindow(L"STATIC", L"B:", WS_CHILD, chromX, chromY + 2, chromLabelW, h, panel2, nullptr, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(ctrl);
-        g_gui.hwndHdrPrimariesBx = CreateWindow(L"EDIT", L"0.131", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_BX, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesBx);
-        g_gui.hwndHdrPrimariesBy = CreateWindow(L"EDIT", L"0.046", WS_CHILD | WS_BORDER,
-            chromX + chromLabelW + chromW + 5, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_BY, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesBy);
-
-        ctrl = CreateWindow(L"STATIC", L"W:", WS_CHILD, chromX + 140, chromY + 2, chromLabelW, h, panel2, nullptr, nullptr, nullptr);
+        ctrl = CreateWindow(L"STATIC", L"x:", WS_CHILD,
+            innerX + 80, innerY + 20, 14, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
         g_gui.hwndHdrPrimariesWx = CreateWindow(L"EDIT", L"0.3127", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_WX, nullptr, nullptr);
+            innerX + 94, innerY + 18, chromW, h, panel2, (HMENU)ID_CORR_HDR_PRIMARIES_WX, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesWx);
-        g_gui.hwndHdrPrimariesWy = CreateWindow(L"EDIT", L"0.329", WS_CHILD | WS_BORDER,
-            chromX + 140 + chromLabelW + chromW + 5, chromY, chromW, h, panel2, (HMENU)ID_HDR_PRIMARIES_WY, nullptr, nullptr);
+
+        ctrl = CreateWindow(L"STATIC", L"y:", WS_CHILD,
+            innerX + 150, innerY + 20, 14, h, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(ctrl);
+        g_gui.hwndHdrPrimariesWy = CreateWindow(L"EDIT", L"0.3290", WS_CHILD | WS_BORDER,
+            innerX + 164, innerY + 18, chromW, h, panel2, (HMENU)ID_CORR_HDR_PRIMARIES_WY, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrPrimariesWy);
 
-        // Apply numeric input validation (4 decimal places for coordinates)
-        SetNumericEdit(g_gui.hwndHdrPrimariesRx, 4);
-        SetNumericEdit(g_gui.hwndHdrPrimariesRy, 4);
-        SetNumericEdit(g_gui.hwndHdrPrimariesGx, 4);
-        SetNumericEdit(g_gui.hwndHdrPrimariesGy, 4);
-        SetNumericEdit(g_gui.hwndHdrPrimariesBx, 4);
-        SetNumericEdit(g_gui.hwndHdrPrimariesBy, 4);
         SetNumericEdit(g_gui.hwndHdrPrimariesWx, 4);
         SetNumericEdit(g_gui.hwndHdrPrimariesWy, 4);
 
-        // Disable HDR primaries edit boxes by default (only enabled for Custom preset)
-        EnableWindow(g_gui.hwndHdrPrimariesRx, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesRy, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesGx, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesGy, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesBx, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesBy, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesWx, FALSE);
-        EnableWindow(g_gui.hwndHdrPrimariesWy, FALSE);
-
-        // HDR Grayscale group
-        innerY += 110;
+        // HDR Grayscale
+        innerY += 53;
         ctrl = CreateWindow(L"BUTTON", L"Grayscale", WS_CHILD | BS_GROUPBOX,
             innerX, innerY, groupW, 75, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
         g_gui.hwndHdrGrayscaleEnable = CreateWindow(L"BUTTON", L"Enable",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_HDR_GRAYSCALE_ENABLE, nullptr, nullptr);
+            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_ENABLE, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscaleEnable);
 
         ctrl = CreateWindow(L"STATIC", L"Points:", WS_CHILD, innerX + 80, innerY + 20, 45, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
         g_gui.hwndHdrGrayscale10 = CreateWindow(L"BUTTON", L"10", WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP,
-            innerX + 130, innerY + 18, 40, h, panel2, (HMENU)ID_HDR_GRAYSCALE_10, nullptr, nullptr);
+            innerX + 130, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_10, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscale10);
         g_gui.hwndHdrGrayscale20 = CreateWindow(L"BUTTON", L"20", WS_CHILD | BS_AUTORADIOBUTTON,
-            innerX + 175, innerY + 18, 40, h, panel2, (HMENU)ID_HDR_GRAYSCALE_20, nullptr, nullptr);
+            innerX + 175, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_20, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscale20);
         g_gui.hwndHdrGrayscale32 = CreateWindow(L"BUTTON", L"32", WS_CHILD | BS_AUTORADIOBUTTON,
-            innerX + 220, innerY + 18, 40, h, panel2, (HMENU)ID_HDR_GRAYSCALE_32, nullptr, nullptr);
+            innerX + 220, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_32, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscale32);
-        SendMessage(g_gui.hwndHdrGrayscale20, BM_SETCHECK, BST_CHECKED, 0);  // Default to 20
+        SendMessage(g_gui.hwndHdrGrayscale20, BM_SETCHECK, BST_CHECKED, 0);
 
         g_gui.hwndHdrGrayscaleEdit = CreateWindow(L"BUTTON", L"Edit Points...",
-            WS_CHILD | BS_OWNERDRAW, innerX + 10, innerY + 45, 90, h, panel2, (HMENU)ID_HDR_GRAYSCALE_EDIT, nullptr, nullptr);
+            WS_CHILD | BS_OWNERDRAW, innerX + 10, innerY + 45, 90, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_EDIT, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscaleEdit);
         g_gui.hwndHdrGrayscaleReset = CreateWindow(L"BUTTON", L"Reset",
-            WS_CHILD | BS_OWNERDRAW, innerX + 110, innerY + 45, 60, h, panel2, (HMENU)ID_HDR_GRAYSCALE_RESET, nullptr, nullptr);
+            WS_CHILD | BS_OWNERDRAW, innerX + 110, innerY + 45, 60, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_RESET, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscaleReset);
-        ctrl = CreateWindow(L"STATIC", L"Peak:", WS_CHILD, innerX + 180, innerY + 47, 35, h, panel2, nullptr, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(ctrl);
-        g_gui.hwndHdrGrayscalePeak = CreateWindow(L"EDIT", L"10000", WS_CHILD | WS_BORDER | ES_NUMBER,
-            innerX + 215, innerY + 45, 45, h, panel2, (HMENU)ID_HDR_GRAYSCALE_PEAK, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrGrayscalePeak);
 
-        // HDR Tonemapping group
+        // HDR only: Peak nits label + edit
+        g_gui.hwndGrayscalePeakLabel = CreateWindow(L"STATIC", L"Peak:", WS_CHILD,
+            innerX + 180, innerY + 47, 35, h, panel2, nullptr, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscalePeakLabel);
+
+        g_gui.hwndGrayscalePeak = CreateWindow(L"EDIT", L"10000", WS_CHILD | WS_BORDER | ES_NUMBER,
+            innerX + 215, innerY + 45, 45, h, panel2, (HMENU)ID_CORR_HDR_GRAYSCALE_PEAK, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndGrayscalePeak);
+
+        // Tonemapping group (HDR only)
         innerY += 80;
         ctrl = CreateWindow(L"BUTTON", L"Tonemapping", WS_CHILD | BS_GROUPBOX,
             innerX, innerY, groupW, 75, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
-        g_gui.hwndHdrTonemapEnable = CreateWindow(L"BUTTON", L"Enable",
+        g_gui.hwndTonemapEnable = CreateWindow(L"BUTTON", L"Enable",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_HDR_TONEMAP_ENABLE, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrTonemapEnable);
+            innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_TONEMAP_ENABLE, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndTonemapEnable);
 
         ctrl = CreateWindow(L"STATIC", L"Curve:", WS_CHILD, innerX + 80, innerY + 20, 40, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
-        g_gui.hwndHdrTonemapCurve = CreateWindow(L"COMBOBOX", nullptr,
+        g_gui.hwndTonemapCurve = CreateWindow(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            innerX + 120, innerY + 18, 95, 120, panel2, (HMENU)ID_HDR_TONEMAP_CURVE, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrTonemapCurve);
-        // Order: BT2390, BT2446A, Reinhard, SoftClip, HardClip (matches g_tonemapDropdownOrder)
-        SendMessage(g_gui.hwndHdrTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"BT.2390");
-        SendMessage(g_gui.hwndHdrTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"BT.2446A");
-        SendMessage(g_gui.hwndHdrTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"Reinhard");
-        SendMessage(g_gui.hwndHdrTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"Soft Clip");
-        SendMessage(g_gui.hwndHdrTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"Hard Clip");
-        SendMessage(g_gui.hwndHdrTonemapCurve, CB_SETCURSEL, 0, 0);
+            innerX + 120, innerY + 18, 95, 120, panel2, (HMENU)ID_CORR_TONEMAP_CURVE, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndTonemapCurve);
+        SendMessage(g_gui.hwndTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"BT.2390");
+        SendMessage(g_gui.hwndTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"BT.2446A");
+        SendMessage(g_gui.hwndTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"Reinhard");
+        SendMessage(g_gui.hwndTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"Soft Clip");
+        SendMessage(g_gui.hwndTonemapCurve, CB_ADDSTRING, 0, (LPARAM)L"Hard Clip");
+        SendMessage(g_gui.hwndTonemapCurve, CB_SETCURSEL, 0, 0);
 
         // Target and Source peak inputs
         int tonemapY = innerY + 45;
         ctrl = CreateWindow(L"STATIC", L"Target:", WS_CHILD, innerX + 10, tonemapY + 2, 40, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
-        g_gui.hwndHdrTonemapTarget = CreateWindow(L"EDIT", L"1000", WS_CHILD | WS_BORDER | ES_NUMBER,
-            innerX + 50, tonemapY, 45, h, panel2, (HMENU)ID_HDR_TONEMAP_TARGET, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrTonemapTarget);
+        g_gui.hwndTonemapTarget = CreateWindow(L"EDIT", L"1000", WS_CHILD | WS_BORDER | ES_NUMBER,
+            innerX + 50, tonemapY, 45, h, panel2, (HMENU)ID_CORR_TONEMAP_TARGET, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndTonemapTarget);
 
         ctrl = CreateWindow(L"STATIC", L"Source:", WS_CHILD, innerX + 100, tonemapY + 2, 40, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
-        g_gui.hwndHdrTonemapSource = CreateWindow(L"EDIT", L"10000", WS_CHILD | WS_BORDER | ES_NUMBER,
-            innerX + 140, tonemapY, 50, h, panel2, (HMENU)ID_HDR_TONEMAP_SOURCE, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrTonemapSource);
+        g_gui.hwndTonemapSource = CreateWindow(L"EDIT", L"10000", WS_CHILD | WS_BORDER | ES_NUMBER,
+            innerX + 140, tonemapY, 50, h, panel2, (HMENU)ID_CORR_TONEMAP_SOURCE, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndTonemapSource);
 
         ctrl = CreateWindow(L"STATIC", L"nits", WS_CHILD, innerX + 192, tonemapY + 2, 25, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
-        // Dynamic peak detection checkbox (far right)
-        g_gui.hwndHdrTonemapDynamic = CreateWindow(L"BUTTON", L"Dynamic",
+        g_gui.hwndTonemapDynamic = CreateWindow(L"BUTTON", L"Dynamic",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 220, tonemapY, 70, h, panel2, (HMENU)ID_HDR_TONEMAP_DYNAMIC, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrTonemapDynamic);
+            innerX + 220, tonemapY, 70, h, panel2, (HMENU)ID_CORR_TONEMAP_DYNAMIC, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndTonemapDynamic);
 
-        // MaxTML group (Windows HDR peak luminance override)
+        // MaxTML group (Windows HDR peak luminance override, HDR only)
         innerY += 80;
         ctrl = CreateWindow(L"BUTTON", L"Display Peak Override (MaxTML)", WS_CHILD | BS_GROUPBOX,
-            innerX, innerY, groupW, 55, panel2, nullptr, nullptr, nullptr);
+            innerX, innerY, groupW, 48, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
-        g_gui.hwndHdrMaxTmlEnable = CreateWindow(L"BUTTON", L"Enable",
+        g_gui.hwndMaxTmlEnable = CreateWindow(L"BUTTON", L"Enable",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 20, 55, h, panel2, (HMENU)ID_HDR_MAXTML_ENABLE, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrMaxTmlEnable);
+            innerX + 10, innerY + 18, 55, h, panel2, (HMENU)ID_CORR_MAXTML_ENABLE, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlEnable);
 
-        g_gui.hwndHdrMaxTmlCombo = CreateWindow(L"COMBOBOX", nullptr,
+
+        g_gui.hwndMaxTmlCombo = CreateWindow(L"COMBOBOX", nullptr,
             WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-            innerX + 70, innerY + 18, 85, 150, panel2, (HMENU)ID_HDR_MAXTML_COMBO, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrMaxTmlCombo);
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"Custom");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"400 nits");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"600 nits");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"1000 nits");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"1400 nits");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"4000 nits");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"10000 nits");
-        SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_SETCURSEL, 3, 0);  // Default to 1000
+            innerX + 70, innerY + 18, 85, 150, panel2, (HMENU)ID_CORR_MAXTML_COMBO, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlCombo);
 
-        g_gui.hwndHdrMaxTmlEdit = CreateWindow(L"EDIT", L"1000", WS_CHILD | WS_BORDER | ES_NUMBER,
-            innerX + 160, innerY + 18, 50, h, panel2, (HMENU)ID_HDR_MAXTML_EDIT, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrMaxTmlEdit);
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"Custom");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"400 nits");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"600 nits");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"1000 nits");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"1400 nits");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"4000 nits");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"10000 nits");
+        SendMessage(g_gui.hwndMaxTmlCombo, CB_SETCURSEL, 3, 0);  // Default to 1000
+
+        g_gui.hwndMaxTmlEdit = CreateWindow(L"EDIT", L"1000", WS_CHILD | WS_BORDER | ES_NUMBER,
+            innerX + 160, innerY + 18, 50, h, panel2, (HMENU)ID_CORR_MAXTML_EDIT, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlEdit);
+
 
         ctrl = CreateWindow(L"STATIC", L"nits", WS_CHILD, innerX + 212, innerY + 20, 25, h, panel2, nullptr, nullptr, nullptr);
         g_gui.tab2Controls.push_back(ctrl);
 
-        g_gui.hwndHdrMaxTmlApply = CreateWindow(L"BUTTON", L"Apply",
-            WS_CHILD | BS_OWNERDRAW, innerX + 245, innerY + 17, 45, h + 2, panel2, (HMENU)ID_HDR_MAXTML_APPLY, nullptr, nullptr);
-        g_gui.tab2Controls.push_back(g_gui.hwndHdrMaxTmlApply);
-        g_gui.contentHeight[2] = innerY + 55 + 8;  // Track content height (for future scroll support)
 
-        // Apply Enter key handling to HDR numeric edit boxes (ES_NUMBER already filters input)
-        SetNumericEdit(g_gui.hwndHdrGrayscalePeak, 0);
-        SetNumericEdit(g_gui.hwndHdrTonemapTarget, 0);
-        SetNumericEdit(g_gui.hwndHdrTonemapSource, 0);
-        SetNumericEdit(g_gui.hwndHdrMaxTmlEdit, 0);
+        g_gui.hwndMaxTmlApply = CreateWindow(L"BUTTON", L"Apply",
+            WS_CHILD | BS_OWNERDRAW, innerX + 245, innerY + 18, 45, h, panel2, (HMENU)ID_CORR_MAXTML_APPLY, nullptr, nullptr);
+        g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlApply);
+
+
+        g_gui.contentHeight[2] = innerY + 48 + 8;  // Fixed content height (both SDR + HDR sections always visible)
+
+        // Apply Enter key handling to numeric edit boxes
+        SetNumericEdit(g_gui.hwndGrayscalePeak, 0);
+        SetNumericEdit(g_gui.hwndTonemapTarget, 0);
+        SetNumericEdit(g_gui.hwndTonemapSource, 0);
+        SetNumericEdit(g_gui.hwndMaxTmlEdit, 0);
 
         // === TAB 3: Settings (initially hidden) ===
         innerY = 8;  // Reset for scroll panel
@@ -1933,12 +946,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         // Passthrough Mode group
         ctrl = CreateWindow(L"BUTTON", L"Passthrough Mode", WS_CHILD | BS_GROUPBOX,
-            innerX, innerY, groupW, 46, panel3, nullptr, nullptr, nullptr);
+            innerX, innerY, groupW, 48, panel3, nullptr, nullptr, nullptr);
         g_gui.tab3Controls.push_back(ctrl);
 
         g_gui.hwndSettingsVrrWhitelistCheck = CreateWindow(L"BUTTON", L"Hide overlay for apps",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 10, innerY + 20, 140, h, panel3, (HMENU)ID_SETTINGS_VRR_WHITELIST_CHECK, nullptr, nullptr);
+            innerX + 10, innerY + 18, 140, h, panel3, (HMENU)ID_SETTINGS_VRR_WHITELIST_CHECK, nullptr, nullptr);
         g_gui.tab3Controls.push_back(g_gui.hwndSettingsVrrWhitelistCheck);
         SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_SETCHECK, g_vrrWhitelistEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
@@ -1948,7 +961,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_gui.tab3Controls.push_back(g_gui.hwndSettingsVrrWhitelistBtn);
 
         // Startup group
-        innerY += 51;
+        innerY += 53;
         ctrl = CreateWindow(L"BUTTON", L"Startup", WS_CHILD | BS_GROUPBOX,
             innerX, innerY, groupW, 68, panel3, nullptr, nullptr, nullptr);
         g_gui.tab3Controls.push_back(ctrl);
@@ -2050,9 +1063,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Buttons anchored to bottom right (owner-drawn for rounded corners)
         int btnPad = 8;
         int enableW = 80, disableW = 80;
-        g_gui.hwndStop = CreateWindow(L"BUTTON", L"Disable", WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
+        g_gui.hwndStop = CreateWindow(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
             clientW - margin - disableW, btnY, disableW, btnH, hwnd, (HMENU)ID_STOP, nullptr, nullptr);
-        g_gui.hwndApply = CreateWindow(L"BUTTON", L"Enable", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        g_gui.hwndApply = CreateWindow(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             clientW - margin - disableW - btnPad - enableW, btnY, enableW, btnH, hwnd, (HMENU)ID_APPLY, nullptr, nullptr);
 
         // Separator line between buttons and status
@@ -2237,260 +1250,124 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveSettings();
             return 0;
 
-        // SDR Color Correction Controls
-        case ID_SDR_PRIMARIES_ENABLE:
+        // SDR Corrections controls
+        case ID_CORR_PRIMARIES_ENABLE:
+        case ID_CORR_HDR_PRIMARIES_ENABLE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.primariesEnabled =
-                    (SendMessage(g_gui.hwndSdrPrimariesEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                ApplyPrimariesChange(false);
+                bool isHDR = (LOWORD(wParam) == ID_CORR_HDR_PRIMARIES_ENABLE);
+                HWND hwndEnable = isHDR ? g_gui.hwndHdrPrimariesEnable : g_gui.hwndPrimariesEnable;
+                auto& cc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection
+                                 : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
+                cc.primariesEnabled = (SendMessage(hwndEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                cc.primariesPreset = g_numPresetPrimaries - 1;  // Custom
+                const auto& defaults = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];
+                cc.customPrimaries.Rx = defaults.Rx; cc.customPrimaries.Ry = defaults.Ry;
+                cc.customPrimaries.Gx = defaults.Gx; cc.customPrimaries.Gy = defaults.Gy;
+                cc.customPrimaries.Bx = defaults.Bx; cc.customPrimaries.By = defaults.By;
+                ApplyPrimariesChange(isHDR);
                 SaveSettings();
             }
             return 0;
 
-        case ID_SDR_PRIMARIES_PRESET:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
-                int sel = (int)SendMessage(g_gui.hwndSdrPrimariesPreset, CB_GETCURSEL, 0, 0);
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    auto& cc = g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
-                    int oldPreset = cc.primariesPreset;
-
-                    // Save current edit box values to customPrimaries if leaving Custom preset
-                    if (oldPreset == g_numPresetPrimaries - 1) {
-                        wchar_t buf[16];
-                        GetWindowText(g_gui.hwndSdrPrimariesRx, buf, 16); cc.customPrimaries.Rx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesRy, buf, 16); cc.customPrimaries.Ry = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesGx, buf, 16); cc.customPrimaries.Gx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesGy, buf, 16); cc.customPrimaries.Gy = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesBx, buf, 16); cc.customPrimaries.Bx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesBy, buf, 16); cc.customPrimaries.By = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesWx, buf, 16); cc.customPrimaries.Wx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndSdrPrimariesWy, buf, 16); cc.customPrimaries.Wy = (float)_wtof(buf);
-                    }
-
-                    cc.primariesPreset = sel;
-                    // Enable/disable custom edit boxes
-                    bool customEnabled = (sel == g_numPresetPrimaries - 1);
-                    EnableWindow(g_gui.hwndSdrPrimariesRx, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesRy, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesGx, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesGy, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesBx, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesBy, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesWx, customEnabled);
-                    EnableWindow(g_gui.hwndSdrPrimariesWy, customEnabled);
-
-                    // Update edit boxes - use customPrimaries for Custom preset, otherwise use preset values
-                    wchar_t buf[16];
-                    if (customEnabled) {
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Rx); SetWindowText(g_gui.hwndSdrPrimariesRx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Ry); SetWindowText(g_gui.hwndSdrPrimariesRy, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Gx); SetWindowText(g_gui.hwndSdrPrimariesGx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Gy); SetWindowText(g_gui.hwndSdrPrimariesGy, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Bx); SetWindowText(g_gui.hwndSdrPrimariesBx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.By); SetWindowText(g_gui.hwndSdrPrimariesBy, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Wx); SetWindowText(g_gui.hwndSdrPrimariesWx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Wy); SetWindowText(g_gui.hwndSdrPrimariesWy, buf);
-                    } else {
-                        const auto& preset = g_presetPrimaries[sel];
-                        swprintf_s(buf, L"%.4f", preset.Rx); SetWindowText(g_gui.hwndSdrPrimariesRx, buf);
-                        swprintf_s(buf, L"%.4f", preset.Ry); SetWindowText(g_gui.hwndSdrPrimariesRy, buf);
-                        swprintf_s(buf, L"%.4f", preset.Gx); SetWindowText(g_gui.hwndSdrPrimariesGx, buf);
-                        swprintf_s(buf, L"%.4f", preset.Gy); SetWindowText(g_gui.hwndSdrPrimariesGy, buf);
-                        swprintf_s(buf, L"%.4f", preset.Bx); SetWindowText(g_gui.hwndSdrPrimariesBx, buf);
-                        swprintf_s(buf, L"%.4f", preset.By); SetWindowText(g_gui.hwndSdrPrimariesBy, buf);
-                        swprintf_s(buf, L"%.4f", preset.Wx); SetWindowText(g_gui.hwndSdrPrimariesWx, buf);
-                        swprintf_s(buf, L"%.4f", preset.Wy); SetWindowText(g_gui.hwndSdrPrimariesWy, buf);
-                    }
-                    ApplyPrimariesChange(false);
-                    SaveSettings();
-                }
-            }
-            return 0;
-
-        case ID_SDR_PRIMARIES_DETECT:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                // Try EDID first (more reliable), fall back to DXGI
-                MonitorPrimaries primaries = GetMonitorPrimariesFromEDID(g_gui.currentMonitor);
-                if (!primaries.valid) {
-                    primaries = GetMonitorPrimaries(g_gui.currentMonitor);
-                }
-                if (primaries.valid) {
-                    auto& cc = g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
-                    // Switch to Custom preset
-                    cc.primariesPreset = g_numPresetPrimaries - 1;
-                    SendMessage(g_gui.hwndSdrPrimariesPreset, CB_SETCURSEL, cc.primariesPreset, 0);
-                    // Fill in detected values
-                    cc.customPrimaries.Rx = primaries.Rx;
-                    cc.customPrimaries.Ry = primaries.Ry;
-                    cc.customPrimaries.Gx = primaries.Gx;
-                    cc.customPrimaries.Gy = primaries.Gy;
-                    cc.customPrimaries.Bx = primaries.Bx;
-                    cc.customPrimaries.By = primaries.By;
-                    // Use D65 white point instead of EDID white point
-                    // EDID reports native panel white, but display presets already calibrate to D65
-                    // Using EDID white would double-correct; user can manually enter if needed
-                    cc.customPrimaries.Wx = 0.3127f;
-                    cc.customPrimaries.Wy = 0.3290f;
-                    // Update edit boxes
-                    wchar_t buf[16];
-                    swprintf_s(buf, L"%.4f", primaries.Rx); SetWindowText(g_gui.hwndSdrPrimariesRx, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Ry); SetWindowText(g_gui.hwndSdrPrimariesRy, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Gx); SetWindowText(g_gui.hwndSdrPrimariesGx, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Gy); SetWindowText(g_gui.hwndSdrPrimariesGy, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Bx); SetWindowText(g_gui.hwndSdrPrimariesBx, buf);
-                    swprintf_s(buf, L"%.4f", primaries.By); SetWindowText(g_gui.hwndSdrPrimariesBy, buf);
-                    swprintf_s(buf, L"%.4f", cc.customPrimaries.Wx); SetWindowText(g_gui.hwndSdrPrimariesWx, buf);
-                    swprintf_s(buf, L"%.4f", cc.customPrimaries.Wy); SetWindowText(g_gui.hwndSdrPrimariesWy, buf);
-                    // Enable custom edit boxes
-                    EnableWindow(g_gui.hwndSdrPrimariesRx, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesRy, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesGx, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesGy, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesBx, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesBy, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesWx, TRUE);
-                    EnableWindow(g_gui.hwndSdrPrimariesWy, TRUE);
-                    ApplyPrimariesChange(false);
-                    SaveSettings();
-                } else {
-                    MessageBox(hwnd, L"Could not detect monitor primaries.\nEDID data may not be available.", L"Detection Failed", MB_OK | MB_ICONWARNING);
-                }
-            }
-            return 0;
-
-        case ID_HDR_PRIMARIES_DETECT:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                // Try EDID first (more reliable), fall back to DXGI
-                MonitorPrimaries primaries = GetMonitorPrimariesFromEDID(g_gui.currentMonitor);
-                if (!primaries.valid) {
-                    primaries = GetMonitorPrimaries(g_gui.currentMonitor);
-                }
-                if (primaries.valid) {
-                    auto& cc = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection;
-                    // Switch to Custom preset
-                    cc.primariesPreset = g_numPresetPrimaries - 1;
-                    SendMessage(g_gui.hwndHdrPrimariesPreset, CB_SETCURSEL, cc.primariesPreset, 0);
-                    // Fill in detected values
-                    cc.customPrimaries.Rx = primaries.Rx;
-                    cc.customPrimaries.Ry = primaries.Ry;
-                    cc.customPrimaries.Gx = primaries.Gx;
-                    cc.customPrimaries.Gy = primaries.Gy;
-                    cc.customPrimaries.Bx = primaries.Bx;
-                    cc.customPrimaries.By = primaries.By;
-                    // Use D65 white point instead of EDID white point
-                    // EDID reports native panel white, but display presets already calibrate to D65
-                    // Using EDID white would double-correct; user can manually enter if needed
-                    cc.customPrimaries.Wx = 0.3127f;
-                    cc.customPrimaries.Wy = 0.3290f;
-                    // Update edit boxes
-                    wchar_t buf[16];
-                    swprintf_s(buf, L"%.4f", primaries.Rx); SetWindowText(g_gui.hwndHdrPrimariesRx, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Ry); SetWindowText(g_gui.hwndHdrPrimariesRy, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Gx); SetWindowText(g_gui.hwndHdrPrimariesGx, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Gy); SetWindowText(g_gui.hwndHdrPrimariesGy, buf);
-                    swprintf_s(buf, L"%.4f", primaries.Bx); SetWindowText(g_gui.hwndHdrPrimariesBx, buf);
-                    swprintf_s(buf, L"%.4f", primaries.By); SetWindowText(g_gui.hwndHdrPrimariesBy, buf);
-                    swprintf_s(buf, L"%.4f", cc.customPrimaries.Wx); SetWindowText(g_gui.hwndHdrPrimariesWx, buf);
-                    swprintf_s(buf, L"%.4f", cc.customPrimaries.Wy); SetWindowText(g_gui.hwndHdrPrimariesWy, buf);
-                    // Enable custom edit boxes
-                    EnableWindow(g_gui.hwndHdrPrimariesRx, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesRy, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesGx, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesGy, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesBx, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesBy, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesWx, TRUE);
-                    EnableWindow(g_gui.hwndHdrPrimariesWy, TRUE);
-                    ApplyPrimariesChange(true);
-                    SaveSettings();
-                } else {
-                    MessageBox(hwnd, L"Could not detect monitor primaries.\nEDID data may not be available.", L"Detection Failed", MB_OK | MB_ICONWARNING);
-                }
-            }
-            return 0;
-
-        case ID_SDR_PRIMARIES_RX: case ID_SDR_PRIMARIES_RY:
-        case ID_SDR_PRIMARIES_GX: case ID_SDR_PRIMARIES_GY:
-        case ID_SDR_PRIMARIES_BX: case ID_SDR_PRIMARIES_BY:
-        case ID_SDR_PRIMARIES_WX: case ID_SDR_PRIMARIES_WY:
-            if (HIWORD(wParam) == EN_CHANGE) {
-                // Update Enable button state while typing
-                UpdateGUIState();
-            }
+        case ID_CORR_PRIMARIES_WX: case ID_CORR_PRIMARIES_WY:
+        case ID_CORR_HDR_PRIMARIES_WX: case ID_CORR_HDR_PRIMARIES_WY:
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    auto& cp = g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.customPrimaries;
+                    bool isHDR = (LOWORD(wParam) == ID_CORR_HDR_PRIMARIES_WX || LOWORD(wParam) == ID_CORR_HDR_PRIMARIES_WY);
+                    HWND hwndWx = isHDR ? g_gui.hwndHdrPrimariesWx : g_gui.hwndPrimariesWx;
+                    HWND hwndWy = isHDR ? g_gui.hwndHdrPrimariesWy : g_gui.hwndPrimariesWy;
+                    HWND hwndEnable = isHDR ? g_gui.hwndHdrPrimariesEnable : g_gui.hwndPrimariesEnable;
+                    auto& cc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection
+                                     : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
                     wchar_t buf[16];
-                    GetWindowText(g_gui.hwndSdrPrimariesRx, buf, 16); cp.Rx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesRy, buf, 16); cp.Ry = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesGx, buf, 16); cp.Gx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesGy, buf, 16); cp.Gy = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesBx, buf, 16); cp.Bx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesBy, buf, 16); cp.By = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesWx, buf, 16); cp.Wx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndSdrPrimariesWy, buf, 16); cp.Wy = (float)_wtof(buf);
-                    ApplyPrimariesChange(false);
+                    GetWindowText(hwndWx, buf, 16); cc.customPrimaries.Wx = (float)_wtof(buf);
+                    GetWindowText(hwndWy, buf, 16); cc.customPrimaries.Wy = (float)_wtof(buf);
+                    cc.primariesEnabled = true;
+                    SendMessage(hwndEnable, BM_SETCHECK, BST_CHECKED, 0);
+                    cc.primariesPreset = g_numPresetPrimaries - 1;
+                    const auto& defaults = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];
+                    cc.customPrimaries.Rx = defaults.Rx; cc.customPrimaries.Ry = defaults.Ry;
+                    cc.customPrimaries.Gx = defaults.Gx; cc.customPrimaries.Gy = defaults.Gy;
+                    cc.customPrimaries.Bx = defaults.Bx; cc.customPrimaries.By = defaults.By;
+                    ApplyPrimariesChange(isHDR);
                     SaveSettings();
                 }
             }
             return 0;
 
-        case ID_SDR_GRAYSCALE_ENABLE:
+        case ID_CORR_GRAYSCALE_ENABLE:
+        case ID_CORR_HDR_GRAYSCALE_ENABLE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale.enabled =
-                    (SendMessage(g_gui.hwndSdrGrayscaleEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                bool isHDR = (LOWORD(wParam) == ID_CORR_HDR_GRAYSCALE_ENABLE);
+                HWND hwndEnable = isHDR ? g_gui.hwndHdrGrayscaleEnable : g_gui.hwndGrayscaleEnable;
+                auto& gs = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale
+                                 : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
+                gs.enabled = (SendMessage(hwndEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 if (g_gui.isRunning) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, false);
+                    UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
                 }
+                SaveSettings();
                 UpdateGUIState();
             }
             return 0;
 
-        case ID_SDR_GRAYSCALE_10:
-        case ID_SDR_GRAYSCALE_20:
-        case ID_SDR_GRAYSCALE_32:
+        case ID_CORR_GRAYSCALE_10:
+        case ID_CORR_GRAYSCALE_20:
+        case ID_CORR_GRAYSCALE_32:
+        case ID_CORR_HDR_GRAYSCALE_10:
+        case ID_CORR_HDR_GRAYSCALE_20:
+        case ID_CORR_HDR_GRAYSCALE_32:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                auto& gs = g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
-                int newCount = (LOWORD(wParam) == ID_SDR_GRAYSCALE_10) ? 10 :
-                               (LOWORD(wParam) == ID_SDR_GRAYSCALE_20) ? 20 : 32;
+                int id = LOWORD(wParam);
+                bool isHDR = (id == ID_CORR_HDR_GRAYSCALE_10 || id == ID_CORR_HDR_GRAYSCALE_20 || id == ID_CORR_HDR_GRAYSCALE_32);
+                auto& gs = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale
+                                 : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
+                int newCount = (id == ID_CORR_GRAYSCALE_10 || id == ID_CORR_HDR_GRAYSCALE_10) ? 10 :
+                               (id == ID_CORR_GRAYSCALE_20 || id == ID_CORR_HDR_GRAYSCALE_20) ? 20 : 32;
                 if (newCount != gs.pointCount) {
                     gs.pointCount = newCount;
                     gs.points.resize(newCount);
-                    gs.initLinear();
+                    if (isHDR) gs.initLinearPQ(); else gs.initLinear();
                     if (g_gui.isRunning) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, false);
+                        UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
                     }
                     UpdateGUIState();
                 }
             }
             return 0;
 
-        case ID_SDR_GRAYSCALE_EDIT:
+        case ID_CORR_GRAYSCALE_EDIT:
+        case ID_CORR_HDR_GRAYSCALE_EDIT:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                auto& gs = g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
+                bool isHDR = (LOWORD(wParam) == ID_CORR_HDR_GRAYSCALE_EDIT);
+                auto& gs = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale
+                                 : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
                 if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
                     gs.points.resize(gs.pointCount);
-                    gs.initLinear();
+                    if (isHDR) gs.initLinearPQ(); else gs.initLinear();
                 }
-                ShowGrayscaleEditor(hwnd, gs, false);
+                ShowGrayscaleEditor(hwnd, gs, isHDR);
             }
             return 0;
 
-        case ID_SDR_GRAYSCALE_RESET:
+        case ID_CORR_GRAYSCALE_RESET:
+        case ID_CORR_HDR_GRAYSCALE_RESET:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                auto& gs = g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
-                gs.initLinear();
+                bool isHDR = (LOWORD(wParam) == ID_CORR_HDR_GRAYSCALE_RESET);
+                auto& gs = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale
+                                 : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale;
+                if (isHDR) gs.initLinearPQ(); else gs.initLinear();
                 if (g_gui.isRunning) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, false);
+                    UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
                 }
                 UpdateGUIState();
             }
             return 0;
 
-        case ID_SDR_GRAYSCALE_24:
+        case ID_CORR_GRAYSCALE_24:  // SDR only: 2.4 gamma checkbox
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale.use24Gamma =
-                    (SendMessage(g_gui.hwndSdrGrayscale24, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    (SendMessage(g_gui.hwndGrayscale24, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, false);
                 }
@@ -2498,158 +1375,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // HDR Color Correction Controls
-        case ID_HDR_PRIMARIES_ENABLE:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.primariesEnabled =
-                    (SendMessage(g_gui.hwndHdrPrimariesEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                ApplyPrimariesChange(true);
-                SaveSettings();
-            }
-            return 0;
-
-        case ID_HDR_PRIMARIES_PRESET:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
-                int sel = (int)SendMessage(g_gui.hwndHdrPrimariesPreset, CB_GETCURSEL, 0, 0);
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    auto& cc = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection;
-                    int oldPreset = cc.primariesPreset;
-
-                    // Save current edit box values to customPrimaries if leaving Custom preset
-                    if (oldPreset == g_numPresetPrimaries - 1) {
-                        wchar_t buf[16];
-                        GetWindowText(g_gui.hwndHdrPrimariesRx, buf, 16); cc.customPrimaries.Rx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesRy, buf, 16); cc.customPrimaries.Ry = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesGx, buf, 16); cc.customPrimaries.Gx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesGy, buf, 16); cc.customPrimaries.Gy = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesBx, buf, 16); cc.customPrimaries.Bx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesBy, buf, 16); cc.customPrimaries.By = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesWx, buf, 16); cc.customPrimaries.Wx = (float)_wtof(buf);
-                        GetWindowText(g_gui.hwndHdrPrimariesWy, buf, 16); cc.customPrimaries.Wy = (float)_wtof(buf);
-                    }
-
-                    cc.primariesPreset = sel;
-                    bool customEnabled = (sel == g_numPresetPrimaries - 1);
-                    EnableWindow(g_gui.hwndHdrPrimariesRx, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesRy, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesGx, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesGy, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesBx, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesBy, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesWx, customEnabled);
-                    EnableWindow(g_gui.hwndHdrPrimariesWy, customEnabled);
-
-                    // Update edit boxes - use customPrimaries for Custom preset, otherwise use preset values
-                    wchar_t buf[16];
-                    if (customEnabled) {
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Rx); SetWindowText(g_gui.hwndHdrPrimariesRx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Ry); SetWindowText(g_gui.hwndHdrPrimariesRy, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Gx); SetWindowText(g_gui.hwndHdrPrimariesGx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Gy); SetWindowText(g_gui.hwndHdrPrimariesGy, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Bx); SetWindowText(g_gui.hwndHdrPrimariesBx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.By); SetWindowText(g_gui.hwndHdrPrimariesBy, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Wx); SetWindowText(g_gui.hwndHdrPrimariesWx, buf);
-                        swprintf_s(buf, L"%.4f", cc.customPrimaries.Wy); SetWindowText(g_gui.hwndHdrPrimariesWy, buf);
-                    } else {
-                        const auto& preset = g_presetPrimaries[sel];
-                        swprintf_s(buf, L"%.4f", preset.Rx); SetWindowText(g_gui.hwndHdrPrimariesRx, buf);
-                        swprintf_s(buf, L"%.4f", preset.Ry); SetWindowText(g_gui.hwndHdrPrimariesRy, buf);
-                        swprintf_s(buf, L"%.4f", preset.Gx); SetWindowText(g_gui.hwndHdrPrimariesGx, buf);
-                        swprintf_s(buf, L"%.4f", preset.Gy); SetWindowText(g_gui.hwndHdrPrimariesGy, buf);
-                        swprintf_s(buf, L"%.4f", preset.Bx); SetWindowText(g_gui.hwndHdrPrimariesBx, buf);
-                        swprintf_s(buf, L"%.4f", preset.By); SetWindowText(g_gui.hwndHdrPrimariesBy, buf);
-                        swprintf_s(buf, L"%.4f", preset.Wx); SetWindowText(g_gui.hwndHdrPrimariesWx, buf);
-                        swprintf_s(buf, L"%.4f", preset.Wy); SetWindowText(g_gui.hwndHdrPrimariesWy, buf);
-                    }
-                    ApplyPrimariesChange(true);
-                    SaveSettings();
-                }
-            }
-            return 0;
-
-        case ID_HDR_PRIMARIES_RX: case ID_HDR_PRIMARIES_RY:
-        case ID_HDR_PRIMARIES_GX: case ID_HDR_PRIMARIES_GY:
-        case ID_HDR_PRIMARIES_BX: case ID_HDR_PRIMARIES_BY:
-        case ID_HDR_PRIMARIES_WX: case ID_HDR_PRIMARIES_WY:
-            if (HIWORD(wParam) == EN_CHANGE) {
-                // Update Enable button state while typing
-                UpdateGUIState();
-            }
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    auto& cp = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.customPrimaries;
-                    wchar_t buf[16];
-                    GetWindowText(g_gui.hwndHdrPrimariesRx, buf, 16); cp.Rx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesRy, buf, 16); cp.Ry = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesGx, buf, 16); cp.Gx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesGy, buf, 16); cp.Gy = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesBx, buf, 16); cp.Bx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesBy, buf, 16); cp.By = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesWx, buf, 16); cp.Wx = (float)_wtof(buf);
-                    GetWindowText(g_gui.hwndHdrPrimariesWy, buf, 16); cp.Wy = (float)_wtof(buf);
-                    ApplyPrimariesChange(true);
-                    SaveSettings();
-                }
-            }
-            return 0;
-
-        case ID_HDR_GRAYSCALE_ENABLE:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale.enabled =
-                    (SendMessage(g_gui.hwndHdrGrayscaleEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                if (g_gui.isRunning) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                }
-                UpdateGUIState();
-            }
-            return 0;
-
-        case ID_HDR_GRAYSCALE_10:
-        case ID_HDR_GRAYSCALE_20:
-        case ID_HDR_GRAYSCALE_32:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                auto& gs = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale;
-                int newCount = (LOWORD(wParam) == ID_HDR_GRAYSCALE_10) ? 10 :
-                               (LOWORD(wParam) == ID_HDR_GRAYSCALE_20) ? 20 : 32;
-                if (newCount != gs.pointCount) {
-                    gs.pointCount = newCount;
-                    gs.points.resize(newCount);
-                    gs.initLinearPQ();  // HDR uses PQ-space grayscale
-                    if (g_gui.isRunning) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                    }
-                    UpdateGUIState();
-                }
-            }
-            return 0;
-
-        case ID_HDR_GRAYSCALE_EDIT:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                auto& gs = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale;
-                if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
-                    gs.points.resize(gs.pointCount);
-                    gs.initLinearPQ();  // HDR uses PQ-space grayscale
-                }
-                ShowGrayscaleEditor(hwnd, gs, true);
-            }
-            return 0;
-
-        case ID_HDR_GRAYSCALE_RESET:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                auto& gs = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.grayscale;
-                gs.initLinearPQ();  // HDR uses PQ-space grayscale
-                if (g_gui.isRunning) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                }
-                UpdateGUIState();
-            }
-            return 0;
-
-        case ID_HDR_GRAYSCALE_PEAK:
+        case ID_CORR_HDR_GRAYSCALE_PEAK:  // HDR only: peak nits
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     wchar_t buf[16];
-                    GetWindowText(g_gui.hwndHdrGrayscalePeak, buf, 16);
+                    GetWindowText(g_gui.hwndGrayscalePeak, buf, 16);
                     float peak = (float)_wtof(buf);
                     if (peak < 100.0f) peak = 100.0f;
                     if (peak > 10000.0f) peak = 10000.0f;
@@ -2662,10 +1392,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // HDR Tonemapping controls
-        case ID_HDR_TONEMAP_ENABLE:
+        // Tonemapping controls (HDR only, but unified IDs)
+        case ID_CORR_TONEMAP_ENABLE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndHdrTonemapEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                bool enabled = (SendMessage(g_gui.hwndTonemapEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.enabled = enabled;
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, true);
@@ -2675,10 +1405,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        case ID_HDR_TONEMAP_CURVE:
+        case ID_CORR_TONEMAP_CURVE:
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    int sel = (int)SendMessage(g_gui.hwndHdrTonemapCurve, CB_GETCURSEL, 0, 0);
+                    int sel = (int)SendMessage(g_gui.hwndTonemapCurve, CB_GETCURSEL, 0, 0);
                     g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.curve =
                         DropdownIndexToTonemapCurve(sel);
                     if (g_gui.isRunning) {
@@ -2689,14 +1419,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        case ID_HDR_TONEMAP_TARGET:
+        case ID_CORR_TONEMAP_TARGET:
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
                     wchar_t buf[16];
-                    GetWindowText(g_gui.hwndHdrTonemapTarget, buf, 16);
+                    GetWindowText(g_gui.hwndTonemapTarget, buf, 16);
                     tm.targetPeakNits = (float)_wtof(buf);
-                    if (tm.targetPeakNits < 100.0f) tm.targetPeakNits = 100.0f;
+                    if (tm.targetPeakNits < 10.0f) tm.targetPeakNits = 10.0f;
                     if (tm.targetPeakNits > 10000.0f) tm.targetPeakNits = 10000.0f;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
@@ -2706,12 +1436,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        case ID_HDR_TONEMAP_DYNAMIC:
+        case ID_CORR_TONEMAP_DYNAMIC:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndHdrTonemapDynamic, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                bool enabled = (SendMessage(g_gui.hwndTonemapDynamic, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.dynamicPeak = enabled;
-                // Enable/disable Source textbox based on Dynamic checkbox
-                EnableWindow(g_gui.hwndHdrTonemapSource, !enabled);
+                EnableWindow(g_gui.hwndTonemapSource, !enabled);
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, true);
                 }
@@ -2719,14 +1448,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        case ID_HDR_TONEMAP_SOURCE:
+        case ID_CORR_TONEMAP_SOURCE:
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
                     wchar_t buf[16];
-                    GetWindowText(g_gui.hwndHdrTonemapSource, buf, 16);
+                    GetWindowText(g_gui.hwndTonemapSource, buf, 16);
                     tm.sourcePeakNits = (float)_wtof(buf);
-                    if (tm.sourcePeakNits < 100.0f) tm.sourcePeakNits = 100.0f;
+                    if (tm.sourcePeakNits < 10.0f) tm.sourcePeakNits = 10.0f;
                     if (tm.sourcePeakNits > 10000.0f) tm.sourcePeakNits = 10000.0f;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
@@ -2736,24 +1465,22 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // MaxTML controls
-        case ID_HDR_MAXTML_ENABLE:
+        // MaxTML controls (HDR only)
+        case ID_CORR_MAXTML_ENABLE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndHdrMaxTmlEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                bool enabled = (SendMessage(g_gui.hwndMaxTmlEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_gui.monitorSettings[g_gui.currentMonitor].maxTml.enabled = enabled;
                 SaveSettings();
             }
             return 0;
 
-        case ID_HDR_MAXTML_COMBO:
+        case ID_CORR_MAXTML_COMBO:
             if (HIWORD(wParam) == CBN_SELCHANGE) {
-                int sel = (int)SendMessage(g_gui.hwndHdrMaxTmlCombo, CB_GETCURSEL, 0, 0);
-                // Update edit box based on preset selection
+                int sel = (int)SendMessage(g_gui.hwndMaxTmlCombo, CB_GETCURSEL, 0, 0);
                 const wchar_t* values[] = { L"", L"400", L"600", L"1000", L"1400", L"4000", L"10000" };
                 const float nitsValues[] = { 0, 400, 600, 1000, 1400, 4000, 10000 };
                 if (sel > 0 && sel < 7) {
-                    SetWindowText(g_gui.hwndHdrMaxTmlEdit, values[sel]);
-                    // Save to settings
+                    SetWindowText(g_gui.hwndMaxTmlEdit, values[sel]);
                     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                         g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nitsValues[sel];
                         SaveSettings();
@@ -2762,26 +1489,22 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        case ID_HDR_MAXTML_APPLY:
+        case ID_CORR_MAXTML_APPLY:
             {
-                // Get the nits value from edit box
                 wchar_t buf[16];
-                GetWindowText(g_gui.hwndHdrMaxTmlEdit, buf, 16);
+                GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
                 float nits = (float)_wtof(buf);
                 if (nits < 100.0f) nits = 100.0f;
                 if (nits > 10000.0f) nits = 10000.0f;
 
-                // Save to settings
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nits;
                     SaveSettings();
                 }
 
-                // Get display info for current monitor
                 DisplayInfo displayInfo;
                 if (GetDisplayInfoForMonitor(g_gui.currentMonitor, displayInfo)) {
                     if (SetDisplayMaxTml(displayInfo, nits)) {
-                        // Success - show brief message
                         wchar_t msg[256];
                         const wchar_t* name = displayInfo.name.empty() ? L"selected monitor" : displayInfo.name.c_str();
                         swprintf_s(msg, L"MaxTML set to %.0f nits for %s", nits, name);
@@ -2792,6 +1515,191 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else {
                     MessageBox(hwnd, L"Could not find display information for this monitor.", L"Error", MB_OK | MB_ICONERROR);
                 }
+            }
+            return 0;
+
+        // MHC Hardware Calibration controls (SDR and HDR sections)
+        case ID_MHC_TAB_EDIT:
+        case ID_MHC_HDR_EDIT:
+            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                int monIdx = g_gui.currentMonitor;
+                bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_EDIT);
+                auto& mhc = isHDR ? g_gui.monitorSettings[monIdx].hdrMHC
+                                   : g_gui.monitorSettings[monIdx].sdrMHC;
+                auto& otherMhc = isHDR ? g_gui.monitorSettings[monIdx].sdrMHC
+                                        : g_gui.monitorSettings[monIdx].hdrMHC;
+
+                // Save original ICC state for live preview restore
+                bool hadProfile = mhc.enabled && !mhc.profileName.empty();
+                std::wstring origProfileName = mhc.profileName;
+                std::wstring origProfilePath = mhc.profilePath;
+
+                // Determine if live preview is possible:
+                // 1. Processing must be running (or we can start it)
+                // 2. Display HDR/SDR mode must match the section being edited
+                bool livePreview = false;
+                bool startedForPreview = false;
+
+                // Check mode match against running monitors
+                if (g_gui.isRunning) {
+                    for (const auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            livePreview = (ctx.isHDREnabled == isHDR);
+                            break;
+                        }
+                    }
+                }
+
+                // If not running but mode could match, try starting processing
+                if (!g_gui.isRunning) {
+                    auto& ms = g_gui.monitorSettings[monIdx];
+                    auto& cc = isHDR ? ms.hdrColorCorrection : ms.sdrColorCorrection;
+                    bool origPrimEnabled = cc.primariesEnabled;
+                    cc.primariesEnabled = true;  // Ensure this monitor is included in processing
+                    StartProcessing();
+                    cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
+                    if (g_gui.isRunning) {
+                        startedForPreview = true;
+                        // Check mode match now that we have monitor contexts
+                        for (const auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                livePreview = (ctx.isHDREnabled == isHDR);
+                                break;
+                            }
+                        }
+                        // Mode mismatch — stop the processing we just started
+                        if (!livePreview) {
+                            StopProcessing();
+                            startedForPreview = false;
+                        }
+                    }
+                }
+
+                // Only remove ICC and clear flags when live preview is active
+                // (shader replaces ICC corrections during preview, restores on Cancel/Apply)
+                std::wstring otherProfileName;
+                bool otherWasEnabled = false;
+                if (livePreview) {
+                    // Remove ICC profile so shader preview isn't double-corrected
+                    if (hadProfile) {
+                        DisplayInfo displayInfo;
+                        if (GetDisplayInfoForMonitor(monIdx, displayInfo)) {
+                            RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+                        }
+                    }
+
+                    // Clear BOTH modes' MHC profile state so processing thread
+                    // sees no active profiles and sets all MHC flags to false.
+                    otherWasEnabled = otherMhc.enabled;
+                    otherProfileName = otherMhc.profileName;
+                    mhc.enabled = false;
+                    mhc.profileName.clear();
+                    mhc.profilePath.clear();
+                    otherMhc.enabled = false;
+                    otherMhc.profileName.clear();
+
+                    // Clear MHC active flags so shader applies corrections
+                    for (auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            ctx.sdrMhcPrimariesActive = false;
+                            ctx.sdrMhcGrayscaleActive = false;
+                            ctx.hdrMhcPrimariesActive = false;
+                            ctx.hdrMhcGrayscaleActive = false;
+                            break;
+                        }
+                    }
+                }
+
+                g_mhcEditDialogOpen.store(true);
+                ShowMhcSettingsDialog(hwnd, mhc, isHDR, monIdx,
+                                      livePreview, hadProfile, origProfileName, origProfilePath);
+                g_mhcEditDialogOpen.store(false);
+
+                // Restore state after dialog closes
+                if (livePreview) {
+                    otherMhc.enabled = otherWasEnabled;
+                    otherMhc.profileName = otherProfileName;
+                    UpdateMhcFlagsLive(monIdx);
+                    if (!startedForPreview) {
+                        UpdateColorCorrectionLive(monIdx, isHDR);
+                    }
+                }
+                // Stop temporary processing if we started it for preview
+                if (startedForPreview) {
+                    StopProcessing();
+                }
+                SaveSettings();
+                UpdateMhcInfoDisplay(monIdx, isHDR);
+            }
+            return 0;
+
+        case ID_MHC_TAB_APPLY:
+        case ID_MHC_HDR_APPLY:
+            {
+                bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_APPLY);
+                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size())
+                    return 0;
+
+                if (!IsMHC2ApiAvailable()) {
+                    MessageBox(hwnd, L"MHC2 color management APIs not available.\nRequires Windows 10 21H2 or later.", L"Not Available", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+
+                if (GenerateAndInstallMhcProfile(g_gui.currentMonitor, isHDR)) {
+                    auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
+                                      : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
+                    ComputeMhcMetadata(mhc, isHDR);
+                    UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
+                    SaveSettings();
+                    MessageBox(hwnd, L"MHC2 profile installed successfully.\nProfile persists even when overlay is off.",
+                        L"DesktopLUT", MB_OK | MB_ICONINFORMATION);
+                } else {
+                    MessageBox(hwnd, L"Failed to install MHC2 profile.\nCheck that HDR is enabled and GPU supports MHC2.",
+                        L"Error", MB_OK | MB_ICONERROR);
+                }
+            }
+            return 0;
+
+        case ID_MHC_TAB_REMOVE:
+        case ID_MHC_HDR_REMOVE:
+            {
+                bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_REMOVE);
+                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size())
+                    return 0;
+
+                auto& settings = g_gui.monitorSettings[g_gui.currentMonitor];
+                auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
+
+                if (mhc.profileName.empty()) {
+                    MessageBox(hwnd, L"No MHC2 profile is installed for this monitor.", L"Info", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+
+                DisplayInfo displayInfo;
+                if (GetDisplayInfoForMonitor(g_gui.currentMonitor, displayInfo)) {
+                    RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+                }
+
+                // Delete the .icm file from system color directory
+                {
+                    wchar_t sysDir[MAX_PATH];
+                    GetSystemDirectory(sysDir, MAX_PATH);
+                    std::wstring icmPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + mhc.profileName;
+                    if (DeleteFileW(icmPath.c_str())) {
+                        std::wcout << L"MHC: Deleted profile file " << mhc.profileName << std::endl;
+                    }
+                }
+
+                mhc.enabled = false;
+                mhc.profilePath.clear();
+                mhc.profileName.clear();
+                mhc.hasPerChannelTRC = false;
+                mhc.metaPrimaries.clear();
+                mhc.metaGamma.clear();
+                mhc.metaPeakNits = 0.0f;
+                UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
+                UpdateMhcFlagsLive(g_gui.currentMonitor);
+                SaveSettings();
             }
             return 0;
 
@@ -2892,6 +1800,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case ID_TRAY_STARTUP:
             SetStartupEnabled(!IsStartupEnabled());
+            if (g_gui.hwndSettingsRunAtStartup)
+                SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
             return 0;
         case ID_TRAY_EXIT:
             StopProcessing();
@@ -2916,11 +1826,62 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         UpdateGUIState();
         return 0;
 
+    case WM_MHC_PROFILE_REAPPLIED: {
+        int monIdx = (int)wParam;
+        bool isHDR = (lParam != 0);
+        if (monIdx == g_gui.currentMonitor) {
+            UpdateMhcInfoDisplay(monIdx, isHDR);
+        }
+        return 0;
+    }
+
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) {
             ShowWindow(hwnd, SW_HIDE);
         }
         return 0;
+
+    case WM_DISPLAYCHANGE: {
+        // Monitor hotplug: re-enumerate and update if count changed
+        std::vector<HMONITOR> newMonitors;
+        EnumDisplayMonitors(nullptr, nullptr, GUIMonitorEnumProc, reinterpret_cast<LPARAM>(&newMonitors));
+        if (newMonitors.size() != g_gui.monitors.size()) {
+            std::cout << "Display change: monitor count " << g_gui.monitors.size()
+                      << " -> " << newMonitors.size() << std::endl;
+            g_gui.monitors = newMonitors;
+
+            // Resize monitorSettings, preserving existing entries
+            size_t oldSize = g_gui.monitorSettings.size();
+            g_gui.monitorSettings.resize(newMonitors.size());
+
+            // Update monitor names and combo box
+            g_gui.monitorNames.clear();
+            SendMessage(g_gui.hwndMonitorList, CB_RESETCONTENT, 0, 0);
+            for (size_t i = 0; i < newMonitors.size(); i++) {
+                MONITORINFO mi = { sizeof(mi) };
+                GetMonitorInfo(newMonitors[i], &mi);
+                wchar_t name[64];
+                swprintf_s(name, L"Monitor %d (%dx%d)", (int)i + 1,
+                    mi.rcMonitor.right - mi.rcMonitor.left,
+                    mi.rcMonitor.bottom - mi.rcMonitor.top);
+                g_gui.monitorNames.push_back(name);
+                SendMessage(g_gui.hwndMonitorList, CB_ADDSTRING, 0, (LPARAM)name);
+            }
+
+            // Clamp current monitor selection
+            if (g_gui.currentMonitor >= (int)newMonitors.size()) {
+                g_gui.currentMonitor = (int)newMonitors.size() - 1;
+            }
+            if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
+            SendMessage(g_gui.hwndMonitorList, CB_SETCURSEL, g_gui.currentMonitor, 0);
+
+            // Force reinit if processing is running
+            if (g_gui.isRunning) {
+                g_forceReinit.store(true);
+            }
+        }
+        return 0;
+    }
 
     case WM_POWERBROADCAST:
         // Handle power events for sleep/wake recovery (defense in depth with overlay WndProc)
@@ -2949,6 +1910,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
+
+// ============================================================================
+// SECTION: Application Entry
+// ============================================================================
 
 int RunGUI() {
     // Boost process priority for faster startup and smoother operation

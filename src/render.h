@@ -4,6 +4,7 @@
 #pragma once
 
 #include "types.h"
+#include "whitelist.h"
 
 // Create swapchain for a monitor
 bool CreateSwapChain(MonitorContext* ctx);
@@ -37,10 +38,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // Cleanup a single monitor context
 void CleanupMonitorContext(MonitorContext* ctx);
-
-// Gamma whitelist polling thread control
-void StartGammaWhitelistThread();
-void StopGammaWhitelistThread();
 
 // Display power state notification (sleep/wake)
 void RegisterDisplayPowerNotification(HWND hwnd);

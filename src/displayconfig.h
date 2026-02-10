@@ -4,6 +4,7 @@
 #pragma once
 
 #include <windows.h>
+#include <dxgi1_6.h>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,7 @@ struct DisplayInfo {
     std::wstring devicePath;
     LUID adapterId = {};
     UINT32 targetId = 0;
+    UINT32 sourceId = 0;        // path.sourceInfo.id for ICC profile APIs
     float currentMaxTml = 0.0f;  // Current MaxTML in nits (0 if unknown)
     bool isHdrCapable = false;
 };
@@ -29,6 +31,9 @@ bool SetDisplayMaxTml(const DisplayInfo& display, float nits);
 
 // Get display info for a specific monitor index (matches g_monitors order)
 bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo);
+
+// Query fresh DXGI output descriptor for a monitor (creates new factory to avoid stale data)
+bool QueryFreshOutputDesc(HMONITOR hMonitor, DXGI_OUTPUT_DESC1& outDesc);
 
 // Get/set HDR state for a display
 bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled);

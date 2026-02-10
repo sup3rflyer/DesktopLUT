@@ -6,7 +6,8 @@
 #include <iostream>
 
 // Calculate 3x3 color matrix from source primaries to target primaries
-// Uses Bradford chromatic adaptation for white point conversion
+// Direct colorimetric conversion (no Bradford chromatic adaptation)
+// White point correction works via normalization difference between source and target matrices
 // Reference: Bruce Lindbloom (brucelindbloom.com)
 void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrimariesData& target, float outMatrix[9]) {
     // Helper: multiply 3x3 matrices (row-major)
@@ -47,62 +48,11 @@ void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrim
         *Z = (1.0f - x - y) / y;
     };
 
-    // Bradford matrix (D50 reference)
-    const float Ma[9] = {
-         0.8951f,  0.2664f, -0.1614f,
-        -0.7502f,  1.7135f,  0.0367f,
-         0.0389f, -0.0685f,  1.0296f
-    };
-    float MaInv[9];
-    if (!matInv(Ma, MaInv)) {
-        // Bradford matrix is constant and always invertible, but check anyway
-        std::cerr << "Error: Bradford matrix inversion failed" << std::endl;
-        // Return identity matrix
-        for (int i = 0; i < 9; i++) outMatrix[i] = (i % 4 == 0) ? 1.0f : 0.0f;
-        return;
-    }
-
     // Get XYZ of white points
     float srcWX, srcWY, srcWZ;
     float tgtWX, tgtWY, tgtWZ;
     xyToXYZ(src.Wx, src.Wy, &srcWX, &srcWY, &srcWZ);
     xyToXYZ(target.Wx, target.Wy, &tgtWX, &tgtWY, &tgtWZ);
-
-    // Calculate Bradford cone response domain coordinates
-    float srcCone[3] = {
-        Ma[0] * srcWX + Ma[1] * srcWY + Ma[2] * srcWZ,
-        Ma[3] * srcWX + Ma[4] * srcWY + Ma[5] * srcWZ,
-        Ma[6] * srcWX + Ma[7] * srcWY + Ma[8] * srcWZ
-    };
-    float tgtCone[3] = {
-        Ma[0] * tgtWX + Ma[1] * tgtWY + Ma[2] * tgtWZ,
-        Ma[3] * tgtWX + Ma[4] * tgtWY + Ma[5] * tgtWZ,
-        Ma[6] * tgtWX + Ma[7] * tgtWY + Ma[8] * tgtWZ
-    };
-
-    // Chromatic adaptation diagonal matrix
-    float scale[9] = {
-        tgtCone[0] / srcCone[0], 0, 0,
-        0, tgtCone[1] / srcCone[1], 0,
-        0, 0, tgtCone[2] / srcCone[2]
-    };
-
-    // Check if white points are similar enough to skip adaptation
-    // (for colorimetric accuracy, skip Bradford when white points match)
-    bool skipAdaptation = (fabs(src.Wx - target.Wx) < 0.01f && fabs(src.Wy - target.Wy) < 0.01f);
-
-    float adapt[9];
-    if (skipAdaptation) {
-        // Identity adaptation - pure colorimetric mapping (white points similar)
-        adapt[0] = 1; adapt[1] = 0; adapt[2] = 0;
-        adapt[3] = 0; adapt[4] = 1; adapt[5] = 0;
-        adapt[6] = 0; adapt[7] = 0; adapt[8] = 1;
-    } else {
-        // Build chromatic adaptation matrix: MaInv * scale * Ma
-        float tmp[9];
-        matMul(scale, Ma, tmp);
-        matMul(MaInv, tmp, adapt);
-    }
 
     // Build RGB to XYZ matrix for source primaries
     float srcRX, srcRY, srcRZ, srcGX, srcGY, srcGZ, srcBX, srcBY, srcBZ;
@@ -119,7 +69,6 @@ void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrim
     float srcPrimInv[9];
     if (!matInv(srcPrim, srcPrimInv)) {
         std::cerr << "Error: Source primaries matrix is singular (degenerate primaries)" << std::endl;
-        // Return identity matrix
         for (int i = 0; i < 9; i++) outMatrix[i] = (i % 4 == 0) ? 1.0f : 0.0f;
         return;
     }
@@ -150,7 +99,11 @@ void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrim
         tgtRZ, tgtGZ, tgtBZ
     };
     float tgtPrimInv[9];
-    matInv(tgtPrim, tgtPrimInv);
+    if (!matInv(tgtPrim, tgtPrimInv)) {
+        std::cerr << "Error: Target primaries matrix is singular (degenerate primaries)" << std::endl;
+        for (int i = 0; i < 9; i++) outMatrix[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+        return;
+    }
 
     float tgtS[3] = {
         tgtPrimInv[0] * tgtWX + tgtPrimInv[1] * tgtWY + tgtPrimInv[2] * tgtWZ,
@@ -166,22 +119,24 @@ void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrim
     float tgtXYZtoRGB[9];
     if (!matInv(tgtRGBtoXYZ, tgtXYZtoRGB)) {
         std::cerr << "Error: Target primaries matrix is singular (degenerate primaries)" << std::endl;
-        // Return identity matrix
         for (int i = 0; i < 9; i++) outMatrix[i] = (i % 4 == 0) ? 1.0f : 0.0f;
         return;
     }
 
-    // Final matrix: tgtXYZtoRGB * adapt * srcRGBtoXYZ
-    float tmp2[9];
-    matMul(adapt, srcRGBtoXYZ, tmp2);
-    matMul(tgtXYZtoRGB, tmp2, outMatrix);
+    // Direct colorimetric: tgtXYZtoRGB * srcRGBtoXYZ
+    // No Bradford — overlay feeds the same display, so white point correction comes from
+    // the normalization difference between source (D65) and target (display white) matrices.
+    // When white points match: identity for same primaries, pure gamut map for different.
+    // When white points differ: (1,1,1) maps to non-(1,1,1), shifting displayed white.
+    matMul(tgtXYZtoRGB, srcRGBtoXYZ, outMatrix);
 
-    // Debug output - identify source by red primary (sRGB=0.64, Rec.2020=0.708)
+    // Debug output
     const char* srcName = (src.Rx > 0.68f) ? "Rec.2020" : "sRGB";
     std::cout << "Primaries matrix: " << srcName << " -> display ("
               << target.Rx << "," << target.Ry << " / "
               << target.Gx << "," << target.Gy << " / "
-              << target.Bx << "," << target.By << ")" << std::endl;
+              << target.Bx << "," << target.By
+              << " W:" << target.Wx << "," << target.Wy << ")" << std::endl;
     std::cout << "  [" << outMatrix[0] << ", " << outMatrix[1] << ", " << outMatrix[2] << "]" << std::endl;
     std::cout << "  [" << outMatrix[3] << ", " << outMatrix[4] << ", " << outMatrix[5] << "]" << std::endl;
     std::cout << "  [" << outMatrix[6] << ", " << outMatrix[7] << ", " << outMatrix[8] << "]" << std::endl;

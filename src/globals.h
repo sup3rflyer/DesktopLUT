@@ -96,6 +96,7 @@ extern std::mutex g_vrrWhitelistMutex;                 // Protects g_vrrWhitelis
 
 extern std::mutex g_gammaWhitelistMutex;  // Protects g_gammaWhitelist, g_gammaWhitelistMatch, g_gammaWhitelistOverrideProcess
 extern std::mutex g_colorCorrectionMutex;
+extern std::mutex g_monitorSettingsMutex; // Protects g_gui.monitorSettings (MHC profileName/enabled fields)
 extern std::vector<PendingColorCorrection> g_pendingColorCorrections;
 extern std::atomic<bool> g_hasPendingColorCorrections;  // Fast check to avoid mutex lock
 
@@ -103,7 +104,7 @@ extern std::atomic<bool> g_hasPendingColorCorrections;  // Fast check to avoid m
 // Global Window Handles
 // ============================================================================
 
-extern HWND g_mainHwnd;     // First monitor's overlay window (for hotkey registration)
+extern std::atomic<HWND> g_mainHwnd;     // First monitor's overlay window (for hotkey registration)
 extern HWND g_osdHwnd;      // On-screen display window
 extern HWND g_analysisHwnd; // Analysis overlay window
 extern std::atomic<bool> g_analysisEnabled;  // Analysis overlay visibility
@@ -137,6 +138,12 @@ extern std::chrono::steady_clock::time_point g_lastSuccessfulFrame;
 // ============================================================================
 
 extern std::atomic<bool> g_displayOff;  // Display is off - skip recovery attempts, wait for wake signal
+
+// ============================================================================
+// MHC Edit Dialog State
+// ============================================================================
+
+extern std::atomic<bool> g_mhcEditDialogOpen;  // Suppress profile monitoring during edit dialog
 
 // ============================================================================
 // GUI State

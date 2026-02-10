@@ -13,6 +13,7 @@
 #include "gui.h"
 #include "gpu.h"
 #include "displayconfig.h"
+#include "mhc.h"
 #include <objbase.h>
 #include <iostream>
 #include <map>
@@ -41,53 +42,69 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
     dst.customPrimaries.Wx = src.customPrimaries.Wx;
     dst.customPrimaries.Wy = src.customPrimaries.Wy;
 
-    // Calculate primaries matrix if enabled
-    // SDR: sRGB content → display primaries (gamut mapping for uncalibrated displays)
-    // HDR: Rec.2020 → measured display primaries (correction applied in Rec.2020 space)
+    // === Gamut mapping matrix (primaries only, D65 white for both sides) ===
     if (src.primariesEnabled) {
         const DisplayPrimaries& userPrimRef = (src.primariesPreset == g_numPresetPrimaries - 1)
             ? src.customPrimaries : g_presetPrimaries[src.primariesPreset];
 
-        DisplayPrimariesData srcPrim, tgtPrim;
+        // Content space primaries
+        const auto& contentPrim = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];
 
-        // Two-step approach:
-        // 1. Gamut mapping matrix (direction depends on SDR vs HDR)
-        // White point correction is handled by Bradford adaptation in the primaries matrix
+        // Source: content space + D65 white
+        DisplayPrimariesData srcPrim = { contentPrim.Rx, contentPrim.Ry,
+                                         contentPrim.Gx, contentPrim.Gy,
+                                         contentPrim.Bx, contentPrim.By,
+                                         0.3127f, 0.3290f };  // D65
 
-        // Step 1: Gamut mapping with actual white points
-        // Note: CalculatePrimariesMatrix includes Bradford adaptation when white points differ
-        if (isHDR) {
-            // HDR: Rec.2020 → measured display primaries
-            // Applied AFTER BT.709→Rec.2020 conversion in shader, in linear Rec.2020 space
-            // This corrects the signal so the display (with its actual primaries) shows intended colors
-            srcPrim = { g_presetPrimaries[3].Rx, g_presetPrimaries[3].Ry,  // Rec.2020
-                        g_presetPrimaries[3].Gx, g_presetPrimaries[3].Gy,
-                        g_presetPrimaries[3].Bx, g_presetPrimaries[3].By,
-                        g_presetPrimaries[3].Wx, g_presetPrimaries[3].Wy };
-            tgtPrim = { userPrimRef.Rx, userPrimRef.Ry, userPrimRef.Gx, userPrimRef.Gy,
-                        userPrimRef.Bx, userPrimRef.By,
-                        userPrimRef.Wx, userPrimRef.Wy };  // Display's measured primaries
-        } else {
-            // SDR: sRGB → display primaries
-            // Applied in linear sRGB space before LUT
-            srcPrim = { g_presetPrimaries[0].Rx, g_presetPrimaries[0].Ry,  // sRGB
-                        g_presetPrimaries[0].Gx, g_presetPrimaries[0].Gy,
-                        g_presetPrimaries[0].Bx, g_presetPrimaries[0].By,
-                        g_presetPrimaries[0].Wx, g_presetPrimaries[0].Wy };
-            tgtPrim = { userPrimRef.Rx, userPrimRef.Ry, userPrimRef.Gx, userPrimRef.Gy,
-                        userPrimRef.Bx, userPrimRef.By,
-                        userPrimRef.Wx, userPrimRef.Wy };  // Display primaries with ACTUAL white
-        }
+        // Target: display primaries + D65 white (pure gamut mapping, no white shift)
+        DisplayPrimariesData tgtPrim = { userPrimRef.Rx, userPrimRef.Ry,
+                                         userPrimRef.Gx, userPrimRef.Gy,
+                                         userPrimRef.Bx, userPrimRef.By,
+                                         0.3127f, 0.3290f };  // D65
 
         CalculatePrimariesMatrix(srcPrim, tgtPrim, dst.primariesMatrix);
-
-        // White point adaptation is handled by Bradford chromatic adaptation
-        // inside CalculatePrimariesMatrix() - no separate RGB gains needed
     } else {
-        // Identity matrix (no primaries correction)
+        // Identity matrix (no gamut mapping)
         dst.primariesMatrix[0] = 1; dst.primariesMatrix[1] = 0; dst.primariesMatrix[2] = 0;
         dst.primariesMatrix[3] = 0; dst.primariesMatrix[4] = 1; dst.primariesMatrix[5] = 0;
         dst.primariesMatrix[6] = 0; dst.primariesMatrix[7] = 0; dst.primariesMatrix[8] = 1;
+    }
+
+    // === White balance gains (von Kries diagonal, independent of primaries) ===
+    // Compute RGB gains that shift D65 → target white in content space
+    // gains = contentXYZtoRGB * targetWhiteXYZ
+    {
+        float Wx = src.customPrimaries.Wx;
+        float Wy = src.customPrimaries.Wy;
+        if (Wy < 1e-6f) Wy = 1e-6f;
+        bool isD65 = (fabs(Wx - 0.3127f) < 0.001f && fabs(Wy - 0.3290f) < 0.001f);
+        if (isD65) {
+            dst.whiteBalanceGains[0] = 1.0f;
+            dst.whiteBalanceGains[1] = 1.0f;
+            dst.whiteBalanceGains[2] = 1.0f;
+        } else {
+            // Target white in XYZ (Y=1)
+            float tX = Wx / Wy;
+            float tY = 1.0f;
+            float tZ = (1.0f - Wx - Wy) / Wy;
+            // Content space XYZ-to-RGB matrix (sRGB for SDR, Rec.2020 for HDR)
+            // sRGB XYZ→RGB (IEC 61966-2-1)
+            const float srgbXYZtoRGB[9] = {
+                 3.2404542f, -1.5371385f, -0.4985314f,
+                -0.9692660f,  1.8760108f,  0.0415560f,
+                 0.0556434f, -0.2040259f,  1.0572252f
+            };
+            // Rec.2020 XYZ→RGB
+            const float rec2020XYZtoRGB[9] = {
+                 1.7166512f, -0.3556708f, -0.2533663f,
+                -0.6666844f,  1.6164812f,  0.0157685f,
+                 0.0176399f, -0.0427706f,  0.9421031f
+            };
+            const float* m = isHDR ? rec2020XYZtoRGB : srgbXYZtoRGB;
+            dst.whiteBalanceGains[0] = m[0] * tX + m[1] * tY + m[2] * tZ;
+            dst.whiteBalanceGains[1] = m[3] * tX + m[4] * tY + m[5] * tZ;
+            dst.whiteBalanceGains[2] = m[6] * tX + m[7] * tY + m[8] * tZ;
+        }
     }
 
     // Copy grayscale settings
@@ -167,6 +184,20 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         ctx.sdrColorCorrection = config.sdrColorCorrection;
         ctx.hdrColorCorrection = config.hdrColorCorrection;
 
+        // Track which MHC corrections are active at GPU scanout (for diagnostics and live preview)
+        // Shader corrections are independent — all layers stack (MHC = Layer 1, shader = Layer 3)
+        if (config.monitorIndex < (int)g_gui.monitorSettings.size()) {
+            const auto& ms = g_gui.monitorSettings[config.monitorIndex];
+            ctx.sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
+                && ms.sdrMHC.primariesEnabled;
+            ctx.sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
+                && ms.sdrMHC.grayscale.enabled;
+            ctx.hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
+                && ms.hdrMHC.primariesEnabled;
+            ctx.hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
+                && ms.hdrMHC.grayscale.enabled;
+        }
+
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfo(ctx.monitor, &mi);
         ctx.width = mi.rcMonitor.right - mi.rcMonitor.left;
@@ -234,21 +265,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
             continue;
         }
 
-        // Check if we have any HDR processing to do
-        bool hasHdrColorCorrection = ctx.hdrColorCorrection.primariesEnabled ||
-                                     ctx.hdrColorCorrection.grayscale.enabled ||
-                                     ctx.hdrColorCorrection.tonemap.enabled;
-
-        if (ctx.isHDREnabled && !hasHDRLUT && !hasHdrColorCorrection) {
-            SetStatus(L"HDR mode requires HDR LUT or color correction");
-            ReleaseMonitorD3DResources(&ctx);
-            DestroyWindow(ctx.hwnd);
-            continue;
-        }
-
         // Set passthrough mode if no applicable LUT for current mode
+        // Overlay still runs for live color corrections, desktop gamma, MHC profiles, etc.
         if (ctx.isHDREnabled) {
-            ctx.usePassthrough = !hasHDRLUT;
+            ctx.usePassthrough = (ctx.lutSRV_HDR == nullptr && !hasHDRLUT);
         }
 
         if (!CreateSwapChain(&ctx)) {
@@ -285,6 +305,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         ReleaseSharedD3DResources();  // Clean up D3D resources on early exit
         return;
     }
+
+    // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles
+    CleanupOrphanedMhcProfiles();
+    ReapplyAllMhcProfiles();
 
     g_mainHwnd = g_monitors[0].hwnd;
 
@@ -507,39 +531,13 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR) {
     g_hasPendingColorCorrections.store(true, std::memory_order_release);
 }
 
-// Helper to compare primaries (DisplayPrimariesData vs DisplayPrimaries)
-static bool PrimariesChanged(const DisplayPrimariesData& a, const DisplayPrimaries& b) {
-    const float eps = 0.0001f;
-    return fabsf(a.Rx - b.Rx) > eps || fabsf(a.Ry - b.Ry) > eps ||
-           fabsf(a.Gx - b.Gx) > eps || fabsf(a.Gy - b.Gy) > eps ||
-           fabsf(a.Bx - b.Bx) > eps || fabsf(a.By - b.By) > eps ||
-           fabsf(a.Wx - b.Wx) > eps || fabsf(a.Wy - b.Wy) > eps;
-}
-
-// Helper to get primaries from edit boxes
-static DisplayPrimariesData GetPrimariesFromEditBoxes(bool isHDR) {
-    DisplayPrimariesData p = {};
+// Helper to get white point from edit boxes
+static void GetWhitePointFromEditBoxes(float& Wx, float& Wy, bool isHDR) {
     wchar_t buf[16];
-    if (isHDR) {
-        if (g_gui.hwndHdrPrimariesRx) { GetWindowText(g_gui.hwndHdrPrimariesRx, buf, 16); p.Rx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesRy) { GetWindowText(g_gui.hwndHdrPrimariesRy, buf, 16); p.Ry = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesGx) { GetWindowText(g_gui.hwndHdrPrimariesGx, buf, 16); p.Gx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesGy) { GetWindowText(g_gui.hwndHdrPrimariesGy, buf, 16); p.Gy = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesBx) { GetWindowText(g_gui.hwndHdrPrimariesBx, buf, 16); p.Bx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesBy) { GetWindowText(g_gui.hwndHdrPrimariesBy, buf, 16); p.By = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesWx) { GetWindowText(g_gui.hwndHdrPrimariesWx, buf, 16); p.Wx = (float)_wtof(buf); }
-        if (g_gui.hwndHdrPrimariesWy) { GetWindowText(g_gui.hwndHdrPrimariesWy, buf, 16); p.Wy = (float)_wtof(buf); }
-    } else {
-        if (g_gui.hwndSdrPrimariesRx) { GetWindowText(g_gui.hwndSdrPrimariesRx, buf, 16); p.Rx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesRy) { GetWindowText(g_gui.hwndSdrPrimariesRy, buf, 16); p.Ry = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesGx) { GetWindowText(g_gui.hwndSdrPrimariesGx, buf, 16); p.Gx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesGy) { GetWindowText(g_gui.hwndSdrPrimariesGy, buf, 16); p.Gy = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesBx) { GetWindowText(g_gui.hwndSdrPrimariesBx, buf, 16); p.Bx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesBy) { GetWindowText(g_gui.hwndSdrPrimariesBy, buf, 16); p.By = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesWx) { GetWindowText(g_gui.hwndSdrPrimariesWx, buf, 16); p.Wx = (float)_wtof(buf); }
-        if (g_gui.hwndSdrPrimariesWy) { GetWindowText(g_gui.hwndSdrPrimariesWy, buf, 16); p.Wy = (float)_wtof(buf); }
-    }
-    return p;
+    HWND hwndWx = isHDR ? g_gui.hwndHdrPrimariesWx : g_gui.hwndPrimariesWx;
+    HWND hwndWy = isHDR ? g_gui.hwndHdrPrimariesWy : g_gui.hwndPrimariesWy;
+    if (hwndWx) { GetWindowText(hwndWx, buf, 16); Wx = (float)_wtof(buf); }
+    if (hwndWy) { GetWindowText(hwndWy, buf, 16); Wy = (float)_wtof(buf); }
 }
 
 bool SettingsChanged() {
@@ -553,27 +551,53 @@ bool SettingsChanged() {
         }
     }
 
-    // Check if current monitor's custom primaries have changed from active settings
-    // Only check when Custom preset (5) is selected in the dropdown
+    // Compare per-monitor settings that affect rendering
+    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+        const auto& cur = g_gui.monitorSettings[i];
+        const auto& act = g_gui.activeSettings[i];
+
+        // Check SDR color correction
+        if (cur.sdrColorCorrection.primariesEnabled != act.sdrColorCorrection.primariesEnabled ||
+            cur.sdrColorCorrection.primariesPreset != act.sdrColorCorrection.primariesPreset ||
+            cur.sdrColorCorrection.grayscale.enabled != act.sdrColorCorrection.grayscale.enabled ||
+            cur.sdrColorCorrection.grayscale.pointCount != act.sdrColorCorrection.grayscale.pointCount ||
+            fabsf(cur.sdrColorCorrection.customPrimaries.Wx - act.sdrColorCorrection.customPrimaries.Wx) > 0.0001f ||
+            fabsf(cur.sdrColorCorrection.customPrimaries.Wy - act.sdrColorCorrection.customPrimaries.Wy) > 0.0001f) {
+            return true;
+        }
+
+        // Check HDR color correction
+        if (cur.hdrColorCorrection.primariesEnabled != act.hdrColorCorrection.primariesEnabled ||
+            cur.hdrColorCorrection.primariesPreset != act.hdrColorCorrection.primariesPreset ||
+            cur.hdrColorCorrection.grayscale.enabled != act.hdrColorCorrection.grayscale.enabled ||
+            cur.hdrColorCorrection.grayscale.pointCount != act.hdrColorCorrection.grayscale.pointCount ||
+            cur.hdrColorCorrection.tonemap.enabled != act.hdrColorCorrection.tonemap.enabled ||
+            fabsf(cur.hdrColorCorrection.customPrimaries.Wx - act.hdrColorCorrection.customPrimaries.Wx) > 0.0001f ||
+            fabsf(cur.hdrColorCorrection.customPrimaries.Wy - act.hdrColorCorrection.customPrimaries.Wy) > 0.0001f) {
+            return true;
+        }
+    }
+
+    // Check current monitor's white point from edit boxes (may differ from stored settings)
     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.activeSettings.size()) {
-        // Check SDR primaries only if Custom preset selected
-        if (g_gui.hwndSdrPrimariesPreset) {
-            int sdrPreset = (int)SendMessage(g_gui.hwndSdrPrimariesPreset, CB_GETCURSEL, 0, 0);
-            if (sdrPreset == 5) {  // Custom preset
-                DisplayPrimariesData sdrFromUI = GetPrimariesFromEditBoxes(false);
-                if (PrimariesChanged(sdrFromUI, g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection.customPrimaries)) {
-                    return true;
-                }
+        // Check SDR white point
+        {
+            float Wx = 0.3127f, Wy = 0.3290f;
+            GetWhitePointFromEditBoxes(Wx, Wy, false);
+            const auto& activeCC = g_gui.activeSettings[g_gui.currentMonitor].sdrColorCorrection;
+            if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
+                fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
+                return true;
             }
         }
-        // Check HDR primaries only if Custom preset selected
-        if (g_gui.hwndHdrPrimariesPreset) {
-            int hdrPreset = (int)SendMessage(g_gui.hwndHdrPrimariesPreset, CB_GETCURSEL, 0, 0);
-            if (hdrPreset == 5) {  // Custom preset
-                DisplayPrimariesData hdrFromUI = GetPrimariesFromEditBoxes(true);
-                if (PrimariesChanged(hdrFromUI, g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection.customPrimaries)) {
-                    return true;
-                }
+        // Check HDR white point
+        {
+            float Wx = 0.3127f, Wy = 0.3290f;
+            GetWhitePointFromEditBoxes(Wx, Wy, true);
+            const auto& activeCC = g_gui.activeSettings[g_gui.currentMonitor].hdrColorCorrection;
+            if (fabsf(Wx - activeCC.customPrimaries.Wx) > 0.0001f ||
+                fabsf(Wy - activeCC.customPrimaries.Wy) > 0.0001f) {
+                return true;
             }
         }
     }

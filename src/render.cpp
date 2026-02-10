@@ -4,18 +4,21 @@
 #include "render.h"
 #include "globals.h"
 #include "gpu.h"
+#include "color.h"
 #include "capture.h"
 #include "osd.h"
 #include "analysis.h"
 #include "displayconfig.h"
 #include "processing.h"
+#include "mhc.h"
 #include <dwmapi.h>
-#include <tlhelp32.h>
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
-#include <cctype>
-#include <thread>
+
+// ============================================================================
+// SECTION: Compositor Clock & Display Power
+// ============================================================================
 
 // Compositor Clock API (Windows 10 1903+) for VRR-aware frame timing
 // Dynamically loaded to maintain compatibility with older Windows
@@ -33,9 +36,6 @@ void InitCompositorClock() {
         std::cout << "Compositor Clock API: not available (using DwmFlush fallback)" << std::endl;
     }
 }
-
-// Thread handle for gamma whitelist polling
-static std::thread g_gammaWhitelistThread;
 
 // Display power notification handle
 static HPOWERNOTIFY g_displayPowerNotify = nullptr;
@@ -63,347 +63,9 @@ void UnregisterDisplayPowerNotification() {
     }
 }
 
-// Check if any whitelisted process is running and update gamma state accordingly
-// Returns true if a whitelisted process was found
-static bool CheckGammaWhitelist() {
-    // Copy whitelist data under lock for thread-safe access
-    std::vector<std::wstring> localWhitelist;
-    std::wstring localOverrideProcess;
-    {
-        std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-        localWhitelist = g_gammaWhitelist;
-        localOverrideProcess = g_gammaWhitelistOverrideProcess;
-    }
-
-    // Early exit conditions - only check when:
-    // 1. Whitelist is populated
-    // 2. User has gamma enabled (checkbox checked)
-    // 3. At least one monitor is in HDR mode
-    if (localWhitelist.empty() || !g_userDesktopGammaMode.load()) {
-        if (g_gammaWhitelistActive.load()) {
-            // Was active, now conditions changed - restore user preference
-            g_gammaWhitelistActive.store(false);
-            {
-                std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                g_gammaWhitelistMatch.clear();
-            }
-            g_desktopGammaMode.store(g_userDesktopGammaMode.load());
-        }
-        // Also clear override if conditions no longer apply
-        if (g_gammaWhitelistUserOverride.load()) {
-            g_gammaWhitelistUserOverride.store(false);
-            std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-            g_gammaWhitelistOverrideProcess.clear();
-        }
-        return false;
-    }
-
-    // Check if any monitor is in HDR mode
-    bool anyHDR = false;
-    for (const auto& ctx : g_monitors) {
-        if (ctx.isHDREnabled) {
-            anyHDR = true;
-            break;
-        }
-    }
-    if (!anyHDR) {
-        if (g_gammaWhitelistActive.load()) {
-            g_gammaWhitelistActive.store(false);
-            {
-                std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                g_gammaWhitelistMatch.clear();
-            }
-            g_desktopGammaMode.store(g_userDesktopGammaMode.load());
-        }
-        // Also clear override if conditions no longer apply
-        if (g_gammaWhitelistUserOverride.load()) {
-            g_gammaWhitelistUserOverride.store(false);
-            std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-            g_gammaWhitelistOverrideProcess.clear();
-        }
-        return false;
-    }
-
-    // Enumerate running processes
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(pe32);
-
-    bool found = false;
-    std::wstring matchedProcess;
-    bool overrideProcessStillRunning = false;
-
-    // Helper: case-insensitive length-limited compare
-    auto matchesPattern = [](const wchar_t* str, size_t strLen, const std::wstring& pattern) -> bool {
-        // Compare without .exe extension
-        size_t baseLen = strLen;
-        if (baseLen > 4 && _wcsnicmp(str + baseLen - 4, L".exe", 4) == 0) {
-            baseLen -= 4;
-        }
-        // Match pattern against base name (without extension)
-        if (baseLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), baseLen) == 0) {
-            return true;
-        }
-        // Match pattern against full name (with extension)
-        if (strLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), strLen) == 0) {
-            return true;
-        }
-        // Match pattern+.exe against full name
-        if (strLen == pattern.size() + 4 && _wcsnicmp(str, pattern.c_str(), pattern.size()) == 0 &&
-            _wcsnicmp(str + pattern.size(), L".exe", 4) == 0) {
-            return true;
-        }
-        return false;
-    };
-
-    if (Process32FirstW(snapshot, &pe32)) {
-        do {
-            const wchar_t* exeName = pe32.szExeFile;
-            size_t exeLen = wcslen(exeName);
-
-            // Check if the override process is still running
-            if (g_gammaWhitelistUserOverride.load() && !localOverrideProcess.empty()) {
-                if (matchesPattern(exeName, exeLen, localOverrideProcess)) {
-                    overrideProcessStillRunning = true;
-                }
-            }
-
-            // Check against whitelist (case-insensitive matching)
-            for (const auto& pattern : localWhitelist) {
-                if (matchesPattern(exeName, exeLen, pattern)) {
-                    found = true;
-                    matchedProcess = pe32.szExeFile;  // Original case for display
-                    break;
-                }
-            }
-            // Don't break early - need to check if override process is still running too
-        } while (Process32NextW(snapshot, &pe32));
-    }
-
-    CloseHandle(snapshot);
-
-    // Handle user override: if user manually toggled while whitelist was active,
-    // the override persists until the whitelisted app that triggered it exits
-    if (g_gammaWhitelistUserOverride.load()) {
-        if (!overrideProcessStillRunning) {
-            // Override process has exited - clear override and resume normal whitelist behavior
-            std::wcout << L"Gamma whitelist: override process " << localOverrideProcess << L" exited, resuming normal whitelist" << std::endl;
-            g_gammaWhitelistUserOverride.store(false);
-            {
-                std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                g_gammaWhitelistOverrideProcess.clear();
-            }
-            // Continue to normal whitelist handling below
-        } else {
-            // Override process still running - don't trigger whitelist
-            return found;
-        }
-    }
-
-    // Update state based on result
-    bool wasActive = g_gammaWhitelistActive.load();
-    if (found) {
-        if (!wasActive) {
-            // Just detected whitelisted app - disable gamma
-            g_gammaWhitelistActive.store(true);
-            {
-                std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                g_gammaWhitelistMatch = matchedProcess;
-            }
-            g_desktopGammaMode.store(false);
-            std::wcout << L"Gamma whitelist: detected " << matchedProcess << L", disabling desktop gamma" << std::endl;
-            ShowOSD(L"Gamma: sRGB");
-        }
-    } else {
-        if (wasActive) {
-            // Whitelisted app exited - restore user preference
-            g_gammaWhitelistActive.store(false);
-            std::wstring exitedProcess;
-            {
-                std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                exitedProcess = g_gammaWhitelistMatch;
-                g_gammaWhitelistMatch.clear();
-            }
-            std::wcout << L"Gamma whitelist: " << exitedProcess << L" exited, restoring desktop gamma" << std::endl;
-            g_desktopGammaMode.store(g_userDesktopGammaMode.load());
-            ShowOSD(g_userDesktopGammaMode.load() ? L"Gamma: 2.2" : L"Gamma: sRGB");
-        }
-    }
-
-    return found;
-}
-
-// Check if any VRR-whitelisted process is running and hide/show overlay accordingly
-static void CheckVrrWhitelist() {
-    // Copy whitelist data under lock for thread-safe access
-    std::vector<std::wstring> localWhitelist;
-    {
-        std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
-        localWhitelist = g_vrrWhitelist;
-    }
-
-    // Early exit if feature disabled or whitelist empty
-    if (!g_vrrWhitelistEnabled.load() || localWhitelist.empty()) {
-        if (g_vrrWhitelistActive.load()) {
-            // Was active, now disabled - show overlays again
-            g_vrrWhitelistActive.store(false);
-            {
-                std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
-                g_vrrWhitelistMatch.clear();
-            }
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
-                    SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
-                    ShowWindow(ctx.hwnd, SW_SHOWNA);
-                }
-            }
-            std::cout << "VRR whitelist: disabled, showing overlays" << std::endl;
-        }
-        return;
-    }
-
-    // Enumerate running processes
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    PROCESSENTRY32W pe32;
-    pe32.dwSize = sizeof(pe32);
-
-    bool found = false;
-    std::wstring matchedProcess;
-
-    // Helper: case-insensitive length-limited compare
-    auto matchesPattern = [](const wchar_t* str, size_t strLen, const std::wstring& pattern) -> bool {
-        size_t baseLen = strLen;
-        if (baseLen > 4 && _wcsnicmp(str + baseLen - 4, L".exe", 4) == 0) {
-            baseLen -= 4;
-        }
-        if (baseLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), baseLen) == 0) {
-            return true;
-        }
-        if (strLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), strLen) == 0) {
-            return true;
-        }
-        if (strLen == pattern.size() + 4 && _wcsnicmp(str, pattern.c_str(), pattern.size()) == 0 &&
-            _wcsnicmp(str + pattern.size(), L".exe", 4) == 0) {
-            return true;
-        }
-        return false;
-    };
-
-    if (Process32FirstW(snapshot, &pe32)) {
-        do {
-            const wchar_t* exeName = pe32.szExeFile;
-            size_t exeLen = wcslen(exeName);
-
-            for (const auto& pattern : localWhitelist) {
-                if (matchesPattern(exeName, exeLen, pattern)) {
-                    found = true;
-                    matchedProcess = pe32.szExeFile;
-                    break;
-                }
-            }
-            if (found) break;
-        } while (Process32NextW(snapshot, &pe32));
-    }
-
-    CloseHandle(snapshot);
-
-    // Update state based on result
-    bool wasActive = g_vrrWhitelistActive.load();
-    if (found) {
-        if (!wasActive) {
-            // Just detected whitelisted app - hide overlays
-            g_vrrWhitelistActive.store(true);
-            {
-                std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
-                g_vrrWhitelistMatch = matchedProcess;
-            }
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd) {
-                    ShowWindow(ctx.hwnd, SW_HIDE);
-                }
-            }
-            std::wcout << L"VRR whitelist: detected " << matchedProcess << L", hiding overlays" << std::endl;
-        }
-    } else {
-        if (wasActive) {
-            // Whitelisted app exited - show overlays again
-            g_vrrWhitelistActive.store(false);
-            std::wstring exitedProcess;
-            {
-                std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
-                exitedProcess = g_vrrWhitelistMatch;
-                g_vrrWhitelistMatch.clear();
-            }
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
-                    SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
-                    ShowWindow(ctx.hwnd, SW_SHOWNA);
-                }
-            }
-            std::wcout << L"VRR whitelist: " << exitedProcess << L" exited, showing overlays" << std::endl;
-        }
-    }
-}
-
-// Dedicated thread function for gamma whitelist polling
-// Runs every 500ms to avoid impacting frame timing
-static void GammaWhitelistThreadFunc() {
-    // Initial delay - let processing fully initialize before first check
-    // Matches the original 500ms delay from inline check timing
-    for (int i = 0; i < 10 && g_gammaWhitelistThreadRunning.load(); i++) {
-        Sleep(50);  // 500ms total, in chunks for responsive shutdown
-    }
-
-    while (g_gammaWhitelistThreadRunning.load()) {
-        CheckGammaWhitelist();
-        CheckVrrWhitelist();
-
-        // Sleep in small chunks to allow quick exit on shutdown
-        for (int i = 0; i < 10 && g_gammaWhitelistThreadRunning.load(); i++) {
-            Sleep(50);  // 10 x 50ms = 500ms total
-        }
-    }
-}
-
-void StartGammaWhitelistThread() {
-    if (g_gammaWhitelistThreadRunning.load()) return;  // Already running
-
-    g_gammaWhitelistThreadRunning.store(true);
-    g_gammaWhitelistThread = std::thread(GammaWhitelistThreadFunc);
-}
-
-void StopGammaWhitelistThread() {
-    if (!g_gammaWhitelistThreadRunning.load()) return;  // Not running
-
-    g_gammaWhitelistThreadRunning.store(false);
-    if (g_gammaWhitelistThread.joinable()) {
-        g_gammaWhitelistThread.join();
-    }
-
-    // Reset state when thread stops
-    g_gammaWhitelistActive.store(false);
-    g_gammaWhitelistUserOverride.store(false);
-    {
-        std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-        g_gammaWhitelistMatch.clear();
-        g_gammaWhitelistOverrideProcess.clear();
-    }
-
-    // Reset VRR whitelist state
-    g_vrrWhitelistActive.store(false);
-    {
-        std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
-        g_vrrWhitelistMatch.clear();
-    }
-}
+// ============================================================================
+// SECTION: Peak Detection Resources
+// ============================================================================
 
 // Create peak detection resources for dynamic tonemapping
 bool CreatePeakDetectionResources(MonitorContext* ctx) {
@@ -455,6 +117,10 @@ bool CreatePeakDetectionResources(MonitorContext* ctx) {
     return true;
 }
 
+// ============================================================================
+// SECTION: HDR Metadata
+// ============================================================================
+
 // Update HDR metadata on swapchain to tell Windows our content's peak brightness
 // This allows us to bypass Windows tonemapping by declaring our output peak
 void UpdateHDRMetadata(MonitorContext* ctx) {
@@ -501,6 +167,10 @@ void UpdateHDRMetadata(MonitorContext* ctx) {
     }
 }
 
+// ============================================================================
+// SECTION: Swapchain Management
+// ============================================================================
+
 bool CreateSwapChain(MonitorContext* ctx) {
     IDXGIDevice* dxgiDevice = nullptr;
     if (FAILED(g_device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) || !dxgiDevice) {
@@ -524,9 +194,9 @@ bool CreateSwapChain(MonitorContext* ctx) {
     }
 
     // Select format based on HDR state
-    // HDR: FP16 scRGB for linear HDR content
-    // SDR: R10G10B10A2 for 10-bit output (reduces banding after LUT)
-    ctx->swapchainFormat = ctx->isHDREnabled ?
+    // HDR / ACM: FP16 scRGB for linear content (ACM needs FP16 for transparent passthrough)
+    // SDR legacy: R10G10B10A2 for 10-bit output (reduces banding after LUT)
+    ctx->swapchainFormat = (ctx->isHDREnabled || ctx->isFP16SDR) ?
         DXGI_FORMAT_R16G16B16A16_FLOAT :
         DXGI_FORMAT_R10G10B10A2_UNORM;
 
@@ -561,9 +231,9 @@ bool CreateSwapChain(MonitorContext* ctx) {
     if (FAILED(hr)) return false;
 
     // Set color space based on HDR state
-    // HDR: scRGB linear (G10 = linear gamma, P709 = BT.709 primaries)
-    // SDR: sRGB (G22 = 2.2 gamma, P709 = BT.709 primaries)
-    ctx->colorSpace = ctx->isHDREnabled ?
+    // HDR / ACM: scRGB linear (G10 = linear gamma, P709 = BT.709 primaries)
+    // SDR legacy: sRGB (G22 = 2.2 gamma, P709 = BT.709 primaries)
+    ctx->colorSpace = (ctx->isHDREnabled || ctx->isFP16SDR) ?
         DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 :
         DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
@@ -571,8 +241,10 @@ bool CreateSwapChain(MonitorContext* ctx) {
     hr = ctx->swapchain->CheckColorSpaceSupport(ctx->colorSpace, &colorSpaceSupport);
     if (SUCCEEDED(hr) && (colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
         hr = ctx->swapchain->SetColorSpace1(ctx->colorSpace);
+        const char* csName = ctx->isHDREnabled ? "scRGB linear (HDR)" :
+                             ctx->isFP16SDR ? "scRGB linear (ACM SDR)" : "sRGB (SDR)";
         if (SUCCEEDED(hr)) {
-            std::cout << "Monitor " << ctx->index << " color space: " << (ctx->isHDREnabled ? "scRGB linear (HDR)" : "sRGB (SDR)") << std::endl;
+            std::cout << "Monitor " << ctx->index << " color space: " << csName << std::endl;
         }
     } else {
         std::cout << "Warning: Monitor " << ctx->index << " requested color space not supported" << std::endl;
@@ -604,6 +276,10 @@ bool CreateSwapChain(MonitorContext* ctx) {
 
     return true;
 }
+
+// ============================================================================
+// SECTION: DirectComposition
+// ============================================================================
 
 bool InitDirectCompositionDevice() {
     HRESULT hr = DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&g_dcompDevice));
@@ -733,6 +409,44 @@ bool RecreateSwapchain(MonitorContext* ctx) {
     return true;
 }
 
+// ============================================================================
+// SECTION: MHC Profile Mode Switch
+// ============================================================================
+
+// Reapply MHC ICC profiles after HDR/SDR mode switch
+// When HDR is toggled programmatically via DisplayConfigSetDeviceInfo, Windows changes
+// the display mode but doesn't refresh its color management pipeline. The previously
+// associated MHC profile for the new mode exists but isn't activated. A simple reassociate
+// is a no-op since Windows already considers it associated. Remove + re-add forces Windows
+// to reprocess the profile and apply it to the active pipeline.
+static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
+    if (ctx->index >= (int)g_gui.monitorSettings.size()) return;
+    const auto& ms = g_gui.monitorSettings[ctx->index];
+
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(ctx->index, displayInfo)) return;
+
+    // Remove + re-add profile for current mode to force Windows to apply it
+    const auto& mhc = ctx->isHDREnabled ? ms.hdrMHC : ms.sdrMHC;
+    if (mhc.enabled && !mhc.profileName.empty()) {
+        std::wcout << L"Mode switch: reapplying " << (ctx->isHDREnabled ? L"HDR" : L"SDR")
+                   << L" MHC profile '" << mhc.profileName
+                   << L"' for monitor " << ctx->index << std::endl;
+        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
+        ReassociateMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
+    }
+
+    // Update MHC flags to match current settings
+    ctx->sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.primariesEnabled;
+    ctx->sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.grayscale.enabled;
+    ctx->hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.primariesEnabled;
+    ctx->hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.grayscale.enabled;
+}
+
+// ============================================================================
+// SECTION: Render Monitor
+// ============================================================================
+
 void RenderMonitor(MonitorContext* ctx) {
     // Entry validation - skip if monitor is disabled
     if (!ctx || !ctx->enabled) return;
@@ -859,6 +573,9 @@ void RenderMonitor(MonitorContext* ctx) {
                 // Reapply MaxTML settings (may be lost after HDR mode change)
                 ApplyMaxTmlSettings();
             }
+            // Always reapply MHC profiles after duplication reinit — covers both mode
+            // changes and cases where duplication was lost/recovered without mode change
+            ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
         }
         return;
@@ -911,6 +628,8 @@ void RenderMonitor(MonitorContext* ctx) {
             ctx->usePassthrough = !hasApplicableLUT;
             RecreateSwapchain(ctx);
             ApplyMaxTmlSettings();
+            // Always reapply MHC ICC profiles after duplication reinit
+            ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
             std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
         }
@@ -935,7 +654,17 @@ void RenderMonitor(MonitorContext* ctx) {
         return;
     }
 
-    // Update constant buffer with current HDR state, gamma mode, and manual corrections
+    // Check if atomic toggles changed → mark constant buffer dirty
+    bool curGamma = g_desktopGammaMode.load();
+    bool curTetrahedral = g_tetrahedralInterp.load();
+    if (curGamma != ctx->lastDesktopGamma || curTetrahedral != ctx->lastTetrahedralInterp) {
+        ctx->cbDirty = true;
+        ctx->lastDesktopGamma = curGamma;
+        ctx->lastTetrahedralInterp = curTetrahedral;
+    }
+
+    // Update constant buffer only when dirty (avoids Map/Unmap overhead on static frames)
+    if (ctx->cbDirty) {
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = g_context->Map(g_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
@@ -951,43 +680,54 @@ void RenderMonitor(MonitorContext* ctx) {
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
         const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
-        cbData[7] = (cc.primariesEnabled || cc.grayscale.enabled) ? 1.0f : 0.0f;  // useManualCorrection
+        // MHC primaries and shader primaries are independent layers:
+        // MHC = base calibration at GPU scanout (yearly), shader = fine-tuning on top (anytime)
+        // Same principle as grayscale: both layers can be active simultaneously
+        bool shaderPrimaries = cc.primariesEnabled;  // White point correction (primaries gamut mapping is MHC-only)
+        bool shaderGrayscale = cc.grayscale.enabled;
+        // White balance gains only apply when explicitly enabled — prevents leftover
+        // non-D65 values in INI from silently shifting white point when corrections are off
+        bool shaderWhiteBalance = cc.primariesEnabled &&
+            (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
+        cbData[7] = (shaderPrimaries || shaderGrayscale || shaderWhiteBalance) ? 1.0f : 0.0f;  // useManualCorrection
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
-        cbData[9] = cc.grayscale.enabled ? 1.0f : 0.0f;
+        cbData[9] = shaderGrayscale ? 1.0f : 0.0f;
         cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled) ? 1.0f : 0.0f;  // tonemapEnabled
         cbData[11] = (float)static_cast<int>(cc.tonemap.curve);  // tonemapCurve
-        // Row 3-5: Primaries matrix (3 rows as float4, w unused)
+        // Row 3-5: Primaries matrix (xyz) + white balance gains (w)
         cbData[12] = cc.primariesMatrix[0];
         cbData[13] = cc.primariesMatrix[1];
         cbData[14] = cc.primariesMatrix[2];
-        cbData[15] = 0.0f;
+        cbData[15] = cc.whiteBalanceGains[0];  // R gain
         cbData[16] = cc.primariesMatrix[3];
         cbData[17] = cc.primariesMatrix[4];
         cbData[18] = cc.primariesMatrix[5];
-        cbData[19] = 0.0f;
+        cbData[19] = cc.whiteBalanceGains[1];  // G gain
         cbData[20] = cc.primariesMatrix[6];
         cbData[21] = cc.primariesMatrix[7];
         cbData[22] = cc.primariesMatrix[8];
-        cbData[23] = 0.0f;
+        cbData[23] = cc.whiteBalanceGains[2];  // B gain
         // Row 6: Tonemapping parameters
         cbData[24] = cc.tonemap.sourcePeakNits;  // tonemapSourcePeak
         cbData[25] = cc.tonemap.targetPeakNits;
         cbData[26] = cc.tonemap.dynamicPeak ? 1.0f : 0.0f;  // tonemapDynamic
-        cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24 (SDR 2.2->2.4 transform)
-        // Row 7: Grayscale peak + padding (white balance now handled by Bradford in primaries matrix)
+        cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24
+        // Row 7: Grayscale peak + ACM flag
         cbData[28] = cc.grayscale.peakNits;  // grayscalePeakNits (HDR only)
-        cbData[29] = 0.0f;  // padding
-        cbData[30] = 0.0f;  // padding
-        cbData[31] = 0.0f;  // padding
+        cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
+        cbData[30] = LinearToPQScalar(cc.tonemap.targetPeakNits / 10000.0f);  // pqTargetPeak (precomputed)
+        cbData[31] = LinearToPQScalar((std::max)(cc.grayscale.peakNits, 1.0f) / 10000.0f);  // pqGrayscalePeak (precomputed)
         // Row 8-15: Grayscale LUT (32 points packed into 8 float4s)
         for (int i = 0; i < 32; i++) {
-            cbData[32 + i] = (i < cc.grayscale.pointCount)
+            cbData[32 + i] = (i < cc.grayscale.pointCount && i < 32)
                 ? cc.grayscale.points[i]
                 : ((float)i / 31.0f);  // Linear fallback
         }
         g_context->Unmap(g_constantBuffer, 0);
     }
+    ctx->cbDirty = false;
+    } // end if cbDirty
 
     // Select the appropriate LUT based on HDR mode (no fallback - SDR/HDR LUTs are incompatible)
     // If no applicable LUT, usePassthrough is true and shader skips LUT sampling
@@ -1170,6 +910,10 @@ void RenderMonitor(MonitorContext* ctx) {
     }
 }
 
+// ============================================================================
+// SECTION: Render Loop
+// ============================================================================
+
 void RenderAll() {
     int activeCount = 0;
 
@@ -1237,11 +981,14 @@ void RenderAll() {
                 ctx.duplication = nullptr;
             }
             ctx.consecutiveFailures = 0;  // Reset backoff
+            ctx.cbDirty = true;           // Force constant buffer refresh
         }
         // Reset watchdog to avoid timeout during recovery
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Reapply MaxTML settings (may be lost after sleep/wake)
         ApplyMaxTmlSettings();
+        // Reapply MHC profiles (may be silently dropped after sleep/wake)
+        ReapplyAllMhcProfiles();
         // Force TOPMOST reassert after wake (z-order most likely disrupted)
         g_forceTopmostReassert.store(true);
     }
@@ -1250,7 +997,7 @@ void RenderAll() {
     static auto lastTopmost = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     bool forceReassert = g_forceTopmostReassert.exchange(false);
-    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 2000) {
+    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 10000) {
         for (auto& ctx : g_monitors) {
             if (ctx.hwnd) {
                 SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -1272,15 +1019,38 @@ void RenderAll() {
     if (g_hasPendingColorCorrections.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
         for (const auto& update : g_pendingColorCorrections) {
-            if (update.monitorIndex >= 0 && update.monitorIndex < (int)g_monitors.size()) {
-                auto& ctx = g_monitors[update.monitorIndex];
-                if (update.isHDR) {
-                    ctx.hdrColorCorrection = update.data;
-                    // HDR metadata (MaxCLL=10000) is set once at swapchain creation
-                    // and doesn't change based on color correction settings
-                } else {
-                    ctx.sdrColorCorrection = update.data;
+            bool matched = false;
+            // Match by ctx.index (GUI monitor index), not vector position
+            for (auto& ctx : g_monitors) {
+                if (ctx.index == update.monitorIndex) {
+                    if (update.isHDR) {
+                        ctx.hdrColorCorrection = update.data;
+                    } else {
+                        ctx.sdrColorCorrection = update.data;
+                    }
+                    // MHC live preview: clear active flags so diagnostics reflect preview state
+                    if (update.clearMhcFlags) {
+                        ctx.sdrMhcPrimariesActive = false;
+                        ctx.sdrMhcGrayscaleActive = false;
+                        ctx.hdrMhcPrimariesActive = false;
+                        ctx.hdrMhcGrayscaleActive = false;
+                    }
+                    ctx.cbDirty = true;
+                    std::cout << "[Render] Applied CC: mon=" << ctx.index
+                              << " isHDR=" << update.isHDR
+                              << " mhcPrim=" << (ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive : ctx.sdrMhcPrimariesActive)
+                              << " primEn=" << update.data.primariesEnabled
+                              << " gsEn=" << update.data.grayscale.enabled
+                              << " gsPts=" << update.data.grayscale.pointCount
+                              << " clearMhc=" << update.clearMhcFlags
+                              << std::endl;
+                    matched = true;
+                    break;
                 }
+            }
+            if (!matched) {
+                std::cout << "[Render] DROPPED CC: mon=" << update.monitorIndex
+                          << " (no matching ctx, g_monitors.size=" << g_monitors.size() << ")" << std::endl;
             }
         }
         g_pendingColorCorrections.clear();
@@ -1299,6 +1069,10 @@ void RenderAll() {
         g_running = false;
     }
 }
+
+// ============================================================================
+// SECTION: Overlay Window Procedure
+// ============================================================================
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -1357,12 +1131,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (wParam == HOTKEY_HDR_TOGGLE) {
             // Win+Shift+H - toggle HDR on focused monitor
-            ToggleHdrOnFocusedMonitor();
+            if (ToggleHdrOnFocusedMonitor()) {
+                // On ACM displays, HDR→SDR keeps FP16 format so format-change detection
+                // doesn't fire. Schedule a delayed reinit to re-detect HDR state after
+                // Windows completes the transition (no render thread blocking).
+                SetTimer(hwnd, HDR_REINIT_TIMER_ID, HDR_REINIT_DELAY_MS, nullptr);
+            }
         }
         return 0;
     case WM_TIMER:
+        if (wParam == HDR_REINIT_TIMER_ID) {
+            KillTimer(hwnd, HDR_REINIT_TIMER_ID);
+            // Release duplication so render loop re-detects HDR state and reapplies MHC profiles
+            for (auto& ctx : g_monitors) {
+                if (ctx.duplication) {
+                    ctx.duplication->Release();
+                    ctx.duplication = nullptr;
+                }
+                ctx.consecutiveFailures = 0;
+            }
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return 0;
+        }
         HideOSD();
         return 0;
+    case WM_WINDOWPOSCHANGING: {
+        // If another window is changing our z-order, trigger TOPMOST reassertion
+        WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (wp && !(wp->flags & SWP_NOZORDER)) {
+            g_forceTopmostReassert.store(true);
+        }
+        break;
+    }
     case WM_POWERBROADCAST:
         // Handle power events for sleep/wake recovery
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {

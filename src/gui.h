@@ -5,6 +5,9 @@
 
 #include <windows.h>
 #include "types.h"
+#include "gui_shared.h"
+#include "gui_mhc.h"
+#include "gui_whitelist.h"
 
 // Update GUI state (enable/disable controls)
 void UpdateGUIState();
@@ -14,6 +17,9 @@ void SetStatus(const wchar_t* text);
 
 // Browse for LUT file
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize);
+
+// Update color correction controls for current monitor
+void UpdateColorCorrectionControls();
 
 // Startup registry functions
 bool IsStartupEnabled();
@@ -26,11 +32,8 @@ void RemoveTrayIcon();
 void ShowTrayMenu(HWND hwnd);
 
 // Grayscale editor
-void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR);
-LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-
-// Gamma whitelist dialog
-void ShowGammaWhitelistDialog(HWND hwndParent);
+void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR,
+                         std::function<void()> liveUpdateCallback = nullptr);
 
 // Main GUI window procedure
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

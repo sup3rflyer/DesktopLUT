@@ -26,6 +26,14 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
                                   ColorCorrectionSettings& cc, const wchar_t* iniPath);
 
+// Save MHC settings with a prefix (SDR_ or HDR_)
+void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
+                      const MHCSettings& mhc, const wchar_t* iniPath);
+
+// Load MHC settings with a prefix (SDR_ or HDR_)
+void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
+                      MHCSettings& mhc, const wchar_t* iniPath);
+
 // Save all settings to INI file
 void SaveSettings();
 

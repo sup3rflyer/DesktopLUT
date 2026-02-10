@@ -94,6 +94,7 @@ bool EnumerateDisplaysForMaxTml(std::vector<DisplayInfo>& displays) {
         info.devicePath = targetName.monitorDevicePath;
         info.adapterId = path.targetInfo.adapterId;
         info.targetId = path.targetInfo.id;
+        info.sourceId = path.sourceInfo.id;
         info.currentMaxTml = 0.0f;  // Can't easily read current value
         info.isHdrCapable = isHdrCapable;
 
@@ -161,18 +162,85 @@ bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo) {
     return false;
 }
 
+bool QueryFreshOutputDesc(HMONITOR hMonitor, DXGI_OUTPUT_DESC1& outDesc) {
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+
+    bool found = false;
+    IDXGIAdapter* adapter = nullptr;
+    for (UINT a = 0; !found && factory->EnumAdapters(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+        IDXGIOutput* output = nullptr;
+        for (UINT o = 0; !found && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
+            DXGI_OUTPUT_DESC desc;
+            output->GetDesc(&desc);
+            if (desc.Monitor == hMonitor) {
+                IDXGIOutput6* output6 = nullptr;
+                if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output6)))) {
+                    if (SUCCEEDED(output6->GetDesc1(&outDesc))) {
+                        found = true;
+                    }
+                    output6->Release();
+                }
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+}
+
 bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled) {
+    // Use fresh DXGI factory to check actual display color space.
+    // DISPLAYCONFIG advancedColorEnabled is true for both HDR and ACM,
+    // so we can't use it to distinguish HDR from ACM.
+    // DXGI ColorSpace is G2084_P2020 only when actual HDR mode is active.
+
+    // We need HMONITOR to match DXGI outputs - find it via display position
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+        return false;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
+        &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
+        return false;
+
+    for (UINT32 i = 0; i < pathCount; i++) {
+        const auto& path = paths[i];
+        if (path.targetInfo.adapterId.LowPart == display.adapterId.LowPart &&
+            path.targetInfo.adapterId.HighPart == display.adapterId.HighPart &&
+            path.targetInfo.id == display.targetId) {
+            // Found matching path - get source position to find HMONITOR
+            if (path.sourceInfo.modeInfoIdx < modeCount) {
+                const auto& mode = modes[path.sourceInfo.modeInfoIdx];
+                if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+                    POINT pt = { mode.sourceMode.position.x, mode.sourceMode.position.y };
+                    HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+                    if (hMonitor) {
+                        DXGI_OUTPUT_DESC1 desc1;
+                        if (QueryFreshOutputDesc(hMonitor, desc1)) {
+                            outEnabled = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                            return true;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // Fallback: use DISPLAYCONFIG (may be wrong with ACM)
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO colorInfo = {};
     colorInfo.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
     colorInfo.header.size = sizeof(colorInfo);
     colorInfo.header.adapterId = display.adapterId;
     colorInfo.header.id = display.targetId;
 
-    if (DisplayConfigGetDeviceInfo(&colorInfo.header) != ERROR_SUCCESS) {
+    if (DisplayConfigGetDeviceInfo(&colorInfo.header) != ERROR_SUCCESS)
         return false;
-    }
 
-    // Bit 0 = advancedColorSupported, Bit 1 = advancedColorEnabled
     outEnabled = (colorInfo.value & 0x2) != 0;
     return true;
 }

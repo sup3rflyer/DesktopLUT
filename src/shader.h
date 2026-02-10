@@ -44,9 +44,9 @@ cbuffer LUTParams : register(b0) {
     float tonemapDynamic;
     float grayscale24;     // SDR: apply 2.2->2.4 gamma transform (0 or 1)
     float grayscalePeakNits;   // HDR grayscale peak - must match ColourSpace target peak
-    float _padding;            // Padding for alignment (was whiteBalanceGains, now in primaries matrix via Bradford)
-    float _padding2;
-    float _padding3;
+    float isFP16SDR;           // ACM: FP16 capture with SDR color space (input is linear scRGB)
+    float pqTargetPeak;        // Precomputed PQ of tonemapTargetPeak (avoids per-pixel pow())
+    float pqGrayscalePeak;     // Precomputed PQ of grayscalePeakNits (avoids per-pixel pow())
     float4 grayscale[8];
 };
 
@@ -61,11 +61,27 @@ SamplerState wrapSampler : register(s2);
 float3 ApplyPrimariesMatrix(float3 rgb) {
     if (useManualCorrection < 0.5) return rgb;
     float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-    return mul(mat, rgb);
+    float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+    return mul(mat, rgb) * wbGains;
 }
 )"
-// Part 2: SDR Grayscale correction functions
+// Part 2: SDR transfer functions and grayscale correction
 R"(
+// sRGB transfer functions (IEC 61966-2-1)
+// Used by ACM SDR path to match Legacy SDR's native sRGB encoding
+float sRGB_OETF(float L) {
+    return (L <= 0.0031308f) ? (12.92f * L) : (1.055f * pow(L, 1.0f / 2.4f) - 0.055f);
+}
+float sRGB_EOTF(float V) {
+    return (V <= 0.04045f) ? (V / 12.92f) : pow((V + 0.055f) / 1.055f, 2.4f);
+}
+float3 sRGB_OETF3(float3 rgb) {
+    return float3(sRGB_OETF(rgb.r), sRGB_OETF(rgb.g), sRGB_OETF(rgb.b));
+}
+float3 sRGB_EOTF3(float3 rgb) {
+    return float3(sRGB_EOTF(rgb.r), sRGB_EOTF(rgb.g), sRGB_EOTF(rgb.b));
+}
+
 // SDR 2.2->2.4 gamma transform (independent of grayscale correction)
 // For BT.1886 displays that use 2.4 gamma instead of 2.2
 float3 Apply24Gamma(float3 rgb) {
@@ -80,11 +96,12 @@ float3 Apply24Gamma(float3 rgb) {
 // SDR grayscale: sqrt distribution in linear space
 float3 ApplyGrayscaleCorrection(float3 rgb) {
     if (grayscaleEnabled < 0.5) return rgb;
+    float pointCount = max(2.0f, grayscalePoints);
     float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
     // sqrt distribution: index = sqrt(Y) * (N-1), curve stores Y values
-    float idx = sqrt(saturate(Y)) * (grayscalePoints - 1.0f);
+    float idx = sqrt(saturate(Y)) * (pointCount - 1.0f);
     int i0 = (int)floor(idx);
-    int i1 = min(i0 + 1, (int)grayscalePoints - 1);
+    int i1 = min(i0 + 1, (int)pointCount - 1);
     float v0 = grayscale[i0 / 4][i0 % 4];
     float v1 = grayscale[i1 / 4][i1 % 4];
     float t = idx - floor(idx);
@@ -359,23 +376,24 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     // If content already fits display, no tonemapping needed
     if (sourcePeakNits <= tonemapTargetPeak) return ictcp;
 
-    // Convert peaks to PQ domain (2 pow() ops total - much better than 4)
+    // Source peak varies (dynamic detection) - must compute per-pixel
+    // Target peak is precomputed in constant buffer (pqTargetPeak)
     float pqSourcePeak = Linear_to_PQ_scalar(sourcePeakNits / 10000.0f);
-    float pqTargetPeak = Linear_to_PQ_scalar(tonemapTargetPeak / 10000.0f);
+    float pqTgtPeak = pqTargetPeak;  // Precomputed from CPU
 
     // Apply PQ-native curve directly on I channel
     float I_mapped;
     if (tonemapCurve < 0.5f) {
         // BT.2390 EETF - spec-native PQ implementation (ITU-R BT.2390)
-        I_mapped = TonemapBT2390_PQ(I, pqSourcePeak, pqTargetPeak);
+        I_mapped = TonemapBT2390_PQ(I, pqSourcePeak, pqTgtPeak);
     }
     else if (tonemapCurve < 1.5f) {
         // Soft clip - PQ native
-        I_mapped = TonemapSoftClip_PQ(I, pqSourcePeak, pqTargetPeak, tonemapTargetPeak);
+        I_mapped = TonemapSoftClip_PQ(I, pqSourcePeak, pqTgtPeak, tonemapTargetPeak);
     }
     else if (tonemapCurve < 2.5f) {
         // Reinhard - PQ native
-        I_mapped = TonemapReinhard_PQ(I, pqSourcePeak, pqTargetPeak, tonemapTargetPeak);
+        I_mapped = TonemapReinhard_PQ(I, pqSourcePeak, pqTgtPeak, tonemapTargetPeak);
     }
     else if (tonemapCurve < 3.5f) {
         // BT.2446A - linear-space (complex gamma operations don't translate to PQ)
@@ -387,7 +405,7 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     }
     else {
         // Hard clip - trivial PQ native
-        I_mapped = TonemapHardClip_PQ(I, pqTargetPeak);
+        I_mapped = TonemapHardClip_PQ(I, pqTgtPeak);
     }
 
     // Return with CT/CP unchanged - hue and saturation preserved!
@@ -399,13 +417,13 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 // Much more accurate than the old max-channel approximation
 float3 ApplyGrayscaleICtCp(float3 ictcp) {
     if (grayscaleEnabled < 0.5f) return ictcp;
+    float pointCount = max(2.0f, grayscalePoints);
 
     float I = ictcp.x;
     if (I < 1e-6f) return ictcp;
 
-    // Convert grayscalePeakNits to PQ value for scaling
-    // Guard against zero/negative peak (would cause division by zero)
-    float pqPeak = Linear_to_PQ_scalar(max(grayscalePeakNits, 1.0f) / 10000.0f);
+    // Use precomputed PQ peak from constant buffer (avoids per-pixel pow() calls)
+    float pqPeak = pqGrayscalePeak;
 
     float scaledI = I / pqPeak;
     float correctedI;
@@ -413,16 +431,16 @@ float3 ApplyGrayscaleICtCp(float3 ictcp) {
     if (scaledI <= 1.0f) {
         // Within calibration range - linear interpolation
         // No undulations, kinks imperceptible in practice
-        float idx = scaledI * (grayscalePoints - 1.0f);
+        float idx = scaledI * (pointCount - 1.0f);
         int i0 = (int)floor(idx);
-        int i1 = min(i0 + 1, (int)grayscalePoints - 1);
+        int i1 = min(i0 + 1, (int)pointCount - 1);
         float t = idx - floor(idx);
         float v0 = grayscale[i0 / 4][i0 % 4];
         float v1 = grayscale[i1 / 4][i1 % 4];
         correctedI = lerp(v0, v1, t) * pqPeak;
     } else {
         // Above peak - apply same correction factor as last point
-        int lastIdx = (int)grayscalePoints - 1;
+        int lastIdx = (int)pointCount - 1;
         float lastCurveValue = grayscale[lastIdx / 4][lastIdx % 4];
         correctedI = lastCurveValue * I;
     }
@@ -548,7 +566,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // ═══════════════════════════════════════════════════════════════════════
 
         // Primaries correction: adjusts for display's actual vs ideal primaries
-        // Includes Bradford chromatic adaptation for white point correction
+        // Pure gamut mapping (no chromatic adaptation - white point shift via separate gains)
         rec2020 = ApplyPrimariesMatrix(rec2020);
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -627,30 +645,57 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     }
 )"
 // Part 6: Main function - SDR path
+// ACM (FP16 scRGB): linear input → primaries in linear → encode gamma → gamma ops → decode linear
+// Legacy (B8G8R8A8): gamma input → primaries (decode/encode) → gamma ops → gamma output
+// Both share gamma-space operations (grayscale, 2.4 gamma, LUT). No unnecessary roundtrips.
 R"(
     else {
         float3 input = color.rgb;
-        // Primaries matrix operates in linear space
-        // Decode/encode both use 2.2 to match display reality (no gamma curve change)
-        if (useManualCorrection > 0.5) {
-            // Decode with gamma 2.2 (matching display's actual EOTF)
-            float3 lin = pow(max(input, 0.0), 2.2);
-            // Apply primaries matrix in linear space
-            // Includes Bradford chromatic adaptation for white point correction
-            float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-            lin = mul(mat, lin);
-            // Clamp to avoid negative values from out-of-gamut colors
-            lin = max(lin, 0.0);
-            // Encode with gamma 2.2 (same as decode = no gamma change)
-            input = pow(lin, 1.0 / 2.2);
-            // Clamp to valid range after matrix
-            input = saturate(input);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 1-2: Input handling + primaries (mode-dependent)
+        // ═══════════════════════════════════════════════════════════════════════
+        if (isFP16SDR > 0.5) {
+            // ACM: input is linear scRGB - primaries + white balance in native linear
+            if (useManualCorrection > 0.5) {
+                float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
+                float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+                input = max(mul(mat, input) * wbGains, 0.0);
+            }
+            // Encode to sRGB for shared gamma-space operations
+            // Using proper sRGB OETF (not gamma 2.2) so control points match
+            // Legacy SDR's native sRGB encoding — labels are correct for both paths
+            input = saturate(sRGB_OETF3(max(input, 0.0)));
+        } else {
+            // Legacy: input is sRGB-encoded from framebuffer
+            if (useManualCorrection > 0.5) {
+                float3 lin = sRGB_EOTF3(max(input, 0.0));
+                float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
+                float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+                lin = max(mul(mat, lin) * wbGains, 0.0);
+                input = saturate(sRGB_OETF3(lin));
+            }
         }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 3: Gamma-space corrections (shared by ACM and legacy)
+        // ═══════════════════════════════════════════════════════════════════════
         input = ApplyGrayscaleCorrection(input);
         input = Apply24Gamma(input);
+
         float3 corrected;
         if (usePassthrough > 0.5) corrected = input;
         else corrected = SampleLUT(input);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 4: Output conversion
+        // ═══════════════════════════════════════════════════════════════════════
+        if (isFP16SDR > 0.5) {
+            // ACM: FP16 swapchain expects linear - sRGB decode
+            corrected = sRGB_EOTF3(max(corrected, 0.0));
+        }
+        // Legacy: R10G10B10A2 + G22 swapchain - already sRGB-encoded
+
         // Dithering
         float2 noiseUV = pos.xy / 64.0;
         float noise = blueNoiseTexture.Sample(wrapSampler, noiseUV);
