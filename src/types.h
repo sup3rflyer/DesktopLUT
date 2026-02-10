@@ -306,6 +306,7 @@ struct MonitorContext {
     IDXGISwapChain4* swapchain = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     ID3D11ShaderResourceView* captureSRV = nullptr;
+    ID3D11Texture2D* lastCaptureTexture = nullptr;  // Weak ref for SRV cache (not AddRef'd)
     DXGI_FORMAT swapchainFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
     DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
@@ -326,6 +327,8 @@ struct MonitorContext {
     ID3D11UnorderedAccessView* peakUAV = nullptr;     // UAV for compute shader write
     ID3D11ShaderResourceView* peakSRV = nullptr;      // SRV for pixel shader read
     ID3D11Texture2D* peakStagingTexture = nullptr;    // Staging texture for CPU readback
+    ID3D11Texture2D* peakStagingTexture2 = nullptr;  // Second staging for double-buffered readback
+    int peakStagingReadIndex = 0;                     // Alternates 0/1 for deferred readback
     int lastPeakCBWidth = 0;                          // Track last written dimensions to avoid redundant CB updates
     int lastPeakCBHeight = 0;
     float detectedPeakNits = 0.0f;                    // Last detected peak (for analysis overlay)
@@ -357,6 +360,8 @@ struct MonitorContext {
     // Per-monitor error tracking
     bool enabled = true;           // false = skip in render loop
     int consecutiveFailures = 0;   // track failures for retry logic
+    std::chrono::steady_clock::time_point lastRecoveryAttempt{};  // Non-blocking recovery timing
+    int recoveryBackoffMs = 0;     // Current backoff in ms (0 = no pending recovery)
     bool usePassthrough = false;   // true = no LUT applied (no applicable LUT for current mode)
     bool dcompCommitted = false;   // true after first frame rendered (prevents black flash)
     int framesAfterCommit = 0;     // frames rendered since dcompCommitted, for visibility delay

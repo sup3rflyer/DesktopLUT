@@ -453,32 +453,46 @@ void RenderMonitor(MonitorContext* ctx) {
     // Entry validation - skip if monitor is disabled
     if (!ctx || !ctx->enabled) return;
 
-    // If resources are missing (failed reinit), try to recover with backoff
+    // If resources are missing (failed reinit), try to recover with non-blocking backoff.
+    // No Sleep() — returns immediately so other monitors keep rendering at full frame rate.
     if (!ctx->duplication) {
-        // If display is off, don't retry - wait for wake signal
         if (g_displayOff.load()) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-            Sleep(100);  // Minimal CPU usage while waiting
             return;
         }
 
+        // Non-blocking backoff: skip this monitor until enough time has passed
+        auto now = std::chrono::steady_clock::now();
+        if (ctx->recoveryBackoffMs > 0) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->lastRecoveryAttempt);
+            if (elapsed.count() < ctx->recoveryBackoffMs)
+                return;  // Not time yet — skip, don't block
+        }
+
+        ctx->lastRecoveryAttempt = now;
         ctx->consecutiveFailures++;
-        // Fast initial retry (50ms), exponential backoff to 5s for prolonged failures
-        int backoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
-        Sleep(backoffMs);
+        ctx->recoveryBackoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
 
         if (ctx->consecutiveFailures % 10 == 0) {
             std::cout << "Monitor " << ctx->index << " attempting recovery, attempt "
                       << ctx->consecutiveFailures << "..." << std::endl;
         }
 
-        // Reset watchdog - we're actively trying to recover, not stuck
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
-        if (InitDesktopDuplication(ctx)) {
-            std::cout << "Monitor " << ctx->index << " recovery success" << std::endl;
+        if (ReinitDesktopDuplication(ctx)) {
+            std::cout << "Monitor " << ctx->index << " reinit success" << std::endl;
             ctx->consecutiveFailures = 0;
-            // Window will be shown after first successful frame render
+            ctx->recoveryBackoffMs = 0;
+            ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache after reinit
+            // ReinitDesktopDuplication handles HDR change + swapchain recreation internally.
+            // Apply additional mode-switch steps not covered by reinit:
+            if (ctx->isHDREnabled != ctx->wasHDREnabled) {
+                ApplyMaxTmlSettings();
+                ctx->cbDirty = true;
+            }
+            ReapplyMhcProfilesOnModeSwitch(ctx);
+            ctx->wasHDREnabled = ctx->isHDREnabled;
         }
         return;
     }
@@ -486,22 +500,24 @@ void RenderMonitor(MonitorContext* ctx) {
     if (!ctx->swapchain || !ctx->rtv) return;
 
     // Acquire next frame from desktop duplication
-    // First try with 0 timeout for immediate response to desktop changes (menus, etc.)
-    // If no frame ready, use DwmFlush for pacing then wait with normal timeout
+    // Always sync to compositor FIRST for consistent frame pacing. This prevents
+    // jitter at transitions (e.g., mouse start/stop moving) by ensuring all frames
+    // are compositor-aligned regardless of whether Desktop Duplication has a frame
+    // ready immediately or not.
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
     bool frameAcquired = false;
 
+    if (g_pfnWaitForCompositorClock) {
+        g_pfnWaitForCompositorClock(0, nullptr, ctx->frameTimeMs);
+    } else {
+        DwmFlush();
+    }
+
+    // After compositor sync, grab whatever frame is available now
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // No frame immediately available - sync to compositor
-        if (g_pfnWaitForCompositorClock) {
-            // Compositor Clock: VRR-aware timing (Windows 10 1903+)
-            g_pfnWaitForCompositorClock(0, nullptr, ctx->frameTimeMs);
-        } else {
-            // Fallback: DwmFlush (not VRR-aware but widely compatible)
-            DwmFlush();
-        }
+        // No frame ready after sync — wait for next desktop change
         hr = ctx->duplication->AcquireNextFrame(ctx->frameTimeMs, &frameInfo, &desktopResource);
     }
 
@@ -513,7 +529,8 @@ void RenderMonitor(MonitorContext* ctx) {
         // Still need to handle initial visibility even without new frames
         // (window waits to be shown after DirectComposition commit)
         // Skip if VRR whitelist is hiding overlays (passthrough mode)
-        if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd) && !g_vrrWhitelistActive.load()) {
+        if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)
+            && !g_vrrWhitelistActive.load() && !g_overlayAutoSleep.load()) {
             ctx->framesAfterCommit++;
             if (ctx->framesAfterCommit >= 1) {
                 SetLayeredWindowAttributes(ctx->hwnd, 0, 255, LWA_ALPHA);
@@ -522,70 +539,48 @@ void RenderMonitor(MonitorContext* ctx) {
         }
         return;
     } else if (hr == DXGI_ERROR_ACCESS_LOST || FAILED(hr)) {
-        // Desktop duplication lost or other error - hide overlay and release duplication
+        // Desktop duplication lost — hide overlay, release, set up non-blocking recovery.
+        // NO Sleep() here: return immediately so other monitors keep rendering.
+        // Recovery will be attempted on next RenderMonitor call via the !ctx->duplication path.
         if (ctx->hwnd && IsWindowVisible(ctx->hwnd)) {
             ShowWindow(ctx->hwnd, SW_HIDE);
         }
-
-        // Release duplication interface so forceReinit can recreate it cleanly
         if (ctx->duplication) {
             ctx->duplication->Release();
             ctx->duplication = nullptr;
         }
+        ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache
 
-        // If display is off, don't retry - wait for wake signal to trigger forceReinit
         if (g_displayOff.load()) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-            ctx->consecutiveFailures = 0;  // Will start fresh on wake
+            ctx->consecutiveFailures = 0;
             return;
         }
 
         ctx->consecutiveFailures++;
+        ctx->recoveryBackoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
+        ctx->lastRecoveryAttempt = std::chrono::steady_clock::now();
 
-        // Exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, max 5s
-        // Fast initial retry for transient issues, backs off for secure desktop (UAC) recovery
-        int backoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
-        Sleep(backoffMs);
-
-        // Log occasionally (not every attempt)
         if (ctx->consecutiveFailures == 1 || ctx->consecutiveFailures % 10 == 0) {
             std::cout << "Monitor " << ctx->index << " duplication lost (0x" << std::hex << hr << std::dec
                       << "), attempt " << ctx->consecutiveFailures << "..." << std::endl;
         }
 
-        // Reset watchdog - we're actively trying to recover, not stuck
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-
-        // Try to reinit - never give up, secure desktop can take a while
-        if (ReinitDesktopDuplication(ctx)) {
-            std::cout << "Monitor " << ctx->index << " reinit success" << std::endl;
-            ctx->consecutiveFailures = 0;
-
-            if (ctx->isHDREnabled != ctx->wasHDREnabled) {
-                // Passthrough if no applicable LUT for current mode:
-                // - SDR mode: need SDR LUT (SDR LUTs expect sRGB input)
-                // - HDR mode: need HDR LUT (HDR LUTs expect PQ Rec.2020 input)
-                // No fallback - SDR and HDR LUTs are incompatible
-                bool hasApplicableLUT = ctx->isHDREnabled
-                    ? (ctx->lutSRV_HDR != nullptr)
-                    : (ctx->lutSRV_SDR != nullptr);
-                ctx->usePassthrough = !hasApplicableLUT;
-                // RecreateSwapchain sets HDR metadata via CreateSwapChain -> UpdateHDRMetadata
-                RecreateSwapchain(ctx);
-                // Reapply MaxTML settings (may be lost after HDR mode change)
-                ApplyMaxTmlSettings();
-                // Constant buffer must be refreshed with new HDR state, color corrections, etc.
-                ctx->cbDirty = true;
-            }
-            // Always reapply MHC profiles after duplication reinit — covers both mode
-            // changes and cases where duplication was lost/recovered without mode change
-            ReapplyMhcProfilesOnModeSwitch(ctx);
-            ctx->wasHDREnabled = ctx->isHDREnabled;
-        }
         return;
     }
 
     frameAcquired = true;
+
+    // Skip mouse-only frames (no desktop pixels changed, just cursor position update).
+    // Desktop Duplication delivers a frame for every cursor update even when no desktop
+    // pixels changed. No additional sync needed — next iteration starts with compositor sync.
+    if (frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0) {
+        desktopResource->Release();
+        ctx->duplication->ReleaseFrame();
+        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+        return;
+    }
 
     // Reset consecutive failures on successful frame acquisition
     ctx->consecutiveFailures = 0;
@@ -619,11 +614,11 @@ void RenderMonitor(MonitorContext* ctx) {
         std::cout << "Monitor " << ctx->index << " capture format changed, forcing full reinit..." << std::endl;
         frameTexture->Release();
         ctx->duplication->ReleaseFrame();
-        // Force reinit to properly detect new HDR state and recreate swapchain
         if (ctx->duplication) {
             ctx->duplication->Release();
             ctx->duplication = nullptr;
         }
+        ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache
         if (ReinitDesktopDuplication(ctx)) {
             // HDR state changed - update swapchain and settings
             bool hasApplicableLUT = ctx->isHDREnabled
@@ -641,17 +636,19 @@ void RenderMonitor(MonitorContext* ctx) {
         return;
     }
 
-    // Create SRV for captured frame (must be done while frame is held)
-    if (ctx->captureSRV) {
-        ctx->captureSRV->Release();
-        ctx->captureSRV = nullptr;
+    // Create SRV for captured frame (reuse if same texture pointer — common case)
+    if (frameTexture != ctx->lastCaptureTexture) {
+        if (ctx->captureSRV) {
+            ctx->captureSRV->Release();
+            ctx->captureSRV = nullptr;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = texDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        hr = g_device->CreateShaderResourceView(frameTexture, &srvDesc, &ctx->captureSRV);
+        ctx->lastCaptureTexture = frameTexture;  // Weak ref for comparison (not AddRef'd)
     }
-
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = texDesc.Format;
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    hr = g_device->CreateShaderResourceView(frameTexture, &srvDesc, &ctx->captureSRV);
     frameTexture->Release();
 
     if (FAILED(hr)) {
@@ -782,17 +779,18 @@ void RenderMonitor(MonitorContext* ctx) {
             ID3D11ShaderResourceView* nullSRV = nullptr;
             g_context->CSSetShaderResources(0, 1, &nullSRV);
 
-            // Read detected peak for analysis overlay or debug logging
+            // Double-buffered peak readback: copy to staging[N], read staging[N-1] from previous frame.
+            // This avoids GPU pipeline stalls by reading data that's guaranteed to be ready.
             bool needPeakReadback = g_analysisEnabled.load() || g_logPeakDetection.load();
             if (needPeakReadback) {
-                // Throttle readback to once per second per monitor (analysis has its own display throttle)
                 static std::chrono::steady_clock::time_point lastReadback[8] = {};
                 auto now = std::chrono::steady_clock::now();
                 int idx = ctx->index < 8 ? ctx->index : 0;
 
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReadback[idx]).count() >= 500) {
-                    // Create staging texture on first use
-                    if (!ctx->peakStagingTexture) {
+                    // Create both staging textures on first use
+                    auto createStaging = [&](ID3D11Texture2D** tex) {
+                        if (*tex) return;
                         D3D11_TEXTURE2D_DESC stagingDesc = {};
                         stagingDesc.Width = 1;
                         stagingDesc.Height = 1;
@@ -802,21 +800,32 @@ void RenderMonitor(MonitorContext* ctx) {
                         stagingDesc.SampleDesc.Count = 1;
                         stagingDesc.Usage = D3D11_USAGE_STAGING;
                         stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                        g_device->CreateTexture2D(&stagingDesc, nullptr, &ctx->peakStagingTexture);
-                    }
+                        g_device->CreateTexture2D(&stagingDesc, nullptr, tex);
+                    };
+                    createStaging(&ctx->peakStagingTexture);
+                    createStaging(&ctx->peakStagingTexture2);
 
-                    if (ctx->peakStagingTexture) {
-                        g_context->CopyResource(ctx->peakStagingTexture, ctx->peakTexture);
+                    if (ctx->peakStagingTexture && ctx->peakStagingTexture2) {
+                        // Write: copy GPU result to current staging buffer
+                        ID3D11Texture2D* writeTarget = (ctx->peakStagingReadIndex == 0)
+                            ? ctx->peakStagingTexture : ctx->peakStagingTexture2;
+                        g_context->CopyResource(writeTarget, ctx->peakTexture);
+
+                        // Read: map the OTHER staging buffer (from previous readback cycle)
+                        ID3D11Texture2D* readSource = (ctx->peakStagingReadIndex == 0)
+                            ? ctx->peakStagingTexture2 : ctx->peakStagingTexture;
                         D3D11_MAPPED_SUBRESOURCE mapped;
-                        if (SUCCEEDED(g_context->Map(ctx->peakStagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
-                            float peakNits = *((float*)mapped.pData);  // Already in nits from compute shader
-                            g_context->Unmap(ctx->peakStagingTexture, 0);
-                            ctx->detectedPeakNits = peakNits;  // Store for analysis overlay
+                        if (SUCCEEDED(g_context->Map(readSource, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
+                            float peakNits = *((float*)mapped.pData);
+                            g_context->Unmap(readSource, 0);
+                            ctx->detectedPeakNits = peakNits;
                             if (g_logPeakDetection.load()) {
                                 std::cout << "Monitor " << ctx->index << " detected peak: "
                                           << std::fixed << std::setprecision(1) << peakNits << " nits" << std::endl;
                             }
                         }
+                        // Alternate for next cycle
+                        ctx->peakStagingReadIndex = 1 - ctx->peakStagingReadIndex;
                     }
                     lastReadback[idx] = now;
                 }
@@ -875,18 +884,23 @@ void RenderMonitor(MonitorContext* ctx) {
         // Successful frame - update watchdog timestamp
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
-        // Track frame timing for analysis overlay
-        if (ctx->lastFrameTime.time_since_epoch().count() > 0) {
-            auto now = std::chrono::steady_clock::now();
-            float frameMs = std::chrono::duration<float, std::milli>(now - ctx->lastFrameTime).count();
-            ctx->lastFrameTime = now;
+        // Track frame timing only when analysis overlay is active (avoid unnecessary work)
+        if (g_analysisEnabled.load()) {
+            if (ctx->lastFrameTime.time_since_epoch().count() > 0) {
+                auto now = std::chrono::steady_clock::now();
+                float frameMs = std::chrono::duration<float, std::milli>(now - ctx->lastFrameTime).count();
+                ctx->lastFrameTime = now;
 
-            // Store in circular buffer
-            ctx->frameTimeHistory[ctx->frameTimeIndex] = frameMs;
-            ctx->frameTimeIndex = (ctx->frameTimeIndex + 1) % 64;
-            if (ctx->frameTimeCount < 64) ctx->frameTimeCount++;
+                ctx->frameTimeHistory[ctx->frameTimeIndex] = frameMs;
+                ctx->frameTimeIndex = (ctx->frameTimeIndex + 1) % 64;
+                if (ctx->frameTimeCount < 64) ctx->frameTimeCount++;
+            } else {
+                ctx->lastFrameTime = std::chrono::steady_clock::now();
+            }
         } else {
-            ctx->lastFrameTime = std::chrono::steady_clock::now();
+            // Reset so we get a fresh baseline when analysis is toggled on
+            ctx->lastFrameTime = {};
+            ctx->frameTimeCount = 0;
         }
 
         // Two-phase visibility: first commit DirectComposition, then show window on next frame
@@ -897,12 +911,12 @@ void RenderMonitor(MonitorContext* ctx) {
             g_dcompDevice->Commit();
             ctx->dcompCommitted = true;
             ctx->framesAfterCommit = 0;  // Start counting frames after commit
-        } else if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd) && !g_vrrWhitelistActive.load()) {
+        } else if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)
+                   && !g_vrrWhitelistActive.load() && !g_overlayAutoSleep.load()) {
             // Wait one frame after commit for DirectComposition to process, then show
-            // Skip if VRR whitelist is hiding overlays (passthrough mode)
+            // Skip if VRR whitelist or auto-sleep is hiding overlays
             ctx->framesAfterCommit++;
             if (ctx->framesAfterCommit >= 1) {
-                // Make window opaque and show it now that DirectComposition content is ready
                 SetLayeredWindowAttributes(ctx->hwnd, 0, 255, LWA_ALPHA);
                 ShowWindow(ctx->hwnd, SW_SHOWNA);
             }
@@ -922,40 +936,9 @@ void RenderMonitor(MonitorContext* ctx) {
 void RenderAll() {
     int activeCount = 0;
 
-    // Check device health periodically (not every frame - driver call has some overhead)
-    static int deviceCheckCounter = 0;
-    if (++deviceCheckCounter >= 60) {  // Check every ~60 frames (~1 second at 60Hz)
-        deviceCheckCounter = 0;
-        if (g_device) {
-            HRESULT reason = g_device->GetDeviceRemovedReason();
-            if (reason != S_OK) {
-                std::cerr << "GPU device lost (TDR/driver crash): 0x" << std::hex << reason << std::dec << std::endl;
-                // Hide all overlay windows immediately to prevent black screen
-                for (auto& ctx : g_monitors) {
-                    if (ctx.hwnd) {
-                        ShowWindow(ctx.hwnd, SW_HIDE);
-                    }
-                }
-
-                // Attempt recovery once
-                if (AttemptDeviceRecovery()) {
-                    // Recovery succeeded - reset watchdog and continue
-                    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-                    std::cout << "Resuming after TDR recovery" << std::endl;
-                    return;
-                }
-
-                // Recovery failed - exit with error sound
-                std::cerr << "TDR recovery failed, exiting" << std::endl;
-                MessageBeep(MB_ICONERROR);
-                for (auto& ctx : g_monitors) {
-                    ctx.enabled = false;
-                }
-                g_running = false;
-                return;
-            }
-        }
-    }
+    // Device health is checked reactively when Present() or AcquireNextFrame() returns
+    // DXGI_ERROR_DEVICE_REMOVED — no need for periodic proactive polling.
+    // The watchdog below catches any case where rendering is silently stuck.
 
     // Watchdog: if no successful frame for N seconds, exit gracefully
     // This catches cases where device appears healthy but rendering is stuck
@@ -986,7 +969,9 @@ void RenderAll() {
                 ctx.duplication = nullptr;
             }
             ctx.consecutiveFailures = 0;  // Reset backoff
+            ctx.recoveryBackoffMs = 0;    // Reset non-blocking backoff
             ctx.cbDirty = true;           // Force constant buffer refresh
+            ctx.lastCaptureTexture = nullptr;  // Invalidate SRV cache
         }
         // Reset watchdog to avoid timeout during recovery
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -1002,7 +987,7 @@ void RenderAll() {
     static auto lastTopmost = std::chrono::steady_clock::now();
     auto now = std::chrono::steady_clock::now();
     bool forceReassert = g_forceTopmostReassert.exchange(false);
-    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 10000) {
+    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 30000) {
         for (auto& ctx : g_monitors) {
             if (ctx.hwnd) {
                 SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -1021,11 +1006,16 @@ void RenderAll() {
     // The render loop just reads the atomic g_gammaWhitelistActive flag via constant buffer
 
     // Apply any pending color correction updates (fast path: skip mutex if no updates)
+    // Swap-under-lock pattern: grab pending updates quickly, process without holding lock
     if (g_hasPendingColorCorrections.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
-        for (const auto& update : g_pendingColorCorrections) {
+        std::vector<PendingColorCorrection> localUpdates;
+        {
+            std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
+            localUpdates.swap(g_pendingColorCorrections);
+            g_hasPendingColorCorrections.store(false, std::memory_order_release);
+        }
+        for (const auto& update : localUpdates) {
             bool matched = false;
-            // Match by ctx.index (GUI monitor index), not vector position
             for (auto& ctx : g_monitors) {
                 if (ctx.index == update.monitorIndex) {
                     if (update.isHDR) {
@@ -1033,7 +1023,6 @@ void RenderAll() {
                     } else {
                         ctx.sdrColorCorrection = update.data;
                     }
-                    // MHC live preview: clear active flags so diagnostics reflect preview state
                     if (update.clearMhcFlags) {
                         ctx.sdrMhcPrimariesActive = false;
                         ctx.sdrMhcGrayscaleActive = false;
@@ -1058,8 +1047,53 @@ void RenderAll() {
                           << " (no matching ctx, g_monitors.size=" << g_monitors.size() << ")" << std::endl;
             }
         }
-        g_pendingColorCorrections.clear();
-        g_hasPendingColorCorrections.store(false, std::memory_order_release);
+    }
+
+    // Auto-sleep: hide overlay when no monitor needs processing (e.g., only MHC ICC active)
+    {
+        bool anyMonitorNeedsOverlay = false;
+        for (auto& ctx : g_monitors) {
+            if (!ctx.enabled) continue;
+            const auto& cc = ctx.isHDREnabled ? ctx.hdrColorCorrection : ctx.sdrColorCorrection;
+            bool shaderPrimaries = cc.primariesEnabled;
+            bool shaderGrayscale = cc.grayscale.enabled;
+            bool shaderWhiteBalance = cc.primariesEnabled &&
+                (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
+            bool overlayNeeded = !ctx.usePassthrough              // Has LUT
+                || shaderPrimaries || shaderGrayscale || shaderWhiteBalance  // Has corrections
+                || (ctx.isHDREnabled && cc.tonemap.enabled)       // Has tonemap
+                || g_desktopGammaMode.load();                     // Has desktop gamma
+            if (overlayNeeded) {
+                anyMonitorNeedsOverlay = true;
+                break;
+            }
+        }
+
+        if (!anyMonitorNeedsOverlay && !g_overlayAutoSleep.load()) {
+            g_overlayAutoSleep.store(true);
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd) ShowWindow(ctx.hwnd, SW_HIDE);
+            }
+            std::cout << "Auto-sleep: overlay has nothing to do, hiding" << std::endl;
+        } else if (anyMonitorNeedsOverlay && g_overlayAutoSleep.load()) {
+            g_overlayAutoSleep.store(false);
+            // Don't force-show here — RenderMonitor's two-phase visibility handles it
+            // Just mark dcompCommitted = false so windows go through proper show sequence
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd && ctx.enabled) {
+                    ctx.dcompCommitted = false;
+                    ctx.framesAfterCommit = 0;
+                }
+            }
+            std::cout << "Auto-sleep: overlay needed again, waking" << std::endl;
+        }
+    }
+
+    // When auto-sleeping, skip rendering entirely but keep the loop alive for state changes
+    if (g_overlayAutoSleep.load()) {
+        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+        Sleep(50);  // ~20Hz polling for state changes
+        return;
     }
 
     for (auto& ctx : g_monitors) {

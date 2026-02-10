@@ -45,6 +45,7 @@ std::atomic<bool> g_forceTopmostReassert{ false }; // Force TOPMOST reassert on 
 std::atomic<bool> g_logPeakDetection{ false };  // Debug: log detected peak nits to console
 std::atomic<bool> g_consoleEnabled{ false };   // Show console window (GUI mode only, default off)
 std::atomic<bool> g_showFrameTiming{ false };  // Show frame timing in analysis overlay (default off)
+std::atomic<bool> g_overlayAutoSleep{ false };  // true = overlay has nothing to do, windows hidden
 
 // ============================================================================
 // Hotkey Settings

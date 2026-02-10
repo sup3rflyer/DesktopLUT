@@ -265,6 +265,7 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     if (ctx->dcompVisual) { ctx->dcompVisual->Release(); ctx->dcompVisual = nullptr; }
     if (ctx->dcompTarget) { ctx->dcompTarget->Release(); ctx->dcompTarget = nullptr; }
     if (ctx->captureSRV) { ctx->captureSRV->Release(); ctx->captureSRV = nullptr; }
+    ctx->lastCaptureTexture = nullptr;  // Weak ref, just null it
     if (ctx->lutSRV_SDR) { ctx->lutSRV_SDR->Release(); ctx->lutSRV_SDR = nullptr; }
     if (ctx->lutTextureSDR) { ctx->lutTextureSDR->Release(); ctx->lutTextureSDR = nullptr; }
     if (ctx->lutSRV_HDR) { ctx->lutSRV_HDR->Release(); ctx->lutSRV_HDR = nullptr; }
@@ -273,6 +274,7 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     if (ctx->peakUAV) { ctx->peakUAV->Release(); ctx->peakUAV = nullptr; }
     if (ctx->peakTexture) { ctx->peakTexture->Release(); ctx->peakTexture = nullptr; }
     if (ctx->peakStagingTexture) { ctx->peakStagingTexture->Release(); ctx->peakStagingTexture = nullptr; }
+    if (ctx->peakStagingTexture2) { ctx->peakStagingTexture2->Release(); ctx->peakStagingTexture2 = nullptr; }
     // Analysis resources
     if (ctx->analysisUAV) { ctx->analysisUAV->Release(); ctx->analysisUAV = nullptr; }
     if (ctx->analysisBuffer) { ctx->analysisBuffer->Release(); ctx->analysisBuffer = nullptr; }

@@ -43,7 +43,8 @@ static bool MatchesPattern(const wchar_t* str, size_t strLen, const std::wstring
 
 // Check if any whitelisted process is running and update gamma state accordingly
 // Returns true if a whitelisted process was found
-static bool CheckGammaWhitelist() {
+// snapshot: shared process snapshot handle (caller creates/closes)
+static bool CheckGammaWhitelist(HANDLE snapshot) {
     // Copy whitelist data under lock for thread-safe access
     std::vector<std::wstring> localWhitelist;
     std::wstring localOverrideProcess;
@@ -102,8 +103,6 @@ static bool CheckGammaWhitelist() {
         return false;
     }
 
-    // Enumerate running processes
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return false;
     }
@@ -138,8 +137,6 @@ static bool CheckGammaWhitelist() {
             // Don't break early - need to check if override process is still running too
         } while (Process32NextW(snapshot, &pe32));
     }
-
-    CloseHandle(snapshot);
 
     // Handle user override: if user manually toggled while whitelist was active,
     // the override persists until the whitelisted app that triggered it exits
@@ -197,7 +194,8 @@ static bool CheckGammaWhitelist() {
 // ============================================================================
 
 // Check if any VRR-whitelisted process is running and hide/show overlay accordingly
-static void CheckVrrWhitelist() {
+// snapshot: shared process snapshot handle (caller creates/closes)
+static void CheckVrrWhitelist(HANDLE snapshot) {
     // Copy whitelist data under lock for thread-safe access
     std::vector<std::wstring> localWhitelist;
     {
@@ -208,16 +206,18 @@ static void CheckVrrWhitelist() {
     // Early exit if feature disabled or whitelist empty
     if (!g_vrrWhitelistEnabled.load() || localWhitelist.empty()) {
         if (g_vrrWhitelistActive.load()) {
-            // Was active, now disabled - show overlays again
+            // Was active, now disabled - show overlays again (unless auto-sleeping)
             g_vrrWhitelistActive.store(false);
             {
                 std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
                 g_vrrWhitelistMatch.clear();
             }
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
-                    SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
-                    ShowWindow(ctx.hwnd, SW_SHOWNA);
+            if (!g_overlayAutoSleep.load()) {
+                for (auto& ctx : g_monitors) {
+                    if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
+                        SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
+                        ShowWindow(ctx.hwnd, SW_SHOWNA);
+                    }
                 }
             }
             std::cout << "VRR whitelist: disabled, showing overlays" << std::endl;
@@ -225,8 +225,6 @@ static void CheckVrrWhitelist() {
         return;
     }
 
-    // Enumerate running processes
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
         return;
     }
@@ -253,8 +251,6 @@ static void CheckVrrWhitelist() {
         } while (Process32NextW(snapshot, &pe32));
     }
 
-    CloseHandle(snapshot);
-
     // Update state based on result
     bool wasActive = g_vrrWhitelistActive.load();
     if (found) {
@@ -274,7 +270,7 @@ static void CheckVrrWhitelist() {
         }
     } else {
         if (wasActive) {
-            // Whitelisted app exited - show overlays again
+            // Whitelisted app exited - show overlays again (unless auto-sleeping)
             g_vrrWhitelistActive.store(false);
             std::wstring exitedProcess;
             {
@@ -282,10 +278,12 @@ static void CheckVrrWhitelist() {
                 exitedProcess = g_vrrWhitelistMatch;
                 g_vrrWhitelistMatch.clear();
             }
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
-                    SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
-                    ShowWindow(ctx.hwnd, SW_SHOWNA);
+            if (!g_overlayAutoSleep.load()) {
+                for (auto& ctx : g_monitors) {
+                    if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
+                        SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
+                        ShowWindow(ctx.hwnd, SW_SHOWNA);
+                    }
                 }
             }
             std::wcout << L"VRR whitelist: " << exitedProcess << L" exited, showing overlays" << std::endl;
@@ -324,11 +322,26 @@ static void CheckMhcProfiles() {
         hwndMain = g_gui.hwndMain;
     }
 
+    // Early exit if no monitor has any MHC profile enabled — avoids expensive display config API calls
+    bool anyProfileEnabled = false;
+    for (const auto& snap : snapshots) {
+        if ((snap.sdrEnabled && !snap.sdrProfileName.empty()) ||
+            (snap.hdrEnabled && !snap.hdrProfileName.empty())) {
+            anyProfileEnabled = true;
+            break;
+        }
+    }
+    if (!anyProfileEnabled) return;
+
+    // Enumerate displays ONCE for all monitors (instead of per-monitor GetDisplayInfoForMonitor
+    // which calls EnumerateDisplaysForMaxTml each time — N full display config enumerations → 1)
+    std::vector<DisplayInfo> displays;
+    if (!EnumerateDisplaysForMaxTml(displays)) return;
+
     for (int i = 0; i < (int)snapshots.size(); i++) {
         const auto& snap = snapshots[i];
-
-        DisplayInfo displayInfo;
-        if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
+        if (i >= (int)displays.size()) continue;
+        const auto& displayInfo = displays[i];
 
         // Check SDR profile
         if (snap.sdrEnabled && !snap.sdrProfileName.empty()) {
@@ -375,11 +388,18 @@ static void GammaWhitelistThreadFunc() {
 
     int mhcCheckCounter = 0;
     while (g_gammaWhitelistThreadRunning.load()) {
-        CheckGammaWhitelist();
-        CheckVrrWhitelist();
+        // Single process snapshot shared by both gamma and VRR whitelist checks
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        CheckGammaWhitelist(snapshot);
+        CheckVrrWhitelist(snapshot);
+        if (snapshot != INVALID_HANDLE_VALUE) {
+            CloseHandle(snapshot);
+        }
 
-        // Check MHC profiles every 6th iteration (~3 seconds)
-        if (++mhcCheckCounter >= 6) {
+        // Check MHC profiles every 20th iteration (~10 seconds).
+        // Profile displacement is rare (only when another app sets a profile).
+        // Heavy display config API calls here can contend with DWM/render thread.
+        if (++mhcCheckCounter >= 20) {
             mhcCheckCounter = 0;
             CheckMhcProfiles();
         }
@@ -421,4 +441,7 @@ void StopGammaWhitelistThread() {
         std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
         g_vrrWhitelistMatch.clear();
     }
+
+    // Reset auto-sleep state
+    g_overlayAutoSleep.store(false);
 }
