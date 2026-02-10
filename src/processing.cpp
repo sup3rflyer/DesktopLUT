@@ -184,9 +184,8 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         ctx.sdrColorCorrection = config.sdrColorCorrection;
         ctx.hdrColorCorrection = config.hdrColorCorrection;
 
-        // Set MHC profile flags to prevent double-correction
-        // When MHC is active at GPU scanout, shader skips those stages
-        // MHC has its own primaries/grayscale (Layer 1), separate from shader corrections (Layer 3)
+        // Track which MHC corrections are active at GPU scanout (for diagnostics and live preview)
+        // Shader corrections are independent — all layers stack (MHC = Layer 1, shader = Layer 3)
         if (config.monitorIndex < (int)g_gui.monitorSettings.size()) {
             const auto& ms = g_gui.monitorSettings[config.monitorIndex];
             ctx.sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()

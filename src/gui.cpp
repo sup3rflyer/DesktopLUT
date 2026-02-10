@@ -241,8 +241,8 @@ void ShowTrayMenu(HWND hwnd) {
     HMENU hMenu = CreatePopupMenu();
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(hMenu, g_gui.isRunning ? MF_GRAYED : MF_STRING, ID_TRAY_APPLY, L"Enable");
-    AppendMenu(hMenu, g_gui.isRunning ? MF_STRING : MF_GRAYED, ID_TRAY_STOP, L"Disable");
+    AppendMenu(hMenu, g_gui.isRunning ? MF_GRAYED : MF_STRING, ID_TRAY_APPLY, L"Start");
+    AppendMenu(hMenu, g_gui.isRunning ? MF_STRING : MF_GRAYED, ID_TRAY_STOP, L"Stop");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, IsStartupEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
                ID_TRAY_STARTUP, L"Run at startup");
@@ -1063,9 +1063,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Buttons anchored to bottom right (owner-drawn for rounded corners)
         int btnPad = 8;
         int enableW = 80, disableW = 80;
-        g_gui.hwndStop = CreateWindow(L"BUTTON", L"Disable", WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
+        g_gui.hwndStop = CreateWindow(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE | WS_DISABLED | BS_OWNERDRAW,
             clientW - margin - disableW, btnY, disableW, btnH, hwnd, (HMENU)ID_STOP, nullptr, nullptr);
-        g_gui.hwndApply = CreateWindow(L"BUTTON", L"Enable", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        g_gui.hwndApply = CreateWindow(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             clientW - margin - disableW - btnPad - enableW, btnY, enableW, btnH, hwnd, (HMENU)ID_APPLY, nullptr, nullptr);
 
         // Separator line between buttons and status
@@ -1534,28 +1534,23 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::wstring origProfileName = mhc.profileName;
                 std::wstring origProfilePath = mhc.profilePath;
 
-                // Remove ICC profile before starting preview
-                if (hadProfile) {
-                    DisplayInfo displayInfo;
-                    if (GetDisplayInfoForMonitor(monIdx, displayInfo)) {
-                        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+                // Determine if live preview is possible:
+                // 1. Processing must be running (or we can start it)
+                // 2. Display HDR/SDR mode must match the section being edited
+                bool livePreview = false;
+                bool startedForPreview = false;
+
+                // Check mode match against running monitors
+                if (g_gui.isRunning) {
+                    for (const auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            livePreview = (ctx.isHDREnabled == isHDR);
+                            break;
+                        }
                     }
                 }
 
-                // Clear BOTH modes' MHC profile state before StartProcessing so the processing
-                // thread initialization sees no active profiles and sets all MHC flags to false.
-                // Save and restore the non-edited mode's state after the dialog closes.
-                bool otherWasEnabled = otherMhc.enabled;
-                std::wstring otherProfileName = otherMhc.profileName;
-                mhc.enabled = false;
-                mhc.profileName.clear();
-                mhc.profilePath.clear();
-                otherMhc.enabled = false;
-                otherMhc.profileName.clear();
-
-                // Ensure overlay is running for this monitor to enable live preview
-                // If not running, temporarily start processing with passthrough for this monitor
-                bool startedForPreview = false;
+                // If not running but mode could match, try starting processing
                 if (!g_gui.isRunning) {
                     auto& ms = g_gui.monitorSettings[monIdx];
                     auto& cc = isHDR ? ms.hdrColorCorrection : ms.sdrColorCorrection;
@@ -1563,14 +1558,47 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     cc.primariesEnabled = true;  // Ensure this monitor is included in processing
                     StartProcessing();
                     cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
-                    if (g_gui.isRunning) startedForPreview = true;
+                    if (g_gui.isRunning) {
+                        startedForPreview = true;
+                        // Check mode match now that we have monitor contexts
+                        for (const auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                livePreview = (ctx.isHDREnabled == isHDR);
+                                break;
+                            }
+                        }
+                        // Mode mismatch — stop the processing we just started
+                        if (!livePreview) {
+                            StopProcessing();
+                            startedForPreview = false;
+                        }
+                    }
                 }
 
-                bool livePreview = g_gui.isRunning;
-
-                // Force-clear MHC flags on existing MonitorContext (for already-running case).
-                // MhcPushLivePreview also sets clearMhcFlags on each push for ongoing protection.
+                // Only remove ICC and clear flags when live preview is active
+                // (shader replaces ICC corrections during preview, restores on Cancel/Apply)
+                std::wstring otherProfileName;
+                bool otherWasEnabled = false;
                 if (livePreview) {
+                    // Remove ICC profile so shader preview isn't double-corrected
+                    if (hadProfile) {
+                        DisplayInfo displayInfo;
+                        if (GetDisplayInfoForMonitor(monIdx, displayInfo)) {
+                            RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+                        }
+                    }
+
+                    // Clear BOTH modes' MHC profile state so processing thread
+                    // sees no active profiles and sets all MHC flags to false.
+                    otherWasEnabled = otherMhc.enabled;
+                    otherProfileName = otherMhc.profileName;
+                    mhc.enabled = false;
+                    mhc.profileName.clear();
+                    mhc.profilePath.clear();
+                    otherMhc.enabled = false;
+                    otherMhc.profileName.clear();
+
+                    // Clear MHC active flags so shader applies corrections
                     for (auto& ctx : g_monitors) {
                         if (ctx.index == monIdx) {
                             ctx.sdrMhcPrimariesActive = false;
@@ -1587,12 +1615,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                       livePreview, hadProfile, origProfileName, origProfilePath);
                 g_mhcEditDialogOpen.store(false);
 
-                // Restore non-edited mode's MHC state
-                otherMhc.enabled = otherWasEnabled;
-                otherMhc.profileName = otherProfileName;
-
-                // After dialog closes, restore MHC flags and shader corrections
+                // Restore state after dialog closes
                 if (livePreview) {
+                    otherMhc.enabled = otherWasEnabled;
+                    otherMhc.profileName = otherProfileName;
                     UpdateMhcFlagsLive(monIdx);
                     if (!startedForPreview) {
                         UpdateColorCorrectionLive(monIdx, isHDR);

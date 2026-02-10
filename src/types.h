@@ -365,11 +365,13 @@ struct MonitorContext {
     ColorCorrectionData sdrColorCorrection;
     ColorCorrectionData hdrColorCorrection;
 
-    // MHC profile active flags (set during init, skip shader stages when MHC handles them)
-    bool sdrMhcPrimariesActive = false;   // MHC handles SDR primaries at GPU scanout
-    bool sdrMhcGrayscaleActive = false;   // MHC handles SDR grayscale at GPU scanout
-    bool hdrMhcPrimariesActive = false;   // MHC handles HDR primaries at GPU scanout
-    bool hdrMhcGrayscaleActive = false;   // MHC handles HDR grayscale at GPU scanout
+    // MHC profile active flags — tracks which MHC corrections are installed at GPU scanout
+    // Used for diagnostics logging and MHC live preview state management
+    // Note: shader corrections are always independent of MHC (all layers stack, no suppression)
+    bool sdrMhcPrimariesActive = false;   // SDR MHC primaries installed at GPU scanout
+    bool sdrMhcGrayscaleActive = false;   // SDR MHC grayscale installed at GPU scanout
+    bool hdrMhcPrimariesActive = false;   // HDR MHC primaries installed at GPU scanout
+    bool hdrMhcGrayscaleActive = false;   // HDR MHC grayscale installed at GPU scanout
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     bool cbDirty = true;                     // True when constant buffer needs update
@@ -396,7 +398,7 @@ struct PendingColorCorrection {
     int monitorIndex;
     bool isHDR;  // true = update HDR settings, false = update SDR settings
     ColorCorrectionData data;
-    bool clearMhcFlags = false;  // When true, render thread clears all MHC suppress flags (for live preview)
+    bool clearMhcFlags = false;  // When true, render thread clears MHC active flags (for live preview tracking)
 };
 
 // Grayscale correction settings for GUI (uses vector)

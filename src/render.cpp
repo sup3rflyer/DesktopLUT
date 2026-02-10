@@ -1028,7 +1028,7 @@ void RenderAll() {
                     } else {
                         ctx.sdrColorCorrection = update.data;
                     }
-                    // MHC live preview: clear all suppress flags so shader applies corrections
+                    // MHC live preview: clear active flags so diagnostics reflect preview state
                     if (update.clearMhcFlags) {
                         ctx.sdrMhcPrimariesActive = false;
                         ctx.sdrMhcGrayscaleActive = false;

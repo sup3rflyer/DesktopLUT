@@ -19,8 +19,8 @@
 // SECTION: MHC Helper Functions
 // ============================================================================
 
-// Update MHC flags on the running MonitorContext to prevent double-correction
-// Called after MHC install/remove/enable toggle so shader immediately skips/restores stages
+// Update MHC active flags on the running MonitorContext
+// Called after MHC install/remove/enable toggle — tracks state for diagnostics and live preview
 void UpdateMhcFlagsLive(int monitorIndex) {
     if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
     const auto& ms = g_gui.monitorSettings[monitorIndex];
@@ -29,7 +29,6 @@ void UpdateMhcFlagsLive(int monitorIndex) {
     bool hdrMhcActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
 
     // Update running MonitorContext if processing is active
-    // MHC has its own primaries/grayscale (Layer 1), separate from shader corrections (Layer 3)
     bool found = false;
     for (auto& ctx : g_monitors) {
         if (ctx.index == monitorIndex) {
@@ -668,7 +667,10 @@ static LRESULT CALLBACK MhcScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, L
 
 static void MhcUpdatePrimariesFields(MhcDialogData* d) {
     int sel = (int)SendMessage(d->hwndPreset, CB_GETCURSEL, 0, 0);
-    bool custom = (sel == g_numPresetPrimaries - 1) && !d->fileLoaded;
+    // Only block editing when the loaded file specifically provides primaries (ICC with primaries)
+    // 1D cube files have no primaries data — coordinate fields should stay editable in Custom mode
+    bool filePrimaries = d->fileLoaded && d->hasLoadedICC && d->loadedICC.hasPrimaries;
+    bool custom = (sel == g_numPresetPrimaries - 1) && !filePrimaries;
     EnableWindow(d->hwndRx, custom); EnableWindow(d->hwndRy, custom);
     EnableWindow(d->hwndGx, custom); EnableWindow(d->hwndGy, custom);
     EnableWindow(d->hwndBx, custom); EnableWindow(d->hwndBy, custom);
@@ -695,17 +697,29 @@ static void MhcUpdatePrimariesFields(MhcDialogData* d) {
     swprintf_s(buf, L"%.4f", Wy); SetWindowText(d->hwndWy, buf);
 }
 
-static void MhcSaveCustomFromFields(MhcDialogData* d) {
+// Chromaticity bounds — generous enough for any real display, prevents screen-breaking values
+static constexpr float CHROM_MIN = 0.01f;   // No real primary is at 0
+static constexpr float CHROM_X_MAX = 0.80f;  // Spectral locus max x ~0.74
+static constexpr float CHROM_Y_MAX = 0.90f;  // Spectral locus max y ~0.83
+static constexpr float WHITE_MIN = 0.20f;    // All standard illuminants > 0.25
+static constexpr float WHITE_MAX = 0.50f;    // Illuminant A ~0.45 is the warmest common white
+
+static float ReadAndClamp(HWND hwnd, float lo, float hi) {
     wchar_t buf[16];
+    GetWindowText(hwnd, buf, 16);
+    return std::clamp((float)_wtof(buf), lo, hi);
+}
+
+static void MhcSaveCustomFromFields(MhcDialogData* d) {
     auto& cp = d->settings->customPrimaries;
-    GetWindowText(d->hwndRx, buf, 16); cp.Rx = (float)_wtof(buf);
-    GetWindowText(d->hwndRy, buf, 16); cp.Ry = (float)_wtof(buf);
-    GetWindowText(d->hwndGx, buf, 16); cp.Gx = (float)_wtof(buf);
-    GetWindowText(d->hwndGy, buf, 16); cp.Gy = (float)_wtof(buf);
-    GetWindowText(d->hwndBx, buf, 16); cp.Bx = (float)_wtof(buf);
-    GetWindowText(d->hwndBy, buf, 16); cp.By = (float)_wtof(buf);
-    GetWindowText(d->hwndWx, buf, 16); cp.Wx = (float)_wtof(buf);
-    GetWindowText(d->hwndWy, buf, 16); cp.Wy = (float)_wtof(buf);
+    cp.Rx = ReadAndClamp(d->hwndRx, CHROM_MIN, CHROM_X_MAX);
+    cp.Ry = ReadAndClamp(d->hwndRy, CHROM_MIN, CHROM_Y_MAX);
+    cp.Gx = ReadAndClamp(d->hwndGx, CHROM_MIN, CHROM_X_MAX);
+    cp.Gy = ReadAndClamp(d->hwndGy, CHROM_MIN, CHROM_Y_MAX);
+    cp.Bx = ReadAndClamp(d->hwndBx, CHROM_MIN, CHROM_X_MAX);
+    cp.By = ReadAndClamp(d->hwndBy, CHROM_MIN, CHROM_Y_MAX);
+    cp.Wx = ReadAndClamp(d->hwndWx, WHITE_MIN, WHITE_MAX);
+    cp.Wy = ReadAndClamp(d->hwndWy, WHITE_MIN, WHITE_MAX);
 }
 
 // Enable/disable manual controls based on what data the loaded file provides
@@ -723,12 +737,9 @@ static void MhcSetFileLoadedState(MhcDialogData* d, bool loaded) {
     BOOL primEnable = filePrimaries ? FALSE : TRUE;
     BOOL gsEnable = fileTRC ? FALSE : TRUE;
 
-    // Primaries controls - only lock when file provides primaries
+    // Primaries section: lock preset dropdown and Detect when file provides primaries
+    // Coordinate fields are handled by MhcUpdatePrimariesFields (respects both file state and preset)
     if (d->hwndPreset) EnableWindow(d->hwndPreset, primEnable);
-    EnableWindow(d->hwndRx, primEnable); EnableWindow(d->hwndRy, primEnable);
-    EnableWindow(d->hwndGx, primEnable); EnableWindow(d->hwndGy, primEnable);
-    EnableWindow(d->hwndBx, primEnable); EnableWindow(d->hwndBy, primEnable);
-    EnableWindow(d->hwndWx, primEnable); EnableWindow(d->hwndWy, primEnable);
     HWND hwndDetect = GetDlgItem(d->hwndDialog, ID_MHC_PRIMARIES_DETECT);
     if (hwndDetect) EnableWindow(hwndDetect, primEnable);
 
@@ -740,25 +751,22 @@ static void MhcSetFileLoadedState(MhcDialogData* d, bool loaded) {
     if (d->hwndGrayscaleReset) EnableWindow(d->hwndGrayscaleReset, gsEnable);
     HWND hwndEdit = GetDlgItem(d->hwndDialog, ID_MHC_GRAYSCALE_EDIT);
     if (hwndEdit) EnableWindow(hwndEdit, gsEnable);
+
+    // Update coordinate field enable state (accounts for both file state and preset selection)
+    MhcUpdatePrimariesFields(d);
 }
 
 // Push current MHC settings as temporary shader corrections for live preview
 static void MhcPushLivePreview(MhcDialogData* d) {
     if (!d || !d->livePreview) return;
-    // Skip preview when a file (cube/ICC) is loaded - manual controls are locked
-    // and the extracted data isn't suitable for direct shader preview
-    if (d->fileLoaded) return;
 
-    // Check if the current display mode matches the edit mode.
-    // SDR corrections don't work in the HDR pipeline and vice versa.
-    bool displayIsHDR = false;
-    for (const auto& ctx : g_monitors) {
-        if (ctx.index == d->monitorIndex) {
-            displayIsHDR = ctx.isHDREnabled;
-            break;
-        }
-    }
-    if (displayIsHDR != d->isHDR) return;  // Mode mismatch, skip preview
+    // When a file is loaded, determine what it provides
+    bool filePrimaries = d->fileLoaded && d->hasLoadedICC && d->loadedICC.hasPrimaries;
+    bool fileGrayscale = d->fileLoaded && (d->loadedFileIs1DCube || (d->hasLoadedICC && d->loadedICC.hasTRC));
+
+    // Skip preview entirely when file provides both primaries and grayscale (all controls locked)
+    if (filePrimaries && fileGrayscale) return;
+    // Note: display mode match is guaranteed by the Edit handler (livePreview=false when mismatched)
 
     // Save custom primaries from edit boxes
     if (d->settings->primariesPreset == g_numPresetPrimaries - 1)
@@ -769,11 +777,16 @@ static void MhcPushLivePreview(MhcDialogData* d) {
     tempCC.primariesEnabled = d->settings->primariesEnabled;
     tempCC.primariesPreset = d->settings->primariesPreset;
     tempCC.customPrimaries = d->settings->customPrimaries;
-    tempCC.grayscale.enabled = d->settings->grayscale.enabled;
-    tempCC.grayscale.pointCount = d->settings->grayscale.pointCount;
-    tempCC.grayscale.points = d->settings->grayscale.points;
-    tempCC.grayscale.peakNits = d->settings->grayscale.peakNits;
-    tempCC.grayscale.use24Gamma = d->settings->grayscale.use24Gamma;
+
+    // Only preview grayscale if the file doesn't handle it
+    // (1D cube TRC / ICC TRC can't be previewed through shader — they're baked into the ICC at Apply)
+    if (!fileGrayscale) {
+        tempCC.grayscale.enabled = d->settings->grayscale.enabled;
+        tempCC.grayscale.pointCount = d->settings->grayscale.pointCount;
+        tempCC.grayscale.points = d->settings->grayscale.points;
+        tempCC.grayscale.peakNits = d->settings->grayscale.peakNits;
+        tempCC.grayscale.use24Gamma = d->settings->grayscale.use24Gamma;
+    }
 
     ColorCorrectionData data = ConvertColorCorrection(tempCC, d->isHDR);
 
@@ -804,6 +817,28 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (d->hwndPrimariesEnable)
                 d->settings->primariesEnabled = (SendMessage(d->hwndPrimariesEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
             MhcPushLivePreview(d);
+            return 0;
+
+        // Live preview when coordinate edit boxes lose focus (clamps + writes back)
+        case ID_MHC_PRIMARIES_RX: case ID_MHC_PRIMARIES_RY:
+        case ID_MHC_PRIMARIES_GX: case ID_MHC_PRIMARIES_GY:
+        case ID_MHC_PRIMARIES_BX: case ID_MHC_PRIMARIES_BY:
+        case ID_MHC_PRIMARIES_WX: case ID_MHC_PRIMARIES_WY:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                MhcSaveCustomFromFields(d);
+                // Write clamped values back so user sees the actual value
+                wchar_t clampBuf[16];
+                const auto& cp = d->settings->customPrimaries;
+                float vals[8] = { cp.Rx, cp.Ry, cp.Gx, cp.Gy, cp.Bx, cp.By, cp.Wx, cp.Wy };
+                HWND fields[8] = { d->hwndRx, d->hwndRy, d->hwndGx, d->hwndGy,
+                                   d->hwndBx, d->hwndBy, d->hwndWx, d->hwndWy };
+                int idx = LOWORD(wParam) - ID_MHC_PRIMARIES_RX;
+                if (idx >= 0 && idx < 8) {
+                    swprintf_s(clampBuf, L"%.4f", vals[idx]);
+                    SetWindowText(fields[idx], clampBuf);
+                }
+                MhcPushLivePreview(d);
+            }
             return 0;
 
         case ID_MHC_PRIMARIES_PRESET:
