@@ -337,6 +337,9 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     SetStatus(L"Active");
 
+    // Create auto-sleep wake event (auto-reset: resets after WaitForSingleObject returns)
+    g_overlayWakeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
     // Initialize watchdog timestamp
     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
@@ -374,6 +377,13 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     if (g_osdHwnd) {
         DestroyWindow(g_osdHwnd);
         g_osdHwnd = nullptr;
+    }
+    DestroyOSDFont();
+
+    // Clean up auto-sleep wake event
+    if (g_overlayWakeEvent) {
+        CloseHandle(g_overlayWakeEvent);
+        g_overlayWakeEvent = nullptr;
     }
 
     // Cleanup monitor contexts

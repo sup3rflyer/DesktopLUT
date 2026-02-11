@@ -167,6 +167,7 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             }
             g_gammaWhitelistActive.store(true);
             g_desktopGammaMode.store(false);
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"Gamma whitelist: detected " << matchedProcess << L", disabling desktop gamma" << std::endl;
             ShowOSD(L"Gamma: sRGB");
         }
@@ -182,6 +183,7 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             }
             std::wcout << L"Gamma whitelist: " << exitedProcess << L" exited, restoring desktop gamma" << std::endl;
             g_desktopGammaMode.store(g_userDesktopGammaMode.load());
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             ShowOSD(g_userDesktopGammaMode.load() ? L"Gamma: 2.2" : L"Gamma: sRGB");
         }
     }
@@ -266,6 +268,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                     ShowWindow(ctx.hwnd, SW_HIDE);
                 }
             }
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"VRR whitelist: detected " << matchedProcess << L", hiding overlays" << std::endl;
         }
     } else {
@@ -286,6 +289,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                     }
                 }
             }
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"VRR whitelist: " << exitedProcess << L" exited, showing overlays" << std::endl;
         }
     }

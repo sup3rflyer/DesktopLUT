@@ -21,3 +21,15 @@ inline float LinearToPQScalar(float L) {
     float Ym = powf(L, m1);
     return powf((c1 + c2 * Ym) / (1.0f + c3 * Ym), m2);
 }
+
+// CPU-side PQ EOTF: PQ signal (0-1) -> linear light (0-1 normalized to 10000 nits)
+// Used to convert PQ-encoded peak detection result back to nits for analysis display
+inline float PQToLinearScalar(float N) {
+    static const float m1 = 0.1593017578125f;
+    static const float m2 = 78.84375f;
+    static const float c1 = 0.8359375f;
+    static const float c2 = 18.8515625f;
+    static const float c3 = 18.6875f;
+    float Np = powf((std::max)(N, 0.0f), 1.0f / m2);
+    return powf((std::max)(Np - c1, 0.0f) / (c2 - c3 * Np), 1.0f / m1);
+}

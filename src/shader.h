@@ -39,7 +39,7 @@ cbuffer LUTParams : register(b0) {
     float4 primariesRow0;
     float4 primariesRow1;
     float4 primariesRow2;
-    float tonemapSourcePeak;
+    float pqSourcePeakCB;       // Precomputed PQ of source peak (static) or floor peak (dynamic)
     float tonemapTargetPeak;
     float tonemapDynamic;
     float grayscale24;     // SDR: apply 2.2->2.4 gamma transform (0 or 1)
@@ -48,6 +48,10 @@ cbuffer LUTParams : register(b0) {
     float pqTargetPeak;        // Precomputed PQ of tonemapTargetPeak (avoids per-pixel pow())
     float pqGrayscalePeak;     // Precomputed PQ of grayscalePeakNits (avoids per-pixel pow())
     float4 grayscale[8];
+    float motionBarEnabled;
+    float motionBarPosition;
+    float motionBarPad0;
+    float motionBarPad1;
 };
 
 Texture2D<float4> captureTexture : register(t0);
@@ -360,43 +364,41 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     float I = ictcp.x;
     if (I <= 0.0f) return ictcp;
 
-    // Get source peak: dynamic (from peak texture) or user-specified
-    // Dynamic tonemapping disabled at ≤203 nits (SDR reference white) - use static instead
-    float sourcePeakNits;
+    // Get PQ-encoded source peak: all PQ conversion done outside per-pixel path
+    // - Static mode: pqSourcePeakCB = PQ(user-specified peak) (precomputed on CPU)
+    // - Dynamic mode: peak texture stores PQ(smoothed nits) (computed once per frame in CS)
+    //                 pqSourcePeakCB = PQ(targetPeak * 1.25) as floor for detected peak
+    float pqSrcPeak;
     if (tonemapDynamic > 0.5f && tonemapTargetPeak > 203.0f) {
-        float detectedPeak = max(peakTexture.Load(int3(0, 0, 0)), 203.0f);
-        float minSourcePeak = tonemapTargetPeak * 1.25f;
-        sourcePeakNits = max(detectedPeak, minSourcePeak);
+        float pqDetected = peakTexture.Load(int3(0, 0, 0));  // Already PQ-encoded by CS
+        pqSrcPeak = max(pqDetected, pqSourcePeakCB);         // CB has PQ(targetPeak*1.25)
     } else {
-        // Static mode: use user-specified peak, fallback to 1000 if not set
-        // 1000 nits covers 99.9% of HDR content (typical HDR10 mastering peak)
-        sourcePeakNits = (tonemapSourcePeak > 0.0f) ? tonemapSourcePeak : 1000.0f;
+        pqSrcPeak = pqSourcePeakCB;                           // CB has PQ(staticSourcePeak)
     }
 
-    // If content already fits display, no tonemapping needed
-    if (sourcePeakNits <= tonemapTargetPeak) return ictcp;
-
-    // Source peak varies (dynamic detection) - must compute per-pixel
-    // Target peak is precomputed in constant buffer (pqTargetPeak)
-    float pqSourcePeak = Linear_to_PQ_scalar(sourcePeakNits / 10000.0f);
     float pqTgtPeak = pqTargetPeak;  // Precomputed from CPU
+
+    // If source peak ≤ target peak, no tonemapping needed (PQ is monotonic, comparison valid)
+    if (pqSrcPeak <= pqTgtPeak) return ictcp;
 
     // Apply PQ-native curve directly on I channel
     float I_mapped;
     if (tonemapCurve < 0.5f) {
         // BT.2390 EETF - spec-native PQ implementation (ITU-R BT.2390)
-        I_mapped = TonemapBT2390_PQ(I, pqSourcePeak, pqTgtPeak);
+        I_mapped = TonemapBT2390_PQ(I, pqSrcPeak, pqTgtPeak);
     }
     else if (tonemapCurve < 1.5f) {
         // Soft clip - PQ native
-        I_mapped = TonemapSoftClip_PQ(I, pqSourcePeak, pqTgtPeak, tonemapTargetPeak);
+        I_mapped = TonemapSoftClip_PQ(I, pqSrcPeak, pqTgtPeak, tonemapTargetPeak);
     }
     else if (tonemapCurve < 2.5f) {
         // Reinhard - PQ native
-        I_mapped = TonemapReinhard_PQ(I, pqSourcePeak, pqTgtPeak, tonemapTargetPeak);
+        I_mapped = TonemapReinhard_PQ(I, pqSrcPeak, pqTgtPeak, tonemapTargetPeak);
     }
     else if (tonemapCurve < 3.5f) {
         // BT.2446A - linear-space (complex gamma operations don't translate to PQ)
+        // Need nits for normalization — convert PQ source peak back to linear
+        float sourcePeakNits = PQ_to_Linear_scalar(pqSrcPeak) * 10000.0f;
         float nits = PQ_to_Linear_scalar(I) * 10000.0f;
         float normalized = nits / sourcePeakNits;
         float targetNormalized = tonemapTargetPeak / sourcePeakNits;
@@ -641,7 +643,24 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             dot(linearRec2020, float3(-0.1245505f, 1.1328999f, -0.0083494f)),
             dot(linearRec2020, float3(-0.0181508f, -0.1005789f, 1.1187297f)));
 
-        return float4(result, 1.0);
+        float4 finalColor = float4(result, 1.0);
+        // Motion bar: judder detection (UFO test style)
+        if (motionBarEnabled > 0.5) {
+            float2 screenSize;
+            captureTexture.GetDimensions(screenSize.x, screenSize.y);
+            float barHeight = 60.0 / screenSize.y;
+            float barBottom = 1.0 - 80.0 / screenSize.y;  // 80px above screen bottom (above taskbar)
+            float barTop = barBottom - barHeight;
+            if (uv.y > barTop && uv.y < barBottom) {
+                float lineX = motionBarPosition;
+                float pixelWidth = 1.0 / screenSize.x;
+                float dist = abs(uv.x - lineX);
+                float lineVal = saturate(1.0 - dist / (pixelWidth * 4.0));  // ~8px wide anti-aliased
+                // Dark bar background with white line, in linear scRGB
+                finalColor = float4(lineVal * 10.0, lineVal * 10.0, lineVal * 10.0, 1.0);
+            }
+        }
+        return finalColor;
     }
 )"
 // Part 6: Main function - SDR path
@@ -701,7 +720,24 @@ R"(
         float noise = blueNoiseTexture.Sample(wrapSampler, noiseUV);
         float dither = (noise - 0.5) / 1024.0;
         float3 dithered = corrected.rgb + dither;
-        return float4(dithered, 1.0);
+        float4 finalColor = float4(dithered, 1.0);
+        // Motion bar: judder detection (UFO test style)
+        if (motionBarEnabled > 0.5) {
+            float2 screenSize;
+            captureTexture.GetDimensions(screenSize.x, screenSize.y);
+            float barHeight = 60.0 / screenSize.y;
+            float barBottom = 1.0 - 80.0 / screenSize.y;
+            float barTop = barBottom - barHeight;
+            if (uv.y > barTop && uv.y < barBottom) {
+                float lineX = motionBarPosition;
+                float pixelWidth = 1.0 / screenSize.x;
+                float dist = abs(uv.x - lineX);
+                float lineVal = saturate(1.0 - dist / (pixelWidth * 4.0));
+                // SDR: gamma-encoded white line on dark bar
+                finalColor = float4(lineVal, lineVal, lineVal, 1.0);
+            }
+        }
+        return finalColor;
     }
 }
 )";
@@ -790,7 +826,12 @@ void main(uint3 GTid : SV_GroupThreadID) {
 
         // Upper clamp prevents overflow from corrupted frames
         smoothedPeak = clamp(smoothedPeak, 0.0f, 10000.0f);
-        peakOutput[uint2(0, 0)] = smoothedPeak;
+
+        // Convert smoothed nits to PQ signal (runs once per frame, 1 thread)
+        // This moves the PQ conversion out of the per-pixel pixel shader path
+        float Y = max(smoothedPeak / 10000.0, 1e-10);
+        float Ym = pow(Y, 0.1593017578125);
+        peakOutput[uint2(0, 0)] = pow((0.8359375 + 18.8515625 * Ym) / (1.0 + 18.6875 * Ym), 78.84375);
     }
 }
 )";

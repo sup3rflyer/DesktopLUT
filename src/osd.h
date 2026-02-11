@@ -16,3 +16,6 @@ void HideOSD();
 
 // Create OSD window
 bool CreateOSDWindow(HINSTANCE hInstance);
+
+// Clean up cached OSD font
+void DestroyOSDFont();

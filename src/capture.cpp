@@ -125,8 +125,10 @@ done:
     // Calculate frame time from refresh rate (with 5ms margin for timing tolerance)
     if (duplDesc.ModeDesc.RefreshRate.Numerator > 0) {
         double frameTimeExact = 1000.0 * duplDesc.ModeDesc.RefreshRate.Denominator / duplDesc.ModeDesc.RefreshRate.Numerator;
+        ctx->frameTimeExactMs = static_cast<float>(frameTimeExact);
         ctx->frameTimeMs = static_cast<UINT>(frameTimeExact + 5.0);  // Add 5ms margin
     } else {
+        ctx->frameTimeExactMs = 16.667f;
         ctx->frameTimeMs = 20;  // Fallback for unknown refresh rate
     }
 

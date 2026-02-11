@@ -37,6 +37,10 @@ void InitCompositorClock() {
     }
 }
 
+// Motion bar time origin (set on first frame)
+static std::chrono::steady_clock::time_point s_motionBarOrigin;
+static bool s_motionBarOriginSet = false;
+
 // Display power notification handle
 static HPOWERNOTIFY g_displayPowerNotify = nullptr;
 static std::chrono::steady_clock::time_point g_powerNotifyRegisteredTime;
@@ -499,25 +503,18 @@ void RenderMonitor(MonitorContext* ctx) {
 
     if (!ctx->swapchain || !ctx->rtv) return;
 
-    // Acquire next frame from desktop duplication
-    // Always sync to compositor FIRST for consistent frame pacing. This prevents
-    // jitter at transitions (e.g., mouse start/stop moving) by ensuring all frames
-    // are compositor-aligned regardless of whether Desktop Duplication has a frame
-    // ready immediately or not.
+    // Acquire next frame from desktop duplication (non-blocking).
+    // Frame pacing is handled by compositor sync in RenderAll(), so we only need
+    // Try instant capture first (catches context menus, cursor changes, etc.)
+    // If no frame ready, DwmFlush syncs to compositor then blocking acquire gets the frame.
+    // DWM composes at 60Hz regardless of display refresh rate — DD delivery matches compositor.
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
     bool frameAcquired = false;
 
-    if (g_pfnWaitForCompositorClock) {
-        g_pfnWaitForCompositorClock(0, nullptr, ctx->frameTimeMs);
-    } else {
-        DwmFlush();
-    }
-
-    // After compositor sync, grab whatever frame is available now
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // No frame ready after sync — wait for next desktop change
+        DwmFlush();
         hr = ctx->duplication->AcquireNextFrame(ctx->frameTimeMs, &frameInfo, &desktopResource);
     }
 
@@ -665,6 +662,10 @@ void RenderMonitor(MonitorContext* ctx) {
         ctx->lastTetrahedralInterp = curTetrahedral;
     }
 
+    // Motion bar position changes every frame — force CB update when enabled
+    bool motionBar = g_showMotionBar.load();
+    if (motionBar) ctx->cbDirty = true;
+
     // Update constant buffer only when dirty (avoids Map/Unmap overhead on static frames)
     if (ctx->cbDirty) {
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -711,7 +712,15 @@ void RenderMonitor(MonitorContext* ctx) {
         cbData[22] = cc.primariesMatrix[8];
         cbData[23] = cc.whiteBalanceGains[2];  // B gain
         // Row 6: Tonemapping parameters
-        cbData[24] = cc.tonemap.sourcePeakNits;  // tonemapSourcePeak
+        // Slot [24]: PQ-encoded source peak (avoids per-pixel pow() in pixel shader)
+        if (cc.tonemap.dynamicPeak) {
+            // Dynamic: PQ of (targetPeak * 1.25) as floor for GPU-detected peak
+            cbData[24] = LinearToPQScalar(cc.tonemap.targetPeakNits * 1.25f / 10000.0f);
+        } else {
+            // Static: PQ of user-specified source peak (fallback 1000 nits)
+            float srcPeak = (cc.tonemap.sourcePeakNits > 0.0f) ? cc.tonemap.sourcePeakNits : 1000.0f;
+            cbData[24] = LinearToPQScalar(srcPeak / 10000.0f);
+        }
         cbData[25] = cc.tonemap.targetPeakNits;
         cbData[26] = cc.tonemap.dynamicPeak ? 1.0f : 0.0f;  // tonemapDynamic
         cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24
@@ -726,6 +735,22 @@ void RenderMonitor(MonitorContext* ctx) {
                 ? cc.grayscale.points[i]
                 : ((float)i / 31.0f);  // Linear fallback
         }
+        // Row 16: Motion bar (UFO test-style judder detection)
+        if (motionBar) {
+            if (!s_motionBarOriginSet) {
+                s_motionBarOrigin = std::chrono::steady_clock::now();
+                s_motionBarOriginSet = true;
+            }
+            float elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - s_motionBarOrigin).count();
+            cbData[64] = 1.0f;  // motionBarEnabled
+            cbData[65] = fmodf(elapsed * 0.5f, 1.0f);  // position: 0.5 traversals/sec
+        } else {
+            cbData[64] = 0.0f;
+            cbData[65] = 0.0f;
+        }
+        cbData[66] = 0.0f;  // reserved
+        cbData[67] = 0.0f;  // reserved
         g_context->Unmap(g_constantBuffer, 0);
     }
     ctx->cbDirty = false;
@@ -816,12 +841,13 @@ void RenderMonitor(MonitorContext* ctx) {
                             ? ctx->peakStagingTexture2 : ctx->peakStagingTexture;
                         D3D11_MAPPED_SUBRESOURCE mapped;
                         if (SUCCEEDED(g_context->Map(readSource, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
-                            float peakNits = *((float*)mapped.pData);
+                            float pqValue = *((float*)mapped.pData);
                             g_context->Unmap(readSource, 0);
-                            ctx->detectedPeakNits = peakNits;
+                            // Convert PQ-encoded peak back to nits for analysis display
+                            ctx->detectedPeakNits = PQToLinearScalar(pqValue) * 10000.0f;
                             if (g_logPeakDetection.load()) {
                                 std::cout << "Monitor " << ctx->index << " detected peak: "
-                                          << std::fixed << std::setprecision(1) << peakNits << " nits" << std::endl;
+                                          << std::fixed << std::setprecision(1) << ctx->detectedPeakNits << " nits" << std::endl;
                             }
                         }
                         // Alternate for next cycle
@@ -959,6 +985,7 @@ void RenderAll() {
 
     // Check for forced reinit (e.g., resume from sleep)
     if (g_forceReinit.exchange(false)) {
+        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         std::cout << "Forcing reinit of all monitors..." << std::endl;
         // Give system time to stabilize after wake
         Sleep(500);
@@ -999,6 +1026,11 @@ void RenderAll() {
             SetWindowPos(g_analysisHwnd, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
+        // Our own SetWindowPos calls trigger WM_WINDOWPOSCHANGING (no SWP_NOZORDER),
+        // which re-sets g_forceTopmostReassert — creating a feedback loop that would
+        // reassert on EVERY frame. Clear the self-triggered flag to break the cycle.
+        // External z-order changes between here and next check are caught by 30s fallback.
+        g_forceTopmostReassert.store(false);
         lastTopmost = now;
     }
 
@@ -1007,7 +1039,9 @@ void RenderAll() {
 
     // Apply any pending color correction updates (fast path: skip mutex if no updates)
     // Swap-under-lock pattern: grab pending updates quickly, process without holding lock
+    // Also signal wake event in case we're about to enter auto-sleep check
     if (g_hasPendingColorCorrections.load(std::memory_order_acquire)) {
+        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         std::vector<PendingColorCorrection> localUpdates;
         {
             std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
@@ -1077,6 +1111,7 @@ void RenderAll() {
             std::cout << "Auto-sleep: overlay has nothing to do, hiding" << std::endl;
         } else if (anyMonitorNeedsOverlay && g_overlayAutoSleep.load()) {
             g_overlayAutoSleep.store(false);
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             // Don't force-show here — RenderMonitor's two-phase visibility handles it
             // Just mark dcompCommitted = false so windows go through proper show sequence
             for (auto& ctx : g_monitors) {
@@ -1089,10 +1124,14 @@ void RenderAll() {
         }
     }
 
-    // When auto-sleeping, skip rendering entirely but keep the loop alive for state changes
+    // When auto-sleeping, skip rendering entirely — wait for wake event or 500ms timeout
     if (g_overlayAutoSleep.load()) {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-        Sleep(50);  // ~20Hz polling for state changes
+        if (g_overlayWakeEvent) {
+            WaitForSingleObject(g_overlayWakeEvent, 500);
+        } else {
+            Sleep(50);
+        }
         return;
     }
 
@@ -1125,6 +1164,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_HOTKEY:
+        // Wake auto-sleep on any hotkey (overlay may need to start rendering)
+        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         if (wParam == HOTKEY_GAMMA) {
             // Win+Shift+G - toggle gamma mode (HDR only)
             // Check if any monitor is in HDR mode

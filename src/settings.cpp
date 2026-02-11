@@ -438,6 +438,7 @@ void SaveSettings() {
     WritePrivateProfileBool(L"General", L"LogPeakDetection", g_logPeakDetection.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ConsoleLog", g_consoleEnabled.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ShowFrameTiming", g_showFrameTiming.load(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"ShowMotionBar", g_showMotionBar.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"GammaWhitelist", g_gammaWhitelistRaw.c_str(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"VRRWhitelist", g_vrrWhitelistRaw.c_str(), iniPath.c_str());
@@ -489,6 +490,7 @@ void LoadSettings() {
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
     g_showFrameTiming.store(GetPrivateProfileBool(L"General", L"ShowFrameTiming", false, iniPath.c_str()));
+    g_showMotionBar.store(GetPrivateProfileBool(L"General", L"ShowMotionBar", false, iniPath.c_str()));
 
     // Load gamma whitelist
     wchar_t whitelistBuf[1024] = {};

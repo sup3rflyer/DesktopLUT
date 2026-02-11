@@ -14,6 +14,9 @@
 // Window class name for analysis overlay
 static const wchar_t* g_analysisClassName = L"DesktopLUT_Analysis";
 
+// Cached font for analysis overlay (avoids CreateFont/DeleteObject per paint)
+static HFONT g_analysisFont = nullptr;
+
 // Timing constants
 static const int ANALYSIS_DISPATCH_INTERVAL = 30;  // Dispatch every 30 frames (~0.5 sec at 60Hz)
 static const int ANALYSIS_READBACK_DELAY = 2;      // Read back 2 frames after dispatch
@@ -75,10 +78,7 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (text) {
             // Draw text
             SetBkMode(memDC, TRANSPARENT);
-            HFONT font = CreateFont(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-            HFONT oldFont = (HFONT)SelectObject(memDC, font);
+            HFONT oldFont = (HFONT)SelectObject(memDC, g_analysisFont);
 
             // Parse and draw lines with different colors
             RECT textRc = rc;
@@ -136,7 +136,6 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             }
 
             SelectObject(memDC, oldFont);
-            DeleteObject(font);
         }
 
         // Blit to screen in one operation
@@ -328,6 +327,13 @@ bool CreateAnalysisOverlay(HINSTANCE hInstance) {
     int x = screenW - width - margin;
     int y = margin;
 
+    // Create cached font (reused by WM_PAINT handler)
+    if (!g_analysisFont) {
+        g_analysisFont = CreateFont(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    }
+
     g_analysisHwnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
         g_analysisClassName, L"",
@@ -354,6 +360,10 @@ void DestroyAnalysisOverlay() {
     if (g_analysisHwnd) {
         DestroyWindow(g_analysisHwnd);
         g_analysisHwnd = nullptr;
+    }
+    if (g_analysisFont) {
+        DeleteObject(g_analysisFont);
+        g_analysisFont = nullptr;
     }
 }
 

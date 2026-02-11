@@ -355,7 +355,8 @@ struct MonitorContext {
     std::wstring hdrLutPath;
 
     // Frame timing (calculated from refresh rate)
-    UINT frameTimeMs = 16;  // Default for 60Hz, updated on init
+    UINT frameTimeMs = 16;          // Acquire timeout (with margin), updated on init
+    float frameTimeExactMs = 16.667f; // Precise frame time for pacing (no margin)
 
     // Per-monitor error tracking
     bool enabled = true;           // false = skip in render loop

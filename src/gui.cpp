@@ -70,6 +70,10 @@ void UpdateColorCorrectionControls() {
         return;
     }
 
+    // Suppress repaints during bulk control update to prevent cascade (~24 controls → 1 repaint)
+    HWND scrollPanel = g_gui.hwndScrollPanel[2];  // Corrections tab
+    SendMessage(scrollPanel, WM_SETREDRAW, FALSE, 0);
+
     const auto& settings = g_gui.monitorSettings[g_gui.currentMonitor];
     wchar_t buf[16];
 
@@ -145,6 +149,10 @@ void UpdateColorCorrectionControls() {
     // MHC info display (both sections)
     UpdateMhcInfoDisplay(g_gui.currentMonitor, false);
     UpdateMhcInfoDisplay(g_gui.currentMonitor, true);
+
+    // Re-enable repaints and trigger single
+    SendMessage(scrollPanel, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(scrollPanel, nullptr, TRUE);
 }
 
 

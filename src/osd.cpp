@@ -4,6 +4,8 @@
 #include "osd.h"
 #include "globals.h"
 
+static HFONT g_osdFont = nullptr;
+
 LRESULT CALLBACK OSDWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_PAINT: {
@@ -35,13 +37,9 @@ LRESULT CALLBACK OSDWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Draw text
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(255, 255, 255));
-        HFONT font = CreateFont(24, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT oldFont = (HFONT)SelectObject(hdc, font);
+        HFONT oldFont = (HFONT)SelectObject(hdc, g_osdFont);
         DrawText(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldFont);
-        DeleteObject(font);
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -58,14 +56,10 @@ void ShowOSD(const wchar_t* text) {
 
     // Calculate size based on text
     HDC hdc = GetDC(g_osdHwnd);
-    HFONT font = CreateFont(24, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HFONT oldFont = (HFONT)SelectObject(hdc, font);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_osdFont);
     SIZE textSize;
     GetTextExtentPoint32(hdc, text, (int)wcslen(text), &textSize);
     SelectObject(hdc, oldFont);
-    DeleteObject(font);
     ReleaseDC(g_osdHwnd, hdc);
 
     int padding = 20;
@@ -105,6 +99,13 @@ bool CreateOSDWindow(HINSTANCE hInstance) {
     wcOSD.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassEx(&wcOSD);
 
+    // Create cached font (reused by WM_PAINT and ShowOSD)
+    if (!g_osdFont) {
+        g_osdFont = CreateFont(24, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+
     g_osdHwnd = CreateWindowEx(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
         g_osdClassName, L"",
@@ -118,4 +119,11 @@ bool CreateOSDWindow(HINSTANCE hInstance) {
     SetLayeredWindowAttributes(g_osdHwnd, 0, 230, LWA_ALPHA);
 
     return true;
+}
+
+void DestroyOSDFont() {
+    if (g_osdFont) {
+        DeleteObject(g_osdFont);
+        g_osdFont = nullptr;
+    }
 }

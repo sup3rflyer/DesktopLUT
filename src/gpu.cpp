@@ -183,7 +183,7 @@ bool InitD3D() {
 
     // Create constant buffer for shader parameters
     D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = 256;  // 64 floats (16 float4s) - includes grayscale peak
+    cbDesc.ByteWidth = 272;  // 68 floats (17 float4s) - includes motion bar
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;

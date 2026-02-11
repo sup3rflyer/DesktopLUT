@@ -53,7 +53,9 @@ extern std::atomic<bool> g_forceTopmostReassert; // Force TOPMOST reassert on ne
 extern std::atomic<bool> g_logPeakDetection;   // Debug: log detected peak nits to console
 extern std::atomic<bool> g_consoleEnabled;     // Show console window (GUI mode only)
 extern std::atomic<bool> g_showFrameTiming;    // Show frame timing in analysis overlay
+extern std::atomic<bool> g_showMotionBar;      // Show motion bar for judder detection (UFO test style)
 extern std::atomic<bool> g_overlayAutoSleep;   // true = overlay has nothing to do, windows hidden
+extern HANDLE g_overlayWakeEvent;              // Auto-reset event for auto-sleep wake (replaces Sleep polling)
 
 // ============================================================================
 // Hotkey Settings
