@@ -16,11 +16,15 @@
 #include <iomanip>
 #include <algorithm>
 
+#ifndef STATUS_GRAPHICS_PRESENT_OCCLUDED
+#define STATUS_GRAPHICS_PRESENT_OCCLUDED ((DWORD)0xC01E05A1)
+#endif
+
 // ============================================================================
 // SECTION: Compositor Clock & Display Power
 // ============================================================================
 
-// Compositor Clock API (Windows 10 1903+) for VRR-aware frame timing
+// Compositor Clock API (Windows 11+) for VBlank-aligned frame timing
 // Dynamically loaded to maintain compatibility with older Windows
 PFN_DCompositionWaitForCompositorClock g_pfnWaitForCompositorClock = nullptr;
 
@@ -31,9 +35,9 @@ void InitCompositorClock() {
             GetProcAddress(hDcomp, "DCompositionWaitForCompositorClock");
     }
     if (g_pfnWaitForCompositorClock) {
-        std::cout << "Compositor Clock API: available" << std::endl;
+        std::cout << "Frame sync: Compositor Clock API (VBlank-aligned)" << std::endl;
     } else {
-        std::cout << "Compositor Clock API: not available (using DwmFlush fallback)" << std::endl;
+        std::cout << "Frame sync: DwmFlush fallback (post-composition)" << std::endl;
     }
 }
 
@@ -262,7 +266,7 @@ bool CreateSwapChain(MonitorContext* ctx) {
     }
 
     // Set maximum frame latency to 1 for minimum latency
-    // Note: We don't use the waitable object for pacing (DwmFlush works better with DirectComposition)
+    // Note: We don't use the waitable object for pacing (compositor sync in RenderAll handles it)
     // but SetMaximumFrameLatency still limits the present queue to prevent frame buildup
     ctx->swapchain->SetMaximumFrameLatency(1);
 
@@ -503,29 +507,19 @@ void RenderMonitor(MonitorContext* ctx) {
 
     if (!ctx->swapchain || !ctx->rtv) return;
 
-    // Acquire next frame from desktop duplication (non-blocking).
-    // Frame pacing is handled by compositor sync in RenderAll(), so we only need
-    // Try instant capture first (catches context menus, cursor changes, etc.)
-    // If no frame ready, DwmFlush syncs to compositor then blocking acquire gets the frame.
-    // DWM composes at 60Hz regardless of display refresh rate — DD delivery matches compositor.
+    // Acquire next frame from desktop duplication (non-blocking only).
+    // Frame pacing is handled by compositor sync in RenderAll() — we just grab whatever
+    // frame the compositor produced. If desktop is static, no frame is available and
+    // DirectComposition holds the last presented buffer (overlay stays visible).
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
-    bool frameAcquired = false;
 
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        DwmFlush();
-        hr = ctx->duplication->AcquireNextFrame(ctx->frameTimeMs, &frameInfo, &desktopResource);
-    }
-
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // No new frame available - nothing to render
-        // Reset watchdog since the duplication interface is working (just no desktop changes)
-        // This prevents false watchdog triggers when monitor is off or desktop is static
+        // No new frame from compositor — desktop is static or frame not yet ready.
+        // DirectComposition holds the last presented buffer, so overlay stays visible.
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Still need to handle initial visibility even without new frames
-        // (window waits to be shown after DirectComposition commit)
-        // Skip if VRR whitelist is hiding overlays (passthrough mode)
         if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)
             && !g_vrrWhitelistActive.load() && !g_overlayAutoSleep.load()) {
             ctx->framesAfterCommit++;
@@ -566,8 +560,6 @@ void RenderMonitor(MonitorContext* ctx) {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         return;
     }
-
-    frameAcquired = true;
 
     // Skip mouse-only frames (no desktop pixels changed, just cursor position update).
     // Desktop Duplication delivers a frame for every cursor update even when no desktop
@@ -890,7 +882,7 @@ void RenderMonitor(MonitorContext* ctx) {
         UpdateAnalysisDisplay(ctx);
     }
 
-    // Present immediately - DwmFlush at start of loop handles sync
+    // Present immediately - compositor sync at start of RenderAll handles frame pacing
     UINT presentFlags = g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0;
     HRESULT presentHr = ctx->swapchain->Present(0, presentFlags);
 
@@ -949,10 +941,9 @@ void RenderMonitor(MonitorContext* ctx) {
         }
     }
 
-    // Release the frame after rendering is complete
-    if (frameAcquired) {
-        ctx->duplication->ReleaseFrame();
-    }
+    // Release DD frame after rendering — SRV references DD's texture directly (not a copy),
+    // so the frame must be held until all GPU draw commands are queued.
+    ctx->duplication->ReleaseFrame();
 }
 
 // ============================================================================
@@ -983,6 +974,19 @@ void RenderAll() {
         return;
     }
 
+    // When auto-sleeping, skip rendering entirely — wait for wake event.
+    // Must happen before compositor sync: WaitForCompositorClock keeps VBlank
+    // interrupts active, wasting power when nobody needs frames.
+    if (g_overlayAutoSleep.load()) {
+        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+        if (g_overlayWakeEvent) {
+            WaitForSingleObject(g_overlayWakeEvent, 500);
+        } else {
+            Sleep(50);
+        }
+        return;
+    }
+
     // Check for forced reinit (e.g., resume from sleep)
     if (g_forceReinit.exchange(false)) {
         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
@@ -1008,6 +1012,27 @@ void RenderAll() {
         ReapplyAllMhcProfiles();
         // Force TOPMOST reassert after wake (z-order most likely disrupted)
         g_forceTopmostReassert.store(true);
+    }
+
+    // ── Frame sync: wait for next compositor cycle ──
+    // Compositor Clock (Win11+): wakes at VBlank start — full frame budget, consistent timing
+    // DwmFlush fallback (Win10): wakes after DWM compositing — ~1-2ms variable offset
+    if (g_pfnWaitForCompositorClock) {
+        HANDLE handles[] = { g_overlayWakeEvent };
+        DWORD handleCount = g_overlayWakeEvent ? 1 : 0;
+        DWORD result = g_pfnWaitForCompositorClock(handleCount,
+                                                    handleCount ? handles : nullptr,
+                                                    INFINITE);
+        if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+            // Display is off — backoff to avoid CPU spin
+            Sleep(100);
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return;
+        }
+        // WAIT_OBJECT_0 + handleCount = compositor tick → render a frame
+        // WAIT_OBJECT_0 + 0 = wake event signaled → also proceed (something changed)
+    } else {
+        DwmFlush();
     }
 
     // Periodically reassert TOPMOST to prevent other windows pushing us down
@@ -1122,17 +1147,6 @@ void RenderAll() {
             }
             std::cout << "Auto-sleep: overlay needed again, waking" << std::endl;
         }
-    }
-
-    // When auto-sleeping, skip rendering entirely — wait for wake event or 500ms timeout
-    if (g_overlayAutoSleep.load()) {
-        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-        if (g_overlayWakeEvent) {
-            WaitForSingleObject(g_overlayWakeEvent, 500);
-        } else {
-            Sleep(50);
-        }
-        return;
     }
 
     for (auto& ctx : g_monitors) {

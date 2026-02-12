@@ -12,7 +12,7 @@ bool CreateSwapChain(MonitorContext* ctx);
 // Initialize DirectComposition device (shared)
 bool InitDirectCompositionDevice();
 
-// Initialize Compositor Clock API (VRR-aware frame timing)
+// Initialize Compositor Clock API (Windows 11+ frame timing, DwmFlush fallback on Win10)
 void InitCompositorClock();
 
 // Initialize DirectComposition for a monitor
@@ -44,5 +44,5 @@ void RegisterDisplayPowerNotification(HWND hwnd);
 void UnregisterDisplayPowerNotification();
 
 // Compositor Clock API availability (for status display)
-typedef HRESULT (WINAPI *PFN_DCompositionWaitForCompositorClock)(UINT, const HANDLE*, DWORD);
+typedef DWORD (WINAPI *PFN_DCompositionWaitForCompositorClock)(UINT, const HANDLE*, DWORD);
 extern PFN_DCompositionWaitForCompositorClock g_pfnWaitForCompositorClock;
