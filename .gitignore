@@ -21,8 +21,8 @@ ipch/
 # Calibration data
 *.csv
 
-# Reference PDFs (copyrighted)
-resources/*.pdf
+# Resources (research docs, PDFs, internal references)
+resources/
 
 # Claude Code
 .claude/
