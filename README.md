@@ -39,6 +39,7 @@ However, the layers stack: each one processes the output of the one before it. I
 - Multi-monitor with independent settings per display
 - App whitelist — auto-disable corrections for games and video players
 - Passthrough mode — auto-hide overlay to preserve VRR for whitelisted apps
+- Predictive frame pacer — three-tier adaptive sync with sub-0.1ms jitter (MMCSS + QPC spin-wait)
 - System tray operation, optional auto-start with Windows
 - No input lag — ~1 frame of visual latency only; input goes directly to apps
 

@@ -48,6 +48,8 @@ std::atomic<bool> g_showFrameTiming{ false };  // Show frame timing in analysis 
 std::atomic<bool> g_showMotionBar{ false };    // Show motion bar for judder detection (default off)
 std::atomic<bool> g_overlayAutoSleep{ false };  // true = overlay has nothing to do, windows hidden
 HANDLE g_overlayWakeEvent = nullptr;           // Auto-reset event for auto-sleep wake
+std::atomic<bool> g_framePacerEnabled{ true };  // Enable predictive frame pacer (default: true)
+std::atomic<bool> g_framePacerSpinWait{ true }; // Enable spin-wait phase (default: true)
 
 // ============================================================================
 // Hotkey Settings

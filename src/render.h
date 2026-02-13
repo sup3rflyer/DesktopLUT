@@ -5,6 +5,7 @@
 
 #include "types.h"
 #include "whitelist.h"
+#include "framepacer.h"
 
 // Create swapchain for a monitor
 bool CreateSwapChain(MonitorContext* ctx);
@@ -28,10 +29,10 @@ void UpdateHDRMetadata(MonitorContext* ctx);
 void ResizeSwapChain(MonitorContext* ctx, int width, int height);
 
 // Render a single monitor
-void RenderMonitor(MonitorContext* ctx);
+void RenderMonitor(MonitorContext* ctx, FramePacer* fp);
 
 // Main render loop for all monitors
-void RenderAll();
+void RenderAll(FramePacer* fp);
 
 // Overlay window procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

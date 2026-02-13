@@ -439,6 +439,8 @@ void SaveSettings() {
     WritePrivateProfileBool(L"General", L"ConsoleLog", g_consoleEnabled.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ShowFrameTiming", g_showFrameTiming.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ShowMotionBar", g_showMotionBar.load(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"FramePacerEnabled", g_framePacerEnabled.load(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"FramePacerSpinWait", g_framePacerSpinWait.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"GammaWhitelist", g_gammaWhitelistRaw.c_str(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"VRRWhitelist", g_vrrWhitelistRaw.c_str(), iniPath.c_str());
@@ -491,6 +493,8 @@ void LoadSettings() {
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
     g_showFrameTiming.store(GetPrivateProfileBool(L"General", L"ShowFrameTiming", false, iniPath.c_str()));
     g_showMotionBar.store(GetPrivateProfileBool(L"General", L"ShowMotionBar", false, iniPath.c_str()));
+    g_framePacerEnabled.store(GetPrivateProfileBool(L"General", L"FramePacerEnabled", true, iniPath.c_str()));
+    g_framePacerSpinWait.store(GetPrivateProfileBool(L"General", L"FramePacerSpinWait", true, iniPath.c_str()));
 
     // Load gamma whitelist
     wchar_t whitelistBuf[1024] = {};

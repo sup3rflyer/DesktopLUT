@@ -457,7 +457,7 @@ static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
 // SECTION: Render Monitor
 // ============================================================================
 
-void RenderMonitor(MonitorContext* ctx) {
+void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     // Entry validation - skip if monitor is disabled
     if (!ctx || !ctx->enabled) return;
 
@@ -573,6 +573,9 @@ void RenderMonitor(MonitorContext* ctx) {
 
     // Reset consecutive failures on successful frame acquisition
     ctx->consecutiveFailures = 0;
+
+    // Update frame pacer composition offset EMA
+    if (fp) FramePacerRecordAcquisition(fp);
 
     // Got a new frame - get the texture
     ID3D11Texture2D* frameTexture = nullptr;
@@ -915,6 +918,13 @@ void RenderMonitor(MonitorContext* ctx) {
             } else {
                 ctx->lastFrameTime = std::chrono::steady_clock::now();
             }
+            // Feed frame pacer stats into FrameTimingStats for analysis overlay
+            if (fp) {
+                ctx->frameTimingStats.pacerStrategy = fp->strategy;
+                ctx->frameTimingStats.syncJitterMs = fp->syncJitterMs;
+                ctx->frameTimingStats.compositionOffsetMs = fp->compositionOffsetMs;
+                ctx->frameTimingStats.spinWaitMs = fp->lastSpinWaitMs;
+            }
         } else {
             // Reset so we get a fresh baseline when analysis is toggled on
             ctx->lastFrameTime = {};
@@ -950,7 +960,7 @@ void RenderMonitor(MonitorContext* ctx) {
 // SECTION: Render Loop
 // ============================================================================
 
-void RenderAll() {
+void RenderAll(FramePacer* fp) {
     int activeCount = 0;
 
     // Device health is checked reactively when Present() or AcquireNextFrame() returns
@@ -990,6 +1000,8 @@ void RenderAll() {
     // Check for forced reinit (e.g., resume from sleep)
     if (g_forceReinit.exchange(false)) {
         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+        // Reset frame pacer EMA (force re-convergence after wake)
+        if (fp) fp->offsetSampleCount = 0;
         std::cout << "Forcing reinit of all monitors..." << std::endl;
         // Give system time to stabilize after wake
         Sleep(500);
@@ -1014,25 +1026,13 @@ void RenderAll() {
         g_forceTopmostReassert.store(true);
     }
 
-    // ── Frame sync: wait for next compositor cycle ──
-    // Compositor Clock (Win11+): wakes at VBlank start — full frame budget, consistent timing
-    // DwmFlush fallback (Win10): wakes after DWM compositing — ~1-2ms variable offset
-    if (g_pfnWaitForCompositorClock) {
-        HANDLE handles[] = { g_overlayWakeEvent };
-        DWORD handleCount = g_overlayWakeEvent ? 1 : 0;
-        DWORD result = g_pfnWaitForCompositorClock(handleCount,
-                                                    handleCount ? handles : nullptr,
-                                                    INFINITE);
-        if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-            // Display is off — backoff to avoid CPU spin
-            Sleep(100);
-            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-            return;
-        }
-        // WAIT_OBJECT_0 + handleCount = compositor tick → render a frame
-        // WAIT_OBJECT_0 + 0 = wake event signaled → also proceed (something changed)
-    } else {
-        DwmFlush();
+    // ── Frame sync: wait for next compositor cycle via frame pacer ──
+    // Strategy A (Win11+): CompositorClock + predictive offset + spin-wait
+    // Strategy B (Win10): DwmFlush + DwmTimingInfo + spin-wait
+    // Strategy C (fallback): CompositorClock or DwmFlush only (legacy behavior)
+    if (!FramePacerWaitForNextFrame(fp, g_overlayWakeEvent)) {
+        // Display off or occluded — skip this frame
+        return;
     }
 
     // Periodically reassert TOPMOST to prevent other windows pushing us down
@@ -1137,6 +1137,8 @@ void RenderAll() {
         } else if (anyMonitorNeedsOverlay && g_overlayAutoSleep.load()) {
             g_overlayAutoSleep.store(false);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            // Reset frame pacer EMA on wake (force re-convergence)
+            if (fp) fp->offsetSampleCount = 0;
             // Don't force-show here — RenderMonitor's two-phase visibility handles it
             // Just mark dcompCommitted = false so windows go through proper show sequence
             for (auto& ctx : g_monitors) {
@@ -1151,7 +1153,7 @@ void RenderAll() {
 
     for (auto& ctx : g_monitors) {
         if (ctx.enabled) {
-            RenderMonitor(&ctx);
+            RenderMonitor(&ctx, fp);
             activeCount++;
         }
     }

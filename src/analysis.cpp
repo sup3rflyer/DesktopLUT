@@ -234,7 +234,22 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ss << L"   Min:   " << std::setw(6) << data.frameTiming.minMs << L" ms\n";
                 ss << L"   Max:   " << std::setw(6) << data.frameTiming.maxMs << L" ms\n";
                 ss << L"   Jit:   " << std::setw(6) << data.frameTiming.varianceMs << L" ms\n";
-                ss << L"   Sync:  " << (data.frameTiming.compositorClockAvailable ? L"CompClock" : L"DwmFlush") << L"\n";
+                // Show pacer strategy and metrics
+                {
+                    const wchar_t* syncName = L"DwmFlush";
+                    if (data.frameTiming.pacerStrategy == FramePacerStrategy::CompositorClockPredictive)
+                        syncName = L"CC+Predict";
+                    else if (data.frameTiming.pacerStrategy == FramePacerStrategy::DwmFlushPredictive)
+                        syncName = L"Dwm+Predict";
+                    else if (data.frameTiming.compositorClockAvailable)
+                        syncName = L"CompClock";
+                    ss << L"   Sync:  " << syncName << L"\n";
+                }
+                if (data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly) {
+                    ss << L"   PJit:  " << std::setw(6) << data.frameTiming.syncJitterMs << L" ms\n";
+                    ss << L"   Offs:  " << std::setw(6) << data.frameTiming.compositionOffsetMs << L" ms\n";
+                    ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
+                }
             }
         } else {
             ss << L" ANALYSIS (SDR)\n";
@@ -274,7 +289,22 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ss << L"   Min:   " << std::setw(6) << data.frameTiming.minMs << L" ms\n";
                 ss << L"   Max:   " << std::setw(6) << data.frameTiming.maxMs << L" ms\n";
                 ss << L"   Jit:   " << std::setw(6) << data.frameTiming.varianceMs << L" ms\n";
-                ss << L"   Sync:  " << (data.frameTiming.compositorClockAvailable ? L"CompClock" : L"DwmFlush") << L"\n";
+                // Show pacer strategy and metrics
+                {
+                    const wchar_t* syncName = L"DwmFlush";
+                    if (data.frameTiming.pacerStrategy == FramePacerStrategy::CompositorClockPredictive)
+                        syncName = L"CC+Predict";
+                    else if (data.frameTiming.pacerStrategy == FramePacerStrategy::DwmFlushPredictive)
+                        syncName = L"Dwm+Predict";
+                    else if (data.frameTiming.compositorClockAvailable)
+                        syncName = L"CompClock";
+                    ss << L"   Sync:  " << syncName << L"\n";
+                }
+                if (data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly) {
+                    ss << L"   PJit:  " << std::setw(6) << data.frameTiming.syncJitterMs << L" ms\n";
+                    ss << L"   Offs:  " << std::setw(6) << data.frameTiming.compositionOffsetMs << L" ms\n";
+                    ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
+                }
             }
         }
 
@@ -288,11 +318,14 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             if (oldText) free(oldText);
             SetProp(hwnd, L"AnalysisText", textCopy);
 
-            // Window heights depend on frame timing visibility
-            // HDR: 430 base, +160 with frame timing = 590
-            // SDR: 260 base, +160 with frame timing = 420
+            // Window heights depend on frame timing visibility and pacer metrics
+            // HDR: 430 base, +160 with frame timing, +54 with pacer metrics (3 extra lines)
+            // SDR: 260 base, +160 with frame timing, +54 with pacer metrics
             bool showTiming = g_showFrameTiming.load();
-            int height = data.isHDR ? (showTiming ? 590 : 430) : (showTiming ? 420 : 260);
+            bool showPacer = showTiming && data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly;
+            int height = data.isHDR ? 430 : 260;
+            if (showTiming) height += 160;
+            if (showPacer) height += 54;
             SetWindowPos(hwnd, nullptr, 0, 0, 260, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             InvalidateRect(hwnd, nullptr, FALSE);  // FALSE = don't erase, prevents flicker
         }

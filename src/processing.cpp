@@ -6,6 +6,7 @@
 #include "lut.h"
 #include "color.h"
 #include "render.h"
+#include "framepacer.h"
 #include "capture.h"
 #include "osd.h"
 #include "analysis.h"
@@ -169,6 +170,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     // Initialize Compositor Clock API for VRR-aware frame timing
     InitCompositorClock();
+
+    // Initialize high-precision frame pacer (uses CompositorClock result for strategy selection)
+    FramePacer framePacer = {};
+    InitFramePacer(&framePacer);
 
     // LUT cache
     std::map<std::wstring, std::pair<std::vector<float>, int>> lutCache;
@@ -352,10 +357,13 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         }
 
         if (g_running) {
-            RenderAll();
+            RenderAll(&framePacer);
             // AcquireNextFrame timeout provides CPU yielding
         }
     }
+
+    // Clean up frame pacer (MMCSS, timers, timeEndPeriod)
+    CleanupFramePacer(&framePacer);
 
     // Stop gamma whitelist polling thread
     StopGammaWhitelistThread();

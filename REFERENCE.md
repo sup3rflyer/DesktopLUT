@@ -39,6 +39,10 @@ HotkeyHdrKey=Z
 HotkeyAnalysisEnabled=1
 HotkeyAnalysisKey=X
 
+; Frame pacer settings
+FramePacerEnabled=1    ; 1 = predictive frame pacer (default), 0 = legacy DwmFlush/CompClock only
+FramePacerSpinWait=1   ; 1 = QPC spin-wait for sub-ms precision (default), 0 = sleep-only (less CPU)
+
 ; Startup settings
 StartMinimized=0       ; 1 = start minimized to system tray
 ; Note: Processing auto-starts if any correction is enabled (LUT, Primaries, Grayscale, 2.4 Gamma, Tonemapping)
@@ -249,7 +253,7 @@ Input → Grayscale → Primaries → 3D LUT → Output
 - Gamut: Rec.709, P3-D65 only, Rec.2020 only, out-of-gamut
 - HDR histogram: 5 buckets (0-203, 203-1k, 1k-2k, 2k-4k, 4000+ nits)
 - Session MaxCLL/MaxFALL tracking
-- Frame timing (optional, `ShowFrameTiming=1` in INI): FPS, frame times, jitter, sync method
+- Frame timing (optional, `ShowFrameTiming=1` in INI): FPS, frame times, jitter, sync method, pacer metrics (composition offset EMA, spin-wait duration, pacer jitter)
 
 **Frame timing note**: These metrics measure Desktop Duplication frame delivery timing, not actual display presentation. Values fluctuate based on desktop activity and are useful for debugging the render loop, not for assessing VRR behavior or presentation quality.
 
@@ -267,11 +271,13 @@ Runs 24/7, must be invisible. All operations follow:
 ### Latency Profile
 | Stage | Latency |
 |-------|---------|
-| DwmFlush (composition sync) | 0-16ms |
+| Frame sync (CompClock/DwmFlush + predictive wait) | 0-16ms |
 | AcquireNextFrame | <1ms |
 | GPU shader | <0.1ms |
 | Present (tearing enabled) | Immediate |
 | **Processing overhead** | **~1-2ms** |
+
+**Frame pacer jitter**: ~0.01-0.05ms with predictive strategies (vs ~0.5-2ms with legacy DwmFlush). MMCSS "Pro Audio" thread priority ensures consistent scheduling. Spin-wait adds <2ms CPU per frame (<12% of 60Hz budget).
 
 Full pipeline adds ~1 frame visual latency (inherent to capture-and-reprocess). This is display latency only - input is unaffected since games/apps render directly to the display; the overlay just shows a color-corrected copy.
 

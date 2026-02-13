@@ -217,6 +217,13 @@ struct AnalysisResult {
     uint32_t histogram[5] = {0, 0, 0, 0, 0};  // 0-203, 203-1k, 1k-2k, 2k-4k, 4k+ nits
 };
 
+// Frame pacer strategy (auto-selected at init based on OS capabilities)
+enum class FramePacerStrategy {
+    CompositorClockPredictive = 0,  // Win11+: CompClock + measured offset + spin-wait
+    DwmFlushPredictive = 1,         // Win10: DwmFlush + DwmTimingInfo + spin-wait
+    DwmFlushOnly = 2,               // Fallback: DwmFlush only (current behavior)
+};
+
 // Frame timing statistics (rolling window)
 struct FrameTimingStats {
     float currentMs = 0.0f;      // Last frame time
@@ -226,6 +233,52 @@ struct FrameTimingStats {
     float varianceMs = 0.0f;     // Variance (jitter indicator)
     float fps = 0.0f;            // Current FPS (1000/avgMs)
     bool compositorClockAvailable = false;  // Whether API is available
+    // Frame pacer metrics
+    FramePacerStrategy pacerStrategy = FramePacerStrategy::DwmFlushOnly;
+    float syncJitterMs = 0.0f;        // Pacer sync jitter
+    float compositionOffsetMs = 0.0f; // Composition offset EMA
+    float spinWaitMs = 0.0f;          // Last spin-wait duration
+};
+
+// High-precision frame pacer state
+struct FramePacer {
+    // Strategy
+    FramePacerStrategy strategy = FramePacerStrategy::DwmFlushOnly;
+
+    // QPC
+    int64_t qpcFrequency = 0;                // Cached, never changes
+    int64_t qpcRefreshPeriod = 0;            // From DWM_TIMING_INFO
+    int64_t lastVBlankQpc = 0;               // Last known VBlank timestamp
+
+    // Composition offset EMA (VBlank -> DD frame ready)
+    float compositionOffsetMs = 4.0f;        // Current EMA estimate
+    int offsetSampleCount = 0;               // For initial convergence weighting
+
+    // Timing
+    int64_t lastFrameTargetQpc = 0;          // For jitter measurement
+    int64_t lastFrameQpc = 0;                // QPC at last frame sync
+    float lastSpinWaitMs = 0.0f;             // Duration of last spin-wait
+    float lastSleepMs = 0.0f;                // Duration of last coarse sleep
+    float syncJitterMs = 0.0f;               // Rolling jitter metric
+
+    // Jitter tracking (QPC-based)
+    float jitterHistory[64] = {};            // Rolling jitter samples
+    int jitterIndex = 0;
+    int jitterCount = 0;
+
+    // Adaptive sleep overshoot
+    float sleepOvershootEma = 0.5f;          // EMA of actual-vs-requested sleep
+
+    // MMCSS
+    HANDLE mmcssHandle = nullptr;
+    DWORD mmcssTaskIndex = 0;
+
+    // High-resolution waitable timer
+    HANDLE highResTimer = nullptr;
+
+    // Diagnostics
+    int consecutiveTimeouts = 0;             // DD timeouts after predicted ready
+    int consecutiveEarly = 0;                // DD frames ready before prediction
 };
 
 // Tonemapping curve types (values match shader constants)
