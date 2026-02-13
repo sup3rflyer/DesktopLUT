@@ -46,6 +46,18 @@ static int64_t SnapVBlankForward(int64_t lastVBlank, int64_t refreshPeriod, int6
 }
 
 // ============================================================================
+// RecalcRefreshThresholds — precompute refresh-rate-derived values
+// ============================================================================
+
+static void RecalcRefreshThresholds(FramePacer* fp) {
+    fp->refreshPeriodMs = (float)QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency);
+    fp->minSpinBudgetMs = (std::max)(fp->refreshPeriodMs * 0.06f, 0.3f);
+    fp->safetyValveMs = (std::max)(fp->refreshPeriodMs - 2.0f, 3.0f);
+    fp->outlierFloorMs = (std::max)(fp->refreshPeriodMs * 0.5f, 4.0f);
+    fp->offsetClampMaxMs = (std::min)(fp->refreshPeriodMs * 0.7f, 12.0f);
+}
+
+// ============================================================================
 // InitFramePacer
 // ============================================================================
 
@@ -119,6 +131,14 @@ void InitFramePacer(FramePacer* fp) {
     fp->sleepOvershootEma = 0.5f;
     fp->consecutiveTimeouts = 0;
     fp->consecutiveEarly = 0;
+    fp->consecutiveLate = 0;
+    fp->droppedFrameCount = 0;
+    fp->dwmTimingRefreshCounter = 0;
+
+    // Precompute refresh-rate-derived thresholds
+    if (fp->qpcRefreshPeriod > 0) {
+        RecalcRefreshThresholds(fp);
+    }
 
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -160,9 +180,13 @@ static void HybridWaitUntil(FramePacer* fp, int64_t targetQpc) {
     fp->lastSleepMs = 0.0f;
     fp->lastSpinWaitMs = 0.0f;
 
-    // Phase 1: Coarse sleep (only if > 2ms remaining, leave margin for spin)
-    if (remainingMs > 2.0 && g_framePacerSpinWait.load()) {
-        double sleepMs = remainingMs - 1.5;  // Leave 1.5ms for spin (under MMCSS 2ms quota)
+    // Phase 1: Coarse sleep — adaptive margin based on measured timer precision
+    // Use 2.5x overshoot EMA (covers tail of distribution) + base margin,
+    // but never less than the refresh-rate-proportional floor
+    double spinBudget = (std::max)((double)fp->sleepOvershootEma * 2.5 + 0.2,
+                                   (double)fp->minSpinBudgetMs);
+    if (remainingMs > (spinBudget + 0.5) && g_framePacerSpinWait.load()) {
+        double sleepMs = remainingMs - spinBudget;
 
         LARGE_INTEGER sleepStart;
         QueryPerformanceCounter(&sleepStart);
@@ -187,9 +211,17 @@ static void HybridWaitUntil(FramePacer* fp, int64_t targetQpc) {
         double overshoot = actualSleepMs - sleepMs;
         fp->sleepOvershootEma = fp->sleepOvershootEma * 0.8f + (float)overshoot * 0.2f;
     } else if (!g_framePacerSpinWait.load()) {
-        // Spin-wait disabled: just sleep the full remaining time
-        if (remainingMs > 1.0) {
-            Sleep((DWORD)(remainingMs - 0.5));
+        // Spin-wait disabled: use high-res timer for better precision than Sleep()
+        if (remainingMs > 0.5) {
+            if (fp->highResTimer) {
+                LARGE_INTEGER dueTime;
+                dueTime.QuadPart = -(int64_t)((remainingMs - 0.3) * 10000.0);
+                if (SetWaitableTimer(fp->highResTimer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+                    WaitForSingleObject(fp->highResTimer, (DWORD)(remainingMs + 5.0));
+                }
+            } else if (remainingMs > 1.0) {
+                Sleep((DWORD)(remainingMs - 0.5));
+            }
         }
         return;
     }
@@ -215,8 +247,10 @@ static bool RefreshDwmTimingInfo(FramePacer* fp) {
     DWM_TIMING_INFO ti = {};
     ti.cbSize = sizeof(ti);
     if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod > 0) {
+        bool rateChanged = (fp->qpcRefreshPeriod != ti.qpcRefreshPeriod);
         fp->qpcRefreshPeriod = ti.qpcRefreshPeriod;
         fp->lastVBlankQpc = ti.qpcVBlank;
+        if (rateChanged) RecalcRefreshThresholds(fp);
         return true;
     }
     return false;
@@ -268,15 +302,18 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
         // 2. Record VBlank reference time
         QueryPerformanceCounter(&now);
 
-        // 3. Refresh DWM timing info
+        // 3. Refresh DWM timing info (keeps lastVBlankQpc fresh for RecordAcquisition)
         RefreshDwmTimingInfo(fp);
 
-        // 4. Compute target: VBlank + compositionOffsetEma
+        // 4. Compute target: VBlank wake time + compositionOffsetEma
+        //    CompClock wakes at VBlank so now.QuadPart IS the VBlank reference —
+        //    no need for SnapVBlankForward (that would route through stale lastVBlankQpc
+        //    and an imprecise period, adding prediction noise at non-standard refresh rates)
         int64_t offsetTicks = MsToQpc(fp->compositionOffsetMs, fp->qpcFrequency);
         int64_t targetQpc = now.QuadPart + offsetTicks;
 
-        // Clamp: don't wait past 80% of refresh period (safety valve)
-        int64_t maxWait = (int64_t)(fp->qpcRefreshPeriod * 0.80);
+        // Clamp: don't wait past (refreshPeriod - 2ms) to preserve time for next sync
+        int64_t maxWait = MsToQpc(fp->safetyValveMs, fp->qpcFrequency);
         if (offsetTicks > maxWait) {
             targetQpc = now.QuadPart + maxWait;
         }
@@ -311,7 +348,7 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
         // 2. Record post-flush QPC
         QueryPerformanceCounter(&now);
 
-        // 3. Refresh DWM timing
+        // 3. Refresh DWM timing (keeps lastVBlankQpc fresh for RecordAcquisition)
         RefreshDwmTimingInfo(fp);
 
         // 4. Predict DD-ready time
@@ -401,7 +438,7 @@ void FramePacerRecordAcquisition(FramePacer* fp) {
     // DWM frame drops produce offsets of 8-12ms (vs normal ~4ms) that would slowly
     // poison the EMA and cause stutters during recovery. Use a relative threshold
     // instead of a fixed 15ms cutoff.
-    float outlierThreshold = (std::max)(fp->compositionOffsetMs * 2.0f, 8.0f);
+    float outlierThreshold = (std::max)(fp->compositionOffsetMs * 2.0f, fp->outlierFloorMs);
     if (fp->offsetSampleCount >= 7 && (float)measuredOffsetMs > outlierThreshold) {
         // DWM frame drop detected — skip this sample entirely
         fp->consecutiveTimeouts++;
@@ -430,11 +467,13 @@ void FramePacerRecordAcquisition(FramePacer* fp) {
 
     fp->compositionOffsetMs = fp->compositionOffsetMs * (1.0f - alpha) + (float)measuredOffsetMs * alpha;
 
-    // Clamp to sane range
+    // Clamp to sane range (upper bound scales with refresh rate)
     if (fp->compositionOffsetMs < 1.0f) fp->compositionOffsetMs = 1.0f;
-    if (fp->compositionOffsetMs > 12.0f) fp->compositionOffsetMs = 12.0f;
+    if (fp->compositionOffsetMs > fp->offsetClampMaxMs) fp->compositionOffsetMs = fp->offsetClampMaxMs;
 
-    // Adaptive nudge for consistent drift (not DWM drops, but genuine offset shift)
+    // Nudge down for consistent early drift (EMA stuck too high)
+    // No late-frame nudge needed — EMA with alpha=0.25 naturally converges upward,
+    // and discrete nudge-up jumps cause oscillation during transient DD delivery shifts
     double targetOffsetMs = (double)fp->compositionOffsetMs;
     if (measuredOffsetMs < targetOffsetMs - 1.0) {
         fp->consecutiveEarly++;
@@ -445,4 +484,13 @@ void FramePacerRecordAcquisition(FramePacer* fp) {
     } else {
         fp->consecutiveEarly = 0;
     }
+}
+
+// ============================================================================
+// FramePacerNotifyTimeout — called when AcquireNextFrame(0) returns WAIT_TIMEOUT
+// ============================================================================
+
+void FramePacerNotifyTimeout(FramePacer* fp) {
+    if (fp->strategy == FramePacerStrategy::DwmFlushOnly) return;
+    fp->droppedFrameCount++;
 }

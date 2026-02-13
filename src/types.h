@@ -238,6 +238,8 @@ struct FrameTimingStats {
     float syncJitterMs = 0.0f;        // Pacer sync jitter
     float compositionOffsetMs = 0.0f; // Composition offset EMA
     float spinWaitMs = 0.0f;          // Last spin-wait duration
+    float sleepOvershootMs = 0.0f;    // Sleep overshoot EMA (timer precision indicator)
+    int droppedFrameCount = 0;        // Total DD acquisition timeouts
 };
 
 // High-precision frame pacer state
@@ -279,6 +281,18 @@ struct FramePacer {
     // Diagnostics
     int consecutiveTimeouts = 0;             // DD timeouts after predicted ready
     int consecutiveEarly = 0;                // DD frames ready before prediction
+    int consecutiveLate = 0;                 // DD frames arriving after prediction
+    int droppedFrameCount = 0;               // Total DD acquisition timeouts (for diagnostics)
+
+    // Cached refresh-rate-derived thresholds (recomputed on rate change, not per-frame)
+    float refreshPeriodMs = 16.667f;         // Cached refresh period in ms
+    float minSpinBudgetMs = 1.0f;            // Spin budget floor = max(refreshPeriod * 0.06, 0.3)
+    float safetyValveMs = 14.667f;           // Max wait = refreshPeriod - 2ms
+    float outlierFloorMs = 8.0f;             // Outlier rejection floor = max(refreshPeriod * 0.5, 4.0)
+    float offsetClampMaxMs = 12.0f;          // Upper EMA clamp = min(refreshPeriod * 0.7, 12.0)
+
+    // DWM timing refresh throttle
+    int dwmTimingRefreshCounter = 0;         // Throttle DwmGetCompositionTimingInfo calls
 };
 
 // Tonemapping curve types (values match shader constants)

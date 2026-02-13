@@ -516,6 +516,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
 
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        if (fp) FramePacerNotifyTimeout(fp);
         // No new frame from compositor — desktop is static or frame not yet ready.
         // DirectComposition holds the last presented buffer, so overlay stays visible.
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -924,6 +925,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
                 ctx->frameTimingStats.syncJitterMs = fp->syncJitterMs;
                 ctx->frameTimingStats.compositionOffsetMs = fp->compositionOffsetMs;
                 ctx->frameTimingStats.spinWaitMs = fp->lastSpinWaitMs;
+                ctx->frameTimingStats.sleepOvershootMs = fp->sleepOvershootEma;
+                ctx->frameTimingStats.droppedFrameCount = fp->droppedFrameCount;
             }
         } else {
             // Reset so we get a fresh baseline when analysis is toggled on
@@ -1001,7 +1004,7 @@ void RenderAll(FramePacer* fp) {
     if (g_forceReinit.exchange(false)) {
         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         // Reset frame pacer EMA (force re-convergence after wake)
-        if (fp) fp->offsetSampleCount = 0;
+        if (fp) { fp->offsetSampleCount = 0; fp->dwmTimingRefreshCounter = 0; }
         std::cout << "Forcing reinit of all monitors..." << std::endl;
         // Give system time to stabilize after wake
         Sleep(500);
@@ -1138,7 +1141,7 @@ void RenderAll(FramePacer* fp) {
             g_overlayAutoSleep.store(false);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             // Reset frame pacer EMA on wake (force re-convergence)
-            if (fp) fp->offsetSampleCount = 0;
+            if (fp) { fp->offsetSampleCount = 0; fp->dwmTimingRefreshCounter = 0; }
             // Don't force-show here — RenderMonitor's two-phase visibility handles it
             // Just mark dcompCommitted = false so windows go through proper show sequence
             for (auto& ctx : g_monitors) {

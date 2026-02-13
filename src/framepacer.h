@@ -17,3 +17,6 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent);
 
 // Record that AcquireNextFrame succeeded — updates composition offset EMA
 void FramePacerRecordAcquisition(FramePacer* fp);
+
+// Notify pacer that AcquireNextFrame(0) returned WAIT_TIMEOUT
+void FramePacerNotifyTimeout(FramePacer* fp);
