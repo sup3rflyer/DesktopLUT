@@ -249,6 +249,11 @@ float TonemapBT2390_PQ(float I, float pqSourcePeak, float pqTargetPeak) {
     float KS = 1.5f * maxLum - 0.5f;
     KS = max(KS, 0.0f);
 
+    // Defense-in-depth: skip spline when KS >= 1 (source ≈ target)
+    // Matches libplacebo's guard: if (ks < 1) { ... } else passthrough
+    // Prevents division by zero in t = (E - KS) / (1 - KS) at the singularity
+    if (KS >= 1.0f) return clamp(E * iw, 0.0f, ow);
+
     // Below knee: linear passthrough
     if (E <= KS) {
         return E * iw;  // Denormalize and return
@@ -367,19 +372,30 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     // Get PQ-encoded source peak: all PQ conversion done outside per-pixel path
     // - Static mode: pqSourcePeakCB = PQ(user-specified peak) (precomputed on CPU)
     // - Dynamic mode: peak texture stores PQ(smoothed nits) (computed once per frame in CS)
-    //                 pqSourcePeakCB = PQ(targetPeak * 1.25) as floor for detected peak
+    //                 pqSourcePeakCB = PQ(targetPeak) as floor (per libplacebo: no headroom multiplier)
+    //                 When detected ≤ target → safety clamp passthrough, no curve runs
     float pqSrcPeak;
     if (tonemapDynamic > 0.5f && tonemapTargetPeak > 203.0f) {
         float pqDetected = peakTexture.Load(int3(0, 0, 0));  // Already PQ-encoded by CS
-        pqSrcPeak = max(pqDetected, pqSourcePeakCB);         // CB has PQ(targetPeak*1.25)
+        pqSrcPeak = max(pqDetected, pqSourcePeakCB);         // CB floor = PQ(targetPeak)
     } else {
         pqSrcPeak = pqSourcePeakCB;                           // CB has PQ(staticSourcePeak)
     }
 
     float pqTgtPeak = pqTargetPeak;  // Precomputed from CPU
 
-    // If source peak ≤ target peak, no tonemapping needed (PQ is monotonic, comparison valid)
-    if (pqSrcPeak <= pqTgtPeak) return ictcp;
+    // Smooth crossfade when source peak is near target peak
+    // Prevents flicker when detected peak oscillates near target (hard clip → curve → hard clip)
+    float headroom = pqSrcPeak - pqTgtPeak;
+    float margin = pqTgtPeak * 0.03f;  // 3% PQ crossfade zone (~3-5% brightness)
+
+    // If source peak ≤ target peak, no curve compression needed — hard clip only
+    // (BT.2390 has a singularity at source=target: KS=1.0 causes division by zero)
+    // Clipping I in ICtCp preserves chromaticity (CT/CP unchanged) — reduces brightness only
+    if (headroom <= 0.0f) {
+        ictcp.x = min(ictcp.x, pqTgtPeak);
+        return ictcp;
+    }
 
     // Apply PQ-native curve directly on I channel
     float I_mapped;
@@ -398,7 +414,7 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     else if (tonemapCurve < 3.5f) {
         // BT.2446A - linear-space (complex gamma operations don't translate to PQ)
         // Need nits for normalization — convert PQ source peak back to linear
-        float sourcePeakNits = PQ_to_Linear_scalar(pqSrcPeak) * 10000.0f;
+        float sourcePeakNits = max(PQ_to_Linear_scalar(pqSrcPeak) * 10000.0f, 1.0f);
         float nits = PQ_to_Linear_scalar(I) * 10000.0f;
         float normalized = nits / sourcePeakNits;
         float targetNormalized = tonemapTargetPeak / sourcePeakNits;
@@ -408,6 +424,14 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     else {
         // Hard clip - trivial PQ native
         I_mapped = TonemapHardClip_PQ(I, pqTgtPeak);
+    }
+
+    // Crossfade between hard clip and curve when source peak barely exceeds target
+    // With breathing room (BT.2390/BT.2446A): headroom is always large, blend=1, crossfade is moot
+    // Without breathing room (SoftClip/Reinhard/HardClip): smooth transition prevents flicker
+    if (headroom < margin) {
+        float blend = headroom / margin;
+        I_mapped = lerp(min(I, pqTgtPeak), I_mapped, blend);
     }
 
     // Return with CT/CP unchanged - hue and saturation preserved!
@@ -765,22 +789,22 @@ groupshared float sharedMax[256];
 [numthreads(256, 1, 1)]
 void main(uint3 GTid : SV_GroupThreadID) {
     // Each thread samples a grid of pixels across the image
-    // 256 threads, each samples ~16 points = 4096 sample points total
+    // 80x45 = 3600 samples in 16:9 aspect ratio
     float localMax = 0.0f;
 
-    uint samplesPerThread = 16;
-    uint totalSamples = 256 * samplesPerThread;
+    uint gridX = 80, gridY = 45;
+    uint totalSamples = gridX * gridY;  // 3600
+    uint samplesPerThread = (totalSamples + 255) / 256;  // 15 (ceil)
 
     for (uint i = 0; i < samplesPerThread; i++) {
         uint sampleIdx = GTid.x * samplesPerThread + i;
+        if (sampleIdx >= totalSamples) break;
 
-        // Distribute samples across the image in a grid pattern
-        uint gridSize = 64;  // 64x64 grid = 4096 points
-        uint gx = sampleIdx % gridSize;
-        uint gy = sampleIdx / gridSize;
+        uint gx = sampleIdx % gridX;
+        uint gy = sampleIdx / gridX;
 
-        uint px = (gx * frameWidth) / gridSize;
-        uint py = (gy * frameHeight) / gridSize;
+        uint px = (gx * frameWidth) / gridX;
+        uint py = (gy * frameHeight) / gridY;
 
         if (px < frameWidth && py < frameHeight) {
             float4 pixel = inputTexture.Load(int3(px, py, 0));
@@ -803,13 +827,23 @@ void main(uint3 GTid : SV_GroupThreadID) {
 
     // Thread 0 applies temporal smoothing with slew limiting
     if (GTid.x == 0) {
-        float framePeak = sharedMax[0];
-        float prevPeak = peakOutput[uint2(0, 0)];
+        float framePeak = sharedMax[0];  // nits from reduction
 
-        // Initialize on first frame
-        if (prevPeak <= 0.0f) prevPeak = framePeak;
+        // Read previous smoothed peak (stored as PQ) and convert back to nits
+        // peakOutput stores PQ-encoded values for the pixel shader, but smoothing
+        // must happen in nits domain (slew limits are nits-based)
+        float prevPQ = peakOutput[uint2(0, 0)];
+        float prevPeak;
+        if (prevPQ <= 0.0f) {
+            prevPeak = framePeak;  // Initialize on first frame
+        } else {
+            // PQ EOTF: PQ → linear → nits (inverse of encoding below)
+            float Np = pow(prevPQ, 1.0f / 78.84375f);
+            float L = pow(max(Np - 0.8359375f, 0.0f) / max(18.8515625f - 18.6875f * Np, 1e-10f), 1.0f / 0.1593017578125f);
+            prevPeak = L * 10000.0f;
+        }
 
-        // Hybrid: exponential smoothing + slew rate limiting
+        // Hybrid: exponential smoothing + slew rate limiting (all in nits)
         // Exponential gives smooth small changes, slew limit prevents jarring jumps
         float target;
         float maxDelta;
@@ -827,11 +861,11 @@ void main(uint3 GTid : SV_GroupThreadID) {
         // Upper clamp prevents overflow from corrupted frames
         smoothedPeak = clamp(smoothedPeak, 0.0f, 10000.0f);
 
-        // Convert smoothed nits to PQ signal (runs once per frame, 1 thread)
-        // This moves the PQ conversion out of the per-pixel pixel shader path
-        float Y = max(smoothedPeak / 10000.0, 1e-10);
-        float Ym = pow(Y, 0.1593017578125);
-        peakOutput[uint2(0, 0)] = pow((0.8359375 + 18.8515625 * Ym) / (1.0 + 18.6875 * Ym), 78.84375);
+        // Convert smoothed nits to PQ for storage (pixel shader reads as PQ)
+        // PQ OETF: nits → linear → PQ (runs once per frame, 1 thread)
+        float Y = max(smoothedPeak / 10000.0f, 1e-10f);
+        float Ym = pow(Y, 0.1593017578125f);
+        peakOutput[uint2(0, 0)] = pow((0.8359375f + 18.8515625f * Ym) / (1.0f + 18.6875f * Ym), 78.84375f);
     }
 }
 )";
@@ -911,13 +945,8 @@ void main(uint3 GTid : SV_GroupThreadID) {
     uint localClipBlack = 0, localClipWhite = 0;
     uint localHist0 = 0, localHist1 = 0, localHist2 = 0, localHist3 = 0, localHist4 = 0;
 
-    // Aspect-ratio-aware grid: ~4096 samples distributed proportionally
-    // gridX = sqrt(4096 * aspectRatio), gridY = sqrt(4096 / aspectRatio)
-    float aspectRatio = (float)frameWidth / (float)frameHeight;
-    uint gridX = (uint)sqrt(4096.0f * aspectRatio);
-    uint gridY = (uint)sqrt(4096.0f / aspectRatio);
-    if (gridX < 1) gridX = 1;
-    if (gridY < 1) gridY = 1;
+    // Fixed 16:9 grid: 80x45 = 3600 samples (matches peak detection CS)
+    uint gridX = 80, gridY = 45;
     uint totalSamples = gridX * gridY;
 
     // Each thread samples totalSamples/256 points (rounded up)

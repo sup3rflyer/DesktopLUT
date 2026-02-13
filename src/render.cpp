@@ -650,12 +650,12 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     }
 
     // Check if atomic toggles changed → mark constant buffer dirty
+    // Cache values are updated only AFTER successful constant buffer write (below)
+    // to ensure retries on Map failure
     bool curGamma = g_desktopGammaMode.load();
     bool curTetrahedral = g_tetrahedralInterp.load();
     if (curGamma != ctx->lastDesktopGamma || curTetrahedral != ctx->lastTetrahedralInterp) {
         ctx->cbDirty = true;
-        ctx->lastDesktopGamma = curGamma;
-        ctx->lastTetrahedralInterp = curTetrahedral;
     }
 
     // Motion bar position changes every frame — force CB update when enabled
@@ -710,8 +710,17 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
         // Row 6: Tonemapping parameters
         // Slot [24]: PQ-encoded source peak (avoids per-pixel pow() in pixel shader)
         if (cc.tonemap.dynamicPeak) {
-            // Dynamic: PQ of (targetPeak * 1.25) as floor for GPU-detected peak
-            cbData[24] = LinearToPQScalar(cc.tonemap.targetPeakNits * 1.25f / 10000.0f);
+            // Dynamic: floor ensures detected peak can't drop below a minimum
+            // BT.2390/BT.2446A: raised floor guarantees compression headroom on high-nit displays
+            //   ratio scales from 1.0× at 400 nits to 1.5× at 4000 nits (smooth highlight rolloff)
+            // Other curves: floor at target peak (passthrough when detected ≤ target)
+            float floorNits = cc.tonemap.targetPeakNits;
+            if (cc.tonemap.curve == TonemapCurve::BT2390 || cc.tonemap.curve == TonemapCurve::BT2446A) {
+                float t = (std::clamp)(((std::max)(cc.tonemap.targetPeakNits, 400.0f) - 400.0f) / 3600.0f, 0.0f, 1.0f);
+                float ratio = 1.0f + t * 0.5f;
+                floorNits = cc.tonemap.targetPeakNits * ratio;
+            }
+            cbData[24] = LinearToPQScalar(floorNits / 10000.0f);
         } else {
             // Static: PQ of user-specified source peak (fallback 1000 nits)
             float srcPeak = (cc.tonemap.sourcePeakNits > 0.0f) ? cc.tonemap.sourcePeakNits : 1000.0f;
@@ -748,8 +757,13 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
         cbData[66] = 0.0f;  // reserved
         cbData[67] = 0.0f;  // reserved
         g_context->Unmap(g_constantBuffer, 0);
+
+        // Only clear dirty flag and update cached atomics AFTER successful write.
+        // If Map failed, cbDirty stays true so we retry next frame.
+        ctx->cbDirty = false;
+        ctx->lastDesktopGamma = curGamma;
+        ctx->lastTetrahedralInterp = curTetrahedral;
     }
-    ctx->cbDirty = false;
     } // end if cbDirty
 
     // Select the appropriate LUT based on HDR mode (no fallback - SDR/HDR LUTs are incompatible)
