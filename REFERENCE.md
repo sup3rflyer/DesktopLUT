@@ -98,7 +98,7 @@ HDR processing uses the Dolby ICtCp color space for perceptually accurate tonema
 
 **Processing Order**: Grayscale before tonemap because grayscale is display calibration (constant, measured without tonemap), while tonemapping is content-dependent (user preference).
 
-**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). Only 2 pow() ops for peak conversion (curve evaluation uses closed-form math). BT.2446A uses linear-space (6 pow() due to complex gamma operations).
+**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). Only 2 pow() ops for peak conversion (curve evaluation uses closed-form math). BT.2446A uses linear-space (6 pow() due to complex gamma operations). Guards: BT.2390 KS≥1 singularity passthrough, BT.2446A 1-nit division floor. Dynamic mode: BT.2390/BT.2446A get target-relative breathing room (1.0×–1.5× floor scaling with target nits) for guaranteed compression headroom on high-nit displays. 3% PQ hysteresis crossfade prevents flicker when detected peak oscillates near target.
 
 Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
 
@@ -257,7 +257,7 @@ Input → Grayscale → Primaries → 3D LUT → Output
 
 **Frame timing note**: These metrics measure Desktop Duplication frame delivery timing, not actual display presentation. Values fluctuate based on desktop activity and are useful for debugging the render loop, not for assessing VRR behavior or presentation quality.
 
-Implementation: Compute shader samples ~4096 pixels, async readback with 2-frame delay.
+Implementation: Compute shader samples 3600 pixels (80x45 grid), async readback with 2-frame delay.
 
 ## Performance
 

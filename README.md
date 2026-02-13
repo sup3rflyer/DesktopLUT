@@ -186,7 +186,7 @@ DesktopLUT includes a full HDR tonemapping engine that operates in the ICtCp col
 - **BT.2446A** — ITU-R method A
 - **Hard Clip** — Simple clamp
 
-**Dynamic mode** detects the actual peak brightness of each frame via a compute shader and adjusts the source peak in real-time. This means dark scenes aren't over-compressed and bright scenes get proper rolloff. Falls back to static when content is below SDR reference white (203 nits).
+**Dynamic mode** detects the actual peak brightness of each frame via a compute shader and adjusts the source peak in real-time. This means dark scenes aren't over-compressed and bright scenes get proper rolloff. Falls back to static when content is below SDR reference white (203 nits). BT.2390 and BT.2446A automatically apply breathing room above the target peak so high-nit displays always get smooth highlight gradients. A hysteresis crossfade prevents flicker when the detected peak hovers near the target.
 
 ### Bypassing Double Tonemapping
 
