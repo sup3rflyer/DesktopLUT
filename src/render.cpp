@@ -921,6 +921,14 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
             }
             // Feed frame pacer stats into FrameTimingStats for analysis overlay
             if (fp) {
+                // Reset pacer diagnostics on analysis overlay toggle
+                if (g_resetPacerStats.exchange(false)) {
+                    fp->droppedFrameCount = 0;
+                    fp->sleepOvershootEma = 0.5f;
+                    fp->syncJitterMs = 0.0f;
+                    fp->jitterCount = 0;
+                    fp->jitterIndex = 0;
+                }
                 ctx->frameTimingStats.pacerStrategy = fp->strategy;
                 ctx->frameTimingStats.syncJitterMs = fp->syncJitterMs;
                 ctx->frameTimingStats.compositionOffsetMs = fp->compositionOffsetMs;

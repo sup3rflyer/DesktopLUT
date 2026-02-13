@@ -112,7 +112,8 @@ extern std::atomic<bool> g_hasPendingColorCorrections;  // Fast check to avoid m
 extern std::atomic<HWND> g_mainHwnd;     // First monitor's overlay window (for hotkey registration)
 extern HWND g_osdHwnd;      // On-screen display window
 extern HWND g_analysisHwnd; // Analysis overlay window
-extern std::atomic<bool> g_analysisEnabled;  // Analysis overlay visibility
+extern std::atomic<bool> g_analysisEnabled;       // Analysis overlay visibility
+extern std::atomic<bool> g_resetPacerStats;       // Signal render thread to reset pacer diagnostics
 
 // ============================================================================
 // Single Instance Mutex

@@ -105,6 +105,7 @@ std::atomic<HWND> g_mainHwnd{ nullptr };
 HWND g_osdHwnd = nullptr;
 HWND g_analysisHwnd = nullptr;
 std::atomic<bool> g_analysisEnabled{ false };
+std::atomic<bool> g_resetPacerStats{ false };
 
 // ============================================================================
 // Single Instance Mutex

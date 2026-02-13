@@ -406,11 +406,12 @@ void DestroyAnalysisOverlay() {
 
 void ShowAnalysisOverlay() {
     if (g_analysisHwnd) {
-        // Reset session tracking when overlay is opened
+        // Reset session tracking and pacer stats when overlay is opened
         for (auto& ctx : g_monitors) {
             ctx.sessionMaxCLL = 0.0f;
             ctx.sessionMaxFALL = 0.0f;
         }
+        g_resetPacerStats.store(true);
 
         // Set initial placeholder text
         const wchar_t* initialText = L" ANALYSIS\n--------------------\n Collecting data...";
