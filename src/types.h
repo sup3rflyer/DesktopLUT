@@ -224,6 +224,12 @@ enum class FramePacerStrategy {
     DwmFlushOnly = 2,               // Fallback: DwmFlush only (current behavior)
 };
 
+// Cadence lock state (frame pacer steady-state detection)
+enum class CadenceLockState {
+    Unlocked = 0,   // EMA tracking normally
+    Locked = 1,     // Offset frozen, shadow EMA running in background
+};
+
 // Frame timing statistics (rolling window)
 struct FrameTimingStats {
     float currentMs = 0.0f;      // Last frame time
@@ -240,6 +246,7 @@ struct FrameTimingStats {
     float spinWaitMs = 0.0f;          // Last spin-wait duration
     float sleepOvershootMs = 0.0f;    // Sleep overshoot EMA (timer precision indicator)
     int droppedFrameCount = 0;        // Total DD acquisition timeouts
+    bool cadenceLocked = false;       // True when cadence lock is active (frozen offset)
 };
 
 // High-precision frame pacer state
@@ -280,9 +287,24 @@ struct FramePacer {
 
     // Diagnostics
     int consecutiveTimeouts = 0;             // DD timeouts after predicted ready
-    int consecutiveEarly = 0;                // DD frames ready before prediction
-    int consecutiveLate = 0;                 // DD frames arriving after prediction
+    int consecutiveEarly = 0;                // DD frames ready before prediction (unused, kept for compat)
+    int consecutiveLate = 0;                 // DD frames arriving after prediction (unused, kept for compat)
     int droppedFrameCount = 0;               // Total DD acquisition timeouts (for diagnostics)
+
+    // Cadence lock state machine
+    CadenceLockState cadenceLockState = CadenceLockState::Unlocked;
+    float lockedOffset = 0.0f;               // Frozen composition offset when locked
+    float shadowEmaOffset = 4.0f;            // Shadow EMA running while locked (for unlock fallback)
+    int stableFrameCount = 0;                // Consecutive frames with low jitter (for lock qualification)
+
+    // Rolling minimum tracking (bias correction)
+    float rollingMinBuffer[16] = {};         // Last 16 good offset samples
+    int rollingMinIndex = 0;
+    int rollingMinCount = 0;
+    int biasAboveMinCount = 0;               // Consecutive frames where EMA > rollingMin + 1ms
+
+    // Timeout-aware upward adjustment
+    int consecutiveAcquireTimeouts = 0;      // Consecutive AcquireNextFrame(0) timeouts
 
     // Cached refresh-rate-derived thresholds (recomputed on rate change, not per-frame)
     float refreshPeriodMs = 16.667f;         // Cached refresh period in ms
@@ -290,6 +312,8 @@ struct FramePacer {
     float safetyValveMs = 14.667f;           // Max wait = refreshPeriod - 2ms
     float outlierFloorMs = 8.0f;             // Outlier rejection floor = max(refreshPeriod * 0.5, 4.0)
     float offsetClampMaxMs = 12.0f;          // Upper EMA clamp = min(refreshPeriod * 0.7, 12.0)
+    float lockJitterMs = 0.17f;              // Rolling buffer spread to enter lock = max(0.5, period*0.05)
+    float lockDivergenceMs = 1.67f;          // Shadow EMA divergence to exit lock = max(0.4, period*0.03)
 
     // DWM timing refresh throttle
     int dwmTimingRefreshCounter = 0;         // Throttle DwmGetCompositionTimingInfo calls

@@ -168,27 +168,17 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             std::wstring tmStr;
             if (!data.tonemapEnabled) {
                 tmStr = L"Off";
-            } else if (!data.tonemapDynamic) {
-                // Static mode: show source peak, color based on content vs source
-                std::wstringstream tmss;
-                tmss << std::fixed << std::setprecision(0);
-                if (data.result.peakNits > data.tonemapSourcePeak) {
-                    // Content exceeds configured source - clipping (~ prefix, yellow)
-                    tmss << L"~" << data.tonemapSourcePeak;
-                } else {
-                    // Content within range (< prefix, green)
-                    tmss << L"<" << data.tonemapSourcePeak;
-                }
-                tmStr = tmss.str();
             } else {
-                // Dynamic mode: show detected peak or target threshold
+                // Both static and dynamic: compare content peak vs target peak
+                // Green (<target): content below target, tonemapper passing through
+                // Yellow (~peak): content above target, tonemapper compressing
                 std::wstringstream tmss;
                 tmss << std::fixed << std::setprecision(0);
-                if (data.detectedPeak > data.tonemapTargetPeak) {
-                    // Above threshold - compressing (~ prefix, yellow)
-                    tmss << L"~" << data.detectedPeak;
+                if (data.result.peakNits > data.tonemapTargetPeak) {
+                    // Content exceeds target - compressing to target (~ prefix, yellow)
+                    tmss << L"~" << data.tonemapTargetPeak;
                 } else {
-                    // Below threshold - passing through (< prefix, green)
+                    // Content within target - passing through (< prefix, green)
                     tmss << L"<" << data.tonemapTargetPeak;
                 }
                 tmStr = tmss.str();
@@ -247,7 +237,9 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 }
                 if (data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly) {
                     ss << L"   PJit:  " << std::setw(6) << data.frameTiming.syncJitterMs << L" ms\n";
-                    ss << L"   Offs:  " << std::setw(6) << data.frameTiming.compositionOffsetMs << L" ms\n";
+                    ss << L"   Offs:  " << std::setw(6) << data.frameTiming.compositionOffsetMs << L" ms";
+                    if (data.frameTiming.cadenceLocked) ss << L" [LOCK]";
+                    ss << L"\n";
                     ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
                     ss << L"   Ovsh:  " << std::setw(6) << data.frameTiming.sleepOvershootMs << L" ms\n";
                     ss << L"   Drop:  " << std::setw(6) << data.frameTiming.droppedFrameCount << L"\n";
@@ -304,7 +296,9 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 }
                 if (data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly) {
                     ss << L"   PJit:  " << std::setw(6) << data.frameTiming.syncJitterMs << L" ms\n";
-                    ss << L"   Offs:  " << std::setw(6) << data.frameTiming.compositionOffsetMs << L" ms\n";
+                    ss << L"   Offs:  " << std::setw(6) << data.frameTiming.compositionOffsetMs << L" ms";
+                    if (data.frameTiming.cadenceLocked) ss << L" [LOCK]";
+                    ss << L"\n";
                     ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
                     ss << L"   Ovsh:  " << std::setw(6) << data.frameTiming.sleepOvershootMs << L" ms\n";
                     ss << L"   Drop:  " << std::setw(6) << data.frameTiming.droppedFrameCount << L"\n";
@@ -672,20 +666,16 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     // Store latest result
     ctx->analysisResult = result;
 
-    // Get tonemap settings for APL calculation and TM indicator
+    // Get tonemap settings from render thread's live data (not startup snapshot)
+    // ctx->hdrColorCorrection is updated by UpdateColorCorrectionLive, same data the shader uses
     float referencePeak = 1000.0f;
-    bool tmEnabled = false, tmDynamic = false;
-    float tmSourcePeak = 10000.0f, tmTargetPeak = 1000.0f;
-    if (ctx->index < (int)g_gui.activeSettings.size()) {
-        const auto& tonemap = g_gui.activeSettings[ctx->index].hdrColorCorrection.tonemap;
-        tmEnabled = tonemap.enabled;
-        tmDynamic = tonemap.dynamicPeak;
-        tmSourcePeak = tonemap.sourcePeakNits;
-        tmTargetPeak = tonemap.targetPeakNits;
-        // Reference peak for APL: static mode uses source peak, dynamic uses 1000 nits
-        if (!tonemap.dynamicPeak && tonemap.sourcePeakNits > 0.0f) {
-            referencePeak = tonemap.sourcePeakNits;
-        }
+    const auto& tonemap = ctx->hdrColorCorrection.tonemap;
+    bool tmEnabled = ctx->isHDREnabled && tonemap.enabled;
+    bool tmDynamic = tonemap.dynamicPeak;
+    float tmSourcePeak = tonemap.sourcePeakNits > 0.0f ? tonemap.sourcePeakNits : 10000.0f;
+    float tmTargetPeak = tonemap.targetPeakNits > 0.0f ? tonemap.targetPeakNits : 1000.0f;
+    if (!tonemap.dynamicPeak && tonemap.sourcePeakNits > 0.0f) {
+        referencePeak = tonemap.sourcePeakNits;
     }
 
     // Compute and pass frame timing stats

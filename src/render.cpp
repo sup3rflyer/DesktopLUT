@@ -514,9 +514,17 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
 
+    // Take QPC immediately before acquire for cleaner composition offset measurement
+    // (removes variable processing overhead: topmost reassert, color correction, loop iteration)
+    LARGE_INTEGER preAcquireQpc;
+    QueryPerformanceCounter(&preAcquireQpc);
+
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        if (fp) FramePacerNotifyTimeout(fp);
+        // Only primary monitor feeds timeouts — secondary monitors timing out just means
+        // "no new content on that output", not a compositor timing issue.
+        // All monitors feed successful acquisitions (same compositor offset).
+        if (fp && ctx->index == 0) FramePacerNotifyTimeout(fp);
         // No new frame from compositor — desktop is static or frame not yet ready.
         // DirectComposition holds the last presented buffer, so overlay stays visible.
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -575,8 +583,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     // Reset consecutive failures on successful frame acquisition
     ctx->consecutiveFailures = 0;
 
-    // Update frame pacer composition offset EMA
-    if (fp) FramePacerRecordAcquisition(fp);
+    // Update frame pacer composition offset EMA (use pre-acquire QPC for cleaner measurement)
+    if (fp) FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart);
 
     // Got a new frame - get the texture
     ID3D11Texture2D* frameTexture = nullptr;
@@ -942,13 +950,18 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
                     fp->syncJitterMs = 0.0f;
                     fp->jitterCount = 0;
                     fp->jitterIndex = 0;
+                    fp->consecutiveAcquireTimeouts = 0;
                 }
                 ctx->frameTimingStats.pacerStrategy = fp->strategy;
                 ctx->frameTimingStats.syncJitterMs = fp->syncJitterMs;
-                ctx->frameTimingStats.compositionOffsetMs = fp->compositionOffsetMs;
+                ctx->frameTimingStats.compositionOffsetMs =
+                    (fp->cadenceLockState == CadenceLockState::Locked)
+                    ? fp->lockedOffset : fp->compositionOffsetMs;
                 ctx->frameTimingStats.spinWaitMs = fp->lastSpinWaitMs;
                 ctx->frameTimingStats.sleepOvershootMs = fp->sleepOvershootEma;
                 ctx->frameTimingStats.droppedFrameCount = fp->droppedFrameCount;
+                ctx->frameTimingStats.cadenceLocked =
+                    (fp->cadenceLockState == CadenceLockState::Locked);
             }
         } else {
             // Reset so we get a fresh baseline when analysis is toggled on
@@ -1025,8 +1038,16 @@ void RenderAll(FramePacer* fp) {
     // Check for forced reinit (e.g., resume from sleep)
     if (g_forceReinit.exchange(false)) {
         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-        // Reset frame pacer EMA (force re-convergence after wake)
-        if (fp) { fp->offsetSampleCount = 0; fp->dwmTimingRefreshCounter = 0; }
+        // Reset frame pacer EMA and cadence lock (force re-convergence after wake)
+        if (fp) {
+            fp->offsetSampleCount = 0;
+            fp->dwmTimingRefreshCounter = 0;
+            fp->cadenceLockState = CadenceLockState::Unlocked;
+            fp->stableFrameCount = 0;
+            fp->rollingMinCount = 0;
+            fp->biasAboveMinCount = 0;
+            fp->consecutiveAcquireTimeouts = 0;
+        }
         std::cout << "Forcing reinit of all monitors..." << std::endl;
         // Give system time to stabilize after wake
         Sleep(500);
@@ -1162,8 +1183,16 @@ void RenderAll(FramePacer* fp) {
         } else if (anyMonitorNeedsOverlay && g_overlayAutoSleep.load()) {
             g_overlayAutoSleep.store(false);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-            // Reset frame pacer EMA on wake (force re-convergence)
-            if (fp) { fp->offsetSampleCount = 0; fp->dwmTimingRefreshCounter = 0; }
+            // Reset frame pacer EMA and cadence lock on wake (force re-convergence)
+            if (fp) {
+                fp->offsetSampleCount = 0;
+                fp->dwmTimingRefreshCounter = 0;
+                fp->cadenceLockState = CadenceLockState::Unlocked;
+                fp->stableFrameCount = 0;
+                fp->rollingMinCount = 0;
+                fp->biasAboveMinCount = 0;
+                fp->consecutiveAcquireTimeouts = 0;
+                }
             // Don't force-show here — RenderMonitor's two-phase visibility handles it
             // Just mark dcompCommitted = false so windows go through proper show sequence
             for (auto& ctx : g_monitors) {

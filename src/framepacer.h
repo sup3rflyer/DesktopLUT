@@ -16,7 +16,10 @@ void CleanupFramePacer(FramePacer* fp);
 bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent);
 
 // Record that AcquireNextFrame succeeded — updates composition offset EMA
-void FramePacerRecordAcquisition(FramePacer* fp);
+// preAcquireQpc: QPC taken immediately before AcquireNextFrame(0) for cleaner measurement
+//                (removes variable processing overhead from offset calculation)
+//                If 0, falls back to QueryPerformanceCounter at call time.
+void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc = 0);
 
 // Notify pacer that AcquireNextFrame(0) returned WAIT_TIMEOUT
 void FramePacerNotifyTimeout(FramePacer* fp);
