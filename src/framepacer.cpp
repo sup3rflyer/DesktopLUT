@@ -273,13 +273,15 @@ static bool RefreshDwmTimingInfo(FramePacer* fp) {
         fp->lastVBlankQpc = ti.qpcVBlank;
         if (rateChanged) {
             RecalcRefreshThresholds(fp);
-            // Rate change invalidates cadence lock — new thresholds, new baseline
+            // Rate change invalidates everything — force full EMA re-convergence
+            fp->offsetSampleCount = 0;
+            fp->stableFrameCount = 0;
+            fp->rollingMinCount = 0;
+            fp->biasAboveMinCount = 0;
+            fp->consecutiveAcquireTimeouts = 0;
             if (fp->cadenceLockState == CadenceLockState::Locked) {
                 fp->cadenceLockState = CadenceLockState::Unlocked;
                 fp->compositionOffsetMs = fp->shadowEmaOffset;
-                fp->stableFrameCount = 0;
-                fp->rollingMinCount = 0;
-                fp->biasAboveMinCount = 0;
                 std::cout << "Frame pacer: cadence UNLOCK (rate change to "
                           << std::fixed << std::setprecision(1)
                           << (1000.0 / QpcToMs(ti.qpcRefreshPeriod, fp->qpcFrequency))
@@ -580,7 +582,7 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
             }
         }
 
-        if (fp->stableFrameCount >= 32 && fp->offsetSampleCount >= 48) {
+        if (fp->stableFrameCount >= 32 && fp->offsetSampleCount >= 120) {
             fp->cadenceLockState = CadenceLockState::Locked;
             fp->lockedOffset = fp->compositionOffsetMs;
             fp->shadowEmaOffset = fp->compositionOffsetMs;
