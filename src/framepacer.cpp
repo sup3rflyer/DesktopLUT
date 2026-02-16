@@ -66,6 +66,9 @@ static void RecalcRefreshThresholds(FramePacer* fp) {
     // in ~10-15 frames (0.15-0.25s at 60Hz).
     //   At 48Hz: max(0.4, 20.9*0.03) = 0.63ms; at 60Hz: 0.50ms; at 240Hz: 0.40ms
     fp->lockDivergenceMs = (std::max)(0.4f, fp->refreshPeriodMs * 0.03f);
+    // Bias correction: EMA above rolling min by this threshold triggers nudge
+    // At 48Hz: max(0.5, 20.9*0.06) = 1.25ms; at 60Hz: 1.0ms; at 120Hz: 0.5ms; at 240Hz: 0.5ms
+    fp->biasThresholdMs = (std::max)(0.5f, fp->refreshPeriodMs * 0.06f);
 }
 
 // ============================================================================
@@ -155,6 +158,20 @@ void InitFramePacer(FramePacer* fp) {
     fp->rollingMinCount = 0;
     fp->biasAboveMinCount = 0;
     fp->consecutiveAcquireTimeouts = 0;
+
+    // Variance-adaptive EMA
+    fp->varianceEma = 0.5f;
+    fp->currentAlpha = 0.125f;
+
+    // DComp stats
+    fp->hasDCompStats = (g_pfnDCompGetFrameId != nullptr && g_pfnDCompGetStatistics != nullptr);
+    fp->dcompDroppedFrames = 0;
+    fp->dcompFrameDropThisCycle = false;
+    fp->lastCompletedFrameId = 0;
+    fp->dcompFramePeriod = 0;
+    if (fp->hasDCompStats) {
+        std::cout << "Frame pacer: DComp frame statistics enabled" << std::endl;
+    }
 
     // Precompute refresh-rate-derived thresholds
     if (fp->qpcRefreshPeriod > 0) {
@@ -274,6 +291,7 @@ static bool RefreshDwmTimingInfo(FramePacer* fp) {
         if (rateChanged) {
             RecalcRefreshThresholds(fp);
             // Rate change invalidates everything — force full EMA re-convergence
+            fp->varianceEma = 0.5f;
             fp->offsetSampleCount = 0;
             fp->stableFrameCount = 0;
             fp->rollingMinCount = 0;
@@ -315,6 +333,59 @@ static void RecordJitter(FramePacer* fp, float jitterMs) {
 }
 
 // ============================================================================
+// QueryDCompFrameStats — ground-truth frame period and frame ID tracking
+// ============================================================================
+
+static void QueryDCompFrameStats(FramePacer* fp) {
+    if (!fp->hasDCompStats) return;
+
+    COMPOSITION_FRAME_ID completedId = 0;
+    HRESULT hr = g_pfnDCompGetFrameId(COMPOSITION_FRAME_ID_COMPLETED, &completedId);
+    if (FAILED(hr) || completedId == 0) return;
+
+    COMPOSITION_FRAME_STATS frameStats = {};
+    hr = g_pfnDCompGetStatistics(completedId, &frameStats, 0, nullptr, nullptr);
+    if (FAILED(hr)) return;
+
+    // Detect DWM frame drops via frame ID gaps
+    fp->dcompFrameDropThisCycle = (fp->lastCompletedFrameId > 0 && completedId > fp->lastCompletedFrameId + 1);
+    if (fp->dcompFrameDropThisCycle) {
+        int dropped = (int)(completedId - fp->lastCompletedFrameId - 1);
+        fp->dcompDroppedFrames += dropped;
+    }
+
+    // Update authoritative frame period (if valid and different from DWM timing)
+    if (frameStats.framePeriod > 0) {
+        fp->dcompFramePeriod = (int64_t)frameStats.framePeriod;
+
+        // Use DComp frame period as authoritative refresh period when it differs
+        // from DwmTimingInfo (happens under DRR, multi-monitor mismatches)
+        if (fp->dcompFramePeriod != fp->qpcRefreshPeriod) {
+            bool rateChanged = true;
+            fp->qpcRefreshPeriod = fp->dcompFramePeriod;
+            if (rateChanged) {
+                RecalcRefreshThresholds(fp);
+                fp->varianceEma = 0.5f;
+                fp->offsetSampleCount = 0;
+                fp->stableFrameCount = 0;
+                fp->rollingMinCount = 0;
+                fp->biasAboveMinCount = 0;
+                fp->consecutiveAcquireTimeouts = 0;
+                if (fp->cadenceLockState == CadenceLockState::Locked) {
+                    fp->cadenceLockState = CadenceLockState::Unlocked;
+                    fp->compositionOffsetMs = fp->shadowEmaOffset;
+                    double hz = 1000.0 / QpcToMs(fp->dcompFramePeriod, fp->qpcFrequency);
+                    std::cout << "Frame pacer: cadence UNLOCK (DComp rate change to "
+                              << std::fixed << std::setprecision(1) << hz << " Hz)" << std::endl;
+                }
+            }
+        }
+    }
+
+    fp->lastCompletedFrameId = completedId;
+}
+
+// ============================================================================
 // FramePacerWaitForNextFrame
 // ============================================================================
 
@@ -341,6 +412,7 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
 
         // 3. Refresh DWM timing info (keeps lastVBlankQpc fresh for RecordAcquisition)
         RefreshDwmTimingInfo(fp);
+        QueryDCompFrameStats(fp);
 
         // 4. Compute target: VBlank wake time + active offset
         //    CompClock wakes at VBlank so now.QuadPart IS the VBlank reference —
@@ -390,6 +462,7 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
 
         // 3. Refresh DWM timing (keeps lastVBlankQpc fresh for RecordAcquisition)
         RefreshDwmTimingInfo(fp);
+        QueryDCompFrameStats(fp);
 
         // 4. Predict DD-ready time
         // Snap lastVBlankQpc forward to most recent, then add active offset
@@ -488,11 +561,20 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
     float activeOffset = (fp->cadenceLockState == CadenceLockState::Locked)
         ? fp->lockedOffset : fp->compositionOffsetMs;
 
-    // Outlier detection: reject samples that deviate too far from the active offset.
-    // DWM frame drops produce offsets of 8-12ms (vs normal ~4ms) that would slowly
-    // poison the EMA and cause stutters during recovery.
+    // Outlier detection: two methods, either triggers rejection
+    // 1. DComp frame ID gap (deterministic, Win11+)
+    // 2. Threshold-based (heuristic fallback, always available)
     float outlierThreshold = (std::max)(activeOffset * 2.0f, fp->outlierFloorMs);
-    if (fp->offsetSampleCount >= 7 && (float)measuredOffsetMs > outlierThreshold) {
+    bool isOutlier = false;
+    if (fp->dcompFrameDropThisCycle) {
+        isOutlier = true;
+        fp->dcompFrameDropThisCycle = false;
+    }
+    if (!isOutlier && fp->offsetSampleCount >= 7 && (float)measuredOffsetMs > outlierThreshold) {
+        isOutlier = true;
+    }
+
+    if (isOutlier) {
         fp->consecutiveTimeouts++;
 
         // If we get many consecutive outliers, the baseline has genuinely shifted
@@ -501,6 +583,7 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
             fp->compositionOffsetMs = (float)measuredOffsetMs;
             fp->shadowEmaOffset = (float)measuredOffsetMs;
             fp->consecutiveTimeouts = 0;
+            fp->varianceEma = 0.5f;
             // Force unlock on baseline shift
             if (fp->cadenceLockState == CadenceLockState::Locked) {
                 fp->cadenceLockState = CadenceLockState::Unlocked;
@@ -516,14 +599,24 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
     fp->consecutiveTimeouts = 0;
     fp->consecutiveAcquireTimeouts = 0;
 
-    // 15-frame EMA: alpha = 2/(15+1) = 0.125, higher weight for initial samples
+    // Variance-adaptive EMA: alpha adapts to prediction error
     fp->offsetSampleCount++;
     float alpha;
     if (fp->offsetSampleCount <= 7) {
-        alpha = 1.0f / fp->offsetSampleCount;
+        alpha = 1.0f / fp->offsetSampleCount;  // Fast convergence for initial samples
     } else {
-        alpha = 0.125f;
+        // Track squared prediction error with EMA
+        float error = (float)measuredOffsetMs - fp->compositionOffsetMs;
+        fp->varianceEma = fp->varianceEma * 0.9f + error * error * 0.1f;
+
+        // Map variance to alpha:
+        //   variance ~0   -> alpha ~0.08 (38-sample window, very stable)
+        //   variance ~0.5 -> alpha ~0.14 (13-sample window, moderate)
+        //   variance ~2.0 -> alpha ~0.18 (10-sample window, responsive)
+        float varianceFactor = fp->varianceEma / (fp->varianceEma + 0.5f);
+        alpha = 0.08f + 0.12f * varianceFactor;
     }
+    fp->currentAlpha = alpha;  // Store for diagnostics
 
     // Always update the live EMA
     fp->compositionOffsetMs = fp->compositionOffsetMs * (1.0f - alpha) + (float)measuredOffsetMs * alpha;
@@ -553,7 +646,7 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
                 if (fp->rollingMinBuffer[i] < rollingMin)
                     rollingMin = fp->rollingMinBuffer[i];
             }
-            if (fp->compositionOffsetMs > rollingMin + 1.0f) {
+            if (fp->compositionOffsetMs > rollingMin + fp->biasThresholdMs) {
                 fp->biasAboveMinCount++;
                 if (fp->biasAboveMinCount >= 8) {
                     fp->compositionOffsetMs = (std::max)(fp->compositionOffsetMs - 0.1f, 1.0f);

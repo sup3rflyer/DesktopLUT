@@ -247,6 +247,8 @@ struct FrameTimingStats {
     float sleepOvershootMs = 0.0f;    // Sleep overshoot EMA (timer precision indicator)
     int droppedFrameCount = 0;        // Total DD acquisition timeouts
     bool cadenceLocked = false;       // True when cadence lock is active (frozen offset)
+    float currentAlpha = 0.125f;      // Current adaptive EMA alpha
+    int dcompDroppedFrames = 0;       // DWM frame drops detected via DComp frame ID gaps
 };
 
 // High-precision frame pacer state
@@ -317,6 +319,20 @@ struct FramePacer {
 
     // DWM timing refresh throttle
     int dwmTimingRefreshCounter = 0;         // Throttle DwmGetCompositionTimingInfo calls
+
+    // DComposition frame statistics (Win11+)
+    bool hasDCompStats = false;              // Whether DComp stats APIs are available
+    uint64_t lastCompletedFrameId = 0;       // Last COMPOSITION_FRAME_ID_COMPLETED seen
+    int dcompDroppedFrames = 0;              // DWM frame drops detected via frame ID gaps
+    int64_t dcompFramePeriod = 0;            // Compositor frame period from DComp stats (QPC ticks)
+    bool dcompFrameDropThisCycle = false;    // Set by QueryDCompFrameStats, cleared after RecordAcquisition
+
+    // Variance-adaptive EMA
+    float varianceEma = 0.5f;               // EMA of squared prediction error
+    float currentAlpha = 0.125f;             // Current adaptive alpha (for diagnostics)
+
+    // Refresh-rate-scaled bias threshold
+    float biasThresholdMs = 1.0f;            // Bias correction threshold = max(0.5, period*0.06)
 };
 
 // Tonemapping curve types (values match shader constants)

@@ -47,3 +47,30 @@ void UnregisterDisplayPowerNotification();
 // Compositor Clock API availability (for status display)
 typedef DWORD (WINAPI *PFN_DCompositionWaitForCompositorClock)(UINT, const HANDLE*, DWORD);
 extern PFN_DCompositionWaitForCompositorClock g_pfnWaitForCompositorClock;
+
+// DComposition frame statistics API (Win11+ SDK 10.0.22000+, forward-declared for older SDKs)
+#if !__has_include(<dcomptypes.h>)
+typedef enum {
+    COMPOSITION_FRAME_ID_CREATED = 0,
+    COMPOSITION_FRAME_ID_CONFIRMED = 1,
+    COMPOSITION_FRAME_ID_COMPLETED = 2
+} COMPOSITION_FRAME_ID_TYPE;
+typedef ULONG64 COMPOSITION_FRAME_ID;
+typedef struct {
+    UINT64 startTime;
+    UINT64 targetTime;
+    UINT64 framePeriod;
+} COMPOSITION_FRAME_STATS;
+typedef struct {
+    LUID displayAdapterLuid;
+    LUID renderAdapterLuid;
+    UINT vidPnSourceId;
+    UINT vidPnTargetId;
+    UINT uniqueId;
+} COMPOSITION_TARGET_ID;
+#endif
+
+typedef HRESULT (WINAPI *PFN_DCompositionGetFrameId)(COMPOSITION_FRAME_ID_TYPE, COMPOSITION_FRAME_ID*);
+typedef HRESULT (WINAPI *PFN_DCompositionGetStatistics)(COMPOSITION_FRAME_ID, COMPOSITION_FRAME_STATS*, UINT, COMPOSITION_TARGET_ID*, UINT*);
+extern PFN_DCompositionGetFrameId g_pfnDCompGetFrameId;
+extern PFN_DCompositionGetStatistics g_pfnDCompGetStatistics;

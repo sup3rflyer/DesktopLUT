@@ -243,6 +243,10 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
                     ss << L"   Ovsh:  " << std::setw(6) << data.frameTiming.sleepOvershootMs << L" ms\n";
                     ss << L"   Drop:  " << std::setw(6) << data.frameTiming.droppedFrameCount << L"\n";
+                    ss << L"   Alph:  " << std::setw(6) << std::setprecision(3) << data.frameTiming.currentAlpha << L"\n";
+                    if (data.frameTiming.dcompDroppedFrames > 0) {
+                        ss << L"   DDrp:  " << std::setw(6) << data.frameTiming.dcompDroppedFrames << L"\n";
+                    }
                 }
             }
         } else {
@@ -302,6 +306,10 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
                     ss << L"   Ovsh:  " << std::setw(6) << data.frameTiming.sleepOvershootMs << L" ms\n";
                     ss << L"   Drop:  " << std::setw(6) << data.frameTiming.droppedFrameCount << L"\n";
+                    ss << L"   Alph:  " << std::setw(6) << std::setprecision(3) << data.frameTiming.currentAlpha << L"\n";
+                    if (data.frameTiming.dcompDroppedFrames > 0) {
+                        ss << L"   DDrp:  " << std::setw(6) << data.frameTiming.dcompDroppedFrames << L"\n";
+                    }
                 }
             }
         }
@@ -317,13 +325,13 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetProp(hwnd, L"AnalysisText", textCopy);
 
             // Window heights depend on frame timing visibility and pacer metrics
-            // HDR: 430 base, +160 with frame timing, +90 with pacer metrics (5 extra lines)
-            // SDR: 260 base, +160 with frame timing, +90 with pacer metrics
+            // HDR: 430 base, +160 with frame timing, +126 with pacer metrics (7 lines: PJit/Offs/Spin/Ovsh/Drop/Alph + DDrp)
+            // SDR: 260 base, +160 with frame timing, +126 with pacer metrics
             bool showTiming = g_showFrameTiming.load();
             bool showPacer = showTiming && data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly;
             int height = data.isHDR ? 430 : 260;
             if (showTiming) height += 160;
-            if (showPacer) height += 90;
+            if (showPacer) height += 126;
             SetWindowPos(hwnd, nullptr, 0, 0, 260, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             InvalidateRect(hwnd, nullptr, FALSE);  // FALSE = don't erase, prevents flicker
         }

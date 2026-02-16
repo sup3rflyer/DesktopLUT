@@ -135,6 +135,36 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
     return dst;
 }
 
+// TOPMOST reassert helper thread — runs at low priority to avoid impacting
+// the MMCSS render loop. Periodically calls SetWindowPos(HWND_TOPMOST) for
+// all overlay windows, either on-demand (event signaled) or every 30 seconds.
+static DWORD WINAPI TopmostHelperThread(LPVOID) {
+    while (true) {
+        DWORD result = WaitForSingleObject(g_topmostEvent, 500);
+        if (!g_running) break;
+
+        static auto lastReassert = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        bool doReassert = (result == WAIT_OBJECT_0) ||
+            (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReassert).count() >= 30000);
+
+        if (doReassert) {
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd) {
+                    SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+            }
+            if (g_analysisHwnd && g_analysisEnabled.load()) {
+                SetWindowPos(g_analysisHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            lastReassert = std::chrono::steady_clock::now();
+        }
+    }
+    return 0;
+}
+
 void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     // Initialize COM for this thread (separate apartment from GUI thread)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -345,6 +375,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     // Create auto-sleep wake event (auto-reset: resets after WaitForSingleObject returns)
     g_overlayWakeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
+    // Start TOPMOST reassert helper thread (offloads SetWindowPos from MMCSS render thread)
+    g_topmostEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    HANDLE topmostThread = CreateThread(nullptr, 0, TopmostHelperThread, nullptr, 0, nullptr);
+
     // Initialize watchdog timestamp
     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
@@ -361,6 +395,11 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
             // AcquireNextFrame timeout provides CPU yielding
         }
     }
+
+    // Stop TOPMOST helper thread
+    if (g_topmostEvent) SetEvent(g_topmostEvent);
+    if (topmostThread) { WaitForSingleObject(topmostThread, 1000); CloseHandle(topmostThread); }
+    if (g_topmostEvent) { CloseHandle(g_topmostEvent); g_topmostEvent = nullptr; }
 
     // Clean up frame pacer (MMCSS, timers, timeEndPeriod)
     CleanupFramePacer(&framePacer);

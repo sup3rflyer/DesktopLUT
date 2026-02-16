@@ -12,6 +12,7 @@
 #include "processing.h"
 #include "mhc.h"
 #include <dwmapi.h>
+#include <avrt.h>
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
@@ -27,6 +28,8 @@
 // Compositor Clock API (Windows 11+) for VBlank-aligned frame timing
 // Dynamically loaded to maintain compatibility with older Windows
 PFN_DCompositionWaitForCompositorClock g_pfnWaitForCompositorClock = nullptr;
+PFN_DCompositionGetFrameId g_pfnDCompGetFrameId = nullptr;
+PFN_DCompositionGetStatistics g_pfnDCompGetStatistics = nullptr;
 
 void InitCompositorClock() {
     HMODULE hDcomp = GetModuleHandleW(L"dcomp.dll");
@@ -38,6 +41,17 @@ void InitCompositorClock() {
         std::cout << "Frame sync: Compositor Clock API (VBlank-aligned)" << std::endl;
     } else {
         std::cout << "Frame sync: DwmFlush fallback (post-composition)" << std::endl;
+    }
+
+    // Load DComposition frame statistics API (Win11+)
+    if (hDcomp) {
+        g_pfnDCompGetFrameId = (PFN_DCompositionGetFrameId)
+            GetProcAddress(hDcomp, "DCompositionGetFrameId");
+        g_pfnDCompGetStatistics = (PFN_DCompositionGetStatistics)
+            GetProcAddress(hDcomp, "DCompositionGetStatistics");
+        if (g_pfnDCompGetFrameId && g_pfnDCompGetStatistics) {
+            std::cout << "Frame pacer: DComposition frame statistics API available" << std::endl;
+        }
     }
 }
 
@@ -962,6 +976,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
                 ctx->frameTimingStats.droppedFrameCount = fp->droppedFrameCount;
                 ctx->frameTimingStats.cadenceLocked =
                     (fp->cadenceLockState == CadenceLockState::Locked);
+                ctx->frameTimingStats.currentAlpha = fp->currentAlpha;
+                ctx->frameTimingStats.dcompDroppedFrames = fp->dcompDroppedFrames;
             }
         } else {
             // Reset so we get a fresh baseline when analysis is toggled on
@@ -1047,6 +1063,13 @@ void RenderAll(FramePacer* fp) {
             fp->rollingMinCount = 0;
             fp->biasAboveMinCount = 0;
             fp->consecutiveAcquireTimeouts = 0;
+            fp->varianceEma = 0.5f;
+        }
+        // Temporarily drop MMCSS priority during heavy reinit work
+        // (500ms Sleep + system API calls would exceed Pro Audio time quota)
+        if (fp && fp->mmcssHandle) {
+            AvRevertMmThreadCharacteristics(fp->mmcssHandle);
+            fp->mmcssHandle = nullptr;
         }
         std::cout << "Forcing reinit of all monitors..." << std::endl;
         // Give system time to stabilize after wake
@@ -1070,6 +1093,14 @@ void RenderAll(FramePacer* fp) {
         ReapplyAllMhcProfiles();
         // Force TOPMOST reassert after wake (z-order most likely disrupted)
         g_forceTopmostReassert.store(true);
+        // Re-acquire MMCSS after reinit
+        if (fp && fp->strategy != FramePacerStrategy::DwmFlushOnly) {
+            fp->mmcssTaskIndex = 0;
+            fp->mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &fp->mmcssTaskIndex);
+            if (fp->mmcssHandle) {
+                AvSetMmThreadPriority(fp->mmcssHandle, AVRT_PRIORITY_CRITICAL);
+            }
+        }
     }
 
     // ── Frame sync: wait for next compositor cycle via frame pacer ──
@@ -1081,28 +1112,11 @@ void RenderAll(FramePacer* fp) {
         return;
     }
 
-    // Periodically reassert TOPMOST to prevent other windows pushing us down
-    static auto lastTopmost = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    bool forceReassert = g_forceTopmostReassert.exchange(false);
-    if (forceReassert || std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTopmost).count() >= 30000) {
-        for (auto& ctx : g_monitors) {
-            if (ctx.hwnd) {
-                SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
-        }
-        // Keep analysis overlay above monitor overlays
-        if (g_analysisHwnd && g_analysisEnabled.load()) {
-            SetWindowPos(g_analysisHwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
-        // Our own SetWindowPos calls trigger WM_WINDOWPOSCHANGING (no SWP_NOZORDER),
-        // which re-sets g_forceTopmostReassert — creating a feedback loop that would
-        // reassert on EVERY frame. Clear the self-triggered flag to break the cycle.
-        // External z-order changes between here and next check are caught by 30s fallback.
-        g_forceTopmostReassert.store(false);
-        lastTopmost = now;
+    // TOPMOST reassert: signal helper thread instead of blocking render loop.
+    // The helper thread handles both on-demand (event-driven) and periodic (30s) reasserts.
+    // exchange(false) prevents re-signaling from the same WM_WINDOWPOSCHANGING event.
+    if (g_forceTopmostReassert.exchange(false, std::memory_order_relaxed)) {
+        if (g_topmostEvent) SetEvent(g_topmostEvent);
     }
 
     // Gamma whitelist is now checked on a separate thread (see GammaWhitelistThreadFunc)
@@ -1192,6 +1206,7 @@ void RenderAll(FramePacer* fp) {
                 fp->rollingMinCount = 0;
                 fp->biasAboveMinCount = 0;
                 fp->consecutiveAcquireTimeouts = 0;
+                fp->varianceEma = 0.5f;
                 }
             // Don't force-show here — RenderMonitor's two-phase visibility handles it
             // Just mark dcompCommitted = false so windows go through proper show sequence
@@ -1306,9 +1321,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HideOSD();
         return 0;
     case WM_WINDOWPOSCHANGING: {
-        // If another window is changing our z-order, trigger TOPMOST reassertion
+        // If an external window is changing our z-order, trigger TOPMOST reassertion.
+        // Ignore our own HWND_TOPMOST reasserts to prevent feedback loop with helper thread.
         WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
-        if (wp && !(wp->flags & SWP_NOZORDER)) {
+        if (wp && !(wp->flags & SWP_NOZORDER) && wp->hwndInsertAfter != HWND_TOPMOST) {
             g_forceTopmostReassert.store(true);
         }
         break;
