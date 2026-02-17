@@ -25,11 +25,11 @@ bool RecreateSwapchain(MonitorContext* ctx);
 // Update HDR metadata on swapchain (call when tonemapping settings change)
 void UpdateHDRMetadata(MonitorContext* ctx);
 
-// Resize swapchain (display change handling)
-void ResizeSwapChain(MonitorContext* ctx, int width, int height);
+// Resize swapchain (display change handling). Returns false on failure.
+bool ResizeSwapChain(MonitorContext* ctx, int width, int height);
 
-// Render a single monitor
-void RenderMonitor(MonitorContext* ctx, FramePacer* fp);
+// Render a single monitor (bufferActive = auto frame buffer is currently engaged)
+void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive);
 
 // Main render loop for all monitors
 void RenderAll(FramePacer* fp);

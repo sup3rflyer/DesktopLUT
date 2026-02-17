@@ -143,11 +143,8 @@ void InitFramePacer(FramePacer* fp) {
     fp->compositionOffsetMs = 4.0f;  // Initial estimate
     fp->offsetSampleCount = 0;
     fp->sleepOvershootEma = 0.5f;
-    fp->consecutiveTimeouts = 0;
-    fp->consecutiveEarly = 0;
-    fp->consecutiveLate = 0;
+    fp->consecutiveOutliers = 0;
     fp->droppedFrameCount = 0;
-    fp->dwmTimingRefreshCounter = 0;
 
     // Cadence lock state
     fp->cadenceLockState = CadenceLockState::Unlocked;
@@ -290,21 +287,10 @@ static bool RefreshDwmTimingInfo(FramePacer* fp) {
         fp->lastVBlankQpc = ti.qpcVBlank;
         if (rateChanged) {
             RecalcRefreshThresholds(fp);
-            // Rate change invalidates everything — force full EMA re-convergence
-            fp->varianceEma = 0.5f;
-            fp->offsetSampleCount = 0;
-            fp->stableFrameCount = 0;
-            fp->rollingMinCount = 0;
-            fp->biasAboveMinCount = 0;
-            fp->consecutiveAcquireTimeouts = 0;
-            if (fp->cadenceLockState == CadenceLockState::Locked) {
-                fp->cadenceLockState = CadenceLockState::Unlocked;
-                fp->compositionOffsetMs = fp->shadowEmaOffset;
-                std::cout << "Frame pacer: cadence UNLOCK (rate change to "
-                          << std::fixed << std::setprecision(1)
-                          << (1000.0 / QpcToMs(ti.qpcRefreshPeriod, fp->qpcFrequency))
-                          << " Hz)" << std::endl;
-            }
+            char buf[64];
+            snprintf(buf, sizeof(buf), "rate change to %.1f Hz",
+                     1000.0 / QpcToMs(ti.qpcRefreshPeriod, fp->qpcFrequency));
+            ResetFramePacerState(fp, buf);
         }
         return true;
     }
@@ -361,24 +347,12 @@ static void QueryDCompFrameStats(FramePacer* fp) {
         // Use DComp frame period as authoritative refresh period when it differs
         // from DwmTimingInfo (happens under DRR, multi-monitor mismatches)
         if (fp->dcompFramePeriod != fp->qpcRefreshPeriod) {
-            bool rateChanged = true;
             fp->qpcRefreshPeriod = fp->dcompFramePeriod;
-            if (rateChanged) {
-                RecalcRefreshThresholds(fp);
-                fp->varianceEma = 0.5f;
-                fp->offsetSampleCount = 0;
-                fp->stableFrameCount = 0;
-                fp->rollingMinCount = 0;
-                fp->biasAboveMinCount = 0;
-                fp->consecutiveAcquireTimeouts = 0;
-                if (fp->cadenceLockState == CadenceLockState::Locked) {
-                    fp->cadenceLockState = CadenceLockState::Unlocked;
-                    fp->compositionOffsetMs = fp->shadowEmaOffset;
-                    double hz = 1000.0 / QpcToMs(fp->dcompFramePeriod, fp->qpcFrequency);
-                    std::cout << "Frame pacer: cadence UNLOCK (DComp rate change to "
-                              << std::fixed << std::setprecision(1) << hz << " Hz)" << std::endl;
-                }
-            }
+            RecalcRefreshThresholds(fp);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "DComp rate change to %.1f Hz",
+                     1000.0 / QpcToMs(fp->dcompFramePeriod, fp->qpcFrequency));
+            ResetFramePacerState(fp, buf);
         }
     }
 
@@ -391,6 +365,10 @@ static void QueryDCompFrameStats(FramePacer* fp) {
 
 bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
     LARGE_INTEGER now;
+
+    // Clear DComp frame drop flag at the start of each cycle so all monitors
+    // in the current frame see the same drop signal from QueryDCompFrameStats
+    fp->dcompFrameDropThisCycle = false;
 
     switch (fp->strategy) {
     // ── Strategy A: CompositorClock + Predict ──
@@ -455,7 +433,7 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
     // ── Strategy B: DwmFlush + Predict ──
     case FramePacerStrategy::DwmFlushPredictive: {
         // 1. DwmFlush — coarse sync (wakes 1-2ms after composition)
-        DwmFlush();
+        if (FAILED(DwmFlush())) { Sleep(1); }
 
         // 2. Record post-flush QPC
         QueryPerformanceCounter(&now);
@@ -513,7 +491,7 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
                 return false;
             }
         } else {
-            DwmFlush();
+            if (FAILED(DwmFlush())) { Sleep(1); }
         }
 
         QueryPerformanceCounter(&now);
@@ -568,21 +546,20 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
     bool isOutlier = false;
     if (fp->dcompFrameDropThisCycle) {
         isOutlier = true;
-        fp->dcompFrameDropThisCycle = false;
     }
     if (!isOutlier && fp->offsetSampleCount >= 7 && (float)measuredOffsetMs > outlierThreshold) {
         isOutlier = true;
     }
 
     if (isOutlier) {
-        fp->consecutiveTimeouts++;
+        fp->consecutiveOutliers++;
 
         // If we get many consecutive outliers, the baseline has genuinely shifted
-        if (fp->consecutiveTimeouts > 20) {
+        if (fp->consecutiveOutliers > 20) {
             fp->offsetSampleCount = 0;
             fp->compositionOffsetMs = (float)measuredOffsetMs;
             fp->shadowEmaOffset = (float)measuredOffsetMs;
-            fp->consecutiveTimeouts = 0;
+            fp->consecutiveOutliers = 0;
             fp->varianceEma = 0.5f;
             // Force unlock on baseline shift
             if (fp->cadenceLockState == CadenceLockState::Locked) {
@@ -596,11 +573,11 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
     }
 
     // Good sample — reset outlier and acquire timeout counters
-    fp->consecutiveTimeouts = 0;
+    fp->consecutiveOutliers = 0;
     fp->consecutiveAcquireTimeouts = 0;
 
     // Variance-adaptive EMA: alpha adapts to prediction error
-    fp->offsetSampleCount++;
+    if (fp->offsetSampleCount < 1000) fp->offsetSampleCount++;
     float alpha;
     if (fp->offsetSampleCount <= 7) {
         alpha = 1.0f / fp->offsetSampleCount;  // Fast convergence for initial samples
@@ -715,6 +692,25 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
 // ============================================================================
 // FramePacerNotifyTimeout — called when AcquireNextFrame(0) returns WAIT_TIMEOUT
 // ============================================================================
+
+// ============================================================================
+// ResetFramePacerState — reset tracking state after disruptive events
+// ============================================================================
+
+void ResetFramePacerState(FramePacer* fp, const char* reason) {
+    fp->varianceEma = 0.5f;
+    fp->offsetSampleCount = 0;
+    fp->stableFrameCount = 0;
+    fp->rollingMinCount = 0;
+    fp->biasAboveMinCount = 0;
+    fp->consecutiveAcquireTimeouts = 0;
+    fp->consecutiveOutliers = 0;
+    if (fp->cadenceLockState == CadenceLockState::Locked) {
+        fp->cadenceLockState = CadenceLockState::Unlocked;
+        fp->compositionOffsetMs = fp->shadowEmaOffset;
+        std::cout << "Frame pacer: cadence UNLOCK (" << reason << ")" << std::endl;
+    }
+}
 
 void FramePacerNotifyTimeout(FramePacer* fp) {
     if (fp->strategy == FramePacerStrategy::DwmFlushOnly) return;

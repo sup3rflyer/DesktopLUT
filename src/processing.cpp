@@ -149,16 +149,36 @@ static DWORD WINAPI TopmostHelperThread(LPVOID) {
             (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReassert).count() >= 30000);
 
         if (doReassert) {
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd) {
-                    SetWindowPos(ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            // Guard: suppress WM_WINDOWPOSCHANGING handler during our own reasserts
+            // to prevent feedback loop (our analysis TOPMOST triggers overlay's handler
+            // which re-signals this thread → rapid z-order bouncing → visible flicker)
+            g_selfReassertInProgress.store(true, std::memory_order_release);
+
+            // Batch all z-order changes atomically via DeferWindowPos to prevent
+            // intermediate state where overlay is above analysis (causes brief flash)
+            int count = 0;
+            for (auto& ctx : g_monitors) { if (ctx.hwnd) count++; }
+            bool showAnalysis = g_analysisHwnd && g_analysisEnabled.load();
+            if (showAnalysis) count++;
+
+            HDWP hdwp = BeginDeferWindowPos(count);
+            if (hdwp) {
+                for (auto& ctx : g_monitors) {
+                    if (ctx.hwnd) {
+                        hdwp = DeferWindowPos(hdwp, ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        if (!hdwp) break;
+                    }
+                }
+                // Analysis last = highest in z-order (above overlays)
+                if (hdwp && showAnalysis) {
+                    hdwp = DeferWindowPos(hdwp, g_analysisHwnd, HWND_TOPMOST, 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
+                if (hdwp) EndDeferWindowPos(hdwp);
             }
-            if (g_analysisHwnd && g_analysisEnabled.load()) {
-                SetWindowPos(g_analysisHwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            }
+
+            g_selfReassertInProgress.store(false, std::memory_order_release);
             lastReassert = std::chrono::steady_clock::now();
         }
     }
@@ -446,21 +466,7 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         DispatchMessage(&msg);
     }
 
-    if (g_dcompDevice) { g_dcompDevice->Release(); g_dcompDevice = nullptr; }
-    if (g_blueNoiseSRV) { g_blueNoiseSRV->Release(); g_blueNoiseSRV = nullptr; }
-    if (g_blueNoiseTexture) { g_blueNoiseTexture->Release(); g_blueNoiseTexture = nullptr; }
-    if (g_constantBuffer) { g_constantBuffer->Release(); g_constantBuffer = nullptr; }
-    if (g_samplerPoint) { g_samplerPoint->Release(); g_samplerPoint = nullptr; }
-    if (g_samplerLinear) { g_samplerLinear->Release(); g_samplerLinear = nullptr; }
-    if (g_samplerWrap) { g_samplerWrap->Release(); g_samplerWrap = nullptr; }
-    if (g_peakDetectCS) { g_peakDetectCS->Release(); g_peakDetectCS = nullptr; }
-    if (g_peakCB) { g_peakCB->Release(); g_peakCB = nullptr; }
-    if (g_analysisCS) { g_analysisCS->Release(); g_analysisCS = nullptr; }
-    if (g_analysisCB) { g_analysisCB->Release(); g_analysisCB = nullptr; }
-    if (g_ps) { g_ps->Release(); g_ps = nullptr; }
-    if (g_vs) { g_vs->Release(); g_vs = nullptr; }
-    if (g_context) { g_context->Release(); g_context = nullptr; }
-    if (g_device) { g_device->Release(); g_device = nullptr; }
+    ReleaseSharedD3DResources();
 
     CoUninitialize();
 
@@ -622,13 +628,24 @@ void ApplyMaxTmlSettings() {
     // - TDR recovery
     // - After HDR mode changes (swapchain recreation)
     // Reapplying is cheap and safe, so we do it liberally to ensure the setting isn't lost
-    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        const auto& ms = g_gui.monitorSettings[i];
-        if (ms.maxTml.enabled) {
+
+    // Snapshot MaxTML settings under lock (called from render thread, GUI thread writes settings)
+    struct MaxTmlEntry { bool enabled; float peakNits; };
+    std::vector<MaxTmlEntry> entries;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        entries.reserve(g_gui.monitorSettings.size());
+        for (const auto& ms : g_gui.monitorSettings) {
+            entries.push_back({ms.maxTml.enabled, ms.maxTml.peakNits});
+        }
+    }
+
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (entries[i].enabled) {
             DisplayInfo displayInfo;
             if (GetDisplayInfoForMonitor((int)i, displayInfo)) {
-                if (SetDisplayMaxTml(displayInfo, ms.maxTml.peakNits)) {
-                    std::cout << "Applied MaxTML " << ms.maxTml.peakNits << " nits to monitor " << i << std::endl;
+                if (SetDisplayMaxTml(displayInfo, entries[i].peakNits)) {
+                    std::cout << "Applied MaxTML " << entries[i].peakNits << " nits to monitor " << i << std::endl;
                 }
             }
         }

@@ -275,6 +275,10 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     if (ctx->peakTexture) { ctx->peakTexture->Release(); ctx->peakTexture = nullptr; }
     if (ctx->peakStagingTexture) { ctx->peakStagingTexture->Release(); ctx->peakStagingTexture = nullptr; }
     if (ctx->peakStagingTexture2) { ctx->peakStagingTexture2->Release(); ctx->peakStagingTexture2 = nullptr; }
+    // Frame buffer resources
+    if (ctx->bufferRTV) { ctx->bufferRTV->Release(); ctx->bufferRTV = nullptr; }
+    if (ctx->bufferTexture) { ctx->bufferTexture->Release(); ctx->bufferTexture = nullptr; }
+    ctx->bufferReady = false;
     // Analysis resources
     if (ctx->analysisUAV) { ctx->analysisUAV->Release(); ctx->analysisUAV = nullptr; }
     if (ctx->analysisBuffer) { ctx->analysisBuffer->Release(); ctx->analysisBuffer = nullptr; }
@@ -327,6 +331,12 @@ bool AttemptDeviceRecovery() {
     }
     std::cout << "D3D reinitialized" << std::endl;
 
+    // Recreate DirectComposition device (depends on D3D device)
+    if (!InitDirectCompositionDevice()) {
+        std::cerr << "Failed to reinit DirectComposition device after TDR" << std::endl;
+        return false;
+    }
+
     // Check tearing support again
     g_tearingSupported = CheckTearingSupport();
 
@@ -336,7 +346,7 @@ bool AttemptDeviceRecovery() {
         std::vector<float> lutDataSDR, lutDataHDR;
         int lutSizeSDR = 0, lutSizeHDR = 0;
 
-        if (!LoadLUT(ctx.sdrLutPath, lutDataSDR, lutSizeSDR)) {
+        if (!ctx.sdrLutPath.empty() && !LoadLUT(ctx.sdrLutPath, lutDataSDR, lutSizeSDR)) {
             std::cerr << "Failed to reload SDR LUT for monitor " << ctx.index << std::endl;
             return false;
         }

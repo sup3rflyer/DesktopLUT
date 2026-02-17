@@ -295,11 +295,11 @@ static const float g_d50XYZ[3] = { 0.9642f, 1.0000f, 0.8249f };
 // D65 illuminant
 static const float g_d65XYZ[3] = { 0.9505f, 1.0000f, 1.0890f };
 
-// Bradford matrix for D65 -> D50 chromatic adaptation
+// Bradford matrix for D65 -> D50 chromatic adaptation (ICC spec / Bruce Lindbloom)
 static const float g_bradfordD65toD50[9] = {
-     1.0479f,  0.0229f, -0.0502f,
-     0.0296f,  0.9904f, -0.0171f,
-    -0.0092f,  0.0151f,  0.7519f
+     1.0478112f,  0.0228866f, -0.0501270f,
+     0.0295424f,  0.9904844f, -0.0170491f,
+    -0.0092345f,  0.0150436f,  0.7521316f
 };
 
 // ============================================================================
@@ -327,9 +327,13 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     // (via its white point scaling), so they're naturally included.
 
     float srcToXYZ[9], displayToXYZ[9], displayFromXYZ[9];
-    BuildRGBtoXYZ(srcPrimaries, srcToXYZ);
-    BuildRGBtoXYZ(displayPrimaries, displayToXYZ);
-    MatInv3(displayToXYZ, displayFromXYZ);
+    if (!BuildRGBtoXYZ(srcPrimaries, srcToXYZ) || !BuildRGBtoXYZ(displayPrimaries, displayToXYZ)
+        || !MatInv3(displayToXYZ, displayFromXYZ)) {
+        std::cerr << "MHC2 matrix: degenerate primaries, using identity" << std::endl;
+        memset(outMHC, 0, sizeof(float) * 12);
+        outMHC[0] = outMHC[4] = outMHC[8] = 1.0f;  // 3x4 identity
+        return;
+    }
 
     // MHC2 = srcRGBtoXYZ * inv(displayRGBtoXYZ)
     float result[9];
@@ -1051,11 +1055,11 @@ static float ReadS15Fixed16(const uint8_t* p) {
     return (float)val / 65536.0f;
 }
 
-// Bradford D50->D65 matrix (inverse of D65->D50)
+// Bradford D50->D65 matrix (inverse of D65->D50, ICC spec / Bruce Lindbloom)
 static const float g_bradfordD50toD65[9] = {
-     0.9556f, -0.0230f,  0.0632f,
-    -0.0284f,  1.0099f,  0.0210f,
-     0.0123f, -0.0205f,  1.3300f
+     0.9555766f, -0.0230393f,  0.0631636f,
+    -0.0282895f,  1.0099416f,  0.0210077f,
+     0.0122982f, -0.0204830f,  1.3299098f
 };
 
 bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
@@ -1082,7 +1086,8 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
 
     // Read tag table
     uint32_t tagCount = ReadBE32(d + 128);
-    if (128 + 4 + tagCount * 12 > fileSize) return false;
+    if (tagCount > 200) return false;  // Sanity: no real ICC has >~30 tags
+    if (128 + 4 + (uint64_t)tagCount * 12 > fileSize) return false;
 
     struct TagInfo { uint32_t sig, offset, size; };
     std::vector<TagInfo> tags(tagCount);
@@ -1182,7 +1187,8 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
                 return true;
             } else {
                 // Tabular data
-                if (tag->offset + 12 + count * 2 > fileSize) return false;
+                if (count > 65536) return false;  // Sanity: reasonable max for tabular TRC
+                if ((uint64_t)tag->offset + 12 + (uint64_t)count * 2 > fileSize) return false;
                 outCurve.resize(count);
                 for (uint32_t i = 0; i < count; i++) {
                     outCurve[i] = (float)ReadBE16(p + 12 + i * 2) / 65535.0f;

@@ -46,6 +46,8 @@ static std::atomic<bool> g_analysisDataReady{false};
 // Analysis overlay window procedure
 static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;  // Suppress — WM_PAINT does full double-buffered repaint
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
@@ -223,7 +225,7 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ss << L"   Avg:   " << std::setw(6) << data.frameTiming.avgMs << L" ms\n";
                 ss << L"   Min:   " << std::setw(6) << data.frameTiming.minMs << L" ms\n";
                 ss << L"   Max:   " << std::setw(6) << data.frameTiming.maxMs << L" ms\n";
-                ss << L"   Jit:   " << std::setw(6) << data.frameTiming.varianceMs << L" ms\n";
+                ss << L"   Jit:   " << std::setw(6) << data.frameTiming.jitterMs << L" ms\n";
                 // Show pacer strategy and metrics
                 {
                     const wchar_t* syncName = L"DwmFlush";
@@ -243,9 +245,8 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
                     ss << L"   Ovsh:  " << std::setw(6) << data.frameTiming.sleepOvershootMs << L" ms\n";
                     ss << L"   Drop:  " << std::setw(6) << data.frameTiming.droppedFrameCount << L"\n";
-                    ss << L"   Alph:  " << std::setw(6) << std::setprecision(3) << data.frameTiming.currentAlpha << L"\n";
-                    if (data.frameTiming.dcompDroppedFrames > 0) {
-                        ss << L"   DDrp:  " << std::setw(6) << data.frameTiming.dcompDroppedFrames << L"\n";
+                    if (data.frameTiming.bufferJitterMs > 0.0f) {
+                        ss << L"   BJit:  " << std::setw(6) << data.frameTiming.bufferJitterMs << L" ms\n";
                     }
                 }
             }
@@ -286,7 +287,7 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 ss << L"   Avg:   " << std::setw(6) << data.frameTiming.avgMs << L" ms\n";
                 ss << L"   Min:   " << std::setw(6) << data.frameTiming.minMs << L" ms\n";
                 ss << L"   Max:   " << std::setw(6) << data.frameTiming.maxMs << L" ms\n";
-                ss << L"   Jit:   " << std::setw(6) << data.frameTiming.varianceMs << L" ms\n";
+                ss << L"   Jit:   " << std::setw(6) << data.frameTiming.jitterMs << L" ms\n";
                 // Show pacer strategy and metrics
                 {
                     const wchar_t* syncName = L"DwmFlush";
@@ -306,9 +307,8 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                     ss << L"   Spin:  " << std::setw(6) << data.frameTiming.spinWaitMs << L" ms\n";
                     ss << L"   Ovsh:  " << std::setw(6) << data.frameTiming.sleepOvershootMs << L" ms\n";
                     ss << L"   Drop:  " << std::setw(6) << data.frameTiming.droppedFrameCount << L"\n";
-                    ss << L"   Alph:  " << std::setw(6) << std::setprecision(3) << data.frameTiming.currentAlpha << L"\n";
-                    if (data.frameTiming.dcompDroppedFrames > 0) {
-                        ss << L"   DDrp:  " << std::setw(6) << data.frameTiming.dcompDroppedFrames << L"\n";
+                    if (data.frameTiming.bufferJitterMs > 0.0f) {
+                        ss << L"   BJit:  " << std::setw(6) << data.frameTiming.bufferJitterMs << L" ms\n";
                     }
                 }
             }
@@ -325,15 +325,20 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetProp(hwnd, L"AnalysisText", textCopy);
 
             // Window heights depend on frame timing visibility and pacer metrics
-            // HDR: 430 base, +160 with frame timing, +126 with pacer metrics (7 lines: PJit/Offs/Spin/Ovsh/Drop/Alph + DDrp)
-            // SDR: 260 base, +160 with frame timing, +126 with pacer metrics
+            // HDR: 430 base, +160 with frame timing, +108 with pacer metrics (6 lines: PJit/Offs/Spin/Ovsh/Drop + BJit)
+            // SDR: 260 base, +160 with frame timing, +108 with pacer metrics
             bool showTiming = g_showFrameTiming.load();
             bool showPacer = showTiming && data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly;
             int height = data.isHDR ? 430 : 260;
             if (showTiming) height += 160;
-            if (showPacer) height += 126;
-            SetWindowPos(hwnd, nullptr, 0, 0, 260, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            InvalidateRect(hwnd, nullptr, FALSE);  // FALSE = don't erase, prevents flicker
+            if (showPacer) height += 108;
+
+            // Only resize when height actually changes (avoids triggering unnecessary repaints)
+            RECT curRc;
+            GetWindowRect(hwnd, &curRc);
+            if ((curRc.bottom - curRc.top) != height)
+                SetWindowPos(hwnd, nullptr, 0, 0, 260, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
@@ -616,7 +621,7 @@ static void ComputeFrameTimingStats(MonitorContext* ctx) {
     ctx->frameTimingStats.minMs = minMs;
     ctx->frameTimingStats.maxMs = maxMs;
     ctx->frameTimingStats.avgMs = avgMs;
-    ctx->frameTimingStats.varianceMs = sqrtf(variance);  // Std dev
+    ctx->frameTimingStats.jitterMs = sqrtf(variance);  // Std dev
     ctx->frameTimingStats.fps = (avgMs > 0.0f) ? (1000.0f / avgMs) : 0.0f;
 }
 

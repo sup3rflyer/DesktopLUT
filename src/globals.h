@@ -50,6 +50,7 @@ extern std::atomic<bool> g_tetrahedralInterp;  // true = tetrahedral, false = tr
 extern std::atomic<bool> g_running;            // Main loop control
 extern std::atomic<bool> g_forceReinit;        // Force reinit on next frame
 extern std::atomic<bool> g_forceTopmostReassert; // Force TOPMOST reassert on next frame
+extern std::atomic<bool> g_selfReassertInProgress; // Guard: suppress WM_WINDOWPOSCHANGING during our own reasserts
 extern std::atomic<bool> g_logPeakDetection;   // Debug: log detected peak nits to console
 extern std::atomic<bool> g_consoleEnabled;     // Show console window (GUI mode only)
 extern std::atomic<bool> g_showFrameTiming;    // Show frame timing in analysis overlay
@@ -59,6 +60,8 @@ extern HANDLE g_overlayWakeEvent;              // Auto-reset event for auto-slee
 extern HANDLE g_topmostEvent;                 // Signaled when TOPMOST reassert needed (helper thread)
 extern std::atomic<bool> g_framePacerEnabled;  // Enable predictive frame pacer (default: true)
 extern std::atomic<bool> g_framePacerSpinWait; // Enable spin-wait phase (default: true)
+extern std::atomic<bool> g_frameBufferEnabled; // Enable auto frame buffer (engages on idle)
+extern int g_frameBufferIdleMs;               // Idle timeout before buffer engages (ms, 0 = always active)
 
 // ============================================================================
 // Hotkey Settings

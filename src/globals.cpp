@@ -42,6 +42,7 @@ std::atomic<bool> g_tetrahedralInterp{ false };  // Default: trilinear (tetrahed
 std::atomic<bool> g_running{ true };            // Main loop control
 std::atomic<bool> g_forceReinit{ false };       // Force reinit on next frame
 std::atomic<bool> g_forceTopmostReassert{ false }; // Force TOPMOST reassert on next frame
+std::atomic<bool> g_selfReassertInProgress{ false }; // Guard: suppress WM_WINDOWPOSCHANGING during our own reasserts
 std::atomic<bool> g_logPeakDetection{ false };  // Debug: log detected peak nits to console
 std::atomic<bool> g_consoleEnabled{ false };   // Show console window (GUI mode only, default off)
 std::atomic<bool> g_showFrameTiming{ false };  // Show frame timing in analysis overlay (default off)
@@ -51,6 +52,8 @@ HANDLE g_overlayWakeEvent = nullptr;           // Auto-reset event for auto-slee
 HANDLE g_topmostEvent = nullptr;              // Signaled when TOPMOST reassert needed
 std::atomic<bool> g_framePacerEnabled{ true };  // Enable predictive frame pacer (default: true)
 std::atomic<bool> g_framePacerSpinWait{ true }; // Enable spin-wait phase (default: true)
+std::atomic<bool> g_frameBufferEnabled{ true };  // Enable auto frame buffer (default: on)
+int g_frameBufferIdleMs = 3000;               // Idle timeout before buffer engages (default: 3s)
 
 // ============================================================================
 // Hotkey Settings

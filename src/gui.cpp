@@ -1717,8 +1717,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyGamma, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_hotkeyGammaEnabled.store(enable);
                 if (g_mainHwnd) {
-                    if (enable) RegisterHotKey(g_mainHwnd, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
-                    else UnregisterHotKey(g_mainHwnd, HOTKEY_GAMMA);
+                    PostMessage(g_mainHwnd, WM_HOTKEY_REGISTER, HOTKEY_GAMMA, enable ? 1 : 0);
                 }
                 SaveSettings();
             }
@@ -1729,8 +1728,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyHdr, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_hotkeyHdrEnabled.store(enable);
                 if (g_mainHwnd) {
-                    if (enable) RegisterHotKey(g_mainHwnd, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
-                    else UnregisterHotKey(g_mainHwnd, HOTKEY_HDR_TOGGLE);
+                    PostMessage(g_mainHwnd, WM_HOTKEY_REGISTER, HOTKEY_HDR_TOGGLE, enable ? 1 : 0);
                 }
                 SaveSettings();
             }
@@ -1741,8 +1739,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyAnalysis, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_hotkeyAnalysisEnabled.store(enable);
                 if (g_mainHwnd) {
-                    if (enable) RegisterHotKey(g_mainHwnd, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
-                    else UnregisterHotKey(g_mainHwnd, HOTKEY_ANALYSIS);
+                    PostMessage(g_mainHwnd, WM_HOTKEY_REGISTER, HOTKEY_ANALYSIS, enable ? 1 : 0);
                 }
                 SaveSettings();
             }
@@ -1864,7 +1861,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Update monitor names and combo box
             g_gui.monitorNames.clear();
-            SendMessage(g_gui.hwndMonitorList, CB_RESETCONTENT, 0, 0);
+            SendMessage(g_gui.hwndMonitorList, LB_RESETCONTENT, 0, 0);
             for (size_t i = 0; i < newMonitors.size(); i++) {
                 MONITORINFO mi = { sizeof(mi) };
                 GetMonitorInfo(newMonitors[i], &mi);
@@ -1873,7 +1870,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     mi.rcMonitor.right - mi.rcMonitor.left,
                     mi.rcMonitor.bottom - mi.rcMonitor.top);
                 g_gui.monitorNames.push_back(name);
-                SendMessage(g_gui.hwndMonitorList, CB_ADDSTRING, 0, (LPARAM)name);
+                SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)name);
             }
 
             // Clamp current monitor selection
@@ -1881,7 +1878,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_gui.currentMonitor = (int)newMonitors.size() - 1;
             }
             if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
-            SendMessage(g_gui.hwndMonitorList, CB_SETCURSEL, g_gui.currentMonitor, 0);
+            SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, g_gui.currentMonitor, 0);
 
             // Force reinit if processing is running
             if (g_gui.isRunning) {

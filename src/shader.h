@@ -1066,17 +1066,10 @@ void main(uint3 GTid : SV_GroupThreadID) {
 
     // Thread 0 writes output
     if (GTid.x == 0) {
-        // Recalculate grid size for totalPixels (same as above)
-        float ar = (float)frameWidth / (float)frameHeight;
-        uint gX = (uint)sqrt(4096.0f * ar);
-        uint gY = (uint)sqrt(4096.0f / ar);
-        if (gX < 1) gX = 1;
-        if (gY < 1) gY = 1;
-
         output[0] = asuint(sharedPeak[0]);
         output[1] = asuint(sharedMin[0]);
         output[2] = asuint(sharedSum[0]);  // Will divide by totalPixels in CPU code
-        output[3] = gX * gY;  // totalPixels (aspect-ratio-aware grid)
+        output[3] = 80 * 45;  // totalPixels: must match gridX*gridY sampling grid above
         output[4] = sharedRec709[0];
         output[5] = sharedP3Only[0];
         output[6] = sharedRec2020Only[0];

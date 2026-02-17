@@ -65,6 +65,7 @@ bool InitDesktopDuplication(MonitorContext* ctx) {
 
                 ctx->captureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
                 ctx->isHDREnabled = false;
+                ctx->isHDRAtom.store(false, std::memory_order_relaxed);
                 adapter->Release();
                 dxgiDevice->Release();
                 goto done;
@@ -120,6 +121,7 @@ done:
     ctx->captureFormat = duplDesc.ModeDesc.Format;
     bool isFP16 = (ctx->captureFormat == DXGI_FORMAT_R16G16B16A16_FLOAT);
     ctx->isHDREnabled = isFP16 && ctx->isHDRCapable;
+    ctx->isHDRAtom.store(ctx->isHDREnabled, std::memory_order_relaxed);
     ctx->isFP16SDR = isFP16 && !ctx->isHDRCapable;
 
     // Calculate frame time from refresh rate (with 5ms margin for timing tolerance)

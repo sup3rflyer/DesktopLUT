@@ -77,10 +77,10 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
         return false;
     }
 
-    // Check if any monitor is in HDR mode
+    // Check if any monitor is in HDR mode (use atomic for thread safety)
     bool anyHDR = false;
     for (const auto& ctx : g_monitors) {
-        if (ctx.isHDREnabled) {
+        if (ctx.isHDRAtom.load(std::memory_order_relaxed)) {
             anyHDR = true;
             break;
         }
@@ -216,11 +216,9 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
             }
             if (!g_overlayAutoSleep.load()) {
                 for (auto& ctx : g_monitors) {
-                    if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
-                        SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
-                        ShowWindow(ctx.hwnd, SW_SHOWNA);
-                    }
+                    ctx.requestedVisibility.store(1, std::memory_order_relaxed);
                 }
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             }
             std::cout << "VRR whitelist: disabled, showing overlays" << std::endl;
         }
@@ -264,9 +262,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                 g_vrrWhitelistMatch = matchedProcess;
             }
             for (auto& ctx : g_monitors) {
-                if (ctx.hwnd) {
-                    ShowWindow(ctx.hwnd, SW_HIDE);
-                }
+                ctx.requestedVisibility.store(-1, std::memory_order_relaxed);
             }
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"VRR whitelist: detected " << matchedProcess << L", hiding overlays" << std::endl;
@@ -283,10 +279,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
             }
             if (!g_overlayAutoSleep.load()) {
                 for (auto& ctx : g_monitors) {
-                    if (ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
-                        SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
-                        ShowWindow(ctx.hwnd, SW_SHOWNA);
-                    }
+                    ctx.requestedVisibility.store(1, std::memory_order_relaxed);
                 }
             }
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);

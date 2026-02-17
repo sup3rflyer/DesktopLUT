@@ -472,6 +472,8 @@ struct MhcDialogData {
     HWND hwndGrayscaleReset = nullptr;
     HWND hwndScrollPanel = nullptr;  // Horizontal scroll panel for trackbars
     HWND hwndDialog = nullptr;
+    // Font resources
+    HFONT smallFont = nullptr;
     // File import state
     ICCProfileData loadedICC;
     bool hasLoadedICC = false;
@@ -513,9 +515,11 @@ static void MhcRebuildTrackbars(MhcDialogData* d) {
     HFONT font = (HFONT)SendMessage(d->hwndDialog, WM_GETFONT, 0, 0);
     if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-    HFONT smallFont = CreateFont(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+    if (d->smallFont) DeleteObject(d->smallFont);
+    d->smallFont = CreateFont(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT smallFont = d->smallFont;
 
     int maxRange = GRAYSCALE_RANGE * GRAYSCALE_SLIDER_SCALE;
 
@@ -1160,6 +1164,10 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_DESTROY:
+        if (g_mhcDialog && g_mhcDialog->smallFont) {
+            DeleteObject(g_mhcDialog->smallFont);
+            g_mhcDialog->smallFont = nullptr;
+        }
         g_mhcDialog = nullptr;
         return 0;
 

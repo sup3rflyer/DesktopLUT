@@ -12,9 +12,26 @@
 #include <dcomp.h>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <functional>
+
+// Atomic wrapper that allows copy/move (for use in vector-stored structs)
+// Uses relaxed ordering for copies since these are cross-thread flags, not synchronization primitives
+template<typename T>
+struct MovableAtomic {
+    std::atomic<T> v;
+    MovableAtomic() : v{} {}
+    MovableAtomic(T val) : v{val} {}
+    MovableAtomic(const MovableAtomic& o) : v{o.v.load(std::memory_order_relaxed)} {}
+    MovableAtomic(MovableAtomic&& o) noexcept : v{o.v.load(std::memory_order_relaxed)} {}
+    MovableAtomic& operator=(const MovableAtomic& o) { v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed); return *this; }
+    MovableAtomic& operator=(MovableAtomic&& o) noexcept { v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed); return *this; }
+    T load(std::memory_order mo = std::memory_order_seq_cst) const { return v.load(mo); }
+    void store(T val, std::memory_order mo = std::memory_order_seq_cst) { v.store(val, mo); }
+    T exchange(T val, std::memory_order mo = std::memory_order_seq_cst) { return v.exchange(val, mo); }
+};
 
 // ============================================================================
 // Control IDs
@@ -37,6 +54,7 @@
 #define ID_TRAY_ICON        1
 #define WM_TRAYICON              (WM_USER + 1)
 #define WM_MHC_PROFILE_REAPPLIED (WM_USER + 101)
+#define WM_HOTKEY_REGISTER       (WM_USER + 102)
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003
@@ -100,6 +118,7 @@
 #define ID_SETTINGS_START_MINIMIZED       404
 #define ID_SETTINGS_RUN_AT_STARTUP        405
 #define ID_SETTINGS_CONSOLE_LOG           406
+#define ID_SETTINGS_FRAME_BUFFER          410
 #define ID_SETTINGS_LOG_PEAK              407
 #define ID_SETTINGS_VRR_WHITELIST_CHECK   408
 #define ID_SETTINGS_VRR_WHITELIST_BTN     409
@@ -236,7 +255,7 @@ struct FrameTimingStats {
     float minMs = 0.0f;          // Min in window
     float maxMs = 0.0f;          // Max in window
     float avgMs = 0.0f;          // Average in window
-    float varianceMs = 0.0f;     // Variance (jitter indicator)
+    float jitterMs = 0.0f;       // Std dev of frame time (jitter)
     float fps = 0.0f;            // Current FPS (1000/avgMs)
     bool compositorClockAvailable = false;  // Whether API is available
     // Frame pacer metrics
@@ -247,8 +266,7 @@ struct FrameTimingStats {
     float sleepOvershootMs = 0.0f;    // Sleep overshoot EMA (timer precision indicator)
     int droppedFrameCount = 0;        // Total DD acquisition timeouts
     bool cadenceLocked = false;       // True when cadence lock is active (frozen offset)
-    float currentAlpha = 0.125f;      // Current adaptive EMA alpha
-    int dcompDroppedFrames = 0;       // DWM frame drops detected via DComp frame ID gaps
+    float bufferJitterMs = 0.0f;      // Frame buffer present-to-present jitter (std dev)
 };
 
 // High-precision frame pacer state
@@ -288,9 +306,7 @@ struct FramePacer {
     HANDLE highResTimer = nullptr;
 
     // Diagnostics
-    int consecutiveTimeouts = 0;             // DD timeouts after predicted ready
-    int consecutiveEarly = 0;                // DD frames ready before prediction (unused, kept for compat)
-    int consecutiveLate = 0;                 // DD frames arriving after prediction (unused, kept for compat)
+    int consecutiveOutliers = 0;             // Consecutive outlier samples rejected by EMA
     int droppedFrameCount = 0;               // Total DD acquisition timeouts (for diagnostics)
 
     // Cadence lock state machine
@@ -316,9 +332,6 @@ struct FramePacer {
     float offsetClampMaxMs = 12.0f;          // Upper EMA clamp = min(refreshPeriod * 0.7, 12.0)
     float lockJitterMs = 0.17f;              // Rolling buffer spread to enter lock = max(0.5, period*0.05)
     float lockDivergenceMs = 1.67f;          // Shadow EMA divergence to exit lock = max(0.4, period*0.03)
-
-    // DWM timing refresh throttle
-    int dwmTimingRefreshCounter = 0;         // Throttle DwmGetCompositionTimingInfo calls
 
     // DComposition frame statistics (Win11+)
     bool hasDCompStats = false;              // Whether DComp stats APIs are available
@@ -404,6 +417,7 @@ struct MonitorContext {
     IDXGIOutputDuplication* duplication = nullptr;
     DXGI_FORMAT captureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
     bool isHDREnabled = false;
+    MovableAtomic<bool> isHDRAtom{false};  // Thread-safe HDR flag for whitelist thread
     bool isHDRCapable = false;
     bool isFP16SDR = false;  // ACM: FP16 capture but SDR color space (input is linear scRGB at 80 nits)
     bool wasHDREnabled = false;  // Track previous HDR state for mode change detection
@@ -474,6 +488,14 @@ struct MonitorContext {
     bool dcompCommitted = false;   // true after first frame rendered (prevents black flash)
     int framesAfterCommit = 0;     // frames rendered since dcompCommitted, for visibility delay
 
+    // Frame buffer (experimental: decouple capture from present for timing consistency)
+    ID3D11Texture2D* bufferTexture = nullptr;       // Intermediate render target
+    ID3D11RenderTargetView* bufferRTV = nullptr;    // RTV for rendering to buffer
+    bool bufferReady = false;                       // Buffer has valid content to present
+    // Buffer present jitter tracking (EMA of absolute deviation from expected period)
+    LARGE_INTEGER lastBufferPresentQpc = {};        // QPC of last buffer present
+    float bufferJitterEma = 0.0f;                   // Jitter EMA (ms), alpha=0.125
+
     // Manual color correction settings (separate for SDR and HDR)
     ColorCorrectionData sdrColorCorrection;
     ColorCorrectionData hdrColorCorrection;
@@ -490,6 +512,9 @@ struct MonitorContext {
     bool cbDirty = true;                     // True when constant buffer needs update
     bool lastDesktopGamma = true;            // Cached atomic value
     bool lastTetrahedralInterp = false;      // Cached atomic value
+
+    // Thread-safe visibility requests (whitelist thread → render thread)
+    MovableAtomic<int> requestedVisibility{0};  // 0=no change, 1=show, -1=hide
 };
 
 // Per-monitor LUT configuration from command line

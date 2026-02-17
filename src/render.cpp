@@ -298,6 +298,31 @@ bool CreateSwapChain(MonitorContext* ctx) {
         return false;
     }
 
+    // Create frame buffer texture for experimental 1-frame buffer mode
+    // Same format/size as swapchain — shader renders here, then CopyResource to backbuffer on next cycle
+    {
+        D3D11_TEXTURE2D_DESC bufDesc = {};
+        bufDesc.Width = ctx->width;
+        bufDesc.Height = ctx->height;
+        bufDesc.MipLevels = 1;
+        bufDesc.ArraySize = 1;
+        bufDesc.Format = ctx->swapchainFormat;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Usage = D3D11_USAGE_DEFAULT;
+        bufDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+        hr = g_device->CreateTexture2D(&bufDesc, nullptr, &ctx->bufferTexture);
+        if (SUCCEEDED(hr)) {
+            hr = g_device->CreateRenderTargetView(ctx->bufferTexture, nullptr, &ctx->bufferRTV);
+            if (FAILED(hr)) {
+                ctx->bufferTexture->Release();
+                ctx->bufferTexture = nullptr;
+            }
+        }
+        ctx->bufferReady = false;
+        // Non-fatal: buffer mode just won't work if creation fails
+    }
+
     return true;
 }
 
@@ -355,11 +380,15 @@ bool InitDirectComposition(MonitorContext* ctx) {
     return true;
 }
 
-void ResizeSwapChain(MonitorContext* ctx, int width, int height) {
+bool ResizeSwapChain(MonitorContext* ctx, int width, int height) {
     if (ctx->rtv) {
         ctx->rtv->Release();
         ctx->rtv = nullptr;
     }
+    // Release frame buffer (will be recreated at new size)
+    if (ctx->bufferRTV) { ctx->bufferRTV->Release(); ctx->bufferRTV = nullptr; }
+    if (ctx->bufferTexture) { ctx->bufferTexture->Release(); ctx->bufferTexture = nullptr; }
+    ctx->bufferReady = false;
 
     UINT flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     if (g_tearingSupported) flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
@@ -369,8 +398,7 @@ void ResizeSwapChain(MonitorContext* ctx, int width, int height) {
     if (FAILED(hr)) {
         std::cerr << "Monitor " << ctx->index << " ResizeBuffers failed: 0x"
                   << std::hex << hr << std::dec << std::endl;
-        // Don't disable - will retry on next reinit cycle
-        return;
+        return false;
     }
 
     ID3D11Texture2D* backBuffer = nullptr;
@@ -378,18 +406,41 @@ void ResizeSwapChain(MonitorContext* ctx, int width, int height) {
     if (FAILED(hr) || !backBuffer) {
         std::cerr << "Monitor " << ctx->index << " GetBuffer failed after resize: 0x"
                   << std::hex << hr << std::dec << std::endl;
-        return;
+        return false;
     }
     hr = g_device->CreateRenderTargetView(backBuffer, nullptr, &ctx->rtv);
     backBuffer->Release();
     if (FAILED(hr)) {
         std::cerr << "Monitor " << ctx->index << " CreateRTV failed after resize: 0x"
                   << std::hex << hr << std::dec << std::endl;
-        return;
+        return false;
     }
 
     ctx->width = width;
     ctx->height = height;
+
+    // Recreate frame buffer at new size
+    {
+        D3D11_TEXTURE2D_DESC bufDesc = {};
+        bufDesc.Width = width;
+        bufDesc.Height = height;
+        bufDesc.MipLevels = 1;
+        bufDesc.ArraySize = 1;
+        bufDesc.Format = ctx->swapchainFormat;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Usage = D3D11_USAGE_DEFAULT;
+        bufDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+        hr = g_device->CreateTexture2D(&bufDesc, nullptr, &ctx->bufferTexture);
+        if (SUCCEEDED(hr)) {
+            hr = g_device->CreateRenderTargetView(ctx->bufferTexture, nullptr, &ctx->bufferRTV);
+            if (FAILED(hr)) {
+                ctx->bufferTexture->Release();
+                ctx->bufferTexture = nullptr;
+            }
+        }
+    }
+    return true;
 }
 
 bool RecreateSwapchain(MonitorContext* ctx) {
@@ -407,6 +458,9 @@ bool RecreateSwapchain(MonitorContext* ctx) {
     }
 
     // Clean up existing swapchain resources
+    if (ctx->bufferRTV) { ctx->bufferRTV->Release(); ctx->bufferRTV = nullptr; }
+    if (ctx->bufferTexture) { ctx->bufferTexture->Release(); ctx->bufferTexture = nullptr; }
+    ctx->bufferReady = false;
     if (ctx->rtv) {
         ctx->rtv->Release();
         ctx->rtv = nullptr;
@@ -444,34 +498,52 @@ bool RecreateSwapchain(MonitorContext* ctx) {
 // is a no-op since Windows already considers it associated. Remove + re-add forces Windows
 // to reprocess the profile and apply it to the active pipeline.
 static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
-    if (ctx->index >= (int)g_gui.monitorSettings.size()) return;
-    const auto& ms = g_gui.monitorSettings[ctx->index];
+    // Snapshot MHC settings under lock (render thread reads, GUI thread writes)
+    bool mhcEnabled = false;
+    std::wstring profileName;
+    bool isHDR = ctx->isHDREnabled;
+    bool sdrPrimEn = false, sdrGsEn = false, hdrPrimEn = false, hdrGsEn = false;
+    std::wstring sdrName, hdrName, sdrProfName, hdrProfName;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (ctx->index >= (int)g_gui.monitorSettings.size()) return;
+        const auto& ms = g_gui.monitorSettings[ctx->index];
+        const auto& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
+        mhcEnabled = mhc.enabled;
+        profileName = mhc.profileName;
+        sdrPrimEn = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.primariesEnabled;
+        sdrGsEn = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.grayscale.enabled;
+        hdrPrimEn = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.primariesEnabled;
+        hdrGsEn = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.grayscale.enabled;
+    }
 
     DisplayInfo displayInfo;
     if (!GetDisplayInfoForMonitor(ctx->index, displayInfo)) return;
 
     // Remove + re-add profile for current mode to force Windows to apply it
-    const auto& mhc = ctx->isHDREnabled ? ms.hdrMHC : ms.sdrMHC;
-    if (mhc.enabled && !mhc.profileName.empty()) {
-        std::wcout << L"Mode switch: reapplying " << (ctx->isHDREnabled ? L"HDR" : L"SDR")
-                   << L" MHC profile '" << mhc.profileName
+    if (mhcEnabled && !profileName.empty()) {
+        std::wcout << L"Mode switch: reapplying " << (isHDR ? L"HDR" : L"SDR")
+                   << L" MHC profile '" << profileName
                    << L"' for monitor " << ctx->index << std::endl;
-        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
-        ReassociateMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, ctx->isHDREnabled);
+        RemoveMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        ReassociateMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
     }
 
     // Update MHC flags to match current settings
-    ctx->sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.primariesEnabled;
-    ctx->sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.grayscale.enabled;
-    ctx->hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.primariesEnabled;
-    ctx->hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.grayscale.enabled;
+    ctx->sdrMhcPrimariesActive = sdrPrimEn;
+    ctx->sdrMhcGrayscaleActive = sdrGsEn;
+    ctx->hdrMhcPrimariesActive = hdrPrimEn;
+    ctx->hdrMhcGrayscaleActive = hdrGsEn;
 }
+
+// Maximum recovery retries before giving up on a monitor (~5 min at 5s backoff cap)
+static const int MAX_RECOVERY_RETRIES = 60;
 
 // ============================================================================
 // SECTION: Render Monitor
 // ============================================================================
 
-void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
+void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Entry validation - skip if monitor is disabled
     if (!ctx || !ctx->enabled) return;
 
@@ -495,18 +567,24 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
         ctx->consecutiveFailures++;
         ctx->recoveryBackoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
 
+        if (ctx->consecutiveFailures > MAX_RECOVERY_RETRIES) {
+            std::cerr << "Monitor " << ctx->index << " exceeded " << MAX_RECOVERY_RETRIES
+                      << " recovery attempts, disabling" << std::endl;
+            ctx->enabled = false;
+            return;
+        }
+
         if (ctx->consecutiveFailures % 10 == 0) {
             std::cout << "Monitor " << ctx->index << " attempting recovery, attempt "
                       << ctx->consecutiveFailures << "..." << std::endl;
         }
-
-        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
         if (ReinitDesktopDuplication(ctx)) {
             std::cout << "Monitor " << ctx->index << " reinit success" << std::endl;
             ctx->consecutiveFailures = 0;
             ctx->recoveryBackoffMs = 0;
             ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache after reinit
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             // ReinitDesktopDuplication handles HDR change + swapchain recreation internally.
             // Apply additional mode-switch steps not covered by reinit:
             if (ctx->isHDREnabled != ctx->wasHDREnabled) {
@@ -521,26 +599,90 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
 
     if (!ctx->swapchain || !ctx->rtv) return;
 
-    // Acquire next frame from desktop duplication (non-blocking only).
-    // Frame pacing is handled by compositor sync in RenderAll() — we just grab whatever
-    // frame the compositor produced. If desktop is static, no frame is available and
+    // ── Frame buffer mode: present previously rendered buffer first ──
+    // Decouples capture timing from present timing for consistent DWM reads.
+    // Cost: +1 frame latency (~21ms at 48Hz). Benefit: Present always happens
+    // immediately after compositor sync, eliminating capture-to-present variance.
+    bool useFrameBuffer = bufferActive && ctx->bufferTexture && ctx->bufferRTV;
+
+    // Take QPC BEFORE buffer present for clean composition offset measurement.
+    // Buffer Present can block under GPU load (MaxFrameLatency=1 backpressure),
+    // which would contaminate the offset with our own overhead and prevent cadence lock.
+    // Blocking fallback re-takes QPC on success for accurate late-delivery measurement.
+    LARGE_INTEGER preAcquireQpc;
+    QueryPerformanceCounter(&preAcquireQpc);
+
+    if (useFrameBuffer && ctx->bufferReady) {
+        // Fast path: copy buffered frame to backbuffer and present immediately.
+        // This happens right after compositor sync (top of RenderAll), so Present timing
+        // is decoupled from variable DD acquisition + shader processing time.
+        ID3D11Texture2D* backBuffer = nullptr;
+        HRESULT bufHr = ctx->swapchain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+        if (SUCCEEDED(bufHr) && backBuffer) {
+            g_context->CopyResource(backBuffer, ctx->bufferTexture);
+            backBuffer->Release();
+
+            UINT presentFlags = g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0;
+            HRESULT presentHr = ctx->swapchain->Present(0, presentFlags);
+            if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
+                std::cerr << "Monitor " << ctx->index << " device lost during buffer Present: 0x"
+                          << std::hex << presentHr << std::dec << std::endl;
+                for (auto& m : g_monitors) {
+                    if (m.hwnd) ShowWindow(m.hwnd, SW_HIDE);
+                }
+                g_running = false;
+                return;
+            }
+
+            // Measure buffer present-to-present jitter (EMA of absolute deviation from expected period).
+            // EMA decays outliers in ~8 frames vs 64 with a rolling window.
+            if (g_analysisEnabled.load()) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                if (ctx->lastBufferPresentQpc.QuadPart > 0 && fp) {
+                    float intervalMs = (float)(now.QuadPart - ctx->lastBufferPresentQpc.QuadPart)
+                                     / (float)fp->qpcFrequency * 1000.0f;
+                    float deviation = fabsf(intervalMs - fp->refreshPeriodMs);
+                    ctx->bufferJitterEma = ctx->bufferJitterEma * 0.875f + deviation * 0.125f;
+                }
+                ctx->lastBufferPresentQpc = now;
+            }
+        }
+        // Visibility and watchdog handled in the success path at the bottom
+    }
+
+    // Acquire next frame from desktop duplication.
+    // Two-phase: instant try first (AcquireNextFrame(0)), then short blocking fallback
+    // (2-3ms) if the pacer's predicted offset was slightly early. This catches frames
+    // where variable DWM composition time shifts DD delivery past the prediction without
+    // blocking for a full period. If both fail, desktop is genuinely static and
     // DirectComposition holds the last presented buffer (overlay stays visible).
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
 
-    // Take QPC immediately before acquire for cleaner composition offset measurement
-    // (removes variable processing overhead: topmost reassert, color correction, loop iteration)
-    LARGE_INTEGER preAcquireQpc;
-    QueryPerformanceCounter(&preAcquireQpc);
-
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
+
+    // Short blocking fallback: catches frames where DD delivery is slightly later than
+    // the pacer's predicted offset (e.g., variable DWM composition time under GPU load).
+    // Without this, AcquireNextFrame(0) misses frames that arrive even 0.1ms late,
+    // turning a clean 2:2 cadence into irregular 1:3 gaps → visible judder.
+    // Timeout scales with refresh period: 3ms at 48Hz, 2ms at 60Hz, 1ms at 120Hz.
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT && fp && fp->strategy != FramePacerStrategy::DwmFlushOnly) {
+        UINT fallbackMs = (UINT)(std::min)(3.0f, fp->refreshPeriodMs * 0.15f);
+        if (fallbackMs > 0) {
+            hr = ctx->duplication->AcquireNextFrame(fallbackMs, &frameInfo, &desktopResource);
+            if (SUCCEEDED(hr)) {
+                // Re-take QPC for accurate offset measurement: reflects actual DD delivery
+                // time, not the pacer's (too-early) prediction. EMA converges to reality,
+                // reducing future near-misses. MMCSS Pro Audio minimizes schedule wake latency.
+                QueryPerformanceCounter(&preAcquireQpc);
+            }
+        }
+    }
+
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // Only primary monitor feeds timeouts — secondary monitors timing out just means
-        // "no new content on that output", not a compositor timing issue.
-        // All monitors feed successful acquisitions (same compositor offset).
+        // Truly no new content this cycle (content static or frame rate < display rate).
         if (fp && ctx->index == 0) FramePacerNotifyTimeout(fp);
-        // No new frame from compositor — desktop is static or frame not yet ready.
-        // DirectComposition holds the last presented buffer, so overlay stays visible.
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Still need to handle initial visibility even without new frames
         if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)
@@ -574,6 +716,13 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
         ctx->consecutiveFailures++;
         ctx->recoveryBackoffMs = (std::min)(50 * (1 << (std::min)(ctx->consecutiveFailures - 1, 7)), 5000);
         ctx->lastRecoveryAttempt = std::chrono::steady_clock::now();
+
+        if (ctx->consecutiveFailures > MAX_RECOVERY_RETRIES) {
+            std::cerr << "Monitor " << ctx->index << " exceeded " << MAX_RECOVERY_RETRIES
+                      << " recovery attempts after ACCESS_LOST, disabling" << std::endl;
+            ctx->enabled = false;
+            return;
+        }
 
         if (ctx->consecutiveFailures == 1 || ctx->consecutiveFailures % 10 == 0) {
             std::cout << "Monitor " << ctx->index << " duplication lost (0x" << std::hex << hr << std::dec
@@ -617,7 +766,12 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     if ((int)texDesc.Width != ctx->width || (int)texDesc.Height != ctx->height) {
         ctx->width = texDesc.Width;
         ctx->height = texDesc.Height;
-        ResizeSwapChain(ctx, ctx->width, ctx->height);
+        if (!ResizeSwapChain(ctx, ctx->width, ctx->height)) {
+            frameTexture->Release();
+            ctx->duplication->ReleaseFrame();
+            g_forceReinit = true;
+            return;
+        }
 
         // Also resize window
         SetWindowPos(ctx->hwnd, nullptr, 0, 0, ctx->width, ctx->height,
@@ -683,6 +837,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     // Motion bar position changes every frame — force CB update when enabled
     bool motionBar = g_showMotionBar.load();
     if (motionBar) ctx->cbDirty = true;
+
+    // Multi-monitor: always update CB since it's shared across monitors (272-byte Map/Unmap is ~1-5μs)
+    if (g_monitors.size() > 1) ctx->cbDirty = true;
 
     // Update constant buffer only when dirty (avoids Map/Unmap overhead on static frames)
     if (ctx->cbDirty) {
@@ -891,13 +1048,17 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
         }
     }
 
-    // Render
+    // Render — choose render target based on buffer mode
+    // Buffer mode: render to intermediate texture (presented next cycle for consistent timing)
+    // Normal mode: render directly to swapchain backbuffer
+    ID3D11RenderTargetView* renderTarget = (useFrameBuffer) ? ctx->bufferRTV : ctx->rtv;
+
     float clearColor[4] = { 0, 0, 0, 0 };
-    g_context->ClearRenderTargetView(ctx->rtv, clearColor);
+    g_context->ClearRenderTargetView(renderTarget, clearColor);
 
     D3D11_VIEWPORT vp = { 0, 0, (float)ctx->width, (float)ctx->height, 0, 1 };
     g_context->RSSetViewports(1, &vp);
-    g_context->OMSetRenderTargets(1, &ctx->rtv, nullptr);
+    g_context->OMSetRenderTargets(1, &renderTarget, nullptr);
 
     g_context->VSSetShader(g_vs, nullptr, 0);
     g_context->PSSetShader(g_ps, nullptr, 0);
@@ -916,15 +1077,28 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
     g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_context->Draw(3, 0);
 
-    // Analysis overlay (primary monitor only)
+    // Analysis overlay (primary monitor only) — always renders to backbuffer
     if (ctx->index == 0 && g_analysisEnabled.load()) {
+        // If buffer mode, switch back to backbuffer for analysis (it's an overlay on the presented frame)
+        if (useFrameBuffer) {
+            g_context->OMSetRenderTargets(1, &ctx->rtv, nullptr);
+        }
         DispatchAnalysisCompute(ctx);
         UpdateAnalysisDisplay(ctx);
     }
 
-    // Present immediately - compositor sync at start of RenderAll handles frame pacing
+    if (useFrameBuffer) {
+        // Buffer mode: mark buffer ready for next cycle's present.
+        // No Present here — it was already done at the top of this function.
+        ctx->bufferReady = true;
+    }
+
+    // Normal mode: present immediately — compositor sync at start of RenderAll handles frame pacing
     UINT presentFlags = g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    HRESULT presentHr = ctx->swapchain->Present(0, presentFlags);
+    HRESULT presentHr = S_OK;
+    if (!useFrameBuffer) {
+        presentHr = ctx->swapchain->Present(0, presentFlags);
+    }
 
     if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
         std::cerr << "Monitor " << ctx->index << " device lost during Present: 0x"
@@ -933,11 +1107,11 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
             HRESULT reason = g_device->GetDeviceRemovedReason();
             std::cerr << "  Device removed reason: 0x" << std::hex << reason << std::dec << std::endl;
         }
-        // Hide overlay immediately to prevent black screen blocking desktop
-        if (ctx->hwnd) {
-            ShowWindow(ctx->hwnd, SW_HIDE);
+        // Device is shared — hide all overlays and stop (one removal means all are dead)
+        for (auto& m : g_monitors) {
+            if (m.hwnd) ShowWindow(m.hwnd, SW_HIDE);
         }
-        ctx->enabled = false;
+        g_running = false;
     } else {
         // Successful frame - update watchdog timestamp
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -976,8 +1150,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp) {
                 ctx->frameTimingStats.droppedFrameCount = fp->droppedFrameCount;
                 ctx->frameTimingStats.cadenceLocked =
                     (fp->cadenceLockState == CadenceLockState::Locked);
-                ctx->frameTimingStats.currentAlpha = fp->currentAlpha;
-                ctx->frameTimingStats.dcompDroppedFrames = fp->dcompDroppedFrames;
+                ctx->frameTimingStats.bufferJitterMs = ctx->bufferJitterEma;
             }
         } else {
             // Reset so we get a fresh baseline when analysis is toggled on
@@ -1056,14 +1229,7 @@ void RenderAll(FramePacer* fp) {
         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         // Reset frame pacer EMA and cadence lock (force re-convergence after wake)
         if (fp) {
-            fp->offsetSampleCount = 0;
-            fp->dwmTimingRefreshCounter = 0;
-            fp->cadenceLockState = CadenceLockState::Unlocked;
-            fp->stableFrameCount = 0;
-            fp->rollingMinCount = 0;
-            fp->biasAboveMinCount = 0;
-            fp->consecutiveAcquireTimeouts = 0;
-            fp->varianceEma = 0.5f;
+            ResetFramePacerState(fp, "forced reinit");
         }
         // Temporarily drop MMCSS priority during heavy reinit work
         // (500ms Sleep + system API calls would exceed Pro Audio time quota)
@@ -1121,6 +1287,17 @@ void RenderAll(FramePacer* fp) {
 
     // Gamma whitelist is now checked on a separate thread (see GammaWhitelistThreadFunc)
     // The render loop just reads the atomic g_gammaWhitelistActive flag via constant buffer
+
+    // Consume visibility requests from whitelist thread (atomic flags → UI calls on render thread)
+    for (auto& ctx : g_monitors) {
+        int vis = ctx.requestedVisibility.exchange(0, std::memory_order_relaxed);
+        if (vis == 1 && ctx.hwnd && ctx.enabled && ctx.dcompCommitted) {
+            SetLayeredWindowAttributes(ctx.hwnd, 0, 255, LWA_ALPHA);
+            ShowWindow(ctx.hwnd, SW_SHOWNA);
+        } else if (vis == -1 && ctx.hwnd) {
+            ShowWindow(ctx.hwnd, SW_HIDE);
+        }
+    }
 
     // Apply any pending color correction updates (fast path: skip mutex if no updates)
     // Swap-under-lock pattern: grab pending updates quickly, process without holding lock
@@ -1199,15 +1376,8 @@ void RenderAll(FramePacer* fp) {
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             // Reset frame pacer EMA and cadence lock on wake (force re-convergence)
             if (fp) {
-                fp->offsetSampleCount = 0;
-                fp->dwmTimingRefreshCounter = 0;
-                fp->cadenceLockState = CadenceLockState::Unlocked;
-                fp->stableFrameCount = 0;
-                fp->rollingMinCount = 0;
-                fp->biasAboveMinCount = 0;
-                fp->consecutiveAcquireTimeouts = 0;
-                fp->varianceEma = 0.5f;
-                }
+                ResetFramePacerState(fp, "auto-sleep wake");
+            }
             // Don't force-show here — RenderMonitor's two-phase visibility handles it
             // Just mark dcompCommitted = false so windows go through proper show sequence
             for (auto& ctx : g_monitors) {
@@ -1220,9 +1390,31 @@ void RenderAll(FramePacer* fp) {
         }
     }
 
+    // Auto frame buffer: engage when no user input for configured idle timeout.
+    // Decouples capture from present for smoother video playback.
+    // Disengages instantly on input for responsive desktop interaction.
+    static bool s_frameBufferActive = false;
+    bool frameBufferActive = false;
+    if (g_frameBufferEnabled.load(std::memory_order_relaxed)) {
+        LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
+        if (GetLastInputInfo(&lii)) {
+            DWORD idleMs = GetTickCount() - lii.dwTime;
+            frameBufferActive = (g_frameBufferIdleMs == 0) || (idleMs >= (DWORD)g_frameBufferIdleMs);
+        }
+    }
+    // Reset buffer state on transitions
+    if (frameBufferActive != s_frameBufferActive) {
+        s_frameBufferActive = frameBufferActive;
+        for (auto& ctx : g_monitors) {
+            ctx.bufferReady = false;
+            ctx.bufferJitterEma = 0.0f;
+            ctx.lastBufferPresentQpc = {};
+        }
+    }
+
     for (auto& ctx : g_monitors) {
         if (ctx.enabled) {
-            RenderMonitor(&ctx, fp);
+            RenderMonitor(&ctx, fp, frameBufferActive);
             activeCount++;
         }
     }
@@ -1304,6 +1496,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
         return 0;
+    case WM_HOTKEY_REGISTER:
+        // Handle hotkey register/unregister on the render thread (which owns g_mainHwnd)
+        {
+            int hotkeyId = (int)wParam;
+            bool enable = (lParam != 0);
+            UINT vk = 0;
+            switch (hotkeyId) {
+                case HOTKEY_GAMMA:    vk = g_hotkeyGammaKey; break;
+                case HOTKEY_HDR_TOGGLE: vk = g_hotkeyHdrKey; break;
+                case HOTKEY_ANALYSIS: vk = g_hotkeyAnalysisKey; break;
+            }
+            if (vk) {
+                if (enable) RegisterHotKey(hwnd, hotkeyId, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, vk);
+                else UnregisterHotKey(hwnd, hotkeyId);
+            }
+        }
+        return 0;
     case WM_TIMER:
         if (wParam == HDR_REINIT_TIMER_ID) {
             KillTimer(hwnd, HDR_REINIT_TIMER_ID);
@@ -1322,9 +1531,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_WINDOWPOSCHANGING: {
         // If an external window is changing our z-order, trigger TOPMOST reassertion.
-        // Ignore our own HWND_TOPMOST reasserts to prevent feedback loop with helper thread.
+        // Ignore our own reasserts: HWND_TOPMOST check catches direct calls,
+        // g_selfReassertInProgress catches indirect z-order changes from our analysis/OSD windows.
         WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
-        if (wp && !(wp->flags & SWP_NOZORDER) && wp->hwndInsertAfter != HWND_TOPMOST) {
+        if (wp && !(wp->flags & SWP_NOZORDER) && wp->hwndInsertAfter != HWND_TOPMOST
+            && !g_selfReassertInProgress.load(std::memory_order_acquire)) {
             g_forceTopmostReassert.store(true);
         }
         break;

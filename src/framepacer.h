@@ -23,3 +23,7 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc = 0);
 
 // Notify pacer that AcquireNextFrame(0) returned WAIT_TIMEOUT
 void FramePacerNotifyTimeout(FramePacer* fp);
+
+// Reset frame pacer tracking state (EMA, cadence lock, counters).
+// Call after events that invalidate timing assumptions (sleep/wake, forced reinit, auto-sleep wake).
+void ResetFramePacerState(FramePacer* fp, const char* reason);
