@@ -322,7 +322,8 @@ struct FramePacer {
     int biasAboveMinCount = 0;               // Consecutive frames where EMA > rollingMin + 1ms
 
     // Timeout-aware upward adjustment
-    int consecutiveAcquireTimeouts = 0;      // Consecutive AcquireNextFrame(0) timeouts
+    int consecutiveAcquireTimeouts = 0;      // Consecutive AcquireNextFrame(0) timeouts (both instant+blocking failed)
+    int consecutiveBlockingFallbacks = 0;    // Consecutive frames where instant Acquire(0) failed but blocking caught it
 
     // Cached refresh-rate-derived thresholds (recomputed on rate change, not per-frame)
     float refreshPeriodMs = 16.667f;         // Cached refresh period in ms

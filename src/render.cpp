@@ -599,57 +599,14 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
 
     if (!ctx->swapchain || !ctx->rtv) return;
 
-    // ── Frame buffer mode: present previously rendered buffer first ──
-    // Decouples capture timing from present timing for consistent DWM reads.
-    // Cost: +1 frame latency (~21ms at 48Hz). Benefit: Present always happens
-    // immediately after compositor sync, eliminating capture-to-present variance.
     bool useFrameBuffer = bufferActive && ctx->bufferTexture && ctx->bufferRTV;
 
-    // Take QPC BEFORE buffer present for clean composition offset measurement.
-    // Buffer Present can block under GPU load (MaxFrameLatency=1 backpressure),
-    // which would contaminate the offset with our own overhead and prevent cadence lock.
+    // preAcquireQpc: taken just before AcquireNextFrame for clean composition offset
+    // measurement. Buffer present has been hoisted to RenderAll (immediately after VBlank
+    // wake), so there's no Present() blocking between this QPC and Acquire.
     // Blocking fallback re-takes QPC on success for accurate late-delivery measurement.
     LARGE_INTEGER preAcquireQpc;
     QueryPerformanceCounter(&preAcquireQpc);
-
-    if (useFrameBuffer && ctx->bufferReady) {
-        // Fast path: copy buffered frame to backbuffer and present immediately.
-        // This happens right after compositor sync (top of RenderAll), so Present timing
-        // is decoupled from variable DD acquisition + shader processing time.
-        ID3D11Texture2D* backBuffer = nullptr;
-        HRESULT bufHr = ctx->swapchain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-        if (SUCCEEDED(bufHr) && backBuffer) {
-            g_context->CopyResource(backBuffer, ctx->bufferTexture);
-            backBuffer->Release();
-
-            UINT presentFlags = g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0;
-            HRESULT presentHr = ctx->swapchain->Present(0, presentFlags);
-            if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
-                std::cerr << "Monitor " << ctx->index << " device lost during buffer Present: 0x"
-                          << std::hex << presentHr << std::dec << std::endl;
-                for (auto& m : g_monitors) {
-                    if (m.hwnd) ShowWindow(m.hwnd, SW_HIDE);
-                }
-                g_running = false;
-                return;
-            }
-
-            // Measure buffer present-to-present jitter (EMA of absolute deviation from expected period).
-            // EMA decays outliers in ~8 frames vs 64 with a rolling window.
-            if (g_analysisEnabled.load()) {
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-                if (ctx->lastBufferPresentQpc.QuadPart > 0 && fp) {
-                    float intervalMs = (float)(now.QuadPart - ctx->lastBufferPresentQpc.QuadPart)
-                                     / (float)fp->qpcFrequency * 1000.0f;
-                    float deviation = fabsf(intervalMs - fp->refreshPeriodMs);
-                    ctx->bufferJitterEma = ctx->bufferJitterEma * 0.875f + deviation * 0.125f;
-                }
-                ctx->lastBufferPresentQpc = now;
-            }
-        }
-        // Visibility and watchdog handled in the success path at the bottom
-    }
 
     // Acquire next frame from desktop duplication.
     // Two-phase: instant try first (AcquireNextFrame(0)), then short blocking fallback
@@ -667,15 +624,19 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Without this, AcquireNextFrame(0) misses frames that arrive even 0.1ms late,
     // turning a clean 2:2 cadence into irregular 1:3 gaps → visible judder.
     // Timeout scales with refresh period: 3ms at 48Hz, 2ms at 60Hz, 1ms at 120Hz.
+    // NOTE: preAcquireQpc is NOT re-taken on blocking success. The old approach (re-take
+    // QPC to measure actual delivery time) created a positive feedback loop: inflated
+    // offset measurements pushed the EMA up, causing more blocking fallbacks, causing
+    // more inflation. At non-standard rates like 47.952Hz this produced ~1 missed frame
+    // per 33 cycles (3.6ms jitter settling). The near-miss counter in RecordAcquisition
+    // provides gentler upward pressure instead.
+    bool blockingFallbackUsed = false;
     if (hr == DXGI_ERROR_WAIT_TIMEOUT && fp && fp->strategy != FramePacerStrategy::DwmFlushOnly) {
         UINT fallbackMs = (UINT)(std::min)(3.0f, fp->refreshPeriodMs * 0.15f);
         if (fallbackMs > 0) {
             hr = ctx->duplication->AcquireNextFrame(fallbackMs, &frameInfo, &desktopResource);
             if (SUCCEEDED(hr)) {
-                // Re-take QPC for accurate offset measurement: reflects actual DD delivery
-                // time, not the pacer's (too-early) prediction. EMA converges to reality,
-                // reducing future near-misses. MMCSS Pro Audio minimizes schedule wake latency.
-                QueryPerformanceCounter(&preAcquireQpc);
+                blockingFallbackUsed = true;
             }
         }
     }
@@ -747,7 +708,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     ctx->consecutiveFailures = 0;
 
     // Update frame pacer composition offset EMA (use pre-acquire QPC for cleaner measurement)
-    if (fp) FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart);
+    if (fp) FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed);
 
     // Got a new frame - get the texture
     ID3D11Texture2D* frameTexture = nullptr;
@@ -1269,6 +1230,28 @@ void RenderAll(FramePacer* fp) {
         }
     }
 
+    // Auto frame buffer: compute idle state BEFORE sync (GetLastInputInfo + GetTickCount
+    // are ~0 cost reads from shared memory, no syscall overhead). Must be known before
+    // buffer present pre-pass that fires immediately after VBlank wake.
+    static bool s_frameBufferActive = false;
+    bool frameBufferActive = false;
+    if (g_frameBufferEnabled.load(std::memory_order_relaxed)) {
+        LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
+        if (GetLastInputInfo(&lii)) {
+            DWORD idleMs = GetTickCount() - lii.dwTime;
+            frameBufferActive = (g_frameBufferIdleMs == 0) || (idleMs >= (DWORD)g_frameBufferIdleMs);
+        }
+    }
+    // Reset buffer state on transitions
+    if (frameBufferActive != s_frameBufferActive) {
+        s_frameBufferActive = frameBufferActive;
+        for (auto& ctx : g_monitors) {
+            ctx.bufferReady = false;
+            ctx.bufferJitterEma = 0.0f;
+            ctx.lastBufferPresentQpc = {};
+        }
+    }
+
     // ── Frame sync: wait for next compositor cycle via frame pacer ──
     // Strategy A (Win11+): CompositorClock + predictive offset + spin-wait
     // Strategy B (Win10): DwmFlush + DwmTimingInfo + spin-wait
@@ -1277,6 +1260,52 @@ void RenderAll(FramePacer* fp) {
         // Display off or occluded — skip this frame
         return;
     }
+
+    // ── Buffer present pre-pass: IMMEDIATELY after VBlank wake ──
+    // Present previously rendered buffer for all monitors before any housekeeping.
+    // This is the tightest possible wake-to-present path: only an if + loop + GPU submit.
+    // All variable-cost housekeeping (TOPMOST, ShowWindow, mutex, cout) happens AFTER,
+    // where timing no longer affects present jitter (BJit).
+    if (frameBufferActive) {
+        for (auto& ctx : g_monitors) {
+            if (!ctx.enabled || !ctx.bufferReady || !ctx.swapchain || !ctx.bufferTexture)
+                continue;
+
+            ID3D11Texture2D* backBuffer = nullptr;
+            HRESULT bufHr = ctx.swapchain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+            if (SUCCEEDED(bufHr) && backBuffer) {
+                g_context->CopyResource(backBuffer, ctx.bufferTexture);
+                backBuffer->Release();
+
+                UINT presentFlags = g_tearingSupported ? DXGI_PRESENT_ALLOW_TEARING : 0;
+                HRESULT presentHr = ctx.swapchain->Present(0, presentFlags);
+                if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
+                    std::cerr << "Monitor " << ctx.index << " device lost during buffer Present: 0x"
+                              << std::hex << presentHr << std::dec << std::endl;
+                    for (auto& m : g_monitors) {
+                        if (m.hwnd) ShowWindow(m.hwnd, SW_HIDE);
+                    }
+                    g_running = false;
+                    return;
+                }
+
+                // Measure buffer present-to-present jitter (EMA of absolute deviation from expected period).
+                if (g_analysisEnabled.load()) {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    if (ctx.lastBufferPresentQpc.QuadPart > 0 && fp) {
+                        float intervalMs = (float)(now.QuadPart - ctx.lastBufferPresentQpc.QuadPart)
+                                         / (float)fp->qpcFrequency * 1000.0f;
+                        float deviation = fabsf(intervalMs - fp->refreshPeriodMs);
+                        ctx.bufferJitterEma = ctx.bufferJitterEma * 0.875f + deviation * 0.125f;
+                    }
+                    ctx.lastBufferPresentQpc = now;
+                }
+            }
+        }
+    }
+
+    // ── Housekeeping: timing no longer critical past this point ──
 
     // TOPMOST reassert: signal helper thread instead of blocking render loop.
     // The helper thread handles both on-demand (event-driven) and periodic (30s) reasserts.
@@ -1387,28 +1416,6 @@ void RenderAll(FramePacer* fp) {
                 }
             }
             std::cout << "Auto-sleep: overlay needed again, waking" << std::endl;
-        }
-    }
-
-    // Auto frame buffer: engage when no user input for configured idle timeout.
-    // Decouples capture from present for smoother video playback.
-    // Disengages instantly on input for responsive desktop interaction.
-    static bool s_frameBufferActive = false;
-    bool frameBufferActive = false;
-    if (g_frameBufferEnabled.load(std::memory_order_relaxed)) {
-        LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
-        if (GetLastInputInfo(&lii)) {
-            DWORD idleMs = GetTickCount() - lii.dwTime;
-            frameBufferActive = (g_frameBufferIdleMs == 0) || (idleMs >= (DWORD)g_frameBufferIdleMs);
-        }
-    }
-    // Reset buffer state on transitions
-    if (frameBufferActive != s_frameBufferActive) {
-        s_frameBufferActive = frameBufferActive;
-        for (auto& ctx : g_monitors) {
-            ctx.bufferReady = false;
-            ctx.bufferJitterEma = 0.0f;
-            ctx.lastBufferPresentQpc = {};
         }
     }
 

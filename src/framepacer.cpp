@@ -514,7 +514,7 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
 // FramePacerRecordAcquisition — called after successful AcquireNextFrame
 // ============================================================================
 
-void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
+void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool wasBlockingFallback) {
     if (fp->strategy == FramePacerStrategy::DwmFlushOnly) return;
     if (fp->qpcRefreshPeriod <= 0) return;
 
@@ -575,6 +575,22 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc) {
     // Good sample — reset outlier and acquire timeout counters
     fp->consecutiveOutliers = 0;
     fp->consecutiveAcquireTimeouts = 0;
+
+    // Near-miss tracking: when AcquireNextFrame(0) fails but blocking fallback catches
+    // the frame, the pacer was slightly early. Track consecutive near-misses and nudge
+    // the EMA up gently. This replaces the old QPC re-take approach which created a
+    // positive feedback loop: inflated measurements → higher EMA → more near-misses →
+    // more inflation → eventually missing ~1 frame per 33 cycles at non-standard rates.
+    if (wasBlockingFallback) {
+        fp->consecutiveBlockingFallbacks++;
+        if (fp->consecutiveBlockingFallbacks >= 4 && fp->cadenceLockState != CadenceLockState::Locked) {
+            fp->compositionOffsetMs = (std::min)(fp->compositionOffsetMs + 0.15f, fp->offsetClampMaxMs);
+            fp->shadowEmaOffset = (std::min)(fp->shadowEmaOffset + 0.15f, fp->offsetClampMaxMs);
+            fp->consecutiveBlockingFallbacks = 0;
+        }
+    } else {
+        fp->consecutiveBlockingFallbacks = 0;
+    }
 
     // Variance-adaptive EMA: alpha adapts to prediction error
     if (fp->offsetSampleCount < 1000) fp->offsetSampleCount++;
@@ -705,6 +721,7 @@ void ResetFramePacerState(FramePacer* fp, const char* reason) {
     fp->biasAboveMinCount = 0;
     fp->consecutiveAcquireTimeouts = 0;
     fp->consecutiveOutliers = 0;
+    fp->consecutiveBlockingFallbacks = 0;
     if (fp->cadenceLockState == CadenceLockState::Locked) {
         fp->cadenceLockState = CadenceLockState::Unlocked;
         fp->compositionOffsetMs = fp->shadowEmaOffset;
