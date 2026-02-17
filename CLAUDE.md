@@ -137,7 +137,7 @@ Key APIs:
 - `GRAYSCALE_RANGE = 25`: ±25% deviation range for grayscale sliders
 
 ### Thread Safety
-- Atomics: `g_desktopGammaMode`, `g_tetrahedralInterp`, `g_forceReinit`, `g_userDesktopGammaMode`, `g_hasPendingColorCorrections`, `g_logPeakDetection`, `g_consoleEnabled`, `g_hotkeyGammaEnabled`, `g_hotkeyHdrEnabled`, `g_hotkeyAnalysisEnabled`, `g_startMinimized`, `g_mainHwnd`, `g_forceTopmostReassert`
+- Atomics: `g_desktopGammaMode`, `g_tetrahedralInterp`, `g_forceReinit`, `g_userDesktopGammaMode`, `g_hasPendingColorCorrections`, `g_logPeakDetection`, `g_consoleEnabled`, `g_hotkeyGammaEnabled`, `g_hotkeyHdrEnabled`, `g_hotkeyAnalysisEnabled`, `g_startMinimized`, `g_mainHwnd`, `g_forceTopmostReassert`, `g_selfReassertInProgress`, `g_frameBufferEnabled`
 - `g_gammaWhitelistMutex`: protects whitelist vector and match strings
 - `g_monitorSettingsMutex`: protects per-monitor MHC settings (profile names, enabled flags) — whitelist thread snapshots under lock
 - `g_colorCorrectionMutex`: protects pending update queue (atomic fast-path skips lock when empty)
@@ -178,6 +178,21 @@ Three-tier predictive frame pacer with automatic strategy selection at init:
 **Multi-monitor**: Single FramePacer shared across all monitors (correct — DWM has one compositor cadence). All monitors feed successful acquisitions (all measure the same compositor offset). Only primary monitor feeds timeouts (secondary monitor timeouts just mean "no new content on that output", not a compositor timing issue).
 
 **Frame acquisition**: `AcquireNextFrame(0)` tried first (instant capture), then `AcquireNextFrame(frameTimeMs)` after sync. `DXGI_PRESENT_ALLOW_TEARING` for immediate present. `SetMaximumFrameLatency(1)` limits queue. Timeouts tracked via `FramePacerNotifyTimeout` for diagnostics.
+
+**State reset**: `ResetFramePacerState()` centralizes EMA/cadence lock/counter reset — called on sleep/wake, rate change, forced reinit, auto-sleep wake. Prevents stale offset data from causing timing errors after disruptions.
+
+### Auto Frame Buffer (render.cpp)
+Idle-triggered one-frame buffer that decouples capture timing from present timing for smoother video playback. Renders to an intermediate texture, then presents the previous cycle's result immediately after compositor sync. Cost: +1 frame latency (~21ms at 48Hz). Benefit: Present always at fixed offset from VBlank regardless of variable DD delivery.
+
+**Pipeline**: VBlank wake → CopyResource(swapchain ← buffer) + Present (~0.1ms) → AcquireNextFrame → Shader render to buffer texture
+
+**Idle detection**: `GetLastInputInfo()` in `RenderAll()` checks keyboard/mouse idle time. Buffer engages after `g_frameBufferIdleMs` (default 3s). Disengages instantly on input — transition resets `bufferReady` on all monitors before any `RenderMonitor` call, so no stale frame is ever presented. First mouse move after idle has zero extra latency.
+
+**INI settings**: `FrameBuffer=true` (enable/disable), `FrameBufferIdleMs=3000` (idle timeout, 0 = always active)
+
+**BJit analysis stat**: EMA (alpha=0.125) of absolute deviation of buffer present intervals from expected refresh period. Only shown when buffer is active. Healthy range: 0.04-0.10ms.
+
+**preAcquireQpc placement**: Taken BEFORE buffer present block, not after. Buffer `Present()` can block under GPU backpressure (`MaxFrameLatency=1`), which would contaminate the composition offset measurement and prevent cadence lock from engaging.
 
 ### Color Correction Live Updates
 GUI changes queue `PendingColorCorrection` → render thread applies each frame → constant buffer updated
@@ -239,7 +254,7 @@ scRGB → Desktop Gamma → BT.709→Rec.2020 → Primaries (with Bradford)
 
 ## Data Structures (types.h)
 
-**MonitorContext**: Per-monitor state (window, swapchain, duplication, LUTs, color correction, analysis resources, constant buffer dirty tracking)
+**MonitorContext**: Per-monitor state (window, swapchain, duplication, LUTs, color correction, analysis resources, constant buffer dirty tracking, frame buffer texture/RTV/jitter EMA)
 
 **ColorCorrectionData**: Runtime format (fixed-size grayscale array, calculated matrix)
 
@@ -264,10 +279,10 @@ scRGB → Desktop Gamma → BT.709→Rec.2020 → Primaries (with Bradford)
 `StartProcessing()` → build configs → spawn `ProcessingThreadFunc()` → init D3D → init duplication per monitor → register hotkeys → create OSD → start whitelist thread → render loop
 
 ### Render Loop
-`RenderAll(FramePacer*)` → `FramePacerWaitForNextFrame()` → device health check (every 60 frames) → watchdog check → forced reinit check → TOPMOST reassert (event-driven via WM_WINDOWPOSCHANGING + 10s fallback) → apply pending color corrections → `RenderMonitor()` per monitor
+`RenderAll(FramePacer*)` → `FramePacerWaitForNextFrame()` → device health check (every 60 frames) → watchdog check → forced reinit check → TOPMOST reassert (event-driven via WM_WINDOWPOSCHANGING + self-reassert guard + 10s fallback) → auto frame buffer idle detection → apply pending color corrections → `RenderMonitor(ctx, fp, bufferActive)` per monitor
 
 ### RenderMonitor
-Acquire frame → `FramePacerRecordAcquisition()` → create capture SRV → update constant buffer (dirty-tracked, skips Map/Unmap when unchanged) → run peak detection compute (if dynamic tonemap) → set pipeline state → draw fullscreen triangle → analysis compute (primary only) → present → two-phase visibility handling
+Buffer present (if active: CopyResource + Present of previous buffer) → preAcquireQpc → acquire frame → `FramePacerRecordAcquisition()` → create capture SRV → update constant buffer (dirty-tracked) → peak detection compute (if dynamic tonemap) → set pipeline state → draw fullscreen triangle (to buffer texture if buffered, swapchain if not) → analysis compute (primary only) → present (skipped if buffered, already done at top) → two-phase visibility handling
 
 ## GUI Implementation Notes (gui.cpp)
 
