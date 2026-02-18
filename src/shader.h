@@ -595,53 +595,33 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         rec2020 = ApplyPrimariesMatrix(rec2020);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 4: Convert to ICTCP (perceptually uniform space)
+        // STAGE 4-6: ICtCp processing (only when grayscale or tonemap active)
+        // Skips 4 matrix multiplies + 6 pow() per pixel when neither is needed
         // ═══════════════════════════════════════════════════════════════════════
 
-        // Rec.2020 -> LMS (Hunt-Pointer-Estevez with crosstalk)
-        // Note: Wide-gamut Rec.2020 can produce negative LMS for out-of-gamut colors.
-        // These are clipped to near-zero during PQ encoding (intentional - no valid PQ for negative light).
-        float3 lms = mul(Rec2020_to_LMS, rec2020);
+        // Both paths converge to rec2020_out in 80/10000 normalized units
+        float3 rec2020_out;
+        if (grayscaleEnabled > 0.5 || tonemapEnabled > 0.5) {
+            // ICtCp path: grayscale and/or tonemap need perceptual space
+            float3 lms = mul(Rec2020_to_LMS, rec2020);
+            float3 lmsPQ = Linear_to_PQ(lms * (80.0f / 10000.0f));
+            float3 ictcp = mul(LMSprime_to_ICtCp, lmsPQ);
 
-        // LMS -> L'M'S' (PQ encode, normalized to 10000 nits)
-        // Input is scRGB-like where 1.0 = 80 nits
-        float3 lmsPQ = Linear_to_PQ(lms * (80.0f / 10000.0f));
+            ictcp = ApplyGrayscaleICtCp(ictcp);
+            ictcp = ApplyTonemappingICtCp(ictcp);
+            ictcp = ApplyDitherICtCp(ictcp, pos.xy);
 
-        // L'M'S' -> ICtCp
-        float3 ictcp = mul(LMSprime_to_ICtCp, lmsPQ);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 5: ICTCP processing (perceptually uniform operations)
-        // All operations on I channel preserve hue/saturation (CT/CP unchanged)
-        // ═══════════════════════════════════════════════════════════════════════
-
-        // Grayscale correction on I channel (display calibration - constant)
-        // Applied first: calibrate display response before content-dependent processing
-        ictcp = ApplyGrayscaleICtCp(ictcp);
-
-        // Tonemapping on I channel (content preference - dynamic)
-        // Applied after grayscale: compress dynamic range on calibrated display
-        ictcp = ApplyTonemappingICtCp(ictcp);
-
-        // Dithering in ICtCp space (perceptually uniform noise distribution)
-        ictcp = ApplyDitherICtCp(ictcp, pos.xy);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 6: Convert back to Linear Rec.2020
-        // ═══════════════════════════════════════════════════════════════════════
-
-        // ICtCp -> L'M'S'
-        float3 lmsPQ2 = mul(ICtCp_to_LMSprime, ictcp);
-
-        // L'M'S' -> LMS (PQ decode)
-        float3 lms2 = PQ_to_Linear(lmsPQ2);
-
-        // LMS -> Rec.2020 linear
-        float3 rec2020_linear = mul(LMS_to_Rec2020, lms2);
+            float3 lmsPQ2 = mul(ICtCp_to_LMSprime, ictcp);
+            float3 lms2 = PQ_to_Linear(lmsPQ2);
+            rec2020_out = mul(LMS_to_Rec2020, lms2);
+        } else {
+            // Direct path: skip ICtCp entirely
+            rec2020_out = rec2020 * (80.0f / 10000.0f);
+        }
 
         // White balance: shift display white point (after grayscale which assumes D65)
         if (useManualCorrection > 0.5) {
-            rec2020_linear *= float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+            rec2020_out *= float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -650,10 +630,10 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
         float3 linearRec2020;
         if (usePassthrough > 0.5) {
-            // No LUT — skip PQ round-trip (saves 6 pow() per pixel)
-            linearRec2020 = rec2020_linear * (10000.0f / 80.0f);
+            // No LUT — skip PQ round-trip
+            linearRec2020 = rec2020_out * (10000.0f / 80.0f);
         } else {
-            float3 pqRGB = Linear_to_PQ(rec2020_linear);
+            float3 pqRGB = Linear_to_PQ(rec2020_out);
             float3 lutResult = SampleLUT(pqRGB);
             linearRec2020 = PQ_to_Linear(lutResult) * (10000.0f / 80.0f);
         }
