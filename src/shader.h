@@ -65,8 +65,7 @@ SamplerState wrapSampler : register(s2);
 float3 ApplyPrimariesMatrix(float3 rgb) {
     if (useManualCorrection < 0.5) return rgb;
     float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-    float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
-    return mul(mat, rgb) * wbGains;
+    return mul(mat, rgb);
 }
 )"
 // Part 2: SDR transfer functions and grayscale correction
@@ -628,7 +627,7 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         ictcp = ApplyDitherICtCp(ictcp, pos.xy);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 6: Convert to PQ Rec.2020 RGB for LUT
+        // STAGE 6: Convert back to Linear Rec.2020
         // ═══════════════════════════════════════════════════════════════════════
 
         // ICtCp -> L'M'S'
@@ -640,26 +639,24 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // LMS -> Rec.2020 linear
         float3 rec2020_linear = mul(LMS_to_Rec2020, lms2);
 
-        // Rec.2020 linear -> PQ Rec.2020 (for LUT)
-        float3 pqRGB = Linear_to_PQ(rec2020_linear);
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 7: LUT application (PQ Rec.2020)
-        // ═══════════════════════════════════════════════════════════════════════
-
-        float3 lutResult;
-        if (usePassthrough > 0.5) {
-            lutResult = pqRGB;
-        } else {
-            lutResult = SampleLUT(pqRGB);
+        // White balance: shift display white point (after grayscale which assumes D65)
+        if (useManualCorrection > 0.5) {
+            rec2020_linear *= float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 8: Output conversion (PQ -> Linear -> scRGB)
+        // STAGE 7: LUT application or passthrough -> Output
         // ═══════════════════════════════════════════════════════════════════════
 
-        // PQ -> Linear Rec.2020
-        float3 linearRec2020 = PQ_to_Linear(lutResult) * (10000.0f / 80.0f);
+        float3 linearRec2020;
+        if (usePassthrough > 0.5) {
+            // No LUT — skip PQ round-trip (saves 6 pow() per pixel)
+            linearRec2020 = rec2020_linear * (10000.0f / 80.0f);
+        } else {
+            float3 pqRGB = Linear_to_PQ(rec2020_linear);
+            float3 lutResult = SampleLUT(pqRGB);
+            linearRec2020 = PQ_to_Linear(lutResult) * (10000.0f / 80.0f);
+        }
 
         // Rec.2020 -> BT.709 (scRGB output)
         float3 result = float3(
@@ -699,11 +696,10 @@ R"(
         // STAGE 1-2: Input handling + primaries (mode-dependent)
         // ═══════════════════════════════════════════════════════════════════════
         if (isFP16SDR > 0.5) {
-            // ACM: input is linear scRGB - primaries + white balance in native linear
+            // ACM: input is linear scRGB - primaries correction in native linear
             if (useManualCorrection > 0.5) {
                 float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-                float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
-                input = max(mul(mat, input) * wbGains, 0.0);
+                input = max(mul(mat, input), 0.0);
             }
             // Encode to sRGB for shared gamma-space operations
             // Using proper sRGB OETF (not gamma 2.2) so control points match
@@ -714,8 +710,7 @@ R"(
             if (useManualCorrection > 0.5) {
                 float3 lin = sRGB_EOTF3(max(input, 0.0));
                 float3x3 mat = float3x3(primariesRow0.xyz, primariesRow1.xyz, primariesRow2.xyz);
-                float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
-                lin = max(mul(mat, lin) * wbGains, 0.0);
+                lin = max(mul(mat, lin), 0.0);
                 input = saturate(sRGB_OETF3(lin));
             }
         }
@@ -725,6 +720,14 @@ R"(
         // ═══════════════════════════════════════════════════════════════════════
         input = ApplyGrayscaleCorrection(input);
         input = Apply24Gamma(input);
+
+        // White balance: applied after grayscale (which assumes D65)
+        // pow(linearGain, 1/2.2) converts linear gain to gamma space
+        // (exact for power-law gamma, negligible error at sRGB toe)
+        if (useManualCorrection > 0.5) {
+            float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+            input *= pow(max(wbGains, 0.001), 1.0 / 2.2);
+        }
 
         float3 corrected;
         if (usePassthrough > 0.5) corrected = input;

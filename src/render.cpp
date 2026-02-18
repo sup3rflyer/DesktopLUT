@@ -838,15 +838,15 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         cbData[12] = cc.primariesMatrix[0];
         cbData[13] = cc.primariesMatrix[1];
         cbData[14] = cc.primariesMatrix[2];
-        cbData[15] = cc.whiteBalanceGains[0];  // R gain
+        cbData[15] = cc.primariesEnabled ? cc.whiteBalanceGains[0] : 1.0f;  // R gain (identity when white point disabled)
         cbData[16] = cc.primariesMatrix[3];
         cbData[17] = cc.primariesMatrix[4];
         cbData[18] = cc.primariesMatrix[5];
-        cbData[19] = cc.whiteBalanceGains[1];  // G gain
+        cbData[19] = cc.primariesEnabled ? cc.whiteBalanceGains[1] : 1.0f;  // G gain
         cbData[20] = cc.primariesMatrix[6];
         cbData[21] = cc.primariesMatrix[7];
         cbData[22] = cc.primariesMatrix[8];
-        cbData[23] = cc.whiteBalanceGains[2];  // B gain
+        cbData[23] = cc.primariesEnabled ? cc.whiteBalanceGains[2] : 1.0f;  // B gain
         // Row 6: Tonemapping parameters
         // Slot [24]: PQ-encoded source peak (avoids per-pixel pow() in pixel shader)
         if (cc.tonemap.dynamicPeak) {
