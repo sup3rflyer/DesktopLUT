@@ -707,8 +707,13 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Reset consecutive failures on successful frame acquisition
     ctx->consecutiveFailures = 0;
 
-    // Update frame pacer composition offset EMA (use pre-acquire QPC for cleaner measurement)
-    if (fp) FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed);
+    // Update frame pacer composition offset EMA.
+    // Pass LastPresentTime as the preferred measurement point — it is the exact QPC when DWM
+    // finished compositing, eliminating the variable latency between DD availability and our
+    // AcquireNextFrame call. Falls back to preAcquireQpc when LastPresentTime is zero
+    // (cursor-only updates with no desktop pixel change).
+    if (fp) FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed,
+                                         frameInfo.LastPresentTime.QuadPart);
 
     // Got a new frame - get the texture
     ID3D11Texture2D* frameTexture = nullptr;
@@ -975,7 +980,12 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
                         stagingDesc.SampleDesc.Count = 1;
                         stagingDesc.Usage = D3D11_USAGE_STAGING;
                         stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                        g_device->CreateTexture2D(&stagingDesc, nullptr, tex);
+                        HRESULT hr = g_device->CreateTexture2D(&stagingDesc, nullptr, tex);
+                        if (FAILED(hr)) {
+                            std::cerr << "Monitor " << ctx->index
+                                      << " peak staging texture failed: 0x"
+                                      << std::hex << hr << std::dec << std::endl;
+                        }
                     };
                     createStaging(&ctx->peakStagingTexture);
                     createStaging(&ctx->peakStagingTexture2);
@@ -1182,7 +1192,11 @@ void RenderAll(FramePacer* fp) {
         } else {
             Sleep(50);
         }
-        return;
+        // Fall through if reinit or pending corrections need processing — both are
+        // handled after this block and can change whether the overlay is needed.
+        if (!g_forceReinit.load() && !g_hasPendingColorCorrections.load()) {
+            return;
+        }
     }
 
     // Check for forced reinit (e.g., resume from sleep)
@@ -1552,6 +1566,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
             std::cout << "System power resume detected, forcing reinit..." << std::endl;
             g_forceReinit.store(true);
+            // Wake the render thread in case it is auto-sleeping — g_forceReinit is
+            // checked AFTER the auto-sleep wait, so without this signal the thread
+            // would miss the reinit until the 500ms timeout expires AND fall through.
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         }
         // Handle display power state changes (sleep/wake of monitor only)
         else if (wParam == PBT_POWERSETTINGCHANGE) {
@@ -1571,6 +1589,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     std::cout << "Display waking from sleep, forcing reinit..." << std::endl;
                     g_displayOff.store(false);
                     g_forceReinit.store(true);
+                    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 } else if (displayState == 0) {
                     std::cout << "Display entering sleep mode" << std::endl;
                     g_displayOff.store(true);

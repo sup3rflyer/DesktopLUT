@@ -514,13 +514,22 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
 // FramePacerRecordAcquisition — called after successful AcquireNextFrame
 // ============================================================================
 
-void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool wasBlockingFallback) {
+void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool wasBlockingFallback, int64_t lastPresentTime) {
     if (fp->strategy == FramePacerStrategy::DwmFlushOnly) return;
     if (fp->qpcRefreshPeriod <= 0) return;
 
-    // Use pre-acquire QPC if provided (removes variable processing overhead from measurement)
+    // Measurement point selection (best → fallback):
+    //   1. lastPresentTime  — exact QPC from DXGI_OUTDUPL_FRAME_INFO.LastPresentTime; set by DWM
+    //                         when it finishes compositing.  Removes thread-scheduling latency
+    //                         between DD-ready and our AcquireNextFrame call entirely.
+    //                         Zero on cursor-only frames — must fall back.
+    //   2. preAcquireQpc    — QPC taken just before AcquireNextFrame(0); still better than
+    //                         measuring after because it excludes DD driver overhead.
+    //   3. current QPC      — last resort when neither is provided.
     int64_t measureQpc;
-    if (preAcquireQpc > 0) {
+    if (lastPresentTime > 0) {
+        measureQpc = lastPresentTime;
+    } else if (preAcquireQpc > 0) {
         measureQpc = preAcquireQpc;
     } else {
         LARGE_INTEGER now;

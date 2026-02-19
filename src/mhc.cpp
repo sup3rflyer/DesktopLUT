@@ -458,7 +458,7 @@ void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize) {
         // Apply grayscale correction (sqrt-domain interpolation, matches shader)
         float Y_corrected = EvalGrayscaleSDR(Y_linear, gs);
 
-        // Apply 2.4 gamma if enabled
+        // 2.2->2.4 gamma transform (BT.1886): pow(L, 2.4/2.2) in linear, darker midtones
         if (gs.use24Gamma) {
             Y_corrected = powf((std::max)(Y_corrected, 0.0f), 2.4f / 2.2f);
         }

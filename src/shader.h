@@ -85,14 +85,15 @@ float3 sRGB_EOTF3(float3 rgb) {
     return float3(sRGB_EOTF(rgb.r), sRGB_EOTF(rgb.g), sRGB_EOTF(rgb.b));
 }
 
-// SDR 2.2->2.4 gamma transform (independent of grayscale correction)
-// For BT.1886 displays that use 2.4 gamma instead of 2.2
+// Gamma 2.2 -> 2.4 transform (BT.1886)
+// Treats the encoded signal as gamma 2.2 (power law) and re-encodes for a 2.4 target.
+// In the encoded domain: pow(Y, 2.4/2.2) = pow(Y, 12/11), darkening midtones.
+// For apps/content that assume a 2.2-gamma display but you want a 2.4 rendering.
 float3 Apply24Gamma(float3 rgb) {
     if (grayscale24 < 0.5f) return rgb;
     float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
     if (Y < 1e-6f) return rgb;
-    // Apply 2.2->2.4 gamma transform: pow(x, 2.4/2.2)
-    float correctedY = pow(max(Y, 0.0f), 1.090909f);  // 2.4/2.2 = 12/11
+    float correctedY = pow(max(Y, 0.0f), 1.090909f);  // pow(L, 2.4/2.2) = 12/11
     return rgb * (correctedY / Y);
 }
 

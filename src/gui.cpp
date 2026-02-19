@@ -754,9 +754,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | BS_OWNERDRAW, innerX + 110, innerY + 45, 60, h, panel2, (HMENU)ID_CORR_GRAYSCALE_RESET, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndGrayscaleReset);
 
-        g_gui.hwndGrayscale24 = CreateWindow(L"BUTTON", L"2.4 Gamma (BT.1886)",
+        g_gui.hwndGrayscale24 = CreateWindow(L"BUTTON", L"2.2\u21922.4 Gamma",
             WS_CHILD | BS_AUTOCHECKBOX,
-            innerX + 180, innerY + 47, 150, h, panel2, (HMENU)ID_CORR_GRAYSCALE_24, nullptr, nullptr);
+            innerX + 180, innerY + 47, 130, h, panel2, (HMENU)ID_CORR_GRAYSCALE_24, nullptr, nullptr);
         g_gui.tab2Controls.push_back(g_gui.hwndGrayscale24);
 
         // --- HDR Corrections section ---
@@ -1372,7 +1372,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        case ID_CORR_GRAYSCALE_24:  // SDR only: 2.4 gamma checkbox
+        case ID_CORR_GRAYSCALE_24:  // SDR only: 2.2->2.4 gamma checkbox
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale.use24Gamma =
                     (SendMessage(g_gui.hwndGrayscale24, BM_GETCHECK, 0, 0) == BST_CHECKED);

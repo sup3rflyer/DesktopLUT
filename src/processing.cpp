@@ -592,6 +592,10 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR) {
         g_pendingColorCorrections.end());
     g_pendingColorCorrections.push_back({ monitorIndex, isHDR, cc });
     g_hasPendingColorCorrections.store(true, std::memory_order_release);
+    // Wake the render thread in case it is auto-sleeping — without this, corrections
+    // queued while the overlay is dormant wait up to 500ms and then are still missed
+    // because the auto-sleep path used to return unconditionally before the queue check.
+    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
 }
 
 // Helper to get white point from edit boxes

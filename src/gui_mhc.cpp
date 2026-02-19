@@ -117,7 +117,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
             swprintf_s(buf, L"Custom (%dpt)", mhc.grayscale.pointCount);
             gammaBase = buf;
         } else if (mhc.grayscale.use24Gamma) {
-            gammaBase = L"2.4 (BT.1886)";
+            gammaBase = L"2.2\u21922.4";
         } else {
             gammaBase = L"2.2";
         }

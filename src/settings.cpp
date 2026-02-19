@@ -123,7 +123,7 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     if (isHDR) {
         WritePrivateProfileFloat(section, (p + L"GrayscalePeak").c_str(), cc.grayscale.peakNits, iniPath);
     } else {
-        // SDR only: 2.4 gamma option
+        // SDR only: 2.2->2.4 gamma option
         WritePrivateProfileBool(section, (p + L"Grayscale24").c_str(), cc.grayscale.use24Gamma, iniPath);
     }
     if (isHDR) {

@@ -618,7 +618,7 @@ struct MHCSettings {
 
     // Display metadata for installed profile (computed at Apply time, persisted)
     std::wstring metaPrimaries;  // "sRGB", "Rec.709", "Custom", "P3-D65", etc.
-    std::wstring metaGamma;      // SDR: "2.2", "2.4 (BT.1886)", "Custom (20pt) + TRC"
+    std::wstring metaGamma;      // SDR: "2.2", "2.2→2.4", "Custom (20pt) + TRC"
                                  // HDR: "PQ", "20pt-Custom + TRC"
     float metaPeakNits = 0.0f;   // HDR only, 0 = not set
 };

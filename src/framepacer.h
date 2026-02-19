@@ -16,12 +16,18 @@ void CleanupFramePacer(FramePacer* fp);
 bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent);
 
 // Record that AcquireNextFrame succeeded — updates composition offset EMA
-// preAcquireQpc: QPC taken immediately before AcquireNextFrame(0) for cleaner measurement
-//                (removes variable processing overhead from offset calculation)
-//                If 0, falls back to QueryPerformanceCounter at call time.
-// wasBlockingFallback: true if AcquireNextFrame(0) timed out but blocking fallback caught the frame.
-//                      Used for gentle upward EMA nudge (prevents positive feedback from QPC re-take).
-void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc = 0, bool wasBlockingFallback = false);
+// preAcquireQpc:   QPC taken immediately before AcquireNextFrame(0). Removes variable
+//                  thread-scheduling overhead from the offset measurement. Falls back to
+//                  QueryPerformanceCounter at call time if 0.
+// wasBlockingFallback: true if AcquireNextFrame(0) timed out but the blocking fallback
+//                  caught the frame. Triggers a gentle upward EMA nudge.
+// lastPresentTime: DXGI_OUTDUPL_FRAME_INFO.LastPresentTime.QuadPart — the QPC when DWM
+//                  finished compositing this frame. When non-zero, preferred over preAcquireQpc
+//                  because it is the exact DWM composition event timestamp, removing the
+//                  additional variable latency between DD-ready and our AcquireNextFrame call.
+//                  Zero on cursor-only frames; preAcquireQpc is used as fallback.
+void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc = 0,
+                                  bool wasBlockingFallback = false, int64_t lastPresentTime = 0);
 
 // Notify pacer that AcquireNextFrame(0) returned WAIT_TIMEOUT
 void FramePacerNotifyTimeout(FramePacer* fp);
