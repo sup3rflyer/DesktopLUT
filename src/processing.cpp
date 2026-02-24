@@ -489,12 +489,15 @@ void StartProcessing() {
     for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
         const auto& ms = g_gui.monitorSettings[i];
         bool hasLUT = !ms.sdrPath.empty();
-        bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled || ms.sdrColorCorrection.grayscale.enabled;
+        bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
+                                     ms.sdrColorCorrection.grayscale.enabled ||
+                                     ms.sdrColorCorrection.grayscale.use24Gamma;
         bool hasHdrColorCorrection = ms.hdrColorCorrection.primariesEnabled ||
                                      ms.hdrColorCorrection.grayscale.enabled ||
                                      ms.hdrColorCorrection.tonemap.enabled;
+        bool hasDesktopGamma = g_userDesktopGammaMode.load();
 
-        if (hasLUT || hasSdrColorCorrection || hasHdrColorCorrection) {
+        if (hasLUT || hasSdrColorCorrection || hasHdrColorCorrection || hasDesktopGamma) {
             MonitorLUTConfig config;
             config.monitorIndex = (int)i;
             config.sdrLutPath = ms.sdrPath;

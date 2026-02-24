@@ -22,6 +22,19 @@
 #pragma comment(lib, "comctl32.lib")
 
 // ============================================================================
+// SECTION: Display Power Notification (GUI-side)
+// ============================================================================
+
+// GUI-side display power notification — fires on the main thread regardless of
+// whether the processing thread is blocked in WaitForCompositorClock/DwmFlush.
+// The overlay WndProc handler is defense-in-depth (only fires when PeekMessage runs).
+static HPOWERNOTIFY g_guiDisplayPowerNotify = nullptr;
+
+// GUID_CONSOLE_DISPLAY_STATE: {6FE69556-704A-47A0-8F24-C28D936FDA47}
+static const GUID GUID_CONSOLE_DISPLAY_STATE_GUI =
+    { 0x6fe69556, 0x704a, 0x47a0, { 0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47 } };
+
+// ============================================================================
 // SECTION: Utilities
 // ============================================================================
 
@@ -1160,6 +1173,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Note: Auto-start is handled in RunGUI() after window creation
         // This allows proper control of button states and startup flags
 
+        // Register for display power state notifications on the GUI window.
+        // The GUI thread's message pump is never blocked by CompClock/DwmFlush,
+        // so this fires immediately when the display goes off/on.
+        g_guiDisplayPowerNotify = RegisterPowerSettingNotification(
+            hwnd, &GUID_CONSOLE_DISPLAY_STATE_GUI, DEVICE_NOTIFY_WINDOW_HANDLE);
+
         return 0;
     }
 
@@ -1895,6 +1914,30 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_forceReinit.store(true);
             }
         }
+        // Handle display power state changes — GUI-side handler fires immediately on the
+        // main thread even when the processing thread is blocked in CompClock/DwmFlush.
+        // This prevents the watchdog from firing during display sleep.
+        else if (wParam == PBT_POWERSETTINGCHANGE) {
+            POWERBROADCAST_SETTING* pbs = reinterpret_cast<POWERBROADCAST_SETTING*>(lParam);
+            if (pbs && pbs->PowerSetting == GUID_CONSOLE_DISPLAY_STATE_GUI) {
+                DWORD displayState = *reinterpret_cast<DWORD*>(pbs->Data);
+                if (displayState == 0) {
+                    // Display off — set flag and unblock processing thread
+                    std::cout << "[GUI] Display entering sleep mode" << std::endl;
+                    g_displayOff.store(true);
+                    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+                    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+                } else if (displayState == 1) {
+                    // Display on — trigger reinit
+                    std::cout << "[GUI] Display waking from sleep" << std::endl;
+                    g_displayOff.store(false);
+                    if (g_gui.isRunning) {
+                        g_forceReinit.store(true);
+                    }
+                    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+                }
+            }
+        }
         return TRUE;
 
     case WM_CLOSE:
@@ -1904,6 +1947,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         StopProcessing();
         RemoveTrayIcon();
+        // Unregister GUI-side display power notification
+        if (g_guiDisplayPowerNotify) {
+            UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);
+            g_guiDisplayPowerNotify = nullptr;
+        }
         // Clean up custom brushes and fonts
         if (g_tabBgBrush) { DeleteObject(g_tabBgBrush); g_tabBgBrush = nullptr; }
         if (g_inactiveTabBrush) { DeleteObject(g_inactiveTabBrush); g_inactiveTabBrush = nullptr; }

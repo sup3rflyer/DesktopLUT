@@ -385,6 +385,14 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
             return false;
         }
 
+        // Display off: GUI thread may have set g_displayOff while we were blocked.
+        // Skip rendering — the forced reinit on wake handles recovery.
+        if (g_displayOff.load(std::memory_order_relaxed)) {
+            Sleep(100);
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return false;
+        }
+
         // 2. Record VBlank reference time
         QueryPerformanceCounter(&now);
 
@@ -434,6 +442,13 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
     case FramePacerStrategy::DwmFlushPredictive: {
         // 1. DwmFlush — coarse sync (wakes 1-2ms after composition)
         if (FAILED(DwmFlush())) { Sleep(1); }
+
+        // Display off: GUI thread may have set g_displayOff while DwmFlush was blocking.
+        if (g_displayOff.load(std::memory_order_relaxed)) {
+            Sleep(100);
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return false;
+        }
 
         // 2. Record post-flush QPC
         QueryPerformanceCounter(&now);
@@ -492,6 +507,13 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
             }
         } else {
             if (FAILED(DwmFlush())) { Sleep(1); }
+        }
+
+        // Display off: skip rendering (GUI thread sets g_displayOff immediately)
+        if (g_displayOff.load(std::memory_order_relaxed)) {
+            Sleep(100);
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return false;
         }
 
         QueryPerformanceCounter(&now);

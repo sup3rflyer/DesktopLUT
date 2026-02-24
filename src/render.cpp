@@ -1166,20 +1166,26 @@ void RenderAll(FramePacer* fp) {
     // The watchdog below catches any case where rendering is silently stuck.
 
     // Watchdog: if no successful frame for N seconds, exit gracefully
-    // This catches cases where device appears healthy but rendering is stuck
-    auto timeSinceLastFrame = std::chrono::steady_clock::now() - g_lastSuccessfulFrame;
-    if (timeSinceLastFrame > std::chrono::seconds(WATCHDOG_TIMEOUT_SECONDS)) {
-        std::cerr << "Watchdog timeout: no successful frame for " << WATCHDOG_TIMEOUT_SECONDS << " seconds" << std::endl;
-        MessageBeep(MB_ICONERROR);
-        // Hide all overlay windows
-        for (auto& ctx : g_monitors) {
-            if (ctx.hwnd) {
-                ShowWindow(ctx.hwnd, SW_HIDE);
+    // This catches cases where device appears healthy but rendering is stuck.
+    // Skip watchdog during display sleep — the display-off flag is set by the GUI
+    // thread (always responsive) so this is reliable even when CompClock blocks.
+    if (g_displayOff.load(std::memory_order_relaxed)) {
+        g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+    } else {
+        auto timeSinceLastFrame = std::chrono::steady_clock::now() - g_lastSuccessfulFrame;
+        if (timeSinceLastFrame > std::chrono::seconds(WATCHDOG_TIMEOUT_SECONDS)) {
+            std::cerr << "Watchdog timeout: no successful frame for " << WATCHDOG_TIMEOUT_SECONDS << " seconds" << std::endl;
+            MessageBeep(MB_ICONERROR);
+            // Hide all overlay windows
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd) {
+                    ShowWindow(ctx.hwnd, SW_HIDE);
+                }
+                ctx.enabled = false;
             }
-            ctx.enabled = false;
+            g_running = false;
+            return;
         }
-        g_running = false;
-        return;
     }
 
     // When auto-sleeping, skip rendering entirely — wait for wake event.
@@ -1221,6 +1227,7 @@ void RenderAll(FramePacer* fp) {
                 ctx.duplication->Release();
                 ctx.duplication = nullptr;
             }
+            ctx.enabled = true;           // Re-enable monitors disabled by MAX_RECOVERY_RETRIES
             ctx.consecutiveFailures = 0;  // Reset backoff
             ctx.recoveryBackoffMs = 0;    // Reset non-blocking backoff
             ctx.cbDirty = true;           // Force constant buffer refresh
@@ -1401,7 +1408,8 @@ void RenderAll(FramePacer* fp) {
             bool overlayNeeded = !ctx.usePassthrough              // Has LUT
                 || shaderPrimaries || shaderGrayscale || shaderWhiteBalance  // Has corrections
                 || (ctx.isHDREnabled && cc.tonemap.enabled)       // Has tonemap
-                || g_desktopGammaMode.load();                     // Has desktop gamma
+                || g_desktopGammaMode.load()                      // Has desktop gamma
+                || cc.grayscale.use24Gamma;                       // Has 2.4 gamma
             if (overlayNeeded) {
                 anyMonitorNeedsOverlay = true;
                 break;
