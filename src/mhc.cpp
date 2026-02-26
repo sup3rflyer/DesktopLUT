@@ -331,7 +331,7 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
         || !MatInv3(displayToXYZ, displayFromXYZ)) {
         std::cerr << "MHC2 matrix: degenerate primaries, using identity" << std::endl;
         memset(outMHC, 0, sizeof(float) * 12);
-        outMHC[0] = outMHC[4] = outMHC[8] = 1.0f;  // 3x4 identity
+        outMHC[0] = outMHC[5] = outMHC[10] = 1.0f;  // 3x4 identity (row-major)
         return;
     }
 

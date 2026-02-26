@@ -1928,13 +1928,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
                     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 } else if (displayState == 1) {
-                    // Display on — trigger reinit
+                    // Display on — trigger reinit or restart processing
                     std::cout << "[GUI] Display waking from sleep" << std::endl;
                     g_displayOff.store(false);
                     if (g_gui.isRunning) {
                         g_forceReinit.store(true);
+                        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+                    } else if (!g_gui.activeSettings.empty()) {
+                        // Processing thread exited during display-off (e.g., watchdog timeout).
+                        // Restart it automatically since the user had it running before.
+                        std::cout << "[GUI] Processing was interrupted during display-off, restarting..." << std::endl;
+                        StartProcessing();
                     }
-                    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 }
             }
         }

@@ -380,6 +380,13 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
                                                      handleCount ? handles : nullptr,
                                                      INFINITE);
         if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+            // OCCLUDED = display off (DPMS, power settings, sleep).
+            // Set g_displayOff as secondary detection in case GUID_CONSOLE_DISPLAY_STATE
+            // notification is delayed or absent (e.g., "Turn off screen after" power setting).
+            if (!g_displayOff.load(std::memory_order_relaxed)) {
+                std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
+                g_displayOff.store(true, std::memory_order_relaxed);
+            }
             Sleep(100);
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return false;
@@ -501,6 +508,10 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
                                                          handleCount ? handles : nullptr,
                                                          INFINITE);
             if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+                if (!g_displayOff.load(std::memory_order_relaxed)) {
+                    std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
+                    g_displayOff.store(true, std::memory_order_relaxed);
+                }
                 Sleep(100);
                 g_lastSuccessfulFrame = std::chrono::steady_clock::now();
                 return false;

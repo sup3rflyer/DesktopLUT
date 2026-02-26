@@ -559,8 +559,13 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         auto now = std::chrono::steady_clock::now();
         if (ctx->recoveryBackoffMs > 0) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->lastRecoveryAttempt);
-            if (elapsed.count() < ctx->recoveryBackoffMs)
+            if (elapsed.count() < ctx->recoveryBackoffMs) {
+                // Keep watchdog alive during recovery — thread is actively recovering,
+                // not stuck. Without this, display-off causes watchdog timeout when
+                // GUID_CONSOLE_DISPLAY_STATE notification is delayed or absent.
+                g_lastSuccessfulFrame = now;
                 return;  // Not time yet — skip, don't block
+            }
         }
 
         ctx->lastRecoveryAttempt = now;

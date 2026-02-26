@@ -194,16 +194,22 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         // Peak nits is display metadata, needed regardless of file type
         params.peakNits = mhc.grayscale.peakNits;
     } else if (mhc.grayscale.enabled) {
-        params.grayscaleEnabled = true;
-        params.grayscale.enabled = true;
-        params.grayscale.pointCount = mhc.grayscale.pointCount;
-        for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
-            params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
-                ? mhc.grayscale.points[i] : 0.0f;
+        // Safety: if points are empty (e.g., dialog set enabled=true without init), use identity
+        if (mhc.grayscale.points.empty()) {
+            params.grayscaleEnabled = false;
+            params.grayscale.enabled = false;
+        } else {
+            params.grayscaleEnabled = true;
+            params.grayscale.enabled = true;
+            params.grayscale.pointCount = mhc.grayscale.pointCount;
+            for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
+                params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
+                    ? mhc.grayscale.points[i] : 0.0f;
+            }
+            params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+            params.grayscale.peakNits = mhc.grayscale.peakNits;
+            params.peakNits = mhc.grayscale.peakNits;
         }
-        params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-        params.grayscale.peakNits = mhc.grayscale.peakNits;
-        params.peakNits = mhc.grayscale.peakNits;
     }
 
     std::vector<uint8_t> profileData;
@@ -311,16 +317,21 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         // Peak nits is display metadata, needed regardless of file type
         params.peakNits = mhc.grayscale.peakNits;
     } else if (mhc.grayscale.enabled) {
-        params.grayscaleEnabled = true;
-        params.grayscale.enabled = true;
-        params.grayscale.pointCount = mhc.grayscale.pointCount;
-        for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
-            params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
-                ? mhc.grayscale.points[i] : 0.0f;
+        if (mhc.grayscale.points.empty()) {
+            params.grayscaleEnabled = false;
+            params.grayscale.enabled = false;
+        } else {
+            params.grayscaleEnabled = true;
+            params.grayscale.enabled = true;
+            params.grayscale.pointCount = mhc.grayscale.pointCount;
+            for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
+                params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
+                    ? mhc.grayscale.points[i] : 0.0f;
+            }
+            params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+            params.grayscale.peakNits = mhc.grayscale.peakNits;
+            params.peakNits = mhc.grayscale.peakNits;
         }
-        params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-        params.grayscale.peakNits = mhc.grayscale.peakNits;
-        params.peakNits = mhc.grayscale.peakNits;
     }
 
     std::vector<uint8_t> profileData;
@@ -1316,6 +1327,11 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
     data.hwndGsPeak = nullptr;
     data.hwndScrollPanel = nullptr;
     settings.grayscale.enabled = true;
+    // Ensure points are initialized (empty for never-configured monitors → all-zeros LUT → black screen)
+    if (settings.grayscale.points.empty() || (int)settings.grayscale.points.size() != settings.grayscale.pointCount) {
+        if (isHDR) settings.grayscale.initLinearPQ();
+        else settings.grayscale.initLinear();
+    }
 
     // HDR: Peak nits on first row
     int gsRowY = cy + 18;
