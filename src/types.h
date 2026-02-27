@@ -286,6 +286,7 @@ struct FramePacer {
     // Timing
     int64_t lastFrameTargetQpc = 0;          // For jitter measurement
     int64_t lastFrameQpc = 0;                // QPC at last frame sync
+    int64_t vblankWakeQpc = 0;               // QPC at VBlank wake (set by SyncToVBlank, read by WaitForDDReady)
     float lastSpinWaitMs = 0.0f;             // Duration of last spin-wait
     float lastSleepMs = 0.0f;                // Duration of last coarse sleep
     float syncJitterMs = 0.0f;               // Rolling jitter metric
@@ -331,8 +332,15 @@ struct FramePacer {
     float safetyValveMs = 14.667f;           // Max wait = refreshPeriod - 2ms
     float outlierFloorMs = 8.0f;             // Outlier rejection floor = max(refreshPeriod * 0.5, 4.0)
     float offsetClampMaxMs = 12.0f;          // Upper EMA clamp = min(refreshPeriod * 0.7, 12.0)
-    float lockJitterMs = 0.17f;              // Rolling buffer spread to enter lock = max(0.5, period*0.05)
-    float lockDivergenceMs = 1.67f;          // Shadow EMA divergence to exit lock = max(0.4, period*0.03)
+    float lockJitterMs = 0.17f;              // Rolling buffer spread to enter lock
+    float lockDivergenceBufferMs = 1.67f;    // Shadow EMA divergence to exit lock (buffer mode, relaxed)
+    float lockDivergenceDirectMs = 0.83f;    // Shadow EMA divergence to exit lock (direct mode, tight)
+
+    // Runtime state set by render loop
+    bool bufferActive = false;               // Whether frame buffer is currently engaged (set by RenderAll)
+
+    // Diagnostics log (CSV output for tuning)
+    FILE* logFile = nullptr;                 // CSV log file (nullptr = disabled)
 
     // DComposition frame statistics (Win11+)
     bool hasDCompStats = false;              // Whether DComp stats APIs are available

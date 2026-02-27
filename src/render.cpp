@@ -1278,21 +1278,22 @@ void RenderAll(FramePacer* fp) {
         }
     }
 
-    // ── Frame sync: wait for next compositor cycle via frame pacer ──
-    // Strategy A (Win11+): CompositorClock + predictive offset + spin-wait
-    // Strategy B (Win10): DwmFlush + DwmTimingInfo + spin-wait
-    // Strategy C (fallback): CompositorClock or DwmFlush only (legacy behavior)
-    if (!FramePacerWaitForNextFrame(fp, g_overlayWakeEvent)) {
-        // Display off or occluded — skip this frame
-        return;
-    }
+    // Communicate buffer state to frame pacer (for lock threshold selection)
+    fp->bufferActive = frameBufferActive;
 
-    // ── Buffer present pre-pass: IMMEDIATELY after VBlank wake ──
-    // Present previously rendered buffer for all monitors before any housekeeping.
-    // This is the tightest possible wake-to-present path: only an if + loop + GPU submit.
-    // All variable-cost housekeeping (TOPMOST, ShowWindow, mutex, cout) happens AFTER,
-    // where timing no longer affects present jitter (BJit).
+    // ── Frame sync ──
+    // Buffer mode: split-phase — VBlank sync → buffer present → DD prediction wait.
+    // Buffer present at VBlank + ~0.05ms ensures DWM picks it up for this composition
+    // cycle instead of next (fixes 2:2 cadence breaks at 24fps@48Hz).
+    // Non-buffer mode: combined VBlank sync + prediction (original behavior).
     if (frameBufferActive) {
+        if (!FramePacerSyncToVBlank(fp, g_overlayWakeEvent)) {
+            return;
+        }
+
+        // ── Buffer present pre-pass: IMMEDIATELY after VBlank wake ──
+        // Present previously rendered buffer for all monitors before prediction wait.
+        // This is the tightest possible wake-to-present path: only an if + loop + GPU submit.
         for (auto& ctx : g_monitors) {
             if (!ctx.enabled || !ctx.bufferReady || !ctx.swapchain || !ctx.bufferTexture)
                 continue;
@@ -1328,6 +1329,13 @@ void RenderAll(FramePacer* fp) {
                     ctx.lastBufferPresentQpc = now;
                 }
             }
+        }
+
+        // Phase 2: prediction wait for DD readiness
+        FramePacerWaitForDDReady(fp);
+    } else {
+        if (!FramePacerWaitForNextFrame(fp, g_overlayWakeEvent)) {
+            return;
         }
     }
 

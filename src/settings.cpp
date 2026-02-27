@@ -442,6 +442,7 @@ void SaveSettings() {
     WritePrivateProfileBool(L"General", L"FramePacerEnabled", g_framePacerEnabled.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"FramePacerSpinWait", g_framePacerSpinWait.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"FrameBuffer", g_frameBufferEnabled.load(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"FramePacerLog", g_framePacerLogEnabled.load(), iniPath.c_str());
     {
         wchar_t buf[32];
         swprintf_s(buf, L"%d", g_frameBufferIdleMs);
@@ -502,6 +503,7 @@ void LoadSettings() {
     g_framePacerEnabled.store(GetPrivateProfileBool(L"General", L"FramePacerEnabled", true, iniPath.c_str()));
     g_framePacerSpinWait.store(GetPrivateProfileBool(L"General", L"FramePacerSpinWait", true, iniPath.c_str()));
     g_frameBufferEnabled.store(GetPrivateProfileBool(L"General", L"FrameBuffer", true, iniPath.c_str()));
+    g_framePacerLogEnabled.store(GetPrivateProfileBool(L"General", L"FramePacerLog", false, iniPath.c_str()));
     g_frameBufferIdleMs = (int)GetPrivateProfileIntW(L"General", L"FrameBufferIdleMs", 3000, iniPath.c_str());
 
     // Load gamma whitelist

@@ -15,6 +15,12 @@ void CleanupFramePacer(FramePacer* fp);
 // wakeEvent: auto-reset event for auto-sleep wake (passed through to CompClock/WaitForSingleObject)
 bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent);
 
+// Split-phase API for buffer mode: present between VBlank wake and DD prediction wait.
+// Phase 1: Block until VBlank/compositor sync. Returns false if display off (skip frame).
+bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent);
+// Phase 2: Prediction wait for DD readiness. Must call after SyncToVBlank.
+void FramePacerWaitForDDReady(FramePacer* fp);
+
 // Record that AcquireNextFrame succeeded — updates composition offset EMA
 // preAcquireQpc:   QPC taken immediately before AcquireNextFrame(0). Removes variable
 //                  thread-scheduling overhead from the offset measurement. Falls back to

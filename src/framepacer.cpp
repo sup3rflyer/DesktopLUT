@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "avrt.lib")
@@ -56,16 +57,17 @@ static void RecalcRefreshThresholds(FramePacer* fp) {
     fp->outlierFloorMs = (std::max)(fp->refreshPeriodMs * 0.5f, 4.0f);
     fp->offsetClampMaxMs = (std::min)(fp->refreshPeriodMs * 0.7f, 12.0f);
     // Cadence lock thresholds (scale with refresh period)
-    // Both lock and unlock use 16-sample rolling buffer spread (max-min).
-    // lockJitterMs: spread must be below this to enter lock
-    //   At 48Hz: max(0.5, 20.9*0.05) = 1.04ms; at 60Hz: 0.83ms; at 240Hz: 0.5ms
-    fp->lockJitterMs = (std::max)(0.5f, fp->refreshPeriodMs * 0.05f);
-    // lockDivergenceMs: shadow EMA drift from locked offset to trigger unlock.
-    // Shadow EMA (alpha=0.125) has noise std dev ≈ input_noise * 0.26 ≈ 0.05ms.
-    // Threshold at ~10σ gives zero false positives from noise, but catches genuine drift
-    // in ~10-15 frames (0.15-0.25s at 60Hz).
-    //   At 48Hz: max(0.4, 20.9*0.03) = 0.63ms; at 60Hz: 0.50ms; at 240Hz: 0.40ms
-    fp->lockDivergenceMs = (std::max)(0.4f, fp->refreshPeriodMs * 0.03f);
+    // lockJitterMs: 16-sample rolling buffer spread must be below this to enter lock
+    //   At 48Hz: max(0.7, 20.9*0.07) = 1.46ms; at 60Hz: 1.17ms; at 240Hz: 0.7ms
+    fp->lockJitterMs = (std::max)(0.7f, fp->refreshPeriodMs * 0.07f);
+    // lockDivergence: shadow EMA drift from locked offset to trigger unlock.
+    // Two thresholds: relaxed for buffer mode (offset only affects DD acquisition),
+    // tight for direct mode (offset affects present timing relative to DWM).
+    // Shadow uses half-alpha when locked, further reducing noise sensitivity.
+    //   Buffer  @ 48Hz: max(1.0, 20.9*0.06) = 1.25ms  (relaxed — DD timing only)
+    //   Direct  @ 48Hz: max(0.5, 20.9*0.035) = 0.73ms  (tight — DWM pickup critical)
+    fp->lockDivergenceBufferMs = (std::max)(1.0f, fp->refreshPeriodMs * 0.06f);
+    fp->lockDivergenceDirectMs = (std::max)(0.5f, fp->refreshPeriodMs * 0.035f);
     // Bias correction: EMA above rolling min by this threshold triggers nudge
     // At 48Hz: max(0.5, 20.9*0.06) = 1.25ms; at 60Hz: 1.0ms; at 120Hz: 0.5ms; at 240Hz: 0.5ms
     fp->biasThresholdMs = (std::max)(0.5f, fp->refreshPeriodMs * 0.06f);
@@ -175,6 +177,16 @@ void InitFramePacer(FramePacer* fp) {
         RecalcRefreshThresholds(fp);
     }
 
+    // Open CSV log file if enabled
+    if (g_framePacerLogEnabled.load()) {
+        fopen_s(&fp->logFile, "framepacer.csv", "w");
+        if (fp->logFile) {
+            fprintf(fp->logFile,
+                "frame,measured,ema,shadow,locked,state,divergence,threshold,spread,stable,alpha,var,buffer\n");
+            std::cout << "Frame pacer: CSV log enabled (framepacer.csv)" << std::endl;
+        }
+    }
+
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     fp->lastFrameQpc = now.QuadPart;
@@ -198,6 +210,12 @@ void CleanupFramePacer(FramePacer* fp) {
 
     if (fp->strategy != FramePacerStrategy::DwmFlushOnly) {
         timeEndPeriod(1);
+    }
+
+    if (fp->logFile) {
+        fclose(fp->logFile);
+        fp->logFile = nullptr;
+        std::cout << "Frame pacer: CSV log closed" << std::endl;
     }
 }
 
@@ -360,10 +378,10 @@ static void QueryDCompFrameStats(FramePacer* fp) {
 }
 
 // ============================================================================
-// FramePacerWaitForNextFrame
+// FramePacerSyncToVBlank — Phase 1: block until VBlank/compositor sync
 // ============================================================================
 
-bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
+bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
     LARGE_INTEGER now;
 
     // Clear DComp frame drop flag at the start of each cycle so all monitors
@@ -371,18 +389,14 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
     fp->dcompFrameDropThisCycle = false;
 
     switch (fp->strategy) {
-    // ── Strategy A: CompositorClock + Predict ──
+    // ── Strategy A: CompositorClock sync ──
     case FramePacerStrategy::CompositorClockPredictive: {
-        // 1. Wait for VBlank via CompositorClock
         HANDLE handles[] = { wakeEvent };
         DWORD handleCount = wakeEvent ? 1 : 0;
         DWORD result = g_pfnWaitForCompositorClock(handleCount,
                                                      handleCount ? handles : nullptr,
                                                      INFINITE);
         if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-            // OCCLUDED = display off (DPMS, power settings, sleep).
-            // Set g_displayOff as secondary detection in case GUID_CONSOLE_DISPLAY_STATE
-            // notification is delayed or absent (e.g., "Turn off screen after" power setting).
             if (!g_displayOff.load(std::memory_order_relaxed)) {
                 std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
                 g_displayOff.store(true, std::memory_order_relaxed);
@@ -392,115 +406,39 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
             return false;
         }
 
-        // Display off: GUI thread may have set g_displayOff while we were blocked.
-        // Skip rendering — the forced reinit on wake handles recovery.
         if (g_displayOff.load(std::memory_order_relaxed)) {
             Sleep(100);
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return false;
         }
 
-        // 2. Record VBlank reference time
         QueryPerformanceCounter(&now);
-
-        // 3. Refresh DWM timing info (keeps lastVBlankQpc fresh for RecordAcquisition)
         RefreshDwmTimingInfo(fp);
         QueryDCompFrameStats(fp);
-
-        // 4. Compute target: VBlank wake time + active offset
-        //    CompClock wakes at VBlank so now.QuadPart IS the VBlank reference —
-        //    no need for SnapVBlankForward (that would route through stale lastVBlankQpc
-        //    and an imprecise period, adding prediction noise at non-standard refresh rates)
-        //    Use locked offset when cadence is locked (perfectly constant wait target)
-        float activeOffset = (fp->cadenceLockState == CadenceLockState::Locked)
-            ? fp->lockedOffset : fp->compositionOffsetMs;
-        int64_t offsetTicks = MsToQpc(activeOffset, fp->qpcFrequency);
-        int64_t targetQpc = now.QuadPart + offsetTicks;
-
-        // Clamp: don't wait past (refreshPeriod - 2ms) to preserve time for next sync
-        int64_t maxWait = MsToQpc(fp->safetyValveMs, fp->qpcFrequency);
-        if (offsetTicks > maxWait) {
-            targetQpc = now.QuadPart + maxWait;
-        }
-
-        // 5. Hybrid wait to target
-        if (g_framePacerSpinWait.load()) {
-            HybridWaitUntil(fp, targetQpc);
-        }
-
-        // 6. Record timing and compute jitter (skip outliers from DWM drops)
-        LARGE_INTEGER afterWait;
-        QueryPerformanceCounter(&afterWait);
-        if (fp->lastFrameTargetQpc > 0) {
-            int64_t actualInterval = afterWait.QuadPart - fp->lastFrameQpc;
-            double actualMs = QpcToMs(actualInterval, fp->qpcFrequency);
-            double expectedMs = QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency);
-            float jitterMs = (float)fabs(actualMs - expectedMs);
-            // Skip DWM frame drops from jitter stats (> 2x expected = dropped frame)
-            if (actualMs < expectedMs * 1.8)
-                RecordJitter(fp, jitterMs);
-        }
-        fp->lastFrameTargetQpc = targetQpc;
-        fp->lastFrameQpc = afterWait.QuadPart;
+        fp->vblankWakeQpc = now.QuadPart;
         return true;
     }
 
-    // ── Strategy B: DwmFlush + Predict ──
+    // ── Strategy B: DwmFlush sync ──
     case FramePacerStrategy::DwmFlushPredictive: {
-        // 1. DwmFlush — coarse sync (wakes 1-2ms after composition)
         if (FAILED(DwmFlush())) { Sleep(1); }
 
-        // Display off: GUI thread may have set g_displayOff while DwmFlush was blocking.
         if (g_displayOff.load(std::memory_order_relaxed)) {
             Sleep(100);
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return false;
         }
 
-        // 2. Record post-flush QPC
         QueryPerformanceCounter(&now);
-
-        // 3. Refresh DWM timing (keeps lastVBlankQpc fresh for RecordAcquisition)
         RefreshDwmTimingInfo(fp);
         QueryDCompFrameStats(fp);
-
-        // 4. Predict DD-ready time
-        // Snap lastVBlankQpc forward to most recent, then add active offset
-        // Use locked offset when cadence is locked (perfectly constant wait target)
-        float activeOffset = (fp->cadenceLockState == CadenceLockState::Locked)
-            ? fp->lockedOffset : fp->compositionOffsetMs;
-        int64_t recentVBlank = SnapVBlankForward(fp->lastVBlankQpc, fp->qpcRefreshPeriod, now.QuadPart);
-        int64_t offsetTicks = MsToQpc(activeOffset, fp->qpcFrequency);
-        int64_t targetQpc = recentVBlank + offsetTicks;
-
-        // If DwmFlush already woke past the target, acquire immediately
-        if (now.QuadPart >= targetQpc) {
-            // Already past predicted DD-ready — good, less spin needed
-        } else if (g_framePacerSpinWait.load()) {
-            // Spin-wait the remaining time (typically < 2ms since DwmFlush wakes post-composition)
-            HybridWaitUntil(fp, targetQpc);
-        }
-
-        // 5. Record and compute jitter (skip outliers from DWM drops)
-        LARGE_INTEGER afterWait;
-        QueryPerformanceCounter(&afterWait);
-        if (fp->lastFrameTargetQpc > 0) {
-            int64_t actualInterval = afterWait.QuadPart - fp->lastFrameQpc;
-            double actualMs = QpcToMs(actualInterval, fp->qpcFrequency);
-            double expectedMs = QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency);
-            float jitterMs = (float)fabs(actualMs - expectedMs);
-            if (actualMs < expectedMs * 1.8)
-                RecordJitter(fp, jitterMs);
-        }
-        fp->lastFrameTargetQpc = targetQpc;
-        fp->lastFrameQpc = afterWait.QuadPart;
+        fp->vblankWakeQpc = now.QuadPart;
         return true;
     }
 
     // ── Strategy C: DwmFlush Only (legacy fallback) ──
     case FramePacerStrategy::DwmFlushOnly:
     default: {
-        // Use CompositorClock if available (same as old behavior), else DwmFlush
         if (g_pfnWaitForCompositorClock) {
             HANDLE handles[] = { wakeEvent };
             DWORD handleCount = wakeEvent ? 1 : 0;
@@ -520,7 +458,6 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
             if (FAILED(DwmFlush())) { Sleep(1); }
         }
 
-        // Display off: skip rendering (GUI thread sets g_displayOff immediately)
         if (g_displayOff.load(std::memory_order_relaxed)) {
             Sleep(100);
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -528,19 +465,105 @@ bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
         }
 
         QueryPerformanceCounter(&now);
+        fp->vblankWakeQpc = now.QuadPart;
+        return true;
+    }
+    }
+}
+
+// ============================================================================
+// FramePacerWaitForDDReady — Phase 2: prediction wait for DD readiness
+// ============================================================================
+
+void FramePacerWaitForDDReady(FramePacer* fp) {
+    switch (fp->strategy) {
+    // ── Strategy A: CompositorClock prediction ──
+    case FramePacerStrategy::CompositorClockPredictive: {
+        // CompClock wakes at VBlank so vblankWakeQpc IS the VBlank reference
+        float activeOffset = (fp->cadenceLockState == CadenceLockState::Locked)
+            ? fp->lockedOffset : fp->compositionOffsetMs;
+        int64_t offsetTicks = MsToQpc(activeOffset, fp->qpcFrequency);
+        int64_t targetQpc = fp->vblankWakeQpc + offsetTicks;
+
+        int64_t maxWait = MsToQpc(fp->safetyValveMs, fp->qpcFrequency);
+        if (offsetTicks > maxWait) {
+            targetQpc = fp->vblankWakeQpc + maxWait;
+        }
+
+        if (g_framePacerSpinWait.load()) {
+            HybridWaitUntil(fp, targetQpc);
+        }
+
+        LARGE_INTEGER afterWait;
+        QueryPerformanceCounter(&afterWait);
+        if (fp->lastFrameTargetQpc > 0) {
+            int64_t actualInterval = afterWait.QuadPart - fp->lastFrameQpc;
+            double actualMs = QpcToMs(actualInterval, fp->qpcFrequency);
+            double expectedMs = QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency);
+            float jitterMs = (float)fabs(actualMs - expectedMs);
+            if (actualMs < expectedMs * 1.8)
+                RecordJitter(fp, jitterMs);
+        }
+        fp->lastFrameTargetQpc = targetQpc;
+        fp->lastFrameQpc = afterWait.QuadPart;
+        return;
+    }
+
+    // ── Strategy B: DwmFlush prediction ──
+    case FramePacerStrategy::DwmFlushPredictive: {
+        // Snap lastVBlankQpc forward to most recent, then add active offset
+        float activeOffset = (fp->cadenceLockState == CadenceLockState::Locked)
+            ? fp->lockedOffset : fp->compositionOffsetMs;
+        int64_t recentVBlank = SnapVBlankForward(fp->lastVBlankQpc, fp->qpcRefreshPeriod, fp->vblankWakeQpc);
+        int64_t offsetTicks = MsToQpc(activeOffset, fp->qpcFrequency);
+        int64_t targetQpc = recentVBlank + offsetTicks;
+
+        if (fp->vblankWakeQpc >= targetQpc) {
+            // Already past predicted DD-ready — good, less spin needed
+        } else if (g_framePacerSpinWait.load()) {
+            HybridWaitUntil(fp, targetQpc);
+        }
+
+        LARGE_INTEGER afterWait;
+        QueryPerformanceCounter(&afterWait);
+        if (fp->lastFrameTargetQpc > 0) {
+            int64_t actualInterval = afterWait.QuadPart - fp->lastFrameQpc;
+            double actualMs = QpcToMs(actualInterval, fp->qpcFrequency);
+            double expectedMs = QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency);
+            float jitterMs = (float)fabs(actualMs - expectedMs);
+            if (actualMs < expectedMs * 1.8)
+                RecordJitter(fp, jitterMs);
+        }
+        fp->lastFrameTargetQpc = targetQpc;
+        fp->lastFrameQpc = afterWait.QuadPart;
+        return;
+    }
+
+    // ── Strategy C: No prediction (legacy) ──
+    case FramePacerStrategy::DwmFlushOnly:
+    default: {
         if (fp->lastFrameQpc > 0) {
-            int64_t interval = now.QuadPart - fp->lastFrameQpc;
+            int64_t interval = fp->vblankWakeQpc - fp->lastFrameQpc;
             double intervalMs = QpcToMs(interval, fp->qpcFrequency);
-            // Estimate refresh from DWM or fallback to 16.667ms
             double expectedMs = fp->qpcRefreshPeriod > 0
                 ? QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency) : 16.667;
             float jitterMs = (float)fabs(intervalMs - expectedMs);
             RecordJitter(fp, jitterMs);
         }
-        fp->lastFrameQpc = now.QuadPart;
-        return true;
+        fp->lastFrameQpc = fp->vblankWakeQpc;
+        return;
     }
     }
+}
+
+// ============================================================================
+// FramePacerWaitForNextFrame — combined Phase 1 + Phase 2 (non-buffer mode)
+// ============================================================================
+
+bool FramePacerWaitForNextFrame(FramePacer* fp, HANDLE wakeEvent) {
+    if (!FramePacerSyncToVBlank(fp, wakeEvent)) return false;
+    FramePacerWaitForDDReady(fp);
+    return true;
 }
 
 // ============================================================================
@@ -660,8 +683,11 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
     if (fp->compositionOffsetMs < 1.0f) fp->compositionOffsetMs = 1.0f;
     if (fp->compositionOffsetMs > fp->offsetClampMaxMs) fp->compositionOffsetMs = fp->offsetClampMaxMs;
 
-    // Also update shadow EMA (tracks independently while locked)
-    fp->shadowEmaOffset = fp->shadowEmaOffset * (1.0f - alpha) + (float)measuredOffsetMs * alpha;
+    // Also update shadow EMA (tracks independently while locked).
+    // Use half alpha when locked: shadow should be sluggish so transient offset
+    // wander doesn't trigger false unlocks. Only sustained baseline shifts accumulate.
+    float shadowAlpha = (fp->cadenceLockState == CadenceLockState::Locked) ? alpha * 0.5f : alpha;
+    fp->shadowEmaOffset = fp->shadowEmaOffset * (1.0f - shadowAlpha) + (float)measuredOffsetMs * shadowAlpha;
     if (fp->shadowEmaOffset < 1.0f) fp->shadowEmaOffset = 1.0f;
     if (fp->shadowEmaOffset > fp->offsetClampMaxMs) fp->shadowEmaOffset = fp->offsetClampMaxMs;
 
@@ -671,10 +697,27 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
     if (fp->rollingMinCount < 16) fp->rollingMinCount++;
 
     // ── Cadence lock state machine ──
+
+    // Compute rolling buffer spread for both lock qualification and logging
+    float spread = -1.0f;
+    if (fp->rollingMinCount >= 16) {
+        float bufMin = fp->rollingMinBuffer[0], bufMax = fp->rollingMinBuffer[0];
+        for (int i = 1; i < 16; i++) {
+            if (fp->rollingMinBuffer[i] < bufMin) bufMin = fp->rollingMinBuffer[i];
+            if (fp->rollingMinBuffer[i] > bufMax) bufMax = fp->rollingMinBuffer[i];
+        }
+        spread = bufMax - bufMin;
+    }
+
+    // Select divergence threshold based on buffer mode:
+    // Buffer active: offset only affects DD acquisition timing (relaxed)
+    // Buffer inactive: offset affects present timing relative to DWM (tight)
+    float activeDivergence = fp->bufferActive
+        ? fp->lockDivergenceBufferMs : fp->lockDivergenceDirectMs;
+
     if (fp->cadenceLockState == CadenceLockState::Unlocked) {
-        // Bias correction (replaces consecutiveEarly logic):
-        // Track rolling minimum of last 16 samples. If EMA exceeds min by >1ms for
-        // 8+ consecutive frames, nudge down by 0.1ms. Smoother than the old 10+0.3ms step.
+        // Bias correction: track rolling minimum of last 16 samples. If EMA exceeds
+        // min by >threshold for 8+ consecutive frames, nudge down by 0.1ms.
         if (fp->rollingMinCount >= 4) {
             float rollingMin = fp->rollingMinBuffer[0];
             for (int i = 1; i < fp->rollingMinCount; i++) {
@@ -692,16 +735,8 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
             }
         }
 
-        // Check for lock qualification using rolling buffer spread (max-min of last 16 samples).
-        // Per-sample checks are too fragile — a single noisy frame resets all progress.
-        // The spread of a 16-sample window absorbs occasional blips while still detecting instability.
-        if (fp->rollingMinCount >= 16) {
-            float bufMin = fp->rollingMinBuffer[0], bufMax = fp->rollingMinBuffer[0];
-            for (int i = 1; i < 16; i++) {
-                if (fp->rollingMinBuffer[i] < bufMin) bufMin = fp->rollingMinBuffer[i];
-                if (fp->rollingMinBuffer[i] > bufMax) bufMax = fp->rollingMinBuffer[i];
-            }
-            float spread = bufMax - bufMin;
+        // Check for lock qualification using rolling buffer spread
+        if (spread >= 0.0f) {
             if (spread < fp->lockJitterMs) {
                 fp->stableFrameCount++;
             } else {
@@ -710,40 +745,47 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
             }
         }
 
-        if (fp->stableFrameCount >= 32 && fp->offsetSampleCount >= 120) {
+        if (fp->stableFrameCount >= 20 && fp->offsetSampleCount >= 64) {
             fp->cadenceLockState = CadenceLockState::Locked;
             fp->lockedOffset = fp->compositionOffsetMs;
             fp->shadowEmaOffset = fp->compositionOffsetMs;
-                    std::cout << "Frame pacer: cadence LOCK at " << std::fixed << std::setprecision(2)
-                      << fp->lockedOffset << " ms" << std::endl;
+            std::cout << "Frame pacer: cadence LOCK at " << std::fixed << std::setprecision(2)
+                      << fp->lockedOffset << " ms (threshold: " << activeDivergence << " ms)" << std::endl;
         }
     } else {
-        // Locked: check for unlock conditions.
-        // Only two triggers: shadow EMA divergence (smooth, noise-resistant) and timeouts.
-        //
-        // NOT using rolling buffer spread here — a single noisy sample inflates the
-        // max-min spread for 16 consecutive frames (until it rotates out), causing
-        // false unlock cascades even when PJit/Jit look perfectly stable.
-        const char* unlockReason = nullptr;
-
-        // Shadow EMA divergence: background tracker has drifted from locked offset.
-        // The shadow EMA (alpha=0.125) naturally smooths noise — its std dev is ~0.05ms
-        // for input noise of ~0.2ms. A 0.5ms divergence threshold gives ~10σ margin,
-        // so transient blips can't trigger it. Only genuine baseline drift (rate change,
-        // GPU load shift, DWM behavior change) will accumulate enough to cross.
+        // Locked: check for unlock via shadow EMA divergence.
+        // Shadow uses half-alpha when locked, reducing noise sensitivity.
+        // Threshold adapts to buffer mode (relaxed when buffer active, tight when direct).
         float divergence = fabsf(fp->shadowEmaOffset - fp->lockedOffset);
-        if (divergence > fp->lockDivergenceMs) {
-            unlockReason = "shadow divergence";
-        }
-
-        if (unlockReason) {
+        if (divergence > activeDivergence) {
             fp->cadenceLockState = CadenceLockState::Unlocked;
-            fp->compositionOffsetMs = fp->shadowEmaOffset;  // Adopt shadow (was tracking all along)
+            fp->compositionOffsetMs = fp->shadowEmaOffset;
             fp->stableFrameCount = 0;
             fp->biasAboveMinCount = 0;
-            std::cout << "Frame pacer: cadence UNLOCK (" << unlockReason << "), EMA = "
-                      << std::fixed << std::setprecision(2) << fp->compositionOffsetMs << " ms" << std::endl;
+            std::cout << "Frame pacer: cadence UNLOCK (shadow divergence "
+                      << std::fixed << std::setprecision(2) << divergence
+                      << " > " << activeDivergence << " ms), EMA = "
+                      << fp->compositionOffsetMs << " ms" << std::endl;
         }
+    }
+
+    // ── CSV log ──
+    if (fp->logFile) {
+        float divergence = fabsf(fp->shadowEmaOffset - fp->lockedOffset);
+        fprintf(fp->logFile, "%d,%.3f,%.3f,%.3f,%.3f,%c,%.3f,%.3f,%.3f,%d,%.4f,%.4f,%d\n",
+                fp->offsetSampleCount,
+                (float)measuredOffsetMs,
+                fp->compositionOffsetMs,
+                fp->shadowEmaOffset,
+                fp->lockedOffset,
+                (fp->cadenceLockState == CadenceLockState::Locked) ? 'L' : 'U',
+                divergence,
+                activeDivergence,
+                spread,
+                fp->stableFrameCount,
+                fp->currentAlpha,
+                fp->varianceEma,
+                fp->bufferActive ? 1 : 0);
     }
 }
 
