@@ -1160,6 +1160,40 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
         outData.hasPrimaries = true;
     }
 
+    // Read chrm tag for precise primaries (no chromatic un-adaptation needed)
+    // chrm contains measured CIE xy chromaticities directly, so it's more accurate
+    // than un-adapting rXYZ/gXYZ/bXYZ when the profile uses a non-standard CAT
+    // (e.g., DaVinci Resolve profiles have 'arts' tag instead of 'chad')
+    if (auto* tag = findTag(MakeSig("chrm"))) {
+        if (tag->offset + 36 <= fileSize) {  // 12 header + 3*8 data minimum
+            const uint8_t* p = d + tag->offset;
+            uint16_t numChannels = ReadBE16(p + 8);
+            if (numChannels >= 3) {
+                float cRx = ReadS15Fixed16(p + 12);
+                float cRy = ReadS15Fixed16(p + 16);
+                float cGx = ReadS15Fixed16(p + 20);
+                float cGy = ReadS15Fixed16(p + 24);
+                float cBx = ReadS15Fixed16(p + 28);
+                float cBy = ReadS15Fixed16(p + 32);
+                // Sanity: all values should be in valid chromaticity range
+                if (cRx > 0.0f && cRx < 1.0f && cRy > 0.0f && cRy < 1.0f &&
+                    cGx > 0.0f && cGx < 1.0f && cGy > 0.0f && cGy < 1.0f &&
+                    cBx > 0.0f && cBx < 1.0f && cBy > 0.0f && cBy < 1.0f) {
+                    outData.primaries.Rx = cRx; outData.primaries.Ry = cRy;
+                    outData.primaries.Gx = cGx; outData.primaries.Gy = cGy;
+                    outData.primaries.Bx = cBx; outData.primaries.By = cBy;
+                    outData.hasPrimaries = true;
+                    // White point: keep from rXYZ sum above, or default to D65
+                    if (outData.primaries.Wx == 0.0f && outData.primaries.Wy == 0.0f) {
+                        outData.primaries.Wx = 0.3127f;
+                        outData.primaries.Wy = 0.3290f;
+                    }
+                    std::cout << "ICC: Using chrm tag for primaries (bypasses CAT un-adaptation)" << std::endl;
+                }
+            }
+        }
+    }
+
     // Read rTRC/gTRC/bTRC tags -> extract transfer curves
     auto readCurvTag = [&](uint32_t sig, std::vector<float>& outCurve, float& outGamma) -> bool {
         auto* tag = findTag(sig);
