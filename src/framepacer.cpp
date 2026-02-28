@@ -39,7 +39,7 @@ static inline int64_t MsToQpc(double ms, int64_t freq) {
 }
 
 // Snap lastVBlankQpc forward to the most recent VBlank at or before 'now'
-static int64_t SnapVBlankForward(int64_t lastVBlank, int64_t refreshPeriod, int64_t now) {
+int64_t SnapVBlankForward(int64_t lastVBlank, int64_t refreshPeriod, int64_t now) {
     if (refreshPeriod <= 0 || lastVBlank > now) return lastVBlank;
     int64_t elapsed = now - lastVBlank;
     int64_t periods = elapsed / refreshPeriod;
@@ -50,7 +50,7 @@ static int64_t SnapVBlankForward(int64_t lastVBlank, int64_t refreshPeriod, int6
 // RecalcRefreshThresholds — precompute refresh-rate-derived values
 // ============================================================================
 
-static void RecalcRefreshThresholds(FramePacer* fp) {
+void RecalcRefreshThresholds(FramePacer* fp) {
     fp->refreshPeriodMs = (float)QpcToMs(fp->qpcRefreshPeriod, fp->qpcFrequency);
     fp->minSpinBudgetMs = (std::max)(fp->refreshPeriodMs * 0.06f, 0.3f);
     fp->safetyValveMs = (std::max)(fp->refreshPeriodMs - 2.0f, 3.0f);

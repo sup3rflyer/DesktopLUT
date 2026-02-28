@@ -435,7 +435,7 @@ MonitorPrimaries GetMonitorPrimaries(int monitorIndex) {
 // Parse chromaticity coordinates from EDID bytes 25-34
 // EDID encodes each coordinate as a 10-bit value: 8 MSBs in one byte, 2 LSBs packed with others
 // The value represents a CIE 1931 xy coordinate as a binary fraction (value / 1024)
-static bool ParseEDIDChromaticity(const BYTE* edid, size_t edidSize, MonitorPrimaries& primaries) {
+bool ParseEDIDChromaticity(const BYTE* edid, size_t edidSize, MonitorPrimaries& primaries) {
     if (edidSize < 35) {
         return false;  // Need at least 35 bytes for chromaticity data
     }
@@ -484,7 +484,7 @@ static bool ParseEDIDChromaticity(const BYTE* edid, size_t edidSize, MonitorPrim
 // Device path format: \\?\DISPLAY#<HardwareID>#<InstanceID>#{GUID}
 // Example: \\?\DISPLAY#DELA1EE#5&2a3b4c5d&0&UID12345#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}
 // We extract "DELA1EE" (the hardware ID / EDID manufacturer+product code)
-static std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath) {
+std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath) {
     // Find "DISPLAY#" and extract the next segment
     size_t displayPos = devicePath.find(L"DISPLAY#");
     if (displayPos == std::wstring::npos) {

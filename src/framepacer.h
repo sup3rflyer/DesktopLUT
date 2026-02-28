@@ -41,3 +41,7 @@ void FramePacerNotifyTimeout(FramePacer* fp);
 // Reset frame pacer tracking state (EMA, cadence lock, counters).
 // Call after events that invalidate timing assumptions (sleep/wake, forced reinit, auto-sleep wake).
 void ResetFramePacerState(FramePacer* fp, const char* reason);
+
+// Pure math helpers (exposed for testing)
+int64_t SnapVBlankForward(int64_t lastVBlank, int64_t refreshPeriod, int64_t now);
+void RecalcRefreshThresholds(FramePacer* fp);

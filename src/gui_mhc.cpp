@@ -189,6 +189,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
                 params.trcB = icc.trcB;
                 params.grayscaleEnabled = true;
                 params.grayscale.enabled = true;
+                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
             }
         }
         // Peak nits is display metadata, needed regardless of file type
@@ -312,6 +313,7 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
                 params.trcB = icc.trcB;
                 params.grayscaleEnabled = true;
                 params.grayscale.enabled = true;
+                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
             }
         }
         // Peak nits is display metadata, needed regardless of file type

@@ -40,6 +40,13 @@ void SaveSettings();
 // Load all settings from INI file
 void LoadSettings();
 
+// Tonemap curve enum conversion
+const wchar_t* TonemapCurveToString(TonemapCurve curve);
+TonemapCurve StringToTonemapCurve(const wchar_t* str);
+
+// Whitelist string parsing (exposed for testing)
+void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out);
+
 // Parse g_gammaWhitelistRaw into g_gammaWhitelist vector
 void ParseGammaWhitelist();
 

@@ -87,6 +87,11 @@ void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize = 1
 // Generate MHC2 1D LUT for HDR (4096 entries, PQ signal domain)
 void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT, int lutSize = 4096);
 
+// Generate MHC2 1D LUT from per-channel TRC (exposed for testing)
+// targetGamma: display calibration target (2.2 default, 2.4 for BT.1886)
+void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, int lutSize, float targetGamma = 2.2f);
+void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize);
+
 // ============================================================================
 // ICC Profile Reading (for Extract feature)
 // ============================================================================
@@ -117,6 +122,25 @@ bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGr
 // Load a 1D .cube LUT as per-channel correction curves
 // Returns three vectors (R, G, B) with normalized 0-1 correction values
 bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vector<float>& outG, std::vector<float>& outB);
+
+// Binary format helpers (exposed for testing)
+int32_t FloatToS15Fixed16(float f);
+float ReadS15Fixed16(const uint8_t* p);
+uint32_t ReadBE32(const uint8_t* p);
+uint16_t ReadBE16(const uint8_t* p);
+
+// Transfer function helpers (exposed for testing)
+float SrgbEOTF(float v);
+float SrgbOETF(float v);
+float PqEOTF(float pq);
+float PqOETF(float L);
+
+// Grayscale evaluation (exposed for testing)
+float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs);
+float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak);
+
+// TRC inversion (exposed for testing)
+float InvertTRC(const std::vector<float>& trc, float targetLinear);
 
 // ============================================================================
 // Profile Query (for monitoring)

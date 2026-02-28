@@ -61,3 +61,7 @@ MonitorPrimaries GetMonitorPrimaries(int monitorIndex);
 // This is more reliable than GetMonitorPrimaries() as it reads actual EDID values
 // Returns primaries with valid=true if successful
 MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex);
+
+// EDID parsing (exposed for testing)
+bool ParseEDIDChromaticity(const BYTE* edid, size_t edidSize, MonitorPrimaries& primaries);
+std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath);

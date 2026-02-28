@@ -372,7 +372,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
 }
 
 // Helper to parse comma-separated whitelist into vector of lowercase exe names
-static void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out) {
+void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out) {
     out.clear();
     if (raw.empty()) return;
 

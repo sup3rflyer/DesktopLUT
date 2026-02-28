@@ -17,6 +17,7 @@ ipch/
 *.cube
 *.txt
 !README*.txt
+!tests/fixtures/*.cube
 
 # Calibration data
 *.csv

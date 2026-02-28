@@ -29,7 +29,7 @@
 // ============================================================================
 
 // Convert float to ICC s15Fixed16Number (multiply by 65536, round)
-static int32_t FloatToS15Fixed16(float f) {
+int32_t FloatToS15Fixed16(float f) {
     return (int32_t)(f * 65536.0f + (f >= 0 ? 0.5f : -0.5f));
 }
 
@@ -355,14 +355,14 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
 // ============================================================================
 
 // sRGB EOTF: decode sRGB-encoded value to linear light
-static float SrgbEOTF(float v) {
+float SrgbEOTF(float v) {
     if (v <= 0.04045f)
         return v / 12.92f;
     return powf((v + 0.055f) / 1.055f, 2.4f);
 }
 
 // sRGB OETF: encode linear light to sRGB signal
-static float SrgbOETF(float v) {
+float SrgbOETF(float v) {
     if (v <= 0.0031308f)
         return v * 12.92f;
     return 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
@@ -376,14 +376,14 @@ static const float PQ_c2 = 18.8515625f;
 static const float PQ_c3 = 18.6875f;
 
 // PQ EOTF: PQ signal (0-1) -> linear light (0-1 normalized to 10000 nits)
-static float PqEOTF(float pq) {
+float PqEOTF(float pq) {
     float Vm = powf((std::max)(pq, 1e-10f), 1.0f / PQ_m2);
     float t = (std::max)(Vm - PQ_c1, 0.0f) / (std::max)(PQ_c2 - PQ_c3 * Vm, 1e-10f);
     return powf(t, 1.0f / PQ_m1);
 }
 
 // PQ OETF: linear light (0-1 normalized to 10000 nits) -> PQ signal (0-1)
-static float PqOETF(float L) {
+float PqOETF(float L) {
     float Y = (std::max)(L, 1e-10f);
     float Ym = powf(Y, PQ_m1);
     return powf((PQ_c1 + PQ_c2 * Ym) / (1.0f + PQ_c3 * Ym), PQ_m2);
@@ -395,7 +395,7 @@ static float PqOETF(float L) {
 
 // Evaluate SDR grayscale correction (matches shader's ApplyGrayscaleCorrection)
 // Input/output are linear light values (0-1)
-static float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
+float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
     if (Y_linear <= 0.0f) return 0.0f;
 
     float idx = sqrtf(std::clamp(Y_linear, 0.0f, 1.0f)) * (float)(gs.pointCount - 1);
@@ -415,7 +415,7 @@ static float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
 
 // Evaluate HDR grayscale correction (matches shader's ApplyGrayscaleICtCp on I channel)
 // For achromatic content (R=G=B), I channel maps to PQ value directly
-static float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak) {
+float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak) {
     if (pqValue <= 0.0f || pqPeak <= 0.0f) return pqValue;
 
     float scaledI = pqValue / pqPeak;
@@ -494,7 +494,7 @@ void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT,
 // Invert a tabulated TRC: given target linear value, find the signal that produces it.
 // TRC is monotonically increasing: signal(0-1) → linear(0-1), tabulated at even intervals.
 // Uses binary search for robustness.
-static float InvertTRC(const std::vector<float>& trc, float targetLinear) {
+float InvertTRC(const std::vector<float>& trc, float targetLinear) {
     if (trc.size() < 2) return targetLinear;
     int n = (int)trc.size();
 
@@ -516,12 +516,16 @@ static float InvertTRC(const std::vector<float>& trc, float targetLinear) {
 }
 
 // Generate MHC2 1D LUT from a measured per-channel TRC curve (SDR).
-// The LUT corrects the display's non-ideal gamma to match sRGB.
-// Pipeline: signal_in (sRGB) → sRGB_EOTF → linear_target → TRC_inverse → signal_out
-void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, int lutSize) {
+// The LUT corrects the display's non-ideal gamma to match the target power law gamma.
+// Pipeline: signal_in → pow(signal, targetGamma) → linear_target → TRC_inverse → signal_out
+// Default target is pure 2.2 power law (industry standard for display calibration).
+// Note: sRGB EOTF (linear toe + 2.4 power) is NOT used because it produces variable
+// effective gamma (~1.0 near black to ~2.27 near white), not flat 2.2 as expected by
+// calibration workflows (DisplayCal, ColourSpace, CalMAN).
+void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, int lutSize, float targetGamma) {
     for (int j = 0; j < lutSize; j++) {
         float signalIn = (float)j / (float)(lutSize - 1);
-        float linearTarget = SrgbEOTF(signalIn);
+        float linearTarget = powf(signalIn, targetGamma);
         float signalOut = InvertTRC(trc, linearTarget);
         outLUT[j] = std::clamp(signalOut, 0.0f, 1.0f);
     }
@@ -621,15 +625,17 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         resampleCurve(params.corrB, lutB.data(), lutSize);
     } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
         // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
-        std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points)" << std::endl;
         if (params.isHDR) {
+            std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, HDR/PQ)" << std::endl;
             GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR.data(), lutSize);
             GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG.data(), lutSize);
             GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB.data(), lutSize);
         } else {
-            GenerateMHC2LUT_FromTRC_SDR(params.trcR, lutR.data(), lutSize);
-            GenerateMHC2LUT_FromTRC_SDR(params.trcG, lutG.data(), lutSize);
-            GenerateMHC2LUT_FromTRC_SDR(params.trcB, lutB.data(), lutSize);
+            float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
+            std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
+            GenerateMHC2LUT_FromTRC_SDR(params.trcR, lutR.data(), lutSize, targetGamma);
+            GenerateMHC2LUT_FromTRC_SDR(params.trcG, lutG.data(), lutSize, targetGamma);
+            GenerateMHC2LUT_FromTRC_SDR(params.trcB, lutB.data(), lutSize, targetGamma);
         }
     } else if (params.isHDR) {
         GenerateMHC2LUT_HDR(params.grayscale, params.peakNits, lutR.data(), lutSize);
@@ -686,8 +692,10 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     WriteXYZTag(tagGXYZ, adaptedRGBtoXYZ[1], adaptedRGBtoXYZ[4], adaptedRGBtoXYZ[7]);
     WriteXYZTag(tagBXYZ, adaptedRGBtoXYZ[2], adaptedRGBtoXYZ[5], adaptedRGBtoXYZ[8]);
 
-    // rTRC/gTRC/bTRC - gamma 2.2 (shared tag, same offset for all three)
-    WriteCurvTagGamma(tagTRC, 2.2f);
+    // rTRC/gTRC/bTRC - target gamma (shared tag, same offset for all three)
+    // Tells color-aware apps what the corrected display's EOTF is (2.2 default, 2.4 for BT.1886)
+    float profileGamma = (!params.isHDR && params.grayscale.use24Gamma) ? 2.4f : 2.2f;
+    WriteCurvTagGamma(tagTRC, profileGamma);
 
     // chad - chromatic adaptation matrix (D65 -> D50 Bradford)
     WriteSf32Tag(tagChad, g_bradfordD65toD50);
@@ -1040,17 +1048,17 @@ bool ReassociateMHC2Profile(const std::wstring& profileName, LUID adapterLuid, U
 // ============================================================================
 
 // Read big-endian 32-bit from buffer
-static uint32_t ReadBE32(const uint8_t* p) {
+uint32_t ReadBE32(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
 // Read big-endian 16-bit from buffer
-static uint16_t ReadBE16(const uint8_t* p) {
+uint16_t ReadBE16(const uint8_t* p) {
     return ((uint16_t)p[0] << 8) | p[1];
 }
 
 // Read s15Fixed16Number
-static float ReadS15Fixed16(const uint8_t* p) {
+float ReadS15Fixed16(const uint8_t* p) {
     int32_t val = (int32_t)ReadBE32(p);
     return (float)val / 65536.0f;
 }

@@ -242,6 +242,15 @@ MSBuild DesktopLUT.sln -p:Configuration=Release -p:Platform=x64
 
 Or open `DesktopLUT.sln` in VS2022 and build Release x64.
 
+### Running Tests
+
+```
+MSBuild DesktopLUT.Tests.vcxproj -p:Configuration=Release -p:Platform=x64
+bin\Test\DesktopLUT.Tests.exe
+```
+
+156 test cases covering color math (PQ, primaries matrices, sRGB EOTF), MHC ICC profile generation and reading, EDID chromaticity parsing, frame pacer EMA/cadence lock, LUT loading, and settings round-trips. Uses [doctest](https://github.com/doctest/doctest).
+
 ## Technical Details
 
 See [REFERENCE.md](REFERENCE.md) for in-depth documentation covering:

@@ -1,0 +1,84 @@
+#pragma once
+#include <cstdint>
+
+// Helper to construct 10-bit EDID chromaticity values.
+// Each CIE xy coordinate is stored as value/1024 across 10 bits:
+//   8 MSBs in a dedicated byte (bytes 27-34)
+//   2 LSBs packed into bytes 25-26 at specific bit positions
+
+// sRGB-class monitor EDID
+// Primaries: R(0.640,0.330) G(0.300,0.600) B(0.150,0.060) W(0.313,0.329)
+// 10-bit values: Rx=655 Ry=338 Gx=307 Gy=614 Bx=154 By=61 Wx=320 Wy=337
+//
+// Byte 25 (rgLsb): Rx[1:0]=11 Ry[1:0]=10 Gx[1:0]=11 Gy[1:0]=10 = 0xEE
+// Byte 26 (bwLsb): Bx[1:0]=10 By[1:0]=01 Wx[1:0]=00 Wy[1:0]=01 = 0x91
+// Bytes 27-34: MSBs = 163, 84, 76, 153, 38, 15, 80, 84
+static const uint8_t kEDID_sRGB[128] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,  // Header (bytes 0-7)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Manufacturer/product (bytes 8-15)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Serial/dates (bytes 16-23)
+    0x00,                                              // Byte 24: EDID version
+    0xEE,                                              // Byte 25: rgLsb
+    0x91,                                              // Byte 26: bwLsb
+    0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,  // Bytes 27-34: MSBs (Rx Ry Gx Gy Bx By Wx Wy)
+    // Remaining bytes (35-127) zeroed
+};
+
+// Expected primaries from kEDID_sRGB (byte 26 = 0x91 = 10_01_00_01):
+// Rx = (0xA3<<2 | 3) / 1024 = 655/1024 = 0.6396...
+// Ry = (0x54<<2 | 2) / 1024 = 338/1024 = 0.3300...
+// Gx = (0x4C<<2 | 3) / 1024 = 307/1024 = 0.2998...
+// Gy = (0x99<<2 | 2) / 1024 = 614/1024 = 0.5996...
+// Bx = (0x26<<2 | 2) / 1024 = 154/1024 = 0.1503...
+// By = (0x0F<<2 | 1) / 1024 = 61/1024  = 0.0595...
+// Wx = (0x50<<2 | 0) / 1024 = 320/1024 = 0.3125
+// Wy = (0x54<<2 | 1) / 1024 = 337/1024 = 0.3291...
+
+// Wide-gamut P3-class EDID
+// Primaries: R(0.680,0.320) G(0.265,0.690) B(0.150,0.060) W(0.313,0.329)
+// 10-bit values: Rx=696 Ry=328 Gx=271 Gy=707 Bx=154 By=61 Wx=320 Wy=337
+//
+// Byte 25 (rgLsb): Rx[1:0]=00 Ry[1:0]=00 Gx[1:0]=11 Gy[1:0]=11 = 0x0F
+// Byte 26 (bwLsb): Bx[1:0]=10 By[1:0]=01 Wx[1:0]=00 Wy[1:0]=01 = 0x91
+// Bytes 27-34: MSBs = 174, 82, 67, 176, 38, 15, 80, 84
+static const uint8_t kEDID_P3[128] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,  // Header
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,
+    0x0F,                                              // Byte 25: rgLsb
+    0x91,                                              // Byte 26: bwLsb
+    0xAE, 0x52, 0x43, 0xB0, 0x26, 0x0F, 0x50, 0x54,  // Bytes 27-34: MSBs
+};
+
+// Too-short EDID (only 34 bytes — need 35 for chromaticity)
+static const uint8_t kEDID_TooShort[34] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,
+    0xEE,
+    0xA1,
+    0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50,
+    // Missing byte 34
+};
+
+// Bad header EDID
+static const uint8_t kEDID_BadHeader[128] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Wrong header
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,
+    0xEE, 0xA1,
+    0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54,
+};
+
+// All-zero chromaticity bytes (valid header, zero primaries)
+static const uint8_t kEDID_ZeroChromaticity[128] = {
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,  // Header
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00,
+    0x00, 0x00,  // Bytes 25-26: all LSBs zero
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // Bytes 27-34: all MSBs zero
+};
