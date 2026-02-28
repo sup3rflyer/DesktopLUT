@@ -380,6 +380,7 @@ void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHD
     BOOL bRet;
     while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndEditor)) {
         if (bRet == -1) break;  // Error occurred
+        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }

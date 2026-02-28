@@ -351,8 +351,8 @@ bool AttemptDeviceRecovery() {
             return false;
         }
 
-        if (!ctx.hdrLutPath.empty()) {
-            LoadLUT(ctx.hdrLutPath, lutDataHDR, lutSizeHDR);
+        if (!ctx.hdrLutPath.empty() && !LoadLUT(ctx.hdrLutPath, lutDataHDR, lutSizeHDR)) {
+            std::cerr << "Failed to reload HDR LUT for monitor " << ctx.index << std::endl;
         }
 
         // Recreate swapchain (window already exists)

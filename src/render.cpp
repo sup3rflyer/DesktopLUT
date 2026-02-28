@@ -231,7 +231,7 @@ bool CreateSwapChain(MonitorContext* ctx) {
     scd.SampleDesc.Count = 1;
     scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = 2;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     scd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     if (g_tearingSupported) {
@@ -1265,7 +1265,8 @@ void RenderAll(FramePacer* fp) {
         LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
         if (GetLastInputInfo(&lii)) {
             DWORD idleMs = GetTickCount() - lii.dwTime;
-            frameBufferActive = (g_frameBufferIdleMs == 0) || (idleMs >= (DWORD)g_frameBufferIdleMs);
+            int idleThreshold = g_frameBufferIdleMs.load(std::memory_order_relaxed);
+            frameBufferActive = (idleThreshold == 0) || (idleMs >= (DWORD)idleThreshold);
         }
     }
     // Reset buffer state on transitions

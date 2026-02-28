@@ -1411,6 +1411,7 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
     MSG winMsg;
     while (GetMessage(&winMsg, nullptr, 0, 0)) {
         if (!IsWindow(dlg)) break;
+        if (winMsg.message == WM_QUIT) { PostQuitMessage((int)winMsg.wParam); break; }
         // Enter: push live preview (confirm text box edits) or apply if not previewing
         if (winMsg.message == WM_KEYDOWN && winMsg.wParam == VK_RETURN) {
             if (data.livePreview) {

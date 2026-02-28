@@ -29,7 +29,10 @@ bool InitDesktopDuplication(MonitorContext* ctx) {
     IDXGIOutput* output = nullptr;
     IDXGIOutput5* output5 = nullptr;
 
-    for (UINT i = 0; adapter->EnumOutputs(i, &output) != DXGI_ERROR_NOT_FOUND; i++) {
+    for (UINT i = 0; ; i++) {
+        HRESULT hrEnum = adapter->EnumOutputs(i, &output);
+        if (hrEnum == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(hrEnum)) break;
         DXGI_OUTPUT_DESC desc;
         output->GetDesc(&desc);
 
@@ -65,6 +68,7 @@ bool InitDesktopDuplication(MonitorContext* ctx) {
 
                 ctx->captureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
                 ctx->isHDREnabled = false;
+                ctx->isFP16SDR = false;
                 ctx->isHDRAtom.store(false, std::memory_order_relaxed);
                 adapter->Release();
                 dxgiDevice->Release();

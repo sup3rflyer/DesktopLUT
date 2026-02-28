@@ -31,6 +31,8 @@ struct MovableAtomic {
     T load(std::memory_order mo = std::memory_order_seq_cst) const { return v.load(mo); }
     void store(T val, std::memory_order mo = std::memory_order_seq_cst) { v.store(val, mo); }
     T exchange(T val, std::memory_order mo = std::memory_order_seq_cst) { return v.exchange(val, mo); }
+    operator T() const { return v.load(std::memory_order_relaxed); }
+    MovableAtomic& operator=(T val) { v.store(val, std::memory_order_relaxed); return *this; }
 };
 
 // ============================================================================
@@ -515,10 +517,10 @@ struct MonitorContext {
     // MHC profile active flags — tracks which MHC corrections are installed at GPU scanout
     // Used for diagnostics logging and MHC live preview state management
     // Note: shader corrections are always independent of MHC (all layers stack, no suppression)
-    bool sdrMhcPrimariesActive = false;   // SDR MHC primaries installed at GPU scanout
-    bool sdrMhcGrayscaleActive = false;   // SDR MHC grayscale installed at GPU scanout
-    bool hdrMhcPrimariesActive = false;   // HDR MHC primaries installed at GPU scanout
-    bool hdrMhcGrayscaleActive = false;   // HDR MHC grayscale installed at GPU scanout
+    MovableAtomic<bool> sdrMhcPrimariesActive{ false };   // SDR MHC primaries installed at GPU scanout
+    MovableAtomic<bool> sdrMhcGrayscaleActive{ false };   // SDR MHC grayscale installed at GPU scanout
+    MovableAtomic<bool> hdrMhcPrimariesActive{ false };   // HDR MHC primaries installed at GPU scanout
+    MovableAtomic<bool> hdrMhcGrayscaleActive{ false };   // HDR MHC grayscale installed at GPU scanout
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     bool cbDirty = true;                     // True when constant buffer needs update

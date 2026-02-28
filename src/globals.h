@@ -62,7 +62,7 @@ extern std::atomic<bool> g_framePacerEnabled;  // Enable predictive frame pacer 
 extern std::atomic<bool> g_framePacerSpinWait; // Enable spin-wait phase (default: true)
 extern std::atomic<bool> g_frameBufferEnabled; // Enable auto frame buffer (engages on idle)
 extern std::atomic<bool> g_framePacerLogEnabled; // Log frame pacer stats to CSV
-extern int g_frameBufferIdleMs;               // Idle timeout before buffer engages (ms, 0 = always active)
+extern std::atomic<int> g_frameBufferIdleMs;   // Idle timeout before buffer engages (ms, 0 = always active)
 
 // ============================================================================
 // Hotkey Settings
@@ -130,7 +130,7 @@ extern HANDLE g_singleInstanceMutex;
 // Tearing Support
 // ============================================================================
 
-extern bool g_tearingSupported;
+extern std::atomic<bool> g_tearingSupported;
 
 // ============================================================================
 // SDR White Point

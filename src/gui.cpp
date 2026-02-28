@@ -383,11 +383,13 @@ static LRESULT CALLBACK ScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     }
 
     case WM_MOUSEWHEEL: {
-        // Handle mouse wheel scrolling
+        // Handle mouse wheel scrolling (accumulate delta for smooth-scroll mice)
+        static int wheelAccum = 0;
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        int lines = delta / WHEEL_DELTA * 3;  // 3 lines per wheel click
-        SendMessage(hwnd, WM_VSCROLL, lines > 0 ? SB_LINEUP : SB_LINEDOWN, 0);
-        for (int i = 1; i < abs(lines); i++) {
+        wheelAccum += delta;
+        int lines = (wheelAccum * 3) / WHEEL_DELTA;
+        wheelAccum -= (lines * WHEEL_DELTA) / 3;
+        for (int i = 0; i < abs(lines); i++) {
             SendMessage(hwnd, WM_VSCROLL, lines > 0 ? SB_LINEUP : SB_LINEDOWN, 0);
         }
         return 0;

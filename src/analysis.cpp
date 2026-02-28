@@ -22,7 +22,7 @@ static const int ANALYSIS_DISPATCH_INTERVAL = 30;  // Dispatch every 30 frames (
 static const int ANALYSIS_READBACK_DELAY = 2;      // Read back 2 frames after dispatch
 
 // Custom message for async UI update (offloads formatting from render thread)
-static const UINT WM_UPDATE_ANALYSIS = WM_USER + 1;
+static const UINT WM_UPDATE_ANALYSIS = WM_USER + 2;
 
 // Data passed to UI thread for formatting
 struct AnalysisDisplayData {

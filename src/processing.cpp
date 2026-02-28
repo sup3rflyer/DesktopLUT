@@ -241,16 +241,19 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
         // Track which MHC corrections are active at GPU scanout (for diagnostics and live preview)
         // Shader corrections are independent — all layers stack (MHC = Layer 1, shader = Layer 3)
-        if (config.monitorIndex < (int)g_gui.monitorSettings.size()) {
-            const auto& ms = g_gui.monitorSettings[config.monitorIndex];
-            ctx.sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
-                && ms.sdrMHC.primariesEnabled;
-            ctx.sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
-                && ms.sdrMHC.grayscale.enabled;
-            ctx.hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
-                && ms.hdrMHC.primariesEnabled;
-            ctx.hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
-                && ms.hdrMHC.grayscale.enabled;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            if (config.monitorIndex < (int)g_gui.monitorSettings.size()) {
+                const auto& ms = g_gui.monitorSettings[config.monitorIndex];
+                ctx.sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
+                    && ms.sdrMHC.primariesEnabled;
+                ctx.sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
+                    && ms.sdrMHC.grayscale.enabled;
+                ctx.hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
+                    && ms.hdrMHC.primariesEnabled;
+                ctx.hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
+                    && ms.hdrMHC.grayscale.enabled;
+            }
         }
 
         MONITORINFO mi = { sizeof(mi) };
@@ -541,17 +544,21 @@ void StopProcessing() {
     SetStatus(L"Stopping...");
     g_running = false;
 
+    // Signal wake event to unblock any CompClock/WaitForSingleObject in the render loop
+    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+
     if (g_gui.processingThread.joinable()) {
         // Wait for thread with timeout to prevent GUI freeze
         // Process GUI messages while waiting so window stays responsive
         auto handle = g_gui.processingThread.native_handle();
         DWORD startTime = GetTickCount();
-        DWORD timeout = 2000;  // 2 second timeout
+        DWORD timeout = 6000;  // 6 second timeout (accounts for Sleep(500) in forced reinit + frame sync)
 
         while (true) {
             DWORD elapsed = GetTickCount() - startTime;
             if (elapsed >= timeout) {
-                // Timeout - detach thread
+                // Timeout - detach thread (last resort, should not normally happen)
+                std::cerr << "Processing thread shutdown timed out after " << timeout << "ms, detaching" << std::endl;
                 g_gui.processingThread.detach();
                 SetStatus(L"Inactive");
                 break;

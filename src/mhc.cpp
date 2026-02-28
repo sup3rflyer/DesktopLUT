@@ -1600,25 +1600,39 @@ void CleanupOrphanedMhcProfiles() {
 void ReapplyAllMhcProfiles() {
     if (!IsMHC2ApiAvailable()) return;
 
-    for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
-        const auto& ms = g_gui.monitorSettings[i];
+    // Snapshot MHC state under lock to avoid racing with GUI thread
+    struct MhcSnapshot { bool sdrEnabled; std::wstring sdrName; bool hdrEnabled; std::wstring hdrName; };
+    std::vector<MhcSnapshot> snapshots;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        snapshots.reserve(g_gui.monitorSettings.size());
+        for (const auto& ms : g_gui.monitorSettings) {
+            snapshots.push_back({
+                ms.sdrMHC.enabled, ms.sdrMHC.profileName,
+                ms.hdrMHC.enabled, ms.hdrMHC.profileName
+            });
+        }
+    }
+
+    for (int i = 0; i < (int)snapshots.size(); i++) {
+        const auto& snap = snapshots[i];
 
         DisplayInfo displayInfo;
         if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
 
         // Reapply SDR profile
-        if (ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) {
-            RemoveMHC2Profile(ms.sdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, false);
-            ReassociateMHC2Profile(ms.sdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, false);
-            std::wcout << L"MHC reapply: SDR profile '" << ms.sdrMHC.profileName
+        if (snap.sdrEnabled && !snap.sdrName.empty()) {
+            RemoveMHC2Profile(snap.sdrName, displayInfo.adapterId, displayInfo.sourceId, false);
+            ReassociateMHC2Profile(snap.sdrName, displayInfo.adapterId, displayInfo.sourceId, false);
+            std::wcout << L"MHC reapply: SDR profile '" << snap.sdrName
                        << L"' for monitor " << i << std::endl;
         }
 
         // Reapply HDR profile
-        if (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()) {
-            RemoveMHC2Profile(ms.hdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
-            ReassociateMHC2Profile(ms.hdrMHC.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
-            std::wcout << L"MHC reapply: HDR profile '" << ms.hdrMHC.profileName
+        if (snap.hdrEnabled && !snap.hdrName.empty()) {
+            RemoveMHC2Profile(snap.hdrName, displayInfo.adapterId, displayInfo.sourceId, true);
+            ReassociateMHC2Profile(snap.hdrName, displayInfo.adapterId, displayInfo.sourceId, true);
+            std::wcout << L"MHC reapply: HDR profile '" << snap.hdrName
                        << L"' for monitor " << i << std::endl;
         }
     }
