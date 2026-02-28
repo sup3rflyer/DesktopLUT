@@ -38,6 +38,19 @@ static inline int64_t MsToQpc(double ms, int64_t freq) {
     return (int64_t)(ms * (double)freq / 1000.0);
 }
 
+// Check if two QPC refresh periods represent the same rate (within 0.1% tolerance).
+// DWM and DComp can report slightly different periods for the same rate due to
+// rounding/measurement differences. Without tolerance, this causes a ping-pong
+// reset loop: DWM sets period A, DComp overwrites with B, next frame DWM sees
+// "rate change" back to A, etc. — resetting the pacer every 2 frames.
+static inline bool IsSameRefreshPeriod(int64_t a, int64_t b) {
+    if (a <= 0 || b <= 0) return false;
+    int64_t diff = (a > b) ? (a - b) : (b - a);
+    int64_t tolerance = (std::max)(a, b) / 1000;  // 0.1%
+    if (tolerance < 1) tolerance = 1;
+    return diff <= tolerance;
+}
+
 // Snap lastVBlankQpc forward to the most recent VBlank at or before 'now'
 int64_t SnapVBlankForward(int64_t lastVBlank, int64_t refreshPeriod, int64_t now) {
     if (refreshPeriod <= 0 || lastVBlank > now) return lastVBlank;
@@ -182,7 +195,7 @@ void InitFramePacer(FramePacer* fp) {
         fopen_s(&fp->logFile, "framepacer.csv", "w");
         if (fp->logFile) {
             fprintf(fp->logFile,
-                "frame,measured,ema,shadow,locked,state,divergence,threshold,spread,stable,alpha,var,buffer\n");
+                "frame,measured,ema,shadow,locked,state,divergence,threshold,spread,stable,alpha,var,buffer,drops,dwm_drops\n");
             std::cout << "Frame pacer: CSV log enabled (framepacer.csv)" << std::endl;
         }
     }
@@ -300,7 +313,7 @@ static bool RefreshDwmTimingInfo(FramePacer* fp) {
     DWM_TIMING_INFO ti = {};
     ti.cbSize = sizeof(ti);
     if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod > 0) {
-        bool rateChanged = (fp->qpcRefreshPeriod != ti.qpcRefreshPeriod);
+        bool rateChanged = !IsSameRefreshPeriod(fp->qpcRefreshPeriod, ti.qpcRefreshPeriod);
         fp->qpcRefreshPeriod = ti.qpcRefreshPeriod;
         fp->lastVBlankQpc = ti.qpcVBlank;
         if (rateChanged) {
@@ -364,7 +377,7 @@ static void QueryDCompFrameStats(FramePacer* fp) {
 
         // Use DComp frame period as authoritative refresh period when it differs
         // from DwmTimingInfo (happens under DRR, multi-monitor mismatches)
-        if (fp->dcompFramePeriod != fp->qpcRefreshPeriod) {
+        if (!IsSameRefreshPeriod(fp->dcompFramePeriod, fp->qpcRefreshPeriod)) {
             fp->qpcRefreshPeriod = fp->dcompFramePeriod;
             RecalcRefreshThresholds(fp);
             char buf[64];
@@ -772,7 +785,7 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
     // ── CSV log ──
     if (fp->logFile) {
         float divergence = fabsf(fp->shadowEmaOffset - fp->lockedOffset);
-        fprintf(fp->logFile, "%d,%.3f,%.3f,%.3f,%.3f,%c,%.3f,%.3f,%.3f,%d,%.4f,%.4f,%d\n",
+        fprintf(fp->logFile, "%d,%.3f,%.3f,%.3f,%.3f,%c,%.3f,%.3f,%.3f,%d,%.4f,%.4f,%d,%d,%d\n",
                 fp->offsetSampleCount,
                 (float)measuredOffsetMs,
                 fp->compositionOffsetMs,
@@ -785,7 +798,9 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
                 fp->stableFrameCount,
                 fp->currentAlpha,
                 fp->varianceEma,
-                fp->bufferActive ? 1 : 0);
+                fp->bufferActive ? 1 : 0,
+                fp->droppedFrameCount,
+                fp->dcompDroppedFrames);
     }
 }
 
