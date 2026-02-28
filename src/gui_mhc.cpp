@@ -687,15 +687,18 @@ static void MhcUpdatePrimariesFields(MhcDialogData* d) {
     // Only block editing when the loaded file specifically provides primaries (ICC with primaries)
     // 1D cube files have no primaries data — coordinate fields should stay editable in Custom mode
     bool filePrimaries = d->fileLoaded && d->hasLoadedICC && d->loadedICC.hasPrimaries;
-    bool custom = (sel == g_numPresetPrimaries - 1) && !filePrimaries;
-    EnableWindow(d->hwndRx, custom); EnableWindow(d->hwndRy, custom);
-    EnableWindow(d->hwndGx, custom); EnableWindow(d->hwndGy, custom);
-    EnableWindow(d->hwndBx, custom); EnableWindow(d->hwndBy, custom);
-    EnableWindow(d->hwndWx, custom); EnableWindow(d->hwndWy, custom);
+    bool isCustom = (sel == g_numPresetPrimaries - 1);
+    bool editable = isCustom && !filePrimaries;
+    EnableWindow(d->hwndRx, editable); EnableWindow(d->hwndRy, editable);
+    EnableWindow(d->hwndGx, editable); EnableWindow(d->hwndGy, editable);
+    EnableWindow(d->hwndBx, editable); EnableWindow(d->hwndBy, editable);
+    EnableWindow(d->hwndWx, editable); EnableWindow(d->hwndWy, editable);
 
     wchar_t buf[16];
     float Rx, Ry, Gx, Gy, Bx, By, Wx, Wy;
-    if (custom) {
+    if (isCustom) {
+        // Show customPrimaries whether editable or locked by ICC import
+        // (ICC import populates customPrimaries with the ICC's measured chromaticities)
         const auto& cp = d->settings->customPrimaries;
         Rx = cp.Rx; Ry = cp.Ry; Gx = cp.Gx; Gy = cp.Gy;
         Bx = cp.Bx; By = cp.By; Wx = cp.Wx; Wy = cp.Wy;
