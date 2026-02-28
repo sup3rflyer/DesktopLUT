@@ -143,7 +143,7 @@ bool SetDisplayMaxTml(const DisplayInfo& display, float nits) {
 }
 
 bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo) {
-    if (monitorIndex < 0 || monitorIndex >= (int)g_monitors.size()) {
+    if (monitorIndex < 0) {
         return false;
     }
 

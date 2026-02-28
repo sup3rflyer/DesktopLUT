@@ -168,7 +168,10 @@ struct MovableAtomic {
 
 const int OSD_TIMER_ID = 100;
 const int HDR_REINIT_TIMER_ID = 101;  // Delayed reinit after hotkey HDR toggle
+const int RESTART_TIMER_ID = 102;     // Auto-restart processing after unexpected exit
 const int HDR_REINIT_DELAY_MS = 1000; // Wait for Windows to complete HDR transition
+const int RESTART_INITIAL_DELAY_MS = 3000;  // First retry after 3s
+const int RESTART_MAX_DELAY_MS = 30000;     // Cap at 30s
 const int OSD_DURATION_MS = 3000;
 const int WATCHDOG_TIMEOUT_SECONDS = 5;
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear
@@ -752,6 +755,9 @@ struct GUIState {
     HWND hwndSettingsVrrWhitelistBtn = nullptr;
 
     int panelHeight = 0;  // Visible height of scroll panels
+
+    // Auto-restart state
+    int restartRetryCount = 0;  // Exponential backoff counter (0 = no pending restart)
 };
 
 // Grayscale editor dialog data

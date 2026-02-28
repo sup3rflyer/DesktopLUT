@@ -488,7 +488,7 @@ void StartProcessing() {
     std::vector<MonitorLUTConfig> configs;
     for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
         const auto& ms = g_gui.monitorSettings[i];
-        bool hasLUT = !ms.sdrPath.empty();
+        bool hasLUT = !ms.sdrPath.empty() || !ms.hdrPath.empty();
         bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
                                      ms.sdrColorCorrection.grayscale.enabled ||
                                      ms.sdrColorCorrection.grayscale.use24Gamma;
@@ -521,6 +521,8 @@ void StartProcessing() {
 
     g_running = true;
     g_gui.isRunning = true;
+    g_gui.restartRetryCount = 0;  // Reset backoff on successful start
+    if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
     g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
 
     // Directly set button states - don't call UpdateGUIState which may re-enable via SettingsChanged
@@ -530,6 +532,10 @@ void StartProcessing() {
 }
 
 void StopProcessing() {
+    // Cancel any pending auto-restart (user explicitly wants stopped)
+    g_gui.restartRetryCount = 0;
+    if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+
     if (!g_gui.isRunning) return;
 
     SetStatus(L"Stopping...");

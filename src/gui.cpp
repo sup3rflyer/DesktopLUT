@@ -1848,6 +1848,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_USER + 100:  // Processing stopped
         g_gui.isRunning = false;
         UpdateGUIState();
+        // Auto-restart if user didn't click Stop (activeSettings still populated)
+        if (!g_gui.activeSettings.empty()) {
+            int delay = RESTART_INITIAL_DELAY_MS * (1 << (std::min)(g_gui.restartRetryCount, 3));
+            if (delay > RESTART_MAX_DELAY_MS) delay = RESTART_MAX_DELAY_MS;
+            g_gui.restartRetryCount++;
+            SetTimer(hwnd, RESTART_TIMER_ID, delay, nullptr);
+            wchar_t status[64];
+            swprintf_s(status, L"Restarting in %ds...", delay / 1000);
+            SetStatus(status);
+        }
         return 0;
 
     case WM_MHC_PROFILE_REAPPLIED: {
@@ -1864,6 +1874,29 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowWindow(hwnd, SW_HIDE);
         }
         return 0;
+
+    case WM_TIMER:
+        if (wParam == RESTART_TIMER_ID) {
+            KillTimer(hwnd, RESTART_TIMER_ID);
+            if (!g_gui.isRunning && !g_gui.activeSettings.empty()) {
+                StartProcessing();
+                if (g_gui.isRunning) {
+                    // Success — reset backoff
+                    g_gui.restartRetryCount = 0;
+                } else {
+                    // Still failing — schedule next retry with backoff
+                    int delay = RESTART_INITIAL_DELAY_MS * (1 << (std::min)(g_gui.restartRetryCount, 3));
+                    if (delay > RESTART_MAX_DELAY_MS) delay = RESTART_MAX_DELAY_MS;
+                    g_gui.restartRetryCount++;
+                    SetTimer(hwnd, RESTART_TIMER_ID, delay, nullptr);
+                    wchar_t status[64];
+                    swprintf_s(status, L"Restart failed, retrying in %ds...", delay / 1000);
+                    SetStatus(status);
+                }
+            }
+            return 0;
+        }
+        break;  // Let other timers pass through to DefWindowProc
 
     case WM_DISPLAYCHANGE: {
         // Monitor hotplug: re-enumerate and update if count changed
