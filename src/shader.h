@@ -620,11 +620,6 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             rec2020_out = rec2020 * (80.0f / 10000.0f);
         }
 
-        // White balance: shift display white point (after grayscale which assumes D65)
-        if (useManualCorrection > 0.5) {
-            rec2020_out *= float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
-        }
-
         // ═══════════════════════════════════════════════════════════════════════
         // STAGE 7: LUT application or passthrough -> Output
         // ═══════════════════════════════════════════════════════════════════════
@@ -637,6 +632,11 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             float3 pqRGB = Linear_to_PQ(rec2020_out);
             float3 lutResult = SampleLUT(pqRGB);
             linearRec2020 = PQ_to_Linear(lutResult) * (10000.0f / 80.0f);
+        }
+
+        // White balance: applied after LUT (which was calibrated for D65 input)
+        if (useManualCorrection > 0.5) {
+            linearRec2020 *= float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
         }
 
         // Rec.2020 -> BT.709 (scRGB output)
@@ -702,17 +702,19 @@ R"(
         input = ApplyGrayscaleCorrection(input);
         input = Apply24Gamma(input);
 
-        // White balance: applied after grayscale (which assumes D65)
+        float3 corrected;
+        if (usePassthrough > 0.5) corrected = input;
+        else corrected = SampleLUT(input);
+
+        // White balance: applied after LUT (which was calibrated for D65 input)
+        // Applying before LUT caused the LUT to partially undo the white shift
+        // for neutrals while incorrectly remapping saturated colors
         // pow(linearGain, 1/2.2) converts linear gain to gamma space
         // (exact for power-law gamma, negligible error at sRGB toe)
         if (useManualCorrection > 0.5) {
             float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
-            input *= pow(max(wbGains, 0.001), 1.0 / 2.2);
+            corrected *= pow(max(wbGains, 0.001), 1.0 / 2.2);
         }
-
-        float3 corrected;
-        if (usePassthrough > 0.5) corrected = input;
-        else corrected = SampleLUT(input);
 
         // ═══════════════════════════════════════════════════════════════════════
         // STAGE 4: Output conversion
