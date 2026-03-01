@@ -343,6 +343,7 @@ struct FramePacer {
 
     // Runtime state set by render loop
     bool bufferActive = false;               // Whether frame buffer is currently engaged (set by RenderAll)
+    DWORD lastIdleMs = 0;                    // Last measured idle time from GetLastInputInfo (diagnostics)
 
     // Diagnostics log (CSV output for tuning)
     FILE* logFile = nullptr;                 // CSV log file (nullptr = disabled)

@@ -195,7 +195,7 @@ void InitFramePacer(FramePacer* fp) {
         fopen_s(&fp->logFile, "framepacer.csv", "w");
         if (fp->logFile) {
             fprintf(fp->logFile,
-                "frame,measured,ema,shadow,locked,state,divergence,threshold,spread,stable,alpha,var,buffer,drops,dwm_drops\n");
+                "frame,measured,ema,shadow,locked,state,divergence,threshold,spread,stable,alpha,var,buffer,drops,dwm_drops,idle_ms,outlier\n");
             std::cout << "Frame pacer: CSV log enabled (framepacer.csv)" << std::endl;
         }
     }
@@ -371,20 +371,11 @@ static void QueryDCompFrameStats(FramePacer* fp) {
         fp->dcompDroppedFrames += dropped;
     }
 
-    // Update authoritative frame period (if valid and different from DWM timing)
+    // Store DComp frame period for diagnostics (not used as authoritative rate —
+    // DComp's framePeriod is per-frame actual timing with scheduling jitter, not
+    // the nominal rate. DWM's qpcRefreshPeriod tracks rate changes reliably.)
     if (frameStats.framePeriod > 0) {
         fp->dcompFramePeriod = (int64_t)frameStats.framePeriod;
-
-        // Use DComp frame period as authoritative refresh period when it differs
-        // from DwmTimingInfo (happens under DRR, multi-monitor mismatches)
-        if (!IsSameRefreshPeriod(fp->dcompFramePeriod, fp->qpcRefreshPeriod)) {
-            fp->qpcRefreshPeriod = fp->dcompFramePeriod;
-            RecalcRefreshThresholds(fp);
-            char buf[64];
-            snprintf(buf, sizeof(buf), "DComp rate change to %.1f Hz",
-                     1000.0 / QpcToMs(fp->dcompFramePeriod, fp->qpcFrequency));
-            ResetFramePacerState(fp, buf);
-        }
     }
 
     fp->lastCompletedFrameId = completedId;
@@ -617,15 +608,24 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
     float activeOffset = (fp->cadenceLockState == CadenceLockState::Locked)
         ? fp->lockedOffset : fp->compositionOffsetMs;
 
-    // Outlier detection: two methods, either triggers rejection
-    // 1. DComp frame ID gap (deterministic, Win11+)
-    // 2. Threshold-based (heuristic fallback, always available)
+    // Outlier detection: three checks, any triggers rejection.
+    // All gated on offsetSampleCount >= 7 to allow initial convergence.
+    // 1. DComp frame ID gap — DWM skipped a compositor cycle. The drop happened in a
+    //    PREVIOUS cycle; the current frame's lastPresentTime is from a composition that
+    //    completed normally, so the offset measurement is often valid. Still reject after
+    //    convergence because the gap can shift SnapVBlankForward's baseline.
+    // 2. High outlier: measured > 2× active offset (DWM frame drop)
+    // 3. Low outlier: measured < 0.5ms (repeat frames where lastPresentTime=0 —
+    //    e.g. 24fps 2:2 cadence at 48Hz — fallback to preAcquireQpc is unreliable)
     float outlierThreshold = (std::max)(activeOffset * 2.0f, fp->outlierFloorMs);
     bool isOutlier = false;
-    if (fp->dcompFrameDropThisCycle) {
+    if (fp->offsetSampleCount >= 7 && fp->dcompFrameDropThisCycle) {
         isOutlier = true;
     }
     if (!isOutlier && fp->offsetSampleCount >= 7 && (float)measuredOffsetMs > outlierThreshold) {
+        isOutlier = true;
+    }
+    if (!isOutlier && fp->offsetSampleCount >= 7 && (float)measuredOffsetMs < 0.5f) {
         isOutlier = true;
     }
 
@@ -646,6 +646,45 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
                 fp->stableFrameCount = 0;
                 std::cout << "Frame pacer: cadence UNLOCK (baseline shift)" << std::endl;
             }
+        }
+
+        // Log outlier frames to CSV (normally skipped — invisible outliers made debugging impossible)
+        if (fp->logFile) {
+            // Determine outlier reason: D=DComp frame drop, H=high outlier, L=low outlier
+            char reason = 'D';
+            if (!fp->dcompFrameDropThisCycle) {
+                reason = ((float)measuredOffsetMs < 0.5f) ? 'L' : 'H';
+            }
+            float divergence = fabsf(fp->shadowEmaOffset - fp->lockedOffset);
+            float spread = -1.0f;
+            if (fp->rollingMinCount >= 16) {
+                float bufMin = fp->rollingMinBuffer[0], bufMax = fp->rollingMinBuffer[0];
+                for (int i = 1; i < 16; i++) {
+                    if (fp->rollingMinBuffer[i] < bufMin) bufMin = fp->rollingMinBuffer[i];
+                    if (fp->rollingMinBuffer[i] > bufMax) bufMax = fp->rollingMinBuffer[i];
+                }
+                spread = bufMax - bufMin;
+            }
+            float outDivergence = fp->bufferActive
+                ? fp->lockDivergenceBufferMs : fp->lockDivergenceDirectMs;
+            fprintf(fp->logFile, "%d,%.3f,%.3f,%.3f,%.3f,%c,%.3f,%.3f,%.3f,%d,%.4f,%.4f,%d,%d,%d,%lu,%c\n",
+                    fp->offsetSampleCount,
+                    (float)measuredOffsetMs,
+                    fp->compositionOffsetMs,
+                    fp->shadowEmaOffset,
+                    fp->lockedOffset,
+                    (fp->cadenceLockState == CadenceLockState::Locked) ? 'L' : 'U',
+                    divergence,
+                    outDivergence,
+                    spread,
+                    fp->stableFrameCount,
+                    fp->currentAlpha,
+                    fp->varianceEma,
+                    fp->bufferActive ? 1 : 0,
+                    fp->droppedFrameCount,
+                    fp->dcompDroppedFrames,
+                    fp->lastIdleMs,
+                    reason);
         }
         return;
     }
@@ -785,7 +824,7 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
     // ── CSV log ──
     if (fp->logFile) {
         float divergence = fabsf(fp->shadowEmaOffset - fp->lockedOffset);
-        fprintf(fp->logFile, "%d,%.3f,%.3f,%.3f,%.3f,%c,%.3f,%.3f,%.3f,%d,%.4f,%.4f,%d,%d,%d\n",
+        fprintf(fp->logFile, "%d,%.3f,%.3f,%.3f,%.3f,%c,%.3f,%.3f,%.3f,%d,%.4f,%.4f,%d,%d,%d,%lu,\n",
                 fp->offsetSampleCount,
                 (float)measuredOffsetMs,
                 fp->compositionOffsetMs,
@@ -800,7 +839,8 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
                 fp->varianceEma,
                 fp->bufferActive ? 1 : 0,
                 fp->droppedFrameCount,
-                fp->dcompDroppedFrames);
+                fp->dcompDroppedFrames,
+                fp->lastIdleMs);
     }
 }
 

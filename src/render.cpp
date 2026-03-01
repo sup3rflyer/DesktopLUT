@@ -624,11 +624,13 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
 
     HRESULT hr = ctx->duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
 
-    // Short blocking fallback: catches frames where DD delivery is slightly later than
+    // Blocking fallback: catches frames where DD delivery is slightly later than
     // the pacer's predicted offset (e.g., variable DWM composition time under GPU load).
     // Without this, AcquireNextFrame(0) misses frames that arrive even 0.1ms late,
     // turning a clean 2:2 cadence into irregular 1:3 gaps → visible judder.
-    // Timeout scales with refresh period: 3ms at 48Hz, 2ms at 60Hz, 1ms at 120Hz.
+    // Direct mode: short timeout (period×0.15, cap 3ms) — blocking delays Present.
+    // Buffer mode: longer timeout (period×0.40, cap 10ms) — previous frame already
+    // presented at VBlank, we're filling the buffer for next cycle with no visual cost.
     // NOTE: preAcquireQpc is NOT re-taken on blocking success. The old approach (re-take
     // QPC to measure actual delivery time) created a positive feedback loop: inflated
     // offset measurements pushed the EMA up, causing more blocking fallbacks, causing
@@ -637,7 +639,12 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // provides gentler upward pressure instead.
     bool blockingFallbackUsed = false;
     if (hr == DXGI_ERROR_WAIT_TIMEOUT && fp && fp->strategy != FramePacerStrategy::DwmFlushOnly) {
-        UINT fallbackMs = (UINT)(std::min)(3.0f, fp->refreshPeriodMs * 0.15f);
+        // Buffer mode: previous frame already presented at VBlank, we're filling the buffer
+        // for next cycle. Safe to wait longer — up to 40% of frame period (8.3ms at 48Hz).
+        // Direct mode: keep short — blocking delays Present, missing DWM's sampling window.
+        float fallbackFraction = useFrameBuffer ? 0.40f : 0.15f;
+        float fallbackCap = useFrameBuffer ? 10.0f : 3.0f;
+        UINT fallbackMs = (UINT)(std::min)(fallbackCap, fp->refreshPeriodMs * fallbackFraction);
         if (fallbackMs > 0) {
             hr = ctx->duplication->AcquireNextFrame(fallbackMs, &frameInfo, &desktopResource);
             if (SUCCEEDED(hr)) {
@@ -1267,6 +1274,7 @@ void RenderAll(FramePacer* fp) {
             DWORD idleMs = GetTickCount() - lii.dwTime;
             int idleThreshold = g_frameBufferIdleMs.load(std::memory_order_relaxed);
             frameBufferActive = (idleThreshold == 0) || (idleMs >= (DWORD)idleThreshold);
+            if (fp) fp->lastIdleMs = idleMs;
         }
     }
     // Reset buffer state on transitions
