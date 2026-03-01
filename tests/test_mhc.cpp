@@ -581,17 +581,41 @@ TEST_CASE("FromTRC SDR: linear TRC produces non-identity LUT") {
     }
 }
 
-TEST_CASE("FromTRC HDR: identity TRC produces identity LUT") {
-    // Identity TRC: trc[i] = i/255
+TEST_CASE("FromTRC HDR: PQ-shaped TRC produces identity LUT") {
+    // A perfect PQ display: TRC(s) = PqEOTF(s) * 10000 / peakNits
+    // For such a display, the MHC correction should be identity (no correction needed)
+    float peakNits = 1000.0f;
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) {
+        float pqSignal = (float)i / 255.0f;
+        trc[i] = std::min(PqEOTF(pqSignal) * 10000.0f / peakNits, 1.0f);
+    }
+
+    std::vector<float> lut(64);
+    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
+
+    CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.01));
+    // At display peak PQ signal, output should be at peak
+    float pqPeak = PqOETF(peakNits / 10000.0f);
+    int peakIdx = (int)(pqPeak * 63.0f + 0.5f);
+    CHECK(lut[peakIdx] == doctest::Approx(pqPeak).epsilon(0.03));
+    // Midrange should be near-identity
+    CHECK(lut[16] == doctest::Approx(16.0f / 63.0f).epsilon(0.03));
+}
+
+TEST_CASE("FromTRC HDR: linear TRC applies PQ pre-encoding") {
+    // A linear display (TRC(s)=s) doesn't follow PQ — MHC must pre-encode
+    float peakNits = 1000.0f;
     std::vector<float> trc(256);
     for (int i = 0; i < 256; i++) trc[i] = (float)i / 255.0f;
 
     std::vector<float> lut(64);
-    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64);
+    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
 
+    // For linear TRC, output should be PqEOTF(pqIn)*10000/peak (much darker than identity)
+    // At pqIn=0.5 (index 32): PqEOTF(0.5)*10000/1000 ≈ 0.094 — far below 0.5
+    CHECK(lut[32] < 0.15f);  // Much darker than identity
     CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.01));
-    CHECK(lut[63] == doctest::Approx(1.0f).epsilon(0.01));
-    CHECK(lut[32] == doctest::Approx(32.0f / 63.0f).epsilon(0.02));
 }
 
 // ============================================================================

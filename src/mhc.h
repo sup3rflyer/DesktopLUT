@@ -90,7 +90,7 @@ void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT,
 // Generate MHC2 1D LUT from per-channel TRC (exposed for testing)
 // targetGamma: display calibration target (2.2 default, 2.4 for BT.1886)
 void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, int lutSize, float targetGamma = 2.2f);
-void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize);
+void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize, float peakNits);
 
 // ============================================================================
 // ICC Profile Reading (for Extract feature)

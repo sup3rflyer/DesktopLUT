@@ -532,13 +532,17 @@ void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, i
 }
 
 // Generate MHC2 1D LUT from a measured per-channel TRC curve (HDR / PQ).
-// For HDR, the TRC operates in PQ signal domain.
-void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize) {
+// ICC TRC maps PQ signal (0-1) → linear light (0-1, normalized to display peak).
+// Pipeline: pqIn → PqEOTF (target linear) → scale to display peak → InvertTRC → pqOut
+// For a perfect PQ display: TRC(s) = PqEOTF(s)*10000/peak, so InvertTRC(target) = pqIn → identity.
+void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize, float peakNits) {
     for (int j = 0; j < lutSize; j++) {
         float pqIn = (float)j / (float)(lutSize - 1);
-        // For HDR, assume TRC maps PQ signal → linear (PQ-normalized)
-        // Identity display: TRC(s) = s, so InvertTRC gives s back
-        float pqOut = InvertTRC(trc, pqIn);
+        // Target: ideal PQ response, normalized to display peak
+        float targetLinear = PqEOTF(pqIn) * 10000.0f / peakNits;
+        targetLinear = (std::min)(targetLinear, 1.0f);  // Clip to display capability
+        // Find what PQ signal the display needs to produce this luminance
+        float pqOut = InvertTRC(trc, targetLinear);
         outLUT[j] = std::clamp(pqOut, 0.0f, 1.0f);
     }
 }
@@ -627,9 +631,9 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
         if (params.isHDR) {
             std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, HDR/PQ)" << std::endl;
-            GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR.data(), lutSize);
-            GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG.data(), lutSize);
-            GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB.data(), lutSize);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR.data(), lutSize, params.peakNits);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG.data(), lutSize, params.peakNits);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB.data(), lutSize, params.peakNits);
         } else {
             float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
             std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
