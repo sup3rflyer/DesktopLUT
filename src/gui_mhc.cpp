@@ -1040,6 +1040,16 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     d->settings->grayscale.enabled = true;
                 }
 
+                // Auto-populate peak nits from ICC luminance tag (HDR only)
+                if (d->isHDR && d->hasLoadedICC && d->loadedICC.hasLuminance && d->loadedICC.luminance >= 10.0f) {
+                    d->settings->grayscale.peakNits = d->loadedICC.luminance;
+                    if (d->hwndGsPeak) {
+                        wchar_t buf[16];
+                        swprintf_s(buf, L"%.0f", d->loadedICC.luminance);
+                        SetWindowText(d->hwndGsPeak, buf);
+                    }
+                }
+
                 // Show summary of what was extracted from the file
                 {
                     std::wstring msg = L"Loaded: ";
