@@ -180,16 +180,25 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
                 params.grayscale.enabled = true;
             }
         } else {
-            // ICC: per-channel TRC (characterization curves, need inversion)
-            ICCProfileData icc;
-            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-                params.hasPerChannelTRC = true;
-                params.trcR = icc.trcR;
-                params.trcG = icc.trcG;
-                params.trcB = icc.trcB;
-                params.grayscaleEnabled = true;
-                params.grayscale.enabled = true;
-                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+            // ICC profile: handling depends on HDR vs SDR
+            if (isHDR) {
+                // HDR: SDR ICC TRC describes the display's SDR-mode response (including
+                // calibration target like gamma 2.2, BT.1886, S-curve, etc.) — not the
+                // display's HDR PQ tracking. Cannot extract meaningful grayscale correction.
+                // Primaries matrix is still applied (same physical panel). For HDR grayscale,
+                // user can add manual points or use DisplayCal 3DLUT maker for full correction.
+            } else {
+                // SDR: use per-channel TRC directly (gamma-domain inversion works correctly)
+                ICCProfileData icc;
+                if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+                    params.hasPerChannelTRC = true;
+                    params.trcR = icc.trcR;
+                    params.trcG = icc.trcG;
+                    params.trcB = icc.trcB;
+                    params.grayscaleEnabled = true;
+                    params.grayscale.enabled = true;
+                    params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+                }
             }
         }
         // Peak nits is display metadata, needed regardless of file type
@@ -304,16 +313,25 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
                 params.grayscale.enabled = true;
             }
         } else {
-            // ICC: per-channel TRC (characterization curves, need inversion)
-            ICCProfileData icc;
-            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-                params.hasPerChannelTRC = true;
-                params.trcR = icc.trcR;
-                params.trcG = icc.trcG;
-                params.trcB = icc.trcB;
-                params.grayscaleEnabled = true;
-                params.grayscale.enabled = true;
-                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+            // ICC profile: handling depends on HDR vs SDR
+            if (isHDR) {
+                // HDR: SDR ICC TRC describes the display's SDR-mode response (including
+                // calibration target like gamma 2.2, BT.1886, S-curve, etc.) — not the
+                // display's HDR PQ tracking. Cannot extract meaningful grayscale correction.
+                // Primaries matrix is still applied (same physical panel). For HDR grayscale,
+                // user can add manual points or use DisplayCal 3DLUT maker for full correction.
+            } else {
+                // SDR: use per-channel TRC directly (gamma-domain inversion works correctly)
+                ICCProfileData icc;
+                if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+                    params.hasPerChannelTRC = true;
+                    params.trcR = icc.trcR;
+                    params.trcG = icc.trcG;
+                    params.trcB = icc.trcB;
+                    params.grayscaleEnabled = true;
+                    params.grayscale.enabled = true;
+                    params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+                }
             }
         }
         // Peak nits is display metadata, needed regardless of file type
@@ -1026,6 +1044,16 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     MhcUpdatePrimariesFields(d);
                 }
 
+                // Auto-populate peak nits from ICC luminance tag (HDR only)
+                if (d->isHDR && d->hasLoadedICC && d->loadedICC.hasLuminance && d->loadedICC.luminance >= 10.0f) {
+                    d->settings->grayscale.peakNits = d->loadedICC.luminance;
+                    if (d->hwndGsPeak) {
+                        wchar_t buf[16];
+                        swprintf_s(buf, L"%.0f", d->loadedICC.luminance);
+                        SetWindowText(d->hwndGsPeak, buf);
+                    }
+                }
+
                 // Auto-populate grayscale from loaded file
                 // 1D cube: per-channel correction used directly (no grayscale extraction needed)
                 // ICC: per-channel TRC extracted
@@ -1038,16 +1066,6 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
                 if (gsExtracted) {
                     d->settings->grayscale.enabled = true;
-                }
-
-                // Auto-populate peak nits from ICC luminance tag (HDR only)
-                if (d->isHDR && d->hasLoadedICC && d->loadedICC.hasLuminance && d->loadedICC.luminance >= 10.0f) {
-                    d->settings->grayscale.peakNits = d->loadedICC.luminance;
-                    if (d->hwndGsPeak) {
-                        wchar_t buf[16];
-                        swprintf_s(buf, L"%.0f", d->loadedICC.luminance);
-                        SetWindowText(d->hwndGsPeak, buf);
-                    }
                 }
 
                 // Show summary of what was extracted from the file

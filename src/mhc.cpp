@@ -630,10 +630,12 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
         // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
         if (params.isHDR) {
-            std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, HDR/PQ)" << std::endl;
-            GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR.data(), lutSize, params.peakNits);
-            GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG.data(), lutSize, params.peakNits);
-            GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB.data(), lutSize, params.peakNits);
+            // SDR ICC TRC is gamma-domain (signal -> luminance), not PQ-domain.
+            // Cannot accurately correct HDR grayscale from SDR measurements — the display's
+            // PQ tracking, tone mapping, and local dimming differ entirely from SDR mode.
+            // Use identity LUT; primaries matrix still corrects gamut. User can add manual
+            // grayscale points measured in HDR mode for grayscale correction.
+            std::cout << "MHC2: ICC TRC is SDR gamma-domain, skipping for HDR (identity LUT)" << std::endl;
         } else {
             float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
             std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
@@ -650,11 +652,11 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     }
 
     // Build ICC colorants (D50-adapted)
-    // SDR: Always use sRGB colorants so Windows classifies as "SDR Profile".
-    //      The MHC2 matrix handles the actual correction independently.
-    // HDR: Use display native primaries (or BT.2020) for proper HDR classification.
+    // Always use wire-format primaries (sRGB for SDR, BT.2020 for HDR) so the profile's
+    // ICC tags match what Windows assumes for the wire format. The MHC2 matrix handles
+    // the actual gamut correction independently, just like SDR.
     const DisplayPrimariesData& iccPrimaries = params.isHDR
-        ? (params.primariesEnabled ? params.displayPrimaries : g_bt2020Primaries)
+        ? g_bt2020Primaries
         : g_srgbPrimaries;
     float displayRGBtoXYZ[9];
     if (!BuildRGBtoXYZ(iccPrimaries, displayRGBtoXYZ)) {
@@ -1359,22 +1361,15 @@ bool ExtractGrayscaleFromICC(const ICCProfileData& icc, GrayscaleSettings& outGr
     outGrayscale.points.resize(N);
 
     if (isHDR) {
-        // HDR: evenly-spaced PQ points
-        // ICC TRC is input-to-output in linear space; map to PQ deviation
-        // For simplicity, treat ICC TRC as gamma correction and convert to PQ deviation
-        for (int i = 0; i < N; i++) {
-            float t = (float)i / (float)(N - 1);  // Input PQ value
-            // Sample ICC curve at this position (linear interpolation)
-            float idx = t * (float)(curveLen - 1);
-            int i0 = (int)idx;
-            int i1 = (std::min)(i0 + 1, (int)curveLen - 1);
-            float frac = idx - floorf(idx);
-            float iccVal = avgCurve[i0] + (avgCurve[i1] - avgCurve[i0]) * frac;
-            // In PQ space, the output should equal the input for identity
-            // ICC curve maps signal -> linear, so deviation = iccVal / expected
-            outGrayscale.points[i] = iccVal;
-        }
-        outGrayscale.enabled = true;
+        // HDR: SDR ICC TRC cannot provide meaningful HDR grayscale correction.
+        // The TRC describes the display's SDR-mode response (which includes the calibration
+        // target — gamma 2.2, BT.1886, S-curve, etc.), not the display's HDR PQ tracking.
+        // HDR uses a completely different signal domain (PQ) with different panel behavior
+        // (tone mapping, local dimming, ABL). Primaries transfer (same physical panel) but
+        // grayscale does not. For HDR grayscale correction, use measurements taken in HDR mode.
+        // For full volumetric correction from SDR ICC, use DisplayCal's 3DLUT maker to generate
+        // a PQ BT.2020 .cube file and load it in the 3D LUT tab.
+        return false;  // No grayscale extracted for HDR
     } else {
         // SDR: sqrt-distribution points
         // ICC TRC: input signal -> linear light output

@@ -667,7 +667,9 @@ TEST_CASE("ExtractGrayscaleFromICC: identity TRC SDR") {
     }
 }
 
-TEST_CASE("ExtractGrayscaleFromICC: identity TRC HDR") {
+TEST_CASE("ExtractGrayscaleFromICC: HDR returns false (SDR TRC not applicable)") {
+    // SDR ICC TRC describes the display's SDR-mode response (including calibration target),
+    // not the display's HDR PQ tracking. Extraction correctly returns false for HDR.
     ICCProfileData icc;
     icc.hasTRC = true;
     icc.trcR.resize(256);
@@ -683,12 +685,8 @@ TEST_CASE("ExtractGrayscaleFromICC: identity TRC HDR") {
     GrayscaleSettings gs;
     gs.pointCount = 20;
     bool ok = ExtractGrayscaleFromICC(icc, gs, true);
-    CHECK(ok);
-    CHECK(gs.enabled);
-    REQUIRE(gs.points.size() == 20);
-    // Identity TRC: endpoints should be 0 and 1
-    CHECK(gs.points[0] == doctest::Approx(0.0f).epsilon(0.01));
-    CHECK(gs.points[19] == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK_FALSE(ok);
+    CHECK_FALSE(gs.enabled);
 }
 
 // ============================================================================
