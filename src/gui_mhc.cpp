@@ -179,26 +179,20 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
                 params.grayscaleEnabled = true;
                 params.grayscale.enabled = true;
             }
-        } else {
-            // ICC profile: handling depends on HDR vs SDR
-            if (isHDR) {
-                // HDR: SDR ICC TRC describes the display's SDR-mode response (including
-                // calibration target like gamma 2.2, BT.1886, S-curve, etc.) — not the
-                // display's HDR PQ tracking. Cannot extract meaningful grayscale correction.
-                // Primaries matrix is still applied (same physical panel). For HDR grayscale,
-                // user can add manual points or use DisplayCal 3DLUT maker for full correction.
-            } else {
-                // SDR: use per-channel TRC directly (gamma-domain inversion works correctly)
-                ICCProfileData icc;
-                if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-                    params.hasPerChannelTRC = true;
-                    params.trcR = icc.trcR;
-                    params.trcG = icc.trcG;
-                    params.trcB = icc.trcB;
-                    params.grayscaleEnabled = true;
-                    params.grayscale.enabled = true;
-                    params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-                }
+        } else if (!isHDR) {
+            // SDR ICC profile: use per-channel TRC for correction (shape reliable per research)
+            // TRC inverted against target gamma (2.2/2.4)
+            // HDR ICC TRC disabled: DisplayCal's sparse measurements + curve fitting produce
+            // shadow corrections 10-20x too aggressive vs ColourSpace ground truth
+            ICCProfileData icc;
+            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+                params.hasPerChannelTRC = true;
+                params.trcR = icc.trcR;
+                params.trcG = icc.trcG;
+                params.trcB = icc.trcB;
+                params.grayscaleEnabled = true;
+                params.grayscale.enabled = true;
+                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
             }
         }
         // Peak nits is display metadata, needed regardless of file type
@@ -312,26 +306,18 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
                 params.grayscaleEnabled = true;
                 params.grayscale.enabled = true;
             }
-        } else {
-            // ICC profile: handling depends on HDR vs SDR
-            if (isHDR) {
-                // HDR: SDR ICC TRC describes the display's SDR-mode response (including
-                // calibration target like gamma 2.2, BT.1886, S-curve, etc.) — not the
-                // display's HDR PQ tracking. Cannot extract meaningful grayscale correction.
-                // Primaries matrix is still applied (same physical panel). For HDR grayscale,
-                // user can add manual points or use DisplayCal 3DLUT maker for full correction.
-            } else {
-                // SDR: use per-channel TRC directly (gamma-domain inversion works correctly)
-                ICCProfileData icc;
-                if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-                    params.hasPerChannelTRC = true;
-                    params.trcR = icc.trcR;
-                    params.trcG = icc.trcG;
-                    params.trcB = icc.trcB;
-                    params.grayscaleEnabled = true;
-                    params.grayscale.enabled = true;
-                    params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-                }
+        } else if (!isHDR) {
+            // SDR ICC profile: use per-channel TRC for correction (shape reliable per research)
+            // TRC inverted against target gamma (2.2/2.4)
+            ICCProfileData icc;
+            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+                params.hasPerChannelTRC = true;
+                params.trcR = icc.trcR;
+                params.trcG = icc.trcG;
+                params.trcB = icc.trcB;
+                params.grayscaleEnabled = true;
+                params.grayscale.enabled = true;
+                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
             }
         }
         // Peak nits is display metadata, needed regardless of file type
@@ -476,6 +462,12 @@ void ApplyPrimariesChange(bool isHDR) {
     // Just trigger the live update with current stored values
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
+    } else {
+        auto& cc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection
+                         : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
+        if (cc.primariesEnabled) {
+            StartProcessing();
+        }
     }
     UpdateGUIState();
 }
@@ -710,7 +702,9 @@ static void MhcUpdatePrimariesFields(MhcDialogData* d) {
     EnableWindow(d->hwndRx, editable); EnableWindow(d->hwndRy, editable);
     EnableWindow(d->hwndGx, editable); EnableWindow(d->hwndGy, editable);
     EnableWindow(d->hwndBx, editable); EnableWindow(d->hwndBy, editable);
-    EnableWindow(d->hwndWx, editable); EnableWindow(d->hwndWy, editable);
+    // White point stays editable when file provides primaries — user may want to
+    // override ICC white (which is always D65 for D65-adapted profiles) with actual measured white
+    EnableWindow(d->hwndWx, isCustom); EnableWindow(d->hwndWy, isCustom);
 
     wchar_t buf[16];
     float Rx, Ry, Gx, Gy, Bx, By, Wx, Wy;
@@ -770,7 +764,8 @@ static void MhcSetFileLoadedState(MhcDialogData* d, bool loaded) {
 
     // Determine what the file provides
     bool filePrimaries = loaded && d->hasLoadedICC && d->loadedICC.hasPrimaries;
-    bool fileTRC = loaded && (d->loadedFileIs1DCube || (d->hasLoadedICC && d->loadedICC.hasTRC));
+    // HDR ICC: TRC not used (sparse measurements produce 10-20x over-correction in shadows)
+    bool fileTRC = loaded && (d->loadedFileIs1DCube || (d->hasLoadedICC && d->loadedICC.hasTRC && !d->isHDR));
 
     BOOL primEnable = filePrimaries ? FALSE : TRUE;
     BOOL gsEnable = fileTRC ? FALSE : TRUE;
@@ -800,7 +795,8 @@ static void MhcPushLivePreview(MhcDialogData* d) {
 
     // When a file is loaded, determine what it provides
     bool filePrimaries = d->fileLoaded && d->hasLoadedICC && d->loadedICC.hasPrimaries;
-    bool fileGrayscale = d->fileLoaded && (d->loadedFileIs1DCube || (d->hasLoadedICC && d->loadedICC.hasTRC));
+    // HDR ICC: TRC not used (DisplayCal sparse measurements produce 10-20x over-correction in shadows)
+    bool fileGrayscale = d->fileLoaded && (d->loadedFileIs1DCube || (d->hasLoadedICC && d->loadedICC.hasTRC && !d->isHDR));
 
     // Skip preview entirely when file provides both primaries and grayscale (all controls locked)
     if (filePrimaries && fileGrayscale) return;
@@ -1007,6 +1003,21 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                 L"Unsupported Profile", MB_OK | MB_ICONWARNING);
                             return 0;
                         }
+                        // Reject LUT-based profiles — their rTRC/gTRC/bTRC are approximate
+                        // fallback curves with divergent per-channel gammas that produce severe
+                        // color shifts when used for 1D correction. Only Curves+Matrix profiles
+                        // have authoritative per-channel TRC data.
+                        if (d->loadedICC.isLUTBased) {
+                            SetWindowText(d->hwndFilePath, L"");
+                            d->loadedFilePath.clear();
+                            MessageBox(hwnd,
+                                L"This is a LUT-based ICC profile. Its transfer curves are approximate "
+                                L"fallbacks, not suitable for MHC correction.\n\n"
+                                L"MHC profiles require a Curves+Matrix profile type.\n"
+                                L"In DisplayCal, set profile type to \"Curves + matrix\".",
+                                L"Unsupported Profile Type", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
                         d->hasLoadedICC = true;
                     } else {
                         SetWindowText(d->hwndFilePath, L"");
@@ -1045,7 +1056,8 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
 
                 // Auto-populate peak nits from ICC luminance tag (HDR only)
-                if (d->isHDR && d->hasLoadedICC && d->loadedICC.hasLuminance && d->loadedICC.luminance >= 10.0f) {
+                if (d->isHDR && d->hasLoadedICC && d->loadedICC.hasLuminance &&
+                    d->loadedICC.luminance >= 10.0f) {
                     d->settings->grayscale.peakNits = d->loadedICC.luminance;
                     if (d->hwndGsPeak) {
                         wchar_t buf[16];
@@ -1088,7 +1100,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                             msg += L"\n  Description: " + d->loadedICC.description;
                         if (d->loadedICC.hasPrimaries)
                             msg += L"\n  Primaries (R/G/B/W chromaticity)";
-                        if (d->loadedICC.hasTRC) {
+                        if (d->loadedICC.hasTRC && !d->isHDR) {
                             if (d->loadedICC.hasGamma) {
                                 wchar_t buf[64];
                                 swprintf_s(buf, L"\n  TRC R/G/B (gamma %.2f)", d->loadedICC.gamma);
@@ -1105,6 +1117,8 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                             swprintf_s(buf, L"\n  Luminance: %.0f cd/m\u00B2", d->loadedICC.luminance);
                             msg += buf;
                         }
+                        if (d->isHDR)
+                            msg += L"\n\nNote: ICC grayscale (TRC) not used for HDR.\nUse a 1D cube for HDR grayscale correction.";
                     }
                     MessageBox(hwnd, msg.c_str(), L"File Import", MB_OK | MB_ICONINFORMATION);
                 }

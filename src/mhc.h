@@ -106,6 +106,7 @@ struct ICCProfileData {
     bool hasGamma = false;
     float luminance = 0.0f;               // Peak luminance from 'lumi' tag (cd/m²)
     bool hasLuminance = false;
+    bool isLUTBased = false;              // Has A2B0/B2A0 tags (LUT-based profile, TRC is approximate fallback)
     std::wstring description;
 };
 

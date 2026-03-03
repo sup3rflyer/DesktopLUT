@@ -1269,6 +1269,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_desktopGammaMode.store(checked);
                 }
                 SaveSettings();
+                if (!g_gui.isRunning && checked) {
+                    StartProcessing();
+                }
             }
             return 0;
         case ID_GAMMA_WHITELIST_BTN:
@@ -1334,6 +1337,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 gs.enabled = (SendMessage(hwndEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
+                } else if (gs.enabled) {
+                    StartProcessing();
                 }
                 SaveSettings();
                 UpdateGUIState();
@@ -1395,10 +1400,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case ID_CORR_GRAYSCALE_24:  // SDR only: 2.2->2.4 gamma checkbox
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale.use24Gamma =
-                    (SendMessage(g_gui.hwndGrayscale24, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                bool use24 = (SendMessage(g_gui.hwndGrayscale24, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection.grayscale.use24Gamma = use24;
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, false);
+                } else if (use24) {
+                    StartProcessing();
                 }
                 UpdateGUIState();
             }
@@ -1428,6 +1435,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.enabled = enabled;
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+                } else if (enabled) {
+                    StartProcessing();
                 }
                 SaveSettings();
                 UpdateGUIState();

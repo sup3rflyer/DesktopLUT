@@ -533,16 +533,26 @@ void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, i
 
 // Generate MHC2 1D LUT from a measured per-channel TRC curve (HDR / PQ).
 // ICC TRC maps PQ signal (0-1) → linear light (0-1, normalized to display peak).
-// Pipeline: pqIn → PqEOTF (target linear) → scale to display peak → InvertTRC → pqOut
+// Pipeline: pqIn → PqEOTF (target linear) → BPC → InvertTRC → pqOut
 // For a perfect PQ display: TRC(s) = PqEOTF(s)*10000/peak, so InvertTRC(target) = pqIn → identity.
+//
+// Black point compensation (BPC): The display's black level (TRC[0]) may be above the target
+// luminance for low PQ values. Without BPC, everything below the display's black floor maps to 0,
+// crushing shadow detail. BPC linearly remaps the target range from (0, 1) to (blackLevel, 1),
+// preserving relative shadow detail while accepting the display's actual minimum luminance.
 void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize, float peakNits) {
+    float blackLevel = (!trc.empty()) ? trc[0] : 0.0f;  // Display's minimum luminance (normalized)
+
     for (int j = 0; j < lutSize; j++) {
         float pqIn = (float)j / (float)(lutSize - 1);
         // Target: ideal PQ response, normalized to display peak
         float targetLinear = PqEOTF(pqIn) * 10000.0f / peakNits;
         targetLinear = (std::min)(targetLinear, 1.0f);  // Clip to display capability
+        // Black point compensation: remap (0, 1) → (blackLevel, 1)
+        // PQ 0% → display's actual black; PQ at peak → display's peak; shadow detail preserved
+        float bpcTarget = blackLevel + targetLinear * (1.0f - blackLevel);
         // Find what PQ signal the display needs to produce this luminance
-        float pqOut = InvertTRC(trc, targetLinear);
+        float pqOut = InvertTRC(trc, bpcTarget);
         outLUT[j] = std::clamp(pqOut, 0.0f, 1.0f);
     }
 }
@@ -629,13 +639,17 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         resampleCurve(params.corrB, lutB.data(), lutSize);
     } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
         // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
+        // Note: TRC may not reach 1.0 on all channels (e.g. Curves+Matrix HDR profiles where
+        // per-channel peaks differ). This is valid data — InvertTRC handles it by clamping.
+        // LUT-based profiles with garbage fallback TRC are rejected at import time in gui_mhc.cpp.
         if (params.isHDR) {
-            // SDR ICC TRC is gamma-domain (signal -> luminance), not PQ-domain.
-            // Cannot accurately correct HDR grayscale from SDR measurements — the display's
-            // PQ tracking, tone mapping, and local dimming differ entirely from SDR mode.
-            // Use identity LUT; primaries matrix still corrects gamut. User can add manual
-            // grayscale points measured in HDR mode for grayscale correction.
-            std::cout << "MHC2: ICC TRC is SDR gamma-domain, skipping for HDR (identity LUT)" << std::endl;
+            // ICC TRC from HDR-mode profiling (e.g. DisplayCal with PQ pattern generator like
+            // Dogegen/Resolve): TRC maps PQ signal → measured linear light (normalized to peak).
+            // Use per-channel PQ correction to fix the display's PQ tracking errors.
+            std::cout << "MHC2: Using per-channel TRC for HDR PQ correction (" << params.trcR.size() << " points, peak " << params.peakNits << " nits)" << std::endl;
+            GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR.data(), lutSize, params.peakNits);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG.data(), lutSize, params.peakNits);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB.data(), lutSize, params.peakNits);
         } else {
             float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
             std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
@@ -1208,6 +1222,11 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
         }
     }
 
+    // Detect LUT-based profiles (A2B0 or B2A0 tags present)
+    // LUT-based profiles have approximate fallback TRCs that are unsuitable for 1D correction
+    if (findTag(MakeSig("A2B0")) || findTag(MakeSig("B2A0")))
+        outData.isLUTBased = true;
+
     // Read rTRC/gTRC/bTRC tags -> extract transfer curves
     auto readCurvTag = [&](uint32_t sig, std::vector<float>& outCurve, float& outGamma) -> bool {
         auto* tag = findTag(sig);
@@ -1302,6 +1321,24 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
             outData.gamma = (gammaR + gammaG + gammaB) / 3.0f;
             outData.hasGamma = true;
         }
+
+        // Normalize each TRC channel to reach 1.0 at full signal.
+        // In Curves+Matrix profiles (especially HDR), per-channel TRC maxes can differ
+        // (e.g. bTRC[max]=0.72 on wide-gamut displays). Without normalization, the 1D LUT
+        // correction compensates for the absolute channel imbalance (boosting blue) — but
+        // that's the matrix's job. The 1D LUT should only correct the transfer function SHAPE
+        // (PQ tracking / gamma linearity). Normalizing ensures clean separation.
+        auto normalizeTRC = [](std::vector<float>& trc) {
+            if (trc.empty()) return;
+            float trcMax = trc.back();
+            if (trcMax > 0.0f && trcMax < 0.999f) {
+                float invMax = 1.0f / trcMax;
+                for (auto& v : trc) v = std::clamp(v * invMax, 0.0f, 1.0f);
+            }
+        };
+        normalizeTRC(outData.trcR);
+        normalizeTRC(outData.trcG);
+        normalizeTRC(outData.trcB);
     }
 
     // Read description tag

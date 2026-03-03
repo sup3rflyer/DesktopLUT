@@ -492,7 +492,7 @@ void LoadSettings() {
     std::wstring iniPath = GetIniPath();
 
     // Load general settings
-    bool desktopGamma = GetPrivateProfileBool(L"General", L"DesktopGamma", true, iniPath.c_str());
+    bool desktopGamma = GetPrivateProfileBool(L"General", L"DesktopGamma", false, iniPath.c_str());
     g_userDesktopGammaMode.store(desktopGamma);
     g_desktopGammaMode.store(desktopGamma);  // Effective starts at user preference
     g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", false, iniPath.c_str()));

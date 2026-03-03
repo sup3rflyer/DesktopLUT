@@ -37,7 +37,7 @@ std::vector<MonitorContext> g_monitors;
 // Atomic Control Flags
 // ============================================================================
 
-std::atomic<bool> g_desktopGammaMode{ true };   // Effective gamma state (may be overridden by whitelist)
+std::atomic<bool> g_desktopGammaMode{ false };   // Effective gamma state (may be overridden by whitelist)
 std::atomic<bool> g_tetrahedralInterp{ false };  // Default: trilinear (tetrahedral opt-in for quality)
 std::atomic<bool> g_running{ true };            // Main loop control
 std::atomic<bool> g_forceReinit{ false };       // Force reinit on next frame
@@ -72,7 +72,7 @@ std::atomic<bool> g_startMinimized{ false };       // Start minimized to tray
 // Gamma Whitelist
 // ============================================================================
 
-std::atomic<bool> g_userDesktopGammaMode{ true };      // User's preference (checkbox state)
+std::atomic<bool> g_userDesktopGammaMode{ false };      // User's preference (checkbox state)
 std::vector<std::wstring> g_gammaWhitelist;            // Parsed exe names (lowercase)
 std::wstring g_gammaWhitelistRaw;                      // Raw comma-separated string
 std::atomic<bool> g_gammaWhitelistActive{ false };     // A whitelisted process is running
