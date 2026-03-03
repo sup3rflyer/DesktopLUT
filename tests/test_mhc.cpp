@@ -816,6 +816,337 @@ TEST_CASE("HDR LUT: monotonicity") {
 // 1D Cube Loading
 // ============================================================================
 
+// ============================================================================
+// Black Point Compensation (HDR TRC)
+// ============================================================================
+
+TEST_CASE("FromTRC HDR BPC: raised black floor preserves shadow detail") {
+    // Display with 5% black floor: trc[0] = 0.05 (non-zero minimum luminance)
+    // Without BPC, everything below the display's floor maps to 0 (shadow crushing)
+    // With BPC, PQ 0% maps to the display's actual black level instead
+    float peakNits = 1000.0f;
+    int N = 256;
+    std::vector<float> trc(N);
+    float blackFloor = 0.05f;
+    for (int i = 0; i < N; i++) {
+        float t = (float)i / (float)(N - 1);
+        // Perfect PQ display with raised black: linear output from blackFloor to 1.0
+        trc[i] = blackFloor + t * (1.0f - blackFloor);
+        trc[i] = std::min(PqEOTF(t) * 10000.0f / peakNits, 1.0f);
+        // Shift up by black floor
+        trc[i] = blackFloor + trc[i] * (1.0f - blackFloor);
+    }
+
+    std::vector<float> lut(64);
+    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
+
+    // At pqIn=0: BPC maps target 0 → blackFloor, InvertTRC finds signal for blackFloor
+    // The output should be near 0 (the signal that produces the display's minimum)
+    CHECK(lut[0] >= 0.0f);
+    CHECK(lut[0] < 0.05f);  // Should be very low signal
+
+    // Monotonicity preserved
+    for (int i = 1; i < 64; i++) {
+        CHECK(lut[i] >= lut[i - 1]);
+    }
+}
+
+TEST_CASE("FromTRC HDR BPC: zero black level matches no-BPC behavior") {
+    // When trc[0] ≈ 0, BPC formula becomes: bpcTarget = 0 + targetLinear * 1.0 = targetLinear
+    // This is identical to the pre-BPC behavior (identity remap)
+    float peakNits = 1000.0f;
+    int N = 256;
+    std::vector<float> trc(N);
+    for (int i = 0; i < N; i++) {
+        float pq = (float)i / (float)(N - 1);
+        trc[i] = std::min(PqEOTF(pq) * 10000.0f / peakNits, 1.0f);
+    }
+    CHECK(trc[0] == doctest::Approx(0.0f).epsilon(1e-6));
+
+    std::vector<float> lut(64);
+    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
+
+    // Should produce near-identity (perfect PQ display, no BPC effect)
+    CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.01));
+    CHECK(lut[16] == doctest::Approx(16.0f / 63.0f).epsilon(0.03));
+}
+
+TEST_CASE("FromTRC HDR BPC: formula correctness at extremes") {
+    // Verify BPC formula: bpcTarget = blackLevel + targetLinear * (1 - blackLevel)
+    // At targetLinear=0 → bpcTarget=blackLevel; at targetLinear=1 → bpcTarget=1
+    float peakNits = 500.0f;
+    float blackFloor = 0.10f;
+    int N = 256;
+    std::vector<float> trc(N);
+    trc[0] = blackFloor;
+    for (int i = 1; i < N; i++) {
+        trc[i] = blackFloor + ((float)i / (float)(N - 1)) * (1.0f - blackFloor);
+    }
+
+    std::vector<float> lut(64);
+    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
+
+    // At pqIn=0, targetLinear=0, bpcTarget=0.10
+    // InvertTRC(trc, 0.10) should find index 0 (trc[0]=0.10) → signal ≈ 0.0
+    CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.02));
+
+    // Above peak: targetLinear clamped to 1.0, bpcTarget=1.0
+    // InvertTRC(trc, 1.0) should return signal ≈ 1.0
+    CHECK(lut[63] == doctest::Approx(1.0f).epsilon(0.02));
+}
+
+// ============================================================================
+// HDR Per-Channel TRC Profile Generation
+// ============================================================================
+
+TEST_CASE("GenerateMHC2Profile: per-channel HDR TRC generates valid profile") {
+    MHC2ProfileParams params;
+    params.monitorName = L"TestHDR_TRC";
+    params.displayPrimaries = kBT2020;
+    params.primariesEnabled = true;
+    params.isHDR = true;
+    params.peakNits = 1000.0f;
+    params.hasPerChannelTRC = true;
+
+    // Create slightly different TRC per channel (simulating per-channel PQ tracking errors)
+    int N = 256;
+    params.trcR.resize(N);
+    params.trcG.resize(N);
+    params.trcB.resize(N);
+    for (int i = 0; i < N; i++) {
+        float pq = (float)i / (float)(N - 1);
+        float base = std::min(PqEOTF(pq) * 10000.0f / 1000.0f, 1.0f);
+        params.trcR[i] = base * 0.98f;  // Red slightly dim
+        params.trcG[i] = base;           // Green perfect
+        params.trcB[i] = base * 0.95f;  // Blue more dim
+    }
+    params.grayscaleEnabled = true;
+    params.grayscale.enabled = true;
+
+    std::vector<uint8_t> data;
+    REQUIRE(GenerateMHC2Profile(params, data));
+    CHECK(data.size() > 132);
+
+    // Write and read back to verify validity
+    TempFile tmp(L"_test_hdr_trc_profile.icm");
+    {
+        std::ofstream f(tmp.path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+    ICCProfileData icc;
+    REQUIRE(ReadICCProfile(tmp.path, icc));
+    CHECK(icc.hasTRC);
+}
+
+TEST_CASE("GenerateMHC2Profile: per-channel TRC takes precedence over grayscale") {
+    // When both hasPerChannelTRC and grayscaleEnabled are set,
+    // the per-channel TRC path should execute (params.hasPrecomputedCorrection check first,
+    // then hasPerChannelTRC, then grayscale fallback)
+    MHC2ProfileParams paramsWithTRC;
+    paramsWithTRC.monitorName = L"TestTRC";
+    paramsWithTRC.displayPrimaries = kBT2020;
+    paramsWithTRC.primariesEnabled = false;
+    paramsWithTRC.isHDR = true;
+    paramsWithTRC.peakNits = 1000.0f;
+    paramsWithTRC.hasPerChannelTRC = true;
+    // Linear TRC (very different from PQ — will produce non-identity LUT)
+    paramsWithTRC.trcR.resize(256);
+    paramsWithTRC.trcG.resize(256);
+    paramsWithTRC.trcB.resize(256);
+    for (int i = 0; i < 256; i++) {
+        float v = (float)i / 255.0f;
+        paramsWithTRC.trcR[i] = v;
+        paramsWithTRC.trcG[i] = v;
+        paramsWithTRC.trcB[i] = v;
+    }
+    paramsWithTRC.grayscaleEnabled = true;
+    paramsWithTRC.grayscale.enabled = true;
+    paramsWithTRC.grayscale.pointCount = 20;
+    paramsWithTRC.grayscale.initLinearPQ();
+
+    MHC2ProfileParams paramsGSOnly;
+    paramsGSOnly.monitorName = L"TestGS";
+    paramsGSOnly.displayPrimaries = kBT2020;
+    paramsGSOnly.primariesEnabled = false;
+    paramsGSOnly.isHDR = true;
+    paramsGSOnly.peakNits = 1000.0f;
+    paramsGSOnly.hasPerChannelTRC = false;
+    paramsGSOnly.grayscaleEnabled = true;
+    paramsGSOnly.grayscale.enabled = true;
+    paramsGSOnly.grayscale.pointCount = 20;
+    paramsGSOnly.grayscale.initLinearPQ();
+
+    std::vector<uint8_t> dataTRC, dataGS;
+    REQUIRE(GenerateMHC2Profile(paramsWithTRC, dataTRC));
+    REQUIRE(GenerateMHC2Profile(paramsGSOnly, dataGS));
+
+    // The profiles should differ in their LUT data (TRC path vs grayscale path)
+    CHECK(dataTRC != dataGS);
+}
+
+// ============================================================================
+// TRC Normalization & isLUTBased Detection
+// ============================================================================
+
+// Helper: build a minimal synthetic ICC file for testing ReadICCProfile behavior.
+// Creates a valid ICC with rTRC/gTRC/bTRC curv tags (tabular) and optional A2B0 tag.
+static std::vector<uint8_t> BuildSyntheticICC(
+    const std::vector<uint16_t>& trcR,
+    const std::vector<uint16_t>& trcG,
+    const std::vector<uint16_t>& trcB,
+    bool includeA2B0 = false)
+{
+    // Each curv tag: 4 (type) + 4 (reserved) + 4 (count) + count*2 (data)
+    auto curvSize = [](size_t count) -> uint32_t { return 12 + (uint32_t)count * 2; };
+    uint32_t rSize = curvSize(trcR.size());
+    uint32_t gSize = curvSize(trcG.size());
+    uint32_t bSize = curvSize(trcB.size());
+
+    uint32_t tagCount = 3 + (includeA2B0 ? 1 : 0);
+    uint32_t tagTableSize = 4 + tagCount * 12;
+    uint32_t dataStart = 128 + tagTableSize;
+
+    // Pad each tag to 4-byte boundary
+    auto pad4 = [](uint32_t v) -> uint32_t { return (v + 3) & ~3u; };
+    uint32_t rOff = dataStart;
+    uint32_t gOff = rOff + pad4(rSize);
+    uint32_t bOff = gOff + pad4(gSize);
+    uint32_t a2b0Off = bOff + pad4(bSize);
+    uint32_t a2b0Size = 16;  // Minimal dummy tag
+    uint32_t profileSize = includeA2B0 ? (a2b0Off + pad4(a2b0Size)) : (bOff + pad4(bSize));
+
+    std::vector<uint8_t> data(profileSize, 0);
+    auto writeBE32 = [&](size_t off, uint32_t v) {
+        data[off] = (uint8_t)(v >> 24); data[off+1] = (uint8_t)(v >> 16);
+        data[off+2] = (uint8_t)(v >> 8); data[off+3] = (uint8_t)v;
+    };
+    auto writeBE16 = [&](size_t off, uint16_t v) {
+        data[off] = (uint8_t)(v >> 8); data[off+1] = (uint8_t)v;
+    };
+    auto writeSig = [&](size_t off, const char* s) {
+        data[off] = s[0]; data[off+1] = s[1]; data[off+2] = s[2]; data[off+3] = s[3];
+    };
+
+    // Header
+    writeBE32(0, profileSize);      // Profile size
+    writeSig(36, "acsp");           // ICC signature
+
+    // Tag table
+    writeBE32(128, tagCount);
+    size_t t = 132;
+    writeSig(t, "rTRC"); writeBE32(t+4, rOff); writeBE32(t+8, rSize); t += 12;
+    writeSig(t, "gTRC"); writeBE32(t+4, gOff); writeBE32(t+8, gSize); t += 12;
+    writeSig(t, "bTRC"); writeBE32(t+4, bOff); writeBE32(t+8, bSize); t += 12;
+    if (includeA2B0) {
+        writeSig(t, "A2B0"); writeBE32(t+4, a2b0Off); writeBE32(t+8, a2b0Size); t += 12;
+    }
+
+    // Write curv tags
+    auto writeCurv = [&](uint32_t off, const std::vector<uint16_t>& vals) {
+        writeSig(off, "curv");                    // Type signature
+        writeBE32(off + 4, 0);                    // Reserved
+        writeBE32(off + 8, (uint32_t)vals.size()); // Count
+        for (size_t i = 0; i < vals.size(); i++) {
+            writeBE16(off + 12 + i * 2, vals[i]);
+        }
+    };
+    writeCurv(rOff, trcR);
+    writeCurv(gOff, trcG);
+    writeCurv(bOff, trcB);
+
+    return data;
+}
+
+TEST_CASE("ICC: TRC normalization scales channels to reach 1.0") {
+    // Build synthetic ICC with TRC maxes: R=0.90, G=0.85, B=0.72
+    int N = 64;
+    std::vector<uint16_t> r(N), g(N), b(N);
+    for (int i = 0; i < N; i++) {
+        float t = (float)i / (float)(N - 1);
+        r[i] = (uint16_t)(t * 0.90f * 65535.0f + 0.5f);
+        g[i] = (uint16_t)(t * 0.85f * 65535.0f + 0.5f);
+        b[i] = (uint16_t)(t * 0.72f * 65535.0f + 0.5f);
+    }
+
+    auto data = BuildSyntheticICC(r, g, b);
+    TempFile tmp(L"_test_trc_norm.icm");
+    { std::ofstream f(tmp.path, std::ios::binary); f.write((const char*)data.data(), data.size()); }
+
+    ICCProfileData icc;
+    REQUIRE(ReadICCProfile(tmp.path, icc));
+    CHECK(icc.hasTRC);
+
+    // After normalization, all channels should reach 1.0
+    CHECK(icc.trcR.back() == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK(icc.trcG.back() == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK(icc.trcB.back() == doctest::Approx(1.0f).epsilon(0.01));
+
+    // Shape preserved: midpoint ratios should be maintained
+    // Original mid R = 0.45/0.90 = 0.50, normalized should still be ~0.50
+    int mid = N / 2;
+    CHECK(icc.trcR[mid] == doctest::Approx(0.50f).epsilon(0.02));
+    CHECK(icc.trcG[mid] == doctest::Approx(0.50f).epsilon(0.02));
+    CHECK(icc.trcB[mid] == doctest::Approx(0.50f).epsilon(0.02));
+}
+
+TEST_CASE("ICC: TRC already at 1.0 not modified") {
+    // Build synthetic ICC with TRC that already reaches 1.0
+    int N = 64;
+    std::vector<uint16_t> trc(N);
+    for (int i = 0; i < N; i++) {
+        trc[i] = (uint16_t)((float)i / (float)(N - 1) * 65535.0f + 0.5f);
+    }
+
+    auto data = BuildSyntheticICC(trc, trc, trc);
+    TempFile tmp(L"_test_trc_already_norm.icm");
+    { std::ofstream f(tmp.path, std::ios::binary); f.write((const char*)data.data(), data.size()); }
+
+    ICCProfileData icc;
+    REQUIRE(ReadICCProfile(tmp.path, icc));
+    CHECK(icc.hasTRC);
+    CHECK(icc.trcR.back() == doctest::Approx(1.0f).epsilon(0.001));
+
+    // Midpoint should be ~0.5 (linear ramp, unchanged)
+    int mid = N / 2;
+    CHECK(icc.trcR[mid] == doctest::Approx((float)mid / (float)(N - 1)).epsilon(0.001));
+}
+
+TEST_CASE("ICC: isLUTBased false for standard matrix+TRC profile") {
+    // Build synthetic ICC without A2B0/B2A0 tags
+    int N = 32;
+    std::vector<uint16_t> trc(N);
+    for (int i = 0; i < N; i++) trc[i] = (uint16_t)((float)i / (float)(N - 1) * 65535.0f);
+
+    auto data = BuildSyntheticICC(trc, trc, trc, false);
+    TempFile tmp(L"_test_not_lut_based.icm");
+    { std::ofstream f(tmp.path, std::ios::binary); f.write((const char*)data.data(), data.size()); }
+
+    ICCProfileData icc;
+    REQUIRE(ReadICCProfile(tmp.path, icc));
+    CHECK_FALSE(icc.isLUTBased);
+}
+
+TEST_CASE("ICC: isLUTBased true when A2B0 tag present") {
+    // Build synthetic ICC with A2B0 tag
+    int N = 32;
+    std::vector<uint16_t> trc(N);
+    for (int i = 0; i < N; i++) trc[i] = (uint16_t)((float)i / (float)(N - 1) * 65535.0f);
+
+    auto data = BuildSyntheticICC(trc, trc, trc, true);
+    TempFile tmp(L"_test_lut_based.icm");
+    { std::ofstream f(tmp.path, std::ios::binary); f.write((const char*)data.data(), data.size()); }
+
+    ICCProfileData icc;
+    REQUIRE(ReadICCProfile(tmp.path, icc));
+    CHECK(icc.isLUTBased);
+    // TRC should still be read (isLUTBased is just a flag, not a filter)
+    CHECK(icc.hasTRC);
+}
+
+// ============================================================================
+// 1D Cube Loading
+// ============================================================================
+
 TEST_CASE("1D cube: valid identity file") {
     std::vector<float> r, g, b;
     bool ok = Load1DCubeLUT(L"tests/fixtures/test_1d.cube", r, g, b);
