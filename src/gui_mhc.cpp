@@ -863,6 +863,9 @@ static void MhcPushLivePreview(MhcDialogData* d) {
 
 static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     auto* d = g_mhcDialog;
+    if (!d && msg != WM_CTLCOLORSTATIC && msg != WM_CTLCOLORBTN
+           && msg != WM_ERASEBKGND && msg != WM_DRAWITEM && msg != WM_DESTROY)
+        return DefWindowProc(hwnd, msg, wParam, lParam);
     switch (msg) {
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
@@ -1473,9 +1476,10 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
     UpdateWindow(dlg);
 
     MSG winMsg;
-    while (GetMessage(&winMsg, nullptr, 0, 0)) {
+    BOOL bRet;
+    while ((bRet = GetMessage(&winMsg, nullptr, 0, 0)) != 0) {
+        if (bRet == -1) break;
         if (!IsWindow(dlg)) break;
-        if (winMsg.message == WM_QUIT) { PostQuitMessage((int)winMsg.wParam); break; }
         // Enter: push live preview (confirm text box edits) or apply if not previewing
         if (winMsg.message == WM_KEYDOWN && winMsg.wParam == VK_RETURN) {
             if (data.livePreview) {

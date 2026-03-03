@@ -815,8 +815,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // finished compositing, eliminating the variable latency between DD availability and our
     // AcquireNextFrame call. Falls back to preAcquireQpc when LastPresentTime is zero
     // (cursor-only updates with no desktop pixel change).
-    if (fp) FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed,
-                                         frameInfo.LastPresentTime.QuadPart);
+    if (fp && ctx->index == 0)
+        FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed,
+                                     frameInfo.LastPresentTime.QuadPart);
 
     // Got a new frame - get the texture
     ID3D11Texture2D* frameTexture = nullptr;
@@ -1732,7 +1733,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return 0;
         }
-        HideOSD();
+        if (wParam == OSD_TIMER_ID) HideOSD();
         return 0;
     case WM_WINDOWPOSCHANGING: {
         // If an external window is changing our z-order, trigger TOPMOST reassertion.

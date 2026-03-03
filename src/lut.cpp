@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
+#include <locale>
 #include <DirectXPackedVector.h>
 
 bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
@@ -18,9 +19,13 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
     data.clear();
     lutSize = 0;
 
-    // Detect format by extension
-    bool isCube = path.size() > 5 &&
-        (path.substr(path.size() - 5) == L".cube" || path.substr(path.size() - 5) == L".CUBE");
+    // Detect format by extension (case-insensitive)
+    bool isCube = false;
+    if (path.size() > 5) {
+        std::wstring ext = path.substr(path.size() - 5);
+        for (auto& c : ext) c = towlower(c);
+        isCube = (ext == L".cube");
+    }
 
     std::string line;
     int count = 0;
@@ -41,6 +46,7 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
 
             if (line.find("LUT_3D_SIZE") == 0) {
                 std::istringstream iss(line.substr(11));
+                iss.imbue(std::locale::classic());
                 iss >> lutSize;
                 // Validate LUT size (reasonable range: 2-128, typical values: 17, 33, 65)
                 // 128^3 = 8MB texture, 256^3 = 64MB which is excessive
@@ -63,6 +69,7 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
 
             // Parse RGB values
             std::istringstream iss(line);
+            iss.imbue(std::locale::classic());
             float r, g, b;
             if (iss >> r >> g >> b) {
                 data.push_back(r);
@@ -86,20 +93,22 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
             if (line.empty() || line[0] == '#') continue;
 
             std::istringstream iss(line);
+            iss.imbue(std::locale::classic());
             float r, g, b;
             if (iss >> r >> g >> b) {
-                // Normalize if values are in 0-65535 range
-                if (r > 1.0f || g > 1.0f || b > 1.0f) {
-                    r /= 65535.0f;
-                    g /= 65535.0f;
-                    b /= 65535.0f;
-                }
                 data.push_back(r);
                 data.push_back(g);
                 data.push_back(b);
                 data.push_back(1.0f);
                 count++;
             }
+        }
+
+        // Single-pass normalization: if any value exceeds 1.5 it's clearly integer range
+        float maxVal = 0.0f;
+        for (float v : data) maxVal = (std::max)(maxVal, v);
+        if (maxVal > 1.5f) {
+            for (float& v : data) v /= 65535.0f;
         }
     }
 

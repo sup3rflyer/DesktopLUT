@@ -16,6 +16,8 @@
 #include "displayconfig.h"
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <locale>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -1366,14 +1368,8 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
                 }
                 return true;
             }
-            // Fallback: assume gamma 2.2
-            outGamma = 2.2f;
-            outCurve.resize(256);
-            for (int i = 0; i < 256; i++) {
-                float t = (float)i / 255.0f;
-                outCurve[i] = powf(t, 2.2f);
-            }
-            return true;
+            // Unsupported para types 1, 2, 4 — return false so caller sees hasTRC=false
+            return false;
         }
         return false;
     };
@@ -1479,15 +1475,15 @@ bool ExtractGrayscaleFromICC(const ICCProfileData& icc, GrayscaleSettings& outGr
         // SDR: sqrt-distribution points
         // ICC TRC: input signal -> linear light output
         // GrayscaleSettings: points[i] = output linear value for input (i/(N-1))^2
+        // TRC index is in signal domain, so convert linear to signal using gamma
+        float gamma = (icc.gamma > 0.1f) ? icc.gamma : 2.2f;
         for (int i = 0; i < N; i++) {
             float t = (float)i / (float)(N - 1);
             float inputLinear = t * t;  // Input level (sqrt distribution)
 
-            // Find where in the ICC curve this input linear level maps from
-            // ICC: input_signal -> output_linear
-            // We need: what is the output linear for input signal = sRGB_encode(inputLinear)?
-            // Approximate: sample ICC curve at position = inputLinear (normalized index)
-            float idx = inputLinear * (float)(curveLen - 1);
+            // Convert linear to signal domain for TRC indexing
+            float signal = powf(inputLinear, 1.0f / gamma);
+            float idx = signal * (float)(curveLen - 1);
             int i0 = (int)idx;
             int i1 = (std::min)(i0 + 1, (int)curveLen - 1);
             float frac = idx - floorf(idx);
@@ -1589,6 +1585,7 @@ bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vect
 
         if (line.find("LUT_1D_SIZE") == 0) {
             std::istringstream iss(line.substr(11));
+            iss.imbue(std::locale::classic());
             iss >> lutSize;
             if (lutSize < 2 || lutSize > 65536) {
                 std::cerr << "Invalid 1D LUT size: " << lutSize << std::endl;
@@ -1604,6 +1601,7 @@ bool Load1DCubeLUT(const std::wstring& path, std::vector<float>& outR, std::vect
 
         // Parse R G B triplets
         std::istringstream iss(line);
+        iss.imbue(std::locale::classic());
         float r, g, b;
         if (iss >> r >> g >> b) {
             tempR.push_back(r);

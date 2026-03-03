@@ -276,6 +276,7 @@ static void HybridWaitUntil(FramePacer* fp, int64_t targetQpc) {
         // Track sleep overshoot with EMA
         double overshoot = actualSleepMs - sleepMs;
         fp->sleepOvershootEma = fp->sleepOvershootEma * 0.8f + (float)overshoot * 0.2f;
+        if (fp->sleepOvershootEma < 0.0f) fp->sleepOvershootEma = 0.0f;
     } else if (!g_framePacerSpinWait.load()) {
         // Spin-wait disabled: use high-res timer for better precision than Sleep()
         if (remainingMs > 0.5) {
@@ -397,17 +398,26 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
     case FramePacerStrategy::CompositorClockPredictive: {
         HANDLE handles[] = { wakeEvent };
         DWORD handleCount = wakeEvent ? 1 : 0;
-        DWORD result = g_pfnWaitForCompositorClock(handleCount,
-                                                     handleCount ? handles : nullptr,
-                                                     INFINITE);
-        if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-            if (!g_displayOff.load(std::memory_order_relaxed)) {
-                std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
-                g_displayOff.store(true, std::memory_order_relaxed);
+        for (;;) {
+            DWORD result = g_pfnWaitForCompositorClock(handleCount,
+                                                         handleCount ? handles : nullptr,
+                                                         INFINITE);
+            if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+                if (!g_displayOff.load(std::memory_order_relaxed)) {
+                    std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
+                    g_displayOff.store(true, std::memory_order_relaxed);
+                }
+                Sleep(100);
+                g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+                return false;
             }
-            Sleep(100);
-            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-            return false;
+            // Wake event fired (auto-sleep/reinit) — re-wait for actual VBlank
+            if (handleCount > 0 && result >= WAIT_OBJECT_0 + 1
+                && result <= WAIT_OBJECT_0 + handleCount) {
+                handleCount = 0;
+                continue;
+            }
+            break;
         }
 
         if (g_displayOff.load(std::memory_order_relaxed)) {
@@ -446,17 +456,26 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
         if (g_pfnWaitForCompositorClock) {
             HANDLE handles[] = { wakeEvent };
             DWORD handleCount = wakeEvent ? 1 : 0;
-            DWORD result = g_pfnWaitForCompositorClock(handleCount,
-                                                         handleCount ? handles : nullptr,
-                                                         INFINITE);
-            if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-                if (!g_displayOff.load(std::memory_order_relaxed)) {
-                    std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
-                    g_displayOff.store(true, std::memory_order_relaxed);
+            for (;;) {
+                DWORD result = g_pfnWaitForCompositorClock(handleCount,
+                                                             handleCount ? handles : nullptr,
+                                                             INFINITE);
+                if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+                    if (!g_displayOff.load(std::memory_order_relaxed)) {
+                        std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
+                        g_displayOff.store(true, std::memory_order_relaxed);
+                    }
+                    Sleep(100);
+                    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+                    return false;
                 }
-                Sleep(100);
-                g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-                return false;
+                // Wake event fired — re-wait for actual VBlank
+                if (handleCount > 0 && result >= WAIT_OBJECT_0 + 1
+                    && result <= WAIT_OBJECT_0 + handleCount) {
+                    handleCount = 0;
+                    continue;
+                }
+                break;
             }
         } else {
             if (FAILED(DwmFlush())) { Sleep(1); }
@@ -639,6 +658,10 @@ void FramePacerRecordAcquisition(FramePacer* fp, int64_t preAcquireQpc, bool was
             fp->shadowEmaOffset = (float)measuredOffsetMs;
             fp->consecutiveOutliers = 0;
             fp->varianceEma = 0.5f;
+            fp->rollingMinCount = 0;
+            fp->rollingMinIndex = 0;
+            fp->biasAboveMinCount = 0;
+            fp->consecutiveBlockingFallbacks = 0;
             // Force unlock on baseline shift
             if (fp->cadenceLockState == CadenceLockState::Locked) {
                 fp->cadenceLockState = CadenceLockState::Unlocked;

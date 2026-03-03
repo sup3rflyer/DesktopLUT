@@ -1910,10 +1910,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;  // Let other timers pass through to DefWindowProc
 
     case WM_DISPLAYCHANGE: {
-        // Monitor hotplug: re-enumerate and update if count changed
+        // Monitor hotplug: re-enumerate and update if count or handles changed
         std::vector<HMONITOR> newMonitors;
         EnumDisplayMonitors(nullptr, nullptr, GUIMonitorEnumProc, reinterpret_cast<LPARAM>(&newMonitors));
-        if (newMonitors.size() != g_gui.monitors.size()) {
+        bool changed = (newMonitors.size() != g_gui.monitors.size());
+        if (!changed) {
+            for (size_t i = 0; i < newMonitors.size(); i++) {
+                if (newMonitors[i] != g_gui.monitors[i]) { changed = true; break; }
+            }
+        }
+        if (changed) {
             std::cout << "Display change: monitor count " << g_gui.monitors.size()
                       << " -> " << newMonitors.size() << std::endl;
             g_gui.monitors = newMonitors;
@@ -1988,6 +1994,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
         return TRUE;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wParam) {
+            StopProcessing();
+            RemoveTrayIcon();
+            DestroyWindow(hwnd);
+        }
+        return 0;
 
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);

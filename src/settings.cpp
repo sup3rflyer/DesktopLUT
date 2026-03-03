@@ -5,6 +5,15 @@
 #include "globals.h"
 #include <cwchar>
 #include <iostream>
+#include <locale.h>
+
+// Cached C locale for locale-independent float parsing/writing.
+// _wtof and swprintf_s use the thread locale which may use comma as decimal
+// separator on European systems, breaking INI round-trips.
+static _locale_t GetCLocale() {
+    static _locale_t loc = _create_locale(LC_ALL, "C");
+    return loc;
+}
 
 std::wstring GetIniPath() {
     wchar_t exePath[MAX_PATH];
@@ -19,7 +28,7 @@ std::wstring GetIniPath() {
 
 void WritePrivateProfileFloat(const wchar_t* section, const wchar_t* key, float value, const wchar_t* file) {
     wchar_t buf[32];
-    swprintf_s(buf, L"%.4f", value);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), value);
     WritePrivateProfileStringW(section, key, buf, file);
 }
 
@@ -27,7 +36,7 @@ float GetPrivateProfileFloat(const wchar_t* section, const wchar_t* key, float d
     wchar_t buf[32] = {};
     GetPrivateProfileStringW(section, key, L"", buf, 32, file);
     if (buf[0] == L'\0') return def;
-    return (float)_wtof(buf);
+    return (float)_wcstod_l(buf, nullptr, GetCLocale());
 }
 
 void WritePrivateProfileBool(const wchar_t* section, const wchar_t* key, bool value, const wchar_t* file) {
@@ -48,7 +57,7 @@ bool GetPrivateProfileBool(const wchar_t* section, const wchar_t* key, bool def,
 
 void WritePrivateProfileXY(const wchar_t* section, const wchar_t* key, float x, float y, const wchar_t* file) {
     wchar_t buf[64];
-    swprintf_s(buf, L"%.4f, %.4f", x, y);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f, %.4f", GetCLocale(), x, y);
     WritePrivateProfileStringW(section, key, buf, file);
 }
 
@@ -60,8 +69,8 @@ bool GetPrivateProfileXY(const wchar_t* section, const wchar_t* key, float& x, f
     wchar_t* comma = wcschr(buf, L',');
     if (!comma) return false;
     *comma = L'\0';
-    x = (float)_wtof(buf);
-    y = (float)_wtof(comma + 1);
+    x = (float)_wcstod_l(buf, nullptr, GetCLocale());
+    y = (float)_wcstod_l(comma + 1, nullptr, GetCLocale());
     return true;
 }
 
@@ -112,7 +121,7 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     std::wstring grayscaleData;
     for (size_t j = 0; j < cc.grayscale.points.size(); j++) {
         wchar_t val[16];
-        swprintf_s(val, L"%.4f", cc.grayscale.points[j]);
+        _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), cc.grayscale.points[j]);
         if (j > 0) grayscaleData += L"; ";
         grayscaleData += val;
     }
@@ -126,7 +135,7 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
             if (!dev.empty()) {
                 std::wstring devData;
                 for (size_t j = 0; j < dev.size(); j++) {
-                    wchar_t val[16]; swprintf_s(val, L"%.4f", dev[j]);
+                    wchar_t val[16]; _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), dev[j]);
                     if (j > 0) devData += L"; ";
                     devData += val;
                 }
@@ -204,7 +213,7 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         while (token) {
             // Skip leading whitespace
             while (*token == L' ' || *token == L'\t') token++;
-            cc.grayscale.points.push_back((float)_wtof(token));
+            cc.grayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
             token = wcstok_s(nullptr, L";", &ctx);
         }
     }
@@ -235,7 +244,7 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
                 wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
                 while (token) {
                     while (*token == L' ' || *token == L'\t') token++;
-                    cc.grayscale.rgbDeviations[ch].push_back((float)_wtof(token));
+                    cc.grayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
                     token = wcstok_s(nullptr, L";", &ctx2);
                 }
             }
@@ -300,7 +309,7 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     std::wstring grayscaleData;
     for (size_t j = 0; j < mhc.grayscale.points.size(); j++) {
         wchar_t val[16];
-        swprintf_s(val, L"%.4f", mhc.grayscale.points[j]);
+        _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), mhc.grayscale.points[j]);
         if (j > 0) grayscaleData += L"; ";
         grayscaleData += val;
     }
@@ -314,7 +323,7 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
             if (!dev.empty()) {
                 std::wstring devData;
                 for (size_t j = 0; j < dev.size(); j++) {
-                    wchar_t val[16]; swprintf_s(val, L"%.4f", dev[j]);
+                    wchar_t val[16]; _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), dev[j]);
                     if (j > 0) devData += L"; ";
                     devData += val;
                 }
@@ -394,7 +403,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         wchar_t* token = wcstok_s(grayscaleData, L";", &ctx);
         while (token) {
             while (*token == L' ' || *token == L'\t') token++;
-            mhc.grayscale.points.push_back((float)_wtof(token));
+            mhc.grayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
             token = wcstok_s(nullptr, L";", &ctx);
         }
     }
@@ -422,7 +431,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
                 wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
                 while (token) {
                     while (*token == L' ' || *token == L'\t') token++;
-                    mhc.grayscale.rgbDeviations[ch].push_back((float)_wtof(token));
+                    mhc.grayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
                     token = wcstok_s(nullptr, L";", &ctx2);
                 }
             }
@@ -509,6 +518,18 @@ void ParseVrrWhitelist() {
     ParseWhitelistString(g_vrrWhitelistRaw, g_vrrWhitelist);
 }
 
+// Read potentially long INI strings with expanding buffer (avoids truncation)
+static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key, const wchar_t* path) {
+    DWORD size = 1024;
+    std::wstring buf(size, L'\0');
+    for (;;) {
+        DWORD ret = GetPrivateProfileStringW(section, key, L"", buf.data(), size, path);
+        if (ret < size - 2) { buf.resize(ret); return buf; }
+        size *= 2;
+        buf.resize(size);
+    }
+}
+
 void SaveSettings() {
     std::wstring iniPath = GetIniPath();
 
@@ -586,16 +607,13 @@ void LoadSettings() {
     g_framePacerLogEnabled.store(GetPrivateProfileBool(L"General", L"FramePacerLog", false, iniPath.c_str()));
     g_frameBufferIdleMs.store((int)GetPrivateProfileIntW(L"General", L"FrameBufferIdleMs", 3000, iniPath.c_str()));
 
-    // Load gamma whitelist
-    wchar_t whitelistBuf[1024] = {};
-    GetPrivateProfileStringW(L"General", L"GammaWhitelist", L"", whitelistBuf, 1024, iniPath.c_str());
-    g_gammaWhitelistRaw = whitelistBuf;
+    // Load gamma whitelist (expanding buffer to avoid truncation)
+    g_gammaWhitelistRaw = ReadLongINIString(L"General", L"GammaWhitelist", iniPath.c_str());
     ParseGammaWhitelist();
 
     // Load VRR whitelist
     g_vrrWhitelistEnabled.store(GetPrivateProfileBool(L"General", L"VRRWhitelistEnabled", false, iniPath.c_str()));
-    GetPrivateProfileStringW(L"General", L"VRRWhitelist", L"", whitelistBuf, 1024, iniPath.c_str());
-    g_vrrWhitelistRaw = whitelistBuf;
+    g_vrrWhitelistRaw = ReadLongINIString(L"General", L"VRRWhitelist", iniPath.c_str());
     ParseVrrWhitelist();
 
     // Load hotkey settings
