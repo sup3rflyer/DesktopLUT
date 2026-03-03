@@ -209,6 +209,14 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
             for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
                 params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
                     ? mhc.grayscale.points[i] : 0.0f;
+                // Compute per-channel values from base * deviation
+                float base = params.grayscale.points[i];
+                float devR = (i < (int)mhc.grayscale.rgbDeviations[0].size()) ? mhc.grayscale.rgbDeviations[0][i] : 1.0f;
+                float devG = (i < (int)mhc.grayscale.rgbDeviations[1].size()) ? mhc.grayscale.rgbDeviations[1][i] : 1.0f;
+                float devB = (i < (int)mhc.grayscale.rgbDeviations[2].size()) ? mhc.grayscale.rgbDeviations[2][i] : 1.0f;
+                params.grayscale.pointsR[i] = base * devR;
+                params.grayscale.pointsG[i] = base * devG;
+                params.grayscale.pointsB[i] = base * devB;
             }
             params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
             params.grayscale.peakNits = mhc.grayscale.peakNits;
@@ -333,6 +341,14 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
             for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
                 params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
                     ? mhc.grayscale.points[i] : 0.0f;
+                // Compute per-channel values from base * deviation
+                float base = params.grayscale.points[i];
+                float devR = (i < (int)mhc.grayscale.rgbDeviations[0].size()) ? mhc.grayscale.rgbDeviations[0][i] : 1.0f;
+                float devG = (i < (int)mhc.grayscale.rgbDeviations[1].size()) ? mhc.grayscale.rgbDeviations[1][i] : 1.0f;
+                float devB = (i < (int)mhc.grayscale.rgbDeviations[2].size()) ? mhc.grayscale.rgbDeviations[2][i] : 1.0f;
+                params.grayscale.pointsR[i] = base * devR;
+                params.grayscale.pointsG[i] = base * devG;
+                params.grayscale.pointsB[i] = base * devB;
             }
             params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
             params.grayscale.peakNits = mhc.grayscale.peakNits;
@@ -818,6 +834,9 @@ static void MhcPushLivePreview(MhcDialogData* d) {
         tempCC.grayscale.enabled = d->settings->grayscale.enabled;
         tempCC.grayscale.pointCount = d->settings->grayscale.pointCount;
         tempCC.grayscale.points = d->settings->grayscale.points;
+        tempCC.grayscale.rgbDeviations[0] = d->settings->grayscale.rgbDeviations[0];
+        tempCC.grayscale.rgbDeviations[1] = d->settings->grayscale.rgbDeviations[1];
+        tempCC.grayscale.rgbDeviations[2] = d->settings->grayscale.rgbDeviations[2];
         tempCC.grayscale.peakNits = d->settings->grayscale.peakNits;
         tempCC.grayscale.use24Gamma = d->settings->grayscale.use24Gamma;
     }
@@ -838,7 +857,7 @@ static void MhcPushLivePreview(MhcDialogData* d) {
                 return p.monitorIndex == d->monitorIndex;
             }),
         g_pendingColorCorrections.end());
-    g_pendingColorCorrections.push_back({ d->monitorIndex, d->isHDR, data, true });
+    g_pendingColorCorrections.push_back({ d->monitorIndex, d->isHDR, data, true, d->isHDR });
     g_hasPendingColorCorrections.store(true, std::memory_order_release);
 }
 
@@ -1477,4 +1496,11 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
 
     EnableWindow(hwndParent, TRUE);
     SetForegroundWindow(hwndParent);
+
+    // Revert shader corrections to Corrections tab state with ictcpMode=false
+    // MHC preview was overriding shader corrections; now that the dialog is closed,
+    // restore the real corrections (OK installed the ICC profile, Cancel restored original)
+    if (data.livePreview) {
+        UpdateColorCorrectionLive(data.monitorIndex, data.isHDR, false);
+    }
 }

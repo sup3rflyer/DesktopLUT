@@ -118,6 +118,23 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
     WritePrivateProfileStringW(section, (p + L"GrayscaleData").c_str(), grayscaleData.c_str(), iniPath);
 
+    // Save per-channel RGB deviations (new keys, backward compat: old versions ignore them)
+    {
+        const wchar_t* devSuffix[] = { L"GrayscaleDevR", L"GrayscaleDevG", L"GrayscaleDevB" };
+        for (int ch = 0; ch < 3; ch++) {
+            auto& dev = cc.grayscale.rgbDeviations[ch];
+            if (!dev.empty()) {
+                std::wstring devData;
+                for (size_t j = 0; j < dev.size(); j++) {
+                    wchar_t val[16]; swprintf_s(val, L"%.4f", dev[j]);
+                    if (j > 0) devData += L"; ";
+                    devData += val;
+                }
+                WritePrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), devData.c_str(), iniPath);
+            }
+        }
+    }
+
     // HDR-specific and SDR-specific settings
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
     if (isHDR) {
@@ -206,6 +223,29 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
             cc.grayscale.initLinear();
         }
     }
+    // Load per-channel RGB deviations (new in this version, missing = identity 1.0)
+    {
+        const wchar_t* devSuffix[] = { L"GrayscaleDevR", L"GrayscaleDevG", L"GrayscaleDevB" };
+        for (int ch = 0; ch < 3; ch++) {
+            wchar_t devBuf[1024] = {};
+            GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf, 1024, iniPath);
+            cc.grayscale.rgbDeviations[ch].clear();
+            if (devBuf[0] != L'\0') {
+                wchar_t* ctx2 = nullptr;
+                wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
+                while (token) {
+                    while (*token == L' ' || *token == L'\t') token++;
+                    cc.grayscale.rgbDeviations[ch].push_back((float)_wtof(token));
+                    token = wcstok_s(nullptr, L";", &ctx2);
+                }
+            }
+            if (cc.grayscale.rgbDeviations[ch].empty() ||
+                (int)cc.grayscale.rgbDeviations[ch].size() != cc.grayscale.pointCount) {
+                cc.grayscale.rgbDeviations[ch].assign(cc.grayscale.pointCount, 1.0f);
+            }
+        }
+    }
+
     // HDR-specific settings
     if (isHDR) {
         float peakNits = GetPrivateProfileFloat(section, (p + L"GrayscalePeak").c_str(), 10000.0f, iniPath);
@@ -265,6 +305,23 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
         grayscaleData += val;
     }
     WritePrivateProfileStringW(section, (p + L"MHCGrayscaleData").c_str(), grayscaleData.c_str(), iniPath);
+
+    // Save per-channel RGB deviations for MHC grayscale
+    {
+        const wchar_t* devSuffix[] = { L"MHCGrayscaleDevR", L"MHCGrayscaleDevG", L"MHCGrayscaleDevB" };
+        for (int ch = 0; ch < 3; ch++) {
+            auto& dev = mhc.grayscale.rgbDeviations[ch];
+            if (!dev.empty()) {
+                std::wstring devData;
+                for (size_t j = 0; j < dev.size(); j++) {
+                    wchar_t val[16]; swprintf_s(val, L"%.4f", dev[j]);
+                    if (j > 0) devData += L"; ";
+                    devData += val;
+                }
+                WritePrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), devData.c_str(), iniPath);
+            }
+        }
+    }
 
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
     if (isHDR) {
@@ -351,6 +408,29 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         mhc.grayscale.points.resize(mhc.grayscale.pointCount);
         if (isHDR) mhc.grayscale.initLinearPQ();
         else mhc.grayscale.initLinear();
+    }
+
+    // Load per-channel RGB deviations for MHC grayscale
+    {
+        const wchar_t* devSuffix[] = { L"MHCGrayscaleDevR", L"MHCGrayscaleDevG", L"MHCGrayscaleDevB" };
+        for (int ch = 0; ch < 3; ch++) {
+            wchar_t devBuf[1024] = {};
+            GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf, 1024, iniPath);
+            mhc.grayscale.rgbDeviations[ch].clear();
+            if (devBuf[0] != L'\0') {
+                wchar_t* ctx2 = nullptr;
+                wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
+                while (token) {
+                    while (*token == L' ' || *token == L'\t') token++;
+                    mhc.grayscale.rgbDeviations[ch].push_back((float)_wtof(token));
+                    token = wcstok_s(nullptr, L";", &ctx2);
+                }
+            }
+            if (mhc.grayscale.rgbDeviations[ch].empty() ||
+                (int)mhc.grayscale.rgbDeviations[ch].size() != mhc.grayscale.pointCount) {
+                mhc.grayscale.rgbDeviations[ch].assign(mhc.grayscale.pointCount, 1.0f);
+            }
+        }
     }
 
     if (isHDR) {

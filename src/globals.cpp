@@ -27,6 +27,26 @@ IDCompositionDevice* g_dcompDevice = nullptr;
 ID3D11Texture2D* g_blueNoiseTexture = nullptr;
 ID3D11ShaderResourceView* g_blueNoiseSRV = nullptr;
 
+// Desktop gamma LUT (shared) - precomputed sRGB→2.2 correction curve
+ID3D11Texture2D* g_desktopGammaTexture = nullptr;
+ID3D11ShaderResourceView* g_desktopGammaSRV = nullptr;
+
+// PQ transfer function LUTs (shared) - replace all pow() in HDR pixel shader
+ID3D11Texture2D* g_pqOetfTexture = nullptr;
+ID3D11ShaderResourceView* g_pqOetfSRV = nullptr;
+ID3D11Texture2D* g_pqEotfTexture = nullptr;
+ID3D11ShaderResourceView* g_pqEotfSRV = nullptr;
+
+// SDR transfer function LUTs (shared) - replace all pow() in SDR pixel shader
+ID3D11Texture2D* g_srgbOetfTexture = nullptr;
+ID3D11ShaderResourceView* g_srgbOetfSRV = nullptr;
+ID3D11Texture2D* g_srgbEotfTexture = nullptr;
+ID3D11ShaderResourceView* g_srgbEotfSRV = nullptr;
+ID3D11Texture2D* g_gammaRatioTexture = nullptr;
+ID3D11ShaderResourceView* g_gammaRatioSRV = nullptr;
+ID3D11Texture2D* g_wbGammaTexture = nullptr;
+ID3D11ShaderResourceView* g_wbGammaSRV = nullptr;
+
 // ============================================================================
 // Monitor State
 // ============================================================================

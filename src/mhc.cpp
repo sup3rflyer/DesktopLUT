@@ -438,6 +438,48 @@ float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak) {
     }
 }
 
+// Per-channel variants: read from pointsR/G/B instead of points
+float EvalGrayscaleSDR_Channel(float Y_linear, const GrayscaleData& gs, int channel) {
+    if (Y_linear <= 0.0f) return 0.0f;
+
+    const float* pts = (channel == 0) ? gs.pointsR : (channel == 1) ? gs.pointsG : gs.pointsB;
+    float idx = sqrtf(std::clamp(Y_linear, 0.0f, 1.0f)) * (float)(gs.pointCount - 1);
+    int i0 = (int)floorf(idx);
+    int i1 = (std::min)(i0 + 1, gs.pointCount - 1);
+    float t = idx - floorf(idx);
+
+    float v0 = (i0 < 32) ? pts[i0] : 0.0f;
+    float v1 = (i1 < 32) ? pts[i1] : 0.0f;
+
+    float s0 = sqrtf((std::max)(v0, 0.0f));
+    float s1 = sqrtf((std::max)(v1, 0.0f));
+    float correctedS = s0 + (s1 - s0) * t;
+    return correctedS * correctedS;
+}
+
+float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqPeak, int channel) {
+    if (pqValue <= 0.0f || pqPeak <= 0.0f) return pqValue;
+
+    const float* pts = (channel == 0) ? gs.pointsR : (channel == 1) ? gs.pointsG : gs.pointsB;
+    float scaledI = pqValue / pqPeak;
+    if (scaledI <= 1.0f) {
+        float idx = scaledI * (float)(gs.pointCount - 1);
+        int i0 = (int)floorf(idx);
+        int i1 = (std::min)(i0 + 1, gs.pointCount - 1);
+        float t = idx - floorf(idx);
+
+        float v0 = (i0 < 32) ? pts[i0] : 0.0f;
+        float v1 = (i1 < 32) ? pts[i1] : 0.0f;
+
+        float corrected = v0 + (v1 - v0) * t;
+        return corrected * pqPeak;
+    } else {
+        int lastIdx = gs.pointCount - 1;
+        float lastVal = (lastIdx < 32) ? pts[lastIdx] : 1.0f;
+        return lastVal * pqValue;
+    }
+}
+
 // ============================================================================
 // SECTION: 1D LUT Generation
 // ============================================================================
@@ -483,6 +525,30 @@ void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT,
         // Apply grayscale correction in PQ domain
         float pqOut = EvalGrayscaleHDR(pqIn, gs, pqPeak);
 
+        outLUT[j] = std::clamp(pqOut, 0.0f, 1.0f);
+    }
+}
+
+// Per-channel LUT generators: uses pointsR/G/B for per-channel corrections
+void GenerateMHC2LUT_SDR_Channel(const GrayscaleData& gs, float* outLUT, int lutSize, int channel) {
+    for (int j = 0; j < lutSize; j++) {
+        float t = (float)j / (float)(lutSize - 1);
+        if (!gs.enabled) { outLUT[j] = t; continue; }
+        float Y_linear = SrgbEOTF(t);
+        float Y_corrected = EvalGrayscaleSDR_Channel(Y_linear, gs, channel);
+        if (gs.use24Gamma) {
+            Y_corrected = powf((std::max)(Y_corrected, 0.0f), 2.4f / 2.2f);
+        }
+        outLUT[j] = std::clamp(SrgbOETF((std::max)(Y_corrected, 0.0f)), 0.0f, 1.0f);
+    }
+}
+
+void GenerateMHC2LUT_HDR_Channel(const GrayscaleData& gs, float peakNits, float* outLUT, int lutSize, int channel) {
+    float pqPeak = PqOETF(peakNits / 10000.0f);
+    for (int j = 0; j < lutSize; j++) {
+        float pqIn = (float)j / (float)(lutSize - 1);
+        if (!gs.enabled) { outLUT[j] = pqIn; continue; }
+        float pqOut = EvalGrayscaleHDR_Channel(pqIn, gs, pqPeak, channel);
         outLUT[j] = std::clamp(pqOut, 0.0f, 1.0f);
     }
 }
@@ -658,11 +724,13 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
             GenerateMHC2LUT_FromTRC_SDR(params.trcB, lutB.data(), lutSize, targetGamma);
         }
     } else if (params.isHDR) {
-        GenerateMHC2LUT_HDR(params.grayscale, params.peakNits, lutR.data(), lutSize);
-        lutG = lutR; lutB = lutR;
+        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutR.data(), lutSize, 0);
+        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutG.data(), lutSize, 1);
+        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutB.data(), lutSize, 2);
     } else {
-        GenerateMHC2LUT_SDR(params.grayscale, lutR.data(), lutSize);
-        lutG = lutR; lutB = lutR;
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutR.data(), lutSize, 0);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutG.data(), lutSize, 1);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutB.data(), lutSize, 2);
     }
 
     // Build ICC colorants (D50-adapted)

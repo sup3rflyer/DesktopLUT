@@ -158,6 +158,8 @@ struct MovableAtomic {
 #define ID_GRAYSCALE_CANCEL 5002
 #define ID_GRAYSCALE_SLIDER_BASE 5100
 #define ID_GRAYSCALE_EDIT_BASE 2500
+#define ID_GRAYSCALE_RGB_STRIP_BASE 5200
+#define ID_GRAYSCALE_RGB_EDIT_BASE 5300
 
 // Gamma whitelist dialog control IDs
 #define ID_WHITELIST_EDIT   6001
@@ -203,8 +205,18 @@ struct GrayscaleData {
     bool enabled = false;
     int pointCount = 20;           // 10, 20, or 32
     float points[32] = {};         // Fixed size, values 0-1 (max 32 points)
+    float pointsR[32] = {};        // Per-channel final values (computed from points * rgbDeviations)
+    float pointsG[32] = {};
+    float pointsB[32] = {};
     float peakNits = 10000.0f;     // HDR only: peak luminance for curve scaling
     bool use24Gamma = false;       // SDR only: apply 2.2->2.4 gamma transform
+
+    // ICtCp delta offsets (precomputed from per-channel PQ corrections on CPU)
+    // Used in combined ICtCp path when grayscale + tonemap share one round-trip
+    float ictcpI[32] = {};         // delta I (intensity offset from neutral)
+    float ictcpCt[32] = {};        // delta Ct (tritan/yellow-blue offset)
+    float ictcpCp[32] = {};        // delta Cp (protan/red-green offset)
+    bool ictcpValid = false;       // true when arrays are computed and current
 
     void initLinear() {
         // Initialize to linear response using square root distribution (for SDR)
@@ -212,6 +224,9 @@ struct GrayscaleData {
         for (int i = 0; i < pointCount && i < 32; i++) {
             float t = (float)i / (float)(pointCount - 1);
             points[i] = t * t;  // Square root distribution: output = input = t^2
+            pointsR[i] = points[i];
+            pointsG[i] = points[i];
+            pointsB[i] = points[i];
         }
     }
 
@@ -221,6 +236,9 @@ struct GrayscaleData {
         for (int i = 0; i < pointCount && i < 32; i++) {
             float t = (float)i / (float)(pointCount - 1);
             points[i] = t;  // Evenly spaced in PQ: output = input = t
+            pointsR[i] = points[i];
+            pointsG[i] = points[i];
+            pointsB[i] = points[i];
         }
     }
 };
@@ -527,6 +545,7 @@ struct MonitorContext {
     bool cbDirty = true;                     // True when constant buffer needs update
     bool lastDesktopGamma = true;            // Cached atomic value
     bool lastTetrahedralInterp = false;      // Cached atomic value
+    bool grayscaleICtCp = false;             // true = shader uses ICtCp offsets for HDR grayscale
 
     // Thread-safe visibility requests (whitelist thread → render thread)
     MovableAtomic<int> requestedVisibility{0};  // 0=no change, 1=show, -1=hide
@@ -552,6 +571,7 @@ struct PendingColorCorrection {
     bool isHDR;  // true = update HDR settings, false = update SDR settings
     ColorCorrectionData data;
     bool clearMhcFlags = false;  // When true, render thread clears MHC active flags (for live preview tracking)
+    bool ictcpMode = false;      // Request ICtCp grayscale mode (HDR editing: perceptually accurate preview)
 };
 
 // Grayscale correction settings for GUI (uses vector)
@@ -559,6 +579,7 @@ struct GrayscaleSettings {
     bool enabled = false;
     int pointCount = 20;           // 10, 20, or 32
     std::vector<float> points;     // Size = pointCount, values 0-1
+    std::vector<float> rgbDeviations[3];  // [R][G][B], size=pointCount, centered at 1.0 (no offset)
     float peakNits = 10000.0f;     // HDR only: peak luminance for curve scaling
     bool use24Gamma = false;       // SDR only: apply 2.2->2.4 gamma transform
 
@@ -570,6 +591,7 @@ struct GrayscaleSettings {
             float t = (float)i / (float)(pointCount - 1);
             points[i] = t * t;  // Square root distribution: output = input = t^2
         }
+        initRGBDeviations();
     }
 
     void initLinearPQ() {
@@ -580,6 +602,12 @@ struct GrayscaleSettings {
             float t = (float)i / (float)(pointCount - 1);
             points[i] = t;  // Evenly spaced in PQ: output = input = t
         }
+        initRGBDeviations();
+    }
+
+    void initRGBDeviations() {
+        for (int ch = 0; ch < 3; ch++)
+            rgbDeviations[ch].assign(pointCount, 1.0f);
     }
 };
 
@@ -776,6 +804,12 @@ struct GrayscaleEditorData {
     bool isHDR = false;      // true if editing HDR grayscale, false for SDR
     float peakNits = 10000.0f;  // HDR peak for label calculation (must match ColourSpace target)
     std::function<void()> liveUpdateCallback;  // If set, called instead of UpdateColorCorrectionLive
+    // Per-channel RGB deviations
+    float* rgbDeviations[3] = {};          // Pointers to settings rgbDeviations data
+    std::vector<float> originalRGBDev[3];  // Backup for Cancel
+    std::vector<HWND> rgbStrips;           // Custom strip controls (one per point)
+    std::vector<HWND> rgbEditBoxes;        // Per-point RGB edit boxes (one per point)
+    int selectedChannel = 0;               // 0=R, 1=G, 2=B (which channel edits show)
 };
 
 // ============================================================================

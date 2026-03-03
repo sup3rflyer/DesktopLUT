@@ -123,6 +123,14 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
             float t = (float)i / (float)(dst.grayscale.pointCount - 1);
             dst.grayscale.points[i] = t * t;
         }
+        // Compute per-channel final values from base * deviation
+        float base = dst.grayscale.points[i];
+        float devR = (i < (int)src.grayscale.rgbDeviations[0].size()) ? src.grayscale.rgbDeviations[0][i] : 1.0f;
+        float devG = (i < (int)src.grayscale.rgbDeviations[1].size()) ? src.grayscale.rgbDeviations[1][i] : 1.0f;
+        float devB = (i < (int)src.grayscale.rgbDeviations[2].size()) ? src.grayscale.rgbDeviations[2][i] : 1.0f;
+        dst.grayscale.pointsR[i] = base * devR;
+        dst.grayscale.pointsG[i] = base * devG;
+        dst.grayscale.pointsB[i] = base * devB;
     }
 
     // Copy tonemapping settings
@@ -587,7 +595,7 @@ void StopProcessing() {
     UpdateGUIState();
 }
 
-void UpdateColorCorrectionLive(int monitorIndex, bool isHDR) {
+void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode) {
     if (!g_gui.isRunning || monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) {
         return;
     }
@@ -606,7 +614,7 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR) {
                 return p.monitorIndex == monitorIndex && p.isHDR == isHDR;
             }),
         g_pendingColorCorrections.end());
-    g_pendingColorCorrections.push_back({ monitorIndex, isHDR, cc });
+    g_pendingColorCorrections.push_back({ monitorIndex, isHDR, cc, false, ictcpMode });
     g_hasPendingColorCorrections.store(true, std::memory_order_release);
     // Wake the render thread in case it is auto-sleeping — without this, corrections
     // queued while the overlay is dormant wait up to 500ms and then are still missed

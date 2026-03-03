@@ -540,6 +540,97 @@ static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
 static const int MAX_RECOVERY_RETRIES = 60;
 
 // ============================================================================
+// SECTION: ICtCp Grayscale Conversion (CPU precomputation)
+// ============================================================================
+
+// Rec.2020 → LMS matrix (Dolby, matches shader Rec2020_to_LMS)
+static const float kRec2020ToLMS[9] = {
+    0.41210938f, 0.52392578f, 0.06396484f,
+    0.16674805f, 0.72045898f, 0.11279297f,
+    0.02416992f, 0.07543945f, 0.90039063f
+};
+
+// L'M'S' → ICtCp matrix (Dolby, matches shader LMSprime_to_ICtCp)
+static const float kLMSprimeToICtCp[9] = {
+    0.50000000f,  0.50000000f,  0.00000000f,
+    1.61376953f, -3.32348633f,  1.70971680f,
+    4.37817383f, -4.24560547f, -0.13256836f
+};
+
+// Convert per-channel PQ corrections → ICtCp delta offsets for all 32 points.
+// For each point: builds corrected Rec.2020 (R≠G≠B from per-channel corrections),
+// transforms through LMS→PQ→ICtCp, and subtracts neutral reference (equal RGB).
+// Result: additive deltas that can be applied in ICtCp space during the combined pass.
+// Identity: when R=G=B (all deviations 1.0), deltas are zero (LMS row sums = 1.0).
+void ComputeGrayscaleICtCpOffsets(GrayscaleData& gs) {
+    const float pqPeak = LinearToPQScalar((std::max)(gs.peakNits, 1.0f) / 10000.0f);
+
+    for (int i = 0; i < 32; i++) {
+        float t = (gs.pointCount > 1) ? (float)i / (float)(gs.pointCount - 1) : 0.0f;
+
+        // Get per-channel normalized PQ corrections (same values sent to shader in PQ mode)
+        float nR = (i < gs.pointCount) ? gs.pointsR[i] : t;
+        float nG = (i < gs.pointCount) ? gs.pointsG[i] : t;
+        float nB = (i < gs.pointCount) ? gs.pointsB[i] : t;
+
+        // Safety: if uninitialized (zero beyond first point), use identity
+        if (i > 0 && nR == 0.0f) nR = t;
+        if (i > 0 && nG == 0.0f) nG = t;
+        if (i > 0 && nB == 0.0f) nB = t;
+
+        // Corrected PQ values (scaled by peak)
+        float pqR = nR * pqPeak;
+        float pqG = nG * pqPeak;
+        float pqB = nB * pqPeak;
+
+        // Neutral PQ value (equal R=G=B at this point)
+        float pqNeutral = t * pqPeak;
+
+        // --- Corrected path: per-channel PQ → linear → LMS → PQ → ICtCp ---
+        float linR = PQToLinearScalar(pqR);
+        float linG = PQToLinearScalar(pqG);
+        float linB = PQToLinearScalar(pqB);
+
+        // Rec.2020 → LMS (matrix multiply)
+        float lmsL = kRec2020ToLMS[0] * linR + kRec2020ToLMS[1] * linG + kRec2020ToLMS[2] * linB;
+        float lmsM = kRec2020ToLMS[3] * linR + kRec2020ToLMS[4] * linG + kRec2020ToLMS[5] * linB;
+        float lmsS = kRec2020ToLMS[6] * linR + kRec2020ToLMS[7] * linG + kRec2020ToLMS[8] * linB;
+
+        // LMS → PQ (per-component, with 80/10000 normalization already in linear values)
+        float lmsPqL = LinearToPQScalar((std::max)(lmsL, 1e-10f));
+        float lmsPqM = LinearToPQScalar((std::max)(lmsM, 1e-10f));
+        float lmsPqS = LinearToPQScalar((std::max)(lmsS, 1e-10f));
+
+        // L'M'S' → ICtCp
+        float corrI  = kLMSprimeToICtCp[0] * lmsPqL + kLMSprimeToICtCp[1] * lmsPqM + kLMSprimeToICtCp[2] * lmsPqS;
+        float corrCt = kLMSprimeToICtCp[3] * lmsPqL + kLMSprimeToICtCp[4] * lmsPqM + kLMSprimeToICtCp[5] * lmsPqS;
+        float corrCp = kLMSprimeToICtCp[6] * lmsPqL + kLMSprimeToICtCp[7] * lmsPqM + kLMSprimeToICtCp[8] * lmsPqS;
+
+        // --- Neutral path: equal R=G=B at neutral PQ ---
+        float linN = PQToLinearScalar(pqNeutral);
+
+        float lmsNL = kRec2020ToLMS[0] * linN + kRec2020ToLMS[1] * linN + kRec2020ToLMS[2] * linN;
+        float lmsNM = kRec2020ToLMS[3] * linN + kRec2020ToLMS[4] * linN + kRec2020ToLMS[5] * linN;
+        float lmsNS = kRec2020ToLMS[6] * linN + kRec2020ToLMS[7] * linN + kRec2020ToLMS[8] * linN;
+
+        float lmsPqNL = LinearToPQScalar((std::max)(lmsNL, 1e-10f));
+        float lmsPqNM = LinearToPQScalar((std::max)(lmsNM, 1e-10f));
+        float lmsPqNS = LinearToPQScalar((std::max)(lmsNS, 1e-10f));
+
+        float neutI  = kLMSprimeToICtCp[0] * lmsPqNL + kLMSprimeToICtCp[1] * lmsPqNM + kLMSprimeToICtCp[2] * lmsPqNS;
+        float neutCt = kLMSprimeToICtCp[3] * lmsPqNL + kLMSprimeToICtCp[4] * lmsPqNM + kLMSprimeToICtCp[5] * lmsPqNS;
+        float neutCp = kLMSprimeToICtCp[6] * lmsPqNL + kLMSprimeToICtCp[7] * lmsPqNM + kLMSprimeToICtCp[8] * lmsPqNS;
+
+        // Store deltas
+        gs.ictcpI[i]  = corrI  - neutI;
+        gs.ictcpCt[i] = corrCt - neutCt;
+        gs.ictcpCp[i] = corrCp - neutCp;
+    }
+
+    gs.ictcpValid = true;
+}
+
+// ============================================================================
 // SECTION: Render Monitor
 // ============================================================================
 
@@ -891,13 +982,65 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
         cbData[30] = LinearToPQScalar(cc.tonemap.targetPeakNits / 10000.0f);  // pqTargetPeak (precomputed)
         cbData[31] = LinearToPQScalar((std::max)(cc.grayscale.peakNits, 1.0f) / 10000.0f);  // pqGrayscalePeak (precomputed)
-        // Row 8-15: Grayscale LUT (32 points packed into 8 float4s)
-        for (int i = 0; i < 32; i++) {
-            cbData[32 + i] = (i < cc.grayscale.pointCount && i < 32)
-                ? cc.grayscale.points[i]
-                : ((float)i / 31.0f);  // Linear fallback
+        // Rows 8-15: Red channel grayscale (32 floats)
+        // Rows 16-23: Green channel grayscale (32 floats)
+        // Rows 24-31: Blue channel grayscale (32 floats)
+        // In ICtCp mode: R=deltaI, G=deltaCt, B=deltaCp (additive offsets)
+        // In PQ mode: R/G/B = normalized PQ corrections (per-channel gains)
+        bool useICtCp = ctx->isHDREnabled && cc.grayscale.enabled &&
+                        (cc.tonemap.enabled || ctx->grayscaleICtCp);
+        if (ctx->isHDREnabled && cc.grayscale.enabled) {
+            if (useICtCp) {
+                // ICtCp mode: send precomputed delta offsets
+                // Compute if not yet valid (data changed since last compute)
+                auto& gsRef = const_cast<GrayscaleData&>(cc.grayscale);
+                if (!gsRef.ictcpValid) ComputeGrayscaleICtCpOffsets(gsRef);
+                for (int i = 0; i < 32; i++) {
+                    if (i < cc.grayscale.pointCount) {
+                        cbData[32 + i] = cc.grayscale.ictcpI[i];   // delta I
+                        cbData[64 + i] = cc.grayscale.ictcpCt[i];  // delta Ct
+                        cbData[96 + i] = cc.grayscale.ictcpCp[i];  // delta Cp
+                    } else {
+                        cbData[32 + i] = 0.0f;  // identity: zero delta
+                        cbData[64 + i] = 0.0f;
+                        cbData[96 + i] = 0.0f;
+                    }
+                }
+            } else {
+                // PQ mode: send normalized per-channel PQ corrections
+                for (int i = 0; i < 32; i++) {
+                    float t = (cc.grayscale.pointCount > 1) ? (float)i / (float)(cc.grayscale.pointCount - 1) : 0.0f;
+                    auto safeVal = [&](float v) -> float { return (i > 0 && v == 0.0f) ? t : v; };
+                    if (i < cc.grayscale.pointCount) {
+                        cbData[32 + i] = safeVal(cc.grayscale.pointsR[i]);
+                        cbData[64 + i] = safeVal(cc.grayscale.pointsG[i]);
+                        cbData[96 + i] = safeVal(cc.grayscale.pointsB[i]);
+                    } else {
+                        cbData[32 + i] = t;
+                        cbData[64 + i] = t;
+                        cbData[96 + i] = t;
+                    }
+                }
+            }
+        } else {
+            // SDR or grayscale disabled: write per-channel values directly
+            // Safety: if pointsR/G/B are uninitialized (all zero), use identity ramp
+            for (int i = 0; i < 32; i++) {
+                float t = (float)i / (float)(cc.grayscale.pointCount > 1 ? cc.grayscale.pointCount - 1 : 31);
+                float identity = t * t;  // SDR sqrt distribution identity
+                auto safeVal = [&](float v) -> float { return (i > 0 && v == 0.0f) ? identity : v; };
+                if (i < cc.grayscale.pointCount) {
+                    cbData[32 + i] = safeVal(cc.grayscale.pointsR[i]);
+                    cbData[64 + i] = safeVal(cc.grayscale.pointsG[i]);
+                    cbData[96 + i] = safeVal(cc.grayscale.pointsB[i]);
+                } else {
+                    cbData[32 + i] = identity;
+                    cbData[64 + i] = identity;
+                    cbData[96 + i] = identity;
+                }
+            }
         }
-        // Row 16: Motion bar (UFO test-style judder detection)
+        // Row 32: Motion bar (UFO test-style judder detection)
         if (motionBar) {
             if (!s_motionBarOriginSet) {
                 s_motionBarOrigin = std::chrono::steady_clock::now();
@@ -905,14 +1048,14 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             }
             float elapsed = std::chrono::duration<float>(
                 std::chrono::steady_clock::now() - s_motionBarOrigin).count();
-            cbData[64] = 1.0f;  // motionBarEnabled
-            cbData[65] = fmodf(elapsed * 0.5f, 1.0f);  // position: 0.5 traversals/sec
+            cbData[128] = 1.0f;  // motionBarEnabled
+            cbData[129] = fmodf(elapsed * 0.5f, 1.0f);  // position: 0.5 traversals/sec
         } else {
-            cbData[64] = 0.0f;
-            cbData[65] = 0.0f;
+            cbData[128] = 0.0f;
+            cbData[129] = 0.0f;
         }
-        cbData[66] = 0.0f;  // reserved
-        cbData[67] = 0.0f;  // reserved
+        cbData[130] = useICtCp ? 1.0f : 0.0f;  // grayscaleICtCp
+        cbData[131] = 0.0f;  // reserved
         g_context->Unmap(g_constantBuffer, 0);
 
         // Only clear dirty flag and update cached atomics AFTER successful write.
@@ -1053,6 +1196,14 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     if (ctx->peakSRV) {
         g_context->PSSetShaderResources(3, 1, &ctx->peakSRV);
     }
+    // Bind precomputed transfer function LUTs (t4-t6)
+    g_context->PSSetShaderResources(4, 1, &g_desktopGammaSRV);   // sRGB->2.2 correction
+    g_context->PSSetShaderResources(5, 1, &g_pqOetfSRV);         // PQ OETF (Linear->PQ)
+    g_context->PSSetShaderResources(6, 1, &g_pqEotfSRV);         // PQ EOTF (PQ->Linear)
+    g_context->PSSetShaderResources(7, 1, &g_srgbOetfSRV);       // sRGB OETF (Linear->sRGB)
+    g_context->PSSetShaderResources(8, 1, &g_srgbEotfSRV);       // sRGB EOTF (sRGB->Linear)
+    g_context->PSSetShaderResources(9, 1, &g_gammaRatioSRV);     // pow(Y, 1/11) for 2.4 gamma
+    g_context->PSSetShaderResources(10, 1, &g_wbGammaSRV);       // pow(gain, 1/2.2) for WB
 
     ID3D11SamplerState* samplers[] = { g_samplerPoint, g_samplerLinear, g_samplerWrap };
     g_context->PSSetSamplers(0, 3, samplers);
@@ -1388,9 +1539,11 @@ void RenderAll(FramePacer* fp) {
                 if (ctx.index == update.monitorIndex) {
                     if (update.isHDR) {
                         ctx.hdrColorCorrection = update.data;
+                        ctx.hdrColorCorrection.grayscale.ictcpValid = false;  // Force recompute
                     } else {
                         ctx.sdrColorCorrection = update.data;
                     }
+                    ctx.grayscaleICtCp = update.ictcpMode;
                     if (update.clearMhcFlags) {
                         ctx.sdrMhcPrimariesActive = false;
                         ctx.sdrMhcGrayscaleActive = false;
@@ -1405,6 +1558,7 @@ void RenderAll(FramePacer* fp) {
                               << " gsEn=" << update.data.grayscale.enabled
                               << " gsPts=" << update.data.grayscale.pointCount
                               << " clearMhc=" << update.clearMhcFlags
+                              << " ictcpMode=" << update.ictcpMode
                               << std::endl;
                     matched = true;
                     break;

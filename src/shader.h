@@ -47,10 +47,12 @@ cbuffer LUTParams : register(b0) {
     float isFP16SDR;           // ACM: FP16 capture with SDR color space (input is linear scRGB)
     float pqTargetPeak;        // Precomputed PQ of tonemapTargetPeak (avoids per-pixel pow())
     float pqGrayscalePeak;     // Precomputed PQ of grayscalePeakNits (avoids per-pixel pow())
-    float4 grayscale[8];
+    float4 grayscaleR[8];      // Per-channel red (32 floats)
+    float4 grayscaleG[8];      // Per-channel green (32 floats)
+    float4 grayscaleB[8];      // Per-channel blue (32 floats)
     float motionBarEnabled;
     float motionBarPosition;
-    float motionBarPad0;
+    float grayscaleICtCp;          // HDR: use ICtCp offsets instead of PQ per-channel gains
     float motionBarPad1;
 };
 
@@ -58,6 +60,13 @@ Texture2D<float4> captureTexture : register(t0);
 Texture3D<float4> lutTexture : register(t1);
 Texture2D<float> blueNoiseTexture : register(t2);
 Texture2D<float> peakTexture : register(t3);  // Dynamic peak detection result
+Texture2D<float> desktopGammaLUT : register(t4);  // Precomputed sRGB->2.2 correction (1024x1)
+Texture2D<float> pqOetfLUT : register(t5);        // PQ OETF: Linear->PQ, sqrt-domain (4096x1)
+Texture2D<float> pqEotfLUT : register(t6);        // PQ EOTF: PQ->Linear, uniform (4096x1)
+Texture2D<float> srgbOetfLUT : register(t7);      // sRGB OETF: Linear->sRGB (1024x1)
+Texture2D<float> srgbEotfLUT : register(t8);      // sRGB EOTF: sRGB->Linear (1024x1)
+Texture2D<float> gammaRatioLUT : register(t9);     // pow(Y, 1/11) ratio for 2.4 gamma (1024x1)
+Texture2D<float> wbGammaLUT : register(t10);       // pow(gain, 1/2.2) for WB gains [0,2] (512x1)
 SamplerState pointSampler : register(s0);
 SamplerState linearSampler : register(s1);
 SamplerState wrapSampler : register(s2);
@@ -70,61 +79,80 @@ float3 ApplyPrimariesMatrix(float3 rgb) {
 )"
 // Part 2: SDR transfer functions and grayscale correction
 R"(
-// sRGB transfer functions (IEC 61966-2-1)
-// Used by ACM SDR path to match Legacy SDR's native sRGB encoding
+// sRGB transfer functions via 1D LUT (IEC 61966-2-1)
+// 1 tex sample per channel replaces piecewise pow()
 float sRGB_OETF(float L) {
-    return (L <= 0.0031308f) ? (12.92f * L) : (1.055f * pow(L, 1.0f / 2.4f) - 0.055f);
+    float scale = 1023.0f / 1024.0f;
+    float bias = 0.5f / 1024.0f;
+    return srgbOetfLUT.SampleLevel(linearSampler, float2(saturate(L) * scale + bias, 0.5f), 0);
 }
 float sRGB_EOTF(float V) {
-    return (V <= 0.04045f) ? (V / 12.92f) : pow((V + 0.055f) / 1.055f, 2.4f);
+    float scale = 1023.0f / 1024.0f;
+    float bias = 0.5f / 1024.0f;
+    return srgbEotfLUT.SampleLevel(linearSampler, float2(saturate(V) * scale + bias, 0.5f), 0);
 }
 float3 sRGB_OETF3(float3 rgb) {
-    return float3(sRGB_OETF(rgb.r), sRGB_OETF(rgb.g), sRGB_OETF(rgb.b));
+    float scale = 1023.0f / 1024.0f;
+    float bias = 0.5f / 1024.0f;
+    float3 uv = saturate(rgb) * scale + bias;
+    return float3(
+        srgbOetfLUT.SampleLevel(linearSampler, float2(uv.x, 0.5f), 0),
+        srgbOetfLUT.SampleLevel(linearSampler, float2(uv.y, 0.5f), 0),
+        srgbOetfLUT.SampleLevel(linearSampler, float2(uv.z, 0.5f), 0));
 }
 float3 sRGB_EOTF3(float3 rgb) {
-    return float3(sRGB_EOTF(rgb.r), sRGB_EOTF(rgb.g), sRGB_EOTF(rgb.b));
+    float scale = 1023.0f / 1024.0f;
+    float bias = 0.5f / 1024.0f;
+    float3 uv = saturate(rgb) * scale + bias;
+    return float3(
+        srgbEotfLUT.SampleLevel(linearSampler, float2(uv.x, 0.5f), 0),
+        srgbEotfLUT.SampleLevel(linearSampler, float2(uv.y, 0.5f), 0),
+        srgbEotfLUT.SampleLevel(linearSampler, float2(uv.z, 0.5f), 0));
 }
 
-// Gamma 2.2 -> 2.4 transform (BT.1886)
-// Treats the encoded signal as gamma 2.2 (power law) and re-encodes for a 2.4 target.
-// In the encoded domain: pow(Y, 2.4/2.2) = pow(Y, 12/11), darkening midtones.
-// For apps/content that assume a 2.2-gamma display but you want a 2.4 rendering.
+// Gamma 2.2 -> 2.4 transform via LUT (BT.1886)
+// pow(Y, 12/11) = Y * pow(Y, 1/11), so we LUT-lookup pow(Y, 1/11) as a ratio multiplier.
+// 1 tex sample replaces 1 pow.
 float3 Apply24Gamma(float3 rgb) {
     if (grayscale24 < 0.5f) return rgb;
     float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
     if (Y < 1e-6f) return rgb;
-    float correctedY = pow(max(Y, 0.0f), 1.090909f);  // pow(L, 2.4/2.2) = 12/11
-    return rgb * (correctedY / Y);
+    float scale = 1023.0f / 1024.0f;
+    float bias = 0.5f / 1024.0f;
+    float ratio = gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(Y) * scale + bias, 0.5f), 0);
+    return rgb * ratio;  // ratio = pow(Y, 1/11) → rgb * pow(Y, 1/11) = rgb * correctedY/Y
 }
 
-// SDR grayscale: sqrt distribution in linear space
+// SDR grayscale: per-channel sqrt distribution in linear space
 float3 ApplyGrayscaleCorrection(float3 rgb) {
     if (grayscaleEnabled < 0.5) return rgb;
     float pointCount = max(2.0f, grayscalePoints);
     float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
+    if (Y < 1e-6f) return rgb;
     // sqrt distribution: index = sqrt(Y) * (N-1), curve stores Y values
     float idx = sqrt(saturate(Y)) * (pointCount - 1.0f);
     int i0 = (int)floor(idx);
     int i1 = min(i0 + 1, (int)pointCount - 1);
-    float v0 = grayscale[i0 / 4][i0 % 4];
-    float v1 = grayscale[i1 / 4][i1 % 4];
     float t = idx - floor(idx);
-    // Linear interpolation - no undulations, kinks imperceptible in practice
-    // Interpolate in sqrt domain for correct curve reconstruction
-    float s0 = sqrt(max(v0, 0.0f));
-    float s1 = sqrt(max(v1, 0.0f));
-    float correctedS = lerp(s0, s1, t);
-    float correctedY = correctedS * correctedS;
-    // Scale all channels proportionally to preserve chromaticity
-    if (Y < 1e-6f) return rgb;
-    return rgb * (correctedY / Y);
+    // Per-channel interpolation in sqrt domain
+    float sR0 = sqrt(max(grayscaleR[i0/4][i0%4], 0.0f));
+    float sR1 = sqrt(max(grayscaleR[i1/4][i1%4], 0.0f));
+    float corrR = lerp(sR0, sR1, t); corrR *= corrR;
+    float sG0 = sqrt(max(grayscaleG[i0/4][i0%4], 0.0f));
+    float sG1 = sqrt(max(grayscaleG[i1/4][i1%4], 0.0f));
+    float corrG = lerp(sG0, sG1, t); corrG *= corrG;
+    float sB0 = sqrt(max(grayscaleB[i0/4][i0%4], 0.0f));
+    float sB1 = sqrt(max(grayscaleB[i1/4][i1%4], 0.0f));
+    float corrB = lerp(sB0, sB1, t); corrB *= corrB;
+    // Scale each channel by its own correction relative to luminance
+    return float3(rgb.r * corrR / Y, rgb.g * corrG / Y, rgb.b * corrB / Y);
 }
 )"
 // Part 2b: ICTCP color space infrastructure (Dolby ICtCp for HDR)
 // Based on Dolby white paper "What is ICtCp?" v7.1
 // Provides perceptually uniform processing for tonemapping and grayscale
 R"(
-// PQ (ST.2084) constants
+// PQ (ST.2084) constants — used by compute shaders (pixel shader uses LUT lookups)
 static const float PQ_m1 = 0.1593017578125f;   // 2610/16384
 static const float PQ_m2 = 78.84375f;          // 2523/4096 * 128
 static const float PQ_c1 = 0.8359375f;         // 3424/4096
@@ -161,31 +189,39 @@ static const float3x3 ICtCp_to_LMSprime = {
     1.0f,  0.56003134f, -0.32062717f
 };
 
-// PQ OETF: Linear light (0-1 normalized to 10000 nits) -> PQ signal (0-1)
+// PQ OETF via 1D LUT: Linear light (0-1) -> PQ signal (0-1)
+// Sqrt-domain sampling for shadow precision (entry i = PQ((i/4095)^2))
+// Cost: 1 sqrt + 1 tex sample per channel (vs 2 pow per channel analytical)
 float3 Linear_to_PQ(float3 L) {
-    float3 Y = max(L, 1e-10f);
-    float3 Ym = pow(Y, PQ_m1);
-    return pow((PQ_c1 + PQ_c2 * Ym) / (1.0f + PQ_c3 * Ym), PQ_m2);
+    float3 sq = sqrt(max(L, 0.0f));
+    float scale = 4095.0f / 4096.0f;
+    float bias = 0.5f / 4096.0f;
+    return float3(
+        pqOetfLUT.SampleLevel(linearSampler, float2(sq.x * scale + bias, 0.5f), 0),
+        pqOetfLUT.SampleLevel(linearSampler, float2(sq.y * scale + bias, 0.5f), 0),
+        pqOetfLUT.SampleLevel(linearSampler, float2(sq.z * scale + bias, 0.5f), 0));
 }
 
-// PQ EOTF: PQ signal (0-1) -> Linear light (0-1 normalized to 10000 nits)
+// PQ EOTF via 1D LUT: PQ signal (0-1) -> Linear light (0-1)
+// Uniform sampling (PQ is perceptually uniform, so uniform = good resolution everywhere)
+// Cost: 1 tex sample per channel (vs 2 pow per channel analytical)
 float3 PQ_to_Linear(float3 pq) {
-    float3 Vm = pow(max(pq, 1e-10f), 1.0f / PQ_m2);
-    float3 t = max(Vm - PQ_c1, 0.0f) / max(PQ_c2 - PQ_c3 * Vm, 1e-10f);
-    return pow(t, 1.0f / PQ_m1);
+    float scale = 4095.0f / 4096.0f;
+    float bias = 0.5f / 4096.0f;
+    return float3(
+        pqEotfLUT.SampleLevel(linearSampler, float2(max(pq.x, 0.0f) * scale + bias, 0.5f), 0),
+        pqEotfLUT.SampleLevel(linearSampler, float2(max(pq.y, 0.0f) * scale + bias, 0.5f), 0),
+        pqEotfLUT.SampleLevel(linearSampler, float2(max(pq.z, 0.0f) * scale + bias, 0.5f), 0));
 }
 
-// Single-channel PQ for efficiency when only I channel needed
+// Single-channel PQ via LUT
 float Linear_to_PQ_scalar(float L) {
-    float Y = max(L, 1e-10f);
-    float Ym = pow(Y, PQ_m1);
-    return pow((PQ_c1 + PQ_c2 * Ym) / (1.0f + PQ_c3 * Ym), PQ_m2);
+    float sq = sqrt(max(L, 0.0f));
+    return pqOetfLUT.SampleLevel(linearSampler, float2(sq * (4095.0f / 4096.0f) + (0.5f / 4096.0f), 0.5f), 0);
 }
 
 float PQ_to_Linear_scalar(float pq) {
-    float Vm = pow(max(pq, 1e-10f), 1.0f / PQ_m2);
-    float t = max(Vm - PQ_c1, 0.0f) / max(PQ_c2 - PQ_c3 * Vm, 1e-10f);
-    return pow(t, 1.0f / PQ_m1);
+    return pqEotfLUT.SampleLevel(linearSampler, float2(max(pq, 0.0f) * (4095.0f / 4096.0f) + (0.5f / 4096.0f), 0.5f), 0);
 }
 
 )"
@@ -438,42 +474,9 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
     return float3(I_mapped, ictcp.y, ictcp.z);
 }
 
-// ICTCP Grayscale: operates on I (intensity) channel only
-// I channel is true perceptual luminance (r=0.998 correlation per Dolby paper)
-// Much more accurate than the old max-channel approximation
-float3 ApplyGrayscaleICtCp(float3 ictcp) {
-    if (grayscaleEnabled < 0.5f) return ictcp;
-    float pointCount = max(2.0f, grayscalePoints);
-
-    float I = ictcp.x;
-    if (I < 1e-6f) return ictcp;
-
-    // Use precomputed PQ peak from constant buffer (avoids per-pixel pow() calls)
-    float pqPeak = pqGrayscalePeak;
-
-    float scaledI = I / pqPeak;
-    float correctedI;
-
-    if (scaledI <= 1.0f) {
-        // Within calibration range - linear interpolation
-        // No undulations, kinks imperceptible in practice
-        float idx = scaledI * (pointCount - 1.0f);
-        int i0 = (int)floor(idx);
-        int i1 = min(i0 + 1, (int)pointCount - 1);
-        float t = idx - floor(idx);
-        float v0 = grayscale[i0 / 4][i0 % 4];
-        float v1 = grayscale[i1 / 4][i1 % 4];
-        correctedI = lerp(v0, v1, t) * pqPeak;
-    } else {
-        // Above peak - apply same correction factor as last point
-        int lastIdx = (int)pointCount - 1;
-        float lastCurveValue = grayscale[lastIdx / 4][lastIdx % 4];
-        correctedI = lastCurveValue * I;
-    }
-
-    // Return with CT/CP unchanged
-    return float3(correctedI, ictcp.y, ictcp.z);
-}
+// Note: ICtCp grayscale removed — per-channel grayscale now applied in linear Rec.2020
+// before ICtCp conversion (Stage 4 in HDR pipeline). This saves 5 pow/pixel when
+// only grayscale is active (no tonemap). The CPU precomputes PQ→linear gains per channel.
 
 // ICTCP Dithering: adds perceptually uniform blue noise
 // Dithering in ICtCp space ensures noise is distributed according to human perception
@@ -565,15 +568,19 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // Desktop gamma correction (sRGB EOTF -> 2.2 power law)
         // Fixes Windows using sRGB EOTF - applies to ALL SDR-range content (sub 80 nits)
         // Sign preserved for wide-gamut; HDR highlights (>80 nits) pass through unchanged
+        // Uses precomputed 1D LUT (0 pow) instead of analytical sRGB OETF+pow (6 pow)
         if (desktopGamma > 0.5) {
             float3 absInput = abs(input);
             float3 signInput = sign(input);
             float3 sdrPart = min(absInput, 1.0);
             float3 hdrPart = max(absInput - 1.0, 0.0);
-            float3 srgbEncoded = lerp(12.92 * sdrPart,
-                1.055 * pow(max(sdrPart, 0.0001), 1.0 / 2.4) - 0.055,
-                step(0.0031308, sdrPart));
-            float3 corrected = pow(max(srgbEncoded, 0.0001), 2.2);
+            // UV mapping: texel centers at (i+0.5)/1024, map [0,1] linear → texel space
+            float dgScale = 1023.0f / 1024.0f;
+            float dgBias = 0.5f / 1024.0f;
+            float3 corrected = float3(
+                desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.r * dgScale + dgBias, 0.5), 0),
+                desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.g * dgScale + dgBias, 0.5), 0),
+                desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.b * dgScale + dgBias, 0.5), 0));
             input = (corrected + hdrPart) * signInput;
         }
 
@@ -596,25 +603,77 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         rec2020 = ApplyPrimariesMatrix(rec2020);
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 4-6: ICtCp processing (only when grayscale or tonemap active)
-        // Skips 4 matrix multiplies + 6 pow() per pixel when neither is needed
+        // STAGE 4-6: Grayscale + ICtCp processing (unified or separate paths)
+        //
+        // Three paths:
+        //   A) Combined ICtCp (10 pow): grayscale(ICtCp offsets) + tonemap share one round-trip
+        //   B) ICtCp editing (10 pow): grayscale editor open, perceptually accurate preview
+        //   C) PQ/linear gains (4 pow): runtime grayscale only, tonemap off
+        //   D) Tonemap only (10 pow): no grayscale
+        //   E) Direct (0 pow): neither active
         // ═══════════════════════════════════════════════════════════════════════
 
         // Both paths converge to rec2020_out in 80/10000 normalized units
         float3 rec2020_out;
-        if (grayscaleEnabled > 0.5 || tonemapEnabled > 0.5) {
-            // ICtCp path: grayscale and/or tonemap need perceptual space
+        bool gsICtCp = (grayscaleEnabled > 0.5 && grayscaleICtCp > 0.5);
+        bool needICtCp = (tonemapEnabled > 0.5) || gsICtCp;
+
+        if (needICtCp) {
+            // Combined ICtCp path (10 pow) — grayscale + tonemap in single round-trip
             float3 lms = mul(Rec2020_to_LMS, rec2020);
             float3 lmsPQ = Linear_to_PQ(lms * (80.0f / 10000.0f));
             float3 ictcp = mul(LMSprime_to_ICtCp, lmsPQ);
 
-            ictcp = ApplyGrayscaleICtCp(ictcp);
-            ictcp = ApplyTonemappingICtCp(ictcp);
-            ictcp = ApplyDitherICtCp(ictcp, pos.xy);
+            // Grayscale: additive ICtCp offsets (precomputed on CPU)
+            if (gsICtCp) {
+                float scaledI = ictcp.x / pqGrayscalePeak;
+                float idx = saturate(scaledI) * (max(2.0f, grayscalePoints) - 1.0f);
+                int i0 = (int)floor(idx);
+                int i1 = min(i0 + 1, (int)max(2.0f, grayscalePoints) - 1);
+                float t = idx - floor(idx);
 
+                // CB stores ICtCp deltas in R/G/B arrays: R=deltaI, G=deltaCt, B=deltaCp
+                float dI  = lerp(grayscaleR[i0/4][i0%4], grayscaleR[i1/4][i1%4], t);
+                float dCt = lerp(grayscaleG[i0/4][i0%4], grayscaleG[i1/4][i1%4], t);
+                float dCp = lerp(grayscaleB[i0/4][i0%4], grayscaleB[i1/4][i1%4], t);
+
+                ictcp += float3(dI, dCt, dCp);
+            }
+
+            // Tonemap (I-channel, preserves Ct/Cp grayscale corrections)
+            if (tonemapEnabled > 0.5) {
+                ictcp = ApplyTonemappingICtCp(ictcp);
+                ictcp = ApplyDitherICtCp(ictcp, pos.xy);
+            }
+
+            // Back to Rec.2020
             float3 lmsPQ2 = mul(ICtCp_to_LMSprime, ictcp);
             float3 lms2 = PQ_to_Linear(lmsPQ2);
             rec2020_out = mul(LMS_to_Rec2020, lms2);
+
+        } else if (grayscaleEnabled > 0.5) {
+            // PQ/linear gain path (4 pow) — runtime, tonemap off
+            float luminance = dot(rec2020, float3(0.2627f, 0.6780f, 0.0593f));
+            float lumaNorm = luminance * (80.0f / 10000.0f);
+            float pqLuma = Linear_to_PQ_scalar(lumaNorm);
+            float scaledI = pqLuma / pqGrayscalePeak;
+            float idx = saturate(scaledI) * (max(2.0f, grayscalePoints) - 1.0f);
+            int i0 = (int)floor(idx);
+            int i1 = min(i0 + 1, (int)max(2.0f, grayscalePoints) - 1);
+            float t = idx - floor(idx);
+
+            float nR = lerp(grayscaleR[i0/4][i0%4], grayscaleR[i1/4][i1%4], t);
+            float nG = lerp(grayscaleG[i0/4][i0%4], grayscaleG[i1/4][i1%4], t);
+            float nB = lerp(grayscaleB[i0/4][i0%4], grayscaleB[i1/4][i1%4], t);
+
+            if (lumaNorm > 1e-10f) {
+                float3 corrPQ = float3(nR, nG, nB) * pqGrayscalePeak;
+                float gR = PQ_to_Linear_scalar(corrPQ.x) / lumaNorm;
+                float gG = PQ_to_Linear_scalar(corrPQ.y) / lumaNorm;
+                float gB = PQ_to_Linear_scalar(corrPQ.z) / lumaNorm;
+                rec2020 *= float3(gR, gG, gB);
+            }
+            rec2020_out = rec2020 * (80.0f / 10000.0f);
         } else {
             // Direct path: skip ICtCp entirely
             rec2020_out = rec2020 * (80.0f / 10000.0f);
@@ -707,13 +766,16 @@ R"(
         else corrected = SampleLUT(input);
 
         // White balance: applied after LUT (which was calibrated for D65 input)
-        // Applying before LUT caused the LUT to partially undo the white shift
-        // for neutrals while incorrectly remapping saturated colors
-        // pow(linearGain, 1/2.2) converts linear gain to gamma space
-        // (exact for power-law gamma, negligible error at sRGB toe)
+        // pow(linearGain, 1/2.2) via LUT converts linear gain to gamma space
+        // LUT domain [0,2], 512 entries — 1 tex sample per channel replaces 3 pow
         if (useManualCorrection > 0.5) {
             float3 wbGains = float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
-            corrected *= pow(max(wbGains, 0.001), 1.0 / 2.2);
+            float wbScale = 511.0f / 512.0f;
+            float wbBias = 0.5f / 512.0f;
+            corrected *= float3(
+                wbGammaLUT.SampleLevel(linearSampler, float2(saturate(wbGains.x * 0.5f) * wbScale + wbBias, 0.5f), 0),
+                wbGammaLUT.SampleLevel(linearSampler, float2(saturate(wbGains.y * 0.5f) * wbScale + wbBias, 0.5f), 0),
+                wbGammaLUT.SampleLevel(linearSampler, float2(saturate(wbGains.z * 0.5f) * wbScale + wbBias, 0.5f), 0));
         }
 
         // ═══════════════════════════════════════════════════════════════════════

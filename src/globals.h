@@ -35,6 +35,26 @@ extern IDCompositionDevice* g_dcompDevice;
 extern ID3D11Texture2D* g_blueNoiseTexture;
 extern ID3D11ShaderResourceView* g_blueNoiseSRV;
 
+// Desktop gamma LUT (shared) - precomputed sRGB→2.2 correction curve
+extern ID3D11Texture2D* g_desktopGammaTexture;
+extern ID3D11ShaderResourceView* g_desktopGammaSRV;
+
+// PQ transfer function LUTs (shared) - replace all pow() in HDR pixel shader
+extern ID3D11Texture2D* g_pqOetfTexture;   // Linear→PQ, sqrt-domain (4096 entries)
+extern ID3D11ShaderResourceView* g_pqOetfSRV;
+extern ID3D11Texture2D* g_pqEotfTexture;   // PQ→Linear, uniform (4096 entries)
+extern ID3D11ShaderResourceView* g_pqEotfSRV;
+
+// SDR transfer function LUTs (shared) - replace all pow() in SDR pixel shader
+extern ID3D11Texture2D* g_srgbOetfTexture;     // Linear→sRGB (1024 entries)
+extern ID3D11ShaderResourceView* g_srgbOetfSRV;
+extern ID3D11Texture2D* g_srgbEotfTexture;     // sRGB→Linear (1024 entries)
+extern ID3D11ShaderResourceView* g_srgbEotfSRV;
+extern ID3D11Texture2D* g_gammaRatioTexture;   // pow(Y, 1/11) ratio for 2.4 gamma (1024 entries)
+extern ID3D11ShaderResourceView* g_gammaRatioSRV;
+extern ID3D11Texture2D* g_wbGammaTexture;      // pow(gain, 1/2.2) for WB gains [0,2] (512 entries)
+extern ID3D11ShaderResourceView* g_wbGammaSRV;
+
 // ============================================================================
 // Monitor State
 // ============================================================================

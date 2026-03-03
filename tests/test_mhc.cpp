@@ -1166,3 +1166,288 @@ TEST_CASE("1D cube: valid identity file") {
     CHECK(r[0] == doctest::Approx(0.0f).epsilon(0.001));
     CHECK(r[15] == doctest::Approx(1.0f).epsilon(0.001));
 }
+
+// ============================================================================
+// Per-channel grayscale evaluation
+// ============================================================================
+
+TEST_CASE("Grayscale SDR per-channel: R=G=B equals single-value") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.initLinear();  // Also initializes pointsR/G/B to match points
+    // Modify some points
+    for (int i = 0; i < 20; i++) {
+        float t = (float)i / 19.0f;
+        gs.points[i] = t * t * 0.9f + 0.05f * t;  // Non-trivial curve
+        gs.pointsR[i] = gs.points[i];
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i];
+    }
+
+    // When per-channel matches single-value, results must be identical
+    float testInputs[] = { 0.0f, 0.01f, 0.1f, 0.25f, 0.5f, 0.75f, 1.0f };
+    for (float Y : testInputs) {
+        float single = EvalGrayscaleSDR(Y, gs);
+        float chR = EvalGrayscaleSDR_Channel(Y, gs, 0);
+        float chG = EvalGrayscaleSDR_Channel(Y, gs, 1);
+        float chB = EvalGrayscaleSDR_Channel(Y, gs, 2);
+        CHECK(chR == doctest::Approx(single).epsilon(0.0001));
+        CHECK(chG == doctest::Approx(single).epsilon(0.0001));
+        CHECK(chB == doctest::Approx(single).epsilon(0.0001));
+    }
+}
+
+TEST_CASE("Grayscale SDR per-channel: independent corrections") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 10;
+    gs.initLinear();
+    // Set different R/G/B at midpoint (index 5)
+    // Base points are all equal, but per-channel differs
+    float t5 = 5.0f / 9.0f;
+    float base = t5 * t5;
+    gs.pointsR[5] = base * 0.9f;  // R darker
+    gs.pointsG[5] = base * 1.0f;  // G unchanged
+    gs.pointsB[5] = base * 1.1f;  // B brighter
+
+    float Y = base;  // Linear value at index 5
+    float chR = EvalGrayscaleSDR_Channel(Y, gs, 0);
+    float chG = EvalGrayscaleSDR_Channel(Y, gs, 1);
+    float chB = EvalGrayscaleSDR_Channel(Y, gs, 2);
+    CHECK(chR < chG);
+    CHECK(chG < chB);
+}
+
+TEST_CASE("Grayscale HDR per-channel: R=G=B equals single-value") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Modify to non-trivial curve
+    for (int i = 0; i < 20; i++) {
+        float t = (float)i / 19.0f;
+        gs.points[i] = t * 0.95f + 0.025f * t * t;
+        gs.pointsR[i] = gs.points[i];
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i];
+    }
+
+    float pqPeak = PqOETF(1000.0f / 10000.0f);
+    float testPQ[] = { 0.0f, 0.1f, 0.3f, 0.5f, 0.7f, pqPeak };
+    for (float pq : testPQ) {
+        float single = EvalGrayscaleHDR(pq, gs, pqPeak);
+        float chR = EvalGrayscaleHDR_Channel(pq, gs, pqPeak, 0);
+        float chG = EvalGrayscaleHDR_Channel(pq, gs, pqPeak, 1);
+        float chB = EvalGrayscaleHDR_Channel(pq, gs, pqPeak, 2);
+        CHECK(chR == doctest::Approx(single).epsilon(0.0001));
+        CHECK(chG == doctest::Approx(single).epsilon(0.0001));
+        CHECK(chB == doctest::Approx(single).epsilon(0.0001));
+    }
+}
+
+TEST_CASE("Grayscale HDR per-channel: independent corrections") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 10;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Make R < G < B at midpoint
+    gs.pointsR[5] = gs.points[5] * 0.95f;
+    gs.pointsG[5] = gs.points[5] * 1.00f;
+    gs.pointsB[5] = gs.points[5] * 1.05f;
+
+    float pqPeak = PqOETF(1000.0f / 10000.0f);
+    float pqMid = (5.0f / 9.0f) * pqPeak;
+    float chR = EvalGrayscaleHDR_Channel(pqMid, gs, pqPeak, 0);
+    float chG = EvalGrayscaleHDR_Channel(pqMid, gs, pqPeak, 1);
+    float chB = EvalGrayscaleHDR_Channel(pqMid, gs, pqPeak, 2);
+    CHECK(chR < chG);
+    CHECK(chG < chB);
+}
+
+TEST_CASE("MHC LUT SDR per-channel: R/G/B differ") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 10;
+    gs.initLinear();
+    // Make R slightly darker, B slightly brighter than G
+    for (int i = 0; i < 10; i++) {
+        gs.pointsR[i] = gs.points[i] * 0.95f;
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i] * 1.05f;
+    }
+
+    const int lutSize = 256;
+    std::vector<float> lutR(lutSize), lutG(lutSize), lutB(lutSize);
+    GenerateMHC2LUT_SDR_Channel(gs, lutR.data(), lutSize, 0);
+    GenerateMHC2LUT_SDR_Channel(gs, lutG.data(), lutSize, 1);
+    GenerateMHC2LUT_SDR_Channel(gs, lutB.data(), lutSize, 2);
+
+    // Endpoints preserved
+    CHECK(lutR[0] == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(lutG[0] == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(lutB[0] == doctest::Approx(0.0f).epsilon(0.001));
+
+    // Mid-LUT values should differ: R < G < B
+    CHECK(lutR[128] < lutG[128]);
+    CHECK(lutG[128] < lutB[128]);
+}
+
+TEST_CASE("MHC LUT HDR per-channel: R/G/B differ") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 10;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    for (int i = 0; i < 10; i++) {
+        gs.pointsR[i] = gs.points[i] * 0.95f;
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i] * 1.05f;
+    }
+
+    const int lutSize = 512;
+    std::vector<float> lutR(lutSize), lutG(lutSize), lutB(lutSize);
+    GenerateMHC2LUT_HDR_Channel(gs, 1000.0f, lutR.data(), lutSize, 0);
+    GenerateMHC2LUT_HDR_Channel(gs, 1000.0f, lutG.data(), lutSize, 1);
+    GenerateMHC2LUT_HDR_Channel(gs, 1000.0f, lutB.data(), lutSize, 2);
+
+    // Endpoints
+    CHECK(lutR[0] == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(lutG[0] == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(lutB[0] == doctest::Approx(0.0f).epsilon(0.001));
+
+    // Mid-LUT: R < G < B
+    CHECK(lutR[256] < lutG[256]);
+    CHECK(lutG[256] < lutB[256]);
+}
+
+// ============================================================================
+// ICtCp Grayscale Offset Conversion
+// ============================================================================
+
+TEST_CASE("ICtCp offsets: identity produces zero deltas") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Identity: all deviations = 1.0, so pointsR/G/B = points (equal per-channel)
+
+    ComputeGrayscaleICtCpOffsets(gs);
+    CHECK(gs.ictcpValid);
+
+    // All deltas should be zero (or very close)
+    for (int i = 0; i < 20; i++) {
+        CHECK(gs.ictcpI[i] == doctest::Approx(0.0f).epsilon(0.001));
+        CHECK(gs.ictcpCt[i] == doctest::Approx(0.0f).epsilon(0.001));
+        CHECK(gs.ictcpCp[i] == doctest::Approx(0.0f).epsilon(0.001));
+    }
+}
+
+TEST_CASE("ICtCp offsets: equal non-identity produces zero Ct/Cp") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // All channels equally brighter at midpoint
+    for (int i = 0; i < 20; i++) {
+        float boosted = gs.points[i] * 1.05f;
+        gs.pointsR[i] = boosted;
+        gs.pointsG[i] = boosted;
+        gs.pointsB[i] = boosted;
+    }
+
+    ComputeGrayscaleICtCpOffsets(gs);
+    CHECK(gs.ictcpValid);
+
+    // Non-zero I deltas (luminance change), but Ct/Cp should be zero (no hue shift)
+    for (int i = 1; i < 20; i++) {
+        CHECK(gs.ictcpCt[i] == doctest::Approx(0.0f).epsilon(0.001));
+        CHECK(gs.ictcpCp[i] == doctest::Approx(0.0f).epsilon(0.001));
+    }
+    // At least some mid-range points should have non-zero I delta
+    bool anyNonZeroI = false;
+    for (int i = 5; i < 15; i++) {
+        if (std::fabs(gs.ictcpI[i]) > 1e-5f) anyNonZeroI = true;
+    }
+    CHECK(anyNonZeroI);
+}
+
+TEST_CASE("ICtCp offsets: red boost produces positive Cp") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Boost red only at midpoints
+    for (int i = 0; i < 20; i++) {
+        gs.pointsR[i] = gs.points[i] * 1.10f;  // Red 10% brighter
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i];
+    }
+
+    ComputeGrayscaleICtCpOffsets(gs);
+    CHECK(gs.ictcpValid);
+
+    // Red boost should produce positive Cp (protan axis) at mid-range points
+    // ICtCp Cp row: [4.378, -4.246, -0.133] — heavily weighted towards L (red-ish)
+    // More L' (from red) → more positive Cp
+    bool anyPositiveCp = false;
+    for (int i = 5; i < 15; i++) {
+        if (gs.ictcpCp[i] > 1e-5f) anyPositiveCp = true;
+    }
+    CHECK(anyPositiveCp);
+}
+
+TEST_CASE("ICtCp offsets: black point produces near-zero deltas") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Modify only mid/high points, leave black (index 0) at identity
+    for (int i = 5; i < 20; i++) {
+        gs.pointsR[i] = gs.points[i] * 1.05f;
+        gs.pointsG[i] = gs.points[i] * 0.95f;
+        gs.pointsB[i] = gs.points[i];
+    }
+
+    ComputeGrayscaleICtCpOffsets(gs);
+
+    // Index 0 (black) should have zero deltas regardless of other point modifications
+    CHECK(gs.ictcpI[0] == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(gs.ictcpCt[0] == doctest::Approx(0.0f).epsilon(0.001));
+    CHECK(gs.ictcpCp[0] == doctest::Approx(0.0f).epsilon(0.001));
+}
+
+TEST_CASE("ICtCp offsets: peak value produces no NaN/infinity") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Extreme corrections at peak
+    gs.pointsR[19] = gs.points[19] * 1.25f;  // +25%
+    gs.pointsG[19] = gs.points[19] * 0.75f;  // -25%
+    gs.pointsB[19] = gs.points[19] * 1.25f;
+
+    ComputeGrayscaleICtCpOffsets(gs);
+
+    for (int i = 0; i < 20; i++) {
+        CHECK(!std::isnan(gs.ictcpI[i]));
+        CHECK(!std::isinf(gs.ictcpI[i]));
+        CHECK(!std::isnan(gs.ictcpCt[i]));
+        CHECK(!std::isinf(gs.ictcpCt[i]));
+        CHECK(!std::isnan(gs.ictcpCp[i]));
+        CHECK(!std::isinf(gs.ictcpCp[i]));
+    }
+    // Beyond pointCount should be zero (identity)
+    for (int i = 20; i < 32; i++) {
+        CHECK(gs.ictcpI[i] == doctest::Approx(0.0f).epsilon(0.001));
+        CHECK(gs.ictcpCt[i] == doctest::Approx(0.0f).epsilon(0.001));
+        CHECK(gs.ictcpCp[i] == doctest::Approx(0.0f).epsilon(0.001));
+    }
+}

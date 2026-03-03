@@ -183,7 +183,7 @@ bool InitD3D() {
 
     // Create constant buffer for shader parameters
     D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = 272;  // 68 floats (17 float4s) - includes motion bar
+    cbDesc.ByteWidth = 544;  // 136 floats (34 float4s) - grayscaleR/G/B[8] + motion bar
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -221,6 +221,221 @@ bool InitD3D() {
     }
 
     std::cout << "Blue noise dithering: enabled (64x64 texture)" << std::endl;
+
+    // Create desktop gamma LUT (precomputed sRGB→2.2 correction)
+    // f(L) = (sRGB_OETF(L))^2.2 for L in [0,1]
+    // Replaces 6 pow() per pixel with 3 texture samples
+    {
+        const int DG_LUT_SIZE = 1024;
+        float dgData[DG_LUT_SIZE];
+        for (int i = 0; i < DG_LUT_SIZE; i++) {
+            float L = static_cast<float>(i) / static_cast<float>(DG_LUT_SIZE - 1);
+            // sRGB OETF: linear → encoded signal
+            float srgb;
+            if (L <= 0.0031308f)
+                srgb = 12.92f * L;
+            else
+                srgb = 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
+            // Decode with 2.2 power law
+            dgData[i] = powf(std::max(srgb, 0.0f), 2.2f);
+        }
+
+        D3D11_TEXTURE2D_DESC dgDesc = {};
+        dgDesc.Width = DG_LUT_SIZE;
+        dgDesc.Height = 1;
+        dgDesc.MipLevels = 1;
+        dgDesc.ArraySize = 1;
+        dgDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        dgDesc.SampleDesc.Count = 1;
+        dgDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        dgDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA dgInitData = {};
+        dgInitData.pSysMem = dgData;
+        dgInitData.SysMemPitch = DG_LUT_SIZE * sizeof(float);
+
+        hr = g_device->CreateTexture2D(&dgDesc, &dgInitData, &g_desktopGammaTexture);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create desktop gamma LUT texture: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+
+        hr = g_device->CreateShaderResourceView(g_desktopGammaTexture, nullptr, &g_desktopGammaSRV);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create desktop gamma LUT SRV: 0x" << std::hex << hr << std::dec << std::endl;
+            g_desktopGammaTexture->Release();
+            g_desktopGammaTexture = nullptr;
+            return false;
+        }
+
+        std::cout << "Desktop gamma LUT: enabled (1024-entry sRGB->2.2)" << std::endl;
+    }
+
+    // Create PQ transfer function LUTs (replaces all pow() in HDR pixel shader)
+    {
+        const int PQ_LUT_SIZE = 4096;
+
+        // PQ constants (ST.2084)
+        const float m1 = 0.1593017578125f;
+        const float m2 = 78.84375f;
+        const float c1 = 0.8359375f;
+        const float c2 = 18.8515625f;
+        const float c3 = 18.6875f;
+
+        // PQ OETF LUT: Linear [0,1] → PQ [0,1], sqrt-domain sampling for shadow precision
+        // Entry i maps to L = (i/(N-1))^2, stores PQ(L)
+        float oetfData[PQ_LUT_SIZE];
+        for (int i = 0; i < PQ_LUT_SIZE; i++) {
+            float t = static_cast<float>(i) / static_cast<float>(PQ_LUT_SIZE - 1);
+            float L = t * t;  // sqrt-domain: L = t^2, so shader does t = sqrt(L)
+            float Y = std::max(L, 1e-12f);
+            float Ym = powf(Y, m1);
+            oetfData[i] = powf((c1 + c2 * Ym) / (1.0f + c3 * Ym), m2);
+        }
+
+        // PQ EOTF LUT: PQ [0,1] → Linear [0,1], uniform sampling (PQ is perceptually uniform)
+        float eotfData[PQ_LUT_SIZE];
+        for (int i = 0; i < PQ_LUT_SIZE; i++) {
+            float pq = static_cast<float>(i) / static_cast<float>(PQ_LUT_SIZE - 1);
+            float Vm = powf(std::max(pq, 1e-12f), 1.0f / m2);
+            float t = std::max(Vm - c1, 0.0f) / std::max(c2 - c3 * Vm, 1e-12f);
+            eotfData[i] = powf(t, 1.0f / m1);
+        }
+
+        D3D11_TEXTURE2D_DESC pqDesc = {};
+        pqDesc.Width = PQ_LUT_SIZE;
+        pqDesc.Height = 1;
+        pqDesc.MipLevels = 1;
+        pqDesc.ArraySize = 1;
+        pqDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        pqDesc.SampleDesc.Count = 1;
+        pqDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        pqDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA oetfInitData = {};
+        oetfInitData.pSysMem = oetfData;
+        oetfInitData.SysMemPitch = PQ_LUT_SIZE * sizeof(float);
+
+        hr = g_device->CreateTexture2D(&pqDesc, &oetfInitData, &g_pqOetfTexture);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create PQ OETF LUT: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+        hr = g_device->CreateShaderResourceView(g_pqOetfTexture, nullptr, &g_pqOetfSRV);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create PQ OETF SRV: 0x" << std::hex << hr << std::dec << std::endl;
+            g_pqOetfTexture->Release(); g_pqOetfTexture = nullptr;
+            return false;
+        }
+
+        D3D11_SUBRESOURCE_DATA eotfInitData = {};
+        eotfInitData.pSysMem = eotfData;
+        eotfInitData.SysMemPitch = PQ_LUT_SIZE * sizeof(float);
+
+        hr = g_device->CreateTexture2D(&pqDesc, &eotfInitData, &g_pqEotfTexture);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create PQ EOTF LUT: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+        hr = g_device->CreateShaderResourceView(g_pqEotfTexture, nullptr, &g_pqEotfSRV);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create PQ EOTF SRV: 0x" << std::hex << hr << std::dec << std::endl;
+            g_pqEotfTexture->Release(); g_pqEotfTexture = nullptr;
+            return false;
+        }
+
+        std::cout << "PQ transfer LUTs: enabled (4096-entry OETF sqrt-domain + EOTF uniform)" << std::endl;
+    }
+
+    // Create sRGB transfer function LUTs (replaces pow() in SDR pixel shader)
+    {
+        const int SRGB_LUT_SIZE = 1024;
+
+        // sRGB OETF LUT: Linear [0,1] → sRGB encoded [0,1]
+        float oetfData[SRGB_LUT_SIZE];
+        for (int i = 0; i < SRGB_LUT_SIZE; i++) {
+            float L = static_cast<float>(i) / static_cast<float>(SRGB_LUT_SIZE - 1);
+            if (L <= 0.0031308f)
+                oetfData[i] = 12.92f * L;
+            else
+                oetfData[i] = 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
+        }
+
+        // sRGB EOTF LUT: sRGB encoded [0,1] → Linear [0,1]
+        float eotfData[SRGB_LUT_SIZE];
+        for (int i = 0; i < SRGB_LUT_SIZE; i++) {
+            float V = static_cast<float>(i) / static_cast<float>(SRGB_LUT_SIZE - 1);
+            if (V <= 0.04045f)
+                eotfData[i] = V / 12.92f;
+            else
+                eotfData[i] = powf((V + 0.055f) / 1.055f, 2.4f);
+        }
+
+        // Gamma 2.4/2.2 ratio LUT: stores pow(Y, 1/11) for Y in [0,1]
+        // Apply24Gamma needs ratio = pow(Y, 12/11) / Y = pow(Y, 1/11)
+        float gammaRatioData[SRGB_LUT_SIZE];
+        for (int i = 0; i < SRGB_LUT_SIZE; i++) {
+            float Y = static_cast<float>(i) / static_cast<float>(SRGB_LUT_SIZE - 1);
+            if (Y < 1e-6f)
+                gammaRatioData[i] = 1.0f;  // Avoid 0^(1/11) = 0 → ratio = 0/0
+            else
+                gammaRatioData[i] = powf(Y, 1.0f / 11.0f);  // pow(Y, 1/11) = pow(Y,12/11)/Y
+        }
+
+        // White balance gamma LUT: stores pow(gain, 1/2.2) for gain in [0,2]
+        // Domain [0,2] covers typical WB gains; UV = gain/2
+        const int WB_LUT_SIZE = 512;
+        float wbGammaData[WB_LUT_SIZE];
+        for (int i = 0; i < WB_LUT_SIZE; i++) {
+            float gain = static_cast<float>(i) / static_cast<float>(WB_LUT_SIZE - 1) * 2.0f;
+            wbGammaData[i] = powf(std::max(gain, 0.001f), 1.0f / 2.2f);
+        }
+
+        D3D11_TEXTURE2D_DESC srgbDesc = {};
+        srgbDesc.Width = SRGB_LUT_SIZE;
+        srgbDesc.Height = 1;
+        srgbDesc.MipLevels = 1;
+        srgbDesc.ArraySize = 1;
+        srgbDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        srgbDesc.SampleDesc.Count = 1;
+        srgbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        srgbDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        // sRGB OETF
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = oetfData;
+        initData.SysMemPitch = SRGB_LUT_SIZE * sizeof(float);
+        hr = g_device->CreateTexture2D(&srgbDesc, &initData, &g_srgbOetfTexture);
+        if (FAILED(hr)) { std::cerr << "Failed to create sRGB OETF LUT\n"; return false; }
+        hr = g_device->CreateShaderResourceView(g_srgbOetfTexture, nullptr, &g_srgbOetfSRV);
+        if (FAILED(hr)) { g_srgbOetfTexture->Release(); g_srgbOetfTexture = nullptr; return false; }
+
+        // sRGB EOTF
+        initData.pSysMem = eotfData;
+        hr = g_device->CreateTexture2D(&srgbDesc, &initData, &g_srgbEotfTexture);
+        if (FAILED(hr)) { std::cerr << "Failed to create sRGB EOTF LUT\n"; return false; }
+        hr = g_device->CreateShaderResourceView(g_srgbEotfTexture, nullptr, &g_srgbEotfSRV);
+        if (FAILED(hr)) { g_srgbEotfTexture->Release(); g_srgbEotfTexture = nullptr; return false; }
+
+        // Gamma 2.4/2.2 ratio
+        initData.pSysMem = gammaRatioData;
+        hr = g_device->CreateTexture2D(&srgbDesc, &initData, &g_gammaRatioTexture);
+        if (FAILED(hr)) { std::cerr << "Failed to create gamma ratio LUT\n"; return false; }
+        hr = g_device->CreateShaderResourceView(g_gammaRatioTexture, nullptr, &g_gammaRatioSRV);
+        if (FAILED(hr)) { g_gammaRatioTexture->Release(); g_gammaRatioTexture = nullptr; return false; }
+
+        // White balance gamma
+        D3D11_TEXTURE2D_DESC wbDesc = srgbDesc;
+        wbDesc.Width = WB_LUT_SIZE;
+        initData.pSysMem = wbGammaData;
+        initData.SysMemPitch = WB_LUT_SIZE * sizeof(float);
+        hr = g_device->CreateTexture2D(&wbDesc, &initData, &g_wbGammaTexture);
+        if (FAILED(hr)) { std::cerr << "Failed to create WB gamma LUT\n"; return false; }
+        hr = g_device->CreateShaderResourceView(g_wbGammaTexture, nullptr, &g_wbGammaSRV);
+        if (FAILED(hr)) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; return false; }
+
+        std::cout << "SDR transfer LUTs: enabled (sRGB OETF/EOTF + gamma ratio + WB gamma)" << std::endl;
+    }
 
     return true;
 }
@@ -297,6 +512,20 @@ void ReleaseSharedD3DResources() {
     if (g_dcompDevice) { g_dcompDevice->Release(); g_dcompDevice = nullptr; }
     if (g_blueNoiseSRV) { g_blueNoiseSRV->Release(); g_blueNoiseSRV = nullptr; }
     if (g_blueNoiseTexture) { g_blueNoiseTexture->Release(); g_blueNoiseTexture = nullptr; }
+    if (g_desktopGammaSRV) { g_desktopGammaSRV->Release(); g_desktopGammaSRV = nullptr; }
+    if (g_desktopGammaTexture) { g_desktopGammaTexture->Release(); g_desktopGammaTexture = nullptr; }
+    if (g_pqOetfSRV) { g_pqOetfSRV->Release(); g_pqOetfSRV = nullptr; }
+    if (g_pqOetfTexture) { g_pqOetfTexture->Release(); g_pqOetfTexture = nullptr; }
+    if (g_pqEotfSRV) { g_pqEotfSRV->Release(); g_pqEotfSRV = nullptr; }
+    if (g_pqEotfTexture) { g_pqEotfTexture->Release(); g_pqEotfTexture = nullptr; }
+    if (g_srgbOetfSRV) { g_srgbOetfSRV->Release(); g_srgbOetfSRV = nullptr; }
+    if (g_srgbOetfTexture) { g_srgbOetfTexture->Release(); g_srgbOetfTexture = nullptr; }
+    if (g_srgbEotfSRV) { g_srgbEotfSRV->Release(); g_srgbEotfSRV = nullptr; }
+    if (g_srgbEotfTexture) { g_srgbEotfTexture->Release(); g_srgbEotfTexture = nullptr; }
+    if (g_gammaRatioSRV) { g_gammaRatioSRV->Release(); g_gammaRatioSRV = nullptr; }
+    if (g_gammaRatioTexture) { g_gammaRatioTexture->Release(); g_gammaRatioTexture = nullptr; }
+    if (g_wbGammaSRV) { g_wbGammaSRV->Release(); g_wbGammaSRV = nullptr; }
+    if (g_wbGammaTexture) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; }
     if (g_constantBuffer) { g_constantBuffer->Release(); g_constantBuffer = nullptr; }
     if (g_samplerPoint) { g_samplerPoint->Release(); g_samplerPoint = nullptr; }
     if (g_samplerLinear) { g_samplerLinear->Release(); g_samplerLinear = nullptr; }

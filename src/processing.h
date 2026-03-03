@@ -19,7 +19,8 @@ void StartProcessing();
 void StopProcessing();
 
 // Update color correction for a running monitor in real-time
-void UpdateColorCorrectionLive(int monitorIndex, bool isHDR);
+// ictcpMode: when true (HDR editing), shader uses ICtCp offsets for perceptually accurate preview
+void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode = false);
 
 // Check if current settings differ from active (running) settings
 bool SettingsChanged();

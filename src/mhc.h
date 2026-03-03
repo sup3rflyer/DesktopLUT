@@ -139,9 +139,19 @@ float PqOETF(float L);
 // Grayscale evaluation (exposed for testing)
 float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs);
 float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak);
+float EvalGrayscaleSDR_Channel(float Y_linear, const GrayscaleData& gs, int channel);
+float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqPeak, int channel);
+
+// Per-channel MHC2 LUT generators (exposed for testing)
+void GenerateMHC2LUT_SDR_Channel(const GrayscaleData& gs, float* outLUT, int lutSize, int channel);
+void GenerateMHC2LUT_HDR_Channel(const GrayscaleData& gs, float peakNits, float* outLUT, int lutSize, int channel);
 
 // TRC inversion (exposed for testing)
 float InvertTRC(const std::vector<float>& trc, float targetLinear);
+
+// ICtCp grayscale conversion (exposed for testing)
+// Converts per-channel PQ corrections → ICtCp delta offsets for combined pass
+void ComputeGrayscaleICtCpOffsets(GrayscaleData& gs);
 
 // ============================================================================
 // Profile Query (for monitoring)
