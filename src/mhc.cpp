@@ -601,26 +601,14 @@ void GenerateMHC2LUT_FromTRC_SDR(const std::vector<float>& trc, float* outLUT, i
 
 // Generate MHC2 1D LUT from a measured per-channel TRC curve (HDR / PQ).
 // ICC TRC maps PQ signal (0-1) → linear light (0-1, normalized to display peak).
-// Pipeline: pqIn → PqEOTF (target linear) → BPC → InvertTRC → pqOut
+// Pipeline: pqIn → PqEOTF (target linear) → InvertTRC → pqOut
 // For a perfect PQ display: TRC(s) = PqEOTF(s)*10000/peak, so InvertTRC(target) = pqIn → identity.
-//
-// Black point compensation (BPC): The display's black level (TRC[0]) may be above the target
-// luminance for low PQ values. Without BPC, everything below the display's black floor maps to 0,
-// crushing shadow detail. BPC linearly remaps the target range from (0, 1) to (blackLevel, 1),
-// preserving relative shadow detail while accepting the display's actual minimum luminance.
 void GenerateMHC2LUT_FromTRC_HDR(const std::vector<float>& trc, float* outLUT, int lutSize, float peakNits) {
-    float blackLevel = (!trc.empty()) ? trc[0] : 0.0f;  // Display's minimum luminance (normalized)
-
     for (int j = 0; j < lutSize; j++) {
         float pqIn = (float)j / (float)(lutSize - 1);
-        // Target: ideal PQ response, normalized to display peak
         float targetLinear = PqEOTF(pqIn) * 10000.0f / peakNits;
-        targetLinear = (std::min)(targetLinear, 1.0f);  // Clip to display capability
-        // Black point compensation: remap (0, 1) → (blackLevel, 1)
-        // PQ 0% → display's actual black; PQ at peak → display's peak; shadow detail preserved
-        float bpcTarget = blackLevel + targetLinear * (1.0f - blackLevel);
-        // Find what PQ signal the display needs to produce this luminance
-        float pqOut = InvertTRC(trc, bpcTarget);
+        targetLinear = (std::min)(targetLinear, 1.0f);
+        float pqOut = InvertTRC(trc, targetLinear);
         outLUT[j] = std::clamp(pqOut, 0.0f, 1.0f);
     }
 }
