@@ -398,27 +398,21 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
     case FramePacerStrategy::CompositorClockPredictive: {
         HANDLE handles[] = { wakeEvent };
         DWORD handleCount = wakeEvent ? 1 : 0;
-        for (;;) {
-            DWORD result = g_pfnWaitForCompositorClock(handleCount,
-                                                         handleCount ? handles : nullptr,
-                                                         INFINITE);
-            if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-                if (!g_displayOff.load(std::memory_order_relaxed)) {
-                    std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
-                    g_displayOff.store(true, std::memory_order_relaxed);
-                }
-                Sleep(100);
-                g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-                return false;
+        DWORD result = g_pfnWaitForCompositorClock(handleCount,
+                                                     handleCount ? handles : nullptr,
+                                                     INFINITE);
+        if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+            if (!g_displayOff.load(std::memory_order_relaxed)) {
+                std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
+                g_displayOff.store(true, std::memory_order_relaxed);
             }
-            // Wake event fired (auto-sleep/reinit) — re-wait for actual VBlank
-            if (handleCount > 0 && result >= WAIT_OBJECT_0 + 1
-                && result <= WAIT_OBJECT_0 + handleCount) {
-                handleCount = 0;
-                continue;
-            }
-            break;
+            Sleep(100);
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            return false;
         }
+        // Wake event fired (auto-sleep/reinit) or VBlank — proceed with current QPC.
+        // Note: if wake event fired, vblankWakeQpc will be slightly off-VBlank, but
+        // re-waiting for the next VBlank halves frame rate (was causing 30fps at 60Hz).
 
         if (g_displayOff.load(std::memory_order_relaxed)) {
             Sleep(100);
@@ -456,26 +450,17 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
         if (g_pfnWaitForCompositorClock) {
             HANDLE handles[] = { wakeEvent };
             DWORD handleCount = wakeEvent ? 1 : 0;
-            for (;;) {
-                DWORD result = g_pfnWaitForCompositorClock(handleCount,
-                                                             handleCount ? handles : nullptr,
-                                                             INFINITE);
-                if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-                    if (!g_displayOff.load(std::memory_order_relaxed)) {
-                        std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
-                        g_displayOff.store(true, std::memory_order_relaxed);
-                    }
-                    Sleep(100);
-                    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-                    return false;
+            DWORD result = g_pfnWaitForCompositorClock(handleCount,
+                                                         handleCount ? handles : nullptr,
+                                                         INFINITE);
+            if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
+                if (!g_displayOff.load(std::memory_order_relaxed)) {
+                    std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
+                    g_displayOff.store(true, std::memory_order_relaxed);
                 }
-                // Wake event fired — re-wait for actual VBlank
-                if (handleCount > 0 && result >= WAIT_OBJECT_0 + 1
-                    && result <= WAIT_OBJECT_0 + handleCount) {
-                    handleCount = 0;
-                    continue;
-                }
-                break;
+                Sleep(100);
+                g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+                return false;
             }
         } else {
             if (FAILED(DwmFlush())) { Sleep(1); }
