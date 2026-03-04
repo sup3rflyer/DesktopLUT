@@ -1371,7 +1371,6 @@ void RenderAll(FramePacer* fp) {
 
     // Check for forced reinit (e.g., resume from sleep)
     if (g_forceReinit.exchange(false)) {
-        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         // Reset frame pacer EMA and cadence lock (force re-convergence after wake)
         if (fp) {
             ResetFramePacerState(fp, "forced reinit");
@@ -1525,9 +1524,7 @@ void RenderAll(FramePacer* fp) {
 
     // Apply any pending color correction updates (fast path: skip mutex if no updates)
     // Swap-under-lock pattern: grab pending updates quickly, process without holding lock
-    // Also signal wake event in case we're about to enter auto-sleep check
     if (g_hasPendingColorCorrections.load(std::memory_order_acquire)) {
-        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         std::vector<PendingColorCorrection> localUpdates;
         {
             std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
