@@ -11,9 +11,9 @@
 #include <cmath>
 
 // RGB strip dimensions
-static constexpr int RGB_STRIP_W = 32;
+static constexpr int RGB_STRIP_W = 38;
 static constexpr int RGB_STRIP_H = 50;   // Vertical bars height
-static constexpr int RGB_BAR_W = 8;
+static constexpr int RGB_BAR_W = 10;
 static constexpr int RGB_BAR_GAP = 2;
 // RGB deviation range (same as GRAYSCALE_RANGE for consistency: +/-25%)
 static constexpr float RGB_DEV_STEP = 0.001f;  // 0.1% per scroll notch
@@ -25,8 +25,9 @@ static const COLORREF kStripColors[3] = {
 };
 
 // Channel color indicator bars under RGB edit boxes (file-static, one editor at a time)
-static std::vector<HWND> s_rgbIndicators;
-static HBRUSH s_indicatorBrush = nullptr;
+static std::vector<HWND> s_rgbIndicators;         // One per point
+static std::vector<int>  s_indicatorChannel;       // Per-point last-edited channel (0=R,1=G,2=B)
+static HBRUSH s_indicatorBrushes[3] = {};          // One brush per channel color
 
 static constexpr int RGB_INDICATOR_H = 3;
 
@@ -34,7 +35,7 @@ static constexpr int RGB_INDICATOR_H = 3;
 static void FireLiveUpdate();
 static void UpdateRGBEditBoxes();
 static void InvalidateAllStrips();
-static void InvalidateIndicators();
+static void SetPointIndicatorChannel(int pointIndex, int ch);
 static int ChannelFromX(int x, int controlW = RGB_STRIP_W);
 
 // ============================================================================
@@ -128,6 +129,7 @@ static LRESULT CALLBACK RGBStripProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int ch = ChannelFromX(x);
         if (ch >= 0) {
             data->selectedChannel = ch;
+            SetPointIndicatorChannel(stripData->pointIndex, ch);
             UpdateRGBEditBoxes();
             InvalidateAllStrips();
         }
@@ -135,18 +137,16 @@ static LRESULT CALLBACK RGBStripProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     }
 
     case WM_MBUTTONDOWN: {
-        // Middle click: reset channel deviation to 1.0
+        // Middle click: reset all 3 channels to 1.0
         if (!data || !stripData) break;
-        int x = LOWORD(lParam);
-        int ch = ChannelFromX(x);
-        if (ch < 0) ch = data->selectedChannel;
-        if (ch >= 0 && data->rgbDeviations[ch]) {
-            data->rgbDeviations[ch][stripData->pointIndex] = 1.0f;
-            data->selectedChannel = ch;
-            UpdateRGBEditBoxes();
-            InvalidateRect(hwnd, nullptr, FALSE);
-            FireLiveUpdate();
+        int pi = stripData->pointIndex;
+        for (int c = 0; c < 3; c++) {
+            if (data->rgbDeviations[c] && pi < data->pointCount)
+                data->rgbDeviations[c][pi] = 1.0f;
         }
+        UpdateRGBEditBoxes();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        FireLiveUpdate();
         return 0;
     }
 
@@ -172,6 +172,7 @@ static LRESULT CALLBACK RGBStripProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             float minDev = 1.0f - (float)GRAYSCALE_RANGE / 100.0f;
             dev = (std::max)(minDev, (std::min)(maxDev, dev));
             data->selectedChannel = ch;
+            SetPointIndicatorChannel(stripData->pointIndex, ch);
             UpdateRGBEditBoxes();
             InvalidateRect(hwnd, nullptr, FALSE);
             FireLiveUpdate();
@@ -205,10 +206,11 @@ static void FireLiveUpdate() {
 static void UpdateRGBEditBoxes() {
     auto* data = g_grayscaleEditor;
     if (!data) return;
-    int ch = data->selectedChannel;
-    if (ch < 0) return;
 
     for (int i = 0; i < data->pointCount && i < (int)data->rgbEditBoxes.size(); i++) {
+        // Each point shows its own last-edited channel
+        int ch = (i < (int)s_indicatorChannel.size()) ? s_indicatorChannel[i] : 0;
+        if (ch < 0) ch = 0;
         float dev = (data->rgbDeviations[ch] && i < data->pointCount)
             ? data->rgbDeviations[ch][i] : 1.0f;
         float pct = (dev - 1.0f) * 100.0f;
@@ -216,7 +218,6 @@ static void UpdateRGBEditBoxes() {
         swprintf_s(text, L"%.2f", pct);
         SetWindowText(data->rgbEditBoxes[i], text);
     }
-    InvalidateIndicators();
 }
 
 static void InvalidateAllStrips() {
@@ -227,33 +228,32 @@ static void InvalidateAllStrips() {
     }
 }
 
-static void InvalidateIndicators() {
-    for (HWND ind : s_rgbIndicators) {
-        if (ind) InvalidateRect(ind, nullptr, TRUE);
-    }
-    // Recreate brush for current channel
-    if (s_indicatorBrush) { DeleteObject(s_indicatorBrush); s_indicatorBrush = nullptr; }
-    auto* data = g_grayscaleEditor;
-    int ch = data ? data->selectedChannel : 0;
-    if (ch < 0) ch = 0;
-    s_indicatorBrush = CreateSolidBrush(kStripColors[ch]);
+static void SetPointIndicatorChannel(int pointIndex, int ch) {
+    if (pointIndex < 0 || pointIndex >= (int)s_indicatorChannel.size()) return;
+    if (ch < 0 || ch > 2) return;
+    s_indicatorChannel[pointIndex] = ch;
+    if (pointIndex < (int)s_rgbIndicators.size() && s_rgbIndicators[pointIndex])
+        InvalidateRect(s_rgbIndicators[pointIndex], nullptr, TRUE);
 }
 
 static void ApplyRGBEditValue(int pointIndex) {
     auto* data = g_grayscaleEditor;
     if (!data || pointIndex < 0 || pointIndex >= data->pointCount) return;
-    int ch = data->selectedChannel;
+    // Use this point's tracked channel, not the global one
+    int ch = (pointIndex < (int)s_indicatorChannel.size()) ? s_indicatorChannel[pointIndex] : data->selectedChannel;
     if (ch < 0) return;
     if (pointIndex >= (int)data->rgbEditBoxes.size()) return;
 
     wchar_t text[16];
     GetWindowText(data->rgbEditBoxes[pointIndex], text, 16);
     float pct = (float)_wtof(text);
-    pct = (std::max)(-(float)GRAYSCALE_RANGE, (std::min)((float)GRAYSCALE_RANGE, pct));
+    static constexpr float RGB_MANUAL_MAX = 50.0f;  // Manual input allows wider range than slider
+    pct = (std::max)(-RGB_MANUAL_MAX, (std::min)(RGB_MANUAL_MAX, pct));
     float dev = 1.0f + pct / 100.0f;
 
     if (data->rgbDeviations[ch] && pointIndex < data->pointCount) {
         data->rgbDeviations[ch][pointIndex] = dev;
+        SetPointIndicatorChannel(pointIndex, ch);
         // Reformat
         wchar_t fmt[16];
         swprintf_s(fmt, L"%.2f", pct);
@@ -275,12 +275,12 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         data->hwndDialog = hwnd;
 
-        int sliderW = 32;
+        int sliderW = 38;
         int sliderH = 150;
         int rgbLabelH = 16;   // Code value at top (8-bit SDR, 10-bit HDR)
         int pctLabelH = 16;   // Input percentage below slider
         int editH = 20;
-        int pad = 2;
+        int pad = 4;
         int startX = 10;
         int startY = 10;
 
@@ -373,11 +373,12 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             SetNumericEdit(rgbEdit, 2);
             data->rgbEditBoxes.push_back(rgbEdit);
 
-            // Channel color indicator bar below RGB edit
+            // Channel color indicator bar below RGB edit (shows last-edited channel per point)
             HWND indicator = CreateWindow(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 x, rgbEditY + editH, sliderW, RGB_INDICATOR_H,
                 hwnd, nullptr, nullptr, nullptr);
             s_rgbIndicators.push_back(indicator);
+            s_indicatorChannel.push_back(data->selectedChannel >= 0 ? data->selectedChannel : 0);
         }
 
         // Calculate dialog content width
@@ -388,16 +389,16 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         int labelX = dialogContentW - 36;
         const wchar_t* chLabels[] = { L"R", L"G", L"B" };
         for (int ch = 0; ch < 3; ch++) {
-            int barCenterY = stripY + (int)((1.0f) * 0.5f * (RGB_STRIP_H - 1));
-            // Position labels at top/middle/bottom of strip area
             int labelY = stripY + ch * (RGB_STRIP_H / 3);
             CreateWindow(L"STATIC", chLabels[ch], WS_CHILD | WS_VISIBLE | SS_CENTER,
                 labelX, labelY, 20, 16, hwnd, nullptr, nullptr, nullptr);
         }
 
-        // Initialize indicator brush for default channel
-        if (s_indicatorBrush) { DeleteObject(s_indicatorBrush); s_indicatorBrush = nullptr; }
-        s_indicatorBrush = CreateSolidBrush(kStripColors[data->selectedChannel >= 0 ? data->selectedChannel : 0]);
+        // Initialize per-channel indicator brushes
+        for (int ch = 0; ch < 3; ch++) {
+            if (s_indicatorBrushes[ch]) { DeleteObject(s_indicatorBrushes[ch]); }
+            s_indicatorBrushes[ch] = CreateSolidBrush(kStripColors[ch]);
+        }
 
         // Buttons
         int rgbEditY = stripY + RGB_STRIP_H + 2;
@@ -472,7 +473,8 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         // Check if hovering over a per-point RGB edit box
         for (int i = 0; i < data->pointCount && i < (int)data->rgbEditBoxes.size(); i++) {
             if (data->rgbEditBoxes[i] == hwndUnder) {
-                int ch = data->selectedChannel;
+                // Use this point's tracked channel
+                int ch = (i < (int)s_indicatorChannel.size()) ? s_indicatorChannel[i] : data->selectedChannel;
                 if (ch < 0) break;
 
                 static int rgbEditWheelAccum = 0;
@@ -487,6 +489,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     float maxDev = 1.0f + (float)GRAYSCALE_RANGE / 100.0f;
                     float minDev = 1.0f - (float)GRAYSCALE_RANGE / 100.0f;
                     dev = (std::max)(minDev, (std::min)(maxDev, dev));
+                    SetPointIndicatorChannel(i, ch);
                     // Update just this edit box
                     wchar_t text[16];
                     swprintf_s(text, L"%.2f", (dev - 1.0f) * 100.0f);
@@ -523,18 +526,18 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             }
         }
 
-        // RGB edit box: reset selected channel's deviation to 1.0
+        // RGB edit box: reset all 3 channels to 1.0 for this point
         for (int i = 0; i < data->pointCount && i < (int)data->rgbEditBoxes.size(); i++) {
             if (data->rgbEditBoxes[i] == child) {
-                int ch = data->selectedChannel;
-                if (ch >= 0 && data->rgbDeviations[ch]) {
-                    data->rgbDeviations[ch][i] = 1.0f;
-                    wchar_t text[16];
-                    swprintf_s(text, L"%.2f", 0.0f);
-                    SetWindowText(data->rgbEditBoxes[i], text);
-                    InvalidateAllStrips();
-                    FireLiveUpdate();
+                for (int c = 0; c < 3; c++) {
+                    if (data->rgbDeviations[c] && i < data->pointCount)
+                        data->rgbDeviations[c][i] = 1.0f;
                 }
+                wchar_t text[16];
+                swprintf_s(text, L"%.2f", 0.0f);
+                SetWindowText(data->rgbEditBoxes[i], text);
+                InvalidateAllStrips();
+                FireLiveUpdate();
                 return 0;
             }
         }
@@ -578,10 +581,27 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (data) {
                 int editIndex = id - ID_GRAYSCALE_EDIT_BASE;
                 if (editIndex >= 0 && editIndex < data->pointCount) {
-                    UpdateSliderFromEdit(editIndex);
-                    UpdateEditFromSlider(editIndex);
-                    int pos = (int)SendMessage(data->sliders[editIndex], TBM_GETPOS, 0, 0);
-                    float deviationPct = (float)(-pos) / GRAYSCALE_SLIDER_SCALE;
+                    // Read deviation directly from edit (allows ±50 manual input)
+                    static constexpr float LUMINANCE_MANUAL_MAX = 50.0f;
+                    wchar_t text[16];
+                    GetWindowText(data->editBoxes[editIndex], text, 16);
+                    float deviationPct = (float)_wtof(text);
+                    deviationPct = (std::max)(-LUMINANCE_MANUAL_MAX, (std::min)(LUMINANCE_MANUAL_MAX, deviationPct));
+
+                    // Reformat edit box and pin slider at ±25 visually.
+                    // updatingFromSlider blocks WM_VSCROLL→UpdateEditFromSlider
+                    // from overwriting the edit with the clamped slider value.
+                    wchar_t fmt[16];
+                    swprintf_s(fmt, L"%.2f", deviationPct);
+                    data->updatingFromSlider = true;
+                    SetWindowText(data->editBoxes[editIndex], fmt);
+                    int maxRange = GRAYSCALE_RANGE * GRAYSCALE_SLIDER_SCALE;
+                    int sliderVal = (int)(deviationPct * GRAYSCALE_SLIDER_SCALE + 0.5f);
+                    sliderVal = (std::max)(-maxRange, (std::min)(maxRange, sliderVal));
+                    SendMessage(data->sliders[editIndex], TBM_SETPOS, TRUE, -sliderVal);
+                    data->updatingFromSlider = false;
+
+                    // Apply the full manual value (not the slider-clamped one)
                     float t = (float)editIndex / (float)(data->pointCount - 1);
                     float targetVal = data->isHDR ? t : (t * t);
                     float newVal;
@@ -660,14 +680,12 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wParam;
         HWND hwndStatic = (HWND)lParam;
-        // Channel color indicator bars
-        for (HWND ind : s_rgbIndicators) {
-            if (ind == hwndStatic && s_indicatorBrush) {
-                auto* data = g_grayscaleEditor;
-                int ch = data ? data->selectedChannel : 0;
-                if (ch < 0) ch = 0;
+        // Per-point color indicator bars (each shows its own last-edited channel)
+        for (int i = 0; i < (int)s_rgbIndicators.size(); i++) {
+            if (s_rgbIndicators[i] == hwndStatic) {
+                int ch = (i < (int)s_indicatorChannel.size()) ? s_indicatorChannel[i] : 0;
                 SetBkColor(hdc, kStripColors[ch]);
-                return (LRESULT)s_indicatorBrush;
+                return (LRESULT)s_indicatorBrushes[ch];
             }
         }
         if (!g_tabBgBrush) g_tabBgBrush = CreateSolidBrush(TAB_BG_COLOR);
@@ -690,7 +708,10 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
     case WM_DESTROY:
         s_rgbIndicators.clear();
-        if (s_indicatorBrush) { DeleteObject(s_indicatorBrush); s_indicatorBrush = nullptr; }
+        s_indicatorChannel.clear();
+        for (int ch = 0; ch < 3; ch++) {
+            if (s_indicatorBrushes[ch]) { DeleteObject(s_indicatorBrushes[ch]); s_indicatorBrushes[ch] = nullptr; }
+        }
         g_grayscaleEditor = nullptr;
         return 0;
     }
@@ -755,12 +776,12 @@ void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHD
     g_grayscaleEditor = &data;
 
     // Calculate window size (must match layout in GrayscaleEditorProc)
-    int sliderW = 32;
+    int sliderW = 38;
     int sliderH = 150;
     int rgbLabelH = 16;
     int pctLabelH = 16;
     int editH = 20;
-    int pad = 2;
+    int pad = 4;
     int btnH = 28;
     int startY = 10;
 
