@@ -249,7 +249,7 @@ MSBuild DesktopLUT.Tests.vcxproj -p:Configuration=Release -p:Platform=x64
 bin\Test\DesktopLUT.Tests.exe
 ```
 
-156 test cases covering color math (PQ, primaries matrices, sRGB EOTF), MHC ICC profile generation and reading, EDID chromaticity parsing, frame pacer EMA/cadence lock, LUT loading, and settings round-trips. Uses [doctest](https://github.com/doctest/doctest).
+180 test cases covering color math (PQ, primaries matrices, sRGB EOTF), MHC ICC profile generation/reading/grayscale extraction/per-channel eval+LUT/ICtCp offsets, EDID chromaticity parsing, frame pacer EMA/cadence lock/thresholds, LUT loading (.cube/.txt), and settings round-trips. Uses [doctest](https://github.com/doctest/doctest).
 
 ## Technical Details
 

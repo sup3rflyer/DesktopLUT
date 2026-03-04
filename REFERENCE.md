@@ -42,6 +42,9 @@ HotkeyAnalysisKey=X
 ; Frame pacer settings
 FramePacerEnabled=1    ; 1 = predictive frame pacer (default), 0 = legacy DwmFlush/CompClock only
 FramePacerSpinWait=1   ; 1 = QPC spin-wait for sub-ms precision (default), 0 = sleep-only (less CPU)
+FrameBuffer=1          ; 1 = auto frame buffer (default), 0 = direct present
+FrameBufferIdleMs=3000 ; Idle timeout before buffer engages (ms), 0 = always active
+FramePacerLog=0        ; 1 = write per-frame CSV (framepacer.csv) for diagnostics
 
 ; Startup settings
 StartMinimized=0       ; 1 = start minimized to system tray
@@ -77,18 +80,18 @@ MaxTmlPeak=1000.0
 
 HDR processing uses the Dolby ICtCp color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.
 
-**8-Stage Pipeline:**
-1. **Desktop Gamma**: sRGB EOTF → 2.2 power law (optional toggle)
+**Pipeline (per-channel Rec.2020 grayscale + ICtCp tonemap):**
+1. **Desktop Gamma**: sRGB→2.2 correction via precomputed 1D LUT (t4)
 2. **BT.709 → Rec.2020**: Standards-derived RGB primary conversion per ITU-R BT.2087
 3. **Primaries Matrix**: Display calibration in linear Rec.2020 (includes Bradford chromatic adaptation)
-4. **Rec.2020 → ICtCp**: LMS (Hunt-Pointer-Estevez) → PQ encode → ICtCp matrix
-5. **ICtCp Processing** (all on I channel, CT/CP unchanged = hue preserved):
-   - Grayscale correction (display calibration - constant)
-   - Tonemapping (content preference - dynamic)
+4. **Per-channel Grayscale**: PQ-domain R/G/B interpolation with linear gains (via t5/t6 LUT)
+5. **Rec.2020 → ICtCp**: LMS (Hunt-Pointer-Estevez) → PQ encode (t5) → ICtCp matrix
+6. **ICtCp Tonemapping** (on I channel only, CT/CP unchanged = hue preserved):
+   - Tonemapping (content preference - static or dynamic)
    - Blue noise dithering (always on, perceptually uniform)
-6. **ICtCp → PQ RGB**: Inverse transforms for LUT input
-7. **Apply LUT**: Tetrahedral or trilinear interpolation
-8. **PQ → scRGB**: ST.2084 EOTF → Rec.2020 → BT.709
+7. **ICtCp → PQ Rec.2020**: Inverse transforms → PQ decode (t6) for LUT input
+8. **Apply LUT**: Tetrahedral or trilinear interpolation
+9. **PQ → scRGB**: ST.2084 EOTF (t6) → White Balance (von Kries gains) → Rec.2020 → BT.709
 
 **Why ICtCp?** (from Dolby whitepaper)
 - I channel correlates r=0.998 with true luminance (vs r=0.819 for Y'CbCr)
@@ -96,9 +99,9 @@ HDR processing uses the Dolby ICtCp color space for perceptually accurate tonema
 - More uniform MacAdam ellipses = better perceptual accuracy
 - 10-bit ICtCp ≈ 11.5-bit Y'CbCr quality
 
-**Processing Order**: Grayscale before tonemap because grayscale is display calibration (constant, measured without tonemap), while tonemapping is content-dependent (user preference).
+**Processing Order**: Grayscale is per-channel in Rec.2020 BEFORE ICtCp conversion. Tonemapping operates on I channel inside ICtCp. This separation allows independent R/G/B grayscale correction (display calibration) while preserving ICtCp's hue-preserving tonemapping. Combined into a single ICtCp pass (grayscale feeds directly into the Rec.2020→LMS→PQ→ICtCp chain, avoiding separate PQ encode/decode round-trips).
 
-**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). Only 2 pow() ops for peak conversion (curve evaluation uses closed-form math). BT.2446A uses linear-space (6 pow() due to complex gamma operations). Guards: BT.2390 KS≥1 singularity passthrough, BT.2446A 1-nit division floor. Dynamic mode: BT.2390/BT.2446A get target-relative breathing room (1.0×–1.5× floor scaling with target nits) for guaranteed compression headroom on high-nit displays. 3% PQ hysteresis crossfade prevents flicker when detected peak oscillates near target.
+**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). All transfer functions use precomputed 1D LUT textures — zero analytical pow() in the pixel shader hot path. BT.2446A remains linear-space (4 pow() due to complex gamma operations that resist tabulation). Guards: BT.2390 KS≥1 singularity passthrough, BT.2446A 1-nit division floor. Dynamic mode: BT.2390/BT.2446A get target-relative breathing room (1.0×–1.5× floor scaling with target nits) for guaranteed compression headroom on high-nit displays. 3% PQ hysteresis crossfade prevents flicker when detected peak oscillates near target.
 
 Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
 
@@ -125,22 +128,25 @@ ICtCp → L'M'S':
 
 ### Performance Cost
 
-ICtCp pipeline adds ~4 matrix multiplies and ~2 PQ cycles (~100 extra ALU ops/pixel). At 4K@144Hz: <1% overhead on modern GPUs.
+ICtCp pipeline adds ~4 matrix multiplies and LUT-based PQ encode/decode (~100 extra ALU ops/pixel). At 4K@144Hz: <1% overhead on modern GPUs. All transfer functions (sRGB, PQ, desktop gamma, white balance gamma) use precomputed 1D texture lookups — zero analytical pow() on the main pixel shader path.
 
 | Tonemap Curve | pow() ops |
 |---------------|-----------|
-| BT.2390/SoftClip/Reinhard/HardClip | 2 (peak conversion only) |
-| BT.2446A | 6 (peak + I conversions) |
+| BT.2390/SoftClip/Reinhard/HardClip | 0 (PQ via LUT) |
+| BT.2446A | 4 (complex gamma operations) |
 
 ## SDR Color Pipeline
 
 ```
-Input → Grayscale → 2.4 Gamma → [Primaries: 2.2 Decode → Matrix (with Bradford) → 2.2 Encode] → 3D LUT → Dithering → Output
+Primaries (matrix, linear) → sRGB encode (t7 LUT) → Per-channel Grayscale (sqrt-domain R/G/B)
+    → 2.4γ (t9 LUT) → 3D LUT → White Balance (t10 LUT) → Output (ACM: sRGB decode via t8)
 ```
 
-**Grayscale**: Applied first in sRGB signal space. Uses sqrt distribution matching 2.2 gamma signal levels, so slider N affects patch N in calibration software.
+Zero analytical pow() — all transfer functions via precomputed 1D texture lookups.
 
-**2.4 Gamma**: Optional transform for BT.1886 displays. Applies `pow(x, 2.4/2.2)` to darken the image, approximating BT.1886 behavior suitable for displays with near-zero black level. Independent of grayscale correction - can be used alone or combined.
+**Grayscale**: Per-channel (R/G/B independent corrections) in sqrt-domain sRGB signal space. Uses sqrt distribution matching 2.2 gamma signal levels, so slider N affects patch N in calibration software.
+
+**2.4 Gamma**: Optional BT.1886 transform via ratio LUT (1 tex sample). `pow(Y, 12/11) = Y × pow(Y, 1/11)` where the ratio `pow(Y, 1/11)` is a LUT lookup. Independent of grayscale correction - can be used alone or combined.
 
 **Primaries Matrix**: Uses gamma 2.2 decode AND encode (not sRGB). This ensures:
 - Identity matrix = zero change (perfect round-trip)
@@ -378,6 +384,16 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 | ICC profiles | OS-integrated | 1D gamma + 3x3 only |
 | DWM_LUT | Full 3D LUT | Broken on 50-series, Win11 25H2 |
 | **DesktopLUT** | Full 3D LUT, no input lag | ~1 frame visual latency |
+
+## Developer Tools
+
+Tools in `tools/` for diagnostics and development:
+
+| Tool | Usage |
+|------|-------|
+| `analyze_framepacer.py` | `python tools/analyze_framepacer.py framepacer.csv` — plots offset EMA, cadence lock state, outliers, and jitter. Enable logging with `FramePacerLog=1` in INI. |
+| `parse_icc.py` | `python tools/parse_icc.py <file.icm> [file2.icm ...]` — prints ICC tag table, primaries (CIE xy), TRC curves, and transfer functions. Useful for debugging ICC import issues. |
+| `generate_blue_noise.py` | Regenerates the blue noise texture used for HDR ICtCp dithering (CC0 license). |
 
 ## References
 

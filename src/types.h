@@ -181,7 +181,7 @@ const int WATCHDOG_TIMEOUT_SECONDS = 5;
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear
 const int HOTKEY_GAMMA = 2;      // Win+Shift+G for gamma toggle
 const int HOTKEY_ANALYSIS = 4;   // Win+Shift+X for analysis toggle
-const int HOTKEY_HDR_TOGGLE = 5; // Win+Shift+H for HDR toggle on focused monitor
+const int HOTKEY_HDR_TOGGLE = 5; // Win+Shift+Z for HDR toggle on focused monitor
 
 // ============================================================================
 // Data Structures
