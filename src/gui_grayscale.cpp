@@ -17,6 +17,7 @@ static constexpr int RGB_BAR_W = 10;
 static constexpr int RGB_BAR_GAP = 2;
 // RGB deviation range (same as GRAYSCALE_RANGE for consistency: +/-25%)
 static constexpr float RGB_DEV_STEP = 0.001f;  // 0.1% per scroll notch
+static constexpr float MANUAL_INPUT_MAX = 50.0f;  // Manual text input allows wider range than slider ±25
 
 static const COLORREF kStripColors[3] = {
     RGB(200, 50, 50),    // Red
@@ -36,6 +37,8 @@ static void FireLiveUpdate();
 static void UpdateRGBEditBoxes();
 static void InvalidateAllStrips();
 static void SetPointIndicatorChannel(int pointIndex, int ch);
+static int GetPointChannel(int pointIndex);
+static void ResetAllRGBDeviations(int pointIndex);
 static int ChannelFromX(int x, int controlW = RGB_STRIP_W);
 
 // ============================================================================
@@ -44,6 +47,7 @@ static int ChannelFromX(int x, int controlW = RGB_STRIP_W);
 
 struct RGBStripData {
     int pointIndex;
+    int wheelAccum;  // Per-strip accumulator for smooth-scroll mice
 };
 
 static int ChannelFromX(int x, int controlW) {
@@ -139,11 +143,7 @@ static LRESULT CALLBACK RGBStripProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_MBUTTONDOWN: {
         // Middle click: reset all 3 channels to 1.0
         if (!data || !stripData) break;
-        int pi = stripData->pointIndex;
-        for (int c = 0; c < 3; c++) {
-            if (data->rgbDeviations[c] && pi < data->pointCount)
-                data->rgbDeviations[c][pi] = 1.0f;
-        }
+        ResetAllRGBDeviations(stripData->pointIndex);
         UpdateRGBEditBoxes();
         InvalidateRect(hwnd, nullptr, FALSE);
         FireLiveUpdate();
@@ -158,9 +158,9 @@ static LRESULT CALLBACK RGBStripProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (ch < 0) ch = data->selectedChannel;
         if (ch < 0) ch = 0;
 
-        // Accumulate delta for smooth-scroll mice
-        static int wheelAccum = 0;
-        wheelAccum += GET_WHEEL_DELTA_WPARAM(wParam);
+        // Accumulate delta for smooth-scroll mice (per-strip instance)
+        stripData->wheelAccum += GET_WHEEL_DELTA_WPARAM(wParam);
+        int& wheelAccum = stripData->wheelAccum;
         int notches = wheelAccum / WHEEL_DELTA;
         if (notches == 0) break;
         wheelAccum -= notches * WHEEL_DELTA;
@@ -208,9 +208,7 @@ static void UpdateRGBEditBoxes() {
     if (!data) return;
 
     for (int i = 0; i < data->pointCount && i < (int)data->rgbEditBoxes.size(); i++) {
-        // Each point shows its own last-edited channel
-        int ch = (i < (int)s_indicatorChannel.size()) ? s_indicatorChannel[i] : 0;
-        if (ch < 0) ch = 0;
+        int ch = GetPointChannel(i);
         float dev = (data->rgbDeviations[ch] && i < data->pointCount)
             ? data->rgbDeviations[ch][i] : 1.0f;
         float pct = (dev - 1.0f) * 100.0f;
@@ -236,19 +234,32 @@ static void SetPointIndicatorChannel(int pointIndex, int ch) {
         InvalidateRect(s_rgbIndicators[pointIndex], nullptr, TRUE);
 }
 
+static int GetPointChannel(int pointIndex) {
+    if (pointIndex >= 0 && pointIndex < (int)s_indicatorChannel.size())
+        return s_indicatorChannel[pointIndex];
+    return 0;
+}
+
+static void ResetAllRGBDeviations(int pointIndex) {
+    auto* data = g_grayscaleEditor;
+    if (!data || pointIndex < 0 || pointIndex >= data->pointCount) return;
+    for (int c = 0; c < 3; c++) {
+        if (data->rgbDeviations[c])
+            data->rgbDeviations[c][pointIndex] = 1.0f;
+    }
+}
+
 static void ApplyRGBEditValue(int pointIndex) {
     auto* data = g_grayscaleEditor;
     if (!data || pointIndex < 0 || pointIndex >= data->pointCount) return;
-    // Use this point's tracked channel, not the global one
-    int ch = (pointIndex < (int)s_indicatorChannel.size()) ? s_indicatorChannel[pointIndex] : data->selectedChannel;
+    int ch = GetPointChannel(pointIndex);
     if (ch < 0) return;
     if (pointIndex >= (int)data->rgbEditBoxes.size()) return;
 
     wchar_t text[16];
     GetWindowText(data->rgbEditBoxes[pointIndex], text, 16);
     float pct = (float)_wtof(text);
-    static constexpr float RGB_MANUAL_MAX = 50.0f;  // Manual input allows wider range than slider
-    pct = (std::max)(-RGB_MANUAL_MAX, (std::min)(RGB_MANUAL_MAX, pct));
+    pct = (std::max)(-MANUAL_INPUT_MAX, (std::min)(MANUAL_INPUT_MAX, pct));
     float dev = 1.0f + pct / 100.0f;
 
     if (data->rgbDeviations[ch] && pointIndex < data->pointCount) {
@@ -355,7 +366,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 WS_CHILD | WS_VISIBLE,
                 x, stripY, sliderW, RGB_STRIP_H,
                 hwnd, (HMENU)(INT_PTR)(ID_GRAYSCALE_RGB_STRIP_BASE + i), nullptr, nullptr);
-            RGBStripData* sd = new RGBStripData{ i };
+            RGBStripData* sd = new RGBStripData{ i, 0 };
             SetWindowLongPtr(strip, GWLP_USERDATA, (LONG_PTR)sd);
             data->rgbStrips.push_back(strip);
 
@@ -473,9 +484,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         // Check if hovering over a per-point RGB edit box
         for (int i = 0; i < data->pointCount && i < (int)data->rgbEditBoxes.size(); i++) {
             if (data->rgbEditBoxes[i] == hwndUnder) {
-                // Use this point's tracked channel
-                int ch = (i < (int)s_indicatorChannel.size()) ? s_indicatorChannel[i] : data->selectedChannel;
-                if (ch < 0) break;
+                int ch = GetPointChannel(i);
 
                 static int rgbEditWheelAccum = 0;
                 rgbEditWheelAccum += GET_WHEEL_DELTA_WPARAM(wParam);
@@ -529,13 +538,8 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         // RGB edit box: reset all 3 channels to 1.0 for this point
         for (int i = 0; i < data->pointCount && i < (int)data->rgbEditBoxes.size(); i++) {
             if (data->rgbEditBoxes[i] == child) {
-                for (int c = 0; c < 3; c++) {
-                    if (data->rgbDeviations[c] && i < data->pointCount)
-                        data->rgbDeviations[c][i] = 1.0f;
-                }
-                wchar_t text[16];
-                swprintf_s(text, L"%.2f", 0.0f);
-                SetWindowText(data->rgbEditBoxes[i], text);
+                ResetAllRGBDeviations(i);
+                UpdateRGBEditBoxes();
                 InvalidateAllStrips();
                 FireLiveUpdate();
                 return 0;
@@ -581,12 +585,11 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (data) {
                 int editIndex = id - ID_GRAYSCALE_EDIT_BASE;
                 if (editIndex >= 0 && editIndex < data->pointCount) {
-                    // Read deviation directly from edit (allows ±50 manual input)
-                    static constexpr float LUMINANCE_MANUAL_MAX = 50.0f;
+                    // Read deviation directly from edit (allows wider range than slider ±25)
                     wchar_t text[16];
                     GetWindowText(data->editBoxes[editIndex], text, 16);
                     float deviationPct = (float)_wtof(text);
-                    deviationPct = (std::max)(-LUMINANCE_MANUAL_MAX, (std::min)(LUMINANCE_MANUAL_MAX, deviationPct));
+                    deviationPct = (std::max)(-MANUAL_INPUT_MAX, (std::min)(MANUAL_INPUT_MAX, deviationPct));
 
                     // Reformat edit box and pin slider at ±25 visually.
                     // updatingFromSlider blocks WM_VSCROLL→UpdateEditFromSlider
@@ -683,7 +686,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         // Per-point color indicator bars (each shows its own last-edited channel)
         for (int i = 0; i < (int)s_rgbIndicators.size(); i++) {
             if (s_rgbIndicators[i] == hwndStatic) {
-                int ch = (i < (int)s_indicatorChannel.size()) ? s_indicatorChannel[i] : 0;
+                int ch = GetPointChannel(i);
                 SetBkColor(hdc, kStripColors[ch]);
                 return (LRESULT)s_indicatorBrushes[ch];
             }

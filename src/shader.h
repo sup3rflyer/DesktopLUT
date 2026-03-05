@@ -779,19 +779,19 @@ R"(
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 4: Output conversion
+        // STAGE 4: Dithering + Output conversion
         // ═══════════════════════════════════════════════════════════════════════
-        if (isFP16SDR > 0.5) {
-            // ACM: FP16 swapchain expects linear - sRGB decode
-            corrected = sRGB_EOTF3(max(corrected, 0.0));
-        }
-        // Legacy: R10G10B10A2 + G22 swapchain - already sRGB-encoded
-
-        // Dithering
+        // Dither in encoded/gamma space (before EOTF decode) so 1/1024 magnitude is correct
         float2 noiseUV = pos.xy / 64.0;
         float noise = blueNoiseTexture.Sample(wrapSampler, noiseUV);
         float dither = (noise - 0.5) / 1024.0;
         float3 dithered = corrected.rgb + dither;
+
+        if (isFP16SDR > 0.5) {
+            // ACM: FP16 swapchain expects linear - sRGB decode
+            dithered = sRGB_EOTF3(max(dithered, 0.0));
+        }
+        // Legacy: R10G10B10A2 + G22 swapchain - already sRGB-encoded
         float4 finalColor = float4(dithered, 1.0);
         // Motion bar: judder detection (UFO test style)
         if (motionBarEnabled > 0.5) {

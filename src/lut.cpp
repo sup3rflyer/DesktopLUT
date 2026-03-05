@@ -108,7 +108,7 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
         float maxVal = 0.0f;
         for (float v : data) maxVal = (std::max)(maxVal, v);
         if (maxVal > 1.5f) {
-            for (float& v : data) v /= 65535.0f;
+            for (float& v : data) v /= maxVal;
         }
     }
 

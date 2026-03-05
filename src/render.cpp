@@ -289,12 +289,14 @@ bool CreateSwapChain(MonitorContext* ctx) {
     hr = ctx->swapchain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
     if (FAILED(hr) || !backBuffer) {
         std::cerr << "Failed to get swapchain back buffer: 0x" << std::hex << hr << std::dec << std::endl;
+        ctx->swapchain->Release(); ctx->swapchain = nullptr;
         return false;
     }
     hr = g_device->CreateRenderTargetView(backBuffer, nullptr, &ctx->rtv);
     backBuffer->Release();
     if (FAILED(hr)) {
         std::cerr << "Failed to create RTV: 0x" << std::hex << hr << std::dec << std::endl;
+        ctx->swapchain->Release(); ctx->swapchain = nullptr;
         return false;
     }
 

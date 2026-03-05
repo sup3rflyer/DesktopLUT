@@ -22,6 +22,7 @@
 #include <cmath>
 #include <algorithm>
 #include <set>
+#include <mutex>
 #include <wincrypt.h>
 
 #pragma comment(lib, "Advapi32.lib")
@@ -976,12 +977,9 @@ static PFN_InstallColorProfileW g_pfnInstallColorProfile = nullptr;
 static PFN_ColorProfileAddDisplayAssociation g_pfnAddAssociation = nullptr;
 static PFN_ColorProfileRemoveDisplayAssociation g_pfnRemoveAssociation = nullptr;
 static PFN_ColorProfileGetDisplayDefault g_pfnGetDisplayDefault = nullptr;
-static bool g_mscmsChecked = false;
+static std::once_flag g_mscmsOnce;
 
-static void EnsureMscmsLoaded() {
-    if (g_mscmsChecked) return;
-    g_mscmsChecked = true;
-
+static void DoMscmsLoad() {
     g_hMscms = LoadLibraryW(L"Mscms.dll");
     if (!g_hMscms) {
         std::cerr << "MHC2: Failed to load Mscms.dll" << std::endl;
@@ -1002,6 +1000,10 @@ static void EnsureMscmsLoaded() {
     } else {
         std::cout << "MHC2: ColorProfileAddDisplayAssociation not found (requires Windows 10 21H2+)" << std::endl;
     }
+}
+
+static void EnsureMscmsLoaded() {
+    std::call_once(g_mscmsOnce, DoMscmsLoad);
 }
 
 bool IsMHC2ApiAvailable() {
@@ -1401,7 +1403,7 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
             if (typeSig == MakeSig("mluc") && tag->offset + 28 <= fileSize) {
                 uint32_t strLen = ReadBE32(p + 20);
                 uint32_t strOff = ReadBE32(p + 24);
-                if (tag->offset + strOff + strLen <= fileSize) {
+                if ((size_t)tag->offset + strOff + strLen <= fileSize) {
                     for (uint32_t i = 0; i < strLen / 2; i++) {
                         outData.description += (wchar_t)ReadBE16(p + strOff + i * 2);
                     }
@@ -1652,11 +1654,14 @@ std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool 
 void CleanupOrphanedMhcProfiles() {
     // Build set of profile names currently referenced by settings
     std::set<std::wstring> activeProfiles;
-    for (const auto& ms : g_gui.monitorSettings) {
-        if (!ms.sdrMHC.profileName.empty())
-            activeProfiles.insert(ms.sdrMHC.profileName);
-        if (!ms.hdrMHC.profileName.empty())
-            activeProfiles.insert(ms.hdrMHC.profileName);
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        for (const auto& ms : g_gui.monitorSettings) {
+            if (!ms.sdrMHC.profileName.empty())
+                activeProfiles.insert(ms.sdrMHC.profileName);
+            if (!ms.hdrMHC.profileName.empty())
+                activeProfiles.insert(ms.hdrMHC.profileName);
+        }
     }
 
     // Scan system color directory for DesktopLUT_*.icm files

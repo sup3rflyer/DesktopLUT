@@ -1292,10 +1292,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
                 cc.primariesEnabled = (SendMessage(hwndEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 cc.primariesPreset = g_numPresetPrimaries - 1;  // Custom
-                const auto& defaults = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];
-                cc.customPrimaries.Rx = defaults.Rx; cc.customPrimaries.Ry = defaults.Ry;
-                cc.customPrimaries.Gx = defaults.Gx; cc.customPrimaries.Gy = defaults.Gy;
-                cc.customPrimaries.Bx = defaults.Bx; cc.customPrimaries.By = defaults.By;
                 ApplyPrimariesChange(isHDR);
                 SaveSettings();
             }
@@ -1317,10 +1313,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     cc.primariesEnabled = true;
                     SendMessage(hwndEnable, BM_SETCHECK, BST_CHECKED, 0);
                     cc.primariesPreset = g_numPresetPrimaries - 1;
-                    const auto& defaults = isHDR ? g_presetPrimaries[3] : g_presetPrimaries[0];
-                    cc.customPrimaries.Rx = defaults.Rx; cc.customPrimaries.Ry = defaults.Ry;
-                    cc.customPrimaries.Gx = defaults.Gx; cc.customPrimaries.Gy = defaults.Gy;
-                    cc.customPrimaries.Bx = defaults.Bx; cc.customPrimaries.By = defaults.By;
                     ApplyPrimariesChange(isHDR);
                     SaveSettings();
                 }
