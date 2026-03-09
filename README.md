@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="DesktopLUT-logo.png" alt="DesktopLUT" width="128">
+</p>
+
 # DesktopLUT
 
 DesktopLUT applies color corrections to the entire Windows desktop in real time using a three-layer system. It works with any DirectX 11 GPU and supports both SDR and HDR modes.
