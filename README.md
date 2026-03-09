@@ -1,264 +1,124 @@
-<p align="center">
-  <img src="DesktopLUT-logo.png" alt="DesktopLUT" width="128">
-</p>
-
 # DesktopLUT
 
-Professional display calibration for your Windows desktop — from quick fixes to full three-layer color correction.
+DesktopLUT applies color corrections to the entire Windows desktop in real time using a three-layer system. It works with any DirectX 11 GPU and supports both SDR and HDR modes.
 
-## What Is This?
+## How the three layers work
 
-DesktopLUT applies display calibration to your entire Windows desktop in real-time. It uses a three-layer color pipeline that ranges from zero-overhead GPU corrections to full 3D LUT processing:
+DesktopLUT uses the following layers, which can be enabled individually or together:
 
-| Layer | What It Does | Update Frequency |
-|-------|-------------|-----------------|
-| **I. MHC Display Calibration** | GPU-level ICC profiles — corrects primaries and grayscale at the scanout stage. Zero overhead, VRR-safe. | Yearly |
-| **II. 3D LUT** | Volumetric color correction via overlay shader — fixes residual hue shifts and non-linearities. | Every ~6 months |
-| **III. Corrections** | Real-time fine-tuning — primaries, white point, grayscale, tonemapping. | Anytime |
+1. **MHC (GPU-level)**
+   Installs color corrections directly at the graphics card driver level. This layer remains active even when DesktopLUT is not running.
 
-Each layer is optional — use one, two, or all three. No calibration hardware required to get started.
+2. **3D LUT**
+   Applies a volumetric color correction using a loaded .cube file.
 
-However, the layers stack: each one processes the output of the one before it. If you change a lower layer (e.g., regenerate your MHC profile), the layers above it (3D LUT, Corrections) were calibrated against the old output and may need to be redone. Work from the bottom up: get MHC right first, then profile for your 3D LUT, then fine-tune with Corrections.
+3. **Corrections**
+   Provides real-time adjustments including white point shift, grayscale correction with per-point RGB tuning, and HDR tone mapping.
 
-## Features
-
-**Color Pipeline**
-- Three independent layers: MHC (GPU) → 3D LUT (overlay) → Corrections (fine-tuning)
-- MHC display calibration via ICC profiles — zero overlay overhead, VRR-safe (G-Sync/FreeSync compatible)
-- Full 3D LUT support with trilinear or tetrahedral interpolation
-- HDR and SDR with automatic detection and separate settings per mode
-- ICtCp-based HDR pipeline for perceptually accurate luminance handling
-
-**No Hardware Required**
-- Auto-detect display primaries from EDID
-- Adjust grayscale by eye using test patterns
-- Import existing ICC profiles or 1D .cube files from ColourSpace, CalMAN, etc.
-- Fix washed-out HDR desktop with one hotkey (Win+Shift+G)
-
-**Practical**
-- Multi-monitor with independent settings per display
-- App whitelist — auto-disable corrections for games and video players
-- Passthrough mode — auto-hide overlay to preserve VRR for whitelisted apps
-- Predictive frame pacer — three-tier adaptive sync with sub-0.1ms jitter (MMCSS + QPC spin-wait)
-- System tray operation, optional auto-start with Windows
-- No input lag — ~1 frame of visual latency only; input goes directly to apps
+The layers are applied in sequence within a single shader pass.
 
 ## Requirements
 
-- Windows 10 21H2+ or Windows 11
-- Any DirectX 11 GPU
-- **Auto Color Management (ACM) recommended** — With ACM on, Windows uses an FP16 DWM pipeline with higher precision. Without it, the legacy 8-bit pipeline is used. Enable in **Settings → Display → Advanced display → Auto Color Management** (Windows 11) or by enabling HDR (Windows 10).
+- Windows 10 (version 21H2 or newer) or Windows 11
+- DirectX 11 compatible GPU (NVIDIA, AMD, or Intel)
+- Recommended: Enable "Auto Color Management" in Windows display settings
 
-## Getting Started
+## Installation
 
-1. Download `DesktopLUT.exe` from [Releases](https://github.com/sup3rflyer/DesktopLUT/releases)
-2. Run it — the settings window opens with four tabs: **I. MHC**, **II. 3D LUT**, **III. Corrections**, **Settings**
-3. Configure your corrections (see guides below)
-4. Click **Start** to activate the overlay
-5. Minimize to system tray for 24/7 operation
+1. Download the latest `DesktopLUT.exe` from the [Releases page](https://github.com/sup3rflyer/DesktopLUT/releases).
+2. Run the executable (no installer is required).
+3. The settings window will open automatically.
 
----
+## Common setups
 
-## Quick Start (No Hardware Required)
+### 1. Correct SDR content in HDR mode
+This addresses washed-out colors when using HDR.
 
-### Fix Washed-Out SDR Content in HDR Mode
+1. Open DesktopLUT and go to the **Settings** tab.
+2. Ensure the gamma hotkey is enabled.
+3. Click **Start**.
+4. Use the hotkey **Win + Shift + G** to toggle the correction.
+5. Add video players and games to the gamma whitelist so the correction is bypassed for those applications.
 
-Windows HDR applies sRGB gamma to SDR content, but most displays expect 2.2 gamma — this mismatch makes the desktop look washed out. The Desktop Gamma correction fixes this.
+### 2. Apply basic color correction using MHC
+1. Go to the **I. MHC** tab.
+2. Click **Detect** to read the monitor's reported color primaries (or enter values manually).
+3. Click **Apply**.
 
-1. Go to the **Settings** tab, ensure the Gamma hotkey is enabled
-2. Click **Start**
-3. Press **Win+Shift+G** — SDR desktop content will look correct
-4. Add video players and games to the **gamma whitelist** — HDR-mastered content already displays correctly and doesn't need the gamma fix. The whitelist auto-disables the correction when those apps are in the foreground.
+This correction stays active at the GPU level.
 
-### Fix Oversaturated Colors on a Wide-Gamut Display
+### 3. Use a measured 3D LUT
+1. Keep the MHC layer active (if used).
+2. Generate a .cube file (33³ or 65³) with your calibration software while MHC is enabled.
+3. Load the file in the **II. 3D LUT** tab.
 
-**Using MHC (recommended — VRR-safe, zero overhead):**
+### 4. Fine-tune with corrections
+1. Go to the **III. Corrections** tab.
+2. Adjust white point if needed.
+3. Use the grayscale and HDR tone mapping options (see dedicated sections below).
+4. Use the analysis overlay (**Win + Shift + X**) to inspect results in real time.
 
-1. Go to the **I. MHC** tab
-2. In the SDR section, click **Edit** → click **Detect** to read your monitor's primaries from EDID
-3. Click **Apply** — an ICC profile is generated and installed at the GPU level
-4. Done. No overlay needed, correction persists even when DesktopLUT isn't running
+## Grayscale correction
 
-**Using Corrections (real-time adjustment):**
+This is one of the most commonly used features in the Corrections layer. It allows precise neutral-tone adjustment across the full brightness range.
 
-1. Go to the **III. Corrections** tab
-2. Enable **Primaries Correction** and click **Detect** or choose a preset (P3-D65, Adobe RGB, etc.)
-3. Click **Start**
+- Choose between 10, 20, or 32 control points.
+- At each point you can independently tune the red, green, and blue channels.
+- Uses piecewise linear interpolation.
+- Separate handling for SDR (sRGB gamma space) and HDR (PQ domain, per-channel before ICtCp conversion).
 
-### Basic Calibration Without a Colorimeter
+This enables accurate grayscale tracking without affecting hue or saturation.
 
-Combine MHC primaries with grayscale adjustment for a solid baseline:
+## HDR tone mapping
 
-1. **I. MHC** tab → **Edit** → **Detect** primaries → **Apply** (installs GPU-level profile)
-2. **III. Corrections** tab → Enable **Grayscale Correction** → choose 10 points → adjust by eye using test patterns
-3. Click **Start**
+DesktopLUT includes built-in HDR tone mapping that applies to all desktop content (not limited to specific applications). It operates in the ICtCp color space, mapping only the luminance (I) channel to preserve hue and saturation.
 
-This achieves results comparable to Windows Auto Color Management (ACM), with the added benefit of grayscale fine-tuning.
+Key features:
+- Multiple selectable curves, including BT.2390 (ITU-R standard), Soft Clip, Reinhard, BT.2446A, and Hard Clip.
+- **Dynamic peak detection**: A compute shader measures the maximum luminance of each frame in real time. The tone mapping curve then adapts automatically, preventing over-compression in dark scenes and providing smooth highlight roll-off in bright scenes.
+- Works on any HDR content (games, videos, browser, desktop UI).
+- Option to override Windows HDR tone mapping by setting a high Display Peak value (typically 4000–10000 nits).
+- Hysteresis crossfade (3 % in PQ space) prevents visible flickering when peaks fluctuate.
 
----
+Grayscale correction is applied before tone mapping so display calibration remains consistent.
 
-## MHC Display Calibration
-
-The **I. MHC** tab generates ICC profiles that Windows applies at the GPU scanout level — before the desktop is composited. This is the foundation layer of the pipeline. ACM is recommended for the highest precision (see [Requirements](#requirements)).
-
-**Why use MHC?**
-- Zero overhead — no overlay window, no frame capture or processing
-- VRR-safe — G-Sync and FreeSync work normally
-- Always active — works even when the overlay is off or in passthrough mode
-- Automatic mode switching — separate SDR and HDR profiles, switches when your display changes modes
-
-**What it corrects:**
-- **Primaries + White Point** — 3x3 color matrix with Bradford chromatic adaptation
-- **Grayscale / Gamma** — Per-channel 1D LUT (1024 entries for SDR, 4096 for HDR)
-
-### Data Sources
-
-| Source | What You Get |
-|--------|-------------|
-| **Detect (EDID)** | Monitor's native primaries. White point defaults to D65 |
-| **ICC profile** (.icm/.icc) | Primaries, white point, and per-channel TRC curves |
-| **1D .cube file** (BMD_4096) | Per-channel grayscale correction curves |
-| **Manual entry** | Type CIE xy coordinates directly and edit a 10, 20, or 32 point grayscale curve to bake into the ICC profile |
-
-### ColourSpace / CalMAN Workflow
-
-1. Run a Primaries and Grayscale profile measurement
-2. Export a BMD_4096 1D .cube file
-3. In the MHC tab, click **Edit** → load the .cube file → click **Detect** for EDID or enter measured values
-4. Click **Apply**
-
----
-
-## Full Calibration Guide (With Hardware)
-
-For the best results with a colorimeter or spectrophotometer, use all three layers. Each handles different aspects of calibration — MHC does the heavy lifting, the 3D LUT catches what MHC can't, and Corrections provides live fine-tuning.
-
-```
-Pipeline:  I. MHC (GPU scanout)  →  II. 3D LUT (overlay shader)  →  III. Corrections (fine-tuning)
-```
-
-### Step 1: MHC Foundation
-
-1. Import your ICC profile or 1D .cube file from profiling software into the **I. MHC** tab
-2. Click **Detect** for primaries (or enter measured values)
-3. Click **Apply** — GPU-level correction is now active
-
-### Step 2: Profile for 3D LUT
-
-Profile your display **with MHC active** so the LUT only corrects residual errors:
-
-1. Ensure MHC profiles are installed and active
-2. Run your profiling software and generate a 3D LUT (.cube, 33³ or 65³ recommended)
-3. Load it in the **II. 3D LUT** tab
-
-### Step 3: Fine-Tune with Corrections
-
-Use the **III. Corrections** tab for adjustments on top of the other layers:
-
-- **White Point** — Adjust color temperature (von Kries adaptation)
-- **Grayscale** — Fine-tune gamma tracking at 10, 20, or 32 brightness levels
-- **Tonemapping** (HDR) — Five curves with static or dynamic peak detection (see [HDR Tonemapping](#hdr-tonemapping))
-- **Desktop Gamma** (HDR) — Fix sRGB→2.2 gamma mismatch in Windows HDR
-
-### Step 4: Verify
-
-Run verification patches through your profiling software:
-- Target: deltaE < 1 for grayscale, deltaE < 2 for colors
-- Small Corrections adjustments won't significantly affect the LUT since corrections are minor
-
-### What NOT to Do
-
-- **Don't change MHC and keep your old 3D LUT** — The LUT was profiled against the previous MHC output. If you update MHC, reprofile for a new LUT.
-- **Don't profile without MHC active** — The LUT will try to correct everything MHC should handle, resulting in larger, less stable corrections
-- **Don't make large post-LUT adjustments** — If big changes are needed, reprofile with the new MHC/Corrections settings
-- **Don't profile HDR with tonemapping enabled**
-
----
-
-## HDR Tonemapping
-
-DesktopLUT includes a full HDR tonemapping engine that operates in the ICtCp color space (Dolby). Tonemapping is applied to the I (intensity) channel only, which preserves hue and saturation — no color shifts when compressing dynamic range.
-
-**Five curves available:**
-- **BT.2390** — ITU-R spec-compliant Hermite spline (recommended)
-- **Soft Clip** — Gentle exponential rolloff
-- **Reinhard** — Classic hyperbolic compression
-- **BT.2446A** — ITU-R method A
-- **Hard Clip** — Simple clamp
-
-**Dynamic mode** detects the actual peak brightness of each frame via a compute shader and adjusts the source peak in real-time. This means dark scenes aren't over-compressed and bright scenes get proper rolloff. Falls back to static when content is below SDR reference white (203 nits). BT.2390 and BT.2446A automatically apply breathing room above the target peak so high-nit displays always get smooth highlight gradients. A hysteresis crossfade prevents flicker when the detected peak hovers near the target.
-
-### Bypassing Double Tonemapping
-
-Windows and media players apply their own tonemapping, which can conflict with DesktopLUT's. To take full control:
-
-1. **Display Peak Override** — In the **III. Corrections** tab, enable **Display Peak Override (MaxTML)** and set it to **10000 nits**. This tells Windows your display can handle everything, so it passes HDR content through untouched.
-2. **Set Target Peak** — Set DesktopLUT's tonemap **Target** to your display's actual peak brightness (e.g., 1000 nits). Leave **Source** at 10000.
-3. **In media players** — Set the display peak / MaxCLL to 10000 nits so they also pass through without tonemapping.
-
-Now DesktopLUT is the only tonemapper in the chain, giving you consistent results and your choice of curve.
-
-> **MHC peak nits:** If you loaded a 1D .cube or ICC file, the peak value only affects profile metadata — the correction curve comes from the file itself, so peak doesn't change the actual correction. If you're using the built-in grayscale editor instead, set peak to your display's actual peak (or your 3D LUT profiling target) — it controls where the 32 correction points are placed in PQ space. MaxTML at 10000 is a separate system-level override that tells Windows to skip its tonemapping.
-
-## Other HDR Notes
-
-- Set **Grayscale Peak** to match your profiling software's target peak (e.g., 1000 nits)
-- MHC HDR profiles use BT.2100 ST.2084 (PQ) — mode switching is automatic
-- The **Desktop Gamma** correction (Win+Shift+G) fixes the sRGB→2.2 gamma mismatch that makes SDR content look washed out in Windows HDR mode. Add games and video players to the **gamma whitelist** so the correction is auto-disabled for HDR-mastered content that already displays correctly.
-
-## Hotkeys
-
-All hotkeys use **Win+Shift** and can be enabled/disabled in the Settings tab:
+## Hotkeys (Win + Shift + ...)
 
 | Hotkey | Action |
 |--------|--------|
-| Win+Shift+G | Toggle desktop gamma mode (sRGB ↔ 2.2 for SDR-in-HDR content) |
-| Win+Shift+Z | Toggle HDR on/off for focused monitor |
-| Win+Shift+X | Toggle analysis overlay (peak nits, gamut info, histogram) |
+| **G**  | Toggle gamma correction (SDR-in-HDR fix) |
+| **Z**  | Toggle HDR state for the current monitor |
+| **X**  | Show real-time analysis overlay |
 
-## Supported Formats
+Hotkeys can be disabled or remapped in the **Settings** tab.
 
-| Format | Tab | Notes |
-|--------|-----|-------|
-| **.cube** (3D) | II. 3D LUT | Industry standard, any size up to 128³ |
-| **.txt** | II. 3D LUT | eeColor format (65³) |
-| **.cube** (1D) | I. MHC | Per-channel correction curves (e.g., BMD_4096) |
-| **.icm / .icc** | I. MHC | ICC profile import — extracts primaries and TRC |
+## Additional features
+
+- Per-monitor settings (SDR and HDR modes handled separately)
+- Application whitelist to bypass corrections for selected programs
+- Passthrough mode for full VRR compatibility
+- Automatic start with Windows
+- Support for .cube, .icc, and .icm files
+- 3D LUT interpolation (trilinear or tetrahedral)
 
 ## Limitations
 
-- **~1 frame visual delay** — Inherent to capture-and-reprocess; input is unaffected
-- **DRM content shows black** — Windows prevents capturing protected content
-- **Some system UI not captured** — Start menu animations, notification popups
-- **NVIDIA G-Sync disabled while overlay is active** — The overlay window breaks VRR on NVIDIA GPUs ([details](https://github.com/sup3rflyer/DesktopLUT/issues/1)). Use MHC-only mode or passthrough for VRR-sensitive apps. AMD FreeSync and Intel VRR work normally.
+- Introduces approximately one frame of visual delay (input latency is unaffected)
+- DRM-protected content (e.g., Netflix) appears black
+- Some UI elements (such as Start menu animations) may remain uncorrected
+- NVIDIA G-Sync may require MHC-only operation in certain configurations
 
-## Building from Source
+## Building from source
 
-Requires Visual Studio 2022 with C++ desktop development workload and Windows SDK 10.0.19041+.
+1. Install Visual Studio 2022 with the C++ desktop development workload.
+2. Install Windows SDK 10.0.19041 or newer.
+3. Open `DesktopLUT.sln`.
+4. Build the Release x64 configuration.
 
-```
-MSBuild DesktopLUT.sln -p:Configuration=Release -p:Platform=x64
-```
+## Technical details
 
-Or open `DesktopLUT.sln` in VS2022 and build Release x64.
-
-### Running Tests
-
-```
-MSBuild DesktopLUT.Tests.vcxproj -p:Configuration=Release -p:Platform=x64
-bin\Test\DesktopLUT.Tests.exe
-```
-
-180 test cases covering color math (PQ, primaries matrices, sRGB EOTF), MHC ICC profile generation/reading/grayscale extraction/per-channel eval+LUT/ICtCp offsets, EDID chromaticity parsing, frame pacer EMA/cadence lock/thresholds, LUT loading (.cube/.txt), and settings round-trips. Uses [doctest](https://github.com/doctest/doctest).
-
-## Technical Details
-
-See [REFERENCE.md](REFERENCE.md) for in-depth documentation covering:
-- Complete color pipeline (ICtCp, PQ, Bradford adaptation, MHC2 ICC format)
-- Module architecture and implementation patterns
-- INI file format and all settings
-- Performance characteristics
+For the full color pipeline, shader code, registry handling, and INI format, see **[REFERENCE.md](REFERENCE.md)**.
 
 ## License
 
-GPL v3 — See [LICENSE](LICENSE)
+GPL v3. See [LICENSE](LICENSE) for details.
