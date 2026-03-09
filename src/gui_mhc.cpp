@@ -19,6 +19,7 @@
 // SECTION: MHC Helper Functions
 // ============================================================================
 
+
 // Update MHC active flags on the running MonitorContext
 // Called after MHC install/remove/enable toggle — tracks state for diagnostics and live preview
 void UpdateMhcFlagsLive(int monitorIndex) {
@@ -227,18 +228,19 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
 
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return false;
+
     // Use unique filename each time to bypass Windows profile caching
-    static int profileSeq = 0;
-    std::wstring profileName = L"DesktopLUT_" + (isHDR ? std::wstring(L"HDR") : std::wstring(L"SDR"))
-        + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
+    wchar_t monTag[8];
+    swprintf_s(monTag, L"Mon%d", monitorIndex);
+    std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag)
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     // Write to temp directory - InstallColorProfileW copies to system color dir
     wchar_t tempDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + profileName;
-
-    DisplayInfo displayInfo;
-    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return false;
 
     // Remove old profile association and delete old file from color dir
     if (mhc.enabled && !mhc.profileName.empty()) {
@@ -359,18 +361,22 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return;
 
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return;
+
     // Unique filename to bypass caching
-    std::wstring newProfileName = L"DesktopLUT_" + (isHDR ? std::wstring(L"HDR") : std::wstring(L"SDR"))
-        + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
+    wchar_t monTag[8];
+    swprintf_s(monTag, L"Mon%d", monitorIndex);
+    std::wstring newProfileName = L"DesktopLUT_" + std::wstring(monTag)
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     wchar_t tempDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + newProfileName;
 
-    DisplayInfo displayInfo;
-    if (GetDisplayInfoForMonitor(monitorIndex, displayInfo)) {
-        // Remove old profile and clean up old file
-        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    // Remove old profile and clean up old file
+    RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    {
         wchar_t sysDir[MAX_PATH];
         GetSystemDirectory(sysDir, MAX_PATH);
         std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + mhc.profileName;

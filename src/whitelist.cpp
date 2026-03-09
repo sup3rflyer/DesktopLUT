@@ -371,6 +371,39 @@ static void CheckMhcProfiles() {
 }
 
 // ============================================================================
+// SECTION: System Health Check
+// ============================================================================
+
+// Cached adapter LUID for detecting driver updates / adapter changes
+static LUID s_cachedAdapterLuid = {};
+static bool s_luidInitialized = false;
+
+static void CheckSystemHealth() {
+    // LUID validation: detect adapter changes (driver update, GPU reset)
+    DisplayInfo displayInfo;
+    if (GetDisplayInfoForMonitor(0, displayInfo)) {
+        if (!s_luidInitialized) {
+            s_cachedAdapterLuid = displayInfo.adapterId;
+            s_luidInitialized = true;
+        } else if (displayInfo.adapterId.LowPart != s_cachedAdapterLuid.LowPart ||
+                   displayInfo.adapterId.HighPart != s_cachedAdapterLuid.HighPart) {
+            std::cout << "Adapter LUID changed, forcing reinit..." << std::endl;
+            s_cachedAdapterLuid = displayInfo.adapterId;
+            g_forceReinit.store(true);
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+        }
+    }
+
+    // Overlay window health check
+    HWND mainHwnd = g_mainHwnd.load();
+    if (mainHwnd && !IsWindow(mainHwnd)) {
+        std::cerr << "Overlay window destroyed externally, forcing reinit..." << std::endl;
+        g_forceReinit.store(true);
+        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+    }
+}
+
+// ============================================================================
 // SECTION: Whitelist Thread
 // ============================================================================
 
@@ -384,6 +417,7 @@ static void GammaWhitelistThreadFunc() {
     }
 
     int mhcCheckCounter = 0;
+    int healthCheckCounter = 0;
     while (g_gammaWhitelistThreadRunning.load()) {
         // Single process snapshot shared by both gamma and VRR whitelist checks
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -399,6 +433,13 @@ static void GammaWhitelistThreadFunc() {
         if (++mhcCheckCounter >= 20) {
             mhcCheckCounter = 0;
             CheckMhcProfiles();
+        }
+
+        // System health check every 10th iteration (~5 seconds).
+        // Detects adapter LUID changes and overlay window destruction.
+        if (++healthCheckCounter >= 10) {
+            healthCheckCounter = 0;
+            CheckSystemHealth();
         }
 
         // Sleep in small chunks to allow quick exit on shutdown

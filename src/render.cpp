@@ -21,6 +21,10 @@
 #define STATUS_GRAPHICS_PRESENT_OCCLUDED ((DWORD)0xC01E05A1)
 #endif
 
+#ifndef WM_DWMCOMPOSITIONCHANGED
+#define WM_DWMCOMPOSITIONCHANGED 0x031E
+#endif
+
 // ============================================================================
 // SECTION: Compositor Clock & Display Power
 // ============================================================================
@@ -58,6 +62,9 @@ void InitCompositorClock() {
 // Motion bar time origin (set on first frame)
 static std::chrono::steady_clock::time_point s_motionBarOrigin;
 static bool s_motionBarOriginSet = false;
+
+// Watchdog recovery attempt counter (reset on successful frame)
+static int s_watchdogRecoveryAttempts = 0;
 
 // Display power notification handle
 static HPOWERNOTIFY g_displayPowerNotify = nullptr;
@@ -1252,6 +1259,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     } else {
         // Successful frame - update watchdog timestamp
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+        s_watchdogRecoveryAttempts = 0;
 
         // Track frame timing only when analysis overlay is active (avoid unnecessary work)
         if (g_analysisEnabled.load()) {
@@ -1331,8 +1339,7 @@ void RenderAll(FramePacer* fp) {
     // DXGI_ERROR_DEVICE_REMOVED — no need for periodic proactive polling.
     // The watchdog below catches any case where rendering is silently stuck.
 
-    // Watchdog: if no successful frame for N seconds, exit gracefully
-    // This catches cases where device appears healthy but rendering is stuck.
+    // Watchdog: if no successful frame for N seconds, attempt recovery before exit.
     // Skip watchdog during display sleep — the display-off flag is set by the GUI
     // thread (always responsive) so this is reliable even when CompClock blocks.
     if (g_displayOff.load(std::memory_order_relaxed)) {
@@ -1340,13 +1347,60 @@ void RenderAll(FramePacer* fp) {
     } else {
         auto timeSinceLastFrame = std::chrono::steady_clock::now() - g_lastSuccessfulFrame;
         if (timeSinceLastFrame > std::chrono::seconds(WATCHDOG_TIMEOUT_SECONDS)) {
-            std::cerr << "Watchdog timeout: no successful frame for " << WATCHDOG_TIMEOUT_SECONDS << " seconds" << std::endl;
-            MessageBeep(MB_ICONERROR);
-            // Hide all overlay windows
-            for (auto& ctx : g_monitors) {
-                if (ctx.hwnd) {
-                    ShowWindow(ctx.hwnd, SW_HIDE);
+            if (s_watchdogRecoveryAttempts < MAX_WATCHDOG_RECOVERY_ATTEMPTS) {
+                std::cerr << "Watchdog timeout (attempt " << (s_watchdogRecoveryAttempts + 1)
+                          << "/" << MAX_WATCHDOG_RECOVERY_ATTEMPTS
+                          << "), attempting recovery..." << std::endl;
+                MessageBeep(MB_ICONWARNING);
+
+                // Drop MMCSS priority during heavy recovery work
+                if (fp && fp->mmcssHandle) {
+                    AvRevertMmThreadCharacteristics(fp->mmcssHandle);
+                    fp->mmcssHandle = nullptr;
                 }
+
+                // Prevent re-triggering during recovery sleep
+                g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+
+                if (AttemptDeviceRecovery()) {
+                    std::cout << "Watchdog recovery succeeded, resetting state..." << std::endl;
+                    if (fp) {
+                        ResetFramePacerState(fp, "watchdog recovery");
+                    }
+                    for (auto& ctx : g_monitors) {
+                        ctx.enabled = true;
+                        ctx.consecutiveFailures = 0;
+                        ctx.recoveryBackoffMs = 0;
+                        ctx.cbDirty = true;
+                        ctx.dcompCommitted = false;
+                        ctx.lastCaptureTexture = nullptr;
+                    }
+                    g_forceTopmostReassert.store(true);
+                    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+                } else {
+                    std::cerr << "Watchdog recovery failed" << std::endl;
+                    // Reset watchdog timer for next attempt
+                    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+                }
+
+                // Re-acquire MMCSS after recovery
+                if (fp && fp->strategy != FramePacerStrategy::DwmFlushOnly) {
+                    fp->mmcssTaskIndex = 0;
+                    fp->mmcssHandle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &fp->mmcssTaskIndex);
+                    if (fp->mmcssHandle) {
+                        AvSetMmThreadPriority(fp->mmcssHandle, AVRT_PRIORITY_CRITICAL);
+                    }
+                }
+
+                s_watchdogRecoveryAttempts++;
+                return;  // Skip rendering this cycle
+            }
+
+            // Recovery attempts exhausted — exit
+            std::cerr << "Watchdog timeout: recovery attempts exhausted, exiting" << std::endl;
+            MessageBeep(MB_ICONERROR);
+            for (auto& ctx : g_monitors) {
+                if (ctx.hwnd) ShowWindow(ctx.hwnd, SW_HIDE);
                 ctx.enabled = false;
             }
             g_running = false;
@@ -1386,6 +1440,15 @@ void RenderAll(FramePacer* fp) {
         std::cout << "Forcing reinit of all monitors..." << std::endl;
         // Give system time to stabilize after wake
         Sleep(500);
+        // Check overlay window validity — if destroyed externally, trigger restart
+        for (auto& ctx : g_monitors) {
+            if (ctx.hwnd && !IsWindow(ctx.hwnd)) {
+                std::cerr << "Monitor " << ctx.index
+                          << " overlay window destroyed externally, triggering restart" << std::endl;
+                g_running = false;
+                return;
+            }
+        }
         // Release all duplication interfaces to force reinit
         for (auto& ctx : g_monitors) {
             if (ctx.duplication) {
@@ -1733,6 +1796,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (wParam == OSD_TIMER_ID) HideOSD();
+        return 0;
+    case WM_DWMCOMPOSITIONCHANGED:
+        std::cout << "DWM composition changed, forcing reinit..." << std::endl;
+        g_forceReinit.store(true);
+        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         return 0;
     case WM_WINDOWPOSCHANGING: {
         // If an external window is changing our z-order, trigger TOPMOST reassertion.

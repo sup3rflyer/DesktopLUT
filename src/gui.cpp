@@ -18,8 +18,11 @@
 #include <algorithm>
 #include <iostream>
 #include <cstdio>
+#include <wtsapi32.h>
+#include <dbt.h>
 
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "Wtsapi32.lib")
 
 // ============================================================================
 // SECTION: Display Power Notification (GUI-side)
@@ -1125,9 +1128,21 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             GetMonitorInfo(monitors[i], &mi);
             int monW = mi.rcMonitor.right - mi.rcMonitor.left;
             int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+            bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            // Query friendly display name (e.g. "PA32UCXR") from Windows display config
+            DisplayInfo dispInfo;
+            std::wstring friendlyName;
+            if (GetDisplayInfoForMonitor((int)i, dispInfo) && !dispInfo.name.empty()) {
+                friendlyName = dispInfo.name;
+            }
             wchar_t name[128];
-            swprintf_s(name, L"Monitor %d: %dx%d%s", (int)i + 1, monW, monH,
-                (mi.dwFlags & MONITORINFOF_PRIMARY) ? L" [Primary]" : L"");
+            if (!friendlyName.empty()) {
+                swprintf_s(name, L"Monitor %d - %s: %dx%d%s", (int)i, friendlyName.c_str(),
+                    monW, monH, isPrimary ? L" [Primary]" : L"");
+            } else {
+                swprintf_s(name, L"Monitor %d: %dx%d%s", (int)i,
+                    monW, monH, isPrimary ? L" [Primary]" : L"");
+            }
             SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)name);
             g_gui.monitorNames.push_back(name);
             g_gui.monitorSettings.push_back({});  // Empty settings for each monitor
@@ -1181,6 +1196,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_guiDisplayPowerNotify = RegisterPowerSettingNotification(
             hwnd, &GUID_CONSOLE_DISPLAY_STATE_GUI, DEVICE_NOTIFY_WINDOW_HANDLE);
 
+        // Register for session change notifications (lock/unlock/RDP connect/disconnect)
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+
         return 0;
     }
 
@@ -1219,7 +1237,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     g_gui.monitorSettings[g_gui.currentMonitor].sdrPath = path;
                 }
-                UpdateGUIState();
+                if (g_gui.isRunning) {
+                    SaveSettings();
+                    StopProcessing();
+                    StartProcessing();
+                } else {
+                    UpdateGUIState();
+                }
             }
             return 0;
         }
@@ -1228,7 +1252,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 g_gui.monitorSettings[g_gui.currentMonitor].sdrPath.clear();
             }
-            UpdateGUIState();
+            if (g_gui.isRunning) {
+                SaveSettings();
+                StopProcessing();
+                StartProcessing();
+            } else {
+                UpdateGUIState();
+            }
             return 0;
         case ID_HDR_BROWSE: {
             wchar_t path[MAX_PATH] = {};
@@ -1237,7 +1267,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     g_gui.monitorSettings[g_gui.currentMonitor].hdrPath = path;
                 }
-                UpdateGUIState();
+                if (g_gui.isRunning) {
+                    SaveSettings();
+                    StopProcessing();
+                    StartProcessing();
+                } else {
+                    UpdateGUIState();
+                }
             }
             return 0;
         }
@@ -1246,7 +1282,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrPath.clear();
             }
-            UpdateGUIState();
+            if (g_gui.isRunning) {
+                SaveSettings();
+                StopProcessing();
+                StartProcessing();
+            } else {
+                UpdateGUIState();
+            }
             return 0;
         case ID_APPLY:
             g_desktopGammaMode = (SendMessage(g_gui.hwndGammaCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -1899,6 +1941,24 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (wParam == SETTINGS_CHANGE_TIMER_ID) {
+            KillTimer(hwnd, SETTINGS_CHANGE_TIMER_ID);
+            std::cout << "[GUI] Settings change debounce fired, forcing reinit..." << std::endl;
+            if (g_gui.isRunning) {
+                g_forceReinit.store(true);
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            }
+            return 0;
+        }
+        if (wParam == DEVICE_CHANGE_TIMER_ID) {
+            KillTimer(hwnd, DEVICE_CHANGE_TIMER_ID);
+            std::cout << "[GUI] Device change debounce fired, forcing reinit..." << std::endl;
+            if (g_gui.isRunning) {
+                g_forceReinit.store(true);
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            }
+            return 0;
+        }
         break;  // Let other timers pass through to DefWindowProc
 
     case WM_DISPLAYCHANGE: {
@@ -1916,9 +1976,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                       << " -> " << newMonitors.size() << std::endl;
             g_gui.monitors = newMonitors;
 
-            // Resize monitorSettings, preserving existing entries
-            size_t oldSize = g_gui.monitorSettings.size();
-            g_gui.monitorSettings.resize(newMonitors.size());
+            // Resize monitorSettings under lock — render/whitelist threads snapshot this vector
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                g_gui.monitorSettings.resize(newMonitors.size());
+            }
 
             // Update monitor names and combo box
             g_gui.monitorNames.clear();
@@ -1926,10 +1988,22 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             for (size_t i = 0; i < newMonitors.size(); i++) {
                 MONITORINFO mi = { sizeof(mi) };
                 GetMonitorInfo(newMonitors[i], &mi);
-                wchar_t name[64];
-                swprintf_s(name, L"Monitor %d (%dx%d)", (int)i + 1,
-                    mi.rcMonitor.right - mi.rcMonitor.left,
-                    mi.rcMonitor.bottom - mi.rcMonitor.top);
+                int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+                int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+                DisplayInfo dispInfo;
+                std::wstring friendlyName;
+                if (GetDisplayInfoForMonitor((int)i, dispInfo) && !dispInfo.name.empty()) {
+                    friendlyName = dispInfo.name;
+                }
+                wchar_t name[128];
+                if (!friendlyName.empty()) {
+                    swprintf_s(name, L"Monitor %d - %s: %dx%d%s", (int)i, friendlyName.c_str(),
+                        monW, monH, isPrimary ? L" [Primary]" : L"");
+                } else {
+                    swprintf_s(name, L"Monitor %d: %dx%d%s", (int)i,
+                        monW, monH, isPrimary ? L" [Primary]" : L"");
+                }
                 g_gui.monitorNames.push_back(name);
                 SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)name);
             }
@@ -1948,6 +2022,45 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+
+    case WM_WTSSESSION_CHANGE:
+        switch (wParam) {
+        case WTS_SESSION_UNLOCK:
+        case WTS_CONSOLE_CONNECT:
+            std::cout << "[GUI] Session unlock/connect, forcing reinit..." << std::endl;
+            g_displayOff.store(false);
+            if (g_gui.isRunning) {
+                g_forceReinit.store(true);
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            }
+            break;
+        case WTS_SESSION_LOCK:
+        case WTS_CONSOLE_DISCONNECT:
+            std::cout << "[GUI] Session lock/disconnect" << std::endl;
+            g_displayOff.store(true);
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+            if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            break;
+        }
+        return 0;
+
+    case WM_SETTINGCHANGE:
+        // Detect color/display settings changes that can silently break ICC profiles
+        if (lParam && wcscmp(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") == 0) {
+            std::cout << "[GUI] ImmersiveColorSet changed, debouncing reinit..." << std::endl;
+            SetTimer(hwnd, SETTINGS_CHANGE_TIMER_ID, 500, nullptr);
+        } else if (wParam == SPI_SETWORKAREA) {
+            std::cout << "[GUI] Work area changed, debouncing reinit..." << std::endl;
+            SetTimer(hwnd, SETTINGS_CHANGE_TIMER_ID, 500, nullptr);
+        }
+        break;  // Let DefWindowProc also process
+
+    case WM_DEVICECHANGE:
+        if (wParam == DBT_DEVNODES_CHANGED) {
+            std::cout << "[GUI] Device tree changed, debouncing reinit..." << std::endl;
+            SetTimer(hwnd, DEVICE_CHANGE_TIMER_ID, 2000, nullptr);
+        }
+        return TRUE;
 
     case WM_POWERBROADCAST:
         // Handle power events for sleep/wake recovery (defense in depth with overlay WndProc)
@@ -2005,6 +2118,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         StopProcessing();
         RemoveTrayIcon();
+        // Unregister session change notifications
+        WTSUnRegisterSessionNotification(hwnd);
         // Unregister GUI-side display power notification
         if (g_guiDisplayPowerNotify) {
             UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);
