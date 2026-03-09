@@ -397,6 +397,33 @@ TEST_CASE("Bool: unrecognized value returns default") {
 }
 
 // ============================================================================
+// Float I/O Locale Safety
+// ============================================================================
+
+TEST_CASE("Float: round-trip preserves decimal point") {
+    TempIni ini;
+    // Values that would break under comma-decimal locales (e.g. 0.6400 → "0,6400")
+    float testValues[] = { 0.6400f, 0.3300f, 0.0001f, 1.0f, 0.0f, -0.5f, 999.123f };
+    for (int i = 0; i < 7; i++) {
+        wchar_t key[32];
+        swprintf(key, 32, L"val%d", i);
+        WritePrivateProfileFloat(L"FloatTest", key, testValues[i], ini.c_str());
+    }
+    for (int i = 0; i < 7; i++) {
+        wchar_t key[32];
+        swprintf(key, 32, L"val%d", i);
+        float loaded = GetPrivateProfileFloat(L"FloatTest", key, -999.0f, ini.c_str());
+        CHECK(loaded == doctest::Approx(testValues[i]).epsilon(0.0001));
+    }
+}
+
+TEST_CASE("Float: default returned for missing key") {
+    TempIni ini;
+    float result = GetPrivateProfileFloat(L"NonExistent", L"missing", 42.0f, ini.c_str());
+    CHECK(result == doctest::Approx(42.0f).epsilon(0.001));
+}
+
+// ============================================================================
 // Tonemap Case-Insensitive Parsing
 // ============================================================================
 

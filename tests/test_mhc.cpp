@@ -2,6 +2,7 @@
 #include "mhc.h"
 #include "color.h"
 #include <cmath>
+#include <algorithm>
 #include <fstream>
 #include <cstring>
 
@@ -357,6 +358,40 @@ TEST_CASE("InvertTRC: gamma 2.2 TRC") {
     CHECK(result == doctest::Approx(expected).epsilon(0.01));
 }
 
+TEST_CASE("InvertTRC: 2-entry TRC (minimum)") {
+    std::vector<float> trc = { 0.0f, 1.0f };
+    CHECK(InvertTRC(trc, 0.0f) == doctest::Approx(0.0f).epsilon(0.01));
+    CHECK(InvertTRC(trc, 1.0f) == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK(InvertTRC(trc, 0.5f) == doctest::Approx(0.5f).epsilon(0.02));
+}
+
+TEST_CASE("InvertTRC: 4096-entry TRC (HDR-sized)") {
+    std::vector<float> trc(4096);
+    for (int i = 0; i < 4096; i++) trc[i] = powf((float)i / 4095.0f, 2.2f);
+
+    float result = InvertTRC(trc, 0.5f);
+    float expected = powf(0.5f, 1.0f / 2.2f);
+    CHECK(result == doctest::Approx(expected).epsilon(0.005));
+}
+
+TEST_CASE("InvertTRC: target below TRC minimum") {
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) trc[i] = 0.1f + 0.9f * ((float)i / 255.0f);
+    // trc[0] = 0.1, target = 0.0 → should return ~0
+    float result = InvertTRC(trc, 0.0f);
+    CHECK(result >= 0.0f);
+    CHECK(result < 0.05f);
+}
+
+TEST_CASE("InvertTRC: target above TRC maximum") {
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) trc[i] = 0.8f * ((float)i / 255.0f);
+    // trc[255] = 0.8, target = 1.0 → should return ~1.0
+    float result = InvertTRC(trc, 1.0f);
+    CHECK(result >= 0.9f);
+    CHECK(result <= 1.0f);
+}
+
 // ============================================================================
 // ICC Profile Generation & Read-Back
 // ============================================================================
@@ -579,6 +614,45 @@ TEST_CASE("FromTRC SDR: linear TRC produces non-identity LUT") {
     for (int i = 1; i < 64; i++) {
         CHECK(lut[i] >= lut[i - 1]);
     }
+}
+
+TEST_CASE("FromTRC SDR: targetGamma 2.4 differs from 2.2") {
+    // BT.1886 uses 2.4 gamma; the LUT should differ from the default 2.2 path
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) trc[i] = powf((float)i / 255.0f, 2.2f);
+
+    std::vector<float> lut22(64), lut24(64);
+    GenerateMHC2LUT_FromTRC_SDR(trc, lut22.data(), 64);           // default 2.2
+    GenerateMHC2LUT_FromTRC_SDR(trc, lut24.data(), 64, 2.4f);     // BT.1886
+
+    // Endpoints should be the same
+    CHECK(lut24[0] == doctest::Approx(0.0f).epsilon(0.01));
+    CHECK(lut24[63] == doctest::Approx(1.0f).epsilon(0.01));
+
+    // Midtone values should differ (2.4 target is darker than 2.2)
+    bool differs = false;
+    for (int i = 10; i < 50; i++) {
+        if (std::fabs(lut24[i] - lut22[i]) > 0.001f) { differs = true; break; }
+    }
+    CHECK(differs);
+
+    // Monotonicity
+    for (int i = 1; i < 64; i++) {
+        CHECK(lut24[i] >= lut24[i - 1]);
+    }
+}
+
+TEST_CASE("FromTRC SDR: gamma 2.4 TRC with targetGamma 2.4 is identity") {
+    // Display already has 2.4 gamma and target is 2.4 → no correction needed
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) trc[i] = powf((float)i / 255.0f, 2.4f);
+
+    std::vector<float> lut(64);
+    GenerateMHC2LUT_FromTRC_SDR(trc, lut.data(), 64, 2.4f);
+
+    CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.01));
+    CHECK(lut[63] == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK(lut[32] == doctest::Approx(32.0f / 63.0f).epsilon(0.02));
 }
 
 TEST_CASE("FromTRC HDR: PQ-shaped TRC produces identity LUT") {
@@ -817,21 +891,19 @@ TEST_CASE("HDR LUT: monotonicity") {
 // ============================================================================
 
 // ============================================================================
-// Black Point Compensation (HDR TRC)
+// HDR TRC LUT Pipeline (pqIn → PqEOTF → InvertTRC → pqOut)
 // ============================================================================
 
-TEST_CASE("FromTRC HDR BPC: raised black floor preserves shadow detail") {
+TEST_CASE("FromTRC HDR: raised black floor maps to non-zero output") {
     // Display with 5% black floor: trc[0] = 0.05 (non-zero minimum luminance)
-    // Without BPC, everything below the display's floor maps to 0 (shadow crushing)
-    // With BPC, PQ 0% maps to the display's actual black level instead
+    // Without BPC, PQ 0% targets linear 0.0 → InvertTRC finds signal near 0
+    // (below the display's floor), so shadow detail is lost
     float peakNits = 1000.0f;
     int N = 256;
     std::vector<float> trc(N);
     float blackFloor = 0.05f;
     for (int i = 0; i < N; i++) {
         float t = (float)i / (float)(N - 1);
-        // Perfect PQ display with raised black: linear output from blackFloor to 1.0
-        trc[i] = blackFloor + t * (1.0f - blackFloor);
         trc[i] = std::min(PqEOTF(t) * 10000.0f / peakNits, 1.0f);
         // Shift up by black floor
         trc[i] = blackFloor + trc[i] * (1.0f - blackFloor);
@@ -840,20 +912,21 @@ TEST_CASE("FromTRC HDR BPC: raised black floor preserves shadow detail") {
     std::vector<float> lut(64);
     GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
 
-    // At pqIn=0: BPC maps target 0 → blackFloor, InvertTRC finds signal for blackFloor
-    // The output should be near 0 (the signal that produces the display's minimum)
+    // At pqIn=0: target=0.0, InvertTRC(trc, 0.0) → signal ≈ 0 (below trc[0]=0.05)
     CHECK(lut[0] >= 0.0f);
-    CHECK(lut[0] < 0.05f);  // Should be very low signal
+    CHECK(lut[0] < 0.02f);  // Very low signal — below the display's floor
 
     // Monotonicity preserved
     for (int i = 1; i < 64; i++) {
         CHECK(lut[i] >= lut[i - 1]);
     }
+
+    // Peak maps to 1.0
+    CHECK(lut[63] == doctest::Approx(1.0f).epsilon(0.02));
 }
 
-TEST_CASE("FromTRC HDR BPC: zero black level matches no-BPC behavior") {
-    // When trc[0] ≈ 0, BPC formula becomes: bpcTarget = 0 + targetLinear * 1.0 = targetLinear
-    // This is identical to the pre-BPC behavior (identity remap)
+TEST_CASE("FromTRC HDR: perfect PQ display produces near-identity") {
+    // TRC perfectly matches PQ → InvertTRC(target) ≈ pqIn (identity)
     float peakNits = 1000.0f;
     int N = 256;
     std::vector<float> trc(N);
@@ -866,33 +939,35 @@ TEST_CASE("FromTRC HDR BPC: zero black level matches no-BPC behavior") {
     std::vector<float> lut(64);
     GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
 
-    // Should produce near-identity (perfect PQ display, no BPC effect)
+    // Near-identity: pqOut ≈ pqIn at sampled points
     CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.01));
     CHECK(lut[16] == doctest::Approx(16.0f / 63.0f).epsilon(0.03));
+    CHECK(lut[32] == doctest::Approx(32.0f / 63.0f).epsilon(0.03));
 }
 
-TEST_CASE("FromTRC HDR BPC: formula correctness at extremes") {
-    // Verify BPC formula: bpcTarget = blackLevel + targetLinear * (1 - blackLevel)
-    // At targetLinear=0 → bpcTarget=blackLevel; at targetLinear=1 → bpcTarget=1
-    float peakNits = 500.0f;
-    float blackFloor = 0.10f;
-    int N = 256;
-    std::vector<float> trc(N);
-    trc[0] = blackFloor;
-    for (int i = 1; i < N; i++) {
-        trc[i] = blackFloor + ((float)i / (float)(N - 1)) * (1.0f - blackFloor);
+TEST_CASE("FromTRC HDR: endpoints and monotonicity at various peaks") {
+    // Pipeline: pqIn → PqEOTF(pqIn)*10000/peak → clamp to 1.0 → InvertTRC → pqOut
+    // At pqIn=0: targetLinear=0 → InvertTRC(0.0) ≈ 0.0
+    // At peak: targetLinear=1.0 → InvertTRC(1.0) ≈ 1.0
+    float peaks[] = { 400.0f, 1000.0f, 4000.0f };
+    for (float peakNits : peaks) {
+        int N = 256;
+        std::vector<float> trc(N);
+        for (int i = 0; i < N; i++) {
+            trc[i] = (float)i / (float)(N - 1);  // Linear ramp
+        }
+
+        std::vector<float> lut(64);
+        GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
+
+        CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.02));
+        CHECK(lut[63] == doctest::Approx(1.0f).epsilon(0.02));
+
+        // Monotonicity
+        for (int i = 1; i < 64; i++) {
+            CHECK(lut[i] >= lut[i - 1]);
+        }
     }
-
-    std::vector<float> lut(64);
-    GenerateMHC2LUT_FromTRC_HDR(trc, lut.data(), 64, peakNits);
-
-    // At pqIn=0, targetLinear=0, bpcTarget=0.10
-    // InvertTRC(trc, 0.10) should find index 0 (trc[0]=0.10) → signal ≈ 0.0
-    CHECK(lut[0] == doctest::Approx(0.0f).epsilon(0.02));
-
-    // Above peak: targetLinear clamped to 1.0, bpcTarget=1.0
-    // InvertTRC(trc, 1.0) should return signal ≈ 1.0
-    CHECK(lut[63] == doctest::Approx(1.0f).epsilon(0.02));
 }
 
 // ============================================================================
@@ -1267,6 +1342,34 @@ TEST_CASE("Grayscale HDR per-channel: independent corrections") {
     CHECK(chG < chB);
 }
 
+TEST_CASE("Grayscale HDR per-channel: above-peak extrapolation") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Set per-channel corrections
+    for (int i = 0; i < 20; i++) {
+        gs.pointsR[i] = gs.points[i] * 0.95f;
+        gs.pointsG[i] = gs.points[i] * 1.00f;
+        gs.pointsB[i] = gs.points[i] * 1.05f;
+    }
+
+    float pqPeak = PqOETF(1000.0f / 10000.0f);
+    float abovePeak = pqPeak + 0.1f;
+    for (int ch = 0; ch < 3; ch++) {
+        float result = EvalGrayscaleHDR_Channel(abovePeak, gs, pqPeak, ch);
+        CHECK(std::isfinite(result));
+        CHECK(result > 0.0f);
+    }
+    // Ordering should be preserved above peak (R < G < B corrections)
+    float rAbove = EvalGrayscaleHDR_Channel(abovePeak, gs, pqPeak, 0);
+    float gAbove = EvalGrayscaleHDR_Channel(abovePeak, gs, pqPeak, 1);
+    float bAbove = EvalGrayscaleHDR_Channel(abovePeak, gs, pqPeak, 2);
+    CHECK(rAbove <= gAbove);
+    CHECK(gAbove <= bAbove);
+}
+
 TEST_CASE("MHC LUT SDR per-channel: R/G/B differ") {
     GrayscaleData gs;
     gs.enabled = true;
@@ -1321,6 +1424,66 @@ TEST_CASE("MHC LUT HDR per-channel: R/G/B differ") {
     // Mid-LUT: R < G < B
     CHECK(lutR[256] < lutG[256]);
     CHECK(lutG[256] < lutB[256]);
+}
+
+// ============================================================================
+// 32-Point Grayscale Boundary Tests
+// ============================================================================
+
+TEST_CASE("Grayscale SDR: 32-point full sweep") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 32;
+    gs.initLinear();
+    // Apply a sine-wave modulation to test interpolation across all 32 points
+    for (int i = 0; i < 32; i++) {
+        float t = (float)i / 31.0f;
+        gs.points[i] = t * t + 0.02f * sinf(t * 6.28f);
+        gs.points[i] = std::clamp(gs.points[i], 0.0f, 1.0f);
+        gs.pointsR[i] = gs.points[i];
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i];
+    }
+
+    // Sweep through 100 input values — all must be finite and in range
+    for (int i = 0; i <= 100; i++) {
+        float Y = (float)i / 100.0f;
+        float result = EvalGrayscaleSDR(Y, gs);
+        CHECK(std::isfinite(result));
+        CHECK(result >= 0.0f);
+        CHECK(result <= 1.1f);
+    }
+
+    // Per-channel should match when R=G=B
+    float Y = 0.5f;
+    float single = EvalGrayscaleSDR(Y, gs);
+    CHECK(EvalGrayscaleSDR_Channel(Y, gs, 0) == doctest::Approx(single).epsilon(0.0001));
+    CHECK(EvalGrayscaleSDR_Channel(Y, gs, 1) == doctest::Approx(single).epsilon(0.0001));
+    CHECK(EvalGrayscaleSDR_Channel(Y, gs, 2) == doctest::Approx(single).epsilon(0.0001));
+}
+
+TEST_CASE("Grayscale HDR: 32-point full sweep") {
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 32;
+    gs.peakNits = 1000.0f;
+    gs.initLinearPQ();
+    // Modulate some points
+    for (int i = 0; i < 32; i++) {
+        gs.points[i] *= (1.0f + 0.05f * sinf((float)i * 0.5f));
+        gs.pointsR[i] = gs.points[i];
+        gs.pointsG[i] = gs.points[i];
+        gs.pointsB[i] = gs.points[i];
+    }
+
+    float pqPeak = PqOETF(1000.0f / 10000.0f);
+    // Sweep PQ values 0 to pqPeak
+    for (int i = 0; i <= 50; i++) {
+        float pq = pqPeak * (float)i / 50.0f;
+        float result = EvalGrayscaleHDR(pq, gs, pqPeak);
+        CHECK(std::isfinite(result));
+        CHECK(result >= 0.0f);
+    }
 }
 
 // ============================================================================

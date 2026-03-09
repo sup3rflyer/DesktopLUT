@@ -193,6 +193,65 @@ TEST_CASE("LUT: blank lines skipped") {
     CHECK(lutSize == 2);
 }
 
+TEST_CASE("LUT: tab-separated values") {
+    TempFile tmp(L"_test_tabs.cube");
+    {
+        std::ofstream f(tmp.path);
+        f << "LUT_3D_SIZE 2\n";
+        for (int b = 0; b < 2; b++)
+            for (int g = 0; g < 2; g++)
+                for (int r = 0; r < 2; r++)
+                    f << (float)r << "\t" << (float)g << "\t" << (float)b << "\n";
+    }
+
+    std::vector<float> data;
+    int lutSize = 0;
+    bool ok = LoadLUT(tmp.path, data, lutSize);
+
+    CHECK(ok);
+    CHECK(lutSize == 2);
+    CHECK(data.size() == 8 * 4);
+}
+
+TEST_CASE("LUT: CRLF line endings") {
+    TempFile tmp(L"_test_crlf.cube");
+    {
+        std::ofstream f(tmp.path, std::ios::binary);
+        f << "LUT_3D_SIZE 2\r\n";
+        for (int b = 0; b < 2; b++)
+            for (int g = 0; g < 2; g++)
+                for (int r = 0; r < 2; r++)
+                    f << (float)r << " " << (float)g << " " << (float)b << "\r\n";
+    }
+
+    std::vector<float> data;
+    int lutSize = 0;
+    bool ok = LoadLUT(tmp.path, data, lutSize);
+
+    CHECK(ok);
+    CHECK(lutSize == 2);
+}
+
+TEST_CASE("LUT: mixed whitespace (spaces and tabs)") {
+    TempFile tmp(L"_test_mixed_ws.cube");
+    {
+        std::ofstream f(tmp.path);
+        f << "LUT_3D_SIZE  2\n";
+        for (int b = 0; b < 2; b++)
+            for (int g = 0; g < 2; g++)
+                for (int r = 0; r < 2; r++)
+                    f << "  " << (float)r << "  \t " << (float)g << "   " << (float)b << "\n";
+    }
+
+    std::vector<float> data;
+    int lutSize = 0;
+    bool ok = LoadLUT(tmp.path, data, lutSize);
+
+    CHECK(ok);
+    CHECK(lutSize == 2);
+    CHECK(data.size() == 8 * 4);
+}
+
 // ============================================================================
 // .txt Format (eeColor)
 // ============================================================================
