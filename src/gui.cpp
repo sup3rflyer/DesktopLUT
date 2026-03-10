@@ -2015,9 +2015,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, g_gui.currentMonitor, 0);
 
-            // Force reinit if processing is running
+            // Force reinit if processing is running, or restart if it exited
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
+                g_forceMhcReapply.store(true);
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            } else if (!g_gui.activeSettings.empty()) {
+                // Processing exited (e.g., monitors were off during init) — restart now
+                std::cout << "[GUI] Display change with active settings, restarting processing..." << std::endl;
+                StartProcessing();
             }
         }
         return 0;

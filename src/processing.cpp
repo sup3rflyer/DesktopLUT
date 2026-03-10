@@ -215,6 +215,8 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     if (!InitD3D()) {
         SetStatus(L"Failed to initialize D3D11");
         ReleaseSharedD3DResources();  // Clean up any partially initialized resources
+        CoUninitialize();
+        PostMessage(g_gui.hwndMain, WM_USER + 100, 0, 0);
         return;
     }
 
@@ -223,6 +225,8 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     if (!InitDirectCompositionDevice()) {
         SetStatus(L"Failed to initialize DirectComposition");
         ReleaseSharedD3DResources();  // Clean up D3D resources
+        CoUninitialize();
+        PostMessage(g_gui.hwndMain, WM_USER + 100, 0, 0);
         return;
     }
 
@@ -369,6 +373,8 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     if (g_monitors.empty()) {
         SetStatus(L"No monitors initialized");
         ReleaseSharedD3DResources();  // Clean up D3D resources on early exit
+        CoUninitialize();
+        PostMessage(g_gui.hwndMain, WM_USER + 100, 0, 0);
         return;
     }
 
