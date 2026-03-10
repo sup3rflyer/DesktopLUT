@@ -1976,10 +1976,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                       << " -> " << newMonitors.size() << std::endl;
             g_gui.monitors = newMonitors;
 
-            // Resize monitorSettings under lock — render/whitelist threads snapshot this vector
+            // Grow monitorSettings if needed — never shrink, to preserve settings for
+            // monitors that may temporarily disappear (physical power-off, KVM switch).
+            // Render/whitelist threads bounds-check via monitor index.
             {
                 std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-                g_gui.monitorSettings.resize(newMonitors.size());
+                if (newMonitors.size() > g_gui.monitorSettings.size()) {
+                    g_gui.monitorSettings.resize(newMonitors.size());
+                }
             }
 
             // Update monitor names and combo box
