@@ -61,6 +61,7 @@ std::atomic<bool> g_desktopGammaMode{ false };   // Effective gamma state (may b
 std::atomic<bool> g_tetrahedralInterp{ false };  // Default: trilinear (tetrahedral opt-in for quality)
 std::atomic<bool> g_running{ true };            // Main loop control
 std::atomic<bool> g_forceReinit{ false };       // Force reinit on next frame
+std::atomic<bool> g_forceMhcReapply{ false };  // Force MHC profile reapply on next reinit (sleep/wake, TDR)
 std::atomic<bool> g_forceTopmostReassert{ false }; // Force TOPMOST reassert on next frame
 std::atomic<bool> g_selfReassertInProgress{ false }; // Guard: suppress WM_WINDOWPOSCHANGING during our own reasserts
 std::atomic<bool> g_logPeakDetection{ false };  // Debug: log detected peak nits to console

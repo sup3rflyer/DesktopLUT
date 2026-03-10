@@ -390,6 +390,7 @@ static void CheckSystemHealth() {
             std::cout << "Adapter LUID changed, forcing reinit..." << std::endl;
             s_cachedAdapterLuid = displayInfo.adapterId;
             g_forceReinit.store(true);
+            g_forceMhcReapply.store(true);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
         }
     }

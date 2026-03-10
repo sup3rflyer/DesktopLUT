@@ -695,8 +695,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             if (ctx->isHDREnabled != ctx->wasHDREnabled) {
                 ApplyMaxTmlSettings();
                 ctx->cbDirty = true;
+                ReapplyMhcProfilesOnModeSwitch(ctx);
             }
-            ReapplyMhcProfilesOnModeSwitch(ctx);
             ctx->wasHDREnabled = ctx->isHDREnabled;
         }
         return;
@@ -875,8 +875,10 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             ctx->usePassthrough = !hasApplicableLUT;
             RecreateSwapchain(ctx);
             ApplyMaxTmlSettings();
-            // Always reapply MHC ICC profiles after duplication reinit
-            ReapplyMhcProfilesOnModeSwitch(ctx);
+            // Reapply MHC ICC profiles only if display mode actually changed
+            if (ctx->isHDREnabled != ctx->wasHDREnabled) {
+                ReapplyMhcProfilesOnModeSwitch(ctx);
+            }
             ctx->wasHDREnabled = ctx->isHDREnabled;
             ctx->cbDirty = true;
             std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
@@ -1465,8 +1467,11 @@ void RenderAll(FramePacer* fp) {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
         // Reapply MaxTML settings (may be lost after sleep/wake)
         ApplyMaxTmlSettings();
-        // Reapply MHC profiles (may be silently dropped after sleep/wake)
-        ReapplyAllMhcProfiles();
+        // Reapply MHC profiles only when specifically requested (sleep/wake, TDR)
+        // — not for every reinit source (ImmersiveColorSet, device tree, DWM composition)
+        if (g_forceMhcReapply.exchange(false)) {
+            ReapplyAllMhcProfiles();
+        }
         // Force TOPMOST reassert after wake (z-order most likely disrupted)
         g_forceTopmostReassert.store(true);
         // Re-acquire MMCSS after reinit
@@ -1818,6 +1823,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
             std::cout << "System power resume detected, forcing reinit..." << std::endl;
             g_forceReinit.store(true);
+            g_forceMhcReapply.store(true);
             // Wake the render thread in case it is auto-sleeping — g_forceReinit is
             // checked AFTER the auto-sleep wait, so without this signal the thread
             // would miss the reinit until the 500ms timeout expires AND fall through.
@@ -1841,6 +1847,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     std::cout << "Display waking from sleep, forcing reinit..." << std::endl;
                     g_displayOff.store(false);
                     g_forceReinit.store(true);
+                    g_forceMhcReapply.store(true);
                     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 } else if (displayState == 0) {
                     std::cout << "Display entering sleep mode" << std::endl;

@@ -2031,6 +2031,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_displayOff.store(false);
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
+                g_forceMhcReapply.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             }
             break;
@@ -2045,12 +2046,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_SETTINGCHANGE:
-        // Detect color/display settings changes that can silently break ICC profiles
+        // Detect color settings changes that can affect capture format (Night Light, ACM, HDR)
+        // SPI_SETWORKAREA (taskbar resize) removed — unrelated to color pipeline
         if (lParam && wcscmp(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") == 0) {
             std::cout << "[GUI] ImmersiveColorSet changed, debouncing reinit..." << std::endl;
-            SetTimer(hwnd, SETTINGS_CHANGE_TIMER_ID, 500, nullptr);
-        } else if (wParam == SPI_SETWORKAREA) {
-            std::cout << "[GUI] Work area changed, debouncing reinit..." << std::endl;
             SetTimer(hwnd, SETTINGS_CHANGE_TIMER_ID, 500, nullptr);
         }
         break;  // Let DefWindowProc also process
@@ -2067,6 +2066,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
+                g_forceMhcReapply.store(true);
             }
         }
         // Handle display power state changes — GUI-side handler fires immediately on the
@@ -2088,6 +2088,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_displayOff.store(false);
                     if (g_gui.isRunning) {
                         g_forceReinit.store(true);
+                        g_forceMhcReapply.store(true);
                         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                     } else if (!g_gui.activeSettings.empty()) {
                         // Processing thread exited during display-off (e.g., watchdog timeout).
