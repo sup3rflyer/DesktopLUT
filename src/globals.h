@@ -84,6 +84,7 @@ extern std::atomic<bool> g_framePacerSpinWait; // Enable spin-wait phase (defaul
 extern std::atomic<bool> g_frameBufferEnabled; // Enable auto frame buffer (engages on idle)
 extern std::atomic<bool> g_framePacerLogEnabled; // Log frame pacer stats to CSV
 extern std::atomic<int> g_frameBufferIdleMs;   // Idle timeout before buffer engages (ms, 0 = always active)
+extern std::atomic<bool> g_dwmHookMode;        // Use DWM hook injection instead of overlay for LUT
 
 // ============================================================================
 // Hotkey Settings

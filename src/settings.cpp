@@ -549,6 +549,7 @@ void SaveSettings() {
         swprintf_s(buf, L"%d", g_frameBufferIdleMs.load());
         WritePrivateProfileStringW(L"General", L"FrameBufferIdleMs", buf, iniPath.c_str());
     }
+    WritePrivateProfileBool(L"General", L"DwmHookMode", g_dwmHookMode.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"GammaWhitelist", g_gammaWhitelistRaw.c_str(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
     WritePrivateProfileStringW(L"General", L"VRRWhitelist", g_vrrWhitelistRaw.c_str(), iniPath.c_str());
@@ -606,6 +607,7 @@ void LoadSettings() {
     g_frameBufferEnabled.store(GetPrivateProfileBool(L"General", L"FrameBuffer", true, iniPath.c_str()));
     g_framePacerLogEnabled.store(GetPrivateProfileBool(L"General", L"FramePacerLog", false, iniPath.c_str()));
     g_frameBufferIdleMs.store((int)GetPrivateProfileIntW(L"General", L"FrameBufferIdleMs", 3000, iniPath.c_str()));
+    g_dwmHookMode.store(GetPrivateProfileBool(L"General", L"DwmHookMode", false, iniPath.c_str()));
 
     // Load gamma whitelist (expanding buffer to avoid truncation)
     g_gammaWhitelistRaw = ReadLongINIString(L"General", L"GammaWhitelist", iniPath.c_str());

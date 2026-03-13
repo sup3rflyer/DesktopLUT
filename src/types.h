@@ -124,6 +124,7 @@ struct MovableAtomic {
 #define ID_SETTINGS_LOG_PEAK              407
 #define ID_SETTINGS_VRR_WHITELIST_CHECK   408
 #define ID_SETTINGS_VRR_WHITELIST_BTN     409
+#define ID_SETTINGS_DWM_HOOK             411
 
 // MHC Settings dialog control IDs
 #define ID_MHC_PRIMARIES_ENABLE  7001
@@ -787,6 +788,7 @@ struct GUIState {
     HWND hwndSettingsConsoleLog = nullptr;
     HWND hwndSettingsVrrWhitelistCheck = nullptr;
     HWND hwndSettingsVrrWhitelistBtn = nullptr;
+    HWND hwndSettingsDwmHook = nullptr;
 
     int panelHeight = 0;  // Visible height of scroll panels
 

@@ -359,6 +359,7 @@ static LRESULT CALLBACK ScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             case 0: controls = &g_gui.tab0Controls; originalY = &g_gui.tab0OriginalY; break;
             case 1: controls = &g_gui.tab1Controls; originalY = &g_gui.tab1OriginalY; break;
             case 2: controls = &g_gui.tab2Controls; originalY = &g_gui.tab2OriginalY; break;
+            case 3: controls = &g_gui.tab3Controls; originalY = &g_gui.tab3OriginalY; break;
             }
 
             if (controls && originalY && controls->size() == originalY->size()) {
@@ -1047,6 +1048,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_gui.tab3Controls.push_back(g_gui.hwndSettingsConsoleLog);
         SendMessage(g_gui.hwndSettingsConsoleLog, BM_SETCHECK, g_consoleEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
+        // Experimental group
+        innerY += 51;
+        ctrl = CreateWindow(L"BUTTON", L"Experimental", WS_CHILD | BS_GROUPBOX,
+            innerX, innerY, groupW, 46, panel3, nullptr, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(ctrl);
+
+        g_gui.hwndSettingsDwmHook = CreateWindow(L"BUTTON", L"DWM Hook Mode (requires admin)",
+            WS_CHILD | BS_AUTOCHECKBOX,
+            innerX + 10, innerY + 20, 210, h, panel3, (HMENU)ID_SETTINGS_DWM_HOOK, nullptr, nullptr);
+        g_gui.tab3Controls.push_back(g_gui.hwndSettingsDwmHook);
+        SendMessage(g_gui.hwndSettingsDwmHook, BM_SETCHECK, g_dwmHookMode.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+
         g_gui.contentHeight[3] = innerY + 46 + 8;  // Track content height
 
         // Show all controls inside scroll panels (panels control visibility, not individual controls)
@@ -1170,6 +1183,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_consoleEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_SETCHECK,
             g_vrrWhitelistEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessage(g_gui.hwndSettingsDwmHook, BM_SETCHECK,
+            g_dwmHookMode.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
         if (!monitors.empty()) {
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, 0, 0);
@@ -1842,6 +1857,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         FreeConsole();
                     }
                 }
+                SaveSettings();
+            }
+            return 0;
+
+        case ID_SETTINGS_DWM_HOOK:
+            {
+                bool enable = (SendMessage(g_gui.hwndSettingsDwmHook, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                g_dwmHookMode.store(enable);
                 SaveSettings();
             }
             return 0;

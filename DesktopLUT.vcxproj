@@ -53,6 +53,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;dcomp.lib;windowsapp.lib;winmm.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -69,6 +70,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;dcomp.lib;windowsapp.lib;winmm.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -92,6 +94,7 @@
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\whitelist.cpp" />
     <ClCompile Include="src\framepacer.cpp" />
+    <ClCompile Include="src\dwm_inject.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\types.h" />
@@ -114,6 +117,7 @@
     <ClInclude Include="src\mhc.h" />
     <ClInclude Include="src\whitelist.h" />
     <ClInclude Include="src\framepacer.h" />
+    <ClInclude Include="src\dwm_inject.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resource.rc" />

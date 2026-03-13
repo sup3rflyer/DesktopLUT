@@ -15,6 +15,7 @@
 #include "gpu.h"
 #include "displayconfig.h"
 #include "mhc.h"
+#include "dwm_inject.h"
 #include <objbase.h>
 #include <iostream>
 #include <map>
@@ -536,6 +537,83 @@ void StartProcessing() {
     // Save current settings as active (for comparison to detect changes)
     g_gui.activeSettings = g_gui.monitorSettings;
 
+    if (g_dwmHookMode.load()) {
+        // DWM Hook Mode: inject DLL into dwm.exe for LUT application
+        std::cout << "[DWM Hook] Starting in DWM Hook mode" << std::endl;
+
+        // Build monitor LUT list for injection
+        std::vector<DwmHookMonitorLUT> dwmMonitors;
+        for (const auto& cfg : configs) {
+            if (cfg.sdrLutPath.empty() && cfg.hdrLutPath.empty()) continue;
+            if (cfg.monitorIndex < 0 || cfg.monitorIndex >= (int)g_gui.monitors.size()) continue;
+
+            MONITORINFO mi = { sizeof(mi) };
+            if (GetMonitorInfo(g_gui.monitors[cfg.monitorIndex], &mi)) {
+                DwmHookMonitorLUT lut;
+                lut.left = mi.rcMonitor.left;
+                lut.top = mi.rcMonitor.top;
+                lut.sdrLutPath = cfg.sdrLutPath;
+                lut.hdrLutPath = cfg.hdrLutPath;
+                dwmMonitors.push_back(lut);
+            }
+        }
+
+        std::cout << "[DWM Hook] " << dwmMonitors.size() << " monitor(s) with LUT paths" << std::endl;
+
+        if (!dwmMonitors.empty()) {
+            std::wstring err = InjectDwmHook(dwmMonitors);
+            if (!err.empty()) {
+                std::cout << "[DWM Hook] Injection failed" << std::endl;
+                SetStatus(err.c_str());
+                return;
+            }
+        }
+
+        // Check if overlay is also needed (corrections or analysis configured)
+        bool needOverlay = false;
+        for (const auto& cfg : configs) {
+            const auto& ms = g_gui.monitorSettings[cfg.monitorIndex];
+            bool hasSdrCorrection = ms.sdrColorCorrection.primariesEnabled ||
+                                    ms.sdrColorCorrection.grayscale.enabled ||
+                                    ms.sdrColorCorrection.grayscale.use24Gamma;
+            bool hasHdrCorrection = ms.hdrColorCorrection.primariesEnabled ||
+                                    ms.hdrColorCorrection.grayscale.enabled ||
+                                    ms.hdrColorCorrection.tonemap.enabled;
+            bool hasDesktopGamma = g_userDesktopGammaMode.load();
+            if (hasSdrCorrection || hasHdrCorrection || hasDesktopGamma) {
+                needOverlay = true;
+                break;
+            }
+        }
+
+        if (needOverlay) {
+            // Start overlay in passthrough for LUT (DWM hook handles LUT)
+            // Clear LUT paths so shader only applies corrections
+            std::cout << "[DWM Hook] Shader overlay ACTIVE (corrections-only passthrough, DWM hook handles LUT)" << std::endl;
+            for (auto& cfg : configs) {
+                cfg.sdrLutPath.clear();
+                cfg.hdrLutPath.clear();
+            }
+            g_running = true;
+            g_gui.isRunning = true;
+            g_gui.restartRetryCount = 0;
+            if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
+        } else {
+            // LUT-only mode: no overlay needed
+            std::cout << "[DWM Hook] Shader overlay DISABLED (LUT-only mode, no overlay needed)" << std::endl;
+            g_running = true;
+            g_gui.isRunning = true;
+            g_gui.restartRetryCount = 0;
+            if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+        }
+
+        EnableWindow(g_gui.hwndApply, FALSE);
+        EnableWindow(g_gui.hwndStop, TRUE);
+        SetStatus(L"Active (DWM Hook)");
+        return;
+    }
+
     g_running = true;
     g_gui.isRunning = true;
     g_gui.restartRetryCount = 0;  // Reset backoff on successful start
@@ -557,6 +635,12 @@ void StopProcessing() {
 
     SetStatus(L"Stopping...");
     g_running = false;
+
+    // Uninject DWM hook if in DWM hook mode (always try — harmless if not injected)
+    if (g_dwmHookMode.load()) {
+        std::cout << "[DWM Hook] Stopping — uninjecting from dwm.exe" << std::endl;
+        UninjectDwmHook();
+    }
 
     // Signal wake event to unblock any CompClock/WaitForSingleObject in the render loop
     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);

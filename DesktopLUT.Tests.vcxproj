@@ -94,6 +94,7 @@
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\whitelist.cpp" />
     <ClCompile Include="src\framepacer.cpp" />
+    <ClCompile Include="src\dwm_inject.cpp" />
   </ItemGroup>
   <!-- Test files -->
   <ItemGroup>
