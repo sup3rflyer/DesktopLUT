@@ -77,6 +77,7 @@ std::atomic<bool> g_frameBufferEnabled{ true };  // Enable auto frame buffer (de
 std::atomic<bool> g_framePacerLogEnabled{ false }; // Log frame pacer stats to CSV (default: off)
 std::atomic<int> g_frameBufferIdleMs{ 3000 };  // Idle timeout before buffer engages (default: 3s)
 std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (default: off, experimental)
+int g_dwmHookWatchdogRetries = 0;              // Consecutive re-injection failures (GUI thread only)
 
 // ============================================================================
 // Hotkey Settings

@@ -8,6 +8,7 @@
 #include <dxgi.h>
 #include <dxgi1_6.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <cstdio>
 #include <intrin.h>
 #include <vector>

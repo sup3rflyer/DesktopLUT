@@ -276,6 +276,87 @@ bool isWindows11_25h2 = false;
 
 static int* g_pOverlayTestMode = NULL;
 
+// --- Heartbeat event: signals to host that the DWM hook is active ---
+static HANDLE g_heartbeatEvent = NULL;
+
+// --- Host process monitoring: detect orphaned injection ---
+// dwm.exe is a Protected Process on Win11 — cannot call OpenProcess() on non-PP processes.
+// Instead, poll the process list every 5s using CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS).
+static DWORD g_hostPid = 0;
+static HANDLE g_hostMonitorThread = NULL;
+static HANDLE g_hostMonitorStopEvent = NULL;
+static volatile bool g_hookReverted = false;  // Set when host dies, prevents double-revert in DLL_PROCESS_DETACH
+
+static bool IsProcessAlive(DWORD pid)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) return true;  // Can't check, assume alive
+
+	PROCESSENTRY32W pe{};
+	pe.dwSize = sizeof(pe);
+	bool found = false;
+
+	if (Process32FirstW(snap, &pe)) {
+		do {
+			if (pe.th32ProcessID == pid) {
+				found = true;
+				break;
+			}
+		} while (Process32NextW(snap, &pe));
+	}
+
+	CloseHandle(snap);
+	return found;
+}
+
+static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
+{
+	while (true) {
+		// Wait 5 seconds or until stop event is signaled
+		DWORD result = WaitForSingleObject(g_hostMonitorStopEvent, 5000);
+		if (result == WAIT_OBJECT_0) break;  // Stop event signaled — normal shutdown
+
+		// Check if host process is still alive
+		if (!IsProcessAlive(g_hostPid)) {
+			// Host process terminated — revert DWM to normal
+			log_to_file("Host process exited unexpectedly, reverting DWM hook...");
+
+			if (g_pOverlayTestMode != NULL) {
+				__try { *g_pOverlayTestMode = 0; }
+				__except (EXCEPTION_EXECUTE_HANDLER) {}
+			}
+
+			MH_DisableHook(MH_ALL_HOOKS);
+			g_hookReverted = true;
+
+			// Close heartbeat event so host watchdog (if restarted) sees it as gone
+			if (g_heartbeatEvent) {
+				CloseHandle(g_heartbeatEvent);
+				g_heartbeatEvent = NULL;
+			}
+
+			log_to_file("DWM hook reverted (host exit) — DLL remains loaded but inert");
+			break;
+		}
+	}
+	return 0;
+}
+
+// Read host PID from staging file written by the injector
+static DWORD ReadHostPid()
+{
+	char pidPath[MAX_PATH] = {0};
+	ExpandEnvironmentStringsA("%SYSTEMROOT%\\Temp\\DesktopLUT_luts\\host.pid", pidPath, sizeof(pidPath));
+
+	FILE* pf = fopen(pidPath, "r");
+	if (!pf) return 0;
+
+	DWORD pid = 0;
+	if (fscanf(pf, "%lu", &pid) != 1) pid = 0;
+	fclose(pf);
+	return pid;
+}
+
 bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 {
 	for (int i = 0; i < buf_len; ++i)
@@ -2018,21 +2099,78 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				MH_EnableHook(MH_ALL_HOOKS);
 				LOG_ONLY_ONCE("DWM HOOK DLL INITIALIZATION. START LOGGING")
 
+				// Create heartbeat event so host can detect hook is active
+				{
+					SECURITY_DESCRIPTOR sd;
+					InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+					SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);  // NULL DACL = everyone can access
+					SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+					g_heartbeatEvent = CreateEventW(&sa, TRUE, TRUE, L"Global\\DesktopLUT_DwmHook_Active");
+					if (g_heartbeatEvent)
+						log_to_file("Heartbeat event created: Global\\DesktopLUT_DwmHook_Active");
+					else
+						log_to_file("WARNING: Failed to create heartbeat event");
+				}
+
+				// Start host process monitor (detects orphaned injection)
+				// dwm.exe is a Protected Process — can't OpenProcess on the host.
+				// Uses process list polling (CreateToolhelp32Snapshot) every 5s instead.
+				{
+					g_hostPid = ReadHostPid();
+					if (g_hostPid != 0) {
+						g_hostMonitorStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+						if (g_hostMonitorStopEvent) {
+							g_hostMonitorThread = CreateThread(NULL, 0, HostMonitorThreadFunc, NULL, 0, NULL);
+							if (g_hostMonitorThread) {
+								char buf[128];
+								sprintf_s(buf, "Host monitor started for PID %lu (polling)", g_hostPid);
+								log_to_file(buf);
+							} else {
+								log_to_file("WARNING: Failed to create host monitor thread");
+							}
+						}
+					} else {
+						log_to_file("WARNING: No host.pid found — orphan detection disabled");
+					}
+				}
+
 				break;
 			}
 			log_to_file("Hook condition not met — returning FALSE");
 			return FALSE;
 		}
 	case DLL_PROCESS_DETACH:
+		log_to_file("DLL_PROCESS_DETACH: cleanup starting");
 
-		if (g_pOverlayTestMode != NULL)
-		{
-			__try { *g_pOverlayTestMode = 0; }
-			__except (EXCEPTION_EXECUTE_HANDLER) { /* already detaching, nothing to do */ }
+		// Stop host monitor thread first (before removing hooks)
+		if (g_hostMonitorStopEvent) {
+			SetEvent(g_hostMonitorStopEvent);
 		}
-		MH_Uninitialize();
-		Sleep(100);
+		if (g_hostMonitorThread) {
+			// Short timeout to avoid deadlock under loader lock
+			if (WaitForSingleObject(g_hostMonitorThread, 5000) == WAIT_TIMEOUT) {
+				log_to_file("WARNING: Host monitor thread did not exit in 5s");
+			}
+			CloseHandle(g_hostMonitorThread);
+			g_hostMonitorThread = NULL;
+		}
+		if (g_hostMonitorStopEvent) { CloseHandle(g_hostMonitorStopEvent); g_hostMonitorStopEvent = NULL; }
+
+		// Close heartbeat event (host will see hook as gone)
+		if (g_heartbeatEvent) { CloseHandle(g_heartbeatEvent); g_heartbeatEvent = NULL; }
+
+		// Only revert hooks/overlay mode if not already done by host monitor
+		if (!g_hookReverted) {
+			if (g_pOverlayTestMode != NULL)
+			{
+				__try { *g_pOverlayTestMode = 0; }
+				__except (EXCEPTION_EXECUTE_HANDLER) { /* already detaching, nothing to do */ }
+			}
+			MH_Uninitialize();
+			Sleep(100);
+		}
 		UninitializeStuff();
+		log_to_file("DLL_PROCESS_DETACH: cleanup complete");
 		break;
 	default:
 		break;

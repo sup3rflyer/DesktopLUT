@@ -12,6 +12,7 @@
 #include "osd.h"
 #include "displayconfig.h"
 #include "mhc.h"
+#include "dwm_inject.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -1979,6 +1980,60 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            }
+            return 0;
+        }
+        if (wParam == DWM_HOOK_WATCHDOG_TIMER_ID) {
+            // Periodic health check for DWM hook injection
+            if (!g_gui.isRunning || !g_dwmHookMode.load()) {
+                KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                return 0;
+            }
+            if (!IsDwmHookActive()) {
+                std::cout << "[DWM Hook Watchdog] Hook lost (DWM restart?), attempting re-injection..." << std::endl;
+
+                // Re-derive monitor LUT config from current settings + monitors
+                std::vector<DwmHookMonitorLUT> dwmMonitors;
+                for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+                    const auto& ms = g_gui.monitorSettings[i];
+                    if (ms.sdrPath.empty() && ms.hdrPath.empty()) continue;
+                    if (i >= g_gui.monitors.size()) continue;
+
+                    MONITORINFO mi = { sizeof(mi) };
+                    if (GetMonitorInfo(g_gui.monitors[i], &mi)) {
+                        DwmHookMonitorLUT lut;
+                        lut.left = mi.rcMonitor.left;
+                        lut.top = mi.rcMonitor.top;
+                        lut.sdrLutPath = ms.sdrPath;
+                        lut.hdrLutPath = ms.hdrPath;
+                        dwmMonitors.push_back(lut);
+                    }
+                }
+
+                if (!dwmMonitors.empty()) {
+                    std::wstring err = InjectDwmHook(dwmMonitors);
+                    if (err.empty()) {
+                        std::cout << "[DWM Hook Watchdog] Re-injection successful" << std::endl;
+                        g_dwmHookWatchdogRetries = 0;
+                        SetStatus(L"Active (DWM Hook)");
+                    } else {
+                        g_dwmHookWatchdogRetries++;
+                        std::wcout << L"[DWM Hook Watchdog] Re-injection failed (attempt "
+                                   << g_dwmHookWatchdogRetries << L"/" << DWM_HOOK_WATCHDOG_MAX_RETRIES
+                                   << L"): " << err << std::endl;
+                        if (g_dwmHookWatchdogRetries >= DWM_HOOK_WATCHDOG_MAX_RETRIES) {
+                            KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                            SetStatus(L"DWM Hook lost — re-injection failed");
+                            std::cout << "[DWM Hook Watchdog] Max retries reached, giving up" << std::endl;
+                        }
+                    }
+                } else {
+                    // No LUT paths configured — nothing to inject
+                    KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                }
+            } else {
+                // Hook is healthy — reset retry counter
+                g_dwmHookWatchdogRetries = 0;
             }
             return 0;
         }

@@ -218,6 +218,18 @@ bool IsDwmHookInjected()
     return false;
 }
 
+bool IsDwmHookActive()
+{
+    // Lightweight check: the injected DLL creates this named event on attach.
+    // No SYSTEM elevation needed — just open and close.
+    HANDLE h = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\DesktopLUT_DwmHook_Active");
+    if (h) {
+        CloseHandle(h);
+        return true;
+    }
+    return false;
+}
+
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 {
     SystemImpersonationGuard impGuard;
@@ -378,6 +390,20 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             ClearDACL(monitorsPath);
         } else {
             std::wcerr << L"[DWM Hook] WARNING: Failed to create monitors.dat" << std::endl;
+        }
+    }
+
+    // --- Write host PID for DLL-side orphan detection ---
+    {
+        std::wstring pidPath = lutsDir + L"host.pid";
+        FILE* pf = nullptr;
+        if (_wfopen_s(&pf, pidPath.c_str(), L"w") == 0 && pf) {
+            fprintf(pf, "%lu\n", GetCurrentProcessId());
+            fclose(pf);
+            ClearDACL(pidPath);
+            std::wcout << L"[DWM Hook] Host PID " << GetCurrentProcessId() << L" written to host.pid" << std::endl;
+        } else {
+            std::wcerr << L"[DWM Hook] WARNING: Failed to create host.pid" << std::endl;
         }
     }
 

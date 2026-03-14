@@ -611,6 +611,12 @@ void StartProcessing() {
         EnableWindow(g_gui.hwndApply, FALSE);
         EnableWindow(g_gui.hwndStop, TRUE);
         SetStatus(L"Active (DWM Hook)");
+
+        // Start DWM hook watchdog timer (detects DWM restart / hook loss)
+        g_dwmHookWatchdogRetries = 0;
+        if (g_gui.hwndMain)
+            SetTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID, DWM_HOOK_WATCHDOG_INTERVAL_MS, nullptr);
+
         return;
     }
 
@@ -635,6 +641,10 @@ void StopProcessing() {
 
     SetStatus(L"Stopping...");
     g_running = false;
+
+    // Kill DWM hook watchdog timer
+    if (g_gui.hwndMain)
+        KillTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID);
 
     // Uninject DWM hook if in DWM hook mode (always try — harmless if not injected)
     if (g_dwmHookMode.load()) {
