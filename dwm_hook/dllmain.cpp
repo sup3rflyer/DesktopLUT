@@ -1643,6 +1643,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 	{
 	case DLL_PROCESS_ATTACH:
 		{
+			log_to_file("DLL_PROCESS_ATTACH: DllMain entered");
 			HMODULE dwmcore = GetModuleHandle(L"dwmcore.dll");
 			MODULEINFO moduleInfo;
 			GetModuleInformation(GetCurrentProcess(), dwmcore, &moduleInfo, sizeof moduleInfo);
@@ -1926,7 +1927,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			ExpandEnvironmentStringsA(LUT_FOLDER, lutFolderPath, sizeof(lutFolderPath));
 			if (!AddLUTs(lutFolderPath))
 			{
+				log_to_file("AddLUTs FAILED — returning FALSE");
 				return FALSE;
+			}
+			{
+				char msg[256];
+				snprintf(msg, sizeof(msg), "AddLUTs OK: numLuts=%d hooks=%s",
+					numLuts, (COverlayContext_Present_orig_24h2 ? "24h2" :
+					          (COverlayContext_Present_orig ? "pre-24h2" : "none")));
+				log_to_file(msg);
 			}
 			if (numLuts > 0 && ((COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
 				COverlayContext_OverlaysEnabled_orig) ||
@@ -2011,6 +2020,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				break;
 			}
+			log_to_file("Hook condition not met — returning FALSE");
 			return FALSE;
 		}
 	case DLL_PROCESS_DETACH:

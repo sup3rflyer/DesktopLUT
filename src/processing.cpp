@@ -539,7 +539,7 @@ void StartProcessing() {
 
     if (g_dwmHookMode.load()) {
         // DWM Hook Mode: inject DLL into dwm.exe for LUT application
-        std::cout << "[DWM Hook] Starting in DWM Hook mode" << std::endl;
+        std::wcout << L"[DWM Hook] Starting in DWM Hook mode" << std::endl;
 
         // Build monitor LUT list for injection
         std::vector<DwmHookMonitorLUT> dwmMonitors;
@@ -558,12 +558,12 @@ void StartProcessing() {
             }
         }
 
-        std::cout << "[DWM Hook] " << dwmMonitors.size() << " monitor(s) with LUT paths" << std::endl;
+        std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with LUT paths" << std::endl;
 
         if (!dwmMonitors.empty()) {
             std::wstring err = InjectDwmHook(dwmMonitors);
             if (!err.empty()) {
-                std::cout << "[DWM Hook] Injection failed" << std::endl;
+                std::wcout << L"[DWM Hook] Injection failed" << std::endl;
                 SetStatus(err.c_str());
                 return;
             }

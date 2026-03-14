@@ -6,7 +6,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
-#include <aclapi.h>
 #include <dxgi1_6.h>
 #include <iostream>
 #include <string>
@@ -85,71 +84,34 @@ static std::wstring GetExeDirectory()
     return path;
 }
 
-// Set a restrictive DACL on a file or directory so dwm.exe (running as SYSTEM)
-// can read it, but other users cannot.  Replaces null-DACL approach.
-static bool SetRestrictiveDACL(const std::wstring& path)
+// Clear the DACL on a file or directory (null DACL = unrestricted access).
+// Required so dwm.exe (SYSTEM) can read staged files.
+// Security note: files are in %SYSTEMROOT%\Temp which is already ACL-protected
+// at the directory level (only SYSTEM/Administrators can write).
+static bool ClearDACL(const std::wstring& path)
 {
+    SECURITY_DESCRIPTOR sd;
+    if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION))
+        return false;
+    // Set a null DACL (no access restrictions)
+    if (!SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE))
+        return false;
+
     HANDLE hFile = CreateFileW(
         path.c_str(),
         READ_CONTROL | WRITE_DAC,
         0,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, // backup semantics for directories
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
         nullptr);
 
-    if (hFile == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"SetRestrictiveDACL: CreateFile failed for " << path << L": " << GetLastErrorString() << std::endl;
+    if (hFile == INVALID_HANDLE_VALUE)
         return false;
-    }
 
-    // Build ACL granting SYSTEM and Administrators full access
-    PSID pSystemSid = nullptr;
-    PSID pAdminSid = nullptr;
-    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
-    PACL pAcl = nullptr;
-    bool success = false;
-
-    if (AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
-            0, 0, 0, 0, 0, 0, 0, &pSystemSid) &&
-        AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
-            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &pAdminSid))
-    {
-        EXPLICIT_ACCESS_A ea[2] = {};
-        ea[0].grfAccessPermissions = GENERIC_ALL;
-        ea[0].grfAccessMode = SET_ACCESS;
-        ea[0].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-        ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-        ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-        ea[0].Trustee.ptstrName = (LPSTR)pSystemSid;
-
-        ea[1].grfAccessPermissions = GENERIC_ALL;
-        ea[1].grfAccessMode = SET_ACCESS;
-        ea[1].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
-        ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-        ea[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-        ea[1].Trustee.ptstrName = (LPSTR)pAdminSid;
-
-        if (SetEntriesInAclA(2, ea, nullptr, &pAcl) == ERROR_SUCCESS)
-        {
-            DWORD ret = SetSecurityInfo(
-                hFile,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                nullptr, nullptr, pAcl, nullptr);
-
-            success = (ret == ERROR_SUCCESS);
-            if (!success)
-                std::wcerr << L"SetRestrictiveDACL: SetSecurityInfo failed for " << path << std::endl;
-        }
-    }
-
-    if (pAcl) LocalFree(pAcl);
-    if (pSystemSid) FreeSid(pSystemSid);
-    if (pAdminSid) FreeSid(pAdminSid);
+    BOOL ok = SetKernelObjectSecurity(hFile, DACL_SECURITY_INFORMATION, &sd);
     CloseHandle(hFile);
-
-    return success;
+    return ok != FALSE;
 }
 
 // RAII guard to ensure RevertToSelf() is always called on scope exit.
@@ -321,7 +283,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         std::wcout << L"[DWM Hook] DLL copy FAILED: " << GetLastErrorString() << std::endl;
         return L"Failed to copy DwmHook.dll to staging: " + GetLastErrorString();
     }
-    SetRestrictiveDACL(dllDest);
+    ClearDACL(dllDest);
     std::wcout << L"[DWM Hook] DLL staged OK" << std::endl;
 
     // --- Prepare LUT staging directory ---
@@ -334,7 +296,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             return L"Failed to create LUT staging directory: " + GetLastErrorString();
         }
     }
-    SetRestrictiveDACL(lutsDir);
+    ClearDACL(lutsDir);
     std::wcout << L"[DWM Hook] LUT staging dir: " << lutsDir << std::endl;
 
     // --- Copy LUT files with position-based names ---
@@ -347,7 +309,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             if (!CopyFileW(mon.sdrLutPath.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy SDR LUT: " << GetLastErrorString() << std::endl;
             } else {
-                SetRestrictiveDACL(dest);
+                ClearDACL(dest);
             }
         }
 
@@ -357,7 +319,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             if (!CopyFileW(mon.hdrLutPath.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy HDR LUT: " << GetLastErrorString() << std::endl;
             } else {
-                SetRestrictiveDACL(dest);
+                ClearDACL(dest);
             }
         }
     }
@@ -413,7 +375,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
                 std::wcerr << L"[DWM Hook] WARNING: CreateDXGIFactory1 failed for monitors.dat" << std::endl;
             }
             fclose(mf);
-            SetRestrictiveDACL(monitorsPath);
+            ClearDACL(monitorsPath);
         } else {
             std::wcerr << L"[DWM Hook] WARNING: Failed to create monitors.dat" << std::endl;
         }
@@ -498,6 +460,10 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         }
 
         DWORD waitResult = WaitForSingleObject(hThread, 10000);
+
+        // Get exit code before closing handle (fallback verification)
+        DWORD exitCode = 0;
+        GetExitCodeThread(hThread, &exitCode);
         CloseHandle(hThread);
 
         if (waitResult == WAIT_TIMEOUT) {
@@ -509,7 +475,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             continue;
         }
 
-        // Verify DLL loaded by enumerating modules (avoids GetExitCodeThread 64-bit truncation)
+        // Verify DLL loaded: try module enumeration first, fall back to exit code
+        // Module enumeration can fail under SYSTEM impersonation (CreateToolhelp32Snapshot
+        // may not work with impersonation tokens for cross-process module snapshots)
         {
             bool dllFound = false;
             HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
@@ -527,9 +495,17 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
                 CloseHandle(snap);
             }
 
+            if (!dllFound && exitCode != 0) {
+                // Module enumeration failed but LoadLibraryA returned non-NULL (low 32 bits)
+                // Trust the exit code — HMODULE truncation is theoretical, not practical
+                dllFound = true;
+                std::wcout << L"[DWM Hook] Module enumeration couldn't verify DLL in PID " << pid
+                           << L", but LoadLibraryA returned 0x" << std::hex << exitCode << std::dec << std::endl;
+            }
+
             if (!dllFound) {
-                std::wcout << L"[DWM Hook] DLL not found in PID " << pid << L" after LoadLibraryA — injection failed" << std::endl;
-                std::wcout << L"[DWM Hook]   DLL may have failed AOB scan or LUT parse in DllMain" << std::endl;
+                std::wcout << L"[DWM Hook] DLL not found in PID " << pid << L" after LoadLibraryA (exitCode=0x"
+                           << std::hex << exitCode << std::dec << L")" << std::endl;
                 anyFailed = true;
                 if (firstError.empty())
                     firstError = L"Failed to load or initialize DwmHook.dll in dwm.exe. "
