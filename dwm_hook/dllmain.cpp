@@ -26,8 +26,7 @@
 #define RELEASE_IF_NOT_NULL(x) { if (x != NULL) { x->Release(); } }
 #define _STRINGIFY(x) #x
 #define STRINGIFY(x) _STRINGIFY(x)
-#define RESIZE(x, y) realloc(x, (y) * sizeof(*x));
-#define MAX_LOG_FILE_SIZE 20 * 1024 * 1024
+#define MAX_LOG_FILE_SIZE (20 * 1024 * 1024)
 
 // Always-on logging
 static char g_logFilePath[MAX_PATH] = {0};
@@ -53,11 +52,11 @@ static const char* GetLogFilePath()
 			std::stringstream ss; \
 			ss << "ERROR AT LINE: " << __LINE__ << " HR: " << hr << " - DETAILS: "; \
 			LPSTR error_message = nullptr; \
-			FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, \
+			DWORD fmtResult = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, \
 				NULL, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&error_message, 0, NULL); \
-			ss << error_message; \
+			ss << ((fmtResult > 0 && error_message) ? error_message : "(FormatMessage failed)"); \
+			if (error_message) LocalFree(error_message); \
 			log_to_file(ss.str().c_str()); \
-			LocalFree(error_message); \
 			throw std::exception(ss.str().c_str()); \
 		} \
 	} while (false);
@@ -70,12 +69,13 @@ static const char* GetLogFilePath()
 			std::stringstream ss; \
 			ss << "ERROR AT LINE: " << __LINE__ << " HR: " << hr << " - DETAILS: "; \
 			LPSTR error_message = nullptr; \
-			FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, \
+			DWORD fmtResult = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, \
 				NULL, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&error_message, 0, NULL); \
-			ss << error_message << " - DX COMPILE ERROR: " << (char*)error_interface->GetBufferPointer(); \
+			ss << ((fmtResult > 0 && error_message) ? error_message : "(FormatMessage failed)"); \
+			ss << " - DX COMPILE ERROR: " << (char*)error_interface->GetBufferPointer(); \
 			error_interface->Release(); \
+			if (error_message) LocalFree(error_message); \
 			log_to_file(ss.str().c_str()); \
-			LocalFree(error_message); \
 			throw std::exception(ss.str().c_str()); \
 		} \
 	} while (false);
@@ -108,22 +108,6 @@ void log_to_file(const char* log_buf)
 	fseek(pFile, 0, SEEK_END);
 	fprintf(pFile, "%s\n", log_buf);
 	fclose(pFile);
-}
-
-
-int g_DynamicSwapChainOffset = -1;
-
-void print_error(const char* prefix_message)
-{
-	DWORD errorCode = GetLastError();
-	LPSTR errorMessage = nullptr;
-	FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-	               nullptr, errorCode, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&errorMessage, 0, nullptr);
-
-	char message_buf[100];
-	sprintf(message_buf, "%s: %s - error code: %u", prefix_message, errorMessage, errorCode);
-	log_to_file(message_buf);
-	return;
 }
 
 
@@ -322,8 +306,12 @@ SamplerState smp : register(s0);
 Texture2D noiseTex : register(t2);
 SamplerState noiseSmp : register(s1);
 
-int lutSize : register(b0);
-int colorMode : register(b0);  // 0=SDR 8-bit, 1=HDR, 2=ACM SDR (FP16 linear)
+cbuffer Constants : register(b0) {
+	int lutSize;
+	int colorMode;  // 0=SDR 8-bit, 1=HDR, 2=ACM SDR (FP16 linear)
+	int ditherLevels;
+	int pad0;
+};
 
 static float3x3 scrgb_to_bt2100 = {
 2939026994.L / 585553224375.L, 9255011753.L / 3513319346250.L,   173911579.L / 501902763750.L,
@@ -386,8 +374,8 @@ float3 pq_inv_eotf(float3 y) {
 }
 
 float3 OrderedDither(float3 rgb, float2 pos) {
-	float3 low = floor(rgb * 255) / 255;
-	float3 high = low + 1.0 / 255;
+	float3 low = floor(rgb * ditherLevels) / ditherLevels;
+	float3 high = low + 1.0 / ditherLevels;
 
 	float3 rgb_linear = pow(rgb,)" STRINGIFY(DITHER_GAMMA) R"();
 	float3 low_linear = pow(low,)" STRINGIFY(DITHER_GAMMA) R"();
@@ -491,7 +479,7 @@ static bool IsMonitorHdr(int left, int top) {
 		if (g_monitorHdrStates[i].left == left && g_monitorHdrStates[i].top == top)
 			return g_monitorHdrStates[i].isHdr;
 	}
-	return true;  // default to HDR if unknown (preserves original behavior)
+	return false;  // default to SDR if unknown (safer — avoids PQ pipeline on SDR content)
 }
 
 struct lutData
@@ -562,37 +550,47 @@ bool ParseLUT(lutData* lut, char* filename)
 			fclose(file);
 			return false;
 		}
-		if (sscanf(line, "LUT_3D_SIZE%d", &lutSize) == 1)
+		if (sscanf(line, "LUT_3D_SIZE %d", &lutSize) == 1)
 		{
+			if (lutSize < 2 || lutSize > 128)
+			{
+				fclose(file);
+				return false;
+			}
 			break;
 		}
 	}
 
-	float* rawLut = (float*)malloc(lutSize * lutSize * lutSize * 4 * sizeof(float));
-
-
-	for (int b = 0; b < lutSize; b++)
+	float* rawLut = (float*)malloc((size_t)lutSize * lutSize * lutSize * 4 * sizeof(float));
+	if (!rawLut)
 	{
-		for (int g = 0; g < lutSize; g++)
+		fclose(file);
+		return false;
+	}
+
+
+	for (unsigned int b = 0; b < lutSize; b++)
+	{
+		for (unsigned int g = 0; g < lutSize; g++)
 		{
-			for (int r = 0; r < lutSize; r++)
+			for (unsigned int r = 0; r < lutSize; r++)
 			{
 				while (1)
 				{
 					if (!fgets(line, sizeof(line), file))
 					{
 						fclose(file);
-
+						free(rawLut);
 						return false;
 					}
-					if (line[0] <= '9' && line[0] != '#' && line[0] != '\n')
+					if (((line[0] >= '0' && line[0] <= '9') || line[0] == '-' || line[0] == '+' || line[0] == '.') && line[0] != '#' && line[0] != '\n')
 					{
 						float red, green, blue;
 
 						if (sscanf(line, "%f%f%f", &red, &green, &blue) != 3)
 						{
 							fclose(file);
-
+							free(rawLut);
 							return false;
 						}
 						LUT_ACCESS_INDEX(rawLut, b, g, r, 0, lutSize) = red;
@@ -617,8 +615,7 @@ bool AddLUTs(char* folder)
 	WIN32_FIND_DATAA findData;
 
 	char path[MAX_PATH];
-	strcpy(path, folder);
-	strcat(path, "\\*");
+	snprintf(path, sizeof(path), "%s\\*", folder);
 	HANDLE hFind = FindFirstFileA(path, &findData);
 	if (hFind == INVALID_HANDLE_VALUE) return false;
 	do
@@ -628,11 +625,15 @@ bool AddLUTs(char* folder)
 			char filePath[MAX_PATH];
 			char* fileName = findData.cFileName;
 
-			strcpy(filePath, folder);
-			strcat(filePath, "\\");
-			strcat(filePath, fileName);
+			snprintf(filePath, sizeof(filePath), "%s\\%s", folder, fileName);
 
-			luts = (lutData*)RESIZE(luts, numLuts + 1)
+			lutData* tmp = (lutData*)realloc(luts, (size_t)(numLuts + 1) * sizeof(lutData));
+			if (!tmp)
+			{
+				FindClose(hFind);
+				return false;
+			}
+			luts = tmp;
 			lutData* lut = &luts[numLuts];
 			if (sscanf(findData.cFileName, "%d_%d", &lut->left, &lut->top) == 2)
 			{
@@ -640,7 +641,7 @@ bool AddLUTs(char* folder)
 				lut->textureView = NULL;
 				if (!ParseLUT(lut, filePath))
 				{
-					LOG_ONLY_ONCE("LUT could not be parsed")
+					LOG_ONLY_ONCE("LUT could not be parsed");
 					FindClose(hFind);
 					return false;
 				}
@@ -676,7 +677,9 @@ void SetLUTActive(void* target)
 {
 	if (!IsLUTActive(target))
 	{
-		lutTargets = (void**)RESIZE(lutTargets, numLutTargets + 1)
+		void** tmp = (void**)realloc(lutTargets, (size_t)(numLutTargets + 1) * sizeof(void*));
+		if (!tmp) return;
+		lutTargets = tmp;
 		lutTargets[numLutTargets++] = target;
 	}
 }
@@ -688,7 +691,16 @@ void UnsetLUTActive(void* target)
 		if (lutTargets[i] == target)
 		{
 			lutTargets[i] = lutTargets[--numLutTargets];
-			lutTargets = (void**)RESIZE(lutTargets, numLutTargets)
+			if (numLutTargets > 0)
+			{
+				void** tmp = (void**)realloc(lutTargets, (size_t)numLutTargets * sizeof(void*));
+				if (tmp) lutTargets = tmp;
+			}
+			else
+			{
+				free(lutTargets);
+				lutTargets = NULL;
+			}
 			return;
 		}
 	}
@@ -729,32 +741,41 @@ static bool LookupContextPosition(void* context, int& left, int& top) {
 // Extract monitor desktop position from COverlayContext
 static void GetMonitorPositionFromContext(void* context, int& left, int& top)
 {
-	if (isWindows11_25h2)
+	__try
 	{
-		// 25H2: Use cached position from swapchain GetContainingOutput (set in ApplyLUT)
-		if (LookupContextPosition(context, left, top))
-			return;
-		// Fallback if not yet cached
+		if (isWindows11_25h2)
+		{
+			// 25H2: Use cached position from swapchain GetContainingOutput (set in ApplyLUT)
+			if (LookupContextPosition(context, left, top))
+				return;
+			// Fallback if not yet cached
+			left = 0;
+			top = 0;
+		}
+		else if (isWindows11_24h2)
+		{
+			float* rect = (float*)((unsigned char*)*(void**)context + COverlayContext_DeviceClipBox_offset_w11_24h2);
+			left = (int)rect[2];
+			top = (int)rect[3];
+		}
+		else if (isWindows11)
+		{
+			float* rect = (float*)((unsigned char*)*(void**)context + COverlayContext_DeviceClipBox_offset_w11);
+			left = (int)rect[0];
+			top = (int)rect[1];
+		}
+		else
+		{
+			int* rect = (int*)((unsigned char*)context + COverlayContext_DeviceClipBox_offset);
+			left = rect[0];
+			top = rect[1];
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
 		left = 0;
 		top = 0;
-	}
-	else if (isWindows11_24h2)
-	{
-		float* rect = (float*)((unsigned char*)*(void**)context + COverlayContext_DeviceClipBox_offset_w11_24h2);
-		left = (int)rect[2];
-		top = (int)rect[3];
-	}
-	else if (isWindows11)
-	{
-		float* rect = (float*)((unsigned char*)*(void**)context + COverlayContext_DeviceClipBox_offset_w11);
-		left = (int)rect[0];
-		top = (int)rect[1];
-	}
-	else
-	{
-		int* rect = (int*)((unsigned char*)context + COverlayContext_DeviceClipBox_offset);
-		left = rect[0];
-		top = rect[1];
+		LOG_ONLY_ONCE("SEH exception in GetMonitorPositionFromContext — defaulting to (0,0)");
 	}
 }
 
@@ -942,6 +963,10 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << ": " << ex.what() << std::endl;
 		log_to_file(ex_message.str().c_str());
+		RELEASE_IF_NOT_NULL(device)
+		RELEASE_IF_NOT_NULL(deviceContext)
+		device = nullptr;
+		deviceContext = nullptr;
 		return;
 	}
 	catch (...)
@@ -949,6 +974,10 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << ": (unknown)" << std::endl;
 		log_to_file(ex_message.str().c_str());
+		RELEASE_IF_NOT_NULL(device)
+		RELEASE_IF_NOT_NULL(deviceContext)
+		device = nullptr;
+		deviceContext = nullptr;
 		return;
 	}
 }
@@ -1098,7 +1127,11 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	deviceContext->PSSetShaderResources(2, 1, &noiseTextureView);
 	deviceContext->PSSetSamplers(1, 1, &noiseSamplerState);
 
-	int constantData[4] = {lut->size, colorMode};
+	// Dither levels: 255 for 8-bit, 1023 for R10G10B10A2, 255 default
+	int dLevels = 255;
+	if (newBackBufferDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
+		dLevels = 1023;
+	int constantData[4] = {lut->size, colorMode, dLevels, 0};
 
 	D3D11_MAPPED_SUBRESOURCE resource;
 	EXECUTE_WITH_LOG(deviceContext->Map((ID3D11Resource*)constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
@@ -1740,7 +1773,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 
 						int rip_offset = *(int*)(address + 2);
-						g_pOverlayTestMode = (int*)(address + 7 + rip_offset);
+						int* candidatePtr = (int*)(address + 7 + rip_offset);
+						// Validate computed address is within dwmcore.dll image range
+						if ((unsigned char*)candidatePtr >= (unsigned char*)dwmcore &&
+							(unsigned char*)candidatePtr < (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
+						{
+							g_pOverlayTestMode = candidatePtr;
+						}
+						else
+						{
+							g_pOverlayTestMode = NULL;
+							LOG_ONLY_ONCE("WARNING: g_pOverlayTestMode address outside dwmcore.dll range — skipped");
+						}
 
 
 
@@ -1884,9 +1928,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			{
 				return FALSE;
 			}
-			if ((COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
+			if (numLuts > 0 && ((COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
 				COverlayContext_OverlaysEnabled_orig) ||
-				(COverlayContext_Present_orig_24h2 && COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 && COverlayContext_OverlaysEnabled_orig) && numLuts != 0)
+				(COverlayContext_Present_orig_24h2 && COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 && COverlayContext_OverlaysEnabled_orig)))
 
 			{
 				MH_Initialize();
@@ -1952,7 +1996,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (g_pOverlayTestMode != NULL)
 				{
-					*g_pOverlayTestMode = 5;
+					__try { *g_pOverlayTestMode = 5; }
+					__except (EXCEPTION_EXECUTE_HANDLER) { g_pOverlayTestMode = NULL; }
 					LOG_ONLY_ONCE("SUCCESS: Forced OverlayTestMode to 5")
 				}
 				else {
@@ -1964,13 +2009,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				MH_EnableHook(MH_ALL_HOOKS);
 				LOG_ONLY_ONCE("DWM HOOK DLL INITIALIZATION. START LOGGING")
 
-
-				if (g_pOverlayTestMode != NULL)
-				{
-					*g_pOverlayTestMode = 5;
-					LOG_ONLY_ONCE("Set OverlayTestMode global to 5 in DWM memory")
-				}
-
 				break;
 			}
 			return FALSE;
@@ -1979,7 +2017,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 		if (g_pOverlayTestMode != NULL)
 		{
-			*g_pOverlayTestMode = 0;
+			__try { *g_pOverlayTestMode = 0; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { /* already detaching, nothing to do */ }
 		}
 		MH_Uninitialize();
 		Sleep(100);

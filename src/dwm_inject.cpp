@@ -85,9 +85,9 @@ static std::wstring GetExeDirectory()
     return path;
 }
 
-// Clear the DACL on a file or directory so dwm.exe (running as a different
-// user) can read it.  Mirrors the C# ClearPermissions().
-static bool ClearDACL(const std::wstring& path)
+// Set a restrictive DACL on a file or directory so dwm.exe (running as SYSTEM)
+// can read it, but other users cannot.  Replaces null-DACL approach.
+static bool SetRestrictiveDACL(const std::wstring& path)
 {
     HANDLE hFile = CreateFileW(
         path.c_str(),
@@ -99,28 +99,66 @@ static bool ClearDACL(const std::wstring& path)
         nullptr);
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"ClearDACL: CreateFile failed for " << path << L": " << GetLastErrorString() << std::endl;
+        std::wcerr << L"SetRestrictiveDACL: CreateFile failed for " << path << L": " << GetLastErrorString() << std::endl;
         return false;
     }
 
-    DWORD ret = SetSecurityInfo(
-        hFile,
-        SE_FILE_OBJECT,
-        DACL_SECURITY_INFORMATION,
-        nullptr, // owner
-        nullptr, // group
-        nullptr, // dacl  — null DACL = everyone full access
-        nullptr  // sacl
-    );
+    // Build ACL granting SYSTEM and Administrators full access
+    PSID pSystemSid = nullptr;
+    PSID pAdminSid = nullptr;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    PACL pAcl = nullptr;
+    bool success = false;
 
+    if (AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+            0, 0, 0, 0, 0, 0, 0, &pSystemSid) &&
+        AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &pAdminSid))
+    {
+        EXPLICIT_ACCESS_A ea[2] = {};
+        ea[0].grfAccessPermissions = GENERIC_ALL;
+        ea[0].grfAccessMode = SET_ACCESS;
+        ea[0].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea[0].Trustee.ptstrName = (LPSTR)pSystemSid;
+
+        ea[1].grfAccessPermissions = GENERIC_ALL;
+        ea[1].grfAccessMode = SET_ACCESS;
+        ea[1].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+        ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        ea[1].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+        ea[1].Trustee.ptstrName = (LPSTR)pAdminSid;
+
+        if (SetEntriesInAclA(2, ea, nullptr, &pAcl) == ERROR_SUCCESS)
+        {
+            DWORD ret = SetSecurityInfo(
+                hFile,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                nullptr, nullptr, pAcl, nullptr);
+
+            success = (ret == ERROR_SUCCESS);
+            if (!success)
+                std::wcerr << L"SetRestrictiveDACL: SetSecurityInfo failed for " << path << std::endl;
+        }
+    }
+
+    if (pAcl) LocalFree(pAcl);
+    if (pSystemSid) FreeSid(pSystemSid);
+    if (pAdminSid) FreeSid(pAdminSid);
     CloseHandle(hFile);
 
-    if (ret != ERROR_SUCCESS) {
-        std::wcerr << L"ClearDACL: SetSecurityInfo failed for " << path << std::endl;
-        return false;
-    }
-    return true;
+    return success;
 }
+
+// RAII guard to ensure RevertToSelf() is always called on scope exit.
+struct SystemImpersonationGuard {
+    bool active = false;
+    ~SystemImpersonationGuard() { if (active) RevertToSelf(); }
+    void engage() { active = true; }
+    void disengage() { if (active) { RevertToSelf(); active = false; } }
+};
 
 // Elevate the current thread to SYSTEM by impersonating lsass.exe's token.
 static std::wstring ElevateToSystem()
@@ -190,7 +228,6 @@ static void DeleteDirectoryRecursive(const std::wstring& dir)
 // ---------------------------------------------------------------------------
 
 static const wchar_t* const kDllName   = L"DwmHook.dll";
-static const char* const    kDllNameA  = "DwmHook.dll";  // for module enumeration
 
 bool IsDwmHookInjected()
 {
@@ -221,6 +258,8 @@ bool IsDwmHookInjected()
 
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 {
+    SystemImpersonationGuard impGuard;
+
     // --- Elevate to SYSTEM ---
     std::wcout << L"[DWM Hook] Elevating to SYSTEM..." << std::endl;
     std::wstring err = ElevateToSystem();
@@ -228,6 +267,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         std::wcout << L"[DWM Hook] SYSTEM elevation FAILED: " << err << std::endl;
         return err;
     }
+    impGuard.engage();
     std::wcout << L"[DWM Hook] SYSTEM elevation OK" << std::endl;
 
     // --- Uninject if already loaded (handles stale injection from previous run) ---
@@ -279,10 +319,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     std::wcout << L"[DWM Hook] Copying DLL: " << dllSrc << L" -> " << dllDest << std::endl;
     if (!CopyFileW(dllSrc.c_str(), dllDest.c_str(), FALSE)) {
         std::wcout << L"[DWM Hook] DLL copy FAILED: " << GetLastErrorString() << std::endl;
-        RevertToSelf();
         return L"Failed to copy DwmHook.dll to staging: " + GetLastErrorString();
     }
-    ClearDACL(dllDest);
+    SetRestrictiveDACL(dllDest);
     std::wcout << L"[DWM Hook] DLL staged OK" << std::endl;
 
     // --- Prepare LUT staging directory ---
@@ -292,11 +331,10 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     if (!CreateDirectoryW(lutsDir.c_str(), nullptr)) {
         DWORD e = GetLastError();
         if (e != ERROR_ALREADY_EXISTS) {
-            RevertToSelf();
             return L"Failed to create LUT staging directory: " + GetLastErrorString();
         }
     }
-    ClearDACL(lutsDir);
+    SetRestrictiveDACL(lutsDir);
     std::wcout << L"[DWM Hook] LUT staging dir: " << lutsDir << std::endl;
 
     // --- Copy LUT files with position-based names ---
@@ -309,7 +347,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             if (!CopyFileW(mon.sdrLutPath.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy SDR LUT: " << GetLastErrorString() << std::endl;
             } else {
-                ClearDACL(dest);
+                SetRestrictiveDACL(dest);
             }
         }
 
@@ -319,7 +357,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             if (!CopyFileW(mon.hdrLutPath.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy HDR LUT: " << GetLastErrorString() << std::endl;
             } else {
-                ClearDACL(dest);
+                SetRestrictiveDACL(dest);
             }
         }
     }
@@ -375,7 +413,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
                 std::wcerr << L"[DWM Hook] WARNING: CreateDXGIFactory1 failed for monitors.dat" << std::endl;
             }
             fclose(mf);
-            ClearDACL(monitorsPath);
+            SetRestrictiveDACL(monitorsPath);
         } else {
             std::wcerr << L"[DWM Hook] WARNING: Failed to create monitors.dat" << std::endl;
         }
@@ -385,19 +423,16 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     // Resolve LoadLibraryA address (same virtual address in all processes due to kernel32 ASLR base sharing)
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32) {
-        RevertToSelf();
         return L"Failed to get kernel32.dll handle";
     }
     FARPROC pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
     if (!pLoadLibraryA) {
-        RevertToSelf();
         return L"Failed to get LoadLibraryA address";
     }
 
     // Convert DLL path to ANSI for LoadLibraryA
     int ansiLen = WideCharToMultiByte(CP_ACP, 0, dllDest.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (ansiLen <= 0) {
-        RevertToSelf();
         return L"Failed to convert DLL path to ANSI";
     }
     std::vector<char> dllPathAnsi(ansiLen);
@@ -407,7 +442,6 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     if (dwmPids.empty()) {
         std::wcout << L"[DWM Hook] No dwm.exe processes found!" << std::endl;
         DeleteDirectoryRecursive(lutsDir);
-        RevertToSelf();
         return L"No dwm.exe processes found";
     }
     std::wcout << L"[DWM Hook] Found " << dwmPids.size() << L" dwm.exe process(es)" << std::endl;
@@ -463,22 +497,48 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             continue;
         }
 
-        WaitForSingleObject(hThread, 10000);
+        DWORD waitResult = WaitForSingleObject(hThread, 10000);
+        CloseHandle(hThread);
 
-        DWORD exitCode = 0;
-        GetExitCodeThread(hThread, &exitCode);
-        if (exitCode == 0) {
-            std::wcout << L"[DWM Hook] LoadLibraryA returned 0 (FAILED) for PID " << pid << std::endl;
-            std::wcout << L"[DWM Hook]   DLL may have failed AOB scan or LUT parse in DllMain" << std::endl;
+        if (waitResult == WAIT_TIMEOUT) {
+            std::wcerr << L"Warning: Remote thread timed out for PID " << pid << L", skipping VirtualFreeEx" << std::endl;
+            // Don't free remoteMem — thread may still be using it
+            CloseHandle(hProcess);
             anyFailed = true;
-            if (firstError.empty())
-                firstError = L"Failed to load or initialize DwmHook.dll in dwm.exe. "
-                             L"This probably means that a LUT file is malformed or that DWM got updated.";
-        } else {
-            std::wcout << L"[DWM Hook] DLL loaded in PID " << pid << L" (module base 0x" << std::hex << exitCode << std::dec << L")" << std::endl;
+            if (firstError.empty()) firstError = L"Remote LoadLibraryA thread timed out in dwm.exe PID " + std::to_wstring(pid);
+            continue;
         }
 
-        CloseHandle(hThread);
+        // Verify DLL loaded by enumerating modules (avoids GetExitCodeThread 64-bit truncation)
+        {
+            bool dllFound = false;
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+            if (snap != INVALID_HANDLE_VALUE) {
+                MODULEENTRY32W me{};
+                me.dwSize = sizeof(me);
+                if (Module32FirstW(snap, &me)) {
+                    do {
+                        if (_wcsicmp(me.szModule, kDllName) == 0) {
+                            dllFound = true;
+                            break;
+                        }
+                    } while (Module32NextW(snap, &me));
+                }
+                CloseHandle(snap);
+            }
+
+            if (!dllFound) {
+                std::wcout << L"[DWM Hook] DLL not found in PID " << pid << L" after LoadLibraryA — injection failed" << std::endl;
+                std::wcout << L"[DWM Hook]   DLL may have failed AOB scan or LUT parse in DllMain" << std::endl;
+                anyFailed = true;
+                if (firstError.empty())
+                    firstError = L"Failed to load or initialize DwmHook.dll in dwm.exe. "
+                                 L"This probably means that a LUT file is malformed or that DWM got updated.";
+            } else {
+                std::wcout << L"[DWM Hook] DLL verified loaded in PID " << pid << std::endl;
+            }
+        }
+
         VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
         CloseHandle(hProcess);
     }
@@ -491,8 +551,6 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         DeleteFileW(dllDest.c_str());
     }
 
-    RevertToSelf();
-
     if (anyFailed) {
         std::wcout << L"[DWM Hook] Injection completed with errors: " << firstError << std::endl;
         return firstError;
@@ -504,6 +562,8 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 
 std::wstring UninjectDwmHook()
 {
+    SystemImpersonationGuard impGuard;
+
     std::wcout << L"[DWM Hook] Uninjecting..." << std::endl;
 
     // Elevate to SYSTEM — required to open dwm.exe and enumerate its modules
@@ -512,20 +572,20 @@ std::wstring UninjectDwmHook()
         std::wcout << L"[DWM Hook] SYSTEM elevation failed for uninjection: " << elevErr << std::endl;
         return elevErr;
     }
+    impGuard.engage();
     std::wcout << L"[DWM Hook] SYSTEM elevation OK (for uninjection)" << std::endl;
 
     auto dwmPids = FindProcessesByName(L"dwm.exe");
     if (dwmPids.empty()) {
         std::wcout << L"[DWM Hook] No dwm.exe processes found" << std::endl;
-        RevertToSelf();
         return {};
     }
 
     // Resolve FreeLibrary address
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!hKernel32) { RevertToSelf(); return L"Failed to get kernel32.dll handle"; }
+    if (!hKernel32) { return L"Failed to get kernel32.dll handle"; }
     FARPROC pFreeLibrary = GetProcAddress(hKernel32, "FreeLibrary");
-    if (!pFreeLibrary) { RevertToSelf(); return L"Failed to get FreeLibrary address"; }
+    if (!pFreeLibrary) { return L"Failed to get FreeLibrary address"; }
 
     bool anyFailed = false;
     std::wstring firstError;
@@ -577,17 +637,19 @@ std::wstring UninjectDwmHook()
             continue;
         }
 
-        WaitForSingleObject(hThread, 10000);
-        std::wcout << L"[DWM Hook] FreeLibrary completed for PID " << pid << std::endl;
+        DWORD waitResult = WaitForSingleObject(hThread, 10000);
         CloseHandle(hThread);
+        if (waitResult == WAIT_TIMEOUT) {
+            std::wcerr << L"Warning: FreeLibrary thread timed out for PID " << pid << std::endl;
+        } else {
+            std::wcout << L"[DWM Hook] FreeLibrary completed for PID " << pid << std::endl;
+        }
         CloseHandle(hProcess);
     }
 
     // Clean up DLL from staging location
     std::wstring dllPath = ExpandEnv(L"%SYSTEMROOT%\\Temp\\") + kDllName;
     DeleteFileW(dllPath.c_str());
-
-    RevertToSelf();
 
     if (anyFailed) {
         std::wcout << L"[DWM Hook] Uninjection completed with errors" << std::endl;
