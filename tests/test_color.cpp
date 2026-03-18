@@ -25,6 +25,17 @@ TEST_CASE("PQ: PQToLinearScalar known values") {
     CHECK(PQToLinearScalar(1.0f) == doctest::Approx(1.0f).epsilon(0.001));
 }
 
+TEST_CASE("PQ: ST.2084 extended reference sweep") {
+    // PQ values computed from ST.2084 OETF formula (float, not 10-bit quantized)
+    CHECK(LinearToPQScalar(1.0f / 10000.0f) == doctest::Approx(0.1499f).epsilon(0.002));    // 1 nit
+    CHECK(LinearToPQScalar(10.0f / 10000.0f) == doctest::Approx(0.2997f).epsilon(0.002));   // 10 nits
+    CHECK(LinearToPQScalar(200.0f / 10000.0f) == doctest::Approx(0.5791f).epsilon(0.002));  // 200 nits
+    // Verify inverse at these points
+    CHECK(PQToLinearScalar(0.1499f) == doctest::Approx(1.0f / 10000.0f).epsilon(0.0005));
+    CHECK(PQToLinearScalar(0.2997f) == doctest::Approx(10.0f / 10000.0f).epsilon(0.0005));
+    CHECK(PQToLinearScalar(0.5791f) == doctest::Approx(200.0f / 10000.0f).epsilon(0.001));
+}
+
 TEST_CASE("PQ: round-trip fidelity") {
     float testValues[] = {0.001f, 0.01f, 0.1f, 0.5f, 1.0f};
     for (float x : testValues) {
@@ -71,7 +82,7 @@ TEST_CASE("Primaries: sRGB to BT2020 is non-identity") {
     float m[9];
     CalculatePrimariesMatrix(kSRGB, kBT2020, m);
     CHECK_FALSE(IsIdentity(m, 0.01f));
-    // Published BT.709→BT.2020 matrix reference values (row-major 3x3)
+    // Verified against BT.709→BT.2020 conversion derived from ITU-R BT.2020 Table 4 primaries
     CHECK(m[0] == doctest::Approx(0.6274f).epsilon(0.01));  // R→R
     CHECK(m[1] == doctest::Approx(0.3293f).epsilon(0.01));  // G→R
     CHECK(m[2] == doctest::Approx(0.0433f).epsilon(0.01));  // B→R
@@ -81,12 +92,6 @@ TEST_CASE("Primaries: sRGB to BT2020 is non-identity") {
     CHECK(m[6] == doctest::Approx(0.0164f).epsilon(0.01));  // R→B
     CHECK(m[7] == doctest::Approx(0.0880f).epsilon(0.01));  // G→B
     CHECK(m[8] == doctest::Approx(0.8956f).epsilon(0.01));  // B→B
-
-    // Verify row sums ≈ 1.0 (D65 white maps to D65 white)
-    for (int row = 0; row < 3; row++) {
-        float sum = m[row*3+0] + m[row*3+1] + m[row*3+2];
-        CHECK(sum == doctest::Approx(1.0f).epsilon(0.01));
-    }
 }
 
 TEST_CASE("Primaries: invertibility (sRGB->P3 then P3->sRGB)") {
@@ -173,4 +178,53 @@ TEST_CASE("Primaries: different white points produces non-identity") {
     for (int i = 0; i < 9; i++) {
         CHECK(std::isfinite(m[i]));
     }
+}
+
+// ============================================================================
+// Color Transform End-to-End Validation
+// ============================================================================
+
+TEST_CASE("Primaries: sRGB red stays red in BT.2020") {
+    float m[9];
+    CalculatePrimariesMatrix(kSRGB, kBT2020, m);
+    // Transform pure red (1,0,0): out = (m[0], m[3], m[6])
+    CHECK(m[0] > 0.5f);   // Red stays primarily in R channel
+    CHECK(m[3] < 0.15f);  // Small green contribution
+    CHECK(m[6] < 0.05f);  // Tiny blue contribution
+    // All positive (sRGB red is within BT.2020 gamut)
+    CHECK(m[0] > 0.0f);
+    CHECK(m[3] > 0.0f);
+    CHECK(m[6] > 0.0f);
+}
+
+TEST_CASE("Primaries: D65 white preserved in gamut mapping") {
+    float m[9];
+    CalculatePrimariesMatrix(kSRGB, kBT2020, m);
+    // White (1,1,1) through matrix: each output = sum of row
+    float outR = m[0] + m[1] + m[2];
+    float outG = m[3] + m[4] + m[5];
+    float outB = m[6] + m[7] + m[8];
+    // Both color spaces share D65 white — white maps to white
+    CHECK(outR == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK(outG == doctest::Approx(1.0f).epsilon(0.01));
+    CHECK(outB == doctest::Approx(1.0f).epsilon(0.01));
+}
+
+TEST_CASE("Primaries: BT.2020 to sRGB has negative coefficients (wide-to-narrow)") {
+    float m[9];
+    CalculatePrimariesMatrix(kBT2020, kSRGB, m);
+    // BT.2020 green (0,1,0) → sRGB: out_R = m[1], should be negative (out-of-gamut)
+    CHECK(m[1] < 0.0f);
+    // BT.2020 blue (0,0,1) → sRGB: out_G = m[5], should be negative
+    CHECK(m[5] < 0.0f);
+}
+
+TEST_CASE("Primaries: D50 to D65 Bradford adaptation direction") {
+    // sRGB with D50 white → sRGB with D65 white
+    DisplayPrimariesData srgbD50 = {0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3457f, 0.3585f};
+    float m[9];
+    CalculatePrimariesMatrix(srgbD50, kSRGB, m);
+    // Bradford D50→D65 in RGB space: red diagonal boosted, blue diagonal reduced
+    CHECK(m[0] > 1.0f);   // Red diagonal boosted
+    CHECK(m[8] < 1.0f);   // Blue diagonal reduced
 }

@@ -396,6 +396,115 @@ TEST_CASE("Tonemap: string to enum case-insensitive") {
 }
 
 // ============================================================================
+// C Locale (locale-independent parsing)
+// ============================================================================
+
+TEST_CASE("GetCLocale: returns valid locale handle") {
+    _locale_t loc = GetCLocale();
+    CHECK(loc != nullptr);
+    CHECK(GetCLocale() == loc);  // Same cached handle
+}
+
+TEST_CASE("GetCLocale: float parsing with C locale") {
+    _locale_t loc = GetCLocale();
+    wchar_t* end = nullptr;
+    double result = _wcstod_l(L"0.6400", &end, loc);
+    CHECK(result == doctest::Approx(0.64).epsilon(0.0001));
+    CHECK(*end == L'\0');
+}
+
+TEST_CASE("GetCLocale: handles negative and zero values") {
+    _locale_t loc = GetCLocale();
+    wchar_t* end = nullptr;
+    CHECK(_wcstod_l(L"0.0", &end, loc) == doctest::Approx(0.0).epsilon(0.0001));
+    CHECK(_wcstod_l(L"-0.5", &end, loc) == doctest::Approx(-0.5).epsilon(0.0001));
+    CHECK(_wcstod_l(L"999.123", &end, loc) == doctest::Approx(999.123).epsilon(0.001));
+}
+
+// ============================================================================
+// Float Written Format
+// ============================================================================
+
+TEST_CASE("Float: written value uses decimal point (not comma)") {
+    TempIni ini;
+    WritePrivateProfileFloat(L"Test", L"val", 0.6400f, ini.c_str());
+    wchar_t buf[64] = {};
+    GetPrivateProfileStringW(L"Test", L"val", L"", buf, 64, ini.c_str());
+    std::wstring raw(buf);
+    CHECK(raw.find(L'.') != std::wstring::npos);
+    CHECK(raw.find(L',') == std::wstring::npos);
+}
+
+// ============================================================================
+// HDR CC Persistence
+// ============================================================================
+
+TEST_CASE("CC settings: HDR primaries/grayscale not persisted") {
+    TempIni ini;
+    ColorCorrectionSettings original;
+    original.primariesEnabled = true;
+    original.grayscale.enabled = true;
+    original.grayscale.pointCount = 20;
+    original.grayscale.initLinearPQ();
+    original.tonemap.enabled = true;
+    original.tonemap.curve = TonemapCurve::BT2390;
+
+    SaveColorCorrectionSettings(L"TestMon", L"HDR_", original, ini.c_str());
+
+    ColorCorrectionSettings loaded;
+    LoadColorCorrectionSettings(L"TestMon", L"HDR_", loaded, ini.c_str());
+
+    CHECK(loaded.tonemap.enabled == true);
+    CHECK(loaded.tonemap.curve == TonemapCurve::BT2390);
+    CHECK(loaded.primariesEnabled == false);
+    CHECK(loaded.grayscale.enabled == false);
+}
+
+// ============================================================================
+// MHC Settings Extended Round-Trips
+// ============================================================================
+
+TEST_CASE("MHC settings: grayscale points round-trip") {
+    TempIni ini;
+    MHCSettings original;
+    original.enabled = true;
+    original.grayscale.pointCount = 20;
+    original.grayscale.initLinear();
+    original.grayscale.points[5] = 0.123f;
+    original.grayscale.points[10] = 0.456f;
+    original.grayscale.enabled = true;
+
+    SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
+
+    MHCSettings loaded;
+    LoadMHCSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
+
+    CHECK(loaded.grayscale.enabled == true);
+    CHECK(loaded.grayscale.pointCount == 20);
+    CHECK(loaded.grayscale.points[5] == doctest::Approx(0.123f).epsilon(0.001));
+    CHECK(loaded.grayscale.points[10] == doctest::Approx(0.456f).epsilon(0.001));
+}
+
+TEST_CASE("MHC settings: white balance round-trip") {
+    TempIni ini;
+    MHCSettings original;
+    original.grayscale.pointCount = 20;
+    original.grayscale.initLinear();
+    original.whiteBalanceEnabled = true;
+    original.whiteBalanceWx = 0.3100f;
+    original.whiteBalanceWy = 0.3200f;
+
+    SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
+
+    MHCSettings loaded;
+    LoadMHCSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
+
+    CHECK(loaded.whiteBalanceEnabled == true);
+    CHECK(loaded.whiteBalanceWx == doctest::Approx(0.3100f).epsilon(0.0001));
+    CHECK(loaded.whiteBalanceWy == doctest::Approx(0.3200f).epsilon(0.0001));
+}
+
+// ============================================================================
 // Per-channel RGB Deviations
 // ============================================================================
 

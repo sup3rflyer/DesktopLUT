@@ -97,3 +97,99 @@ TEST_CASE("HardwareID: no second #") {
 TEST_CASE("HardwareID: empty string") {
     CHECK(ExtractHardwareIdFromPath(L"") == L"");
 }
+
+// ============================================================================
+// EDID Edge Cases
+// ============================================================================
+
+TEST_CASE("EDID: maximum chromaticity values (all bits set)") {
+    uint8_t edid[128] = {};
+    edid[0] = 0x00; edid[1] = 0xFF; edid[2] = 0xFF; edid[3] = 0xFF;
+    edid[4] = 0xFF; edid[5] = 0xFF; edid[6] = 0xFF; edid[7] = 0x00;
+    edid[25] = 0xFF;
+    edid[26] = 0xFF;
+    for (int i = 27; i <= 34; i++) edid[i] = 0xFF;
+
+    MonitorPrimaries p = {};
+    bool ok = ParseEDIDChromaticity(edid, 128, p);
+    CHECK(ok);
+    CHECK(p.valid);
+    // 10-bit value = (255 << 2) | 3 = 1023
+    CHECK(p.Rx == doctest::Approx(1023.0f / 1024.0f).epsilon(0.001));
+    CHECK(p.Ry == doctest::Approx(1023.0f / 1024.0f).epsilon(0.001));
+    CHECK(p.Wx == doctest::Approx(1023.0f / 1024.0f).epsilon(0.001));
+}
+
+TEST_CASE("EDID: LSBs only (MSBs zero)") {
+    uint8_t edid[128] = {};
+    edid[0] = 0x00; edid[1] = 0xFF; edid[2] = 0xFF; edid[3] = 0xFF;
+    edid[4] = 0xFF; edid[5] = 0xFF; edid[6] = 0xFF; edid[7] = 0x00;
+    // Byte 25: Rx[1:0]=11 Ry[1:0]=10 Gx[1:0]=01 Gy[1:0]=00 = 0xE4
+    edid[25] = 0xE4;
+    edid[26] = 0x00;
+    for (int i = 27; i <= 34; i++) edid[i] = 0x00;
+
+    MonitorPrimaries p = {};
+    bool ok = ParseEDIDChromaticity(edid, 128, p);
+    CHECK(ok);
+    CHECK(p.Rx == doctest::Approx(3.0f / 1024.0f).epsilon(0.001));
+    CHECK(p.Ry == doctest::Approx(2.0f / 1024.0f).epsilon(0.001));
+    CHECK(p.Gx == doctest::Approx(1.0f / 1024.0f).epsilon(0.001));
+    CHECK(p.Gy == doctest::Approx(0.0f).epsilon(0.001));
+}
+
+// ============================================================================
+// DWM Hook IPC Struct Layout
+// ============================================================================
+
+#include "../shared/dwm_hook_config.h"
+
+TEST_CASE("DwmHookMonitorConfig: size and alignment") {
+    CHECK(sizeof(DwmHookMonitorConfig) == 48);
+    DwmHookMonitorConfig cfg = {};
+    auto base = reinterpret_cast<uintptr_t>(&cfg);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.left) - base) == 0);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.top) - base) == 4);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.width) - base) == 8);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.height) - base) == 12);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.bpc) - base) == 16);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.isHdr) - base) == 20);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.tonemapEnabled) - base) == 24);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.tonemapCurve) - base) == 28);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.sourcePeakNits) - base) == 32);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.targetPeakNits) - base) == 36);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.dynamicPeak) - base) == 40);
+}
+
+TEST_CASE("DwmHookSharedConfig: size and layout") {
+    CHECK(sizeof(DwmHookSharedConfig) == 464);
+    DwmHookSharedConfig cfg = {};
+    auto base = reinterpret_cast<uintptr_t>(&cfg);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.version) - base) == 0);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.numMonitors) - base) == 4);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.hostPid) - base) == 8);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.lutReloadFlag) - base) == 12);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.monitors[0]) - base) == 16);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.monitors[1]) - base) == 16 + 48);
+}
+
+TEST_CASE("DwmHookTonemapCurve: enum values match host app") {
+    CHECK(DWMHOOK_TONEMAP_BT2390 == 0);
+    CHECK(DWMHOOK_TONEMAP_SOFTCLIP == 1);
+    CHECK(DWMHOOK_TONEMAP_REINHARD == 2);
+    CHECK(DWMHOOK_TONEMAP_BT2446A == 3);
+    CHECK(DWMHOOK_TONEMAP_HARDCLIP == 4);
+}
+
+TEST_CASE("DwmHookSharedConfig: zero-initialized is safe default") {
+    DwmHookSharedConfig cfg = {};
+    CHECK(cfg.version == 0);
+    CHECK(cfg.numMonitors == 0);
+    CHECK(cfg.hostPid == 0);
+    CHECK(cfg.lutReloadFlag == 0);
+    for (int i = 0; i < MAX_DWM_HOOK_MONITORS; i++) {
+        CHECK(cfg.monitors[i].tonemapEnabled == 0);
+        CHECK(cfg.monitors[i].isHdr == 0);
+        CHECK(cfg.monitors[i].sourcePeakNits == 0.0f);
+    }
+}

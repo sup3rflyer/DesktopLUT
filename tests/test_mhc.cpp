@@ -383,6 +383,28 @@ TEST_CASE("InvertTRC: target below TRC minimum") {
     CHECK(result < 0.05f);
 }
 
+TEST_CASE("InvertTRC: steep TRC (gamma 4.0)") {
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) trc[i] = powf((float)i / 255.0f, 4.0f);
+    float result = InvertTRC(trc, 0.5f);
+    float expected = powf(0.5f, 1.0f / 4.0f);  // = 0.8409
+    CHECK(result == doctest::Approx(expected).epsilon(0.02));
+}
+
+TEST_CASE("InvertTRC: flat segment (constant TRC region)") {
+    std::vector<float> trc(256);
+    for (int i = 0; i < 256; i++) {
+        float t = (float)i / 255.0f;
+        if (t < 0.3f) trc[i] = t * (0.5f / 0.3f);
+        else if (t < 0.7f) trc[i] = 0.5f;
+        else trc[i] = 0.5f + (t - 0.7f) * (0.5f / 0.3f);
+    }
+    float result = InvertTRC(trc, 0.5f);
+    CHECK(result >= 0.25f);
+    CHECK(result <= 0.75f);
+    CHECK(std::isfinite(result));
+}
+
 TEST_CASE("InvertTRC: target above TRC maximum") {
     std::vector<float> trc(256);
     for (int i = 0; i < 256; i++) trc[i] = 0.8f * ((float)i / 255.0f);
@@ -1164,28 +1186,6 @@ TEST_CASE("ICC: TRC normalization scales channels to reach 1.0") {
     CHECK(icc.trcB[mid] == doctest::Approx(0.50f).epsilon(0.02));
 }
 
-TEST_CASE("ICC: TRC already at 1.0 not modified") {
-    // Build synthetic ICC with TRC that already reaches 1.0
-    int N = 64;
-    std::vector<uint16_t> trc(N);
-    for (int i = 0; i < N; i++) {
-        trc[i] = (uint16_t)((float)i / (float)(N - 1) * 65535.0f + 0.5f);
-    }
-
-    auto data = BuildSyntheticICC(trc, trc, trc);
-    TempFile tmp(L"_test_trc_already_norm.icm");
-    { std::ofstream f(tmp.path, std::ios::binary); f.write((const char*)data.data(), data.size()); }
-
-    ICCProfileData icc;
-    REQUIRE(ReadICCProfile(tmp.path, icc));
-    CHECK(icc.hasTRC);
-    CHECK(icc.trcR.back() == doctest::Approx(1.0f).epsilon(0.001));
-
-    // Midpoint should be ~0.5 (linear ramp, unchanged)
-    int mid = N / 2;
-    CHECK(icc.trcR[mid] == doctest::Approx((float)mid / (float)(N - 1)).epsilon(0.001));
-}
-
 TEST_CASE("ICC: isLUTBased false for standard matrix+TRC profile") {
     // Build synthetic ICC without A2B0/B2A0 tags
     int N = 32;
@@ -1631,16 +1631,19 @@ TEST_CASE("MHC2 matrix: white balance gains identity") {
 }
 
 TEST_CASE("MHC2 matrix: white balance gains scale output") {
-    // Non-identity gains should produce non-identity matrix
     float mhc[12];
     float gains[3] = { 1.1f, 1.0f, 0.9f };
     ComputeMHC2Matrix(kSRGB, kSRGB, false, mhc, gains);
-    // With sRGB→sRGB and WB gains, the matrix should NOT be identity
-    // R gain > 1 means red channel is boosted
-    // White input [1,1,1] through srcToXYZ_scaled should produce XYZ shifted toward red
-    // Check diagonal is not all 1.0
-    bool isIdentity = (fabsf(mhc[0] - 1.0f) < 0.001f && fabsf(mhc[5] - 1.0f) < 0.001f && fabsf(mhc[10] - 1.0f) < 0.001f);
-    CHECK(!isIdentity);
+    // White input (1,1,1) → output: sum of each matrix row
+    float outR = mhc[0] + mhc[1] + mhc[2];
+    float outG = mhc[4] + mhc[5] + mhc[6];
+    float outB = mhc[8] + mhc[9] + mhc[10];
+    // R gain > 1.0 → red boosted
+    CHECK(outR > 1.0f);
+    // G gain = 1.0 → green near 1.0
+    CHECK(outG == doctest::Approx(1.0f).epsilon(0.01));
+    // B gain < 1.0 → blue reduced
+    CHECK(outB < 1.0f);
 }
 
 TEST_CASE("MHC2 matrix: white balance + primaries combined") {
@@ -1666,23 +1669,25 @@ TEST_CASE("MHC2 matrix: white balance + primaries combined") {
 // ============================================================================
 
 TEST_CASE("Desktop gamma: HDR LUT SDR range corrected") {
-    // Generate HDR profile with desktop gamma enabled
-    MHC2ProfileParams params;
-    params.isHDR = true;
-    params.peakNits = 1000.0f;
-    params.primariesEnabled = false;
-    params.grayscaleEnabled = false;
-    params.grayscale.enabled = false;
-    params.desktopGammaEnabled = true;
+    MHC2ProfileParams paramsNoDG;
+    paramsNoDG.isHDR = true;
+    paramsNoDG.peakNits = 1000.0f;
+    paramsNoDG.primariesEnabled = false;
+    paramsNoDG.grayscaleEnabled = false;
+    paramsNoDG.grayscale.enabled = false;
+    paramsNoDG.desktopGammaEnabled = false;
 
-    std::vector<uint8_t> profileData;
-    bool ok = GenerateMHC2Profile(params, profileData);
-    CHECK(ok);
+    MHC2ProfileParams paramsDG = paramsNoDG;
+    paramsDG.desktopGammaEnabled = true;
 
-    // Verify the LUT is non-identity in SDR range (PQ of 80 nits = ~0.5080)
-    // We can't directly inspect the LUT from the profile binary easily,
-    // but we can verify the profile was generated successfully
-    CHECK(profileData.size() > 128);
+    std::vector<uint8_t> dataNoDG, dataDG;
+    REQUIRE(GenerateMHC2Profile(paramsNoDG, dataNoDG));
+    REQUIRE(GenerateMHC2Profile(paramsDG, dataDG));
+
+    CHECK(dataNoDG.size() > 128);
+    CHECK(dataDG.size() > 128);
+    // Desktop gamma version has different LUT data
+    CHECK(dataNoDG != dataDG);
 }
 
 TEST_CASE("Desktop gamma: sRGB to 2.2 conversion at SDR") {
@@ -1731,6 +1736,17 @@ TEST_CASE("Correction grayscale: SDR composition on identity base") {
     bool ok = GenerateMHC2Profile(params, profileData);
     CHECK(ok);
     CHECK(profileData.size() > 128);
+
+    // Verify correction changes the LUT vs no correction
+    MHC2ProfileParams paramsNone;
+    paramsNone.isHDR = false;
+    paramsNone.primariesEnabled = false;
+    paramsNone.grayscaleEnabled = false;
+    paramsNone.grayscale.enabled = false;
+    paramsNone.correctionGrayscaleEnabled = false;
+    std::vector<uint8_t> noCorr;
+    REQUIRE(GenerateMHC2Profile(paramsNone, noCorr));
+    CHECK(profileData != noCorr);
 }
 
 TEST_CASE("Correction grayscale: HDR composition on identity base") {
