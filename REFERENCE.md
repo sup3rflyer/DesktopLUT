@@ -24,7 +24,7 @@ Settings saved to `DesktopLUT.ini` next to executable.
 TetrahedralInterp=0    ; 0 = trilinear (default), 1 = tetrahedral (higher quality)
 ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
 ShowFrameTiming=0      ; 1 = show frame timing stats in analysis overlay (developer debug)
-DwmHookMode=1          ; 1 = inject DLL into dwm.exe for 3D LUT (overlay handles tonemapping only)
+DwmHookMode=1          ; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay only for analysis)
 GammaWhitelist=mpv.exe,mpvnet.exe  ; Auto-disable desktop gamma when these apps run
 
 ; Passthrough Mode (hide overlay when specific apps are running)
@@ -52,7 +52,7 @@ StartMinimized=0       ; 1 = start minimized to system tray
 LUT_SDR=C:\path\to\sdr.cube   ; 3D LUT for SDR (applied by DWM hook in DwmHookMode)
 LUT_HDR=C:\path\to\hdr.cube   ; 3D LUT for HDR
 
-; HDR shader corrections (only tonemapping — all other corrections in MHC sections below)
+; HDR tonemapping (applied by DWM hook when DwmHookMode=1, overlay shader as fallback)
 HDR_TonemapEnabled=0
 HDR_TonemapCurve=SoftClip     ; BT2390, SoftClip, Reinhard, BT2446A, HardClip
 HDR_TonemapSourcePeak=10000.0
