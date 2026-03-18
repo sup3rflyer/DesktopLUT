@@ -17,7 +17,7 @@ Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurabl
 
 Settings saved to `DesktopLUT.ini` next to executable.
 
-**Note**: On the DWM branch, primaries/grayscale/white balance/desktop gamma live in the MHC sections per monitor. The Corrections section only persists tonemapping. `DesktopGamma` is no longer a global key — it is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
+**Note**: Primaries, grayscale, white balance, and desktop gamma are per-monitor in the MHC sections. The Corrections section only persists tonemapping. `DesktopGamma` is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
 
 ```ini
 [General]
@@ -99,6 +99,22 @@ HDR_MHCWhiteBalanceEnabled=false
 HDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
 HDR_MHCCorrGSPeak=10000.0
 ```
+
+## DWM Hook Mode
+
+When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injecting `DwmHook.dll` into `dwm.exe` instead of using the Desktop Duplication overlay. This is overlay-free — no extra window, no capture latency.
+
+**How it works**:
+1. On Start, `dwm_inject.cpp` elevates to SYSTEM (via TrustedInstaller token), stages LUT files to `%TEMP%\DesktopLUT_DwmHook\`, and injects the DLL via `CreateRemoteThread(LoadLibraryW)`.
+2. `DwmHook.dll` hooks `IDXGISwapChain::Present` in DWM using MinHook. It identifies monitor swapchains by matching desktop coordinates from `IDXGIOutput::GetDesc`.
+3. Before each Present call, the hook applies 3D LUT + ICtCp tonemapping via pixel/compute shaders. All 5 tonemap curves are supported (BT.2390, SoftClip, Reinhard, BT.2446A, HardClip) including dynamic peak detection (80x45 grid, temporal EMA smoothing).
+4. Live parameter updates (tonemapping changes, monitor hotplug) are communicated via shared memory IPC (`Global\DesktopLUT_DwmHook_Config`) — no re-injection needed.
+
+**Overlay is only started for analysis**: The DD overlay activates only for the analysis overlay (Win+Shift+X) or MHC editor live preview. All color correction and tonemapping is overlay-free.
+
+**Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event). Max 3 consecutive re-injection retries. Orphan detection via `hostPid` in shared memory — DLL self-unloads if host process dies.
+
+**Repair**: Windows updates can break DWM internals (AOB patterns, struct offsets). See `DWM_HOOK_REPAIR.md` for diagnosis and repair procedures.
 
 ## HDR Color Pipeline (ICtCp-based)
 
@@ -190,7 +206,7 @@ Maps sRGB content to display correctly on wide-gamut monitors. Without correctio
 
 **Bradford Adaptation**: When source and target white points differ by >0.01 in xy, Bradford chromatic adaptation is applied. This is the industry-standard method for white point conversion, transforming the entire color space correctly (not just neutrals). Skipped when white points are similar for pure colorimetric mapping.
 
-**Detect Button**: Uses `GetMonitorPrimariesFromEDID()` which parses actual EDID data from Windows registry (bytes 25-34 contain CIE 1931 xy chromaticity as 10-bit values). Falls back to DXGI if EDID parsing fails. **White point defaults to D65** because most displays have presets (Gamer, Movie, etc.) that already calibrate to D65 internally - using EDID native white would double-correct. For non-D65 displays, manually measure and enter the white point.
+**Detect Button**: Uses `GetMonitorPrimariesFromEDID()` which parses actual EDID data from Windows registry (bytes 25-34 contain CIE 1931 xy chromaticity as 10-bit values). Falls back to DXGI if EDID parsing fails. **White point defaults to D65** because most displays have presets that already calibrate to D65 internally - using EDID native white would double-correct. For non-D65 displays, manually measure and enter the white point.
 
 **Presets**: sRGB/Rec.709, P3-D65, Adobe RGB, Rec.2020, Custom. Custom values are preserved when switching between presets.
 
@@ -266,12 +282,10 @@ Input → Grayscale → Primaries → 3D LUT → Output
   - Slider N affects patch N in calibration software (ColourSpace, etc.)
   - Applied in signal space before primaries correction
   - Curve values interpolated in sqrt domain for perceptual smoothness
-- **HDR**: ICtCp I-channel correction (evenly spaced in PQ domain)
-  - I channel has r=0.998 correlation with true luminance
-  - Applied before tonemapping (display calibration is constant)
+- **HDR**: Per-channel Rec.2020 corrections in PQ domain
+  - Per-channel R/G/B interpolation with linear gains (applied before ICtCp)
   - Peak setting must match ColourSpace target peak for slider alignment
   - Content above peak passes through with last point's correction factor
-  - CT/CP (chroma) unchanged = no hue shifts from grayscale correction
 - **Linear interpolation** (both SDR and HDR):
   - Piecewise linear between control points
   - Avoids undulations that smoothstep can cause in gradients
@@ -306,6 +320,8 @@ Runs 24/7, must be invisible. All operations follow:
 | GPU shader | <0.1ms |
 | Present (tearing enabled) | Immediate |
 | **Processing overhead** | **~1-2ms** |
+
+**DWM Hook Mode**: Zero capture latency for 3D LUT and tonemapping (applied inside DWM). Overlay latency only applies when analysis is active.
 
 **Frame pacer jitter**: ~0.01-0.05ms with predictive strategies (vs ~0.5-2ms with legacy DwmFlush). MMCSS "Pro Audio" thread priority ensures consistent scheduling. Spin-wait adds <2ms CPU per frame (<12% of 60Hz budget).
 
@@ -362,6 +378,8 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 
 **Fullscreen Exclusive**: Zero impact (but no color correction). Desktop Duplication can't capture games that bypass DWM.
 
+**DWM Hook Mode**: When using DWM hook for 3D LUT + tonemapping (no overlay), impact is lower — no Desktop Duplication capture overhead. Overlay only needed for analysis.
+
 **If concerned**: Run game benchmarks with/without DesktopLUT enabled to measure actual impact on your specific hardware.
 
 ## Limitations
@@ -370,20 +388,24 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 2. **Animated system UI**: Start menu, notifications not captured
 3. **Secure desktop**: UAC/lock screen temporarily disables overlay (auto-recovers)
 4. **Memory bandwidth**: ~8 GB/s at 4K 60Hz HDR
+5. **DWM Hook**: Experimental — may break on Windows updates that change DWM internals
 
 ## VRR (Variable Refresh Rate) Compatibility
 
 | GPU Vendor | VRR Status | Notes |
 |------------|-----------|-------|
-| NVIDIA G-Sync | **Incompatible** | Driver disables VRR with any overlay window |
+| NVIDIA G-Sync | **Incompatible** (overlay mode) | Driver disables VRR with any overlay window |
 | AMD FreeSync | Compatible | Works normally |
 | Intel VRR | Compatible | Works normally |
 
 This is a fundamental NVIDIA driver limitation affecting all external overlay applications (ShaderGlass, Lossless Scaling, Discord overlay, Xbox Game Bar, etc.). No workaround exists.
 
+**DWM Hook Mode**: When using DWM hook (no overlay active), VRR is unaffected on all vendors. The overlay is only created when analysis is needed.
+
 **For NVIDIA users**:
 1. Enable Windows "Variable refresh rate" setting (Settings > Display > Graphics > Variable refresh rate: On)
 2. Use Passthrough Mode (Settings tab) to auto-hide overlay when specific games are running
+3. Use DWM Hook Mode — 3D LUT and tonemapping are overlay-free; overlay only activates for analysis
 
 See [GitHub Issue #1](https://github.com/sup3rflyer/DesktopLUT/issues/1) for technical details.
 
@@ -407,7 +429,7 @@ Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains v
 | Monitor hardware LUT | Zero latency, HDR | Limited RGB support, vendor lock-in |
 | ICC profiles | OS-integrated | 1D gamma + 3x3 only |
 | DWM_LUT | Full 3D LUT | Broken on 50-series, Win11 25H2 |
-| **DesktopLUT** | Full 3D LUT, no input lag | ~1 frame visual latency |
+| **DesktopLUT** | Full 3D LUT, DWM hook + overlay, no input lag | ~1 frame visual latency (overlay mode) |
 
 ## Developer Tools
 

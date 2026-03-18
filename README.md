@@ -11,13 +11,13 @@ DesktopLUT applies color corrections to the entire Windows desktop in real time 
 DesktopLUT uses the following layers, which can be enabled individually or together:
 
 1. **MHC (GPU-level)**
-   Installs color corrections directly at the graphics card driver level. This layer remains active even when DesktopLUT is not running.
+   Installs color corrections directly at the graphics card driver level via ICC profiles. Handles primaries mapping, white balance, grayscale correction, and desktop gamma. This layer remains active even when DesktopLUT is not running.
 
-2. **3D LUT**
-   Applies a volumetric color correction using a loaded .cube file.
+2. **3D LUT + Tonemapping (DWM hook)**
+   Applies a volumetric color correction using a loaded .cube file, plus ICtCp HDR tone mapping with dynamic peak detection. Injected directly into DWM — no overlay needed. Falls back to overlay if DWM hook is disabled.
 
-3. **Corrections**
-   Provides real-time adjustments including white point shift, grayscale correction with per-point RGB tuning, and HDR tone mapping.
+3. **Analysis overlay**
+   Real-time frame analysis (luminance, gamut, HDR histogram, timing stats). The only component that uses the Desktop Duplication overlay, activated on-demand via hotkey.
 
 The layers are applied in sequence within a single shader pass.
 
@@ -47,7 +47,8 @@ This addresses washed-out colors when using HDR.
 ### 2. Apply basic color correction using MHC
 1. Go to the **I. MHC** tab.
 2. Click **Detect** to read the monitor's reported color primaries (or enter values manually).
-3. Click **Apply**.
+3. Optionally adjust white balance and grayscale correction inline.
+4. Click **Apply**.
 
 This correction stays active at the GPU level.
 
@@ -56,26 +57,36 @@ This correction stays active at the GPU level.
 2. Generate a .cube file (33³ or 65³) with your calibration software while MHC is enabled.
 3. Load the file in the **II. 3D LUT** tab.
 
-### 4. Fine-tune with corrections
+With DWM Hook Mode enabled (default), the 3D LUT is applied directly inside DWM without needing the overlay.
+
+### 4. HDR tone mapping
 1. Go to the **III. Corrections** tab.
-2. Adjust white point if needed.
-3. Use the grayscale and HDR tone mapping options (see dedicated sections below).
-4. Use the analysis overlay (**Win + Shift + X**) to inspect results in real time.
+2. Enable tonemapping and select a curve (BT.2390, Soft Clip, Reinhard, etc.).
+3. Set source and target peak luminance values.
+4. Optionally enable dynamic peak detection for automatic adjustment.
+5. Use the analysis overlay (**Win + Shift + X**) to inspect results in real time.
+
+## DWM Hook Mode
+
+When enabled (default), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. This means:
+- No extra overlay window — 3D LUT and tonemapping are fully overlay-free
+- No Desktop Duplication capture overhead
+- VRR/G-Sync compatible (no overlay window to break it)
+- The overlay is only started for analysis (Win+Shift+X) or MHC editor preview
 
 ## Grayscale correction
 
-This is one of the most commonly used features in the Corrections layer. It allows precise neutral-tone adjustment across the full brightness range.
+Precise neutral-tone adjustment available as inline controls in the MHC tab (baked into ICC profiles for zero-latency GPU-level correction):
 
 - Choose between 10, 20, or 32 control points.
 - At each point you can independently tune the red, green, and blue channels.
 - Uses piecewise linear interpolation.
-- Separate handling for SDR (sRGB gamma space) and HDR (PQ domain, per-channel before ICtCp conversion).
-
-This enables accurate grayscale tracking without affecting hue or saturation.
+- Separate handling for SDR (sRGB gamma space) and HDR (PQ domain, per-channel Rec.2020).
+- Two-layer system: base calibration (from 1D cube/ICC) + fine-tuning (inline sliders).
 
 ## HDR tone mapping
 
-DesktopLUT includes built-in HDR tone mapping that applies to all desktop content (not limited to specific applications). It operates in the ICtCp color space, mapping only the luminance (I) channel to preserve hue and saturation.
+DesktopLUT includes built-in HDR tone mapping that applies to all desktop content. It operates in the ICtCp color space, mapping only the luminance (I) channel to preserve hue and saturation.
 
 Key features:
 - Multiple selectable curves, including BT.2390 (ITU-R standard), Soft Clip, Reinhard, BT.2446A, and Hard Clip.
@@ -104,13 +115,16 @@ Hotkeys can be disabled or remapped in the **Settings** tab.
 - Automatic start with Windows
 - Support for .cube, .icc, and .icm files
 - 3D LUT interpolation (trilinear or tetrahedral)
+- Real-time analysis overlay (luminance, gamut, HDR histogram, frame timing)
+- Auto frame buffer for smoother video playback (idle-triggered, zero-latency disengage on input)
 
 ## Limitations
 
-- Introduces approximately one frame of visual delay (input latency is unaffected)
+- Introduces approximately one frame of visual delay in overlay mode, zero in DWM hook mode (input latency is unaffected)
 - DRM-protected content (e.g., Netflix) appears black
 - Some UI elements (such as Start menu animations) may remain uncorrected
-- NVIDIA G-Sync may require MHC-only operation in certain configurations
+- NVIDIA G-Sync compatible in DWM Hook Mode (overlay only needed for analysis)
+- DWM Hook Mode is experimental and may need repair after Windows updates
 
 ## Building from source
 
@@ -119,9 +133,11 @@ Hotkeys can be disabled or remapped in the **Settings** tab.
 3. Open `DesktopLUT.sln`.
 4. Build the Release x64 configuration.
 
+222 tests with 17,111 assertions cover color math, MHC ICC profiles, EDID parsing, frame pacing, LUT loading, and settings persistence.
+
 ## Technical details
 
-For the full color pipeline, shader code, registry handling, and INI format, see **[REFERENCE.md](REFERENCE.md)**.
+For the full color pipeline, shader code, DWM hook architecture, and INI format, see **[REFERENCE.md](REFERENCE.md)**.
 
 ## License
 
