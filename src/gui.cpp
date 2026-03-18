@@ -1269,8 +1269,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     g_gui.monitorSettings[g_gui.currentMonitor].sdrPath = path;
                 }
+                SaveSettings();
                 if (g_gui.isRunning) {
-                    SaveSettings();
                     StopProcessing();
                     StartProcessing();
                 } else {
@@ -1284,8 +1284,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 g_gui.monitorSettings[g_gui.currentMonitor].sdrPath.clear();
             }
+            SaveSettings();
             if (g_gui.isRunning) {
-                SaveSettings();
                 StopProcessing();
                 StartProcessing();
             } else {
@@ -1299,8 +1299,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     g_gui.monitorSettings[g_gui.currentMonitor].hdrPath = path;
                 }
+                SaveSettings();
                 if (g_gui.isRunning) {
-                    SaveSettings();
                     StopProcessing();
                     StartProcessing();
                 } else {
@@ -1314,8 +1314,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrPath.clear();
             }
+            SaveSettings();
             if (g_gui.isRunning) {
-                SaveSettings();
                 StopProcessing();
                 StartProcessing();
             } else {
@@ -2080,6 +2080,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool enable = (SendMessage(g_gui.hwndSettingsDwmHook, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_dwmHookMode.store(enable);
                 SaveSettings();
+                // If processing is running, restart so the new mode takes effect immediately
+                if (g_gui.isRunning) {
+                    StopProcessing();
+                    StartProcessing();
+                }
             }
             return 0;
 
