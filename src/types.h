@@ -49,12 +49,11 @@ struct MovableAtomic {
 #define ID_HDR_CLEAR        107
 #define ID_APPLY            108
 #define ID_STOP             109
-#define ID_GAMMA_CHECK      110
 #define ID_STATUS           111
 #define ID_TETRAHEDRAL_CHECK 112
-#define ID_GAMMA_WHITELIST_BTN 113
 #define ID_TRAY_ICON        1
 #define WM_TRAYICON              (WM_USER + 1)
+#define WM_PROCESSING_EXITED     (WM_USER + 100)
 #define WM_MHC_PROFILE_REAPPLIED (WM_USER + 101)
 #define WM_HOTKEY_REGISTER       (WM_USER + 102)
 #define WM_SHADER_STATE_CHANGED  (WM_USER + 103)
@@ -735,8 +734,6 @@ struct GUIState {
     HWND hwndSdrPath = nullptr;
     HWND hwndHdrPath = nullptr;
     HWND hwndStatus = nullptr;
-    HWND hwndGammaCheck = nullptr;
-    HWND hwndGammaWhitelistBtn = nullptr;
     HWND hwndTetrahedralCheck = nullptr;
     HWND hwndApply = nullptr;
     HWND hwndStop = nullptr;

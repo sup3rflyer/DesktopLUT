@@ -41,8 +41,6 @@ bool IsAnalysisOverlayVisible();
 
 // GPU resources (per-monitor, but only used for primary)
 bool CreateAnalysisResources(MonitorContext* ctx);
-void ReleaseAnalysisResources(MonitorContext* ctx);
-
 // Per-frame dispatch (called from RenderMonitor)
 void DispatchAnalysisCompute(MonitorContext* ctx);
 

@@ -79,7 +79,7 @@ std::atomic<bool> g_framePacerLogEnabled{ false }; // Log frame pacer stats to C
 std::atomic<int> g_frameBufferIdleMs{ 3000 };  // Idle timeout before buffer engages (default: 3s)
 std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (default: off, experimental)
 int g_dwmHookWatchdogRetries = 0;              // Consecutive re-injection failures (GUI thread only)
-bool g_hookOnlyHotkeys = false;                // Hotkeys registered on GUI window (hook-only mode, GUI thread only)
+std::atomic<bool> g_hookOnlyHotkeys{ false };  // Hotkeys registered on GUI window (hook-only mode)
 
 // ============================================================================
 // Hotkey Settings

@@ -59,9 +59,6 @@ void UpdateGUIState() {
     EnableWindow(g_gui.hwndHdrPath, TRUE);
     EnableWindow(GetDlgItem(g_gui.hwndMain, ID_HDR_BROWSE), TRUE);
     EnableWindow(GetDlgItem(g_gui.hwndMain, ID_HDR_CLEAR), TRUE);
-    // Gamma checkbox stays enabled - can toggle while running
-    EnableWindow(g_gui.hwndGammaCheck, TRUE);
-
     // Enable button: enabled if not running, OR if running but settings changed
     bool enableApply = !g_gui.isRunning || (g_gui.isRunning && SettingsChanged());
     EnableWindow(g_gui.hwndApply, enableApply);
@@ -1183,8 +1180,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         LoadSettings();
 
         // Update checkboxes from loaded settings
-        SendMessage(g_gui.hwndGammaCheck, BM_SETCHECK,
-            g_desktopGammaMode ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessage(g_gui.hwndTetrahedralCheck, BM_SETCHECK,
             g_tetrahedralInterp ? BST_CHECKED : BST_UNCHECKED, 0);
 
@@ -1324,7 +1319,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         case ID_APPLY:
-            g_desktopGammaMode = (SendMessage(g_gui.hwndGammaCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             g_tetrahedralInterp = (SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             SaveSettings();
             if (g_gui.isRunning) {
@@ -1384,7 +1378,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
                     wchar_t buf[16];
                     GetWindowText(g_gui.hwndTonemapTarget, buf, 16);
-                    tm.targetPeakNits = (float)_wtof(buf);
+                    tm.targetPeakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
                     if (tm.targetPeakNits < 10.0f) tm.targetPeakNits = 10.0f;
                     if (tm.targetPeakNits > 10000.0f) tm.targetPeakNits = 10000.0f;
                     if (g_gui.isRunning) {
@@ -1417,7 +1411,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
                     wchar_t buf[16];
                     GetWindowText(g_gui.hwndTonemapSource, buf, 16);
-                    tm.sourcePeakNits = (float)_wtof(buf);
+                    tm.sourcePeakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
                     if (tm.sourcePeakNits < 10.0f) tm.sourcePeakNits = 10.0f;
                     if (tm.sourcePeakNits > 10000.0f) tm.sourcePeakNits = 10000.0f;
                     if (g_gui.isRunning) {
@@ -1458,7 +1452,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 wchar_t buf[16];
                 GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
-                float nits = (float)_wtof(buf);
+                float nits = (float)_wcstod_l(buf, nullptr, GetCLocale());
                 if (nits < 100.0f) nits = 100.0f;
                 if (nits > 10000.0f) nits = 10000.0f;
 
@@ -2150,7 +2144,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DwmHookReevaluateOverlay();
         return 0;
 
-    case WM_USER + 100:  // Processing thread exited
+    case WM_PROCESSING_EXITED:  // Processing thread exited
         // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
         // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
         if (g_dwmHookMode.load() && g_running.load()) {

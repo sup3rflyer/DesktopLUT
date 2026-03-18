@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <mutex>
+
+static std::recursive_mutex g_dwmInjectMutex;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -236,6 +239,7 @@ bool IsDwmHookActive()
 
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     SystemImpersonationGuard impGuard;
 
     // --- Elevate to SYSTEM ---
@@ -571,6 +575,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 
 std::wstring UninjectDwmHook()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     SystemImpersonationGuard impGuard;
 
     std::wcout << L"[DWM Hook] Uninjecting..." << std::endl;
@@ -691,6 +696,7 @@ static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
 
 bool CreateDwmHookSharedMemory()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     if (g_sharedMemPtr) return true;
 
     // NULL DACL = unrestricted access. Required because dwm.exe runs as SYSTEM and
@@ -729,6 +735,7 @@ bool CreateDwmHookSharedMemory()
 
 void UpdateDwmHookSharedConfig()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     if (!g_sharedMemPtr) return;
 
     DwmHookSharedConfig cfg = {};
@@ -803,6 +810,7 @@ void UpdateDwmHookSharedConfig()
 
 void CloseDwmHookSharedMemory()
 {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     if (g_sharedMemPtr) {
         UnmapViewOfFile(g_sharedMemPtr);
         g_sharedMemPtr = nullptr;

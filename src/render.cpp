@@ -157,14 +157,11 @@ bool CreatePeakDetectionResources(MonitorContext* ctx) {
 void UpdateHDRMetadata(MonitorContext* ctx) {
     if (!ctx->swapchain || !ctx->isHDREnabled) return;
 
-    const auto& tm = ctx->hdrColorCorrection.tonemap;
-
     // Determine our output peak brightness
     // If tonemapping enabled: we handle tonemapping, tell Windows max (10000) so it passes through
     // If tonemapping disabled: content is unclamped, tell Windows max so it applies system tonemapping based on MaxTML
     // In both cases, 10000 nits ensures Windows uses MaxTML setting to decide tonemapping behavior
     float contentPeakNits = 10000.0f;
-    (void)tm;  // Tonemapping settings no longer affect metadata
 
     // HDR10 metadata (static metadata)
     DXGI_HDR_METADATA_HDR10 metadata = {};
@@ -948,7 +945,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         cbData[5] = g_tetrahedralInterp.load() ? 1.0f : 0.0f; // Tetrahedral interpolation
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
-        const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
+        auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
         // Suppress primaries/grayscale/WB when MHC handles them
         bool shaderPrimaries = cc.primariesEnabled && !mhcPrim;
         bool shaderGrayscale = cc.grayscale.enabled && !mhcGs;
@@ -1011,7 +1008,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             if (useICtCp) {
                 // ICtCp mode: send precomputed delta offsets
                 // Compute if not yet valid (data changed since last compute)
-                auto& gsRef = const_cast<GrayscaleData&>(cc.grayscale);
+                auto& gsRef = cc.grayscale;
                 if (!gsRef.ictcpValid) ComputeGrayscaleICtCpOffsets(gsRef);
                 for (int i = 0; i < 32; i++) {
                     if (i < cc.grayscale.pointCount) {

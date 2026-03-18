@@ -503,6 +503,8 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
             ctx->analysisStagingBuffer[i] = nullptr;
         }
     }
+    ctx->analysisStagingIndex = 0;
+    ctx->analysisFrameCounter = 0;
     if (ctx->rtv) { ctx->rtv->Release(); ctx->rtv = nullptr; }
     if (ctx->swapchain) { ctx->swapchain->Release(); ctx->swapchain = nullptr; }
     // Keep hwnd - we'll reuse it

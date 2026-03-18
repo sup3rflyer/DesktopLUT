@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <atomic>
 #pragma comment (lib, "d3d11.lib")
 #pragma comment (lib, "d3dcompiler.lib")
 #pragma comment (lib, "dxgi.lib")
@@ -74,8 +75,12 @@ static const char* GetLogFilePath()
 			DWORD fmtResult = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, \
 				NULL, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPSTR)&error_message, 0, NULL); \
 			ss << ((fmtResult > 0 && error_message) ? error_message : "(FormatMessage failed)"); \
-			ss << " - DX COMPILE ERROR: " << (char*)error_interface->GetBufferPointer(); \
-			error_interface->Release(); \
+			if (error_interface) { \
+				ss << " - DX COMPILE ERROR: " << (char*)error_interface->GetBufferPointer(); \
+				error_interface->Release(); \
+			} else { \
+				ss << " - DX COMPILE ERROR: (no error blob)"; \
+			} \
 			if (error_message) LocalFree(error_message); \
 			log_to_file(ss.str().c_str()); \
 			throw std::exception(ss.str().c_str()); \
@@ -287,7 +292,7 @@ static HANDLE g_heartbeatEvent = NULL;
 static DWORD g_hostPid = 0;
 static HANDLE g_hostMonitorThread = NULL;
 static HANDLE g_hostMonitorStopEvent = NULL;
-static volatile bool g_hookReverted = false;  // Set when host dies, prevents double-revert in DLL_PROCESS_DETACH
+static std::atomic<bool> g_hookReverted{false};  // Set when host dies, prevents double-revert in DLL_PROCESS_DETACH
 
 // --- Shared memory IPC: live parameter updates from host ---
 static HANDLE g_sharedMemHandle = NULL;
@@ -537,7 +542,8 @@ float TonemapSoftClip_PQ(float I, float pqSrcPeak, float pqTgtPeak, float target
 	if (I <= pqKnee) return I;
 	float overshoot = I - pqKnee;
 	float headroom = pqTgtPeak - pqKnee;
-	return pqKnee + headroom * (1.0 - exp(-overshoot / headroom));
+	float srcRange = pqSrcPeak - pqKnee;
+	return pqKnee + headroom * (1.0 - exp(-overshoot / srcRange));
 }
 
 float TonemapReinhard_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
@@ -545,7 +551,8 @@ float TonemapReinhard_PQ(float I, float pqSrcPeak, float pqTgtPeak, float target
 	if (I <= pqKnee) return I;
 	float overshoot = I - pqKnee;
 	float headroom = pqTgtPeak - pqKnee;
-	return pqKnee + headroom * overshoot / (overshoot + headroom);
+	float srcRange = pqSrcPeak - pqKnee;
+	return pqKnee + headroom * overshoot / (overshoot + srcRange);
 }
 
 float TonemapHardClip_PQ(float I, float pqTgtPeak) {
@@ -892,6 +899,8 @@ static float LinearToPQ(float L) {
 	return powf((c1_ + c2_ * Ym) / (1.0f + c3_ * Ym), m2_);
 }
 
+static void* g_primaryHdrContext = NULL;  // Cached primary HDR context for 25H2
+
 static void UpdateLocalTonemapFromShared() {
 	if (!g_sharedConfig) return;
 	if (g_sharedConfig->version == g_localConfigVersion) return;
@@ -900,9 +909,13 @@ static void UpdateLocalTonemapFromShared() {
 	memcpy(&local, (const void*)g_sharedConfig, sizeof(local));
 	g_localConfigVersion = local.version;
 
-	// Update monitor HDR states from shared memory
+	// Clamp numMonitors to prevent OOB from shared memory
+	uint32_t numMons = (local.numMonitors < MAX_DWM_HOOK_MONITORS) ? local.numMonitors : MAX_DWM_HOOK_MONITORS;
+
+	// Update monitor HDR states from shared memory — reset cached context on state change
+	g_primaryHdrContext = NULL;
 	g_numMonitorHdrStates = 0;
-	for (uint32_t i = 0; i < local.numMonitors && g_numMonitorHdrStates < 16; i++) {
+	for (uint32_t i = 0; i < numMons && g_numMonitorHdrStates < 16; i++) {
 		auto& mc = local.monitors[i];
 		auto& ms = g_monitorHdrStates[g_numMonitorHdrStates];
 		ms.left = mc.left;
@@ -916,7 +929,7 @@ static void UpdateLocalTonemapFromShared() {
 
 	// Update local tonemap params
 	g_numLocalTonemap = 0;
-	for (uint32_t i = 0; i < local.numMonitors && g_numLocalTonemap < MAX_DWM_HOOK_MONITORS; i++) {
+	for (uint32_t i = 0; i < numMons && g_numLocalTonemap < MAX_DWM_HOOK_MONITORS; i++) {
 		auto& mc = local.monitors[i];
 		auto& tp = g_localTonemap[g_numLocalTonemap];
 		bool prevDynamic = tp.dynamicPeak;
@@ -931,7 +944,7 @@ static void UpdateLocalTonemapFromShared() {
 		tp.pqTargetPeak = LinearToPQ(mc.targetPeakNits / 10000.0f);
 		if (tp.dynamicPeak != prevDynamic) {
 			char msg[128];
-			sprintf(msg, "Tonemap update: mon(%d,%d) dynamic=%d src=%.0f tgt=%.0f pqSrc=%.4f pqTgt=%.4f",
+			snprintf(msg, sizeof(msg), "Tonemap update: mon(%d,%d) dynamic=%d src=%.0f tgt=%.0f pqSrc=%.4f pqTgt=%.4f",
 				tp.left, tp.top, tp.dynamicPeak ? 1 : 0,
 				tp.sourcePeakNits, tp.targetPeakNits, tp.pqSourcePeak, tp.pqTargetPeak);
 			log_to_file(msg);
@@ -1127,10 +1140,6 @@ bool AddLUTs(char* folder)
 int numLutTargets;
 void** lutTargets;
 
-
-
-static void* g_primaryHdrContext = NULL;
-
 bool IsLUTActive(void* target)
 {
 	for (int i = 0; i < numLutTargets; i++)
@@ -1277,6 +1286,8 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr)
 	// No LUT staged for this monitor position — skip LUT application
 	return NULL;
 }
+
+void UninitializeStuff();  // Forward declaration for error cleanup
 
 void InitializeStuff(ID3D11Device* inputDevice)
 {
@@ -1543,10 +1554,7 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << ": " << ex.what() << std::endl;
 		log_to_file(ex_message.str().c_str());
-		RELEASE_IF_NOT_NULL(device)
-		RELEASE_IF_NOT_NULL(deviceContext)
-		device = nullptr;
-		deviceContext = nullptr;
+		UninitializeStuff();
 		return;
 	}
 	catch (...)
@@ -1554,10 +1562,7 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << ": (unknown)" << std::endl;
 		log_to_file(ex_message.str().c_str());
-		RELEASE_IF_NOT_NULL(device)
-		RELEASE_IF_NOT_NULL(deviceContext)
-		device = nullptr;
-		deviceContext = nullptr;
+		UninitializeStuff();
 		return;
 	}
 }
@@ -1650,7 +1655,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			int dbgLeft = 0, dbgTop = 0;
 			GetMonitorPositionFromContext(cOverlayContext, dbgLeft, dbgTop);
 			char msg[256];
-			sprintf(msg, "RenderLUT: ctx=%p pos=(%d,%d) fmt=%d size=%ux%u colorMode=%d",
+			snprintf(msg, sizeof(msg), "RenderLUT: ctx=%p pos=(%d,%d) fmt=%d size=%ux%u colorMode=%d",
 				cOverlayContext, dbgLeft, dbgTop, (int)newBackBufferDesc.Format,
 				newBackBufferDesc.Width, newBackBufferDesc.Height, colorMode);
 			log_to_file(msg);
@@ -1800,12 +1805,39 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		cb.tonemapEnabled = tmEnabled ? 1 : 0;
 		cb.tonemapCurve = tmEnabled ? (int)tp->curve : 0;
 		cb.tonemapTargetNits = tmEnabled ? tp->targetPeakNits : 1000.0f;
-		cb.pqSourcePeak = tmEnabled ? tp->pqSourcePeak : 0.0f;
 		cb.pqTargetPeak = tmEnabled ? tp->pqTargetPeak : 0.0f;
 		cb.tonemapDynamic = (tmEnabled && tp->dynamicPeak) ? 1 : 0;
+		// Dynamic mode: floor = target peak (or raised floor for BT.2390/BT.2446A)
+		// Static mode: PQ of user-specified source peak
+		if (tmEnabled && tp->dynamicPeak) {
+			float floorNits = tp->targetPeakNits;
+			if (tp->curve == DWMHOOK_TONEMAP_BT2390 || tp->curve == DWMHOOK_TONEMAP_BT2446A) {
+				float tgtClamped = tp->targetPeakNits > 400.0f ? tp->targetPeakNits : 400.0f;
+				float t = (tgtClamped - 400.0f) / 3600.0f;
+				if (t > 1.0f) t = 1.0f;
+				floorNits = tp->targetPeakNits * (1.0f + t * 0.5f);
+			}
+			cb.pqSourcePeak = LinearToPQ(floorNits / 10000.0f);
+		} else {
+			cb.pqSourcePeak = tmEnabled ? tp->pqSourcePeak : 0.0f;
+		}
 		cb.hasLut = lut ? 1 : 0;
 		cb.pad1 = 0.0f;
 		cb.pad2 = 0.0f;
+
+		// Diagnostic: periodic logging of tonemap CB state (no GPU readback — DWM can't tolerate stalls)
+		if (tmEnabled) {
+			static int tonemapDiagCounter = 0;
+			if (++tonemapDiagCounter >= 120) {
+				tonemapDiagCounter = 0;
+				char diagMsg[256];
+				snprintf(diagMsg, sizeof(diagMsg), "TM DIAG: tmEn=%d dyn=%d curve=%d pqSrc=%.4f pqTgt=%.4f tgtNits=%.0f srcNits=%.0f csOK=%d uavOK=%d",
+					cb.tonemapEnabled, cb.tonemapDynamic, cb.tonemapCurve,
+					cb.pqSourcePeak, cb.pqTargetPeak, cb.tonemapTargetNits,
+					tp->sourcePeakNits, peakDetectCS ? 1 : 0, peakUAV ? 1 : 0);
+				log_to_file(diagMsg);
+			}
+		}
 
 		D3D11_MAPPED_SUBRESOURCE resource;
 		EXECUTE_WITH_LOG(deviceContext->Map((ID3D11Resource*)constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
@@ -1871,7 +1903,7 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 					if (SUCCEEDED(output->GetDesc(&desc))) {
 						CacheContextPosition(cOverlayContext, desc.DesktopCoordinates.left, desc.DesktopCoordinates.top);
 						char msg[256];
-						sprintf(msg, "Cached context %p position from swapchain: (%ld,%ld) %ldx%ld",
+						snprintf(msg, sizeof(msg), "Cached context %p position from swapchain: (%ld,%ld) %ldx%ld",
 							cOverlayContext, desc.DesktopCoordinates.left, desc.DesktopCoordinates.top,
 							desc.DesktopCoordinates.right - desc.DesktopCoordinates.left,
 							desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
@@ -1880,7 +1912,7 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 					output->Release();
 				} else {
 					char msg[128];
-					sprintf(msg, "GetContainingOutput failed for context %p", cOverlayContext);
+					snprintf(msg, sizeof(msg), "GetContainingOutput failed for context %p", cOverlayContext);
 					log_to_file(msg);
 				}
 				if (numCached < 16) cachedContexts[numCached++] = cOverlayContext;
@@ -1961,7 +1993,7 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 					auto& ms = g_monitorHdrStates[matchIndices[0]];
 					CacheContextPosition(cOverlayContext, ms.left, ms.top);
 					char msg[256];
-					sprintf(msg, "25H2: Cached ctx %p pos (%d,%d) unique match (%ux%u fmt=%d)",
+					snprintf(msg, sizeof(msg), "25H2: Cached ctx %p pos (%d,%d) unique match (%ux%u fmt=%d)",
 						cOverlayContext, ms.left, ms.top, bbDesc.Width, bbDesc.Height, (int)bbDesc.Format);
 					log_to_file(msg);
 				} else if (numMatches > 1) {
@@ -2004,14 +2036,14 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 					auto& ms = g_monitorHdrStates[matchIndices[bestIdx]];
 					CacheContextPosition(cOverlayContext, ms.left, ms.top);
 					char msg[256];
-					sprintf(msg, "25H2: Cached ctx %p pos (%d,%d) %s (bpc=%u, fp16=%d, %d candidates)",
+					snprintf(msg, sizeof(msg), "25H2: Cached ctx %p pos (%d,%d) %s (bpc=%u, fp16=%d, %d candidates)",
 						cOverlayContext, ms.left, ms.top,
 						bpcVaries ? "bpc-match" : "order-match",
 						ms.bpc, isFP16 ? 1 : 0, numMatches);
 					log_to_file(msg);
 				} else {
 					char msg[128];
-					sprintf(msg, "25H2: No output match for ctx %p (%ux%u fmt=%d)",
+					snprintf(msg, sizeof(msg), "25H2: No output match for ctx %p (%ux%u fmt=%d)",
 						cOverlayContext, bbDesc.Width, bbDesc.Height, (int)bbDesc.Format);
 					log_to_file(msg);
 				}
@@ -2100,42 +2132,40 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 	// Check for shared memory updates (live tonemap param changes from host)
 	UpdateLocalTonemapFromShared();
 
-	if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig_24h2 || isWindows11_24h2 || isWindows11_25h2)
 	{
-			LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
-			std::stringstream overlay_swapchain_message;
-			overlay_swapchain_message << "OverlaySwapChain address: 0x" << std::hex << overlaySwapChain
-				<< " -- windows 11 25h2: " << isWindows11_25h2
-				<< " -- windows 11 24h2: " << isWindows11_24h2
-				<< " -- " << "windows 11: " << isWindows11;
-			LOG_ONLY_ONCE(overlay_swapchain_message.str().c_str())
+		LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
+		std::stringstream overlay_swapchain_message;
+		overlay_swapchain_message << "OverlaySwapChain address: 0x" << std::hex << overlaySwapChain
+			<< " -- windows 11 25h2: " << isWindows11_25h2
+			<< " -- windows 11 24h2: " << isWindows11_24h2
+			<< " -- " << "windows 11: " << isWindows11;
+		LOG_ONLY_ONCE(overlay_swapchain_message.str().c_str())
 
-			if (isWindows11_25h2)
+		if (isWindows11_25h2)
+		{
+			bool success = false;
+
+			ID3D11Texture2D* backBuffer = GetBackBuffer_25H2(overlaySwapChain);
+			if (backBuffer)
 			{
-				bool success = false;
-
-				ID3D11Texture2D* backBuffer = GetBackBuffer_25H2(overlaySwapChain);
-				if (backBuffer)
+				if (ApplyLUTDirect(self, backBuffer, rectVec->start, rectVec->end - rectVec->start))
 				{
-					if (ApplyLUTDirect(self, backBuffer, rectVec->start, rectVec->end - rectVec->start))
-					{
-						SetLUTActive(self);
-						success = true;
-					}
-					backBuffer->Release();
+					SetLUTActive(self);
+					success = true;
 				}
-
-				// No fallback probing — ApplyLUTDirect returning false means
-				// this monitor has no LUT configured, not a failure to try harder.
-
-				if (!success)
-				{
-					UnsetLUTActive(self);
-				}
+				backBuffer->Release();
 			}
-			else
-			{
 
+			// No fallback probing — ApplyLUTDirect returning false means
+			// this monitor has no LUT configured, not a failure to try harder.
+
+			if (!success)
+			{
+				UnsetLUTActive(self);
+			}
+		}
+		else
+		{
 			bool hwProtected = false;
 			if (isWindows11_24h2)
 				hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_24h2);
@@ -2185,7 +2215,7 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 					UnsetLUTActive(self);
 				}
 			}
-			}
+		}
 	}
 
 	return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
@@ -2231,7 +2261,7 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 					IOverlaySwapChain_IDXGISwapChain_offset);
 			}
 
-			if (ApplyLUT(self, swapChain, rectVec->start, rectVec->end - rectVec->start))
+			if (swapChain != NULL && ApplyLUT(self, swapChain, rectVec->start, rectVec->end - rectVec->start))
 			{
 				LOG_ONLY_ONCE("Setting LUTactive")
 				SetLUTActive(self);
@@ -2352,8 +2382,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		{
 			log_to_file("DLL_PROCESS_ATTACH: DllMain entered");
 			HMODULE dwmcore = GetModuleHandle(L"dwmcore.dll");
+			if (!dwmcore) {
+				log_to_file("ERROR: dwmcore.dll not found — cannot set up hooks");
+				return FALSE;
+			}
 			MODULEINFO moduleInfo;
-			GetModuleInformation(GetCurrentProcess(), dwmcore, &moduleInfo, sizeof moduleInfo);
+			if (!GetModuleInformation(GetCurrentProcess(), dwmcore, &moduleInfo, sizeof moduleInfo)) {
+				log_to_file("ERROR: GetModuleInformation failed for dwmcore.dll");
+				return FALSE;
+			}
 
 			OSVERSIONINFOEX versionInfo;
 			ZeroMemory(&versionInfo, sizeof OSVERSIONINFOEX);
@@ -2410,7 +2447,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 								ms.bpc = (UINT)bpc; ms.isHdr = (hdr != 0);
 
 								char msg[256];
-								sprintf(msg, "monitors.dat: (%d,%d) %s bpc=%u %ux%u",
+								snprintf(msg, sizeof(msg), "monitors.dat: (%d,%d) %s bpc=%u %ux%u",
 									left, top, ms.isHdr ? "HDR" : "SDR", ms.bpc, ms.width, ms.height);
 								log_to_file(msg);
 
@@ -2420,7 +2457,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					}
 					fclose(mf);
 					char msg[64];
-					sprintf(msg, "Loaded %d monitors from monitors.dat", g_numMonitorHdrStates);
+					snprintf(msg, sizeof(msg), "Loaded %d monitors from monitors.dat", g_numMonitorHdrStates);
 					log_to_file(msg);
 				} else {
 					log_to_file("WARNING: monitors.dat not found, position matching disabled");
@@ -2533,9 +2570,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 
 						const unsigned char flipMatch[] = { 0x48, 0x8D, 0x05 };
+						unsigned char* imageEnd = (unsigned char*)dwmcore + moduleInfo.SizeOfImage;
 						for (int j = 0; j < 500; j++) {
 							unsigned char* fAddr = address + j;
-							if (!memcmp(fAddr, flipMatch, 3)) {
+							if (fAddr + sizeof(flipMatch) > imageEnd) break;
+							if (!memcmp(fAddr, flipMatch, sizeof(flipMatch))) {
 								CCompSwapChain_IsCandidateIndependentFlipCompatible_orig = (CCompSwapChain_IsCandidateIndependentFlipCompatible_t*)fAddr;
 								break;
 							}
@@ -2692,29 +2731,45 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				(COverlayContext_Present_orig_24h2 && COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 && COverlayContext_OverlaysEnabled_orig)))
 
 			{
-				MH_Initialize();
+				if (MH_Initialize() != MH_OK) {
+				log_to_file("ERROR: MH_Initialize failed");
+				return FALSE;
+			}
+			MH_STATUS mhStatus;
 				if (!isWindows11_24h2 && !isWindows11_25h2)
-					MH_CreateHook((PVOID)COverlayContext_Present_orig, (PVOID)COverlayContext_Present_hook,
+					mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig, (PVOID)COverlayContext_Present_hook,
 								  (PVOID*)&COverlayContext_Present_orig);
 				else
-					MH_CreateHook((PVOID)COverlayContext_Present_orig_24h2, (PVOID)COverlayContext_Present_hook_24h2,
+					mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig_24h2, (PVOID)COverlayContext_Present_hook_24h2,
 						(PVOID*)&COverlayContext_Present_orig_24h2);
+				if (mhStatus != MH_OK) {
+					log_to_file("ERROR: MH_CreateHook failed for COverlayContext::Present");
+					MH_Uninitialize();
+					return FALSE;
+				}
 
 				if (!isWindows11_24h2 && !isWindows11_25h2)
-					MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
+					mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
 								  (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook,
 								  (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig);
 				else
-					MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2,
+					mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2,
 						(PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2,
 						(PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2);
+				if (mhStatus != MH_OK) {
+					log_to_file("ERROR: MH_CreateHook failed for IsCandidateDirectFlipCompatible");
+				}
 
 				if (CWindowContext_IsCandidateDirectFlipCompatbile_orig)
 				{
-					MH_CreateHook((PVOID)CWindowContext_IsCandidateDirectFlipCompatbile_orig,
+					mhStatus = MH_CreateHook((PVOID)CWindowContext_IsCandidateDirectFlipCompatbile_orig,
 						(PVOID)CWindowContext_IsCandidateDirectFlipCompatbile_hook,
 						(PVOID*)&CWindowContext_IsCandidateDirectFlipCompatbile_orig);
-					LOG_ONLY_ONCE("Hooked CWindowContext::IsCandidateDirectFlipCompatible")
+					if (mhStatus == MH_OK) {
+						LOG_ONLY_ONCE("Hooked CWindowContext::IsCandidateDirectFlipCompatible")
+					} else {
+						LOG_ONLY_ONCE("FAILED to hook CWindowContext::IsCandidateDirectFlipCompatible")
+					}
 				}
 				else {
 					LOG_ONLY_ONCE("FAILED to find CWindowContext::IsCandidateDirectFlipCompatible")
@@ -2722,10 +2777,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (CCompSwapChain_IsCandidateIndependentFlipCompatible_orig)
 				{
-					MH_CreateHook((PVOID)CCompSwapChain_IsCandidateIndependentFlipCompatible_orig,
+					mhStatus = MH_CreateHook((PVOID)CCompSwapChain_IsCandidateIndependentFlipCompatible_orig,
 						(PVOID)CCompSwapChain_IsCandidateIndependentFlipCompatible_hook,
 						(PVOID*)&CCompSwapChain_IsCandidateIndependentFlipCompatible_orig);
-					LOG_ONLY_ONCE("Hooked CCompSwapChain::IsCandidateIndependentFlipCompatible")
+					if (mhStatus == MH_OK) {
+						LOG_ONLY_ONCE("Hooked CCompSwapChain::IsCandidateIndependentFlipCompatible")
+					} else {
+						LOG_ONLY_ONCE("FAILED to hook CCompSwapChain::IsCandidateIndependentFlipCompatible")
+					}
 				}
 				else {
 					LOG_ONLY_ONCE("FAILED to find CCompSwapChain::IsCandidateIndependentFlipCompatible")
@@ -2733,10 +2792,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (CCompSwapChain_IsCandidateDirectFlipCompatbile_orig)
 				{
-					MH_CreateHook((PVOID)CCompSwapChain_IsCandidateDirectFlipCompatbile_orig,
+					mhStatus = MH_CreateHook((PVOID)CCompSwapChain_IsCandidateDirectFlipCompatbile_orig,
 						(PVOID)CCompSwapChain_IsCandidateDirectFlipCompatbile_hook,
 						(PVOID*)&CCompSwapChain_IsCandidateDirectFlipCompatbile_orig);
-					LOG_ONLY_ONCE("Hooked CCompSwapChain::IsCandidateDirectFlipCompatible")
+					if (mhStatus == MH_OK) {
+						LOG_ONLY_ONCE("Hooked CCompSwapChain::IsCandidateDirectFlipCompatible")
+					} else {
+						LOG_ONLY_ONCE("FAILED to hook CCompSwapChain::IsCandidateDirectFlipCompatible")
+					}
 				}
 				else {
 					LOG_ONLY_ONCE("FAILED to find CCompSwapChain::IsCandidateDirectFlipCompatible")
@@ -2744,10 +2807,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (CCompVisual_IsCandidateForPromotion_orig)
 				{
-					MH_CreateHook((PVOID)CCompVisual_IsCandidateForPromotion_orig,
+					mhStatus = MH_CreateHook((PVOID)CCompVisual_IsCandidateForPromotion_orig,
 						(PVOID)CCompVisual_IsCandidateForPromotion_hook,
 						(PVOID*)&CCompVisual_IsCandidateForPromotion_orig);
-					LOG_ONLY_ONCE("Hooked CCompVisual::IsCandidateForPromotion")
+					if (mhStatus == MH_OK) {
+						LOG_ONLY_ONCE("Hooked CCompVisual::IsCandidateForPromotion")
+					} else {
+						LOG_ONLY_ONCE("FAILED to hook CCompVisual::IsCandidateForPromotion")
+					}
 				}
 				else {
 					LOG_ONLY_ONCE("FAILED to find CCompVisual::IsCandidateForPromotion")
@@ -2765,7 +2832,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
 				              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
-				MH_EnableHook(MH_ALL_HOOKS);
+				if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+					log_to_file("ERROR: MH_EnableHook failed");
+					MH_Uninitialize();
+					return FALSE;
+				}
 				LOG_ONLY_ONCE("DWM HOOK DLL INITIALIZATION. START LOGGING")
 
 				// Create heartbeat event so host can detect hook is active
@@ -2816,9 +2887,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			SetEvent(g_hostMonitorStopEvent);
 		}
 		if (g_hostMonitorThread) {
-			// Short timeout to avoid deadlock under loader lock
-			if (WaitForSingleObject(g_hostMonitorThread, 5000) == WAIT_TIMEOUT) {
-				log_to_file("WARNING: Host monitor thread did not exit in 5s");
+			// Non-blocking check — cannot safely wait under loader lock
+			if (WaitForSingleObject(g_hostMonitorThread, 0) == WAIT_TIMEOUT) {
+				log_to_file("WARNING: Host monitor thread still running at detach — closing handle");
 			}
 			CloseHandle(g_hostMonitorThread);
 			g_hostMonitorThread = NULL;

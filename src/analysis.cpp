@@ -512,16 +512,6 @@ bool CreateAnalysisResources(MonitorContext* ctx) {
     return true;
 }
 
-void ReleaseAnalysisResources(MonitorContext* ctx) {
-    if (ctx->analysisUAV) { ctx->analysisUAV->Release(); ctx->analysisUAV = nullptr; }
-    if (ctx->analysisBuffer) { ctx->analysisBuffer->Release(); ctx->analysisBuffer = nullptr; }
-    for (int i = 0; i < 2; i++) {
-        if (ctx->analysisStagingBuffer[i]) {
-            ctx->analysisStagingBuffer[i]->Release();
-            ctx->analysisStagingBuffer[i] = nullptr;
-        }
-    }
-}
 
 void DispatchAnalysisCompute(MonitorContext* ctx) {
     if (!g_analysisCS || !g_analysisCB || !ctx->captureSRV) return;

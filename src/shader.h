@@ -322,9 +322,12 @@ float TonemapSoftClip_PQ(float I, float pqSourcePeak, float pqTargetPeak, float 
 
     float overshoot = I - pqKnee;
     float headroom = pqTargetPeak - pqKnee;
+    float srcRange = pqSourcePeak - pqKnee;
 
-    // Exponential compression in PQ space
-    return pqKnee + headroom * (1.0f - exp(-overshoot / headroom));
+    // Exponential compression in PQ space, normalized by source range
+    // When source ≈ target: srcRange ≈ headroom, identical to previous behavior
+    // When source >> target: gentler decay spread over wider range
+    return pqKnee + headroom * (1.0f - exp(-overshoot / srcRange));
 }
 
 // Reinhard - PQ native (hyperbolic compression)
@@ -336,9 +339,12 @@ float TonemapReinhard_PQ(float I, float pqSourcePeak, float pqTargetPeak, float 
 
     float overshoot = I - pqKnee;
     float headroom = pqTargetPeak - pqKnee;
+    float srcRange = pqSourcePeak - pqKnee;
 
-    // Reinhard hyperbolic compression in PQ space
-    return pqKnee + headroom * overshoot / (overshoot + headroom);
+    // Reinhard hyperbolic compression in PQ space, normalized by source range
+    // When source ≈ target: srcRange ≈ headroom, identical to previous behavior
+    // When source >> target: compression spread over wider range
+    return pqKnee + headroom * overshoot / (overshoot + srcRange);
 }
 
 // Hard clip - PQ native (trivial)
