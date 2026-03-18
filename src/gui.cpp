@@ -253,6 +253,20 @@ void RemoveTrayIcon() {
     Shell_NotifyIcon(NIM_DELETE, &g_gui.nid);
 }
 
+void UpdateTrayIcon(bool active) {
+    HICON hIcon = LoadIcon(GetModuleHandle(nullptr),
+        MAKEINTRESOURCE(active ? IDI_APPICON_ACTIVE : IDI_APPICON));
+    g_gui.nid.hIcon = hIcon;
+    wcscpy_s(g_gui.nid.szTip, active ? L"DesktopLUT (Active)" : L"DesktopLUT");
+    Shell_NotifyIcon(NIM_MODIFY, &g_gui.nid);
+
+    // Also update the taskbar button icon
+    if (g_gui.hwndMain) {
+        SendMessage(g_gui.hwndMain, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+        SendMessage(g_gui.hwndMain, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+    }
+}
+
 void ShowTrayMenu(HWND hwnd) {
     POINT pt;
     GetCursorPos(&pt);
@@ -1332,6 +1346,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.enabled = enabled;
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+                    DwmHookReevaluateOverlay();
                 } else if (enabled) {
                     StartProcessing();
                 }
@@ -1474,9 +1489,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // 2. Display HDR/SDR mode must match the section being edited
                 bool livePreview = false;
                 bool startedForPreview = false;
+                bool startedOverlayForPreview = false;
 
                 // Check mode match against running monitors
-                if (g_gui.isRunning) {
+                if (g_gui.isRunning && g_gui.processingThread.joinable()) {
                     for (const auto& ctx : g_monitors) {
                         if (ctx.index == monIdx) {
                             livePreview = (ctx.isHDREnabled == isHDR);
@@ -1485,7 +1501,31 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
 
-                // If not running but mode could match, try starting processing
+                // DWM hook mode running without overlay — start overlay for preview
+                if (g_gui.isRunning && !g_gui.processingThread.joinable() && g_dwmHookMode.load()) {
+                    g_mhcEditDialogOpen.store(true);  // Set early so HasActiveShaderCorrections() returns true
+                    DwmHookReevaluateOverlay();
+                    if (g_gui.processingThread.joinable()) {
+                        startedOverlayForPreview = true;
+                        // Wait briefly for monitor contexts to be populated
+                        Sleep(200);
+                        for (const auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                livePreview = (ctx.isHDREnabled == isHDR);
+                                break;
+                            }
+                        }
+                        if (!livePreview) {
+                            g_mhcEditDialogOpen.store(false);
+                            DwmHookReevaluateOverlay();
+                            startedOverlayForPreview = false;
+                        }
+                    } else {
+                        g_mhcEditDialogOpen.store(false);
+                    }
+                }
+
+                // If not running at all, try starting processing
                 if (!g_gui.isRunning) {
                     auto& ms = g_gui.monitorSettings[monIdx];
                     auto& cc = isHDR ? ms.hdrColorCorrection : ms.sdrColorCorrection;
@@ -1562,6 +1602,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Stop temporary processing if we started it for preview
                 if (startedForPreview) {
                     StopProcessing();
+                }
+                // Stop overlay thread if we started it just for DWM hook preview
+                if (startedOverlayForPreview) {
+                    DwmHookReevaluateOverlay();
                 }
                 SaveSettings();
                 UpdateMhcInfoDisplay(monIdx, isHDR);
@@ -1694,6 +1738,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                   : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 HWND hwndEn = isHDR ? g_gui.hwndHdrMhcGsEnable : g_gui.hwndMhcGsEnable;
                 mhc.correctionGrayscale.enabled = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                // Initialize points to identity on first enable if empty
+                if (mhc.correctionGrayscale.enabled && mhc.correctionGrayscale.points.empty()) {
+                    if (isHDR) mhc.correctionGrayscale.initLinearPQ();
+                    else mhc.correctionGrayscale.initLinear();
+                }
                 RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
                 SaveSettings();
             }
@@ -1727,19 +1776,151 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_HDR_GS_EDIT:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_GS_EDIT);
-                auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
+                int monIdx = g_gui.currentMonitor;
+                auto& mhc = isHDR ? g_gui.monitorSettings[monIdx].hdrMHC
+                                  : g_gui.monitorSettings[monIdx].sdrMHC;
+                auto& otherMhc = isHDR ? g_gui.monitorSettings[monIdx].sdrMHC
+                                       : g_gui.monitorSettings[monIdx].hdrMHC;
                 auto& gs = mhc.correctionGrayscale;
                 if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
                     gs.points.resize(gs.pointCount);
                     if (isHDR) gs.initLinearPQ(); else gs.initLinear();
                 }
-                // Live update callback: regenerate MHC profile on each edit
-                int monIdx = g_gui.currentMonitor;
-                ShowGrayscaleEditor(hwnd, gs, isHDR, [monIdx, isHDR]() {
-                    RegenerateMhcIfActive(monIdx, isHDR);
-                    SaveSettings();
+
+                // Start overlay for live preview (same pattern as MHC Edit dialog)
+                bool livePreview = false;
+                bool startedForPreview = false;
+                bool startedOverlayForPreview = false;
+
+                if (g_gui.isRunning && g_gui.processingThread.joinable()) {
+                    for (const auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            livePreview = (ctx.isHDREnabled == isHDR);
+                            break;
+                        }
+                    }
+                }
+
+                // DWM hook running without overlay — start overlay for preview
+                if (g_gui.isRunning && !g_gui.processingThread.joinable() && g_dwmHookMode.load()) {
+                    g_mhcEditDialogOpen.store(true);
+                    DwmHookReevaluateOverlay();
+                    if (g_gui.processingThread.joinable()) {
+                        startedOverlayForPreview = true;
+                        Sleep(200);
+                        for (const auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                livePreview = (ctx.isHDREnabled == isHDR);
+                                break;
+                            }
+                        }
+                        if (!livePreview) {
+                            g_mhcEditDialogOpen.store(false);
+                            DwmHookReevaluateOverlay();
+                            startedOverlayForPreview = false;
+                        }
+                    } else {
+                        g_mhcEditDialogOpen.store(false);
+                    }
+                }
+
+                // Not running at all — start processing for preview
+                if (!g_gui.isRunning) {
+                    auto& cc = isHDR ? g_gui.monitorSettings[monIdx].hdrColorCorrection
+                                     : g_gui.monitorSettings[monIdx].sdrColorCorrection;
+                    bool origPrimEnabled = cc.primariesEnabled;
+                    cc.primariesEnabled = true;
+                    StartProcessing();
+                    cc.primariesEnabled = origPrimEnabled;
+                    if (g_gui.isRunning) {
+                        startedForPreview = true;
+                        for (const auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                livePreview = (ctx.isHDREnabled == isHDR);
+                                break;
+                            }
+                        }
+                        if (!livePreview) {
+                            StopProcessing();
+                            startedForPreview = false;
+                        }
+                    }
+                }
+
+                // Remove ICC profile and clear MHC flags for shader preview
+                bool hadProfile = mhc.enabled && !mhc.profileName.empty();
+                std::wstring savedProfileName = mhc.profileName;   // saved for restore
+                bool savedEnabled = mhc.enabled;                    // saved for restore
+                std::wstring otherProfileName;
+                bool otherWasEnabled = false;
+                if (livePreview) {
+                    if (hadProfile) {
+                        DisplayInfo displayInfo;
+                        if (GetDisplayInfoForMonitor(monIdx, displayInfo)) {
+                            RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+                        }
+                    }
+                    otherWasEnabled = otherMhc.enabled;
+                    otherProfileName = otherMhc.profileName;
+                    mhc.enabled = false;
+                    mhc.profileName.clear();
+                    otherMhc.enabled = false;
+                    otherMhc.profileName.clear();
+
+                    for (auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            ctx.sdrMhcPrimariesActive = false;
+                            ctx.sdrMhcGrayscaleActive = false;
+                            ctx.hdrMhcPrimariesActive = false;
+                            ctx.hdrMhcGrayscaleActive = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (!startedOverlayForPreview)
+                    g_mhcEditDialogOpen.store(true);
+
+                // Live preview callback: push correction grayscale + MHC primaries to shader
+                ShowGrayscaleEditor(hwnd, gs, isHDR, [monIdx, isHDR, &mhc]() {
+                    ColorCorrectionSettings tempCC;
+                    tempCC.primariesEnabled = mhc.primariesEnabled;
+                    tempCC.primariesPreset = mhc.primariesPreset;
+                    tempCC.customPrimaries = mhc.customPrimaries;
+                    tempCC.grayscale = mhc.correctionGrayscale;
+                    ColorCorrectionData data = ConvertColorCorrection(tempCC, isHDR);
+                    std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
+                    g_pendingColorCorrections.erase(
+                        std::remove_if(g_pendingColorCorrections.begin(), g_pendingColorCorrections.end(),
+                            [monIdx](const PendingColorCorrection& p) { return p.monitorIndex == monIdx; }),
+                        g_pendingColorCorrections.end());
+                    g_pendingColorCorrections.push_back({ monIdx, isHDR, data, true, isHDR });
+                    g_hasPendingColorCorrections.store(true, std::memory_order_release);
+                    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 });
+
+                g_mhcEditDialogOpen.store(false);
+
+                // Restore MHC state and bake correction into ICC once
+                if (livePreview) {
+                    // Restore mhc (was cleared for preview) so RegenerateMhcIfActive can run
+                    mhc.enabled = savedEnabled;
+                    mhc.profileName = savedProfileName;
+                    otherMhc.enabled = otherWasEnabled;
+                    otherMhc.profileName = otherProfileName;
+                    UpdateMhcFlagsLive(monIdx);
+                    if (!startedForPreview) {
+                        UpdateColorCorrectionLive(monIdx, isHDR);
+                    }
+                }
+                RegenerateMhcIfActive(monIdx, isHDR);
+                if (startedForPreview) {
+                    StopProcessing();
+                }
+                if (startedOverlayForPreview) {
+                    DwmHookReevaluateOverlay();
+                }
+                SaveSettings();
             }
             return 0;
 
@@ -1777,12 +1958,33 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC;
                 bool checked = (SendMessage(g_gui.hwndHdrMhcDgEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 mhc.desktopGammaEnabled = checked;
-                // Also update shader's desktop gamma global (for overlay preview / non-MHC mode)
-                g_userDesktopGammaMode.store(checked);
+                // DG only applies when the HDR MHC profile is enabled to carry it
+                bool dgActive = checked && mhc.enabled;
+                g_userDesktopGammaMode.store(dgActive);
                 if (!g_gammaWhitelistActive.load()) {
-                    g_desktopGammaMode.store(checked);
+                    g_desktopGammaMode.store(dgActive);
                 }
-                RegenerateMhcIfActive(g_gui.currentMonitor, true);
+                // Fast path: hotswap between the two pre-generated profile variants.
+                // profileName = currently active; profileNameDG = standby variant.
+                // Apply time always generates both; here we just swap which is associated.
+                if (!mhc.profileName.empty() && !mhc.profileNameDG.empty()) {
+                    DisplayInfo displayInfo;
+                    if (GetDisplayInfoForMonitor(g_gui.currentMonitor, displayInfo)) {
+                        // Disassociate active, associate standby
+                        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
+                        ReassociateMHC2Profile(mhc.profileNameDG, displayInfo.adapterId, displayInfo.sourceId, true);
+                        // Swap stored names so profileName always reflects the active profile
+                        {
+                            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                            std::swap(mhc.profileName, mhc.profileNameDG);
+                            std::swap(mhc.profilePath, mhc.profilePathDG);
+                        }
+                        UpdateMhcFlagsLive(g_gui.currentMonitor);
+                    }
+                } else {
+                    // Fallback: one or both variants missing — full regeneration creates both
+                    RegenerateMhcIfActive(g_gui.currentMonitor, true);
+                }
                 SaveSettings();
             }
             return 0;
@@ -1925,8 +2127,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_SHADER_STATE_CHANGED:  // Shader active state changed (from render thread)
+        UpdateTrayIcon(g_shaderCorrectionsActive.load(std::memory_order_relaxed));
+        // If render thread says corrections are now needed, start overlay thread (DWM hook mode)
+        DwmHookReevaluateOverlay();
+        return 0;
+
     case WM_USER + 100:  // Processing stopped
         g_gui.isRunning = false;
+        UpdateTrayIcon(false);
         UpdateGUIState();
         // Auto-restart if user didn't click Stop (activeSettings still populated)
         if (!g_gui.activeSettings.empty()) {

@@ -28,15 +28,21 @@ void UpdateMhcFlagsLive(int monitorIndex) {
 
     bool sdrMhcActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
     bool hdrMhcActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
+    // Grayscale flag covers all MHC gamma/grayscale forms that suppress shader equivalents
+    bool sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+                    ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
+    bool hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+                    ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
+                    ms.hdrMHC.desktopGammaEnabled;
 
     // Update running MonitorContext if processing is active
     bool found = false;
     for (auto& ctx : g_monitors) {
         if (ctx.index == monitorIndex) {
             ctx.sdrMhcPrimariesActive = sdrMhcActive && ms.sdrMHC.primariesEnabled;
-            ctx.sdrMhcGrayscaleActive = sdrMhcActive && ms.sdrMHC.grayscale.enabled;
+            ctx.sdrMhcGrayscaleActive = sdrMhcActive && sdrHasGs;
             ctx.hdrMhcPrimariesActive = hdrMhcActive && ms.hdrMHC.primariesEnabled;
-            ctx.hdrMhcGrayscaleActive = hdrMhcActive && ms.hdrMHC.grayscale.enabled;
+            ctx.hdrMhcGrayscaleActive = hdrMhcActive && hdrHasGs;
             std::cout << "[MHC Flags] mon=" << monitorIndex
                       << " sdrPrim=" << ctx.sdrMhcPrimariesActive
                       << " sdrGs=" << ctx.sdrMhcGrayscaleActive
@@ -315,23 +321,33 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + profileName;
 
-    // Remove old profile association and delete old file from color dir
-    if (mhc.enabled && !mhc.profileName.empty()) {
-        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-        // Delete old file from system color directory
-        wchar_t sysDir[MAX_PATH];
-        GetSystemDirectory(sysDir, MAX_PATH);
-        std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + mhc.profileName;
-        DeleteFileW(oldPath.c_str());
-    }
+    // Save old profile info for rollback if new install fails
+    std::wstring oldProfileName = (mhc.enabled && !mhc.profileName.empty()) ? mhc.profileName : L"";
 
     if (!WriteMHC2Profile(profileData, tempPath)) return false;
 
+    // Remove old profile AFTER new one is written and ready to install
+    if (!oldProfileName.empty()) {
+        RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    }
+
     if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
         DeleteFileW(tempPath.c_str());
+        // Rollback: re-associate old profile if it still exists in system color dir
+        if (!oldProfileName.empty()) {
+            ReassociateMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        }
         return false;
     }
     DeleteFileW(tempPath.c_str());
+
+    // Clean up old profile file only after new profile is confirmed installed
+    if (!oldProfileName.empty()) {
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectory(sysDir, MAX_PATH);
+        std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldProfileName;
+        DeleteFileW(oldPath.c_str());
+    }
 
     // Store the system color directory path
     wchar_t sysDir[MAX_PATH];
@@ -364,13 +380,13 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
                 if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
                     // Immediately disassociate — we only want it in the color dir, not active
                     RemoveMHC2Profile(dgProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                    // Re-associate the main profile (Install above may have switched it)
-                    ReassociateMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, true);
 
                     wchar_t sysDirDG[MAX_PATH];
                     GetSystemDirectory(sysDirDG, MAX_PATH);
                     dgProfilePath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + dgProfileName;
                 }
+                // Always re-associate main profile (Install may have switched it, or Remove may have cleared it)
+                ReassociateMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, true);
                 DeleteFileW(dgTempPath.c_str());
             }
         }
@@ -397,7 +413,9 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
     auto& settings = g_gui.monitorSettings[monitorIndex];
     auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
-    if (!mhc.enabled || mhc.profileName.empty()) return;
+    // Only require a profile name — editing inline corrections re-enables MHC automatically.
+    // An existing profileName means Apply was run at some point and a profile file exists.
+    if (mhc.profileName.empty()) return;
     if (!IsMHC2ApiAvailable()) return;
 
     // Read from MHC's own primaries/grayscale (Layer 1), not shader's (Layer 3)
@@ -535,26 +553,33 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + newProfileName;
 
-    // Remove old profile and clean up old file
-    RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-    {
-        wchar_t sysDir[MAX_PATH];
-        GetSystemDirectory(sysDir, MAX_PATH);
-        std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + mhc.profileName;
-        DeleteFileW(oldPath.c_str());
-    }
+    // Save old profile info for rollback if new install fails
+    std::wstring oldProfileName = mhc.profileName;
 
     if (!WriteMHC2Profile(profileData, tempPath)) return;
 
-    if (GetDisplayInfoForMonitor(monitorIndex, displayInfo)) {
-        if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
-            std::cerr << "RegenerateMhcIfActive: InstallMHC2Profile failed for monitor "
-                      << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
-            DeleteFileW(tempPath.c_str());
-            return;
+    // Remove old profile AFTER new one is written and ready to install
+    RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+
+    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+        std::cerr << "RegenerateMhcIfActive: InstallMHC2Profile failed for monitor "
+                  << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
+        DeleteFileW(tempPath.c_str());
+        // Rollback: re-associate old profile if it still exists
+        if (!oldProfileName.empty()) {
+            ReassociateMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
         }
+        return;
     }
     DeleteFileW(tempPath.c_str());
+
+    // Clean up old profile file only after new one is confirmed installed
+    if (!oldProfileName.empty()) {
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectory(sysDir, MAX_PATH);
+        std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldProfileName;
+        DeleteFileW(oldPath.c_str());
+    }
 
     // Delete old DG variant
     if (isHDR && !mhc.profileNameDG.empty()) {
@@ -577,21 +602,23 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
             if (WriteMHC2Profile(dgData, dgTempPath)) {
                 if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
                     RemoveMHC2Profile(dgProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                    ReassociateMHC2Profile(newProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
                     wchar_t sysDirDG[MAX_PATH];
                     GetSystemDirectory(sysDirDG, MAX_PATH);
                     dgProfilePath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + dgProfileName;
                 }
+                // Always re-associate main profile (Install may have switched it, or Remove may have cleared it)
+                ReassociateMHC2Profile(newProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
                 DeleteFileW(dgTempPath.c_str());
             }
         }
     }
 
-    // Update stored name
+    // Update stored name — profile is now active, ensure enabled is true
     wchar_t sysDir2[MAX_PATH];
     GetSystemDirectory(sysDir2, MAX_PATH);
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        mhc.enabled = true;
         mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
         mhc.profileName = newProfileName;
         mhc.hasPerChannelTRC = params.hasPerChannelTRC;

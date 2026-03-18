@@ -69,6 +69,7 @@ std::atomic<bool> g_consoleEnabled{ false };   // Show console window (GUI mode 
 std::atomic<bool> g_showFrameTiming{ false };  // Show frame timing in analysis overlay (default off)
 std::atomic<bool> g_showMotionBar{ false };    // Show motion bar for judder detection (default off)
 std::atomic<bool> g_overlayAutoSleep{ false };  // true = overlay has nothing to do, windows hidden
+std::atomic<bool> g_shaderCorrectionsActive{ false };  // true = shader applying corrections (not just LUT)
 HANDLE g_overlayWakeEvent = nullptr;           // Auto-reset event for auto-sleep wake
 HANDLE g_topmostEvent = nullptr;              // Signaled when TOPMOST reassert needed
 std::atomic<bool> g_framePacerEnabled{ true };  // Enable predictive frame pacer (default: true)

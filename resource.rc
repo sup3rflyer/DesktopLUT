@@ -3,3 +3,4 @@
 
 // Icon resource - ID 1 is the main application icon
 IDI_APPICON ICON "DesktopLUT.ico"
+IDI_APPICON_ACTIVE ICON "DesktopLUT-active.ico"

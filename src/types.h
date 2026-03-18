@@ -57,6 +57,7 @@ struct MovableAtomic {
 #define WM_TRAYICON              (WM_USER + 1)
 #define WM_MHC_PROFILE_REAPPLIED (WM_USER + 101)
 #define WM_HOTKEY_REGISTER       (WM_USER + 102)
+#define WM_SHADER_STATE_CHANGED  (WM_USER + 103)
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003
@@ -576,6 +577,7 @@ struct MonitorContext {
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     bool cbDirty = true;                     // True when constant buffer needs update
+    bool shaderCorrActive = false;           // True when shader is applying corrections (for tray icon)
     bool lastDesktopGamma = true;            // Cached atomic value
     bool lastTetrahedralInterp = false;      // Cached atomic value
     bool grayscaleICtCp = false;             // true = shader uses ICtCp offsets for HDR grayscale

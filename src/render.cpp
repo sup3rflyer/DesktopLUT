@@ -520,10 +520,17 @@ static void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
         const auto& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
         mhcEnabled = mhc.enabled;
         profileName = mhc.profileName;
-        sdrPrimEn = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.primariesEnabled;
-        sdrGsEn = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty() && ms.sdrMHC.grayscale.enabled;
-        hdrPrimEn = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.primariesEnabled;
-        hdrGsEn = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() && ms.hdrMHC.grayscale.enabled;
+        bool sdrA = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
+        bool hdrA = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
+        bool sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+                        ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
+        bool hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+                        ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
+                        ms.hdrMHC.desktopGammaEnabled;
+        sdrPrimEn = sdrA && ms.sdrMHC.primariesEnabled;
+        sdrGsEn   = sdrA && sdrHasGs;
+        hdrPrimEn = hdrA && ms.hdrMHC.primariesEnabled;
+        hdrGsEn   = hdrA && hdrHasGs;
     }
 
     DisplayInfo displayInfo;
@@ -934,19 +941,18 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         cbData[2] = ctx->maxDisplayNits;
         cbData[3] = (float)(ctx->isHDREnabled ? ctx->lutSizeHDR : ctx->lutSizeSDR);
         // Row 1: Toggles
-        cbData[4] = g_desktopGammaMode.load() ? 1.0f : 0.0f;  // Desktop gamma toggle
+        // Suppress shader corrections when MHC ICC profile handles them at GPU scanout
+        bool mhcPrim = ctx->isHDREnabled ? ctx->hdrMhcPrimariesActive.load() : ctx->sdrMhcPrimariesActive.load();
+        bool mhcGs = ctx->isHDREnabled ? ctx->hdrMhcGrayscaleActive.load() : ctx->sdrMhcGrayscaleActive.load();
+        cbData[4] = (ctx->isHDREnabled && g_desktopGammaMode.load() && !mhcGs) ? 1.0f : 0.0f;  // Desktop gamma (HDR-only, MHC bakes into 1D LUT)
         cbData[5] = g_tetrahedralInterp.load() ? 1.0f : 0.0f; // Tetrahedral interpolation
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
         const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
-        // MHC primaries and shader primaries are independent layers:
-        // MHC = base calibration at GPU scanout (yearly), shader = fine-tuning on top (anytime)
-        // Same principle as grayscale: both layers can be active simultaneously
-        bool shaderPrimaries = cc.primariesEnabled;  // White point correction (primaries gamut mapping is MHC-only)
-        bool shaderGrayscale = cc.grayscale.enabled;
-        // White balance gains only apply when explicitly enabled — prevents leftover
-        // non-D65 values in INI from silently shifting white point when corrections are off
-        bool shaderWhiteBalance = cc.primariesEnabled &&
+        // Suppress primaries/grayscale/WB when MHC handles them
+        bool shaderPrimaries = cc.primariesEnabled && !mhcPrim;
+        bool shaderGrayscale = cc.grayscale.enabled && !mhcGs;
+        bool shaderWhiteBalance = cc.primariesEnabled && !mhcPrim &&
             (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
         cbData[7] = (shaderPrimaries || shaderGrayscale || shaderWhiteBalance) ? 1.0f : 0.0f;  // useManualCorrection
         // Row 2: Grayscale control + tonemapping toggles
@@ -988,7 +994,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         }
         cbData[25] = cc.tonemap.targetPeakNits;
         cbData[26] = cc.tonemap.dynamicPeak ? 1.0f : 0.0f;  // tonemapDynamic
-        cbData[27] = cc.grayscale.use24Gamma ? 1.0f : 0.0f;  // grayscale24
+        cbData[27] = (cc.grayscale.use24Gamma && !mhcGs) ? 1.0f : 0.0f;  // grayscale24 (MHC bakes into 1D LUT)
         // Row 7: Grayscale peak + ACM flag
         cbData[28] = cc.grayscale.peakNits;  // grayscalePeakNits (HDR only)
         cbData[29] = ctx->isFP16SDR ? 1.0f : 0.0f;  // ACM: FP16 SDR, input is linear scRGB
@@ -1077,6 +1083,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         ctx->lastTetrahedralInterp = curTetrahedral;
     }
     } // end if cbDirty
+
+    // shaderCorrActive is evaluated in RenderAll() before the auto-sleep check
 
     // Select the appropriate LUT based on HDR mode (no fallback - SDR/HDR LUTs are incompatible)
     // If no applicable LUT, usePassthrough is true and shader skips LUT sampling
@@ -1639,22 +1647,33 @@ void RenderAll(FramePacer* fp) {
         }
     }
 
+    // Evaluate shaderCorrActive for all monitors BEFORE auto-sleep decision.
+    // Must run here (not inside RenderMonitor) so auto-sleep sees fresh state
+    // after pending corrections are applied above.
+    for (auto& ctx : g_monitors) {
+        if (!ctx.enabled) continue;
+        bool mhcP = ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive.load() : ctx.sdrMhcPrimariesActive.load();
+        bool mhcG = ctx.isHDREnabled ? ctx.hdrMhcGrayscaleActive.load() : ctx.sdrMhcGrayscaleActive.load();
+        const auto& cc2 = ctx.isHDREnabled ? ctx.hdrColorCorrection : ctx.sdrColorCorrection;
+        bool hasPrim = cc2.primariesEnabled && !mhcP;
+        bool hasGs = cc2.grayscale.enabled && !mhcG;
+        bool hasWB = cc2.primariesEnabled && !mhcP &&
+            (cc2.whiteBalanceGains[0] != 1.0f || cc2.whiteBalanceGains[1] != 1.0f || cc2.whiteBalanceGains[2] != 1.0f);
+        bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled;
+        bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
+        bool has24 = cc2.grayscale.use24Gamma && !mhcG;
+        bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only
+        bool hasMhcPreview = g_mhcEditDialogOpen.load();                  // MHC/grayscale editor live preview
+        ctx.shaderCorrActive = hasPrim || hasGs || hasWB || hasTonemap || hasDG || has24
+                               || hasAnalysis || hasMhcPreview;
+    }
+
     // Auto-sleep: hide overlay when no monitor needs processing (e.g., only MHC ICC active)
     {
         bool anyMonitorNeedsOverlay = false;
         for (auto& ctx : g_monitors) {
             if (!ctx.enabled) continue;
-            const auto& cc = ctx.isHDREnabled ? ctx.hdrColorCorrection : ctx.sdrColorCorrection;
-            bool shaderPrimaries = cc.primariesEnabled;
-            bool shaderGrayscale = cc.grayscale.enabled;
-            bool shaderWhiteBalance = cc.primariesEnabled &&
-                (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
-            bool overlayNeeded = !ctx.usePassthrough              // Has LUT
-                || shaderPrimaries || shaderGrayscale || shaderWhiteBalance  // Has corrections
-                || (ctx.isHDREnabled && cc.tonemap.enabled)       // Has tonemap
-                || g_desktopGammaMode.load()                      // Has desktop gamma
-                || cc.grayscale.use24Gamma;                       // Has 2.4 gamma
-            if (overlayNeeded) {
+            if (!ctx.usePassthrough || ctx.shaderCorrActive) {
                 anyMonitorNeedsOverlay = true;
                 break;
             }
@@ -1682,6 +1701,12 @@ void RenderAll(FramePacer* fp) {
                 }
             }
             std::cout << "Auto-sleep: overlay needed again, waking" << std::endl;
+        }
+
+        // Update shader-active state from current frame's evaluation
+        if (anyMonitorNeedsOverlay != g_shaderCorrectionsActive.load(std::memory_order_relaxed)) {
+            g_shaderCorrectionsActive.store(anyMonitorNeedsOverlay, std::memory_order_relaxed);
+            if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_SHADER_STATE_CHANGED, 0, 0);
         }
     }
 

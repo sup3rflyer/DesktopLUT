@@ -258,14 +258,17 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
             std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
             if (config.monitorIndex < (int)g_gui.monitorSettings.size()) {
                 const auto& ms = g_gui.monitorSettings[config.monitorIndex];
-                ctx.sdrMhcPrimariesActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
-                    && ms.sdrMHC.primariesEnabled;
-                ctx.sdrMhcGrayscaleActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()
-                    && ms.sdrMHC.grayscale.enabled;
-                ctx.hdrMhcPrimariesActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
-                    && ms.hdrMHC.primariesEnabled;
-                ctx.hdrMhcGrayscaleActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty()
-                    && ms.hdrMHC.grayscale.enabled;
+                bool sdrActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
+                bool hdrActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
+                bool sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+                                ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
+                bool hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+                                ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
+                                ms.hdrMHC.desktopGammaEnabled;
+                ctx.sdrMhcPrimariesActive = sdrActive && ms.sdrMHC.primariesEnabled;
+                ctx.sdrMhcGrayscaleActive = sdrActive && sdrHasGs;
+                ctx.hdrMhcPrimariesActive = hdrActive && ms.hdrMHC.primariesEnabled;
+                ctx.hdrMhcGrayscaleActive = hdrActive && hdrHasGs;
             }
         }
 
@@ -492,6 +495,50 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     PostMessage(g_gui.hwndMain, WM_USER + 100, 0, 0);  // Signal GUI to update
 }
 
+// Check if any shader corrections are active.
+// In DWM hook mode this determines whether the overlay thread is needed.
+// Reads g_shaderCorrectionsActive (set by render thread) when overlay is running,
+// falls back to GUI state check when overlay isn't running yet.
+// Must mirror the conditions in render.cpp's shaderCorrActive evaluation to avoid
+// silently dropping corrections when the overlay thread isn't started.
+static bool HasActiveShaderCorrections() {
+    // Analysis overlay requires the render thread regardless of corrections
+    if (g_analysisEnabled.load()) return true;
+    // Render thread is the source of truth when running — use its last evaluation
+    if (g_gui.processingThread.joinable())
+        return g_shaderCorrectionsActive.load(std::memory_order_relaxed);
+    // MHC/grayscale editor live preview needs the overlay
+    if (g_mhcEditDialogOpen.load()) return true;
+    // Static GUI check when render thread is not running.
+    // MHC suppression mirrors UpdateMhcFlagsLive() and the render loop's mhcG evaluation.
+    bool desktopGamma = g_userDesktopGammaMode.load();
+    for (const auto& ms : g_gui.monitorSettings) {
+        bool sdrMhcP = ms.sdrMHC.enabled && ms.sdrMHC.primariesEnabled;
+        bool sdrMhcG = ms.sdrMHC.enabled && (ms.sdrMHC.grayscale.enabled ||
+                       ms.sdrMHC.correctionGrayscale.enabled ||
+                       !ms.sdrMHC.sourceFilePath.empty() || ms.sdrMHC.hasPerChannelTRC);
+        bool hdrMhcP = ms.hdrMHC.enabled && ms.hdrMHC.primariesEnabled;
+        bool hdrMhcG = ms.hdrMHC.enabled && (ms.hdrMHC.grayscale.enabled ||
+                       ms.hdrMHC.correctionGrayscale.enabled ||
+                       !ms.hdrMHC.sourceFilePath.empty() || ms.hdrMHC.hasPerChannelTRC ||
+                       ms.hdrMHC.desktopGammaEnabled);
+
+        // SDR: corrections not baked into MHC (DG is HDR-only, skip for SDR)
+        const auto& sdr = ms.sdrColorCorrection;
+        if (sdr.primariesEnabled && !sdrMhcP) return true;
+        if (sdr.grayscale.enabled && !sdrMhcG) return true;
+        if (sdr.grayscale.use24Gamma && !sdrMhcG) return true;
+
+        // HDR: tonemapping is the primary shader correction; DG only active if MHC not handling it
+        const auto& hdr = ms.hdrColorCorrection;
+        if (hdr.primariesEnabled && !hdrMhcP) return true;
+        if (hdr.grayscale.enabled && !hdrMhcG) return true;
+        if (hdr.tonemap.enabled) return true;
+        if (desktopGamma && !hdrMhcG) return true;
+    }
+    return false;
+}
+
 void StartProcessing() {
     if (g_gui.isRunning) return;
 
@@ -570,21 +617,7 @@ void StartProcessing() {
         }
 
         // Check if overlay is also needed (corrections or analysis configured)
-        bool needOverlay = false;
-        for (const auto& cfg : configs) {
-            const auto& ms = g_gui.monitorSettings[cfg.monitorIndex];
-            bool hasSdrCorrection = ms.sdrColorCorrection.primariesEnabled ||
-                                    ms.sdrColorCorrection.grayscale.enabled ||
-                                    ms.sdrColorCorrection.grayscale.use24Gamma;
-            bool hasHdrCorrection = ms.hdrColorCorrection.primariesEnabled ||
-                                    ms.hdrColorCorrection.grayscale.enabled ||
-                                    ms.hdrColorCorrection.tonemap.enabled;
-            bool hasDesktopGamma = g_userDesktopGammaMode.load();
-            if (hasSdrCorrection || hasHdrCorrection || hasDesktopGamma) {
-                needOverlay = true;
-                break;
-            }
-        }
+        bool needOverlay = HasActiveShaderCorrections();
 
         if (needOverlay) {
             // Start overlay in passthrough for LUT (DWM hook handles LUT)
@@ -692,7 +725,43 @@ void StopProcessing() {
 
     g_gui.isRunning = false;
     g_gui.activeSettings.clear();  // No longer running, clear active settings
+    g_shaderCorrectionsActive.store(false);
+    UpdateTrayIcon(false);
     UpdateGUIState();
+}
+
+void DwmHookReevaluateOverlay() {
+    if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
+
+    bool needOverlay = HasActiveShaderCorrections();
+    bool overlayRunning = g_gui.processingThread.joinable();
+
+    if (overlayRunning && !needOverlay) {
+        // Render thread's auto-sleep already hides windows and stops DD when nothing to do.
+        // No need to kill the thread here — auto-sleep is effectively free (500ms wait loop).
+        // Thread lifecycle is only managed by StartProcessing/StopProcessing.
+        return;
+    }
+
+    if (!overlayRunning && needOverlay) {
+        // Join any previously-exited thread (e.g., after watchdog exit) before spawning new one
+        if (g_gui.processingThread.joinable()) {
+            g_gui.processingThread.join();
+        }
+        std::cout << "[DWM Hook] Shader overlay now needed, starting DD" << std::endl;
+        std::vector<MonitorLUTConfig> configs;
+        for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+            const auto& ms = g_gui.monitorSettings[i];
+            MonitorLUTConfig config;
+            config.monitorIndex = (int)i;
+            config.sdrColorCorrection = ConvertColorCorrection(ms.sdrColorCorrection, false);
+            config.hdrColorCorrection = ConvertColorCorrection(ms.hdrColorCorrection, true);
+            configs.push_back(config);
+        }
+        g_running = true;
+        g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
+        // Render thread evaluates shaderCorrActive on first frame and posts WM_SHADER_STATE_CHANGED
+    }
 }
 
 void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode) {

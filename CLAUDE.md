@@ -63,7 +63,7 @@ Rules:
 ```bash
 # From Git Bash (Claude Code environment)
 "/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" \
-  "H:\Projects\DesktopLUT\DesktopLUT.sln" -p:Configuration=Release -p:Platform=x64 -v:minimal
+  "H:\Projects\DesktopLUT_DWM\DesktopLUT.sln" -p:Configuration=Release -p:Platform=x64 -v:minimal
 ```
 
 Requires: VS2022, Windows SDK 10.0.19041+, C++20
@@ -72,12 +72,12 @@ Requires: VS2022, Windows SDK 10.0.19041+, C++20
 
 ```bash
 "/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" \
-  "H:\Projects\DesktopLUT\DesktopLUT.Tests.vcxproj" -p:Configuration=Release -p:Platform=x64 -v:minimal
+  "H:\Projects\DesktopLUT_DWM\DesktopLUT.Tests.vcxproj" -p:Configuration=Release -p:Platform=x64 -v:minimal
 
 ./bin/Test/DesktopLUT.Tests.exe
 ```
 
-180 tests covering color math (PQ, primaries matrices, sRGB EOTF), MHC ICC profile generation/reading/grayscale extraction/per-channel eval+LUT/ICtCp offsets, EDID chromaticity parsing, frame pacer EMA/cadence lock/thresholds, LUT loading (.cube/.txt), and settings round-trips (including per-channel RGB deviations). Uses [doctest](https://github.com/doctest/doctest).
+198 tests covering color math (PQ, primaries matrices, sRGB EOTF), MHC ICC profile generation/reading/grayscale extraction/per-channel eval+LUT/ICtCp offsets, EDID chromaticity parsing, frame pacer EMA/cadence lock/thresholds, LUT loading (.cube/.txt), and settings round-trips (tonemapping only — primaries/grayscale/WB moved to MHC). Uses [doctest](https://github.com/doctest/doctest).
 
 Test files: `tests/test_color.cpp`, `tests/test_mhc.cpp`, `tests/test_displayconfig.cpp`, `tests/test_framepacer.cpp`, `tests/test_lut.cpp`, `tests/test_settings.cpp`. Fixtures in `tests/fixtures/`.
 
@@ -111,6 +111,23 @@ Key APIs:
 - DirectComposition for transparent overlay
 - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` prevents feedback loop
 - `ColorProfileAddDisplayAssociation` / `ColorProfileRemoveDisplayAssociation` for MHC ICC management
+
+### DWM Hook Mode (this branch)
+
+In DWM hook mode (`DwmHookMode=true`), 3D LUTs are applied by injecting `DwmHook.dll` into `dwm.exe` rather than via the overlay. The overlay is only started when genuinely needed:
+
+**Overlay activates for** (evaluated per-frame in `RenderAll`, stored as `shaderCorrActive`):
+- HDR tonemapping enabled (`cc.tonemap.enabled && ctx.isHDREnabled`)
+- Analysis overlay active (`g_analysisEnabled`, primary monitor only)
+- MHC or grayscale editor open for live preview (`g_mhcEditDialogOpen`)
+
+**Overlay stays off for all other cases** — MHC ICC profiles handle primaries, white balance, grayscale, and desktop gamma at GPU scanout with zero overlay overhead.
+
+**Auto-sleep**: When `shaderCorrActive` is false for all monitors and no LUT is loaded in overlay, `g_overlayAutoSleep` is set, windows are hidden, and the render loop waits on `g_overlayWakeEvent` (500ms timeout). `WM_SHADER_STATE_CHANGED` → `UpdateTrayIcon` + `DwmHookReevaluateOverlay` — tray icon reflects actual DD state.
+
+**MHC inline corrections** (WB, correction grayscale, DG toggle, 2.4 gamma): Each change calls `RegenerateMhcIfActive()` which regenerates and reinstalls the ICC profile if a `profileName` exists. For HDR, always generates both DG and non-DG variants. The DG checkbox uses `ReassociateMHC2Profile` (single API call hotswap) when both variants exist, falling back to full regeneration if missing. Editing any inline correction re-enables MHC (`mhc.enabled = true`) automatically.
+
+**Desktop gamma**: HDR-only, baked into MHC 1D LUT. `g_desktopGammaMode` is derived at startup from `hdrMHC.enabled && hdrMHC.desktopGammaEnabled` — only active if the MHC profile is also enabled. Never applied by the shader when MHC handles it (`mhcG` flag suppresses `hasDG`).
 
 ## Module Structure (~17,200 lines)
 

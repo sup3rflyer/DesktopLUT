@@ -97,61 +97,9 @@ TonemapCurve StringToTonemapCurve(const wchar_t* str) {
 void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
                                   const ColorCorrectionSettings& cc, const wchar_t* iniPath) {
     std::wstring p(prefix);
-    WritePrivateProfileBool(section, (p + L"PrimariesEnabled").c_str(), cc.primariesEnabled, iniPath);
-    wchar_t presetBuf[8];
-    swprintf_s(presetBuf, L"%d", cc.primariesPreset);
-    WritePrivateProfileStringW(section, (p + L"PrimariesPreset").c_str(), presetBuf, iniPath);
-
-    // Primaries as xy coordinate pairs (more readable)
-    WritePrivateProfileXY(section, (p + L"PrimariesRed").c_str(),
-        cc.customPrimaries.Rx, cc.customPrimaries.Ry, iniPath);
-    WritePrivateProfileXY(section, (p + L"PrimariesGreen").c_str(),
-        cc.customPrimaries.Gx, cc.customPrimaries.Gy, iniPath);
-    WritePrivateProfileXY(section, (p + L"PrimariesBlue").c_str(),
-        cc.customPrimaries.Bx, cc.customPrimaries.By, iniPath);
-    WritePrivateProfileXY(section, (p + L"PrimariesWhite").c_str(),
-        cc.customPrimaries.Wx, cc.customPrimaries.Wy, iniPath);
-
-    WritePrivateProfileBool(section, (p + L"GrayscaleEnabled").c_str(), cc.grayscale.enabled, iniPath);
-    wchar_t pointsBuf[8];
-    swprintf_s(pointsBuf, L"%d", cc.grayscale.pointCount);
-    WritePrivateProfileStringW(section, (p + L"GrayscalePoints").c_str(), pointsBuf, iniPath);
-
-    // Grayscale data: space after semicolons for readability
-    std::wstring grayscaleData;
-    for (size_t j = 0; j < cc.grayscale.points.size(); j++) {
-        wchar_t val[16];
-        _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), cc.grayscale.points[j]);
-        if (j > 0) grayscaleData += L"; ";
-        grayscaleData += val;
-    }
-    WritePrivateProfileStringW(section, (p + L"GrayscaleData").c_str(), grayscaleData.c_str(), iniPath);
-
-    // Save per-channel RGB deviations (new keys, backward compat: old versions ignore them)
-    {
-        const wchar_t* devSuffix[] = { L"GrayscaleDevR", L"GrayscaleDevG", L"GrayscaleDevB" };
-        for (int ch = 0; ch < 3; ch++) {
-            auto& dev = cc.grayscale.rgbDeviations[ch];
-            if (!dev.empty()) {
-                std::wstring devData;
-                for (size_t j = 0; j < dev.size(); j++) {
-                    wchar_t val[16]; _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), dev[j]);
-                    if (j > 0) devData += L"; ";
-                    devData += val;
-                }
-                WritePrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), devData.c_str(), iniPath);
-            }
-        }
-    }
-
-    // HDR-specific and SDR-specific settings
+    // Primaries, grayscale, white balance, and desktop gamma are now in MHC settings.
+    // Only tonemapping remains as a shader-level correction.
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
-    if (isHDR) {
-        WritePrivateProfileFloat(section, (p + L"GrayscalePeak").c_str(), cc.grayscale.peakNits, iniPath);
-    } else {
-        // SDR only: 2.2->2.4 gamma option
-        WritePrivateProfileBool(section, (p + L"Grayscale24").c_str(), cc.grayscale.use24Gamma, iniPath);
-    }
     if (isHDR) {
         WritePrivateProfileBool(section, (p + L"TonemapEnabled").c_str(), cc.tonemap.enabled, iniPath);
         WritePrivateProfileStringW(section, (p + L"TonemapCurve").c_str(),
@@ -165,105 +113,9 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
                                   ColorCorrectionSettings& cc, const wchar_t* iniPath) {
     std::wstring p(prefix);
-    cc.primariesEnabled = GetPrivateProfileBool(section, (p + L"PrimariesEnabled").c_str(), false, iniPath);
-    int preset = GetPrivateProfileIntW(section, (p + L"PrimariesPreset").c_str(), 0, iniPath);
-    cc.primariesPreset = (preset >= 0 && preset < g_numPresetPrimaries) ? preset : 0;
-
-    // HDR defaults to Rec.2020 primaries, SDR defaults to sRGB
+    // Primaries, grayscale, white balance, and desktop gamma are now in MHC settings.
+    // Only tonemapping remains as a shader-level correction.
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
-    float defRx = isHDR ? 0.708f : 0.64f;
-    float defRy = isHDR ? 0.292f : 0.33f;
-    float defGx = isHDR ? 0.170f : 0.30f;
-    float defGy = isHDR ? 0.797f : 0.60f;
-    float defBx = isHDR ? 0.131f : 0.15f;
-    float defBy = isHDR ? 0.046f : 0.06f;
-
-    // Load primaries as xy coordinate pairs
-    if (!GetPrivateProfileXY(section, (p + L"PrimariesRed").c_str(),
-            cc.customPrimaries.Rx, cc.customPrimaries.Ry, iniPath)) {
-        cc.customPrimaries.Rx = defRx;
-        cc.customPrimaries.Ry = defRy;
-    }
-    if (!GetPrivateProfileXY(section, (p + L"PrimariesGreen").c_str(),
-            cc.customPrimaries.Gx, cc.customPrimaries.Gy, iniPath)) {
-        cc.customPrimaries.Gx = defGx;
-        cc.customPrimaries.Gy = defGy;
-    }
-    if (!GetPrivateProfileXY(section, (p + L"PrimariesBlue").c_str(),
-            cc.customPrimaries.Bx, cc.customPrimaries.By, iniPath)) {
-        cc.customPrimaries.Bx = defBx;
-        cc.customPrimaries.By = defBy;
-    }
-    if (!GetPrivateProfileXY(section, (p + L"PrimariesWhite").c_str(),
-            cc.customPrimaries.Wx, cc.customPrimaries.Wy, iniPath)) {
-        cc.customPrimaries.Wx = 0.3127f;
-        cc.customPrimaries.Wy = 0.329f;
-    }
-
-    cc.grayscale.enabled = GetPrivateProfileBool(section, (p + L"GrayscaleEnabled").c_str(), false, iniPath);
-    int points = GetPrivateProfileIntW(section, (p + L"GrayscalePoints").c_str(), 20, iniPath);
-    cc.grayscale.pointCount = (points == 10 || points == 20 || points == 32) ? points : 20;
-
-    wchar_t grayscaleData[1024] = {};
-    GetPrivateProfileStringW(section, (p + L"GrayscaleData").c_str(), L"", grayscaleData, 1024, iniPath);
-    cc.grayscale.points.clear();
-    if (grayscaleData[0] != L'\0') {
-        wchar_t* ctx = nullptr;
-        wchar_t* token = wcstok_s(grayscaleData, L";", &ctx);
-        while (token) {
-            // Skip leading whitespace
-            while (*token == L' ' || *token == L'\t') token++;
-            cc.grayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
-            token = wcstok_s(nullptr, L";", &ctx);
-        }
-    }
-    // Ensure points vector size matches pointCount, reinitialize if mismatch or empty
-    if (cc.grayscale.points.empty() || (int)cc.grayscale.points.size() != cc.grayscale.pointCount) {
-        if (!cc.grayscale.points.empty()) {
-            std::wcerr << L"Warning: " << section << L"/" << p
-                       << L"GrayscaleData has " << cc.grayscale.points.size()
-                       << L" points but GrayscalePoints=" << cc.grayscale.pointCount
-                       << L", reinitializing to linear" << std::endl;
-        }
-        cc.grayscale.points.resize(cc.grayscale.pointCount);
-        if (isHDR) {
-            cc.grayscale.initLinearPQ();
-        } else {
-            cc.grayscale.initLinear();
-        }
-    }
-    // Load per-channel RGB deviations (new in this version, missing = identity 1.0)
-    {
-        const wchar_t* devSuffix[] = { L"GrayscaleDevR", L"GrayscaleDevG", L"GrayscaleDevB" };
-        for (int ch = 0; ch < 3; ch++) {
-            wchar_t devBuf[1024] = {};
-            GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf, 1024, iniPath);
-            cc.grayscale.rgbDeviations[ch].clear();
-            if (devBuf[0] != L'\0') {
-                wchar_t* ctx2 = nullptr;
-                wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
-                while (token) {
-                    while (*token == L' ' || *token == L'\t') token++;
-                    cc.grayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
-                    token = wcstok_s(nullptr, L";", &ctx2);
-                }
-            }
-            if (cc.grayscale.rgbDeviations[ch].empty() ||
-                (int)cc.grayscale.rgbDeviations[ch].size() != cc.grayscale.pointCount) {
-                cc.grayscale.rgbDeviations[ch].assign(cc.grayscale.pointCount, 1.0f);
-            }
-        }
-    }
-
-    // HDR-specific settings
-    if (isHDR) {
-        float peakNits = GetPrivateProfileFloat(section, (p + L"GrayscalePeak").c_str(), 10000.0f, iniPath);
-        cc.grayscale.peakNits = (peakNits >= 10.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
-    } else {
-        cc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"Grayscale24").c_str(), false, iniPath);
-    }
-
-    // Tonemapping settings (HDR only)
     if (isHDR) {
         cc.tonemap.enabled = GetPrivateProfileBool(section, (p + L"TonemapEnabled").c_str(), false, iniPath);
         wchar_t curveBuf[32] = {};
@@ -657,8 +509,8 @@ static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key
 void SaveSettings() {
     std::wstring iniPath = GetIniPath();
 
-    // Save general settings (save user preference, not effective state)
-    WritePrivateProfileBool(L"General", L"DesktopGamma", g_userDesktopGammaMode.load(), iniPath.c_str());
+    // Save general settings
+    // DesktopGamma is now per-monitor (MHCDesktopGamma in each monitor section) — not saved globally
     WritePrivateProfileBool(L"General", L"TetrahedralInterp", g_tetrahedralInterp.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"LogPeakDetection", g_logPeakDetection.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ConsoleLog", g_consoleEnabled.load(), iniPath.c_str());
@@ -718,9 +570,7 @@ void LoadSettings() {
     std::wstring iniPath = GetIniPath();
 
     // Load general settings
-    bool desktopGamma = GetPrivateProfileBool(L"General", L"DesktopGamma", false, iniPath.c_str());
-    g_userDesktopGammaMode.store(desktopGamma);
-    g_desktopGammaMode.store(desktopGamma);  // Effective starts at user preference
+    // DesktopGamma is now per-monitor (derived from MHCDesktopGamma after monitors load below)
     g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", false, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
@@ -783,4 +633,13 @@ void LoadSettings() {
         LoadMHCSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrMHC, iniPath.c_str());
         LoadMHCSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrMHC, iniPath.c_str());
     }
+
+    // Derive desktop gamma global from per-monitor MHC settings.
+    // Only active when the HDR MHC profile is enabled AND has DG baked —
+    // if MHC is disabled there's nothing to apply DG through.
+    bool anyDG = false;
+    for (const auto& ms : g_gui.monitorSettings)
+        if (ms.hdrMHC.enabled && ms.hdrMHC.desktopGammaEnabled) { anyDG = true; break; }
+    g_userDesktopGammaMode.store(anyDG);
+    g_desktopGammaMode.store(anyDG);
 }

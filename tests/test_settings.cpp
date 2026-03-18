@@ -192,64 +192,26 @@ TEST_CASE("Tonemap: all 5 curves round-trip") {
 
 // ============================================================================
 // Color Correction Settings Round-Trip
+// Primaries, grayscale, WB, and desktop gamma moved to MHC settings on this branch.
+// CC only persists tonemapping (HDR) — everything else loads as defaults.
 // ============================================================================
 
-TEST_CASE("CC settings: default SDR round-trip") {
+TEST_CASE("CC settings: SDR saves and loads no-ops (tonemapping only branch)") {
     TempIni ini;
     ColorCorrectionSettings original;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.primariesEnabled = true;       // should NOT persist
+    original.grayscale.enabled = true;      // should NOT persist
+    original.grayscale.use24Gamma = true;   // should NOT persist
 
     SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
     ColorCorrectionSettings loaded;
     LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
 
-    CHECK(loaded.primariesEnabled == original.primariesEnabled);
-    CHECK(loaded.grayscale.enabled == original.grayscale.enabled);
-    CHECK(loaded.grayscale.pointCount == original.grayscale.pointCount);
-}
-
-TEST_CASE("CC settings: custom primaries round-trip") {
-    TempIni ini;
-    ColorCorrectionSettings original;
-    original.primariesEnabled = true;
-    original.customPrimaries = {0.6800f, 0.3200f, 0.2650f, 0.6900f, 0.1500f, 0.0600f, 0.3127f, 0.3290f, L"Custom"};
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
-
-    SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
-
-    ColorCorrectionSettings loaded;
-    LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
-
-    CHECK(loaded.primariesEnabled == true);
-    CHECK(loaded.customPrimaries.Rx == doctest::Approx(0.6800f).epsilon(0.0001));
-    CHECK(loaded.customPrimaries.Gy == doctest::Approx(0.6900f).epsilon(0.0001));
-    CHECK(loaded.customPrimaries.Wx == doctest::Approx(0.3127f).epsilon(0.0001));
-    CHECK(loaded.customPrimaries.Wy == doctest::Approx(0.3290f).epsilon(0.0001));
-}
-
-TEST_CASE("CC settings: grayscale 20pt round-trip") {
-    TempIni ini;
-    ColorCorrectionSettings original;
-    original.grayscale.enabled = true;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
-    // Modify some points
-    original.grayscale.points[5] = 0.123f;
-    original.grayscale.points[10] = 0.456f;
-
-    SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
-
-    ColorCorrectionSettings loaded;
-    LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
-
-    CHECK(loaded.grayscale.enabled == true);
-    CHECK(loaded.grayscale.pointCount == 20);
-    REQUIRE(loaded.grayscale.points.size() == 20);
-    CHECK(loaded.grayscale.points[5] == doctest::Approx(0.123f).epsilon(0.001));
-    CHECK(loaded.grayscale.points[10] == doctest::Approx(0.456f).epsilon(0.001));
+    // Primaries and grayscale are in MHC now — defaults come back
+    CHECK(loaded.primariesEnabled == false);
+    CHECK(loaded.grayscale.enabled == false);
+    CHECK(loaded.grayscale.use24Gamma == false);
 }
 
 TEST_CASE("CC settings: HDR tonemap round-trip") {
@@ -275,19 +237,17 @@ TEST_CASE("CC settings: HDR tonemap round-trip") {
     CHECK(loaded.tonemap.dynamicPeak == true);
 }
 
-TEST_CASE("CC settings: 24Gamma toggle round-trip") {
+TEST_CASE("CC settings: 24Gamma not persisted (moved to MHC)") {
     TempIni ini;
     ColorCorrectionSettings original;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
-    original.grayscale.use24Gamma = true;
+    original.grayscale.use24Gamma = true;  // moved to MHC — should NOT persist
 
     SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
     ColorCorrectionSettings loaded;
     LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
 
-    CHECK(loaded.grayscale.use24Gamma == true);
+    CHECK(loaded.grayscale.use24Gamma == false);
 }
 
 // ============================================================================
@@ -439,85 +399,20 @@ TEST_CASE("Tonemap: string to enum case-insensitive") {
 // Per-channel RGB Deviations
 // ============================================================================
 
-TEST_CASE("CC settings: per-channel RGB deviations round-trip") {
+TEST_CASE("CC settings: grayscale deviations not persisted (moved to MHC)") {
     TempIni ini;
     ColorCorrectionSettings original;
     original.grayscale.enabled = true;
     original.grayscale.pointCount = 20;
     original.grayscale.initLinear();
-    // Set non-identity deviations
-    original.grayscale.rgbDeviations[0][5] = 0.95f;   // R at point 5
-    original.grayscale.rgbDeviations[1][10] = 1.03f;  // G at point 10
-    original.grayscale.rgbDeviations[2][15] = 1.10f;  // B at point 15
+    original.grayscale.rgbDeviations[0][5] = 0.95f;
 
     SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
     ColorCorrectionSettings loaded;
     LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
 
-    REQUIRE(loaded.grayscale.rgbDeviations[0].size() == 20);
-    REQUIRE(loaded.grayscale.rgbDeviations[1].size() == 20);
-    REQUIRE(loaded.grayscale.rgbDeviations[2].size() == 20);
-    CHECK(loaded.grayscale.rgbDeviations[0][5] == doctest::Approx(0.95f).epsilon(0.001));
-    CHECK(loaded.grayscale.rgbDeviations[1][10] == doctest::Approx(1.03f).epsilon(0.001));
-    CHECK(loaded.grayscale.rgbDeviations[2][15] == doctest::Approx(1.10f).epsilon(0.001));
-    // Non-modified points should be 1.0
-    CHECK(loaded.grayscale.rgbDeviations[0][0] == doctest::Approx(1.0f).epsilon(0.001));
-    CHECK(loaded.grayscale.rgbDeviations[1][0] == doctest::Approx(1.0f).epsilon(0.001));
-    CHECK(loaded.grayscale.rgbDeviations[2][0] == doctest::Approx(1.0f).epsilon(0.001));
-}
-
-TEST_CASE("CC settings: backward compat (no RGB deviation keys)") {
-    TempIni ini;
-    // Save with old-style settings (no deviations)
-    ColorCorrectionSettings original;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
-    // Deliberately leave rgbDeviations empty to simulate old behavior
-    // But we need to save without the deviation keys...
-    // We save normally (which writes deviations), then delete the keys
-    SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
-    // Delete deviation keys to simulate old INI
-    WritePrivateProfileStringW(L"TestMon", L"SDR_GrayscaleDevR", nullptr, ini.c_str());
-    WritePrivateProfileStringW(L"TestMon", L"SDR_GrayscaleDevG", nullptr, ini.c_str());
-    WritePrivateProfileStringW(L"TestMon", L"SDR_GrayscaleDevB", nullptr, ini.c_str());
-
-    ColorCorrectionSettings loaded;
-    LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
-
-    // Deviations should default to 1.0
-    REQUIRE(loaded.grayscale.rgbDeviations[0].size() == 20);
-    REQUIRE(loaded.grayscale.rgbDeviations[1].size() == 20);
-    REQUIRE(loaded.grayscale.rgbDeviations[2].size() == 20);
-    for (int ch = 0; ch < 3; ch++) {
-        for (int i = 0; i < 20; i++) {
-            CHECK(loaded.grayscale.rgbDeviations[ch][i] == doctest::Approx(1.0f).epsilon(0.001));
-        }
-    }
-}
-
-TEST_CASE("CC settings: per-channel RGB deviations 32pt round-trip") {
-    TempIni ini;
-    ColorCorrectionSettings original;
-    original.grayscale.enabled = true;
-    original.grayscale.pointCount = 32;
-    original.grayscale.initLinear();
-    // Set various deviations
-    for (int i = 0; i < 32; i++) {
-        original.grayscale.rgbDeviations[0][i] = 1.0f + 0.005f * i;  // R: slight ramp up
-        original.grayscale.rgbDeviations[1][i] = 1.0f;               // G: identity
-        original.grayscale.rgbDeviations[2][i] = 1.0f - 0.003f * i;  // B: slight ramp down
-    }
-
-    SaveColorCorrectionSettings(L"TestMon", L"SDR_", original, ini.c_str());
-
-    ColorCorrectionSettings loaded;
-    LoadColorCorrectionSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
-
-    REQUIRE(loaded.grayscale.rgbDeviations[0].size() == 32);
-    for (int i = 0; i < 32; i++) {
-        CHECK(loaded.grayscale.rgbDeviations[0][i] == doctest::Approx(1.0f + 0.005f * i).epsilon(0.001));
-        CHECK(loaded.grayscale.rgbDeviations[1][i] == doctest::Approx(1.0f).epsilon(0.001));
-        CHECK(loaded.grayscale.rgbDeviations[2][i] == doctest::Approx(1.0f - 0.003f * i).epsilon(0.001));
-    }
+    // Grayscale moved to MHC — deviations should be empty (not loaded)
+    CHECK(loaded.grayscale.enabled == false);
+    CHECK(loaded.grayscale.rgbDeviations[0].empty());
 }

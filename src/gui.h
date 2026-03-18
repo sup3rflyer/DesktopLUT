@@ -29,6 +29,7 @@ void UpdateStartupPath();
 // Tray icon functions
 void AddTrayIcon(HWND hwnd);
 void RemoveTrayIcon();
+void UpdateTrayIcon(bool active);
 void ShowTrayMenu(HWND hwnd);
 
 // Grayscale editor

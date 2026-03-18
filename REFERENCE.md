@@ -15,23 +15,23 @@ Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurabl
 
 ## Settings File (INI)
 
-Settings saved to `DesktopLUT.ini` next to executable:
+Settings saved to `DesktopLUT.ini` next to executable.
+
+**Note**: On the DWM branch, primaries/grayscale/white balance/desktop gamma live in the MHC sections per monitor. The Corrections section only persists tonemapping. `DesktopGamma` is no longer a global key — it is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
 
 ```ini
 [General]
-DesktopGamma=1
 TetrahedralInterp=0    ; 0 = trilinear (default), 1 = tetrahedral (higher quality)
 ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
 ShowFrameTiming=0      ; 1 = show frame timing stats in analysis overlay (developer debug)
-GammaWhitelist=mpv,vlc,mpc-hc64  ; Auto-disable gamma when these apps run
-; Matching: case-insensitive, executable name only (no path), .exe suffix optional
+DwmHookMode=1          ; 1 = inject DLL into dwm.exe for 3D LUT (overlay handles tonemapping only)
+GammaWhitelist=mpv.exe,mpvnet.exe  ; Auto-disable desktop gamma when these apps run
 
 ; Passthrough Mode (hide overlay when specific apps are running)
 VRRWhitelistEnabled=0           ; 1 = enable passthrough mode
-VRRWhitelist=game1,game2        ; Comma-separated list of exe names
-; Use this to disable color correction for games that need VRR (NVIDIA G-Sync)
+VRRWhitelist=game1.exe          ; Comma-separated exe names
 
-; Hotkey settings (enable/disable and key configuration)
+; Hotkey settings
 HotkeyGammaEnabled=1
 HotkeyGammaKey=G
 HotkeyHdrEnabled=1
@@ -40,40 +40,64 @@ HotkeyAnalysisEnabled=1
 HotkeyAnalysisKey=X
 
 ; Frame pacer settings
-FramePacerEnabled=1    ; 1 = predictive frame pacer (default), 0 = legacy DwmFlush/CompClock only
-FramePacerSpinWait=1   ; 1 = QPC spin-wait for sub-ms precision (default), 0 = sleep-only (less CPU)
-FrameBuffer=1          ; 1 = auto frame buffer (default), 0 = direct present
+FramePacerEnabled=1    ; 1 = predictive frame pacer (default)
+FramePacerSpinWait=1   ; 1 = QPC spin-wait for sub-ms precision
+FrameBuffer=1          ; 1 = auto frame buffer (decouples capture from present)
 FrameBufferIdleMs=3000 ; Idle timeout before buffer engages (ms), 0 = always active
 FramePacerLog=0        ; 1 = write per-frame CSV (framepacer.csv) for diagnostics
 
-; Startup settings
 StartMinimized=0       ; 1 = start minimized to system tray
-; Note: Processing auto-starts if any correction is enabled (LUT, Primaries, Grayscale, 2.4 Gamma, Tonemapping)
 
 [Monitor0]
-SDR=C:\path\to\sdr.cube
-HDR=C:\path\to\hdr.cube
-; SDR color correction
-SDR_PrimariesEnabled=1
-SDR_PrimariesPreset=4      ; 0=sRGB, 1=P3-D65, 2=AdobeRGB, 3=Rec.2020, 4=Custom
-SDR_PrimariesRx=0.680000   ; Custom chromaticity (only when preset=4)
-; ... (Ry,Gx,Gy,Bx,By,Wx,Wy)
-SDR_GrayscaleEnabled=1
-SDR_GrayscalePoints=20     ; 10, 20, or 32
-SDR_GrayscaleData=0.0;0.05;0.10;...;1.0
-SDR_Grayscale24=0          ; 1 = apply 2.4 gamma (BT.1886)
-; HDR color correction
-HDR_GrayscaleEnabled=1
-HDR_GrayscalePoints=20
-HDR_GrayscaleData=0.0;0.05;0.10;...;1.0
-HDR_GrayscalePeak=1400.0   ; Must match ColourSpace target peak
-HDR_TonemapEnabled=1
-HDR_TonemapCurve=0         ; 0=BT.2390, 1=Soft Clip, 2=Reinhard, 3=BT.2446A, 4=Hard Clip
+LUT_SDR=C:\path\to\sdr.cube   ; 3D LUT for SDR (applied by DWM hook in DwmHookMode)
+LUT_HDR=C:\path\to\hdr.cube   ; 3D LUT for HDR
+
+; HDR shader corrections (only tonemapping — all other corrections in MHC sections below)
+HDR_TonemapEnabled=0
+HDR_TonemapCurve=SoftClip     ; BT2390, SoftClip, Reinhard, BT2446A, HardClip
 HDR_TonemapSourcePeak=10000.0
 HDR_TonemapTargetPeak=1000.0
-HDR_TonemapDynamic=0
+HDR_TonemapDynamic=0          ; 1 = detect peak per-frame
+
 MaxTmlEnabled=0
 MaxTmlPeak=1000.0
+
+; --- MHC ICC Profile (SDR) ---
+SDR_MHCEnabled=true
+SDR_MHCProfilePath=C:\Windows\system32\spool\drivers\color\DesktopLUT_Mon0_SDR_xxx.icm
+SDR_MHCPrimariesEnabled=true
+SDR_MHCPrimariesPreset=4       ; 0=sRGB, 1=P3-D65, 2=AdobeRGB, 3=Rec.2020, 4=Custom
+SDR_MHCPrimariesRed=0.68, 0.32
+SDR_MHCPrimariesGreen=0.30, 0.60
+SDR_MHCPrimariesBlue=0.15, 0.06
+SDR_MHCPrimariesWhite=0.3127, 0.3290
+SDR_MHCSourceFile=C:\path\to\1D.cube  ; 1D cube or ICC — locks grayscale section
+SDR_MHCSourceIs1DCube=true
+SDR_MHCGrayscaleEnabled=true
+SDR_MHCGrayscalePoints=20      ; 10, 20, or 32
+SDR_MHCGrayscaleData=0.000; 0.003; ...
+SDR_MHCGrayscale24=false       ; true = apply 2.4 gamma (BT.1886) in LUT
+SDR_MHCWhiteBalanceEnabled=false
+SDR_MHCWhiteBalanceWx=0.3127
+SDR_MHCWhiteBalanceWy=0.3290
+SDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
+SDR_MHCCorrGSPoints=20
+SDR_MHCCorrGSData=...
+
+; --- MHC ICC Profile (HDR) ---
+HDR_MHCEnabled=true
+HDR_MHCProfilePath=C:\Windows\system32\spool\drivers\color\DesktopLUT_Mon0_HDR_xxx.icm
+HDR_MHCProfilePathDG=C:\Windows\system32\spool\drivers\color\DesktopLUT_Mon0_HDR_DG_xxx.icm
+HDR_MHCPrimariesEnabled=true
+HDR_MHCPrimariesPreset=4
+HDR_MHCSourceFile=C:\path\to\hdr.cube
+HDR_MHCSourceIs1DCube=true
+HDR_MHCGrayscaleEnabled=true
+HDR_MHCGrayscalePeak=10000.0
+HDR_MHCDesktopGamma=false      ; true = sRGB→2.2 baked into 1D LUT for SDR range; hotswaps via profilePathDG
+HDR_MHCWhiteBalanceEnabled=false
+HDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
+HDR_MHCCorrGSPeak=10000.0
 ```
 
 ## HDR Color Pipeline (ICtCp-based)
