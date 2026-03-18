@@ -53,6 +53,7 @@ struct MovableAtomic {
 #define ID_TETRAHEDRAL_CHECK 112
 #define ID_TRAY_ICON        1
 #define WM_TRAYICON              (WM_USER + 1)
+#define WM_UPDATE_ANALYSIS       (WM_USER + 2)
 #define WM_PROCESSING_EXITED     (WM_USER + 100)
 #define WM_MHC_PROFILE_REAPPLIED (WM_USER + 101)
 #define WM_HOTKEY_REGISTER       (WM_USER + 102)

@@ -399,7 +399,9 @@ void DestroyAnalysisOverlay() {
 
 void ShowAnalysisOverlay() {
     if (g_analysisHwnd) {
-        // Reset session tracking and pacer stats when overlay is opened
+        // Reset session tracking and pacer stats when overlay is opened.
+        // Benign race: render thread may overwrite with a new max, but worst case
+        // is session tracking restarts cleanly next cycle (cosmetic display data only).
         for (auto& ctx : g_monitors) {
             ctx.sessionMaxCLL = 0.0f;
             ctx.sessionMaxFALL = 0.0f;
@@ -602,15 +604,18 @@ static void ComputeFrameTimingStats(MonitorContext* ctx) {
 }
 
 void UpdateAnalysisDisplay(MonitorContext* ctx) {
-    if (!g_analysisHwnd || !IsWindowVisible(g_analysisHwnd)) return;
+    if (!g_analysisHwnd) return;  // Caller already gates on g_analysisEnabled
     if (!ctx->analysisStagingBuffer[0] || !ctx->analysisStagingBuffer[1]) return;
+
+    // Skip readback until first dispatch has completed its GPU readback delay
+    if (ctx->analysisFrameCounter < ANALYSIS_DISPATCH_INTERVAL + ANALYSIS_READBACK_DELAY) return;
 
     // Only read back 2 frames after dispatch to avoid GPU sync stall
     int frameInCycle = ctx->analysisFrameCounter % ANALYSIS_DISPATCH_INTERVAL;
     if (frameInCycle != ANALYSIS_READBACK_DELAY) return;
 
-    // Read from the OTHER staging buffer (the one we copied to 2 frames ago)
-    int readIdx = ctx->analysisStagingIndex;  // Current index points to buffer we'll write NEXT
+    // Read the most recently written staging buffer (the one dispatch copied to last cycle)
+    int readIdx = 1 - ctx->analysisStagingIndex;
 
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = g_context->Map(ctx->analysisStagingBuffer[readIdx], 0, D3D11_MAP_READ, 0, &mapped);
@@ -657,7 +662,7 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
 
     // Get tonemap settings from render thread's live data (not startup snapshot)
     // ctx->hdrColorCorrection is updated by UpdateColorCorrectionLive, same data the shader uses
-    float referencePeak = 1000.0f;
+    float referencePeak = 1000.0f;  // Standard HDR reference level for APL when tonemapping disabled
     const auto& tonemap = ctx->hdrColorCorrection.tonemap;
     bool tmEnabled = ctx->isHDREnabled && tonemap.enabled;
     bool tmDynamic = tonemap.dynamicPeak;
@@ -671,6 +676,9 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     ComputeFrameTimingStats(ctx);
     ctx->frameTimingStats.compositorClockAvailable = (g_pfnWaitForCompositorClock != nullptr);
 
+    // SPSC handoff: skip if GUI hasn't consumed previous data (prevents torn reads)
+    if (g_analysisDataReady.load(std::memory_order_acquire)) return;
+
     // Queue data for UI thread (offloads formatting from render thread)
     g_pendingAnalysis.result = result;
     g_pendingAnalysis.isHDR = ctx->isHDREnabled;
@@ -683,7 +691,7 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     g_pendingAnalysis.tonemapTargetPeak = tmTargetPeak;
     g_pendingAnalysis.detectedPeak = ctx->detectedPeakNits;
     g_pendingAnalysis.frameTiming = ctx->frameTimingStats;
-    g_analysisDataReady.store(true);
+    g_analysisDataReady.store(true, std::memory_order_release);
 
     // Post message to trigger UI update on window's thread
     PostMessage(g_analysisHwnd, WM_UPDATE_ANALYSIS, 0, 0);

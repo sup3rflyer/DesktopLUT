@@ -28,8 +28,7 @@ struct AnalysisDisplayData {
 extern AnalysisDisplayData g_pendingAnalysis;
 extern std::atomic<bool> g_analysisDataReady;
 
-// Custom message for async UI update
-static const UINT WM_UPDATE_ANALYSIS = WM_USER + 2;
+// WM_UPDATE_ANALYSIS defined in types.h alongside other WM_USER messages
 
 // Overlay management
 bool CreateAnalysisOverlay(HINSTANCE hInstance);
