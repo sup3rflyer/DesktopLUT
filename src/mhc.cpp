@@ -311,7 +311,8 @@ static const float g_bradfordD65toD50[9] = {
 
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
-                       bool isHDR, float outMHC[12]) {
+                       bool isHDR, float outMHC[12],
+                       const float* whiteBalanceGains) {
     // The MHC2 driver pipeline:
     //   wire → DeGamma → RGBtoXYZ → [MHC2 matrix] → XYZtoRGB → ReGamma → LUT → display
     //
@@ -328,6 +329,11 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     // No Bradford adaptation - the matrix directly maps XYZ coordinates.
     // White point changes are encoded in the displayRGBtoXYZ matrix itself
     // (via its white point scaling), so they're naturally included.
+    //
+    // White balance gains (optional): diagonal RGB scaling in wire space.
+    // Baked into the matrix by scaling each column of srcToXYZ before the multiply:
+    //   srcToXYZ_scaled[col_i] = srcToXYZ[col_i] * gains[i]
+    // This shifts the white point from D65 to the target in a single matrix pass.
 
     float srcToXYZ[9], displayToXYZ[9], displayFromXYZ[9];
     if (!BuildRGBtoXYZ(srcPrimaries, srcToXYZ) || !BuildRGBtoXYZ(displayPrimaries, displayToXYZ)
@@ -338,7 +344,17 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
         return;
     }
 
-    // MHC2 = srcRGBtoXYZ * inv(displayRGBtoXYZ)
+    // Apply white balance gains to srcToXYZ columns (von Kries in wire RGB space)
+    if (whiteBalanceGains) {
+        // Column 0 (R): rows 0,3,6 of row-major matrix
+        srcToXYZ[0] *= whiteBalanceGains[0]; srcToXYZ[3] *= whiteBalanceGains[0]; srcToXYZ[6] *= whiteBalanceGains[0];
+        // Column 1 (G): rows 1,4,7
+        srcToXYZ[1] *= whiteBalanceGains[1]; srcToXYZ[4] *= whiteBalanceGains[1]; srcToXYZ[7] *= whiteBalanceGains[1];
+        // Column 2 (B): rows 2,5,8
+        srcToXYZ[2] *= whiteBalanceGains[2]; srcToXYZ[5] *= whiteBalanceGains[2]; srcToXYZ[8] *= whiteBalanceGains[2];
+    }
+
+    // MHC2 = srcRGBtoXYZ_scaled * inv(displayRGBtoXYZ)
     float result[9];
     MatMul3(srcToXYZ, displayFromXYZ, result);
 
@@ -667,8 +683,12 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         std::cout << "MHC2: primariesEnabled=false, identity matrix" << std::endl;
     }
 
+    // Check if white balance gains are non-identity
+    bool hasWB = (params.whiteBalanceGains[0] != 1.0f || params.whiteBalanceGains[1] != 1.0f || params.whiteBalanceGains[2] != 1.0f);
+    const float* wbGains = hasWB ? params.whiteBalanceGains : nullptr;
+
     float mhcMatrix[12];
-    ComputeMHC2Matrix(srcPrim, displayPrim, params.isHDR, mhcMatrix);
+    ComputeMHC2Matrix(srcPrim, displayPrim, params.isHDR, mhcMatrix, wbGains);
 
     // Generate 1D LUTs
     // SDR: 1024 entries (sRGB signal, sufficient for 8-bit output)
@@ -722,6 +742,67 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         GenerateMHC2LUT_SDR_Channel(params.grayscale, lutR.data(), lutSize, 0);
         GenerateMHC2LUT_SDR_Channel(params.grayscale, lutG.data(), lutSize, 1);
         GenerateMHC2LUT_SDR_Channel(params.grayscale, lutB.data(), lutSize, 2);
+    }
+
+    // ========================================================================
+    // Compose additional corrections on top of base LUT
+    // Desktop gamma (HDR only) and correction grayscale are applied via
+    // function composition: the base LUT output feeds into the next stage.
+    // ========================================================================
+
+    bool hasDG = params.isHDR && params.desktopGammaEnabled;
+    bool hasCorrGS = params.correctionGrayscaleEnabled && params.correctionGrayscale.enabled;
+
+    if (hasDG || hasCorrGS) {
+        float pqPeak = params.isHDR ? PqOETF(params.peakNits / 10000.0f) : 0.0f;
+
+        float* luts[3] = { lutR.data(), lutG.data(), lutB.data() };
+        for (int ch = 0; ch < 3; ch++) {
+            for (int j = 0; j < lutSize; j++) {
+                float v = luts[ch][j];  // Base LUT output (signal domain)
+
+                if (params.isHDR) {
+                    // HDR: LUT output is PQ signal
+
+                    // Desktop gamma: sRGB→2.2 for SDR luminance range
+                    if (hasDG) {
+                        float linearNits = PqEOTF(v) * 10000.0f;
+                        if (linearNits <= 80.0f && linearNits > 0.0f) {
+                            // Normalize to 0-1 range within SDR (80 nits)
+                            float sdrLinear = linearNits / 80.0f;
+                            // Apply sRGB OETF then pow(2.2) (sRGB→2.2 conversion)
+                            float srgbEncoded = SrgbOETF(sdrLinear);
+                            float gamma22 = powf(srgbEncoded, 2.2f);
+                            // Convert back to PQ
+                            v = PqOETF(gamma22 * 80.0f / 10000.0f);
+                        }
+                    }
+
+                    // Correction grayscale (fine-tuning on top of base)
+                    if (hasCorrGS) {
+                        v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
+                    }
+                } else {
+                    // SDR: LUT output is sRGB signal
+
+                    // Correction grayscale (fine-tuning on top of base)
+                    if (hasCorrGS) {
+                        float Y_linear = SrgbEOTF(v);
+                        float Y_corrected = EvalGrayscaleSDR_Channel(Y_linear, params.correctionGrayscale, ch);
+                        // Optional 2.2→2.4 gamma from correction grayscale
+                        if (params.correctionGrayscale.use24Gamma) {
+                            Y_corrected = powf((std::max)(Y_corrected, 0.0f), 2.4f / 2.2f);
+                        }
+                        v = SrgbOETF((std::max)(Y_corrected, 0.0f));
+                    }
+                }
+
+                luts[ch][j] = std::clamp(v, 0.0f, 1.0f);
+            }
+        }
+
+        if (hasDG) std::cout << "MHC2: Desktop gamma (sRGB→2.2) composed into HDR LUT" << std::endl;
+        if (hasCorrGS) std::cout << "MHC2: Correction grayscale composed on top of base LUT" << std::endl;
     }
 
     // Build ICC colorants (D50-adapted)
@@ -1661,6 +1742,8 @@ void CleanupOrphanedMhcProfiles() {
                 activeProfiles.insert(ms.sdrMHC.profileName);
             if (!ms.hdrMHC.profileName.empty())
                 activeProfiles.insert(ms.hdrMHC.profileName);
+            if (!ms.hdrMHC.profileNameDG.empty())
+                activeProfiles.insert(ms.hdrMHC.profileNameDG);
         }
     }
 

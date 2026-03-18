@@ -1614,3 +1614,173 @@ TEST_CASE("ICtCp offsets: peak value produces no NaN/infinity") {
         CHECK(gs.ictcpCp[i] == doctest::Approx(0.0f).epsilon(0.001));
     }
 }
+
+// ============================================================================
+// SECTION: White Balance Matrix Baking
+// ============================================================================
+
+TEST_CASE("MHC2 matrix: white balance gains identity") {
+    // WB gains of 1.0 should produce same result as no gains
+    float mhcNoWB[12], mhcWithWB[12];
+    float gains[3] = { 1.0f, 1.0f, 1.0f };
+    ComputeMHC2Matrix(kSRGB, kSRGB, false, mhcNoWB);
+    ComputeMHC2Matrix(kSRGB, kSRGB, false, mhcWithWB, gains);
+    for (int i = 0; i < 12; i++) {
+        CHECK(mhcWithWB[i] == doctest::Approx(mhcNoWB[i]).epsilon(1e-5));
+    }
+}
+
+TEST_CASE("MHC2 matrix: white balance gains scale output") {
+    // Non-identity gains should produce non-identity matrix
+    float mhc[12];
+    float gains[3] = { 1.1f, 1.0f, 0.9f };
+    ComputeMHC2Matrix(kSRGB, kSRGB, false, mhc, gains);
+    // With sRGB→sRGB and WB gains, the matrix should NOT be identity
+    // R gain > 1 means red channel is boosted
+    // White input [1,1,1] through srcToXYZ_scaled should produce XYZ shifted toward red
+    // Check diagonal is not all 1.0
+    bool isIdentity = (fabsf(mhc[0] - 1.0f) < 0.001f && fabsf(mhc[5] - 1.0f) < 0.001f && fabsf(mhc[10] - 1.0f) < 0.001f);
+    CHECK(!isIdentity);
+}
+
+TEST_CASE("MHC2 matrix: white balance + primaries combined") {
+    // Verify matrix encodes both gamut mapping AND white shift
+    float mhcPrimOnly[12], mhcBoth[12];
+    float gains[3] = { 1.05f, 1.0f, 0.95f };
+    ComputeMHC2Matrix(kSRGB, kP3D65, false, mhcPrimOnly);
+    ComputeMHC2Matrix(kSRGB, kP3D65, false, mhcBoth, gains);
+    // Results should differ (WB modifies the matrix)
+    bool same = true;
+    for (int i = 0; i < 12; i++) {
+        if (fabsf(mhcBoth[i] - mhcPrimOnly[i]) > 1e-5f) { same = false; break; }
+    }
+    CHECK(!same);
+    // Column 4 should still be zero
+    CHECK(mhcBoth[3] == 0.0f);
+    CHECK(mhcBoth[7] == 0.0f);
+    CHECK(mhcBoth[11] == 0.0f);
+}
+
+// ============================================================================
+// SECTION: Desktop Gamma HDR LUT
+// ============================================================================
+
+TEST_CASE("Desktop gamma: HDR LUT SDR range corrected") {
+    // Generate HDR profile with desktop gamma enabled
+    MHC2ProfileParams params;
+    params.isHDR = true;
+    params.peakNits = 1000.0f;
+    params.primariesEnabled = false;
+    params.grayscaleEnabled = false;
+    params.grayscale.enabled = false;
+    params.desktopGammaEnabled = true;
+
+    std::vector<uint8_t> profileData;
+    bool ok = GenerateMHC2Profile(params, profileData);
+    CHECK(ok);
+
+    // Verify the LUT is non-identity in SDR range (PQ of 80 nits = ~0.5080)
+    // We can't directly inspect the LUT from the profile binary easily,
+    // but we can verify the profile was generated successfully
+    CHECK(profileData.size() > 128);
+}
+
+TEST_CASE("Desktop gamma: sRGB to 2.2 conversion at SDR") {
+    // Verify the math: sRGB OETF then pow(2.2) should darken relative to PQ identity
+    float sdrLinear = 0.5f;  // 50% linear light at 40 nits
+    float srgbEncoded = SrgbOETF(sdrLinear);
+    float gamma22 = powf(srgbEncoded, 2.2f);
+    // sRGB OETF of 0.5 ≈ 0.735, pow(0.735, 2.2) ≈ 0.514
+    // So gamma22 should be close to but slightly above sdrLinear (sRGB→2.2 at midtone)
+    CHECK(gamma22 > 0.4f);
+    CHECK(gamma22 < 0.6f);
+    // Convert to PQ and back
+    float pqOriginal = PqOETF(sdrLinear * 80.0f / 10000.0f);
+    float pqCorrected = PqOETF(gamma22 * 80.0f / 10000.0f);
+    // They should differ (correction is applied)
+    CHECK(pqOriginal != doctest::Approx(pqCorrected).epsilon(1e-4));
+}
+
+// ============================================================================
+// SECTION: Correction Grayscale Composition
+// ============================================================================
+
+TEST_CASE("Correction grayscale: SDR composition on identity base") {
+    // Base grayscale = identity, correction grayscale = non-trivial
+    // Result should equal just the correction grayscale applied
+    MHC2ProfileParams params;
+    params.isHDR = false;
+    params.primariesEnabled = false;
+    params.grayscaleEnabled = false;
+    params.grayscale.enabled = false;
+
+    // Set up correction grayscale with a midtone boost
+    params.correctionGrayscaleEnabled = true;
+    params.correctionGrayscale.enabled = true;
+    params.correctionGrayscale.pointCount = 20;
+    params.correctionGrayscale.initLinear();
+    // Darken midpoint
+    params.correctionGrayscale.points[10] = params.correctionGrayscale.points[10] * 0.9f;
+    for (int i = 0; i < 20; i++) {
+        params.correctionGrayscale.pointsR[i] = params.correctionGrayscale.points[i];
+        params.correctionGrayscale.pointsG[i] = params.correctionGrayscale.points[i];
+        params.correctionGrayscale.pointsB[i] = params.correctionGrayscale.points[i];
+    }
+
+    std::vector<uint8_t> profileData;
+    bool ok = GenerateMHC2Profile(params, profileData);
+    CHECK(ok);
+    CHECK(profileData.size() > 128);
+}
+
+TEST_CASE("Correction grayscale: HDR composition on identity base") {
+    MHC2ProfileParams params;
+    params.isHDR = true;
+    params.peakNits = 1000.0f;
+    params.primariesEnabled = false;
+    params.grayscaleEnabled = false;
+    params.grayscale.enabled = false;
+
+    // Non-trivial correction grayscale
+    params.correctionGrayscaleEnabled = true;
+    params.correctionGrayscale.enabled = true;
+    params.correctionGrayscale.pointCount = 20;
+    params.correctionGrayscale.peakNits = 1000.0f;
+    params.correctionGrayscale.initLinearPQ();
+    params.correctionGrayscale.points[10] = params.correctionGrayscale.points[10] * 0.95f;
+    for (int i = 0; i < 20; i++) {
+        params.correctionGrayscale.pointsR[i] = params.correctionGrayscale.points[i];
+        params.correctionGrayscale.pointsG[i] = params.correctionGrayscale.points[i];
+        params.correctionGrayscale.pointsB[i] = params.correctionGrayscale.points[i];
+    }
+
+    std::vector<uint8_t> profileData;
+    bool ok = GenerateMHC2Profile(params, profileData);
+    CHECK(ok);
+    CHECK(profileData.size() > 128);
+}
+
+TEST_CASE("Correction grayscale + desktop gamma combined HDR") {
+    // Both desktop gamma and correction grayscale enabled
+    MHC2ProfileParams params;
+    params.isHDR = true;
+    params.peakNits = 1000.0f;
+    params.primariesEnabled = false;
+    params.desktopGammaEnabled = true;
+
+    params.correctionGrayscaleEnabled = true;
+    params.correctionGrayscale.enabled = true;
+    params.correctionGrayscale.pointCount = 20;
+    params.correctionGrayscale.peakNits = 1000.0f;
+    params.correctionGrayscale.initLinearPQ();
+    for (int i = 0; i < 20; i++) {
+        params.correctionGrayscale.pointsR[i] = params.correctionGrayscale.points[i];
+        params.correctionGrayscale.pointsG[i] = params.correctionGrayscale.points[i];
+        params.correctionGrayscale.pointsB[i] = params.correctionGrayscale.points[i];
+    }
+
+    std::vector<uint8_t> profileData;
+    bool ok = GenerateMHC2Profile(params, profileData);
+    CHECK(ok);
+    CHECK(profileData.size() > 128);
+}

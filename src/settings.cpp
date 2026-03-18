@@ -339,9 +339,59 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
         WritePrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), mhc.grayscale.use24Gamma, iniPath);
     }
 
+    // White balance settings
+    WritePrivateProfileBool(section, (p + L"MHCWhiteBalanceEnabled").c_str(), mhc.whiteBalanceEnabled, iniPath);
+    WritePrivateProfileFloat(section, (p + L"MHCWhiteBalanceWx").c_str(), mhc.whiteBalanceWx, iniPath);
+    WritePrivateProfileFloat(section, (p + L"MHCWhiteBalanceWy").c_str(), mhc.whiteBalanceWy, iniPath);
+
+    // Desktop gamma (HDR only)
+    if (isHDR) {
+        WritePrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), mhc.desktopGammaEnabled, iniPath);
+        WritePrivateProfileStringW(section, (p + L"MHCProfilePathDG").c_str(), mhc.profilePathDG.c_str(), iniPath);
+    }
+
+    // Correction grayscale (fine-tuning on top of base)
+    WritePrivateProfileBool(section, (p + L"MHCCorrGSEnabled").c_str(), mhc.correctionGrayscale.enabled, iniPath);
+    {
+        wchar_t ptsBuf[8];
+        swprintf_s(ptsBuf, L"%d", mhc.correctionGrayscale.pointCount);
+        WritePrivateProfileStringW(section, (p + L"MHCCorrGSPoints").c_str(), ptsBuf, iniPath);
+    }
+    {
+        std::wstring gsData;
+        for (size_t j = 0; j < mhc.correctionGrayscale.points.size(); j++) {
+            wchar_t val[16];
+            _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), mhc.correctionGrayscale.points[j]);
+            if (j > 0) gsData += L"; ";
+            gsData += val;
+        }
+        WritePrivateProfileStringW(section, (p + L"MHCCorrGSData").c_str(), gsData.c_str(), iniPath);
+    }
+    {
+        const wchar_t* devSuffix[] = { L"MHCCorrGSDevR", L"MHCCorrGSDevG", L"MHCCorrGSDevB" };
+        for (int ch = 0; ch < 3; ch++) {
+            auto& dev = mhc.correctionGrayscale.rgbDeviations[ch];
+            if (!dev.empty()) {
+                std::wstring devData;
+                for (size_t j = 0; j < dev.size(); j++) {
+                    wchar_t val[16]; _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), dev[j]);
+                    if (j > 0) devData += L"; ";
+                    devData += val;
+                }
+                WritePrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), devData.c_str(), iniPath);
+            }
+        }
+    }
+    if (isHDR) {
+        WritePrivateProfileFloat(section, (p + L"MHCCorrGSPeak").c_str(), mhc.correctionGrayscale.peakNits, iniPath);
+    } else {
+        WritePrivateProfileBool(section, (p + L"MHCCorrGS24").c_str(), mhc.correctionGrayscale.use24Gamma, iniPath);
+    }
+
     // Metadata for display labels
     WritePrivateProfileStringW(section, (p + L"MHCMetaPrimaries").c_str(), mhc.metaPrimaries.c_str(), iniPath);
     WritePrivateProfileStringW(section, (p + L"MHCMetaGamma").c_str(), mhc.metaGamma.c_str(), iniPath);
+    WritePrivateProfileStringW(section, (p + L"MHCMetaWhiteBalance").c_str(), mhc.metaWhiteBalance.c_str(), iniPath);
     if (isHDR) {
         WritePrivateProfileFloat(section, (p + L"MHCMetaPeakNits").c_str(), mhc.metaPeakNits, iniPath);
     }
@@ -449,12 +499,86 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         mhc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), false, iniPath);
     }
 
+    // White balance settings
+    mhc.whiteBalanceEnabled = GetPrivateProfileBool(section, (p + L"MHCWhiteBalanceEnabled").c_str(), false, iniPath);
+    mhc.whiteBalanceWx = GetPrivateProfileFloat(section, (p + L"MHCWhiteBalanceWx").c_str(), 0.3127f, iniPath);
+    mhc.whiteBalanceWy = GetPrivateProfileFloat(section, (p + L"MHCWhiteBalanceWy").c_str(), 0.3290f, iniPath);
+
+    // Desktop gamma (HDR only)
+    if (isHDR) {
+        mhc.desktopGammaEnabled = GetPrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), false, iniPath);
+        wchar_t dgPath[MAX_PATH] = {};
+        GetPrivateProfileStringW(section, (p + L"MHCProfilePathDG").c_str(), L"", dgPath, MAX_PATH, iniPath);
+        mhc.profilePathDG = dgPath;
+        // Extract DG filename
+        std::wstring dgName = mhc.profilePathDG;
+        size_t dgSlash = dgName.find_last_of(L"\\/");
+        if (dgSlash != std::wstring::npos) dgName = dgName.substr(dgSlash + 1);
+        mhc.profileNameDG = dgName;
+    }
+
+    // Correction grayscale (fine-tuning on top of base)
+    mhc.correctionGrayscale.enabled = GetPrivateProfileBool(section, (p + L"MHCCorrGSEnabled").c_str(), false, iniPath);
+    int corrPts = GetPrivateProfileIntW(section, (p + L"MHCCorrGSPoints").c_str(), 20, iniPath);
+    mhc.correctionGrayscale.pointCount = (corrPts == 10 || corrPts == 20 || corrPts == 32) ? corrPts : 20;
+
+    {
+        wchar_t corrGsData[1024] = {};
+        GetPrivateProfileStringW(section, (p + L"MHCCorrGSData").c_str(), L"", corrGsData, 1024, iniPath);
+        mhc.correctionGrayscale.points.clear();
+        if (corrGsData[0] != L'\0') {
+            wchar_t* ctx3 = nullptr;
+            wchar_t* token = wcstok_s(corrGsData, L";", &ctx3);
+            while (token) {
+                while (*token == L' ' || *token == L'\t') token++;
+                mhc.correctionGrayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
+                token = wcstok_s(nullptr, L";", &ctx3);
+            }
+        }
+        if (mhc.correctionGrayscale.points.empty() || (int)mhc.correctionGrayscale.points.size() != mhc.correctionGrayscale.pointCount) {
+            mhc.correctionGrayscale.points.resize(mhc.correctionGrayscale.pointCount);
+            if (isHDR) mhc.correctionGrayscale.initLinearPQ();
+            else mhc.correctionGrayscale.initLinear();
+        }
+    }
+
+    {
+        const wchar_t* devSuffix[] = { L"MHCCorrGSDevR", L"MHCCorrGSDevG", L"MHCCorrGSDevB" };
+        for (int ch = 0; ch < 3; ch++) {
+            wchar_t devBuf2[1024] = {};
+            GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf2, 1024, iniPath);
+            mhc.correctionGrayscale.rgbDeviations[ch].clear();
+            if (devBuf2[0] != L'\0') {
+                wchar_t* ctx4 = nullptr;
+                wchar_t* token = wcstok_s(devBuf2, L";", &ctx4);
+                while (token) {
+                    while (*token == L' ' || *token == L'\t') token++;
+                    mhc.correctionGrayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
+                    token = wcstok_s(nullptr, L";", &ctx4);
+                }
+            }
+            if (mhc.correctionGrayscale.rgbDeviations[ch].empty() ||
+                (int)mhc.correctionGrayscale.rgbDeviations[ch].size() != mhc.correctionGrayscale.pointCount) {
+                mhc.correctionGrayscale.rgbDeviations[ch].assign(mhc.correctionGrayscale.pointCount, 1.0f);
+            }
+        }
+    }
+
+    if (isHDR) {
+        float corrPeak = GetPrivateProfileFloat(section, (p + L"MHCCorrGSPeak").c_str(), 10000.0f, iniPath);
+        mhc.correctionGrayscale.peakNits = (corrPeak >= 10.0f && corrPeak <= 10000.0f) ? corrPeak : 10000.0f;
+    } else {
+        mhc.correctionGrayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCCorrGS24").c_str(), false, iniPath);
+    }
+
     // Metadata for display labels
     wchar_t metaBuf[256] = {};
     GetPrivateProfileStringW(section, (p + L"MHCMetaPrimaries").c_str(), L"", metaBuf, 256, iniPath);
     mhc.metaPrimaries = metaBuf;
     GetPrivateProfileStringW(section, (p + L"MHCMetaGamma").c_str(), L"", metaBuf, 256, iniPath);
     mhc.metaGamma = metaBuf;
+    GetPrivateProfileStringW(section, (p + L"MHCMetaWhiteBalance").c_str(), L"", metaBuf, 256, iniPath);
+    mhc.metaWhiteBalance = metaBuf;
     if (isHDR) {
         mhc.metaPeakNits = GetPrivateProfileFloat(section, (p + L"MHCMetaPeakNits").c_str(), 0.0f, iniPath);
     }

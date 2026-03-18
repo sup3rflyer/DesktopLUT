@@ -126,6 +126,28 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
     if (mhc.hasPerChannelTRC) {
         gammaBase += L" + TRC";
     }
+
+    // --- White balance label ---
+    if (mhc.whiteBalanceEnabled) {
+        float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
+        if (fabsf(wx - 0.3127f) < 0.001f && fabsf(wy - 0.3290f) < 0.001f) {
+            mhc.metaWhiteBalance = L"D65";
+        } else {
+            wchar_t wbBuf[48];
+            swprintf_s(wbBuf, L"Custom (%.4f, %.4f)", wx, wy);
+            mhc.metaWhiteBalance = wbBuf;
+        }
+    } else {
+        mhc.metaWhiteBalance.clear();
+    }
+
+    // Append desktop gamma and correction grayscale to gamma label
+    if (isHDR && mhc.desktopGammaEnabled) {
+        gammaBase += L" + DG";
+    }
+    if (mhc.correctionGrayscale.enabled) {
+        gammaBase += L" + Corr";
+    }
     mhc.metaGamma = gammaBase;
 
     // --- Peak nits (HDR only) ---
@@ -225,6 +247,57 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         }
     }
 
+    // White balance gains (von Kries in wire RGB space)
+    if (mhc.whiteBalanceEnabled) {
+        float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
+        // Check if not D65 (within tolerance)
+        bool isD65 = (fabsf(wx - 0.3127f) < 0.001f && fabsf(wy - 0.3290f) < 0.001f);
+        if (!isD65 && wy > 0.001f) {
+            // Convert target white from CIE xy to XYZ (Y=1)
+            float tX = wx / wy;
+            float tY = 1.0f;
+            float tZ = (1.0f - wx - wy) / wy;
+            // XYZ→RGB matrix for wire space
+            static const float rec2020XYZtoRGB[9] = {
+                 1.7166512f, -0.3556708f, -0.2533663f,
+                -0.6666844f,  1.6164812f,  0.0157685f,
+                 0.0176399f, -0.0427706f,  0.9421031f };
+            static const float srgbXYZtoRGB[9] = {
+                 3.2404542f, -1.5371385f, -0.4985314f,
+                -0.9692660f,  1.8760108f,  0.0415560f,
+                 0.0556434f, -0.2040259f,  1.0572252f };
+            const float* m = isHDR ? rec2020XYZtoRGB : srgbXYZtoRGB;
+            params.whiteBalanceGains[0] = m[0]*tX + m[1]*tY + m[2]*tZ;
+            params.whiteBalanceGains[1] = m[3]*tX + m[4]*tY + m[5]*tZ;
+            params.whiteBalanceGains[2] = m[6]*tX + m[7]*tY + m[8]*tZ;
+        }
+    }
+
+    // Desktop gamma (HDR only): sRGB→2.2 baked into 1D LUT
+    if (isHDR && mhc.desktopGammaEnabled) {
+        params.desktopGammaEnabled = true;
+    }
+
+    // Correction grayscale (fine-tuning on top of base)
+    if (mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty()) {
+        params.correctionGrayscaleEnabled = true;
+        params.correctionGrayscale.enabled = true;
+        params.correctionGrayscale.pointCount = mhc.correctionGrayscale.pointCount;
+        for (int i = 0; i < mhc.correctionGrayscale.pointCount && i < 32; i++) {
+            params.correctionGrayscale.points[i] = (i < (int)mhc.correctionGrayscale.points.size())
+                ? mhc.correctionGrayscale.points[i] : 0.0f;
+            float base = params.correctionGrayscale.points[i];
+            float devR = (i < (int)mhc.correctionGrayscale.rgbDeviations[0].size()) ? mhc.correctionGrayscale.rgbDeviations[0][i] : 1.0f;
+            float devG = (i < (int)mhc.correctionGrayscale.rgbDeviations[1].size()) ? mhc.correctionGrayscale.rgbDeviations[1][i] : 1.0f;
+            float devB = (i < (int)mhc.correctionGrayscale.rgbDeviations[2].size()) ? mhc.correctionGrayscale.rgbDeviations[2][i] : 1.0f;
+            params.correctionGrayscale.pointsR[i] = base * devR;
+            params.correctionGrayscale.pointsG[i] = base * devG;
+            params.correctionGrayscale.pointsB[i] = base * devB;
+        }
+        params.correctionGrayscale.use24Gamma = mhc.correctionGrayscale.use24Gamma;
+        params.correctionGrayscale.peakNits = mhc.correctionGrayscale.peakNits;
+    }
+
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
 
@@ -265,12 +338,54 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     GetSystemDirectory(sysDir, MAX_PATH);
     std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
 
+    // For HDR: generate the DG variant profile (opposite desktop gamma state)
+    // Both profiles stay in system color dir, ready for instant hotswap
+    std::wstring dgProfilePath, dgProfileName;
+    if (isHDR) {
+        // Delete old DG variant if it exists
+        if (!mhc.profileNameDG.empty()) {
+            wchar_t sysDirDG[MAX_PATH];
+            GetSystemDirectory(sysDirDG, MAX_PATH);
+            std::wstring oldDGPath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + mhc.profileNameDG;
+            DeleteFileW(oldDGPath.c_str());
+        }
+
+        // Generate variant with opposite DG state
+        MHC2ProfileParams dgParams = params;
+        dgParams.desktopGammaEnabled = !params.desktopGammaEnabled;
+
+        std::vector<uint8_t> dgData;
+        if (GenerateMHC2Profile(dgParams, dgData)) {
+            dgProfileName = L"DesktopLUT_" + std::wstring(monTag)
+                + L"_HDR_DG_" + std::to_wstring(GetTickCount64()) + L".icm";
+            std::wstring dgTempPath = std::wstring(tempDir) + dgProfileName;
+            if (WriteMHC2Profile(dgData, dgTempPath)) {
+                // Install to system color dir (not associated with display)
+                if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
+                    // Immediately disassociate — we only want it in the color dir, not active
+                    RemoveMHC2Profile(dgProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+                    // Re-associate the main profile (Install above may have switched it)
+                    ReassociateMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, true);
+
+                    wchar_t sysDirDG[MAX_PATH];
+                    GetSystemDirectory(sysDirDG, MAX_PATH);
+                    dgProfilePath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + dgProfileName;
+                }
+                DeleteFileW(dgTempPath.c_str());
+            }
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         mhc.enabled = true;
         mhc.profilePath = profilePath;
         mhc.profileName = profileName;
         mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
+        if (isHDR) {
+            mhc.profilePathDG = dgProfilePath;
+            mhc.profileNameDG = dgProfileName;
+        }
     }
     UpdateMhcFlagsLive(monitorIndex);
     return true;
@@ -358,6 +473,52 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         }
     }
 
+    // White balance gains (von Kries in wire RGB space)
+    if (mhc.whiteBalanceEnabled) {
+        float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
+        bool isD65 = (fabsf(wx - 0.3127f) < 0.001f && fabsf(wy - 0.3290f) < 0.001f);
+        if (!isD65 && wy > 0.001f) {
+            float tX = wx / wy, tY = 1.0f, tZ = (1.0f - wx - wy) / wy;
+            static const float rec2020XYZtoRGB[9] = {
+                 1.7166512f, -0.3556708f, -0.2533663f,
+                -0.6666844f,  1.6164812f,  0.0157685f,
+                 0.0176399f, -0.0427706f,  0.9421031f };
+            static const float srgbXYZtoRGB[9] = {
+                 3.2404542f, -1.5371385f, -0.4985314f,
+                -0.9692660f,  1.8760108f,  0.0415560f,
+                 0.0556434f, -0.2040259f,  1.0572252f };
+            const float* m = isHDR ? rec2020XYZtoRGB : srgbXYZtoRGB;
+            params.whiteBalanceGains[0] = m[0]*tX + m[1]*tY + m[2]*tZ;
+            params.whiteBalanceGains[1] = m[3]*tX + m[4]*tY + m[5]*tZ;
+            params.whiteBalanceGains[2] = m[6]*tX + m[7]*tY + m[8]*tZ;
+        }
+    }
+
+    // Desktop gamma (HDR only)
+    if (isHDR && mhc.desktopGammaEnabled) {
+        params.desktopGammaEnabled = true;
+    }
+
+    // Correction grayscale (fine-tuning on top of base)
+    if (mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty()) {
+        params.correctionGrayscaleEnabled = true;
+        params.correctionGrayscale.enabled = true;
+        params.correctionGrayscale.pointCount = mhc.correctionGrayscale.pointCount;
+        for (int i = 0; i < mhc.correctionGrayscale.pointCount && i < 32; i++) {
+            params.correctionGrayscale.points[i] = (i < (int)mhc.correctionGrayscale.points.size())
+                ? mhc.correctionGrayscale.points[i] : 0.0f;
+            float base = params.correctionGrayscale.points[i];
+            float devR = (i < (int)mhc.correctionGrayscale.rgbDeviations[0].size()) ? mhc.correctionGrayscale.rgbDeviations[0][i] : 1.0f;
+            float devG = (i < (int)mhc.correctionGrayscale.rgbDeviations[1].size()) ? mhc.correctionGrayscale.rgbDeviations[1][i] : 1.0f;
+            float devB = (i < (int)mhc.correctionGrayscale.rgbDeviations[2].size()) ? mhc.correctionGrayscale.rgbDeviations[2][i] : 1.0f;
+            params.correctionGrayscale.pointsR[i] = base * devR;
+            params.correctionGrayscale.pointsG[i] = base * devG;
+            params.correctionGrayscale.pointsB[i] = base * devB;
+        }
+        params.correctionGrayscale.use24Gamma = mhc.correctionGrayscale.use24Gamma;
+        params.correctionGrayscale.peakNits = mhc.correctionGrayscale.peakNits;
+    }
+
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return;
 
@@ -395,6 +556,37 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     }
     DeleteFileW(tempPath.c_str());
 
+    // Delete old DG variant
+    if (isHDR && !mhc.profileNameDG.empty()) {
+        wchar_t sysDirOld[MAX_PATH];
+        GetSystemDirectory(sysDirOld, MAX_PATH);
+        std::wstring oldDGPath = std::wstring(sysDirOld) + L"\\spool\\drivers\\color\\" + mhc.profileNameDG;
+        DeleteFileW(oldDGPath.c_str());
+    }
+
+    // Generate DG variant for HDR
+    std::wstring dgProfilePath, dgProfileName;
+    if (isHDR) {
+        MHC2ProfileParams dgParams = params;
+        dgParams.desktopGammaEnabled = !params.desktopGammaEnabled;
+        std::vector<uint8_t> dgData;
+        if (GenerateMHC2Profile(dgParams, dgData)) {
+            dgProfileName = L"DesktopLUT_" + std::wstring(monTag)
+                + L"_HDR_DG_" + std::to_wstring(GetTickCount64()) + L".icm";
+            std::wstring dgTempPath = std::wstring(tempDir) + dgProfileName;
+            if (WriteMHC2Profile(dgData, dgTempPath)) {
+                if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
+                    RemoveMHC2Profile(dgProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+                    ReassociateMHC2Profile(newProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+                    wchar_t sysDirDG[MAX_PATH];
+                    GetSystemDirectory(sysDirDG, MAX_PATH);
+                    dgProfilePath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + dgProfileName;
+                }
+                DeleteFileW(dgTempPath.c_str());
+            }
+        }
+    }
+
     // Update stored name
     wchar_t sysDir2[MAX_PATH];
     GetSystemDirectory(sysDir2, MAX_PATH);
@@ -403,6 +595,10 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
         mhc.profileName = newProfileName;
         mhc.hasPerChannelTRC = params.hasPerChannelTRC;
+        if (isHDR) {
+            mhc.profilePathDG = dgProfilePath;
+            mhc.profileNameDG = dgProfileName;
+        }
     }
     UpdateMhcFlagsLive(monitorIndex);
 }

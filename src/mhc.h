@@ -31,6 +31,16 @@ struct MHC2ProfileParams {
     // Each vector holds signal(0-1) → corrected signal(0-1), already the final correction
     std::vector<float> corrR, corrG, corrB;
     bool hasPrecomputedCorrection = false;
+
+    // White balance gains baked into matrix (von Kries diagonal in wire RGB space)
+    float whiteBalanceGains[3] = {1.0f, 1.0f, 1.0f};
+
+    // Desktop gamma: sRGB->2.2 baked into HDR 1D LUT
+    bool desktopGammaEnabled = false;
+
+    // Correction grayscale (fine-tuning on top of base grayscale from Edit dialog)
+    GrayscaleData correctionGrayscale;
+    bool correctionGrayscaleEnabled = false;
 };
 
 // Generate complete ICC v4 profile binary data with MHC2 tag
@@ -77,9 +87,12 @@ struct MHCProfileState {
 // Compute MHC2 3x4 matrix directly from source and display primaries
 // No Bradford adaptation - white point changes are encoded naturally
 // outMHC is 12 floats: 3x4 row-major (4th column = 0)
+// whiteBalanceGains: optional diagonal RGB gains baked into matrix (von Kries)
+//   When non-null, scales each column of srcToXYZ before final multiply
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
-                       bool isHDR, float outMHC[12]);
+                       bool isHDR, float outMHC[12],
+                       const float* whiteBalanceGains = nullptr);
 
 // Generate MHC2 1D LUT for SDR (1024 entries, sRGB signal domain)
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize = 1024);

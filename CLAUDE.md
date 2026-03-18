@@ -85,11 +85,9 @@ Test files: `tests/test_color.cpp`, `tests/test_mhc.cpp`, `tests/test_displaycon
 
 Three layers, each updated on different cadences:
 
-1. **MHC ICC Profile** (update yearly) — GPU scanout-level correction via Windows ACM. Matrix (primaries/white point) + 1D LUT (per-channel gamma). VRR-safe, zero overlay overhead. Foundation layer. Sources: 1D .cube from ColourSpace/CalMAN, ICC profiles, or manual entry. Achieves avg <0.5 dE with measured primaries + 1D cube.
-2. **3D LUT** (update every ~6 months) — Loaded into overlay shader. Full volumetric color transform (.cube/.txt files). Trilinear or tetrahedral interpolation. Handles the remaining non-linearities (hue shifts at specific saturation/luminance).
-3. **Corrections** (adjust anytime) — Fine-tuning on top of MHC + LUT. Primaries, white point (von Kries), grayscale, tonemap, desktop gamma. Applied in shader constant buffer, live-updated from GUI.
-
-MHC does NOT suppress any shader corrections — all three layers are independent fine-tuning. MHC is the base calibration at GPU scanout; shader primaries, grayscale, and white point are all fine-tuning on top.
+1. **MHC ICC Profile** (base calibration) — GPU scanout-level correction via Windows ACM. Matrix (primaries/white point/white balance) + 1D LUT (per-channel gamma/grayscale/desktop gamma). VRR-safe, zero overlay overhead. Foundation layer. Sources: 1D .cube from ColourSpace/CalMAN, ICC profiles, or manual entry. White balance, correction grayscale, and desktop gamma baked into profile via function composition. Dual-profile hotswap for HDR desktop gamma variants.
+2. **3D LUT** (volumetric correction) — Loaded into overlay shader. Full volumetric color transform (.cube/.txt files). Trilinear or tetrahedral interpolation. Handles remaining non-linearities (hue shifts at specific saturation/luminance).
+3. **Corrections** (HDR tonemapping) — HDR tonemapping + MaxTML only. Applied in shader constant buffer, live-updated from GUI. White point, grayscale, and desktop gamma moved to MHC tab (baked into ICC profiles).
 
 ## Architecture
 
@@ -361,7 +359,7 @@ preAcquireQpc → acquire frame → `FramePacerRecordAcquisition()` (primary mon
 
 ## GUI Implementation Notes (gui.cpp)
 
-**4 tabs**: MHC, 3D LUT, Corrections, Settings
+**4 tabs**: MHC (base calibration + inline WB/grayscale/DG corrections), 3D LUT, Corrections (HDR tonemapping + MaxTML only), Settings
 
 **Monitor list**: 0-based, shows friendly display name from `monitorFriendlyDeviceName` when available: `Monitor 0 - PA32UCXR: 3840x2160 [Primary]`. Falls back to `Monitor 0: 3840x2160` if name unavailable.
 
@@ -395,7 +393,7 @@ preAcquireQpc → acquire frame → `FramePacerRecordAcquisition()` (primary mon
 
 **MHC ICC Requirements**: Windows 10 21H2+ for `ColorProfileAddDisplayAssociation` API. SDR profiles MUST use sRGB colorants + `associateAsAdvancedColor=FALSE`. HDR profiles use display/BT.2020 colorants + `associateAsAdvancedColor=TRUE`. Wide-gamut colorants on SDR → Windows classifies as "HDR Profile" → not applied when HDR is off.
 
-**MHC Profile Scope**: Matrix (3x3 primaries + white point) + 1D LUT (per-channel gamma). No 3D LUT support — that's what the overlay layer is for. Generated profile naming: `DesktopLUT_Mon{index}_{SDR|HDR}_{tickcount}.icm` (0-based monitor index).
+**MHC Profile Scope**: Matrix (3x3 primaries + white point + white balance) + 1D LUT (per-channel gamma + correction grayscale + desktop gamma). No 3D LUT support — that's what the overlay layer is for. White balance baked into matrix via column scaling. Correction grayscale and desktop gamma composed into 1D LUT via function composition. Generated profile naming: `DesktopLUT_Mon{index}_{SDR|HDR}_{tickcount}.icm` (0-based). HDR desktop gamma generates dual profiles (with/without DG) for instant hotswap via `ReassociateMHC2Profile`.
 
 **MHC File Import**: Edit dialog accepts ICC profiles (.icm/.icc) and 1D .cube files (e.g. BMD_4096). 3D .cube files rejected with error. LUT-based ICC profiles (A2B0/B2A0 tags) rejected — their fallback TRC curves have divergent per-channel gammas unsuitable for 1D correction; only Curves+Matrix profiles accepted. Files with no usable data (no primaries, no TRC) rejected. Import summary popup shows what was extracted (including ICC description and luminance from lumi tag). Control locking is granular: ICC with primaries+TRC locks both sections (SDR only — HDR ICC TRC not used); 1D cube locks only grayscale (primaries/Detect stay enabled since 1D cubes don't contain chromaticity data). White point (Wx/Wy) stays editable when ICC provides primaries — user may override ICC white (always D65 for D65-adapted profiles) with measured white. ICC primaries extraction prefers `chrm` tag (direct CIE xy, no un-adaptation needed) over un-adapted rXYZ/gXYZ/bXYZ — critical for profiles without `chad` tag (e.g. DaVinci Resolve uses `arts` instead). TRC normalization: each channel divided by its max value, separating nonlinearity correction (1D LUT) from channel balance (matrix). Colorimeter spectral mismatch is a constant multiplicative factor per channel — normalization strips gain error while preserving shape (well under 1% shape error per research). ICC parametric curve (`para` tag): type 0 (power law) and type 3 (sRGB-like) supported; types 1, 2, 4 return false (unsupported complexity, no fake 2.2 fallback).
 
@@ -407,68 +405,33 @@ preAcquireQpc → acquire frame → `FramePacerRecordAcquisition()` (primary mon
 
 **ICC White Point**: Computed from sum of un-adapted rXYZ+gXYZ+bXYZ (native display white), not hardcoded D65. EDID Detect still defaults to D65 because displays internally correct white to D65 in their default mode — different from ICC which represents measured reality.
 
-**Corrections Tab Layout**: SDR mode hides Desktop Gamma group; `RecalcCorrectionsLayout` shifts remaining controls up by 51px using stored `tab2BaseY` positions.
+**Corrections Tab Layout**: HDR-only (Tonemapping + MaxTML). SDR corrections (White Point, Grayscale, Desktop Gamma) moved to MHC tab as inline controls baked into ICC profiles.
 
-## Future Ideas
+## Baked Corrections in MHC ICC Profiles (Implemented)
 
-### Bake Corrections into MHC ICC Profiles (Overlay-Free Mode)
+White Point, Grayscale, and Desktop Gamma corrections are baked directly into MHC ICC profiles at GPU scanout. The overlay shader is only needed for tonemapping and 3D LUT.
 
-Reduce overlay dependency by baking shader corrections directly into MHC ICC profiles. The overlay shader would only be needed for tonemapping and 3D LUT — everything else can live in MHC's matrix + 1D LUT at GPU scanout.
-
-**What can be baked into MHC**:
+**What is baked into MHC**:
 | Correction | MHC Component | Notes |
 |-----------|---------------|-------|
 | Primaries matrix (gamut mapping) | Matrix (3x3) | Already supported in MHC generation |
-| White point / white balance gains | Matrix (bake von Kries into matrix) | Currently separate diagonal RGB gains in shader |
-| Grayscale correction (per-channel) | 1D LUT (1024 SDR / 4096 HDR entries) | Already supported in MHC generation |
-| 2.4 gamma (BT.1886) | 1D LUT | Bake gamma transform into LUT curve |
-| Desktop gamma (sRGB→2.2, HDR) | 1D LUT | Already planned (see Memory: MHC-based Desktop Gamma) |
+| White point / white balance gains | Matrix (von Kries diagonal scales srcToXYZ columns) | Baked into 3x4 matrix alongside primaries |
+| Grayscale correction (per-channel) | 1D LUT (1024 SDR / 4096 HDR entries) | Composed on top of base grayscale via function composition |
+| 2.4 gamma (BT.1886) | 1D LUT | Composed into correction grayscale LUT pass |
+| Desktop gamma (sRGB→2.2, HDR) | 1D LUT | SDR range (≤80 nits): sRGB OETF → pow(2.2) → PQ. Dual-profile hotswap |
 
 **What CANNOT be baked**:
 - **Tonemapping**: Per-frame dynamic processing, needs real-time shader
 - **3D LUT**: MHC only supports matrix + 1D LUT, no volumetric transforms
 - **Dynamic peak detection**: GPU compute, per-frame
 
-**Architecture: Shader preview → ICM commit**
+**MHC tab inline controls**: Each MHC section (SDR/HDR) has White Balance (Enable + Wx/Wy), Grayscale (Enable + 10/20/32 points + Edit/Reset + 2.4 gamma), and Desktop Gamma (HDR only: sRGB→2.2 + Whitelist). Changes auto-regenerate the ICC profile via `RegenerateMhcIfActive()`.
 
-The overlay shader serves as a live preview layer while the user adjusts corrections. Once confirmed, corrections are baked into a new ICM profile that combines the base MHC data (1D cube / ICC / manual) with the confirmed corrections. The ICM profile is static — it only changes on explicit confirm or enable/disable toggle.
+**Two-layer grayscale**: Edit dialog grayscale = base calibration (1D cube/ICC TRC/manual). Inline grayscale = fine-tuning on top. Both compose in the 1D LUT: `base(input) → correction(base_output)`.
 
-**Workflow**:
-1. User has an MHC profile active (from 1D cube, ICC import, or manual entry in MHC tab)
-2. User adjusts corrections in the Corrections tab — overlay shader provides instant live preview (as currently)
-3. User confirms corrections → new ICM generated combining base MHC data + corrections, shader corrections disabled for baked parameters
-4. Enable/disable toggle hotswaps between the baked profile and the base profile via `ReassociateMHC2Profile`
+**Dual-profile desktop gamma hotswap** (HDR only): Both DG variants pre-generated at Apply time. `ID_MHC_HDR_DG_ENABLE` checkbox swaps via `ReassociateMHC2Profile` (single API call). Also updates `g_desktopGammaMode` atomic for shader preview.
 
-**On-demand variant generation**: Base profile always exists (from MHC tab). Additional variants are generated as the user enables/disables individual correction checkboxes — each unique combination of enabled corrections produces a variant (Base, Base+Grayscale, Base+Grayscale+WP, Base+WP+24gamma, etc.). Variants are generated on checkbox toggle and hotswapped in, not pre-generated upfront.
-
-**Combining 1D cube + corrections in the 1D LUT** (function composition):
-- **SDR**: `cube_out = cube[ch](input)` → `SrgbEOTF` → `EvalGrayscaleSDR` → optional 2.4 gamma → `SrgbOETF`
-- **HDR**: `cube_out = cube[ch](pqInput)` → `EvalGrayscaleHDR(cube_out, gs, pqPeak)`
-- White balance baked into matrix: `wireRGBtoXYZ * M_correction * diag(wbGains) * XYZtoWireRGB`
-- Multiple non-linear corrections composed into single 1D LUT (grayscale × 2.4 gamma × desktop gamma)
-
-**State management per monitor**:
-- Base ICM data source (loaded 1D cube / ICC / manual MHC params)
-- Confirmed correction values (grayscale, white balance, 2.4 gamma, desktop gamma)
-- Whether user is actively editing (shader active for preview) vs committed (ICM has baked corrections, shader bypassed)
-- Base profile path and baked profile path for hotswap
-
-**Benefits**:
-- **VRR-safe**: MHC operates at GPU scanout, no overlay window to break G-Sync
-- **Zero overhead**: No Desktop Duplication, no shader, no DirectComposition
-- **Passthrough-compatible**: Corrections persist when overlay is hidden for games
-- **Works without overlay running**: Color accuracy even when DesktopLUT process isn't active (profile stays installed)
-- **Instant feedback**: Shader preview during editing feels identical to current UX
-
-**Implementation approach**:
-1. Extend `GenerateMHC2LUT_SDR` / `GenerateMHC2LUT_HDR` to accept optional correction parameters (white balance gains, 2.4 gamma flag, desktop gamma flag)
-2. Add combined path in `GenerateMHC2Profile`: when base has 1D cube/TRC data AND corrections are present, compose them via function composition in the 1D LUT
-3. Bake white balance into the MHC matrix alongside primaries correction
-4. On confirm: generate baked profile, swap it in, disable shader corrections for baked parameters
-5. On enable/disable: hotswap between base and baked profiles via `ReassociateMHC2Profile`
-6. Auto-sleep overlay when only MHC corrections are active (already works) — but now more scenarios qualify
-
-**Key constraint**: MHC matrix is a single 3x3 — it can encode primaries OR white balance OR both combined, but it's still a linear transform. Non-linear corrections (gamma, grayscale) go in the 1D LUT. The 1D LUT can compose multiple curves into one.
+**Key constraint**: MHC matrix is a single 3x3 — encodes primaries + white balance combined. Non-linear corrections (gamma, grayscale) go in the 1D LUT. Multiple curves compose into one.
 
 ## Detailed Reference
 

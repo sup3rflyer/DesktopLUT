@@ -154,6 +154,32 @@ struct MovableAtomic {
 // ID 7026 was ID_MHC_GRAYSCALE_STANDARD (removed)
 #define ID_MHC_FILE_CLEAR        7027
 
+// MHC tab inline correction control IDs (SDR)
+#define ID_MHC_SDR_WB_ENABLE     7030
+#define ID_MHC_SDR_WB_WX         7031
+#define ID_MHC_SDR_WB_WY         7032
+#define ID_MHC_SDR_GS_ENABLE     7033
+#define ID_MHC_SDR_GS_10         7034
+#define ID_MHC_SDR_GS_20         7035
+#define ID_MHC_SDR_GS_32         7036
+#define ID_MHC_SDR_GS_EDIT       7037
+#define ID_MHC_SDR_GS_RESET      7038
+#define ID_MHC_SDR_GS_24         7039
+
+// MHC tab inline correction control IDs (HDR)
+#define ID_MHC_HDR_WB_ENABLE     7040
+#define ID_MHC_HDR_WB_WX         7041
+#define ID_MHC_HDR_WB_WY         7042
+#define ID_MHC_HDR_GS_ENABLE     7043
+#define ID_MHC_HDR_GS_10         7044
+#define ID_MHC_HDR_GS_20         7045
+#define ID_MHC_HDR_GS_32         7046
+#define ID_MHC_HDR_GS_EDIT       7047
+#define ID_MHC_HDR_GS_RESET      7048
+#define ID_MHC_HDR_GS_PEAK       7049
+#define ID_MHC_HDR_DG_ENABLE     7050
+#define ID_MHC_HDR_DG_WHITELIST  7051
+
 // Grayscale editor control IDs
 #define ID_GRAYSCALE_OK     5001
 #define ID_GRAYSCALE_CANCEL 5002
@@ -662,13 +688,30 @@ struct MHCSettings {
     int primariesPreset = 0;           // Index into g_presetPrimaries (0=sRGB default)
     DisplayPrimaries customPrimaries = { 0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3127f, 0.3290f, L"Custom" };
 
-    // MHC's own grayscale correction
+    // MHC's own grayscale correction (base calibration from Edit dialog)
     GrayscaleSettings grayscale;
+
+    // White balance (von Kries target, separate from display measured white)
+    bool whiteBalanceEnabled = false;
+    float whiteBalanceWx = 0.3127f;  // Target white x (D65 default)
+    float whiteBalanceWy = 0.3290f;  // Target white y
+
+    // Correction grayscale (fine-tuning on top of base grayscale from Edit dialog)
+    GrayscaleSettings correctionGrayscale;
+
+    // Desktop gamma (HDR only): sRGB->2.2 baked into 1D LUT
+    bool desktopGammaEnabled = false;
+
+    // Dual-profile paths for desktop gamma hotswap (HDR only)
+    // Base profilePath/profileName stores the WITHOUT-DG variant
+    std::wstring profilePathDG;    // Profile WITH desktop gamma
+    std::wstring profileNameDG;    // Filename for DG variant
 
     // Display metadata for installed profile (computed at Apply time, persisted)
     std::wstring metaPrimaries;  // "sRGB", "Rec.709", "Custom", "P3-D65", etc.
     std::wstring metaGamma;      // SDR: "2.2", "2.2→2.4", "Custom (20pt) + TRC"
                                  // HDR: "PQ", "20pt-Custom + TRC"
+    std::wstring metaWhiteBalance;  // "D65", "Custom (0.3100, 0.3200)", etc.
     float metaPeakNits = 0.0f;   // HDR only, 0 = not set
 };
 
@@ -763,6 +806,32 @@ struct GUIState {
     HWND hwndHdrMhcStatus = nullptr;
     HWND hwndHdrMhcIccCoords[8] = {};
     HWND hwndHdrMhcMetaLabels[3] = {};  // Primaries, Gamma/EOTF, Peak
+
+    // SDR MHC inline correction controls (MHC tab)
+    HWND hwndMhcWbEnable = nullptr;
+    HWND hwndMhcWbWx = nullptr;
+    HWND hwndMhcWbWy = nullptr;
+    HWND hwndMhcGsEnable = nullptr;
+    HWND hwndMhcGs10 = nullptr;
+    HWND hwndMhcGs20 = nullptr;
+    HWND hwndMhcGs32 = nullptr;
+    HWND hwndMhcGsEdit = nullptr;
+    HWND hwndMhcGsReset = nullptr;
+    HWND hwndMhcGs24 = nullptr;         // SDR only: 2.2->2.4 gamma
+
+    // HDR MHC inline correction controls (MHC tab)
+    HWND hwndHdrMhcWbEnable = nullptr;
+    HWND hwndHdrMhcWbWx = nullptr;
+    HWND hwndHdrMhcWbWy = nullptr;
+    HWND hwndHdrMhcGsEnable = nullptr;
+    HWND hwndHdrMhcGs10 = nullptr;
+    HWND hwndHdrMhcGs20 = nullptr;
+    HWND hwndHdrMhcGs32 = nullptr;
+    HWND hwndHdrMhcGsEdit = nullptr;
+    HWND hwndHdrMhcGsReset = nullptr;
+    HWND hwndHdrMhcGsPeak = nullptr;    // HDR only: peak nits edit
+    HWND hwndHdrMhcDgEnable = nullptr;  // HDR only: desktop gamma checkbox
+    HWND hwndHdrMhcDgWhitelist = nullptr; // HDR only: DG whitelist button
 
     // Scrollable panels for each tab
     HWND hwndScrollPanel[4] = { nullptr, nullptr, nullptr, nullptr };
