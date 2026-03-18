@@ -2395,8 +2395,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, g_gui.currentMonitor, 0);
 
             // Update shared memory with new monitor positions/HDR state
-            if (g_dwmHookMode.load() && g_gui.isRunning)
+            if (g_dwmHookMode.load() && g_gui.isRunning) {
+                InvalidateDxgiMonitorCache();
                 UpdateDwmHookSharedConfig();
+            }
 
             // Force reinit if processing is running, or restart if it exited
             if (g_gui.isRunning) {

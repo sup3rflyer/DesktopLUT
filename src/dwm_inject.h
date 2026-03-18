@@ -13,9 +13,6 @@ struct DwmHookMonitorLUT {
     std::wstring hdrLutPath;          // HDR .cube path (empty = no HDR LUT)
 };
 
-// Check if DwmHook.dll is loaded in any dwm.exe process (requires SYSTEM elevation, slow)
-bool IsDwmHookInjected();
-
 // Check if the DWM hook is active via named event (lightweight, no elevation needed).
 // The injected DLL creates Global\DesktopLUT_DwmHook_Active on attach.
 bool IsDwmHookActive();
@@ -40,4 +37,7 @@ void UpdateDwmHookSharedConfig();
 
 // Close shared memory mapping. Called on uninject/stop.
 void CloseDwmHookSharedMemory();
+
+// Invalidate cached DXGI monitor info (call on WM_DISPLAYCHANGE).
+void InvalidateDxgiMonitorCache();
 

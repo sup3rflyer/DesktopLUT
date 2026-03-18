@@ -15,6 +15,7 @@
 #include <vector>
 #include <cmath>
 #include <mutex>
+#include <atomic>
 
 static std::recursive_mutex g_dwmInjectMutex;
 
@@ -79,12 +80,22 @@ static std::wstring ExpandEnv(const wchar_t* src)
     return result;
 }
 
-// Get the directory of the running executable.
+// Get the directory of the running executable (handles paths > MAX_PATH).
 static std::wstring GetExeDirectory()
 {
-    wchar_t buf[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring path(buf);
+    DWORD bufSize = MAX_PATH;
+    std::wstring path(bufSize, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(nullptr, path.data(), bufSize);
+        if (len == 0) return {};
+        if (len < bufSize) {
+            path.resize(len);
+            break;
+        }
+        // Buffer too small — double and retry
+        bufSize *= 2;
+        path.resize(bufSize);
+    }
     auto pos = path.find_last_of(L"\\/");
     if (pos != std::wstring::npos)
         path.resize(pos + 1);
@@ -149,12 +160,22 @@ static std::wstring ElevateToSystem()
     }
     CloseHandle(hProcess);
 
-    if (!ImpersonateLoggedOnUser(hToken)) {
-        std::wstring err = L"Failed to impersonate SYSTEM: " + GetLastErrorString();
+    // Explicitly duplicate to SecurityImpersonation level for full SYSTEM access
+    HANDLE hDupToken = nullptr;
+    if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, nullptr,
+                          SecurityImpersonation, TokenImpersonation, &hDupToken)) {
+        std::wstring err = L"Failed to duplicate SYSTEM token: " + GetLastErrorString();
         CloseHandle(hToken);
         return err;
     }
     CloseHandle(hToken);
+
+    if (!SetThreadToken(nullptr, hDupToken)) {
+        std::wstring err = L"Failed to set impersonation token: " + GetLastErrorString();
+        CloseHandle(hDupToken);
+        return err;
+    }
+    CloseHandle(hDupToken);
 
     // Verify we're SYSTEM
     wchar_t userName[256]{};
@@ -192,38 +213,72 @@ static void DeleteDirectoryRecursive(const std::wstring& dir)
     RemoveDirectoryW(dir.c_str());
 }
 
+// Verify an opened process handle is still dwm.exe (guards against PID reuse).
+static bool IsProcessDwm(HANDLE hProcess)
+{
+    wchar_t name[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameW(hProcess, 0, name, &size)) {
+        const wchar_t* slash = wcsrchr(name, L'\\');
+        const wchar_t* filename = slash ? slash + 1 : name;
+        return _wcsicmp(filename, L"dwm.exe") == 0;
+    }
+    return false;
+}
+
+// Cached DXGI monitor info — refreshed on InjectDwmHook and InvalidateDxgiMonitorCache.
+// Must be accessed under g_dwmInjectMutex.
+struct DxgiMonInfo { int left, top, w, h, bpc; bool hdr; };
+static std::vector<DxgiMonInfo> g_cachedDxgiMons;
+static bool g_dxgiCacheValid = false;
+
+// Enumerate all DXGI monitors (creates fresh factory). Returns cached data if valid.
+static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh = false)
+{
+    if (g_dxgiCacheValid && !forceRefresh)
+        return g_cachedDxgiMons;
+
+    g_cachedDxgiMons.clear();
+
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT ai = 0; factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
+            IDXGIOutput* output = nullptr;
+            for (UINT oi = 0; adapter->EnumOutputs(oi, &output) == S_OK; oi++) {
+                IDXGIOutput6* output6 = nullptr;
+                if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
+                    DXGI_OUTPUT_DESC1 desc1;
+                    if (SUCCEEDED(output6->GetDesc1(&desc1))) {
+                        DxgiMonInfo mi;
+                        mi.left = desc1.DesktopCoordinates.left;
+                        mi.top = desc1.DesktopCoordinates.top;
+                        mi.w = desc1.DesktopCoordinates.right - desc1.DesktopCoordinates.left;
+                        mi.h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
+                        mi.bpc = static_cast<int>(desc1.BitsPerColor);
+                        mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                        g_cachedDxgiMons.push_back(mi);
+                    }
+                    output6->Release();
+                }
+                output->Release();
+                output = nullptr;
+            }
+            adapter->Release();
+            adapter = nullptr;
+        }
+        factory->Release();
+    }
+
+    g_dxgiCacheValid = true;
+    return g_cachedDxgiMons;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 static const wchar_t* const kDllName   = L"DwmHook.dll";
-
-bool IsDwmHookInjected()
-{
-    auto dwmPids = FindProcessesByName(L"dwm.exe");
-    if (dwmPids.empty()) return false;
-
-    for (DWORD pid : dwmPids) {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        if (snap == INVALID_HANDLE_VALUE) continue;
-
-        MODULEENTRY32W me{};
-        me.dwSize = sizeof(me);
-
-        if (Module32FirstW(snap, &me)) {
-            do {
-                if (_wcsicmp(me.szModule, kDllName) == 0) {
-                    CloseHandle(snap);
-                    return true;
-                }
-            } while (Module32NextW(snap, &me));
-        }
-
-        CloseHandle(snap);
-    }
-
-    return false;
-}
 
 bool IsDwmHookActive()
 {
@@ -258,6 +313,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
         FARPROC pFreeLib = hK32 ? GetProcAddress(hK32, "FreeLibrary") : nullptr;
 
+        if (!hK32 || !pFreeLib)
+            std::wcerr << L"[DWM Hook] WARNING: Cannot resolve FreeLibrary — stale injection cleanup skipped" << std::endl;
+
         for (DWORD pid : dwmPids) {
             HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
             if (snap == INVALID_HANDLE_VALUE) continue;
@@ -279,10 +337,15 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
                 std::wcout << L"[DWM Hook] Stale DLL found in PID " << pid << L", unloading first..." << std::endl;
                 HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
                 if (hProc) {
+                    if (!IsProcessDwm(hProc)) {
+                        std::wcerr << L"[DWM Hook] PID " << pid << L" is no longer dwm.exe, skipping stale cleanup" << std::endl;
+                        CloseHandle(hProc);
+                        continue;
+                    }
                     HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0,
                         reinterpret_cast<LPTHREAD_START_ROUTINE>(pFreeLib), dllBase, 0, nullptr);
                     if (hThread) {
-                        WaitForSingleObject(hThread, 10000);
+                        WaitForSingleObject(hThread, 4000);
                         CloseHandle(hThread);
                     }
                     CloseHandle(hProc);
@@ -293,8 +356,19 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 
     // --- Paths ---
     std::wstring basePath = ExpandEnv(L"%SYSTEMROOT%\\Temp\\");
+    if (basePath.empty())
+        return L"Failed to expand %SYSTEMROOT% — environment variable not set";
     std::wstring dllDest  = basePath + kDllName;
     std::wstring lutsDir  = basePath + L"DesktopLUT_luts\\";
+
+    // RAII guard: delete staged DLL on early exit (disarmed on successful injection)
+    struct StagedDllGuard {
+        std::wstring path;
+        bool active = false;
+        ~StagedDllGuard() { if (active) DeleteFileW(path.c_str()); }
+        void arm(const std::wstring& p) { path = p; active = true; }
+        void disarm() { active = false; }
+    } dllGuard;
 
     // --- Copy DwmHook.dll to %SYSTEMROOT%\Temp\ ---
     std::wstring dllSrc = GetExeDirectory() + kDllName;
@@ -304,6 +378,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         return L"Failed to copy DwmHook.dll to staging: " + GetLastErrorString();
     }
     ClearDACL(dllDest);
+    dllGuard.arm(dllDest);
     std::wcout << L"[DWM Hook] DLL staged OK" << std::endl;
 
     // --- Prepare LUT staging directory ---
@@ -346,53 +421,19 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 
     // --- Write monitor metadata for the DLL (DXGI can't run inside DWM) ---
     {
+        // Force-refresh DXGI cache at injection time (fresh factory for accurate HDR state)
+        const auto& mons = EnumerateDxgiMonitors(/*forceRefresh=*/true);
+
         std::wstring monitorsPath = lutsDir + L"monitors.dat";
         FILE* mf = nullptr;
         if (_wfopen_s(&mf, monitorsPath.c_str(), L"w") == 0 && mf) {
-            IDXGIFactory1* factory = nullptr;
-            int count = 0;
-            if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
-                // First pass: count monitors
-                struct MonInfo { int left, top, w, h, bpc, hdr; };
-                std::vector<MonInfo> mons;
-
-                IDXGIAdapter1* adapter = nullptr;
-                for (UINT ai = 0; factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
-                    IDXGIOutput* output = nullptr;
-                    for (UINT oi = 0; adapter->EnumOutputs(oi, &output) == S_OK; oi++) {
-                        IDXGIOutput6* output6 = nullptr;
-                        if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
-                            DXGI_OUTPUT_DESC1 desc1;
-                            if (SUCCEEDED(output6->GetDesc1(&desc1))) {
-                                MonInfo mi;
-                                mi.left = desc1.DesktopCoordinates.left;
-                                mi.top = desc1.DesktopCoordinates.top;
-                                mi.w = desc1.DesktopCoordinates.right - desc1.DesktopCoordinates.left;
-                                mi.h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
-                                mi.bpc = static_cast<int>(desc1.BitsPerColor);
-                                mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1 : 0;
-                                mons.push_back(mi);
-                                std::wcout << L"[DWM Hook] DXGI monitor: (" << mi.left << L"," << mi.top
-                                           << L") " << mi.w << L"x" << mi.h << L" bpc=" << mi.bpc
-                                           << L" hdr=" << mi.hdr << std::endl;
-                            }
-                            output6->Release();
-                        }
-                        output->Release();
-                        output = nullptr;
-                    }
-                    adapter->Release();
-                    adapter = nullptr;
-                }
-                factory->Release();
-
-                fprintf(mf, "%d\n", static_cast<int>(mons.size()));
-                for (const auto& mi : mons) {
-                    fprintf(mf, "%d %d %d %d %d %d\n", mi.left, mi.top, mi.w, mi.h, mi.bpc, mi.hdr);
-                }
-            } else {
-                fprintf(mf, "0\n");
-                std::wcerr << L"[DWM Hook] WARNING: CreateDXGIFactory1 failed for monitors.dat" << std::endl;
+            fprintf(mf, "%d\n", static_cast<int>(mons.size()));
+            for (const auto& mi : mons) {
+                int hdr = mi.hdr ? 1 : 0;
+                fprintf(mf, "%d %d %d %d %d %d\n", mi.left, mi.top, mi.w, mi.h, mi.bpc, hdr);
+                std::wcout << L"[DWM Hook] DXGI monitor: (" << mi.left << L"," << mi.top
+                           << L") " << mi.w << L"x" << mi.h << L" bpc=" << mi.bpc
+                           << L" hdr=" << hdr << std::endl;
             }
             fclose(mf);
             ClearDACL(monitorsPath);
@@ -419,23 +460,15 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     CreateDwmHookSharedMemory();
 
     // --- Inject into all dwm.exe processes ---
-    // Resolve LoadLibraryA address (same virtual address in all processes due to kernel32 ASLR base sharing)
+    // Resolve LoadLibraryW address (same virtual address in all processes due to kernel32 ASLR base sharing)
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel32) {
         return L"Failed to get kernel32.dll handle";
     }
-    FARPROC pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
-    if (!pLoadLibraryA) {
-        return L"Failed to get LoadLibraryA address";
+    FARPROC pLoadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
+    if (!pLoadLibraryW) {
+        return L"Failed to get LoadLibraryW address";
     }
-
-    // Convert DLL path to ANSI for LoadLibraryA
-    int ansiLen = WideCharToMultiByte(CP_ACP, 0, dllDest.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (ansiLen <= 0) {
-        return L"Failed to convert DLL path to ANSI";
-    }
-    std::vector<char> dllPathAnsi(ansiLen);
-    WideCharToMultiByte(CP_ACP, 0, dllDest.c_str(), -1, dllPathAnsi.data(), ansiLen, nullptr, nullptr);
 
     auto dwmPids = FindProcessesByName(L"dwm.exe");
     if (dwmPids.empty()) {
@@ -458,8 +491,15 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             continue;
         }
 
-        // Allocate memory in dwm.exe for the DLL path string
-        SIZE_T pathSize = dllPathAnsi.size(); // includes null terminator
+        // Verify process is still dwm.exe (guards against PID reuse after DWM restart)
+        if (!IsProcessDwm(hProcess)) {
+            std::wcerr << L"[DWM Hook] PID " << pid << L" is no longer dwm.exe, skipping" << std::endl;
+            CloseHandle(hProcess);
+            continue;
+        }
+
+        // Allocate memory in dwm.exe for the wide DLL path string
+        SIZE_T pathSize = (dllDest.size() + 1) * sizeof(wchar_t); // includes null terminator
         LPVOID remoteMem = VirtualAllocEx(hProcess, nullptr, pathSize,
                                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (!remoteMem) {
@@ -471,7 +511,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         }
 
         SIZE_T bytesWritten = 0;
-        if (!WriteProcessMemory(hProcess, remoteMem, dllPathAnsi.data(), pathSize, &bytesWritten)) {
+        if (!WriteProcessMemory(hProcess, remoteMem, dllDest.c_str(), pathSize, &bytesWritten)) {
             std::wcerr << L"Warning: WriteProcessMemory failed for PID " << pid << L": " << GetLastErrorString() << std::endl;
             VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
             CloseHandle(hProcess);
@@ -480,11 +520,11 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             continue;
         }
 
-        // Create remote thread to call LoadLibraryA with the DLL path
+        // Create remote thread to call LoadLibraryW with the wide DLL path
         DWORD threadId = 0;
         HANDLE hThread = CreateRemoteThread(
             hProcess, nullptr, 0,
-            reinterpret_cast<LPTHREAD_START_ROUTINE>(pLoadLibraryA),
+            reinterpret_cast<LPTHREAD_START_ROUTINE>(pLoadLibraryW),
             remoteMem, 0, &threadId);
 
         if (!hThread) {
@@ -496,7 +536,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             continue;
         }
 
-        DWORD waitResult = WaitForSingleObject(hThread, 10000);
+        DWORD waitResult = WaitForSingleObject(hThread, 4000);
 
         // Get exit code before closing handle (fallback verification)
         DWORD exitCode = 0;
@@ -508,7 +548,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             // Don't free remoteMem — thread may still be using it
             CloseHandle(hProcess);
             anyFailed = true;
-            if (firstError.empty()) firstError = L"Remote LoadLibraryA thread timed out in dwm.exe PID " + std::to_wstring(pid);
+            if (firstError.empty()) firstError = L"Remote LoadLibraryW thread timed out in dwm.exe PID " + std::to_wstring(pid);
             continue;
         }
 
@@ -533,15 +573,15 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             }
 
             if (!dllFound && exitCode != 0) {
-                // Module enumeration failed but LoadLibraryA returned non-NULL (low 32 bits)
+                // Module enumeration failed but LoadLibraryW returned non-NULL (low 32 bits)
                 // Trust the exit code — HMODULE truncation is theoretical, not practical
                 dllFound = true;
                 std::wcout << L"[DWM Hook] Module enumeration couldn't verify DLL in PID " << pid
-                           << L", but LoadLibraryA returned 0x" << std::hex << exitCode << std::dec << std::endl;
+                           << L", but LoadLibraryW returned 0x" << std::hex << exitCode << std::dec << std::endl;
             }
 
             if (!dllFound) {
-                std::wcout << L"[DWM Hook] DLL not found in PID " << pid << L" after LoadLibraryA (exitCode=0x"
+                std::wcout << L"[DWM Hook] DLL not found in PID " << pid << L" after LoadLibraryW (exitCode=0x"
                            << std::hex << exitCode << std::dec << L")" << std::endl;
                 anyFailed = true;
                 if (firstError.empty())
@@ -560,15 +600,13 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     DeleteDirectoryRecursive(lutsDir);
 
     if (anyFailed) {
-        // On failure, also clean up the DLL
-        DeleteFileW(dllDest.c_str());
-    }
-
-    if (anyFailed) {
+        // dllGuard will auto-delete the staged DLL on return
         std::wcout << L"[DWM Hook] Injection completed with errors: " << firstError << std::endl;
         return firstError;
     }
 
+    // Injection succeeded — keep the staged DLL (dwm.exe has it loaded)
+    dllGuard.disarm();
     std::wcout << L"[DWM Hook] Injection successful" << std::endl;
     return {};
 }
@@ -637,6 +675,13 @@ std::wstring UninjectDwmHook()
             continue;
         }
 
+        // Verify process is still dwm.exe (guards against PID reuse after DWM restart)
+        if (!IsProcessDwm(hProcess)) {
+            std::wcerr << L"[DWM Hook] PID " << pid << L" is no longer dwm.exe, skipping uninject" << std::endl;
+            CloseHandle(hProcess);
+            continue;
+        }
+
         DWORD threadId = 0;
         HANDLE hThread = CreateRemoteThread(
             hProcess, nullptr, 0,
@@ -651,7 +696,7 @@ std::wstring UninjectDwmHook()
             continue;
         }
 
-        DWORD waitResult = WaitForSingleObject(hThread, 10000);
+        DWORD waitResult = WaitForSingleObject(hThread, 4000);
         CloseHandle(hThread);
         if (waitResult == WAIT_TIMEOUT) {
             std::wcerr << L"Warning: FreeLibrary thread timed out for PID " << pid << std::endl;
@@ -663,8 +708,11 @@ std::wstring UninjectDwmHook()
 
     // Clean up shared memory and DLL from staging location
     CloseDwmHookSharedMemory();
-    std::wstring dllPath = ExpandEnv(L"%SYSTEMROOT%\\Temp\\") + kDllName;
-    DeleteFileW(dllPath.c_str());
+    std::wstring sysTemp = ExpandEnv(L"%SYSTEMROOT%\\Temp\\");
+    if (!sysTemp.empty()) {
+        std::wstring dllPath = sysTemp + kDllName;
+        DeleteFileW(dllPath.c_str());
+    }
 
     if (anyFailed) {
         std::wcout << L"[DWM Hook] Uninjection completed with errors" << std::endl;
@@ -742,39 +790,8 @@ void UpdateDwmHookSharedConfig()
     cfg.hostPid = GetCurrentProcessId();
     cfg.lutReloadFlag = g_sharedMemPtr->lutReloadFlag;
 
-    // Enumerate monitors via DXGI
-    struct MonInfo { int left, top, w, h, bpc; bool hdr; };
-    std::vector<MonInfo> mons;
-
-    IDXGIFactory1* factory = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
-        IDXGIAdapter1* adapter = nullptr;
-        for (UINT ai = 0; factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
-            IDXGIOutput* output = nullptr;
-            for (UINT oi = 0; adapter->EnumOutputs(oi, &output) == S_OK; oi++) {
-                IDXGIOutput6* output6 = nullptr;
-                if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
-                    DXGI_OUTPUT_DESC1 desc1;
-                    if (SUCCEEDED(output6->GetDesc1(&desc1))) {
-                        MonInfo mi;
-                        mi.left = desc1.DesktopCoordinates.left;
-                        mi.top = desc1.DesktopCoordinates.top;
-                        mi.w = desc1.DesktopCoordinates.right - desc1.DesktopCoordinates.left;
-                        mi.h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
-                        mi.bpc = static_cast<int>(desc1.BitsPerColor);
-                        mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-                        mons.push_back(mi);
-                    }
-                    output6->Release();
-                }
-                output->Release();
-                output = nullptr;
-            }
-            adapter->Release();
-            adapter = nullptr;
-        }
-        factory->Release();
-    }
+    // Use cached DXGI monitor info (refreshed on inject and WM_DISPLAYCHANGE)
+    const auto& mons = EnumerateDxgiMonitors();
 
     cfg.numMonitors = static_cast<uint32_t>(std::min(mons.size(), static_cast<size_t>(MAX_DWM_HOOK_MONITORS)));
 
@@ -804,8 +821,15 @@ void UpdateDwmHookSharedConfig()
         }
     }
 
-    cfg.version = ++g_sharedMemVersion;
-    memcpy(g_sharedMemPtr, &cfg, sizeof(DwmHookSharedConfig));
+    // Write data first, then version last with release fence to prevent torn reads.
+    // The DWM hook checks version to detect updates — seeing new version with stale
+    // data would cause one frame of wrong tonemap params.
+    cfg.version = 0; // placeholder (overwritten below)
+    memcpy(reinterpret_cast<char*>(g_sharedMemPtr) + sizeof(uint32_t),
+           reinterpret_cast<const char*>(&cfg) + sizeof(uint32_t),
+           sizeof(DwmHookSharedConfig) - sizeof(uint32_t));
+    std::atomic_thread_fence(std::memory_order_release);
+    g_sharedMemPtr->version = ++g_sharedMemVersion;
 }
 
 void CloseDwmHookSharedMemory()
@@ -822,3 +846,8 @@ void CloseDwmHookSharedMemory()
     g_sharedMemVersion = 0;
 }
 
+void InvalidateDxgiMonitorCache()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    g_dxgiCacheValid = false;
+}
