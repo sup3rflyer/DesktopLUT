@@ -21,27 +21,10 @@ static HFONT g_analysisFont = nullptr;
 static const int ANALYSIS_DISPATCH_INTERVAL = 30;  // Dispatch every 30 frames (~0.5 sec at 60Hz)
 static const int ANALYSIS_READBACK_DELAY = 2;      // Read back 2 frames after dispatch
 
-// Custom message for async UI update (offloads formatting from render thread)
-static const UINT WM_UPDATE_ANALYSIS = WM_USER + 2;
-
-// Data passed to UI thread for formatting
-struct AnalysisDisplayData {
-    AnalysisResult result;
-    bool isHDR;
-    float targetPeak;
-    float sessionMaxCLL;
-    float sessionMaxFALL;
-    // Tonemap state for TM indicator
-    bool tonemapEnabled;
-    bool tonemapDynamic;
-    float tonemapSourcePeak;   // Static mode: configured source peak
-    float tonemapTargetPeak;   // Target peak (display capability)
-    float detectedPeak;        // Dynamic mode: GPU-detected peak
-    // Frame timing
-    FrameTimingStats frameTiming;
-};
-static AnalysisDisplayData g_pendingAnalysis = {};
-static std::atomic<bool> g_analysisDataReady{false};
+// AnalysisDisplayData declared in analysis.h (shared with gui.cpp for hook polling)
+// Definitions (non-static for cross-TU access):
+AnalysisDisplayData g_pendingAnalysis = {};
+std::atomic<bool> g_analysisDataReady{false};
 
 // Analysis overlay window procedure
 static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -354,6 +337,9 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 }
 
 bool CreateAnalysisOverlay(HINSTANCE hInstance) {
+    // Skip if already created (hook-only mode creates it early, overlay thread must not duplicate)
+    if (g_analysisHwnd) return true;
+
     // Register window class
     WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
     wc.lpfnWndProc = AnalysisWndProc;

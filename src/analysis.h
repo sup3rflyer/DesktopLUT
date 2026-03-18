@@ -7,6 +7,30 @@
 
 // AnalysisResult is defined in types.h
 
+// Data passed to UI thread for formatting (used by both render thread and hook polling)
+struct AnalysisDisplayData {
+    AnalysisResult result;
+    bool isHDR;
+    float targetPeak;
+    float sessionMaxCLL;
+    float sessionMaxFALL;
+    // Tonemap state for TM indicator
+    bool tonemapEnabled;
+    bool tonemapDynamic;
+    float tonemapSourcePeak;   // Static mode: configured source peak
+    float tonemapTargetPeak;   // Target peak (display capability)
+    float detectedPeak;        // Dynamic mode: GPU-detected peak
+    // Frame timing
+    FrameTimingStats frameTiming;
+};
+
+// Shared state for analysis data handoff (non-static for hook polling access)
+extern AnalysisDisplayData g_pendingAnalysis;
+extern std::atomic<bool> g_analysisDataReady;
+
+// Custom message for async UI update
+static const UINT WM_UPDATE_ANALYSIS = WM_USER + 2;
+
 // Overlay management
 bool CreateAnalysisOverlay(HINSTANCE hInstance);
 void DestroyAnalysisOverlay();

@@ -1428,9 +1428,10 @@ void RenderAll(FramePacer* fp) {
         } else {
             Sleep(50);
         }
-        // Fall through if reinit or pending corrections need processing — both are
-        // handled after this block and can change whether the overlay is needed.
-        if (!g_forceReinit.load() && !g_hasPendingColorCorrections.load()) {
+        // Fall through if reinit, pending corrections, or analysis state change
+        // need processing — all can change whether the overlay needs to render.
+        if (!g_forceReinit.load() && !g_hasPendingColorCorrections.load()
+            && !g_analysisEnabled.load()) {
             return;
         }
     }
@@ -1659,7 +1660,7 @@ void RenderAll(FramePacer* fp) {
         bool hasGs = cc2.grayscale.enabled && !mhcG;
         bool hasWB = cc2.primariesEnabled && !mhcP &&
             (cc2.whiteBalanceGains[0] != 1.0f || cc2.whiteBalanceGains[1] != 1.0f || cc2.whiteBalanceGains[2] != 1.0f);
-        bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled;
+        bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled && !g_dwmHookMode.load();
         bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;
         bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only

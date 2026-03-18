@@ -63,7 +63,7 @@ Rules:
 ```bash
 # From Git Bash (Claude Code environment)
 "/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" \
-  "H:\Projects\DesktopLUT_DWM\DesktopLUT.sln" -p:Configuration=Release -p:Platform=x64 -v:minimal
+  "H:\Projects\DesktopLUT\DesktopLUT.sln" -p:Configuration=Release -p:Platform=x64 -v:minimal
 ```
 
 Requires: VS2022, Windows SDK 10.0.19041+, C++20
@@ -72,7 +72,7 @@ Requires: VS2022, Windows SDK 10.0.19041+, C++20
 
 ```bash
 "/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" \
-  "H:\Projects\DesktopLUT_DWM\DesktopLUT.Tests.vcxproj" -p:Configuration=Release -p:Platform=x64 -v:minimal
+  "H:\Projects\DesktopLUT\DesktopLUT.Tests.vcxproj" -p:Configuration=Release -p:Platform=x64 -v:minimal
 
 ./bin/Test/DesktopLUT.Tests.exe
 ```
@@ -112,16 +112,18 @@ Key APIs:
 - `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` prevents feedback loop
 - `ColorProfileAddDisplayAssociation` / `ColorProfileRemoveDisplayAssociation` for MHC ICC management
 
-### DWM Hook Mode (this branch)
+### DWM Hook Mode (Experimental)
 
 In DWM hook mode (`DwmHookMode=true`), 3D LUTs are applied by injecting `DwmHook.dll` into `dwm.exe` rather than via the overlay. The overlay is only started when genuinely needed:
 
 **Overlay activates for** (evaluated per-frame in `RenderAll`, stored as `shaderCorrActive`):
 - HDR tonemapping enabled (`cc.tonemap.enabled && ctx.isHDREnabled`)
-- Analysis overlay active (`g_analysisEnabled`, primary monitor only)
+- Analysis overlay active (`g_analysisEnabled`, primary monitor only) — but see hook analysis below
 - MHC or grayscale editor open for live preview (`g_mhcEditDialogOpen`)
 
 **Overlay stays off for all other cases** — MHC ICC profiles handle primaries, white balance, grayscale, and desktop gamma at GPU scanout with zero overlay overhead.
+
+**Hook analysis mode**: When overlay is not running (LUT-only), analysis runs inside the DWM hook. The hook compiles the analysis CS alongside the LUT/tonemap shaders, dispatches it on the same backbuffer, and writes results to shared memory (`DwmHookAnalysisResult` in `DwmHookSharedConfig`). The host polls at ~60Hz via `ANALYSIS_POLL_TIMER_ID` and feeds data to the same `WM_UPDATE_ANALYSIS` path. Hotkeys are registered on `g_gui.hwndMain` (tracked by `g_hookOnlyHotkeys`). Frame timing stats are unavailable in hook mode (no DD frame pacer). Analysis window is a standalone GDI window — no DD required.
 
 **Auto-sleep**: When `shaderCorrActive` is false for all monitors and no LUT is loaded in overlay, `g_overlayAutoSleep` is set, windows are hidden, and the render loop waits on `g_overlayWakeEvent` (500ms timeout). `WM_SHADER_STATE_CHANGED` → `UpdateTrayIcon` + `DwmHookReevaluateOverlay` — tray icon reflects actual DD state.
 

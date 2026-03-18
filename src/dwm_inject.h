@@ -5,6 +5,7 @@
 
 #include <string>
 #include <vector>
+#include "../shared/dwm_hook_config.h"
 
 struct DwmHookMonitorLUT {
     int left = 0, top = 0;           // Desktop position from MONITORINFO
@@ -28,3 +29,15 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors);
 // Uninject DwmHook.dll from all dwm.exe processes via FreeLibrary.
 // Returns empty string on success, error message on failure.
 std::wstring UninjectDwmHook();
+
+// --- Shared memory IPC (live parameter updates to hook without re-injection) ---
+
+// Create shared memory mapping. Called before injection so DLL can open it in DLL_PROCESS_ATTACH.
+bool CreateDwmHookSharedMemory();
+
+// Update shared memory with current tonemap params. Called on GUI changes and WM_DISPLAYCHANGE.
+void UpdateDwmHookSharedConfig();
+
+// Close shared memory mapping. Called on uninject/stop.
+void CloseDwmHookSharedMemory();
+

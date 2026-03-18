@@ -13,6 +13,7 @@
 #include "displayconfig.h"
 #include "mhc.h"
 #include "dwm_inject.h"
+#include "analysis.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -1340,13 +1341,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         // Tonemapping controls (HDR only)
+        // In hook mode, tonemap is handled by DwmHook.dll via shared memory.
+        // We still call UpdateColorCorrectionLive() so the overlay's MonitorContext stays
+        // in sync for the analysis overlay's TM indicator (reads ctx->hdrColorCorrection.tonemap).
         case ID_CORR_TONEMAP_ENABLE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                 bool enabled = (SendMessage(g_gui.hwndTonemapEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.enabled = enabled;
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                    DwmHookReevaluateOverlay();
+                    if (g_dwmHookMode.load())
+                        UpdateDwmHookSharedConfig();
+                    else
+                        DwmHookReevaluateOverlay();
                 } else if (enabled) {
                     StartProcessing();
                 }
@@ -1363,6 +1370,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         DropdownIndexToTonemapCurve(sel);
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+                        if (g_dwmHookMode.load())
+                            UpdateDwmHookSharedConfig();
                     }
                     SaveSettings();
                 }
@@ -1380,6 +1389,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (tm.targetPeakNits > 10000.0f) tm.targetPeakNits = 10000.0f;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+                        if (g_dwmHookMode.load())
+                            UpdateDwmHookSharedConfig();
                     }
                     SaveSettings();
                 }
@@ -1393,6 +1404,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(g_gui.hwndTonemapSource, !enabled);
                 if (g_gui.isRunning) {
                     UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+                    if (g_dwmHookMode.load())
+                        UpdateDwmHookSharedConfig();
                 }
                 SaveSettings();
             }
@@ -1409,6 +1422,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (tm.sourcePeakNits > 10000.0f) tm.sourcePeakNits = 10000.0f;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+                        if (g_dwmHookMode.load())
+                            UpdateDwmHookSharedConfig();
                     }
                     SaveSettings();
                 }
@@ -2009,9 +2024,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyGamma, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_hotkeyGammaEnabled.store(enable);
-                if (g_mainHwnd) {
-                    PostMessage(g_mainHwnd, WM_HOTKEY_REGISTER, HOTKEY_GAMMA, enable ? 1 : 0);
-                }
+                HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
+                if (target) PostMessage(target, WM_HOTKEY_REGISTER, HOTKEY_GAMMA, enable ? 1 : 0);
                 SaveSettings();
             }
             return 0;
@@ -2020,9 +2034,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyHdr, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_hotkeyHdrEnabled.store(enable);
-                if (g_mainHwnd) {
-                    PostMessage(g_mainHwnd, WM_HOTKEY_REGISTER, HOTKEY_HDR_TOGGLE, enable ? 1 : 0);
-                }
+                HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
+                if (target) PostMessage(target, WM_HOTKEY_REGISTER, HOTKEY_HDR_TOGGLE, enable ? 1 : 0);
                 SaveSettings();
             }
             return 0;
@@ -2031,9 +2044,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyAnalysis, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_hotkeyAnalysisEnabled.store(enable);
-                if (g_mainHwnd) {
-                    PostMessage(g_mainHwnd, WM_HOTKEY_REGISTER, HOTKEY_ANALYSIS, enable ? 1 : 0);
-                }
+                HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
+                if (target) PostMessage(target, WM_HOTKEY_REGISTER, HOTKEY_ANALYSIS, enable ? 1 : 0);
                 SaveSettings();
             }
             return 0;
@@ -2138,7 +2150,21 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DwmHookReevaluateOverlay();
         return 0;
 
-    case WM_USER + 100:  // Processing stopped
+    case WM_USER + 100:  // Processing thread exited
+        // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
+        // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
+        if (g_dwmHookMode.load() && g_running.load()) {
+            if (!g_hookOnlyHotkeys && g_gui.hwndMain) {
+                if (g_hotkeyGammaEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
+                if (g_hotkeyAnalysisEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
+                if (g_hotkeyHdrEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
+                g_hookOnlyHotkeys = true;
+            }
+            return 0;  // Hook still running — don't set isRunning=false or trigger auto-restart
+        }
         g_gui.isRunning = false;
         UpdateTrayIcon(false);
         UpdateGUIState();
@@ -2162,6 +2188,58 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+
+    case WM_HOTKEY:
+        // Hook-only mode: hotkeys registered on GUI window
+        if (g_hookOnlyHotkeys) {
+            if (wParam == HOTKEY_GAMMA) {
+                // Toggle desktop gamma (HDR only)
+                bool newMode = !g_desktopGammaMode.load();
+                g_desktopGammaMode.store(newMode);
+                g_userDesktopGammaMode.store(newMode);
+                if (g_gammaWhitelistActive.load()) {
+                    std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
+                    g_gammaWhitelistOverrideProcess = g_gammaWhitelistMatch;
+                    for (wchar_t& c : g_gammaWhitelistOverrideProcess) c = towlower(c);
+                    g_gammaWhitelistMatch.clear();
+                    g_gammaWhitelistUserOverride.store(true);
+                    g_gammaWhitelistActive.store(false);
+                }
+                std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
+                ShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
+            }
+            else if (wParam == HOTKEY_ANALYSIS) {
+                ToggleAnalysisOverlay();
+                // In hook mode, start/stop the DD overlay for analysis
+                // (HasActiveShaderCorrections checks g_analysisEnabled)
+                DwmHookReevaluateOverlay();
+                // Wake auto-sleeping overlay thread so it picks up the analysis state change
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            }
+            else if (wParam == HOTKEY_HDR_TOGGLE) {
+                ToggleHdrOnFocusedMonitor();
+            }
+        }
+        return 0;
+
+    case WM_HOTKEY_REGISTER:
+        // Dynamic hotkey register/unregister from Settings tab (hook-only mode)
+        if (g_hookOnlyHotkeys) {
+            int hotkeyId = (int)wParam;
+            bool enable = (lParam != 0);
+            UINT vk = 0;
+            switch (hotkeyId) {
+                case HOTKEY_GAMMA:    vk = g_hotkeyGammaKey; break;
+                case HOTKEY_HDR_TOGGLE: vk = g_hotkeyHdrKey; break;
+                case HOTKEY_ANALYSIS: vk = g_hotkeyAnalysisKey; break;
+            }
+            if (vk) {
+                if (enable) RegisterHotKey(hwnd, hotkeyId, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, vk);
+                else UnregisterHotKey(hwnd, hotkeyId);
+            }
+            return 0;
+        }
+        break;
 
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) {
@@ -2321,6 +2399,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, g_gui.currentMonitor, 0);
+
+            // Update shared memory with new monitor positions/HDR state
+            if (g_dwmHookMode.load() && g_gui.isRunning)
+                UpdateDwmHookSharedConfig();
 
             // Force reinit if processing is running, or restart if it exited
             if (g_gui.isRunning) {

@@ -2,6 +2,9 @@
 // DWM Hook DLL injection/uninjection — native C++ port of dwm_lut_fixed Injector.cs
 
 #include "dwm_inject.h"
+#include "../shared/dwm_hook_config.h"
+#include "globals.h"
+#include "gui.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -10,6 +13,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -407,6 +411,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         }
     }
 
+    // --- Create shared memory for live IPC (before injection so DLL can open in DLL_PROCESS_ATTACH) ---
+    CreateDwmHookSharedMemory();
+
     // --- Inject into all dwm.exe processes ---
     // Resolve LoadLibraryA address (same virtual address in all processes due to kernel32 ASLR base sharing)
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -649,7 +656,8 @@ std::wstring UninjectDwmHook()
         CloseHandle(hProcess);
     }
 
-    // Clean up DLL from staging location
+    // Clean up shared memory and DLL from staging location
+    CloseDwmHookSharedMemory();
     std::wstring dllPath = ExpandEnv(L"%SYSTEMROOT%\\Temp\\") + kDllName;
     DeleteFileW(dllPath.c_str());
 
@@ -661,3 +669,148 @@ std::wstring UninjectDwmHook()
     std::wcout << L"[DWM Hook] Uninjection successful" << std::endl;
     return {};
 }
+
+// ---------------------------------------------------------------------------
+// Shared memory IPC
+// ---------------------------------------------------------------------------
+
+static HANDLE g_sharedMemHandle = nullptr;
+static DwmHookSharedConfig* g_sharedMemPtr = nullptr;
+static uint32_t g_sharedMemVersion = 0;
+
+static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
+    switch (curve) {
+        case 0:  return DWMHOOK_TONEMAP_BT2390;
+        case 1:  return DWMHOOK_TONEMAP_SOFTCLIP;
+        case 2:  return DWMHOOK_TONEMAP_REINHARD;
+        case 3:  return DWMHOOK_TONEMAP_BT2446A;
+        case 4:  return DWMHOOK_TONEMAP_HARDCLIP;
+        default: return DWMHOOK_TONEMAP_BT2390;
+    }
+}
+
+bool CreateDwmHookSharedMemory()
+{
+    if (g_sharedMemPtr) return true;
+
+    // NULL DACL = unrestricted access. Required because dwm.exe runs as SYSTEM and
+    // our process runs as admin — without NULL DACL, SYSTEM can't open the mapping.
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+
+    g_sharedMemHandle = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
+        sizeof(DwmHookSharedConfig), DWM_HOOK_CONFIG_NAME);
+
+    if (!g_sharedMemHandle) {
+        std::wcerr << L"[DWM Hook] Failed to create shared memory: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    g_sharedMemPtr = static_cast<DwmHookSharedConfig*>(
+        MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, sizeof(DwmHookSharedConfig)));
+
+    if (!g_sharedMemPtr) {
+        std::wcerr << L"[DWM Hook] Failed to map shared memory: " << GetLastError() << std::endl;
+        CloseHandle(g_sharedMemHandle);
+        g_sharedMemHandle = nullptr;
+        return false;
+    }
+
+    memset(g_sharedMemPtr, 0, sizeof(DwmHookSharedConfig));
+    g_sharedMemVersion = 0;
+    UpdateDwmHookSharedConfig();
+
+    std::wcout << L"[DWM Hook] Shared memory created OK" << std::endl;
+    return true;
+}
+
+void UpdateDwmHookSharedConfig()
+{
+    if (!g_sharedMemPtr) return;
+
+    DwmHookSharedConfig cfg = {};
+    cfg.hostPid = GetCurrentProcessId();
+    cfg.lutReloadFlag = g_sharedMemPtr->lutReloadFlag;
+
+    // Enumerate monitors via DXGI
+    struct MonInfo { int left, top, w, h, bpc; bool hdr; };
+    std::vector<MonInfo> mons;
+
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT ai = 0; factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
+            IDXGIOutput* output = nullptr;
+            for (UINT oi = 0; adapter->EnumOutputs(oi, &output) == S_OK; oi++) {
+                IDXGIOutput6* output6 = nullptr;
+                if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
+                    DXGI_OUTPUT_DESC1 desc1;
+                    if (SUCCEEDED(output6->GetDesc1(&desc1))) {
+                        MonInfo mi;
+                        mi.left = desc1.DesktopCoordinates.left;
+                        mi.top = desc1.DesktopCoordinates.top;
+                        mi.w = desc1.DesktopCoordinates.right - desc1.DesktopCoordinates.left;
+                        mi.h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
+                        mi.bpc = static_cast<int>(desc1.BitsPerColor);
+                        mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                        mons.push_back(mi);
+                    }
+                    output6->Release();
+                }
+                output->Release();
+                output = nullptr;
+            }
+            adapter->Release();
+            adapter = nullptr;
+        }
+        factory->Release();
+    }
+
+    cfg.numMonitors = static_cast<uint32_t>(std::min(mons.size(), static_cast<size_t>(MAX_DWM_HOOK_MONITORS)));
+
+    for (uint32_t i = 0; i < cfg.numMonitors; i++) {
+        auto& mc = cfg.monitors[i];
+        mc.left = mons[i].left;
+        mc.top = mons[i].top;
+        mc.width = static_cast<uint32_t>(mons[i].w);
+        mc.height = static_cast<uint32_t>(mons[i].h);
+        mc.bpc = static_cast<uint32_t>(mons[i].bpc);
+        mc.isHdr = mons[i].hdr ? 1 : 0;
+
+        // Match to GUI monitor settings by position
+        for (size_t mi = 0; mi < g_gui.monitors.size() && mi < g_gui.monitorSettings.size(); mi++) {
+            MONITORINFO info = { sizeof(info) };
+            if (GetMonitorInfo(g_gui.monitors[mi], &info)) {
+                if (info.rcMonitor.left == mc.left && info.rcMonitor.top == static_cast<int32_t>(mc.top)) {
+                    const auto& tm = g_gui.monitorSettings[mi].hdrColorCorrection.tonemap;
+                    mc.tonemapEnabled = tm.enabled ? 1 : 0;
+                    mc.tonemapCurve = ConvertTonemapCurve(static_cast<int>(tm.curve));
+                    mc.sourcePeakNits = tm.sourcePeakNits;
+                    mc.targetPeakNits = tm.targetPeakNits;
+                    mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    cfg.version = ++g_sharedMemVersion;
+    memcpy(g_sharedMemPtr, &cfg, sizeof(DwmHookSharedConfig));
+}
+
+void CloseDwmHookSharedMemory()
+{
+    if (g_sharedMemPtr) {
+        UnmapViewOfFile(g_sharedMemPtr);
+        g_sharedMemPtr = nullptr;
+    }
+    if (g_sharedMemHandle) {
+        CloseHandle(g_sharedMemHandle);
+        g_sharedMemHandle = nullptr;
+    }
+    g_sharedMemVersion = 0;
+}
+

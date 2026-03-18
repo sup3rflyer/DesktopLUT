@@ -533,7 +533,7 @@ static bool HasActiveShaderCorrections() {
         const auto& hdr = ms.hdrColorCorrection;
         if (hdr.primariesEnabled && !hdrMhcP) return true;
         if (hdr.grayscale.enabled && !hdrMhcG) return true;
-        if (hdr.tonemap.enabled) return true;
+        if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
         if (desktopGamma && !hdrMhcG) return true;
     }
     return false;
@@ -639,6 +639,20 @@ void StartProcessing() {
             g_gui.isRunning = true;
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+
+            // Register hotkeys on GUI window since overlay WndProc doesn't exist
+            if (g_gui.hwndMain) {
+                if (g_hotkeyGammaEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
+                if (g_hotkeyAnalysisEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
+                if (g_hotkeyHdrEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
+                g_hookOnlyHotkeys = true;
+            }
+
+            // Create analysis overlay (for potential hotkey toggle)
+            CreateAnalysisOverlay(GetModuleHandle(nullptr));
         }
 
         EnableWindow(g_gui.hwndApply, FALSE);
@@ -678,6 +692,19 @@ void StopProcessing() {
     // Kill DWM hook watchdog timer
     if (g_gui.hwndMain)
         KillTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID);
+
+    // Unregister hotkeys from GUI window if registered there (hook-only mode)
+    if (g_hookOnlyHotkeys && g_gui.hwndMain) {
+        UnregisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA);
+        UnregisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS);
+        UnregisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE);
+        g_hookOnlyHotkeys = false;
+    }
+
+    // Destroy analysis overlay if created in hook-only mode
+    if (g_dwmHookMode.load() && !g_gui.processingThread.joinable()) {
+        DestroyAnalysisOverlay();
+    }
 
     // Uninject DWM hook if in DWM hook mode (always try — harmless if not injected)
     if (g_dwmHookMode.load()) {
@@ -747,6 +774,13 @@ void DwmHookReevaluateOverlay() {
         // Join any previously-exited thread (e.g., after watchdog exit) before spawning new one
         if (g_gui.processingThread.joinable()) {
             g_gui.processingThread.join();
+        }
+        // Unregister hook-only hotkeys — overlay thread will register its own on the overlay window
+        if (g_hookOnlyHotkeys && g_gui.hwndMain) {
+            UnregisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA);
+            UnregisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS);
+            UnregisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE);
+            g_hookOnlyHotkeys = false;
         }
         std::cout << "[DWM Hook] Shader overlay now needed, starting DD" << std::endl;
         std::vector<MonitorLUTConfig> configs;

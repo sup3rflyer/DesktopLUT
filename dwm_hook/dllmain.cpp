@@ -5,12 +5,14 @@
  * This program is free software: you can redistribute it and/or modify...
  */
 #include "pch.h"
+#include "dwm_hook_config.h"
 
 #include <io.h>
 #include <string>
 #include <sstream>
 #include <iostream>
 #include <iomanip>
+#include <cmath>
 #pragma comment (lib, "d3d11.lib")
 #pragma comment (lib, "d3dcompiler.lib")
 #pragma comment (lib, "dxgi.lib")
@@ -287,6 +289,31 @@ static HANDLE g_hostMonitorThread = NULL;
 static HANDLE g_hostMonitorStopEvent = NULL;
 static volatile bool g_hookReverted = false;  // Set when host dies, prevents double-revert in DLL_PROCESS_DETACH
 
+// --- Shared memory IPC: live parameter updates from host ---
+static HANDLE g_sharedMemHandle = NULL;
+static const DwmHookSharedConfig* g_sharedConfig = NULL;
+static uint32_t g_localConfigVersion = 0;
+
+// Local tonemap params per monitor (updated from shared memory)
+struct LocalTonemapParams {
+	int left, top;
+	bool enabled;
+	DwmHookTonemapCurve curve;
+	float sourcePeakNits;
+	float targetPeakNits;
+	bool dynamicPeak;
+	// Precomputed PQ values (avoid per-pixel pow)
+	float pqSourcePeak;
+	float pqTargetPeak;
+};
+static LocalTonemapParams g_localTonemap[MAX_DWM_HOOK_MONITORS] = {};
+static int g_numLocalTonemap = 0;
+
+// Forward declarations for shared memory functions (defined after g_monitorHdrStates)
+static float LinearToPQ(float L);
+static void UpdateLocalTonemapFromShared();
+static LocalTonemapParams* FindTonemapForMonitor(int left, int top);
+
 static bool IsProcessAlive(DWORD pid)
 {
 	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -370,7 +397,7 @@ bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 }
 
 char shaders[] = R"(
-    struct VS_INPUT {
+struct VS_INPUT {
 	float2 pos : POSITION;
 	float2 tex : TEXCOORD;
 };
@@ -387,13 +414,29 @@ SamplerState smp : register(s0);
 Texture2D noiseTex : register(t2);
 SamplerState noiseSmp : register(s1);
 
+Texture2D<float> pqOetfLUT : register(t3);
+Texture2D<float> pqEotfLUT : register(t4);
+Texture2D<float> peakTexture : register(t5);
+SamplerState linearSmp : register(s2);
+
 cbuffer Constants : register(b0) {
 	int lutSize;
-	int colorMode;  // 0=SDR 8-bit, 1=HDR, 2=ACM SDR (FP16 linear)
+	int colorMode;       // 0=SDR 8-bit, 1=HDR, 2=ACM SDR
 	int ditherLevels;
-	int pad0;
+	int tonemapEnabled;
+
+	int tonemapCurve;    // 0-4 (BT2390, SoftClip, Reinhard, BT2446A, HardClip)
+	float tonemapTargetNits;
+	float pqSourcePeak;  // Precomputed PQ of source peak (or floor for dynamic)
+	float pqTargetPeak;  // Precomputed PQ of target peak
+
+	int tonemapDynamic;
+	int hasLut;          // 1 if 3D LUT loaded for this monitor
+	float pad1;
+	float pad2;
 };
 
+// BT.709 <-> Rec.2020 conversion
 static float3x3 scrgb_to_bt2100 = {
 2939026994.L / 585553224375.L, 9255011753.L / 3513319346250.L,   173911579.L / 501902763750.L,
   76515593.L / 138420033750.L, 6109575001.L / 830520202500.L,    75493061.L / 830520202500.L,
@@ -406,23 +449,200 @@ static float3x3 bt2100_to_scrgb = {
  -12183628000.L / 5369968309.L, -472592308000.L / 37589778163.L, 5256599974375.L / 37589778163.L,
 };
 
+// ICtCp color space matrices (Dolby)
+static const float3x3 Rec2020_to_LMS = {
+	0.41210938, 0.52392578, 0.06396484,
+	0.16674805, 0.72045898, 0.11279297,
+	0.02416992, 0.07543945, 0.90039063
+};
+static const float3x3 LMS_to_Rec2020 = {
+	3.43661000, -2.50645000,  0.06984000,
+	-0.79133000,  1.98360000, -0.19227000,
+	-0.02595000, -0.09891000,  1.12486000
+};
+static const float3x3 LMSprime_to_ICtCp = {
+	0.50000000,  0.50000000,  0.00000000,
+	1.61376953, -3.32348633,  1.70971680,
+	4.37817383, -4.24560547, -0.13256836
+};
+static const float3x3 ICtCp_to_LMSprime = {
+	1.0,  0.00860904,  0.11102963,
+	1.0, -0.00860904, -0.11102963,
+	1.0,  0.56003134, -0.32062717
+};
+
+// PQ constants for analytical fallback (compute shader peak detection)
 static float m1 = 1305 / 8192.;
 static float m2 = 2523 / 32.;
 static float c1 = 107 / 128.;
 static float c2 = 2413 / 128.;
 static float c3 = 2392 / 128.;
 
+// PQ via 1D LUT (sqrt-domain OETF, uniform EOTF)
+float3 Linear_to_PQ(float3 L) {
+	float3 sq = sqrt(max(L, 0.0));
+	float scale = 4095.0 / 4096.0;
+	float bias = 0.5 / 4096.0;
+	return float3(
+		pqOetfLUT.SampleLevel(linearSmp, float2(sq.x * scale + bias, 0.5), 0),
+		pqOetfLUT.SampleLevel(linearSmp, float2(sq.y * scale + bias, 0.5), 0),
+		pqOetfLUT.SampleLevel(linearSmp, float2(sq.z * scale + bias, 0.5), 0));
+}
+float3 PQ_to_Linear(float3 pq) {
+	float scale = 4095.0 / 4096.0;
+	float bias = 0.5 / 4096.0;
+	return float3(
+		pqEotfLUT.SampleLevel(linearSmp, float2(max(pq.x, 0.0) * scale + bias, 0.5), 0),
+		pqEotfLUT.SampleLevel(linearSmp, float2(max(pq.y, 0.0) * scale + bias, 0.5), 0),
+		pqEotfLUT.SampleLevel(linearSmp, float2(max(pq.z, 0.0) * scale + bias, 0.5), 0));
+}
+float Linear_to_PQ_scalar(float L) {
+	float sq = sqrt(max(L, 0.0));
+	return pqOetfLUT.SampleLevel(linearSmp, float2(sq * (4095.0/4096.0) + (0.5/4096.0), 0.5), 0);
+}
+float PQ_to_Linear_scalar(float pq) {
+	return pqEotfLUT.SampleLevel(linearSmp, float2(max(pq, 0.0) * (4095.0/4096.0) + (0.5/4096.0), 0.5), 0);
+}
+
+// Analytical PQ (for legacy LUT path when tonemap disabled)
+float3 pq_eotf(float3 e) {
+	return pow(max((pow(e, 1 / m2) - c1), 0) / (c2 - c3 * pow(e, 1 / m2)), 1 / m1);
+}
+float3 pq_inv_eotf(float3 y) {
+	return pow((c1 + c2 * pow(y, m1)) / (1 + c3 * pow(y, m1)), m2);
+}
+
+// ========== Tonemapping curves (PQ-native, from shader.h) ==========
+
+float TonemapBT2390_PQ(float I, float pqSrcPeak, float pqTgtPeak) {
+	float iw = pqSrcPeak;
+	float ow = pqTgtPeak;
+	float E = I / iw;
+	float maxLum = ow / iw;
+	float KS = 1.5 * maxLum - 0.5;
+	KS = max(KS, 0.0);
+	if (KS >= 1.0) return clamp(E * iw, 0.0, ow);
+	if (E <= KS) return E * iw;
+	float t = (E - KS) / (1.0 - KS);
+	float t2 = t * t, t3 = t2 * t;
+	float h00 = 2.0*t3 - 3.0*t2 + 1.0;
+	float h10 = t3 - 2.0*t2 + t;
+	float h01 = -2.0*t3 + 3.0*t2;
+	float E_mapped = h00 * KS + h10 * (1.0 - KS) + h01 * maxLum;
+	return clamp(E_mapped * iw, 0.0, ow);
+}
+
+float TonemapSoftClip_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
+	float pqKnee = (targetNits <= 203.0) ? 0.0 : pqTgtPeak * 0.8;
+	if (I <= pqKnee) return I;
+	float overshoot = I - pqKnee;
+	float headroom = pqTgtPeak - pqKnee;
+	return pqKnee + headroom * (1.0 - exp(-overshoot / headroom));
+}
+
+float TonemapReinhard_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
+	float pqKnee = (targetNits <= 203.0) ? 0.0 : pqTgtPeak * 0.8;
+	if (I <= pqKnee) return I;
+	float overshoot = I - pqKnee;
+	float headroom = pqTgtPeak - pqKnee;
+	return pqKnee + headroom * overshoot / (overshoot + headroom);
+}
+
+float TonemapHardClip_PQ(float I, float pqTgtPeak) {
+	return min(I, pqTgtPeak);
+}
+
+float TonemapBT2446A(float Y, float targetPeak, float targetNits) {
+	float knee = (targetNits <= 203.0) ? 0.0 : targetPeak * 0.8;
+	if (Y <= knee) return Y;
+	float overshoot = Y - knee;
+	float maxOvershoot = 1.0 - knee;
+	float headroom = targetPeak - knee;
+	float normalizedOvershoot = overshoot / maxOvershoot;
+	float Yg = pow(normalizedOvershoot, 1.0 / 2.4);
+	float compressionRatio = maxOvershoot / headroom;
+	float pHDR = 1.0 + 32.0 * pow(compressionRatio, 1.0 / 2.4);
+	float pSDR = 1.0 + 32.0;
+	float Yp = log(1.0 + (pHDR - 1.0) * Yg) / log(pHDR);
+	float Yc;
+	if (Yp <= 0.7399)      Yc = Yp * 1.0770;
+	else if (Yp < 0.9909)  Yc = Yp * (-1.1510 * Yp + 2.7811) - 0.6302;
+	else                    Yc = Yp * 0.5000 + 0.5000;
+	float Ysdr = (pow(pSDR, Yc) - 1.0) / (pSDR - 1.0);
+	float compressed = pow(max(Ysdr, 0.0), 2.4);
+	return knee + compressed * headroom;
+}
+
+float3 ApplyTonemappingICtCp(float3 ictcp) {
+	float I = ictcp.x;
+	if (I <= 0.0) return ictcp;
+
+	float pqSrcPeak;
+	if (tonemapDynamic > 0 && tonemapTargetNits > 203.0) {
+		float pqDetected = peakTexture.Load(int3(0, 0, 0));
+		pqSrcPeak = max(pqDetected, pqSourcePeak);
+	} else {
+		pqSrcPeak = pqSourcePeak;
+	}
+
+	float pqTgtPeak = pqTargetPeak;
+	float headroom = pqSrcPeak - pqTgtPeak;
+	float margin = pqTgtPeak * 0.03;
+
+	if (headroom <= 0.0) {
+		ictcp.x = min(ictcp.x, pqTgtPeak);
+		return ictcp;
+	}
+
+	float I_mapped;
+	if (tonemapCurve == 0)
+		I_mapped = TonemapBT2390_PQ(I, pqSrcPeak, pqTgtPeak);
+	else if (tonemapCurve == 1)
+		I_mapped = TonemapSoftClip_PQ(I, pqSrcPeak, pqTgtPeak, tonemapTargetNits);
+	else if (tonemapCurve == 2)
+		I_mapped = TonemapReinhard_PQ(I, pqSrcPeak, pqTgtPeak, tonemapTargetNits);
+	else if (tonemapCurve == 3) {
+		float sourcePeakNits = max(PQ_to_Linear_scalar(pqSrcPeak) * 10000.0, 1.0);
+		float nits = PQ_to_Linear_scalar(I) * 10000.0;
+		float normalized = nits / sourcePeakNits;
+		float targetNormalized = tonemapTargetNits / sourcePeakNits;
+		float mapped = TonemapBT2446A(normalized, targetNormalized, tonemapTargetNits);
+		I_mapped = Linear_to_PQ_scalar(mapped * sourcePeakNits / 10000.0);
+	}
+	else
+		I_mapped = TonemapHardClip_PQ(I, pqTgtPeak);
+
+	if (headroom < margin) {
+		float blend = headroom / margin;
+		I_mapped = lerp(min(I, pqTgtPeak), I_mapped, blend);
+	}
+
+	return float3(I_mapped, ictcp.y, ictcp.z);
+}
+
+float3 ApplyDitherICtCp(float3 ictcp, float2 pos) {
+	float2 noiseUV = pos / )" STRINGIFY(NOISE_SIZE) R"(;
+	float noiseI  = noiseTex.Sample(noiseSmp, noiseUV).x;
+	float noiseCT = noiseTex.Sample(noiseSmp, noiseUV + float2(0.5, 0.0)).x;
+	float noiseCP = noiseTex.Sample(noiseSmp, noiseUV + float2(0.0, 0.5)).x;
+	float ditherI  = (noiseI  - 0.5) / 1023.0;
+	float ditherCT = (noiseCT - 0.5) / 2046.0;
+	float ditherCP = (noiseCP - 0.5) / 2046.0;
+	return ictcp + float3(ditherI, ditherCT, ditherCP);
+}
+
+// ========== LUT sampling ==========
+
 float3 SampleLut(float3 index) {
 	float3 tex = (index + 0.5) / lutSize;
 	return lutTex.Sample(smp, tex).rgb;
 }
 
-
 void barycentricWeight(float3 r, out float4 bary, out int3 vert2, out int3 vert3) {
 	vert2 = int3(0, 0, 0); vert3 = int3(1, 1, 1);
-	int3 c = r.xyz >= r.yzx;
-	bool c_xy = c.x; bool c_yz = c.y; bool c_zx = c.z;
-	bool c_yx = !c.x; bool c_zy = !c.y; bool c_xz = !c.z;
+	int3 cc = r.xyz >= r.yzx;
+	bool c_xy = cc.x; bool c_yz = cc.y; bool c_zx = cc.z;
+	bool c_yx = !cc.x; bool c_zy = !cc.y; bool c_xz = !cc.z;
 	bool cond;  float3 s = float3(0, 0, 0);
 #define ORDER(X, Y, Z)                   \
             cond = c_ ## X ## Y && c_ ## Y ## Z; \
@@ -438,7 +658,6 @@ float3 LutTransformTetrahedral(float3 rgb) {
 	float3 lutIndex = rgb * (lutSize - 1);
 	float4 bary; int3 vert2; int3 vert3;
 	barycentricWeight(frac(lutIndex), bary, vert2, vert3);
-
 	float3 base = floor(lutIndex);
 	return bary.x * SampleLut(base) +
 		bary.y * SampleLut(base + 1) +
@@ -446,33 +665,17 @@ float3 LutTransformTetrahedral(float3 rgb) {
 		bary.w * SampleLut(base + vert3);
 }
 
-float3 pq_eotf(float3 e) {
-	return pow(max((pow(e, 1 / m2) - c1), 0) / (c2 - c3 * pow(e, 1 / m2)), 1 / m1);
-}
-
-float3 pq_inv_eotf(float3 y) {
-	return pow((c1 + c2 * pow(y, m1)) / (1 + c3 * pow(y, m1)), m2);
-}
+// ========== SDR functions ==========
 
 float3 OrderedDither(float3 rgb, float2 pos) {
 	float3 low = floor(rgb * ditherLevels) / ditherLevels;
 	float3 high = low + 1.0 / ditherLevels;
-
 	float3 rgb_linear = pow(rgb,)" STRINGIFY(DITHER_GAMMA) R"();
 	float3 low_linear = pow(low,)" STRINGIFY(DITHER_GAMMA) R"();
 	float3 high_linear = pow(high,)" STRINGIFY(DITHER_GAMMA) R"();
-
 	float noise = noiseTex.Sample(noiseSmp, pos / )" STRINGIFY(NOISE_SIZE) R"().x;
 	float3 threshold = lerp(low_linear, high_linear, noise);
-
 	return lerp(low, high, rgb_linear > threshold);
-}
-
-VS_OUTPUT VS(VS_INPUT input) {
-	VS_OUTPUT output;
-	output.pos = float4(input.pos, 0, 1);
-	output.tex = input.tex;
-	return output;
 }
 
 float3 srgb_encode(float3 L) {
@@ -489,34 +692,134 @@ float3 srgb_decode(float3 V) {
 		V.b <= 0.04045 ? V.b / 12.92 : pow((V.b + 0.055) / 1.055, 2.4));
 }
 
-float4 PS(VS_OUTPUT input) : SV_TARGET{
+// ========== Vertex/Pixel shaders ==========
+
+VS_OUTPUT VS(VS_INPUT input) {
+	VS_OUTPUT output;
+	output.pos = float4(input.pos, 0, 1);
+	output.tex = input.tex;
+	return output;
+}
+
+float4 PS(VS_OUTPUT input) : SV_TARGET {
 	float3 sample = backBufferTex.Sample(smp, input.tex).rgb;
 
 	if (colorMode == 1) {
-		// HDR: scRGB linear -> BT.2100 PQ -> LUT -> PQ decode -> scRGB
-		float3 hdr10_sample = pq_inv_eotf(saturate(mul(scrgb_to_bt2100, sample)));
+		// HDR: scRGB linear -> Rec.2020 -> [tonemap in ICtCp] -> PQ -> LUT -> scRGB
+		float3 rec2020 = mul(scrgb_to_bt2100, sample);
 
-		float3 hdr10_res = LutTransformTetrahedral(hdr10_sample);
+		if (tonemapEnabled) {
+			// Rec.2020 -> LMS -> PQ -> ICtCp -> Tonemap(I) -> Dither -> reverse
+			// Note: rec2020 is already normalized (10000 nits = 1.0) via scrgb_to_bt2100 matrix,
+			// unlike the overlay shader where rec2020 is scRGB-scale (80 nits = 1.0).
+			// No 80/10000 scaling needed here.
+			float3 lms = mul(Rec2020_to_LMS, rec2020);
+			float3 lmsPQ = Linear_to_PQ(lms);
+			float3 ictcp = mul(LMSprime_to_ICtCp, lmsPQ);
+			ictcp = ApplyTonemappingICtCp(ictcp);
+			ictcp = ApplyDitherICtCp(ictcp, input.pos.xy);
+			float3 lmsPQ2 = mul(ICtCp_to_LMSprime, ictcp);
+			rec2020 = mul(LMS_to_Rec2020, PQ_to_Linear(lmsPQ2));
+		}
 
-		float3 scrgb_res = mul(bt2100_to_scrgb, pq_eotf(hdr10_res));
-
-		return float4(scrgb_res, 1);
+		if (hasLut) {
+			// PQ encode -> LUT -> PQ decode -> scRGB
+			float3 pq = pq_inv_eotf(saturate(rec2020));
+			float3 lut_out = LutTransformTetrahedral(pq);
+			return float4(mul(bt2100_to_scrgb, pq_eotf(lut_out)), 1);
+		} else {
+			// No LUT — passthrough
+			return float4(mul(bt2100_to_scrgb, rec2020), 1);
+		}
 	}
 	else if (colorMode == 2) {
-		// ACM SDR: scRGB linear [0,1] -> sRGB encode -> LUT -> sRGB decode -> scRGB linear
+		// ACM SDR: scRGB linear -> sRGB encode -> LUT -> sRGB decode -> scRGB
 		float3 srgb = srgb_encode(saturate(sample));
-
 		float3 res = LutTransformTetrahedral(srgb);
-
 		return float4(srgb_decode(res), 1);
 	}
 	else {
 		// Legacy SDR: 8-bit sRGB gamma input -> LUT -> dither
 		float3 res = LutTransformTetrahedral(sample);
-
 		res = OrderedDither(res, input.pos.xy);
-
 		return float4(res, 1);
+	}
+}
+)";
+
+// Peak detection compute shader (80x45 grid, temporal smoothing)
+const char peakDetectShader[] = R"(
+Texture2D<float4> inputTexture : register(t0);
+RWTexture2D<float> peakOutput : register(u0);
+
+cbuffer PeakParams : register(b0) {
+	uint frameWidth;
+	uint frameHeight;
+	float riseRate;
+	float fallRate;
+	float maxRisePerFrame;
+	float maxFallPerFrame;
+	float2 _padding;
+};
+
+groupshared float sharedMax[256];
+
+[numthreads(256, 1, 1)]
+void main(uint3 GTid : SV_GroupThreadID) {
+	float localMax = 0.0;
+	uint gridX = 80, gridY = 45;
+	uint totalSamples = gridX * gridY;
+	uint samplesPerThread = (totalSamples + 255) / 256;
+
+	for (uint i = 0; i < samplesPerThread; i++) {
+		uint sampleIdx = GTid.x * samplesPerThread + i;
+		if (sampleIdx >= totalSamples) break;
+		uint gx = sampleIdx % gridX;
+		uint gy = sampleIdx / gridX;
+		uint px = (gx * frameWidth) / gridX;
+		uint py = (gy * frameHeight) / gridY;
+		if (px < frameWidth && py < frameHeight) {
+			float4 pixel = inputTexture.Load(int3(px, py, 0));
+			float Y = dot(pixel.rgb, float3(0.2126, 0.7152, 0.0722));
+			float nits = Y * 80.0;
+			localMax = max(localMax, nits);
+		}
+	}
+
+	sharedMax[GTid.x] = localMax;
+	GroupMemoryBarrierWithGroupSync();
+
+	for (uint stride = 128; stride > 0; stride >>= 1) {
+		if (GTid.x < stride)
+			sharedMax[GTid.x] = max(sharedMax[GTid.x], sharedMax[GTid.x + stride]);
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (GTid.x == 0) {
+		float framePeak = sharedMax[0];
+		float prevPQ = peakOutput[uint2(0, 0)];
+		float prevPeak;
+		if (prevPQ <= 0.0) {
+			prevPeak = framePeak;
+		} else {
+			float Np = pow(prevPQ, 1.0 / 78.84375);
+			float L = pow(max(Np - 0.8359375, 0.0) / max(18.8515625 - 18.6875 * Np, 1e-10), 1.0 / 0.1593017578125);
+			prevPeak = L * 10000.0;
+		}
+		float target;
+		float maxDelta;
+		if (framePeak > prevPeak) {
+			target = lerp(prevPeak, framePeak, riseRate);
+			maxDelta = maxRisePerFrame;
+		} else {
+			target = lerp(prevPeak, framePeak, fallRate);
+			maxDelta = maxFallPerFrame;
+		}
+		float smoothedPeak = clamp(target, prevPeak - maxDelta, prevPeak + maxDelta);
+		smoothedPeak = clamp(smoothedPeak, 0.0, 10000.0);
+		float Yp = max(smoothedPeak / 10000.0, 1e-10);
+		float Ym = pow(Yp, 0.1593017578125);
+		peakOutput[uint2(0, 0)] = pow((0.8359375 + 18.8515625 * Ym) / (1.0 + 18.6875 * Ym), 78.84375);
 	}
 }
 )";
@@ -544,6 +847,20 @@ ID3D11ShaderResourceView* noiseTextureView;
 
 ID3D11Buffer* constantBuffer;
 
+// PQ transfer function LUTs (for ICtCp tonemapping)
+ID3D11Texture2D* pqOetfTexture = NULL;
+ID3D11ShaderResourceView* pqOetfSRV = NULL;
+ID3D11Texture2D* pqEotfTexture = NULL;
+ID3D11ShaderResourceView* pqEotfSRV = NULL;
+ID3D11SamplerState* linearSamplerState = NULL;
+
+// Peak detection compute shader resources
+ID3D11ComputeShader* peakDetectCS = NULL;
+ID3D11Texture2D* peakTexture = NULL;
+ID3D11UnorderedAccessView* peakUAV = NULL;
+ID3D11ShaderResourceView* peakSRV = NULL;
+ID3D11Buffer* peakCB = NULL;
+
 // Per-monitor HDR state detected via DXGI output enumeration
 struct MonitorHdrState {
 	int left, top;
@@ -561,6 +878,78 @@ static bool IsMonitorHdr(int left, int top) {
 			return g_monitorHdrStates[i].isHdr;
 	}
 	return false;  // default to SDR if unknown (safer — avoids PQ pipeline on SDR content)
+}
+
+// --- Shared memory function implementations (need g_monitorHdrStates) ---
+
+static float LinearToPQ(float L) {
+	const float m1_ = 0.1593017578125f;
+	const float m2_ = 78.84375f;
+	const float c1_ = 0.8359375f;
+	const float c2_ = 18.8515625f;
+	const float c3_ = 18.6875f;
+	float Ym = powf(fmaxf(L, 1e-12f), m1_);
+	return powf((c1_ + c2_ * Ym) / (1.0f + c3_ * Ym), m2_);
+}
+
+static void UpdateLocalTonemapFromShared() {
+	if (!g_sharedConfig) return;
+	if (g_sharedConfig->version == g_localConfigVersion) return;
+
+	DwmHookSharedConfig local;
+	memcpy(&local, (const void*)g_sharedConfig, sizeof(local));
+	g_localConfigVersion = local.version;
+
+	// Update monitor HDR states from shared memory
+	g_numMonitorHdrStates = 0;
+	for (uint32_t i = 0; i < local.numMonitors && g_numMonitorHdrStates < 16; i++) {
+		auto& mc = local.monitors[i];
+		auto& ms = g_monitorHdrStates[g_numMonitorHdrStates];
+		ms.left = mc.left;
+		ms.top = mc.top;
+		ms.width = mc.width;
+		ms.height = mc.height;
+		ms.bpc = mc.bpc;
+		ms.isHdr = (mc.isHdr != 0);
+		g_numMonitorHdrStates++;
+	}
+
+	// Update local tonemap params
+	g_numLocalTonemap = 0;
+	for (uint32_t i = 0; i < local.numMonitors && g_numLocalTonemap < MAX_DWM_HOOK_MONITORS; i++) {
+		auto& mc = local.monitors[i];
+		auto& tp = g_localTonemap[g_numLocalTonemap];
+		bool prevDynamic = tp.dynamicPeak;
+		tp.left = mc.left;
+		tp.top = mc.top;
+		tp.enabled = (mc.tonemapEnabled != 0);
+		tp.curve = mc.tonemapCurve;
+		tp.sourcePeakNits = mc.sourcePeakNits;
+		tp.targetPeakNits = mc.targetPeakNits;
+		tp.dynamicPeak = (mc.dynamicPeak != 0);
+		tp.pqSourcePeak = LinearToPQ(mc.sourcePeakNits / 10000.0f);
+		tp.pqTargetPeak = LinearToPQ(mc.targetPeakNits / 10000.0f);
+		if (tp.dynamicPeak != prevDynamic) {
+			char msg[128];
+			sprintf(msg, "Tonemap update: mon(%d,%d) dynamic=%d src=%.0f tgt=%.0f pqSrc=%.4f pqTgt=%.4f",
+				tp.left, tp.top, tp.dynamicPeak ? 1 : 0,
+				tp.sourcePeakNits, tp.targetPeakNits, tp.pqSourcePeak, tp.pqTargetPeak);
+			log_to_file(msg);
+		}
+		g_numLocalTonemap++;
+	}
+
+	if (local.lutReloadFlag) {
+		log_to_file("Shared memory: lutReloadFlag set (not yet implemented)");
+	}
+}
+
+static LocalTonemapParams* FindTonemapForMonitor(int left, int top) {
+	for (int i = 0; i < g_numLocalTonemap; i++) {
+		if (g_localTonemap[i].left == left && g_localTonemap[i].top == top)
+			return &g_localTonemap[i];
+	}
+	return NULL;
 }
 
 struct lutData
@@ -1031,12 +1420,122 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		{
 			D3D11_BUFFER_DESC constantBufferDesc = {};
 			constantBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-			constantBufferDesc.ByteWidth = 16;
+			constantBufferDesc.ByteWidth = 48;  // Expanded for tonemap params (3 x float4)
 			constantBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
 			constantBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
 			EXECUTE_WITH_LOG(device->CreateBuffer(&constantBufferDesc, NULL, &constantBuffer))
-			LOG_ONLY_ONCE("Final buffer created in InitializeStuff")
+			LOG_ONLY_ONCE("Constant buffer created (48 bytes)")
+		}
+		// Create linear sampler for PQ 1D LUT hardware bilinear interpolation
+		{
+			D3D11_SAMPLER_DESC samplerDesc = {};
+			samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			samplerDesc.AddressU = samplerDesc.AddressV = samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+			samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+			EXECUTE_WITH_LOG(device->CreateSamplerState(&samplerDesc, &linearSamplerState))
+			LOG_ONLY_ONCE("Linear sampler created for PQ LUTs")
+		}
+		// Generate PQ transfer function LUTs
+		{
+			const int PQ_LUT_SIZE = 4096;
+			const float pq_m1 = 0.1593017578125f;
+			const float pq_m2 = 78.84375f;
+			const float pq_c1 = 0.8359375f;
+			const float pq_c2 = 18.8515625f;
+			const float pq_c3 = 18.6875f;
+
+			// PQ OETF: sqrt-domain — entry i = PQ((i/(N-1))^2)
+			float oetfData[PQ_LUT_SIZE];
+			for (int i = 0; i < PQ_LUT_SIZE; i++) {
+				float t = (float)i / (float)(PQ_LUT_SIZE - 1);
+				float L = t * t;  // sqrt-domain
+				float Y = fmaxf(L, 1e-12f);
+				float Ym = powf(Y, pq_m1);
+				oetfData[i] = powf((pq_c1 + pq_c2 * Ym) / (1.0f + pq_c3 * Ym), pq_m2);
+			}
+
+			// PQ EOTF: uniform — entry i = EOTF(i/(N-1))
+			float eotfData[PQ_LUT_SIZE];
+			for (int i = 0; i < PQ_LUT_SIZE; i++) {
+				float pq = (float)i / (float)(PQ_LUT_SIZE - 1);
+				float Vm = powf(fmaxf(pq, 1e-12f), 1.0f / pq_m2);
+				float t = fmaxf(Vm - pq_c1, 0.0f) / fmaxf(pq_c2 - pq_c3 * Vm, 1e-12f);
+				eotfData[i] = powf(t, 1.0f / pq_m1);
+			}
+
+			D3D11_TEXTURE2D_DESC pqDesc = {};
+			pqDesc.Width = PQ_LUT_SIZE;
+			pqDesc.Height = 1;
+			pqDesc.MipLevels = 1;
+			pqDesc.ArraySize = 1;
+			pqDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			pqDesc.SampleDesc.Count = 1;
+			pqDesc.Usage = D3D11_USAGE_IMMUTABLE;
+			pqDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+			D3D11_SUBRESOURCE_DATA oetfInit = {};
+			oetfInit.pSysMem = oetfData;
+			oetfInit.SysMemPitch = PQ_LUT_SIZE * sizeof(float);
+			EXECUTE_WITH_LOG(device->CreateTexture2D(&pqDesc, &oetfInit, &pqOetfTexture))
+			EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)pqOetfTexture, NULL, &pqOetfSRV))
+
+			D3D11_SUBRESOURCE_DATA eotfInit = {};
+			eotfInit.pSysMem = eotfData;
+			eotfInit.SysMemPitch = PQ_LUT_SIZE * sizeof(float);
+			EXECUTE_WITH_LOG(device->CreateTexture2D(&pqDesc, &eotfInit, &pqEotfTexture))
+			EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)pqEotfTexture, NULL, &pqEotfSRV))
+
+			LOG_ONLY_ONCE("PQ transfer LUTs created (4096-entry OETF sqrt-domain + EOTF uniform)")
+		}
+		// Create peak detection resources (1x1 R32_FLOAT for temporal smoothing)
+		{
+			D3D11_TEXTURE2D_DESC peakDesc = {};
+			peakDesc.Width = 1;
+			peakDesc.Height = 1;
+			peakDesc.MipLevels = 1;
+			peakDesc.ArraySize = 1;
+			peakDesc.Format = DXGI_FORMAT_R32_FLOAT;
+			peakDesc.SampleDesc.Count = 1;
+			peakDesc.Usage = D3D11_USAGE_DEFAULT;
+			peakDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+			float zero = 0.0f;
+			D3D11_SUBRESOURCE_DATA peakInit = {};
+			peakInit.pSysMem = &zero;
+			peakInit.SysMemPitch = sizeof(float);
+			EXECUTE_WITH_LOG(device->CreateTexture2D(&peakDesc, &peakInit, &peakTexture))
+			EXECUTE_WITH_LOG(device->CreateUnorderedAccessView((ID3D11Resource*)peakTexture, NULL, &peakUAV))
+			EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)peakTexture, NULL, &peakSRV))
+
+			D3D11_BUFFER_DESC peakCbDesc = {};
+			peakCbDesc.ByteWidth = 32;  // 8 floats
+			peakCbDesc.Usage = D3D11_USAGE_DYNAMIC;
+			peakCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			peakCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			EXECUTE_WITH_LOG(device->CreateBuffer(&peakCbDesc, NULL, &peakCB))
+
+			LOG_ONLY_ONCE("Peak detection resources created")
+		}
+		// Compile peak detection compute shader
+		{
+			ID3DBlob* csBlob = NULL;
+			ID3DBlob* csError = NULL;
+			HRESULT hr = D3DCompile(peakDetectShader, sizeof(peakDetectShader), NULL, NULL, NULL,
+				"main", "cs_5_0", 0, 0, &csBlob, &csError);
+			if (SUCCEEDED(hr) && csBlob) {
+				EXECUTE_WITH_LOG(device->CreateComputeShader(csBlob->GetBufferPointer(),
+					csBlob->GetBufferSize(), NULL, &peakDetectCS))
+				csBlob->Release();
+				LOG_ONLY_ONCE("Peak detection compute shader compiled OK")
+			} else {
+				if (csError) {
+					std::stringstream ss;
+					ss << "Peak detection CS compile error: " << (char*)csError->GetBufferPointer();
+					log_to_file(ss.str().c_str());
+					csError->Release();
+				}
+				log_to_file("WARNING: Peak detection CS compilation failed — dynamic tonemapping disabled");
+			}
 		}
 	}
 	catch (std::exception& ex)
@@ -1080,6 +1579,16 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(noiseSamplerState)
 	RELEASE_IF_NOT_NULL(noiseTextureView)
 	RELEASE_IF_NOT_NULL(constantBuffer)
+	RELEASE_IF_NOT_NULL(linearSamplerState)
+	RELEASE_IF_NOT_NULL(pqOetfTexture)
+	RELEASE_IF_NOT_NULL(pqOetfSRV)
+	RELEASE_IF_NOT_NULL(pqEotfTexture)
+	RELEASE_IF_NOT_NULL(pqEotfSRV)
+	RELEASE_IF_NOT_NULL(peakDetectCS)
+	RELEASE_IF_NOT_NULL(peakTexture)
+	RELEASE_IF_NOT_NULL(peakUAV)
+	RELEASE_IF_NOT_NULL(peakSRV)
+	RELEASE_IF_NOT_NULL(peakCB)
 	for (int i = 0; i < numLuts; i++)
 	{
 		free(luts[i].rawLut);
@@ -1151,10 +1660,26 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 
 	// For ACM SDR, look for SDR LUT (isHdr=false); for HDR, look for HDR LUT
 	bool lookForHdrLut = (colorMode == 1);
-	lutData* lut;
-	if (index == -1 || !(lut = GetLUTDataFromCOverlayContext(cOverlayContext, lookForHdrLut)))
+	lutData* lut = NULL;
+	if (index != -1)
+		lut = GetLUTDataFromCOverlayContext(cOverlayContext, lookForHdrLut);
+
+	// Look up tonemap params for this monitor
+	int monLeft = 0, monTop = 0;
+	if (!lut && index != -1) {
+		// Need position even without LUT for tonemap lookup
+		GetMonitorPositionFromContext(cOverlayContext, monLeft, monTop);
+	} else if (lut) {
+		monLeft = lut->left;
+		monTop = lut->top;
+	}
+	LocalTonemapParams* tp = FindTonemapForMonitor(monLeft, monTop);
+	bool tmEnabled = (colorMode == 1 && tp && tp->enabled);
+
+	// Skip if no LUT AND no tonemap — nothing to render
+	if (index == -1 || (!lut && !tmEnabled))
 	{
-		return false;  // No LUT for this monitor — skip silently
+		return false;
 	}
 
 	D3D11_TEXTURE2D_DESC oldTextureDesc = textureDesc[index];
@@ -1188,56 +1713,143 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 
 	backBufferDesc = newBackBufferDesc;
 
-	EXECUTE_WITH_LOG(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, NULL, &renderTargetView))
-	const D3D11_VIEWPORT d3d11_viewport(0, 0, backBufferDesc.Width, backBufferDesc.Height, 0.0f, 1.0f);
-	deviceContext->RSSetViewports(1, &d3d11_viewport);
+	bool hasLutOrTonemap = (lut || tmEnabled);
 
-	deviceContext->OMSetRenderTargets(1, &renderTargetView, NULL);
-	renderTargetView->Release();
+	if (hasLutOrTonemap) {
+		EXECUTE_WITH_LOG(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, NULL, &renderTargetView))
+		const D3D11_VIEWPORT d3d11_viewport(0, 0, backBufferDesc.Width, backBufferDesc.Height, 0.0f, 1.0f);
+		deviceContext->RSSetViewports(1, &d3d11_viewport);
 
-	deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-	deviceContext->IASetInputLayout(inputLayout);
+		deviceContext->OMSetRenderTargets(1, &renderTargetView, NULL);
+		renderTargetView->Release();
 
-	deviceContext->VSSetShader(vertexShader, NULL, 0);
-	deviceContext->PSSetShader(pixelShader, NULL, 0);
+		deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		deviceContext->IASetInputLayout(inputLayout);
 
-	deviceContext->PSSetShaderResources(0, 1, &textureView[index]);
-	deviceContext->PSSetShaderResources(1, 1, &lut->textureView);
-	deviceContext->PSSetSamplers(0, 1, &samplerState);
+		deviceContext->VSSetShader(vertexShader, NULL, 0);
+		deviceContext->PSSetShader(pixelShader, NULL, 0);
 
-	deviceContext->PSSetShaderResources(2, 1, &noiseTextureView);
-	deviceContext->PSSetSamplers(1, 1, &noiseSamplerState);
+		// Bind shader resources
+		deviceContext->PSSetShaderResources(0, 1, &textureView[index]);
+		if (lut)
+			deviceContext->PSSetShaderResources(1, 1, &lut->textureView);
+		deviceContext->PSSetSamplers(0, 1, &samplerState);
 
-	// Dither levels: 255 for 8-bit, 1023 for R10G10B10A2, 255 default
-	int dLevels = 255;
-	if (newBackBufferDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
-		dLevels = 1023;
-	int constantData[4] = {lut->size, colorMode, dLevels, 0};
+		deviceContext->PSSetShaderResources(2, 1, &noiseTextureView);
+		deviceContext->PSSetSamplers(1, 1, &noiseSamplerState);
 
-	D3D11_MAPPED_SUBRESOURCE resource;
-	EXECUTE_WITH_LOG(deviceContext->Map((ID3D11Resource*)constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
-		&resource))
-	memcpy(resource.pData, constantData, sizeof(constantData));
-	deviceContext->Unmap((ID3D11Resource*)constantBuffer, 0);
+		// PQ LUTs + linear sampler for tonemapping
+		if (pqOetfSRV) deviceContext->PSSetShaderResources(3, 1, &pqOetfSRV);
+		if (pqEotfSRV) deviceContext->PSSetShaderResources(4, 1, &pqEotfSRV);
+		if (linearSamplerState) deviceContext->PSSetSamplers(2, 1, &linearSamplerState);
 
-	deviceContext->PSSetConstantBuffers(0, 1, &constantBuffer);
+		// Peak detection compute pass (before pixel shader)
+		if (tmEnabled && tp->dynamicPeak && peakDetectCS && peakUAV && peakCB) {
+			// Update peak CB
+			struct { UINT fw, fh; float rise, fall, maxRise, maxFall; float pad[2]; } peakParams;
+			peakParams.fw = newBackBufferDesc.Width;
+			peakParams.fh = newBackBufferDesc.Height;
+			peakParams.rise = 0.3f;   // Rise rate
+			peakParams.fall = 0.05f;  // Fall rate
+			peakParams.maxRise = 100.0f;
+			peakParams.maxFall = 50.0f;
+			peakParams.pad[0] = peakParams.pad[1] = 0.0f;
 
-	for (int i = 0; i < numRects; i++)
-	{
-		D3D11_BOX sourceRegion;
-		sourceRegion.left = rects[i].left;
-		sourceRegion.right = rects[i].right;
-		sourceRegion.top = rects[i].top;
-		sourceRegion.bottom = rects[i].bottom;
-		sourceRegion.front = 0;
-		sourceRegion.back = 1;
+			D3D11_MAPPED_SUBRESOURCE peakRes;
+			if (SUCCEEDED(deviceContext->Map((ID3D11Resource*)peakCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &peakRes))) {
+				memcpy(peakRes.pData, &peakParams, sizeof(peakParams));
+				deviceContext->Unmap((ID3D11Resource*)peakCB, 0);
+			}
 
-		deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
-		                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
-		DrawRectangle(&rects[i], index);
+			deviceContext->CSSetShader(peakDetectCS, NULL, 0);
+			deviceContext->CSSetConstantBuffers(0, 1, &peakCB);
+			deviceContext->CSSetShaderResources(0, 1, &textureView[index]);  // Input: captured backbuffer
+			deviceContext->CSSetUnorderedAccessViews(0, 1, &peakUAV, NULL);
+			deviceContext->Dispatch(1, 1, 1);
+
+			// Unbind CS UAV and bind peak SRV for pixel shader
+			ID3D11UnorderedAccessView* nullUAV = NULL;
+			deviceContext->CSSetUnorderedAccessViews(0, 1, &nullUAV, NULL);
+			deviceContext->CSSetShader(NULL, NULL, 0);
+		}
+		// Bind peak texture for pixel shader read (even if not dynamic — shader checks tonemapDynamic)
+		if (peakSRV) deviceContext->PSSetShaderResources(5, 1, &peakSRV);
+
+		// Fill expanded constant buffer (48 bytes = 12 ints/floats)
+		int dLevels = 255;
+		if (newBackBufferDesc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)
+			dLevels = 1023;
+
+		struct {
+			int lutSize;
+			int colorMode;
+			int ditherLevels;
+			int tonemapEnabled;
+			int tonemapCurve;
+			float tonemapTargetNits;
+			float pqSourcePeak;
+			float pqTargetPeak;
+			int tonemapDynamic;
+			int hasLut;
+			float pad1;
+			float pad2;
+		} cb;
+		cb.lutSize = lut ? lut->size : 0;
+		cb.colorMode = colorMode;
+		cb.ditherLevels = dLevels;
+		cb.tonemapEnabled = tmEnabled ? 1 : 0;
+		cb.tonemapCurve = tmEnabled ? (int)tp->curve : 0;
+		cb.tonemapTargetNits = tmEnabled ? tp->targetPeakNits : 1000.0f;
+		cb.pqSourcePeak = tmEnabled ? tp->pqSourcePeak : 0.0f;
+		cb.pqTargetPeak = tmEnabled ? tp->pqTargetPeak : 0.0f;
+		cb.tonemapDynamic = (tmEnabled && tp->dynamicPeak) ? 1 : 0;
+		cb.hasLut = lut ? 1 : 0;
+		cb.pad1 = 0.0f;
+		cb.pad2 = 0.0f;
+
+		D3D11_MAPPED_SUBRESOURCE resource;
+		EXECUTE_WITH_LOG(deviceContext->Map((ID3D11Resource*)constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0,
+			&resource))
+		memcpy(resource.pData, &cb, sizeof(cb));
+		deviceContext->Unmap((ID3D11Resource*)constantBuffer, 0);
+
+		deviceContext->PSSetConstantBuffers(0, 1, &constantBuffer);
+
+		for (int i = 0; i < numRects; i++)
+		{
+			D3D11_BOX sourceRegion;
+			sourceRegion.left = rects[i].left;
+			sourceRegion.right = rects[i].right;
+			sourceRegion.top = rects[i].top;
+			sourceRegion.bottom = rects[i].bottom;
+			sourceRegion.front = 0;
+			sourceRegion.back = 1;
+
+			deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
+			                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
+			DrawRectangle(&rects[i], index);
+		}
 	}
 
-	return true;
+	// Clean up ALL state we set — DWM reuses this device context for its own rendering.
+	// Any stale bindings can collide with DWM's own shaders and cause GPU faults.
+	// The original hook left t0-t2, s0-s1, b0 (16-byte) bound and DWM tolerated it,
+	// but our expanded 48-byte b0 has non-zero data at offsets 16+ that DWM's shader
+	// may misinterpret if it reads from its own (larger) constant buffer at b0.
+	{
+		ID3D11ShaderResourceView* nullSRVs[6] = {};
+		deviceContext->PSSetShaderResources(0, 6, nullSRVs);  // Clear t0-t5
+		ID3D11SamplerState* nullSamplers[3] = {};
+		deviceContext->PSSetSamplers(0, 3, nullSamplers);      // Clear s0-s2
+		ID3D11Buffer* nullCB = NULL;
+		deviceContext->PSSetConstantBuffers(0, 1, &nullCB);    // Clear b0
+		deviceContext->CSSetConstantBuffers(0, 1, &nullCB);    // Clear CS b0
+		deviceContext->VSSetShader(NULL, NULL, 0);
+		deviceContext->PSSetShader(NULL, NULL, 0);
+		deviceContext->OMSetRenderTargets(0, NULL, NULL);
+	}
+
+	return hasLutOrTonemap;  // Only report active when backbuffer was actually modified
 }
 
 bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* rects, int numRects)
@@ -1485,6 +2097,9 @@ COverlayContext_Present_24h2_t* COverlayContext_Present_real_orig_24h2 = NULL;
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
+	// Check for shared memory updates (live tonemap param changes from host)
+	UpdateLocalTonemapFromShared();
+
 	if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig_24h2 || isWindows11_24h2 || isWindows11_25h2)
 	{
 			LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
@@ -1580,6 +2195,8 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
                                   unsigned int a5, bool a6)
 {
+	UpdateLocalTonemapFromShared();
+
 	if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig)
 	{
 		LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
@@ -1633,9 +2250,18 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 typedef bool (CWindowContext_IsCandidateDirectFlipCompatbile_t)(void*, void*, bool);
 CWindowContext_IsCandidateDirectFlipCompatbile_t* CWindowContext_IsCandidateDirectFlipCompatbile_orig = NULL;
 
+// Check if any active processing (LUT or tonemap) requires DWM composition
+static bool HasActiveHookProcessing() {
+	if (numLuts > 0) return true;
+	for (int i = 0; i < g_numLocalTonemap; i++) {
+		if (g_localTonemap[i].enabled) return true;
+	}
+	return false;
+}
+
 bool CWindowContext_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, bool a3)
 {
-	if (numLuts > 0)
+	if (HasActiveHookProcessing())
 	{
 		return false;
 	}
@@ -1647,7 +2273,7 @@ CCompSwapChain_IsCandidateDirectFlipCompatbile_t* CCompSwapChain_IsCandidateDire
 
 bool CCompSwapChain_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, bool a3)
 {
-	if (numLuts > 0)
+	if (HasActiveHookProcessing())
 	{
 		return false;
 	}
@@ -1659,7 +2285,7 @@ CCompVisual_IsCandidateForPromotion_t* CCompVisual_IsCandidateForPromotion_orig 
 
 bool CCompVisual_IsCandidateForPromotion_hook(void* self, void* a2, void* a3)
 {
-	if (numLuts > 0)
+	if (HasActiveHookProcessing())
 	{
 		return false;
 	}
@@ -1671,7 +2297,7 @@ CCompSwapChain_IsCandidateIndependentFlipCompatible_t* CCompSwapChain_IsCandidat
 
 bool CCompSwapChain_IsCandidateIndependentFlipCompatible_hook(void* self)
 {
-	if (numLuts > 0)
+	if (HasActiveHookProcessing())
 	{
 		return false;
 	}
@@ -1800,6 +2426,42 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					log_to_file("WARNING: monitors.dat not found, position matching disabled");
 				}
 				g_hdrStatesDetected = true;
+			}
+
+			// Open shared memory for live IPC from host
+			{
+				g_sharedMemHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, DWM_HOOK_CONFIG_NAME);
+				if (g_sharedMemHandle) {
+					g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
+						g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
+					if (g_sharedConfig) {
+						log_to_file("Shared memory opened OK");
+						// Initial read of tonemap params
+						UpdateLocalTonemapFromShared();
+					} else {
+						log_to_file("WARNING: MapViewOfFile failed for shared memory");
+						CloseHandle(g_sharedMemHandle);
+						g_sharedMemHandle = NULL;
+					}
+				} else {
+					// Retry once after 100ms (race: host creates mapping just before CreateRemoteThread)
+					Sleep(100);
+					g_sharedMemHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, DWM_HOOK_CONFIG_NAME);
+					if (g_sharedMemHandle) {
+						g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
+							g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
+						if (g_sharedConfig) {
+							log_to_file("Shared memory opened OK (retry)");
+							UpdateLocalTonemapFromShared();
+						} else {
+							CloseHandle(g_sharedMemHandle);
+							g_sharedMemHandle = NULL;
+						}
+					}
+					if (!g_sharedConfig) {
+						log_to_file("WARNING: Shared memory not available — tonemap via hook disabled");
+					}
+				}
 			}
 
 			if (isWindows11_25h2)
@@ -2018,7 +2680,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					          (COverlayContext_Present_orig ? "pre-24h2" : "none")));
 				log_to_file(msg);
 			}
-			if (numLuts > 0 && ((COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
+			// Activate hooks if we have LUTs OR tonemap enabled via shared memory
+			bool hasTonemapViaShared = false;
+			for (int ti = 0; ti < g_numLocalTonemap; ti++) {
+				if (g_localTonemap[ti].enabled) { hasTonemapViaShared = true; break; }
+			}
+			bool hasActiveWork = (numLuts > 0) || hasTonemapViaShared;
+
+			if (hasActiveWork && ((COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
 				COverlayContext_OverlaysEnabled_orig) ||
 				(COverlayContext_Present_orig_24h2 && COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 && COverlayContext_OverlaysEnabled_orig)))
 
@@ -2169,6 +2838,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			MH_Uninitialize();
 			Sleep(100);
 		}
+		// Close shared memory
+		if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
+		if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }
+
 		UninitializeStuff();
 		log_to_file("DLL_PROCESS_DETACH: cleanup complete");
 		break;
