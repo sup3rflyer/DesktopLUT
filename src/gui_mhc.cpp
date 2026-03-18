@@ -23,25 +23,33 @@
 // Update MHC active flags on the running MonitorContext
 // Called after MHC install/remove/enable toggle — tracks state for diagnostics and live preview
 void UpdateMhcFlagsLive(int monitorIndex) {
-    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
-    const auto& ms = g_gui.monitorSettings[monitorIndex];
+    // Snapshot MHC state under lock — callers may have just released the mutex
+    bool sdrMhcActive, hdrMhcActive, sdrHasGs, hdrHasGs;
+    bool sdrPrimEnabled, hdrPrimEnabled;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
+        const auto& ms = g_gui.monitorSettings[monitorIndex];
 
-    bool sdrMhcActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
-    bool hdrMhcActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
-    // Grayscale flag covers all MHC gamma/grayscale forms that suppress shader equivalents
-    bool sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
-                    ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
-    bool hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
-                    ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
-                    ms.hdrMHC.desktopGammaEnabled;
+        sdrMhcActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
+        hdrMhcActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
+        // Grayscale flag covers all MHC gamma/grayscale forms that suppress shader equivalents
+        sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+                   ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
+        hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+                   ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
+                   ms.hdrMHC.desktopGammaEnabled;
+        sdrPrimEnabled = ms.sdrMHC.primariesEnabled;
+        hdrPrimEnabled = ms.hdrMHC.primariesEnabled;
+    }
 
-    // Update running MonitorContext if processing is active
+    // Update running MonitorContext if processing is active (atomics, no lock needed)
     bool found = false;
     for (auto& ctx : g_monitors) {
         if (ctx.index == monitorIndex) {
-            ctx.sdrMhcPrimariesActive = sdrMhcActive && ms.sdrMHC.primariesEnabled;
+            ctx.sdrMhcPrimariesActive = sdrMhcActive && sdrPrimEnabled;
             ctx.sdrMhcGrayscaleActive = sdrMhcActive && sdrHasGs;
-            ctx.hdrMhcPrimariesActive = hdrMhcActive && ms.hdrMHC.primariesEnabled;
+            ctx.hdrMhcPrimariesActive = hdrMhcActive && hdrPrimEnabled;
             ctx.hdrMhcGrayscaleActive = hdrMhcActive && hdrHasGs;
             std::cout << "[MHC Flags] mon=" << monitorIndex
                       << " sdrPrim=" << ctx.sdrMhcPrimariesActive
@@ -168,17 +176,8 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
 // SECTION: MHC Profile Generation & Installation
 // ============================================================================
 
-// Generate, write, and install MHC2 ICC profile from current MHCSettings
-// Updates mhc.enabled/profilePath/profileName on success, calls UpdateMhcFlagsLive
-// Returns true if profile was generated and installed successfully
-bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
-    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
-    if (!IsMHC2ApiAvailable()) return false;
-
-    auto& settings = g_gui.monitorSettings[monitorIndex];
-    auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
-
-    MHC2ProfileParams params;
+// Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate)
+static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
     params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
         ? g_gui.monitorNames[monitorIndex] : L"Monitor";
     params.isHDR = isHDR;
@@ -303,6 +302,66 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         params.correctionGrayscale.use24Gamma = mhc.correctionGrayscale.use24Gamma;
         params.correctionGrayscale.peakNits = mhc.correctionGrayscale.peakNits;
     }
+}
+
+// Generate and install the DG variant profile (opposite desktop gamma state) for HDR hotswap.
+// Deletes old DG variant, generates new one, stores in system color dir (disassociated).
+// Re-associates mainProfileName as the active profile after install/remove cycle.
+static void GenerateAndInstallDGVariant(
+    const MHC2ProfileParams& params, const std::wstring& oldDGProfileName,
+    const std::wstring& mainProfileName, int monitorIndex,
+    const DisplayInfo& displayInfo, const wchar_t* tempDir,
+    std::wstring& outDGProfilePath, std::wstring& outDGProfileName)
+{
+    // Delete old DG variant if it exists
+    if (!oldDGProfileName.empty()) {
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectory(sysDir, MAX_PATH);
+        std::wstring oldDGPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldDGProfileName;
+        DeleteFileW(oldDGPath.c_str());
+    }
+
+    // Generate variant with opposite DG state
+    MHC2ProfileParams dgParams = params;
+    dgParams.desktopGammaEnabled = !params.desktopGammaEnabled;
+
+    std::vector<uint8_t> dgData;
+    if (!GenerateMHC2Profile(dgParams, dgData)) return;
+
+    wchar_t monTag[8];
+    swprintf_s(monTag, L"Mon%d", monitorIndex);
+    outDGProfileName = L"DesktopLUT_" + std::wstring(monTag)
+        + L"_HDR_DG_" + std::to_wstring(GetTickCount64()) + L".icm";
+    std::wstring dgTempPath = std::wstring(tempDir) + outDGProfileName;
+
+    if (!WriteMHC2Profile(dgData, dgTempPath)) return;
+
+    // Install to system color dir (not associated with display)
+    if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
+        // Immediately disassociate — we only want it in the color dir, not active
+        RemoveMHC2Profile(outDGProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectory(sysDir, MAX_PATH);
+        outDGProfilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + outDGProfileName;
+    }
+    // Always re-associate main profile (Install may have switched it, or Remove may have cleared it)
+    ReassociateMHC2Profile(mainProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+    DeleteFileW(dgTempPath.c_str());
+}
+
+// Generate, write, and install MHC2 ICC profile from current MHCSettings
+// Updates mhc.enabled/profilePath/profileName on success, calls UpdateMhcFlagsLive
+// Returns true if profile was generated and installed successfully
+bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
+    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+    if (!IsMHC2ApiAvailable()) return false;
+
+    auto& settings = g_gui.monitorSettings[monitorIndex];
+    auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
+
+    MHC2ProfileParams params;
+    BuildMHC2Params(mhc, isHDR, monitorIndex, params);
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
@@ -358,38 +417,8 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     // Both profiles stay in system color dir, ready for instant hotswap
     std::wstring dgProfilePath, dgProfileName;
     if (isHDR) {
-        // Delete old DG variant if it exists
-        if (!mhc.profileNameDG.empty()) {
-            wchar_t sysDirDG[MAX_PATH];
-            GetSystemDirectory(sysDirDG, MAX_PATH);
-            std::wstring oldDGPath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + mhc.profileNameDG;
-            DeleteFileW(oldDGPath.c_str());
-        }
-
-        // Generate variant with opposite DG state
-        MHC2ProfileParams dgParams = params;
-        dgParams.desktopGammaEnabled = !params.desktopGammaEnabled;
-
-        std::vector<uint8_t> dgData;
-        if (GenerateMHC2Profile(dgParams, dgData)) {
-            dgProfileName = L"DesktopLUT_" + std::wstring(monTag)
-                + L"_HDR_DG_" + std::to_wstring(GetTickCount64()) + L".icm";
-            std::wstring dgTempPath = std::wstring(tempDir) + dgProfileName;
-            if (WriteMHC2Profile(dgData, dgTempPath)) {
-                // Install to system color dir (not associated with display)
-                if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
-                    // Immediately disassociate — we only want it in the color dir, not active
-                    RemoveMHC2Profile(dgProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-
-                    wchar_t sysDirDG[MAX_PATH];
-                    GetSystemDirectory(sysDirDG, MAX_PATH);
-                    dgProfilePath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + dgProfileName;
-                }
-                // Always re-associate main profile (Install may have switched it, or Remove may have cleared it)
-                ReassociateMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                DeleteFileW(dgTempPath.c_str());
-            }
-        }
+        GenerateAndInstallDGVariant(params, mhc.profileNameDG, profileName,
+            monitorIndex, displayInfo, tempDir, dgProfilePath, dgProfileName);
     }
 
     {
@@ -418,124 +447,8 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     if (mhc.profileName.empty()) return;
     if (!IsMHC2ApiAvailable()) return;
 
-    // Read from MHC's own primaries/grayscale (Layer 1), not shader's (Layer 3)
     MHC2ProfileParams params;
-    params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
-        ? g_gui.monitorNames[monitorIndex] : L"Monitor";
-    params.isHDR = isHDR;
-
-    if (mhc.primariesEnabled) {
-        params.primariesEnabled = true;
-        int preset = mhc.primariesPreset;
-        if (preset == g_numPresetPrimaries - 1) {
-            const auto& cp = mhc.customPrimaries;
-            params.displayPrimaries = { cp.Rx, cp.Ry, cp.Gx, cp.Gy, cp.Bx, cp.By, cp.Wx, cp.Wy };
-        } else {
-            const auto& p = g_presetPrimaries[preset];
-            params.displayPrimaries = { p.Rx, p.Ry, p.Gx, p.Gy, p.Bx, p.By, p.Wx, p.Wy };
-        }
-    }
-
-    // If source file is set, re-read and use per-channel data directly
-    if (!mhc.sourceFilePath.empty()) {
-        if (mhc.sourceIs1DCube) {
-            // 1D cube: per-channel correction curves used directly as MHC2 LUT
-            std::vector<float> corrR, corrG, corrB;
-            if (Load1DCubeLUT(mhc.sourceFilePath, corrR, corrG, corrB)) {
-                params.hasPrecomputedCorrection = true;
-                params.corrR = std::move(corrR);
-                params.corrG = std::move(corrG);
-                params.corrB = std::move(corrB);
-                params.grayscaleEnabled = true;
-                params.grayscale.enabled = true;
-            }
-        } else if (!isHDR) {
-            // SDR ICC profile: use per-channel TRC for correction (shape reliable per research)
-            // TRC inverted against target gamma (2.2/2.4)
-            ICCProfileData icc;
-            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
-                params.hasPerChannelTRC = true;
-                params.trcR = icc.trcR;
-                params.trcG = icc.trcG;
-                params.trcB = icc.trcB;
-                params.grayscaleEnabled = true;
-                params.grayscale.enabled = true;
-                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-            }
-        }
-        // Peak nits is display metadata, needed regardless of file type
-        params.peakNits = mhc.grayscale.peakNits;
-    } else if (mhc.grayscale.enabled) {
-        if (mhc.grayscale.points.empty()) {
-            params.grayscaleEnabled = false;
-            params.grayscale.enabled = false;
-        } else {
-            params.grayscaleEnabled = true;
-            params.grayscale.enabled = true;
-            params.grayscale.pointCount = mhc.grayscale.pointCount;
-            for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
-                params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
-                    ? mhc.grayscale.points[i] : 0.0f;
-                // Compute per-channel values from base * deviation
-                float base = params.grayscale.points[i];
-                float devR = (i < (int)mhc.grayscale.rgbDeviations[0].size()) ? mhc.grayscale.rgbDeviations[0][i] : 1.0f;
-                float devG = (i < (int)mhc.grayscale.rgbDeviations[1].size()) ? mhc.grayscale.rgbDeviations[1][i] : 1.0f;
-                float devB = (i < (int)mhc.grayscale.rgbDeviations[2].size()) ? mhc.grayscale.rgbDeviations[2][i] : 1.0f;
-                params.grayscale.pointsR[i] = base * devR;
-                params.grayscale.pointsG[i] = base * devG;
-                params.grayscale.pointsB[i] = base * devB;
-            }
-            params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-            params.grayscale.peakNits = mhc.grayscale.peakNits;
-            params.peakNits = mhc.grayscale.peakNits;
-        }
-    }
-
-    // White balance gains (von Kries in wire RGB space)
-    if (mhc.whiteBalanceEnabled) {
-        float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
-        bool isD65 = (fabsf(wx - 0.3127f) < 0.001f && fabsf(wy - 0.3290f) < 0.001f);
-        if (!isD65 && wy > 0.001f) {
-            float tX = wx / wy, tY = 1.0f, tZ = (1.0f - wx - wy) / wy;
-            static const float rec2020XYZtoRGB[9] = {
-                 1.7166512f, -0.3556708f, -0.2533663f,
-                -0.6666844f,  1.6164812f,  0.0157685f,
-                 0.0176399f, -0.0427706f,  0.9421031f };
-            static const float srgbXYZtoRGB[9] = {
-                 3.2404542f, -1.5371385f, -0.4985314f,
-                -0.9692660f,  1.8760108f,  0.0415560f,
-                 0.0556434f, -0.2040259f,  1.0572252f };
-            const float* m = isHDR ? rec2020XYZtoRGB : srgbXYZtoRGB;
-            params.whiteBalanceGains[0] = m[0]*tX + m[1]*tY + m[2]*tZ;
-            params.whiteBalanceGains[1] = m[3]*tX + m[4]*tY + m[5]*tZ;
-            params.whiteBalanceGains[2] = m[6]*tX + m[7]*tY + m[8]*tZ;
-        }
-    }
-
-    // Desktop gamma (HDR only)
-    if (isHDR && mhc.desktopGammaEnabled) {
-        params.desktopGammaEnabled = true;
-    }
-
-    // Correction grayscale (fine-tuning on top of base)
-    if (mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty()) {
-        params.correctionGrayscaleEnabled = true;
-        params.correctionGrayscale.enabled = true;
-        params.correctionGrayscale.pointCount = mhc.correctionGrayscale.pointCount;
-        for (int i = 0; i < mhc.correctionGrayscale.pointCount && i < 32; i++) {
-            params.correctionGrayscale.points[i] = (i < (int)mhc.correctionGrayscale.points.size())
-                ? mhc.correctionGrayscale.points[i] : 0.0f;
-            float base = params.correctionGrayscale.points[i];
-            float devR = (i < (int)mhc.correctionGrayscale.rgbDeviations[0].size()) ? mhc.correctionGrayscale.rgbDeviations[0][i] : 1.0f;
-            float devG = (i < (int)mhc.correctionGrayscale.rgbDeviations[1].size()) ? mhc.correctionGrayscale.rgbDeviations[1][i] : 1.0f;
-            float devB = (i < (int)mhc.correctionGrayscale.rgbDeviations[2].size()) ? mhc.correctionGrayscale.rgbDeviations[2][i] : 1.0f;
-            params.correctionGrayscale.pointsR[i] = base * devR;
-            params.correctionGrayscale.pointsG[i] = base * devG;
-            params.correctionGrayscale.pointsB[i] = base * devB;
-        }
-        params.correctionGrayscale.use24Gamma = mhc.correctionGrayscale.use24Gamma;
-        params.correctionGrayscale.peakNits = mhc.correctionGrayscale.peakNits;
-    }
+    BuildMHC2Params(mhc, isHDR, monitorIndex, params);
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return;
@@ -581,36 +494,11 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         DeleteFileW(oldPath.c_str());
     }
 
-    // Delete old DG variant
-    if (isHDR && !mhc.profileNameDG.empty()) {
-        wchar_t sysDirOld[MAX_PATH];
-        GetSystemDirectory(sysDirOld, MAX_PATH);
-        std::wstring oldDGPath = std::wstring(sysDirOld) + L"\\spool\\drivers\\color\\" + mhc.profileNameDG;
-        DeleteFileW(oldDGPath.c_str());
-    }
-
-    // Generate DG variant for HDR
+    // Generate DG variant for HDR (deletes old variant, installs new one)
     std::wstring dgProfilePath, dgProfileName;
     if (isHDR) {
-        MHC2ProfileParams dgParams = params;
-        dgParams.desktopGammaEnabled = !params.desktopGammaEnabled;
-        std::vector<uint8_t> dgData;
-        if (GenerateMHC2Profile(dgParams, dgData)) {
-            dgProfileName = L"DesktopLUT_" + std::wstring(monTag)
-                + L"_HDR_DG_" + std::to_wstring(GetTickCount64()) + L".icm";
-            std::wstring dgTempPath = std::wstring(tempDir) + dgProfileName;
-            if (WriteMHC2Profile(dgData, dgTempPath)) {
-                if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
-                    RemoveMHC2Profile(dgProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                    wchar_t sysDirDG[MAX_PATH];
-                    GetSystemDirectory(sysDirDG, MAX_PATH);
-                    dgProfilePath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + dgProfileName;
-                }
-                // Always re-associate main profile (Install may have switched it, or Remove may have cleared it)
-                ReassociateMHC2Profile(newProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                DeleteFileW(dgTempPath.c_str());
-            }
-        }
+        GenerateAndInstallDGVariant(params, mhc.profileNameDG, newProfileName,
+            monitorIndex, displayInfo, tempDir, dgProfilePath, dgProfileName);
     }
 
     // Update stored name — profile is now active, ensure enabled is true
@@ -621,7 +509,7 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         mhc.enabled = true;
         mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
         mhc.profileName = newProfileName;
-        mhc.hasPerChannelTRC = params.hasPerChannelTRC;
+        mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
         if (isHDR) {
             mhc.profilePathDG = dgProfilePath;
             mhc.profileNameDG = dgProfileName;
@@ -984,7 +872,7 @@ static constexpr float WHITE_MAX = 0.50f;    // Illuminant A ~0.45 is the warmes
 static float ReadAndClamp(HWND hwnd, float lo, float hi) {
     wchar_t buf[16];
     GetWindowText(hwnd, buf, 16);
-    return std::clamp((float)_wtof(buf), lo, hi);
+    return std::clamp((float)_wcstod_l(buf, nullptr, GetCLocale()), lo, hi);
 }
 
 static void MhcSaveCustomFromFields(MhcDialogData* d) {
@@ -1193,7 +1081,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (d->isHDR && d->hwndGsPeak) {
                 wchar_t buf[16];
                 GetWindowText(d->hwndGsPeak, buf, 16);
-                d->settings->grayscale.peakNits = (float)_wtof(buf);
+                d->settings->grayscale.peakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
                 if (d->settings->grayscale.peakNits < 10.0f) d->settings->grayscale.peakNits = 10.0f;
             }
             // Ensure points are initialized
@@ -1413,7 +1301,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (d->isHDR && d->hwndGsPeak) {
                 wchar_t buf[16];
                 GetWindowText(d->hwndGsPeak, buf, 16);
-                d->settings->grayscale.peakNits = (float)_wtof(buf);
+                d->settings->grayscale.peakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
                 if (d->settings->grayscale.peakNits < 10.0f) d->settings->grayscale.peakNits = 10.0f;
             }
             // Store source file path and type for profile regeneration

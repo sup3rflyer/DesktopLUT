@@ -27,12 +27,6 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Wtsapi32.lib")
 
-// C locale for float parsing (matches settings.cpp)
-static _locale_t GetCLocale() {
-    static _locale_t loc = _create_locale(LC_ALL, "C");
-    return loc;
-}
-
 // ============================================================================
 // SECTION: Display Power Notification (GUI-side)
 // ============================================================================
@@ -49,6 +43,82 @@ static const GUID GUID_CONSOLE_DISPLAY_STATE_GUI =
 // ============================================================================
 // SECTION: Utilities
 // ============================================================================
+
+// Start overlay/processing for MHC live preview if not already running.
+// Sets livePreview=true if monitor mode matches isHDR, and sets the
+// startedForPreview / startedOverlayForPreview flags accordingly.
+static void EnsureProcessingForPreview(int monIdx, bool isHDR,
+                                       bool& livePreview,
+                                       bool& startedForPreview,
+                                       bool& startedOverlayForPreview) {
+    livePreview = false;
+    startedForPreview = false;
+    startedOverlayForPreview = false;
+
+    // Case 1: Already running with overlay — check mode match
+    if (g_gui.isRunning && g_gui.processingThread.joinable()) {
+        for (const auto& ctx : g_monitors) {
+            if (ctx.index == monIdx) {
+                livePreview = (ctx.isHDREnabled == isHDR);
+                break;
+            }
+        }
+    }
+
+    // Case 2: DWM hook running without overlay — start overlay for preview
+    if (g_gui.isRunning && !g_gui.processingThread.joinable() && g_dwmHookMode.load()) {
+        g_mhcEditDialogOpen.store(true);
+        DwmHookReevaluateOverlay();
+        if (g_gui.processingThread.joinable()) {
+            startedOverlayForPreview = true;
+            // Wait for monitor contexts with message pumping (up to 500ms)
+            for (int waitI = 0; waitI < 50 && !livePreview; waitI++) {
+                MSG pumpMsg;
+                while (PeekMessage(&pumpMsg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&pumpMsg);
+                    DispatchMessage(&pumpMsg);
+                }
+                for (const auto& ctx : g_monitors) {
+                    if (ctx.index == monIdx) {
+                        livePreview = (ctx.isHDREnabled == isHDR);
+                        break;
+                    }
+                }
+                if (!livePreview) Sleep(10);
+            }
+            if (!livePreview) {
+                g_mhcEditDialogOpen.store(false);
+                DwmHookReevaluateOverlay();
+                startedOverlayForPreview = false;
+            }
+        } else {
+            g_mhcEditDialogOpen.store(false);
+        }
+    }
+
+    // Case 3: Not running at all — start processing
+    if (!g_gui.isRunning) {
+        auto& cc = isHDR ? g_gui.monitorSettings[monIdx].hdrColorCorrection
+                         : g_gui.monitorSettings[monIdx].sdrColorCorrection;
+        bool origPrimEnabled = cc.primariesEnabled;
+        cc.primariesEnabled = true;  // Ensure this monitor is included in processing
+        StartProcessing();
+        cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
+        if (g_gui.isRunning) {
+            startedForPreview = true;
+            for (const auto& ctx : g_monitors) {
+                if (ctx.index == monIdx) {
+                    livePreview = (ctx.isHDREnabled == isHDR);
+                    break;
+                }
+            }
+            if (!livePreview) {
+                StopProcessing();
+                startedForPreview = false;
+            }
+        }
+    }
+}
 
 void UpdateGUIState() {
     // Monitor list, browse, clear buttons always enabled (can edit while running)
@@ -394,12 +464,14 @@ static LRESULT CALLBACK ScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
     }
 
     case WM_MOUSEWHEEL: {
-        // Handle mouse wheel scrolling (accumulate delta for smooth-scroll mice)
-        static int wheelAccum = 0;
+        // Handle mouse wheel scrolling (accumulate delta per-panel for smooth-scroll mice)
+        static int wheelAccum[4] = {};
+        int tabIdx = (int)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+        if (tabIdx < 0 || tabIdx >= 4) return 0;
         int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-        wheelAccum += delta;
-        int lines = (wheelAccum * 3) / WHEEL_DELTA;
-        wheelAccum -= (lines * WHEEL_DELTA) / 3;
+        wheelAccum[tabIdx] += delta;
+        int lines = (wheelAccum[tabIdx] * 3) / WHEEL_DELTA;
+        wheelAccum[tabIdx] -= (lines * WHEEL_DELTA) / 3;
         for (int i = 0; i < abs(lines); i++) {
             SendMessage(hwnd, WM_VSCROLL, lines > 0 ? SB_LINEUP : SB_LINEDOWN, 0);
         }
@@ -1438,10 +1510,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int sel = (int)SendMessage(g_gui.hwndMaxTmlCombo, CB_GETCURSEL, 0, 0);
                 const wchar_t* values[] = { L"", L"400", L"600", L"1000", L"1400", L"4000", L"10000" };
                 const float nitsValues[] = { 0, 400, 600, 1000, 1400, 4000, 10000 };
-                if (sel > 0 && sel < 7) {
-                    SetWindowText(g_gui.hwndMaxTmlEdit, values[sel]);
+                if (sel >= 0 && sel < 7) {
+                    if (sel > 0)
+                        SetWindowText(g_gui.hwndMaxTmlEdit, values[sel]);
                     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                        g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nitsValues[sel];
+                        float nits = nitsValues[sel];
+                        if (sel == 0) {
+                            // "Custom" — sync stored value from current edit box text
+                            wchar_t buf[16];
+                            GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
+                            nits = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                        }
+                        g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nits;
                         SaveSettings();
                     }
                 }
@@ -1493,71 +1573,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::wstring origProfileName = mhc.profileName;
                 std::wstring origProfilePath = mhc.profilePath;
 
-                // Determine if live preview is possible:
-                // 1. Processing must be running (or we can start it)
-                // 2. Display HDR/SDR mode must match the section being edited
-                bool livePreview = false;
-                bool startedForPreview = false;
-                bool startedOverlayForPreview = false;
-
-                // Check mode match against running monitors
-                if (g_gui.isRunning && g_gui.processingThread.joinable()) {
-                    for (const auto& ctx : g_monitors) {
-                        if (ctx.index == monIdx) {
-                            livePreview = (ctx.isHDREnabled == isHDR);
-                            break;
-                        }
-                    }
-                }
-
-                // DWM hook mode running without overlay — start overlay for preview
-                if (g_gui.isRunning && !g_gui.processingThread.joinable() && g_dwmHookMode.load()) {
-                    g_mhcEditDialogOpen.store(true);  // Set early so HasActiveShaderCorrections() returns true
-                    DwmHookReevaluateOverlay();
-                    if (g_gui.processingThread.joinable()) {
-                        startedOverlayForPreview = true;
-                        // Wait briefly for monitor contexts to be populated
-                        Sleep(200);
-                        for (const auto& ctx : g_monitors) {
-                            if (ctx.index == monIdx) {
-                                livePreview = (ctx.isHDREnabled == isHDR);
-                                break;
-                            }
-                        }
-                        if (!livePreview) {
-                            g_mhcEditDialogOpen.store(false);
-                            DwmHookReevaluateOverlay();
-                            startedOverlayForPreview = false;
-                        }
-                    } else {
-                        g_mhcEditDialogOpen.store(false);
-                    }
-                }
-
-                // If not running at all, try starting processing
-                if (!g_gui.isRunning) {
-                    auto& ms = g_gui.monitorSettings[monIdx];
-                    auto& cc = isHDR ? ms.hdrColorCorrection : ms.sdrColorCorrection;
-                    bool origPrimEnabled = cc.primariesEnabled;
-                    cc.primariesEnabled = true;  // Ensure this monitor is included in processing
-                    StartProcessing();
-                    cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
-                    if (g_gui.isRunning) {
-                        startedForPreview = true;
-                        // Check mode match now that we have monitor contexts
-                        for (const auto& ctx : g_monitors) {
-                            if (ctx.index == monIdx) {
-                                livePreview = (ctx.isHDREnabled == isHDR);
-                                break;
-                            }
-                        }
-                        // Mode mismatch — stop the processing we just started
-                        if (!livePreview) {
-                            StopProcessing();
-                            startedForPreview = false;
-                        }
-                    }
-                }
+                bool livePreview, startedForPreview, startedOverlayForPreview;
+                EnsureProcessingForPreview(monIdx, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
 
                 // Only remove ICC and clear flags when live preview is active
                 // (shader replaces ICC corrections during preview, restores on Cancel/Apply)
@@ -1796,65 +1813,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (isHDR) gs.initLinearPQ(); else gs.initLinear();
                 }
 
-                // Start overlay for live preview (same pattern as MHC Edit dialog)
-                bool livePreview = false;
-                bool startedForPreview = false;
-                bool startedOverlayForPreview = false;
-
-                if (g_gui.isRunning && g_gui.processingThread.joinable()) {
-                    for (const auto& ctx : g_monitors) {
-                        if (ctx.index == monIdx) {
-                            livePreview = (ctx.isHDREnabled == isHDR);
-                            break;
-                        }
-                    }
-                }
-
-                // DWM hook running without overlay — start overlay for preview
-                if (g_gui.isRunning && !g_gui.processingThread.joinable() && g_dwmHookMode.load()) {
-                    g_mhcEditDialogOpen.store(true);
-                    DwmHookReevaluateOverlay();
-                    if (g_gui.processingThread.joinable()) {
-                        startedOverlayForPreview = true;
-                        Sleep(200);
-                        for (const auto& ctx : g_monitors) {
-                            if (ctx.index == monIdx) {
-                                livePreview = (ctx.isHDREnabled == isHDR);
-                                break;
-                            }
-                        }
-                        if (!livePreview) {
-                            g_mhcEditDialogOpen.store(false);
-                            DwmHookReevaluateOverlay();
-                            startedOverlayForPreview = false;
-                        }
-                    } else {
-                        g_mhcEditDialogOpen.store(false);
-                    }
-                }
-
-                // Not running at all — start processing for preview
-                if (!g_gui.isRunning) {
-                    auto& cc = isHDR ? g_gui.monitorSettings[monIdx].hdrColorCorrection
-                                     : g_gui.monitorSettings[monIdx].sdrColorCorrection;
-                    bool origPrimEnabled = cc.primariesEnabled;
-                    cc.primariesEnabled = true;
-                    StartProcessing();
-                    cc.primariesEnabled = origPrimEnabled;
-                    if (g_gui.isRunning) {
-                        startedForPreview = true;
-                        for (const auto& ctx : g_monitors) {
-                            if (ctx.index == monIdx) {
-                                livePreview = (ctx.isHDREnabled == isHDR);
-                                break;
-                            }
-                        }
-                        if (!livePreview) {
-                            StopProcessing();
-                            startedForPreview = false;
-                        }
-                    }
-                }
+                bool livePreview, startedForPreview, startedOverlayForPreview;
+                EnsureProcessingForPreview(monIdx, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
 
                 // Remove ICC profile and clear MHC flags for shader preview
                 bool hadProfile = mhc.enabled && !mhc.profileName.empty();
@@ -2013,7 +1973,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // Settings tab controls - hotkeys register/unregister dynamically if running
+        // Settings tab controls - hotkeys register/unregister dynamically if running.
+        // Routing: g_hookOnlyHotkeys=true → GUI window (DWM hook mode, no overlay);
+        //          g_hookOnlyHotkeys=false → g_mainHwnd (render thread's overlay window).
         case ID_SETTINGS_HOTKEY_GAMMA_CHECK:
             {
                 bool enable = (SendMessage(g_gui.hwndSettingsHotkeyGamma, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -2592,11 +2554,13 @@ int RunGUI() {
         return 1;
     }
 
-    // Check if any visual correction is enabled (LUT, Primaries, Grayscale, 2.4 Gamma, Desktop Gamma)
+    // Check if any visual correction is enabled (LUT, MHC, Primaries, Grayscale, 2.4 Gamma, Desktop Gamma, DWM hook)
     bool hasAnyCorrection = g_userDesktopGammaMode.load();  // Desktop gamma is a global setting
     for (const auto& settings : g_gui.monitorSettings) {
         if (!settings.sdrPath.empty() ||
             !settings.hdrPath.empty() ||
+            settings.sdrMHC.enabled ||
+            settings.hdrMHC.enabled ||
             settings.sdrColorCorrection.primariesEnabled ||
             settings.sdrColorCorrection.grayscale.enabled ||
             settings.sdrColorCorrection.grayscale.use24Gamma ||

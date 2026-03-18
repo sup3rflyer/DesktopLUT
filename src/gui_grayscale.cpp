@@ -4,6 +4,7 @@
 #include "gui.h"
 #include "gui_shared.h"
 #include "globals.h"
+#include "settings.h"
 #include "processing.h"
 #include <commctrl.h>
 #include <windowsx.h>
@@ -258,7 +259,7 @@ static void ApplyRGBEditValue(int pointIndex) {
 
     wchar_t text[16];
     GetWindowText(data->rgbEditBoxes[pointIndex], text, 16);
-    float pct = (float)_wtof(text);
+    float pct = (float)_wcstod_l(text, nullptr, GetCLocale());
     pct = (std::max)(-MANUAL_INPUT_MAX, (std::min)(MANUAL_INPUT_MAX, pct));
     float dev = 1.0f + pct / 100.0f;
 
@@ -588,7 +589,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     // Read deviation directly from edit (allows wider range than slider ±25)
                     wchar_t text[16];
                     GetWindowText(data->editBoxes[editIndex], text, 16);
-                    float deviationPct = (float)_wtof(text);
+                    float deviationPct = (float)_wcstod_l(text, nullptr, GetCLocale());
                     deviationPct = (std::max)(-MANUAL_INPUT_MAX, (std::min)(MANUAL_INPUT_MAX, deviationPct));
 
                     // Reformat edit box and pin slider at ±25 visually.

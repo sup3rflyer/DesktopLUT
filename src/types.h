@@ -482,7 +482,7 @@ struct MonitorContext {
     // Desktop duplication
     IDXGIOutputDuplication* duplication = nullptr;
     DXGI_FORMAT captureFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-    bool isHDREnabled = false;
+    MovableAtomic<bool> isHDREnabled{false};  // Atomic: set by processing thread, read by GUI thread
     MovableAtomic<bool> isHDRAtom{false};  // Thread-safe HDR flag for whitelist thread
     bool isHDRCapable = false;
     bool isFP16SDR = false;  // ACM: FP16 capture but SDR color space (input is linear scRGB at 80 nits)

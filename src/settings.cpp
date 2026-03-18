@@ -10,7 +10,7 @@
 // Cached C locale for locale-independent float parsing/writing.
 // _wtof and swprintf_s use the thread locale which may use comma as decimal
 // separator on European systems, breaking INI round-trips.
-static _locale_t GetCLocale() {
+_locale_t GetCLocale() {
     static _locale_t loc = _create_locale(LC_ALL, "C");
     return loc;
 }

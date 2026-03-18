@@ -1757,6 +1757,10 @@ void CleanupOrphanedMhcProfiles() {
     HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
+    // Note: we skip ColorProfileRemoveDisplayAssociation here because:
+    // 1) Orphaned profiles are from a previous session — likely already disassociated on clean exit
+    // 2) We don't have adapter LUID / source ID for profiles that may belong to disconnected monitors
+    // 3) Windows handles missing profile files gracefully (falls back to default)
     int deleted = 0;
     do {
         std::wstring fileName = fd.cFileName;

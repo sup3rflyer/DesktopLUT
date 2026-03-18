@@ -3,6 +3,7 @@
 
 #include "gui_shared.h"
 #include "globals.h"
+#include "settings.h"
 #include <algorithm>
 
 // Custom colors for Windows 11-like scheme
@@ -35,7 +36,7 @@ void UpdateSliderFromEdit(int index) {
     data->updatingFromEdit = true;
     wchar_t text[16];
     GetWindowText(data->editBoxes[index], text, 16);
-    float deviation = (float)_wtof(text);
+    float deviation = (float)_wcstod_l(text, nullptr, GetCLocale());
     int maxRange = GRAYSCALE_RANGE * GRAYSCALE_SLIDER_SCALE;
     int sliderVal = (int)(deviation * GRAYSCALE_SLIDER_SCALE + 0.5f);
     sliderVal = (std::max)(-maxRange, (std::min)(maxRange, sliderVal));

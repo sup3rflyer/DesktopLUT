@@ -6,6 +6,11 @@
 #include "types.h"
 #include <string>
 
+// Cached C locale for locale-independent float parsing/writing.
+// _wtof and swprintf_s use the thread locale which may use comma as decimal
+// separator on European systems, breaking float round-trips.
+_locale_t GetCLocale();
+
 // Get path to INI file (next to exe)
 std::wstring GetIniPath();
 

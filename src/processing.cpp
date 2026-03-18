@@ -830,8 +830,8 @@ static void GetWhitePointFromEditBoxes(float& Wx, float& Wy, bool isHDR) {
     wchar_t buf[16];
     HWND hwndWx = isHDR ? g_gui.hwndHdrPrimariesWx : g_gui.hwndPrimariesWx;
     HWND hwndWy = isHDR ? g_gui.hwndHdrPrimariesWy : g_gui.hwndPrimariesWy;
-    if (hwndWx) { GetWindowText(hwndWx, buf, 16); Wx = (float)_wtof(buf); }
-    if (hwndWy) { GetWindowText(hwndWy, buf, 16); Wy = (float)_wtof(buf); }
+    if (hwndWx) { GetWindowText(hwndWx, buf, 16); Wx = (float)_wcstod_l(buf, nullptr, GetCLocale()); }
+    if (hwndWy) { GetWindowText(hwndWy, buf, 16); Wy = (float)_wcstod_l(buf, nullptr, GetCLocale()); }
 }
 
 bool SettingsChanged() {
