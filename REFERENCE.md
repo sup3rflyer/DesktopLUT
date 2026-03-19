@@ -24,7 +24,7 @@ Settings saved to `DesktopLUT.ini` next to executable.
 TetrahedralInterp=0    ; 0 = trilinear (default), 1 = tetrahedral (higher quality)
 ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
 ShowFrameTiming=0      ; 1 = show frame timing stats in analysis overlay (developer debug)
-DwmHookMode=1          ; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay only for analysis)
+DwmHookMode=1          ; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis)
 GammaWhitelist=mpv.exe,mpvnet.exe  ; Auto-disable desktop gamma when these apps run
 
 ; Passthrough Mode (hide overlay when specific apps are running)
@@ -110,7 +110,7 @@ When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injec
 3. Before each Present call, the hook applies 3D LUT + ICtCp tonemapping via pixel/compute shaders. All 5 tonemap curves are supported (BT.2390, SoftClip, Reinhard, BT.2446A, HardClip) including dynamic peak detection (80x45 grid, temporal EMA smoothing).
 4. Live parameter updates (tonemapping changes, monitor hotplug) are communicated via shared memory IPC (`Global\DesktopLUT_DwmHook_Config`) — no re-injection needed.
 
-**Overlay is only started for analysis**: The DD overlay activates only for the analysis overlay (Win+Shift+X) or MHC editor live preview. All color correction and tonemapping is overlay-free.
+**Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for MHC editor live preview or non-DWM-hook shader corrections. State tracked by `g_analysisOnlyMode` atomic.
 
 **Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event). Max 3 consecutive re-injection retries. Orphan detection via `hostPid` in shared memory — DLL self-unloads if host process dies.
 
@@ -321,7 +321,7 @@ Runs 24/7, must be invisible. All operations follow:
 | Present (tearing enabled) | Immediate |
 | **Processing overhead** | **~1-2ms** |
 
-**DWM Hook Mode**: Zero capture latency for 3D LUT and tonemapping (applied inside DWM). Overlay latency only applies when analysis is active.
+**DWM Hook Mode**: Zero capture latency for 3D LUT and tonemapping (applied inside DWM). Analysis runs in lightweight mode (DD capture + compute shader only, no overlay).
 
 **Frame pacer jitter**: ~0.01-0.05ms with predictive strategies (vs ~0.5-2ms with legacy DwmFlush). MMCSS "Pro Audio" thread priority ensures consistent scheduling. Spin-wait adds <2ms CPU per frame (<12% of 60Hz budget).
 
@@ -378,7 +378,7 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 
 **Fullscreen Exclusive**: Zero impact (but no color correction). Desktop Duplication can't capture games that bypass DWM.
 
-**DWM Hook Mode**: When using DWM hook for 3D LUT + tonemapping (no overlay), impact is lower — no Desktop Duplication capture overhead. Overlay only needed for analysis.
+**DWM Hook Mode**: When using DWM hook for 3D LUT + tonemapping (no overlay), impact is lower — no Desktop Duplication capture overhead. Analysis also runs overlay-free (lightweight DD capture + compute shader only).
 
 **If concerned**: Run game benchmarks with/without DesktopLUT enabled to measure actual impact on your specific hardware.
 
@@ -400,12 +400,12 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 
 This is a fundamental NVIDIA driver limitation affecting all external overlay applications (ShaderGlass, Lossless Scaling, Discord overlay, Xbox Game Bar, etc.). No workaround exists.
 
-**DWM Hook Mode**: When using DWM hook (no overlay active), VRR is unaffected on all vendors. The overlay is only created when analysis is needed.
+**DWM Hook Mode**: When using DWM hook, VRR is unaffected on all vendors. Analysis runs in lightweight mode (no overlay window) so it does not break G-Sync.
 
 **For NVIDIA users**:
 1. Enable Windows "Variable refresh rate" setting (Settings > Display > Graphics > Variable refresh rate: On)
 2. Use Passthrough Mode (Settings tab) to auto-hide overlay when specific games are running
-3. Use DWM Hook Mode — 3D LUT and tonemapping are overlay-free; overlay only activates for analysis
+3. Use DWM Hook Mode — 3D LUT, tonemapping, and analysis are all overlay-free
 
 See [GitHub Issue #1](https://github.com/sup3rflyer/DesktopLUT/issues/1) for technical details.
 
@@ -447,6 +447,7 @@ Tools in `tools/` for diagnostics and development:
 - [DirectComposition](https://docs.microsoft.com/en-us/windows/win32/directcomp/directcomposition-portal)
 - [ShaderGlass](https://github.com/mausimus/ShaderGlass) - Similar overlay approach
 - [set_maxtml](https://github.com/ledoge/set_maxtml) - MaxTML implementation reference
+- [dwm_lut_fixed](https://github.com/zkippp/dwm_lut_fixed) - DWM hook injection approach, made DWM hooking possible again
 - [Free Blue Noise Textures](https://github.com/Calinou/free-blue-noise-textures) - Christoph Peters (CC0)
 - [.cube LUT format](https://resolve.cafe/developers/luts/)
 - [Lilium HDR shaders](https://github.com/EndlesslyFlowering/ReShade_HDR_shaders)

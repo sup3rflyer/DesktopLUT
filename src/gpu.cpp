@@ -440,6 +440,61 @@ bool InitD3D() {
     return true;
 }
 
+bool InitD3DAnalysisOnly() {
+    // Minimal D3D init for analysis-only mode: device, context, analysis compute shader, analysis CB.
+    // No VS/PS, no samplers, no constant buffer, no textures, no DComp.
+    D3D_FEATURE_LEVEL featureLevel;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#ifdef _DEBUG
+    flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+        nullptr, 0, D3D11_SDK_VERSION, &g_device, &featureLevel, &g_context);
+    if (FAILED(hr)) {
+        std::cerr << "InitD3DAnalysisOnly: D3D11CreateDevice failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Compile analysis compute shader
+    ID3DBlob* analysisBlob = nullptr;
+    ID3DBlob* errorBlob = nullptr;
+    hr = D3DCompile(g_analysisCSSource, strlen(g_analysisCSSource), "AnalysisCS", nullptr, nullptr,
+        "main", "cs_5_0", 0, 0, &analysisBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) {
+            std::cerr << "Analysis CS Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+            errorBlob->Release();
+        }
+        std::cerr << "InitD3DAnalysisOnly: Analysis compute shader compilation failed" << std::endl;
+        return false;
+    }
+    if (errorBlob) { errorBlob->Release(); errorBlob = nullptr; }
+    hr = g_device->CreateComputeShader(analysisBlob->GetBufferPointer(), analysisBlob->GetBufferSize(), nullptr, &g_analysisCS);
+    analysisBlob->Release();
+    if (FAILED(hr)) {
+        std::cerr << "InitD3DAnalysisOnly: Failed to create analysis compute shader" << std::endl;
+        return false;
+    }
+
+    // Create constant buffer for analysis parameters
+    D3D11_BUFFER_DESC analysisCbDesc = {};
+    analysisCbDesc.ByteWidth = 16;  // 4 uints: width, height, isHDR, pad
+    analysisCbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    analysisCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    analysisCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_device->CreateBuffer(&analysisCbDesc, nullptr, &g_analysisCB);
+    if (FAILED(hr)) {
+        std::cerr << "InitD3DAnalysisOnly: Failed to create analysis CB" << std::endl;
+        g_analysisCS->Release();
+        g_analysisCS = nullptr;
+        return false;
+    }
+
+    std::cout << "InitD3DAnalysisOnly: device + analysis CS initialized" << std::endl;
+    return true;
+}
+
 bool CheckTearingSupport() {
     IDXGIDevice* dxgiDevice = nullptr;
     if (FAILED(g_device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) || !dxgiDevice) {

@@ -55,8 +55,8 @@ static void EnsureProcessingForPreview(int monIdx, bool isHDR,
     startedForPreview = false;
     startedOverlayForPreview = false;
 
-    // Case 1: Already running with overlay — check mode match
-    if (g_gui.isRunning && g_gui.processingThread.joinable()) {
+    // Case 1: Already running with full overlay (not analysis-only) — check mode match
+    if (g_gui.isRunning && g_gui.processingThread.joinable() && !g_analysisOnlyMode.load()) {
         for (const auto& ctx : g_monitors) {
             if (ctx.index == monIdx) {
                 livePreview = (ctx.isHDREnabled == isHDR);
@@ -65,8 +65,8 @@ static void EnsureProcessingForPreview(int monIdx, bool isHDR,
         }
     }
 
-    // Case 2: DWM hook running without overlay — start overlay for preview
-    if (g_gui.isRunning && !g_gui.processingThread.joinable() && g_dwmHookMode.load()) {
+    // Case 2: DWM hook running without full overlay (or with analysis-only) — start overlay for preview
+    if (g_gui.isRunning && (!g_gui.processingThread.joinable() || g_analysisOnlyMode.load()) && g_dwmHookMode.load()) {
         g_mhcEditDialogOpen.store(true);
         DwmHookReevaluateOverlay();
         if (g_gui.processingThread.joinable()) {
@@ -2106,6 +2106,26 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DwmHookReevaluateOverlay();
         return 0;
 
+    case WM_ANALYSIS_ONLY_EXITED: {
+        // Analysis-only thread exited.
+        // Guard: StopAnalysisOnlyMode may have already handled cleanup during its message pump.
+        if (!g_analysisOnlyMode.load() && !g_gui.processingThread.joinable())
+            return 0;  // Already handled by StopAnalysisOnlyMode or StopProcessing
+
+        if (g_gui.processingThread.joinable())
+            g_gui.processingThread.join();
+        g_analysisOnlyMode.store(false);
+
+        if (wParam == 1 && g_gui.isRunning) {
+            // Needs transition to full overlay (MHC editor opened or corrections activated)
+            DwmHookReevaluateOverlay();
+        } else if (g_running.load() && g_analysisEnabled.load() && g_gui.isRunning) {
+            // Transient error — restart analysis-only mode
+            DwmHookReevaluateOverlay();
+        }
+        return 0;
+    }
+
     case WM_PROCESSING_EXITED:  // Processing thread exited
         // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
         // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
@@ -2118,6 +2138,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_hotkeyHdrEnabled.load())
                     RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
                 g_hookOnlyHotkeys = true;
+            }
+            // If analysis is still enabled, start analysis-only mode (full overlay no longer needed)
+            if (g_analysisEnabled.load()) {
+                DwmHookReevaluateOverlay();
             }
             return 0;  // Hook still running — don't set isRunning=false or trigger auto-restart
         }

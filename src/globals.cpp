@@ -80,6 +80,7 @@ std::atomic<int> g_frameBufferIdleMs{ 3000 };  // Idle timeout before buffer eng
 std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (default: off, experimental)
 int g_dwmHookWatchdogRetries = 0;              // Consecutive re-injection failures (GUI thread only)
 std::atomic<bool> g_hookOnlyHotkeys{ false };  // Hotkeys registered on GUI window (hook-only mode)
+std::atomic<bool> g_analysisOnlyMode{ false }; // Lightweight analysis-only thread running (no overlay)
 
 // ============================================================================
 // Hotkey Settings

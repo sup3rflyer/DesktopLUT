@@ -58,6 +58,7 @@ struct MovableAtomic {
 #define WM_MHC_PROFILE_REAPPLIED (WM_USER + 101)
 #define WM_HOTKEY_REGISTER       (WM_USER + 102)
 #define WM_SHADER_STATE_CHANGED  (WM_USER + 103)
+#define WM_ANALYSIS_ONLY_EXITED  (WM_USER + 104)
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003

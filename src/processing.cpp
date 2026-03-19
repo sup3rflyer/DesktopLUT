@@ -458,8 +458,12 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     // Unregister display power notifications
     UnregisterDisplayPowerNotification();
 
-    // Cleanup analysis overlay
-    DestroyAnalysisOverlay();
+    // Cleanup analysis overlay — skip in DWM hook mode if analysis is still enabled,
+    // so the window survives the transition to analysis-only mode or hook-only hotkey mode.
+    // StopProcessing handles final destruction.
+    if (!g_dwmHookMode.load() || !g_analysisEnabled.load()) {
+        DestroyAnalysisOverlay();
+    }
 
     // Cleanup OSD
     if (g_osdHwnd) {
@@ -534,9 +538,274 @@ static bool HasActiveShaderCorrections() {
         if (hdr.primariesEnabled && !hdrMhcP) return true;
         if (hdr.grayscale.enabled && !hdrMhcG) return true;
         if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
-        if (desktopGamma && !hdrMhcG) return true;
+        if (desktopGamma && ms.hdrMHC.enabled && !hdrMhcG) return true;
     }
     return false;
+}
+
+// Check if any non-analysis shader corrections need the full overlay.
+// Returns true if MHC preview, primaries, grayscale, WB, tonemapping,
+// desktop gamma, or 2.4 gamma require the overlay pixel shader.
+static bool HasNonAnalysisShaderCorrections() {
+    if (g_mhcEditDialogOpen.load()) return true;
+    bool desktopGamma = g_userDesktopGammaMode.load();
+    for (const auto& ms : g_gui.monitorSettings) {
+        bool sdrMhcP = ms.sdrMHC.enabled && ms.sdrMHC.primariesEnabled;
+        bool sdrMhcG = ms.sdrMHC.enabled && (ms.sdrMHC.grayscale.enabled ||
+                       ms.sdrMHC.correctionGrayscale.enabled ||
+                       !ms.sdrMHC.sourceFilePath.empty() || ms.sdrMHC.hasPerChannelTRC);
+        bool hdrMhcP = ms.hdrMHC.enabled && ms.hdrMHC.primariesEnabled;
+        bool hdrMhcG = ms.hdrMHC.enabled && (ms.hdrMHC.grayscale.enabled ||
+                       ms.hdrMHC.correctionGrayscale.enabled ||
+                       !ms.hdrMHC.sourceFilePath.empty() || ms.hdrMHC.hasPerChannelTRC ||
+                       ms.hdrMHC.desktopGammaEnabled);
+
+        const auto& sdr = ms.sdrColorCorrection;
+        if (sdr.primariesEnabled && !sdrMhcP) return true;
+        if (sdr.grayscale.enabled && !sdrMhcG) return true;
+        if (sdr.grayscale.use24Gamma && !sdrMhcG) return true;
+
+        const auto& hdr = ms.hdrColorCorrection;
+        if (hdr.primariesEnabled && !hdrMhcP) return true;
+        if (hdr.grayscale.enabled && !hdrMhcG) return true;
+        if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
+        // Desktop gamma is HDR-only (render loop gates on ctx.isHDREnabled).
+        // Use ms.hdrMHC.enabled as proxy for "monitor configured for HDR" to avoid
+        // false positives on SDR monitors that have no HDR MHC at all.
+        if (desktopGamma && ms.hdrMHC.enabled && !hdrMhcG) return true;
+    }
+    return false;
+}
+
+// Start the lightweight analysis-only thread (DWM hook mode).
+// Keeps hotkeys on g_gui.hwndMain (no overlay window to register them on).
+static void StartAnalysisOnlyMode() {
+    if (g_gui.processingThread.joinable()) {
+        g_gui.processingThread.join();
+    }
+    CreateAnalysisOverlay(GetModuleHandle(nullptr));
+    g_analysisOnlyMode.store(true);
+    g_running.store(true);
+    g_gui.processingThread = std::thread(AnalysisOnlyThreadFunc);
+    std::cout << "[DWM Hook] Analysis-only mode started (no overlay)" << std::endl;
+}
+
+// Stop the analysis-only thread and wait for it to exit.
+static void StopAnalysisOnlyMode() {
+    g_running.store(false);
+    if (g_gui.processingThread.joinable()) {
+        auto handle = g_gui.processingThread.native_handle();
+        DWORD startTime = GetTickCount();
+        DWORD timeout = 2000;
+        while (true) {
+            DWORD elapsed = GetTickCount() - startTime;
+            if (elapsed >= timeout) {
+                g_gui.processingThread.detach();
+                break;
+            }
+            DWORD waitTime = (100 < timeout - elapsed) ? 100 : (timeout - elapsed);
+            if (WaitForSingleObject(handle, waitTime) == WAIT_OBJECT_0) {
+                g_gui.processingThread.join();
+                break;
+            }
+            MSG msg;
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+        }
+    }
+    g_analysisOnlyMode.store(false);
+    std::cout << "[DWM Hook] Analysis-only mode stopped" << std::endl;
+}
+
+void AnalysisOnlyThreadFunc() {
+    // Lightweight processing thread: DD capture + analysis compute shader only.
+    // No overlay windows, no swapchain, no pixel shader, no frame pacer.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Enumerate monitors
+    std::vector<HMONITOR> hMonitors;
+    EnumDisplayMonitors(nullptr, nullptr, MonitorEnumProc, (LPARAM)&hMonitors);
+    if (hMonitors.empty()) {
+        std::cerr << "[Analysis-only] No monitors found" << std::endl;
+        CoUninitialize();
+        PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, 0, 0);
+        return;
+    }
+
+    // Init minimal D3D (device + context + analysis CS/CB only)
+    if (!InitD3DAnalysisOnly()) {
+        ReleaseSharedD3DResources();
+        CoUninitialize();
+        PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, 0, 0);
+        return;
+    }
+
+    // Set up primary monitor context (analysis only runs on primary)
+    MonitorContext ctx = {};
+    ctx.index = 0;
+    ctx.monitor = hMonitors[0];
+    ctx.enabled = true;
+
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(ctx.monitor, &mi);
+    ctx.x = mi.rcMonitor.left;
+    ctx.y = mi.rcMonitor.top;
+    ctx.width = mi.rcMonitor.right - mi.rcMonitor.left;
+    ctx.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+
+    // Init Desktop Duplication (captures desktop frames — no overlay needed)
+    if (!InitDesktopDuplication(&ctx)) {
+        std::cerr << "[Analysis-only] Failed to init Desktop Duplication" << std::endl;
+        ReleaseSharedD3DResources();
+        CoUninitialize();
+        PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, 0, 0);
+        return;
+    }
+
+    // Populate tonemap settings for TM indicator in analysis display
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (!g_gui.monitorSettings.empty()) {
+            ctx.hdrColorCorrection = ConvertColorCorrection(
+                g_gui.monitorSettings[0].hdrColorCorrection, true);
+        }
+    }
+
+    g_monitors.push_back(std::move(ctx));
+    auto& mon = g_monitors[0];
+
+    g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+    std::cout << "[Analysis-only] Running (" << mon.width << "x" << mon.height
+              << (mon.isHDREnabled ? " HDR" : " SDR") << ")" << std::endl;
+
+    int consecutiveErrors = 0;
+
+    // Main analysis loop — blocking AcquireNextFrame for natural compositor-rate sync
+    while (g_running.load() && g_analysisEnabled.load()) {
+        // Check if we need to transition to full overlay (MHC editor or corrections)
+        if (g_mhcEditDialogOpen.load() || HasNonAnalysisShaderCorrections()) {
+            std::cout << "[Analysis-only] Full overlay needed, transitioning" << std::endl;
+            break;
+        }
+
+        DXGI_OUTDUPL_FRAME_INFO frameInfo;
+        IDXGIResource* resource = nullptr;
+        HRESULT hr = mon.duplication->AcquireNextFrame(100, &frameInfo, &resource);
+
+        if (SUCCEEDED(hr)) {
+            consecutiveErrors = 0;
+
+            // Get texture from acquired frame
+            ID3D11Texture2D* frameTexture = nullptr;
+            resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frameTexture);
+            resource->Release();
+
+            // Create or reuse SRV (same caching pattern as RenderMonitor)
+            if (frameTexture != mon.lastCaptureTexture) {
+                if (mon.captureSRV) {
+                    mon.captureSRV->Release();
+                    mon.captureSRV = nullptr;
+                }
+                D3D11_TEXTURE2D_DESC texDesc;
+                frameTexture->GetDesc(&texDesc);
+
+                // Detect capture format change (HDR toggle)
+                if (mon.captureFormat != DXGI_FORMAT_UNKNOWN &&
+                    texDesc.Format != mon.captureFormat) {
+                    std::cout << "[Analysis-only] Capture format changed, re-init DD" << std::endl;
+                    frameTexture->Release();
+                    mon.duplication->ReleaseFrame();
+                    mon.duplication->Release();
+                    mon.duplication = nullptr;
+                    mon.lastCaptureTexture = nullptr;
+                    Sleep(100);
+                    if (!InitDesktopDuplication(&mon)) {
+                        std::cerr << "[Analysis-only] DD re-init failed after format change" << std::endl;
+                        break;
+                    }
+                    continue;
+                }
+
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                srvDesc.Format = texDesc.Format;
+                srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srvDesc.Texture2D.MipLevels = 1;
+                HRESULT srvHr = g_device->CreateShaderResourceView(frameTexture, &srvDesc, &mon.captureSRV);
+                if (FAILED(srvHr)) {
+                    frameTexture->Release();
+                    mon.duplication->ReleaseFrame();
+                    continue;
+                }
+                mon.lastCaptureTexture = frameTexture;
+            }
+            frameTexture->Release();
+
+            // Dispatch analysis compute + readback (uses existing functions)
+            DispatchAnalysisCompute(&mon);
+            UpdateAnalysisDisplay(&mon);
+
+            // Track frame timing (same ring buffer pattern as RenderMonitor)
+            if (mon.lastFrameTime.time_since_epoch().count() > 0) {
+                auto now = std::chrono::steady_clock::now();
+                float frameMs = std::chrono::duration<float, std::milli>(now - mon.lastFrameTime).count();
+                mon.frameTimeHistory[mon.frameTimeIndex] = frameMs;
+                mon.frameTimeIndex = (mon.frameTimeIndex + 1) % 64;
+                if (mon.frameTimeCount < 64) mon.frameTimeCount++;
+            }
+            mon.lastFrameTime = std::chrono::steady_clock::now();
+            g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+
+            mon.duplication->ReleaseFrame();
+        } else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            continue;
+        } else if (hr == DXGI_ERROR_ACCESS_LOST) {
+            std::cout << "[Analysis-only] ACCESS_LOST, re-initializing DD" << std::endl;
+            if (mon.duplication) { mon.duplication->Release(); mon.duplication = nullptr; }
+            if (mon.captureSRV) { mon.captureSRV->Release(); mon.captureSRV = nullptr; }
+            mon.lastCaptureTexture = nullptr;
+            Sleep(100);
+            if (!InitDesktopDuplication(&mon)) {
+                consecutiveErrors++;
+                if (consecutiveErrors > 10) {
+                    std::cerr << "[Analysis-only] DD re-init failed " << consecutiveErrors << " times, exiting" << std::endl;
+                    break;
+                }
+            } else {
+                consecutiveErrors = 0;
+            }
+        } else {
+            std::cerr << "[Analysis-only] AcquireNextFrame failed: 0x" << std::hex << hr << std::dec << std::endl;
+            consecutiveErrors++;
+            if (consecutiveErrors > 10) break;
+            Sleep(100);
+        }
+    }
+
+    // Determine exit reason for GUI handler
+    bool needsFullOverlay = g_mhcEditDialogOpen.load() || HasNonAnalysisShaderCorrections();
+
+    // Cleanup per-monitor resources
+    if (mon.duplication) { mon.duplication->Release(); mon.duplication = nullptr; }
+    if (mon.captureSRV) { mon.captureSRV->Release(); mon.captureSRV = nullptr; }
+    mon.lastCaptureTexture = nullptr;
+    if (mon.analysisUAV) { mon.analysisUAV->Release(); mon.analysisUAV = nullptr; }
+    if (mon.analysisBuffer) { mon.analysisBuffer->Release(); mon.analysisBuffer = nullptr; }
+    for (int i = 0; i < 2; i++) {
+        if (mon.analysisStagingBuffer[i]) {
+            mon.analysisStagingBuffer[i]->Release();
+            mon.analysisStagingBuffer[i] = nullptr;
+        }
+    }
+    g_monitors.clear();
+
+    ReleaseSharedD3DResources();
+    CoUninitialize();
+
+    // wParam: 1 = needs transition to full overlay, 0 = normal exit
+    PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, needsFullOverlay ? 1 : 0, 0);
 }
 
 void StartProcessing() {
@@ -618,9 +887,10 @@ void StartProcessing() {
 
         // Check if overlay is also needed (corrections or analysis configured)
         bool needOverlay = HasActiveShaderCorrections();
+        bool needFullOverlay = HasNonAnalysisShaderCorrections();
 
-        if (needOverlay) {
-            // Start overlay in passthrough for LUT (DWM hook handles LUT)
+        if (needOverlay && needFullOverlay) {
+            // Full overlay needed for shader corrections (not just analysis)
             // Clear LUT paths so shader only applies corrections
             std::cout << "[DWM Hook] Shader overlay ACTIVE (corrections-only passthrough, DWM hook handles LUT)" << std::endl;
             for (auto& cfg : configs) {
@@ -632,6 +902,25 @@ void StartProcessing() {
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
             g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
+        } else if (needOverlay && !needFullOverlay) {
+            // Only analysis active — use lightweight analysis-only mode (no overlay windows)
+            std::cout << "[DWM Hook] Analysis-only mode (no overlay, DD capture + compute only)" << std::endl;
+            g_gui.isRunning = true;
+            g_gui.restartRetryCount = 0;
+            if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+
+            // Register hotkeys on GUI window (analysis-only has no overlay WndProc)
+            if (g_gui.hwndMain) {
+                if (g_hotkeyGammaEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
+                if (g_hotkeyAnalysisEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
+                if (g_hotkeyHdrEnabled.load())
+                    RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
+                g_hookOnlyHotkeys = true;
+            }
+
+            StartAnalysisOnlyMode();
         } else {
             // LUT-only mode: no overlay needed
             std::cout << "[DWM Hook] Shader overlay DISABLED (LUT-only mode, no overlay needed)" << std::endl;
@@ -701,7 +990,32 @@ void StopProcessing() {
         g_hookOnlyHotkeys = false;
     }
 
-    // Destroy analysis overlay if created in hook-only mode
+    // Stop analysis-only thread if running
+    if (g_analysisOnlyMode.load()) {
+        g_analysisEnabled.store(false);  // Break analysis-only loop
+        // Thread will exit and post WM_ANALYSIS_ONLY_EXITED, but we handle cleanup here
+        if (g_gui.processingThread.joinable()) {
+            auto handle = g_gui.processingThread.native_handle();
+            DWORD startTime = GetTickCount();
+            while (GetTickCount() - startTime < 2000) {
+                if (WaitForSingleObject(handle, 100) == WAIT_OBJECT_0) {
+                    g_gui.processingThread.join();
+                    break;
+                }
+                MSG msg;
+                while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+            }
+            if (g_gui.processingThread.joinable())
+                g_gui.processingThread.detach();
+        }
+        g_analysisOnlyMode.store(false);
+        DestroyAnalysisOverlay();
+    }
+
+    // Destroy analysis overlay if created in hook-only mode (no thread running)
     if (g_dwmHookMode.load() && !g_gui.processingThread.joinable()) {
         DestroyAnalysisOverlay();
     }
@@ -760,41 +1074,64 @@ void StopProcessing() {
 void DwmHookReevaluateOverlay() {
     if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
 
-    bool needOverlay = HasActiveShaderCorrections();
-    bool overlayRunning = g_gui.processingThread.joinable();
+    bool needAnalysis = g_analysisEnabled.load();
+    bool needFullOverlay = HasNonAnalysisShaderCorrections();
+    bool threadRunning = g_gui.processingThread.joinable();
+    bool inAnalysisOnly = g_analysisOnlyMode.load();
 
-    if (overlayRunning && !needOverlay) {
-        // Render thread's auto-sleep already hides windows and stops DD when nothing to do.
-        // No need to kill the thread here — auto-sleep is effectively free (500ms wait loop).
-        // Thread lifecycle is only managed by StartProcessing/StopProcessing.
-        return;
-    }
-
-    if (!overlayRunning && needOverlay) {
-        // Join any previously-exited thread (e.g., after watchdog exit) before spawning new one
-        if (g_gui.processingThread.joinable()) {
-            g_gui.processingThread.join();
+    if (needFullOverlay) {
+        // Full overlay needed (MHC preview, corrections, etc.)
+        if (threadRunning && inAnalysisOnly) {
+            // Transition: analysis-only → full overlay
+            std::cout << "[DWM Hook] Transitioning analysis-only → full overlay" << std::endl;
+            bool wasAnalysisOn = g_analysisEnabled.load();
+            StopAnalysisOnlyMode();
+            if (wasAnalysisOn) g_analysisEnabled.store(true);  // Restore — still wanted
         }
-        // Unregister hook-only hotkeys — overlay thread will register its own on the overlay window
-        if (g_hookOnlyHotkeys && g_gui.hwndMain) {
-            UnregisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA);
-            UnregisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS);
-            UnregisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE);
-            g_hookOnlyHotkeys = false;
+        if (!g_gui.processingThread.joinable()) {
+            // Join any previously-exited thread
+            // (StopAnalysisOnlyMode already joins, but handle other cases)
         }
-        std::cout << "[DWM Hook] Shader overlay now needed, starting DD" << std::endl;
-        std::vector<MonitorLUTConfig> configs;
-        for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-            const auto& ms = g_gui.monitorSettings[i];
-            MonitorLUTConfig config;
-            config.monitorIndex = (int)i;
-            config.sdrColorCorrection = ConvertColorCorrection(ms.sdrColorCorrection, false);
-            config.hdrColorCorrection = ConvertColorCorrection(ms.hdrColorCorrection, true);
-            configs.push_back(config);
+        if (!g_gui.processingThread.joinable()) {
+            // Unregister hook-only hotkeys — overlay thread will register its own
+            if (g_hookOnlyHotkeys && g_gui.hwndMain) {
+                UnregisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA);
+                UnregisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS);
+                UnregisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE);
+                g_hookOnlyHotkeys = false;
+            }
+            std::cout << "[DWM Hook] Shader overlay now needed, starting DD" << std::endl;
+            std::vector<MonitorLUTConfig> configs;
+            for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+                const auto& ms = g_gui.monitorSettings[i];
+                MonitorLUTConfig config;
+                config.monitorIndex = (int)i;
+                config.sdrColorCorrection = ConvertColorCorrection(ms.sdrColorCorrection, false);
+                config.hdrColorCorrection = ConvertColorCorrection(ms.hdrColorCorrection, true);
+                configs.push_back(config);
+            }
+            g_running = true;
+            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
         }
-        g_running = true;
-        g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
-        // Render thread evaluates shaderCorrActive on first frame and posts WM_SHADER_STATE_CHANGED
+    } else if (needAnalysis) {
+        // Analysis only (no other corrections need the overlay shader)
+        if (threadRunning && !inAnalysisOnly) {
+            // Full overlay running but only analysis needed — auto-sleep handles it.
+            // When the overlay thread eventually exits via WM_PROCESSING_EXITED,
+            // that handler will start analysis-only mode.
+            return;
+        }
+        if (!threadRunning) {
+            // Start analysis-only thread (no overlay windows, no swapchain)
+            StartAnalysisOnlyMode();
+        }
+    } else {
+        // Nothing needed
+        if (threadRunning && inAnalysisOnly) {
+            // Analysis was disabled, stop analysis-only thread
+            StopAnalysisOnlyMode();
+        }
+        // Full overlay: auto-sleep handles it
     }
 }
 

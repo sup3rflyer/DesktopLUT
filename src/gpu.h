@@ -8,6 +8,9 @@
 // Initialize D3D11 device, context, shaders, and resources
 bool InitD3D();
 
+// Initialize minimal D3D resources for analysis-only mode (device, context, analysis CS/CB)
+bool InitD3DAnalysisOnly();
+
 // Check if tearing (immediate present) is supported
 bool CheckTearingSupport();
 

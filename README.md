@@ -66,13 +66,24 @@ With DWM Hook Mode enabled (default), the 3D LUT is applied directly inside DWM 
 4. Optionally enable dynamic peak detection for automatic adjustment.
 5. Use the analysis overlay (**Win + Shift + X**) to inspect results in real time.
 
+## System tray icon
+
+DesktopLUT shows a system tray icon that reflects the current state:
+
+| Icon | Meaning |
+|------|---------|
+| Normal | DWM hook and/or MHC active — no Desktop Duplication overlay running |
+| **Inverted** | **Desktop Duplication overlay is actively rendering on screen** (corrections via overlay shader, or MHC editor live preview) |
+
+The inverted icon specifically indicates the DD overlay is presenting frames. It does **not** activate for DWM hook operation, MHC profiles, or analysis-only mode — those run without a visible overlay.
+
 ## DWM Hook Mode
 
 When enabled (default), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. This means:
 - No extra overlay window — 3D LUT and tonemapping are fully overlay-free
 - No Desktop Duplication capture overhead
 - VRR/G-Sync compatible (no overlay window to break it)
-- The overlay is only started for analysis (Win+Shift+X) or MHC editor preview
+- Analysis overlay runs in lightweight mode (DD capture + compute shader only, no fullscreen overlay window)
 
 ## Grayscale correction
 
@@ -123,7 +134,7 @@ Hotkeys can be disabled or remapped in the **Settings** tab.
 - Introduces approximately one frame of visual delay in overlay mode, zero in DWM hook mode (input latency is unaffected)
 - DRM-protected content (e.g., Netflix) appears black
 - Some UI elements (such as Start menu animations) may remain uncorrected
-- NVIDIA G-Sync compatible in DWM Hook Mode (overlay only needed for analysis)
+- NVIDIA G-Sync compatible in DWM Hook Mode (analysis runs without overlay)
 - DWM Hook Mode is experimental and may need repair after Windows updates
 
 ## Building from source

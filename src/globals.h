@@ -88,6 +88,7 @@ extern std::atomic<int> g_frameBufferIdleMs;   // Idle timeout before buffer eng
 extern std::atomic<bool> g_dwmHookMode;        // Use DWM hook injection instead of overlay for LUT
 extern int g_dwmHookWatchdogRetries;           // Consecutive re-injection failures (GUI thread only)
 extern std::atomic<bool> g_hookOnlyHotkeys;    // Hotkeys registered on GUI window (hook-only mode)
+extern std::atomic<bool> g_analysisOnlyMode;   // Lightweight analysis-only thread running (no overlay)
 
 // ============================================================================
 // Hotkey Settings
