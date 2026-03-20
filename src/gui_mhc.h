@@ -31,3 +31,26 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
                            bool livePreview = false, bool hadProfile = false,
                            const std::wstring& origProfileName = L"",
                            const std::wstring& origProfilePath = L"");
+
+// ============================================================================
+// Permutation Profile System
+// ============================================================================
+// MHC inline corrections (WB, DG, GS) are baked into ICC profiles. To toggle
+// any correction at runtime (hotkey, whitelist) without regeneration delay, we
+// cache profile variants keyed by a 3-bit permutation bitmask (see MHCSettings::PERM_*).
+// Profiles are generated on-demand and cached until the base calibration data changes.
+
+// Compute the permutation bitmask from current MHCSettings enable flags
+uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR);
+
+// Ensure a specific permutation profile exists in the system color directory.
+// Generates on-demand if not cached. Thread-safe (takes g_monitorSettingsMutex internally).
+bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm);
+
+// Swap the active MHC ICC profile to a different permutation.
+// Calls EnsureMhcPermProfile, then Remove+Reassociate. Updates profileName/profilePath.
+bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm);
+
+// Toggle the DG bit in the active permutation for all HDR monitors.
+// Called by hotkey handlers and whitelist when desktop gamma changes at runtime.
+void SwapDgForAllMonitors(bool dgEnabled);

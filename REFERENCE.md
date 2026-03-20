@@ -83,21 +83,26 @@ SDR_MHCWhiteBalanceWy=0.3290
 SDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
 SDR_MHCCorrGSPoints=20
 SDR_MHCCorrGSData=...
+SDR_MHCActivePerm=0            ; Active permutation bitmask (WB=1, DG=2, GS=4)
+SDR_MHCPermPath0=              ; Cached profile paths indexed by permutation bitmask
+SDR_MHCPermPath1=              ; ...through MHCPermPath7
 
 ; --- MHC ICC Profile (HDR) ---
 HDR_MHCEnabled=true
 HDR_MHCProfilePath=C:\Windows\system32\spool\drivers\color\DesktopLUT_Mon0_HDR_xxx.icm
-HDR_MHCProfilePathDG=C:\Windows\system32\spool\drivers\color\DesktopLUT_Mon0_HDR_DG_xxx.icm
 HDR_MHCPrimariesEnabled=true
 HDR_MHCPrimariesPreset=4
 HDR_MHCSourceFile=C:\path\to\hdr.cube
 HDR_MHCSourceIs1DCube=true
 HDR_MHCGrayscaleEnabled=true
 HDR_MHCGrayscalePeak=10000.0
-HDR_MHCDesktopGamma=false      ; true = sRGB→2.2 baked into 1D LUT for SDR range; hotswaps via profilePathDG
+HDR_MHCDesktopGamma=false      ; true = sRGB→2.2 baked into 1D LUT for SDR range; hotswaps via permutation cache
 HDR_MHCWhiteBalanceEnabled=false
 HDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
 HDR_MHCCorrGSPeak=10000.0
+HDR_MHCActivePerm=2            ; Active permutation bitmask (WB=1, DG=2, GS=4)
+HDR_MHCPermPath0=              ; Cached profiles indexed by bitmask (0-7)
+HDR_MHCPermPath2=C:\...\DesktopLUT_Mon0_HDR_P2_xxx.icm  ; DG-only variant
 ```
 
 ## DWM Hook Mode

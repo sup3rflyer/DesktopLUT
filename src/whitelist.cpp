@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "osd.h"
 #include "mhc.h"
+#include "gui_mhc.h"
 #include "displayconfig.h"
 #include <tlhelp32.h>
 #include <thread>
@@ -167,6 +168,8 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             }
             g_gammaWhitelistActive.store(true);
             g_desktopGammaMode.store(false);
+            // Swap MHC profiles to non-DG variant for all HDR monitors
+            SwapDgForAllMonitors(false);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"Gamma whitelist: detected " << matchedProcess << L", disabling desktop gamma" << std::endl;
             ShowOSD(L"Gamma: sRGB");
@@ -182,9 +185,12 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
                 g_gammaWhitelistMatch.clear();
             }
             std::wcout << L"Gamma whitelist: " << exitedProcess << L" exited, restoring desktop gamma" << std::endl;
-            g_desktopGammaMode.store(g_userDesktopGammaMode.load());
+            bool restoreDg = g_userDesktopGammaMode.load();
+            g_desktopGammaMode.store(restoreDg);
+            // Swap MHC profiles back to user's preferred DG state
+            SwapDgForAllMonitors(restoreDg);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-            ShowOSD(g_userDesktopGammaMode.load() ? L"Gamma: 2.2" : L"Gamma: sRGB");
+            ShowOSD(restoreDg ? L"Gamma: 2.2" : L"Gamma: sRGB");
         }
     }
 

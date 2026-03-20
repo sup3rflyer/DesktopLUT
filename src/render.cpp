@@ -11,6 +11,7 @@
 #include "displayconfig.h"
 #include "processing.h"
 #include "mhc.h"
+#include "gui_mhc.h"
 #include <dwmapi.h>
 #include <avrt.h>
 #include <iostream>
@@ -1773,6 +1774,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_gammaWhitelistActive.store(false);
                     std::wcout << L"Gamma whitelist: user override active until " << overrideProcess << L" exits" << std::endl;
                 }
+                // Swap MHC ICC profiles for all HDR monitors
+                SwapDgForAllMonitors(newMode);
                 std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
                 ShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
             }

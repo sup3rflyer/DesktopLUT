@@ -304,50 +304,223 @@ static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex
     }
 }
 
-// Generate and install the DG variant profile (opposite desktop gamma state) for HDR hotswap.
-// Deletes old DG variant, generates new one, stores in system color dir (disassociated).
-// Re-associates mainProfileName as the active profile after install/remove cycle.
-static void GenerateAndInstallDGVariant(
-    const MHC2ProfileParams& params, const std::wstring& oldDGProfileName,
-    const std::wstring& mainProfileName, int monitorIndex,
-    const DisplayInfo& displayInfo, const wchar_t* tempDir,
-    std::wstring& outDGProfilePath, std::wstring& outDGProfileName)
-{
-    // Delete old DG variant if it exists
-    if (!oldDGProfileName.empty()) {
-        wchar_t sysDir[MAX_PATH];
-        GetSystemDirectory(sysDir, MAX_PATH);
-        std::wstring oldDGPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldDGProfileName;
-        DeleteFileW(oldDGPath.c_str());
+// ============================================================================
+// SECTION: Permutation Profile System
+// ============================================================================
+
+// Build MHC2ProfileParams for a specific permutation bitmask.
+// Starts from the full MHCSettings, then disables corrections not in the bitmask.
+static void BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex,
+                                    uint8_t perm, MHC2ProfileParams& params) {
+    BuildMHC2Params(mhc, isHDR, monitorIndex, params);
+
+    // Disable white balance if PERM_WB bit is not set
+    if (!(perm & MHCSettings::PERM_WB)) {
+        params.whiteBalanceGains[0] = 1.0f;
+        params.whiteBalanceGains[1] = 1.0f;
+        params.whiteBalanceGains[2] = 1.0f;
     }
 
-    // Generate variant with opposite DG state
-    MHC2ProfileParams dgParams = params;
-    dgParams.desktopGammaEnabled = !params.desktopGammaEnabled;
+    // Disable desktop gamma if PERM_DG bit is not set (or not HDR)
+    if (!(perm & MHCSettings::PERM_DG) || !isHDR) {
+        params.desktopGammaEnabled = false;
+    }
 
-    std::vector<uint8_t> dgData;
-    if (!GenerateMHC2Profile(dgParams, dgData)) return;
+    // Disable correction grayscale if PERM_GS bit is not set
+    if (!(perm & MHCSettings::PERM_GS)) {
+        params.correctionGrayscaleEnabled = false;
+        params.correctionGrayscale.enabled = false;
+    }
+}
 
+uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR) {
+    uint8_t perm = 0;
+
+    // WB: enabled AND not D65 (within tolerance) AND meaningful gains
+    if (mhc.whiteBalanceEnabled) {
+        bool isD65 = (fabsf(mhc.whiteBalanceWx - 0.3127f) < 0.001f &&
+                      fabsf(mhc.whiteBalanceWy - 0.3290f) < 0.001f);
+        if (!isD65 && mhc.whiteBalanceWy > 0.001f)
+            perm |= MHCSettings::PERM_WB;
+    }
+
+    // DG: HDR only
+    if (isHDR && mhc.desktopGammaEnabled)
+        perm |= MHCSettings::PERM_DG;
+
+    // GS: correction grayscale with actual data
+    if (mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty())
+        perm |= MHCSettings::PERM_GS;
+
+    return perm;
+}
+
+// Delete all cached permutation profiles from disk (except the active one if keepActive=true)
+static void ClearPermCache(MHCSettings& mhc, int monitorIndex, bool isHDR, bool keepActive) {
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectory(sysDir, MAX_PATH);
+    std::wstring colorDir = std::wstring(sysDir) + L"\\spool\\drivers\\color\\";
+
+    for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+        if (keepActive && k == (int)mhc.activePerm) continue;
+        if (!mhc.permNames[k].empty()) {
+            DeleteFileW((colorDir + mhc.permNames[k]).c_str());
+            mhc.permNames[k].clear();
+            mhc.permPaths[k].clear();
+        }
+    }
+}
+
+bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
+    if (!IsMHC2ApiAvailable()) return false;
+
+    // Check cache — fast path under lock
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        const auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                                 : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        if (!mhc.permNames[perm].empty()) {
+            // Verify file still exists on disk
+            if (GetFileAttributesW(mhc.permPaths[perm].c_str()) != INVALID_FILE_ATTRIBUTES)
+                return true;
+            // File missing — fall through to generate
+        }
+    }
+
+    // Snapshot settings for generation (release lock during I/O)
+    MHCSettings mhcCopy;
+    std::wstring currentActiveName;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        const auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                                 : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        mhcCopy = mhc;
+        currentActiveName = mhc.profileName;
+    }
+
+    // Build params for the specific permutation
+    MHC2ProfileParams params;
+    BuildMHC2ParamsForPerm(mhcCopy, isHDR, monitorIndex, perm, params);
+
+    std::vector<uint8_t> profileData;
+    if (!GenerateMHC2Profile(params, profileData)) return false;
+
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return false;
+
+    // Unique filename encoding the permutation
     wchar_t monTag[8];
     swprintf_s(monTag, L"Mon%d", monitorIndex);
-    outDGProfileName = L"DesktopLUT_" + std::wstring(monTag)
-        + L"_HDR_DG_" + std::to_wstring(GetTickCount64()) + L".icm";
-    std::wstring dgTempPath = std::wstring(tempDir) + outDGProfileName;
+    std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag)
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_P" + std::to_wstring(perm)
+        + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
-    if (!WriteMHC2Profile(dgData, dgTempPath)) return;
+    wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring tempPath = std::wstring(tempDir) + profileName;
 
-    // Install to system color dir (not associated with display)
-    if (InstallMHC2Profile(dgTempPath, displayInfo.adapterId, displayInfo.sourceId, true)) {
-        // Immediately disassociate — we only want it in the color dir, not active
-        RemoveMHC2Profile(outDGProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
+    if (!WriteMHC2Profile(profileData, tempPath)) return false;
 
-        wchar_t sysDir[MAX_PATH];
-        GetSystemDirectory(sysDir, MAX_PATH);
-        outDGProfilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + outDGProfileName;
+    // Install to system color dir (disassociated — not the active profile)
+    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+        DeleteFileW(tempPath.c_str());
+        return false;
     }
-    // Always re-associate main profile (Install may have switched it, or Remove may have cleared it)
-    ReassociateMHC2Profile(mainProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-    DeleteFileW(dgTempPath.c_str());
+    // Immediately disassociate — we only want it in the color dir, ready for swap
+    RemoveMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    // Re-associate the currently active profile (Install may have switched it)
+    if (!currentActiveName.empty()) {
+        ReassociateMHC2Profile(currentActiveName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    }
+    DeleteFileW(tempPath.c_str());
+
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectory(sysDir, MAX_PATH);
+    std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
+
+    // Store in cache
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                           : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        mhc.permNames[perm] = profileName;
+        mhc.permPaths[perm] = profilePath;
+    }
+
+    std::cout << "MHC perm: generated P" << (int)perm << " for monitor " << monitorIndex
+              << (isHDR ? " HDR" : " SDR") << std::endl;
+    return true;
+}
+
+bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
+    // Ensure the target variant exists
+    if (!EnsureMhcPermProfile(monitorIndex, isHDR, newPerm)) return false;
+
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return false;
+
+    std::wstring oldName, newName, newPath;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                           : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        if (newPerm == mhc.activePerm) return true;  // already active
+        oldName = mhc.profileName;
+        newName = mhc.permNames[newPerm];
+        newPath = mhc.permPaths[newPerm];
+    }
+
+    if (newName.empty()) return false;
+
+    // Swap ICC profiles via Windows Color Management
+    RemoveMHC2Profile(oldName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    ReassociateMHC2Profile(newName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+
+    // Update state
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                           : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        mhc.activePerm = newPerm;
+        mhc.profileName = newName;
+        mhc.profilePath = newPath;
+    }
+
+    UpdateMhcFlagsLive(monitorIndex);
+    std::cout << "MHC perm: swapped to P" << (int)newPerm << " for monitor " << monitorIndex
+              << (isHDR ? " HDR" : " SDR") << std::endl;
+    return true;
+}
+
+void SwapDgForAllMonitors(bool dgEnabled) {
+    int numMonitors;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        numMonitors = (int)g_gui.monitorSettings.size();
+    }
+
+    for (int i = 0; i < numMonitors; i++) {
+        bool needSwap = false;
+        uint8_t newPerm = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            if (i >= (int)g_gui.monitorSettings.size()) break;
+            auto& mhc = g_gui.monitorSettings[i].hdrMHC;
+            if (mhc.profileName.empty() || !mhc.enabled) continue;
+
+            newPerm = mhc.activePerm;
+            if (dgEnabled) newPerm |= MHCSettings::PERM_DG;
+            else           newPerm &= ~MHCSettings::PERM_DG;
+
+            if (newPerm != mhc.activePerm) needSwap = true;
+        }
+
+        if (needSwap) {
+            SwapMhcToPermutation(i, true, newPerm);
+        }
+    }
 }
 
 // Generate, write, and install MHC2 ICC profile from current MHCSettings
@@ -413,24 +586,20 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     GetSystemDirectory(sysDir, MAX_PATH);
     std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
 
-    // For HDR: generate the DG variant profile (opposite desktop gamma state)
-    // Both profiles stay in system color dir, ready for instant hotswap
-    std::wstring dgProfilePath, dgProfileName;
-    if (isHDR) {
-        GenerateAndInstallDGVariant(params, mhc.profileNameDG, profileName,
-            monitorIndex, displayInfo, tempDir, dgProfilePath, dgProfileName);
-    }
+    // Compute the active permutation from current settings
+    uint8_t perm = ComputeMhcPermutation(mhc, isHDR);
 
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        // Clear all old cached permutation profiles (base data changed)
+        ClearPermCache(mhc, monitorIndex, isHDR, false);
         mhc.enabled = true;
         mhc.profilePath = profilePath;
         mhc.profileName = profileName;
         mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
-        if (isHDR) {
-            mhc.profilePathDG = dgProfilePath;
-            mhc.profileNameDG = dgProfileName;
-        }
+        mhc.activePerm = perm;
+        mhc.permNames[perm] = profileName;
+        mhc.permPaths[perm] = profilePath;
     }
     UpdateMhcFlagsLive(monitorIndex);
     return true;
@@ -494,26 +663,23 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
         DeleteFileW(oldPath.c_str());
     }
 
-    // Generate DG variant for HDR (deletes old variant, installs new one)
-    std::wstring dgProfilePath, dgProfileName;
-    if (isHDR) {
-        GenerateAndInstallDGVariant(params, mhc.profileNameDG, newProfileName,
-            monitorIndex, displayInfo, tempDir, dgProfilePath, dgProfileName);
-    }
+    // Recompute active permutation (corrections may have changed)
+    uint8_t perm = ComputeMhcPermutation(mhc, isHDR);
 
     // Update stored name — profile is now active, ensure enabled is true
     wchar_t sysDir2[MAX_PATH];
     GetSystemDirectory(sysDir2, MAX_PATH);
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        // Clear all cached permutation profiles (base data changed, variants are stale)
+        ClearPermCache(mhc, monitorIndex, isHDR, false);
         mhc.enabled = true;
         mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
         mhc.profileName = newProfileName;
         mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
-        if (isHDR) {
-            mhc.profilePathDG = dgProfilePath;
-            mhc.profileNameDG = dgProfileName;
-        }
+        mhc.activePerm = perm;
+        mhc.permNames[perm] = newProfileName;
+        mhc.permPaths[perm] = mhc.profilePath;
     }
     UpdateMhcFlagsLive(monitorIndex);
 }

@@ -199,7 +199,17 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     // Desktop gamma (HDR only)
     if (isHDR) {
         WritePrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), mhc.desktopGammaEnabled, iniPath);
-        WritePrivateProfileStringW(section, (p + L"MHCProfilePathDG").c_str(), mhc.profilePathDG.c_str(), iniPath);
+    }
+
+    // Permutation profile cache
+    {
+        wchar_t permBuf[8];
+        swprintf_s(permBuf, L"%d", (int)mhc.activePerm);
+        WritePrivateProfileStringW(section, (p + L"MHCActivePerm").c_str(), permBuf, iniPath);
+    }
+    for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+        std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
+        WritePrivateProfileStringW(section, key.c_str(), mhc.permPaths[k].c_str(), iniPath);
     }
 
     // Correction grayscale (fine-tuning on top of base)
@@ -359,14 +369,47 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     // Desktop gamma (HDR only)
     if (isHDR) {
         mhc.desktopGammaEnabled = GetPrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), false, iniPath);
+    }
+
+    // Permutation profile cache
+    mhc.activePerm = (uint8_t)GetPrivateProfileIntW(section, (p + L"MHCActivePerm").c_str(), 0, iniPath);
+    for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+        std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
+        wchar_t permPath[MAX_PATH] = {};
+        GetPrivateProfileStringW(section, key.c_str(), L"", permPath, MAX_PATH, iniPath);
+        mhc.permPaths[k] = permPath;
+        // Extract filename from path
+        std::wstring permName = mhc.permPaths[k];
+        size_t permSlash = permName.find_last_of(L"\\/");
+        if (permSlash != std::wstring::npos) permName = permName.substr(permSlash + 1);
+        mhc.permNames[k] = permName;
+    }
+    // Backward compatibility: if no permutation data but old DG path exists, migrate
+    if (mhc.permNames[mhc.activePerm].empty() && !mhc.profileName.empty()) {
+        // Old format: profilePath is the active profile, compute perm from settings
+        uint8_t perm = 0;
+        if (mhc.whiteBalanceEnabled) {
+            bool isD65 = (fabsf(mhc.whiteBalanceWx - 0.3127f) < 0.001f &&
+                          fabsf(mhc.whiteBalanceWy - 0.3290f) < 0.001f);
+            if (!isD65 && mhc.whiteBalanceWy > 0.001f) perm |= MHCSettings::PERM_WB;
+        }
+        if (isHDR && mhc.desktopGammaEnabled) perm |= MHCSettings::PERM_DG;
+        if (mhc.correctionGrayscale.enabled) perm |= MHCSettings::PERM_GS;
+        mhc.activePerm = perm;
+        mhc.permNames[perm] = mhc.profileName;
+        mhc.permPaths[perm] = mhc.profilePath;
+        // Migrate old DG variant if present
         wchar_t dgPath[MAX_PATH] = {};
         GetPrivateProfileStringW(section, (p + L"MHCProfilePathDG").c_str(), L"", dgPath, MAX_PATH, iniPath);
-        mhc.profilePathDG = dgPath;
-        // Extract DG filename
-        std::wstring dgName = mhc.profilePathDG;
-        size_t dgSlash = dgName.find_last_of(L"\\/");
-        if (dgSlash != std::wstring::npos) dgName = dgName.substr(dgSlash + 1);
-        mhc.profileNameDG = dgName;
+        if (dgPath[0] != L'\0') {
+            uint8_t dgPerm = perm ^ MHCSettings::PERM_DG;  // opposite DG state
+            std::wstring dgPathStr = dgPath;
+            std::wstring dgName = dgPathStr;
+            size_t dgSlash = dgName.find_last_of(L"\\/");
+            if (dgSlash != std::wstring::npos) dgName = dgName.substr(dgSlash + 1);
+            mhc.permNames[dgPerm] = dgName;
+            mhc.permPaths[dgPerm] = dgPathStr;
+        }
     }
 
     // Correction grayscale (fine-tuning on top of base)

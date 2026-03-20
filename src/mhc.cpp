@@ -1738,12 +1738,12 @@ void CleanupOrphanedMhcProfiles() {
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         for (const auto& ms : g_gui.monitorSettings) {
-            if (!ms.sdrMHC.profileName.empty())
-                activeProfiles.insert(ms.sdrMHC.profileName);
-            if (!ms.hdrMHC.profileName.empty())
-                activeProfiles.insert(ms.hdrMHC.profileName);
-            if (!ms.hdrMHC.profileNameDG.empty())
-                activeProfiles.insert(ms.hdrMHC.profileNameDG);
+            for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+                if (!ms.sdrMHC.permNames[k].empty())
+                    activeProfiles.insert(ms.sdrMHC.permNames[k]);
+                if (!ms.hdrMHC.permNames[k].empty())
+                    activeProfiles.insert(ms.hdrMHC.permNames[k]);
+            }
         }
     }
 

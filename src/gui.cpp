@@ -1695,19 +1695,24 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
 
-                // Delete DG variant file if it exists (HDR only)
-                if (isHDR && !mhc.profileNameDG.empty()) {
-                    wchar_t sysDirDG[MAX_PATH];
-                    GetSystemDirectory(sysDirDG, MAX_PATH);
-                    std::wstring dgPath = std::wstring(sysDirDG) + L"\\spool\\drivers\\color\\" + mhc.profileNameDG;
-                    DeleteFileW(dgPath.c_str());
+                // Delete all cached permutation profile files
+                {
+                    wchar_t sysDirPerm[MAX_PATH];
+                    GetSystemDirectory(sysDirPerm, MAX_PATH);
+                    std::wstring colorDir = std::wstring(sysDirPerm) + L"\\spool\\drivers\\color\\";
+                    for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+                        if (!mhc.permNames[k].empty()) {
+                            DeleteFileW((colorDir + mhc.permNames[k]).c_str());
+                            mhc.permNames[k].clear();
+                            mhc.permPaths[k].clear();
+                        }
+                    }
                 }
 
                 mhc.enabled = false;
                 mhc.profilePath.clear();
                 mhc.profileName.clear();
-                mhc.profilePathDG.clear();
-                mhc.profileNameDG.clear();
+                mhc.activePerm = 0;
                 mhc.hasPerChannelTRC = false;
                 mhc.metaPrimaries.clear();
                 mhc.metaGamma.clear();
@@ -1933,26 +1938,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!g_gammaWhitelistActive.load()) {
                     g_desktopGammaMode.store(dgActive);
                 }
-                // Fast path: hotswap between the two pre-generated profile variants.
-                // profileName = currently active; profileNameDG = standby variant.
-                // Apply time always generates both; here we just swap which is associated.
-                if (!mhc.profileName.empty() && !mhc.profileNameDG.empty()) {
-                    DisplayInfo displayInfo;
-                    if (GetDisplayInfoForMonitor(g_gui.currentMonitor, displayInfo)) {
-                        // Disassociate active, associate standby
-                        RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                        ReassociateMHC2Profile(mhc.profileNameDG, displayInfo.adapterId, displayInfo.sourceId, true);
-                        // Swap stored names so profileName always reflects the active profile
-                        {
-                            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-                            std::swap(mhc.profileName, mhc.profileNameDG);
-                            std::swap(mhc.profilePath, mhc.profilePathDG);
-                        }
-                        UpdateMhcFlagsLive(g_gui.currentMonitor);
-                    }
-                } else {
-                    // Fallback: one or both variants missing — full regeneration creates both
-                    RegenerateMhcIfActive(g_gui.currentMonitor, true);
+                // Swap to permutation with/without DG via on-demand cached profiles
+                if (!mhc.profileName.empty()) {
+                    uint8_t newPerm = mhc.activePerm;
+                    if (checked) newPerm |= MHCSettings::PERM_DG;
+                    else         newPerm &= ~MHCSettings::PERM_DG;
+                    SwapMhcToPermutation(g_gui.currentMonitor, true, newPerm);
                 }
                 SaveSettings();
             }
@@ -2185,6 +2176,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_gammaWhitelistUserOverride.store(true);
                     g_gammaWhitelistActive.store(false);
                 }
+                // Swap MHC ICC profiles for all HDR monitors
+                SwapDgForAllMonitors(newMode);
                 std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
                 ShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
             }

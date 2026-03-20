@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <cstdint>
 #include <thread>
 #include <chrono>
 #include <functional>
@@ -705,10 +706,20 @@ struct MHCSettings {
     // Desktop gamma (HDR only): sRGB->2.2 baked into 1D LUT
     bool desktopGammaEnabled = false;
 
-    // Dual-profile paths for desktop gamma hotswap (HDR only)
-    // Base profilePath/profileName stores the WITHOUT-DG variant
-    std::wstring profilePathDG;    // Profile WITH desktop gamma
-    std::wstring profileNameDG;    // Filename for DG variant
+    // Permutation profile cache — indexed by correction bitmask
+    // Each bit controls whether that correction is baked into the ICC profile.
+    // Profiles are generated on-demand and cached for instant runtime swapping.
+    // Bit 0 (0x1): White Balance    (matrix)
+    // Bit 1 (0x2): Desktop Gamma    (1D LUT, HDR only)
+    // Bit 2 (0x4): Correction GS    (1D LUT)
+    static constexpr uint8_t PERM_WB = 0x1;
+    static constexpr uint8_t PERM_DG = 0x2;
+    static constexpr uint8_t PERM_GS = 0x4;
+    static constexpr int PERM_COUNT = 8;
+
+    std::wstring permNames[PERM_COUNT];  // Cached profile filenames (indexed by bitmask)
+    std::wstring permPaths[PERM_COUNT];  // Cached profile full paths
+    uint8_t activePerm = 0;              // Currently active permutation bitmask
 
     // Display metadata for installed profile (computed at Apply time, persisted)
     std::wstring metaPrimaries;  // "sRGB", "Rec.709", "Custom", "P3-D65", etc.
