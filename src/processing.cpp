@@ -15,6 +15,7 @@
 #include "gpu.h"
 #include "displayconfig.h"
 #include "mhc.h"
+#include "whitelist.h"
 #include "dwm_inject.h"
 #include <objbase.h>
 #include <iostream>
@@ -921,6 +922,10 @@ void StartProcessing() {
             }
 
             StartAnalysisOnlyMode();
+
+            // Start whitelist thread (analysis-only mode has g_monitors but
+            // ProcessingThreadFunc isn't running to start it)
+            StartGammaWhitelistThread();
         } else {
             // LUT-only mode: no overlay needed
             std::cout << "[DWM Hook] Shader overlay DISABLED (LUT-only mode, no overlay needed)" << std::endl;
@@ -942,6 +947,13 @@ void StartProcessing() {
 
             // Create analysis overlay (for potential hotkey toggle)
             CreateAnalysisOverlay(GetModuleHandle(nullptr));
+
+            // Start whitelist thread (no ProcessingThreadFunc to start it)
+            StartGammaWhitelistThread();
+
+            // Clean up orphaned MHC profiles and reapply active ones
+            CleanupOrphanedMhcProfiles();
+            ReapplyAllMhcProfiles();
         }
 
         EnableWindow(g_gui.hwndApply, FALSE);
@@ -977,6 +989,10 @@ void StopProcessing() {
 
     SetStatus(L"Stopping...");
     g_running = false;
+
+    // Stop whitelist thread (may have been started by ProcessingThreadFunc,
+    // analysis-only mode, or LUT-only mode — idempotent if not running)
+    StopGammaWhitelistThread();
 
     // Kill DWM hook watchdog timer
     if (g_gui.hwndMain)

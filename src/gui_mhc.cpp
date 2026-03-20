@@ -60,7 +60,7 @@ void UpdateMhcFlagsLive(int monitorIndex) {
             break;
         }
     }
-    if (!found) {
+    if (!found && !g_monitors.empty()) {
         std::cout << "[MHC Flags] mon=" << monitorIndex
                   << " NOT FOUND in g_monitors (size=" << g_monitors.size() << ")" << std::endl;
     }

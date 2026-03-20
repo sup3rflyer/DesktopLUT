@@ -79,11 +79,17 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
     }
 
     // Check if any monitor is in HDR mode (use atomic for thread safety)
+    // In DWM hook mode with no overlay, g_monitors may be empty — trust
+    // g_userDesktopGammaMode which is only true when hdrMHC.enabled && desktopGammaEnabled
     bool anyHDR = false;
-    for (const auto& ctx : g_monitors) {
-        if (ctx.isHDRAtom.load(std::memory_order_relaxed)) {
-            anyHDR = true;
-            break;
+    if (g_monitors.empty() && g_dwmHookMode.load()) {
+        anyHDR = true;  // DG is HDR-only; g_userDesktopGammaMode guard above is sufficient
+    } else {
+        for (const auto& ctx : g_monitors) {
+            if (ctx.isHDRAtom.load(std::memory_order_relaxed)) {
+                anyHDR = true;
+                break;
+            }
         }
     }
     if (!anyHDR) {
