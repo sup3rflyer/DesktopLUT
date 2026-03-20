@@ -88,6 +88,7 @@
     <ClCompile Include="src\gui.cpp" />
     <ClCompile Include="src\gui_shared.cpp" />
     <ClCompile Include="src\gui_mhc.cpp" />
+    <ClCompile Include="src\gui_mhc_dialog.cpp" />
     <ClCompile Include="src\gui_grayscale.cpp" />
     <ClCompile Include="src\gui_whitelist.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
