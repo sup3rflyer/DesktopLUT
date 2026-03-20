@@ -82,6 +82,7 @@
     <ClCompile Include="src\gpu.cpp" />
     <ClCompile Include="src\capture.cpp" />
     <ClCompile Include="src\render.cpp" />
+    <ClCompile Include="src\render_init.cpp" />
     <ClCompile Include="src\osd.cpp" />
     <ClCompile Include="src\analysis.cpp" />
     <ClCompile Include="src\processing.cpp" />

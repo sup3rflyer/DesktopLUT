@@ -44,6 +44,25 @@ void CleanupMonitorContext(MonitorContext* ctx);
 void RegisterDisplayPowerNotification(HWND hwnd);
 void UnregisterDisplayPowerNotification();
 
+// Create peak detection resources for dynamic tonemapping
+bool CreatePeakDetectionResources(MonitorContext* ctx);
+
+// Reapply MHC ICC profiles after HDR/SDR mode switch
+void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx);
+
+// ICtCp grayscale conversion (CPU precomputation for HDR per-channel grayscale)
+void ComputeGrayscaleICtCpOffsets(GrayscaleData& gs);
+
+// Maximum recovery retries before giving up on a monitor (~5 min at 5s backoff cap)
+extern const int MAX_RECOVERY_RETRIES;
+
+// Shared render state (defined in render_init.cpp, used by render.cpp)
+extern std::chrono::steady_clock::time_point s_motionBarOrigin;
+extern bool s_motionBarOriginSet;
+extern int s_watchdogRecoveryAttempts;
+extern std::chrono::steady_clock::time_point g_powerNotifyRegisteredTime;
+extern const GUID GUID_CONSOLE_DISPLAY_STATE_LOCAL;
+
 // Compositor Clock API availability (for status display)
 typedef DWORD (WINAPI *PFN_DCompositionWaitForCompositorClock)(UINT, const HANDLE*, DWORD);
 extern PFN_DCompositionWaitForCompositorClock g_pfnWaitForCompositorClock;
