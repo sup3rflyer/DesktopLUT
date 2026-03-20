@@ -36,6 +36,15 @@ void ShowTrayMenu(HWND hwnd);
 void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR,
                          std::function<void()> liveUpdateCallback = nullptr);
 
+// GUI layout creation (WM_CREATE body, in gui_layout.cpp)
+void CreateGUILayout(HWND hwnd);
+LRESULT CALLBACK ScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+BOOL CALLBACK GUIMonitorEnumProc(HMONITOR hMonitor, HDC hdc, LPRECT lprcMonitor, LPARAM lParam);
+
+// Display power notification (shared between gui.cpp and gui_layout.cpp)
+extern HPOWERNOTIFY g_guiDisplayPowerNotify;
+extern const GUID GUID_CONSOLE_DISPLAY_STATE_GUI;
+
 // Main GUI window procedure
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
