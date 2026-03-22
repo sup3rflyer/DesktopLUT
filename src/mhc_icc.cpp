@@ -274,10 +274,11 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     //   displayed_XYZ = displayRGBtoXYZ * XYZtoWire * MHC2 * WireToXYZ * input_linear
     //
     // For correct colors: displayed_XYZ = srcRGBtoXYZ * input_linear
-    // Therefore: MHC2 = wireToXYZ * inv(displayRGBtoXYZ) * srcRGBtoXYZ * XYZtoWire
+    // Therefore: displayRGBtoXYZ * MHC2 = srcRGBtoXYZ  (wire cancels since wire = src)
+    //   MHC2 = inv(displayRGBtoXYZ) * srcRGBtoXYZ
     //
-    // Since wire = src (sRGB for SDR, BT.2020 for HDR):
-    //   MHC2 = srcRGBtoXYZ * inv(displayRGBtoXYZ)
+    // But MHC2 operates in XYZ space (between the driver's RGB↔XYZ wraps):
+    //   MHC2_xyz = srcRGBtoXYZ * inv(displayRGBtoXYZ)
     //
     // No Bradford adaptation - the matrix directly maps XYZ coordinates.
     // White point changes are encoded in the displayRGBtoXYZ matrix itself

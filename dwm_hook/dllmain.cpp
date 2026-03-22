@@ -13,6 +13,7 @@
 #include <io.h>
 #include <string>
 #include <sstream>
+#include <atomic>
 #include <iostream>
 #include <iomanip>
 #include <cmath>
@@ -292,6 +293,10 @@ bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 static void UpdateLocalTonemapFromShared() {
 	if (!g_sharedConfig) return;
 	if (g_sharedConfig->version == g_localConfigVersion) return;
+
+	// Acquire fence pairs with release fence on the host write side,
+	// ensuring all config fields are visible after the version check.
+	std::atomic_thread_fence(std::memory_order_acquire);
 
 	DwmHookSharedConfig local;
 	memcpy(&local, (const void*)g_sharedConfig, sizeof(local));
@@ -1133,9 +1138,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			SetEvent(g_hostMonitorStopEvent);
 		}
 		if (g_hostMonitorThread) {
-			// Non-blocking check — cannot safely wait under loader lock
-			if (WaitForSingleObject(g_hostMonitorThread, 0) == WAIT_TIMEOUT) {
-				log_to_file("WARNING: Host monitor thread still running at detach — closing handle");
+			// Wait briefly for thread exit — stop event was signaled above,
+			// thread wakes from WaitForSingleObject immediately. 200ms is generous.
+			DWORD waitResult = WaitForSingleObject(g_hostMonitorThread, 200);
+			if (waitResult == WAIT_TIMEOUT) {
+				log_to_file("WARNING: Host monitor thread still running after 200ms — closing handle");
 			}
 			CloseHandle(g_hostMonitorThread);
 			g_hostMonitorThread = NULL;

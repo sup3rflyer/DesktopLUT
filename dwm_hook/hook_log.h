@@ -10,7 +10,7 @@
 #define DITHER_GAMMA 2.2
 #define LUT_FOLDER "%SYSTEMROOT%\\Temp\\DesktopLUT_luts"
 
-#define RELEASE_IF_NOT_NULL(x) { if (x != NULL) { x->Release(); } }
+#define RELEASE_IF_NOT_NULL(x) { if (x != NULL) { x->Release(); x = NULL; } }
 #define _STRINGIFY(x) #x
 #define STRINGIFY(x) _STRINGIFY(x)
 #define MAX_LOG_FILE_SIZE (20 * 1024 * 1024)

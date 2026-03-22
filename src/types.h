@@ -18,6 +18,21 @@
 #include <chrono>
 #include <functional>
 
+// Atomic wrapper for steady_clock::time_point (lock-free on x64 via int64_t ticks)
+// Provides implicit conversion operators so existing code works unchanged.
+struct AtomicTimePoint {
+    std::atomic<int64_t> ticks{0};
+    void store(std::chrono::steady_clock::time_point tp) {
+        ticks.store(tp.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+    std::chrono::steady_clock::time_point load() const {
+        return std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(ticks.load(std::memory_order_relaxed)));
+    }
+    AtomicTimePoint& operator=(std::chrono::steady_clock::time_point tp) { store(tp); return *this; }
+    operator std::chrono::steady_clock::time_point() const { return load(); }
+};
+
 // Atomic wrapper that allows copy/move (for use in vector-stored structs)
 // Uses relaxed ordering for copies since these are cross-thread flags, not synchronization primitives
 template<typename T>
@@ -60,6 +75,7 @@ struct MovableAtomic {
 #define WM_HOTKEY_REGISTER       (WM_USER + 102)
 #define WM_SHADER_STATE_CHANGED  (WM_USER + 103)
 #define WM_ANALYSIS_ONLY_EXITED  (WM_USER + 104)
+#define WM_SHOW_OSD              (WM_USER + 105)
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003
@@ -751,7 +767,7 @@ struct GUIState {
     HWND hwndApply = nullptr;
     HWND hwndStop = nullptr;
     NOTIFYICONDATA nid = {};
-    bool isRunning = false;
+    std::atomic<bool> isRunning{false};
     std::thread processingThread;
     std::vector<HMONITOR> monitors;
     std::vector<std::wstring> monitorNames;

@@ -28,9 +28,11 @@ resources/
 # Claude Code
 .claude/
 CLAUDE.md
+docs/LLM_GUIDE.md
 VRR_RESEARCH.md
 DWM_HOOK_AUDIT.md
 DWM_HOOK_REPAIR.md
+audit/
 
 # Misc
 nul

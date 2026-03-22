@@ -71,6 +71,8 @@ bool GetPrivateProfileXY(const wchar_t* section, const wchar_t* key, float& x, f
     *comma = L'\0';
     x = (float)_wcstod_l(buf, nullptr, GetCLocale());
     y = (float)_wcstod_l(comma + 1, nullptr, GetCLocale());
+    // Validate: chromaticity coords must be in [0,1] with y > 0 (avoid div-by-zero in Bradford)
+    if (x < 0.0f || x > 1.0f || y < 0.001f || y > 1.0f) return false;
     return true;
 }
 
@@ -372,7 +374,8 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     }
 
     // Permutation profile cache
-    mhc.activePerm = (uint8_t)GetPrivateProfileIntW(section, (p + L"MHCActivePerm").c_str(), 0, iniPath);
+    int rawPerm = GetPrivateProfileIntW(section, (p + L"MHCActivePerm").c_str(), 0, iniPath);
+    mhc.activePerm = (rawPerm >= 0 && rawPerm < MHCSettings::PERM_COUNT) ? (uint8_t)rawPerm : 0;
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
         std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
         wchar_t permPath[MAX_PATH] = {};
@@ -544,6 +547,7 @@ static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key
     for (;;) {
         DWORD ret = GetPrivateProfileStringW(section, key, L"", buf.data(), size, path);
         if (ret < size - 2) { buf.resize(ret); return buf; }
+        if (size >= (1u << 20)) { buf.resize(0); return buf; }  // 1MB safety cap
         size *= 2;
         buf.resize(size);
     }
@@ -641,11 +645,11 @@ void LoadSettings() {
     g_hotkeyAnalysisEnabled.store(GetPrivateProfileBool(L"General", L"HotkeyAnalysisEnabled", true, iniPath.c_str()));
     wchar_t keyBuf[4] = {};
     GetPrivateProfileStringW(L"General", L"HotkeyGammaKey", L"G", keyBuf, 4, iniPath.c_str());
-    g_hotkeyGammaKey = (keyBuf[0] >= 'A' && keyBuf[0] <= 'Z') ? (char)keyBuf[0] : 'G';
+    { wchar_t ch = towupper(keyBuf[0]); g_hotkeyGammaKey = (ch >= L'A' && ch <= L'Z') ? (char)ch : 'G'; }
     GetPrivateProfileStringW(L"General", L"HotkeyHdrKey", L"Z", keyBuf, 4, iniPath.c_str());
-    g_hotkeyHdrKey = (keyBuf[0] >= 'A' && keyBuf[0] <= 'Z') ? (char)keyBuf[0] : 'Z';
+    { wchar_t ch = towupper(keyBuf[0]); g_hotkeyHdrKey = (ch >= L'A' && ch <= L'Z') ? (char)ch : 'Z'; }
     GetPrivateProfileStringW(L"General", L"HotkeyAnalysisKey", L"X", keyBuf, 4, iniPath.c_str());
-    g_hotkeyAnalysisKey = (keyBuf[0] >= 'A' && keyBuf[0] <= 'Z') ? (char)keyBuf[0] : 'X';
+    { wchar_t ch = towupper(keyBuf[0]); g_hotkeyAnalysisKey = (ch >= L'A' && ch <= L'Z') ? (char)ch : 'X'; }
 
     // Load startup settings
     g_startMinimized.store(GetPrivateProfileBool(L"General", L"StartMinimized", false, iniPath.c_str()));
@@ -670,7 +674,8 @@ void LoadSettings() {
 
         // Load MaxTML settings
         g_gui.monitorSettings[i].maxTml.enabled = GetPrivateProfileBool(section, L"MaxTmlEnabled", false, iniPath.c_str());
-        g_gui.monitorSettings[i].maxTml.peakNits = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath.c_str());
+        float rawPeak = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath.c_str());
+        g_gui.monitorSettings[i].maxTml.peakNits = (std::min)(10000.0f, (std::max)(10.0f, rawPeak));
 
         // Load MHC settings (with own primaries and grayscale)
         LoadMHCSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrMHC, iniPath.c_str());
@@ -678,11 +683,11 @@ void LoadSettings() {
     }
 
     // Derive desktop gamma global from per-monitor MHC settings.
-    // Only active when the HDR MHC profile is enabled AND has DG baked —
-    // if MHC is disabled there's nothing to apply DG through.
+    // DG is user intent — if desktopGammaEnabled is set, flag it active.
+    // Processing init will auto-generate an identity MHC profile if needed.
     bool anyDG = false;
     for (const auto& ms : g_gui.monitorSettings)
-        if (ms.hdrMHC.enabled && ms.hdrMHC.desktopGammaEnabled) { anyDG = true; break; }
+        if (ms.hdrMHC.desktopGammaEnabled) { anyDG = true; break; }
     g_userDesktopGammaMode.store(anyDG);
     g_desktopGammaMode.store(anyDG);
 }

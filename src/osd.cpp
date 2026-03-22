@@ -49,7 +49,7 @@ LRESULT CALLBACK OSDWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void ShowOSD(const wchar_t* text) {
-    if (!g_osdHwnd || !g_mainHwnd) return;
+    if (!g_osdHwnd || !g_gui.hwndMain) return;
 
     // Update text
     SetWindowText(g_osdHwnd, text);
@@ -77,17 +77,28 @@ void ShowOSD(const wchar_t* text) {
     SetWindowPos(g_osdHwnd, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
     InvalidateRect(g_osdHwnd, nullptr, TRUE);
 
-    // Set timer to hide
-    KillTimer(g_mainHwnd, OSD_TIMER_ID);
-    SetTimer(g_mainHwnd, OSD_TIMER_ID, OSD_DURATION_MS, nullptr);
+    // Timer on GUI window — always valid, always on the GUI thread
+    KillTimer(g_gui.hwndMain, OSD_TIMER_ID);
+    SetTimer(g_gui.hwndMain, OSD_TIMER_ID, OSD_DURATION_MS, nullptr);
+}
+
+void RequestShowOSD(const wchar_t* message) {
+    HWND hwnd = g_gui.hwndMain;
+    if (!hwnd) return;
+    // Allocate a copy — the receiving WndProc will free it
+    wchar_t* copy = _wcsdup(message);
+    if (!copy) return;
+    if (!PostMessage(hwnd, WM_SHOW_OSD, 0, reinterpret_cast<LPARAM>(copy))) {
+        free(copy);  // PostMessage failed (window destroyed), don't leak
+    }
 }
 
 void HideOSD() {
     if (g_osdHwnd) {
         ShowWindow(g_osdHwnd, SW_HIDE);
     }
-    if (g_mainHwnd) {
-        KillTimer(g_mainHwnd, OSD_TIMER_ID);
+    if (g_gui.hwndMain) {
+        KillTimer(g_gui.hwndMain, OSD_TIMER_ID);
     }
 }
 

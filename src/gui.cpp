@@ -133,6 +133,11 @@ void UpdateGUIState() {
     bool enableApply = !g_gui.isRunning || (g_gui.isRunning && SettingsChanged());
     EnableWindow(g_gui.hwndApply, enableApply);
     EnableWindow(g_gui.hwndStop, g_gui.isRunning);
+
+    // Keep cached atomic fresh for the analysis-only thread (avoids cross-thread
+    // iteration of g_gui.monitorSettings). Safe to evaluate here — GUI thread only.
+    if (g_analysisOnlyMode.load(std::memory_order_relaxed))
+        g_nonAnalysisCorrectionsActive.store(EvalNonAnalysisShaderCorrections(), std::memory_order_relaxed);
 }
 
 void SetStatus(const wchar_t* text) {
@@ -1316,7 +1321,21 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_SHOW_OSD: {
+        // Cross-thread OSD request — lParam is a heap-allocated wchar_t* string
+        wchar_t* text = reinterpret_cast<wchar_t*>(lParam);
+        if (text) {
+            ShowOSD(text);
+            free(text);
+        }
+        return 0;
+    }
+
     case WM_TIMER:
+        if (wParam == OSD_TIMER_ID) {
+            HideOSD();
+            return 0;
+        }
         if (wParam == RESTART_TIMER_ID) {
             KillTimer(hwnd, RESTART_TIMER_ID);
             if (!g_gui.isRunning && !g_gui.activeSettings.empty()) {
@@ -1592,6 +1611,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);
             g_guiDisplayPowerNotify = nullptr;
         }
+        // Clean up OSD (owned by GUI thread now)
+        if (g_osdHwnd) { DestroyWindow(g_osdHwnd); g_osdHwnd = nullptr; }
+        DestroyOSDFont();
         // Clean up custom brushes and fonts
         if (g_tabBgBrush) { DeleteObject(g_tabBgBrush); g_tabBgBrush = nullptr; }
         if (g_inactiveTabBrush) { DeleteObject(g_inactiveTabBrush); g_inactiveTabBrush = nullptr; }
@@ -1666,6 +1688,9 @@ int RunGUI() {
     if (!g_gui.hwndMain) {
         return 1;
     }
+
+    // Create OSD window on GUI thread — available in all modes (hook-only, analysis-only, full overlay)
+    CreateOSDWindow(GetModuleHandle(nullptr));
 
     // Check if any visual correction is enabled (LUT, MHC, Primaries, Grayscale, 2.4 Gamma, Desktop Gamma, DWM hook)
     bool hasAnyCorrection = g_userDesktopGammaMode.load();  // Desktop gamma is a global setting

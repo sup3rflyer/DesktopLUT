@@ -15,6 +15,7 @@
 #include "gpu.h"
 #include "displayconfig.h"
 #include "mhc.h"
+#include "gui_mhc.h"
 #include "whitelist.h"
 #include "dwm_inject.h"
 #include <objbase.h>
@@ -387,6 +388,16 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     CleanupOrphanedMhcProfiles();
     ReapplyAllMhcProfiles();
 
+    // Auto-generate identity MHC profiles for monitors with DG enabled but no profile
+    if (g_userDesktopGammaMode.load()) {
+        for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
+            auto& mhc = g_gui.monitorSettings[i].hdrMHC;
+            if (mhc.desktopGammaEnabled && !mhc.enabled) {
+                GenerateAndInstallMhcProfile(i, true);
+            }
+        }
+    }
+
     g_mainHwnd = g_monitors[0].hwnd;
 
     // Register hotkeys (conditional based on settings, MOD_NOREPEAT prevents repeat when held)
@@ -402,9 +413,6 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     // Register for display power state notifications (display sleep/wake)
     RegisterDisplayPowerNotification(g_mainHwnd);
-
-    // Create OSD
-    CreateOSDWindow(GetModuleHandle(nullptr));
 
     // Create analysis overlay
     CreateAnalysisOverlay(GetModuleHandle(nullptr));
@@ -440,7 +448,8 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     // Stop TOPMOST helper thread
     if (g_topmostEvent) SetEvent(g_topmostEvent);
-    if (topmostThread) { WaitForSingleObject(topmostThread, 1000); CloseHandle(topmostThread); }
+    // TOPMOST thread checks g_running every 500ms and exits promptly — INFINITE wait is safe
+    if (topmostThread) { WaitForSingleObject(topmostThread, INFINITE); CloseHandle(topmostThread); }
     if (g_topmostEvent) { CloseHandle(g_topmostEvent); g_topmostEvent = nullptr; }
 
     // Clean up frame pacer (MMCSS, timers, timeEndPeriod)
@@ -465,13 +474,6 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     if (!g_dwmHookMode.load() || !g_analysisEnabled.load()) {
         DestroyAnalysisOverlay();
     }
-
-    // Cleanup OSD
-    if (g_osdHwnd) {
-        DestroyWindow(g_osdHwnd);
-        g_osdHwnd = nullptr;
-    }
-    DestroyOSDFont();
 
     // Clean up auto-sleep wake event
     if (g_overlayWakeEvent) {
@@ -544,10 +546,9 @@ static bool HasActiveShaderCorrections() {
     return false;
 }
 
-// Check if any non-analysis shader corrections need the full overlay.
-// Returns true if MHC preview, primaries, grayscale, WB, tonemapping,
-// desktop gamma, or 2.4 gamma require the overlay pixel shader.
-static bool HasNonAnalysisShaderCorrections() {
+// Evaluate whether non-analysis shader corrections need the full overlay.
+// Always iterates g_gui.monitorSettings — MUST only be called from the GUI thread.
+bool EvalNonAnalysisShaderCorrections() {
     if (g_mhcEditDialogOpen.load()) return true;
     bool desktopGamma = g_userDesktopGammaMode.load();
     for (const auto& ms : g_gui.monitorSettings) {
@@ -576,6 +577,17 @@ static bool HasNonAnalysisShaderCorrections() {
         if (desktopGamma && ms.hdrMHC.enabled && !hdrMhcG) return true;
     }
     return false;
+}
+
+// Thread-safe wrapper: when the processing/analysis-only thread is running,
+// returns a cached atomic to avoid iterating g_gui.monitorSettings from a non-GUI thread.
+// GUI-thread callers update the atomic via EvalNonAnalysisShaderCorrections().
+static bool HasNonAnalysisShaderCorrections() {
+    if (g_gui.processingThread.joinable())
+        return g_nonAnalysisCorrectionsActive.load(std::memory_order_relaxed);
+    bool result = EvalNonAnalysisShaderCorrections();
+    g_nonAnalysisCorrectionsActive.store(result, std::memory_order_relaxed);
+    return result;
 }
 
 // Start the lightweight analysis-only thread (DWM hook mode).
@@ -889,6 +901,7 @@ void StartProcessing() {
         // Check if overlay is also needed (corrections or analysis configured)
         bool needOverlay = HasActiveShaderCorrections();
         bool needFullOverlay = HasNonAnalysisShaderCorrections();
+        // HasNonAnalysisShaderCorrections already cached the result in g_nonAnalysisCorrectionsActive
 
         if (needOverlay && needFullOverlay) {
             // Full overlay needed for shader corrections (not just analysis)
@@ -1091,7 +1104,9 @@ void DwmHookReevaluateOverlay() {
     if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
 
     bool needAnalysis = g_analysisEnabled.load();
-    bool needFullOverlay = HasNonAnalysisShaderCorrections();
+    // Evaluate directly from GUI thread and update cached atomic for analysis-only thread
+    bool needFullOverlay = EvalNonAnalysisShaderCorrections();
+    g_nonAnalysisCorrectionsActive.store(needFullOverlay, std::memory_order_relaxed);
     bool threadRunning = g_gui.processingThread.joinable();
     bool inAnalysisOnly = g_analysisOnlyMode.load();
 

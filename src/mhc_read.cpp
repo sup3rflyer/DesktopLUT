@@ -272,7 +272,7 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
         // (PQ tracking / gamma linearity). Normalizing ensures clean separation.
         auto normalizeTRC = [](std::vector<float>& trc) {
             if (trc.empty()) return;
-            float trcMax = trc.back();
+            float trcMax = *std::max_element(trc.begin(), trc.end());
             if (trcMax > 0.0f && trcMax < 0.999f) {
                 float invMax = 1.0f / trcMax;
                 for (auto& v : trc) v = std::clamp(v * invMax, 0.0f, 1.0f);

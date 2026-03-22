@@ -28,6 +28,10 @@ void AnalysisOnlyThreadFunc();
 // ictcpMode: when true (HDR editing), shader uses ICtCp offsets for perceptually accurate preview
 void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode = false);
 
+// Evaluate whether non-analysis shader corrections need the full overlay.
+// Always iterates g_gui.monitorSettings — MUST only be called from the GUI thread.
+bool EvalNonAnalysisShaderCorrections();
+
 // Check if current settings differ from active (running) settings
 bool SettingsChanged();
 

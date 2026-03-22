@@ -78,6 +78,7 @@ extern std::atomic<bool> g_showFrameTiming;    // Show frame timing in analysis 
 extern std::atomic<bool> g_showMotionBar;      // Show motion bar for judder detection (UFO test style)
 extern std::atomic<bool> g_overlayAutoSleep;   // true = overlay has nothing to do, windows hidden
 extern std::atomic<bool> g_shaderCorrectionsActive;  // true = shader is applying corrections (not just LUT passthrough)
+extern std::atomic<bool> g_nonAnalysisCorrectionsActive;  // true = non-analysis corrections need the overlay (cached for analysis-only thread)
 extern HANDLE g_overlayWakeEvent;              // Auto-reset event for auto-sleep wake (replaces Sleep polling)
 extern HANDLE g_topmostEvent;                 // Signaled when TOPMOST reassert needed (helper thread)
 extern std::atomic<bool> g_framePacerEnabled;  // Enable predictive frame pacer (default: true)
@@ -168,7 +169,7 @@ extern float g_sdrWhiteNits;
 // Watchdog Timer
 // ============================================================================
 
-extern std::chrono::steady_clock::time_point g_lastSuccessfulFrame;
+extern AtomicTimePoint g_lastSuccessfulFrame;
 
 // ============================================================================
 // Display Power State

@@ -736,7 +736,7 @@ void RenderAll(FramePacer* fp) {
     if (g_displayOff.load(std::memory_order_relaxed)) {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
     } else {
-        auto timeSinceLastFrame = std::chrono::steady_clock::now() - g_lastSuccessfulFrame;
+        auto timeSinceLastFrame = std::chrono::steady_clock::now() - g_lastSuccessfulFrame.load();
         if (timeSinceLastFrame > std::chrono::seconds(WATCHDOG_TIMEOUT_SECONDS)) {
             if (s_watchdogRecoveryAttempts < MAX_WATCHDOG_RECOVERY_ATTEMPTS) {
                 std::cerr << "Watchdog timeout (attempt " << (s_watchdogRecoveryAttempts + 1)
@@ -883,7 +883,7 @@ void RenderAll(FramePacer* fp) {
         LASTINPUTINFO lii = { sizeof(LASTINPUTINFO) };
         if (GetLastInputInfo(&lii)) {
             DWORD idleMs = GetTickCount() - lii.dwTime;
-            int idleThreshold = g_frameBufferIdleMs.load(std::memory_order_relaxed);
+            int idleThreshold = (std::max)(0, g_frameBufferIdleMs.load(std::memory_order_relaxed));
             frameBufferActive = (idleThreshold == 0) || (idleMs >= (DWORD)idleThreshold);
             if (fp) fp->lastIdleMs = idleMs;
         }
@@ -1160,7 +1160,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Swap MHC ICC profiles for all HDR monitors
                 SwapDgForAllMonitors(newMode);
                 std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
-                ShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
+                RequestShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
             }
             // Silent ignore if no HDR monitors
         }
@@ -1209,7 +1209,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return 0;
         }
-        if (wParam == OSD_TIMER_ID) HideOSD();
         return 0;
     case WM_DWMCOMPOSITIONCHANGED:
         std::cout << "DWM composition changed, forcing reinit..." << std::endl;

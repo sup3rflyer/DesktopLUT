@@ -70,6 +70,7 @@ std::atomic<bool> g_showFrameTiming{ false };  // Show frame timing in analysis 
 std::atomic<bool> g_showMotionBar{ false };    // Show motion bar for judder detection (default off)
 std::atomic<bool> g_overlayAutoSleep{ false };  // true = overlay has nothing to do, windows hidden
 std::atomic<bool> g_shaderCorrectionsActive{ false };  // true = shader applying corrections (not just LUT)
+std::atomic<bool> g_nonAnalysisCorrectionsActive{ false };  // Cached for analysis-only thread (avoids iterating monitorSettings)
 HANDLE g_overlayWakeEvent = nullptr;           // Auto-reset event for auto-sleep wake
 HANDLE g_topmostEvent = nullptr;              // Signaled when TOPMOST reassert needed
 std::atomic<bool> g_framePacerEnabled{ true };  // Enable predictive frame pacer (default: true)
@@ -160,7 +161,7 @@ float g_sdrWhiteNits = 80.0f;
 // Watchdog Timer
 // ============================================================================
 
-std::chrono::steady_clock::time_point g_lastSuccessfulFrame;
+AtomicTimePoint g_lastSuccessfulFrame;
 
 // ============================================================================
 // Display Power State

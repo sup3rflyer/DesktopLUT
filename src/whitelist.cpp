@@ -80,7 +80,7 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
 
     // Check if any monitor is in HDR mode (use atomic for thread safety)
     // In DWM hook mode with no overlay, g_monitors may be empty — trust
-    // g_userDesktopGammaMode which is only true when hdrMHC.enabled && desktopGammaEnabled
+    // g_userDesktopGammaMode which reflects the user's DG preference (auto-generates MHC if needed)
     bool anyHDR = false;
     if (g_monitors.empty() && g_dwmHookMode.load()) {
         anyHDR = true;  // DG is HDR-only; g_userDesktopGammaMode guard above is sufficient
@@ -178,7 +178,7 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             SwapDgForAllMonitors(false);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"Gamma whitelist: detected " << matchedProcess << L", disabling desktop gamma" << std::endl;
-            ShowOSD(L"Gamma: sRGB");
+            RequestShowOSD(L"Gamma: sRGB");
         }
     } else {
         if (wasActive) {
@@ -196,7 +196,7 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             // Swap MHC profiles back to user's preferred DG state
             SwapDgForAllMonitors(restoreDg);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-            ShowOSD(restoreDg ? L"Gamma: 2.2" : L"Gamma: sRGB");
+            RequestShowOSD(restoreDg ? L"Gamma: 2.2" : L"Gamma: sRGB");
         }
     }
 
