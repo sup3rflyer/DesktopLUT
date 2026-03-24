@@ -96,11 +96,11 @@ static void MhcRebuildTrackbars(MhcDialogData* d) {
         wchar_t pctBuf[8];
         if (d->isHDR) {
             float pctVal = (float)(i + 1) / (float)N * 100.0f;
-            swprintf_s(pctBuf, L"%.0f%%", pctVal);
+            _swprintf_s_l(pctBuf, _countof(pctBuf), L"%.0f%%", GetCLocale(), pctVal);
         } else {
             float t = (float)i / (float)(N - 1);
             float inputPct = t * t * 100.0f;
-            swprintf_s(pctBuf, L"%.0f%%", inputPct);
+            _swprintf_s_l(pctBuf, _countof(pctBuf), L"%.0f%%", GetCLocale(), inputPct);
         }
         HWND label = CreateWindow(L"STATIC", pctBuf, WS_CHILD | WS_VISIBLE | SS_CENTER,
             x, startY, sliderW, pctLabelH, d->hwndScrollPanel, nullptr, nullptr, nullptr);
@@ -262,14 +262,14 @@ static void MhcUpdatePrimariesFields(MhcDialogData* d) {
         Rx = p.Rx; Ry = p.Ry; Gx = p.Gx; Gy = p.Gy;
         Bx = p.Bx; By = p.By; Wx = p.Wx; Wy = p.Wy;
     }
-    swprintf_s(buf, L"%.4f", Rx); SetWindowText(d->hwndRx, buf);
-    swprintf_s(buf, L"%.4f", Ry); SetWindowText(d->hwndRy, buf);
-    swprintf_s(buf, L"%.4f", Gx); SetWindowText(d->hwndGx, buf);
-    swprintf_s(buf, L"%.4f", Gy); SetWindowText(d->hwndGy, buf);
-    swprintf_s(buf, L"%.4f", Bx); SetWindowText(d->hwndBx, buf);
-    swprintf_s(buf, L"%.4f", By); SetWindowText(d->hwndBy, buf);
-    swprintf_s(buf, L"%.4f", Wx); SetWindowText(d->hwndWx, buf);
-    swprintf_s(buf, L"%.4f", Wy); SetWindowText(d->hwndWy, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Rx); SetWindowText(d->hwndRx, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Ry); SetWindowText(d->hwndRy, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Gx); SetWindowText(d->hwndGx, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Gy); SetWindowText(d->hwndGy, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Bx); SetWindowText(d->hwndBx, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), By); SetWindowText(d->hwndBy, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Wx); SetWindowText(d->hwndWx, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), Wy); SetWindowText(d->hwndWy, buf);
 }
 
 // Chromaticity bounds — generous enough for any real display, prevents screen-breaking values
@@ -417,7 +417,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                    d->hwndBx, d->hwndBy, d->hwndWx, d->hwndWy };
                 int idx = LOWORD(wParam) - ID_MHC_PRIMARIES_RX;
                 if (idx >= 0 && idx < 8) {
-                    swprintf_s(clampBuf, L"%.4f", vals[idx]);
+                    _swprintf_s_l(clampBuf, _countof(clampBuf), L"%.4f", GetCLocale(), vals[idx]);
                     SetWindowText(fields[idx], clampBuf);
                 }
                 MhcPushLivePreview(d);
@@ -610,7 +610,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     d->settings->grayscale.peakNits = d->loadedICC.luminance;
                     if (d->hwndGsPeak) {
                         wchar_t buf[16];
-                        swprintf_s(buf, L"%.0f", d->loadedICC.luminance);
+                        _swprintf_s_l(buf, _countof(buf), L"%.0f", GetCLocale(), d->loadedICC.luminance);
                         SetWindowText(d->hwndGsPeak, buf);
                     }
                 }
@@ -652,7 +652,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         if (d->loadedICC.hasTRC && !d->isHDR) {
                             if (d->loadedICC.hasGamma) {
                                 wchar_t buf[64];
-                                swprintf_s(buf, L"\n  TRC R/G/B (gamma %.2f)", d->loadedICC.gamma);
+                                _swprintf_s_l(buf, _countof(buf), L"\n  TRC R/G/B (gamma %.2f)", GetCLocale(), d->loadedICC.gamma);
                                 msg += buf;
                             } else {
                                 wchar_t buf[64];
@@ -663,7 +663,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         }
                         if (d->loadedICC.hasLuminance) {
                             wchar_t buf[64];
-                            swprintf_s(buf, L"\n  Luminance: %.0f cd/m\u00B2", d->loadedICC.luminance);
+                            _swprintf_s_l(buf, _countof(buf), L"\n  Luminance: %.0f cd/m\u00B2", GetCLocale(), d->loadedICC.luminance);
                             msg += buf;
                         }
                         if (d->isHDR)
@@ -936,7 +936,7 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
         data.hwndGsPeak = makeCtrl(L"EDIT", L"", WS_BORDER | ES_NUMBER,
             cx + 46, gsRowY, 50, h, ID_MHC_GRAYSCALE_PEAK);
         wchar_t peakBuf[16];
-        swprintf_s(peakBuf, L"%.0f", settings.grayscale.peakNits);
+        _swprintf_s_l(peakBuf, _countof(peakBuf), L"%.0f", GetCLocale(), settings.grayscale.peakNits);
         SetWindowText(data.hwndGsPeak, peakBuf);
         SetNumericEdit(data.hwndGsPeak, 0);
         makeCtrl(L"STATIC", L"nits", 0, cx + 100, gsRowY + 2, 25, h, 0);

@@ -17,6 +17,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <clocale>
 #include <atomic>
 #pragma comment (lib, "d3d11.lib")
 #pragma comment (lib, "d3dcompiler.lib")
@@ -305,8 +306,7 @@ static void UpdateLocalTonemapFromShared() {
 	// Clamp numMonitors to prevent OOB from shared memory
 	uint32_t numMons = (local.numMonitors < MAX_DWM_HOOK_MONITORS) ? local.numMonitors : MAX_DWM_HOOK_MONITORS;
 
-	// Update monitor HDR states from shared memory — reset cached context on state change
-	g_primaryHdrContext = NULL;
+	// Update monitor HDR states from shared memory
 	g_numMonitorHdrStates = 0;
 	for (uint32_t i = 0; i < numMons && g_numMonitorHdrStates < 16; i++) {
 		auto& mc = local.monitors[i];
@@ -631,6 +631,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 	{
 	case DLL_PROCESS_ATTACH:
 		{
+			// Force C locale so sscanf("%f") always uses '.' as decimal separator,
+			// regardless of the system locale. Without this, .cube LUT parsing breaks
+			// on European locales where ',' is the decimal separator.
+			setlocale(LC_NUMERIC, "C");
+
 			log_to_file("DLL_PROCESS_ATTACH: DllMain entered");
 			HMODULE dwmcore = GetModuleHandle(L"dwmcore.dll");
 			if (!dwmcore) {

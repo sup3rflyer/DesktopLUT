@@ -29,7 +29,7 @@ The layers are applied in sequence within a single shader pass.
 
 ## Installation
 
-1. Download the latest `DesktopLUT.exe` from the [Releases page](https://github.com/sup3rflyer/DesktopLUT/releases).
+1. Download `DesktopLUT.exe` and `DwmHook.dll` from the [Releases page](https://github.com/sup3rflyer/DesktopLUT/releases) and place them in the same folder.
 2. Run the executable (no installer is required).
 3. The settings window will open automatically.
 

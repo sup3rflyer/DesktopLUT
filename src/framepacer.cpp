@@ -8,6 +8,7 @@
 
 #include "framepacer.h"
 #include "globals.h"
+#include "settings.h"
 #include "render.h"
 #include <dwmapi.h>
 #include <avrt.h>
@@ -190,9 +191,13 @@ void InitFramePacer(FramePacer* fp) {
         RecalcRefreshThresholds(fp);
     }
 
-    // Open CSV log file if enabled
+    // Open CSV log file if enabled (wide path for non-ASCII exe directories)
     if (g_framePacerLogEnabled.load()) {
-        fopen_s(&fp->logFile, "framepacer.csv", "w");
+        std::wstring csvPath = GetIniPath();
+        auto slash = csvPath.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) csvPath = csvPath.substr(0, slash + 1);
+        csvPath += L"framepacer.csv";
+        _wfopen_s(&fp->logFile, csvPath.c_str(), L"w");
         if (fp->logFile) {
             fprintf(fp->logFile,
                 "frame,measured,ema,shadow,locked,state,divergence,threshold,spread,stable,alpha,var,buffer,drops,dwm_drops,idle_ms,outlier\n");

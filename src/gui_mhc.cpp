@@ -148,7 +148,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
             mhc.metaWhiteBalance = L"D65";
         } else {
             wchar_t wbBuf[48];
-            swprintf_s(wbBuf, L"Custom (%.4f, %.4f)", wx, wy);
+            _swprintf_s_l(wbBuf, _countof(wbBuf), L"Custom (%.4f, %.4f)", GetCLocale(), wx, wy);
             mhc.metaWhiteBalance = wbBuf;
         }
     } else {
@@ -737,7 +737,7 @@ void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR) {
         for (int i = 0; i < 8; i++) {
             if (coords[i]) {
                 wchar_t buf[16];
-                swprintf_s(buf, L"%.4f", vals[i]);
+                _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), vals[i]);
                 SetWindowText(coords[i], buf);
             }
         }
@@ -762,7 +762,7 @@ void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR) {
     }
     if (installed && isHDR && mhc.metaPeakNits > 0.0f) {
         wchar_t peakBuf[64];
-        swprintf_s(peakBuf, L"Peak: %.0f nits", mhc.metaPeakNits);
+        _swprintf_s_l(peakBuf, _countof(peakBuf), L"Peak: %.0f nits", GetCLocale(), mhc.metaPeakNits);
         if (metaLabels[2]) { SetWindowText(metaLabels[2], peakBuf); ShowWindow(metaLabels[2], SW_SHOW); }
     } else {
         if (metaLabels[2]) { SetWindowText(metaLabels[2], L""); ShowWindow(metaLabels[2], SW_HIDE); }

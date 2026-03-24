@@ -4,7 +4,6 @@
 #include "hook_render.h"
 
 extern bool isWindows11_25h2;
-extern void* g_primaryHdrContext;
 
 int numLuts = 0;
 lutData* luts = NULL;
@@ -191,18 +190,6 @@ lutData* GetLUTDataFromCOverlayContext(void* context, bool hdr)
 		if (luts[i].left == left && luts[i].top == top && luts[i].isHdr == hdr)
 		{
 			return &luts[i];
-		}
-	}
-
-	// 25H2 workaround: HDR primary context may need opposite hdr flag LUT
-	if (isWindows11_25h2 && g_primaryHdrContext == context)
-	{
-		for (int i = 0; i < numLuts; i++)
-		{
-			if (luts[i].left == left && luts[i].top == top && luts[i].isHdr != hdr)
-			{
-				return &luts[i];
-			}
 		}
 	}
 

@@ -24,7 +24,7 @@ void UpdateEditFromSlider(int index) {
     int pos = (int)SendMessage(data->sliders[index], TBM_GETPOS, 0, 0);
     float deviation = (float)(-pos) / GRAYSCALE_SLIDER_SCALE;  // Negate because trackbar is inverted
     wchar_t text[16];
-    swprintf_s(text, L"%.2f", deviation);
+    _swprintf_s_l(text, _countof(text), L"%.2f", GetCLocale(), deviation);
     SetWindowText(data->editBoxes[index], text);
     data->updatingFromSlider = false;
 }

@@ -70,8 +70,6 @@ bool IsMonitorHdr(int left, int top) {
 	return false;  // default to SDR if unknown (safer — avoids PQ pipeline on SDR content)
 }
 
-void* g_primaryHdrContext = NULL;  // Cached primary HDR context for 25H2
-
 // Cache: map cOverlayContext pointers to monitor positions (populated via swapchain in ApplyLUT)
 ContextPositionCache g_contextPosCache[16] = {};
 int g_numContextPosCache = 0;
@@ -530,10 +528,6 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			colorMode = 2;   // ACM SDR (FP16 linear, SDR LUT)
 		}
 
-		if (isWindows11_25h2 && g_primaryHdrContext == NULL && monitorIsHdr)
-		{
-			g_primaryHdrContext = cOverlayContext;
-		}
 	}
 
 	// Log per-context info for diagnostics (track up to 8 unique contexts)

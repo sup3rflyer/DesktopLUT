@@ -214,7 +214,7 @@ static void UpdateRGBEditBoxes() {
             ? data->rgbDeviations[ch][i] : 1.0f;
         float pct = (dev - 1.0f) * 100.0f;
         wchar_t text[16];
-        swprintf_s(text, L"%.2f", pct);
+        _swprintf_s_l(text, _countof(text), L"%.2f", GetCLocale(), pct);
         SetWindowText(data->rgbEditBoxes[i], text);
     }
 }
@@ -268,7 +268,7 @@ static void ApplyRGBEditValue(int pointIndex) {
         SetPointIndicatorChannel(pointIndex, ch);
         // Reformat
         wchar_t fmt[16];
-        swprintf_s(fmt, L"%.2f", pct);
+        _swprintf_s_l(fmt, _countof(fmt), L"%.2f", GetCLocale(), pct);
         SetWindowText(data->rgbEditBoxes[pointIndex], fmt);
         InvalidateAllStrips();
         FireLiveUpdate();
@@ -353,7 +353,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
             // Edit box for luminance deviation
             wchar_t editText[16];
-            swprintf_s(editText, L"%.2f", deviationPct);
+            _swprintf_s_l(editText, _countof(editText), L"%.2f", GetCLocale(), deviationPct);
             HWND edit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", editText,
                 WS_CHILD | WS_VISIBLE | ES_CENTER,
                 x, startY + rgbLabelH + sliderH + pctLabelH + 4, sliderW, editH,
@@ -377,7 +377,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             float dev = (ch >= 0 && data->rgbDeviations[ch]) ? data->rgbDeviations[ch][i] : 1.0f;
             float devPct = (dev - 1.0f) * 100.0f;
             wchar_t rgbEditText[16];
-            swprintf_s(rgbEditText, L"%.2f", devPct);
+            _swprintf_s_l(rgbEditText, _countof(rgbEditText), L"%.2f", GetCLocale(), devPct);
             HWND rgbEdit = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", rgbEditText,
                 WS_CHILD | WS_VISIBLE | ES_CENTER,
                 x, rgbEditY, sliderW, editH,
@@ -502,7 +502,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     SetPointIndicatorChannel(i, ch);
                     // Update just this edit box
                     wchar_t text[16];
-                    swprintf_s(text, L"%.2f", (dev - 1.0f) * 100.0f);
+                    _swprintf_s_l(text, _countof(text), L"%.2f", GetCLocale(), (dev - 1.0f) * 100.0f);
                     SetWindowText(data->rgbEditBoxes[i], text);
                     InvalidateAllStrips();
                     FireLiveUpdate();
@@ -596,7 +596,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     // updatingFromSlider blocks WM_VSCROLL→UpdateEditFromSlider
                     // from overwriting the edit with the clamped slider value.
                     wchar_t fmt[16];
-                    swprintf_s(fmt, L"%.2f", deviationPct);
+                    _swprintf_s_l(fmt, _countof(fmt), L"%.2f", GetCLocale(), deviationPct);
                     data->updatingFromSlider = true;
                     SetWindowText(data->editBoxes[editIndex], fmt);
                     int maxRange = GRAYSCALE_RANGE * GRAYSCALE_SLIDER_SCALE;

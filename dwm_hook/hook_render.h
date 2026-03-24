@@ -49,9 +49,6 @@ extern MonitorHdrState g_monitorHdrStates[16];
 extern int g_numMonitorHdrStates;
 extern bool g_hdrStatesDetected;
 
-// Primary HDR context (25H2) — set in RenderLUT, reset in UpdateLocalTonemap
-extern void* g_primaryHdrContext;
-
 // Context position cache
 struct ContextPositionCache {
     void* context;

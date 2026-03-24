@@ -177,15 +177,42 @@ static std::wstring ElevateToSystem()
     }
     CloseHandle(hDupToken);
 
-    // Verify we're SYSTEM
-    wchar_t userName[256]{};
-    DWORD nameSize = static_cast<DWORD>(std::size(userName));
-    if (!GetUserNameW(userName, &nameSize))
-        return L"Failed to get username after impersonation: " + GetLastErrorString();
+    // Verify we're SYSTEM by checking the token SID (locale-independent).
+    // GetUserName() returns localized account names on non-English Windows,
+    // but the SYSTEM SID (S-1-5-18) is always the same.
+    {
+        HANDLE hThreadToken = nullptr;
+        if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hThreadToken)) {
+            RevertToSelf();
+            return L"Failed to open thread token for SYSTEM check: " + GetLastErrorString();
+        }
 
-    if (_wcsicmp(userName, L"SYSTEM") != 0) {
-        RevertToSelf();
-        return L"Impersonation succeeded but running as '" + std::wstring(userName) + L"', not SYSTEM";
+        BYTE tokenUserBuf[256]{};
+        DWORD needed = 0;
+        BOOL ok = GetTokenInformation(hThreadToken, TokenUser, tokenUserBuf, sizeof(tokenUserBuf), &needed);
+        CloseHandle(hThreadToken);
+
+        if (!ok) {
+            RevertToSelf();
+            return L"Failed to get token user info: " + GetLastErrorString();
+        }
+
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        PSID systemSid = nullptr;
+        if (!AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+                                       0, 0, 0, 0, 0, 0, 0, &systemSid)) {
+            RevertToSelf();
+            return L"Failed to create SYSTEM SID: " + GetLastErrorString();
+        }
+
+        PSID tokenSid = reinterpret_cast<TOKEN_USER*>(tokenUserBuf)->User.Sid;
+        bool isSystem = EqualSid(tokenSid, systemSid);
+        FreeSid(systemSid);
+
+        if (!isSystem) {
+            RevertToSelf();
+            return L"Impersonation succeeded but token is not SYSTEM";
+        }
     }
 
     return {};

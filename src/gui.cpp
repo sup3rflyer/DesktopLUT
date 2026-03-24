@@ -183,9 +183,9 @@ void UpdateColorCorrectionControls() {
     SendMessage(g_gui.hwndTonemapCurve, CB_SETCURSEL,
         TonemapCurveToDropdownIndex(hdrCC.tonemap.curve), 0);
     wchar_t tonemapBuf[16];
-    swprintf_s(tonemapBuf, L"%.0f", hdrCC.tonemap.targetPeakNits);
+    _swprintf_s_l(tonemapBuf, _countof(tonemapBuf), L"%.0f", GetCLocale(), hdrCC.tonemap.targetPeakNits);
     SetWindowText(g_gui.hwndTonemapTarget, tonemapBuf);
-    swprintf_s(tonemapBuf, L"%.0f", hdrCC.tonemap.sourcePeakNits);
+    _swprintf_s_l(tonemapBuf, _countof(tonemapBuf), L"%.0f", GetCLocale(), hdrCC.tonemap.sourcePeakNits);
     SetWindowText(g_gui.hwndTonemapSource, tonemapBuf);
     SendMessage(g_gui.hwndTonemapDynamic, BM_SETCHECK,
         hdrCC.tonemap.dynamicPeak ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -194,7 +194,7 @@ void UpdateColorCorrectionControls() {
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
         settings.maxTml.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    swprintf_s(tonemapBuf, L"%.0f", settings.maxTml.peakNits);
+    _swprintf_s_l(tonemapBuf, _countof(tonemapBuf), L"%.0f", GetCLocale(), settings.maxTml.peakNits);
     SetWindowText(g_gui.hwndMaxTmlEdit, tonemapBuf);
     float peakNits = settings.maxTml.peakNits;
     int comboSel = 0;
@@ -214,8 +214,8 @@ void UpdateColorCorrectionControls() {
     // SDR MHC inline corrections
     const auto& sdrMHC = settings.sdrMHC;
     SendMessage(g_gui.hwndMhcWbEnable, BM_SETCHECK, sdrMHC.whiteBalanceEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    swprintf_s(buf, L"%.4f", sdrMHC.whiteBalanceWx); SetWindowText(g_gui.hwndMhcWbWx, buf);
-    swprintf_s(buf, L"%.4f", sdrMHC.whiteBalanceWy); SetWindowText(g_gui.hwndMhcWbWy, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), sdrMHC.whiteBalanceWx); SetWindowText(g_gui.hwndMhcWbWx, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), sdrMHC.whiteBalanceWy); SetWindowText(g_gui.hwndMhcWbWy, buf);
     SendMessage(g_gui.hwndMhcGsEnable, BM_SETCHECK, sdrMHC.correctionGrayscale.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndMhcGs10, BM_SETCHECK, sdrMHC.correctionGrayscale.pointCount == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndMhcGs20, BM_SETCHECK, sdrMHC.correctionGrayscale.pointCount == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -226,13 +226,13 @@ void UpdateColorCorrectionControls() {
     const auto& hdrMHC = settings.hdrMHC;
     SendMessage(g_gui.hwndHdrMhcDgEnable, BM_SETCHECK, hdrMHC.desktopGammaEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrMhcWbEnable, BM_SETCHECK, hdrMHC.whiteBalanceEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    swprintf_s(buf, L"%.4f", hdrMHC.whiteBalanceWx); SetWindowText(g_gui.hwndHdrMhcWbWx, buf);
-    swprintf_s(buf, L"%.4f", hdrMHC.whiteBalanceWy); SetWindowText(g_gui.hwndHdrMhcWbWy, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), hdrMHC.whiteBalanceWx); SetWindowText(g_gui.hwndHdrMhcWbWx, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), hdrMHC.whiteBalanceWy); SetWindowText(g_gui.hwndHdrMhcWbWy, buf);
     SendMessage(g_gui.hwndHdrMhcGsEnable, BM_SETCHECK, hdrMHC.correctionGrayscale.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrMhcGs10, BM_SETCHECK, hdrMHC.correctionGrayscale.pointCount == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrMhcGs20, BM_SETCHECK, hdrMHC.correctionGrayscale.pointCount == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndHdrMhcGs32, BM_SETCHECK, hdrMHC.correctionGrayscale.pointCount == 32 ? BST_CHECKED : BST_UNCHECKED, 0);
-    swprintf_s(buf, L"%.0f", hdrMHC.correctionGrayscale.peakNits); SetWindowText(g_gui.hwndHdrMhcGsPeak, buf);
+    _swprintf_s_l(buf, _countof(buf), L"%.0f", GetCLocale(), hdrMHC.correctionGrayscale.peakNits); SetWindowText(g_gui.hwndHdrMhcGsPeak, buf);
 
     // Re-enable repaints and trigger single
     SendMessage(scrollPanel, WM_SETREDRAW, TRUE, 0);
@@ -644,7 +644,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (SetDisplayMaxTml(displayInfo, nits)) {
                         wchar_t msg[256];
                         const wchar_t* name = displayInfo.name.empty() ? L"selected monitor" : displayInfo.name.c_str();
-                        swprintf_s(msg, L"MaxTML set to %.0f nits for %s", nits, name);
+                        _swprintf_s_l(msg, _countof(msg), L"MaxTML set to %.0f nits for %s", GetCLocale(), nits, name);
                         MessageBox(hwnd, msg, L"DesktopLUT", MB_OK | MB_ICONINFORMATION);
                     } else {
                         MessageBox(hwnd, L"Failed to set MaxTML. Make sure HDR is enabled.", L"Error", MB_OK | MB_ICONERROR);
