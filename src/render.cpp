@@ -342,21 +342,24 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
         cbData[9] = shaderGrayscale ? 1.0f : 0.0f;
-        cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled) ? 1.0f : 0.0f;  // tonemapEnabled
+        // Exclude tonemapping when DWM hook handles it (hook applies before DD capture)
+        cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled && !g_dwmHookMode.load()) ? 1.0f : 0.0f;  // tonemapEnabled
         cbData[11] = (float)static_cast<int>(cc.tonemap.curve);  // tonemapCurve
         // Row 3-5: Primaries matrix (xyz) + white balance gains (w)
-        cbData[12] = cc.primariesMatrix[0];
-        cbData[13] = cc.primariesMatrix[1];
-        cbData[14] = cc.primariesMatrix[2];
-        cbData[15] = cc.primariesEnabled ? cc.whiteBalanceGains[0] : 1.0f;  // R gain (identity when white point disabled)
-        cbData[16] = cc.primariesMatrix[3];
-        cbData[17] = cc.primariesMatrix[4];
-        cbData[18] = cc.primariesMatrix[5];
-        cbData[19] = cc.primariesEnabled ? cc.whiteBalanceGains[1] : 1.0f;  // G gain
-        cbData[20] = cc.primariesMatrix[6];
-        cbData[21] = cc.primariesMatrix[7];
-        cbData[22] = cc.primariesMatrix[8];
-        cbData[23] = cc.primariesEnabled ? cc.whiteBalanceGains[2] : 1.0f;  // B gain
+        // Write identity when MHC handles primaries/WB — useManualCorrection may still be true
+        // for grayscale, so the shader would apply non-identity matrix/WB if we wrote them.
+        cbData[12] = shaderPrimaries ? cc.primariesMatrix[0] : 1.0f;
+        cbData[13] = shaderPrimaries ? cc.primariesMatrix[1] : 0.0f;
+        cbData[14] = shaderPrimaries ? cc.primariesMatrix[2] : 0.0f;
+        cbData[15] = shaderWhiteBalance ? cc.whiteBalanceGains[0] : 1.0f;
+        cbData[16] = shaderPrimaries ? cc.primariesMatrix[3] : 0.0f;
+        cbData[17] = shaderPrimaries ? cc.primariesMatrix[4] : 1.0f;
+        cbData[18] = shaderPrimaries ? cc.primariesMatrix[5] : 0.0f;
+        cbData[19] = shaderWhiteBalance ? cc.whiteBalanceGains[1] : 1.0f;
+        cbData[20] = shaderPrimaries ? cc.primariesMatrix[6] : 0.0f;
+        cbData[21] = shaderPrimaries ? cc.primariesMatrix[7] : 0.0f;
+        cbData[22] = shaderPrimaries ? cc.primariesMatrix[8] : 1.0f;
+        cbData[23] = shaderWhiteBalance ? cc.whiteBalanceGains[2] : 1.0f;
         // Row 6: Tonemapping parameters
         // Slot [24]: PQ-encoded source peak (avoids per-pixel pow() in pixel shader)
         if (cc.tonemap.dynamicPeak) {

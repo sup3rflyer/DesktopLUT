@@ -541,7 +541,7 @@ static bool HasActiveShaderCorrections() {
         if (hdr.primariesEnabled && !hdrMhcP) return true;
         if (hdr.grayscale.enabled && !hdrMhcG) return true;
         if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
-        if (desktopGamma && ms.hdrMHC.enabled && !hdrMhcG) return true;
+        if (desktopGamma && ms.hdrMHC.desktopGammaEnabled && !hdrMhcG) return true;
     }
     return false;
 }
@@ -571,10 +571,9 @@ bool EvalNonAnalysisShaderCorrections() {
         if (hdr.primariesEnabled && !hdrMhcP) return true;
         if (hdr.grayscale.enabled && !hdrMhcG) return true;
         if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
-        // Desktop gamma is HDR-only (render loop gates on ctx.isHDREnabled).
-        // Use ms.hdrMHC.enabled as proxy for "monitor configured for HDR" to avoid
-        // false positives on SDR monitors that have no HDR MHC at all.
-        if (desktopGamma && ms.hdrMHC.enabled && !hdrMhcG) return true;
+        // Desktop gamma is HDR-only. Check per-monitor desktopGammaEnabled (not global
+        // g_desktopGammaMode) to avoid false positives on SDR monitors.
+        if (desktopGamma && ms.hdrMHC.desktopGammaEnabled && !hdrMhcG) return true;
     }
     return false;
 }
