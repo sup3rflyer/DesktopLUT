@@ -331,8 +331,11 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Select color correction based on HDR state
         auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
         // Suppress primaries/grayscale/WB when MHC handles them
+        // corrGsPreviewActive: correction GS editor open — MHC has base calibration,
+        // shader adds correction GS on top. DG stays suppressed (already in MHC LUT).
+        bool corrGsPreview = ctx->corrGsPreviewActive.load();
         bool shaderPrimaries = cc.primariesEnabled && !mhcPrim;
-        bool shaderGrayscale = cc.grayscale.enabled && !mhcGs;
+        bool shaderGrayscale = cc.grayscale.enabled && (!mhcGs || corrGsPreview);
         bool shaderWhiteBalance = cc.primariesEnabled && !mhcPrim &&
             (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
         cbData[7] = (shaderPrimaries || shaderGrayscale || shaderWhiteBalance) ? 1.0f : 0.0f;  // useManualCorrection

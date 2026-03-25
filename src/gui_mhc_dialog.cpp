@@ -384,7 +384,8 @@ static void MhcPushLivePreview(MhcDialogData* d) {
                 return p.monitorIndex == d->monitorIndex;
             }),
         g_pendingColorCorrections.end());
-    g_pendingColorCorrections.push_back({ d->monitorIndex, d->isHDR, data, true, d->isHDR });
+    // Use PQ/linear gain path (not ICtCp) so per-channel behavior matches MHC LUT
+    g_pendingColorCorrections.push_back({ d->monitorIndex, d->isHDR, data, true, false });
     g_hasPendingColorCorrections.store(true, std::memory_order_release);
 }
 

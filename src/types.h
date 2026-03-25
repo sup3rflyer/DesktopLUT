@@ -592,6 +592,7 @@ struct MonitorContext {
     MovableAtomic<bool> sdrMhcGrayscaleActive{ false };   // SDR MHC grayscale installed at GPU scanout
     MovableAtomic<bool> hdrMhcPrimariesActive{ false };   // HDR MHC primaries installed at GPU scanout
     MovableAtomic<bool> hdrMhcGrayscaleActive{ false };   // HDR MHC grayscale installed at GPU scanout
+    MovableAtomic<bool> corrGsPreviewActive{ false };    // Correction GS preview: let shader GS through MHC suppression
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     bool cbDirty = true;                     // True when constant buffer needs update

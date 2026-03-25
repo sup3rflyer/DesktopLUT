@@ -50,7 +50,7 @@ float PqOETF(float L) {
 // SECTION: Grayscale Evaluation
 // ============================================================================
 
-// Evaluate SDR grayscale correction (matches shader's ApplyGrayscaleCorrection)
+// Evaluate SDR grayscale correction (matches shader's ApplyGrayscaleCorrectionLinear)
 // Input/output are linear light values (0-1)
 float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
     if (Y_linear <= 0.0f) return 0.0f;

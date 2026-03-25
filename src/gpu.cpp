@@ -372,7 +372,7 @@ bool InitD3D() {
         }
 
         // Gamma 2.4/2.2 ratio LUT: stores pow(Y, 1/11) for Y in [0,1]
-        // Apply24Gamma needs ratio = pow(Y, 12/11) / Y = pow(Y, 1/11)
+        // Apply24GammaLinear needs ratio = pow(Y, 12/11) / Y = pow(Y, 1/11)
         float gammaRatioData[SRGB_LUT_SIZE];
         for (int i = 0; i < SRGB_LUT_SIZE; i++) {
             float Y = static_cast<float>(i) / static_cast<float>(SRGB_LUT_SIZE - 1);

@@ -388,7 +388,7 @@ bool ExtractGrayscaleFromCube(const std::wstring& path, GrayscaleSettings& outGr
     outGrayscale.points.resize(N);
 
     // Sample neutral axis (R=G=B diagonal) at sqrt-spaced input levels.
-    // The shader's ApplyGrayscaleCorrection uses sqrt indexing: idx = sqrt(Y) * (N-1),
+    // The shader's ApplyGrayscaleCorrectionLinear uses sqrt indexing: idx = sqrt(Y) * (N-1),
     // so point i corresponds to input Y = (i/(N-1))^2.
     for (int i = 0; i < N; i++) {
         float sqrtT = (float)i / (float)(N - 1);  // sqrt-space index 0-1

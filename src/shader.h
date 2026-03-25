@@ -110,26 +110,17 @@ float3 sRGB_EOTF3(float3 rgb) {
         srgbEotfLUT.SampleLevel(linearSampler, float2(uv.z, 0.5f), 0));
 }
 
-// Gamma 2.2 -> 2.4 transform via LUT (BT.1886)
-// pow(Y, 12/11) = Y * pow(Y, 1/11), so we LUT-lookup pow(Y, 1/11) as a ratio multiplier.
-// 1 tex sample replaces 1 pow.
-float3 Apply24Gamma(float3 rgb) {
-    if (grayscale24 < 0.5f) return rgb;
-    float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
-    if (Y < 1e-6f) return rgb;
-    float scale = 1023.0f / 1024.0f;
-    float bias = 0.5f / 1024.0f;
-    float ratio = gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(Y) * scale + bias, 0.5f), 0);
-    return rgb * ratio;  // ratio = pow(Y, 1/11) → rgb * pow(Y, 1/11) = rgb * correctedY/Y
-}
+// Linear-domain helpers for SDR grayscale + 2.4 gamma (match MHC 1D LUT pipeline).
+// Both operate in linear light so the shader preview matches the MHC ICC profile.
+// Called from a single sRGB decode/encode roundtrip in the SDR pipeline.
 
-// SDR grayscale: per-channel sqrt distribution in linear space
-float3 ApplyGrayscaleCorrection(float3 rgb) {
-    if (grayscaleEnabled < 0.5) return rgb;
+// Grayscale: per-channel sqrt-domain correction in linear space
+// Input/output are linear light; matches MHC's EvalGrayscaleSDR_Channel exactly.
+float3 ApplyGrayscaleCorrectionLinear(float3 lin) {
     float pointCount = max(2.0f, grayscalePoints);
-    float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
-    if (Y < 1e-6f) return rgb;
-    // sqrt distribution: index = sqrt(Y) * (N-1), curve stores Y values
+    float Y = dot(lin, float3(0.2126f, 0.7152f, 0.0722f));
+    if (Y < 1e-6f) return lin;
+    // sqrt distribution: index = sqrt(Y_linear) * (N-1), curve stores linear Y values
     float idx = sqrt(saturate(Y)) * (pointCount - 1.0f);
     int i0 = (int)floor(idx);
     int i1 = min(i0 + 1, (int)pointCount - 1);
@@ -145,7 +136,29 @@ float3 ApplyGrayscaleCorrection(float3 rgb) {
     float sB1 = sqrt(max(grayscaleB[i1/4][i1%4], 0.0f));
     float corrB = lerp(sB0, sB1, t); corrB *= corrB;
     // Scale each channel by its own correction relative to luminance
-    return float3(rgb.r * corrR / Y, rgb.g * corrG / Y, rgb.b * corrB / Y);
+    return float3(lin.r * corrR / Y, lin.g * corrG / Y, lin.b * corrB / Y);
+}
+
+// 2.4 gamma: pow(Y, 2.4/2.2) in linear space via LUT ratio
+// Matches MHC's pow(Y_corrected, 2.4/2.2) in GenerateMHC2LUT_SDR_Channel.
+float3 Apply24GammaLinear(float3 lin) {
+    float Y = dot(lin, float3(0.2126f, 0.7152f, 0.0722f));
+    if (Y < 1e-6f) return lin;
+    float scale = 1023.0f / 1024.0f;
+    float bias = 0.5f / 1024.0f;
+    // gammaRatioLUT stores pow(Y, 1/11); lin * pow(Y, 1/11) = lin * pow(Y, 12/11)/Y = lin * pow(Y, 2.4/2.2)/Y
+    float ratio = gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(Y) * scale + bias, 0.5f), 0);
+    return lin * ratio;
+}
+
+// Combined SDR corrections: single sRGB decode/encode roundtrip for both grayscale + 2.4 gamma.
+// Called when either correction is active. Matches the MHC 1D LUT pipeline:
+//   SrgbEOTF → grayscale correction → pow(2.4/2.2) → SrgbOETF
+float3 ApplySDRCorrections(float3 rgb) {
+    float3 lin = sRGB_EOTF3(rgb);
+    if (grayscaleEnabled > 0.5) lin = ApplyGrayscaleCorrectionLinear(lin);
+    if (grayscale24 > 0.5f) lin = Apply24GammaLinear(lin);
+    return sRGB_OETF3(max(lin, 0.0));
 }
 )"
 // Part 2b: ICTCP color space infrastructure (Dolby ICtCp for HDR)
@@ -762,10 +775,11 @@ R"(
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 3: Gamma-space corrections (shared by ACM and legacy)
+        // STAGE 3: Linear-space corrections (matches MHC 1D LUT pipeline)
+        // Single sRGB decode/encode roundtrip for grayscale + 2.4 gamma
         // ═══════════════════════════════════════════════════════════════════════
-        input = ApplyGrayscaleCorrection(input);
-        input = Apply24Gamma(input);
+        if (grayscaleEnabled > 0.5 || grayscale24 > 0.5)
+            input = ApplySDRCorrections(input);
 
         float3 corrected;
         if (usePassthrough > 0.5) corrected = input;

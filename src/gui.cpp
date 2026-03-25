@@ -908,8 +908,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int monIdx = g_gui.currentMonitor;
                 auto& mhc = isHDR ? g_gui.monitorSettings[monIdx].hdrMHC
                                   : g_gui.monitorSettings[monIdx].sdrMHC;
-                auto& otherMhc = isHDR ? g_gui.monitorSettings[monIdx].sdrMHC
-                                       : g_gui.monitorSettings[monIdx].hdrMHC;
                 auto& gs = mhc.correctionGrayscale;
                 if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
                     gs.points.resize(gs.pointCount);
@@ -919,32 +917,21 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool livePreview, startedForPreview, startedOverlayForPreview;
                 EnsureProcessingForPreview(monIdx, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
 
-                // Remove ICC profile and clear MHC flags for shader preview
+                // Keep MHC ICC profile active — swap to permutation WITHOUT correction GS
+                // so the shader can preview correction GS on top of the base calibration.
                 bool hadProfile = mhc.enabled && !mhc.profileName.empty();
-                std::wstring savedProfileName = mhc.profileName;   // saved for restore
-                bool savedEnabled = mhc.enabled;                    // saved for restore
-                std::wstring otherProfileName;
-                bool otherWasEnabled = false;
-                if (livePreview) {
-                    if (hadProfile) {
-                        DisplayInfo displayInfo;
-                        if (GetDisplayInfoForMonitor(monIdx, displayInfo)) {
-                            RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-                        }
+                uint8_t savedPerm = mhc.activePerm;
+                if (livePreview && hadProfile) {
+                    // Swap to permutation with correction GS stripped out
+                    uint8_t previewPerm = savedPerm & ~MHCSettings::PERM_GS;
+                    if (previewPerm != savedPerm) {
+                        SwapMhcToPermutation(monIdx, isHDR, previewPerm);
                     }
-                    otherWasEnabled = otherMhc.enabled;
-                    otherProfileName = otherMhc.profileName;
-                    mhc.enabled = false;
-                    mhc.profileName.clear();
-                    otherMhc.enabled = false;
-                    otherMhc.profileName.clear();
-
+                    // Enable corrGsPreviewActive so shader GS passes through MHC suppression
                     for (auto& ctx : g_monitors) {
                         if (ctx.index == monIdx) {
-                            ctx.sdrMhcPrimariesActive = false;
-                            ctx.sdrMhcGrayscaleActive = false;
-                            ctx.hdrMhcPrimariesActive = false;
-                            ctx.hdrMhcGrayscaleActive = false;
+                            ctx.corrGsPreviewActive = true;
+                            ctx.cbDirty = true;
                             break;
                         }
                     }
@@ -953,39 +940,45 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!startedOverlayForPreview)
                     g_mhcEditDialogOpen.store(true);
 
-                // Live preview callback: push correction grayscale + MHC primaries to shader
-                ShowGrayscaleEditor(hwnd, gs, isHDR, [monIdx, isHDR, &mhc]() {
-                    ColorCorrectionSettings tempCC;
-                    tempCC.primariesEnabled = mhc.primariesEnabled;
-                    tempCC.primariesPreset = mhc.primariesPreset;
-                    tempCC.customPrimaries = mhc.customPrimaries;
-                    tempCC.grayscale = mhc.correctionGrayscale;
-                    ColorCorrectionData data = ConvertColorCorrection(tempCC, isHDR);
-                    std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
-                    g_pendingColorCorrections.erase(
-                        std::remove_if(g_pendingColorCorrections.begin(), g_pendingColorCorrections.end(),
-                            [monIdx](const PendingColorCorrection& p) { return p.monitorIndex == monIdx; }),
-                        g_pendingColorCorrections.end());
-                    g_pendingColorCorrections.push_back({ monIdx, isHDR, data, true, isHDR });
-                    g_hasPendingColorCorrections.store(true, std::memory_order_release);
-                    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-                });
+                // Live preview callback: push correction grayscale to shader overlay.
+                // MHC ICC stays active (base + DG + WB + primaries), shader adds correction GS on top.
+                // Uses PQ/linear gain path (not ICtCp) so per-channel behavior matches MHC LUT.
+                // Only push when live preview is active — avoids stale entries in pending queue
+                // that would overwrite correct CC data if processing starts later.
+                ShowGrayscaleEditor(hwnd, gs, isHDR, livePreview
+                    ? std::function<void()>([monIdx, isHDR, &mhc]() {
+                        ColorCorrectionSettings tempCC;
+                        tempCC.grayscale = mhc.correctionGrayscale;
+                        ColorCorrectionData data = ConvertColorCorrection(tempCC, isHDR);
+                        std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
+                        g_pendingColorCorrections.erase(
+                            std::remove_if(g_pendingColorCorrections.begin(), g_pendingColorCorrections.end(),
+                                [monIdx](const PendingColorCorrection& p) { return p.monitorIndex == monIdx; }),
+                            g_pendingColorCorrections.end());
+                        g_pendingColorCorrections.push_back({ monIdx, isHDR, data, false, false });
+                        g_hasPendingColorCorrections.store(true, std::memory_order_release);
+                        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+                    })
+                    : std::function<void()>(nullptr));
 
                 g_mhcEditDialogOpen.store(false);
 
-                // Restore MHC state and bake correction into ICC once
+                // Disable preview flag and restore full permutation
+                for (auto& ctx : g_monitors) {
+                    if (ctx.index == monIdx) {
+                        ctx.corrGsPreviewActive = false;
+                        ctx.cbDirty = true;
+                        break;
+                    }
+                }
+                // Regenerate ICC profile with updated correction GS (clears stale perm cache)
+                RegenerateMhcIfActive(monIdx, isHDR);
                 if (livePreview) {
-                    // Restore mhc (was cleared for preview) so RegenerateMhcIfActive can run
-                    mhc.enabled = savedEnabled;
-                    mhc.profileName = savedProfileName;
-                    otherMhc.enabled = otherWasEnabled;
-                    otherMhc.profileName = otherProfileName;
                     UpdateMhcFlagsLive(monIdx);
                     if (!startedForPreview) {
                         UpdateColorCorrectionLive(monIdx, isHDR);
                     }
                 }
-                RegenerateMhcIfActive(monIdx, isHDR);
                 if (startedForPreview) {
                     StopProcessing();
                 }
