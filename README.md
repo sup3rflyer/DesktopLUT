@@ -82,7 +82,8 @@ The inverted icon specifically indicates the DD overlay is presenting frames. It
 When enabled (default), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. This means:
 - No extra overlay window — 3D LUT and tonemapping are fully overlay-free
 - No Desktop Duplication capture overhead
-- VRR/G-Sync compatible (no overlay window to break it)
+- No TOPMOST overlay window (eliminates the G-Sync tearline issue from overlay mode)
+- Fullscreen/borderless games fall back to DWM-composed mode when LUT or tonemapping is active (DirectFlip/iFlip disabled so the shader can process all content) — VRR is lost for those apps; use Passthrough Mode to restore it
 - Analysis overlay runs in lightweight mode (DD capture + compute shader only, no fullscreen overlay window)
 
 ## Grayscale correction
@@ -134,7 +135,7 @@ Hotkeys can be disabled or remapped in the **Settings** tab.
 - Introduces approximately one frame of visual delay in overlay mode, zero in DWM hook mode (input latency is unaffected)
 - DRM-protected content (e.g., Netflix) appears black
 - Some UI elements (such as Start menu animations) may remain uncorrected
-- NVIDIA G-Sync compatible in DWM Hook Mode (analysis runs without overlay)
+- DWM Hook Mode disables DirectFlip/iFlip when LUT or tonemapping is active — fullscreen/borderless games lose VRR (use Passthrough Mode to restore it for specific apps)
 - DWM Hook Mode is experimental and may need repair after Windows updates
 
 ## Building from source

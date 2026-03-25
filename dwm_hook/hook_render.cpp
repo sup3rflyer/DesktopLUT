@@ -492,6 +492,10 @@ void UninitializeStuff()
 	}
 	free(luts);
 	free(lutTargets);
+	luts = NULL;
+	numLuts = 0;
+	lutTargets = NULL;
+	numLutTargets = 0;
 }
 
 
@@ -608,6 +612,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	bool hasLutOrTonemap = (lut || tmEnabled);
 
 	if (hasLutOrTonemap) {
+	  try {
 		EXECUTE_WITH_LOG(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, NULL, &renderTargetView))
 		const D3D11_VIEWPORT d3d11_viewport(0, 0, backBufferDesc.Width, backBufferDesc.Height, 0.0f, 1.0f);
 		deviceContext->RSSetViewports(1, &d3d11_viewport);
@@ -748,6 +753,21 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
 			DrawRectangle(&rects[i], index);
 		}
+	  }
+	  catch (...) {
+		// Cleanup on exception — prevent stale bindings on DWM's device context
+		ID3D11ShaderResourceView* nullSRVs[6] = {};
+		deviceContext->PSSetShaderResources(0, 6, nullSRVs);
+		ID3D11SamplerState* nullSamplers[3] = {};
+		deviceContext->PSSetSamplers(0, 3, nullSamplers);
+		ID3D11Buffer* nullCB = NULL;
+		deviceContext->PSSetConstantBuffers(0, 1, &nullCB);
+		deviceContext->CSSetConstantBuffers(0, 1, &nullCB);
+		deviceContext->VSSetShader(NULL, NULL, 0);
+		deviceContext->PSSetShader(NULL, NULL, 0);
+		deviceContext->OMSetRenderTargets(0, NULL, NULL);
+		throw;
+	  }
 	}
 
 	// Clean up ALL state we set — DWM reuses this device context for its own rendering.

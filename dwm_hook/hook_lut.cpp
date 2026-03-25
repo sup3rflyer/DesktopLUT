@@ -2,6 +2,7 @@
 #include "hook_lut.h"
 #include "hook_log.h"
 #include "hook_render.h"
+#include <cmath>
 
 extern bool isWindows11_25h2;
 
@@ -74,6 +75,12 @@ bool ParseLUT(lutData* lut, char* filename)
 							free(rawLut);
 							return false;
 						}
+						if (!std::isfinite(red) || !std::isfinite(green) || !std::isfinite(blue))
+						{
+							fclose(file);
+							free(rawLut);
+							return false;
+						}
 						LUT_ACCESS_INDEX(rawLut, b, g, r, 0, lutSize) = red;
 						LUT_ACCESS_INDEX(rawLut, b, g, r, 1, lutSize) = green;
 						LUT_ACCESS_INDEX(rawLut, b, g, r, 2, lutSize) = blue;
@@ -122,9 +129,10 @@ bool AddLUTs(char* folder)
 				lut->textureView = NULL;
 				if (!ParseLUT(lut, filePath))
 				{
-					LOG_ONLY_ONCE("LUT could not be parsed");
-					FindClose(hFind);
-					return false;
+					char warnMsg[MAX_PATH + 64];
+					snprintf(warnMsg, sizeof(warnMsg), "WARNING: Skipping unparseable LUT: %s", filePath);
+					log_to_file(warnMsg);
+					continue;
 				}
 				numLuts++;
 			}

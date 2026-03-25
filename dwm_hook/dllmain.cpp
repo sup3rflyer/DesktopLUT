@@ -293,7 +293,9 @@ bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 
 static void UpdateLocalTonemapFromShared() {
 	if (!g_sharedConfig) return;
-	if (g_sharedConfig->version == g_localConfigVersion) return;
+
+	uint32_t v1 = g_sharedConfig->version;
+	if (v1 == g_localConfigVersion) return;
 
 	// Acquire fence pairs with release fence on the host write side,
 	// ensuring all config fields are visible after the version check.
@@ -301,6 +303,14 @@ static void UpdateLocalTonemapFromShared() {
 
 	DwmHookSharedConfig local;
 	memcpy(&local, (const void*)g_sharedConfig, sizeof(local));
+
+	// Seqlock: re-read version after copy to detect torn reads.
+	// If the host was mid-write during our memcpy, versions won't match.
+	// Skip this frame — next Present call will pick up the consistent state.
+	std::atomic_thread_fence(std::memory_order_acquire);
+	uint32_t v2 = g_sharedConfig->version;
+	if (v1 != v2) return;
+
 	g_localConfigVersion = local.version;
 
 	// Clamp numMonitors to prevent OOB from shared memory
@@ -377,6 +387,48 @@ COverlayContext_Present_t* COverlayContext_Present_real_orig = NULL;
 COverlayContext_Present_24h2_t* COverlayContext_Present_orig_24h2 = NULL;
 COverlayContext_Present_24h2_t* COverlayContext_Present_real_orig_24h2 = NULL;
 
+// SEH-protected overlay swapchain info extraction.
+// Reads hwProtected flag and IDXGISwapChain pointer from DWM internal structs via hardcoded offsets.
+// Returns false on SEH exception (offset mismatch after Windows update) — caller should skip LUT.
+static bool ReadOverlaySwapChainInfo(void* overlaySwapChain, bool& hwProtected, IDXGISwapChain*& swapChain)
+{
+	__try
+	{
+		hwProtected = false;
+		swapChain = NULL;
+
+		if (isWindows11_24h2)
+			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_24h2);
+		else if (isWindows11)
+			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11);
+		else
+			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset);
+
+		if (!hwProtected) {
+			if (isWindows11_24h2) {
+				swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain +
+					IOverlaySwapChain_IDXGISwapChain_offset_w11_24h2);
+			} else if (isWindows11) {
+				int sub = *(int*)((unsigned char*)overlaySwapChain - 4);
+				void* real = (unsigned char*)overlaySwapChain - sub - 0x1b0;
+				swapChain = *(IDXGISwapChain**)((unsigned char*)real +
+					IOverlaySwapChain_IDXGISwapChain_offset_w11);
+			} else {
+				swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain +
+					IOverlaySwapChain_IDXGISwapChain_offset);
+			}
+		}
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		LOG_ONLY_ONCE("SEH exception reading overlay swapchain — skipping LUT application");
+		hwProtected = false;
+		swapChain = NULL;
+		return false;
+	}
+}
+
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
@@ -391,6 +443,10 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 			<< " -- windows 11 24h2: " << isWindows11_24h2
 			<< " -- " << "windows 11: " << isWindows11;
 		LOG_ONLY_ONCE(overlay_swapchain_message.str().c_str())
+
+		if (!rectVec || !rectVec->start || rectVec->end < rectVec->start) {
+			return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
+		}
 
 		if (isWindows11_25h2)
 		{
@@ -418,53 +474,26 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 		else
 		{
 			bool hwProtected = false;
-			if (isWindows11_24h2)
-				hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_24h2);
-			else if (isWindows11)
-				hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11);
-			else
-				hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset);
+			IDXGISwapChain* swapChain = NULL;
 
-			if (hwProtected)
+			if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
+			{
+				UnsetLUTActive(self);
+			}
+			else if (hwProtected)
 			{
 				LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 				UnsetLUTActive(self);
 			}
+			else if (swapChain != NULL && ApplyLUT(self, swapChain, rectVec->start, rectVec->end - rectVec->start))
+			{
+				LOG_ONLY_ONCE("Setting LUTactive")
+				SetLUTActive(self);
+			}
 			else
 			{
-				IDXGISwapChain* swapChain = NULL;
-
-				if (isWindows11_24h2)
-				{
-					LOG_ONLY_ONCE("Gathering IDXGISwapChain pointer")
-					swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain +
-						IOverlaySwapChain_IDXGISwapChain_offset_w11_24h2);
-				}
-				else if (isWindows11)
-				{
-					LOG_ONLY_ONCE("Gathering IDXGISwapChain pointer")
-					int sub_from_legacy_swapchain = *(int*)((unsigned char*)overlaySwapChain - 4);
-					void* real_overlay_swap_chain = (unsigned char*)overlaySwapChain - sub_from_legacy_swapchain -
-						0x1b0;
-					swapChain = *(IDXGISwapChain**)((unsigned char*)real_overlay_swap_chain +
-						IOverlaySwapChain_IDXGISwapChain_offset_w11);
-				}
-				else
-				{
-					swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain +
-						IOverlaySwapChain_IDXGISwapChain_offset);
-				}
-
-				if (swapChain != NULL && ApplyLUT(self, swapChain, rectVec->start, rectVec->end - rectVec->start))
-				{
-					LOG_ONLY_ONCE("Setting LUTactive")
-					SetLUTActive(self);
-				}
-				else
-				{
-					LOG_ONLY_ONCE("Un-setting LUTactive")
-					UnsetLUTActive(self);
-				}
+				LOG_ONLY_ONCE("Un-setting LUTactive")
+				UnsetLUTActive(self);
 			}
 		}
 	}
@@ -482,46 +511,31 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 	{
 		LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
 
-		bool hwProtected = false;
-		if (isWindows11)
-			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11);
-		else
-			hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset);
+		if (!rectVec || !rectVec->start || rectVec->end < rectVec->start) {
+			return COverlayContext_Present_orig(self, overlaySwapChain, a3, rectVec, a5, a6);
+		}
 
-		if (hwProtected)
+		bool hwProtected = false;
+		IDXGISwapChain* swapChain = NULL;
+
+		if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
+		{
+			UnsetLUTActive(self);
+		}
+		else if (hwProtected)
 		{
 			LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 			UnsetLUTActive(self);
 		}
+		else if (swapChain != NULL && ApplyLUT(self, swapChain, rectVec->start, rectVec->end - rectVec->start))
+		{
+			LOG_ONLY_ONCE("Setting LUTactive")
+			SetLUTActive(self);
+		}
 		else
 		{
-			IDXGISwapChain* swapChain;
-
-			if (isWindows11)
-			{
-				LOG_ONLY_ONCE("Gathering IDXGISwapChain pointer")
-				int sub_from_legacy_swapchain = *(int*)((unsigned char*)overlaySwapChain - 4);
-				void* real_overlay_swap_chain = (unsigned char*)overlaySwapChain - sub_from_legacy_swapchain -
-					0x1b0;
-				swapChain = *(IDXGISwapChain**)((unsigned char*)real_overlay_swap_chain +
-					IOverlaySwapChain_IDXGISwapChain_offset_w11);
-			}
-			else
-			{
-				swapChain = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain +
-					IOverlaySwapChain_IDXGISwapChain_offset);
-			}
-
-			if (swapChain != NULL && ApplyLUT(self, swapChain, rectVec->start, rectVec->end - rectVec->start))
-			{
-				LOG_ONLY_ONCE("Setting LUTactive")
-				SetLUTActive(self);
-			}
-			else
-			{
-				LOG_ONLY_ONCE("Un-setting LUTactive")
-				UnsetLUTActive(self);
-			}
+			LOG_ONLY_ONCE("Un-setting LUTactive")
+			UnsetLUTActive(self);
 		}
 	}
 
@@ -737,23 +751,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						g_sharedMemHandle = NULL;
 					}
 				} else {
-					// Retry once after 100ms (race: host creates mapping just before CreateRemoteThread)
-					Sleep(100);
-					g_sharedMemHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, DWM_HOOK_CONFIG_NAME);
-					if (g_sharedMemHandle) {
-						g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
-							g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
-						if (g_sharedConfig) {
-							log_to_file("Shared memory opened OK (retry)");
-							UpdateLocalTonemapFromShared();
-						} else {
-							CloseHandle(g_sharedMemHandle);
-							g_sharedMemHandle = NULL;
-						}
-					}
-					if (!g_sharedConfig) {
-						log_to_file("WARNING: Shared memory not available — tonemap via hook disabled");
-					}
+					log_to_file("WARNING: Shared memory not available — live tonemap IPC disabled");
 				}
 			}
 
@@ -848,14 +846,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				for (size_t i = 0; i <= moduleInfo.SizeOfImage - sizeof COverlayContext_OverlaysEnabled_bytes_relative_w11_24h2; i++)
 				{
 					unsigned char* address = (unsigned char*)dwmcore + i;
-					if (!COverlayContext_Present_orig && sizeof COverlayContext_Present_bytes_w11_24h2 <= moduleInfo.
+					if (!COverlayContext_Present_orig_24h2 && sizeof COverlayContext_Present_bytes_w11_24h2 <= moduleInfo.
 						SizeOfImage - i && !aob_match_inverse(address, COverlayContext_Present_bytes_w11_24h2,
 							sizeof COverlayContext_Present_bytes_w11_24h2))
 					{
 						COverlayContext_Present_orig_24h2 = (COverlayContext_Present_24h2_t*)address;
 						COverlayContext_Present_real_orig_24h2 = COverlayContext_Present_orig_24h2;
 					}
-					else if (!COverlayContext_IsCandidateDirectFlipCompatbile_orig && sizeof
+					else if (!COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 && sizeof
 						COverlayContext_IsCandidateDirectFlipCompatbile_bytes_w11_24h2 <= moduleInfo.SizeOfImage - i && !
 						aob_match_inverse(
 							address, COverlayContext_IsCandidateDirectFlipCompatbile_bytes_w11_24h2,
@@ -873,7 +871,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 						COverlayContext_OverlaysEnabled_orig = (COverlayContext_OverlaysEnabled_t*)get_relative_address(address, 1, 5);
 					}
-					if (COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
+					if (COverlayContext_Present_orig_24h2 && COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 &&
 						COverlayContext_OverlaysEnabled_orig)
 					{
 						break;
@@ -1164,9 +1162,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				__try { *g_pOverlayTestMode = 0; }
 				__except (EXCEPTION_EXECUTE_HANDLER) { /* already detaching, nothing to do */ }
 			}
+			MH_DisableHook(MH_ALL_HOOKS);
 			MH_Uninitialize();
-			Sleep(100);
 		}
+		g_hookReverted = true;  // Prevent any late HostMonitor action after timeout
 		// Close shared memory
 		if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
 		if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }

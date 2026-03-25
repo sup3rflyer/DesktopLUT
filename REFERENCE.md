@@ -405,12 +405,12 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 
 This is a fundamental NVIDIA driver limitation affecting all external overlay applications (ShaderGlass, Lossless Scaling, Discord overlay, Xbox Game Bar, etc.). No workaround exists.
 
-**DWM Hook Mode**: When using DWM hook, VRR is unaffected on all vendors. Analysis runs in lightweight mode (no overlay window) so it does not break G-Sync.
+**DWM Hook Mode**: The hook eliminates the overlay window that breaks NVIDIA G-Sync, but when a 3D LUT or tonemapping is active, the hook disables DirectFlip/iFlip to ensure all content passes through the composition pipeline where the shader runs. This forces fullscreen and borderless-fullscreen games into DWM-composed mode, which means VRR is lost for those apps. Analysis-only mode (no LUT or tonemapping) does not block DirectFlip.
 
 **For NVIDIA users**:
 1. Enable Windows "Variable refresh rate" setting (Settings > Display > Graphics > Variable refresh rate: On)
-2. Use Passthrough Mode (Settings tab) to auto-hide overlay when specific games are running
-3. Use DWM Hook Mode — 3D LUT, tonemapping, and analysis are all overlay-free
+2. Use Passthrough Mode (Settings tab) to disable corrections when specific games are running — this restores full VRR
+3. DWM Hook Mode eliminates the overlay G-Sync tearline issue, but VRR is still lost for fullscreen apps when LUT/tonemapping is active
 
 See [GitHub Issue #1](https://github.com/sup3rflyer/DesktopLUT/issues/1) for technical details.
 

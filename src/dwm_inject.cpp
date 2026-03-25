@@ -822,27 +822,30 @@ void UpdateDwmHookSharedConfig()
 
     cfg.numMonitors = static_cast<uint32_t>(std::min(mons.size(), static_cast<size_t>(MAX_DWM_HOOK_MONITORS)));
 
-    for (uint32_t i = 0; i < cfg.numMonitors; i++) {
-        auto& mc = cfg.monitors[i];
-        mc.left = mons[i].left;
-        mc.top = mons[i].top;
-        mc.width = static_cast<uint32_t>(mons[i].w);
-        mc.height = static_cast<uint32_t>(mons[i].h);
-        mc.bpc = static_cast<uint32_t>(mons[i].bpc);
-        mc.isHdr = mons[i].hdr ? 1 : 0;
+    {
+        std::lock_guard<std::mutex> settingsLock(g_monitorSettingsMutex);
+        for (uint32_t i = 0; i < cfg.numMonitors; i++) {
+            auto& mc = cfg.monitors[i];
+            mc.left = mons[i].left;
+            mc.top = mons[i].top;
+            mc.width = static_cast<uint32_t>(mons[i].w);
+            mc.height = static_cast<uint32_t>(mons[i].h);
+            mc.bpc = static_cast<uint32_t>(mons[i].bpc);
+            mc.isHdr = mons[i].hdr ? 1 : 0;
 
-        // Match to GUI monitor settings by position
-        for (size_t mi = 0; mi < g_gui.monitors.size() && mi < g_gui.monitorSettings.size(); mi++) {
-            MONITORINFO info = { sizeof(info) };
-            if (GetMonitorInfo(g_gui.monitors[mi], &info)) {
-                if (info.rcMonitor.left == mc.left && info.rcMonitor.top == static_cast<int32_t>(mc.top)) {
-                    const auto& tm = g_gui.monitorSettings[mi].hdrColorCorrection.tonemap;
-                    mc.tonemapEnabled = tm.enabled ? 1 : 0;
-                    mc.tonemapCurve = ConvertTonemapCurve(static_cast<int>(tm.curve));
-                    mc.sourcePeakNits = tm.sourcePeakNits;
-                    mc.targetPeakNits = tm.targetPeakNits;
-                    mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
-                    break;
+            // Match to GUI monitor settings by position
+            for (size_t mi = 0; mi < g_gui.monitors.size() && mi < g_gui.monitorSettings.size(); mi++) {
+                MONITORINFO info = { sizeof(info) };
+                if (GetMonitorInfo(g_gui.monitors[mi], &info)) {
+                    if (info.rcMonitor.left == mc.left && info.rcMonitor.top == static_cast<int32_t>(mc.top)) {
+                        const auto& tm = g_gui.monitorSettings[mi].hdrColorCorrection.tonemap;
+                        mc.tonemapEnabled = tm.enabled ? 1 : 0;
+                        mc.tonemapCurve = ConvertTonemapCurve(static_cast<int>(tm.curve));
+                        mc.sourcePeakNits = tm.sourcePeakNits;
+                        mc.targetPeakNits = tm.targetPeakNits;
+                        mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
+                        break;
+                    }
                 }
             }
         }
