@@ -439,8 +439,8 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
 
     // ========================================================================
     // Compose additional corrections on top of base LUT
-    // Desktop gamma (HDR only) and correction grayscale are applied via
-    // function composition: the base LUT output feeds into the next stage.
+    // Order: correction grayscale first (calibration), then desktop gamma (look).
+    // DG must be last so correction GS sees un-DG'd values matching calibration.
     // ========================================================================
 
     bool hasDG = params.isHDR && params.desktopGammaEnabled;
@@ -457,23 +457,22 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
                 if (params.isHDR) {
                     // HDR: LUT output is PQ signal
 
-                    // Desktop gamma: sRGB→2.2 for SDR luminance range
+                    // Correction grayscale first (calibration refinement)
+                    // Must precede DG so the correction curve sees un-DG'd values
+                    // matching its calibration conditions.
+                    if (hasCorrGS) {
+                        v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
+                    }
+
+                    // Desktop gamma last: sRGB→2.2 for SDR luminance range
                     if (hasDG) {
                         float linearNits = PqEOTF(v) * 10000.0f;
                         if (linearNits <= 80.0f && linearNits > 0.0f) {
-                            // Normalize to 0-1 range within SDR (80 nits)
                             float sdrLinear = linearNits / 80.0f;
-                            // Apply sRGB OETF then pow(2.2) (sRGB→2.2 conversion)
                             float srgbEncoded = SrgbOETF(sdrLinear);
                             float gamma22 = powf(srgbEncoded, 2.2f);
-                            // Convert back to PQ
                             v = PqOETF(gamma22 * 80.0f / 10000.0f);
                         }
-                    }
-
-                    // Correction grayscale (fine-tuning on top of base)
-                    if (hasCorrGS) {
-                        v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
                     }
                 } else {
                     // SDR: LUT output is sRGB signal
