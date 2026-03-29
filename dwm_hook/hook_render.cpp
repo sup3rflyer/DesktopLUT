@@ -196,7 +196,11 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		{
 			ID3DBlob* vsBlob;
 			ID3DBlob* compile_error_interface;
-			LOG_ONLY_ONCE(("Trying to compile vshader with this code:\n" + std::string(g_shaders)).c_str())
+			{
+				char shaderMsg[64];
+				snprintf(shaderMsg, sizeof(shaderMsg), "Compiling shaders (%zu bytes)", sizeof g_shaders);
+				LOG_ONLY_ONCE(shaderMsg)
+			}
 			EXECUTE_D3DCOMPILE_WITH_LOG(
 				D3DCompile(g_shaders, sizeof g_shaders, NULL, NULL, NULL, "VS", "vs_5_0", 0, 0, &vsBlob, &
 					compile_error_interface), compile_error_interface)
@@ -717,11 +721,14 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		cb.pad1 = 0.0f;
 		cb.pad2 = 0.0f;
 
-		// Diagnostic: periodic logging of tonemap CB state (no GPU readback — DWM can't tolerate stalls)
+		// Diagnostic: log tonemap CB state only when values change (avoids per-frame spam)
 		if (tmEnabled) {
-			static int tonemapDiagCounter = 0;
-			if (++tonemapDiagCounter >= 120) {
-				tonemapDiagCounter = 0;
+			static int prevCurve = -1;
+			static float prevPqSrc = -1.0f, prevPqTgt = -1.0f;
+			if (cb.tonemapCurve != prevCurve || cb.pqSourcePeak != prevPqSrc || cb.pqTargetPeak != prevPqTgt) {
+				prevCurve = cb.tonemapCurve;
+				prevPqSrc = cb.pqSourcePeak;
+				prevPqTgt = cb.pqTargetPeak;
 				char diagMsg[256];
 				snprintf(diagMsg, sizeof(diagMsg), "TM DIAG: tmEn=%d dyn=%d curve=%d pqSrc=%.4f pqTgt=%.4f tgtNits=%.0f srcNits=%.0f csOK=%d uavOK=%d",
 					cb.tonemapEnabled, cb.tonemapDynamic, cb.tonemapCurve,
