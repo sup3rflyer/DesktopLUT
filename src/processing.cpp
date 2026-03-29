@@ -785,6 +785,7 @@ void AnalysisOnlyThreadFunc() {
                     std::cerr << "[Analysis-only] DD re-init failed " << consecutiveErrors << " times, exiting" << std::endl;
                     break;
                 }
+                continue;  // mon.duplication is null — retry before AcquireNextFrame
             } else {
                 consecutiveErrors = 0;
             }
