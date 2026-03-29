@@ -177,6 +177,32 @@ const int IOverlaySwapChain_HardwareProtected_offset_w11_25h2 = 0x4C;
 
 const int IOverlaySwapChain_GetSwapChain_vtable_offset_w11_25h2 = 0x108;
 
+/**
+ * AOB for COverlayContext::IsDirectFlipSupportedOnTarget in 25H2
+ * Replaces the removed CWindowContext/CCompVisual DirectFlip hooks.
+ * Prevents DWM from attempting DirectFlip on any overlay target.
+ *
+ * 48 89 5C 24 20 55 56 57 48 83 EC 60 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 44 24 50 48 8B 81 ?? ?? ?? ?? 49 8B D8 48 8B F1
+ */
+const unsigned char COverlayContext_IsDirectFlipSupportedOnTarget_bytes_w11_25h2[] = {
+	0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x60,
+	0x48, 0x8B, 0x05, '?', '?', '?', '?', 0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x50,
+	0x48, 0x8B, 0x81, '?', '?', '?', '?', 0x49, 0x8B, 0xD8, 0x48, 0x8B, 0xF1
+};
+
+/**
+ * AOB for CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible in 25H2
+ * Replaces the removed CCompSwapChain DirectFlip/IndependentFlip hooks.
+ * Prevents surfaces from being marked as advanced DirectFlip compatible.
+ *
+ * 40 53 48 83 EC 20 48 8B 89 ?? ?? ?? ?? 48 85 C9 74 ?? 48 83 64 24 30 00
+ */
+const unsigned char CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_bytes_w11_25h2[] = {
+	0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x89,
+	'?', '?', '?', '?', 0x48, 0x85, 0xC9, 0x74, '?',
+	0x48, 0x83, 0x64, 0x24, 0x30, 0x00
+};
+
 
 bool isWindows11 = false;
 bool isWindows11_24h2 = false;
@@ -599,6 +625,31 @@ bool CCompSwapChain_IsCandidateIndependentFlipCompatible_hook(void* self)
 	return CCompSwapChain_IsCandidateIndependentFlipCompatible_orig(self);
 }
 
+// 25H2 replacement hooks for removed CWindowContext/CCompVisual/CCompSwapChain DirectFlip functions
+typedef bool (COverlayContext_IsDirectFlipSupportedOnTarget_t)(void*, void*, void*);
+COverlayContext_IsDirectFlipSupportedOnTarget_t* COverlayContext_IsDirectFlipSupportedOnTarget_orig = NULL;
+
+bool COverlayContext_IsDirectFlipSupportedOnTarget_hook(void* self, void* a2, void* a3)
+{
+	if (IsLUTActive(self))
+	{
+		return false;
+	}
+	return COverlayContext_IsDirectFlipSupportedOnTarget_orig(self, a2, a3);
+}
+
+typedef bool (CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_t)(void*);
+CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_t* CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig = NULL;
+
+bool CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_hook(void* self)
+{
+	if (HasActiveHookProcessing())
+	{
+		return false;
+	}
+	return CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig(self);
+}
+
 typedef bool (COverlayContext_IsCandidateDirectFlipCompatbile_t)(void*, void*, void*, void*, int, unsigned int, bool,
                                                                  bool);
 typedef bool (COverlayContext_IsCandidateDirectFlipCompatbile_24h2_t)(void*, void*, void*, void*, unsigned int, bool);
@@ -796,6 +847,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 							sizeof CCompVisual_IsCandidateForPromotion_bytes_w11_25h2))
 					{
 						CCompVisual_IsCandidateForPromotion_orig = (CCompVisual_IsCandidateForPromotion_t*)address;
+					}
+					else if (!COverlayContext_IsDirectFlipSupportedOnTarget_orig && sizeof COverlayContext_IsDirectFlipSupportedOnTarget_bytes_w11_25h2
+						<= moduleInfo.SizeOfImage - i && !aob_match_inverse(
+							address, COverlayContext_IsDirectFlipSupportedOnTarget_bytes_w11_25h2,
+							sizeof COverlayContext_IsDirectFlipSupportedOnTarget_bytes_w11_25h2))
+					{
+						COverlayContext_IsDirectFlipSupportedOnTarget_orig = (COverlayContext_IsDirectFlipSupportedOnTarget_t*)address;
+					}
+					else if (!CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig && sizeof CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_bytes_w11_25h2
+						<= moduleInfo.SizeOfImage - i && !aob_match_inverse(
+							address, CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_bytes_w11_25h2,
+							sizeof CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_bytes_w11_25h2))
+					{
+						CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig = (CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_t*)address;
 					}
 					else if (!COverlayContext_OverlaysEnabled_orig && sizeof COverlayContext_OverlaysEnabled_bytes_w11_25h2
 						<= moduleInfo.SizeOfImage - i && !aob_match_inverse(
@@ -1072,6 +1137,36 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				}
 				else {
 					LOG_ONLY_ONCE("FAILED to find CCompVisual::IsCandidateForPromotion")
+				}
+
+				if (COverlayContext_IsDirectFlipSupportedOnTarget_orig)
+				{
+					mhStatus = MH_CreateHook((PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_orig,
+						(PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_hook,
+						(PVOID*)&COverlayContext_IsDirectFlipSupportedOnTarget_orig);
+					if (mhStatus == MH_OK) {
+						LOG_ONLY_ONCE("Hooked COverlayContext::IsDirectFlipSupportedOnTarget")
+					} else {
+						LOG_ONLY_ONCE("FAILED to hook COverlayContext::IsDirectFlipSupportedOnTarget")
+					}
+				}
+				else {
+					LOG_ONLY_ONCE("FAILED to find COverlayContext::IsDirectFlipSupportedOnTarget")
+				}
+
+				if (CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig)
+				{
+					mhStatus = MH_CreateHook((PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig,
+						(PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_hook,
+						(PVOID*)&CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig);
+					if (mhStatus == MH_OK) {
+						LOG_ONLY_ONCE("Hooked CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
+					} else {
+						LOG_ONLY_ONCE("FAILED to hook CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
+					}
+				}
+				else {
+					LOG_ONLY_ONCE("FAILED to find CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
 				}
 
 				if (g_pOverlayTestMode != NULL)
