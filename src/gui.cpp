@@ -23,9 +23,11 @@
 #include <locale>
 #include <wtsapi32.h>
 #include <dbt.h>
+#include <taskschd.h>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Wtsapi32.lib")
+#pragma comment(lib, "taskschd.lib")
 
 // ============================================================================
 // SECTION: Display Power Notification (GUI-side)
@@ -244,71 +246,212 @@ void UpdateColorCorrectionControls() {
 // SECTION: System Tray
 // ============================================================================
 
-bool IsStartupEnabled() {
-    HKEY hKey;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, g_startupRegKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
-        return false;
+// Task Scheduler startup (runs elevated without UAC prompt at logon)
+static const wchar_t* g_scheduledTaskName = L"DesktopLUT";
+
+struct TaskSchedulerConnection {
+    ITaskService* service = nullptr;
+    ITaskFolder*  folder  = nullptr;
+
+    bool Connect() {
+        HRESULT hr = CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_ITaskService, (void**)&service);
+        if (FAILED(hr)) return false;
+
+        VARIANT v;
+        VariantInit(&v);
+        hr = service->Connect(v, v, v, v);
+        if (FAILED(hr)) { service->Release(); service = nullptr; return false; }
+
+        BSTR root = SysAllocString(L"\\");
+        hr = service->GetFolder(root, &folder);
+        SysFreeString(root);
+        if (FAILED(hr)) { service->Release(); service = nullptr; return false; }
+
+        return true;
     }
 
-    wchar_t value[MAX_PATH];
-    DWORD valueSize = sizeof(value);
+    ~TaskSchedulerConnection() {
+        if (folder)  folder->Release();
+        if (service) service->Release();
+    }
+
+    TaskSchedulerConnection() = default;
+    TaskSchedulerConnection(const TaskSchedulerConnection&) = delete;
+    TaskSchedulerConnection& operator=(const TaskSchedulerConnection&) = delete;
+};
+
+static void RemoveOldRegistryStartup() {
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER,
+                     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                     0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValue(hKey, L"DesktopLUT");
+        RegCloseKey(hKey);
+    }
+}
+
+static bool HasOldRegistryStartup() {
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER,
+                     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                     0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+
     DWORD type;
-    bool exists = (RegQueryValueEx(hKey, g_startupValueName, nullptr, &type,
-                                   (LPBYTE)value, &valueSize) == ERROR_SUCCESS);
+    bool exists = (RegQueryValueEx(hKey, L"DesktopLUT", nullptr, &type,
+                                   nullptr, nullptr) == ERROR_SUCCESS);
     RegCloseKey(hKey);
     return exists;
 }
 
+bool IsStartupEnabled() {
+    TaskSchedulerConnection ts;
+    if (!ts.Connect()) return false;
+
+    BSTR name = SysAllocString(g_scheduledTaskName);
+    IRegisteredTask* pTask = nullptr;
+    HRESULT hr = ts.folder->GetTask(name, &pTask);
+    SysFreeString(name);
+    if (FAILED(hr)) return false;
+
+    VARIANT_BOOL enabled = VARIANT_FALSE;
+    pTask->get_Enabled(&enabled);
+    pTask->Release();
+    return enabled == VARIANT_TRUE;
+}
+
 void UpdateStartupPath() {
-    // If startup is enabled but path is stale, update it to current exe location
-    HKEY hKey;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, g_startupRegKey, 0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) {
+    bool hasOldReg = HasOldRegistryStartup();
+
+    TaskSchedulerConnection ts;
+    if (!ts.Connect()) return;
+
+    BSTR name = SysAllocString(g_scheduledTaskName);
+    IRegisteredTask* pRegTask = nullptr;
+    HRESULT hr = ts.folder->GetTask(name, &pRegTask);
+    SysFreeString(name);
+
+    if (FAILED(hr)) {
+        // No scheduled task — migrate from old registry Run key if present
+        if (hasOldReg) SetStartupEnabled(true);
         return;
     }
 
-    wchar_t regPath[MAX_PATH];
-    DWORD regPathSize = sizeof(regPath);
-    DWORD type;
-    if (RegQueryValueEx(hKey, g_startupValueName, nullptr, &type,
-                        (LPBYTE)regPath, &regPathSize) != ERROR_SUCCESS) {
-        RegCloseKey(hKey);
-        return;  // Not enabled, nothing to update
-    }
-
-    // Get current exe path
+    // Task exists — check if exe path matches current location
     wchar_t currentPath[MAX_PATH];
     GetModuleFileName(nullptr, currentPath, MAX_PATH);
+    bool needsUpdate = false;
 
-    // Compare paths (case-insensitive)
-    if (_wcsicmp(regPath, currentPath) != 0) {
-        // Path changed, update registry
-        RegSetValueEx(hKey, g_startupValueName, 0, REG_SZ,
-                      (LPBYTE)currentPath, (DWORD)((wcslen(currentPath) + 1) * sizeof(wchar_t)));
+    ITaskDefinition* pDef = nullptr;
+    hr = pRegTask->get_Definition(&pDef);
+    pRegTask->Release();
+    if (SUCCEEDED(hr)) {
+        IActionCollection* pActions = nullptr;
+        if (SUCCEEDED(pDef->get_Actions(&pActions))) {
+            IAction* pAction = nullptr;
+            if (SUCCEEDED(pActions->get_Item(1, &pAction))) {
+                IExecAction* pExec = nullptr;
+                if (SUCCEEDED(pAction->QueryInterface(__uuidof(IExecAction), (void**)&pExec))) {
+                    BSTR bstrPath = nullptr;
+                    if (SUCCEEDED(pExec->get_Path(&bstrPath)) && bstrPath) {
+                        needsUpdate = (_wcsicmp(bstrPath, currentPath) != 0);
+                        SysFreeString(bstrPath);
+                    }
+                    pExec->Release();
+                }
+                pAction->Release();
+            }
+            pActions->Release();
+        }
+        pDef->Release();
     }
 
-    RegCloseKey(hKey);
+    if (needsUpdate) SetStartupEnabled(true);
 }
 
 void SetStartupEnabled(bool enable) {
-    HKEY hKey;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, g_startupRegKey, 0, KEY_WRITE, &hKey) != ERROR_SUCCESS) {
-        return;
-    }
+    TaskSchedulerConnection ts;
+    if (!ts.Connect()) return;
+
+    BSTR bstrName = SysAllocString(g_scheduledTaskName);
 
     if (enable) {
-        // Get the path to the current executable
-        wchar_t exePath[MAX_PATH];
-        GetModuleFileName(nullptr, exePath, MAX_PATH);
+        RemoveOldRegistryStartup();
 
-        // Set the registry value (just the exe path, no arguments - GUI mode)
-        RegSetValueEx(hKey, g_startupValueName, 0, REG_SZ,
-                      (LPBYTE)exePath, (DWORD)((wcslen(exePath) + 1) * sizeof(wchar_t)));
+        ITaskDefinition* pTaskDef = nullptr;
+        HRESULT hr = ts.service->NewTask(0, &pTaskDef);
+        if (FAILED(hr)) { SysFreeString(bstrName); return; }
+
+        IRegistrationInfo* pRegInfo = nullptr;
+        if (SUCCEEDED(pTaskDef->get_RegistrationInfo(&pRegInfo))) {
+            BSTR desc = SysAllocString(L"Start DesktopLUT at logon with elevated privileges");
+            pRegInfo->put_Description(desc);
+            SysFreeString(desc);
+            pRegInfo->Release();
+        }
+
+        // Highest available privileges (bypasses UAC prompt)
+        IPrincipal* pPrincipal = nullptr;
+        if (SUCCEEDED(pTaskDef->get_Principal(&pPrincipal))) {
+            pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+            pPrincipal->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN);
+            pPrincipal->Release();
+        }
+
+        ITaskSettings* pSettings = nullptr;
+        if (SUCCEEDED(pTaskDef->get_Settings(&pSettings))) {
+            pSettings->put_StartWhenAvailable(VARIANT_TRUE);
+            pSettings->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
+            pSettings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
+            BSTR noLimit = SysAllocString(L"PT0S");
+            pSettings->put_ExecutionTimeLimit(noLimit);
+            SysFreeString(noLimit);
+            pSettings->put_AllowHardTerminate(VARIANT_FALSE);
+            pSettings->Release();
+        }
+
+        ITriggerCollection* pTriggers = nullptr;
+        if (SUCCEEDED(pTaskDef->get_Triggers(&pTriggers))) {
+            ITrigger* pTrigger = nullptr;
+            if (SUCCEEDED(pTriggers->Create(TASK_TRIGGER_LOGON, &pTrigger)))
+                pTrigger->Release();
+            pTriggers->Release();
+        }
+
+        IActionCollection* pActions = nullptr;
+        if (SUCCEEDED(pTaskDef->get_Actions(&pActions))) {
+            IAction* pAction = nullptr;
+            if (SUCCEEDED(pActions->Create(TASK_ACTION_EXEC, &pAction))) {
+                IExecAction* pExec = nullptr;
+                if (SUCCEEDED(pAction->QueryInterface(__uuidof(IExecAction), (void**)&pExec))) {
+                    wchar_t exePath[MAX_PATH];
+                    GetModuleFileName(nullptr, exePath, MAX_PATH);
+                    BSTR bstrPath = SysAllocString(exePath);
+                    pExec->put_Path(bstrPath);
+                    SysFreeString(bstrPath);
+                    pExec->Release();
+                }
+                pAction->Release();
+            }
+            pActions->Release();
+        }
+
+        VARIANT vEmpty;
+        VariantInit(&vEmpty);
+        IRegisteredTask* pRegistered = nullptr;
+        hr = ts.folder->RegisterTaskDefinition(
+            bstrName, pTaskDef, TASK_CREATE_OR_UPDATE,
+            vEmpty, vEmpty, TASK_LOGON_INTERACTIVE_TOKEN, vEmpty,
+            &pRegistered);
+        if (SUCCEEDED(hr)) pRegistered->Release();
+        pTaskDef->Release();
     } else {
-        // Delete the registry value
-        RegDeleteValue(hKey, g_startupValueName);
+        ts.folder->DeleteTask(bstrName, 0);
+        RemoveOldRegistryStartup();
     }
 
-    RegCloseKey(hKey);
+    SysFreeString(bstrName);
 }
 
 void AddTrayIcon(HWND hwnd) {

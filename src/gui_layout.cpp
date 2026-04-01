@@ -924,7 +924,7 @@ void CreateGUILayout(HWND hwnd) {
     // Add tray icon
     AddTrayIcon(hwnd);
 
-    // Update startup registry path if exe was moved
+    // Update startup task path if exe was moved (migrates old registry Run key)
     UpdateStartupPath();
 
     // Note: Auto-start is handled in RunGUI() after window creation

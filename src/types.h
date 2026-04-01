@@ -1196,7 +1196,3 @@ inline const unsigned char g_blueNoiseData[64 * 64] = {
 // Window class names
 inline const wchar_t* g_windowClassName = L"DesktopLUT";
 inline const wchar_t* g_osdClassName = L"DesktopLUT_OSD";
-
-// Startup registry
-inline const wchar_t* g_startupRegKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-inline const wchar_t* g_startupValueName = L"DesktopLUT";
