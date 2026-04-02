@@ -414,8 +414,20 @@ void SetStartupEnabled(bool enable) {
         ITriggerCollection* pTriggers = nullptr;
         if (SUCCEEDED(pTaskDef->get_Triggers(&pTriggers))) {
             ITrigger* pTrigger = nullptr;
-            if (SUCCEEDED(pTriggers->Create(TASK_TRIGGER_LOGON, &pTrigger)))
+            if (SUCCEEDED(pTriggers->Create(TASK_TRIGGER_LOGON, &pTrigger))) {
+                ILogonTrigger* pLogonTrigger = nullptr;
+                if (SUCCEEDED(pTrigger->QueryInterface(__uuidof(ILogonTrigger), (void**)&pLogonTrigger))) {
+                    wchar_t username[256];
+                    DWORD nameLen = 256;
+                    if (GetUserNameW(username, &nameLen)) {
+                        BSTR bstrUser = SysAllocString(username);
+                        pLogonTrigger->put_UserId(bstrUser);
+                        SysFreeString(bstrUser);
+                    }
+                    pLogonTrigger->Release();
+                }
                 pTrigger->Release();
+            }
             pTriggers->Release();
         }
 
@@ -507,7 +519,17 @@ void ShowTrayMenu(HWND hwnd) {
 // SECTION: Main Window Procedure
 // ============================================================================
 
+static UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Re-add tray icon when explorer restarts or finishes initializing
+    if (msg == WM_TASKBARCREATED) {
+        AddTrayIcon(hwnd);
+        if (g_gui.isRunning)
+            UpdateTrayIcon(g_shaderCorrectionsActive.load(std::memory_order_relaxed));
+        return 0;
+    }
+
     switch (msg) {
     case WM_CTLCOLORSTATIC: {
         // Set background color for static controls inside the tab
