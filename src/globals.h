@@ -98,9 +98,9 @@ extern std::atomic<bool> g_analysisOnlyMode;   // Lightweight analysis-only thre
 extern std::atomic<bool> g_hotkeyGammaEnabled;    // Enable Win+Shift+G hotkey
 extern std::atomic<bool> g_hotkeyHdrEnabled;      // Enable Win+Shift+H hotkey
 extern std::atomic<bool> g_hotkeyAnalysisEnabled; // Enable Win+Shift+X hotkey
-extern char g_hotkeyGammaKey;                     // Key for gamma toggle (default 'G')
-extern char g_hotkeyHdrKey;                       // Key for HDR toggle (default 'H')
-extern char g_hotkeyAnalysisKey;                  // Key for analysis toggle (default 'X')
+extern std::atomic<char> g_hotkeyGammaKey;        // Key for gamma toggle (default 'G')
+extern std::atomic<char> g_hotkeyHdrKey;          // Key for HDR toggle (default 'Z')
+extern std::atomic<char> g_hotkeyAnalysisKey;     // Key for analysis toggle (default 'X')
 extern std::atomic<bool> g_startMinimized;        // Start minimized to tray
 
 // ============================================================================

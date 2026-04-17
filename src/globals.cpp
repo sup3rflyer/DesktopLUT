@@ -90,9 +90,9 @@ std::atomic<bool> g_analysisOnlyMode{ false }; // Lightweight analysis-only thre
 std::atomic<bool> g_hotkeyGammaEnabled{ true };    // Enable Win+Shift+G hotkey
 std::atomic<bool> g_hotkeyHdrEnabled{ true };      // Enable Win+Shift+H hotkey
 std::atomic<bool> g_hotkeyAnalysisEnabled{ true }; // Enable Win+Shift+X hotkey
-char g_hotkeyGammaKey = 'G';                       // Key for gamma toggle
-char g_hotkeyHdrKey = 'Z';                         // Key for HDR toggle
-char g_hotkeyAnalysisKey = 'X';                    // Key for analysis toggle
+std::atomic<char> g_hotkeyGammaKey{ 'G' };         // Key for gamma toggle
+std::atomic<char> g_hotkeyHdrKey{ 'Z' };           // Key for HDR toggle
+std::atomic<char> g_hotkeyAnalysisKey{ 'X' };      // Key for analysis toggle
 std::atomic<bool> g_startMinimized{ false };       // Start minimized to tray
 
 // ============================================================================

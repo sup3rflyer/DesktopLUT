@@ -234,8 +234,8 @@ void InitializeStuff(ID3D11Device* inputDevice)
 					compile_error_interface), compile_error_interface)
 
 			LOG_ONLY_ONCE("Pixel shader compiled successfully")
-			device->CreatePixelShader(psBlob->GetBufferPointer(),
-			                          psBlob->GetBufferSize(), NULL, &pixelShader);
+			EXECUTE_WITH_LOG(device->CreatePixelShader(psBlob->GetBufferPointer(),
+			                                          psBlob->GetBufferSize(), NULL, &pixelShader))
 			psBlob->Release();
 		}
 		{
@@ -602,10 +602,18 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	D3D11_TEXTURE2D_DESC oldTextureDesc = textureDesc[index];
 	if (newBackBufferDesc.Width > oldTextureDesc.Width || newBackBufferDesc.Height > oldTextureDesc.Height)
 	{
+		// Release old and null the slots before recreating, so a throw from
+		// CreateTexture2D/CreateShaderResourceView leaves slots cleanly empty
+		// rather than dangling (next RenderLUT would Release() a freed pointer).
 		if (texture[index] != NULL)
 		{
 			texture[index]->Release();
+			texture[index] = NULL;
+		}
+		if (textureView[index] != NULL)
+		{
 			textureView[index]->Release();
+			textureView[index] = NULL;
 		}
 
 		UINT newWidth = max(newBackBufferDesc.Width, oldTextureDesc.Width);
@@ -712,6 +720,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			float pad1;
 			float pad2;
 		} cb;
+		static_assert(sizeof(cb) == 48, "Constant buffer size must match ByteWidth=48 in InitializeStuff");
 		cb.lutSize = lut ? lut->size : 0;
 		cb.colorMode = colorMode;
 		cb.ditherLevels = dLevels;
