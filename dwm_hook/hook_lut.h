@@ -22,8 +22,12 @@ unsigned int lut_index(unsigned int b, unsigned int g, unsigned int r, unsigned 
 // LUT state (extern — defined in hook_lut.cpp)
 extern int numLuts;
 extern lutData* luts;
+
+// Active-LUT target set: fixed-size array so Set/Unset/IsLUTActive can't race
+// via realloc if DWM ever calls Present-hooks on multiple threads concurrently.
+#define MAX_LUT_TARGETS 64
 extern int numLutTargets;
-extern void** lutTargets;
+extern void* lutTargets[MAX_LUT_TARGETS];
 
 // LUT management functions
 bool ParseLUT(lutData* lut, char* filename);

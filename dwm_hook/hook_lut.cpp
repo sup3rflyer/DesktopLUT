@@ -9,7 +9,7 @@ extern bool isWindows11_25h2;
 int numLuts = 0;
 lutData* luts = NULL;
 int numLutTargets = 0;
-void** lutTargets = NULL;
+void* lutTargets[MAX_LUT_TARGETS] = {};
 
 unsigned int lut_index(const unsigned int b, const unsigned int g, const unsigned int r, const unsigned int c,
                        const unsigned int lut_size)
@@ -145,7 +145,8 @@ bool AddLUTs(char* folder)
 
 bool IsLUTActive(void* target)
 {
-	for (int i = 0; i < numLutTargets; i++)
+	int n = numLutTargets;
+	for (int i = 0; i < n && i < MAX_LUT_TARGETS; i++)
 	{
 		if (lutTargets[i] == target)
 		{
@@ -157,32 +158,26 @@ bool IsLUTActive(void* target)
 
 void SetLUTActive(void* target)
 {
-	if (!IsLUTActive(target))
+	if (!IsLUTActive(target) && numLutTargets < MAX_LUT_TARGETS)
 	{
-		void** tmp = (void**)realloc(lutTargets, (size_t)(numLutTargets + 1) * sizeof(void*));
-		if (!tmp) return;
-		lutTargets = tmp;
 		lutTargets[numLutTargets++] = target;
 	}
 }
 
 void UnsetLUTActive(void* target)
 {
-	for (int i = 0; i < numLutTargets; i++)
+	int n = numLutTargets;
+	for (int i = 0; i < n && i < MAX_LUT_TARGETS; i++)
 	{
 		if (lutTargets[i] == target)
 		{
-			lutTargets[i] = lutTargets[--numLutTargets];
-			if (numLutTargets > 0)
-			{
-				void** tmp = (void**)realloc(lutTargets, (size_t)numLutTargets * sizeof(void*));
-				if (tmp) lutTargets = tmp;
+			// Swap with last, then shrink count. No realloc.
+			int last = numLutTargets - 1;
+			if (last >= 0 && last < MAX_LUT_TARGETS) {
+				lutTargets[i] = lutTargets[last];
+				lutTargets[last] = NULL;
 			}
-			else
-			{
-				free(lutTargets);
-				lutTargets = NULL;
-			}
+			numLutTargets--;
 			return;
 		}
 	}

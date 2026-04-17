@@ -489,17 +489,20 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(peakUAV)
 	RELEASE_IF_NOT_NULL(peakSRV)
 	RELEASE_IF_NOT_NULL(peakCB)
-	for (int i = 0; i < numLuts; i++)
-	{
-		free(luts[i].rawLut);
-		RELEASE_IF_NOT_NULL(luts[i].textureView)
-	}
-	free(luts);
-	free(lutTargets);
-	luts = NULL;
+	// Snapshot + clear first so a concurrent reader sees an empty list before we free.
+	int oldNumLuts = numLuts;
+	lutData* oldLuts = luts;
 	numLuts = 0;
-	lutTargets = NULL;
+	luts = NULL;
 	numLutTargets = 0;
+	for (int i = 0; i < MAX_LUT_TARGETS; i++) lutTargets[i] = NULL;
+
+	for (int i = 0; i < oldNumLuts; i++)
+	{
+		free(oldLuts[i].rawLut);
+		RELEASE_IF_NOT_NULL(oldLuts[i].textureView)
+	}
+	free(oldLuts);
 }
 
 
