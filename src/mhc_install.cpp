@@ -4,9 +4,12 @@
 #include "mhc.h"
 #include "globals.h"
 #include "displayconfig.h"
+#include "types.h"
 #include <iostream>
 #include <set>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 // ============================================================================
 // SECTION: MSCMS API Loading
@@ -335,6 +338,78 @@ void VerifyAndRestoreMhcProfiles() {
     }
 }
 
+bool TriggerCalibrationLoader() {
+    // schtasks /Run /TN "\Microsoft\Windows\WindowsColorSystem\Calibration Loader"
+    //
+    // The scheduled task reads every display's currently-associated default ICC
+    // profile and rewrites its MHC2 tag into the hardware LUT. Unlike our own
+    // remove+re-add kick this never disassociates, so the display never briefly
+    // drops to a fallback profile — no visible flicker.
+    //
+    // Returns true when schtasks.exe reports success (the task was started; it
+    // then runs asynchronously). If the task is disabled or deleted (DisplayCAL
+    // is the usual culprit), schtasks exits non-zero and the caller should fall
+    // back to ReapplyAllMhcProfiles().
+
+    const wchar_t* cmdline =
+        L"schtasks.exe /Run /TN \"\\Microsoft\\Windows\\WindowsColorSystem\\Calibration Loader\"";
+
+    // CreateProcessW requires a mutable buffer for lpCommandLine.
+    std::wstring mutableCmd(cmdline);
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    // CREATE_NO_WINDOW suppresses the console flash that schtasks normally
+    // produces. Pass explicit env = nullptr to inherit.
+    BOOL ok = CreateProcessW(
+        nullptr,
+        mutableCmd.data(),
+        nullptr, nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr, nullptr,
+        &si, &pi);
+
+    if (!ok) {
+        std::cerr << "MHC: CreateProcess(schtasks) failed, error=" << GetLastError() << std::endl;
+        return false;
+    }
+
+    // Wait briefly for schtasks.exe itself to exit (it returns as soon as the
+    // scheduled task is queued; the task runs asynchronously). 2s is plenty —
+    // schtasks normally exits in <100ms. Don't block longer; this runs from
+    // the GUI thread.
+    DWORD waitResult = WaitForSingleObject(pi.hProcess, 2000);
+    DWORD exitCode = STILL_ACTIVE;
+    if (waitResult == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+    } else {
+        // Timed out — abandon, still treat as not-started so caller can fall back.
+        std::cerr << "MHC: schtasks.exe timed out, falling back" << std::endl;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (waitResult != WAIT_OBJECT_0 || exitCode != 0) {
+        // Non-zero exit usually means the task is disabled or doesn't exist.
+        // Don't spam logs on every tick — one line is enough for diagnosis.
+        static bool loggedOnce = false;
+        if (!loggedOnce) {
+            std::cerr << "MHC: Calibration Loader task unavailable (schtasks exit "
+                      << exitCode << "), will use remove+re-add kick instead" << std::endl;
+            loggedOnce = true;
+        }
+        return false;
+    }
+
+    return true;
+}
+
 void ReapplyAllMhcProfiles() {
     if (!IsMHC2ApiAvailable()) return;
 
@@ -374,4 +449,179 @@ void ReapplyAllMhcProfiles() {
                        << L"' for monitor " << i << std::endl;
         }
     }
+}
+
+// ============================================================================
+// SECTION: ICM Registry Watcher
+// ============================================================================
+//
+// Calibration tools, GPU vendor control panels, and Windows' own Color
+// Management UI all end up writing to one of the ICM registry subtrees when
+// they manipulate color state. Watching those keys via RegNotifyChangeKeyValue
+// gives us a precise "something touched color management" signal without any
+// polling, catching cases where the compositor silently stops honoring our
+// MHC2 tag while the association itself stays intact.
+//
+// One background thread waits on a small array of notification events plus a
+// stop event; on wake it posts a WM_TIMER to the GUI window to trigger the
+// debounced kick (multiple writes in quick succession coalesce into one).
+//
+// Re-arming after every notification is required — RegNotifyChangeKeyValue is
+// one-shot per subscription.
+
+static std::thread g_icmWatcherThread;
+static std::atomic<HWND> g_icmWatcherHwnd{nullptr};
+static HANDLE g_icmWatcherStopEvent = nullptr;
+static std::atomic<bool> g_icmWatcherRunning{false};
+
+static void IcmWatcherThreadFunc() {
+    // Paths watched, in priority order. If any open fails (Windows SKU
+    // differences, missing subkey before first MHC profile ever installed),
+    // we silently skip that key — partial coverage is still useful.
+    struct WatchTarget {
+        HKEY root;
+        const wchar_t* subkey;
+    };
+    const WatchTarget targets[] = {
+        { HKEY_CURRENT_USER,
+          L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display" },
+        { HKEY_LOCAL_MACHINE,
+          L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display" },
+        { HKEY_CURRENT_USER,
+          L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\Display" },
+    };
+    const int kNumTargets = sizeof(targets) / sizeof(targets[0]);
+
+    HKEY   hKeys[kNumTargets]   = {};
+    HANDLE hEvents[kNumTargets] = {};
+    int numOpen = 0;
+
+    for (int i = 0; i < kNumTargets; i++) {
+        LONG r = RegOpenKeyExW(targets[i].root, targets[i].subkey, 0, KEY_NOTIFY, &hKeys[i]);
+        if (r != ERROR_SUCCESS) {
+            hKeys[i] = nullptr;
+            continue;
+        }
+        hEvents[i] = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!hEvents[i]) {
+            RegCloseKey(hKeys[i]);
+            hKeys[i] = nullptr;
+            continue;
+        }
+        // Arm the initial watch for this key.
+        r = RegNotifyChangeKeyValue(
+            hKeys[i], TRUE,
+            REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_ATTRIBUTES,
+            hEvents[i], TRUE);
+        if (r != ERROR_SUCCESS) {
+            CloseHandle(hEvents[i]);
+            hEvents[i] = nullptr;
+            RegCloseKey(hKeys[i]);
+            hKeys[i] = nullptr;
+            continue;
+        }
+        numOpen++;
+    }
+
+    if (numOpen == 0) {
+        std::cerr << "[MHC] ICM registry watcher: no keys opened — giving up" << std::endl;
+        return;
+    }
+
+    // Build the wait array: stop event first, then each notification event.
+    HANDLE waitHandles[kNumTargets + 1];
+    waitHandles[0] = g_icmWatcherStopEvent;
+    int waitCount = 1;
+    int eventToTarget[kNumTargets];
+    for (int i = 0; i < kNumTargets; i++) {
+        if (hEvents[i]) {
+            waitHandles[waitCount] = hEvents[i];
+            eventToTarget[waitCount - 1] = i;
+            waitCount++;
+        }
+    }
+
+    std::cout << "[MHC] ICM registry watcher active on " << numOpen << " key(s)" << std::endl;
+
+    while (g_icmWatcherRunning.load()) {
+        DWORD wr = WaitForMultipleObjects(waitCount, waitHandles, FALSE, INFINITE);
+        if (wr == WAIT_OBJECT_0) {
+            break;  // Stop event signaled
+        }
+        if (wr >= WAIT_OBJECT_0 + 1 && wr < WAIT_OBJECT_0 + (DWORD)waitCount) {
+            int idx = eventToTarget[wr - WAIT_OBJECT_0 - 1];
+
+            // Debounced kick request: SetTimer with the same ID on each
+            // registry write restarts the countdown, so a burst of writes
+            // collapses into a single kick when the dust settles. SetTimer
+            // is thread-safe across threads owning the same window handle.
+            HWND hwnd = g_icmWatcherHwnd.load();
+            if (hwnd) {
+                SetTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID,
+                         MHC_REGISTRY_KICK_DEBOUNCE_MS, nullptr);
+            }
+
+            // Re-arm this key's notification (RegNotifyChangeKeyValue is one-shot)
+            ResetEvent(hEvents[idx]);
+            LONG r = RegNotifyChangeKeyValue(
+                hKeys[idx], TRUE,
+                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_ATTRIBUTES,
+                hEvents[idx], TRUE);
+            if (r != ERROR_SUCCESS) {
+                std::cerr << "[MHC] Re-arm failed on key " << idx
+                          << " error=" << r << std::endl;
+                // Drop this key from the wait list to avoid a hot loop.
+                CloseHandle(hEvents[idx]);
+                hEvents[idx] = nullptr;
+                RegCloseKey(hKeys[idx]);
+                hKeys[idx] = nullptr;
+                // Rebuild wait list without this entry.
+                waitCount = 1;
+                for (int i = 0; i < kNumTargets; i++) {
+                    if (hEvents[i]) {
+                        waitHandles[waitCount] = hEvents[i];
+                        eventToTarget[waitCount - 1] = i;
+                        waitCount++;
+                    }
+                }
+                if (waitCount == 1) break;  // Nothing left to watch
+            }
+        } else {
+            // Wait failed unexpectedly — exit rather than spin.
+            break;
+        }
+    }
+
+    for (int i = 0; i < kNumTargets; i++) {
+        if (hEvents[i]) CloseHandle(hEvents[i]);
+        if (hKeys[i])   RegCloseKey(hKeys[i]);
+    }
+    std::cout << "[MHC] ICM registry watcher stopped" << std::endl;
+}
+
+void StartIcmRegistryWatcher(HWND hwnd) {
+    if (g_icmWatcherRunning.load()) return;  // Already running — idempotent
+
+    g_icmWatcherStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_icmWatcherStopEvent) {
+        std::cerr << "[MHC] Failed to create ICM watcher stop event" << std::endl;
+        return;
+    }
+
+    g_icmWatcherHwnd.store(hwnd);
+    g_icmWatcherRunning.store(true);
+    g_icmWatcherThread = std::thread(IcmWatcherThreadFunc);
+}
+
+void StopIcmRegistryWatcher() {
+    if (!g_icmWatcherRunning.load()) return;
+
+    g_icmWatcherRunning.store(false);
+    if (g_icmWatcherStopEvent) SetEvent(g_icmWatcherStopEvent);
+    if (g_icmWatcherThread.joinable()) g_icmWatcherThread.join();
+    if (g_icmWatcherStopEvent) {
+        CloseHandle(g_icmWatcherStopEvent);
+        g_icmWatcherStopEvent = nullptr;
+    }
+    g_icmWatcherHwnd.store(nullptr);
 }

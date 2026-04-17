@@ -1598,6 +1598,42 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             VerifyAndRestoreMhcProfiles();
             return 0;
         }
+        if (wParam == MHC_BLIND_KICK_TIMER_ID) {
+            // Periodic hardware-LUT reload. Associations may still be correct
+            // while the hardware LUT has silently drifted (GPU panel apps,
+            // driver resets, etc. — not detectable via QueryDisplayDefault).
+            // Triggering Windows' Calibration Loader task rewrites every
+            // default profile's MHC2 into hardware without disassociating, so
+            // no fallback-flicker. Falls back to remove+re-add kick if the
+            // task is disabled (e.g., DisplayCAL installed).
+            bool anyMhcActive = false;
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                for (const auto& ms : g_gui.monitorSettings) {
+                    if ((ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) ||
+                        (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty())) {
+                        anyMhcActive = true; break;
+                    }
+                }
+            }
+            if (anyMhcActive) {
+                if (!TriggerCalibrationLoader()) {
+                    ReapplyAllMhcProfiles();
+                }
+            }
+            return 0;
+        }
+        if (wParam == MHC_REGISTRY_KICK_TIMER_ID) {
+            // Registry watcher saw an ICM key change. Wait-then-kick pattern:
+            // the writer may still be mid-update, so debouncing prevents
+            // racing it, and coalesces bursts of writes into one kick.
+            KillTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID);
+            std::cout << "[MHC] Registry change → kicking calibration" << std::endl;
+            if (!TriggerCalibrationLoader()) {
+                ReapplyAllMhcProfiles();
+            }
+            return 0;
+        }
         break;  // Let other timers pass through to DefWindowProc
 
     case WM_DISPLAYCHANGE: {
@@ -1789,6 +1825,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Unregister session change notifications
         WTSUnRegisterSessionNotification(hwnd);
         KillTimer(hwnd, MHC_VERIFY_TIMER_ID);
+        KillTimer(hwnd, MHC_BLIND_KICK_TIMER_ID);
+        KillTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID);
+        StopIcmRegistryWatcher();
         // Unregister GUI-side display power notification
         if (g_guiDisplayPowerNotify) {
             UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);

@@ -945,4 +945,15 @@ void CreateGUILayout(HWND hwnd) {
     // fires even when no processing thread is active — MHC-only users are also
     // covered. Timer fires every MHC_VERIFY_INTERVAL_MS.
     SetTimer(hwnd, MHC_VERIFY_TIMER_ID, MHC_VERIFY_INTERVAL_MS, nullptr);
+
+    // Periodic hardware-LUT reload: catches silent drops that verify can't see
+    // (the profile stays associated but the compositor/driver stopped honoring
+    // the MHC2 tag). Uses Windows' own Calibration Loader scheduled task, so
+    // no flicker through a fallback profile.
+    SetTimer(hwnd, MHC_BLIND_KICK_TIMER_ID, MHC_BLIND_KICK_INTERVAL_MS, nullptr);
+
+    // Launch the registry watcher that detects third-party writes to the ICM
+    // keys (calibration tools, GPU control panels, colorcpl) and fires a kick
+    // on demand. Started here so it's tied to GUI window lifetime.
+    StartIcmRegistryWatcher(hwnd);
 }

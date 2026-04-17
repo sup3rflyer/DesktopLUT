@@ -192,3 +192,22 @@ void ReapplyAllMhcProfiles();
 // the Color Management control panel, driver resets, and ImmersiveColorSet
 // changes that don't fire WM_DISPLAYCHANGE.
 void VerifyAndRestoreMhcProfiles();
+
+// Ask Windows to reload calibrations for all associated displays using its own
+// scheduled task (\Microsoft\Windows\WindowsColorSystem\Calibration Loader).
+// This is the same mechanism Windows uses at logon and "Reload current
+// calibrations" in colorcpl — it rewrites the hardware LUT from each default
+// profile's MHC2 tag without disassociating anything, so no flicker through a
+// fallback profile. Returns true if schtasks successfully started the task.
+// Caller should fall back to ReapplyAllMhcProfiles() if this returns false
+// (task disabled by DisplayCAL etc.).
+bool TriggerCalibrationLoader();
+
+// Start a background thread that watches the Windows Color Management registry
+// keys via RegNotifyChangeKeyValue. On any write (calibration tools, GPU
+// panels, colorcpl, other LUT loaders) it posts WM_TIMER for a debounced kick
+// on the given hwnd. Idempotent — safe to call once at GUI startup.
+void StartIcmRegistryWatcher(HWND hwnd);
+
+// Stop the watcher and wait for its thread to exit. Call before DestroyWindow.
+void StopIcmRegistryWatcher();
