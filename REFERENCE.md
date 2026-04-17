@@ -121,6 +121,31 @@ When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injec
 
 **Repair**: Windows updates can break DWM internals (AOB patterns, struct offsets). See `DWM_HOOK_REPAIR.md` for diagnosis and repair procedures.
 
+**Transient monitor-state hardening**: DWM can temporarily hide a monitor's DXGI output when a fullscreen video takes over, or briefly report HDR=false during color re-brokering. Without protection, this corrupts context→monitor routing mid-frame and can crash DWM. Mitigations:
+- Hook side (`UpdateLocalTonemapFromShared` in `dwm_hook/dllmain.cpp`): require 3 consecutive observations of a monitor-count shrink or same-position HDR-flag flip before accepting. Benign growth and tonemap-param tweaks apply immediately. Context position cache invalidated on topology changes.
+- Host side (`EnumerateDxgiMonitors` in `src/dwm_inject.cpp`): retry DXGI enumeration up to 2× with 50 ms spacing if the fresh result shrank vs the last known-good count.
+- `RenderLUT` (in `dwm_hook/hook_render.cpp`): for FP16 backbuffers, pick `colorMode` based on which LUT is staged for the position (HDR LUT → 1, SDR LUT → 2) before falling back to `IsMonitorHdr`. Keeps the right pipeline live even if monitor state is briefly wrong.
+
+## MHC Profile Self-Healing
+
+Windows can silently drop MHC calibration without unassociating the profile. Two failure modes, both covered:
+
+**Mode A — Association dropped** (Windows no longer reports our profile as default). Causes: Color Management control panel opened, calibration tool ran, driver reset, `WcsSetCalibrationManagementState` toggled. Detection: `QueryDisplayDefaultProfile` returns something other than our expected name.
+
+**Mode B — Association intact, hardware LUT reverted** (the MHC2 tag stops being honored by the compositor/driver while Windows still reports our profile as default; visible symptom is white balance / grayscale snapping back to uncalibrated). Causes: GPU vendor control panels writing their own gamma state, driver-internal resets, `ImmersiveColorSet` refresh, fullscreen game exit, sleep/wake edge cases. No API detects this state.
+
+**Defensive infrastructure** (all active whenever the host is running, independent of whether the processing thread is alive):
+
+| Mechanism | Interval / Trigger | Handles |
+|---|---|---|
+| `VerifyAndRestoreMhcProfiles` | Every 15 s (GUI-thread timer) | Mode A — re-associates any profile that lost its default status, after verifying the `.icm` file still exists |
+| `TriggerCalibrationLoader` | Every 5 min blind kick, plus event handlers | Mode B — runs Windows' own `\Microsoft\Windows\WindowsColorSystem\Calibration Loader` scheduled task via `schtasks /Run`, which rewrites MHC2 into hardware without disassociating (no fallback-profile flicker) |
+| ICM registry watcher thread | `RegNotifyChangeKeyValue` on HKCU+HKLM `ICM\ProfileAssociations\Display` and HKCU `ICM\Display`, 500 ms debounce | Mode B — catches third-party writes from calibration tools, colorcpl, GPU vendor panels |
+| `ReapplyAllMhcProfiles` fallback | On demand, if `TriggerCalibrationLoader` fails | Mode B — remove+re-add kick when DisplayCAL's installer (or similar) has disabled the Calibration Loader task |
+| Event-driven reapply | WM_DISPLAYCHANGE, WM_WTSSESSION_CHANGE unlock, WM_SETTINGCHANGE ImmersiveColorSet, WM_POWERBROADCAST wake | Mode A + Mode B proactively on known triggers |
+
+The Calibration Loader is preferred over remove+re-add because it never disassociates — the display never briefly falls back to sRGB IEC or another profile, so there's no visible flicker.
+
 ## HDR Color Pipeline (ICtCp-based)
 
 HDR processing uses the Dolby ICtCp color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.

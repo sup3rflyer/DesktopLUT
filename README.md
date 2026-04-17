@@ -11,7 +11,7 @@ DesktopLUT applies color corrections to the entire Windows desktop in real time 
 DesktopLUT uses the following layers, which can be enabled individually or together:
 
 1. **MHC (GPU-level)**
-   Installs color corrections directly at the graphics card driver level via ICC profiles. Handles primaries mapping, white balance, grayscale correction, and desktop gamma. This layer remains active even when DesktopLUT is not running.
+   Installs color corrections directly at the graphics card driver level via ICC profiles. Handles primaries mapping, white balance, grayscale correction, and desktop gamma. This layer remains active even when DesktopLUT is not running. While running, DesktopLUT also watches for Windows silently dropping the calibration (a known issue with calibration tools, GPU control panels, sleep/wake, etc.) and re-applies it automatically.
 
 2. **3D LUT + Tonemapping (DWM hook)**
    Applies a volumetric color correction using a loaded .cube file, plus ICtCp HDR tone mapping with dynamic peak detection. Injected directly into DWM — no overlay needed. Falls back to overlay if DWM hook is disabled.
