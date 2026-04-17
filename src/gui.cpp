@@ -424,6 +424,13 @@ void SetStartupEnabled(bool enable) {
                         pLogonTrigger->put_UserId(bstrUser);
                         SysFreeString(bstrUser);
                     }
+                    // Delay 15s after logon so secondary drives are mounted and the
+                    // window-station/desktop subsystem is fully initialized — without
+                    // this, CreateWindowEx can fail at very-early logon and the
+                    // process exits with code 1 before any UI appears.
+                    BSTR bstrDelay = SysAllocString(L"PT15S");
+                    pLogonTrigger->put_Delay(bstrDelay);
+                    SysFreeString(bstrDelay);
                     pLogonTrigger->Release();
                 }
                 pTrigger->Release();
