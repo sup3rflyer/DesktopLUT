@@ -259,14 +259,11 @@ struct DxgiMonInfo { int left, top, w, h, bpc; bool hdr; };
 static std::vector<DxgiMonInfo> g_cachedDxgiMons;
 static bool g_dxgiCacheValid = false;
 
-// Enumerate all DXGI monitors (creates fresh factory). Returns cached data if valid.
-static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh = false)
+// One-shot DXGI enumeration — creates a fresh factory and walks adapters+outputs.
+// Separated from EnumerateDxgiMonitors so the caching layer can retry on transients.
+static std::vector<DxgiMonInfo> DoDxgiEnumerateOnce()
 {
-    if (g_dxgiCacheValid && !forceRefresh)
-        return g_cachedDxgiMons;
-
-    g_cachedDxgiMons.clear();
-
+    std::vector<DxgiMonInfo> result;
     IDXGIFactory1* factory = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
         IDXGIAdapter1* adapter = nullptr;
@@ -284,7 +281,7 @@ static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh =
                         mi.h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
                         mi.bpc = static_cast<int>(desc1.BitsPerColor);
                         mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-                        g_cachedDxgiMons.push_back(mi);
+                        result.push_back(mi);
                     }
                     output6->Release();
                 }
@@ -296,7 +293,37 @@ static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh =
         }
         factory->Release();
     }
+    return result;
+}
 
+// Enumerate all DXGI monitors (creates fresh factory). Returns cached data if valid.
+//
+// Defensive retry: if a fresh enumeration reports fewer monitors than the last
+// known-good snapshot, retry briefly before committing. Fullscreen video can
+// transiently hide a monitor's output from DXGI (e.g., exclusive presentation,
+// HDR mid-transition re-brokering). Retrying rides out sub-100ms glitches.
+// If the shrink is genuine (monitor unplugged), retries will all agree and we
+// commit the smaller set; the hook side has its own debounce as well.
+static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh = false)
+{
+    if (g_dxgiCacheValid && !forceRefresh)
+        return g_cachedDxgiMons;
+
+    const size_t lastKnownGood = g_cachedDxgiMons.size();
+    std::vector<DxgiMonInfo> fresh = DoDxgiEnumerateOnce();
+
+    if (lastKnownGood > 0 && fresh.size() < lastKnownGood) {
+        for (int retry = 0; retry < 2 && fresh.size() < lastKnownGood; retry++) {
+            Sleep(50);
+            fresh = DoDxgiEnumerateOnce();
+        }
+        if (fresh.size() < lastKnownGood) {
+            std::wcerr << L"[DWM Hook] DXGI enumeration shrank " << lastKnownGood
+                       << L" -> " << fresh.size() << L" after retries, accepting" << std::endl;
+        }
+    }
+
+    g_cachedDxgiMons = std::move(fresh);
     g_dxgiCacheValid = true;
     return g_cachedDxgiMons;
 }

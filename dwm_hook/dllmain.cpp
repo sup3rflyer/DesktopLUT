@@ -317,6 +317,14 @@ bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 }
 
 
+// Suspicious-change debounce: require N consecutive identical observations of a
+// monitor-set shrink or HDR-flag flip before accepting, to ride out transient DXGI
+// hiccups (e.g., fullscreen video temporarily hiding a monitor, or HDR mid-transition
+// misreporting a monitor's color space). Benign changes (topology growth, tonemap
+// param tweaks) apply immediately.
+static int g_suspiciousChangeCount = 0;
+#define SUSPICIOUS_CHANGE_DEBOUNCE 3
+
 static void UpdateLocalTonemapFromShared() {
 	if (!g_sharedConfig) return;
 
@@ -342,43 +350,110 @@ static void UpdateLocalTonemapFromShared() {
 	// Clamp numMonitors to prevent OOB from shared memory
 	uint32_t numMons = (local.numMonitors < MAX_DWM_HOOK_MONITORS) ? local.numMonitors : MAX_DWM_HOOK_MONITORS;
 
-	// Update monitor HDR states from shared memory
-	g_numMonitorHdrStates = 0;
-	for (uint32_t i = 0; i < numMons && g_numMonitorHdrStates < 16; i++) {
-		auto& mc = local.monitors[i];
-		auto& ms = g_monitorHdrStates[g_numMonitorHdrStates];
-		ms.left = mc.left;
-		ms.top = mc.top;
-		ms.width = mc.width;
-		ms.height = mc.height;
-		ms.bpc = mc.bpc;
-		ms.isHdr = (mc.isHdr != 0);
-		g_numMonitorHdrStates++;
+	// Classify this update as suspicious if:
+	//  (a) monitor count shrank, or
+	//  (b) a monitor at a position present in both old and new state flipped HDR flag.
+	// Suspicious updates are held for SUSPICIOUS_CHANGE_DEBOUNCE consecutive updates
+	// before the new monitor state is applied. Tonemap params still update immediately.
+	bool suspicious = false;
+	if (g_numMonitorHdrStates > 0) {
+		if ((int)numMons < g_numMonitorHdrStates) {
+			suspicious = true;
+		} else {
+			for (uint32_t i = 0; i < numMons; i++) {
+				for (int j = 0; j < g_numMonitorHdrStates; j++) {
+					if ((int)local.monitors[i].left == g_monitorHdrStates[j].left &&
+					    (int)local.monitors[i].top == g_monitorHdrStates[j].top) {
+						bool newHdr = (local.monitors[i].isHdr != 0);
+						if (newHdr != g_monitorHdrStates[j].isHdr) { suspicious = true; }
+						break;
+					}
+				}
+				if (suspicious) break;
+			}
+		}
 	}
 
-	// Update local tonemap params
-	g_numLocalTonemap = 0;
-	for (uint32_t i = 0; i < numMons && g_numLocalTonemap < MAX_DWM_HOOK_MONITORS; i++) {
-		auto& mc = local.monitors[i];
-		auto& tp = g_localTonemap[g_numLocalTonemap];
-		bool prevDynamic = tp.dynamicPeak;
-		tp.left = mc.left;
-		tp.top = mc.top;
-		tp.enabled = (mc.tonemapEnabled != 0);
-		tp.curve = mc.tonemapCurve;
-		tp.sourcePeakNits = mc.sourcePeakNits;
-		tp.targetPeakNits = mc.targetPeakNits;
-		tp.dynamicPeak = (mc.dynamicPeak != 0);
-		tp.pqSourcePeak = LinearToPQ(mc.sourcePeakNits / 10000.0f);
-		tp.pqTargetPeak = LinearToPQ(mc.targetPeakNits / 10000.0f);
-		if (tp.dynamicPeak != prevDynamic) {
-			char msg[128];
-			snprintf(msg, sizeof(msg), "Tonemap update: mon(%d,%d) dynamic=%d src=%.0f tgt=%.0f pqSrc=%.4f pqTgt=%.4f",
-				tp.left, tp.top, tp.dynamicPeak ? 1 : 0,
-				tp.sourcePeakNits, tp.targetPeakNits, tp.pqSourcePeak, tp.pqTargetPeak);
-			log_to_file(msg);
+	bool applyMonitorState = true;
+	if (suspicious) {
+		g_suspiciousChangeCount++;
+		if (g_suspiciousChangeCount < SUSPICIOUS_CHANGE_DEBOUNCE) {
+			applyMonitorState = false;
 		}
-		g_numLocalTonemap++;
+		if (g_suspiciousChangeCount == 1) {
+			char msg[160];
+			snprintf(msg, sizeof(msg),
+				"Monitor state change looks suspicious (count %d->%u) — debouncing",
+				g_numMonitorHdrStates, numMons);
+			log_to_file(msg);
+		} else if (g_suspiciousChangeCount == SUSPICIOUS_CHANGE_DEBOUNCE) {
+			log_to_file("Monitor state change persisted — accepting after debounce");
+		}
+	} else {
+		if (g_suspiciousChangeCount > 0) {
+			log_to_file("Monitor state change canceled (state recovered)");
+		}
+		g_suspiciousChangeCount = 0;
+	}
+
+	// Update monitor HDR states from shared memory (gated on debounce result).
+	// Also invalidate context position cache if topology actually changed, so stale
+	// ctx→monitor mappings don't route rendering to the wrong pipeline.
+	if (applyMonitorState) {
+		bool topologyChanged = ((int)numMons != g_numMonitorHdrStates);
+		if (!topologyChanged) {
+			for (uint32_t i = 0; i < numMons; i++) {
+				if ((int)local.monitors[i].left != g_monitorHdrStates[i].left ||
+				    (int)local.monitors[i].top != g_monitorHdrStates[i].top) {
+					topologyChanged = true; break;
+				}
+			}
+		}
+
+		g_numMonitorHdrStates = 0;
+		for (uint32_t i = 0; i < numMons && g_numMonitorHdrStates < 16; i++) {
+			auto& mc = local.monitors[i];
+			auto& ms = g_monitorHdrStates[g_numMonitorHdrStates];
+			ms.left = mc.left;
+			ms.top = mc.top;
+			ms.width = mc.width;
+			ms.height = mc.height;
+			ms.bpc = mc.bpc;
+			ms.isHdr = (mc.isHdr != 0);
+			g_numMonitorHdrStates++;
+		}
+
+		if (topologyChanged) {
+			g_numContextPosCache = 0;
+		}
+	}
+
+	// Update local tonemap params — tied to monitor state so we also gate on debounce,
+	// otherwise a shrunken-but-held monitor would lose its tonemap entry mid-Present.
+	if (applyMonitorState) {
+		g_numLocalTonemap = 0;
+		for (uint32_t i = 0; i < numMons && g_numLocalTonemap < MAX_DWM_HOOK_MONITORS; i++) {
+			auto& mc = local.monitors[i];
+			auto& tp = g_localTonemap[g_numLocalTonemap];
+			bool prevDynamic = tp.dynamicPeak;
+			tp.left = mc.left;
+			tp.top = mc.top;
+			tp.enabled = (mc.tonemapEnabled != 0);
+			tp.curve = mc.tonemapCurve;
+			tp.sourcePeakNits = mc.sourcePeakNits;
+			tp.targetPeakNits = mc.targetPeakNits;
+			tp.dynamicPeak = (mc.dynamicPeak != 0);
+			tp.pqSourcePeak = LinearToPQ(mc.sourcePeakNits / 10000.0f);
+			tp.pqTargetPeak = LinearToPQ(mc.targetPeakNits / 10000.0f);
+			if (tp.dynamicPeak != prevDynamic) {
+				char msg[128];
+				snprintf(msg, sizeof(msg), "Tonemap update: mon(%d,%d) dynamic=%d src=%.0f tgt=%.0f pqSrc=%.4f pqTgt=%.4f",
+					tp.left, tp.top, tp.dynamicPeak ? 1 : 0,
+					tp.sourcePeakNits, tp.targetPeakNits, tp.pqSourcePeak, tp.pqTargetPeak);
+				log_to_file(msg);
+			}
+			g_numLocalTonemap++;
+		}
 	}
 
 	if (local.lutReloadFlag) {

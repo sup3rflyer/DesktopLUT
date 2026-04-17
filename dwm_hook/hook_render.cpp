@@ -523,19 +523,33 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	}
 	else if (newBackBufferDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
 	{
-		// FP16 could be HDR or ACM SDR — check DXGI output state
+		// FP16 could be HDR or ACM SDR. Preferred signal: HDR LUT staged for this
+		// position means the user configured HDR for this monitor, so route through
+		// the HDR pipeline regardless of IsMonitorHdr (which depends on monitor state
+		// that can be transiently wrong during display re-brokering or fullscreen
+		// video events). Fall back to IsMonitorHdr only when no LUT hint exists.
 		int monLeft = 0, monTop = 0;
 		GetMonitorPositionFromContext(cOverlayContext, monLeft, monTop);
 
-		bool monitorIsHdr = IsMonitorHdr(monLeft, monTop);
-		if (monitorIsHdr) {
-			index = 1;
-			colorMode = 1;  // HDR
-		} else {
-			index = 1;       // ACM SDR is also FP16 — must use FP16 staging texture (not index=0 which is B8G8R8A8)
-			colorMode = 2;   // ACM SDR (FP16 linear, SDR LUT)
+		bool hdrLutAtPos = false;
+		bool sdrLutAtPos = false;
+		for (int k = 0; k < numLuts; k++) {
+			if (luts[k].left == monLeft && luts[k].top == monTop) {
+				if (luts[k].isHdr) hdrLutAtPos = true;
+				else sdrLutAtPos = true;
+			}
 		}
 
+		index = 1;  // FP16 staging texture either way
+		if (hdrLutAtPos) {
+			colorMode = 1;  // HDR (LUT evidence)
+		} else if (sdrLutAtPos) {
+			colorMode = 2;  // ACM SDR (LUT evidence)
+		} else if (IsMonitorHdr(monLeft, monTop)) {
+			colorMode = 1;  // HDR (monitor state fallback)
+		} else {
+			colorMode = 2;  // ACM SDR (monitor state fallback)
+		}
 	}
 
 	// Log per-context info for diagnostics (track up to 8 unique contexts)
