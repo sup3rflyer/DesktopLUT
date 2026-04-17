@@ -293,6 +293,22 @@ void VerifyAndRestoreMhcProfiles() {
                 displayInfo.adapterId, displayInfo.sourceId, isHDR);
             if (current == expected) return;  // Already correct — nothing to do.
 
+            // Before trying to re-associate, confirm the profile file actually
+            // exists in the system color directory. If not, Windows' own cleanup
+            // (or a user uninstall / disk cleanup) removed the .icm file, and
+            // any re-associate will fail silently. Log and skip — the GUI
+            // Enable-toggle path (RegenerateMhcIfActive) is the correct remedy.
+            wchar_t sysDir[MAX_PATH];
+            GetSystemDirectory(sysDir, MAX_PATH);
+            std::wstring profilePath = std::wstring(sysDir)
+                + L"\\spool\\drivers\\color\\" + expected;
+            if (GetFileAttributesW(profilePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                std::wcerr << L"MHC verify: profile file missing: " << profilePath
+                           << L" — skipping restore (re-enable in GUI to regenerate)"
+                           << std::endl;
+                return;
+            }
+
             // Windows forgot our profile. Force re-broker: remove association,
             // then re-add with setAsDefault=TRUE. This mirrors the mode-switch
             // recovery path, which has been proven to kick Windows' color
