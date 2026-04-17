@@ -185,3 +185,10 @@ void CleanupOrphanedMhcProfiles();
 // Re-associate all enabled MHC profiles across all monitors (remove + re-add)
 // Ensures profiles are actively applied after sleep/wake, TDR, or app restart
 void ReapplyAllMhcProfiles();
+
+// Verify each enabled profile is still Windows' default; restore any that
+// silently dropped. Safe to call from the GUI thread on a timer — independent
+// of the processing thread. Catches profile loss caused by calibration tools,
+// the Color Management control panel, driver resets, and ImmersiveColorSet
+// changes that don't fire WM_DISPLAYCHANGE.
+void VerifyAndRestoreMhcProfiles();

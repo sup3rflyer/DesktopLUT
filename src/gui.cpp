@@ -1519,7 +1519,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::cout << "[GUI] Settings change debounce fired, forcing reinit..." << std::endl;
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
+                g_forceMhcReapply.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            } else {
+                // ImmersiveColorSet covers HDR toggle and other color-pipeline
+                // state changes — always re-assert MHC.
+                VerifyAndRestoreMhcProfiles();
             }
             return 0;
         }
@@ -1584,6 +1589,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Hook is healthy — reset retry counter
                 g_dwmHookWatchdogRetries = 0;
             }
+            return 0;
+        }
+        if (wParam == MHC_VERIFY_TIMER_ID) {
+            // Periodic re-assertion: if any enabled MHC profile is no longer
+            // the OS default for its monitor, put it back. Runs independently
+            // of the processing thread so MHC-only users are also protected.
+            VerifyAndRestoreMhcProfiles();
             return 0;
         }
         break;  // Let other timers pass through to DefWindowProc
@@ -1661,6 +1673,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Processing exited (e.g., monitors were off during init) — restart now
                 std::cout << "[GUI] Display change with active settings, restarting processing..." << std::endl;
                 StartProcessing();
+            } else {
+                // MHC-only configuration (no processing thread): verify profiles
+                // directly since g_forceMhcReapply is only read by the render loop.
+                VerifyAndRestoreMhcProfiles();
             }
         }
         return 0;
@@ -1676,6 +1692,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_forceReinit.store(true);
                 g_forceMhcReapply.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            } else {
+                // Windows often resets MHC associations across a lock/unlock cycle.
+                VerifyAndRestoreMhcProfiles();
             }
             break;
         case WTS_SESSION_LOCK:
@@ -1710,6 +1729,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
                 g_forceMhcReapply.store(true);
+            } else {
+                VerifyAndRestoreMhcProfiles();
             }
         }
         // Handle display power state changes — GUI-side handler fires immediately on the
@@ -1738,6 +1759,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         // Restart it automatically since the user had it running before.
                         std::cout << "[GUI] Processing was interrupted during display-off, restarting..." << std::endl;
                         StartProcessing();
+                    } else {
+                        // MHC-only setup: verify profiles on display wake too.
+                        VerifyAndRestoreMhcProfiles();
                     }
                 }
             }
@@ -1764,6 +1788,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         RemoveTrayIcon();
         // Unregister session change notifications
         WTSUnRegisterSessionNotification(hwnd);
+        KillTimer(hwnd, MHC_VERIFY_TIMER_ID);
         // Unregister GUI-side display power notification
         if (g_guiDisplayPowerNotify) {
             UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);

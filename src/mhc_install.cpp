@@ -253,6 +253,72 @@ void CleanupOrphanedMhcProfiles() {
     }
 }
 
+// Verify that the OS currently reports our expected profile as the default for
+// each monitor / mode. If Windows silently dropped the association (user opened
+// the Color Management panel, driver reset, calibration tool interfered, etc.),
+// remove + re-add to force Windows to re-broker and set it as default again.
+//
+// Safe to call periodically from the GUI thread regardless of whether the
+// processing thread is running — operates purely through Windows Color Management
+// APIs and takes the monitorSettings snapshot under lock.
+void VerifyAndRestoreMhcProfiles() {
+    if (!IsMHC2ApiAvailable()) return;
+
+    struct MhcSnapshot {
+        bool sdrEnabled;  std::wstring sdrName;
+        bool hdrEnabled;  std::wstring hdrName;
+    };
+    std::vector<MhcSnapshot> snapshots;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        snapshots.reserve(g_gui.monitorSettings.size());
+        for (const auto& ms : g_gui.monitorSettings) {
+            snapshots.push_back({
+                ms.sdrMHC.enabled, ms.sdrMHC.profileName,
+                ms.hdrMHC.enabled, ms.hdrMHC.profileName
+            });
+        }
+    }
+
+    int restored = 0;
+    for (int i = 0; i < (int)snapshots.size(); i++) {
+        const auto& snap = snapshots[i];
+
+        DisplayInfo displayInfo;
+        if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
+
+        auto verifyOne = [&](bool isHDR, const std::wstring& expected) {
+            if (expected.empty()) return;
+            std::wstring current = QueryDisplayDefaultProfile(
+                displayInfo.adapterId, displayInfo.sourceId, isHDR);
+            if (current == expected) return;  // Already correct — nothing to do.
+
+            // Windows forgot our profile. Force re-broker: remove association,
+            // then re-add with setAsDefault=TRUE. This mirrors the mode-switch
+            // recovery path, which has been proven to kick Windows' color
+            // pipeline into picking up the profile again.
+            std::wcout << L"MHC verify: monitor " << i
+                       << (isHDR ? L" HDR" : L" SDR")
+                       << L" default is '" << (current.empty() ? L"(none)" : current.c_str())
+                       << L"', expected '" << expected << L"' — restoring"
+                       << std::endl;
+
+            RemoveMHC2Profile(expected, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+            if (ReassociateMHC2Profile(expected, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+                restored++;
+            }
+        };
+
+        if (snap.sdrEnabled) verifyOne(false, snap.sdrName);
+        if (snap.hdrEnabled) verifyOne(true,  snap.hdrName);
+    }
+
+    if (restored > 0) {
+        std::cout << "MHC verify: restored " << restored << " profile association(s)"
+                  << std::endl;
+    }
+}
+
 void ReapplyAllMhcProfiles() {
     if (!IsMHC2ApiAvailable()) return;
 

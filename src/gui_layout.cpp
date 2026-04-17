@@ -938,4 +938,11 @@ void CreateGUILayout(HWND hwnd) {
 
     // Register for session change notifications (lock/unlock/RDP connect/disconnect)
     WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+
+    // Kick off the periodic MHC profile verification. Windows can silently drop
+    // our ICC profile association (calibration tools, Color Management panel,
+    // driver resets, Auto-HDR re-brokering). Running on the GUI thread means it
+    // fires even when no processing thread is active — MHC-only users are also
+    // covered. Timer fires every MHC_VERIFY_INTERVAL_MS.
+    SetTimer(hwnd, MHC_VERIFY_TIMER_ID, MHC_VERIFY_INTERVAL_MS, nullptr);
 }
