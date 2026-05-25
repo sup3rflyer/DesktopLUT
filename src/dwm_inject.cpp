@@ -878,15 +878,16 @@ void UpdateDwmHookSharedConfig()
         }
     }
 
-    // Write data first, then version last with release fence to prevent torn reads.
-    // The DWM hook checks version to detect updates — seeing new version with stale
-    // data would cause one frame of wrong tonemap params.
-    cfg.version = 0; // placeholder (overwritten below)
+    // Seqlock write: odd version = write in progress, even = complete.
+    // Reader rejects odd versions and mismatched pre/post-copy versions.
+    g_sharedMemPtr->version = ++g_sharedMemVersion;  // odd = write in progress
+    std::atomic_thread_fence(std::memory_order_release);
+    cfg.version = 0;
     memcpy(reinterpret_cast<char*>(g_sharedMemPtr) + sizeof(uint32_t),
            reinterpret_cast<const char*>(&cfg) + sizeof(uint32_t),
            sizeof(DwmHookSharedConfig) - sizeof(uint32_t));
     std::atomic_thread_fence(std::memory_order_release);
-    g_sharedMemPtr->version = ++g_sharedMemVersion;
+    g_sharedMemPtr->version = ++g_sharedMemVersion;  // even = write complete
 }
 
 void CloseDwmHookSharedMemory()

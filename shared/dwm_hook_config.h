@@ -35,7 +35,12 @@ struct DwmHookMonitorConfig {
 static_assert(sizeof(DwmHookMonitorConfig) == 48, "DwmHookMonitorConfig must be 48 bytes");
 
 struct DwmHookSharedConfig {
-    volatile uint32_t version;       // Bumped by host on every write
+    // Seqlock version: odd = write in progress, even = complete.
+    // Accessed via volatile + explicit fences (not std::atomic) because:
+    // (1) struct is memcpy'd across process boundary — std::atomic memcpy is UB
+    // (2) MSVC /volatile:ms provides acquire/release on x86-64
+    // (3) Interlocked ops add ~20 cycles per Present hook call for no benefit on x86-64
+    volatile uint32_t version;
     uint32_t numMonitors;
     uint32_t hostPid;                // Replaces host.pid file
     uint32_t lutReloadFlag;          // Host sets 1, hook resets 0 after reload
