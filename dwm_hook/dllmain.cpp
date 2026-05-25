@@ -209,6 +209,19 @@ bool isWindows11_25h2 = false;
 
 
 static int* g_pOverlayTestMode = NULL;
+static int* g_pDisableIndependentFlip = NULL;
+// Hook level controls which hooks are activated. Default 4 = all except OverlaysEnabled.
+// OverlaysEnabled hook (level 5) crashes DWM on dwmcore.dll builds >= 26200.8457
+// (KB5089549, May 2026). Overridable via DesktopLUT_HookLevel.flag file content (0-5).
+// 0=none, 1=Present, 2=+IsCandidateDirectFlip, 3=+fallback DirectFlip,
+// 4=+OverlayTestMode=5, 5=+OverlaysEnabled (UNSAFE on current builds)
+static int g_hookLevel = 4;
+// Saved original bytes for OverlaysEnabled inline-patch (restored on detach)
+static unsigned char g_overlaysEnabledOrigBytes[17] = {0};
+static unsigned char* g_overlaysEnabledPatchAddr = NULL;
+// Offset from m_dwOverlayTestMode to m_fDisableIndependentFlip in CCommonRegistryData.
+// Derived from PDB analysis of dwmcore.dll (Build 26200): RVA 0x3FE3F8 - 0x3FE3E4 = 0x14.
+static const int kOverlayTestModeToDisableIFlipOffset = 0x14;
 
 // --- Heartbeat event: signals to host that the DWM hook is active ---
 static HANDLE g_heartbeatEvent = NULL;
@@ -267,13 +280,25 @@ static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
 			// Host process terminated — revert DWM to normal
 			log_to_file("Host process exited unexpectedly, reverting DWM hook...");
 
-			if (g_pOverlayTestMode != NULL) {
-				__try { *g_pOverlayTestMode = 0; }
-				__except (EXCEPTION_EXECUTE_HANDLER) {}
+			if (!g_hookReverted.exchange(true)) {
+				if (g_pOverlayTestMode != NULL) {
+					__try { *g_pOverlayTestMode = 0; }
+					__except (EXCEPTION_EXECUTE_HANDLER) {}
+				}
+				if (g_pDisableIndependentFlip != NULL) {
+					__try { *g_pDisableIndependentFlip = 0; }
+					__except (EXCEPTION_EXECUTE_HANDLER) {}
+				}
+				if (g_overlaysEnabledPatchAddr != NULL) {
+					DWORD oldProt;
+					if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
+						memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
+						VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
+					}
+					g_overlaysEnabledPatchAddr = NULL;
+				}
+				MH_DisableHook(MH_ALL_HOOKS);
 			}
-
-			MH_DisableHook(MH_ALL_HOOKS);
-			g_hookReverted = true;
 
 			// Close heartbeat event so host watchdog (if restarted) sees it as gone
 			if (g_heartbeatEvent) {
@@ -953,6 +978,28 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 							(unsigned char*)candidatePtr < (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
 						{
 							g_pOverlayTestMode = candidatePtr;
+
+							// m_fDisableIndependentFlip lives at a known offset from
+							// m_dwOverlayTestMode in the CCommonRegistryData global.
+							int* iflipCandidate = (int*)((char*)candidatePtr + kOverlayTestModeToDisableIFlipOffset);
+							if ((unsigned char*)iflipCandidate >= (unsigned char*)dwmcore &&
+								(unsigned char*)iflipCandidate + sizeof(int) <= (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
+							{
+								__try {
+									int curVal = *iflipCandidate;
+									if (curVal == 0 || curVal == 1) {
+										g_pDisableIndependentFlip = iflipCandidate;
+									} else {
+										char msg[128];
+										snprintf(msg, sizeof(msg),
+											"WARNING: DisableIndependentFlip candidate has unexpected value %d — skipped", curVal);
+										log_to_file(msg);
+									}
+								}
+								__except (EXCEPTION_EXECUTE_HANDLER) {
+									log_to_file("WARNING: DisableIndependentFlip candidate not readable — skipped");
+								}
+							}
 						}
 						else
 						{
@@ -977,6 +1024,49 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						COverlayContext_OverlaysEnabled_orig)
 					{
 						break;
+					}
+				}
+			{
+					// PDB-derived fallback: if AOB scan missed OverlaysEnabled,
+					// OverlayTestMode, or DisableIndependentFlip, resolve them from
+					// known RVAs (dwmcore.dll 10.0.26100.8115, KB5089549).
+					// Fallback: if the main else-if chain missed OverlaysEnabled
+					// (can happen when chain order prevents match), do a dedicated pass.
+					if (!COverlayContext_OverlaysEnabled_orig && moduleInfo.SizeOfImage >= 17) {
+						for (size_t j = 0; j < moduleInfo.SizeOfImage - 17; j++) {
+							unsigned char* c = (unsigned char*)dwmcore + j;
+							if (c[0] == 0x83 && c[1] == 0x3D &&
+							    c[6] == 0x05 && c[7] == 0x74 && c[8] == 0x09 &&
+							    c[9] == 0x83 && c[10] == 0x79 && c[11] == 0x28 &&
+							    c[12] == 0x01 && c[13] == 0x0F && c[14] == 0x97 &&
+							    c[15] == 0xC0 && c[16] == 0xC3)
+							{
+								COverlayContext_OverlaysEnabled_orig = (COverlayContext_OverlaysEnabled_t*)c;
+								log_to_file("OverlaysEnabled found via dedicated scan");
+
+								int rip_offset = *(int*)(c + 2);
+								int* otmCandidate = (int*)(c + 7 + rip_offset);
+								if ((unsigned char*)otmCandidate >= (unsigned char*)dwmcore &&
+								    (unsigned char*)otmCandidate < (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
+								{
+									g_pOverlayTestMode = otmCandidate;
+									int* iflipCandidate = (int*)((char*)otmCandidate + kOverlayTestModeToDisableIFlipOffset);
+									if ((unsigned char*)iflipCandidate >= (unsigned char*)dwmcore &&
+									    (unsigned char*)iflipCandidate + sizeof(int) <= (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
+									{
+										__try {
+											int curVal = *iflipCandidate;
+											if (curVal == 0 || curVal == 1)
+												g_pDisableIndependentFlip = iflipCandidate;
+										}
+										__except (EXCEPTION_EXECUTE_HANDLER) {}
+									}
+								}
+								break;
+							}
+						}
+						if (!COverlayContext_OverlaysEnabled_orig)
+							log_to_file("WARNING: OverlaysEnabled not found");
 					}
 				}
 			}
@@ -1119,9 +1209,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			}
 			bool hasActiveWork = (numLuts > 0) || hasTonemapViaShared;
 
-			if (hasActiveWork && ((COverlayContext_Present_orig && COverlayContext_IsCandidateDirectFlipCompatbile_orig &&
-				COverlayContext_OverlaysEnabled_orig) ||
-				(COverlayContext_Present_orig_24h2 && COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2 && COverlayContext_OverlaysEnabled_orig)))
+			if (hasActiveWork && (COverlayContext_Present_orig || COverlayContext_Present_orig_24h2))
 
 			{
 				if (MH_Initialize() != MH_OK) {
@@ -1129,28 +1217,34 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				return FALSE;
 			}
 			MH_STATUS mhStatus;
-				if (!isWindows11_24h2 && !isWindows11_25h2)
-					mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig, (PVOID)COverlayContext_Present_hook,
-								  (PVOID*)&COverlayContext_Present_orig);
-				else
-					mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig_24h2, (PVOID)COverlayContext_Present_hook_24h2,
-						(PVOID*)&COverlayContext_Present_orig_24h2);
-				if (mhStatus != MH_OK) {
-					log_to_file("ERROR: MH_CreateHook failed for COverlayContext::Present");
-					MH_Uninitialize();
-					return FALSE;
+				if (g_hookLevel >= 1) {
+					if (!isWindows11_24h2 && !isWindows11_25h2)
+						mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig, (PVOID)COverlayContext_Present_hook,
+									  (PVOID*)&COverlayContext_Present_orig);
+					else
+						mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig_24h2, (PVOID)COverlayContext_Present_hook_24h2,
+							(PVOID*)&COverlayContext_Present_orig_24h2);
+					if (mhStatus != MH_OK) {
+						log_to_file("ERROR: MH_CreateHook failed for COverlayContext::Present");
+						MH_Uninitialize();
+						return FALSE;
+					}
+					LOG_ONLY_ONCE("Hook L1: Present")
 				}
 
-				if (!isWindows11_24h2 && !isWindows11_25h2)
-					mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
-								  (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook,
-								  (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig);
-				else
-					mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2,
-						(PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2,
-						(PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2);
-				if (mhStatus != MH_OK) {
-					log_to_file("ERROR: MH_CreateHook failed for IsCandidateDirectFlipCompatible");
+				if (g_hookLevel >= 2) {
+					if (!isWindows11_24h2 && !isWindows11_25h2)
+						mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
+									  (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook,
+									  (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig);
+					else
+						mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2,
+							(PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2,
+							(PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2);
+					if (mhStatus != MH_OK) {
+						log_to_file("ERROR: MH_CreateHook failed for IsCandidateDirectFlipCompatible");
+					}
+					LOG_ONLY_ONCE("Hook L2: IsCandidateDirectFlipCompatible")
 				}
 
 				if (CWindowContext_IsCandidateDirectFlipCompatbile_orig)
@@ -1213,49 +1307,131 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					LOG_ONLY_ONCE("FAILED to find CCompVisual::IsCandidateForPromotion")
 				}
 
-				if (COverlayContext_IsDirectFlipSupportedOnTarget_orig)
+				if (g_hookLevel < 3)
 				{
-					mhStatus = MH_CreateHook((PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_orig,
-						(PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_hook,
-						(PVOID*)&COverlayContext_IsDirectFlipSupportedOnTarget_orig);
-					if (mhStatus == MH_OK) {
-						LOG_ONLY_ONCE("Hooked COverlayContext::IsDirectFlipSupportedOnTarget")
-					} else {
-						LOG_ONLY_ONCE("FAILED to hook COverlayContext::IsDirectFlipSupportedOnTarget")
+					LOG_ONLY_ONCE("Hook L3: fallback DirectFlip hooks SKIPPED (hookLevel < 3)")
+				}
+				else
+				{
+					if (COverlayContext_IsDirectFlipSupportedOnTarget_orig)
+					{
+						mhStatus = MH_CreateHook((PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_orig,
+							(PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_hook,
+							(PVOID*)&COverlayContext_IsDirectFlipSupportedOnTarget_orig);
+						if (mhStatus == MH_OK) {
+							LOG_ONLY_ONCE("Hooked COverlayContext::IsDirectFlipSupportedOnTarget")
+						} else {
+							LOG_ONLY_ONCE("FAILED to hook COverlayContext::IsDirectFlipSupportedOnTarget")
+						}
+					}
+					else {
+						LOG_ONLY_ONCE("FAILED to find COverlayContext::IsDirectFlipSupportedOnTarget")
+					}
+
+					if (CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig)
+					{
+						mhStatus = MH_CreateHook((PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig,
+							(PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_hook,
+							(PVOID*)&CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig);
+						if (mhStatus == MH_OK) {
+							LOG_ONLY_ONCE("Hooked CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
+						} else {
+							LOG_ONLY_ONCE("FAILED to hook CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
+						}
+					}
+					else {
+						LOG_ONLY_ONCE("FAILED to find CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
 					}
 				}
-				else {
-					LOG_ONLY_ONCE("FAILED to find COverlayContext::IsDirectFlipSupportedOnTarget")
-				}
 
-				if (CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig)
+				// Read hook level BEFORE any hook decisions (diagnostic override).
+				// 0=none, 1=Present, 2=+IsCandidateDirectFlip, 3=+fallback DirectFlip,
+				// 4=+OverlayTestMode=5+OverlaysEnabled, 5=OverlaysEnabled via MinHook
 				{
-					mhStatus = MH_CreateHook((PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig,
-						(PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_hook,
-						(PVOID*)&CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig);
-					if (mhStatus == MH_OK) {
-						LOG_ONLY_ONCE("Hooked CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
-					} else {
-						LOG_ONLY_ONCE("FAILED to hook CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
+					char hlPath[MAX_PATH] = {0};
+					ExpandEnvironmentStringsA(
+						"%SYSTEMROOT%\\Temp\\DesktopLUT_HookLevel.flag",
+						hlPath, sizeof(hlPath));
+					FILE* hlf = fopen(hlPath, "r");
+					if (hlf) {
+						char c = 0;
+						if (fread(&c, 1, 1, hlf) == 1 && c >= '0' && c <= '5')
+							g_hookLevel = c - '0';
+						fclose(hlf);
 					}
-				}
-				else {
-					LOG_ONLY_ONCE("FAILED to find CGlobalCompositionSurfaceInfo::IsAdvancedDirectFlipCompatible")
+					char msg[128];
+					snprintf(msg, sizeof(msg), "DIAG: hookLevel=%d (0=none..5=all)", g_hookLevel);
+					log_to_file(msg);
 				}
 
-				if (g_pOverlayTestMode != NULL)
+				if (g_pOverlayTestMode != NULL && g_hookLevel >= 4)
 				{
 					__try { *g_pOverlayTestMode = 5; }
 					__except (EXCEPTION_EXECUTE_HANDLER) { g_pOverlayTestMode = NULL; }
-					LOG_ONLY_ONCE("SUCCESS: Forced OverlayTestMode to 5")
+					LOG_ONLY_ONCE("Forced OverlayTestMode to 5")
 				}
-				else {
-					LOG_ONLY_ONCE("FAILED to find g_pOverlayTestMode")
+				else if (g_pOverlayTestMode == NULL) {
+					LOG_ONLY_ONCE("WARNING: g_pOverlayTestMode not found")
 				}
 
-				MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
-				              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
-				if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+				// DisableIndependentFlip: 25H2-only (replaces 4 removed DirectFlip functions).
+				// Validate page is writable before patching.
+				if (g_pDisableIndependentFlip != NULL && isWindows11_25h2 && g_hookLevel >= 4)
+				{
+					MEMORY_BASIC_INFORMATION mbi = {};
+					if (VirtualQuery(g_pDisableIndependentFlip, &mbi, sizeof(mbi)) &&
+					    (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)))
+					{
+						__try { *g_pDisableIndependentFlip = 1; }
+						__except (EXCEPTION_EXECUTE_HANDLER) { g_pDisableIndependentFlip = NULL; }
+						LOG_ONLY_ONCE("Forced DisableIndependentFlip = 1")
+					} else {
+						g_pDisableIndependentFlip = NULL;
+						LOG_ONLY_ONCE("WARNING: DisableIndependentFlip page not writable — skipped")
+					}
+				}
+
+				// OverlaysEnabled hook: on 25H2+ use inline-patch (MinHook trampoline
+				// crashes on dwmcore.dll >= 26200.8457). On older builds, use MinHook.
+				if (g_hookLevel >= 5) {
+					// Level 5: force MinHook (diagnostic — known to crash on 25H2+)
+					if (COverlayContext_OverlaysEnabled_orig) {
+						MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
+						              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+						LOG_ONLY_ONCE("Hook L5: OverlaysEnabled (MinHook)")
+					}
+				}
+				else if (isWindows11_25h2 && g_hookLevel >= 4 && COverlayContext_OverlaysEnabled_orig != NULL)
+				{
+					// 25H2: inline-patch to "mov al, 1; ret" — no trampoline needed
+					unsigned char* func = (unsigned char*)COverlayContext_OverlaysEnabled_orig;
+					if (func[0] == 0x83 && func[1] == 0x3D && func[6] == 0x05 &&
+					    func[7] == 0x74 && func[8] == 0x09)
+					{
+						DWORD oldProt;
+						if (VirtualProtect(func, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
+							memcpy(g_overlaysEnabledOrigBytes, func, 17);
+							g_overlaysEnabledPatchAddr = func;
+							func[0] = 0xB0; func[1] = 0x01;  // mov al, 1
+							func[2] = 0xC3;                   // ret
+							for (int p = 3; p < 17; p++) func[p] = 0xCC;  // int3 padding
+							VirtualProtect(func, 17, oldProt, &oldProt);
+							LOG_ONLY_ONCE("OverlaysEnabled inline-patched (mov al,1; ret)")
+						}
+					}
+				}
+				else if (!isWindows11_25h2 && COverlayContext_OverlaysEnabled_orig != NULL)
+				{
+					// Pre-25H2: MinHook works fine on older OverlaysEnabled functions
+					MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
+					              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+					LOG_ONLY_ONCE("Hooked OverlaysEnabled (MinHook)")
+				}
+
+				if (g_hookLevel == 0) {
+					LOG_ONLY_ONCE("DIAG: hookLevel=0 — no hooks activated, memory patches only")
+					MH_Uninitialize();
+				} else if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
 					log_to_file("ERROR: MH_EnableHook failed");
 					MH_Uninitialize();
 					return FALSE;
@@ -1325,16 +1501,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		if (g_heartbeatEvent) { CloseHandle(g_heartbeatEvent); g_heartbeatEvent = NULL; }
 
 		// Only revert hooks/overlay mode if not already done by host monitor
-		if (!g_hookReverted) {
+		if (!g_hookReverted.exchange(true)) {
 			if (g_pOverlayTestMode != NULL)
 			{
 				__try { *g_pOverlayTestMode = 0; }
 				__except (EXCEPTION_EXECUTE_HANDLER) { /* already detaching, nothing to do */ }
 			}
+			if (g_pDisableIndependentFlip != NULL)
+			{
+				__try { *g_pDisableIndependentFlip = 0; }
+				__except (EXCEPTION_EXECUTE_HANDLER) {}
+			}
+			if (g_overlaysEnabledPatchAddr != NULL)
+			{
+				DWORD oldProt;
+				if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
+					memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
+					VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
+				}
+				g_overlaysEnabledPatchAddr = NULL;
+			}
 			MH_DisableHook(MH_ALL_HOOKS);
 			MH_Uninitialize();
 		}
-		g_hookReverted = true;  // Prevent any late HostMonitor action after timeout
 		// Close shared memory
 		if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
 		if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }
