@@ -236,6 +236,7 @@ const int MHC_BLIND_KICK_TIMER_ID = 107;        // Periodic unconditional reload
 const int MHC_BLIND_KICK_INTERVAL_MS = 300000;  // Every 5 min — catches silent drops invisible to association verify
 const int MHC_REGISTRY_KICK_TIMER_ID = 108;     // Debounce for ICM registry-change-triggered kick
 const int MHC_REGISTRY_KICK_DEBOUNCE_MS = 500;  // Wait 500ms after registry write before kicking (writer may fire multiple times)
+const int MHC_BURST_TIMER_ID = 109;             // Staggered MHC re-assertion burst after display transition events
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear
 const int HOTKEY_GAMMA = 2;      // Win+Shift+G for gamma toggle
 const int HOTKEY_ANALYSIS = 4;   // Win+Shift+X for analysis toggle

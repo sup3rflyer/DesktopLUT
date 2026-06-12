@@ -384,8 +384,12 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         return;
     }
 
-    // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles
+    // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles.
+    // Sweep stale association entries first — orphan cleanup deletes files but
+    // can't disassociate (no LUID for prior-session state), and Windows can
+    // re-broker defaults to dead entries during mode switches.
     CleanupOrphanedMhcProfiles();
+    SweepStaleMhcAssociations();
     ReapplyAllMhcProfiles();
 
     // Auto-generate identity MHC profiles for monitors with DG enabled but no profile
@@ -964,8 +968,10 @@ void StartProcessing() {
             // Start whitelist thread (no ProcessingThreadFunc to start it)
             StartGammaWhitelistThread();
 
-            // Clean up orphaned MHC profiles and reapply active ones
+            // Clean up orphaned MHC profiles, sweep stale association entries,
+            // and reapply active ones
             CleanupOrphanedMhcProfiles();
+            SweepStaleMhcAssociations();
             ReapplyAllMhcProfiles();
         }
 

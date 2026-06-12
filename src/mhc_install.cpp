@@ -26,12 +26,16 @@ typedef HRESULT(WINAPI* PFN_ColorProfileRemoveDisplayAssociation)(
 typedef HRESULT(WINAPI* PFN_ColorProfileGetDisplayDefault)(
     int scope, LUID targetAdapterID, UINT32 sourceID,
     int profileType, int profileSubType, LPWSTR* profileName);
+typedef HRESULT(WINAPI* PFN_ColorProfileGetDisplayList)(
+    int scope, LUID targetAdapterID, UINT32 sourceID,
+    LPWSTR** profileList, DWORD* profileCount);
 
 static HMODULE g_hMscms = nullptr;
 static PFN_InstallColorProfileW g_pfnInstallColorProfile = nullptr;
 static PFN_ColorProfileAddDisplayAssociation g_pfnAddAssociation = nullptr;
 static PFN_ColorProfileRemoveDisplayAssociation g_pfnRemoveAssociation = nullptr;
 static PFN_ColorProfileGetDisplayDefault g_pfnGetDisplayDefault = nullptr;
+static PFN_ColorProfileGetDisplayList g_pfnGetDisplayList = nullptr;
 static std::once_flag g_mscmsOnce;
 
 static void DoMscmsLoad() {
@@ -49,6 +53,8 @@ static void DoMscmsLoad() {
         GetProcAddress(g_hMscms, "ColorProfileRemoveDisplayAssociation");
     g_pfnGetDisplayDefault = (PFN_ColorProfileGetDisplayDefault)
         GetProcAddress(g_hMscms, "ColorProfileGetDisplayDefault");
+    g_pfnGetDisplayList = (PFN_ColorProfileGetDisplayList)
+        GetProcAddress(g_hMscms, "ColorProfileGetDisplayList");
 
     if (g_pfnAddAssociation) {
         std::cout << "MHC2: Color management APIs available" << std::endl;
@@ -253,6 +259,76 @@ void CleanupOrphanedMhcProfiles() {
     FindClose(hFind);
     if (deleted > 0) {
         std::cout << "MHC cleanup: removed " << deleted << " orphaned profile(s)" << std::endl;
+    }
+}
+
+// Remove stale DesktopLUT_* entries from each connected display's association
+// lists. Regeneration and prior sessions can leave dead association entries
+// (file deleted, association kept — CleanupOrphanedMhcProfiles intentionally
+// skips disassociation). Windows re-brokers the default from the association
+// list during mode switches, so a stale entry can silently become the active
+// "calibration". Only names referenced by current settings survive.
+//
+// The keep-set is GLOBAL (all monitors, active + all cached permutation names)
+// rather than per-monitor: permutation swaps can run on the gamma-whitelist
+// thread concurrently with a GUI-thread sweep, and a global keep-set guarantees
+// a just-associated variant is never swept mid-swap. Stale entries always carry
+// names absent from current settings (timestamp-suffixed), so they're still
+// caught.
+void SweepStaleMhcAssociations() {
+    EnsureMscmsLoaded();
+    if (!g_pfnGetDisplayList || !g_pfnRemoveAssociation) return;
+
+    // Snapshot every profile name referenced by current settings
+    std::set<std::wstring> keep;
+    size_t monitorCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        monitorCount = g_gui.monitorSettings.size();
+        for (const auto& ms : g_gui.monitorSettings) {
+            for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+                if (!ms.sdrMHC.permNames[k].empty()) keep.insert(ms.sdrMHC.permNames[k]);
+                if (!ms.hdrMHC.permNames[k].empty()) keep.insert(ms.hdrMHC.permNames[k]);
+            }
+            if (!ms.sdrMHC.profileName.empty()) keep.insert(ms.sdrMHC.profileName);
+            if (!ms.hdrMHC.profileName.empty()) keep.insert(ms.hdrMHC.profileName);
+        }
+    }
+
+    int swept = 0;
+    for (int i = 0; i < (int)monitorCount; i++) {
+        DisplayInfo di;
+        if (!GetDisplayInfoForMonitor(i, di)) continue;
+
+        LPWSTR* list = nullptr;
+        DWORD count = 0;
+        HRESULT hr = g_pfnGetDisplayList(
+            1,  // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
+            di.adapterId, di.sourceId, &list, &count);
+        if (FAILED(hr) || !list) continue;
+
+        for (DWORD k = 0; k < count; k++) {
+            if (!list[k]) continue;
+            std::wstring name = list[k];
+            if (name.rfind(L"DesktopLUT_", 0) != 0) continue;  // not ours — never touch
+            if (keep.count(name)) continue;                     // referenced by settings
+
+            // Stale entry. The list API doesn't say which list (SDR vs Advanced
+            // Color) the entry lives in, so remove from both — removal from the
+            // list it's not in fails harmlessly.
+            HRESULT r1 = g_pfnRemoveAssociation(1, name.c_str(), di.adapterId, di.sourceId, FALSE);
+            HRESULT r2 = g_pfnRemoveAssociation(1, name.c_str(), di.adapterId, di.sourceId, TRUE);
+            if (SUCCEEDED(r1) || SUCCEEDED(r2)) {
+                std::wcout << L"MHC sweep: removed stale association '" << name
+                           << L"' from monitor " << i << std::endl;
+                swept++;
+            }
+        }
+        LocalFree(list);
+    }
+
+    if (swept > 0) {
+        std::cout << "MHC sweep: removed " << swept << " stale association(s)" << std::endl;
     }
 }
 

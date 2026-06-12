@@ -134,6 +134,8 @@ Windows can silently drop MHC calibration without unassociating the profile. Two
 
 **Mode B — Association intact, hardware LUT reverted** (the MHC2 tag stops being honored by the compositor/driver while Windows still reports our profile as default; visible symptom is white balance / grayscale snapping back to uncalibrated). Causes: GPU vendor control panels writing their own gamma state, driver-internal resets, `ImmersiveColorSet` refresh, fullscreen game exit, sleep/wake edge cases. No API detects this state.
 
+**Mode C — Stale association re-brokered** (Windows picks an outdated `DesktopLUT_*` entry as default during a mode switch). Cause: regeneration and prior sessions can leave dead entries in a display's association lists — orphan cleanup deletes the `.icm` files but cannot disassociate entries from prior sessions (no adapter LUID available). During HDR↔SDR transitions Windows re-brokers the default from the association list and can land on a stale entry.
+
 **Defensive infrastructure** (all active whenever the host is running, independent of whether the processing thread is alive):
 
 | Mechanism | Interval / Trigger | Handles |
@@ -143,8 +145,10 @@ Windows can silently drop MHC calibration without unassociating the profile. Two
 | ICM registry watcher thread | `RegNotifyChangeKeyValue` on HKCU+HKLM `ICM\ProfileAssociations\Display` and HKCU `ICM\Display`, 500 ms debounce | Mode B — catches third-party writes from calibration tools, colorcpl, GPU vendor panels |
 | `ReapplyAllMhcProfiles` fallback | On demand, if `TriggerCalibrationLoader` fails | Mode B — remove+re-add kick when DisplayCAL's installer (or similar) has disabled the Calibration Loader task |
 | Event-driven reapply | WM_DISPLAYCHANGE, WM_WTSSESSION_CHANGE unlock, WM_SETTINGCHANGE ImmersiveColorSet, WM_POWERBROADCAST wake | Mode A + Mode B proactively on known triggers |
+| `SweepStaleMhcAssociations` | At startup and in every transition-burst stage | Mode C — enumerates each display's association list via `ColorProfileGetDisplayList` and removes any `DesktopLUT_*` entry not referenced by current settings, from both the SDR and Advanced Color lists |
+| Transition burst | Staged at +2 s / +7 s / +22 s after ImmersiveColorSet, any WM_DISPLAYCHANGE (including refresh-rate-only modesets), resume, session unlock, display wake | Modes A+B+C — each stage runs verify + sweep + an unconditional Calibration Loader kick. Outlasts Windows' own transition processing, which can re-broker associations or reload hardware LUTs *after* a single immediate reapply |
 
-The Calibration Loader is preferred over remove+re-add because it never disassociates — the display never briefly falls back to sRGB IEC or another profile, so there's no visible flicker.
+The Calibration Loader is preferred over remove+re-add because it never disassociates — the display never briefly falls back to sRGB IEC or another profile, so there's no visible flicker. The transition burst exists because a mode switch is a race: one immediate reapply can be overwritten by Windows' own late transition work, and Mode B staleness right after a switch is invisible to association queries — so the burst re-asserts unconditionally until the transition has long settled.
 
 ## HDR Color Pipeline (ICtCp-based)
 

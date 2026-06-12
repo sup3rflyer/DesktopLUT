@@ -523,6 +523,46 @@ void ShowTrayMenu(HWND hwnd) {
 }
 
 // ============================================================================
+// SECTION: MHC Transition Burst
+// ============================================================================
+
+// Staggered MHC re-assertion after display transition events (HDR toggle,
+// modeset/refresh-rate switch, resume, unlock, display wake). A single
+// immediate reapply can race Windows' own transition processing — Windows may
+// re-broker associations or reload hardware LUTs AFTER us, leaving stale state
+// that the 15s association verify can't detect (association reads correct
+// while the hardware LUT still holds the previous mode's curves). Each stage
+// re-verifies associations, sweeps stale entries, and kicks the Calibration
+// Loader (flickerless hardware-LUT rewrite). Stage delays are spaced to catch
+// both fast transitions and slow stragglers (driver modesets can settle
+// seconds after the OS event).
+static const int MHC_BURST_DELAYS_MS[] = { 2000, 5000, 15000 };  // fires at +2s, +7s, +22s
+static const int MHC_BURST_STAGES = 3;
+static int g_mhcBurstStage = 0;
+
+static bool AnyMhcProfileActive() {
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    for (const auto& ms : g_gui.monitorSettings) {
+        if ((ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) ||
+            (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// (Re)start the burst from stage 0. Coalesces: a new trigger during a running
+// burst restarts the schedule, which is the desired behavior — the most recent
+// transition is the one whose settling we need to outlast.
+static void StartMhcTransitionBurst(HWND hwnd, const char* reason) {
+    if (!AnyMhcProfileActive()) return;
+    std::cout << "[MHC] Transition burst started (" << reason << ")" << std::endl;
+    g_mhcBurstStage = 0;
+    KillTimer(hwnd, MHC_BURST_TIMER_ID);
+    SetTimer(hwnd, MHC_BURST_TIMER_ID, MHC_BURST_DELAYS_MS[0], nullptr);
+}
+
+// ============================================================================
 // SECTION: Main Window Procedure
 // ============================================================================
 
@@ -1533,6 +1573,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // state changes — always re-assert MHC.
                 VerifyAndRestoreMhcProfiles();
             }
+            // The immediate reapply above can race Windows' own transition
+            // processing — follow up with the staggered burst either way.
+            StartMhcTransitionBurst(hwnd, "ImmersiveColorSet");
             return 0;
         }
         if (wParam == DEVICE_CHANGE_TIMER_ID) {
@@ -1641,9 +1684,39 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (wParam == MHC_BURST_TIMER_ID) {
+            KillTimer(hwnd, MHC_BURST_TIMER_ID);
+            int stage = g_mhcBurstStage;
+            std::cout << "[MHC] Transition burst stage " << (stage + 1)
+                      << "/" << MHC_BURST_STAGES << std::endl;
+            // Association layer: fix wrong/missing defaults, then sweep stale
+            // DesktopLUT_* entries Windows could re-broker to.
+            VerifyAndRestoreMhcProfiles();
+            SweepStaleMhcAssociations();
+            // Hardware layer: unconditional reload. Associations can read
+            // correct while the hardware LUT still has the previous mode's
+            // curves — undetectable by any query, so always kick.
+            if (!TriggerCalibrationLoader() && stage == 0) {
+                // Fall back to remove+re-add only on the first stage — the
+                // fallback flickers through a fallback profile, and repeating
+                // it three times per transition would be visible.
+                ReapplyAllMhcProfiles();
+            }
+            if (++g_mhcBurstStage < MHC_BURST_STAGES) {
+                SetTimer(hwnd, MHC_BURST_TIMER_ID, MHC_BURST_DELAYS_MS[g_mhcBurstStage], nullptr);
+            }
+            return 0;
+        }
         break;  // Let other timers pass through to DefWindowProc
 
     case WM_DISPLAYCHANGE: {
+        // Any WM_DISPLAYCHANGE is a modeset (resolution OR refresh-rate switch)
+        // even when the monitor set is unchanged below — a modeset can reset
+        // GPU gamma/MHC2 hardware state without any other signal. Refresh-rate
+        // switching (e.g. video players matching content rate) hits this path
+        // constantly, so always run the re-assertion burst.
+        StartMhcTransitionBurst(hwnd, "display change");
+
         // Monitor hotplug: re-enumerate and update if count or handles changed
         std::vector<HMONITOR> newMonitors;
         EnumDisplayMonitors(nullptr, nullptr, GUIMonitorEnumProc, reinterpret_cast<LPARAM>(&newMonitors));
@@ -1739,6 +1812,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Windows often resets MHC associations across a lock/unlock cycle.
                 VerifyAndRestoreMhcProfiles();
             }
+            StartMhcTransitionBurst(hwnd, "session unlock");
             break;
         case WTS_SESSION_LOCK:
         case WTS_CONSOLE_DISCONNECT:
@@ -1775,6 +1849,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 VerifyAndRestoreMhcProfiles();
             }
+            StartMhcTransitionBurst(hwnd, "resume");
         }
         // Handle display power state changes — GUI-side handler fires immediately on the
         // main thread even when the processing thread is blocked in CompClock/DwmFlush.
@@ -1793,6 +1868,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // Display on — trigger reinit or restart processing
                     std::cout << "[GUI] Display waking from sleep" << std::endl;
                     g_displayOff.store(false);
+                    StartMhcTransitionBurst(hwnd, "display wake");
                     if (g_gui.isRunning) {
                         g_forceReinit.store(true);
                         g_forceMhcReapply.store(true);

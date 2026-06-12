@@ -182,6 +182,14 @@ std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool 
 // Deletes any files not referenced by current g_gui.monitorSettings
 void CleanupOrphanedMhcProfiles();
 
+// Remove stale DesktopLUT_* association entries from every connected display's
+// association lists (both SDR and Advanced Color). Only profiles referenced by
+// the current settings (active + cached permutations) are kept — anything else
+// is a leftover Windows could re-broker to as default during a mode switch.
+// Complements CleanupOrphanedMhcProfiles, which deletes files but cannot
+// disassociate (no LUID for prior-session monitors).
+void SweepStaleMhcAssociations();
+
 // Re-associate all enabled MHC profiles across all monitors (remove + re-add)
 // Ensures profiles are actively applied after sleep/wake, TDR, or app restart
 void ReapplyAllMhcProfiles();
