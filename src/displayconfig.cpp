@@ -46,23 +46,52 @@ struct DISPLAYCONFIG_SET_ADVANCED_COLOR_PARAM {
     char padding[4];  // Additional padding observed in Windows
 };
 
+static bool GetDisplayInfoAtPoint(POINT pt, DisplayInfo& outInfo);  // fwd decl
+
+// Query the active display paths/modes with a retry loop. The topology can change
+// between GetDisplayConfigBufferSizes and QueryDisplayConfig (the latter then returns
+// ERROR_INSUFFICIENT_BUFFER); MSDN prescribes re-querying sizes and retrying. This
+// matters because these functions run during the exact windows (mode switches,
+// transition bursts, MHC verify) when the topology is changing. On success the vectors
+// are resized to the actual counts so callers can use .size().
+static bool QueryActivePaths(std::vector<DISPLAYCONFIG_PATH_INFO>& paths,
+                             std::vector<DISPLAYCONFIG_MODE_INFO>& modes) {
+    for (int attempt = 0; attempt < 5; attempt++) {
+        UINT32 pathCount = 0, modeCount = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+            return false;
+        paths.assign(pathCount, {});
+        modes.assign(modeCount, {});
+        LONG r = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
+                                    &modeCount, modes.data(), nullptr);
+        if (r == ERROR_SUCCESS) {
+            paths.resize(pathCount);   // QueryDisplayConfig may report fewer than allocated
+            modes.resize(modeCount);
+            return true;
+        }
+        if (r != ERROR_INSUFFICIENT_BUFFER) return false;  // hard failure — don't spin
+        // else: topology changed between the two calls — loop and re-query sizes
+    }
+    return false;
+}
+
+// Collect HMONITORs in EnumDisplayMonitors order (this is the order DesktopLUT indexes
+// monitors by, in gui_layout / processing).
+static BOOL CALLBACK CollectMonitorsProc(HMONITOR h, HDC, LPRECT, LPARAM lp) {
+    reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(h);
+    return TRUE;
+}
+
 bool EnumerateDisplaysForMaxTml(std::vector<DisplayInfo>& displays) {
     displays.clear();
 
-    UINT32 pathCount = 0, modeCount = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) {
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActivePaths(paths, modes)) {
         return false;
     }
 
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
-        &modeCount, modes.data(), nullptr) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    for (UINT32 i = 0; i < pathCount; i++) {
+    for (size_t i = 0; i < paths.size(); i++) {
         const auto& path = paths[i];
 
         // Get target device name
@@ -147,13 +176,30 @@ bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo) {
         return false;
     }
 
-    // Enumerate displays and find matching one
+    // Preferred: correlate the DesktopLUT monitor index (EnumDisplayMonitors order) to the
+    // correct display by POSITION, then match the DisplayInfo by target identity inside
+    // GetDisplayInfoAtPoint. displays[monitorIndex] is unreliable — QueryDisplayConfig path
+    // order need not match EnumDisplayMonitors order, and EnumerateDisplaysForMaxTml skips
+    // paths whose target-name query failed (which shifts the indices). Wrong-monitor
+    // targeting here would associate an MHC profile / toggle HDR on the wrong display.
+    std::vector<HMONITOR> mons;
+    EnumDisplayMonitors(nullptr, nullptr, CollectMonitorsProc, reinterpret_cast<LPARAM>(&mons));
+    if (monitorIndex < (int)mons.size()) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfo(mons[monitorIndex], &mi)) {
+            POINT pt = { mi.rcMonitor.left, mi.rcMonitor.top };
+            if (GetDisplayInfoAtPoint(pt, outInfo)) {
+                return true;
+            }
+        }
+    }
+
+    // Fallback: legacy positional index (only as good as the order assumption, but no
+    // worse than the previous behavior if the position match above could not resolve).
     std::vector<DisplayInfo> displays;
     if (!EnumerateDisplaysForMaxTml(displays)) {
         return false;
     }
-
-    // The display enumeration order typically matches EnumDisplayMonitors order
     if (monitorIndex < (int)displays.size()) {
         outInfo = displays[monitorIndex];
         return true;
@@ -197,23 +243,18 @@ bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled) {
     // DXGI ColorSpace is G2084_P2020 only when actual HDR mode is active.
 
     // We need HMONITOR to match DXGI outputs - find it via display position
-    UINT32 pathCount = 0, modeCount = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActivePaths(paths, modes))
         return false;
 
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
-        &modeCount, modes.data(), nullptr) != ERROR_SUCCESS)
-        return false;
-
-    for (UINT32 i = 0; i < pathCount; i++) {
+    for (size_t i = 0; i < paths.size(); i++) {
         const auto& path = paths[i];
         if (path.targetInfo.adapterId.LowPart == display.adapterId.LowPart &&
             path.targetInfo.adapterId.HighPart == display.adapterId.HighPart &&
             path.targetInfo.id == display.targetId) {
             // Found matching path - get source position to find HMONITOR
-            if (path.sourceInfo.modeInfoIdx < modeCount) {
+            if (path.sourceInfo.modeInfoIdx < modes.size()) {
                 const auto& mode = modes[path.sourceInfo.modeInfoIdx];
                 if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
                     POINT pt = { mode.sourceMode.position.x, mode.sourceMode.position.y };
@@ -278,31 +319,33 @@ static bool GetDisplayInfoAtPoint(POINT pt, DisplayInfo& outInfo) {
 
     // Match by finding the display at this position
     // We need to query each path's source mode to get position
-    UINT32 pathCount = 0, modeCount = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) {
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActivePaths(paths, modes)) {
         return false;
     }
 
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-
-    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
-        &modeCount, modes.data(), nullptr) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    for (UINT32 i = 0; i < pathCount && i < displays.size(); i++) {
+    for (size_t i = 0; i < paths.size(); i++) {
         const auto& path = paths[i];
 
         // Find the source mode for this path to get position
-        if (path.sourceInfo.modeInfoIdx < modeCount) {
+        if (path.sourceInfo.modeInfoIdx < modes.size()) {
             const auto& mode = modes[path.sourceInfo.modeInfoIdx];
             if (mode.infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
                 POINTL pos = mode.sourceMode.position;
                 // Check if monitor rect matches this source position
                 if (mi.rcMonitor.left == pos.x && mi.rcMonitor.top == pos.y) {
-                    outInfo = displays[i];
-                    return true;
+                    // Match the DisplayInfo by target identity (adapterId+targetId), NOT by
+                    // the parallel index i — EnumerateDisplaysForMaxTml skips paths whose
+                    // target-name query failed, so displays[i] is not aligned with paths[i].
+                    for (const auto& d : displays) {
+                        if (d.adapterId.LowPart == path.targetInfo.adapterId.LowPart &&
+                            d.adapterId.HighPart == path.targetInfo.adapterId.HighPart &&
+                            d.targetId == path.targetInfo.id) {
+                            outInfo = d;
+                            return true;
+                        }
+                    }
                 }
             }
         }

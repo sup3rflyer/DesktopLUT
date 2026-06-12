@@ -66,9 +66,12 @@ static LRESULT CALLBACK GammaWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, L
         switch (LOWORD(wParam)) {
         case ID_WHITELIST_OK:
             {
-                // Get text from edit box
-                wchar_t buf[1024] = {};
-                GetWindowText(g_whitelistEdit, buf, 1024);
+                // Get text from edit box (size dynamically — a long process list must
+                // not be silently truncated and then saved, losing entries).
+                int len = GetWindowTextLengthW(g_whitelistEdit);
+                std::wstring buf(len + 1, L'\0');
+                int copied = GetWindowTextW(g_whitelistEdit, &buf[0], len + 1);
+                buf.resize(copied);
                 g_gammaWhitelistRaw = buf;
                 ParseGammaWhitelist();
                 SaveSettings();
@@ -211,9 +214,11 @@ static LRESULT CALLBACK VrrWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         switch (LOWORD(wParam)) {
         case ID_WHITELIST_OK:
             {
-                // Get text from edit box
-                wchar_t buf[1024] = {};
-                GetWindowText(g_vrrWhitelistEdit, buf, 1024);
+                // Get text from edit box (size dynamically — see gamma whitelist OK).
+                int len = GetWindowTextLengthW(g_vrrWhitelistEdit);
+                std::wstring buf(len + 1, L'\0');
+                int copied = GetWindowTextW(g_vrrWhitelistEdit, &buf[0], len + 1);
+                buf.resize(copied);
                 g_vrrWhitelistRaw = buf;
                 ParseVrrWhitelist();
                 SaveSettings();

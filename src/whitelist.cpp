@@ -490,6 +490,16 @@ void StopGammaWhitelistThread() {
         g_gammaWhitelistThread.join();
     }
 
+    // If a whitelisted app had forced desktop gamma off, restore the user's preference
+    // before clearing state (thread is now joined, so no concurrent swap). MHC profiles
+    // persist independently of the overlay, so without this the display would stay on the
+    // non-DG permutation after Stop until a restart/re-Apply re-evaluated it.
+    if (g_gammaWhitelistActive.load()) {
+        bool restoreDg = g_userDesktopGammaMode.load();
+        g_desktopGammaMode.store(restoreDg);
+        SwapDgForAllMonitors(restoreDg);
+    }
+
     // Reset state when thread stops
     g_gammaWhitelistActive.store(false);
     g_gammaWhitelistUserOverride.store(false);

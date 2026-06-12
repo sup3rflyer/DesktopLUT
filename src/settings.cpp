@@ -4,6 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include <cwchar>
+#include <cmath>
 #include <iostream>
 #include <locale.h>
 
@@ -321,12 +322,20 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
             token = wcstok_s(nullptr, L";", &ctx);
         }
     }
-    if (mhc.grayscale.points.empty() || (int)mhc.grayscale.points.size() != mhc.grayscale.pointCount) {
+    // Reinitialize on a count mismatch OR any corrupt value (NaN/Inf/out-of-[0,1]) — a
+    // hand-edited or truncated INI must not feed garbage into MHC LUT generation.
+    bool gsNeedsReinit = mhc.grayscale.points.empty() ||
+                         (int)mhc.grayscale.points.size() != mhc.grayscale.pointCount;
+    if (!gsNeedsReinit) {
+        for (float v : mhc.grayscale.points) {
+            if (!std::isfinite(v) || v < 0.0f || v > 1.0f) { gsNeedsReinit = true; break; }
+        }
+    }
+    if (gsNeedsReinit) {
         if (!mhc.grayscale.points.empty()) {
             std::wcerr << L"Warning: " << section << L"/" << p
-                       << L"MHCGrayscaleData has " << mhc.grayscale.points.size()
-                       << L" points but MHCGrayscalePoints=" << mhc.grayscale.pointCount
-                       << L", reinitializing to linear" << std::endl;
+                       << L"MHCGrayscaleData invalid (count/NaN/range), reinitializing to linear"
+                       << std::endl;
         }
         mhc.grayscale.points.resize(mhc.grayscale.pointCount);
         if (isHDR) mhc.grayscale.initLinearPQ();
@@ -349,8 +358,15 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
                     token = wcstok_s(nullptr, L";", &ctx2);
                 }
             }
-            if (mhc.grayscale.rgbDeviations[ch].empty() ||
-                (int)mhc.grayscale.rgbDeviations[ch].size() != mhc.grayscale.pointCount) {
+            bool devValid = !mhc.grayscale.rgbDeviations[ch].empty() &&
+                            (int)mhc.grayscale.rgbDeviations[ch].size() == mhc.grayscale.pointCount;
+            if (devValid) {
+                for (float v : mhc.grayscale.rgbDeviations[ch]) {
+                    // Per-channel gains; reject NaN/Inf and absurd magnitudes.
+                    if (!std::isfinite(v) || v < 0.0f || v > 8.0f) { devValid = false; break; }
+                }
+            }
+            if (!devValid) {
                 mhc.grayscale.rgbDeviations[ch].assign(mhc.grayscale.pointCount, 1.0f);
             }
         }
@@ -367,6 +383,12 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     mhc.whiteBalanceEnabled = GetPrivateProfileBool(section, (p + L"MHCWhiteBalanceEnabled").c_str(), false, iniPath);
     mhc.whiteBalanceWx = GetPrivateProfileFloat(section, (p + L"MHCWhiteBalanceWx").c_str(), 0.3127f, iniPath);
     mhc.whiteBalanceWy = GetPrivateProfileFloat(section, (p + L"MHCWhiteBalanceWy").c_str(), 0.3290f, iniPath);
+    // Chromaticity coordinates must be finite and in (0,1); a corrupt INI value would
+    // otherwise flow into the von Kries white-balance matrix.
+    if (!std::isfinite(mhc.whiteBalanceWx) || mhc.whiteBalanceWx <= 0.0f || mhc.whiteBalanceWx >= 1.0f)
+        mhc.whiteBalanceWx = 0.3127f;
+    if (!std::isfinite(mhc.whiteBalanceWy) || mhc.whiteBalanceWy <= 0.0f || mhc.whiteBalanceWy >= 1.0f)
+        mhc.whiteBalanceWy = 0.3290f;
 
     // Desktop gamma (HDR only)
     if (isHDR) {

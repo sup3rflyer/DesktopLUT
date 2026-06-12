@@ -833,10 +833,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                         float nits = nitsValues[sel];
                         if (sel == 0) {
-                            // "Custom" — sync stored value from current edit box text
+                            // "Custom" — sync stored value from current edit box text.
+                            // Clamp to the same [100, 10000] range as the Apply handler so an
+                            // empty/partial box can't store 0 nits (which ApplyMaxTmlSettings
+                            // would then push to the display on the next Start).
                             wchar_t buf[16];
                             GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
                             nits = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                            if (!std::isfinite(nits) || nits < 100.0f) nits = 100.0f;
+                            if (nits > 10000.0f) nits = 10000.0f;
                         }
                         g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nits;
                         SaveSettings();
