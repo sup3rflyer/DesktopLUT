@@ -592,9 +592,10 @@ struct MonitorContext {
     ColorCorrectionData sdrColorCorrection;
     ColorCorrectionData hdrColorCorrection;
 
-    // MHC profile active flags — tracks which MHC corrections are installed at GPU scanout
-    // Used for diagnostics logging and MHC live preview state management
-    // Note: shader corrections are always independent of MHC (all layers stack, no suppression)
+    // MHC profile active flags — tracks which MHC corrections are installed at GPU scanout.
+    // Used for diagnostics logging, MHC live preview state, AND shader suppression: when an
+    // MHC flag is set, RenderMonitor() suppresses the matching shader correction
+    // (primaries/grayscale/WB/DG) so MHC and the shader don't double-correct the same axis.
     MovableAtomic<bool> sdrMhcPrimariesActive{ false };   // SDR MHC primaries installed at GPU scanout
     MovableAtomic<bool> sdrMhcGrayscaleActive{ false };   // SDR MHC grayscale installed at GPU scanout
     MovableAtomic<bool> hdrMhcPrimariesActive{ false };   // HDR MHC primaries installed at GPU scanout

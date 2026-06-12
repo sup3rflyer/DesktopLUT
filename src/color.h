@@ -5,8 +5,10 @@
 
 #include "types.h"
 
-// Calculate 3x3 color space conversion matrix using Bradford chromatic adaptation
-// Converts from source primaries (content) to target primaries (display)
+// Calculate 3x3 color space conversion matrix from source primaries (content) to target
+// primaries (display). Direct colorimetric conversion, NO chromatic adaptation — the overlay
+// corrects the same display so source/target share the white point (see color.cpp). The MHC
+// path (mhc_*.cpp) is the one that uses Bradford, not this.
 void CalculatePrimariesMatrix(const DisplayPrimariesData& src, const DisplayPrimariesData& tgt, float* outMatrix);
 
 // CPU-side PQ (ST.2084) OETF: linear light (0-1 normalized to 10000 nits) -> PQ signal (0-1)

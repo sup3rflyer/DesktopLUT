@@ -32,8 +32,11 @@ docs/LLM_GUIDE.md
 VRR_RESEARCH.md
 DWM_HOOK_AUDIT.md
 DWM_HOOK_REPAIR.md
+STRATEGIC_REVIEW.md
 audit/
 
 # Misc
 nul
 *.log
+*.bak
+*.obj
