@@ -602,7 +602,7 @@ struct MonitorContext {
     MovableAtomic<bool> corrGsPreviewActive{ false };    // Correction GS preview: let shader GS through MHC suppression
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
-    bool cbDirty = true;                     // True when constant buffer needs update
+    MovableAtomic<bool> cbDirty{ true };     // True when constant buffer needs update (GUI thread sets it cross-thread)
     bool shaderCorrActive = false;           // True when shader is applying corrections (for tray icon)
     bool lastDesktopGamma = true;            // Cached atomic value
     bool lastTetrahedralInterp = false;      // Cached atomic value

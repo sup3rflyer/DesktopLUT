@@ -166,20 +166,26 @@ static DWORD WINAPI TopmostHelperThread(LPVOID) {
             g_selfReassertInProgress.store(true, std::memory_order_release);
 
             // Batch all z-order changes atomically via DeferWindowPos to prevent
-            // intermediate state where overlay is above analysis (causes brief flash)
-            int count = 0;
-            for (auto& ctx : g_monitors) { if (ctx.hwnd) count++; }
+            // intermediate state where overlay is above analysis (causes brief flash).
+            // This runs on the dedicated z-order thread, so snapshot the overlay hwnds
+            // under g_monitorsMutex and act on the copy — never hold the lock across a
+            // window call (SetWindowPos/DeferWindowPos can pump messages -> deadlock risk).
+            std::vector<HWND> overlayHwnds;
+            {
+                std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                overlayHwnds.reserve(g_monitors.size());
+                for (auto& ctx : g_monitors) { if (ctx.hwnd) overlayHwnds.push_back(ctx.hwnd); }
+            }
+            int count = (int)overlayHwnds.size();
             bool showAnalysis = g_analysisHwnd && g_analysisEnabled.load();
             if (showAnalysis) count++;
 
             HDWP hdwp = BeginDeferWindowPos(count);
             if (hdwp) {
-                for (auto& ctx : g_monitors) {
-                    if (ctx.hwnd) {
-                        hdwp = DeferWindowPos(hdwp, ctx.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                        if (!hdwp) break;
-                    }
+                for (HWND h : overlayHwnds) {
+                    hdwp = DeferWindowPos(hdwp, h, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    if (!hdwp) break;
                 }
                 // Analysis last = highest in z-order (above overlays)
                 if (hdwp && showAnalysis) {
@@ -373,7 +379,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         }
 
         // Don't show window yet - render loop will show it after first frame is rendered
-        g_monitors.push_back(ctx);
+        {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            g_monitors.push_back(ctx);
+        }
     }
 
     if (g_monitors.empty()) {
@@ -485,11 +494,17 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         g_overlayWakeEvent = nullptr;
     }
 
-    // Cleanup monitor contexts
+    // Cleanup monitor contexts. The cleanup loop releases D3D + destroys windows
+    // without the lock (cross-thread readers only touch POD/atomic fields, which stay
+    // valid); clear() itself is locked so a concurrent reader can't iterate a vector
+    // whose elements are being destroyed.
     for (auto& ctx : g_monitors) {
         CleanupMonitorContext(&ctx);
     }
-    g_monitors.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        g_monitors.clear();
+    }
     g_mainHwnd = nullptr;
 
     // Pump any remaining messages
@@ -690,7 +705,10 @@ void AnalysisOnlyThreadFunc() {
         }
     }
 
-    g_monitors.push_back(std::move(ctx));
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        g_monitors.push_back(std::move(ctx));
+    }
     auto& mon = g_monitors[0];
 
     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -816,7 +834,10 @@ void AnalysisOnlyThreadFunc() {
             mon.analysisStagingBuffer[i] = nullptr;
         }
     }
-    g_monitors.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        g_monitors.clear();
+    }
 
     ReleaseSharedD3DResources();
     CoUninitialize();

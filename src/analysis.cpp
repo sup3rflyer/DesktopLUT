@@ -402,9 +402,12 @@ void ShowAnalysisOverlay() {
         // Reset session tracking and pacer stats when overlay is opened.
         // Benign race: render thread may overwrite with a new max, but worst case
         // is session tracking restarts cleanly next cycle (cosmetic display data only).
-        for (auto& ctx : g_monitors) {
-            ctx.sessionMaxCLL = 0.0f;
-            ctx.sessionMaxFALL = 0.0f;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            for (auto& ctx : g_monitors) {
+                ctx.sessionMaxCLL = 0.0f;
+                ctx.sessionMaxFALL = 0.0f;
+            }
         }
         g_resetPacerStats.store(true);
 

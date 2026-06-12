@@ -59,6 +59,7 @@ static void EnsureProcessingForPreview(int monIdx, bool isHDR,
 
     // Case 1: Already running with full overlay (not analysis-only) — check mode match
     if (g_gui.isRunning && g_gui.processingThread.joinable() && !g_analysisOnlyMode.load()) {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
         for (const auto& ctx : g_monitors) {
             if (ctx.index == monIdx) {
                 livePreview = (ctx.isHDREnabled == isHDR);
@@ -80,10 +81,13 @@ static void EnsureProcessingForPreview(int monIdx, bool isHDR,
                     TranslateMessage(&pumpMsg);
                     DispatchMessage(&pumpMsg);
                 }
-                for (const auto& ctx : g_monitors) {
-                    if (ctx.index == monIdx) {
-                        livePreview = (ctx.isHDREnabled == isHDR);
-                        break;
+                {
+                    std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                    for (const auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            livePreview = (ctx.isHDREnabled == isHDR);
+                            break;
+                        }
                     }
                 }
                 if (!livePreview) Sleep(10);
@@ -108,10 +112,13 @@ static void EnsureProcessingForPreview(int monIdx, bool isHDR,
         cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
         if (g_gui.isRunning) {
             startedForPreview = true;
-            for (const auto& ctx : g_monitors) {
-                if (ctx.index == monIdx) {
-                    livePreview = (ctx.isHDREnabled == isHDR);
-                    break;
+            {
+                std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                for (const auto& ctx : g_monitors) {
+                    if (ctx.index == monIdx) {
+                        livePreview = (ctx.isHDREnabled == isHDR);
+                        break;
+                    }
                 }
             }
             if (!livePreview) {
@@ -901,22 +908,31 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                     // Clear BOTH modes' MHC profile state so processing thread
                     // sees no active profiles and sets all MHC flags to false.
-                    otherWasEnabled = otherMhc.enabled;
-                    otherProfileName = otherMhc.profileName;
-                    mhc.enabled = false;
-                    mhc.profileName.clear();
-                    mhc.profilePath.clear();
-                    otherMhc.enabled = false;
-                    otherMhc.profileName.clear();
+                    // Locked: the whitelist thread (CheckMhcProfiles) reads these wstrings
+                    // under g_monitorSettingsMutex and is only suppressed once
+                    // g_mhcEditDialogOpen is set below — this clear runs before that.
+                    {
+                        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                        otherWasEnabled = otherMhc.enabled;
+                        otherProfileName = otherMhc.profileName;
+                        mhc.enabled = false;
+                        mhc.profileName.clear();
+                        mhc.profilePath.clear();
+                        otherMhc.enabled = false;
+                        otherMhc.profileName.clear();
+                    }
 
                     // Clear MHC active flags so shader applies corrections
-                    for (auto& ctx : g_monitors) {
-                        if (ctx.index == monIdx) {
-                            ctx.sdrMhcPrimariesActive = false;
-                            ctx.sdrMhcGrayscaleActive = false;
-                            ctx.hdrMhcPrimariesActive = false;
-                            ctx.hdrMhcGrayscaleActive = false;
-                            break;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                        for (auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                ctx.sdrMhcPrimariesActive = false;
+                                ctx.sdrMhcGrayscaleActive = false;
+                                ctx.hdrMhcPrimariesActive = false;
+                                ctx.hdrMhcGrayscaleActive = false;
+                                break;
+                            }
                         }
                     }
                 }
@@ -928,8 +944,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 // Restore state after dialog closes
                 if (livePreview) {
-                    otherMhc.enabled = otherWasEnabled;
-                    otherMhc.profileName = otherProfileName;
+                    {
+                        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                        otherMhc.enabled = otherWasEnabled;
+                        otherMhc.profileName = otherProfileName;
+                    }
                     UpdateMhcFlagsLive(monIdx);
                     if (!startedForPreview) {
                         UpdateColorCorrectionLive(monIdx, isHDR);
@@ -1005,29 +1024,38 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
 
-                // Delete all cached permutation profile files
+                // Lock the MHC field writes against the whitelist reader (CheckMhcProfiles)
+                // and the generation snapshot (both read these wstrings under the mutex).
+                // DeleteFileW / GetSystemDirectory take no locks, so holding across them is
+                // safe; the *Display/*Live/SaveSettings calls below re-lock g_monitorSettingsMutex
+                // so they are deliberately left outside this scope (it is non-recursive).
                 {
-                    wchar_t sysDirPerm[MAX_PATH];
-                    GetSystemDirectory(sysDirPerm, MAX_PATH);
-                    std::wstring colorDir = std::wstring(sysDirPerm) + L"\\spool\\drivers\\color\\";
-                    for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
-                        if (!mhc.permNames[k].empty()) {
-                            DeleteFileW((colorDir + mhc.permNames[k]).c_str());
-                            mhc.permNames[k].clear();
-                            mhc.permPaths[k].clear();
+                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+
+                    // Delete all cached permutation profile files
+                    {
+                        wchar_t sysDirPerm[MAX_PATH];
+                        GetSystemDirectory(sysDirPerm, MAX_PATH);
+                        std::wstring colorDir = std::wstring(sysDirPerm) + L"\\spool\\drivers\\color\\";
+                        for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+                            if (!mhc.permNames[k].empty()) {
+                                DeleteFileW((colorDir + mhc.permNames[k]).c_str());
+                                mhc.permNames[k].clear();
+                                mhc.permPaths[k].clear();
+                            }
                         }
                     }
-                }
 
-                mhc.enabled = false;
-                mhc.profilePath.clear();
-                mhc.profileName.clear();
-                mhc.activePerm = 0;
-                mhc.hasPerChannelTRC = false;
-                mhc.metaPrimaries.clear();
-                mhc.metaGamma.clear();
-                mhc.metaWhiteBalance.clear();
-                mhc.metaPeakNits = 0.0f;
+                    mhc.enabled = false;
+                    mhc.profilePath.clear();
+                    mhc.profileName.clear();
+                    mhc.activePerm = 0;
+                    mhc.hasPerChannelTRC = false;
+                    mhc.metaPrimaries.clear();
+                    mhc.metaGamma.clear();
+                    mhc.metaWhiteBalance.clear();
+                    mhc.metaPeakNits = 0.0f;
+                }
                 UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
                 UpdateMhcFlagsLive(g_gui.currentMonitor);
                 SaveSettings();
@@ -1078,11 +1106,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
                                   : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 HWND hwndEn = isHDR ? g_gui.hwndHdrMhcGsEnable : g_gui.hwndMhcGsEnable;
-                mhc.correctionGrayscale.enabled = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                // Initialize points to identity on first enable if empty
-                if (mhc.correctionGrayscale.enabled && mhc.correctionGrayscale.points.empty()) {
-                    if (isHDR) mhc.correctionGrayscale.initLinearPQ();
-                    else mhc.correctionGrayscale.initLinear();
+                bool gsChecked = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                // Lock: initLinear*/points are a std::vector read by the generation snapshot.
+                {
+                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                    mhc.correctionGrayscale.enabled = gsChecked;
+                    // Initialize points to identity on first enable if empty
+                    if (mhc.correctionGrayscale.enabled && mhc.correctionGrayscale.points.empty()) {
+                        if (isHDR) mhc.correctionGrayscale.initLinearPQ();
+                        else mhc.correctionGrayscale.initLinear();
+                    }
                 }
                 RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
                 SaveSettings();
@@ -1104,9 +1137,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int newCount = (id == ID_MHC_SDR_GS_10 || id == ID_MHC_HDR_GS_10) ? 10 :
                                (id == ID_MHC_SDR_GS_32 || id == ID_MHC_HDR_GS_32) ? 32 : 20;
                 if (newCount != mhc.correctionGrayscale.pointCount) {
-                    mhc.correctionGrayscale.pointCount = newCount;
-                    if (isHDR) mhc.correctionGrayscale.initLinearPQ();
-                    else mhc.correctionGrayscale.initLinear();
+                    // Lock: pointCount + points (std::vector) are read by the generation snapshot.
+                    {
+                        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                        mhc.correctionGrayscale.pointCount = newCount;
+                        if (isHDR) mhc.correctionGrayscale.initLinearPQ();
+                        else mhc.correctionGrayscale.initLinear();
+                    }
                     RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
                     SaveSettings();
                 }
@@ -1140,11 +1177,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         SwapMhcToPermutation(monIdx, isHDR, previewPerm);
                     }
                     // Enable corrGsPreviewActive so shader GS passes through MHC suppression
-                    for (auto& ctx : g_monitors) {
-                        if (ctx.index == monIdx) {
-                            ctx.corrGsPreviewActive = true;
-                            ctx.cbDirty = true;
-                            break;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                        for (auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                ctx.corrGsPreviewActive = true;
+                                ctx.cbDirty = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1176,11 +1216,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_mhcEditDialogOpen.store(false);
 
                 // Disable preview flag and restore full permutation
-                for (auto& ctx : g_monitors) {
-                    if (ctx.index == monIdx) {
-                        ctx.corrGsPreviewActive = false;
-                        ctx.cbDirty = true;
-                        break;
+                {
+                    std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                    for (auto& ctx : g_monitors) {
+                        if (ctx.index == monIdx) {
+                            ctx.corrGsPreviewActive = false;
+                            ctx.cbDirty = true;
+                            break;
+                        }
                     }
                 }
                 // Regenerate ICC profile with updated correction GS (clears stale perm cache)

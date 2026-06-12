@@ -52,6 +52,11 @@ ID3D11ShaderResourceView* g_wbGammaSRV = nullptr;
 // ============================================================================
 
 std::vector<MonitorContext> g_monitors;
+std::mutex g_monitorsMutex; // Protects g_monitors STRUCTURE (push_back/clear). The
+                            // processing/render thread is the sole mutator and reads it
+                            // lock-free in the steady-state render loop; other threads
+                            // (GUI, whitelist, z-order reassert, analysis hotkey) must
+                            // hold this while iterating to avoid realloc/clear UB.
 
 // ============================================================================
 // Atomic Control Flags

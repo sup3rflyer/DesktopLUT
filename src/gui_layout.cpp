@@ -863,6 +863,13 @@ void CreateGUILayout(HWND hwnd) {
     EnumDisplayMonitors(nullptr, nullptr, GUIMonitorEnumProc, reinterpret_cast<LPARAM>(&monitors));
     g_gui.monitors = monitors;
 
+    // Reserve stable storage up front. The WM_DISPLAYCHANGE handler only ever GROWS
+    // monitorSettings (never shrinks), so reserving well beyond any real display count
+    // guarantees those later resize() calls never reallocate — which lets the MHC and
+    // grayscale editor dialogs safely hold an MHCSettings& across their modal message
+    // loop (a hot-plug pumped mid-dialog would otherwise dangle the reference).
+    g_gui.monitorSettings.reserve(64);
+
     for (size_t i = 0; i < monitors.size(); i++) {
         MONITORINFO mi = { sizeof(mi) };
         GetMonitorInfo(monitors[i], &mi);

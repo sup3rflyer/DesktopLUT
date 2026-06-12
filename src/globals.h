@@ -60,6 +60,8 @@ extern ID3D11ShaderResourceView* g_wbGammaSRV;
 // ============================================================================
 
 extern std::vector<MonitorContext> g_monitors;
+extern std::mutex g_monitorsMutex; // Protects g_monitors structure (push_back/clear) against
+                                   // cross-thread iteration. Render thread reads lock-free.
 
 // ============================================================================
 // Atomic Control Flags

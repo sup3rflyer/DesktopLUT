@@ -82,13 +82,16 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
     // In DWM hook mode with no overlay, g_monitors may be empty — trust
     // g_userDesktopGammaMode which reflects the user's DG preference (auto-generates MHC if needed)
     bool anyHDR = false;
-    if (g_monitors.empty() && g_dwmHookMode.load()) {
-        anyHDR = true;  // DG is HDR-only; g_userDesktopGammaMode guard above is sufficient
-    } else {
-        for (const auto& ctx : g_monitors) {
-            if (ctx.isHDRAtom.load(std::memory_order_relaxed)) {
-                anyHDR = true;
-                break;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        if (g_monitors.empty() && g_dwmHookMode.load()) {
+            anyHDR = true;  // DG is HDR-only; g_userDesktopGammaMode guard above is sufficient
+        } else {
+            for (const auto& ctx : g_monitors) {
+                if (ctx.isHDRAtom.load(std::memory_order_relaxed)) {
+                    anyHDR = true;
+                    break;
+                }
             }
         }
     }
@@ -227,8 +230,11 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                 g_vrrWhitelistMatch.clear();
             }
             if (!g_overlayAutoSleep.load()) {
-                for (auto& ctx : g_monitors) {
-                    ctx.requestedVisibility.store(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                    for (auto& ctx : g_monitors) {
+                        ctx.requestedVisibility.store(1, std::memory_order_relaxed);
+                    }
                 }
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             }
@@ -273,8 +279,11 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                 std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
                 g_vrrWhitelistMatch = matchedProcess;
             }
-            for (auto& ctx : g_monitors) {
-                ctx.requestedVisibility.store(-1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                for (auto& ctx : g_monitors) {
+                    ctx.requestedVisibility.store(-1, std::memory_order_relaxed);
+                }
             }
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
             std::wcout << L"VRR whitelist: detected " << matchedProcess << L", hiding overlays" << std::endl;
@@ -290,6 +299,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                 g_vrrWhitelistMatch.clear();
             }
             if (!g_overlayAutoSleep.load()) {
+                std::lock_guard<std::mutex> lk(g_monitorsMutex);
                 for (auto& ctx : g_monitors) {
                     ctx.requestedVisibility.store(1, std::memory_order_relaxed);
                 }
@@ -307,7 +317,10 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
 // Check if our MHC profiles have been displaced by another app and reapply if needed
 static void CheckMhcProfiles() {
     if (g_mhcEditDialogOpen.load()) return;
-    if (g_monitors.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        if (g_monitors.empty()) return;
+    }
     if (!IsMHC2ApiAvailable()) return;
 
     // Snapshot MHC data under lock to avoid racing with GUI thread writes

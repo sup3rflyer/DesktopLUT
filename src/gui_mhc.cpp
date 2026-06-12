@@ -43,26 +43,32 @@ void UpdateMhcFlagsLive(int monitorIndex) {
         hdrPrimEnabled = ms.hdrMHC.primariesEnabled;
     }
 
-    // Update running MonitorContext if processing is active (atomics, no lock needed)
+    // Update running MonitorContext if processing is active. The flag fields are
+    // read by the render thread; the g_monitorsMutex here guards the container
+    // traversal against a concurrent build/teardown (the snapshot lock above is
+    // already released, so there is no nesting with g_monitorSettingsMutex).
     bool found = false;
-    for (auto& ctx : g_monitors) {
-        if (ctx.index == monitorIndex) {
-            ctx.sdrMhcPrimariesActive = sdrMhcActive && sdrPrimEnabled;
-            ctx.sdrMhcGrayscaleActive = sdrMhcActive && sdrHasGs;
-            ctx.hdrMhcPrimariesActive = hdrMhcActive && hdrPrimEnabled;
-            ctx.hdrMhcGrayscaleActive = hdrMhcActive && hdrHasGs;
-            std::cout << "[MHC Flags] mon=" << monitorIndex
-                      << " sdrPrim=" << ctx.sdrMhcPrimariesActive
-                      << " sdrGs=" << ctx.sdrMhcGrayscaleActive
-                      << " hdrPrim=" << ctx.hdrMhcPrimariesActive
-                      << " hdrGs=" << ctx.hdrMhcGrayscaleActive << std::endl;
-            found = true;
-            break;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        for (auto& ctx : g_monitors) {
+            if (ctx.index == monitorIndex) {
+                ctx.sdrMhcPrimariesActive = sdrMhcActive && sdrPrimEnabled;
+                ctx.sdrMhcGrayscaleActive = sdrMhcActive && sdrHasGs;
+                ctx.hdrMhcPrimariesActive = hdrMhcActive && hdrPrimEnabled;
+                ctx.hdrMhcGrayscaleActive = hdrMhcActive && hdrHasGs;
+                std::cout << "[MHC Flags] mon=" << monitorIndex
+                          << " sdrPrim=" << ctx.sdrMhcPrimariesActive
+                          << " sdrGs=" << ctx.sdrMhcGrayscaleActive
+                          << " hdrPrim=" << ctx.hdrMhcPrimariesActive
+                          << " hdrGs=" << ctx.hdrMhcGrayscaleActive << std::endl;
+                found = true;
+                break;
+            }
         }
-    }
-    if (!found && !g_monitors.empty()) {
-        std::cout << "[MHC Flags] mon=" << monitorIndex
-                  << " NOT FOUND in g_monitors (size=" << g_monitors.size() << ")" << std::endl;
+        if (!found && !g_monitors.empty()) {
+            std::cout << "[MHC Flags] mon=" << monitorIndex
+                      << " NOT FOUND in g_monitors (size=" << g_monitors.size() << ")" << std::endl;
+        }
     }
 }
 
@@ -545,14 +551,22 @@ void SwapDgForAllMonitors(bool dgEnabled) {
 // Updates mhc.enabled/profilePath/profileName on success, calls UpdateMhcFlagsLive
 // Returns true if profile was generated and installed successfully
 bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
-    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
     if (!IsMHC2ApiAvailable()) return false;
 
-    auto& settings = g_gui.monitorSettings[monitorIndex];
-    auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
+    // Snapshot settings under lock — this runs off the GUI thread too (e.g. via
+    // SwapDgForAllMonitors on the whitelist/render thread), so we must not hold a live
+    // reference into g_gui.monitorSettings across the I/O below: the GUI thread can
+    // reassign the wstring fields or resize the vector (WM_DISPLAYCHANGE) concurrently.
+    MHCSettings mhcCopy;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        mhcCopy = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                        : g_gui.monitorSettings[monitorIndex].sdrMHC;
+    }
 
     MHC2ProfileParams params;
-    BuildMHC2Params(mhc, isHDR, monitorIndex, params);
+    BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params);
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
@@ -572,7 +586,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     std::wstring tempPath = std::wstring(tempDir) + profileName;
 
     // Save old profile info for rollback if new install fails
-    std::wstring oldProfileName = (mhc.enabled && !mhc.profileName.empty()) ? mhc.profileName : L"";
+    std::wstring oldProfileName = (mhcCopy.enabled && !mhcCopy.profileName.empty()) ? mhcCopy.profileName : L"";
 
     if (!WriteMHC2Profile(profileData, tempPath)) return false;
 
@@ -605,10 +619,13 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
 
     // Compute the active permutation from current settings
-    uint8_t perm = ComputeMhcPermutation(mhc, isHDR);
+    uint8_t perm = ComputeMhcPermutation(mhcCopy, isHDR);
 
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                          : g_gui.monitorSettings[monitorIndex].sdrMHC;
         // Clear all old cached permutation profiles (base data changed)
         ClearPermCache(mhc, monitorIndex, isHDR, false);
         mhc.enabled = true;
@@ -626,16 +643,22 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
 // Auto-regenerate and reinstall MHC profile when MHC settings change
 // Only acts if MHC is enabled and a profile is already installed for the given mode
 void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
-    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
-    auto& settings = g_gui.monitorSettings[monitorIndex];
-    auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
-    // Only require a profile name — editing inline corrections re-enables MHC automatically.
-    // An existing profileName means Apply was run at some point and a profile file exists.
-    if (mhc.profileName.empty()) return;
     if (!IsMHC2ApiAvailable()) return;
 
+    // Snapshot under lock (see GenerateAndInstallMhcProfile — reachable off the GUI thread).
+    MHCSettings mhcCopy;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
+        mhcCopy = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                        : g_gui.monitorSettings[monitorIndex].sdrMHC;
+    }
+    // Only require a profile name — editing inline corrections re-enables MHC automatically.
+    // An existing profileName means Apply was run at some point and a profile file exists.
+    if (mhcCopy.profileName.empty()) return;
+
     MHC2ProfileParams params;
-    BuildMHC2Params(mhc, isHDR, monitorIndex, params);
+    BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params);
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return;
@@ -654,7 +677,7 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     std::wstring tempPath = std::wstring(tempDir) + newProfileName;
 
     // Save old profile info for rollback if new install fails
-    std::wstring oldProfileName = mhc.profileName;
+    std::wstring oldProfileName = mhcCopy.profileName;
 
     if (!WriteMHC2Profile(profileData, tempPath)) return;
 
@@ -682,13 +705,16 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     }
 
     // Recompute active permutation (corrections may have changed)
-    uint8_t perm = ComputeMhcPermutation(mhc, isHDR);
+    uint8_t perm = ComputeMhcPermutation(mhcCopy, isHDR);
 
     // Update stored name — profile is now active, ensure enabled is true
     wchar_t sysDir2[MAX_PATH];
     GetSystemDirectory(sysDir2, MAX_PATH);
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                          : g_gui.monitorSettings[monitorIndex].sdrMHC;
         // Clear all cached permutation profiles (base data changed, variants are stale)
         ClearPermCache(mhc, monitorIndex, isHDR, false);
         mhc.enabled = true;
