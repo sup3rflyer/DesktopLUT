@@ -510,6 +510,108 @@ TEST_CASE("ICC: generate then read round-trip") {
     CHECK(icc.trcR.size() >= 256);
 }
 
+TEST_CASE("ICC: parametric curve type 3 (para) extraction") {
+    // Build a minimal ICC whose rTRC/gTRC/bTRC are parametric type-3 curves and verify the
+    // extracted TRC follows the ICC SPEC formula:  Y = (aX+b)^g for X >= d, else Y = c*X.
+    // Params g=2, a=1, b=0, c=0.1, d=0.5  ->  upper = X^2, lower = 0.1*X, max (at X=1) = 1.
+    // The old code applied a type-4-shaped formula with c/e swapped and read 7 params from a
+    // 5-param tag, so this case would have failed (spurious +c on the upper segment, garbage
+    // lower segment). max==1.0 so the reader's normalizeTRC leaves the curve unchanged.
+    auto putBE32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back((uint8_t)(x >> 24)); v.push_back((uint8_t)(x >> 16));
+        v.push_back((uint8_t)(x >> 8));  v.push_back((uint8_t)x);
+    };
+    auto putBE16 = [](std::vector<uint8_t>& v, uint16_t x) {
+        v.push_back((uint8_t)(x >> 8)); v.push_back((uint8_t)x);
+    };
+    auto putFixed = [&](std::vector<uint8_t>& v, float f) { putBE32(v, (uint32_t)FloatToS15Fixed16(f)); };
+
+    const uint32_t tagDataOffset = 168;     // 128 header + 4 count + 3*12 table
+    const uint32_t paraSize = 12 + 5 * 4;   // 'para'+reserved+funcType+reserved + 5 params = 32
+
+    std::vector<uint8_t> icc(128, 0);       // header
+    icc[36] = 'a'; icc[37] = 'c'; icc[38] = 's'; icc[39] = 'p';  // 'acsp' signature
+    putBE32(icc, 3);                        // tag count
+    const char* sigs[3] = { "rTRC", "gTRC", "bTRC" };
+    for (int t = 0; t < 3; t++) {
+        for (int k = 0; k < 4; k++) icc.push_back((uint8_t)sigs[t][k]);
+        putBE32(icc, tagDataOffset);        // all three share the same para data
+        putBE32(icc, paraSize);
+    }
+    REQUIRE(icc.size() == tagDataOffset);
+    icc.push_back('p'); icc.push_back('a'); icc.push_back('r'); icc.push_back('a');
+    putBE32(icc, 0);            // reserved
+    putBE16(icc, 3);           // funcType 3
+    putBE16(icc, 0);           // reserved
+    putFixed(icc, 2.0f);       // g
+    putFixed(icc, 1.0f);       // a
+    putFixed(icc, 0.0f);       // b
+    putFixed(icc, 0.1f);       // c
+    putFixed(icc, 0.5f);       // d
+    uint32_t sz = (uint32_t)icc.size();
+    icc[0] = (uint8_t)(sz >> 24); icc[1] = (uint8_t)(sz >> 16);
+    icc[2] = (uint8_t)(sz >> 8);  icc[3] = (uint8_t)sz;  // profile size field
+
+    TempFile tmp(L"_test_para_type3.icm");
+    {
+        std::ofstream f(tmp.path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(icc.data()), icc.size());
+    }
+
+    ICCProfileData out;
+    REQUIRE(ReadICCProfile(tmp.path, out));
+    REQUIRE(out.hasTRC);
+    REQUIRE(out.trcR.size() == 256);
+
+    // Lower segment (X < 0.5): Y = c*X = 0.1*X
+    CHECK(out.trcR[0]  == doctest::Approx(0.0f).epsilon(0.01));
+    CHECK(out.trcR[64] == doctest::Approx(0.1f * (64.0f / 255.0f)).epsilon(0.02));
+    // Upper segment (X >= 0.5): Y = X^2
+    CHECK(out.trcR[200] == doctest::Approx(std::pow(200.0f / 255.0f, 2.0f)).epsilon(0.01));
+    CHECK(out.trcR[255] == doctest::Approx(1.0f).epsilon(0.01));
+}
+
+TEST_CASE("ICC: MHC2 tag matrix serialization") {
+    // Locate the MHC2 tag in the generated profile and verify the 3x4 matrix was serialized
+    // exactly as ComputeMHC2Matrix produced it. The MHC2 tag — the product's core artifact —
+    // was previously never parsed back by any test, so a wrong tag-relative offset, byte order,
+    // s15Fixed16 scaling, matrix transpose, or sign error would have passed the whole suite.
+    MHC2ProfileParams params;
+    params.monitorName = L"TestMHC2";
+    params.displayPrimaries = kBT2020;     // non-identity: SDR wire (sRGB) != display (BT.2020)
+    params.primariesEnabled = true;
+    params.grayscaleEnabled = false;
+    params.isHDR = false;
+
+    // GenerateMHC2Profile uses sRGB as the SDR source/wire primaries and no WB gains here.
+    float expected[12];
+    ComputeMHC2Matrix(kSRGB, kBT2020, false, expected, nullptr);
+
+    std::vector<uint8_t> data;
+    REQUIRE(GenerateMHC2Profile(params, data));
+    REQUIRE(data.size() > 168);
+
+    // 'MHC2' fourcc as ReadBE32 (big-endian) sees it; MakeSig is internal to mhc.cpp.
+    const uint32_t MHC2_SIG = ((uint32_t)'M' << 24) | ((uint32_t)'H' << 16) | ((uint32_t)'C' << 8) | (uint32_t)'2';
+    uint32_t tagCount = ReadBE32(data.data() + 128);
+    uint32_t mhc2Offset = 0;
+    for (uint32_t i = 0; i < tagCount; i++) {
+        const uint8_t* e = data.data() + 132 + i * 12;
+        if (ReadBE32(e) == MHC2_SIG) { mhc2Offset = ReadBE32(e + 4); break; }
+    }
+    REQUIRE(mhc2Offset != 0);
+    REQUIRE(ReadBE32(data.data() + mhc2Offset) == MHC2_SIG);
+
+    // Matrix lives at tag-relative offset 36, 12 x s15Fixed16 big-endian. Margin is loose
+    // enough to absorb any micro-difference in the sRGB source constant yet far tighter than
+    // a transpose/sign/scaling error (the sRGB->BT.2020 matrix elements are O(0.1-1.6)).
+    const uint8_t* m = data.data() + mhc2Offset + 36;
+    for (int i = 0; i < 12; i++) {
+        float serialized = ReadS15Fixed16(m + i * 4);
+        CHECK(serialized == doctest::Approx(expected[i]).epsilon(0.02));
+    }
+}
+
 TEST_CASE("ICC: HDR profile generation") {
     MHC2ProfileParams params;
     params.monitorName = L"TestHDR";

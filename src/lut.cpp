@@ -104,11 +104,18 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
             }
         }
 
-        // Single-pass normalization: if any value exceeds 1.5 it's clearly integer range
+        // Single-pass normalization: if any RGB value exceeds 1.5 it's clearly integer
+        // range (e.g. eeColor 0..65535). Normalize RGB by the max but SKIP the alpha
+        // column (every 4th element) so alpha stays exactly 1.0 — dividing it too would
+        // leave alpha ~1.5e-5 and break the "alpha is always 1.0" invariant.
         float maxVal = 0.0f;
-        for (float v : data) maxVal = (std::max)(maxVal, v);
+        for (size_t i = 0; i < data.size(); i++) {
+            if (i % 4 != 3) maxVal = (std::max)(maxVal, data[i]);
+        }
         if (maxVal > 1.5f) {
-            for (float& v : data) v /= maxVal;
+            for (size_t i = 0; i < data.size(); i++) {
+                if (i % 4 != 3) data[i] /= maxVal;
+            }
         }
     }
 

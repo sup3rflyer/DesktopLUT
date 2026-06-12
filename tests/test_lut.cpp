@@ -381,8 +381,11 @@ TEST_CASE("LUT: eeColor .txt normalization") {
 
     CHECK(ok);
     CHECK(lutSize == 65);
-    // First entry: 0/65535 = 0
-    CHECK(data[0] == doctest::Approx(0.0f).epsilon(0.001));
-    // Values should be normalized to 0-1 range
-    CHECK(data[4] == doctest::Approx(1008.0f / 65535.0f).epsilon(0.001));
+    // RGB is normalized by the MAX written value (64*1008 = 64512), not by 65535.
+    // data[0] is entry (0,0,0)'s R = 0; data[4] is entry (r=1,g=0,b=0)'s R = 1008/64512 = 1/64.
+    CHECK(data[0] == doctest::Approx(0.0f));
+    CHECK(data[4] == doctest::Approx(1008.0f / 64512.0f));  // == 1/64
+    // The alpha column (every 4th element) must stay EXACTLY 1.0 — normalization skips it.
+    CHECK(data[3] == doctest::Approx(1.0f));
+    CHECK(data[7] == doctest::Approx(1.0f));
 }
