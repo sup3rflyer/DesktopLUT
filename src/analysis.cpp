@@ -337,8 +337,12 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 }
 
 bool CreateAnalysisOverlay(HINSTANCE hInstance) {
-    // Skip if already created (hook-only mode creates it early, overlay thread must not duplicate)
-    if (g_analysisHwnd) return true;
+    // Skip if already created (hook-only mode creates it early, overlay thread must not duplicate).
+    // Validate with IsWindow: if the thread that owned the window has since exited, USER
+    // destroyed the window and g_analysisHwnd is now a stale handle — recreate it rather than
+    // return success on a dead handle (which would leave the analysis display permanently blank).
+    if (g_analysisHwnd && IsWindow(g_analysisHwnd)) return true;
+    g_analysisHwnd = nullptr;
 
     // Register window class
     WNDCLASSEX wc = { sizeof(WNDCLASSEX) };

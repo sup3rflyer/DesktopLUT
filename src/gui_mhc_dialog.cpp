@@ -590,6 +590,17 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                             L"Unsupported Format", MB_OK | MB_ICONWARNING);
                         return 0;
                     }
+                } else {
+                    // Unknown extension (the "All Files" filter allows anything). Reject so
+                    // it isn't recorded as a loaded source — neither parse branch ran, so
+                    // hasLoadedICC/loadedFileIs1DCube are false and later regenerations would
+                    // silently extract nothing.
+                    SetWindowText(d->hwndFilePath, L"");
+                    d->loadedFilePath.clear();
+                    MessageBox(hwnd,
+                        L"Unsupported file type. Load an ICC profile (.icm / .icc) or a 1D .cube LUT.",
+                        L"Unsupported Format", MB_OK | MB_ICONWARNING);
+                    return 0;
                 }
 
                 // Auto-populate primaries from loaded file
@@ -851,6 +862,13 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
         L"DesktopLUT_MHC", isHDR ? L"MHC Settings (HDR)" : L"MHC Settings (SDR)",
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
         x, y, winW, winH, hwndParent, nullptr, GetModuleHandle(nullptr), nullptr);
+    // Window creation can fail (e.g. at early logon). Bail before the child-control
+    // creation, the EnableWindow(parent, FALSE), and the modal loop would run against a
+    // null dialog — matching the grayscale/whitelist dialogs which already check.
+    if (!dlg) {
+        std::cerr << "MHC dialog: CreateWindowEx failed, error=" << GetLastError() << std::endl;
+        return;
+    }
     data.hwndDialog = dlg;
 
     int cx = 10, cy = 8, h = 24, w = dlgW - 20;

@@ -18,6 +18,12 @@
 
 // Convert float to ICC s15Fixed16Number (multiply by 65536, round)
 int32_t FloatToS15Fixed16(float f) {
+    // s15Fixed16 represents [-32768, +32767.99998]. Guard NaN (-> 0) and out-of-range
+    // magnitudes so the float->int conversion is never UB and the tag is never silently
+    // corrupted. Current callers are bounded, so this is defensive.
+    if (!(f == f)) return 0;                       // NaN
+    if (f >= 32767.99998f)  return 0x7FFFFFFF;     // saturate +max
+    if (f <= -32768.0f)     return (int32_t)0x80000000;  // saturate -min
     return (int32_t)(f * 65536.0f + (f >= 0 ? 0.5f : -0.5f));
 }
 
