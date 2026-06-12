@@ -72,6 +72,14 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
         tags[i].sig = ReadBE32(d + base);
         tags[i].offset = ReadBE32(d + base + 4);
         tags[i].size = ReadBE32(d + base + 8);
+        // Reject any tag whose data lies outside the file (64-bit math so the add can't
+        // wrap). This neutralizes the tag (sig=0 -> findTag never returns it) and, by
+        // bounding every surviving tag->offset to <= fileSize, makes all the downstream
+        // `tag->offset + N <= fileSize` bounds checks safe from uint32 overflow on a
+        // corrupt or maliciously crafted profile.
+        if ((uint64_t)tags[i].offset + (uint64_t)tags[i].size > (uint64_t)fileSize) {
+            tags[i].sig = 0;
+        }
     }
 
     auto findTag = [&](uint32_t sig) -> const TagInfo* {

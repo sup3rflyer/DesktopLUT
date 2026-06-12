@@ -221,6 +221,13 @@ void CleanupOrphanedMhcProfiles() {
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         for (const auto& ms : g_gui.monitorSettings) {
+            // Keep the active profile name explicitly (mirrors SweepStaleMhcAssociations).
+            // The profileName == permNames[activePerm] invariant holds by convention, but a
+            // stale or hand-edited INI can break it; without this the active profile's file
+            // could be deleted at startup, after which verify reports "file missing" and
+            // never restores it.
+            if (!ms.sdrMHC.profileName.empty()) activeProfiles.insert(ms.sdrMHC.profileName);
+            if (!ms.hdrMHC.profileName.empty()) activeProfiles.insert(ms.hdrMHC.profileName);
             for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
                 if (!ms.sdrMHC.permNames[k].empty())
                     activeProfiles.insert(ms.sdrMHC.permNames[k]);
@@ -388,6 +395,19 @@ void VerifyAndRestoreMhcProfiles() {
                 return;
             }
 
+            // Re-validate under lock: a permutation swap on another thread (hotkey /
+            // whitelist DG toggle) may have changed the active profile since we
+            // snapshotted. If 'expected' is no longer the active name, it is stale —
+            // skip, or we'd re-assert the OLD permutation over the just-applied new one.
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                if (i >= (int)g_gui.monitorSettings.size()) return;
+                const std::wstring& nameNow = isHDR
+                    ? g_gui.monitorSettings[i].hdrMHC.profileName
+                    : g_gui.monitorSettings[i].sdrMHC.profileName;
+                if (nameNow != expected) return;
+            }
+
             // Windows forgot our profile. Force re-broker: remove association,
             // then re-add with setAsDefault=TRUE. This mirrors the mode-switch
             // recovery path, which has been proven to kick Windows' color
@@ -433,6 +453,18 @@ bool TriggerCalibrationLoader() {
     // CreateProcessW requires a mutable buffer for lpCommandLine.
     std::wstring mutableCmd(cmdline);
 
+    // Fully-qualify schtasks.exe via System32 and pass it as lpApplicationName.
+    // With a null lpApplicationName, CreateProcessW searches the application
+    // directory first, so a "schtasks.exe" planted next to DesktopLUT.exe could be
+    // run instead (binary planting). lpCommandLine still carries argv[0] by convention.
+    wchar_t sysDirSch[MAX_PATH];
+    UINT sysDirLen = GetSystemDirectoryW(sysDirSch, MAX_PATH);
+    if (sysDirLen == 0 || sysDirLen >= MAX_PATH) {
+        std::cerr << "MHC: GetSystemDirectory failed, error=" << GetLastError() << std::endl;
+        return false;
+    }
+    std::wstring schtasksPath = std::wstring(sysDirSch) + L"\\schtasks.exe";
+
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -442,7 +474,7 @@ bool TriggerCalibrationLoader() {
     // CREATE_NO_WINDOW suppresses the console flash that schtasks normally
     // produces. Pass explicit env = nullptr to inherit.
     BOOL ok = CreateProcessW(
-        nullptr,
+        schtasksPath.c_str(),
         mutableCmd.data(),
         nullptr, nullptr,
         FALSE,
