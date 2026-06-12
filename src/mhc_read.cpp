@@ -211,43 +211,52 @@ bool ReadICCProfile(const std::wstring& path, ICCProfileData& outData) {
                 return true;
             }
         } else if (typeSig == MakeSig("para")) {
-            // Parametric curve type
-            if (tag->offset + 16 > fileSize) return false;
+            // ICC parametricCurveType (ICC.1:2010 §10.18).
+            // Layout: 'para'(0) reserved(4) funcType:u16(8) reserved(10) params:s15Fixed16[](12..)
+            // Parameters are encoded in the fixed order g,a,b,c,d,e,f (only those the
+            // function type uses are present). Function types and their formulas:
+            //   0: Y = X^g                                          params: g          (1)
+            //   1: Y = (aX+b)^g for X >= -b/a, else 0                params: g,a,b      (3)
+            //   2: Y = (aX+b)^g + c for X >= -b/a, else c            params: g,a,b,c    (4)
+            //   3: Y = (aX+b)^g for X >= d, else c*X                 params: g,a,b,c,d  (5)
+            //   4: Y = (aX+b)^g + e for X >= d, else c*X + f         params: g,a,b,c,d,e,f (7)
+            if (tag->offset + 12 > fileSize) return false;
             uint16_t funcType = ReadBE16(p + 8);
-            if (funcType == 0) {
-                // Type 0: Y = X^g
-                outGamma = ReadS15Fixed16(p + 12);
-                outCurve.resize(256);
-                for (int i = 0; i < 256; i++) {
-                    float t = (float)i / 255.0f;
-                    outCurve[i] = powf(t, outGamma);
-                }
-                return true;
+            int paramCount;
+            switch (funcType) {
+                case 0: paramCount = 1; break;
+                case 1: paramCount = 3; break;
+                case 2: paramCount = 4; break;
+                case 3: paramCount = 5; break;
+                case 4: paramCount = 7; break;
+                default: return false;  // unknown type -> caller sees hasTRC=false
             }
-            // Other para types (1-4) are more complex; generate curve from the function
-            // For simplicity, handle type 3 (sRGB-like: Y = (aX+b)^g + c for X>=d, else eX+f)
-            if (funcType == 3 && tag->offset + 12 + 7 * 4 <= fileSize) {
-                float g = ReadS15Fixed16(p + 12);
-                float a = ReadS15Fixed16(p + 16);
-                float b = ReadS15Fixed16(p + 20);
-                float c = ReadS15Fixed16(p + 24);
-                float d_param = ReadS15Fixed16(p + 28);
-                float e = ReadS15Fixed16(p + 32);
-                float f = ReadS15Fixed16(p + 36);
-                outCurve.resize(256);
-                for (int i = 0; i < 256; i++) {
-                    float x = (float)i / 255.0f;
-                    if (x >= d_param) {
-                        outCurve[i] = powf(a * x + b, g) + c;
-                    } else {
-                        outCurve[i] = e * x + f;
-                    }
-                    outCurve[i] = std::clamp(outCurve[i], 0.0f, 1.0f);
+            if ((uint64_t)tag->offset + 12 + (uint64_t)paramCount * 4 > fileSize) return false;
+
+            float prm[7] = { 0,0,0,0,0,0,0 };
+            for (int i = 0; i < paramCount; i++) prm[i] = ReadS15Fixed16(p + 12 + i * 4);
+            const float g = prm[0];
+            const float a = prm[1], b = prm[2], c = prm[3], d_param = prm[4];
+            const float e = prm[5], f = prm[6];
+
+            outGamma = g;  // report the exponent for the channel-balance path
+            outCurve.resize(256);
+            for (int i = 0; i < 256; i++) {
+                float x = (float)i / 255.0f;
+                float base = a * x + b;
+                // Guard powf against a negative base (NaN for non-integer exponent).
+                float basePow = (base > 0.0f) ? powf(base, g) : 0.0f;
+                float y;
+                switch (funcType) {
+                    case 0:  y = powf(x, g); break;                                    // X^g
+                    case 1:  y = (a != 0.0f && x >= -b / a) ? basePow : 0.0f; break;    // (aX+b)^g | 0
+                    case 2:  y = (a != 0.0f && x >= -b / a) ? basePow + c : c; break;   // (aX+b)^g + c | c
+                    case 3:  y = (x >= d_param) ? basePow : c * x; break;               // (aX+b)^g | cX
+                    default: y = (x >= d_param) ? basePow + e : c * x + f; break;       // case 4: (aX+b)^g + e | cX + f
                 }
-                return true;
+                outCurve[i] = std::clamp(y, 0.0f, 1.0f);
             }
-            // Unsupported para types 1, 2, 4 — return false so caller sees hasTRC=false
-            return false;
+            return true;
         }
         return false;
     };

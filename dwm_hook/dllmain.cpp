@@ -1481,6 +1481,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			return FALSE;
 		}
 	case DLL_PROCESS_DETACH:
+		// lpReserved != NULL => the process (dwm.exe) is terminating, not an explicit
+		// FreeLibrary uninject. On process exit the OS reclaims all memory, handles, and
+		// the patched code pages, so the blocking thread-join + D3D teardown + free() below
+		// are not only unnecessary but actively dangerous under the loader lock (a deadlock
+		// if the monitored thread is blocked needing the lock). Skip all cleanup; only do
+		// the full teardown on a real FreeLibrary unload (lpReserved == NULL, the host
+		// uninject path). Matches dwm_hook/CLAUDE.md: "never block under the loader lock".
+		if (lpReserved != NULL) {
+			break;
+		}
 		log_to_file("DLL_PROCESS_DETACH: cleanup starting");
 
 		// Stop host monitor thread first (before removing hooks)

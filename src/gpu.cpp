@@ -653,12 +653,17 @@ bool AttemptDeviceRecovery() {
             return false;
         }
 
-        // Recreate LUT textures
-        if (!CreateLUTTexture(lutDataSDR, lutSizeSDR, &ctx.lutTextureSDR, &ctx.lutSRV_SDR)) {
-            std::cerr << "Failed to recreate SDR LUT texture for monitor " << ctx.index << std::endl;
-            return false;
+        // Recreate LUT textures (only when an SDR LUT is actually loaded — MHC-only,
+        // HDR-LUT-only, and corrections-only setups have no SDR cube. CreateLUTTexture
+        // with size 0 fails E_INVALIDARG, which would otherwise abort recovery and kill
+        // the overlay after MAX_WATCHDOG_RECOVERY_ATTEMPTS. Mirror the startup gate.)
+        if (!lutDataSDR.empty()) {
+            if (!CreateLUTTexture(lutDataSDR, lutSizeSDR, &ctx.lutTextureSDR, &ctx.lutSRV_SDR)) {
+                std::cerr << "Failed to recreate SDR LUT texture for monitor " << ctx.index << std::endl;
+                return false;
+            }
+            ctx.lutSizeSDR = lutSizeSDR;
         }
-        ctx.lutSizeSDR = lutSizeSDR;
 
         if (!lutDataHDR.empty()) {
             if (!CreateLUTTexture(lutDataHDR, lutSizeHDR, &ctx.lutTextureHDR, &ctx.lutSRV_HDR)) {

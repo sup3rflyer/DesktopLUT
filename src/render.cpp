@@ -285,11 +285,19 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = 1;
         hr = g_device->CreateShaderResourceView(frameTexture, &srvDesc, &ctx->captureSRV);
-        ctx->lastCaptureTexture = frameTexture;  // Weak ref for comparison (not AddRef'd)
+        // Only cache the weak ref on success. Caching it after a failed Create would
+        // poison the comparison: DD reuses the same texture object every frame, so the
+        // next frame would skip recreation, leave hr stale-success, and render with a
+        // NULL captureSRV -> shader samples 0 -> opaque black TOPMOST overlay that
+        // Present still succeeds on (watchdog never fires). Leave lastCaptureTexture
+        // unchanged on failure so the next frame retries the Create.
+        if (SUCCEEDED(hr)) {
+            ctx->lastCaptureTexture = frameTexture;  // Weak ref for comparison (not AddRef'd)
+        }
     }
     frameTexture->Release();
 
-    if (FAILED(hr)) {
+    if (FAILED(hr) || !ctx->captureSRV) {
         ctx->duplication->ReleaseFrame();
         return;
     }
