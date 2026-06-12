@@ -1681,6 +1681,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 // Hook is healthy — reset retry counter
                 g_dwmHookWatchdogRetries = 0;
+                // Drive the hook's monitor-state debounce to convergence after a topology
+                // change by re-sending the shared config a few times (see WM_DISPLAYCHANGE).
+                if (g_dwmHookConfigResends > 0) {
+                    UpdateDwmHookSharedConfig();
+                    g_dwmHookConfigResends--;
+                }
             }
             return 0;
         }
@@ -1821,6 +1827,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_dwmHookMode.load() && g_gui.isRunning) {
                 InvalidateDxgiMonitorCache();
                 UpdateDwmHookSharedConfig();
+                // Schedule additional resends over the next few watchdog ticks. The hook
+                // debounces monitor-set shrinks / HDR flips over 3 consecutive shared-config
+                // updates; a single WM_DISPLAYCHANGE resend would never reach that threshold,
+                // so a *persistent* shrink would never be applied by the hook. These bounded
+                // resends drive the debounce to convergence for a real change while a transient
+                // glitch (which recovers within the window) still gets rejected.
+                g_dwmHookConfigResends = 3;
             }
 
             // Force reinit if processing is running, or restart if it exited
