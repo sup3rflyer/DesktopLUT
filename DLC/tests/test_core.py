@@ -1561,6 +1561,13 @@ class HumanActionTests(unittest.TestCase):
                         "operator_handoff": {"status": "waiting_for_operator", "next_operator_action": "spectro_placed"},
                         "operator_next": "old spectro command",
                         "operator_run": "old run command",
+                        "dashboard_server_command": "python -m dlc.cli dashboard-server --run SOURCE --host 127.0.0.1",
+                        "mission_control": {
+                            "dashboard_server_command": "python -m dlc.cli dashboard-server --run SOURCE --host 127.0.0.1",
+                            "dashboard_file": "old_dashboard.html",
+                            "readout_file": "old_readout.html",
+                        },
+                        "live_setup": {"suggested_commands": {"preflight": "dlc preflight --run SOURCE"}},
                         "artifact": str(prep),
                     },
                     indent=2,
@@ -1616,6 +1623,10 @@ class HumanActionTests(unittest.TestCase):
             self.assertIn(f"--run {ctx.root}", refreshed_prep["operator_run"])
             self.assertNotIn("--run RUN", refreshed_prep["operator_next"])
             self.assertNotIn("--run RUN", refreshed_prep["operator_run"])
+            self.assertIn(f"--run {ctx.root}", refreshed_prep["dashboard_server_command"])
+            self.assertIn(f"--run {ctx.root}", refreshed_prep["mission_control"]["dashboard_server_command"])
+            self.assertIn(f"--run {ctx.root}", refreshed_prep["live_setup"]["suggested_commands"]["preflight"])
+            self.assertEqual(refreshed_prep["mission_control"]["dashboard_file"], str(ctx.root / "reports" / "dashboard.html"))
             self.assertTrue(has_human_action(open_run(ctx.root), "spectro_placed"))
 
 

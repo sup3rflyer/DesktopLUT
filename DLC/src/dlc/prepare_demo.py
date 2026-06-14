@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,21 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _rewrite_run_arg(command: str, run: Path) -> str:
+    pattern = re.compile(r"--run\s+(\"[^\"]+\"|'[^']+'|\S+)")
+    return pattern.sub(lambda _match: f"--run {run}", command)
+
+
+def _rewrite_packet_run_args(value: Any, run: Path) -> Any:
+    if isinstance(value, str):
+        return _rewrite_run_arg(value, run) if "--run" in value else value
+    if isinstance(value, list):
+        return [_rewrite_packet_run_args(item, run) for item in value]
+    if isinstance(value, dict):
+        return {key: _rewrite_packet_run_args(item, run) for key, item in value.items()}
+    return value
+
+
 def refresh_first_demo_packets(
     *,
     ctx: RunContext,
@@ -130,6 +146,7 @@ def refresh_first_demo_packets(
             prep["readout"] = str(readout)
             if isinstance(prep.get("mission_control"), dict):
                 prep["mission_control"]["readout_file"] = str(readout)
+        prep = _rewrite_packet_run_args(prep, ctx.root)
         _write_json(prep_path, prep)
         updated["first_demo_prepare"] = str(prep_path)
     return updated
