@@ -124,6 +124,43 @@ def _refresh_demo_operator_actions(ctx: RunContext, payload: dict[str, Any]) -> 
     return refreshed
 
 
+def _demo_operator_handoff(demo_gate: dict[str, Any]) -> dict[str, Any]:
+    if not demo_gate:
+        return {
+            "status": "missing_demo_gate",
+            "next_operator_action": None,
+            "next_operator_command": None,
+            "run_command": None,
+            "caution_count": 0,
+        }
+    suggested = demo_gate.get("suggested_commands") if isinstance(demo_gate.get("suggested_commands"), dict) else {}
+    next_operator = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
+    run_command = suggested.get("run_live_hardware_mock_desktoplut") or suggested.get("run_unattended")
+    if next_operator:
+        return {
+            "status": "waiting_for_operator",
+            "next_operator_action": next_operator.get("action"),
+            "next_operator_command": next_operator.get("command"),
+            "run_command": run_command,
+            "caution_count": demo_gate.get("caution_count", 0),
+        }
+    if demo_gate.get("ok") is True:
+        return {
+            "status": "ready_to_run",
+            "next_operator_action": None,
+            "next_operator_command": None,
+            "run_command": run_command,
+            "caution_count": demo_gate.get("caution_count", 0),
+        }
+    return {
+        "status": "demo_gate_blocked",
+        "next_operator_action": None,
+        "next_operator_command": None,
+        "run_command": run_command,
+        "caution_count": demo_gate.get("caution_count", 0),
+    }
+
+
 def _completion_evidence(ctx: RunContext) -> dict[str, Any]:
     latest_unattended = _latest_unattended(ctx)
     evidence = latest_unattended.get("completion_evidence") if isinstance(latest_unattended, dict) else None
@@ -587,6 +624,7 @@ def _operator_html(operator: dict[str, Any]) -> str:
     loop_status = operator.get("loop_status") if isinstance(operator.get("loop_status"), dict) else {}
     completion = operator.get("completion") if isinstance(operator.get("completion"), dict) else {}
     demo_gate = operator.get("demo_gate") if isinstance(operator.get("demo_gate"), dict) else {}
+    operator_handoff = _demo_operator_handoff(demo_gate)
     self_test = safety.get("self_test") if isinstance(safety.get("self_test"), dict) else {}
     windows_audit = safety.get("windows_local_audit") if isinstance(safety.get("windows_local_audit"), dict) else {}
     next_milestone = progress.get("next_milestone") if isinstance(progress.get("next_milestone"), dict) else None
@@ -624,13 +662,18 @@ def _operator_html(operator: dict[str, Any]) -> str:
     demo_next = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
     demo_next_text = str(demo_next.get("action")) if demo_next else ("none" if demo_gate else "missing")
     demo_text = "ready" if demo_ok else str(demo_gate.get("reason", "missing"))
+    operator_handoff = _demo_operator_handoff(demo_gate)
     caution_count = demo_gate.get("caution_count", 0) if demo_gate else 0
     cautions = demo_gate.get("cautions") if isinstance(demo_gate.get("cautions"), list) else []
     caution_names = [str(caution.get("name")) for caution in cautions[:3] if isinstance(caution, dict)]
     caution_text = ", ".join(caution_names) if caution_names else "none"
+    handoff_status = str(operator_handoff.get("status", "missing_demo_gate"))
+    next_command = str(operator_handoff.get("next_operator_command") or operator_handoff.get("run_command") or "missing")
     return f"""
       <div class="kv"><span>Workflow</span><strong>{html.escape(str(progress.get("completed", 0)))}/{html.escape(str(progress.get("total", 0)))} ({html.escape(str(progress.get("percent", 0)))}%)</strong></div>
       <div class="kv"><span>Demo Gate</span><strong class="{"ok" if demo_ok else "fail"}">{html.escape(demo_text)}</strong></div>
+      <div class="kv"><span>Handoff</span><strong class="{"warn" if handoff_status == "waiting_for_operator" else "ok" if handoff_status == "ready_to_run" else "fail"}">{html.escape(handoff_status)}</strong></div>
+      <div class="kv"><span>Next Command</span><strong>{html.escape(next_command)}</strong></div>
       <div class="kv"><span>Next Placement</span><strong class="{"warn" if demo_next else "ok"}">{html.escape(demo_next_text)}</strong></div>
       <div class="kv"><span>Demo Cautions</span><strong class="{"warn" if caution_count else "ok"}">{html.escape(str(caution_count))}</strong></div>
       <div class="kv"><span>Caution Names</span><strong class="{"warn" if caution_count else "ok"}">{html.escape(caution_text)}</strong></div>
@@ -682,6 +725,7 @@ def _readout_snapshot(
     last_command = operator.get("last_command") if isinstance(operator.get("last_command"), dict) else None
     active_command = operator.get("active_command") if isinstance(operator.get("active_command"), dict) else None
     demo_next = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
+    operator_handoff = _demo_operator_handoff(demo_gate)
     metric_value = "n/a"
     metric_label = "Latest dE00 avg"
     if latest_metrics:
@@ -730,6 +774,9 @@ def _readout_snapshot(
         "demo_gate_ok": bool(demo_gate.get("ok")),
         "demo_gate": "ready" if demo_gate.get("ok") else str(demo_gate.get("reason", "missing")),
         "demo_next_operator_action": str(demo_next.get("action")) if demo_next else ("none" if demo_gate else "missing"),
+        "demo_next_operator_command": str(operator_handoff.get("next_operator_command") or ""),
+        "demo_run_command": str(operator_handoff.get("run_command") or ""),
+        "operator_handoff_status": str(operator_handoff.get("status")),
         "demo_caution_count": demo_gate.get("caution_count", 0) if demo_gate else 0,
         "last_command_ok": bool(last_command and last_command.get("ok")),
         "last_command": _short_command(last_command),
@@ -762,6 +809,7 @@ def dashboard_status_payload(ctx: RunContext, options: DashboardOptions | None =
     loop_status = operator.get("loop_status") if isinstance(operator.get("loop_status"), dict) else {}
     completion = operator.get("completion") if isinstance(operator.get("completion"), dict) else {}
     demo_gate = operator.get("demo_gate") if isinstance(operator.get("demo_gate"), dict) else {}
+    operator_handoff = _demo_operator_handoff(demo_gate)
     quality_policy = _quality_policy(ctx)
     status_class = _status_class(next_action, readiness)
     readout = _readout_snapshot(
@@ -789,6 +837,7 @@ def dashboard_status_payload(ctx: RunContext, options: DashboardOptions | None =
         "operator": operator,
         "completion": completion,
         "demo_gate": demo_gate,
+        "operator_handoff": operator_handoff,
         "readout": readout,
         "tool_preflight": tool_preflight,
         "pipeline_evidence": pipeline_evidence,
@@ -1180,6 +1229,7 @@ def render_readout_html(
     <div class="mini"><span class="label">Loops</span><strong class="{"ok" if loops_ok else "fail"}">{html.escape(str(readout.get("loop_status", "missing")))}</strong></div>
     <div class="mini"><span class="label">Completion</span><strong class="{"ok" if completion_ok else "fail"}">{html.escape(str(readout.get("completion", "missing")))}</strong></div>
     <div class="mini"><span class="label">Demo Gate</span><strong class="{"ok" if demo_gate_ok else "fail"}">{html.escape(str(readout.get("demo_gate", "missing")))}</strong></div>
+    <div class="mini"><span class="label">Handoff</span><strong class="{"warn" if readout.get("operator_handoff_status") == "waiting_for_operator" else "ok" if readout.get("operator_handoff_status") == "ready_to_run" else "fail"}">{html.escape(str(readout.get("operator_handoff_status", "missing")))}</strong></div>
     <div class="mini"><span class="label">Next Placement</span><strong class="{"warn" if demo_next_waiting else "ok"}">{html.escape(str(readout.get("demo_next_operator_action", "missing")))}</strong></div>
     <div class="mini"><span class="label">Demo Cautions</span><strong class="{"warn" if demo_caution_count else "ok"}">{html.escape(str(demo_caution_count))}</strong></div>
     <div class="mini"><span class="label">Active Command</span><strong class="{"ok" if readout.get("active_command_running") else "muted"}">{html.escape(str(readout.get("active_command") or "idle"))}</strong></div>

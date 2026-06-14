@@ -3794,6 +3794,9 @@ class DashboardTests(unittest.TestCase):
                         "next_operator_action": {"action": "spectro_placed", "required": True, "acknowledged": False},
                         "caution_count": 1,
                         "cautions": [{"severity": "warning", "name": "profile_associations"}],
+                        "suggested_commands": {
+                            "run_live_hardware_mock_desktoplut": "python -m dlc.cli run-unattended --run RUN --port 1 --execute-safe --mock-desktoplut --allow-hardware --update-dashboard"
+                        },
                     },
                     indent=2,
                 ),
@@ -3809,14 +3812,33 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(payload["demo_gate"]["operator_actions"][0]["acknowledged"])
             self.assertFalse(payload["demo_gate"]["operator_actions"][1]["acknowledged"])
             self.assertEqual(payload["demo_gate"]["next_operator_action"]["action"], "colorimeter_placed")
+            self.assertEqual(payload["operator_handoff"]["status"], "waiting_for_operator")
+            self.assertEqual(payload["operator_handoff"]["next_operator_action"], "colorimeter_placed")
+            self.assertIn("--action colorimeter_placed", payload["operator_handoff"]["next_operator_command"])
+            self.assertIn("run-unattended", payload["operator_handoff"]["run_command"])
             self.assertTrue(payload["readout"]["demo_gate_ok"])
             self.assertEqual(payload["readout"]["demo_next_operator_action"], "colorimeter_placed")
+            self.assertEqual(payload["readout"]["operator_handoff_status"], "waiting_for_operator")
+            self.assertIn("--action colorimeter_placed", payload["readout"]["demo_next_operator_command"])
+            self.assertIn("run-unattended", payload["readout"]["demo_run_command"])
             self.assertEqual(payload["readout"]["demo_caution_count"], 1)
             self.assertIn("Demo Gate", html)
+            self.assertIn("Next Command", html)
             self.assertIn("colorimeter_placed", html)
             self.assertIn("profile_associations", html)
+            self.assertIn("Handoff", readout)
             self.assertIn("Next Placement", readout)
             self.assertIn("colorimeter_placed", readout)
+
+            acknowledge_human_action(open_run(ctx.root), "colorimeter_placed")
+            ready = dashboard_status_payload(open_run(ctx.root), DashboardOptions(port=1, execute_safe=True, mock_desktoplut=True))
+
+            self.assertEqual(ready["operator_handoff"]["status"], "ready_to_run")
+            self.assertIsNone(ready["operator_handoff"]["next_operator_action"])
+            self.assertIsNone(ready["operator_handoff"]["next_operator_command"])
+            self.assertIn("run-unattended", ready["operator_handoff"]["run_command"])
+            self.assertEqual(ready["readout"]["demo_next_operator_action"], "none")
+            self.assertEqual(ready["readout"]["operator_handoff_status"], "ready_to_run")
 
     def test_dashboard_operator_snapshot_summarizes_unattended_supervision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
