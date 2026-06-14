@@ -173,6 +173,21 @@ def _demo_operator_handoff(demo_gate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _launch_state(operator_handoff: dict[str, Any]) -> dict[str, Any]:
+    status = operator_handoff.get("status")
+    next_action = operator_handoff.get("next_operator_action")
+    run_command = operator_handoff.get("run_command")
+    ready = status == "ready_to_run" and isinstance(run_command, str) and bool(run_command)
+    return {
+        "ready": ready,
+        "status": status,
+        "pending_operator_action": next_action,
+        "blocked_by": next_action if next_action else (None if ready else status),
+        "command": run_command if ready else None,
+        "run_command": run_command,
+    }
+
+
 def _completion_evidence(ctx: RunContext) -> dict[str, Any]:
     latest_unattended = _latest_unattended(ctx)
     evidence = latest_unattended.get("completion_evidence") if isinstance(latest_unattended, dict) else None
@@ -738,6 +753,7 @@ def _readout_snapshot(
     active_command = operator.get("active_command") if isinstance(operator.get("active_command"), dict) else None
     demo_next = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
     operator_handoff = _demo_operator_handoff(demo_gate)
+    launch = _launch_state(operator_handoff)
     metric_value = "n/a"
     metric_label = "Latest dE00 avg"
     if latest_metrics:
@@ -789,6 +805,9 @@ def _readout_snapshot(
         "demo_next_operator_command": str(operator_handoff.get("next_operator_command") or ""),
         "demo_run_command": str(operator_handoff.get("run_command") or ""),
         "operator_handoff_status": str(operator_handoff.get("status")),
+        "launch_ready": bool(launch.get("ready")),
+        "launch_command": str(launch.get("command") or ""),
+        "launch_blocked_by": str(launch.get("blocked_by") or ""),
         "demo_caution_count": demo_gate.get("caution_count", 0) if demo_gate else 0,
         "last_command_ok": bool(last_command and last_command.get("ok")),
         "last_command": _short_command(last_command),
@@ -822,6 +841,7 @@ def dashboard_status_payload(ctx: RunContext, options: DashboardOptions | None =
     completion = operator.get("completion") if isinstance(operator.get("completion"), dict) else {}
     demo_gate = operator.get("demo_gate") if isinstance(operator.get("demo_gate"), dict) else {}
     operator_handoff = _demo_operator_handoff(demo_gate)
+    launch = _launch_state(operator_handoff)
     quality_policy = _quality_policy(ctx)
     status_class = _status_class(next_action, readiness)
     readout = _readout_snapshot(
@@ -850,6 +870,9 @@ def dashboard_status_payload(ctx: RunContext, options: DashboardOptions | None =
         "completion": completion,
         "demo_gate": demo_gate,
         "operator_handoff": operator_handoff,
+        "launch": launch,
+        "launch_ready": launch["ready"],
+        "launch_command": launch["command"],
         "readout": readout,
         "tool_preflight": tool_preflight,
         "pipeline_evidence": pipeline_evidence,
@@ -1096,6 +1119,7 @@ def render_readout_html(
     demo_gate_ok = bool(readout.get("demo_gate_ok"))
     demo_caution_count = int(readout.get("demo_caution_count", 0) or 0)
     demo_next_waiting = str(readout.get("demo_next_operator_action", "missing")) not in {"", "none", "missing"}
+    launch_ready = bool(readout.get("launch_ready"))
     progress = float(readout.get("progress_percent", 0.0) or 0.0)
     return f"""<!doctype html>
 <html lang="en">
@@ -1242,6 +1266,7 @@ def render_readout_html(
     <div class="mini"><span class="label">Completion</span><strong class="{"ok" if completion_ok else "fail"}">{html.escape(str(readout.get("completion", "missing")))}</strong></div>
     <div class="mini"><span class="label">Demo Gate</span><strong class="{"ok" if demo_gate_ok else "fail"}">{html.escape(str(readout.get("demo_gate", "missing")))}</strong></div>
     <div class="mini"><span class="label">Handoff</span><strong class="{"warn" if readout.get("operator_handoff_status") == "waiting_for_operator" else "ok" if readout.get("operator_handoff_status") == "ready_to_run" else "fail"}">{html.escape(str(readout.get("operator_handoff_status", "missing")))}</strong></div>
+    <div class="mini"><span class="label">Launch</span><strong class="{"ok" if launch_ready else "warn"}">{html.escape("ready" if launch_ready else str(readout.get("launch_blocked_by") or "blocked"))}</strong></div>
     <div class="mini"><span class="label">Next Placement</span><strong class="{"warn" if demo_next_waiting else "ok"}">{html.escape(str(readout.get("demo_next_operator_action", "missing")))}</strong></div>
     <div class="mini"><span class="label">Demo Cautions</span><strong class="{"warn" if demo_caution_count else "ok"}">{html.escape(str(demo_caution_count))}</strong></div>
     <div class="mini"><span class="label">Active Command</span><strong class="{"ok" if readout.get("active_command_running") else "muted"}">{html.escape(str(readout.get("active_command") or "idle"))}</strong></div>

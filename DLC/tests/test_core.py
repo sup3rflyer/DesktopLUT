@@ -4180,9 +4180,14 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(payload["operator_handoff"]["next_operator_action"], "colorimeter_placed")
             self.assertIn("--action colorimeter_placed", payload["operator_handoff"]["next_operator_command"])
             self.assertIn("run-unattended", payload["operator_handoff"]["run_command"])
+            self.assertFalse(payload["launch_ready"])
+            self.assertIsNone(payload["launch_command"])
+            self.assertEqual(payload["launch"]["blocked_by"], "colorimeter_placed")
             self.assertTrue(payload["readout"]["demo_gate_ok"])
             self.assertEqual(payload["readout"]["demo_next_operator_action"], "colorimeter_placed")
             self.assertEqual(payload["readout"]["operator_handoff_status"], "waiting_for_operator")
+            self.assertFalse(payload["readout"]["launch_ready"])
+            self.assertEqual(payload["readout"]["launch_blocked_by"], "colorimeter_placed")
             self.assertIn("--action colorimeter_placed", payload["readout"]["demo_next_operator_command"])
             self.assertIn("run-unattended", payload["readout"]["demo_run_command"])
             self.assertEqual(payload["readout"]["demo_caution_count"], 1)
@@ -4191,6 +4196,7 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("colorimeter_placed", html)
             self.assertIn("profile_associations", html)
             self.assertIn("Handoff", readout)
+            self.assertIn("Launch", readout)
             self.assertIn("Next Placement", readout)
             self.assertIn("colorimeter_placed", readout)
 
@@ -4201,8 +4207,13 @@ class DashboardTests(unittest.TestCase):
             self.assertIsNone(ready["operator_handoff"]["next_operator_action"])
             self.assertIsNone(ready["operator_handoff"]["next_operator_command"])
             self.assertIn("run-unattended", ready["operator_handoff"]["run_command"])
+            self.assertTrue(ready["launch_ready"])
+            self.assertIn("run-unattended", ready["launch_command"])
+            self.assertIsNone(ready["launch"]["blocked_by"])
             self.assertEqual(ready["readout"]["demo_next_operator_action"], "none")
             self.assertEqual(ready["readout"]["operator_handoff_status"], "ready_to_run")
+            self.assertTrue(ready["readout"]["launch_ready"])
+            self.assertIn("run-unattended", ready["readout"]["launch_command"])
 
     def test_dashboard_operator_snapshot_summarizes_unattended_supervision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

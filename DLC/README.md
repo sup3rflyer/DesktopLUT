@@ -319,7 +319,9 @@ to the run manifest. `dashboard-server` serves the dense view at
 `http://127.0.0.1:8765/readout`, and the machine-readable current status at
 `/status.json`, including the same `operator` and compact `readout` snapshots
 for agent monitors, including the compact loop, toolchain, completion, and
-quality-policy gates.
+quality-policy gates. The status payload and readout snapshot also expose
+`launch_ready` and `launch_command` so an agent can wait for physical placement
+acks before starting the walk-away command.
 `handoff` writes `reports\agent_handoff.json`, combining that status payload
 with the latest tool-preflight/self-test/unattended records, the live self-test
 gate result, artifact count,
