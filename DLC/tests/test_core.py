@@ -24,7 +24,7 @@ from dlc.dashboard import (
     write_dashboard_html,
     write_readout_html,
 )
-from dlc.cli import cmd_ack, cmd_demo_readiness, cmd_handoff, cmd_preflight, cmd_vendor_tools
+from dlc.cli import cmd_ack, cmd_demo_readiness, cmd_handoff, cmd_prepare_demo, cmd_preflight, cmd_vendor_tools
 from dlc.decisions import IterationMetrics, MetricThresholds, decide_iteration, metric_thresholds_for_run, write_decision_record, write_quality_policy
 from dlc.desktoplut_api_spec import build_desktoplut_api_spec, write_desktoplut_api_spec
 from dlc.desktoplut_client import DesktopLutClient, DesktopLutCommand, JsonlFileTransport, decode_message
@@ -1146,6 +1146,80 @@ class DemoReadinessTests(unittest.TestCase):
             expected["artifact"] = str(output)
             self.assertEqual(persisted, expected)
             self.assertEqual(printed["artifact"], str(output))
+
+    def test_cli_prepare_demo_creates_mission_control_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "first_demo"
+            readiness = {
+                "ok": True,
+                "target": "live hardware measurement with mock DesktopLUT",
+                "operator_actions": [
+                    {
+                        "action": "spectro_placed",
+                        "required": True,
+                        "acknowledged": False,
+                        "command": f'python -m dlc.cli ack --run {run} --action spectro_placed --instrument "ColorChecker Studio"',
+                    },
+                    {
+                        "action": "colorimeter_placed",
+                        "required": True,
+                        "acknowledged": False,
+                        "command": f'python -m dlc.cli ack --run {run} --action colorimeter_placed --instrument "i1 Display Pro"',
+                    },
+                ],
+                "next_operator_action": {"action": "spectro_placed", "required": True, "acknowledged": False},
+                "caution_count": 0,
+                "suggested_commands": {
+                    "run_live_hardware_mock_desktoplut": f"python -m dlc.cli run-unattended --run {run} --port 1 --execute-safe --mock-desktoplut --allow-hardware --update-dashboard"
+                },
+            }
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": run,
+                    "mode": "SDR",
+                    "display": "DISPLAY_MODEL",
+                    "meter_port": 1,
+                    "monitor_hint": "DISPLAY1",
+                    "probe_match": True,
+                    "probe_match_kind": "ccmx",
+                    "probe_match_display_tech": "u",
+                    "probe_match_high_res": True,
+                    "probe_match_display_index": 1,
+                    "probe_match_patch_window": "0.5,0.5,1.0",
+                    "adaptive_drift": True,
+                    "adaptive_drift_stages": None,
+                    "no_default_quality_policy": False,
+                    "windows_local_audit": False,
+                    "live_desktoplut": False,
+                    "allow_builds": False,
+                    "refresh_seconds": 5,
+                },
+            )()
+
+            with patch("dlc.prepare_demo.build_demo_readiness", return_value=dict(readiness)):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    rc = cmd_prepare_demo(args)
+
+            printed = json.loads(stdout.getvalue())
+            self.assertEqual(rc, 0)
+            self.assertTrue(printed["created_run"])
+            self.assertEqual(printed["operator_handoff"]["status"], "waiting_for_operator")
+            self.assertEqual(printed["operator_handoff"]["next_operator_action"], "spectro_placed")
+            self.assertIn("--action spectro_placed", printed["operator_next"])
+            self.assertIn("run-unattended", printed["operator_run"])
+            self.assertTrue((run / "reports" / "live_setup.json").exists())
+            self.assertTrue((run / "reports" / "demo_readiness_probe_match.json").exists())
+            self.assertTrue((run / "reports" / "dashboard.html").exists())
+            self.assertTrue((run / "reports" / "readout.html").exists())
+            self.assertTrue((run / "reports" / "agent_handoff.json").exists())
+            self.assertTrue((run / "reports" / "first_demo_prepare.json").exists())
+            reopened = open_run(run)
+            self.assertEqual(reopened.manifest.desktoplut["live_setup"]["meter_port"], 1)
+            self.assertTrue(reopened.manifest.desktoplut["probe_match_request"]["enabled"])
+            self.assertTrue(reopened.manifest.desktoplut["adaptive_drift"]["enabled"])
 
 
 class ToolSetTests(unittest.TestCase):

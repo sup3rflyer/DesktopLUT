@@ -98,8 +98,18 @@ python -m dlc.cli vendor-tools --manifest-existing
 python -m dlc.cli demo-readiness --port 1
 ```
 
-For a run-specific walk-away rehearsal, add the run folder after recording live
-setup and the local Windows audit:
+For a run-specific walk-away rehearsal, `prepare-demo` creates or updates the
+run folder, writes live setup, default MHC/3D LUT quality thresholds, the
+run-local demo-readiness artifact, dashboard, readout, handoff, and a compact
+`reports\first_demo_prepare.json` packet with the next operator action:
+
+```powershell
+python -m dlc.cli prepare-demo --run runs\first_demo_sdr --meter-port 1 --monitor-hint DISPLAY_ID --probe-match --probe-match-display-tech u --probe-match-high-res
+```
+
+Add `--windows-local-audit` when you want preparation to collect the safe local
+Windows ICC/gamma audit immediately instead of letting `run-unattended` collect
+it before readiness. The older manual setup path is still available:
 
 ```powershell
 python -m dlc.cli live-setup --run runs\example --meter-port 1 --monitor-hint DISPLAY_ID
@@ -238,6 +248,7 @@ python -m dlc.cli dashboard --run runs\example --execute-safe --mock-desktoplut
 python -m dlc.cli readout --run runs\example --execute-safe --mock-desktoplut
 python -m dlc.cli dashboard-server --run runs\example --execute-safe --mock-desktoplut
 python -m dlc.cli handoff --run runs\example --execute-safe --mock-desktoplut --simulate
+python -m dlc.cli prepare-demo --run runs\example --meter-port 1 --monitor-hint DISPLAY_ID --probe-match
 python -m dlc.cli supervise --run runs\example --execute-safe --mock-desktoplut --update-dashboard
 python -m dlc.cli run-unattended --run runs\example --execute-safe --mock-desktoplut --simulate --update-dashboard
 python -m dlc.cli artifact-list --run runs\example

@@ -49,6 +49,7 @@ from .patch_presenter import (
 from .pipeline_evidence import tool_evidence_from_tools, write_pipeline_evidence
 from .profile_plan import STAGE_PRESETS, execute_profile_measurement_plan, write_profile_measurement_plan
 from .preflight import record_tool_preflight_stage, write_tool_preflight
+from .prepare_demo import prepare_first_demo
 from .probe_match import execute_probe_match_plan, write_probe_match_plan
 from .profiles import default_dummy_icc, resolve_profile_path
 from .readiness import write_readiness_audit
@@ -302,6 +303,31 @@ def cmd_demo_readiness(args: argparse.Namespace) -> int:
         payload["artifact"] = str(args.output)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["ok"] else 2
+
+
+def cmd_prepare_demo(args: argparse.Namespace) -> int:
+    payload = prepare_first_demo(
+        run=args.run,
+        mode=args.mode,
+        display=args.display,
+        meter_port=args.meter_port,
+        monitor_hint=args.monitor_hint,
+        probe_match=args.probe_match,
+        probe_match_kind=args.probe_match_kind,
+        probe_match_display_tech=args.probe_match_display_tech,
+        probe_match_high_res=args.probe_match_high_res,
+        probe_match_display_index=args.probe_match_display_index,
+        probe_match_patch_window=args.probe_match_patch_window,
+        adaptive_drift=args.adaptive_drift,
+        adaptive_drift_stages=args.adaptive_drift_stages,
+        default_quality_policy=not args.no_default_quality_policy,
+        windows_local_audit=args.windows_local_audit,
+        live_desktoplut=args.live_desktoplut,
+        refresh_seconds=args.refresh_seconds,
+        allow_builds=args.allow_builds,
+    )
     print(json.dumps(payload, indent=2))
     return 0 if payload["ok"] else 2
 
@@ -1298,6 +1324,27 @@ def build_parser() -> argparse.ArgumentParser:
     demo_readiness.add_argument("--self-test-max-age-hours", type=float, default=24.0)
     demo_readiness.add_argument("--output", type=Path)
     demo_readiness.set_defaults(func=cmd_demo_readiness)
+
+    prepare_demo = sub.add_parser("prepare-demo", help="Create first-live-demo run setup, mission control, and handoff artifacts")
+    prepare_demo.add_argument("--run", type=Path, help="Run folder to create or update; defaults to a timestamped run")
+    prepare_demo.add_argument("--mode", choices=["SDR", "HDR"], default="SDR")
+    prepare_demo.add_argument("--display", default="DISPLAY_MODEL")
+    prepare_demo.add_argument("--meter-port", type=int, help="Argyll instrument port selected for this run")
+    prepare_demo.add_argument("--monitor-hint", help="Windows monitor id hint such as DISPLAY_ID for ICC/gamma audits")
+    prepare_demo.add_argument("--probe-match", action="store_true", help="Include the optional spectro-to-colorimeter branch")
+    prepare_demo.add_argument("--probe-match-kind", choices=["ccmx", "ccss"], default="ccmx")
+    prepare_demo.add_argument("--probe-match-display-tech", default="u")
+    prepare_demo.add_argument("--probe-match-high-res", action="store_true")
+    prepare_demo.add_argument("--probe-match-display-index", type=int, default=1)
+    prepare_demo.add_argument("--probe-match-patch-window", default="0.5,0.5,1.0")
+    prepare_demo.add_argument("--adaptive-drift", action="store_true", help="Enable agent-planned adaptive gray-drift rehearsal artifacts")
+    prepare_demo.add_argument("--adaptive-drift-stages", type=parse_csv_strings, default=None)
+    prepare_demo.add_argument("--no-default-quality-policy", action="store_true", help="Do not record default MHC/3D LUT acceptance policy")
+    prepare_demo.add_argument("--windows-local-audit", action="store_true", help="Also collect the local Windows ICC/gamma audit now")
+    prepare_demo.add_argument("--live-desktoplut", action="store_true", help="Prepare mission control for live DesktopLUT API mutation")
+    prepare_demo.add_argument("--allow-builds", action="store_true", help="Prepare mission control with long 3D LUT builds enabled")
+    prepare_demo.add_argument("--refresh-seconds", type=int, default=5)
+    prepare_demo.set_defaults(func=cmd_prepare_demo)
 
     dashboard = sub.add_parser("dashboard", help="Write an auto-refreshing second-monitor run dashboard")
     dashboard.add_argument("--run", type=Path, required=True)
