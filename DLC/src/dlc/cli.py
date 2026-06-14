@@ -7,6 +7,7 @@ import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from .agent import recommend_next_action
 from .argyll import Argyll
@@ -61,6 +62,17 @@ from .vendor import contained_vendor_tools, copy_vendor_tools, plan_vendor_tools
 from .windows_local import write_windows_local_audit
 from .windows_state import capture_windows_color_state
 from .workflow import describe_unattended_pipeline
+
+
+def _compact_handoff_payload(result: Any) -> dict[str, Any]:
+    return {
+        "ok": result.ok,
+        "run": result.run,
+        "artifact": result.artifact,
+        "operator_handoff": result.operator_handoff,
+        "operator_next": result.suggested_commands.get("operator_next"),
+        "operator_run": result.suggested_commands.get("operator_run"),
+    }
 
 
 def cmd_init_run(args: argparse.Namespace) -> int:
@@ -249,14 +261,7 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     result = write_agent_handoff(ctx, options=options, output=args.output)
     payload = result.as_dict()
     if getattr(args, "compact", False):
-        payload = {
-            "ok": result.ok,
-            "run": result.run,
-            "artifact": result.artifact,
-            "operator_handoff": result.operator_handoff,
-            "operator_next": result.suggested_commands.get("operator_next"),
-            "operator_run": result.suggested_commands.get("operator_run"),
-        }
+        payload = _compact_handoff_payload(result)
     print(json.dumps(payload, indent=2))
     return 0 if result.ok else 1
 
@@ -869,6 +874,26 @@ def cmd_ack(args: argparse.Namespace) -> int:
         "note": args.note,
     }
     record = acknowledge_human_action(ctx, args.action, **{k: v for k, v in details.items() if v})
+    if getattr(args, "compact_handoff", False):
+        refreshed = open_run(args.run)
+        port = resolve_live_meter_port(refreshed, getattr(args, "port", None))
+        handoff = write_agent_handoff(
+            refreshed,
+            options=DashboardOptions(
+                port=port,
+                refresh_seconds=getattr(args, "refresh_seconds", 5),
+                execute_safe=getattr(args, "execute_safe", False),
+                allow_hardware=getattr(args, "allow_hardware", False),
+                allow_live_desktoplut=getattr(args, "allow_live_desktoplut", False),
+                allow_builds=getattr(args, "allow_builds", False),
+                mock_desktoplut=getattr(args, "mock_desktoplut", False),
+                simulate_execution=getattr(args, "simulate", False),
+            ),
+        )
+        payload = _compact_handoff_payload(handoff)
+        payload["acknowledged"] = asdict(record)
+        print(json.dumps(payload, indent=2))
+        return 0 if handoff.ok else 1
     print(json.dumps(asdict(record), indent=2))
     return 0
 
@@ -1571,6 +1596,15 @@ def build_parser() -> argparse.ArgumentParser:
     ack.add_argument("--instrument")
     ack.add_argument("--position", default="center")
     ack.add_argument("--note")
+    ack.add_argument("--compact-handoff", action="store_true", help="After acknowledging, print a compact refreshed handoff packet")
+    ack.add_argument("--port", type=int, help="Argyll instrument port to use when refreshing the compact handoff")
+    ack.add_argument("--refresh-seconds", type=int, default=5)
+    ack.add_argument("--execute-safe", action="store_true", help="Refresh handoff with safe action execution enabled")
+    ack.add_argument("--mock-desktoplut", action="store_true", help="Refresh handoff with DesktopLUT mutation mock-routed")
+    ack.add_argument("--allow-hardware", action="store_true", help="Refresh handoff with hardware measurement enabled")
+    ack.add_argument("--allow-live-desktoplut", action="store_true", help="Refresh handoff with live DesktopLUT mutation enabled")
+    ack.add_argument("--allow-builds", action="store_true", help="Refresh handoff with long 3D LUT builds enabled")
+    ack.add_argument("--simulate", action="store_true", help="Refresh handoff with synthetic measurement/build rehearsal enabled")
     ack.set_defaults(func=cmd_ack)
 
     measure = sub.add_parser("measure-rgbw", help="Plan or run supervised RGBW probe-match measurements")

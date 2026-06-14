@@ -310,7 +310,10 @@ setup, the handoff includes the exact `ack_spectro_placed` or
 also promotes a compact `operator_handoff` object to the top level. Use
 `handoff --compact` when an LLM supervisor needs a low-noise refresh containing
 only `operator_handoff`, the artifact path, and the next operator/run commands.
-also suggests `preflight --run RUN`,
+`ack --compact-handoff` records a placement acknowledgement and immediately
+prints the same compact packet, so the next physical action or run command is
+visible without a separate handoff refresh.
+It also suggests `preflight --run RUN`,
 `quality-policy`, `loop-status`, and `pipeline-evidence` so an agent can refresh
 tool readiness, acceptance thresholds, loop summary, and scriptable toolchain
 proof before final reporting. For probe-match sessions, live setup and handoff
