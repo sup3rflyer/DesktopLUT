@@ -1582,6 +1582,11 @@ class HumanActionTests(unittest.TestCase):
             self.assertIn("--action colorimeter_placed", printed["operator_next"])
             self.assertIn("run-unattended", printed["operator_run"])
             self.assertTrue((ctx.root / "reports" / "agent_handoff.json").exists())
+            self.assertEqual(printed["dashboard"], str(ctx.root / "reports" / "dashboard.html"))
+            self.assertEqual(printed["readout"], str(ctx.root / "reports" / "readout.html"))
+            self.assertTrue((ctx.root / "reports" / "dashboard.html").exists())
+            self.assertTrue((ctx.root / "reports" / "readout.html").exists())
+            self.assertIn("colorimeter_placed", (ctx.root / "reports" / "dashboard.html").read_text(encoding="utf-8"))
             self.assertTrue(has_human_action(open_run(ctx.root), "spectro_placed"))
 
 

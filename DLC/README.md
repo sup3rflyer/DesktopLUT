@@ -326,7 +326,9 @@ also promotes a compact `operator_handoff` object to the top level. Use
 only `operator_handoff`, the artifact path, and the next operator/run commands.
 `ack --compact-handoff` records a placement acknowledgement and immediately
 prints the same compact packet, so the next physical action or run command is
-visible without a separate handoff refresh.
+visible without a separate handoff refresh. It also refreshes
+`reports\dashboard.html` and `reports\readout.html` for a static mission-control
+view after each placement acknowledgement.
 It also suggests `preflight --run RUN`,
 `quality-policy`, `loop-status`, and `pipeline-evidence` so an agent can refresh
 tool readiness, acceptance thresholds, loop summary, and scriptable toolchain

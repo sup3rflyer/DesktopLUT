@@ -905,21 +905,48 @@ def cmd_ack(args: argparse.Namespace) -> int:
     if getattr(args, "compact_handoff", False):
         refreshed = open_run(args.run)
         port = resolve_live_meter_port(refreshed, getattr(args, "port", None))
-        handoff = write_agent_handoff(
+        options = DashboardOptions(
+            port=port,
+            refresh_seconds=getattr(args, "refresh_seconds", 5),
+            execute_safe=getattr(args, "execute_safe", False),
+            allow_hardware=getattr(args, "allow_hardware", False),
+            allow_live_desktoplut=getattr(args, "allow_live_desktoplut", False),
+            allow_builds=getattr(args, "allow_builds", False),
+            mock_desktoplut=getattr(args, "mock_desktoplut", False),
+            simulate_execution=getattr(args, "simulate", False),
+        )
+        dashboard = write_dashboard_html(
             refreshed,
-            options=DashboardOptions(
-                port=port,
-                refresh_seconds=getattr(args, "refresh_seconds", 5),
-                execute_safe=getattr(args, "execute_safe", False),
-                allow_hardware=getattr(args, "allow_hardware", False),
-                allow_live_desktoplut=getattr(args, "allow_live_desktoplut", False),
-                allow_builds=getattr(args, "allow_builds", False),
-                mock_desktoplut=getattr(args, "mock_desktoplut", False),
-                simulate_execution=getattr(args, "simulate", False),
-            ),
+            port=options.port,
+            refresh_seconds=options.refresh_seconds,
+            execute_safe=options.execute_safe,
+            allow_hardware=options.allow_hardware,
+            allow_live_desktoplut=options.allow_live_desktoplut,
+            allow_builds=options.allow_builds,
+            mock_desktoplut=options.mock_desktoplut,
+            simulate_execution=options.simulate_execution,
+            record_stage=False,
+        )
+        readout = write_readout_html(
+            refreshed,
+            port=options.port,
+            refresh_seconds=options.refresh_seconds,
+            execute_safe=options.execute_safe,
+            allow_hardware=options.allow_hardware,
+            allow_live_desktoplut=options.allow_live_desktoplut,
+            allow_builds=options.allow_builds,
+            mock_desktoplut=options.mock_desktoplut,
+            simulate_execution=options.simulate_execution,
+            record_stage=False,
+        )
+        handoff = write_agent_handoff(
+            open_run(args.run),
+            options=options,
         )
         payload = _compact_handoff_payload(handoff)
         payload["acknowledged"] = asdict(record)
+        payload["dashboard"] = str(dashboard)
+        payload["readout"] = str(readout)
         print(json.dumps(payload, indent=2))
         return 0 if handoff.ok else 1
     print(json.dumps(asdict(record), indent=2))
