@@ -20,6 +20,7 @@ from .desktoplut_mock import MockDesktopLutTransport
 from .desktoplut_parent_plan import build_parent_implementation_plan, write_parent_implementation_plan
 from .desktoplut_state import capture_desktoplut_state
 from .dogegen import DogegenPatchDisplay
+from .demo import build_demo_readiness
 from .drift import evaluate_drift, write_drift_plan
 from .events import EventWriter, read_events
 from .final_audit import write_final_audit
@@ -56,7 +57,7 @@ from .selftest import run_self_test
 from .supervise import run_stage_once, supervise_run
 from .tools import FALLBACK_ARGYLL_BIN, FALLBACK_DOGEGEN, discover_tools
 from .unattended import run_unattended
-from .vendor import copy_vendor_tools, plan_vendor_tools, write_vendor_manifest
+from .vendor import contained_vendor_tools, copy_vendor_tools, plan_vendor_tools, write_vendor_manifest
 from .windows_local import write_windows_local_audit
 from .windows_state import capture_windows_color_state
 from .workflow import describe_unattended_pipeline
@@ -96,23 +97,36 @@ def cmd_preflight(args: argparse.Namespace) -> int:
 
 
 def cmd_vendor_tools(args: argparse.Namespace) -> int:
-    items = plan_vendor_tools(
-        argyll_source=args.argyll_source,
-        dogegen_source=args.dogegen_source,
-        overwrite=args.overwrite,
-    )
-    if args.copy:
+    if args.copy and args.manifest_existing:
+        print("--copy and --manifest-existing are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.manifest_existing:
+        items = contained_vendor_tools()
+        manifest_path = write_vendor_manifest(items, copied=False)
+    else:
+        if args.copy and (args.argyll_source is None or args.dogegen_source is None):
+            print(
+                "--copy requires --argyll-source and --dogegen-source, or set DLC_ARGYLL_BIN and DLC_DOGEGEN",
+                file=sys.stderr,
+            )
+            return 2
+        items = plan_vendor_tools(
+            argyll_source=args.argyll_source or Path("__DLC_ARGYLL_BIN_not_configured__"),
+            dogegen_source=args.dogegen_source or Path("__DLC_DOGEGEN_not_configured__"),
+            overwrite=args.overwrite,
+        )
+        manifest_path = None
+    if args.copy and not args.manifest_existing:
         items = copy_vendor_tools(items)
         manifest_path = write_vendor_manifest(items, copied=True)
-    else:
-        manifest_path = None
     payload = {
         "copied": args.copy,
+        "manifest_existing": args.manifest_existing,
         "items": [item.as_dict() for item in items],
         "manifest": str(manifest_path) if manifest_path else None,
     }
     print(json.dumps(payload, indent=2))
-    return 2 if any(item.action == "missing-source" for item in items) else 0
+    return 2 if any(item.action in {"missing-source", "missing-contained"} for item in items) else 0
 
 
 def cmd_self_test(args: argparse.Namespace) -> int:
@@ -258,6 +272,23 @@ def cmd_readiness(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result.as_dict(), indent=2))
     return 0 if result.ready_to_continue else 1
+
+
+def cmd_demo_readiness(args: argparse.Namespace) -> int:
+    payload = build_demo_readiness(
+        run=args.run,
+        port=args.port,
+        monitor_hint=args.monitor_hint,
+        probe_match=args.probe_match,
+        mock_desktoplut=not args.live_desktoplut,
+        self_test_max_age_hours=args.self_test_max_age_hours,
+    )
+    if args.output:
+        payload["artifact"] = str(args.output)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["ok"] else 2
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
@@ -1105,14 +1136,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     vendor_tools = sub.add_parser("vendor-tools", help="Plan or copy third-party tools into DLC third_party")
     vendor_tools.add_argument("--copy", action="store_true", help="Copy tools instead of only printing the plan")
+    vendor_tools.add_argument("--manifest-existing", action="store_true", help="Write vendor_manifest.json from tools already contained in third_party")
     vendor_tools.add_argument("--overwrite", action="store_true", help="Replace existing contained tools")
     vendor_tools.add_argument(
         "--argyll-source",
         type=Path,
         default=(FALLBACK_ARGYLL_BIN.parent if FALLBACK_ARGYLL_BIN is not None else None),
-        required=FALLBACK_ARGYLL_BIN is None,
     )
-    vendor_tools.add_argument("--dogegen-source", type=Path, default=FALLBACK_DOGEGEN, required=FALLBACK_DOGEGEN is None)
+    vendor_tools.add_argument("--dogegen-source", type=Path, default=FALLBACK_DOGEGEN)
     vendor_tools.set_defaults(func=cmd_vendor_tools)
 
     self_test = sub.add_parser("self-test", help="Run a full simulated unattended calibration rehearsal")
@@ -1221,6 +1252,16 @@ def build_parser() -> argparse.ArgumentParser:
     readiness.add_argument("--windows-local-audit-label", default="preflight")
     readiness.add_argument("--output", type=Path)
     readiness.set_defaults(func=cmd_readiness)
+
+    demo_readiness = sub.add_parser("demo-readiness", help="Check whether the first live demo is ready to run")
+    demo_readiness.add_argument("--run", type=Path, help="Run folder to require live setup and Windows local audit evidence from")
+    demo_readiness.add_argument("--port", type=int, help="Argyll instrument port expected for the demo")
+    demo_readiness.add_argument("--monitor-hint", help="Windows monitor hint expected for live setup/audit commands")
+    demo_readiness.add_argument("--probe-match", action="store_true", help="Require the optional spectrometer probe-match branch")
+    demo_readiness.add_argument("--live-desktoplut", action="store_true", help="Require the real DesktopLUT API instead of the mock transport")
+    demo_readiness.add_argument("--self-test-max-age-hours", type=float, default=24.0)
+    demo_readiness.add_argument("--output", type=Path)
+    demo_readiness.set_defaults(func=cmd_demo_readiness)
 
     dashboard = sub.add_parser("dashboard", help="Write an auto-refreshing second-monitor run dashboard")
     dashboard.add_argument("--run", type=Path, required=True)

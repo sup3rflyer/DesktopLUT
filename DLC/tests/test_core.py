@@ -24,7 +24,7 @@ from dlc.dashboard import (
     write_dashboard_html,
     write_readout_html,
 )
-from dlc.cli import cmd_preflight
+from dlc.cli import cmd_demo_readiness, cmd_preflight, cmd_vendor_tools
 from dlc.decisions import IterationMetrics, MetricThresholds, decide_iteration, metric_thresholds_for_run, write_decision_record, write_quality_policy
 from dlc.desktoplut_api_spec import build_desktoplut_api_spec, write_desktoplut_api_spec
 from dlc.desktoplut_client import DesktopLutClient, DesktopLutCommand, JsonlFileTransport, decode_message
@@ -33,6 +33,7 @@ from dlc.desktoplut_mock import MockDesktopLutTransport
 from dlc.desktoplut_parent_plan import build_parent_implementation_plan, render_parent_implementation_plan_markdown, write_parent_implementation_plan
 from dlc.desktoplut_state import capture_desktoplut_state
 from dlc.dogegen import DogegenPatchDisplay
+from dlc.demo import build_demo_readiness
 from dlc.drift import adaptive_gray_patch, coldest_channel_from_xyz, evaluate_drift, write_drift_plan
 from dlc.events import EventWriter, read_events
 from dlc.final_audit import write_final_audit
@@ -68,7 +69,7 @@ from dlc.selftest import latest_self_test_status, run_self_test
 from dlc.supervise import argv_for_action, run_stage_once, supervise_run
 from dlc.tools import ToolPath, ToolSet
 from dlc.unattended import completion_evidence, run_unattended
-from dlc.vendor import VendorItem, build_vendor_manifest, plan_vendor_tools, vendor_manifest_status, write_vendor_manifest
+from dlc.vendor import VendorItem, build_vendor_manifest, contained_vendor_tools, plan_vendor_tools, vendor_manifest_status, write_vendor_manifest
 from dlc.windows_local import evaluate_gamma_ramp_identity, expected_identity_gamma_value, write_windows_local_audit
 from dlc.windows_state import capture_windows_color_state
 
@@ -795,6 +796,71 @@ class VendorPlanTests(unittest.TestCase):
             self.assertEqual(by_name["dogegen"]["file_count"], 1)
             self.assertEqual(len(by_name["dogegen"]["files"][0]["sha256"]), 64)
 
+    def test_contained_vendor_manifest_records_existing_destinations(self) -> None:
+        with patch("dlc.vendor.ARGYLL_DEST_ROOT", Path("third_party") / "argyll" / "3.3.0"), patch(
+            "dlc.vendor.dogegen_path",
+            return_value=Path("third_party") / "dogegen" / "dogegen.exe",
+        ), patch.object(Path, "exists", return_value=True):
+            items = contained_vendor_tools()
+
+        self.assertEqual([item.action for item in items], ["record-existing", "record-existing"])
+        self.assertEqual(items[0].source, items[0].destination)
+        self.assertEqual(items[1].source, items[1].destination)
+
+    def test_vendor_tools_can_write_manifest_from_existing_contained_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            argyll = root / "argyll" / "3.3.0"
+            (argyll / "bin").mkdir(parents=True)
+            (argyll / "bin" / "spotread.exe").write_text("spotread", encoding="utf-8")
+            dogegen = root / "dogegen" / "dogegen.exe"
+            dogegen.parent.mkdir(parents=True)
+            dogegen.write_text("dogegen", encoding="utf-8")
+            output = root / "vendor_manifest.json"
+            with patch("dlc.vendor.ARGYLL_DEST_ROOT", argyll), patch(
+                "dlc.vendor.dogegen_path",
+                return_value=dogegen,
+            ), patch("dlc.vendor.VENDOR_MANIFEST_PATH", output):
+                stdout = io.StringIO()
+                args = type(
+                    "Args",
+                    (),
+                    {
+                        "manifest_existing": True,
+                        "copy": False,
+                        "argyll_source": None,
+                        "dogegen_source": None,
+                        "overwrite": False,
+                    },
+                )()
+                with redirect_stdout(stdout):
+                    rc = cmd_vendor_tools(args)
+
+            payload = json.loads(stdout.getvalue())
+            manifest = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(rc, 0)
+            self.assertFalse(payload["copied"])
+            self.assertTrue(payload["manifest_existing"])
+            self.assertFalse(manifest["copied"])
+            by_name = {item["name"]: item for item in manifest["items"]}
+            self.assertEqual(by_name["argyll"]["action"], "record-existing")
+            self.assertEqual(by_name["argyll"]["file_count"], 1)
+            self.assertEqual(by_name["dogegen"]["file_count"], 1)
+
+    def test_vendor_tools_rejects_copy_and_manifest_existing_together(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "manifest_existing": True,
+                "copy": True,
+                "argyll_source": None,
+                "dogegen_source": None,
+                "overwrite": False,
+            },
+        )()
+        self.assertEqual(cmd_vendor_tools(args), 2)
+
     def test_write_vendor_manifest_persists_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -882,7 +948,10 @@ class VendorPlanTests(unittest.TestCase):
     def test_preflight_run_records_tool_preflight_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
-            with patch("dlc.cli.discover_tools", return_value=make_existing_tools(Path(tmp))):
+            with patch("dlc.cli.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+                "dlc.preflight.vendor_manifest_status",
+                return_value={"ok": False, "exists": False, "reason": "missing manifest"},
+            ):
                 output = io.StringIO()
                 with redirect_stdout(output):
                     rc = cmd_preflight(type("Args", (), {"run": ctx.root, "output": None})())
@@ -895,6 +964,102 @@ class VendorPlanTests(unittest.TestCase):
             self.assertEqual(reopened.manifest.stages[-1]["stage"], "tool_preflight")
             self.assertEqual(reopened.manifest.stages[-1]["artifact"], str(ctx.root / "preflight" / "tool_preflight.json"))
             self.assertFalse(reopened.manifest.stages[-1]["vendor_manifest_ready"])
+
+
+class DemoReadinessTests(unittest.TestCase):
+    def ready_preflight(self) -> dict:
+        return {
+            "required_ready": True,
+            "contained_ready": True,
+            "contained_paths_ready": True,
+            "vendor_manifest_ready": True,
+            "missing_required": [],
+            "missing_contained": [],
+        }
+
+    def test_demo_readiness_passes_for_mock_hardware_demo_when_prereqs_are_ready(self) -> None:
+        instruments = [{"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"}]
+        with tempfile.TemporaryDirectory() as tmp, patch("dlc.demo.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+            "dlc.demo.build_tool_preflight_payload",
+            return_value=self.ready_preflight(),
+        ), patch("dlc.demo._instrument_inventory", return_value=(instruments, None)), patch(
+            "dlc.demo.latest_self_test_status",
+            return_value={"ok": True, "age_hours": 0.5},
+        ):
+            payload = build_demo_readiness(port=1)
+
+        self.assertTrue(payload["ok"])
+        checks = {check["name"]: check for check in payload["checks"]}
+        self.assertTrue(checks["contained_tool_preflight"]["ok"])
+        self.assertTrue(checks["colorimeter_connected"]["ok"])
+        self.assertFalse(checks["spectrometer_connected"]["required"])
+        self.assertIn("vendor-tools --manifest-existing", payload["suggested_commands"]["write_vendor_manifest"])
+        self.assertIn("--mock-desktoplut", payload["suggested_commands"]["run_live_hardware_mock_desktoplut"])
+
+    def test_demo_readiness_requires_spectrometer_when_probe_match_requested(self) -> None:
+        instruments = [{"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"}]
+        with tempfile.TemporaryDirectory() as tmp, patch("dlc.demo.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+            "dlc.demo.build_tool_preflight_payload",
+            return_value=self.ready_preflight(),
+        ), patch("dlc.demo._instrument_inventory", return_value=(instruments, None)), patch(
+            "dlc.demo.latest_self_test_status",
+            return_value={"ok": True, "age_hours": 0.5, "probe_match": True},
+        ):
+            payload = build_demo_readiness(port=1, probe_match=True)
+
+        checks = {check["name"]: check for check in payload["checks"]}
+        self.assertFalse(payload["ok"])
+        self.assertTrue(checks["spectrometer_connected"]["required"])
+        self.assertFalse(checks["spectrometer_connected"]["ok"])
+        self.assertIn("--probe-match", payload["suggested_commands"]["self_test"])
+
+    def test_demo_readiness_requires_run_setup_and_windows_audit_for_run_target(self) -> None:
+        instruments = [{"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"}]
+        with tempfile.TemporaryDirectory() as tmp, patch("dlc.demo.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+            "dlc.demo.build_tool_preflight_payload",
+            return_value=self.ready_preflight(),
+        ), patch("dlc.demo._instrument_inventory", return_value=(instruments, None)), patch(
+            "dlc.demo.latest_self_test_status",
+            return_value={"ok": True, "age_hours": 0.5},
+        ):
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            payload = build_demo_readiness(run=ctx.root, port=1)
+
+        checks = {check["name"]: check for check in payload["checks"]}
+        self.assertFalse(payload["ok"])
+        self.assertFalse(checks["live_setup_recorded"]["ok"])
+        self.assertFalse(checks["windows_local_audit_recorded"]["ok"])
+        self.assertIn("--run", payload["suggested_commands"]["readiness"])
+
+    def test_cli_demo_readiness_writes_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "demo_readiness.json"
+            payload = {"ok": True, "checks": [], "suggested_commands": {}}
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": None,
+                    "port": 1,
+                    "monitor_hint": None,
+                    "probe_match": False,
+                    "live_desktoplut": False,
+                    "self_test_max_age_hours": 24.0,
+                    "output": output,
+                },
+            )()
+            with patch("dlc.cli.build_demo_readiness", return_value=dict(payload)):
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    rc = cmd_demo_readiness(args)
+
+            printed = json.loads(stdout.getvalue())
+            persisted = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(rc, 0)
+            expected = dict(payload)
+            expected["artifact"] = str(output)
+            self.assertEqual(persisted, expected)
+            self.assertEqual(printed["artifact"], str(output))
 
 
 class ToolSetTests(unittest.TestCase):
@@ -2918,6 +3083,48 @@ class ReadinessTests(unittest.TestCase):
             self.assertTrue(checks["tool_preflight_snapshot"].evidence["required"])
             self.assertFalse(checks["tool_preflight_snapshot"].evidence["recorded"])
 
+    def test_readiness_accepts_preflight_artifact_relative_to_cwd(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            acknowledge_human_action(ctx, "colorimeter_placed")
+            acknowledge_human_action(ctx, "self_test_gate_override", note="test isolates relative tool preflight")
+            tools = make_existing_tools(Path(tmp))
+            preflight_path = ctx.root / "preflight" / "tool_preflight.json"
+            preflight = write_tool_preflight(
+                tools,
+                preflight_path,
+                vendor_status=valid_vendor_manifest_status(),
+            )
+            artifact = str(preflight_path.resolve().relative_to(Path.cwd()))
+            ctx.manifest.stages.append(
+                {
+                    "stage": "tool_preflight",
+                    "status": "passed",
+                    "artifact": artifact,
+                    "required_ready": preflight["required_ready"],
+                    "contained_ready": preflight["contained_ready"],
+                    "contained_paths_ready": preflight["contained_paths_ready"],
+                    "vendor_manifest_ready": preflight["vendor_manifest_ready"],
+                }
+            )
+            ctx.save()
+
+            result = write_readiness_audit(
+                ctx=open_run(ctx.root),
+                tools=tools,
+                port=1,
+                execute_safe=True,
+                allow_hardware=True,
+                allow_live_desktoplut=True,
+                allow_builds=True,
+                skip_self_test_gate=True,
+            )
+
+            checks = {check.name: check for check in result.checks}
+            self.assertTrue(checks["tool_preflight_snapshot"].ok)
+            self.assertTrue(checks["tool_preflight_snapshot"].evidence["recorded"])
+            self.assertEqual(checks["tool_preflight_snapshot"].evidence["artifact"], artifact)
+
     def test_readiness_blocks_live_side_effects_when_vendor_manifest_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
@@ -3257,7 +3464,11 @@ class DashboardTests(unittest.TestCase):
     def test_dashboard_status_payload_surfaces_tool_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
-            preflight = write_tool_preflight(make_existing_tools(Path(tmp)), ctx.root / "preflight" / "tool_preflight.json")
+            preflight = write_tool_preflight(
+                make_existing_tools(Path(tmp)),
+                ctx.root / "preflight" / "tool_preflight.json",
+                vendor_status={"ok": False, "exists": False, "reason": "missing manifest"},
+            )
             record_tool_preflight_stage(ctx, preflight)
 
             payload = dashboard_status_payload(open_run(ctx.root), DashboardOptions(execute_safe=True, mock_desktoplut=True))

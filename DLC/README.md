@@ -46,15 +46,24 @@ known local tools into DLC, run:
 python -m dlc.cli vendor-tools --copy
 ```
 
+If the tools are already in `third_party`, write the provenance manifest without
+copying from any external source:
+
+```powershell
+python -m dlc.cli vendor-tools --manifest-existing
+```
+
 The required open-path tools include Argyll `spotread`, `dispread`, `targen`,
 `colprof`, and `collink`, plus Dogegen. `collink` is required because DLC uses
 Argyll for scriptable 3D LUT generation instead of ColourSpace.
 After copying, `vendor-tools --copy` writes
 `third_party\vendor_manifest.json` with file counts, sizes, and SHA-256
-fingerprints for the contained binaries. `dlc preflight` reports that manifest
-status alongside `required_ready`, `contained_ready`, and the resolved tool
-fingerprints, marks `vendor_manifest_ready`, and writes the same evidence to
-`preflight\tool_preflight.json` for agent handoff/review.
+fingerprints for the contained binaries. `vendor-tools --manifest-existing`
+writes the same fingerprint manifest from already-contained binaries. `dlc
+preflight` reports that manifest status alongside `required_ready`,
+`contained_ready`, and the resolved tool fingerprints, marks
+`vendor_manifest_ready`, and writes the same evidence to
+`preflight\tool_preflight.json` for supervised review.
 
 ## Automation Self-Test
 
@@ -79,6 +88,31 @@ runs the optional `ccxxmake` branch through `next`/`supervise`, creates a
 synthetic `.ccmx`/`.ccss`, and verifies the raw-MHC profile plan consumed that
 correction through both metadata and Argyll `dispread -X`.
 
+## First Live Demo Gate
+
+After contained tools are fingerprinted and the self-test marker is fresh, use
+`demo-readiness` as the top-level go/no-go check for the first hardware demo:
+
+```powershell
+python -m dlc.cli vendor-tools --manifest-existing
+python -m dlc.cli demo-readiness --port 1
+```
+
+For a run-specific walk-away rehearsal, add the run folder after recording live
+setup and the local Windows audit:
+
+```powershell
+python -m dlc.cli live-setup --run runs\example --meter-port 1 --monitor-hint DISPLAY_ID
+python -m dlc.cli windows-local-audit --run runs\example --monitor-hint DISPLAY_ID
+python -m dlc.cli demo-readiness --run runs\example --port 1 --monitor-hint DISPLAY_ID --output runs\example\reports\demo_readiness.json
+```
+
+The default target is live hardware measurement with mock-routed DesktopLUT
+mutation, which is the safer first demo before enabling live app changes. Add
+`--live-desktoplut` only when the DesktopLUT named-pipe API is running and
+ready to accept real state mutations. Add `--probe-match` to require a visible
+spectrometer and a recent probe-match self-test marker.
+
 ## Current Status
 
 This repository is at the initial scaffold stage. The first vertical slice is:
@@ -97,6 +131,7 @@ This repository is at the initial scaffold stage. The first vertical slice is:
 - contained dummy ICC resolution for DesktopLUT calibration mode
 - local Windows ICC association and gamma-ramp preflight audit
 - run-specific unattended readiness audits
+- first-live-demo readiness gate for contained tools, visible instruments, self-test freshness, DesktopLUT API/mock state, live setup, and Windows audit evidence
 - auto-refreshing dashboard plus large-format second-monitor readout
 - scriptable pipeline evidence proving the run used contained DLC/Argyll tooling
 - standalone HTML reports with executive summaries, setup/probe-match evidence, automation provenance, completion/simulation proof, metrics summaries, grayscale/RGB/gamma/gamut charts, iteration history, and artifact hashes

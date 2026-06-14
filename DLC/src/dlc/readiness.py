@@ -85,7 +85,9 @@ def _resolve_artifact(ctx: RunContext, value: str | None) -> Path | None:
     if not value:
         return None
     path = Path(value)
-    return path if path.is_absolute() else ctx.root / path
+    if path.is_absolute() or path.exists():
+        return path
+    return ctx.root / path
 
 
 def _tool_preflight_snapshot(ctx: RunContext) -> dict[str, Any]:

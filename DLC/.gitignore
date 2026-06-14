@@ -7,10 +7,12 @@ runs/*
 !runs/.gitkeep
 profiles/*
 !profiles/.gitkeep
+preflight/
 
 # Contained third-party binaries are installed/copied locally.
 third_party/argyll/
 third_party/dogegen/
+third_party/vendor_manifest.json
 
 # Local/private operator and supervisor handoff notes
 docs/calibration-handoff.md

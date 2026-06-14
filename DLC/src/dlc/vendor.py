@@ -95,6 +95,27 @@ def plan_vendor_tools(
     ]
 
 
+def contained_vendor_tools() -> list[VendorItem]:
+    items = []
+    for name, destination, kind in [
+        ("argyll", ARGYLL_DEST_ROOT, "directory"),
+        ("dogegen", dogegen_path(), "file"),
+    ]:
+        destination_exists = destination.exists()
+        items.append(
+            VendorItem(
+                name=name,
+                source=destination,
+                destination=destination,
+                kind=kind,
+                source_exists=destination_exists,
+                destination_exists=destination_exists,
+                action="record-existing" if destination_exists else "missing-contained",
+            )
+        )
+    return items
+
+
 def build_vendor_manifest(items: list[VendorItem], *, copied: bool) -> dict[str, Any]:
     item_records = []
     for item in items:
