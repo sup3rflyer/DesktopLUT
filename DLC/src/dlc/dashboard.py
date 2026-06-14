@@ -147,7 +147,7 @@ def _demo_operator_handoff(demo_gate: dict[str, Any]) -> dict[str, Any]:
         }
     suggested = demo_gate.get("suggested_commands") if isinstance(demo_gate.get("suggested_commands"), dict) else {}
     next_operator = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
-    run_command = suggested.get("run_live_hardware_mock_desktoplut") or suggested.get("run_unattended")
+    run_command = suggested.get("run_unattended") or suggested.get("run_live_hardware_mock_desktoplut") or suggested.get("run_live_hardware_live_desktoplut")
     if next_operator:
         return {
             "status": "waiting_for_operator",

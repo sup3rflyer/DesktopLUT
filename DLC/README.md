@@ -121,7 +121,9 @@ python -m dlc.cli demo-readiness --run runs\example --port 1 --monitor-hint DISP
 The default target is live hardware measurement with mock-routed DesktopLUT
 mutation, which is the safer first demo before enabling live app changes. Add
 `--live-desktoplut` only when the DesktopLUT named-pipe API is running and
-ready to accept real state mutations. Add `--probe-match` to require a visible
+ready to accept real state mutations; the suggested `run_unattended` command
+then uses `--allow-live-desktoplut` instead of `--mock-desktoplut`. Add
+`--probe-match` to require a visible
 spectrometer and a recent probe-match self-test marker.
 
 `demo-readiness` also emits compact mission-control fields for an agent:

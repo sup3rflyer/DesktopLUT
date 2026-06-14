@@ -218,9 +218,15 @@ def _suggested_commands(
     port: int | None,
     monitor_hint: str | None,
     probe_match: bool,
+    mock_desktoplut: bool,
 ) -> dict[str, str]:
     port_value = str(port if port is not None else "PORT")
     run_value = str(run) if run is not None else "RUN"
+    run_unattended = f"python -m dlc.cli run-unattended --run {run_value} --port {port_value} --execute-safe --allow-hardware --update-dashboard"
+    if mock_desktoplut:
+        run_unattended += " --mock-desktoplut"
+    else:
+        run_unattended += " --allow-live-desktoplut"
     commands = {
         "write_vendor_manifest": "python -m dlc.cli vendor-tools --manifest-existing",
         "preflight": "python -m dlc.cli preflight" + (f" --run {run_value}" if run is not None else ""),
@@ -229,12 +235,21 @@ def _suggested_commands(
         "live_setup": f"python -m dlc.cli live-setup --run {run_value} --meter-port {port_value}",
         "windows_local_audit": f"python -m dlc.cli windows-local-audit --run {run_value}",
         "readiness": f"python -m dlc.cli readiness --run {run_value} --port {port_value} --execute-safe --mock-desktoplut --allow-hardware",
-        "run_live_hardware_mock_desktoplut": f"python -m dlc.cli run-unattended --run {run_value} --port {port_value} --execute-safe --mock-desktoplut --allow-hardware --update-dashboard",
+        "run_unattended": run_unattended,
     }
+    if mock_desktoplut:
+        commands["run_live_hardware_mock_desktoplut"] = run_unattended
+    else:
+        commands["run_live_hardware_live_desktoplut"] = run_unattended
+        commands["readiness"] = f"python -m dlc.cli readiness --run {run_value} --port {port_value} --execute-safe --allow-hardware --allow-live-desktoplut"
     if monitor_hint:
         commands["live_setup"] += f" --monitor-hint {monitor_hint}"
         commands["windows_local_audit"] += f" --monitor-hint {monitor_hint}"
-        commands["run_live_hardware_mock_desktoplut"] += f" --windows-monitor-hint {monitor_hint}"
+        commands["run_unattended"] += f" --windows-monitor-hint {monitor_hint}"
+        if mock_desktoplut:
+            commands["run_live_hardware_mock_desktoplut"] = commands["run_unattended"]
+        else:
+            commands["run_live_hardware_live_desktoplut"] = commands["run_unattended"]
     if probe_match:
         commands["self_test"] += " --probe-match --probe-match-display-tech u --probe-match-high-res"
         commands["live_setup"] += " --probe-match --probe-match-display-tech u --probe-match-high-res"
@@ -337,5 +352,5 @@ def build_demo_readiness(
         "next_operator_action": _next_operator_action(operator_actions),
         "cautions": cautions,
         "caution_count": len(cautions),
-        "suggested_commands": _suggested_commands(run=run, port=port, monitor_hint=monitor_hint, probe_match=probe_match),
+        "suggested_commands": _suggested_commands(run=run, port=port, monitor_hint=monitor_hint, probe_match=probe_match, mock_desktoplut=mock_desktoplut),
     }

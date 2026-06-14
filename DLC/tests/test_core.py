@@ -995,6 +995,27 @@ class DemoReadinessTests(unittest.TestCase):
         self.assertFalse(checks["spectrometer_connected"]["required"])
         self.assertIn("vendor-tools --manifest-existing", payload["suggested_commands"]["write_vendor_manifest"])
         self.assertIn("--mock-desktoplut", payload["suggested_commands"]["run_live_hardware_mock_desktoplut"])
+        self.assertEqual(payload["suggested_commands"]["run_unattended"], payload["suggested_commands"]["run_live_hardware_mock_desktoplut"])
+
+    def test_demo_readiness_live_desktoplut_suggests_live_run_command(self) -> None:
+        instruments = [{"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"}]
+        with tempfile.TemporaryDirectory() as tmp, patch("dlc.demo.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+            "dlc.demo.build_tool_preflight_payload",
+            return_value=self.ready_preflight(),
+        ), patch("dlc.demo._instrument_inventory", return_value=(instruments, None)), patch(
+            "dlc.demo.latest_self_test_status",
+            return_value={"ok": True, "age_hours": 0.5},
+        ):
+            payload = build_demo_readiness(port=1, monitor_hint="DISPLAY_ID", mock_desktoplut=False)
+
+        command = payload["suggested_commands"]["run_unattended"]
+        self.assertEqual(payload["target"], "live hardware and live DesktopLUT")
+        self.assertIn("--allow-live-desktoplut", command)
+        self.assertIn("--allow-hardware", command)
+        self.assertIn("--windows-monitor-hint DISPLAY_ID", command)
+        self.assertNotIn("--mock-desktoplut", command)
+        self.assertEqual(command, payload["suggested_commands"]["run_live_hardware_live_desktoplut"])
+        self.assertIn("--allow-live-desktoplut", payload["suggested_commands"]["readiness"])
 
     def test_demo_readiness_requires_spectrometer_when_probe_match_requested(self) -> None:
         instruments = [{"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"}]
