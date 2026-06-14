@@ -49,7 +49,7 @@ from .patch_presenter import (
 from .pipeline_evidence import tool_evidence_from_tools, write_pipeline_evidence
 from .profile_plan import STAGE_PRESETS, execute_profile_measurement_plan, write_profile_measurement_plan
 from .preflight import record_tool_preflight_stage, write_tool_preflight
-from .prepare_demo import launch_state_from_handoff, prepare_first_demo, refresh_first_demo_packets
+from .prepare_demo import launch_state_from_handoff, mission_control_from_prepare, prepare_first_demo, refresh_first_demo_packets
 from .probe_match import execute_probe_match_plan, write_probe_match_plan
 from .profiles import default_dummy_icc, resolve_profile_path
 from .readiness import write_readiness_audit
@@ -65,9 +65,9 @@ from .windows_state import capture_windows_color_state
 from .workflow import describe_unattended_pipeline
 
 
-def _compact_handoff_payload(result: Any) -> dict[str, Any]:
+def _compact_handoff_payload(result: Any, ctx: Any | None = None) -> dict[str, Any]:
     launch = launch_state_from_handoff(result)
-    return {
+    payload = {
         "ok": result.ok,
         "run": result.run,
         "artifact": result.artifact,
@@ -78,6 +78,9 @@ def _compact_handoff_payload(result: Any) -> dict[str, Any]:
         "launch_ready": launch["ready"],
         "launch_command": launch["command"],
     }
+    if ctx is not None:
+        payload.update(mission_control_from_prepare(ctx))
+    return payload
 
 
 def cmd_init_run(args: argparse.Namespace) -> int:
@@ -266,7 +269,7 @@ def cmd_handoff(args: argparse.Namespace) -> int:
     result = write_agent_handoff(ctx, options=options, output=args.output)
     payload = result.as_dict()
     if getattr(args, "compact", False):
-        payload = _compact_handoff_payload(result)
+        payload = _compact_handoff_payload(result, ctx)
     print(json.dumps(payload, indent=2))
     return 0 if result.ok else 1
 
@@ -953,7 +956,7 @@ def cmd_ack(args: argparse.Namespace) -> int:
             dashboard=dashboard,
             readout=readout,
         )
-        payload = _compact_handoff_payload(handoff)
+        payload = _compact_handoff_payload(handoff, open_run(args.run))
         payload["acknowledged"] = asdict(record)
         payload["dashboard"] = str(dashboard)
         payload["readout"] = str(readout)

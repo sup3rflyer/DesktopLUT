@@ -108,6 +108,22 @@ def _rewrite_packet_run_args(value: Any, run: Path) -> Any:
     return value
 
 
+def mission_control_from_prepare(ctx: RunContext) -> dict[str, Any]:
+    prep = _read_json(ctx.root / "reports" / "first_demo_prepare.json")
+    if prep is None:
+        return {}
+    prep = _rewrite_packet_run_args(prep, ctx.root)
+    fields: dict[str, Any] = {}
+    mission_control = prep.get("mission_control")
+    if isinstance(mission_control, dict):
+        fields["mission_control"] = mission_control
+    for key in ("dashboard_server_command", "dashboard_url", "readout_url", "status_url"):
+        value = prep.get(key)
+        if value is not None:
+            fields[key] = value
+    return fields
+
+
 def launch_state_from_handoff(handoff: Any) -> dict[str, Any]:
     operator = handoff.operator_handoff if isinstance(getattr(handoff, "operator_handoff", None), dict) else {}
     status = operator.get("status")

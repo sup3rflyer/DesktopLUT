@@ -330,7 +330,9 @@ setup, the handoff includes the exact `ack_spectro_placed` or
 `ack_colorimeter_placed` command instead of suggesting a supervisor step. It
 also promotes a compact `operator_handoff` object to the top level. Use
 `handoff --compact` when an LLM supervisor needs a low-noise refresh containing
-only `operator_handoff`, the artifact path, and the next operator/run commands.
+only `operator_handoff`, the artifact path, the next operator/run commands, and
+the mission-control server command/URLs from `reports\first_demo_prepare.json`
+when that packet exists.
 `ack --compact-handoff` records a placement acknowledgement and immediately
 prints the same compact packet, so the next physical action or run command is
 visible without a separate handoff refresh. It also refreshes

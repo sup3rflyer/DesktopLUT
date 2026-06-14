@@ -1586,8 +1586,14 @@ class HumanActionTests(unittest.TestCase):
                         "operator_next": "old spectro command",
                         "operator_run": "old run command",
                         "dashboard_server_command": "python -m dlc.cli dashboard-server --run SOURCE --host 127.0.0.1",
+                        "dashboard_url": "http://127.0.0.1:8765/",
+                        "readout_url": "http://127.0.0.1:8765/readout",
+                        "status_url": "http://127.0.0.1:8765/status.json",
                         "mission_control": {
                             "dashboard_server_command": "python -m dlc.cli dashboard-server --run SOURCE --host 127.0.0.1",
+                            "dashboard_url": "http://127.0.0.1:8765/",
+                            "readout_url": "http://127.0.0.1:8765/readout",
+                            "status_url": "http://127.0.0.1:8765/status.json",
                             "dashboard_file": "old_dashboard.html",
                             "readout_file": "old_readout.html",
                         },
@@ -1640,6 +1646,11 @@ class HumanActionTests(unittest.TestCase):
             self.assertIn("colorimeter_placed", (ctx.root / "reports" / "dashboard.html").read_text(encoding="utf-8"))
             self.assertEqual(printed["updated_packets"]["demo_readiness"], str(report))
             self.assertEqual(printed["updated_packets"]["first_demo_prepare"], str(prep))
+            self.assertIn(f"--run {ctx.root}", printed["dashboard_server_command"])
+            self.assertEqual(printed["dashboard_url"], "http://127.0.0.1:8765/")
+            self.assertEqual(printed["readout_url"], "http://127.0.0.1:8765/readout")
+            self.assertEqual(printed["status_url"], "http://127.0.0.1:8765/status.json")
+            self.assertIn(f"--run {ctx.root}", printed["mission_control"]["dashboard_server_command"])
             refreshed_report = json.loads(report.read_text(encoding="utf-8"))
             refreshed_prep = json.loads(prep.read_text(encoding="utf-8"))
             self.assertTrue(refreshed_report["operator_actions"][0]["acknowledged"])
@@ -1672,6 +1683,8 @@ class HumanActionTests(unittest.TestCase):
             self.assertEqual(printed["operator_handoff"]["status"], "ready_to_run")
             self.assertTrue(printed["launch_ready"])
             self.assertIn("run-unattended", printed["launch_command"])
+            self.assertIn(f"--run {ctx.root}", printed["dashboard_server_command"])
+            self.assertEqual(printed["mission_control"]["readout_url"], "http://127.0.0.1:8765/readout")
             self.assertTrue(refreshed_prep["launch_ready"])
             self.assertEqual(refreshed_prep["launch_command"], printed["launch_command"])
 
@@ -3124,6 +3137,27 @@ class AgentHandoffTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            prep = ctx.root / "reports" / "first_demo_prepare.json"
+            prep.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "run": str(ctx.root),
+                        "dashboard_server_command": "python -m dlc.cli dashboard-server --run SOURCE --host 127.0.0.1",
+                        "dashboard_url": "http://127.0.0.1:8765/",
+                        "readout_url": "http://127.0.0.1:8765/readout",
+                        "status_url": "http://127.0.0.1:8765/status.json",
+                        "mission_control": {
+                            "dashboard_server_command": "python -m dlc.cli dashboard-server --run SOURCE --host 127.0.0.1",
+                            "dashboard_url": "http://127.0.0.1:8765/",
+                            "readout_url": "http://127.0.0.1:8765/readout",
+                            "status_url": "http://127.0.0.1:8765/status.json",
+                        },
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             stdout = io.StringIO()
             args = type(
                 "Args",
@@ -3153,6 +3187,11 @@ class AgentHandoffTests(unittest.TestCase):
             self.assertIn("run-unattended", printed["operator_run"])
             self.assertIn("agent_handoff.json", printed["artifact"])
             self.assertNotIn("status", printed)
+            self.assertIn(f"--run {ctx.root}", printed["dashboard_server_command"])
+            self.assertEqual(printed["dashboard_url"], "http://127.0.0.1:8765/")
+            self.assertEqual(printed["readout_url"], "http://127.0.0.1:8765/readout")
+            self.assertEqual(printed["status_url"], "http://127.0.0.1:8765/status.json")
+            self.assertIn(f"--run {ctx.root}", printed["mission_control"]["dashboard_server_command"])
             self.assertTrue((ctx.root / "reports" / "agent_handoff.json").exists())
 
 
