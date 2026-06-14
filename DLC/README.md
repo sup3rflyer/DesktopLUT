@@ -113,6 +113,12 @@ mutation, which is the safer first demo before enabling live app changes. Add
 ready to accept real state mutations. Add `--probe-match` to require a visible
 spectrometer and a recent probe-match self-test marker.
 
+`demo-readiness` also emits compact mission-control fields for an agent:
+`operator_actions` lists the required human placement acknowledgements in order,
+`next_operator_action` names the next placement/ack command to wait for, and
+`cautions` lifts Windows-audit warnings such as noisy ICC associations or an
+unreadable desktop gamma ramp out of the larger evidence blob.
+
 ## Current Status
 
 This repository is at the initial scaffold stage. The first vertical slice is:

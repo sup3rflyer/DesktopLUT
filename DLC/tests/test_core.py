@@ -1031,6 +1031,92 @@ class DemoReadinessTests(unittest.TestCase):
         self.assertFalse(checks["windows_local_audit_recorded"]["ok"])
         self.assertIn("--run", payload["suggested_commands"]["readiness"])
 
+    def test_demo_readiness_surfaces_operator_actions_and_audit_cautions(self) -> None:
+        instruments = [
+            {"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"},
+            {"port": 2, "description": "X-Rite ColorMunki spectro", "kind": "spectrometer"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch("dlc.demo.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+            "dlc.demo.build_tool_preflight_payload",
+            return_value=self.ready_preflight(),
+        ), patch("dlc.demo._instrument_inventory", return_value=(instruments, None)), patch(
+            "dlc.demo.latest_self_test_status",
+            return_value={"ok": True, "age_hours": 0.5, "probe_match": True},
+        ):
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            ctx.manifest.desktoplut["live_setup"] = {
+                "meter_port": 1,
+                "probe_match": {"enabled": True},
+            }
+            ctx.manifest.desktoplut["windows_local_audits"] = {
+                "preflight": {
+                    "ok": True,
+                    "findings": [
+                        {"severity": "ok", "name": "gamma_ramp_identity", "detail": "identity", "evidence": {}},
+                        {
+                            "severity": "warning",
+                            "name": "gamma_ramp_unavailable",
+                            "detail": "Desktop gamma ramp could not be read locally.",
+                            "evidence": {"error": "GetDeviceGammaRamp failed"},
+                        },
+                        {
+                            "severity": "warning",
+                            "name": "profile_associations",
+                            "detail": "Non-benign ICC association strings are present.",
+                            "evidence": {
+                                "monitor_hint": None,
+                                "matched_count": 2,
+                                "disallowed": [
+                                    {"key": "DISPLAY\\1", "name": "ICMProfile", "profile_name": "custom.icm"},
+                                    {"key": "DISPLAY\\2", "name": "ICMProfile", "profile_name": "other.icm"},
+                                ],
+                            },
+                        },
+                    ],
+                }
+            }
+            ctx.save()
+
+            payload = build_demo_readiness(run=ctx.root, port=1, probe_match=True)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["caution_count"], 2)
+        cautions = {caution["name"]: caution for caution in payload["cautions"]}
+        self.assertEqual(cautions["gamma_ramp_unavailable"]["evidence"]["error"], "GetDeviceGammaRamp failed")
+        self.assertNotIn("disallowed", cautions["profile_associations"]["evidence"])
+        self.assertEqual(cautions["profile_associations"]["evidence"]["disallowed_count"], 2)
+        self.assertEqual(len(cautions["profile_associations"]["evidence"]["disallowed_samples"]), 2)
+        self.assertEqual(payload["next_operator_action"]["action"], "spectro_placed")
+        self.assertEqual([item["action"] for item in payload["operator_actions"]], ["spectro_placed", "colorimeter_placed"])
+        self.assertFalse(payload["operator_actions"][0]["acknowledged"])
+
+    def test_demo_readiness_moves_next_operator_action_after_ack(self) -> None:
+        instruments = [
+            {"port": 1, "description": "X-Rite i1 DisplayPro", "kind": "colorimeter"},
+            {"port": 2, "description": "X-Rite ColorMunki spectro", "kind": "spectrometer"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch("dlc.demo.discover_tools", return_value=make_existing_tools(Path(tmp))), patch(
+            "dlc.demo.build_tool_preflight_payload",
+            return_value=self.ready_preflight(),
+        ), patch("dlc.demo._instrument_inventory", return_value=(instruments, None)), patch(
+            "dlc.demo.latest_self_test_status",
+            return_value={"ok": True, "age_hours": 0.5, "probe_match": True},
+        ):
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            ctx.manifest.desktoplut["live_setup"] = {
+                "meter_port": 1,
+                "probe_match": {"enabled": True},
+            }
+            ctx.manifest.desktoplut["windows_local_audits"] = {"preflight": {"ok": True, "findings": []}}
+            ctx.save()
+            acknowledge_human_action(open_run(ctx.root), "spectro_placed", instrument="ColorChecker Studio")
+
+            payload = build_demo_readiness(run=ctx.root, port=1, probe_match=True)
+
+        self.assertEqual(payload["next_operator_action"]["action"], "colorimeter_placed")
+        self.assertTrue(payload["operator_actions"][0]["acknowledged"])
+        self.assertFalse(payload["operator_actions"][1]["acknowledged"])
+
     def test_cli_demo_readiness_writes_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "demo_readiness.json"

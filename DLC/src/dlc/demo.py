@@ -10,8 +10,9 @@ from typing import Any
 from .argyll import Argyll
 from .desktoplut_client import DesktopLutApiError, DesktopLutClient
 from .desktoplut_mock import MockDesktopLutTransport
+from .human_actions import has_human_action
 from .preflight import build_tool_preflight_payload
-from .runs import open_run
+from .runs import RunContext, open_run
 from .selftest import latest_self_test_status
 from .tools import discover_tools
 
@@ -97,6 +98,98 @@ def _live_setup(run: Path | None) -> dict[str, Any] | None:
     return setup if isinstance(setup, dict) else None
 
 
+def _run_context(run: Path | None) -> RunContext | None:
+    if run is None:
+        return None
+    try:
+        return open_run(run)
+    except FileNotFoundError:
+        return None
+
+
+def _audit_cautions(windows_audit: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(windows_audit, dict):
+        return []
+    findings = windows_audit.get("findings")
+    if not isinstance(findings, list):
+        return []
+    cautions = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        severity = str(finding.get("severity", ""))
+        if severity in {"", "ok"}:
+            continue
+        cautions.append(
+            {
+                "severity": severity,
+                "name": finding.get("name"),
+                "detail": finding.get("detail"),
+                "evidence": _compact_caution_evidence(finding.get("evidence", {})),
+            }
+        )
+    return cautions
+
+
+def _compact_caution_evidence(evidence: Any) -> dict[str, Any]:
+    if not isinstance(evidence, dict):
+        return {}
+    compact = {key: value for key, value in evidence.items() if key != "disallowed"}
+    disallowed = evidence.get("disallowed")
+    if isinstance(disallowed, list):
+        compact["disallowed_count"] = len(disallowed)
+        compact["disallowed_samples"] = [
+            {
+                "key": item.get("key"),
+                "name": item.get("name"),
+                "profile_name": item.get("profile_name"),
+            }
+            for item in disallowed[:3]
+            if isinstance(item, dict)
+        ]
+    return compact
+
+
+def _operator_actions(
+    *,
+    ctx: RunContext | None,
+    run: Path | None,
+    probe_match: bool,
+) -> list[dict[str, Any]]:
+    if ctx is None or run is None:
+        return []
+    actions = []
+    if probe_match:
+        acknowledged = has_human_action(ctx, "spectro_placed")
+        actions.append(
+            {
+                "action": "spectro_placed",
+                "required": True,
+                "acknowledged": acknowledged,
+                "command": f'python -m dlc.cli ack --run {run} --action spectro_placed --instrument "ColorChecker Studio"',
+                "reason": "Place the spectrometer for the optional probe-match reference before ccxxmake runs.",
+            }
+        )
+    acknowledged = has_human_action(ctx, "colorimeter_placed")
+    actions.append(
+        {
+            "action": "colorimeter_placed",
+            "required": True,
+            "acknowledged": acknowledged,
+            "command": f'python -m dlc.cli ack --run {run} --action colorimeter_placed --instrument "i1 Display Pro"',
+            "reason": "Place the colorimeter at screen center for unattended Argyll measurements.",
+        }
+    )
+    return actions
+
+
+def _next_operator_action(actions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for action in actions:
+        if action.get("required") is True and action.get("acknowledged") is not True:
+            return action
+    return None
+
+
 def _suggested_commands(
     *,
     run: Path | None,
@@ -144,6 +237,9 @@ def build_demo_readiness(
     desktoplut = _desktoplut_probe(mock_desktoplut=mock_desktoplut)
     setup = _live_setup(run)
     windows_audit = _latest_windows_local_audit(run, "preflight")
+    ctx = _run_context(run)
+    operator_actions = _operator_actions(ctx=ctx, run=run, probe_match=probe_match)
+    cautions = _audit_cautions(windows_audit)
 
     checks = [
         DemoCheck(
@@ -215,6 +311,9 @@ def build_demo_readiness(
         "probe_match": probe_match,
         "mock_desktoplut": mock_desktoplut,
         "checks": [check.as_dict() for check in checks],
+        "operator_actions": operator_actions,
+        "next_operator_action": _next_operator_action(operator_actions),
+        "cautions": cautions,
+        "caution_count": len(cautions),
         "suggested_commands": _suggested_commands(run=run, port=port, monitor_hint=monitor_hint, probe_match=probe_match),
     }
-
