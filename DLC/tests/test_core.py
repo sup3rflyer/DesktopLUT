@@ -2719,6 +2719,7 @@ class AgentHandoffTests(unittest.TestCase):
             self.assertEqual(handoff.latest_unattended["simulate_execution"], True)
             self.assertEqual(handoff.latest_tool_preflight["required_ready"], True)
             self.assertIn("operator", handoff.status)
+            self.assertEqual(handoff.operator_handoff["status"], "missing_demo_gate")
             self.assertIn("--simulate", handoff.suggested_commands["run_unattended"])
             self.assertIn("run-stage", handoff.suggested_commands["run_stage"])
             self.assertIn("preflight --run", handoff.suggested_commands["tool_preflight"])
@@ -2793,6 +2794,62 @@ class AgentHandoffTests(unittest.TestCase):
             self.assertIn("ack_colorimeter_placed", handoff.suggested_commands)
             self.assertIn("--action colorimeter_placed", handoff.suggested_commands["ack_colorimeter_placed"])
             self.assertNotIn("run_stage", handoff.suggested_commands)
+
+    def test_handoff_promotes_demo_operator_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            report = ctx.root / "reports" / "demo_readiness_probe_match.json"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "operator_actions": [
+                            {
+                                "action": "spectro_placed",
+                                "required": True,
+                                "acknowledged": False,
+                                "command": "python -m dlc.cli ack --run RUN --action spectro_placed --instrument \"ColorChecker Studio\"",
+                            },
+                            {
+                                "action": "colorimeter_placed",
+                                "required": True,
+                                "acknowledged": False,
+                                "command": "python -m dlc.cli ack --run RUN --action colorimeter_placed --instrument \"i1 Display Pro\"",
+                            },
+                        ],
+                        "next_operator_action": {"action": "spectro_placed", "required": True, "acknowledged": False},
+                        "caution_count": 2,
+                        "suggested_commands": {
+                            "run_live_hardware_mock_desktoplut": "python -m dlc.cli run-unattended --run RUN --port 1 --execute-safe --mock-desktoplut --allow-hardware --update-dashboard"
+                        },
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            acknowledge_human_action(ctx, "spectro_placed")
+            ctx.manifest.stages.append({"stage": "readiness", "status": "blocked", "next_action": "ack_spectro_placed"})
+            ctx.save()
+
+            handoff = write_agent_handoff(
+                open_run(ctx.root),
+                options=DashboardOptions(port=1, execute_safe=True, mock_desktoplut=True, allow_hardware=True),
+            )
+
+            self.assertTrue(handoff.ok)
+            self.assertFalse(handoff.status["health"]["ok"])
+            self.assertEqual(handoff.status["health"]["failed_stage_count"], 1)
+            self.assertEqual(handoff.operator_handoff["status"], "waiting_for_operator")
+            self.assertEqual(handoff.operator_handoff["next_operator_action"], "colorimeter_placed")
+            self.assertIn("--action colorimeter_placed", handoff.operator_handoff["next_operator_command"])
+            self.assertIn("run-unattended", handoff.operator_handoff["run_command"])
+            self.assertEqual(handoff.operator_handoff["caution_count"], 2)
+            self.assertEqual(handoff.suggested_commands["operator_next"], handoff.operator_handoff["next_operator_command"])
+            self.assertEqual(handoff.suggested_commands["operator_run"], handoff.operator_handoff["run_command"])
+
+            payload = json.loads(Path(handoff.artifact).read_text(encoding="utf-8"))
+            self.assertEqual(payload["operator_handoff"], handoff.operator_handoff)
 
 
 class LiveSetupTests(unittest.TestCase):

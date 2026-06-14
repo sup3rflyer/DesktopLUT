@@ -24,6 +24,7 @@ class AgentHandoff:
     self_test_gate: dict[str, Any]
     latest_unattended: dict[str, Any] | None
     latest_tool_preflight: dict[str, Any] | None
+    operator_handoff: dict[str, Any]
     artifact_count: int
     suggested_commands: dict[str, str]
     artifact: str
@@ -113,9 +114,36 @@ def suggested_commands(
         commands["ack_spectro_placed"] = str(next_action.get("command") or _command(["dlc", "ack", "--run", run, "--action", "spectro_placed", "--instrument", "\"ColorChecker Studio\""]))
     if action == "ack_colorimeter_placed":
         commands["ack_colorimeter_placed"] = str(next_action.get("command") or _command(["dlc", "ack", "--run", run, "--action", "colorimeter_placed", "--instrument", "\"i1 Display Pro\""]))
+    operator_handoff = status.get("operator_handoff") if isinstance(status.get("operator_handoff"), dict) else {}
+    handoff_command = operator_handoff.get("next_operator_command")
+    if isinstance(handoff_command, str) and handoff_command:
+        handoff_action = operator_handoff.get("next_operator_action")
+        if handoff_action == "spectro_placed":
+            commands["ack_spectro_placed"] = handoff_command
+        elif handoff_action == "colorimeter_placed":
+            commands["ack_colorimeter_placed"] = handoff_command
+        commands["operator_next"] = handoff_command
+    run_command = operator_handoff.get("run_command")
+    if isinstance(run_command, str) and run_command:
+        commands["operator_run"] = run_command
     if isinstance(action, str) and next_action.get("status") == "ready" and action != "complete":
         commands["run_stage"] = _command(["dlc", "run-stage", "--run", run, "--port", port, action, *flags, "--update-dashboard"])
     return commands
+
+
+def _handoff_ok(*, health: dict[str, Any], next_action: dict[str, Any], supervisor_gate: dict[str, Any], operator_handoff: dict[str, Any]) -> bool:
+    actionable = (
+        next_action.get("action") == "complete"
+        or next_action.get("status") == "human_required"
+        or supervisor_gate.get("open") is True
+    )
+    if not actionable:
+        return False
+    if health.get("ok") is True:
+        return True
+    if int(health.get("error_event_count", 0) or 0) > 0:
+        return False
+    return operator_handoff.get("status") in {"waiting_for_operator", "ready_to_run"}
 
 
 def write_agent_handoff(
@@ -137,12 +165,8 @@ def write_agent_handoff(
     latest_unattended = _read_json(ctx.root / "reports" / "unattended.json")
     latest_tool_preflight = _read_json(ctx.root / "preflight" / "tool_preflight.json")
     next_action = status.get("next_action") if isinstance(status.get("next_action"), dict) else {}
-    actionable = (
-        next_action.get("action") == "complete"
-        or next_action.get("status") == "human_required"
-        or supervisor_gate.get("open") is True
-    )
-    ok = bool(health.get("ok", False)) and actionable
+    operator_handoff = status.get("operator_handoff") if isinstance(status.get("operator_handoff"), dict) else {}
+    ok = _handoff_ok(health=health, next_action=next_action, supervisor_gate=supervisor_gate, operator_handoff=operator_handoff)
     result = AgentHandoff(
         ok=ok,
         run=str(ctx.root),
@@ -152,6 +176,7 @@ def write_agent_handoff(
         self_test_gate=self_test_gate,
         latest_unattended=latest_unattended,
         latest_tool_preflight=latest_tool_preflight,
+        operator_handoff=operator_handoff,
         artifact_count=len(artifact_records),
         suggested_commands=suggested_commands(
             ctx.root,
