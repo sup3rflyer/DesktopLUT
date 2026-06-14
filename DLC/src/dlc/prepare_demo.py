@@ -25,6 +25,50 @@ def _demo_readiness_path(ctx: RunContext, probe_match: bool) -> Path:
     return ctx.root / "reports" / f"demo_readiness{suffix}.json"
 
 
+def _command(parts: list[str | Path | int | None]) -> str:
+    return " ".join(str(part) for part in parts if part is not None)
+
+
+def _mission_control_payload(
+    *,
+    ctx: RunContext,
+    meter_port: int | None,
+    host: str,
+    port: int,
+    live_desktoplut: bool,
+    allow_builds: bool,
+    dashboard: Path,
+    readout: Path,
+) -> dict[str, Any]:
+    command_parts: list[str | Path | int | None] = [
+        "python",
+        "-m",
+        "dlc.cli",
+        "dashboard-server",
+        "--run",
+        ctx.root,
+        "--host",
+        host,
+        "--port",
+        port,
+        "--execute-safe",
+        "--allow-hardware",
+        "--meter-port" if meter_port is not None else None,
+        meter_port,
+        "--allow-live-desktoplut" if live_desktoplut else "--mock-desktoplut",
+        "--allow-builds" if allow_builds else None,
+    ]
+    base_url = f"http://{host}:{port}"
+    return {
+        "dashboard_server_command": _command(command_parts),
+        "dashboard_url": f"{base_url}/",
+        "readout_url": f"{base_url}/readout",
+        "status_url": f"{base_url}/status.json",
+        "dashboard_file": str(dashboard),
+        "readout_file": str(readout),
+    }
+
+
 def prepare_first_demo(
     *,
     run: Path | None = None,
@@ -45,6 +89,8 @@ def prepare_first_demo(
     live_desktoplut: bool = False,
     refresh_seconds: int = 5,
     allow_builds: bool = False,
+    dashboard_host: str = "127.0.0.1",
+    dashboard_port: int = 8765,
 ) -> dict[str, Any]:
     """Create the run-local artifacts an agent needs before the first live demo."""
 
@@ -103,6 +149,16 @@ def prepare_first_demo(
     dashboard = write_dashboard_html(open_run(ctx.root), **dashboard_args)
     readout = write_readout_html(open_run(ctx.root), **dashboard_args)
     handoff = write_agent_handoff(open_run(ctx.root), options=options)
+    mission_control = _mission_control_payload(
+        ctx=ctx,
+        meter_port=meter_port,
+        host=dashboard_host,
+        port=dashboard_port,
+        live_desktoplut=live_desktoplut,
+        allow_builds=allow_builds,
+        dashboard=dashboard,
+        readout=readout,
+    )
 
     artifact = ctx.root / "reports" / "first_demo_prepare.json"
     payload = {
@@ -113,6 +169,11 @@ def prepare_first_demo(
         "live_setup": live_setup.as_dict(),
         "windows_local_audit": audit_payload,
         "demo_readiness": readiness,
+        "mission_control": mission_control,
+        "dashboard_server_command": mission_control["dashboard_server_command"],
+        "dashboard_url": mission_control["dashboard_url"],
+        "readout_url": mission_control["readout_url"],
+        "status_url": mission_control["status_url"],
         "dashboard": str(dashboard),
         "readout": str(readout),
         "handoff": handoff.as_dict(),

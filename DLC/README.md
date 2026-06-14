@@ -101,7 +101,8 @@ python -m dlc.cli demo-readiness --port 1
 For a run-specific walk-away rehearsal, `prepare-demo` creates or updates the
 run folder, writes live setup, default MHC/3D LUT quality thresholds, the
 run-local demo-readiness artifact, dashboard, readout, handoff, and a compact
-`reports\first_demo_prepare.json` packet with the next operator action:
+`reports\first_demo_prepare.json` packet with the next operator action,
+mission-control server command, dashboard URL, readout URL, and status URL:
 
 ```powershell
 python -m dlc.cli prepare-demo --run runs\first_demo_sdr --meter-port 1 --monitor-hint DISPLAY_ID --probe-match --probe-match-display-tech u --probe-match-high-res

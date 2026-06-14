@@ -327,6 +327,8 @@ def cmd_prepare_demo(args: argparse.Namespace) -> int:
         live_desktoplut=args.live_desktoplut,
         refresh_seconds=args.refresh_seconds,
         allow_builds=args.allow_builds,
+        dashboard_host=args.dashboard_host,
+        dashboard_port=args.dashboard_port,
     )
     print(json.dumps(payload, indent=2))
     return 0 if payload["ok"] else 2
@@ -1344,6 +1346,8 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_demo.add_argument("--live-desktoplut", action="store_true", help="Prepare mission control for live DesktopLUT API mutation")
     prepare_demo.add_argument("--allow-builds", action="store_true", help="Prepare mission control with long 3D LUT builds enabled")
     prepare_demo.add_argument("--refresh-seconds", type=int, default=5)
+    prepare_demo.add_argument("--dashboard-host", default="127.0.0.1")
+    prepare_demo.add_argument("--dashboard-port", type=int, default=8765)
     prepare_demo.set_defaults(func=cmd_prepare_demo)
 
     dashboard = sub.add_parser("dashboard", help="Write an auto-refreshing second-monitor run dashboard")

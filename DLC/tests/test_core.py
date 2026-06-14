@@ -1201,6 +1201,8 @@ class DemoReadinessTests(unittest.TestCase):
                     "live_desktoplut": False,
                     "allow_builds": False,
                     "refresh_seconds": 5,
+                    "dashboard_host": "127.0.0.1",
+                    "dashboard_port": 8765,
                 },
             )()
 
@@ -1216,6 +1218,12 @@ class DemoReadinessTests(unittest.TestCase):
             self.assertEqual(printed["operator_handoff"]["next_operator_action"], "spectro_placed")
             self.assertIn("--action spectro_placed", printed["operator_next"])
             self.assertIn("run-unattended", printed["operator_run"])
+            self.assertEqual(printed["dashboard_url"], "http://127.0.0.1:8765/")
+            self.assertEqual(printed["readout_url"], "http://127.0.0.1:8765/readout")
+            self.assertEqual(printed["status_url"], "http://127.0.0.1:8765/status.json")
+            self.assertIn("dashboard-server", printed["dashboard_server_command"])
+            self.assertIn("--meter-port 1", printed["dashboard_server_command"])
+            self.assertEqual(printed["mission_control"]["dashboard_file"], str(run / "reports" / "dashboard.html"))
             self.assertTrue((run / "reports" / "live_setup.json").exists())
             self.assertTrue((run / "reports" / "demo_readiness_probe_match.json").exists())
             self.assertTrue((run / "reports" / "dashboard.html").exists())
