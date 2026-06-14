@@ -108,6 +108,22 @@ def _rewrite_packet_run_args(value: Any, run: Path) -> Any:
     return value
 
 
+def launch_state_from_handoff(handoff: Any) -> dict[str, Any]:
+    operator = handoff.operator_handoff if isinstance(getattr(handoff, "operator_handoff", None), dict) else {}
+    status = operator.get("status")
+    next_action = operator.get("next_operator_action")
+    run_command = operator.get("run_command")
+    ready = status == "ready_to_run" and isinstance(run_command, str) and bool(run_command)
+    return {
+        "ready": ready,
+        "status": status,
+        "pending_operator_action": next_action,
+        "blocked_by": next_action if next_action else (None if ready else status),
+        "command": run_command if ready else None,
+        "run_command": run_command,
+    }
+
+
 def refresh_first_demo_packets(
     *,
     ctx: RunContext,
@@ -138,6 +154,10 @@ def refresh_first_demo_packets(
         prep["operator_handoff"] = handoff.operator_handoff
         prep["operator_next"] = handoff.suggested_commands.get("operator_next")
         prep["operator_run"] = handoff.suggested_commands.get("operator_run")
+        launch = launch_state_from_handoff(handoff)
+        prep["launch"] = launch
+        prep["launch_ready"] = launch["ready"]
+        prep["launch_command"] = launch["command"]
         if dashboard is not None:
             prep["dashboard"] = str(dashboard)
             if isinstance(prep.get("mission_control"), dict):
@@ -243,6 +263,7 @@ def prepare_first_demo(
     )
 
     artifact = ctx.root / "reports" / "first_demo_prepare.json"
+    launch = launch_state_from_handoff(handoff)
     payload = {
         "ok": bool(readiness.get("ok")),
         "run": str(ctx.root),
@@ -262,6 +283,9 @@ def prepare_first_demo(
         "operator_handoff": handoff.operator_handoff,
         "operator_next": handoff.suggested_commands.get("operator_next"),
         "operator_run": handoff.suggested_commands.get("operator_run"),
+        "launch": launch,
+        "launch_ready": launch["ready"],
+        "launch_command": launch["command"],
         "artifact": str(artifact),
     }
     _write_json(artifact, payload)

@@ -102,7 +102,8 @@ For a run-specific walk-away rehearsal, `prepare-demo` creates or updates the
 run folder, writes live setup, default MHC/3D LUT quality thresholds, the
 run-local demo-readiness artifact, dashboard, readout, handoff, and a compact
 `reports\first_demo_prepare.json` packet with the next operator action,
-mission-control server command, dashboard URL, readout URL, and status URL:
+explicit `launch_ready`/`launch_command` fields, mission-control server
+command, dashboard URL, readout URL, and status URL:
 
 ```powershell
 python -m dlc.cli prepare-demo --run runs\first_demo_sdr --meter-port 1 --monitor-hint DISPLAY_ID --probe-match --probe-match-display-tech u --probe-match-high-res
@@ -133,6 +134,8 @@ spectrometer and a recent probe-match self-test marker.
 unreadable desktop gamma ramp out of the larger evidence blob. Placement
 commands include `ack --compact-handoff` so each acknowledgement immediately
 prints the next physical action or run command.
+Use `launch_ready=true` as the unambiguous signal that all physical placement
+acks are complete and `launch_command` may be started.
 
 ## Current Status
 

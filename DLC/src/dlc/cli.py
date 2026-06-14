@@ -49,7 +49,7 @@ from .patch_presenter import (
 from .pipeline_evidence import tool_evidence_from_tools, write_pipeline_evidence
 from .profile_plan import STAGE_PRESETS, execute_profile_measurement_plan, write_profile_measurement_plan
 from .preflight import record_tool_preflight_stage, write_tool_preflight
-from .prepare_demo import prepare_first_demo, refresh_first_demo_packets
+from .prepare_demo import launch_state_from_handoff, prepare_first_demo, refresh_first_demo_packets
 from .probe_match import execute_probe_match_plan, write_probe_match_plan
 from .profiles import default_dummy_icc, resolve_profile_path
 from .readiness import write_readiness_audit
@@ -66,6 +66,7 @@ from .workflow import describe_unattended_pipeline
 
 
 def _compact_handoff_payload(result: Any) -> dict[str, Any]:
+    launch = launch_state_from_handoff(result)
     return {
         "ok": result.ok,
         "run": result.run,
@@ -73,6 +74,9 @@ def _compact_handoff_payload(result: Any) -> dict[str, Any]:
         "operator_handoff": result.operator_handoff,
         "operator_next": result.suggested_commands.get("operator_next"),
         "operator_run": result.suggested_commands.get("operator_run"),
+        "launch": launch,
+        "launch_ready": launch["ready"],
+        "launch_command": launch["command"],
     }
 
 

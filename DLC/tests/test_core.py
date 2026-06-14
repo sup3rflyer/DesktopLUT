@@ -1239,6 +1239,9 @@ class DemoReadinessTests(unittest.TestCase):
             self.assertEqual(printed["operator_handoff"]["next_operator_action"], "spectro_placed")
             self.assertIn("--action spectro_placed", printed["operator_next"])
             self.assertIn("run-unattended", printed["operator_run"])
+            self.assertFalse(printed["launch_ready"])
+            self.assertIsNone(printed["launch_command"])
+            self.assertEqual(printed["launch"]["blocked_by"], "spectro_placed")
             self.assertEqual(printed["dashboard_url"], "http://127.0.0.1:8765/")
             self.assertEqual(printed["readout_url"], "http://127.0.0.1:8765/readout")
             self.assertEqual(printed["status_url"], "http://127.0.0.1:8765/status.json")
@@ -1626,6 +1629,9 @@ class HumanActionTests(unittest.TestCase):
             self.assertEqual(printed["operator_handoff"]["next_operator_action"], "colorimeter_placed")
             self.assertIn("--action colorimeter_placed", printed["operator_next"])
             self.assertIn("run-unattended", printed["operator_run"])
+            self.assertFalse(printed["launch_ready"])
+            self.assertIsNone(printed["launch_command"])
+            self.assertEqual(printed["launch"]["blocked_by"], "colorimeter_placed")
             self.assertTrue((ctx.root / "reports" / "agent_handoff.json").exists())
             self.assertEqual(printed["dashboard"], str(ctx.root / "reports" / "dashboard.html"))
             self.assertEqual(printed["readout"], str(ctx.root / "reports" / "readout.html"))
@@ -1640,6 +1646,9 @@ class HumanActionTests(unittest.TestCase):
             self.assertEqual(refreshed_report["next_operator_action"]["action"], "colorimeter_placed")
             self.assertEqual(refreshed_prep["operator_handoff"]["next_operator_action"], "colorimeter_placed")
             self.assertIn("--action colorimeter_placed", refreshed_prep["operator_next"])
+            self.assertFalse(refreshed_prep["launch_ready"])
+            self.assertIsNone(refreshed_prep["launch_command"])
+            self.assertEqual(refreshed_prep["launch"]["blocked_by"], "colorimeter_placed")
             self.assertIn(f"--run {ctx.root}", refreshed_prep["operator_next"])
             self.assertIn(f"--run {ctx.root}", refreshed_prep["operator_run"])
             self.assertNotIn("--run RUN", refreshed_prep["operator_next"])
@@ -1649,6 +1658,22 @@ class HumanActionTests(unittest.TestCase):
             self.assertIn(f"--run {ctx.root}", refreshed_prep["live_setup"]["suggested_commands"]["preflight"])
             self.assertEqual(refreshed_prep["mission_control"]["dashboard_file"], str(ctx.root / "reports" / "dashboard.html"))
             self.assertTrue(has_human_action(open_run(ctx.root), "spectro_placed"))
+
+            args.action = "colorimeter_placed"
+            args.instrument = "i1 Display Pro"
+            args.position = "center"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = cmd_ack(args)
+
+            printed = json.loads(stdout.getvalue())
+            refreshed_prep = json.loads(prep.read_text(encoding="utf-8"))
+            self.assertEqual(rc, 0)
+            self.assertEqual(printed["operator_handoff"]["status"], "ready_to_run")
+            self.assertTrue(printed["launch_ready"])
+            self.assertIn("run-unattended", printed["launch_command"])
+            self.assertTrue(refreshed_prep["launch_ready"])
+            self.assertEqual(refreshed_prep["launch_command"], printed["launch_command"])
 
 
 class ArtifactTests(unittest.TestCase):
