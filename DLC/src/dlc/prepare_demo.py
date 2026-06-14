@@ -25,6 +25,14 @@ def _demo_readiness_path(ctx: RunContext, probe_match: bool) -> Path:
     return ctx.root / "reports" / f"demo_readiness{suffix}.json"
 
 
+def _latest_demo_readiness_path(ctx: RunContext) -> Path | None:
+    report_dir = ctx.root / "reports"
+    if not report_dir.exists():
+        return None
+    records = sorted(report_dir.glob("demo_readiness*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return records[0] if records else None
+
+
 def _command(parts: list[str | Path | int | None]) -> str:
     return " ".join(str(part) for part in parts if part is not None)
 
@@ -67,6 +75,64 @@ def _mission_control_payload(
         "dashboard_file": str(dashboard),
         "readout_file": str(readout),
     }
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def refresh_first_demo_packets(
+    *,
+    ctx: RunContext,
+    handoff: Any,
+    dashboard: Path | None = None,
+    readout: Path | None = None,
+) -> dict[str, str]:
+    """Persist refreshed handoff/demo state after a compact operator transition."""
+
+    updated: dict[str, str] = {}
+    demo_gate = handoff.status.get("demo_gate") if isinstance(handoff.status.get("demo_gate"), dict) else None
+    if isinstance(demo_gate, dict):
+        demo_path = _latest_demo_readiness_path(ctx)
+        if demo_path is not None:
+            demo_gate = dict(demo_gate)
+            demo_gate["artifact"] = str(demo_path)
+            _write_json(demo_path, demo_gate)
+            updated["demo_readiness"] = str(demo_path)
+
+    prep_path = ctx.root / "reports" / "first_demo_prepare.json"
+    prep = _read_json(prep_path)
+    if prep is not None:
+        prep["ok"] = bool(demo_gate.get("ok")) if isinstance(demo_gate, dict) else prep.get("ok")
+        if isinstance(demo_gate, dict):
+            prep["target"] = demo_gate.get("target", prep.get("target"))
+            prep["demo_readiness"] = demo_gate
+        prep["handoff"] = handoff.as_dict()
+        prep["operator_handoff"] = handoff.operator_handoff
+        prep["operator_next"] = handoff.suggested_commands.get("operator_next")
+        prep["operator_run"] = handoff.suggested_commands.get("operator_run")
+        if dashboard is not None:
+            prep["dashboard"] = str(dashboard)
+            if isinstance(prep.get("mission_control"), dict):
+                prep["mission_control"]["dashboard_file"] = str(dashboard)
+        if readout is not None:
+            prep["readout"] = str(readout)
+            if isinstance(prep.get("mission_control"), dict):
+                prep["mission_control"]["readout_file"] = str(readout)
+        _write_json(prep_path, prep)
+        updated["first_demo_prepare"] = str(prep_path)
+    return updated
 
 
 def prepare_first_demo(
@@ -123,8 +189,7 @@ def prepare_first_demo(
         mock_desktoplut=not live_desktoplut,
     )
     readiness["artifact"] = str(readiness_path)
-    readiness_path.parent.mkdir(parents=True, exist_ok=True)
-    readiness_path.write_text(json.dumps(readiness, indent=2), encoding="utf-8")
+    _write_json(readiness_path, readiness)
 
     options = DashboardOptions(
         port=meter_port,
@@ -182,5 +247,5 @@ def prepare_first_demo(
         "operator_run": handoff.suggested_commands.get("operator_run"),
         "artifact": str(artifact),
     }
-    artifact.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _write_json(artifact, payload)
     return payload

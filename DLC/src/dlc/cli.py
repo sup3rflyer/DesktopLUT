@@ -49,7 +49,7 @@ from .patch_presenter import (
 from .pipeline_evidence import tool_evidence_from_tools, write_pipeline_evidence
 from .profile_plan import STAGE_PRESETS, execute_profile_measurement_plan, write_profile_measurement_plan
 from .preflight import record_tool_preflight_stage, write_tool_preflight
-from .prepare_demo import prepare_first_demo
+from .prepare_demo import prepare_first_demo, refresh_first_demo_packets
 from .probe_match import execute_probe_match_plan, write_probe_match_plan
 from .profiles import default_dummy_icc, resolve_profile_path
 from .readiness import write_readiness_audit
@@ -943,10 +943,17 @@ def cmd_ack(args: argparse.Namespace) -> int:
             open_run(args.run),
             options=options,
         )
+        packet_updates = refresh_first_demo_packets(
+            ctx=open_run(args.run),
+            handoff=handoff,
+            dashboard=dashboard,
+            readout=readout,
+        )
         payload = _compact_handoff_payload(handoff)
         payload["acknowledged"] = asdict(record)
         payload["dashboard"] = str(dashboard)
         payload["readout"] = str(readout)
+        payload["updated_packets"] = packet_updates
         print(json.dumps(payload, indent=2))
         return 0 if handoff.ok else 1
     print(json.dumps(asdict(record), indent=2))

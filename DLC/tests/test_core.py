@@ -1526,6 +1526,7 @@ class HumanActionTests(unittest.TestCase):
                 json.dumps(
                     {
                         "ok": True,
+                        "artifact": "stale\\copied\\demo_readiness_probe_match.json",
                         "operator_actions": [
                             {
                                 "action": "spectro_placed",
@@ -1545,6 +1546,22 @@ class HumanActionTests(unittest.TestCase):
                         "suggested_commands": {
                             "run_live_hardware_mock_desktoplut": "python -m dlc.cli run-unattended --run RUN --port 1 --execute-safe --mock-desktoplut --allow-hardware --update-dashboard"
                         },
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            prep = ctx.root / "reports" / "first_demo_prepare.json"
+            prep.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "run": str(ctx.root),
+                        "demo_readiness": json.loads(report.read_text(encoding="utf-8")),
+                        "operator_handoff": {"status": "waiting_for_operator", "next_operator_action": "spectro_placed"},
+                        "operator_next": "old spectro command",
+                        "operator_run": "old run command",
+                        "artifact": str(prep),
                     },
                     indent=2,
                 ),
@@ -1587,6 +1604,14 @@ class HumanActionTests(unittest.TestCase):
             self.assertTrue((ctx.root / "reports" / "dashboard.html").exists())
             self.assertTrue((ctx.root / "reports" / "readout.html").exists())
             self.assertIn("colorimeter_placed", (ctx.root / "reports" / "dashboard.html").read_text(encoding="utf-8"))
+            self.assertEqual(printed["updated_packets"]["demo_readiness"], str(report))
+            self.assertEqual(printed["updated_packets"]["first_demo_prepare"], str(prep))
+            refreshed_report = json.loads(report.read_text(encoding="utf-8"))
+            refreshed_prep = json.loads(prep.read_text(encoding="utf-8"))
+            self.assertTrue(refreshed_report["operator_actions"][0]["acknowledged"])
+            self.assertEqual(refreshed_report["next_operator_action"]["action"], "colorimeter_placed")
+            self.assertEqual(refreshed_prep["operator_handoff"]["next_operator_action"], "colorimeter_placed")
+            self.assertIn("--action colorimeter_placed", refreshed_prep["operator_next"])
             self.assertTrue(has_human_action(open_run(ctx.root), "spectro_placed"))
 
 
