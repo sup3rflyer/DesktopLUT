@@ -67,6 +67,28 @@ def _command(parts: list[str | Path | int | None]) -> str:
     return " ".join(str(part) for part in parts if part is not None)
 
 
+def _ack_handoff_command(*, run: Path, action: str, instrument: str, meter_port: int | None) -> str:
+    port = str(meter_port) if meter_port is not None else "PORT"
+    return _command(
+        [
+            "dlc",
+            "ack",
+            "--run",
+            run,
+            "--action",
+            action,
+            "--instrument",
+            f'"{instrument}"',
+            "--compact-handoff",
+            "--port",
+            port,
+            "--execute-safe",
+            "--mock-desktoplut",
+            "--allow-hardware",
+        ]
+    )
+
+
 def _probe_match_request(
     *,
     enabled: bool,
@@ -216,10 +238,20 @@ def _suggested_commands(
         if probe_match_high_res:
             probe_args.append("--probe-match-high-res")
         commands["self_test_probe_match"] = _command(["dlc", "self-test", "--port", port, *probe_args])
-        commands["ack_spectro_placed"] = _command(["dlc", "ack", "--run", run, "--action", "spectro_placed", "--instrument", '"ColorChecker Studio"'])
+        commands["ack_spectro_placed"] = _ack_handoff_command(
+            run=run,
+            action="spectro_placed",
+            instrument="ColorChecker Studio",
+            meter_port=meter_port,
+        )
     if adaptive_drift_enabled:
         commands["adaptive_drift_status"] = _command(["dlc", "next", "--run", run, "--port", port])
-    commands["ack_colorimeter_placed"] = _command(["dlc", "ack", "--run", run, "--action", "colorimeter_placed", "--instrument", '"i1 Display Pro"'])
+    commands["ack_colorimeter_placed"] = _ack_handoff_command(
+        run=run,
+        action="colorimeter_placed",
+        instrument="i1 Display Pro",
+        meter_port=meter_port,
+    )
     return commands
 
 

@@ -127,7 +127,9 @@ spectrometer and a recent probe-match self-test marker.
 `operator_actions` lists the required human placement acknowledgements in order,
 `next_operator_action` names the next placement/ack command to wait for, and
 `cautions` lifts Windows-audit warnings such as noisy ICC associations or an
-unreadable desktop gamma ramp out of the larger evidence blob.
+unreadable desktop gamma ramp out of the larger evidence blob. Placement
+commands include `ack --compact-handoff` so each acknowledgement immediately
+prints the next physical action or run command.
 
 ## Current Status
 

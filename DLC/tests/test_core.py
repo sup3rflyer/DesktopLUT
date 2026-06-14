@@ -1089,6 +1089,10 @@ class DemoReadinessTests(unittest.TestCase):
         self.assertEqual(payload["next_operator_action"]["action"], "spectro_placed")
         self.assertEqual([item["action"] for item in payload["operator_actions"]], ["spectro_placed", "colorimeter_placed"])
         self.assertFalse(payload["operator_actions"][0]["acknowledged"])
+        self.assertIn("--compact-handoff", payload["operator_actions"][0]["command"])
+        self.assertIn("--port 1", payload["operator_actions"][0]["command"])
+        self.assertIn("--mock-desktoplut", payload["operator_actions"][0]["command"])
+        self.assertIn("--allow-hardware", payload["operator_actions"][0]["command"])
 
     def test_demo_readiness_moves_next_operator_action_after_ack(self) -> None:
         instruments = [
@@ -1116,6 +1120,8 @@ class DemoReadinessTests(unittest.TestCase):
         self.assertEqual(payload["next_operator_action"]["action"], "colorimeter_placed")
         self.assertTrue(payload["operator_actions"][0]["acknowledged"])
         self.assertFalse(payload["operator_actions"][1]["acknowledged"])
+        self.assertIn("--compact-handoff", payload["next_operator_action"]["command"])
+        self.assertIn("--action colorimeter_placed", payload["next_operator_action"]["command"])
 
     def test_cli_demo_readiness_writes_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3090,6 +3096,9 @@ class LiveSetupTests(unittest.TestCase):
             self.assertIn("next --run", setup.suggested_commands["adaptive_drift_status"])
             self.assertIn("--action spectro_placed", setup.suggested_commands["ack_spectro_placed"])
             self.assertIn("--action colorimeter_placed", setup.suggested_commands["ack_colorimeter_placed"])
+            self.assertIn("--compact-handoff", setup.suggested_commands["ack_spectro_placed"])
+            self.assertIn("--port 2", setup.suggested_commands["ack_spectro_placed"])
+            self.assertIn("--mock-desktoplut", setup.suggested_commands["ack_spectro_placed"])
 
             reopened = open_run(ctx.root)
             self.assertEqual(reopened.manifest.desktoplut["live_setup"]["monitor_hint"], "DISPLAY_ID")

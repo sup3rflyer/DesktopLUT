@@ -155,6 +155,8 @@ def _operator_actions(
     ctx: RunContext | None,
     run: Path | None,
     probe_match: bool,
+    port: int | None,
+    mock_desktoplut: bool,
 ) -> list[dict[str, Any]]:
     if ctx is None or run is None:
         return []
@@ -166,7 +168,13 @@ def _operator_actions(
                 "action": "spectro_placed",
                 "required": True,
                 "acknowledged": acknowledged,
-                "command": f'python -m dlc.cli ack --run {run} --action spectro_placed --instrument "ColorChecker Studio"',
+                "command": _ack_handoff_command(
+                    run=run,
+                    action="spectro_placed",
+                    instrument="ColorChecker Studio",
+                    port=port,
+                    mock_desktoplut=mock_desktoplut,
+                ),
                 "reason": "Place the spectrometer for the optional probe-match reference before ccxxmake runs.",
             }
         )
@@ -176,11 +184,25 @@ def _operator_actions(
             "action": "colorimeter_placed",
             "required": True,
             "acknowledged": acknowledged,
-            "command": f'python -m dlc.cli ack --run {run} --action colorimeter_placed --instrument "i1 Display Pro"',
+            "command": _ack_handoff_command(
+                run=run,
+                action="colorimeter_placed",
+                instrument="i1 Display Pro",
+                port=port,
+                mock_desktoplut=mock_desktoplut,
+            ),
             "reason": "Place the colorimeter at screen center for unattended Argyll measurements.",
         }
     )
     return actions
+
+
+def _ack_handoff_command(*, run: Path, action: str, instrument: str, port: int | None, mock_desktoplut: bool) -> str:
+    command = f'python -m dlc.cli ack --run {run} --action {action} --instrument "{instrument}" --compact-handoff --execute-safe --allow-hardware'
+    if port is not None:
+        command += f" --port {port}"
+    command += " --mock-desktoplut" if mock_desktoplut else " --allow-live-desktoplut"
+    return command
 
 
 def _next_operator_action(actions: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -238,7 +260,7 @@ def build_demo_readiness(
     setup = _live_setup(run)
     windows_audit = _latest_windows_local_audit(run, "preflight")
     ctx = _run_context(run)
-    operator_actions = _operator_actions(ctx=ctx, run=run, probe_match=probe_match)
+    operator_actions = _operator_actions(ctx=ctx, run=run, probe_match=probe_match, port=port, mock_desktoplut=mock_desktoplut)
     cautions = _audit_cautions(windows_audit)
 
     checks = [
