@@ -1,0 +1,107 @@
+"""Run folder and manifest management."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from .events import EventWriter
+from .paths import RUNS_DIR
+
+
+@dataclass
+class RunManifest:
+    """Persistent run metadata."""
+
+    name: str
+    mode: str
+    display: str | None
+    created: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    status: str = "created"
+    tools: dict[str, str | None] = field(default_factory=dict)
+    desktoplut: dict[str, Any] = field(default_factory=dict)
+    human_actions: dict[str, Any] = field(default_factory=dict)
+    stages: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class RunContext:
+    """Paths and manifest for one calibration run."""
+
+    root: Path
+    manifest: RunManifest
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.root / "manifest.json"
+
+    @property
+    def log_path(self) -> Path:
+        return self.root / "workflow.log"
+
+    @property
+    def events_path(self) -> Path:
+        return self.root / "events.jsonl"
+
+    def ensure_dirs(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=False)
+        for name in [
+            "preflight",
+            "probe_match",
+            "sequences",
+            "measurements",
+            "generated",
+            "reports",
+        ]:
+            (self.root / name).mkdir()
+
+    def save(self) -> None:
+        self.manifest_path.write_text(
+            json.dumps(asdict(self.manifest), indent=2),
+            encoding="utf-8",
+        )
+
+    def log(self, message: str) -> None:
+        line = f"{datetime.now().isoformat(timespec='seconds')}  {message}"
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+def make_run_name(mode: str, display: str | None) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = display.lower().replace(" ", "_") if display else "display"
+    return f"{timestamp}_{mode.lower()}_{suffix}"
+
+
+def create_run(mode: str, display: str | None = None, run_dir: Path | None = None) -> RunContext:
+    name = run_dir.name if run_dir else make_run_name(mode, display)
+    root = run_dir or RUNS_DIR / name
+    ctx = RunContext(root=root, manifest=RunManifest(name=name, mode=mode, display=display))
+    ctx.ensure_dirs()
+    ctx.save()
+    ctx.log("Run created")
+    EventWriter(ctx.events_path).write("INFO", "init", "run_created", run=str(ctx.root))
+    return ctx
+
+
+def open_run(run_dir: Path) -> RunContext:
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"manifest not found: {manifest_path}")
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = RunManifest(
+        name=raw["name"],
+        mode=raw["mode"],
+        display=raw.get("display"),
+        created=raw.get("created", ""),
+        status=raw.get("status", "created"),
+        tools=raw.get("tools", {}),
+        desktoplut=raw.get("desktoplut", {}),
+        human_actions=raw.get("human_actions", {}),
+        stages=raw.get("stages", []),
+    )
+    return RunContext(root=run_dir, manifest=manifest)
+

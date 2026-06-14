@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local calibration output
+runs/*
+!runs/.gitkeep
+profiles/*
+!profiles/.gitkeep
+
+# Contained third-party binaries are installed/copied locally.
+third_party/argyll/
+third_party/dogegen/
+
+# Local/private operator and supervisor handoff notes
+docs/calibration-handoff.md
+docs/agent-tooling.md
+CLAUDE.md
+.claude/
+

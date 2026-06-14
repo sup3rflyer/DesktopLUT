@@ -1,0 +1,611 @@
+{
+  "name": "DesktopLUT Calibrator API",
+  "version": 1,
+  "transport": {
+    "default_pipe": "\\\\.\\pipe\\DesktopLUT.Calibration",
+    "framing": "one UTF-8 JSON object per line; one request per named-pipe connection",
+    "request_envelope": {
+      "method": "string",
+      "params": "object"
+    },
+    "response_envelope": {
+      "ok": "boolean",
+      "result": "object when ok",
+      "error": "string when not ok"
+    }
+  },
+  "threading": {
+    "pipe_thread": "decode request and marshal GUI mutations",
+    "gui_thread": "perform DesktopLUT state/settings mutations for gui_thread_required methods"
+  },
+  "methods": [
+    {
+      "method": "state.get",
+      "purpose": "Return current DesktopLUT automation state.",
+      "params": {},
+      "result": {
+        "running": "boolean",
+        "corrections_enabled": "boolean",
+        "calibration_mode": "object or null",
+        "mhc": "object keyed by '<monitor>:<MODE>'",
+        "runtime": "object keyed by '<monitor>:<MODE>'"
+      },
+      "mutates_state": false,
+      "gui_thread_required": false
+    },
+    {
+      "method": "state.snapshot",
+      "purpose": "Capture enough DesktopLUT runtime/settings state to restore later.",
+      "params": {},
+      "result": {
+        "snapshot_id": "string"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "state.restore",
+      "purpose": "Restore a previously captured DesktopLUT snapshot.",
+      "params": {
+        "snapshot_id": {
+          "type": "string",
+          "required": false,
+          "description": "Snapshot id returned by state.snapshot or calibration.enter."
+        }
+      },
+      "result": {
+        "snapshot_id": "string",
+        "restored": "boolean"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "corrections.disable_all",
+      "purpose": "Disable all runtime correction layers for a clean measurement baseline.",
+      "params": {},
+      "result": {
+        "corrections_enabled": "boolean false"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "calibration.enter",
+      "purpose": "Enter calibration mode: snapshot state, associate dummy ICC, and reset correction layers.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        },
+        "dummy_icc_path": {
+          "type": "string",
+          "required": true,
+          "description": "Absolute path to the neutral/dummy ICC DLC wants associated."
+        },
+        "reason": {
+          "type": "string",
+          "required": false,
+          "description": "Human-readable reason recorded by DesktopLUT."
+        }
+      },
+      "result": {
+        "active": "boolean true",
+        "snapshot_id": "string",
+        "monitor": "integer",
+        "mode": "string",
+        "dummy_icc_path": "string",
+        "corrections_reset": "boolean true"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "calibration.status",
+      "purpose": "Return current calibration-mode bookkeeping.",
+      "params": {},
+      "result": {
+        "active": "boolean",
+        "state": "object or null"
+      },
+      "mutates_state": false,
+      "gui_thread_required": false
+    },
+    {
+      "method": "calibration.exit",
+      "purpose": "Exit calibration mode, optionally restoring the calibration snapshot.",
+      "params": {
+        "restore_snapshot": {
+          "type": "boolean",
+          "required": false,
+          "description": "Restore the snapshot captured by calibration.enter."
+        }
+      },
+      "result": {
+        "active": "boolean false",
+        "restored": "boolean"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "mhc.set_primaries",
+      "purpose": "Set measured/native MHC primaries for the target monitor/mode.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        },
+        "primaries": {
+          "type": "object",
+          "required": true,
+          "description": "Chromaticity object with rx, ry, gx, gy, bx, by."
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "mhc": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "mhc.set_white",
+      "purpose": "Set MHC white point target or measured white for the target monitor/mode.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        },
+        "x": {
+          "type": "number",
+          "required": true,
+          "description": "CIE x chromaticity."
+        },
+        "y": {
+          "type": "number",
+          "required": true,
+          "description": "CIE y chromaticity."
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "mhc": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "mhc.set_1dlut",
+      "purpose": "Load the MHC profile grayscale/1D LUT cube for the target monitor/mode.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        },
+        "cube_path": {
+          "type": "string",
+          "required": true,
+          "description": "Absolute or run-relative path to a 1D cube file."
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "mhc": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "mhc.apply",
+      "purpose": "Apply the staged MHC settings to DesktopLUT.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "mhc": "object with applied=true"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "mhc.remove",
+      "purpose": "Remove active MHC settings for the target monitor/mode.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "removed": "boolean true"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "maintenance.verify_mhc",
+      "purpose": "Report whether DesktopLUT has a coherent applied MHC state.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        }
+      },
+      "result": {
+        "verified": "boolean"
+      },
+      "mutates_state": false,
+      "gui_thread_required": true
+    },
+    {
+      "method": "runtime.set_3dlut",
+      "purpose": "Load the runtime 3D LUT cube for the target monitor/mode.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        },
+        "cube_path": {
+          "type": "string",
+          "required": true,
+          "description": "Absolute or run-relative path to a 3D cube file."
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "runtime": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "runtime.clear_3dlut",
+      "purpose": "Clear the runtime 3D LUT for the target monitor/mode.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "runtime": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "runtime.set_grayscale_tweak",
+      "purpose": "Set the separate runtime grayscale tweak layer.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        },
+        "grayscale_tweak": {
+          "type": "object",
+          "required": true,
+          "description": "DesktopLUT runtime tweak payload."
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "runtime": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "runtime.disable_grayscale_tweak",
+      "purpose": "Disable the separate runtime grayscale tweak layer.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": true,
+          "description": "Zero-based DesktopLUT monitor index."
+        },
+        "mode": {
+          "type": "string",
+          "required": true,
+          "description": "Target DesktopLUT mode.",
+          "values": [
+            "SDR",
+            "HDR"
+          ]
+        }
+      },
+      "result": {
+        "monitor_mode": "string",
+        "runtime": "object"
+      },
+      "mutates_state": true,
+      "gui_thread_required": true
+    },
+    {
+      "method": "windows.query_profiles",
+      "purpose": "Return active Windows ICC/profile association data for the target monitor.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": false,
+          "description": "Zero-based DesktopLUT monitor index."
+        }
+      },
+      "result": {
+        "available": "boolean",
+        "profiles": "array",
+        "active_profile": "string or null"
+      },
+      "mutates_state": false,
+      "gui_thread_required": false
+    },
+    {
+      "method": "windows.query_gamma_ramp",
+      "purpose": "Return Windows gamma ramp/VCGT state for the target monitor.",
+      "params": {
+        "monitor": {
+          "type": "integer",
+          "required": false,
+          "description": "Zero-based DesktopLUT monitor index."
+        }
+      },
+      "result": {
+        "available": "boolean",
+        "gamma_ramp_loaded": "boolean or null",
+        "vcgt_present": "boolean or null"
+      },
+      "mutates_state": false,
+      "gui_thread_required": false
+    }
+  ],
+  "contract_check_sequence": [
+    {
+      "step": "initial_state",
+      "request": {
+        "method": "state.get",
+        "params": {}
+      }
+    },
+    {
+      "step": "calibration_enter",
+      "request": {
+        "method": "calibration.enter",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR",
+          "dummy_icc_path": "<DLC>\\third_party\\argyll\\3.3.0\\ref\\sRGB.icm",
+          "reason": "DesktopLUT Calibrator API contract check"
+        }
+      }
+    },
+    {
+      "step": "disable_all",
+      "request": {
+        "method": "corrections.disable_all",
+        "params": {}
+      }
+    },
+    {
+      "step": "mhc_set_primaries",
+      "request": {
+        "method": "mhc.set_primaries",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR",
+          "primaries": {
+            "rx": 0.64,
+            "ry": 0.33,
+            "gx": 0.3,
+            "gy": 0.6,
+            "bx": 0.15,
+            "by": 0.06
+          }
+        }
+      }
+    },
+    {
+      "step": "mhc_set_white",
+      "request": {
+        "method": "mhc.set_white",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR",
+          "x": 0.3127,
+          "y": 0.329
+        }
+      }
+    },
+    {
+      "step": "mhc_set_1dlut",
+      "request": {
+        "method": "mhc.set_1dlut",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR",
+          "cube_path": "RUN\\generated\\desktoplut_contract_contract_1dlut.cube"
+        }
+      }
+    },
+    {
+      "step": "mhc_apply",
+      "request": {
+        "method": "mhc.apply",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR"
+        }
+      }
+    },
+    {
+      "step": "mhc_verify",
+      "request": {
+        "method": "maintenance.verify_mhc",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR"
+        }
+      }
+    },
+    {
+      "step": "runtime_disable_grayscale_tweak",
+      "request": {
+        "method": "runtime.disable_grayscale_tweak",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR"
+        }
+      }
+    },
+    {
+      "step": "runtime_set_3dlut",
+      "request": {
+        "method": "runtime.set_3dlut",
+        "params": {
+          "monitor": 0,
+          "mode": "SDR",
+          "cube_path": "RUN\\generated\\desktoplut_contract_contract_3dlut.cube"
+        }
+      }
+    },
+    {
+      "step": "windows_query_profiles",
+      "request": {
+        "method": "windows.query_profiles",
+        "params": {
+          "monitor": 0
+        }
+      }
+    },
+    {
+      "step": "windows_query_gamma_ramp",
+      "request": {
+        "method": "windows.query_gamma_ramp",
+        "params": {
+          "monitor": 0
+        }
+      }
+    },
+    {
+      "step": "final_state",
+      "request": {
+        "method": "state.get",
+        "params": {}
+      }
+    }
+  ],
+  "final_state_checks": [
+    "all commands return ok=true",
+    "state.get reports running=true",
+    "calibration_mode is active after calibration.enter",
+    "corrections_enabled=false after disable_all/calibration.enter",
+    "mhc entry for 0:SDR has applied=true and a cube_path",
+    "runtime entry for 0:SDR has a cube_path",
+    "windows.query_profiles and windows.query_gamma_ramp return ok=true"
+  ]
+}
