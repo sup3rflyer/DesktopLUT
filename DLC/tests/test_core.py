@@ -24,7 +24,7 @@ from dlc.dashboard import (
     write_dashboard_html,
     write_readout_html,
 )
-from dlc.cli import cmd_demo_readiness, cmd_preflight, cmd_vendor_tools
+from dlc.cli import cmd_demo_readiness, cmd_handoff, cmd_preflight, cmd_vendor_tools
 from dlc.decisions import IterationMetrics, MetricThresholds, decide_iteration, metric_thresholds_for_run, write_decision_record, write_quality_policy
 from dlc.desktoplut_api_spec import build_desktoplut_api_spec, write_desktoplut_api_spec
 from dlc.desktoplut_client import DesktopLutClient, DesktopLutCommand, JsonlFileTransport, decode_message
@@ -2850,6 +2850,64 @@ class AgentHandoffTests(unittest.TestCase):
 
             payload = json.loads(Path(handoff.artifact).read_text(encoding="utf-8"))
             self.assertEqual(payload["operator_handoff"], handoff.operator_handoff)
+
+    def test_cli_handoff_compact_prints_operator_resume_packet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            report = ctx.root / "reports" / "demo_readiness_probe_match.json"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "operator_actions": [
+                            {
+                                "action": "spectro_placed",
+                                "required": True,
+                                "acknowledged": False,
+                                "command": "python -m dlc.cli ack --run RUN --action spectro_placed --instrument \"ColorChecker Studio\"",
+                            }
+                        ],
+                        "next_operator_action": {"action": "spectro_placed", "required": True, "acknowledged": False},
+                        "caution_count": 2,
+                        "suggested_commands": {
+                            "run_live_hardware_mock_desktoplut": "python -m dlc.cli run-unattended --run RUN --port 1 --execute-safe --mock-desktoplut --allow-hardware --update-dashboard"
+                        },
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            args = type(
+                "Args",
+                (),
+                {
+                    "run": ctx.root,
+                    "output": None,
+                    "port": 1,
+                    "refresh_seconds": 5,
+                    "execute_safe": True,
+                    "mock_desktoplut": True,
+                    "allow_hardware": True,
+                    "allow_live_desktoplut": False,
+                    "allow_builds": False,
+                    "simulate": False,
+                    "compact": True,
+                },
+            )()
+            with redirect_stdout(stdout):
+                rc = cmd_handoff(args)
+
+            printed = json.loads(stdout.getvalue())
+            self.assertEqual(rc, 0)
+            self.assertEqual(printed["operator_handoff"]["status"], "waiting_for_operator")
+            self.assertEqual(printed["operator_handoff"]["next_operator_action"], "spectro_placed")
+            self.assertIn("--action spectro_placed", printed["operator_next"])
+            self.assertIn("run-unattended", printed["operator_run"])
+            self.assertIn("agent_handoff.json", printed["artifact"])
+            self.assertNotIn("status", printed)
+            self.assertTrue((ctx.root / "reports" / "agent_handoff.json").exists())
 
 
 class LiveSetupTests(unittest.TestCase):

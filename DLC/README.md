@@ -307,6 +307,9 @@ gate result, artifact count,
 and suggested resume commands for the same safety flags. If the run is waiting on physical
 setup, the handoff includes the exact `ack_spectro_placed` or
 `ack_colorimeter_placed` command instead of suggesting a supervisor step. It
+also promotes a compact `operator_handoff` object to the top level. Use
+`handoff --compact` when an LLM supervisor needs a low-noise refresh containing
+only `operator_handoff`, the artifact path, and the next operator/run commands.
 also suggests `preflight --run RUN`,
 `quality-policy`, `loop-status`, and `pipeline-evidence` so an agent can refresh
 tool readiness, acceptance thresholds, loop summary, and scriptable toolchain

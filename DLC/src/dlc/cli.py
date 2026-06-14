@@ -247,7 +247,17 @@ def cmd_handoff(args: argparse.Namespace) -> int:
         simulate_execution=args.simulate,
     )
     result = write_agent_handoff(ctx, options=options, output=args.output)
-    print(json.dumps(result.as_dict(), indent=2))
+    payload = result.as_dict()
+    if getattr(args, "compact", False):
+        payload = {
+            "ok": result.ok,
+            "run": result.run,
+            "artifact": result.artifact,
+            "operator_handoff": result.operator_handoff,
+            "operator_next": result.suggested_commands.get("operator_next"),
+            "operator_run": result.suggested_commands.get("operator_run"),
+        }
+    print(json.dumps(payload, indent=2))
     return 0 if result.ok else 1
 
 
@@ -1235,6 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--allow-live-desktoplut", action="store_true", help="Record handoff with live DesktopLUT mutation enabled")
     handoff.add_argument("--allow-builds", action="store_true", help="Record handoff with long 3D LUT builds enabled")
     handoff.add_argument("--simulate", action="store_true", help="Record handoff with synthetic measurement/build rehearsal enabled")
+    handoff.add_argument("--compact", action="store_true", help="Print only the top-level operator handoff and resume commands")
     handoff.set_defaults(func=cmd_handoff)
 
     readiness = sub.add_parser("readiness", help="Write a run-specific unattended readiness audit")
