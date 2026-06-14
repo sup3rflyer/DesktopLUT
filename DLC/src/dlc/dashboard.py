@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -111,6 +112,7 @@ def _refresh_demo_operator_actions(ctx: RunContext, payload: dict[str, Any]) -> 
         action_name = item.get("action")
         if isinstance(action_name, str):
             item["acknowledged"] = has_human_action(ctx, action_name)
+        item["command"] = _rewrite_run_arg(item.get("command"), ctx.root)
         actions.append(item)
     refreshed["operator_actions"] = actions
     refreshed["next_operator_action"] = next(
@@ -121,7 +123,17 @@ def _refresh_demo_operator_actions(ctx: RunContext, payload: dict[str, Any]) -> 
         ),
         None,
     )
+    suggested = payload.get("suggested_commands")
+    if isinstance(suggested, dict):
+        refreshed["suggested_commands"] = {key: _rewrite_run_arg(value, ctx.root) for key, value in suggested.items()}
     return refreshed
+
+
+def _rewrite_run_arg(command: Any, run: Path) -> Any:
+    if not isinstance(command, str):
+        return command
+    pattern = re.compile(r"--run\s+(\"[^\"]+\"|'[^']+'|\S+)")
+    return pattern.sub(lambda _match: f"--run {run}", command)
 
 
 def _demo_operator_handoff(demo_gate: dict[str, Any]) -> dict[str, Any]:

@@ -1612,6 +1612,10 @@ class HumanActionTests(unittest.TestCase):
             self.assertEqual(refreshed_report["next_operator_action"]["action"], "colorimeter_placed")
             self.assertEqual(refreshed_prep["operator_handoff"]["next_operator_action"], "colorimeter_placed")
             self.assertIn("--action colorimeter_placed", refreshed_prep["operator_next"])
+            self.assertIn(f"--run {ctx.root}", refreshed_prep["operator_next"])
+            self.assertIn(f"--run {ctx.root}", refreshed_prep["operator_run"])
+            self.assertNotIn("--run RUN", refreshed_prep["operator_next"])
+            self.assertNotIn("--run RUN", refreshed_prep["operator_run"])
             self.assertTrue(has_human_action(open_run(ctx.root), "spectro_placed"))
 
 

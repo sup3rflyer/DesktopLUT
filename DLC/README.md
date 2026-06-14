@@ -329,7 +329,9 @@ prints the same compact packet, so the next physical action or run command is
 visible without a separate handoff refresh. It also refreshes
 `reports\dashboard.html`, `reports\readout.html`, the demo-readiness JSON, and
 `reports\first_demo_prepare.json` for a static mission-control view after each
-placement acknowledgement.
+placement acknowledgement. Refreshed operator commands are rewritten to the
+current run folder, so copied rehearsal runs do not point back at their source
+run.
 It also suggests `preflight --run RUN`,
 `quality-policy`, `loop-status`, and `pipeline-evidence` so an agent can refresh
 tool readiness, acceptance thresholds, loop summary, and scriptable toolchain
