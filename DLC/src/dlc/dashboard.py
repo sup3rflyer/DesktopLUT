@@ -41,6 +41,15 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _resolve_artifact(ctx: RunContext, value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_absolute() or path.exists():
+        return path
+    return ctx.root / path
+
+
 def _latest_stage(ctx: RunContext) -> dict[str, Any]:
     return ctx.manifest.stages[-1] if ctx.manifest.stages else {}
 
@@ -144,8 +153,7 @@ def _tool_preflight(ctx: RunContext) -> dict[str, Any]:
     path = None
     for entry in reversed(ctx.manifest.stages):
         if entry.get("stage") == "tool_preflight" and isinstance(entry.get("artifact"), str):
-            candidate = Path(str(entry["artifact"]))
-            path = candidate if candidate.is_absolute() else ctx.root / candidate
+            path = _resolve_artifact(ctx, str(entry["artifact"]))
             break
     path = path or ctx.root / "preflight" / "tool_preflight.json"
     payload = _read_json(path) or {}

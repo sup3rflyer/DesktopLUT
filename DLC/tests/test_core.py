@@ -3567,6 +3567,25 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(payload["readout"]["tool_preflight"], "ready; vendor manifest missing")
             self.assertIn("Tool Preflight", html)
 
+    def test_dashboard_status_payload_accepts_tool_preflight_artifact_relative_to_cwd(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            preflight = write_tool_preflight(
+                make_existing_tools(Path(tmp)),
+                ctx.root / "preflight" / "tool_preflight.json",
+                vendor_status=valid_vendor_manifest_status(),
+            )
+            artifact = str(Path(preflight["artifact"]).resolve().relative_to(Path.cwd()))
+            ctx.manifest.stages.append({"stage": "tool_preflight", "status": "passed", "artifact": artifact})
+            ctx.save()
+
+            payload = dashboard_status_payload(open_run(ctx.root), DashboardOptions(execute_safe=True, mock_desktoplut=True))
+
+            self.assertTrue(payload["tool_preflight"]["ok"])
+            self.assertEqual(payload["tool_preflight"]["artifact"], artifact)
+            self.assertTrue(payload["readout"]["tool_preflight_ok"])
+            self.assertEqual(payload["readout"]["tool_preflight"], "ready")
+
     def test_dashboard_status_payload_surfaces_tool_path_containment_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
