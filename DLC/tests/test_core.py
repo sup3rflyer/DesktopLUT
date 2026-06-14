@@ -3768,6 +3768,56 @@ class DashboardTests(unittest.TestCase):
             self.assertIn("probe-match branch", html)
             self.assertIn("probe-match branch", readout)
 
+    def test_dashboard_status_payload_surfaces_demo_readiness_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            report = ctx.root / "reports" / "demo_readiness_probe_match.json"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "operator_actions": [
+                            {
+                                "action": "spectro_placed",
+                                "required": True,
+                                "acknowledged": False,
+                                "command": "python -m dlc.cli ack --action spectro_placed",
+                            },
+                            {
+                                "action": "colorimeter_placed",
+                                "required": True,
+                                "acknowledged": False,
+                                "command": "python -m dlc.cli ack --action colorimeter_placed",
+                            },
+                        ],
+                        "next_operator_action": {"action": "spectro_placed", "required": True, "acknowledged": False},
+                        "caution_count": 1,
+                        "cautions": [{"severity": "warning", "name": "profile_associations"}],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            acknowledge_human_action(ctx, "spectro_placed")
+
+            payload = dashboard_status_payload(open_run(ctx.root), DashboardOptions(port=1, execute_safe=True, mock_desktoplut=True))
+            html = render_dashboard_html(open_run(ctx.root), port=1, execute_safe=True, mock_desktoplut=True)
+            readout = render_readout_html(open_run(ctx.root), port=1, execute_safe=True, mock_desktoplut=True)
+
+            self.assertTrue(payload["demo_gate"]["ok"])
+            self.assertTrue(payload["demo_gate"]["operator_actions"][0]["acknowledged"])
+            self.assertFalse(payload["demo_gate"]["operator_actions"][1]["acknowledged"])
+            self.assertEqual(payload["demo_gate"]["next_operator_action"]["action"], "colorimeter_placed")
+            self.assertTrue(payload["readout"]["demo_gate_ok"])
+            self.assertEqual(payload["readout"]["demo_next_operator_action"], "colorimeter_placed")
+            self.assertEqual(payload["readout"]["demo_caution_count"], 1)
+            self.assertIn("Demo Gate", html)
+            self.assertIn("colorimeter_placed", html)
+            self.assertIn("profile_associations", html)
+            self.assertIn("Next Placement", readout)
+            self.assertIn("colorimeter_placed", readout)
+
     def test_dashboard_operator_snapshot_summarizes_unattended_supervision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")

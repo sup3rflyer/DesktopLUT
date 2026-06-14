@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 from .agent import recommend_next_action
 from .events import read_events
+from .human_actions import has_human_action
 from .monitor import evaluate_run_health
 from .runs import RunContext, open_run
 from .safety import blocked_reason_for_action
@@ -85,6 +86,42 @@ def _latest_supervision(ctx: RunContext) -> dict[str, Any] | None:
 
 def _latest_unattended(ctx: RunContext) -> dict[str, Any] | None:
     return _read_json(ctx.root / "reports" / "unattended.json")
+
+
+def _latest_demo_readiness(ctx: RunContext) -> dict[str, Any] | None:
+    report_dir = ctx.root / "reports"
+    if not report_dir.exists():
+        return None
+    records = sorted(report_dir.glob("demo_readiness*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in records:
+        payload = _read_json(path)
+        if payload:
+            payload.setdefault("artifact", str(path))
+            return _refresh_demo_operator_actions(ctx, payload)
+    return None
+
+
+def _refresh_demo_operator_actions(ctx: RunContext, payload: dict[str, Any]) -> dict[str, Any]:
+    refreshed = dict(payload)
+    actions = []
+    for action in payload.get("operator_actions", []):
+        if not isinstance(action, dict):
+            continue
+        item = dict(action)
+        action_name = item.get("action")
+        if isinstance(action_name, str):
+            item["acknowledged"] = has_human_action(ctx, action_name)
+        actions.append(item)
+    refreshed["operator_actions"] = actions
+    refreshed["next_operator_action"] = next(
+        (
+            action
+            for action in actions
+            if action.get("required") is True and action.get("acknowledged") is not True
+        ),
+        None,
+    )
+    return refreshed
 
 
 def _completion_evidence(ctx: RunContext) -> dict[str, Any]:
@@ -464,6 +501,7 @@ def _operator_snapshot(ctx: RunContext, next_action: dict[str, Any], safety: dic
         "tool_preflight": _tool_preflight(ctx),
         "pipeline_evidence": _pipeline_evidence(ctx),
         "loop_status": _loop_status(ctx),
+        "demo_gate": _latest_demo_readiness(ctx),
     }
 
 
@@ -548,6 +586,7 @@ def _operator_html(operator: dict[str, Any]) -> str:
     pipeline = operator.get("pipeline_evidence") if isinstance(operator.get("pipeline_evidence"), dict) else {}
     loop_status = operator.get("loop_status") if isinstance(operator.get("loop_status"), dict) else {}
     completion = operator.get("completion") if isinstance(operator.get("completion"), dict) else {}
+    demo_gate = operator.get("demo_gate") if isinstance(operator.get("demo_gate"), dict) else {}
     self_test = safety.get("self_test") if isinstance(safety.get("self_test"), dict) else {}
     windows_audit = safety.get("windows_local_audit") if isinstance(safety.get("windows_local_audit"), dict) else {}
     next_milestone = progress.get("next_milestone") if isinstance(progress.get("next_milestone"), dict) else None
@@ -581,8 +620,20 @@ def _operator_html(operator: dict[str, Any]) -> str:
     loops_text = "stopped" if loops_ok else str(loop_status.get("reason", "missing"))
     completion_ok = bool(completion.get("ok"))
     completion_text = "accepted" if completion_ok else str(completion.get("reason", "missing"))
+    demo_ok = bool(demo_gate.get("ok"))
+    demo_next = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
+    demo_next_text = str(demo_next.get("action")) if demo_next else ("none" if demo_gate else "missing")
+    demo_text = "ready" if demo_ok else str(demo_gate.get("reason", "missing"))
+    caution_count = demo_gate.get("caution_count", 0) if demo_gate else 0
+    cautions = demo_gate.get("cautions") if isinstance(demo_gate.get("cautions"), list) else []
+    caution_names = [str(caution.get("name")) for caution in cautions[:3] if isinstance(caution, dict)]
+    caution_text = ", ".join(caution_names) if caution_names else "none"
     return f"""
       <div class="kv"><span>Workflow</span><strong>{html.escape(str(progress.get("completed", 0)))}/{html.escape(str(progress.get("total", 0)))} ({html.escape(str(progress.get("percent", 0)))}%)</strong></div>
+      <div class="kv"><span>Demo Gate</span><strong class="{"ok" if demo_ok else "fail"}">{html.escape(demo_text)}</strong></div>
+      <div class="kv"><span>Next Placement</span><strong class="{"warn" if demo_next else "ok"}">{html.escape(demo_next_text)}</strong></div>
+      <div class="kv"><span>Demo Cautions</span><strong class="{"warn" if caution_count else "ok"}">{html.escape(str(caution_count))}</strong></div>
+      <div class="kv"><span>Caution Names</span><strong class="{"warn" if caution_count else "ok"}">{html.escape(caution_text)}</strong></div>
       <div class="kv"><span>Next Milestone</span><strong>{html.escape(str((next_milestone or {}).get("label", "complete")))}</strong></div>
       <div class="kv"><span>Self-Test Gate</span><strong class="{"ok" if self_test_ok else "fail"}">{html.escape(self_test_text)}</strong></div>
       <div class="kv"><span>Windows Gate</span><strong class="{"ok" if windows_ok else "fail"}">{html.escape(windows_text)}</strong></div>
@@ -627,8 +678,10 @@ def _readout_snapshot(
     pipeline = operator.get("pipeline_evidence") if isinstance(operator.get("pipeline_evidence"), dict) else {}
     loop_status = operator.get("loop_status") if isinstance(operator.get("loop_status"), dict) else {}
     completion = operator.get("completion") if isinstance(operator.get("completion"), dict) else {}
+    demo_gate = operator.get("demo_gate") if isinstance(operator.get("demo_gate"), dict) else {}
     last_command = operator.get("last_command") if isinstance(operator.get("last_command"), dict) else None
     active_command = operator.get("active_command") if isinstance(operator.get("active_command"), dict) else None
+    demo_next = demo_gate.get("next_operator_action") if isinstance(demo_gate.get("next_operator_action"), dict) else None
     metric_value = "n/a"
     metric_label = "Latest dE00 avg"
     if latest_metrics:
@@ -674,6 +727,10 @@ def _readout_snapshot(
         "completion_ok": bool(completion.get("ok")),
         "completion": "accepted" if completion.get("ok") else str(completion.get("reason", "missing")),
         "completion_current_audit_ok": bool(completion.get("finalization_current_audit_ok")),
+        "demo_gate_ok": bool(demo_gate.get("ok")),
+        "demo_gate": "ready" if demo_gate.get("ok") else str(demo_gate.get("reason", "missing")),
+        "demo_next_operator_action": str(demo_next.get("action")) if demo_next else ("none" if demo_gate else "missing"),
+        "demo_caution_count": demo_gate.get("caution_count", 0) if demo_gate else 0,
         "last_command_ok": bool(last_command and last_command.get("ok")),
         "last_command": _short_command(last_command),
         "active_command": _short_command(active_command) if active_command else "",
@@ -704,6 +761,7 @@ def dashboard_status_payload(ctx: RunContext, options: DashboardOptions | None =
     pipeline_evidence = operator.get("pipeline_evidence") if isinstance(operator.get("pipeline_evidence"), dict) else {}
     loop_status = operator.get("loop_status") if isinstance(operator.get("loop_status"), dict) else {}
     completion = operator.get("completion") if isinstance(operator.get("completion"), dict) else {}
+    demo_gate = operator.get("demo_gate") if isinstance(operator.get("demo_gate"), dict) else {}
     quality_policy = _quality_policy(ctx)
     status_class = _status_class(next_action, readiness)
     readout = _readout_snapshot(
@@ -730,6 +788,7 @@ def dashboard_status_payload(ctx: RunContext, options: DashboardOptions | None =
         "health": health,
         "operator": operator,
         "completion": completion,
+        "demo_gate": demo_gate,
         "readout": readout,
         "tool_preflight": tool_preflight,
         "pipeline_evidence": pipeline_evidence,
@@ -846,7 +905,7 @@ def render_dashboard_html(
     .status.running strong, .ok span, .big.ok {{ color: var(--accent); }}
     .status.human strong {{ color: var(--warn); }}
     .status.blocked strong, .status.done strong, .fail span, .big.fail {{ color: var(--bad); }}
-    .big.warn {{ color: var(--warn); }}
+    .big.warn, .warn {{ color: var(--warn); }}
     .panel {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -973,6 +1032,9 @@ def render_readout_html(
     pipeline_ok = bool(readout.get("pipeline_evidence_ok"))
     loops_ok = bool(readout.get("loop_status_ok"))
     completion_ok = bool(readout.get("completion_ok"))
+    demo_gate_ok = bool(readout.get("demo_gate_ok"))
+    demo_caution_count = int(readout.get("demo_caution_count", 0) or 0)
+    demo_next_waiting = str(readout.get("demo_next_operator_action", "missing")) not in {"", "none", "missing"}
     progress = float(readout.get("progress_percent", 0.0) or 0.0)
     return f"""<!doctype html>
 <html lang="en">
@@ -1117,6 +1179,9 @@ def render_readout_html(
     <div class="mini"><span class="label">Toolchain</span><strong class="{"ok" if pipeline_ok else "fail"}">{html.escape(str(readout.get("pipeline_evidence", "missing")))}</strong></div>
     <div class="mini"><span class="label">Loops</span><strong class="{"ok" if loops_ok else "fail"}">{html.escape(str(readout.get("loop_status", "missing")))}</strong></div>
     <div class="mini"><span class="label">Completion</span><strong class="{"ok" if completion_ok else "fail"}">{html.escape(str(readout.get("completion", "missing")))}</strong></div>
+    <div class="mini"><span class="label">Demo Gate</span><strong class="{"ok" if demo_gate_ok else "fail"}">{html.escape(str(readout.get("demo_gate", "missing")))}</strong></div>
+    <div class="mini"><span class="label">Next Placement</span><strong class="{"warn" if demo_next_waiting else "ok"}">{html.escape(str(readout.get("demo_next_operator_action", "missing")))}</strong></div>
+    <div class="mini"><span class="label">Demo Cautions</span><strong class="{"warn" if demo_caution_count else "ok"}">{html.escape(str(demo_caution_count))}</strong></div>
     <div class="mini"><span class="label">Active Command</span><strong class="{"ok" if readout.get("active_command_running") else "muted"}">{html.escape(str(readout.get("active_command") or "idle"))}</strong></div>
     <div class="mini"><span class="label">Last Command</span><strong>{html.escape(str(readout.get("last_command", "none")))}</strong></div>
   </footer>
