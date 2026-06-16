@@ -30,10 +30,14 @@ request, adjudicates ambiguous results on digests, and writes the report.
   drives a display to its physical floor. It builds a corrected 3D LUT from the
   measured error model, **applies it and re-measures reality, then folds those real
   measurements back into the model and rebuilds** — repeating until every patch is
-  at the target or at the panel's floor. Points that can't reach the target are
-  surfaced for adjudication (with the worst offenders) instead of being silently
-  accepted. The display/meter is a single seam, so the same loop runs against a
-  software model (preview), the live shader, or an installed profile.
+  at the target or at the panel's floor. The correction budget is **derived from
+  the measured residual** (not a hand-tuned constant) and auto-raised when needed,
+  and the machine **distinguishes a real physical floor from a too-small budget** —
+  so a tuning limit is never reported as "the panel can't do better." Points that
+  genuinely can't reach the target are surfaced for adjudication (with the worst
+  offenders) instead of being silently accepted. The display/meter is a single
+  seam, so the same loop runs against a software model (preview), the live shader,
+  or an installed profile.
 - **Adaptive measurement loop** (`dlc/measure_loop.py`) — turns a patch set into a
   clean `.ti3` plus a streaming `measurements.ndjson`, self-healing against panel
   drift: warm-up-settle (biased toward the temperamental channel), a per-patch

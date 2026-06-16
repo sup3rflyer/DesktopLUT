@@ -15,20 +15,35 @@ The fold-back is the magic: the points the cube actually drives the panel to
 (``cube(signal)``) are re-measured, and those ``(driven_signal, measured_xyz)``
 pairs are added to the model's training set — so the next model is accurate
 *exactly where the cube operates*, its inverse is more self-consistent, and the
-residual shrinks. The loop converges as the model becomes true at its operating
-points.
+residual shrinks.
 
-**The LLM adjudicates convergence** (the reason an LLM is in the loop at all): a
-point that won't drop below the target is surfaced as a digest — "floor reached /
-panel limit (accept) / worth another nudge" — never silently accepted or abandoned.
+**Correction budget — derived and self-disambiguating (not a hand-tuned guess).**
+The inner builder soft-clamps each node's correction to ``max_correction`` (signal
+space) to protect gamut edges and reject model noise. A fixed default is dangerous:
+too tight and the machine reports *clamp-limited* points as if they were the panel's
+physical floor (a false floor — "accept this, the panel can't do better" when really
+a bigger budget fixes it). So this loop:
+
+1. **Seeds** ``max_correction`` from the *measured* residual (a high percentile of
+   the per-channel signal correction the panel actually needs × a safety factor),
+   not a constant.
+2. **Auto-escalates** the budget when stuck points are *clamp-limited with signal
+   headroom*, up to a cap, before ever calling anything a floor.
+3. **Disambiguates** every above-threshold point into ``signal_clipped`` (driven
+   channel already at 0/1 — a real physical floor), ``budget_limited`` (clamp
+   binding but signal interior — raise the budget), or ``residual`` (interior, clamp
+   slack, still off — model/measurement floor). Only the real floors reach the LLM's
+   adjudication question; a tuning limit never masquerades as a panel limit.
+
+**The LLM adjudicates** the real floors (the reason an LLM is in the loop): "floor
+reached / panel limit (accept) / worth another nudge" — never silently accepted.
 
 **Fidelity ladder (which ``probe`` you pass):** the probe is a single seam,
 ``measure(signals) -> measured_xyz``. Pass a software ground-truth model for a
 preview/test (tier 1), the DWM-hook shader re-measure for the 3D LUT (tier 2 — and
 for the 3D LUT the shader *is* production, so this is ground truth, fast), or the
-installed-file re-measure for final verification (tier 3). The machine's math is
-identical for all three — it samples the cube itself and measures the driven
-signal, so it needs only that one capability.
+installed-file re-measure for final verification (tier 3). The machine samples the
+cube itself and measures the driven signal, so it needs only that one capability.
 
 Numpy/scipy/colour live in :mod:`dlc.engine`; importing this module pulls them
 (it is the engine-tier orchestrator). The dependency-free spine never imports it.
@@ -51,6 +66,7 @@ __all__ = [
     "IterationResult",
     "OptimizeResult",
     "sample_cube",
+    "seed_correction_budget",
     "optimize_cube",
     "synthetic_probe",
 ]
@@ -65,16 +81,34 @@ ProbeFn = Callable[[np.ndarray], np.ndarray]
 class OptimizeConfig:
     """Outer-loop tunables. The judgment-bearing ones (``threshold``,
     ``max_outer``, ``floor_tol``) are **LLM-deferred** — the orchestrator sets them
-    per run / per the target (SDR: every patch < dE 2; HDR: LLM-negotiated)."""
+    per run / per target (SDR: every patch < dE 2; HDR: LLM-negotiated).
+
+    ``max_correction`` defaults to ``None`` ⇒ **derive it from the measured
+    residual** (:func:`seed_correction_budget`). Set an explicit value only to pin
+    the budget (e.g. to honour a known small post-MHC residual). ``auto_escalate``
+    raises the budget toward ``max_correction_cap`` while points are clamp-limited
+    with signal headroom, so a too-small budget self-corrects instead of producing
+    a false floor.
+    """
 
     grid_size: int = 33
     threshold: float = 2.0          # per-patch dE_ITP convergence target (SDR: 2)
-    max_outer: int = 4              # outer measure→fold→rebuild iterations
-    floor_tol: float = 0.2          # dE improvement below this ⇒ a point is "stuck"
+    max_outer: int = 6              # outer measure→(escalate)→fold→rebuild iterations
+    floor_tol: float = 0.2          # dE improvement below this ⇒ a stuck point is "not improving"
+
+    # Correction budget (signal-space soft-clamp on the inner builder) ------
+    max_correction: Optional[float] = None   # None ⇒ seed from the measured residual
+    auto_escalate: bool = True
+    max_correction_cap: float = 0.25         # ceiling for the seed and escalation
+    correction_floor: float = 0.01           # smallest sane budget
+    correction_safety: float = 1.5           # seed = percentile(needed) × safety
+    seed_percentile: float = 98.0
+    escalate_factor: float = 1.6             # budget × this when clamp-limited persists
+    clamp_active_frac: float = 0.85          # |correction| ≥ frac×budget ⇒ clamp binding
+    boundary_eps: float = 2e-3               # driven channel within eps of 0/1 ⇒ clipped
+
     top_k: int = 8                  # worst points to surface in the digest
     smoothing: Optional[float] = None   # None ⇒ per-iteration k-fold CV
-    # build_cube knobs (defaults assume a post-MHC residual — small corrections):
-    max_correction: float = 0.05
     n_inner_iterations: int = 3
     fade_width: float = 0.05
     near_black_nits: float = 0.1
@@ -83,11 +117,15 @@ class OptimizeConfig:
 @dataclass
 class IterationResult:
     iteration: int
+    max_correction: float          # the correction budget used this iteration
     measured_mean_de: float
     measured_p95_de: float
     measured_max_de: float
     predicted_max_de: float        # the model's own estimate (model vs reality gap)
     above_threshold: int
+    budget_limited: int            # clamp binding + signal headroom (→ raise budget)
+    signal_clipped: int            # driven channel at 0/1 (→ physical floor)
+    residual: int                  # interior, clamp slack, still off (→ model floor)
     worst: list[tuple[list[float], float]]   # [(signal, dE), …] top-k by dE
     smoothing: float
     cube_monotonic: bool
@@ -96,12 +134,16 @@ class IterationResult:
     def as_dict(self) -> dict[str, Any]:
         return {
             "iteration": self.iteration,
+            "max_correction": round(self.max_correction, 4),
             "measured_mean_de": round(self.measured_mean_de, 4),
             "measured_p95_de": round(self.measured_p95_de, 4),
             "measured_max_de": round(self.measured_max_de, 4),
             "predicted_max_de": round(self.predicted_max_de, 4),
             "model_reality_gap": round(self.measured_max_de - self.predicted_max_de, 4),
             "above_threshold": self.above_threshold,
+            "budget_limited": self.budget_limited,
+            "signal_clipped": self.signal_clipped,
+            "residual": self.residual,
             "smoothing": round(self.smoothing, 4),
             "cube_monotonic": self.cube_monotonic,
             "train_points": self.train_points,
@@ -115,9 +157,10 @@ class OptimizeResult:
     iterations: int
     cube: np.ndarray
     grid_size: int
+    max_correction: float          # final budget that produced the returned cube
     final: IterationResult
     history: list[IterationResult]
-    floor_points: list[tuple[list[float], float]]
+    floor_points: list[tuple[list[float], float]]   # real (non-budget) floors, worst first
     needs_adjudication: bool
     question: Optional[str]
     digest: dict[str, Any] = field(default_factory=dict)
@@ -138,6 +181,38 @@ def sample_cube(cube: np.ndarray, signals: np.ndarray) -> np.ndarray:
     return np.clip(out, 0.0, 1.0)
 
 
+def seed_correction_budget(space: TargetSpace, signals: np.ndarray, measured_xyz: np.ndarray,
+                           *, safety: float = 1.5, percentile: float = 98.0,
+                           floor: float = 0.01, cap: float = 0.25) -> float:
+    """Size the correction budget from the *measured* residual, in signal space.
+
+    The signal that would ideally produce ``measured_xyz`` is the panel's "apparent
+    signal"; its gap from the driven signal is roughly the correction the panel
+    demands. A high percentile of that (× safety), clamped to ``[floor, cap]``,
+    sizes the budget to the panel instead of guessing a constant.
+    """
+    signals = np.asarray(signals, dtype=float).reshape(-1, 3)
+    apparent = space.xyz_to_signal(np.maximum(np.asarray(measured_xyz, float).reshape(-1, 3), 0.0))
+    needed = np.max(np.abs(apparent - signals), axis=1)
+    p = float(np.percentile(needed, percentile)) if needed.size else floor
+    return float(np.clip(p * safety, floor, cap))
+
+
+def _classify(verify: np.ndarray, driven: np.ndarray, de: np.ndarray,
+              threshold: float, budget: float, *, clamp_frac: float, boundary_eps: float):
+    """Bucket above-threshold points: signal_clipped (boundary), budget_limited
+    (clamp binding, interior), residual (interior, clamp slack)."""
+    above = de > threshold
+    corr_mag = np.max(np.abs(driven - verify), axis=1)
+    at_boundary = np.any((driven <= boundary_eps) | (driven >= 1.0 - boundary_eps), axis=1)
+    clamp_active = corr_mag >= clamp_frac * budget
+    signal_clipped = above & at_boundary
+    budget_limited = above & ~at_boundary & clamp_active
+    residual = above & ~at_boundary & ~clamp_active
+    return {"above": above, "signal_clipped": signal_clipped,
+            "budget_limited": budget_limited, "residual": residual}
+
+
 def optimize_cube(
     *,
     target: Target,
@@ -153,128 +228,149 @@ def optimize_cube(
     ``signals`` / ``measured_xyz`` are the initial **raw** profiling measurements
     (item 2's output: panel response with no LUT). ``probe`` re-measures the panel
     at arbitrary driven signals (the fidelity-ladder seam). Returns the best cube
-    plus a per-iteration history and an LLM-facing digest.
-
-    Each outer iteration: fit a :class:`DisplayErrorModel` on all measurements so
-    far → :func:`build_cube` (inner loop) → sample the cube at ``verify_signals`` →
-    ``probe`` the driven points → score per-patch dE_ITP vs target → if not
-    converged, **fold the (driven, measured) pairs back** into the training set and
-    repeat. Floor = points that stay above ``threshold`` without improving.
+    plus a per-iteration history and an LLM-facing digest that separates real floors
+    from a too-small correction budget.
     """
 
     cfg = config or OptimizeConfig()
     space = TargetSpace(target)
 
     train_signals = np.asarray(signals, dtype=float).reshape(-1, 3)
-    train_xyz = np.asarray(measured_xyz, dtype=float).reshape(-1, 3)
+    train_xyz = np.maximum(np.asarray(measured_xyz, dtype=float).reshape(-1, 3), 0.0)
     verify = (np.asarray(verify_signals, dtype=float).reshape(-1, 3)
               if verify_signals is not None else train_signals.copy())
     target_ictcp = space.ideal_ictcp(verify)
 
+    # Budget: seed from the measured residual unless pinned.
+    budget = (cfg.max_correction if cfg.max_correction is not None
+              else seed_correction_budget(space, train_signals, train_xyz,
+                                          safety=cfg.correction_safety,
+                                          percentile=cfg.seed_percentile,
+                                          floor=cfg.correction_floor,
+                                          cap=cfg.max_correction_cap))
+
     history: list[IterationResult] = []
-    best_cube = identity_cube(cfg.grid_size)
-    best_max = float("inf")
+    snapshots: list[dict[str, Any]] = []   # cached per-iter measurements (no extra probing)
     prev_de: Optional[np.ndarray] = None
     converged = False
-    floor_mask = np.zeros(len(verify), dtype=bool)
 
     for it in range(1, cfg.max_outer + 1):
         model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing)
         cube = build_cube(
             model, cfg.grid_size, signal_points=train_signals,
-            fade_width=cfg.fade_width, max_correction=cfg.max_correction,
+            fade_width=cfg.fade_width, max_correction=budget,
             n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
         )
-
         driven = sample_cube(cube, verify)
         measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
         de = de_itp(space.xyz_to_ictcp(measured) - target_ictcp)
 
-        pred = predicted_accuracy(model, cube, verify)
+        masks = _classify(verify, driven, de, cfg.threshold, budget,
+                          clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps)
         diag = cube_diagnostics(cube)
         order = np.argsort(de)[::-1][: cfg.top_k]
         result = IterationResult(
-            iteration=it,
-            measured_mean_de=float(de.mean()),
-            measured_p95_de=float(np.percentile(de, 95)),
+            iteration=it, max_correction=budget,
+            measured_mean_de=float(de.mean()), measured_p95_de=float(np.percentile(de, 95)),
             measured_max_de=float(de.max()),
-            predicted_max_de=float(pred["max"]),
-            above_threshold=int(np.sum(de > cfg.threshold)),
+            predicted_max_de=float(predicted_accuracy(model, cube, verify)["max"]),
+            above_threshold=int(masks["above"].sum()),
+            budget_limited=int(masks["budget_limited"].sum()),
+            signal_clipped=int(masks["signal_clipped"].sum()),
+            residual=int(masks["residual"].sum()),
             worst=[(verify[i].tolist(), float(de[i])) for i in order],
-            smoothing=float(model.smoothing),
-            cube_monotonic=diag.monotonic,
+            smoothing=float(model.smoothing), cube_monotonic=diag.monotonic,
             train_points=int(len(train_signals)),
         )
         history.append(result)
+        snapshots.append({"cube": cube, "driven": driven, "measured": measured, "de": de,
+                          "budget": budget, "monotonic": diag.monotonic})
         if on_iteration is not None:
             on_iteration(result)
-
-        if result.measured_max_de < best_max:
-            best_max = result.measured_max_de
-            best_cube = cube
 
         if de.max() < cfg.threshold:
             converged = True
             break
 
-        # Floor detection: above-threshold points that stopped improving.
-        if prev_de is not None:
-            stuck = (de > cfg.threshold) & ((prev_de - de) < cfg.floor_tol)
-            floor_mask = stuck
-            if np.all((de <= cfg.threshold) | stuck):
-                break  # everything is either good or at its floor — re-measure won't help
-        prev_de = de
+        # Escalate the budget while points are clamp-limited with signal headroom —
+        # a too-small budget self-corrects rather than reading as a floor.
+        if cfg.auto_escalate and masks["budget_limited"].any() and budget < cfg.max_correction_cap:
+            budget = min(cfg.max_correction_cap, budget * cfg.escalate_factor)
+        else:
+            # No budget headroom to gain: stop once no above-threshold point is
+            # still improving (real floor — clipped or model residual).
+            if prev_de is not None:
+                improving = (de > cfg.threshold) & ((prev_de - de) >= cfg.floor_tol)
+                if not np.any(improving):
+                    prev_de = de
+                    train_signals = np.vstack([train_signals, driven])
+                    train_xyz = np.vstack([train_xyz, measured])
+                    break
 
-        # Fold reality back: the driven points + their true response are new
-        # ground truth about the panel where the cube actually operates.
+        prev_de = de
+        # Fold reality back: the driven points + their true response are new ground
+        # truth about the panel where the cube actually operates.
         train_signals = np.vstack([train_signals, driven])
         train_xyz = np.vstack([train_xyz, measured])
 
+    # Pick the cube to return: prefer monotonic, then lowest worst-case dE — using
+    # the cached measurements (no extra probing).
+    def _rank(s: dict[str, Any]) -> tuple[int, float]:
+        return (0 if s["monotonic"] else 1, float(s["de"].max()))
+    best = min(snapshots, key=_rank)
+    best_cube, best_de, best_driven, best_budget = (best["cube"], best["de"],
+                                                    best["driven"], best["budget"])
     final = history[-1]
-    # Best-cube error at verify (the cube we actually return):
-    best_driven = sample_cube(best_cube, verify)
-    best_de = de_itp(space.xyz_to_ictcp(np.maximum(np.asarray(probe(best_driven), float).reshape(-1, 3), 0.0)) - target_ictcp)
-    floor_points = [(verify[i].tolist(), float(best_de[i]))
-                    for i in np.where(best_de > cfg.threshold)[0]]
+
+    masks_best = _classify(verify, best_driven, best_de, cfg.threshold, best_budget,
+                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps)
+    # Real floors = physically clipped + model residual (more budget won't help).
+    real_floor = masks_best["signal_clipped"] | masks_best["residual"]
+    budget_limited = masks_best["budget_limited"]
+    floor_points = [(verify[i].tolist(), float(best_de[i])) for i in np.where(real_floor)[0]]
     floor_points.sort(key=lambda p: p[1], reverse=True)
 
-    needs_adjudication = not converged and bool(floor_points)
+    needs_adjudication = bool(real_floor.any() or budget_limited.any())
     question = None
     if needs_adjudication:
-        worst_sig, worst_de = floor_points[0]
-        question = (
-            f"{len(floor_points)} patch(es) stay above dE {cfg.threshold:g} after "
-            f"{len(history)} outer iteration(s) (worst dE {worst_de:.1f} at signal "
-            f"{[round(c, 3) for c in worst_sig]}) — accept as the panel's physical floor, "
-            f"or raise the iteration budget / loosen the target?"
-        )
+        parts: list[str] = []
+        if real_floor.any():
+            worst_sig, worst_de = floor_points[0]
+            parts.append(
+                f"{int(real_floor.sum())} patch(es) at the panel's physical floor "
+                f"(worst dE {worst_de:.1f} at signal {[round(c, 3) for c in worst_sig]}, "
+                f"channel at full scale) — accept as the panel limit, or loosen the target?"
+            )
+        if budget_limited.any():
+            parts.append(
+                f"{int(budget_limited.sum())} patch(es) still need a correction beyond the "
+                f"budget cap ({cfg.max_correction_cap:g}); raise the cap (the 3D LUT is doing "
+                f"more than a post-MHC residual) or run MHC first."
+            )
+        question = " ".join(parts)
 
     digest = {
         "converged": converged,
         "iterations": len(history),
         "grid_size": cfg.grid_size,
         "threshold": cfg.threshold,
+        "max_correction": round(best_budget, 4),
         "best_max_de": round(float(best_de.max()), 4),
         "best_mean_de": round(float(best_de.mean()), 4),
         "best_p95_de": round(float(np.percentile(best_de, 95)), 4),
-        "above_threshold": int(np.sum(best_de > cfg.threshold)),
-        "floor_points": len(floor_points),
-        "cube_monotonic": cube_diagnostics(best_cube).monotonic,
+        "above_threshold": int(masks_best["above"].sum()),
+        "physical_floor": int(real_floor.sum()),
+        "budget_limited": int(budget_limited.sum()),
+        "cube_monotonic": bool(best["monotonic"]),
         "needs_adjudication": needs_adjudication,
         "history": [h.as_dict() for h in history],
     }
 
     return OptimizeResult(
-        converged=converged,
-        iterations=len(history),
-        cube=best_cube,
-        grid_size=cfg.grid_size,
-        final=final,
-        history=history,
-        floor_points=floor_points[: cfg.top_k],
-        needs_adjudication=needs_adjudication,
-        question=question,
-        digest=digest,
+        converged=converged, iterations=len(history), cube=best_cube, grid_size=cfg.grid_size,
+        max_correction=best_budget, final=final, history=history,
+        floor_points=floor_points[: cfg.top_k], needs_adjudication=needs_adjudication,
+        question=question, digest=digest,
     )
 
 
@@ -296,8 +392,9 @@ def synthetic_probe(
     gain+gamma (and optional cross-channel leak) to the driven signal, then emits
     the *ideal* XYZ of that distorted signal. The correction machine should invert
     it. Gains ≥ 1 keep every correction feasible (no full-white ceiling), so the
-    loop converges cleanly; raise a gain above what the LUT can pull down to test
-    floor detection. Pure/deterministic (optional seeded gaussian noise)."""
+    loop converges cleanly; a gain < 1 needs the cube to push past full scale at
+    bright signals, which clips — a genuine physical floor (to test floor
+    detection). Pure/deterministic (optional seeded gaussian noise)."""
 
     space = TargetSpace(target)
     g = np.asarray(gains, dtype=float)

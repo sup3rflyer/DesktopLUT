@@ -23,6 +23,7 @@ from dlc.optimize import (
     OptimizeConfig,
     optimize_cube,
     sample_cube,
+    seed_correction_budget,
     synthetic_probe,
 )
 from dlc.engine.lut_rbf import identity_cube
@@ -92,13 +93,11 @@ def test_foldback_loop_is_no_worse_than_a_single_build():
     one = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
                         config=OptimizeConfig(grid_size=17, max_outer=1))
     many = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
-                         config=OptimizeConfig(grid_size=17, max_outer=4))
+                         config=OptimizeConfig(grid_size=17, max_outer=6))
 
-    # Folding reality back never makes the returned cube worse, and the history
-    # is monotone non-increasing in worst-case dE.
+    # Folding reality back (and escalating the budget) never makes the returned
+    # cube worse — the result selects the best cube across iterations.
     assert many.digest["best_max_de"] <= one.digest["best_max_de"] + 1e-6
-    maxes = [h.measured_max_de for h in many.history]
-    assert all(b <= a + 1e-6 for a, b in zip(maxes, maxes[1:]))
     # the model→reality gap is reported so the LLM can see model error
     assert "model_reality_gap" in many.history[0].as_dict()
 
@@ -107,24 +106,65 @@ def test_foldback_loop_is_no_worse_than_a_single_build():
 # floor detection / escalation
 # ---------------------------------------------------------------------------
 
-def test_infeasible_correction_surfaces_a_floor_for_adjudication():
+def test_infeasible_correction_surfaces_only_real_floors():
     target = _sdr_target()
     # Blue reads 12% too DIM: correcting it needs to push blue past full scale at
-    # bright signals, which clips — an unreachable floor near white.
+    # bright signals, which clips — a genuine physical floor near white.
     probe = synthetic_probe(target, gains=(1.0, 1.0, 0.88))
     signals = _cube_signals(5)
     measured = probe(signals)
 
     result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
-                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4))
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=6))
 
     assert result.converged is False
-    assert len(result.floor_points) >= 1
     assert result.needs_adjudication is True
-    assert result.question is not None and "floor" in result.question
+    # the seed + escalation resolve the clamp-limited (false) floors — what remains
+    # is the real, signal-clipped floor only.
+    assert result.digest["physical_floor"] >= 1
+    assert result.digest["budget_limited"] == 0
+    assert len(result.floor_points) >= 1
+    assert result.question is not None and "physical floor" in result.question
     # the worst floor point is a bright, blue-bearing stimulus
-    worst_signal = result.floor_points[0][0]
-    assert max(worst_signal) > 0.5
+    assert max(result.floor_points[0][0]) > 0.5
+
+
+def test_clamp_limited_points_are_not_labelled_a_panel_floor():
+    """The hardening's core guarantee: a too-small budget is reported as
+    budget-limited (raise the budget), NOT as the panel's physical floor."""
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.0, 0.88))
+    signals = _cube_signals(5)
+    measured = probe(signals)
+
+    # Pin a deliberately tiny budget and disable escalation (the old behaviour).
+    pinned = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=17, max_outer=2,
+                                                 max_correction=0.05, auto_escalate=False))
+    # Most stuck points are clamp-limited, and the machine SAYS so (vs the panel).
+    assert pinned.digest["budget_limited"] > 0
+    assert pinned.question is not None and "budget" in pinned.question
+
+    # The hardened run (seed + escalate) resolves those — strictly fewer above
+    # threshold, none left budget-limited.
+    hardened = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                             config=OptimizeConfig(grid_size=17, max_outer=6))
+    assert hardened.digest["above_threshold"] < pinned.digest["above_threshold"]
+    assert hardened.digest["budget_limited"] == 0
+    assert hardened.max_correction > 0.05  # the budget was raised to fit the panel
+
+
+def test_seed_budget_scales_with_measured_residual():
+    target = _sdr_target()
+    space = TargetSpace(target)
+    signals = _cube_signals(5)
+    mild = synthetic_probe(target, gains=(1.0, 1.004, 1.008))
+    big = synthetic_probe(target, gains=(1.0, 1.0, 0.85))
+    b_mild = seed_correction_budget(space, signals, mild(signals))
+    b_big = seed_correction_budget(space, signals, big(signals))
+    assert b_big > b_mild
+    assert 0.01 <= b_mild <= 0.05
+    assert b_big > 0.06
 
 
 # ---------------------------------------------------------------------------
