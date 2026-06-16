@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 __all__ = [
     "CorrectionInfo",
@@ -42,10 +42,17 @@ __all__ = [
     "QualityTargets",
     "Profile",
     "StalenessVerdict",
+    "WhitePointResolution",
+    "WhiteFn",
     "load_profile",
     "DEFAULT_PROFILE_PATH",
     "D65_XY",
 ]
+
+# A white-point resolver seam: ``(spd_file, *, strength, observer, anchor) -> dict``
+# with at least ``{"xy": (x, y)}`` (optionally ``cct``/``duv``/``observer``/``anchor``).
+# The default lazy-imports the engine; tests inject a deterministic stand-in.
+WhiteFn = Callable[..., dict]
 
 # Numeric (textbook) D65 under the CIE 1931 2° observer — the correction-strength-0
 # default. The SPD-derived "CRT-like" D65 (whitepoint.py) is the strength→1 path and
@@ -115,6 +122,8 @@ class DisplayConfig:
     panel: PanelInfo = field(default_factory=PanelInfo)
     sdr_target: Optional[str] = None
     hdr_target: Optional[str] = None
+    white_spd: Optional[str] = None    # the display's measured white SPD (.sp/.csv);
+    #                                    the SPD double-duty source (correction + white)
     quirks: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -138,6 +147,8 @@ class WhiteSpec:
     intent: str = "D65"
     method: str = "numeric"            # 'numeric' | 'spd_crt_like'
     correction_strength: float = 0.0   # 0 = numeric D65; →1 = SPD observer-corrected
+    observer: str = "2015_2"           # modern observer for the SPD correction (whitepoint.py)
+    anchor: str = "reference"          # 'reference' | 'legacy' anchor for the correction
 
 
 @dataclass(frozen=True)
@@ -213,6 +224,48 @@ class StalenessVerdict:
                 "stale": self.stale, "refreshable": self.refreshable, "message": self.message}
 
 
+@dataclass(frozen=True)
+class WhitePointResolution:
+    """The resolved calibration-target white **and how it was derived** — the
+    provenance the report, the deliverable, and the cross-run correction store all
+    carry (HANDOFF item 7). ``provenance`` is one of ``override`` / ``spd_crt_like``
+    / ``numeric``; ``note`` explains the choice in plain language."""
+
+    xy: tuple[float, float]
+    provenance: str
+    method: str
+    strength: float
+    observer: Optional[str] = None
+    anchor: Optional[str] = None
+    spd_file: Optional[str] = None
+    cct: Optional[float] = None
+    duv: Optional[float] = None
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"xy": [self.xy[0], self.xy[1]], "provenance": self.provenance,
+                "method": self.method, "strength": self.strength, "observer": self.observer,
+                "anchor": self.anchor, "spd_file": self.spd_file, "cct": self.cct,
+                "duv": self.duv, "note": self.note}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "WhitePointResolution":
+        xy = d["xy"]
+        return cls(xy=(float(xy[0]), float(xy[1])), provenance=d["provenance"],
+                   method=d.get("method", "numeric"), strength=float(d.get("strength", 0.0)),
+                   observer=d.get("observer"), anchor=d.get("anchor"),
+                   spd_file=d.get("spd_file"), cct=d.get("cct"), duv=d.get("duv"),
+                   note=d.get("note", ""))
+
+
+def _default_white_fn(spd_file: str, *, strength: float, observer: str, anchor: str) -> dict:
+    """Default SPD→white resolver. Lazy-imports the engine (numpy/colour) so the
+    profile module stays dependency-light unless the SPD path is actually taken."""
+    from .engine.whitepoint import white_from_spd_file
+
+    return white_from_spd_file(spd_file, strength=strength, observer=observer, anchor=anchor)
+
+
 # ---------------------------------------------------------------------------
 # Profile
 # ---------------------------------------------------------------------------
@@ -253,16 +306,75 @@ class Profile:
         return self.target(name)
 
     # -- engine builders (lazy-import the numpy/colour engine) ------------
-    def engine_target(self, target_name: str):
-        """Build the engine :class:`~dlc.engine.model.Target` for a named target."""
+    def engine_target(self, target_name: str, *, white_xy: Optional[tuple[float, float]] = None):
+        """Build the engine :class:`~dlc.engine.model.Target` for a named target.
+
+        ``white_xy`` overrides the target's own white (the orchestrator passes the
+        run's :meth:`resolve_white` result so the 3D-LUT correction targets the same
+        white the MHC/GS+WB stages do); without it, falls back to ``spec.white_xy()``.
+        """
         from .engine.model import Target
 
         spec = self.target(target_name)
-        white_xy = spec.white_xy()
+        wxy = white_xy if white_xy is not None else spec.white_xy()
         if spec.is_hdr:
-            return Target.hdr_rec2020_pq(peak_nits=spec.luminance_nits, white_xy=white_xy)
+            return Target.hdr_rec2020_pq(peak_nits=spec.luminance_nits, white_xy=wxy)
         return Target.sdr_srgb_power(gamma=spec.gamma, white_nits=spec.luminance_nits,
-                                     white_xy=white_xy)
+                                     white_xy=wxy)
+
+    # -- white-point resolution (HANDOFF item 7) --------------------------
+    def resolve_white(self, monitor: int, target_name: str, *,
+                      white_fn: Optional[WhiteFn] = None) -> WhitePointResolution:
+        """Resolve the calibration-target white chromaticity + its provenance.
+
+        Precedence:
+
+        1. a ``white_xy`` override pinned on the target → used verbatim
+           (provenance ``override`` — e.g. an eye-verified SPD result).
+        2. ``white.method == 'spd_crt_like'`` with ``correction_strength > 0`` **and**
+           the display has a readable white SPD → the SPD-derived observer-corrected
+           "CRT-like" white (provenance ``spd_crt_like``), computed by ``white_fn``
+           (defaults to :func:`_default_white_fn` → the engine; injectable for tests).
+        3. otherwise → numeric (textbook) D65 (provenance ``numeric``), with a note
+           saying why (strength 0, method numeric, or no SPD on hand). The graceful
+           fallback means a missing SPD never crashes a run — it just stays on D65.
+        """
+        spec = self.target(target_name)
+        white = spec.white
+        if spec.white_xy_override is not None:
+            return WhitePointResolution(
+                xy=spec.white_xy_override, provenance="override", method=white.method,
+                strength=float(white.correction_strength), observer=white.observer,
+                anchor=white.anchor,
+                note="white_xy_override pinned in the profile (e.g. an eye-verified result)")
+        display = self.display_for(monitor)
+        strength = float(white.correction_strength)
+        if white.method == "spd_crt_like" and strength > 0.0:
+            spd = display.white_spd
+            spd_path = Path(spd) if spd else None
+            if spd_path is not None and spd_path.exists():
+                fn = white_fn or _default_white_fn
+                res = fn(str(spd_path), strength=strength, observer=white.observer,
+                         anchor=white.anchor)
+                rx, ry = res["xy"]
+                return WhitePointResolution(
+                    xy=(float(rx), float(ry)), provenance="spd_crt_like", method=white.method,
+                    strength=strength, observer=res.get("observer", white.observer),
+                    anchor=res.get("anchor", white.anchor), spd_file=str(spd_path),
+                    cct=res.get("cct"), duv=res.get("duv"),
+                    note=f"SPD-derived CRT-like white at strength {strength:g} "
+                         f"({white.observer}/{white.anchor} anchor)")
+            note = (f"spd_crt_like requested but no white SPD configured for display "
+                    f"{display.name!r} → numeric D65" if spd is None
+                    else f"white SPD {spd!r} not found → numeric D65")
+            return WhitePointResolution(
+                xy=D65_XY, provenance="numeric", method=white.method, strength=strength,
+                observer=white.observer, anchor=white.anchor, spd_file=spd, note=note)
+        note = ("spd_crt_like method but correction_strength 0 → numeric D65"
+                if white.method == "spd_crt_like" else "numeric (textbook) D65")
+        return WhitePointResolution(
+            xy=D65_XY, provenance="numeric", method=white.method, strength=strength,
+            observer=white.observer, anchor=white.anchor, note=note)
 
     def transfer_for(self, target_name: str, *, bit_depth: Optional[int] = None):
         """Build the :class:`~dlc.engine.patches.Transfer` for a named target."""
@@ -275,19 +387,30 @@ class Profile:
         return Transfer.power(gamma=spec.gamma, peak_nits=spec.luminance_nits, bit_depth=depth)
 
     # -- SPD-correction staleness (tell, don't ask) -----------------------
-    def correction_staleness(self, *, today: Optional[date] = None) -> StalenessVerdict:
+    def correction_staleness(self, *, today: Optional[date] = None,
+                             made_override: Optional[str] = None) -> StalenessVerdict:
+        """The SPD-correction staleness *tell* (never a gate).
+
+        ``made_override`` lets the caller supply the correction's build date from the
+        persistent per-display correction store (§10) instead of the profile YAML, so
+        a correction refreshed since the profile was written ages from its real date.
+        """
         c = self.meter.correction
         today = today or date.today()
         if not c.file:
             return StalenessVerdict(
-                has_correction=False, made=c.made, age_days=None, max_age_days=c.max_age_days,
-                stale=False, refreshable=c.spectrometer_available,
+                has_correction=False, made=made_override or c.made, age_days=None,
+                max_age_days=c.max_age_days, stale=False, refreshable=c.spectrometer_available,
                 message="no colorimeter correction configured — raw meter readings "
                         "(consider building a CCMX/CCSS for a mini-LED/QD panel).")
-        made = c.made_date
+        made_str = made_override if made_override is not None else c.made
+        try:
+            made = datetime.strptime(str(made_str), "%Y-%m-%d").date() if made_str else None
+        except ValueError:
+            made = None
         if made is None:
             return StalenessVerdict(
-                has_correction=True, made=c.made, age_days=None, max_age_days=c.max_age_days,
+                has_correction=True, made=made_str, age_days=None, max_age_days=c.max_age_days,
                 stale=False, refreshable=c.spectrometer_available,
                 message="correction present but its build date is unknown — cannot judge staleness.")
         age = (today - made).days
@@ -298,18 +421,23 @@ class Profile:
         else:
             msg = f"colorimeter correction is {age} days old (within the {c.max_age_days}d policy)."
         return StalenessVerdict(
-            has_correction=True, made=c.made, age_days=age, max_age_days=c.max_age_days,
+            has_correction=True, made=made_str, age_days=age, max_age_days=c.max_age_days,
             stale=stale, refreshable=c.spectrometer_available, message=msg)
 
     # -- construction -----------------------------------------------------
     @classmethod
     def synthetic(cls, *, monitor: int = 0, sdr_nits: float = 120.0,
                   cold_channel: str = "B", correction_made: Optional[str] = None,
-                  output_dir: Optional[str] = None) -> "Profile":
+                  output_dir: Optional[str] = None, white_method: str = "numeric",
+                  white_strength: float = 0.0, white_spd: Optional[str] = None) -> "Profile":
         """A deterministic in-memory profile for tests / autonomous rehearsals —
         never touches the local-only YAML. Models the lab's primary mini-LED panel
         (temperamental blue, sRGB/γ2.2/120-nit SDR target). ``output_dir`` (absolute)
-        pins where the deliverable folder lands; defaults to the relative ``results``."""
+        pins where the deliverable folder lands; defaults to the relative ``results``.
+
+        ``white_method``/``white_strength``/``white_spd`` opt the SDR target into the
+        SPD-derived "CRT-like" white path (item 7) for exercising the resolver; the
+        default keeps numeric D65."""
         return cls(
             meter=MeterConfig(model="synthetic meter", argyll_port=1,
                               correction=CorrectionInfo(file="synthetic.ccmx", made=correction_made,
@@ -317,11 +445,13 @@ class Profile:
             displays=(DisplayConfig(
                 name="Synthetic mini-LED", desktoplut_monitor=monitor, argyll_display=monitor + 1,
                 primary=True, panel=PanelInfo(tech="mini-LED IPS", bit_depth=10),
-                sdr_target="srgb_g22", hdr_target="rec2020_pq",
+                sdr_target="srgb_g22", hdr_target="rec2020_pq", white_spd=white_spd,
                 quirks={"temperamental_channel": cold_channel, "settle_delta_de": 0.3}),),
             targets={
                 "srgb_g22": TargetSpec(name="srgb_g22", colorspace="Rec.709", transfer_type="power",
-                                       gamma=2.2, white=WhiteSpec(), white_luminance_nits=sdr_nits),
+                                       gamma=2.2, white_luminance_nits=sdr_nits,
+                                       white=WhiteSpec(method=white_method,
+                                                       correction_strength=white_strength)),
                 "rec2020_pq": TargetSpec(name="rec2020_pq", colorspace="Rec.2020", transfer_type="pq",
                                          gamma=2.2, white=WhiteSpec(), peak_luminance_nits=1600.0),
             },
@@ -341,6 +471,8 @@ def _white_spec(raw: dict[str, Any]) -> WhiteSpec:
         intent=str(w.get("intent", "D65")),
         method=str(w.get("method", "numeric")),
         correction_strength=float(w.get("correction_strength", 0.0) or 0.0),
+        observer=str(w.get("observer", "2015_2")),
+        anchor=str(w.get("anchor", "reference")),
     )
 
 
@@ -377,6 +509,7 @@ def _display_config(raw: dict[str, Any]) -> DisplayConfig:
         ),
         sdr_target=raw.get("sdr_target"),
         hdr_target=raw.get("hdr_target"),
+        white_spd=raw.get("white_spd"),
         quirks=dict(raw.get("quirks", {}) or {}),
     )
 

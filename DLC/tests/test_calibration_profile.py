@@ -47,6 +47,97 @@ def test_white_xy_override_takes_precedence():
     assert spec.white_xy() == (0.308, 0.325)
 
 
+# ---------------------------------------------------------------------------
+# resolve_white — the white-point resolver (HANDOFF item 7)
+# ---------------------------------------------------------------------------
+
+def _fake_white_fn(spd_file, *, strength, observer, anchor):
+    """A deterministic SPD→white stand-in (no numpy/colour) for the resolver tests —
+    returns a fixed cooler "CRT-like" white and echoes the dials."""
+    return {"xy": (0.3080, 0.3250), "cct": 6800.0, "duv": 0.003,
+            "observer": observer, "anchor": anchor}
+
+
+def test_resolve_white_numeric_by_default():
+    p = cp.Profile.synthetic()
+    r = p.resolve_white(0, "srgb_g22")
+    assert r.provenance == "numeric"
+    assert r.xy == cp.D65_XY
+    assert r.observer == "2015_2" and r.anchor == "reference"
+
+
+def test_resolve_white_spd_path_uses_injected_fn(tmp_path):
+    spd = tmp_path / "white.sp"
+    spd.write_text("stub", encoding="utf-8")
+    p = cp.Profile.synthetic(white_method="spd_crt_like", white_strength=0.5, white_spd=str(spd))
+    r = p.resolve_white(0, "srgb_g22", white_fn=_fake_white_fn)
+    assert r.provenance == "spd_crt_like"
+    assert r.xy == (0.3080, 0.3250)
+    assert r.cct == 6800.0 and r.strength == 0.5
+    assert r.spd_file == str(spd)
+
+
+def test_resolve_white_strength_zero_is_numeric(tmp_path):
+    spd = tmp_path / "white.sp"
+    spd.write_text("stub", encoding="utf-8")
+    # spd_crt_like method but strength 0 ⇒ numeric D65 (no SPD load, no fn call).
+    p = cp.Profile.synthetic(white_method="spd_crt_like", white_strength=0.0, white_spd=str(spd))
+    r = p.resolve_white(0, "srgb_g22", white_fn=_fake_white_fn)
+    assert r.provenance == "numeric"
+    assert r.xy == cp.D65_XY
+
+
+def test_resolve_white_falls_back_when_no_spd():
+    # spd_crt_like + strength>0 but no SPD on hand ⇒ graceful numeric fallback, not a crash.
+    p = cp.Profile.synthetic(white_method="spd_crt_like", white_strength=0.7, white_spd=None)
+    r = p.resolve_white(0, "srgb_g22", white_fn=_fake_white_fn)
+    assert r.provenance == "numeric"
+    assert r.xy == cp.D65_XY
+    assert "no white SPD" in r.note
+
+
+def test_resolve_white_falls_back_when_spd_missing(tmp_path):
+    p = cp.Profile.synthetic(white_method="spd_crt_like", white_strength=0.7,
+                             white_spd=str(tmp_path / "absent.sp"))
+    r = p.resolve_white(0, "srgb_g22", white_fn=_fake_white_fn)
+    assert r.provenance == "numeric"
+    assert "not found" in r.note
+
+
+def test_resolve_white_override_beats_spd(tmp_path):
+    spd = tmp_path / "white.sp"
+    spd.write_text("stub", encoding="utf-8")
+    spec = cp.TargetSpec(name="t", white_xy_override=(0.310, 0.331),
+                         white=cp.WhiteSpec(method="spd_crt_like", correction_strength=1.0))
+    p = cp.Profile(meter=cp.MeterConfig(),
+                   displays=(cp.DisplayConfig(name="d", desktoplut_monitor=0, argyll_display=1,
+                                              sdr_target="t", white_spd=str(spd)),),
+                   targets={"t": spec})
+    r = p.resolve_white(0, "t", white_fn=_fake_white_fn)
+    assert r.provenance == "override"
+    assert r.xy == (0.310, 0.331)
+
+
+def test_white_point_resolution_round_trips():
+    r = cp.WhitePointResolution(xy=(0.308, 0.325), provenance="spd_crt_like", method="spd_crt_like",
+                                strength=0.5, observer="2015_2", anchor="reference",
+                                spd_file="w.sp", cct=6800.0, duv=0.003, note="x")
+    assert cp.WhitePointResolution.from_dict(r.as_dict()).xy == r.xy
+    assert cp.WhitePointResolution.from_dict(r.as_dict()).provenance == "spd_crt_like"
+
+
+# ---------------------------------------------------------------------------
+# staleness with a store-supplied made date (made_override)
+# ---------------------------------------------------------------------------
+
+def test_staleness_made_override_supersedes_profile():
+    # Profile says the correction is fresh, but the store records an older real date.
+    p = cp.Profile.synthetic(correction_made="2026-06-01")
+    v = p.correction_staleness(today=datetime.date(2026, 6, 16), made_override="2025-01-01")
+    assert v.made == "2025-01-01"
+    assert v.stale is True
+
+
 def test_hdr_target_uses_peak_luminance():
     p = cp.Profile.synthetic()
     hdr = p.target("rec2020_pq")
@@ -106,12 +197,13 @@ displays:
     panel: {tech: mini-LED, bit_depth: 10}
     sdr_target: srgb_g22_120
     hdr_target: null
+    white_spd: white.sp
     quirks: {temperamental_channel: blue, settle_delta_de: 0.3}
 targets:
   srgb_g22_120:
     colorspace: Rec.709
     transfer: {type: power, gamma: 2.2}
-    white: {intent: D65, method: spd_crt_like, correction_strength: 0.0}
+    white: {intent: D65, method: spd_crt_like, correction_strength: 0.5, observer: "1964_10", anchor: legacy}
     white_luminance_nits: 120
 quality:
   avg_de2000: 1.2
@@ -131,9 +223,12 @@ def test_load_profile_round_trips(tmp_path: Path):
     assert d.name == "Panel One"
     assert d.temperamental_channel == "B"
     assert d.sdr_target == "srgb_g22_120"
+    assert d.white_spd == "white.sp"
     t = p.target("srgb_g22_120")
     assert t.transfer_type == "power" and t.gamma == 2.2
     assert t.white.method == "spd_crt_like"
+    assert t.white.correction_strength == 0.5
+    assert t.white.observer == "1964_10" and t.white.anchor == "legacy"
     assert p.quality.avg_de2000 == 1.2
     assert p.source_path == str(path)
 

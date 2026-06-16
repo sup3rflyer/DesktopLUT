@@ -48,6 +48,7 @@ import numpy as np
 
 from . import calibration_profile as cp
 from .controller import CalibrationController, normalize_mode
+from .correction_store import CorrectionRecord, CorrectionStore
 from .engine.patches import Transfer, ramp_patches, sort_patches, tube_patches
 from .measure_loop import (
     MeasureFn,
@@ -250,6 +251,7 @@ class Calibration:
         force: bool = False,
         dummy_icc: str = "sRGB.icm",
         patch_sizes: Optional[PatchSizes] = None,
+        white_fn: Optional[cp.WhiteFn] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -267,6 +269,7 @@ class Calibration:
         self.force = force
         self.dummy_icc = dummy_icc
         self.patch_sizes = patch_sizes or PatchSizes()
+        self._white_fn = white_fn
 
         self._state = _common.load_dlc_state(ctx)
         self.calib: dict[str, Any] = self._state.setdefault("calib", {})
@@ -327,7 +330,34 @@ class Calibration:
         return self.profile.transfer_for(self.target_name, bit_depth=self.bit_depth)
 
     def _engine_target(self):
-        return self.profile.engine_target(self.target_name)
+        # The 3D-LUT correction targets the SAME resolved white the MHC/GS+WB stages do.
+        return self.profile.engine_target(self.target_name, white_xy=self._white_xy())
+
+    # -- white-point resolution (HANDOFF item 7) --------------------------
+    def _correction_store(self) -> CorrectionStore:
+        """The cross-run, per-display correction store. Profile-adjacent when the
+        profile is on disk (durable across ``runs/`` prunes), else beside the run
+        folders (tests / synthetic profiles)."""
+        if self.profile.source_path:
+            base = Path(self.profile.source_path).resolve().parent
+        else:
+            base = self.ctx.root.parent if self.ctx.root.parent != self.ctx.root else self.ctx.root
+        return CorrectionStore.load(base / "correction_store.json")
+
+    def _resolved_white(self) -> cp.WhitePointResolution:
+        """The run's resolved target white (memoised in the run-record by
+        :meth:`stage_whitepoint`; resolved on demand if a stage reaches for it first
+        — e.g. a resumed run before that stage replays)."""
+        cached = self.calib.get("white")
+        if cached:
+            return cp.WhitePointResolution.from_dict(cached)
+        res = self.profile.resolve_white(self.monitor, self.target_name, white_fn=self._white_fn)
+        self.calib["white"] = res.as_dict()
+        self._save()
+        return res
+
+    def _white_xy(self) -> tuple[float, float]:
+        return self._resolved_white().xy
 
     def _measure_set(self, patches: Sequence[tuple[int, int, int]], *, role: str,
                      ti3_name: str, ndjson_name: str) -> MeasureLoopResult:
@@ -383,11 +413,17 @@ class Calibration:
             except Exception as exc:  # noqa: BLE001 - surfaced in the digest
                 state = {"error": f"{type(exc).__name__}: {exc}"}
                 mapping_ok = False
-            staleness = self.profile.correction_staleness(today=self.run_date)
+            # The persistent per-display store supplies the correction's real build
+            # date when present (a refresh recorded since the profile was written),
+            # so staleness ages from when the correction was actually made (§10).
+            store_rec = self._correction_store().get(self.display.name)
+            store_made = store_rec.correction_made if store_rec else None
+            staleness = self.profile.correction_staleness(today=self.run_date, made_override=store_made)
             digest = {"monitor": self.monitor, "mode": self.mode, "display": self.display.name,
                       "argyll_display": self.display.argyll_display, "mapping_ok": mapping_ok,
                       "seen_monitors": sorted(set(seen_monitors)),
-                      "correction": staleness.as_dict()}
+                      "correction": staleness.as_dict(),
+                      "correction_from_store": store_made is not None}
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
 
@@ -428,6 +464,41 @@ class Calibration:
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
         return StageOutcome("resolve-target", "done", digest=digest, data={"target": target})
+
+    def stage_whitepoint(self) -> StageOutcome:
+        """Resolve the calibration-target white + its provenance (§9, §10; item 7) and
+        persist it to the cross-run per-display correction store. SPD/white-point
+        promoted to a **first-class early stage**: the SPD does double duty (the
+        colorimeter correction *and* the SPD-derived "CRT-like" D65), and the resolved
+        white flows into the MHC matrix, the 3D-LUT target, and the GS+WB tweak — all
+        three aim at the *same* white. No new ⚑ seam: the correction-staleness *tell*
+        already fired in preflight; the white is reported (in the digest + report), not
+        asked. Falls back to numeric D65 when no SPD is on hand, so it never blocks."""
+        def run() -> StageOutcome:
+            res = self.profile.resolve_white(self.monitor, self.target_name, white_fn=self._white_fn)
+            self.calib["white"] = res.as_dict()
+            corr = self.profile.meter.correction
+            self._correction_store().record(CorrectionRecord(
+                display=self.display.name,
+                correction_file=corr.file, correction_made=corr.made,
+                spd_file=res.spd_file or self.display.white_spd,
+                white_xy=[res.xy[0], res.xy[1]], white_provenance=res.provenance,
+                observer=res.observer, anchor=res.anchor, strength=res.strength,
+                updated=self.run_date.isoformat()))
+            digest = {"white_xy": [round(res.xy[0], 5), round(res.xy[1], 5)],
+                      "provenance": res.provenance, "method": res.method, "strength": res.strength,
+                      "observer": res.observer, "anchor": res.anchor,
+                      "cct": round(res.cct, 1) if res.cct is not None else None,
+                      "duv": round(res.duv, 5) if res.duv is not None else None,
+                      "spd_file": res.spd_file, "note": res.note}
+            return StageOutcome("whitepoint", "done", digest=digest, data={"resolution": res.as_dict()})
+
+        outcome = self._stage("whitepoint", run)
+        # Cache the resolution for downstream stages (also after a memoised replay).
+        if "white" not in self.calib and outcome.data.get("resolution"):
+            self.calib["white"] = outcome.data["resolution"]
+            self._save()
+        return outcome
 
     def stage_enter_neutral(self) -> StageOutcome:
         def run() -> StageOutcome:
@@ -507,7 +578,8 @@ class Calibration:
             base = params["base_grayscale"]
             # Install through the controller (set primaries/white/base grayscale → apply → verify).
             self.controller.set_primaries(self.monitor, self.mode, params["primaries"])
-            wx, wy = spec.white_xy()
+            white = self._resolved_white()
+            wx, wy = white.xy
             self.controller.set_white(self.monitor, self.mode, wx, wy)
             self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
                                                base["points"], base["deviations"])
@@ -516,6 +588,7 @@ class Calibration:
             profile_name = applied.get("profile_name") if isinstance(applied, dict) else None
             verify_ok = bool(verified.get("verified")) if isinstance(verified, dict) else False
             digest = {"primaries": params["primaries"], "white_xy": [wx, wy],
+                      "white_provenance": white.provenance,
                       "measured_white": params.get("measured_white"),
                       "white_de_vs_d65": derive.metrics.get("measured_white_de2000_vs_d65"),
                       "profile_name": profile_name, "verified": verify_ok}
@@ -566,7 +639,7 @@ class Calibration:
                     if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
             gray.sort(key=lambda p: p.level)
             white_xy = _xy(max(samples, key=lambda s: s.xyz[1]).xyz)
-            wx, wy = spec.white_xy()
+            wx, wy = self._white_xy()
             white_move = float(np.hypot(white_xy[0] - wx, white_xy[1] - wy))
             if len(gray) < 2:
                 magnitude = 0.0
@@ -726,6 +799,7 @@ class Calibration:
         payload = {
             "flow": self.calib.get("flow"), "monitor": self.monitor, "mode": self.mode,
             "display": self.display.name, "target": self.target_name, "date": self.run_date.isoformat(),
+            "whitepoint": sd("whitepoint") or None,
             "mhc": sd("build-install-mhc") or None,
             "lut3d": {k: sd("build-install-3dlut").get(k) for k in
                       ("converged", "best_max_de", "best_mean_de", "above_threshold",
@@ -803,6 +877,7 @@ class Calibration:
     def _flow_full(self) -> CalibrationResult:
         self.stage_preflight()
         self.stage_resolve_target()
+        self.stage_whitepoint()
         self.stage_enter_neutral()
         self.stage_brightness()
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
@@ -822,6 +897,7 @@ class Calibration:
     def _flow_3dlut_only(self) -> CalibrationResult:
         self.stage_preflight()
         self.stage_resolve_target()
+        self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=False)
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
@@ -834,6 +910,7 @@ class Calibration:
     def _flow_gray_wb(self) -> CalibrationResult:
         self.stage_preflight()
         self.stage_resolve_target()
+        self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=True)
         self.stage_brightness()
         gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),

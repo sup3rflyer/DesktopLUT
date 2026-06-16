@@ -12,6 +12,9 @@ preflight/
 # Private user data — the "skill ⊥ user-data separation" boundary.
 # The agent/core is generic & shareable; THIS is yours and never leaves the box.
 calibration_profile.yaml
+# The persistent per-display correction store (CCMX/SPD/resolved-white record) —
+# display- and probe-specific, lives next to the profile.
+correction_store.json
 results/
 # Measurement & instrument-correction artifacts (display- and probe-specific)
 *.ti1

@@ -81,11 +81,12 @@ def test_full_flow_completes_clean(tmp_path: Path):
 
     assert result.status == "completed"
     assert result.target == "srgb_g22"
-    # the canonical pipeline ICC → 3D LUT → GS+WB, in order
+    # the canonical pipeline ICC → 3D LUT → GS+WB, in order (whitepoint resolves the
+    # target white early, before any stage that consumes it)
     assert result.stages == [
-        "preflight", "enter-neutral", "brightness", "measure:raw", "build-install-mhc",
-        "measure:post-mhc", "build-install-3dlut", "measure:gray-wb", "gswb-tweak",
-        "measure:verify", "verify",
+        "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
+        "build-install-mhc", "measure:post-mhc", "build-install-3dlut", "measure:gray-wb",
+        "gswb-tweak", "measure:verify", "verify",
     ]
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
@@ -119,6 +120,59 @@ def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):
     # the two seams that always fire in a clean run
     assert decisions["resolve-target:plan"]["choice"] == "approve"
     assert decisions["verify:accept"]["choice"] == "accept"
+
+
+# ---------------------------------------------------------------------------
+# white-point stage (item 7): numeric default + SPD-derived white flow-through
+# ---------------------------------------------------------------------------
+
+def test_whitepoint_stage_numeric_and_writes_store(tmp_path: Path):
+    calib = _make(tmp_path, "wp_numeric")
+    calib.run("full")
+    wp = calib.calib["stages"]["whitepoint"]["digest"]
+    assert wp["provenance"] == "numeric"
+    assert wp["white_xy"] == [round(cp.D65_XY[0], 5), round(cp.D65_XY[1], 5)]
+    # the MHC matrix aimed at the resolved white
+    assert calib.calib["stages"]["build-install-mhc"]["digest"]["white_provenance"] == "numeric"
+    # the cross-run correction store was written for this display
+    store = json.loads((calib._correction_store().path).read_text())
+    assert "Synthetic mini-LED" in store["displays"]
+    assert store["displays"]["Synthetic mini-LED"]["white_provenance"] == "numeric"
+
+
+def _fake_crt_white(spd_file, *, strength, observer, anchor):
+    """Deterministic SPD→white stand-in (no colour dep): a cooler CRT-like white."""
+    return {"xy": (0.3080, 0.3250), "cct": 6800.0, "duv": 0.003,
+            "observer": observer, "anchor": anchor}
+
+
+def test_spd_derived_white_flows_through_full_flow(tmp_path: Path):
+    spd = tmp_path / "white.sp"
+    spd.write_text("stub", encoding="utf-8")
+    ctx = create_run("SDR", display="spd", run_dir=tmp_path / "spd")
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"),
+                                   white_method="spd_crt_like", white_strength=0.5,
+                                   white_spd=str(spd))
+    calib = Calibration(
+        ctx=ctx, profile=profile, monitor=0, mode="SDR",
+        controller=CalibrationController.mock(), measure=_perfect_panel(),
+        adjudicator=AutoAdjudicator(), optimize_config=_OPT, patch_sizes=_SMALL,
+        run_date=_DATE, white_fn=_fake_crt_white)
+    result = calib.run("full")
+    assert result.status == "completed"
+
+    wp = calib.calib["stages"]["whitepoint"]["digest"]
+    assert wp["provenance"] == "spd_crt_like"
+    assert wp["white_xy"] == [0.308, 0.325]
+    assert wp["cct"] == 6800.0 and wp["strength"] == 0.5
+    # the resolved white reached the MHC matrix and the deliverable report
+    assert calib.calib["stages"]["build-install-mhc"]["digest"]["white_xy"] == [0.308, 0.325]
+    payload = json.loads((Path(result.results_dir) / "report.json").read_text())
+    assert payload["whitepoint"]["provenance"] == "spd_crt_like"
+    # and persisted to the per-display correction store
+    store = json.loads(calib._correction_store().path.read_text())
+    rec = store["displays"]["Synthetic mini-LED"]
+    assert rec["white_xy"] == [0.308, 0.325] and rec["spd_file"] == str(spd)
 
 
 # ---------------------------------------------------------------------------

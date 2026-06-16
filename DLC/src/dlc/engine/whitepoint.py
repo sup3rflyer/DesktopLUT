@@ -307,12 +307,35 @@ def format_table(candidates: list[Candidate]) -> str:
     return "\n".join(rows)
 
 
-def _load_white(path: str) -> "colour.SpectralDistribution":
+def _load_white(path: str | Path) -> "colour.SpectralDistribution":
     """Load a white SPD from a ``.sp`` file or a CR-250 CSV (auto-detected)."""
     p = Path(path)
     if p.suffix.lower() == ".csv":
         return load_cr250(p)["white"]
     return load_sp(p)
+
+
+def white_from_spd_file(path: str | Path, *, strength: float = 1.0,
+                        observer: str = DEFAULT_OBSERVER, anchor: str = "reference",
+                        illuminant: str = "D65") -> dict:
+    """Resolve the 1931-colorimeter target white for a display from its white SPD
+    file (Argyll ``.sp`` or CR-250 ``.csv``) — the path-based convenience the
+    calibration-profile white-point resolver calls.
+
+    Loads the measured white SPD, applies the observer-metamerism correction at
+    ``strength`` (:func:`corrected_white_xy` — ``0`` = numeric D65, ``1`` = full
+    perceptual correction), and returns the target chromaticity plus its CCT/Duv::
+
+        {"xy": (x, y), "cct": K, "duv": d, "observer": ..., "anchor": ..., "strength": ...}
+
+    Engine-tier (numpy/colour); the caller lazy-imports it only on the SPD path.
+    """
+    spd = _load_white(path)
+    xy = corrected_white_xy(spd, observer, anchor=anchor, illuminant=illuminant,
+                            strength=strength)
+    cct, duv = cct_duv(xy)
+    return {"xy": (float(xy[0]), float(xy[1])), "cct": float(cct), "duv": float(duv),
+            "observer": observer, "anchor": anchor, "strength": float(strength)}
 
 
 def main(argv: Optional[list[str]] = None) -> int:

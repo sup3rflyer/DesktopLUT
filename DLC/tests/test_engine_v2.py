@@ -259,6 +259,28 @@ def test_corrected_white_differs_from_measured_for_narrowband():
     assert (abs(measured[0] - corrected[0]) + abs(measured[1] - corrected[1])) > 0.002
 
 
+def test_white_from_spd_file_strength_dial(tmp_path):
+    # The path-based helper the profile resolver calls: write a synthetic narrowband
+    # white as a CGATS .sp, then strength 0 = numeric D65, strength 1 = corrected.
+    wl = np.arange(380, 731, 5.0)
+
+    def gauss(c, w, a):
+        return a * np.exp(-0.5 * ((wl - c) / w) ** 2)
+
+    vals = gauss(450, 12, 1.0) + gauss(530, 12, 1.0) + gauss(620, 14, 1.2)
+    sp = tmp_path / "white.sp"
+    sp.write_text(
+        'CGATS.17\nSPECTRAL_BANDS "%d"\nSPECTRAL_START_NM "380"\nSPECTRAL_END_NM "730"\n'
+        "BEGIN_DATA\n" % len(vals) + " ".join("%.6f" % v for v in vals) + "\nEND_DATA\n",
+        encoding="utf-8")
+
+    at0 = W.white_from_spd_file(sp, strength=0.0)
+    assert at0["xy"] == pytest.approx(W.LEGACY_D65_XY, abs=1e-9)
+    at1 = W.white_from_spd_file(sp, strength=1.0)
+    assert (abs(at1["xy"][0] - at0["xy"][0]) + abs(at1["xy"][1] - at0["xy"][1])) > 0.002
+    assert at1["cct"] > 0 and "duv" in at1 and at1["observer"] == "2015_2"
+
+
 @pytest.mark.skipif(WHITE_SP is None, reason="set DLC_COLORCAL to the local lab dir")
 def test_real_white_sp_integrates_to_plausible_white():
     # End-to-end SPD pipeline check on a real capture: a calibrated display white
