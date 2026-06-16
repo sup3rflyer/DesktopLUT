@@ -25,6 +25,7 @@ engine = [
 # for the end-to-end mock rehearsal only.
 [project.scripts]
 dlc-simulate = "dlc.stages.simulate:main"
+dlc-readout = "dlc.readout:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

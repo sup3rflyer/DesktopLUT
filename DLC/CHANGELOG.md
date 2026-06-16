@@ -35,6 +35,11 @@ request, adjudicates ambiguous results on digests, and writes the report.
   run. Points that won't settle are surfaced for adjudication rather than silently
   accepted. The display/meter is a single swappable seam (dogegen + Argyll spotread
   live; a deterministic synthetic panel for tests). Numpy-free.
+- **Live measurement readout** (`dlc/readout.py`, `dlc-readout`) — a standalone,
+  dependency-free consumer that tails the `measurements.ndjson` stream and shows
+  brightness, patch progress, and drift live in a terminal (or a refreshing HTML
+  page), so a human can follow a run while the loop drives it. Drift is reported
+  generically — the temperamental channel is read from the data, never assumed.
 - **Spine**: `controller` (named-pipe calibration contract), `refine` (grayscale /
   white-point refinement control law), `stage` (LLM-readable stage results),
   `colormath`.
