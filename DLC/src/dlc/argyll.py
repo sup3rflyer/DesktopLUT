@@ -81,6 +81,11 @@ class Argyll:
             self.spotread_command(request),
             text=True,
             capture_output=True,
+            # spotread is interactive ("hit any key to take a reading"); with no stdin it
+            # inherits the parent's, which in a BACKGROUND run never EOFs → it blocks/returns
+            # no reading → callers see 0.0. A closed stdin gives a deterministic EOF → exactly
+            # one reading → exit, identical in foreground and background.
+            stdin=subprocess.DEVNULL,
             timeout=timeout_seconds,
             check=False,
         )

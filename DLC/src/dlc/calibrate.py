@@ -253,6 +253,7 @@ class Calibration:
         dummy_icc: str = "sRGB.icm",
         patch_sizes: Optional[PatchSizes] = None,
         white_fn: Optional[cp.WhiteFn] = None,
+        probe_launcher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -271,6 +272,9 @@ class Calibration:
         self.dummy_icc = dummy_icc
         self.patch_sizes = patch_sizes or PatchSizes()
         self._white_fn = white_fn
+        # The correction-build launches Argyll ccxxmake in its own console (live only); an
+        # injectable seam keeps tests/sim from spawning a real process.
+        self._probe_launcher = probe_launcher or self._default_launch_ccxxmake
 
         self._state = _common.load_dlc_state(ctx)
         self.calib: dict[str, Any] = self._state.setdefault("calib", {})
@@ -540,14 +544,23 @@ class Calibration:
         ccmx_out = bindir / f"{safe}{mode_tag}-ColorChecker-i1Display3{suffix}"
         white_sp = bindir / f"{safe}{mode_tag}_white.sp"
         desc = f"DLC {name} {self.mode} {pm.kind.upper()} (ColorChecker Studio x i1 DisplayPro)"
-        # ccxxmake — proven create_ccmx.bat flag set (NOT DLC's older build_probe_match_plan,
-        # whose -P/-N additions were never validated against live ccxxmake).
+        # ccxxmake — proven create_ccmx.bat flag set, plus per-panel patch-scale/settle
+        # (mini-LED needs a ~fullscreen patch so local-dimming zones stay lit, and a settle
+        # delay so the backlight/pixels stabilise before each read).
         cc: list[Any] = [ccxxmake, "-v", "-d", self.display.argyll_display]
         if pm.colorimeter_display_type:
             cc += ["-y", pm.colorimeter_display_type]
         if pm.high_res:
             cc.append("-H")
         cc.append("-F")
+        if pm.patch_scale:                                  # -P ho,vo,ss: centered, scaled large ⇒ ~fullscreen
+            cc += ["-P", f"0.5,0.5,{pm.patch_scale:g}"]
+        if pm.settle_seconds and pm.settle_seconds > 0:
+            # ccxxmake runs -C each time a colour is SET (before measuring); use it as a
+            # per-patch settle. ping is the reliable Windows sleep (n pings ≈ n-1 s).
+            pings = max(2, int(round(pm.settle_seconds)) + 1)
+            # -w 1000 holds the delay even if loopback pings fail; >nul 2>&1 keeps the console clean.
+            cc += ["-C", f"ping -n {pings} -w 1000 127.0.0.1 >nul 2>&1"]
         cc += ["-t", pm.display_tech]
         if pm.kind == "ccss":
             cc.append("-S")
@@ -596,40 +609,89 @@ class Calibration:
 
     def stage_probe_match(self) -> StageOutcome:
         """Build (refresh) the colorimeter correction via Argyll ``ccxxmake`` — the
-        SPD/probe-match GENERATION step (item 9). ``ccxxmake`` is interactive + two-
-        instrument, so the core **prepares** the exact command + checklist (the ⚑ gate),
-        the operator runs it at the box (place the spectrometer → calibrate → measure RGBW
-        → swap to the colorimeter → re-measure), and we **ingest** the produced ``.ccmx``
-        (+ optional ``white.sp`` double-duty) → persist to the store as the active
-        correction. ``skip`` keeps the current correction; ``abort`` ends the build."""
+        SPD/probe-match GENERATION step. ``ccxxmake`` needs ONE continuous calibrated
+        session (the spectrometer's white-tile calibration is held only while its process
+        is open) and walks the operator through the instrument swap, so the core **launches
+        it in its own console** (the operator types nothing) — the panel was already cleared
+        to native by :meth:`stage_clear_native`. The operator follows the window's
+        place→calibrate→measure→swap→measure prompts; on resume the core **ingests** the
+        produced ``.ccmx`` → persists it to the store as the active correction. ``done``
+        ingests, ``skip`` keeps the current correction, ``abort`` ends the build."""
         def run() -> StageOutcome:
             cmds = self._probe_match_commands()
+            launch = self._probe_launcher(cmds)
+            opened = bool(launch.get("launched"))
+            lead = ("A measurement window has opened on this display — the core already cleared "
+                    "DesktopLUT to native and started Argyll ccxxmake. You type nothing."
+                    if opened else
+                    f"Couldn't auto-open the measurement window ({launch.get('error', 'unknown')}). "
+                    f"Fallback — run this once from the DLC dir: {cmds['ccxxmake']}")
             checklist = [
-                "Place the ColorChecker Studio spectrometer on its calibration tile; calibrate when prompted.",
-                f"Turn the spectrometer dial to measurement (SENSOR) mode, place it flat on monitor "
-                f"{self.monitor} ({self.display.name}); maximise/fullscreen the patch window (avoid mini-LED edge bleed).",
-                f"Run the ccxxmake command below — it measures RGBW with the spectrometer, then prompts you to "
-                f"SWAP to the i1 DisplayPro colorimeter and re-measure; it writes {cmds['ccmx_out']}.",
-                f"(Optional — SPD double-duty) show a full-white field and run the white-SPD command → {cmds['white_sp']}.",
-                "Then resume: --decide probe-match:build=done  (or =skip to keep the current correction).",
+                lead,
+                "Place the ColorChecker Studio spectrometer on its calibration tile; calibrate when the window prompts.",
+                f"Set it to measurement (SENSOR) mode, lay it flat on the patch window on monitor "
+                f"{self.monitor} ({self.display.name}); press the key the window asks for to measure RGBW.",
+                "When the window says to SWAP, lift the spectrometer and set the i1 DisplayPro on the SAME spot, "
+                f"then measure again — it writes {cmds['ccmx_out']}.",
+                "Tell me when the window reports it's done — I'll ingest + record the correction "
+                "(resume probe-match:build=done; =skip keeps the current correction).",
             ]
             digest = {"kind": cmds["kind"], "display_tech": cmds["display_tech"],
                       "spectro_port": cmds["spectro_port"], "ccxxmake": cmds["ccxxmake"],
-                      "white_spd_cmd": cmds["white_spd_cmd"], "ccmx_out": cmds["ccmx_out"],
+                      "launched": opened, "launch": launch, "ccmx_out": cmds["ccmx_out"],
                       "white_sp": cmds["white_sp"], "checklist": checklist}
             return StageOutcome("probe-match", "done", digest=digest, data=cmds)
 
         outcome = self._stage("probe-match", run)
         decision = self._abort_if(self.adjudicate(AdjudicationRequest(
             key="probe-match:build", seam=SEAM_PROBE_MATCH, stage="probe-match",
-            question=("Refresh the colorimeter correction: run ccxxmake at the box (place the spectrometer "
-                      "→ calibrate → measure RGBW → SWAP to the colorimeter → re-measure), then resume. "
-                      "The exact commands + the place/calibrate/swap checklist are in digest.checklist."),
+            question=("Building the colorimeter correction: a ccxxmake window has opened (panel already "
+                      "cleared to native). Operator places the spectrometer → calibrates → measures → "
+                      "SWAPS to the i1 → measures. The place/calibrate/swap checklist is in digest.checklist. "
+                      "Resume =done once the .ccmx is written and I'll ingest it."),
             options=("done", "skip", "abort"), recommendation="done", digest=outcome.digest)),
             stage="probe-match", message="aborted at the correction build")
         if decision.choice == "done":
-            self._ingest_correction(outcome.data)
+            self._ingest_correction(outcome.data or outcome.digest)
         return outcome
+
+    def _default_launch_ccxxmake(self, cmds: dict[str, Any]) -> dict[str, Any]:
+        """Launch Argyll ``ccxxmake`` in its OWN console window so the operator interacts with
+        its place/calibrate/measure/swap prompts directly — the core opens it; nothing is typed
+        by hand. ``ccxxmake`` outlives this (paused) orchestrator and writes the ``.ccmx``; the
+        operator then resumes and the core ingests it. Best-effort: a spawn failure is surfaced
+        in the digest (the rendered command is the fallback) rather than crashing the build."""
+        import subprocess
+        argv = [str(a) for a in cmds["ccxxmake_argv"]]
+        root = Path(self.profile.source_path).parent if self.profile.source_path else Path.cwd()
+        try:
+            flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+            proc = subprocess.Popen(argv, cwd=str(root), creationflags=flags)
+            self.ctx.log(f"launched ccxxmake (pid {proc.pid}) in a new console; cwd={root}")
+            return {"launched": True, "pid": proc.pid, "new_console": bool(flags), "cwd": str(root)}
+        except Exception as exc:  # noqa: BLE001 - surfaced; the rendered command is the fallback
+            self.ctx.log(f"could not launch ccxxmake ({type(exc).__name__}: {exc}); see digest fallback")
+            return {"launched": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def stage_clear_native(self) -> StageOutcome:
+        """Clear DesktopLUT's corrections on this monitor so the correction is built against the
+        panel's NATIVE emission — the operator never clears by hand, the core does it over the
+        calibration pipe. Best-effort: if the pipe is unreachable it's surfaced (the panel may
+        already be native / unmanaged), not fatal, so the build can still proceed."""
+        def run() -> StageOutcome:
+            try:
+                res = self.controller.enter_neutral(self.monitor, self.mode, self.dummy_icc,
+                                                    reason="DLC build-correction: native panel for CCMX")
+                return StageOutcome("clear-native", "done",
+                                    digest={"cleared": True, "via": "enter_neutral"},
+                                    data={"raw": _jsonable(res)})
+            except Exception as exc:  # noqa: BLE001 - a down pipe shouldn't crash the build
+                return StageOutcome("clear-native", "done",
+                                    digest={"cleared": False, "error": f"{type(exc).__name__}: {exc}",
+                                            "note": "calibration pipe unreachable — verify the panel is at "
+                                                    "native (OSD standard/native mode, no external LUT) before measuring."},
+                                    data={})
+        return self._stage("clear-native", run)
 
     def stage_enter_neutral(self) -> StageOutcome:
         def run() -> StageOutcome:
@@ -644,15 +706,27 @@ class Calibration:
         in range (DesktopLUT can't drive the backlight). The seam kicks it off and is
         told the result — in auto/sim there's no human, so the current reading stands."""
         def run() -> StageOutcome:
+            import time
             transfer = self._transfer()
             white_patch = MeasurePatch(label="white", rgb=(transfer.max_cv,) * 3,
                                        signal=(1.0, 1.0, 1.0), role="measurement",
                                        bit_depth=transfer.bit_depth)
+            # enter-neutral reconfigures the scanout (ICC / calibration mode), which can briefly
+            # blank the panel OUTPUT even though the patch window stays white — so this single
+            # read can land in that transient → 0.0. Re-read until real light returns (the
+            # streamed measure stages have their own warm-up; this one-shot needs its own).
             reading = self.measure(white_patch)
             nits = reading.nits or 0.0
+            attempts = 1
+            while nits <= 1.0 and attempts < 6:
+                time.sleep(2.0)
+                reading = self.measure(white_patch)
+                nits = reading.nits or 0.0
+                attempts += 1
             target = self._spec().luminance_nits
             in_range = abs(nits - target) <= max(3.0, 0.05 * target)
-            digest = {"white_nits": round(nits, 2), "target_nits": target, "in_range": in_range}
+            digest = {"white_nits": round(nits, 2), "target_nits": target,
+                      "in_range": in_range, "read_attempts": attempts}
             return StageOutcome("brightness", "done", digest=digest,
                                 data={"white_nits": nits, "in_range": in_range})
 
@@ -963,6 +1037,8 @@ class Calibration:
         try:
             if flow == "full":
                 return self._flow_full()
+            if flow == "mhc-only":
+                return self._flow_mhc_only()
             if flow == "3dlut-only":
                 return self._flow_3dlut_only()
             if flow == "gray-wb":
@@ -1027,6 +1103,26 @@ class Calibration:
         self.stage_verify(ver.data["ti3"])
         return self._finish()
 
+    def _flow_mhc_only(self) -> CalibrationResult:
+        """ICC only — MHC matrix + base 1D LUT, then verify + report. NO 3D LUT and NO
+        GS+WB tweak (those are what make ``full`` long), so this is the fast end-to-end
+        path that proves the orchestration + hardware before committing to a dense run.
+        The MHC alone is the *foundation*; without the volumetric/neutral refinement the
+        3D LUT+GS+WB add, verify may sit above the final quality targets — that's expected
+        for an ICC-only pass (accept it as a shakedown, judge it on the before/after)."""
+        self.stage_preflight()
+        self.stage_resolve_target()
+        self.stage_whitepoint()
+        self.stage_enter_neutral()
+        self.stage_brightness()
+        raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
+                                 ti3_name="raw.ti3", ndjson_name="raw.ndjson")
+        self.stage_build_install_mhc(raw.data["ti3"])
+        ver = self.stage_measure(role="verify", patches=self._ramp_patches(),
+                                 ti3_name="verify.ti3", ndjson_name="verify.ndjson")
+        self.stage_verify(ver.data["ti3"])
+        return self._finish()
+
     def _flow_3dlut_only(self) -> CalibrationResult:
         self.stage_preflight()
         self.stage_resolve_target()
@@ -1060,7 +1156,8 @@ class Calibration:
         is wired at flow start, so the fresh correction must be recorded first). Persists
         the result to the correction store as the active correction (+ optional white SPD)."""
         self.stage_preflight()
-        self.stage_probe_match()
+        self.stage_clear_native()      # core clears DesktopLUT to native over the pipe (not the operator's job)
+        self.stage_probe_match()       # launches ccxxmake in its own console; ingests the .ccmx on resume
         store = self._correction_store()
         rec = store.get(self.display.name)
         return CalibrationResult(
@@ -1108,6 +1205,7 @@ class Calibration:
 # later goal; v1 is SDR-first.
 FLOWS: dict[str, str] = {
     "full": "neutral → raw → MHC → post-MHC → 3D LUT → GS+WB → verify → report",
+    "mhc-only": "raw → MHC (matrix + 1D) → verify → report (ICC only; no 3D LUT / GS+WB — shakedown)",
     "3dlut-only": "verify MHC present → measure → 3D LUT → verify → report",
     "gray-wb": "require stack → brightness → measure neutral → GS+WB tweak → verify → report",
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
@@ -1257,6 +1355,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--run", type=Path, default=None, help="run dir (resume an existing run)")
     parser.add_argument("--profile", type=Path, default=None)
     parser.add_argument("--bit-depth", type=int, default=None, dest="bit_depth")
+    parser.add_argument("--raw-steps", type=int, default=None, dest="raw_steps",
+                        help="override the raw/verify ramp step count (MHC patch density; "
+                             "default 17 ≈ 113 patches). Lower ⇒ shorter shakedown run.")
+    parser.add_argument("--dogegen-server", default=None, dest="dogegen_server",
+                        metavar="HOST:PORT",
+                        help="drive a PERSISTENT dogegen daemon (dlc.dogegen_server) over a local "
+                             "socket instead of spawning a window per step — start it once, Alt+Enter "
+                             "it fullscreen, reuse it across the whole run (required for 10-bit).")
     parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
                         help="record a seam decision (repeatable) then run/resume")
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
@@ -1277,36 +1383,76 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         decisions[key.strip()] = Decision(choice.strip(), note="cli")
     adjudicator: Adjudicator = AutoAdjudicator() if args.auto else MappingAdjudicator(decisions)
 
-    from .measure_loop import DogegenPresenter, make_spotread_meter  # lazy: live only
+    from .measure_loop import DogegenPresenter, SocketPresenter, make_spotread_meter  # lazy: live only
     from .argyll import Argyll
     from .dogegen import DogegenPatchDisplay
     from .measure_rgbw import resolve_spotread_instrument_port
 
-    argyll_dir = profile.paths.get("argyll")
-    dogegen_path = profile.paths.get("dogegen")
-    argyll = Argyll(Path(argyll_dir) / "spotread.exe") if argyll_dir else None
-    port = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port) if argyll else profile.meter.argyll_port
-    presenter = DogegenPresenter(DogegenPatchDisplay(dogegen_path))
-    # The active correction comes from the store first (a freshly probe-matched .ccmx)
-    # then the profile — so a build-correction run is picked up without editing the YAML.
-    store = CorrectionStore.load(correction_store_path(profile, ctx.root))
-    correction = active_correction(profile, store, profile.display_for(args.monitor).name)
-    measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
-                                  output_dir=ctx.root / "measurements" / "probe",
-                                  ccmx_or_ccss=Path(correction) if correction else None)
-
     controller = CalibrationController.connect()
+
+    # The live measurement stack (dogegen patch display + spotread meter) is only needed by
+    # flows that MEASURE. build-correction mints a colorimeter correction via interactive
+    # ccxxmake — run by the operator at the box — and never measures through spotread here,
+    # so it needs neither dogegen nor a meter. Skip the whole stack (keeps the build robust
+    # even when dogegen / the live pipe aren't configured) and run with no measure function.
+    # One effective bit depth drives BOTH dogegen's mode AND the patch generator, so the code
+    # values dogegen renders match what the patches encode (no 8/10 mismatch). SDR defaults to
+    # 8-bit (dogegen "mode 8", composited — 3D-LUT-safe); --bit-depth 10 opts into 10-bit
+    # ("mode 10"), which needs the TPG window borderless-fullscreened to render accurately.
+    bit_depth = args.bit_depth if args.bit_depth is not None else (10 if normalize_mode(args.mode) == "HDR" else 8)
+    presenter = None
+    measure: Optional[MeasureFn] = None
+    if args.flow != "build-correction":
+        argyll_dir = profile.paths.get("argyll")
+        argyll = Argyll(Path(argyll_dir) / "spotread.exe") if argyll_dir else None
+        # resolve_spotread_instrument_port returns (port, info) — MUST unpack; passing the
+        # whole tuple as the port makes spotread's "-c" a stringified tuple → "out of range"
+        # → no reading → 0.0 nits on every read.
+        if argyll:
+            port, _ = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
+        else:
+            port = profile.meter.argyll_port
+        if args.dogegen_server:
+            # Reuse a persistent, operator-fullscreened dogegen window across invocations
+            # (no respawn/flash) — the daemon owns the dogegen process + its bit-depth mode.
+            host, _, srv_port = args.dogegen_server.partition(":")
+            presenter = SocketPresenter(host or "127.0.0.1", int(srv_port or 28930))
+        else:
+            dogegen_path = profile.paths.get("dogegen")
+            if not dogegen_path:
+                raise SystemExit("profile paths.dogegen is required for measuring flows "
+                                 "(the patch generator executable, e.g. third_party/dogegen/dogegen.exe)")
+            presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), normalize_mode(args.mode),
+                                                             bit_depth=bit_depth))
+        # The active correction comes from the store first (a freshly probe-matched .ccmx)
+        # then the profile — so a build-correction run is picked up without editing the YAML.
+        store = CorrectionStore.load(correction_store_path(profile, ctx.root))
+        correction = active_correction(profile, store, profile.display_for(args.monitor).name)
+        measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
+                                      output_dir=ctx.root / "measurements" / "probe",
+                                      ccmx_or_ccss=Path(correction) if correction else None)
+    patch_sizes = PatchSizes(raw_ramp_steps=args.raw_steps) if args.raw_steps else None
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
-                        bit_depth=args.bit_depth, force=args.force)
+                        bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes)
     try:
-        result = calib.run(args.flow)
-    except AdjudicationRequired as req:
-        print(json.dumps({"status": "adjudication_required", "request": req.request.as_dict(),
-                          "run": str(ctx.root)}, indent=2))
-        return 10
-    print(json.dumps(result.as_dict(), indent=2))
-    return 0 if result.status == "completed" else 1
+        try:
+            result = calib.run(args.flow)
+        except AdjudicationRequired as req:
+            print(json.dumps({"status": "adjudication_required", "request": req.request.as_dict(),
+                              "run": str(ctx.root)}, indent=2))
+            return 10
+        print(json.dumps(result.as_dict(), indent=2))
+        return 0 if result.status == "completed" else 1
+    finally:
+        # Close the presenter so a spawned dogegen never orphans on pause/exit. For the
+        # persistent daemon (SocketPresenter) this just drops our socket — the daemon's
+        # fullscreen window persists across invocations by design.
+        if presenter is not None:
+            try:
+                presenter.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -62,6 +62,7 @@ __all__ = [
     "write_ti3",
     "Presenter",
     "DogegenPresenter",
+    "SocketPresenter",
     "make_spotread_meter",
     "SyntheticPanel",
 ]
@@ -851,6 +852,60 @@ class DogegenPresenter:
             self._proc = None
 
 
+class SocketPresenter:
+    """:class:`Presenter` that drives a PERSISTENT dogegen via :mod:`dlc.dogegen_server`
+    over a local socket. The window is started + Alt+Enter-fullscreened **once** and reused
+    across every CLI invocation — no respawn, no flash, fullscreen preserved (the enabler
+    for accurate 10-bit, which needs a fullscreen window). Patch code values are sent in the
+    server's dogegen bit depth, so the run's ``--bit-depth`` must match the server's."""
+
+    def __init__(self, host: str, port: int, *, settle_seconds: float = 0.5,
+                 timeout: float = 30.0) -> None:
+        self.host = host
+        self.port = port
+        self.settle_seconds = settle_seconds
+        self.timeout = timeout
+        self._sock = None
+
+    def _ensure(self):
+        if self._sock is None:
+            import socket
+            s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            s.settimeout(self.timeout)
+            self._sock = s
+        return self._sock
+
+    def _recv_line(self, s) -> str:
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(256)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode("ascii", "ignore").strip()
+
+    def show(self, patch: MeasurePatch) -> None:
+        import time
+        s = self._ensure()
+        r, g, b = patch.rgb
+        s.sendall(f"{r} {g} {b}\n".encode("ascii"))
+        ack = self._recv_line(s)
+        if not ack.startswith("ok"):
+            raise RuntimeError(f"dogegen-server did not ack patch ({r},{g},{b}): {ack!r}")
+        if self.settle_seconds:
+            time.sleep(self.settle_seconds)
+
+    def close(self) -> None:
+        # Drop our connection ONLY — the daemon (and its fullscreen window) persists across
+        # invocations on purpose. Stop the daemon explicitly with a `quit` when the run ends.
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+
 def make_spotread_meter(
     *,
     presenter: Presenter,
@@ -883,6 +938,11 @@ def make_spotread_meter(
             high_res=high_res,
             display_type=display_type,
             ccmx_or_ccss=ccmx_or_ccss,
+            # Do NOT pass -N: the i1 DisplayPro reports "Disable initial-calibrate not
+            # supported", and that failed -N leaves spotread not taking a reading in a
+            # background (console-less) run → callers see 0.0. Letting it auto-calibrate
+            # (fast for an emissive colorimeter) reads reliably in foreground AND background.
+            skip_calibration=False,
         )
         completed = spotread.run_spotread_once(request)
         combined = (completed.stdout or "") + "\n" + (completed.stderr or "")

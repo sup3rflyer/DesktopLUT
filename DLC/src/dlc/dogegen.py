@@ -6,7 +6,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 RGBW_SDR = {
@@ -28,10 +28,20 @@ RGBW_HDR = {
 class DogegenPatchDisplay:
     executable: Path
     mode: str
+    bit_depth: Optional[int] = None     # 8 | 10; None ⇒ 8 (SDR) / 10 (HDR), preserving prior defaults
+
+    @property
+    def _depth(self) -> int:
+        if self.bit_depth is not None:
+            return self.bit_depth
+        return 10 if self.mode.upper() == "HDR" else 8
 
     @property
     def startup_mode(self) -> str:
-        return "mode 8" if self.mode.upper() == "SDR" else "mode 10_hdr"
+        # dogegen modes: 8 | 8_hdr | 10 | 10_hdr (README). 10-bit SDR ("mode 10") gives
+        # 0..1023 code values but needs the TPG window borderless-fullscreened for accuracy.
+        suffix = "_hdr" if self.mode.upper() == "HDR" else ""
+        return f"mode {self._depth}{suffix}"
 
     def rgbw_commands(self, patch_size: int = 100) -> list[str]:
         patches = RGBW_SDR if self.mode.upper() == "SDR" else RGBW_HDR

@@ -116,6 +116,9 @@ class ProbeMatchSpec:
     display_name: Optional[str] = None                # ccxxmake -I (defaults to the display name)
     high_res: bool = True                             # ccxxmake -H (spectro high-res spectrum)
     kind: str = "ccmx"                                # 'ccmx' (spectro reference) | 'ccss'
+    patch_scale: Optional[float] = None               # ccxxmake -P scale; large ⇒ ~fullscreen patch
+                                                      # (mini-LED: keep every local-dimming zone lit)
+    settle_seconds: Optional[float] = None            # per-patch settle before each read (via ccxxmake -C)
 
 
 @dataclass(frozen=True)
@@ -529,6 +532,8 @@ def _probe_match_spec(raw: dict[str, Any]) -> ProbeMatchSpec:
         display_name=pm.get("display_name"),
         high_res=bool(pm.get("high_res", True)),
         kind=str(pm.get("kind", "ccmx")),
+        patch_scale=(float(pm["patch_scale"]) if pm.get("patch_scale") is not None else None),
+        settle_seconds=(float(pm["settle_seconds"]) if pm.get("settle_seconds") is not None else None),
     )
 
 

@@ -57,8 +57,13 @@ def _perfect_panel() -> SyntheticPanel:
     return SyntheticPanel(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0)
 
 
+def _fake_launch(cmds):
+    # Test/sim stand-in for the real ccxxmake console launch — records, never spawns.
+    return {"launched": True, "fake": True, "argv": cmds["ccxxmake_argv"]}
+
+
 def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator=None,
-          probe=None, output_dir=None) -> Calibration:
+          probe=None, output_dir=None, probe_launcher=_fake_launch) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run("SDR", display="synthetic", run_dir=run_dir)
@@ -68,7 +73,8 @@ def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator
         controller=controller or CalibrationController.mock(),
         measure=panel if panel is not None else _perfect_panel(),
         adjudicator=adjudicator or AutoAdjudicator(),
-        probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+        probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE,
+        probe_launcher=probe_launcher)
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +97,17 @@ def test_full_flow_completes_clean(tmp_path: Path):
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
     assert verify["max_de2000"] <= calib.profile.quality.max_de2000
+
+
+def test_mhc_only_flow_is_icc_only(tmp_path: Path):
+    # The shakedown flow: MHC matrix + 1D LUT, verify, report — NO 3D LUT, NO GS+WB.
+    calib = _make(tmp_path, "mhc_only")
+    result = calib.run("mhc-only")
+    assert result.status == "completed"
+    assert "build-install-mhc" in result.stages
+    assert "build-install-3dlut" not in result.stages   # ICC only
+    assert "gswb-tweak" not in result.stages
+    assert result.stages[-1] == "verify"
 
 
 def test_full_flow_writes_deliverable_folder(tmp_path: Path):
@@ -362,6 +379,21 @@ def test_probe_match_command_uses_proven_recipe(tmp_path: Path):
     assert "-O" in cmds["white_spd_argv"] and "2" in cmds["white_spd_argv"]
 
 
+def test_probe_match_fullscreen_and_settle(tmp_path: Path):
+    # Per-panel mini-LED refinements: a ~fullscreen patch (-P, all zones lit) + a per-patch
+    # settle delay (-C sleep) before each read. Off by default; on when the recipe sets them.
+    import dataclasses as dc
+    calib = _make(tmp_path, "pm_fs")
+    calib.display = dc.replace(
+        calib.display,
+        probe_match=dc.replace(calib.display.probe_match, patch_scale=8, settle_seconds=2))
+    cc = calib._probe_match_commands()["ccxxmake_argv"]
+    assert cc[cc.index("-P") + 1] == "0.5,0.5,8"            # centered, scaled large ⇒ fullscreen
+    assert cc.index("-P") < cc.index("-t")                  # before the trailing -t/-I/out args
+    assert "ping" in cc[cc.index("-C") + 1]                 # per-patch settle hook
+    assert cc[-1].endswith(".ccmx")                         # output still last
+
+
 def test_build_correction_pauses_at_probe_match(tmp_path: Path):
     calib = _make(tmp_path, "bc_pause", adjudicator=MappingAdjudicator({}))
     with pytest.raises(AdjudicationRequired) as exc:
@@ -444,6 +476,40 @@ def test_refresh_decision_redirects_to_build_correction(tmp_path: Path):
     result = calib.run("full")
     assert result.status == "aborted" and result.digest["aborted_at"] == "preflight"
     assert "build-correction" in result.digest["message"]
+
+
+def test_build_correction_clears_native_and_launches(tmp_path: Path):
+    # The core clears DesktopLUT over the pipe AND launches ccxxmake itself — the operator
+    # never clears by hand or types a command. The pause exposes both in the digest.
+    calib = _make(tmp_path, "bc_launch", adjudicator=MappingAdjudicator({}))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("build-correction")
+    # clear-native ran (over the mock pipe) before the probe-match pause
+    assert calib.calib["stages"]["clear-native"]["digest"]["cleared"] is True
+    pm = exc.value.request.digest
+    assert pm["launched"] is True                                  # core opened the measurement window
+    assert pm["launch"]["argv"][0].endswith("ccxxmake.exe")
+    assert any("type nothing" in step.lower() for step in pm["checklist"])
+
+
+def test_default_launch_ccxxmake_opens_new_console(tmp_path: Path, monkeypatch):
+    calib = _make(tmp_path, "bc_real_launch")
+    captured = {}
+
+    class _FakeProc:
+        pid = 4321
+
+    def _fake_popen(argv, cwd=None, creationflags=0):
+        captured.update(argv=argv, cwd=cwd, flags=creationflags)
+        return _FakeProc()
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    info = calib._default_launch_ccxxmake(calib._probe_match_commands())
+    assert info["launched"] is True and info["pid"] == 4321
+    assert captured["argv"][0].endswith("ccxxmake.exe") and captured["argv"][-1].endswith(".ccmx")
+    if hasattr(subprocess, "CREATE_NEW_CONSOLE"):                  # a NEW console so the operator can interact
+        assert captured["flags"] == subprocess.CREATE_NEW_CONSOLE
 
 
 def test_run_calibration_convenience_entry(tmp_path: Path):

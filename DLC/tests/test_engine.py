@@ -255,6 +255,15 @@ class RgbwPlanTests(unittest.TestCase):
         self.assertTrue(any("window 100 242 242 242" in cmd for cmd in plan.commands))
         self.assertEqual(plan.commands.count("dogegen: quit"), 1)
 
+    def test_startup_mode_is_bit_depth_aware(self) -> None:
+        # dogegen modes: 8 | 8_hdr | 10 | 10_hdr. None preserves the prior defaults
+        # (SDR→8, HDR→10_hdr); 10-bit SDR opts into "mode 10".
+        D = lambda mode, bd: DogegenPatchDisplay(Path(r"C:\Tools\dogegen.exe"), mode, bit_depth=bd).startup_mode
+        self.assertEqual(D("SDR", None), "mode 8")
+        self.assertEqual(D("SDR", 10), "mode 10")
+        self.assertEqual(D("HDR", None), "mode 10_hdr")
+        self.assertEqual(D("HDR", 8), "mode 8_hdr")
+
     def test_rgbw_plan_can_use_dlc_presenter_without_dogegen(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             argyll = Argyll(Path(r"C:\Argyll\spotread.exe"))
