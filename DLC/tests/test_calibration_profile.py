@@ -198,6 +198,7 @@ displays:
     sdr_target: srgb_g22_120
     hdr_target: null
     white_spd: white.sp
+    probe_match: {display_tech: s, colorimeter_display_type: n, spectro_port: 2, display_name: PA32UCXR}
     quirks: {temperamental_channel: blue, settle_delta_de: 0.3}
 targets:
   srgb_g22_120:
@@ -224,6 +225,10 @@ def test_load_profile_round_trips(tmp_path: Path):
     assert d.temperamental_channel == "B"
     assert d.sdr_target == "srgb_g22_120"
     assert d.white_spd == "white.sp"
+    assert d.probe_match.display_tech == "s"
+    assert d.probe_match.colorimeter_display_type == "n"
+    assert d.probe_match.spectro_port == 2
+    assert d.probe_match.display_name == "PA32UCXR"
     t = p.target("srgb_g22_120")
     assert t.transfer_type == "power" and t.gamma == 2.2
     assert t.white.method == "spd_crt_like"

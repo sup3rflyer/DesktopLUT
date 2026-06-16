@@ -342,6 +342,110 @@ def test_mapping_adjudicator_raises_on_unknown_seam(tmp_path: Path):
     assert exc.value.request.seam == "plan_veto"
 
 
+# ---------------------------------------------------------------------------
+# probe-match (SPD-correlation) generation — the build-correction flow (item 9)
+# ---------------------------------------------------------------------------
+
+def test_probe_match_command_uses_proven_recipe(tmp_path: Path):
+    calib = _make(tmp_path, "pm_cmd")
+    cmds = calib._probe_match_commands()
+    cc = cmds["ccxxmake_argv"]
+    # faithful to the proven create_ccmx.bat: -v -d <argyll_display> -y n -H -F -t s -I -E out
+    assert cc[0].endswith("ccxxmake.exe")
+    assert "-v" in cc and "-F" in cc and "-H" in cc
+    assert cc[cc.index("-d") + 1] == "1"           # argyll_display for monitor 0
+    assert cc[cc.index("-y") + 1] == "n"           # non-refresh LCD
+    assert cc[cc.index("-t") + 1] == "s"           # QD mini-LED Argyll tech id
+    assert cc[cc.index("-I") + 1] == "Synthetic mini-LED"
+    assert cc[-1].endswith(".ccmx")
+    # white-SPD capture is a spectrometer-port spotread (double-duty)
+    assert "-O" in cmds["white_spd_argv"] and "2" in cmds["white_spd_argv"]
+
+
+def test_build_correction_pauses_at_probe_match(tmp_path: Path):
+    calib = _make(tmp_path, "bc_pause", adjudicator=MappingAdjudicator({}))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("build-correction")
+    assert exc.value.request.key == "probe-match:build"
+    assert exc.value.request.seam == "probe_match"
+    assert "ccxxmake" in exc.value.request.digest
+
+
+def test_build_correction_missing_ccmx_aborts(tmp_path: Path):
+    calib = _make(tmp_path, "bc_missing")          # AutoAdjudicator → 'done', but no .ccmx exists
+    result = calib.run("build-correction")
+    assert result.status == "aborted"
+    assert "not found" in result.digest["message"]
+
+
+def test_build_correction_ingests_and_records(tmp_path: Path):
+    calib = _make(tmp_path, "bc_ok")
+    Path(calib._probe_match_commands()["ccmx_out"]).write_text("CCMX\n0.99 0 0\n", encoding="utf-8")
+    result = calib.run("build-correction")
+    assert result.status == "completed"
+    rec = calib._correction_store().get("Synthetic mini-LED")
+    assert rec.correction_file.endswith(".ccmx")
+    assert rec.correction_made == "2026-06-16"
+
+
+def test_build_correction_skip_keeps_existing(tmp_path: Path):
+    calib = _make(tmp_path, "bc_skip",
+                  adjudicator=MappingAdjudicator({"probe-match:build": Decision("skip")}))
+    result = calib.run("build-correction")
+    assert result.status == "completed"
+    assert calib._correction_store().get("Synthetic mini-LED") is None   # nothing ingested
+
+
+def test_build_correction_white_spd_double_duty(tmp_path: Path):
+    calib = _make(tmp_path, "bc_spd")
+    cmds = calib._probe_match_commands()
+    Path(cmds["ccmx_out"]).write_text("CCMX\n", encoding="utf-8")
+    # a minimal valid CGATS .sp at the prescribed white_sp path (load_sp must accept it)
+    wl = np.arange(380, 731, 10.0)
+    Path(cmds["white_sp"]).write_text(
+        'CGATS.17\nSPECTRAL_BANDS "%d"\nSPECTRAL_START_NM "380"\nSPECTRAL_END_NM "730"\n'
+        "BEGIN_DATA\n" % len(wl) + " ".join("0.5" for _ in wl) + "\nEND_DATA\n",
+        encoding="utf-8")
+    calib.run("build-correction")
+    rec = calib._correction_store().get("Synthetic mini-LED")
+    assert rec.spd_file == cmds["white_sp"]        # SPD double-duty recorded
+
+
+def test_active_correction_store_overrides_profile(tmp_path: Path):
+    from dlc.calibrate import active_correction
+    from dlc.correction_store import CorrectionRecord
+    calib = _make(tmp_path, "active")
+    store = calib._correction_store()
+    assert active_correction(calib.profile, store, "Synthetic mini-LED") == "synthetic.ccmx"
+    store.record(CorrectionRecord(display="Synthetic mini-LED", correction_file="fresh.ccmx"))
+    assert active_correction(calib.profile, calib._correction_store(), "Synthetic mini-LED") == "fresh.ccmx"
+
+
+def test_whitepoint_preserves_probe_matched_correction(tmp_path: Path):
+    # A later calibration's whitepoint must NOT clobber a probe-matched correction —
+    # the store stays the active-correction source of truth across runs.
+    build = _make(tmp_path, "preserve_build")
+    Path(build._probe_match_commands()["ccmx_out"]).write_text("CCMX\n", encoding="utf-8")
+    build.run("build-correction")
+    fresh = build._correction_store().get("Synthetic mini-LED").correction_file
+    # a separate full run sharing the same (tmp_path-rooted) store
+    full = _make(tmp_path, "preserve_full")
+    full.run("full")
+    assert full._correction_store().get("Synthetic mini-LED").correction_file == fresh
+
+
+def test_refresh_decision_redirects_to_build_correction(tmp_path: Path):
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"), correction_made="2024-01-01")
+    ctx = create_run("SDR", display="synthetic", run_dir=tmp_path / "refresh")
+    calib = Calibration(
+        ctx=ctx, profile=profile, monitor=0, mode="SDR", controller=CalibrationController.mock(),
+        measure=_perfect_panel(), adjudicator=MappingAdjudicator({"preflight:spd": Decision("refresh")}),
+        optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+    result = calib.run("full")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "preflight"
+    assert "build-correction" in result.digest["message"]
+
+
 def test_run_calibration_convenience_entry(tmp_path: Path):
     ctx = create_run("SDR", display="conv", run_dir=tmp_path / "conv")
     profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))

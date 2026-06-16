@@ -81,6 +81,7 @@ __all__ = [
 # Stable seam ids — the ``⚑`` points where the LLM judges (v2-design-notes §5).
 SEAM_PLAN = "plan_veto"            # state the resolved flow + target; allow veto
 SEAM_SPD = "spd_staleness"         # correction past policy → tell, don't ask (§10)
+SEAM_PROBE_MATCH = "probe_match"   # build-correction: operator runs ccxxmake at the box (§10)
 SEAM_BRIGHTNESS = "brightness"     # white luminance to target (human turns OSD)
 SEAM_MEASURE = "measure"           # loop didn't settle / unresolved patches (§6)
 SEAM_OPTIMIZE = "optimize_floor"   # physical floor / budget-limited points (§7)
@@ -335,14 +336,16 @@ class Calibration:
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def _correction_store(self) -> CorrectionStore:
-        """The cross-run, per-display correction store. Profile-adjacent when the
-        profile is on disk (durable across ``runs/`` prunes), else beside the run
-        folders (tests / synthetic profiles)."""
-        if self.profile.source_path:
-            base = Path(self.profile.source_path).resolve().parent
-        else:
-            base = self.ctx.root.parent if self.ctx.root.parent != self.ctx.root else self.ctx.root
-        return CorrectionStore.load(base / "correction_store.json")
+        """The cross-run, per-display correction store (profile-adjacent / runs-parent)."""
+        return CorrectionStore.load(correction_store_path(self.profile, self.ctx.root))
+
+    def _resolve_white_now(self) -> cp.WhitePointResolution:
+        """Resolve the target white, preferring a white SPD captured by a probe-match
+        build (item 9) recorded in the store over the profile's ``display.white_spd``."""
+        rec = self._correction_store().get(self.display.name)
+        spd_override = rec.spd_file if rec else None
+        return self.profile.resolve_white(self.monitor, self.target_name,
+                                          white_fn=self._white_fn, spd_override=spd_override)
 
     def _resolved_white(self) -> cp.WhitePointResolution:
         """The run's resolved target white (memoised in the run-record by
@@ -351,7 +354,7 @@ class Calibration:
         cached = self.calib.get("white")
         if cached:
             return cp.WhitePointResolution.from_dict(cached)
-        res = self.profile.resolve_white(self.monitor, self.target_name, white_fn=self._white_fn)
+        res = self._resolve_white_now()
         self.calib["white"] = res.as_dict()
         self._save()
         return res
@@ -429,12 +432,21 @@ class Calibration:
 
         outcome = self._stage("preflight", run)
         staleness = outcome.digest.get("correction", {})
-        if staleness.get("stale"):
-            self._abort_if(self.adjudicate(AdjudicationRequest(
+        # The build-correction flow IS the refresh, so don't ask about staleness there.
+        if staleness.get("stale") and self.calib.get("flow") != "build-correction":
+            decision = self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="preflight:spd", seam=SEAM_SPD, stage="preflight",
                 question=staleness.get("message", "colorimeter correction is stale — refresh or proceed?"),
                 options=("proceed", "refresh", "abort"), recommendation="proceed",
                 digest=staleness)), stage="preflight", message="aborted on stale colorimeter correction")
+            if decision.choice == "refresh":
+                # The meter for THIS run is already wired to the current correction, so a
+                # mid-flow refresh can't apply — direct the operator to the build first.
+                raise CalibrationAborted(StageOutcome(
+                    "preflight", "aborted",
+                    digest={"message": "correction refresh requested — run `--flow build-correction` first "
+                                       "(it mints a fresh CCMX via ccxxmake at the box and records it as the "
+                                       "active correction), then re-run this calibration."}))
         return outcome
 
     def stage_resolve_target(self) -> StageOutcome:
@@ -475,13 +487,19 @@ class Calibration:
         already fired in preflight; the white is reported (in the digest + report), not
         asked. Falls back to numeric D65 when no SPD is on hand, so it never blocks."""
         def run() -> StageOutcome:
-            res = self.profile.resolve_white(self.monitor, self.target_name, white_fn=self._white_fn)
+            res = self._resolve_white_now()
             self.calib["white"] = res.as_dict()
+            # Persist the white provenance WITHOUT clobbering a correction/SPD a
+            # probe-match build (item 9) recorded: keep the prior store record's
+            # correction_file/made/spd_file unless this run has newer data.
+            store = self._correction_store()
+            prior = store.get(self.display.name)
             corr = self.profile.meter.correction
-            self._correction_store().record(CorrectionRecord(
+            store.record(CorrectionRecord(
                 display=self.display.name,
-                correction_file=corr.file, correction_made=corr.made,
-                spd_file=res.spd_file or self.display.white_spd,
+                correction_file=active_correction(self.profile, store, self.display.name),
+                correction_made=(prior.correction_made if prior and prior.correction_made else corr.made),
+                spd_file=res.spd_file or (prior.spd_file if prior else None) or self.display.white_spd,
                 white_xy=[res.xy[0], res.xy[1]], white_provenance=res.provenance,
                 observer=res.observer, anchor=res.anchor, strength=res.strength,
                 updated=self.run_date.isoformat()))
@@ -498,6 +516,119 @@ class Calibration:
         if "white" not in self.calib and outcome.data.get("resolution"):
             self.calib["white"] = outcome.data["resolution"]
             self._save()
+        return outcome
+
+    # ====================================================================
+    # Probe-match (SPD-correlation) GENERATION (item 9) — the build-correction step
+    # ====================================================================
+    def _probe_match_commands(self) -> dict[str, Any]:
+        """Prepare the exact Argyll commands for a correction build, from the display's
+        ``probe_match`` recipe — faithful to the proven ``create_ccmx.bat`` recipe
+        (``ccxxmake -v -d N -y n -H -F -t s -I -E``) plus an optional white-SPD capture
+        (double-duty for the SPD-derived white). The correction lands in the (durable)
+        Argyll bin dir so it survives ``runs/`` prunes and is auto-discoverable."""
+        pm = self.display.probe_match
+        argyll_dir = self.profile.paths.get("argyll")
+        bindir = Path(argyll_dir) if argyll_dir else (self.ctx.root / "probe_match")
+        bindir.mkdir(parents=True, exist_ok=True)
+        ccxxmake = str(Path(argyll_dir) / "ccxxmake.exe") if argyll_dir else "ccxxmake.exe"
+        spotread = str(Path(argyll_dir) / "spotread.exe") if argyll_dir else "spotread.exe"
+        name = pm.display_name or self.display.name
+        safe = name.replace(" ", "_").replace("/", "_")
+        mode_tag = "" if self.mode == "SDR" else f"_{self.mode}"
+        suffix = ".ccss" if pm.kind == "ccss" else ".ccmx"
+        ccmx_out = bindir / f"{safe}{mode_tag}-ColorChecker-i1Display3{suffix}"
+        white_sp = bindir / f"{safe}{mode_tag}_white.sp"
+        desc = f"DLC {name} {self.mode} {pm.kind.upper()} (ColorChecker Studio x i1 DisplayPro)"
+        # ccxxmake — proven create_ccmx.bat flag set (NOT DLC's older build_probe_match_plan,
+        # whose -P/-N additions were never validated against live ccxxmake).
+        cc: list[Any] = [ccxxmake, "-v", "-d", self.display.argyll_display]
+        if pm.colorimeter_display_type:
+            cc += ["-y", pm.colorimeter_display_type]
+        if pm.high_res:
+            cc.append("-H")
+        cc.append("-F")
+        cc += ["-t", pm.display_tech]
+        if pm.kind == "ccss":
+            cc.append("-S")
+        cc += ["-I", name, "-E", desc, str(ccmx_out)]
+        # white-SPD capture with the spectrometer (one high-res emissive read on a white field).
+        sp: list[Any] = [spotread, "-c", pm.spectro_port, "-e", "-x", "-H", "-O", str(white_sp)]
+        return {"ccxxmake_argv": [str(a) for a in cc], "ccxxmake": _render_cmd(cc),
+                "ccmx_out": str(ccmx_out), "white_spd_argv": [str(a) for a in sp],
+                "white_spd_cmd": _render_cmd(sp), "white_sp": str(white_sp),
+                "kind": pm.kind, "display_tech": pm.display_tech, "spectro_port": pm.spectro_port}
+
+    def _ingest_correction(self, data: dict[str, Any]) -> None:
+        """Ingest the operator-produced ``.ccmx`` (+ optional ``white.sp``) and persist it
+        to the correction store as the **active** correction (overrides the profile)."""
+        ccmx = Path(data["ccmx_out"])
+        if not ccmx.exists() or ccmx.stat().st_size == 0:
+            raise CalibrationAborted(StageOutcome(
+                "probe-match", "aborted",
+                digest={"message": f"expected correction not found at {ccmx} — did ccxxmake finish? "
+                                   "Resume with --decide probe-match:build=done after it writes the file, "
+                                   "or --decide probe-match:build=skip to keep the current correction."}))
+        white_sp = Path(data.get("white_sp") or "")
+        spd_ok = False
+        if str(white_sp) and white_sp.exists() and white_sp.stat().st_size > 0:
+            try:
+                from .engine.whitepoint import load_sp
+                load_sp(white_sp)   # validate it parses before we trust it
+                spd_ok = True
+            except Exception as exc:  # noqa: BLE001 - bad SPD is non-fatal; just skip it
+                self.ctx.log(f"white SPD {white_sp} present but did not parse ({exc}); ignoring")
+        store = self._correction_store()
+        prior = store.get(self.display.name)
+        store.record(CorrectionRecord(
+            display=self.display.name,
+            correction_file=str(ccmx),
+            correction_made=self.run_date.isoformat(),
+            spd_file=(str(white_sp) if spd_ok else (prior.spd_file if prior else None)),
+            white_xy=(prior.white_xy if prior else None),
+            white_provenance=(prior.white_provenance if prior else None),
+            observer=(prior.observer if prior else None),
+            anchor=(prior.anchor if prior else None),
+            strength=(prior.strength if prior else None),
+            updated=self.run_date.isoformat()))
+        self.ctx.log(f"ingested correction {ccmx.name}"
+                     + (f" + white SPD {white_sp.name} (SPD double-duty)" if spd_ok else ""))
+
+    def stage_probe_match(self) -> StageOutcome:
+        """Build (refresh) the colorimeter correction via Argyll ``ccxxmake`` — the
+        SPD/probe-match GENERATION step (item 9). ``ccxxmake`` is interactive + two-
+        instrument, so the core **prepares** the exact command + checklist (the ⚑ gate),
+        the operator runs it at the box (place the spectrometer → calibrate → measure RGBW
+        → swap to the colorimeter → re-measure), and we **ingest** the produced ``.ccmx``
+        (+ optional ``white.sp`` double-duty) → persist to the store as the active
+        correction. ``skip`` keeps the current correction; ``abort`` ends the build."""
+        def run() -> StageOutcome:
+            cmds = self._probe_match_commands()
+            checklist = [
+                "Place the ColorChecker Studio spectrometer on its calibration tile; calibrate when prompted.",
+                f"Turn the spectrometer dial to measurement (SENSOR) mode, place it flat on monitor "
+                f"{self.monitor} ({self.display.name}); maximise/fullscreen the patch window (avoid mini-LED edge bleed).",
+                f"Run the ccxxmake command below — it measures RGBW with the spectrometer, then prompts you to "
+                f"SWAP to the i1 DisplayPro colorimeter and re-measure; it writes {cmds['ccmx_out']}.",
+                f"(Optional — SPD double-duty) show a full-white field and run the white-SPD command → {cmds['white_sp']}.",
+                "Then resume: --decide probe-match:build=done  (or =skip to keep the current correction).",
+            ]
+            digest = {"kind": cmds["kind"], "display_tech": cmds["display_tech"],
+                      "spectro_port": cmds["spectro_port"], "ccxxmake": cmds["ccxxmake"],
+                      "white_spd_cmd": cmds["white_spd_cmd"], "ccmx_out": cmds["ccmx_out"],
+                      "white_sp": cmds["white_sp"], "checklist": checklist}
+            return StageOutcome("probe-match", "done", digest=digest, data=cmds)
+
+        outcome = self._stage("probe-match", run)
+        decision = self._abort_if(self.adjudicate(AdjudicationRequest(
+            key="probe-match:build", seam=SEAM_PROBE_MATCH, stage="probe-match",
+            question=("Refresh the colorimeter correction: run ccxxmake at the box (place the spectrometer "
+                      "→ calibrate → measure RGBW → SWAP to the colorimeter → re-measure), then resume. "
+                      "The exact commands + the place/calibrate/swap checklist are in digest.checklist."),
+            options=("done", "skip", "abort"), recommendation="done", digest=outcome.digest)),
+            stage="probe-match", message="aborted at the correction build")
+        if decision.choice == "done":
+            self._ingest_correction(outcome.data)
         return outcome
 
     def stage_enter_neutral(self) -> StageOutcome:
@@ -836,6 +967,8 @@ class Calibration:
                 return self._flow_3dlut_only()
             if flow == "gray-wb":
                 return self._flow_gray_wb()
+            if flow == "build-correction":
+                return self._flow_build_correction()
             if flow == "hdr":
                 raise CalibrationAborted(StageOutcome(
                     "resolve-target", "aborted",
@@ -921,6 +1054,24 @@ class Calibration:
         self.stage_verify(ver.data["ti3"])
         return self._finish()
 
+    def _flow_build_correction(self) -> CalibrationResult:
+        """Mint (refresh) the colorimeter correction via ccxxmake, standalone — run this
+        BEFORE a calibration when the correction is stale/missing (the calibration's meter
+        is wired at flow start, so the fresh correction must be recorded first). Persists
+        the result to the correction store as the active correction (+ optional white SPD)."""
+        self.stage_preflight()
+        self.stage_probe_match()
+        store = self._correction_store()
+        rec = store.get(self.display.name)
+        return CalibrationResult(
+            flow="build-correction", monitor=self.monitor, mode=self.mode, target=None,
+            status="completed", stages=list(self.calib["stages"].keys()),
+            results_dir=None, report_path=None,
+            digest={"correction": rec.correction_file if rec else None,
+                    "correction_made": rec.correction_made if rec else None,
+                    "white_spd": rec.spd_file if rec else None,
+                    "probe_match": (self.calib["stages"].get("probe-match") or {}).get("digest")})
+
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
         """gray-wb / 3dlut-only assume an installed stack. If it's missing, escalate
         ('nothing to tune — do a full calibration first') rather than silently
@@ -959,6 +1110,7 @@ FLOWS: dict[str, str] = {
     "full": "neutral → raw → MHC → post-MHC → 3D LUT → GS+WB → verify → report",
     "3dlut-only": "verify MHC present → measure → 3D LUT → verify → report",
     "gray-wb": "require stack → brightness → measure neutral → GS+WB tweak → verify → report",
+    "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "hdr": "(post-v1) Rec.2020/PQ — SDR-first in v1",
 }
 
@@ -986,6 +1138,35 @@ def _jsonable(value: Any) -> Any:
         return value
     except (TypeError, ValueError):
         return str(value)
+
+
+def correction_store_path(profile: cp.Profile, ctx_root: Path) -> Path:
+    """Where the cross-run per-display correction store lives: profile-adjacent when the
+    profile is on disk (durable across ``runs/`` prunes), else beside the run folders
+    (tests / synthetic profiles). Shared by the orchestrator and the live CLI so both see
+    the same store."""
+    if profile.source_path:
+        base = Path(profile.source_path).resolve().parent
+    else:
+        base = ctx_root.parent if ctx_root.parent != ctx_root else ctx_root
+    return base / "correction_store.json"
+
+
+def _render_cmd(argv: Sequence[Any]) -> str:
+    """Render an argv list as a copy-pasteable command line (Windows quoting)."""
+    import subprocess
+    return subprocess.list2cmdline([str(a) for a in argv])
+
+
+def active_correction(profile: cp.Profile, store: CorrectionStore, display_name: str) -> Optional[str]:
+    """The colorimeter correction the meter should actually use: the store's recorded
+    correction (e.g. a freshly probe-matched one) overrides the profile YAML; falls back
+    to ``profile.meter.correction.file``. The store is the machine-maintained record; the
+    profile is the human-authored config (the §2 skill ⊥ user-data boundary)."""
+    rec = store.get(display_name)
+    if rec and rec.correction_file:
+        return rec.correction_file
+    return profile.meter.correction.file
 
 
 def _render_report_html(p: dict[str, Any]) -> str:
@@ -1106,7 +1287,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     argyll = Argyll(Path(argyll_dir) / "spotread.exe") if argyll_dir else None
     port = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port) if argyll else profile.meter.argyll_port
     presenter = DogegenPresenter(DogegenPatchDisplay(dogegen_path))
-    correction = profile.meter.correction.file
+    # The active correction comes from the store first (a freshly probe-matched .ccmx)
+    # then the profile — so a build-correction run is picked up without editing the YAML.
+    store = CorrectionStore.load(correction_store_path(profile, ctx.root))
+    correction = active_correction(profile, store, profile.display_for(args.monitor).name)
     measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
                                   output_dir=ctx.root / "measurements" / "probe",
                                   ccmx_or_ccss=Path(correction) if correction else None)

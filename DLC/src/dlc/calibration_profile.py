@@ -36,6 +36,7 @@ __all__ = [
     "CorrectionInfo",
     "MeterConfig",
     "PanelInfo",
+    "ProbeMatchSpec",
     "DisplayConfig",
     "WhiteSpec",
     "TargetSpec",
@@ -101,6 +102,23 @@ class MeterConfig:
 
 
 @dataclass(frozen=True)
+class ProbeMatchSpec:
+    """Per-display recipe for building a colorimeter correction via Argyll ``ccxxmake``
+    (HANDOFF item 9). Drives the exact command so the core never guesses. The proven
+    PA32UCXR values: ``display_tech='s'`` (Argyll "LCD PFS Phosphor IPS" = QD mini-LED),
+    ``colorimeter_display_type='n'`` (non-refresh LCD), the ColorChecker Studio spectro on
+    ``spectro_port``. CCMX (a 3×3 matrix from a spectrometer reference) is the right kind
+    when correcting *this* exact meter+display; CCSS is for sharing a spectral sample."""
+
+    display_tech: str = "u"                           # ccxxmake -t (Argyll tech id; 'u'=unknown)
+    colorimeter_display_type: Optional[str] = None    # ccxxmake -y (e.g. 'n'=non-refresh LCD)
+    spectro_port: int = 2                             # spectrometer Argyll instrument port
+    display_name: Optional[str] = None                # ccxxmake -I (defaults to the display name)
+    high_res: bool = True                             # ccxxmake -H (spectro high-res spectrum)
+    kind: str = "ccmx"                                # 'ccmx' (spectro reference) | 'ccss'
+
+
+@dataclass(frozen=True)
 class PanelInfo:
     tech: Optional[str] = None
     bit_depth: int = 10
@@ -124,6 +142,7 @@ class DisplayConfig:
     hdr_target: Optional[str] = None
     white_spd: Optional[str] = None    # the display's measured white SPD (.sp/.csv);
     #                                    the SPD double-duty source (correction + white)
+    probe_match: ProbeMatchSpec = field(default_factory=ProbeMatchSpec)
     quirks: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -324,7 +343,8 @@ class Profile:
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def resolve_white(self, monitor: int, target_name: str, *,
-                      white_fn: Optional[WhiteFn] = None) -> WhitePointResolution:
+                      white_fn: Optional[WhiteFn] = None,
+                      spd_override: Optional[str] = None) -> WhitePointResolution:
         """Resolve the calibration-target white chromaticity + its provenance.
 
         Precedence:
@@ -332,12 +352,16 @@ class Profile:
         1. a ``white_xy`` override pinned on the target → used verbatim
            (provenance ``override`` — e.g. an eye-verified SPD result).
         2. ``white.method == 'spd_crt_like'`` with ``correction_strength > 0`` **and**
-           the display has a readable white SPD → the SPD-derived observer-corrected
-           "CRT-like" white (provenance ``spd_crt_like``), computed by ``white_fn``
-           (defaults to :func:`_default_white_fn` → the engine; injectable for tests).
+           a readable white SPD → the SPD-derived observer-corrected "CRT-like" white
+           (provenance ``spd_crt_like``), computed by ``white_fn`` (defaults to
+           :func:`_default_white_fn` → the engine; injectable for tests).
         3. otherwise → numeric (textbook) D65 (provenance ``numeric``), with a note
            saying why (strength 0, method numeric, or no SPD on hand). The graceful
            fallback means a missing SPD never crashes a run — it just stays on D65.
+
+        ``spd_override`` (the persistent correction store's freshly-captured ``white.sp``)
+        takes precedence over the profile's ``display.white_spd`` — so an SPD captured by
+        a probe-match build (item 9) feeds the white-point without editing the YAML.
         """
         spec = self.target(target_name)
         white = spec.white
@@ -350,7 +374,7 @@ class Profile:
         display = self.display_for(monitor)
         strength = float(white.correction_strength)
         if white.method == "spd_crt_like" and strength > 0.0:
-            spd = display.white_spd
+            spd = spd_override or display.white_spd
             spd_path = Path(spd) if spd else None
             if spd_path is not None and spd_path.exists():
                 fn = white_fn or _default_white_fn
@@ -446,6 +470,8 @@ class Profile:
                 name="Synthetic mini-LED", desktoplut_monitor=monitor, argyll_display=monitor + 1,
                 primary=True, panel=PanelInfo(tech="mini-LED IPS", bit_depth=10),
                 sdr_target="srgb_g22", hdr_target="rec2020_pq", white_spd=white_spd,
+                probe_match=ProbeMatchSpec(display_tech="s", colorimeter_display_type="n",
+                                           spectro_port=2, display_name="Synthetic mini-LED"),
                 quirks={"temperamental_channel": cold_channel, "settle_delta_de": 0.3}),),
             targets={
                 "srgb_g22": TargetSpec(name="srgb_g22", colorspace="Rec.709", transfer_type="power",
@@ -493,6 +519,19 @@ def _target_spec(name: str, raw: dict[str, Any]) -> TargetSpec:
     )
 
 
+def _probe_match_spec(raw: dict[str, Any]) -> ProbeMatchSpec:
+    pm = raw or {}
+    return ProbeMatchSpec(
+        display_tech=str(pm.get("display_tech", "u")),
+        colorimeter_display_type=(str(pm["colorimeter_display_type"])
+                                  if pm.get("colorimeter_display_type") is not None else None),
+        spectro_port=int(pm.get("spectro_port", 2)),
+        display_name=pm.get("display_name"),
+        high_res=bool(pm.get("high_res", True)),
+        kind=str(pm.get("kind", "ccmx")),
+    )
+
+
 def _display_config(raw: dict[str, Any]) -> DisplayConfig:
     panel = raw.get("panel", {}) or {}
     return DisplayConfig(
@@ -510,6 +549,7 @@ def _display_config(raw: dict[str, Any]) -> DisplayConfig:
         sdr_target=raw.get("sdr_target"),
         hdr_target=raw.get("hdr_target"),
         white_spd=raw.get("white_spd"),
+        probe_match=_probe_match_spec(raw.get("probe_match", {}) or {}),
         quirks=dict(raw.get("quirks", {}) or {}),
     )
 
