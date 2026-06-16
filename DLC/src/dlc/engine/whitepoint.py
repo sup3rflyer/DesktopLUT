@@ -201,12 +201,26 @@ def observer_offset(white_spd: "colour.SpectralDistribution", observer: str,
 def corrected_white_xy(white_spd: "colour.SpectralDistribution",
                        observer: str = DEFAULT_OBSERVER, *,
                        anchor: str = "reference", illuminant: str = "D65",
-                       baseline: str = BASELINE_OBSERVER) -> tuple[float, float]:
+                       baseline: str = BASELINE_OBSERVER,
+                       strength: float = 1.0) -> tuple[float, float]:
     """The 1931 colorimeter target for a "CRT-like" perceived-D65 white.
 
     ``anchor='reference'`` aims at the reference illuminant as ``observer`` sees
     it (``xy_obs(D65) + Δ``); ``anchor='legacy'`` aims at the textbook 1931-D65
     numbers shifted by the metameric offset (``0.3127/0.3290 + Δ``).
+
+    ``strength`` scales the observer correction between numeric D65 and the full
+    perceptual correction:
+
+    * ``0.0`` → **numeric D65** (0.3127/0.3290) — the colorimetric standard:
+      verifiable, interoperable, what colour-critical pipelines expect.
+    * ``1.0`` → the **full** correction (~300 K / dE 3-4 off D65 for a QD panel,
+      with a slight green Duv). This trades standard-conformance for perceptual
+      neutrality *for the average CIE-2015 observer* — which may not be YOUR eye
+      (individual cone variation on narrowband primaries is significant). EYE-
+      VERIFY it (``experiment()``) before adopting; partial values split it.
+
+    For colour-critical / interop work, keep ``strength`` small (or 0).
     """
     dx, dy = observer_offset(white_spd, observer, baseline)
     if anchor == "reference":
@@ -215,16 +229,25 @@ def corrected_white_xy(white_spd: "colour.SpectralDistribution",
         ax, ay = LEGACY_D65_XY
     else:
         raise ValueError(f"unknown anchor: {anchor!r}")
-    return (ax + dx, ay + dy)
+    full = (ax + dx, ay + dy)
+    s = max(0.0, min(1.0, strength))
+    nx, ny = LEGACY_D65_XY  # numeric D65 anchor for strength=0
+    return (nx + s * (full[0] - nx), ny + s * (full[1] - ny))
 
 
-def target_white(white_spd: "colour.SpectralDistribution") -> tuple[float, float]:
-    """Default-to-beat CRT-like D65 target: CIE 2015 2°, reference anchor.
+def target_white(white_spd: "colour.SpectralDistribution", *,
+                 strength: float = 0.0) -> tuple[float, float]:
+    """Calibration target white. **Default is numeric D65** (``strength=0``) —
+    the colour-critical-safe, standards-conformant choice.
 
-    The owner may override the (observer, anchor) after eyeballing
-    :func:`experiment`; this is the principled starting point.
+    The SPD-derived observer correction is an opt-in dial: raise ``strength``
+    toward 1.0 (CIE 2015 2°, reference anchor) only after eye-verifying it with
+    :func:`experiment`, and prefer a partial amount over the full ~300 K shift.
+    The machinery stays available; the *default* no longer bakes a perceptual
+    correction into a colour-critical calibration.
     """
-    return corrected_white_xy(white_spd, DEFAULT_OBSERVER, anchor="reference")
+    return corrected_white_xy(white_spd, DEFAULT_OBSERVER, anchor="reference",
+                              strength=strength)
 
 
 # ---------------------------------------------------------------------------
