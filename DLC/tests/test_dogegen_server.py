@@ -136,3 +136,43 @@ def test_socket_presenter_raises_on_non_ack():
         pres.close()
     finally:
         srv.close()
+
+
+def _drain_until(daemon, pred, tries=50):
+    import time
+    for _ in range(tries):
+        if pred(daemon.received):
+            return
+        time.sleep(0.01)
+
+
+def test_socket_presenter_shutdown_sends_quit():
+    # A terminal run stops the persistent daemon with an explicit `quit`.
+    daemon = _FakeDaemon()
+    try:
+        pres = SocketPresenter("127.0.0.1", daemon.port, settle_seconds=0.0)
+        pres.show(MeasurePatch(label="white", rgb=(1, 1, 1), signal=(1.0, 1.0, 1.0), bit_depth=10))
+        pres.shutdown_daemon()
+        _drain_until(daemon, lambda r: "quit" in r)
+        assert "quit" in daemon.received
+    finally:
+        daemon.stop()
+
+
+def test_socket_presenter_close_does_not_quit():
+    # A pause only drops our socket — the daemon (and its fullscreen window) must survive.
+    daemon = _FakeDaemon()
+    try:
+        pres = SocketPresenter("127.0.0.1", daemon.port, settle_seconds=0.0)
+        pres.show(MeasurePatch(label="white", rgb=(1, 1, 1), signal=(1.0, 1.0, 1.0), bit_depth=10))
+        pres.close()
+        _drain_until(daemon, lambda r: len(r) >= 1)
+        assert "quit" not in daemon.received
+    finally:
+        daemon.stop()
+
+
+def test_shutdown_daemon_is_safe_when_unreachable():
+    # No daemon listening: shutdown_daemon must be a no-op, not raise.
+    pres = SocketPresenter("127.0.0.1", 1, settle_seconds=0.0)  # port 1: nothing there
+    pres.shutdown_daemon()  # must not raise

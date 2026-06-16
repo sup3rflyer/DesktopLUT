@@ -897,13 +897,30 @@ class SocketPresenter:
 
     def close(self) -> None:
         # Drop our connection ONLY — the daemon (and its fullscreen window) persists across
-        # invocations on purpose. Stop the daemon explicitly with a `quit` when the run ends.
+        # invocations on purpose (so a pause/resume keeps one fullscreen window). The run's
+        # terminal step calls :meth:`shutdown_daemon` to actually stop it.
         if self._sock is not None:
             try:
                 self._sock.close()
             except Exception:
                 pass
             self._sock = None
+
+    def shutdown_daemon(self) -> None:
+        """Tell the persistent daemon to quit (closing its dogegen window), then drop the
+        socket. Call this once the run reaches a TERMINAL state — never on a pause, where the
+        daemon must survive for the resuming invocation. Best-effort and idempotent."""
+        try:
+            s = self._ensure()
+            s.sendall(b"quit\n")
+            try:
+                self._recv_line(s)  # drain the 'bye' ack; ignore content
+            except Exception:
+                pass
+        except Exception:
+            pass  # daemon already gone / unreachable — nothing to stop
+        finally:
+            self.close()
 
 
 def make_spotread_meter(

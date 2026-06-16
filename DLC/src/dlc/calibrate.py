@@ -1363,6 +1363,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="drive a PERSISTENT dogegen daemon (dlc.dogegen_server) over a local "
                              "socket instead of spawning a window per step — start it once, Alt+Enter "
                              "it fullscreen, reuse it across the whole run (required for 10-bit).")
+    parser.add_argument("--keep-dogegen-server", action="store_true", dest="keep_dogegen_server",
+                        help="do NOT stop the persistent dogegen daemon when the run finishes "
+                             "(default: a terminal run sends it `quit`, closing its window). A "
+                             "pause/resume never stops it regardless.")
     parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
                         help="record a seam decision (repeatable) then run/resume")
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
@@ -1435,22 +1439,30 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes)
+    paused = False
     try:
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:
+            paused = True  # daemon must survive for the resuming invocation
             print(json.dumps({"status": "adjudication_required", "request": req.request.as_dict(),
                               "run": str(ctx.root)}, indent=2))
             return 10
         print(json.dumps(result.as_dict(), indent=2))
         return 0 if result.status == "completed" else 1
     finally:
-        # Close the presenter so a spawned dogegen never orphans on pause/exit. For the
-        # persistent daemon (SocketPresenter) this just drops our socket — the daemon's
-        # fullscreen window persists across invocations by design.
+        # Tear down the presenter so dogegen never orphans. On a PAUSE we only drop our socket
+        # (the persistent daemon + its fullscreen window must survive for resume); on a TERMINAL
+        # exit (completed/failed, not paused) we stop the daemon too — unless the operator opted
+        # to keep it for reuse. A spawned (non-persistent) DogegenPresenter always quits on close.
         if presenter is not None:
             try:
-                presenter.close()
+                terminal = not paused
+                if (terminal and not args.keep_dogegen_server
+                        and hasattr(presenter, "shutdown_daemon")):
+                    presenter.shutdown_daemon()
+                else:
+                    presenter.close()
             except Exception:  # noqa: BLE001
                 pass
 
