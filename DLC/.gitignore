@@ -9,6 +9,23 @@ profiles/*
 !profiles/.gitkeep
 preflight/
 
+# Private user data — the "skill ⊥ user-data separation" boundary.
+# The agent/core is generic & shareable; THIS is yours and never leaves the box.
+calibration_profile.yaml
+results/
+# Measurement & instrument-correction artifacts (display- and probe-specific)
+*.ti1
+*.ti3
+*.sp
+*.ccmx
+*.ccss
+# Scratch bring-up tooling
+_bringup_smoke.py
+
+# requirements.txt is a real tracked file; the root-level "*.txt" rule (eeColor
+# LUT data) would otherwise sweep it up. Re-include it.
+!requirements.txt
+
 # Contained third-party binaries are installed/copied locally.
 third_party/argyll/
 third_party/dogegen/
@@ -17,6 +34,11 @@ third_party/vendor_manifest.json
 # Local/private operator and supervisor handoff notes
 docs/calibration-handoff.md
 docs/agent-tooling.md
+# Internal R&D / handoff design docs (kept local until DLC is published-ready;
+# some carry display-specific measurements). The public face is README + CHANGELOG.
+docs/HANDOFF.md
+docs/v2-design-notes.md
+docs/v1-rebuild-plan.md
 CLAUDE.md
 .claude/
 
