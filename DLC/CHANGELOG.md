@@ -26,6 +26,15 @@ request, adjudicates ambiguous results on digests, and writes the report.
     primaries + transfer inversion), with the target white baked in.
   - `whitepoint` — SPD-derived "CRT-like" D65 via observer-metamerism correction
     (CIE 1931 vs modern physiologically-relevant observers), with a comparison CLI.
+- **Adaptive measurement loop** (`dlc/measure_loop.py`) — turns a patch set into a
+  clean `.ti3` plus a streaming `measurements.ndjson`, self-healing against panel
+  drift: warm-up-settle (biased toward the temperamental channel), a per-patch
+  repeatability gate that re-reads transient glitches on the spot, and an
+  interleaved neutral reference that catches slow warm-up creep and redoes the
+  affected patches once the panel is stable — a few bad patches never abort the
+  run. Points that won't settle are surfaced for adjudication rather than silently
+  accepted. The display/meter is a single swappable seam (dogegen + Argyll spotread
+  live; a deterministic synthetic panel for tests). Numpy-free.
 - **Spine**: `controller` (named-pipe calibration contract), `refine` (grayscale /
   white-point refinement control law), `stage` (LLM-readable stage results),
   `colormath`.
