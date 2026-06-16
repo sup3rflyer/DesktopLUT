@@ -5,12 +5,26 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "desktoplut-calibrator"
 version = "0.1.0"
-description = "Automation-first profiling and calibration companion for DesktopLUT"
+description = "LLM-steered display calibration harness for DesktopLUT (stage tools under dlc.stages.*)"
 requires-python = ">=3.11"
+# The spine and contract stay dependency-free. The heavy scientific stack lives
+# behind the `engine` extra (pip install -e .[engine]) and is imported only by
+# dlc.engine.* — see requirements.txt.
 dependencies = []
 
+[project.optional-dependencies]
+engine = [
+    "numpy>=1.26,<3",
+    "scipy>=1.11,<2",
+    "colour-science>=0.4.4,<0.5",
+]
+
+# The harness has no single CLI entry point: the arbitrating assistant invokes
+# each stage tool as `python -m dlc.stages.<tool>`. The old `dlc = dlc.cli:main`
+# console script was removed with the autopilot. A convenience entry is provided
+# for the end-to-end mock rehearsal only.
 [project.scripts]
-dlc = "dlc.cli:main"
+dlc-simulate = "dlc.stages.simulate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
