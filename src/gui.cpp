@@ -14,6 +14,7 @@
 #include "mhc.h"
 #include "dwm_inject.h"
 #include "analysis.h"
+#include "desktoplut_ipc_server.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -1959,11 +1960,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_CALIB_CMD:
+        return HandleCalibrationGuiCommand(wParam, lParam);
+
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
         return 0;
 
     case WM_DESTROY:
+        StopCalibrationIpcServer();
         StopProcessing();
         RemoveTrayIcon();
         // Unregister session change notifications
@@ -2087,6 +2092,9 @@ int RunGUI() {
         UpdateWindow(g_gui.hwndMain);
     }
     // If starting minimized, window stays hidden (tray icon provides access)
+
+    // Start the opt-in calibration control server (no-op unless explicitly enabled).
+    StartCalibrationIpcServer();
 
     // Message loop
     MSG msg = {};

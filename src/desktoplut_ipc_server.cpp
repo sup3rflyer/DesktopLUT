@@ -1,0 +1,964 @@
+// DesktopLUT - desktoplut_ipc_server.cpp
+// See desktoplut_ipc_server.h for the security model.
+
+#include "desktoplut_ipc_server.h"
+
+#include <windows.h>
+#include <sddl.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "types.h"
+#include "globals.h"
+#include "gui_mhc.h"
+#include "mhc.h"
+#include "displayconfig.h"
+#include "settings.h"
+#include "processing.h"
+
+#pragma comment(lib, "Advapi32.lib")
+
+namespace {
+
+const wchar_t* kPipeName = L"\\\\.\\pipe\\DesktopLUT.Calibration";
+constexpr size_t kMaxRequestBytes = 256 * 1024;  // DoS guard
+constexpr DWORD kGuiTimeoutMs = 60000;           // MHC install can be slow
+
+// ===========================================================================
+// UTF-8 <-> wide
+// ===========================================================================
+std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string out(len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring out(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), len);
+    return out;
+}
+
+// ===========================================================================
+// Minimal, self-contained JSON (no external dependency)
+// ===========================================================================
+struct JsonValue {
+    enum Type { Null, Bool, Num, Str, Arr, Obj } type = Null;
+    bool b = false;
+    double num = 0.0;
+    std::string str;
+    std::vector<JsonValue> arr;
+    std::vector<std::pair<std::string, JsonValue>> members;
+
+    const JsonValue* find(const std::string& key) const {
+        if (type != Obj) return nullptr;
+        for (const auto& kv : members)
+            if (kv.first == key) return &kv.second;
+        return nullptr;
+    }
+    bool has(const std::string& key) const { return find(key) != nullptr; }
+    std::string getStr(const std::string& key, const std::string& def = "") const {
+        const JsonValue* v = find(key);
+        return (v && v->type == Str) ? v->str : def;
+    }
+    double getNum(const std::string& key, double def = 0.0) const {
+        const JsonValue* v = find(key);
+        return (v && v->type == Num) ? v->num : def;
+    }
+    int getInt(const std::string& key, int def = 0) const {
+        const JsonValue* v = find(key);
+        return (v && v->type == Num) ? (int)std::llround(v->num) : def;
+    }
+    void set(const std::string& key, JsonValue v) { members.emplace_back(key, std::move(v)); }
+};
+
+JsonValue JBool(bool v) { JsonValue j; j.type = JsonValue::Bool; j.b = v; return j; }
+JsonValue JNum(double v) { JsonValue j; j.type = JsonValue::Num; j.num = v; return j; }
+JsonValue JStr(const std::string& v) { JsonValue j; j.type = JsonValue::Str; j.str = v; return j; }
+JsonValue JObj() { JsonValue j; j.type = JsonValue::Obj; return j; }
+JsonValue JArr() { JsonValue j; j.type = JsonValue::Arr; return j; }
+
+void AppendUtf8(std::string& out, unsigned cp) {
+    if (cp <= 0x7F) {
+        out += (char)cp;
+    } else if (cp <= 0x7FF) {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+struct JsonParser {
+    const std::string& s;
+    size_t i = 0;
+    explicit JsonParser(const std::string& str) : s(str) {}
+
+    [[noreturn]] void err(const char* m) { throw std::runtime_error(m); }
+    void ws() {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+    }
+    JsonValue parse() { ws(); JsonValue v = value(); return v; }
+
+    JsonValue value() {
+        ws();
+        if (i >= s.size()) err("unexpected end of input");
+        char c = s[i];
+        if (c == '{') return object();
+        if (c == '[') return array();
+        if (c == '"') return JStr(string());
+        if (c == 't') { literal("true"); return JBool(true); }
+        if (c == 'f') { literal("false"); return JBool(false); }
+        if (c == 'n') { literal("null"); return JsonValue(); }
+        return number();
+    }
+    void literal(const char* lit) {
+        for (const char* p = lit; *p; ++p) {
+            if (i >= s.size() || s[i] != *p) err("invalid literal");
+            i++;
+        }
+    }
+    unsigned hex4() {
+        if (i + 4 > s.size()) err("bad \\u escape");
+        unsigned v = 0;
+        for (int k = 0; k < 4; ++k) {
+            char c = s[i++];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= (c - '0');
+            else if (c >= 'a' && c <= 'f') v |= (c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= (c - 'A' + 10);
+            else err("bad hex digit");
+        }
+        return v;
+    }
+    std::string string() {
+        if (s[i] != '"') err("expected string");
+        i++;
+        std::string out;
+        while (i < s.size()) {
+            char c = s[i++];
+            if (c == '"') return out;
+            if (c == '\\') {
+                if (i >= s.size()) err("bad escape");
+                char e = s[i++];
+                switch (e) {
+                    case '"': out += '"'; break;
+                    case '\\': out += '\\'; break;
+                    case '/': out += '/'; break;
+                    case 'n': out += '\n'; break;
+                    case 't': out += '\t'; break;
+                    case 'r': out += '\r'; break;
+                    case 'b': out += '\b'; break;
+                    case 'f': out += '\f'; break;
+                    case 'u': {
+                        unsigned cp = hex4();
+                        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.size() && s[i] == '\\' && s[i + 1] == 'u') {
+                            i += 2;
+                            unsigned lo = hex4();
+                            if (lo >= 0xDC00 && lo <= 0xDFFF)
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        }
+                        AppendUtf8(out, cp);
+                        break;
+                    }
+                    default: err("bad escape");
+                }
+            } else {
+                out += c;
+            }
+        }
+        err("unterminated string");
+    }
+    JsonValue number() {
+        size_t start = i;
+        if (i < s.size() && s[i] == '-') i++;
+        while (i < s.size() &&
+               ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-'))
+            i++;
+        if (i == start) err("invalid number");
+        return JNum(std::strtod(s.substr(start, i - start).c_str(), nullptr));
+    }
+    JsonValue array() {
+        JsonValue v = JArr();
+        i++;  // [
+        ws();
+        if (i < s.size() && s[i] == ']') { i++; return v; }
+        while (true) {
+            v.arr.push_back(value());
+            ws();
+            if (i >= s.size()) err("unterminated array");
+            if (s[i] == ',') { i++; continue; }
+            if (s[i] == ']') { i++; break; }
+            err("expected , or ]");
+        }
+        return v;
+    }
+    JsonValue object() {
+        JsonValue v = JObj();
+        i++;  // {
+        ws();
+        if (i < s.size() && s[i] == '}') { i++; return v; }
+        while (true) {
+            ws();
+            std::string key = string();
+            ws();
+            if (i >= s.size() || s[i] != ':') err("expected :");
+            i++;
+            v.members.emplace_back(key, value());
+            ws();
+            if (i >= s.size()) err("unterminated object");
+            if (s[i] == ',') { i++; continue; }
+            if (s[i] == '}') { i++; break; }
+            err("expected , or }");
+        }
+        return v;
+    }
+};
+
+void SerializeStr(const std::string& s, std::string& out) {
+    out += '"';
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    out += '"';
+}
+
+void Serialize(const JsonValue& v, std::string& out) {
+    switch (v.type) {
+        case JsonValue::Null: out += "null"; break;
+        case JsonValue::Bool: out += v.b ? "true" : "false"; break;
+        case JsonValue::Num: {
+            char buf[40];
+            std::snprintf(buf, sizeof(buf), "%.10g", v.num);
+            out += buf;
+            break;
+        }
+        case JsonValue::Str: SerializeStr(v.str, out); break;
+        case JsonValue::Arr: {
+            out += '[';
+            for (size_t k = 0; k < v.arr.size(); ++k) { if (k) out += ','; Serialize(v.arr[k], out); }
+            out += ']';
+            break;
+        }
+        case JsonValue::Obj: {
+            out += '{';
+            for (size_t k = 0; k < v.members.size(); ++k) {
+                if (k) out += ',';
+                SerializeStr(v.members[k].first, out);
+                out += ':';
+                Serialize(v.members[k].second, out);
+            }
+            out += '}';
+            break;
+        }
+    }
+}
+
+std::string OkResponse(const JsonValue& result) {
+    JsonValue env = JObj();
+    env.set("ok", JBool(true));
+    env.set("result", result);
+    std::string out;
+    Serialize(env, out);
+    return out;
+}
+std::string ErrResponse(const std::string& error) {
+    JsonValue env = JObj();
+    env.set("ok", JBool(false));
+    env.set("error", JStr(error));
+    std::string out;
+    Serialize(env, out);
+    return out;
+}
+
+std::vector<float> ReadFloatArray(const JsonValue* v) {
+    std::vector<float> out;
+    if (v && v->type == JsonValue::Arr)
+        for (const auto& e : v->arr)
+            if (e.type == JsonValue::Num) out.push_back((float)e.num);
+    return out;
+}
+
+// ===========================================================================
+// Calibration-mode bookkeeping (module-local; own mutex)
+// ===========================================================================
+struct CalibState {
+    bool active = false;
+    int monitor = -1;
+    std::wstring mode;  // L"SDR" / L"HDR"
+    std::wstring dummyIcc;
+    std::wstring reason;
+    bool correctionsReset = false;
+    bool hasSnapshot = false;
+    int snapMonitor = -1;
+    bool snapWasHdr = false;
+    MonitorSettings snapshot;
+};
+std::mutex g_calibMutex;
+CalibState g_calib;
+
+// Marshaling envelope: pipe thread -> GUI thread.
+struct CalibGuiRequest {
+    const std::string* method;
+    const JsonValue* params;
+    JsonValue* result;
+    std::string* error;
+};
+
+// ---- shared helpers --------------------------------------------------------
+bool ParseMonitorMode(const JsonValue& p, int& mon, bool& isHDR, std::string& error) {
+    if (!p.has("monitor")) { error = "missing parameter: monitor"; return false; }
+    mon = p.getInt("monitor", -1);
+    std::string mode = p.getStr("mode");
+    if (mode != "SDR" && mode != "HDR") { error = "mode must be SDR or HDR"; return false; }
+    isHDR = (mode == "HDR");
+    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+    if (mon < 0 || mon >= (int)g_gui.monitorSettings.size()) { error = "monitor index out of range"; return false; }
+    return true;
+}
+
+std::string MonitorModeKey(int mon, bool isHDR) {
+    return std::to_string(mon) + (isHDR ? ":HDR" : ":SDR");
+}
+
+bool AnyCorrectionActive() {
+    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+    for (const auto& s : g_gui.monitorSettings) {
+        if (!s.sdrPath.empty() || !s.hdrPath.empty() ||
+            s.sdrMHC.enabled || s.hdrMHC.enabled ||
+            s.sdrColorCorrection.primariesEnabled || s.sdrColorCorrection.grayscale.enabled ||
+            s.hdrColorCorrection.primariesEnabled || s.hdrColorCorrection.grayscale.enabled ||
+            s.hdrColorCorrection.tonemap.enabled)
+            return true;
+    }
+    return false;
+}
+
+// Restart the overlay/hook processing so cleared/loaded LUTs and shader flags
+// take effect, mirroring what the GUI's Apply path does.
+void ReapplyProcessing() {
+    StopProcessing();
+    if (AnyCorrectionActive()) StartProcessing();
+}
+
+void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
+    int pc = p.getInt("point_count", 0);
+    std::vector<float> pts = ReadFloatArray(p.find("points"));
+    const JsonValue* dev = p.find("deviations");
+    std::vector<float> r = ReadFloatArray(dev ? dev->find("r") : nullptr);
+    std::vector<float> g = ReadFloatArray(dev ? dev->find("g") : nullptr);
+    std::vector<float> b = ReadFloatArray(dev ? dev->find("b") : nullptr);
+    if (pc <= 0) pc = (int)pts.size();
+    if (pc <= 0) pc = (int)gs.points.size();
+    if ((int)pts.size() != pc) {
+        pts.assign(pc, 0.0f);
+        for (int k = 0; k < pc; ++k) pts[k] = (pc > 1) ? (float)k / (pc - 1) : 0.0f;
+    }
+    auto fix = [pc](std::vector<float>& v) { if ((int)v.size() != pc) v.assign(pc, 1.0f); };
+    fix(r); fix(g); fix(b);
+    gs.pointCount = pc;
+    gs.points = pts;
+    gs.rgbDeviations[0] = r;
+    gs.rgbDeviations[1] = g;
+    gs.rgbDeviations[2] = b;
+    gs.enabled = true;
+}
+
+// ===========================================================================
+// Read-only handlers (served on the pipe thread)
+// ===========================================================================
+void HandleStateGet(JsonValue& result) {
+    result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
+    result.set("corrections_enabled", JBool(g_shaderCorrectionsActive.load()));
+    {
+        std::lock_guard<std::mutex> lk(g_calibMutex);
+        if (g_calib.active) {
+            JsonValue cm = JObj();
+            cm.set("active", JBool(true));
+            cm.set("monitor", JNum(g_calib.monitor));
+            cm.set("mode", JStr(WideToUtf8(g_calib.mode)));
+            cm.set("dummy_icc_path", JStr(WideToUtf8(g_calib.dummyIcc)));
+            cm.set("corrections_reset", JBool(g_calib.correctionsReset));
+            result.set("calibration_mode", cm);
+        } else {
+            result.set("calibration_mode", JsonValue());
+        }
+    }
+    JsonValue mhc = JObj();
+    JsonValue runtime = JObj();
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        for (size_t idx = 0; idx < g_gui.monitorSettings.size(); ++idx) {
+            const MonitorSettings& s = g_gui.monitorSettings[idx];
+            for (int mode = 0; mode < 2; ++mode) {
+                bool isHDR = (mode == 1);
+                const MHCSettings& m = isHDR ? s.hdrMHC : s.sdrMHC;
+                std::string key = MonitorModeKey((int)idx, isHDR);
+                if (m.enabled && !m.profileName.empty()) {
+                    JsonValue e = JObj();
+                    e.set("applied", JBool(true));
+                    e.set("profile_name", JStr(WideToUtf8(m.profileName)));
+                    mhc.set(key, e);
+                }
+                const std::wstring& path = isHDR ? s.hdrPath : s.sdrPath;
+                if (!path.empty()) {
+                    JsonValue e = JObj();
+                    e.set("cube_path", JStr(WideToUtf8(path)));
+                    runtime.set(key, e);
+                }
+            }
+        }
+    }
+    result.set("mhc", mhc);
+    result.set("runtime", runtime);
+}
+
+void HandleCalibStatus(JsonValue& result) {
+    std::lock_guard<std::mutex> lk(g_calibMutex);
+    result.set("active", JBool(g_calib.active));
+    if (g_calib.active) {
+        JsonValue st = JObj();
+        st.set("monitor", JNum(g_calib.monitor));
+        st.set("mode", JStr(WideToUtf8(g_calib.mode)));
+        st.set("dummy_icc_path", JStr(WideToUtf8(g_calib.dummyIcc)));
+        st.set("corrections_reset", JBool(g_calib.correctionsReset));
+        result.set("state", st);
+    } else {
+        result.set("state", JsonValue());
+    }
+}
+
+void HandleQueryProfiles(const JsonValue& p, JsonValue& result) {
+    // v1: DLC performs the authoritative Windows ICC audit via Argyll; here we
+    // only echo the request and report the active device default if cheap.
+    result.set("available", JBool(false));
+    result.set("profiles", JArr());
+    result.set("active_profile", JsonValue());
+    if (p.has("monitor")) result.set("monitor", JNum(p.getInt("monitor", 0)));
+    result.set("note", JStr("use Argyll dispwin for authoritative VCGT/profile state"));
+}
+
+void HandleQueryGammaRamp(const JsonValue& p, JsonValue& result) {
+    int mon = p.has("monitor") ? p.getInt("monitor", 0) : 0;
+    result.set("monitor", JNum(mon));
+    HMONITOR hmon = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        if (mon >= 0 && mon < (int)g_gui.monitors.size()) hmon = g_gui.monitors[mon];
+    }
+    auto unavailable = [&]() {
+        result.set("available", JBool(false));
+        result.set("gamma_ramp_loaded", JsonValue());
+        result.set("vcgt_present", JsonValue());
+    };
+    if (!hmon) { unavailable(); return; }
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hmon, &mi)) { unavailable(); return; }
+    HDC hdc = CreateDCW(mi.szDevice, mi.szDevice, nullptr, nullptr);
+    if (!hdc) { unavailable(); return; }
+    WORD ramp[3][256];
+    BOOL got = GetDeviceGammaRamp(hdc, ramp);
+    DeleteDC(hdc);
+    if (!got) { unavailable(); return; }
+    bool identity = true;
+    for (int c = 0; c < 3 && identity; ++c) {
+        for (int k = 0; k < 256; ++k) {
+            int expect = k * 257;
+            if (expect > 65535) expect = 65535;
+            int diff = (int)ramp[c][k] - expect;
+            if (diff < 0) diff = -diff;
+            if (diff > 384) { identity = false; break; }  // ~0.6% tolerance
+        }
+    }
+    result.set("available", JBool(true));
+    result.set("gamma_ramp_loaded", JBool(!identity));
+    result.set("vcgt_present", JBool(!identity));
+}
+
+// ===========================================================================
+// Mutating handlers (run on the GUI thread via WM_CALIB_CMD)
+// ===========================================================================
+void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    std::wstring dummy = Utf8ToWide(p.getStr("dummy_icc_path"));
+    std::wstring reason = Utf8ToWide(p.getStr("reason"));
+
+    DisplayInfo di;
+    bool haveDi = GetDisplayInfoForMonitor(mon, di);
+
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MonitorSettings& ms = g_gui.monitorSettings[mon];
+        {
+            std::lock_guard<std::mutex> ck(g_calibMutex);
+            g_calib.snapshot = ms;  // snapshot BEFORE clearing
+            g_calib.hasSnapshot = true;
+            g_calib.snapMonitor = mon;
+            g_calib.snapWasHdr = isHDR;
+        }
+        MHCSettings& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
+        if (haveDi && mhc.enabled && !mhc.profileName.empty())
+            RemoveMHC2Profile(mhc.profileName, di.adapterId, di.sourceId, isHDR);
+        mhc.enabled = false;
+        // Clear runtime 3D LUTs.
+        ms.sdrPath.clear();
+        ms.hdrPath.clear();
+        // Zero shader correction layers.
+        ms.sdrColorCorrection.primariesEnabled = false;
+        ms.sdrColorCorrection.grayscale.enabled = false;
+        ms.hdrColorCorrection.primariesEnabled = false;
+        ms.hdrColorCorrection.grayscale.enabled = false;
+        ms.hdrColorCorrection.tonemap.enabled = false;
+    }
+    SaveSettings();
+    UpdateMhcFlagsLive(mon);
+    ReapplyProcessing();
+    // NOTE: dummy-ICC association is deferred to live bring-up; neutrality here
+    // comes from MHC removal + cleared layers, plus DLC's own `dispwin -c`.
+
+    {
+        std::lock_guard<std::mutex> ck(g_calibMutex);
+        g_calib.active = true;
+        g_calib.monitor = mon;
+        g_calib.mode = isHDR ? L"HDR" : L"SDR";
+        g_calib.dummyIcc = dummy;
+        g_calib.reason = reason;
+        g_calib.correctionsReset = true;
+    }
+    result.set("active", JBool(true));
+    result.set("snapshot_id", JStr("calib-snapshot"));
+    result.set("monitor", JNum(mon));
+    result.set("mode", JStr(isHDR ? "HDR" : "SDR"));
+    result.set("dummy_icc_path", JStr(WideToUtf8(dummy)));
+    result.set("corrections_reset", JBool(true));
+}
+
+void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error) {
+    bool restore = false;
+    const JsonValue* rv = p.find("restore_snapshot");
+    if (rv && rv->type == JsonValue::Bool) restore = rv->b;
+    bool restored = false;
+    if (restore) {
+        std::lock_guard<std::mutex> ck(g_calibMutex);
+        if (g_calib.hasSnapshot && g_calib.snapMonitor >= 0) {
+            {
+                std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                if (g_calib.snapMonitor < (int)g_gui.monitorSettings.size())
+                    g_gui.monitorSettings[g_calib.snapMonitor] = g_calib.snapshot;
+            }
+            SaveSettings();
+            // Reinstall the original MHC for the captured mode if it was active.
+            MHCSettings& m = g_calib.snapWasHdr ? g_calib.snapshot.hdrMHC : g_calib.snapshot.sdrMHC;
+            if (m.enabled) GenerateAndInstallMhcProfile(g_calib.snapMonitor, g_calib.snapWasHdr);
+            UpdateMhcFlagsLive(g_calib.snapMonitor);
+            ReapplyProcessing();
+            restored = true;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> ck(g_calibMutex);
+        g_calib.active = false;
+        g_calib.correctionsReset = false;
+    }
+    result.set("active", JBool(false));
+    result.set("restored", JBool(restored));
+}
+
+void DoDisableAll(const JsonValue& /*p*/, JsonValue& result, std::string& /*error*/) {
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        for (auto& s : g_gui.monitorSettings) {
+            s.sdrPath.clear();
+            s.hdrPath.clear();
+            s.sdrColorCorrection.primariesEnabled = false;
+            s.sdrColorCorrection.grayscale.enabled = false;
+            s.hdrColorCorrection.primariesEnabled = false;
+            s.hdrColorCorrection.grayscale.enabled = false;
+            s.hdrColorCorrection.tonemap.enabled = false;
+        }
+    }
+    SaveSettings();
+    ReapplyProcessing();
+    result.set("corrections_enabled", JBool(false));
+}
+
+void DoMhcSetPrimaries(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    const JsonValue* prim = p.find("primaries");
+    if (!prim || prim->type != JsonValue::Obj) { error = "missing parameter: primaries"; return; }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        // Measured DISPLAY primaries; the MHC matrix maps the standard source to these.
+        m.customPrimaries.Rx = (float)prim->getNum("rx", m.customPrimaries.Rx);
+        m.customPrimaries.Ry = (float)prim->getNum("ry", m.customPrimaries.Ry);
+        m.customPrimaries.Gx = (float)prim->getNum("gx", m.customPrimaries.Gx);
+        m.customPrimaries.Gy = (float)prim->getNum("gy", m.customPrimaries.Gy);
+        m.customPrimaries.Bx = (float)prim->getNum("bx", m.customPrimaries.Bx);
+        m.customPrimaries.By = (float)prim->getNum("by", m.customPrimaries.By);
+        m.primariesEnabled = true;
+    }
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("mhc", JObj());
+}
+
+void DoMhcSetWhite(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    double x = p.getNum("x", 0.3127);
+    double y = p.getNum("y", 0.3290);
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        m.customPrimaries.Wx = (float)x;
+        m.customPrimaries.Wy = (float)y;
+    }
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("mhc", JObj());
+}
+
+void DoMhcSetGrayscale(const JsonValue& p, JsonValue& result, std::string& error, bool correction) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        ApplyGrayscalePayload(correction ? m.correctionGrayscale : m.grayscale, p);
+    }
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("mhc", JObj());
+}
+
+void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        m.enabled = true;
+    }
+    // GenerateAndInstallMhcProfile snapshots settings under the mutex internally,
+    // so it MUST be called without g_monitorSettingsMutex held.
+    if (!GenerateAndInstallMhcProfile(mon, isHDR)) {
+        error = "GenerateAndInstallMhcProfile failed";
+        return;
+    }
+    UpdateMhcFlagsLive(mon);
+    SaveSettings();
+    JsonValue m = JObj();
+    m.set("applied", JBool(true));
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        const MHCSettings& s = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        m.set("profile_name", JStr(WideToUtf8(s.profileName)));
+    }
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("mhc", m);
+}
+
+void DoMhcRemove(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    DisplayInfo di;
+    bool haveDi = GetDisplayInfoForMonitor(mon, di);
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        if (haveDi && !m.profileName.empty())
+            RemoveMHC2Profile(m.profileName, di.adapterId, di.sourceId, isHDR);
+        m.enabled = false;
+    }
+    UpdateMhcFlagsLive(mon);
+    SaveSettings();
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("removed", JBool(true));
+}
+
+void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    bool verified;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        const MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        verified = m.enabled && !m.profileName.empty();
+    }
+    result.set("verified", JBool(verified));
+}
+
+void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    std::wstring cube = Utf8ToWide(p.getStr("cube_path"));
+    if (cube.empty()) { error = "missing parameter: cube_path"; return; }
+    if (GetFileAttributesW(cube.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = "cube_path does not exist";
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MonitorSettings& ms = g_gui.monitorSettings[mon];
+        if (isHDR) ms.hdrPath = cube; else ms.sdrPath = cube;
+    }
+    SaveSettings();
+    ReapplyProcessing();
+    JsonValue rt = JObj();
+    rt.set("cube_path", JStr(WideToUtf8(cube)));
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("runtime", rt);
+}
+
+void DoClear3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MonitorSettings& ms = g_gui.monitorSettings[mon];
+        if (isHDR) ms.hdrPath.clear(); else ms.sdrPath.clear();
+    }
+    SaveSettings();
+    ReapplyProcessing();
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("runtime", JObj());
+}
+
+bool IsMutatingMethod(const std::string& m) {
+    return m == "calibration.enter" || m == "calibration.exit" ||
+           m == "corrections.disable_all" || m.rfind("mhc.", 0) == 0 ||
+           m == "runtime.set_3dlut" || m == "runtime.clear_3dlut";
+}
+
+// ===========================================================================
+// Dispatch
+// ===========================================================================
+std::string Dispatch(const std::string& request) {
+    JsonValue root;
+    try {
+        JsonParser parser(request);
+        root = parser.parse();
+    } catch (const std::exception& e) {
+        return ErrResponse(std::string("invalid JSON: ") + e.what());
+    } catch (...) {
+        return ErrResponse("invalid JSON request");
+    }
+    if (root.type != JsonValue::Obj) return ErrResponse("request must be a JSON object");
+
+    std::string method = root.getStr("method");
+    if (method.empty()) return ErrResponse("missing method");
+    const JsonValue* paramsPtr = root.find("params");
+    JsonValue emptyParams = JObj();
+    const JsonValue& params = (paramsPtr && paramsPtr->type == JsonValue::Obj) ? *paramsPtr : emptyParams;
+
+    JsonValue result = JObj();
+    std::string error;
+
+    try {
+        if (method == "state.get") {
+            HandleStateGet(result);
+        } else if (method == "calibration.status") {
+            HandleCalibStatus(result);
+        } else if (method == "windows.query_profiles") {
+            HandleQueryProfiles(params, result);
+        } else if (method == "windows.query_gamma_ramp") {
+            HandleQueryGammaRamp(params, result);
+        } else if (method == "maintenance.verify_mhc") {
+            DoVerifyMhc(params, result, error);  // read-only, safe off the GUI thread
+        } else if (IsMutatingMethod(method)) {
+            if (!g_gui.hwndMain) {
+                error = "GUI window not available";
+            } else {
+                CalibGuiRequest req{&method, &params, &result, &error};
+                DWORD_PTR res = 0;
+                LRESULT ok = SendMessageTimeoutW(g_gui.hwndMain, WM_CALIB_CMD, (WPARAM)&req, 0,
+                                                 SMTO_NORMAL, kGuiTimeoutMs, &res);
+                if (!ok && error.empty()) error = "GUI thread did not respond";
+            }
+        } else {
+            error = "unknown method: " + method;
+        }
+    } catch (const std::exception& e) {
+        error = std::string("exception: ") + e.what();
+    } catch (...) {
+        error = "unhandled exception";
+    }
+
+    return error.empty() ? OkResponse(result) : ErrResponse(error);
+}
+
+// ===========================================================================
+// Pipe server
+// ===========================================================================
+std::atomic<bool> g_stop{false};
+HANDLE g_serverThread = nullptr;
+
+bool ServerEnabled() {
+    wchar_t env[8] = {0};
+    DWORD n = GetEnvironmentVariableW(L"DESKTOPLUT_CALIBRATION", env, 8);
+    if (n > 0 && env[0] != L'0') return true;
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
+    std::wstring p(path);
+    size_t slash = p.find_last_of(L"\\/");
+    std::wstring dir = (slash != std::wstring::npos) ? p.substr(0, slash + 1) : L"";
+    std::wstring flag = dir + L"DesktopLUT_Calibration.flag";
+    return GetFileAttributesW(flag.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Build a protected DACL granting access to the current user + SYSTEM only.
+PSECURITY_DESCRIPTOR BuildLocalUserSd() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return nullptr;
+    DWORD len = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &len);
+    std::vector<BYTE> buf(len ? len : 1);
+    LPWSTR sidStr = nullptr;
+    if (len && GetTokenInformation(token, TokenUser, buf.data(), len, &len)) {
+        PTOKEN_USER tu = (PTOKEN_USER)buf.data();
+        ConvertSidToStringSidW(tu->User.Sid, &sidStr);
+    }
+    CloseHandle(token);
+    if (!sidStr) return nullptr;
+    std::wstring sddl = L"D:P(A;;GA;;;" + std::wstring(sidStr) + L")(A;;GA;;;SY)";
+    LocalFree(sidStr);
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr))
+        return nullptr;
+    return sd;
+}
+
+void HandleConnection(HANDLE pipe) {
+    std::string request;
+    char buf[4096];
+    DWORD read = 0;
+    while (request.size() < kMaxRequestBytes) {
+        if (!ReadFile(pipe, buf, sizeof(buf), &read, nullptr) || read == 0) break;
+        request.append(buf, read);
+        size_t nl = request.find('\n');
+        if (nl != std::string::npos) { request.resize(nl); break; }
+    }
+    if (request.size() >= kMaxRequestBytes) {
+        std::string resp = ErrResponse("request too large") + "\n";
+        DWORD written = 0;
+        WriteFile(pipe, resp.data(), (DWORD)resp.size(), &written, nullptr);
+        return;
+    }
+    std::string response = Dispatch(request) + "\n";
+    DWORD written = 0;
+    WriteFile(pipe, response.data(), (DWORD)response.size(), &written, nullptr);
+}
+
+DWORD WINAPI ServerThreadProc(LPVOID) {
+    PSECURITY_DESCRIPTOR sd = BuildLocalUserSd();
+    SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+    while (!g_stop.load()) {
+        HANDLE pipe = CreateNamedPipeW(
+            kPipeName,
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,                       // single instance — one client at a time
+            64 * 1024, 64 * 1024,
+            0,
+            sd ? &sa : nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) { Sleep(500); continue; }
+
+        BOOL connected = ConnectNamedPipe(pipe, nullptr)
+                             ? TRUE
+                             : (GetLastError() == ERROR_PIPE_CONNECTED);
+        if (g_stop.load()) { CloseHandle(pipe); break; }
+        if (connected) {
+            HandleConnection(pipe);
+            FlushFileBuffers(pipe);
+        }
+        DisconnectNamedPipe(pipe);
+        CloseHandle(pipe);
+    }
+    if (sd) LocalFree(sd);
+    return 0;
+}
+
+}  // namespace
+
+// ===========================================================================
+// Public entry points
+// ===========================================================================
+void StartCalibrationIpcServer() {
+    if (g_serverThread) return;
+    if (!ServerEnabled()) return;  // SECURITY: opt-in only
+    g_stop.store(false);
+    g_serverThread = CreateThread(nullptr, 0, ServerThreadProc, nullptr, 0, nullptr);
+}
+
+void StopCalibrationIpcServer() {
+    if (!g_serverThread) return;
+    g_stop.store(true);
+    // Unblock a pending ConnectNamedPipe by connecting to ourselves.
+    HANDLE h = CreateFileW(kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    WaitForSingleObject(g_serverThread, 5000);
+    CloseHandle(g_serverThread);
+    g_serverThread = nullptr;
+}
+
+LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
+    CalibGuiRequest* r = reinterpret_cast<CalibGuiRequest*>(wParam);
+    if (!r || !r->method || !r->params || !r->result || !r->error) return 0;
+    try {
+        const std::string& m = *r->method;
+        if (m == "calibration.enter") DoEnterNeutral(*r->params, *r->result, *r->error);
+        else if (m == "calibration.exit") DoExitCalibration(*r->params, *r->result, *r->error);
+        else if (m == "corrections.disable_all") DoDisableAll(*r->params, *r->result, *r->error);
+        else if (m == "mhc.set_primaries") DoMhcSetPrimaries(*r->params, *r->result, *r->error);
+        else if (m == "mhc.set_white") DoMhcSetWhite(*r->params, *r->result, *r->error);
+        else if (m == "mhc.set_base_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, false);
+        else if (m == "mhc.set_correction_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, true);
+        else if (m == "mhc.apply") DoMhcApply(*r->params, *r->result, *r->error);
+        else if (m == "mhc.remove") DoMhcRemove(*r->params, *r->result, *r->error);
+        else if (m == "maintenance.verify_mhc") DoVerifyMhc(*r->params, *r->result, *r->error);
+        else if (m == "runtime.set_3dlut") DoSet3dlut(*r->params, *r->result, *r->error);
+        else if (m == "runtime.clear_3dlut") DoClear3dlut(*r->params, *r->result, *r->error);
+        else *r->error = "unknown method: " + m;
+    } catch (const std::exception& e) {
+        *r->error = std::string("exception: ") + e.what();
+    } catch (...) {
+        *r->error = "unhandled exception";
+    }
+    return 0;
+}
