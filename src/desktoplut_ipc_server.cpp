@@ -511,6 +511,81 @@ void HandleQueryGammaRamp(const JsonValue& p, JsonValue& result) {
     result.set("vcgt_present", JBool(!identity));
 }
 
+// Enumerate DesktopLUT monitors with enough identity for DLC to map a
+// DesktopLUT monitor index -> an Argyll DISPLAY -> the physical panel
+// deterministically (device name, position, primary flag, EDID hardware id,
+// and the live color space SDR/ACM/HDR). Read-only: snapshot the HMONITOR +
+// friendly name under g_monitorSettingsMutex, then run the (thread-safe)
+// display query APIs OUTSIDE the lock — mirrors HandleQueryGammaRamp and keeps
+// the slow DXGI work off the settings mutex.
+void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
+    struct MonSnap { HMONITOR hmon; std::wstring friendly; };
+    std::vector<MonSnap> snaps;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        snaps.reserve(g_gui.monitors.size());
+        for (size_t i = 0; i < g_gui.monitors.size(); ++i) {
+            MonSnap s;
+            s.hmon = g_gui.monitors[i];
+            s.friendly = (i < g_gui.monitorNames.size()) ? g_gui.monitorNames[i] : std::wstring();
+            snaps.push_back(std::move(s));
+        }
+    }
+
+    JsonValue arr = JArr();
+    for (size_t i = 0; i < snaps.size(); ++i) {
+        JsonValue e = JObj();
+        e.set("index", JNum((double)i));
+        e.set("friendly_name", JStr(WideToUtf8(snaps[i].friendly)));
+
+        if (snaps[i].hmon) {
+            MONITORINFOEXW mi;
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(snaps[i].hmon, &mi)) {
+                // GDI device name (\\.\DISPLAYn) — the Argyll display enumeration order.
+                e.set("device_name", JStr(WideToUtf8(mi.szDevice)));
+                JsonValue rect = JObj();
+                rect.set("x", JNum((double)mi.rcMonitor.left));
+                rect.set("y", JNum((double)mi.rcMonitor.top));
+                rect.set("width", JNum((double)(mi.rcMonitor.right - mi.rcMonitor.left)));
+                rect.set("height", JNum((double)(mi.rcMonitor.bottom - mi.rcMonitor.top)));
+                e.set("rect", rect);
+                e.set("primary", JBool((mi.dwFlags & MONITORINFOF_PRIMARY) != 0));
+            }
+        }
+
+        DisplayInfo di;
+        if (GetDisplayInfoForMonitor((int)i, di)) {
+            e.set("device_path", JStr(WideToUtf8(di.devicePath)));
+            e.set("hardware_id", JStr(WideToUtf8(ExtractHardwareIdFromPath(di.devicePath))));
+            e.set("source_id", JNum((double)di.sourceId));
+            e.set("target_id", JNum((double)di.targetId));
+            e.set("hdr_capable", JBool(di.isHdrCapable));
+            JsonValue adapter = JObj();
+            adapter.set("low", JNum((double)di.adapterId.LowPart));
+            adapter.set("high", JNum((double)di.adapterId.HighPart));
+            e.set("adapter_id", adapter);
+        }
+
+        // Live color space via a fresh DXGI query (the same check the capture
+        // path uses) so DLC can confirm the monitor's current mode before a run.
+        if (snaps[i].hmon) {
+            DXGI_OUTPUT_DESC1 desc;
+            if (QueryFreshOutputDesc(snaps[i].hmon, desc)) {
+                bool hdrActive = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                bool acmSdr = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+                e.set("hdr_active", JBool(hdrActive));
+                e.set("color_space", JStr(hdrActive ? "HDR" : (acmSdr ? "ACM_SDR" : "SDR")));
+            }
+        }
+
+        arr.arr.push_back(std::move(e));
+    }
+    result.set("available", JBool(true));
+    result.set("count", JNum((double)snaps.size()));
+    result.set("monitors", arr);
+}
+
 // ===========================================================================
 // Mutating handlers (run on the GUI thread via WM_CALIB_CMD)
 // ===========================================================================
@@ -760,10 +835,51 @@ void DoClear3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("runtime", JObj());
 }
 
+// Runtime (shader) grayscale tweak = DesktopLUT's main-GUI grayscale-correction
+// path (ColorCorrectionSettings.grayscale). This is the fast PROXY tier for the
+// GS+WB final tweak: DLC iterates it without an ICC re-bake, then bakes the
+// converged values into the editable MHC grayscale/WB controls. Payload mirrors
+// the MHC grayscale shape (point_count / points / deviations{r,g,b}), wrapped in
+// a "grayscale_tweak" object. The per-channel deviations carry both grayscale
+// tracking (their shape) and white balance (their DC component).
+void DoSetGrayscaleTweak(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    const JsonValue* tweak = p.find("grayscale_tweak");
+    if (!tweak || tweak->type != JsonValue::Obj) { error = "missing parameter: grayscale_tweak"; return; }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        ColorCorrectionSettings& cc = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection
+                                            : g_gui.monitorSettings[mon].sdrColorCorrection;
+        ApplyGrayscalePayload(cc.grayscale, *tweak);  // sets enabled = true
+    }
+    SaveSettings();
+    ReapplyProcessing();
+    JsonValue rt = JObj();
+    rt.set("grayscale_tweak", JBool(true));  // enabled
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("runtime", rt);
+}
+
+void DoDisableGrayscaleTweak(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        ColorCorrectionSettings& cc = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection
+                                            : g_gui.monitorSettings[mon].sdrColorCorrection;
+        cc.grayscale.enabled = false;
+    }
+    SaveSettings();
+    ReapplyProcessing();
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("runtime", JObj());
+}
+
 bool IsMutatingMethod(const std::string& m) {
     return m == "calibration.enter" || m == "calibration.exit" ||
            m == "corrections.disable_all" || m.rfind("mhc.", 0) == 0 ||
-           m == "runtime.set_3dlut" || m == "runtime.clear_3dlut";
+           m.rfind("runtime.", 0) == 0;  // set_3dlut / clear_3dlut / *_grayscale_tweak
 }
 
 // ===========================================================================
@@ -799,6 +915,8 @@ std::string Dispatch(const std::string& request) {
             HandleQueryProfiles(params, result);
         } else if (method == "windows.query_gamma_ramp") {
             HandleQueryGammaRamp(params, result);
+        } else if (method == "windows.query_monitors") {
+            HandleQueryMonitors(params, result);
         } else if (method == "maintenance.verify_mhc") {
             DoVerifyMhc(params, result, error);  // read-only, safe off the GUI thread
         } else if (IsMutatingMethod(method)) {
@@ -830,6 +948,10 @@ std::atomic<bool> g_stop{false};
 HANDLE g_serverThread = nullptr;
 
 bool ServerEnabled() {
+    // In-app toggle (Settings checkbox / tray) — the human's deliberate arming
+    // action. Persisted, so a checkbox left on re-arms at next launch.
+    if (g_calibrationControlEnabled.load()) return true;
+    // Headless/dev/CI enable: env var or a flag file next to the exe.
     wchar_t env[8] = {0};
     DWORD n = GetEnvironmentVariableW(L"DESKTOPLUT_CALIBRATION", env, 8);
     if (n > 0 && env[0] != L'0') return true;
@@ -954,6 +1076,8 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "maintenance.verify_mhc") DoVerifyMhc(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_3dlut") DoSet3dlut(*r->params, *r->result, *r->error);
         else if (m == "runtime.clear_3dlut") DoClear3dlut(*r->params, *r->result, *r->error);
+        else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
+        else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);
         else *r->error = "unknown method: " + m;
     } catch (const std::exception& e) {
         *r->error = std::string("exception: ") + e.what();

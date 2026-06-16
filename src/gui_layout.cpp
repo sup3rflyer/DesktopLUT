@@ -778,7 +778,7 @@ void CreateGUILayout(HWND hwnd) {
     // Experimental group
     innerY += 51;
     ctrl = CreateWindow(L"BUTTON", L"Experimental", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 46, panel3, nullptr, nullptr, nullptr);
+        innerX, innerY, groupW, 68, panel3, nullptr, nullptr, nullptr);
     g_gui.tab3Controls.push_back(ctrl);
 
     g_gui.hwndSettingsDwmHook = CreateWindow(L"BUTTON", L"DWM Hook Mode (requires admin)",
@@ -787,7 +787,15 @@ void CreateGUILayout(HWND hwnd) {
     g_gui.tab3Controls.push_back(g_gui.hwndSettingsDwmHook);
     SendMessage(g_gui.hwndSettingsDwmHook, BM_SETCHECK, g_dwmHookMode.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    g_gui.contentHeight[3] = innerY + 46 + 8;  // Track content height
+    // DLC calibration control: arms the opt-in IPC server live (no restart). OFF by
+    // default — normal DesktopLUT exposes nothing; this deliberate check is the consent.
+    g_gui.hwndSettingsCalibration = CreateWindow(L"BUTTON", L"Calibration control (DLC)",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 10, innerY + 42, 210, h, panel3, (HMENU)ID_SETTINGS_CALIBRATION, nullptr, nullptr);
+    g_gui.tab3Controls.push_back(g_gui.hwndSettingsCalibration);
+    SendMessage(g_gui.hwndSettingsCalibration, BM_SETCHECK, g_calibrationControlEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    g_gui.contentHeight[3] = innerY + 68 + 8;  // Track content height
 
     // Show all controls inside scroll panels (panels control visibility, not individual controls)
     for (HWND hCtrl : g_gui.tab0Controls) ShowWindow(hCtrl, SW_SHOW);
@@ -917,6 +925,8 @@ void CreateGUILayout(HWND hwnd) {
         g_vrrWhitelistEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndSettingsDwmHook, BM_SETCHECK,
         g_dwmHookMode.load() ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndSettingsCalibration, BM_SETCHECK,
+        g_calibrationControlEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
     if (!monitors.empty()) {
         SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, 0, 0);

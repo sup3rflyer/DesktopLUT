@@ -81,12 +81,52 @@ class MockDesktopLutServer:
                         "vcgt_present": None,
                     }
                 )
+            if method == "windows.query_monitors":
+                return self.ok(self.query_monitors())
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         except KeyError as exc:
             return DesktopLutResponse(ok=False, error=f"missing parameter: {exc.args[0]}")
 
     def ok(self, result: dict[str, Any]) -> DesktopLutResponse:
         return DesktopLutResponse(ok=True, result=result)
+
+    def query_monitors(self) -> dict[str, Any]:
+        """A deterministic two-display layout mirroring the C++ contract shape:
+        monitor 0 primary (SDR), monitor 1 secondary. Lets orchestrator/mapping
+        tests exercise display-mapping logic with no hardware."""
+        monitors = [
+            {
+                "index": 0,
+                "device_name": r"\\.\DISPLAY1",
+                "friendly_name": "Simulated Display 0",
+                "rect": {"x": 0, "y": 0, "width": 3840, "height": 2160},
+                "primary": True,
+                "device_path": r"\\?\DISPLAY#SIM0000#0",
+                "hardware_id": "SIM0000",
+                "source_id": 0,
+                "target_id": 0,
+                "adapter_id": {"low": 0, "high": 0},
+                "hdr_capable": True,
+                "hdr_active": False,
+                "color_space": "SDR",
+            },
+            {
+                "index": 1,
+                "device_name": r"\\.\DISPLAY2",
+                "friendly_name": "Simulated Display 1",
+                "rect": {"x": 3840, "y": 0, "width": 2560, "height": 1440},
+                "primary": False,
+                "device_path": r"\\?\DISPLAY#SIM0001#0",
+                "hardware_id": "SIM0001",
+                "source_id": 1,
+                "target_id": 1,
+                "adapter_id": {"low": 0, "high": 0},
+                "hdr_capable": False,
+                "hdr_active": False,
+                "color_space": "SDR",
+            },
+        ]
+        return {"available": True, "simulated": True, "count": len(monitors), "monitors": monitors}
 
     def key(self, params: dict[str, Any]) -> str:
         return f"{params['monitor']}:{str(params['mode']).upper()}"

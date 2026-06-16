@@ -193,3 +193,81 @@ def test_refinement_holds_dark_points():
     # The black patch (level 0) is too dark to balance -> held at 1.0.
     assert proposal["deviations"]["r"][0] == 1.0
     assert proposal["residuals"][0]["held_dark"] is True
+
+
+# --------------------------------------------------------------------------
+# Item 6: runtime GS+WB tweak (shader proxy) + deterministic display mapping
+# --------------------------------------------------------------------------
+def test_grayscale_tweak_proxy_roundtrip():
+    """The runtime shader grayscale (GS+WB) tweak is the un-deferred proxy tier:
+    set it, see it on the runtime layer, disable it, see it gone."""
+    ctrl = CalibrationController.mock()
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm", reason="item6 test")
+
+    points = [0.0, 0.5, 1.0]
+    deviations = {"r": [1.0, 1.01, 1.0], "g": [1.0, 1.0, 1.0], "b": [1.0, 0.99, 0.98]}
+    res = ctrl.set_grayscale_tweak(0, "SDR", 3, points, deviations)
+    assert res["monitor_mode"] == "0:SDR"
+
+    runtime = ctrl.state()["runtime"]["0:SDR"]
+    tweak = runtime["grayscale_tweak"]
+    assert tweak["point_count"] == 3
+    assert tweak["points"] == points
+    # Deviations are float-coerced through the controller.
+    assert tweak["deviations"]["b"] == pytest.approx([1.0, 0.99, 0.98])
+
+    ctrl.disable_grayscale_tweak(0, "SDR")
+    assert "grayscale_tweak" not in ctrl.state()["runtime"].get("0:SDR", {})
+
+
+def test_grayscale_tweak_independent_of_3dlut():
+    """The GS+WB tweak (final, after the 3D LUT) coexists with the runtime cube
+    on the same runtime layer without clobbering it."""
+    ctrl = CalibrationController.mock()
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    ctrl.set_3dlut(0, "SDR", "C:/run/generated/final.cube")
+    ctrl.set_grayscale_tweak(0, "SDR", 2, [0.0, 1.0], {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 0.99]})
+
+    runtime = ctrl.state()["runtime"]["0:SDR"]
+    assert runtime["cube_path"].endswith("final.cube")
+    assert runtime["grayscale_tweak"]["point_count"] == 2
+
+
+def test_query_monitors_deterministic_mapping():
+    ctrl = CalibrationController.mock()
+    info = ctrl.query_monitors()
+    assert info["available"] is True
+    assert info["count"] == len(info["monitors"]) == 2
+
+    m0 = info["monitors"][0]
+    # Fields DLC needs to pair index <-> Argyll DISPLAY <-> physical panel.
+    for field in ("index", "device_name", "rect", "primary", "hardware_id", "color_space"):
+        assert field in m0, field
+    assert m0["index"] == 0
+    assert m0["primary"] is True
+    assert m0["device_name"].endswith("DISPLAY1")
+    assert info["monitors"][1]["primary"] is False
+    # Distinct stable hardware ids so cross-run matching is unambiguous.
+    assert m0["hardware_id"] != info["monitors"][1]["hardware_id"]
+
+
+# --------------------------------------------------------------------------
+# Item 6: the published API contract carries the un-deferred methods
+# --------------------------------------------------------------------------
+def test_api_spec_documents_item6_methods():
+    from dlc.desktoplut_api_spec import build_desktoplut_api_spec
+
+    spec = build_desktoplut_api_spec()
+    methods = {m["method"]: m for m in spec["methods"]}
+    assert "windows.query_monitors" in methods
+    assert "runtime.set_grayscale_tweak" in methods
+    assert "runtime.disable_grayscale_tweak" in methods
+
+    # The grayscale_tweak payload shape is now pinned (was "runtime tweak payload").
+    tweak_param = methods["runtime.set_grayscale_tweak"]["params"]["grayscale_tweak"]
+    assert "point_count" in tweak_param["description"]
+    assert "deviations" in tweak_param["description"]
+
+    qm = methods["windows.query_monitors"]
+    assert qm["mutates_state"] is False
+    assert "device_name" in qm["result"]["monitors"]

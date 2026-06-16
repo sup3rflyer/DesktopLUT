@@ -229,19 +229,29 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "runtime.set_grayscale_tweak",
-            "Set the separate runtime grayscale tweak layer.",
+            "Set the runtime shader grayscale (GS+WB) tweak — DesktopLUT's main-GUI "
+            "grayscale-correction path. The fast proxy tier for GS+WB iteration: applied "
+            "without an ICC re-bake, later baked into the editable MHC grayscale/WB controls.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "grayscale_tweak": ApiParamSpec("object", description="DesktopLUT runtime tweak payload."),
+                "grayscale_tweak": ApiParamSpec(
+                    "object",
+                    description=(
+                        "Grayscale payload {point_count:int, points:[ascending [0,1]], "
+                        "deviations:{r:[],g:[],b:[]} multiplicative, centered at 1.0}. The "
+                        "per-channel deviations carry both grayscale tracking (their shape) "
+                        "and white balance (their DC component)."
+                    ),
+                ),
             },
-            {"monitor_mode": "string", "runtime": "object"},
+            {"monitor_mode": "string", "runtime": "object with grayscale_tweak=true"},
             mutates_state=True,
             gui_thread_required=True,
         ),
         ApiMethodSpec(
             "runtime.disable_grayscale_tweak",
-            "Disable the separate runtime grayscale tweak layer.",
+            "Disable the runtime shader grayscale (GS+WB) tweak layer.",
             {"monitor": _monitor_param(), "mode": _mode_param()},
             {"monitor_mode": "string", "runtime": "object"},
             mutates_state=True,
@@ -260,6 +270,24 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "Return Windows gamma ramp/VCGT state for the target monitor.",
             {"monitor": ApiParamSpec("integer", required=False, description="Zero-based DesktopLUT monitor index.")},
             {"available": "boolean", "gamma_ramp_loaded": "boolean or null", "vcgt_present": "boolean or null"},
+            mutates_state=False,
+            gui_thread_required=False,
+        ),
+        ApiMethodSpec(
+            "windows.query_monitors",
+            "Enumerate DesktopLUT monitors with enough identity for DLC to deterministically "
+            "map a monitor index to an Argyll DISPLAY and the physical panel.",
+            {},
+            {
+                "available": "boolean",
+                "count": "integer",
+                "monitors": (
+                    "array of {index:int, device_name:'\\\\.\\DISPLAYn' (Argyll order), friendly_name:string, "
+                    "rect:{x,y,width,height}, primary:boolean, device_path:string, hardware_id:string (EDID), "
+                    "source_id:int, target_id:int, adapter_id:{low,high}, hdr_capable:boolean, hdr_active:boolean, "
+                    "color_space:'SDR'|'ACM_SDR'|'HDR'}"
+                ),
+            },
             mutates_state=False,
             gui_thread_required=False,
         ),

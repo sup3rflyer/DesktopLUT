@@ -64,6 +64,16 @@ class CalibrationController:
         params = {"monitor": monitor} if monitor is not None else {}
         return self.call("windows.query_gamma_ramp", params)
 
+    def query_monitors(self) -> dict[str, Any]:
+        r"""Enumerate DesktopLUT monitors for deterministic display mapping.
+
+        Returns ``{"available", "count", "monitors": [...]}`` where each monitor
+        carries enough identity (``device_name`` = ``\\.\DISPLAYn``, ``rect``,
+        ``primary``, ``hardware_id``, ``hdr_capable``/``hdr_active``/``color_space``)
+        to pair a DesktopLUT monitor index with an Argyll DISPLAY and the panel.
+        """
+        return self.call("windows.query_monitors")
+
     # -- calibration mode / clearing --------------------------------------
     def enter_neutral(
         self,
@@ -161,6 +171,40 @@ class CalibrationController:
     def clear_3dlut(self, monitor: int, mode: str) -> dict[str, Any]:
         return self.call(
             "runtime.clear_3dlut",
+            {"monitor": monitor, "mode": normalize_mode(mode)},
+        )
+
+    # -- runtime GS+WB tweak (fast shader proxy tier) ---------------------
+    def set_grayscale_tweak(
+        self,
+        monitor: int,
+        mode: str,
+        point_count: int,
+        points: list[float],
+        deviations: dict[str, list[float]],
+    ) -> dict[str, Any]:
+        """Set the runtime shader grayscale (GS+WB) tweak — the fast proxy tier.
+
+        Iterated without an ICC re-bake; converged values are later baked into the
+        editable MHC grayscale/WB controls (set_correction_grayscale + set_white).
+        Per-channel deviations carry both grayscale tracking and white balance.
+        """
+        return self.call(
+            "runtime.set_grayscale_tweak",
+            {
+                "monitor": monitor,
+                "mode": normalize_mode(mode),
+                "grayscale_tweak": {
+                    "point_count": int(point_count),
+                    "points": [float(p) for p in points],
+                    "deviations": _coerce_deviations(deviations),
+                },
+            },
+        )
+
+    def disable_grayscale_tweak(self, monitor: int, mode: str) -> dict[str, Any]:
+        return self.call(
+            "runtime.disable_grayscale_tweak",
             {"monitor": monitor, "mode": normalize_mode(mode)},
         )
 

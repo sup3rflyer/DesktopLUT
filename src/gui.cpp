@@ -500,7 +500,12 @@ void UpdateTrayIcon(bool active) {
     HICON hIcon = LoadIcon(GetModuleHandle(nullptr),
         MAKEINTRESOURCE(active ? IDI_APPICON_ACTIVE : IDI_APPICON));
     g_gui.nid.hIcon = hIcon;
-    wcscpy_s(g_gui.nid.szTip, active ? L"DesktopLUT (Active)" : L"DesktopLUT");
+    // Visible-while-armed: the only break in "invisible 24/7" is shown plainly.
+    const wchar_t* base = active ? L"DesktopLUT (Active)" : L"DesktopLUT";
+    if (g_calibrationControlEnabled.load())
+        swprintf_s(g_gui.nid.szTip, L"%s - Calibration armed", base);
+    else
+        wcscpy_s(g_gui.nid.szTip, base);
     Shell_NotifyIcon(NIM_MODIFY, &g_gui.nid);
 
     // Also update the taskbar button icon
@@ -522,12 +527,29 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, IsStartupEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
                ID_TRAY_STARTUP, L"Run at startup");
+    AppendMenu(hMenu, g_calibrationControlEnabled.load() ? (MF_STRING | MF_CHECKED) : MF_STRING,
+               ID_TRAY_CALIBRATION, L"Calibration control");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, L"Exit");
 
     SetForegroundWindow(hwnd);
     TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(hMenu);
+}
+
+// Arm/disarm the opt-in DLC calibration IPC server live (no restart). The human's
+// deliberate toggle is the consent/security boundary; persisted so a checkbox left
+// on re-arms next launch. Keeps the Settings checkbox + tray tooltip in sync.
+// GUI-thread only (Start/StopCalibrationIpcServer create/join the server thread).
+void ApplyCalibrationControl(bool enable) {
+    g_calibrationControlEnabled.store(enable);
+    if (enable) StartCalibrationIpcServer();
+    else        StopCalibrationIpcServer();
+    SaveSettings();
+    if (g_gui.hwndSettingsCalibration)
+        SendMessage(g_gui.hwndSettingsCalibration, BM_SETCHECK,
+                    enable ? BST_CHECKED : BST_UNCHECKED, 0);
+    UpdateTrayIcon(g_gui.isRunning.load());  // refresh the armed-state tooltip
 }
 
 // ============================================================================
@@ -1402,6 +1424,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        case ID_SETTINGS_CALIBRATION:
+            ApplyCalibrationControl(
+                SendMessage(g_gui.hwndSettingsCalibration, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            return 0;
+
         case ID_SETTINGS_VRR_WHITELIST_CHECK:
             g_vrrWhitelistEnabled.store(SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             SaveSettings();
@@ -1427,6 +1454,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetStartupEnabled(!IsStartupEnabled());
             if (g_gui.hwndSettingsRunAtStartup)
                 SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+            return 0;
+        case ID_TRAY_CALIBRATION:
+            ApplyCalibrationControl(!g_calibrationControlEnabled.load());
             return 0;
         case ID_TRAY_EXIT:
             StopProcessing();
@@ -2093,8 +2123,11 @@ int RunGUI() {
     }
     // If starting minimized, window stays hidden (tray icon provides access)
 
-    // Start the opt-in calibration control server (no-op unless explicitly enabled).
+    // Start the opt-in calibration control server (no-op unless explicitly enabled
+    // via the Settings checkbox/persisted setting, the flag file, or the env var).
     StartCalibrationIpcServer();
+    if (g_calibrationControlEnabled.load())
+        UpdateTrayIcon(g_gui.isRunning.load());  // reflect armed state in the tray tooltip
 
     // Message loop
     MSG msg = {};

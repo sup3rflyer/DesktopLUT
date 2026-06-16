@@ -219,3 +219,6 @@ class DesktopLutClient:
         params = {"monitor": monitor} if monitor is not None else {}
         return DesktopLutCommand("windows.query_gamma_ramp", params)
 
+    def windows_query_monitors(self) -> DesktopLutCommand:
+        return DesktopLutCommand("windows.query_monitors")
+

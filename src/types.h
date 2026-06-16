@@ -81,6 +81,7 @@ struct MovableAtomic {
 #define ID_TRAY_STOP        2003
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
+#define ID_TRAY_CALIBRATION 2006
 
 // Tab control
 #define ID_TAB_CONTROL      200
@@ -144,6 +145,7 @@ struct MovableAtomic {
 #define ID_SETTINGS_VRR_WHITELIST_CHECK   408
 #define ID_SETTINGS_VRR_WHITELIST_BTN     409
 #define ID_SETTINGS_DWM_HOOK             411
+#define ID_SETTINGS_CALIBRATION          412
 
 // MHC Settings dialog control IDs
 #define ID_MHC_PRIMARIES_ENABLE  7001
@@ -898,6 +900,7 @@ struct GUIState {
     HWND hwndSettingsVrrWhitelistCheck = nullptr;
     HWND hwndSettingsVrrWhitelistBtn = nullptr;
     HWND hwndSettingsDwmHook = nullptr;
+    HWND hwndSettingsCalibration = nullptr;  // DLC calibration-control IPC server arm/disarm
 
     int panelHeight = 0;  // Visible height of scroll panels
 
