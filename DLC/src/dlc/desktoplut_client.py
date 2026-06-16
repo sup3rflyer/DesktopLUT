@@ -156,6 +156,22 @@ class DesktopLutClient:
             {"monitor": monitor, "mode": mode, "cube_path": cube_path},
         )
 
+    def set_mhc_base_grayscale(
+        self, monitor: int, mode: str, point_count: int, points: list[float], deviations: dict[str, list[float]]
+    ) -> DesktopLutCommand:
+        return DesktopLutCommand(
+            "mhc.set_base_grayscale",
+            {"monitor": monitor, "mode": mode, "point_count": point_count, "points": points, "deviations": deviations},
+        )
+
+    def set_mhc_correction_grayscale(
+        self, monitor: int, mode: str, point_count: int, points: list[float], deviations: dict[str, list[float]]
+    ) -> DesktopLutCommand:
+        return DesktopLutCommand(
+            "mhc.set_correction_grayscale",
+            {"monitor": monitor, "mode": mode, "point_count": point_count, "points": points, "deviations": deviations},
+        )
+
     def set_mhc_primaries(self, monitor: int, mode: str, primaries: dict[str, float]) -> DesktopLutCommand:
         return DesktopLutCommand(
             "mhc.set_primaries",

@@ -360,23 +360,58 @@ def execute_probe_match_plan(
         if instrument_inventory.get("ok") is not True:
             error = str(instrument_inventory.get("reason", "probe-match instrument inventory failed"))
         else:
+            timed_out = False
+            proc: subprocess.Popen[str] | None = None
             try:
-                completed = subprocess.run(
+                proc = subprocess.Popen(
                     plan.command_argv,
                     text=True,
-                    capture_output=True,
-                    timeout=timeout_seconds,
-                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                 )
-                returncode = completed.returncode
-                stdout = completed.stdout or ""
-                stderr = completed.stderr or ""
+                EventWriter(ctx.events_path).write(
+                    "INFO",
+                    "probe_match",
+                    "probe_match_ccxxmake_started",
+                    kind=plan.kind,
+                    iteration=plan.iteration,
+                    argv=plan.command_argv,
+                    pid=proc.pid,
+                    timeout_seconds=timeout_seconds,
+                    stdout=str(stdout_path),
+                    stderr=str(stderr_path),
+                )
+                stdout, stderr = proc.communicate(timeout=timeout_seconds)
+                returncode = proc.returncode
             except subprocess.TimeoutExpired as exc:
-                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-                stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+                timed_out = True
+                if proc is not None:
+                    proc.kill()
+                    killed_stdout, killed_stderr = proc.communicate()
+                    stdout = killed_stdout or (exc.stdout if isinstance(exc.stdout, str) else "")
+                    stderr = killed_stderr or (exc.stderr if isinstance(exc.stderr, str) else "")
+                    returncode = proc.returncode
+                else:
+                    stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+                    stderr = exc.stderr if isinstance(exc.stderr, str) else ""
                 error = f"timeout after {timeout_seconds} seconds"
             except OSError as exc:
                 error = str(exc)
+            finally:
+                if proc is not None:
+                    EventWriter(ctx.events_path).write(
+                        "ERROR" if error else "INFO",
+                        "probe_match",
+                        "probe_match_ccxxmake_finished",
+                        kind=plan.kind,
+                        iteration=plan.iteration,
+                        argv=plan.command_argv,
+                        pid=proc.pid,
+                        returncode=returncode,
+                        timed_out=timed_out,
+                        stdout=str(stdout_path),
+                        stderr=str(stderr_path),
+                    )
         stdout_path.write_text(stdout, encoding="utf-8")
         stderr_path.write_text(stderr, encoding="utf-8")
         if returncode == 0 and not correction.exists():

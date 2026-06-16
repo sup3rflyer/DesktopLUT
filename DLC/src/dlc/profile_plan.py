@@ -107,7 +107,7 @@ def build_profile_measurement_plan(
     iteration: int,
     port: int,
     display_index: int = 1,
-    patch_window: str = "0.5,0.5,1.0",
+    patch_window: str = "0.5,0.5,50,50",
     patch_count: int | None = None,
     correction: Path | None = None,
     high_res: bool = False,
@@ -400,15 +400,6 @@ def execute_profile_measurement_plan(
         instrument_resolution = resolution if resolution.get("applicable") else None
         command = command_for_log(effective_argv)
 
-        EventWriter(ctx.events_path).write(
-            "INFO",
-            plan.stage,
-            "profile_measurement_command_started",
-            iteration=plan.iteration,
-            index=index,
-            command=command,
-            instrument_resolution=instrument_resolution,
-        )
         stdout_path = log_dir / f"{index:02d}_stdout.txt"
         stderr_path = log_dir / f"{index:02d}_stderr.txt"
         error = ""
@@ -418,27 +409,66 @@ def execute_profile_measurement_plan(
             stderr = ""
             error = str(instrument_resolution.get("reason", "instrument resolution failed"))
         else:
+            timed_out = False
+            proc: subprocess.Popen[str] | None = None
             try:
-                completed = subprocess.run(
+                proc = subprocess.Popen(
                     effective_argv,
                     text=True,
-                    capture_output=True,
-                    timeout=timeout_seconds,
-                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                 )
-                returncode = completed.returncode
-                stdout = completed.stdout or ""
-                stderr = completed.stderr or ""
+                EventWriter(ctx.events_path).write(
+                    "INFO",
+                    plan.stage,
+                    "profile_measurement_command_started",
+                    iteration=plan.iteration,
+                    index=index,
+                    command=command,
+                    argv=effective_argv,
+                    pid=proc.pid,
+                    timeout_seconds=timeout_seconds,
+                    stdout=str(stdout_path),
+                    stderr=str(stderr_path),
+                    instrument_resolution=instrument_resolution,
+                )
+                stdout, stderr = proc.communicate(timeout=timeout_seconds)
+                returncode = proc.returncode
             except subprocess.TimeoutExpired as exc:
-                returncode = None
-                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-                stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+                timed_out = True
+                if proc is not None:
+                    proc.kill()
+                    killed_stdout, killed_stderr = proc.communicate()
+                    stdout = killed_stdout or (exc.stdout if isinstance(exc.stdout, str) else "")
+                    stderr = killed_stderr or (exc.stderr if isinstance(exc.stderr, str) else "")
+                    returncode = proc.returncode
+                else:
+                    stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+                    stderr = exc.stderr if isinstance(exc.stderr, str) else ""
                 error = f"timeout after {timeout_seconds} seconds"
             except OSError as exc:
                 returncode = None
                 stdout = ""
                 stderr = ""
                 error = str(exc)
+            finally:
+                if proc is not None:
+                    EventWriter(ctx.events_path).write(
+                        "ERROR" if error or returncode != 0 else "INFO",
+                        plan.stage,
+                        "profile_measurement_command_finished",
+                        iteration=plan.iteration,
+                        index=index,
+                        command=command,
+                        argv=effective_argv,
+                        pid=proc.pid,
+                        returncode=returncode,
+                        error=error,
+                        timed_out=timed_out,
+                        stdout=str(stdout_path),
+                        stderr=str(stderr_path),
+                        instrument_resolution=instrument_resolution,
+                    )
         stdout_path.write_text(stdout, encoding="utf-8")
         stderr_path.write_text(stderr, encoding="utf-8")
         results.append(
@@ -452,18 +482,22 @@ def execute_profile_measurement_plan(
                 instrument_resolution=instrument_resolution,
             )
         )
-        EventWriter(ctx.events_path).write(
-            "INFO" if returncode == 0 else "ERROR",
-            plan.stage,
-            "profile_measurement_command_finished",
-            iteration=plan.iteration,
-            index=index,
-            returncode=returncode,
-            error=error,
-            stdout=str(stdout_path),
-            stderr=str(stderr_path),
-            instrument_resolution=instrument_resolution,
-        )
+        if instrument_resolution is not None and instrument_resolution.get("ok") is not True:
+            EventWriter(ctx.events_path).write(
+                "ERROR",
+                plan.stage,
+                "profile_measurement_command_finished",
+                iteration=plan.iteration,
+                index=index,
+                command=command,
+                argv=effective_argv,
+                returncode=returncode,
+                error=error,
+                timed_out=False,
+                stdout=str(stdout_path),
+                stderr=str(stderr_path),
+                instrument_resolution=instrument_resolution,
+            )
         if returncode != 0:
             break
 
@@ -524,7 +558,7 @@ def write_profile_measurement_plan(
     iteration: int,
     port: int,
     display_index: int = 1,
-    patch_window: str = "0.5,0.5,1.0",
+    patch_window: str = "0.5,0.5,50,50",
     patch_count: int | None = None,
     correction: Path | None = None,
     use_probe_correction: bool = True,

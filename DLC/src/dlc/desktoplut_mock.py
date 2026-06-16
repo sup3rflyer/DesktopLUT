@@ -142,6 +142,18 @@ class MockDesktopLutServer:
             state["white"] = {"x": params["x"], "y": params["y"]}
         elif method == "mhc.set_1dlut":
             state["cube_path"] = params["cube_path"]
+        elif method == "mhc.set_base_grayscale":
+            state["base_grayscale"] = {
+                "point_count": params.get("point_count"),
+                "points": deepcopy(params.get("points", [])),
+                "deviations": deepcopy(params.get("deviations", {})),
+            }
+        elif method == "mhc.set_correction_grayscale":
+            state["correction_grayscale"] = {
+                "point_count": params.get("point_count"),
+                "points": deepcopy(params.get("points", [])),
+                "deviations": deepcopy(params.get("deviations", {})),
+            }
         elif method == "mhc.apply":
             state["applied"] = True
         elif method == "mhc.remove":

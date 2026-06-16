@@ -1,14 +1,22 @@
-"""Iteration scoring and decision records."""
+"""Iteration scoring and decision records.
+
+DLC v1 treats this module as an **advisor, not a gate** (rebuild plan §1.4): the
+threshold computation here (`MetricThresholds`, `IterationMetrics`,
+`decide_iteration`) is surfaced to the arbitrating assistant as advisory
+`default_policy_verdict` + reasons. The assistant is always free to override it.
+The pure threshold functions intentionally do not import the run-record/loop-status
+machinery, so they stay importable from the stage tools after the autopilot modules
+are deleted. `write_quality_policy` / `metric_thresholds_for_run` still take a
+RunContext but never gate; the old `write_decision_record` (loop-status coupled) was
+removed with the autopilot.
+"""
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 from .events import EventWriter
-from .loop_status import write_loop_status
 from .runs import RunContext
 
 
@@ -282,52 +290,4 @@ def decide_iteration(
         reason="thresholds are not yet satisfied",
         next_params=_mhc_next_params(metrics) if phase == "mhc" else _3dlut_next_params(metrics, thresholds),
     )
-
-
-def write_decision_record(
-    *,
-    ctx: RunContext,
-    decision: Decision,
-    metrics: IterationMetrics,
-    thresholds: MetricThresholds,
-    metrics_path: Path | None = None,
-) -> Path:
-    output_dir = ctx.root / "reports"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    decision_path = output_dir / f"{decision.phase}_iter{decision.iteration:02d}_decision.json"
-    payload = {
-        "phase": decision.phase,
-        "iteration": decision.iteration,
-        "decision": decision.decision,
-        "reason": decision.reason,
-        "next_params": decision.next_params,
-        "metrics": asdict(metrics),
-        "thresholds": asdict(thresholds),
-        "metrics_json": str(metrics_path) if metrics_path else None,
-    }
-    decision_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    ctx.manifest.stages.append(
-        {
-            "stage": f"{decision.phase}_decision",
-            "iteration": decision.iteration,
-            "status": decision.decision,
-            "decision": str(decision_path),
-            "metrics": str(metrics_path) if metrics_path else None,
-            "reason": decision.reason,
-            "next_params": decision.next_params,
-        }
-    )
-    ctx.save()
-    write_loop_status(ctx=ctx, record_stage=False)
-    ctx.log(f"Decision for {decision.phase} iteration {decision.iteration}: {decision.decision} - {decision.reason}")
-    EventWriter(ctx.events_path).write(
-        "INFO",
-        f"{decision.phase}_decision",
-        "decision_recorded",
-        iteration=decision.iteration,
-        decision=decision.decision,
-        reason=decision.reason,
-        artifact=str(decision_path),
-    )
-    return decision_path
 

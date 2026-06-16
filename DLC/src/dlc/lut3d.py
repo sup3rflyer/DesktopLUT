@@ -249,23 +249,57 @@ def execute_3dlut_build_plan(
         write_placeholder_icc(resolve_run_path(ctx, plan.artifacts["device_link"]), description=f"3D LUT device link iteration {plan.iteration}")
         stdout = f"simulated command: {plan.command}\n"
     elif not dry_run:
+        timed_out = False
+        proc: subprocess.Popen[str] | None = None
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 plan.command_argv,
                 text=True,
-                capture_output=True,
-                timeout=timeout_seconds,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            returncode = completed.returncode
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
+            EventWriter(ctx.events_path).write(
+                "INFO",
+                "build_3dlut",
+                "3dlut_build_collink_started",
+                iteration=plan.iteration,
+                argv=plan.command_argv,
+                pid=proc.pid,
+                timeout_seconds=timeout_seconds,
+                stdout=str(stdout_path),
+                stderr=str(stderr_path),
+            )
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            returncode = proc.returncode
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            timed_out = True
+            if proc is not None:
+                proc.kill()
+                killed_stdout, killed_stderr = proc.communicate()
+                stdout = killed_stdout or (exc.stdout if isinstance(exc.stdout, str) else "")
+                stderr = killed_stderr or (exc.stderr if isinstance(exc.stderr, str) else "")
+                returncode = proc.returncode
+            else:
+                stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+                stderr = exc.stderr if isinstance(exc.stderr, str) else ""
             error = f"timeout after {timeout_seconds} seconds"
         except OSError as exc:
             error = str(exc)
+        finally:
+            if proc is not None:
+                EventWriter(ctx.events_path).write(
+                    "ERROR" if error or returncode != 0 else "INFO",
+                    "build_3dlut",
+                    "3dlut_build_collink_finished",
+                    iteration=plan.iteration,
+                    argv=plan.command_argv,
+                    pid=proc.pid,
+                    returncode=returncode,
+                    error=error,
+                    timed_out=timed_out,
+                    stdout=str(stdout_path),
+                    stderr=str(stderr_path),
+                )
         stdout_path.write_text(stdout, encoding="utf-8")
         stderr_path.write_text(stderr, encoding="utf-8")
         if returncode == 0 and not cube_path.exists():

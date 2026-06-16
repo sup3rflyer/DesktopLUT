@@ -7,8 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .desktoplut_client import DEFAULT_PIPE_NAME, DesktopLutClient
-from .desktoplut_contract import _contract_commands
+from .desktoplut_client import DEFAULT_PIPE_NAME
 
 
 @dataclass(frozen=True)
@@ -152,12 +151,33 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             gui_thread_required=True,
         ),
         ApiMethodSpec(
-            "mhc.set_1dlut",
-            "Load the MHC profile grayscale/1D LUT cube for the target monitor/mode.",
+            "mhc.set_base_grayscale",
+            "Set the MHC base grayscale (per-channel 1D tone correction) for the target monitor/mode.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "cube_path": ApiParamSpec("string", description="Absolute or run-relative path to a 1D cube file."),
+                "point_count": ApiParamSpec("integer", description="Number of grayscale control points."),
+                "points": ApiParamSpec("array", description="Ascending input levels in [0,1]."),
+                "deviations": ApiParamSpec(
+                    "object", description="Per-channel multiplicative deviations centered at 1.0: {r:[],g:[],b:[]}."
+                ),
+            },
+            {"monitor_mode": "string", "mhc": "object"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "mhc.set_correction_grayscale",
+            "Set the MHC correction grayscale (the refinement layer composed on top of the base) "
+            "for the target monitor/mode.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "point_count": ApiParamSpec("integer", description="Number of grayscale control points."),
+                "points": ApiParamSpec("array", description="Ascending input levels in [0,1]."),
+                "deviations": ApiParamSpec(
+                    "object", description="Per-channel multiplicative deviations centered at 1.0: {r:[],g:[],b:[]}."
+                ),
             },
             {"monitor_mode": "string", "mhc": "object"},
             mutates_state=True,
@@ -245,18 +265,27 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
     ]
 
-    client = DesktopLutClient()
-    sequence = [
-        {"step": name, "request": command.as_dict()}
-        for name, command in _contract_commands(
-            client,
-            monitor=0,
-            mode="SDR",
-            dummy_icc_path=r"<DLC>\third_party\argyll\3.3.0\ref\sRGB.icm",
-            mhc_lut_path=r"RUN\generated\desktoplut_contract_contract_1dlut.cube",
-            runtime_lut_path=r"RUN\generated\desktoplut_contract_contract_3dlut.cube",
-        )
+    # The per-phase acceptance sequence DLC runs against the live pipe (and the
+    # mock). Final contract: MHC is staged via primaries + white + base grayscale
+    # (no 1D-cube import), then applied/verified, then the runtime 3D LUT is set.
+    _m, _mode = 0, "SDR"
+    _grayscale = {"point_count": 2, "points": [0.0, 1.0], "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}}
+    sequence_steps = [
+        ("initial_state", "state.get", {}),
+        (
+            "enter",
+            "calibration.enter",
+            {"monitor": _m, "mode": _mode, "dummy_icc_path": r"<DLC>\third_party\argyll\3.3.0\ref\sRGB.icm", "reason": "DLC contract check"},
+        ),
+        ("primaries", "mhc.set_primaries", {"monitor": _m, "mode": _mode, "primaries": {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06}}),
+        ("white", "mhc.set_white", {"monitor": _m, "mode": _mode, "x": 0.3127, "y": 0.3290}),
+        ("base_grayscale", "mhc.set_base_grayscale", {"monitor": _m, "mode": _mode, **_grayscale}),
+        ("apply_mhc", "mhc.apply", {"monitor": _m, "mode": _mode}),
+        ("verify_mhc", "maintenance.verify_mhc", {"monitor": _m, "mode": _mode}),
+        ("runtime_3dlut", "runtime.set_3dlut", {"monitor": _m, "mode": _mode, "cube_path": r"RUN\generated\final.cube"}),
+        ("final_state", "state.get", {}),
     ]
+    sequence = [{"step": step, "request": {"method": method, "params": params}} for step, method, params in sequence_steps]
 
     return {
         "name": "DesktopLUT Calibrator API",
@@ -277,10 +306,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "all commands return ok=true",
             "state.get reports running=true",
             "calibration_mode is active after calibration.enter",
-            "corrections_enabled=false after disable_all/calibration.enter",
-            "mhc entry for 0:SDR has applied=true and a cube_path",
+            "corrections_enabled=false after calibration.enter",
+            "mhc entry for 0:SDR has applied=true",
+            "maintenance.verify_mhc reports verified=true",
             "runtime entry for 0:SDR has a cube_path",
-            "windows.query_profiles and windows.query_gamma_ramp return ok=true",
         ],
     }
 
