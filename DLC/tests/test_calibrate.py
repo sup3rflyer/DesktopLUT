@@ -1,0 +1,298 @@
+"""Tests for the scripted calibration orchestrator (``dlc.calibrate``).
+
+Drives the whole state machine against deterministic synthetic seams — a
+:class:`~dlc.measure_loop.SyntheticPanel` measure fn, a :func:`~dlc.optimize.synthetic_probe`
+re-measure probe, and the in-process mock controller — so it runs with no display,
+no meter, no hardware. Engine-tier (numpy/scipy/colour), so guarded with importorskip
+like ``test_optimize.py``.
+
+Asserts the load-bearing behaviour: the ``full`` flow runs end-to-end to a clean
+deliverable; the ``⚑`` seams surface digests for adjudication (optimize floor,
+GS+WB watchdog, missing-stack escalation); the live LLM pause/resume model
+(:class:`MappingAdjudicator`) pauses and resumes without re-measuring (stage
+memoisation).
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+from pathlib import Path
+
+import pytest
+
+np = pytest.importorskip("numpy")
+pytest.importorskip("scipy")
+pytest.importorskip("colour")
+
+from dlc import calibration_profile as cp
+from dlc.calibrate import (
+    AdjudicationRequired,
+    AutoAdjudicator,
+    Calibration,
+    Decision,
+    MappingAdjudicator,
+    PatchSizes,
+    run_calibration,
+)
+from dlc.controller import CalibrationController
+from dlc.engine.patches import Transfer
+from dlc.measure_loop import SyntheticPanel
+from dlc.optimize import OptimizeConfig, synthetic_probe
+from dlc.runs import RunContext, create_run, open_run
+
+_DATE = datetime.date(2026, 6, 16)
+# Tiny patch sets + a small cube keep the RBF engine fast in tests.
+_SMALL = PatchSizes(raw_ramp_steps=9, cube_size=3, tube_size=5, tube_radius=1, neutral_steps=9)
+_OPT = OptimizeConfig(grid_size=9, max_outer=3, threshold=2.0)
+
+
+def _transfer() -> Transfer:
+    return Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+
+
+def _perfect_panel() -> SyntheticPanel:
+    # start_temp=1.0 + cold_blue_gain=1.0 → a warm, perfect sRGB/D65 panel: warm-up
+    # settles immediately and measurements equal the target (clean wiring run).
+    return SyntheticPanel(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0)
+
+
+def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator=None,
+          probe=None, output_dir=None) -> Calibration:
+    run_dir = tmp_path / name
+    ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
+        else create_run("SDR", display="synthetic", run_dir=run_dir)
+    profile = cp.Profile.synthetic(output_dir=str(output_dir or (tmp_path / "results")))
+    return Calibration(
+        ctx=ctx, profile=profile, monitor=0, mode="SDR",
+        controller=controller or CalibrationController.mock(),
+        measure=panel if panel is not None else _perfect_panel(),
+        adjudicator=adjudicator or AutoAdjudicator(),
+        probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+
+
+# ---------------------------------------------------------------------------
+# full flow
+# ---------------------------------------------------------------------------
+
+def test_full_flow_completes_clean(tmp_path: Path):
+    calib = _make(tmp_path, "full")
+    result = calib.run("full")
+
+    assert result.status == "completed"
+    assert result.target == "srgb_g22"
+    # the canonical pipeline ICC → 3D LUT → GS+WB, in order
+    assert result.stages == [
+        "preflight", "enter-neutral", "brightness", "measure:raw", "build-install-mhc",
+        "measure:post-mhc", "build-install-3dlut", "measure:gray-wb", "gswb-tweak",
+        "measure:verify", "verify",
+    ]
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert verify["within_quality"] is True
+    assert verify["max_de2000"] <= calib.profile.quality.max_de2000
+
+
+def test_full_flow_writes_deliverable_folder(tmp_path: Path):
+    calib = _make(tmp_path, "full", output_dir=tmp_path / "deliverables")
+    result = calib.run("full")
+
+    results_dir = Path(result.results_dir)
+    assert results_dir.exists()
+    assert results_dir.name == "Synthetic_mini-LED_2026-06-16_SDR"
+    assert (results_dir / "report.json").exists()
+    assert (results_dir / "report.html").exists()
+    assert (results_dir / "measurements.ti3").exists()
+    assert (results_dir / f"{results_dir.name}.cube").exists()
+
+    payload = json.loads((results_dir / "report.json").read_text())
+    assert payload["flow"] == "full"
+    assert payload["verification"]["within_quality"] is True
+    # the LLM display-analysis slot is present and empty for the assistant to fill
+    assert "display_analysis" in payload and payload["display_analysis"] is None
+    assert payload["lut3d"]["converged"] in (True, False)
+
+
+def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):
+    calib = _make(tmp_path, "full")
+    calib.run("full")
+    decisions = calib.calib["decisions"]
+    # the two seams that always fire in a clean run
+    assert decisions["resolve-target:plan"]["choice"] == "approve"
+    assert decisions["verify:accept"]["choice"] == "accept"
+
+
+# ---------------------------------------------------------------------------
+# optimize floor seam
+# ---------------------------------------------------------------------------
+
+def test_optimize_floor_surfaces_for_adjudication(tmp_path: Path):
+    # A blue channel that reads 15% too dim cannot be corrected at bright signals
+    # (it would need to push blue past full scale) — a genuine physical floor.
+    target = cp.Profile.synthetic().engine_target("srgb_g22")
+    dim_blue = synthetic_probe(target, gains=(1.0, 1.0, 0.85))
+    calib = _make(tmp_path, "floor", probe=dim_blue)
+    result = calib.run("full")
+
+    lut = calib.calib["stages"]["build-install-3dlut"]["digest"]
+    assert lut["physical_floor"] >= 1
+    assert "build-install-3dlut:floor" in calib.calib["decisions"]
+    # the floor is surfaced, not silently accepted as success
+    assert lut["converged"] is False
+    # the run still completes (AutoAdjudicator accepts the floor) and reports
+    assert result.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# GS+WB tweak-drift watchdog
+# ---------------------------------------------------------------------------
+
+def test_watchdog_trips_on_large_accumulated_trend(tmp_path: Path):
+    calib = _make(tmp_path, "wd")
+    # Seed a per-display history whose accumulated magnitude already sits near the
+    # 3D-LUT-override threshold; the next tweak pushes the trend over it.
+    hist_path = calib._tweak_history_path()
+    hist_path.parent.mkdir(parents=True, exist_ok=True)
+    hist_path.write_text(json.dumps({
+        "Synthetic mini-LED:SDR": [
+            {"date": "2026-01-01", "magnitude": 0.07},
+            {"date": "2026-03-01", "magnitude": 0.06},
+        ]}), encoding="utf-8")
+
+    calib.run("full")
+    wd = calib.calib["stages"]["gswb-tweak"]["digest"]["watchdog"]
+    assert wd["trips"] is True
+    assert wd["recommendation"] == "recommend_recal"
+    assert "gswb-tweak:watchdog" in calib.calib["decisions"]
+    # the new tweak was appended to the persistent history
+    history = json.loads(hist_path.read_text())
+    assert len(history["Synthetic mini-LED:SDR"]) == 3
+
+
+def test_watchdog_quiet_on_small_tweak(tmp_path: Path):
+    calib = _make(tmp_path, "wd_quiet")
+    calib.run("full")
+    wd = calib.calib["stages"]["gswb-tweak"]["digest"]["watchdog"]
+    assert wd["trips"] is False
+    assert "gswb-tweak:watchdog" not in calib.calib["decisions"]
+
+
+# ---------------------------------------------------------------------------
+# gray-wb / 3dlut-only stack precondition
+# ---------------------------------------------------------------------------
+
+def test_gray_wb_escalates_without_a_stack(tmp_path: Path):
+    calib = _make(tmp_path, "gw_empty")
+    result = calib.run("gray-wb")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "require-stack"
+    assert "require-stack:missing" in calib.calib["decisions"]
+
+
+def test_3dlut_only_escalates_without_mhc(tmp_path: Path):
+    calib = _make(tmp_path, "lut_empty")
+    result = calib.run("3dlut-only")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "require-stack"
+
+
+def test_gray_wb_proceeds_with_a_seeded_stack(tmp_path: Path):
+    controller = CalibrationController.mock()
+    # Pre-install an MHC profile + a 3D LUT so the stack precondition is met.
+    controller.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06})
+    controller.apply_mhc(0, "SDR")
+    controller.set_3dlut(0, "SDR", str(tmp_path / "existing.cube"))
+
+    calib = _make(tmp_path, "gw_ok", controller=controller)
+    result = calib.run("gray-wb")
+    assert result.status == "completed"
+    assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
+
+
+# ---------------------------------------------------------------------------
+# HDR is SDR-first in v1
+# ---------------------------------------------------------------------------
+
+def test_hdr_flow_aborts_sdr_first(tmp_path: Path):
+    calib = _make(tmp_path, "hdr")
+    result = calib.run("hdr")
+    assert result.status == "aborted"
+    assert "SDR-first" in result.digest["message"]
+
+
+# ---------------------------------------------------------------------------
+# the live LLM pause/resume model + stage memoisation
+# ---------------------------------------------------------------------------
+
+class _CountingPanel(SyntheticPanel):
+    """A perfect panel that counts every probe read (to prove memoisation)."""
+
+    def __init__(self) -> None:
+        super().__init__(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0)
+        self.count = 0
+
+    def __call__(self, patch):
+        self.count += 1
+        return super().__call__(patch)
+
+
+def test_mapping_adjudicator_pause_resume_does_not_remeasure(tmp_path: Path):
+    run_dir = tmp_path / "pr"
+    panel = _CountingPanel()
+    decisions: dict[str, Decision] = {}
+    pauses = 0
+    reads_after_first_completion = None
+
+    while True:
+        ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
+            else create_run("SDR", display="pr", run_dir=run_dir)
+        profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
+        calib = Calibration(
+            ctx=ctx, profile=profile, monitor=0, mode="SDR",
+            controller=CalibrationController.mock(), measure=panel,
+            adjudicator=MappingAdjudicator(dict(decisions)),
+            optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+        try:
+            result = calib.run("full")
+            break
+        except AdjudicationRequired as exc:
+            pauses += 1
+            assert exc.request.recommendation in exc.request.options
+            # record the recommendation (what an LLM rubber-stamp would do) and resume
+            decisions[exc.request.key] = Decision(exc.request.recommendation, note="resumed")
+            if reads_after_first_completion is None and exc.request.seam == "verify":
+                reads_after_first_completion = panel.count
+            assert pauses <= 6
+
+    assert result.status == "completed"
+    # exactly the two always-on seams paused the run (plan veto, verify acceptance)
+    assert pauses == 2
+    # the final resume (everything memoised) re-measured nothing: the count is
+    # unchanged from when the run first reached the verify seam.
+    assert panel.count == reads_after_first_completion
+
+
+def test_plan_veto_aborts_when_operator_declines(tmp_path: Path):
+    # An LLM/operator returning 'abort' at the plan-veto seam ends the flow cleanly.
+    calib = _make(tmp_path, "veto",
+                  adjudicator=MappingAdjudicator({"resolve-target:plan": Decision("abort", note="not now")}))
+    result = calib.run("full")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "resolve-target"
+    assert "vetoed" in result.digest["message"]
+
+
+def test_mapping_adjudicator_raises_on_unknown_seam(tmp_path: Path):
+    calib = _make(tmp_path, "raise", adjudicator=MappingAdjudicator({}))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("full")
+    assert exc.value.request.seam == "plan_veto"
+
+
+def test_run_calibration_convenience_entry(tmp_path: Path):
+    ctx = create_run("SDR", display="conv", run_dir=tmp_path / "conv")
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
+    result = run_calibration(
+        flow="full", monitor=0, mode="SDR", controller=CalibrationController.mock(),
+        measure=_perfect_panel(), profile=profile, ctx=ctx,
+        optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+    assert result.status == "completed"

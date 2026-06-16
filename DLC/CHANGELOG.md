@@ -11,6 +11,30 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Scripted calibration orchestrator** (`dlc/calibrate.py`, `dlc-calibrate`) — the
+  state machine that runs a whole calibration as a **named flow** (`full` /
+  `3dlut-only` / `gray-wb`; HDR is the later goal), wiring the controller, the
+  adaptive measurement loop, the MHC derivation, and the correction machine into the
+  canonical pipeline **MHC ICC → 3D LUT → GS+WB** (the GS+WB grayscale/white tweak is
+  the small *final* step after the 3D LUT). The LLM appears only at the seams: it
+  judges a **digest** at each boundary (state the plan, accept a measurement that
+  won't settle, accept a correction floor, judge the GS+WB **tweak-drift watchdog**,
+  accept the final score) — it never tails the measurement stream. Two adjudication
+  modes: fully autonomous (rubber-stamp the core's recommendation) or a live
+  pause/resume model where each un-decided seam pauses the run, the assistant
+  decides, and resuming fast-forwards without re-measuring (every stage is memoised
+  in the run-record, which also gives crash-recovery). Each run produces a clean
+  deliverable folder (`results/<display>_<date>_<MODE>/`: the installed 3D LUT,
+  verification `.ti3`, and `report.json`/`report.html` with a slot for the
+  assistant's short panel analysis). The **tweak-drift watchdog** tracks GS+WB tweak
+  magnitude across runs and recommends a full recalibration once drift grows large
+  enough to fight the 3D LUT.
+- **Calibration profile** (`dlc/calibration_profile.py`) — the skill ⊥ user-data
+  boundary: loads the local-only `calibration_profile.yaml` (meter + correction,
+  the DesktopLUT-monitor ⇄ Argyll-display mapping, per-panel quirks, named targets,
+  quality targets, tool paths) so the core never guesses hardware. Computes the
+  colorimeter-correction **staleness** verdict (tell, don't ask) and builds the
+  engine target/transfer for a named target. Pure stdlib except a lazy YAML import.
 - **Colour engine** (`dlc/engine/`, behind the optional `engine` extra —
   numpy / scipy / colour; the spine and pipe contract stay dependency-free):
   - `patches` — thermal golden-ratio patch ordering (holds panel temperature within

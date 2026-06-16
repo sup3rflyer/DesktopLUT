@@ -26,6 +26,7 @@ engine = [
 [project.scripts]
 dlc-simulate = "dlc.stages.simulate:main"
 dlc-readout = "dlc.readout:main"
+dlc-calibrate = "dlc.calibrate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
