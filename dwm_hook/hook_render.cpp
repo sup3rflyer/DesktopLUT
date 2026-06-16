@@ -526,32 +526,44 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	}
 	else if (newBackBufferDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
 	{
-		// FP16 could be HDR or ACM SDR. Preferred signal: HDR LUT staged for this
-		// position means the user configured HDR for this monitor, so route through
-		// the HDR pipeline regardless of IsMonitorHdr (which depends on monitor state
-		// that can be transiently wrong during display re-brokering or fullscreen
-		// video events). Fall back to IsMonitorHdr only when no LUT hint exists.
+		// FP16 backbuffer is either HDR (scRGB, PQ pipeline) or ACM SDR (scRGB, sRGB
+		// pipeline). The monitor's *current* mode is the only correct discriminator:
+		// a configured HDR LUT does NOT mean the monitor is in HDR right now — users
+		// keep an HDR LUT loaded across HDR/SDR mode switches — so LUT presence must
+		// not force the pipeline. The previous "prefer HDR LUT presence" heuristic
+		// pinned every ACM-SDR monitor to the HDR pipeline whenever an HDR LUT was
+		// configured: it ran PQ math on SDR content and silently ignored the SDR LUT.
+		// g_monitorHdrStates is fed by the debounced shared-memory monitor updates, so
+		// it is already safe against transient re-brokering / fullscreen-video HDR
+		// flips, and IsMonitorHdr defaults to SDR (the safe pipeline) when unknown.
 		int monLeft = 0, monTop = 0;
 		GetMonitorPositionFromContext(cOverlayContext, monLeft, monTop);
 
-		bool hdrLutAtPos = false;
-		bool sdrLutAtPos = false;
-		for (int k = 0; k < numLuts; k++) {
-			if (luts[k].left == monLeft && luts[k].top == monTop) {
-				if (luts[k].isHdr) hdrLutAtPos = true;
-				else sdrLutAtPos = true;
+		index = 1;  // FP16 staging texture either way
+
+		// Use the known monitor mode when this position is in the detected state list.
+		// Only fall back to LUT-presence evidence when the position is absent (e.g. a
+		// bogus/uncached context position) — there monitor state is genuinely unknown.
+		bool monKnown = false, monIsHdr = false;
+		for (int m = 0; m < g_numMonitorHdrStates; m++) {
+			if (g_monitorHdrStates[m].left == monLeft && g_monitorHdrStates[m].top == monTop) {
+				monKnown = true;
+				monIsHdr = g_monitorHdrStates[m].isHdr;
+				break;
 			}
 		}
-
-		index = 1;  // FP16 staging texture either way
-		if (hdrLutAtPos) {
-			colorMode = 1;  // HDR (LUT evidence)
-		} else if (sdrLutAtPos) {
-			colorMode = 2;  // ACM SDR (LUT evidence)
-		} else if (IsMonitorHdr(monLeft, monTop)) {
-			colorMode = 1;  // HDR (monitor state fallback)
+		if (monKnown) {
+			colorMode = monIsHdr ? 1 : 2;  // 1=HDR, 2=ACM SDR
 		} else {
-			colorMode = 2;  // ACM SDR (monitor state fallback)
+			bool hdrLutAtPos = false, sdrLutAtPos = false;
+			for (int k = 0; k < numLuts; k++) {
+				if (luts[k].left == monLeft && luts[k].top == monTop) {
+					if (luts[k].isHdr) hdrLutAtPos = true;
+					else sdrLutAtPos = true;
+				}
+			}
+			// Only an HDR-only hint routes to HDR; both-or-neither defaults to ACM SDR.
+			colorMode = (hdrLutAtPos && !sdrLutAtPos) ? 1 : 2;
 		}
 	}
 
