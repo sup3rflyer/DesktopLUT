@@ -26,6 +26,14 @@ request, adjudicates ambiguous results on digests, and writes the report.
     primaries + transfer inversion), with the target white baked in.
   - `whitepoint` — SPD-derived "CRT-like" D65 via observer-metamerism correction
     (CIE 1931 vs modern physiologically-relevant observers), with a comparison CLI.
+- **The correction machine** (`dlc/optimize.py`) — the outer hardware loop that
+  drives a display to its physical floor. It builds a corrected 3D LUT from the
+  measured error model, **applies it and re-measures reality, then folds those real
+  measurements back into the model and rebuilds** — repeating until every patch is
+  at the target or at the panel's floor. Points that can't reach the target are
+  surfaced for adjudication (with the worst offenders) instead of being silently
+  accepted. The display/meter is a single seam, so the same loop runs against a
+  software model (preview), the live shader, or an installed profile.
 - **Adaptive measurement loop** (`dlc/measure_loop.py`) — turns a patch set into a
   clean `.ti3` plus a streaming `measurements.ndjson`, self-healing against panel
   drift: warm-up-settle (biased toward the temperamental channel), a per-patch
