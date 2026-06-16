@@ -19,8 +19,9 @@ results/
 *.sp
 *.ccmx
 *.ccss
-# Scratch bring-up tooling
+# Scratch bring-up tooling (names the panel model / local paths — keep local)
 _bringup_smoke.py
+_live_measure_smoke.py
 
 # requirements.txt is a real tracked file; the root-level "*.txt" rule (eeColor
 # LUT data) would otherwise sweep it up. Re-include it.
