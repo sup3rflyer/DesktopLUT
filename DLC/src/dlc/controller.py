@@ -19,6 +19,7 @@ from .desktoplut_client import (
     DesktopLutTransport,
     NamedPipeTransport,
 )
+from .mhc_grayscale import to_desktoplut_sdr_grayscale
 
 
 def normalize_mode(mode: str) -> str:
@@ -121,12 +122,15 @@ class CalibrationController:
         point_count: int,
         points: list[float],
         deviations: dict[str, list[float]],
+        gamma: float = 2.2,
     ) -> dict[str, Any]:
+        mode = normalize_mode(mode)
+        points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
         return self.call(
             "mhc.set_base_grayscale",
             {
                 "monitor": monitor,
-                "mode": normalize_mode(mode),
+                "mode": mode,
                 "point_count": int(point_count),
                 "points": [float(p) for p in points],
                 "deviations": _coerce_deviations(deviations),
@@ -140,17 +144,31 @@ class CalibrationController:
         point_count: int,
         points: list[float],
         deviations: dict[str, list[float]],
+        gamma: float = 2.2,
     ) -> dict[str, Any]:
+        mode = normalize_mode(mode)
+        points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
         return self.call(
             "mhc.set_correction_grayscale",
             {
                 "monitor": monitor,
-                "mode": normalize_mode(mode),
+                "mode": mode,
                 "point_count": int(point_count),
                 "points": [float(p) for p in points],
                 "deviations": _coerce_deviations(deviations),
             },
         )
+
+    @staticmethod
+    def _bridge_grayscale(mode, points, deviations, gamma):
+        """Translate the DLC's signal-domain grayscale into DesktopLUT's MHC2
+        convention. SDR needs sqrt-distributed linear-light points + linear-light
+        deviations (see mhc_grayscale); HDR (PQ) already matches and is passed
+        through unchanged."""
+        if mode != "SDR":
+            return list(points), deviations
+        new_points, new_dev = to_desktoplut_sdr_grayscale(points, deviations, gamma=gamma)
+        return new_points, new_dev
 
     def apply_mhc(self, monitor: int, mode: str) -> dict[str, Any]:
         return self.call("mhc.apply", {"monitor": monitor, "mode": normalize_mode(mode)})

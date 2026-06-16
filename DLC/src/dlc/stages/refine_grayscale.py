@@ -69,7 +69,8 @@ def build(args, ctx: RunContext) -> StageResult:
     controller = _common.make_controller(args, ctx)
     try:
         controller.set_correction_grayscale(
-            monitor, mode, proposal["point_count"], proposal["points"], proposal["deviations"]
+            monitor, mode, proposal["point_count"], proposal["points"], proposal["deviations"],
+            gamma=float(getattr(target, "gamma", 2.2)),
         )
         result.action("pushed correction grayscale")
         applied = controller.apply_mhc(monitor, mode)

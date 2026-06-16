@@ -48,7 +48,8 @@ def build(args, ctx: RunContext) -> StageResult:
         controller.set_white(monitor, mode, white["x"], white["y"])
         result.action(f"pushed white target x={white['x']} y={white['y']}")
         controller.set_base_grayscale(
-            monitor, mode, base["point_count"], base["points"], base["deviations"]
+            monitor, mode, base["point_count"], base["points"], base["deviations"],
+            gamma=float(params.get("target_gamma", 2.2)),
         )
         result.action(f"pushed base grayscale ({base['point_count']} points)")
         applied = controller.apply_mhc(monitor, mode)

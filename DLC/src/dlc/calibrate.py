@@ -787,7 +787,7 @@ class Calibration:
             wx, wy = white.xy
             self.controller.set_white(self.monitor, self.mode, wx, wy)
             self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
-                                               base["points"], base["deviations"])
+                                               base["points"], base["deviations"], gamma=spec.gamma)
             applied = self.controller.apply_mhc(self.monitor, self.mode)
             verified = self.controller.verify_mhc(self.monitor, self.mode)
             profile_name = applied.get("profile_name") if isinstance(applied, dict) else None
@@ -863,7 +863,7 @@ class Calibration:
                 points = proposal["points"]
                 point_count = proposal["point_count"]
                 magnitude = float(proposal["summary"].get("max_abs_deviation", 0.0))
-                self.controller.set_correction_grayscale(self.monitor, self.mode, point_count, points, deviations)
+                self.controller.set_correction_grayscale(self.monitor, self.mode, point_count, points, deviations, gamma=spec.gamma)
                 self.controller.set_white(self.monitor, self.mode, wx, wy)
                 self.controller.apply_mhc(self.monitor, self.mode)
             watchdog = self._watchdog(magnitude)
