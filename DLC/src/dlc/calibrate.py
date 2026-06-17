@@ -2018,10 +2018,20 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     char.add_argument("--char-settle-reads", type=int, default=None, dest="char_settle_reads",
                       help="max reads per settle level before flagging (default 40).")
     char.add_argument("--char-warmup-max-minutes", type=float, default=None, dest="char_warmup_max_minutes",
-                      help="thermal-stabilization observation bound in minutes (0 ⇒ SKIP the thermal "
-                           "phase, e.g. a quick mechanism check; default 30).")
+                      help="run/skip toggle for the closed-loop thermal phase (0 ⇒ SKIP it, e.g. a quick "
+                           "mechanism check; >0 ⇒ run it — the real bound is --char-thermal-max-blocks).")
     char.add_argument("--char-warmup-stable", type=float, default=None, dest="char_warmup_stable",
-                      help="windowed creep (dE/min) below which the panel is 'thermally stable' (default 0.15).")
+                      help="(legacy static-hold knob) windowed creep dE/min for 'stable' (default 0.15).")
+    char.add_argument("--char-thermal-max-blocks", type=int, default=None, dest="char_thermal_max_blocks",
+                      help="closed-loop thermal observation bound in BLOCKS; exceeding it FLAGs (default 240).")
+    char.add_argument("--char-thermal-load-reads", type=int, default=None, dest="char_thermal_load_reads",
+                      help="scaled-content reads per thermal block (the heat per block; default 12).")
+    char.add_argument("--char-thermal-ref-reads", type=int, default=None, dest="char_thermal_ref_reads",
+                      help="neutral-sensor reads per thermal block (warm-in + noise self-cal; default 5).")
+    char.add_argument("--char-thermal-window", type=int, default=None, dest="char_thermal_window",
+                      help="sliding window (blocks) for the net/gross convergence judgement (default 5).")
+    char.add_argument("--char-thermal-k-start", type=float, default=None, dest="char_thermal_k_start",
+                      help="SOAK luminance scale while warm-in is measured (1.0 ⇒ no preheat; default 1.6).")
 
     parser.add_argument("--dogegen-server", default=None, dest="dogegen_server",
                         metavar="HOST:PORT",
@@ -2217,6 +2227,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         "settle_observe_reads": args.char_settle_reads,
         "warmup_max_minutes": args.char_warmup_max_minutes,
         "warmup_stable_de_per_min": args.char_warmup_stable,
+        "thermal_max_blocks": args.char_thermal_max_blocks,
+        "thermal_load_reads_per_block": args.char_thermal_load_reads,
+        "thermal_ref_reads": args.char_thermal_ref_reads,
+        "thermal_window_blocks": args.char_thermal_window,
+        "thermal_k_start": args.char_thermal_k_start,
     }
     char_overrides = {k: v for k, v in char_overrides.items() if v is not None}
     characterize_config = replace(CharacterizeConfig(), **char_overrides) if char_overrides else None
