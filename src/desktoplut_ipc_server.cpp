@@ -612,6 +612,22 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
         if (haveDi && mhc.enabled && !mhc.profileName.empty())
             RemoveMHC2Profile(mhc.profileName, di.adapterId, di.sourceId, isHDR);
         mhc.enabled = false;
+        // Clean MHC slate for a calibration build. A DLC run defines exactly what it
+        // wants over the pipe (set_primaries / set_white / set_base_grayscale), so any
+        // stale manual MHC correction left in the GUI must NOT bake into the new profile.
+        // The pre-clear snapshot above preserves all of this for restore on revert/fail.
+        //  * white balance: a leftover enabled WB silently shifts the matrix' white
+        //    (this is exactly what contaminated an early DLC run).
+        //  * base/correction grayscale: disabled so a stale curve can't ride along.
+        //  * source ICC/1D-cube import: while set, primaries+TRC come from the FILE and
+        //    the DLC's set_primaries is ignored — clear it so the manual path is used.
+        mhc.whiteBalanceEnabled = false;
+        mhc.grayscale.enabled = false;
+        mhc.correctionGrayscale.enabled = false;
+        mhc.sourceFilePath.clear();
+        mhc.hasPerChannelTRC = false;
+        mhc.sourceIs1DCube = false;
+        mhc.desktopGammaEnabled = false;
         // Clear runtime 3D LUTs.
         ms.sdrPath.clear();
         ms.hdrPath.clear();
