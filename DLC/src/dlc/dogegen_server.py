@@ -56,7 +56,7 @@ def dispatch(cmd: str, *, show: Callable[[int, int, int], None]) -> Tuple[str, b
 
 def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
           patch_size: int = 100, monitor_rect: Optional[Rect] = None,
-          auto_fullscreen: bool = True, resolve: bool = False,
+          auto_fullscreen: bool = True, resolve: bool = True,
           resolve_port: int = 20002) -> None:
     """Start one dogegen window and serve patch commands until ``quit`` (blocking).
 
@@ -69,13 +69,16 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
     pass the DLC target monitor's rect to hit a non-primary panel. If auto-placement fails, fall
     back to the manual Alt+Enter prompt.
 
-    ``resolve=True`` drives dogegen over its **Resolve TPG protocol** (:mod:`dlc.dogegen_resolve`)
-    instead of the stdin ``window`` path. The stdin path deterministically stalls dogegen's present
-    pipeline under a long continuous full-field HDR session (a display freeze at ~23 min, ~12 min
-    with the DWM hook forcing composition) — reproduced across dogegen builds, no handle leak, no
-    GPU TDR. The Resolve path (what ColourSpace/DisplayCAL/Calman drive for hours) does not freeze;
-    HW-validated 28 min clean. The orchestrator-facing line protocol on ``host:port`` is identical
-    either way — only how the daemon talks to dogegen changes."""
+    **Resolve is the DEFAULT transport** (``resolve=True``): the daemon drives dogegen over its
+    **Resolve TPG protocol** (:mod:`dlc.dogegen_resolve`). ``resolve=False`` (``--stdin``) reverts
+    to the legacy stdin ``window`` path, which deterministically stalls dogegen's present pipeline
+    under a long continuous full-field HDR session (a display freeze at ~23 min, ~12 min with the
+    DWM hook forcing composition) — reproduced across dogegen builds, no handle leak, no GPU TDR;
+    keep it only for debugging. The Resolve path (what ColourSpace/DisplayCAL/Calman drive for
+    hours) does not freeze; HW-validated 28 min clean. The daemon exists for the fullscreen
+    10-bit/HDR path, which is exactly where the freeze bites — hence Resolve as the default. The
+    orchestrator-facing line protocol on ``host:port`` is identical either way; only how the daemon
+    talks to dogegen changes."""
     if resolve:
         rdg = ResolveDogegen(Path(dogegen_path), is_hdr=(mode.upper() == "HDR"),
                              bits=bit_depth, port=resolve_port)
@@ -197,10 +200,10 @@ def main(argv=None) -> int:  # pragma: no cover - live wiring
                     help='Explicit target bounds "x,y,w,h" (overrides --monitor; no pipe needed).')
     ap.add_argument("--no-auto-fullscreen", action="store_false", dest="auto_fullscreen",
                     help="Disable auto-fullscreen and prompt for a manual Alt+Enter instead.")
-    ap.add_argument("--resolve", action="store_true",
-                    help="Drive dogegen over its Resolve TPG protocol instead of the stdin "
-                         "'window' path. Required for long HDR runs: the stdin path freezes "
-                         "dogegen's present pipeline after ~12-23 min; the Resolve path does not.")
+    ap.add_argument("--stdin", action="store_false", dest="resolve",
+                    help="Drive dogegen over the legacy stdin 'window' path instead of the Resolve "
+                         "TPG protocol (Resolve is the DEFAULT). The stdin path freezes dogegen's "
+                         "present pipeline on long HDR sessions (~12-23 min) — use only for debugging.")
     ap.add_argument("--resolve-port", type=int, default=20002, dest="resolve_port",
                     help="TCP port the daemon listens on for dogegen's Resolve connection (default 20002).")
     a = ap.parse_args(argv)
