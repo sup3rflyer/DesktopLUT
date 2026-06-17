@@ -68,7 +68,9 @@ class DisplayInstrumentProfile:
     # -- instrument axis --------------------------------------------------
     noise_model: list[NoiseBand] = field(default_factory=list)   # σ vs luminance, ascending nits
     noise_floor_nits: Optional[float] = None     # below this a read is noise-dominated; don't trust a single read
-    read_overhead_s: Optional[float] = None      # fixed per-read cost beyond integration (for time estimates)
+    read_overhead_s: Optional[float] = None      # measured per-read wall time at white (the practical
+    #                                              fast-read floor: ~integration+overhead at the brightest
+    #                                              patch, where integration is shortest) — for time estimates
     # -- display axis -----------------------------------------------------
     settle_seconds: Optional[float] = None       # measured step-response settle (the conservative worst case)
     settle_by_level: Optional[dict[str, float]] = None   # {"bright": s, "dark": s}
@@ -218,6 +220,14 @@ class DipStore:
         if save:
             self.save()
         return dip
+
+    def remove(self, display: str, *, save: bool = True) -> bool:
+        """Drop a display's DIP (e.g. when a characterization is rejected at review, so a
+        bad profile is never left silently active). Returns whether a record was removed."""
+        existed = self._records.pop(display, None) is not None
+        if existed and save:
+            self.save()
+        return existed
 
     def save(self) -> None:
         payload = {"displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}

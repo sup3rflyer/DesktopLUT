@@ -47,9 +47,12 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 import numpy as np
 
 from . import calibration_profile as cp
+from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
+from .dip import DipStore, DisplayInstrumentProfile
 from .engine.patches import Transfer, cube_patches, gamut_patches, ramp_patches, sort_patches, tube_patches
+from .events import EventWriter
 from .measure_loop import (
     MeasureFn,
     MeasureLoopConfig,
@@ -89,6 +92,7 @@ SEAM_OPTIMIZE = "optimize_floor"   # physical floor / budget-limited points (§7
 SEAM_WATCHDOG = "gswb_watchdog"    # tweak magnitude growing large → recal (§3)
 SEAM_VERIFY = "verify"             # final score vs quality targets
 SEAM_STACK = "require_stack"       # gray-wb/3dlut-only precondition unmet
+SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/meter behaviour
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +305,7 @@ class Calibration:
         bit_depth: Optional[int] = None,
         loop_config: Optional[MeasureLoopConfig] = None,
         optimize_config: Optional[OptimizeConfig] = None,
+        characterize_config: Optional[CharacterizeConfig] = None,
         run_date: Optional[date] = None,
         force: bool = False,
         dummy_icc: str = "sRGB.icm",
@@ -321,6 +326,7 @@ class Calibration:
         self.bit_depth = bit_depth if bit_depth is not None else self.display.panel.bit_depth
         self.loop_config = loop_config
         self.optimize_config = optimize_config or OptimizeConfig()
+        self.characterize_config = characterize_config
         self.run_date = run_date or date.today()
         self.force = force
         self.dummy_icc = dummy_icc
@@ -563,6 +569,32 @@ class Calibration:
         """The cross-run, per-display correction store (profile-adjacent / runs-parent)."""
         return CorrectionStore.load(correction_store_path(self.profile, self.ctx.root))
 
+    # -- Display+Instrument Profile (DIP) — produced by characterize -------
+    def _dip_store(self) -> DipStore:
+        """The cross-run, per-display DIP store (profile-adjacent / runs-parent), produced
+        by the ``characterize`` flow and consumed by the measure loop's read policy."""
+        return DipStore.load(dip_store_path(self.profile, self.ctx.root))
+
+    def _dip(self) -> Optional[DisplayInstrumentProfile]:
+        """This display's DIP, if one has been characterized (else ``None`` → the measure
+        loop falls back to its single-read default; runs are leaner, just not noise-aware)."""
+        return self._dip_store().get(self.display.name)
+
+    def _loop_config_for(self, dip: Optional[DisplayInstrumentProfile]) -> MeasureLoopConfig:
+        """Build the measure-loop config, preferring DIP-*measured* values over the profile's
+        learned-fact fallbacks (the cold channel; the interleaved drift reference's interval
+        + threshold). The per-patch read budget is NOT set here — it is decided per patch from
+        the DIP's noise model inside the loop (single read by default, escalate on measured σ)."""
+        cold = self.display.temperamental_channel or (dip.cold_channel if dip else None)
+        kw: dict[str, Any] = {"cold_channel": cold,
+                              "settle_threshold": (self.display.settle_delta_de or 0.3) / 100.0}
+        if dip is not None:
+            if dip.recommended_neutral_interval:
+                kw["neutral_interval"] = dip.recommended_neutral_interval
+            if dip.recommended_drift_threshold:
+                kw["drift_threshold"] = dip.recommended_drift_threshold
+        return MeasureLoopConfig(**kw)
+
     def _resolve_white_now(self) -> cp.WhitePointResolution:
         """Resolve the target white, preferring a white SPD captured by a probe-match
         build (item 9) recorded in the store over the profile's ``display.white_spd``."""
@@ -589,14 +621,16 @@ class Calibration:
     def _measure_set(self, patches: Sequence[tuple[int, int, int]], *, role: str,
                      ti3_name: str, ndjson_name: str) -> MeasureLoopResult:
         transfer = self._transfer()
-        cfg = self.loop_config or MeasureLoopConfig(
-            cold_channel=self.display.temperamental_channel,
-            settle_threshold=(self.display.settle_delta_de or 0.3) / 100.0,
-        )
+        dip = self._dip()
+        cfg = self.loop_config or self._loop_config_for(dip)
         meas_dir = self.ctx.root / "measurements"
+        # Pass the DIP through: the loop reads a single adaptive-integration read by default
+        # and escalates to more averaged reads only where the DIP's measured noise model says
+        # this luminance needs SNR — never a fixed count, never a silent cap.
         return run_measure_loop(
             patches=patches, transfer=transfer, measure=self.measure, config=cfg,
             ti3_path=meas_dir / ti3_name, ndjson_path=meas_dir / ndjson_name,
+            dip=dip,
         )
 
     def _probe_fn(self) -> ProbeFn:
@@ -687,6 +721,18 @@ class Calibration:
             patch_window = self._patch_window_guard()
             if patch_window.get("warning"):
                 self.ctx.log(patch_window["warning"])
+            # Display+Instrument Profile staleness *tell* (never a gate): the measure loop
+            # works without a DIP (single-read default), but a fresh one makes reads noise-aware.
+            # Surface present/stale/missing so the LLM can choose to `--flow characterize` first.
+            dip = self._dip()
+            dip_status = {"present": dip is not None,
+                          "stale": (dip.is_stale(self.run_date.isoformat()) if dip else None),
+                          "made": (dip.made if dip else None),
+                          "bands": (len(dip.noise_model) if dip else 0)}
+            if dip is None or dip_status["stale"]:
+                self.ctx.log("no fresh Display+Instrument Profile for this display — run "
+                             "`--flow characterize` to learn panel+meter behaviour "
+                             "(calibration falls back to a single adaptive-integration read meanwhile).")
             # Save the user's current DesktopLUT state BEFORE we touch anything, so a
             # failed/cancelled run can be rolled back to exactly this. preflight is the
             # first stage and read-only, so this captures the pristine pre-run setup.
@@ -697,6 +743,7 @@ class Calibration:
                       "correction": staleness.as_dict(),
                       "correction_from_store": store_made is not None,
                       "patch_window": patch_window,
+                      "dip": dip_status,
                       "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
@@ -974,6 +1021,66 @@ class Calibration:
             return StageOutcome("enter-neutral", "done",
                                 digest={"entered": True}, data={"raw": _jsonable(res)})
         return self._stage("enter-neutral", run)
+
+    # ====================================================================
+    # Characterize (Display+Instrument Profile GENERATION) — the learning run
+    # ====================================================================
+    def stage_characterize(self) -> StageOutcome:
+        """Learn how THIS panel + meter behave together and persist a Display+Instrument
+        Profile (DIP) — the run that *produces* the priors the measure loop's read policy
+        consumes. NOT a calibration: nothing is built or applied (the panel was already
+        cleared to native by :meth:`stage_clear_native`). Measures the three axes via the
+        single measure seam — instrument noise vs luminance, display settle + native
+        white/black/primaries, warm-up/drift — writes ``characterize.ndjson``, stamps the
+        DIP with this display/date/instrument/correction and upserts it into the store.
+        Abnormal panel/meter behaviour is FLAGGED for review (a non-aborting seam), never
+        silently capped or swallowed."""
+        def run() -> StageOutcome:
+            transfer = self._transfer()
+            cfg = self.characterize_config or CharacterizeConfig()
+            meas_dir = self.ctx.root / "measurements"
+            result = run_characterization(
+                measure=self.measure, transfer=transfer, config=cfg,
+                cold_channel=self.display.temperamental_channel,
+                display=self.display.name,
+                events=EventWriter(self.ctx.events_path),
+                ndjson_path=meas_dir / "characterize.ndjson")
+            # Stamp the provenance the store keys staleness + meter-pairing on, then persist.
+            store = self._dip_store()
+            dip = replace(result.dip,
+                          display=self.display.name,
+                          instrument=self.profile.meter.model,
+                          correction_file=active_correction(self.profile, store, self.display.name),
+                          made=self.run_date.isoformat(),
+                          updated=self.run_date.isoformat())
+            # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
+            # 180-day default) — panel+meter behaviour drift is a different clock than the
+            # colorimeter correction's age, so we deliberately do NOT inherit correction.max_age_days.
+            store.record(dip)
+            self.ctx.log(f"characterized {self.display.name}: {len(dip.noise_model)} noise band(s), "
+                         f"cold channel {dip.cold_channel}, "
+                         f"settle {dip.settle_seconds}s — DIP → {store.path.name}")
+            return StageOutcome("characterize", "done", digest=result.digest,
+                                data={"needs_adjudication": result.needs_adjudication,
+                                      "question": result.question, "flags": result.flags,
+                                      "ndjson": result.ndjson_path,
+                                      "dip_store": str(store.path)},
+                                artifacts=[p for p in (result.ndjson_path,) if p])
+
+        outcome = self._stage("characterize", run)
+        if outcome.data.get("needs_adjudication"):
+            # Non-aborting: the learned DIP is still useful priors (the loop flags per-patch
+            # regardless), so surface the abnormality for judgment without discarding it. An
+            # explicit 'abort' decision is honoured; the default accepts the profile.
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="characterize:review", seam=SEAM_CHARACTERIZE, stage="characterize",
+                question=outcome.data.get("question")
+                or "characterization surfaced abnormal panel/meter behaviour — accept the learned profile or recharacterize?",
+                options=("accept", "abort"), recommendation="accept",
+                digest={k: outcome.digest.get(k) for k in
+                        ("flags", "warm", "cold_channel", "settle_seconds", "noise_floor_nits")})),
+                stage="characterize", message="characterization rejected at review")
+        return outcome
 
     def stage_brightness(self) -> StageOutcome:
         """Brightness-to-target: the core reads white; the human turns the OSD until
@@ -1338,6 +1445,8 @@ class Calibration:
                 return self._flow_gray_wb()
             if flow == "build-correction":
                 return self._flow_build_correction()
+            if flow == "characterize":
+                return self._flow_characterize()
             if flow == "hdr":
                 raise CalibrationAborted(StageOutcome(
                     "resolve-target", "aborted",
@@ -1480,6 +1589,63 @@ class Calibration:
                     "white_spd": rec.spd_file if rec else None,
                     "probe_match": (self.calib["stages"].get("probe-match") or {}).get("digest")})
 
+    def _flow_characterize(self) -> CalibrationResult:
+        """Learn this panel+meter's behaviour and persist a DIP — run this BEFORE a
+        calibration when the DIP is stale/missing (the measure loop's read policy consumes
+        it). NOT a calibration: it clears to native, measures the three axes, restores the
+        user's setup, and applies nothing. The plan-veto confirms the (hardware) run; the
+        per-display DIP store is the deliverable, not a results folder."""
+        self.stage_preflight()
+        # Resolve the target only for its transfer (bit depth + signal↔code-value map) — the
+        # native panel is driven at code values, so the target's white/gamma don't matter here.
+        target = self.display.target_name(self.mode)
+        if not target:
+            raise CalibrationAborted(StageOutcome(
+                "characterize", "aborted",
+                digest={"message": f"display {self.monitor} has no {self.mode} target — needed only "
+                                   "for the patch transfer (bit depth); add one to the profile."}))
+        spec = self.profile.target(target)
+        if spec.is_hdr:
+            raise CalibrationAborted(StageOutcome(
+                "characterize", "aborted",
+                digest={"message": "HDR characterization is post-v1 (SDR-first); characterize on an SDR target."}))
+        self.target_name = target
+        self.calib["target"] = target
+        self._save()
+        # Plan veto: a hardware run worth confirming (its own seam — NOT the calibration plan).
+        self._abort_if(self.adjudicate(AdjudicationRequest(
+            key="characterize:plan", seam=SEAM_PLAN, stage="characterize",
+            question=(f"Characterize monitor {self.monitor} ({self.display.name}) — LEARN how the "
+                      f"panel and meter behave (read noise vs luminance, settle, warm-up/drift). "
+                      f"This is NOT a calibration: nothing is built or applied, and your setup is "
+                      f"restored afterwards. Proceed?"),
+            options=("approve", "abort"), recommendation="approve",
+            digest={"flow": "characterize", "display": self.display.name, "monitor": self.monitor,
+                    "dip_store": str(self._dip_store().path)})),
+            stage="characterize", message="characterization vetoed by the operator")
+        self.stage_clear_native()      # measure the NATIVE panel (no corrections in the path)
+        try:
+            outcome = self.stage_characterize()
+        except CalibrationAborted:
+            # Review rejected this characterization: drop the just-written DIP so a bad profile
+            # is never left silently active, then RESTORE the display before re-raising — the
+            # operator's setup must come back even on the abort path (clear-native put it in
+            # native). A live AdjudicationRequired pause is NOT a CalibrationAborted, so it skips
+            # this and propagates to the pause (the panel stays native for the resuming run).
+            self._dip_store().remove(self.display.name)
+            self._restore_user_setup(why="characterization rejected at review — nothing applied")
+            raise
+        # Leave the display exactly as we found it (clear-native entered native via the pipe).
+        self._restore_user_setup(why="characterization complete — panel learned, nothing applied")
+        dip = self._dip()
+        return CalibrationResult(
+            flow="characterize", monitor=self.monitor, mode=self.mode, target=self.target_name,
+            status="completed", stages=list(self.calib["stages"].keys()),
+            results_dir=None, report_path=None,
+            digest={"characterize": outcome.digest,
+                    "stored_display": dip.display if dip else None,
+                    "dip_store": str(self._dip_store().path)})
+
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
         """gray-wb / 3dlut-only assume an installed stack. If it's missing, escalate
         ('nothing to tune — do a full calibration first') rather than silently
@@ -1520,6 +1686,7 @@ FLOWS: dict[str, str] = {
     "3dlut-only": "verify MHC present → measure → 3D LUT → verify → report",
     "gray-wb": "require stack → brightness → measure neutral → GS+WB tweak → verify → report",
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
+    "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
     "hdr": "(post-v1) Rec.2020/PQ — SDR-first in v1",
 }
 
@@ -1623,6 +1790,18 @@ def correction_store_path(profile: cp.Profile, ctx_root: Path) -> Path:
     else:
         base = ctx_root.parent if ctx_root.parent != ctx_root else ctx_root
     return base / "correction_store.json"
+
+
+def dip_store_path(profile: cp.Profile, ctx_root: Path) -> Path:
+    """Where the cross-run per-display Display+Instrument Profile store lives: alongside the
+    profile when it's on disk (durable across ``runs/`` prunes), else beside the run folders
+    (tests / synthetic profiles). Mirrors :func:`correction_store_path` so the orchestrator
+    and the live CLI agree on one DIP store."""
+    if profile.source_path:
+        base = Path(profile.source_path).resolve().parent
+    else:
+        base = ctx_root.parent if ctx_root.parent != ctx_root else ctx_root
+    return base / "dip_store.json"
 
 
 def _render_cmd(argv: Sequence[Any]) -> str:
@@ -1872,11 +2051,21 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             port, _ = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
         else:
             port = profile.meter.argyll_port
+        # Per-patch presenter dwell: prefer the panel's MEASURED step-response settle (from the
+        # DIP) over the guessed 0.5 s — a fast panel runs leaner, a slow mini-LED waits long
+        # enough. EXCEPT during `characterize` itself, which must observe the raw step response
+        # (waiting out a prior settle estimate would hide it), so it keeps the paint-safe default.
+        dip_rec = DipStore.load(dip_store_path(profile, ctx.root)).get(
+            profile.display_for(args.monitor).name)
+        presenter_settle = (dip_rec.settle_seconds
+                            if (args.flow != "characterize" and dip_rec and dip_rec.settle_seconds)
+                            else 0.5)
         if args.dogegen_server:
             # Reuse a persistent, operator-fullscreened dogegen window across invocations
             # (no respawn/flash) — the daemon owns the dogegen process + its bit-depth mode.
             host, _, srv_port = args.dogegen_server.partition(":")
-            presenter = SocketPresenter(host or "127.0.0.1", int(srv_port or 28930))
+            presenter = SocketPresenter(host or "127.0.0.1", int(srv_port or 28930),
+                                        settle_seconds=presenter_settle)
         else:
             dogegen_path = profile.paths.get("dogegen")
             if not dogegen_path:
@@ -1893,7 +2082,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                 place_rect = None
             presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), normalize_mode(args.mode),
                                                              bit_depth=bit_depth),
-                                         place_rect=place_rect)
+                                         settle_seconds=presenter_settle, place_rect=place_rect)
         # The active correction comes from the store first (a freshly probe-matched .ccmx)
         # then the profile — so a build-correction run is picked up without editing the YAML.
         store = CorrectionStore.load(correction_store_path(profile, ctx.root))

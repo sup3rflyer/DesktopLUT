@@ -66,7 +66,8 @@ def _fake_launch(cmds):
 
 
 def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator=None,
-          probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None) -> Calibration:
+          probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
+          characterize_config=None) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run("SDR", display="synthetic", run_dir=run_dir)
@@ -77,7 +78,8 @@ def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator
         measure=panel if panel is not None else _perfect_panel(),
         adjudicator=adjudicator or AutoAdjudicator(),
         probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE,
-        probe_launcher=probe_launcher, decision_overrides=decision_overrides)
+        probe_launcher=probe_launcher, decision_overrides=decision_overrides,
+        characterize_config=characterize_config)
 
 
 # ---------------------------------------------------------------------------
@@ -795,3 +797,174 @@ def test_run_calibration_convenience_entry(tmp_path: Path):
         measure=_perfect_panel(), profile=profile, ctx=ctx,
         optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
     assert result.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# characterize flow (Component 2) + DIP wiring into the measure loop (Component 4)
+# ---------------------------------------------------------------------------
+
+from dlc.characterize import CharacterizeConfig
+
+# A small, fast characterization recipe for the orchestrator tests.
+_CHAR = CharacterizeConfig(noise_levels=(1.0, 0.2), noise_reads=4, black_reads=2,
+                           primary_reads=1, settle_levels={"bright": 1.0},
+                           warmup_observe_reads=8, creep_reads=2)
+
+
+def test_characterize_flow_produces_and_stores_dip(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "char", controller=ctrl, characterize_config=_CHAR)
+    result = calib.run("characterize")
+
+    assert result.status == "completed"
+    # it is NOT a calibration: no MHC / 3D LUT / verify stages, just the learning steps
+    assert result.stages == ["preflight", "clear-native", "characterize"]
+    # the DIP was persisted for this display, with a noise model and a discovered cold channel
+    dip = calib._dip()
+    assert dip is not None and dip.display == "Synthetic mini-LED"
+    assert len(dip.noise_model) == 2
+    assert dip.cold_channel in ("R", "G", "B")
+    assert dip.made == "2026-06-16"
+    assert dip.correction_file == "synthetic.ccmx"   # the active correction in force, stamped on
+    # nothing was applied: the display was restored to the user's setup (no MHC left installed)
+    assert not ctrl.state().get("mhc")
+    assert ctrl.calibration_status().get("active") is False
+
+
+def test_characterize_then_calibration_consumes_the_dip(tmp_path: Path):
+    # characterize writes the DIP; a later run sharing the same (tmp-rooted) store picks it up.
+    char = _make(tmp_path, "char_first", characterize_config=_CHAR)
+    char.run("characterize")
+    assert char._dip() is not None
+
+    full = _make(tmp_path, "full_after")
+    full.run("full")
+    # the calibration's preflight sees a present, fresh DIP (the escalate-when-stale tell)
+    dip_status = full.calib["stages"]["preflight"]["digest"]["dip"]
+    assert dip_status["present"] is True
+    assert dip_status["stale"] is False
+    assert dip_status["bands"] == 2
+
+
+def test_preflight_dip_tell_when_missing(tmp_path: Path):
+    # No characterization yet → the preflight digest surfaces the missing DIP (a tell, not a gate);
+    # the run still completes on the single-read fallback.
+    calib = _make(tmp_path, "no_dip")
+    result = calib.run("full")
+    assert result.status == "completed"
+    dip_status = calib.calib["stages"]["preflight"]["digest"]["dip"]
+    assert dip_status["present"] is False
+    assert dip_status["bands"] == 0
+
+
+def test_dip_recommendations_flow_into_loop_config(tmp_path: Path):
+    # A stored DIP's measured recommendations override the loop's defaults for the next run.
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_cfg")
+    store = calib._dip_store()
+    store.record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.05, reads=10)],
+        cold_channel="G", recommended_neutral_interval=12,
+        recommended_drift_threshold=0.009, made="2026-06-16"))
+    dip = calib._dip()
+    cfg = calib._loop_config_for(dip)
+    assert cfg.neutral_interval == 12
+    assert cfg.drift_threshold == 0.009
+    # the profile's known cold channel still wins over the DIP's (it is the human-authored fact)
+    assert cfg.cold_channel == calib.display.temperamental_channel
+
+
+def test_characterize_plan_veto_aborts_cleanly(tmp_path: Path):
+    calib = _make(tmp_path, "char_veto", characterize_config=_CHAR,
+                  adjudicator=MappingAdjudicator({"characterize:plan": Decision("abort", note="not now")}))
+    result = calib.run("characterize")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "characterize"
+    assert "vetoed" in result.digest["message"]
+    # vetoed before touching the display: no DIP written
+    assert calib._dip() is None
+
+
+def test_characterize_abnormal_surfaces_review_seam(tmp_path: Path):
+    # A jittery panel can't settle → the review seam fires (AutoAdjudicator accepts, so the run
+    # still completes and the learned DIP — useful priors — is kept, not discarded).
+    jittery = SyntheticPanel(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0,
+                             noise=0.5, seed=5)
+    calib = _make(tmp_path, "char_abn", panel=jittery,
+                  characterize_config=CharacterizeConfig(
+                      noise_levels=(1.0,), noise_reads=4, black_reads=1, primary_reads=1,
+                      settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1))
+    result = calib.run("characterize")
+    assert result.status == "completed"
+    assert "characterize:review" in calib.calib["decisions"]
+    assert calib.calib["decisions"]["characterize:review"]["choice"] == "accept"
+    assert calib._dip() is not None   # priors kept despite the flag
+
+
+def test_characterize_review_abort_restores_display_and_drops_dip(tmp_path: Path):
+    # A jittery panel flags at review; the operator aborts ("recharacterize"). Even on this
+    # abort path (which fires AFTER clear-native entered native) the display must be restored
+    # and the rejected DIP must NOT be left silently active.
+    ctrl = CalibrationController.mock()
+    jittery = SyntheticPanel(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0,
+                             noise=0.5, seed=9)
+    calib = _make(tmp_path, "char_abort", panel=jittery, controller=ctrl,
+                  characterize_config=CharacterizeConfig(
+                      noise_levels=(1.0,), noise_reads=4, black_reads=1, primary_reads=1,
+                      settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1),
+                  adjudicator=MappingAdjudicator({"characterize:plan": Decision("approve"),
+                                                  "characterize:review": Decision("abort", note="redo")}))
+    result = calib.run("characterize")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "characterize"
+    # restored: left calibration mode, nothing applied
+    assert ctrl.calibration_status().get("active") is False
+    assert not ctrl.state().get("mhc")
+    # the rejected characterization is not left as the active DIP
+    assert calib._dip() is None
+
+
+def test_measure_set_escalates_reads_when_a_dip_says_snr_is_poor(tmp_path: Path):
+    # End-to-end Component 4: with no DIP every patch is a single read; once a DIP whose noise
+    # model says white needs SNR is stored, the SAME _measure_set takes extra averaged reads.
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_reads")
+    calib.target_name = "srgb_g22"   # what resolve-target would set; needed for the transfer
+    patches = [(1023, 1023, 1023), (900, 900, 900), (780, 780, 780)]
+
+    no_dip = calib._measure_set(patches, role="t", ti3_name="a.ti3", ndjson_name="a.ndjson")
+    assert no_dip.digest["immediate_remeasures"] == 0    # single adaptive-integration read each
+
+    calib._dip_store().record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.4, reads=10)], made="2026-06-16"))
+    with_dip = calib._measure_set(patches, role="t", ti3_name="b.ti3", ndjson_name="b.ndjson")
+    # σ 0.4 vs tol 0.2 ⇒ √N rule wants 4 reads/patch ⇒ extra reads happen (and the loop converges)
+    assert with_dip.digest["immediate_remeasures"] > 0
+
+
+def test_preflight_dip_tell_when_stale(tmp_path: Path):
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_stale")
+    calib._dip_store().record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.05, reads=10)],
+        made="2025-01-01", max_age_days=180))   # ~17 months before the 2026-06-16 run → stale
+    result = calib.run("full")
+    assert result.status == "completed"
+    dip_status = calib.calib["stages"]["preflight"]["digest"]["dip"]
+    assert dip_status["present"] is True and dip_status["stale"] is True
+
+
+def test_loop_config_uses_dip_cold_channel_when_profile_has_none(tmp_path: Path):
+    import dataclasses as dc
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_cold")
+    calib.display = dc.replace(calib.display, quirks={})   # the profile knows no cold channel
+    dip = DisplayInstrumentProfile(
+        display="Synthetic mini-LED",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.05, reads=10)],
+        cold_channel="G", made="2026-06-16")
+    cfg = calib._loop_config_for(dip)
+    assert cfg.cold_channel == "G"   # the DIP-discovered channel is used when the profile has none
