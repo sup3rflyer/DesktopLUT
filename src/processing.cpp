@@ -1123,6 +1123,11 @@ void StopProcessing() {
     g_gui.isRunning = false;
     g_gui.activeSettings.clear();  // No longer running, clear active settings
     g_shaderCorrectionsActive.store(false);
+    // Guarantee the status reflects the stop in every path. The "Inactive" sets
+    // above only run inside the joinable-thread branch, which is skipped in the
+    // DWM hook LUT-only and analysis-only modes (no host-side processing thread),
+    // leaving the label stuck at "Stopping..." even though teardown completed.
+    SetStatus(L"Inactive");
     UpdateTrayIcon(false);
     UpdateGUIState();
 }
