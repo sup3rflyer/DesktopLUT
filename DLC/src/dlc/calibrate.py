@@ -325,11 +325,28 @@ class Calibration:
         return decision
 
     # -- backup / restore (rollback guard) --------------------------------
+    def _resolve_desktoplut_ini(self) -> Optional[Path]:
+        """Locate the user's DesktopLUT.ini (the complete persisted settings) from the
+        profile's ``paths.desktoplut_ini`` (absolute, or relative to the cwd). Returns None
+        if unset/missing — the backup then falls back to the lighter state.get JSON."""
+        configured = self.profile.paths.get("desktoplut_ini")
+        if not configured:
+            return None
+        p = Path(configured)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        try:
+            return p if p.exists() else None
+        except Exception:  # noqa: BLE001
+            return None
+
     def _capture_user_backup(self, state: dict[str, Any]) -> dict[str, Any]:
-        """Persist the user's pre-run DesktopLUT state to the run dir so a failed or
-        cancelled run can be rolled back. The live rollback uses DesktopLUT's own
-        in-memory snapshot (taken at ``calibration.enter``); this durable copy is the
-        safety net if that snapshot is lost (e.g. the app restarted). Captured once."""
+        """Save the user's complete pre-run DesktopLUT setup to the run dir so a failed or
+        cancelled run can be rolled back. Copies the whole ``DesktopLUT.ini`` (every setting:
+        MHC, 3D LUTs, corrections, WB, tonemap — all of it) BEFORE ``enter-neutral``'s own
+        SaveSettings overwrites it, plus a small ``state.get`` JSON noting the active profile.
+        The live rollback still uses DesktopLUT's in-memory snapshot; this file copy is the
+        complete durable safety net. Captured once."""
         existing = self.calib.get("backup")
         if existing and existing.get("captured"):
             return existing
@@ -343,6 +360,18 @@ class Calibration:
             record = {"captured": True, "path": str(path),
                       "active_profile": active_profile,
                       "had_mhc": bool(active_profile)}
+            # The complete settings file — the real durable backup.
+            ini = self._resolve_desktoplut_ini()
+            if ini is not None:
+                dest = self.ctx.root / "desktoplut_settings_backup.ini"
+                shutil.copy2(ini, dest)
+                record["ini_backup"] = str(dest)
+                record["ini_source"] = str(ini)
+                self.ctx.log(f"backed up full DesktopLUT settings: {ini} → {dest.name}")
+            else:
+                record["ini_backup"] = None
+                self.ctx.log("DesktopLUT.ini not found — set paths.desktoplut_ini in the profile "
+                             "for a complete settings backup (state.get JSON saved as a fallback)")
             self.ctx.log(f"backed up user's DesktopLUT state → {path.name}"
                          + (f" (active MHC: {active_profile})" if active_profile else " (no MHC active)"))
         except Exception as exc:  # noqa: BLE001 - backup is best-effort, never blocks the run

@@ -161,6 +161,19 @@ def test_preflight_backs_up_user_state(tmp_path: Path):
     assert (calib.ctx.root / "desktoplut_backup.json").exists()
 
 
+def test_backup_copies_full_ini_when_configured(tmp_path: Path):
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text("[Monitor0_SDR]\nMHCWhiteBalanceEnabled=true\n", encoding="utf-8")
+    calib = _make(tmp_path, "inibak")
+    calib.profile.paths["desktoplut_ini"] = str(ini)  # paths is a plain mutable dict
+    calib.run("mhc-only")
+    bak = calib.calib.get("backup") or {}
+    assert bak.get("ini_backup")
+    dest = calib.ctx.root / "desktoplut_settings_backup.ini"
+    assert dest.exists()
+    assert dest.read_text(encoding="utf-8") == ini.read_text(encoding="utf-8")
+
+
 def test_apply_commits_and_leaves_calibration(tmp_path: Path):
     ctrl = CalibrationController.mock()
     calib = _make(tmp_path, "applycommit", controller=ctrl)
