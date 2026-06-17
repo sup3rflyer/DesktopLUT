@@ -262,8 +262,10 @@ def test_preheat_soaks_a_cold_panel_before_measuring():
     assert loop.cold_channel == "B"               # the biggest thermal mover, discovered not assumed
 
 
-def test_preheat_auto_gates_on_regime():
-    # "auto" soaks only on content-driven / still-warming panels; a convergent (or no) DIP skips it.
+def test_preheat_auto_soaks_any_characterized_panel():
+    # "auto" soaks any CHARACTERIZED panel — convergent included (a cheap self-deactivating warm cycle:
+    # a convergent panel still has a cold-start warm-in, and the static-grey gate holds a fixed load, not
+    # the sweep's mean). Only an uncharacterized (no-DIP) or compromised panel falls back to static grey.
     t = _sdr()
 
     def fresh():
@@ -273,14 +275,15 @@ def test_preheat_auto_gates_on_regime():
     def dip(regime):
         return DisplayInstrumentProfile(display="x", thermal_regime=regime)
 
-    convergent = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
-                            _bright_content(t), dip=dip("convergent"))
-    assert convergent.preheat() is None           # skipped: the static-grey settle handles it
-    fluctuating = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
-                             _bright_content(t), dip=dip("fluctuating"))
-    assert fluctuating.preheat() is not None       # soaked: grey can't warm a fluctuating panel
+    for regime in ("convergent", "fluctuating", "warming"):
+        loop = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
+                          _bright_content(t), dip=dip(regime))
+        assert loop.preheat() is not None, regime      # characterized ⇒ soaked (even convergent/SDR)
     no_dip = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t))
-    assert no_dip.preheat() is None                # unknown regime ⇒ no soak
+    assert no_dip.preheat() is None                    # uncharacterized ⇒ static-grey settle gate
+    compromised = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
+                             _bright_content(t), dip=dip("compromised"))
+    assert compromised.preheat() is None               # bad characterization ⇒ no soak
 
 
 def test_preheat_wires_into_run_and_is_off_by_default(tmp_path: Path):

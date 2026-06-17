@@ -139,12 +139,13 @@ class MeasureLoopConfig:
     max_warmup_reads: int = 24          # not settled within this ⇒ escalate to the LLM (a FLAG, not a silent cap)
 
     # Thermal preheat (soak-into-calibration) -------------------------------
-    preheat: str = "auto"               # "auto" (soak when the DIP regime is fluctuating/warming),
-    #                                     "always", or "never". A convergent/unknown panel uses the
-    #                                     plain static-grey settle gate; a content-driven panel that
-    #                                     holding grey can't warm is soaked to its OPERATING load (this
-    #                                     run's own patch set) first, then rides that equilibrium — the
-    #                                     golden-ratio patch ordering holds the load through the run.
+    preheat: str = "auto"               # "auto" (soak any CHARACTERIZED panel — convergent included),
+    #                                     "always", or "never". The soak parks the panel at its OPERATING
+    #                                     load (this run's own patch set) before measuring, then rides it
+    #                                     (the golden-ratio ordering holds the load). It SELF-DEACTIVATES
+    #                                     on an already-warm panel, so the convergent/SDR case is a cheap
+    #                                     "just to be safe" warm cycle; only an uncharacterized (no-DIP) or
+    #                                     compromised panel falls back to the static-grey settle gate.
     preheat_k_start: float = 1.6        # soak luminance overshoot while warm-in is measured (1.0 ⇒ none)
     rewarm_max_blocks: int = 6          # bounded reactive re-soak on a drift episode (the rare fallback,
     #                                     fired only when the interleaved drift checkpoint trips — not an
@@ -571,16 +572,19 @@ class _Loop:
     # -- thermal preheat: soak-into-calibration ----------------------------
 
     def _preheat_enabled(self) -> bool:
-        """Whether to soak before measuring. ``auto`` (the default) soaks only when the DIP says
-        the panel is content-driven (``fluctuating``) or still climbing (``warming``) — regimes the
-        static-grey settle gate cannot warm. A ``convergent``/unknown panel uses the plain warm-up."""
+        """Whether to soak before measuring. ``auto`` (the default) soaks any *characterized* panel —
+        ``convergent`` included. A convergent panel still has a cold-start warm-in, and the static-grey
+        settle gate holds a fixed low load (not the sweep's mean energy), so a quick soak is strictly
+        more thorough; it **self-deactivates** on an already-warm panel, so the convergent/SDR case is a
+        cheap "just to be safe" warm cycle. Only an UNCHARACTERIZED (no-DIP / no regime) or a
+        ``compromised`` panel falls back to the plain static-grey warm-up."""
         mode = self.cfg.preheat
         if mode == "never":
             return False
         if mode == "always":
             return True
         regime = self.dip.thermal_regime if self.dip is not None else None
-        return regime in ("fluctuating", "warming")
+        return regime in ("convergent", "fluctuating", "warming")
 
     def _run_soak(self, *, phase: str, max_blocks: Optional[int] = None):
         """Drive a closed-loop :class:`~dlc.thermal.ThermalController` over THIS run's patch set.
