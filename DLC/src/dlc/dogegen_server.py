@@ -94,9 +94,13 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
                 buf = b""
                 done = False
                 while not done:
-                    data = conn.recv(4096)
+                    try:
+                        data = conn.recv(4096)
+                    except (ConnectionResetError, ConnectionAbortedError, OSError):
+                        break                  # client died / abruptly closed (e.g. killed mid-run);
+                                               # treat like a disconnect — KEEP dogegen, accept the next run
                     if not data:
-                        break                  # client gone; KEEP dogegen, accept the next run
+                        break                  # client gone (graceful); KEEP dogegen, accept the next run
                     buf += data
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)

@@ -1182,6 +1182,8 @@ class SyntheticPanel:
         noise: float = 0.0,
         seed: int = 7,
         start_temp: float = 0.0,
+        load_thermal: bool = False,
+        thermal_rate: float = 0.05,
     ) -> None:
         self.transfer = transfer
         self.white_nits = white_nits
@@ -1194,6 +1196,8 @@ class SyntheticPanel:
         self.noise = noise
         self._rng_state = seed & 0x7FFFFFFF
         self.temp = max(0.0, min(1.0, start_temp))
+        self.load_thermal = load_thermal
+        self.thermal_rate = thermal_rate
         self.reads = 0
         self._flaky_seen: dict[str, int] = {}
 
@@ -1204,13 +1208,22 @@ class SyntheticPanel:
 
     def __call__(self, patch: MeasurePatch) -> Reading:
         self.reads += 1
-        # Warm a little on every read toward fully warm (1.0). A slow tau means
-        # the panel is still creeping when the per-read delta first dips under a
-        # settle threshold — the exact "taken cold" failure mode.
-        self.temp += (1.0 - self.temp) * self.warm_tau
+        r, g, b = patch.signal
+        if self.load_thermal:
+            # Load-dependent thermal model (opt-in): the panel relaxes toward an
+            # equilibrium temperature set by the CURRENT patch's drive load (max
+            # channel), so higher-luminance content heats faster AND dropping the
+            # load lets it COOL (overshoot is real). Time constant = thermal_rate.
+            # This is what exercises the closed-loop ThermalController in tests.
+            load = max(max(0.0, r), max(0.0, g), max(0.0, b)) ** self.gamma
+            self.temp += (load - self.temp) * self.thermal_rate
+        else:
+            # Legacy: warm a little on every read toward fully warm (1.0), load-
+            # independent — the "taken cold" warm-up creep model.
+            self.temp += (1.0 - self.temp) * self.warm_tau
+        self.temp = max(0.0, min(1.0, self.temp))
         blue_gain = self.cold_blue_gain + (1.0 - self.cold_blue_gain) * self.temp
 
-        r, g, b = patch.signal
         lr = max(0.0, r) ** self.gamma
         lg = max(0.0, g) ** self.gamma
         lb = (max(0.0, b) ** self.gamma) * blue_gain

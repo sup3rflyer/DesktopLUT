@@ -80,9 +80,16 @@ class DisplayInstrumentProfile:
     native_white_nits: Optional[float] = None
     native_black_nits: Optional[float] = None
     native_primaries: Optional[dict[str, list[float]]] = None    # {"R":[x,y],"G":..,"B":..}
+    eotf_undershoot: Optional[float] = None       # HDR: full-field measured-vs-requested luminance error
+    #   (e.g. -0.06 = panel renders ~6% below the PQ target across the range — a calibratable gain)
+    white_vs_luminance: Optional[list[list[float]]] = None  # HDR: [[nits, x, y], ...] — the panel's
+    #   white point is luminance-dependent; this maps it so calibration doesn't assume a fixed white
     # -- drift axis -------------------------------------------------------
     warmup_reads_to_settle: Optional[int] = None
     warmup_minutes: Optional[float] = None       # wall-time to thermal stability (convergent panels only)
+    fluctuation_envelope: Optional[float] = None  # residual channel-balance wander band once warmed (the
+    #   run-time drift watch trips on drift LEAVING this band; the fluctuating regime never reaches 0)
+    warmin_magnitude: Optional[float] = None      # total active-channel balance drift observed warming in
     thermal_regime: Optional[str] = None         # 'convergent' | 'fluctuating' | 'warming' — DISCOVERED.
     #   convergent: warms to a steady temperature (SDR). fluctuating: content-driven, never settles —
     #   calibrate by MAINTAINING a consistent thermal load, not by reaching a target (HDR). warming:
@@ -127,8 +134,13 @@ class DisplayInstrumentProfile:
             native_white_nits=_opt_float(d.get("native_white_nits")),
             native_black_nits=_opt_float(d.get("native_black_nits")),
             native_primaries=(dict(d["native_primaries"]) if d.get("native_primaries") else None),
+            eotf_undershoot=_opt_float(d.get("eotf_undershoot")),
+            white_vs_luminance=([[float(c) for c in row] for row in d["white_vs_luminance"]]
+                                if d.get("white_vs_luminance") else None),
             warmup_reads_to_settle=(int(d["warmup_reads_to_settle"]) if d.get("warmup_reads_to_settle") is not None else None),
             warmup_minutes=_opt_float(d.get("warmup_minutes")),
+            fluctuation_envelope=_opt_float(d.get("fluctuation_envelope")),
+            warmin_magnitude=_opt_float(d.get("warmin_magnitude")),
             thermal_regime=d.get("thermal_regime"),
             cold_channel=d.get("cold_channel"),
             creep_rate_de_per_min=_opt_float(d.get("creep_rate_de_per_min")),

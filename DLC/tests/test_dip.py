@@ -26,6 +26,22 @@ def _dip(**kw) -> DisplayInstrumentProfile:
     return DisplayInstrumentProfile(**base)
 
 
+def test_thermal_and_hdr_fields_round_trip(tmp_path):
+    """The closed-loop thermal + HDR characterization fields persist and reload."""
+    store = DipStore(tmp_path / "dip_store.json")
+    dip = _dip(mode="HDR", thermal_regime="fluctuating", fluctuation_envelope=0.012,
+               warmin_magnitude=0.08, eotf_undershoot=-0.061,
+               white_vs_luminance=[[100.0, 0.3127, 0.329], [1840.0, 0.328, 0.329]])
+    store.record(dip)
+    reloaded = DipStore.load(tmp_path / "dip_store.json").get("Test Panel:HDR")
+    assert reloaded is not None
+    assert reloaded.thermal_regime == "fluctuating"
+    assert reloaded.fluctuation_envelope == 0.012
+    assert reloaded.warmin_magnitude == 0.08
+    assert reloaded.eotf_undershoot == -0.061
+    assert reloaded.white_vs_luminance == [[100.0, 0.3127, 0.329], [1840.0, 0.328, 0.329]]
+
+
 def test_round_trip_persist_and_load(tmp_path):
     store = DipStore(tmp_path / "dip_store.json")
     store.record(_dip())
