@@ -255,6 +255,20 @@ def test_unquoted_observer_in_yaml_is_repaired(tmp_path: Path):
     path.write_text(yaml, encoding="utf-8")
     p = cp.load_profile(path)
     assert p.target("srgb_g22_120").white.observer == "1964_10"
+
+
+def test_profile_patches_block_loads(tmp_path: Path):
+    # Durable per-profile run-size preference: a `patches:` block is carried verbatim as a dict
+    # (the orchestrator/CLI builds PatchSizes from it). Absent block ⇒ empty dict.
+    yaml = _YAML + "patches:\n  raw_ramp_steps: 33\n  volumetric_mode: cube\n  cube_size: 13\n"
+    path = tmp_path / "calibration_profile.yaml"
+    path.write_text(yaml, encoding="utf-8")
+    p = cp.load_profile(path)
+    assert p.patches == {"raw_ramp_steps": 33, "volumetric_mode": "cube", "cube_size": 13}
+
+    plain = tmp_path / "plain.yaml"
+    plain.write_text(_YAML, encoding="utf-8")
+    assert cp.load_profile(plain).patches == {}
     assert p.quality.avg_de2000 == 1.2
     assert p.source_path == str(path)
 

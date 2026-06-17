@@ -299,6 +299,10 @@ class Profile:
     targets: dict[str, TargetSpec]
     quality: QualityTargets = field(default_factory=QualityTargets)
     paths: dict[str, str] = field(default_factory=dict)
+    # Durable per-profile patch-sequence defaults (the user's run-size preference). A raw
+    # dict mirroring PatchSizes fields — kept as a dict here (not a PatchSizes) so the
+    # profile module stays free of the orchestrator import. The CLI's patch flags override it.
+    patches: dict[str, Any] = field(default_factory=dict)
     source_path: Optional[str] = None
 
     # -- lookups ----------------------------------------------------------
@@ -626,4 +630,5 @@ def load_profile(path: Optional[Path | str] = None) -> Profile:
     )
 
     return Profile(meter=meter, displays=displays, targets=targets, quality=quality,
-                   paths=dict(raw.get("paths", {}) or {}), source_path=str(p))
+                   paths=dict(raw.get("paths", {}) or {}),
+                   patches=dict(raw.get("patches", {}) or {}), source_path=str(p))

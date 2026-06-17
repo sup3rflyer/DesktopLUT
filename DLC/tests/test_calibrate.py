@@ -33,6 +33,9 @@ from dlc.calibrate import (
     Decision,
     MappingAdjudicator,
     PatchSizes,
+    build_volumetric_set,
+    flow_patch_counts,
+    main,
     run_calibration,
 )
 from dlc.controller import CalibrationController
@@ -691,6 +694,97 @@ def test_default_launch_ccxxmake_opens_new_console(tmp_path: Path, monkeypatch):
     assert captured["argv"][0].endswith("ccxxmake.exe") and captured["argv"][-1].endswith(".ccmx")
     if hasattr(subprocess, "CREATE_NEW_CONSOLE"):                  # a NEW console so the operator can interact
         assert captured["flags"] == subprocess.CREATE_NEW_CONSOLE
+
+
+# ---------------------------------------------------------------------------
+# patch-sequence control — the run is not stuck with a preset (size/time decidable)
+# ---------------------------------------------------------------------------
+
+def test_patch_sizes_from_dict_and_cli_merge():
+    # profile `patches:` block parses (saturations -> tuple); CLI .merged() overrides only the
+    # keys actually passed (None is ignored), so CLI beats profile while leaving the rest.
+    base = PatchSizes.from_dict({"raw_ramp_steps": 33, "raw_saturations": [1.0, 0.5],
+                                 "volumetric_mode": "cube", "spines": True})
+    assert base.raw_ramp_steps == 33 and base.raw_saturations == (1.0, 0.5)
+    assert base.volumetric_mode == "cube" and base.spines is True
+    assert base.cube_size == 9                       # untouched default preserved
+    merged = base.merged(cube_size=13, raw_ramp_steps=None)
+    assert merged.cube_size == 13 and merged.raw_ramp_steps == 33   # None override ignored
+
+
+def test_volumetric_mode_selects_generator():
+    # The user/agent chooses HOW the 3D-LUT set samples the cube — not a fixed preset.
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
+    cube = build_volumetric_set(PatchSizes(volumetric_mode="cube", cube_size=5), t)
+    assert len(cube) == 125                          # 5^3 uniform grid
+    tube = build_volumetric_set(PatchSizes(volumetric_mode="tube", cube_size=5,
+                                           tube_size=9, tube_radius=2), t)
+    assert len(tube) > 125                           # cube + neutral-axis core
+    gamut = build_volumetric_set(PatchSizes(volumetric_mode="gamut", gamut_lum_steps=5,
+                                            gamut_hues=6), t)
+    assert len(gamut) > 0
+
+
+def test_patch_sizes_drive_run_size():
+    # Smaller knobs ⇒ fewer patches ⇒ a shorter run (and vice versa) — the time lever.
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
+    small = flow_patch_counts("full", PatchSizes(raw_ramp_steps=5, cube_size=5, tube_size=5,
+                                                 tube_radius=1, neutral_steps=5), t)
+    big = flow_patch_counts("full", PatchSizes(raw_ramp_steps=33, cube_size=17, tube_size=33,
+                                               tube_radius=3, neutral_steps=33), t)
+    assert small["total_patches"] < big["total_patches"]
+    assert set(small["stages"]) == {"raw", "post-mhc", "gray-wb", "verify-vol"}
+
+
+def test_plan_seam_surfaces_run_size(tmp_path: Path):
+    # The plan-veto seam shows the run's size up front so it can be approved/aborted informed.
+    calib = _make(tmp_path, "plan_size", adjudicator=MappingAdjudicator({}))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("full")
+    assert exc.value.request.seam == "plan_veto"
+    pp = exc.value.request.digest["patch_plan"]
+    assert pp["total_patches"] > 0
+    assert set(pp["stages"]) == {"raw", "post-mhc", "gray-wb", "verify-vol"}
+
+
+def test_custom_patch_sizes_flow_through_to_measurement(tmp_path: Path):
+    # A non-default PatchSizes (here a cube volumetric mode) actually drives what gets measured.
+    ctx = open_run(tmp_path / "custom") if (tmp_path / "custom" / "manifest.json").exists() \
+        else create_run("SDR", display="synthetic", run_dir=tmp_path / "custom")
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
+    sizes = PatchSizes(raw_ramp_steps=9, volumetric_mode="cube", cube_size=3, neutral_steps=9)
+    calib = Calibration(ctx=ctx, profile=profile, monitor=0, mode="SDR",
+                        controller=CalibrationController.mock(), measure=_perfect_panel(),
+                        adjudicator=AutoAdjudicator(), optimize_config=_OPT, patch_sizes=sizes,
+                        run_date=_DATE)
+    calib.target_name = profile.display_for(0).target_name("SDR")   # what resolve-target sets
+    assert len(calib._volumetric_patches()) == 27   # 3^3 cube, not the default tube
+    result = calib.run("full")
+    assert result.status == "completed"
+
+
+def test_preview_patches_cli_sizes_a_run_offline(tmp_path: Path, capsys):
+    # `--preview-patches` prints the per-stage patch counts and exits 0 with NO run folder,
+    # controller, or meter — decide time/size before committing.
+    yaml = (
+        "meter: {model: M, argyll_port: 1, correction: {file: c.ccmx, made: 2026-06-01, max_age_days: 180}}\n"
+        "displays:\n"
+        "  - {name: P, desktoplut_monitor: 0, argyll_display: 1, primary: true,\n"
+        "     panel: {tech: mini-LED, bit_depth: 10}, sdr_target: t, hdr_target: null}\n"
+        "targets:\n"
+        "  t: {colorspace: Rec.709, transfer: {type: power, gamma: 2.2},\n"
+        "      white: {intent: D65, method: numeric}, white_luminance_nits: 120}\n"
+        "patches: {raw_ramp_steps: 9, volumetric_mode: cube, cube_size: 5}\n"
+    )
+    path = tmp_path / "calibration_profile.yaml"
+    path.write_text(yaml, encoding="utf-8")
+    rc = main(["--preview-patches", "--flow", "full", "--profile", str(path)])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["flow"] == "full"
+    assert out["patch_sizes"]["volumetric_mode"] == "cube"   # profile block applied
+    assert out["patch_plan"]["stages"]["post-mhc"] == 125    # 5^3 cube
+    assert not (path.parent / "runs").exists()               # no run folder created
 
 
 def test_run_calibration_convenience_entry(tmp_path: Path):

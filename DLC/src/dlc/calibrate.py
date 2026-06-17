@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import shutil
 from argparse import Namespace
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
@@ -49,7 +49,7 @@ import numpy as np
 from . import calibration_profile as cp
 from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
-from .engine.patches import Transfer, ramp_patches, sort_patches, tube_patches
+from .engine.patches import Transfer, cube_patches, gamut_patches, ramp_patches, sort_patches, tube_patches
 from .measure_loop import (
     MeasureFn,
     MeasureLoopConfig,
@@ -170,14 +170,66 @@ class MappingAdjudicator:
 
 @dataclass(frozen=True)
 class PatchSizes:
-    """Patch-set sizes per stage — the core's mechanics, tunable for tests (tiny)
-    vs real runs (dense). All sets are thermally ordered by the generator."""
+    """Patch-set sizes AND sequence knobs per stage — the user/agent's lever over the
+    run's time/size. Every field maps onto the ported ColorCalibration generator
+    (:mod:`dlc.engine.patches`); the defaults reproduce the original preset. Override
+    per-run via the CLI patch flags, or durably per-display via the profile's
+    ``patches:`` block (CLI wins over profile). So a run is never stuck with a preset:
+    a quick shakedown and a dense overnight pass are both just different sizes here.
 
-    raw_ramp_steps: int = 17        # grey + RGBCMY ramp for the MHC matrix + base 1D
-    cube_size: int = 9              # volumetric cube axis for the 3D LUT
-    tube_size: int = 17             # neutral-axis core resolution
-    tube_radius: int = 2            # Manhattan radius of the neutral tube
-    neutral_steps: int = 17         # grey-axis ramp for the GS+WB tweak / gray-wb flow
+    All sets are drift-ordered by ``order`` (``thermal`` by default)."""
+
+    # raw ramp (MHC matrix + base 1D): grey + RGBCMY ramps
+    raw_ramp_steps: int = 17        # grey + RGBCMY ramp steps
+    raw_saturations: tuple[float, ...] = (1.0,)   # RGBCMY saturation shells (breadth)
+    raw_spacing: str = "uniform"    # uniform | perceptual (even-signal vs even-perceptual)
+
+    # volumetric set (3D LUT post-MHC + verify): how the cube interior is sampled
+    volumetric_mode: str = "tube"   # tube | cube | gamut
+    cube_size: int = 9              # volumetric cube axis
+    tube_size: int = 17             # neutral-axis core resolution (tube mode)
+    tube_radius: int = 2            # Manhattan radius of the neutral tube (tube mode)
+    grid_type: str = "cub"          # cub | bcc (tube/cube)
+    spines: bool = False            # tube: add RGBCMY gamut-edge spines
+    gamut_lum_steps: int = 17       # gamut mode: luminance axis
+    gamut_hues: int = 12            # gamut mode: hue angles per shell
+    gamut_lum_bias: float = 1.3     # gamut mode: shadow density bias
+
+    # neutral axis (GS+WB tweak / gray-wb flow)
+    neutral_steps: int = 17         # grey-axis ramp steps
+
+    # ordering for every stage (drift prevention)
+    order: str = "thermal"          # thermal | luminance | random
+
+    @classmethod
+    def from_dict(cls, raw: Optional[dict[str, Any]]) -> "PatchSizes":
+        """Build from a profile ``patches:`` block — only known keys, coerced to the
+        field types (saturations → tuple of floats); unknown keys are ignored."""
+        d = dict(raw or {})
+        kw: dict[str, Any] = {}
+        for f in fields(cls):
+            if f.name not in d or d[f.name] is None:
+                continue
+            v = d[f.name]
+            if f.name == "raw_saturations":
+                kw[f.name] = tuple(float(x) for x in v)
+            elif f.name in ("spines",):
+                kw[f.name] = bool(v)
+            elif f.name in ("gamut_lum_bias",):
+                kw[f.name] = float(v)
+            elif f.name in ("raw_spacing", "volumetric_mode", "grid_type", "order"):
+                kw[f.name] = str(v)
+            else:
+                kw[f.name] = int(v)
+        return cls(**kw)
+
+    def merged(self, **overrides: Any) -> "PatchSizes":
+        """Return a copy with only the **non-None** overrides applied (CLI flags that
+        were actually passed). ``raw_saturations`` is coerced to a tuple."""
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if "raw_saturations" in clean:
+            clean["raw_saturations"] = tuple(float(x) for x in clean["raw_saturations"])
+        return replace(self, **clean)
 
 
 @dataclass
@@ -683,15 +735,22 @@ class Calibration:
         self.target_name = target
         self.calib["target"] = target
         self._save()
-        digest = {"flow": self.calib.get("flow"), "target": target,
+        flow = self.calib.get("flow")
+        # Surface the run's SIZE up front (patch counts per measured stage), so the operator/LLM
+        # approves the plan knowing the time cost — and can abort + re-run with different patch
+        # flags if it's too long/short. This is the "no reservations about deciding time" lever.
+        patch_plan = self.flow_patch_counts(flow)
+        digest = {"flow": flow, "target": target,
                   "colorspace": spec.colorspace, "transfer": f"power γ{spec.gamma}",
                   "white": f"{spec.white.intent} ({spec.white.method})",
-                  "white_nits": spec.luminance_nits}
+                  "white_nits": spec.luminance_nits, "patch_plan": patch_plan}
         self._abort_if(self.adjudicate(AdjudicationRequest(
             key="resolve-target:plan", seam=SEAM_PLAN, stage="resolve-target",
-            question=(f"Plan: {self.calib.get('flow')} calibration of monitor {self.monitor} "
+            question=(f"Plan: {flow} calibration of monitor {self.monitor} "
                       f"({self.display.name}) to target '{target}' "
-                      f"(γ{spec.gamma}, {spec.white.intent}, {spec.luminance_nits:g} nits). Proceed?"),
+                      f"(γ{spec.gamma}, {spec.white.intent}, {spec.luminance_nits:g} nits) — "
+                      f"{patch_plan['total_patches']} patches "
+                      f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
         return StageOutcome("resolve-target", "done", digest=digest, data={"target": target})
@@ -1295,19 +1354,16 @@ class Calibration:
                         "reason": str(exc)})
 
     def _ramp_patches(self) -> list[tuple[int, int, int]]:
-        return ramp_patches(self._transfer(), steps=self.patch_sizes.raw_ramp_steps,
-                            saturations=(1.0,), order="thermal")
+        return build_ramp_set(self.patch_sizes, self._transfer())
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:
-        ps = self.patch_sizes
-        return tube_patches(self._transfer(), cube_size=ps.cube_size, tube_size=ps.tube_size,
-                            tube_radius=ps.tube_radius, order="thermal")
+        return build_volumetric_set(self.patch_sizes, self._transfer())
 
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
-        t = self._transfer()
-        steps = self.patch_sizes.neutral_steps
-        levels = [round(i * t.max_cv / (steps - 1)) for i in range(steps)]
-        return sort_patches([(v, v, v) for v in levels], "thermal", t)
+        return build_neutral_set(self.patch_sizes, self._transfer())
+
+    def flow_patch_counts(self, flow: str) -> dict[str, Any]:
+        return flow_patch_counts(flow, self.patch_sizes, self._transfer())
 
     def _finish(self, *, analysis: Optional[str] = None) -> CalibrationResult:
         rep = self.stage_report(analysis=analysis)
@@ -1479,6 +1535,70 @@ def _xy(xyz: Sequence[float]) -> tuple[float, float]:
     return (xyz[0] / total, xyz[1] / total)
 
 
+# ---------------------------------------------------------------------------
+# Patch-set builders — the one place a flow's stages turn PatchSizes + Transfer into
+# an actual sequence (module-level so a pre-run preview can size a run with no live
+# Calibration/controller/ctx). The orchestrator's stage builders just delegate here.
+# ---------------------------------------------------------------------------
+
+def build_ramp_set(ps: PatchSizes, transfer: Transfer) -> list[tuple[int, int, int]]:
+    """The MHC raw/verify ramp: grey + RGBCMY at each saturation shell."""
+    return ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
+                        spacing=ps.raw_spacing, order=ps.order)
+
+
+def build_volumetric_set(ps: PatchSizes, transfer: Transfer) -> list[tuple[int, int, int]]:
+    """The 3D-LUT sampling set. ``volumetric_mode`` picks HOW the cube interior is sampled:
+    a neutral-axis ``tube`` (default; dense where content lives), a uniform ``cube``, or a
+    content-weighted ``gamut`` shell set."""
+    if ps.volumetric_mode == "cube":
+        return cube_patches(transfer, size=ps.cube_size, order=ps.order)
+    if ps.volumetric_mode == "gamut":
+        return gamut_patches(transfer, lum_steps=ps.gamut_lum_steps, hues=ps.gamut_hues,
+                             lum_bias=ps.gamut_lum_bias, order=ps.order)
+    if ps.volumetric_mode != "tube":
+        raise ValueError(f"unknown volumetric_mode: {ps.volumetric_mode!r} (tube|cube|gamut)")
+    return tube_patches(transfer, cube_size=ps.cube_size, tube_size=ps.tube_size,
+                        tube_radius=ps.tube_radius, grid_type=ps.grid_type,
+                        spines=ps.spines, order=ps.order)
+
+
+def build_neutral_set(ps: PatchSizes, transfer: Transfer) -> list[tuple[int, int, int]]:
+    """The grey-axis ramp for the GS+WB tweak / gray-wb flow."""
+    n = ps.neutral_steps
+    levels = [round(i * transfer.max_cv / (n - 1)) for i in range(n)]
+    return sort_patches([(v, v, v) for v in levels], ps.order, transfer)
+
+
+# The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show
+# the run's size before any measurement). build-correction measures nothing through spotread.
+_FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
+    "full": ("raw", "post-mhc", "gray-wb", "verify-vol"),
+    "mhc-only": ("raw", "verify-ramp"),
+    "3dlut-only": ("post-mhc", "verify-vol"),
+    "gray-wb": ("gray-wb", "verify-neutral"),
+}
+_PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
+                   "post-mhc": build_volumetric_set, "verify-vol": build_volumetric_set,
+                   "gray-wb": build_neutral_set, "verify-neutral": build_neutral_set}
+
+
+def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer) -> dict[str, Any]:
+    """Per-stage patch counts for ``flow`` from a PatchSizes + Transfer — the run's size, so
+    the agent/user can judge time/cost up front. Cheap (pure-stdlib generation); each distinct
+    builder is generated once."""
+    roles = _FLOW_PATCH_STAGES.get(flow, ())
+    cache: dict[Any, int] = {}
+    stages: dict[str, int] = {}
+    for role in roles:
+        fn = _PATCH_BUILDERS[role]
+        if fn not in cache:
+            cache[fn] = len(fn(ps, transfer))
+        stages[role] = cache[fn]
+    return {"stages": stages, "total_patches": sum(stages.values()),
+            "volumetric_mode": ps.volumetric_mode, "order": ps.order}
+
+
 def _measured_primaries(params: Optional[dict[str, float]], white_xy: tuple[float, float]) -> MeasuredPrimaries:
     p = params or {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06}
     return MeasuredPrimaries(rx=p["rx"], ry=p["ry"], gx=p["gx"], gy=p["gy"], bx=p["bx"], by=p["by"],
@@ -1610,9 +1730,37 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--run", type=Path, default=None, help="run dir (resume an existing run)")
     parser.add_argument("--profile", type=Path, default=None)
     parser.add_argument("--bit-depth", type=int, default=None, dest="bit_depth")
-    parser.add_argument("--raw-steps", type=int, default=None, dest="raw_steps",
-                        help="override the raw/verify ramp step count (MHC patch density; "
-                             "default 17 ≈ 113 patches). Lower ⇒ shorter shakedown run.")
+
+    # ---- Patch sequence / run-size control (override the profile's `patches:` block) -------
+    # Every flag is default=None ⇒ "not set" (keep the profile value, else the built-in
+    # default), so a run is never stuck with a preset. --preview-patches prints the resulting
+    # per-stage patch counts and exits, so the size/time can be decided BEFORE measuring.
+    patch = parser.add_argument_group("patch sequence (run size/time — overrides profile patches:)")
+    patch.add_argument("--raw-steps", type=int, default=None, dest="raw_ramp_steps",
+                       help="grey + RGBCMY ramp steps (MHC density; default 17).")
+    patch.add_argument("--raw-saturations", type=float, nargs="+", default=None, dest="raw_saturations",
+                       help="RGBCMY saturation shells, e.g. 1.0 0.5 0.25 (default 1.0).")
+    patch.add_argument("--raw-spacing", choices=["uniform", "perceptual"], default=None, dest="raw_spacing")
+    patch.add_argument("--volumetric-mode", choices=["tube", "cube", "gamut"], default=None,
+                       dest="volumetric_mode", help="how the 3D-LUT set samples the cube (default tube).")
+    patch.add_argument("--cube-size", type=int, default=None, dest="cube_size",
+                       help="volumetric cube axis (default 9).")
+    patch.add_argument("--tube-size", type=int, default=None, dest="tube_size")
+    patch.add_argument("--tube-radius", type=int, default=None, dest="tube_radius")
+    patch.add_argument("--grid-type", choices=["cub", "bcc"], default=None, dest="grid_type")
+    patch.add_argument("--spines", action="store_true", default=None,
+                       help="tube: add RGBCMY gamut-edge spines.")
+    patch.add_argument("--gamut-lum-steps", type=int, default=None, dest="gamut_lum_steps")
+    patch.add_argument("--gamut-hues", type=int, default=None, dest="gamut_hues")
+    patch.add_argument("--gamut-lum-bias", type=float, default=None, dest="gamut_lum_bias")
+    patch.add_argument("--neutral-steps", type=int, default=None, dest="neutral_steps",
+                       help="grey-axis ramp steps for GS+WB / gray-wb (default 17).")
+    patch.add_argument("--patch-order", choices=["thermal", "luminance", "random"], default=None,
+                       dest="order", help="patch ordering — thermal (drift-safe) default.")
+    patch.add_argument("--preview-patches", action="store_true", dest="preview_patches",
+                       help="print the per-stage patch counts for the flow (the run's size) and exit, "
+                            "WITHOUT measuring — decide the time/size first.")
+
     parser.add_argument("--dogegen-server", default=None, dest="dogegen_server",
                         metavar="HOST:PORT",
                         help="drive a PERSISTENT dogegen daemon (dlc.dogegen_server) over a local "
@@ -1638,6 +1786,27 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     args = parser.parse_args(argv)
 
     profile = cp.load_profile(args.profile)
+
+    # The run's patch plan: the profile's `patches:` defaults, overridden by any patch CLI
+    # flags (each default=None ⇒ unset). One source of run size for both preview and the run,
+    # so a run is never stuck with a preset sequence.
+    patch_sizes = PatchSizes.from_dict(profile.patches).merged(
+        **{f.name: getattr(args, f.name, None) for f in fields(PatchSizes)})
+
+    if args.preview_patches:
+        # Decide the time/size BEFORE committing: print the per-stage patch counts for the flow
+        # and exit. Pure offline sizing — no run folder, controller, dogegen, or meter.
+        mode = normalize_mode(args.mode)
+        bd = args.bit_depth if args.bit_depth is not None else (10 if mode == "HDR" else 8)
+        target = profile.display_for(args.monitor).target_name(mode)
+        out: dict[str, Any] = {"flow": args.flow, "monitor": args.monitor, "mode": mode,
+                               "patch_sizes": asdict(patch_sizes)}
+        out["patch_plan"] = (flow_patch_counts(args.flow, patch_sizes,
+                                               profile.transfer_for(target, bit_depth=bd))
+                             if target else {"note": f"no {mode} target for monitor {args.monitor}"})
+        print(json.dumps(out, indent=2))
+        return 0
+
     ctx = open_run(args.run) if args.run and (args.run / "manifest.json").exists() \
         else create_run(normalize_mode(args.mode), display=profile.display_for(args.monitor).name,
                         run_dir=args.run)
@@ -1731,7 +1900,6 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
                                           output_dir=ctx.root / "measurements" / "probe",
                                           ccmx_or_ccss=ccmx)
-    patch_sizes = PatchSizes(raw_ramp_steps=args.raw_steps) if args.raw_steps else None
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
