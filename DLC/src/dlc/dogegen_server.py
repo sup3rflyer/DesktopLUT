@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import argparse
 import socket
+import time
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from .dogegen import DogegenPatchDisplay
+from .dogegen_resolve import ResolveDogegen
 from .dogegen_window import Rect, place_dogegen, resolve_monitor_rect
 
 
@@ -54,7 +56,8 @@ def dispatch(cmd: str, *, show: Callable[[int, int, int], None]) -> Tuple[str, b
 
 def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
           patch_size: int = 100, monitor_rect: Optional[Rect] = None,
-          auto_fullscreen: bool = True) -> None:
+          auto_fullscreen: bool = True, resolve: bool = False,
+          resolve_port: int = 20002) -> None:
     """Start one dogegen window and serve patch commands until ``quit`` (blocking).
 
     The window is borderless-fullscreened automatically onto ``monitor_rect`` (the persistent
@@ -64,10 +67,48 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
     composition globally, so bit-accurate characterization needs that hook inactive. When
     ``monitor_rect`` is ``None`` the window lands on dogegen's own monitor (the Windows primary);
     pass the DLC target monitor's rect to hit a non-primary panel. If auto-placement fails, fall
-    back to the manual Alt+Enter prompt."""
-    disp = DogegenPatchDisplay(Path(dogegen_path), mode, bit_depth=bit_depth)
-    proc = disp.start()  # the D3D11 patch window appears on the primary display
-    print(f"[dogegen-server] dogegen up ({disp.startup_mode}) pid {proc.pid}", flush=True)
+    back to the manual Alt+Enter prompt.
+
+    ``resolve=True`` drives dogegen over its **Resolve TPG protocol** (:mod:`dlc.dogegen_resolve`)
+    instead of the stdin ``window`` path. The stdin path deterministically stalls dogegen's present
+    pipeline under a long continuous full-field HDR session (a display freeze at ~23 min, ~12 min
+    with the DWM hook forcing composition) — reproduced across dogegen builds, no handle leak, no
+    GPU TDR. The Resolve path (what ColourSpace/DisplayCAL/Calman drive for hours) does not freeze;
+    HW-validated 28 min clean. The orchestrator-facing line protocol on ``host:port`` is identical
+    either way — only how the daemon talks to dogegen changes."""
+    if resolve:
+        rdg = ResolveDogegen(Path(dogegen_path), is_hdr=(mode.upper() == "HDR"),
+                             bits=bit_depth, port=resolve_port)
+        proc = rdg.start()                 # we listen, launch dogegen, accept its connection
+        print(f"[dogegen-server] dogegen up via Resolve ({rdg.startup_command}) pid {proc.pid}",
+              flush=True)
+        mid = ((1 << bit_depth) - 1) // 2
+        rdg.show(mid, mid, mid)            # first pattern switches dogegen into the target depth/HDR
+        time.sleep(1.0)                    # let the mode switch + swapchain settle before fullscreen
+
+        def show(r: int, g: int, b: int) -> None:
+            rdg.show(r, g, b)
+
+        def teardown() -> None:
+            rdg.close()
+    else:
+        disp = DogegenPatchDisplay(Path(dogegen_path), mode, bit_depth=bit_depth)
+        proc = disp.start()  # the D3D11 patch window appears on the primary display
+        print(f"[dogegen-server] dogegen up ({disp.startup_mode}) pid {proc.pid}", flush=True)
+
+        def show(r: int, g: int, b: int) -> None:
+            disp.send(proc, f"window {patch_size} {r} {g} {b}", settle_seconds=0.0)
+
+        def teardown() -> None:
+            try:
+                disp.send(proc, "quit", settle_seconds=0.1)
+                proc.wait(timeout=2)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.terminate()
+                except Exception:  # noqa: BLE001
+                    pass
+
     placed = place_dogegen(proc.pid, rect=monitor_rect, fullscreen=True) if auto_fullscreen \
         else {"ok": False, "reason": "auto-fullscreen disabled"}
     if placed.get("ok"):
@@ -77,9 +118,6 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
         print(f"[dogegen-server] auto-fullscreen unavailable ({placed.get('reason')})", flush=True)
         print("[dogegen-server] >>> click the patch window and press Alt+Enter to FULLSCREEN it "
               "on monitor 0, then leave it <<<", flush=True)
-
-    def show(r: int, g: int, b: int) -> None:
-        disp.send(proc, f"window {patch_size} {r} {g} {b}", settle_seconds=0.0)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -118,14 +156,7 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
                             done = True
                             break
     finally:
-        try:
-            disp.send(proc, "quit", settle_seconds=0.1)
-            proc.wait(timeout=2)
-        except Exception:  # noqa: BLE001
-            try:
-                proc.terminate()
-            except Exception:  # noqa: BLE001
-                pass
+        teardown()
         srv.close()
         print("[dogegen-server] stopped", flush=True)
 
@@ -166,6 +197,12 @@ def main(argv=None) -> int:  # pragma: no cover - live wiring
                     help='Explicit target bounds "x,y,w,h" (overrides --monitor; no pipe needed).')
     ap.add_argument("--no-auto-fullscreen", action="store_false", dest="auto_fullscreen",
                     help="Disable auto-fullscreen and prompt for a manual Alt+Enter instead.")
+    ap.add_argument("--resolve", action="store_true",
+                    help="Drive dogegen over its Resolve TPG protocol instead of the stdin "
+                         "'window' path. Required for long HDR runs: the stdin path freezes "
+                         "dogegen's present pipeline after ~12-23 min; the Resolve path does not.")
+    ap.add_argument("--resolve-port", type=int, default=20002, dest="resolve_port",
+                    help="TCP port the daemon listens on for dogegen's Resolve connection (default 20002).")
     a = ap.parse_args(argv)
     rect: Optional[Rect] = None
     if a.monitor_rect:
@@ -174,7 +211,8 @@ def main(argv=None) -> int:  # pragma: no cover - live wiring
         rect = _rect_for_monitor(a.monitor)
     serve(dogegen_path=a.dogegen, mode=a.mode, bit_depth=a.bit_depth,
           host=a.host, port=a.port, patch_size=a.patch_size,
-          monitor_rect=rect, auto_fullscreen=a.auto_fullscreen)
+          monitor_rect=rect, auto_fullscreen=a.auto_fullscreen,
+          resolve=a.resolve, resolve_port=a.resolve_port)
     return 0
 
 
