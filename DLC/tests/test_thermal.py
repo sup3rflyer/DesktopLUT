@@ -121,6 +121,28 @@ def test_wandering_panel_classified_fluctuating():
     assert res.fluctuation_envelope > res.drift_threshold
 
 
+def test_threshold_self_calibrates_when_balance_noise_absent():
+    """With no balance_noise supplied, the controller estimates its drift threshold from the
+    within-block reference-read scatter (read noise) and still converges with warm-in observed."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    panel = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,
+                           load_thermal=True, thermal_rate=0.06, start_temp=0.0, noise=0.004, seed=11)
+    clock = _Clock()
+
+    def measure(patch: MeasurePatch) -> Reading:
+        clock.tick(); return panel(patch)
+
+    ctrl = ThermalController(measure=measure, transfer=transfer, content=_grey_content(transfer),
+                             ref_nits=60.0, balance_noise=None,   # <- self-calibrate
+                             config=ThermalConfig(load_reads_per_block=8, ref_reads=5, max_blocks=240),
+                             clock=clock)
+    res = ctrl.run()
+    assert res.converged, res.flags
+    assert res.drift_threshold >= 0.003          # at least the floor
+    assert res.active_channel == "B"
+    assert res.warmin_magnitude > 0.0
+
+
 def test_thermal_block_records_are_emitted():
     transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
     panel = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,

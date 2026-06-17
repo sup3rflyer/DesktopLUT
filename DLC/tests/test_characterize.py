@@ -291,61 +291,71 @@ def test_display_name_is_stamped_through():
 # ---------------------------------------------------------------------------
 
 def _thermal_cfg(**kw) -> CharacterizeConfig:
+    # warmup_max_minutes>0 RUNS the (now closed-loop) thermal phase; small block/read counts keep
+    # the synthetic run snappy. The warm-in signal is injected on the neutral-reference reads.
     base = dict(noise_levels=(1.0,), noise_reads=2, black_reads=1, primary_reads=1,
-                settle_levels={"bright": 1.0}, creep_reads=2,
-                warmup_max_minutes=0.05, warmup_window_reads=4, warmup_stable_windows=2)
+                settle_levels={"bright": 1.0}, creep_reads=2, warmup_max_minutes=0.05,
+                thermal_load_reads_per_block=4, thermal_ref_reads=4,
+                thermal_window_blocks=5, thermal_max_blocks=40)
     base.update(kw)
     return CharacterizeConfig(**base)
 
 
+def _bal_xyz(blue: float, lum: float = 30.0):
+    """An XYZ at luminance ~``lum`` whose normalized channel balance is (1, 1, ``blue``) — the
+    handle the thermal controller's warm-in sensor reads. Lets a test drive a chosen blue-balance
+    trajectory through normalized_channels without touching luminance."""
+    from dlc.measure_loop import _SRGB_TO_XYZ_D65 as M
+    x = M[0][0] + M[0][1] + M[0][2] * blue
+    y = M[1][0] + M[1][1] + M[1][2] * blue
+    z = M[2][0] + M[2][1] + M[2][2] * blue
+    s = lum / y if y > 0 else 1.0
+    return (x * s, y * s, z * s)
+
+
 def test_thermal_regime_convergent_on_warm_panel():
-    # A warm, stable panel reaches steady temperature → convergent, with a recorded warm-up time.
+    # A warm, stable panel reads in-band immediately → convergent, with a recorded warm-up time.
     res = run_characterization(measure=_perfect_panel(), transfer=_transfer(),
                                config=_thermal_cfg(warmup_max_minutes=2.0), clock=_FakeClock())
     assert res.dip.thermal_regime == "convergent"
     assert res.dip.warmup_minutes is not None
-    assert not any("steady" in f or "warming" in f for f in res.flags)
+    assert not any("DYNAMIC" in f or "warming" in f for f in res.flags)
 
 
 def test_thermal_regime_fluctuating_detected():
-    # A panel that bounces (high gross motion, ~0 net drift) never settles → FLUCTUATING (HDR-like):
-    # the DIP marks it, recommends frequent re-referencing, and flags the maintain-load strategy.
-    import math
+    # A panel whose neutral balance WANDERS (high gross, ~0 net) never settles → FLUCTUATING
+    # (HDR-like): the DIP marks it, recommends frequent re-referencing + the maintain-load strategy.
     from dlc.measure_loop import Reading
-    base = _perfect_panel()
     n = {"i": 0}
 
     def osc(patch):
-        r = base(patch)
-        if patch.label == "thermal_white" and r.xyz:
-            n["i"] += 1
-            f = 1.0 + 0.04 * math.sin(n["i"] * 1.3)
-            x, y, z = r.xyz
-            return Reading(xyz=(x * f, y * f, z * f), yxy=r.yxy, ok=True)
-        return r
+        if patch.role == "neutral_ref":
+            i = n["i"]; n["i"] += 1
+            swing = 0.05 if (i // 4) % 2 == 0 else -0.05  # ALTERNATES per block (4 ref reads/block) →
+            noise = 0.0015 * (((i * 7) % 3) - 1)          # reverses within the window: high gross, ~0 net
+            return Reading(xyz=_bal_xyz(0.90 + swing + noise))
+        return Reading(xyz=_bal_xyz(0.90))              # load reads: neutral, no heating in the synthetic
 
     res = run_characterization(measure=osc, transfer=_transfer(), config=_thermal_cfg(), clock=_FakeClock())
     assert res.dip.thermal_regime == "fluctuating"
     assert res.dip.recommended_neutral_interval == 4      # no steady state → aggressive drift checks
     assert res.dip.warmup_minutes is None                 # no warm-up target exists
+    assert res.dip.fluctuation_envelope and res.dip.fluctuation_envelope > 0.0
     assert res.needs_adjudication is True
-    assert any("steady temperature" in f for f in res.flags)
+    assert any("DYNAMIC" in f or "maintain a consistent load" in f for f in res.flags)
 
 
 def test_thermal_regime_warming_when_monotonic_and_unsettled():
-    # A panel still drifting in ONE direction at the bound is 'warming' (net≈gross), not fluctuating.
+    # A neutral balance still climbing in ONE direction at the bound is 'warming' (net≈gross).
     from dlc.measure_loop import Reading
-    base = _perfect_panel()
     n = {"i": 0}
 
     def warming(patch):
-        r = base(patch)
-        if patch.label == "thermal_white" and r.xyz:
-            n["i"] += 1
-            f = 1.0 + 0.02 * n["i"]            # monotonic upward drift, never settles
-            x, y, z = r.xyz
-            return Reading(xyz=(x * f, y * f, z * f), yxy=r.yxy, ok=True)
-        return r
+        if patch.role == "neutral_ref":
+            i = n["i"]; n["i"] += 1
+            noise = 0.0010 * (((i * 5) % 3) - 1)
+            return Reading(xyz=_bal_xyz(0.80 + 0.004 * (i // 4) + noise))   # monotonic per-block climb
+        return Reading(xyz=_bal_xyz(0.80))
 
     res = run_characterization(measure=warming, transfer=_transfer(), config=_thermal_cfg(), clock=_FakeClock())
     assert res.dip.thermal_regime == "warming"

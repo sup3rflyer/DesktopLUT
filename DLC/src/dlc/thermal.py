@@ -51,6 +51,14 @@ __all__ = ["ThermalConfig", "ThermalResult", "net_over_gross", "ThermalControlle
 Clock = Callable[[], float]
 
 
+def _pstd(xs: Sequence[float]) -> float:
+    """Population standard deviation (the read-to-read scatter of a held stimulus)."""
+    if len(xs) < 2:
+        return 0.0
+    m = sum(xs) / len(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+
+
 def net_over_gross(series: Sequence[float]) -> tuple[float, float, Optional[float]]:
     """For a 1-D series: ``net`` (|last − first|, the directional drift), ``gross``
     (Σ|consecutive Δ|, the total motion), and ``net/gross`` (→1 directional, →0 oscillating;
@@ -144,8 +152,10 @@ class ThermalController:
         return MeasurePatch(label="thermal_ref", rgb=rgb_t, signal=sig,
                             role="neutral_ref", bit_depth=self.transfer.bit_depth)
 
-    def _read_ref(self) -> Optional[dict[Channel, float]]:
-        """Read the fixed neutral sensor ``ref_reads`` times; return the mean channel balance."""
+    def _read_ref(self) -> tuple[Optional[dict[Channel, float]], list[dict[Channel, float]]]:
+        """Read the fixed neutral sensor ``ref_reads`` times (back-to-back, same temperature).
+        Return the mean channel balance AND the per-read balances — the within-block scatter is
+        the read noise the threshold self-calibrates from when ``balance_noise`` isn't supplied."""
         ref = self._ref_patch()
         xyzs = []
         for _ in range(max(1, self.cfg.ref_reads)):
@@ -153,19 +163,19 @@ class ThermalController:
             if r.xyz is not None:
                 xyzs.append(r.xyz)
         if not xyzs:
-            return None
+            return None, []
         n = len(xyzs)
         mean = (sum(v[0] for v in xyzs) / n, sum(v[1] for v in xyzs) / n, sum(v[2] for v in xyzs) / n)
-        bal = normalized_channels(mean)
         # carry absolute ref nits for the digest via attribute side-channel
         self._last_ref_nits = mean[1]
-        return bal
+        return normalized_channels(mean), [normalized_channels(v) for v in xyzs]
 
     # -- the closed loop --------------------------------------------------
     def run(self) -> ThermalResult:
         cfg = self.cfg
         threshold = max(cfg.drift_floor,
                         cfg.drift_sigma_mult * self.balance_noise) if self.balance_noise else cfg.drift_floor
+        noise_blocks: list[float] = []                    # within-block ref-read scatter (self-calibration)
         history: list[dict[Channel, float]] = []          # ref channel balance per block
         first_bal: Optional[dict[Channel, float]] = None
         k = 1.0      # start at operating load; the loop raises k to SOAK only when it MEASURES warm-in
@@ -190,7 +200,7 @@ class ThermalController:
                 ci += 1
                 content_reads += 1
             # --- PROBE: the fixed neutral warm-in sensor ---
-            bal = self._read_ref()
+            bal, per_read = self._read_ref()
             now = self.clock()
             if t0 is None:
                 t0 = now
@@ -200,6 +210,15 @@ class ThermalController:
             if first_bal is None:
                 first_bal = bal
             history.append(bal)
+            # Self-calibrate the threshold from the within-block read scatter (read noise at a
+            # fixed temperature) when no balance_noise was supplied — so the gate is keyed to THIS
+            # panel+meter's noise, never a hardcoded constant. Estimated once, after a couple blocks.
+            if self.balance_noise is None and len(per_read) >= 2:
+                block_sigma = max(_pstd([b[ch] for b in per_read]) for ch in CHANNELS)
+                noise_blocks.append(block_sigma)
+                if len(noise_blocks) == 2:
+                    est = sum(noise_blocks) / len(noise_blocks)
+                    threshold = max(cfg.drift_floor, cfg.drift_sigma_mult * est)
             window = history[-cfg.window_blocks:]
             # net/gross per channel over the window; the active channel is the biggest mover.
             net_active = gross_active = 0.0
@@ -259,13 +278,19 @@ class ThermalController:
                 envelope = max(envelope, max(vals) - min(vals))
         if not converged:
             regime = "fluctuating" if (ratio is not None and ratio < cfg.net_gross_ratio) else "warming"
+        # Flag by regime, NOT just by (non-)convergence: a fluctuating panel that "converges" (a
+        # bounded wander) is the fluctuating STEADY STATE and still needs the maintain-load strategy,
+        # so it's surfaced too. A convergent panel is clean (no flag).
+        if regime == "fluctuating":
+            flags.append(
+                f"panel never reaches a steady temperature (net/gross {ratio}, residual band "
+                f"{round(envelope, 5)}) — thermally DYNAMIC: calibrate by maintaining a consistent "
+                "thermal load (golden-ratio order) + aggressive drift checks, not by warming to a target")
+        elif not converged:   # warming
             flags.append(
                 f"panel did not thermally converge within {cfg.max_blocks} blocks "
-                f"(regime {regime}, net {net_active:.4f} vs threshold {threshold:.4f}, "
-                f"net/gross {ratio}) — " + (
-                    "thermally DYNAMIC: maintain a consistent load + drift-check aggressively"
-                    if regime == "fluctuating" else
-                    "still warming; warm longer / inject more heat"))
+                f"(net {net_active:.4f} vs threshold {threshold:.4f}) — still warming; "
+                "warm longer / inject more heat")
         needs = bool(flags)
         question = None
         if needs:

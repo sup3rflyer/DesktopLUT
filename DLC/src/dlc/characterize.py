@@ -94,13 +94,23 @@ class CharacterizeConfig:
     # -- drift: responsive warm-up + thermal-regime characterization -----
     warmup_observe_reads: int = 60      # responsive warm-up bound; exceeding it FLAGS (never a silent cap)
     warmup_settle_threshold: float = 0.003   # channel-balance Δ for the responsive warm-up (normalized space)
-    # thermal regime (hold white; classify convergent / fluctuating / warming from the data) ---
-    warmup_stable_de_per_min: float = 0.15   # windowed creep below this (sustained) ⇒ thermally stable
-    warmup_window_reads: int = 8             # sliding window over which the creep rate is estimated
-    warmup_stable_windows: int = 3           # consecutive in-tolerance windows ⇒ stable (sustained)
-    warmup_max_minutes: float = 30.0         # thermal observation bound; exceeding it FLAGS. 0 ⇒ skip thermal.
-    warmup_max_reads: int = 5000             # runaway backstop (wall-bound trips first on real HW; ~70 min @0.85s)
-    fluctuation_ratio: float = 0.35          # net/gross drift below this at the bound ⇒ FLUCTUATING (no steady state)
+    # thermal regime — the CLOSED-LOOP controller (dlc.thermal): drive diverse golden-ratio
+    # content scaled to a higher luminance to inject heat, glide back to operating load, and
+    # classify convergent / fluctuating / warming from the net-vs-gross of the warm-in drift.
+    # ``warmup_max_minutes`` is retained only as the run/skip toggle (0 ⇒ skip thermal); the real
+    # observation bound is ``thermal_max_blocks``. The other ``warmup_*`` / ``fluctuation_ratio``
+    # below are legacy (the old static-hold phase) — kept so the ``--char-*`` CLI mapping is stable.
+    warmup_max_minutes: float = 30.0         # >0 ⇒ run the thermal phase; 0 ⇒ skip it
+    thermal_load_reads_per_block: int = 12   # scaled-content reads per block (the heat per block)
+    thermal_ref_reads: int = 5               # neutral-sensor reads per block (warm-in + noise self-cal)
+    thermal_window_blocks: int = 5           # sliding window for the net/gross convergence judgement
+    thermal_max_blocks: int = 240            # block observation bound; exceeding it FLAGS (never a cap)
+    thermal_k_start: float = 1.6             # SOAK luminance scale while warm-in is still measured
+    warmup_stable_de_per_min: float = 0.15   # (legacy) windowed creep below this ⇒ thermally stable
+    warmup_window_reads: int = 8             # (legacy) sliding window for the creep rate
+    warmup_stable_windows: int = 3           # (legacy) consecutive in-tolerance windows ⇒ stable
+    warmup_max_reads: int = 5000             # (legacy) runaway backstop for the static-hold phase
+    fluctuation_ratio: float = 0.35          # (legacy) net/gross below this ⇒ fluctuating
     creep_reads: int = 12               # post-warm reference reads to estimate residual creep
     creep_dwell_s: float = 0.0          # optional extra dwell between creep reads (real runs: spread the window)
 
@@ -287,100 +297,65 @@ class _Characterizer:
         return {"settled": settled, "reads": reads, "cold_channel": loop.cold_channel,
                 "reference_xyz": list(loop.reference_xyz) if loop.reference_xyz else None}
 
-    # -- drift: thermal regime (hold white; convergent / fluctuating / warming) ----
+    # -- drift: thermal regime via the CLOSED-LOOP controller (dlc.thermal) ----
     def thermal_characterize(self) -> dict[str, Any]:
-        """Hold white and watch the panel's thermal behaviour until it STABILISES or the
-        observation bound is hit, then CLASSIFY the regime from the data (never assume it). The
-        panel can take minutes to warm and — in HDR especially — may never reach a steady
-        temperature at all, so the goal isn't always "warm to a target":
+        """Drive the :class:`~dlc.thermal.ThermalController`: diverse golden-ratio content scaled
+        to a higher luminance to inject heat (``soak`` while the warm-in is still measured),
+        gliding back to operating load and classifying the regime from the net-vs-gross of the
+        warm-in drift — instead of holding a static white field (which can't reproduce the
+        content-driven HDR dynamics, only warms the white point, and risks blasting peak):
 
-        * **convergent** — windowed creep decays below ``warmup_stable_de_per_min`` (sustained):
-          a steady temperature exists; record the wall-time to reach it. (SDR.)
-        * **fluctuating** — at the bound, lots of motion but little NET drift (``net/gross`` below
-          ``fluctuation_ratio``): content/backlight-driven, no steady state — calibrate by
-          MAINTAINING a consistent thermal load (thermal/golden-ratio patch order), not by warming
-          to a target. (HDR.)
-        * **warming** — at the bound, drift still largely directional (net ≈ gross): simply slow;
-          warm longer.
+        * **convergent** — warm-in settles in-band with little residual motion (SDR).
+        * **fluctuating** — net stays in-band but gross is large: wanders, no steady state — HDR;
+          calibrate by maintaining a consistent thermal load + frequent drift checks.
+        * **warming** — net stays directional at the bound: still ramping; warm longer.
 
-        Net-vs-gross can't false-positive "fluctuating" in SDR because warming drift is directional
-        (net ≈ gross). Flag-don't-cap: a non-convergent regime is FLAGGED (with the regime) and the
-        run proceeds. ``warmup_max_minutes <= 0`` skips the thermal phase (quick runs)."""
+        Self-activating (a warm panel needs no soak), direction-aware (no sawtooth / over-heat),
+        and the convergence threshold self-calibrates from the reference read scatter (no
+        ``balance_noise`` exists yet — the noise phase runs after this). ``warmup_max_minutes <= 0``
+        skips the phase entirely. Flag-don't-cap: a non-convergent panel is FLAGGED with its
+        regime, never silently truncated."""
         cfg = self.cfg
         if cfg.warmup_max_minutes <= 0:
-            return {"regime": None, "stable": False, "skipped": True, "minutes": 0.0,
-                    "reads": 0, "final_creep_de_per_min": None, "net_over_gross": None}
-        patch = self._patch(1.0, label="thermal_white", role="warmup")
-        window: list[tuple[float, tuple[float, float, float]]] = []
-        all_reads: list[tuple[float, float, float]] = []     # every usable read (for net/gross)
-        t0: Optional[float] = None
-        stable_windows = 0
-        stable = False
-        creep_rate: Optional[float] = None
-        reads = 0
-        bound_s = cfg.warmup_max_minutes * 60.0
-        while True:
-            reading, _dt = self._read(patch, phase="char:thermal", read_index=reads)
-            reads += 1
-            if reading.xyz is not None:
-                now = self.clock()
-                if t0 is None:
-                    t0 = now
-                all_reads.append(reading.xyz)
-                window.append((now, reading.xyz))
-                if len(window) > cfg.warmup_window_reads:
-                    window.pop(0)
-                if len(window) >= cfg.warmup_window_reads:
-                    t_start, xyz_start = window[0]
-                    span_min = (now - t_start) / 60.0
-                    if span_min > 1e-9:
-                        anchor = self.white_xyz or reading.xyz
-                        de = delta_e2000(xyz_to_lab(reading.xyz, anchor), xyz_to_lab(xyz_start, anchor))
-                        creep_rate = de / span_min
-                        if creep_rate <= cfg.warmup_stable_de_per_min:
-                            stable_windows += 1
-                        else:
-                            stable_windows = 0
-                        if stable_windows >= cfg.warmup_stable_windows:
-                            stable = True
-                            break
-            # Wall-clock bound (the real bound on HW); the reads bound is a runaway backstop for an
-            # instant-read environment where wall-clock alone would spin.
-            if (t0 is not None and (self.clock() - t0) >= bound_s) or reads >= cfg.warmup_max_reads:
-                break
-        minutes = round((self.clock() - t0) / 60.0, 4) if t0 is not None else 0.0
-        # Classify the regime from net-vs-gross drift over the whole observation.
-        net_over_gross: Optional[float] = None
-        if stable:
-            regime = "convergent"
-        else:
-            anchor = self.white_xyz or (all_reads[-1] if all_reads else None)
-            regime = "warming"
-            if anchor and len(all_reads) >= 3:
-                labs = [xyz_to_lab(r, anchor) for r in all_reads]
-                net = delta_e2000(labs[0], labs[-1])
-                gross = sum(delta_e2000(labs[i], labs[i + 1]) for i in range(len(labs) - 1))
-                net_over_gross = round(net / gross, 4) if gross > 1e-9 else None
-                if net_over_gross is not None and net_over_gross < cfg.fluctuation_ratio:
-                    regime = "fluctuating"
-            if regime == "fluctuating":
-                self.flags.append(
-                    f"panel never reaches a steady temperature (net/gross drift {net_over_gross}) — "
-                    "thermally DYNAMIC: calibrate by maintaining a consistent thermal load "
-                    "(thermal/golden-ratio patch order) + aggressive drift checks, not by warming to a target")
-            else:
-                self.flags.append(
-                    f"panel did not thermally stabilize within {cfg.warmup_max_minutes:g} min"
-                    + (f" (creep still ~{creep_rate:.2f} dE/min)" if creep_rate is not None else "")
-                    + " — still warming; calibration should warm longer / drift-check aggressively")
-        self._emit_event("INFO" if stable else "WARN", "thermal_regime", regime=regime,
-                         stable=stable, minutes=minutes, reads=reads,
-                         final_creep_de_per_min=(round(creep_rate, 4) if creep_rate is not None else None),
-                         net_over_gross=net_over_gross)
-        return {"regime": regime, "stable": stable, "skipped": False, "minutes": minutes,
-                "reads": reads,
-                "final_creep_de_per_min": (round(creep_rate, 4) if creep_rate is not None else None),
-                "net_over_gross": net_over_gross}
+            return {"regime": None, "skipped": True, "minutes": 0.0, "reads": 0,
+                    "final_creep_de_per_min": None, "net_over_gross": None,
+                    "fluctuation_envelope": None, "warmin_magnitude": None, "active_channel": None}
+        from .thermal import ThermalController, ThermalConfig
+        max_cv = self.transfer.max_cv
+        # Diverse content: a grey ramp (luminance/power diversity) + R/G/B (channel exercise);
+        # the controller golden-ratio-orders it so the running average load is held steady.
+        greys = [round(s * max_cv) for s in (0.12, 0.22, 0.35, 0.5, 0.68, 0.85, 1.0)]
+        content = [(g, g, g) for g in greys]
+        hi = round(0.7 * max_cv)
+        content += [(hi, 0, 0), (0, hi, 0), (0, 0, hi)]
+        ref_nits = self.transfer.cv_to_nits(round(0.5 * max_cv))
+        tcfg = ThermalConfig(
+            load_reads_per_block=cfg.thermal_load_reads_per_block,
+            ref_reads=cfg.thermal_ref_reads,
+            window_blocks=cfg.thermal_window_blocks,
+            max_blocks=cfg.thermal_max_blocks,
+            k_start=cfg.thermal_k_start,
+            drift_floor=cfg.warmup_settle_threshold,
+        )
+        ctrl = ThermalController(
+            measure=self.measure, transfer=self.transfer, content=content, ref_nits=ref_nits,
+            balance_noise=self.balance_noise,   # None here ⇒ the controller self-calibrates
+            config=tcfg, clock=self.clock,
+            emit=self.ndjson.emit, event=self._emit_event,
+        )
+        res = ctrl.run()
+        self.flags.extend(res.flags)
+        if res.active_channel and not self.cold_channel:
+            self.cold_channel = res.active_channel   # the biggest thermal mover = the cold channel
+        return {"regime": res.regime, "skipped": False,
+                "minutes": res.warmup_minutes or 0.0, "reads": res.content_reads,
+                "final_creep_de_per_min": None,
+                "net_over_gross": res.digest.get("net_over_gross"),
+                "fluctuation_envelope": res.fluctuation_envelope,
+                "warmin_magnitude": res.warmin_magnitude,
+                "active_channel": res.active_channel,
+                "drift_threshold": res.drift_threshold,
+                "converged": res.converged}
 
     # -- instrument: noise vs luminance ----------------------------------
     def noise_model(self) -> tuple[list[NoiseBand], dict[str, Any]]:
@@ -647,11 +622,14 @@ def run_characterization(
         native_primaries=native.get("primaries"),
         warmup_reads_to_settle=(warm.get("reads") if warm.get("settled") else None),
         warmup_minutes=(thermal.get("minutes") if thermal.get("regime") == "convergent" else None),
+        fluctuation_envelope=thermal.get("fluctuation_envelope"),
+        warmin_magnitude=thermal.get("warmin_magnitude"),
         thermal_regime=thermal.get("regime"),
         cold_channel=ch.cold_channel,
         creep_rate_de_per_min=creep.get("creep_rate_de_per_min"),
         recommended_neutral_interval=rec.get("recommended_neutral_interval"),
-        recommended_drift_threshold=rec.get("recommended_drift_threshold"),
+        recommended_drift_threshold=(rec.get("recommended_drift_threshold")
+                                     or thermal.get("drift_threshold")),
         notes=list(ch.flags),
     )
 
@@ -670,6 +648,8 @@ def run_characterization(
         "warmup_minutes": dip.warmup_minutes,
         "thermal_final_creep_de_per_min": thermal.get("final_creep_de_per_min"),
         "thermal_net_over_gross": thermal.get("net_over_gross"),
+        "fluctuation_envelope": dip.fluctuation_envelope,
+        "warmin_magnitude": dip.warmin_magnitude,
         "cold_channel": ch.cold_channel,
         "noise": noise["bands"],
         "noise_floor_nits": dip.noise_floor_nits,
