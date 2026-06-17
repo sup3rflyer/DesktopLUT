@@ -322,11 +322,14 @@ class _Characterizer:
                     "fluctuation_envelope": None, "warmin_magnitude": None, "active_channel": None}
         from .thermal import ThermalController, ThermalConfig
         max_cv = self.transfer.max_cv
-        # Diverse content: a grey ramp (luminance/power diversity) + R/G/B (channel exercise);
-        # the controller golden-ratio-orders it so the running average load is held steady.
-        greys = [round(s * max_cv) for s in (0.12, 0.22, 0.35, 0.5, 0.68, 0.85, 1.0)]
+        # Diverse but BRIGHT-BIASED content: a mid-to-bright grey ramp + R/G/B (channel exercise),
+        # golden-ratio-ordered by the controller so the running average load is held steady. Dim
+        # patches are deliberately excluded — they inject almost no heat AND (in HDR) read very
+        # slowly (long dark integration), so they'd waste the preheat; the fixed neutral reference
+        # sensor handles the measurement, not the load content.
+        greys = [round(s * max_cv) for s in (0.4, 0.55, 0.7, 0.85, 1.0)]
         content = [(g, g, g) for g in greys]
-        hi = round(0.7 * max_cv)
+        hi = round(0.8 * max_cv)
         content += [(hi, 0, 0), (0, hi, 0), (0, 0, hi)]
         ref_nits = self.transfer.cv_to_nits(round(0.5 * max_cv))
         tcfg = ThermalConfig(
