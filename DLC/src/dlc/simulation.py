@@ -97,9 +97,12 @@ def write_identity_cube(path: Path, *, size: int = 17, title: str = "DLC synthet
         "DOMAIN_MIN 0.0 0.0 0.0",
         "DOMAIN_MAX 1.0 1.0 1.0",
     ]
-    for r in range(size):
+    # Standard .cube order is R-fastest (matches write_cube / DesktopLUT LoadLUT). Writing
+    # R-slowest here produces an R↔B-transposed "identity" (not actually identity), so
+    # rehearsals would silently swap red and blue.
+    for b in range(size):
         for g in range(size):
-            for b in range(size):
+            for r in range(size):
                 lines.append(f"{r / denominator:.8f} {g / denominator:.8f} {b / denominator:.8f}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path

@@ -139,11 +139,13 @@ def write_synthetic_ti3(path: Path) -> None:
 
 
 def write_identity_cube(path: Path, size: int = 2) -> None:
+    # Standard .cube order is R-fastest (`for b: for g: for r:`) — matches write_cube and
+    # DesktopLUT's LoadLUT, so this is a TRUE identity (R-slowest would be an R↔B transpose).
     lines = ['TITLE "identity"', f"LUT_3D_SIZE {size}"]
-    for r in range(size):
+    scale = size - 1
+    for b in range(size):
         for g in range(size):
-            for b in range(size):
-                scale = size - 1
+            for r in range(size):
                 lines.append(f"{r / scale:.6f} {g / scale:.6f} {b / scale:.6f}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1245,12 +1247,24 @@ class Lut3dTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
             cube = ctx.root / "generated" / "bad.cube"
-            write_identity_cube(cube)
-            text = cube.read_text(encoding="utf-8").replace("1.000000 0.000000 0.000000", "-0.250000 0.000000 0.000000", 1)
-            cube.write_text(text, encoding="utf-8")
+            cube.parent.mkdir(parents=True, exist_ok=True)
+            # A genuinely non-monotonic cube with ALL outputs IN RANGE [0,1], written in the
+            # standard R-fastest order — so this exercises the monotonicity axis check itself,
+            # not the out-of-bounds check (audit O-5: the old test only failed via a -0.25 edit).
+            # R output along the R axis at (g=0,b=0) goes 0.0 -> 0.5 -> 0.2: the last step inverts.
+            size = 3
+            sc = size - 1
+            lines = ['TITLE "bad"', f"LUT_3D_SIZE {size}"]
+            for b in range(size):
+                for g in range(size):
+                    for r in range(size):
+                        rr = 0.2 if (g == 0 and b == 0 and r == 2) else r / sc
+                        lines.append(f"{rr:.6f} {g / sc:.6f} {b / sc:.6f}")
+            cube.write_text("\n".join(lines) + "\n", encoding="utf-8")
             summary = write_lut_integrity(ctx=ctx, cube_path=cube)
-            self.assertFalse(summary.ok)
+            self.assertEqual(summary.out_of_bounds_count, 0)   # isolates the monotonicity check
             self.assertGreater(summary.monotonicity_violations, 0)
+            self.assertFalse(summary.ok)
 
 
 class MetricsTests(unittest.TestCase):

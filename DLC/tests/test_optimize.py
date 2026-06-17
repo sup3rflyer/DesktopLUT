@@ -20,6 +20,7 @@ pytest.importorskip("colour")
 
 from dlc.engine.model import Target, TargetSpace, de_itp
 from dlc.optimize import (
+    DegenerateMeasurements,
     OptimizeConfig,
     optimize_cube,
     sample_cube,
@@ -43,6 +44,33 @@ def _raw_max_de(target: Target, probe, signals: np.ndarray) -> float:
     measured = probe(signals)
     de = de_itp(space.xyz_to_ictcp(measured) - space.ideal_ictcp(signals))
     return float(de.max())
+
+
+# ---------------------------------------------------------------------------
+# degenerate measurements (T2.3) — converted to a typed signal, not a crash
+# ---------------------------------------------------------------------------
+
+def test_collinear_measurements_raise_degenerate_not_linalgerror():
+    target = _sdr_target()
+    # A grayscale-only ramp: every signal on the r=g=b line ⇒ singular RBF interpolation
+    # matrix (rank-deficient monomials). The raw failure is numpy.linalg.LinAlgError; the
+    # boundary must convert it to an actionable DegenerateMeasurements, not crash the run.
+    signals = np.array([[v, v, v] for v in np.linspace(0.0, 1.0, 12)], dtype=float)
+    measured = TargetSpace(target).ideal_xyz(signals)
+    probe = synthetic_probe(target)
+    with pytest.raises(DegenerateMeasurements) as exc:
+        optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                      config=OptimizeConfig(grid_size=9, max_outer=3, threshold=2.0))
+    assert "degenerate" in str(exc.value).lower()
+
+
+def test_duplicate_measurements_raise_degenerate():
+    target = _sdr_target()
+    signals = np.tile([0.5, 0.5, 0.5], (8, 1)).astype(float)
+    measured = TargetSpace(target).ideal_xyz(signals)
+    with pytest.raises(DegenerateMeasurements):
+        optimize_cube(target=target, probe=synthetic_probe(target), signals=signals,
+                      measured_xyz=measured, config=OptimizeConfig(grid_size=9, max_outer=2))
 
 
 # ---------------------------------------------------------------------------

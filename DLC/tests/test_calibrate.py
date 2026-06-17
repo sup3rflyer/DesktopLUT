@@ -63,7 +63,7 @@ def _fake_launch(cmds):
 
 
 def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator=None,
-          probe=None, output_dir=None, probe_launcher=_fake_launch) -> Calibration:
+          probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run("SDR", display="synthetic", run_dir=run_dir)
@@ -74,7 +74,7 @@ def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator
         measure=panel if panel is not None else _perfect_panel(),
         adjudicator=adjudicator or AutoAdjudicator(),
         probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE,
-        probe_launcher=probe_launcher)
+        probe_launcher=probe_launcher, decision_overrides=decision_overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -321,17 +321,68 @@ def test_3dlut_only_escalates_without_mhc(tmp_path: Path):
     assert result.digest["aborted_at"] == "require-stack"
 
 
+def _seed_stack(controller: CalibrationController, *, cube: str | None = None) -> None:
+    """Pre-install an MHC profile (+ optional 3D LUT) so the gray-wb / 3dlut-only
+    stack precondition is met."""
+    controller.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06})
+    controller.apply_mhc(0, "SDR")
+    if cube is not None:
+        controller.set_3dlut(0, "SDR", cube)
+
+
 def test_gray_wb_proceeds_with_a_seeded_stack(tmp_path: Path):
     controller = CalibrationController.mock()
     # Pre-install an MHC profile + a 3D LUT so the stack precondition is met.
-    controller.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06})
-    controller.apply_mhc(0, "SDR")
-    controller.set_3dlut(0, "SDR", str(tmp_path / "existing.cube"))
+    _seed_stack(controller, cube=str(tmp_path / "existing.cube"))
 
     calib = _make(tmp_path, "gw_ok", controller=controller)
     result = calib.run("gray-wb")
     assert result.status == "completed"
     assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
+
+
+# ---------------------------------------------------------------------------
+# revert at the apply gate for the in-place flows (gray-wb / 3dlut-only) — these
+# never enter calibration mode, so the snapshot rollback path doesn't apply. The
+# 3D-LUT cube is restorable over the pipe; the MHC grayscale a gray-wb tweak
+# overwrites is NOT (state.get doesn't expose it), so its revert is honest-unavailable.
+# ---------------------------------------------------------------------------
+
+def test_3dlut_only_revert_restores_previous_cube(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    prev_cube = str(tmp_path / "previous.cube")
+    _seed_stack(ctrl, cube=prev_cube)
+
+    calib = _make(tmp_path, "lut_revert", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
+    result = calib.run("3dlut-only")
+
+    # revert is honoured (not silently 'completed'): the prior cube is back on the wire.
+    assert result.status == "reverted"
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == prev_cube
+
+
+def test_3dlut_only_revert_clears_cube_when_none_existed(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=None)   # MHC present, but no prior 3D LUT (need_lut=False)
+
+    calib = _make(tmp_path, "lut_revert_clear", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
+    result = calib.run("3dlut-only")
+
+    assert result.status == "reverted"
+    # nothing was installed before this run, so revert leaves no cube
+    assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
+
+
+def test_gray_wb_revert_is_unavailable_not_silent(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=str(tmp_path / "existing.cube"))
+
+    calib = _make(tmp_path, "gw_revert", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
+    result = calib.run("gray-wb")
+
+    # the MHC grayscale/white can't be faithfully restored over the pipe — the run must
+    # NOT claim 'completed' when the operator asked to revert; it surfaces the gap honestly.
+    assert result.status == "revert_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +446,81 @@ def test_mapping_adjudicator_pause_resume_does_not_remeasure(tmp_path: Path):
     # the final resume (everything memoised) re-measured nothing: the count is
     # unchanged from when the run first reached the verify seam.
     assert panel.count == reads_after_first_completion
+
+
+def _verify_request():
+    from dlc.calibrate import AdjudicationRequest
+    return AdjudicationRequest(
+        key="verify:accept", seam="verify", stage="verify", question="apply or revert?",
+        options=("apply", "revert"), recommendation="apply")
+
+
+def test_recorded_decision_replays_without_override(tmp_path: Path):
+    # Baseline: a recorded decision is replayed as-is, and the seed map alone CANNOT change
+    # it on resume (this is exactly the bug --decide overrides fix — the seed loses to the record).
+    calib = _make(tmp_path, "rec")
+    assert calib.adjudicate(_verify_request()).choice == "apply"          # records 'apply'
+    # reopen the same run, seed the adjudicator with 'revert' but NO explicit override
+    seeded = _make(tmp_path, "rec", adjudicator=MappingAdjudicator({"verify:accept": Decision("revert")}))
+    assert seeded.adjudicate(_verify_request()).choice == "apply"         # recorded value still wins
+
+
+def test_decide_override_supersedes_recorded_decision_on_resume(tmp_path: Path):
+    # The fix: an explicit --decide override beats the recorded decision without --force.
+    calib = _make(tmp_path, "ov")
+    assert calib.adjudicate(_verify_request()).choice == "apply"          # records 'apply'
+    resumed = _make(tmp_path, "ov", decision_overrides={"verify:accept": Decision("revert", note="cli")})
+    d = resumed.adjudicate(_verify_request())
+    assert d.choice == "revert"                                           # override wins
+    # and it is re-persisted (flagged as an override) so the resumed _finish acts on it
+    rec = resumed.calib["decisions"]["verify:accept"]
+    assert rec["choice"] == "revert" and rec.get("overridden") is True
+
+
+def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
+    # End-to-end: a full run records verify:accept=apply; resuming the SAME run with an
+    # explicit override flips the terminal gate to a real snapshot revert.
+    ctrl = CalibrationController.mock()
+    first = _make(tmp_path, "ovfull", controller=ctrl)
+    assert first.run("full").status == "completed"
+    assert first.calib["decisions"]["verify:accept"]["choice"] == "apply"
+
+    resumed = _make(tmp_path, "ovfull", controller=ctrl,
+                    decision_overrides={"verify:accept": Decision("revert", note="cli")})
+    result = resumed.run("full")
+    assert result.status == "reverted"
+    assert resumed.calib["decisions"]["verify:accept"]["choice"] == "revert"
+
+
+def test_patch_window_guard_quiet_when_target_is_primary(tmp_path: Path):
+    # The mock topology makes monitor 0 the primary; calibrating monitor 0 ⇒ no warning.
+    calib = _make(tmp_path, "pw_ok")
+    guard = calib._patch_window_guard()
+    assert guard["checked"] is True
+    assert guard["target_is_primary"] is True
+    assert "warning" not in guard
+
+
+def test_patch_window_guard_warns_when_target_not_primary(tmp_path: Path):
+    # The exact at-risk setup (this user's): the calibration target is NOT the Windows
+    # primary, so the dogegen window would default to the wrong panel — must be surfaced.
+    calib = _make(tmp_path, "pw_warn")
+    calib.controller.query_monitors = lambda: {"monitors": [
+        {"index": 0, "primary": False, "device_name": r"\\.\DISPLAY1", "rect": {"x": 0, "y": 0}},
+        {"index": 1, "primary": True, "device_name": r"\\.\DISPLAY2", "rect": {"x": 3840, "y": 0}},
+    ]}
+    guard = calib._patch_window_guard()
+    assert guard["target_is_primary"] is False
+    assert guard["primary_monitor"] == 1 and guard["target_monitor"] == 0
+    assert "wrong panel" in guard["warning"]
+
+
+def test_preflight_surfaces_patch_window_guard(tmp_path: Path):
+    # The guard rides in the preflight digest so the report/LLM/operator see it.
+    calib = _make(tmp_path, "pw_pre")
+    calib.run("mhc-only")
+    pw = calib.calib["stages"]["preflight"]["digest"]["patch_window"]
+    assert pw["checked"] is True and pw["target_is_primary"] is True
 
 
 def test_plan_veto_aborts_when_operator_declines(tmp_path: Path):

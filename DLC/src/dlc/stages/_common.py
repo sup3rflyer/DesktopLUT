@@ -25,7 +25,7 @@ from ..desktoplut_client import (
 )
 from ..desktoplut_mock import MockDesktopLutServer, MockDesktopLutState
 from ..mhc import Ti3Sample, classify_samples, parse_ti3, xy_from_xyz
-from ..paths import RUNS_DIR
+from ..paths import RUNS_DIR, atomic_write_text
 from ..refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget
 from ..runs import RunContext, create_run, open_run
 from ..stage import StageResult
@@ -171,9 +171,11 @@ def load_dlc_state(ctx: RunContext) -> dict[str, Any]:
 
 
 def save_dlc_state(ctx: RunContext, state: dict[str, Any]) -> Path:
+    # Atomic write: the run-record is rewritten after every stage/decision; a crash mid-write
+    # must leave the prior complete record (load_dlc_state does a bare json.loads), never a
+    # truncated one that loses the run's memoised stages/decisions/backup pointer.
     path = ctx.root / DLC_STATE_FILE
-    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    return path
+    return atomic_write_text(path, json.dumps(state, indent=2))
 
 
 def record_stage(ctx: RunContext, result: StageResult, *, iteration: int | None = None) -> Path:

@@ -65,11 +65,23 @@ __all__ = [
     "OptimizeConfig",
     "IterationResult",
     "OptimizeResult",
+    "DegenerateMeasurements",
     "sample_cube",
     "seed_correction_budget",
     "optimize_cube",
     "synthetic_probe",
 ]
+
+
+class DegenerateMeasurements(Exception):
+    """The measurement set cannot support an RBF correction model — duplicate or collinear
+    signals make the interpolation matrix singular (``numpy.linalg.LinAlgError`` from the RBF
+    solve). Raised at the optimize boundary so the orchestrator surfaces a clear
+    'measurements degenerate — re-measure' outcome instead of crashing the whole run."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 # A probe drives the panel at ``signals`` (N, 3) in [0, 1] and returns the
 # measured absolute XYZ (N, 3). The cube is sampled by the machine, so the probe
@@ -255,12 +267,26 @@ def optimize_cube(
     converged = False
 
     for it in range(1, cfg.max_outer + 1):
-        model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing)
-        cube = build_cube(
-            model, cfg.grid_size, signal_points=train_signals,
-            fade_width=cfg.fade_width, max_correction=budget,
-            n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
-        )
+        try:
+            model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing)
+            cube = build_cube(
+                model, cfg.grid_size, signal_points=train_signals,
+                fade_width=cfg.fade_width, max_correction=budget,
+                n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
+            )
+        except np.linalg.LinAlgError as exc:
+            if snapshots:
+                # A later iteration went singular — typically the fold-back stacked duplicate
+                # or collinear driven points onto the training set. Keep the best cube built so
+                # far rather than crashing; the loop's job is done.
+                break
+            # First build failed: there is no usable model at all. Convert the raw numpy error
+            # into a typed, actionable signal for the orchestrator (re-measure with more variation).
+            raise DegenerateMeasurements(
+                f"the {len(train_signals)} profiling measurement(s) cannot build an RBF "
+                f"correction model (singular interpolation matrix: {exc}). The patch set is "
+                f"degenerate — duplicate or collinear signals. Re-measure with more signal "
+                f"variation (a fuller volumetric/ramp set), then retry.") from exc
         driven = sample_cube(cube, verify)
         measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
         de = de_itp(space.xyz_to_ictcp(measured) - target_ictcp)

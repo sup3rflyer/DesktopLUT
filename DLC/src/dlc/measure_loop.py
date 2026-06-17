@@ -472,6 +472,14 @@ class _Loop:
 
         self.warm = settled
         self.warmup_reads += reads
+        # Stream the warm-up's HONEST final verdict to the ndjson (a control marker, not a
+        # probe read — no seq increment). The per-read settle records lag the settle by one
+        # (the settling read itself breaks before its post-state is recorded), so the human
+        # readout — which tails the ndjson, not the events — can't otherwise tell a settled
+        # run from an escalated (cap-hit) one. This is what keeps the readout's `warm` honest
+        # instead of assuming warm the moment the main pass starts.
+        self.ndjson.emit({"t": _now(), "phase": phase, "role": "warmup_complete",
+                          "settled": settled, "reads": reads, "cold_channel": self.cold_channel})
         self._emit_event(
             "INFO" if settled else "WARN",
             "warmup_complete",

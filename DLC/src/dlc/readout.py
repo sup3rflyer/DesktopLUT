@@ -142,6 +142,15 @@ class ReadoutState:
         return len(self.measured)
 
     def update(self, rec: dict[str, Any]) -> None:
+        # The warm-up completion marker is a control record (the loop's honest final settle
+        # verdict), not a probe read — track `warm` from it and do NOT count it as a read, so
+        # total_reads stays equal to the loop's seq_counter. This is the single source of the
+        # human view's warm state; the main pass starting does NOT imply the panel settled
+        # (the loop proceeds past the warm-up cap with warm=False when it escalates).
+        if rec.get("role") == "warmup_complete":
+            self.warm = bool(rec.get("settled"))
+            return
+
         self.total_reads += 1
         self.phase = rec.get("phase", self.phase)
 
@@ -161,10 +170,9 @@ class ReadoutState:
             label = rec.get("label")
             if label:
                 self.measured.add(label)
-            # the first time we leave warm-up for a measurement, the panel was
-            # declared warm (the loop only starts the main pass after settle).
-            if rec.get("phase") in ("main", "remeasure"):
-                self.warm = self.warm or True
+            # warm is tracked from the warm-up verdict (warmup_complete marker), NOT assumed
+            # from the main pass starting — the loop can begin the main pass with warm=False
+            # after exhausting the warm-up cap (the escalation case the cross-check exists for).
         elif role == "neutral_ref":
             drift = rec.get("drift") or {}
             self.last_drift = drift

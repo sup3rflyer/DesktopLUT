@@ -42,6 +42,45 @@ def test_invert3x3_identity():
 
 
 # --------------------------------------------------------------------------
+# verify scoring targets the resolved white (T1.3) — not hardcoded D65
+# --------------------------------------------------------------------------
+def test_verify_scores_against_resolved_white_not_hardcoded_d65():
+    from dlc.metrics import npm_for_white, score_samples, target_xyz_for_rgb
+    from dlc.mhc import Ti3Sample
+
+    # A cooler-than-D65 CRT-like white (what strength>0 SPD resolution aims at).
+    white = (0.3080, 0.3250)
+    lum, gamma = 120.0, 2.2
+    # A *perfect* panel: every patch emits exactly the ideal XYZ for that resolved white.
+    matrix = npm_for_white(white)
+    rgbs = [(1.0, 1.0, 1.0), (0.5, 0.5, 0.5), (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), (0.2, 0.4, 0.6)]
+    samples = [Ti3Sample(rgb=rgb, xyz=target_xyz_for_rgb(rgb, lum, gamma, matrix)) for rgb in rgbs]
+
+    # Scored against the SAME resolved white → ~0 error (the white is the goal).
+    correct, _ = score_samples(samples, luminance=lum, gamma=gamma, white_xy=white)
+    assert max(m.de2000 for m in correct) < 0.01
+
+    # Scored against hardcoded D65 (the old behaviour) → the intended white offset is
+    # wrongly counted as white error and would fail a tight gate.
+    d65, _ = score_samples(samples, luminance=lum, gamma=gamma)   # white_xy=None → D65
+    white_metric = max(d65, key=lambda m: sum(m.rgb))
+    assert white_metric.de2000 > 1.0
+
+
+def test_score_samples_default_white_is_unchanged_d65():
+    # The legacy (white_xy=None) path must still be textbook D65, byte-for-byte behaviour.
+    from dlc.metrics import score_samples, target_xyz_for_rgb
+    from dlc.mhc import Ti3Sample
+
+    lum, gamma = 100.0, 2.2
+    rgbs = [(1.0, 1.0, 1.0), (0.5, 0.2, 0.8)]
+    samples = [Ti3Sample(rgb=rgb, xyz=target_xyz_for_rgb(rgb, lum, gamma)) for rgb in rgbs]
+    metrics, _ = score_samples(samples, luminance=lum, gamma=gamma)
+    assert max(m.de2000 for m in metrics) < 1e-9   # perfect D65 panel scores ~0 under D65
+
+
+# --------------------------------------------------------------------------
 # StageResult contract
 # --------------------------------------------------------------------------
 def test_stage_result_shape_and_hashing(tmp_path):

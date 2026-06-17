@@ -168,7 +168,10 @@ def cube_axis_checks(cube: CubeData) -> tuple[int, list[float]]:
         return (0, [])
 
     def value_at(r: int, g: int, b: int) -> tuple[float, float, float]:
-        return cube.values[(r * size * size) + (g * size) + b]
+        # Standard .cube order is R-fastest (write_cube / DesktopLUT LoadLUT write
+        # `for b: for g: for r:`), so the flat index is b*size² + g*size + r. Indexing
+        # R-slowest here would check monotonicity on transposed axes (real violations missed).
+        return cube.values[(b * size * size) + (g * size) + r]
 
     violations = 0
     neighbor_deltas: list[float] = []

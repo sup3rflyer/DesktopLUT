@@ -230,20 +230,27 @@ def test_ndjson_stream_is_one_line_per_read_with_pinned_schema(tmp_path: Path):
         ndjson_path=ndj,
     )
     lines = [json.loads(ln) for ln in ndj.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(lines) == res.total_reads
-    # seq is a dense 0..N-1 index (every probe read accounted for, none dropped).
-    assert [ln["seq"] for ln in lines] == list(range(len(lines)))
+    # The stream is read records (one line per probe read) interleaved with control markers
+    # (warm-up completion verdicts — NOT reads, no seq). Separate them.
+    reads = [ln for ln in lines if ln.get("role") != "warmup_complete"]
+    markers = [ln for ln in lines if ln.get("role") == "warmup_complete"]
+    assert len(reads) == res.total_reads
+    # seq is a dense 0..N-1 index over READS (every probe read accounted for, none dropped).
+    assert [ln["seq"] for ln in reads] == list(range(len(reads)))
     required = {
         "t", "seq", "phase", "role", "label", "rgb", "signal", "read_index",
         "xyz", "yxy", "nits", "ok", "accepted", "agreement_de", "drift",
         "settle", "disposition", "note",
     }
-    for ln in lines:
+    for ln in reads:
         assert required <= set(ln)
-    phases = {ln["phase"] for ln in lines}
+    phases = {ln["phase"] for ln in reads}
     assert {"warmup", "main"} <= phases
     # the interleaved checkpoints carry a drift verdict
-    assert any(ln["role"] == "neutral_ref" and ln["drift"] is not None for ln in lines)
+    assert any(ln["role"] == "neutral_ref" and ln["drift"] is not None for ln in reads)
+    # the warm-up completion marker streams the honest settle verdict (for the readout)
+    assert markers and all(set(m) >= {"role", "settled", "phase"} for m in markers)
+    assert markers[-1]["settled"] == res.warm
 
 
 # ---------------------------------------------------------------------------

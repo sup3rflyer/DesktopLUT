@@ -27,6 +27,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from .paths import atomic_write_text
+
 __all__ = ["CorrectionRecord", "CorrectionStore"]
 
 
@@ -73,26 +75,32 @@ class CorrectionStore:
     record, never a gate.
     """
 
-    def __init__(self, path: Path | str, records: Optional[dict[str, CorrectionRecord]] = None) -> None:
+    def __init__(self, path: Path | str, records: Optional[dict[str, CorrectionRecord]] = None,
+                 *, corrupt: bool = False) -> None:
         self.path = Path(path)
         self._records: dict[str, CorrectionRecord] = dict(records or {})
+        # True iff the file existed but did not parse — distinct from "absent" (a clean first
+        # run). Lets a caller surface real corruption (vs silently falling back to the stale
+        # YAML correction), while the store itself stays tolerant (never a gate).
+        self.corrupt = corrupt
 
     # -- loading ----------------------------------------------------------
     @classmethod
     def load(cls, path: Path | str) -> "CorrectionStore":
         p = Path(path)
         records: dict[str, CorrectionRecord] = {}
+        corrupt = False
         if p.exists():
             try:
                 raw = json.loads(p.read_text(encoding="utf-8"))
             except (ValueError, OSError):
-                raw = {}
+                raw, corrupt = {}, True   # present but unparseable — surface it (see .corrupt)
             for name, rec in (raw.get("displays", {}) or {}).items():
                 try:
                     records[name] = CorrectionRecord.from_dict({**rec, "display": rec.get("display", name)})
                 except (KeyError, TypeError, ValueError):
                     continue
-        return cls(p, records)
+        return cls(p, records, corrupt=corrupt)
 
     # -- access -----------------------------------------------------------
     def get(self, display: str) -> Optional[CorrectionRecord]:
@@ -111,5 +119,7 @@ class CorrectionStore:
 
     def save(self) -> None:
         payload = {"displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Atomic: a crash mid-write must not truncate the store and silently drop a
+        # freshly-minted CCMX/SPD (the load is corruption-tolerant, so a truncated file would
+        # fall back to the stale YAML correction with no error). See paths.atomic_write_text.
+        atomic_write_text(self.path, json.dumps(payload, indent=2))

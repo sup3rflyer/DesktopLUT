@@ -59,7 +59,8 @@ from .measure_loop import (
 )
 from .metrics import score_samples, summarize_metrics
 from .mhc import parse_ti3
-from .optimize import OptimizeConfig, ProbeFn, optimize_cube
+from .optimize import DegenerateMeasurements, OptimizeConfig, ProbeFn, optimize_cube
+from .paths import atomic_write_text
 from .refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget, propose_correction_grayscale
 from .runs import RunContext, create_run, open_run
 from .stages import _common, build_mhc
@@ -254,6 +255,7 @@ class Calibration:
         patch_sizes: Optional[PatchSizes] = None,
         white_fn: Optional[cp.WhiteFn] = None,
         probe_launcher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+        decision_overrides: Optional[dict[str, "Decision"]] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -272,6 +274,11 @@ class Calibration:
         self.dummy_icc = dummy_icc
         self.patch_sizes = patch_sizes or PatchSizes()
         self._white_fn = white_fn
+        # Explicit per-key decision overrides (the CLI's --decide flags). Unlike the
+        # adjudicator's seed map, these take precedence over an ALREADY-recorded decision, so
+        # a resumed run can change a recorded seam (e.g. verify:accept apply↔revert) without
+        # --force re-measuring everything. See adjudicate().
+        self.decision_overrides: dict[str, Decision] = dict(decision_overrides or {})
         # The correction-build launches Argyll ccxxmake in its own console (live only); an
         # injectable seam keeps tests/sim from spawning a real process.
         self._probe_launcher = probe_launcher or self._default_launch_ccxxmake
@@ -304,17 +311,41 @@ class Calibration:
     # -- the seam ---------------------------------------------------------
     def adjudicate(self, request: AdjudicationRequest) -> Decision:
         """Ask the adjudicator and persist the decision (audit trail + resume
-        seed). Propagates :class:`AdjudicationRequired` to pause a live run."""
+        seed). Propagates :class:`AdjudicationRequired` to pause a live run.
+
+        Precedence: an explicit ``--decide`` override (``self.decision_overrides``) wins over
+        an already-recorded decision, so a resumed run can change a recorded seam (notably the
+        terminal ``verify:accept`` apply↔revert gate) without ``--force`` discarding all stage
+        memoisation. A recorded decision is otherwise replayed as-is; only an un-decided seam
+        consults the adjudicator (which may pause the run)."""
+        override = self.decision_overrides.get(request.key)
+        if override is not None and not self.force:
+            recorded = self.calib["decisions"].get(request.key)
+            if (recorded is None or recorded.get("choice") != override.choice
+                    or recorded.get("note") != override.note):
+                # NOTE: a targeted override is safe for terminal/leaf seams (verify:accept has
+                # no downstream stages) and for re-deciding an aborted seam (an abort left no
+                # downstream stages memoised). No current seam injects a value a later memoised
+                # stage consumes; if one is added, that stage's cache would need invalidation.
+                self._record_decision(request, override, overridden=recorded is not None)
+            return Decision(override.choice, override.note)
         if request.key in self.calib["decisions"] and not self.force:
             d = self.calib["decisions"][request.key]
             return Decision(d["choice"], d.get("note"))
         decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
-        self.calib["decisions"][request.key] = {
-            **decision.as_dict(), "seam": request.seam, "question": request.question}
+        self._record_decision(request, decision)
+        return decision
+
+    def _record_decision(self, request: AdjudicationRequest, decision: Decision,
+                         *, overridden: bool = False) -> None:
+        rec = {**decision.as_dict(), "seam": request.seam, "question": request.question}
+        if overridden:
+            rec["overridden"] = True
+        self.calib["decisions"][request.key] = rec
         self.ctx.log(f"seam {request.key}: {decision.choice}"
+                     + (" (override)" if overridden else "")
                      + (f" ({decision.note})" if decision.note else ""))
         self._save()
-        return decision
 
     def _abort_if(self, decision: Decision, *, stage: str, message: str) -> Decision:
         """Honour an LLM 'abort' verdict at a seam — end the flow cleanly. (The
@@ -356,7 +387,7 @@ class Calibration:
             key = f"{self.monitor}:{self.mode}"
             active_profile = (mhc.get(key) or {}).get("profile_name")
             path = self.ctx.root / "desktoplut_backup.json"
-            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            atomic_write_text(path, json.dumps(state, indent=2))   # the durable pre-run safety net
             record = {"captured": True, "path": str(path),
                       "active_profile": active_profile,
                       "had_mhc": bool(active_profile)}
@@ -399,6 +430,58 @@ class Calibration:
             self.ctx.log(f"restore failed ({why}): {exc}"
                          + (f"; manual backup at {bak}" if bak else ""))
             return False
+
+    def _capture_inplace_baseline(self) -> dict[str, Any]:
+        """In-place flows (gray-wb / 3dlut-only) tune the *installed* stack directly — they
+        never enter calibration mode, so there is no C++ snapshot to revert to. Record what
+        IS restorable over the pipe (the runtime 3D-LUT cube) BEFORE we mutate, so a 'revert'
+        at the apply gate can put the prior cube back. The MHC correction-grayscale/white a
+        gray-wb tweak overwrites is NOT exposed by ``state.get`` (the C++ HandleStateGet only
+        reports ``applied``/``cube_path``), so that half is not auto-revertible — the durable
+        settings backup captured at preflight is the fallback. Captured once (persists across
+        a pause/resume in the run-record)."""
+        existing = self.calib.get("inplace_baseline")
+        if existing is not None:
+            return existing
+        ck = f"{self.monitor}:{self.mode}"
+        try:
+            state = self.controller.state()
+            cube = ((state.get("runtime") or {}).get(ck) or {}).get("cube_path")
+            record: dict[str, Any] = {"captured": True, "cube_path": cube}
+        except Exception as exc:  # noqa: BLE001 - a down pipe shouldn't crash the flow
+            record = {"captured": False, "error": f"{type(exc).__name__}: {exc}"}
+        self.calib["inplace_baseline"] = record
+        self._save()
+        return record
+
+    def _revert_inplace(self) -> str:
+        """Revert an in-place refinement (gray-wb / 3dlut-only). 3dlut-only's only display
+        mutation is the runtime cube, so it is fully restorable — put the prior cube back
+        (or clear it if there was none). gray-wb overwrote the MHC correction-grayscale/white,
+        which ``state.get`` does not expose, so it cannot be faithfully auto-reverted: surface
+        the durable settings backup for a manual restore. Returns the terminal status
+        (``reverted`` when the display was put back, else ``revert_unavailable``)."""
+        baseline = self.calib.get("inplace_baseline") or {}
+        flow = self.calib.get("flow")
+        if flow == "3dlut-only" and baseline.get("captured"):
+            prev = baseline.get("cube_path")
+            try:
+                if prev:
+                    self.controller.set_3dlut(self.monitor, self.mode, prev)
+                    self.ctx.log(f"reverted: restored the previous 3D LUT ({prev})")
+                else:
+                    self.controller.clear_3dlut(self.monitor, self.mode)
+                    self.ctx.log("reverted: cleared the 3D LUT (none was installed before this run)")
+                return "reverted"
+            except Exception as exc:  # noqa: BLE001 - fall through to the manual-backup guidance
+                self.ctx.log(f"3D-LUT revert failed ({type(exc).__name__}: {exc}); see settings backup")
+        bak = self.calib.get("backup") or {}
+        ref = bak.get("ini_backup") or bak.get("path")
+        self.ctx.log(
+            "could not auto-revert this in-place refinement: the prior MHC grayscale/white is "
+            "not recoverable over the pipe. Restore manually from the pre-run settings backup"
+            + (f" ({ref})" if ref else " in the run folder") + ", or run a full calibration.")
+        return "revert_unavailable"
 
     def _commit_calibration(self) -> None:
         """Keep the freshly-built calibration and leave calibration mode cleanly (no
@@ -487,6 +570,40 @@ class Calibration:
 
         return probe
 
+    def _patch_window_guard(self) -> dict[str, Any]:
+        """Assert the dogegen patch window will land on the calibration target monitor.
+
+        dogegen renders on the Windows primary and has no monitor-select CLI (the window is
+        moved/fullscreened by hand). If the target monitor isn't the primary, every patch
+        would be measured on the wrong panel. Cross-check the topology via ``query_monitors``
+        and surface a precise, actionable warning when they differ — best-effort (a monitor
+        query that fails or omits ``primary`` just yields no warning, never blocks the run)."""
+        try:
+            monitors = (self.controller.query_monitors() or {}).get("monitors") or []
+        except Exception as exc:  # noqa: BLE001 - advisory only; never blocks
+            return {"checked": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if not monitors:
+            return {"checked": False, "reason": "no monitor topology available"}
+        primary = next((m for m in monitors if m.get("primary")), None)
+        target = next((m for m in monitors if m.get("index") == self.monitor), None)
+        primary_idx = primary.get("index") if primary else None
+        target_is_primary = primary_idx is not None and primary_idx == self.monitor
+        guard: dict[str, Any] = {
+            "checked": True, "target_monitor": self.monitor, "primary_monitor": primary_idx,
+            "target_is_primary": target_is_primary,
+            "target_device": (target or {}).get("device_name"),
+            "target_rect": (target or {}).get("rect"),
+        }
+        if primary_idx is not None and not target_is_primary:
+            dev = (target or {}).get("device_name") or f"monitor {self.monitor}"
+            guard["warning"] = (
+                f"patch-window placement: calibration targets monitor {self.monitor} ({dev}), "
+                f"but the Windows primary is monitor {primary_idx}. dogegen opens its pattern "
+                f"window on the primary and has NO monitor-select flag — move/Alt+Enter-fullscreen "
+                f"it onto monitor {self.monitor} BEFORE measuring, or every patch lands on the "
+                f"wrong panel and all readings are silently wrong.")
+        return guard
+
     # ====================================================================
     # Stages
     # ====================================================================
@@ -511,6 +628,13 @@ class Calibration:
             store_rec = self._correction_store().get(self.display.name)
             store_made = store_rec.correction_made if store_rec else None
             staleness = self.profile.correction_staleness(today=self.run_date, made_override=store_made)
+            # Patch-window placement guard (M3): dogegen has NO monitor-select CLI — its window
+            # opens on the Windows primary and is positioned/fullscreened by hand. If the
+            # calibration target isn't the primary, patches would land on the WRONG panel and
+            # every measurement would be silently wrong. Assert the topology instead of assuming it.
+            patch_window = self._patch_window_guard()
+            if patch_window.get("warning"):
+                self.ctx.log(patch_window["warning"])
             # Save the user's current DesktopLUT state BEFORE we touch anything, so a
             # failed/cancelled run can be rolled back to exactly this. preflight is the
             # first stage and read-only, so this captures the pristine pre-run setup.
@@ -520,6 +644,7 @@ class Calibration:
                       "seen_monitors": sorted(set(seen_monitors)),
                       "correction": staleness.as_dict(),
                       "correction_from_store": store_made is not None,
+                      "patch_window": patch_window,
                       "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
@@ -899,8 +1024,16 @@ class Calibration:
             signals = np.array([s.rgb for s in samples], dtype=float)
             measured = np.array([s.xyz for s in samples], dtype=float)
             cube_path = str(self.ctx.root / "generated" / f"final_{self.mode.lower()}.cube")
-            result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
-                                   measured_xyz=measured, config=self.optimize_config)
+            try:
+                result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
+                                       measured_xyz=measured, config=self.optimize_config)
+            except DegenerateMeasurements as exc:
+                # The RBF model can't be built from this patch set (degenerate/collinear) —
+                # surface a clear, actionable abort instead of crashing with a numpy traceback.
+                raise CalibrationAborted(StageOutcome(
+                    "build-install-3dlut", "aborted",
+                    digest={"message": f"3D-LUT correction could not be built: {exc.detail}",
+                            "degenerate": True, "measurement_count": int(len(signals))}))
             result.write(cube_path, title=f"DLC {self.mode} 3D LUT")
             self.controller.set_3dlut(self.monitor, self.mode, cube_path)
             digest = {**result.digest, "cube_path": cube_path}
@@ -978,7 +1111,12 @@ class Calibration:
         def run() -> StageOutcome:
             spec = self._spec()
             samples = parse_ti3(Path(verify_ti3))
-            metrics, lum = score_samples(samples, gamma=spec.gamma)
+            # Score against the SAME resolved white the pipeline targeted (MHC matrix, 3D-LUT
+            # target, GS+WB tweak) — not textbook D65 — so a non-zero white strength is the goal
+            # here, not scored as white error. NOTE: the gate metric is CIEDE2000 while the
+            # 3D-LUT correction converged in dE_ITP (ICtCp); both are surfaced for the operator.
+            wx, wy = self._white_xy()
+            metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
             summary = summarize_metrics(phase="verification", iteration=0, source=Path(verify_ti3),
                                         patch_metrics=metrics, target_luminance=lum,
                                         metrics_path=Path(verify_ti3), patches_path=Path(verify_ti3))
@@ -991,6 +1129,9 @@ class Calibration:
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
                       "patch_count": summary.patch_count, "within_quality": within,
                       "quality_targets": q.as_dict(),
+                      "metric": "CIEDE2000", "optimize_metric": "dE_ITP",
+                      "target_white_xy": [round(wx, 5), round(wy, 5)],
+                      "white_provenance": self._resolved_white().provenance,
                       "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2)} for m in worst]}
             return StageOutcome("verify", "done", digest=digest,
                                 data={"within_quality": within, "metrics": {
@@ -1047,9 +1188,9 @@ class Calibration:
         recommendation = "recommend_recal" if trips else "apply"
         entries.append({"date": self.run_date.isoformat(), "magnitude": round(magnitude, 5)})
         history[key] = entries
-        path = self._tweak_history_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+        # Atomic: the cross-run tweak history is the watchdog's medical record; a truncated
+        # write would corrupt it (load is try/except-tolerant → silently empty → lost trend).
+        atomic_write_text(self._tweak_history_path(), json.dumps(history, indent=2))
         return {"magnitude": round(magnitude, 5), "trend": trend, "single_limit": single_limit,
                 "trend_limit": trend_limit, "prior_runs": len(prior), "trips": trips,
                 "recommendation": recommendation}
@@ -1172,16 +1313,24 @@ class Calibration:
     def _finish(self, *, analysis: Optional[str] = None) -> CalibrationResult:
         rep = self.stage_report(analysis=analysis)
         status = "completed"
-        # Honour the apply/revert gate (only meaningful when this run entered calibration
-        # mode and thus has a snapshot to roll back to). 'revert' restores the user's
-        # previous setup; 'apply' (or any non-revert) keeps the new profile.
+        # Honour the apply/revert gate. Two rollback regimes:
+        #  - flows that ENTERED calibration mode (full / mhc-only) have a real C++ snapshot:
+        #    'revert' restores it, 'apply' (or anything non-revert) commits the new profile.
+        #  - in-place flows (gray-wb / 3dlut-only) never entered calibration mode; the change
+        #    is already live. 'revert' is honoured as far as the pipe allows (the 3D-LUT cube
+        #    is restorable; the MHC grayscale a gray-wb tweak overwrote is not — see
+        #    _revert_inplace). Either way we must NOT silently report 'completed' on a revert.
+        choice = (self.calib.get("decisions") or {}).get("verify:accept", {}).get("choice")
         if self._entered_calibration():
-            choice = (self.calib.get("decisions") or {}).get("verify:accept", {}).get("choice")
             if choice == "revert":
                 self._restore_user_setup(why="operator chose revert at the apply gate")
                 status = "reverted"
             else:
                 self._commit_calibration()
+        elif self.calib.get("inplace_baseline") is not None:
+            if choice == "revert":
+                status = self._revert_inplace()
+            # else: the in-place refinement is already applied; nothing to commit.
         return CalibrationResult(
             flow=self.calib.get("flow"), monitor=self.monitor, mode=self.mode, target=self.target_name,
             status=status, stages=list(self.calib["stages"].keys()),
@@ -1233,6 +1382,7 @@ class Calibration:
         self.stage_resolve_target()
         self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=False)
+        self._capture_inplace_baseline()   # rollback point before set_3dlut mutates the live cube
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
@@ -1246,6 +1396,7 @@ class Calibration:
         self.stage_resolve_target()
         self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=True)
+        self._capture_inplace_baseline()   # record the restorable cube before the GS+WB tweak mutates the MHC
         self.stage_brightness()
         gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
                                 ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
@@ -1492,13 +1643,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         else create_run(normalize_mode(args.mode), display=profile.display_for(args.monitor).name,
                         run_dir=args.run)
 
-    # Seed decisions from the run-record + any new --decide flags.
+    # Seed decisions from the run-record + any new --decide flags. The --decide flags are ALSO
+    # kept as explicit overrides so they win over an already-recorded decision on resume (the
+    # seed map alone can't — adjudicate() replays a recorded key before consulting the
+    # adjudicator). See Calibration.adjudicate().
     state = _common.load_dlc_state(ctx)
     recorded = (state.get("calib", {}) or {}).get("decisions", {})
     decisions = {k: Decision(v["choice"], v.get("note")) for k, v in recorded.items()}
+    overrides: dict[str, Decision] = {}
     for spec in args.decide:
         key, _, choice = spec.partition("=")
-        decisions[key.strip()] = Decision(choice.strip(), note="cli")
+        overrides[key.strip()] = Decision(choice.strip(), note="cli")
+    decisions.update(overrides)   # also seed the adjudicator (covers not-yet-recorded keys)
     adjudicator: Adjudicator = AutoAdjudicator() if args.auto else MappingAdjudicator(decisions)
 
     from .measure_loop import (  # lazy: live only
@@ -1579,7 +1735,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     patch_sizes = PatchSizes(raw_ramp_steps=args.raw_steps) if args.raw_steps else None
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
-                        bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes)
+                        bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
+                        decision_overrides=overrides)
     result = None
     paused = False
     try:
@@ -1615,12 +1772,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                 persistent_meter.close()
             except Exception:  # noqa: BLE001
                 pass
-        # Rollback guard: a clean run reaches a 'completed' (applied) or 'reverted' terminal
-        # state, both of which already settled calibration mode in _finish. Anything else on a
+        # Rollback guard: a clean run reaches a 'completed' (applied), 'reverted', or
+        # 'revert_unavailable' terminal state — all of which _finish already settled (commit,
+        # snapshot restore, in-place cube restore, or an honest surface of the manual backup
+        # when the in-place MHC tweak can't be undone over the pipe). Anything else on a
         # non-paused exit — an abort or an unexpected exception — means we may have left a
         # half-applied profile, so roll DesktopLUT back to the user's pre-run snapshot.
         if not paused:
-            handled = result is not None and getattr(result, "status", None) in ("completed", "reverted")
+            handled = result is not None and getattr(result, "status", None) in (
+                "completed", "reverted", "revert_unavailable")
             if not handled:
                 try:
                     controller.exit_calibration(restore_snapshot=True)

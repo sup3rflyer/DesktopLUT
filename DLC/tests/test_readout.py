@@ -189,3 +189,27 @@ def test_readout_state_agrees_with_loop_digest(tmp_path: Path):
     assert state.warm == d["warm"]
     # the digest rounds white nits to 3 dp; the readout keeps full precision.
     assert round(state.white_nits, 3) == d["white_nits"]
+
+
+def test_readout_warm_agrees_with_digest_when_panel_never_settles(tmp_path: Path):
+    # The case the cross-check exists for: an UNSETTLED panel. The human readout must NOT
+    # claim "warm" while the loop digest escalates "cold" (the old `warm = warm or True` bug).
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+    panel = SyntheticPanel(transfer=t, warm_tau=0.5, cold_blue_gain=0.7)
+    levels = [round(i * t.max_cv / 5) for i in range(6)]
+    patches = [(v, v, v) for v in levels]
+    ndjson = tmp_path / "m.ndjson"
+    # settle_required > max_warmup_reads ⇒ settling is structurally impossible ⇒ warm=False.
+    result = run_measure_loop(
+        patches=patches, transfer=t, measure=panel,
+        config=MeasureLoopConfig(max_warmup_reads=3, settle_required=4),
+        ndjson_path=ndjson)
+    assert result.warm is False  # precondition: the loop escalated cold
+
+    state = ReadoutState()
+    for rec in iter_records(ndjson):
+        state.update(rec)
+
+    assert state.warm is False                       # the human view agrees — no false "warm"
+    assert state.warm == result.digest["warm"]
+    assert state.total_reads == result.digest["total_reads"]  # the marker isn't counted as a read

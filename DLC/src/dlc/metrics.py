@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .colormath import rgb_to_xyz_matrix
 from .events import EventWriter
 from .mhc import Ti3Sample, parse_ti3, resolve_run_path, white_xyz
 from .runs import RunContext
@@ -18,6 +19,21 @@ SRGB_TO_XYZ_D65 = (
     (0.2126729, 0.7151522, 0.0721750),
     (0.0193339, 0.1191920, 0.9503041),
 )
+
+# sRGB / Rec.709 primaries — the gamut the pipeline targets (same primaries the engine's
+# colour.RGB_COLOURSPACES["sRGB"] uses in optimize).
+SRGB_PRIMARIES = ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))
+
+
+def npm_for_white(white_xy: tuple[float, float],
+                  primaries: tuple[tuple[float, float], ...] = SRGB_PRIMARIES) -> list[list[float]]:
+    """Normalized primary matrix RGB(linear)→XYZ for ``primaries`` + ``white_xy``, normalized
+    so RGB(1,1,1) maps to the white at Y=1 (row-major: ``XYZ = matrix @ linear_rgb``). Reuses
+    the tested :func:`colormath.rgb_to_xyz_matrix` — the same construction the engine's
+    TargetSpace uses (sRGB primaries, whitepoint replaced), so verify and optimize share one
+    target white. At D65 it equals ``SRGB_TO_XYZ_D65`` to ~2e-4."""
+    (rx, ry), (gx, gy), (bx, by) = primaries
+    return rgb_to_xyz_matrix(rx, ry, gx, gy, bx, by, white_xy[0], white_xy[1])
 
 
 @dataclass(frozen=True)
@@ -51,9 +67,10 @@ class MetricsSummary:
         return asdict(self)
 
 
-def target_xyz_for_rgb(rgb: tuple[float, float, float], luminance: float, gamma: float) -> tuple[float, float, float]:
+def target_xyz_for_rgb(rgb: tuple[float, float, float], luminance: float, gamma: float,
+                       matrix: tuple[tuple[float, ...], ...] | list[list[float]] = SRGB_TO_XYZ_D65) -> tuple[float, float, float]:
     linear = tuple(max(0.0, min(1.0, channel)) ** gamma for channel in rgb)
-    return tuple(luminance * sum(row[i] * linear[i] for i in range(3)) for row in SRGB_TO_XYZ_D65)  # type: ignore[return-value]
+    return tuple(luminance * sum(row[i] * linear[i] for i in range(3)) for row in matrix)  # type: ignore[return-value]
 
 
 def xyz_to_lab(xyz: tuple[float, float, float], white: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -147,14 +164,27 @@ def is_grayscale(rgb: tuple[float, float, float]) -> bool:
     return abs(rgb[0] - rgb[1]) < 1e-6 and abs(rgb[1] - rgb[2]) < 1e-6
 
 
-def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, gamma: float = 2.2) -> tuple[list[PatchMetric], float]:
+def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, gamma: float = 2.2,
+                  white_xy: tuple[float, float] | None = None) -> tuple[list[PatchMetric], float]:
+    """Score TI3 samples as CIEDE2000 vs the ideal target.
+
+    ``white_xy`` is the run's RESOLVED target white (what stage_whitepoint fed into the MHC
+    matrix, the 3D-LUT target, and the GS+WB tweak). When given, both the per-patch target and
+    the Lab reference white are built from sRGB primaries + that white, so a non-D65 white
+    (e.g. the SPD-derived CRT-like white at strength>0) is the GOAL rather than scored as error.
+    When ``None`` (legacy callers), it falls back to textbook D65 — unchanged behaviour."""
     if not samples:
         raise ValueError("no TI3 samples to score")
     target_luminance = luminance if luminance is not None else infer_target_luminance(samples)
-    white = white_xyz(target_luminance)
+    if white_xy is not None:
+        matrix: tuple[tuple[float, ...], ...] | list[list[float]] = npm_for_white(white_xy)
+        white = white_xyz(target_luminance, white_xy[0], white_xy[1])
+    else:
+        matrix = SRGB_TO_XYZ_D65
+        white = white_xyz(target_luminance)
     metrics: list[PatchMetric] = []
     for sample in samples:
-        target = target_xyz_for_rgb(sample.rgb, target_luminance, gamma)
+        target = target_xyz_for_rgb(sample.rgb, target_luminance, gamma, matrix)
         de = delta_e2000(xyz_to_lab(sample.xyz, white), xyz_to_lab(target, white))
         metrics.append(PatchMetric(sample.rgb, sample.xyz, target, de, is_grayscale(sample.rgb)))
     return metrics, target_luminance

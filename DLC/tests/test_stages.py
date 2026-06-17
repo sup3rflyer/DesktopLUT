@@ -178,6 +178,36 @@ def test_check_cube_identity_ok(tmp_path):
     assert result.advice["default_policy_verdict"] == "install"
 
 
+def _cube_data(size, values):
+    from dlc.lut_integrity import CubeData
+    return CubeData(path="x", title="t", size=size, domain_min=(0.0, 0.0, 0.0),
+                    domain_max=(1.0, 1.0, 1.0), values=values)
+
+
+def test_cube_axis_checks_are_r_fastest():
+    # The check must index the flat .cube R-fastest (b*size² + g*size + r) — the order
+    # write_cube / DesktopLUT use. A R-slowest (transposed) index silently passes real
+    # violations and flags valid cubes (audit T2.1 / Assumption 9, six-agent consensus).
+    from dlc.lut_integrity import cube_axis_checks
+
+    size, sc = 3, 2
+    # values laid out R-fastest:
+    ident = [(r / sc, g / sc, b / sc) for b in range(size) for g in range(size) for r in range(size)]
+    assert cube_axis_checks(_cube_data(size, ident))[0] == 0          # true identity → clean
+
+    # a monotonic NON-identity (squared R ramp) must also be clean — the regression the
+    # audit asked for (the old test only ever checked an identity).
+    mono = [((r / sc) ** 2, g / sc, b / sc) for b in range(size) for g in range(size) for r in range(size)]
+    assert cube_axis_checks(_cube_data(size, mono))[0] == 0
+
+    # invert one in-range R-axis step: value_at(2,0,0).R (flat idx 2) drops to 0.2, below the
+    # r=1 node's 0.5. The CORRECT R-fastest checker catches this on the R axis; the old
+    # R-slowest index examined it on the wrong axis and missed it.
+    bad = list(ident)
+    bad[2] = (0.2, bad[2][1], bad[2][2])
+    assert cube_axis_checks(_cube_data(size, bad))[0] >= 1
+
+
 def test_score_perfect_panel(tmp_path):
     ctx = _new_run(tmp_path)
     ti3 = write_synthetic_ti3(tmp_path / "v.ti3")
