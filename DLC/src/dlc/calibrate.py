@@ -324,6 +324,62 @@ class Calibration:
                 stage, "aborted", digest={"message": message, "decision_note": decision.note}))
         return decision
 
+    # -- backup / restore (rollback guard) --------------------------------
+    def _capture_user_backup(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Persist the user's pre-run DesktopLUT state to the run dir so a failed or
+        cancelled run can be rolled back. The live rollback uses DesktopLUT's own
+        in-memory snapshot (taken at ``calibration.enter``); this durable copy is the
+        safety net if that snapshot is lost (e.g. the app restarted). Captured once."""
+        existing = self.calib.get("backup")
+        if existing and existing.get("captured"):
+            return existing
+        record: dict[str, Any] = {"captured": False}
+        try:
+            mhc = (state or {}).get("mhc") or {}
+            key = f"{self.monitor}:{self.mode}"
+            active_profile = (mhc.get(key) or {}).get("profile_name")
+            path = self.ctx.root / "desktoplut_backup.json"
+            path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            record = {"captured": True, "path": str(path),
+                      "active_profile": active_profile,
+                      "had_mhc": bool(active_profile)}
+            self.ctx.log(f"backed up user's DesktopLUT state → {path.name}"
+                         + (f" (active MHC: {active_profile})" if active_profile else " (no MHC active)"))
+        except Exception as exc:  # noqa: BLE001 - backup is best-effort, never blocks the run
+            record = {"captured": False, "error": f"{type(exc).__name__}: {exc}"}
+            self.ctx.log(f"could not back up DesktopLUT state: {exc}")
+        self.calib["backup"] = record
+        self._save()
+        return record
+
+    def _entered_calibration(self) -> bool:
+        """True once ``enter-neutral`` ran (persisted in the run-record, so it holds
+        across the pause/resume invocations even though the stage is memoised)."""
+        return "enter-neutral" in (self.calib.get("stages") or {})
+
+    def _restore_user_setup(self, *, why: str) -> bool:
+        """Roll DesktopLUT back to the user's pre-run setup: restore the snapshot taken
+        at ``calibration.enter`` (which re-installs their original MHC) and leave
+        calibration mode. Best-effort; returns whether the restore call succeeded."""
+        try:
+            self.controller.exit_calibration(restore_snapshot=True)
+            self.ctx.log(f"restored the user's previous DesktopLUT setup ({why})")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            bak = (self.calib.get("backup") or {}).get("path")
+            self.ctx.log(f"restore failed ({why}): {exc}"
+                         + (f"; manual backup at {bak}" if bak else ""))
+            return False
+
+    def _commit_calibration(self) -> None:
+        """Keep the freshly-built calibration and leave calibration mode cleanly (no
+        snapshot restore). Best-effort."""
+        try:
+            self.controller.exit_calibration(restore_snapshot=False)
+            self.ctx.log("applied the new calibration (left calibration mode, profile kept)")
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.log(f"commit (exit calibration) failed: {exc}")
+
     # ====================================================================
     # Stage helpers
     # ====================================================================
@@ -426,11 +482,16 @@ class Calibration:
             store_rec = self._correction_store().get(self.display.name)
             store_made = store_rec.correction_made if store_rec else None
             staleness = self.profile.correction_staleness(today=self.run_date, made_override=store_made)
+            # Save the user's current DesktopLUT state BEFORE we touch anything, so a
+            # failed/cancelled run can be rolled back to exactly this. preflight is the
+            # first stage and read-only, so this captures the pristine pre-run setup.
+            backup = self._capture_user_backup(state)
             digest = {"monitor": self.monitor, "mode": self.mode, "display": self.display.name,
                       "argyll_display": self.display.argyll_display, "mapping_ok": mapping_ok,
                       "seen_monitors": sorted(set(seen_monitors)),
                       "correction": staleness.as_dict(),
-                      "correction_from_store": store_made is not None}
+                      "correction_from_store": store_made is not None,
+                      "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
 
@@ -908,12 +969,16 @@ class Calibration:
                                     "max_de2000": summary.max_de2000, "white_de2000": summary.white_de2000}})
 
         outcome = self._stage("verify", run)
+        d = outcome.digest
+        within = outcome.data.get("within_quality")
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
-            question=("verification " + ("meets" if outcome.data.get("within_quality") else "is outside")
-                      + " the quality targets — accept the result, or iterate?"),
-            options=("accept", "iterate"),
-            recommendation="accept" if outcome.data.get("within_quality") else "iterate",
+            question=(f"The new calibration reads avg ΔE2000 {d.get('avg_de2000')} "
+                      f"(white ΔE {d.get('white_de2000')}, max {d.get('max_de2000')}) — "
+                      f"{'within' if within else 'outside'} the quality targets. "
+                      "Apply this calibration, or revert to the previous display setup?"),
+            options=("apply", "revert"),
+            recommendation="apply",
             digest=outcome.digest))
         return outcome
 
@@ -1077,9 +1142,20 @@ class Calibration:
 
     def _finish(self, *, analysis: Optional[str] = None) -> CalibrationResult:
         rep = self.stage_report(analysis=analysis)
+        status = "completed"
+        # Honour the apply/revert gate (only meaningful when this run entered calibration
+        # mode and thus has a snapshot to roll back to). 'revert' restores the user's
+        # previous setup; 'apply' (or any non-revert) keeps the new profile.
+        if self._entered_calibration():
+            choice = (self.calib.get("decisions") or {}).get("verify:accept", {}).get("choice")
+            if choice == "revert":
+                self._restore_user_setup(why="operator chose revert at the apply gate")
+                status = "reverted"
+            else:
+                self._commit_calibration()
         return CalibrationResult(
             flow=self.calib.get("flow"), monitor=self.monitor, mode=self.mode, target=self.target_name,
-            status="completed", stages=list(self.calib["stages"].keys()),
+            status=status, stages=list(self.calib["stages"].keys()),
             results_dir=rep.data.get("results_dir"), report_path=rep.data.get("report_path"),
             digest=rep.digest)
 
@@ -1371,6 +1447,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="record a seam decision (repeatable) then run/resume")
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
     parser.add_argument("--force", action="store_true", help="ignore stage memoisation")
+    parser.add_argument("--abort", action="store_true",
+                        help="cancel: roll DesktopLUT back to the user's pre-run setup "
+                             "(restore the calibration snapshot) and exit. Use to bail out of "
+                             "a paused/abandoned run without leaving a half-applied profile.")
     args = parser.parse_args(argv)
 
     profile = cp.load_profile(args.profile)
@@ -1393,6 +1473,21 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     from .measure_rgbw import resolve_spotread_instrument_port
 
     controller = CalibrationController.connect()
+
+    # Explicit cancel: restore the user's pre-run setup and exit (no measurement stack needed).
+    if args.abort:
+        restored = False
+        try:
+            controller.exit_calibration(restore_snapshot=True)
+            restored = True
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"status": "abort_failed", "error": f"{type(exc).__name__}: {exc}",
+                              "run": str(ctx.root)}, indent=2))
+            return 1
+        bak = (state.get("calib", {}) or {}).get("backup", {})
+        print(json.dumps({"status": "reverted", "restored_snapshot": restored,
+                          "backup": bak, "run": str(ctx.root)}, indent=2))
+        return 0
 
     # The live measurement stack (dogegen patch display + spotread meter) is only needed by
     # flows that MEASURE. build-correction mints a colorimeter correction via interactive
@@ -1439,6 +1534,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes)
+    result = None
     paused = False
     try:
         try:
@@ -1465,6 +1561,20 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                     presenter.close()
             except Exception:  # noqa: BLE001
                 pass
+        # Rollback guard: a clean run reaches a 'completed' (applied) or 'reverted' terminal
+        # state, both of which already settled calibration mode in _finish. Anything else on a
+        # non-paused exit — an abort or an unexpected exception — means we may have left a
+        # half-applied profile, so roll DesktopLUT back to the user's pre-run snapshot.
+        if not paused:
+            handled = result is not None and getattr(result, "status", None) in ("completed", "reverted")
+            if not handled:
+                try:
+                    controller.exit_calibration(restore_snapshot=True)
+                    print(json.dumps({"status": "rolled_back",
+                                      "reason": "run did not complete; restored pre-run setup",
+                                      "run": str(ctx.root)}, indent=2))
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 if __name__ == "__main__":  # pragma: no cover

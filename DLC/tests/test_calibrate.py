@@ -136,7 +136,49 @@ def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):
     decisions = calib.calib["decisions"]
     # the two seams that always fire in a clean run
     assert decisions["resolve-target:plan"]["choice"] == "approve"
-    assert decisions["verify:accept"]["choice"] == "accept"
+    # the final gate is now an apply/revert confirmation (auto-adjudicator applies)
+    assert decisions["verify:accept"]["choice"] == "apply"
+
+
+class _AutoExceptVerify:
+    """Auto-adjudicate every seam by its recommendation, except force the final
+    apply/revert gate to a fixed choice (to exercise the rollback path)."""
+
+    def __init__(self, verify_choice: str) -> None:
+        self.verify_choice = verify_choice
+
+    def adjudicate(self, request):
+        if request.key == "verify:accept":
+            return Decision(self.verify_choice, note="test")
+        return Decision(request.recommendation, note="auto")
+
+
+def test_preflight_backs_up_user_state(tmp_path: Path):
+    calib = _make(tmp_path, "backup")
+    calib.run("mhc-only")
+    bak = calib.calib.get("backup") or {}
+    assert bak.get("captured") is True
+    assert (calib.ctx.root / "desktoplut_backup.json").exists()
+
+
+def test_apply_commits_and_leaves_calibration(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "applycommit", controller=ctrl)
+    res = calib.run("mhc-only")
+    assert res.status == "completed"
+    # applied: left calibration mode but KEPT the freshly built MHC
+    assert ctrl.calibration_status().get("active") is False
+    assert ctrl.state().get("mhc")
+
+
+def test_revert_rolls_back_to_previous_setup(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "revertroll", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
+    res = calib.run("mhc-only")
+    assert res.status == "reverted"
+    # reverted: calibration mode exited AND the built MHC rolled back to the pre-run snapshot
+    assert ctrl.calibration_status().get("active") is False
+    assert not ctrl.state().get("mhc")
 
 
 # ---------------------------------------------------------------------------
