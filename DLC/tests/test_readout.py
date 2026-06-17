@@ -49,6 +49,27 @@ def _rec(**kw) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# soak markers (preheat / reactive re-warm) are control rows, not probe reads
+# ---------------------------------------------------------------------------
+
+def test_soak_markers_do_not_inflate_totals_and_render_cleanly():
+    state = ReadoutState()
+    state.update(_rec(seq=0, role="measurement"))
+    preheat = {"role": "preheat_complete", "phase": "preheat", "regime": "fluctuating",
+               "content_reads": 96, "final_k": 1.0}
+    rewarm = {"role": "rewarm", "phase": "main", "content_reads": 36, "regime": "fluctuating"}
+    state.update(preheat)
+    state.update(rewarm)
+    state.update(_rec(seq=1, role="measurement", label="p0001"))
+    # the two markers added zero probe reads — only the two real measurements count
+    assert state.total_reads == 2
+    # and they render as soak status, not a phantom measurement row
+    assert "[soak ]" in render_console_line(preheat, state)
+    assert "preheat" in render_console_line(preheat, state)
+    assert "[soak ]" in render_console_line(rewarm, state)
+
+
+# ---------------------------------------------------------------------------
 # tailer
 # ---------------------------------------------------------------------------
 

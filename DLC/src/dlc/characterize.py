@@ -368,6 +368,7 @@ class _Characterizer:
             self.cold_channel = res.active_channel   # the biggest thermal mover = the cold channel
         return {"regime": res.regime, "skipped": False,
                 "minutes": res.warmup_minutes or 0.0, "reads": res.content_reads,
+                "tau_patches": res.tau_patches,
                 "final_creep_de_per_min": None,
                 "net_over_gross": res.digest.get("net_over_gross"),
                 "fluctuation_envelope": res.fluctuation_envelope,
@@ -700,6 +701,7 @@ def run_characterization(
         eotf_undershoot=eotf.get("eotf_undershoot"),
         white_vs_luminance=eotf.get("white_vs_luminance"),
         warmup_reads_to_settle=(warm.get("reads") if warm.get("settled") else None),
+        thermal_tau_patches=thermal.get("tau_patches"),
         warmup_minutes=(thermal.get("minutes") if thermal.get("regime") == "convergent" else None),
         fluctuation_envelope=thermal.get("fluctuation_envelope"),
         warmin_magnitude=thermal.get("warmin_magnitude"),

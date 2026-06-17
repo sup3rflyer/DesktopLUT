@@ -1498,14 +1498,20 @@ class Calibration:
                 digest={"aborted_at": exc.outcome.stage, "message": exc.outcome.digest.get("message"),
                         "reason": str(exc)})
 
+    def _warm_tau(self) -> Optional[int]:
+        """The panel's measured thermal time constant (in patches) for the warm-start
+        ordering rotation — from the DIP if characterized, else ``None`` (engine default)."""
+        dip = self._dip()
+        return dip.thermal_tau_patches if dip else None
+
     def _ramp_patches(self) -> list[tuple[int, int, int]]:
-        return build_ramp_set(self.patch_sizes, self._transfer())
+        return build_ramp_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:
-        return build_volumetric_set(self.patch_sizes, self._transfer())
+        return build_volumetric_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
 
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
-        return build_neutral_set(self.patch_sizes, self._transfer())
+        return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
 
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
         return flow_patch_counts(flow, self.patch_sizes, self._transfer())
@@ -1774,33 +1780,36 @@ def _xy(xyz: Sequence[float]) -> tuple[float, float]:
 # Calibration/controller/ctx). The orchestrator's stage builders just delegate here.
 # ---------------------------------------------------------------------------
 
-def build_ramp_set(ps: PatchSizes, transfer: Transfer) -> list[tuple[int, int, int]]:
+def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
+                   warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The MHC raw/verify ramp: grey + RGBCMY at each saturation shell."""
     return ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
-                        spacing=ps.raw_spacing, order=ps.order)
+                        spacing=ps.raw_spacing, order=ps.order, warm_tau=warm_tau)
 
 
-def build_volumetric_set(ps: PatchSizes, transfer: Transfer) -> list[tuple[int, int, int]]:
+def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
+                         warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The 3D-LUT sampling set. ``volumetric_mode`` picks HOW the cube interior is sampled:
     a neutral-axis ``tube`` (default; dense where content lives), a uniform ``cube``, or a
     content-weighted ``gamut`` shell set."""
     if ps.volumetric_mode == "cube":
-        return cube_patches(transfer, size=ps.cube_size, order=ps.order)
+        return cube_patches(transfer, size=ps.cube_size, order=ps.order, warm_tau=warm_tau)
     if ps.volumetric_mode == "gamut":
         return gamut_patches(transfer, lum_steps=ps.gamut_lum_steps, hues=ps.gamut_hues,
-                             lum_bias=ps.gamut_lum_bias, order=ps.order)
+                             lum_bias=ps.gamut_lum_bias, order=ps.order, warm_tau=warm_tau)
     if ps.volumetric_mode != "tube":
         raise ValueError(f"unknown volumetric_mode: {ps.volumetric_mode!r} (tube|cube|gamut)")
     return tube_patches(transfer, cube_size=ps.cube_size, tube_size=ps.tube_size,
                         tube_radius=ps.tube_radius, grid_type=ps.grid_type,
-                        spines=ps.spines, order=ps.order)
+                        spines=ps.spines, order=ps.order, warm_tau=warm_tau)
 
 
-def build_neutral_set(ps: PatchSizes, transfer: Transfer) -> list[tuple[int, int, int]]:
+def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
+                      warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The grey-axis ramp for the GS+WB tweak / gray-wb flow."""
     n = ps.neutral_steps
     levels = [round(i * transfer.max_cv / (n - 1)) for i in range(n)]
-    return sort_patches([(v, v, v) for v in levels], ps.order, transfer)
+    return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
 # The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show

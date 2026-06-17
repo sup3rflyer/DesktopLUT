@@ -138,6 +138,18 @@ class MeasureLoopConfig:
     settle_required: int = 3            # consecutive in-tolerance reads ⇒ "warm"
     max_warmup_reads: int = 24          # not settled within this ⇒ escalate to the LLM (a FLAG, not a silent cap)
 
+    # Thermal preheat (soak-into-calibration) -------------------------------
+    preheat: str = "auto"               # "auto" (soak when the DIP regime is fluctuating/warming),
+    #                                     "always", or "never". A convergent/unknown panel uses the
+    #                                     plain static-grey settle gate; a content-driven panel that
+    #                                     holding grey can't warm is soaked to its OPERATING load (this
+    #                                     run's own patch set) first, then rides that equilibrium — the
+    #                                     golden-ratio patch ordering holds the load through the run.
+    preheat_k_start: float = 1.6        # soak luminance overshoot while warm-in is measured (1.0 ⇒ none)
+    rewarm_max_blocks: int = 6          # bounded reactive re-soak on a drift episode (the rare fallback,
+    #                                     fired only when the interleaved drift checkpoint trips — not an
+    #                                     unconditional every-patch interleave)
+
     # Interleaved drift reference (appended re-measure) ----------------------
     neutral_interval: int = 8           # measurement patches between neutral re-reads (DIP may override)
     drift_threshold: float = 0.004      # channel-balance Δ vs the warm reference (DIP may override)
@@ -556,6 +568,83 @@ class _Loop:
         )
         return settled, reads
 
+    # -- thermal preheat: soak-into-calibration ----------------------------
+
+    def _preheat_enabled(self) -> bool:
+        """Whether to soak before measuring. ``auto`` (the default) soaks only when the DIP says
+        the panel is content-driven (``fluctuating``) or still climbing (``warming``) — regimes the
+        static-grey settle gate cannot warm. A ``convergent``/unknown panel uses the plain warm-up."""
+        mode = self.cfg.preheat
+        if mode == "never":
+            return False
+        if mode == "always":
+            return True
+        regime = self.dip.thermal_regime if self.dip is not None else None
+        return regime in ("fluctuating", "warming")
+
+    def _run_soak(self, *, phase: str, max_blocks: Optional[int] = None):
+        """Drive a closed-loop :class:`~dlc.thermal.ThermalController` over THIS run's patch set.
+
+        Feeding the measurement set as the soak content is the whole trick: the controller glides
+        to ``k=1`` = the set's own mean backlight energy, so the panel is parked at exactly the load
+        the measurement will then sustain — no thermal step at the soak→measure boundary. Returns the
+        ``ThermalResult`` (or ``None`` when there's no content to soak with). Per-block records are
+        kept off ``measurements.ndjson`` (the readout tails it and expects measurement-shaped rows);
+        the caller emits a single summary marker instead."""
+        from .thermal import ThermalController, ThermalConfig  # lazy: keep the module import light
+
+        content = [p.rgb for p in self.patches]
+        if not content:
+            return None
+        max_cv = self.transfer.max_cv
+        ref_nits = self.transfer.cv_to_nits(round(self.cfg.warmup_signal * max_cv))
+        # Prefer the DIP's measured channel-balance noise (≈ drift_threshold / 3) so the soak's
+        # convergence gate is keyed to this panel+meter; else let the controller self-calibrate.
+        balance_noise: Optional[float] = None
+        if self.dip is not None and self.dip.recommended_drift_threshold:
+            balance_noise = self.dip.recommended_drift_threshold / 3.0
+        tcfg_kw: dict[str, Any] = {"k_start": self.cfg.preheat_k_start}
+        if max_blocks is not None:
+            tcfg_kw["max_blocks"] = max_blocks
+        ctrl = ThermalController(
+            measure=self.measure, transfer=self.transfer, content=content,
+            ref_nits=ref_nits, balance_noise=balance_noise, config=ThermalConfig(**tcfg_kw),
+            emit=None, event=self._emit_event,
+        )
+        res = ctrl.run()
+        if res.active_channel and self.cold_channel is None:
+            self.cold_channel = res.active_channel
+        return res
+
+    def preheat(self) -> Optional[dict[str, Any]]:
+        """Soak the panel to its operating equilibrium BEFORE the main pass (regime-gated; see
+        :meth:`_preheat_enabled`). Returns a digest, or ``None`` when skipped/empty."""
+        if not self._preheat_enabled():
+            return None
+        res = self._run_soak(phase="preheat")
+        if res is None:
+            return None
+        digest = {"regime": res.regime, "converged": res.converged, "blocks": res.blocks,
+                  "content_reads": res.content_reads, "final_k": res.final_k,
+                  "compromised": res.compromised, "active_channel": res.active_channel}
+        self.ndjson.emit({"t": _now(), "phase": "preheat", "role": "preheat_complete", **digest})
+        self._emit_event("INFO" if (res.converged and not res.compromised) else "WARN",
+                         "preheat_complete", **digest)
+        return digest
+
+    def _rewarm(self, *, phase: str) -> None:
+        """Re-establish the warm reference after a drift episode. On a content-driven panel a
+        static-grey re-settle can't actually re-warm it, so inject a BOUNDED thermal soak (the rare
+        reactive fallback — fired only here, when the interleaved drift checkpoint trips) before
+        re-settling. On a convergent/unknown panel this is exactly the prior static-grey re-settle."""
+        if self._preheat_enabled():
+            res = self._run_soak(phase="rewarm", max_blocks=self.cfg.rewarm_max_blocks)
+            if res is not None:
+                self.ndjson.emit({"t": _now(), "phase": phase, "role": "rewarm",
+                                  "blocks": res.blocks, "content_reads": res.content_reads,
+                                  "regime": res.regime})
+        self.warm_up(phase=phase, existing_reference=True)
+
     # -- one measurement patch (DIP-driven read policy) --------------------
 
     def _abnormal_reads(self, target_n: Optional[int]) -> int:
@@ -752,8 +841,9 @@ class _Loop:
             )
             pending.clear()
             if not final:
-                # Re-settle so the rest of the pass measures warm.
-                self.warm_up(phase="main", existing_reference=True)
+                # Re-warm so the rest of the pass measures warm (soak-then-resettle on a
+                # content-driven panel; plain static-grey re-settle on a convergent one).
+                self._rewarm(phase="main")
         else:
             pending.clear()
 
@@ -765,8 +855,8 @@ class _Loop:
         if not self.appended_queue:
             return unresolved
 
-        # Re-settle once before redoing warm-up casualties.
-        self.warm_up(phase="warmup", existing_reference=True)
+        # Re-warm once before redoing warm-up casualties.
+        self._rewarm(phase="warmup")
 
         # De-dup while preserving order (a patch can be flagged by >1 episode).
         seen: set[str] = set()
@@ -824,6 +914,7 @@ def run_measure_loop(
         dip=dip,
     )
 
+    preheat_digest = loop.preheat()
     loop.warm_up()
     loop.main_pass()
     unresolved = loop.drain_appended()
@@ -875,6 +966,7 @@ def run_measure_loop(
         "unresolved": unresolved_all,
         "white_xyz": [round(c, 4) for c in loop.white_xyz] if loop.white_xyz else None,
         "white_nits": round(loop.white_xyz[1], 3) if loop.white_xyz else None,
+        "preheat": preheat_digest,
         "needs_adjudication": needs_adjudication,
     }
     if events is not None:

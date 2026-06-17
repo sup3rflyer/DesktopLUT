@@ -105,6 +105,38 @@ def test_thermal_balances_windows_far_better_than_luminance():
     assert worst_window("thermal") < worst_window("luminance") / 3
 
 
+def test_patch_energy_is_peak_channel_luminance():
+    tf = P.Transfer.pq()
+    assert P.patch_energy((0, 0, 0), tf) == 0.0
+    assert P.patch_energy((tf.max_cv,) * 3, tf) == pytest.approx(10000.0, rel=1e-6)
+    # peak channel drives the proxy, not luminance: a saturated-red patch's energy is its red CV.
+    red = (tf.max_cv, 0, 0)
+    assert P.patch_energy(red, tf) == pytest.approx(tf.cv_to_nits(tf.max_cv))
+
+
+def test_mean_patch_energy_matches_build_set_mean():
+    # The soak-into-calibration coupling: a preheat fed the build set parks at this mean.
+    tf = P.Transfer.pq()
+    cube = P.cube_patches(tf, size=9)
+    by_hand = sum(P.patch_energy(p, tf) for p in cube) / len(cube)
+    assert P.mean_patch_energy(cube, tf) == pytest.approx(by_hand)
+    assert P.mean_patch_energy([], tf) == 0.0
+
+
+def test_warm_tau_threads_and_defaults():
+    # None coalesces to the built-in default; a different measured tau changes the warm-start
+    # rotation; the result is always a valid permutation of the input.
+    tf = P.Transfer.pq()
+    cube = P.cube_patches(tf, size=9, order="none")
+    assert P.sort_patches(cube, "thermal", tf, warm_tau=None) == P.sort_patches(cube, "thermal", tf)
+    fast = P.sort_patches(cube, "thermal", tf, warm_tau=1)
+    slow = P.sort_patches(cube, "thermal", tf, warm_tau=200)
+    assert fast != slow
+    assert sorted(fast) == sorted(slow) == sorted(cube)
+    # the builders thread it through to the same effect
+    assert P.cube_patches(tf, size=9, warm_tau=1, order="thermal") == fast
+
+
 def test_gamut_respects_floor_and_has_neutral_axis():
     tf = P.Transfer.pq()
     floor = tf.floor_cv()

@@ -86,6 +86,11 @@ class DisplayInstrumentProfile:
     #   white point is luminance-dependent; this maps it so calibration doesn't assume a fixed white
     # -- drift axis -------------------------------------------------------
     warmup_reads_to_settle: Optional[int] = None
+    thermal_tau_patches: Optional[int] = None    # measured thermal time constant in content-read
+    #   (≈ measurement-patch) units, from the closed-loop warm-in. Feeds the patch-ordering
+    #   warm-start rotation (``dlc.engine.patches.sort_patches`` ``warm_tau``) so the rotation
+    #   models THIS panel rather than the built-in default. None ⇒ no warm-in observed (or older
+    #   record) → the ordering falls back to its default τ.
     warmup_minutes: Optional[float] = None       # wall-time to thermal stability (convergent panels only)
     fluctuation_envelope: Optional[float] = None  # residual channel-balance wander band once warmed (the
     #   run-time drift watch trips on drift LEAVING this band; the fluctuating regime never reaches 0)
@@ -138,6 +143,7 @@ class DisplayInstrumentProfile:
             white_vs_luminance=([[float(c) for c in row] for row in d["white_vs_luminance"]]
                                 if d.get("white_vs_luminance") else None),
             warmup_reads_to_settle=(int(d["warmup_reads_to_settle"]) if d.get("warmup_reads_to_settle") is not None else None),
+            thermal_tau_patches=(int(d["thermal_tau_patches"]) if d.get("thermal_tau_patches") is not None else None),
             warmup_minutes=_opt_float(d.get("warmup_minutes")),
             fluctuation_envelope=_opt_float(d.get("fluctuation_envelope")),
             warmin_magnitude=_opt_float(d.get("warmin_magnitude")),

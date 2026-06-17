@@ -31,7 +31,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 __all__ = [
     "Transfer",
@@ -40,6 +40,8 @@ __all__ = [
     "pq_to_luminance",
     "uniform_levels",
     "perceptual_levels",
+    "patch_energy",
+    "mean_patch_energy",
     "sort_patches",
     "ramp_patches",
     "cube_patches",
@@ -162,12 +164,39 @@ def _luminance_key(transfer: Transfer) -> Callable[[Patch], tuple[float, float]]
     return key
 
 
+def patch_energy(patch: Patch, transfer: Transfer) -> float:
+    """The patch's backlight-drive proxy in nits: the peak channel's luminance.
+
+    Peak channel correlates with the mini-LED backlight zone intensity — the primary
+    driver of the panel's thermal load (heat). This is the scalar the thermal
+    ``warm-start`` rotation balances and the quantity a soak must hold to ride
+    equilibrium through a measurement run.
+    """
+    return max(transfer.cv_to_nits(patch[0]),
+               transfer.cv_to_nits(patch[1]),
+               transfer.cv_to_nits(patch[2]))
+
+
+def mean_patch_energy(patches: Iterable[Patch], transfer: Transfer) -> float:
+    """The session-average backlight energy a sequence sustains (mean :func:`patch_energy`).
+
+    This is the *operating thermal load* the sequence holds once a low-discrepancy
+    (``thermal``) ordering spreads its luminance evenly — so a preheat soak that parks
+    the panel here hands the measurement run a panel already at the temperature the run
+    will maintain (no thermal step at the soak→measure boundary). ``0.0`` for an empty set.
+    """
+    items = list(patches)
+    if not items:
+        return 0.0
+    return sum(patch_energy(p, transfer) for p in items) / len(items)
+
+
 # ---------------------------------------------------------------------------
 # Ordering — thermal golden-ratio (drift prevention), luminance, random
 # ---------------------------------------------------------------------------
 
 def sort_patches(patches: Iterable[Patch], order: str, transfer: Transfer,
-                 *, seed: int = 42, warm_tau: int = 30) -> list[Patch]:
+                 *, seed: int = 42, warm_tau: Optional[int] = None) -> list[Patch]:
     """Order a patch set.
 
     ``luminance`` — monotonic dark→bright. Minimizes backlight transitions but
@@ -179,7 +208,12 @@ def sort_patches(patches: Iterable[Patch], order: str, transfer: Transfer,
         constant. Then rotate for a pre-warmed warm-start.
     ``random``    — deterministic seeded shuffle. Decent averaging, less uniform.
     ``none``      — preserve input order.
+
+    ``warm_tau`` is the thermal time constant (in patches) the warm-start rotation
+    assumes; ``None`` ⇒ the built-in default (30). Pass the panel's *measured* τ from
+    the DIP (``thermal_tau_patches``) so the rotation models this panel, not a guess.
     """
+    tau = warm_tau if (warm_tau and warm_tau > 0) else 30
     patches = list(patches)
     if order == "none":
         return patches
@@ -209,12 +243,10 @@ def sort_patches(patches: Iterable[Patch], order: str, transfer: Transfer,
     # Warm-start rotation: pick the offset where, starting from a pre-warmed
     # panel (T = global average backlight energy), the first ~3τ patches deviate
     # least from the average — a first-order thermal model.
-    energies = [max(transfer.cv_to_nits(p[0]),
-                    transfer.cv_to_nits(p[1]),
-                    transfer.cv_to_nits(p[2])) for p in golden]
+    energies = [patch_energy(p, transfer) for p in golden]
     global_avg = sum(energies) / n
-    check = min(3 * warm_tau, n)
-    alpha = 1.0 / warm_tau
+    check = min(3 * tau, n)
+    alpha = 1.0 / tau
 
     best_off, best_mse = 0, float("inf")
     for off in range(n):
@@ -284,7 +316,8 @@ _RAMP_COLORS = _PRIMARIES + _SECONDARIES
 def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  saturations: Sequence[float] = (1.0,),
                  spacing: str = "uniform", order: str = "thermal",
-                 max_cv: int | None = None) -> list[Patch]:
+                 max_cv: int | None = None,
+                 warm_tau: Optional[int] = None) -> list[Patch]:
     """Grey ramp + RGBCMY ramps at each saturation (deduped, then ordered).
 
     For each level ``V`` and saturation ``S``: on-channels = ``V``, off-channels
@@ -318,7 +351,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
                 off = round(v * (1 - sat))
                 add((v if r_on else off, v if g_on else off, v if b_on else off))
 
-    return sort_patches(patches, order, transfer)
+    return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +359,13 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
 # ---------------------------------------------------------------------------
 
 def cube_patches(transfer: Transfer, *, size: int = 9, order: str = "luminance",
-                 max_cv: int | None = None) -> list[Patch]:
+                 max_cv: int | None = None, warm_tau: Optional[int] = None) -> list[Patch]:
     """Uniform ``size**3`` grid in code-value space."""
     if max_cv is None:
         max_cv = transfer.max_cv
     axis = uniform_levels(size, max_cv)
     patches = [(r, g, b) for r in axis for g in axis for b in axis]
-    return sort_patches(patches, order, transfer)
+    return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +375,8 @@ def cube_patches(transfer: Transfer, *, size: int = 9, order: str = "luminance",
 def tube_patches(transfer: Transfer, *, cube_size: int = 17, tube_size: int = 65,
                  tube_radius: int = 3, grid_type: str = "cub",
                  spines: bool = False, cube_max_cv: int | None = None,
-                 order: str = "thermal", max_cv: int | None = None) -> list[Patch]:
+                 order: str = "thermal", max_cv: int | None = None,
+                 warm_tau: Optional[int] = None) -> list[Patch]:
     """Cube (or BCC) grid + a Manhattan-radius tube around the neutral axis.
 
     The neutral core gives the LUT engine high resolution in the perceptually
@@ -413,7 +447,7 @@ def tube_patches(transfer: Transfer, *, cube_size: int = 17, tube_size: int = 65
             patches.update({(v, 0, 0), (0, v, 0), (0, 0, v),
                             (0, v, v), (v, 0, v), (v, v, 0)})
 
-    return sort_patches(patches, order, transfer)
+    return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 
 
 # ---------------------------------------------------------------------------
@@ -456,8 +490,8 @@ def _hsv_to_rgb_cv(h: float, s: float, v: float) -> Patch:
 
 def gamut_patches(transfer: Transfer, *, lum_steps: int = 17, hues: int = 12,
                   lum_bias: float = 1.3, floor_nits: float = 0.19,
-                  order: str = "luminance", max_cv: int | None = None
-                  ) -> list[Patch]:
+                  order: str = "luminance", max_cv: int | None = None,
+                  warm_tau: Optional[int] = None) -> list[Patch]:
     """Content-weighted volumetric set: a power-biased luminance axis (denser at
     low end), saturation shells dense near neutral, ``hues`` hue angles per
     shell, neutral axis at every level. Skips deep shadows below the probe floor.
@@ -493,7 +527,7 @@ def gamut_patches(transfer: Transfer, *, lum_steps: int = 17, hues: int = 12,
             for h in hue_angles:
                 add(_hsv_to_rgb_cv(h, s, v))
 
-    return sort_patches(patches, order, transfer)
+    return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 
 
 # ---------------------------------------------------------------------------

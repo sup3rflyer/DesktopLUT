@@ -107,6 +107,9 @@ class ThermalResult:
     drift_threshold: float                       # the net threshold used (from balance_noise)
     active_channel: Optional[Channel]            # the channel that drifted most (the cold/temperamental one)
     final_k: float
+    tau_patches: Optional[int] = None            # first-order thermal time constant in content-read
+    #   (≈ measurement-patch) units, estimated from the warm-in. None when no warm-in was observed
+    #   (inert/flat panel) — the patch-ordering rotation then keeps its default τ.
     compromised: bool = False                    # display/meter read implausibly (frozen patch / wrong mode)
     flags: list[str] = field(default_factory=list)
     needs_adjudication: bool = False
@@ -322,6 +325,16 @@ class ThermalController:
                     f"panel did not thermally converge within {cfg.max_blocks} blocks "
                     f"(net {net_active:.4f} vs threshold {threshold:.4f}) — still warming; "
                     "warm longer / inject more heat")
+        # A first-order estimate of the panel's thermal time constant in content-read (≈ measurement-
+        # patch) units: warm-in took ~(block − converge_blocks) blocks before it confirmed in-band,
+        # and a first-order system settles in ~3τ, so τ ≈ warm-in reads / 3. Only meaningful when a
+        # real warm-in was observed and the loop converged — an inert/flat panel has no τ to report
+        # (None → the patch-ordering rotation keeps its default).
+        tau_patches: Optional[int] = None
+        if converged and active is not None and warmin > threshold:
+            warmin_reads = max(0, block - cfg.converge_blocks) * max(1, cfg.load_reads_per_block)
+            if warmin_reads > 0:
+                tau_patches = max(1, round(warmin_reads / 3.0))
         needs = bool(flags)
         question = None
         if needs:
@@ -335,7 +348,7 @@ class ThermalController:
             "drift_threshold": round(threshold, 6), "active_channel": active,
             "final_k": round(k, 3), "net_active": round(net_active, 5),
             "gross_active": round(gross_active, 5), "net_over_gross": ratio,
-            "compromised": compromised,
+            "tau_patches": tau_patches, "compromised": compromised,
         }
         if self.event is not None:
             self.event("INFO" if (converged and not compromised) else "WARN", "thermal_regime", **digest)
@@ -344,7 +357,7 @@ class ThermalController:
             warmup_minutes=(minutes if regime == "convergent" else None),
             warmin_magnitude=round(warmin, 5), fluctuation_envelope=round(envelope, 5),
             drift_threshold=round(threshold, 6), active_channel=active, final_k=round(k, 3),
-            compromised=compromised,
+            tau_patches=tau_patches, compromised=compromised,
             flags=flags, needs_adjudication=needs, question=question, digest=digest)
 
     def _block_record(self, block: int, k: float, net: float, gross: float,

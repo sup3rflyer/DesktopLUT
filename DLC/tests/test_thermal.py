@@ -85,6 +85,22 @@ def test_warming_panel_converges_with_warmin_observed():
     assert res.fluctuation_envelope >= 0.0
 
 
+def test_tau_patches_reported_for_warming_panel_not_inert():
+    """The controller estimates a thermal time constant (in content-read units) from the warm-in:
+    a panel that genuinely warms in gets a positive tau; an inert panel (no chroma drift) gets
+    None (no warm-in to fit) so the patch-ordering rotation keeps its default."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    warming = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,
+                             load_thermal=True, thermal_rate=0.06, start_temp=0.0)
+    inert = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=1.0,
+                           load_thermal=True, thermal_rate=0.06, start_temp=0.0)
+    warm_res = _controller(warming, transfer).run()
+    inert_res = _controller(inert, transfer).run()
+    assert warm_res.tau_patches is not None and warm_res.tau_patches >= 1
+    assert warm_res.digest["tau_patches"] == warm_res.tau_patches
+    assert inert_res.tau_patches is None
+
+
 def test_self_activating_no_warmin_needs_no_preheat():
     """A panel with no thermal CHROMA drift (cold_blue_gain=1.0 ⇒ the neutral balance never
     moves with temperature) reads in-band immediately, so the loop never soaks and converges

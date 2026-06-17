@@ -231,6 +231,81 @@ def test_warmup_creep_triggers_drift_episode_and_appended_remeasure(tmp_path: Pa
     assert res.needs_adjudication is False
 
 
+# ---------------------------------------------------------------------------
+# thermal preheat: soak-into-calibration
+# ---------------------------------------------------------------------------
+
+def _bright_content(t: Transfer) -> list[tuple[int, int, int]]:
+    """A mid-to-bright load set (greys + R/G/B) — enough drive to warm the panel."""
+    cv = t.max_cv
+    greys = [(round(s * cv),) * 3 for s in (0.4, 0.55, 0.7, 0.85, 1.0)]
+    hi = round(0.8 * cv)
+    return greys + [(hi, 0, 0), (0, hi, 0), (0, 0, hi)]
+
+
+def _loop_with(panel, t: Transfer, cfg: MeasureLoopConfig, patches, dip=None) -> _Loop:
+    return _Loop(patches=patches, transfer=t, measure=panel, config=cfg,
+                 ndjson=_NdjsonWriter(None), events=None, dip=dip)
+
+
+def test_preheat_soaks_a_cold_panel_before_measuring():
+    # A cold, content-driven panel can't be warmed by holding grey; the preheat soaks it (using
+    # the run's OWN patch set as the load) so the panel is parked at its operating load first.
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, cold_blue_gain=0.85, load_thermal=True,
+                           thermal_rate=0.06, start_temp=0.0)
+    loop = _loop_with(panel, t, MeasureLoopConfig(preheat="always"), _bright_content(t))
+    assert panel.temp == 0.0
+    digest = loop.preheat()
+    assert digest is not None and digest["content_reads"] > 0
+    assert panel.temp > 0.3                       # the soak actually heated the panel
+    assert loop.cold_channel == "B"               # the biggest thermal mover, discovered not assumed
+
+
+def test_preheat_auto_gates_on_regime():
+    # "auto" soaks only on content-driven / still-warming panels; a convergent (or no) DIP skips it.
+    t = _sdr()
+
+    def fresh():
+        return SyntheticPanel(transfer=t, cold_blue_gain=0.85, load_thermal=True,
+                              thermal_rate=0.06, start_temp=0.0)
+
+    def dip(regime):
+        return DisplayInstrumentProfile(display="x", thermal_regime=regime)
+
+    convergent = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
+                            _bright_content(t), dip=dip("convergent"))
+    assert convergent.preheat() is None           # skipped: the static-grey settle handles it
+    fluctuating = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
+                             _bright_content(t), dip=dip("fluctuating"))
+    assert fluctuating.preheat() is not None       # soaked: grey can't warm a fluctuating panel
+    no_dip = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t))
+    assert no_dip.preheat() is None                # unknown regime ⇒ no soak
+
+
+def test_preheat_wires_into_run_and_is_off_by_default(tmp_path: Path):
+    t = _sdr()
+    # Default (auto, no DIP) ⇒ no preheat, behaviour unchanged.
+    plain = run_measure_loop(patches=_grey_ramp(t, 8), transfer=t,
+                             measure=SyntheticPanel(transfer=t, start_temp=1.0),
+                             config=MeasureLoopConfig(), ndjson_path=tmp_path / "a.ndjson")
+    assert plain.digest["preheat"] is None
+    assert plain.patch_count == 8
+    # preheat="always" ⇒ the soak runs and is reported; the run still completes normally.
+    cold = SyntheticPanel(transfer=t, cold_blue_gain=0.85, load_thermal=True,
+                          thermal_rate=0.06, start_temp=0.0)
+    soaked = run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=cold,
+                              config=MeasureLoopConfig(preheat="always"),
+                              ndjson_path=tmp_path / "b.ndjson")
+    assert soaked.digest["preheat"] is not None
+    assert soaked.digest["preheat"]["content_reads"] > 0
+    assert soaked.patch_count == 8
+    # the preheat summary marker lands in the ndjson (per-block soak rows do NOT — kept clean).
+    rows = [json.loads(ln) for ln in (tmp_path / "b.ndjson").read_text().splitlines()]
+    assert any(r.get("role") == "preheat_complete" for r in rows)
+    assert not any(r.get("phase") == "thermal" for r in rows)
+
+
 def test_persistent_flaky_patch_surfaces_as_unresolved(tmp_path: Path):
     t = _sdr()
     # start warm so warm-up settles immediately; only p0003 misbehaves.

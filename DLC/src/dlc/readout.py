@@ -150,6 +150,10 @@ class ReadoutState:
         if rec.get("role") == "warmup_complete":
             self.warm = bool(rec.get("settled"))
             return
+        # Soak summary markers (the thermal preheat / reactive re-warm) are control rows, not probe
+        # reads — don't count them toward total_reads or treat them as measurements.
+        if rec.get("role") in ("preheat_complete", "rewarm"):
+            return
 
         self.total_reads += 1
         self.phase = rec.get("phase", self.phase)
@@ -214,6 +218,12 @@ def render_console_line(rec: dict[str, Any], state: ReadoutState) -> str:
     xy = _xy(rec)
     xys = f"xy({xy[0]:.4f},{xy[1]:.4f})" if xy else "xy(  --  ,  --  )"
     role = rec.get("role")
+
+    if role == "preheat_complete":
+        return (f"[soak ] {'preheat':6s} regime={rec.get('regime', '?')} "
+                f"reads={rec.get('content_reads', '?')} k={rec.get('final_k', '?')} -> parked")
+    if role == "rewarm":
+        return f"[soak ] {'rewarm':6s} reads={rec.get('content_reads', '?')} -> re-warmed"
 
     if role == "warmup":
         settle = rec.get("settle") or {}
