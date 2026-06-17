@@ -1472,6 +1472,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="do NOT stop the persistent dogegen daemon when the run finishes "
                              "(default: a terminal run sends it `quit`, closing its window). A "
                              "pause/resume never stops it regardless.")
+    parser.add_argument("--persistent-meter", action="store_true", dest="persistent_meter",
+                        help="OPT-IN: drive ONE long-lived interactive spotread across the whole "
+                             "pass (calibrate once, one reading per trigger) instead of re-spawning "
+                             "+ re-calibrating spotread per read. ~2-3x faster per read; validate the "
+                             "raw-pipe transport against the meter once before trusting it.")
     parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
                         help="record a seam decision (repeatable) then run/resume")
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
@@ -1496,8 +1501,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         decisions[key.strip()] = Decision(choice.strip(), note="cli")
     adjudicator: Adjudicator = AutoAdjudicator() if args.auto else MappingAdjudicator(decisions)
 
-    from .measure_loop import DogegenPresenter, SocketPresenter, make_spotread_meter  # lazy: live only
-    from .argyll import Argyll
+    from .measure_loop import (  # lazy: live only
+        DogegenPresenter, SocketPresenter, make_spotread_meter, make_persistent_spotread_meter,
+    )
+    from .argyll import Argyll, SpotreadRequest
     from .dogegen import DogegenPatchDisplay
     from .measure_rgbw import resolve_spotread_instrument_port
 
@@ -1529,6 +1536,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # ("mode 10"), which needs the TPG window borderless-fullscreened to render accurately.
     bit_depth = args.bit_depth if args.bit_depth is not None else (10 if normalize_mode(args.mode) == "HDR" else 8)
     presenter = None
+    persistent_meter = None
     measure: Optional[MeasureFn] = None
     if args.flow != "build-correction":
         argyll_dir = profile.paths.get("argyll")
@@ -1556,9 +1564,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # then the profile — so a build-correction run is picked up without editing the YAML.
         store = CorrectionStore.load(correction_store_path(profile, ctx.root))
         correction = active_correction(profile, store, profile.display_for(args.monitor).name)
-        measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
-                                      output_dir=ctx.root / "measurements" / "probe",
-                                      ccmx_or_ccss=Path(correction) if correction else None)
+        ccmx = Path(correction) if correction else None
+        if args.persistent_meter:
+            # Fast path: ONE interactive spotread, identical instrument config to the one-shot
+            # (same port + correction) so it is a true drop-in to A/B against. Closed in finally.
+            if argyll is None:
+                raise SystemExit("--persistent-meter requires profile paths.argyll (the spotread executable)")
+            persistent_meter = argyll.open_persistent(SpotreadRequest(port=port, ccmx_or_ccss=ccmx))
+            measure = make_persistent_spotread_meter(presenter=presenter, persistent=persistent_meter)
+        else:
+            measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
+                                          output_dir=ctx.root / "measurements" / "probe",
+                                          ccmx_or_ccss=ccmx)
     patch_sizes = PatchSizes(raw_ramp_steps=args.raw_steps) if args.raw_steps else None
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
@@ -1588,6 +1605,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                     presenter.shutdown_daemon()
                 else:
                     presenter.close()
+            except Exception:  # noqa: BLE001
+                pass
+        # The interactive spotread is a child of THIS process — it can't outlive the CLI exit
+        # (even a pause), so always close it; a resume re-opens (one calibration per invocation,
+        # still far cheaper than per-patch).
+        if persistent_meter is not None:
+            try:
+                persistent_meter.close()
             except Exception:  # noqa: BLE001
                 pass
         # Rollback guard: a clean run reaches a 'completed' (applied) or 'reverted' terminal

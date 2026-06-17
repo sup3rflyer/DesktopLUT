@@ -64,6 +64,7 @@ __all__ = [
     "DogegenPresenter",
     "SocketPresenter",
     "make_spotread_meter",
+    "make_persistent_spotread_meter",
     "SyntheticPanel",
 ]
 
@@ -979,6 +980,43 @@ def make_spotread_meter(
                 "returncode": completed.returncode,
                 "spectral_file": str(request.output_sp) if request.output_sp else None,
             },
+        )
+
+    return measure
+
+
+def make_persistent_spotread_meter(
+    *,
+    presenter: Presenter,
+    persistent: Any,
+    settle_seconds: float = 0.0,
+) -> MeasureFn:
+    """Compose a :class:`Presenter` + a live :class:`dlc.argyll.PersistentSpotread`
+    into a :data:`MeasureFn` — the fast path that reuses ONE interactive spotread
+    process across the whole pass (calibrate once, one reading per trigger) instead
+    of spawning a fresh, self-calibrating process per read like
+    :func:`make_spotread_meter`.
+
+    ``persistent`` is a started-or-startable ``PersistentSpotread`` (its
+    :meth:`measure` returns a ``SpotreadResult``); the caller owns its lifecycle
+    and must ``close()`` it when the pass ends. ``settle_seconds`` is an OPTIONAL
+    extra dwell *after* the presenter's own settle and *before* the read — leave it
+    at 0 here and let the presenter / measure-loop own settle, so a confirm/repeat
+    read of an unchanged patch never re-pays a panel-settle it doesn't need."""
+
+    import time as _time
+
+    def measure(patch: MeasurePatch) -> Reading:
+        presenter.show(patch)
+        if settle_seconds:
+            _time.sleep(settle_seconds)
+        res = persistent.measure()
+        return Reading(
+            xyz=res.xyz,
+            yxy=res.yxy,
+            ok=res.ok,
+            error=res.error,
+            raw={"persistent": True, "result": res.raw},
         )
 
     return measure
