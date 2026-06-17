@@ -17,6 +17,9 @@ class MockDesktopLutState:
     snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     mhc: dict[str, Any] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
+    # Live HDR-active state per monitor index (the OS advanced-color flip
+    # windows.set_hdr drives). Absent ⇒ SDR. Capability is fixed (see HDR_CAPABLE).
+    hdr: dict[int, bool] = field(default_factory=dict)
     command_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
@@ -27,12 +30,17 @@ class MockDesktopLutState:
             "snapshots": deepcopy(self.snapshots),
             "mhc": deepcopy(self.mhc),
             "runtime": deepcopy(self.runtime),
+            "hdr": deepcopy(self.hdr),
             "command_count": self.command_count,
         }
 
 
 class MockDesktopLutServer:
     """Small command handler matching the DesktopLUT API contract."""
+
+    # Fixed HDR capability per simulated monitor (mirrors query_monitors below):
+    # monitor 0 is the HDR-capable primary, monitor 1 is SDR-only.
+    HDR_CAPABLE = {0: True, 1: False}
 
     def __init__(self) -> None:
         self.state = MockDesktopLutState()
@@ -77,6 +85,8 @@ class MockDesktopLutServer:
                 )
             if method == "windows.query_monitors":
                 return self.ok(self.query_monitors())
+            if method == "windows.set_hdr":
+                return self.handle_set_hdr(params)
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         except KeyError as exc:
             return DesktopLutResponse(ok=False, error=f"missing parameter: {exc.args[0]}")
@@ -86,8 +96,9 @@ class MockDesktopLutServer:
 
     def query_monitors(self) -> dict[str, Any]:
         """A deterministic two-display layout mirroring the C++ contract shape:
-        monitor 0 primary (SDR), monitor 1 secondary. Lets orchestrator/mapping
-        tests exercise display-mapping logic with no hardware."""
+        monitor 0 primary (HDR-capable), monitor 1 secondary (SDR-only). The
+        hdr_active/color_space fields track windows.set_hdr so orchestrator/mapping
+        tests exercise display-mapping + mode-switch logic with no hardware."""
         monitors = [
             {
                 "index": 0,
@@ -101,8 +112,6 @@ class MockDesktopLutServer:
                 "target_id": 0,
                 "adapter_id": {"low": 0, "high": 0},
                 "hdr_capable": True,
-                "hdr_active": False,
-                "color_space": "SDR",
             },
             {
                 "index": 1,
@@ -116,11 +125,38 @@ class MockDesktopLutServer:
                 "target_id": 1,
                 "adapter_id": {"low": 0, "high": 0},
                 "hdr_capable": False,
-                "hdr_active": False,
-                "color_space": "SDR",
             },
         ]
+        for m in monitors:
+            active = bool(self.state.hdr.get(m["index"], False))
+            m["hdr_active"] = active
+            m["color_space"] = "HDR" if active else "SDR"
         return {"available": True, "simulated": True, "count": len(monitors), "monitors": monitors}
+
+    def handle_set_hdr(self, params: dict[str, Any]) -> DesktopLutResponse:
+        if "monitor" not in params:
+            return DesktopLutResponse(ok=False, error="missing parameter: monitor")
+        mon = int(params["monitor"])
+        if mon not in self.HDR_CAPABLE:
+            return DesktopLutResponse(ok=False, error="monitor index out of range")
+        capable = self.HDR_CAPABLE[mon]
+        current = bool(self.state.hdr.get(mon, False))
+        enable = params.get("enable")
+        target = (not current) if enable is None else bool(enable)
+        if target and not capable:
+            return DesktopLutResponse(ok=False, error="monitor does not support HDR")
+        changed = target != current
+        if changed:
+            self.state.hdr[mon] = target
+        return self.ok(
+            {
+                "monitor": mon,
+                "hdr_capable": capable,
+                "was_active": current,
+                "now_active": target,
+                "changed": changed,
+            }
+        )
 
     def key(self, params: dict[str, Any]) -> str:
         return f"{params['monitor']}:{str(params['mode']).upper()}"

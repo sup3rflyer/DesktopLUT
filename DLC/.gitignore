@@ -15,6 +15,10 @@ calibration_profile.yaml
 # The persistent per-display correction store (CCMX/SPD/resolved-white record) —
 # display- and probe-specific, lives next to the profile.
 correction_store.json
+# The persistent per-display+instrument profile (DIP): measured panel/meter behaviour
+# (native white/primaries, noise model, cold channel, thermal regime) — same private,
+# display-specific class as correction_store.json.
+dip_store.json
 results/
 # Measurement & instrument-correction artifacts (display- and probe-specific)
 *.ti1

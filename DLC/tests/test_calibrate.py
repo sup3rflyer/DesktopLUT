@@ -33,7 +33,9 @@ from dlc.calibrate import (
     Decision,
     MappingAdjudicator,
     PatchSizes,
+    apply_set_hdr,
     build_volumetric_set,
+    color_space_is_hdr,
     flow_patch_counts,
     main,
     run_calibration,
@@ -65,15 +67,15 @@ def _fake_launch(cmds):
     return {"launched": True, "fake": True, "argv": cmds["ccxxmake_argv"]}
 
 
-def _make(tmp_path: Path, name: str, *, panel=None, controller=None, adjudicator=None,
+def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
           characterize_config=None) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
-        else create_run("SDR", display="synthetic", run_dir=run_dir)
+        else create_run(mode, display="synthetic", run_dir=run_dir)
     profile = cp.Profile.synthetic(output_dir=str(output_dir or (tmp_path / "results")))
     return Calibration(
-        ctx=ctx, profile=profile, monitor=0, mode="SDR",
+        ctx=ctx, profile=profile, monitor=0, mode=mode,
         controller=controller or CalibrationController.mock(),
         measure=panel if panel is not None else _perfect_panel(),
         adjudicator=adjudicator or AutoAdjudicator(),
@@ -526,6 +528,54 @@ def test_preflight_surfaces_patch_window_guard(tmp_path: Path):
     calib.run("mhc-only")
     pw = calib.calib["stages"]["preflight"]["digest"]["patch_window"]
     assert pw["checked"] is True and pw["target_is_primary"] is True
+
+
+# ---------------------------------------------------------------------------
+# display mode (SDR <-> HDR) — the guard tell + helpers
+# ---------------------------------------------------------------------------
+def test_guard_quiet_when_display_mode_matches_request(tmp_path: Path):
+    # SDR run on an SDR panel (the mock default) ⇒ no mode warning.
+    calib = _make(tmp_path, "mode_ok", mode="SDR")
+    guard = calib._patch_window_guard()
+    assert guard["target_color_space"] == "SDR"
+    assert "mode_warning" not in guard
+
+
+def test_guard_warns_when_run_is_hdr_but_panel_is_sdr(tmp_path: Path):
+    # An HDR run on a still-SDR panel would measure the wrong colorspace on every
+    # patch — the guard must say so and name the --set-hdr fix.
+    calib = _make(tmp_path, "mode_warn", mode="HDR")
+    guard = calib._patch_window_guard()
+    assert guard["requested_mode"] == "HDR" and guard["target_color_space"] == "SDR"
+    assert "mismatch" in guard["mode_warning"]
+    assert "--set-hdr on" in guard["mode_warning"]
+
+
+def test_guard_quiet_when_hdr_run_on_hdr_panel(tmp_path: Path):
+    # Flip the panel to HDR first; an HDR run then matches ⇒ no warning.
+    calib = _make(tmp_path, "mode_hdr_ok", mode="HDR")
+    calib.controller.set_hdr(0, enable=True)
+    guard = calib._patch_window_guard()
+    assert guard["target_color_space"] == "HDR" and "mode_warning" not in guard
+
+
+def test_color_space_is_hdr_classifies_acm_as_sdr_family():
+    assert color_space_is_hdr("HDR") is True
+    assert color_space_is_hdr("SDR") is False
+    assert color_space_is_hdr("ACM_SDR") is False   # FP16 SDR scanout is still SDR
+    assert color_space_is_hdr(None) is False
+
+
+def test_apply_set_hdr_resolves_actions(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    on = apply_set_hdr(ctrl, 0, "on")
+    assert on["now_active"] is True and on["changed"] is True
+    off = apply_set_hdr(ctrl, 0, "off")
+    assert off["now_active"] is False
+    tog = apply_set_hdr(ctrl, 0, "toggle")
+    assert tog["now_active"] is True
+    with pytest.raises(ValueError):
+        apply_set_hdr(ctrl, 0, "sideways")
 
 
 def test_plan_veto_aborts_when_operator_declines(tmp_path: Path):

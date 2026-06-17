@@ -75,6 +75,22 @@ class CalibrationController:
         """
         return self.call("windows.query_monitors")
 
+    # -- display mode (SDR <-> HDR) ---------------------------------------
+    def set_hdr(self, monitor: int, enable: bool) -> dict[str, Any]:
+        """Switch a monitor's OS advanced-color (HDR) state on or off.
+
+        The same flip DesktopLUT's HDR-toggle hotkey performs, but targeted at an
+        explicit monitor + explicit desired state so DLC can drive SDR/HDR
+        characterize/calibrate modes without the operator touching Windows
+        Settings. Idempotent (a no-op when already in the requested state).
+        Returns ``{monitor, hdr_capable, was_active, now_active, changed}``.
+        """
+        return self.call("windows.set_hdr", {"monitor": int(monitor), "enable": bool(enable)})
+
+    def toggle_hdr(self, monitor: int) -> dict[str, Any]:
+        """Flip a monitor between SDR and HDR (omit the target to invert current)."""
+        return self.call("windows.set_hdr", {"monitor": int(monitor)})
+
     # -- calibration mode / clearing --------------------------------------
     def enter_neutral(
         self,

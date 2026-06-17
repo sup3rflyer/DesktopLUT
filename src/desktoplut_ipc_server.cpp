@@ -586,6 +586,60 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
     result.set("monitors", arr);
 }
 
+// Switch a monitor between SDR and HDR over the wire — the same OS advanced-color
+// flip the HDR-toggle hotkey performs, but targeted at an explicit monitor and an
+// explicit desired state (so DLC can drive the SDR<->HDR characterize/calibrate
+// modes without the operator touching Windows Settings). Params: monitor (int,
+// required) + enable (bool, optional — absent means toggle). Idempotent: a no-op
+// when already in the requested state. Resolution/read/set are thread-agnostic
+// DisplayConfig calls (the same ones HandleQueryMonitors uses off-thread), so this
+// runs off the GUI thread; DesktopLUT's own mode-switch MHC reapply fires
+// independently off the WM_DISPLAYCHANGE the flip generates.
+void HandleSetHdr(const JsonValue& p, JsonValue& result, std::string& error) {
+    if (!p.has("monitor")) { error = "missing parameter: monitor"; return; }
+    int mon = p.getInt("monitor", -1);
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        if (mon < 0 || mon >= (int)g_gui.monitorSettings.size()) {
+            error = "monitor index out of range"; return;
+        }
+    }
+
+    DisplayInfo di;
+    if (!GetDisplayInfoForMonitor(mon, di)) {
+        error = "could not resolve display for monitor"; return;
+    }
+    result.set("monitor", JNum((double)mon));
+    result.set("hdr_capable", JBool(di.isHdrCapable));
+
+    bool current = false;
+    if (!GetDisplayHdrState(di, current)) {
+        error = "could not read current HDR state"; return;
+    }
+    result.set("was_active", JBool(current));
+
+    // Target: explicit `enable` (accept bool or 0/1 number), else toggle.
+    const JsonValue* en = p.find("enable");
+    bool target;
+    if (en && en->type == JsonValue::Bool) target = en->b;
+    else if (en && en->type == JsonValue::Num) target = (en->num != 0.0);
+    else target = !current;  // toggle
+
+    if (target && !di.isHdrCapable) { error = "monitor does not support HDR"; return; }
+
+    bool changed = false;
+    if (target != current) {
+        if (!SetDisplayHdrState(di, target)) { error = "SetDisplayHdrState failed"; return; }
+        changed = true;
+    }
+
+    // Re-read so the result reflects the authoritative resulting state, not intent.
+    bool now = target;
+    GetDisplayHdrState(di, now);
+    result.set("now_active", JBool(now));
+    result.set("changed", JBool(changed));
+}
+
 // ===========================================================================
 // Mutating handlers (run on the GUI thread via WM_CALIB_CMD)
 // ===========================================================================
@@ -933,6 +987,8 @@ std::string Dispatch(const std::string& request) {
             HandleQueryGammaRamp(params, result);
         } else if (method == "windows.query_monitors") {
             HandleQueryMonitors(params, result);
+        } else if (method == "windows.set_hdr") {
+            HandleSetHdr(params, result, error);  // off-thread DisplayConfig flip
         } else if (method == "maintenance.verify_mhc") {
             DoVerifyMhc(params, result, error);  // read-only, safe off the GUI thread
         } else if (IsMutatingMethod(method)) {

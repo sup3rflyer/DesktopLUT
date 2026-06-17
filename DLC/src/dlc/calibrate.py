@@ -682,12 +682,28 @@ class Calibration:
         target = next((m for m in monitors if m.get("index") == self.monitor), None)
         primary_idx = primary.get("index") if primary else None
         target_is_primary = primary_idx is not None and primary_idx == self.monitor
+        live_cs = (target or {}).get("color_space")
         guard: dict[str, Any] = {
             "checked": True, "target_monitor": self.monitor, "primary_monitor": primary_idx,
             "target_is_primary": target_is_primary,
             "target_device": (target or {}).get("device_name"),
             "target_rect": (target or {}).get("rect"),
+            "target_color_space": live_cs,
+            "requested_mode": self.mode,
         }
+        # Display-mode match: a run in --mode HDR measured on a still-SDR panel (or vice
+        # versa) reads the wrong colorspace on every patch. Tell the operator to flip the
+        # panel first (`dlc-calibrate --set-hdr on/off --monitor N`) rather than measure
+        # blindly. Best-effort: an unknown color_space yields no warning, never blocks.
+        if live_cs is not None:
+            want_hdr = self.mode == "HDR"
+            if want_hdr != color_space_is_hdr(live_cs):
+                guard["mode_warning"] = (
+                    f"display mode mismatch: calibration runs in {self.mode} but monitor "
+                    f"{self.monitor} is currently {live_cs}. Flip the panel to {self.mode} first — "
+                    f"`dlc-calibrate --set-hdr {'on' if want_hdr else 'off'} --monitor {self.monitor}` "
+                    f"(and start the dogegen daemon in the matching mode) — or every patch is "
+                    f"measured in the wrong colorspace.")
         if primary_idx is not None and not target_is_primary:
             dev = (target or {}).get("device_name") or f"monitor {self.monitor}"
             guard["warning"] = (
@@ -729,6 +745,8 @@ class Calibration:
             patch_window = self._patch_window_guard()
             if patch_window.get("warning"):
                 self.ctx.log(patch_window["warning"])
+            if patch_window.get("mode_warning"):
+                self.ctx.log(patch_window["mode_warning"])
             # Display+Instrument Profile staleness *tell* (never a gate): the measure loop
             # works without a DIP (single-read default), but a fresh one makes reads noise-aware.
             # Surface present/stale/missing so the LLM can choose to `--flow characterize` first.
@@ -1703,6 +1721,34 @@ FLOWS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Display mode (SDR <-> HDR)
+# ---------------------------------------------------------------------------
+
+def color_space_is_hdr(color_space: Optional[str]) -> bool:
+    """True iff a query_monitors ``color_space`` is HDR. SDR and ACM_SDR are both
+    SDR-family (ACM is the FP16 SDR scanout, still an SDR calibration target)."""
+    return str(color_space).upper() == "HDR"
+
+
+def apply_set_hdr(controller: Any, monitor: int, action: str) -> dict[str, Any]:
+    """Resolve a ``--set-hdr`` action to a controller call + result.
+
+    ``on``/``off`` set the OS advanced-color (HDR) state explicitly; ``toggle``
+    inverts it. This is the same flip DesktopLUT's HDR-toggle hotkey performs,
+    exposed so the operator can put the panel in the right mode (and start the
+    matching dogegen daemon) before an HDR characterize/calibrate run.
+    """
+    a = str(action).strip().lower()
+    if a in ("toggle", ""):
+        return controller.toggle_hdr(monitor) or {}
+    if a in ("on", "hdr", "true", "1", "enable"):
+        return controller.set_hdr(monitor, enable=True) or {}
+    if a in ("off", "sdr", "false", "0", "disable"):
+        return controller.set_hdr(monitor, enable=False) or {}
+    raise ValueError(f"--set-hdr must be on/off/toggle, got {action!r}")
+
+
+# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
@@ -1990,7 +2036,28 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="cancel: roll DesktopLUT back to the user's pre-run setup "
                              "(restore the calibration snapshot) and exit. Use to bail out of "
                              "a paused/abandoned run without leaving a half-applied profile.")
+    parser.add_argument("--set-hdr", choices=["on", "off", "toggle"], default=None, dest="set_hdr",
+                        help="flip monitor --monitor between SDR and HDR (the same OS advanced-color "
+                             "switch as DesktopLUT's HDR-toggle hotkey) and EXIT — no calibration. "
+                             "Use before an HDR run: --set-hdr on, then start the HDR dogegen daemon, "
+                             "then characterize/calibrate.")
     args = parser.parse_args(argv)
+
+    # Standalone display-mode switch: flip the monitor's OS HDR state and exit. Independent
+    # of any profile/run/measure stack (just the pipe) so it works as a quick pre-run step —
+    # put the panel in HDR, start the matching dogegen daemon, THEN run characterize.
+    if args.set_hdr is not None:
+        controller = CalibrationController.connect()
+        try:
+            res = apply_set_hdr(controller, args.monitor, args.set_hdr)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"status": "set_hdr_failed", "monitor": args.monitor,
+                              "action": args.set_hdr, "error": f"{type(exc).__name__}: {exc}",
+                              "hint": "needs DesktopLUT running with the calibration pipe armed "
+                                      "and a build that supports windows.set_hdr"}, indent=2))
+            return 1
+        print(json.dumps({"status": "set_hdr", "action": args.set_hdr, **res}, indent=2))
+        return 0
 
     profile = cp.load_profile(args.profile)
 
