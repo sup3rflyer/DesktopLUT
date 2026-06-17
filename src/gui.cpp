@@ -549,7 +549,10 @@ void ApplyCalibrationControl(bool enable) {
     if (g_gui.hwndSettingsCalibration)
         SendMessage(g_gui.hwndSettingsCalibration, BM_SETCHECK,
                     enable ? BST_CHECKED : BST_UNCHECKED, 0);
-    UpdateTrayIcon(g_gui.isRunning.load());  // refresh the armed-state tooltip
+    // Refresh the armed-state tooltip. The icon argument MUST be the real
+    // shader-active state — the icon strictly signals "software shader active"
+    // and nothing else. Arming/disarming calibration only changes the tooltip.
+    UpdateTrayIcon(g_shaderCorrectionsActive.load(std::memory_order_relaxed));
 }
 
 // ============================================================================
