@@ -828,17 +828,32 @@ class Presenter(Protocol):
 
 
 class DogegenPresenter:
-    """:class:`Presenter` backed by :class:`dlc.dogegen.DogegenPatchDisplay`."""
+    """:class:`Presenter` backed by :class:`dlc.dogegen.DogegenPatchDisplay`.
 
-    def __init__(self, display: Any, *, patch_size: int = 100, settle_seconds: float = 0.5) -> None:
+    When ``place_rect`` is given, the spawned window is placed onto that monitor automatically
+    (closing dogegen's wrong-panel hazard — it always opens on the Windows primary, which may not
+    be the calibration target). ``fullscreen=False`` (the default) *moves* the window but keeps it
+    composited so a DWM-hook 3D LUT still applies — correct for the 8-bit SDR / verify path;
+    ``fullscreen=True`` borderless-fullscreens it (bypasses the compositor) for corrections-OFF
+    bit-accurate 10-bit/HDR measurement. Placement is best-effort and never blocks a spawn."""
+
+    def __init__(self, display: Any, *, patch_size: int = 100, settle_seconds: float = 0.5,
+                 place_rect: Any = None, fullscreen: bool = False) -> None:
         self.display = display
         self.patch_size = patch_size
         self.settle_seconds = settle_seconds
+        self.place_rect = place_rect
+        self.fullscreen = fullscreen
+        self.placement: Any = None
         self._proc = None
 
     def _ensure(self) -> Any:
         if self._proc is None:
             self._proc = self.display.start()
+            if self.place_rect is not None:
+                from .dogegen_window import place_dogegen
+                self.placement = place_dogegen(self._proc.pid, rect=self.place_rect,
+                                               fullscreen=self.fullscreen)
         return self._proc
 
     def show(self, patch: MeasurePatch) -> None:

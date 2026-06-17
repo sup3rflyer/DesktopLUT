@@ -1882,8 +1882,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             if not dogegen_path:
                 raise SystemExit("profile paths.dogegen is required for measuring flows "
                                  "(the patch generator executable, e.g. third_party/dogegen/dogegen.exe)")
+            # Place the spawned window on the calibration target monitor (dogegen opens on the
+            # Windows primary and has no monitor-select CLI). Composited move-only by default so
+            # the 3D LUT still applies; best-effort — a pipe hiccup just leaves it on the primary.
+            from .dogegen_window import resolve_monitor_rect
+            try:
+                place_rect = resolve_monitor_rect(
+                    (controller.query_monitors() or {}).get("monitors"), args.monitor)
+            except Exception:  # noqa: BLE001 - advisory placement; never block the run
+                place_rect = None
             presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), normalize_mode(args.mode),
-                                                             bit_depth=bit_depth))
+                                                             bit_depth=bit_depth),
+                                         place_rect=place_rect)
         # The active correction comes from the store first (a freshly probe-matched .ccmx)
         # then the profile — so a build-correction run is picked up without editing the YAML.
         store = CorrectionStore.load(correction_store_path(profile, ctx.root))
