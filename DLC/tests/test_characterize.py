@@ -44,9 +44,11 @@ class _FakeClock:
 
 
 def _fast_cfg(**kw) -> CharacterizeConfig:
+    # warmup_max_minutes=0 SKIPS the (slow) thermal phase by default; the thermal-regime tests
+    # opt back in explicitly. Keeps the noise/settle/native tests fast.
     base = dict(noise_levels=(1.0, 0.2), noise_reads=5, settle_discard=1, black_reads=2,
                 primary_reads=2, settle_levels={"bright": 1.0, "dark": 0.05},
-                warmup_observe_reads=10, creep_reads=3)
+                warmup_observe_reads=10, warmup_max_minutes=0, creep_reads=3)
     base.update(kw)
     return CharacterizeConfig(**base)
 
@@ -146,16 +148,39 @@ def test_native_white_black_primaries_measured():
     assert abs(dip.native_primaries["B"][0] - 0.15) < 0.01
 
 
-def test_settle_time_is_measured_per_level():
+def test_settle_is_dwell_based_not_read_time_inflated():
+    # A panel that settles within one integration reports a SMALL dwell — NOT the old read-count
+    # artifact (which reported ~28 s = 3-4 slow dark reads). The earliest read already matches the
+    # final value, so the reported settle is sub-second regardless of how slow the reads are.
     res = run_characterization(measure=_perfect_panel(), transfer=_transfer(),
                                config=_fast_cfg(), clock=_FakeClock(dt=0.1))
     dip = res.dip
-    assert dip.settle_by_level is not None
-    assert set(dip.settle_by_level) == {"bright", "dark"}
-    # a clean warm panel settles quickly, but the elapsed time is real (>0) and the
-    # reported worst-case settle_seconds is the max across levels
-    assert all(v > 0 for v in dip.settle_by_level.values())
+    assert dip.settle_by_level is not None and set(dip.settle_by_level) == {"bright", "dark"}
+    assert all(0.0 <= v < 1.0 for v in dip.settle_by_level.values())   # sub-second, not integration-inflated
     assert dip.settle_seconds == max(dip.settle_by_level.values())
+
+
+def test_settle_dwell_detects_slow_droop():
+    # A panel with ABL-style droop (target reads high then decays over a few reads) must report a
+    # settle PAST the first read — the dwell method catches the real slow stabilization.
+    from dlc.measure_loop import Reading
+    base = _perfect_panel()
+    seen: dict = {}
+
+    def droop(patch):
+        r = base(patch)
+        if patch.label.startswith("settle_") and not patch.label.endswith("_from") and r.xyz:
+            i = seen.get(patch.label, 0)
+            seen[patch.label] = i + 1
+            d = max(0.0, 0.20 * (1.0 - i / 4.0))   # +20% fading to 0 by the 4th read
+            x, y, z = r.xyz
+            return Reading(xyz=(x * (1 + d), y * (1 + d), z * (1 + d)), yxy=r.yxy, ok=True)
+        return r
+
+    res = run_characterization(measure=droop, transfer=_transfer(),
+                               config=_fast_cfg(settle_levels={"bright": 1.0}, settle_required=2),
+                               clock=_FakeClock(dt=0.1))
+    assert res.dip.settle_by_level["bright"] >= 0.5   # the droop pushed settle well past the instant case
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +234,8 @@ def test_unsettleable_settle_is_flagged_not_capped():
                                config=_fast_cfg(warmup_observe_reads=4, settle_observe_reads=5),
                                clock=_FakeClock())
     assert res.needs_adjudication is True
-    assert any("settle did not converge" in f for f in res.flags)
-    # an unconverged level contributes NO fabricated settle value
+    assert any("settle did not stabilize" in f for f in res.flags)
+    # an unstable level contributes NO fabricated settle value
     assert "bright" not in (res.dip.settle_by_level or {})
 
 
@@ -259,3 +284,76 @@ def test_display_name_is_stamped_through():
     res = run_characterization(measure=_perfect_panel(), transfer=_transfer(),
                                config=_fast_cfg(), clock=_FakeClock(), display="My Panel")
     assert res.dip.display == "My Panel"
+
+
+# ---------------------------------------------------------------------------
+# thermal regime — classified from the data (convergent / fluctuating / warming)
+# ---------------------------------------------------------------------------
+
+def _thermal_cfg(**kw) -> CharacterizeConfig:
+    base = dict(noise_levels=(1.0,), noise_reads=2, black_reads=1, primary_reads=1,
+                settle_levels={"bright": 1.0}, creep_reads=2,
+                warmup_max_minutes=0.05, warmup_window_reads=4, warmup_stable_windows=2)
+    base.update(kw)
+    return CharacterizeConfig(**base)
+
+
+def test_thermal_regime_convergent_on_warm_panel():
+    # A warm, stable panel reaches steady temperature → convergent, with a recorded warm-up time.
+    res = run_characterization(measure=_perfect_panel(), transfer=_transfer(),
+                               config=_thermal_cfg(warmup_max_minutes=2.0), clock=_FakeClock())
+    assert res.dip.thermal_regime == "convergent"
+    assert res.dip.warmup_minutes is not None
+    assert not any("steady" in f or "warming" in f for f in res.flags)
+
+
+def test_thermal_regime_fluctuating_detected():
+    # A panel that bounces (high gross motion, ~0 net drift) never settles → FLUCTUATING (HDR-like):
+    # the DIP marks it, recommends frequent re-referencing, and flags the maintain-load strategy.
+    import math
+    from dlc.measure_loop import Reading
+    base = _perfect_panel()
+    n = {"i": 0}
+
+    def osc(patch):
+        r = base(patch)
+        if patch.label == "thermal_white" and r.xyz:
+            n["i"] += 1
+            f = 1.0 + 0.04 * math.sin(n["i"] * 1.3)
+            x, y, z = r.xyz
+            return Reading(xyz=(x * f, y * f, z * f), yxy=r.yxy, ok=True)
+        return r
+
+    res = run_characterization(measure=osc, transfer=_transfer(), config=_thermal_cfg(), clock=_FakeClock())
+    assert res.dip.thermal_regime == "fluctuating"
+    assert res.dip.recommended_neutral_interval == 4      # no steady state → aggressive drift checks
+    assert res.dip.warmup_minutes is None                 # no warm-up target exists
+    assert res.needs_adjudication is True
+    assert any("steady temperature" in f for f in res.flags)
+
+
+def test_thermal_regime_warming_when_monotonic_and_unsettled():
+    # A panel still drifting in ONE direction at the bound is 'warming' (net≈gross), not fluctuating.
+    from dlc.measure_loop import Reading
+    base = _perfect_panel()
+    n = {"i": 0}
+
+    def warming(patch):
+        r = base(patch)
+        if patch.label == "thermal_white" and r.xyz:
+            n["i"] += 1
+            f = 1.0 + 0.02 * n["i"]            # monotonic upward drift, never settles
+            x, y, z = r.xyz
+            return Reading(xyz=(x * f, y * f, z * f), yxy=r.yxy, ok=True)
+        return r
+
+    res = run_characterization(measure=warming, transfer=_transfer(), config=_thermal_cfg(), clock=_FakeClock())
+    assert res.dip.thermal_regime == "warming"
+    assert any("still warming" in f for f in res.flags)
+
+
+def test_thermal_phase_skipped_when_disabled():
+    res = run_characterization(measure=_perfect_panel(), transfer=_transfer(),
+                               config=_fast_cfg(warmup_max_minutes=0), clock=_FakeClock())
+    assert res.dip.thermal_regime is None
+    assert res.dip.warmup_minutes is None

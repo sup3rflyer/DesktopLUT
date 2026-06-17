@@ -805,10 +805,12 @@ def test_run_calibration_convenience_entry(tmp_path: Path):
 
 from dlc.characterize import CharacterizeConfig
 
-# A small, fast characterization recipe for the orchestrator tests.
+# A small, fast characterization recipe for the orchestrator tests. warmup_max_minutes=0 SKIPS the
+# thermal phase: the orchestrator runs with the real monotonic clock + an instant synthetic panel, so
+# a wall-clock thermal bound would spin. Thermal-regime logic is covered in test_characterize.py.
 _CHAR = CharacterizeConfig(noise_levels=(1.0, 0.2), noise_reads=4, black_reads=2,
                            primary_reads=1, settle_levels={"bright": 1.0},
-                           warmup_observe_reads=8, creep_reads=2)
+                           warmup_observe_reads=8, creep_reads=2, warmup_max_minutes=0)
 
 
 def test_characterize_flow_produces_and_stores_dip(tmp_path: Path):
@@ -894,7 +896,8 @@ def test_characterize_abnormal_surfaces_review_seam(tmp_path: Path):
     calib = _make(tmp_path, "char_abn", panel=jittery,
                   characterize_config=CharacterizeConfig(
                       noise_levels=(1.0,), noise_reads=4, black_reads=1, primary_reads=1,
-                      settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1))
+                      settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1,
+                      warmup_max_minutes=0))
     result = calib.run("characterize")
     assert result.status == "completed"
     assert "characterize:review" in calib.calib["decisions"]
@@ -912,7 +915,8 @@ def test_characterize_review_abort_restores_display_and_drops_dip(tmp_path: Path
     calib = _make(tmp_path, "char_abort", panel=jittery, controller=ctrl,
                   characterize_config=CharacterizeConfig(
                       noise_levels=(1.0,), noise_reads=4, black_reads=1, primary_reads=1,
-                      settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1),
+                      settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1,
+                      warmup_max_minutes=0),
                   adjudicator=MappingAdjudicator({"characterize:plan": Decision("approve"),
                                                   "characterize:review": Decision("abort", note="redo")}))
     result = calib.run("characterize")
@@ -955,6 +959,24 @@ def test_preflight_dip_tell_when_stale(tmp_path: Path):
     assert result.status == "completed"
     dip_status = calib.calib["stages"]["preflight"]["digest"]["dip"]
     assert dip_status["present"] is True and dip_status["stale"] is True
+
+
+def test_dip_lookup_is_mode_specific(tmp_path: Path):
+    # SDR and HDR DIPs for one panel coexist; an SDR calibration picks the SDR profile, not HDR.
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_mode")   # mode SDR
+    store = calib._dip_store()
+    store.record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED", mode="SDR", cold_channel="B",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.05, reads=10)],
+        recommended_neutral_interval=20, made="2026-06-16"), save=False)
+    store.record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED", mode="HDR", cold_channel="B", thermal_regime="fluctuating",
+        noise_model=[NoiseBand(nits=600.0, sigma_de=0.3, reads=10)],
+        recommended_neutral_interval=4, made="2026-06-16"))
+    dip = calib._dip()
+    assert dip is not None and dip.mode == "SDR"
+    assert dip.recommended_neutral_interval == 20   # the SDR profile, not the HDR one (interval 4)
 
 
 def test_loop_config_uses_dip_cold_channel_when_profile_has_none(tmp_path: Path):

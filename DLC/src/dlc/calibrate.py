@@ -575,10 +575,18 @@ class Calibration:
         by the ``characterize`` flow and consumed by the measure loop's read policy."""
         return DipStore.load(dip_store_path(self.profile, self.ctx.root))
 
+    def _dip_key(self) -> str:
+        """The per-display, per-MODE DIP key — panel thermal/noise behaviour differs by mode
+        (SDR converges to a steady temperature; HDR is content-driven and never settles), so an
+        SDR and an HDR profile for one panel must coexist."""
+        return f"{self.display.name}:{self.mode}"
+
     def _dip(self) -> Optional[DisplayInstrumentProfile]:
-        """This display's DIP, if one has been characterized (else ``None`` → the measure
-        loop falls back to its single-read default; runs are leaner, just not noise-aware)."""
-        return self._dip_store().get(self.display.name)
+        """This display+mode's DIP, if one has been characterized (else ``None`` → the measure
+        loop falls back to its single-read default; runs are leaner, just not noise-aware). Falls
+        back to a mode-less record for back-compat with DIPs written before mode-keying."""
+        store = self._dip_store()
+        return store.get(self._dip_key()) or store.get(self.display.name)
 
     def _loop_config_for(self, dip: Optional[DisplayInstrumentProfile]) -> MeasureLoopConfig:
         """Build the measure-loop config, preferring DIP-*measured* values over the profile's
@@ -1049,6 +1057,7 @@ class Calibration:
             store = self._dip_store()
             dip = replace(result.dip,
                           display=self.display.name,
+                          mode=self.mode,           # store keyed by display:mode (SDR/HDR coexist)
                           instrument=self.profile.meter.model,
                           correction_file=active_correction(self.profile, store, self.display.name),
                           made=self.run_date.isoformat(),
@@ -1605,10 +1614,12 @@ class Calibration:
                 digest={"message": f"display {self.monitor} has no {self.mode} target — needed only "
                                    "for the patch transfer (bit depth); add one to the profile."}))
         spec = self.profile.target(target)
+        # HDR characterization IS allowed (unlike HDR *calibration*, which is post-v1): it only
+        # measures the native panel + restores, and HDR is exactly where learning the thermal
+        # regime matters most (the backlight is content-driven and may never reach steady state).
         if spec.is_hdr:
-            raise CalibrationAborted(StageOutcome(
-                "characterize", "aborted",
-                digest={"message": "HDR characterization is post-v1 (SDR-first); characterize on an SDR target."}))
+            self.ctx.log("characterizing in HDR — measurement-only (no calibration is built/applied); "
+                         "learning the panel's HDR thermal behaviour.")
         self.target_name = target
         self.calib["target"] = target
         self._save()
@@ -1632,7 +1643,7 @@ class Calibration:
             # operator's setup must come back even on the abort path (clear-native put it in
             # native). A live AdjudicationRequired pause is NOT a CalibrationAborted, so it skips
             # this and propagates to the pause (the panel stays native for the resuming run).
-            self._dip_store().remove(self.display.name)
+            self._dip_store().remove(self._dip_key())
             self._restore_user_setup(why="characterization rejected at review — nothing applied")
             raise
         # Leave the display exactly as we found it (clear-native entered native via the pipe).
@@ -1940,6 +1951,23 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                        help="print the per-stage patch counts for the flow (the run's size) and exit, "
                             "WITHOUT measuring — decide the time/size first.")
 
+    # ---- characterize tuning (the `characterize` flow only; default=None ⇒ keep the built-in) ----
+    char = parser.add_argument_group("characterize (DIP learning run — overrides the defaults)")
+    char.add_argument("--char-noise-levels", type=float, nargs="+", default=None, dest="char_noise_levels",
+                      help="signal levels (code-value fractions) to estimate read σ at (default 1.0 0.5 0.18 0.05).")
+    char.add_argument("--char-noise-reads", type=int, default=None, dest="char_noise_reads",
+                      help="back-to-back reads per noise level (σ-estimation sample; default 20).")
+    char.add_argument("--char-black-reads", type=int, default=None, dest="char_black_reads")
+    char.add_argument("--char-primary-reads", type=int, default=None, dest="char_primary_reads")
+    char.add_argument("--char-creep-reads", type=int, default=None, dest="char_creep_reads")
+    char.add_argument("--char-settle-reads", type=int, default=None, dest="char_settle_reads",
+                      help="max reads per settle level before flagging (default 40).")
+    char.add_argument("--char-warmup-max-minutes", type=float, default=None, dest="char_warmup_max_minutes",
+                      help="thermal-stabilization observation bound in minutes (0 ⇒ SKIP the thermal "
+                           "phase, e.g. a quick mechanism check; default 30).")
+    char.add_argument("--char-warmup-stable", type=float, default=None, dest="char_warmup_stable",
+                      help="windowed creep (dE/min) below which the panel is 'thermally stable' (default 0.15).")
+
     parser.add_argument("--dogegen-server", default=None, dest="dogegen_server",
                         metavar="HOST:PORT",
                         help="drive a PERSISTENT dogegen daemon (dlc.dogegen_server) over a local "
@@ -2057,9 +2085,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # (waiting out a prior settle estimate would hide it), so it keeps the paint-safe default.
         dip_rec = DipStore.load(dip_store_path(profile, ctx.root)).get(
             profile.display_for(args.monitor).name)
-        presenter_settle = (dip_rec.settle_seconds
-                            if (args.flow != "characterize" and dip_rec and dip_rec.settle_seconds)
-                            else 0.5)
+        # Floor the dwell so a fast panel (measured settle ≈ 0) still gets a paint-safe wait, while a
+        # slow-ABL panel's larger measured settle is honoured. characterize keeps the default (it must
+        # observe the raw step response, and its settle measurement is dwell-independent anyway).
+        if args.flow != "characterize" and dip_rec is not None and dip_rec.settle_seconds is not None:
+            presenter_settle = max(0.2, dip_rec.settle_seconds)
+        else:
+            presenter_settle = 0.5
         if args.dogegen_server:
             # Reuse a persistent, operator-fullscreened dogegen window across invocations
             # (no respawn/flash) — the daemon owns the dogegen process + its bit-depth mode.
@@ -2099,10 +2131,24 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
                                           output_dir=ctx.root / "measurements" / "probe",
                                           ccmx_or_ccss=ccmx)
+    # Characterize tuning: start from the defaults, override only the --char-* flags that were set.
+    char_overrides = {
+        "noise_levels": (tuple(args.char_noise_levels) if args.char_noise_levels else None),
+        "noise_reads": args.char_noise_reads,
+        "black_reads": args.char_black_reads,
+        "primary_reads": args.char_primary_reads,
+        "creep_reads": args.char_creep_reads,
+        "settle_observe_reads": args.char_settle_reads,
+        "warmup_max_minutes": args.char_warmup_max_minutes,
+        "warmup_stable_de_per_min": args.char_warmup_stable,
+    }
+    char_overrides = {k: v for k, v in char_overrides.items() if v is not None}
+    characterize_config = replace(CharacterizeConfig(), **char_overrides) if char_overrides else None
+
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
-                        decision_overrides=overrides)
+                        characterize_config=characterize_config, decision_overrides=overrides)
     result = None
     paused = False
     try:

@@ -19,9 +19,12 @@ It measures three axes (see :class:`~dlc.dip.DisplayInstrumentProfile`):
 * **display** — a forced colour transition sampled until stable gives the step-response
   settle time (bright + dark, which differ on a local-dimming mini-LED), plus the
   native white / black / primaries.
-* **drift** — the warm-up reads-to-settle, the *discovered* (never assumed) cold
-  channel, and the post-warm creep rate → recommended ``neutral_interval`` /
-  ``drift_threshold`` for the measure loop's interleaved drift reference.
+* **drift** — the responsive warm-up reads-to-settle, the *discovered* (never assumed)
+  cold channel, the **thermal regime** (``convergent`` warms to a steady temperature, SDR;
+  ``fluctuating`` never settles and must be calibrated by maintaining a consistent thermal
+  load, HDR; ``warming`` still climbing — classified from net-vs-gross drift, not assumed),
+  and the post-warm creep rate → recommended ``neutral_interval`` / ``drift_threshold`` for
+  the measure loop's interleaved drift reference.
 
 **Load-bearing design rule (owner directive):** there is **no fixed cap** anywhere a
 panel could legitimately need more reads. A warm-up or settle that won't converge
@@ -88,10 +91,17 @@ class CharacterizeConfig:
     settle_required: int = 3            # consecutive in-tolerance reads ⇒ settled
     settle_observe_reads: int = 40      # generous bound; exceeding it FLAGS (never a silent cap)
 
-    # -- drift (warm-up + creep) -----------------------------------------
-    warmup_observe_reads: int = 60      # warm-up bound; exceeding it FLAGS (never a silent cap)
-    warmup_settle_threshold: float = 0.003   # channel-balance Δ for warm-up (normalized space)
-    creep_reads: int = 12               # post-warm reference reads to estimate creep
+    # -- drift: responsive warm-up + thermal-regime characterization -----
+    warmup_observe_reads: int = 60      # responsive warm-up bound; exceeding it FLAGS (never a silent cap)
+    warmup_settle_threshold: float = 0.003   # channel-balance Δ for the responsive warm-up (normalized space)
+    # thermal regime (hold white; classify convergent / fluctuating / warming from the data) ---
+    warmup_stable_de_per_min: float = 0.15   # windowed creep below this (sustained) ⇒ thermally stable
+    warmup_window_reads: int = 8             # sliding window over which the creep rate is estimated
+    warmup_stable_windows: int = 3           # consecutive in-tolerance windows ⇒ stable (sustained)
+    warmup_max_minutes: float = 30.0         # thermal observation bound; exceeding it FLAGS. 0 ⇒ skip thermal.
+    warmup_max_reads: int = 5000             # runaway backstop (wall-bound trips first on real HW; ~70 min @0.85s)
+    fluctuation_ratio: float = 0.35          # net/gross drift below this at the bound ⇒ FLUCTUATING (no steady state)
+    creep_reads: int = 12               # post-warm reference reads to estimate residual creep
     creep_dwell_s: float = 0.0          # optional extra dwell between creep reads (real runs: spread the window)
 
     # -- framing ----------------------------------------------------------
@@ -277,6 +287,101 @@ class _Characterizer:
         return {"settled": settled, "reads": reads, "cold_channel": loop.cold_channel,
                 "reference_xyz": list(loop.reference_xyz) if loop.reference_xyz else None}
 
+    # -- drift: thermal regime (hold white; convergent / fluctuating / warming) ----
+    def thermal_characterize(self) -> dict[str, Any]:
+        """Hold white and watch the panel's thermal behaviour until it STABILISES or the
+        observation bound is hit, then CLASSIFY the regime from the data (never assume it). The
+        panel can take minutes to warm and — in HDR especially — may never reach a steady
+        temperature at all, so the goal isn't always "warm to a target":
+
+        * **convergent** — windowed creep decays below ``warmup_stable_de_per_min`` (sustained):
+          a steady temperature exists; record the wall-time to reach it. (SDR.)
+        * **fluctuating** — at the bound, lots of motion but little NET drift (``net/gross`` below
+          ``fluctuation_ratio``): content/backlight-driven, no steady state — calibrate by
+          MAINTAINING a consistent thermal load (thermal/golden-ratio patch order), not by warming
+          to a target. (HDR.)
+        * **warming** — at the bound, drift still largely directional (net ≈ gross): simply slow;
+          warm longer.
+
+        Net-vs-gross can't false-positive "fluctuating" in SDR because warming drift is directional
+        (net ≈ gross). Flag-don't-cap: a non-convergent regime is FLAGGED (with the regime) and the
+        run proceeds. ``warmup_max_minutes <= 0`` skips the thermal phase (quick runs)."""
+        cfg = self.cfg
+        if cfg.warmup_max_minutes <= 0:
+            return {"regime": None, "stable": False, "skipped": True, "minutes": 0.0,
+                    "reads": 0, "final_creep_de_per_min": None, "net_over_gross": None}
+        patch = self._patch(1.0, label="thermal_white", role="warmup")
+        window: list[tuple[float, tuple[float, float, float]]] = []
+        all_reads: list[tuple[float, float, float]] = []     # every usable read (for net/gross)
+        t0: Optional[float] = None
+        stable_windows = 0
+        stable = False
+        creep_rate: Optional[float] = None
+        reads = 0
+        bound_s = cfg.warmup_max_minutes * 60.0
+        while True:
+            reading, _dt = self._read(patch, phase="char:thermal", read_index=reads)
+            reads += 1
+            if reading.xyz is not None:
+                now = self.clock()
+                if t0 is None:
+                    t0 = now
+                all_reads.append(reading.xyz)
+                window.append((now, reading.xyz))
+                if len(window) > cfg.warmup_window_reads:
+                    window.pop(0)
+                if len(window) >= cfg.warmup_window_reads:
+                    t_start, xyz_start = window[0]
+                    span_min = (now - t_start) / 60.0
+                    if span_min > 1e-9:
+                        anchor = self.white_xyz or reading.xyz
+                        de = delta_e2000(xyz_to_lab(reading.xyz, anchor), xyz_to_lab(xyz_start, anchor))
+                        creep_rate = de / span_min
+                        if creep_rate <= cfg.warmup_stable_de_per_min:
+                            stable_windows += 1
+                        else:
+                            stable_windows = 0
+                        if stable_windows >= cfg.warmup_stable_windows:
+                            stable = True
+                            break
+            # Wall-clock bound (the real bound on HW); the reads bound is a runaway backstop for an
+            # instant-read environment where wall-clock alone would spin.
+            if (t0 is not None and (self.clock() - t0) >= bound_s) or reads >= cfg.warmup_max_reads:
+                break
+        minutes = round((self.clock() - t0) / 60.0, 4) if t0 is not None else 0.0
+        # Classify the regime from net-vs-gross drift over the whole observation.
+        net_over_gross: Optional[float] = None
+        if stable:
+            regime = "convergent"
+        else:
+            anchor = self.white_xyz or (all_reads[-1] if all_reads else None)
+            regime = "warming"
+            if anchor and len(all_reads) >= 3:
+                labs = [xyz_to_lab(r, anchor) for r in all_reads]
+                net = delta_e2000(labs[0], labs[-1])
+                gross = sum(delta_e2000(labs[i], labs[i + 1]) for i in range(len(labs) - 1))
+                net_over_gross = round(net / gross, 4) if gross > 1e-9 else None
+                if net_over_gross is not None and net_over_gross < cfg.fluctuation_ratio:
+                    regime = "fluctuating"
+            if regime == "fluctuating":
+                self.flags.append(
+                    f"panel never reaches a steady temperature (net/gross drift {net_over_gross}) — "
+                    "thermally DYNAMIC: calibrate by maintaining a consistent thermal load "
+                    "(thermal/golden-ratio patch order) + aggressive drift checks, not by warming to a target")
+            else:
+                self.flags.append(
+                    f"panel did not thermally stabilize within {cfg.warmup_max_minutes:g} min"
+                    + (f" (creep still ~{creep_rate:.2f} dE/min)" if creep_rate is not None else "")
+                    + " — still warming; calibration should warm longer / drift-check aggressively")
+        self._emit_event("INFO" if stable else "WARN", "thermal_regime", regime=regime,
+                         stable=stable, minutes=minutes, reads=reads,
+                         final_creep_de_per_min=(round(creep_rate, 4) if creep_rate is not None else None),
+                         net_over_gross=net_over_gross)
+        return {"regime": regime, "stable": stable, "skipped": False, "minutes": minutes,
+                "reads": reads,
+                "final_creep_de_per_min": (round(creep_rate, 4) if creep_rate is not None else None),
+                "net_over_gross": net_over_gross}
+
     # -- instrument: noise vs luminance ----------------------------------
     def noise_model(self) -> tuple[list[NoiseBand], dict[str, Any]]:
         cfg = self.cfg
@@ -350,51 +455,68 @@ class _Characterizer:
         return {"white_xy": white_xy, "white_nits": white_nits, "black_nits": black_nits,
                 "primaries": primaries or None}
 
-    # -- display: step-response settle -----------------------------------
+    # -- display: step-response settle (dwell-based) ---------------------
     def settle(self) -> dict[str, Any]:
+        """Measure the post-transition dwell at which a reading already matches the panel's final
+        settled value — the usable "wait this long after showing a patch before reading."
+
+        Force a step (from a contrasting level), then read cumulatively, tagging each read with its
+        **post-transition START time** (``t_start``). Read until consecutive reads agree (the panel
+        reached steady state), then the settle is the EARLIEST ``t_start`` whose read already
+        matches that final value. This can't be inflated by slow dark-patch integrations: a panel
+        that settled within the first integration reports ~0 even when each read takes 7 s (the old
+        method reported ~28 s = 3-4 dark reads). The blind spot is below one integration — which is
+        exactly the region the meter's own integration has already averaged out. A reading that
+        never stabilises (ongoing droop / instability) is FLAGGED, not capped."""
         cfg = self.cfg
         out: dict[str, float] = {}
         observed: dict[str, dict[str, Any]] = {}
         for name, level in cfg.settle_levels.items():
-            # Force a transition FROM a contrasting level so we measure a real step response.
             from_level = 0.0 if level >= 0.5 else 1.0
             self._read(self._patch(from_level, label=f"settle_{name}_from", role="characterize"),
                        phase="char:settle", read_index=-1, note="transition-from")
             patch = self._patch(level, label=f"settle_{name}", role="characterize")
-            prev: Optional[tuple[float, float, float]] = None
+            t_trans = self.clock()                       # the step happens at the first target read's show
+            samples: list[tuple[float, tuple[float, float, float]]] = []   # (t_start, xyz)
             consecutive = 0
-            settled = False
-            t0 = self.clock()
-            elapsed = 0.0
-            reads = 0
+            reached = False
             for ri in range(cfg.settle_observe_reads):
+                t_start = self.clock() - t_trans         # post-transition start time of THIS read
                 reading, _dt = self._read(patch, phase="char:settle", read_index=ri)
-                reads += 1
-                elapsed = self.clock() - t0
                 if reading.xyz is None:
-                    prev = None
                     consecutive = 0
                     continue
-                if prev is not None:
+                samples.append((t_start, reading.xyz))
+                if len(samples) >= 2:
                     anchor = self.white_xyz or reading.xyz
-                    de = delta_e2000(xyz_to_lab(prev, anchor), xyz_to_lab(reading.xyz, anchor))
-                    if de <= cfg.settle_threshold_de:
-                        consecutive += 1
-                    else:
-                        consecutive = 0
+                    de = delta_e2000(xyz_to_lab(samples[-1][1], anchor), xyz_to_lab(samples[-2][1], anchor))
+                    consecutive = consecutive + 1 if de <= cfg.settle_threshold_de else 0
                     if consecutive >= cfg.settle_required:
-                        settled = True
+                        reached = True
                         break
-                prev = reading.xyz
-            if settled:
-                out[name] = round(elapsed, 4)
-                observed[name] = {"settled": True, "seconds": round(elapsed, 4), "reads": reads}
+            if not samples:
+                observed[name] = {"settled": False, "reads": 0}
+                self.flags.append(f"{name} settle: no usable read")
+                continue
+            # Final settled value = mean of the agreeing tail; settle = earliest read that matches it.
+            stable_xyz = _mean_xyz([s[1] for s in samples[-(cfg.settle_required + 1):]])
+            anchor = self.white_xyz or stable_xyz
+            stable_lab = xyz_to_lab(stable_xyz, anchor)
+            settle_t: Optional[float] = None
+            for t_start, xyz in samples:
+                if delta_e2000(xyz_to_lab(xyz, anchor), stable_lab) <= cfg.settle_threshold_de:
+                    settle_t = max(0.0, round(t_start, 4))
+                    break
+            if reached and settle_t is not None:
+                out[name] = settle_t
+                observed[name] = {"settled": True, "settle_seconds": settle_t, "reads": len(samples)}
             else:
-                observed[name] = {"settled": False, "seconds": round(elapsed, 4), "reads": reads}
-                self.flags.append(f"{name} settle did not converge within {cfg.settle_observe_reads} reads "
-                                  f"({elapsed:.1f}s) — abnormally slow step response (FLAG, not capped)")
-            self._emit_event("INFO" if settled else "WARN", "settle", patch_level=name,
-                             settled=settled, seconds=observed[name]["seconds"], reads=reads)
+                observed[name] = {"settled": False, "reads": len(samples)}
+                self.flags.append(f"{name} settle did not stabilize within {cfg.settle_observe_reads} reads "
+                                  "— ongoing droop/instability (FLAG, not capped)")
+            self._emit_event("INFO" if reached else "WARN", "settle", patch_level=name,
+                             settled=reached, settle_seconds=observed[name].get("settle_seconds"),
+                             reads=len(samples))
         # The conservative worst case is what calibration should wait out.
         settle_seconds = max(out.values()) if out else None
         return {"settle_seconds": settle_seconds, "settle_by_level": (out or None), "observed": observed}
@@ -445,7 +567,8 @@ class _Characterizer:
 
     # -- recommendations derived from the measured axes ------------------
     def recommend(self, *, bands: Sequence[NoiseBand], read_overhead_s: Optional[float],
-                  settle_seconds: Optional[float], creep: dict[str, Any]) -> dict[str, Any]:
+                  settle_seconds: Optional[float], creep: dict[str, Any],
+                  thermal_regime: Optional[str] = None) -> dict[str, Any]:
         cfg = self.cfg
         # Drift threshold (channel-balance space, matching evaluate_drift): set above the
         # measured read-to-read *channel-balance* noise on a held white (creep excluded) so
@@ -469,6 +592,10 @@ class _Characterizer:
                 neutral_interval = 32
             else:
                 neutral_interval = int(max(4, min(32, math.floor(cfg.read_tolerance_de / creep_per_patch))))
+        if thermal_regime == "fluctuating":
+            # No steady state (HDR): the steady-creep estimate is meaningless — re-reference the
+            # drift frequently no matter what, since the temperature moves second by second.
+            neutral_interval = 4 if neutral_interval is None else min(4, neutral_interval)
         return {"recommended_drift_threshold": drift_threshold,
                 "recommended_neutral_interval": neutral_interval}
 
@@ -496,12 +623,14 @@ def run_characterization(
                         injected_clock=clock is not None, cold_channel=cold_channel)
 
     warm = ch.warm_up()
-    bands, noise = ch.noise_model()
+    thermal = ch.thermal_characterize()      # learn (or classify) the panel's thermal regime first
+    bands, noise = ch.noise_model()          # ... then measure noise/settle/native on the warm panel
     native = ch.native_levels()
     settle = ch.settle()
     creep = ch.creep()
     rec = ch.recommend(bands=bands, read_overhead_s=noise.get("read_overhead_s"),
-                       settle_seconds=settle.get("settle_seconds"), creep=creep)
+                       settle_seconds=settle.get("settle_seconds"), creep=creep,
+                       thermal_regime=thermal.get("regime"))
 
     noise_floor = _noise_floor_nits(bands, cfg.read_tolerance_de, native.get("black_nits"))
 
@@ -517,6 +646,8 @@ def run_characterization(
         native_black_nits=native.get("black_nits"),
         native_primaries=native.get("primaries"),
         warmup_reads_to_settle=(warm.get("reads") if warm.get("settled") else None),
+        warmup_minutes=(thermal.get("minutes") if thermal.get("regime") == "convergent" else None),
+        thermal_regime=thermal.get("regime"),
         cold_channel=ch.cold_channel,
         creep_rate_de_per_min=creep.get("creep_rate_de_per_min"),
         recommended_neutral_interval=rec.get("recommended_neutral_interval"),
@@ -535,6 +666,10 @@ def run_characterization(
     digest = {
         "warm": warm.get("settled"),
         "warmup_reads_to_settle": dip.warmup_reads_to_settle,
+        "thermal_regime": thermal.get("regime"),
+        "warmup_minutes": dip.warmup_minutes,
+        "thermal_final_creep_de_per_min": thermal.get("final_creep_de_per_min"),
+        "thermal_net_over_gross": thermal.get("net_over_gross"),
         "cold_channel": ch.cold_channel,
         "noise": noise["bands"],
         "noise_floor_nits": dip.noise_floor_nits,

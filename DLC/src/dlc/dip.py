@@ -65,6 +65,8 @@ class DisplayInstrumentProfile:
     partial characterization (or an older record missing newer fields) still loads."""
 
     display: str
+    mode: Optional[str] = None                    # 'SDR' | 'HDR' — panel behaviour (thermal/noise) differs
+    #                                               by mode, so the store is keyed by display:mode (see `key`)
     # -- instrument axis --------------------------------------------------
     noise_model: list[NoiseBand] = field(default_factory=list)   # σ vs luminance, ascending nits
     noise_floor_nits: Optional[float] = None     # below this a read is noise-dominated; don't trust a single read
@@ -80,6 +82,11 @@ class DisplayInstrumentProfile:
     native_primaries: Optional[dict[str, list[float]]] = None    # {"R":[x,y],"G":..,"B":..}
     # -- drift axis -------------------------------------------------------
     warmup_reads_to_settle: Optional[int] = None
+    warmup_minutes: Optional[float] = None       # wall-time to thermal stability (convergent panels only)
+    thermal_regime: Optional[str] = None         # 'convergent' | 'fluctuating' | 'warming' — DISCOVERED.
+    #   convergent: warms to a steady temperature (SDR). fluctuating: content-driven, never settles —
+    #   calibrate by MAINTAINING a consistent thermal load, not by reaching a target (HDR). warming:
+    #   still climbing monotonically at the observation bound (warm longer).
     cold_channel: Optional[str] = None           # discovered, NOT assumed
     creep_rate_de_per_min: Optional[float] = None
     recommended_neutral_interval: Optional[int] = None
@@ -91,6 +98,12 @@ class DisplayInstrumentProfile:
     max_age_days: Optional[int] = None
     updated: Optional[str] = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        """The store key: ``display:mode`` when a mode is set (so SDR and HDR profiles for one
+        panel coexist), else the bare display name (back-compat with mode-less records)."""
+        return f"{self.display}:{self.mode}" if self.mode else self.display
 
     # -- serialization ----------------------------------------------------
     def as_dict(self) -> dict[str, Any]:
@@ -104,6 +117,7 @@ class DisplayInstrumentProfile:
         bands.sort(key=lambda b: b.nits)
         return cls(
             display=d["display"],
+            mode=d.get("mode"),
             noise_model=bands,
             noise_floor_nits=_opt_float(d.get("noise_floor_nits")),
             read_overhead_s=_opt_float(d.get("read_overhead_s")),
@@ -114,6 +128,8 @@ class DisplayInstrumentProfile:
             native_black_nits=_opt_float(d.get("native_black_nits")),
             native_primaries=(dict(d["native_primaries"]) if d.get("native_primaries") else None),
             warmup_reads_to_settle=(int(d["warmup_reads_to_settle"]) if d.get("warmup_reads_to_settle") is not None else None),
+            warmup_minutes=_opt_float(d.get("warmup_minutes")),
+            thermal_regime=d.get("thermal_regime"),
             cold_channel=d.get("cold_channel"),
             creep_rate_de_per_min=_opt_float(d.get("creep_rate_de_per_min")),
             recommended_neutral_interval=(int(d["recommended_neutral_interval"]) if d.get("recommended_neutral_interval") is not None else None),
@@ -215,8 +231,8 @@ class DipStore:
         return dict(self._records)
 
     def record(self, dip: DisplayInstrumentProfile, *, save: bool = True) -> DisplayInstrumentProfile:
-        """Upsert ``dip`` (keyed by ``dip.display``) and persist by default."""
-        self._records[dip.display] = dip
+        """Upsert ``dip`` (keyed by ``dip.key`` = ``display:mode``, else bare display) and persist."""
+        self._records[dip.key] = dip
         if save:
             self.save()
         return dip

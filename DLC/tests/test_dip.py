@@ -90,6 +90,22 @@ def test_staleness_uses_record_then_default():
     assert _dip(made=None).is_stale("2026-06-17") is True
 
 
+def test_mode_keys_let_sdr_and_hdr_coexist(tmp_path):
+    # A panel's thermal/noise behaviour differs by mode, so an SDR and an HDR DIP must coexist —
+    # the store keys by display:mode when a mode is set, bare display name otherwise (back-compat).
+    store = DipStore(tmp_path / "dip_store.json")
+    store.record(_dip(mode="SDR", settle_seconds=0.3))
+    store.record(_dip(mode="HDR", settle_seconds=0.9))
+    again = DipStore.load(tmp_path / "dip_store.json")
+    assert again.get("Test Panel:SDR").settle_seconds == 0.3
+    assert again.get("Test Panel:HDR").settle_seconds == 0.9
+    assert again.get("Test Panel:SDR").mode == "SDR"
+    assert len(again.records()) == 2          # two distinct profiles for one display
+    # a mode-less record still keys by the bare display name
+    store.record(_dip(settle_seconds=0.5))
+    assert store.get("Test Panel").settle_seconds == 0.5
+
+
 def test_upsert_by_display_name(tmp_path):
     store = DipStore(tmp_path / "dip_store.json")
     store.record(_dip(settle_seconds=0.3))
