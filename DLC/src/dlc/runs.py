@@ -78,7 +78,10 @@ def make_run_name(mode: str, display: str | None) -> str:
 
 def create_run(mode: str, display: str | None = None, run_dir: Path | None = None) -> RunContext:
     name = run_dir.name if run_dir else make_run_name(mode, display)
-    root = run_dir or RUNS_DIR / name
+    # The run root MUST be absolute: paths derived from it (e.g. the generated 3D-LUT cube)
+    # are sent over the IPC pipe to DesktopLUT.exe, a SEPARATE process with its own working
+    # directory — a relative path would resolve against DesktopLUT's cwd and not be found.
+    root = (run_dir or RUNS_DIR / name).resolve()
     ctx = RunContext(root=root, manifest=RunManifest(name=name, mode=mode, display=display))
     ctx.ensure_dirs()
     ctx.save()
@@ -103,5 +106,5 @@ def open_run(run_dir: Path) -> RunContext:
         human_actions=raw.get("human_actions", {}),
         stages=raw.get("stages", []),
     )
-    return RunContext(root=run_dir, manifest=manifest)
+    return RunContext(root=run_dir.resolve(), manifest=manifest)
 
