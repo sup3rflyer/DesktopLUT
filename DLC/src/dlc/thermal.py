@@ -89,6 +89,10 @@ class ThermalConfig:
     converge_blocks: int = 2        # consecutive in-band (net) blocks ⇒ converged
     max_blocks: int = 240           # observation bound; exceeding it FLAGS (never a silent cap)
     peak_nits: Optional[float] = None  # clamp scaled luminance here (None ⇒ transfer/display ceiling)
+    # reference-read sanity (catch a frozen / wrong display or a dislodged meter) ---
+    ref_sanity_low: float = 0.33    # measured ref nits below this × commanded ⇒ implausible
+    ref_sanity_high: float = 3.0    # measured ref nits above this × commanded ⇒ implausible
+    ref_sanity_blocks: int = 2      # consecutive implausible reads ⇒ display/meter COMPROMISED (abort+flag)
 
 
 @dataclass
@@ -103,6 +107,7 @@ class ThermalResult:
     drift_threshold: float                       # the net threshold used (from balance_noise)
     active_channel: Optional[Channel]            # the channel that drifted most (the cold/temperamental one)
     final_k: float
+    compromised: bool = False                    # display/meter read implausibly (frozen patch / wrong mode)
     flags: list[str] = field(default_factory=list)
     needs_adjudication: bool = False
     question: Optional[str] = None
@@ -190,6 +195,8 @@ class ThermalController:
         active: Optional[Channel] = None
         net_active = gross_active = 0.0
         ratio: Optional[float] = None
+        sane_violations = 0
+        compromised = False
         self._last_ref_nits = None
 
         while block < cfg.max_blocks:
@@ -210,6 +217,26 @@ class ThermalController:
             if first_bal is None:
                 first_bal = bal
             history.append(bal)
+            # SANITY: the reference read luminance must be plausibly near the COMMANDED ref level.
+            # A wild mismatch (e.g. reading 1156 nits when we asked for ~92) means the display/meter
+            # is compromised — a frozen patch (D3D render hang), a wrong colorspace, or a dislodged
+            # meter — so the "drift" data is garbage. A frozen display reads identical values that
+            # otherwise LOOK like perfect convergence; catch it here and FLAG, never silently accept.
+            if self.ref_nits and self._last_ref_nits is not None and self._last_ref_nits > 0:
+                rn = self._last_ref_nits / self.ref_nits
+                if rn < cfg.ref_sanity_low or rn > cfg.ref_sanity_high:
+                    sane_violations += 1
+                    if sane_violations >= cfg.ref_sanity_blocks:
+                        flags.append(
+                            f"reference read {self._last_ref_nits:.0f} nits is wildly off the commanded "
+                            f"~{self.ref_nits:.0f} nits ({rn:.1f}x) for {sane_violations} blocks — display/"
+                            "meter COMPROMISED (frozen patch / wrong colorspace / meter dislodged); thermal "
+                            "data is not trustworthy, abort + investigate")
+                        compromised = True
+                        self._block_record(block, k, 0.0, 0.0, None, threshold, None, "COMPROMISED")
+                        break
+                else:
+                    sane_violations = 0
             # Self-calibrate the threshold from the within-block read scatter (read noise at a
             # fixed temperature) when no balance_noise was supplied — so the gate is keyed to THIS
             # panel+meter's noise, never a hardcoded constant. Estimated once, after a couple blocks.
@@ -276,21 +303,25 @@ class ThermalController:
             for ch in CHANNELS:
                 vals = [b[ch] for b in win]
                 envelope = max(envelope, max(vals) - min(vals))
-        if not converged:
+        if compromised:
+            regime = "compromised"          # the display/meter was bad — the regime is unknowable
+        elif not converged:
             regime = "fluctuating" if (ratio is not None and ratio < cfg.net_gross_ratio) else "warming"
         # Flag by regime, NOT just by (non-)convergence: a fluctuating panel that "converges" (a
         # bounded wander) is the fluctuating STEADY STATE and still needs the maintain-load strategy,
-        # so it's surfaced too. A convergent panel is clean (no flag).
-        if regime == "fluctuating":
-            flags.append(
-                f"panel never reaches a steady temperature (net/gross {ratio}, residual band "
-                f"{round(envelope, 5)}) — thermally DYNAMIC: calibrate by maintaining a consistent "
-                "thermal load (golden-ratio order) + aggressive drift checks, not by warming to a target")
-        elif not converged:   # warming
-            flags.append(
-                f"panel did not thermally converge within {cfg.max_blocks} blocks "
-                f"(net {net_active:.4f} vs threshold {threshold:.4f}) — still warming; "
-                "warm longer / inject more heat")
+        # so it's surfaced too. A convergent panel is clean (no flag). A COMPROMISED run already has
+        # its flag from the loop — don't double-flag it as a (meaningless) regime.
+        if not compromised:
+            if regime == "fluctuating":
+                flags.append(
+                    f"panel never reaches a steady temperature (net/gross {ratio}, residual band "
+                    f"{round(envelope, 5)}) — thermally DYNAMIC: calibrate by maintaining a consistent "
+                    "thermal load (golden-ratio order) + aggressive drift checks, not by warming to a target")
+            elif not converged:   # warming
+                flags.append(
+                    f"panel did not thermally converge within {cfg.max_blocks} blocks "
+                    f"(net {net_active:.4f} vs threshold {threshold:.4f}) — still warming; "
+                    "warm longer / inject more heat")
         needs = bool(flags)
         question = None
         if needs:
@@ -304,14 +335,16 @@ class ThermalController:
             "drift_threshold": round(threshold, 6), "active_channel": active,
             "final_k": round(k, 3), "net_active": round(net_active, 5),
             "gross_active": round(gross_active, 5), "net_over_gross": ratio,
+            "compromised": compromised,
         }
         if self.event is not None:
-            self.event("INFO" if converged else "WARN", "thermal_regime", **digest)
+            self.event("INFO" if (converged and not compromised) else "WARN", "thermal_regime", **digest)
         return ThermalResult(
             regime=regime, converged=converged, blocks=block, content_reads=content_reads,
             warmup_minutes=(minutes if regime == "convergent" else None),
             warmin_magnitude=round(warmin, 5), fluctuation_envelope=round(envelope, 5),
             drift_threshold=round(threshold, 6), active_channel=active, final_k=round(k, 3),
+            compromised=compromised,
             flags=flags, needs_adjudication=needs, question=question, digest=digest)
 
     def _block_record(self, block: int, k: float, net: float, gross: float,

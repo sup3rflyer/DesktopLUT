@@ -104,7 +104,13 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
                     buf += data
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        reply, keep = dispatch(line.decode("ascii", "ignore"), show=show)
+                        try:
+                            reply, keep = dispatch(line.decode("ascii", "ignore"), show=show)
+                        except OSError as exc:
+                            # The dogegen child died (broken stdin pipe) — report it cleanly to the
+                            # client instead of crashing the daemon, so the caller gets a clear error
+                            # (not an empty ack) and the daemon stays up to accept a restart.
+                            reply, keep = (f"err dogegen unavailable: {exc}", True)
                         if reply:
                             conn.sendall((reply + "\n").encode("ascii"))
                         if not keep:

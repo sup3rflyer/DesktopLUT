@@ -109,12 +109,14 @@ def test_wandering_panel_classified_fluctuating():
     state = {"n": 0}
 
     def wander(patch: MeasurePatch) -> Reading:
+        # ~60-nit luminance so it matches the commanded reference (sanity guard stays quiet);
+        # only the BLUE BALANCE wanders.
         if patch.role == "neutral_ref":
             n = state["n"]; state["n"] += 1
             tri = abs((n % 6) - 3) - 1.5          # triangle wave in [-1.5, 1.5]
             blue = 0.90 + 0.03 * tri              # wanders ±0.045 around 0.90, mean-reverting
-            return Reading(xyz=_xyz_for_linear_rgb(1.0, 1.0, blue))
-        return Reading(xyz=_xyz_for_linear_rgb(1.0, 1.0, 0.90))
+            return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, blue)))
+        return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, 0.90)))
 
     res = _controller(wander, transfer, max_blocks=40).run()
     assert res.regime == "fluctuating"
@@ -141,6 +143,26 @@ def test_threshold_self_calibrates_when_balance_noise_absent():
     assert res.drift_threshold >= 0.003          # at least the floor
     assert res.active_channel == "B"
     assert res.warmin_magnitude > 0.0
+
+
+def test_compromised_display_is_flagged_not_converged():
+    """A frozen / wrong display (reference reads wildly off the commanded luminance) is caught as
+    COMPROMISED and FLAGGED — never silently accepted as 'convergent' just because the frozen reads
+    are identical. (This is the live-HW dogegen render-freeze failure mode.)"""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    base = _xyz_for_linear_rgb(1.0, 1.0, 1.0)   # Y ~ 1.0
+
+    def frozen(patch: MeasurePatch) -> Reading:
+        if patch.role == "neutral_ref":
+            return Reading(xyz=tuple(c * 720.0 for c in base))   # ~720 nits vs the 60 commanded = 12x
+        return Reading(xyz=tuple(c * 30.0 for c in base))
+
+    res = _controller(frozen, transfer).run()
+    assert res.compromised is True
+    assert res.regime == "compromised"
+    assert res.needs_adjudication is True
+    assert not res.converged
+    assert any("COMPROMISED" in f for f in res.flags)
 
 
 def test_thermal_block_records_are_emitted():
