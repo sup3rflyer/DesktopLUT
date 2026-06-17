@@ -114,6 +114,11 @@ class CharacterizeConfig:
     creep_reads: int = 12               # post-warm reference reads to estimate residual creep
     creep_dwell_s: float = 0.0          # optional extra dwell between creep reads (real runs: spread the window)
 
+    # -- display: EOTF + luminance-dependent white sweep (HDR-focused, additive) --
+    eotf_levels: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 0.9, 1.0)
+    #   full-field grey signal fractions (code-value) to sweep for the measured EOTF + white-vs-lum
+    eotf_reads: int = 3                 # reads averaged per EOTF level (0 ⇒ skip the sweep)
+
     # -- framing ----------------------------------------------------------
     read_tolerance_de: float = 0.2      # the calibration read tolerance the floor / interval are framed around
     abnormal_white_sigma_de: float = 0.5  # white σ above this ⇒ FLAG (meter/correction trouble)
@@ -148,6 +153,17 @@ def _pstd(xs: Sequence[float]) -> float:
         return 0.0
     m = _mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+
+
+def _median(xs: Sequence[float]) -> float:
+    """Median (robust central estimate — used for the EOTF undershoot so a stray clipped
+    level can't drag the summary)."""
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 def _mean_xyz(reads: Sequence[tuple[float, float, float]]) -> tuple[float, float, float]:
@@ -433,6 +449,63 @@ class _Characterizer:
         return {"white_xy": white_xy, "white_nits": white_nits, "black_nits": black_nits,
                 "primaries": primaries or None}
 
+    # -- display: EOTF + luminance-dependent white -----------------------
+    def eotf_white_sweep(self) -> dict[str, Any]:
+        """Full-field grey sweep measuring the panel's actual EOTF and its luminance-dependent
+        white point — the HDR-specific DIP refinement (additive; harmless for SDR).
+
+        For each signal level we compare the MEASURED luminance to the REQUESTED luminance
+        (``transfer.cv_to_nits`` — PQ-absolute for HDR), and record the white chromaticity.
+
+        Populates two DIP fields:
+          * ``eotf_undershoot`` — the median ``measured/requested - 1`` over the **reachable**
+            (sub-peak) levels: a calibratable gain (e.g. -0.06 = ~6% below target). Clipped
+            levels (request beyond the panel's physical peak) are EXCLUDED — that error is the
+            peak ceiling, not a gain, and is already captured by ``native_white_nits``.
+          * ``white_vs_luminance`` — ``[[nits, x, y], ...]`` ascending: the grey axis isn't a
+            single white, so calibration must target the right white at each level, not one.
+
+        ``eotf_reads <= 0`` (or no levels) skips the phase. Full per-level data goes to the
+        ndjson (``char:eotf``) + the digest; the DIP keeps the scalar + the white map."""
+        cfg = self.cfg
+        if cfg.eotf_reads <= 0 or not cfg.eotf_levels:
+            return {"eotf_undershoot": None, "white_vs_luminance": None, "skipped": True, "points": []}
+        max_cv = self.transfer.max_cv
+        samples: list[tuple[float, float, float, float]] = []   # (target_nits, measured_nits, x, y)
+        for level in sorted(set(cfg.eotf_levels)):
+            cv = max(0, min(max_cv, round(level * max_cv)))
+            target_nits = self.transfer.cv_to_nits(cv)
+            patch = self._patch(level, label=f"eotf_{level:.3f}", role="characterize")
+            reads = [r for r in (self._read(patch, phase="char:eotf", read_index=i)[0].xyz
+                                 for i in range(cfg.eotf_reads)) if r is not None]
+            if not reads:
+                continue
+            mean = _mean_xyz(reads)
+            measured_nits = mean[1]
+            x, y = _xy(mean)
+            samples.append((target_nits, measured_nits, x, y))
+            self._emit_event("INFO", "eotf_point", signal=round(level, 4),
+                             target_nits=round(target_nits, 3), measured_nits=round(measured_nits, 3),
+                             x=round(x, 5), y=round(y, 5))
+        if not samples:
+            self.flags.append("EOTF sweep: no usable reads")
+            return {"eotf_undershoot": None, "white_vs_luminance": None, "skipped": False, "points": []}
+        white_vs_luminance = sorted(
+            ([round(m, 4), round(x, 5), round(y, 5)] for (_t, m, x, y) in samples),
+            key=lambda row: row[0])
+        # Undershoot from the REACHABLE levels only — exclude the clip (request > physical peak),
+        # whose error is the peak ceiling (native_white_nits), not a calibratable gain.
+        measured_peak = max(m for (_t, m, _x, _y) in samples)
+        ratios = [(m / t - 1.0) for (t, m, _x, _y) in samples
+                  if t > 0 and m > 0 and t <= measured_peak * 1.02]
+        undershoot = round(_median(ratios), 5) if ratios else None
+        points = [{"target_nits": round(t, 3), "measured_nits": round(m, 3),
+                   "x": round(x, 5), "y": round(y, 5)} for (t, m, x, y) in samples]
+        self._emit_event("INFO", "eotf_sweep", undershoot=undershoot, points=len(samples),
+                         clipped=len(samples) - len(ratios))
+        return {"eotf_undershoot": undershoot, "white_vs_luminance": white_vs_luminance,
+                "skipped": False, "points": points}
+
     # -- display: step-response settle (dwell-based) ---------------------
     def settle(self) -> dict[str, Any]:
         """Measure the post-transition dwell at which a reading already matches the panel's final
@@ -604,6 +677,7 @@ def run_characterization(
     thermal = ch.thermal_characterize()      # learn (or classify) the panel's thermal regime first
     bands, noise = ch.noise_model()          # ... then measure noise/settle/native on the warm panel
     native = ch.native_levels()
+    eotf = ch.eotf_white_sweep()             # measured EOTF + luminance-dependent white (HDR refinement)
     settle = ch.settle()
     creep = ch.creep()
     rec = ch.recommend(bands=bands, read_overhead_s=noise.get("read_overhead_s"),
@@ -623,6 +697,8 @@ def run_characterization(
         native_white_nits=native.get("white_nits"),
         native_black_nits=native.get("black_nits"),
         native_primaries=native.get("primaries"),
+        eotf_undershoot=eotf.get("eotf_undershoot"),
+        white_vs_luminance=eotf.get("white_vs_luminance"),
         warmup_reads_to_settle=(warm.get("reads") if warm.get("settled") else None),
         warmup_minutes=(thermal.get("minutes") if thermal.get("regime") == "convergent" else None),
         fluctuation_envelope=thermal.get("fluctuation_envelope"),
@@ -661,6 +737,9 @@ def run_characterization(
         "native_white_nits": dip.native_white_nits,
         "native_black_nits": dip.native_black_nits,
         "native_primaries": dip.native_primaries,
+        "eotf_undershoot": dip.eotf_undershoot,
+        "white_vs_luminance": dip.white_vs_luminance,
+        "eotf_points": eotf.get("points"),
         "settle_seconds": dip.settle_seconds,
         "settle_by_level": dip.settle_by_level,
         "creep_rate_de_per_min": dip.creep_rate_de_per_min,

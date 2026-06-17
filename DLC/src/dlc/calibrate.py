@@ -2032,6 +2032,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                       help="sliding window (blocks) for the net/gross convergence judgement (default 5).")
     char.add_argument("--char-thermal-k-start", type=float, default=None, dest="char_thermal_k_start",
                       help="SOAK luminance scale while warm-in is measured (1.0 ⇒ no preheat; default 1.6).")
+    char.add_argument("--char-eotf-reads", type=int, default=None, dest="char_eotf_reads",
+                      help="reads averaged per EOTF/white sweep level (0 ⇒ SKIP the sweep; default 3).")
+    char.add_argument("--char-eotf-levels", type=float, nargs="+", default=None, dest="char_eotf_levels",
+                      help="signal levels (code-value fractions) for the EOTF + white-vs-luminance "
+                           "sweep (default 0.1 0.2 0.3 0.4 0.5 0.65 0.8 0.9 1.0).")
 
     parser.add_argument("--dogegen-server", default=None, dest="dogegen_server",
                         metavar="HOST:PORT",
@@ -2232,6 +2237,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         "thermal_ref_reads": args.char_thermal_ref_reads,
         "thermal_window_blocks": args.char_thermal_window,
         "thermal_k_start": args.char_thermal_k_start,
+        "eotf_reads": args.char_eotf_reads,
+        "eotf_levels": (tuple(args.char_eotf_levels) if args.char_eotf_levels else None),
     }
     char_overrides = {k: v for k, v in char_overrides.items() if v is not None}
     characterize_config = replace(CharacterizeConfig(), **char_overrides) if char_overrides else None
