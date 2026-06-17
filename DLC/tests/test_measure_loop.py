@@ -27,6 +27,7 @@ from dlc.measure_loop import (
     run_measure_loop,
     write_ti3,
 )
+from dlc.dip import DisplayInstrumentProfile, NoiseBand
 from dlc.mhc import parse_ti3
 
 
@@ -118,10 +119,11 @@ def test_warmup_escalates_when_it_never_settles(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# immediate repeatability gate
+# per-patch read policy (single-read default + DIP-driven escalation)
 # ---------------------------------------------------------------------------
 
-def _solo_loop(panel: SyntheticPanel, transfer: Transfer, cfg: MeasureLoopConfig) -> _Loop:
+def _solo_loop(panel, transfer: Transfer, cfg: MeasureLoopConfig,
+               dip: DisplayInstrumentProfile | None = None) -> _Loop:
     return _Loop(
         patches=[],
         transfer=transfer,
@@ -129,43 +131,76 @@ def _solo_loop(panel: SyntheticPanel, transfer: Transfer, cfg: MeasureLoopConfig
         config=cfg,
         ndjson=_NdjsonWriter(None),
         events=None,
+        dip=dip,
     )
 
 
-def test_transient_flaky_patch_is_re_measured_and_converges():
-    t = _sdr()
-    panel = SyntheticPanel(transfer=t, start_temp=1.0, flaky_label="px", flaky_chroma=0.06)
-    loop = _solo_loop(panel, t, MeasureLoopConfig(confirm_reads=2, repeat_threshold=0.5, max_repeats=3))
-    rec = loop.measure_patch(_patch("px", (512, 512, 512), t, 0), phase="main")
-    assert rec.immediate_remeasures >= 2  # extra re-read beyond the clean single confirm
-    assert rec.unstable is False          # converged to a good read
-    # The accepted value matches a clean (non-glitch) read of the same patch.
-    clean = SyntheticPanel(transfer=t, start_temp=1.0)(_patch("px", (512, 512, 512), t, 0))
-    assert abs(rec.xyz[1] - clean.xyz[1]) < 1e-6
+class _ScriptedPanel:
+    """A :data:`MeasureFn` returning a fixed XYZ sequence (cycling on the last entry)
+    — for precise read-policy tests independent of the synthetic panel's glitch model."""
+
+    def __init__(self, seq: list[tuple[float, float, float]]) -> None:
+        self._seq = list(seq)
+        self._i = 0
+
+    def __call__(self, patch: MeasurePatch) -> Reading:
+        xyz = self._seq[min(self._i, len(self._seq) - 1)]
+        self._i += 1
+        return Reading(xyz=xyz, yxy=(xyz[1], 0.31, 0.33), ok=True)
 
 
-def test_persistent_flaky_patch_stays_unstable():
-    t = _sdr()
-    panel = SyntheticPanel(transfer=t, start_temp=1.0, flaky_label="px",
-                           flaky_persistent=True, flaky_chroma=0.06)
-    loop = _solo_loop(panel, t, MeasureLoopConfig(confirm_reads=2, repeat_threshold=0.5, max_repeats=3))
-    rec = loop.measure_patch(_patch("px", (512, 512, 512), t, 0), phase="main")
-    assert rec.unstable is True
-    assert rec.immediate_remeasures == 3  # exhausted max_repeats without agreement
+def _dip_for(nits: float, sigma_de: float) -> DisplayInstrumentProfile:
+    return DisplayInstrumentProfile(display="x", noise_model=[NoiseBand(nits=nits, sigma_de=sigma_de, reads=20)])
 
 
-def test_single_read_mode_does_no_immediate_remeasures(tmp_path: Path):
+def test_single_read_is_the_default_without_a_dip(tmp_path: Path):
+    # No DIP ⇒ one adaptive-integration read per patch (the professional default).
     t = _sdr()
     panel = SyntheticPanel(transfer=t, start_temp=1.0)
     res = run_measure_loop(
-        patches=_grey_ramp(t, 8),
-        transfer=t,
-        measure=panel,
-        config=MeasureLoopConfig(confirm_reads=1),
-        ndjson_path=tmp_path / "m.ndjson",
+        patches=_grey_ramp(t, 8), transfer=t, measure=panel,
+        config=MeasureLoopConfig(), ndjson_path=tmp_path / "m.ndjson",
     )
     assert res.immediate_remeasures == 0
     assert res.patch_count == 8
+
+
+def test_dip_drives_extra_averaged_reads_where_snr_is_poor():
+    # σ=0.4 dE at this luminance, tolerance 0.2 ⇒ N=(0.4/0.2)²=4 reads averaged for SNR.
+    t = _sdr()
+    panel = _ScriptedPanel([(50.0, 50.0, 55.0)])   # a clean, perfectly-repeatable read
+    loop = _solo_loop(panel, t, MeasureLoopConfig(read_tolerance_de=0.2), dip=_dip_for(50.0, 0.4))
+    rec = loop.measure_patch(_patch("px", (512, 512, 512), t, 0), phase="main")
+    assert rec.reads_taken == 4
+    assert rec.immediate_remeasures == 3
+    assert rec.unstable is False
+    assert abs(rec.xyz[1] - 50.0) < 1e-9
+
+
+def test_gross_glitch_is_rejected_not_averaged_in():
+    # A big one-off outlier (read 0) must be DROPPED from the mean, not diluted in.
+    t = _sdr()
+    clean = (50.0, 50.0, 55.0)
+    glitch = (50.0, 80.0, 55.0)
+    panel = _ScriptedPanel([glitch, clean, clean, clean, clean, clean])
+    loop = _solo_loop(panel, t, MeasureLoopConfig(read_tolerance_de=0.3), dip=_dip_for(50.0, 0.5))
+    rec = loop.measure_patch(_patch("px", (512, 512, 512), t, 0), phase="main")
+    assert rec.unstable is False
+    assert abs(rec.xyz[1] - 50.0) < 0.5    # accepted ≈ clean — the Y=80 glitch was rejected
+    assert rec.reads_taken >= 4            # one extra read to replace the rejected glitch
+
+
+def test_unconverging_patch_is_flagged_not_silently_capped():
+    # Reads that never settle (a steady drift, no stable cluster) → SE never tightens →
+    # FLAG at the abnormal bound. Not unbounded, not silently accepted.
+    t = _sdr()
+    panel = _ScriptedPanel([(50.0, 30.0 + 4.0 * i, 55.0) for i in range(30)])
+    loop = _solo_loop(panel, t, MeasureLoopConfig(read_tolerance_de=0.2, abnormal_reads=8),
+                      dip=_dip_for(50.0, 0.3))
+    rec = loop.measure_patch(_patch("px", (512, 512, 512), t, 0), phase="main")
+    assert rec.unstable is True
+    assert rec.note and "abnormal" in rec.note
+    assert rec.reads_taken <= 12           # bounded — flagged, not run forever, not capped-and-accepted
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +236,16 @@ def test_persistent_flaky_patch_surfaces_as_unresolved(tmp_path: Path):
     # start warm so warm-up settles immediately; only p0003 misbehaves.
     panel = SyntheticPanel(transfer=t, start_temp=1.0, flaky_label="p0003",
                            flaky_persistent=True, flaky_chroma=0.06)
+    # A DIP makes the loop take >1 read per patch (σ=0.3 ⇒ target 3); the persistent
+    # glitch never agrees with itself → SE never tightens → flagged at the abnormal
+    # bound → surfaced for adjudication. (Without a DIP it would be a trusted single read.)
     res = run_measure_loop(
         patches=_grey_ramp(t, 8),
         transfer=t,
         measure=panel,
-        config=MeasureLoopConfig(),
+        config=MeasureLoopConfig(read_tolerance_de=0.2, abnormal_reads=6),
         ndjson_path=tmp_path / "m.ndjson",
+        dip=_dip_for(50.0, 0.3),
     )
     assert res.warm is True
     assert "p0003" in res.unresolved

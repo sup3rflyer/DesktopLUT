@@ -9,10 +9,13 @@ via three mechanisms the design calls for:
    (blue, from the profile ``quirks``) and re-read until consecutive reads agree
    within ``settle_threshold`` for ``settle_required`` reads → "panel warm". The
    last settled read becomes the live *drift reference*.
-2. **Per-patch repeatability gate (immediate re-measure)** — a patch whose
-   confirm read disagrees with its first read beyond ``repeat_threshold`` (a
-   transient glitch) is re-read on the spot up to ``max_repeats`` times; only the
-   converged read is accepted.
+2. **Per-patch read policy (DIP-driven, no fixed count)** — a *single*
+   adaptive-integration read by default (as professional tools do); more *averaged*
+   reads only where the Display+Instrument Profile's measured noise model says SNR
+   needs it at that luminance; and continued reads until the sample standard error
+   falls within ``read_tolerance_de``. A patch that reads abnormally (won't tighten
+   within ~2× its DIP target) is **flagged for adjudication — never silently capped.**
+   The accepted value is the mean of the valid reads (the averaging IS the SNR win).
 3. **Interleaved drift reference (appended re-measure)** — every
    ``neutral_interval`` patches, re-read the neutral reference and compare to the
    warm reference. A slow warm-up creep beats a per-step settle threshold, so the
@@ -45,6 +48,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
 
+from .dip import DisplayInstrumentProfile
 from .drift import Channel, coldest_channel_from_xyz, evaluate_drift
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter
@@ -116,29 +120,34 @@ MeasureFn = Callable[[MeasurePatch], Reading]
 
 @dataclass(frozen=True)
 class MeasureLoopConfig:
-    """Loop tunables. The defaults are sane *core* values; the genuinely
-    judgment-bearing ones (``settle_threshold``, ``settle_required``,
-    ``repeat_threshold``, ``max_repeats``, ``remeasure_cap``) are **LLM-deferred**
-    — the orchestrator may override per run. *Physical facts* (``cold_channel``,
-    the settle tolerance) come from the profile, never hardwired here.
+    """Loop tunables. *Physical facts* (``cold_channel``, settle tolerance) come from
+    the profile / the Display+Instrument Profile (DIP); the **per-patch read budget is
+    deliberately NOT a fixed count.** A single adaptive-integration read by default (as
+    professional tools do), escalating to more *averaged* reads only where the DIP's
+    measured noise model says SNR needs it, and **escalating-with-a-flag — never a silent
+    cap** — when a patch reads abnormally. ``read_tolerance_de`` / ``min_reads`` /
+    ``abnormal_reads`` are the only read-policy knobs; how many reads a given patch
+    actually takes is decided per patch from the measured noise, not a constant.
     """
 
     # Warm-up-settle ---------------------------------------------------------
     warmup_signal: float = 0.5          # neutral grey level for warm-up / reference
     warmup_bias_signal: float = 0.02    # extra signal on the cold channel
-    cold_channel: Optional[Channel] = None  # from profile quirks; None → auto-detect
+    cold_channel: Optional[Channel] = None  # from profile quirks / DIP; None → auto-detect
     settle_threshold: float = 0.003     # channel-balance Δ between consecutive reads
     settle_required: int = 3            # consecutive in-tolerance reads ⇒ "warm"
-    max_warmup_reads: int = 24          # cap; not settled ⇒ escalate to the LLM
+    max_warmup_reads: int = 24          # not settled within this ⇒ escalate to the LLM (a FLAG, not a silent cap)
 
     # Interleaved drift reference (appended re-measure) ----------------------
-    neutral_interval: int = 8           # measurement patches between neutral re-reads
-    drift_threshold: float = 0.004      # channel-balance Δ vs the warm reference
+    neutral_interval: int = 8           # measurement patches between neutral re-reads (DIP may override)
+    drift_threshold: float = 0.004      # channel-balance Δ vs the warm reference (DIP may override)
 
-    # Per-patch repeatability (immediate re-measure) -------------------------
-    confirm_reads: int = 2              # reads/patch; ≥2 enables the repeatability gate
-    repeat_threshold: float = 0.5       # dE2000 agreement tolerance between reads
-    max_repeats: int = 3               # extra immediate re-reads on disagreement
+    # Per-patch read policy (single-read default + DIP-driven escalation) -----
+    read_tolerance_de: float = 0.2      # target standard error of the mean (CIEDE2000) per patch
+    min_reads: int = 1                  # single adaptive-integration read by default (pro-standard)
+    abnormal_reads: int = 16            # reads past ~2× the DIP target ⇒ FLAG for adjudication (never a silent cap)
+    outlier_factor: float = 3.0         # a read >factor×σ from the patch median is a glitch ⇒ rejected, not averaged in
+    outlier_floor_de: float = 0.5       # never reject within this ΔE of the median (a σ-independent floor)
 
     # Selective re-measure budget -------------------------------------------
     remeasure_cap: int = 256            # total appended re-measures allowed
@@ -217,6 +226,21 @@ def _agreement_de(
 
     wx = white if white and white[1] > 0 else (a[0] or 1.0, max(a[1], 1e-6), a[2] or 1.0)
     return delta_e2000(xyz_to_lab(a, wx), xyz_to_lab(b, wx))
+
+
+def _mean_xyz(vals: Sequence[tuple[float, float, float]]) -> tuple[float, float, float]:
+    """Component-wise mean of XYZ reads — averaging is how repeated reads buy SNR."""
+    n = len(vals)
+    return (sum(v[0] for v in vals) / n, sum(v[1] for v in vals) / n, sum(v[2] for v in vals) / n)
+
+
+def _median_xyz(vals: Sequence[tuple[float, float, float]]) -> tuple[float, float, float]:
+    """Component-wise median — the outlier-robust anchor for glitch rejection."""
+    def med(xs: list[float]) -> float:
+        xs = sorted(xs)
+        m = len(xs) // 2
+        return xs[m] if len(xs) % 2 else 0.5 * (xs[m - 1] + xs[m])
+    return (med([v[0] for v in vals]), med([v[1] for v in vals]), med([v[2] for v in vals]))
 
 
 def write_ti3(
@@ -304,12 +328,17 @@ class _Loop:
         config: MeasureLoopConfig,
         ndjson: _NdjsonWriter,
         events: Optional[EventWriter],
+        dip: Optional[DisplayInstrumentProfile] = None,
     ) -> None:
         self.transfer = transfer
         self.measure = measure
         self.cfg = config
         self.ndjson = ndjson
         self.events = events
+        # The measured panel+meter model that drives the per-patch read budget. When
+        # absent, the loop falls back to the single-read default (trust the instrument's
+        # adaptive integration) — variance-based SNR/abnormality needs a DIP to know σ.
+        self.dip = dip
 
         signals = to_signal(patches, transfer)
         width = max(4, len(str(max(0, len(patches) - 1))))
@@ -387,6 +416,43 @@ class _Loop:
     def _update_white(self, xyz: tuple[float, float, float]) -> None:
         if self.white_xyz is None or xyz[1] > self.white_xyz[1]:
             self.white_xyz = xyz
+
+    def _sample_se_de(self, reads: Sequence[tuple[float, float, float]]) -> Optional[float]:
+        """Standard error of the mean of these reads, in CIEDE2000. ``None`` for <2
+        reads (no spread to estimate). Computed as the RMS perceptual deviation of the
+        reads from their mean, divided by √n — so it tightens as reads accumulate, which
+        is exactly the statistical stopping signal the read policy waits on."""
+        n = len(reads)
+        if n < 2:
+            return None
+        mean = _mean_xyz(reads)
+        white = self.white_xyz or mean
+        rms = math.sqrt(sum(_agreement_de(r, mean, white) ** 2 for r in reads) / n)
+        return rms / math.sqrt(n)
+
+    def _robust_stats(self, reads: Sequence[tuple[float, float, float]],
+                      *, sigma: Optional[float] = None):
+        """``(robust_mean_xyz, se_de, n_inliers, n_outliers)`` for the reads so far, or
+        ``None`` when there are none. With ≥3 reads, a read whose ΔE from the patch
+        *median* exceeds ``outlier_factor × σ`` (σ from the DIP, else the sample's own
+        median-absolute-deviation) — floored at ``outlier_floor_de`` — is a glitch and
+        is **dropped from the mean**, not diluted into it; the SE and inlier count are
+        computed on the survivors. Below 3 reads there's nothing to reject against, so
+        all count (and a lone read trusts the instrument's adaptive integration)."""
+        n = len(reads)
+        if n == 0:
+            return None
+        if n < 3:
+            return (_mean_xyz(reads), self._sample_se_de(reads), n, 0)
+        med = _median_xyz(reads)
+        white = self.white_xyz or med
+        spread = sigma
+        if spread is None:
+            devs = sorted(_agreement_de(r, med, white) for r in reads)
+            spread = devs[len(devs) // 2]   # median absolute deviation, in ΔE
+        thr = max(self.cfg.outlier_floor_de, self.cfg.outlier_factor * (spread or 0.0))
+        inliers = [r for r in reads if _agreement_de(r, med, white) <= thr] or list(reads)
+        return (_mean_xyz(inliers), self._sample_se_de(inliers), len(inliers), n - len(inliers))
 
     # -- warm-up-settle ----------------------------------------------------
 
@@ -490,79 +556,104 @@ class _Loop:
         )
         return settled, reads
 
-    # -- one measurement patch (with the immediate repeatability gate) -----
+    # -- one measurement patch (DIP-driven read policy) --------------------
+
+    def _abnormal_reads(self, target_n: Optional[int]) -> int:
+        """The read count past which a patch is *abnormal* and must be FLAGGED (not
+        silently capped). Scaled off the DIP's per-luminance target so a legitimately
+        noisy dark patch (large target) isn't flagged at its own target, while a bright
+        patch that keeps disagreeing is flagged early. Always ≥ ``cfg.abnormal_reads``."""
+        base = self.cfg.abnormal_reads
+        return max(base, 2 * (target_n or 1))
 
     def measure_patch(self, patch: MeasurePatch, *, phase: str, disposition: Optional[str] = None) -> AcceptedRead:
+        """Measure one patch with the single-read-default policy: take one
+        adaptive-integration read, take *more averaged* reads only where the DIP's
+        measured noise says SNR needs it (``target_n``), and keep reading (then FLAG,
+        never silently cap) when the sample standard error won't fall within
+        ``read_tolerance_de`` — an abnormal patch the LLM must adjudicate."""
         cfg = self.cfg
-        first = self._read(patch, phase=phase, read_index=0, accepted=True, disposition=disposition)
-        reads = 1
-        immediate = 0
+        reads: list[tuple[float, float, float]] = []
+        yxys: list[tuple[float, float, float]] = []
+        target_n: Optional[int] = None          # DIP-predicted reads for SNR (set on first valid read)
+        sigma: Optional[float] = None           # DIP per-read σ at this luminance (drives outlier rejection)
+        read_index = 0
         unstable = False
-        note = None
+        note: Optional[str] = None
 
-        accepted_xyz = first.xyz
-        accepted_yxy = first.yxy
+        while True:
+            st = self._robust_stats(reads, sigma=sigma)
+            running_se = st[1] if st else None
+            r = self._read(
+                patch, phase=phase, read_index=read_index, accepted=True,
+                agreement_de=(round(running_se, 4) if running_se is not None else None),
+                disposition=("immediate" if read_index else disposition),
+            )
+            read_index += 1
+            if r.xyz is not None:
+                reads.append(r.xyz)
+                if r.yxy is not None:
+                    yxys.append(r.yxy)
+                self._update_white(r.xyz)
+                if target_n is None:
+                    # First valid read fixes the SNR target + σ from the DIP at this
+                    # patch's luminance; no DIP ⇒ min_reads (the single-read default).
+                    nits = r.xyz[1]
+                    sigma = self.dip.expected_sigma_de(nits) if self.dip else None
+                    dip_n = self.dip.reads_for_tolerance(nits, cfg.read_tolerance_de) if self.dip else None
+                    target_n = max(cfg.min_reads, dip_n or cfg.min_reads)
 
-        if accepted_xyz is None:
-            # A failed read is itself a transient — retry within the gate.
-            unstable = True
+            st = self._robust_stats(reads, sigma=sigma)
+            n_inliers = st[2] if st else 0
+            se = st[1] if st else None
+            outliers = st[3] if st else 0
 
-        if cfg.confirm_reads >= 2 or accepted_xyz is None:
-            prev_xyz = accepted_xyz
-            # Confirm reads until two consecutive agree, or max_repeats hit.
-            for attempt in range(1, cfg.max_repeats + 1):
-                confirm = self._read(
-                    patch,
-                    phase=phase,
-                    read_index=attempt,
-                    accepted=True,
-                    disposition="immediate",
-                )
-                reads += 1
-                immediate += 1
-                if confirm.xyz is None:
-                    continue
-                de = None
-                if prev_xyz is not None:
-                    de = _agreement_de(prev_xyz, confirm.xyz, self.white_xyz or confirm.xyz)
-                accepted_xyz = confirm.xyz
-                accepted_yxy = confirm.yxy
-                if de is not None and de <= cfg.repeat_threshold:
-                    unstable = False
-                    note = None
-                    break
-                prev_xyz = confirm.xyz
+            # Converge only on a CLEAN cluster: enough inlier reads at the SNR target,
+            # agreeing within tolerance, AND not too many reads rejected as glitches. A
+            # one-off transient is tolerated (resolved by the surviving inliers), but a
+            # patch that is *mostly* outliers — bimodal / ping-ponging / genuinely
+            # unstable — must FLAG, not be silently resolved by majority vote.
+            if (target_n is not None and n_inliers >= target_n
+                    and (se is None or se <= cfg.read_tolerance_de)
+                    and outliers <= max(1, read_index // 4)):
+                break
+
+            # Abnormal: too many reads for this luminance band ⇒ FLAG, do not cap silently.
+            if read_index >= self._abnormal_reads(target_n):
                 unstable = True
-                note = f"repeatability {de:.3f} dE > {cfg.repeat_threshold:.3f}" if de is not None else "read failed"
-            else:
-                if accepted_xyz is not None and immediate:
-                    self._emit_event("WARN", "patch_unstable", label=patch.label, reads=reads)
+                note = (f"abnormal: {read_index} reads ({st[3] if st else 0} outlier(s)), SE "
+                        + (f"{se:.3f} dE > {cfg.read_tolerance_de:.3f}" if se is not None else "n/a")
+                        + " — flagged for adjudication") if reads else "no usable read"
+                self._emit_event("WARN", "patch_unstable", label=patch.label,
+                                 reads=read_index, se=(round(se, 4) if se is not None else None),
+                                 outliers=(st[3] if st else 0))
+                break
 
-        if accepted_xyz is None:
-            # Never got a usable read — record a sentinel so the patch is visible
-            # downstream as a hole rather than silently missing.
-            accepted_xyz = (0.0, 0.0, 0.0)
-            unstable = True
-            note = "no usable read"
+        # Accept the outlier-rejected MEAN (averaging the inliers IS the SNR win; a gross
+        # glitch is dropped, not diluted in); a sentinel hole if nothing usable came back.
+        st = self._robust_stats(reads, sigma=sigma)
+        if st:
+            accepted_xyz = st[0]
+            accepted_yxy = _mean_xyz(yxys) if yxys else None
+        else:
+            accepted_xyz, accepted_yxy, unstable = (0.0, 0.0, 0.0), None, True
+            note = note or "no usable read"
 
         self._update_white(accepted_xyz)
+        immediate = max(0, read_index - 1)
         record = self.accepted.get(patch.label)
         if record is None:
             record = AcceptedRead(
-                patch=patch,
-                xyz=accepted_xyz,
-                yxy=accepted_yxy,
-                reads_taken=reads,
-                immediate_remeasures=immediate,
-                unstable=unstable,
-                note=note,
+                patch=patch, xyz=accepted_xyz, yxy=accepted_yxy,
+                reads_taken=read_index, immediate_remeasures=immediate,
+                unstable=unstable, note=note,
             )
             self.accepted[patch.label] = record
         else:
             # Overwrite in place (re-measure): keep only the final accepted read.
             record.xyz = accepted_xyz
             record.yxy = accepted_yxy
-            record.reads_taken += reads
+            record.reads_taken += read_index
             record.immediate_remeasures += immediate
             record.unstable = unstable
             record.note = note
@@ -709,6 +800,7 @@ def run_measure_loop(
     ti3_path: Optional[Path] = None,
     ndjson_path: Optional[Path] = None,
     events: Optional[EventWriter] = None,
+    dip: Optional[DisplayInstrumentProfile] = None,
 ) -> MeasureLoopResult:
     """Run the adaptive measurement loop over ``patches`` (code-value triples,
     already thermally ordered by the caller via :mod:`dlc.engine.patches`).
@@ -729,6 +821,7 @@ def run_measure_loop(
         config=cfg,
         ndjson=ndjson,
         events=events,
+        dip=dip,
     )
 
     loop.warm_up()
@@ -766,7 +859,7 @@ def run_measure_loop(
         question = (
             "; ".join(bits)
             + " — accept these as the panel's physical floor/limit, or keep warming / "
-            "loosen the repeatability tolerance and retry?"
+            "loosen the read tolerance and retry?"
         )
 
     digest = {
