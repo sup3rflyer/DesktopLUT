@@ -66,22 +66,6 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             gui_thread_required=False,
         ),
         ApiMethodSpec(
-            "state.snapshot",
-            "Capture enough DesktopLUT runtime/settings state to restore later.",
-            {},
-            {"snapshot_id": "string"},
-            mutates_state=True,
-            gui_thread_required=True,
-        ),
-        ApiMethodSpec(
-            "state.restore",
-            "Restore a previously captured DesktopLUT snapshot.",
-            {"snapshot_id": ApiParamSpec("string", required=False, description="Snapshot id returned by state.snapshot or calibration.enter.")},
-            {"snapshot_id": "string", "restored": "boolean"},
-            mutates_state=True,
-            gui_thread_required=True,
-        ),
-        ApiMethodSpec(
             "corrections.disable_all",
             "Disable all runtime correction layers for a clean measurement baseline.",
             {},

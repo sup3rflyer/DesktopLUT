@@ -234,6 +234,27 @@ def test_load_profile_round_trips(tmp_path: Path):
     assert t.white.method == "spd_crt_like"
     assert t.white.correction_strength == 0.5
     assert t.white.observer == "1964_10" and t.white.anchor == "legacy"
+
+
+def test_observer_normalization_repairs_unquoted_yaml():
+    # YAML 1.1 parses an unquoted `observer: 2015_2` as the int 20152 (underscore = digit
+    # separator); the loader must repair it to the canonical id, not pass a bogus observer to
+    # the white solver (M7). A genuinely unknown observer fails loudly.
+    assert cp._normalize_observer("2015_2") == "2015_2"
+    assert cp._normalize_observer(20152) == "2015_2"
+    assert cp._normalize_observer(196410) == "1964_10"
+    assert cp._normalize_observer(19312) == "1931_2"
+    with pytest.raises(ValueError):
+        cp._normalize_observer("nonsense")
+
+
+def test_unquoted_observer_in_yaml_is_repaired(tmp_path: Path):
+    # The live landmine: a profile edit that drops the quotes around the observer id.
+    yaml = _YAML.replace('observer: "1964_10"', "observer: 1964_10")
+    path = tmp_path / "calibration_profile.yaml"
+    path.write_text(yaml, encoding="utf-8")
+    p = cp.load_profile(path)
+    assert p.target("srgb_g22_120").white.observer == "1964_10"
     assert p.quality.avg_de2000 == 1.2
     assert p.source_path == str(path)
 

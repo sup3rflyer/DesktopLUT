@@ -117,13 +117,6 @@ class DesktopLutClient:
     def state_get(self) -> DesktopLutCommand:
         return DesktopLutCommand("state.get")
 
-    def snapshot(self) -> DesktopLutCommand:
-        return DesktopLutCommand("state.snapshot")
-
-    def restore(self, snapshot_id: str | None = None) -> DesktopLutCommand:
-        params = {"snapshot_id": snapshot_id} if snapshot_id else {}
-        return DesktopLutCommand("state.restore", params)
-
     def disable_all(self) -> DesktopLutCommand:
         return DesktopLutCommand("corrections.disable_all")
 
@@ -149,12 +142,6 @@ class DesktopLutClient:
 
     def exit_calibration_mode(self, restore_snapshot: bool = False) -> DesktopLutCommand:
         return DesktopLutCommand("calibration.exit", {"restore_snapshot": restore_snapshot})
-
-    def set_mhc_1dlut(self, monitor: int, mode: str, cube_path: str) -> DesktopLutCommand:
-        return DesktopLutCommand(
-            "mhc.set_1dlut",
-            {"monitor": monitor, "mode": mode, "cube_path": cube_path},
-        )
 
     def set_mhc_base_grayscale(
         self, monitor: int, mode: str, point_count: int, points: list[float], deviations: dict[str, list[float]]

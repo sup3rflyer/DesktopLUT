@@ -263,7 +263,7 @@ def optimize_cube(
 
     history: list[IterationResult] = []
     snapshots: list[dict[str, Any]] = []   # cached per-iter measurements (no extra probing)
-    prev_de: Optional[np.ndarray] = None
+    best_seen_max: Optional[float] = None  # best worst-case dE so far (noise-robust stop)
     converged = False
 
     for it in range(1, cfg.max_outer + 1):
@@ -314,28 +314,29 @@ def optimize_cube(
         if on_iteration is not None:
             on_iteration(result)
 
-        if de.max() < cfg.threshold:
+        cur_max = float(de.max())
+        if cur_max < cfg.threshold:
             converged = True
             break
 
-        # Escalate the budget while points are clamp-limited with signal headroom —
-        # a too-small budget self-corrects rather than reading as a floor.
-        if cfg.auto_escalate and masks["budget_limited"].any() and budget < cfg.max_correction_cap:
+        # Escalating the budget is a real lever (clamp-limited points with signal headroom),
+        # not noise — keep doing it ahead of any stall test.
+        escalating = (cfg.auto_escalate and masks["budget_limited"].any()
+                      and budget < cfg.max_correction_cap)
+        if escalating:
             budget = min(cfg.max_correction_cap, budget * cfg.escalate_factor)
-        else:
-            # No budget headroom to gain: stop once no above-threshold point is
-            # still improving (real floor — clipped or model residual).
-            if prev_de is not None:
-                improving = (de > cfg.threshold) & ((prev_de - de) >= cfg.floor_tol)
-                if not np.any(improving):
-                    prev_de = de
-                    train_signals = np.vstack([train_signals, driven])
-                    train_xyz = np.vstack([train_xyz, measured])
-                    break
+        elif best_seen_max is not None and cur_max > best_seen_max - cfg.floor_tol:
+            # No budget headroom AND this iteration did not improve the best worst-case error
+            # by at least floor_tol (the measurement-noise band). Folding its driven/measured
+            # pairs would just inject noise into the next model — stop and keep the best cube.
+            # (The old per-point "still improving" guard oscillated under noise: some point
+            # always wiggled by floor_tol, so the loop ran to the cap and folded noisy pairs.)
+            break
 
-        prev_de = de
-        # Fold reality back: the driven points + their true response are new ground
-        # truth about the panel where the cube actually operates.
+        best_seen_max = cur_max if best_seen_max is None else min(best_seen_max, cur_max)
+        # Fold reality back: the driven points + their true response are new ground truth where
+        # the cube actually operates. Only reached when escalating or genuinely improving — a
+        # non-improving (likely noisy) iteration breaks above WITHOUT polluting the model.
         train_signals = np.vstack([train_signals, driven])
         train_xyz = np.vstack([train_xyz, measured])
 

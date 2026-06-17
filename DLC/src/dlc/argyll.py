@@ -512,6 +512,9 @@ class PersistentSpotread:
             if stale:
                 self._results.clear()
                 self.stale_discarded += stale
+            # A warning queued before this trigger pertains to a prior reading, not this
+            # patch — drop it so a stale warn-token can't demote this patch's valid reading.
+            self._pending_warning = None
         if self._dead():
             return SpotreadResult(None, None, ok=False, error="spotread process is not running")
         self._send(self._trigger)

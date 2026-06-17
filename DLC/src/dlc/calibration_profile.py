@@ -494,13 +494,33 @@ class Profile:
 # YAML loading
 # ---------------------------------------------------------------------------
 
+# Valid CIE observer ids (mirrors engine.whitepoint.OBSERVERS — kept here so profile load
+# stays engine-free). The digit-stripped map repairs the YAML 1.1 landmine: an UNQUOTED
+# `observer: 2015_2` parses as the int 20152 (underscore = digit separator), whose str() would
+# otherwise silently reach the white solver as a bogus observer.
+_KNOWN_OBSERVERS = ("1931_2", "2015_2", "1964_10")
+_OBSERVER_BY_DIGITS = {o.replace("_", ""): o for o in _KNOWN_OBSERVERS}
+
+
+def _normalize_observer(value: Any) -> str:
+    s = str(value).strip()
+    if s in _KNOWN_OBSERVERS:
+        return s
+    if s in _OBSERVER_BY_DIGITS:           # e.g. unquoted YAML 2015_2 -> int 20152 -> "2015_2"
+        return _OBSERVER_BY_DIGITS[s]
+    raise ValueError(
+        f"unknown CIE observer {value!r}; expected one of {list(_KNOWN_OBSERVERS)}. "
+        'Quote it in YAML (observer: "2015_2") so YAML 1.1 does not read the underscore as a '
+        "numeric digit separator.")
+
+
 def _white_spec(raw: dict[str, Any]) -> WhiteSpec:
     w = raw or {}
     return WhiteSpec(
         intent=str(w.get("intent", "D65")),
         method=str(w.get("method", "numeric")),
         correction_strength=float(w.get("correction_strength", 0.0) or 0.0),
-        observer=str(w.get("observer", "2015_2")),
+        observer=_normalize_observer(w.get("observer", "2015_2")),
         anchor=str(w.get("anchor", "reference")),
     )
 

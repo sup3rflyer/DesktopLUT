@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .desktoplut_client import DesktopLutClient
 from .events import EventWriter
 from .runs import RunContext
 
@@ -371,61 +370,4 @@ def build_mhc_candidate(
 def load_mhc_candidate(path: Path) -> MhcCandidate:
     raw = json.loads(path.read_text(encoding="utf-8"))
     return MhcCandidate(**raw)
-
-
-def latest_mhc_candidate(ctx: RunContext) -> Path | None:
-    for entry in reversed(ctx.manifest.stages):
-        if entry.get("stage") == "build_mhc_baseline" and isinstance(entry.get("candidate"), str):
-            return Path(str(entry["candidate"]))
-    return None
-
-
-def apply_mhc_candidate(
-    *,
-    ctx: RunContext,
-    client: DesktopLutClient,
-    candidate_path: Path | None = None,
-    monitor: int = 0,
-) -> dict[str, Any]:
-    candidate_path = candidate_path or latest_mhc_candidate(ctx)
-    if candidate_path is None:
-        raise FileNotFoundError("no MHC candidate found")
-    candidate = load_mhc_candidate(candidate_path)
-    responses = []
-    for command in [
-        client.snapshot(),
-        client.disable_all(),
-        client.set_mhc_primaries(monitor, candidate.mode, candidate.measured_primaries),
-        client.set_mhc_white(monitor, candidate.mode, candidate.target_white["x"], candidate.target_white["y"]),
-        client.set_mhc_1dlut(monitor, candidate.mode, candidate.cube_path),
-        client.apply_mhc(monitor, candidate.mode),
-        client.verify_mhc(monitor, candidate.mode),
-    ]:
-        response = client.send(command, raise_on_error=False)
-        responses.append({"command": command.as_dict(), "response": response.as_dict()})
-        if not response.ok:
-            break
-    ok = all(item["response"]["ok"] for item in responses)
-    result = {"ok": ok, "candidate": str(candidate_path), "monitor": monitor, "responses": responses}
-    ctx.manifest.stages.append(
-        {
-            "stage": "apply_mhc_baseline",
-            "iteration": candidate.iteration,
-            "status": "applied" if ok else "failed",
-            "candidate": str(candidate_path),
-            "result": result,
-        }
-    )
-    ctx.manifest.desktoplut["last_mhc_apply"] = result
-    ctx.save()
-    ctx.log(f"{'Applied' if ok else 'Failed to apply'} MHC candidate iteration {candidate.iteration}")
-    EventWriter(ctx.events_path).write(
-        "INFO" if ok else "ERROR",
-        "apply_mhc_baseline",
-        "mhc_candidate_applied",
-        ok=ok,
-        candidate=str(candidate_path),
-        monitor=monitor,
-    )
-    return result
 

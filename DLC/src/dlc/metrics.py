@@ -60,8 +60,8 @@ class MetricsSummary:
     white_de2000: float
     grayscale_avg_de2000: float
     grayscale_max_de2000: float
-    metrics_path: str
-    patches_path: str
+    metrics_path: str | None
+    patches_path: str | None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,9 +79,12 @@ def xyz_to_lab(xyz: tuple[float, float, float], white: tuple[float, float, float
         kappa = 24389 / 27
         return value ** (1 / 3) if value > epsilon else (kappa * value + 16) / 116
 
-    xr = xyz[0] / white[0] if white[0] else 0.0
-    yr = xyz[1] / white[1] if white[1] else 0.0
-    zr = xyz[2] / white[2] if white[2] else 0.0
+    # Clamp the relative tristimulus to >= 0: a dark/noisy measurement can read slightly
+    # negative XYZ, which otherwise produces garbage Lab (and can quietly corrupt the dE
+    # accept/iterate verdict). Clamping to 0 maps it to legitimate black.
+    xr = max(0.0, xyz[0] / white[0]) if white[0] else 0.0
+    yr = max(0.0, xyz[1] / white[1]) if white[1] else 0.0
+    zr = max(0.0, xyz[2] / white[2]) if white[2] else 0.0
     fx, fy, fz = f(xr), f(yr), f(zr)
     return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
 
@@ -197,8 +200,8 @@ def summarize_metrics(
     source: Path,
     patch_metrics: list[PatchMetric],
     target_luminance: float,
-    metrics_path: Path,
-    patches_path: Path,
+    metrics_path: Path | None = None,
+    patches_path: Path | None = None,
 ) -> MetricsSummary:
     values = [metric.de2000 for metric in patch_metrics]
     grayscale = [metric.de2000 for metric in patch_metrics if metric.grayscale]
@@ -217,8 +220,8 @@ def summarize_metrics(
         white_de2000=white_patch.de2000,
         grayscale_avg_de2000=(sum(grayscale) / len(grayscale)) if grayscale else 0.0,
         grayscale_max_de2000=max(grayscale) if grayscale else 0.0,
-        metrics_path=str(metrics_path),
-        patches_path=str(patches_path),
+        metrics_path=str(metrics_path) if metrics_path is not None else None,
+        patches_path=str(patches_path) if patches_path is not None else None,
     )
 
 

@@ -168,6 +168,20 @@ def test_measure_auto_starts_when_not_started_explicitly():
     drv.close()
 
 
+def test_stale_warning_does_not_demote_next_reading():
+    # A warn token can arrive between reads (a transient), setting _pending_warning with no
+    # following result line. The trigger-time drain must drop it so it can't be attached to —
+    # and falsely demote — the NEXT patch's valid reading (M1).
+    fake = FakeSpotread()
+    drv = _driver(fake)
+    drv.start()
+    with drv._lock:
+        drv._pending_warning = "spurious under-range warning from a prior transient"
+    res = drv.measure()
+    assert res.ok is True and res.error is None   # the stale warning was dropped, not attached
+    drv.close()
+
+
 def test_trigger_and_quit_bytes_are_forwarded():
     fake = FakeSpotread()
     drv = _driver(fake, trigger=b"\n", quit_command=b"q\n")

@@ -24,14 +24,14 @@ def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float) -> dict[str
         return None
     samples = parse_ti3(ti3)
     patch_metrics, lum = score_samples(samples, gamma=gamma)
+    # This report only extracts the dE numbers below — it writes no metrics/patch JSON, so
+    # metrics_path/patches_path stay None rather than masquerading as the TI3 path.
     summary = summarize_metrics(
         phase=stage,
         iteration=0,
         source=ti3,
         patch_metrics=patch_metrics,
         target_luminance=lum,
-        metrics_path=ti3,
-        patches_path=ti3,
     )
     return {
         "avg_de2000": round(summary.avg_de2000, 4),

@@ -227,6 +227,20 @@ def test_sdr_missing_channel_raises():
         S.build_sdr_cube({"red": [(1.0, [1, 1, 1])], "green": [(1.0, [1, 1, 1])]})
 
 
+def test_drive_for_y_clamps_out_of_domain():
+    # inv_y extrapolates (Pchip blows up far out of the measured domain); drive_for_y must
+    # clamp at the SOURCE so an out-of-range request can't yield a garbage / black-for-white
+    # drive when a caller forgets to clip (M4).
+    ramps = _synth_ramps("sRGB")
+    model = S.make_channel_model(ramps["green"])
+    assert model.drive_for_y(model.peak_y * 1000.0) == pytest.approx(1.0)   # over peak -> 1
+    assert model.drive_for_y(-1e6) == 0.0                                   # below black -> 0
+    # the raw extrapolating interpolator is wildly UNbounded (huge negative over peak, huge
+    # positive below black) — proving the guard does real work, not just echoing a clip.
+    assert not (0.0 <= float(model.inv_y(model.peak_y * 1000.0)) <= 1.0)
+    assert not (0.0 <= float(model.inv_y(-1e6)) <= 1.0)
+
+
 # ===========================================================================
 # whitepoint
 # ===========================================================================

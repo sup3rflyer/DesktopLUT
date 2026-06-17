@@ -44,12 +44,6 @@ class MockDesktopLutServer:
         try:
             if method == "state.get":
                 return self.ok(self.state.as_dict())
-            if method == "state.snapshot":
-                snapshot_id = f"snapshot-{len(self.state.snapshots) + 1}"
-                self.state.snapshots[snapshot_id] = self.state.as_dict()
-                return self.ok({"snapshot_id": snapshot_id})
-            if method == "state.restore":
-                return self.restore(str(params.get("snapshot_id", "")))
             if method == "corrections.disable_all":
                 self.state.corrections_enabled = False
                 return self.ok({"corrections_enabled": False})
@@ -180,8 +174,6 @@ class MockDesktopLutServer:
             state["primaries"] = deepcopy(params["primaries"])
         elif method == "mhc.set_white":
             state["white"] = {"x": params["x"], "y": params["y"]}
-        elif method == "mhc.set_1dlut":
-            state["cube_path"] = params["cube_path"]
         elif method == "mhc.set_base_grayscale":
             state["base_grayscale"] = {
                 "point_count": params.get("point_count"),

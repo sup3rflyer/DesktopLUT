@@ -36,7 +36,7 @@ from dlc.lut3d import apply_3dlut_candidate, execute_3dlut_build_plan, write_3dl
 from dlc.lut_integrity import parse_cube, write_lut_integrity
 from dlc.measure_rgbw import plan_rgbw_measurement, resolve_spotread_instrument_port, run_rgbw_measurement
 from dlc.metrics import score_samples, write_metrics
-from dlc.mhc import apply_mhc_candidate, build_mhc_candidate, parse_ti3
+from dlc.mhc import build_mhc_candidate, parse_ti3
 from dlc.patch_presenter import (
     build_drift_sequence, build_rgbw_sequence, code_to_css_rgb, load_drift_plan,
     load_patch_sequence, preview_sequence, run_scripted_presenter, write_patch_sequence,
@@ -1044,16 +1044,19 @@ class DesktopLutApiTests(unittest.TestCase):
         self.assertEqual(decode_message(encoded)["method"], "state.get")
 
     def test_mock_mhc_sequence_updates_state(self) -> None:
+        # The v2 MHC contract stages primaries + white + base grayscale (no 1D-cube import),
+        # then applies. (mhc.set_1dlut was a phantom method with no C++ handler — removed.)
         client = DesktopLutClient(transport=MockDesktopLutTransport())
         client.send(client.disable_all())
         client.send(client.set_mhc_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33}))
         client.send(client.set_mhc_white(0, "SDR", 0.3127, 0.329))
-        client.send(client.set_mhc_1dlut(0, "SDR", "generated/test.cube"))
+        client.send(client.set_mhc_base_grayscale(
+            0, "SDR", 2, [0.0, 1.0], {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}))
         client.send(client.apply_mhc(0, "SDR"))
         state = client.send(client.state_get()).result or {}
         self.assertFalse(state["corrections_enabled"])
         self.assertTrue(state["mhc"]["0:SDR"]["applied"])
-        self.assertEqual(state["mhc"]["0:SDR"]["cube_path"], "generated/test.cube")
+        self.assertIn("base_grayscale", state["mhc"]["0:SDR"])
 
     def test_jsonl_transport_records_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1111,18 +1114,14 @@ class MhcCandidateTests(unittest.TestCase):
             self.assertFalse(candidate.fallback)
             self.assertGreater(candidate.target_luminance, 0)
 
-    def test_build_default_candidate_and_apply_to_mock(self) -> None:
+    def test_build_default_candidate(self) -> None:
+        # The default (no-TI3) candidate build still works; the v1 apply_mhc_candidate path
+        # (which drove the phantom snapshot/set_1dlut methods) has been removed.
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
             candidate = build_mhc_candidate(ctx=ctx, allow_defaults=True, lut_size=9)
-            result = apply_mhc_candidate(
-                ctx=open_run(ctx.root),
-                client=DesktopLutClient(transport=MockDesktopLutTransport()),
-                candidate_path=Path(candidate.candidate_path),
-            )
-            self.assertTrue(result["ok"])
-            reopened = open_run(ctx.root)
-            self.assertEqual(reopened.manifest.stages[-1]["stage"], "apply_mhc_baseline")
+            self.assertTrue(Path(candidate.candidate_path).exists())
+            self.assertTrue(Path(candidate.cube_path).exists())
 
 
 class Lut3dTests(unittest.TestCase):

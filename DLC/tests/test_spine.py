@@ -68,6 +68,31 @@ def test_verify_scores_against_resolved_white_not_hardcoded_d65():
     assert white_metric.de2000 > 1.0
 
 
+def test_xyz_to_lab_clamps_negative_tristimulus():
+    # A dark/noisy measurement can read slightly negative XYZ; it must map to legitimate black
+    # (finite Lab), not garbage that could corrupt the dE accept/iterate verdict (M5).
+    import math
+
+    from dlc.metrics import xyz_to_lab
+    white = (95.047, 100.0, 108.883)
+    lab = xyz_to_lab((-0.5, -0.3, -0.2), white)
+    assert lab == xyz_to_lab((0.0, 0.0, 0.0), white)   # clamped to black
+    assert all(math.isfinite(c) for c in lab)
+
+
+def test_summarize_metrics_paths_default_to_none():
+    # Callers that write no metrics/patch JSON must not record a fake artifact path (M8).
+    from pathlib import Path
+
+    from dlc.metrics import score_samples, summarize_metrics, target_xyz_for_rgb
+    from dlc.mhc import Ti3Sample
+    samples = [Ti3Sample(rgb=(1.0, 1.0, 1.0), xyz=target_xyz_for_rgb((1.0, 1.0, 1.0), 100.0, 2.2))]
+    metrics, lum = score_samples(samples, luminance=100.0, gamma=2.2)
+    summary = summarize_metrics(phase="v", iteration=0, source=Path("x.ti3"),
+                                patch_metrics=metrics, target_luminance=lum)
+    assert summary.metrics_path is None and summary.patches_path is None
+
+
 def test_score_samples_default_white_is_unchanged_d65():
     # The legacy (white_xy=None) path must still be textbook D65, byte-for-byte behaviour.
     from dlc.metrics import score_samples, target_xyz_for_rgb
@@ -310,3 +335,26 @@ def test_api_spec_documents_item6_methods():
     qm = methods["windows.query_monitors"]
     assert qm["mutates_state"] is False
     assert "device_name" in qm["result"]["monitors"]
+
+
+def test_api_spec_methods_all_have_a_cpp_handler():
+    # Conformance: every method the spec advertises MUST have a real C++ Dispatch case, so
+    # API drift (and phantom methods like the removed state.snapshot/set_1dlut) is caught here
+    # — not just by the Python<->mock roundtrip, which passes by construction. Skips cleanly
+    # if the C++ source isn't checked out alongside (DLC can live standalone).
+    import re
+    from pathlib import Path
+
+    from dlc.desktoplut_api_spec import build_desktoplut_api_spec
+
+    # DLC root = tests/.. ; the C++ IPC server lives at <repo>/src (../src from the DLC root).
+    cpp = Path(__file__).resolve().parents[1].parent / "src" / "desktoplut_ipc_server.cpp"
+    if not cpp.exists():
+        pytest.skip(f"C++ IPC server not found at {cpp}")
+    text = cpp.read_text(encoding="utf-8", errors="replace")
+    # Every handler dispatches on a string literal (`m == "..."` / `method == "..."`).
+    handled = set(re.findall(r'(?:\bm|\bmethod)\s*==\s*"([^"]+)"', text))
+    advertised = {m["method"] for m in build_desktoplut_api_spec()["methods"]}
+
+    missing = sorted(advertised - handled)
+    assert not missing, f"spec advertises methods with no C++ Dispatch handler: {missing}"

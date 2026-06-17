@@ -1118,8 +1118,7 @@ class Calibration:
             wx, wy = self._white_xy()
             metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
             summary = summarize_metrics(phase="verification", iteration=0, source=Path(verify_ti3),
-                                        patch_metrics=metrics, target_luminance=lum,
-                                        metrics_path=Path(verify_ti3), patches_path=Path(verify_ti3))
+                                        patch_metrics=metrics, target_luminance=lum)
             q = self.profile.quality
             within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
                       and summary.max_de2000 <= q.max_de2000 and summary.white_de2000 <= q.white_de2000)

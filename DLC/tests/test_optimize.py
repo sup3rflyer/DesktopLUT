@@ -131,6 +131,37 @@ def test_foldback_loop_is_no_worse_than_a_single_build():
 
 
 # ---------------------------------------------------------------------------
+# noise-robust termination (T2.4)
+# ---------------------------------------------------------------------------
+
+def test_noisy_run_stops_early_instead_of_running_to_cap():
+    target = _sdr_target()
+    # An infeasible floor (blue 12% dim) + 1% measurement noise: the worst-case error can't
+    # keep improving, so the aggregate noise-aware rule must stop well before the iteration
+    # cap. The old per-point "still improving" guard oscillated under noise (some point always
+    # wiggled by floor_tol) and ran every iteration, folding noisy pairs into the model.
+    probe = synthetic_probe(target, gains=(1.0, 1.0, 0.88), noise=0.01, seed=3)
+    signals = _cube_signals(5)
+    measured = probe(signals)
+    cap = 12
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=9, threshold=2.0, max_outer=cap, floor_tol=0.3))
+    assert result.iterations < cap            # terminated by the stall rule, not the cap
+    assert result.needs_adjudication is True   # the real floor is still surfaced
+
+
+def test_noiseless_correctable_panel_still_converges():
+    # The termination change must not regress the clean (noiseless) convergence path.
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
+    signals = _cube_signals(5)
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=probe(signals),
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=6))
+    assert result.converged is True
+    assert result.digest["best_max_de"] < 2.0
+
+
+# ---------------------------------------------------------------------------
 # floor detection / escalation
 # ---------------------------------------------------------------------------
 

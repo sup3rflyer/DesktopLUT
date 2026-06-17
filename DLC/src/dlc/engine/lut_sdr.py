@@ -65,6 +65,14 @@ class ChannelModel:
     inv_y: PchipInterpolator    # absolute Y -> drive level
     f_xyz: list[PchipInterpolator]  # level -> X/Y/Z (forward, for validation)
 
+    def drive_for_y(self, desired_y: float) -> float:
+        """Drive level in [0,1] that produces ``desired_y`` (absolute Y) — robust at the
+        SOURCE. ``inv_y`` extrapolates (Pchip can blow up to ~-1e29 far out of the measured
+        domain), so clamp the request into the measured Y range before inverting, then clamp
+        the level. A caller can't get a garbage / black-for-white drive by forgetting to clip."""
+        y = min(max(float(desired_y), 0.0), self.peak_y)
+        return min(max(float(self.inv_y(y)), 0.0), 1.0)
+
 
 def make_channel_model(samples: Sequence[Sample]) -> ChannelModel:
     """Build a per-channel model from ``(level, XYZ)`` ramp samples.
@@ -182,8 +190,7 @@ def build_sdr_cube(channel_samples: dict[str, Sequence[Sample]], *,
                 out = []
                 for amount, ch in zip(amounts, ("red", "green", "blue")):
                     desired_y = np.clip(amount, 0.0, 1.0) * models[ch].peak_y
-                    level = float(models[ch].inv_y(desired_y))
-                    out.append(min(max(level, 0.0), 1.0))
+                    out.append(models[ch].drive_for_y(desired_y))
                 lut[bi, gi, ri] = out
 
     def xy(ch: str) -> tuple[float, float]:
