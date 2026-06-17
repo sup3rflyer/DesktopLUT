@@ -20,11 +20,15 @@ from __future__ import annotations
 import sys
 import threading
 import subprocess
+from pathlib import Path
 
 from dlc.argyll import (
+    Argyll,
     PersistentSpotread,
+    SpotreadRequest,
     SpotreadResult,
     _PipeSpotreadProcess,
+    _strip_ansi,
 )
 
 
@@ -340,6 +344,52 @@ def test_two_readings_for_one_trigger_takes_latest_and_counts_extra():
     assert res.ok and abs(res.xyz[0] - 20.0) < 1e-6
     assert drv.extra_readings == 1
     drv.close()
+
+
+# ---------------------------------------------------------------------------
+# ConPTY transport: VT-decorated stream + default wiring (the box-validated fix)
+# ---------------------------------------------------------------------------
+
+def test_strip_ansi_removes_vt_decoration_keeps_reading_text():
+    raw = ("\x1b[2K\x1b[0m Result is XYZ: 80.000000 85.000000 90.000000, "
+           "Yxy: 85.000000 0.310000 0.330000\x1b[?25h\r")
+    clean = _strip_ansi(raw)
+    assert "\x1b" not in clean and "\r" not in clean
+    assert "Result is XYZ: 80.000000 85.000000 90.000000" in clean
+
+
+def test_conpty_style_ansi_decorated_readings_parse_cleanly():
+    # A ConPTY wraps spotread's line-oriented output in VT/SGR escapes, echoes CRs,
+    # and re-emits the prompt with cursor codes. The pump must strip all of it and
+    # still parse XYZ/Yxy — this is what makes the pseudo-console transport usable.
+    def responder(n):
+        x = 80.0 + n
+        return (
+            "\x1b[2K\x1b[0m Result is XYZ: %f %f %f, Yxy: %f 0.312700 0.329000\x1b[0m\r\n"
+            "\x1b[?25h\x1b[1mPlace instrument and hit any key to take a reading: \x1b[0m"
+            % (x, 100.0, 108.0, 100.0)
+        ).encode("ascii")
+
+    prompt = b"\x1b[2J\x1b[H Spot read\r\n hit any key to take a reading: "
+    fake = FakeSpotread(prompt=prompt, responder=responder)
+    with _driver(fake) as drv:
+        first = drv.measure()
+        second = drv.measure()
+    assert first.ok and second.ok
+    assert first.xyz is not None and abs(first.xyz[0] - 81.0) < 1e-6
+    assert second.xyz is not None and abs(second.xyz[0] - 82.0) < 1e-6
+    assert abs(first.yxy[1] - 0.3127) < 1e-6
+
+
+def test_open_persistent_defaults_to_conpty_with_enter_trigger():
+    arg = Argyll(Path("spotread.exe"))
+    req = SpotreadRequest(port=1)
+    # Default transport is ConPTY (Windows-correct); the factory is lazy so nothing spawns.
+    meter = arg.open_persistent(req)
+    assert meter._trigger == b"\r"
+    # The raw-pipe fallback keeps the newline trigger.
+    pipe_meter = arg.open_persistent(req, transport="pipe")
+    assert pipe_meter._trigger == b"\n"
 
 
 # ---------------------------------------------------------------------------

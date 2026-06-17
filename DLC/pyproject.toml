@@ -9,7 +9,9 @@ description = "LLM-steered display calibration harness for DesktopLUT (stage too
 requires-python = ">=3.11"
 # The spine and contract stay dependency-free. The heavy scientific stack lives
 # behind the `engine` extra (pip install -e .[engine]) and is imported only by
-# dlc.engine.* — see requirements.txt.
+# dlc.engine.*; the persistent-meter ConPTY transport needs the `meter` extra
+# (pywinpty), lazily imported by dlc.argyll only when --persistent-meter is used.
+# See requirements.txt.
 dependencies = []
 
 [project.optional-dependencies]
@@ -17,6 +19,11 @@ engine = [
     "numpy>=1.26,<3",
     "scipy>=1.11,<2",
     "colour-science>=0.4.4,<0.5",
+]
+# Persistent (interactive) spotread needs a Windows pseudo-console to deliver its
+# trigger keystroke — the raw pipe doesn't work (box-validated 2026-06-17).
+meter = [
+    "pywinpty>=2.0; platform_system == 'Windows'",
 ]
 
 # The harness has no single CLI entry point: the arbitrating assistant invokes

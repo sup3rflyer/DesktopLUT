@@ -125,15 +125,25 @@ class Argyll:
             cmd.extend(["-Y", "A"])
         return cmd
 
-    def open_persistent(self, request: SpotreadRequest, **kwargs) -> "PersistentSpotread":
-        """Build a :class:`PersistentSpotread` that spawns ``spotread`` in
-        interactive mode (one long-lived process). ``kwargs`` are forwarded to
-        :class:`PersistentSpotread` (``trigger``, ``read_timeout``, …). The caller
-        owns the lifecycle — :meth:`PersistentSpotread.close` it when the pass ends."""
+    def open_persistent(self, request: SpotreadRequest, *, transport: str = "conpty",
+                        cwd: Optional[str] = None, **kwargs) -> "PersistentSpotread":
+        """Build a :class:`PersistentSpotread` that spawns ``spotread`` in interactive
+        mode (one long-lived process). ``transport`` selects how the trigger keystroke is
+        delivered: ``"conpty"`` (default) drives spotread through a Windows pseudo-console
+        — REQUIRED on Windows, where spotread reads the trigger via the console API and
+        never sees a raw-pipe trigger (box-validated 2026-06-17); ``"pipe"`` is the raw
+        :class:`subprocess.Popen` fallback (non-Windows / tests). ``kwargs`` are forwarded
+        to :class:`PersistentSpotread`. The caller owns the lifecycle —
+        :meth:`PersistentSpotread.close` it when the pass ends."""
 
         command = self.interactive_command(request)
 
-        def factory() -> "SpotreadProcess":
+        if transport == "conpty":
+            # Enter, delivered as a real console keypress (spotread: "any key to take a reading").
+            kwargs.setdefault("trigger", b"\r")
+            return PersistentSpotread(lambda: _ConPtySpotreadProcess(command, cwd=cwd), **kwargs)
+
+        def factory() -> "SpotreadProcess":  # raw-pipe fallback
             proc = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -196,6 +206,22 @@ def command_for_log(command: Sequence[str]) -> str:
     return subprocess.list2cmdline([str(part) for part in command])
 
 
+# CSI / OSC / two-char VT escape sequences. ConPTY decorates spotread's otherwise
+# line-oriented output with these (plus echoed CRs); the line pump strips them so
+# classification/parsing sees clean ASCII. A no-op on the raw-pipe transport.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"             # CSI ... final byte
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL/ST
+    r"|\x1b[@-Z\\-_]"                      # two-char (Fe) escapes
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip terminal/VT control sequences and bare CR/BEL so a ConPTY-decorated
+    spotread stream parses like the raw-pipe one."""
+    return _ANSI_RE.sub("", text).replace("\r", "").replace("\x07", "").replace("\x1b", "")
+
+
 # ---------------------------------------------------------------------------
 # Persistent (interactive) spotread driver
 # ---------------------------------------------------------------------------
@@ -208,12 +234,14 @@ def command_for_log(command: Sequence[str]) -> str:
 # one reading per trigger. Each read drops to ~integration time, which also makes
 # the repeatability gate and adaptive settle cheap.
 #
-# Transport is isolated behind `SpotreadProcess` on purpose: the one genuine
-# hardware unknown is whether Windows Argyll triggers a reading from a *raw pipe*
-# stdin (the simple `_PipeSpotreadProcess`) or needs a pseudo-console (ConPTY).
-# DisplayCAL proves piped-stdin driving works; if box-validation shows otherwise,
-# only a new SpotreadProcess implementation is needed — the state machine below
-# (start → trigger → parse → loop → quit) is transport-agnostic and unit-tested.
+# Transport is isolated behind `SpotreadProcess` on purpose. Box-validation
+# (2026-06-17) RESOLVED the open question: Windows Argyll spotread reads its trigger
+# key via the console API (_getch), so a `\n` on raw-pipe stdin is NEVER seen — it
+# calibrates but never measures (spotread idle, read times out). The pseudo-console
+# transport (`_ConPtySpotreadProcess`, the default) makes spotread see a real console
+# so the trigger lands as a keypress; `_PipeSpotreadProcess` stays as the non-Windows /
+# test fallback. The state machine below (start → trigger → parse → loop → quit) is
+# transport-agnostic and unit-tested, so only the transport changed.
 
 
 @dataclass(frozen=True)
@@ -281,6 +309,74 @@ class _PipeSpotreadProcess:
             pass
 
 
+class _ConPtySpotreadProcess:
+    """:class:`SpotreadProcess` over a Windows pseudo-console (ConPTY) via pywinpty.
+
+    The raw-pipe transport can't deliver spotread's trigger keystroke — on Windows,
+    spotread reads the "hit any key to take a reading" key via the console API
+    (``_getch``), not line-buffered stdin, so a trigger written to a pipe is never seen
+    (box-validated 2026-06-17: spotread calibrates but never measures). A pseudo-console
+    makes spotread believe it owns a real console, so the written trigger lands as a
+    keypress. The console is sized very wide so spotread's reading lines never wrap;
+    ConPTY's VT/echo decoration is stripped in the line pump (:func:`_strip_ansi`).
+    ``pywinpty`` is imported lazily so it's only required when this transport is used."""
+
+    def __init__(self, argv: Sequence[str], *, cwd: Optional[str] = None,
+                 cols: int = 1000, rows: int = 50) -> None:
+        from winpty import PtyProcess  # lazy: keep pywinpty off the spine's import path
+        self._pty = PtyProcess.spawn([str(a) for a in argv], cwd=cwd, dimensions=(rows, cols))
+
+    def write(self, data: bytes) -> None:
+        try:
+            self._pty.write(data.decode("ascii", "ignore"))
+        except Exception:
+            pass
+
+    def read_some(self) -> bytes:
+        # Return b"" ONLY at true EOF (dead process); a transient empty read while the
+        # process is alive is "no data yet" → brief yield and retry, never a false EOF.
+        while True:
+            try:
+                chunk = self._pty.read(4096)
+            except EOFError:
+                return b""
+            except Exception:
+                return b""
+            if chunk:
+                return chunk.encode("ascii", "ignore")
+            try:
+                alive = self._pty.isalive()
+            except Exception:
+                alive = False
+            if not alive:
+                return b""
+            time.sleep(0.005)
+
+    def poll(self) -> Optional[int]:
+        try:
+            if self._pty.isalive():
+                return None
+        except Exception:
+            pass
+        try:
+            code = self._pty.exitstatus
+        except Exception:
+            code = None
+        return code if code is not None else 0
+
+    def terminate(self) -> None:
+        try:
+            self._pty.terminate(force=False)
+        except Exception:
+            pass
+
+    def kill(self) -> None:
+        try:
+            self._pty.terminate(force=True)  # pywinpty.kill needs a signal; force-terminate instead
+        except Exception:
+            pass
+
+
 class PersistentSpotread:
     """Drive one long-lived interactive ``spotread`` process.
 
@@ -304,9 +400,10 @@ class PersistentSpotread:
       failed :class:`SpotreadResult`, never a hang; the buffer holds only the current
       partial line (extracted readings move to a small queue), so no unbounded growth.
 
-    The one piece this CANNOT settle in software is whether Windows Argyll triggers a
-    reading from a raw pipe at all (vs a ConPTY) — that is the at-the-box validation;
-    if it needs a console, only a new :class:`SpotreadProcess` impl changes.
+    Transport is pluggable: box-validation (2026-06-17) showed Windows spotread needs a
+    pseudo-console for its trigger keystroke, so :meth:`Argyll.open_persistent` defaults
+    to the ConPTY transport (:class:`_ConPtySpotreadProcess`); this state machine — and
+    its ANSI-tolerant line pump — is unchanged across transports.
     """
 
     def __init__(
@@ -374,7 +471,7 @@ class PersistentSpotread:
             idx = self._buf.find(b"\n")
             if idx == -1:
                 return
-            line = bytes(self._buf[: idx]).decode("ascii", "ignore")
+            line = _strip_ansi(bytes(self._buf[: idx]).decode("ascii", "ignore"))
             del self._buf[: idx + 1]
             self._classify_locked(line)
 
@@ -415,7 +512,7 @@ class PersistentSpotread:
 
     def _tail(self) -> str:
         with self._lock:
-            return bytes(self._buf).decode("ascii", "ignore")
+            return _strip_ansi(bytes(self._buf).decode("ascii", "ignore"))
 
     def _bytes_seen(self) -> int:
         with self._lock:
@@ -425,7 +522,7 @@ class PersistentSpotread:
         with self._lock:
             if self._saw_cal:
                 return True
-            return bool(self._CAL_RE.search(bytes(self._buf).decode("ascii", "ignore")))
+            return bool(self._CAL_RE.search(_strip_ansi(bytes(self._buf).decode("ascii", "ignore"))))
 
     def _dead(self) -> bool:
         with self._lock:
