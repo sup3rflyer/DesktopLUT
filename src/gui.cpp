@@ -2130,7 +2130,10 @@ int RunGUI() {
     // via the Settings checkbox/persisted setting, the flag file, or the env var).
     StartCalibrationIpcServer();
     if (g_calibrationControlEnabled.load())
-        UpdateTrayIcon(g_gui.isRunning.load());  // reflect armed state in the tray tooltip
+        // Refresh the tooltip to show the armed state. The icon argument MUST be the real
+        // shader-active state — the icon strictly signals "software shader active" and nothing
+        // else; arming calibration must not flip it (matches ApplyCalibrationControl).
+        UpdateTrayIcon(g_shaderCorrectionsActive.load(std::memory_order_relaxed));
 
     // Message loop
     MSG msg = {};
