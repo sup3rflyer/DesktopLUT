@@ -927,6 +927,23 @@ def test_dip_recommendations_flow_into_loop_config(tmp_path: Path):
     assert cfg.cold_channel == calib.display.temperamental_channel
 
 
+def test_fluctuation_envelope_raises_runtime_drift_threshold(tmp_path: Path):
+    # A fluctuating panel always wanders within its measured envelope; the run-time drift watch
+    # must tolerate that band (threshold >= envelope) so it re-references but never thrashes
+    # re-measures on the known wander. Envelope > the read-noise threshold ⇒ envelope wins.
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_fluct")
+    store = calib._dip_store()
+    store.record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.05, reads=10)],
+        thermal_regime="fluctuating", fluctuation_envelope=0.018,
+        recommended_neutral_interval=4, recommended_drift_threshold=0.006, made="2026-06-16"))
+    cfg = calib._loop_config_for(calib._dip())
+    assert cfg.neutral_interval == 4              # frequent re-reference (no steady state)
+    assert cfg.drift_threshold == 0.018           # raised to the envelope, not the smaller read-noise threshold
+
+
 def test_characterize_plan_veto_aborts_cleanly(tmp_path: Path):
     calib = _make(tmp_path, "char_veto", characterize_config=_CHAR,
                   adjudicator=MappingAdjudicator({"characterize:plan": Decision("abort", note="not now")}))

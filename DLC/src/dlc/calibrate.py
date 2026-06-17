@@ -599,8 +599,17 @@ class Calibration:
         if dip is not None:
             if dip.recommended_neutral_interval:
                 kw["neutral_interval"] = dip.recommended_neutral_interval
-            if dip.recommended_drift_threshold:
-                kw["drift_threshold"] = dip.recommended_drift_threshold
+            thr = dip.recommended_drift_threshold
+            # Envelope-aware run-time drift watch: a fluctuating panel ALWAYS wanders within its
+            # measured fluctuation_envelope, so the interleaved drift reference must tolerate that
+            # band — it re-references frequently (the small neutral_interval the DIP recommends for
+            # fluctuating) but only FLAGs / re-warms when drift LEAVES the envelope, never thrashing
+            # re-measures on the known wander. The threshold is therefore at least the envelope
+            # (a no-op on a convergent panel, whose envelope is ~read noise).
+            if dip.fluctuation_envelope:
+                thr = max(thr or 0.0, dip.fluctuation_envelope)
+            if thr:
+                kw["drift_threshold"] = thr
         return MeasureLoopConfig(**kw)
 
     def _resolve_white_now(self) -> cp.WhitePointResolution:
