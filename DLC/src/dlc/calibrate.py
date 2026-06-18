@@ -313,6 +313,7 @@ class Calibration:
         white_fn: Optional[cp.WhiteFn] = None,
         probe_launcher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         decision_overrides: Optional[dict[str, "Decision"]] = None,
+        skip_gswb: bool = False,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -332,6 +333,10 @@ class Calibration:
         self.dummy_icc = dummy_icc
         self.patch_sizes = patch_sizes or PatchSizes()
         self._white_fn = white_fn
+        # Skip the FINAL GS+WB tweak in `full` (the deferred stage that targets the wrong
+        # DesktopLUT layer — see reference-dlc-gswb-target). Yields a cohesive ICC→3D-LUT run
+        # (one rollback unit, one verify gate) without baking a known-wrong grayscale tweak.
+        self.skip_gswb = skip_gswb
         # Explicit per-key decision overrides (the CLI's --decide flags). Unlike the
         # adjudicator's seed map, these take precedence over an ALREADY-recorded decision, so
         # a resumed run can change a recorded seam (e.g. verify:accept apply↔revert) without
@@ -1555,9 +1560,10 @@ class Calibration:
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
-        gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
-                                ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
-        self.stage_gswb_tweak(gw.data["ti3"])
+        if not self.skip_gswb:
+            gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
+                                    ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
+            self.stage_gswb_tweak(gw.data["ti3"])
         ver = self.stage_measure(role="verify", patches=self._volumetric_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
@@ -2064,6 +2070,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
                         help="record a seam decision (repeatable) then run/resume")
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
+    parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
+                        help="full flow: skip the final GS+WB tweak (deferred stage targets the "
+                             "wrong layer) — runs DIP-less ICC→3D-LUT as one cohesive unit")
     parser.add_argument("--force", action="store_true", help="ignore stage memoisation")
     parser.add_argument("--abort", action="store_true",
                         help="cancel: roll DesktopLUT back to the user's pre-run setup "
@@ -2255,7 +2264,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
-                        characterize_config=characterize_config, decision_overrides=overrides)
+                        characterize_config=characterize_config, decision_overrides=overrides,
+                        skip_gswb=args.skip_gswb)
     result = None
     paused = False
     try:

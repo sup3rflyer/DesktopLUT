@@ -69,7 +69,7 @@ def _fake_launch(cmds):
 
 def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
-          characterize_config=None) -> Calibration:
+          characterize_config=None, skip_gswb=False) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -81,7 +81,7 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
         adjudicator=adjudicator or AutoAdjudicator(),
         probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE,
         probe_launcher=probe_launcher, decision_overrides=decision_overrides,
-        characterize_config=characterize_config)
+        characterize_config=characterize_config, skip_gswb=skip_gswb)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,25 @@ def test_full_flow_completes_clean(tmp_path: Path):
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
     assert verify["max_de2000"] <= calib.profile.quality.max_de2000
+
+
+def test_full_flow_skip_gswb_drops_only_the_gswb_stages(tmp_path: Path):
+    # --skip-gswb: ICC → 3D LUT (one cohesive run, one verify gate) with NO GS+WB tweak —
+    # the deferred stage targets the wrong DesktopLUT layer (see reference-dlc-gswb-target).
+    calib = _make(tmp_path, "full_skip", skip_gswb=True)
+    result = calib.run("full")
+
+    assert result.status == "completed"
+    assert result.stages == [
+        "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
+        "build-install-mhc", "measure:post-mhc", "build-install-3dlut",
+        "measure:verify", "verify",
+    ]
+    # the GS+WB measure + tweak are gone; everything else (incl. the 3D LUT) stays
+    assert "gswb-tweak" not in result.stages
+    assert "measure:gray-wb" not in result.stages
+    assert "build-install-3dlut" in result.stages
+    assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
 
 
 def test_mhc_only_flow_is_icc_only(tmp_path: Path):
