@@ -8,7 +8,7 @@ import time
 import pytest
 
 from dlc.events import Ev, RunLog, read_events
-from dlc.liveness import Liveness, RunStalled
+from dlc.liveness import Liveness, RunCancelled, RunStalled
 
 
 class _Clock:
@@ -121,3 +121,52 @@ def test_watchdog_quiet_when_progressing(tmp_path):
     finally:
         live.stop()
     assert not [e for e in read_events(tmp_path / "e.jsonl") if e.event == Ev.STALL]
+
+
+# --------------------------------------------------------------------------
+# Cooperative cancel (the actionable half of mid-run gating)
+# --------------------------------------------------------------------------
+def test_request_cancel_makes_check_raise_runcancelled(tmp_path):
+    clk = _Clock()
+    live = Liveness(RunLog(tmp_path / "e.jsonl"), stall_after_s=1000.0, clock=clk)
+    live.progress("measure")
+    live.request_cancel()
+    with pytest.raises(RunCancelled) as ei:
+        live.check("measure")
+    assert ei.value.stage == "measure"
+    events = read_events(tmp_path / "e.jsonl")
+    notes = [e for e in events if e.event == Ev.NOTE and e.data.get("cancelled")]
+    assert len(notes) == 1 and notes[0].level == "WARN"      # one digest-tier cancel note
+    assert not [e for e in events if e.event == Ev.STALL]    # cancel is not a stall
+
+
+def test_cancel_takes_precedence_over_stall(tmp_path):
+    clk = _Clock()
+    live = Liveness(RunLog(tmp_path / "e.jsonl"), stall_after_s=10.0, clock=clk)
+    live.progress("measure")
+    clk.advance(100.0)            # ALSO past the stall threshold
+    live.request_cancel()
+    with pytest.raises(RunCancelled):
+        live.check("measure")
+    assert not [e for e in read_events(tmp_path / "e.jsonl") if e.event == Ev.STALL]
+
+
+def test_watchdog_polls_cancel_check_and_aborts(tmp_path):
+    flag = {"cancel": False}
+    live = Liveness(RunLog(tmp_path / "e.jsonl"), stall_after_s=100.0,
+                    heartbeat_every_s=0.1, cancel_check=lambda: flag["cancel"])
+    live.progress("build")
+    live.start()
+    try:
+        flag["cancel"] = True       # the operator/LLM signalled cancel out-of-band
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                live.check("build")
+            except RunCancelled:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("watchdog never latched the cancel")
+    finally:
+        live.stop()

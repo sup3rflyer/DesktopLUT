@@ -398,6 +398,7 @@ class _Loop:
         self.remeasure_budget = config.remeasure_cap
         self.warm = False
         self.warmup_reads = 0
+        self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
 
     # -- low-level read ----------------------------------------------------
 
@@ -463,6 +464,29 @@ class _Loop:
             patches_total=len(self.patches),
             reads=self.seq_counter,
         )
+
+    def _maybe_checkin(self, index: int) -> None:
+        """A coarse, PROGRESS-driven digest check-in at quartiles of the patch set, so the
+        LLM's digest projection shows forward motion DURING a long measure stage — the
+        per-patch ``patch_read`` + ``heartbeat`` are stream-tier and dropped from the
+        digest, so without this a 30-min measure looks (to the LLM) like ``stage_start``
+        then silence until ``stage_done``. Fires off MEASURED progress, never a wall-clock
+        timer (the owner's no-magic-cadence rule)."""
+        if self.runlog is None:
+            return
+        total = len(self.patches)
+        if total <= 0:
+            return
+        frac = index / total
+        for q in (0.25, 0.5, 0.75):
+            if q not in self._checkin_quartiles and frac >= q:
+                self._checkin_quartiles.add(q)
+                self.runlog.check_in(
+                    "measure", progress=round(frac, 2),
+                    patches_done=index, patches_total=total,
+                    reads=self.seq_counter, warm=self.warm,
+                    drift_episodes=self.drift_episodes,
+                    white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None))
 
     def _read(
         self,
@@ -863,6 +887,7 @@ class _Loop:
         for index, patch in enumerate(self.patches, start=1):
             self.measure_patch(patch, phase="main")
             pending.append(patch.label)
+            self._maybe_checkin(index)   # coarse digest check-in at quartiles (LLM visibility)
 
             if cfg.neutral_interval > 0 and index % cfg.neutral_interval == 0:
                 self._neutral_checkpoint(warmup_patch, pending)
@@ -1090,6 +1115,17 @@ def run_measure_loop(
             "INFO" if not needs_adjudication else "WARN",
             "measure_loop",
             "completed",
+            **{k: v for k, v in digest.items() if k != "reference_xyz"},
+        )
+    # Land the measure stage's OUTCOME (warm, drift episodes, reads, white, unresolved) on
+    # the shared spine as a digest-tier event — otherwise the LLM's digest projection sees a
+    # measure stage's start/end but never its result (the rich digest used to reach only the
+    # legacy `events` writer, which the orchestrator doesn't pass). The dashboard already
+    # reconstructs white from patch reads; this is the LLM-facing summary.
+    if runlog is not None:
+        runlog.emit(
+            "INFO" if not needs_adjudication else "WARN",
+            "measure_loop", "completed", tier="digest",
             **{k: v for k, v in digest.items() if k != "reference_xyz"},
         )
 

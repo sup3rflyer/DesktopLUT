@@ -181,11 +181,16 @@ class DashboardState:
     _progress_marks: Deque[tuple] = field(default_factory=lambda: deque(maxlen=80))
 
     # chart accumulators (bounded; served via /api/charts, OFF the fast SSE path so the 2 s
-    # state push stays lean while the scatter can grow to thousands of points)
-    _cie_points: Deque[dict] = field(default_factory=lambda: deque(maxlen=5000))
-    _grayscale: dict = field(default_factory=dict)          # signal-level → latest neutral sample
-    _color_track: dict = field(default_factory=dict)        # colour-patch signal → latest sample
-    _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
+    # state push stays lean while the scatter can grow to thousands of points). The "current
+    # state" charts (CIE / grayscale / EOTF / colour-luminance) are kept PER MEASUREMENT STAGE
+    # so the dashboard shows the LATEST stage (the corrected result) instead of raw + post-MHC +
+    # verify + build-probe reads overlaid into one unreadable cloud. Warm-up + 3D-LUT build-probe
+    # reads are excluded entirely (panel-conditioning / transient, not a settled measurement).
+    _cie_by_stage: dict = field(default_factory=dict)       # stage → deque[point]
+    _gray_by_stage: dict = field(default_factory=dict)      # stage → {level: latest neutral sample}
+    _color_by_stage: dict = field(default_factory=dict)     # stage → {signal: latest colour sample}
+    _stage_seq: list = field(default_factory=list)          # measurement stages, first-seen order
+    _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))  # cross-stage time series
     _optimizer_history: list = field(default_factory=list)
 
     # ----------------------------------------------------------------------
@@ -322,21 +327,42 @@ class DashboardState:
             return None
         return round(max(0.0, (t - start).total_seconds()), 1)
 
+    def _chart_stage(self, ev: Event, data: dict[str, Any]) -> Optional[str]:
+        """The measurement-stage bucket a read belongs to for the 'current state' charts, or
+        ``None`` if it must be EXCLUDED. Warm-up + drift-reference reads (panel conditioning, not
+        target patches) and 3D-LUT build-probe reads (transient mid-convergence, not a settled
+        measurement) are dropped; everything else is keyed by the run phase (e.g.
+        ``measure:post-mhc``) so each stage is its own dataset and the dashboard shows the latest."""
+        role = data.get("role")
+        if role in ("warmup", "neutral_ref", "probe") or data.get("disposition") == "probe":
+            return None
+        return ev.phase or ev.stage or "measure"
+
     def _accumulate_charts(self, ev: Event, data: dict[str, Any], x: float, y: float,
                            Y: Any, enriched: dict[str, Any]) -> None:
-        """Fold a good read into the bounded chart datasets (served via /api/charts)."""
+        """Fold a good read into the bounded, PER-STAGE chart datasets (served via /api/charts)."""
+        stage = self._chart_stage(ev, data)
+        if stage is None:
+            return                              # warm-up / build-probe: kept off the snapshot charts
+        if stage not in self._cie_by_stage:
+            self._cie_by_stage[stage] = deque(maxlen=5000)
+            self._gray_by_stage[stage] = {}
+            self._color_by_stage[stage] = {}
+            self._stage_seq.append(stage)
         rgb = data.get("rgb")
         neutral = _is_neutral(rgb)
         sig = data.get("signal")
-        self._cie_points.append({"x": round(x, 5), "y": round(y, 5),
-                                 "role": data.get("role"), "neutral": neutral,
-                                 "c": (None if neutral else _sig_hex(sig)) if sig else None})
+        self._cie_by_stage[stage].append({"x": round(x, 5), "y": round(y, 5),
+                                          "role": data.get("role"), "neutral": neutral,
+                                          "c": (None if neutral else _sig_hex(sig)) if sig else None})
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             # latest measurement at this grayscale level wins (re-measures overwrite)
-            self._grayscale[round(level, 5)] = {
+            self._gray_by_stage[stage][round(level, 5)] = {
                 "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
                 "cct": enriched.get("cct"), "duv": enriched.get("duv")}
+            # The drift chart is a cross-stage TIME series (it shows white wander over the whole
+            # run), so it accumulates globally rather than per stage.
             self._white_track.append({"elapsed_s": self._elapsed_at(ev.time),
                                       "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y})
         elif not neutral and sig and len(sig) >= 3 and Y is not None:
@@ -344,7 +370,7 @@ class DashboardState:
             # Colour Luminance chart (luminance error vs target is derived in charts()).
             try:
                 key = (round(float(sig[0]), 4), round(float(sig[1]), 4), round(float(sig[2]), 4))
-                self._color_track[key] = {"signal": list(key), "Y": Y}
+                self._color_by_stage[stage][key] = {"signal": list(key), "Y": Y}
             except (TypeError, ValueError):
                 pass
 
@@ -366,16 +392,30 @@ class DashboardState:
             self.de_history = self.de_history[-64:]
 
     # ----------------------------------------------------------------------
+    def _latest_chart_stage(self) -> Optional[str]:
+        """The most recent measurement stage with charted reads — the one the snapshot charts
+        show (so the CIE/grayscale/EOTF/colour-luminance tiles track the latest correction
+        state: raw while profiling, verify once verified)."""
+        return self._stage_seq[-1] if self._stage_seq else None
+
     def charts(self) -> dict[str, Any]:
         """Chart-ready datasets, built from the bounded accumulators. Served via
         /api/charts (NOT the SSE state) so the heavy scatter stays off the fast path.
-        Everything is already numeric/derived — the browser only draws SVG."""
-        gray = [self._grayscale[k] for k in sorted(self._grayscale)]
+        The snapshot charts reflect the LATEST measurement stage (not all stages overlaid);
+        the drift chart is the cross-stage time series. Everything is already numeric/derived
+        — the browser only draws SVG."""
+        stage = self._latest_chart_stage()
+        cie_points = list(self._cie_by_stage.get(stage, ())) if stage else []
+        gray_map = self._gray_by_stage.get(stage, {}) if stage else {}
+        gray = [gray_map[k] for k in sorted(gray_map)]
+        color_map = self._color_by_stage.get(stage, {}) if stage else {}
         white = (self.header.get("white") or {}).get("xy")
         gamma = self.header.get("gamma") or 2.2
         return {
+            "stage": stage,                       # the measurement stage these snapshot charts reflect
+            "stages": list(self._stage_seq),
             "cie": {
-                "points": list(self._cie_points),
+                "points": cie_points,
                 "white": white,
                 "primaries": _SRGB_PRIMARIES,
                 "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
@@ -386,12 +426,12 @@ class DashboardState:
                 "luminance": self.header.get("luminance"),
                 "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
             },
-            "color_lum": self._color_luminance(gray, gamma),
+            "color_lum": self._color_luminance(color_map, gray, gamma),
             "optimizer": list(self._optimizer_history),
             "white_track": [w for w in self._white_track if w.get("elapsed_s") is not None],
         }
 
-    def _color_luminance(self, gray: list[dict], gamma: float) -> list[dict[str, Any]]:
+    def _color_luminance(self, color_map: dict, gray: list[dict], gamma: float) -> list[dict[str, Any]]:
         """Per-colour-patch luminance error vs target, as fractions (-0.1 = 5% dim, etc.).
         Target relative luminance = Σ Kc·signal_c^γ (Rec.709 weights); measured relative =
         measured Y / the brightest neutral Y. Computed here (not at read time) against the
@@ -404,7 +444,7 @@ class DashboardState:
         # Aggregate per (family, saturation-bucket): many patches share a label, so average
         # their luminance error into one bar (the representative colour = the brightest patch).
         groups: dict[str, dict[str, Any]] = {}
-        for c in self._color_track.values():
+        for c in color_map.values():
             sig, Y = c.get("signal"), c.get("Y")
             if Y is None or not sig:
                 continue

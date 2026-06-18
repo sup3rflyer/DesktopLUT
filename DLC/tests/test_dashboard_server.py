@@ -98,6 +98,40 @@ def test_api_snapshot_returns_state_and_backlog(tmp_path):
         httpd.shutdown()
 
 
+def test_api_digest_projects_digest_tier_only(tmp_path):
+    # The live twin of `python -m dlc.digest`: the LLM pulls /api/digest to check in on a
+    # run and gets the boundaries, NOT the per-patch firehose.
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        status, body = _get(base + "/api/digest")
+        assert status == 200
+        data = json.loads(body)
+        names = [e["event"] for e in data["digest"]]
+        assert "run_header" in names and "stage_start" in names
+        assert "patch_read" not in names              # firehose dropped from the LLM view
+        assert data["count"] == len(data["digest"])
+    finally:
+        httpd.shutdown()
+
+
+def test_api_cancel_writes_control_json(tmp_path):
+    # The dashboard's Cancel button POSTs here; it writes control.json into the watched run
+    # so the live process rolls back at its next checkpoint (the actionable half of gating).
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        req = urllib.request.Request(base + "/api/cancel", method="POST")
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read())
+        assert data["ok"] is True
+        ctrl = tmp_path / "control.json"               # run root == events.jsonl's parent
+        assert ctrl.exists() and json.loads(ctrl.read_text())["action"] == "cancel"
+    finally:
+        httpd.shutdown()
+
+
 def test_sse_primes_with_state_then_streams(tmp_path):
     hub = _hub_with_events(tmp_path)
     httpd, base = _serve(hub)

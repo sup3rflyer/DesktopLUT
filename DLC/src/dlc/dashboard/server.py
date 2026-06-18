@@ -104,6 +104,13 @@ class Hub:
         with self._state_lock:
             return self.state.charts()
 
+    def digest(self) -> list[dict[str, Any]]:
+        """The LLM-facing projection: the digest-tier slice of what we've tailed (the
+        per-patch / heartbeat / progress firehose dropped). The live twin of
+        ``python -m dlc.digest`` — an assistant can poll this to check in on a run."""
+        with self._state_lock:
+            return [w for w in self.recent if w.get("tier") == "digest"]
+
     def run_root(self) -> Optional[Path]:
         cur = self.tail.current
         return cur.parent if cur is not None else None
@@ -202,6 +209,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self.do_GET()
 
+    def do_POST(self) -> None:
+        path = self.path.split("?", 1)[0]
+        if path == "/api/cancel":
+            self._send_json(self._cancel_run())
+        else:
+            self._send_bytes(b"not found", "text/plain; charset=utf-8", 404)
+
+    def _cancel_run(self) -> dict[str, Any]:
+        """Write control.json into the watched run so the live calibration process rolls back
+        to the pre-run setup at its next checkpoint/stage boundary — the Cancel button (and any
+        assistant POSTing here). The read-only dashboard's one mutating action; it touches only
+        the run's own control file, never the display."""
+        root = self.hub.run_root()
+        if root is None:
+            return {"ok": False, "error": "no run is being watched"}
+        try:
+            ctrl = root / "control.json"
+            ctrl.write_text(json.dumps({"action": "cancel",
+                                        "requested": datetime.now().isoformat(timespec="seconds")}),
+                            encoding="utf-8")
+            return {"ok": True, "control": str(ctrl)}
+        except OSError as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
@@ -214,6 +245,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"state": self.hub.snapshot(), "backlog": self.hub.backlog()})
         elif path == "/api/charts":
             self._send_json(self.hub.charts())
+        elif path == "/api/digest":
+            digest = self.hub.digest()
+            self._send_json({"count": len(digest), "digest": digest})
         elif path == "/api/patch_metrics":
             self._send_json(self._latest_patch_metrics())
         elif path == "/api/export":

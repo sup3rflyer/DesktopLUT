@@ -44,6 +44,17 @@ class RunStalled(Exception):
             f"(stall threshold {threshold_s:.0f}s) during {stage}")
 
 
+class RunCancelled(Exception):
+    """A cooperative cancel was requested (the LLM/operator wrote ``control.json``).
+    Raised at the next checkpoint so the run aborts cleanly + rolls back — the
+    actionable half of mid-run gating (the LLM can *stop* a run it's watching, not
+    just watch it). Distinct from :class:`RunStalled` (a stall is involuntary)."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        super().__init__(f"run cancelled at a checkpoint during {stage}")
+
+
 class Liveness:
     """Shared progress clock + the two stall watchers. One instance per run; the
     orchestrator owns it, the measure loop / optimizer call into it."""
@@ -56,6 +67,7 @@ class Liveness:
         heartbeat_every_s: float = 15.0,
         watchdog_factor: float = 2.0,
         on_stall: Optional[Callable[[], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.runlog = runlog
@@ -63,6 +75,9 @@ class Liveness:
         self.heartbeat_every_s = max(1.0, float(heartbeat_every_s))
         self.watchdog_factor = max(1.0, float(watchdog_factor))
         self.on_stall = on_stall
+        # Polled by the watchdog thread (NOT per-read — no syscall storm): a True result
+        # latches a cancel that the next check() turns into a clean RunCancelled abort.
+        self.cancel_check = cancel_check
         self._clock = clock
 
         self._lock = threading.Lock()
@@ -72,6 +87,8 @@ class Liveness:
         self._stage = "run"
         self._tripped = False          # the watchdog fired; the next check() must abort
         self._stall_emitted = False    # emit the stall event exactly once
+        self._cancel_requested = False # control.json asked to cancel; next check() aborts
+        self._cancel_emitted = False   # emit the cancel note exactly once
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
@@ -97,23 +114,39 @@ class Liveness:
             self._stage = stage
 
     def check(self, stage: str) -> None:
-        """Checkpoint guard (main thread). Emits a ``stall`` (once) and raises
-        :class:`RunStalled` if progress has stalled — or if the watchdog already
-        tripped while the main thread was wedged. Cheap; call it liberally."""
+        """Checkpoint guard (main thread). Honours a cooperative cancel first, then
+        emits a ``stall`` (once) and raises :class:`RunStalled` if progress has stalled
+        — or if the watchdog already tripped while the main thread was wedged. Cheap;
+        call it liberally."""
         with self._lock:
             self._stage = stage
+            cancelled = self._cancel_requested
+            emit_cancel = cancelled and not self._cancel_emitted
+            if emit_cancel:
+                self._cancel_emitted = True
             since = self._clock() - self._last_progress
             thr = self.stall_after_s
             tripped = self._tripped
             should_raise = tripped or since > thr
-            emit = should_raise and not self._stall_emitted
+            emit = (not cancelled) and should_raise and not self._stall_emitted
             if emit:
                 self._stall_emitted = True
+        if emit_cancel:
+            self.runlog.note(stage, "run cancelled (control.json) — aborting at checkpoint",
+                             level="WARN", cancelled=True)
+        if cancelled:
+            raise RunCancelled(stage)
         if emit:
             self.runlog.stall(stage, since_progress_s=round(since, 1),
                               threshold_s=round(thr, 1), via="checkpoint")
         if should_raise:
             raise RunStalled(stage, since, thr)
+
+    def request_cancel(self) -> None:
+        """Latch a cancel (so the next :meth:`check` aborts). Used directly by tests
+        and as the watchdog's action when ``cancel_check`` fires."""
+        with self._lock:
+            self._cancel_requested = True
 
     # -- watchdog thread --------------------------------------------------
     def start(self) -> None:
@@ -144,6 +177,16 @@ class Liveness:
         last_beat = self._clock()
         while not self._stop.wait(tick):
             now = self._clock()
+            # Cooperative cancel: poll the control channel off the main thread (so it works
+            # even while the main thread is wedged in a syscall) and latch it — the next
+            # main-thread check() turns it into a clean RunCancelled abort.
+            if self.cancel_check is not None:
+                try:
+                    if self.cancel_check():
+                        with self._lock:
+                            self._cancel_requested = True
+                except Exception:  # noqa: BLE001 - a bad control read must never kill the watcher
+                    pass
             with self._lock:
                 since = now - self._last_progress
                 stage = self._stage

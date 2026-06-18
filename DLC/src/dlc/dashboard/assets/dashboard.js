@@ -129,7 +129,8 @@ function renderState(s) {
   flag("flag-stall", s.stall, (d) => d.message || d.via || "tripped", true);
   flag("flag-seam", s.seam, (d) => `${d.key || d.stage || ""} ${d.status || ""}`.trim());
   flag("flag-anomaly", s.anomaly, (d) => d.message || d.reason || "—");
-  flag("flag-checkin", s.check_in, (d) => d.message || "—");
+  flag("flag-checkin", s.check_in, (d) => d.message
+    || (d.progress != null ? `${Math.round(d.progress * 100)}% (${d.patches_done || 0}/${d.patches_total || 0})` : "—"));
 }
 
 function flag(id, obj, fmt, bad) {
@@ -168,7 +169,10 @@ function fmtMsg(ev) {
         kv(k, typeof v === "number" ? num(v, 3) : v)).join(" ");
     case "seam": return `${kv("key", d.key || "")} ${kv("status", d.status || "")}`;
     case "anomaly": return `<span class="v">${esc(d.message || d.reason || "")}</span>`;
-    case "check_in": return `<span class="v">${esc(d.message || "")}</span>`;
+    case "check_in":
+      return d.message ? `<span class="v">${esc(d.message)}</span>`
+        : `${kv("progress", d.progress != null ? Math.round(d.progress * 100) + "%" : "")} `
+          + `${kv("patches", (d.patches_done || 0) + "/" + (d.patches_total || 0))}`;
     case "stall": return `<span class="nok">STALL</span> ${esc(d.message || "")} ${kv("via", d.via || "")}`;
     case "metrics_scored":
       return `${kv("avg", num(d.avg_de2000))} ${kv("p95", num(d.p95_de2000))} ${kv("max", num(d.max_de2000))} ${kv("white", num(d.white_de2000))}`;
@@ -283,6 +287,9 @@ async function refreshCharts() {
     const r = await fetch("/api/charts");
     lastCharts = await r.json();
     const header = lastState ? lastState.header : null;
+    // which measurement stage the snapshot charts reflect (raw → post-mhc → verify), so the
+    // single-stage scatter is never mistaken for "all stages" — the charts show the latest.
+    $("charts-stage").textContent = lastCharts && lastCharts.stage ? lastCharts.stage : "—";
     if (window.DLCCharts) {
       DLCCharts.renderInto($("charts"), lastCharts, header);
       if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, lastCharts, header);  // keep the open tile live
@@ -329,6 +336,20 @@ function wireUi() {
       toast("export failed");
     } finally {
       $("btn-export").disabled = false;
+    }
+  });
+  // Cancel: drop control.json into the run; the live process rolls back at its next checkpoint.
+  $("btn-cancel").addEventListener("click", async () => {
+    if (!confirm("Cancel this run? DesktopLUT rolls back to your pre-run setup at the next checkpoint.")) return;
+    $("btn-cancel").disabled = true;
+    try {
+      const r = await fetch("/api/cancel", { method: "POST" });
+      const j = await r.json();
+      toast(j.ok ? "cancel requested — rolling back at the next checkpoint" : ("cancel failed: " + (j.error || "")));
+    } catch (e) {
+      toast("cancel failed");
+    } finally {
+      $("btn-cancel").disabled = false;
     }
   });
 }

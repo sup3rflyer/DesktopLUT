@@ -53,7 +53,7 @@ from .correction_store import CorrectionRecord, CorrectionStore
 from .dip import DipStore, DisplayInstrumentProfile
 from .engine.patches import Transfer, cube_patches, gamut_patches, ramp_patches, sort_patches, tube_patches
 from .events import Ev, EventWriter, RunLog
-from .liveness import Liveness, RunStalled
+from .liveness import Liveness, RunCancelled, RunStalled
 from .measure_loop import (
     MeasureFn,
     MeasureLoopConfig,
@@ -379,7 +379,11 @@ class Calibration:
         # the watchdog thread is opt-in (live runs set enable_watchdog) so tests don't spin threads.
         # stall_kill_hook force-kills a wedged meter/presenter so the watchdog can unblock a main
         # thread stuck in a syscall (the CLI wires it to the persistent meter + presenter).
-        self.liveness = Liveness(self.runlog, on_stall=stall_kill_hook)
+        # The watchdog also polls control.json (off the main thread) so an LLM/operator can
+        # CANCEL a run it's watching — the actionable half of mid-run gating. A latched cancel
+        # becomes a clean RunCancelled abort at the next checkpoint.
+        self.liveness = Liveness(self.runlog, on_stall=stall_kill_hook,
+                                 cancel_check=self._cancel_requested_on_disk)
         self._enable_watchdog = enable_watchdog
 
     # -- persistence ------------------------------------------------------
@@ -388,6 +392,42 @@ class Calibration:
         self._state.setdefault("monitor", self.monitor)
         self._state.setdefault("mode", self.mode)
         _common.save_dlc_state(self.ctx, self._state)
+
+    # -- cooperative cancel (the actionable half of mid-run gating) --------
+    def _control_path(self) -> Path:
+        return self.ctx.root / "control.json"
+
+    def _cancel_requested_on_disk(self) -> bool:
+        """Cooperative cancel: an LLM/operator wrote ``control.json`` (via
+        ``dlc-calibrate --cancel --run <dir>``) asking this run to stop. Polled by the
+        watchdog thread AND at every stage boundary. Best-effort — a half-written file or
+        a read race just reads as 'no cancel' and is retried on the next poll."""
+        try:
+            p = self._control_path()
+            if not p.exists():
+                return False
+            ctrl = json.loads(p.read_text(encoding="utf-8"))
+            return str(ctrl.get("action", "")).strip().lower() == "cancel"
+        except Exception:  # noqa: BLE001 - a bad control file never crashes the run
+            return False
+
+    def _consume_control(self) -> None:
+        """Delete the control file once a cancel is acted on, so a later resume of the same
+        run dir isn't killed by a stale cancel. Best-effort."""
+        try:
+            self._control_path().unlink()
+        except OSError:
+            pass
+
+    def _poll_cancel(self) -> None:
+        """Honour a cooperative cancel at a stage boundary — covers a run with no watchdog
+        thread (tests / autonomous) and a cancel issued while the run was paused between
+        invocations (resume picks it up at the first boundary)."""
+        if self._cancel_requested_on_disk():
+            self._consume_control()
+            raise CalibrationAborted(StageOutcome(
+                self.runlog.phase or "run", "aborted",
+                digest={"message": "run cancelled by operator/LLM (control.json)", "cancelled": True}))
 
     def _header_data(self) -> dict[str, Any]:
         """The dashboard status-bar payload: who/what is being calibrated, against what
@@ -443,6 +483,7 @@ class Calibration:
         Every stage announces itself on the spine: the phase becomes ``key`` (the
         dashboard's phase header), a ``stage_start`` opens it, and a ``stage_done`` /
         ``stage_aborted`` closes it — so the run is never opaque between digests."""
+        self._poll_cancel()           # honour a cooperative cancel before opening the stage
         self.runlog.set_phase(key)
         self.runlog.stage_start(key)
         self.liveness.progress(key)   # reset the stall clock at every stage boundary (no cross-stage false trips)
@@ -460,6 +501,13 @@ class Calibration:
             self.runlog.stage_aborted(key, message=str(exc), stalled=True)
             raise CalibrationAborted(StageOutcome(
                 key, "aborted", digest={"message": str(exc), "stalled": True}))
+        except RunCancelled as exc:
+            # The LLM/operator cancelled mid-stage (checkpoint guard raised it). Consume the
+            # control file so a resume isn't re-cancelled, then abort cleanly + roll back.
+            self._consume_control()
+            self.runlog.stage_aborted(key, message=str(exc), cancelled=True)
+            raise CalibrationAborted(StageOutcome(
+                key, "aborted", digest={"message": str(exc), "cancelled": True}))
         except CalibrationAborted as exc:
             self.runlog.stage_aborted(exc.outcome.stage,
                                       message=(exc.outcome.digest or {}).get("message"))
@@ -788,10 +836,13 @@ class Calibration:
             return self._probe
         transfer = self._transfer()
         max_cv = transfer.max_cv
+        batch = {"n": 0}   # outer-iteration counter so the build's progress bar pulses per pass
 
         def probe(signals: np.ndarray) -> np.ndarray:
             sig = np.clip(np.asarray(signals, dtype=float).reshape(-1, 3), 0.0, 1.0)
             out = np.zeros((len(sig), 3), dtype=float)
+            batch["n"] += 1
+            total = len(sig)
             # The optimizer's per-iteration compute (model + cube build) precedes this batch;
             # reset the stall clock so that bounded compute is never mistaken for a stall.
             self.liveness.progress("build-install-3dlut")
@@ -830,6 +881,11 @@ class Calibration:
                                 "probe_failure": True,
                                 "failed_signal": [round(float(c), 4) for c in s]}))
                 out[i] = reading.xyz
+                # Drive the dashboard's progress bar DURING the build — it would otherwise sit
+                # frozen at the post-MHC count for the whole (longest) stage. Progress-driven,
+                # restarting each outer pass so the bar visibly pulses = clearly alive.
+                self.runlog.progress("build-install-3dlut", patches_done=i + 1,
+                                     patches_total=total, iteration=batch["n"])
             return out
 
         return probe
@@ -911,6 +967,33 @@ class Calibration:
                 f"wrong panel and all readings are silently wrong.")
         return guard
 
+    def _transport_tell(self) -> dict[str, Any]:
+        """Advisory (never a gate): a 3D-LUT flow measured below the panel's bit depth, or on a
+        local-dimming panel without a fullscreen patch, risks contaminated VOLUMETRIC reads —
+        the very data the 3D LUT is built from. The orchestrator can't see the presenter
+        transport (wired in the CLI) but it knows the run's bit depth + the panel, so it surfaces
+        the risk + the fix: an ACM/FP16 SDR scanout is 10-bit-live (an 8-bit windowed read
+        under-samples it), and mini-LED local dimming contaminates a non-fullscreen patch."""
+        flow = self.calib.get("flow")
+        if flow not in ("full", "3dlut-only") or self.mode != "SDR":
+            return {"checked": False, "reason": "not an SDR 3D-LUT flow"}
+        panel = self.display.panel
+        panel_bits = panel.bit_depth or 8
+        tech = (panel.tech or "").lower()
+        local_dimming = bool(panel.backlight_zones) or any(t in tech for t in ("mini", "fald", "local"))
+        guard: dict[str, Any] = {"checked": True, "bit_depth": self.bit_depth,
+                                 "panel_bit_depth": panel_bits, "local_dimming": local_dimming}
+        if self.bit_depth < 10 and (panel_bits >= 10 or local_dimming):
+            guard["warning"] = (
+                f"3D-LUT flow measuring at {self.bit_depth}-bit on a {panel_bits}-bit"
+                f"{' mini-LED/local-dimming' if local_dimming else ''} panel in SDR: an ACM/FP16 SDR "
+                f"scanout is 10-bit-live (an 8-bit windowed read under-samples it)"
+                f"{' and local dimming contaminates a non-fullscreen patch' if local_dimming else ''}. "
+                f"Run with `--bit-depth 10` over the persistent fullscreen dogegen daemon "
+                f"(`--dogegen-server HOST:PORT`), DesktopLUT hook ON — or the volumetric reads "
+                f"feeding the 3D LUT may be silently wrong.")
+        return guard
+
     # ====================================================================
     # Stages
     # ====================================================================
@@ -944,6 +1027,10 @@ class Calibration:
                 self.ctx.log(patch_window["warning"])
             if patch_window.get("mode_warning"):
                 self.ctx.log(patch_window["mode_warning"])
+            # Measurement-transport adequacy for 3D-LUT flows (advisory): bit depth + panel.
+            transport = self._transport_tell()
+            if transport.get("warning"):
+                self.ctx.log(transport["warning"])
             # Display+Instrument Profile staleness *tell* (never a gate): the measure loop
             # works without a DIP (single-read default), but a fresh one makes reads noise-aware.
             # Surface present/stale/missing so the LLM can choose to `--flow characterize` first.
@@ -966,6 +1053,7 @@ class Calibration:
                       "correction": staleness.as_dict(),
                       "correction_from_store": store_made is not None,
                       "patch_window": patch_window,
+                      "transport": transport,
                       "dip": dip_status,
                       "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
@@ -2341,12 +2429,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
     parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
                         help="full flow: skip the final GS+WB tweak (deferred stage targets the "
-                             "wrong layer) — runs DIP-less ICC→3D-LUT as one cohesive unit")
+                             "wrong layer) — runs ICC→3D-LUT as one cohesive unit (one rollback "
+                             "unit, one verify gate)")
     parser.add_argument("--force", action="store_true", help="ignore stage memoisation")
     parser.add_argument("--abort", action="store_true",
                         help="cancel: roll DesktopLUT back to the user's pre-run setup "
                              "(restore the calibration snapshot) and exit. Use to bail out of "
                              "a paused/abandoned run without leaving a half-applied profile.")
+    parser.add_argument("--cancel", action="store_true",
+                        help="signal a RUNNING run (--run <dir>) to stop: writes control.json; the "
+                             "live process rolls back to the pre-run setup at its next checkpoint / "
+                             "stage boundary. The actionable half of mid-run gating — an LLM/operator "
+                             "watching the dashboard can stop a run going wrong without --abort.")
     parser.add_argument("--set-hdr", choices=["on", "off", "toggle"], default=None, dest="set_hdr",
                         help="flip monitor --monitor between SDR and HDR (the same OS advanced-color "
                              "switch as DesktopLUT's HDR-toggle hotkey) and EXIT — no calibration. "
@@ -2368,6 +2462,28 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                       "and a build that supports windows.set_hdr"}, indent=2))
             return 1
         print(json.dumps({"status": "set_hdr", "action": args.set_hdr, **res}, indent=2))
+        return 0
+
+    # Cooperative cancel of a RUNNING/paused run: drop control.json into its run dir; the live
+    # process (or the next resume) picks it up at a checkpoint/stage boundary and rolls back.
+    # No profile or measure stack needed — just the file, so it works even if the live pipe is busy.
+    if args.cancel:
+        if not args.run:
+            print(json.dumps({"status": "cancel_failed",
+                              "error": "--cancel needs --run <dir> (the run to stop)"}, indent=2))
+            return 1
+        ctrl = Path(args.run) / "control.json"
+        try:
+            ctrl.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(ctrl, json.dumps(
+                {"action": "cancel", "requested": datetime.now().isoformat(timespec="seconds")}, indent=2))
+        except OSError as exc:
+            print(json.dumps({"status": "cancel_failed", "error": f"{type(exc).__name__}: {exc}",
+                              "run": str(args.run)}, indent=2))
+            return 1
+        print(json.dumps({"status": "cancel_requested", "run": str(args.run), "control": str(ctrl),
+                          "note": "the running process rolls back at its next checkpoint / stage boundary"},
+                         indent=2))
         return 0
 
     profile = cp.load_profile(args.profile)

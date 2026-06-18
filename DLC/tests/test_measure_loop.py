@@ -523,6 +523,34 @@ def test_measure_loop_aborts_on_stall(tmp_path: Path):
     assert any(e.event == Ev.STALL for e in read_events(epath))
 
 
+def test_measure_loop_emits_quartile_check_ins_and_completion_digest(tmp_path: Path):
+    """The LLM's digest projection is otherwise blind during a long measure (patch_read +
+    heartbeat are stream-tier): progress-driven quartile check-ins + a completion digest give
+    it the forward-motion signal + the stage outcome it needs to gate the run."""
+    from dlc.events import RunLog, read_events, digest_projection
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, white_nits=120.0)
+    epath = tmp_path / "e.jsonl"
+    runlog = RunLog(epath, phase="measure:post-mhc")
+    run_measure_loop(patches=_grey_ramp(t, 16), transfer=t, measure=panel,
+                     config=MeasureLoopConfig(), runlog=runlog,
+                     ti3_path=tmp_path / "m.ti3", ndjson_path=tmp_path / "m.ndjson")
+
+    digest = digest_projection(read_events(epath))
+    names = [e.event for e in digest]
+    assert "patch_read" not in names and "heartbeat" not in names   # firehose stays off the digest
+
+    check_ins = [e for e in digest if e.event == "check_in"]
+    assert len(check_ins) == 3                                      # 25 / 50 / 75 % of 16 patches
+    assert {round(e.data["progress"], 2) for e in check_ins} == {0.25, 0.5, 0.75}
+    assert check_ins[0].phase == "measure:post-mhc"
+
+    completed = [e for e in digest if e.event == "completed" and e.stage == "measure_loop"]
+    assert len(completed) == 1                                      # the measure OUTCOME on the spine
+    assert completed[0].data["patch_count"] == 16 and "warm" in completed[0].data
+
+
 def test_write_ti3_excludes_unusable_holes(tmp_path: Path):
     """A sentinel hole (no usable read → (0,0,0)) must never reach the .ti3 — the MHC /
     cube builders parse it with no knowledge of `unstable`, so a black row would poison

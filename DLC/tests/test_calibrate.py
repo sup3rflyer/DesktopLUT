@@ -70,7 +70,7 @@ def _fake_launch(cmds):
 
 def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
-          characterize_config=None, skip_gswb=False) -> Calibration:
+          characterize_config=None, skip_gswb=False, bit_depth=None) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -82,7 +82,7 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
         adjudicator=adjudicator or AutoAdjudicator(),
         probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE,
         probe_launcher=probe_launcher, decision_overrides=decision_overrides,
-        characterize_config=characterize_config, skip_gswb=skip_gswb)
+        characterize_config=characterize_config, skip_gswb=skip_gswb, bit_depth=bit_depth)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +105,56 @@ def test_full_flow_completes_clean(tmp_path: Path):
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
     assert verify["max_de2000"] <= calib.profile.quality.max_de2000
+
+
+def test_control_json_cancels_the_run(tmp_path: Path):
+    # The actionable half of mid-run gating: an LLM/operator drops control.json and the run
+    # aborts cleanly at its next stage boundary (here, immediately at preflight).
+    calib = _make(tmp_path, "cancelme")
+    (calib.ctx.root / "control.json").write_text(json.dumps({"action": "cancel"}), encoding="utf-8")
+    result = calib.run("full")
+
+    assert result.status == "aborted"
+    assert "cancel" in (result.digest.get("message") or "").lower()
+    # the control file is CONSUMED so a later resume of this dir isn't re-cancelled
+    assert not (calib.ctx.root / "control.json").exists()
+    # terminal marker on the spine (the dashboard liveness light leaves 'running')
+    assert any(e.event == Ev.RUN_DONE and e.data.get("status") == "aborted"
+               for e in read_events(calib.ctx.events_path))
+    # almost nothing measured — it stopped at the very first boundary
+    assert "measure:raw" not in result.stages
+
+
+def test_build_stage_emits_progress_ticks(tmp_path: Path):
+    # #4: the 3D-LUT build must drive the dashboard's progress bar (it would otherwise sit
+    # frozen at the post-MHC count for the whole — longest — stage).
+    calib = _make(tmp_path, "buildprog")
+    result = calib.run("full")
+    assert result.status == "completed"
+
+    prog = [e for e in read_events(calib.ctx.events_path)
+            if e.event == Ev.PROGRESS and e.stage == "build-install-3dlut"]
+    assert prog, "the 3D-LUT build must emit progress ticks (bar not frozen)"
+    assert prog[0].data.get("patches_total") and prog[0].data.get("iteration") == 1
+
+
+def test_transport_tell_warns_for_8bit_3dlut_on_a_10bit_minisled_panel(tmp_path: Path):
+    # #3: an SDR 3D-LUT flow measured at 8-bit on a 10-bit mini-LED panel risks contaminated
+    # volumetric reads — preflight must SURFACE that (advisory), and stay quiet at 10-bit.
+    warn = _make(tmp_path, "tell8", bit_depth=8)
+    warn.calib["flow"] = "full"
+    tell = warn._transport_tell()
+    assert tell["checked"] and tell["local_dimming"] is True
+    assert "warning" in tell and "--bit-depth 10" in tell["warning"]
+
+    ok = _make(tmp_path, "tell10", bit_depth=10)
+    ok.calib["flow"] = "full"
+    assert "warning" not in ok._transport_tell()
+
+    # not a 3D-LUT flow → nothing to say even at 8-bit
+    gw = _make(tmp_path, "tellgw", bit_depth=8)
+    gw.calib["flow"] = "gray-wb"
+    assert gw._transport_tell()["checked"] is False
 
 
 def test_full_flow_skip_gswb_drops_only_the_gswb_stages(tmp_path: Path):

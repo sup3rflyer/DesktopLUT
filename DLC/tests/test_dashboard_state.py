@@ -249,9 +249,10 @@ def test_malformed_progress_event_does_not_crash():
 # chart accumulators (Phase 5)
 # ---------------------------------------------------------------------------
 
-def _read(st, at, rgb, xy, Y, *, signal=None, role="measurement"):
+def _read(st, at, rgb, xy, Y, *, signal=None, role="measurement", phase=None, disposition=None):
     st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=at), stage="measure", tier="stream",
-                  seq=at, role=role, rgb=rgb, signal=signal, xy=xy, Y=Y, ok=True))
+                  phase=phase, seq=at, role=role, rgb=rgb, signal=signal, xy=xy, Y=Y, ok=True,
+                  disposition=disposition))
 
 
 def test_charts_accumulate_cie_grayscale_and_drift():
@@ -299,6 +300,48 @@ def test_color_luminance_error_vs_target():
     assert "R100" in cl and abs(cl["R100"]["error"]) < 0.01           # on target
     assert "G100" in cl and abs(cl["G100"]["error"] - (-0.10)) < 0.01  # ~10% dim
     assert cl["R100"]["color"] == "#ff0000"                            # bar coloured as the patch
+
+
+def test_charts_show_latest_measurement_stage_not_all_overlaid():
+    # raw (uncorrected) then verify (corrected) measurements of the same patch set: the CIE
+    # scatter must show the LATEST stage's points only, not both clouds superimposed.
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, white={"xy": [0.3127, 0.329]}))
+    _read(st, 1, [255, 0, 0], [0.66, 0.32], 40.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    _read(st, 2, [128, 128, 128], [0.30, 0.34], 35.0, signal=[0.5, 0.5, 0.5], phase="measure:raw")
+    _read(st, 3, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:verify")
+    _read(st, 4, [128, 128, 128], [0.313, 0.329], 36.0, signal=[0.5, 0.5, 0.5], phase="measure:verify")
+    ch = st.charts()
+    assert ch["stage"] == "measure:verify"
+    assert ch["stages"] == ["measure:raw", "measure:verify"]
+    assert len(ch["cie"]["points"]) == 2                 # verify only, not 4 overlaid
+    # grayscale + colour-luminance also reflect verify (the corrected result)
+    assert [g["x"] for g in ch["grayscale"]] == [0.313]
+    assert any(c["family"] == "R" for c in ch["color_lum"])
+
+
+def test_warmup_and_build_probe_reads_excluded_from_charts():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, white={"xy": [0.3127, 0.329]}))
+    # warm-up + a 3D-LUT build probe read must NOT pollute the snapshot charts
+    _read(st, 1, [130, 128, 128], [0.31, 0.33], 30.0, signal=[0.51, 0.5, 0.5],
+          role="warmup", phase="measure:post-mhc")
+    _read(st, 2, [200, 50, 50], [0.55, 0.34], 25.0, signal=[0.78, 0.2, 0.2],
+          role="probe", disposition="probe", phase="build-install-3dlut")
+    _read(st, 3, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:verify")
+    ch = st.charts()
+    assert ch["stage"] == "measure:verify"
+    assert len(ch["cie"]["points"]) == 1                 # only the real measurement read
+    assert ch["stages"] == ["measure:verify"]            # warmup/probe never opened a stage
+
+
+def test_check_in_event_surfaces_in_snapshot():
+    st = DashboardState()
+    st.ingest(_ev(Ev.CHECK_IN, t=T0, stage="measure", phase="measure:post-mhc",
+                  progress=0.5, patches_done=64, patches_total=128, warm=True))
+    snap = st.snapshot(T0)
+    assert snap["check_in"]["progress"] == 0.5
+    assert snap["check_in"]["patches_total"] == 128
 
 
 def test_optimizer_history_accumulates():

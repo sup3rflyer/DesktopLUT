@@ -32,8 +32,8 @@
         <span class="live-age" id="live-age"></span>
       </div>
       <div class="controls">
-        <button id="btn-pause" disabled title="Interactive controls land in Phase 6">Pause</button>
-        <button id="btn-cancel" disabled title="Interactive controls land in Phase 6">Cancel</button>
+        <button id="btn-pause" disabled title="Pause/resume lands in Phase 6">Pause</button>
+        <button id="btn-cancel" title="Cancel the run — rolls DesktopLUT back to your pre-run setup at the next checkpoint">Cancel</button>
         <button id="btn-export" title="Write a self-contained HTML report to the run's reports/">Export report</button>
       </div>
     </div>
@@ -104,6 +104,10 @@
 
   <!-- ── charts (centerpiece) ───────────────────────────────────── -->
   <main id="charts-area">
+    <div class="charts-meta">
+      <span class="cm-label">snapshot charts reflect</span>
+      <span class="cm-stage" id="charts-stage">—</span>
+    </div>
     <div class="charts-grid" id="charts">
       <figure class="chart"><figcaption>Color Accuracy · CIE 1931</figcaption><div data-chart="cie"></div></figure>
       <figure class="chart"><figcaption>Tone Response · EOTF</figcaption><div data-chart="eotf"></div></figure>
