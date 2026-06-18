@@ -367,3 +367,21 @@ def test_thermal_phase_skipped_when_disabled():
                                config=_fast_cfg(warmup_max_minutes=0), clock=_FakeClock())
     assert res.dip.thermal_regime is None
     assert res.dip.warmup_minutes is None
+
+
+def test_thermal_phase_records_warm_balance_and_streams_to_spine(tmp_path):
+    # The slow DIP run EARNS a validated warm baseline (the converged operating-load balance) the
+    # later calibration run compares against, and its warm-in trajectory reaches mission control:
+    # per-block STREAM ticks (dashboard) + the milestone/regime DIGEST events (LLM).
+    from dlc.events import EventWriter, read_events
+    events_path = tmp_path / "events.jsonl"
+    res = run_characterization(measure=_perfect_panel(), transfer=_transfer(),
+                               config=_thermal_cfg(warmup_max_minutes=2.0),
+                               events=EventWriter(events_path), clock=_FakeClock())
+    assert res.dip.thermal_regime == "convergent"
+    assert res.dip.warm_balance is not None and len(res.dip.warm_balance) == 3
+    evs = read_events(events_path)
+    # per-block trajectory on the spine as STREAM tier (dashboard-only; the LLM digest drops it)
+    assert any(e.event == "thermal_block" and e.effective_tier == "stream" for e in evs)
+    # the regime summary is DIGEST tier (the LLM sees it)
+    assert any(e.event == "thermal_regime" and e.effective_tier == "digest" for e in evs)

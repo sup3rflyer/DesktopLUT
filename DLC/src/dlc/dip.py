@@ -95,6 +95,9 @@ class DisplayInstrumentProfile:
     fluctuation_envelope: Optional[float] = None  # residual channel-balance wander band once warmed (the
     #   run-time drift watch trips on drift LEAVING this band; the fluctuating regime never reaches 0)
     warmin_magnitude: Optional[float] = None      # total active-channel balance drift observed warming in
+    warm_balance: Optional[list[float]] = None    # the converged OPERATING-load channel balance [R,G,B]
+    #   (normalized) measured warm — a validated 'this is warm' fingerprint a calibration run can
+    #   compare a live read against (Phase-2 fast-path). None on older records / never-converged runs.
     thermal_regime: Optional[str] = None         # 'convergent' | 'fluctuating' | 'warming' — DISCOVERED.
     #   convergent: warms to a steady temperature (SDR). fluctuating: content-driven, never settles —
     #   calibrate by MAINTAINING a consistent thermal load, not by reaching a target (HDR). warming:
@@ -147,6 +150,7 @@ class DisplayInstrumentProfile:
             warmup_minutes=_opt_float(d.get("warmup_minutes")),
             fluctuation_envelope=_opt_float(d.get("fluctuation_envelope")),
             warmin_magnitude=_opt_float(d.get("warmin_magnitude")),
+            warm_balance=([float(c) for c in d["warm_balance"]] if d.get("warm_balance") else None),
             thermal_regime=d.get("thermal_regime"),
             cold_channel=d.get("cold_channel"),
             creep_rate_de_per_min=_opt_float(d.get("creep_rate_de_per_min")),

@@ -200,6 +200,84 @@ def test_thermal_block_records_are_emitted():
     assert all({"k", "net", "gross", "threshold", "state"} <= set(r) for r in rows)
 
 
+def test_landing_requires_operating_window_after_soak():
+    """A panel that SOAKED must not be declared converged until it has LANDED — a full window of
+    operating-load (k≈1) blocks, the overshoot flushed out of the evaluation window — so cooling-
+    from-overshoot can't masquerade as a flat 'converged' point during the ramp-down."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    panel = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,
+                           load_thermal=True, thermal_rate=0.06, start_temp=0.0)
+    rows = []
+    clock = _Clock()
+
+    def measure(patch: MeasurePatch) -> Reading:
+        clock.tick(); return panel(patch)
+
+    cfg = ThermalConfig(load_reads_per_block=8, window_blocks=5, max_blocks=240, drift_floor=0.003)
+    res = ThermalController(measure=measure, transfer=transfer, content=_grey_content(transfer),
+                           ref_nits=60.0, balance_noise=0.0008, config=cfg, clock=clock,
+                           emit=rows.append).run()
+    assert res.converged, res.flags
+    conv = [r for r in rows if str(r["state"]).startswith("CONVERGED")]
+    assert conv, "expected a CONVERGED block record"
+    assert conv[0]["did_soak"] is True                  # this cold panel genuinely warmed in ⇒ soaked
+    assert conv[0]["op_streak"] >= cfg.window_blocks     # convergence judged only after a full landing
+
+
+def test_warm_balance_recorded_on_convergence():
+    """A converging panel reports its converged OPERATING-load channel balance (a validated 'warm'
+    fingerprint for a later calibration run); an early-aborted (compromised) run does not."""
+    from dlc.drift import CHANNELS
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    panel = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,
+                           load_thermal=True, thermal_rate=0.06, start_temp=0.0)
+    res = _controller(panel, transfer).run()
+    assert res.converged
+    assert res.warm_balance is not None
+    assert set(res.warm_balance) == set(CHANNELS)
+    assert all(0.0 <= v <= 1.0 for v in res.warm_balance.values())
+
+
+def test_warm_baseline_is_shadow_only_in_phase1():
+    """A supplied warm_baseline is SHADOW-LOGGED (its distance recorded) but NEVER short-circuits the
+    controller in Phase 1: a genuinely cold panel still soaks and runs its full warm-in."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    panel = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,
+                           load_thermal=True, thermal_rate=0.06, start_temp=0.0)
+    clock = _Clock()
+
+    def measure(patch: MeasurePatch) -> Reading:
+        clock.tick(); return panel(patch)
+
+    cfg = ThermalConfig(load_reads_per_block=8, window_blocks=5, max_blocks=240, drift_floor=0.003)
+    res = ThermalController(measure=measure, transfer=transfer, content=_grey_content(transfer),
+                           ref_nits=60.0, balance_noise=0.0008, config=cfg, clock=clock,
+                           warm_baseline={"R": 0.33, "G": 0.33, "B": 0.34}).run()
+    assert res.baseline_distance is not None and res.baseline_distance >= 0.0   # shadow recorded
+    assert res.blocks > 1 and res.content_reads > cfg.load_reads_per_block       # NOT a 1-block bypass
+
+
+def test_protection_limited_flagged_when_reference_dims_under_soak():
+    """ABL / power / thermal throttle: while soaking (k>1 load drives brighter), the fixed reference
+    DIMS below its operating baseline — active limiting, not injected heat. The flatness that follows
+    must NOT read as convergence; flag it with a PROTECTION reason instead."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=1000.0)   # headroom so the soak drives above operating
+    st = {"last_load_nits": 0.0, "n": 0}
+
+    def measure(patch: MeasurePatch) -> Reading:
+        if patch.role == "neutral_ref":
+            st["n"] += 1
+            warm = min(1.0, 0.85 + 0.01 * st["n"])                  # a directional warm-in ⇒ the loop soaks
+            dim = 0.6 if st["last_load_nits"] > 150.0 else 1.0      # ABL: dim the ref under heavy soak load
+            return Reading(xyz=tuple(c * 60.0 * dim for c in _xyz_for_linear_rgb(1.0, 1.0, warm)))
+        st["last_load_nits"] = transfer.cv_to_nits(max(patch.rgb))  # the (scaled) load drive in nits
+        return Reading(xyz=tuple(c * 30.0 for c in _xyz_for_linear_rgb(1.0, 1.0, 1.0)))
+
+    res = _controller(measure, transfer, max_blocks=30).run()
+    assert res.protection_limited is True
+    assert res.reason == "protection_limited" or any("limiting" in f for f in res.flags)
+
+
 def test_load_thermal_synthetic_heats_with_load():
     """Sanity: the opt-in SyntheticPanel load model warms faster under brighter load and
     cools under black — the property the controller relies on."""

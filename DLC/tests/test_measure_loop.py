@@ -262,43 +262,73 @@ def test_preheat_soaks_a_cold_panel_before_measuring():
     assert loop.cold_channel == "B"               # the biggest thermal mover, discovered not assumed
 
 
-def test_preheat_auto_adapts_to_regime():
-    # "auto" ADAPTS to the measured regime. A not-yet-stable panel (fluctuating/warming) soaks. A
-    # CONVERGENT (thermally stable) panel soaks ONLY when its measured warm-in exceeds the drift
-    # tolerance — a stable panel with negligible warm-in does NOT soak (the static-grey gate covers
-    # cold-start; per-stage soaks are pure cost). Uncharacterized / compromised ⇒ no soak.
+def test_preheat_auto_runs_controller_and_decides_live():
+    # "auto" runs the closed-loop controller on ANY characterized panel and lets it decide from
+    # LIVE state — NO regime-label branch. A COLD panel soaks (heats up) for EVERY regime label
+    # (the decision is live, not label-driven — this is the cold-next-morning fix: a convergent DIP
+    # no longer skips the soak on a cold panel). An ALREADY-STABLE panel self-deactivates: the
+    # controller runs but converges cheaply without a real soak. Uncharacterized / compromised ⇒
+    # no controller (the static-grey settle gate covers it).
     t = _sdr()
 
-    def fresh():
+    def cold_panel():   # cold + temperamental ⇒ genuinely warms in (balance drifts with temp)
         return SyntheticPanel(transfer=t, cold_blue_gain=0.85, load_thermal=True,
+                              thermal_rate=0.06, start_temp=0.0)
+
+    def stable_panel():  # inert balance (no chroma drift with temp) ⇒ reads in-band immediately
+        return SyntheticPanel(transfer=t, cold_blue_gain=1.0, load_thermal=True,
                               thermal_rate=0.06, start_temp=0.0)
 
     def dip(regime, **kw):
         return DisplayInstrumentProfile(display="x", thermal_regime=regime, **kw)
 
-    # not-yet-stable regimes always soak
-    for regime in ("fluctuating", "warming"):
-        loop = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
-                          _bright_content(t), dip=dip(regime))
-        assert loop.preheat() is not None, regime
+    # Characterized + COLD ⇒ the controller engages and actually warms the panel — for EVERY regime.
+    cold_reads = {}
+    for regime in ("fluctuating", "warming", "convergent"):
+        cold = cold_panel()
+        loop = _loop_with(cold, t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
+                          dip=dip(regime, recommended_drift_threshold=0.004))
+        digest = loop.preheat()
+        assert digest is not None, regime
+        assert cold.temp > 0.3, regime            # live-cold ⇒ the soak actually heated it
+        cold_reads[regime] = digest["content_reads"]
 
-    # convergent + negligible warm-in ⇒ NO soak (the key adaptive case — this SDR panel)
-    stable = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
-                        dip=dip("convergent", warmin_magnitude=None,
-                                recommended_drift_threshold=0.004))
-    assert stable.preheat() is None
+    # Characterized + ALREADY STABLE ⇒ the controller self-deactivates: it runs but converges with
+    # far fewer content reads than the cold case (no real soak), so the warm path stays cheap.
+    stable = stable_panel()
+    stable_loop = _loop_with(stable, t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
+                             dip=dip("convergent", recommended_drift_threshold=0.004))
+    stable_digest = stable_loop.preheat()
+    assert stable_digest is not None
+    assert stable_digest["content_reads"] < cold_reads["convergent"]   # self-deactivated, no soak
 
-    # convergent BUT a warm-in larger than the drift tolerance ⇒ soak earns its cost
-    drifty = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
-                        dip=dip("convergent", warmin_magnitude=0.05,
-                                recommended_drift_threshold=0.004))
-    assert drifty.preheat() is not None
-
-    no_dip = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t))
-    assert no_dip.preheat() is None                    # uncharacterized ⇒ static-grey settle gate
-    compromised = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
+    # Uncharacterized / compromised ⇒ no controller (fall back to the static-grey settle gate).
+    no_dip = _loop_with(cold_panel(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t))
+    assert no_dip.preheat() is None
+    compromised = _loop_with(cold_panel(), t, MeasureLoopConfig(preheat="auto"),
                              _bright_content(t), dip=dip("compromised"))
-    assert compromised.preheat() is None               # bad characterization ⇒ no soak
+    assert compromised.preheat() is None
+
+
+def test_cold_calibration_after_warm_characterization_still_soaks():
+    # The cold-next-morning bug this change kills: the panel was characterized WARM (so the DIP
+    # records a tiny warmin_magnitude + a warm_balance), then calibrated COLD. The OLD gate read the
+    # stale warmin_magnitude, decided 'convergent + negligible warm-in ⇒ skip', and silently measured
+    # a still-warming panel. The unified live-state controller MUST engage and soak the cold panel.
+    t = _sdr()
+    cold = SyntheticPanel(transfer=t, cold_blue_gain=0.85, load_thermal=True,
+                          thermal_rate=0.06, start_temp=0.0)
+    warm_characterized = DisplayInstrumentProfile(
+        display="x", thermal_regime="convergent",
+        warmin_magnitude=0.001,                         # characterize saw ~no warm-in (it ran warm)
+        warm_balance=[0.33, 0.33, 0.34],
+        recommended_drift_threshold=0.004)
+    loop = _loop_with(cold, t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
+                      dip=warm_characterized)
+    digest = loop.preheat()
+    assert digest is not None                            # the controller engaged — no stale-gate skip
+    assert cold.temp > 0.3                               # and actually warmed the cold panel
+    assert digest["baseline_distance"] is not None       # the warm_balance distance was shadow-logged
 
 
 def test_preheat_wires_into_run_and_is_off_by_default(tmp_path: Path):

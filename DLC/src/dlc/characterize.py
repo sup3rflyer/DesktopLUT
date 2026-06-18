@@ -282,6 +282,18 @@ class _Characterizer:
         if self.events is not None:
             self.events.write(level, "characterize", event, **data)
 
+    def _thermal_block_emit(self, rec: dict[str, Any]) -> None:
+        """Per-block thermal record → the characterize ndjson (full) AND a compact STREAM-tier
+        event on the spine, so mission-control sees the warm-in trajectory live during the long
+        soak (the dashboard tails everything; the LLM digest drops stream tier and keeps only the
+        milestone ``thermal_state`` / ``thermal_regime`` events)."""
+        self.ndjson.emit(rec)
+        if self.events is not None:
+            self.events.write("INFO", "characterize", "thermal_block", tier="stream",
+                              **{k: rec.get(k) for k in
+                                 ("block", "k", "net", "gross", "state", "ref_nits",
+                                  "active_channel", "op_streak", "protection_limited")})
+
     # -- drift: warm-up (reuse the measure loop's own warm_up) ------------
     def warm_up(self) -> dict[str, Any]:
         """Reuse :meth:`dlc.measure_loop._Loop.warm_up` so characterization measures the
@@ -335,7 +347,8 @@ class _Characterizer:
         if cfg.warmup_max_minutes <= 0:
             return {"regime": None, "skipped": True, "minutes": 0.0, "reads": 0,
                     "final_creep_de_per_min": None, "net_over_gross": None,
-                    "fluctuation_envelope": None, "warmin_magnitude": None, "active_channel": None}
+                    "fluctuation_envelope": None, "warmin_magnitude": None, "active_channel": None,
+                    "warm_balance": None, "protection_limited": False, "reason": None}
         from .thermal import ThermalController, ThermalConfig
         max_cv = self.transfer.max_cv
         # Diverse but BRIGHT-BIASED content: a mid-to-bright grey ramp + R/G/B (channel exercise),
@@ -360,12 +373,14 @@ class _Characterizer:
             measure=self.measure, transfer=self.transfer, content=content, ref_nits=ref_nits,
             balance_noise=self.balance_noise,   # None here ⇒ the controller self-calibrates
             config=tcfg, clock=self.clock,
-            emit=self.ndjson.emit, event=self._emit_event,
+            # characterize is PRODUCING the warm baseline, so no prior one is supplied.
+            emit=self._thermal_block_emit, event=self._emit_event,
         )
         res = ctrl.run()
         self.flags.extend(res.flags)
         if res.active_channel and not self.cold_channel:
             self.cold_channel = res.active_channel   # the biggest thermal mover = the cold channel
+        warm_balance = ([res.warm_balance[c] for c in CHANNELS] if res.warm_balance else None)
         return {"regime": res.regime, "skipped": False,
                 "minutes": res.warmup_minutes or 0.0, "reads": res.content_reads,
                 "tau_patches": res.tau_patches,
@@ -373,8 +388,11 @@ class _Characterizer:
                 "net_over_gross": res.digest.get("net_over_gross"),
                 "fluctuation_envelope": res.fluctuation_envelope,
                 "warmin_magnitude": res.warmin_magnitude,
+                "warm_balance": warm_balance,
                 "active_channel": res.active_channel,
                 "drift_threshold": res.drift_threshold,
+                "protection_limited": res.protection_limited,
+                "reason": res.reason,
                 "converged": res.converged}
 
     # -- instrument: noise vs luminance ----------------------------------
@@ -705,6 +723,7 @@ def run_characterization(
         warmup_minutes=(thermal.get("minutes") if thermal.get("regime") == "convergent" else None),
         fluctuation_envelope=thermal.get("fluctuation_envelope"),
         warmin_magnitude=thermal.get("warmin_magnitude"),
+        warm_balance=thermal.get("warm_balance"),
         thermal_regime=thermal.get("regime"),
         cold_channel=ch.cold_channel,
         creep_rate_de_per_min=creep.get("creep_rate_de_per_min"),

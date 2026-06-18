@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 from .dip import DisplayInstrumentProfile
-from .drift import Channel, coldest_channel_from_xyz, evaluate_drift
+from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
 from .liveness import Liveness
@@ -678,34 +678,33 @@ class _Loop:
     # -- thermal preheat: soak-into-calibration ----------------------------
 
     def _preheat_enabled(self) -> bool:
-        """Whether to soak before measuring — ``auto`` ADAPTS to the measured thermal regime.
+        """Whether to run the closed-loop thermal controller before measuring.
 
-        A not-yet-stable panel (``fluctuating`` / ``warming``) always soaks. A ``convergent``
-        panel is thermally stable, so it soaks ONLY when its measured cold-start warm-in
-        (``warmin_magnitude``) actually moves more than the run-time drift tolerance — otherwise
-        the static-grey warm-up settle gate already covers the cold-start and the soak is pure
-        cost: it runs once PER measure-stage, each block reading slow dark load patches, for no
-        thermal benefit on a stable panel (HW-confirmed on a convergent SDR panel, creep
-        ~0.01 ΔE/min). ``always`` / ``never`` force it on/off; an UNCHARACTERIZED (no-DIP / no
-        regime) or ``compromised`` panel does not soak — it falls back to the static-grey warm-up."""
+        ``auto`` (the default) runs it on ANY characterized panel and lets the controller decide
+        from LIVE measured state: it self-activates — a panel already at operating equilibrium reads
+        in-band and converges in a couple of blocks (no soak); a cold panel soaks to equilibrium; a
+        content-driven one maintains the load. This is the unified, regime-AGNOSTIC path — the
+        SDR/HDR difference falls out of the live measurement + the classifier-derived drift handling,
+        NOT a branch here.
+
+        It deliberately REPLACES the earlier gate that skipped ``convergent`` panels based on the
+        *characterize-time* ``warmin_magnitude`` — a stale snapshot that mis-fired on the
+        cold-next-morning case: a panel characterized warm would skip the soak and silently begin
+        measuring while still warming in (a moving target). Deciding live closes that hole; a warm
+        panel still confirms-and-skips cheaply (the controller's fast self-deactivation).
+
+        ``always`` / ``never`` force it; an UNCHARACTERIZED panel (no DIP / no measured regime) has
+        no priors to seed the controller, so it falls back to the static-grey warm-up."""
         mode = self.cfg.preheat
         if mode == "never":
             return False
         if mode == "always":
             return True
         dip = self.dip
-        if dip is None or dip.thermal_regime is None:
-            return False
-        if dip.thermal_regime in ("fluctuating", "warming"):
-            return True
-        if dip.thermal_regime == "convergent":
-            # Stable panel: soak only if the MEASURED warm-in exceeds the drift tolerance, i.e.
-            # the panel moves more warming in than the run-time drift watch will tolerate — then
-            # parking at the operating load first earns its cost; otherwise warm-up settle suffices.
-            warmin = dip.warmin_magnitude or 0.0
-            tol = dip.recommended_drift_threshold or self.cfg.drift_threshold
-            return warmin > tol
-        return False
+        # Characterized (a measured regime exists, and it wasn't a known-bad 'compromised' run) ⇒
+        # run the self-limiting controller, decided live. 'compromised' means the characterize
+        # display/meter was bad, so its priors aren't trustworthy — fall back to the static warm-up.
+        return dip is not None and dip.thermal_regime not in (None, "compromised")
 
     def _run_soak(self, *, phase: str, max_blocks: Optional[int] = None):
         """Drive a closed-loop :class:`~dlc.thermal.ThermalController` over THIS run's patch set.
@@ -729,33 +728,59 @@ class _Loop:
         balance_noise: Optional[float] = None
         if self.dip is not None and self.dip.recommended_drift_threshold:
             balance_noise = self.dip.recommended_drift_threshold / 3.0
+        # The DIP's validated warm balance, passed for SHADOW logging only (Phase 1): the controller
+        # records how far the first operating read is from it — evidence for the Phase-2 fast-path —
+        # but never short-circuits on it yet.
+        warm_baseline: Optional[dict[Channel, float]] = None
+        if self.dip is not None and self.dip.warm_balance and len(self.dip.warm_balance) >= len(CHANNELS):
+            warm_baseline = {ch: float(self.dip.warm_balance[i]) for i, ch in enumerate(CHANNELS)}
         tcfg_kw: dict[str, Any] = {"k_start": self.cfg.preheat_k_start}
         if max_blocks is not None:
             tcfg_kw["max_blocks"] = max_blocks
         ctrl = ThermalController(
             measure=self.measure, transfer=self.transfer, content=content,
-            ref_nits=ref_nits, balance_noise=balance_noise, config=ThermalConfig(**tcfg_kw),
-            emit=None, event=self._emit_event,
+            ref_nits=ref_nits, balance_noise=balance_noise, warm_baseline=warm_baseline,
+            config=ThermalConfig(**tcfg_kw),
+            emit=self._soak_block_emit, event=self._emit_event,
         )
         res = ctrl.run()
         if res.active_channel and self.cold_channel is None:
             self.cold_channel = res.active_channel
         return res
 
+    def _soak_block_emit(self, rec: dict[str, Any]) -> None:
+        """Mirror a thermal soak block onto the spine as a STREAM-tier progress tick, so the
+        dashboard shows the soak ADVANCING (block counter + warm-in trajectory) instead of a silent
+        stretch — the soak is otherwise the longest spell with no per-read mirror. The LLM digest
+        drops stream tier and keeps only the milestone ``thermal_state`` / ``thermal_regime`` events.
+        Per-block records stay OFF measurements.ndjson (the readout expects measurement-shaped rows)."""
+        if self.runlog is not None:
+            self.runlog.progress(self._live_phase, **{k: rec.get(k) for k in
+                ("block", "k", "net", "gross", "state", "ref_nits", "active_channel",
+                 "op_streak", "protection_limited")})
+
     def preheat(self) -> Optional[dict[str, Any]]:
-        """Soak the panel to its operating equilibrium BEFORE the main pass (regime-gated; see
-        :meth:`_preheat_enabled`). Returns a digest, or ``None`` when skipped/empty."""
+        """Run the closed-loop thermal controller to bring the panel to its operating equilibrium
+        BEFORE the main pass (gated by :meth:`_preheat_enabled`; the controller self-deactivates on
+        an already-warm panel, so this is cheap when there's nothing to warm). Returns a digest, or
+        ``None`` when skipped/empty."""
         if not self._preheat_enabled():
             return None
         res = self._run_soak(phase="preheat")
         if res is None:
             return None
-        digest = {"regime": res.regime, "converged": res.converged, "blocks": res.blocks,
-                  "content_reads": res.content_reads, "final_k": res.final_k,
-                  "compromised": res.compromised, "active_channel": res.active_channel}
+        # SHADOW (Phase 1): would a one-block warm_baseline fast-path have fired, and does the
+        # controller's own outcome agree it was warm? Recorded for the Phase-2 decision; not acted on.
+        would_fast_path = (res.baseline_distance is not None
+                           and res.baseline_distance <= res.drift_threshold)
+        digest = {"regime": res.regime, "reason": res.reason, "converged": res.converged,
+                  "blocks": res.blocks, "content_reads": res.content_reads, "final_k": res.final_k,
+                  "compromised": res.compromised, "protection_limited": res.protection_limited,
+                  "active_channel": res.active_channel, "baseline_distance": res.baseline_distance,
+                  "shadow_would_fast_path": would_fast_path}
         self.ndjson.emit({"t": _now(), "phase": "preheat", "role": "preheat_complete", **digest})
-        self._emit_event("INFO" if (res.converged and not res.compromised) else "WARN",
-                         "preheat_complete", **digest)
+        self._emit_event("INFO" if (res.converged and not res.compromised and not res.protection_limited)
+                         else "WARN", "preheat_complete", **digest)
         return digest
 
     def _rewarm(self, *, phase: str) -> None:

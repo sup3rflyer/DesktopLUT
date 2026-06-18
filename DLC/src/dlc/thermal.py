@@ -93,6 +93,21 @@ class ThermalConfig:
     ref_sanity_low: float = 0.33    # measured ref nits below this × commanded ⇒ implausible
     ref_sanity_high: float = 3.0    # measured ref nits above this × commanded ⇒ implausible
     ref_sanity_blocks: int = 2      # consecutive implausible reads ⇒ display/meter COMPROMISED (abort+flag)
+    # LANDING: convergence must be judged under SUSTAINED operating load (k≈1), never during the
+    # ramp-down from a soak overshoot — cooling-from-overshoot can cancel warming-from-load into a
+    # transient flat point that reads as 'converged'. So once a run has soaked, require a FULL
+    # window of operating-load blocks (the overshoot flushed out of the evaluation window) before
+    # counting in-band. A never-soaked (already-warm) panel keeps the fast path. ---
+    operating_k_tol: float = 0.05   # |k-1| within this ⇒ this block ran at operating load
+    # PROTECTION / ABL: while SOAKING (k>1 load) the fixed reference should not DIM below its
+    # operating baseline — a falling reference under heavier load is active limiting (ABL / power /
+    # thermal throttle), not heat, so the flatness that follows is NOT convergence. FLAG it. ---
+    protection_drop_frac: float = 0.12   # ref dims > this fraction below its operating baseline ⇒ limited
+    protection_blocks: int = 2           # consecutive limited reads ⇒ FLAG PROTECTION_LIMITED
+    # BASELINE FAST-PATH (Phase 2, OFF by default): with a validated ``warm_baseline`` supplied, a
+    # block that agrees with it (bracketed, small slope, k==1) could converge in one block. Phase 1
+    # only SHADOW-LOGS the distance to gather the evidence to enable this — never short-circuits. ---
+    baseline_fast_path: bool = False
 
 
 @dataclass
@@ -110,6 +125,16 @@ class ThermalResult:
     tau_patches: Optional[int] = None            # first-order thermal time constant in content-read
     #   (≈ measurement-patch) units, estimated from the warm-in. None when no warm-in was observed
     #   (inert/flat panel) — the patch-ordering rotation then keeps its default τ.
+    warm_balance: Optional[dict[Channel, float]] = None   # the converged OPERATING-load channel balance —
+    #   a validated 'this is warm' fingerprint a later calibration run compares a live read against
+    #   (Phase-2 fast-path). Mean of the last operating-load reads (one noisy read can't define it).
+    #   None unless operating-load equilibrium was actually reached.
+    protection_limited: bool = False             # the reference DIMMED under soak load (ABL / power /
+    #   thermal throttle) — the soak can't inject usable heat; flatness here is limiting, not equilibrium
+    baseline_distance: Optional[float] = None    # SHADOW: max channel-balance distance of the first
+    #   operating read from a supplied warm_baseline (Phase-1 evidence; never acted on yet)
+    reason: Optional[str] = None                 # terminal reason code (converged:<regime> | warming |
+    #   fluctuating | protection_limited | compromised) — for the digest / dashboard
     compromised: bool = False                    # display/meter read implausibly (frozen patch / wrong mode)
     flags: list[str] = field(default_factory=list)
     needs_adjudication: bool = False
@@ -122,6 +147,7 @@ class ThermalController:
                  content: Sequence[Patch], ref_nits: float, balance_noise: Optional[float],
                  config: Optional[ThermalConfig] = None,
                  clock: Optional[Clock] = None,
+                 warm_baseline: Optional[dict[Channel, float]] = None,
                  emit: Optional[Callable[[dict[str, Any]], None]] = None,
                  event: Optional[Callable[..., None]] = None) -> None:
         self.measure = measure
@@ -129,6 +155,8 @@ class ThermalController:
         self.cfg = config or ThermalConfig()
         self.ref_nits = ref_nits
         self.balance_noise = balance_noise
+        # A validated warm balance from a prior characterize run (Phase-1: shadow-logged only).
+        self.warm_baseline = warm_baseline
         self.clock = clock or time.monotonic
         self.emit = emit                          # optional ndjson sink (per block)
         self.event = event                        # optional structured-event sink
@@ -201,12 +229,23 @@ class ThermalController:
         sane_violations = 0
         compromised = False
         self._last_ref_nits = None
+        # --- landing / protection / baseline-shadow state ---
+        op_balances: list[dict[Channel, float]] = []   # ref balances measured under OPERATING load (k≈1)
+        op_streak = 0                                   # consecutive operating-load blocks (the landing gate)
+        did_soak = False                                # a SOAK overshoot happened ⇒ require a landing window
+        ref_op_baseline: Optional[float] = None         # the reference luminance at operating load (ABL anchor)
+        protection_hits = 0
+        protection_limited = False
+        baseline_distance: Optional[float] = None       # first operating read's distance to warm_baseline (shadow)
+        emitted_cats: set[str] = set()                  # state-transition digest events emitted (once each)
 
         while block < cfg.max_blocks:
             block += 1
+            load_k = k                                  # the scale driving THIS block's load
+            load_operating = abs(load_k - 1.0) < cfg.operating_k_tol
             # --- LOAD: scaled diverse content (read-and-discard = heat + cadence) ---
             for _ in range(max(1, cfg.load_reads_per_block)):
-                self.measure(self._scaled(self.content[ci % len(self.content)], k))
+                self.measure(self._scaled(self.content[ci % len(self.content)], load_k))
                 ci += 1
                 content_reads += 1
             # --- PROBE: the fixed neutral warm-in sensor ---
@@ -249,6 +288,33 @@ class ThermalController:
                 if len(noise_blocks) == 2:
                     est = sum(noise_blocks) / len(noise_blocks)
                     threshold = max(cfg.drift_floor, cfg.drift_sigma_mult * est)
+            # Operating-load bookkeeping (the landing gate): a block whose LOAD ran at operating
+            # level (k≈1) contributes to convergence; soak/glide blocks do not (their probe carries
+            # the overshoot transient). op_streak is the run of consecutive operating-load blocks.
+            if load_operating:
+                op_streak += 1
+                op_balances.append(bal)
+                if ref_op_baseline is None and self._last_ref_nits:
+                    ref_op_baseline = self._last_ref_nits     # the reference luminance at operating load
+                # SHADOW (Phase 1): how far is the first operating read from a validated warm
+                # baseline? Logged only — it never short-circuits the controller until Phase 2.
+                if baseline_distance is None and self.warm_baseline:
+                    baseline_distance = max(abs(bal[c] - self.warm_baseline.get(c, bal[c])) for c in CHANNELS)
+            else:
+                op_streak = 0
+                # PROTECTION / ABL: under a soak load (k>1), the fixed reference must not DIM below
+                # its operating baseline — a falling reference is active limiting, not injected heat.
+                if ref_op_baseline and self._last_ref_nits and \
+                        self._last_ref_nits < ref_op_baseline * (1.0 - cfg.protection_drop_frac):
+                    protection_hits += 1
+                    if protection_hits >= cfg.protection_blocks and not protection_limited:
+                        protection_limited = True
+                        flags.append(
+                            f"reference dimmed to {self._last_ref_nits:.0f} nits under soak load "
+                            f"(operating baseline {ref_op_baseline:.0f}) — active limiting (ABL / power / "
+                            "thermal throttle), not warm-in; the soak cannot inject usable heat here")
+                else:
+                    protection_hits = 0
             window = history[-cfg.window_blocks:]
             # net/gross per channel over the window; the active channel is the biggest mover.
             net_active = gross_active = 0.0
@@ -274,16 +340,23 @@ class ThermalController:
             if warming:
                 k = cfg.k_start                                     # SOAK: inject heat
                 in_band = 0
+                did_soak = True
                 state = "soak"
             else:
                 k = 1.0 + (k - 1.0) * cfg.k_decay                   # GLIDE toward operating load
                 state = "glide"
-            near_one = abs(k - 1.0) < 0.05
-            in_band_now = near_one and len(window) >= min(cfg.window_blocks, 2) and net_active <= threshold
+            # LANDING-gated convergence: judge settling on a block that RAN at operating load
+            # (so its probe reflects the sustained load), over an operating window. Once we've
+            # soaked, require a FULL window of operating-load blocks (overshoot flushed out) so
+            # cooling-from-overshoot can't masquerade as flat; a never-soaked panel keeps the
+            # fast path (a couple of operating blocks suffice).
+            min_window = cfg.window_blocks if did_soak else min(cfg.window_blocks, 2)
+            in_band_now = (load_operating and op_streak >= min_window
+                           and len(window) >= min(cfg.window_blocks, 2) and net_active <= threshold)
             if in_band_now:
                 in_band += 1
                 state = f"in-band x{in_band}"
-            elif near_one:
+            elif load_operating:
                 in_band = 0
             if in_band >= cfg.converge_blocks:
                 converged = True
@@ -291,11 +364,36 @@ class ThermalController:
                 regime = ("fluctuating" if gross_active > cfg.fluct_gross_mult * threshold
                           else "convergent")
                 state = f"CONVERGED:{regime}"
-            self._block_record(block, k, net_active, gross_active, ratio, threshold, active, state)
+            self._block_record(block, load_k, net_active, gross_active, ratio, threshold, active, state,
+                               op_streak=op_streak, did_soak=did_soak,
+                               baseline_distance=baseline_distance, protection_limited=protection_limited)
+            # Progress-driven digest check-in: emit each milestone category ONCE (first soak, first
+            # landing/in-band, convergence, protection) so the LLM sees the soak's story without the
+            # per-block firehose (which goes to the dashboard via ``emit``). Not wall-clock paced.
+            cat = state.split()[0].split(":")[0]
+            if protection_limited and "protection" not in emitted_cats:
+                emitted_cats.add("protection")
+                self._state_event("WARN", "protection_limited", block=block, k=round(load_k, 3),
+                                  ref_nits=self._last_ref_nits, active_channel=active)
+            if cat in ("soak", "in-band", "CONVERGED") and cat not in emitted_cats:
+                emitted_cats.add(cat)
+                self._state_event("INFO", "thermal_state", block=block, state=state, k=round(load_k, 3),
+                                  net=round(net_active, 5), threshold=round(threshold, 6),
+                                  active_channel=active, op_streak=op_streak)
             if converged:
                 break
 
         minutes = round((self.clock() - t0) / 60.0, 4) if t0 is not None else 0.0
+        # The REPORTED active (cold/temperamental) channel is the one that drifted most over the
+        # WHOLE warm-in (first→last), not the last window's biggest mover: once the panel has landed
+        # and settled, the final window is just noise, so the per-block ``active`` (right for the
+        # live soak decision) no longer identifies the channel that actually warmed in.
+        if first_bal and len(history) >= 2:
+            best_net = -1.0
+            for ch in CHANNELS:
+                net_ch = abs(history[-1][ch] - first_bal[ch])
+                if net_ch > best_net:
+                    best_net, active = net_ch, ch
         warmin = (abs(history[-1][active] - first_bal[active])
                   if (active and first_bal and history) else 0.0)
         # Residual wander band over the final window (the fluctuation envelope) — feeds the
@@ -306,6 +404,14 @@ class ThermalController:
             for ch in CHANNELS:
                 vals = [b[ch] for b in win]
                 envelope = max(envelope, max(vals) - min(vals))
+        # The converged OPERATING-load balance — a validated 'this is warm' fingerprint a later
+        # calibration run compares a live read against (Phase-2 fast-path). Mean of the last
+        # operating-load reads so a single noisy read can't define it; only meaningful once
+        # operating-load equilibrium was actually reached (converged or a bounded fluctuating wander).
+        warm_balance: Optional[dict[Channel, float]] = None
+        if op_balances and (converged or regime == "fluctuating"):
+            owin = op_balances[-cfg.window_blocks:]
+            warm_balance = {ch: round(sum(b[ch] for b in owin) / len(owin), 6) for ch in CHANNELS}
         if compromised:
             regime = "compromised"          # the display/meter was bad — the regime is unknowable
         elif not converged:
@@ -335,6 +441,10 @@ class ThermalController:
             warmin_reads = max(0, block - cfg.converge_blocks) * max(1, cfg.load_reads_per_block)
             if warmin_reads > 0:
                 tau_patches = max(1, round(warmin_reads / 3.0))
+        # Terminal reason code (precedence: a bad display, then active limiting, then the regime).
+        reason = ("compromised" if compromised else
+                  "protection_limited" if protection_limited else
+                  (f"converged:{regime}" if converged else regime))
         needs = bool(flags)
         question = None
         if needs:
@@ -349,24 +459,43 @@ class ThermalController:
             "final_k": round(k, 3), "net_active": round(net_active, 5),
             "gross_active": round(gross_active, 5), "net_over_gross": ratio,
             "tau_patches": tau_patches, "compromised": compromised,
+            "protection_limited": protection_limited, "reason": reason,
+            "warm_balance": warm_balance,
+            "baseline_distance": (round(baseline_distance, 6) if baseline_distance is not None else None),
         }
         if self.event is not None:
-            self.event("INFO" if (converged and not compromised) else "WARN", "thermal_regime", **digest)
+            self.event("INFO" if (converged and not compromised and not protection_limited) else "WARN",
+                       "thermal_regime", **digest)
         return ThermalResult(
             regime=regime, converged=converged, blocks=block, content_reads=content_reads,
             warmup_minutes=(minutes if regime == "convergent" else None),
             warmin_magnitude=round(warmin, 5), fluctuation_envelope=round(envelope, 5),
             drift_threshold=round(threshold, 6), active_channel=active, final_k=round(k, 3),
-            tau_patches=tau_patches, compromised=compromised,
+            tau_patches=tau_patches, warm_balance=warm_balance, protection_limited=protection_limited,
+            baseline_distance=(round(baseline_distance, 6) if baseline_distance is not None else None),
+            reason=reason, compromised=compromised,
             flags=flags, needs_adjudication=needs, question=question, digest=digest)
+
+    def _state_event(self, level: str, event: str, **data: Any) -> None:
+        """Emit a digest-tier milestone (first soak / landing / convergence / protection) to the
+        structured-event sink, if one is wired. Rate-limited by the caller (once per category) so
+        the LLM digest sees the soak's story without the per-block firehose."""
+        if self.event is not None:
+            self.event(level, event, **{k: v for k, v in data.items() if v is not None})
 
     def _block_record(self, block: int, k: float, net: float, gross: float,
                       ratio: Optional[float], threshold: float,
-                      active: Optional[Channel], state: str) -> None:
+                      active: Optional[Channel], state: str, *,
+                      op_streak: int = 0, did_soak: bool = False,
+                      baseline_distance: Optional[float] = None,
+                      protection_limited: bool = False) -> None:
         rec = {"phase": "thermal", "block": block, "k": round(k, 3),
                "ref_nits": (round(self._last_ref_nits, 3) if self._last_ref_nits else None),
                "net": round(net, 5), "gross": round(gross, 5),
                "net_over_gross": ratio, "threshold": round(threshold, 6),
-               "active_channel": active, "state": state}
+               "active_channel": active, "state": state, "op_streak": op_streak,
+               "did_soak": did_soak, "protection_limited": protection_limited}
+        if baseline_distance is not None:
+            rec["baseline_distance"] = round(baseline_distance, 6)
         if self.emit is not None:
             self.emit(rec)
