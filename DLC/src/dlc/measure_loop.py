@@ -572,19 +572,34 @@ class _Loop:
     # -- thermal preheat: soak-into-calibration ----------------------------
 
     def _preheat_enabled(self) -> bool:
-        """Whether to soak before measuring. ``auto`` (the default) soaks any *characterized* panel —
-        ``convergent`` included. A convergent panel still has a cold-start warm-in, and the static-grey
-        settle gate holds a fixed low load (not the sweep's mean energy), so a quick soak is strictly
-        more thorough; it **self-deactivates** on an already-warm panel, so the convergent/SDR case is a
-        cheap "just to be safe" warm cycle. Only an UNCHARACTERIZED (no-DIP / no regime) or a
-        ``compromised`` panel falls back to the plain static-grey warm-up."""
+        """Whether to soak before measuring — ``auto`` ADAPTS to the measured thermal regime.
+
+        A not-yet-stable panel (``fluctuating`` / ``warming``) always soaks. A ``convergent``
+        panel is thermally stable, so it soaks ONLY when its measured cold-start warm-in
+        (``warmin_magnitude``) actually moves more than the run-time drift tolerance — otherwise
+        the static-grey warm-up settle gate already covers the cold-start and the soak is pure
+        cost: it runs once PER measure-stage, each block reading slow dark load patches, for no
+        thermal benefit on a stable panel (HW-confirmed on a convergent SDR panel, creep
+        ~0.01 ΔE/min). ``always`` / ``never`` force it on/off; an UNCHARACTERIZED (no-DIP / no
+        regime) or ``compromised`` panel does not soak — it falls back to the static-grey warm-up."""
         mode = self.cfg.preheat
         if mode == "never":
             return False
         if mode == "always":
             return True
-        regime = self.dip.thermal_regime if self.dip is not None else None
-        return regime in ("convergent", "fluctuating", "warming")
+        dip = self.dip
+        if dip is None or dip.thermal_regime is None:
+            return False
+        if dip.thermal_regime in ("fluctuating", "warming"):
+            return True
+        if dip.thermal_regime == "convergent":
+            # Stable panel: soak only if the MEASURED warm-in exceeds the drift tolerance, i.e.
+            # the panel moves more warming in than the run-time drift watch will tolerate — then
+            # parking at the operating load first earns its cost; otherwise warm-up settle suffices.
+            warmin = dip.warmin_magnitude or 0.0
+            tol = dip.recommended_drift_threshold or self.cfg.drift_threshold
+            return warmin > tol
+        return False
 
     def _run_soak(self, *, phase: str, max_blocks: Optional[int] = None):
         """Drive a closed-loop :class:`~dlc.thermal.ThermalController` over THIS run's patch set.

@@ -262,23 +262,38 @@ def test_preheat_soaks_a_cold_panel_before_measuring():
     assert loop.cold_channel == "B"               # the biggest thermal mover, discovered not assumed
 
 
-def test_preheat_auto_soaks_any_characterized_panel():
-    # "auto" soaks any CHARACTERIZED panel — convergent included (a cheap self-deactivating warm cycle:
-    # a convergent panel still has a cold-start warm-in, and the static-grey gate holds a fixed load, not
-    # the sweep's mean). Only an uncharacterized (no-DIP) or compromised panel falls back to static grey.
+def test_preheat_auto_adapts_to_regime():
+    # "auto" ADAPTS to the measured regime. A not-yet-stable panel (fluctuating/warming) soaks. A
+    # CONVERGENT (thermally stable) panel soaks ONLY when its measured warm-in exceeds the drift
+    # tolerance — a stable panel with negligible warm-in does NOT soak (the static-grey gate covers
+    # cold-start; per-stage soaks are pure cost). Uncharacterized / compromised ⇒ no soak.
     t = _sdr()
 
     def fresh():
         return SyntheticPanel(transfer=t, cold_blue_gain=0.85, load_thermal=True,
                               thermal_rate=0.06, start_temp=0.0)
 
-    def dip(regime):
-        return DisplayInstrumentProfile(display="x", thermal_regime=regime)
+    def dip(regime, **kw):
+        return DisplayInstrumentProfile(display="x", thermal_regime=regime, **kw)
 
-    for regime in ("convergent", "fluctuating", "warming"):
+    # not-yet-stable regimes always soak
+    for regime in ("fluctuating", "warming"):
         loop = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
                           _bright_content(t), dip=dip(regime))
-        assert loop.preheat() is not None, regime      # characterized ⇒ soaked (even convergent/SDR)
+        assert loop.preheat() is not None, regime
+
+    # convergent + negligible warm-in ⇒ NO soak (the key adaptive case — this SDR panel)
+    stable = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
+                        dip=dip("convergent", warmin_magnitude=None,
+                                recommended_drift_threshold=0.004))
+    assert stable.preheat() is None
+
+    # convergent BUT a warm-in larger than the drift tolerance ⇒ soak earns its cost
+    drifty = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t),
+                        dip=dip("convergent", warmin_magnitude=0.05,
+                                recommended_drift_threshold=0.004))
+    assert drifty.preheat() is not None
+
     no_dip = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"), _bright_content(t))
     assert no_dip.preheat() is None                    # uncharacterized ⇒ static-grey settle gate
     compromised = _loop_with(fresh(), t, MeasureLoopConfig(preheat="auto"),
