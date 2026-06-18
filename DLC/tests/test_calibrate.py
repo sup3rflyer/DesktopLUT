@@ -157,6 +157,22 @@ def test_transport_tell_warns_for_8bit_3dlut_on_a_10bit_minisled_panel(tmp_path:
     assert gw._transport_tell()["checked"] is False
 
 
+def test_intermediate_stages_emit_a_before_after_de_series(tmp_path: Path):
+    # #8: raw + post-mhc are scored onto the spine so the dashboard's ΔE panel + de_history
+    # show a convergence series (native → after ICC → after 3D LUT), not just a single verify
+    # point. Each carries a friendly label, in pipeline order, as a digest-tier event.
+    calib = _make(tmp_path, "detrend")
+    calib.run("full")
+    scored = [e for e in read_events(calib.ctx.events_path) if e.event == "metrics_scored"]
+    labels = [e.data.get("label") for e in scored]
+    assert "raw (native)" in labels and "after ICC" in labels and "verification" in labels
+    assert labels.index("raw (native)") < labels.index("after ICC") < labels.index("verification")
+    for e in scored:                       # every point carries the full dE panel the dashboard renders
+        for k in ("avg_de2000", "max_de2000", "white_de2000"):
+            assert isinstance(e.data.get(k), (int, float))
+    assert all(e.effective_tier == "digest" for e in scored)   # the LLM sees the trend too
+
+
 def test_full_flow_skip_gswb_drops_only_the_gswb_stages(tmp_path: Path):
     # --skip-gswb: ICC → 3D LUT (one cohesive run, one verify gate) with NO GS+WB tweak —
     # the deferred stage targets the wrong DesktopLUT layer (see reference-dlc-gswb-target).

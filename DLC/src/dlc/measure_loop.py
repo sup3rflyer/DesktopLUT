@@ -907,16 +907,16 @@ class _Loop:
         seq = self.seq_counter
         self.seq_counter += 1
         if reading.xyz is None:
-            self.ndjson.emit(
-                {
-                    "t": _now(), "seq": seq, "phase": "main", "role": "neutral_ref",
-                    "label": warmup_patch.label, "rgb": list(warmup_patch.rgb),
-                    "signal": [round(s, 6) for s in warmup_patch.signal], "read_index": 0,
-                    "xyz": None, "yxy": None, "nits": None, "ok": False, "accepted": False,
-                    "agreement_de": None, "drift": None, "settle": None,
-                    "disposition": None, "note": "drift_checkpoint_failed",
-                }
-            )
+            record = {
+                "t": _now(), "seq": seq, "phase": "main", "role": "neutral_ref",
+                "label": warmup_patch.label, "rgb": list(warmup_patch.rgb),
+                "signal": [round(s, 6) for s in warmup_patch.signal], "read_index": 0,
+                "xyz": None, "yxy": None, "nits": None, "ok": False, "accepted": False,
+                "agreement_de": None, "drift": None, "settle": None,
+                "disposition": "drift_ref", "note": "drift_checkpoint_failed",
+            }
+            self.ndjson.emit(record)
+            self._mirror_patch_read(record)   # a failed drift checkpoint is still a (failed) read
             return
         self._update_white(reading.xyz)
         ev = evaluate_drift(
@@ -924,32 +924,35 @@ class _Loop:
             current_xyz=reading.xyz,
             delta_threshold=self.cfg.drift_threshold,
         )
-        self.ndjson.emit(
-            {
-                "t": _now(),
-                "seq": seq,
-                "phase": "main",
-                "role": "neutral_ref",
-                "label": warmup_patch.label,
-                "rgb": list(warmup_patch.rgb),
-                "signal": [round(s, 6) for s in warmup_patch.signal],
-                "read_index": 0,
-                "xyz": list(reading.xyz),
-                "yxy": list(reading.yxy) if reading.yxy is not None else None,
-                "nits": reading.nits,
-                "ok": True,
-                "accepted": False,
-                "agreement_de": None,
-                "drift": {
-                    "max_delta": round(ev.max_channel_delta, 6),
-                    "repeat": ev.repeat,
-                    "coldest": ev.coldest_channel,
-                },
-                "settle": None,
-                "disposition": None,
-                "note": "drift_checkpoint",
-            }
-        )
+        record = {
+            "t": _now(),
+            "seq": seq,
+            "phase": "main",
+            "role": "neutral_ref",
+            "label": warmup_patch.label,
+            "rgb": list(warmup_patch.rgb),
+            "signal": [round(s, 6) for s in warmup_patch.signal],
+            "read_index": 0,
+            "xyz": list(reading.xyz),
+            "yxy": list(reading.yxy) if reading.yxy is not None else None,
+            "nits": reading.nits,
+            "ok": True,
+            "accepted": False,
+            "agreement_de": None,
+            "drift": {
+                "max_delta": round(ev.max_channel_delta, 6),
+                "repeat": ev.repeat,
+                "coldest": ev.coldest_channel,
+            },
+            "settle": None,
+            "disposition": "drift_ref",
+            "note": "drift_checkpoint",
+        }
+        self.ndjson.emit(record)
+        # Mirror onto the spine: the interleaved neutral re-read is the CLEANEST white-drift
+        # signal (a fixed neutral re-measured over time), so it belongs on the dashboard's
+        # drift chart + the read count — without this it lived only in the ndjson, invisible.
+        self._mirror_patch_read(record)
 
         if ev.repeat:
             # Panel temperature moved: every patch since the last clean checkpoint

@@ -340,20 +340,30 @@ class DashboardState:
 
     def _accumulate_charts(self, ev: Event, data: dict[str, Any], x: float, y: float,
                            Y: Any, enriched: dict[str, Any]) -> None:
-        """Fold a good read into the bounded, PER-STAGE chart datasets (served via /api/charts)."""
+        """Fold a good read into the bounded chart datasets (served via /api/charts)."""
+        role = data.get("role")
+        disposition = data.get("disposition")
+        rgb = data.get("rgb")
+        sig = data.get("signal")
+        neutral = _is_neutral(rgb)
+        is_probe = role == "probe" or disposition == "probe"
+        # Drift series (cross-stage TIME series): neutral MEASUREMENT reads + the dedicated
+        # neutral-ref drift checkpoints (the cleanest white-drift signal — a fixed neutral
+        # re-measured over time); never warm-up or build-probe reads.
+        if not is_probe and (role == "neutral_ref" or (neutral and role != "warmup")):
+            self._white_track.append({"elapsed_s": self._elapsed_at(ev.time),
+                                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y})
+        # Snapshot charts (latest measurement stage only): exclude warm-up, drift-ref, build-probe.
         stage = self._chart_stage(ev, data)
         if stage is None:
-            return                              # warm-up / build-probe: kept off the snapshot charts
+            return
         if stage not in self._cie_by_stage:
             self._cie_by_stage[stage] = deque(maxlen=5000)
             self._gray_by_stage[stage] = {}
             self._color_by_stage[stage] = {}
             self._stage_seq.append(stage)
-        rgb = data.get("rgb")
-        neutral = _is_neutral(rgb)
-        sig = data.get("signal")
         self._cie_by_stage[stage].append({"x": round(x, 5), "y": round(y, 5),
-                                          "role": data.get("role"), "neutral": neutral,
+                                          "role": role, "neutral": neutral,
                                           "c": (None if neutral else _sig_hex(sig)) if sig else None})
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
@@ -361,10 +371,6 @@ class DashboardState:
             self._gray_by_stage[stage][round(level, 5)] = {
                 "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
                 "cct": enriched.get("cct"), "duv": enriched.get("duv")}
-            # The drift chart is a cross-stage TIME series (it shows white wander over the whole
-            # run), so it accumulates globally rather than per stage.
-            self._white_track.append({"elapsed_s": self._elapsed_at(ev.time),
-                                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y})
         elif not neutral and sig and len(sig) >= 3 and Y is not None:
             # a colour patch: keep the latest measured Y per distinct signal for the
             # Colour Luminance chart (luminance error vs target is derived in charts()).

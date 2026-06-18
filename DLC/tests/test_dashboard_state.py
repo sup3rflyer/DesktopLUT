@@ -335,6 +335,21 @@ def test_warmup_and_build_probe_reads_excluded_from_charts():
     assert ch["stages"] == ["measure:verify"]            # warmup/probe never opened a stage
 
 
+def test_drift_reference_reads_feed_white_track_not_snapshot_charts():
+    # The interleaved neutral-ref drift checkpoints (mirrored from the measure loop) are the
+    # cleanest white-drift signal — they belong on the drift TIME series but NOT the per-stage
+    # CIE/grayscale snapshot (they re-read one fixed neutral, not the patch set).
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, white={"xy": [0.3127, 0.329]}))
+    _read(st, 1, [128, 128, 128], [0.312, 0.329], 40.0, signal=[0.5, 0.5, 0.5], phase="measure:post-mhc")
+    _read(st, 2, [512, 512, 520], [0.311, 0.330], 39.0, signal=[0.5, 0.5, 0.51],
+          role="neutral_ref", disposition="drift_ref", phase="measure:post-mhc")
+    ch = st.charts()
+    assert len(ch["white_track"]) == 2                  # both feed the drift series
+    assert len(ch["cie"]["points"]) == 1               # the drift-ref stays OFF the snapshot
+    assert [g["signal"] for g in ch["grayscale"]] == [0.5]
+
+
 def test_check_in_event_surfaces_in_snapshot():
     st = DashboardState()
     st.ingest(_ev(Ev.CHECK_IN, t=T0, stage="measure", phase="measure:post-mhc",

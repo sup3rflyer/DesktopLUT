@@ -1471,6 +1471,12 @@ class Calibration:
                                 artifacts=[p for p in (res.ti3_path, res.ndjson_path) if p])
 
         outcome = self._stage(key, run)
+        # Before→after dE trend on the spine (#8): score the INTERMEDIATE measures so the
+        # dashboard's ΔE panel + de_history show the run converging (native → after ICC → after
+        # 3D LUT) instead of a single verify point. verify does its own richer scoring at the gate.
+        if role in ("raw", "post-mhc") and outcome.status == "done":
+            self._score_stage(role, outcome.data.get("ti3"),
+                              label="raw (native)" if role == "raw" else "after ICC")
         if outcome.data.get("needs_adjudication"):
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key=f"{key}:escalation", seam=SEAM_MEASURE, stage=key,
@@ -1478,6 +1484,37 @@ class Calibration:
                 options=("accept", "abort"), recommendation="accept", digest=outcome.digest)),
                 stage=key, message="aborted on unsettled measurement")
         return outcome
+
+    def _score_stage(self, role: str, ti3_path: Optional[str], *, label: str) -> None:
+        """Score an intermediate measure stage against the resolved target and put a
+        ``metrics_scored`` digest on the spine — so the dashboard's ΔE panel + de_history show
+        the calibration converging stage by stage (a single verify point was uninformative).
+        Advisory: a missing/empty TI3 or any scoring hiccup is swallowed, never breaks the flow."""
+        if not ti3_path:
+            return
+        try:
+            p = Path(ti3_path)
+            if not p.exists():
+                return
+            samples = parse_ti3(p)
+            if not samples:
+                return
+            spec = self._spec()
+            wx, wy = self._white_xy()
+            metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
+            summary = summarize_metrics(phase=label, iteration=0, source=p,
+                                        patch_metrics=metrics, target_luminance=lum)
+            colour_de = [m.de2000 for m in metrics if not m.grayscale]
+            self.runlog.metrics_scored(
+                f"measure:{role}", label=label, iteration=0,
+                avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
+                p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
+                max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
+                grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
+                colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
+                patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
+        except Exception:  # noqa: BLE001 - advisory telemetry; a scoring hiccup never breaks the flow
+            pass
 
     def stage_build_install_mhc(self, raw_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
