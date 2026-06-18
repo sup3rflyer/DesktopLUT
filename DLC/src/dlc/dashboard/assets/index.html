@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DLC · mission control</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <!-- ── status bar ─────────────────────────────────────────────── -->
+  <header id="statusbar">
+    <div class="brand">
+      <span class="logo">DLC</span>
+      <span class="sub">mission control</span>
+    </div>
+    <div class="status-fields" id="status-fields">
+      <div class="field"><label>run</label><span id="f-run">—</span></div>
+      <div class="field"><label>display</label><span id="f-display">—</span></div>
+      <div class="field"><label>mon</label><span id="f-monitor">—</span></div>
+      <div class="field"><label>mode</label><span id="f-mode">—</span></div>
+      <div class="field"><label>flow</label><span id="f-flow">—</span></div>
+      <div class="field"><label>bits</label><span id="f-bits">—</span></div>
+      <div class="field"><label>target</label><span id="f-target">—</span></div>
+      <div class="field"><label>white</label><span id="f-white">—</span></div>
+      <div class="field"><label>ccmx</label><span id="f-ccmx">—</span></div>
+      <div class="field"><label>spd</label><span id="f-spd">—</span></div>
+    </div>
+    <div class="status-right">
+      <div class="liveness" id="liveness">
+        <span class="dot" id="live-dot"></span>
+        <span class="live-text" id="live-text">connecting…</span>
+        <span class="live-age" id="live-age"></span>
+      </div>
+      <div class="controls">
+        <button id="btn-pause" disabled title="Interactive controls land in Phase 6">Pause</button>
+        <button id="btn-cancel" disabled title="Interactive controls land in Phase 6">Cancel</button>
+        <button id="btn-export" title="Write a snapshot to the run's reports/">Export</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="layout">
+    <!-- ── event log ────────────────────────────────────────────── -->
+    <section id="logpane" class="pane">
+      <div class="phase-header" id="phase-header">
+        <div class="ph-left">
+          <span class="ph-label">phase</span>
+          <span class="ph-phase" id="ph-phase">—</span>
+          <span class="ph-arrow">›</span>
+          <span class="ph-stage" id="ph-stage">—</span>
+        </div>
+        <div class="ph-right" id="ph-status"></div>
+      </div>
+      <div class="log-toolbar">
+        <select id="filter-level" title="Minimum level">
+          <option value="DEBUG">all</option>
+          <option value="INFO" selected>info+</option>
+          <option value="WARN">warn+</option>
+          <option value="ERROR">error</option>
+        </select>
+        <select id="filter-stage" title="Stage"><option value="">all stages</option></select>
+        <label class="chk"><input type="checkbox" id="filter-digest" /> digest only</label>
+        <input type="search" id="filter-text" placeholder="filter…" />
+        <label class="chk"><input type="checkbox" id="autoscroll" checked /> follow</label>
+        <span class="log-count" id="log-count"></span>
+      </div>
+      <div class="log-rows" id="log-rows"></div>
+    </section>
+
+    <!-- ── sidebar ──────────────────────────────────────────────── -->
+    <aside id="sidebar">
+      <div class="card" id="card-progress">
+        <h3>Progress</h3>
+        <div class="bar"><div class="bar-fill" id="prog-fill"></div></div>
+        <div class="kv"><span>patches</span><b id="prog-patches">0 / 0</b></div>
+        <div class="kv"><span>reads</span><b id="prog-reads">0</b></div>
+        <div class="kv"><span>ok / fail</span><b id="prog-okfail">0 / 0</b></div>
+      </div>
+
+      <div class="card" id="card-timers">
+        <h3>Timing</h3>
+        <div class="kv"><span>run elapsed</span><b id="t-run">—</b></div>
+        <div class="kv"><span>stage elapsed</span><b id="t-stage">—</b></div>
+        <div class="kv"><span>ETA</span><b id="t-eta">—</b></div>
+        <div class="kv"><span>s / read</span><b id="t-sread">—</b></div>
+        <div class="kv"><span>s / patch</span><b id="t-spatch">—</b></div>
+      </div>
+
+      <div class="card" id="card-de">
+        <h3>ΔE2000 <span class="card-sub" id="de-source"></span></h3>
+        <div class="bignums">
+          <div class="bignum"><b id="de-avg">—</b><label>avg</label></div>
+          <div class="bignum"><b id="de-p95">—</b><label>95th</label></div>
+          <div class="bignum"><b id="de-p99">—</b><label>99th</label></div>
+          <div class="bignum"><b id="de-max">—</b><label>max</label></div>
+        </div>
+        <div class="de-split">
+          <div class="kv"><span>white</span><b id="de-white">—</b></div>
+          <div class="kv"><span>grayscale</span><b id="de-gray">—</b></div>
+          <div class="kv"><span>colour</span><b id="de-colour">—</b></div>
+        </div>
+      </div>
+
+      <div class="card" id="card-white">
+        <h3>Live white point</h3>
+        <div class="kv"><span>CCT</span><b id="w-cct">—</b></div>
+        <div class="kv"><span>Duv</span><b id="w-duv">—</b></div>
+        <div class="kv"><span>xy</span><b id="w-xy">—</b></div>
+        <div class="kv"><span>Y</span><b id="w-Y">—</b></div>
+      </div>
+
+      <div class="card" id="card-flags">
+        <h3>Attention</h3>
+        <div class="flag" id="flag-stall">stall <span>—</span></div>
+        <div class="flag" id="flag-seam">seam <span>—</span></div>
+        <div class="flag" id="flag-anomaly">anomaly <span>—</span></div>
+        <div class="flag" id="flag-checkin">check-in <span>—</span></div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

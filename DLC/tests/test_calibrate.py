@@ -165,6 +165,26 @@ def test_full_run_populates_the_event_spine(tmp_path: Path):
     assert {Ev.RUN_HEADER, Ev.PHASE, Ev.STAGE_DONE, Ev.RUN_DONE} <= dnames
 
 
+def test_verify_emits_scored_metrics_onto_the_spine(tmp_path: Path):
+    """The dashboard's ΔE big-numbers (and the LLM digest) come from a ``metrics_scored``
+    event — the rich scoring summary otherwise lives only in the adjudicator digest, never
+    on events.jsonl. Regression: a full run must put the avg/p95/p99/max/white plus the
+    grayscale-vs-colour split on the spine, as a digest-tier event."""
+    calib = _make(tmp_path, "scored")
+    calib.run("full")
+
+    events = read_events(calib.ctx.events_path)
+    scored = [e for e in events if e.event == "metrics_scored"]
+    assert scored, "no metrics_scored event reached the spine"
+    d = scored[-1].data
+    for key in ("avg_de2000", "p95_de2000", "p99_de2000", "max_de2000", "white_de2000",
+                "grayscale_avg_de2000", "colour_avg_de2000"):
+        assert key in d, f"metrics_scored missing {key}"
+    # it must reach the LLM (digest tier), not just the dashboard
+    assert scored[-1].effective_tier == "digest"
+    assert scored[-1] in digest_projection(events)
+
+
 def test_build_probe_aborts_instead_of_poisoning_with_black(tmp_path: Path):
     """A probe read that fails even after retries must abort the build — NEVER fold a
     (0,0,0) reading into the cube (optimize folds the probe response into the training

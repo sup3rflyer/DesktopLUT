@@ -204,6 +204,13 @@ class RunLog:
     def optimizer_iteration(self, **data: Any) -> Event:
         return self.emit("INFO", "optimize", Ev.OPTIMIZER_ITER, tier="digest", **data)
 
+    def metrics_scored(self, stage: str, **data: Any) -> Event:
+        """A scored-metrics summary (the dE big-numbers). Digest tier — the dashboard's
+        ΔE panel and the LLM both want it. Carry ``avg/p95/p99/max/white`` plus the
+        grayscale-vs-colour split so the dashboard renders the whole panel from this one
+        event (no dependence on the per-patch report file)."""
+        return self.emit("INFO", stage, "metrics_scored", tier="digest", **data)
+
     def seam(self, stage: str, **data: Any) -> Event:
         return self.emit("INFO", stage, Ev.SEAM, tier="digest", **data)
 
@@ -227,6 +234,21 @@ class RunLog:
         return self.emit(level, stage, Ev.NOTE, message=message, **data)
 
 
+def event_from_dict(raw: dict[str, Any]) -> Event:
+    """Build an :class:`Event` from one parsed JSON line, tolerant of schema drift
+    (keep only known fields, default the rest). Shared by :func:`read_events` and the
+    dashboard's live tailer so both decode the spine identically."""
+    return Event(
+        level=raw.get("level", "INFO"),
+        stage=raw.get("stage", ""),
+        event=raw.get("event", ""),
+        data=raw.get("data", {}) or {},
+        time=raw.get("time", ""),
+        tier=raw.get("tier"),
+        phase=raw.get("phase"),
+    )
+
+
 def read_events(path: Path) -> list[Event]:
     events: list[Event] = []
     if not path.exists():
@@ -239,16 +261,7 @@ def read_events(path: Path) -> list[Event]:
                 raw = json.loads(line)
             except ValueError:
                 continue  # a half-written final line during a live tail — skip, don't crash
-            # Tolerate forward/backward schema drift: keep only known fields.
-            events.append(Event(
-                level=raw.get("level", "INFO"),
-                stage=raw.get("stage", ""),
-                event=raw.get("event", ""),
-                data=raw.get("data", {}) or {},
-                time=raw.get("time", ""),
-                tier=raw.get("tier"),
-                phase=raw.get("phase"),
-            ))
+            events.append(event_from_dict(raw))
     return events
 
 

@@ -40,7 +40,7 @@ import json
 import shutil
 from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields, replace
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
 
@@ -62,10 +62,10 @@ from .measure_loop import (
     Reading,
     run_measure_loop,
 )
-from .metrics import score_samples, summarize_metrics
+from .metrics import percentile, score_samples, summarize_metrics
 from .mhc import parse_ti3
 from .optimize import DegenerateMeasurements, OptimizeConfig, ProbeFn, optimize_cube
-from .paths import atomic_write_text
+from .paths import RUNS_DIR, atomic_write_text
 from .refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget, propose_correction_grayscale
 from .runs import RunContext, create_run, open_run
 from .stages import _common, build_mhc
@@ -1512,6 +1512,19 @@ class Calibration:
             within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
                       and summary.max_de2000 <= q.max_de2000 and summary.white_de2000 <= q.white_de2000)
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
+            # Put the scored dE summary on the spine so the dashboard's ΔE big-numbers
+            # panel (and the LLM digest) get it — the rich digest below only reaches the
+            # adjudicator, not events.jsonl. One event carries the whole panel: the
+            # percentiles plus the grayscale-vs-colour split.
+            colour_de = [m.de2000 for m in metrics if not m.grayscale]
+            self.runlog.metrics_scored(
+                "verify", label="verification", iteration=0,
+                avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
+                p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
+                max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
+                grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
+                colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
+                patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
             digest = {"avg_de2000": round(summary.avg_de2000, 3), "p95_de2000": round(summary.p95_de2000, 3),
                       "max_de2000": round(summary.max_de2000, 3), "white_de2000": round(summary.white_de2000, 3),
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
@@ -1654,9 +1667,27 @@ class Calibration:
     # ====================================================================
     # Flows
     # ====================================================================
+    def _publish_active_pointer(self) -> None:
+        """Point ``runs/active.json`` at this run's spine so the mission-control
+        dashboard follows it (and the next run) without being told which folder. Purely
+        advisory — a failure here must never touch the run, so it's swallowed. The
+        pointer is left in place after the run ends (the dash keeps showing the last
+        run until another starts)."""
+        try:
+            pointer = {
+                "run": str(self.ctx.root),
+                "events": str(self.ctx.events_path),
+                "flow": self.calib.get("flow"),
+                "updated": datetime.now().isoformat(timespec="seconds"),
+            }
+            atomic_write_text(RUNS_DIR / "active.json", json.dumps(pointer, indent=2))
+        except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
+            pass
+
     def run(self, flow: str) -> CalibrationResult:
         self.calib["flow"] = flow
         self._save()
+        self._publish_active_pointer()   # let the dashboard find this run (and the next)
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
         if self._enable_watchdog:
             self.liveness.start()   # backstop thread (live runs only; tests don't spin threads)

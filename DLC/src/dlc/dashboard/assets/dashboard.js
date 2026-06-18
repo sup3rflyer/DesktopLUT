@@ -1,0 +1,287 @@
+/* DLC mission control — the dumb renderer.
+ *
+ * All numbers come from the server (it does the colour math + aggregation); this file
+ * only paints them. It keeps a capped in-memory log and renders a bounded window of rows
+ * so a 10k-patch run can't blow the DOM. */
+"use strict";
+
+const MAX_LOG = 20000;      // ring-buffer cap for retained events
+const RENDER_CAP = 700;     // most-recent matching rows actually put in the DOM
+const $ = (id) => document.getElementById(id);
+
+let logData = [];           // {time, level, stage, event, phase, tier, data, derived?}
+let knownStages = new Set();
+let renderQueued = false;
+let lastState = null;
+
+/* ── helpers ─────────────────────────────────────────────────── */
+const LEVEL_RANK = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function num(v, d = 2) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return Number(v).toFixed(d);
+}
+function clockTime(iso) {
+  if (!iso) return "—";
+  const t = iso.indexOf("T");
+  return t >= 0 ? iso.slice(t + 1, t + 12) : iso;
+}
+function fmtDur(s) {
+  if (s === null || s === undefined) return "—";
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
+  if (m) return `${m}m ${String(sec).padStart(2, "0")}s`;
+  return `${sec}s`;
+}
+function deClass(v) {
+  if (v === null || v === undefined) return "";
+  if (v <= 1.0) return "de-ok";
+  if (v <= 2.3) return "de-warn";
+  return "de-bad";
+}
+function setDe(id, v, d = 2) {
+  const el = $(id);
+  el.textContent = num(v, d);
+  el.className = deClass(v);
+}
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+/* ── status bar + sidebar (from `state`) ─────────────────────── */
+function renderState(s) {
+  lastState = s;
+  const h = s.header || {};
+  $("f-run").textContent = h.run_id || s.run_id || "—";
+  $("f-display").textContent = h.display || "—";
+  $("f-monitor").textContent = (h.monitor !== undefined && h.monitor !== null) ? h.monitor : "—";
+  $("f-mode").textContent = h.mode || "—";
+  $("f-flow").textContent = h.flow || "—";
+  $("f-bits").textContent = h.bit_depth ? `${h.bit_depth}-bit` : "—";
+  $("f-target").textContent = h.target || "—";
+  const w = h.white || {};
+  const wxy = w.xy ? `${num(w.xy[0], 4)},${num(w.xy[1], 4)}` : "";
+  $("f-white").textContent = w.cct ? `${Math.round(w.cct)}K${wxy ? " · " + wxy : ""}` : (wxy || "—");
+  $("f-ccmx").textContent = h.ccmx || "—";
+  $("f-spd").textContent = h.spd || "—";
+
+  // liveness
+  const lv = s.liveness || {};
+  const dot = $("live-dot");
+  dot.className = "dot " + (lv.light || "unknown");
+  $("live-text").textContent = lv.light || "—";
+  $("live-age").textContent = (lv.age_s !== null && lv.age_s !== undefined) ? `${num(lv.age_s, 0)}s ago` : "";
+
+  // phase header
+  $("ph-phase").textContent = s.phase || "—";
+  $("ph-stage").textContent = s.stage || "—";
+  const st = s.run_status || "idle";
+  $("ph-status").innerHTML = `<span class="badge ${esc(st)}">${esc(st)}</span>`;
+
+  // progress
+  const c = s.counters || {};
+  const pct = c.patches_total ? Math.min(100, 100 * c.patches_done / c.patches_total) : 0;
+  $("prog-fill").style.width = pct + "%";
+  $("prog-patches").textContent = `${c.patches_done || 0} / ${c.patches_total || 0}`;
+  $("prog-reads").textContent = c.reads || 0;
+  $("prog-okfail").innerHTML = `<span class="ok">${c.reads_ok || 0}</span> / <span class="${(c.reads_failed) ? "nok" : ""}">${c.reads_failed || 0}</span>`;
+
+  // timers
+  const t = s.timers || {};
+  $("t-run").textContent = fmtDur(t.run_elapsed_s);
+  $("t-stage").textContent = fmtDur(t.stage_elapsed_s);
+  $("t-eta").textContent = (st === "running") ? fmtDur(t.eta_s) : "—";
+  $("t-sread").textContent = (t.s_per_read != null) ? num(t.s_per_read, 2) + "s" : "—";
+  $("t-spatch").textContent = (t.s_per_patch != null) ? num(t.s_per_patch, 1) + "s" : "—";
+
+  // dE big-numbers (from the scoring stage)
+  const de = s.de || {};
+  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
+  setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
+  setDe("de-white", de.white);
+  setDe("de-gray", de.grayscale); setDe("de-colour", de.colour);
+
+  // live white point
+  const lw = s.last_white || {};
+  $("w-cct").textContent = lw.cct ? `${Math.round(lw.cct)} K` : "—";
+  $("w-duv").textContent = (lw.duv != null) ? num(lw.duv, 4) : "—";
+  $("w-xy").textContent = lw.xy ? `${num(lw.xy[0], 4)}, ${num(lw.xy[1], 4)}` : "—";
+  $("w-Y").textContent = (lw.Y != null) ? num(lw.Y, 2) : "—";
+
+  // attention flags
+  flag("flag-stall", s.stall, (d) => d.message || d.via || "tripped", true);
+  flag("flag-seam", s.seam, (d) => `${d.key || d.stage || ""} ${d.status || ""}`.trim());
+  flag("flag-anomaly", s.anomaly, (d) => d.message || d.reason || "—");
+  flag("flag-checkin", s.check_in, (d) => d.message || "—");
+}
+
+function flag(id, obj, fmt, bad) {
+  const el = $(id);
+  const span = el.querySelector("span");
+  const has = obj && Object.keys(obj).length > 0;
+  span.textContent = has ? fmt(obj) : "—";
+  el.classList.toggle("hot", !!has);
+  el.classList.toggle("bad", !!(has && bad));
+}
+
+/* ── per-event message formatting ────────────────────────────── */
+function fmtMsg(ev) {
+  const d = ev.data || {};
+  const kv = (k, v) => `<span class="k">${esc(k)}</span>=<span class="v">${esc(v)}</span>`;
+  switch (ev.event) {
+    case "run_header":
+      return [d.target && kv("target", d.target), d.mode && kv("mode", d.mode),
+              d.flow && kv("flow", d.flow), d.ccmx && kv("ccmx", d.ccmx)].filter(Boolean).join(" ");
+    case "phase": return `→ <span class="v">${esc(d.phase_name || "")}</span>`;
+    case "stage_start": return "start";
+    case "stage_done": return `done ${kv("status", d.status || "")}${d.replayed ? " (replayed)" : ""}`;
+    case "stage_aborted": return `<span class="nok">aborted</span> ${esc(d.message || "")}`;
+    case "patch_read": {
+      const okc = d.ok ? '<span class="ok">ok</span>' : '<span class="nok">FAIL</span>';
+      const rgb = d.rgb ? `[${d.rgb.join(",")}]` : "";
+      const xy = d.xy ? `(${num(d.xy[0], 4)},${num(d.xy[1], 4)})` : "";
+      const der = ev.derived || {};
+      const cct = der.cct ? ` ${kv("cct", Math.round(der.cct) + "K")}` : "";
+      return `${esc(d.role || "")} ${esc(d.label || "")} ${kv("rgb", rgb)} ${kv("Y", num(d.Y, 2))} ${kv("xy", xy)}${cct} ${okc}`;
+    }
+    case "progress": return `${kv("patches", (d.patches_done || 0) + "/" + (d.patches_total || 0))} ${kv("reads", d.reads || 0)}`;
+    case "heartbeat": return `alive ${kv("elapsed", num(d.elapsed_s, 0) + "s")} ${kv("age", num(d.since_progress_s, 0) + "s")}`;
+    case "optimizer_iteration":
+      return Object.entries(d).slice(0, 5).map(([k, v]) =>
+        kv(k, typeof v === "number" ? num(v, 3) : v)).join(" ");
+    case "seam": return `${kv("key", d.key || "")} ${kv("status", d.status || "")}`;
+    case "anomaly": return `<span class="v">${esc(d.message || d.reason || "")}</span>`;
+    case "check_in": return `<span class="v">${esc(d.message || "")}</span>`;
+    case "stall": return `<span class="nok">STALL</span> ${esc(d.message || "")} ${kv("via", d.via || "")}`;
+    case "metrics_scored":
+      return `${kv("avg", num(d.avg_de2000))} ${kv("p95", num(d.p95_de2000))} ${kv("max", num(d.max_de2000))} ${kv("white", num(d.white_de2000))}`;
+    case "run_done": return `${kv("status", d.status || "")} ${esc(d.message || "")}`;
+    case "note": return `<span class="v">${esc(d.message || "")}</span>`;
+    case "run_created": return "run created";
+    default: {
+      const parts = Object.entries(d).slice(0, 6).map(([k, v]) =>
+        kv(k, typeof v === "object" ? JSON.stringify(v) : v));
+      return parts.join(" ");
+    }
+  }
+}
+
+/* ── log rendering (filtered + capped) ───────────────────────── */
+function passesFilter(ev) {
+  const minLvl = LEVEL_RANK[$("filter-level").value] ?? 1;
+  if ((LEVEL_RANK[ev.level] ?? 1) < minLvl) return false;
+  const stage = $("filter-stage").value;
+  if (stage && ev.stage !== stage) return false;
+  if ($("filter-digest").checked && ev.tier !== "digest") return false;
+  const text = $("filter-text").value.trim().toLowerCase();
+  if (text) {
+    const hay = `${ev.event} ${ev.stage} ${ev.phase || ""} ${JSON.stringify(ev.data || {})}`.toLowerCase();
+    if (!hay.includes(text)) return false;
+  }
+  return true;
+}
+
+function renderLog() {
+  renderQueued = false;
+  const box = $("log-rows");
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const follow = $("autoscroll").checked;
+
+  const matched = [];
+  for (let i = logData.length - 1; i >= 0 && matched.length < RENDER_CAP; i--) {
+    if (passesFilter(logData[i])) matched.push(logData[i]);
+  }
+  matched.reverse();
+
+  let html = "";
+  for (const ev of matched) {
+    html += `<div class="row ev-${esc(ev.event)}">`
+      + `<span class="t">${esc(clockTime(ev.time))}</span>`
+      + `<span class="lvl ${esc(ev.level)}">${esc(ev.level)}</span>`
+      + `<span class="stg">${esc(ev.stage || "")}</span>`
+      + `<span class="msg">${fmtMsg(ev)}</span>`
+      + `</div>`;
+  }
+  box.innerHTML = html;
+  $("log-count").textContent = `showing ${matched.length} of ${logData.length}`;
+  if (follow && (nearBottom || matched.length <= RENDER_CAP)) box.scrollTop = box.scrollHeight;
+}
+
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(renderLog);
+}
+
+function pushEvent(ev) {
+  logData.push(ev);
+  if (logData.length > MAX_LOG) logData = logData.slice(logData.length - MAX_LOG);
+  if (ev.stage && !knownStages.has(ev.stage)) {
+    knownStages.add(ev.stage);
+    const opt = document.createElement("option");
+    opt.value = ev.stage; opt.textContent = ev.stage;
+    $("filter-stage").appendChild(opt);
+  }
+}
+
+function seedLog(events) {
+  logData = [];
+  knownStages = new Set();
+  const sel = $("filter-stage");
+  sel.length = 1; // keep "all stages"
+  for (const ev of events) pushEvent(ev);
+  scheduleRender();
+}
+
+/* ── SSE wiring ──────────────────────────────────────────────── */
+function connect() {
+  const es = new EventSource("/events");
+  es.addEventListener("state", (e) => { renderState(JSON.parse(e.data)); });
+  es.addEventListener("backlog", (e) => { seedLog(JSON.parse(e.data).events || []); });
+  es.addEventListener("append", (e) => {
+    const ev = JSON.parse(e.data);
+    pushEvent(ev);
+    scheduleRender();
+  });
+  es.addEventListener("reset", (e) => {
+    seedLog([]);
+    renderState(JSON.parse(e.data));
+    toast("new run — dashboard reset");
+  });
+  es.onerror = () => {
+    $("live-text").textContent = "reconnecting…";
+    $("live-dot").className = "dot unknown";
+    // EventSource auto-reconnects; nothing else to do.
+  };
+}
+
+/* ── controls + filters ──────────────────────────────────────── */
+function wireUi() {
+  for (const id of ["filter-level", "filter-stage", "filter-digest", "filter-text"]) {
+    $(id).addEventListener("input", scheduleRender);
+  }
+  $("btn-export").addEventListener("click", async () => {
+    $("btn-export").disabled = true;
+    try {
+      const r = await fetch("/api/export");
+      const j = await r.json();
+      toast(j.saved_to ? `snapshot → ${j.saved_to.split(/[\\/]/).pop()}` : "snapshot exported");
+    } catch (e) {
+      toast("export failed");
+    } finally {
+      $("btn-export").disabled = false;
+    }
+  });
+}
+
+wireUi();
+connect();
