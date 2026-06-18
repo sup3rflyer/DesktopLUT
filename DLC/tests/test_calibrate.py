@@ -41,6 +41,7 @@ from dlc.calibrate import (
     run_calibration,
 )
 from dlc.controller import CalibrationController
+from dlc.dip import DisplayInstrumentProfile
 from dlc.engine.patches import Transfer
 from dlc.events import Ev, digest_projection, read_events
 from dlc.measure_loop import SyntheticPanel
@@ -155,6 +156,70 @@ def test_transport_tell_warns_for_8bit_3dlut_on_a_10bit_minisled_panel(tmp_path:
     gw = _make(tmp_path, "tellgw", bit_depth=8)
     gw.calib["flow"] = "gray-wb"
     assert gw._transport_tell()["checked"] is False
+
+
+def _inject_dip(calib, **fields):
+    """Persist a DIP for the run's display (keyed display:mode) so the preflight tells read it."""
+    calib._dip_store().record(DisplayInstrumentProfile(
+        display=calib.display.name, mode=calib.mode, **fields))
+
+
+def test_gamut_tell_flags_unreachable_target_primaries(tmp_path: Path):
+    # Consumes the DIP's native_primaries: a narrow native gamut (under-saturated vs the Rec.709
+    # target) ⇒ the preflight flags the unreachable primaries up front (advisory), instead of it
+    # surfacing patch-by-patch in the cube residuals.
+    calib = _make(tmp_path, "gamutnarrow")
+    calib.target_name = "srgb_g22"   # Rec.709
+    _inject_dip(calib, native_primaries={"R": [0.60, 0.34], "G": [0.32, 0.58], "B": [0.16, 0.08]})
+    tell = calib._gamut_tell()
+    assert tell["checked"] and tell["colorspace"] == "Rec.709"
+    assert tell["coverage_ratio"] < 1.0
+    assert tell["shortfall"]                       # at least one unreachable primary
+    assert "warning" in tell and "unreachable" in tell["warning"].lower()
+
+
+def test_gamut_tell_quiet_when_native_covers_target(tmp_path: Path):
+    calib = _make(tmp_path, "gamutwide")
+    calib.target_name = "srgb_g22"
+    # a wide (P3-ish) native gamut fully contains Rec.709
+    _inject_dip(calib, native_primaries={"R": [0.68, 0.32], "G": [0.265, 0.69], "B": [0.15, 0.06]})
+    tell = calib._gamut_tell()
+    assert tell["checked"] and tell["coverage_ratio"] == pytest.approx(1.0, abs=1e-3)
+    assert "warning" not in tell
+
+
+def test_gamut_tell_noop_without_characterization(tmp_path: Path):
+    # No characterized primaries ⇒ the tell no-ops (doesn't guess). Fresh tmp_path so the
+    # cross-run DIP store is empty.
+    bare = _make(tmp_path, "gamutbare")
+    bare.target_name = "srgb_g22"
+    assert bare._gamut_tell()["checked"] is False
+    assert bare._panel_limits_tell()["checked"] is False
+
+
+def test_panel_limits_tell_flags_low_contrast(tmp_path: Path):
+    # Consumes native_white_nits / native_black_nits: a raised black (low contrast) is surfaced.
+    calib = _make(tmp_path, "panellow")
+    calib.target_name = "srgb_g22"
+    _inject_dip(calib, native_white_nits=120.0, native_black_nits=1.0)   # 120:1 → low
+    tell = calib._panel_limits_tell()
+    assert tell["checked"] and tell["contrast"] == 120
+    assert "warning" in tell and "contrast" in tell["warning"]
+
+    ok = _make(tmp_path, "panelok")
+    ok.target_name = "srgb_g22"
+    _inject_dip(ok, native_white_nits=120.0, native_black_nits=0.1)      # 1200:1 → fine
+    assert "warning" not in ok._panel_limits_tell()
+
+
+def test_panel_and_gamut_tells_land_in_preflight_digest(tmp_path: Path):
+    calib = _make(tmp_path, "pftells")
+    _inject_dip(calib, native_primaries={"R": [0.64, 0.33], "G": [0.30, 0.60], "B": [0.15, 0.06]},
+                native_white_nits=120.0, native_black_nits=0.12)
+    calib.run("full")
+    pf = calib.calib["stages"]["preflight"]["digest"]
+    assert pf["gamut"]["checked"] is True
+    assert pf["panel_limits"]["checked"] is True and pf["panel_limits"]["contrast"] == 1000
 
 
 def test_intermediate_stages_emit_a_before_after_de_series(tmp_path: Path):

@@ -50,6 +50,7 @@ from . import calibration_profile as cp
 from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
+from . import gamut
 from .dip import DipStore, DisplayInstrumentProfile
 from .engine.patches import Transfer, cube_patches, gamut_patches, ramp_patches, sort_patches, tube_patches
 from .events import Ev, EventWriter, RunLog
@@ -994,6 +995,90 @@ class Calibration:
                 f"feeding the 3D LUT may be silently wrong.")
         return guard
 
+    def _target_colorspace(self) -> Optional[str]:
+        """The target colour space for this run, resilient to preflight running BEFORE
+        resolve-target sets ``target_name`` (fall back to the display's per-mode target)."""
+        name = self.target_name or self.display.target_name(self.mode)
+        if not name:
+            return None
+        try:
+            return self.profile.target(name).colorspace
+        except (KeyError, AttributeError):
+            return None
+
+    def _gamut_tell(self) -> dict[str, Any]:
+        """Advisory (never a gate): does the panel's MEASURED native gamut (the DIP's
+        ``native_primaries``) cover the target colour space? A target primary OUTSIDE the native
+        RGB triangle is physically unreachable — the build will CLIP there no matter what — so
+        surface it up front (coverage %, which primaries, by how much) and inform gamut-map vs
+        clip, instead of it emerging patch-by-patch in the cube residuals. Consumes
+        ``native_primaries`` (measured by characterize, previously unused by calibration)."""
+        dip = self._dip()
+        if dip is None or not dip.native_primaries:
+            return {"checked": False, "reason": "no characterized native primaries"}
+        native = {ch: (float(xy[0]), float(xy[1]))
+                  for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2}
+        if not {"R", "G", "B"} <= set(native):
+            return {"checked": False, "reason": "incomplete native primaries"}
+        colorspace = self._target_colorspace()
+        tgt = gamut.target_primaries(colorspace)
+        if tgt is None:
+            return {"checked": False, "reason": f"unknown target colourspace {colorspace!r}"}
+        cov = gamut.gamut_coverage(native, tgt)
+        tell: dict[str, Any] = {"checked": True, "colorspace": colorspace,
+                                "coverage_ratio": round(cov["coverage_ratio"], 4),
+                                "reachable": cov["reachable"], "shortfall": cov["shortfall"],
+                                "native_primaries": native}
+        unreachable = [ch for ch, ok in cov["reachable"].items() if not ok]
+        if unreachable:
+            chans = "/".join(unreachable)
+            tell["warning"] = (
+                f"native gamut covers ~{cov['coverage_ratio'] * 100:.1f}% of {colorspace}: the "
+                f"target {chans} primar{'y is' if len(unreachable) == 1 else 'ies are'} OUTSIDE the "
+                f"panel's gamut (unreachable — the build will hard-CLIP there). Consider perceptual "
+                f"gamut-mapping rather than clipping, or a target the panel can cover.")
+        elif cov["coverage_ratio"] < 0.99:
+            tell["warning"] = (f"native gamut covers ~{cov['coverage_ratio'] * 100:.1f}% of "
+                               f"{colorspace} — minor under-coverage near the gamut boundary.")
+        return tell
+
+    def _panel_limits_tell(self) -> dict[str, Any]:
+        """Advisory (never a gate): the panel's MEASURED native white / black (the DIP) vs the
+        target — contrast (raised black ⇒ limited shadows/black level) and, for HDR, peak
+        headroom (measured peak below the target peak ⇒ the build must roll off / lower the
+        ceiling). Consumes ``native_white_nits`` / ``native_black_nits`` (measured by
+        characterize, previously unused). SDR white luminance is OSD-set by the brightness stage,
+        so it's reported but not warned on here."""
+        dip = self._dip()
+        if dip is None or dip.native_white_nits is None:
+            return {"checked": False, "reason": "no characterized native white/black"}
+        white = float(dip.native_white_nits)
+        black = float(dip.native_black_nits) if dip.native_black_nits is not None else None
+        contrast = (white / black) if (black and black > 0) else None
+        colorspace = self._target_colorspace()
+        try:
+            spec = self.profile.target(self.target_name or self.display.target_name(self.mode))
+            target_nits, is_hdr = spec.luminance_nits, spec.is_hdr
+        except (KeyError, AttributeError):
+            target_nits, is_hdr = None, (self.mode == "HDR")
+        tell: dict[str, Any] = {"checked": True, "native_white_nits": round(white, 2),
+                                "native_black_nits": (round(black, 5) if black is not None else None),
+                                "contrast": (round(contrast) if contrast else None),
+                                "target_nits": target_nits, "mode": self.mode}
+        msgs: list[str] = []
+        # HDR peak headroom: the measured peak IS the panel's HDR ceiling (not OSD-adjustable),
+        # so a target peak above it can't be hit — the build must roll off / drop the ceiling.
+        if is_hdr and target_nits and white < target_nits * 0.95:
+            msgs.append(f"native peak {white:.0f} nits is below the {target_nits:g}-nit target peak — "
+                        f"the build must roll off / lower the sustained ceiling to ~{white:.0f}")
+        # Raised black / low contrast (advisory threshold, not panel-specific).
+        if contrast is not None and contrast < 200:
+            msgs.append(f"measured contrast ~{contrast:.0f}:1 (raised black {black:.3f} nits) — "
+                        f"black level + shadow accuracy will be limited")
+        if msgs:
+            tell["warning"] = "; ".join(msgs)
+        return tell
+
     # ====================================================================
     # Stages
     # ====================================================================
@@ -1031,6 +1116,17 @@ class Calibration:
             transport = self._transport_tell()
             if transport.get("warning"):
                 self.ctx.log(transport["warning"])
+            # Panel-capability tells from the DIP (advisory, never gates): does the measured
+            # native gamut cover the target, and do native white/black/contrast fit it? These
+            # consume the DIP's display axis (native primaries / white / black) up front, so an
+            # unreachable target gamut or a raised black is surfaced before the build, not in the
+            # cube residuals afterward.
+            gamut_tell = self._gamut_tell()
+            if gamut_tell.get("warning"):
+                self.ctx.log(gamut_tell["warning"])
+            panel_limits = self._panel_limits_tell()
+            if panel_limits.get("warning"):
+                self.ctx.log(panel_limits["warning"])
             # Display+Instrument Profile staleness *tell* (never a gate): the measure loop
             # works without a DIP (single-read default), but a fresh one makes reads noise-aware.
             # Surface present/stale/missing so the LLM can choose to `--flow characterize` first.
@@ -1054,6 +1150,8 @@ class Calibration:
                       "correction_from_store": store_made is not None,
                       "patch_window": patch_window,
                       "transport": transport,
+                      "gamut": gamut_tell,
+                      "panel_limits": panel_limits,
                       "dip": dip_status,
                       "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
