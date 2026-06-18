@@ -105,14 +105,23 @@
   <!-- ── charts (centerpiece) ───────────────────────────────────── -->
   <main id="charts-area">
     <div class="charts-grid" id="charts">
-      <figure class="chart"><figcaption>CIE 1931 chromaticity</figcaption><div data-chart="cie"></div></figure>
-      <figure class="chart"><figcaption>EOTF / gamma</figcaption><div data-chart="eotf"></div></figure>
+      <figure class="chart"><figcaption>Color Accuracy · CIE 1931</figcaption><div data-chart="cie"></div></figure>
+      <figure class="chart"><figcaption>Tone Response · EOTF</figcaption><div data-chart="eotf"></div></figure>
       <figure class="chart"><figcaption>Grayscale CCT</figcaption><div data-chart="graycct"></div></figure>
       <figure class="chart"><figcaption>Grayscale Duv</figcaption><div data-chart="grayduv"></div></figure>
+      <figure class="chart"><figcaption>Color Luminance</figcaption><div data-chart="colorlum"></div></figure>
       <figure class="chart"><figcaption>Optimizer convergence</figcaption><div data-chart="optimizer"></div></figure>
       <figure class="chart"><figcaption>White CCT vs time</figcaption><div data-chart="drift"></div></figure>
     </div>
   </main>
+
+  <!-- ── lightbox (click a tile to view it large) ──────────────── -->
+  <div id="lightbox" class="lightbox" hidden>
+    <div class="lb-frame">
+      <div class="lb-head"><span id="lb-title"></span><button id="lb-close" title="Close (Esc)">✕</button></div>
+      <div class="lb-body" id="lb-body"></div>
+    </div>
+  </div>
 
   <!-- ── event log (compact footer) ─────────────────────────────── -->
   <footer id="logpane">

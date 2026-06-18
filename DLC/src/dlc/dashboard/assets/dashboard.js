@@ -274,17 +274,44 @@ function connect() {
 
 /* ── charts (polled off the SSE path; the server precomputes everything) ──── */
 let chartsBusy = false;
+let lastCharts = null;
+let lightboxKey = null;
 async function refreshCharts() {
   if (chartsBusy || document.hidden) return;   // skip while a fetch is in flight or tab hidden
   chartsBusy = true;
   try {
     const r = await fetch("/api/charts");
-    const data = await r.json();
+    lastCharts = await r.json();
+    const header = lastState ? lastState.header : null;
     if (window.DLCCharts) {
-      DLCCharts.renderInto($("charts"), data, lastState ? lastState.header : null);
+      DLCCharts.renderInto($("charts"), lastCharts, header);
+      if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, lastCharts, header);  // keep the open tile live
     }
   } catch (e) { /* charts are advisory; ignore a missed poll */ }
   finally { chartsBusy = false; }
+}
+
+/* ── lightbox (image-viewer-style full view of a tile) ──────────── */
+function openLightbox(key, title) {
+  lightboxKey = key;
+  $("lb-title").textContent = title || key;
+  const header = lastState ? lastState.header : null;
+  $("lb-body").innerHTML = (window.DLCCharts && lastCharts) ? DLCCharts.build(key, lastCharts, header) : "";
+  $("lightbox").hidden = false;
+}
+function closeLightbox() { lightboxKey = null; $("lightbox").hidden = true; }
+
+function wireLightbox() {
+  $("charts").addEventListener("click", (e) => {
+    const fig = e.target.closest(".chart");
+    if (!fig) return;
+    const holder = fig.querySelector("[data-chart]");
+    const cap = fig.querySelector("figcaption");
+    if (holder) openLightbox(holder.getAttribute("data-chart"), cap ? cap.textContent : "");
+  });
+  $("lb-close").addEventListener("click", closeLightbox);
+  $("lightbox").addEventListener("click", (e) => { if (e.target.id === "lightbox") closeLightbox(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); });
 }
 
 /* ── controls + filters ──────────────────────────────────────── */
@@ -307,6 +334,7 @@ function wireUi() {
 }
 
 wireUi();
+wireLightbox();
 connect();
 refreshCharts();
 setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency

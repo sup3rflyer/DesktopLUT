@@ -285,6 +285,22 @@ def test_grayscale_latest_measurement_wins_per_level():
     assert gray[0]["x"] == 0.313     # the later read overwrote the earlier one
 
 
+def test_color_luminance_error_vs_target():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # white reference (full neutral) so the chart can normalise
+    _read(st, 1, [255, 255, 255], [0.313, 0.329], 100.0, signal=[1.0, 1.0, 1.0])
+    # a full-red patch reading exactly its target luminance (Kr=0.2126 → 21.26 cd/m²) → 0 error
+    _read(st, 2, [255, 0, 0], [0.64, 0.33], 21.26, signal=[1.0, 0.0, 0.0])
+    # a full-green patch reading 10% dim (target Kg=0.7152 → 71.52; measured 64.37)
+    _read(st, 3, [0, 255, 0], [0.30, 0.60], 64.37, signal=[0.0, 1.0, 0.0])
+    cl = {c["label"]: c for c in st.charts()["color_lum"]}
+    assert "R100" in cl and abs(cl["R100"]["error"]) < 0.01           # on target
+    assert "G100" in cl and abs(cl["G100"]["error"] - (-0.10)) < 0.01  # ~10% dim
+    assert cl["R100"]["color"] == "#ff0000"                            # bar coloured as the patch
+
+
 def test_optimizer_history_accumulates():
     st = DashboardState()
     for i in range(3):

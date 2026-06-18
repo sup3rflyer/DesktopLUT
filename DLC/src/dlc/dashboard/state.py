@@ -23,6 +23,42 @@ from .colorimetry import neutral_metrics, planckian_locus_xy
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
 _SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
+# Rec.709/sRGB luminance weights — enough to compute a colour patch's TARGET relative
+# luminance (Kr·r^γ + Kg·g^γ + Kb·b^γ) without the full primary matrix, so the Colour
+# Luminance chart is live + dependency-free. The authoritative dE still comes from scoring.
+_LUMA = (0.2126, 0.7152, 0.0722)
+# Patch-family ordering for the Colour Luminance bar chart (matches HCFR's R/G/B/C/M/Y sweep).
+_FAMILY_ORDER = {"R": 0, "Y": 1, "G": 2, "C": 3, "B": 4, "M": 5, "mix": 6}
+
+
+def _sig_hex(sig) -> str:
+    """A colour patch's approximate on-screen colour (its normalised code values as sRGB),
+    for colouring the CIE dots + the luminance bars."""
+    try:
+        r, g, b = (max(0, min(255, int(round(float(c) * 255)))) for c in sig[:3])
+        return f"#{r:02x}{g:02x}{b:02x}"
+    except (TypeError, ValueError, IndexError):
+        return "#888888"
+
+
+def _classify_color(sig) -> tuple[str, int]:
+    """Classify a colour patch into a hue family (R/G/B/C/M/Y/mix) + a saturation percent,
+    for the Colour Luminance bar labels (e.g. 'R75'). Heuristic — a monitoring label, not
+    a colorimetric identity."""
+    try:
+        r, g, b = (float(sig[0]), float(sig[1]), float(sig[2]))
+    except (TypeError, ValueError, IndexError):
+        return ("mix", 0)
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx <= 0:
+        return ("mix", 0)
+    # bucket saturation to the nearest 25% so the many tube/volumetric patches collapse into
+    # a readable R25/R50/R75/R100-style sweep (matching HCFR), not hundreds of bars.
+    sat = max(0, min(100, round((mx - mn) / mx * 100 / 25) * 25))
+    hi = tuple(1 if v >= 0.5 * mx else 0 for v in (r, g, b))
+    family = {(1, 0, 0): "R", (0, 1, 0): "G", (0, 0, 1): "B",
+              (1, 1, 0): "Y", (0, 1, 1): "C", (1, 0, 1): "M"}.get(hi, "mix")
+    return (family, sat)
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -148,6 +184,7 @@ class DashboardState:
     # state push stays lean while the scatter can grow to thousands of points)
     _cie_points: Deque[dict] = field(default_factory=lambda: deque(maxlen=5000))
     _grayscale: dict = field(default_factory=dict)          # signal-level → latest neutral sample
+    _color_track: dict = field(default_factory=dict)        # colour-patch signal → latest sample
     _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
     _optimizer_history: list = field(default_factory=list)
 
@@ -290,18 +327,26 @@ class DashboardState:
         """Fold a good read into the bounded chart datasets (served via /api/charts)."""
         rgb = data.get("rgb")
         neutral = _is_neutral(rgb)
-        self._cie_points.append({"x": round(x, 5), "y": round(y, 5),
-                                 "role": data.get("role"), "neutral": neutral})
         sig = data.get("signal")
+        self._cie_points.append({"x": round(x, 5), "y": round(y, 5),
+                                 "role": data.get("role"), "neutral": neutral,
+                                 "c": (None if neutral else _sig_hex(sig)) if sig else None})
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             # latest measurement at this grayscale level wins (re-measures overwrite)
             self._grayscale[round(level, 5)] = {
                 "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
                 "cct": enriched.get("cct"), "duv": enriched.get("duv")}
-        if neutral:
             self._white_track.append({"elapsed_s": self._elapsed_at(ev.time),
                                       "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y})
+        elif not neutral and sig and len(sig) >= 3 and Y is not None:
+            # a colour patch: keep the latest measured Y per distinct signal for the
+            # Colour Luminance chart (luminance error vs target is derived in charts()).
+            try:
+                key = (round(float(sig[0]), 4), round(float(sig[1]), 4), round(float(sig[2]), 4))
+                self._color_track[key] = {"signal": list(key), "Y": Y}
+            except (TypeError, ValueError):
+                pass
 
     def _ingest_metrics(self, ev: Event, data: dict[str, Any]) -> None:
         entry = {
@@ -327,6 +372,7 @@ class DashboardState:
         Everything is already numeric/derived — the browser only draws SVG."""
         gray = [self._grayscale[k] for k in sorted(self._grayscale)]
         white = (self.header.get("white") or {}).get("xy")
+        gamma = self.header.get("gamma") or 2.2
         return {
             "cie": {
                 "points": list(self._cie_points),
@@ -336,13 +382,50 @@ class DashboardState:
             },
             "grayscale": gray,
             "eotf": {
-                "gamma": self.header.get("gamma"),
+                "gamma": gamma,
                 "luminance": self.header.get("luminance"),
                 "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
             },
+            "color_lum": self._color_luminance(gray, gamma),
             "optimizer": list(self._optimizer_history),
             "white_track": [w for w in self._white_track if w.get("elapsed_s") is not None],
         }
+
+    def _color_luminance(self, gray: list[dict], gamma: float) -> list[dict[str, Any]]:
+        """Per-colour-patch luminance error vs target, as fractions (-0.1 = 5% dim, etc.).
+        Target relative luminance = Σ Kc·signal_c^γ (Rec.709 weights); measured relative =
+        measured Y / the brightest neutral Y. Computed here (not at read time) against the
+        best-known white, so it tracks even if white was measured at a different moment."""
+        white_y = max((g["Y"] for g in gray if g.get("Y") is not None), default=None)
+        if white_y is None:
+            white_y = (self.last_white or {}).get("Y")
+        if not white_y or white_y <= 0:
+            return []
+        # Aggregate per (family, saturation-bucket): many patches share a label, so average
+        # their luminance error into one bar (the representative colour = the brightest patch).
+        groups: dict[str, dict[str, Any]] = {}
+        for c in self._color_track.values():
+            sig, Y = c.get("signal"), c.get("Y")
+            if Y is None or not sig:
+                continue
+            target_rel = sum(k * (max(0.0, s) ** gamma) for k, s in zip(_LUMA, sig))
+            if target_rel <= 1e-4:
+                continue
+            family, sat = _classify_color(sig)
+            label = f"{family}{sat}"
+            err = Y / white_y / target_rel - 1.0
+            mag = max(sig)
+            grp = groups.setdefault(label, {"family": family, "sat": sat, "errs": [],
+                                            "color": _sig_hex(sig), "mag": mag})
+            grp["errs"].append(err)
+            if mag >= grp["mag"]:
+                grp["color"], grp["mag"] = _sig_hex(sig), mag
+        out = [{"label": lbl, "family": g["family"], "sat": g["sat"],
+                "error": round(sum(g["errs"]) / len(g["errs"]), 4),
+                "n": len(g["errs"]), "color": g["color"]}
+               for lbl, g in groups.items()]
+        out.sort(key=lambda d: (_FAMILY_ORDER.get(d["family"], 9), d["sat"]))
+        return out
 
     # ----------------------------------------------------------------------
     def _wire(self, ev: Event, data: dict[str, Any]) -> dict[str, Any]:

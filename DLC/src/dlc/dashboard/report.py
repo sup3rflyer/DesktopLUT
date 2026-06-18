@@ -79,8 +79,9 @@ def render_report_html(snap: dict[str, Any], charts: dict[str, Any], exported_at
     chart_cards = "".join(
         f'<figure class="chart"><figcaption>{html.escape(title)}</figcaption>'
         f'<div data-chart="{key}"></div></figure>'
-        for key, title in (("cie", "CIE 1931 chromaticity"), ("eotf", "EOTF / gamma"),
+        for key, title in (("cie", "Color Accuracy · CIE 1931"), ("eotf", "Tone Response · EOTF"),
                            ("graycct", "Grayscale CCT"), ("grayduv", "Grayscale Duv"),
+                           ("colorlum", "Color Luminance"),
                            ("optimizer", "Optimizer convergence"), ("drift", "White CCT vs time")))
 
     payload = _safe_json({"charts": charts, "header": h})
@@ -111,25 +112,27 @@ def render_report_html(snap: dict[str, Any], charts: dict[str, Any], exported_at
 
 
 _REPORT_CSS = """
-:root{--bg:#0d1117;--panel:#161b22;--edge:#2a313c;--ink:#e6edf3;--dim:#8b949e;--accent:#58a6ff;
---good:#3fb950;--mono:ui-monospace,Consolas,monospace}
+:root{--bg:#0a0a0b;--panel:#151517;--edge:#2c2c31;--ink:#e8e8ea;--dim:#9a9aa0;--accent:#c9a227;
+--good:#6fae5e;--mono:ui-monospace,Consolas,monospace}
 *{box-sizing:border-box}body{background:var(--bg);color:var(--ink);font-family:Segoe UI,system-ui,sans-serif;
-margin:0;padding:20px;font-size:13px}h1{font-size:18px;margin:0 0 14px}h2{font-size:12px;text-transform:uppercase;
-letter-spacing:1px;color:var(--dim);margin:0 0 10px}.cols{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+margin:0;padding:20px;font-size:13px}h1{font-size:18px;margin:0 0 14px;font-family:var(--mono)}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin:0 0 10px;font-family:var(--mono)}
+.cols{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px}
 .card{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:14px;flex:1 1 320px}
 table.kv{width:100%;border-collapse:collapse}table.kv th{text-align:left;color:var(--dim);font-weight:400;
 padding:2px 8px 2px 0;white-space:nowrap}table.kv td{font-family:var(--mono);padding:2px 0}
-.bignums{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.bn{background:#1c2330;border-radius:6px;
+.bignums{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.bn{background:#1c1c20;border-radius:6px;
 padding:8px;text-align:center}.bn b{display:block;font-family:var(--mono);font-size:17px;color:var(--good)}
-.bn label{color:var(--dim);font-size:10px;text-transform:uppercase}.muted{color:#5b636d;font-size:11px}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
-.chart{background:#0f141b;border:1px solid var(--edge);border-radius:8px;padding:8px;margin:0}
-.chart figcaption{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+.bn label{color:var(--dim);font-size:10px;text-transform:uppercase}.muted{color:#5c5c62;font-size:11px}
+.charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;align-items:stretch}
+.chart{background:#151517;border:1px solid var(--edge);border-radius:8px;padding:8px;margin:0}
+.chart figcaption{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;font-family:var(--mono)}
 .chart-svg{width:100%;height:auto;display:block}
-.ch-area{fill:#0a0e13;stroke:#1f2733}.ch-grid{stroke:#1a212b;stroke-width:.5}.ch-tick{fill:#5b636d;font-size:9px;font-family:var(--mono)}
-.ch-locus{stroke:#6e7681;stroke-width:1;stroke-dasharray:3 2}.ch-gamut{fill:none;stroke:#3a4452;stroke-width:1}
-.ch-pt{fill:#d2693a;opacity:.55}.ch-pt-n{fill:#58a6ff;opacity:.8}.ch-white{fill:#fff;stroke:#000;stroke-width:.5}
-.ch-line{stroke:#58a6ff;stroke-width:1.5}.ch-line-max{stroke:#f85149;stroke-width:1}.ch-ref{stroke:#3fb950;stroke-width:1;stroke-dasharray:4 3}
-.ch-dot{fill:#58a6ff}.ch-dot-max{fill:#f85149}.ch-note{fill:#8b949e;font-size:10px;font-family:var(--mono)}
-.ch-empty{fill:#5b636d;font-size:12px;font-family:var(--mono)}
+.ch-area{fill:#0d0d0e;stroke:#242428}.ch-grid{stroke:#1c1c20;stroke-width:.5}.ch-tick{fill:#5c5c62;font-size:9px;font-family:var(--mono)}
+.ch-locus{stroke:#8a8a90;stroke-width:1;stroke-dasharray:3 2}.ch-gamut{fill:none;stroke:#4a4a50;stroke-width:1}
+.ch-pt{fill:#b0b0b4;opacity:.7}.ch-pt-n{fill:#e8e8ea;opacity:.85}.ch-white{fill:#fff;stroke:#000;stroke-width:.5}
+.ch-line{stroke:var(--accent);stroke-width:1.5}.ch-line-max{stroke:#9a9aa0;stroke-width:1}.ch-ref{stroke:#8a8a90;stroke-width:1;stroke-dasharray:4 3}
+.ch-dot{fill:var(--accent)}.ch-dot-max{fill:#9a9aa0}.ch-guide{stroke:var(--accent);stroke-width:.8;stroke-dasharray:5 4;opacity:.7}
+.ch-axis0{stroke:#6a6a70;stroke-width:1}.ch-note{fill:#9a9aa0;font-size:10px;font-family:var(--mono)}
+.ch-empty{fill:#5c5c62;font-size:12px;font-family:var(--mono)}
 """
