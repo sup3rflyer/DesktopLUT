@@ -52,12 +52,14 @@ from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
 from .dip import DipStore, DisplayInstrumentProfile
 from .engine.patches import Transfer, cube_patches, gamut_patches, ramp_patches, sort_patches, tube_patches
-from .events import EventWriter
+from .events import Ev, EventWriter, RunLog
+from .liveness import Liveness, RunStalled
 from .measure_loop import (
     MeasureFn,
     MeasureLoopConfig,
     MeasurePatch,
     MeasureLoopResult,
+    Reading,
     run_measure_loop,
 )
 from .metrics import score_samples, summarize_metrics
@@ -286,6 +288,19 @@ class CalibrationAborted(Exception):
         self.outcome = outcome
 
 
+def _reading_xy(reading: Any) -> Optional[list[float]]:
+    """The (x, y) chromaticity of a meter reading for the spine, from Yxy when present
+    else derived from XYZ. ``None`` for a failed/black read (the dashboard skips it)."""
+    yxy = getattr(reading, "yxy", None)
+    if yxy is not None:
+        return [round(yxy[1], 5), round(yxy[2], 5)]
+    xyz = getattr(reading, "xyz", None)
+    if xyz is not None and sum(xyz) > 0:
+        tot = sum(xyz)
+        return [round(xyz[0] / tot, 5), round(xyz[1] / tot, 5)]
+    return None
+
+
 class Calibration:
     """One calibration run: a flow over a monitor/mode, driving the injected
     controller + measure/probe seams + adjudicator, memoising every stage in the
@@ -314,6 +329,8 @@ class Calibration:
         probe_launcher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         decision_overrides: Optional[dict[str, "Decision"]] = None,
         skip_gswb: bool = False,
+        stall_kill_hook: Optional[Callable[[], None]] = None,
+        enable_watchdog: bool = False,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -352,6 +369,19 @@ class Calibration:
         self.calib.setdefault("decisions", {})
         self.target_name: Optional[str] = self.calib.get("target")
 
+        # The unified event spine: every phase change, stage boundary, seam, and (via the
+        # measure loop / optimizer) every patch read + heartbeat lands in events.jsonl, the
+        # one log the dashboard tails and the LLM reads (as a digest projection). This is
+        # what makes a run's liveness visible — its absence is why the 53-min stall hid.
+        self.runlog = RunLog(ctx.events_path)
+        self._last_header: dict[str, Any] = {}   # change-detection so the header isn't re-spammed
+        # The self-acting stall guard (§12). The checkpoint guard always runs (cheap, thread-free);
+        # the watchdog thread is opt-in (live runs set enable_watchdog) so tests don't spin threads.
+        # stall_kill_hook force-kills a wedged meter/presenter so the watchdog can unblock a main
+        # thread stuck in a syscall (the CLI wires it to the persistent meter + presenter).
+        self.liveness = Liveness(self.runlog, on_stall=stall_kill_hook)
+        self._enable_watchdog = enable_watchdog
+
     # -- persistence ------------------------------------------------------
     def _save(self) -> None:
         self._state["calib"] = self.calib
@@ -359,16 +389,77 @@ class Calibration:
         self._state.setdefault("mode", self.mode)
         _common.save_dlc_state(self.ctx, self._state)
 
+    def _header_data(self) -> dict[str, Any]:
+        """The dashboard status-bar payload: who/what is being calibrated, against what
+        target, with which correction. Gathered defensively — a missing piece (target not
+        yet resolved, no correction on file) just omits that key, never blocks."""
+        data: dict[str, Any] = {
+            "run_id": self.ctx.root.name,
+            "display": self.display.name,
+            "monitor": self.monitor,
+            "mode": self.mode,
+            "flow": self.calib.get("flow"),
+            "bit_depth": self.bit_depth,
+        }
+        if self.target_name:
+            data["target"] = self.target_name
+        white = self.calib.get("white")
+        if white:
+            data["white"] = white   # dict: xy, provenance, cct, duv, …
+        try:
+            store = self._correction_store()
+            ccmx = active_correction(self.profile, store, self.display.name)
+            if ccmx:
+                data["ccmx"] = Path(ccmx).name
+            rec = store.get(self.display.name)
+            if rec and getattr(rec, "spd_file", None):
+                data["spd"] = Path(rec.spd_file).name
+        except Exception:  # noqa: BLE001 - the status bar is advisory, never blocks the run
+            pass
+        return data
+
+    def _emit_header(self) -> None:
+        """Emit the run header, but only when it actually changed (it's enriched as the
+        target → white → correction become known), so the digest isn't spammed."""
+        data = self._header_data()
+        if data == self._last_header:
+            return
+        self._last_header = data
+        self.runlog.header(**data)
+
     def _stage(self, key: str, run_fn: Callable[[], StageOutcome]) -> StageOutcome:
         """Run (or replay) a memoised stage. A recorded ``done`` stage is returned
         from the record without re-doing the work — so a resume after an
-        adjudication pause never re-measures."""
+        adjudication pause never re-measures.
+
+        Every stage announces itself on the spine: the phase becomes ``key`` (the
+        dashboard's phase header), a ``stage_start`` opens it, and a ``stage_done`` /
+        ``stage_aborted`` closes it — so the run is never opaque between digests."""
+        self.runlog.set_phase(key)
+        self.runlog.stage_start(key)
+        self.liveness.progress(key)   # reset the stall clock at every stage boundary (no cross-stage false trips)
         rec = self.calib["stages"].get(key)
         if rec and rec.get("status") == "done" and not self.force:
-            return StageOutcome.from_record(rec)
-        outcome = run_fn()
+            outcome = StageOutcome.from_record(rec)
+            self.runlog.stage_done(key, status=outcome.status, replayed=True)
+            return outcome
+        try:
+            outcome = run_fn()
+        except RunStalled as exc:
+            # The guard tripped mid-stage. The stall event is already on the spine; turn it
+            # into a clean abort so the run rolls back instead of grinding silently — the
+            # whole point of this work (the 53-min wedge becomes a clean, surfaced failure).
+            self.runlog.stage_aborted(key, message=str(exc), stalled=True)
+            raise CalibrationAborted(StageOutcome(
+                key, "aborted", digest={"message": str(exc), "stalled": True}))
+        except CalibrationAborted as exc:
+            self.runlog.stage_aborted(exc.outcome.stage,
+                                      message=(exc.outcome.digest or {}).get("message"))
+            raise
         self.calib["stages"][key] = outcome.as_record()
         self._save()
+        self.runlog.stage_done(key, status=outcome.status)
+        self._emit_header()   # target/white/correction may have just become known
         return outcome
 
     # -- the seam ---------------------------------------------------------
@@ -395,7 +486,14 @@ class Calibration:
         if request.key in self.calib["decisions"] and not self.force:
             d = self.calib["decisions"][request.key]
             return Decision(d["choice"], d.get("note"))
-        decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
+        try:
+            decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
+        except AdjudicationRequired:
+            # The run is pausing for a human/LLM decision — make the pause visible on the
+            # spine (the dashboard shows "waiting at <seam>"; the LLM digest sees the ask).
+            self.runlog.seam(request.stage, key=request.key, status="paused",
+                             question=request.question, options=list(request.options))
+            raise
         self._record_decision(request, decision)
         return decision
 
@@ -408,6 +506,9 @@ class Calibration:
         self.ctx.log(f"seam {request.key}: {decision.choice}"
                      + (" (override)" if overridden else "")
                      + (f" ({decision.note})" if decision.note else ""))
+        self.runlog.seam(request.stage, key=request.key, status="decided",
+                         choice=decision.choice, note=decision.note,
+                         question=request.question, overridden=overridden)
         self._save()
 
     def _abort_if(self, decision: Decision, *, stage: str, message: str) -> Decision:
@@ -649,11 +750,27 @@ class Calibration:
         # Pass the DIP through: the loop reads a single adaptive-integration read by default
         # and escalates to more averaged reads only where the DIP's measured noise model says
         # this luminance needs SNR — never a fixed count, never a silent cap.
+        self.liveness.set_stall_after(self._liveness_threshold(dip))
         return run_measure_loop(
             patches=patches, transfer=transfer, measure=self.measure, config=cfg,
             ti3_path=meas_dir / ti3_name, ndjson_path=meas_dir / ndjson_name,
-            dip=dip,
+            runlog=self.runlog, liveness=self.liveness, dip=dip,
         )
+
+    def _liveness_threshold(self, dip: Optional[Any]) -> float:
+        """The no-progress stall threshold, derived from the measured panel+meter timing
+        when characterized — never a bare magic number. A patch can legitimately take a
+        settle plus a budget of slow dark-patch reads (each capped at the meter's per-read
+        ceiling), so the bound is a generous multiple of that worst case with a floor; with
+        no DIP it falls back to a conservative fixed bound (still active — the stalled panel
+        may well be uncharacterized)."""
+        floor = 180.0
+        if dip is None:
+            return 600.0
+        settle = dip.settle_seconds or 0.0
+        per_read = max(dip.read_overhead_s or 2.0, 2.0)
+        budget = 8          # a generous per-patch read budget (the loop flags, never hard-caps)
+        return max(floor, 4.0 * (settle + budget * per_read))
 
     def _probe_fn(self) -> ProbeFn:
         """The re-measure probe for the correction machine. Injected in tests;
@@ -667,16 +784,74 @@ class Calibration:
         def probe(signals: np.ndarray) -> np.ndarray:
             sig = np.clip(np.asarray(signals, dtype=float).reshape(-1, 3), 0.0, 1.0)
             out = np.zeros((len(sig), 3), dtype=float)
+            # The optimizer's per-iteration compute (model + cube build) precedes this batch;
+            # reset the stall clock so that bounded compute is never mistaken for a stall.
+            self.liveness.progress("build-install-3dlut")
             for i, s in enumerate(sig):
                 rgb = tuple(int(round(c * max_cv)) for c in s)
                 patch = MeasurePatch(label=f"probe{i:04d}", rgb=rgb,  # type: ignore[arg-type]
                                      signal=(float(s[0]), float(s[1]), float(s[2])),
                                      role="measurement", bit_depth=transfer.bit_depth)
-                reading = self.measure(patch)
-                out[i] = reading.xyz if reading.xyz is not None else (0.0, 0.0, 0.0)
+                # The build probe re-measures off the meter, bypassing the measure loop — so it
+                # arms the same stall guard itself (this is the exact loop that wedged for 53 min).
+                self.liveness.activity("build-install-3dlut")
+                self.liveness.check("build-install-3dlut")
+                reading = self._probe_read(patch)
+                ok = reading.ok and reading.xyz is not None
+                if ok:
+                    self.liveness.progress("build-install-3dlut")
+                # Mirror the probe read onto the spine so the build (the loop that stalled
+                # for 53 min) is LIVE on the dashboard — the build probe re-measures off the
+                # measure loop, so without this the longest phase was invisible.
+                self.runlog.patch_read(
+                    "build-install-3dlut", seq=i, role="probe", label=patch.label,
+                    rgb=list(rgb), signal=[round(float(c), 5) for c in s],
+                    Y=(round(reading.xyz[1], 4) if ok else None),
+                    xy=_reading_xy(reading), ok=ok, disposition="probe")
+                if not ok:
+                    # NEVER fold a failed read as (0,0,0): optimize_cube folds the probe's
+                    # response back into the TRAINING set (optimize.py), so one black reading
+                    # permanently poisons the model and every subsequent cube. Abort cleanly
+                    # instead — a missing correction beats a black-poisoned one.
+                    raise CalibrationAborted(StageOutcome(
+                        "build-install-3dlut", "aborted",
+                        digest={"message": (f"build probe could not read signal "
+                                            f"{[round(float(c), 4) for c in s]} after retries "
+                                            f"({reading.error}); aborting rather than folding a black "
+                                            f"reading into the cube."),
+                                "probe_failure": True,
+                                "failed_signal": [round(float(c), 4) for c in s]}))
+                out[i] = reading.xyz
             return out
 
         return probe
+
+    def _probe_read(self, patch: MeasurePatch, *, retries: int = 2) -> Reading:
+        """Read one probe patch with a small retry ladder — a transient glitch (a single
+        garbled/under-range read) is common and recoverable, so re-trigger before giving
+        up. Each retry is surfaced as an ``anomaly`` (digest tier) so the dashboard + LLM
+        see the meter struggling. An unrecoverable read is left for the caller to abort on
+        (never folded as black)."""
+        reading = self.measure(patch)
+        attempt = 0
+        while (not reading.ok or reading.xyz is None) and attempt < retries:
+            attempt += 1
+            self.runlog.anomaly("build-install-3dlut", label=patch.label, attempt=attempt,
+                                error=reading.error or "no reading")
+            reading = self.measure(patch)
+        return reading
+
+    def _on_optimize_iteration(self, result: Any) -> None:
+        """Stream each outer correction-machine iteration to the spine (digest tier):
+        the convergence curve (mean/p95/max dE), the budget, and the model-vs-reality
+        gap — so the LLM and the dashboard both watch the build converge or stall."""
+        # A completed outer iteration is real progress — reset the stall clock before the
+        # next iteration's compute span.
+        self.liveness.progress("build-install-3dlut")
+        try:
+            self.runlog.optimizer_iteration(**result.as_dict())
+        except Exception:  # noqa: BLE001 - telemetry must never break the build
+            pass
 
     def _patch_window_guard(self) -> dict[str, Any]:
         """Assert the dogegen patch window will land on the calibration target monitor.
@@ -808,6 +983,10 @@ class Calibration:
         return outcome
 
     def stage_resolve_target(self) -> StageOutcome:
+        # This stage owns its own adjudication (the plan seam) and so bypasses _stage —
+        # announce it on the spine directly so the dashboard phase header still tracks it.
+        self.runlog.set_phase("resolve-target")
+        self.runlog.stage_start("resolve-target")
         target = self.display.target_name(self.mode)
         if not target:
             raise CalibrationAborted(StageOutcome(
@@ -840,6 +1019,8 @@ class Calibration:
                       f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
+        self.runlog.stage_done("resolve-target", target=target)
+        self._emit_header()   # the target is now known — enrich the dashboard status bar
         return StageOutcome("resolve-target", "done", digest=digest, data={"target": target})
 
     def stage_whitepoint(self) -> StageOutcome:
@@ -1233,7 +1414,8 @@ class Calibration:
             cube_path = str(self.ctx.root / "generated" / f"final_{self.mode.lower()}.cube")
             try:
                 result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
-                                       measured_xyz=measured, config=self.optimize_config)
+                                       measured_xyz=measured, config=self.optimize_config,
+                                       on_iteration=self._on_optimize_iteration)
             except DegenerateMeasurements as exc:
                 # The RBF model can't be built from this patch set (degenerate/collinear) —
                 # surface a clear, actionable abort instead of crashing with a numpy traceback.
@@ -1475,6 +1657,16 @@ class Calibration:
     def run(self, flow: str) -> CalibrationResult:
         self.calib["flow"] = flow
         self._save()
+        self._emit_header()   # open the spine with what we know; enriched as the run proceeds
+        if self._enable_watchdog:
+            self.liveness.start()   # backstop thread (live runs only; tests don't spin threads)
+        try:
+            return self._run_flow(flow)
+        finally:
+            if self._enable_watchdog:
+                self.liveness.stop()
+
+    def _run_flow(self, flow: str) -> CalibrationResult:
         try:
             if flow == "full":
                 return self._flow_full()
@@ -1496,6 +1688,8 @@ class Calibration:
         except CalibrationAborted as exc:
             self.calib["stages"][exc.outcome.stage] = exc.outcome.as_record()
             self._save()
+            self.runlog.run_done("aborted", aborted_at=exc.outcome.stage,
+                                 message=(exc.outcome.digest or {}).get("message"))
             return CalibrationResult(
                 flow=flow, monitor=self.monitor, mode=self.mode, target=self.target_name,
                 status="aborted", stages=list(self.calib["stages"].keys()),
@@ -1542,6 +1736,8 @@ class Calibration:
             if choice == "revert":
                 status = self._revert_inplace()
             # else: the in-place refinement is already applied; nothing to commit.
+        self.runlog.run_done(status, results_dir=rep.data.get("results_dir"),
+                             report_path=rep.data.get("report_path"))
         return CalibrationResult(
             flow=self.calib.get("flow"), monitor=self.monitor, mode=self.mode, target=self.target_name,
             status=status, stages=list(self.calib["stages"].keys()),
@@ -2261,11 +2457,27 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     char_overrides = {k: v for k, v in char_overrides.items() if v is not None}
     characterize_config = replace(CharacterizeConfig(), **char_overrides) if char_overrides else None
 
+    def _stall_kill() -> None:
+        # The watchdog tripped on a wedge (a read/present blocked in a syscall the checkpoint
+        # can't reach). Force the blocking resources down so the main thread returns and aborts
+        # at its checkpoint. Best-effort + idempotent (the finally below closes them again).
+        if persistent_meter is not None:
+            try:
+                persistent_meter.close()   # escalates terminate→kill on the spotread child
+            except Exception:  # noqa: BLE001
+                pass
+        if presenter is not None:
+            try:
+                presenter.close()          # drops the dogegen socket / kills a spawned window
+            except Exception:  # noqa: BLE001
+                pass
+
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
                         characterize_config=characterize_config, decision_overrides=overrides,
-                        skip_gswb=args.skip_gswb)
+                        skip_gswb=args.skip_gswb,
+                        stall_kill_hook=_stall_kill, enable_watchdog=True)
     result = None
     paused = False
     try:

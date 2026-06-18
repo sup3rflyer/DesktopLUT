@@ -410,7 +410,7 @@ class _FakeSpotread:
     def __init__(self) -> None:
         self.calls = 0
 
-    def run_spotread_once(self, request):  # noqa: ANN001 - duck-typed
+    def run_spotread_once(self, request, timeout_seconds=None):  # noqa: ANN001 - duck-typed
         self.calls += 1
         return _FakeCompleted()
 
@@ -440,7 +440,7 @@ def test_make_spotread_meter_reports_spotread_failure(tmp_path: Path):
         returncode = 1
 
     class _BadSpot:
-        def run_spotread_once(self, request):  # noqa: ANN001
+        def run_spotread_once(self, request, timeout_seconds=None):  # noqa: ANN001
             return _Bad()
 
     meter = make_spotread_meter(
@@ -452,3 +452,88 @@ def test_make_spotread_meter_reports_spotread_failure(tmp_path: Path):
     reading = meter(_patch("p0", (512, 512, 512), t, 0))
     assert reading.ok is False
     assert reading.error is not None and "spotread" in reading.error
+
+
+def test_make_spotread_meter_bounded_on_timeout(tmp_path: Path):
+    """A hung one-shot meter must come back ok=False, NOT raise TimeoutExpired and
+    crash the run — the whole checkpoint-liveness design depends on this contract."""
+    import subprocess
+
+    t = _sdr()
+
+    class _HangSpot:
+        def run_spotread_once(self, request, timeout_seconds=None):  # noqa: ANN001
+            # subprocess.run would have killed the hung process and raised this.
+            raise subprocess.TimeoutExpired(cmd="spotread", timeout=timeout_seconds or 60)
+
+    meter = make_spotread_meter(
+        presenter=_FakePresenter(),
+        spotread=_HangSpot(),
+        port=1,
+        output_dir=tmp_path / "probe",
+        read_timeout=5.0,
+    )
+    reading = meter(_patch("p0", (512, 512, 512), t, 0))
+    assert reading.ok is False
+    assert reading.xyz is None
+    assert reading.error is not None and "timed out" in reading.error
+
+
+def test_make_spotread_meter_bounded_on_spawn_error(tmp_path: Path):
+    """A spawn failure (meter unplugged mid-run) is also a bounded ok=False, not a crash."""
+    t = _sdr()
+
+    class _NoSpot:
+        def run_spotread_once(self, request, timeout_seconds=None):  # noqa: ANN001
+            raise OSError("device not found")
+
+    meter = make_spotread_meter(
+        presenter=_FakePresenter(),
+        spotread=_NoSpot(),
+        port=1,
+        output_dir=tmp_path / "probe",
+    )
+    reading = meter(_patch("p0", (512, 512, 512), t, 0))
+    assert reading.ok is False
+    assert reading.error is not None and "spawn failed" in reading.error
+
+
+def test_measure_loop_aborts_on_stall(tmp_path: Path):
+    """A panel whose reads never SUCCEED makes no progress; with a tiny stall threshold
+    the loop's guard must raise RunStalled (a clean abort the orchestrator rolls back)
+    instead of grinding forever — the 53-min wedge, prevented."""
+    import time as _t
+
+    import pytest
+
+    from dlc.events import Ev, RunLog, read_events
+    from dlc.liveness import Liveness, RunStalled
+
+    t = _sdr()
+
+    def hung(patch: MeasurePatch) -> Reading:
+        _t.sleep(0.01)                       # reads "work" but never succeed → no progress
+        return Reading(xyz=None, yxy=None, ok=False, error="hung")
+
+    epath = tmp_path / "e.jsonl"
+    live = Liveness(RunLog(epath), stall_after_s=0.05)
+    with pytest.raises(RunStalled):
+        run_measure_loop(patches=_grey_ramp(t, 16), transfer=t, measure=hung,
+                         config=MeasureLoopConfig(), liveness=live)
+    assert any(e.event == Ev.STALL for e in read_events(epath))
+
+
+def test_write_ti3_excludes_unusable_holes(tmp_path: Path):
+    """A sentinel hole (no usable read → (0,0,0)) must never reach the .ti3 — the MHC /
+    cube builders parse it with no knowledge of `unstable`, so a black row would poison
+    the build."""
+    from dlc.measure_loop import AcceptedRead, write_ti3
+
+    t = _sdr()
+    good = AcceptedRead(patch=_patch("g", (512, 512, 512), t, 0), xyz=(50.0, 52.0, 55.0))
+    hole = AcceptedRead(patch=_patch("h", (0, 0, 0), t, 1), xyz=(0.0, 0.0, 0.0),
+                        unstable=True, usable=False)
+    text = write_ti3(tmp_path / "m.ti3", [good, hole]).read_text()
+    assert "NUMBER_OF_SETS 1" in text     # only the good row survived
+    assert "52.000000" in text            # the good read's XYZ_Y is present
+    assert "0.000000 0.000000 0.000000" not in text   # the black hole is not a data row

@@ -51,7 +51,8 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 from .dip import DisplayInstrumentProfile
 from .drift import Channel, coldest_channel_from_xyz, evaluate_drift
 from .engine.patches import Patch, Transfer, to_signal
-from .events import EventWriter
+from .events import EventWriter, RunLog
+from .liveness import Liveness
 from .metrics import delta_e2000, xyz_to_lab
 
 __all__ = [
@@ -179,6 +180,7 @@ class AcceptedRead:
     appended_remeasures: int = 0
     taken_cold: bool = False
     unstable: bool = False
+    usable: bool = True          # False = a sentinel hole (no usable read) — kept OFF the .ti3
     note: Optional[str] = None
 
 
@@ -268,6 +270,13 @@ def write_ti3(
     path.parent.mkdir(parents=True, exist_ok=True)
     rows: list[str] = []
     for item in accepted:
+        # A sentinel hole (no usable read → (0,0,0)) must NEVER reach the engine: the MHC
+        # matrix / 3D-LUT builders parse this .ti3 with no knowledge of `unstable`, so a black
+        # row would poison the build even when the operator/LLM rubber-stamped the escalation.
+        # Drop it — a missing training point beats a black-poisoned one (the patch is still
+        # flagged in `unresolved` for adjudication).
+        if not item.usable:
+            continue
         r, g, b = item.patch.signal
         x, y, z = item.xyz
         rows.append(
@@ -341,13 +350,24 @@ class _Loop:
         config: MeasureLoopConfig,
         ndjson: _NdjsonWriter,
         events: Optional[EventWriter],
+        runlog: Optional[RunLog] = None,
+        liveness: Optional[Liveness] = None,
         dip: Optional[DisplayInstrumentProfile] = None,
     ) -> None:
         self.transfer = transfer
-        self.measure = measure
         self.cfg = config
         self.ndjson = ndjson
         self.events = events
+        # The shared run spine (preferred over `events`): mirrors a compact patch_read +
+        # progress onto events.jsonl so the dashboard sees the firehose live, phase-stamped.
+        self.runlog = runlog
+        # The stall guard, shared with the orchestrator. Wrapping `measure` here means EVERY
+        # read (warm-up, main, drift, soak) is bracketed by the guard — a stalled loop aborts
+        # at its next read, and a wedged read is force-unblocked by the watchdog. Reads that
+        # bypass this loop (the build probe) instrument themselves with the same Liveness.
+        self.liveness = liveness
+        self._live_phase = "measure"
+        self.measure = self._instrument(measure)
         # The measured panel+meter model that drives the per-patch read budget. When
         # absent, the loop falls back to the single-read default (trust the instrument's
         # adaptive integration) — variance-based SNR/abnormality needs a DIP to know σ.
@@ -381,9 +401,68 @@ class _Loop:
 
     # -- low-level read ----------------------------------------------------
 
+    def _instrument(self, inner: MeasureFn) -> MeasureFn:
+        """Bracket every read with the stall guard: ``check`` before (abort if a prior
+        stall went unhandled / the watchdog tripped while wedged) and ``progress`` after
+        a good read (reset the clock). A failed read is activity, not progress, so a
+        failed-read storm still trips the guard. No-op when no liveness is injected."""
+        live = self.liveness
+        if live is None:
+            return inner
+
+        def measured(patch: MeasurePatch) -> Reading:
+            live.activity(self._live_phase)
+            live.check(self._live_phase)
+            reading = inner(patch)
+            if reading.ok:
+                live.progress(self._live_phase)
+            return reading
+
+        return measured
+
     def _emit_event(self, level: str, event: str, **data: Any) -> None:
-        if self.events is not None:
+        # Prefer the shared spine (phase-stamped, tier-derived); fall back to the legacy
+        # event-only writer (characterize / tests) when no runlog was injected.
+        if self.runlog is not None:
+            self.runlog.emit(level, "measure_loop", event, **data)
+        elif self.events is not None:
             self.events.write(level, "measure_loop", event, **data)
+
+    def _mirror_patch_read(self, record: dict[str, Any]) -> None:
+        """Mirror one measurements.ndjson read onto the spine as a compact, stream-tier
+        ``patch_read`` (the dense record stays in the ndjson). This is the dashboard's
+        live firehose + per-read liveness; the LLM digest drops it. No dE here — it's
+        target-relative and computed by the scoring/verify stage, not the meter loop."""
+        if self.runlog is None:
+            return
+        xyz = record.get("xyz")
+        yxy = record.get("yxy")
+        self.runlog.patch_read(
+            "measure",
+            seq=record.get("seq"),
+            role=record.get("role"),
+            label=record.get("label"),
+            rgb=record.get("rgb"),
+            signal=record.get("signal"),
+            Y=(round(xyz[1], 4) if xyz else None),
+            xy=([round(yxy[1], 5), round(yxy[2], 5)] if yxy else None),
+            ok=record.get("ok"),
+            disposition=record.get("disposition"),
+            read_index=record.get("read_index"),
+            drift=record.get("drift"),
+        )
+
+    def _emit_progress(self) -> None:
+        """A coarse progress tick (stream tier) for the dashboard counters/ETA: how many
+        distinct patches are measured out of the total, and the running read count."""
+        if self.runlog is None:
+            return
+        self.runlog.progress(
+            "measure",
+            patches_done=len(self.accepted),
+            patches_total=len(self.patches),
+            reads=self.seq_counter,
+        )
 
     def _read(
         self,
@@ -424,6 +503,9 @@ class _Loop:
         if reading.error:
             record["error"] = reading.error
         self.ndjson.emit(record)
+        self._mirror_patch_read(record)          # live firehose + per-read liveness on the spine
+        if phase != "soak" and read_index == 0 and patch.role == "measurement":
+            self._emit_progress()                # one coarse tick per new patch (counters / ETA)
         return reading
 
     def _update_white(self, xyz: tuple[float, float, float]) -> None:
@@ -493,7 +575,7 @@ class _Loop:
         ``existing_reference=True`` (a re-settle mid-run) keeps the prior warm
         reference if settling fails, rather than clobbering it with a cold read.
         """
-
+        self._live_phase = phase
         cfg = self.cfg
         prev: Optional[tuple[float, float, float]] = None
         consecutive = 0
@@ -612,6 +694,7 @@ class _Loop:
         the caller emits a single summary marker instead."""
         from .thermal import ThermalController, ThermalConfig  # lazy: keep the module import light
 
+        self._live_phase = phase
         content = [p.rgb for p in self.patches]
         if not content:
             return None
@@ -687,6 +770,7 @@ class _Loop:
         sigma: Optional[float] = None           # DIP per-read σ at this luminance (drives outlier rejection)
         read_index = 0
         unstable = False
+        usable = True
         note: Optional[str] = None
 
         while True:
@@ -744,7 +828,7 @@ class _Loop:
             accepted_xyz = st[0]
             accepted_yxy = _mean_xyz(yxys) if yxys else None
         else:
-            accepted_xyz, accepted_yxy, unstable = (0.0, 0.0, 0.0), None, True
+            accepted_xyz, accepted_yxy, unstable, usable = (0.0, 0.0, 0.0), None, True, False
             note = note or "no usable read"
 
         self._update_white(accepted_xyz)
@@ -754,7 +838,7 @@ class _Loop:
             record = AcceptedRead(
                 patch=patch, xyz=accepted_xyz, yxy=accepted_yxy,
                 reads_taken=read_index, immediate_remeasures=immediate,
-                unstable=unstable, note=note,
+                unstable=unstable, usable=usable, note=note,
             )
             self.accepted[patch.label] = record
         else:
@@ -764,12 +848,14 @@ class _Loop:
             record.reads_taken += read_index
             record.immediate_remeasures += immediate
             record.unstable = unstable
+            record.usable = usable
             record.note = note
         return record
 
     # -- main pass ---------------------------------------------------------
 
     def main_pass(self) -> None:
+        self._live_phase = "measure"
         cfg = self.cfg
         warmup_patch = self._warmup_patch()
         pending: list[str] = []  # measured since the last clean neutral checkpoint
@@ -909,6 +995,8 @@ def run_measure_loop(
     ti3_path: Optional[Path] = None,
     ndjson_path: Optional[Path] = None,
     events: Optional[EventWriter] = None,
+    runlog: Optional[RunLog] = None,
+    liveness: Optional[Liveness] = None,
     dip: Optional[DisplayInstrumentProfile] = None,
 ) -> MeasureLoopResult:
     """Run the adaptive measurement loop over ``patches`` (code-value triples,
@@ -919,6 +1007,13 @@ def run_measure_loop(
     Writes a clean ``.ti3`` (accepted reads) and ``measurements.ndjson`` (every
     read) when the paths are given. Returns a :class:`MeasureLoopResult` whose
     ``digest`` is the LLM-facing boundary object.
+
+    ``runlog`` (the shared run spine) makes the loop's progress LIVE: every read
+    mirrors a compact ``patch_read`` onto ``events.jsonl`` and ``progress`` ticks
+    advance the dashboard's counters/ETA. It's stamped with the orchestrator's
+    current phase, so the firehose is dashboard-only (stream tier) while the LLM
+    keeps reading just the digest. ``events`` stays as the legacy event-only seam
+    (characterize, tests); ``runlog`` supersedes it when both are present.
     """
 
     cfg = config or MeasureLoopConfig()
@@ -930,6 +1025,8 @@ def run_measure_loop(
         config=cfg,
         ndjson=ndjson,
         events=events,
+        runlog=runlog,
+        liveness=liveness,
         dip=dip,
     )
 
@@ -1161,6 +1258,7 @@ def make_spotread_meter(
     high_res: bool = False,
     display_type: Optional[str] = None,
     ccmx_or_ccss: Optional[Path] = None,
+    read_timeout: float = 60.0,
 ) -> MeasureFn:
     """Compose a :class:`Presenter` + Argyll ``spotread`` into a :data:`MeasureFn`.
 
@@ -1168,7 +1266,19 @@ def make_spotread_meter(
     :func:`dlc.measure_rgbw._measure_patch` but generalized to any patch label and
     decoupled from ``RgbwPatch``. The instrument ``port`` should be resolved by
     :func:`dlc.measure_rgbw.resolve_spotread_instrument_port` before the meter
-    phase (ports are not stable across probe swaps)."""
+    phase (ports are not stable across probe swaps).
+
+    ``read_timeout`` is the hard per-read ceiling. The whole liveness/stall design
+    assumes a read ALWAYS returns bounded — but ``run_spotread_once`` uses
+    ``subprocess.run(timeout=…)`` which **raises** :class:`subprocess.TimeoutExpired`
+    on a hung meter. Left uncaught (as it was) that crashes the run mid-stage, and the
+    checkpoint guard never gets to run. So we catch it here and return ``ok=False``
+    (subprocess.run has already killed the hung process), honouring the contract. The
+    ceiling is generous vs the ~2 s fast floor / slow dark-patch adaptive integration,
+    but far below the 53-min wedge — the real (DIP-derived) stall threshold is the
+    guard's job, this is just the per-read backstop."""
+
+    import subprocess  # local: only this factory talks to a one-shot subprocess
 
     from .argyll import SpotreadRequest, parse_xyz, parse_yxy
 
@@ -1189,7 +1299,18 @@ def make_spotread_meter(
             # (fast for an emissive colorimeter) reads reliably in foreground AND background.
             skip_calibration=False,
         )
-        completed = spotread.run_spotread_once(request)
+        try:
+            completed = spotread.run_spotread_once(request, timeout_seconds=int(read_timeout))
+        except subprocess.TimeoutExpired:
+            # The hung spotread was killed by subprocess.run's own timeout. Return a
+            # bounded failure so the loop reaches its next checkpoint instead of crashing.
+            return Reading(xyz=None, yxy=None, ok=False,
+                           error=f"spotread one-shot timed out after {read_timeout:.0f}s",
+                           raw={"timed_out": True})
+        except OSError as exc:
+            return Reading(xyz=None, yxy=None, ok=False,
+                           error=f"spotread spawn failed: {type(exc).__name__}: {exc}",
+                           raw={"spawn_error": True})
         combined = (completed.stdout or "") + "\n" + (completed.stderr or "")
         xyz = parse_xyz(combined)
         yxy = parse_yxy(combined)

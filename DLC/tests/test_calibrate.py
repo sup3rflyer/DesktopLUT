@@ -42,6 +42,7 @@ from dlc.calibrate import (
 )
 from dlc.controller import CalibrationController
 from dlc.engine.patches import Transfer
+from dlc.events import Ev, digest_projection, read_events
 from dlc.measure_loop import SyntheticPanel
 from dlc.optimize import OptimizeConfig, synthetic_probe
 from dlc.runs import RunContext, create_run, open_run
@@ -123,6 +124,89 @@ def test_full_flow_skip_gswb_drops_only_the_gswb_stages(tmp_path: Path):
     assert "measure:gray-wb" not in result.stages
     assert "build-install-3dlut" in result.stages
     assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
+
+
+def test_full_run_populates_the_event_spine(tmp_path: Path):
+    """Regression: the supervision spine must actually be FED during a run. Its being
+    inert (only characterize wired an EventWriter) is the real reason the 53-min build
+    stall hid. A full run must put the header, phase changes, stage boundaries, the
+    patch-read firehose, the optimizer iterations, and a terminal run_done onto
+    events.jsonl — and the LLM digest projection must keep the boundaries while dropping
+    the firehose."""
+    calib = _make(tmp_path, "spine")
+    calib.run("full")
+
+    events = read_events(calib.ctx.events_path)
+    names = [e.event for e in events]
+    assert Ev.RUN_HEADER in names
+    assert Ev.PHASE in names
+    assert Ev.STAGE_START in names and Ev.STAGE_DONE in names
+    assert Ev.PATCH_READ in names              # the measure + probe firehose is mirrored
+    assert Ev.OPTIMIZER_ITER in names          # the build (the loop that stalled) is now visible
+    assert events[-1].event == Ev.RUN_DONE     # terminal marker for the dashboard liveness light
+
+    # the header carries what the dashboard status bar needs (enriched once the target resolves)
+    header = next(e for e in events if e.event == Ev.RUN_HEADER and e.data.get("target"))
+    assert header.data["target"] == "srgb_g22"
+    assert header.data["mode"] == "SDR"
+    assert header.data.get("schema_version") == 1
+
+    # every patch_read is phase-stamped (the dashboard's phase header) and stream tier
+    reads = [e for e in events if e.event == Ev.PATCH_READ]
+    assert reads and all(e.phase for e in reads)
+    assert all(e.effective_tier == "stream" for e in reads)
+    # the build probe's reads are tagged so the dashboard can tell them from measure reads
+    assert any(e.data.get("role") == "probe" for e in reads)
+
+    # the LLM digest drops the firehose but keeps the boundaries
+    digest = digest_projection(events)
+    dnames = {e.event for e in digest}
+    assert Ev.PATCH_READ not in dnames
+    assert {Ev.RUN_HEADER, Ev.PHASE, Ev.STAGE_DONE, Ev.RUN_DONE} <= dnames
+
+
+def test_build_probe_aborts_instead_of_poisoning_with_black(tmp_path: Path):
+    """A probe read that fails even after retries must abort the build — NEVER fold a
+    (0,0,0) reading into the cube (optimize folds the probe response into the training
+    set, so one black reading poisons every subsequent cube)."""
+    import numpy as np
+    import pytest
+
+    from dlc.calibrate import CalibrationAborted
+    from dlc.measure_loop import Reading
+
+    def always_fail(patch):
+        return Reading(xyz=None, yxy=None, ok=False, error="probe fail")
+
+    calib = _make(tmp_path, "probepoison", panel=always_fail)
+    calib.target_name = "srgb_g22"   # the probe needs a resolved target for its transfer
+    probe = calib._probe_fn()
+    with pytest.raises(CalibrationAborted) as ei:
+        probe(np.array([[0.5, 0.5, 0.5]]))
+    assert ei.value.outcome.digest.get("probe_failure") is True
+    # the retries were surfaced as anomalies (digest tier) for the dashboard + LLM
+    assert any(e.event == Ev.ANOMALY for e in read_events(calib.ctx.events_path))
+
+
+def test_stage_converts_runstalled_to_clean_abort(tmp_path: Path):
+    """A stall inside a stage becomes a CalibrationAborted (→ clean rollback), and the
+    stall→abort is recorded on the spine — never a silent grind."""
+    import pytest
+
+    from dlc.calibrate import CalibrationAborted
+    from dlc.liveness import RunStalled
+
+    calib = _make(tmp_path, "stallconv")
+
+    def boom():
+        raise RunStalled("measure:raw", since_progress_s=999.0, threshold_s=100.0)
+
+    with pytest.raises(CalibrationAborted) as ei:
+        calib._stage("measure:raw", boom)
+    assert ei.value.outcome.digest.get("stalled") is True
+
+    events = read_events(calib.ctx.events_path)
+    assert any(e.event == Ev.STAGE_ABORTED and e.data.get("stalled") for e in events)
 
 
 def test_mhc_only_flow_is_icc_only(tmp_path: Path):
