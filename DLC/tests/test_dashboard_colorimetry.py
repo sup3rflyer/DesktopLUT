@@ -39,6 +39,15 @@ def test_black_and_degenerate_return_none():
     assert cct_duv(0.7, 0.05) is None
 
 
+def test_far_off_locus_returns_none_not_bogus_cct():
+    # A point that brackets the locus but sits implausibly far from it (|Duv| huge) must
+    # return None — a coloured patch mislabeled neutral should read as a dash, not a
+    # confident junk temperature (it used to report ~39000 K / Duv 0.069).
+    assert cct_duv(0.18, 0.30) is None
+    # A real near-neutral white (small Duv) still resolves.
+    assert cct_duv(0.3127, 0.329) is not None
+
+
 def test_uv60_matches_definition():
     uv = xy_to_uv60(0.31271, 0.32902)
     assert uv is not None

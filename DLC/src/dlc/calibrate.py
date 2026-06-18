@@ -1260,8 +1260,25 @@ class Calibration:
             transfer = self._transfer()
             cfg = self.characterize_config or CharacterizeConfig()
             meas_dir = self.ctx.root / "measurements"
+            # Characterize reads the panel directly (not via the instrumented measure loop), so
+            # without this wrapper its long warm-up sweep never resets the stall clock and the
+            # live-CLI watchdog would force-kill the meter mid-characterization (~20 min). Wrap
+            # the meter so each read arms the guard (real stall still aborts) and each good read
+            # registers progress. The threshold is generous: characterize HAS no DIP yet (it's
+            # producing one) and warm-up dwells can be long between reads.
+            self.liveness.set_stall_after(max(self.liveness.stall_after_s, 900.0))
+            live = self.liveness
+
+            def instrumented_measure(patch: MeasurePatch) -> Reading:
+                live.activity("characterize")
+                live.check("characterize")
+                reading = self.measure(patch)
+                if reading.ok:
+                    live.progress("characterize")
+                return reading
+
             result = run_characterization(
-                measure=self.measure, transfer=transfer, config=cfg,
+                measure=instrumented_measure, transfer=transfer, config=cfg,
                 cold_channel=self.display.temperamental_channel,
                 display=self.display.name,
                 events=EventWriter(self.ctx.events_path),
@@ -1500,6 +1517,15 @@ class Calibration:
         def run() -> StageOutcome:
             spec = self._spec()
             samples = parse_ti3(Path(verify_ti3))
+            if not samples:
+                # A fully-failed verify measure can leave a TI3 with zero usable rows. Scoring
+                # raises on an empty set; turn it into a CLEAN abort (→ stage_aborted + a
+                # terminal run_done the dashboard sees) instead of an uncaught exception that
+                # would escape _run_flow with the spine still showing "running".
+                raise CalibrationAborted(StageOutcome(
+                    "verify", "aborted",
+                    digest={"message": "verify TI3 has no usable measurements to score "
+                                       "(all reads failed?) — aborting before the quality gate."}))
             # Score against the SAME resolved white the pipeline targeted (MHC matrix, 3D-LUT
             # target, GS+WB tweak) — not textbook D65 — so a non-zero white strength is the goal
             # here, not scored as white error. NOTE: the gate metric is CIEDE2000 while the
@@ -1855,6 +1881,10 @@ class Calibration:
         self.stage_probe_match()       # launches ccxxmake in its own console; ingests the .ccmx on resume
         store = self._correction_store()
         rec = store.get(self.display.name)
+        # Terminal marker on the spine (this flow doesn't go through _finish): without it the
+        # dashboard liveness light never leaves "running" on a completed build-correction.
+        self.runlog.run_done("completed", flow="build-correction",
+                             correction=(rec.correction_file if rec else None))
         return CalibrationResult(
             flow="build-correction", monitor=self.monitor, mode=self.mode, target=None,
             status="completed", stages=list(self.calib["stages"].keys()),
@@ -1915,6 +1945,10 @@ class Calibration:
         # Leave the display exactly as we found it (clear-native entered native via the pipe).
         self._restore_user_setup(why="characterization complete — panel learned, nothing applied")
         dip = self._dip()
+        # Terminal marker on the spine (this flow doesn't go through _finish) so the dashboard
+        # flips to 'done' instead of hanging on "running" after a completed characterization.
+        self.runlog.run_done("completed", flow="characterize",
+                             dip_store=str(self._dip_store().path))
         return CalibrationResult(
             flow="characterize", monitor=self.monitor, mode=self.mode, target=self.target_name,
             status="completed", stages=list(self.calib["stages"].keys()),

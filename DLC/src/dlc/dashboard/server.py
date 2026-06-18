@@ -53,7 +53,11 @@ class Hub:
         self.state = DashboardState()
         self.recent: deque[dict[str, Any]] = deque(maxlen=backlog)
         self._subs: list[queue.Queue] = []
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # guards the subscriber list / broadcast
+        # Separate lock for state+recent: HTTP handler threads snapshot() while the tail
+        # thread mutates/reassigns state. Kept distinct from _lock so a broadcast (under
+        # _lock) inside the ingest path can't deadlock against a snapshot (under this).
+        self._state_lock = threading.Lock()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -88,10 +92,12 @@ class Hub:
 
     # -- snapshots ---------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
-        return self.state.snapshot(datetime.now())
+        with self._state_lock:
+            return self.state.snapshot(datetime.now())
 
     def backlog(self) -> list[dict[str, Any]]:
-        return list(self.recent)
+        with self._state_lock:
+            return list(self.recent)
 
     def run_root(self) -> Optional[Path]:
         cur = self.tail.current
@@ -112,8 +118,12 @@ class Hub:
         self._stop.set()
 
     def _ingest_event(self, ev: Event) -> None:
-        wire = self.state.ingest(ev)
-        self.recent.append(wire)
+        try:
+            with self._state_lock:
+                wire = self.state.ingest(ev)
+                self.recent.append(wire)
+        except Exception:  # noqa: BLE001 - one malformed event must never poison the batch
+            return
         self._broadcast({"type": "append", "event": wire})
 
     def _tail_loop(self, poll_interval: float) -> None:
@@ -121,8 +131,9 @@ class Hub:
             try:
                 events, switched = self.tail.poll()
                 if switched:
-                    self.state = DashboardState()
-                    self.recent.clear()
+                    with self._state_lock:
+                        self.state = DashboardState()
+                        self.recent.clear()
                     self._broadcast({"type": "reset", "state": self.snapshot(),
                                      "backlog": []})
                 for ev in events:

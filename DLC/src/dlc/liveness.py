@@ -147,13 +147,17 @@ class Liveness:
             with self._lock:
                 since = now - self._last_progress
                 stage = self._stage
+                stall_after = self.stall_after_s
                 wd_threshold = self.watchdog_factor * self.stall_after_s
                 started = self._start
             if now - last_beat >= self.heartbeat_every_s:
                 last_beat = now
                 # Heartbeat is the liveness signal even when the MAIN thread is wedged in a
                 # syscall (the checkpoint can't fire) — the one beat that proves the wedge.
+                # since_progress_s + stall_after_s let the dashboard warn (amber) as progress
+                # age approaches the guard's threshold, before the stall itself fires.
                 self.runlog.heartbeat(stage, since_progress_s=round(since, 1),
+                                      stall_after_s=round(stall_after, 1),
                                       elapsed_s=round(now - started, 1))
             if since > wd_threshold:
                 with self._lock:

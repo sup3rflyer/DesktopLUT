@@ -23,11 +23,34 @@ from .colorimetry import neutral_metrics
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    """Parse a spine timestamp to a tz-NAIVE datetime. The spine writes naive local
+    wall-clock, and snapshot() compares against a naive ``datetime.now()`` — but a
+    foreign/drifted producer could write a tz-aware string (``...Z`` / ``+00:00``),
+    which 3.11+ accepts. Mixing naive and aware datetimes raises TypeError, and that
+    would be swallowed by the server's loop guard → the dashboard silently freezes (the
+    worst failure for a liveness tool). So normalise any aware value to naive local."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value)
     except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 
@@ -80,7 +103,15 @@ class DashboardState:
     stage_started_iso: Optional[str] = None
     last_event_iso: Optional[str] = None
     last_read_iso: Optional[str] = None
+    last_progress_iso: Optional[str] = None   # last event that meant real forward progress
     ended_iso: Optional[str] = None
+
+    # -- liveness inputs ------------------------------------------------------
+    # The producer's authoritative progress-age (monotonic, reset by soak blocks too) rides
+    # the heartbeat. Tracking it lets the light tell "alive AND progressing" from "alive but
+    # WEDGED" — the exact 53-min failure shape — before the producer's own stall fires.
+    last_heartbeat: dict[str, Any] = field(default_factory=dict)
+    awaiting_decision: bool = False           # paused at a seam (NOT a stall) — don't show red
 
     # -- counters -------------------------------------------------------------
     patches_done: int = 0
@@ -135,8 +166,11 @@ class DashboardState:
         elif name == Ev.STAGE_START:
             self.stage = ev.stage
             self.stage_started_iso = ev.time
-            if self.run_status in (RUN_IDLE, RUN_STALLED):
-                self.run_status = RUN_RUNNING
+            # A stage boundary is real progress and resets the per-stage rate window — the
+            # patch counter restarts at ~0, so an ETA computed across the reset is garbage.
+            self._mark_progress(ev.time)
+            self._progress_marks.clear()
+            self._clear_alarm()
         elif name == Ev.STAGE_ABORTED:
             # keep self.stage as the failing stage for the header
             pass
@@ -144,19 +178,35 @@ class DashboardState:
             # patches_done/total are per-stage (the bar shows the CURRENT stage's progress);
             # the cumulative read total is tracked in _ingest_patch_read so it stays
             # consistent with reads_ok/reads_failed (PROGRESS.reads resets each stage).
-            self.patches_done = int(data.get("patches_done", self.patches_done))
-            self.patches_total = int(data.get("patches_total", self.patches_total))
+            self.patches_done = _as_int(data.get("patches_done"), self.patches_done)
+            self.patches_total = _as_int(data.get("patches_total"), self.patches_total)
+            self._mark_progress(ev.time)
+            self._clear_alarm()
             mark_t = _parse_iso(ev.time)
             if mark_t is not None:
                 self._progress_marks.append((mark_t, self.patches_done))
         elif name == Ev.PATCH_READ:
             self._ingest_patch_read(ev, data)
+        elif name == Ev.HEARTBEAT:
+            # The producer's authoritative progress-age (monotonic) — the one signal that
+            # survives a syscall wedge AND a silent soak (soak blocks reset it producer-side).
+            self.last_heartbeat = {"time": ev.time,
+                                   "since_progress_s": _as_float(data.get("since_progress_s")),
+                                   "stall_after_s": _as_float(data.get("stall_after_s"))}
         elif name == "metrics_scored":
             self._ingest_metrics(ev, data)
+            self._mark_progress(ev.time)
         elif name == Ev.OPTIMIZER_ITER:
             self.optimizer = dict(data)
+            self._mark_progress(ev.time)
+            self._clear_alarm()
         elif name == Ev.SEAM:
             self.last_seam = {"stage": ev.stage, "time": ev.time, **data}
+            # A paused seam is a healthy human-in-the-loop wait, NOT a stall — but heartbeats
+            # stop (the run process exits to await the decision), so without this flag the
+            # light would drift to red and read identically to a hang. Latch it; any later
+            # progress (the resuming run) clears it.
+            self.awaiting_decision = (data.get("status") == "paused")
         elif name == Ev.ANOMALY:
             self.last_anomaly = {"stage": ev.stage, "time": ev.time, **data}
         elif name == Ev.CHECK_IN:
@@ -168,8 +218,22 @@ class DashboardState:
             status = data.get("status", "completed")
             self.run_status = _TERMINAL_BY_STATUS.get(status, status)
             self.ended_iso = ev.time
+            self.awaiting_decision = False
 
         return self._wire(ev, data)
+
+    def _mark_progress(self, iso: Optional[str]) -> None:
+        if iso:
+            self.last_progress_iso = iso
+
+    def _clear_alarm(self) -> None:
+        """Fresh forward progress arrived → the run is moving again. Clear a paused seam,
+        promote IDLE→RUNNING (the run is observably live), and un-latch a prior stall (if a
+        stall guard self-recovered within the stage) — so the light reflects the data, not a
+        stale status. Never resurrects a TERMINAL run (completed/reverted/aborted)."""
+        self.awaiting_decision = False
+        if self.run_status in (RUN_IDLE, RUN_STALLED):
+            self.run_status = RUN_RUNNING
 
     def _ingest_patch_read(self, ev: Event, data: dict[str, Any]) -> None:
         ok = bool(data.get("ok"))
@@ -185,16 +249,20 @@ class DashboardState:
 
         xy = data.get("xy")
         Y = data.get("Y")
-        enriched = {}
-        if ok and xy and len(xy) >= 2:
+        has_xy = bool(xy) and len(xy) >= 2 and _as_float(xy[0]) is not None and _as_float(xy[1]) is not None
+        enriched: dict[str, Any] = {}
+        if ok and has_xy:
             enriched = neutral_metrics(float(xy[0]), float(xy[1]))
+            self._mark_progress(ev.time)   # a good read is forward progress
+            self._clear_alarm()
         self.last_read = {
             "seq": data.get("seq"), "role": data.get("role"), "label": data.get("label"),
             "rgb": data.get("rgb"), "Y": Y, "xy": xy, "ok": ok,
             "disposition": data.get("disposition"), **enriched,
         }
-        # The most recent neutral read drives the live white-point readout.
-        if ok and xy and _is_neutral(data.get("rgb")):
+        # The most recent neutral read drives the live white-point readout (needs a usable xy
+        # so the readout shape stays consistent with the enrichment gate above).
+        if ok and has_xy and _is_neutral(data.get("rgb")):
             self.last_white = {"xy": xy, "Y": Y, "rgb": data.get("rgb"), **enriched}
 
     def _ingest_metrics(self, ev: Event, data: dict[str, Any]) -> None:
@@ -226,7 +294,9 @@ class DashboardState:
         if ev.event == Ev.PATCH_READ:
             xy = data.get("xy")
             if data.get("ok") and xy and len(xy) >= 2:
-                out["derived"] = neutral_metrics(float(xy[0]), float(xy[1]))
+                x, y = _as_float(xy[0]), _as_float(xy[1])
+                if x is not None and y is not None:
+                    out["derived"] = neutral_metrics(x, y)
         return out
 
     # ----------------------------------------------------------------------
@@ -249,34 +319,70 @@ class DashboardState:
             return None
         return dt / dp
 
+    def _progress_age(self, now: datetime) -> Optional[float]:
+        """Seconds since the run last made REAL forward progress (a good read, a completed
+        iteration, a soak block, a stage boundary). Distinct from event-age: heartbeats keep
+        event-age fresh during a wedge, but progress-age keeps growing — that gap is exactly
+        the 53-min "alive but stuck" failure. Two estimates of the same quantity; take the
+        smaller (the more recent progress wins):
+
+        * **events** — ``now - last_progress_iso`` (fresh, but blind to the silent soak,
+          which emits no patch/progress events).
+        * **heartbeat** — the producer's monotonic ``since_progress_s`` (authoritative; reset
+          by soak blocks too) carried forward by the age of that heartbeat.
+        """
+        candidates: list[float] = []
+        lp = _parse_iso(self.last_progress_iso)
+        if lp is not None:
+            candidates.append(max(0.0, (now - lp).total_seconds()))
+        hb = self.last_heartbeat
+        hb_t = _parse_iso(hb.get("time")) if hb else None
+        since = hb.get("since_progress_s") if hb else None
+        if hb_t is not None and since is not None:
+            candidates.append(max(0.0, since + (now - hb_t).total_seconds()))
+        return min(candidates) if candidates else None
+
     def _liveness(self, now: datetime) -> dict[str, Any]:
-        """Judge liveness from the age of the last event, not a socket. During the
-        silent soak the heartbeat keeps the age fresh; if the whole process dies the
-        age grows and the light goes red on its own."""
-        age = None
+        """The light, judged from DATA FRESHNESS (not the socket). Order matters:
+        terminal → done; a paused seam → a calm 'paused' (NOT red — a healthy decision
+        wait, even though heartbeats stop); a tripped stall → red; otherwise weigh
+        event-age (is the process alive at all?) against progress-age (is it actually
+        advancing?). The progress-age arm is what catches an alive-but-wedged run before
+        the producer's own stall fires."""
+        event_age = None
         last = _parse_iso(self.last_event_iso)
         if last is not None:
-            age = max(0.0, (now - last).total_seconds())
+            event_age = max(0.0, (now - last).total_seconds())
+        prog_age = self._progress_age(now)
 
         if self.run_status in _TERMINAL_BY_STATUS.values():
             light = "done"
+        elif self.awaiting_decision:
+            light = "paused"
         elif self.run_status == RUN_STALLED:
             light = "stalled"
-        elif age is None:
+        elif event_age is None:
             light = "unknown"
         else:
             spr = self._rolling_s_per_read()
-            # A generous freshness budget: a few read-intervals, floored so a fast run's
-            # tiny interval doesn't trip on normal jitter, and the heartbeat (≤15 s)
-            # comfortably keeps it green through the soak.
-            budget = max(45.0, (spr or 10.0) * 4.0)
-            if age <= budget:
-                light = "live"
-            elif age <= budget * 3.0:
-                light = "slow"
+            # Event budget: heartbeats arrive ≤15 s apart, so any larger silence means the
+            # process itself is gone — go red. Floored generously against read jitter.
+            event_budget = max(45.0, (spr or 10.0) * 4.0)
+            # Progress budget: prefer the producer's own stall threshold (from the heartbeat)
+            # so the dashboard warns in step with the guard; else a generous default.
+            stall_after = (self.last_heartbeat or {}).get("stall_after_s")
+            prog_budget = stall_after if (stall_after and stall_after > 0) else max(120.0, (spr or 10.0) * 12.0)
+            if event_age > event_budget:
+                light = "stalled"            # no heartbeat even → process likely dead
+            elif prog_age is not None and prog_age > prog_budget:
+                light = "stalled"            # alive but past the stall threshold (guard should fire ~now)
+            elif prog_age is not None and prog_age > 0.5 * prog_budget:
+                light = "slow"               # alive but not advancing — the early wedge warning
             else:
-                light = "stalled"
-        return {"light": light, "age_s": round(age, 1) if age is not None else None,
+                light = "live"
+        return {"light": light,
+                "age_s": round(event_age, 1) if event_age is not None else None,
+                "progress_age_s": round(prog_age, 1) if prog_age is not None else None,
                 "last_event_iso": self.last_event_iso, "last_read_iso": self.last_read_iso}
 
     def snapshot(self, now: Optional[datetime] = None) -> dict[str, Any]:

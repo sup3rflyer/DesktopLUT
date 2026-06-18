@@ -77,8 +77,11 @@ function renderState(s) {
   // liveness
   const lv = s.liveness || {};
   const dot = $("live-dot");
-  dot.className = "dot " + (lv.light || "unknown");
-  $("live-text").textContent = lv.light || "—";
+  const light = lv.light || "unknown";
+  dot.className = "dot " + light;
+  const LIVE_LABEL = { live: "live", slow: "not advancing", stalled: "STALLED",
+                       paused: "paused (awaiting decision)", done: "done", unknown: "—" };
+  $("live-text").textContent = LIVE_LABEL[light] || light;
   $("live-age").textContent = (lv.age_s !== null && lv.age_s !== undefined) ? `${num(lv.age_s, 0)}s ago` : "";
 
   // phase header
@@ -102,6 +105,11 @@ function renderState(s) {
   $("t-eta").textContent = (st === "running") ? fmtDur(t.eta_s) : "—";
   $("t-sread").textContent = (t.s_per_read != null) ? num(t.s_per_read, 2) + "s" : "—";
   $("t-spatch").textContent = (t.s_per_patch != null) ? num(t.s_per_patch, 1) + "s" : "—";
+  // "since progress" — the wedge tell: it keeps growing if the run is alive but stuck,
+  // and is coloured by the liveness verdict so a syscall wedge is visible before the stall.
+  const tp = $("t-progress");
+  tp.textContent = (lv.progress_age_s != null) ? fmtDur(lv.progress_age_s) : "—";
+  tp.className = light === "stalled" ? "prog-stalled" : (light === "slow" ? "prog-slow" : "");
 
   // dE big-numbers (from the scoring stage)
   const de = s.de || {};

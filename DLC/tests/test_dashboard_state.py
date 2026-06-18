@@ -135,3 +135,111 @@ def test_run_done_freezes_the_run_clock():
     # Querying much later must not keep advancing run_elapsed past the end.
     snap = st.snapshot(T0 + timedelta(seconds=9999))
     assert abs(snap["timers"]["run_elapsed_s"] - 120.0) < 1.0
+
+
+def test_paused_seam_shows_paused_not_stalled():
+    """A healthy human-in-the-loop pause: the process exits to await a decision, so
+    heartbeats STOP and event-age grows — but it must read 'paused' (calm), never
+    'stalled' (red). This is the highest-value false-red fix from the audit."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="verify"))
+    st.ingest(_ev(Ev.SEAM, t=T0, stage="verify", key="verify:accept", status="paused"))
+    # Minutes later, with no further events, it stays paused — not red.
+    assert st.snapshot(T0 + timedelta(seconds=900))["liveness"]["light"] == "paused"
+    # The resuming run makes progress → the pause clears and it goes live again.
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=905), stage="verify", tier="stream",
+                  seq=0, rgb=[128, 128, 128], xy=[0.31, 0.33], Y=10.0, ok=True))
+    assert st.snapshot(T0 + timedelta(seconds=906))["liveness"]["light"] == "live"
+
+
+def test_alive_but_wedged_goes_amber_then_red_while_heartbeats_continue():
+    """The 53-min failure shape: the process is alive (heartbeats keep coming) but makes
+    NO progress. Event-age stays fresh, yet the light must warn — progress-age is the
+    signal. With the producer's stall threshold on the heartbeat, amber crosses at half
+    the threshold and red at the threshold."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="build-install-3dlut"))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="build-install-3dlut", tier="stream",
+                  seq=0, rgb=[128, 128, 128], xy=[0.31, 0.33], Y=10.0, ok=True))
+    # Heartbeats keep arriving (process alive) but since_progress climbs; threshold 600 s.
+    def beat(at, since):
+        st.ingest(_ev(Ev.HEARTBEAT, t=T0 + timedelta(seconds=at), stage="build-install-3dlut",
+                      level="DEBUG", tier="stream", since_progress_s=float(since),
+                      stall_after_s=600.0, elapsed_s=float(at)))
+    beat(60, 60)
+    assert st.snapshot(T0 + timedelta(seconds=60))["liveness"]["light"] == "live"      # fresh progress
+    beat(360, 360)   # past half the 600 s threshold → early wedge warning
+    assert st.snapshot(T0 + timedelta(seconds=360))["liveness"]["light"] == "slow"
+    beat(620, 620)   # past the threshold → red (the guard should be firing about now)
+    assert st.snapshot(T0 + timedelta(seconds=620))["liveness"]["light"] == "stalled"
+
+
+def test_soak_with_heartbeats_stays_live_even_without_patch_reads():
+    """A healthy silent soak: no patch_read/progress events, but heartbeats carry a SMALL
+    since_progress (soak blocks reset the producer's clock). Must stay green — not a false
+    amber/red just because the patch firehose went quiet."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:raw"))
+    # 10 minutes of soak: only heartbeats, each with a tiny since_progress.
+    for at in range(15, 600, 15):
+        st.ingest(_ev(Ev.HEARTBEAT, t=T0 + timedelta(seconds=at), stage="measure:raw",
+                      level="DEBUG", tier="stream", since_progress_s=5.0,
+                      stall_after_s=600.0, elapsed_s=float(at)))
+    assert st.snapshot(T0 + timedelta(seconds=600))["liveness"]["light"] == "live"
+
+
+def test_stall_unlatches_on_fresh_progress():
+    """If a stall fired but the run kept going (guard self-recovered within the stage),
+    a subsequent good read clears the latched red."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure"))
+    st.ingest(_ev(Ev.STALL, t=T0 + timedelta(seconds=1), stage="measure", level="ERROR",
+                  message="no progress", via="checkpoint"))
+    assert st.snapshot(T0 + timedelta(seconds=1))["run_status"] == "stalled"
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=2), stage="measure", tier="stream",
+                  seq=0, rgb=[128, 128, 128], xy=[0.31, 0.33], Y=10.0, ok=True))
+    assert st.snapshot(T0 + timedelta(seconds=2))["run_status"] == "running"
+
+
+def test_eta_window_resets_at_stage_boundary():
+    """ETA/s-per-patch must not be computed across a stage reset (patches_done restarts at
+    ~0), which otherwise yields a wildly wrong number."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="stage_a"))
+    st.ingest(_ev(Ev.PROGRESS, t=T0, stage="stage_a", patches_done=0, patches_total=50))
+    st.ingest(_ev(Ev.PROGRESS, t=T0 + timedelta(seconds=80), stage="stage_a",
+                  patches_done=40, patches_total=50))   # 2 s/patch
+    # New stage: counters restart. The old marks must be discarded.
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=90), stage="stage_b"))
+    st.ingest(_ev(Ev.PROGRESS, t=T0 + timedelta(seconds=90), stage="stage_b",
+                  patches_done=0, patches_total=10))
+    st.ingest(_ev(Ev.PROGRESS, t=T0 + timedelta(seconds=110), stage="stage_b",
+                  patches_done=4, patches_total=10))    # 5 s/patch, 6 remaining ⇒ ~30 s
+    snap = st.snapshot(T0 + timedelta(seconds=110))
+    assert abs(snap["timers"]["s_per_patch"] - 5.0) < 0.6   # NOT contaminated by stage_a
+    assert abs(snap["timers"]["eta_s"] - 30.0) < 5.0
+
+
+def test_tz_aware_timestamp_does_not_crash_snapshot():
+    """A tz-aware producer timestamp must not raise (it would be swallowed and silently
+    freeze the dashboard) — it's normalised to naive."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(Event(level="INFO", stage="measure", event=Ev.STAGE_START, data={},
+                    time="2026-06-18T12:00:30+00:00"))
+    snap = st.snapshot(T0 + timedelta(seconds=60))   # must not raise
+    assert snap["run_status"] in ("running", "idle")
+
+
+def test_malformed_progress_event_does_not_crash():
+    """A PROGRESS with null counters (a drifted/partial producer) must not raise."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure"))
+    st.ingest(_ev(Ev.PROGRESS, t=T0, stage="measure",
+                  patches_done=None, patches_total="oops"))
+    snap = st.snapshot(T0)   # must not raise
+    assert snap["counters"]["patches_done"] == 0

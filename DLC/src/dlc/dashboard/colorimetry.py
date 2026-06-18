@@ -68,14 +68,22 @@ def xy_to_uv60(x: float, y: float) -> Optional[Tuple[float, float]]:
     return (4.0 * x / denom, 6.0 * y / denom)
 
 
+# A CCT is only meaningful near the Planckian locus. Robertson will "bracket" (and so
+# report a temperature for) points far off the locus too, but their Duv is implausibly
+# large — a real display white sits within a few ×1e-3 of the locus. Past this band we
+# return None so a stray coloured patch mislabeled neutral shows a dash, not a junk CCT.
+_MAX_PLAUSIBLE_DUV = 0.05
+
+
 def cct_duv(x: float, y: float) -> Optional[Tuple[float, float]]:
     """Correlated colour temperature (K) and Duv from CIE 1931 ``xy`` via Robertson.
 
     ``Duv`` is the signed distance from the Planckian locus in CIE 1960 UCS: positive
     above the locus (toward green), negative below (toward magenta) — the same
     convention calibration tools use for "tint". Returns ``None`` when the point is a
-    degenerate chromaticity or falls outside the table's locus span (i.e. no meaningful
-    CCT) so callers can render a clean dash instead of a bogus number.
+    degenerate chromaticity, never brackets the locus, or sits implausibly far from it
+    (``|Duv| > _MAX_PLAUSIBLE_DUV``) — so a non-neutral colour reads as a clean dash
+    rather than a confident but meaningless temperature.
     """
     uv = xy_to_uv60(x, y)
     if uv is None:
@@ -101,6 +109,8 @@ def cct_duv(x: float, y: float) -> Optional[Tuple[float, float]]:
             lu = pu + frac * (ui - pu)
             lv = pv + frac * (vi - pv)
             duv = math.hypot(u - lu, v - lv)
+            if duv > _MAX_PLAUSIBLE_DUV:
+                return None             # too far off the locus for a CCT to mean anything
             duv = math.copysign(duv, v - lv)
             return (cct, duv)
         last_d = di

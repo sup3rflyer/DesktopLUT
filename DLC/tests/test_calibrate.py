@@ -185,6 +185,47 @@ def test_verify_emits_scored_metrics_onto_the_spine(tmp_path: Path):
     assert scored[-1] in digest_projection(events)
 
 
+def test_verify_aborts_cleanly_on_empty_ti3(tmp_path: Path):
+    """A fully-failed verify can leave a TI3 with no usable rows. Scoring raises on an
+    empty set; stage_verify must turn that into a CLEAN abort (CalibrationAborted →
+    stage_aborted), never an uncaught exception that escapes with the spine still
+    'running' and no terminal marker."""
+    import pytest as _pytest
+
+    from dlc.calibrate import CalibrationAborted
+
+    calib = _make(tmp_path, "emptyverify")
+    calib.target_name = "srgb_g22"
+    calib.calib["target"] = "srgb_g22"
+    ti3 = tmp_path / "empty.ti3"
+    ti3.write_text("BEGIN_DATA_FORMAT\nRGB_R RGB_G RGB_B XYZ_X XYZ_Y XYZ_Z\n"
+                   "END_DATA_FORMAT\nBEGIN_DATA\nEND_DATA\n", encoding="utf-8")
+    with _pytest.raises(CalibrationAborted) as ei:
+        calib.stage_verify(str(ti3))
+    assert "no usable measurements" in (ei.value.outcome.digest or {}).get("message", "")
+
+
+def test_characterize_emits_terminal_run_done(tmp_path: Path):
+    """The characterize flow bypasses _finish(); without an explicit run_done the
+    dashboard liveness light would hang on 'running' after a completed characterization."""
+    calib = _make(tmp_path, "char_done", characterize_config=_CHAR)
+    calib.run("characterize")
+    events = read_events(calib.ctx.events_path)
+    assert events[-1].event == Ev.RUN_DONE
+    assert events[-1].data.get("status") == "completed"
+
+
+def test_build_correction_emits_terminal_run_done(tmp_path: Path):
+    """build-correction also bypasses _finish(); it must still post a terminal run_done."""
+    calib = _make(tmp_path, "bc_done")
+    Path(calib._probe_match_commands()["ccmx_out"]).write_text("CCMX\n0.99 0 0\n", encoding="utf-8")
+    result = calib.run("build-correction")
+    assert result.status == "completed"
+    events = read_events(calib.ctx.events_path)
+    assert events[-1].event == Ev.RUN_DONE
+    assert events[-1].data.get("status") == "completed"
+
+
 def test_build_probe_aborts_instead_of_poisoning_with_black(tmp_path: Path):
     """A probe read that fails even after retries must abort the build — NEVER fold a
     (0,0,0) reading into the cube (optimize folds the probe response into the training

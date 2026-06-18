@@ -46,7 +46,12 @@ body {
 .dot.slow { background: var(--slow); }
 .dot.stalled { background: var(--bad); animation: pulse-bad 1s infinite; }
 .dot.done { background: var(--done); }
+.dot.paused { background: var(--accent); animation: pulse-paused 2.4s infinite; }
 .dot.unknown { background: var(--ink-faint); }
+@keyframes pulse-paused { 0% { box-shadow: 0 0 0 0 rgba(88,166,255,.45); } 70% { box-shadow: 0 0 0 7px rgba(88,166,255,0); } 100% { box-shadow: 0 0 0 0 rgba(88,166,255,0); } }
+/* "since progress" turns amber/red when the run is alive but not advancing (the wedge tell) */
+b.prog-slow { color: var(--warn); }
+b.prog-stalled { color: var(--bad); }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(63,185,80,.5); } 70% { box-shadow: 0 0 0 7px rgba(63,185,80,0); } 100% { box-shadow: 0 0 0 0 rgba(63,185,80,0); } }
 @keyframes pulse-bad { 0% { box-shadow: 0 0 0 0 rgba(248,81,73,.6); } 70% { box-shadow: 0 0 0 8px rgba(248,81,73,0); } 100% { box-shadow: 0 0 0 0 rgba(248,81,73,0); } }
 .live-text { font-family: var(--mono); font-size: 12px; }
