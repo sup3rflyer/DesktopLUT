@@ -565,6 +565,61 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     // Keep hwnd - we'll reuse it
 }
 
+// Re-acquire a monitor's LUT textures from its persisted cube paths when a GPU-resource
+// reinit dropped them. Idempotent: a no-op when the SRV is already valid or no path is
+// configured, so it is safe (and cheap) to call on every duplication reinit — including
+// the constant refresh-rate modesets video players trigger. Without this, a reinit that
+// invalidates lutSRV_SDR/lutSRV_HDR leaves the overlay deriving usePassthrough from a null
+// SRV → auto-sleep → the just-applied cube silently stops rendering until a full restart
+// (see OVERLAY_LUT_RELOAD_BUG.md). Returns true if any LUT was reloaded.
+bool EnsureMonitorLutTextures(MonitorContext* ctx) {
+    bool reloaded = false;
+
+    if (!ctx->sdrLutPath.empty() && ctx->lutSRV_SDR == nullptr) {
+        std::vector<float> data;
+        int size = 0;
+        if (LoadLUT(ctx->sdrLutPath, data, size) && !data.empty()) {
+            // Defensive: release any orphaned texture before recreating to avoid a leak
+            // if the SRV/texture pair was left half-released.
+            if (ctx->lutTextureSDR) { ctx->lutTextureSDR->Release(); ctx->lutTextureSDR = nullptr; }
+            if (CreateLUTTexture(data, size, &ctx->lutTextureSDR, &ctx->lutSRV_SDR)) {
+                ctx->lutSizeSDR = size;
+                reloaded = true;
+                std::wcout << L"[LUT] Reloaded SDR cube for monitor " << ctx->index
+                           << L" after reinit: " << ctx->sdrLutPath << std::endl;
+            } else {
+                std::cerr << "[LUT] Failed to recreate SDR LUT texture for monitor "
+                          << ctx->index << " after reinit" << std::endl;
+            }
+        } else {
+            std::wcerr << L"[LUT] Failed to reload SDR cube for monitor " << ctx->index
+                       << L": " << ctx->sdrLutPath << std::endl;
+        }
+    }
+
+    if (!ctx->hdrLutPath.empty() && ctx->lutSRV_HDR == nullptr) {
+        std::vector<float> data;
+        int size = 0;
+        if (LoadLUT(ctx->hdrLutPath, data, size) && !data.empty()) {
+            if (ctx->lutTextureHDR) { ctx->lutTextureHDR->Release(); ctx->lutTextureHDR = nullptr; }
+            if (CreateLUTTexture(data, size, &ctx->lutTextureHDR, &ctx->lutSRV_HDR)) {
+                ctx->lutSizeHDR = size;
+                reloaded = true;
+                std::wcout << L"[LUT] Reloaded HDR cube for monitor " << ctx->index
+                           << L" after reinit: " << ctx->hdrLutPath << std::endl;
+            } else {
+                std::cerr << "[LUT] Failed to recreate HDR LUT texture for monitor "
+                          << ctx->index << " after reinit" << std::endl;
+            }
+        } else {
+            std::wcerr << L"[LUT] Failed to reload HDR cube for monitor " << ctx->index
+                       << L": " << ctx->hdrLutPath << std::endl;
+        }
+    }
+
+    return reloaded;
+}
+
 void ReleaseSharedD3DResources() {
     if (g_dcompDevice) { g_dcompDevice->Release(); g_dcompDevice = nullptr; }
     if (g_blueNoiseSRV) { g_blueNoiseSRV->Release(); g_blueNoiseSRV = nullptr; }

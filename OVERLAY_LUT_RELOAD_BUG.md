@@ -1,6 +1,23 @@
 # Bug report: overlay drops the 3D-LUT after a fullscreen-exclusive app exits (cube not reloaded on reinit)
 
-**Status:** open · **Component:** render thread / DWM overlay · **Severity:** functional (calibration not live until restart)
+**Status:** FIXED 2026-06-18 (fix A) · **Component:** render thread / DWM overlay · **Severity:** functional (calibration not live until restart)
+
+> **Resolution (fix A).** Added `EnsureMonitorLutTextures(ctx)` (`gpu.cpp`/`gpu.h`): reloads
+> `lutSRV_SDR`/`lutSRV_HDR` from the persisted `ctx.sdrLutPath`/`ctx.hdrLutPath` when a reinit
+> dropped them. Idempotent — a no-op when the SRV is already valid or no path is configured.
+> `ReinitDesktopDuplication` (`capture.cpp`) now calls it after `InitDesktopDuplication` and
+> **re-derives `usePassthrough` on every reinit** (previously only on an SDR↔HDR change), so a
+> reinit that settles the monitor back to SDR with a valid cube re-wakes the overlay. All three
+> reinit routes (ACCESS_LOST recovery, `g_forceReinit`, capture-format-change) funnel through
+> `ReinitDesktopDuplication`, so the single chokepoint covers them. The regression guard holds:
+> plain refresh-rate modesets that don't lose duplication never reach it, and when they do the
+> reload is skipped (SRV still valid) and the `usePassthrough` recompute is a pointer compare —
+> no disk read, no LUT re-upload.
+>
+> **Cosmetic fix (below) also done.** `DoSet3dlut`/`DoClear3dlut` (`desktoplut_ipc_server.cpp`)
+> now refresh the GUI's SDR/HDR LUT box (`SetPathText`) when the affected monitor is the one
+> currently shown, so a pipe-applied cube is visible without a restart. Safe because mutating
+> methods run on the GUI thread (dispatched via `WM_CALIB_CMD`).
 **Found:** 2026-06-17, during the DLC calibrator's first SDR 3D-LUT hardware run.
 **Audience:** a DesktopLUT (C++) session. This report is self-contained; no DLC context needed.
 

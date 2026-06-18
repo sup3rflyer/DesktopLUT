@@ -17,6 +17,10 @@ bool CheckTearingSupport();
 // Release D3D resources for a specific monitor
 void ReleaseMonitorD3DResources(MonitorContext* ctx);
 
+// Reload a monitor's LUT textures from its persisted cube paths when a reinit dropped them.
+// Idempotent (no-op when the SRV is valid or no path is set). Returns true if any reloaded.
+bool EnsureMonitorLutTextures(MonitorContext* ctx);
+
 // Release all shared D3D resources
 void ReleaseSharedD3DResources();
 

@@ -19,6 +19,7 @@
 #include "types.h"
 #include "globals.h"
 #include "gui_mhc.h"
+#include "gui_shared.h"
 #include "mhc.h"
 #include "displayconfig.h"
 #include "settings.h"
@@ -885,6 +886,13 @@ void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     }
     SaveSettings();
     ReapplyProcessing();
+    // Reflect the pipe-applied path in the GUI's LUT box so an operator sees it without a
+    // restart. Safe to touch the controls directly: mutating methods run on the GUI thread
+    // (dispatched via WM_CALIB_CMD). Only refresh when the affected monitor is the one
+    // currently shown, otherwise we'd overwrite another monitor's box.
+    if (mon == g_gui.currentMonitor) {
+        SetPathText(isHDR ? g_gui.hwndHdrPath : g_gui.hwndSdrPath, cube.c_str());
+    }
     JsonValue rt = JObj();
     rt.set("cube_path", JStr(WideToUtf8(cube)));
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
@@ -901,6 +909,9 @@ void DoClear3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     }
     SaveSettings();
     ReapplyProcessing();
+    if (mon == g_gui.currentMonitor) {
+        SetPathText(isHDR ? g_gui.hwndHdrPath : g_gui.hwndSdrPath, L"");
+    }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("runtime", JObj());
 }

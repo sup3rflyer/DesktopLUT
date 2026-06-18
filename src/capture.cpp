@@ -4,6 +4,7 @@
 #include "capture.h"
 #include "globals.h"
 #include "render.h"
+#include "gpu.h"
 #include "displayconfig.h"
 #include <iostream>
 #include <iomanip>
@@ -172,16 +173,27 @@ bool ReinitDesktopDuplication(MonitorContext* ctx) {
         return false;
     }
 
-    // Check if HDR state changed and trigger swapchain recreation
+    // Re-acquire any configured cube that this reinit (or a prior GPU-resource reinit) may
+    // have dropped. Must run before deriving usePassthrough below — that flag is the
+    // overlay's "this monitor's cube is live" signal, and deriving it from a null SRV
+    // without first restoring the cube is what silently dropped the LUT and auto-slept the
+    // overlay after a fullscreen-exclusive app exit (see OVERLAY_LUT_RELOAD_BUG.md).
+    EnsureMonitorLutTextures(ctx);
+
+    // Re-derive passthrough every reinit (not only on HDR change): a duplication reinit can
+    // settle the monitor back into SDR with a valid SDR cube after a transient HDR/format
+    // excursion, and usePassthrough must follow the current mode's SRV so the overlay wakes
+    // again. Passthrough if no applicable LUT for current mode:
+    // - SDR mode: need SDR LUT (SDR LUTs expect sRGB input)
+    // - HDR mode: need HDR LUT (HDR LUTs expect PQ Rec.2020 input)
+    // No fallback - SDR and HDR LUTs are incompatible.
+    bool hasApplicableLUT = ctx->isHDREnabled
+        ? (ctx->lutSRV_HDR != nullptr)
+        : (ctx->lutSRV_SDR != nullptr);
+    ctx->usePassthrough = !hasApplicableLUT;
+
+    // Only the SDR<->HDR transition needs a new swapchain (different backbuffer format).
     if (ctx->isHDREnabled != wasHDR) {
-        // Passthrough if no applicable LUT for current mode:
-        // - SDR mode: need SDR LUT (SDR LUTs expect sRGB input)
-        // - HDR mode: need HDR LUT (HDR LUTs expect PQ Rec.2020 input)
-        // No fallback - SDR and HDR LUTs are incompatible
-        bool hasApplicableLUT = ctx->isHDREnabled
-            ? (ctx->lutSRV_HDR != nullptr)
-            : (ctx->lutSRV_SDR != nullptr);
-        ctx->usePassthrough = !hasApplicableLUT;
         RecreateSwapchain(ctx);
     }
 
