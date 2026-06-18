@@ -117,6 +117,20 @@ def cct_duv(x: float, y: float) -> Optional[Tuple[float, float]]:
     return None
 
 
+def uv60_to_xy(u: float, v: float) -> Tuple[float, float]:
+    """CIE 1960 UCS ``(u, v)`` → CIE 1931 ``xy`` (inverse of :func:`xy_to_uv60`)."""
+    denom = 2.0 * u - 8.0 * v + 4.0
+    if abs(denom) < 1e-12:
+        return (0.0, 0.0)
+    return (3.0 * u / denom, 2.0 * v / denom)
+
+
+def planckian_locus_xy() -> list[Tuple[float, float]]:
+    """The Planckian locus as CIE 1931 ``xy`` points (from the Robertson table, warm→cool),
+    for the dashboard's CIE chart. Stdlib-only, so the chart needs no colour-science."""
+    return [uv60_to_xy(u, v) for (_mired, u, v, _t) in reversed(_ROBERTSON)]
+
+
 def neutral_metrics(x: float, y: float) -> dict:
     """A compact CCT/Duv payload for one chromaticity, shaped for the wire.
 

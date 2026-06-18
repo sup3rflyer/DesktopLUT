@@ -243,3 +243,53 @@ def test_malformed_progress_event_does_not_crash():
                   patches_done=None, patches_total="oops"))
     snap = st.snapshot(T0)   # must not raise
     assert snap["counters"]["patches_done"] == 0
+
+
+# ---------------------------------------------------------------------------
+# chart accumulators (Phase 5)
+# ---------------------------------------------------------------------------
+
+def _read(st, at, rgb, xy, Y, *, signal=None, role="measurement"):
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=at), stage="measure", tier="stream",
+                  seq=at, role=role, rgb=rgb, signal=signal, xy=xy, Y=Y, ok=True))
+
+
+def test_charts_accumulate_cie_grayscale_and_drift():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure"))
+    # a couple of neutral (grayscale) reads + one colour read
+    _read(st, 1, [128, 128, 128], [0.312, 0.329], 40.0, signal=[0.5, 0.5, 0.5])
+    _read(st, 2, [255, 255, 255], [0.313, 0.329], 120.0, signal=[1.0, 1.0, 1.0])
+    _read(st, 3, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0])
+    ch = st.charts()
+    assert len(ch["cie"]["points"]) == 3            # every good read scatters
+    assert ch["cie"]["white"] == [0.3127, 0.329]
+    assert len(ch["cie"]["locus"]) == 31
+    # grayscale keyed by signal level (neutrals only) → 2 steps, sorted
+    assert [g["signal"] for g in ch["grayscale"]] == [0.5, 1.0]
+    assert ch["eotf"]["gamma"] == 2.2 and len(ch["eotf"]["points"]) == 2
+    # drift/white track only follows neutral reads
+    assert len(ch["white_track"]) == 2
+    assert all(w["elapsed_s"] is not None for w in ch["white_track"])
+
+
+def test_grayscale_latest_measurement_wins_per_level():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", white={"xy": [0.3127, 0.329]}))
+    _read(st, 1, [128, 128, 128], [0.30, 0.34], 40.0, signal=[0.5, 0.5, 0.5])
+    _read(st, 9, [128, 128, 128], [0.313, 0.329], 41.0, signal=[0.5, 0.5, 0.5])  # re-measure
+    gray = st.charts()["grayscale"]
+    assert len(gray) == 1
+    assert gray[0]["x"] == 0.313     # the later read overwrote the earlier one
+
+
+def test_optimizer_history_accumulates():
+    st = DashboardState()
+    for i in range(3):
+        st.ingest(_ev(Ev.OPTIMIZER_ITER, t=T0 + timedelta(seconds=i), stage="optimize",
+                      iteration=i, measured_mean_de=1.0 - 0.2 * i, measured_max_de=2.0 - 0.3 * i))
+    opt = st.charts()["optimizer"]
+    assert [r["iteration"] for r in opt] == [0, 1, 2]
+    assert opt[-1]["measured_max_de"] == 2.0 - 0.6

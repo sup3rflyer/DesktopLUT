@@ -110,7 +110,7 @@ def test_sse_primes_with_state_then_streams(tmp_path):
         httpd.shutdown()
 
 
-def test_export_writes_snapshot_to_reports(tmp_path):
+def test_export_writes_html_report_to_reports(tmp_path):
     hub = _hub_with_events(tmp_path)
     httpd, base = _serve(hub)
     try:
@@ -119,7 +119,28 @@ def test_export_writes_snapshot_to_reports(tmp_path):
         payload = json.loads(body)
         saved = payload["saved_to"]
         assert saved and Path(saved).exists()
-        assert Path(saved).parent.name == "reports"
+        assert Path(saved).name.endswith(".html") and Path(saved).parent.name == "reports"
+        html = Path(saved).read_text(encoding="utf-8")
+        # self-contained: inlines the chart renderer + embeds data + shows the summary
+        assert "DLCCharts" in html
+        assert 'data-chart="cie"' in html
+        assert "srgb_g22" in html               # the target made it into the summary
+        # the JSON sidecar is written too
+        assert Path(payload["json_saved_to"]).exists()
+    finally:
+        httpd.shutdown()
+
+
+def test_api_charts_returns_chart_datasets(tmp_path):
+    hub = _hub_with_events(tmp_path)   # has one neutral white read
+    httpd, base = _serve(hub)
+    try:
+        status, body = _get(base + "/api/charts")
+        assert status == 200
+        ch = json.loads(body)
+        assert set(ch) >= {"cie", "grayscale", "eotf", "optimizer", "white_track"}
+        assert len(ch["cie"]["points"]) == 1            # the one good read
+        assert len(ch["cie"]["locus"]) == 31            # Planckian locus always present
     finally:
         httpd.shutdown()
 

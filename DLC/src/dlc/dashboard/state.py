@@ -19,7 +19,10 @@ from datetime import datetime
 from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
-from .colorimetry import neutral_metrics
+from .colorimetry import neutral_metrics, planckian_locus_xy
+
+# The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
+_SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -141,6 +144,13 @@ class DashboardState:
     _read_times: Deque[datetime] = field(default_factory=lambda: deque(maxlen=80))
     _progress_marks: Deque[tuple] = field(default_factory=lambda: deque(maxlen=80))
 
+    # chart accumulators (bounded; served via /api/charts, OFF the fast SSE path so the 2 s
+    # state push stays lean while the scatter can grow to thousands of points)
+    _cie_points: Deque[dict] = field(default_factory=lambda: deque(maxlen=5000))
+    _grayscale: dict = field(default_factory=dict)          # signal-level → latest neutral sample
+    _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
+    _optimizer_history: list = field(default_factory=list)
+
     # ----------------------------------------------------------------------
     def ingest(self, ev: Event) -> dict[str, Any]:
         """Fold one event into the state; return its enriched wire form (for the log)."""
@@ -198,6 +208,9 @@ class DashboardState:
             self._mark_progress(ev.time)
         elif name == Ev.OPTIMIZER_ITER:
             self.optimizer = dict(data)
+            self._optimizer_history.append(dict(data))
+            if len(self._optimizer_history) > 256:
+                self._optimizer_history = self._optimizer_history[-256:]
             self._mark_progress(ev.time)
             self._clear_alarm()
         elif name == Ev.SEAM:
@@ -255,6 +268,7 @@ class DashboardState:
             enriched = neutral_metrics(float(xy[0]), float(xy[1]))
             self._mark_progress(ev.time)   # a good read is forward progress
             self._clear_alarm()
+            self._accumulate_charts(ev, data, float(xy[0]), float(xy[1]), Y, enriched)
         self.last_read = {
             "seq": data.get("seq"), "role": data.get("role"), "label": data.get("label"),
             "rgb": data.get("rgb"), "Y": Y, "xy": xy, "ok": ok,
@@ -264,6 +278,30 @@ class DashboardState:
         # so the readout shape stays consistent with the enrichment gate above).
         if ok and has_xy and _is_neutral(data.get("rgb")):
             self.last_white = {"xy": xy, "Y": Y, "rgb": data.get("rgb"), **enriched}
+
+    def _elapsed_at(self, iso: Optional[str]) -> Optional[float]:
+        t, start = _parse_iso(iso), _parse_iso(self.run_started_iso)
+        if t is None or start is None:
+            return None
+        return round(max(0.0, (t - start).total_seconds()), 1)
+
+    def _accumulate_charts(self, ev: Event, data: dict[str, Any], x: float, y: float,
+                           Y: Any, enriched: dict[str, Any]) -> None:
+        """Fold a good read into the bounded chart datasets (served via /api/charts)."""
+        rgb = data.get("rgb")
+        neutral = _is_neutral(rgb)
+        self._cie_points.append({"x": round(x, 5), "y": round(y, 5),
+                                 "role": data.get("role"), "neutral": neutral})
+        sig = data.get("signal")
+        level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
+        if level is not None:
+            # latest measurement at this grayscale level wins (re-measures overwrite)
+            self._grayscale[round(level, 5)] = {
+                "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
+                "cct": enriched.get("cct"), "duv": enriched.get("duv")}
+        if neutral:
+            self._white_track.append({"elapsed_s": self._elapsed_at(ev.time),
+                                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y})
 
     def _ingest_metrics(self, ev: Event, data: dict[str, Any]) -> None:
         entry = {
@@ -281,6 +319,30 @@ class DashboardState:
         self.de_history.append(entry)
         if len(self.de_history) > 64:
             self.de_history = self.de_history[-64:]
+
+    # ----------------------------------------------------------------------
+    def charts(self) -> dict[str, Any]:
+        """Chart-ready datasets, built from the bounded accumulators. Served via
+        /api/charts (NOT the SSE state) so the heavy scatter stays off the fast path.
+        Everything is already numeric/derived — the browser only draws SVG."""
+        gray = [self._grayscale[k] for k in sorted(self._grayscale)]
+        white = (self.header.get("white") or {}).get("xy")
+        return {
+            "cie": {
+                "points": list(self._cie_points),
+                "white": white,
+                "primaries": _SRGB_PRIMARIES,
+                "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
+            },
+            "grayscale": gray,
+            "eotf": {
+                "gamma": self.header.get("gamma"),
+                "luminance": self.header.get("luminance"),
+                "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
+            },
+            "optimizer": list(self._optimizer_history),
+            "white_track": [w for w in self._white_track if w.get("elapsed_s") is not None],
+        }
 
     # ----------------------------------------------------------------------
     def _wire(self, ev: Event, data: dict[str, Any]) -> dict[str, Any]:

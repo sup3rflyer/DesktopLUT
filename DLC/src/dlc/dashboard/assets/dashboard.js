@@ -272,6 +272,21 @@ function connect() {
   };
 }
 
+/* ── charts (polled off the SSE path; the server precomputes everything) ──── */
+let chartsBusy = false;
+async function refreshCharts() {
+  if (chartsBusy || document.hidden) return;   // skip while a fetch is in flight or tab hidden
+  chartsBusy = true;
+  try {
+    const r = await fetch("/api/charts");
+    const data = await r.json();
+    if (window.DLCCharts) {
+      DLCCharts.renderInto($("charts"), data, lastState ? lastState.header : null);
+    }
+  } catch (e) { /* charts are advisory; ignore a missed poll */ }
+  finally { chartsBusy = false; }
+}
+
 /* ── controls + filters ──────────────────────────────────────── */
 function wireUi() {
   for (const id of ["filter-level", "filter-stage", "filter-digest", "filter-text"]) {
@@ -282,7 +297,7 @@ function wireUi() {
     try {
       const r = await fetch("/api/export");
       const j = await r.json();
-      toast(j.saved_to ? `snapshot → ${j.saved_to.split(/[\\/]/).pop()}` : "snapshot exported");
+      toast(j.saved_to ? `report → ${j.saved_to.split(/[\\/]/).pop()}` : "report exported");
     } catch (e) {
       toast("export failed");
     } finally {
@@ -293,3 +308,5 @@ function wireUi() {
 
 wireUi();
 connect();
+refreshCharts();
+setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency

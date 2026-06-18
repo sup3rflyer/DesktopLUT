@@ -1,0 +1,178 @@
+/* DLCCharts — zero-dependency SVG chart builders (HCFR-style).
+ *
+ * Each builder takes server-precomputed data (all numbers; the dashboard does no colour
+ * math) and returns an SVG string. The SAME file renders the live dashboard and the
+ * exported standalone report, so there is one source of truth for the visuals. */
+"use strict";
+(function (global) {
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const fmt = (n, d) => (n == null || Number.isNaN(Number(n))) ? "" : Number(n).toFixed(d == null ? 2 : d);
+
+  // A linear plotting frame: viewBox W×H, margins, scales, grid + tick labels.
+  function Plot(o) {
+    const W = o.w || 360, H = o.h || 260;
+    const m = { l: o.ml == null ? 46 : o.ml, r: o.mr == null ? 14 : o.mr,
+                t: o.mt == null ? 12 : o.mt, b: o.mb == null ? 28 : o.mb };
+    const xr = (o.xmax - o.xmin) || 1, yr = (o.ymax - o.ymin) || 1;
+    const px = (x) => m.l + (x - o.xmin) / xr * (W - m.l - m.r);
+    const py = (y) => H - m.b - (y - o.ymin) / yr * (H - m.t - m.b);
+    const parts = [`<rect x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" class="ch-area"/>`];
+    const api = {
+      W, H, px, py,
+      add: (s) => parts.push(s),
+      gridX(ticks, lab) {
+        ticks.forEach((t) => {
+          const X = px(t);
+          parts.push(`<line x1="${X}" y1="${m.t}" x2="${X}" y2="${H - m.b}" class="ch-grid"/>`);
+          parts.push(`<text x="${X}" y="${H - m.b + 14}" class="ch-tick" text-anchor="middle">${esc(lab ? lab(t) : t)}</text>`);
+        });
+      },
+      gridY(ticks, lab) {
+        ticks.forEach((t) => {
+          const Y = py(t);
+          parts.push(`<line x1="${m.l}" y1="${Y}" x2="${W - m.r}" y2="${Y}" class="ch-grid"/>`);
+          parts.push(`<text x="${m.l - 6}" y="${Y + 3}" class="ch-tick" text-anchor="end">${esc(lab ? lab(t) : t)}</text>`);
+        });
+      },
+      pathLine(points, cls) {
+        if (!points || !points.length) return;
+        const d = points.map((p, i) => (i ? "L" : "M") + fmt(px(p[0]), 1) + " " + fmt(py(p[1]), 1)).join(" ");
+        parts.push(`<path d="${d}" class="${cls}" fill="none"/>`);
+      },
+      svg() { return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="chart-svg">${parts.join("")}</svg>`; },
+    };
+    return api;
+  }
+
+  function empty(msg) {
+    return `<svg viewBox="0 0 360 260" class="chart-svg"><text x="180" y="130" text-anchor="middle" class="ch-empty">${esc(msg || "no data yet")}</text></svg>`;
+  }
+  const niceTicks = (lo, hi, n) => {
+    const out = [];
+    for (let i = 0; i <= n; i++) out.push(lo + (hi - lo) * i / n);
+    return out;
+  };
+
+  const DLCCharts = {};
+
+  // ── CIE 1931 chromaticity: measured scatter vs sRGB gamut + Planckian locus + white ──
+  DLCCharts.cie = function (d) {
+    d = d || {};
+    const P = Plot({ w: 380, h: 320, xmin: 0, xmax: 0.75, ymin: 0, ymax: 0.85 });
+    P.gridX([0, 0.2, 0.4, 0.6], (t) => fmt(t, 1));
+    P.gridY([0, 0.2, 0.4, 0.6, 0.8], (t) => fmt(t, 1));
+    if (d.locus && d.locus.length) P.pathLine(d.locus, "ch-locus");
+    const pr = d.primaries || {};
+    if (pr.r && pr.g && pr.b) {
+      const poly = [pr.r, pr.g, pr.b].map((p) => `${fmt(P.px(p[0]), 1)},${fmt(P.py(p[1]), 1)}`).join(" ");
+      P.add(`<polygon points="${poly}" class="ch-gamut"/>`);
+    }
+    const pts = d.points || [];
+    const cap = 2500, step = pts.length > cap ? Math.ceil(pts.length / cap) : 1;
+    for (let i = 0; i < pts.length; i += step) {
+      const p = pts[i];
+      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.5" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"/>`);
+    }
+    if (d.white && d.white.length >= 2)
+      P.add(`<circle cx="${fmt(P.px(d.white[0]), 1)}" cy="${fmt(P.py(d.white[1]), 1)}" r="4.5" class="ch-white"/>`);
+    return P.svg();
+  };
+
+  // ── EOTF / gamma: measured luminance vs signal, against the target gamma curve ──
+  DLCCharts.eotf = function (d) {
+    d = d || {};
+    const pts = (d.points || []).filter((p) => p.Y != null).sort((a, b) => a.signal - b.signal);
+    if (!pts.length) return empty("no grayscale reads yet");
+    const ymax = Math.max(...pts.map((p) => p.Y)) || 1;
+    const P = Plot({ xmin: 0, xmax: 1, ymin: 0, ymax: 1 });
+    P.gridX([0, 0.25, 0.5, 0.75, 1], (t) => fmt(t, 2));
+    P.gridY([0, 0.25, 0.5, 0.75, 1], (t) => fmt(t, 2));
+    const g = d.gamma || 2.2;
+    P.pathLine(niceTicks(0, 1, 40).map((s) => [s, Math.pow(s, g)]), "ch-ref");        // target curve
+    P.pathLine(pts.map((p) => [p.signal, p.Y / ymax]), "ch-line");                     // measured
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot"/>`));
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">γ ${fmt(g, 2)}</text>`);
+    return P.svg();
+  };
+
+  // ── Grayscale CCT tracking vs signal (+ target white CCT reference) ──
+  DLCCharts.grayscaleCct = function (d, targetCct) {
+    const pts = (d || []).filter((p) => p.cct != null);
+    if (!pts.length) return empty("no grayscale CCT yet");
+    const ccts = pts.map((p) => p.cct).concat(targetCct ? [targetCct] : []);
+    let lo = Math.min(...ccts), hi = Math.max(...ccts);
+    if (hi - lo < 200) { lo -= 200; hi += 200; }
+    const P = Plot({ xmin: 0, xmax: 1, ymin: lo, ymax: hi });
+    P.gridX([0, 0.5, 1], (t) => fmt(t, 1));
+    P.gridY(niceTicks(lo, hi, 4), (t) => Math.round(t));
+    if (targetCct) P.pathLine([[0, targetCct], [1, targetCct]], "ch-ref");
+    P.pathLine(pts.map((p) => [p.signal, p.cct]), "ch-line");
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot"/>`));
+    return P.svg();
+  };
+
+  // ── Grayscale Duv vs signal (zero line = on the Planckian locus) ──
+  DLCCharts.grayscaleDuv = function (d) {
+    const pts = (d || []).filter((p) => p.duv != null);
+    if (!pts.length) return empty("no grayscale Duv yet");
+    const mags = pts.map((p) => Math.abs(p.duv));
+    const span = Math.max(0.005, Math.max(...mags) * 1.2);
+    const P = Plot({ xmin: 0, xmax: 1, ymin: -span, ymax: span });
+    P.gridX([0, 0.5, 1], (t) => fmt(t, 1));
+    P.gridY([-span, 0, span], (t) => fmt(t, 3));
+    P.pathLine([[0, 0], [1, 0]], "ch-ref");
+    P.pathLine(pts.map((p) => [p.signal, p.duv]), "ch-line");
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.2" class="ch-dot"/>`));
+    return P.svg();
+  };
+
+  // ── Optimizer convergence: measured mean / max dE per outer iteration ──
+  DLCCharts.optimizer = function (d) {
+    const its = d || [];
+    if (!its.length) return empty("no optimizer iterations");
+    const xs = its.map((r) => r.iteration);
+    const maxde = Math.max(...its.map((r) => r.measured_max_de || 0), 1);
+    const P = Plot({ xmin: Math.min(...xs), xmax: Math.max(...xs, Math.min(...xs) + 1), ymin: 0, ymax: maxde * 1.1 });
+    P.gridX(niceTicks(Math.min(...xs), Math.max(...xs, Math.min(...xs) + 1), Math.min(4, its.length)), (t) => Math.round(t));
+    P.gridY(niceTicks(0, maxde * 1.1, 4), (t) => fmt(t, 2));
+    P.pathLine(its.map((r) => [r.iteration, r.measured_max_de]), "ch-line-max");
+    P.pathLine(its.map((r) => [r.iteration, r.measured_mean_de]), "ch-line");
+    its.forEach((r) => {
+      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_max_de), 1)}" r="2" class="ch-dot-max"/>`);
+      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_mean_de), 1)}" r="2" class="ch-dot"/>`);
+    });
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">max / mean ΔE</text>`);
+    return P.svg();
+  };
+
+  // ── Drift: white-point CCT over elapsed time (thermal warm-in / stability) ──
+  DLCCharts.drift = function (d) {
+    const pts = (d || []).filter((p) => p.cct != null && p.elapsed_s != null);
+    if (pts.length < 2) return empty("no drift series yet");
+    const xs = pts.map((p) => p.elapsed_s), cs = pts.map((p) => p.cct);
+    let lo = Math.min(...cs), hi = Math.max(...cs);
+    if (hi - lo < 100) { lo -= 100; hi += 100; }
+    const P = Plot({ xmin: 0, xmax: Math.max(...xs) || 1, ymin: lo, ymax: hi });
+    P.gridX(niceTicks(0, Math.max(...xs) || 1, 4), (t) => Math.round(t) + "s");
+    P.gridY(niceTicks(lo, hi, 4), (t) => Math.round(t));
+    P.pathLine(pts.map((p) => [p.elapsed_s, p.cct]), "ch-line");
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">white CCT vs time</text>`);
+    return P.svg();
+  };
+
+  // Render every chart into a container keyed by data-chart attributes (live + report share this).
+  DLCCharts.renderInto = function (root, charts, header) {
+    if (!root || !charts) return;
+    const wcct = header && header.white && header.white.cct;
+    const set = (key, svg) => { const el = root.querySelector(`[data-chart="${key}"]`); if (el) el.innerHTML = svg; };
+    set("cie", DLCCharts.cie(charts.cie));
+    set("eotf", DLCCharts.eotf(charts.eotf));
+    set("graycct", DLCCharts.grayscaleCct(charts.grayscale, wcct));
+    set("grayduv", DLCCharts.grayscaleDuv(charts.grayscale));
+    set("optimizer", DLCCharts.optimizer(charts.optimizer));
+    set("drift", DLCCharts.drift(charts.white_track));
+  };
+
+  global.DLCCharts = DLCCharts;
+})(typeof window !== "undefined" ? window : globalThis);

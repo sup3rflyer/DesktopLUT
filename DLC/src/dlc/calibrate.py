@@ -403,6 +403,14 @@ class Calibration:
         }
         if self.target_name:
             data["target"] = self.target_name
+            try:
+                # Target gamma + luminance — the dashboard's EOTF chart draws the reference
+                # curve from these. Defensive: the spec may not resolve yet at first emit.
+                spec = self._spec()
+                data["gamma"] = spec.gamma
+                data["luminance"] = spec.luminance_nits
+            except Exception:  # noqa: BLE001 - advisory chart metadata, never blocks
+                pass
         white = self.calib.get("white")
         if white:
             data["white"] = white   # dict: xy, provenance, cct, duv, …

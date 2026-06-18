@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 
-from dlc.dashboard.colorimetry import cct_duv, neutral_metrics, xy_to_uv60
+from dlc.dashboard.colorimetry import (
+    cct_duv, neutral_metrics, planckian_locus_xy, uv60_to_xy, xy_to_uv60,
+)
 
 
 def test_d65_lands_on_textbook_cct_and_duv():
@@ -55,6 +57,24 @@ def test_uv60_matches_definition():
     denom = -2 * 0.31271 + 12 * 0.32902 + 3
     assert math.isclose(u, 4 * 0.31271 / denom, rel_tol=1e-9)
     assert math.isclose(v, 6 * 0.32902 / denom, rel_tol=1e-9)
+
+
+def test_uv60_xy_roundtrip():
+    # xy → uv60 → xy must return the original chromaticity (the locus needs the inverse).
+    for x, y in [(0.3127, 0.329), (0.45, 0.40), (0.20, 0.10)]:
+        u, v = xy_to_uv60(x, y)
+        rx, ry = uv60_to_xy(u, v)
+        assert abs(rx - x) < 1e-6 and abs(ry - y) < 1e-6
+
+
+def test_planckian_locus_is_a_sane_warm_to_cool_curve():
+    locus = planckian_locus_xy()
+    assert len(locus) == 31
+    # all points are valid chromaticities in the locus region
+    for x, y in locus:
+        assert 0.2 < x < 0.7 and 0.2 < y < 0.45
+    # ordered warm→cool: the first point (low temp) is redder (higher x) than the last
+    assert locus[0][0] > locus[-1][0]
 
 
 def test_neutral_metrics_shape_is_stable():

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..events import Event
+from .report import render_report_html
 from .state import DashboardState
 from .tail import EventTail
 
@@ -98,6 +99,10 @@ class Hub:
     def backlog(self) -> list[dict[str, Any]]:
         with self._state_lock:
             return list(self.recent)
+
+    def charts(self) -> dict[str, Any]:
+        with self._state_lock:
+            return self.state.charts()
 
     def run_root(self) -> Optional[Path]:
         cur = self.tail.current
@@ -207,6 +212,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._serve_sse()
         elif path == "/api/snapshot":
             self._send_json({"state": self.hub.snapshot(), "backlog": self.hub.backlog()})
+        elif path == "/api/charts":
+            self._send_json(self.hub.charts())
         elif path == "/api/patch_metrics":
             self._send_json(self._latest_patch_metrics())
         elif path == "/api/export":
@@ -269,23 +276,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return {"available": True, "source": files[-1].name, "patches": metrics}
 
     def _export_snapshot(self) -> dict[str, Any]:
-        """Write a point-in-time dashboard snapshot to the run's reports/ and return it —
-        the Export button's seam (the richer report wiring lands with the Phase-5 charts)."""
+        """Write a self-contained HTML report (+ a JSON snapshot) to the run's reports/ and
+        return where they landed. The HTML embeds the state + chart data and inlines the
+        chart renderer, so it opens later with no server — a permanent run artifact."""
         snap = self.hub.snapshot()
+        charts = self.hub.charts()
         payload = {"exported_at": datetime.now().isoformat(timespec="seconds"),
-                   "state": snap, "backlog_lines": len(self.hub.backlog())}
+                   "state": snap, "charts": charts, "backlog_lines": len(self.hub.backlog())}
         root = self.hub.run_root()
-        if root is not None:
-            try:
-                reports = root / "reports"
-                reports.mkdir(parents=True, exist_ok=True)
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                out = reports / f"dashboard_snapshot_{stamp}.json"
-                out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                payload["saved_to"] = str(out)
-            except OSError:
-                payload["saved_to"] = None
-        return payload
+        if root is None:
+            return {**payload, "saved_to": None}
+        try:
+            reports = root / "reports"
+            reports.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            json_out = reports / f"dashboard_snapshot_{stamp}.json"
+            json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            html_out = reports / f"report_{stamp}.html"
+            html_out.write_text(render_report_html(snap, charts, payload["exported_at"],
+                                                   self.assets_dir), encoding="utf-8")
+            return {**payload, "saved_to": str(html_out), "json_saved_to": str(json_out)}
+        except OSError:
+            return {**payload, "saved_to": None}
 
 
 def make_server(hub: Hub, *, host: str = "127.0.0.1", port: int = 8765,
