@@ -16,6 +16,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from contextlib import redirect_stdout
@@ -26,7 +27,15 @@ from unittest.mock import patch
 from dlc.argyll import Argyll, Instrument, parse_spotread_instruments, parse_xyz, parse_yxy
 from dlc.decisions import IterationMetrics, MetricThresholds, decide_iteration, metric_thresholds_for_run, write_quality_policy
 from dlc.desktoplut_api_spec import build_desktoplut_api_spec, write_desktoplut_api_spec
-from dlc.desktoplut_client import DesktopLutClient, DesktopLutCommand, JsonlFileTransport, decode_message
+from dlc.desktoplut_client import (
+    DesktopLutApiError,
+    DesktopLutClient,
+    DesktopLutCommand,
+    DesktopLutResponse,
+    JsonlFileTransport,
+    NamedPipeTransport,
+    decode_message,
+)
 from dlc.desktoplut_mock import MockDesktopLutTransport
 from dlc.dogegen import DogegenPatchDisplay
 from dlc.drift import adaptive_gray_patch, coldest_channel_from_xyz, evaluate_drift, write_drift_plan
@@ -1065,6 +1074,26 @@ class DesktopLutApiTests(unittest.TestCase):
             response = client.send(client.state_get())
             self.assertTrue(response.ok)
             self.assertIn("state.get", path.read_text(encoding="utf-8"))
+
+    def test_named_pipe_transport_times_out_blocking_io(self) -> None:
+        class HangingTransport(NamedPipeTransport):
+            def _request_blocking(self, command: DesktopLutCommand):
+                time.sleep(1.0)
+                return DesktopLutResponse(ok=True, result={"late": True})
+
+        transport = HangingTransport("unused", timeout_s=0.02)
+        t0 = time.monotonic()
+        with self.assertRaisesRegex(DesktopLutApiError, "timed out"):
+            transport.request(DesktopLutCommand("state.get"))
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_named_pipe_transport_propagates_worker_errors(self) -> None:
+        class FailingTransport(NamedPipeTransport):
+            def _request_blocking(self, command: DesktopLutCommand):
+                raise OSError("pipe broke")
+
+        with self.assertRaisesRegex(OSError, "pipe broke"):
+            FailingTransport("unused", timeout_s=1.0).request(DesktopLutCommand("state.get"))
 
     def test_mock_calibration_mode_resets_layers(self) -> None:
         transport = MockDesktopLutTransport()

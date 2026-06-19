@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 DEFAULT_PIPE_NAME = r"\\.\pipe\DesktopLUT.Calibration"
@@ -68,16 +70,46 @@ class NamedPipeTransport:
     this transport is the client contract DLC will use once it does.
     """
 
-    def __init__(self, pipe_name: str = DEFAULT_PIPE_NAME) -> None:
+    def __init__(self, pipe_name: str = DEFAULT_PIPE_NAME, *, timeout_s: float = 75.0) -> None:
         self.pipe_name = pipe_name
+        self.timeout_s = float(timeout_s)
 
     def request(self, command: DesktopLutCommand) -> DesktopLutResponse:
+        return _call_with_timeout(
+            lambda: self._request_blocking(command),
+            timeout_s=self.timeout_s,
+            label=f"DesktopLUT API command {command.method!r}",
+        )
+
+    def _request_blocking(self, command: DesktopLutCommand) -> DesktopLutResponse:
         with open(self.pipe_name, "r+b", buffering=0) as pipe:
             pipe.write(command.encode())
             raw = pipe.readline()
         if not raw:
             raise DesktopLutApiError("DesktopLUT API returned an empty response")
         return DesktopLutResponse.from_dict(decode_message(raw))
+
+
+def _call_with_timeout(fn: Callable[[], DesktopLutResponse], *, timeout_s: float,
+                       label: str) -> DesktopLutResponse:
+    """Run blocking pipe IO behind a bounded wait so the calibrator never wedges forever."""
+    q: queue.Queue[tuple[bool, DesktopLutResponse | BaseException]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            q.put((True, fn()))
+        except BaseException as exc:  # noqa: BLE001 - propagate transport failures unchanged
+            q.put((False, exc))
+
+    thread = threading.Thread(target=worker, name="desktoplut-pipe-request", daemon=True)
+    thread.start()
+    try:
+        ok, value = q.get(timeout=max(0.001, timeout_s))
+    except queue.Empty as exc:
+        raise DesktopLutApiError(f"{label} timed out after {timeout_s:g}s") from exc
+    if ok:
+        return value  # type: ignore[return-value]
+    raise value
 
 
 class JsonlFileTransport:
@@ -101,9 +133,10 @@ class JsonlFileTransport:
 class DesktopLutClient:
     """Client for DesktopLUT's calibration control API."""
 
-    def __init__(self, pipe_name: str = DEFAULT_PIPE_NAME, transport: DesktopLutTransport | None = None) -> None:
+    def __init__(self, pipe_name: str = DEFAULT_PIPE_NAME, transport: DesktopLutTransport | None = None,
+                 timeout_s: float = 75.0) -> None:
         self.pipe_name = pipe_name
-        self.transport = transport or NamedPipeTransport(pipe_name)
+        self.transport = transport or NamedPipeTransport(pipe_name, timeout_s=timeout_s)
 
     def send(self, command: DesktopLutCommand, *, raise_on_error: bool = True) -> DesktopLutResponse:
         response = self.transport.request(command)
@@ -208,4 +241,3 @@ class DesktopLutClient:
 
     def windows_query_monitors(self) -> DesktopLutCommand:
         return DesktopLutCommand("windows.query_monitors")
-

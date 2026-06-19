@@ -35,8 +35,8 @@ class CalibrationController:
 
     # -- construction ------------------------------------------------------
     @classmethod
-    def connect(cls, pipe_name: str = DEFAULT_PIPE_NAME) -> "CalibrationController":
-        return cls(DesktopLutClient(pipe_name, NamedPipeTransport(pipe_name)))
+    def connect(cls, pipe_name: str = DEFAULT_PIPE_NAME, *, timeout_s: float = 75.0) -> "CalibrationController":
+        return cls(DesktopLutClient(pipe_name, NamedPipeTransport(pipe_name, timeout_s=timeout_s)))
 
     @classmethod
     def with_transport(cls, transport: DesktopLutTransport) -> "CalibrationController":
