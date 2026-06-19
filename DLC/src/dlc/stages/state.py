@@ -29,21 +29,37 @@ def build(args, ctx: RunContext) -> StageResult:
     score_history = dl.get("score_history", [])
     refine_history = dl.get("refine_history", [])
     params = dl.get("mhc_params")
+    monitor = dl.get("monitor", getattr(args, "monitor", None))
+    mode = _common.normalize_mode(dl.get("mode", getattr(args, "mode", "SDR")))
+    runtime_key = f"{monitor}:{mode}" if monitor is not None else None
+    runtime_layer = {}
+    overlay_path_enabled = None
+    runtime_3dlut_path = None
+    runtime_3dlut_loaded = None
+    if pipe_alive and isinstance(live, dict):
+        runtime_layer = (live.get("runtime") or {}).get(runtime_key, {}) if runtime_key else {}
+        runtime_3dlut_path = runtime_layer.get("cube_path") if isinstance(runtime_layer, dict) else None
+        runtime_3dlut_loaded = bool(runtime_3dlut_path)
+        overlay_path_enabled = live.get("corrections_enabled")
 
     result.metrics = {
         "run_dir": str(ctx.root),
-        "monitor": dl.get("monitor"),
-        "mode": dl.get("mode"),
+        "monitor": monitor,
+        "mode": mode,
         "stages_emitted": [{"stage": e["stage"], "status": e["status"]} for e in emitted],
         "mhc_params_built": params is not None,
         "refine_iterations": len(refine_history),
         "last_refine": refine_history[-1] if refine_history else None,
         "scores": score_history,
         "correction_grayscale_points": (dl.get("correction_grayscale") or {}).get("point_count"),
+        "overlay_path_enabled": overlay_path_enabled,
+        "runtime_3dlut_loaded": runtime_3dlut_loaded,
+        "runtime_3dlut_path": runtime_3dlut_path,
     }
     if pipe_alive and isinstance(live, dict):
         result.raw["live"] = {
             "running": live.get("running"),
+            "overlay_path_enabled": live.get("corrections_enabled"),
             "calibration_mode": live.get("calibration_mode"),
             "mhc": live.get("mhc"),
             "runtime": live.get("runtime"),

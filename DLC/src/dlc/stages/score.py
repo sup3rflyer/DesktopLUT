@@ -32,8 +32,21 @@ def build(args, ctx: RunContext) -> StageResult:
     source = resolve_run_path(ctx, Path(source))
     result.add_artifact(source)
 
+    dl_state = _common.load_dlc_state(ctx)
+    try:
+        explicit_white = _common.parse_target_white_xy(getattr(args, "target_white_xy", None))
+        if explicit_white is not None:
+            target_white_xy, target_white_source = explicit_white, "explicit"
+        else:
+            target_white_xy, target_white_source = _common.target_white_from_state(dl_state)
+    except ValueError as exc:
+        result.fail("invalid_target_white", str(exc))
+        return result
+
     samples = parse_ti3(source)
-    patch_metrics, target_luminance = score_samples(samples, luminance=args.luminance, gamma=args.gamma)
+    patch_metrics, target_luminance = score_samples(
+        samples, luminance=args.luminance, gamma=args.gamma, white_xy=target_white_xy
+    )
     metrics_path = ctx.root / "reports" / f"score_{args.stage}_iter{args.iteration:02d}.json"
     patches_path = ctx.root / "reports" / f"score_{args.stage}_iter{args.iteration:02d}_patches.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +61,10 @@ def build(args, ctx: RunContext) -> StageResult:
     )
     metrics_path.write_text(json.dumps(summary.as_dict(), indent=2), encoding="utf-8")
     result.add_artifact(metrics_path)
-    result.action(f"scored {summary.patch_count} patches vs gamma {args.gamma} / D65")
+    result.action(
+        f"scored {summary.patch_count} patches vs gamma {args.gamma} / "
+        f"white {target_white_xy[0]:.6f},{target_white_xy[1]:.6f} ({target_white_source})"
+    )
 
     # Worst offenders, for the assistant to inspect.
     worst = sorted(patch_metrics, key=lambda m: m.de2000, reverse=True)[:5]
@@ -69,10 +85,11 @@ def build(args, ctx: RunContext) -> StageResult:
         "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 4),
         "grayscale_max_de2000": round(summary.grayscale_max_de2000, 4),
         "target_luminance": round(summary.target_luminance, 4),
+        "target_white_xy": [round(target_white_xy[0], 6), round(target_white_xy[1], 6)],
+        "target_white_source": target_white_source,
     }
 
     # Delta vs previous score for the same stage + history for the report.
-    dl_state = _common.load_dlc_state(ctx)
     score_history = dl_state.setdefault("score_history", [])
     prev = next((s for s in reversed(score_history) if s.get("stage") == args.stage), None)
     score_history.append(metrics)
@@ -99,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-ti3", default=None, dest="source_ti3")
     parser.add_argument("--gamma", type=float, default=2.2)
     parser.add_argument("--luminance", type=float, default=None, help="target white luminance (default: inferred)")
+    _common.add_target_white_args(parser)
     args = parser.parse_args(argv)
     ctx = _common.resolve_run(args, create=False)
     args.run = ctx.root

@@ -19,11 +19,12 @@ from ..stage import StageResult
 from . import _common
 
 
-def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float) -> dict[str, Any] | None:
+def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
+               white_xy: tuple[float, float]) -> dict[str, Any] | None:
     if not ti3.exists():
         return None
     samples = parse_ti3(ti3)
-    patch_metrics, lum = score_samples(samples, gamma=gamma)
+    patch_metrics, lum = score_samples(samples, gamma=gamma, white_xy=white_xy)
     # This report only extracts the dE numbers below — it writes no metrics/patch JSON, so
     # metrics_path/patches_path stay None rather than masquerading as the TI3 path.
     summary = summarize_metrics(
@@ -46,15 +47,21 @@ def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float) -> dict[str
 def build(args, ctx: RunContext) -> StageResult:
     result = StageResult("report")
     dl = _common.load_dlc_state(ctx)
+    try:
+        target_white_xy, target_white_source = _common.target_white_from_state(dl)
+    except ValueError as exc:
+        result.fail("invalid_target_white", str(exc))
+        return result
 
     raw_ti3 = find_stage_artifact(ctx, "raw-mhc", "ti3")
-    before = _score_ti3(ctx, resolve_run_path(ctx, Path(raw_ti3)), "raw-mhc", args.gamma) if raw_ti3 else None
+    before = _score_ti3(ctx, resolve_run_path(ctx, Path(raw_ti3)), "raw-mhc",
+                        args.gamma, target_white_xy) if raw_ti3 else None
 
     after = None
     for stage in ("3dlut-verification", "mhc-verification", "verification"):
         ti3 = find_stage_artifact(ctx, stage, "ti3")
         if ti3:
-            after = _score_ti3(ctx, resolve_run_path(ctx, Path(ti3)), stage, args.gamma)
+            after = _score_ti3(ctx, resolve_run_path(ctx, Path(ti3)), stage, args.gamma, target_white_xy)
             if after:
                 after["stage"] = stage
                 break
@@ -76,7 +83,8 @@ def build(args, ctx: RunContext) -> StageResult:
         "mode": dl.get("mode"),
         "measured_primaries": params.get("primaries"),
         "measured_white": params.get("measured_white"),
-        "target_white": params.get("white"),
+        "target_white": {"x": round(target_white_xy[0], 6), "y": round(target_white_xy[1], 6)},
+        "target_white_source": target_white_source,
         "target_luminance": params.get("target_luminance"),
         "refine_iterations": len(dl.get("refine_history", [])),
         "before": before,

@@ -27,6 +27,7 @@ from dlc.stages import (
     refine_grayscale,
     report,
     score,
+    state,
 )
 from dlc.stages._common import FileBackedMockTransport, policy_advice
 from dlc.stages.simulate import _DEFAULTS, run_simulation
@@ -106,6 +107,28 @@ def test_build_mhc_derives_srgb_params(tmp_path):
     assert 6300 <= result.metrics["measured_white_cct"] <= 6700
     state = _common.load_dlc_state(ctx)
     assert "mhc_params" in state and "measured_primaries" in state["mhc_params"]
+    assert state["mhc_params"]["white"] == {"x": 0.3127, "y": 0.329}
+    assert state["mhc_params"]["white_source"] == "d65"
+
+
+def test_build_mhc_can_persist_explicit_target_white(tmp_path):
+    ctx = _new_run(tmp_path)
+    measure.build(_ns(ctx, stage="raw-mhc"), ctx)
+    result = build_mhc.build(_ns(ctx, target_white_xy="0.308,0.325"), ctx)
+    assert result.status == "ran"
+    assert result.metrics["target_white_xy"] == [0.308, 0.325]
+    assert result.metrics["target_white_source"] == "explicit"
+    state = _common.load_dlc_state(ctx)
+    assert state["mhc_params"]["white"] == {"x": 0.308, "y": 0.325}
+    assert state["mhc_params"]["white_source"] == "explicit"
+
+
+def test_build_mhc_rejects_invalid_explicit_target_white(tmp_path):
+    ctx = _new_run(tmp_path)
+    measure.build(_ns(ctx, stage="raw-mhc"), ctx)
+    result = build_mhc.build(_ns(ctx, target_white_xy="0.8,0.4"), ctx)
+    assert result.status == "failed"
+    assert result.anomalies[0].code == "invalid_target_white"
 
 
 def test_build_mhc_needs_rgb_ramps(tmp_path):
@@ -214,7 +237,21 @@ def test_score_perfect_panel(tmp_path):
     result = score.build(_ns(ctx, stage="verification", source_ti3=str(ti3)), ctx)
     assert result.status == "ran"
     assert result.metrics["avg_de2000"] < 0.01
+    assert result.metrics["target_white_xy"] == [0.3127, 0.329]
+    assert result.metrics["target_white_source"] == "d65"
     assert result.advice["default_policy_verdict"] == "stop"
+
+
+def test_score_uses_run_record_target_white_when_present(tmp_path):
+    ctx = _new_run(tmp_path)
+    measure.build(_ns(ctx, stage="raw-mhc"), ctx)
+    build_mhc.build(_ns(ctx, target_white_xy="0.308,0.325"), ctx)
+    ti3 = write_synthetic_ti3(tmp_path / "v.ti3")
+    result = score.build(_ns(ctx, stage="verification", source_ti3=str(ti3)), ctx)
+    assert result.status == "ran"
+    assert result.metrics["target_white_xy"] == [0.308, 0.325]
+    assert result.metrics["target_white_source"] == "explicit"
+    assert result.metrics["avg_de2000"] > 0.1
 
 
 def test_build_and_install_3dlut(tmp_path):
@@ -227,6 +264,21 @@ def test_build_and_install_3dlut(tmp_path):
     i = install_3dlut.build(_ns(ctx), ctx)
     assert i.status == "ran"
     assert i.metrics["installed"] is True
+
+
+def test_state_distinguishes_overlay_flag_from_runtime_cube(tmp_path):
+    ctx = _new_run(tmp_path)
+    enter_neutral.build(_ns(ctx), ctx)  # clears overlay-path corrections in the mock
+    measure.build(_ns(ctx, stage="post-mhc"), ctx)
+    build_3dlut.build(_ns(ctx, iteration=1), ctx)
+    install_3dlut.build(_ns(ctx), ctx)
+
+    result = state.build(_ns(ctx), ctx)
+    assert result.status == "ran"
+    assert result.metrics["overlay_path_enabled"] is False
+    assert result.metrics["runtime_3dlut_loaded"] is True
+    assert result.metrics["runtime_3dlut_path"].endswith(".cube")
+    assert result.raw["live"]["overlay_path_enabled"] is False
 
 
 def test_report_before_after(tmp_path):

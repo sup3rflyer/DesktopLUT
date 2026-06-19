@@ -22,15 +22,7 @@ import json
 import sys
 from pathlib import Path
 
-from ..mhc import (
-    D65_X,
-    D65_Y,
-    SRGB_PRIMARIES,
-    build_curves_from_ti3,
-    find_stage_artifact,
-    parse_ti3,
-    resolve_run_path,
-)
+from ..mhc import SRGB_PRIMARIES, build_curves_from_ti3, find_stage_artifact, parse_ti3, resolve_run_path
 from ..refine import Deviations, RefinementTarget, propose_correction_grayscale
 from ..runs import RunContext
 from ..stage import StageResult
@@ -99,6 +91,11 @@ def build(args, ctx: RunContext) -> StageResult:
     # White distance from D65 and a CCT readout for the assistant.
     white_de_d65 = _white_de_from_d65(white_xy, target_luminance)
     cct = _common.cct_mccamy(*white_xy)
+    try:
+        target_white_xy, target_white_source = _common.target_white_from_args(args)
+    except ValueError as exc:
+        result.fail("invalid_target_white", str(exc))
+        return result
 
     # Gamut sanity vs sRGB primaries.
     gamut_drift = {
@@ -117,7 +114,8 @@ def build(args, ctx: RunContext) -> StageResult:
         "monitor": args.monitor,
         "mode": mode,
         "primaries": {k: round(measured_primaries[k], 6) for k in ("rx", "ry", "gx", "gy", "bx", "by")},
-        "white": {"x": D65_X, "y": D65_Y},
+        "white": {"x": round(target_white_xy[0], 6), "y": round(target_white_xy[1], 6)},
+        "white_source": target_white_source,
         "measured_white": {"x": round(white_xy[0], 6), "y": round(white_xy[1], 6)},
         "target_gamma": args.gamma,
         "target_luminance": round(target_luminance, 4),
@@ -141,15 +139,17 @@ def build(args, ctx: RunContext) -> StageResult:
         "measured_white_xy": params["measured_white"],
         "measured_white_cct": round(cct) if cct else None,
         "measured_white_de2000_vs_d65": round(white_de_d65, 3),
-        "target_white_xy": [D65_X, D65_Y],
+        "target_white_xy": [params["white"]["x"], params["white"]["y"]],
+        "target_white_source": target_white_source,
         "target_luminance": params["target_luminance"],
         "gamut_drift_vs_srgb": gamut_drift,
         "base_grayscale_max_abs_deviation": base_summary.get("max_abs_deviation"),
         "params_path": str(params_path),
     }
     result.note(
-        "Matrix carries primaries + native-white->D65; base grayscale is tone-only toward native white. "
-        "The post-install measure->refine loop converges the final white toward D65 empirically."
+        "Matrix carries primaries + native-white->target-white; base grayscale is tone-only toward native white. "
+        f"Target white is {params['white']['x']},{params['white']['y']} ({target_white_source}); "
+        "post-install measure->refine converges the final white empirically."
     )
     result.advice = {
         "default_policy_verdict": "install",
@@ -171,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _common.base_parser("DLC build-mhc: derive MHC params from raw TI3")
     parser.add_argument("--source-ti3", default=None, dest="source_ti3", help="raw-mhc TI3 (default: latest in run)")
     parser.add_argument("--gamma", type=float, default=2.2, help="target tone gamma (default 2.2)")
+    _common.add_target_white_args(parser)
     args = parser.parse_args(argv)
     ctx = _common.resolve_run(args, create=False)
     args.run = ctx.root

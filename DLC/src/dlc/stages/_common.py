@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -24,7 +25,7 @@ from ..desktoplut_client import (
     DesktopLutResponse,
 )
 from ..desktoplut_mock import MockDesktopLutServer, MockDesktopLutState
-from ..mhc import Ti3Sample, classify_samples, parse_ti3, xy_from_xyz
+from ..mhc import D65_X, D65_Y, Ti3Sample, classify_samples, parse_ti3, xy_from_xyz
 from ..paths import RUNS_DIR, atomic_write_text
 from ..refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget
 from ..runs import RunContext, create_run, open_run
@@ -67,6 +68,49 @@ def base_parser(description: str) -> argparse.ArgumentParser:
         help="named pipe for the real DesktopLUT controller (ignored with --simulate)",
     )
     return parser
+
+
+def add_target_white_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--target-white-xy",
+        default=None,
+        help="explicit target white chromaticity as x,y (default: D65)",
+    )
+
+
+def _validate_xy(x: float, y: float) -> tuple[float, float]:
+    if not (math.isfinite(x) and math.isfinite(y)) or x <= 0.0 or y <= 0.0 or x + y >= 1.0:
+        raise ValueError("target white xy must be finite positive values with x+y < 1")
+    return (x, y)
+
+
+def parse_target_white_xy(value: Any) -> tuple[float, float] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        if "x" not in value or "y" not in value:
+            return None
+        return _validate_xy(float(value["x"]), float(value["y"]))
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return _validate_xy(float(value[0]), float(value[1]))
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(";", ",").split(",")]
+        if len(parts) != 2:
+            raise ValueError("target white must be formatted as x,y")
+        return _validate_xy(float(parts[0]), float(parts[1]))
+    raise ValueError("target white must be formatted as x,y")
+
+
+def target_white_from_args(args: Any) -> tuple[tuple[float, float], str]:
+    explicit = parse_target_white_xy(getattr(args, "target_white_xy", None))
+    return (explicit, "explicit") if explicit is not None else ((D65_X, D65_Y), "d65")
+
+
+def target_white_from_state(state: dict[str, Any]) -> tuple[tuple[float, float], str]:
+    params = state.get("mhc_params", {})
+    explicit = parse_target_white_xy(params.get("white"))
+    source = str(params.get("white_source") or "run-record")
+    return (explicit, source) if explicit is not None else ((D65_X, D65_Y), "d65")
 
 
 def latest_run() -> Path | None:

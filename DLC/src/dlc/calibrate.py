@@ -1670,7 +1670,7 @@ class Calibration:
         def run() -> StageOutcome:
             spec = self._spec()
             # Derive MHC params from the raw TI3 (reuses the proven build-mhc stage:
-            # measured primaries + native-white→D65 matrix + tone-only base 1D).
+            # measured primaries + native-white→target-white matrix + tone-only base 1D).
             args = Namespace(run=self.ctx.root, monitor=self.monitor, mode=self.mode,
                              simulate=False, gamma=spec.gamma, source_ti3=raw_ti3)
             derive = build_mhc.build(args, self.ctx)
@@ -1693,6 +1693,10 @@ class Calibration:
                                                base["points"], base["deviations"], gamma=spec.gamma)
             applied = self.controller.apply_mhc(self.monitor, self.mode)
             verified = self.controller.verify_mhc(self.monitor, self.mode)
+            params["white"] = {"x": round(wx, 6), "y": round(wy, 6)}
+            params["white_source"] = white.provenance
+            self._state["mhc_params"] = params
+            _common.save_dlc_state(self.ctx, self._state)
             profile_name = applied.get("profile_name") if isinstance(applied, dict) else None
             verify_ok = bool(verified.get("verified")) if isinstance(verified, dict) else False
             digest = {"primaries": params["primaries"], "white_xy": [wx, wy],

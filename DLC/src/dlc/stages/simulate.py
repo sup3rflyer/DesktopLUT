@@ -62,6 +62,7 @@ _DEFAULTS: dict[str, Any] = {
     "max_neighbor_delta": 1.0,
     "max_monotonicity_violations": 0,
     "luminance": None,
+    "target_white_xy": None,
 }
 
 
