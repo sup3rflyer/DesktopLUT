@@ -31,6 +31,16 @@ def test_synthetic_profile_lookups():
     assert p.target_for(0, "SDR").luminance_nits == 120.0
 
 
+def test_short_name_heuristic_and_override():
+    p = cp.Profile.synthetic()
+    d = p.display_for(0)
+    # heuristic: no digit-bearing token in "Synthetic mini-LED" ⇒ the last token
+    assert d.short_name == "mini-LED"
+    # an explicit quirk wins
+    d.quirks["short_name"] = "PA32UCXR"
+    assert d.short_name == "PA32UCXR"
+
+
 def test_drift_headroom_defaults_and_overrides():
     p = cp.Profile.synthetic()
     d = p.display_for(0)

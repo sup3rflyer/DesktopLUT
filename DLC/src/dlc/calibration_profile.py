@@ -169,6 +169,22 @@ class DisplayConfig:
         return float(v) if v is not None else None
 
     @property
+    def short_name(self) -> str:
+        """A short, model-like display identifier for filenames (e.g. ``PA32UCXR`` from
+        ``Asus ProArt PA32UCXR``). Prefers an explicit ``quirks['short_name']``; else the
+        last whitespace token that carries a digit (model numbers do), else the last token."""
+        explicit = self.quirks.get("short_name")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        tokens = self.name.split()
+        if not tokens:
+            return self.name
+        for tok in reversed(tokens):
+            if any(c.isdigit() for c in tok):
+                return tok
+        return tokens[-1]
+
+    @property
     def drift_headroom(self) -> float:
         """Multiplier on the DIP-measured run-time drift threshold (see
         ``DEFAULT_DRIFT_HEADROOM``). Per-display ``quirks['drift_headroom']`` learnable;

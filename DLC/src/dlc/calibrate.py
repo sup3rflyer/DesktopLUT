@@ -1925,14 +1925,18 @@ class Calibration:
             return (stages.get(key) or {}).get("data", {})
 
         # Copy the in-run build artifact into the deliverable folder under its DESCRIPTIVE name
-        # (DLC_<display>_<mode>_<target>_<date>.cube) — the durable cube the user keeps and that
-        # _finish re-points DesktopLUT at, so the name is self-describing in DesktopLUT's UI.
+        # (<date>_DLC_<display>_<mode>_<gamut>_<transfer>_<lum>n.cube) — the durable cube the user
+        # keeps and that _finish re-points DesktopLUT at, so the name is self-describing in
+        # DesktopLUT's UI (which shows the filename, not the folder).
         cube_src = sdat("build-install-3dlut").get("cube_path")
         cube_out = None
         if cube_src and Path(cube_src).exists():
+            spec = self._spec()
             cube_out = results_dir / descriptive_cube_name(
-                display=self.display.name, mode=self.mode,
-                target=self.target_name, date=self.run_date.isoformat())
+                date=self.run_date.isoformat(), display=self.display.short_name, mode=self.mode,
+                colorspace=spec.colorspace,
+                transfer=_transfer_token(is_hdr=spec.is_hdr, gamma=spec.gamma),
+                luminance_nits=spec.luminance_nits)
             shutil.copy2(cube_src, cube_out)
         # Copy the verification TI3.
         verify_ti3 = sdat("measure:verify").get("ti3") or sdat("measure:gray-wb").get("ti3")
@@ -2343,16 +2347,28 @@ def _fs_safe(token: str) -> str:
     return "".join(out).strip("_")
 
 
-def descriptive_cube_name(*, display: str, mode: str, target: Optional[str], date: str) -> str:
-    """The descriptive, stable filename for an installed/deliverable DLC 3D-LUT cube.
+def _transfer_token(*, is_hdr: bool, gamma: float) -> str:
+    """The EOTF token for a cube name: ``PQ`` for HDR, else ``g<gamma>`` (the dot dropped,
+    e.g. γ2.2 → ``g22``). DLC targets pure power γ, so the SDR token names the gamma exactly."""
+    return "PQ" if is_hdr else "g" + f"{gamma:.1f}".replace(".", "")
+
+
+def descriptive_cube_name(*, date: str, display: str, mode: str, colorspace: str,
+                          transfer: str, luminance_nits: float) -> str:
+    """The descriptive, sortable filename for an installed/deliverable DLC 3D-LUT cube.
 
     DesktopLUT shows a cube's *filename* (not its containing folder), so the name must be
-    self-describing: a ``DLC_`` marker (tells it apart from hand-made cubes), the panel, the
-    mode, the target, and the date. Every token is sanitised to filesystem-safe characters.
-    Example → ``DLC_Asus_ProArt_PA32UCXR_SDR_srgb_g22_2026-06-18.cube``. This is the canonical
-    name for the durable cube the user keeps and DesktopLUT installs (the in-run build artifact
-    under ``runs/<run>/generated/`` stays the generic working ``final_<mode>.cube``)."""
-    tokens = [_fs_safe(p) for p in ("DLC", display, mode, target or "", date)]
+    self-describing; **date-first** so a folder listing sorts chronologically. Scheme:
+    ``<date>_DLC_<display>_<mode>_<colorspace>_<transfer>_<lum>n.cube`` →
+    ``2026-06-18_DLC_PA32UCXR_SDR_sRGB_g22_120n.cube``. ``display`` is the short model name,
+    ``colorspace`` the target gamut label (verbatim from the profile — not mapped), ``transfer``
+    the EOTF token (``g22`` for power γ2.2, ``PQ`` for HDR), ``luminance_nits`` the white (SDR)
+    or peak (HDR) level rendered ``<n>n``. Every token is sanitised to filesystem-safe chars.
+    This is the canonical name for the durable cube the user keeps and DesktopLUT installs (the
+    in-run build artifact under ``runs/<run>/generated/`` stays the generic ``final_<mode>.cube``)."""
+    lum = f"{round(luminance_nits)}n"
+    tokens = [_fs_safe(date), "DLC", _fs_safe(display), _fs_safe(mode),
+              _fs_safe(colorspace), _fs_safe(transfer), lum]
     stem = "_".join(t for t in tokens if t)
     return f"{stem}.cube"
 

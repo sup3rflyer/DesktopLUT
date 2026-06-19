@@ -425,9 +425,10 @@ def test_full_flow_writes_deliverable_folder(tmp_path: Path):
     assert (results_dir / "report.json").exists()
     assert (results_dir / "report.html").exists()
     assert (results_dir / "measurements.ti3").exists()
-    # the deliverable cube carries the descriptive scheme (DLC_<display>_<mode>_<target>_<date>)
+    # the deliverable cube carries the descriptive scheme (<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n)
     assert (results_dir / descriptive_cube_name(
-        display="Synthetic mini-LED", mode="SDR", target="srgb_g22", date="2026-06-16")).exists()
+        date="2026-06-16", display="mini-LED", mode="SDR", colorspace="Rec.709",
+        transfer="g22", luminance_nits=120.0)).exists()
 
     payload = json.loads((results_dir / "report.json").read_text())
     assert payload["flow"] == "full"
@@ -447,7 +448,7 @@ def test_apply_installs_the_durable_results_cube_not_the_run_dir_artifact(tmp_pa
     assert result.status == "completed"
 
     results_dir = Path(result.results_dir)
-    deliverable = next(results_dir.glob("DLC_*.cube"))   # the descriptive deliverable cube
+    deliverable = next(results_dir.glob("*.cube"))   # the descriptive deliverable cube
     assert deliverable.exists()
 
     installed = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
@@ -463,7 +464,7 @@ def test_3dlut_only_apply_installs_the_durable_results_cube(tmp_path: Path):
     assert result.status == "completed"
 
     results_dir = Path(result.results_dir)
-    deliverable = next(results_dir.glob("DLC_*.cube"))
+    deliverable = next(results_dir.glob("*.cube"))
     assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(deliverable)
 
 
@@ -477,13 +478,17 @@ def test_mhc_only_apply_does_not_touch_the_runtime_cube(tmp_path: Path):
 
 
 def test_descriptive_cube_name_scheme():
-    # DLC_ marker + panel + mode + target + date, all filesystem-safe.
-    assert descriptive_cube_name(display="Asus ProArt PA32UCXR", mode="SDR",
-                                 target="srgb_g22", date="2026-06-18") == \
-        "DLC_Asus_ProArt_PA32UCXR_SDR_srgb_g22_2026-06-18.cube"
-    # unsafe chars (slash, space, quote) collapse to single underscores; a missing target drops out
-    assert descriptive_cube_name(display='LG/OLED 27"', mode="HDR", target=None,
-                                 date="2026-06-18") == "DLC_LG_OLED_27_HDR_2026-06-18.cube"
+    from dlc.calibrate import _transfer_token
+    # date-first (sorts chronologically) + DLC marker + short model + mode + gamut + EOTF + luminance
+    assert descriptive_cube_name(
+        date="2026-06-18", display="PA32UCXR", mode="SDR", colorspace="sRGB",
+        transfer="g22", luminance_nits=120.0) == "2026-06-18_DLC_PA32UCXR_SDR_sRGB_g22_120n.cube"
+    # HDR: PQ EOTF token + peak luminance; gamut keeps its dot, luminance rounds
+    assert descriptive_cube_name(
+        date="2026-06-18", display="C2", mode="HDR", colorspace="Rec.2020",
+        transfer=_transfer_token(is_hdr=True, gamma=2.2), luminance_nits=1600.4) == \
+        "2026-06-18_DLC_C2_HDR_Rec.2020_PQ_1600n.cube"
+    assert _transfer_token(is_hdr=False, gamma=2.4) == "g24"
 
 
 def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):
