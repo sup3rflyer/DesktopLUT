@@ -38,6 +38,7 @@ from dlc.calibrate import (
     build_verify_set,
     build_volumetric_set,
     color_space_is_hdr,
+    descriptive_cube_name,
     flow_patch_counts,
     main,
     run_calibration,
@@ -424,7 +425,9 @@ def test_full_flow_writes_deliverable_folder(tmp_path: Path):
     assert (results_dir / "report.json").exists()
     assert (results_dir / "report.html").exists()
     assert (results_dir / "measurements.ti3").exists()
-    assert (results_dir / f"{results_dir.name}.cube").exists()
+    # the deliverable cube carries the descriptive scheme (DLC_<display>_<mode>_<target>_<date>)
+    assert (results_dir / descriptive_cube_name(
+        display="Synthetic mini-LED", mode="SDR", target="srgb_g22", date="2026-06-16")).exists()
 
     payload = json.loads((results_dir / "report.json").read_text())
     assert payload["flow"] == "full"
@@ -444,7 +447,7 @@ def test_apply_installs_the_durable_results_cube_not_the_run_dir_artifact(tmp_pa
     assert result.status == "completed"
 
     results_dir = Path(result.results_dir)
-    deliverable = results_dir / f"{results_dir.name}.cube"
+    deliverable = next(results_dir.glob("DLC_*.cube"))   # the descriptive deliverable cube
     assert deliverable.exists()
 
     installed = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
@@ -460,7 +463,7 @@ def test_3dlut_only_apply_installs_the_durable_results_cube(tmp_path: Path):
     assert result.status == "completed"
 
     results_dir = Path(result.results_dir)
-    deliverable = results_dir / f"{results_dir.name}.cube"
+    deliverable = next(results_dir.glob("DLC_*.cube"))
     assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(deliverable)
 
 
@@ -471,6 +474,16 @@ def test_mhc_only_apply_does_not_touch_the_runtime_cube(tmp_path: Path):
     result = calib.run("mhc-only")
     assert result.status == "completed"
     assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
+
+
+def test_descriptive_cube_name_scheme():
+    # DLC_ marker + panel + mode + target + date, all filesystem-safe.
+    assert descriptive_cube_name(display="Asus ProArt PA32UCXR", mode="SDR",
+                                 target="srgb_g22", date="2026-06-18") == \
+        "DLC_Asus_ProArt_PA32UCXR_SDR_srgb_g22_2026-06-18.cube"
+    # unsafe chars (slash, space, quote) collapse to single underscores; a missing target drops out
+    assert descriptive_cube_name(display='LG/OLED 27"', mode="HDR", target=None,
+                                 date="2026-06-18") == "DLC_LG_OLED_27_HDR_2026-06-18.cube"
 
 
 def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):

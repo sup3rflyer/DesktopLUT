@@ -83,6 +83,7 @@ __all__ = [
     "Calibration",
     "FLOWS",
     "run_calibration",
+    "descriptive_cube_name",
 ]
 
 # Stable seam ids — the ``⚑`` points where the LLM judges (v2-design-notes §5).
@@ -1923,11 +1924,15 @@ class Calibration:
         def sdat(key: str) -> dict[str, Any]:
             return (stages.get(key) or {}).get("data", {})
 
-        # Copy the installed cube into the deliverable folder.
+        # Copy the in-run build artifact into the deliverable folder under its DESCRIPTIVE name
+        # (DLC_<display>_<mode>_<target>_<date>.cube) — the durable cube the user keeps and that
+        # _finish re-points DesktopLUT at, so the name is self-describing in DesktopLUT's UI.
         cube_src = sdat("build-install-3dlut").get("cube_path")
         cube_out = None
         if cube_src and Path(cube_src).exists():
-            cube_out = results_dir / f"{results_dir.name}.cube"
+            cube_out = results_dir / descriptive_cube_name(
+                display=self.display.name, mode=self.mode,
+                target=self.target_name, date=self.run_date.isoformat())
             shutil.copy2(cube_src, cube_out)
         # Copy the verification TI3.
         verify_ti3 = sdat("measure:verify").get("ti3") or sdat("measure:gray-wb").get("ti3")
@@ -2321,6 +2326,35 @@ def _xy(xyz: Sequence[float]) -> tuple[float, float]:
     if total <= 0:
         return (0.0, 0.0)
     return (xyz[0] / total, xyz[1] / total)
+
+
+def _fs_safe(token: str) -> str:
+    """Collapse anything outside ``[A-Za-z0-9.+-]`` to single underscores → a
+    filesystem-safe token (dependency-free; spaces/slashes/punctuation become ``_``)."""
+    out: list[str] = []
+    prev_us = False
+    for ch in token.strip():
+        if ch.isalnum() or ch in ".+-":
+            out.append(ch)
+            prev_us = False
+        elif not prev_us:
+            out.append("_")
+            prev_us = True
+    return "".join(out).strip("_")
+
+
+def descriptive_cube_name(*, display: str, mode: str, target: Optional[str], date: str) -> str:
+    """The descriptive, stable filename for an installed/deliverable DLC 3D-LUT cube.
+
+    DesktopLUT shows a cube's *filename* (not its containing folder), so the name must be
+    self-describing: a ``DLC_`` marker (tells it apart from hand-made cubes), the panel, the
+    mode, the target, and the date. Every token is sanitised to filesystem-safe characters.
+    Example → ``DLC_Asus_ProArt_PA32UCXR_SDR_srgb_g22_2026-06-18.cube``. This is the canonical
+    name for the durable cube the user keeps and DesktopLUT installs (the in-run build artifact
+    under ``runs/<run>/generated/`` stays the generic working ``final_<mode>.cube``)."""
+    tokens = [_fs_safe(p) for p in ("DLC", display, mode, target or "", date)]
+    stem = "_".join(t for t in tokens if t)
+    return f"{stem}.cube"
 
 
 # ---------------------------------------------------------------------------
