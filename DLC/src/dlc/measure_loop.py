@@ -164,7 +164,7 @@ class MeasureLoopConfig:
     outlier_floor_de: float = 0.5       # never reject within this ΔE of the median (a σ-independent floor)
 
     # Selective re-measure budget -------------------------------------------
-    remeasure_cap: int = 256            # total appended re-measures allowed
+    remeasure_cap: int = 256            # advisory threshold for appended re-measures; crossing it flags
 
 
 @dataclass
@@ -396,6 +396,7 @@ class _Loop:
         self.seq_counter = 0            # running probe-read index (every read)
         self.drift_episodes = 0
         self.remeasure_budget = config.remeasure_cap
+        self.remeasure_budget_exceeded = False
         self.warm = False
         self.warmup_reads = 0
         self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
@@ -1021,11 +1022,18 @@ class _Loop:
         queue = [p for p in self.appended_queue if not (p.label in seen or seen.add(p.label))]
         self.appended_queue = []
 
-        for patch in queue:
-            if self.remeasure_budget <= 0:
-                unresolved.append(patch.label)
-                continue
-            self.remeasure_budget -= 1
+        for idx, patch in enumerate(queue):
+            if self.remeasure_budget <= 0 and not self.remeasure_budget_exceeded:
+                self.remeasure_budget_exceeded = True
+                self._emit_event(
+                    "WARN",
+                    "remeasure_budget_exceeded",
+                    cap=cfg.remeasure_cap,
+                    queued=len(queue),
+                    remaining=len(queue) - idx,
+                )
+            if self.remeasure_budget > 0:
+                self.remeasure_budget -= 1
             rec = self.measure_patch(patch, phase="remeasure", disposition="appended")
             rec.appended_remeasures += 1
             rec.taken_cold = False  # redone while warm
@@ -1097,11 +1105,12 @@ def run_measure_loop(
     immediate = sum(r.immediate_remeasures for r in accepted)
     appended = sum(r.appended_remeasures for r in accepted)
     unstable_labels = [r.patch.label for r in accepted if r.unstable]
-    # "Unresolved" = a patch the loop could not stabilise (over budget or still
-    # unstable after the immediate gate) — these are what the LLM must adjudicate.
+    # "Unresolved" = a patch the loop could not stabilise after the immediate/appended gates.
+    # The appended remeasure cap is advisory: crossing it triggers adjudication, but the loop
+    # keeps remeasuring the finite queue so the downstream engines get the best data available.
     unresolved_all = sorted(set(unresolved) | set(unstable_labels))
 
-    needs_adjudication = (not loop.warm) or bool(unresolved_all)
+    needs_adjudication = (not loop.warm) or bool(unresolved_all) or loop.remeasure_budget_exceeded
     question = None
     if needs_adjudication:
         bits = []
@@ -1110,16 +1119,22 @@ def run_measure_loop(
                 f"panel did not settle within {cfg.max_warmup_reads} warm-up reads "
                 f"(cold channel {loop.cold_channel})"
             )
+        if loop.remeasure_budget_exceeded:
+            bits.append(
+                f"appended remeasures exceeded the advisory budget "
+                f"({cfg.remeasure_cap} cap, {appended} performed); the loop continued "
+                "the queued remeasures and is surfacing this for review"
+            )
         if unresolved_all:
             bits.append(
                 f"{len(unresolved_all)} patch(es) would not stabilise: "
                 + ", ".join(unresolved_all[:8])
-                + ("…" if len(unresolved_all) > 8 else "")
+                + ("..." if len(unresolved_all) > 8 else "")
             )
         question = (
             "; ".join(bits)
-            + " — accept these as the panel's physical floor/limit, or keep warming / "
-            "loosen the read tolerance and retry?"
+            + " - accept the completed measurements, retry with adjusted thermal/drift settings, "
+            "or abort?"
         )
 
     digest = {
@@ -1131,6 +1146,9 @@ def run_measure_loop(
         "total_reads": loop.seq_counter,
         "immediate_remeasures": immediate,
         "appended_remeasures": appended,
+        "remeasure_cap": cfg.remeasure_cap,
+        "remeasure_budget_remaining": max(0, loop.remeasure_budget),
+        "remeasure_budget_exceeded": loop.remeasure_budget_exceeded,
         "drift_episodes": loop.drift_episodes,
         "unresolved": unresolved_all,
         "white_xyz": [round(c, 4) for c in loop.white_xyz] if loop.white_xyz else None,

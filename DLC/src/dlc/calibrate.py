@@ -1619,11 +1619,19 @@ class Calibration:
             self._score_stage(role, outcome.data.get("ti3"),
                               label="raw (native)" if role == "raw" else "after ICC")
         if outcome.data.get("needs_adjudication"):
-            self._abort_if(self.adjudicate(AdjudicationRequest(
+            budget_exceeded = bool(outcome.digest.get("remeasure_budget_exceeded"))
+            decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:escalation", seam=SEAM_MEASURE, stage=key,
-                question=outcome.data.get("question") or "measurement did not fully settle — accept or retry?",
-                options=("accept", "abort"), recommendation="accept", digest=outcome.digest)),
-                stage=key, message="aborted on unsettled measurement")
+                question=outcome.data.get("question") or "measurement did not fully settle - accept or retry?",
+                options=(("accept", "retry", "abort") if budget_exceeded else ("accept", "abort")),
+                recommendation=("retry" if budget_exceeded else "accept"),
+                digest=outcome.digest))
+            if decision.choice == "retry":
+                raise CalibrationAborted(StageOutcome(
+                    key, "aborted",
+                    digest={"message": "measurement retry requested at LLM seam",
+                            "retry_requested": True, **outcome.digest}))
+            self._abort_if(decision, stage=key, message="aborted on unsettled measurement")
         return outcome
 
     def _score_stage(self, role: str, ti3_path: Optional[str], *, label: str) -> None:

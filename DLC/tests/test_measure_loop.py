@@ -231,6 +231,30 @@ def test_warmup_creep_triggers_drift_episode_and_appended_remeasure(tmp_path: Pa
     assert res.needs_adjudication is False
 
 
+def test_remeasure_cap_is_advisory_and_surfaces_for_adjudication(tmp_path: Path):
+    # The appended remeasure cap is an LLM-review threshold, not a hard data-loss limit.
+    # Even with a zero budget, queued drift casualties are remeasured and the .ti3 remains
+    # one final accepted row per patch; the abnormal volume is surfaced in the digest.
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, warm_tau=0.06, cold_blue_gain=0.88)
+    ti3 = tmp_path / "m.ti3"
+    res = run_measure_loop(
+        patches=_grey_ramp(t, 24),
+        transfer=t,
+        measure=panel,
+        config=MeasureLoopConfig(neutral_interval=6, remeasure_cap=0),
+        ti3_path=ti3,
+        ndjson_path=tmp_path / "m.ndjson",
+    )
+    assert res.appended_remeasures > 0
+    assert res.unresolved == []
+    assert res.digest["remeasure_budget_exceeded"] is True
+    assert res.digest["remeasure_cap"] == 0
+    assert res.needs_adjudication is True
+    assert res.question is not None and "advisory budget" in res.question
+    assert len(parse_ti3(ti3)) == 24
+
+
 # ---------------------------------------------------------------------------
 # thermal preheat: soak-into-calibration
 # ---------------------------------------------------------------------------
