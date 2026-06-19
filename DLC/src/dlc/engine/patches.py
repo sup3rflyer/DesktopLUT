@@ -317,8 +317,16 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  saturations: Sequence[float] = (1.0,),
                  spacing: str = "uniform", order: str = "thermal",
                  max_cv: int | None = None,
+                 include_secondaries: bool = True,
                  warm_tau: Optional[int] = None) -> list[Patch]:
-    """Grey ramp + RGBCMY ramps at each saturation (deduped, then ordered).
+    """Grey ramp + per-channel colour ramps at each saturation (deduped, then ordered).
+
+    The grey ramp + RGB **primaries** are always included; the CMY **secondaries**
+    only when ``include_secondaries`` (default ``True``, back-compat). The MHC
+    foundation set passes ``False``: a matrix + per-channel 1D LUT is fitted from
+    the grey ramp (base grayscale) and the R/G/B ramps (per-channel curves +
+    primaries) — it *cannot* fit the secondaries, so measuring C/M/Y there is
+    wasted; the volumetric 3D-LUT set covers that region instead.
 
     For each level ``V`` and saturation ``S``: on-channels = ``V``, off-channels
     = ``round(V*(1-S))``. ``spacing`` is ``uniform`` (even signal steps) or
@@ -343,7 +351,8 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
 
     for v in levels:
         add((v, v, v))
-    for _name, r_on, g_on, b_on in _RAMP_COLORS:
+    colors = _RAMP_COLORS if include_secondaries else _PRIMARIES
+    for _name, r_on, g_on, b_on in colors:
         for sat in sorted(saturations):
             for v in levels:
                 if v == 0:

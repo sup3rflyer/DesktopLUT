@@ -74,6 +74,25 @@ def test_ramp_anchors_and_dedup():
     assert len(ramp) == len(set(ramp))  # deduped
 
 
+def _is_secondary(p):
+    """A C/M/Y patch: two channels equal-and-high, the third strictly lower (and not grey)."""
+    hi = max(p)
+    return hi > 0 and list(p).count(hi) == 2 and min(p) < hi and not (p[0] == p[1] == p[2])
+
+
+def test_ramp_primaries_only_drops_secondaries():
+    # The MHC foundation ramp uses grey + R/G/B only (a matrix+1D can't fit C/M/Y). Secondaries
+    # appear with include_secondaries=True (default, back-compat) and are absent when False.
+    tf = P.Transfer.power(2.2, 120.0)
+    full = P.ramp_patches(tf, steps=9, include_secondaries=True)
+    prim = P.ramp_patches(tf, steps=9, include_secondaries=False)
+    assert any(_is_secondary(p) for p in full)
+    assert not any(_is_secondary(p) for p in prim)
+    # primaries-only still has the grey ramp + R/G/B endpoints
+    assert (tf.max_cv, 0, 0) in prim and (0, tf.max_cv, 0) in prim and (0, 0, tf.max_cv) in prim
+    assert len(prim) < len(full)
+
+
 def test_cube_count_and_dedup():
     tf = P.Transfer.pq()
     cube = P.cube_patches(tf, size=9)

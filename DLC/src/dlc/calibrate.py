@@ -186,21 +186,34 @@ class PatchSizes:
 
     All sets are drift-ordered by ``order`` (``thermal`` by default)."""
 
-    # raw ramp (MHC matrix + base 1D): grey + RGBCMY ramps
-    raw_ramp_steps: int = 17        # grey + RGBCMY ramp steps
-    raw_saturations: tuple[float, ...] = (1.0,)   # RGBCMY saturation shells (breadth)
+    # raw ramp = the MHC FOUNDATION set (matrix + base 1D). The MHC fit consumes the grey ramp
+    # (base grayscale 1D) + the R/G/B ramps (per-channel curves + primaries); it cannot fit the
+    # C/M/Y secondaries, so they're EXCLUDED here by default and left to the volumetric 3D-LUT set.
+    raw_ramp_steps: int = 32        # steps per channel (grey + R/G/B): >=32 ⇒ a dense neutral + per-channel foundation
+    raw_saturations: tuple[float, ...] = (1.0,)   # primary saturation shells (breadth)
+    raw_include_secondaries: bool = False   # add C/M/Y ramps too? Off ⇒ grey + R/G/B only (the foundation)
     raw_spacing: str = "uniform"    # uniform | perceptual (even-signal vs even-perceptual)
 
-    # volumetric set (3D LUT post-MHC + verify): how the cube interior is sampled
+    # volumetric set (3D-LUT build, post-MHC). ``tube`` mode hits all three goals at once: the
+    # CUBE covers the ENTIRE gamut (boundary anchoring), the neutral TUBE concentrates density on
+    # the practical near-neutral region where content lives, and the full-resolution GREY AXIS gives
+    # the grayscale its own dense sampling. The 3D-LUT thus optimises the whole volume while focusing
+    # where it matters (denser samples ⇒ more optimiser attention there).
     volumetric_mode: str = "tube"   # tube | cube | gamut
-    cube_size: int = 9              # volumetric cube axis
-    tube_size: int = 17             # neutral-axis core resolution (tube mode)
-    tube_radius: int = 2            # Manhattan radius of the neutral tube (tube mode)
+    cube_size: int = 9              # volumetric cube axis (entire-gamut coverage)
+    tube_size: int = 33             # neutral-axis + tube-core resolution (grayscale + practical density)
+    tube_radius: int = 2            # Manhattan radius of the neutral tube (practical near-neutral region)
     grid_type: str = "cub"          # cub | bcc (tube/cube)
-    spines: bool = False            # tube: add RGBCMY gamut-edge spines
+    spines: bool = False            # tube: add RGBCMY gamut-edge spines (saturated edges — mostly clip/rare,
+    #                                 so off by default; the cube already anchors the gamut corners)
     gamut_lum_steps: int = 17       # gamut mode: luminance axis
     gamut_hues: int = 12            # gamut mode: hue angles per shell
     gamut_lum_bias: float = 1.3     # gamut mode: shadow density bias
+
+    # verify = a LIGHTER sanity set (not the dense build set): grey + RGBCMY at full + half saturation
+    # — confirms grayscale tracking + the gamut hues at practical & saturated levels, normal-sized.
+    verify_steps: int = 13          # verify ramp steps per channel
+    verify_saturations: tuple[float, ...] = (1.0, 0.5)   # saturated + practical mid-saturation
 
     # neutral axis (GS+WB tweak / gray-wb flow)
     neutral_steps: int = 17         # grey-axis ramp steps
@@ -218,9 +231,9 @@ class PatchSizes:
             if f.name not in d or d[f.name] is None:
                 continue
             v = d[f.name]
-            if f.name == "raw_saturations":
+            if f.name in ("raw_saturations", "verify_saturations"):
                 kw[f.name] = tuple(float(x) for x in v)
-            elif f.name in ("spines",):
+            elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
             elif f.name in ("gamut_lum_bias",):
                 kw[f.name] = float(v)
@@ -234,8 +247,9 @@ class PatchSizes:
         """Return a copy with only the **non-None** overrides applied (CLI flags that
         were actually passed). ``raw_saturations`` is coerced to a tuple."""
         clean = {k: v for k, v in overrides.items() if v is not None}
-        if "raw_saturations" in clean:
-            clean["raw_saturations"] = tuple(float(x) for x in clean["raw_saturations"])
+        for sat_key in ("raw_saturations", "verify_saturations"):
+            if sat_key in clean:
+                clean[sat_key] = tuple(float(x) for x in clean[sat_key])
         return replace(self, **clean)
 
 
@@ -2000,6 +2014,9 @@ class Calibration:
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
         return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
 
+    def _verify_patches(self) -> list[tuple[int, int, int]]:
+        return build_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
+
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
         return flow_patch_counts(flow, self.patch_sizes, self._transfer())
 
@@ -2048,7 +2065,7 @@ class Calibration:
             gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
                                     ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
             self.stage_gswb_tweak(gw.data["ti3"])
-        ver = self.stage_measure(role="verify", patches=self._volumetric_patches(),
+        ver = self.stage_measure(role="verify", patches=self._verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -2082,7 +2099,7 @@ class Calibration:
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
-        ver = self.stage_measure(role="verify", patches=self._volumetric_patches(),
+        ver = self.stage_measure(role="verify", patches=self._verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -2280,9 +2297,11 @@ def _xy(xyz: Sequence[float]) -> tuple[float, float]:
 
 def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
                    warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The MHC raw/verify ramp: grey + RGBCMY at each saturation shell."""
+    """The MHC FOUNDATION ramp: a dense grey ramp + R/G/B (the matrix+1D fit's inputs); C/M/Y
+    only if ``raw_include_secondaries`` (off by default — the volumetric set covers them)."""
     return ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
-                        spacing=ps.raw_spacing, order=ps.order, warm_tau=warm_tau)
+                        spacing=ps.raw_spacing, include_secondaries=ps.raw_include_secondaries,
+                        order=ps.order, warm_tau=warm_tau)
 
 
 def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
@@ -2310,16 +2329,27 @@ def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
+def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
+                     warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The verify sanity set — a LIGHTER ramp (grey + RGBCMY at full + half saturation), NOT the
+    dense volumetric build set. It confirms grayscale tracking + the gamut hues at practical and
+    saturated levels at a normal verification resolution (and feeds the dashboard's saturation
+    sweeps), instead of re-measuring the whole cube the build already used."""
+    return ramp_patches(transfer, steps=ps.verify_steps, saturations=ps.verify_saturations,
+                        spacing=ps.raw_spacing, include_secondaries=True,
+                        order=ps.order, warm_tau=warm_tau)
+
+
 # The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show
 # the run's size before any measurement). build-correction measures nothing through spotread.
 _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
-    "full": ("raw", "post-mhc", "gray-wb", "verify-vol"),
+    "full": ("raw", "post-mhc", "gray-wb", "verify"),
     "mhc-only": ("raw", "verify-ramp"),
-    "3dlut-only": ("post-mhc", "verify-vol"),
+    "3dlut-only": ("post-mhc", "verify"),
     "gray-wb": ("gray-wb", "verify-neutral"),
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
-                   "post-mhc": build_volumetric_set, "verify-vol": build_volumetric_set,
+                   "post-mhc": build_volumetric_set, "verify": build_verify_set,
                    "gray-wb": build_neutral_set, "verify-neutral": build_neutral_set}
 
 
@@ -2489,9 +2519,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # per-stage patch counts and exits, so the size/time can be decided BEFORE measuring.
     patch = parser.add_argument_group("patch sequence (run size/time — overrides profile patches:)")
     patch.add_argument("--raw-steps", type=int, default=None, dest="raw_ramp_steps",
-                       help="grey + RGBCMY ramp steps (MHC density; default 17).")
+                       help="steps per channel for the MHC foundation ramp — grey + R/G/B (default 32).")
     patch.add_argument("--raw-saturations", type=float, nargs="+", default=None, dest="raw_saturations",
-                       help="RGBCMY saturation shells, e.g. 1.0 0.5 0.25 (default 1.0).")
+                       help="primary saturation shells, e.g. 1.0 0.5 0.25 (default 1.0).")
+    patch.add_argument("--raw-secondaries", action="store_true", default=None, dest="raw_include_secondaries",
+                       help="also measure C/M/Y ramps in the MHC stage (off by default — the matrix+1D "
+                            "can't fit secondaries; the volumetric 3D-LUT set covers them).")
     patch.add_argument("--raw-spacing", choices=["uniform", "perceptual"], default=None, dest="raw_spacing")
     patch.add_argument("--volumetric-mode", choices=["tube", "cube", "gamut"], default=None,
                        dest="volumetric_mode", help="how the 3D-LUT set samples the cube (default tube).")
@@ -2505,6 +2538,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     patch.add_argument("--gamut-lum-steps", type=int, default=None, dest="gamut_lum_steps")
     patch.add_argument("--gamut-hues", type=int, default=None, dest="gamut_hues")
     patch.add_argument("--gamut-lum-bias", type=float, default=None, dest="gamut_lum_bias")
+    patch.add_argument("--verify-steps", type=int, default=None, dest="verify_steps",
+                       help="verify sanity-ramp steps per channel (default 13 — lighter than the build).")
+    patch.add_argument("--verify-saturations", type=float, nargs="+", default=None, dest="verify_saturations",
+                       help="verify saturation shells (default 1.0 0.5 — saturated + practical mid-sat).")
     patch.add_argument("--neutral-steps", type=int, default=None, dest="neutral_steps",
                        help="grey-axis ramp steps for GS+WB / gray-wb (default 17).")
     patch.add_argument("--patch-order", choices=["thermal", "luminance", "random"], default=None,

@@ -34,6 +34,8 @@ from dlc.calibrate import (
     MappingAdjudicator,
     PatchSizes,
     apply_set_hdr,
+    build_ramp_set,
+    build_verify_set,
     build_volumetric_set,
     color_space_is_hdr,
     flow_patch_counts,
@@ -1072,6 +1074,38 @@ def test_volumetric_mode_selects_generator():
     assert len(gamut) > 0
 
 
+def _is_secondary(p):
+    hi = max(p)
+    return hi > 0 and list(p).count(hi) == 2 and min(p) < hi and not (p[0] == p[1] == p[2])
+
+
+def test_patch_roles_split_grayscale_volume_and_verify():
+    # The patch-sequence design: MHC foundation = dense grey + R/G/B (no C/M/Y); 3D-LUT = the
+    # volumetric set (entire gamut + practical/grayscale density); verify = a LIGHTER sanity ramp.
+    t = _transfer()
+    ps = PatchSizes()   # defaults: raw 32 (no secondaries), tube 33, verify 13 @ (1.0, 0.5)
+
+    raw = build_ramp_set(ps, t)
+    assert not any(_is_secondary(p) for p in raw)                 # MHC: no C/M/Y
+    greys = [p for p in raw if p[0] == p[1] == p[2]]
+    assert len(greys) >= 32                                       # >=32 grey steps (dense foundation)
+    assert (t.max_cv, 0, 0) in raw and (0, t.max_cv, 0) in raw and (0, 0, t.max_cv) in raw  # R/G/B kept
+
+    vol = build_volumetric_set(ps, t)
+    verify = build_verify_set(ps, t)
+    assert len(verify) < len(vol)                                 # verify is lighter than the build
+    assert any(_is_secondary(p) for p in verify)                  # but still sweeps the gamut hues
+    assert any(p[0] == p[1] == p[2] for p in verify)              # and the grayscale
+
+
+def test_opting_into_raw_secondaries():
+    t = _transfer()
+    base = build_ramp_set(PatchSizes(), t)
+    withcmy = build_ramp_set(PatchSizes(raw_include_secondaries=True), t)
+    assert any(_is_secondary(p) for p in withcmy) and not any(_is_secondary(p) for p in base)
+    assert len(withcmy) > len(base)
+
+
 def test_patch_sizes_drive_run_size():
     # Smaller knobs ⇒ fewer patches ⇒ a shorter run (and vice versa) — the time lever.
     t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
@@ -1080,7 +1114,7 @@ def test_patch_sizes_drive_run_size():
     big = flow_patch_counts("full", PatchSizes(raw_ramp_steps=33, cube_size=17, tube_size=33,
                                                tube_radius=3, neutral_steps=33), t)
     assert small["total_patches"] < big["total_patches"]
-    assert set(small["stages"]) == {"raw", "post-mhc", "gray-wb", "verify-vol"}
+    assert set(small["stages"]) == {"raw", "post-mhc", "gray-wb", "verify"}
 
 
 def test_plan_seam_surfaces_run_size(tmp_path: Path):
@@ -1091,7 +1125,7 @@ def test_plan_seam_surfaces_run_size(tmp_path: Path):
     assert exc.value.request.seam == "plan_veto"
     pp = exc.value.request.digest["patch_plan"]
     assert pp["total_patches"] > 0
-    assert set(pp["stages"]) == {"raw", "post-mhc", "gray-wb", "verify-vol"}
+    assert set(pp["stages"]) == {"raw", "post-mhc", "gray-wb", "verify"}
 
 
 def test_custom_patch_sizes_flow_through_to_measurement(tmp_path: Path):
