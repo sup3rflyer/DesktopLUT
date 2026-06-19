@@ -251,6 +251,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._authorize_mutation():
                 return
             self._send_json(self._cancel_run())
+        elif path == "/api/pause":
+            if not self._authorize_mutation():
+                return
+            self._send_json(self._write_control(
+                "pause", timeout_s=180, on_timeout="rollback"))
+        elif path == "/api/resume":
+            if not self._authorize_mutation():
+                return
+            self._send_json(self._write_control("resume"))
         elif path == "/api/export":
             if not self._authorize_mutation():
                 return
@@ -258,22 +267,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self._send_bytes(b"not found", "text/plain; charset=utf-8", 404)
 
-    def _cancel_run(self) -> dict[str, Any]:
-        """Write control.json into the watched run so the live calibration process rolls back
-        to the pre-run setup at its next checkpoint/stage boundary — the Cancel button (and any
-        assistant POSTing here). The read-only dashboard's one mutating action; it touches only
-        the run's own control file, never the display."""
+    def _write_control(self, action: str, **extra: Any) -> dict[str, Any]:
         root = self.hub.run_root()
         if root is None:
             return {"ok": False, "error": "no run is being watched"}
         try:
             ctrl = root / "control.json"
-            ctrl.write_text(json.dumps({"action": "cancel",
-                                        "requested": datetime.now().isoformat(timespec="seconds")}),
+            payload = {"action": action, "requested": datetime.now().isoformat(timespec="seconds")}
+            payload.update(extra)
+            ctrl.write_text(json.dumps(payload),
                             encoding="utf-8")
             return {"ok": True, "control": str(ctrl)}
         except OSError as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _cancel_run(self) -> dict[str, Any]:
+        """Write control.json so the live calibration process rolls back to the pre-run
+        setup at its next checkpoint/stage boundary."""
+        return self._write_control("cancel")
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]

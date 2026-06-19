@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .events import RunLog
 
@@ -50,9 +50,10 @@ class RunCancelled(Exception):
     actionable half of mid-run gating (the LLM can *stop* a run it's watching, not
     just watch it). Distinct from :class:`RunStalled` (a stall is involuntary)."""
 
-    def __init__(self, stage: str) -> None:
+    def __init__(self, stage: str, reason: str = "control.json") -> None:
         self.stage = stage
-        super().__init__(f"run cancelled at a checkpoint during {stage}")
+        self.reason = reason
+        super().__init__(f"run cancelled at a checkpoint during {stage} ({reason})")
 
 
 class Liveness:
@@ -68,7 +69,11 @@ class Liveness:
         watchdog_factor: float = 2.0,
         on_stall: Optional[Callable[[], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        control_check: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
+        on_pause: Optional[Callable[[Mapping[str, Any]], None]] = None,
+        on_resume: Optional[Callable[[Mapping[str, Any]], None]] = None,
         clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.runlog = runlog
         self.stall_after_s = max(1.0, float(stall_after_s))
@@ -78,7 +83,11 @@ class Liveness:
         # Polled by the watchdog thread (NOT per-read — no syscall storm): a True result
         # latches a cancel that the next check() turns into a clean RunCancelled abort.
         self.cancel_check = cancel_check
+        self.control_check = control_check
+        self.on_pause = on_pause
+        self.on_resume = on_resume
         self._clock = clock
+        self._sleep = sleep
 
         self._lock = threading.Lock()
         now = clock()
@@ -118,6 +127,13 @@ class Liveness:
         emits a ``stall`` (once) and raises :class:`RunStalled` if progress has stalled
         — or if the watchdog already tripped while the main thread was wedged. Cheap;
         call it liberally."""
+        ctrl = self._read_control()
+        action = self._control_action(ctrl)
+        if action == "cancel":
+            self.request_cancel()
+        elif action == "pause":
+            self._pause(stage, ctrl or {})
+
         with self._lock:
             self._stage = stage
             cancelled = self._cancel_requested
@@ -147,6 +163,82 @@ class Liveness:
         and as the watchdog's action when ``cancel_check`` fires."""
         with self._lock:
             self._cancel_requested = True
+
+    def _read_control(self) -> Optional[Mapping[str, Any]]:
+        if self.control_check is not None:
+            try:
+                return self.control_check()
+            except Exception:  # noqa: BLE001 - control file races must not kill the run
+                return None
+        if self.cancel_check is not None:
+            try:
+                if self.cancel_check():
+                    return {"action": "cancel"}
+            except Exception:  # noqa: BLE001 - control file races must not kill the run
+                return None
+        return None
+
+    @staticmethod
+    def _control_action(ctrl: Optional[Mapping[str, Any]]) -> str:
+        if not ctrl:
+            return ""
+        return str(ctrl.get("action", "")).strip().lower()
+
+    def _pause_timeout(self, ctrl: Mapping[str, Any]) -> float:
+        try:
+            requested = float(ctrl.get("timeout_s", 180.0))
+        except (TypeError, ValueError):
+            requested = 180.0
+        return max(1.0, min(300.0, requested))
+
+    def _pause(self, stage: str, ctrl: Mapping[str, Any]) -> None:
+        timeout_s = self._pause_timeout(ctrl)
+        start = self._clock()
+        deadline = start + timeout_s
+        self.runlog.seam(stage, key="operator_pause", status="paused",
+                         timeout_s=round(timeout_s, 1), on_timeout="rollback")
+        if self.on_pause is not None:
+            try:
+                self.on_pause(ctrl)
+            except Exception as exc:  # noqa: BLE001 - a failed neutral park must surface but not crash
+                self.runlog.note(stage, "pause requested but neutral park failed",
+                                 level="WARN", paused=True, error=f"{type(exc).__name__}: {exc}")
+        while True:
+            now = self._clock()
+            elapsed = now - start
+            if elapsed >= timeout_s:
+                self.runlog.note(stage, "pause timeout reached - rolling back",
+                                 level="WARN", paused=True, timeout_s=round(timeout_s, 1),
+                                 elapsed_s=round(elapsed, 1), rollback=True)
+                self.request_cancel()
+                raise RunCancelled(stage, "pause timeout")
+
+            next_ctrl = self._read_control()
+            action = self._control_action(next_ctrl)
+            if action == "cancel":
+                self.request_cancel()
+                raise RunCancelled(stage, "cancel while paused")
+            if action == "resume":
+                resume_payload = dict(next_ctrl or {})
+                resume_payload.update({"elapsed_s": round(elapsed, 1),
+                                       "drift_check_required": elapsed >= 60.0})
+                if self.on_resume is not None:
+                    try:
+                        self.on_resume(resume_payload)
+                    except Exception as exc:  # noqa: BLE001 - resume cleanup is best-effort
+                        self.runlog.note(stage, "pause resume cleanup failed",
+                                         level="WARN", error=f"{type(exc).__name__}: {exc}")
+                self.runlog.seam(stage, key="operator_pause", status="resumed",
+                                 elapsed_s=round(elapsed, 1),
+                                 drift_check_required=elapsed >= 60.0)
+                self.progress(stage)
+                return
+
+            remaining = max(0.0, deadline - now)
+            self.runlog.heartbeat(stage, since_progress_s=0.0,
+                                  stall_after_s=round(timeout_s, 1),
+                                  paused=True, rollback_in_s=round(remaining, 1))
+            self._sleep(min(1.0, remaining))
 
     # -- watchdog thread --------------------------------------------------
     def start(self) -> None:
@@ -180,13 +272,10 @@ class Liveness:
             # Cooperative cancel: poll the control channel off the main thread (so it works
             # even while the main thread is wedged in a syscall) and latch it — the next
             # main-thread check() turns it into a clean RunCancelled abort.
-            if self.cancel_check is not None:
-                try:
-                    if self.cancel_check():
-                        with self._lock:
-                            self._cancel_requested = True
-                except Exception:  # noqa: BLE001 - a bad control read must never kill the watcher
-                    pass
+            ctrl = self._read_control()
+            if self._control_action(ctrl) == "cancel":
+                with self._lock:
+                    self._cancel_requested = True
             with self._lock:
                 since = now - self._last_progress
                 stage = self._stage

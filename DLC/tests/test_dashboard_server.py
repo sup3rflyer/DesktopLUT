@@ -159,6 +159,28 @@ def test_api_cancel_writes_control_json(tmp_path):
         httpd.shutdown()
 
 
+def test_api_pause_and_resume_write_control_json(tmp_path):
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        token = _csrf_token(base)
+        status, body = _post(base + "/api/pause", token=token)
+        assert status == 200
+        assert json.loads(body)["ok"] is True
+        ctrl = tmp_path / "control.json"
+        pause = json.loads(ctrl.read_text())
+        assert pause["action"] == "pause"
+        assert pause["timeout_s"] == 180
+        assert pause["on_timeout"] == "rollback"
+
+        status, body = _post(base + "/api/resume", token=token)
+        assert status == 200
+        assert json.loads(body)["ok"] is True
+        assert json.loads(ctrl.read_text())["action"] == "resume"
+    finally:
+        httpd.shutdown()
+
+
 def test_api_cancel_requires_csrf_token(tmp_path):
     hub = _hub_with_events(tmp_path)
     httpd, base = _serve(hub)

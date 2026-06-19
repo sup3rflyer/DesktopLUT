@@ -103,6 +103,10 @@ function renderState(s) {
                        paused: "paused (awaiting decision)", done: "done", unknown: "—" };
   $("live-text").textContent = LIVE_LABEL[light] || light;
   $("live-age").textContent = (lv.age_s !== null && lv.age_s !== undefined) ? `${num(lv.age_s, 0)}s ago` : "";
+  $("btn-pause").textContent = light === "paused" ? "Resume" : "Pause";
+  $("btn-pause").title = light === "paused"
+    ? "Resume the paused run"
+    : "Pause briefly; rolls back automatically after about 3 minutes";
 
   // phase header
   $("ph-phase").textContent = s.phase || "—";
@@ -412,6 +416,20 @@ function wireUi() {
       toast("export failed");
     } finally {
       $("btn-export").disabled = false;
+    }
+  });
+  $("btn-pause").addEventListener("click", async () => {
+    const paused = lastState && lastState.liveness && lastState.liveness.light === "paused";
+    if (!paused && !confirm("Pause briefly? The run parks neutral and rolls back if not resumed within about 3 minutes.")) return;
+    $("btn-pause").disabled = true;
+    try {
+      const j = await postJson(paused ? "/api/resume" : "/api/pause");
+      if (j.ok) toast(paused ? "resume requested" : "pause requested — rollback timer started");
+      else toast((paused ? "resume" : "pause") + " failed: " + (j.error || ""));
+    } catch (e) {
+      toast(paused ? "resume failed" : "pause failed");
+    } finally {
+      $("btn-pause").disabled = false;
     }
   });
   // Cancel: drop control.json into the run; the live process rolls back at its next checkpoint.

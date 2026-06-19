@@ -170,3 +170,47 @@ def test_watchdog_polls_cancel_check_and_aborts(tmp_path):
             raise AssertionError("watchdog never latched the cancel")
     finally:
         live.stop()
+
+
+def test_pause_resumes_and_marks_drift_check_after_long_hold(tmp_path):
+    clk = _Clock()
+    controls = iter([
+        {"action": "pause", "timeout_s": 180},
+        {"action": "pause", "timeout_s": 180},
+        {"action": "resume"},
+    ])
+    resumed = []
+    live = Liveness(
+        RunLog(tmp_path / "e.jsonl"),
+        stall_after_s=1000.0,
+        control_check=lambda: next(controls),
+        on_resume=lambda payload: resumed.append(payload),
+        clock=clk,
+        sleep=lambda dt: clk.advance(75.0),
+    )
+    live.progress("measure")
+    live.check("measure")
+
+    events = read_events(tmp_path / "e.jsonl")
+    seams = [e for e in events if e.event == Ev.SEAM and e.data.get("key") == "operator_pause"]
+    assert [s.data["status"] for s in seams] == ["paused", "resumed"]
+    assert resumed and resumed[0]["drift_check_required"] is True
+
+
+def test_pause_timeout_rolls_back_as_cancel(tmp_path):
+    clk = _Clock()
+    live = Liveness(
+        RunLog(tmp_path / "e.jsonl"),
+        stall_after_s=1000.0,
+        control_check=lambda: {"action": "pause", "timeout_s": 3, "on_timeout": "rollback"},
+        clock=clk,
+        sleep=lambda dt: clk.advance(dt),
+    )
+    live.progress("measure")
+    with pytest.raises(RunCancelled) as ei:
+        live.check("measure")
+
+    assert ei.value.reason == "pause timeout"
+    events = read_events(tmp_path / "e.jsonl")
+    assert any(e.event == Ev.SEAM and e.data.get("status") == "paused" for e in events)
+    assert any(e.event == Ev.NOTE and e.data.get("rollback") for e in events)

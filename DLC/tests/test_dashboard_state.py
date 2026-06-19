@@ -162,6 +162,17 @@ def test_paused_seam_shows_paused_not_stalled():
     assert st.snapshot(T0 + timedelta(seconds=906))["liveness"]["light"] == "live"
 
 
+def test_resumed_pause_seam_clears_paused_light():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.SEAM, t=T0, stage="measure", key="operator_pause", status="paused"))
+    assert st.snapshot(T0 + timedelta(seconds=10))["liveness"]["light"] == "paused"
+
+    st.ingest(_ev(Ev.SEAM, t=T0 + timedelta(seconds=20), stage="measure",
+                  key="operator_pause", status="resumed"))
+    assert st.snapshot(T0 + timedelta(seconds=21))["liveness"]["light"] == "live"
+
+
 def test_alive_but_wedged_goes_amber_then_red_while_heartbeats_continue():
     """The 53-min failure shape: the process is alive (heartbeats keep coming) but makes
     NO progress. Event-age stays fresh, yet the light must warn — progress-age is the

@@ -42,7 +42,7 @@ from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import numpy as np
 
@@ -346,6 +346,7 @@ class Calibration:
         decision_overrides: Optional[dict[str, "Decision"]] = None,
         skip_gswb: bool = False,
         stall_kill_hook: Optional[Callable[[], None]] = None,
+        pause_handler: Optional[Callable[[Mapping[str, Any]], None]] = None,
         enable_watchdog: bool = False,
     ) -> None:
         self.ctx = ctx
@@ -378,6 +379,7 @@ class Calibration:
         # The correction-build launches Argyll ccxxmake in its own console (live only); an
         # injectable seam keeps tests/sim from spawning a real process.
         self._probe_launcher = probe_launcher or self._default_launch_ccxxmake
+        self._pause_handler = pause_handler
 
         self._state = _common.load_dlc_state(ctx)
         self.calib: dict[str, Any] = self._state.setdefault("calib", {})
@@ -399,7 +401,9 @@ class Calibration:
         # CANCEL a run it's watching — the actionable half of mid-run gating. A latched cancel
         # becomes a clean RunCancelled abort at the next checkpoint.
         self.liveness = Liveness(self.runlog, on_stall=stall_kill_hook,
-                                 cancel_check=self._cancel_requested_on_disk)
+                                 control_check=self._control_on_disk,
+                                 on_pause=self._pause_requested,
+                                 on_resume=self._resume_requested)
         self._enable_watchdog = enable_watchdog
 
     # -- persistence ------------------------------------------------------
@@ -413,19 +417,30 @@ class Calibration:
     def _control_path(self) -> Path:
         return self.ctx.root / "control.json"
 
+    def _control_on_disk(self) -> Optional[Mapping[str, Any]]:
+        try:
+            p = self._control_path()
+            if not p.exists():
+                return None
+            ctrl = json.loads(p.read_text(encoding="utf-8"))
+            return ctrl if isinstance(ctrl, dict) else None
+        except Exception:  # noqa: BLE001 - a bad control file never crashes the run
+            return None
+
     def _cancel_requested_on_disk(self) -> bool:
         """Cooperative cancel: an LLM/operator wrote ``control.json`` (via
         ``dlc-calibrate --cancel --run <dir>``) asking this run to stop. Polled by the
         watchdog thread AND at every stage boundary. Best-effort — a half-written file or
         a read race just reads as 'no cancel' and is retried on the next poll."""
-        try:
-            p = self._control_path()
-            if not p.exists():
-                return False
-            ctrl = json.loads(p.read_text(encoding="utf-8"))
-            return str(ctrl.get("action", "")).strip().lower() == "cancel"
-        except Exception:  # noqa: BLE001 - a bad control file never crashes the run
-            return False
+        ctrl = self._control_on_disk()
+        return str((ctrl or {}).get("action", "")).strip().lower() == "cancel"
+
+    def _pause_requested(self, ctrl: Mapping[str, Any]) -> None:
+        if self._pause_handler is not None:
+            self._pause_handler(ctrl)
+
+    def _resume_requested(self, _ctrl: Mapping[str, Any]) -> None:
+        self._consume_control()
 
     def _consume_control(self) -> None:
         """Delete the control file once a cancel is acted on, so a later resume of the same
@@ -439,7 +454,18 @@ class Calibration:
         """Honour a cooperative cancel at a stage boundary — covers a run with no watchdog
         thread (tests / autonomous) and a cancel issued while the run was paused between
         invocations (resume picks it up at the first boundary)."""
-        if self._cancel_requested_on_disk():
+        ctrl = self._control_on_disk()
+        action = str((ctrl or {}).get("action", "")).strip().lower()
+        if action == "pause":
+            try:
+                self.liveness.check(self.runlog.phase or "run")
+            except RunCancelled as exc:
+                self._consume_control()
+                raise CalibrationAborted(StageOutcome(
+                    self.runlog.phase or "run", "aborted",
+                    digest={"message": str(exc), "cancelled": True})) from exc
+            return
+        if action == "cancel":
             self._consume_control()
             raise CalibrationAborted(StageOutcome(
                 self.runlog.phase or "run", "aborted",
@@ -2942,12 +2968,23 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             except Exception:  # noqa: BLE001
                 pass
 
+    def _pause_park(_ctrl: Mapping[str, Any]) -> None:
+        if presenter is None:
+            return
+        max_cv = (1 << bit_depth) - 1
+        mid = int(round(0.5 * max_cv))
+        patch = MeasurePatch(label="pause-neutral", rgb=(mid, mid, mid),
+                             signal=(0.5, 0.5, 0.5), role="neutral_ref",
+                             bit_depth=bit_depth)
+        presenter.show(patch)
+
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
                         characterize_config=characterize_config, decision_overrides=overrides,
                         skip_gswb=args.skip_gswb,
-                        stall_kill_hook=_stall_kill, enable_watchdog=True)
+                        stall_kill_hook=_stall_kill, pause_handler=_pause_park,
+                        enable_watchdog=True)
     result = None
     paused = False
     try:
