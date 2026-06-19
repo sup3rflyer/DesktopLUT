@@ -10,6 +10,7 @@
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const fmt = (n, d) => (n == null || Number.isNaN(Number(n))) ? "" : Number(n).toFixed(d == null ? 2 : d);
   const niceTicks = (lo, hi, n) => { const o = []; for (let i = 0; i <= n; i++) o.push(lo + (hi - lo) * i / n); return o; };
+  const title = (s) => `<title>${esc(s)}</title>`;
 
   function Plot(o) {
     const W = o.w || VB.w, H = o.h || VB.h;
@@ -59,7 +60,10 @@
     const pr = d.primaries || {};
     if (pr.r && pr.g && pr.b) {
       const poly = [pr.r, pr.g, pr.b].map((p) => `${fmt(P.px(p[0]), 1)},${fmt(P.py(p[1]), 1)}`).join(" ");
-      P.add(`<polygon points="${poly}" class="ch-gamut"/>`);
+      P.add(`<polygon points="${poly}" class="ch-gamut">${title("target gamut: Rec.709 / sRGB")}</polygon>`);
+      [["R", pr.r], ["G", pr.g], ["B", pr.b]].forEach(([lab, p]) => {
+        P.add(`<text x="${fmt(P.px(p[0]), 1)}" y="${fmt(P.py(p[1]) - 5, 1)}" class="ch-note" text-anchor="middle">${lab}</text>`);
+      });
     }
     const pts = d.points || [];
     const cap = 2500, step = pts.length > cap ? Math.ceil(pts.length / cap) : 1;
@@ -67,10 +71,12 @@
       const p = pts[i];
       // inline style beats the CSS class fill, so a per-patch colour actually shows
       const fill = p.c ? ` style="fill:${esc(p.c)}"` : "";
-      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}/>`);
+      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}>${title(`${p.neutral ? "neutral" : "colour"} xy ${fmt(p.x, 4)}, ${fmt(p.y, 4)}`)}</circle>`);
     }
-    if (d.white && d.white.length >= 2)
-      P.add(`<circle cx="${fmt(P.px(d.white[0]), 1)}" cy="${fmt(P.py(d.white[1]), 1)}" r="4.5" class="ch-white"/>`);
+    if (d.white && d.white.length >= 2) {
+      P.add(`<circle cx="${fmt(P.px(d.white[0]), 1)}" cy="${fmt(P.py(d.white[1]), 1)}" r="4.5" class="ch-white">${title(`target white xy ${fmt(d.white[0], 4)}, ${fmt(d.white[1], 4)}`)}</circle>`);
+      P.add(`<text x="${fmt(P.px(d.white[0]) + 7, 1)}" y="${fmt(P.py(d.white[1]) - 7, 1)}" class="ch-note">white</text>`);
+    }
     return P.svg();
   };
 
@@ -86,7 +92,7 @@
     const g = d.gamma || 2.2;
     P.pathLine(niceTicks(0, 1, 40).map((s) => [s, Math.pow(s, g)]), "ch-ref");
     P.pathLine(pts.map((p) => [p.signal, p.Y / ymax]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot"/>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(Math.pow(p.signal, g), 4)}`)}</circle>`));
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">γ ${fmt(g, 2)}</text>`);
     return P.svg();
   };
@@ -101,9 +107,12 @@
     const P = Plot({ xmin: 0, xmax: 1, ymin: lo, ymax: hi });
     P.gridX([0, 0.5, 1], (t) => fmt(t, 1));
     P.gridY(niceTicks(lo, hi, 4), (t) => Math.round(t));
-    if (targetCct) P.pathLine([[0, targetCct], [1, targetCct]], "ch-ref");
+    if (targetCct) {
+      P.pathLine([[0, targetCct], [1, targetCct]], "ch-ref");
+      P.add(`<text x="${P.W - 16}" y="${fmt(P.py(targetCct) - 5, 1)}" text-anchor="end" class="ch-note">target ${Math.round(targetCct)}K</text>`);
+    }
     P.pathLine(pts.map((p) => [p.signal, p.cct]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot"/>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K`)}</circle>`));
     return P.svg();
   };
 
@@ -117,7 +126,8 @@
     P.gridY([-span, 0, span], (t) => fmt(t, 3));
     P.pathLine([[0, 0], [1, 0]], "ch-ref");
     P.pathLine(pts.map((p) => [p.signal, p.duv]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.2" class="ch-dot"/>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | target 0`)}</circle>`));
+    P.add(`<text x="${P.W - 16}" y="${fmt(P.py(0) - 5, 1)}" text-anchor="end" class="ch-note">target 0</text>`);
     return P.svg();
   };
 
@@ -139,13 +149,13 @@
     items.forEach((it, i) => {
       const x0 = P.px(i) + bw * 0.15, w = Math.max(1, bw * 0.7);
       const yA = P.py(Math.max(0, it.error)), yB = P.py(Math.min(0, it.error));
-      P.add(`<rect x="${fmt(x0, 1)}" y="${fmt(Math.min(yA, yB), 1)}" width="${fmt(w, 1)}" height="${fmt(Math.max(1, Math.abs(yB - yA)), 1)}" fill="${esc(it.color)}" stroke="#000" stroke-width=".3"/>`);
+      P.add(`<rect x="${fmt(x0, 1)}" y="${fmt(Math.min(yA, yB), 1)}" width="${fmt(w, 1)}" height="${fmt(Math.max(1, Math.abs(yB - yA)), 1)}" fill="${esc(it.color)}" stroke="#000" stroke-width=".3">${title(`${it.label}: ${(it.error >= 0 ? "+" : "")}${fmt(it.error * 100, 1)}% luminance error, ${it.n || 1} patch(es)`)}</rect>`);
       if (showLabels) {
         const lx = P.px(i) + bw / 2, ly = P.H - P.m.b + 11;
         P.add(`<text x="${fmt(lx, 1)}" y="${fmt(ly, 1)}" transform="rotate(-60 ${fmt(lx, 1)} ${fmt(ly, 1)})" text-anchor="end" class="ch-tick">${esc(it.label)}</text>`);
       }
     });
-    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">luminance error</text>`);
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">target 0% error</text>`);
     return P.svg();
   };
 
@@ -162,8 +172,8 @@
     P.pathLine(its.map((r) => [r.iteration, r.measured_max_de]), "ch-line-max");
     P.pathLine(its.map((r) => [r.iteration, r.measured_mean_de]), "ch-line");
     its.forEach((r) => {
-      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_max_de), 1)}" r="2" class="ch-dot-max"/>`);
-      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_mean_de), 1)}" r="2" class="ch-dot"/>`);
+      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_max_de), 1)}" r="2" class="ch-dot-max">${title(`iteration ${r.iteration}: max dE ${fmt(r.measured_max_de, 3)}, above target ${r.above_threshold || 0}`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_mean_de), 1)}" r="2" class="ch-dot">${title(`iteration ${r.iteration}: mean dE ${fmt(r.measured_mean_de, 3)}`)}</circle>`);
     });
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">max / mean ΔE</text>`);
     return P.svg();
@@ -180,6 +190,7 @@
     P.gridX(niceTicks(0, Math.max(...xs) || 1, 4), (t) => Math.round(t) + "s");
     P.gridY(niceTicks(lo, hi, 4), (t) => Math.round(t));
     P.pathLine(pts.map((p) => [p.elapsed_s, p.cct]), "ch-line");
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="1.8" class="ch-dot">${title(`${Math.round(p.elapsed_s)}s | CCT ${Math.round(p.cct)}K${p.Y != null ? " | Y " + fmt(p.Y, 2) : ""}`)}</circle>`));
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">white CCT vs time</text>`);
     return P.svg();
   };
