@@ -34,6 +34,18 @@ class MetricThresholds:
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def acceptance_targets(self) -> dict[str, float]:
+        """Just the dE **acceptance** targets — the subset the 'within quality?' gate compares
+        against, and the only fields the verify digest/report should advertise as quality
+        targets. Excludes the iteration-control knobs (``min_improvement``, ``max_iterations``,
+        the LUT-integrity tolerances) that share this dataclass but are not acceptance criteria."""
+        return {k: getattr(self, k) for k in ACCEPTANCE_FIELDS}
+
+
+# The acceptance-target subset of MetricThresholds (vs the iteration-control knobs): what the
+# verify gate checks and the only fields the verify digest should present as "quality targets".
+ACCEPTANCE_FIELDS = ("avg_de2000", "p95_de2000", "max_de2000", "white_de2000")
+
 
 THRESHOLD_FIELDS = {
     "avg_de2000",

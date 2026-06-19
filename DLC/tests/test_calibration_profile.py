@@ -361,3 +361,16 @@ def test_resolve_hdr_target_rejects_sdr_target():
     p = cp.Profile.synthetic()
     with pytest.raises(ValueError):
         p.resolve_hdr_target("srgb_g22")
+
+
+def test_acceptance_targets_excludes_iteration_control_knobs():
+    from dlc.decisions import MetricThresholds
+
+    at = MetricThresholds().acceptance_targets()
+    assert set(at) == {"avg_de2000", "p95_de2000", "max_de2000", "white_de2000"}
+    # The loop-control knobs share the dataclass but are NOT acceptance criteria.
+    for knob in ("min_improvement", "max_iterations", "max_lut_neighbor_delta",
+                 "max_lut_monotonicity_violations"):
+        assert knob not in at
+    # QualityTargets (the profile's advisory bar) inherits the projection.
+    assert set(cp.QualityTargets().acceptance_targets()) == set(at)

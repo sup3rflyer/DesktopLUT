@@ -2070,7 +2070,10 @@ class Calibration:
                       "max_de2000": round(summary.max_de2000, 3), "white_de2000": round(summary.white_de2000, 3),
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
                       "patch_count": summary.patch_count, "within_quality": within,
-                      "quality_targets": q.as_dict(),
+                      # Only the dE acceptance targets — not the iteration-control knobs that
+                      # share MetricThresholds — so the verify seam (the LLM's judgment surface)
+                      # sees quality criteria, not loop knobs.
+                      "quality_targets": q.acceptance_targets(),
                       "metric": metric_name, "optimize_metric": "dE_ITP",
                       "target_white_xy": [round(wx, 5), round(wy, 5)],
                       "white_provenance": self._resolved_white().provenance,
