@@ -31,6 +31,21 @@ def test_synthetic_profile_lookups():
     assert p.target_for(0, "SDR").luminance_nits == 120.0
 
 
+def test_drift_headroom_defaults_and_overrides():
+    p = cp.Profile.synthetic()
+    d = p.display_for(0)
+    # unset ⇒ the documented default
+    assert d.drift_headroom == cp.DEFAULT_DRIFT_HEADROOM
+    # a valid quirk overrides
+    d.quirks["drift_headroom"] = 2.5
+    assert d.drift_headroom == 2.5
+    # malformed / non-positive values fall back to the default (never disable the watch)
+    d.quirks["drift_headroom"] = "nope"
+    assert d.drift_headroom == cp.DEFAULT_DRIFT_HEADROOM
+    d.quirks["drift_headroom"] = 0
+    assert d.drift_headroom == cp.DEFAULT_DRIFT_HEADROOM
+
+
 def test_display_for_unknown_monitor_raises():
     p = cp.Profile.synthetic(monitor=0)
     with pytest.raises(KeyError):

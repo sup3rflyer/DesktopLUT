@@ -796,16 +796,25 @@ class Calibration:
             if dip.recommended_neutral_interval:
                 kw["neutral_interval"] = dip.recommended_neutral_interval
             thr = dip.recommended_drift_threshold
+            # Headroom over the characterize-soak band: the soak's read-noise/creep-derived
+            # threshold is measured over a SHORT window, but a full calibration runs far longer
+            # and sweeps the whole gamut, so it wanders more (≈2x observed, 2026-06-19). Scale the
+            # *measured* threshold up rather than hardwiring an absolute dE, so the watch tolerates
+            # expected long-run wander but still trips on a genuine excursion. (Per-display
+            # learnable via the profile quirk; default DEFAULT_DRIFT_HEADROOM.)
+            if thr:
+                thr = thr * self.display.drift_headroom
             # Envelope-aware run-time drift watch: a fluctuating panel ALWAYS wanders within its
             # measured fluctuation_envelope, so the interleaved drift reference must tolerate that
             # band — it re-references frequently (the small neutral_interval the DIP recommends for
             # fluctuating) but only FLAGs / re-warms when drift LEAVES the envelope, never thrashing
-            # re-measures on the known wander. The threshold is therefore at least the envelope
-            # (a no-op on a convergent panel, whose envelope is ~read noise).
+            # re-measures on the known wander. The envelope is the panel's DEMONSTRATED wander, so it
+            # is a hard floor (NOT inflated by the headroom — that would over-loosen a fluctuating
+            # watch); a no-op on a convergent panel, whose envelope is ~read noise.
             if dip.fluctuation_envelope:
                 thr = max(thr or 0.0, dip.fluctuation_envelope)
             if thr:
-                kw["drift_threshold"] = thr
+                kw["drift_threshold"] = round(thr, 6)
         return MeasureLoopConfig(**kw)
 
     def _resolve_white_now(self) -> cp.WhitePointResolution:

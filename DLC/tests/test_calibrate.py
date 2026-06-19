@@ -1290,7 +1290,8 @@ def test_dip_recommendations_flow_into_loop_config(tmp_path: Path):
     dip = calib._dip()
     cfg = calib._loop_config_for(dip)
     assert cfg.neutral_interval == 12
-    assert cfg.drift_threshold == 0.009
+    # the measured threshold gets long-run headroom (0.009 * DEFAULT_DRIFT_HEADROOM=2.0)
+    assert cfg.drift_threshold == 0.018
     # the profile's known cold channel still wins over the DIP's (it is the human-authored fact)
     assert cfg.cold_channel == calib.display.temperamental_channel
 
@@ -1309,7 +1310,24 @@ def test_fluctuation_envelope_raises_runtime_drift_threshold(tmp_path: Path):
         recommended_neutral_interval=4, recommended_drift_threshold=0.006, made="2026-06-16"))
     cfg = calib._loop_config_for(calib._dip())
     assert cfg.neutral_interval == 4              # frequent re-reference (no steady state)
-    assert cfg.drift_threshold == 0.018           # raised to the envelope, not the smaller read-noise threshold
+    # The measured envelope (0.018) is the panel's DEMONSTRATED wander → a hard floor that is NOT
+    # inflated by the long-run headroom (recommended 0.006 * 2.0 = 0.012 < 0.018, so the envelope
+    # wins). Inflating it would over-loosen a fluctuating watch.
+    assert cfg.drift_threshold == 0.018
+
+
+def test_drift_headroom_quirk_scales_the_measured_threshold(tmp_path: Path):
+    # The per-display drift_headroom quirk overrides the default multiplier and scales the
+    # soak-measured threshold up for the longer calibration run (no envelope ⇒ headroom governs).
+    from dlc.dip import DisplayInstrumentProfile, NoiseBand
+    calib = _make(tmp_path, "dip_headroom")
+    calib.display.quirks["drift_headroom"] = 3.0
+    calib._dip_store().record(DisplayInstrumentProfile(
+        display="Synthetic mini-LED",
+        noise_model=[NoiseBand(nits=120.0, sigma_de=0.05, reads=10)],
+        recommended_drift_threshold=0.004, made="2026-06-16"))
+    cfg = calib._loop_config_for(calib._dip())
+    assert cfg.drift_threshold == 0.012           # 0.004 * 3.0
 
 
 def test_characterize_plan_veto_aborts_cleanly(tmp_path: Path):

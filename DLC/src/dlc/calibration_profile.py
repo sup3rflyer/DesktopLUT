@@ -121,6 +121,14 @@ class ProbeMatchSpec:
     settle_seconds: Optional[float] = None            # per-patch settle before each read (via ccxxmake -C)
 
 
+# The characterize soak measures the warmed channel-balance wander over a SHORT window; a
+# full calibration runs far longer and sweeps the whole gamut, so it legitimately wanders
+# more than the soak observed (~2x the soak envelope on the PA32UCXR, 2026-06-19). The
+# run-time drift watch scales the *measured* band by this headroom so it doesn't re-warm on
+# expected long-run wander while still flagging a genuine excursion. Per-display learnable.
+DEFAULT_DRIFT_HEADROOM = 2.0
+
+
 @dataclass(frozen=True)
 class PanelInfo:
     tech: Optional[str] = None
@@ -159,6 +167,18 @@ class DisplayConfig:
     def settle_delta_de(self) -> Optional[float]:
         v = self.quirks.get("settle_delta_de")
         return float(v) if v is not None else None
+
+    @property
+    def drift_headroom(self) -> float:
+        """Multiplier on the DIP-measured run-time drift threshold (see
+        ``DEFAULT_DRIFT_HEADROOM``). Per-display ``quirks['drift_headroom']`` learnable;
+        falls back to the default and ignores a malformed/non-positive value."""
+        v = self.quirks.get("drift_headroom")
+        try:
+            f = float(v) if v is not None else DEFAULT_DRIFT_HEADROOM
+        except (TypeError, ValueError):
+            return DEFAULT_DRIFT_HEADROOM
+        return f if f > 0 else DEFAULT_DRIFT_HEADROOM
 
     def target_name(self, mode: str) -> Optional[str]:
         return self.sdr_target if mode.upper() == "SDR" else self.hdr_target
