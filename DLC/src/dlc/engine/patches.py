@@ -40,6 +40,7 @@ __all__ = [
     "pq_to_luminance",
     "uniform_levels",
     "perceptual_levels",
+    "shadow_levels",
     "patch_energy",
     "mean_patch_energy",
     "sort_patches",
@@ -296,6 +297,35 @@ def perceptual_levels(n: int, transfer: Transfer, *, max_cv: int | None = None,
     return out
 
 
+def shadow_levels(n: int, transfer: Transfer, *, max_cv: int | None = None,
+                  max_signal: float = 0.20, bias: float = 2.0) -> list[int]:
+    """Extra low-signal code values, biased toward black.
+
+    This is additive: callers merge these into their ordinary whole-range levels
+    so shadow detail gets more samples without sacrificing white/mid/high anchors.
+    ``bias > 1`` packs more points near black; ``max_signal`` bounds the shadow band.
+    """
+    if max_cv is None:
+        max_cv = transfer.max_cv
+    if n < 2:
+        return []
+    top = max(1, min(max_cv, round(max_cv * max(0.0, min(1.0, max_signal)))))
+    b = max(1.0, float(bias))
+    seen: set[int] = set()
+    out: list[int] = []
+    for i in range(n):
+        t = i / (n - 1)
+        v = round(top * (t ** b))
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _merge_levels(*groups: Iterable[int]) -> list[int]:
+    return sorted({int(v) for group in groups for v in group})
+
+
 # ---------------------------------------------------------------------------
 # Ramp mode — grey + RGBCMY (for MHC matrix + base 1D)
 # ---------------------------------------------------------------------------
@@ -318,6 +348,9 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  spacing: str = "uniform", order: str = "thermal",
                  max_cv: int | None = None,
                  include_secondaries: bool = True,
+                 low_light_steps: int = 0,
+                 low_light_signal: float = 0.20,
+                 low_light_bias: float = 2.0,
                  warm_tau: Optional[int] = None) -> list[Patch]:
     """Grey ramp + per-channel colour ramps at each saturation (deduped, then ordered).
 
@@ -340,6 +373,10 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
         levels = perceptual_levels(steps, transfer, max_cv=max_cv)
     else:
         raise ValueError(f"unknown spacing: {spacing!r}")
+    if low_light_steps > 1:
+        levels = _merge_levels(levels, shadow_levels(
+            low_light_steps, transfer, max_cv=max_cv,
+            max_signal=low_light_signal, bias=low_light_bias))
 
     seen: set[Patch] = set()
     patches: list[Patch] = []
@@ -368,12 +405,32 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
 # ---------------------------------------------------------------------------
 
 def cube_patches(transfer: Transfer, *, size: int = 9, order: str = "luminance",
-                 max_cv: int | None = None, warm_tau: Optional[int] = None) -> list[Patch]:
+                 max_cv: int | None = None, low_light_size: int = 0,
+                 low_light_signal: float = 0.20, low_light_bias: float = 2.0,
+                 warm_tau: Optional[int] = None) -> list[Patch]:
     """Uniform ``size**3`` grid in code-value space."""
     if max_cv is None:
         max_cv = transfer.max_cv
     axis = uniform_levels(size, max_cv)
-    patches = [(r, g, b) for r in axis for g in axis for b in axis]
+    patches: list[Patch] = []
+    seen: set[Patch] = set()
+
+    def add(p: Patch) -> None:
+        if p not in seen:
+            seen.add(p)
+            patches.append(p)
+
+    for r in axis:
+        for g in axis:
+            for b in axis:
+                add((r, g, b))
+    if low_light_size > 1:
+        dark = shadow_levels(low_light_size, transfer, max_cv=max_cv,
+                             max_signal=low_light_signal, bias=low_light_bias)
+        for r in dark:
+            for g in dark:
+                for b in dark:
+                    add((r, g, b))
     return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 
 
@@ -385,6 +442,8 @@ def tube_patches(transfer: Transfer, *, cube_size: int = 17, tube_size: int = 65
                  tube_radius: int = 3, grid_type: str = "cub",
                  spines: bool = False, cube_max_cv: int | None = None,
                  order: str = "thermal", max_cv: int | None = None,
+                 low_light_steps: int = 0, low_light_cube_size: int = 0,
+                 low_light_signal: float = 0.20, low_light_bias: float = 2.0,
                  warm_tau: Optional[int] = None) -> list[Patch]:
     """Cube (or BCC) grid + a Manhattan-radius tube around the neutral axis.
 
@@ -404,6 +463,10 @@ def tube_patches(transfer: Transfer, *, cube_size: int = 17, tube_size: int = 65
 
     cube_levels = levels(cube_max_cv, cube_size)
     tube_levels = levels(max_cv, tube_size)
+    if low_light_steps > 1:
+        tube_levels = _merge_levels(tube_levels, shadow_levels(
+            low_light_steps, transfer, max_cv=max_cv,
+            max_signal=low_light_signal, bias=low_light_bias))
 
     patches: set[Patch] = set()
 
@@ -412,6 +475,14 @@ def tube_patches(transfer: Transfer, *, cube_size: int = 17, tube_size: int = 65
         for g in cube_levels:
             for b in cube_levels:
                 patches.add((r, g, b))
+
+    if low_light_cube_size > 1:
+        dark = shadow_levels(low_light_cube_size, transfer, max_cv=cube_max_cv,
+                             max_signal=low_light_signal, bias=low_light_bias)
+        for r in dark:
+            for g in dark:
+                for b in dark:
+                    patches.add((r, g, b))
 
     # 2. BCC offset grid (midpoints between cube levels)
     if grid_type == "bcc":
@@ -500,6 +571,9 @@ def _hsv_to_rgb_cv(h: float, s: float, v: float) -> Patch:
 def gamut_patches(transfer: Transfer, *, lum_steps: int = 17, hues: int = 12,
                   lum_bias: float = 1.3, floor_nits: float = 0.19,
                   order: str = "luminance", max_cv: int | None = None,
+                  low_light_steps: int = 0,
+                  low_light_signal: float = 0.20,
+                  low_light_bias: float = 2.0,
                   warm_tau: Optional[int] = None) -> list[Patch]:
     """Content-weighted volumetric set: a power-biased luminance axis (denser at
     low end), saturation shells dense near neutral, ``hues`` hue angles per
@@ -517,6 +591,13 @@ def gamut_patches(transfer: Transfer, *, lum_steps: int = 17, hues: int = 12,
         if cv not in seen_lum:
             seen_lum.add(cv)
             lum_values.append(cv)
+    if low_light_steps > 1:
+        for cv in shadow_levels(low_light_steps, transfer, max_cv=max_cv,
+                                max_signal=low_light_signal, bias=low_light_bias):
+            if cv not in seen_lum:
+                seen_lum.add(cv)
+                lum_values.append(cv)
+    lum_values.sort()
 
     hue_angles = [i * (360.0 / hues) for i in range(hues)]
 

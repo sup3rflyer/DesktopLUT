@@ -34,6 +34,7 @@ from dlc.calibrate import (
     MappingAdjudicator,
     PatchSizes,
     apply_set_hdr,
+    build_neutral_set,
     build_ramp_set,
     build_verify_set,
     build_volumetric_set,
@@ -791,6 +792,7 @@ def test_mapping_adjudicator_pause_resume_does_not_remeasure(tmp_path: Path):
     panel = _CountingPanel()
     decisions: dict[str, Decision] = {}
     pauses = 0
+    seams: list[str] = []
     reads_after_first_completion = None
 
     while True:
@@ -807,6 +809,7 @@ def test_mapping_adjudicator_pause_resume_does_not_remeasure(tmp_path: Path):
             break
         except AdjudicationRequired as exc:
             pauses += 1
+            seams.append(exc.request.seam)
             assert exc.request.recommendation in exc.request.options
             # record the recommendation (what an LLM rubber-stamp would do) and resume
             decisions[exc.request.key] = Decision(exc.request.recommendation, note="resumed")
@@ -815,8 +818,9 @@ def test_mapping_adjudicator_pause_resume_does_not_remeasure(tmp_path: Path):
             assert pauses <= 6
 
     assert result.status == "completed"
-    # exactly the two always-on seams paused the run (plan veto, verify acceptance)
-    assert pauses == 2
+    # Plan + verify are always-on; with the denser dark volumetric set this tiny synthetic
+    # run also surfaces the optimizer-floor seam. Resume must still memoise measurements.
+    assert seams == ["plan_veto", "optimize_floor", "verify"]
     # the final resume (everything memoised) re-measured nothing: the count is
     # unchanged from when the run first reached the verify seam.
     assert panel.count == reads_after_first_completion
@@ -1123,9 +1127,11 @@ def test_patch_sizes_from_dict_and_cli_merge():
     # profile `patches:` block parses (saturations -> tuple); CLI .merged() overrides only the
     # keys actually passed (None is ignored), so CLI beats profile while leaving the rest.
     base = PatchSizes.from_dict({"raw_ramp_steps": 33, "raw_saturations": [1.0, 0.5],
-                                 "volumetric_mode": "cube", "spines": True})
+                                 "volumetric_mode": "cube", "spines": True,
+                                 "low_light_signal": 0.18, "low_light_bias": 2.5})
     assert base.raw_ramp_steps == 33 and base.raw_saturations == (1.0, 0.5)
     assert base.volumetric_mode == "cube" and base.spines is True
+    assert base.low_light_signal == 0.18 and base.low_light_bias == 2.5
     assert base.cube_size == 9                       # untouched default preserved
     merged = base.merged(cube_size=13, raw_ramp_steps=None)
     assert merged.cube_size == 13 and merged.raw_ramp_steps == 33   # None override ignored
@@ -1134,7 +1140,8 @@ def test_patch_sizes_from_dict_and_cli_merge():
 def test_volumetric_mode_selects_generator():
     # The user/agent chooses HOW the 3D-LUT set samples the cube — not a fixed preset.
     t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
-    cube = build_volumetric_set(PatchSizes(volumetric_mode="cube", cube_size=5), t)
+    cube = build_volumetric_set(PatchSizes(volumetric_mode="cube", cube_size=5,
+                                           low_light_cube_size=0), t)
     assert len(cube) == 125                          # 5^3 uniform grid
     tube = build_volumetric_set(PatchSizes(volumetric_mode="tube", cube_size=5,
                                            tube_size=9, tube_radius=2), t)
@@ -1166,6 +1173,20 @@ def test_patch_roles_split_grayscale_volume_and_verify():
     assert len(verify) < len(vol)                                 # verify is lighter than the build
     assert any(_is_secondary(p) for p in verify)                  # but still sweeps the gamut hues
     assert any(p[0] == p[1] == p[2] for p in verify)              # and the grayscale
+
+
+def test_default_patch_sizes_add_low_light_density():
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
+    old = PatchSizes(low_light_steps=0, low_light_cube_size=0)
+    new = PatchSizes()
+    cap = round(t.max_cv * new.low_light_signal)
+
+    for builder in (build_ramp_set, build_volumetric_set, build_neutral_set):
+        base = builder(old, t)
+        dense = builder(new, t)
+        assert len(dense) > len(base)
+        assert sum(1 for p in dense if max(p) <= cap) > sum(1 for p in base if max(p) <= cap)
+    assert build_verify_set(old, t) == build_verify_set(new, t)
 
 
 def test_opting_into_raw_secondaries():
@@ -1203,7 +1224,8 @@ def test_custom_patch_sizes_flow_through_to_measurement(tmp_path: Path):
     ctx = open_run(tmp_path / "custom") if (tmp_path / "custom" / "manifest.json").exists() \
         else create_run("SDR", display="synthetic", run_dir=tmp_path / "custom")
     profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
-    sizes = PatchSizes(raw_ramp_steps=9, volumetric_mode="cube", cube_size=3, neutral_steps=9)
+    sizes = PatchSizes(raw_ramp_steps=9, volumetric_mode="cube", cube_size=3, neutral_steps=9,
+                       low_light_cube_size=0)
     calib = Calibration(ctx=ctx, profile=profile, monitor=0, mode="SDR",
                         controller=CalibrationController.mock(), measure=_perfect_panel(),
                         adjudicator=AutoAdjudicator(), optimize_config=_OPT, patch_sizes=sizes,
@@ -1234,7 +1256,7 @@ def test_preview_patches_cli_sizes_a_run_offline(tmp_path: Path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["flow"] == "full"
     assert out["patch_sizes"]["volumetric_mode"] == "cube"   # profile block applied
-    assert out["patch_plan"]["stages"]["post-mhc"] == 125    # 5^3 cube
+    assert out["patch_plan"]["stages"]["post-mhc"] > 125     # 5^3 cube + default dark mini-cube
     assert not (path.parent / "runs").exists()               # no run folder created
 
 

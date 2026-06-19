@@ -67,6 +67,17 @@ def test_floor_is_positive_and_dark():
     assert 0 < pw.floor_cv() < pw.max_cv // 2
 
 
+def test_shadow_levels_add_low_light_density():
+    tf = P.Transfer.power(2.2, 120.0, bit_depth=8)
+    shadow = P.shadow_levels(9, tf, max_signal=0.20, bias=2.0)
+    uniform = P.uniform_levels(9, tf.max_cv)
+
+    assert shadow[0] == 0
+    assert shadow[-1] <= round(tf.max_cv * 0.20)
+    assert shadow[1] < uniform[1]                 # packed toward black
+    assert len(set(shadow) - set(uniform)) >= 6   # genuinely additive, not a no-op
+
+
 def test_ramp_anchors_and_dedup():
     tf = P.Transfer.power(2.2, 120.0)
     ramp = P.ramp_patches(tf, steps=21, order="thermal")
@@ -98,6 +109,17 @@ def test_cube_count_and_dedup():
     cube = P.cube_patches(tf, size=9)
     assert len(cube) == 9 ** 3
     assert len(cube) == len(set(cube))
+
+
+def test_cube_low_light_mini_cube_is_additive():
+    tf = P.Transfer.power(2.2, 120.0, bit_depth=8)
+    base = P.cube_patches(tf, size=5, order="none")
+    dense = P.cube_patches(tf, size=5, low_light_size=5, order="none")
+    dark_cap = round(tf.max_cv * 0.20)
+
+    assert len(dense) > len(base)
+    assert len(dense) == len(set(dense))
+    assert sum(1 for p in dense if max(p) <= dark_cap) > sum(1 for p in base if max(p) <= dark_cap)
 
 
 def test_tube_denser_than_cube_with_neutral_core():
@@ -166,6 +188,17 @@ def test_gamut_respects_floor_and_has_neutral_axis():
             assert r >= floor - 1
     greys = sorted({p[0] for p in pts if p[0] == p[1] == p[2]})
     assert greys[0] == 0 and len(greys) >= 5
+
+
+def test_gamut_low_light_levels_are_additive_when_requested():
+    tf = P.Transfer.power(2.2, 120.0, bit_depth=8)
+    base = P.gamut_patches(tf, lum_steps=9, hues=6, order="none")
+    dense = P.gamut_patches(tf, lum_steps=9, hues=6, low_light_steps=9, order="none")
+    dark_cap = round(tf.max_cv * 0.20)
+
+    assert len(dense) > len(base)
+    assert len(dense) == len(set(dense))
+    assert sum(1 for p in dense if max(p) <= dark_cap) > sum(1 for p in base if max(p) <= dark_cap)
 
 
 def test_to_signal_range():

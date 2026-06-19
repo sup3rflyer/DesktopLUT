@@ -52,7 +52,16 @@ from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
 from . import gamut
 from .dip import DipStore, DisplayInstrumentProfile
-from .engine.patches import Transfer, cube_patches, gamut_patches, ramp_patches, sort_patches, tube_patches
+from .engine.patches import (
+    Transfer,
+    cube_patches,
+    gamut_patches,
+    ramp_patches,
+    shadow_levels,
+    sort_patches,
+    tube_patches,
+    uniform_levels,
+)
 from .events import Ev, EventWriter, RunLog
 from .liveness import Liveness, RunCancelled, RunStalled
 from .measure_loop import (
@@ -219,6 +228,13 @@ class PatchSizes:
     # neutral axis (GS+WB tweak / gray-wb flow)
     neutral_steps: int = 17         # grey-axis ramp steps
 
+    # additive shadow density: preserve ordinary whole-range anchors, then add extra low-light
+    # samples where the eye is most sensitive and the meter/panel are most nonlinear.
+    low_light_steps: int = 9         # extra ramp/tube-axis levels inside the shadow band
+    low_light_cube_size: int = 5     # small dark mini-cube for 3D-LUT build coverage
+    low_light_signal: float = 0.20   # shadow band upper bound as normalized signal
+    low_light_bias: float = 2.0      # >1 packs extra levels toward black
+
     # ordering for every stage (drift prevention)
     order: str = "thermal"          # thermal | luminance | random
 
@@ -236,7 +252,7 @@ class PatchSizes:
                 kw[f.name] = tuple(float(x) for x in v)
             elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
-            elif f.name in ("gamut_lum_bias",):
+            elif f.name in ("gamut_lum_bias", "low_light_signal", "low_light_bias"):
                 kw[f.name] = float(v)
             elif f.name in ("raw_spacing", "volumetric_mode", "grid_type", "order"):
                 kw[f.name] = str(v)
@@ -2091,6 +2107,10 @@ class Calibration:
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
         return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
 
+    def _neutral_verify_patches(self) -> list[tuple[int, int, int]]:
+        return build_neutral_verify_set(self.patch_sizes, self._transfer(),
+                                        warm_tau=self._warm_tau())
+
     def _verify_patches(self) -> list[tuple[int, int, int]]:
         return build_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
 
@@ -2196,7 +2216,7 @@ class Calibration:
         gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
                                 ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
         self.stage_gswb_tweak(gw.data["ti3"])
-        ver = self.stage_measure(role="verify", patches=self._neutral_patches(),
+        ver = self.stage_measure(role="verify", patches=self._neutral_verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -2436,6 +2456,9 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
     only if ``raw_include_secondaries`` (off by default — the volumetric set covers them)."""
     return ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
                         spacing=ps.raw_spacing, include_secondaries=ps.raw_include_secondaries,
+                        low_light_steps=ps.low_light_steps,
+                        low_light_signal=ps.low_light_signal,
+                        low_light_bias=ps.low_light_bias,
                         order=ps.order, warm_tau=warm_tau)
 
 
@@ -2445,22 +2468,46 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
     a neutral-axis ``tube`` (default; dense where content lives), a uniform ``cube``, or a
     content-weighted ``gamut`` shell set."""
     if ps.volumetric_mode == "cube":
-        return cube_patches(transfer, size=ps.cube_size, order=ps.order, warm_tau=warm_tau)
+        return cube_patches(transfer, size=ps.cube_size, order=ps.order,
+                            low_light_size=ps.low_light_cube_size,
+                            low_light_signal=ps.low_light_signal,
+                            low_light_bias=ps.low_light_bias,
+                            warm_tau=warm_tau)
     if ps.volumetric_mode == "gamut":
         return gamut_patches(transfer, lum_steps=ps.gamut_lum_steps, hues=ps.gamut_hues,
-                             lum_bias=ps.gamut_lum_bias, order=ps.order, warm_tau=warm_tau)
+                             lum_bias=ps.gamut_lum_bias, order=ps.order,
+                             low_light_steps=ps.low_light_steps,
+                             low_light_signal=ps.low_light_signal,
+                             low_light_bias=ps.low_light_bias,
+                             warm_tau=warm_tau)
     if ps.volumetric_mode != "tube":
         raise ValueError(f"unknown volumetric_mode: {ps.volumetric_mode!r} (tube|cube|gamut)")
     return tube_patches(transfer, cube_size=ps.cube_size, tube_size=ps.tube_size,
                         tube_radius=ps.tube_radius, grid_type=ps.grid_type,
-                        spines=ps.spines, order=ps.order, warm_tau=warm_tau)
+                        spines=ps.spines, order=ps.order,
+                        low_light_steps=ps.low_light_steps,
+                        low_light_cube_size=ps.low_light_cube_size,
+                        low_light_signal=ps.low_light_signal,
+                        low_light_bias=ps.low_light_bias,
+                        warm_tau=warm_tau)
 
 
 def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
                       warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The grey-axis ramp for the GS+WB tweak / gray-wb flow."""
     n = ps.neutral_steps
-    levels = [round(i * transfer.max_cv / (n - 1)) for i in range(n)]
+    levels = uniform_levels(n, transfer.max_cv)
+    if ps.low_light_steps > 1:
+        levels = sorted(set(levels) | set(shadow_levels(
+            ps.low_light_steps, transfer,
+            max_signal=ps.low_light_signal, bias=ps.low_light_bias)))
+    return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
+
+
+def build_neutral_verify_set(ps: PatchSizes, transfer: Transfer, *,
+                             warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The compact grey-axis sanity ramp for gray-wb verification."""
+    levels = uniform_levels(ps.neutral_steps, transfer.max_cv)
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
@@ -2485,7 +2532,7 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
                    "post-mhc": build_volumetric_set, "verify": build_verify_set,
-                   "gray-wb": build_neutral_set, "verify-neutral": build_neutral_set}
+                   "gray-wb": build_neutral_set, "verify-neutral": build_neutral_verify_set}
 
 
 def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer) -> dict[str, Any]:
@@ -2679,6 +2726,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                        help="verify saturation shells (default 1.0 0.5 — saturated + practical mid-sat).")
     patch.add_argument("--neutral-steps", type=int, default=None, dest="neutral_steps",
                        help="grey-axis ramp steps for GS+WB / gray-wb (default 17).")
+    patch.add_argument("--low-light-steps", type=int, default=None, dest="low_light_steps",
+                       help="extra ramp/tube levels inside the shadow band (default 9).")
+    patch.add_argument("--low-light-cube-size", type=int, default=None, dest="low_light_cube_size",
+                       help="dark mini-cube axis for extra 3D-LUT shadow samples (default 5).")
+    patch.add_argument("--low-light-signal", type=float, default=None, dest="low_light_signal",
+                       help="upper bound of the extra shadow band as signal fraction (default 0.20).")
+    patch.add_argument("--low-light-bias", type=float, default=None, dest="low_light_bias",
+                       help="shadow level bias; >1 packs samples toward black (default 2.0).")
     patch.add_argument("--patch-order", choices=["thermal", "luminance", "random"], default=None,
                        dest="order", help="patch ordering — thermal (drift-safe) default.")
     patch.add_argument("--preview-patches", action="store_true", dest="preview_patches",
