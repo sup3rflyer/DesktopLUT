@@ -288,6 +288,7 @@ function connect() {
     seedLog([]);
     lastCharts = null;
     lightboxKey = null;
+    lightboxReturnFocus = null;
     $("charts-stage").textContent = "—";
     $("charts").innerHTML = "";
     $("lb-body").innerHTML = "";
@@ -307,6 +308,7 @@ function connect() {
 let chartsBusy = false;
 let lastCharts = null;
 let lightboxKey = null;
+let lightboxReturnFocus = null;
 async function refreshCharts() {
   if (chartsBusy || document.hidden) return;   // skip while a fetch is in flight or tab hidden
   chartsBusy = true;
@@ -326,26 +328,74 @@ async function refreshCharts() {
 }
 
 /* ── lightbox (image-viewer-style full view of a tile) ──────────── */
-function openLightbox(key, title) {
+function chartParts(fig) {
+  if (!fig) return null;
+  const holder = fig.querySelector("[data-chart]");
+  if (!holder) return null;
+  const cap = fig.querySelector("figcaption");
+  return {
+    key: holder.getAttribute("data-chart"),
+    title: cap ? cap.textContent : "",
+  };
+}
+
+function openLightbox(key, title, opener) {
   lightboxKey = key;
+  lightboxReturnFocus = opener || document.activeElement;
   $("lb-title").textContent = title || key;
   const header = lastState ? lastState.header : null;
   $("lb-body").innerHTML = (window.DLCCharts && lastCharts) ? DLCCharts.build(key, lastCharts, header) : "";
   $("lightbox").hidden = false;
+  $("lb-frame").focus();
 }
-function closeLightbox() { lightboxKey = null; $("lightbox").hidden = true; }
+function closeLightbox() {
+  const wasOpen = !$("lightbox").hidden;
+  lightboxKey = null;
+  $("lightbox").hidden = true;
+  if (wasOpen && lightboxReturnFocus && document.contains(lightboxReturnFocus)) lightboxReturnFocus.focus();
+  lightboxReturnFocus = null;
+}
+
+function trapLightboxTab(e) {
+  if ($("lightbox").hidden || e.key !== "Tab") return;
+  const focusable = Array.from($("lightbox").querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  )).filter((el) => !el.disabled && el.offsetParent !== null);
+  if (focusable.length === 0) {
+    e.preventDefault();
+    $("lb-frame").focus();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
 
 function wireLightbox() {
   $("charts").addEventListener("click", (e) => {
+    const parts = chartParts(e.target.closest(".chart"));
+    if (parts) openLightbox(parts.key, parts.title, e.target.closest(".chart"));
+  });
+  $("charts").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
     const fig = e.target.closest(".chart");
-    if (!fig) return;
-    const holder = fig.querySelector("[data-chart]");
-    const cap = fig.querySelector("figcaption");
-    if (holder) openLightbox(holder.getAttribute("data-chart"), cap ? cap.textContent : "");
+    const parts = chartParts(fig);
+    if (!parts) return;
+    e.preventDefault();
+    openLightbox(parts.key, parts.title, fig);
   });
   $("lb-close").addEventListener("click", closeLightbox);
   $("lightbox").addEventListener("click", (e) => { if (e.target.id === "lightbox") closeLightbox(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeLightbox(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("lightbox").hidden) closeLightbox();
+    trapLightboxTab(e);
+  });
 }
 
 /* ── controls + filters ──────────────────────────────────────── */

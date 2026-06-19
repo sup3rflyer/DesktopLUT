@@ -97,10 +97,17 @@ def test_http_serves_spa_and_assets(tmp_path):
     try:
         status, body = _get(base + "/")
         assert status == 200 and b"mission control" in body
+        assert b'tabindex="0" role="button"' in body
+        assert b'role="dialog" aria-modal="true" aria-labelledby="lb-title"' in body
+        assert b'aria-label="Close chart view"' in body
         status, js = _get(base + "/static/dashboard.js")
         assert status == 200 and b"EventSource" in js
-        status, _ = _get(base + "/static/dashboard.css")
+        assert b"lightboxReturnFocus" in js
+        assert b'e.key !== "Enter" && e.key !== " "' in js
+        assert b'e.key !== "Tab"' in js
+        status, css = _get(base + "/static/dashboard.css")
         assert status == 200
+        assert b".chart:focus-visible" in css
     finally:
         httpd.shutdown()
 

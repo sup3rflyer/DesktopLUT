@@ -109,20 +109,20 @@
       <span class="cm-stage" id="charts-stage">—</span>
     </div>
     <div class="charts-grid" id="charts">
-      <figure class="chart"><figcaption>Color Accuracy · CIE 1931</figcaption><div data-chart="cie"></div></figure>
-      <figure class="chart"><figcaption>Tone Response · EOTF</figcaption><div data-chart="eotf"></div></figure>
-      <figure class="chart"><figcaption>Grayscale CCT</figcaption><div data-chart="graycct"></div></figure>
-      <figure class="chart"><figcaption>Grayscale Duv</figcaption><div data-chart="grayduv"></div></figure>
-      <figure class="chart"><figcaption>Color Luminance</figcaption><div data-chart="colorlum"></div></figure>
-      <figure class="chart"><figcaption>Optimizer convergence</figcaption><div data-chart="optimizer"></div></figure>
-      <figure class="chart"><figcaption>White CCT vs time</figcaption><div data-chart="drift"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Color Accuracy chart"><figcaption>Color Accuracy · CIE 1931</figcaption><div data-chart="cie"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Tone Response chart"><figcaption>Tone Response · EOTF</figcaption><div data-chart="eotf"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale CCT chart"><figcaption>Grayscale CCT</figcaption><div data-chart="graycct"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale Duv chart"><figcaption>Grayscale Duv</figcaption><div data-chart="grayduv"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Color Luminance chart"><figcaption>Color Luminance</figcaption><div data-chart="colorlum"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Optimizer convergence chart"><figcaption>Optimizer convergence</figcaption><div data-chart="optimizer"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open White CCT vs time chart"><figcaption>White CCT vs time</figcaption><div data-chart="drift"></div></figure>
     </div>
   </main>
 
   <!-- ── lightbox (click a tile to view it large) ──────────────── -->
-  <div id="lightbox" class="lightbox" hidden>
-    <div class="lb-frame">
-      <div class="lb-head"><span id="lb-title"></span><button id="lb-close" title="Close (Esc)">✕</button></div>
+  <div id="lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-labelledby="lb-title">
+    <div class="lb-frame" id="lb-frame" tabindex="-1">
+      <div class="lb-head"><span id="lb-title"></span><button id="lb-close" title="Close (Esc)" aria-label="Close chart view">&times;</button></div>
       <div class="lb-body" id="lb-body"></div>
     </div>
   </div>

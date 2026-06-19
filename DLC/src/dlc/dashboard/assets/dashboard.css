@@ -117,6 +117,7 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .chart { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 8px 10px;
   margin: 0; cursor: zoom-in; transition: border-color .15s; }
 .chart:hover { border-color: var(--accent); }
+.chart:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); }
 .chart figcaption { color: var(--ink-dim); font-size: 11px; text-transform: uppercase;
   letter-spacing: .5px; margin-bottom: 6px; font-family: var(--mono); }
 .chart-svg { width: 100%; height: auto; display: block; }
@@ -147,6 +148,7 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .lb-frame { width: min(92vw, 1100px); height: min(88vh, 900px); background: var(--panel);
   border: 1px solid var(--accent); border-radius: 10px; display: flex; flex-direction: column;
   padding: 12px 16px; box-shadow: 0 12px 48px rgba(0,0,0,.7); }
+.lb-frame:focus { outline: none; }
 .lb-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .lb-head span { color: var(--ink); font-family: var(--mono); font-size: 14px; text-transform: uppercase; letter-spacing: .5px; }
 .lb-head button { background: var(--panel-2); color: var(--ink); border: 1px solid var(--edge);
