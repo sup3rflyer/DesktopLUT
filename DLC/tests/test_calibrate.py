@@ -75,7 +75,8 @@ def _fake_launch(cmds):
 
 def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
-          characterize_config=None, skip_gswb=False, bit_depth=None) -> Calibration:
+          characterize_config=None, skip_gswb=False, bit_depth=None, patch_sizes=None,
+          adaptive_planning=False) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -85,9 +86,10 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
         controller=controller or CalibrationController.mock(),
         measure=panel if panel is not None else _perfect_panel(),
         adjudicator=adjudicator or AutoAdjudicator(),
-        probe=probe, optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE,
+        probe=probe, optimize_config=_OPT, patch_sizes=patch_sizes or _SMALL, run_date=_DATE,
         probe_launcher=probe_launcher, decision_overrides=decision_overrides,
-        characterize_config=characterize_config, skip_gswb=skip_gswb, bit_depth=bit_depth)
+        characterize_config=characterize_config, skip_gswb=skip_gswb, bit_depth=bit_depth,
+        adaptive_planning=adaptive_planning)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,37 @@ def test_full_flow_completes_clean(tmp_path: Path):
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
     assert verify["max_de2000"] <= calib.profile.quality.max_de2000
+
+
+def _perfect_hdr_panel() -> SyntheticPanel:
+    # A warm, perfect Rec.2020/PQ panel (peak 1840) — measurements equal the PQ ideal over
+    # the reachable range, so the HDR pipeline runs clean (the analogue of _perfect_panel).
+    return SyntheticPanel(transfer=Transfer.pq(bit_depth=10), start_temp=1.0,
+                          cold_blue_gain=1.0, native_white_nits=1840.0)
+
+
+def test_hdr_full_flow_completes_clean(tmp_path: Path):
+    # The first HDR run, proven in simulation: the full DIP→ICC→3D-LUT pipeline runs
+    # end-to-end against a perfect PQ/Rec.2020 panel and the mock, scoring dE_ITP.
+    calib = _make(tmp_path, "hdr_full", mode="HDR", panel=_perfect_hdr_panel(),
+                  skip_gswb=True, bit_depth=10)
+    result = calib.run("full")
+
+    assert result.status == "completed", result.digest
+    assert result.target == "rec2020_pq"
+    # ICC → 3D LUT, no GS+WB (skip_gswb): the HDR pipeline the owner asked for.
+    assert result.stages == [
+        "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
+        "build-install-mhc", "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify",
+    ]
+    # The chosen HDR target: peak 1600 (profile pin), fixed D65, scored in dE_ITP.
+    hdr_target = calib.calib["hdr_target"]
+    assert hdr_target["peak_nits"] == 1600.0
+    plan = calib.calib["patch_plan"]
+    assert plan["patch_max_cv"] == calib._transfer().nits_to_cv(1600.0)  # patches capped at peak
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert verify["metric"] == "dE_ITP"
+    assert verify["within_quality"] is True
 
 
 def test_control_json_cancels_the_run(tmp_path: Path):
@@ -226,6 +259,112 @@ def test_panel_and_gamut_tells_land_in_preflight_digest(tmp_path: Path):
     assert pf["panel_limits"]["checked"] is True and pf["panel_limits"]["contrast"] == 1000
 
 
+# ---------------------------------------------------------------------------
+# Adaptive patch planning — the opt-in LLM investigation seam (#47/#49)
+#
+# These exercise stage_adaptive_planning() in ISOLATION (a direct call, no measure/
+# optimizer pipeline) — the seam's job is to gather evidence, adjudicate a structured
+# decision, validate it, and apply/fingerprint it; none of that needs a full run. The
+# flag-OFF byte-identical guarantee is covered by the unchanged full-flow tests above.
+# ---------------------------------------------------------------------------
+
+def _ap_ready(calib):
+    """Minimal post-ICC preconditions for a direct stage_adaptive_planning() call."""
+    calib.calib["flow"] = "full"
+    calib.target_name = "srgb_g22"
+    return calib
+
+
+def test_adaptive_planning_off_is_a_noop(tmp_path: Path):
+    # Flag off ⇒ the seam returns immediately: no evidence gathered, no decision, no file,
+    # PatchSizes untouched. (An ordinary run is byte-identical — the full-flow tests above.)
+    calib = _ap_ready(_make(tmp_path, "ap_off"))
+    calib.stage_adaptive_planning(raw_ti3=None)
+    assert "adaptive_plan" not in calib.calib
+    assert "adaptive-planning:plan" not in calib.calib["decisions"]
+    assert calib.patch_sizes.tube_size == _SMALL.tube_size
+    assert not (calib.ctx.root / "adaptive_evidence.json").exists()
+
+
+def test_adaptive_planning_auto_applies_conservative_fallback(tmp_path: Path):
+    # Flag on + autonomous (AutoAdjudicator) + wide-gamut DIP ⇒ no LLM in the loop, so the
+    # conservative low-confidence fallback decides 'denser' and it is applied + fingerprinted.
+    calib = _ap_ready(_make(tmp_path, "ap_auto", adaptive_planning=True))
+    _inject_dip(calib, native_primaries={"R": [0.68, 0.32], "G": [0.265, 0.69], "B": [0.15, 0.06]})
+    calib.stage_adaptive_planning(raw_ti3=None)
+    ap = calib.calib["adaptive_plan"]
+    assert ap["decision"]["source"] == "fallback" and ap["decision"]["confidence"] == "low"
+    assert ap["decision"]["volumetric_density"] == "denser"
+    assert calib.patch_sizes.tube_size == _SMALL.tube_size + 8
+    assert ap["fingerprint"]
+    assert (calib.ctx.root / "adaptive_evidence.json").exists()
+
+
+def test_adaptive_planning_applies_a_structured_llm_decision(tmp_path: Path):
+    # The LLM's structured decision (a Decision payload, e.g. via --plan-decision-file) is
+    # validated then applied: custom overrides honoured, the ICC/raw FOUNDATION never touched,
+    # an out-of-bounds value clamped — the LLM cannot break the run.
+    payload = {"shadow_treatment": "extra", "volumetric_density": "custom",
+               "patch_size_overrides": {"tube_size": 21, "raw_ramp_steps": 99, "cube_size": 999},
+               "reason": "bumpy near-neutral", "confidence": "high"}
+    calib = _ap_ready(_make(tmp_path, "ap_llm", adaptive_planning=True,
+                            decision_overrides={"adaptive-planning:plan": Decision("apply", payload=payload)}))
+    calib.stage_adaptive_planning(raw_ti3=None)
+    norm = calib.calib["adaptive_plan"]["decision"]
+    assert norm["source"] == "llm" and norm["confidence"] == "high"
+    assert calib.patch_sizes.tube_size == 21                                  # custom override
+    assert calib.patch_sizes.cube_size == 33                                  # clamped from 999
+    assert calib.patch_sizes.low_light_steps == _SMALL.low_light_steps + 6    # 'extra' shadow tier
+    assert calib.patch_sizes.raw_ramp_steps == _SMALL.raw_ramp_steps          # FOUNDATION untouched
+    assert any("raw_ramp_steps" in a for a in norm["adjustments"])
+
+
+def test_adaptive_planning_pauses_for_a_live_llm(tmp_path: Path):
+    # Flag on + a live MappingAdjudicator with no recorded decision ⇒ the seam PAUSES,
+    # surfacing the evidence packet for the LLM to investigate.
+    calib = _ap_ready(_make(tmp_path, "ap_pause", adaptive_planning=True,
+                            adjudicator=MappingAdjudicator({})))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_adaptive_planning(raw_ti3=None)
+    assert exc.value.request.seam == "adaptive_planning"
+    assert "evidence" in exc.value.request.digest
+    assert (calib.ctx.root / "adaptive_evidence.json").exists()
+
+
+def test_adaptive_planning_busts_stale_downstream_on_plan_change(tmp_path: Path):
+    # The seam injects the patch plan that the memoised post-MHC measure (and everything built /
+    # scored on its cube) consumes. A plan change vs the recorded fingerprint drops those caches
+    # so they re-measure/rebuild instead of reusing stale measurements.
+    calib = _ap_ready(_make(tmp_path, "ap_bust", adaptive_planning=True,
+                            decision_overrides={"adaptive-planning:plan":
+                                                Decision("apply", payload={"volumetric_density": "denser"})}))
+    calib.calib["adaptive_plan"] = {"fingerprint": "OLD-FINGERPRINT"}
+    for s in ("measure:post-mhc", "build-install-3dlut", "measure:gray-wb", "gswb-tweak",
+              "measure:verify", "verify"):
+        calib.calib["stages"][s] = {"status": "done"}
+    calib.stage_adaptive_planning(raw_ti3=None)
+    for s in ("measure:post-mhc", "build-install-3dlut", "verify"):
+        assert s not in calib.calib["stages"]                # stale caches dropped
+    assert calib.calib["adaptive_plan"]["fingerprint"] != "OLD-FINGERPRINT"
+
+
+def test_adaptive_planning_resume_replays_the_recorded_decision(tmp_path: Path):
+    # The recorded structured payload replays verbatim on a later run of the same dir (same plan,
+    # same fingerprint, no re-pause) — even under a LIVE adjudicator that would otherwise pause.
+    payload = {"volumetric_density": "denser", "reason": "x", "confidence": "medium"}
+    first = _ap_ready(_make(tmp_path, "ap_resume", adaptive_planning=True,
+                            decision_overrides={"adaptive-planning:plan": Decision("apply", payload=payload)}))
+    first.stage_adaptive_planning(raw_ti3=None)
+    fp1 = first.calib["adaptive_plan"]["fingerprint"]
+    # Re-open the same run dir with a live adjudicator + NO override: the recorded decision must
+    # replay (no AdjudicationRequired), reproducing the same plan + fingerprint.
+    resumed = _ap_ready(_make(tmp_path, "ap_resume", adaptive_planning=True,
+                              adjudicator=MappingAdjudicator({})))
+    resumed.stage_adaptive_planning(raw_ti3=None)
+    assert resumed.calib["adaptive_plan"]["fingerprint"] == fp1
+    assert resumed.calib["decisions"]["adaptive-planning:plan"]["payload"]["volumetric_density"] == "denser"
+
+
 def test_intermediate_stages_emit_a_before_after_de_series(tmp_path: Path):
     # #8: raw + post-mhc are scored onto the spine so the dashboard's ΔE panel + de_history
     # show a convergence series (native → after ICC → after 3D LUT), not just a single verify
@@ -258,6 +397,9 @@ def test_full_flow_skip_gswb_drops_only_the_gswb_stages(tmp_path: Path):
     assert "gswb-tweak" not in result.stages
     assert "measure:gray-wb" not in result.stages
     assert "build-install-3dlut" in result.stages
+    assert "gray-wb" not in calib.calib["patch_plan"]["stages"]
+    assert calib.calib["patch_plan"]["skip_gswb"] is True
+    assert calib.calib["patch_plan"]["approved"] is True
     assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
 
 
@@ -1217,6 +1359,29 @@ def test_plan_seam_surfaces_run_size(tmp_path: Path):
     pp = exc.value.request.digest["patch_plan"]
     assert pp["total_patches"] > 0
     assert set(pp["stages"]) == {"raw", "post-mhc", "gray-wb", "verify"}
+
+
+def test_plan_seam_persists_approved_patch_plan(tmp_path: Path):
+    calib = _make(tmp_path, "plan_persist")
+    outcome = calib.stage_resolve_target()
+    pp = calib.calib["patch_plan"]
+
+    assert pp["approved"] is True
+    assert pp["fingerprint"] == outcome.data["patch_plan"]["fingerprint"]
+    assert pp["patch_sizes"]["raw_ramp_steps"] == _SMALL.raw_ramp_steps
+    assert pp["transfer"]["bit_depth"] == 10
+
+
+def test_resume_aborts_when_approved_patch_plan_changes(tmp_path: Path):
+    first = _make(tmp_path, "plan_guard")
+    first.stage_resolve_target()
+
+    changed = _SMALL.merged(raw_ramp_steps=_SMALL.raw_ramp_steps + 2)
+    resumed = _make(tmp_path, "plan_guard", patch_sizes=changed)
+    result = resumed.run("full")
+
+    assert result.status == "aborted"
+    assert "patch plan changed" in result.digest["message"]
 
 
 def test_custom_patch_sizes_flow_through_to_measurement(tmp_path: Path):

@@ -36,6 +36,7 @@ spine never imports it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from argparse import Namespace
@@ -72,9 +73,11 @@ from .measure_loop import (
     Reading,
     run_measure_loop,
 )
-from .metrics import percentile, score_samples, summarize_metrics
+from .decisions import hdr_metric_thresholds
+from .metrics import percentile, score_samples, score_samples_hdr, summarize_metrics
 from .mhc import parse_ti3
 from .optimize import DegenerateMeasurements, OptimizeConfig, ProbeFn, optimize_cube
+from . import patch_evidence
 from .paths import RUNS_DIR, atomic_write_text
 from .refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget, propose_correction_grayscale
 from .runs import RunContext, create_run, open_run
@@ -106,6 +109,7 @@ SEAM_WATCHDOG = "gswb_watchdog"    # tweak magnitude growing large → recal (§
 SEAM_VERIFY = "verify"             # final score vs quality targets
 SEAM_STACK = "require_stack"       # gray-wb/3dlut-only precondition unmet
 SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/meter behaviour
+SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 
 
 # ---------------------------------------------------------------------------
@@ -115,13 +119,23 @@ SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/me
 @dataclass(frozen=True)
 class Decision:
     """The judgment returned at a seam. ``choice`` is one of the request's
-    ``options``; ``note`` carries the LLM's reasoning for the audit trail."""
+    ``options``; ``note`` carries the LLM's reasoning for the audit trail.
+
+    ``payload`` carries a **structured decision** for seams that need more than a
+    one-of-N choice — notably the adaptive-planning seam, where the LLM returns a
+    full patch strategy (shadow/volumetric tiers + validated overrides). It is
+    persisted in the decision record and replayed verbatim on resume, so the run
+    re-applies the exact plan the LLM chose."""
 
     choice: str
     note: Optional[str] = None
+    payload: Optional[dict[str, Any]] = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"choice": self.choice, "note": self.note}
+        d: dict[str, Any] = {"choice": self.choice, "note": self.note}
+        if self.payload is not None:
+            d["payload"] = self.payload
+        return d
 
 
 @dataclass(frozen=True)
@@ -137,11 +151,18 @@ class AdjudicationRequest:
     options: tuple[str, ...]
     recommendation: str
     digest: dict[str, Any] = field(default_factory=dict)
+    # The structured fallback the core would apply if no LLM answers (e.g. the
+    # conservative patch-strategy planner). AutoAdjudicator returns it verbatim, so
+    # an autonomous run still gets the structured decision the seam expects.
+    recommended_payload: Optional[dict[str, Any]] = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"key": self.key, "seam": self.seam, "stage": self.stage,
-                "question": self.question, "options": list(self.options),
-                "recommendation": self.recommendation, "digest": self.digest}
+        d = {"key": self.key, "seam": self.seam, "stage": self.stage,
+             "question": self.question, "options": list(self.options),
+             "recommendation": self.recommendation, "digest": self.digest}
+        if self.recommended_payload is not None:
+            d["recommended_payload"] = self.recommended_payload
+        return d
 
 
 class AdjudicationRequired(Exception):
@@ -162,7 +183,8 @@ class AutoAdjudicator:
     and the policy a human/LLM would otherwise rubber-stamp."""
 
     def adjudicate(self, request: AdjudicationRequest) -> Decision:
-        return Decision(request.recommendation, note="auto: accepted core recommendation")
+        return Decision(request.recommendation, note="auto: accepted core recommendation",
+                        payload=request.recommended_payload)
 
 
 class MappingAdjudicator:
@@ -361,6 +383,7 @@ class Calibration:
         probe_launcher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         decision_overrides: Optional[dict[str, "Decision"]] = None,
         skip_gswb: bool = False,
+        adaptive_planning: bool = False,
         stall_kill_hook: Optional[Callable[[], None]] = None,
         pause_handler: Optional[Callable[[Mapping[str, Any]], None]] = None,
         enable_watchdog: bool = False,
@@ -387,6 +410,9 @@ class Calibration:
         # DesktopLUT layer — see reference-dlc-gswb-target). Yields a cohesive ICC→3D-LUT run
         # (one rollback unit, one verify gate) without baking a known-wrong grayscale tweak.
         self.skip_gswb = skip_gswb
+        # Opt-in: the LLM patch-strategy investigation seam (#47/#49). OFF ⇒ the deterministic
+        # patch plan, no seam, no evidence gathering (an ordinary run is unchanged).
+        self.adaptive_planning = adaptive_planning
         # Explicit per-key decision overrides (the CLI's --decide flags). Unlike the
         # adjudicator's seed map, these take precedence over an ALREADY-recorded decision, so
         # a resumed run can change a recorded seam (e.g. verify:accept apply↔revert) without
@@ -590,16 +616,18 @@ class Calibration:
         if override is not None and not self.force:
             recorded = self.calib["decisions"].get(request.key)
             if (recorded is None or recorded.get("choice") != override.choice
-                    or recorded.get("note") != override.note):
+                    or recorded.get("note") != override.note
+                    or recorded.get("payload") != override.payload):
                 # NOTE: a targeted override is safe for terminal/leaf seams (verify:accept has
                 # no downstream stages) and for re-deciding an aborted seam (an abort left no
-                # downstream stages memoised). No current seam injects a value a later memoised
-                # stage consumes; if one is added, that stage's cache would need invalidation.
+                # downstream stages memoised). The adaptive-planning seam DOES inject a value
+                # (the patch plan) that later memoised stages consume — it invalidates those
+                # caches itself, keyed on its plan fingerprint (see stage_adaptive_planning).
                 self._record_decision(request, override, overridden=recorded is not None)
-            return Decision(override.choice, override.note)
+            return Decision(override.choice, override.note, payload=override.payload)
         if request.key in self.calib["decisions"] and not self.force:
             d = self.calib["decisions"][request.key]
-            return Decision(d["choice"], d.get("note"))
+            return Decision(d["choice"], d.get("note"), payload=d.get("payload"))
         try:
             decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
         except AdjudicationRequired:
@@ -802,6 +830,27 @@ class Calibration:
     def _engine_target(self):
         # The 3D-LUT correction targets the SAME resolved white the MHC/GS+WB stages do.
         return self.profile.engine_target(self.target_name, white_xy=self._white_xy())
+
+    def _hdr_target(self):
+        """The chosen HDR target (peak/undershoot/knee/fixed white) for an HDR run,
+        resolved from this display+mode's DIP and the run's resolved white
+        (``docs/hdr-target-design.md``). Memoised in the run-record so a resumed verify/
+        report sees the same peak the build targeted. Only meaningful for a PQ target."""
+        cached = self.calib.get("hdr_target")
+        if cached:
+            from .hdr_target import HdrTarget
+
+            return HdrTarget(
+                peak_nits=cached["peak_nits"], white_xy=tuple(cached["white_xy"]),
+                undershoot_gain=cached["undershoot_gain"],
+                knee_start_nits=cached["knee_start_nits"],
+                container_nits=cached.get("container_nits", 10000.0),
+                provenance=cached.get("provenance", {}))
+        tgt = self.profile.resolve_hdr_target(self.target_name, dip=self._dip(),
+                                              white_xy=self._white_xy())
+        self.calib["hdr_target"] = tgt.as_dict()
+        self._save()
+        return tgt
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def _correction_store(self) -> CorrectionStore:
@@ -1272,35 +1321,65 @@ class Calibration:
                 "resolve-target", "aborted",
                 digest={"message": f"display {self.monitor} has no {self.mode} target configured"}))
         spec = self.profile.target(target)
-        if spec.is_hdr:
-            # SDR-first in v1: HDR target acknowledged but not finalised here.
-            raise CalibrationAborted(StageOutcome(
-                "resolve-target", "aborted",
-                digest={"message": "HDR finalisation is post-v1 (SDR-first); pick an SDR target or flow."}))
         self.target_name = target
         self.calib["target"] = target
         self._save()
+        # HDR (PQ): resolve the chosen target (peak off the ladder, undershoot gain + knee,
+        # fixed white) from the DIP now, so the plan digest reports the real peak and the
+        # patch sets are capped to it (docs/hdr-target-design.md). SDR is unaffected.
+        hdr = self._hdr_target() if spec.is_hdr else None
         flow = self.calib.get("flow")
         # Surface the run's SIZE up front (patch counts per measured stage), so the operator/LLM
         # approves the plan knowing the time cost — and can abort + re-run with different patch
         # flags if it's too long/short. This is the "no reservations about deciding time" lever.
-        patch_plan = self.flow_patch_counts(flow)
+        patch_plan = self._patch_plan_record(flow)
+        existing_plan = self.calib.get("patch_plan")
+        if (
+            isinstance(existing_plan, dict)
+            and existing_plan.get("approved")
+            and existing_plan.get("fingerprint") != patch_plan.get("fingerprint")
+            and not self.force
+        ):
+            raise CalibrationAborted(StageOutcome(
+                "resolve-target", "aborted",
+                digest={
+                    "message": "approved patch plan changed since this run was approved; start a fresh run or resume with --force",
+                    "approved_fingerprint": existing_plan.get("fingerprint"),
+                    "current_fingerprint": patch_plan.get("fingerprint"),
+                    "approved_patch_plan": existing_plan,
+                    "current_patch_plan": patch_plan,
+                }))
+        self.calib["patch_plan"] = {**patch_plan, "approved": bool(
+            isinstance(existing_plan, dict)
+            and existing_plan.get("approved")
+            and existing_plan.get("fingerprint") == patch_plan.get("fingerprint")
+        )}
+        self._save()
+        transfer_label = "PQ (ST.2084)" if spec.is_hdr else f"power γ{spec.gamma}"
+        target_nits = hdr.peak_nits if hdr else spec.luminance_nits
+        nits_label = f"{target_nits:g} nit peak" if spec.is_hdr else f"{target_nits:g} nits"
         digest = {"flow": flow, "target": target,
-                  "colorspace": spec.colorspace, "transfer": f"power γ{spec.gamma}",
+                  "colorspace": spec.colorspace, "transfer": transfer_label,
                   "white": f"{spec.white.intent} ({spec.white.method})",
-                  "white_nits": spec.luminance_nits, "patch_plan": patch_plan}
+                  "white_nits": target_nits, "patch_plan": self.calib["patch_plan"]}
+        if hdr:
+            digest["hdr_target"] = hdr.as_dict()
         self._abort_if(self.adjudicate(AdjudicationRequest(
             key="resolve-target:plan", seam=SEAM_PLAN, stage="resolve-target",
             question=(f"Plan: {flow} calibration of monitor {self.monitor} "
                       f"({self.display.name}) to target '{target}' "
-                      f"(γ{spec.gamma}, {spec.white.intent}, {spec.luminance_nits:g} nits) — "
+                      f"({transfer_label}, {spec.white.intent}, {nits_label}) — "
                       f"{patch_plan['total_patches']} patches "
                       f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
+        self.calib["patch_plan"] = {**patch_plan, "approved": True}
+        self._save()
         self.runlog.stage_done("resolve-target", target=target)
         self._emit_header()   # the target is now known — enrich the dashboard status bar
-        return StageOutcome("resolve-target", "done", digest=digest, data={"target": target})
+        digest["patch_plan"] = self.calib["patch_plan"]
+        return StageOutcome("resolve-target", "done", digest=digest,
+                            data={"target": target, "patch_plan": self.calib["patch_plan"]})
 
     def stage_whitepoint(self) -> StageOutcome:
         """Resolve the calibration-target white + its provenance (§9, §10; item 7) and
@@ -1714,7 +1793,8 @@ class Calibration:
             # Derive MHC params from the raw TI3 (reuses the proven build-mhc stage:
             # measured primaries + native-white→target-white matrix + tone-only base 1D).
             args = Namespace(run=self.ctx.root, monitor=self.monitor, mode=self.mode,
-                             simulate=False, gamma=spec.gamma, source_ti3=raw_ti3)
+                             simulate=False, gamma=spec.gamma, source_ti3=raw_ti3,
+                             is_hdr=spec.is_hdr)
             derive = build_mhc.build(args, self.ctx)
             self.ctx.log(f"build-mhc: {derive.status}")
             if derive.status == "failed":
@@ -1750,6 +1830,73 @@ class Calibration:
                                 data={"profile_name": profile_name, "verified": verify_ok})
 
         return self._stage("build-install-mhc", run)
+
+    def stage_adaptive_planning(self, *, raw_ti3: Optional[str]) -> None:
+        """The **opt-in LLM patch-strategy investigation seam** (#47/#49), post-ICC.
+
+        OFF unless ``--adaptive-planning`` ⇒ the deterministic plan, no seam, no evidence
+        gathering. ON: assemble an evidence packet of raw facts (DIP, gamut, raw-tone, ICC
+        residual, plan/time estimate, prior runs, cache state), then let the **LLM** decide
+        the shadow + volumetric patch strategy (it investigates with ``python -m
+        dlc.patch_evidence`` and returns a structured decision via ``--plan-decision-file``).
+        For autonomous (``--auto``) runs with no LLM, a conservative low-confidence fallback
+        decides. The decision is **validated against bounds** (the ICC/raw foundation is not
+        overridable), applied, and the resulting plan **fingerprinted** — a change invalidates
+        the now-stale post-MHC measurement + everything built/scored against the cube.
+
+        Bypasses ``_stage`` so it re-applies on every resume (the chosen knobs must be live on
+        ``self.patch_sizes`` before the post-MHC measure generates patches)."""
+        if not self.adaptive_planning:
+            return
+        self.runlog.set_phase("adaptive-planning")
+        self.runlog.stage_start("adaptive-planning")
+        flow = self.calib.get("flow")
+        base = asdict(self.patch_sizes)
+        mhc_digest = (self.calib["stages"].get("build-install-mhc") or {}).get("digest", {})
+        evidence = patch_evidence.gather_evidence(
+            dip=self._dip(),
+            target_primaries=gamut.target_primaries(self._target_colorspace()),
+            target_colorspace=self._target_colorspace(),
+            raw_ti3=raw_ti3,
+            mhc_digest=mhc_digest if isinstance(mhc_digest, dict) else {},
+            patch_sizes=base, transfer=self._transfer(), flow=flow,
+            prior_runs=patch_evidence.list_prior_runs(self.ctx.root.parent, self.display.name),
+            cache_state={k: (self.calib["stages"].get(k) or {}).get("status")
+                         for k in ("measure:post-mhc", "build-install-3dlut")},
+        )
+        fallback = evidence["conservative_fallback"]
+        # Persist the packet so the paused LLM can drill into it with `python -m dlc.patch_evidence`.
+        atomic_write_text(self.ctx.root / "adaptive_evidence.json",
+                          json.dumps(evidence, indent=2, default=str))
+        decision = self.adjudicate(AdjudicationRequest(
+            key="adaptive-planning:plan", seam=SEAM_PLANNING, stage="adaptive-planning",
+            question=("Investigate the panel/run and choose the patch strategy "
+                      "(shadow_treatment + volumetric_density [+ patch_size_overrides]). "
+                      f"Tools: `python -m dlc.patch_evidence --run {self.ctx.root} --what ...`; "
+                      "answer with `--plan-decision-file <json>`."),
+            options=("apply",), recommendation="apply",
+            digest={"evidence": evidence, "decision_schema": patch_evidence.DECISION_SCHEMA},
+            recommended_payload=fallback))
+        payload = decision.payload if isinstance(decision.payload, dict) else fallback
+        knobs, normalized = patch_evidence.validate_decision(payload, base)
+        if knobs:
+            self.patch_sizes = self.patch_sizes.merged(**knobs)
+        # Fingerprint the RESULTING plan; a change since the last applied plan means the
+        # memoised post-MHC measure (and everything built/scored on its cube) is stale.
+        new_fp = self._patch_plan_record(flow).get("fingerprint")
+        prior = self.calib.get("adaptive_plan")
+        prior_fp = prior.get("fingerprint") if isinstance(prior, dict) else None
+        if prior_fp != new_fp:
+            for stale in ("measure:post-mhc", "build-install-3dlut",
+                          "measure:gray-wb", "gswb-tweak", "measure:verify", "verify"):
+                self.calib["stages"].pop(stale, None)
+        self.calib["adaptive_plan"] = {"fingerprint": new_fp, "decision": normalized,
+                                       "worth_investigating": evidence["worth_investigating"]}
+        self._save()
+        self.runlog.stage_done(
+            "adaptive-planning",
+            strategy=f"{normalized['shadow_treatment']}/{normalized['volumetric_density']}",
+            source=normalized.get("source"), confidence=normalized.get("confidence"))
 
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
@@ -1857,13 +2004,23 @@ class Calibration:
                                        "(all reads failed?) — aborting before the quality gate."}))
             # Score against the SAME resolved white the pipeline targeted (MHC matrix, 3D-LUT
             # target, GS+WB tweak) — not textbook D65 — so a non-zero white strength is the goal
-            # here, not scored as white error. NOTE: the gate metric is CIEDE2000 while the
-            # 3D-LUT correction converged in dE_ITP (ICtCp); both are surfaced for the operator.
+            # here, not scored as white error. SDR scores CIEDE2000 against γ-power/sRGB; HDR
+            # scores dE_ITP against PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's
+            # Lab is meaningless at HDR absolute luminance), with looser, LLM-negotiated targets.
             wx, wy = self._white_xy()
-            metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
+            if spec.is_hdr:
+                hdr = self._hdr_target()
+                metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits)
+                metric_name = "dE_ITP"
+                # Advisory HDR defaults (dE_ITP); the assistant negotiates the real target
+                # at the verify seam after the first refinement round (design §7).
+                q = hdr_metric_thresholds()
+            else:
+                metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
+                metric_name = "CIEDE2000"
+                q = self.profile.quality
             summary = summarize_metrics(phase="verification", iteration=0, source=Path(verify_ti3),
-                                        patch_metrics=metrics, target_luminance=lum)
-            q = self.profile.quality
+                                        patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
                       and summary.max_de2000 <= q.max_de2000 and summary.white_de2000 <= q.white_de2000)
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
@@ -1885,7 +2042,7 @@ class Calibration:
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
                       "patch_count": summary.patch_count, "within_quality": within,
                       "quality_targets": q.as_dict(),
-                      "metric": "CIEDE2000", "optimize_metric": "dE_ITP",
+                      "metric": metric_name, "optimize_metric": "dE_ITP",
                       "target_white_xy": [round(wx, 5), round(wy, 5)],
                       "white_provenance": self._resolved_white().provenance,
                       "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2)} for m in worst]}
@@ -1899,8 +2056,8 @@ class Calibration:
         within = outcome.data.get("within_quality")
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
-            question=(f"The new calibration reads avg ΔE2000 {d.get('avg_de2000')} "
-                      f"(white ΔE {d.get('white_de2000')}, max {d.get('max_de2000')}) — "
+            question=(f"The new calibration reads avg {d.get('metric', 'ΔE')} {d.get('avg_de2000')} "
+                      f"(white {d.get('white_de2000')}, max {d.get('max_de2000')}) — "
                       f"{'within' if within else 'outside'} the quality targets. "
                       "Apply this calibration, or revert to the previous display setup?"),
             options=("apply", "revert"),
@@ -2098,24 +2255,66 @@ class Calibration:
         dip = self._dip()
         return dip.thermal_tau_patches if dip else None
 
+    def _patch_max_cv(self) -> Optional[int]:
+        """For an HDR run, cap patch generation at the target peak's code value so every
+        measured patch is within the panel's reachable sub-peak range — no patch above the
+        target peak, which a ~1840-nit panel would read as a clipped highlight and the verify
+        would score as huge error (the roll-off region above the peak is handled separately,
+        ``docs/hdr-target-design.md`` §4). SDR ⇒ ``None`` (the full bit-depth range)."""
+        if not self._spec().is_hdr:
+            return None
+        return self._transfer().nits_to_cv(self._hdr_target().peak_nits)
+
     def _ramp_patches(self) -> list[tuple[int, int, int]]:
-        return build_ramp_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
+        return build_ramp_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
+                              max_cv=self._patch_max_cv())
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:
-        return build_volumetric_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
+        return build_volumetric_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
+                                    max_cv=self._patch_max_cv())
 
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
-        return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
+        return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
+                                 max_cv=self._patch_max_cv())
 
     def _neutral_verify_patches(self) -> list[tuple[int, int, int]]:
         return build_neutral_verify_set(self.patch_sizes, self._transfer(),
-                                        warm_tau=self._warm_tau())
+                                        warm_tau=self._warm_tau(), max_cv=self._patch_max_cv())
 
     def _verify_patches(self) -> list[tuple[int, int, int]]:
-        return build_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau())
+        return build_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
+                                max_cv=self._patch_max_cv())
 
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
-        return flow_patch_counts(flow, self.patch_sizes, self._transfer())
+        plan = flow_patch_counts(flow, self.patch_sizes, self._transfer(),
+                                 max_cv=self._patch_max_cv())
+        if flow == "full" and self.skip_gswb and "gray-wb" in plan["stages"]:
+            stages = dict(plan["stages"])
+            stages.pop("gray-wb", None)
+            plan = {**plan, "stages": stages, "total_patches": sum(stages.values()), "skip_gswb": True}
+        return plan
+
+    def _patch_plan_record(self, flow: str) -> dict[str, Any]:
+        transfer = self._transfer()
+        plan = self.flow_patch_counts(flow)
+        record = {
+            **plan,
+            "flow": flow,
+            "bit_depth": self.bit_depth,
+            "patch_sizes": asdict(self.patch_sizes),
+            "transfer": {
+                "kind": transfer.kind,
+                "gamma": transfer.gamma,
+                "peak_nits": transfer.peak_nits,
+                "bit_depth": transfer.bit_depth,
+            },
+            # The HDR peak cap (None for SDR) is part of the plan identity: changing the target
+            # peak changes which patches are measured, so it must invalidate an approved plan.
+            "patch_max_cv": self._patch_max_cv(),
+            "skip_gswb": self.skip_gswb,
+        }
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return {**record, "fingerprint": hashlib.sha256(payload).hexdigest()[:16]}
 
     def _finish(self, *, analysis: Optional[str] = None) -> CalibrationResult:
         rep = self.stage_report(analysis=analysis)
@@ -2160,6 +2359,7 @@ class Calibration:
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
+        self.stage_adaptive_planning(raw_ti3=raw.data["ti3"])   # opt-in LLM investigation seam (#47/#49)
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
@@ -2198,6 +2398,7 @@ class Calibration:
         self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=False)
         self._capture_inplace_baseline()   # rollback point before set_3dlut mutates the live cube
+        self.stage_adaptive_planning(raw_ti3=None)   # opt-in LLM investigation seam (no raw ramp here)
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
@@ -2451,35 +2652,41 @@ def descriptive_cube_name(*, date: str, display: str, mode: str, colorspace: str
 # ---------------------------------------------------------------------------
 
 def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
-                   warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
+                   warm_tau: Optional[int] = None,
+                   max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The MHC FOUNDATION ramp: a dense grey ramp + R/G/B (the matrix+1D fit's inputs); C/M/Y
-    only if ``raw_include_secondaries`` (off by default — the volumetric set covers them)."""
+    only if ``raw_include_secondaries`` (off by default — the volumetric set covers them).
+
+    ``max_cv`` caps the top of the generated range (HDR: the target peak's code value, so no
+    patch exceeds the reachable sub-peak range); ``None`` ⇒ the full bit-depth range (SDR)."""
     return ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
                         spacing=ps.raw_spacing, include_secondaries=ps.raw_include_secondaries,
                         low_light_steps=ps.low_light_steps,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
-                        order=ps.order, warm_tau=warm_tau)
+                        order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
 
 
 def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
-                         warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
+                         warm_tau: Optional[int] = None,
+                         max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The 3D-LUT sampling set. ``volumetric_mode`` picks HOW the cube interior is sampled:
     a neutral-axis ``tube`` (default; dense where content lives), a uniform ``cube``, or a
-    content-weighted ``gamut`` shell set."""
+    content-weighted ``gamut`` shell set. ``max_cv`` caps the range (HDR peak; see
+    :func:`build_ramp_set`)."""
     if ps.volumetric_mode == "cube":
         return cube_patches(transfer, size=ps.cube_size, order=ps.order,
                             low_light_size=ps.low_light_cube_size,
                             low_light_signal=ps.low_light_signal,
                             low_light_bias=ps.low_light_bias,
-                            warm_tau=warm_tau)
+                            warm_tau=warm_tau, max_cv=max_cv)
     if ps.volumetric_mode == "gamut":
         return gamut_patches(transfer, lum_steps=ps.gamut_lum_steps, hues=ps.gamut_hues,
                              lum_bias=ps.gamut_lum_bias, order=ps.order,
                              low_light_steps=ps.low_light_steps,
                              low_light_signal=ps.low_light_signal,
                              low_light_bias=ps.low_light_bias,
-                             warm_tau=warm_tau)
+                             warm_tau=warm_tau, max_cv=max_cv)
     if ps.volumetric_mode != "tube":
         raise ValueError(f"unknown volumetric_mode: {ps.volumetric_mode!r} (tube|cube|gamut)")
     return tube_patches(transfer, cube_size=ps.cube_size, tube_size=ps.tube_size,
@@ -2489,37 +2696,44 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
                         low_light_cube_size=ps.low_light_cube_size,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
-                        warm_tau=warm_tau)
+                        warm_tau=warm_tau, max_cv=max_cv)
 
 
 def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
-                      warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The grey-axis ramp for the GS+WB tweak / gray-wb flow."""
+                      warm_tau: Optional[int] = None,
+                      max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The grey-axis ramp for the GS+WB tweak / gray-wb flow. ``max_cv`` caps the range
+    (HDR peak; see :func:`build_ramp_set`)."""
+    cap = max_cv if max_cv is not None else transfer.max_cv
     n = ps.neutral_steps
-    levels = uniform_levels(n, transfer.max_cv)
+    levels = uniform_levels(n, cap)
     if ps.low_light_steps > 1:
         levels = sorted(set(levels) | set(shadow_levels(
-            ps.low_light_steps, transfer,
+            ps.low_light_steps, transfer, max_cv=cap,
             max_signal=ps.low_light_signal, bias=ps.low_light_bias)))
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
 def build_neutral_verify_set(ps: PatchSizes, transfer: Transfer, *,
-                             warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The compact grey-axis sanity ramp for gray-wb verification."""
-    levels = uniform_levels(ps.neutral_steps, transfer.max_cv)
+                             warm_tau: Optional[int] = None,
+                             max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The compact grey-axis sanity ramp for gray-wb verification. ``max_cv`` caps the range."""
+    cap = max_cv if max_cv is not None else transfer.max_cv
+    levels = uniform_levels(ps.neutral_steps, cap)
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
 def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
-                     warm_tau: Optional[int] = None) -> list[tuple[int, int, int]]:
+                     warm_tau: Optional[int] = None,
+                     max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The verify sanity set — a LIGHTER ramp (grey + RGBCMY at full + half saturation), NOT the
     dense volumetric build set. It confirms grayscale tracking + the gamut hues at practical and
     saturated levels at a normal verification resolution (and feeds the dashboard's saturation
-    sweeps), instead of re-measuring the whole cube the build already used."""
+    sweeps), instead of re-measuring the whole cube the build already used. ``max_cv`` caps the
+    range (HDR peak; so verify never asks for an above-peak highlight that would read clipped)."""
     return ramp_patches(transfer, steps=ps.verify_steps, saturations=ps.verify_saturations,
                         spacing=ps.raw_spacing, include_secondaries=True,
-                        order=ps.order, warm_tau=warm_tau)
+                        order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
 
 
 # The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show
@@ -2535,17 +2749,19 @@ _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
                    "gray-wb": build_neutral_set, "verify-neutral": build_neutral_verify_set}
 
 
-def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer) -> dict[str, Any]:
+def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
+                      max_cv: Optional[int] = None) -> dict[str, Any]:
     """Per-stage patch counts for ``flow`` from a PatchSizes + Transfer — the run's size, so
     the agent/user can judge time/cost up front. Cheap (pure-stdlib generation); each distinct
-    builder is generated once."""
+    builder is generated once. ``max_cv`` caps the range (HDR peak), so the previewed counts
+    match what the run actually measures."""
     roles = _FLOW_PATCH_STAGES.get(flow, ())
     cache: dict[Any, int] = {}
     stages: dict[str, int] = {}
     for role in roles:
         fn = _PATCH_BUILDERS[role]
         if fn not in cache:
-            cache[fn] = len(fn(ps, transfer))
+            cache[fn] = len(fn(ps, transfer, max_cv=max_cv))
         stages[role] = cache[fn]
     return {"stages": stages, "total_patches": sum(stages.values()),
             "volumetric_mode": ps.volumetric_mode, "order": ps.order}
@@ -2667,6 +2883,7 @@ def run_calibration(
     optimize_config: Optional[OptimizeConfig] = None,
     patch_sizes: Optional[PatchSizes] = None,
     force: bool = False,
+    adaptive_planning: bool = False,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -2677,7 +2894,8 @@ def run_calibration(
         ctx=ctx, profile=profile, monitor=monitor, mode=mode, controller=controller,
         measure=measure, adjudicator=adjudicator or AutoAdjudicator(), probe=probe,
         bit_depth=bit_depth, loop_config=loop_config, optimize_config=optimize_config,
-        patch_sizes=patch_sizes, run_date=run_date, force=force)
+        patch_sizes=patch_sizes, run_date=run_date, force=force,
+        adaptive_planning=adaptive_planning)
     return calib.run(flow)
 
 
@@ -2788,6 +3006,16 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "raw-pipe transport against the meter once before trusting it.")
     parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
                         help="record a seam decision (repeatable) then run/resume")
+    parser.add_argument("--adaptive-planning", action="store_true", dest="adaptive_planning",
+                        help="OPT-IN, EXPERIMENTAL (value unproven — a synthetic A/B found denser "
+                             "sampling does not beat the optimizer's fold-back; see patch_evidence.py): "
+                             "pause after the ICC and let the LLM investigate the panel/run (evidence "
+                             "packet + `python -m dlc.patch_evidence` tools) and choose the patch "
+                             "strategy. Autonomous (--auto) runs use a conservative fallback.")
+    parser.add_argument("--plan-decision-file", type=Path, default=None, dest="plan_decision_file",
+                        help="resume the adaptive-planning seam with a structured decision JSON file "
+                             "(keys: shadow_treatment, volumetric_density, patch_size_overrides, "
+                             "reason, confidence). Validated + clamped to bounds before it is applied.")
     parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
     parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
                         help="full flow: skip the final GS+WB tweak (deferred stage targets the "
@@ -2880,11 +3108,21 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # adjudicator). See Calibration.adjudicate().
     state = _common.load_dlc_state(ctx)
     recorded = (state.get("calib", {}) or {}).get("decisions", {})
-    decisions = {k: Decision(v["choice"], v.get("note")) for k, v in recorded.items()}
+    decisions = {k: Decision(v["choice"], v.get("note"), payload=v.get("payload"))
+                 for k, v in recorded.items()}
     overrides: dict[str, Decision] = {}
     for spec in args.decide:
         key, _, choice = spec.partition("=")
         overrides[key.strip()] = Decision(choice.strip(), note="cli")
+    # The adaptive-planning seam answers with a structured decision file, not a one-of-N choice.
+    if args.plan_decision_file is not None:
+        try:
+            plan_payload = json.loads(Path(args.plan_decision_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(json.dumps({"error": f"could not read --plan-decision-file: {exc}"}))
+            return 2
+        overrides["adaptive-planning:plan"] = Decision(
+            "apply", note="cli plan-decision-file", payload=plan_payload)
     decisions.update(overrides)   # also seed the adjudicator (covers not-yet-recorded keys)
     adjudicator: Adjudicator = AutoAdjudicator() if args.auto else MappingAdjudicator(decisions)
 
@@ -3037,7 +3275,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
                         characterize_config=characterize_config, decision_overrides=overrides,
-                        skip_gswb=args.skip_gswb,
+                        skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,
                         enable_watchdog=True)
     result = None
