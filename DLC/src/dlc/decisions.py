@@ -31,6 +31,9 @@ class MetricThresholds:
     max_lut_neighbor_delta: float = 1.0
     max_lut_monotonicity_violations: int = 0
 
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 
 THRESHOLD_FIELDS = {
     "avg_de2000",
@@ -110,6 +113,35 @@ def metric_thresholds_for_run(
 ) -> MetricThresholds:
     policy = ctx.manifest.desktoplut.get("quality_policy") if ctx else None
     return metric_thresholds_from_policy(policy, phase, overrides=overrides)
+
+
+# Advisory HDR verify acceptance in **dE_ITP** (BT.2124; 1.0 ≈ one JND), looser than the
+# SDR CIEDE2000 gate and **LLM-negotiated after the first refinement round**
+# (v2-design-notes §7: "HDR — looser and LLM-negotiated"). The MetricThresholds fields
+# keep their ``*_de2000`` names as the generic ΔE carrier; the run's ``metric`` label
+# ("dE_ITP") names the units. Tunable per profile via a ``quality_policy['hdr']`` block.
+HDR_VERIFY_THRESHOLD_DEFAULTS: dict[str, float] = {
+    "avg_de2000": 3.0,
+    "p95_de2000": 6.0,
+    "max_de2000": 10.0,
+    "white_de2000": 4.0,
+}
+
+
+def hdr_metric_thresholds(
+    policy: Any = None,
+    *,
+    overrides: dict[str, Any] | None = None,
+) -> MetricThresholds:
+    """The advisory HDR verify thresholds (dE_ITP) — :data:`HDR_VERIFY_THRESHOLD_DEFAULTS`
+    overlaid by a profile ``quality_policy['hdr']`` block, then explicit ``overrides``
+    (e.g. the LLM's negotiated target). Advisory, never a gate — the assistant decides."""
+    values = asdict(MetricThresholds())
+    values.update(HDR_VERIFY_THRESHOLD_DEFAULTS)
+    if isinstance(policy, dict):
+        values.update(_threshold_updates(policy.get("hdr")))
+    values.update(_threshold_updates(overrides))
+    return MetricThresholds(**values)
 
 
 def quality_policy_coverage(policy: Any) -> dict[str, Any]:
@@ -290,4 +322,3 @@ def decide_iteration(
         reason="thresholds are not yet satisfied",
         next_params=_mhc_next_params(metrics) if phase == "mhc" else _3dlut_next_params(metrics, thresholds),
     )
-

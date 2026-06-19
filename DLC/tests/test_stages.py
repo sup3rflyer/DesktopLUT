@@ -11,6 +11,7 @@ from argparse import Namespace
 from pathlib import Path
 
 from dlc.controller import CalibrationController
+from dlc.decisions import MetricThresholds, write_quality_policy
 from dlc.runs import create_run
 from dlc.simulation import write_identity_cube, write_synthetic_ti3
 from dlc.stages import (
@@ -252,6 +253,21 @@ def test_score_uses_run_record_target_white_when_present(tmp_path):
     assert result.metrics["target_white_xy"] == [0.308, 0.325]
     assert result.metrics["target_white_source"] == "explicit"
     assert result.metrics["avg_de2000"] > 0.1
+
+
+def test_score_large_max_de_uses_run_quality_policy(tmp_path):
+    ctx = _new_run(tmp_path)
+    write_quality_policy(
+        ctx=ctx,
+        phase="verification",
+        thresholds=MetricThresholds(avg_de2000=1.0, p95_de2000=1.0, max_de2000=0.001, white_de2000=1.0),
+    )
+    ti3 = write_synthetic_ti3(tmp_path / "v.ti3")
+    result = score.build(_ns(ctx, stage="verification", source_ti3=str(ti3)), ctx)
+
+    assert result.status == "ran"
+    assert any(a.code == "large_max_de" and "0.00" in a.detail for a in result.anomalies)
+    assert result.advice["thresholds"]["max_de2000"] == 0.001
 
 
 def test_build_and_install_3dlut(tmp_path):

@@ -16,6 +16,7 @@ from ..mhc import parse_ti3, resolve_run_path
 from ..runs import RunContext
 from ..stage import StageResult
 from . import _common
+from ..decisions import metric_thresholds_for_run
 
 
 def build(args, ctx: RunContext) -> StageResult:
@@ -72,8 +73,13 @@ def build(args, ctx: RunContext) -> StageResult:
         {"rgb": [round(c, 4) for c in m.rgb], "de2000": round(m.de2000, 3), "grayscale": m.grayscale}
         for m in worst
     ]
-    if summary.max_de2000 > 5.0:
-        result.anomaly("large_max_de", f"max dE {summary.max_de2000:.2f} exceeds 5", "medium")
+    thresholds = metric_thresholds_for_run(ctx, args.stage)
+    if summary.max_de2000 > thresholds.max_de2000:
+        result.anomaly(
+            "large_max_de",
+            f"max dE {summary.max_de2000:.2f} exceeds {thresholds.max_de2000:.2f}",
+            "medium",
+        )
 
     metrics = {
         "stage": args.stage,
@@ -105,7 +111,11 @@ def build(args, ctx: RunContext) -> StageResult:
     result.preconditions = {"ti3_present": True}
     result.metrics = metrics
     result.deltas = deltas
-    result.advice = _common.policy_advice(metrics, previous_avg=prev["avg_de2000"] if prev else None)
+    result.advice = _common.policy_advice(
+        metrics,
+        previous_avg=prev["avg_de2000"] if prev else None,
+        thresholds=thresholds,
+    )
     return result
 
 

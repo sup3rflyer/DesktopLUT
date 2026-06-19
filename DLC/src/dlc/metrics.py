@@ -193,6 +193,33 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
     return metrics, target_luminance
 
 
+def score_samples_hdr(samples: list[Ti3Sample], *, white_xy: tuple[float, float],
+                      peak_nits: float) -> tuple[list[PatchMetric], float]:
+    """Score TI3 samples for an **HDR (PQ/Rec.2020)** run in ``dE_ITP`` (BT.2124) — the
+    perceptually-uniform metric the 3D-LUT cube converges in. The heavy PQ/ICtCp math is
+    lazy-imported from :mod:`dlc.engine` (numpy/colour), so importing this spine module
+    stays dependency-free; only the HDR path pulls the engine in.
+
+    The returned :class:`PatchMetric` reuses the ``de2000`` field as the generic primary
+    ΔE carrier (it holds **dE_ITP** here); the run/summary ``metric`` label disambiguates
+    — callers must pass ``metric="dE_ITP"`` to :func:`summarize_metrics`. ``target_xyz``
+    is the ideal absolute XYZ; ``target_luminance`` is the target ``peak_nits`` (reported,
+    not used to rescale — PQ is absolute)."""
+    if not samples:
+        raise ValueError("no TI3 samples to score")
+    from .engine.model import score_hdr
+
+    res = score_hdr([s.rgb for s in samples], [s.xyz for s in samples], white_xy=white_xy)
+    de_itp = res["de_itp"]
+    ideal_xyz = res["ideal_xyz"]
+    metrics = [
+        PatchMetric(s.rgb, s.xyz, tuple(float(c) for c in ideal_xyz[i]),
+                    float(de_itp[i]), is_grayscale(s.rgb))
+        for i, s in enumerate(samples)
+    ]
+    return metrics, float(peak_nits)
+
+
 def summarize_metrics(
     *,
     phase: str,
@@ -202,6 +229,7 @@ def summarize_metrics(
     target_luminance: float,
     metrics_path: Path | None = None,
     patches_path: Path | None = None,
+    metric: str = "CIEDE2000",
 ) -> MetricsSummary:
     values = [metric.de2000 for metric in patch_metrics]
     grayscale = [metric.de2000 for metric in patch_metrics if metric.grayscale]
@@ -210,7 +238,7 @@ def summarize_metrics(
         phase=phase,
         iteration=iteration,
         source=str(source),
-        metric="CIEDE2000",
+        metric=metric,
         patch_count=len(patch_metrics),
         grayscale_count=len(grayscale),
         target_luminance=target_luminance,

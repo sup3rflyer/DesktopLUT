@@ -1635,6 +1635,16 @@ _SRGB_TO_XYZ_D65 = (
     (0.0193339, 0.1191920, 0.9503041),
 )
 
+# Rec.2020 primaries → XYZ at D65, white Y normalized to 1.0 (canonical NPM; matches
+# colour's ITU-R BT.2020 to ~1e-7). The HDR synthetic panel emits through these — the
+# wide native gamut the PQ/Rec.2020 target aims at. PQ linear light is already absolute
+# nits (from the ST.2084 EOTF), so unlike sRGB no extra white_nits scaling is applied.
+_REC2020_TO_XYZ_D65 = (
+    (0.6369580, 0.1446169, 0.1688810),
+    (0.2627002, 0.6779981, 0.0593017),
+    (0.0000000, 0.0280727, 1.0609851),
+)
+
 
 class SyntheticPanel:
     """A deterministic, stateful synthetic meter (``MeasureFn``) modelling a QD
@@ -1647,6 +1657,15 @@ class SyntheticPanel:
     * **Flaky patch:** ``flaky_label``'s first read carries a chroma glitch
       (``flaky_chroma``), good on every subsequent read → exercises the immediate
       repeatability gate.
+
+    **Transfer-aware.** With a ``power`` transfer it is the SDR sRGB/γ-power panel
+    (the original behaviour, unchanged). With a ``pq`` transfer it models an HDR
+    panel: the PQ (ST.2084) EOTF decodes each channel's signal to **absolute nits**,
+    emitted through **Rec.2020** primaries; ``native_white_nits`` clips the panel's
+    physical peak and ``eotf_undershoot`` makes it render a fixed fraction under the
+    PQ reference (the calibratable gain the HDR consumer + cube correct). A perfect
+    HDR panel (undershoot 0, warm) reads the PQ/Rec.2020 ideal — the analogue of the
+    perfect SDR panel the orchestrator tests use for a clean wiring run.
 
     Pure stdlib + deterministic (optional seeded gaussian noise), so tests run
     without numpy and never flake.
@@ -1668,6 +1687,8 @@ class SyntheticPanel:
         start_temp: float = 0.0,
         load_thermal: bool = False,
         thermal_rate: float = 0.05,
+        native_white_nits: Optional[float] = None,
+        eotf_undershoot: float = 0.0,
     ) -> None:
         self.transfer = transfer
         self.white_nits = white_nits
@@ -1684,6 +1705,11 @@ class SyntheticPanel:
         self.thermal_rate = thermal_rate
         self.reads = 0
         self._flaky_seen: dict[str, int] = {}
+        # HDR-only knobs (ignored for a power transfer): the panel's physical peak
+        # (clips PQ above it) and its EOTF undershoot → measured = (1+undershoot)×PQ.
+        self.native_white_nits = native_white_nits
+        self.eotf_undershoot = eotf_undershoot
+        self.eotf_gain = 1.0 + float(eotf_undershoot)
 
     def _rand(self) -> float:
         # Tiny LCG → uniform [0,1); only used when noise>0 (kept deterministic).
@@ -1708,13 +1734,16 @@ class SyntheticPanel:
         self.temp = max(0.0, min(1.0, self.temp))
         blue_gain = self.cold_blue_gain + (1.0 - self.cold_blue_gain) * self.temp
 
-        lr = max(0.0, r) ** self.gamma
-        lg = max(0.0, g) ** self.gamma
-        lb = (max(0.0, b) ** self.gamma) * blue_gain
+        if self.transfer.kind == "pq":
+            x, y, z = self._read_pq_xyz(r, g, b, blue_gain)
+        else:
+            lr = max(0.0, r) ** self.gamma
+            lg = max(0.0, g) ** self.gamma
+            lb = (max(0.0, b) ** self.gamma) * blue_gain
 
-        x = self.white_nits * (_SRGB_TO_XYZ_D65[0][0] * lr + _SRGB_TO_XYZ_D65[0][1] * lg + _SRGB_TO_XYZ_D65[0][2] * lb)
-        y = self.white_nits * (_SRGB_TO_XYZ_D65[1][0] * lr + _SRGB_TO_XYZ_D65[1][1] * lg + _SRGB_TO_XYZ_D65[1][2] * lb)
-        z = self.white_nits * (_SRGB_TO_XYZ_D65[2][0] * lr + _SRGB_TO_XYZ_D65[2][1] * lg + _SRGB_TO_XYZ_D65[2][2] * lb)
+            x = self.white_nits * (_SRGB_TO_XYZ_D65[0][0] * lr + _SRGB_TO_XYZ_D65[0][1] * lg + _SRGB_TO_XYZ_D65[0][2] * lb)
+            y = self.white_nits * (_SRGB_TO_XYZ_D65[1][0] * lr + _SRGB_TO_XYZ_D65[1][1] * lg + _SRGB_TO_XYZ_D65[1][2] * lb)
+            z = self.white_nits * (_SRGB_TO_XYZ_D65[2][0] * lr + _SRGB_TO_XYZ_D65[2][1] * lg + _SRGB_TO_XYZ_D65[2][2] * lb)
 
         if self.flaky_label is not None and patch.label == self.flaky_label:
             seen = self._flaky_seen.get(patch.label, 0)
@@ -1741,3 +1770,26 @@ class SyntheticPanel:
         total = x + y + z
         yxy = (y, x / total, y / total) if total > 0 else (0.0, 0.0, 0.0)
         return Reading(xyz=(x, y, z), yxy=yxy, ok=True)
+
+    def _read_pq_xyz(self, r: float, g: float, b: float,
+                     blue_gain: float) -> tuple[float, float, float]:
+        """HDR read: PQ (ST.2084) EOTF → absolute per-channel nits through Rec.2020
+        primaries. The shared :class:`Transfer` math decodes the signal (``cv_to_nits``
+        on the code value), so this matches the engine's PQ ideal; the panel then clips
+        at its physical peak (``native_white_nits``) and under-renders by ``eotf_gain``
+        (= 1 + ``eotf_undershoot``) — the calibratable deficit. Blue carries the same
+        thermal gain as the SDR path (the temperamental channel)."""
+        max_cv = self.transfer.max_cv
+
+        def lin(signal: float) -> float:
+            nits = self.transfer.cv_to_nits(max(0.0, signal) * max_cv)
+            if self.native_white_nits is not None:
+                nits = min(nits, self.native_white_nits)   # the panel can't exceed its peak
+            return nits * self.eotf_gain                    # under-render vs the PQ reference
+
+        lr, lg, lb = lin(r), lin(g), lin(b) * blue_gain
+        m = _REC2020_TO_XYZ_D65
+        x = m[0][0] * lr + m[0][1] * lg + m[0][2] * lb
+        y = m[1][0] * lr + m[1][1] * lg + m[1][2] * lb
+        z = m[2][0] * lr + m[2][1] * lg + m[2][2] * lb
+        return x, y, z

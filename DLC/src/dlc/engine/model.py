@@ -153,6 +153,29 @@ def de_itp(delta_ictcp: np.ndarray) -> np.ndarray:
     return DE_ITP_SCALE * np.sqrt(np.sum(delta ** 2, axis=-1))
 
 
+def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
+              white_xy: Optional[tuple[float, float]] = None) -> dict[str, np.ndarray]:
+    """Per-patch HDR verify error in ``dE_ITP`` (BT.2124) — the metric the cube already
+    converges in, and the right one for HDR (CIEDE2000's Lab is meaningless at 1000+ nit
+    absolute luminance). Scores measured absolute XYZ against the **ideal PQ/Rec.2020
+    target at a single fixed white** (``white_xy`` rebuilds the colour-space so RGB
+    (1,1,1) maps to that white — a panel hitting the resolved white scores ~0, exactly
+    as the SDR path treats its resolved white).
+
+    ``signal_rgb`` / ``measured_xyz`` are ``(N, 3)`` (or flattenable to it); the latter
+    is absolute cd/m². Patches are assumed bounded to the reachable sub-peak range (the
+    roll-off region above the target peak is a later refinement). Returns ``de_itp`` and
+    the ``ideal_xyz`` (absolute cd/m²) per patch.
+    """
+    target = Target.hdr_rec2020_pq(white_xy=white_xy)
+    space = TargetSpace(target)
+    sig = np.asarray(signal_rgb, dtype=float).reshape(-1, 3)
+    meas = np.maximum(np.asarray(measured_xyz, dtype=float).reshape(-1, 3), 0.0)
+    ideal_xyz = space.ideal_xyz(sig)
+    delta = space.xyz_to_ictcp(meas) - space.xyz_to_ictcp(ideal_xyz)
+    return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz}
+
+
 # ---------------------------------------------------------------------------
 # Cross-validated smoothing
 # ---------------------------------------------------------------------------

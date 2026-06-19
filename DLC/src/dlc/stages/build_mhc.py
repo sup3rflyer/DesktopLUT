@@ -28,9 +28,16 @@ from ..runs import RunContext
 from ..stage import StageResult
 from . import _common
 
+# Rec.2020 primaries — the wide-gamut reference for the HDR gamut-drift tell (an HDR
+# panel's native gamut is judged against Rec.2020, not sRGB).
+REC2020_PRIMARIES = {
+    "rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797, "bx": 0.131, "by": 0.046,
+}
+
 
 def build(args, ctx: RunContext) -> StageResult:
     mode = _common.normalize_mode(args.mode)
+    is_hdr = bool(getattr(args, "is_hdr", False))
     result = StageResult("build-mhc")
 
     if args.source_ti3:
@@ -58,7 +65,24 @@ def build(args, ctx: RunContext) -> StageResult:
 
     white_xy = _common.measured_white_xy(samples)
     gray_patches = _common.gray_patches_from_ti3(samples)
-    if len(gray_patches) < 2:
+    if is_hdr:
+        # HDR (PQ): the MHC carries the primaries + native-white→D65 *matrix*; the **tone**
+        # (the PQ EOTF along the neutral axis) is owned by the 3D-LUT cube — the RBF
+        # error-field in ICtCp (v2-design-notes §7/§8 — "the 3D LUT does the volumetric
+        # heavy lifting incl. the neutral axis/grayscale"). A power-γ base 1D fit to PQ
+        # data would bake a wrong curve, so the base grayscale is identity; the cube (and
+        # the final correctionGrayscale tweak) carry the HDR neutral-axis work. The
+        # Advanced-Color dummy-ICC semantics are finalized at hardware bring-up; in
+        # simulation the matrix + identity base are stored plumbing.
+        n = max(1, len(gray_patches))
+        base = {
+            "point_count": n,
+            "points": [round(p.level, 6) for p in gray_patches] or [1.0],
+            "deviations": Deviations.identity(n).as_dict(),
+        }
+        base_summary = {}
+        result.action("HDR: base grayscale set to identity (the 3D LUT owns PQ tone / neutral axis)")
+    elif len(gray_patches) < 2:
         result.anomaly("too_few_gray", "fewer than 2 neutral patches; base grayscale set to identity", "high")
         n = max(1, len(gray_patches))
         base = {
@@ -97,16 +121,18 @@ def build(args, ctx: RunContext) -> StageResult:
         result.fail("invalid_target_white", str(exc))
         return result
 
-    # Gamut sanity vs sRGB primaries.
+    # Gamut sanity vs the target's primaries (Rec.2020 for HDR, sRGB for SDR).
+    ref_primaries = REC2020_PRIMARIES if is_hdr else SRGB_PRIMARIES
+    ref_label = "Rec.2020" if is_hdr else "sRGB"
     gamut_drift = {
-        f"{k}": round(measured_primaries[k] - SRGB_PRIMARIES[k], 4)
+        f"{k}": round(measured_primaries[k] - ref_primaries[k], 4)
         for k in ("rx", "ry", "gx", "gy", "bx", "by")
     }
     wide_gamut = any(abs(v) > 0.03 for v in gamut_drift.values())
     if wide_gamut:
         result.anomaly(
             "wide_gamut",
-            "measured primaries differ from sRGB by >0.03; matrix will map a wide gamut to the sRGB target",
+            f"measured primaries differ from {ref_label} by >0.03; matrix will map a wide gamut to the {ref_label} target",
             "low",
         )
 
@@ -142,7 +168,7 @@ def build(args, ctx: RunContext) -> StageResult:
         "target_white_xy": [params["white"]["x"], params["white"]["y"]],
         "target_white_source": target_white_source,
         "target_luminance": params["target_luminance"],
-        "gamut_drift_vs_srgb": gamut_drift,
+        "gamut_drift_vs_target": gamut_drift,
         "base_grayscale_max_abs_deviation": base_summary.get("max_abs_deviation"),
         "params_path": str(params_path),
     }

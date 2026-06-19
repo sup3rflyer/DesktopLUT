@@ -27,10 +27,12 @@ when called.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+from .decisions import MetricThresholds, metric_thresholds_from_policy
 
 __all__ = [
     "CorrectionInfo",
@@ -250,18 +252,12 @@ class TargetSpec:
 
 
 @dataclass(frozen=True)
-class QualityTargets:
+class QualityTargets(MetricThresholds):
     """Advisory CIEDE2000 acceptance targets (the human/LLM decides; these only
     inform the default recommendation)."""
 
-    avg_de2000: float = 1.5
-    p95_de2000: float = 3.0
-    max_de2000: float = 5.0
-    white_de2000: float = 2.0
-
-    def as_dict(self) -> dict[str, float]:
-        return {"avg_de2000": self.avg_de2000, "p95_de2000": self.p95_de2000,
-                "max_de2000": self.max_de2000, "white_de2000": self.white_de2000}
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -383,6 +379,27 @@ class Profile:
             return Target.hdr_rec2020_pq(peak_nits=spec.luminance_nits, white_xy=wxy)
         return Target.sdr_srgb_power(gamma=spec.gamma, white_nits=spec.luminance_nits,
                                      white_xy=wxy)
+
+    def resolve_hdr_target(self, target_name: str, *, dip: Any = None,
+                           white_xy: Optional[tuple[float, float]] = None):
+        """Resolve the chosen :class:`~dlc.hdr_target.HdrTarget` for a named PQ target
+        from the measured DIP (``docs/hdr-target-design.md``).
+
+        The DIP describes how the panel *deviates* from PQ; this turns it into a chosen
+        target: a sustained peak off the 200-step ladder (the profile's
+        ``peak_luminance_nits`` pins it; else conservative 1600 until a warm capture),
+        the first-order ``eotf_undershoot`` gain + its knee, and the single fixed white.
+        ``white_xy`` is the run's resolved target white (from :meth:`resolve_white`); it
+        falls back to the target's own white. Raises ``ValueError`` for a non-HDR target
+        (the caller should not be resolving an HDR target for an SDR run).
+        """
+        from .hdr_target import resolve_from_dip
+
+        spec = self.target(target_name)
+        if not spec.is_hdr:
+            raise ValueError(f"target {target_name!r} is not an HDR (PQ) target")
+        wxy = white_xy if white_xy is not None else spec.white_xy()
+        return resolve_from_dip(dip, white_xy=wxy, pinned_peak_nits=spec.peak_luminance_nits)
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def resolve_white(self, monitor: int, target_name: str, *,
@@ -658,12 +675,7 @@ def load_profile(path: Optional[Path | str] = None) -> Profile:
         raise ValueError(f"profile {p} defines no targets")
 
     q = raw.get("quality", {}) or {}
-    quality = QualityTargets(
-        avg_de2000=float(q.get("avg_de2000", 1.5)),
-        p95_de2000=float(q.get("p95_de2000", 3.0)),
-        max_de2000=float(q.get("max_de2000", 5.0)),
-        white_de2000=float(q.get("white_de2000", 2.0)),
-    )
+    quality = QualityTargets(**metric_thresholds_from_policy(q, "default").as_dict())
 
     return Profile(meter=meter, displays=displays, targets=targets, quality=quality,
                    paths=dict(raw.get("paths", {}) or {}),

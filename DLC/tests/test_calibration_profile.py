@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from dlc import calibration_profile as cp
+from dlc.decisions import MetricThresholds
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +299,19 @@ def test_profile_patches_block_loads(tmp_path: Path):
     assert p.source_path == str(path)
 
 
+def test_profile_quality_uses_canonical_threshold_defaults(tmp_path: Path):
+    path = tmp_path / "calibration_profile.yaml"
+    path.write_text(_YAML, encoding="utf-8")
+    p = cp.load_profile(path)
+    defaults = MetricThresholds()
+
+    assert p.quality.avg_de2000 == 1.2
+    assert p.quality.max_de2000 == 4.0
+    assert p.quality.p95_de2000 == defaults.p95_de2000
+    assert p.quality.white_de2000 == defaults.white_de2000
+    assert p.quality.min_improvement == defaults.min_improvement
+
+
 def test_load_profile_missing_file_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         cp.load_profile(tmp_path / "nope.yaml")
@@ -329,3 +343,21 @@ def test_engine_target_and_transfer():
 
     hdr = p.engine_target("rec2020_pq")
     assert hdr.transfer == "pq"
+
+
+def test_resolve_hdr_target_pins_peak_from_profile_and_uses_dip():
+    from dlc.dip import DisplayInstrumentProfile
+
+    p = cp.Profile.synthetic()  # rec2020_pq pins peak_luminance_nits = 1600
+    dip = DisplayInstrumentProfile(display="d", mode="HDR", native_white_nits=1840.0,
+                                   eotf_undershoot=-0.06)
+    tgt = p.resolve_hdr_target("rec2020_pq", dip=dip)
+    assert tgt.peak_nits == 1600.0            # the profile's pin, under the ceiling
+    assert tgt.undershoot_gain > 1.0          # the measured undershoot became a gain
+    assert tgt.white_xy == cp.D65_XY          # falls back to the target's own white
+
+
+def test_resolve_hdr_target_rejects_sdr_target():
+    p = cp.Profile.synthetic()
+    with pytest.raises(ValueError):
+        p.resolve_hdr_target("srgb_g22")
