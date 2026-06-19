@@ -1619,12 +1619,13 @@ class Calibration:
             self._score_stage(role, outcome.data.get("ti3"),
                               label="raw (native)" if role == "raw" else "after ICC")
         if outcome.data.get("needs_adjudication"):
-            budget_exceeded = bool(outcome.digest.get("remeasure_budget_exceeded"))
+            retry_recommended = bool(outcome.digest.get("remeasure_budget_exceeded")
+                                     or outcome.digest.get("drift_density_exceeded"))
             decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:escalation", seam=SEAM_MEASURE, stage=key,
                 question=outcome.data.get("question") or "measurement did not fully settle - accept or retry?",
-                options=(("accept", "retry", "abort") if budget_exceeded else ("accept", "abort")),
-                recommendation=("retry" if budget_exceeded else "accept"),
+                options=(("accept", "retry", "abort") if retry_recommended else ("accept", "abort")),
+                recommendation=("retry" if retry_recommended else "accept"),
                 digest=outcome.digest))
             if decision.choice == "retry":
                 raise CalibrationAborted(StageOutcome(

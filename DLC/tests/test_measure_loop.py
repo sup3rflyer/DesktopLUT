@@ -255,6 +255,35 @@ def test_remeasure_cap_is_advisory_and_surfaces_for_adjudication(tmp_path: Path)
     assert len(parse_ti3(ti3)) == 24
 
 
+def test_dense_drift_tightens_interval_and_flags_density():
+    # Repeated neutral-reference excursions in the same direction are not just ordinary
+    # bounded wander: the loop tightens its checkpoint cadence and surfaces the density.
+    t = _sdr()
+    loop = _solo_loop(
+        _ScriptedPanel([(10.0, 10.0, 10.5), (10.0, 10.0, 11.0), (9.8, 10.0, 11.0)]),
+        t,
+        MeasureLoopConfig(
+            neutral_interval=16,
+            adaptive_neutral_min=4,
+            drift_threshold=0.004,
+            drift_density_window=3,
+            drift_density_limit=3,
+        ),
+    )
+    loop.reference_xyz = (10.0, 10.0, 10.0)
+    warmup = loop._warmup_patch()
+    for idx in range(3):
+        pending = [f"p{idx:04d}"]
+        loop._neutral_checkpoint(warmup, pending, final=True, patch_index=(idx + 1) * 16)
+
+    assert loop.drift_density_exceeded is True
+    assert loop.drift_regime == "directional_warm_in"
+    assert loop.neutral_interval_current == 4
+    assert loop.neutral_interval_adjustments == 2
+    assert loop.drift_checkpoints[-1]["repeat_density"] == 1.0
+    assert loop.drift_checkpoints[-1]["dominant_channel"] == "B"
+
+
 # ---------------------------------------------------------------------------
 # thermal preheat: soak-into-calibration
 # ---------------------------------------------------------------------------

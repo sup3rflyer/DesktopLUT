@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Sequence
 
 from .dip import DisplayInstrumentProfile
-from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift
+from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, normalized_channels
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
 from .liveness import Liveness
@@ -155,6 +155,9 @@ class MeasureLoopConfig:
     # Interleaved drift reference (appended re-measure) ----------------------
     neutral_interval: int = 8           # measurement patches between neutral re-reads (DIP may override)
     drift_threshold: float = 0.004      # channel-balance Δ vs the warm reference (DIP may override)
+    adaptive_neutral_min: int = 4       # tightest interval after repeated drift exits the envelope
+    drift_density_window: int = 5       # recent neutral checkpoints considered for dense-drift gating
+    drift_density_limit: int = 4        # repeats in that window => LLM review (continued, not aborted)
 
     # Per-patch read policy (single-read default + DIP-driven escalation) -----
     read_tolerance_de: float = 0.2      # target standard error of the mean (CIEDE2000) per patch
@@ -395,6 +398,12 @@ class _Loop:
         self.appended_queue: list[MeasurePatch] = []
         self.seq_counter = 0            # running probe-read index (every read)
         self.drift_episodes = 0
+        self.drift_checkpoints: list[dict[str, Any]] = []
+        self.drift_density_exceeded = False
+        self.drift_density_event_emitted = False
+        self.drift_regime = "unknown"
+        self.neutral_interval_current = max(0, config.neutral_interval)
+        self.neutral_interval_adjustments = 0
         self.remeasure_budget = config.remeasure_cap
         self.remeasure_budget_exceeded = False
         self.warm = False
@@ -906,23 +915,146 @@ class _Loop:
 
     def main_pass(self) -> None:
         self._live_phase = "measure"
-        cfg = self.cfg
         warmup_patch = self._warmup_patch()
         pending: list[str] = []  # measured since the last clean neutral checkpoint
+        next_checkpoint = self.neutral_interval_current if self.neutral_interval_current > 0 else None
 
         for index, patch in enumerate(self.patches, start=1):
             self.measure_patch(patch, phase="main")
             pending.append(patch.label)
             self._maybe_checkin(index)   # coarse digest check-in at quartiles (LLM visibility)
 
-            if cfg.neutral_interval > 0 and index % cfg.neutral_interval == 0:
-                self._neutral_checkpoint(warmup_patch, pending)
+            if next_checkpoint is not None and index >= next_checkpoint:
+                self._neutral_checkpoint(warmup_patch, pending, patch_index=index)
+                next_checkpoint = index + self.neutral_interval_current if self.neutral_interval_current > 0 else None
 
         # Final checkpoint for the tail of the pass.
         if pending:
-            self._neutral_checkpoint(warmup_patch, pending, final=True)
+            self._neutral_checkpoint(warmup_patch, pending, final=True, patch_index=len(self.patches))
 
-    def _neutral_checkpoint(self, warmup_patch: MeasurePatch, pending: list[str], *, final: bool = False) -> None:
+    def _recent_drift_summary(self) -> dict[str, Any]:
+        window = max(1, self.cfg.drift_density_window)
+        recent = self.drift_checkpoints[-window:]
+        repeats = [s for s in recent if s.get("repeat")]
+        max_delta = max((float(s.get("max_delta", 0.0)) for s in recent), default=0.0)
+        return {
+            "checkpoints": len(self.drift_checkpoints),
+            "window": window,
+            "recent_count": len(recent),
+            "recent_repeats": len(repeats),
+            "repeat_density": (round(len(repeats) / len(recent), 3) if recent else 0.0),
+            "max_delta": round(max_delta, 6),
+            "regime": self.drift_regime,
+            "neutral_interval": self.neutral_interval_current,
+        }
+
+    def _classify_drift_regime(self) -> str:
+        window = max(1, self.cfg.drift_density_window)
+        recent = self.drift_checkpoints[-window:]
+        if not recent:
+            return "unknown"
+        repeats = [s for s in recent if s.get("repeat")]
+        if not repeats:
+            return "bounded_fluctuation"
+        pairs = [(s.get("dominant_channel"), s.get("direction")) for s in repeats
+                 if s.get("direction") != "flat"]
+        if not pairs:
+            return "excursion"
+        top = max(pairs, key=pairs.count)
+        consistency = pairs.count(top) / len(repeats)
+        dense = len(repeats) >= max(1, self.cfg.drift_density_limit)
+        if consistency >= 0.75:
+            return "directional_warm_in" if len(repeats) >= 2 else "excursion"
+        return "chaotic" if dense else "excursion"
+
+    def _maybe_tighten_neutral_interval(self, summary: dict[str, Any]) -> None:
+        current = self.neutral_interval_current
+        if current <= 0:
+            return
+        min_interval = max(1, self.cfg.adaptive_neutral_min)
+        if current <= min_interval:
+            return
+        if int(summary.get("recent_repeats", 0)) < 2:
+            return
+        new_interval = max(min_interval, max(1, current // 2))
+        if new_interval >= current:
+            return
+        self.neutral_interval_current = new_interval
+        self.neutral_interval_adjustments += 1
+        self._emit_event(
+            "INFO",
+            "neutral_interval_adjusted",
+            previous=current,
+            current=new_interval,
+            reason="repeated drift checkpoints exceeded the runtime envelope",
+            recent_repeats=summary.get("recent_repeats"),
+            window=summary.get("window"),
+            drift_regime=self.drift_regime,
+        )
+
+    def _record_drift_checkpoint(
+        self,
+        *,
+        ev,
+        current_xyz: tuple[float, float, float],
+        pending_count: int,
+        final: bool,
+        patch_index: Optional[int],
+    ) -> dict[str, Any]:
+        reference = normalized_channels(self.reference_xyz) if self.reference_xyz is not None else None
+        current = normalized_channels(current_xyz)
+        signed = ({ch: current[ch] - reference[ch] for ch in CHANNELS}
+                  if reference is not None else {ch: 0.0 for ch in CHANNELS})
+        dominant = max(CHANNELS, key=lambda ch: abs(signed[ch]))
+        dom_value = signed[dominant]
+        direction = "positive" if dom_value > 0 else "negative" if dom_value < 0 else "flat"
+        sample = {
+            "checkpoint": len(self.drift_checkpoints) + 1,
+            "patch_index": patch_index,
+            "pending_count": pending_count,
+            "final": final,
+            "repeat": ev.repeat,
+            "max_delta": round(ev.max_channel_delta, 6),
+            "threshold": round(self.cfg.drift_threshold, 6),
+            "coldest": ev.coldest_channel,
+            "dominant_channel": dominant,
+            "direction": direction,
+            "channel_deltas": {ch: round(signed[ch], 6) for ch in CHANNELS},
+        }
+        self.drift_checkpoints.append(sample)
+        self.drift_regime = self._classify_drift_regime()
+        sample["regime"] = self.drift_regime
+        summary = self._recent_drift_summary()
+        sample["recent_repeats"] = summary["recent_repeats"]
+        sample["repeat_density"] = summary["repeat_density"]
+
+        if ev.repeat:
+            self._maybe_tighten_neutral_interval(summary)
+            summary = self._recent_drift_summary()
+            if int(summary["recent_repeats"]) >= max(1, self.cfg.drift_density_limit):
+                self.drift_density_exceeded = True
+                if not self.drift_density_event_emitted:
+                    self.drift_density_event_emitted = True
+                    self._emit_event(
+                        "WARN",
+                        "drift_density_exceeded",
+                        recent_repeats=summary["recent_repeats"],
+                        window=summary["window"],
+                        repeat_density=summary["repeat_density"],
+                        max_delta=summary["max_delta"],
+                        drift_regime=self.drift_regime,
+                        neutral_interval=self.neutral_interval_current,
+                    )
+        return sample
+
+    def _neutral_checkpoint(
+        self,
+        warmup_patch: MeasurePatch,
+        pending: list[str],
+        *,
+        final: bool = False,
+        patch_index: Optional[int] = None,
+    ) -> None:
         if self.reference_xyz is None:
             pending.clear()
             return
@@ -950,6 +1082,13 @@ class _Loop:
             current_xyz=reading.xyz,
             delta_threshold=self.cfg.drift_threshold,
         )
+        drift_sample = self._record_drift_checkpoint(
+            ev=ev,
+            current_xyz=reading.xyz,
+            pending_count=len(pending),
+            final=final,
+            patch_index=patch_index,
+        )
         record = {
             "t": _now(),
             "seq": seq,
@@ -969,6 +1108,13 @@ class _Loop:
                 "max_delta": round(ev.max_channel_delta, 6),
                 "repeat": ev.repeat,
                 "coldest": ev.coldest_channel,
+                "channel_deltas": drift_sample["channel_deltas"],
+                "dominant": drift_sample["dominant_channel"],
+                "direction": drift_sample["direction"],
+                "regime": drift_sample["regime"],
+                "recent_repeats": drift_sample["recent_repeats"],
+                "repeat_density": drift_sample["repeat_density"],
+                "neutral_interval": self.neutral_interval_current,
             },
             "settle": None,
             "disposition": "drift_ref",
@@ -997,6 +1143,9 @@ class _Loop:
                 max_delta=ev.max_channel_delta,
                 coldest=ev.coldest_channel,
                 flagged=len(cold),
+                drift_regime=self.drift_regime,
+                recent_repeats=drift_sample["recent_repeats"],
+                repeat_density=drift_sample["repeat_density"],
             )
             pending.clear()
             if not final:
@@ -1109,8 +1258,14 @@ def run_measure_loop(
     # The appended remeasure cap is advisory: crossing it triggers adjudication, but the loop
     # keeps remeasuring the finite queue so the downstream engines get the best data available.
     unresolved_all = sorted(set(unresolved) | set(unstable_labels))
+    drift_summary = loop._recent_drift_summary()
 
-    needs_adjudication = (not loop.warm) or bool(unresolved_all) or loop.remeasure_budget_exceeded
+    needs_adjudication = (
+        (not loop.warm)
+        or bool(unresolved_all)
+        or loop.remeasure_budget_exceeded
+        or loop.drift_density_exceeded
+    )
     question = None
     if needs_adjudication:
         bits = []
@@ -1124,6 +1279,13 @@ def run_measure_loop(
                 f"appended remeasures exceeded the advisory budget "
                 f"({cfg.remeasure_cap} cap, {appended} performed); the loop continued "
                 "the queued remeasures and is surfacing this for review"
+            )
+        if loop.drift_density_exceeded:
+            bits.append(
+                f"drift repeatedly exceeded the runtime envelope "
+                f"({drift_summary['recent_repeats']}/{drift_summary['window']} recent checkpoints, "
+                f"regime {loop.drift_regime}, max delta {drift_summary['max_delta']}); "
+                f"neutral interval tightened to {loop.neutral_interval_current}"
             )
         if unresolved_all:
             bits.append(
@@ -1150,6 +1312,14 @@ def run_measure_loop(
         "remeasure_budget_remaining": max(0, loop.remeasure_budget),
         "remeasure_budget_exceeded": loop.remeasure_budget_exceeded,
         "drift_episodes": loop.drift_episodes,
+        "drift_checkpoints": drift_summary["checkpoints"],
+        "drift_recent_repeats": drift_summary["recent_repeats"],
+        "drift_repeat_density": drift_summary["repeat_density"],
+        "drift_regime": loop.drift_regime,
+        "drift_density_exceeded": loop.drift_density_exceeded,
+        "neutral_interval_initial": cfg.neutral_interval,
+        "neutral_interval_final": loop.neutral_interval_current,
+        "neutral_interval_adjustments": loop.neutral_interval_adjustments,
         "unresolved": unresolved_all,
         "white_xyz": [round(c, 4) for c in loop.white_xyz] if loop.white_xyz else None,
         "white_nits": round(loop.white_xyz[1], 3) if loop.white_xyz else None,
