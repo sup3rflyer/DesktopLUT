@@ -83,6 +83,39 @@ request, adjudicates ambiguous results on digests, and writes the report.
 - **C++ calibration IPC controller** in DesktopLUT (opt-in, locked-down local named
   pipe) that installs results — MHC ICC profiles and the 3D LUT — on the live
   display.
+- **Display + Instrument Profile** (`dlc/dip.py`) and `stage_characterize` — a
+  measured, persisted record of panel/meter behaviour (native white/primaries, the
+  noise/SNR model, the cold/temperamental channel, the thermal regime) that replaces
+  hand-tuned measurement magic numbers with data-driven read and stop policy.
+- **Thermal controller** (`dlc/thermal.py`) — a closed-loop, regime-adaptive preheat
+  (scaled-golden-ratio luminance clamp with proactive glide + reactive reinject, gated
+  on a net/gross window from the DIP noise) so a panel is measured warm; convergent
+  panels skip the soak unless warm-in earns it.
+- **Run-liveness supervisor** — the event spine (`dlc/events.py`, the single
+  `events.jsonl` both the dashboard and the LLM digest read), a self-acting stall guard
+  + force-kill watchdog (`dlc/liveness.py`), bounded reads, and a no-poison build probe
+  (a bad black read can never be folded into the cube). Closes the silent-stall gap.
+- **Mission-control dashboard** (`dlc/dashboard/`, stdlib-only) — a live run view over
+  the spine ("smart server, dumb browser"): status/timers/ETA, the liveness verdict,
+  ΔE big-numbers, and six HCFR-style zero-dependency SVG charts (CIE 1931, EOTF/gamma,
+  grayscale CCT/Duv, optimizer convergence, white-CCT-vs-time). Exports a self-contained
+  HTML **report** with the same charts.
+- **Probe-match generation** (`dlc/probe_match.py`, `stage_probe_match`, the
+  `build-correction` flow) — prepares the exact two-instrument `ccxxmake` recipe and
+  ingests the resulting `.ccmx` + `white.sp`. The persistent per-display
+  `correction_store.json` is the active-correction source of truth (the meter and
+  white-point resolution prefer it over the YAML).
+- **Resolve TPG transport for dogegen** (`dlc/dogegen_resolve.py`, now the default;
+  `--stdin` opts out) — resolves a deterministic long-run present-stall.
+- **Descriptive, durable deliverable cube** — a self-describing, sortable cube name
+  (`<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n.cube`) installed from the stable
+  `results/` folder, not the gitignored run-dir build artifact.
+
+### Validated
+- **First clean full SDR calibration on hardware (2026-06-19, ASUS ProArt PA32UCXR):**
+  a whole `full` flow ran end-to-end over the Resolve daemon — DLC verify avg ΔE2000
+  **0.41** (white 0.098, grayscale 0.24), **independently cross-checked in ColourSpace
+  at 0.48 / grayscale 0.19** on the same probe-matched i1.
 
 ### Removed
 - The Codex-scaffolded "mission control" autopilot (agent / supervise / dashboard /

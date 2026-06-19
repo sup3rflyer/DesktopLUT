@@ -45,10 +45,12 @@ docs/agent-tooling.md
 # Internal R&D / handoff design docs (kept local until DLC is published-ready;
 # some carry display-specific measurements). The public face is README + CHANGELOG.
 docs/HANDOFF.md
+docs/HANDOFF-archive-*.md
 docs/v2-design-notes.md
 docs/v1-rebuild-plan.md
 docs/hdr-target-design.md
 docs/audit-2026-06-17/
+docs/audit-2026-06-19/
 CLAUDE.md
 .claude/
 

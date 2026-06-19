@@ -1,42 +1,70 @@
 # DesktopLUT Calibrator (DLC)
 
-**LLM-steered display calibration for DesktopLUT.** The human says "calibrate my
-display"; an LLM assistant arbitrates quality at the start and end of every stage.
-The scripts are *hands* — they measure, build, install, and report rich JSON — and
-hold no accept/stop verdict. DesktopLUT remains the runtime color-management engine
-(MHC ICC at scanout + DWM-hook 3D LUT); DLC steers the calibration that fills it.
+**LLM-steered display calibration for DesktopLUT.** A deterministic **scripted core**
+owns *all* the mechanics — display mapping, patch sets, measurement loops, integrity
+gates, LUT generation — and a **thin LLM sits only at the seams**: it routes the
+request to a flow, adjudicates the handful of ambiguous results (on *digests*, never
+the raw measurement stream), and writes the closing panel analysis. DesktopLUT
+remains the runtime colour-management engine (MHC ICC at scanout + DWM-hook 3D LUT);
+DLC steers the calibration that fills it.
 
-> v1 scope: **MHC ICC + 3D LUT, SDR-first.** HDR finalization and the separate
-> shader/runtime post-tuning are deferred. See `docs/v1-rebuild-plan.md`.
+> v1 scope: **MHC ICC + 3D LUT + a small grayscale/white-point tweak, SDR-first.**
+> HDR finalization is the end goal but deferred (the architecture is *aimed* at HDR —
+> PQ patch sets, ICtCp RBF, thermal handling — and proven on SDR first).
+> Design source of truth: **`docs/v2-design-notes.md`**.
 
-## How it works — three parts + a memory
+## How it works — scripted core + thin LLM
 
-1. **Skill** (`.claude/skills/calibrate-display/SKILL.md`) — the assistant's
-   operating manual: mission/stop-condition, the stage map written
-   Start-gate → Action → End-gate with anomaly→response playbooks, quality
-   heuristics as *guidance* (not gates), and recovery patterns. The human types
-   nothing; the assistant reads this and steers.
-2. **Harness** (`src/dlc/stages/`) — deterministic stage tools the assistant calls
-   as `python -m dlc.stages.<tool> --run <RUN> --json`. Each emits one
-   `StageResult` (preconditions, metrics, deltas, anomalies, advisory verdict,
-   artifacts). They wrap the real engine (Argyll + color math) and route every
-   install through the controller.
+The pivot from v1 (an LLM reading a checklist and improvising the mechanics live) to
+v2 came from the first real run: the agent was *fumbling engineering*, not *judging
+quality*. v2 compiles the expertise into tested code and reserves the LLM for genuine
+judgement. **Three consumers of a live measurement, never conflated:**
+
+| Consumer | Watches | Reacts |
+|---|---|---|
+| **Core (code)** | every patch, real time | per-patch, instant, deterministic |
+| **Mission control (human/dashboard)** | live readout (nits, CIE, ΔE) | human real-time; physical adjusts |
+| **LLM** | a **digest** at boundaries / on anomaly — never the firehose | seconds; adjudicates policy |
+
+1. **Scripted orchestrator** (`src/dlc/calibrate.py`, `dlc-calibrate`) — a state
+   machine that runs a whole calibration as a **named flow** over the canonical
+   pipeline **MHC ICC → 3D LUT → GS+WB** (the grayscale/white tweak is the small
+   *final* step after the 3D LUT). Every stage is memoised in the run-record, giving
+   crash-recovery and live pause/resume.
+2. **Front-door skill** (repo-root `.claude/skills/calibrate-display/SKILL.md`) — the
+   assistant's thin operating manual: map intent → flow, adjudicate the seams the
+   core surfaces, write the report.
 3. **Controller** — `src/dlc/controller.py` talks NDJSON over the named pipe
    `\\.\pipe\DesktopLUT.Calibration` to DesktopLUT's C++ IPC server
    (`../src/desktoplut_ipc_server.{h,cpp}`), which actually installs results.
-4. **Run-record** — each `--run <RUN>` directory *is* the calibration's memory
-   (`dlc_state.json`, per-stage `StageResult`s, measurements, generated profiles),
-   so a resumed/compacted conversation reconstructs state via `state`.
+4. **Run-record** — each `runs/<ts>/` directory *is* the calibration's memory
+   (`dlc_state.json`, the `events.jsonl` spine, measurements, generated profiles),
+   so a resumed/compacted conversation reconstructs state.
 
-## The stage map (v1, SDR)
+## Named flows
 
-```
-preflight → enter-neutral → measure(raw) → build-mhc → install-mhc
-  → [measure(mhc-verify) → refine-grayscale]*   (loop until the LLM is satisfied)
-  → measure(post-mhc) → build-3dlut → check-cube → install-3dlut
-  → measure(3dlut-verify) → score → report
-probe-match is an optional, spectrometer-only first stage (skipped silently).
-```
+| You say | Flow | Runs |
+|---|---|---|
+| "calibrate my display" | `full` | neutral → raw → MHC build/install → post-MHC → 3D-LUT build/check/install → verify → report |
+| "give me a fresh 3D LUT" | `3dlut-only` | verify MHC present → measure → build/check/install cube → verify → report |
+| "quick grayscale + white-point tuning" | `gray-wb` | measure the neutral axis → short GS+WB tweak loop → verify → report (no re-profile, no cube) |
+| "calibrate for HDR" | `hdr` *(the goal; deferred)* | aborts — SDR-first in v1 |
+
+`full` is "calibrate the monitor" (ICC + 3D LUT together); `gray-wb` is the most-used
+day-to-day path. A cross-run **tweak-drift watchdog** tracks GS+WB tweak magnitude and
+flags when drift has grown enough to fight the 3D LUT → time for a fresh `full`.
+
+## The correction machine
+
+The differentiator (`src/dlc/optimize.py`): a nested-loop optimiser that drives a
+display to its **physical floor**. The inner loop builds a smoothed RBF model of the
+display's error field and predicts→cancels→re-predicts per LUT node; the outer loop
+installs the result, **re-measures reality, folds the real measurements back into the
+model, and rebuilds** — repeating until every patch is at target or at the panel's
+floor. The correction budget is derived from the measured residual (not hand-tuned),
+and the machine distinguishes a real physical floor from a too-small budget, so a
+tuning limit is never reported as "the panel can't do better." Points that genuinely
+can't reach target are surfaced for adjudication, not silently accepted.
 
 ## Quickstart
 
@@ -47,43 +75,68 @@ cd DLC
 # Rehearse the whole loop on the in-process simulator (no hardware, no pipe):
 PYTHONPATH=src python -m dlc.stages.simulate --run runs/_rehearsal     # -> "Ding"
 
-# Drive a single stage (the assistant does this; --simulate avoids hardware):
-PYTHONPATH=src python -m dlc.stages.preflight --run runs/myrun --simulate
-PYTHONPATH=src python -m dlc.stages.state     --run runs/myrun --simulate
+# Run the suite (no hardware):
+PYTHONPATH=src python -m pytest -q -p no:cacheprovider
+
+# Live mission-control dashboard (follows runs/active.json):
+PYTHONPATH=src python -m dlc.dashboard --open
 ```
 
-A **real** run mutates the live display and needs DesktopLUT launched with the
-calibration pipe enabled (opt-in): an empty `DesktopLUT_Calibration.flag` next to
-the exe, or `DESKTOPLUT_CALIBRATION=1`. This is a deliberate, user-involved step —
-see `docs/HANDOFF.md` §8 for the live bring-up procedure.
+A **real** run mutates the live display and is driven by the orchestrator
+(`dlc-calibrate --flow full`, which connects to the live pipe). It needs DesktopLUT
+launched with the calibration pipe enabled (opt-in): an empty
+`DesktopLUT_Calibration.flag` next to the exe, `DESKTOPLUT_CALIBRATION=1`, or the
+in-app "Calibration control" toggle. A pause/resume seam exits 10 so the assistant can
+decide and resume (`--decide KEY=CHOICE --run <dir>`). This is a deliberate,
+user-involved step — see `docs/HANDOFF.md` for the live bring-up procedure; normally
+the assistant drives it through the `calibrate-display` skill.
+
+## Install & dependencies
+
+The spine and the pipe contract are **dependency-free** (so `import dlc` and the
+controller never pull numpy). The scientific stack is isolated to `dlc/engine/*` and
+imported lazily:
+
+```bash
+pip install -e .            # spine + controller only
+pip install -e .[engine]    # + numpy / scipy / colour-science (the LUT/RBF engine)
+pip install -e .[meter]     # + pywinpty (the persistent-spotread ConPTY transport)
+```
+
+System Python 3.11+ (3.13 on this box). Contained binaries for real runs go under
+`third_party/argyll/3.3.0/bin/` and `third_party/dogegen/dogegen.exe`.
 
 ## Tests
 
 ```bash
-PYTHONPATH=src python -m pytest -q -p no:cacheprovider
-# test_engine.py  — engine + utility unit tests
-# test_spine.py   — color math, refinement convergence, controller contract
-# test_stages.py  — each stage tool + the end-to-end simulate
+PYTHONPATH=src python -m pytest -q -p no:cacheprovider     # 519 passed, 2 skipped
 ```
+
+The 2 skips are opt-in lab integration tests (`test_engine_v2.py`, gated on the
+`DLC_COLORCAL` env var pointing at the local colour-lab data). The suite covers the
+orchestrator, the colour engine, the adaptive measure loop, the correction machine,
+the event spine + liveness supervisor, the dashboard, and the IPC contract.
 
 ## Layout
 
 ```text
 DLC/
-  src/dlc/          engine + spine (argyll, mhc, lut3d, metrics, lut_integrity,
-                    colormath, refine, controller, decisions[advisor], ...)
-  src/dlc/stages/   the stage tools (the assistant's instruments) + simulate driver
-  tests/            test_engine / test_spine / test_stages
-  docs/             v1-rebuild-plan.md (design source of truth), HANDOFF.md (state)
-  runs/             per-run records (gitignored)
-  third_party/      contained tools: ArgyllCMS, dogegen (not committed)
+  src/dlc/            spine + orchestrator (calibrate, controller, refine, colormath,
+                      events, liveness, optimize, measure_loop, readout, ...)
+  src/dlc/engine/     scientific stack (numpy/scipy/colour, lazy): patches, model,
+                      lut_rbf, lut_sdr, whitepoint
+  src/dlc/stages/     stage tools + the end-to-end mock simulator
+  src/dlc/dashboard/  mission-control live view + HTML report (stdlib-only)
+  tests/              the pytest suite (519 tests)
+  docs/               v2-design-notes.md (SOT), HANDOFF.md (state), design notes
+  runs/               per-run records (gitignored)
+  results/            clean deliverable folders per run (gitignored)
+  third_party/        contained tools: ArgyllCMS, dogegen (not committed)
 ```
-
-Contained binaries (for real runs) go under `third_party/argyll/3.3.0/bin/` and
-`third_party/dogegen/dogegen.exe`.
 
 ## More
 
-- **Design / source of truth:** `docs/v1-rebuild-plan.md`
+- **Design / source of truth:** `docs/v2-design-notes.md`
 - **Current state & live bring-up:** `docs/HANDOFF.md`
-- **Operating manual:** `.claude/skills/calibrate-display/SKILL.md`
+- **Changelog:** `CHANGELOG.md`
+- **Operating manual:** repo-root `.claude/skills/calibrate-display/SKILL.md` (one level up from `DLC/`)
