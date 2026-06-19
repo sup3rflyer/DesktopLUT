@@ -22,6 +22,7 @@ from dlc.engine.model import Target, TargetSpace, de_itp
 from dlc.optimize import (
     DegenerateMeasurements,
     OptimizeConfig,
+    _classify,
     optimize_cube,
     sample_cube,
     seed_correction_budget,
@@ -161,9 +162,81 @@ def test_noiseless_correctable_panel_still_converges():
     assert result.digest["best_max_de"] < 2.0
 
 
+def test_adaptive_sampling_starts_focused_then_forces_full_validation():
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
+    signals = _cube_signals(7)  # large enough to avoid the always-full small-set path
+    cfg = OptimizeConfig(
+        grid_size=9,
+        threshold=0.2,  # keep the loop moving to the full-validation milestone
+        max_outer=3,
+        adaptive_min_full=64,
+        adaptive_initial_worst=24,
+        adaptive_sentinels=24,
+        adaptive_low_light_cap=24,
+    )
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=probe(signals), config=cfg)
+
+    assert result.history[0].sampling_mode == "focused"
+    assert result.history[0].probed_patches < result.history[0].probe_total
+    assert result.history[-1].sampling_mode == "full"
+    assert result.digest["full_validation"] is True
+    assert result.digest["best_probed_patches"] == result.digest["probe_total"]
+
+
 # ---------------------------------------------------------------------------
 # floor detection / escalation
 # ---------------------------------------------------------------------------
+
+def test_natural_zero_channels_on_saturated_patches_are_not_physical_floors():
+    # A saturated blue-ish patch naturally has R/G at zero. That alone must not
+    # mark it as clipped; otherwise low/saturated colours get prematurely written
+    # off as panel limits instead of model residuals worth refining.
+    masks = _classify(
+        verify=np.array([[0.0, 0.0, 0.75]], dtype=float),
+        driven=np.array([[0.0, 0.0, 0.70]], dtype=float),
+        de=np.array([5.0]),
+        threshold=2.0,
+        budget=0.20,
+        clamp_frac=0.85,
+        boundary_eps=0.002,
+        low_light_signal=0.08,
+    )
+    assert masks["signal_clipped"][0] == np.bool_(False)
+    assert masks["residual"][0] == np.bool_(True)
+
+
+def test_low_light_boundary_points_are_tracked_not_discarded():
+    masks = _classify(
+        verify=np.array([[0.031, 0.031, 0.0]], dtype=float),
+        driven=np.array([[0.0, 0.0, 0.0]], dtype=float),
+        de=np.array([8.0]),
+        threshold=2.0,
+        budget=0.20,
+        clamp_frac=0.85,
+        boundary_eps=0.002,
+        low_light_signal=0.08,
+    )
+    assert masks["near_black"][0] == np.bool_(True)
+    assert masks["low_clipped"][0] == np.bool_(True)
+    assert masks["signal_clipped"][0] == np.bool_(True)
+
+
+def test_full_scale_ceiling_is_still_a_physical_floor():
+    masks = _classify(
+        verify=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        driven=np.array([[0.0, 0.0, 1.0]], dtype=float),
+        de=np.array([8.0]),
+        threshold=2.0,
+        budget=0.20,
+        clamp_frac=0.85,
+        boundary_eps=0.002,
+        low_light_signal=0.08,
+    )
+    assert masks["high_clipped"][0] == np.bool_(True)
+    assert masks["signal_clipped"][0] == np.bool_(True)
+
 
 def test_infeasible_correction_surfaces_only_real_floors():
     target = _sdr_target()
@@ -181,6 +254,8 @@ def test_infeasible_correction_surfaces_only_real_floors():
     # the seed + escalation resolve the clamp-limited (false) floors — what remains
     # is the real, signal-clipped floor only.
     assert result.digest["physical_floor"] >= 1
+    assert "near_black_floor" in result.digest
+    assert "low_side_clipped" in result.digest and "high_side_clipped" in result.digest
     assert result.digest["budget_limited"] == 0
     assert len(result.floor_points) >= 1
     assert result.question is not None and "physical floor" in result.question

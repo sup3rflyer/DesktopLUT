@@ -29,11 +29,12 @@ a bigger budget fixes it). So this loop:
    not a constant.
 2. **Auto-escalates** the budget when stuck points are *clamp-limited with signal
    headroom*, up to a cap, before ever calling anything a floor.
-3. **Disambiguates** every above-threshold point into ``signal_clipped`` (driven
-   channel already at 0/1 — a real physical floor), ``budget_limited`` (clamp
-   binding but signal interior — raise the budget), or ``residual`` (interior, clamp
-   slack, still off — model/measurement floor). Only the real floors reach the LLM's
-   adjudication question; a tuning limit never masquerades as a panel limit.
+3. **Disambiguates** every above-threshold point into ``signal_clipped`` (a
+   correction actually pushed a channel into a 0/1 rail — a physical limit),
+   ``budget_limited`` (clamp binding but signal interior — raise the budget), or
+   ``residual`` (interior, clamp slack, still off — model/measurement floor).
+   Near-black points are counted separately so the most sensitive region stays
+   visible rather than being dismissed as uninteresting floor noise.
 
 **The LLM adjudicates** the real floors (the reason an LLM is in the loop): "floor
 reached / panel limit (accept) / worth another nudge" — never silently accepted.
@@ -120,6 +121,15 @@ class OptimizeConfig:
     boundary_eps: float = 2e-3               # driven channel within eps of 0/1 ⇒ clipped
 
     top_k: int = 8                  # worst points to surface in the digest
+    low_light_signal: float = 0.08  # permanent near-black accounting; do not discard these
+    adaptive_sampling: bool = True  # focus early outer probes, then force full validation
+    adaptive_min_full: int = 256    # small sets are cheaper/safer to read in full
+    adaptive_full_after: int = 3    # focused, wider, then full validation
+    adaptive_initial_worst: int = 96
+    adaptive_widen_factor: float = 2.0
+    adaptive_neighbors: int = 2
+    adaptive_low_light_cap: int = 128
+    adaptive_sentinels: int = 96
     smoothing: Optional[float] = None   # None ⇒ per-iteration k-fold CV
     n_inner_iterations: int = 3
     fade_width: float = 0.05
@@ -137,11 +147,15 @@ class IterationResult:
     above_threshold: int
     budget_limited: int            # clamp binding + signal headroom (→ raise budget)
     signal_clipped: int            # driven channel at 0/1 (→ physical floor)
+    near_black: int                # above-threshold low-signal points (tracked, never ignored)
     residual: int                  # interior, clamp slack, still off (→ model floor)
     worst: list[tuple[list[float], float]]   # [(signal, dE), …] top-k by dE
     smoothing: float
     cube_monotonic: bool
     train_points: int
+    probed_patches: int
+    probe_total: int
+    sampling_mode: str
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -155,11 +169,17 @@ class IterationResult:
             "above_threshold": self.above_threshold,
             "budget_limited": self.budget_limited,
             "signal_clipped": self.signal_clipped,
+            "near_black": self.near_black,
             "residual": self.residual,
             "smoothing": round(self.smoothing, 4),
             "cube_monotonic": self.cube_monotonic,
             "train_points": self.train_points,
             "worst": [[[round(c, 4) for c in s], round(d, 3)] for s, d in self.worst],
+            "probed_patches": self.probed_patches,
+            "probe_total": self.probe_total,
+            "sample_fraction": round(self.probed_patches / self.probe_total, 4)
+                               if self.probe_total else 0.0,
+            "sampling_mode": self.sampling_mode,
         }
 
 
@@ -211,18 +231,84 @@ def seed_correction_budget(space: TargetSpace, signals: np.ndarray, measured_xyz
 
 
 def _classify(verify: np.ndarray, driven: np.ndarray, de: np.ndarray,
-              threshold: float, budget: float, *, clamp_frac: float, boundary_eps: float):
-    """Bucket above-threshold points: signal_clipped (boundary), budget_limited
-    (clamp binding, interior), residual (interior, clamp slack)."""
+              threshold: float, budget: float, *, clamp_frac: float,
+              boundary_eps: float, low_light_signal: float):
+    """Bucket above-threshold points.
+
+    Boundary classification is directional. A naturally saturated patch such as
+    blue ``[0, 0, 0.75]`` should not be called a physical floor just because its
+    unused red/green channels are already zero. It is clipped only when the cube
+    actually pushes a nonzero channel down to zero, pushes a channel up to one, or
+    the requested signal is already at full scale and remains above threshold.
+    """
     above = de > threshold
     corr_mag = np.max(np.abs(driven - verify), axis=1)
-    at_boundary = np.any((driven <= boundary_eps) | (driven >= 1.0 - boundary_eps), axis=1)
+    low_clipped = np.any((driven <= boundary_eps) & (verify > boundary_eps), axis=1)
+    high_clipped = np.any((driven >= 1.0 - boundary_eps)
+                          & ((verify >= 1.0 - boundary_eps)
+                             | (driven > verify + boundary_eps)), axis=1)
+    at_boundary = low_clipped | high_clipped
     clamp_active = corr_mag >= clamp_frac * budget
+    near_black = above & (np.max(verify, axis=1) <= low_light_signal)
     signal_clipped = above & at_boundary
     budget_limited = above & ~at_boundary & clamp_active
     residual = above & ~at_boundary & ~clamp_active
     return {"above": above, "signal_clipped": signal_clipped,
-            "budget_limited": budget_limited, "residual": residual}
+            "budget_limited": budget_limited, "residual": residual,
+            "near_black": near_black, "low_clipped": above & low_clipped,
+            "high_clipped": above & high_clipped}
+
+
+def _cap_indices(indices: np.ndarray, scores: np.ndarray, cap: int) -> np.ndarray:
+    """Keep at most ``cap`` unique indices, preferring higher-score entries."""
+    unique = np.unique(indices.astype(int))
+    if cap <= 0 or unique.size <= cap:
+        return unique
+    order = np.argsort(scores[unique])[::-1][:cap]
+    return unique[order]
+
+
+def _adaptive_probe_indices(verify: np.ndarray, scores: np.ndarray, *, iteration: int,
+                            cfg: OptimizeConfig, force_full: bool) -> tuple[np.ndarray, str]:
+    """Choose which verification signals to probe this outer iteration.
+
+    The first large-set iterations are active-learning passes: worst known errors,
+    their local neighbours, a permanent near-black spine, and global sentinels.
+    A full pass is still forced at milestones so the final cube is judged against
+    the whole verification set.
+    """
+    total = len(verify)
+    if (not cfg.adaptive_sampling or total <= cfg.adaptive_min_full or force_full
+            or iteration >= cfg.adaptive_full_after):
+        return np.arange(total, dtype=int), "full"
+
+    widen = cfg.adaptive_widen_factor ** max(0, iteration - 1)
+    worst_n = min(total, max(1, int(round(cfg.adaptive_initial_worst * widen))))
+    worst = np.argsort(scores)[::-1][:worst_n]
+
+    picks: list[np.ndarray] = [worst]
+    if cfg.adaptive_neighbors > 0 and worst.size:
+        # Signal-space local neighbourhoods catch the "fix one patch, bend nearby
+        # patches" effect without paying for the whole cube immediately.
+        dist = np.linalg.norm(verify[:, None, :] - verify[worst][None, :, :], axis=2)
+        near = np.argsort(dist, axis=0)[: cfg.adaptive_neighbors + 1, :].reshape(-1)
+        picks.append(near)
+
+    low = np.where(np.max(verify, axis=1) <= cfg.low_light_signal)[0]
+    if low.size:
+        picks.append(_cap_indices(low, scores, cfg.adaptive_low_light_cap))
+
+    if cfg.adaptive_sentinels > 0:
+        # Deterministic canaries across the existing thermally-ordered sequence.
+        sent = np.linspace(0, total - 1, min(total, cfg.adaptive_sentinels), dtype=int)
+        picks.append(sent)
+        neutral = np.where(np.max(verify, axis=1) - np.min(verify, axis=1) <= 0.015)[0]
+        if neutral.size:
+            picks.append(_cap_indices(neutral, scores, max(8, cfg.adaptive_sentinels // 4)))
+
+    selected = np.unique(np.concatenate(picks).astype(int))
+    selected.sort()  # preserve the run's thermal ordering as much as possible
+    return selected, "focused" if iteration == 1 else "widened"
 
 
 def optimize_cube(
@@ -252,6 +338,13 @@ def optimize_cube(
     verify = (np.asarray(verify_signals, dtype=float).reshape(-1, 3)
               if verify_signals is not None else train_signals.copy())
     target_ictcp = space.ideal_ictcp(verify)
+    if len(verify) == len(train_signals):
+        score_hint = de_itp(space.xyz_to_ictcp(train_xyz) - target_ictcp)
+    else:
+        # A caller-supplied verification lattice may not have pre-LUT measurements.
+        # Fall back to a shape-based first pass (sentinels/near-black/neighbours);
+        # subsequent probes update these hints with measured dE.
+        score_hint = np.zeros(len(verify), dtype=float)
 
     # Budget: seed from the measured residual unless pinned.
     budget = (cfg.max_correction if cfg.max_correction is not None
@@ -265,6 +358,7 @@ def optimize_cube(
     snapshots: list[dict[str, Any]] = []   # cached per-iter measurements (no extra probing)
     best_seen_max: Optional[float] = None  # best worst-case dE so far (noise-robust stop)
     converged = False
+    force_full_probe = False
 
     for it in range(1, cfg.max_outer + 1):
         try:
@@ -287,12 +381,21 @@ def optimize_cube(
                 f"correction model (singular interpolation matrix: {exc}). The patch set is "
                 f"degenerate — duplicate or collinear signals. Re-measure with more signal "
                 f"variation (a fuller volumetric/ramp set), then retry.") from exc
-        driven = sample_cube(cube, verify)
-        measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
-        de = de_itp(space.xyz_to_ictcp(measured) - target_ictcp)
+        probe_idx, sampling_mode = _adaptive_probe_indices(
+            verify, score_hint, iteration=it, cfg=cfg, force_full=force_full_probe)
+        force_full_probe = False
+        verify_probe = verify[probe_idx]
+        target_probe = target_ictcp[probe_idx]
+        full_probe = len(probe_idx) == len(verify)
 
-        masks = _classify(verify, driven, de, cfg.threshold, budget,
-                          clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps)
+        driven = sample_cube(cube, verify_probe)
+        measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
+        de = de_itp(space.xyz_to_ictcp(measured) - target_probe)
+        score_hint[probe_idx] = de
+
+        masks = _classify(verify_probe, driven, de, cfg.threshold, budget,
+                          clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
+                          low_light_signal=cfg.low_light_signal)
         diag = cube_diagnostics(cube)
         order = np.argsort(de)[::-1][: cfg.top_k]
         result = IterationResult(
@@ -303,19 +406,23 @@ def optimize_cube(
             above_threshold=int(masks["above"].sum()),
             budget_limited=int(masks["budget_limited"].sum()),
             signal_clipped=int(masks["signal_clipped"].sum()),
+            near_black=int(masks["near_black"].sum()),
             residual=int(masks["residual"].sum()),
-            worst=[(verify[i].tolist(), float(de[i])) for i in order],
+            worst=[(verify_probe[i].tolist(), float(de[i])) for i in order],
             smoothing=float(model.smoothing), cube_monotonic=diag.monotonic,
-            train_points=int(len(train_signals)),
+            train_points=int(len(train_signals)), probed_patches=int(len(probe_idx)),
+            probe_total=int(len(verify)), sampling_mode=sampling_mode,
         )
         history.append(result)
         snapshots.append({"cube": cube, "driven": driven, "measured": measured, "de": de,
-                          "budget": budget, "monotonic": diag.monotonic})
+                          "budget": budget, "monotonic": diag.monotonic,
+                          "verify": verify_probe, "full": full_probe,
+                          "sampling_mode": sampling_mode})
         if on_iteration is not None:
             on_iteration(result)
 
         cur_max = float(de.max())
-        if cur_max < cfg.threshold:
+        if full_probe and cur_max < cfg.threshold:
             converged = True
             break
 
@@ -325,6 +432,14 @@ def optimize_cube(
                       and budget < cfg.max_correction_cap)
         if escalating:
             budget = min(cfg.max_correction_cap, budget * cfg.escalate_factor)
+        elif not full_probe and (cur_max < cfg.threshold
+                                 or (best_seen_max is not None
+                                     and cur_max > best_seen_max - cfg.floor_tol)):
+            # A focused pass either looks clean or is no longer improving. Do not declare
+            # victory or failure from a slice; force a full validation of the current model.
+            force_full_probe = True
+            if cur_max >= cfg.threshold:
+                continue
         elif best_seen_max is not None and cur_max > best_seen_max - cfg.floor_tol:
             # No budget headroom AND this iteration did not improve the best worst-case error
             # by at least floor_tol (the measurement-noise band). Folding its driven/measured
@@ -344,17 +459,20 @@ def optimize_cube(
     # the cached measurements (no extra probing).
     def _rank(s: dict[str, Any]) -> tuple[int, float]:
         return (0 if s["monotonic"] else 1, float(s["de"].max()))
-    best = min(snapshots, key=_rank)
+    full_snapshots = [s for s in snapshots if s["full"]]
+    best = min(full_snapshots or snapshots, key=_rank)
     best_cube, best_de, best_driven, best_budget = (best["cube"], best["de"],
                                                     best["driven"], best["budget"])
+    best_verify = best["verify"]
     final = history[-1]
 
-    masks_best = _classify(verify, best_driven, best_de, cfg.threshold, best_budget,
-                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps)
+    masks_best = _classify(best_verify, best_driven, best_de, cfg.threshold, best_budget,
+                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
+                           low_light_signal=cfg.low_light_signal)
     # Real floors = physically clipped + model residual (more budget won't help).
     real_floor = masks_best["signal_clipped"] | masks_best["residual"]
     budget_limited = masks_best["budget_limited"]
-    floor_points = [(verify[i].tolist(), float(best_de[i])) for i in np.where(real_floor)[0]]
+    floor_points = [(best_verify[i].tolist(), float(best_de[i])) for i in np.where(real_floor)[0]]
     floor_points.sort(key=lambda p: p[1], reverse=True)
 
     needs_adjudication = bool(real_floor.any() or budget_limited.any())
@@ -363,10 +481,19 @@ def optimize_cube(
         parts: list[str] = []
         if real_floor.any():
             worst_sig, worst_de = floor_points[0]
+            near = int((real_floor & masks_best["near_black"]).sum())
+            near_clause = f"; {near} in the near-black region" if near else ""
+            boundary_bits: list[str] = []
+            if masks_best["low_clipped"].any():
+                boundary_bits.append("low-side rail")
+            if masks_best["high_clipped"].any():
+                boundary_bits.append("high-side rail")
+            boundary_clause = f", {', '.join(boundary_bits)}" if boundary_bits else ""
             parts.append(
-                f"{int(real_floor.sum())} patch(es) at the panel's physical floor "
+                f"{int(real_floor.sum())} patch(es) at the panel's physical floor/limit{near_clause} "
                 f"(worst dE {worst_de:.1f} at signal {[round(c, 3) for c in worst_sig]}, "
-                f"channel at full scale) — accept as the panel limit, or loosen the target?"
+                f"{'boundary: ' if boundary_clause else ''}{boundary_clause.lstrip(', ') or 'interior residual'}) "
+                "— accept as the panel limit, refine the model, or loosen the target?"
             )
         if budget_limited.any():
             parts.append(
@@ -387,8 +514,16 @@ def optimize_cube(
         "best_p95_de": round(float(np.percentile(best_de, 95)), 4),
         "above_threshold": int(masks_best["above"].sum()),
         "physical_floor": int(real_floor.sum()),
+        "near_black_floor": int((real_floor & masks_best["near_black"]).sum()),
+        "near_black_above_threshold": int(masks_best["near_black"].sum()),
+        "low_side_clipped": int(masks_best["low_clipped"].sum()),
+        "high_side_clipped": int(masks_best["high_clipped"].sum()),
         "budget_limited": int(budget_limited.sum()),
         "cube_monotonic": bool(best["monotonic"]),
+        "sampling_mode": best["sampling_mode"],
+        "full_validation": bool(best["full"]),
+        "best_probed_patches": int(len(best_de)),
+        "probe_total": int(len(verify)),
         "needs_adjudication": needs_adjudication,
         "history": [h.as_dict() for h in history],
     }
