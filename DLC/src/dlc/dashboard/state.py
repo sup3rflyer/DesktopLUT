@@ -590,6 +590,8 @@ class DashboardState:
 
         stage_started = _parse_iso(self.stage_started_iso)
         stage_elapsed = (now - stage_started).total_seconds() if stage_started else None
+        if ended and stage_started:
+            stage_elapsed = (ended - stage_started).total_seconds()
 
         spr = self._rolling_s_per_read()
         spp = self._rolling_s_per_patch()

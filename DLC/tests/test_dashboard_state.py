@@ -137,6 +137,15 @@ def test_run_done_freezes_the_run_clock():
     assert abs(snap["timers"]["run_elapsed_s"] - 120.0) < 1.0
 
 
+def test_run_done_freezes_the_stage_clock():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=30), stage="measure"))
+    st.ingest(_ev(Ev.RUN_DONE, t=T0 + timedelta(seconds=120), stage="run", status="completed"))
+    snap = st.snapshot(T0 + timedelta(seconds=9999))
+    assert abs(snap["timers"]["stage_elapsed_s"] - 90.0) < 1.0
+
+
 def test_paused_seam_shows_paused_not_stalled():
     """A healthy human-in-the-loop pause: the process exits to await a decision, so
     heartbeats STOP and event-age grows — but it must read 'paused' (calm), never

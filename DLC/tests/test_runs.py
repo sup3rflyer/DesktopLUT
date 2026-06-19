@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dlc.runs import create_run, open_run
+from dlc.runs import create_run, make_run_name, open_run
 
 
 def test_create_run_root_is_absolute_for_relative_dir(tmp_path, monkeypatch):
@@ -32,3 +32,19 @@ def test_create_run_default_dir_is_absolute(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     ctx = create_run("SDR", display="x")   # no run_dir → RUNS_DIR / name
     assert ctx.root.is_absolute()
+
+
+def test_generated_run_names_are_unique_and_slugged():
+    a = make_run_name("SDR", "Asus ProArt PA32UCXR / Lab")
+    b = make_run_name("SDR", "Asus ProArt PA32UCXR / Lab")
+    assert a != b
+    assert a.endswith("_sdr_asus_proart_pa32ucxr_lab")
+    assert "/" not in a and " " not in a
+
+
+def test_run_manifest_save_uses_atomic_writer(tmp_path):
+    ctx = create_run("SDR", display="x", run_dir=tmp_path / "run")
+    assert not list(ctx.root.glob(".manifest.json.*.tmp"))
+    assert ctx.manifest_path.exists()
+    reopened = open_run(ctx.root)
+    assert reopened.manifest.name == "run"

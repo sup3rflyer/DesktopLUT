@@ -72,10 +72,31 @@ def base_parser(description: str) -> argparse.ArgumentParser:
 def latest_run() -> Path | None:
     if not RUNS_DIR.exists():
         return None
+    pointer = RUNS_DIR / "active.json"
+    try:
+        raw = json.loads(pointer.read_text(encoding="utf-8"))
+        active = Path(str(raw.get("run_root") or raw.get("run") or ""))
+        if active and not active.is_absolute():
+            active = (RUNS_DIR / active).resolve()
+        if active.is_dir() and (active / "manifest.json").exists():
+            return active
+    except (OSError, ValueError, TypeError):
+        pass
     candidates = [p for p in RUNS_DIR.iterdir() if p.is_dir() and (p / "manifest.json").exists()]
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def created_or_mtime(path: Path) -> str:
+        try:
+            raw = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            created = raw.get("created")
+            if isinstance(created, str) and created:
+                return created
+        except (OSError, ValueError):
+            pass
+        return path.stat().st_mtime_ns.__str__()
+
+    return max(candidates, key=created_or_mtime)
 
 
 def resolve_run(args: argparse.Namespace, *, create: bool = False) -> RunContext:
@@ -131,6 +152,7 @@ class FileBackedMockTransport:
             snapshots=raw.get("snapshots", {}),
             mhc=raw.get("mhc", {}),
             runtime=raw.get("runtime", {}),
+            hdr={int(k): bool(v) for k, v in (raw.get("hdr", {}) or {}).items()},
             command_count=int(raw.get("command_count", 0)),
         )
         self.server.state = st

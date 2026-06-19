@@ -19,6 +19,7 @@ engine = [
     "numpy>=1.26,<3",
     "scipy>=1.11,<2",
     "colour-science>=0.4.4,<0.5",
+    "PyYAML>=6,<7",
 ]
 # Persistent (interactive) spotread needs a Windows pseudo-console to deliver its
 # trigger keystroke — the raw pipe doesn't work (box-validated 2026-06-17).
@@ -34,8 +35,13 @@ meter = [
 dlc-simulate = "dlc.stages.simulate:main"
 dlc-readout = "dlc.readout:main"
 dlc-calibrate = "dlc.calibrate:main"
+dlc-dashboard = "dlc.dashboard.__main__:main"
+dlc-digest = "dlc.digest:main"
+dlc-dogegen-server = "dlc.dogegen_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"dlc.dashboard" = ["assets/*"]
 

@@ -57,8 +57,8 @@ class DogegenPatchDisplay:
         proc = subprocess.Popen(
             [str(self.executable), self.startup_mode],
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
@@ -77,5 +77,4 @@ class DogegenPatchDisplay:
     def send_many(cls, proc: subprocess.Popen[str], commands: Iterable[str], settle_seconds: float = 0.3) -> None:
         for command in commands:
             cls.send(proc, command, settle_seconds)
-
 

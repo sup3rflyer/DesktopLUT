@@ -253,6 +253,29 @@ def test_file_backed_mock_persists_across_controllers(tmp_path):
     assert state["calibration_mode"]["active"] is True
 
 
+def test_file_backed_mock_persists_hdr_state(tmp_path):
+    path = tmp_path / "sim_state.json"
+    c1 = CalibrationController.with_transport(FileBackedMockTransport(path))
+    c1.set_hdr(0, enable=True)
+
+    c2 = CalibrationController.with_transport(FileBackedMockTransport(path))
+    mon0 = c2.query_monitors()["monitors"][0]
+    assert mon0["hdr_active"] is True
+    assert mon0["color_space"] == "HDR"
+
+
+def test_latest_run_prefers_active_pointer(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(_common, "RUNS_DIR", runs)
+    older = create_run("SDR", display="old", run_dir=runs / "older")
+    newer = create_run("SDR", display="new", run_dir=runs / "newer")
+    (runs / "active.json").write_text('{"run":"' + str(older.root).replace("\\", "\\\\") + '"}', encoding="utf-8")
+
+    assert _common.latest_run() == older.root
+    (runs / "active.json").unlink()
+    assert _common.latest_run() == newer.root
+
+
 # --------------------------------------------------------------------------
 # Advisory policy helper (advice, never a gate)
 # --------------------------------------------------------------------------

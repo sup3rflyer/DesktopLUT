@@ -71,6 +71,26 @@ def _get(url: str, timeout: float = 5.0):
         return resp.status, resp.read()
 
 
+def _post(url: str, *, token: str | None = None, origin: str | None = None,
+          host: str | None = None, timeout: float = 5.0):
+    headers = {}
+    if token:
+        headers["X-DLC-CSRF-Token"] = token
+    if origin:
+        headers["Origin"] = origin
+    if host:
+        headers["Host"] = host
+    req = urllib.request.Request(url, method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()
+
+
+def _csrf_token(base: str) -> str:
+    status, body = _get(base + "/api/snapshot")
+    assert status == 200
+    return json.loads(body)["csrf_token"]
+
+
 def test_http_serves_spa_and_assets(tmp_path):
     hub = _hub_with_events(tmp_path)
     httpd, base = _serve(hub)
@@ -94,6 +114,7 @@ def test_api_snapshot_returns_state_and_backlog(tmp_path):
         payload = json.loads(body)
         assert payload["state"]["header"]["target"] == "srgb_g22"
         assert len(payload["backlog"]) == 3
+        assert isinstance(payload["csrf_token"], str) and payload["csrf_token"]
     finally:
         httpd.shutdown()
 
@@ -121,13 +142,56 @@ def test_api_cancel_writes_control_json(tmp_path):
     hub = _hub_with_events(tmp_path)
     httpd, base = _serve(hub)
     try:
-        req = urllib.request.Request(base + "/api/cancel", method="POST")
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            assert resp.status == 200
-            data = json.loads(resp.read())
+        status, body = _post(base + "/api/cancel", token=_csrf_token(base))
+        assert status == 200
+        data = json.loads(body)
         assert data["ok"] is True
         ctrl = tmp_path / "control.json"               # run root == events.jsonl's parent
         assert ctrl.exists() and json.loads(ctrl.read_text())["action"] == "cancel"
+    finally:
+        httpd.shutdown()
+
+
+def test_api_cancel_requires_csrf_token(tmp_path):
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        try:
+            _post(base + "/api/cancel")
+            assert False, "expected 403"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 403
+        assert not (tmp_path / "control.json").exists()
+    finally:
+        httpd.shutdown()
+
+
+def test_mutating_api_rejects_cross_origin(tmp_path):
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        token = _csrf_token(base)
+        try:
+            _post(base + "/api/cancel", token=token, origin="http://evil.example")
+            assert False, "expected 403"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 403
+        assert not (tmp_path / "control.json").exists()
+    finally:
+        httpd.shutdown()
+
+
+def test_mutating_api_rejects_unexpected_host(tmp_path):
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        token = _csrf_token(base)
+        try:
+            _post(base + "/api/cancel", token=token, host="evil.example")
+            assert False, "expected 403"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 403
+        assert not (tmp_path / "control.json").exists()
     finally:
         httpd.shutdown()
 
@@ -148,7 +212,7 @@ def test_export_writes_html_report_to_reports(tmp_path):
     hub = _hub_with_events(tmp_path)
     httpd, base = _serve(hub)
     try:
-        status, body = _get(base + "/api/export")
+        status, body = _post(base + "/api/export", token=_csrf_token(base))
         assert status == 200
         payload = json.loads(body)
         saved = payload["saved_to"]
@@ -161,6 +225,20 @@ def test_export_writes_html_report_to_reports(tmp_path):
         assert "srgb_g22" in html               # the target made it into the summary
         # the JSON sidecar is written too
         assert Path(payload["json_saved_to"]).exists()
+    finally:
+        httpd.shutdown()
+
+
+def test_export_is_post_only(tmp_path):
+    hub = _hub_with_events(tmp_path)
+    httpd, base = _serve(hub)
+    try:
+        try:
+            _get(base + "/api/export")
+            assert False, "expected 405"
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 405
+        assert not (tmp_path / "reports").exists()
     finally:
         httpd.shutdown()
 

@@ -13,6 +13,7 @@ let logData = [];           // {time, level, stage, event, phase, tier, data, de
 let knownStages = new Set();
 let renderQueued = false;
 let lastState = null;
+let csrfToken = null;
 
 /* ── helpers ─────────────────────────────────────────────────── */
 const LEVEL_RANK = { DEBUG: 0, INFO: 1, WARN: 2, ERROR: 3 };
@@ -55,6 +56,25 @@ function toast(msg) {
   el.classList.add("show");
   clearTimeout(toast._t);
   toast._t = setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+async function ensureCsrfToken() {
+  if (csrfToken) return csrfToken;
+  const r = await fetch("/api/snapshot", { cache: "no-store" });
+  const j = await r.json();
+  csrfToken = j.csrf_token;
+  if (j.state) renderState(j.state);
+  if (j.backlog) seedLog(j.backlog);
+  return csrfToken;
+}
+
+async function postJson(path) {
+  const token = await ensureCsrfToken();
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "X-DLC-CSRF-Token": token },
+  });
+  return r.json();
 }
 
 /* ── status bar + sidebar (from `state`) ─────────────────────── */
@@ -266,7 +286,14 @@ function connect() {
   });
   es.addEventListener("reset", (e) => {
     seedLog([]);
+    lastCharts = null;
+    lightboxKey = null;
+    $("charts-stage").textContent = "—";
+    $("charts").innerHTML = "";
+    $("lb-body").innerHTML = "";
+    $("lightbox").hidden = true;
     renderState(JSON.parse(e.data));
+    refreshCharts();
     toast("new run — dashboard reset");
   });
   es.onerror = () => {
@@ -329,8 +356,7 @@ function wireUi() {
   $("btn-export").addEventListener("click", async () => {
     $("btn-export").disabled = true;
     try {
-      const r = await fetch("/api/export");
-      const j = await r.json();
+      const j = await postJson("/api/export");
       toast(j.saved_to ? `report → ${j.saved_to.split(/[\\/]/).pop()}` : "report exported");
     } catch (e) {
       toast("export failed");
@@ -343,8 +369,7 @@ function wireUi() {
     if (!confirm("Cancel this run? DesktopLUT rolls back to your pre-run setup at the next checkpoint.")) return;
     $("btn-cancel").disabled = true;
     try {
-      const r = await fetch("/api/cancel", { method: "POST" });
-      const j = await r.json();
+      const j = await postJson("/api/cancel");
       toast(j.ok ? "cancel requested — rolling back at the next checkpoint" : ("cancel failed: " + (j.error || "")));
     } catch (e) {
       toast("cancel failed");

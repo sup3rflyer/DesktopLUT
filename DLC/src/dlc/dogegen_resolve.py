@@ -88,7 +88,7 @@ class ResolveDogegen:
         # dogegen connects once with no retry, so we are already listening above.
         self.proc = subprocess.Popen(
             [str(self.executable), self.startup_command],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             text=True, bufsize=1,
         )
         try:

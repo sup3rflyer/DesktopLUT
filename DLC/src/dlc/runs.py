@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .events import EventWriter
-from .paths import RUNS_DIR
+from .paths import RUNS_DIR, atomic_write_text
 
 
 @dataclass
@@ -19,7 +20,7 @@ class RunManifest:
     name: str
     mode: str
     display: str | None
-    created: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    created: str = field(default_factory=lambda: datetime.now().isoformat(timespec="microseconds"))
     status: str = "created"
     tools: dict[str, str | None] = field(default_factory=dict)
     desktoplut: dict[str, Any] = field(default_factory=dict)
@@ -59,7 +60,8 @@ class RunContext:
             (self.root / name).mkdir()
 
     def save(self) -> None:
-        self.manifest_path.write_text(
+        atomic_write_text(
+            self.manifest_path,
             json.dumps(asdict(self.manifest), indent=2),
             encoding="utf-8",
         )
@@ -71,8 +73,9 @@ class RunContext:
 
 
 def make_run_name(mode: str, display: str | None) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    suffix = display.lower().replace(" ", "_") if display else "display"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    suffix = re.sub(r"[^a-z0-9._-]+", "_", display.lower()).strip("_") if display else "display"
+    suffix = suffix or "display"
     return f"{timestamp}_{mode.lower()}_{suffix}"
 
 
@@ -107,4 +110,3 @@ def open_run(run_dir: Path) -> RunContext:
         stages=raw.get("stages", []),
     )
     return RunContext(root=run_dir.resolve(), manifest=manifest)
-

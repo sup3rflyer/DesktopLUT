@@ -169,6 +169,7 @@ class MockDesktopLutServer:
         self.state.calibration_mode = deepcopy(snapshot.get("calibration_mode"))
         self.state.mhc = deepcopy(snapshot.get("mhc", {}))
         self.state.runtime = deepcopy(snapshot.get("runtime", {}))
+        self.state.hdr = {int(k): bool(v) for k, v in deepcopy(snapshot.get("hdr", {})).items()}
         return self.ok({"snapshot_id": snapshot_id, "restored": True})
 
     def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
@@ -255,4 +256,3 @@ class MockDesktopLutTransport:
     def request(self, command: DesktopLutCommand) -> DesktopLutResponse:
         self.requests.append(command)
         return self.server.handle(command)
-

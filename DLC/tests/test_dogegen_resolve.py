@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import subprocess
 import struct
 
 import pytest
 
+from dlc import dogegen_resolve as dgresolve
+from dlc.dogegen import DogegenPatchDisplay
 from dlc.dogegen_resolve import ResolveDogegen, frame, resolve_patch_xml
 
 
@@ -82,3 +85,76 @@ def test_close_is_idempotent_without_start():
     rdg = ResolveDogegen("dogegen.exe")
     rdg.close()   # nothing started — must not raise
     rdg.close()
+
+
+def test_stdin_dogegen_does_not_leave_output_pipes_unread(monkeypatch):
+    captured = {}
+
+    class _FakeProc:
+        pass
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr("dlc.dogegen.time.sleep", lambda *_: None)
+
+    DogegenPatchDisplay("dogegen.exe", "SDR").start()
+    assert captured["stdout"] is subprocess.DEVNULL
+    assert captured["stderr"] is subprocess.DEVNULL
+
+
+def test_resolve_dogegen_does_not_leave_output_pipes_unread(monkeypatch):
+    captured = {}
+
+    class _FakeProc:
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    class _FakeConn:
+        def settimeout(self, *_):
+            pass
+
+        def sendall(self, *_):
+            pass
+
+        def close(self):
+            pass
+
+    class _FakeSocket:
+        def setsockopt(self, *_):
+            pass
+
+        def bind(self, *_):
+            pass
+
+        def listen(self, *_):
+            pass
+
+        def settimeout(self, *_):
+            pass
+
+        def accept(self):
+            return _FakeConn(), ("127.0.0.1", 1234)
+
+        def close(self):
+            pass
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeProc()
+
+    monkeypatch.setattr(dgresolve.socket, "socket", lambda *_: _FakeSocket())
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    rdg = ResolveDogegen("dogegen.exe")
+    try:
+        rdg.start()
+        assert captured["stdout"] is subprocess.DEVNULL
+        assert captured["stderr"] is subprocess.DEVNULL
+    finally:
+        rdg.close()

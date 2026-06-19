@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import json
 import queue
+import secrets
 import threading
 import time
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any, Optional
 
 from ..events import Event
@@ -176,6 +178,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     hub: Hub = None  # type: ignore[assignment]
     assets_dir: Path = ASSETS_DIR
+    csrf_token: str = ""
+    allowed_hosts: set[str] = set()
     server_version = "DLCDashboard/1.0"
 
     # Quiet by default — the dashboard's own event log is the place to look, not stderr.
@@ -195,6 +199,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _send_json(self, obj: Any, status: int = 200) -> None:
         self._send_bytes(json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8", status)
 
+    def _reject_json(self, error: str, status: int = 403) -> None:
+        self._send_json({"ok": False, "error": error}, status)
+
+    def _host_allowed(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        return not self.allowed_hosts or host in self.allowed_hosts
+
+    def _origin_allowed(self) -> bool:
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        if not self.allowed_hosts:
+            return True
+        try:
+            host = (urlsplit(origin).netloc or "").lower()
+        except ValueError:
+            return False
+        return host in self.allowed_hosts
+
+    def _authorize_mutation(self) -> bool:
+        if not self._host_allowed():
+            self._reject_json("unexpected host")
+            return False
+        if not self._origin_allowed():
+            self._reject_json("unexpected origin")
+            return False
+        token = self.headers.get("X-DLC-CSRF-Token")
+        if not token or not secrets.compare_digest(token, self.csrf_token):
+            self._reject_json("missing or invalid csrf token")
+            return False
+        return True
+
     def _send_asset(self, name: str) -> None:
         # Only serve known, flat asset names — no traversal.
         safe = Path(name).name
@@ -212,7 +248,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/api/cancel":
+            if not self._authorize_mutation():
+                return
             self._send_json(self._cancel_run())
+        elif path == "/api/export":
+            if not self._authorize_mutation():
+                return
+            self._send_json(self._export_snapshot())
         else:
             self._send_bytes(b"not found", "text/plain; charset=utf-8", 404)
 
@@ -242,7 +284,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/events":
             self._serve_sse()
         elif path == "/api/snapshot":
-            self._send_json({"state": self.hub.snapshot(), "backlog": self.hub.backlog()})
+            self._send_json({"state": self.hub.snapshot(), "backlog": self.hub.backlog(),
+                             "csrf_token": self.csrf_token})
         elif path == "/api/charts":
             self._send_json(self.hub.charts())
         elif path == "/api/digest":
@@ -251,7 +294,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/patch_metrics":
             self._send_json(self._latest_patch_metrics())
         elif path == "/api/export":
-            self._send_json(self._export_snapshot())
+            self._send_json({"ok": False, "error": "use POST"}, 405)
         else:
             self._send_bytes(b"not found", "text/plain; charset=utf-8", 404)
 
@@ -342,7 +385,14 @@ def make_server(hub: Hub, *, host: str = "127.0.0.1", port: int = 8765,
 
     _Bound.hub = hub
     _Bound.assets_dir = assets_dir
+    _Bound.csrf_token = secrets.token_urlsafe(32)
     httpd = ThreadingHTTPServer((host, port), _Bound)
+    actual_host, actual_port = httpd.server_address[:2]
+    host_candidates = {host, actual_host, "127.0.0.1", "localhost", "[::1]"}
+    _Bound.allowed_hosts = {
+        f"{h.lower()}:{actual_port}" for h in host_candidates
+        if h and h not in {"0.0.0.0", "::"}
+    }
     httpd.daemon_threads = True
     return httpd
 
