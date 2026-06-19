@@ -425,9 +425,10 @@ def test_full_flow_writes_deliverable_folder(tmp_path: Path):
     assert (results_dir / "report.json").exists()
     assert (results_dir / "report.html").exists()
     assert (results_dir / "measurements.ti3").exists()
-    # the deliverable cube carries the descriptive scheme (<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n)
+    # the deliverable cube carries the descriptive scheme (<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n);
+    # the synthetic target is Rec.709 primaries at γ2.2 ⇒ the gamut label follows the EOTF → "sRGB"
     assert (results_dir / descriptive_cube_name(
-        date="2026-06-16", display="mini-LED", mode="SDR", colorspace="Rec.709",
+        date="2026-06-16", display="mini-LED", mode="SDR", colorspace="sRGB",
         transfer="g22", luminance_nits=120.0)).exists()
 
     payload = json.loads((results_dir / "report.json").read_text())
@@ -483,12 +484,24 @@ def test_descriptive_cube_name_scheme():
     assert descriptive_cube_name(
         date="2026-06-18", display="PA32UCXR", mode="SDR", colorspace="sRGB",
         transfer="g22", luminance_nits=120.0) == "2026-06-18_DLC_PA32UCXR_SDR_sRGB_g22_120n.cube"
-    # HDR: PQ EOTF token + peak luminance; gamut keeps its dot, luminance rounds
+    # HDR: PQ EOTF token + peak luminance; luminance rounds
     assert descriptive_cube_name(
-        date="2026-06-18", display="C2", mode="HDR", colorspace="Rec.2020",
+        date="2026-06-18", display="C2", mode="HDR", colorspace="Rec2020",
         transfer=_transfer_token(is_hdr=True, gamma=2.2), luminance_nits=1600.4) == \
-        "2026-06-18_DLC_C2_HDR_Rec.2020_PQ_1600n.cube"
+        "2026-06-18_DLC_C2_HDR_Rec2020_PQ_1600n.cube"
     assert _transfer_token(is_hdr=False, gamma=2.4) == "g24"
+
+
+def test_gamut_label_follows_the_eotf_for_the_srgb_rec709_gamut():
+    from dlc.calibrate import _gamut_label
+    # same primaries, label follows the gamma: γ2.2 → sRGB, γ2.4/BT.1886 → Rec709
+    assert _gamut_label("Rec.709", is_hdr=False, gamma=2.2) == "sRGB"
+    assert _gamut_label("sRGB", is_hdr=False, gamma=2.2) == "sRGB"
+    assert _gamut_label("Rec.709", is_hdr=False, gamma=2.4) == "Rec709"
+    assert _gamut_label("sRGB", is_hdr=False, gamma=2.4) == "Rec709"
+    # other gamuts keep their own name, dots dropped
+    assert _gamut_label("Rec.2020", is_hdr=True, gamma=2.2) == "Rec2020"
+    assert _gamut_label("DCI-P3", is_hdr=False, gamma=2.2) == "DCI-P3"
 
 
 def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):

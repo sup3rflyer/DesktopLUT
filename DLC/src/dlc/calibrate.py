@@ -1934,7 +1934,7 @@ class Calibration:
             spec = self._spec()
             cube_out = results_dir / descriptive_cube_name(
                 date=self.run_date.isoformat(), display=self.display.short_name, mode=self.mode,
-                colorspace=spec.colorspace,
+                colorspace=_gamut_label(spec.colorspace, is_hdr=spec.is_hdr, gamma=spec.gamma),
                 transfer=_transfer_token(is_hdr=spec.is_hdr, gamma=spec.gamma),
                 luminance_nits=spec.luminance_nits)
             shutil.copy2(cube_src, cube_out)
@@ -2351,6 +2351,18 @@ def _transfer_token(*, is_hdr: bool, gamma: float) -> str:
     """The EOTF token for a cube name: ``PQ`` for HDR, else ``g<gamma>`` (the dot dropped,
     e.g. γ2.2 → ``g22``). DLC targets pure power γ, so the SDR token names the gamma exactly."""
     return "PQ" if is_hdr else "g" + f"{gamma:.1f}".replace(".", "")
+
+
+def _gamut_label(colorspace: str, *, is_hdr: bool, gamma: float) -> str:
+    """Friendly gamut/standard label for a cube name. sRGB and Rec.709 are the SAME gamut
+    (shared primaries) — the colloquial name follows the EOTF, not the primaries: pure power
+    γ2.2 reads as ``sRGB``, the BT.1886/γ2.4 broadcast convention reads as ``Rec709`` (owner's
+    call). Other gamuts keep their own name with dots dropped (``Rec.2020`` → ``Rec2020``)."""
+    cs = (colorspace or "").strip()
+    norm = cs.lower().replace(".", "").replace("-", "").replace(" ", "")
+    if not is_hdr and norm in ("srgb", "rec709", "bt709"):
+        return "Rec709" if gamma >= 2.3 else "sRGB"
+    return cs.replace(".", "")
 
 
 def descriptive_cube_name(*, date: str, display: str, mode: str, colorspace: str,
