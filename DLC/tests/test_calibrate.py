@@ -434,6 +434,45 @@ def test_full_flow_writes_deliverable_folder(tmp_path: Path):
     assert payload["lut3d"]["converged"] in (True, False)
 
 
+def test_apply_installs_the_durable_results_cube_not_the_run_dir_artifact(tmp_path: Path):
+    # On apply, DesktopLUT must point at the stable results/ copy, never the gitignored
+    # runs/<run>/generated/final_*.cube build artifact (cleaning the run dir would otherwise
+    # break the live calibration and persist a dead path across restarts).
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "durable_cube", controller=ctrl, output_dir=tmp_path / "deliverables")
+    result = calib.run("full")
+    assert result.status == "completed"
+
+    results_dir = Path(result.results_dir)
+    deliverable = results_dir / f"{results_dir.name}.cube"
+    assert deliverable.exists()
+
+    installed = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
+    assert installed == str(deliverable)
+    assert "generated" not in installed  # not the ephemeral run-dir artifact
+
+
+def test_3dlut_only_apply_installs_the_durable_results_cube(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=str(tmp_path / "previous.cube"))
+    calib = _make(tmp_path, "durable_cube_3dlut", controller=ctrl, output_dir=tmp_path / "deliverables")
+    result = calib.run("3dlut-only")
+    assert result.status == "completed"
+
+    results_dir = Path(result.results_dir)
+    deliverable = results_dir / f"{results_dir.name}.cube"
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(deliverable)
+
+
+def test_mhc_only_apply_does_not_touch_the_runtime_cube(tmp_path: Path):
+    # mhc-only builds no 3D LUT, so the durable-cube re-point must be a no-op (no cube installed).
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "durable_cube_mhc", controller=ctrl)
+    result = calib.run("mhc-only")
+    assert result.status == "completed"
+    assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
+
+
 def test_auto_adjudicator_records_plan_and_verify_seams(tmp_path: Path):
     calib = _make(tmp_path, "full")
     calib.run("full")

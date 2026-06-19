@@ -727,6 +727,25 @@ class Calibration:
         except Exception as exc:  # noqa: BLE001
             self.ctx.log(f"commit (exit calibration) failed: {exc}")
 
+    def _install_durable_cube(self, cube_path: Optional[str]) -> None:
+        """Re-point DesktopLUT at the DURABLE deliverable cube (under ``results/``) rather
+        than leaving it aimed at the run-dir build artifact (``runs/<run>/generated/final_*.cube``,
+        which is gitignored/ephemeral — if the run folder is cleaned, the live calibration breaks
+        and DesktopLUT persists that dead path across restarts). The deliverable is a byte-identical
+        copy assembled by ``stage_report``, so the displayed image does not change — only the
+        persisted path becomes stable. Apply path only, and a no-op for flows that built no cube
+        (``mhc-only`` / ``gray-wb`` leave ``deliverable_cube`` None). Best-effort: a failure leaves
+        the working run-dir cube installed, which is no worse than before this re-point existed."""
+        if not cube_path:
+            return
+        try:
+            self.controller.set_3dlut(self.monitor, self.mode, cube_path)
+            self.ctx.log(f"installed the durable 3D LUT (DesktopLUT now points at {cube_path})")
+        except Exception as exc:  # noqa: BLE001 - durability nicety, never a gate on the run
+            self.ctx.log(
+                f"could not re-point at the durable cube ({type(exc).__name__}: {exc}); the run-dir "
+                f"cube stays installed — re-load the results/ cube in DesktopLUT if you clean the run folder")
+
     # ====================================================================
     # Stage helpers
     # ====================================================================
@@ -1932,7 +1951,8 @@ class Calibration:
                             digest={"results_dir": str(results_dir), "report": str(report_json),
                                     "verification": payload["verification"], "lut3d": payload["lut3d"],
                                     "gswb_watchdog": (payload["gswb"] or {}).get("watchdog")},
-                            data={"results_dir": str(results_dir), "report_path": str(report_json)},
+                            data={"results_dir": str(results_dir), "report_path": str(report_json),
+                                  "deliverable_cube": str(cube_out) if cube_out else None},
                             artifacts=[str(report_json), str(report_html)])
 
     # ====================================================================
@@ -2041,6 +2061,11 @@ class Calibration:
             if choice == "revert":
                 status = self._revert_inplace()
             # else: the in-place refinement is already applied; nothing to commit.
+        if status == "completed":
+            # Apply path: re-point DesktopLUT at the DURABLE deliverable cube so a cleaned
+            # run folder can't break the live calibration (the build artifact lives under the
+            # gitignored run dir). No-ops when this flow built no cube (mhc-only / gray-wb).
+            self._install_durable_cube(rep.data.get("deliverable_cube"))
         self.runlog.run_done(status, results_dir=rep.data.get("results_dir"),
                              report_path=rep.data.get("report_path"))
         return CalibrationResult(
