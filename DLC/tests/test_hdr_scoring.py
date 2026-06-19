@@ -36,14 +36,30 @@ def test_score_hdr_perfect_panel_is_near_zero():
     assert float(np.max(res["de_itp"])) < 1e-6
 
 
-def test_score_hdr_undershoot_is_positive():
+def test_score_hdr_undershoot_is_a_plausible_magnitude():
     np, score_hdr, Target, TargetSpace = _engine()
     space = TargetSpace(Target.hdr_rec2020_pq(white_xy=D65))
     signals = np.array([[0.5, 0.5, 0.5], [0.6, 0.6, 0.6]])
     ideal = space.ideal_xyz(signals)
     measured = ideal * 0.94                     # a 6% luminance undershoot
-    res = score_hdr(signals, measured, white_xy=D65)
-    assert float(np.min(res["de_itp"])) > 0.0
+    de = score_hdr(signals, measured, white_xy=D65)["de_itp"]
+    # A 6% luminance miss is clearly visible (>1 JND) but not absurd — brackets the
+    # magnitude so a sign flip (→0) or a scale bug (→huge) fails, unlike a bare `>0`.
+    assert all(1.0 < float(d) < 20.0 for d in de), list(map(float, de))
+
+
+def test_score_hdr_sanitizes_non_finite_reads():
+    # A dropped/saturated hardware read (NaN/inf XYZ) must score a finite, large error that
+    # surfaces in the summary — not a NaN that silently poisons avg/p95 and hides in max().
+    np, score_hdr, Target, TargetSpace = _engine()
+    space = TargetSpace(Target.hdr_rec2020_pq(white_xy=D65))
+    signals = np.array([[0.5, 0.5, 0.5], [0.6, 0.6, 0.6]])
+    measured = space.ideal_xyz(signals).copy()
+    measured[1] = [float("nan"), float("inf"), float("nan")]   # one garbage read
+    de = score_hdr(signals, measured, white_xy=D65)["de_itp"]
+    assert np.all(np.isfinite(de))              # no NaN propagation
+    assert float(de[0]) < 1e-6                  # the good patch still scores ~0
+    assert float(de[1]) > 1.0                   # the garbage patch scores a large finite error
 
 
 # ---------------------------------------------------------------------------

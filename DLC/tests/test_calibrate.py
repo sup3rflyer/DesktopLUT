@@ -123,18 +123,19 @@ def _perfect_hdr_panel() -> SyntheticPanel:
 
 def test_hdr_full_flow_completes_clean(tmp_path: Path):
     # The first HDR run, proven in simulation: the full DIP→ICC→3D-LUT pipeline runs
-    # end-to-end against a perfect PQ/Rec.2020 panel and the mock, scoring dE_ITP.
-    calib = _make(tmp_path, "hdr_full", mode="HDR", panel=_perfect_hdr_panel(),
-                  skip_gswb=True, bit_depth=10)
+    # end-to-end against a perfect PQ/Rec.2020 panel and the mock, scoring dE_ITP. No
+    # skip_gswb flag — HDR auto-skips GS+WB (the cube owns the PQ neutral axis).
+    calib = _make(tmp_path, "hdr_full", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
     result = calib.run("full")
 
     assert result.status == "completed", result.digest
     assert result.target == "rec2020_pq"
-    # ICC → 3D LUT, no GS+WB (skip_gswb): the HDR pipeline the owner asked for.
+    # ICC → 3D LUT, and GS+WB auto-skipped for HDR even without --skip-gswb.
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
         "build-install-mhc", "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify",
     ]
+    assert "gswb-tweak" not in result.stages and "measure:gray-wb" not in result.stages
     # The chosen HDR target: peak 1600 (profile pin), fixed D65, scored in dE_ITP.
     hdr_target = calib.calib["hdr_target"]
     assert hdr_target["peak_nits"] == 1600.0

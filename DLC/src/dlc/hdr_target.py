@@ -153,42 +153,59 @@ def choose_peak_nits(*, native_white_nits: Optional[float] = None,
 
     Returns ``(peak_nits, provenance)``.
     """
-    ceiling = sustained_peak_nits or native_white_nits
+    # Normalize away non-positive / None inputs uniformly: a 0 or negative peak is invalid
+    # (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML), so it is *ignored* (falls
+    # through to the default), never used as a real ceiling or pin.
+    pinned = float(pinned_peak_nits) if (pinned_peak_nits and pinned_peak_nits > 0) else None
+    sustained = float(sustained_peak_nits) if (sustained_peak_nits and sustained_peak_nits > 0) else None
+    native = float(native_white_nits) if (native_white_nits and native_white_nits > 0) else None
+    floor = min(ladder)
+    ceiling = sustained if sustained is not None else native
 
     def clamp_to_ceiling(value: float) -> float:
         return min(value, ceiling) if ceiling else value
 
-    def highest_rung_at_or_below(limit: float) -> float:
+    def rung_or_ceiling(limit: float) -> float:
+        """Highest ladder rung at or below ``limit``; if ``limit`` is below the lowest
+        rung, the **raw limit** itself — a sub-ladder panel cannot hit a round rung, so it
+        targets its measured ceiling. NEVER a rung *above* the ceiling (that would request
+        patches the panel clips and the verify would score as huge dE_ITP)."""
         rungs = [r for r in ladder if r <= limit + 1e-6]
-        return rungs[-1] if rungs else min(ladder)
+        return rungs[-1] if rungs else float(limit)
 
-    if pinned_peak_nits:
-        peak = clamp_to_ceiling(float(pinned_peak_nits))
-        prov = {"source": "pinned",
-                "note": f"target peak pinned at {pinned_peak_nits:g} nits"
-                        + (f", clamped to the measured ceiling {ceiling:g}" if ceiling and peak < pinned_peak_nits else "")}
-        return peak, prov
+    if pinned is not None:
+        peak = clamp_to_ceiling(pinned)
+        clamped = ceiling is not None and peak < pinned
+        return peak, {"source": "pinned",
+                      "note": f"target peak pinned at {pinned:g} nits"
+                              + (f", clamped to the measured ceiling {ceiling:g}" if clamped else "")}
 
-    if sustained_peak_nits:
-        peak = highest_rung_at_or_below(float(sustained_peak_nits))
-        return peak, {"source": "sustained",
-                      "note": f"highest ladder rung ≤ the sustained-load peak "
-                              f"{sustained_peak_nits:g} nits"}
+    if sustained is not None:
+        peak = rung_or_ceiling(sustained)
+        below = peak < floor - 1e-6
+        note = (f"highest ladder rung ≤ the sustained-load peak {sustained:g} nits" if not below
+                else f"sustained-load peak {sustained:g} nits is below the {floor:g}-nit ladder "
+                     f"floor → target the measured ceiling {peak:g} (no round rung is reachable)")
+        return peak, {"source": "sustained", "below_ladder": below, "note": note}
 
-    # No sustained capture yet → conservative default. A peak is always a round ladder
-    # rung, so if the default exceeds the brief ceiling we step DOWN the ladder rather
-    # than using the raw ceiling.
-    would_allow = highest_rung_at_or_below(native_white_nits) if native_white_nits else None
-    if ceiling and default > ceiling:
-        peak = highest_rung_at_or_below(ceiling)
-        note = (f"default {default:g} exceeds the brief full-field ceiling "
-                f"{ceiling:g} nits → highest ladder rung {peak:g}")
+    # No sustained capture yet → conservative default, never ABOVE the brief ceiling. A
+    # peak is a round ladder rung when one fits under the ceiling; a sub-ladder panel
+    # targets its raw measured ceiling instead (never a rung it cannot reach).
+    would_allow = rung_or_ceiling(native) if native is not None else None
+    if ceiling is not None and default > ceiling:
+        peak = rung_or_ceiling(ceiling)
+        if peak < floor - 1e-6:
+            note = (f"default {default:g} exceeds the brief full-field ceiling {ceiling:g} nits, "
+                    f"which is below the {floor:g}-nit ladder floor → target the measured ceiling {peak:g}")
+        else:
+            note = (f"default {default:g} exceeds the brief full-field ceiling {ceiling:g} nits → "
+                    f"highest ladder rung {peak:g}")
     else:
         peak = default
         note = (f"conservative default {default:g} nits (no sustained-load DIP capture "
                 "yet; owner chose 'decide from the warm DIP')")
-        if native_white_nits:
-            note += (f"; the brief full-field peak {native_white_nits:g} would allow up "
+        if native is not None:
+            note += (f"; the brief full-field peak {native:g} would allow up "
                      f"to {would_allow:g} — needs a warm capture to confirm it holds")
     return peak, {"source": "default", "would_allow": would_allow, "note": note}
 

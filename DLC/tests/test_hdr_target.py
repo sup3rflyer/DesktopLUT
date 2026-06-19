@@ -75,6 +75,23 @@ def test_peak_pinned_is_honored_then_ceiling_clamped():
     assert peak == 1840.0 and "clamped" in prov["note"]
 
 
+def test_peak_never_exceeds_a_sub_ladder_ceiling():
+    # A panel below the 1000-nit ladder floor must NOT be handed an unreachable 1000-nit
+    # target (the old min(ladder) fallback) — it targets its own measured ceiling.
+    peak, prov = ht.choose_peak_nits(native_white_nits=800.0)
+    assert peak == 800.0 and peak <= 800.0
+    peak2, prov2 = ht.choose_peak_nits(sustained_peak_nits=900.0)
+    assert peak2 == 900.0 and prov2["below_ladder"] is True
+    # End to end: the resolved target peak is reachable, not above the panel.
+    assert ht.resolve_hdr_target(white_xy=D65, native_white_nits=800.0).peak_nits == 800.0
+
+
+def test_peak_ignores_non_positive_pin_and_ceiling():
+    # A 0/negative peak (e.g. an unfilled YAML field) is ignored, not treated as a ceiling.
+    assert ht.choose_peak_nits(pinned_peak_nits=0.0, native_white_nits=1840.0)[0] == 1600.0
+    assert ht.choose_peak_nits(native_white_nits=-5.0)[0] == 1600.0
+
+
 # ---------------------------------------------------------------------------
 # resolve_hdr_target — the assembled target + the knee
 # ---------------------------------------------------------------------------

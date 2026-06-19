@@ -840,12 +840,17 @@ class Calibration:
         if cached:
             from .hdr_target import HdrTarget
 
-            return HdrTarget(
-                peak_nits=cached["peak_nits"], white_xy=tuple(cached["white_xy"]),
-                undershoot_gain=cached["undershoot_gain"],
-                knee_start_nits=cached["knee_start_nits"],
-                container_nits=cached.get("container_nits", 10000.0),
-                provenance=cached.get("provenance", {}))
+            try:
+                return HdrTarget(
+                    peak_nits=cached["peak_nits"], white_xy=tuple(cached["white_xy"]),
+                    undershoot_gain=cached["undershoot_gain"],
+                    knee_start_nits=cached["knee_start_nits"],
+                    container_nits=cached.get("container_nits", 10000.0),
+                    provenance=cached.get("provenance", {}))
+            except (KeyError, TypeError, ValueError):
+                # A truncated / hand-edited dlc_state.json must not crash the run with an
+                # opaque KeyError — re-derive from the DIP + resolved white and overwrite.
+                pass
         tgt = self.profile.resolve_hdr_target(self.target_name, dip=self._dip(),
                                               white_xy=self._white_xy())
         self.calib["hdr_target"] = tgt.as_dict()
@@ -1702,9 +1707,14 @@ class Calibration:
                 nits = reading.nits or 0.0
                 attempts += 1
             target = self._spec().luminance_nits
-            in_range = abs(nits - target) <= max(3.0, 0.05 * target)
+            # HDR peak luminance is fixed by the panel (PQ is absolute-luminance-encoded; the
+            # OSD backlight cannot retarget a single point), so there is nothing for the human
+            # to adjust — the brightness seam does not apply. The panel-limits tell already
+            # surfaces a peak below the target. SDR: the human drives the OSD to the target.
+            in_range = True if self._spec().is_hdr else abs(nits - target) <= max(3.0, 0.05 * target)
             digest = {"white_nits": round(nits, 2), "target_nits": target,
-                      "in_range": in_range, "read_attempts": attempts}
+                      "in_range": in_range, "read_attempts": attempts,
+                      "hdr_fixed_peak": self._spec().is_hdr}
             return StageOutcome("brightness", "done", digest=digest,
                                 data={"white_nits": nits, "in_range": in_range})
 
@@ -1772,12 +1782,21 @@ class Calibration:
                 return
             spec = self._spec()
             wx, wy = self._white_xy()
-            metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
+            # HDR scores dE_ITP vs PQ/Rec.2020; SDR CIEDE2000 vs γ-power. Scoring HDR PQ data
+            # as an SDR power target (the old unconditional path) produced garbage dE2000 (~30+
+            # at mid-gray) on the dashboard's convergence trend — branch like stage_verify.
+            if spec.is_hdr:
+                metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy),
+                                                 peak_nits=self._hdr_target().peak_nits)
+                metric_name = "dE_ITP"
+            else:
+                metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
+                metric_name = "CIEDE2000"
             summary = summarize_metrics(phase=label, iteration=0, source=p,
-                                        patch_metrics=metrics, target_luminance=lum)
+                                        patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             colour_de = [m.de2000 for m in metrics if not m.grayscale]
             self.runlog.metrics_scored(
-                f"measure:{role}", label=label, iteration=0,
+                f"measure:{role}", label=label, iteration=0, metric=metric_name,
                 avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
                 p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
                 max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
@@ -1944,6 +1963,16 @@ class Calibration:
         tweak-drift **watchdog** (§3) on the magnitude + cross-run trend."""
         def run() -> StageOutcome:
             spec = self._spec()
+            if spec.is_hdr:
+                # Defensive: GS+WB on PQ is deferred (the cube owns the HDR neutral axis; the
+                # SDR-γ proposal would corrupt the MHC). No-op regardless of how we got here
+                # (a gray-wb flow on HDR also lands here, not just full).
+                return StageOutcome(
+                    "gswb-tweak", "done",
+                    digest={"skipped": True, "reason": "GS+WB deferred for HDR — the 3D LUT owns "
+                            "the PQ neutral axis; no MHC correction-grayscale written.",
+                            "tweak_magnitude": 0.0},
+                    data={"magnitude": 0.0, "watchdog": {}})
             samples = parse_ti3(Path(neutral_ti3))
             gray = [GrayPatch(level=s.rgb[0], xyz=s.xyz) for s in samples
                     if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
@@ -2030,7 +2059,7 @@ class Calibration:
             # percentiles plus the grayscale-vs-colour split.
             colour_de = [m.de2000 for m in metrics if not m.grayscale]
             self.runlog.metrics_scored(
-                "verify", label="verification", iteration=0,
+                "verify", label="verification", iteration=0, metric=metric_name,
                 avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
                 p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
                 max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
@@ -2363,7 +2392,9 @@ class Calibration:
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
-        if not self.skip_gswb:
+        # GS+WB is the small SDR neutral-axis tweak; on PQ the cube owns the HDR neutral axis
+        # and the SDR-γ proposal would bake a wrong curve (§7/§8), so HDR skips it like --skip-gswb.
+        if not self.skip_gswb and not self._spec().is_hdr:
             gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
                                     ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
             self.stage_gswb_tweak(gw.data["ti3"])
@@ -2829,6 +2860,11 @@ def _render_report_html(p: dict[str, Any]) -> str:
     wd = gswb.get("watchdog") or {}
     analysis = p.get("display_analysis")
 
+    # HDR scores dE_ITP, SDR CIEDE2000 — label the deliverable report with the run's actual
+    # metric (the verify digest carries it) so dE_ITP numbers are never shown as "dE2000".
+    metric = v.get("metric", "CIEDE2000")
+    de = "dE_ITP" if metric == "dE_ITP" else "dE2000"
+
     def metric_row(label: str, key: str) -> str:
         return f"<tr><td>{label}</td><td>{v.get(key, '—')}</td></tr>"
 
@@ -2850,12 +2886,12 @@ def _render_report_html(p: dict[str, Any]) -> str:
         f"<p>Target <code>{p.get('target')}</code> · {p.get('date')} · "
         f"3D LUT {'converged' if lut.get('converged') else 'best-effort'} "
         f"(max dE {lut.get('best_max_de', '—')})</p>"
-        "<h2>Verification (CIEDE2000)</h2><table><tr><th>Metric</th><th>After</th></tr>"
-        + metric_row("Average dE2000", "avg_de2000")
-        + metric_row("P95 dE2000", "p95_de2000")
-        + metric_row("Max dE2000", "max_de2000")
-        + metric_row("White dE2000", "white_de2000")
-        + metric_row("Grayscale avg dE2000", "grayscale_avg_de2000")
+        f"<h2>Verification ({metric})</h2><table><tr><th>Metric</th><th>After</th></tr>"
+        + metric_row(f"Average {de}", "avg_de2000")
+        + metric_row(f"P95 {de}", "p95_de2000")
+        + metric_row(f"Max {de}", "max_de2000")
+        + metric_row(f"White {de}", "white_de2000")
+        + metric_row(f"Grayscale avg {de}", "grayscale_avg_de2000")
         + "</table>"
         + watchdog_block
         + analysis_block

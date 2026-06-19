@@ -170,7 +170,14 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     target = Target.hdr_rec2020_pq(white_xy=white_xy)
     space = TargetSpace(target)
     sig = np.asarray(signal_rgb, dtype=float).reshape(-1, 3)
-    meas = np.maximum(np.asarray(measured_xyz, dtype=float).reshape(-1, 3), 0.0)
+    # Sanitize the measured XYZ BEFORE ICtCp: a dropped/saturated hardware read can be NaN or
+    # ±inf, which propagates through colour.XYZ_to_ICtCp to a NaN dE_ITP — and a single NaN
+    # silently corrupts the whole summary (avg/p95 → NaN, while max() can hide the bad patch).
+    # Map every non-finite component to black (0) so the patch scores a large *finite* error
+    # that surfaces in the summary instead of poisoning it; then clamp negatives (meter noise).
+    meas = np.nan_to_num(np.asarray(measured_xyz, dtype=float).reshape(-1, 3),
+                         nan=0.0, posinf=0.0, neginf=0.0)
+    meas = np.maximum(meas, 0.0)
     ideal_xyz = space.ideal_xyz(sig)
     delta = space.xyz_to_ictcp(meas) - space.xyz_to_ictcp(ideal_xyz)
     return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz}

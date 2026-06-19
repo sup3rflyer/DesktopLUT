@@ -36,8 +36,10 @@ def test_pq_panel_perfect_reads_match_the_engine_ideal():
     reads = [panel(_patch(s)).xyz for s in signals]
 
     res = score_hdr(signals, reads, white_xy=D65)
-    # Panel (hand-rolled ST.2084 + canonical Rec.2020 NPM) vs engine (colour) — sub-JND.
-    assert float(np.max(res["de_itp"])) < 1.0
+    # Panel (hand-rolled ST.2084 + canonical Rec.2020 NPM) vs engine (colour). Two correct
+    # implementations agree to ~1e-5; the tight bound catches a real EOTF/matrix divergence
+    # (a loose <1.0 JND bound would pass even a factor-of-2 error).
+    assert float(np.max(res["de_itp"])) < 0.01
 
 
 def test_pq_panel_undershoot_dims_luminance_by_one_plus_u():
