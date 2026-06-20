@@ -29,6 +29,7 @@ from dlc import calibration_profile as cp
 from dlc.calibrate import (
     SEAM_CHECKIN,
     SEAM_FOUNDATION,
+    SEAM_MEASURE,
     AdjudicationRequest,
     AdjudicationRequired,
     AutoAdjudicator,
@@ -54,7 +55,7 @@ from dlc.controller import CalibrationController
 from dlc.dip import DisplayInstrumentProfile
 from dlc.engine.patches import Transfer
 from dlc.events import Ev, digest_projection, read_events
-from dlc.measure_loop import SyntheticPanel
+from dlc.measure_loop import Reading, SyntheticPanel
 from dlc.optimize import OptimizeConfig, synthetic_probe
 from dlc.runs import RunContext, create_run, open_run
 
@@ -1929,3 +1930,63 @@ def test_default_interval_does_not_fire_timed_checkins_in_a_fast_run(tmp_path: P
              if e.event == "check_in" and "overview" in e.data]
     assert timed == []
     assert not any(k.startswith("checkin:") for k in calib.calib["decisions"])
+
+
+# ---------------------------------------------------------------------------
+# Dark-panel guard at the orchestrator: a panel emitting ~no light (asleep/off)
+# must STOP the run loudly — never silently "settle" on black and meter for minutes
+# (the 8-minute silent spin this guards against).
+# ---------------------------------------------------------------------------
+
+def _dark_panel(patch):
+    return Reading(xyz=(0.0, 0.0, 0.0), ok=True)
+
+
+_DARK_RAMP = [(512, 512, 512), (100, 100, 100), (900, 900, 900)]
+
+
+def test_dark_panel_aborts_the_raw_measure_in_auto(tmp_path: Path):
+    # --auto follows the conservative recommendation: a dark panel → retry → clean abort,
+    # never "accept" black data.
+    calib = _make(tmp_path, "darkauto", panel=_dark_panel)
+    calib.target_name = "srgb_g22"; calib.calib["target"] = "srgb_g22"
+    with pytest.raises(CalibrationAborted):
+        calib.stage_measure(role="raw", patches=_DARK_RAMP, ti3_name="r.ti3", ndjson_name="r.ndjson")
+
+
+def test_dark_panel_escalates_to_a_judge_under_supervised(tmp_path: Path):
+    # The same dark panel pulls in a live judge instead of being rubber-stamped, and emits a
+    # loud anomaly on the spine.
+    calib = _make(tmp_path, "darksup", panel=_dark_panel, adjudicator=SupervisedAdjudicator())
+    calib.target_name = "srgb_g22"; calib.calib["target"] = "srgb_g22"
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=_DARK_RAMP, ti3_name="r.ti3", ndjson_name="r.ndjson")
+    req = exc.value.request
+    assert req.seam == SEAM_MEASURE
+    assert req.recommendation == "retry"          # non-benign → supervised escalates
+    assert req.digest.get("panel_dark") is True
+    anomalies = [e for e in read_events(calib.ctx.events_path)
+                 if e.event == Ev.ANOMALY and (e.data or {}).get("panel_dark")]
+    assert anomalies, "a dark panel must raise a loud anomaly on the spine"
+
+
+def test_full_flow_aborts_loudly_on_a_dark_panel_at_brightness(tmp_path: Path, monkeypatch):
+    # End-to-end: a dark panel is caught at the very first white read (brightness), even though
+    # this is the EARLIEST measurement — the run aborts in seconds, not after an 8-minute spin.
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda *a, **k: None)   # skip the brightness re-read waits
+    calib = _make(tmp_path, "darkflow", panel=_dark_panel)
+    result = calib.run("full")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "brightness"
+
+
+def test_hdr_brightness_flags_a_dark_panel_despite_fixed_peak(tmp_path: Path, monkeypatch):
+    # The cousin gap: HDR forces in_range=True (no OSD), so a 0-nit white used to slip through.
+    # Now a near-zero white is caught as dark even in HDR.
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda *a, **k: None)
+    calib = _make(tmp_path, "darkhdr", mode="HDR", panel=_dark_panel, bit_depth=10)
+    calib.target_name = "rec2020_pq"; calib.calib["target"] = "rec2020_pq"
+    with pytest.raises(CalibrationAborted):
+        calib.stage_brightness()

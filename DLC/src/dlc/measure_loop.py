@@ -138,6 +138,13 @@ class MeasureLoopConfig:
     settle_threshold: float = 0.003     # channel-balance Δ between consecutive reads
     settle_required: int = 3            # consecutive in-tolerance reads ⇒ "warm"
     max_warmup_reads: int = 24          # not settled within this ⇒ escalate to the LLM (a FLAG, not a silent cap)
+    # Dark-panel floor: the warm-up patch is a MID-grey (warmup_signal 0.5), so on any live panel
+    # it reads tens-to-hundreds of cd/m². A reference reading below this floor means the panel is
+    # emitting ~no light (asleep / off / wrong input) — settle agreement on black (0≈0) is NOT
+    # "warm". Catch it loudly in a couple of reads instead of "settling" on darkness and then
+    # hanging the meter per patch. (cd/m²; 0 disables the guard.)
+    dark_floor_nits: float = 1.0
+    dark_required: int = 2              # consecutive sub-floor reference reads ⇒ declare the panel dark
 
     # Thermal preheat (soak-into-calibration) -------------------------------
     preheat: str = "auto"               # "auto" (soak any CHARACTERIZED panel — convergent included),
@@ -408,6 +415,8 @@ class _Loop:
         self.remeasure_budget_exceeded = False
         self.warm = False
         self.warmup_reads = 0
+        self.panel_dark = False                       # warm-up reference read ~no light (asleep/off)
+        self.dark_reference_nits: Optional[float] = None
         self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
 
     # -- low-level read ----------------------------------------------------
@@ -613,6 +622,7 @@ class _Loop:
         cfg = self.cfg
         prev: Optional[tuple[float, float, float]] = None
         consecutive = 0
+        dark_reads = 0
         settled = False
         last_good: Optional[tuple[float, float, float]] = None
         reads = 0
@@ -632,6 +642,25 @@ class _Loop:
                 prev = None
                 consecutive = 0
                 continue
+
+            # Dark-panel guard: a MID-grey reference reading ~no light means the panel is asleep /
+            # off / on the wrong input. Settle "agreement" on black (0≈0) is meaningless, so don't
+            # adopt it as the reference and don't let it count toward warm. After a couple of
+            # sub-floor reads, declare the panel dark, flag it loudly, and stop — the caller
+            # escalates instead of falsely settling and then metering a dark panel for minutes.
+            if cfg.dark_floor_nits > 0 and reading.xyz[1] < cfg.dark_floor_nits:
+                dark_reads += 1
+                self.dark_reference_nits = float(reading.xyz[1])
+                if dark_reads >= cfg.dark_required:
+                    self.panel_dark = True
+                    self._emit_event("WARN", "panel_dark",
+                                     reference_nits=round(float(reading.xyz[1]), 4),
+                                     floor_nits=cfg.dark_floor_nits, reads=reads)
+                    break
+                prev = None
+                consecutive = 0
+                continue
+            dark_reads = 0
 
             last_good = reading.xyz
             # Auto-detect the cold channel from the first usable read, then
@@ -1242,8 +1271,14 @@ def run_measure_loop(
 
     preheat_digest = loop.preheat()
     loop.warm_up()
-    loop.main_pass()
-    unresolved = loop.drain_appended()
+    if loop.panel_dark:
+        # The panel is emitting ~no light (asleep/off/wrong input). Skip the main pass entirely —
+        # metering it just yields black data or hangs the meter per patch (the 8-minute silent
+        # spin this guard exists to prevent). Surface it for adjudication instead.
+        unresolved: list[str] = []
+    else:
+        loop.main_pass()
+        unresolved = loop.drain_appended()
 
     accepted = loop.ordered_accepted()
     written_ti3: Optional[str] = None
@@ -1261,7 +1296,8 @@ def run_measure_loop(
     drift_summary = loop._recent_drift_summary()
 
     needs_adjudication = (
-        (not loop.warm)
+        loop.panel_dark
+        or (not loop.warm)
         or bool(unresolved_all)
         or loop.remeasure_budget_exceeded
         or loop.drift_density_exceeded
@@ -1269,7 +1305,14 @@ def run_measure_loop(
     question = None
     if needs_adjudication:
         bits = []
-        if not loop.warm:
+        if loop.panel_dark:
+            ref = loop.dark_reference_nits if loop.dark_reference_nits is not None else 0.0
+            bits.append(
+                f"panel appears DARK/asleep — the mid-grey reference read {ref:.2f} cd/m² "
+                f"(floor {cfg.dark_floor_nits}); no patches were measured (wake the panel / "
+                "check the input + that the patch window is showing, then retry)"
+            )
+        if not loop.warm and not loop.panel_dark:
             bits.append(
                 f"panel did not settle within {cfg.max_warmup_reads} warm-up reads "
                 f"(cold channel {loop.cold_channel})"
@@ -1301,6 +1344,9 @@ def run_measure_loop(
 
     digest = {
         "warm": loop.warm,
+        "panel_dark": loop.panel_dark,
+        "dark_reference_nits": (round(loop.dark_reference_nits, 4)
+                                if loop.dark_reference_nits is not None else None),
         "warmup_reads": loop.warmup_reads,
         "cold_channel": loop.cold_channel,
         "reference_xyz": [round(c, 4) for c in loop.reference_xyz] if loop.reference_xyz else None,

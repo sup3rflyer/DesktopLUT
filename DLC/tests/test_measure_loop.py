@@ -648,3 +648,44 @@ def test_write_ti3_excludes_unusable_holes(tmp_path: Path):
     assert "NUMBER_OF_SETS 1" in text     # only the good row survived
     assert "52.000000" in text            # the good read's XYZ_Y is present
     assert "0.000000 0.000000 0.000000" not in text   # the black hole is not a data row
+
+
+# ---------------------------------------------------------------------------
+# Dark-panel guard: a mid-grey reference reading ~no light (asleep/off) must NOT
+# "settle" on black and then meter for minutes — it is caught in a couple of reads.
+# ---------------------------------------------------------------------------
+
+def _dark(patch):
+    return Reading(xyz=(0.0, 0.0, 0.0), ok=True)   # panel asleep/off — emits ~no light
+
+
+def test_dark_panel_is_detected_and_skips_the_main_pass(tmp_path: Path):
+    t = _sdr()
+    res = run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=_dark,
+                           config=MeasureLoopConfig(), ndjson_path=tmp_path / "m.ndjson")
+    assert res.digest["panel_dark"] is True
+    assert res.digest["dark_reference_nits"] == 0.0
+    assert res.warm is False
+    assert res.patch_count == 0                     # main pass skipped — no black data measured
+    assert res.needs_adjudication is True
+    assert "DARK" in (res.question or "")
+    # caught fast: a couple of warm-up reads, not the full max_warmup_reads or a metered ramp
+    assert res.digest["warmup_reads"] <= MeasureLoopConfig().dark_required + 1
+
+
+def test_a_dim_but_lit_panel_is_not_flagged_dark(tmp_path: Path):
+    # No false positives: a real (if dim) mid-grey reads far above the 1 cd/m² floor.
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, warm_tau=0.06)
+    res = run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=panel,
+                           config=MeasureLoopConfig(), ndjson_path=tmp_path / "m.ndjson")
+    assert res.digest["panel_dark"] is False
+    assert res.patch_count == 8
+
+
+def test_dark_guard_disabled_at_floor_zero_measures_the_ramp(tmp_path: Path):
+    # floor 0 turns the guard off (escape hatch) — the loop runs as before.
+    t = _sdr()
+    res = run_measure_loop(patches=_grey_ramp(t, 6), transfer=t, measure=_dark,
+                           config=MeasureLoopConfig(dark_floor_nits=0.0), ndjson_path=tmp_path / "m.ndjson")
+    assert res.digest["panel_dark"] is False

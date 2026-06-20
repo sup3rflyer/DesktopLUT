@@ -1904,26 +1904,43 @@ class Calibration:
             # to adjust — the brightness seam does not apply. The panel-limits tell already
             # surfaces a peak below the target. SDR: the human drives the OSD to the target.
             in_range = True if self._spec().is_hdr else abs(nits - target) <= max(3.0, 0.05 * target)
+            # A near-zero white means the panel is dark/asleep (off / wrong input / patch window
+            # not showing) — caught even for HDR, where in_range is otherwise forced true (the OSD
+            # can't retarget a PQ peak) and a 0-nit white would slip straight through to measuring.
+            panel_dark = nits is not None and nits < 1.0
             # A gross luminance miss (>25% off target) flags compromised so a supervised run
             # escalates — there is no OSD operator unattended, so a wildly-wrong backlight is a
             # judge's abort/accept call, not an auto-accept. A modest miss (the panel just can't
             # land exactly) stays benign and auto-accepts.
             gross_miss = bool(not in_range and target and abs(nits - target) > 0.25 * target)
             digest = {"white_nits": round(nits, 2), "target_nits": target,
-                      "in_range": in_range, "read_attempts": attempts,
-                      "hdr_fixed_peak": self._spec().is_hdr, "compromised": gross_miss}
+                      "in_range": in_range, "read_attempts": attempts, "panel_dark": panel_dark,
+                      "hdr_fixed_peak": self._spec().is_hdr, "compromised": gross_miss or panel_dark}
             return StageOutcome("brightness", "done", digest=digest,
-                                data={"white_nits": nits, "in_range": in_range})
+                                data={"white_nits": nits, "in_range": in_range, "panel_dark": panel_dark})
 
         outcome = self._stage("brightness", run)
-        if not outcome.data.get("in_range"):
+        panel_dark = bool(outcome.data.get("panel_dark"))
+        if panel_dark:
+            self.runlog.anomaly(
+                "brightness", panel_dark=True, white_nits=outcome.digest.get("white_nits"),
+                message=(f"white reads {outcome.digest.get('white_nits')} nits — panel appears "
+                         "dark/asleep (off / wrong input / patch window not showing)"))
+        if panel_dark or not outcome.data.get("in_range"):
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="brightness:adjust", seam=SEAM_BRIGHTNESS, stage="brightness",
-                question=(f"white reads {outcome.digest['white_nits']} nits vs target "
-                          f"{outcome.digest['target_nits']:g} — have the human set the OSD backlight, "
-                          "or accept this level?"),
-                options=("accept", "abort"), recommendation="accept", digest=outcome.digest)),
-                stage="brightness", message="aborted on out-of-range white luminance")
+                question=((f"white reads {outcome.digest['white_nits']} nits — the panel appears "
+                           "dark/asleep, nothing to calibrate. Wake it / check the input + that the "
+                           "patch window is showing, then retry — or abort?")
+                          if panel_dark else
+                          (f"white reads {outcome.digest['white_nits']} nits vs target "
+                           f"{outcome.digest['target_nits']:g} — have the human set the OSD backlight, "
+                           "or accept this level?")),
+                options=("accept", "abort"),
+                recommendation=("abort" if panel_dark else "accept"), digest=outcome.digest)),
+                stage="brightness",
+                message=("aborted — panel dark at brightness" if panel_dark
+                         else "aborted on out-of-range white luminance"))
         return outcome
 
     def stage_measure(self, *, role: str, patches: Sequence[tuple[int, int, int]],
@@ -1968,14 +1985,26 @@ class Calibration:
             self._score_stage(role, outcome.data.get("ti3"),
                               label="raw (native)" if role == "raw" else "after ICC")
         if outcome.data.get("needs_adjudication"):
+            panel_dark = bool(outcome.digest.get("panel_dark"))
+            if panel_dark:
+                # Loud, immediate anomaly on the spine (dashboard ATTENTION + LLM digest) — a dark
+                # panel must never be a silent "accept", in any mode.
+                self.runlog.anomaly(
+                    key, panel_dark=True, reference_nits=outcome.digest.get("dark_reference_nits"),
+                    message=("panel appears dark/asleep — mid-grey reference read "
+                             f"{outcome.digest.get('dark_reference_nits')} cd/m²; no patches measured"))
+            # A dark panel or a blown remeasure/drift budget is non-benign: recommend retry (not
+            # accept), offer it, and flag compromised so SupervisedAdjudicator escalates rather
+            # than rubber-stamping black/garbage data.
             retry_recommended = bool(outcome.digest.get("remeasure_budget_exceeded")
-                                     or outcome.digest.get("drift_density_exceeded"))
+                                     or outcome.digest.get("drift_density_exceeded")
+                                     or panel_dark)
             decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:escalation", seam=SEAM_MEASURE, stage=key,
                 question=outcome.data.get("question") or "measurement did not fully settle - accept or retry?",
                 options=(("accept", "retry", "abort") if retry_recommended else ("accept", "abort")),
                 recommendation=("retry" if retry_recommended else "accept"),
-                digest=outcome.digest))
+                digest={**outcome.digest, "compromised": panel_dark}))
             if decision.choice == "retry":
                 raise CalibrationAborted(StageOutcome(
                     key, "aborted",
