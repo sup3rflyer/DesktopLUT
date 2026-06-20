@@ -16,13 +16,31 @@ adjudicator a structured :class:`AdjudicationRequest` (a digest + a question + t
 allowed choices + the *core's recommendation*) and gets back a :class:`Decision`.
 
 * :class:`AutoAdjudicator` rubber-stamps the recommendation → the whole flow runs
-  to completion in one process (tests, ``--simulate``, autonomous/CI runs).
+  to completion in one process (tests, ``--simulate``, CI). Use it where there is
+  genuinely no LLM/human to consult and a deterministic, reproducible run is the
+  point — NOT for an unattended *hardware* run, where a safety-critical seam should
+  reach a judge (see below).
 * :class:`MappingAdjudicator` answers from a decisions map and **raises**
   :class:`AdjudicationRequired` on the first un-decided seam → the live LLM-driven
   pause/resume model: the CLI catches it, emits the digest+question, the LLM
   decides, and re-running with that decision recorded fast-forwards (every completed
   stage is **memoised** in the run-record, so measurements are never repeated) to
   the seam and proceeds. The memoisation also gives free crash-recovery.
+* :class:`SupervisedAdjudicator` is the middle ground for an *unattended hardware*
+  run: it auto-accepts **benign** recommendations (a clean run never pauses) but
+  **escalates safety-critical seams to the LLM** — exactly when the core's own
+  recommendation turns non-benign (``abort``/``revert``/``retry``/…) or the digest
+  flags a severe/critical state. This is the answer to "the overnight run had no LLM
+  at the seams": auto-mode is *safe* only if recommendations are conservative, but
+  supervised-mode is *judged* at the boundaries that matter.
+
+**Where the LLM judges (the seam) vs what the core decides (mechanics).** *Detecting*
+an anomaly — a collapsed post-foundation luminance envelope, an optimizer floor, a
+failed verify — is mechanics and stays deterministic. *Deciding what to do about it*
+(abort / retry the foundation / accept and continue) is a **boundary**, so it goes
+through :meth:`Calibration.adjudicate` with a conservative recommendation, never a
+unilateral ``raise`` that the LLM can't see. The core surfaces a strong default; the
+judge gets the final call (and full digest) when one is present.
 
 The display/meter and the re-measure probe are single injectable seams (a
 :data:`~dlc.measure_loop.MeasureFn` and a :data:`~dlc.optimize.ProbeFn`), so the
@@ -90,6 +108,7 @@ __all__ = [
     "Adjudicator",
     "AutoAdjudicator",
     "MappingAdjudicator",
+    "SupervisedAdjudicator",
     "StageOutcome",
     "CalibrationResult",
     "Calibration",
@@ -110,6 +129,14 @@ SEAM_VERIFY = "verify"             # final score vs quality targets
 SEAM_STACK = "require_stack"       # gray-wb/3dlut-only precondition unmet
 SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/meter behaviour
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
+SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
+
+# The benign, happy-path choice at a seam — the recommendation a clean run carries. A
+# recommendation OUTSIDE this set means the deterministic core wants to stop/redo something,
+# which is exactly when SupervisedAdjudicator pulls a live judge into an unattended run.
+_BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "done"})
+# Digest flags that, even under a benign recommendation, mark a seam worth a judge's eyes.
+_SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "critical", "compromised")
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +228,46 @@ class MappingAdjudicator:
         if request.key in self.decisions:
             return self.decisions[request.key]
         raise AdjudicationRequired(request)
+
+
+class SupervisedAdjudicator:
+    """Autonomous, but escalate the seams that matter to a live judge.
+
+    The mode for an **unattended hardware run**: a clean run never pauses (every
+    benign recommendation is auto-accepted, like :class:`AutoAdjudicator`), but the
+    instant a seam goes non-benign — the core recommends ``abort``/``revert``/
+    ``retry``/… or the digest flags a severe/critical state — it **raises**
+    :class:`AdjudicationRequired` so an LLM/human makes the call with the full digest,
+    reusing the same pause/resume + ``--decide`` plumbing as :class:`MappingAdjudicator`.
+
+    This closes the gap that sank the first HDR run: ``--auto`` follows the
+    recommendation blindly, so a foundation collapse recommended as ``accept`` (or not
+    gated at all) plows ahead for hours. Here the foundation seam recommends ``abort``
+    → non-benign → the judge is pulled in instead of rubber-stamping.
+
+    Seed it with the decisions made so far (loaded from the run-record on resume), so a
+    recorded judgment replays verbatim and only a genuinely new safety seam pauses."""
+
+    def __init__(self, decisions: Optional[dict[str, Decision]] = None) -> None:
+        self.decisions = dict(decisions or {})
+
+    def adjudicate(self, request: AdjudicationRequest) -> Decision:
+        if request.key in self.decisions:
+            return self.decisions[request.key]
+        if self._needs_a_judge(request):
+            raise AdjudicationRequired(request)
+        return Decision(request.recommendation,
+                        note="supervised: auto-accepted benign recommendation",
+                        payload=request.recommended_payload)
+
+    @staticmethod
+    def _needs_a_judge(request: AdjudicationRequest) -> bool:
+        """A seam escalates when the core's own recommendation is non-benign, or the
+        digest carries a severity flag even under a benign default."""
+        if request.recommendation not in _BENIGN_RECOMMENDATIONS:
+            return True
+        digest = request.digest or {}
+        return any(bool(digest.get(flag)) for flag in _SEVERITY_FLAGS)
 
 
 # ---------------------------------------------------------------------------
@@ -1746,10 +1813,24 @@ class Calibration:
                                 artifacts=[p for p in (res.ti3_path, res.ndjson_path) if p])
 
         outcome = self._stage(key, run)
-        guard = self._measurement_foundation_guard(role, outcome)
-        if guard is not None:
-            self.runlog.anomaly(key, **guard.digest)
-            raise CalibrationAborted(guard)
+        collapse = self._measurement_foundation_collapse(role, outcome)
+        if collapse is not None:
+            # DETECT is mechanics; the DECISION is a seam. A collapsed post-foundation
+            # luminance envelope means the 3D-LUT would optimize on top of a broken state —
+            # recommend abort (so --auto/supervised stop the disaster) but let a live judge
+            # retry/accept with the full digest (it may know the read was a transient).
+            self.runlog.anomaly(key, **collapse)
+            decision = self.adjudicate(AdjudicationRequest(
+                key=f"{key}:foundation", seam=SEAM_FOUNDATION, stage=key,
+                question=(collapse["message"] + " — abort, retry the foundation, or accept and continue?"),
+                options=("abort", "retry", "accept"), recommendation="abort",
+                digest={**collapse, "foundation_critical": True}))
+            self._abort_if(decision, stage=key, message=collapse["message"])
+            if decision.choice == "retry":
+                raise CalibrationAborted(StageOutcome(
+                    key, "aborted",
+                    digest={**collapse, "retry_requested": True, "decision_note": decision.note}))
+            self.ctx.log(f"foundation collapse at {key} ACCEPTED at the seam: {decision.note}")
         # Before→after dE trend on the spine (#8): score the INTERMEDIATE measures so the
         # dashboard's ΔE panel + de_history show the run converging (native → after ICC → after
         # 3D LUT) instead of a single verify point. verify does its own richer scoring at the gate.
@@ -1773,12 +1854,14 @@ class Calibration:
             self._abort_if(decision, stage=key, message="aborted on unsettled measurement")
         return outcome
 
-    def _measurement_foundation_guard(self, role: str, outcome: StageOutcome) -> Optional[StageOutcome]:
-        """Catch a collapsed correction foundation before the long 3D-LUT build.
+    def _measurement_foundation_collapse(self, role: str, outcome: StageOutcome) -> Optional[dict[str, Any]]:
+        """Detect a collapsed correction foundation before the long 3D-LUT build.
 
-        After any foundation install, the measured bright neutral must remain in the same
-        luminance envelope as raw/brightness/target. If it does not, downstream 3D-LUT work is
-        optimizing on top of a broken hardware/profile state and should stop immediately.
+        After a foundation install the measured bright neutral must stay in the same luminance
+        envelope as raw/brightness/target; if it does not, downstream 3D-LUT work would optimize
+        on top of a broken hardware/profile state. Returns the **evidence digest** when the
+        envelope collapsed (the caller adjudicates a :data:`SEAM_FOUNDATION` seam), else ``None``.
+        Detection only — the decision is the seam's, not a unilateral abort here.
         """
         if role != "post-mhc" or outcome.status != "done":
             return None
@@ -1786,19 +1869,7 @@ class Calibration:
         white = _as_float_local(digest.get("white_nits"))
         if white is None or white <= 0:
             return None
-        refs: list[float] = []
-        for stage_key in ("measure:raw", "brightness"):
-            d = ((self.calib["stages"].get(stage_key) or {}).get("digest") or {})
-            ref = _as_float_local(d.get("white_nits"))
-            if ref and ref > 0:
-                refs.append(ref)
-        try:
-            spec = self._spec()
-            target = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
-            if target and target > 0:
-                refs.append(float(target))
-        except Exception:  # noqa: BLE001 - advisory guard reference only
-            pass
+        refs = self._foundation_reference_nits()
         if not refs:
             return None
         ref = max(refs)
@@ -1809,23 +1880,15 @@ class Calibration:
         critical = ratio < 0.55 or (compromised and ratio < 0.75) or (compromised and baseline_distance >= 0.08)
         if not critical:
             return None
-        message = (
-            f"post-foundation white collapsed to {white:.1f} nits ({ratio:.2f}x of "
-            f"{ref:.1f} nits reference); aborting before 3D-LUT build"
-        )
-        return StageOutcome(
-            "measure:post-mhc", "aborted",
-            digest={
-                "message": message,
-                "white_nits": round(white, 3),
-                "reference_white_nits": round(ref, 3),
-                "white_ratio": round(ratio, 4),
-                "preheat_compromised": compromised,
-                "baseline_distance": baseline_distance,
-                "recommendation": "abort_and_recheck_foundation",
-            },
-            data={"needs_adjudication": True, "guard": "foundation_white_collapse"},
-        )
+        return {
+            "message": (f"post-foundation white collapsed to {white:.1f} nits "
+                        f"({ratio:.2f}x of {ref:.1f} nits reference) before 3D-LUT build"),
+            "white_nits": round(white, 3),
+            "reference_white_nits": round(ref, 3),
+            "white_ratio": round(ratio, 4),
+            "preheat_compromised": compromised,
+            "baseline_distance": baseline_distance,
+        }
 
     def _score_stage(self, role: str, ti3_path: Optional[str], *, label: str) -> None:
         """Score an intermediate measure stage against the resolved target and put a
@@ -1909,15 +1972,30 @@ class Calibration:
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
-                if sanity.get("critical"):
-                    raise CalibrationAborted(StageOutcome(
-                        "build-install-mhc", "aborted",
-                        digest={**digest, "message": sanity.get("message"),
-                                "recommendation": "abort_and_recheck_mhc"}))
             return StageOutcome("build-install-mhc", "done", digest=digest,
                                 data={"profile_name": profile_name, "verified": verify_ok})
 
-        return self._stage("build-install-mhc", run)
+        outcome = self._stage("build-install-mhc", run)
+        sanity = (outcome.digest or {}).get("sanity") or {}
+        if sanity.get("critical"):
+            # The MHC install succeeded (memoised done) but its immediate bright-neutral read
+            # collapsed — DETECT here, DECIDE at the seam. Recommend abort so --auto/supervised
+            # stop before the cube build; a live judge can accept if it knows the read was a
+            # transient (e.g. the scanout reconfigured mid-read).
+            decision = self.adjudicate(AdjudicationRequest(
+                key="build-install-mhc:foundation", seam=SEAM_FOUNDATION, stage="build-install-mhc",
+                question=((sanity.get("message") or "the MHC foundation read collapsed bright-neutral luminance")
+                          + " — abort and recheck the MHC, or accept and continue?"),
+                options=("abort", "accept"), recommendation="abort",
+                digest={**{k: outcome.digest.get(k) for k in ("profile_name", "white_xy", "verified")},
+                        "sanity": sanity, "foundation_critical": True}))
+            if decision.choice == "abort":
+                raise CalibrationAborted(StageOutcome(
+                    "build-install-mhc", "aborted",
+                    digest={**outcome.digest, "message": sanity.get("message"),
+                            "recommendation": "abort_and_recheck_mhc", "decision_note": decision.note}))
+            self.ctx.log(f"MHC foundation sanity critical but ACCEPTED at the seam: {decision.note}")
+        return outcome
 
     def _mhc_foundation_sanity_check(self) -> dict[str, Any]:
         """Immediately read a bright neutral after MHC apply.
@@ -3224,7 +3302,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="resume the adaptive-planning seam with a structured decision JSON file "
                              "(keys: shadow_treatment, volumetric_density, patch_size_overrides, "
                              "reason, confidence). Validated + clamped to bounds before it is applied.")
-    parser.add_argument("--auto", action="store_true", help="auto-adjudicate (no pauses)")
+    parser.add_argument("--auto", action="store_true",
+                        help="auto-adjudicate EVERY seam by its recommendation (no pauses, no LLM) — "
+                             "for sim/CI/reproducible runs, NOT an unattended hardware run")
+    parser.add_argument("--supervised", action="store_true",
+                        help="autonomous, but PAUSE for a live judge at safety-critical seams "
+                             "(foundation collapse / optimizer floor / failed verify) — the mode for "
+                             "an unattended HARDWARE run; a clean run never pauses")
     parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
                         help="full flow: skip the final GS+WB tweak (deferred stage targets the "
                              "wrong layer) — runs ICC→3D-LUT as one cohesive unit (one rollback "
@@ -3332,7 +3416,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         overrides["adaptive-planning:plan"] = Decision(
             "apply", note="cli plan-decision-file", payload=plan_payload)
     decisions.update(overrides)   # also seed the adjudicator (covers not-yet-recorded keys)
-    adjudicator: Adjudicator = AutoAdjudicator() if args.auto else MappingAdjudicator(decisions)
+    if args.auto:
+        adjudicator: Adjudicator = AutoAdjudicator()
+    elif args.supervised:
+        adjudicator = SupervisedAdjudicator(decisions)
+    else:
+        adjudicator = MappingAdjudicator(decisions)
 
     from .measure_loop import (  # lazy: live only
         DogegenPresenter, SocketPresenter, make_spotread_meter, make_persistent_spotread_meter,

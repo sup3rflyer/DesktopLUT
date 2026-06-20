@@ -27,12 +27,17 @@ pytest.importorskip("colour")
 
 from dlc import calibration_profile as cp
 from dlc.calibrate import (
+    SEAM_FOUNDATION,
+    AdjudicationRequest,
     AdjudicationRequired,
     AutoAdjudicator,
     Calibration,
+    CalibrationAborted,
     Decision,
     MappingAdjudicator,
     PatchSizes,
+    StageOutcome,
+    SupervisedAdjudicator,
     apply_set_hdr,
     build_neutral_set,
     build_ramp_set,
@@ -1662,3 +1667,116 @@ def test_loop_config_uses_dip_cold_channel_when_profile_has_none(tmp_path: Path)
         cold_channel="G", made="2026-06-16")
     cfg = calib._loop_config_for(dip)
     assert cfg.cold_channel == "G"   # the DIP-discovered channel is used when the profile has none
+
+
+# ---------------------------------------------------------------------------
+# SupervisedAdjudicator + the foundation-collapse seam.
+#
+# The "LLM decides at the boundary" fix: a safety-critical warning must NOT be
+# resolved deterministically in EITHER direction — not auto-accepted (the first
+# HDR run's failure) and not unilaterally aborted by the core. Detection stays
+# mechanics; the decision is a seam.
+# ---------------------------------------------------------------------------
+
+def _foundation_request(recommendation="abort"):
+    return AdjudicationRequest(
+        key="measure:post-mhc:foundation", seam=SEAM_FOUNDATION, stage="measure:post-mhc",
+        question="post-foundation white collapsed — abort, retry, or accept?",
+        options=("abort", "retry", "accept"), recommendation=recommendation,
+        digest={"white_ratio": 0.12, "foundation_critical": True})
+
+
+def test_supervised_adjudicator_auto_accepts_benign():
+    # A clean seam (benign recommendation, no severity flag) never pauses an unattended run.
+    adj = SupervisedAdjudicator()
+    req = AdjudicationRequest(key="resolve-target:plan", seam="plan_veto", stage="resolve-target",
+                              question="proceed?", options=("approve", "abort"), recommendation="approve")
+    assert adj.adjudicate(req).choice == "approve"
+
+
+def test_supervised_adjudicator_escalates_a_nonbenign_recommendation():
+    # The whole point: when the core wants to abort/retry/revert, a judge is pulled in.
+    adj = SupervisedAdjudicator()
+    with pytest.raises(AdjudicationRequired) as exc:
+        adj.adjudicate(_foundation_request("abort"))
+    assert exc.value.request.seam == SEAM_FOUNDATION
+
+
+def test_supervised_adjudicator_escalates_on_a_severity_flag_under_benign_default():
+    # Even a benign 'accept' default escalates if the digest carries a severity flag.
+    adj = SupervisedAdjudicator()
+    req = AdjudicationRequest(key="x", seam="measure", stage="m", question="?",
+                              options=("accept", "abort"), recommendation="accept",
+                              digest={"compromised": True})
+    with pytest.raises(AdjudicationRequired):
+        adj.adjudicate(req)
+
+
+def test_supervised_adjudicator_replays_a_recorded_decision_without_pausing():
+    # On resume the seeded judgment replays verbatim — only a genuinely new safety seam pauses.
+    adj = SupervisedAdjudicator({"measure:post-mhc:foundation": Decision("accept", note="judged")})
+    assert adj.adjudicate(_foundation_request("abort")).choice == "accept"
+
+
+def test_foundation_collapse_is_detected_and_a_healthy_envelope_passes(tmp_path: Path):
+    calib = _make(tmp_path, "fdet")
+    calib.calib["stages"]["measure:raw"] = {"status": "done", "digest": {"white_nits": 120.0}}
+    calib.calib["stages"]["brightness"] = {"status": "done", "digest": {"white_nits": 118.0}}
+    collapsed = StageOutcome("measure:post-mhc", "done", digest={"white_nits": 14.0})
+    healthy = StageOutcome("measure:post-mhc", "done", digest={"white_nits": 117.0})
+    assert calib._measurement_foundation_collapse("post-mhc", collapsed) is not None
+    assert calib._measurement_foundation_collapse("post-mhc", healthy) is None
+    # only the post-mhc role is guarded (raw has no foundation installed yet)
+    assert calib._measurement_foundation_collapse("raw", collapsed) is None
+
+
+def _drive_post_mhc_collapse(calib, monkeypatch):
+    calib.calib["stages"]["measure:raw"] = {"status": "done", "digest": {"white_nits": 120.0}}
+    calib.calib["stages"]["brightness"] = {"status": "done", "digest": {"white_nits": 118.0}}
+    collapsed = StageOutcome("measure:post-mhc", "done",
+                             digest={"white_nits": 14.0},
+                             data={"ti3": None, "ndjson": None, "needs_adjudication": False})
+    monkeypatch.setattr(calib, "_stage", lambda key, run: collapsed)
+    return collapsed
+
+
+def test_foundation_seam_aborts_the_run_in_auto(tmp_path: Path, monkeypatch):
+    # --auto follows the conservative recommendation: a collapsed foundation now STOPS the run
+    # before the hours-long cube build (the first HDR run plowed ahead instead).
+    calib = _make(tmp_path, "fauto")
+    _drive_post_mhc_collapse(calib, monkeypatch)
+    with pytest.raises(CalibrationAborted):
+        calib.stage_measure(role="post-mhc", patches=[(0, 0, 0)],
+                            ti3_name="p.ti3", ndjson_name="p.ndjson")
+
+
+def test_foundation_seam_escalates_to_a_judge_in_supervised(tmp_path: Path, monkeypatch):
+    # The architectural fix: the same collapse pulls in a live judge instead of a unilateral
+    # deterministic abort — the LLM gets the digest and the call.
+    calib = _make(tmp_path, "fsup", adjudicator=SupervisedAdjudicator())
+    _drive_post_mhc_collapse(calib, monkeypatch)
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="post-mhc", patches=[(0, 0, 0)],
+                            ti3_name="p.ti3", ndjson_name="p.ndjson")
+    assert exc.value.request.seam == SEAM_FOUNDATION
+    assert exc.value.request.recommendation == "abort"
+    assert exc.value.request.recommendation in exc.value.request.options
+
+
+def test_foundation_seam_accept_override_lets_the_run_proceed(tmp_path: Path, monkeypatch):
+    # A judge that knows the read was a transient can override the abort and continue.
+    calib = _make(tmp_path, "facc",
+                  adjudicator=MappingAdjudicator({"measure:post-mhc:foundation": Decision("accept")}))
+    collapsed = _drive_post_mhc_collapse(calib, monkeypatch)
+    out = calib.stage_measure(role="post-mhc", patches=[(0, 0, 0)],
+                              ti3_name="p.ti3", ndjson_name="p.ndjson")
+    assert out is collapsed   # proceeded past the seam
+
+
+def test_supervised_full_flow_completes_without_pausing(tmp_path: Path):
+    # The load-bearing regression: supervised mode must NOT pause a clean run — a perfect panel
+    # never trips a non-benign seam, so the whole flow runs unattended end-to-end.
+    calib = _make(tmp_path, "supfull", adjudicator=SupervisedAdjudicator())
+    result = calib.run("full")
+    assert result.status == "completed"
+    assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
