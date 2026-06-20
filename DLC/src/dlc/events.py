@@ -154,12 +154,17 @@ class RunLog:
         self.writer = EventWriter(path)
         self.path = path
         self.phase = phase
+        # Running per-event-name counts. A timed check-in snapshots this and diffs against the
+        # previous snapshot to report "what happened since the last check-in" (anomalies, seams,
+        # reads, optimizer iterations) without re-reading the firehose off disk.
+        self.tally: dict[str, int] = {}
 
     # -- core emit ---------------------------------------------------------
     def emit(self, level: str, stage: str, event: str, *,
              tier: Optional[str] = None, **data: Any) -> Event:
         if tier is None:
             tier = derive_tier(event, level)
+        self.tally[event] = self.tally.get(event, 0) + 1
         return self.writer.write(level, stage, event, tier=tier, phase=self.phase, **data)
 
     # -- phase tracking ----------------------------------------------------

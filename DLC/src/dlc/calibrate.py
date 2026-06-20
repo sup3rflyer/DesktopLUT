@@ -130,11 +130,14 @@ SEAM_STACK = "require_stack"       # gray-wb/3dlut-only precondition unmet
 SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/meter behaviour
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
+SEAM_CHECKIN = "timed_checkin"     # §12 timed check-in: "status — continue?" (gates live, pings auto/supervised)
 
 # The benign, happy-path choice at a seam — the recommendation a clean run carries. A
 # recommendation OUTSIDE this set means the deterministic core wants to stop/redo something,
 # which is exactly when SupervisedAdjudicator pulls a live judge into an unattended run.
-_BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "done"})
+# ``continue`` (the timed check-in's default) is benign: an unattended run pings through it
+# (the rich digest still lands on the spine), while a fully-live MappingAdjudicator gates on it.
+_BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "done", "continue"})
 # Digest flags that, even under a benign recommendation, mark a seam worth a judge's eyes.
 # ``gate_failed`` is the verify gate's "outside quality targets" signal: a benign ``apply``
 # recommendation on a FAILED verify must still escalate (the recommendation alone is benign, so
@@ -458,6 +461,7 @@ class Calibration:
         stall_kill_hook: Optional[Callable[[], None]] = None,
         pause_handler: Optional[Callable[[Mapping[str, Any]], None]] = None,
         enable_watchdog: bool = False,
+        checkin_interval_s: float = 600.0,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -518,6 +522,18 @@ class Calibration:
                                  on_pause=self._pause_requested,
                                  on_resume=self._resume_requested)
         self._enable_watchdog = enable_watchdog
+        # §12 timed check-in: a coarse wall-clock floor (0 disables) past which the next safe
+        # checkpoint (a stage boundary, an optimizer iteration) surfaces a rich "status — continue?"
+        # so a multi-hour run never goes dark. monotonic so it is immune to wall-clock changes;
+        # reset on each resume (a fresh process), which is fine — a resume is itself a status point.
+        self._checkin_interval_s = max(0.0, float(checkin_interval_s))
+        self._last_checkin_monotonic: Optional[float] = None
+        self._last_checkin_tally: dict[str, int] = {}
+        self._run_started_monotonic: Optional[float] = None
+        # Latest live metrics, snapshotted as they happen, so a check-in carries them without
+        # re-deriving from artifacts: the most recent intermediate score + the last optimizer iter.
+        self._last_scored: dict[str, Any] = {}
+        self._last_optimizer: dict[str, Any] = {}
 
     # -- persistence ------------------------------------------------------
     def _save(self) -> None:
@@ -674,6 +690,11 @@ class Calibration:
         self._save()
         self.runlog.stage_done(key, status=outcome.status)
         self._emit_header()   # target/white/correction may have just become known
+        # A freshly-completed stage is a safe (memoised) boundary — surface a timed check-in if
+        # the floor has elapsed. gating=True: a live run may pause here ("continue?"); the stage
+        # is already recorded done, so a resume replays it without re-doing the work. Replayed
+        # stages (the early-return above) never reach here, so a resume doesn't re-fire check-ins.
+        self._maybe_timed_checkin(key, gating=True)
         return outcome
 
     # -- the seam ---------------------------------------------------------
@@ -1127,9 +1148,102 @@ class Calibration:
         # next iteration's compute span.
         self.liveness.progress("build-install-3dlut")
         try:
-            self.runlog.optimizer_iteration(**result.as_dict())
+            data = result.as_dict()
+            self._last_optimizer = dict(data)
+            self.runlog.optimizer_iteration(**data)
+            # The optimizer is the long pole (it can run for hours). Surface a timed check-in
+            # between iterations — emit-only (gating=False): a mid-stage pause would discard the
+            # un-memoised optimizer work, so we never gate here, only ping.
+            self._maybe_timed_checkin("build-install-3dlut", gating=False)
         except Exception:  # noqa: BLE001 - telemetry must never break the build
             pass
+
+    # -- §12 timed check-in ------------------------------------------------
+    def _maybe_timed_checkin(self, trigger: str, *, gating: bool) -> None:
+        """Surface a rich "status — continue?" check-in once the coarse wall-clock floor has
+        elapsed (§12). Always EMITS the check-in (dashboard flag + LLM digest projection). When
+        ``gating`` is set (a memoised stage boundary — safe to pause), it ALSO routes through the
+        adjudicator: a fully-live ``MappingAdjudicator`` GATES on "continue?", while ``--auto`` /
+        ``--supervised`` ping straight through (``continue`` is benign — the digest still lands).
+        ``gating=False`` (a mid-stage trigger like an optimizer iteration) only emits — a pause
+        there would raise out of an un-memoised stage and discard its work. Disabled at interval 0.
+        """
+        import time
+        if self._checkin_interval_s <= 0 or self.runlog is None:
+            return
+        now = time.monotonic()
+        if self._last_checkin_monotonic is None:
+            # First checkpoint just anchors the clock — no immediate ping at second 0.
+            self._last_checkin_monotonic = now
+            self._last_checkin_tally = dict(self.runlog.tally)
+            return
+        if now - self._last_checkin_monotonic < self._checkin_interval_s:
+            return
+        elapsed_since = now - self._last_checkin_monotonic
+        seq = int(self.calib.get("checkin_seq", 0)) + 1
+        self.calib["checkin_seq"] = seq
+        digest = self._checkin_digest(trigger, seq=seq, elapsed_since_checkin_s=round(elapsed_since, 1))
+        # Reset BEFORE adjudicating so a live pause/resume cycle doesn't immediately re-fire.
+        self._last_checkin_monotonic = now
+        self._last_checkin_tally = dict(self.runlog.tally)
+        self.runlog.check_in(trigger, **digest)   # always: dashboard check-in flag + LLM digest
+        if not gating:
+            return
+        self._save()
+        decision = self.adjudicate(AdjudicationRequest(
+            key=f"checkin:{seq}", seam=SEAM_CHECKIN, stage=trigger,
+            question=(f"Timed check-in #{seq}: at {digest['overview']['stage']}, "
+                      f"{digest['overview']['stages_done']} stage(s) done, "
+                      f"{_fmt_elapsed(digest['overview'].get('elapsed_s'))} elapsed. Continue, or abort?"),
+            options=("continue", "abort"), recommendation="continue", digest=digest))
+        self._abort_if(decision, stage=trigger, message=f"aborted at timed check-in #{seq}")
+
+    def _checkin_digest(self, trigger: str, *, seq: int = 0,
+                        elapsed_since_checkin_s: float = 0.0) -> dict[str, Any]:
+        """The rich check-in payload: the run overview, what happened since the last check-in,
+        and the latest live metrics — exactly what a supervising LLM needs to judge "continue?"."""
+        return {
+            "seq": seq,
+            "elapsed_since_checkin_s": elapsed_since_checkin_s,
+            "overview": self._run_overview(trigger),
+            "since_last": self._events_since_last_checkin(),
+            "metrics": self._latest_checkin_metrics(),
+        }
+
+    def _run_overview(self, trigger: str) -> dict[str, Any]:
+        import time
+        stages = self.calib.get("stages") or {}
+        done = [k for k, v in stages.items() if (v or {}).get("status") == "done"]
+        elapsed = None
+        if self._run_started_monotonic is not None:
+            elapsed = round(time.monotonic() - self._run_started_monotonic, 1)
+        return {
+            "run": self.ctx.root.name,
+            "flow": self.calib.get("flow"),
+            "mode": self.mode,
+            "target": self.target_name,
+            "phase": self.runlog.phase if self.runlog else None,
+            "stage": trigger,
+            "stages_done": len(done),
+            "completed": done,
+            "elapsed_s": elapsed,
+        }
+
+    def _events_since_last_checkin(self) -> dict[str, int]:
+        """Per-event-name counts emitted since the previous check-in (anomalies, seams, reads,
+        optimizer iterations, …) — the spine delta, computed from the RunLog tally, no disk read."""
+        cur = self.runlog.tally if self.runlog else {}
+        prev = self._last_checkin_tally or {}
+        return {name: cur[name] - prev.get(name, 0)
+                for name in cur if cur[name] - prev.get(name, 0) > 0}
+
+    def _latest_checkin_metrics(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self._last_scored:
+            out["last_scored"] = self._last_scored
+        if self._last_optimizer:
+            out["optimizer"] = self._last_optimizer
+        return out
 
     def _patch_window_guard(self) -> dict[str, Any]:
         """Assert the dogegen patch window will land on the calibration target monitor.
@@ -1935,6 +2049,10 @@ class Calibration:
             summary = summarize_metrics(phase=label, iteration=0, source=p,
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             colour_de = [m.de2000 for m in metrics if not m.grayscale]
+            # Snapshot for the timed check-in's live metrics (most recent intermediate score).
+            self._last_scored = {"label": label, "metric": metric_name,
+                                 "avg": round(summary.avg_de2000, 3), "max": round(summary.max_de2000, 3),
+                                 "white": round(summary.white_de2000, 3)}
             self.runlog.metrics_scored(
                 f"measure:{role}", label=label, iteration=0, metric=metric_name,
                 avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
@@ -2508,6 +2626,8 @@ class Calibration:
             pass
 
     def run(self, flow: str) -> CalibrationResult:
+        import time
+        self._run_started_monotonic = time.monotonic()   # check-in elapsed anchor (this process)
         self.calib["flow"] = flow
         self._save()
         self._publish_active_pointer()   # let the dashboard find this run (and the next)
@@ -2902,6 +3022,17 @@ def _as_float_local(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _fmt_elapsed(seconds: Any) -> str:
+    s = _as_float_local(seconds)
+    if s is None:
+        return "?"
+    if s < 90:
+        return f"{s:.0f}s"
+    if s < 5400:
+        return f"{s / 60:.0f}m"
+    return f"{s / 3600:.1f}h"
 
 
 def _fs_safe(token: str) -> str:
@@ -3340,6 +3471,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="autonomous, but PAUSE for a live judge at safety-critical seams "
                              "(foundation collapse / optimizer floor / failed verify) — the mode for "
                              "an unattended HARDWARE run; a clean run never pauses")
+    parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
+                        metavar="SECONDS",
+                        help="§12 timed check-in floor: past this many seconds, the next safe "
+                             "checkpoint surfaces a rich 'status — continue?' (run overview + events "
+                             "since the last check-in) so a long run never goes dark. Default 600 "
+                             "(10 min); live runs GATE on it, --auto/--supervised ping through; 0 disables.")
     parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
                         help="full flow: skip the final GS+WB tweak (deferred stage targets the "
                              "wrong layer) — runs ICC→3D-LUT as one cohesive unit (one rollback "
@@ -3605,7 +3742,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         characterize_config=characterize_config, decision_overrides=overrides,
                         skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,
-                        enable_watchdog=True)
+                        enable_watchdog=True, checkin_interval_s=args.checkin_interval)
     result = None
     paused = False
     try:

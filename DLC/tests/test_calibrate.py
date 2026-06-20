@@ -27,6 +27,7 @@ pytest.importorskip("colour")
 
 from dlc import calibration_profile as cp
 from dlc.calibrate import (
+    SEAM_CHECKIN,
     SEAM_FOUNDATION,
     AdjudicationRequest,
     AdjudicationRequired,
@@ -81,7 +82,7 @@ def _fake_launch(cmds):
 def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
           characterize_config=None, skip_gswb=False, bit_depth=None, patch_sizes=None,
-          adaptive_planning=False) -> Calibration:
+          adaptive_planning=False, checkin_interval_s=600.0) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -94,7 +95,7 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
         probe=probe, optimize_config=_OPT, patch_sizes=patch_sizes or _SMALL, run_date=_DATE,
         probe_launcher=probe_launcher, decision_overrides=decision_overrides,
         characterize_config=characterize_config, skip_gswb=skip_gswb, bit_depth=bit_depth,
-        adaptive_planning=adaptive_planning)
+        adaptive_planning=adaptive_planning, checkin_interval_s=checkin_interval_s)
 
 
 # ---------------------------------------------------------------------------
@@ -1844,3 +1845,87 @@ def test_foundation_seam_does_not_offer_an_unhonoured_retry(tmp_path: Path, monk
                             ti3_name="p.ti3", ndjson_name="p.ndjson")
     assert exc.value.request.options == ("abort", "accept")
     assert "retry" not in exc.value.request.options
+
+
+# ---------------------------------------------------------------------------
+# §12 timed check-in: a default-on "status — continue?" ping with run overview +
+# events-since-last-checkin. Mode-driven: live GATES, --auto/--supervised ping
+# through ("continue" is benign). Drives off a coarse wall-clock floor.
+# ---------------------------------------------------------------------------
+
+def _due(calib):
+    # Make a check-in due now: anchor the clock far in the past (a fresh anchor would just reset).
+    import time
+    calib._last_checkin_monotonic = time.monotonic() - 10_000.0
+
+
+def test_checkin_digest_carries_overview_delta_and_metrics(tmp_path: Path):
+    calib = _make(tmp_path, "ckdigest", checkin_interval_s=1.0)
+    calib.calib["flow"] = "full"
+    calib.calib["stages"]["preflight"] = {"status": "done", "digest": {}}
+    calib.calib["stages"]["whitepoint"] = {"status": "done", "digest": {}}
+    calib._last_checkin_tally = {"patch_read": 10}
+    calib.runlog.tally = {"patch_read": 37, "anomaly": 2, "seam": 1}
+    calib._last_scored = {"label": "after ICC", "metric": "CIEDE2000", "avg": 1.2, "max": 3.0, "white": 0.4}
+    d = calib._checkin_digest("build-install-3dlut", seq=3, elapsed_since_checkin_s=612.0)
+    assert d["seq"] == 3 and d["elapsed_since_checkin_s"] == 612.0
+    ov = d["overview"]
+    assert ov["flow"] == "full" and ov["stage"] == "build-install-3dlut"
+    assert ov["stages_done"] == 2 and set(ov["completed"]) == {"preflight", "whitepoint"}
+    # since-last delta = current tally minus the previous snapshot (firehose included as a count)
+    assert d["since_last"] == {"patch_read": 27, "anomaly": 2, "seam": 1}
+    assert d["metrics"]["last_scored"]["avg"] == 1.2
+
+
+def test_timed_checkin_anchors_then_emits_when_due(tmp_path: Path):
+    calib = _make(tmp_path, "ckfire", checkin_interval_s=1.0)
+    # First call only anchors — no check-in event yet.
+    calib._maybe_timed_checkin("preflight", gating=False)
+    before = dict(calib.runlog.tally)
+    assert before.get("check_in", 0) == 0
+    # Once the floor has elapsed, the next call emits a CHECK_IN event.
+    _due(calib)
+    calib._maybe_timed_checkin("measure:raw", gating=False)
+    assert calib.runlog.tally.get("check_in", 0) == 1
+    events = [e for e in read_events(calib.ctx.events_path) if e.event == "check_in"]
+    assert events and events[-1].data["overview"]["stage"] == "measure:raw"
+
+
+def test_timed_checkin_gates_live_but_pings_through_auto_and_supervised(tmp_path: Path):
+    # Live MappingAdjudicator GATES (pauses for "continue?") ...
+    live = _make(tmp_path, "cklive", adjudicator=MappingAdjudicator({}), checkin_interval_s=1.0)
+    live._maybe_timed_checkin("preflight", gating=True)   # anchor
+    _due(live)
+    with pytest.raises(AdjudicationRequired) as exc:
+        live._maybe_timed_checkin("build-install-3dlut", gating=True)
+    assert exc.value.request.seam == SEAM_CHECKIN
+    assert exc.value.request.recommendation == "continue"
+    assert exc.value.request.recommendation in exc.value.request.options
+    # ... while --auto and --supervised ping straight through (no pause), digest still emitted.
+    for label, adj in (("ckauto", AutoAdjudicator()), ("cksup", SupervisedAdjudicator())):
+        c = _make(tmp_path, label, adjudicator=adj, checkin_interval_s=1.0)
+        c._maybe_timed_checkin("preflight", gating=True)   # anchor
+        _due(c)
+        c._maybe_timed_checkin("build-install-3dlut", gating=True)   # must NOT raise
+        assert c.runlog.tally.get("check_in", 0) == 1
+
+
+def test_timed_checkin_disabled_at_interval_zero(tmp_path: Path):
+    calib = _make(tmp_path, "ckoff", adjudicator=MappingAdjudicator({}), checkin_interval_s=0.0)
+    calib._maybe_timed_checkin("preflight", gating=True)
+    _due(calib)
+    calib._maybe_timed_checkin("build-install-3dlut", gating=True)   # disabled → never gates/emits
+    assert calib.runlog.tally.get("check_in", 0) == 0
+
+
+def test_default_interval_does_not_fire_timed_checkins_in_a_fast_run(tmp_path: Path):
+    # Regression: the default 600s floor must leave fast (sim/CI) runs free of TIMED check-ins —
+    # no spurious checkin seams — so the whole existing suite is unaffected. (The pre-existing
+    # measure-quartile check-ins still fire; the timed one is distinguished by its `overview`.)
+    calib = _make(tmp_path, "ckdefault")   # default 600s
+    result = calib.run("full")
+    assert result.status == "completed"
+    timed = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "check_in" and "overview" in e.data]
+    assert timed == []
+    assert not any(k.startswith("checkin:") for k in calib.calib["decisions"])
