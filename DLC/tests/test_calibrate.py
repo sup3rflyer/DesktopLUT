@@ -29,6 +29,7 @@ from dlc import calibration_profile as cp
 from dlc.calibrate import (
     SEAM_CHECKIN,
     SEAM_FOUNDATION,
+    SEAM_HARDWARE_READY,
     SEAM_MEASURE,
     AdjudicationRequest,
     AdjudicationRequired,
@@ -83,7 +84,8 @@ def _fake_launch(cmds):
 def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
           characterize_config=None, skip_gswb=False, bit_depth=None, patch_sizes=None,
-          adaptive_planning=False, checkin_interval_s=600.0) -> Calibration:
+          adaptive_planning=False, checkin_interval_s=600.0,
+          require_hardware_readiness=False) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -96,7 +98,8 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
         probe=probe, optimize_config=_OPT, patch_sizes=patch_sizes or _SMALL, run_date=_DATE,
         probe_launcher=probe_launcher, decision_overrides=decision_overrides,
         characterize_config=characterize_config, skip_gswb=skip_gswb, bit_depth=bit_depth,
-        adaptive_planning=adaptive_planning, checkin_interval_s=checkin_interval_s)
+        adaptive_planning=adaptive_planning, checkin_interval_s=checkin_interval_s,
+        require_hardware_readiness=require_hardware_readiness)
 
 
 # ---------------------------------------------------------------------------
@@ -1714,10 +1717,47 @@ def test_supervised_adjudicator_escalates_on_a_severity_flag_under_benign_defaul
         adj.adjudicate(req)
 
 
+def test_supervised_adjudicator_escalates_on_any_read_anomaly():
+    # Hardware read-path anomalies should ping the LLM even when the core's local
+    # recommendation is benign; the judge decides whether to accept the evidence.
+    adj = SupervisedAdjudicator()
+    req = AdjudicationRequest(key="measure:raw:escalation", seam="measure", stage="measure:raw",
+                              question="measurement anomaly - accept or abort?",
+                              options=("accept", "abort"), recommendation="accept",
+                              digest={"read_anomaly": True, "anomaly_reasons": ["not_warm"]})
+    with pytest.raises(AdjudicationRequired):
+        adj.adjudicate(req)
+
+
 def test_supervised_adjudicator_replays_a_recorded_decision_without_pausing():
     # On resume the seeded judgment replays verbatim — only a genuinely new safety seam pauses.
     adj = SupervisedAdjudicator({"measure:post-mhc:foundation": Decision("accept", note="judged")})
     assert adj.adjudicate(_foundation_request("abort")).choice == "accept"
+
+
+def test_live_hardware_readiness_gate_pauses_once_before_meter_reads(tmp_path: Path):
+    calib = _make(tmp_path, "ready_gate", adjudicator=SupervisedAdjudicator(),
+                  require_hardware_readiness=True)
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("mhc-only")
+    req = exc.value.request
+    assert req.key == "hardware-readiness:confirm"
+    assert req.seam == SEAM_HARDWARE_READY
+    assert req.options == ("ready", "abort")
+    assert req.recommendation == "ready"
+    assert "brightness" not in calib.calib["stages"]
+
+    resumed = _make(
+        tmp_path, "ready_gate",
+        adjudicator=SupervisedAdjudicator({
+            "hardware-readiness:confirm": Decision("ready", note="operator verified setup"),
+        }),
+        require_hardware_readiness=True,
+    )
+    outcome = resumed.stage_hardware_readiness()
+    assert outcome.status == "done"
+    ready = resumed.calib["stages"]["hardware-readiness"]["digest"]
+    assert ready["confirmed"] is True
 
 
 def test_foundation_collapse_is_detected_and_a_healthy_envelope_passes(tmp_path: Path):
@@ -1968,6 +2008,56 @@ def test_dark_panel_escalates_to_a_judge_under_supervised(tmp_path: Path):
     anomalies = [e for e in read_events(calib.ctx.events_path)
                  if e.event == Ev.ANOMALY and (e.data or {}).get("panel_dark")]
     assert anomalies, "a dark panel must raise a loud anomaly on the spine"
+
+
+def test_catastrophic_measure_score_escalates_as_general_anomaly(tmp_path: Path):
+    def bad_patch_set(_patch):
+        return Reading(xyz=(100000.0, 100000.0, 100000.0),
+                       yxy=(100000.0, 0.333, 0.333), ok=True)
+
+    calib = _make(tmp_path, "scoreanom", mode="HDR", panel=bad_patch_set,
+                  adjudicator=SupervisedAdjudicator(), bit_depth=10)
+    calib.target_name = calib.display.target_name("HDR")
+    calib.calib["target"] = calib.target_name
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=calib._ramp_patches(),
+                            ti3_name="r.ti3", ndjson_name="r.ndjson")
+    req = exc.value.request
+    assert req.seam == SEAM_MEASURE
+    assert req.digest["score_anomaly"] is True
+    assert req.digest["score_anomaly_detail"]["reason"] == "catastrophic_delta_e_distribution"
+    assert "score_anomaly" in req.digest["anomaly_reasons"]
+    assert "catastrophic" in req.question
+    anomalies = [e for e in read_events(calib.ctx.events_path)
+                 if e.event == Ev.ANOMALY and (e.data or {}).get("kind") == "score_anomaly"]
+    assert anomalies
+
+
+def test_single_patch_score_spike_escalates_as_general_anomaly(tmp_path: Path):
+    good = SyntheticPanel(transfer=Transfer.pq(bit_depth=10), start_temp=1.0,
+                          cold_blue_gain=1.0, native_white_nits=1840.0)
+
+    def one_bad_patch(patch):
+        if patch.role == "measurement" and patch.seq == 0:
+            return Reading(xyz=(100000.0, 100000.0, 100000.0),
+                           yxy=(100000.0, 0.333, 0.333), ok=True)
+        return good(patch)
+
+    calib = _make(tmp_path, "scorepatch", mode="HDR", panel=one_bad_patch,
+                  adjudicator=SupervisedAdjudicator(), bit_depth=10)
+    calib.target_name = calib.display.target_name("HDR")
+    calib.calib["target"] = calib.target_name
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=calib._ramp_patches(),
+                            ti3_name="r.ti3", ndjson_name="r.ndjson")
+    req = exc.value.request
+    assert req.digest["score_anomaly"] is True
+    assert req.digest["score_anomaly_detail"]["reason"] in {
+        "single_patch_delta_e_spike",
+        "localized_patch_delta_e_spike",
+    }
+    assert req.digest["score_anomaly_detail"]["worst"][0]["de2000"] >= 100.0
+    assert req.options == ("accept", "suppress", "remeasure", "retry", "abort")
 
 
 def test_full_flow_aborts_loudly_on_a_dark_panel_at_brightness(tmp_path: Path, monkeypatch):

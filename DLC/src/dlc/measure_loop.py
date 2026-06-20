@@ -142,8 +142,10 @@ class MeasureLoopConfig:
     # it reads tens-to-hundreds of cd/m². A reference reading below this floor means the panel is
     # emitting ~no light (asleep / off / wrong input) — settle agreement on black (0≈0) is NOT
     # "warm". Catch it loudly in a couple of reads instead of "settling" on darkness and then
-    # hanging the meter per patch. (cd/m²; 0 disables the guard.)
+    # hanging the meter per patch. This is a minimum cd/m² floor; the live guard also applies a
+    # small fraction of the transfer's expected warm-up luminance. Set to 0 to disable the guard.
     dark_floor_nits: float = 1.0
+    dark_floor_fraction: float = 0.05  # fraction of expected warm-up Y; catches HDR mid-code ≈1 nit
     dark_required: int = 2              # consecutive sub-floor reference reads ⇒ declare the panel dark
 
     # Thermal preheat (soak-into-calibration) -------------------------------
@@ -172,6 +174,13 @@ class MeasureLoopConfig:
     abnormal_reads: int = 16            # reads past ~2× the DIP target ⇒ FLAG for adjudication (never a silent cap)
     outlier_factor: float = 3.0         # a read >factor×σ from the patch median is a glitch ⇒ rejected, not averaged in
     outlier_floor_de: float = 0.5       # never reject within this ΔE of the median (a σ-independent floor)
+
+    plausible_luminance_floor_nits: float = 1.0
+    plausible_luminance_reference_floor_fraction: float = 0.04
+    plausible_luminance_low_expected_nits: float = 10.0
+    plausible_luminance_low_signal: float = 0.20
+    plausible_luminance_high_reference_fraction: float = 0.25
+    plausible_luminance_high_expected_factor: float = 4.0
 
     # Selective re-measure budget -------------------------------------------
     remeasure_cap: int = 256            # advisory threshold for appended re-measures; crossing it flags
@@ -417,6 +426,8 @@ class _Loop:
         self.warmup_reads = 0
         self.panel_dark = False                       # warm-up reference read ~no light (asleep/off)
         self.dark_reference_nits: Optional[float] = None
+        self.measurement_path_compromised = False
+        self.read_anomalies: list[dict[str, Any]] = []
         self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
 
     # -- low-level read ----------------------------------------------------
@@ -610,6 +621,114 @@ class _Loop:
             bit_depth=self.transfer.bit_depth,
         )
 
+    def _dark_floor_for(self, patch: MeasurePatch) -> float:
+        if self.cfg.dark_floor_nits <= 0:
+            return 0.0
+        expected = 0.0
+        try:
+            expected = self.transfer.cv_to_nits(max(patch.rgb))
+        except Exception:
+            expected = 0.0
+        dynamic = max(0.0, expected * max(0.0, self.cfg.dark_floor_fraction))
+        return max(self.cfg.dark_floor_nits, dynamic)
+
+    def _expected_patch_nits(self, patch: MeasurePatch) -> float:
+        try:
+            return max(self.transfer.cv_to_nits(c) for c in patch.rgb)
+        except Exception:
+            return 0.0
+
+    def _read_plausibility_anomaly(
+        self,
+        patch: MeasurePatch,
+        xyz: tuple[float, float, float],
+        *,
+        phase: str,
+        read_index: int,
+    ) -> Optional[dict[str, Any]]:
+        if patch.role != "measurement":
+            return None
+        measured = float(xyz[1])
+        expected = self._expected_patch_nits(patch)
+        reference = float(self.reference_xyz[1]) if self.reference_xyz else 0.0
+        signal_peak = max(patch.signal) if patch.signal else 0.0
+
+        low_expected_cut = max(
+            self.cfg.plausible_luminance_low_expected_nits,
+            reference * self.cfg.plausible_luminance_reference_floor_fraction,
+        )
+        high_for_low_cut = max(
+            self.cfg.plausible_luminance_low_expected_nits,
+            reference * self.cfg.plausible_luminance_high_reference_fraction,
+            expected * self.cfg.plausible_luminance_high_expected_factor
+            + self.cfg.plausible_luminance_floor_nits,
+        )
+        low_drive = (
+            expected <= low_expected_cut
+            or signal_peak <= self.cfg.plausible_luminance_low_signal
+        )
+        if low_drive and measured >= high_for_low_cut:
+            return {
+                "reason": "low_drive_high_luminance",
+                "measure_phase": phase,
+                "read_index": read_index,
+                "label": patch.label,
+                "rgb": list(patch.rgb),
+                "signal": [round(s, 6) for s in patch.signal],
+                "expected_nits": round(expected, 4),
+                "measured_nits": round(measured, 4),
+                "reference_nits": round(reference, 4),
+                "threshold_nits": round(high_for_low_cut, 4),
+            }
+
+        lit_cut = max(
+            self.cfg.plausible_luminance_low_expected_nits * 2.0,
+            reference * 0.5,
+        )
+        low_for_lit_cut = max(
+            self.cfg.plausible_luminance_floor_nits,
+            reference * self.cfg.plausible_luminance_reference_floor_fraction,
+            expected * 0.02,
+        )
+        if expected >= lit_cut and measured <= low_for_lit_cut:
+            return {
+                "reason": "lit_drive_low_luminance",
+                "measure_phase": phase,
+                "read_index": read_index,
+                "label": patch.label,
+                "rgb": list(patch.rgb),
+                "signal": [round(s, 6) for s in patch.signal],
+                "expected_nits": round(expected, 4),
+                "measured_nits": round(measured, 4),
+                "reference_nits": round(reference, 4),
+                "threshold_nits": round(low_for_lit_cut, 4),
+            }
+
+        return None
+
+    def _flag_read_plausibility_anomaly(self, anomaly: dict[str, Any]) -> None:
+        self.measurement_path_compromised = True
+        self.read_anomalies.append(anomaly)
+        self._emit_event(
+            "WARN",
+            "read_plausibility_anomaly",
+            **anomaly,
+            message=(
+                "meter reading is outside the plausible luminance envelope for the presented patch; "
+                "measurement path requires adjudication"
+            ),
+        )
+        if self.runlog is not None:
+            self.runlog.anomaly(
+                "measure",
+                kind="read_plausibility_anomaly",
+                **anomaly,
+                message=(
+                    "meter reading is outside the plausible luminance envelope for the presented patch; "
+                    "retry or correct the display/meter path before trusting this run"
+                ),
+            )
+
     def warm_up(self, *, phase: str = "warmup", existing_reference: bool = False) -> tuple[bool, int]:
         """Present the biased-neutral stimulus until ``settle_required``
         consecutive reads agree within ``settle_threshold``. Returns
@@ -648,14 +767,15 @@ class _Loop:
             # adopt it as the reference and don't let it count toward warm. After a couple of
             # sub-floor reads, declare the panel dark, flag it loudly, and stop — the caller
             # escalates instead of falsely settling and then metering a dark panel for minutes.
-            if cfg.dark_floor_nits > 0 and reading.xyz[1] < cfg.dark_floor_nits:
+            dark_floor = self._dark_floor_for(patch)
+            if dark_floor > 0 and reading.xyz[1] < dark_floor:
                 dark_reads += 1
                 self.dark_reference_nits = float(reading.xyz[1])
                 if dark_reads >= cfg.dark_required:
                     self.panel_dark = True
                     self._emit_event("WARN", "panel_dark",
                                      reference_nits=round(float(reading.xyz[1]), 4),
-                                     floor_nits=cfg.dark_floor_nits, reads=reads)
+                                     floor_nits=round(dark_floor, 4), reads=reads)
                     break
                 prev = None
                 consecutive = 0
@@ -871,6 +991,13 @@ class _Loop:
             )
             read_index += 1
             if r.xyz is not None:
+                anomaly = self._read_plausibility_anomaly(
+                    patch, r.xyz, phase=phase, read_index=read_index - 1
+                )
+                if anomaly is not None:
+                    self._flag_read_plausibility_anomaly(anomaly)
+                    unstable = True
+                    note = f"read plausibility anomaly: {anomaly['reason']}"
                 reads.append(r.xyz)
                 if r.yxy is not None:
                     yxys.append(r.yxy)
@@ -1270,6 +1397,7 @@ def run_measure_loop(
     )
 
     preheat_digest = loop.preheat()
+    preheat_compromised = bool(preheat_digest and preheat_digest.get("compromised"))
     loop.warm_up()
     if loop.panel_dark:
         # The panel is emitting ~no light (asleep/off/wrong input). Skip the main pass entirely —
@@ -1297,11 +1425,25 @@ def run_measure_loop(
 
     needs_adjudication = (
         loop.panel_dark
+        or preheat_compromised
+        or loop.measurement_path_compromised
         or (not loop.warm)
         or bool(unresolved_all)
         or loop.remeasure_budget_exceeded
         or loop.drift_density_exceeded
     )
+    anomaly_reasons = [
+        name for name, active in (
+            ("panel_dark", loop.panel_dark),
+            ("preheat_compromised", preheat_compromised),
+            ("measurement_path_compromised", loop.measurement_path_compromised),
+            ("not_warm", not loop.warm),
+            ("unresolved", bool(unresolved_all)),
+            ("remeasure_budget_exceeded", loop.remeasure_budget_exceeded),
+            ("drift_density_exceeded", loop.drift_density_exceeded),
+        )
+        if active
+    ]
     question = None
     if needs_adjudication:
         bits = []
@@ -1311,6 +1453,22 @@ def run_measure_loop(
                 f"panel appears DARK/asleep — the mid-grey reference read {ref:.2f} cd/m² "
                 f"(floor {cfg.dark_floor_nits}); no patches were measured (wake the panel / "
                 "check the input + that the patch window is showing, then retry)"
+            )
+        if preheat_compromised:
+            bits.append(
+                "preheat classified the display/meter path as COMPROMISED before measurement "
+                "(wrong colorspace/frozen patch/meter issue); measurement continued and this "
+                "data needs adjudication"
+            )
+        if loop.measurement_path_compromised:
+            anomaly = loop.read_anomalies[0] if loop.read_anomalies else {}
+            bits.append(
+                "a patch read was outside the plausible luminance envelope "
+                f"({anomaly.get('reason', 'read_plausibility_anomaly')} at "
+                f"{anomaly.get('label', 'unknown patch')}: measured "
+                f"{anomaly.get('measured_nits', 'n/a')} cd/m^2 vs expected "
+                f"{anomaly.get('expected_nits', 'n/a')} cd/m^2); measurement continued "
+                "and this data needs adjudication"
             )
         if not loop.warm and not loop.panel_dark:
             bits.append(
@@ -1345,6 +1503,9 @@ def run_measure_loop(
     digest = {
         "warm": loop.warm,
         "panel_dark": loop.panel_dark,
+        "preheat_compromised": preheat_compromised,
+        "measurement_path_compromised": loop.measurement_path_compromised,
+        "read_anomalies": loop.read_anomalies[:8],
         "dark_reference_nits": (round(loop.dark_reference_nits, 4)
                                 if loop.dark_reference_nits is not None else None),
         "warmup_reads": loop.warmup_reads,
@@ -1371,6 +1532,8 @@ def run_measure_loop(
         "white_nits": round(loop.white_xyz[1], 3) if loop.white_xyz else None,
         "preheat": preheat_digest,
         "needs_adjudication": needs_adjudication,
+        "read_anomaly": needs_adjudication,
+        "anomaly_reasons": anomaly_reasons,
     }
     if events is not None:
         events.write(

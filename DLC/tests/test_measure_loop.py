@@ -673,6 +673,91 @@ def test_dark_panel_is_detected_and_skips_the_main_pass(tmp_path: Path):
     assert res.digest["warmup_reads"] <= MeasureLoopConfig().dark_required + 1
 
 
+def test_hdr_midcode_one_nit_is_detected_as_dark_path(tmp_path: Path):
+    # Regression from the live HDR MHC run: a PQ mid-code warmup patch [~512,512,532]
+    # reading ~1 nit is not a dim-but-valid HDR panel. The guard must scale with the
+    # expected warmup luminance, not only the fixed 1 cd/m² floor.
+    t = Transfer.pq(bit_depth=10)
+
+    def barely_lit(patch):
+        return Reading(xyz=(1.0, 1.02, 1.0), yxy=(1.02, 0.33, 0.34), ok=True)
+
+    res = run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=barely_lit,
+                           config=MeasureLoopConfig(), ndjson_path=tmp_path / "m.ndjson")
+    assert res.digest["panel_dark"] is True
+    assert res.digest["read_anomaly"] is True
+    assert "panel_dark" in res.digest["anomaly_reasons"]
+    assert res.digest["dark_reference_nits"] == 1.02
+    assert res.patch_count == 0
+    assert res.needs_adjudication is True
+
+
+def test_compromised_preheat_surfaces_but_measurement_continues(tmp_path: Path):
+    t = _sdr()
+    # Frozen luminance/chroma across different soak patches is exactly what the thermal
+    # controller calls compromised: wrong colorspace, frozen presenter, or meter issue.
+    panel = _ScriptedPanel([(5.0, 5.0, 5.0)] * 64)
+    res = run_measure_loop(
+        patches=_grey_ramp(t, 8), transfer=t, measure=panel,
+        config=MeasureLoopConfig(preheat="always"),
+        ndjson_path=tmp_path / "m.ndjson",
+    )
+    assert res.digest["preheat_compromised"] is True
+    assert res.digest["read_anomaly"] is True
+    assert "preheat_compromised" in res.digest["anomaly_reasons"]
+    assert res.digest["needs_adjudication"] is True
+    assert res.patch_count == 8
+    assert "COMPROMISED" in (res.question or "")
+    assert "measurement continued" in (res.question or "")
+
+
+def test_low_drive_patch_reading_bright_flags_measurement_path(tmp_path: Path):
+    t = _sdr()
+
+    def incoherent(patch):
+        if patch.role == "warmup":
+            return Reading(xyz=(25.0, 26.0, 27.0), yxy=(26.0, 0.31, 0.33), ok=True)
+        return Reading(xyz=(19.0, 20.0, 21.0), yxy=(20.0, 0.31, 0.33), ok=True)
+
+    ti3 = tmp_path / "m.ti3"
+    res = run_measure_loop(
+        patches=_grey_ramp(t, 8),
+        transfer=t,
+        measure=incoherent,
+        config=MeasureLoopConfig(),
+        ti3_path=ti3,
+        ndjson_path=tmp_path / "m.ndjson",
+    )
+    assert res.digest["measurement_path_compromised"] is True
+    assert res.digest["read_anomaly"] is True
+    assert "measurement_path_compromised" in res.digest["anomaly_reasons"]
+    assert res.digest["read_anomalies"][0]["reason"] == "low_drive_high_luminance"
+    assert res.patch_count == 8
+    assert ti3.exists()
+    assert "plausible luminance envelope" in (res.question or "")
+
+
+def test_lit_patch_reading_dark_flags_measurement_path(tmp_path: Path):
+    t = _sdr()
+
+    def incoherent(patch):
+        if patch.role == "warmup":
+            return Reading(xyz=(25.0, 26.0, 27.0), yxy=(26.0, 0.31, 0.33), ok=True)
+        return Reading(xyz=(0.2, 0.5, 0.3), yxy=(0.5, 0.31, 0.33), ok=True)
+
+    res = run_measure_loop(
+        patches=[(t.max_cv, t.max_cv, t.max_cv)],
+        transfer=t,
+        measure=incoherent,
+        config=MeasureLoopConfig(),
+        ndjson_path=tmp_path / "m.ndjson",
+    )
+    assert res.digest["measurement_path_compromised"] is True
+    assert res.digest["read_anomalies"][0]["reason"] == "lit_drive_low_luminance"
+    assert res.patch_count == 1
+    assert res.needs_adjudication is True
+
+
 def test_a_dim_but_lit_panel_is_not_flagged_dark(tmp_path: Path):
     # No false positives: a real (if dim) mid-grey reads far above the 1 cd/m² floor.
     t = _sdr()

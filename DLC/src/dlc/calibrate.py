@@ -131,6 +131,7 @@ SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/me
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
 SEAM_CHECKIN = "timed_checkin"     # §12 timed check-in: "status — continue?" (gates live, pings auto/supervised)
+SEAM_HARDWARE_READY = "hardware_readiness"  # one live gate before the first meter/presenter read
 
 # The benign, happy-path choice at a seam — the recommendation a clean run carries. A
 # recommendation OUTSIDE this set means the deterministic core wants to stop/redo something,
@@ -143,7 +144,7 @@ _BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "d
 # recommendation on a FAILED verify must still escalate (the recommendation alone is benign, so
 # without this flag SupervisedAdjudicator would silently apply a sub-quality calibration).
 _SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "critical",
-                   "compromised", "gate_failed")
+                   "compromised", "gate_failed", "read_anomaly", "score_anomaly")
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +463,7 @@ class Calibration:
         pause_handler: Optional[Callable[[Mapping[str, Any]], None]] = None,
         enable_watchdog: bool = False,
         checkin_interval_s: float = 600.0,
+        require_hardware_readiness: bool = False,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -497,6 +499,7 @@ class Calibration:
         # injectable seam keeps tests/sim from spawning a real process.
         self._probe_launcher = probe_launcher or self._default_launch_ccxxmake
         self._pause_handler = pause_handler
+        self.require_hardware_readiness = require_hardware_readiness
 
         self._state = _common.load_dlc_state(ctx)
         self.calib: dict[str, Any] = self._state.setdefault("calib", {})
@@ -1943,6 +1946,35 @@ class Calibration:
                          else "aborted on out-of-range white luminance"))
         return outcome
 
+    def stage_hardware_readiness(self) -> StageOutcome:
+        """One operator/LLM gate before the first live meter read."""
+        key = "hardware-readiness"
+        if not self.require_hardware_readiness:
+            return StageOutcome(key, "done", digest={"required": False})
+
+        def run() -> StageOutcome:
+            decision = self.adjudicate(AdjudicationRequest(
+                key=f"{key}:confirm", seam=SEAM_HARDWARE_READY, stage=key,
+                question=(
+                    "Before the first meter read: is the meter aimed at the patch area, "
+                    "is DogeGen visible/foregrounded on the target display, and are there "
+                    "no windows or overlays covering the sensor? Choose ready to begin, "
+                    "or abort to fix the setup."
+                ),
+                options=("ready", "abort"), recommendation="ready",
+                digest={"required": True, "monitor": self.monitor, "mode": self.mode,
+                        "bit_depth": self.bit_depth, "dogegen_required": True}))
+            if decision.choice == "abort":
+                raise CalibrationAborted(StageOutcome(
+                    key, "aborted",
+                    digest={"message": "hardware readiness aborted by operator/LLM",
+                            "decision_note": decision.note}))
+            return StageOutcome(key, "done",
+                                digest={"required": True, "confirmed": True,
+                                        "decision_note": decision.note})
+
+        return self._stage(key, run)
+
     def stage_measure(self, *, role: str, patches: Sequence[tuple[int, int, int]],
                       ti3_name: str, ndjson_name: str) -> StageOutcome:
         key = f"measure:{role}"
@@ -1982,8 +2014,25 @@ class Calibration:
         # dashboard's ΔE panel + de_history show the run converging (native → after ICC → after
         # 3D LUT) instead of a single verify point. verify does its own richer scoring at the gate.
         if role in ("raw", "post-mhc") and outcome.status == "done":
-            self._score_stage(role, outcome.data.get("ti3"),
-                              label="raw (native)" if role == "raw" else "after ICC")
+            score_anomaly = self._score_stage(
+                role, outcome.data.get("ti3"),
+                label="raw (native)" if role == "raw" else "after ICC")
+            if score_anomaly:
+                outcome.digest["score_anomaly"] = True
+                outcome.digest["score_anomaly_detail"] = score_anomaly
+                outcome.digest["read_anomaly"] = True
+                reasons = list(outcome.digest.get("anomaly_reasons") or [])
+                if "score_anomaly" not in reasons:
+                    reasons.append("score_anomaly")
+                outcome.digest["anomaly_reasons"] = reasons
+                outcome.data["needs_adjudication"] = True
+                base_q = outcome.data.get("question")
+                score_q = (
+                    f"measured patch set has catastrophic {score_anomaly['metric']} errors "
+                    f"(avg {score_anomaly['avg_de2000']}, p95 {score_anomaly['p95_de2000']}, "
+                    f"max {score_anomaly['max_de2000']}); data needs adjudication"
+                )
+                outcome.data["question"] = f"{score_q}; {base_q}" if base_q else score_q
         if outcome.data.get("needs_adjudication"):
             panel_dark = bool(outcome.digest.get("panel_dark"))
             if panel_dark:
@@ -1993,23 +2042,40 @@ class Calibration:
                     key, panel_dark=True, reference_nits=outcome.digest.get("dark_reference_nits"),
                     message=("panel appears dark/asleep — mid-grey reference read "
                              f"{outcome.digest.get('dark_reference_nits')} cd/m²; no patches measured"))
-            # A dark panel or a blown remeasure/drift budget is non-benign: recommend retry (not
-            # accept), offer it, and flag compromised so SupervisedAdjudicator escalates rather
-            # than rubber-stamping black/garbage data.
+            preheat_compromised = bool(outcome.digest.get("preheat_compromised"))
+            measurement_path_compromised = bool(outcome.digest.get("measurement_path_compromised"))
+            score_anomaly = bool(outcome.digest.get("score_anomaly"))
+            # A dark panel, compromised preheat, or a blown remeasure/drift budget is non-benign:
+            # recommend retry (not accept), offer it, and flag compromised so SupervisedAdjudicator
+            # escalates rather than rubber-stamping black/garbage data.
             retry_recommended = bool(outcome.digest.get("remeasure_budget_exceeded")
                                      or outcome.digest.get("drift_density_exceeded")
-                                     or panel_dark)
+                                     or panel_dark
+                                     or preheat_compromised
+                                     or measurement_path_compromised)
+            options = (("accept", "suppress", "remeasure", "retry", "abort")
+                       if (retry_recommended or score_anomaly) else ("accept", "suppress", "abort"))
             decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:escalation", seam=SEAM_MEASURE, stage=key,
                 question=outcome.data.get("question") or "measurement did not fully settle - accept or retry?",
-                options=(("accept", "retry", "abort") if retry_recommended else ("accept", "abort")),
+                options=options,
                 recommendation=("retry" if retry_recommended else "accept"),
-                digest={**outcome.digest, "compromised": panel_dark}))
+                digest={**outcome.digest,
+                        "compromised": (panel_dark or preheat_compromised
+                                        or measurement_path_compromised
+                                        or score_anomaly)}))
+            if decision.choice == "remeasure":
+                self.calib["stages"].pop(key, None)
+                self.calib.get("decisions", {}).pop(f"{key}:escalation", None)
+                self.decision_overrides.pop(f"{key}:escalation", None)
+                self._save()
+                return self.stage_measure(role=role, patches=patches,
+                                          ti3_name=ti3_name, ndjson_name=ndjson_name)
             if decision.choice == "retry":
                 raise CalibrationAborted(StageOutcome(
                     key, "aborted",
-                    digest={"message": "measurement retry requested at LLM seam",
-                            "retry_requested": True, **outcome.digest}))
+                            digest={"message": "measurement retry requested at LLM seam",
+                                    "retry_requested": True, **outcome.digest}))
             self._abort_if(decision, stage=key, message="aborted on unsettled measurement")
         return outcome
 
@@ -2049,20 +2115,20 @@ class Calibration:
             "baseline_distance": baseline_distance,
         }
 
-    def _score_stage(self, role: str, ti3_path: Optional[str], *, label: str) -> None:
+    def _score_stage(self, role: str, ti3_path: Optional[str], *, label: str) -> Optional[dict[str, Any]]:
         """Score an intermediate measure stage against the resolved target and put a
         ``metrics_scored`` digest on the spine — so the dashboard's ΔE panel + de_history show
         the calibration converging stage by stage (a single verify point was uninformative).
         Advisory: a missing/empty TI3 or any scoring hiccup is swallowed, never breaks the flow."""
         if not ti3_path:
-            return
+            return None
         try:
             p = Path(ti3_path)
             if not p.exists():
-                return
+                return None
             samples = parse_ti3(p)
             if not samples:
-                return
+                return None
             spec = self._spec()
             wx, wy = self._white_xy()
             # HDR scores dE_ITP vs PQ/Rec.2020; SDR CIEDE2000 vs γ-power. Scoring HDR PQ data
@@ -2078,6 +2144,8 @@ class Calibration:
             summary = summarize_metrics(phase=label, iteration=0, source=p,
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             colour_de = [m.de2000 for m in metrics if not m.grayscale]
+            all_de = [m.de2000 for m in metrics]
+            p99 = percentile(all_de, 99.0)
             # Snapshot for the timed check-in's live metrics (most recent intermediate score).
             self._last_scored = {"label": label, "metric": metric_name,
                                  "avg": round(summary.avg_de2000, 3), "max": round(summary.max_de2000, 3),
@@ -2085,13 +2153,53 @@ class Calibration:
             self.runlog.metrics_scored(
                 f"measure:{role}", label=label, iteration=0, metric=metric_name,
                 avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
-                p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
+                p99_de2000=round(p99, 3),
                 max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
                 grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
                 colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
                 patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
+            worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
+            high_spikes = [m for m in metrics if m.de2000 >= 100.0]
+            high_fraction = len(high_spikes) / len(metrics) if metrics else 0.0
+            catastrophic_distribution = (
+                bool(high_spikes)
+                and (summary.avg_de2000 >= 100.0 or high_fraction >= 0.25)
+            )
+            patch_spike = bool(high_spikes) and not catastrophic_distribution
+            if catastrophic_distribution or patch_spike:
+                reason = "catastrophic_delta_e_distribution"
+                if patch_spike:
+                    reason = ("single_patch_delta_e_spike" if len(high_spikes) == 1
+                              else "localized_patch_delta_e_spike")
+                anomaly = {
+                    "reason": reason,
+                    "role": role,
+                    "label": label,
+                    "metric": metric_name,
+                    "avg_de2000": round(summary.avg_de2000, 3),
+                    "p95_de2000": round(summary.p95_de2000, 3),
+                    "p99_de2000": round(p99, 3),
+                    "max_de2000": round(summary.max_de2000, 3),
+                    "white_de2000": round(summary.white_de2000, 3),
+                    "high_spike_count": len(high_spikes),
+                    "high_spike_fraction": round(high_fraction, 4),
+                    "patch_count": summary.patch_count,
+                    "worst": [{"rgb": [round(c, 4) for c in m.rgb],
+                               "de2000": round(m.de2000, 3)} for m in worst],
+                }
+                self.runlog.anomaly(
+                    f"measure:{role}",
+                    kind="score_anomaly",
+                    **anomaly,
+                    message=(
+                        "measured patch set is catastrophically far from the target; "
+                        "the measurement path requires adjudication"
+                    ),
+                )
+                return anomaly
+            return None
         except Exception:  # noqa: BLE001 - advisory telemetry; a scoring hiccup never breaks the flow
-            pass
+            return None
 
     def stage_build_install_mhc(self, raw_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
@@ -2807,6 +2915,7 @@ class Calibration:
         self.stage_resolve_target()
         self.stage_whitepoint()
         self.stage_enter_neutral()
+        self.stage_hardware_readiness()
         self.stage_brightness()
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
@@ -2837,6 +2946,7 @@ class Calibration:
         self.stage_resolve_target()
         self.stage_whitepoint()
         self.stage_enter_neutral()
+        self.stage_hardware_readiness()
         self.stage_brightness()
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
@@ -2852,6 +2962,7 @@ class Calibration:
         self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=False)
         self._capture_inplace_baseline()   # rollback point before set_3dlut mutates the live cube
+        self.stage_hardware_readiness()
         self.stage_adaptive_planning(raw_ti3=None)   # opt-in LLM investigation seam (no raw ramp here)
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
@@ -2867,6 +2978,7 @@ class Calibration:
         self.stage_whitepoint()
         self._require_stack(need_mhc=True, need_lut=True)
         self._capture_inplace_baseline()   # record the restorable cube before the GS+WB tweak mutates the MHC
+        self.stage_hardware_readiness()
         self.stage_brightness()
         gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
                                 ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
@@ -2936,6 +3048,7 @@ class Calibration:
                     "dip_store": str(self._dip_store().path)})),
             stage="characterize", message="characterization vetoed by the operator")
         self.stage_clear_native()      # measure the NATIVE panel (no corrections in the path)
+        self.stage_hardware_readiness()
         try:
             outcome = self.stage_characterize()
         except CalibrationAborted:
@@ -3361,6 +3474,7 @@ def run_calibration(
     patch_sizes: Optional[PatchSizes] = None,
     force: bool = False,
     adaptive_planning: bool = False,
+    require_hardware_readiness: bool = False,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -3372,7 +3486,8 @@ def run_calibration(
         measure=measure, adjudicator=adjudicator or AutoAdjudicator(), probe=probe,
         bit_depth=bit_depth, loop_config=loop_config, optimize_config=optimize_config,
         patch_sizes=patch_sizes, run_date=run_date, force=force,
-        adaptive_planning=adaptive_planning)
+        adaptive_planning=adaptive_planning,
+        require_hardware_readiness=require_hardware_readiness)
     return calib.run(flow)
 
 
@@ -3771,7 +3886,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         characterize_config=characterize_config, decision_overrides=overrides,
                         skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,
-                        enable_watchdog=True, checkin_interval_s=args.checkin_interval)
+                        enable_watchdog=True, checkin_interval_s=args.checkin_interval,
+                        require_hardware_readiness=True)
     result = None
     paused = False
     try:
