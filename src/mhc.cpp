@@ -50,18 +50,23 @@ float PqOETF(float L) {
 // SECTION: Grayscale Evaluation
 // ============================================================================
 
+static int EffectiveGrayscalePointCount(const GrayscaleData& gs) {
+    return std::clamp(gs.pointCount, 2, 32);
+}
+
 // Evaluate SDR grayscale correction (matches shader's ApplyGrayscaleCorrectionLinear)
 // Input/output are linear light values (0-1)
 float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
     if (Y_linear <= 0.0f) return 0.0f;
 
-    float idx = sqrtf(std::clamp(Y_linear, 0.0f, 1.0f)) * (float)(gs.pointCount - 1);
+    int pc = EffectiveGrayscalePointCount(gs);
+    float idx = sqrtf(std::clamp(Y_linear, 0.0f, 1.0f)) * (float)(pc - 1);
     int i0 = (int)floorf(idx);
-    int i1 = (std::min)(i0 + 1, gs.pointCount - 1);
+    int i1 = (std::min)(i0 + 1, pc - 1);
     float t = idx - floorf(idx);
 
-    float v0 = (i0 < 32) ? gs.points[i0] : 0.0f;
-    float v1 = (i1 < 32) ? gs.points[i1] : 0.0f;
+    float v0 = gs.points[i0];
+    float v1 = gs.points[i1];
 
     // Interpolate in sqrt domain (matches shader)
     float s0 = sqrtf((std::max)(v0, 0.0f));
@@ -75,22 +80,23 @@ float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
 float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak) {
     if (pqValue <= 0.0f || pqPeak <= 0.0f) return pqValue;
 
+    int pc = EffectiveGrayscalePointCount(gs);
     float scaledI = pqValue / pqPeak;
     if (scaledI <= 1.0f) {
-        float idx = scaledI * (float)(gs.pointCount - 1);
+        float idx = scaledI * (float)(pc - 1);
         int i0 = (int)floorf(idx);
-        int i1 = (std::min)(i0 + 1, gs.pointCount - 1);
+        int i1 = (std::min)(i0 + 1, pc - 1);
         float t = idx - floorf(idx);
 
-        float v0 = (i0 < 32) ? gs.points[i0] : 0.0f;
-        float v1 = (i1 < 32) ? gs.points[i1] : 0.0f;
+        float v0 = gs.points[i0];
+        float v1 = gs.points[i1];
 
         float corrected = v0 + (v1 - v0) * t;
         return corrected * pqPeak;
     } else {
         // Above peak: apply last point's correction factor
-        int lastIdx = gs.pointCount - 1;
-        float lastVal = (lastIdx < 32) ? gs.points[lastIdx] : 1.0f;
+        int lastIdx = pc - 1;
+        float lastVal = gs.points[lastIdx];
         return lastVal * pqValue;
     }
 }
@@ -100,13 +106,14 @@ float EvalGrayscaleSDR_Channel(float Y_linear, const GrayscaleData& gs, int chan
     if (Y_linear <= 0.0f) return 0.0f;
 
     const float* pts = (channel == 0) ? gs.pointsR : (channel == 1) ? gs.pointsG : gs.pointsB;
-    float idx = sqrtf(std::clamp(Y_linear, 0.0f, 1.0f)) * (float)(gs.pointCount - 1);
+    int pc = EffectiveGrayscalePointCount(gs);
+    float idx = sqrtf(std::clamp(Y_linear, 0.0f, 1.0f)) * (float)(pc - 1);
     int i0 = (int)floorf(idx);
-    int i1 = (std::min)(i0 + 1, gs.pointCount - 1);
+    int i1 = (std::min)(i0 + 1, pc - 1);
     float t = idx - floorf(idx);
 
-    float v0 = (i0 < 32) ? pts[i0] : 0.0f;
-    float v1 = (i1 < 32) ? pts[i1] : 0.0f;
+    float v0 = pts[i0];
+    float v1 = pts[i1];
 
     float s0 = sqrtf((std::max)(v0, 0.0f));
     float s1 = sqrtf((std::max)(v1, 0.0f));
@@ -118,21 +125,22 @@ float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqP
     if (pqValue <= 0.0f || pqPeak <= 0.0f) return pqValue;
 
     const float* pts = (channel == 0) ? gs.pointsR : (channel == 1) ? gs.pointsG : gs.pointsB;
+    int pc = EffectiveGrayscalePointCount(gs);
     float scaledI = pqValue / pqPeak;
     if (scaledI <= 1.0f) {
-        float idx = scaledI * (float)(gs.pointCount - 1);
+        float idx = scaledI * (float)(pc - 1);
         int i0 = (int)floorf(idx);
-        int i1 = (std::min)(i0 + 1, gs.pointCount - 1);
+        int i1 = (std::min)(i0 + 1, pc - 1);
         float t = idx - floorf(idx);
 
-        float v0 = (i0 < 32) ? pts[i0] : 0.0f;
-        float v1 = (i1 < 32) ? pts[i1] : 0.0f;
+        float v0 = pts[i0];
+        float v1 = pts[i1];
 
         float corrected = v0 + (v1 - v0) * t;
         return corrected * pqPeak;
     } else {
-        int lastIdx = gs.pointCount - 1;
-        float lastVal = (lastIdx < 32) ? pts[lastIdx] : 1.0f;
+        int lastIdx = pc - 1;
+        float lastVal = pts[lastIdx];
         return lastVal * pqValue;
     }
 }

@@ -19,7 +19,8 @@ Protocol (read straight from dogegen ``main.cpp`` ``StartResolve``):
     setting. Attribute order matters: ``getAttr`` takes the first ``name="`` match, so the
     standalone ``x``/``y`` must precede ``cx``/``cy`` (otherwise ``x`` matches inside ``cx``).
 
-The window still needs borderless-fullscreen for bit-accurate 10-bit/HDR — that is handled
+The window still needs borderless-fullscreen for HDR (to avoid mini-LED local-dimming
+contamination of a windowed patch; HDR composites in FP16, so bit depth is already preserved) — that is handled
 exactly as on the stdin path, via :func:`dlc.dogegen_window.place_dogegen` on ``proc.pid`` once
 the first pattern has switched dogegen into the right bit depth.
 """

@@ -17,7 +17,6 @@ from dlc.stages.simulate import _DEFAULTS
 # The ramp structure build_mhc accepts (grays + per-channel ramps + CMY), as in
 # simulation.write_synthetic_ti3 — but measured by the PQ panel instead of an sRGB one.
 _RGB_ROWS = [
-    (0.0, 0.0, 0.0), (0.25, 0.25, 0.25), (0.5, 0.5, 0.5), (0.75, 0.75, 0.75), (1.0, 1.0, 1.0),
     (0.25, 0.0, 0.0), (0.5, 0.0, 0.0), (0.75, 0.0, 0.0), (1.0, 0.0, 0.0),
     (0.0, 0.25, 0.0), (0.0, 0.5, 0.0), (0.0, 0.75, 0.0), (0.0, 1.0, 0.0),
     (0.0, 0.0, 0.25), (0.0, 0.0, 0.5), (0.0, 0.0, 0.75), (0.0, 0.0, 1.0),
@@ -25,13 +24,14 @@ _RGB_ROWS = [
 ]
 
 
-def _write_hdr_raw_ti3(path: Path) -> Path:
+def _write_hdr_raw_ti3(path: Path, *, gray_steps: int = 5) -> Path:
     transfer = Transfer.pq(bit_depth=10)
     panel = SyntheticPanel(transfer=transfer, start_temp=1.0, cold_blue_gain=1.0,
                            native_white_nits=1840.0)  # perfect Rec.2020/PQ panel
     max_cv = transfer.max_cv
     rows = []
-    for s in _RGB_ROWS:
+    gray = [(i / (gray_steps - 1),) * 3 for i in range(gray_steps)]
+    for s in [*gray, *_RGB_ROWS]:
         rgb = tuple(round(c * max_cv) for c in s)
         x, y, z = panel(MeasurePatch(label="p", rgb=rgb, signal=s, bit_depth=10)).xyz
         rows.append(f"{s[0] * 100:.6f} {s[1] * 100:.6f} {s[2] * 100:.6f} {x:.6f} {y:.6f} {z:.6f}")
@@ -57,6 +57,9 @@ def test_hdr_build_mhc_leaves_base_grayscale_identity(tmp_path):
 
     # The base grayscale is identity (every per-channel deviation ~1.0) — the cube owns tone.
     base = _common.load_dlc_state(ctx)["mhc_params"]["base_grayscale"]
+    assert base["point_count"] == 32
+    assert base["points"][0] == 0.0 and base["points"][-1] == 1.0
+    assert all(a < b for a, b in zip(base["points"], base["points"][1:]))
     for ch in ("r", "g", "b"):
         assert all(abs(d - 1.0) < 1e-9 for d in base["deviations"][ch]), (ch, base["deviations"][ch])
 
@@ -65,6 +68,19 @@ def test_hdr_build_mhc_leaves_base_grayscale_identity(tmp_path):
     # The matrix still carries the measured native primaries (~Rec.2020) + a D65 white.
     mp = result.metrics["measured_primaries"]
     assert abs(mp["rx"] - 0.708) < 0.02 and abs(mp["gy"] - 0.797) < 0.02
+
+
+def test_hdr_build_mhc_adapts_dense_raw_gray_to_desktoplut_mhc_shape(tmp_path):
+    ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
+    ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr_dense.ti3", gray_steps=40)
+
+    result = build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3)), ctx)
+    assert result.status == "ran"
+
+    base = _common.load_dlc_state(ctx)["mhc_params"]["base_grayscale"]
+    assert base["point_count"] == 32
+    assert base["points"][0] == 0.0 and base["points"][-1] == 1.0
+    assert len(base["deviations"]["r"]) == 32
 
 
 def test_sdr_build_mhc_still_derives_a_real_base_grayscale(tmp_path):

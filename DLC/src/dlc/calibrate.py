@@ -532,7 +532,10 @@ class Calibration:
                 # curve from these. Defensive: the spec may not resolve yet at first emit.
                 spec = self._spec()
                 data["gamma"] = spec.gamma
-                data["luminance"] = spec.luminance_nits
+                data["luminance"] = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
+                data["is_hdr"] = spec.is_hdr
+                data["colorspace"] = spec.colorspace
+                data["transfer"] = "pq" if spec.is_hdr else "power"
             except Exception:  # noqa: BLE001 - advisory chart metadata, never blocks
                 pass
         white = self.calib.get("white")
@@ -1743,6 +1746,10 @@ class Calibration:
                                 artifacts=[p for p in (res.ti3_path, res.ndjson_path) if p])
 
         outcome = self._stage(key, run)
+        guard = self._measurement_foundation_guard(role, outcome)
+        if guard is not None:
+            self.runlog.anomaly(key, **guard.digest)
+            raise CalibrationAborted(guard)
         # Before→after dE trend on the spine (#8): score the INTERMEDIATE measures so the
         # dashboard's ΔE panel + de_history show the run converging (native → after ICC → after
         # 3D LUT) instead of a single verify point. verify does its own richer scoring at the gate.
@@ -1765,6 +1772,60 @@ class Calibration:
                             "retry_requested": True, **outcome.digest}))
             self._abort_if(decision, stage=key, message="aborted on unsettled measurement")
         return outcome
+
+    def _measurement_foundation_guard(self, role: str, outcome: StageOutcome) -> Optional[StageOutcome]:
+        """Catch a collapsed correction foundation before the long 3D-LUT build.
+
+        After any foundation install, the measured bright neutral must remain in the same
+        luminance envelope as raw/brightness/target. If it does not, downstream 3D-LUT work is
+        optimizing on top of a broken hardware/profile state and should stop immediately.
+        """
+        if role != "post-mhc" or outcome.status != "done":
+            return None
+        digest = outcome.digest or {}
+        white = _as_float_local(digest.get("white_nits"))
+        if white is None or white <= 0:
+            return None
+        refs: list[float] = []
+        for stage_key in ("measure:raw", "brightness"):
+            d = ((self.calib["stages"].get(stage_key) or {}).get("digest") or {})
+            ref = _as_float_local(d.get("white_nits"))
+            if ref and ref > 0:
+                refs.append(ref)
+        try:
+            spec = self._spec()
+            target = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
+            if target and target > 0:
+                refs.append(float(target))
+        except Exception:  # noqa: BLE001 - advisory guard reference only
+            pass
+        if not refs:
+            return None
+        ref = max(refs)
+        ratio = white / ref if ref > 0 else 1.0
+        preheat = digest.get("preheat") or {}
+        compromised = bool(preheat.get("compromised"))
+        baseline_distance = _as_float_local(preheat.get("baseline_distance")) or 0.0
+        critical = ratio < 0.55 or (compromised and ratio < 0.75) or (compromised and baseline_distance >= 0.08)
+        if not critical:
+            return None
+        message = (
+            f"post-foundation white collapsed to {white:.1f} nits ({ratio:.2f}x of "
+            f"{ref:.1f} nits reference); aborting before 3D-LUT build"
+        )
+        return StageOutcome(
+            "measure:post-mhc", "aborted",
+            digest={
+                "message": message,
+                "white_nits": round(white, 3),
+                "reference_white_nits": round(ref, 3),
+                "white_ratio": round(ratio, 4),
+                "preheat_compromised": compromised,
+                "baseline_distance": baseline_distance,
+                "recommendation": "abort_and_recheck_foundation",
+            },
+            data={"needs_adjudication": True, "guard": "foundation_white_collapse"},
+        )
 
     def _score_stage(self, role: str, ti3_path: Optional[str], *, label: str) -> None:
         """Score an intermediate measure stage against the resolved target and put a
@@ -1845,10 +1906,74 @@ class Calibration:
                       "measured_white": params.get("measured_white"),
                       "white_de_vs_d65": derive.metrics.get("measured_white_de2000_vs_d65"),
                       "profile_name": profile_name, "verified": verify_ok}
+            sanity = self._mhc_foundation_sanity_check()
+            if sanity:
+                digest["sanity"] = sanity
+                if sanity.get("critical"):
+                    raise CalibrationAborted(StageOutcome(
+                        "build-install-mhc", "aborted",
+                        digest={**digest, "message": sanity.get("message"),
+                                "recommendation": "abort_and_recheck_mhc"}))
             return StageOutcome("build-install-mhc", "done", digest=digest,
                                 data={"profile_name": profile_name, "verified": verify_ok})
 
         return self._stage("build-install-mhc", run)
+
+    def _mhc_foundation_sanity_check(self) -> dict[str, Any]:
+        """Immediately read a bright neutral after MHC apply.
+
+        This is a cheap invariant check before the dense post-MHC measurement: applying a
+        foundation profile must not collapse the display's bright-neutral luminance.
+        """
+        transfer = self._transfer()
+        cv = self._patch_max_cv() or transfer.max_cv
+        signal = cv / transfer.max_cv if transfer.max_cv else 1.0
+        patch = MeasurePatch(label="post-mhc-white-sanity", rgb=(cv, cv, cv),
+                             signal=(signal, signal, signal), role="neutral_ref",
+                             bit_depth=transfer.bit_depth)
+        try:
+            reading = self.measure(patch)
+        except Exception as exc:  # noqa: BLE001
+            return {"checked": False, "error": f"{type(exc).__name__}: {exc}"}
+        ok = bool(reading.ok and reading.xyz is not None)
+        self.runlog.patch_read(
+            "build-install-mhc", seq=-1, role="neutral_ref", label=patch.label,
+            rgb=list(patch.rgb), signal=[round(signal, 5)] * 3,
+            Y=(round(reading.xyz[1], 4) if ok else None),
+            xy=_reading_xy(reading), ok=ok, disposition="foundation_sanity")
+        if not ok:
+            return {"checked": True, "ok": False, "critical": True,
+                    "message": f"MHC sanity read failed: {reading.error or 'no XYZ reading'}"}
+        nits = float(reading.xyz[1])
+        refs = self._foundation_reference_nits()
+        if not refs:
+            return {"checked": True, "ok": True, "white_nits": round(nits, 3)}
+        ref = max(refs)
+        ratio = nits / ref if ref > 0 else 1.0
+        critical = ratio < 0.55
+        message = (
+            f"MHC sanity white collapsed to {nits:.1f} nits ({ratio:.2f}x of "
+            f"{ref:.1f} nits reference)"
+        ) if critical else None
+        return {"checked": True, "ok": True, "white_nits": round(nits, 3),
+                "reference_white_nits": round(ref, 3), "white_ratio": round(ratio, 4),
+                "critical": critical, "message": message}
+
+    def _foundation_reference_nits(self) -> list[float]:
+        refs: list[float] = []
+        for stage_key in ("measure:raw", "brightness"):
+            d = ((self.calib["stages"].get(stage_key) or {}).get("digest") or {})
+            ref = _as_float_local(d.get("white_nits"))
+            if ref and ref > 0:
+                refs.append(ref)
+        try:
+            spec = self._spec()
+            target = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
+            if target and target > 0:
+                refs.append(float(target))
+        except Exception:  # noqa: BLE001
+            pass
+        return refs
 
     def stage_adaptive_planning(self, *, raw_ti3: Optional[str]) -> None:
         """The **opt-in LLM patch-strategy investigation seam** (#47/#49), post-ICC.
@@ -1947,14 +2072,37 @@ class Calibration:
 
         outcome = self._stage("build-install-3dlut", run)
         if outcome.data.get("needs_adjudication"):
+            severe = self._severe_optimizer_floor(outcome)
+            recommendation = "abort" if severe else "accept"
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="build-install-3dlut:floor", seam=SEAM_OPTIMIZE, stage="build-install-3dlut",
                 question=outcome.data.get("question") or "the correction machine hit a floor — accept or loosen?",
-                options=("accept", "loosen_target", "abort"), recommendation="accept",
-                digest={k: outcome.digest.get(k) for k in
-                        ("best_max_de", "above_threshold", "physical_floor", "budget_limited", "converged")})),
+                options=("accept", "loosen_target", "abort"), recommendation=recommendation,
+                digest={**{k: outcome.digest.get(k) for k in
+                           ("best_max_de", "best_mean_de", "above_threshold", "physical_floor",
+                            "budget_limited", "converged", "probe_total")},
+                        "severe_floor": severe,
+                        "recommendation": recommendation})),
                 stage="build-install-3dlut", message="aborted at the 3D-LUT correction floor")
         return outcome
+
+    def _severe_optimizer_floor(self, outcome: StageOutcome) -> bool:
+        d = outcome.digest or {}
+        if d.get("converged") is True:
+            return False
+        total = _as_float_local(d.get("probe_total") or d.get("best_probed_patches"))
+        floor = _as_float_local(d.get("physical_floor")) or 0.0
+        budget = _as_float_local(d.get("budget_limited")) or 0.0
+        mean_de = _as_float_local(d.get("best_mean_de")) or 0.0
+        max_de = _as_float_local(d.get("best_max_de")) or 0.0
+        floor_frac = (floor / total) if total else 0.0
+        budget_frac = (budget / total) if total else 0.0
+        # Floor points and even large model residuals can be harmless if the generated cube
+        # later verifies cleanly. Auto-abort only when a large share of probes still need more
+        # correction than the budget can express; that is an in-flight invariant violation.
+        if self._spec().is_hdr:
+            return budget_frac >= 0.20 and mean_de >= 30.0
+        return budget_frac >= 0.20 and mean_de >= 20.0
 
     def stage_gswb_tweak(self, neutral_ti3: str) -> StageOutcome:
         """The small FINAL GS+WB tweak, authored AFTER the 3D LUT (§4). Computes a
@@ -2086,6 +2234,7 @@ class Calibration:
         outcome = self._stage("verify", run)
         d = outcome.digest
         within = outcome.data.get("within_quality")
+        severe = self._severe_verify_failure(outcome)
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
             question=(f"The new calibration reads avg {d.get('metric', 'ΔE')} {d.get('avg_de2000')} "
@@ -2093,9 +2242,21 @@ class Calibration:
                       f"{'within' if within else 'outside'} the quality targets. "
                       "Apply this calibration, or revert to the previous display setup?"),
             options=("apply", "revert"),
-            recommendation="apply",
-            digest=outcome.digest))
+            recommendation=("revert" if severe else "apply"),
+            digest={**outcome.digest, "severe_failure": severe}))
         return outcome
+
+    def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
+        if outcome.data.get("within_quality"):
+            return False
+        d = outcome.digest or {}
+        avg = _as_float_local(d.get("avg_de2000")) or 0.0
+        p95 = _as_float_local(d.get("p95_de2000")) or 0.0
+        max_de = _as_float_local(d.get("max_de2000")) or 0.0
+        white = _as_float_local(d.get("white_de2000")) or 0.0
+        if d.get("metric") == "dE_ITP":
+            return avg >= 30.0 or p95 >= 60.0 or max_de >= 100.0 or white >= 100.0
+        return avg >= 20.0 or p95 >= 40.0 or max_de >= 100.0 or white >= 50.0
 
     # ====================================================================
     # Watchdog (§3) — cross-run GS+WB tweak history
@@ -2320,7 +2481,7 @@ class Calibration:
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
         plan = flow_patch_counts(flow, self.patch_sizes, self._transfer(),
                                  max_cv=self._patch_max_cv())
-        if flow == "full" and self.skip_gswb and "gray-wb" in plan["stages"]:
+        if flow == "full" and (self.skip_gswb or self._spec().is_hdr) and "gray-wb" in plan["stages"]:
             stages = dict(plan["stages"])
             stages.pop("gray-wb", None)
             plan = {**plan, "stages": stages, "total_patches": sum(stages.values()), "skip_gswb": True}
@@ -2328,6 +2489,7 @@ class Calibration:
 
     def _patch_plan_record(self, flow: str) -> dict[str, Any]:
         transfer = self._transfer()
+        spec = self._spec()
         plan = self.flow_patch_counts(flow)
         record = {
             **plan,
@@ -2343,7 +2505,7 @@ class Calibration:
             # The HDR peak cap (None for SDR) is part of the plan identity: changing the target
             # peak changes which patches are measured, so it must invalidate an approved plan.
             "patch_max_cv": self._patch_max_cv(),
-            "skip_gswb": self.skip_gswb,
+            "skip_gswb": bool(self.skip_gswb or spec.is_hdr),
         }
         payload = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return {**record, "fingerprint": hashlib.sha256(payload).hexdigest()[:16]}
@@ -2624,6 +2786,13 @@ def _xy(xyz: Sequence[float]) -> tuple[float, float]:
     if total <= 0:
         return (0.0, 0.0)
     return (xyz[0] / total, xyz[1] / total)
+
+
+def _as_float_local(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _fs_safe(token: str) -> str:

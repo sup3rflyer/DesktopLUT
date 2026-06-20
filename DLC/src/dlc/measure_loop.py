@@ -1386,9 +1386,11 @@ class DogegenPresenter:
     When ``place_rect`` is given, the spawned window is placed onto that monitor automatically
     (closing dogegen's wrong-panel hazard — it always opens on the Windows primary, which may not
     be the calibration target). ``fullscreen=False`` (the default) *moves* the window but keeps it
-    composited so a DWM-hook 3D LUT still applies — correct for the 8-bit SDR / verify path;
-    ``fullscreen=True`` borderless-fullscreens it (bypasses the compositor) for corrections-OFF
-    bit-accurate 10-bit/HDR measurement. Placement is best-effort and never blocks a spawn."""
+    composited so a DWM-hook 3D LUT still applies — correct for a composited verify / the
+    legacy-8-bit SDR path; ``fullscreen=True`` borderless-fullscreens it (avoids mini-LED
+    local-dimming contamination; HDR/ACM-SDR composite in FP16, so bit depth is already
+    preserved — fullscreen only *buys* 10-bit on a legacy-8-bit SDR desktop). Placement is
+    best-effort and never blocks a spawn."""
 
     def __init__(self, display: Any, *, patch_size: int = 100, settle_seconds: float = 0.5,
                  place_rect: Any = None, fullscreen: bool = False) -> None:

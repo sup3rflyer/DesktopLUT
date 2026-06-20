@@ -307,6 +307,25 @@ TEST_CASE("Grayscale HDR: linear response") {
     CHECK(EvalGrayscaleHDR(pqPeak, gs, pqPeak) == doctest::Approx(pqPeak).epsilon(0.01));
 }
 
+TEST_CASE("Grayscale HDR: pointCount above internal table does not collapse highlights") {
+    GrayscaleData gs = {};
+    gs.enabled = true;
+    gs.pointCount = 40;  // Malformed IPC payload; runtime table is fixed at 32.
+    for (int i = 0; i < 32; ++i) {
+        float t = (float)i / 31.0f;
+        gs.points[i] = t;
+        gs.pointsR[i] = t;
+        gs.pointsG[i] = t;
+        gs.pointsB[i] = t;
+    }
+
+    float pqPeak = 1.0f;
+    CHECK(EvalGrayscaleHDR(pqPeak, gs, pqPeak) == doctest::Approx(pqPeak).epsilon(0.01));
+    CHECK(EvalGrayscaleHDR_Channel(pqPeak, gs, pqPeak, 0) == doctest::Approx(pqPeak).epsilon(0.01));
+    CHECK(EvalGrayscaleHDR_Channel(pqPeak, gs, pqPeak, 1) == doctest::Approx(pqPeak).epsilon(0.01));
+    CHECK(EvalGrayscaleHDR_Channel(pqPeak, gs, pqPeak, 2) == doctest::Approx(pqPeak).epsilon(0.01));
+}
+
 TEST_CASE("Grayscale SDR: non-linear correction") {
     GrayscaleData gs = {};
     gs.enabled = true;

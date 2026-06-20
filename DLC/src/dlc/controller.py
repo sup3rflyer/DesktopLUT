@@ -142,6 +142,7 @@ class CalibrationController:
     ) -> dict[str, Any]:
         mode = normalize_mode(mode)
         points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
+        point_count = len(points)
         return self.call(
             "mhc.set_base_grayscale",
             {
@@ -164,6 +165,7 @@ class CalibrationController:
     ) -> dict[str, Any]:
         mode = normalize_mode(mode)
         points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
+        point_count = len(points)
         return self.call(
             "mhc.set_correction_grayscale",
             {

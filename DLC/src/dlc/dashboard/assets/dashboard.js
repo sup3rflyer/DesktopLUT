@@ -137,7 +137,7 @@ function renderState(s) {
 
   // dE big-numbers (from the scoring stage)
   const de = s.de || {};
-  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
+  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}${de.metric ? " · " + de.metric : ""}` : "";
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
   setDe("de-white", de.white);
   setDe("de-gray", de.grayscale); setDe("de-colour", de.colour);

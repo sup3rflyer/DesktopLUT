@@ -23,10 +23,12 @@ from .colorimetry import neutral_metrics, planckian_locus_xy
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
 _SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
+_REC2020_PRIMARIES = {"r": [0.708, 0.292], "g": [0.170, 0.797], "b": [0.131, 0.046]}
 # Rec.709/sRGB luminance weights — enough to compute a colour patch's TARGET relative
 # luminance (Kr·r^γ + Kg·g^γ + Kb·b^γ) without the full primary matrix, so the Colour
 # Luminance chart is live + dependency-free. The authoritative dE still comes from scoring.
 _LUMA = (0.2126, 0.7152, 0.0722)
+_LUMA_REC2020 = (0.2627, 0.6780, 0.0593)
 # Patch-family ordering for the Colour Luminance bar chart (matches HCFR's R/G/B/C/M/Y sweep).
 _FAMILY_ORDER = {"R": 0, "Y": 1, "G": 2, "C": 3, "B": 4, "M": 5, "mix": 6}
 
@@ -109,6 +111,24 @@ def _median(values: list[float]) -> Optional[float]:
     if n % 2:
         return ordered[mid]
     return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _is_hdr_header(header: dict[str, Any]) -> bool:
+    return bool(header.get("is_hdr")) or str(header.get("mode", "")).upper() == "HDR" \
+        or str(header.get("transfer", "")).lower() == "pq"
+
+
+def _pq_eotf(signal: float, peak: Optional[float]) -> float:
+    """ST.2084 EOTF from normalized signal to absolute nits, clamped to target peak."""
+    s = max(0.0, min(1.0, float(signal)))
+    m1 = 2610.0 / 16384.0
+    m2 = 2523.0 / 32.0
+    c1 = 3424.0 / 4096.0
+    c2 = 2413.0 / 128.0
+    c3 = 2392.0 / 128.0
+    p = s ** (1.0 / m2)
+    nits = 10000.0 * (max(p - c1, 0.0) / max(c2 - c3 * p, 1e-9)) ** (1.0 / m1)
+    return min(nits, float(peak)) if peak and peak > 0 else nits
 
 
 # Run lifecycle as the dashboard sees it. "running" is the only live state; the rest are
@@ -384,6 +404,7 @@ class DashboardState:
         entry = {
             "phase": data.get("label") or data.get("phase") or ev.stage,
             "iteration": data.get("iteration"),
+            "metric": data.get("metric"),
             "avg": data.get("avg_de2000"),
             "p95": data.get("p95_de2000"),
             "p99": data.get("p99_de2000"),
@@ -417,27 +438,42 @@ class DashboardState:
         color_map = self._color_by_stage.get(stage, {}) if stage else {}
         white = (self.header.get("white") or {}).get("xy")
         gamma = self.header.get("gamma") or 2.2
+        hdr = _is_hdr_header(self.header)
+        luminance = self.header.get("luminance")
         return {
             "stage": stage,                       # the measurement stage these snapshot charts reflect
             "stages": list(self._stage_seq),
             "cie": {
                 "points": cie_points,
                 "white": white,
-                "primaries": _SRGB_PRIMARIES,
+                "primaries": _REC2020_PRIMARIES if hdr else _SRGB_PRIMARIES,
+                "gamut_label": "Rec.2020" if hdr else "Rec.709 / sRGB",
                 "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
             },
             "grayscale": gray,
             "eotf": {
+                "kind": "pq" if hdr else "power",
                 "gamma": gamma,
-                "luminance": self.header.get("luminance"),
+                "luminance": luminance,
+                "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
                 "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
             },
-            "color_lum": self._color_luminance(color_map, gray, gamma),
+            "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
             "optimizer": list(self._optimizer_history),
             "white_track": [w for w in self._white_track if w.get("elapsed_s") is not None],
         }
 
-    def _color_luminance(self, color_map: dict, gray: list[dict], gamma: float) -> list[dict[str, Any]]:
+    def _eotf_reference(self, *, hdr: bool, gamma: float, luminance: Any) -> list[list[float]]:
+        out = []
+        peak = _as_float(luminance)
+        for i in range(41):
+            s = i / 40.0
+            y = (_pq_eotf(s, peak) / peak) if (hdr and peak and peak > 0) else (s ** float(gamma or 2.2))
+            out.append([round(s, 5), round(max(0.0, min(1.0, y)), 6)])
+        return out
+
+    def _color_luminance(self, color_map: dict, gray: list[dict], gamma: float, *,
+                         hdr: bool = False, luminance: Any = None) -> list[dict[str, Any]]:
         """Per-colour-patch luminance error vs target, as fractions (-0.1 = 5% dim, etc.).
         Target relative luminance = Σ Kc·signal_c^γ (Rec.709 weights); measured relative =
         measured Y / the brightest neutral Y. Computed here (not at read time) against the
@@ -454,7 +490,16 @@ class DashboardState:
             sig, Y = c.get("signal"), c.get("Y")
             if Y is None or not sig:
                 continue
-            target_rel = sum(k * (max(0.0, s) ** gamma) for k, s in zip(_LUMA, sig))
+            if hdr:
+                peak = _as_float(luminance)
+                weights = _LUMA_REC2020
+                if peak and peak > 0:
+                    target_y = sum(k * _pq_eotf(float(s), peak) for k, s in zip(weights, sig))
+                    target_rel = target_y / peak
+                else:
+                    target_rel = sum(k * (max(0.0, s) ** gamma) for k, s in zip(weights, sig))
+            else:
+                target_rel = sum(k * (max(0.0, s) ** gamma) for k, s in zip(_LUMA, sig))
             if target_rel <= 1e-4:
                 continue
             family, sat = _classify_color(sig)

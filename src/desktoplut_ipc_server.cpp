@@ -7,6 +7,7 @@
 #include <sddl.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -377,6 +378,28 @@ void ReapplyProcessing() {
     if (AnyCorrectionActive()) StartProcessing();
 }
 
+constexpr int kMaxMhcGrayscalePoints = 32;
+
+std::vector<float> ResampleUniform(const std::vector<float>& src, int count, float fallback) {
+    std::vector<float> out((std::max)(count, 0), fallback);
+    if (count <= 0 || src.empty()) return out;
+    if ((int)src.size() == count) return src;
+    if (src.size() == 1 || count == 1) {
+        std::fill(out.begin(), out.end(), src.front());
+        return out;
+    }
+    float denom = (float)(count - 1);
+    float srcMax = (float)(src.size() - 1);
+    for (int i = 0; i < count; ++i) {
+        float pos = ((float)i / denom) * srcMax;
+        int i0 = (int)floorf(pos);
+        int i1 = (std::min)(i0 + 1, (int)src.size() - 1);
+        float t = pos - floorf(pos);
+        out[i] = src[i0] + (src[i1] - src[i0]) * t;
+    }
+    return out;
+}
+
 void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
     int pc = p.getInt("point_count", 0);
     std::vector<float> pts = ReadFloatArray(p.find("points"));
@@ -386,17 +409,19 @@ void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
     std::vector<float> b = ReadFloatArray(dev ? dev->find("b") : nullptr);
     if (pc <= 0) pc = (int)pts.size();
     if (pc <= 0) pc = (int)gs.points.size();
+    if (pc <= 0) pc = 20;
     if ((int)pts.size() != pc) {
         pts.assign(pc, 0.0f);
         for (int k = 0; k < pc; ++k) pts[k] = (pc > 1) ? (float)k / (pc - 1) : 0.0f;
     }
     auto fix = [pc](std::vector<float>& v) { if ((int)v.size() != pc) v.assign(pc, 1.0f); };
     fix(r); fix(g); fix(b);
-    gs.pointCount = pc;
-    gs.points = pts;
-    gs.rgbDeviations[0] = r;
-    gs.rgbDeviations[1] = g;
-    gs.rgbDeviations[2] = b;
+    int dstPc = std::clamp(pc, 2, kMaxMhcGrayscalePoints);
+    gs.pointCount = dstPc;
+    gs.points = ResampleUniform(pts, dstPc, 0.0f);
+    gs.rgbDeviations[0] = ResampleUniform(r, dstPc, 1.0f);
+    gs.rgbDeviations[1] = ResampleUniform(g, dstPc, 1.0f);
+    gs.rgbDeviations[2] = ResampleUniform(b, dstPc, 1.0f);
     gs.enabled = true;
 }
 

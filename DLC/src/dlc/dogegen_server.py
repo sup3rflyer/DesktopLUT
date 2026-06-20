@@ -61,11 +61,12 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
     """Start one dogegen window and serve patch commands until ``quit`` (blocking).
 
     The window is borderless-fullscreened automatically onto ``monitor_rect`` (the persistent
-    daemon exists specifically for the fullscreen 10-bit/HDR path). Note the fullscreen only
-    yields a true compositor bypass — the thing that makes 10-bit bit-accurate — when nothing is
-    forcing composition; DesktopLUT's own DWM hook, while injected at its default level, forces
-    composition globally, so bit-accurate characterization needs that hook inactive. When
-    ``monitor_rect`` is ``None`` the window lands on dogegen's own monitor (the Windows primary);
+    daemon exists for the fullscreen HDR path — fullscreen avoids mini-LED local-dimming
+    contamination of a windowed patch). Composited HDR does NOT lose bit depth: the DWM composites
+    HDR (and ACM SDR) in FP16, preserving 10-bit, so a forced-composition DWM hook is not a
+    bit-depth gate here — only a legacy (non-ACM) 8-bit SDR desktop would need the compositor
+    bypass to keep 10-bit. When ``monitor_rect`` is ``None`` the window lands on dogegen's own
+    monitor (the Windows primary);
     pass the DLC target monitor's rect to hit a non-primary panel. If auto-placement fails, fall
     back to the manual Alt+Enter prompt.
 

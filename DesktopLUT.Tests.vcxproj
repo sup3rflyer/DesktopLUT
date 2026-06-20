@@ -94,6 +94,7 @@
     <ClCompile Include="src\gui_grayscale.cpp" />
     <ClCompile Include="src\gui_whitelist.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
+    <ClCompile Include="src\desktoplut_ipc_server.cpp" />
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\mhc_icc.cpp" />
     <ClCompile Include="src\mhc_install.cpp" />

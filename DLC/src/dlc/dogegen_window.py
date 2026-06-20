@@ -19,12 +19,15 @@ Compositor note (matters for *which* placement to use):
     when injected at its default level, forces composition GLOBALLY (``OverlayTestMode`` on every
     Windows build, ``DisableIndependentFlip`` additionally on Win11 25H2 — see
     ``dwm_hook/dllmain.cpp``), so while that hook is active a fullscreen patch stays composited
-    and a 3D LUT still applies to it. Net: fullscreen's only real payoff is bit-accurate
-    10-bit/HDR, and only when the hook is INACTIVE (corrections-OFF characterization with the
-    hook detached / at level 0). It does NOT, by itself, exclude a LUT.
+    and a 3D LUT still applies to it. Composition does NOT, by itself, cost bit depth in HDR or
+    ACM SDR: the DWM composites those in FP16 (16-bit float), which preserves 10-bit. Only a
+    LEGACY (non-ACM) SDR desktop composites at 8-bit, so the compositor bypass is the only thing
+    that buys 10-bit *there*. fullscreen's real payoffs are therefore (a) legacy-SDR 10-bit and
+    (b) avoiding mini-LED local-dimming contamination of a windowed patch — NOT HDR bit depth.
+    It does NOT, by itself, exclude a LUT.
   * ``fullscreen=False`` moves the window onto the target monitor WITHOUT changing its style —
-    unambiguously composited regardless of hook state. Use it for the default 8-bit SDR path
-    and a composited verify.
+    unambiguously composited regardless of hook state. Use it for a composited verify or the
+    legacy-8-bit SDR path.
 
 The pure helpers (style math, window selection, rect parsing) carry no Win32 dependency and are
 unit-tested; the thin ``ctypes`` layer only loads on Windows.
@@ -238,9 +241,10 @@ def place_dogegen(pid: int, *, rect: Optional[Rect] = None, fullscreen: bool = T
                   timeout: float = 5.0) -> dict:
     """Find dogegen's render window (owned by ``pid``) and place it on the target monitor.
 
-    ``fullscreen=True`` → borderless-fullscreen (bit-accurate, bypasses the compositor; for
-    corrections-OFF measurement). ``fullscreen=False`` → move only, stays composited (for a
-    3D-LUT verify / the 8-bit path). ``rect=(x, y, w, h)`` selects the monitor explicitly; when
+    ``fullscreen=True`` → borderless-fullscreen (avoids mini-LED local-dimming contamination;
+    buys 10-bit only on a legacy-8-bit SDR desktop — HDR/ACM-SDR composite in FP16 already).
+    ``fullscreen=False`` → move only, stays composited (for a 3D-LUT verify / composited path).
+    ``rect=(x, y, w, h)`` selects the monitor explicitly; when
     ``None``, falls back to the window's current monitor (dogegen's own Alt+Enter behavior).
 
     Best-effort: returns ``{ok, hwnd, rect, fullscreen, reason}`` and never raises for the

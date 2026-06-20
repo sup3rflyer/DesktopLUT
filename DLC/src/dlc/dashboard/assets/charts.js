@@ -60,7 +60,7 @@
     const pr = d.primaries || {};
     if (pr.r && pr.g && pr.b) {
       const poly = [pr.r, pr.g, pr.b].map((p) => `${fmt(P.px(p[0]), 1)},${fmt(P.py(p[1]), 1)}`).join(" ");
-      P.add(`<polygon points="${poly}" class="ch-gamut">${title("target gamut: Rec.709 / sRGB")}</polygon>`);
+      P.add(`<polygon points="${poly}" class="ch-gamut">${title("target gamut: " + (d.gamut_label || "Rec.709 / sRGB"))}</polygon>`);
       [["R", pr.r], ["G", pr.g], ["B", pr.b]].forEach(([lab, p]) => {
         P.add(`<text x="${fmt(P.px(p[0]), 1)}" y="${fmt(P.py(p[1]) - 5, 1)}" class="ch-note" text-anchor="middle">${lab}</text>`);
       });
@@ -90,10 +90,17 @@
     P.gridX([0, 0.25, 0.5, 0.75, 1], (t) => fmt(t, 2));
     P.gridY([0, 0.25, 0.5, 0.75, 1], (t) => fmt(t, 2));
     const g = d.gamma || 2.2;
-    P.pathLine(niceTicks(0, 1, 40).map((s) => [s, Math.pow(s, g)]), "ch-ref");
+    const ref = d.reference && d.reference.length ? d.reference : niceTicks(0, 1, 40).map((s) => [s, Math.pow(s, g)]);
+    P.pathLine(ref, "ch-ref");
     P.pathLine(pts.map((p) => [p.signal, p.Y / ymax]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(Math.pow(p.signal, g), 4)}`)}</circle>`));
-    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">γ ${fmt(g, 2)}</text>`);
+    const refAt = (s) => {
+      if (!ref.length) return Math.pow(s, g);
+      let best = ref[0];
+      for (const r of ref) if (Math.abs(r[0] - s) < Math.abs(best[0] - s)) best = r;
+      return best[1];
+    };
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}`)}</circle>`));
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">${d.kind === "pq" ? "PQ" : "γ " + fmt(g, 2)}</text>`);
     return P.svg();
   };
 

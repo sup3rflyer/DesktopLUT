@@ -322,6 +322,23 @@ def test_color_luminance_error_vs_target():
     assert cl["R100"]["color"] == "#ff0000"                            # bar coloured as the patch
 
 
+def test_hdr_header_drives_rec2020_pq_charts():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", is_hdr=True,
+                  transfer="pq", luminance=1600.0, gamma=2.2,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    _read(st, 1, [1023, 1023, 1023], [0.3127, 0.329], 1600.0, signal=[1.0, 1.0, 1.0])
+    _read(st, 2, [1023, 0, 0], [0.708, 0.292], 0.2627 * 1600.0, signal=[1.0, 0.0, 0.0])
+
+    ch = st.charts()
+    assert ch["cie"]["gamut_label"] == "Rec.2020"
+    assert ch["cie"]["primaries"]["r"] == [0.708, 0.292]
+    assert ch["eotf"]["kind"] == "pq"
+    assert ch["eotf"]["reference"][20][1] < 0.1
+    cl = {c["label"]: c for c in ch["color_lum"]}
+    assert "R100" in cl and abs(cl["R100"]["error"]) < 0.01
+
+
 def test_charts_show_latest_measurement_stage_not_all_overlaid():
     # raw (uncorrected) then verify (corrected) measurements of the same patch set: the CIE
     # scatter must show the LATEST stage's points only, not both clouds superimposed.

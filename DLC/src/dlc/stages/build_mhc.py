@@ -74,10 +74,15 @@ def build(args, ctx: RunContext) -> StageResult:
         # the final correctionGrayscale tweak) carry the HDR neutral-axis work. The
         # Advanced-Color dummy-ICC semantics are finalized at hardware bring-up; in
         # simulation the matrix + identity base are stored plumbing.
-        n = max(1, len(gray_patches))
+        # DesktopLUT's MHC2 grayscale table is a fixed 32-entry array. The raw HDR
+        # ramp may contain more neutral samples, and those sample levels are absolute
+        # PQ signal values capped to the run target. MHC HDR grayscale points are
+        # instead normalized positions relative to pqPeak, so the base identity curve
+        # must be the full 0..1 table, not the raw measured signal list.
+        n = 32
         base = {
             "point_count": n,
-            "points": [round(p.level, 6) for p in gray_patches] or [1.0],
+            "points": [round(i / (n - 1), 6) for i in range(n)],
             "deviations": Deviations.identity(n).as_dict(),
         }
         base_summary = {}
