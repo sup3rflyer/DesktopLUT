@@ -1780,3 +1780,67 @@ def test_supervised_full_flow_completes_without_pausing(tmp_path: Path):
     result = calib.run("full")
     assert result.status == "completed"
     assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
+
+
+# ---------------------------------------------------------------------------
+# Audit follow-ups: HDR foundation reference (false-positive fix), the verify
+# gate escalating any quality-gate failure under supervised, and the foundation
+# seam no longer offering an unhonoured "retry".
+# ---------------------------------------------------------------------------
+
+def test_hdr_foundation_reference_excludes_native_peak_brightness(tmp_path: Path, monkeypatch):
+    # Regression (audit HIGH): an HDR panel whose NATIVE peak (brightness @ full signal, ~1840)
+    # far exceeds the capped target (~1000) must NOT look collapsed. brightness must be excluded
+    # from the HDR reference; ref = the same-level raw white / target peak.
+    import types
+    calib = _make(tmp_path, "hdrref", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    calib.calib["stages"]["measure:raw"] = {"status": "done", "digest": {"white_nits": 999.0}}
+    calib.calib["stages"]["brightness"] = {"status": "done", "digest": {"white_nits": 1840.0}}
+    monkeypatch.setattr(calib, "_spec", lambda: types.SimpleNamespace(is_hdr=True, luminance_nits=None))
+    monkeypatch.setattr(calib, "_hdr_target", lambda: types.SimpleNamespace(peak_nits=1000.0))
+    refs = calib._foundation_reference_nits()
+    assert 1840.0 not in refs            # native-peak brightness excluded for HDR
+    assert max(refs) <= 1000.0           # reference is the capped target level, not native peak
+    # a healthy post-MHC white at the capped level is NOT flagged as collapsed (the bug aborted it)
+    healthy = StageOutcome("measure:post-mhc", "done", digest={"white_nits": 999.0})
+    assert calib._measurement_foundation_collapse("post-mhc", healthy) is None
+    # a genuine HDR collapse still fires
+    collapsed = StageOutcome("measure:post-mhc", "done", digest={"white_nits": 200.0})
+    assert calib._measurement_foundation_collapse("post-mhc", collapsed) is not None
+
+
+def test_sdr_foundation_reference_still_includes_brightness(tmp_path: Path):
+    # SDR is unchanged: brightness IS measured at the target level, so it stays a valid reference.
+    calib = _make(tmp_path, "sdrref")
+    calib.calib["stages"]["measure:raw"] = {"status": "done", "digest": {"white_nits": 120.0}}
+    calib.calib["stages"]["brightness"] = {"status": "done", "digest": {"white_nits": 118.0}}
+    refs = calib._foundation_reference_nits()
+    assert 118.0 in refs
+
+
+def test_supervised_escalates_a_failed_verify_even_when_not_severe():
+    # The audit CRITICAL fix: a benign 'apply' on a verify that MISSED the quality gate (but is
+    # not catastrophically severe) must still pull in a judge — gate_failed is a severity flag.
+    adj = SupervisedAdjudicator()
+    failed = AdjudicationRequest(key="verify:accept", seam="verify", stage="verify",
+                                 question="apply or revert?", options=("apply", "revert"),
+                                 recommendation="apply", digest={"within_quality": False, "gate_failed": True})
+    with pytest.raises(AdjudicationRequired):
+        adj.adjudicate(failed)
+    # a clean within-quality verify still auto-accepts unattended (no spurious pause)
+    clean = AdjudicationRequest(key="verify:accept", seam="verify", stage="verify",
+                                question="?", options=("apply", "revert"),
+                                recommendation="apply", digest={"within_quality": True, "gate_failed": False})
+    assert adj.adjudicate(clean).choice == "apply"
+
+
+def test_foundation_seam_does_not_offer_an_unhonoured_retry(tmp_path: Path, monkeypatch):
+    # The audit HIGH fix: "retry the foundation" is gone (it could not be honoured and re-aborted
+    # forever on resume) — the seam is abort/accept only, matching build-install-mhc:foundation.
+    calib = _make(tmp_path, "fnoretry", adjudicator=SupervisedAdjudicator())
+    _drive_post_mhc_collapse(calib, monkeypatch)
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="post-mhc", patches=[(0, 0, 0)],
+                            ti3_name="p.ti3", ndjson_name="p.ndjson")
+    assert exc.value.request.options == ("abort", "accept")
+    assert "retry" not in exc.value.request.options

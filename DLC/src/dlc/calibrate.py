@@ -136,7 +136,11 @@ SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright
 # which is exactly when SupervisedAdjudicator pulls a live judge into an unattended run.
 _BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "done"})
 # Digest flags that, even under a benign recommendation, mark a seam worth a judge's eyes.
-_SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "critical", "compromised")
+# ``gate_failed`` is the verify gate's "outside quality targets" signal: a benign ``apply``
+# recommendation on a FAILED verify must still escalate (the recommendation alone is benign, so
+# without this flag SupervisedAdjudicator would silently apply a sub-quality calibration).
+_SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "critical",
+                   "compromised", "gate_failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1749,8 +1753,12 @@ class Calibration:
                 question=outcome.data.get("question")
                 or "characterization surfaced abnormal panel/meter behaviour — accept the learned profile or recharacterize?",
                 options=("accept", "abort"), recommendation="accept",
-                digest={k: outcome.digest.get(k) for k in
-                        ("flags", "warm", "cold_channel", "settle_seconds", "noise_floor_nits")})),
+                # This seam is ONLY reached when characterization flagged abnormal panel/meter
+                # behaviour, so mark it compromised: an unattended (supervised) run must escalate
+                # rather than auto-accept a bad DIP that becomes every future run's read policy.
+                digest={**{k: outcome.digest.get(k) for k in
+                           ("flags", "warm", "cold_channel", "settle_seconds", "noise_floor_nits")},
+                        "compromised": True})),
                 stage="characterize", message="characterization rejected at review")
         return outcome
 
@@ -1782,9 +1790,14 @@ class Calibration:
             # to adjust — the brightness seam does not apply. The panel-limits tell already
             # surfaces a peak below the target. SDR: the human drives the OSD to the target.
             in_range = True if self._spec().is_hdr else abs(nits - target) <= max(3.0, 0.05 * target)
+            # A gross luminance miss (>25% off target) flags compromised so a supervised run
+            # escalates — there is no OSD operator unattended, so a wildly-wrong backlight is a
+            # judge's abort/accept call, not an auto-accept. A modest miss (the panel just can't
+            # land exactly) stays benign and auto-accepts.
+            gross_miss = bool(not in_range and target and abs(nits - target) > 0.25 * target)
             digest = {"white_nits": round(nits, 2), "target_nits": target,
                       "in_range": in_range, "read_attempts": attempts,
-                      "hdr_fixed_peak": self._spec().is_hdr}
+                      "hdr_fixed_peak": self._spec().is_hdr, "compromised": gross_miss}
             return StageOutcome("brightness", "done", digest=digest,
                                 data={"white_nits": nits, "in_range": in_range})
 
@@ -1820,16 +1833,19 @@ class Calibration:
             # recommend abort (so --auto/supervised stop the disaster) but let a live judge
             # retry/accept with the full digest (it may know the read was a transient).
             self.runlog.anomaly(key, **collapse)
+            # Options are abort/accept only: "retry the foundation" is not offered because the
+            # foundation stages are already memoised done and nothing re-installs them on resume,
+            # so a retry would re-abort forever. A judge that believes the read was a transient
+            # accepts (and the next fresh run re-measures); otherwise abort and fix the foundation.
             decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:foundation", seam=SEAM_FOUNDATION, stage=key,
-                question=(collapse["message"] + " — abort, retry the foundation, or accept and continue?"),
-                options=("abort", "retry", "accept"), recommendation="abort",
+                question=(collapse["message"] + " — abort, or accept and continue?"),
+                options=("abort", "accept"), recommendation="abort",
                 digest={**collapse, "foundation_critical": True}))
-            self._abort_if(decision, stage=key, message=collapse["message"])
-            if decision.choice == "retry":
+            if decision.choice == "abort":
+                self.runlog.stage_aborted(key, message=collapse["message"])
                 raise CalibrationAborted(StageOutcome(
-                    key, "aborted",
-                    digest={**collapse, "retry_requested": True, "decision_note": decision.note}))
+                    key, "aborted", digest={**collapse, "decision_note": decision.note}))
             self.ctx.log(f"foundation collapse at {key} ACCEPTED at the seam: {decision.note}")
         # Before→after dE trend on the spine (#8): score the INTERMEDIATE measures so the
         # dashboard's ΔE panel + de_history show the run converging (native → after ICC → after
@@ -1990,6 +2006,7 @@ class Calibration:
                 digest={**{k: outcome.digest.get(k) for k in ("profile_name", "white_xy", "verified")},
                         "sanity": sanity, "foundation_critical": True}))
             if decision.choice == "abort":
+                self.runlog.stage_aborted("build-install-mhc", message=sanity.get("message"))
                 raise CalibrationAborted(StageOutcome(
                     "build-install-mhc", "aborted",
                     digest={**outcome.digest, "message": sanity.get("message"),
@@ -2038,15 +2055,26 @@ class Calibration:
                 "critical": critical, "message": message}
 
     def _foundation_reference_nits(self) -> list[float]:
+        # The post-foundation white is read at the (HDR-capped) target drive level, so its
+        # reference must be a SAME-LEVEL bright neutral. measure:raw is measured at that same
+        # capped level. brightness is measured at FULL signal (= the panel's NATIVE peak); for an
+        # HDR panel whose native peak far exceeds the capped target (a common mini-LED case) that
+        # would make a perfectly healthy post-MHC white look "collapsed" (e.g. 999 vs 1840 nits ⇒
+        # ratio 0.54), so brightness is NOT a valid HDR reference — use raw + the target peak only.
+        spec = None
+        try:
+            spec = self._spec()
+        except Exception:  # noqa: BLE001
+            spec = None
+        is_hdr = bool(spec and spec.is_hdr)
         refs: list[float] = []
-        for stage_key in ("measure:raw", "brightness"):
+        for stage_key in (("measure:raw",) if is_hdr else ("measure:raw", "brightness")):
             d = ((self.calib["stages"].get(stage_key) or {}).get("digest") or {})
             ref = _as_float_local(d.get("white_nits"))
             if ref and ref > 0:
                 refs.append(ref)
         try:
-            spec = self._spec()
-            target = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
+            target = self._hdr_target().peak_nits if is_hdr else (spec.luminance_nits if spec else None)
             if target and target > 0:
                 refs.append(float(target))
         except Exception:  # noqa: BLE001
@@ -2321,7 +2349,10 @@ class Calibration:
                       "Apply this calibration, or revert to the previous display setup?"),
             options=("apply", "revert"),
             recommendation=("revert" if severe else "apply"),
-            digest={**outcome.digest, "severe_failure": severe}))
+            # severe → recommend revert (auto/sim reverts a catastrophic result). gate_failed flag
+            # → even a NON-severe quality-gate miss escalates under SupervisedAdjudicator, so an
+            # unattended run never silently applies a sub-quality calibration at this terminal gate.
+            digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within)}))
         return outcome
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
