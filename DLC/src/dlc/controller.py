@@ -154,6 +154,21 @@ class CalibrationController:
             },
         )
 
+    def set_base_lut(self, monitor: int, mode: str, cube_path: str,
+                     peak_nits: float = 0.0) -> dict[str, Any]:
+        """Import a full-resolution per-channel 1D ``.cube`` as the MHC base EOTF correction.
+
+        The path ColourSpace/DisplayCal use, reached over the pipe (``mhc.set_base_lut`` ->
+        ``sourceIs1DCube`` -> the 4096-entry HDR MHC2 LUT). Replaces the coarse 32-point
+        ``set_base_grayscale`` for the HDR base; the matrix (``set_primaries``/``set_white``)
+        still owns primaries + white. ``peak_nits`` feeds the HDR MHC2 luminance metadata."""
+        params: dict[str, Any] = {
+            "monitor": monitor, "mode": normalize_mode(mode), "cube_path": str(cube_path),
+        }
+        if peak_nits and peak_nits > 0:
+            params["peak_nits"] = float(peak_nits)
+        return self.call("mhc.set_base_lut", params)
+
     def set_correction_grayscale(
         self,
         monitor: int,

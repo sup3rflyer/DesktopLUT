@@ -217,6 +217,13 @@ class MockDesktopLutServer:
                 "points": deepcopy(params.get("points", [])),
                 "deviations": deepcopy(params.get("deviations", {})),
             }
+        elif method == "mhc.set_base_lut":
+            # Full-resolution 1D .cube import (HDR base EOTF). Takes precedence over the 32-point
+            # base_grayscale at bake time, mirroring DesktopLUT's BuildMHC2Params.
+            state["base_lut"] = {
+                "cube_path": params.get("cube_path"),
+                "peak_nits": params.get("peak_nits"),
+            }
         elif method == "mhc.set_correction_grayscale":
             state["correction_grayscale"] = {
                 "point_count": params.get("point_count"),

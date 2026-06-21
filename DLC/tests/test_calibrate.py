@@ -27,7 +27,6 @@ pytest.importorskip("colour")
 
 from dlc import calibration_profile as cp
 from dlc.calibrate import (
-    SEAM_CHECKIN,
     SEAM_FOUNDATION,
     SEAM_HARDWARE_READY,
     SEAM_MEASURE,
@@ -971,9 +970,11 @@ def test_mapping_adjudicator_pause_resume_does_not_remeasure(tmp_path: Path):
             assert pauses <= 6
 
     assert result.status == "completed"
-    # Plan + verify are always-on; with the denser dark volumetric set this tiny synthetic
-    # run also surfaces the optimizer-floor seam. Resume must still memoise measurements.
-    assert seams == ["plan_veto", "optimize_floor", "verify"]
+    # Plan + verify are always-on. (Before the parse_ti3 0–100 scale fix, mis-scaled dark
+    # patches manufactured a contradictory "near-peak signal reads near-black" training point
+    # that spuriously tripped the optimizer-floor seam; with the fix this perfect synthetic
+    # panel converges cleanly, so only the always-on seams remain.) Resume must still memoise.
+    assert seams == ["plan_veto", "verify"]
     # the final resume (everything memoised) re-measured nothing: the count is
     # unchanged from when the run first reached the verify seam.
     assert panel.count == reads_after_first_completion
@@ -1889,9 +1890,10 @@ def test_foundation_seam_does_not_offer_an_unhonoured_retry(tmp_path: Path, monk
 
 
 # ---------------------------------------------------------------------------
-# §12 timed check-in: a default-on "status — continue?" ping with run overview +
-# events-since-last-checkin. Mode-driven: live GATES, --auto/--supervised ping
-# through ("continue" is benign). Drives off a coarse wall-clock floor.
+# §12 timed check-in: a NON-BLOCKING evidence packet for the LLM (run overview +
+# events-since-last-checkin + warnings/max-ΔE evidence). It NEVER gates the spine and
+# carries NO recommendation — the LLM consumes it from the running spine and intervenes
+# only if it sees a problem. Drives off a coarse wall-clock floor.
 # ---------------------------------------------------------------------------
 
 def _due(calib):
@@ -1921,41 +1923,41 @@ def test_checkin_digest_carries_overview_delta_and_metrics(tmp_path: Path):
 def test_timed_checkin_anchors_then_emits_when_due(tmp_path: Path):
     calib = _make(tmp_path, "ckfire", checkin_interval_s=1.0)
     # First call only anchors — no check-in event yet.
-    calib._maybe_timed_checkin("preflight", gating=False)
+    calib._maybe_timed_checkin("preflight")
     before = dict(calib.runlog.tally)
     assert before.get("check_in", 0) == 0
     # Once the floor has elapsed, the next call emits a CHECK_IN event.
     _due(calib)
-    calib._maybe_timed_checkin("measure:raw", gating=False)
+    calib._maybe_timed_checkin("measure:raw")
     assert calib.runlog.tally.get("check_in", 0) == 1
     events = [e for e in read_events(calib.ctx.events_path) if e.event == "check_in"]
     assert events and events[-1].data["overview"]["stage"] == "measure:raw"
 
 
-def test_timed_checkin_gates_live_but_pings_through_auto_and_supervised(tmp_path: Path):
-    # Live MappingAdjudicator GATES (pauses for "continue?") ...
-    live = _make(tmp_path, "cklive", adjudicator=MappingAdjudicator({}), checkin_interval_s=1.0)
-    live._maybe_timed_checkin("preflight", gating=True)   # anchor
-    _due(live)
-    with pytest.raises(AdjudicationRequired) as exc:
-        live._maybe_timed_checkin("build-install-3dlut", gating=True)
-    assert exc.value.request.seam == SEAM_CHECKIN
-    assert exc.value.request.recommendation == "continue"
-    assert exc.value.request.recommendation in exc.value.request.options
-    # ... while --auto and --supervised ping straight through (no pause), digest still emitted.
-    for label, adj in (("ckauto", AutoAdjudicator()), ("cksup", SupervisedAdjudicator())):
+def test_timed_checkin_never_gates_and_carries_no_recommendation(tmp_path: Path):
+    # A check-in is a NON-BLOCKING evidence packet: even a fully-live MappingAdjudicator must
+    # NEVER pause on it (no exit-10 seam), in ANY adjudicator mode. It just emits the digest.
+    for label, adj in (("cklive", MappingAdjudicator({})),
+                       ("ckauto", AutoAdjudicator()),
+                       ("cksup", SupervisedAdjudicator())):
         c = _make(tmp_path, label, adjudicator=adj, checkin_interval_s=1.0)
-        c._maybe_timed_checkin("preflight", gating=True)   # anchor
+        c._maybe_timed_checkin("preflight")   # anchor
         _due(c)
-        c._maybe_timed_checkin("build-install-3dlut", gating=True)   # must NOT raise
+        c._maybe_timed_checkin("build-install-3dlut")   # must NOT raise in any mode
         assert c.runlog.tally.get("check_in", 0) == 1
+    # The emitted digest is evidence only — no recommendation/options for the LLM to rubber-stamp.
+    events = [e for e in read_events(c.ctx.events_path) if e.event == "check_in"]
+    assert events
+    data = events[-1].data
+    assert "recommendation" not in data and "options" not in data
+    assert "evidence" in data and "overview" in data
 
 
 def test_timed_checkin_disabled_at_interval_zero(tmp_path: Path):
     calib = _make(tmp_path, "ckoff", adjudicator=MappingAdjudicator({}), checkin_interval_s=0.0)
-    calib._maybe_timed_checkin("preflight", gating=True)
+    calib._maybe_timed_checkin("preflight")
     _due(calib)
-    calib._maybe_timed_checkin("build-install-3dlut", gating=True)   # disabled → never gates/emits
+    calib._maybe_timed_checkin("build-install-3dlut")   # disabled → never emits
     assert calib.runlog.tally.get("check_in", 0) == 0
 
 

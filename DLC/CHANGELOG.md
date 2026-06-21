@@ -19,7 +19,38 @@ request, adjudicates ambiguous results on digests, and writes the report.
   the small *final* step after the 3D LUT). The LLM appears only at the seams: it
   judges a **digest** at each boundary (state the plan, accept a measurement that
   won't settle, accept a correction floor, judge the GS+WB **tweak-drift watchdog**,
-  accept the final score) — it never tails the measurement stream. Two adjudication
+  accept the final score) — it never tails the measurement stream.
+- **HDR pipeline (mhc-only → 3D LUT), HW-validated on an Asus ProArt PA32UCXR (FALD mini-LED):**
+  - **Full-resolution HDR MHC EOTF via a per-channel 1D `.cube`** baked into DesktopLUT's
+    4096-entry MHC2 LUT over a new `mhc.set_base_lut` IPC command (the 32-point
+    `set_base_grayscale` table is far too sparse for a PQ EOTF; it's now reserved for GS+WB
+    post-fixes). The cube is derived from the **gray ramp** via the primaries matrix — *not*
+    pure-channel ramps — because FALD local dimming makes the panel strongly non-additive
+    (a gray patch reads only ~70–84% of the summed pure R/G/B in the shadows). Targets
+    native-white-proportional PQ per level (the matrix does native→D65); a deep-shadow guard
+    (default 0.3 nit) holds the curve to identity below the colorimeter's chromaticity floor
+    so it stops chasing sub-nit meter noise. (`dlc/mhc_cube.py`, `tests/test_mhc_cube.py`.)
+  - **MHC matrix white fix** — `install-mhc` now sends the **measured native white** to
+    `mhc.set_white` (not the target D65). DesktopLUT's matrix is
+    `srcToXYZ(BT.2020 @ D65)·inv(displayToXYZ(measured primaries, white))`, so white adaptation
+    is the normalization difference between the fixed src white and the display white; sending
+    D65 there made the difference zero ⇒ the panel's native white passed through uncorrected
+    (HW: peak white stuck at native ~0.325 across runs). Sending native white lands peak white
+    on D65 (offline-proven, HW-confirmed: white ΔE_ITP 8.5 → 3.3).
+  - **Uniform PQ gray-ramp spacing for HDR** — even 10-bit PQ code steps are already
+    perceptually uniform (PQ derives from the Barten JND model), so the old gamma-2.2
+    "perceptual" weighting just over-concentrated samples in the highlights; HDR now uses
+    uniform spacing. SDR (true power-law) keeps the perceptual option.
+  - HW result: full pipeline applied — grayscale **3.26 ΔE_ITP**, peak white at D65; the
+    residual avg/max is the panel's physical gamut limit (unreachable BT.2020 corners), not a
+    calibration error (gamut-aware scoring is the next work item).
+- **§12 check-ins reworked to non-blocking evidence packets.** A check-in is no longer a seam
+  and no longer carries a recommendation: it never pauses the spine and is never auto-accepted.
+  Each one collects the evidence since the last (warnings, the max ΔE read, re-reads/anomalies)
+  and emits it for the overseeing LLM to judge from the running spine, intervening only on a real
+  problem. Removed `SEAM_CHECKIN`; `_maybe_timed_checkin` and the measure-loop quartile check-in
+  are now emit-only. (Design law: a check-in is data for LLM intelligence, not a deterministic gate.)
+- The LLM appears only at the seams. Two adjudication
   modes: fully autonomous (rubber-stamp the core's recommendation) or a live
   pause/resume model where each un-decided seam pauses the run, the assistant
   decides, and resuming fast-forwards without re-measuring (every stage is memoised

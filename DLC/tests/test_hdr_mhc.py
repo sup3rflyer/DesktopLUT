@@ -1,7 +1,9 @@
-"""HDR MHC build (the Advanced-Color dummy ICC in simulation): build_mhc on a PQ/Rec.2020
-raw panel derives the primaries + native-white→D65 matrix but leaves the base grayscale
-**identity** — the 3D-LUT cube owns HDR tone (v2-design-notes §7/§8). Pure-ish: the panel
-reads need no numpy, but build_curves_from_ti3 is stdlib."""
+"""HDR MHC build: build_mhc on a PQ/Rec.2020 raw panel derives the primaries +
+native-white→D65 matrix AND a full-resolution per-channel 1D .cube EOTF correction
+(the MHC base — DesktopLUT bakes it into the 4096-entry HDR MHC2 LUT via set_base_lut).
+The 32-point set_base_grayscale table stays identity plumbing (it's too sparse for a PQ
+EOTF; reserved for GS+WB post-fixes). This SUPERSEDES the old "3D LUT owns the HDR neutral
+axis" design. Pure-ish: the panel reads need no numpy, but build_curves_from_ti3 is stdlib."""
 
 from __future__ import annotations
 
@@ -48,20 +50,44 @@ def _ns(ctx, **over) -> Namespace:
     return Namespace(**{**_DEFAULTS, "run": ctx.root, **over})
 
 
-def test_hdr_build_mhc_leaves_base_grayscale_identity(tmp_path):
+def _parse_cube(path: Path):
+    size = None
+    rows = []
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if ln.startswith("LUT_1D_SIZE"):
+            size = int(ln.split()[1])
+        elif ln and ln[0].isdigit():
+            rows.append([float(x) for x in ln.split()])
+    return size, rows
+
+
+def test_hdr_build_mhc_builds_per_channel_eotf_cube(tmp_path):
     ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
     ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr.ti3")
 
     result = build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3)), ctx)
     assert result.status == "ran"
 
-    # The base grayscale is identity (every per-channel deviation ~1.0) — the cube owns tone.
-    base = _common.load_dlc_state(ctx)["mhc_params"]["base_grayscale"]
+    params = _common.load_dlc_state(ctx)["mhc_params"]
+
+    # The 32-point base grayscale stays identity plumbing (the cube is authoritative).
+    base = params["base_grayscale"]
     assert base["point_count"] == 32
-    assert base["points"][0] == 0.0 and base["points"][-1] == 1.0
-    assert all(a < b for a, b in zip(base["points"], base["points"][1:]))
     for ch in ("r", "g", "b"):
         assert all(abs(d - 1.0) < 1e-9 for d in base["deviations"][ch]), (ch, base["deviations"][ch])
+
+    # The HDR base EOTF rides a real per-channel 1D .cube (set_base_lut path).
+    base_lut = params["base_lut"]
+    assert base_lut and base_lut["peak_nits"] > 1000.0
+    size, rows = _parse_cube(base_lut["cube_path"])
+    assert size and size >= 256 and len(rows) == size
+    assert all(len(r) == 3 for r in rows)                      # per-channel R G B
+    # A perfect PQ panel → ~identity cube (monotone, spans [0,1], endpoints anchored).
+    for ch in range(3):
+        col = [r[ch] for r in rows]
+        assert col[0] <= 1e-3 and col[-1] >= 0.99
+        assert all(col[i] <= col[i + 1] + 1e-6 for i in range(size - 1))
 
     # A Rec.2020 panel does not trip the gamut tell (the reference is Rec.2020, not sRGB).
     assert not any(a.code == "wide_gamut" for a in result.anomalies)
@@ -77,10 +103,16 @@ def test_hdr_build_mhc_adapts_dense_raw_gray_to_desktoplut_mhc_shape(tmp_path):
     result = build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3)), ctx)
     assert result.status == "ran"
 
-    base = _common.load_dlc_state(ctx)["mhc_params"]["base_grayscale"]
+    params = _common.load_dlc_state(ctx)["mhc_params"]
+    base = params["base_grayscale"]
     assert base["point_count"] == 32
     assert base["points"][0] == 0.0 and base["points"][-1] == 1.0
     assert len(base["deviations"]["r"]) == 32
+    # The dense gray ramp feeds the cube too (more measured neutral points).
+    base_lut = params["base_lut"]
+    assert base_lut and base_lut["summary"]["gray_points"] >= 40
+    size, rows = _parse_cube(base_lut["cube_path"])
+    assert size and len(rows) == size
 
 
 def test_sdr_build_mhc_still_derives_a_real_base_grayscale(tmp_path):

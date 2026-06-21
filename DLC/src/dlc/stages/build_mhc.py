@@ -65,20 +65,19 @@ def build(args, ctx: RunContext) -> StageResult:
 
     white_xy = _common.measured_white_xy(samples)
     gray_patches = _common.gray_patches_from_ti3(samples)
+    base_lut = None
     if is_hdr:
-        # HDR (PQ): the MHC carries the primaries + native-white→D65 *matrix*; the **tone**
-        # (the PQ EOTF along the neutral axis) is owned by the 3D-LUT cube — the RBF
-        # error-field in ICtCp (v2-design-notes §7/§8 — "the 3D LUT does the volumetric
-        # heavy lifting incl. the neutral axis/grayscale"). A power-γ base 1D fit to PQ
-        # data would bake a wrong curve, so the base grayscale is identity; the cube (and
-        # the final correctionGrayscale tweak) carry the HDR neutral-axis work. The
-        # Advanced-Color dummy-ICC semantics are finalized at hardware bring-up; in
-        # simulation the matrix + identity base are stored plumbing.
-        # DesktopLUT's MHC2 grayscale table is a fixed 32-entry array. The raw HDR
-        # ramp may contain more neutral samples, and those sample levels are absolute
-        # PQ signal values capped to the run target. MHC HDR grayscale points are
-        # instead normalized positions relative to pqPeak, so the base identity curve
-        # must be the full 0..1 table, not the raw measured signal list.
+        # HDR (PQ): the MHC matrix carries primaries + native-white→D65; the per-channel
+        # **EOTF/tone** (neutral axis + per-level grayscale tracking) is carried by a
+        # full-resolution per-channel 1D .cube — the path DesktopLUT bakes into its 4096-entry
+        # HDR MHC2 LUT (the ColourSpace/DisplayCal import path), reached over the pipe via
+        # mhc.set_base_lut. This SUPERSEDES the old "3D LUT owns the HDR neutral axis" design:
+        # a 1D LUT does the neutral axis efficiently and leaves only gamut/volumetric to the
+        # cube. (The 32-point set_base_grayscale table — far too sparse for a PQ EOTF — is now
+        # reserved for GS+WB post-fixes.) See dlc.mhc_cube for the grounded math.
+        from ..mhc_cube import build_hdr_cube, write_1d_cube
+
+        # Identity 32-point base kept as harmless state plumbing; the cube is authoritative.
         n = 32
         base = {
             "point_count": n,
@@ -86,7 +85,26 @@ def build(args, ctx: RunContext) -> StageResult:
             "deviations": Deviations.identity(n).as_dict(),
         }
         base_summary = {}
-        result.action("HDR: base grayscale set to identity (the 3D LUT owns PQ tone / neutral axis)")
+        try:
+            cube_curves, cube_summary = build_hdr_cube(
+                samples, measured_primaries, white_xy, target_luminance
+            )
+            cube_path = ctx.root / "generated" / f"mhc_base_{mode.lower()}.cube"
+            write_1d_cube(cube_path, cube_curves, title=f"DLC HDR MHC base (mon {args.monitor})")
+            result.add_artifact(cube_path)
+            base_lut = {
+                "cube_path": str(cube_path),
+                "peak_nits": round(target_luminance, 4),
+                "summary": cube_summary,
+            }
+            result.action(
+                f"HDR: built {int(cube_summary['lut_size'])}-point per-channel EOTF .cube "
+                f"(white_max {cube_summary['white_max_nits']:.0f} nits) — full-res MHC base"
+            )
+        except ValueError as exc:
+            result.anomaly("hdr_cube_failed",
+                           f"could not build HDR EOTF cube ({exc}); base grayscale left identity",
+                           "high")
     elif len(gray_patches) < 2:
         result.anomaly("too_few_gray", "fewer than 2 neutral patches; base grayscale set to identity", "high")
         n = max(1, len(gray_patches))
@@ -151,6 +169,7 @@ def build(args, ctx: RunContext) -> StageResult:
         "target_gamma": args.gamma,
         "target_luminance": round(target_luminance, 4),
         "base_grayscale": base,
+        "base_lut": base_lut,
     }
     params_path = ctx.root / "generated" / f"mhc_params_{mode.lower()}.json"
     params_path.parent.mkdir(parents=True, exist_ok=True)

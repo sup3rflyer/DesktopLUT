@@ -838,6 +838,47 @@ void DoMhcSetGrayscale(const JsonValue& p, JsonValue& result, std::string& error
     result.set("mhc", JObj());
 }
 
+// Import a full-resolution 1D .cube as the MHC base grayscale/EOTF correction — the
+// path ColourSpace/DisplayCal use via the GUI file-import, now reachable over the pipe
+// so DLC can carry a dense per-channel TRC instead of the coarse 32-point editable table
+// (kMaxMhcGrayscalePoints), which is far too sparse for a PQ EOTF. Sets sourceFilePath/
+// sourceIs1DCube so mhc.apply's BuildMHC2Params loads the cube (Load1DCubeLUT ->
+// params.corrR/G/B) and bakes the 4096-entry (HDR) / 1024-entry (SDR) MHC2 LUT directly.
+// The matrix is untouched: the cube carries ONLY per-channel tone; set_primaries/set_white
+// still own primaries + white. peak_nits feeds the HDR MHC2 luminance metadata (MaxCLL).
+void DoMhcSetBaseLut(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    std::wstring cube = Utf8ToWide(p.getStr("cube_path"));
+    if (cube.empty()) { error = "missing parameter: cube_path"; return; }
+    if (GetFileAttributesW(cube.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        error = "cube_path does not exist";
+        return;
+    }
+    // Validate up-front so a malformed cube fails here with a clear error, rather than
+    // silently falling back to identity at apply time.
+    std::vector<float> r, g, b;
+    if (!Load1DCubeLUT(cube, r, g, b)) {
+        error = "cube_path is not a valid 1D .cube LUT";
+        return;
+    }
+    double peakNits = p.getNum("peak_nits", 0.0);
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        m.sourceFilePath = cube;
+        m.sourceIs1DCube = true;
+        m.hasPerChannelTRC = false;
+        m.grayscale.enabled = true;            // base grayscale now comes from the cube
+        if (peakNits > 0.0) m.grayscale.peakNits = (float)peakNits;
+    }
+    JsonValue mo = JObj();
+    mo.set("source_is_1d_cube", JBool(true));
+    mo.set("lut_size", JNum((int)r.size()));
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("mhc", mo);
+}
+
 void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -1178,6 +1219,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "mhc.set_primaries") DoMhcSetPrimaries(*r->params, *r->result, *r->error);
         else if (m == "mhc.set_white") DoMhcSetWhite(*r->params, *r->result, *r->error);
         else if (m == "mhc.set_base_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, false);
+        else if (m == "mhc.set_base_lut") DoMhcSetBaseLut(*r->params, *r->result, *r->error);
         else if (m == "mhc.set_correction_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, true);
         else if (m == "mhc.apply") DoMhcApply(*r->params, *r->result, *r->error);
         else if (m == "mhc.remove") DoMhcRemove(*r->params, *r->result, *r->error);

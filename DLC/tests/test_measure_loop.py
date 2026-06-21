@@ -68,17 +68,48 @@ def test_write_ti3_round_trips_through_parse_ti3():
     acc = [
         AcceptedRead(patch=_patch("p0", (0, 0, 0), t, 0), xyz=(0.10, 0.10, 0.11)),
         AcceptedRead(patch=_patch("p1", (1023, 1023, 1023), t, 1), xyz=(95.0, 100.0, 108.0)),
+        # A near-black patch (cv 10 ≈ 0.978% signal) writes to a 0–100 value BELOW 1.0; it
+        # MUST round-trip to its true sub-1% signal, not be mis-read as a ~0.978 near-peak
+        # signal — the parse_ti3 scale bug that scored dark HDR patches at dE_ITP ~700.
+        AcceptedRead(patch=_patch("p2", (10, 10, 10), t, 2), xyz=(0.20, 0.21, 0.23)),
     ]
     out = Path("__ti3_tmp__.ti3")
     try:
         write_ti3(out, acc)
         samples = parse_ti3(out)
-        assert len(samples) == 2
+        assert len(samples) == 3
         assert samples[1].rgb == (1.0, 1.0, 1.0)
         assert abs(samples[1].xyz[1] - 100.0) < 1e-3
         assert samples[0].rgb == (0.0, 0.0, 0.0)
+        dark = samples[2].rgb[0]
+        assert abs(dark - 10 / 1023) < 1e-4   # true sub-1% signal preserved
+        assert dark < 0.02                     # NOT the ~0.978 the old >1.0 heuristic produced
     finally:
         out.unlink(missing_ok=True)
+
+
+def test_parse_ti3_scales_and_clamps_per_spec(tmp_path: Path):
+    # Argyll .ti3 device values are 0–100 percent: parse_ti3 divides by 100 UNCONDITIONALLY
+    # (a sub-1.0 entry is a sub-1% patch, not an already-0–1 signal) and clamps to [0, 1]
+    # for out-of-spec / meter-noise values.
+    ti3 = tmp_path / "edge.ti3"
+    ti3.write_text(
+        "CTI3\nBEGIN_DATA_FORMAT\nRGB_R RGB_G RGB_B XYZ_X XYZ_Y XYZ_Z\nEND_DATA_FORMAT\n"
+        "NUMBER_OF_SETS 5\nBEGIN_DATA\n"
+        "0.0 0.0 0.0 0.0 0.0 0.0\n"                          # black
+        "100.0 100.0 100.0 95.0 100.0 108.0\n"              # full white
+        "0.977517 0.977517 0.977517 0.005 0.006 0.008\n"    # near-black (was mis-read as ~0.978)
+        "150.0 150.0 150.0 1.0 1.0 1.0\n"                   # over-spec -> clamp 1.0
+        "-0.5 -0.5 -0.5 0.0 0.0 0.0\n"                      # negative -> clamp 0.0
+        "END_DATA\n",
+        encoding="utf-8",
+    )
+    rgbs = [s.rgb for s in parse_ti3(ti3)]
+    assert rgbs[0] == (0.0, 0.0, 0.0)
+    assert rgbs[1] == (1.0, 1.0, 1.0)
+    assert all(abs(c - 0.00977517) < 1e-6 for c in rgbs[2])   # sub-1% preserved, NOT ~0.978
+    assert rgbs[3] == (1.0, 1.0, 1.0)                          # over-spec clamped
+    assert rgbs[4] == (0.0, 0.0, 0.0)                          # negative clamped
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +663,34 @@ def test_measure_loop_emits_quartile_check_ins_and_completion_digest(tmp_path: P
     completed = [e for e in digest if e.event == "completed" and e.stage == "measure_loop"]
     assert len(completed) == 1                                      # the measure OUTCOME on the spine
     assert completed[0].data["patch_count"] == 16 and "warm" in completed[0].data
+
+
+def test_measure_loop_wall_clock_backstop_emits_beyond_quartiles(tmp_path: Path, monkeypatch):
+    """A slow / measure-only stage must still surface periodic check-ins when the 3 progress
+    quartiles are sparse: the §12 wall-clock backstop (``checkin_interval_s``) fires EMIT-ONLY
+    so a long run is never 0 check-ins. (Default interval 0 → backstop off → only quartiles,
+    per the companion test.)"""
+    import dlc.measure_loop as ml
+    from dlc.events import RunLog, read_events, digest_projection
+
+    # A monotonic clock that advances a fixed step every call, so the wall-clock floor is
+    # crossed repeatedly during the main pass without real waiting. _now() uses datetime, so
+    # only the backstop logic reads time.monotonic — making this deterministic.
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ml.time, "monotonic", lambda: clock.__setitem__("t", clock["t"] + 60.0) or clock["t"])
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, white_nits=120.0)
+    epath = tmp_path / "e.jsonl"
+    runlog = RunLog(epath, phase="measure:raw")
+    run_measure_loop(patches=_grey_ramp(t, 16), transfer=t, measure=panel,
+                     config=MeasureLoopConfig(), runlog=runlog,
+                     ti3_path=tmp_path / "m.ti3", ndjson_path=tmp_path / "m.ndjson",
+                     checkin_interval_s=120.0)
+
+    check_ins = [e for e in digest_projection(read_events(epath)) if e.event == "check_in"]
+    assert len(check_ins) > 3                                       # backstop fired beyond the 3 quartiles
+    assert {0.25, 0.5, 0.75} <= {round(e.data["progress"], 2) for e in check_ins}  # quartiles still present
 
 
 def test_write_ti3_excludes_unusable_holes(tmp_path: Path):

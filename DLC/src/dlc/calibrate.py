@@ -130,14 +130,18 @@ SEAM_STACK = "require_stack"       # gray-wb/3dlut-only precondition unmet
 SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/meter behaviour
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
-SEAM_CHECKIN = "timed_checkin"     # §12 timed check-in: "status — continue?" (gates live, pings auto/supervised)
 SEAM_HARDWARE_READY = "hardware_readiness"  # one live gate before the first meter/presenter read
+# NOTE: there is deliberately NO check-in seam. A §12 check-in is a NON-BLOCKING evidence packet
+# for the LLM (see _maybe_timed_checkin), never an adjudicated yes/no — it must never gate the spine.
 
 # The benign, happy-path choice at a seam — the recommendation a clean run carries. A
-# recommendation OUTSIDE this set means the deterministic core wants to stop/redo something,
-# which is exactly when SupervisedAdjudicator pulls a live judge into an unattended run.
-# ``continue`` (the timed check-in's default) is benign: an unattended run pings through it
-# (the rich digest still lands on the spine), while a fully-live MappingAdjudicator gates on it.
+# recommendation OUTSIDE this set means the deterministic core wants to stop/redo something.
+# CAUTION (Design Law, see module header): "benign" means *the core has a sensible default*,
+# NOT *no LLM needed*. A benign ``accept`` on a passing verify is still a judgment the LLM must
+# make. ``SupervisedAdjudicator`` currently auto-accepts these — the known divergence Task #1
+# fixes (escalate benign judgment seams to the LLM). The default ``MappingAdjudicator`` already
+# routes every seam, benign or not, to the LLM. (Check-ins are NOT seams — they are non-blocking
+# evidence packets the LLM consumes out of band; see ``_maybe_timed_checkin``.)
 _BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "done", "continue"})
 # Digest flags that, even under a benign recommendation, mark a seam worth a judge's eyes.
 # ``gate_failed`` is the verify gate's "outside quality targets" signal: a benign ``apply``
@@ -149,6 +153,26 @@ _SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "cri
 
 # ---------------------------------------------------------------------------
 # Adjudication — the LLM seam
+#
+# DESIGN LAW (do not regress): DLC is not a scripted program — it is scripts tied
+# together by a spine the LLM adjudicates. There is NO headless/unattended/autonomous
+# hardware run; every run is LLM-overseen throughout. Anything that is not a
+# 100%-deterministic yes/no goes to the LLM to decide or to raise with the user; only
+# provably-mechanical facts stay in code. Auto-accepting / rubber-stamping / silently
+# logging a non-trivial decision is a VIOLATION. A "benign" recommendation is a default
+# the LLM may take, not a licence for code to skip the LLM. ``AutoAdjudicator`` is sim/CI
+# ONLY. The ``SupervisedAdjudicator`` benign-auto-accept below is a KNOWN DIVERGENCE from
+# this law (it silently accepts judgment seams like a passing verify); the fix — escalate
+# those to the LLM — is tracked as Task #1.
+#
+# CHECK-INS ARE NOT SEAMS. A §12 check-in (``_maybe_timed_checkin`` / the measure-loop
+# quartile ping) NEVER pauses the spine and carries NO recommendation. It is the spine
+# collecting the evidence since the last check-in — warnings, the max ΔE actually read,
+# re-read/repeated patches, non-stopper anomalies — and emitting it for the LLM to JUDGE
+# ("ΔE high but that's the panel limit"; "re-read twice but the latest is normal → self-
+# corrected"). The LLM consumes it from the running (background) spine and intervenes only
+# if it sees a real problem. Run-stoppers are the adjudicated seams above; check-ins are
+# pure data for LLM intelligence — the point of DLC, not a deterministic program.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -214,8 +238,10 @@ class Adjudicator(Protocol):
 
 
 class AutoAdjudicator:
-    """Deterministic: take the core's recommendation. The headless/sim/CI default
-    and the policy a human/LLM would otherwise rubber-stamp."""
+    """Deterministic: take the core's recommendation. **Sim/CI ONLY — never a hardware
+    run** (see the Design Law above). It consults no LLM, so using it on hardware is a
+    headless run, which by design does not exist. For a real run use ``MappingAdjudicator``
+    (every seam reaches the LLM)."""
 
     def adjudicate(self, request: AdjudicationRequest) -> Decision:
         return Decision(request.recommendation, note="auto: accepted core recommendation",
@@ -239,22 +265,24 @@ class MappingAdjudicator:
 
 
 class SupervisedAdjudicator:
-    """Autonomous, but escalate the seams that matter to a live judge.
+    """Escalate non-benign seams to a live judge; auto-accept benign ones.
 
-    The mode for an **unattended hardware run**: a clean run never pauses (every
-    benign recommendation is auto-accepted, like :class:`AutoAdjudicator`), but the
-    instant a seam goes non-benign — the core recommends ``abort``/``revert``/
-    ``retry``/… or the digest flags a severe/critical state — it **raises**
-    :class:`AdjudicationRequired` so an LLM/human makes the call with the full digest,
-    reusing the same pause/resume + ``--decide`` plumbing as :class:`MappingAdjudicator`.
+    **KNOWN DIVERGENCE from the Design Law (see the module header + Task #1).** This was
+    conceived as the mode for an "unattended hardware run" — but per the law *there is no
+    unattended run*. A benign ``continue``/``accept`` is still a judgment the LLM must make,
+    so silently auto-accepting benign **judgment** seams (timed check-ins, a passing verify)
+    is the bug the law corrects: those must reach the LLM, not land silently on the spine.
 
-    This closes the gap that sank the first HDR run: ``--auto`` follows the
-    recommendation blindly, so a foundation collapse recommended as ``accept`` (or not
-    gated at all) plows ahead for hours. Here the foundation seam recommends ``abort``
-    → non-benign → the judge is pulled in instead of rubber-stamping.
+    What it does today: a recorded decision replays; otherwise a seam **raises**
+    :class:`AdjudicationRequired` only when the core's recommendation is non-benign
+    (``abort``/``revert``/``retry``/…) or the digest flags a severe/critical state — every
+    *benign* seam is auto-accepted. That half is correct (it closes the gap that sank the
+    first HDR run, where ``--auto`` plowed through a foundation collapse for hours); the
+    other half (auto-accepting benign judgment seams) is what Task #1 makes escalate.
 
-    Seed it with the decisions made so far (loaded from the run-record on resume), so a
-    recorded judgment replays verbatim and only a genuinely new safety seam pauses."""
+    Until Task #1 lands, prefer the default ``MappingAdjudicator`` for a hardware run so
+    every seam genuinely reaches the LLM. Seed with decisions-so-far (loaded on resume) so a
+    recorded judgment replays verbatim and only a genuinely new seam pauses."""
 
     def __init__(self, decisions: Optional[dict[str, Decision]] = None) -> None:
         self.decisions = dict(decisions or {})
@@ -532,6 +560,7 @@ class Calibration:
         self._checkin_interval_s = max(0.0, float(checkin_interval_s))
         self._last_checkin_monotonic: Optional[float] = None
         self._last_checkin_tally: dict[str, int] = {}
+        self._last_checkin_pos: int = 0   # events.jsonl byte offset at the last check-in (evidence window)
         self._run_started_monotonic: Optional[float] = None
         # Latest live metrics, snapshotted as they happen, so a check-in carries them without
         # re-deriving from artifacts: the most recent intermediate score + the last optimizer iter.
@@ -693,11 +722,11 @@ class Calibration:
         self._save()
         self.runlog.stage_done(key, status=outcome.status)
         self._emit_header()   # target/white/correction may have just become known
-        # A freshly-completed stage is a safe (memoised) boundary — surface a timed check-in if
-        # the floor has elapsed. gating=True: a live run may pause here ("continue?"); the stage
-        # is already recorded done, so a resume replays it without re-doing the work. Replayed
-        # stages (the early-return above) never reach here, so a resume doesn't re-fire check-ins.
-        self._maybe_timed_checkin(key, gating=True)
+        # A freshly-completed stage is a natural checkpoint — emit a §12 evidence packet for the
+        # LLM if the floor has elapsed. Emit-only (never gates): the stage is already recorded
+        # done. Replayed stages (the early-return above) never reach here, so a resume doesn't
+        # re-fire check-ins.
+        self._maybe_timed_checkin(key)
         return outcome
 
     # -- the seam ---------------------------------------------------------
@@ -1049,6 +1078,7 @@ class Calibration:
             patches=patches, transfer=transfer, measure=self.measure, config=cfg,
             ti3_path=meas_dir / ti3_name, ndjson_path=meas_dir / ndjson_name,
             runlog=self.runlog, liveness=self.liveness, dip=dip,
+            checkin_interval_s=self._checkin_interval_s,
         )
 
     def _liveness_threshold(self, dip: Optional[Any]) -> float:
@@ -1154,22 +1184,26 @@ class Calibration:
             data = result.as_dict()
             self._last_optimizer = dict(data)
             self.runlog.optimizer_iteration(**data)
-            # The optimizer is the long pole (it can run for hours). Surface a timed check-in
-            # between iterations — emit-only (gating=False): a mid-stage pause would discard the
-            # un-memoised optimizer work, so we never gate here, only ping.
-            self._maybe_timed_checkin("build-install-3dlut", gating=False)
+            # The optimizer is the long pole (it can run for hours). Emit a §12 evidence packet
+            # between iterations so a multi-hour optimize never goes dark for the LLM.
+            self._maybe_timed_checkin("build-install-3dlut")
         except Exception:  # noqa: BLE001 - telemetry must never break the build
             pass
 
-    # -- §12 timed check-in ------------------------------------------------
-    def _maybe_timed_checkin(self, trigger: str, *, gating: bool) -> None:
-        """Surface a rich "status — continue?" check-in once the coarse wall-clock floor has
-        elapsed (§12). Always EMITS the check-in (dashboard flag + LLM digest projection). When
-        ``gating`` is set (a memoised stage boundary — safe to pause), it ALSO routes through the
-        adjudicator: a fully-live ``MappingAdjudicator`` GATES on "continue?", while ``--auto`` /
-        ``--supervised`` ping straight through (``continue`` is benign — the digest still lands).
-        ``gating=False`` (a mid-stage trigger like an optimizer iteration) only emits — a pause
-        there would raise out of an un-memoised stage and discard its work. Disabled at interval 0.
+    # -- §12 timed check-in (NON-BLOCKING evidence packet) ------------------
+    def _maybe_timed_checkin(self, trigger: str) -> None:
+        """Emit a rich evidence packet for the overseeing LLM once the wall-clock floor has
+        elapsed (§12). Disabled at interval 0; the first checkpoint only anchors the clock.
+
+        DESIGN LAW (do not regress): a check-in NEVER pauses the spine and carries NO
+        recommendation/accept for anyone to rubber-stamp. It is the spine collecting the
+        evidence since the last check-in — warnings, the max ΔE actually read, re-read /
+        repeated patches, non-stopper anomalies — and handing it to the LLM EVERY TIME so the
+        LLM applies judgment ("ΔE high but that's the panel limit"; "patch re-read twice but
+        the latest read is normal → self-corrected") and intervenes ONLY if it sees a real
+        problem. Run-stoppers are a SEPARATE mechanism (adjudicated seams). The LLM consumes
+        this from the running (background) spine out of band — emit-only, no exit-10 gate. This
+        is the point of DLC: LLM intelligence consuming tools+data, not a deterministic program.
         """
         import time
         if self._checkin_interval_s <= 0 or self.runlog is None:
@@ -1179,6 +1213,7 @@ class Calibration:
             # First checkpoint just anchors the clock — no immediate ping at second 0.
             self._last_checkin_monotonic = now
             self._last_checkin_tally = dict(self.runlog.tally)
+            self._last_checkin_pos = self._events_size()
             return
         if now - self._last_checkin_monotonic < self._checkin_interval_s:
             return
@@ -1186,20 +1221,12 @@ class Calibration:
         seq = int(self.calib.get("checkin_seq", 0)) + 1
         self.calib["checkin_seq"] = seq
         digest = self._checkin_digest(trigger, seq=seq, elapsed_since_checkin_s=round(elapsed_since, 1))
-        # Reset BEFORE adjudicating so a live pause/resume cycle doesn't immediately re-fire.
+        # Reset the window AFTER building the digest, BEFORE emitting, so the next window starts
+        # clean and the check_in event itself isn't counted into it.
         self._last_checkin_monotonic = now
         self._last_checkin_tally = dict(self.runlog.tally)
-        self.runlog.check_in(trigger, **digest)   # always: dashboard check-in flag + LLM digest
-        if not gating:
-            return
-        self._save()
-        decision = self.adjudicate(AdjudicationRequest(
-            key=f"checkin:{seq}", seam=SEAM_CHECKIN, stage=trigger,
-            question=(f"Timed check-in #{seq}: at {digest['overview']['stage']}, "
-                      f"{digest['overview']['stages_done']} stage(s) done, "
-                      f"{_fmt_elapsed(digest['overview'].get('elapsed_s'))} elapsed. Continue, or abort?"),
-            options=("continue", "abort"), recommendation="continue", digest=digest))
-        self._abort_if(decision, stage=trigger, message=f"aborted at timed check-in #{seq}")
+        self._last_checkin_pos = self._events_size()
+        self.runlog.check_in(trigger, **digest)   # EMIT-ONLY: evidence for the LLM, never a gate
 
     def _checkin_digest(self, trigger: str, *, seq: int = 0,
                         elapsed_since_checkin_s: float = 0.0) -> dict[str, Any]:
@@ -1210,8 +1237,59 @@ class Calibration:
             "elapsed_since_checkin_s": elapsed_since_checkin_s,
             "overview": self._run_overview(trigger),
             "since_last": self._events_since_last_checkin(),
+            "evidence": self._checkin_evidence(),
             "metrics": self._latest_checkin_metrics(),
         }
+
+    def _events_size(self) -> int:
+        """Current byte size of events.jsonl (the check-in evidence window high-water mark)."""
+        try:
+            return self.runlog.path.stat().st_size if self.runlog else 0
+        except OSError:
+            return 0
+
+    def _checkin_evidence(self) -> dict[str, Any]:
+        """The REAL evidence since the last check-in, read back from the events.jsonl window:
+        every warning/anomaly (with detail), the max ΔE actually read + which patch, and the
+        read count. This is data for the LLM to JUDGE — deliberately NOT a verdict and NOT a
+        recommendation. The full firehose is always on disk; this is the at-a-glance packet."""
+        import json as _json
+        out: dict[str, Any] = {"reads": 0, "max_dE": None, "max_dE_patch": None, "warnings": []}
+        if self.runlog is None:
+            return out
+        try:
+            with self.runlog.path.open("r", encoding="utf-8") as fh:
+                fh.seek(self._last_checkin_pos or 0)
+                lines = fh.readlines()
+        except OSError:
+            return out
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                e = _json.loads(ln)
+            except ValueError:
+                continue
+            ev = e.get("event")
+            data = e.get("data") or {}
+            if ev == "patch_read":
+                out["reads"] += 1
+                de = data.get("dE")
+                if isinstance(de, (int, float)) and (out["max_dE"] is None or de > out["max_dE"]):
+                    out["max_dE"] = round(de, 3)
+                    out["max_dE_patch"] = data.get("label") or data.get("role") or data.get("signal")
+            elif ev in ("anomaly", "read_plausibility_anomaly", "stall"):
+                w = {"event": ev, "stage": e.get("stage")}
+                for k in ("kind", "label", "reason", "message", "detail", "attempt"):
+                    if k in data:
+                        w[k] = data[k]
+                out["warnings"].append(w)
+        # Cap the inline warning list so the packet stays readable; the full log is on disk.
+        if len(out["warnings"]) > 25:
+            extra = len(out["warnings"]) - 25
+            out["warnings"] = out["warnings"][:25] + [{"truncated": extra, "note": "see events.jsonl"}]
+        return out
 
     def _run_overview(self, trigger: str) -> dict[str, Any]:
         import time
@@ -2220,13 +2298,35 @@ class Calibration:
             self.calib = self._state.setdefault("calib", self.calib)
             params = self._state.get("mhc_params") or {}
             base = params["base_grayscale"]
-            # Install through the controller (set primaries/white/base grayscale → apply → verify).
+            base_lut = params.get("base_lut")
+            # Install through the controller (set primaries/white → base correction → apply → verify).
             self.controller.set_primaries(self.monitor, self.mode, params["primaries"])
             white = self._resolved_white()
             wx, wy = white.xy
-            self.controller.set_white(self.monitor, self.mode, wx, wy)
-            self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
-                                               base["points"], base["deviations"], gamma=spec.gamma)
+            # set_white populates DesktopLUT's customPrimaries.W — the MEASURED *display*
+            # characterization white, NOT the target. The MHC matrix is
+            # srcToXYZ(standard @ D65) · inv(displayToXYZ(measured primaries, displayPrim.W)),
+            # so white adaptation is the normalization difference between the fixed src white
+            # (D65, baked into g_bt2020/g_srgb srcPrim) and displayPrim.W. Sending the TARGET
+            # (D65) here makes displayPrim.W == src white ⇒ ZERO white adaptation ⇒ the panel's
+            # native white passes straight through (HW evidence 2026-06-20: peak white stayed at
+            # native ~0.324 in both HDR runs). The matrix can only correct native→D65 if it knows
+            # the panel's measured white. (SDR limps to target via the post-install refine loop;
+            # HDR has none.) See mhc_icc.cpp ComputeMHC2Matrix / GenerateMHC2Profile.
+            mw = (params.get("measured_white") or {})
+            if spec.is_hdr and mw.get("x") is not None and mw.get("y") is not None:
+                self.controller.set_white(self.monitor, self.mode, mw["x"], mw["y"])
+            else:
+                self.controller.set_white(self.monitor, self.mode, wx, wy)
+            # HDR base EOTF rides a full-resolution per-channel 1D .cube (set_base_lut → 4096-entry
+            # MHC2 LUT); the 32-point set_base_grayscale table is too sparse for a PQ EOTF and is
+            # reserved for GS+WB post-fixes. SDR keeps the (adequate) 32-point base.
+            if spec.is_hdr and base_lut and base_lut.get("cube_path"):
+                self.controller.set_base_lut(self.monitor, self.mode, base_lut["cube_path"],
+                                             base_lut.get("peak_nits", 0.0))
+            else:
+                self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
+                                                   base["points"], base["deviations"], gamma=spec.gamma)
             applied = self.controller.apply_mhc(self.monitor, self.mode)
             verified = self.controller.verify_mhc(self.monitor, self.mode)
             params["white"] = {"x": round(wx, 6), "y": round(wy, 6)}
@@ -3687,6 +3787,17 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # so a run is never stuck with a preset sequence.
     patch_sizes = PatchSizes.from_dict(profile.patches).merged(
         **{f.name: getattr(args, f.name, None) for f in fields(PatchSizes)})
+
+    # HDR foundation ramps use UNIFORM (even PQ-signal) spacing. The per-channel 1D .cube EOTF
+    # correction (dlc.mhc_cube) is built from these grey + R/G/B ramps, and PQ (ST.2084) is ALREADY
+    # perceptually uniform by design (equal 10-bit code steps ≈ equal Barten perceptual steps) — so
+    # even-signal steps give a balanced near-black→peak ladder (e.g. for a 1800-nit cap: ~12 of 32
+    # points below 10 nits, ~8 across the 10–100 nit diffuse range, ~6 in highlights). The additive
+    # low_light_steps then layer MORE toe density on top. The "perceptual" mode (perceptual_levels,
+    # space_gamma≈2.2) is an SDR-gamma construct: layering a 2.2 curve on top of PQ shoves samples
+    # into the bright end (measured: 15/32 points above 400 nits, only 3 below 10) — wrong for a PQ
+    # panel. SDR (true power-law) is where "perceptual" belongs; HDR stays uniform. An explicit
+    # --raw-spacing or a profile `raw_spacing:` still overrides.
 
     if args.preview_patches:
         # Decide the time/size BEFORE committing: print the per-stage patch counts for the flow

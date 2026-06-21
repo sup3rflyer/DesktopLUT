@@ -98,7 +98,21 @@ def parse_ti3(path: Path) -> list[Ti3Sample]:
 
 
 def _normalize_rgb(value: float) -> float:
-    return max(0.0, min(1.0, value / 100.0 if value > 1.0 else value))
+    """Scale an Argyll/CGATS ``.ti3`` device value to ``[0, 1]``.
+
+    Per the Argyll ``.ti3`` spec (https://www.argyllcms.com/doc/ti3_format.html) **all
+    device values are percentages, 0.0–100.0** — and both DLC writers
+    (:func:`dlc.measure_loop.write_ti3` and :func:`dlc.simulation.write_synthetic_ti3`)
+    emit ``signal * 100``. So divide by 100 **unconditionally**.
+
+    The previous ``value / 100 if value > 1.0 else value`` heuristic mis-read any entry
+    ``<= 1.0`` — i.e. a near-black patch (a 10-bit cv-10 grey is ``0.978`` ≈ 0.978%) — as an
+    already-0–1 signal, turning the darkest patches into near-peak signals. That poisoned
+    every consumer (MHC/3D-LUT training and dE scoring); in HDR it was catastrophic because
+    PQ maps the phantom near-peak signal to thousands of nits against a ~0-nit read
+    (white-at-peak scored dE_ITP ~691 instead of ~7.6). Clamp to ``[0, 1]`` for meter-noise
+    negatives / any out-of-spec overshoot."""
+    return max(0.0, min(1.0, value / 100.0))
 
 
 def xy_from_xyz(xyz: tuple[float, float, float]) -> tuple[float, float]:

@@ -151,6 +151,24 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             gui_thread_required=True,
         ),
         ApiMethodSpec(
+            "mhc.set_base_lut",
+            "Import a full-resolution per-channel 1D .cube as the MHC base EOTF correction "
+            "(the ColourSpace/DisplayCal path). DesktopLUT bakes it into the 4096-entry HDR "
+            "(1024 SDR) MHC2 LUT; the matrix (set_primaries/set_white) still owns primaries + "
+            "white. Used for the HDR base where the 32-point table is too sparse for a PQ EOTF.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "cube_path": ApiParamSpec("string", description="Absolute path to a 1D Iridas .cube (LUT_1D_SIZE)."),
+                "peak_nits": ApiParamSpec(
+                    "number", required=False, description="HDR peak luminance metadata (MaxCLL), nits."
+                ),
+            },
+            {"monitor_mode": "string", "mhc": "object"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
             "mhc.set_correction_grayscale",
             "Set the MHC correction grayscale (the refinement layer composed on top of the base) "
             "for the target monitor/mode.",

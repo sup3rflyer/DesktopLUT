@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -372,6 +373,7 @@ class _Loop:
         runlog: Optional[RunLog] = None,
         liveness: Optional[Liveness] = None,
         dip: Optional[DisplayInstrumentProfile] = None,
+        checkin_interval_s: float = 0.0,
     ) -> None:
         self.transfer = transfer
         self.cfg = config
@@ -391,6 +393,9 @@ class _Loop:
         # absent, the loop falls back to the single-read default (trust the instrument's
         # adaptive integration) — variance-based SNR/abnormality needs a DIP to know σ.
         self.dip = dip
+        # §12 wall-clock backstop for the in-measure check-in (emit-only) — see _maybe_checkin.
+        self._checkin_interval_s = max(0.0, float(checkin_interval_s))
+        self._last_checkin_monotonic = time.monotonic()
 
         signals = to_signal(patches, transfer)
         width = max(4, len(str(max(0, len(patches) - 1))))
@@ -496,12 +501,18 @@ class _Loop:
         )
 
     def _maybe_checkin(self, index: int) -> None:
-        """A coarse, PROGRESS-driven digest check-in at quartiles of the patch set, so the
-        LLM's digest projection shows forward motion DURING a long measure stage — the
-        per-patch ``patch_read`` + ``heartbeat`` are stream-tier and dropped from the
-        digest, so without this a 30-min measure looks (to the LLM) like ``stage_start``
-        then silence until ``stage_done``. Fires off MEASURED progress, never a wall-clock
-        timer (the owner's no-magic-cadence rule)."""
+        """A coarse digest check-in DURING a long measure stage, so the LLM's digest
+        projection shows forward motion (per-patch ``patch_read`` + ``heartbeat`` are
+        stream-tier and dropped from the digest — without this a 30-min measure looks like
+        ``stage_start`` then silence until ``stage_done``).
+
+        PRIMARY trigger = MEASURED progress at quartiles (the owner's no-magic-cadence rule).
+        BACKSTOP = a coarse wall-clock floor (§12 ``--checkin-interval``), so a slow stage —
+        or a measure-only flow (``mhc-only`` / ``gray-wb``: no optimizer ticking §12 at the
+        orchestrator) — never goes dark over a long run ("never 0 check-ins in a 3-hour run").
+        EMIT-ONLY: this never gates or pauses (the §12 stage-boundary seam owns the
+        mode-driven continue? decision); here we only surface status. Every emit (quartile or
+        backstop) resets the floor so a quartile crossing doesn't immediately re-trigger it."""
         if self.runlog is None:
             return
         total = len(self.patches)
@@ -511,12 +522,25 @@ class _Loop:
         for q in (0.25, 0.5, 0.75):
             if q not in self._checkin_quartiles and frac >= q:
                 self._checkin_quartiles.add(q)
-                self.runlog.check_in(
-                    "measure", progress=round(frac, 2),
-                    patches_done=index, patches_total=total,
-                    reads=self.seq_counter, warm=self.warm,
-                    drift_episodes=self.drift_episodes,
-                    white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None))
+                self._emit_measure_checkin(index, total, frac)
+        if self._checkin_interval_s > 0 \
+                and time.monotonic() - self._last_checkin_monotonic >= self._checkin_interval_s:
+            self._emit_measure_checkin(index, total, frac)
+
+    def _emit_measure_checkin(self, index: int, total: int, frac: float) -> None:
+        self._last_checkin_monotonic = time.monotonic()
+        # EMIT-ONLY evidence packet for the LLM (never gates): forward motion + the warnings and
+        # repeated-measurement signals the LLM judges. ``drift_episodes`` = neutral re-reads that
+        # left the envelope; ``read_anomalies`` = non-stopper read-plausibility flags. The latest
+        # anomaly detail rides along so the LLM can judge "flagged once, recovered" vs "ongoing".
+        self.runlog.check_in(
+            "measure", progress=round(frac, 2),
+            patches_done=index, patches_total=total,
+            reads=self.seq_counter, warm=self.warm,
+            drift_episodes=self.drift_episodes,
+            read_anomalies=len(self.read_anomalies),
+            last_anomaly=(self.read_anomalies[-1] if self.read_anomalies else None),
+            white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None))
 
     def _read(
         self,
@@ -1364,6 +1388,7 @@ def run_measure_loop(
     runlog: Optional[RunLog] = None,
     liveness: Optional[Liveness] = None,
     dip: Optional[DisplayInstrumentProfile] = None,
+    checkin_interval_s: float = 0.0,
 ) -> MeasureLoopResult:
     """Run the adaptive measurement loop over ``patches`` (code-value triples,
     already thermally ordered by the caller via :mod:`dlc.engine.patches`).
@@ -1394,6 +1419,7 @@ def run_measure_loop(
         runlog=runlog,
         liveness=liveness,
         dip=dip,
+        checkin_interval_s=checkin_interval_s,
     )
 
     preheat_digest = loop.preheat()
