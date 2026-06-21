@@ -231,8 +231,14 @@ class DashboardState:
             self.header = dict(data)
             self.schema_version = data.get("schema_version", self.schema_version)
             self.run_id = data.get("run_id", self.run_id)
-            if self.run_status == RUN_IDLE:
-                self.run_status = RUN_RUNNING
+            # A run_header marks a run process (re)starting. Promote to RUNNING even from a
+            # prior TERMINAL status — a resume appends a fresh run_header into the same events
+            # stream after an earlier run_done (e.g. an aborted run resumed from a memoised
+            # stage); without this the dashboard stays latched on the stale "aborted" while
+            # live build events keep arriving (half-live view). A real end re-terminates via
+            # the next run_done. (_clear_alarm deliberately does NOT resurrect terminal runs;
+            # run_header is the stronger, explicit restart signal that may.)
+            self.run_status = RUN_RUNNING
         elif name == Ev.PHASE:
             self.phase = data.get("phase_name", self.phase)
         elif name == Ev.STAGE_START:
