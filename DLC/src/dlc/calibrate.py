@@ -75,6 +75,7 @@ from .engine.patches import (
     Transfer,
     cube_patches,
     gamut_patches,
+    near_neutral_tube_patches,
     ramp_patches,
     shadow_levels,
     sort_patches,
@@ -329,6 +330,14 @@ class PatchSizes:
     raw_include_secondaries: bool = False   # add C/M/Y ramps too? Off ⇒ grey + R/G/B only (the foundation)
     raw_spacing: str = "uniform"    # uniform | perceptual (even-signal vs even-perceptual)
 
+    # near-neutral tube (MHC FOUNDATION): off-axis samples around the grey axis (R≠G≠B but close
+    # to neutral) along the six hue directions. Characterizes the OFF-AXIS non-additivity / white-
+    # balance region the matrix + per-channel 1D LUT correct THROUGH — which the grey diagonal +
+    # per-channel ramps cannot reveal. Off by default (0); the ICC-characterization sequence turns
+    # it on. DIP-independent (on-axis/near-neutral is in-gamut for any panel).
+    icc_tube_levels: int = 0        # grey anchor levels for the tube (0 ⇒ no tube)
+    icc_tube_offsets: tuple[float, ...] = (0.06, 0.15)   # chroma offsets as a fraction of the level
+
     # volumetric set (3D-LUT build, post-MHC). ``tube`` mode hits all three goals at once: the
     # CUBE covers the ENTIRE gamut (boundary anchoring), the neutral TUBE concentrates density on
     # the practical near-neutral region where content lives, and the full-resolution GREY AXIS gives
@@ -373,7 +382,7 @@ class PatchSizes:
             if f.name not in d or d[f.name] is None:
                 continue
             v = d[f.name]
-            if f.name in ("raw_saturations", "verify_saturations"):
+            if f.name in ("raw_saturations", "verify_saturations", "icc_tube_offsets"):
                 kw[f.name] = tuple(float(x) for x in v)
             elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
@@ -389,7 +398,7 @@ class PatchSizes:
         """Return a copy with only the **non-None** overrides applied (CLI flags that
         were actually passed). ``raw_saturations`` is coerced to a tuple."""
         clean = {k: v for k, v in overrides.items() if v is not None}
-        for sat_key in ("raw_saturations", "verify_saturations"):
+        for sat_key in ("raw_saturations", "verify_saturations", "icc_tube_offsets"):
             if sat_key in clean:
                 clean[sat_key] = tuple(float(x) for x in clean[sat_key])
         return replace(self, **clean)
@@ -3343,13 +3352,27 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
     only if ``raw_include_secondaries`` (off by default — the volumetric set covers them).
 
     ``max_cv`` caps the top of the generated range (HDR: the target peak's code value, so no
-    patch exceeds the reachable sub-peak range); ``None`` ⇒ the full bit-depth range (SDR)."""
-    return ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
+    patch exceeds the reachable sub-peak range); ``None`` ⇒ the full bit-depth range (SDR).
+
+    When ``icc_tube_levels`` > 1 the foundation also carries a near-neutral TUBE (off-axis samples
+    around the grey axis) so the matrix + per-channel-1D white-balance correction has the off-axis
+    non-additivity data the grey diagonal alone can't provide. The tube is merged into the ramp set
+    and the union is re-ordered together for drift safety."""
+    ramp = ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
                         spacing=ps.raw_spacing, include_secondaries=ps.raw_include_secondaries,
                         low_light_steps=ps.low_light_steps,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
                         order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
+    if not ps.icc_tube_levels or ps.icc_tube_levels <= 1:
+        return ramp
+    cap = max_cv if max_cv is not None else transfer.max_cv
+    tube_levels = uniform_levels(ps.icc_tube_levels, cap)
+    tube = near_neutral_tube_patches(transfer, levels=tube_levels, offsets=ps.icc_tube_offsets,
+                                     max_cv=cap, order=ps.order, warm_tau=warm_tau)
+    seen = set(ramp)
+    union = ramp + [p for p in tube if p not in seen]
+    return sort_patches(union, ps.order, transfer, warm_tau=warm_tau)   # re-order the whole set
 
 
 def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
@@ -3618,6 +3641,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                        help="also measure C/M/Y ramps in the MHC stage (off by default — the matrix+1D "
                             "can't fit secondaries; the volumetric 3D-LUT set covers them).")
     patch.add_argument("--raw-spacing", choices=["uniform", "perceptual"], default=None, dest="raw_spacing")
+    patch.add_argument("--icc-tube-levels", type=int, default=None, dest="icc_tube_levels",
+                       help="grey anchor levels for the near-neutral TUBE in the MHC foundation — "
+                            "off-axis samples around the grey axis that characterize the white-balance / "
+                            "non-additivity region the matrix+1D corrects through (0 ⇒ off, the default).")
+    patch.add_argument("--icc-tube-offsets", type=float, nargs="+", default=None, dest="icc_tube_offsets",
+                       help="tube chroma offsets as fractions of the level, e.g. 0.06 0.15 (default).")
     patch.add_argument("--volumetric-mode", choices=["tube", "cube", "gamut"], default=None,
                        dest="volumetric_mode", help="how the 3D-LUT set samples the cube (default tube).")
     patch.add_argument("--cube-size", type=int, default=None, dest="cube_size",

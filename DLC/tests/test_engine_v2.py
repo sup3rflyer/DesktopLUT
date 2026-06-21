@@ -104,6 +104,44 @@ def test_ramp_primaries_only_drops_secondaries():
     assert len(prim) < len(full)
 
 
+def test_near_neutral_tube_is_offaxis_and_near_neutral():
+    # The ICC foundation tube samples R≠G≠B *close* to the grey axis (off-axis non-additivity /
+    # white-balance data) along the six hue directions — never on the diagonal, never wildly saturated.
+    tf = P.Transfer.pq()
+    levels = [128, 512, 800]
+    tube = P.near_neutral_tube_patches(tf, levels=levels, offsets=(0.06, 0.15), max_cv=835)
+    assert tube and len(tube) == len(set(tube))                      # deduped
+    assert all(not (p[0] == p[1] == p[2]) for p in tube)            # all off-axis
+    # near-neutral: chroma stays a modest fraction of the level (≤ ~2*max_offset), never a primary
+    for p in tube:
+        lvl = max(p)
+        assert (max(p) - min(p)) <= 0.4 * lvl + 2                    # bounded chroma
+    # all six hue directions appear at a mid level (R,G,B,C,M,Y around grey)
+    mid = [p for p in tube if 380 <= max(p) <= 640]
+    assert len({tuple(int(c > min(p)) for c in p) for p in mid}) >= 5
+
+
+def _is_tube_patch(p):
+    """A near-neutral tube sample: all three channels lit (min>0), off the grey axis, with chroma
+    only a modest fraction of the level. Distinguishes it from pure-channel ramps (a zero channel)."""
+    return min(p) > 0 and not (p[0] == p[1] == p[2]) and (max(p) - min(p)) <= 0.4 * max(p) + 2
+
+
+def test_foundation_tube_optin_and_backcompat():
+    # icc_tube_levels=0 (default) ⇒ the foundation is the old grey+RGB ramp (back-compat, no tube);
+    # turning it on adds near-neutral off-axis patches without dropping any ramp patch.
+    from dlc.calibrate import PatchSizes, build_ramp_set
+    tf = P.Transfer.pq()
+    base = build_ramp_set(PatchSizes(), tf, max_cv=835)
+    withtube = build_ramp_set(PatchSizes(icc_tube_levels=10, icc_tube_offsets=(0.06, 0.15)),
+                              tf, max_cv=835)
+    assert not any(_is_tube_patch(p) for p in base)                  # default: no tube
+    assert len(withtube) > len(base)
+    assert len(withtube) == len(set(withtube))                       # deduped union
+    assert set(base).issubset(set(withtube))                         # no ramp patch dropped
+    assert any(_is_tube_patch(p) for p in withtube)                  # near-neutral tube present
+
+
 def test_cube_count_and_dedup():
     tf = P.Transfer.pq()
     cube = P.cube_patches(tf, size=9)

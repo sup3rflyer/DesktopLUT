@@ -401,6 +401,58 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
 
 
 # ---------------------------------------------------------------------------
+# Near-neutral tube — off-axis samples around the grey axis (for the ICC fit)
+# ---------------------------------------------------------------------------
+
+# Six hue directions around neutral: push toward R/G/B/C/M/Y (one or two channels up, the
+# rest down) by a small chroma offset. Sampling these reveals OFF-AXIS non-additivity (how the
+# channels combine for R!=G!=B), which the grey diagonal + per-channel ramps cannot show but
+# which the MHC matrix + per-channel 1D white-balance correction operate through.
+_TUBE_DIRS = [
+    (+1, -1, -1),  # toward Red
+    (-1, +1, -1),  # Green
+    (-1, -1, +1),  # Blue
+    (-1, +1, +1),  # Cyan
+    (+1, -1, +1),  # Magenta
+    (+1, +1, -1),  # Yellow
+]
+
+
+def near_neutral_tube_patches(transfer: Transfer, *, levels: Sequence[int],
+                              offsets: Sequence[float] = (0.06, 0.15),
+                              max_cv: int | None = None, order: str = "thermal",
+                              warm_tau: Optional[int] = None) -> list[Patch]:
+    """Off-axis near-neutral samples for characterizing the ICC's white-balance region.
+
+    For each grey ``level`` (a code value on the neutral axis) and each chroma ``offset``
+    (a fraction of the level), perturb the channels along the six hue directions so the patch
+    is R!=G!=B but stays close to neutral. This is the data the per-channel 1D LUT's WB
+    correction needs and that the grey-diagonal-only characterization lacks; the offset scales
+    with the level so the chroma magnitude stays perceptually comparable across luminance.
+    """
+    if max_cv is None:
+        max_cv = transfer.max_cv
+
+    def clamp(x: int) -> int:
+        return min(max_cv, max(0, int(x)))
+
+    seen: set[Patch] = set()
+    out: list[Patch] = []
+    for V in levels:
+        if V <= 0:
+            continue
+        for frac in offsets:
+            d = max(1, round(V * frac))
+            for sr, sg, sb in _TUBE_DIRS:
+                p = (clamp(V + sr * d), clamp(V + sg * d), clamp(V + sb * d))
+                if p[0] == p[1] == p[2] or p in seen:   # clamped back onto the axis / dup
+                    continue
+                seen.add(p)
+                out.append(p)
+    return sort_patches(out, order, transfer, warm_tau=warm_tau)
+
+
+# ---------------------------------------------------------------------------
 # Cube mode — uniform N^3 (for 3D LUT)
 # ---------------------------------------------------------------------------
 
