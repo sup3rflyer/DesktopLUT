@@ -85,6 +85,36 @@ static void WriteCurvTagGamma(std::vector<uint8_t>& buf, float gamma) {
     PadTo4(buf);
 }
 
+// Write para (parametricCurveType) tag encoding the sRGB piecewise EOTF (ICC type 4):
+//   X >= d:  Y = (a*X + b)^g + e
+//   X <  d:  Y = c*X + f
+// sRGB params (e=f=0). Used for the HDR rTRC/gTRC/bTRC. In Advanced-Color/HDR mode Windows
+// IGNORES these TRC tags for a valid MHC profile (only lumi/MHC2/primaries drive the PQ
+// scanout) — so this curve does NOT touch PQ content. It exists for CMM-aware apps that
+// color-manage directly against the display profile: sRGB is the correct neutral tag (a
+// gamma-2.2 tag makes such apps apply an unwanted sRGB->2.2 conversion), and it matches the
+// canonical MHC2 reference (dantmnf/MHC2Gen always tags sRGB, never gamma 2.2). Real PQ-crush
+// would come from the MHC2 regamma LUT (desktop-gamma), not from this tag.
+static void WriteParaTagSrgb(std::vector<uint8_t>& buf) {
+    AppendBE32(buf, MakeSig("para"));   // type signature
+    AppendBE32(buf, 0);                 // reserved
+    AppendBE16(buf, 4);                 // function type 4 (full sRGB piecewise)
+    AppendBE16(buf, 0);                 // reserved
+    const float p[7] = {
+        2.4f,            // g
+        1.0f / 1.055f,   // a
+        0.055f / 1.055f, // b
+        1.0f / 12.92f,   // c
+        0.04045f,        // d
+        0.0f,            // e
+        0.0f,            // f
+    };
+    for (int i = 0; i < 7; i++) {
+        AppendBE32(buf, (uint32_t)FloatToS15Fixed16(p[i]));  // s15Fixed16
+    }
+    PadTo4(buf);
+}
+
 // Write mluc (multi-localized Unicode) tag
 static void WriteMlucTag(std::vector<uint8_t>& buf, const std::wstring& text) {
     AppendBE32(buf, MakeSig("mluc"));   // type signature
@@ -550,10 +580,18 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     WriteXYZTag(tagGXYZ, adaptedRGBtoXYZ[1], adaptedRGBtoXYZ[4], adaptedRGBtoXYZ[7]);
     WriteXYZTag(tagBXYZ, adaptedRGBtoXYZ[2], adaptedRGBtoXYZ[5], adaptedRGBtoXYZ[8]);
 
-    // rTRC/gTRC/bTRC - target gamma (shared tag, same offset for all three)
-    // Tells color-aware apps what the corrected display's EOTF is (2.2 default, 2.4 for BT.1886)
-    float profileGamma = (!params.isHDR && params.grayscale.use24Gamma) ? 2.4f : 2.2f;
-    WriteCurvTagGamma(tagTRC, profileGamma);
+    // rTRC/gTRC/bTRC - display EOTF tag for CMM-aware apps (shared tag, same offset for all
+    // three). SDR: a pure power-law curv (2.2 default, 2.4 for BT.1886) — the owner's "2.2,
+    // never piecewise sRGB" rule. HDR: the sRGB piecewise curve — the standards-correct neutral
+    // tag matching the MHC2 reference (dantmnf/MHC2Gen). NOTE: in HDR/Advanced-Color Windows
+    // ignores this tag for the PQ path; it only affects apps that color-manage against the
+    // profile directly. (See WriteParaTagSrgb.)
+    if (params.isHDR) {
+        WriteParaTagSrgb(tagTRC);
+    } else {
+        float profileGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
+        WriteCurvTagGamma(tagTRC, profileGamma);
+    }
 
     // chad - chromatic adaptation matrix (D65 -> D50 Bradford)
     WriteSf32Tag(tagChad, g_bradfordD65toD50);
