@@ -54,6 +54,8 @@ __all__ = [
     "invert_monotone",
     "peak_chroma_luminance",
     "adaptive_dark_floor",
+    "noise_trust",
+    "dark_trust_weights",
     "HDR_REFERENCE_WHITE_BAND",
     "mhc2_matrix",
     "build_hdr_cube",
@@ -232,6 +234,54 @@ def pq_oetf(y: float) -> float:
     return ((_PQ_C1 + _PQ_C2 * ym) / (1.0 + _PQ_C3 * ym)) ** _PQ_M2
 
 
+def noise_trust(error: float, noise: Optional[float], *,
+                lo_snr: float = 1.0, hi_snr: float = 3.0) -> float:
+    """How much to trust a measured correction of magnitude ``error`` against the per-reading
+    measurement ``noise`` (same units) — i.e. how much of it to apply vs. smooth to identity.
+
+    Returns ``w`` in [0,1]: **0** when the correction is within the noise (``error <= lo_snr·noise``
+    — indistinguishable from sensor noise / display fluctuation, so applying it just chases noise →
+    smooth to identity), **1** when it clearly exceeds the noise (``error >= hi_snr·noise`` — a real
+    signal worth correcting), a smoothstep between. ``noise`` is the read-to-read spread derived from
+    MULTIPLE readings (sensor noise AND short-term display instability both show up as spread). With
+    more readings the spread tightens, so the same real error clears the gate — exactly "more
+    readings → trust the reading more". ``noise`` None/≤0 (single read / perfect) ⇒ trust fully (1.0)."""
+    if noise is None or noise <= 0.0:
+        return 1.0
+    snr = error / noise
+    if snr <= lo_snr:
+        return 0.0
+    if snr >= hi_snr:
+        return 1.0
+    t = (snr - lo_snr) / (hi_snr - lo_snr)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def dark_trust_weights(levels: Sequence[tuple[float, float, float, Optional[float]]],
+                       reference_white_xy: tuple[float, float], *,
+                       lo_snr: float = 1.0, hi_snr: float = 3.0) -> list[tuple[float, float]]:
+    """Per-level trust weights from MEASURED repeatability — the core of the dark-level logic.
+
+    ``levels``: ``[(signal, x, y, chroma_sigma), ...]`` per measured neutral level, where
+    ``chroma_sigma`` is the read-to-read chromaticity spread at that level (e.g. RMS distance of the
+    reads from their mean in ``xy``), estimated from MULTIPLE readings. ``reference_white_xy`` is the
+    chromaticity the per-level correction drives toward (native white for ``build_hdr_cube``'s
+    per-level share correction; D65 for the closed-loop refine).
+
+    For each level the chroma error to correct is ``|measured_xy - reference|`` and the trust is
+    ``noise_trust(error, chroma_sigma)`` — so where the dark read's chromaticity is so noisy/unstable
+    that the error can't be distinguished from the spread, the weight collapses toward 0 (smooth that
+    level's correction to identity); where the read is stable, it stays ~1. Returns sorted
+    ``[(signal, w), ...]``; levels with no σ (single read) get ``w=1`` (trust the adaptive integration)."""
+    rx, ry = reference_white_xy
+    out: list[tuple[float, float]] = []
+    for sig, x, y, sigma in levels:
+        err = ((x - rx) ** 2 + (y - ry) ** 2) ** 0.5
+        out.append((float(sig), noise_trust(err, sigma, lo_snr=lo_snr, hi_snr=hi_snr)))
+    out.sort(key=lambda p: p[0])
+    return out
+
+
 def invert_trc(trc: Sequence[float], target: float) -> float:
     """Given an evenly-sampled monotonic TRC (signal->light, ``trc[k]`` at input ``k/(n-1)``),
     return the input signal in [0, 1] that yields ``target`` light. Port of ``mhc.cpp`` InvertTRC
@@ -311,7 +361,8 @@ def _gray_shares(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
 
 def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
                    white_xy: tuple[float, float], peak_luminance: float,
-                   *, lut_size: int = 1024, dark_floor_nits: float = 0.3
+                   *, lut_size: int = 1024, dark_floor_nits: float = 0.3,
+                   level_trust: Optional[Sequence[tuple[float, float]]] = None
                    ) -> tuple[dict[str, list[float]], dict[str, float]]:
     """Build the per-channel HDR EOTF+WB correction cube from a raw TI3's GRAY ramp.
 
@@ -328,7 +379,13 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     a per-level WB correction just chases meter noise and over-corrects (HW 2026-06-20: native
     gray y at sig 0.05 read 0.32 in one run, 0.42 in the next). Holding identity leaves the
     panel's (well-behaved) native shadow tracking + the matrix's white move to do it. 0.3 nit
-    (PQ signal ~0.117) is the colorimeter-grounded floor; 1 nit was needlessly conservative."""
+    (PQ signal ~0.117) is the colorimeter-grounded floor; 1 nit was needlessly conservative.
+
+    ``level_trust`` (optional): ``[(signal, w), ...]`` per-level trust weights from MEASURED
+    repeatability (:func:`dark_trust_weights`). When given, the per-level correction is additionally
+    scaled by the trust interpolated to each grid point — so a dark level whose chromaticity is too
+    noisy/unstable to trust is smoothed to identity REGARDLESS of the static nit floor. This is the
+    measurement-driven dark logic; the ``dark_floor_nits`` ramp remains as a luminance guard/fallback."""
     if peak_luminance <= 0.0:
         raise ValueError("peak_luminance must be positive")
     sigs, shares = _gray_shares(samples, primaries, white_xy, peak_luminance)
@@ -338,6 +395,9 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     peak_share = {ch: shares[ch][-1] for ch in _CHANNELS}
     # Signal below which a level's luminance is under the trustworthy floor (blend to identity).
     dark_sig = pq_oetf(min(dark_floor_nits, peak_luminance) / _PQ_CONTAINER_NITS)
+    # Measurement-driven per-level trust (sig→w), interpolated to the grid; 1.0 everywhere when absent.
+    trust_xs = [p[0] for p in level_trust] if level_trust else []
+    trust_ws = [p[1] for p in level_trust] if level_trust else []
 
     curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     prev = {ch: 0.0 for ch in _CHANNELS}
@@ -345,8 +405,12 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         pq_in = j / (lut_size - 1)
         lin_nits = min(pq_eotf(pq_in) * _PQ_CONTAINER_NITS, peak_luminance)
         frac = lin_nits / peak_luminance              # native-white-proportional target (0..1)
-        # Trust weight: 0 in the noisy deep shadows, ramping to 1 by 2x the dark-floor signal.
+        # Luminance floor ramp: 0 in the noisy deep shadows, ramping to 1 by 2x the dark-floor signal.
         w = 0.0 if dark_sig <= 0 else min(1.0, max(0.0, (pq_in - dark_sig) / dark_sig))
+        # Fold in the measured per-level trust: where the dark read is too noisy/unstable to trust
+        # (low w_noise), smooth that level's correction to identity even above the luminance floor.
+        if trust_xs:
+            w *= _interp(pq_in, trust_xs, trust_ws)
         for ch in _CHANNELS:
             target_share = frac * peak_share[ch]
             corrected = invert_monotone(sigs, shares[ch], target_share)
@@ -402,8 +466,11 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
     the SDR refine loop).
 
     ``current_curves``    : the installed per-channel cube (r/g/b signal->drive, ``lut_size`` each).
-    ``measured_neutral``  : ``[(wire_signal, measured_XYZ), ...]`` from a neutral-ramp measurement
-                            with the current cube applied.
+    ``measured_neutral``  : ``[(wire_signal, measured_XYZ[, chroma_sigma]), ...]`` from a neutral-ramp
+                            measurement with the current cube applied. The optional 3rd element is the
+                            level's read-to-read chromaticity spread (``xy``) from MULTIPLE reads; when
+                            present, that level's correction is scaled toward identity by its
+                            measurement trust (:func:`noise_trust`) so dark/noisy levels don't bake a tint.
     ``channel_peak_xyz``  : measured native full-drive primary XYZ (R,G,B) — the linear-share basis.
     ``matrix_rowsums``    : ``v_c = (M @ (1,1,1))_c`` for the installed MHC2 matrix (:func:`mhc2_matrix`).
 
@@ -434,18 +501,27 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
 
     # gather (post-matrix signal, linear-light correction factor) per channel from the measurement
     pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
-    for sig, xyz in sorted(measured_neutral, key=lambda p: p[0]):
+    for entry in sorted(measured_neutral, key=lambda p: p[0]):
+        sig, xyz = entry[0], entry[1]
+        chroma_sigma = entry[2] if len(entry) > 2 else None   # per-level read-to-read xy spread, if measured
         lin = pq_eotf(sig)
         tY = min(lin * 10000.0, peak_cap_nits)
         if tY < dark_floor_nits:
             continue
+        # Measurement-trust: if MULTIPLE reads gave a chromaticity spread, scale this level's whole
+        # correction toward identity when its chroma error is within the noise (don't bake a per-channel
+        # tint from noise/instability at a dark level). w=1 when no σ (trust the adaptive integration).
+        total = sum(xyz) or 1.0
+        mx, my = xyz[0] / total, xyz[1] / total
+        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5, chroma_sigma)
         ms = matvec(disp_inv, xyz)
         ts = matvec(disp_inv, xy_to_XYZ(wx, wy, tY))
         for c in range(3):
             ratio = ts[c] / ms[c] if ms[c] > 1e-9 else 1.0
             ratio = min(max(ratio, ratio_clamp[0]), ratio_clamp[1])
+            damped = 1.0 + w_trust * (ratio ** damping - 1.0)   # toward identity by (1-w_trust)
             post_sig = pq_oetf(min(max(matrix_rowsums[c] * lin, 0.0), 1.0))
-            pts[c].append((post_sig, ratio ** damping))
+            pts[c].append((post_sig, damped))
 
     out: dict[str, list[float]] = {}
     for c, ch in enumerate(chans):

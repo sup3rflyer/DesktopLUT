@@ -232,6 +232,97 @@ def test_adaptive_dark_floor_respects_upper_bound():
     assert floor == 3.0
 
 
+# --- noise-derived dark trust ----------------------------------------------
+
+def test_noise_trust_gates_on_snr():
+    # correction within the noise -> 0 (don't chase noise); clearly above -> 1; monotone between.
+    assert mc.noise_trust(0.001, 0.01) == 0.0          # error << noise
+    assert mc.noise_trust(0.05, 0.01) == 1.0           # error >> noise (5σ)
+    mid = mc.noise_trust(0.02, 0.01)                    # 2σ -> partial
+    assert 0.0 < mid < 1.0
+    # no measured noise (single read / perfect) -> trust fully
+    assert mc.noise_trust(0.02, None) == 1.0
+    assert mc.noise_trust(0.02, 0.0) == 1.0
+    # more readings tighten σ (SE shrinks) -> the SAME error clears the gate
+    assert mc.noise_trust(0.02, 0.02) < mc.noise_trust(0.02, 0.02 / (4 ** 0.5))
+
+
+def test_dark_trust_weights_smooths_noisy_levels():
+    # a clean dark level (tiny σ, real error) trusts ~1; a noisy one (σ ≈ error) collapses to ~0.
+    white = (0.3127, 0.3290)
+    levels = [
+        (0.05, 0.34, 0.30, 0.03),   # dark + very noisy (σ≈error) -> low trust
+        (0.20, 0.32, 0.33, 0.001),  # dark but STABLE, small real error -> high trust
+        (0.80, 0.314, 0.330, 0.0005),
+    ]
+    w = dict(mc.dark_trust_weights(levels, white))
+    assert w[0.05] < 0.3            # noisy dark level smoothed toward identity
+    assert w[0.20] > 0.9            # stable level trusted
+    assert w[0.80] > 0.9
+
+
+def test_build_hdr_cube_level_trust_smooths_low_trust_levels_to_identity():
+    # With a level_trust that says "don't trust the dark third", build_hdr_cube must leave that
+    # region ~identity even though the gray ramp asks for a correction there.
+    peak = 1000.0
+    sigs = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+    # a warm-drifting gray ramp (blue share deficient) so the cube WANTS to correct everywhere
+    samples = []
+    for s in sigs:
+        frac = (s ** 2.0)
+        # measured XYZ via _PRIM at a warm white, scaled to peak*frac (controlled drift)
+        from dlc.colormath import rgb_to_xyz_matrix as _m
+        P = _m(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"], _PRIM["bx"], _PRIM["by"],
+               0.335, 0.345, white_Y=peak)   # warm native white
+        samples.append(Ti3Sample(rgb=(s, s, s),
+                                  xyz=(P[0][0] * frac + P[0][1] * frac + P[0][2] * frac,
+                                       P[1][0] * frac + P[1][1] * frac + P[1][2] * frac,
+                                       P[2][0] * frac + P[2][1] * frac + P[2][2] * frac)))
+    prim = _PRIM
+    base, _ = mc.build_hdr_cube(samples, prim, (0.335, 0.345), peak, lut_size=256)
+    # now declare the bottom third untrustworthy (trust 0 below signal 0.35, 1 above 0.5)
+    trust = [(0.0, 0.0), (0.35, 0.0), (0.5, 1.0), (1.0, 1.0)]
+    gated, _ = mc.build_hdr_cube(samples, prim, (0.335, 0.345), peak, lut_size=256, level_trust=trust)
+    N = 256
+    lo_idx = int(0.2 * (N - 1))     # a signal in the untrusted dark third
+    hi_idx = int(0.8 * (N - 1))     # a signal in the trusted region
+    ident = lo_idx / (N - 1)
+    # gated cube is ~identity in the untrusted dark third...
+    assert abs(gated["r"][lo_idx] - ident) < abs(base["r"][lo_idx] - ident) or \
+        abs(gated["b"][lo_idx] - ident) < 1e-3
+    # ...and matches the ungated cube in the trusted region
+    for ch in "rgb":
+        assert abs(gated[ch][hi_idx] - base[ch][hi_idx]) < 1e-6
+
+
+def test_refine_hdr_cube_trust_damps_noisy_dark_level():
+    # A measured neutral with a per-level σ tag: a noisy dark point's correction is damped toward
+    # identity vs the same point with no σ (full correction).
+    peaks, smax, _emit, peak = _synthetic_panel((0.3127, 0.3290))
+    N = 256
+    cube = {ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}
+    # one dark measured point that's off-white (would normally be corrected hard)
+    from dlc.colormath import invert3x3, matvec, xy_to_XYZ
+    disp = [[peaks[c][r] for c in range(3)] for r in range(3)]
+    disp_inv = invert3x3(disp)
+    s = 0.25 * smax
+    tY = min(mc.pq_eotf(s) * 10000.0, peak)
+    ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
+    ms = [ts[0] * 1.3, ts[1], ts[2] * 0.7]                       # off-white (warm) dark read
+    xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
+    rowsums = (1.0, 1.0, 1.0)
+    trusted = mc.refine_hdr_cube(cube, [(s, xyz)], peaks, rowsums, peak_cap_nits=peak, dark_floor_nits=0.5)
+    # same point, but tagged with a σ as large as its chroma error -> low trust -> damped
+    tot = sum(xyz)
+    err = ((xyz[0] / tot - 0.3127) ** 2 + (xyz[1] / tot - 0.3290) ** 2) ** 0.5
+    noisy = mc.refine_hdr_cube(cube, [(s, xyz, err)], peaks, rowsums, peak_cap_nits=peak, dark_floor_nits=0.5)
+    # the noisy-tagged refine moves the cube LESS from identity than the trusted one
+    j = int(0.5 * (N - 1))
+    move_trusted = sum(abs(trusted[ch][j] - cube[ch][j]) for ch in "rgb")
+    move_noisy = sum(abs(noisy[ch][j] - cube[ch][j]) for ch in "rgb")
+    assert move_noisy < move_trusted
+
+
 def test_build_hdr_cube_requires_neutral():
     with pytest.raises(ValueError):
         mc.build_hdr_cube([Ti3Sample(rgb=(0.0, 0.0, 0.0), xyz=(0.0, 0.0, 0.0))],
