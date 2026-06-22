@@ -81,7 +81,7 @@ def render_report_html(snap: dict[str, Any], charts: dict[str, Any], exported_at
         f'<div data-chart="{key}"></div></figure>'
         for key, title in (("cie", "Color Accuracy · CIE 1931"), ("eotf", "Tone Response · EOTF"),
                            ("graycct", "Grayscale CCT"), ("grayduv", "Grayscale Duv"),
-                           ("colorlum", "Color Luminance"),
+                           ("colorlum", "Color Luminance"), ("saturation", "Saturation tracking"),
                            ("optimizer", "Optimizer convergence"), ("drift", "White CCT vs time")))
 
     payload = _safe_json({"charts": charts, "header": h})
@@ -141,4 +141,5 @@ padding:8px;text-align:center}.bn b{display:block;font-family:var(--mono);font-s
 .ch-lab-green{fill:#6fae5e;font-size:9.5px;font-family:var(--mono);opacity:.85}.ch-lab-magenta{fill:#c06fc0;font-size:9.5px;font-family:var(--mono);opacity:.85}
 .ch-track{stroke:#58a6c9;stroke-width:1.2;opacity:.5;stroke-dasharray:2 2}.ch-track-ref{stroke:#58a6c9;stroke-width:.8;opacity:.35}
 .ch-track-dot{fill:#58a6c9;opacity:.55}.ch-track-note{fill:#58a6c9;font-size:9px;font-family:var(--mono);opacity:.7}
+.ch-sat-line{stroke:#6a6a72;stroke-width:.8;opacity:.5}
 """

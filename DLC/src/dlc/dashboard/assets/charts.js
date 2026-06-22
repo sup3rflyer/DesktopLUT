@@ -205,6 +205,27 @@
     return P.svg();
   };
 
+  // ── Saturation tracking: measured chroma (u'v') vs commanded saturation, per hue family ──
+  DLCCharts.saturation = function (d) {
+    const items = d || [];
+    if (!items.length) return empty("no colour patches yet");
+    const P = Plot({ xmin: 0, xmax: 1, ymin: 0, ymax: 1 });
+    P.gridX([0, 0.25, 0.5, 0.75, 1], (t) => Math.round(t * 100) + "%");
+    P.gridY([0, 0.25, 0.5, 0.75, 1], (t) => Math.round(t * 100) + "%");
+    P.pathLine([[0, 0], [1, 1]], "ch-ref");                    // identity = perfect tracking
+    // group into per-family polylines so each hue's saturation sweep reads as one line
+    const fams = {};
+    items.forEach((it) => { (fams[it.family] = fams[it.family] || []).push(it); });
+    Object.keys(fams).forEach((fam) => {
+      const pts = fams[fam].slice().sort((a, b) => a.target - b.target);
+      P.pathLine(pts.map((p) => [p.target, p.measured]), "ch-sat-line");
+      pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.target), 1)}" cy="${fmt(P.py(p.measured), 1)}" r="2.4" style="fill:${esc(p.color)}" stroke="#000" stroke-width=".3">${title(`${esc(fam)} ${Math.round(p.target * 100)}% commanded → ${Math.round(p.measured * 100)}% measured chroma`)}</circle>`));
+    });
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">measured vs commanded</text>`);
+    P.add(`<text x="${P.m.l + 4}" y="${P.H - P.m.b - 5}" class="ch-note">on the line = perfect tracking</text>`);
+    return P.svg();
+  };
+
   // ── Optimizer convergence: max / mean dE per outer iteration ──
   DLCCharts.optimizer = function (d) {
     const its = d || [];
@@ -250,6 +271,7 @@
       case "graycct": return DLCCharts.grayscaleCct(charts.grayscale, wcct);
       case "grayduv": return DLCCharts.grayscaleDuv(charts.grayscale);
       case "colorlum": return DLCCharts.colorLum(charts.color_lum);
+      case "saturation": return DLCCharts.saturation(charts.saturation);
       case "optimizer": return DLCCharts.optimizer(charts.optimizer);
       case "drift": return DLCCharts.drift(charts.white_track);
       default: return empty();

@@ -169,6 +169,7 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-track { stroke: #58a6c9; stroke-width: 1.2; opacity: .5; stroke-dasharray: 2 2; }
 .ch-track-ref { stroke: #58a6c9; stroke-width: .8; opacity: .35; }
 .ch-track-dot { fill: #58a6c9; opacity: .55; }
+.ch-sat-line { stroke: #6a6a72; stroke-width: .8; opacity: .5; }
 .ch-track-note { fill: #58a6c9; font-size: 9px; font-family: var(--mono); opacity: .7; }
 
 /* ── lightbox (click a tile to view large) ─────────────────────── */

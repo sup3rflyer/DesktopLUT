@@ -77,6 +77,29 @@ def test_non_neutral_read_does_not_move_white():
     assert st.snapshot(T0)["last_white"] == {}
 
 
+def test_saturation_tracking_normalises_per_family():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # Three red patches sweeping saturation (secondary channels below half-max → stay family "R"),
+    # measured chroma growing with commanded saturation.
+    sweeps = [([255, 26, 26], [1.0, 0.10, 0.10], [0.52, 0.33]),    # ~100% sat, farthest from white
+              ([255, 77, 77], [1.0, 0.30, 0.30], [0.45, 0.33]),    # ~75%
+              ([255, 115, 115], [1.0, 0.45, 0.45], [0.40, 0.33])]  # ~50%, closest
+    for i, (rgb, sig, xy) in enumerate(sweeps):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i), stage="measure", tier="stream",
+                      seq=i, role="measurement", label=f"r{i}", rgb=rgb, signal=sig,
+                      Y=40.0, xy=xy, ok=True))
+    sat = st.charts()["saturation"]
+    reds = [p for p in sat if p["family"] == "R"]
+    assert len(reds) == 3
+    # commanded saturation buckets recovered (50/75/100%), sorted ascending
+    assert [p["target"] for p in reds] == [0.5, 0.75, 1.0]
+    # normalised so the most-saturated red = 1.0 and chroma tracks monotonically with command
+    assert reds[-1]["measured"] == 1.0
+    assert reds[0]["measured"] < reds[1]["measured"] < reds[2]["measured"]
+
+
 def test_metrics_scored_feeds_the_de_bignumbers():
     st = DashboardState()
     st.ingest(_ev("metrics_scored", t=T0, stage="verify", label="verification",

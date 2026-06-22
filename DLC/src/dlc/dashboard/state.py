@@ -95,6 +95,14 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
+def _xy_to_uv76(x: float, y: float) -> tuple[Optional[float], Optional[float]]:
+    """CIE 1931 xy → CIE 1976 u'v' (the chroma space for saturation distance). None if degenerate."""
+    denom = -2.0 * x + 12.0 * y + 3.0
+    if abs(denom) < 1e-12:
+        return (None, None)
+    return (4.0 * x / denom, 9.0 * y / denom)
+
+
 def _is_neutral(rgb: Optional[list]) -> bool:
     """A grayscale/white patch: all channels equal and non-black."""
     if not rgb or len(rgb) < 3:
@@ -403,7 +411,8 @@ class DashboardState:
             # Colour Luminance chart (luminance error vs target is derived in charts()).
             try:
                 key = (round(float(sig[0]), 4), round(float(sig[1]), 4), round(float(sig[2]), 4))
-                self._color_by_stage[stage][key] = {"signal": list(key), "Y": Y}
+                self._color_by_stage[stage][key] = {"signal": list(key), "Y": Y,
+                                                    "x": round(x, 5), "y": round(y, 5)}
             except (TypeError, ValueError):
                 pass
 
@@ -466,6 +475,7 @@ class DashboardState:
                 "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
             },
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
+            "saturation": self._saturation(color_map, white),
             "optimizer": list(self._optimizer_history),
             "white_track": [w for w in self._white_track if w.get("elapsed_s") is not None],
         }
@@ -523,6 +533,40 @@ class DashboardState:
                 "n": len(g["errs"]), "color": g["color"]}
                for lbl, g in groups.items()]
         out.sort(key=lambda d: (_FAMILY_ORDER.get(d["family"], 9), d["sat"]))
+        return out
+
+    def _saturation(self, color_map: dict, white_xy: Any) -> list[dict[str, Any]]:
+        """Saturation tracking per hue family: measured chroma (CIE 1976 u'v' distance from the
+        target white) vs the commanded saturation, normalised so each family's 100%-saturation
+        patch = 1.0. Ideal tracking is the identity line (commanded → measured). Dependency-free
+        geometry; no dE — a monitoring view of how saturation builds, not the authoritative score."""
+        if not white_xy or len(white_xy) < 2:
+            return []
+        wu, wv = _xy_to_uv76(white_xy[0], white_xy[1])
+        if wu is None:
+            return []
+        fams: dict[str, list[dict[str, Any]]] = {}
+        for c in color_map.values():
+            sig, x, y = c.get("signal"), c.get("x"), c.get("y")
+            if x is None or y is None or not sig:
+                continue
+            family, sat = _classify_color(sig)
+            if family == "mix" or sat <= 0:
+                continue
+            uv = _xy_to_uv76(x, y)
+            if uv[0] is None:
+                continue
+            chroma = ((uv[0] - wu) ** 2 + (uv[1] - wv) ** 2) ** 0.5
+            fams.setdefault(family, []).append({"sat": sat, "chroma": chroma, "color": _sig_hex(sig)})
+        out: list[dict[str, Any]] = []
+        for family, pts in fams.items():
+            cmax = max((p["chroma"] for p in pts), default=0.0)
+            if cmax <= 0:
+                continue
+            for p in pts:
+                out.append({"family": family, "target": round(p["sat"] / 100.0, 4),
+                            "measured": round(p["chroma"] / cmax, 4), "color": p["color"]})
+        out.sort(key=lambda d: (_FAMILY_ORDER.get(d["family"], 9), d["target"]))
         return out
 
     # ----------------------------------------------------------------------
