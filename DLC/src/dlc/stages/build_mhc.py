@@ -274,25 +274,19 @@ def build(args, ctx: RunContext) -> StageResult:
 
 def _dark_level_trust(source, grey_samples, reference_white_xy, dark_trust_weights, xy_from_xyz):
     """Build per-level trust weights from the measure loop's noise sidecar (``<ti3>.noise.json``),
-    if present: each gray level's read-to-read chromaticity σ → ``mhc_cube.dark_trust_weights``.
-    Returns ``[(signal, w), ...]`` or ``None`` when there's no sidecar / no σ (single-read run)."""
-    from ..measure_loop import noise_sidecar_path
-    sidecar = noise_sidecar_path(Path(source))
-    if not sidecar.exists():
-        return None
-    try:
-        by_level = (json.loads(sidecar.read_text(encoding="utf-8")) or {}).get("by_level") or {}
-    except (OSError, ValueError):
-        return None
-    if not by_level:
+    if present: each gray level's measurement noise (SE of the mean chromaticity, or +inf if the
+    level was flagged unstable) → ``mhc_cube.dark_trust_weights``. Levels are matched to the parsed
+    TI3 by NEAREST signal (robust to the ti3 percent roundtrip). Returns ``[(signal, w), ...]`` or
+    ``None`` when there's no sidecar / no usable noise (single-read run)."""
+    from ..measure_loop import match_level_noise, read_noise_sidecar
+    entries = read_noise_sidecar(Path(source))
+    if not entries:
         return None
     levels = []
     for s in grey_samples:
-        lvl = s.rgb[0]
-        info = by_level.get(f"{lvl:.6f}")
-        sigma = info.get("chroma_sigma") if info else None
+        noise = match_level_noise(entries, s.rgb[0])
         x, y = xy_from_xyz(s.xyz)
-        levels.append((lvl, x, y, sigma))
+        levels.append((s.rgb[0], x, y, noise))
     weights = dark_trust_weights(levels, reference_white_xy)
     return weights or None
 

@@ -321,6 +321,54 @@ def noise_sidecar_path(ti3_path: Path) -> Path:
     return Path(str(ti3_path) + ".noise.json")
 
 
+def read_noise_sidecar(ti3_path: Path) -> list[tuple[float, Optional[float]]]:
+    """Parse ``<ti3>.noise.json`` → ``[(gray level, trust-noise), ...]`` sorted by level, where
+    trust-noise is the **standard error of the mean** chromaticity (per-read σ / √reads) — it shrinks
+    as reads accumulate, so more readings → tighter → more trust. An ``unstable`` level (the loop
+    couldn't pin it after many reads = genuine fluctuation, not averageable) returns ``+inf`` ⇒ never
+    trust it. ``<2`` reads ⇒ ``None`` (no spread; trust the adaptive integration). Empty list when no
+    sidecar / unreadable."""
+    p = noise_sidecar_path(ti3_path)
+    if not p.exists():
+        return []
+    try:
+        by = (json.loads(p.read_text(encoding="utf-8")) or {}).get("by_level") or {}
+    except (OSError, ValueError):
+        return []
+    out: list[tuple[float, Optional[float]]] = []
+    for k, v in by.items():
+        try:
+            lvl = float(k)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(v, dict):
+            continue
+        if v.get("unstable"):
+            noise: Optional[float] = math.inf
+        else:
+            sg = v.get("chroma_sigma")
+            n = v.get("reads") or 0
+            noise = (sg / math.sqrt(n)) if (sg is not None and n >= 2) else None
+        out.append((lvl, noise))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
+def match_level_noise(entries: Sequence[tuple[float, Optional[float]]], level: float,
+                      *, tol: float = 1e-5) -> Optional[float]:
+    """Nearest sidecar level's trust-noise to ``level`` within ``tol`` — robust to the ``.ti3``
+    ×100/÷100 percent roundtrip (which perturbs the value ~1e-7), while ``tol`` stays far below the
+    minimum gray-level spacing (≥2.4e-4 even at 12-bit), so it can never match the wrong level.
+    ``None`` when nothing is within ``tol`` (or the matched level has no usable noise)."""
+    best: Optional[float] = None
+    best_d = tol
+    for lvl, noise in entries:
+        d = abs(lvl - level)
+        if d <= best_d:
+            best, best_d = noise, d
+    return best
+
+
 def _write_noise_sidecar(ti3_path: Path, accepted: Sequence[AcceptedRead]) -> None:
     """Persist per-NEUTRAL-LEVEL measured repeatability (chroma σ + SE + reads) beside the ``.ti3``,
     keyed by gray level (signal). Consumed by ``build_mhc`` → ``mhc_cube.dark_trust_weights`` to
@@ -670,16 +718,32 @@ class _Loop:
         rms = math.sqrt(sum(_agreement_de(r, mean, white) ** 2 for r in reads) / n)
         return rms / math.sqrt(n)
 
-    def _chroma_sigma(self, yxys: Sequence[tuple[float, float, float]]) -> Optional[float]:
-        """RMS read-to-read chromaticity spread in ``xy`` (each ``yxy`` is ``(Y, x, y)``) — the
-        dark-level noise estimate that drives the trust (sensor noise + short-term display
-        fluctuation both show up here). ``None`` for <2 reads (no spread to estimate)."""
-        n = len(yxys)
+    def _chroma_sigma(self, reads: Sequence[tuple[float, float, float]],
+                      *, sigma: Optional[float] = None) -> Optional[float]:
+        """RMS read-to-read chromaticity spread in ``xy`` — the dark-level noise estimate (sensor
+        noise + short-term display fluctuation both show up here). Computed over the SAME
+        outlier-rejected INLIERS as the accepted mean (a gross glitch is dropped, not allowed to
+        inflate σ ~200× and collapse the level's trust). ``None`` for <2 inlier reads."""
+        n = len(reads)
         if n < 2:
             return None
-        mx = sum(p[1] for p in yxys) / n
-        my = sum(p[2] for p in yxys) / n
-        return math.sqrt(sum((p[1] - mx) ** 2 + (p[2] - my) ** 2 for p in yxys) / n)
+        if n < 3:
+            inliers = list(reads)
+        else:
+            med = _median_xyz(reads)
+            white = self.white_xyz or med
+            spread = sigma
+            if spread is None:
+                devs = sorted(_agreement_de(r, med, white) for r in reads)
+                spread = devs[len(devs) // 2]
+            thr = max(self.cfg.outlier_floor_de, self.cfg.outlier_factor * (spread or 0.0))
+            inliers = [r for r in reads if _agreement_de(r, med, white) <= thr] or list(reads)
+        xy = [(X / t, Y / t) for (X, Y, Z) in inliers if (t := X + Y + Z) > 0.0]
+        if len(xy) < 2:
+            return None
+        mx = sum(p[0] for p in xy) / len(xy)
+        my = sum(p[1] for p in xy) / len(xy)
+        return math.sqrt(sum((p[0] - mx) ** 2 + (p[1] - my) ** 2 for p in xy) / len(xy))
 
     def _robust_stats(self, reads: Sequence[tuple[float, float, float]],
                       *, sigma: Optional[float] = None):
@@ -1183,7 +1247,7 @@ class _Loop:
         # Measured repeatability for the dark-level trust: the per-patch standard error (dE) and the
         # read-to-read chromaticity spread (xy). Both need ≥2 reads (None otherwise).
         accepted_se = st[1] if st else None
-        accepted_chroma_sigma = self._chroma_sigma(yxys)
+        accepted_chroma_sigma = self._chroma_sigma(reads, sigma=sigma)
         immediate = max(0, read_index - 1)
         record = self.accepted.get(patch.label)
         if record is None:

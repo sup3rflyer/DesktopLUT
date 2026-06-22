@@ -347,6 +347,32 @@ def test_dark_floor_defaults_off_and_gated_by_nits():
     assert loop2._read_floor_for(bright) == cfg.min_reads
 
 
+def test_read_noise_sidecar_computes_se_and_flags_unstable(tmp_path: Path):
+    import math
+    from dlc.measure_loop import noise_sidecar_path, read_noise_sidecar
+    ti3 = tmp_path / "raw.ti3"
+    noise_sidecar_path(ti3).write_text(json.dumps({"schema": 1, "by_level": {
+        "0.100000": {"chroma_sigma": 0.004, "reads": 4, "unstable": False},
+        "0.500000": {"chroma_sigma": 0.002, "reads": 9, "unstable": False},
+        "0.050000": {"chroma_sigma": 0.02, "reads": 5, "unstable": True},
+        "0.900000": {"chroma_sigma": None, "reads": 1, "unstable": False},
+    }}), encoding="utf-8")
+    entries = dict(read_noise_sidecar(ti3))
+    assert math.isclose(entries[0.1], 0.004 / 2.0)     # SE = σ/√4 (more reads → smaller → more trust)
+    assert math.isclose(entries[0.5], 0.002 / 3.0)     # σ/√9
+    assert entries[0.05] == math.inf                   # unstable → never trust (don't bake un-holdable)
+    assert entries[0.9] is None                        # <2 reads → no spread
+
+
+def test_match_level_noise_robust_to_ti3_roundtrip():
+    from dlc.measure_loop import match_level_noise
+    # the .ti3 ×100/÷100 percent roundtrip perturbs a level ~1e-7; nearest-match still finds it,
+    # but a level not actually present is NOT matched (tol << gray-level spacing).
+    entries = [(0.1, 0.002), (0.5, 0.001)]
+    assert match_level_noise(entries, 0.1 + 7e-8) == 0.002
+    assert match_level_noise(entries, 0.3) is None
+
+
 def test_noise_sidecar_records_per_level_chroma_sigma(tmp_path: Path):
     # End-to-end: a warm + NOISY panel over a grey ramp with the dark floor on writes a noise
     # sidecar beside the .ti3 with a positive per-level chromaticity σ (the dark-trust input).

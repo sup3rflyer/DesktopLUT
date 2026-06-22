@@ -42,7 +42,7 @@ Grounding (no handwaving — matched to DesktopLUT's own C++):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Optional, Sequence
 
 from .colormath import invert3x3, matvec, rgb_to_xyz_matrix, xy_to_XYZ
 from .mhc import Ti3Sample
@@ -240,12 +240,14 @@ def noise_trust(error: float, noise: Optional[float], *,
     measurement ``noise`` (same units) — i.e. how much of it to apply vs. smooth to identity.
 
     Returns ``w`` in [0,1]: **0** when the correction is within the noise (``error <= lo_snr·noise``
-    — indistinguishable from sensor noise / display fluctuation, so applying it just chases noise →
-    smooth to identity), **1** when it clearly exceeds the noise (``error >= hi_snr·noise`` — a real
-    signal worth correcting), a smoothstep between. ``noise`` is the read-to-read spread derived from
-    MULTIPLE readings (sensor noise AND short-term display instability both show up as spread). With
-    more readings the spread tightens, so the same real error clears the gate — exactly "more
-    readings → trust the reading more". ``noise`` None/≤0 (single read / perfect) ⇒ trust fully (1.0)."""
+    — indistinguishable from the measurement uncertainty, so applying it just chases noise → smooth
+    to identity), **1** when it clearly exceeds it (``error >= hi_snr·noise`` — a real signal worth
+    correcting), a smoothstep between. ``noise`` is the **standard error of the mean** chromaticity
+    (per-read σ / √reads) estimated from MULTIPLE readings, so it shrinks as reads accumulate — more
+    readings → tighter → the same real error clears the gate ("more readings → trust the reading
+    more"). A level the measure loop flags **unstable** (can't be pinned after many reads = genuine
+    display fluctuation, not averageable) is passed ``noise = +inf`` by the caller ⇒ ``w = 0`` (never
+    bake a correction to a chromaticity the panel won't hold). ``noise`` None/≤0 ⇒ trust fully (1.0)."""
     if noise is None or noise <= 0.0:
         return 1.0
     snr = error / noise
@@ -262,11 +264,12 @@ def dark_trust_weights(levels: Sequence[tuple[float, float, float, Optional[floa
                        lo_snr: float = 1.0, hi_snr: float = 3.0) -> list[tuple[float, float]]:
     """Per-level trust weights from MEASURED repeatability — the core of the dark-level logic.
 
-    ``levels``: ``[(signal, x, y, chroma_sigma), ...]`` per measured neutral level, where
-    ``chroma_sigma`` is the read-to-read chromaticity spread at that level (e.g. RMS distance of the
-    reads from their mean in ``xy``), estimated from MULTIPLE readings. ``reference_white_xy`` is the
-    chromaticity the per-level correction drives toward (native white for ``build_hdr_cube``'s
-    per-level share correction; D65 for the closed-loop refine).
+    ``levels``: ``[(signal, x, y, noise), ...]`` per measured neutral level, where ``noise`` is the
+    measurement uncertainty of that level's chromaticity — the **standard error of the mean** in
+    ``xy`` (per-read σ / √reads), or ``+inf`` for an ``unstable`` level (caller's choice; ⇒ trust 0),
+    or ``None`` for <2 reads. ``reference_white_xy`` is the chromaticity the per-level correction
+    drives toward (native white for ``build_hdr_cube``'s per-level share correction; D65 for the
+    closed-loop refine).
 
     For each level the chroma error to correct is ``|measured_xy - reference|`` and the trust is
     ``noise_trust(error, chroma_sigma)`` — so where the dark read's chromaticity is so noisy/unstable

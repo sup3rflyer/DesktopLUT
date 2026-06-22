@@ -2547,27 +2547,15 @@ class Calibration:
             strategy=f"{normalized['shadow_treatment']}/{normalized['volumetric_density']}",
             source=normalized.get("source"), confidence=normalized.get("confidence"))
 
-    def _noise_sigma_by_level(self, ti3_path: Optional[str]) -> dict[float, Optional[float]]:
-        """``{round(gray level, 6): measured chroma σ}`` from the measure loop's noise sidecar beside
-        ``ti3_path`` (the read-to-read chromaticity spread per level). Empty when single-read / absent —
-        the refine then trusts every level (the σ-driven dark smoothing simply isn't engaged)."""
+    def _dark_noise_entries(self, ti3_path: Optional[str]) -> list:
+        """``[(gray level, trust-noise), ...]`` from the measure loop's noise sidecar beside
+        ``ti3_path`` — trust-noise is the standard error of the mean chromaticity (per-read σ /
+        √reads), or +inf for an unstable level. Empty when single-read / absent (the refine then
+        trusts every level — the σ-driven dark smoothing simply isn't engaged)."""
         if not ti3_path:
-            return {}
-        try:
-            from .measure_loop import noise_sidecar_path
-            p = noise_sidecar_path(Path(ti3_path))
-            if not p.exists():
-                return {}
-            by = (json.loads(p.read_text(encoding="utf-8")) or {}).get("by_level") or {}
-        except (OSError, ValueError):
-            return {}
-        out: dict[float, Optional[float]] = {}
-        for k, v in by.items():
-            try:
-                out[round(float(k), 6)] = v.get("chroma_sigma")
-            except (TypeError, ValueError, AttributeError):
-                continue
-        return out
+            return []
+        from .measure_loop import read_noise_sidecar
+        return read_noise_sidecar(Path(ti3_path))
 
     def _grey_de_vs_white(self, samples, white_xy: tuple[float, float]) -> dict[str, Any]:
         """Average/max dE_ITP of the GRAYSCALE patches against the target white (D65) at the
@@ -2689,13 +2677,16 @@ class Calibration:
                     break
 
                 # --- one refine step toward D65 at the Peak-Chroma cap, then reinstall ---
-                # Attach each level's measured chroma σ (from the measure loop's noise sidecar) so
-                # the refine smooths a noisy/unstable dark level's correction toward identity.
-                sigma_by_level = self._noise_sigma_by_level(res.ti3_path)
-                measured_neutral = [
-                    (s.rgb[0], tuple(s.xyz)) + ((sigma_by_level.get(round(s.rgb[0], 6)),)
-                                                if sigma_by_level.get(round(s.rgb[0], 6)) is not None else ())
-                    for s in grey]
+                # Attach each level's measurement noise (SE of the mean chromaticity, or +inf if the
+                # level was flagged unstable; from the noise sidecar, matched by nearest signal) so the
+                # refine smooths a noisy/unstable dark level's correction toward identity.
+                from .measure_loop import match_level_noise
+                noise_entries = self._dark_noise_entries(res.ti3_path)
+                measured_neutral = []
+                for s in grey:
+                    noise = match_level_noise(noise_entries, s.rgb[0]) if noise_entries else None
+                    entry = (s.rgb[0], tuple(s.xyz))
+                    measured_neutral.append(entry + (noise,) if noise is not None else entry)
                 new_curves = refine_hdr_cube(
                     read_1d_cube(Path(installed)), measured_neutral, channel_peak_xyz, rowsums,
                     peak_cap_nits=cap_nits, target_white_xy=(wx, wy), dark_floor_nits=dark_floor)
