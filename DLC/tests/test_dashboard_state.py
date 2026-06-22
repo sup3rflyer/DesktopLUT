@@ -381,8 +381,10 @@ def test_charts_accumulate_cie_grayscale_and_drift():
     # grayscale keyed by signal level (neutrals only) → 2 steps, sorted
     assert [g["signal"] for g in ch["grayscale"]] == [0.5, 1.0]
     assert ch["eotf"]["gamma"] == 2.2 and len(ch["eotf"]["points"]) == 2
-    # drift/white track only follows neutral reads
-    assert len(ch["white_track"]) == 2
+    # drift/white track (no neutral_ref here) falls back to WHITE-level (signal>=0.9) neutrals
+    # only — the 0.5 grayscale step is excluded so the drift trace isn't buried in ramp noise.
+    assert len(ch["white_track"]) == 1
+    assert [w["signal"] for w in ch["white_track"]] == [1.0]
     assert all(w["elapsed_s"] is not None for w in ch["white_track"])
 
 
@@ -472,9 +474,31 @@ def test_drift_reference_reads_feed_white_track_not_snapshot_charts():
     _read(st, 2, [512, 512, 520], [0.311, 0.330], 39.0, signal=[0.5, 0.5, 0.51],
           role="neutral_ref", disposition="drift_ref", phase="measure:post-mhc")
     ch = st.charts()
-    assert len(ch["white_track"]) == 2                  # both feed the drift series
+    # When neutral_ref checkpoints exist they ARE the drift series — the mid-grayscale
+    # measurement neutral at signal 0.5 is excluded (it would just add noise).
+    assert len(ch["white_track"]) == 1
+    assert ch["white_track"][0]["cct"] is not None
     assert len(ch["cie"]["points"]) == 1               # the drift-ref stays OFF the snapshot
     assert [g["signal"] for g in ch["grayscale"]] == [0.5]
+
+
+def test_drift_series_excludes_grayscale_ramp_noise():
+    # The real-run bug: the drift chart plotted EVERY neutral measurement read at every grayscale
+    # level, so dark/mid steps (noisy CCT) buried the actual white drift. With neutral_ref
+    # checkpoints present, only those fixed re-reads form the drift series.
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, white={"xy": [0.3127, 0.329]}))
+    # a full grayscale ramp of measurement neutrals — must NOT pollute the drift series
+    for i, lvl in enumerate((0.1, 0.25, 0.5, 0.75, 1.0), start=1):
+        v = int(round(lvl * 255))
+        _read(st, i, [v, v, v], [0.31 + 0.001 * i, 0.33], 10.0 * i,
+              signal=[lvl, lvl, lvl], phase="measure:raw")
+    # three interleaved drift checkpoints (the fixed re-read neutral) over time
+    for j, at in enumerate((6, 7, 8)):
+        _read(st, at, [128, 128, 128], [0.312, 0.329], 40.0 + j, signal=[0.5, 0.5, 0.5],
+              role="neutral_ref", disposition="drift_ref", phase="measure:raw")
+    track = st.charts()["white_track"]
+    assert len(track) == 3                              # only the neutral_ref checkpoints, not the ramp
 
 
 def test_check_in_event_surfaces_in_snapshot():

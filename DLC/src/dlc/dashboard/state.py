@@ -222,7 +222,12 @@ class DashboardState:
     _gray_by_stage: dict = field(default_factory=dict)      # stage → {level: latest neutral sample}
     _color_by_stage: dict = field(default_factory=dict)     # stage → {signal: latest colour sample}
     _stage_seq: list = field(default_factory=list)          # measurement stages, first-seen order
-    _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))  # cross-stage time series
+    # Cross-stage white-DRIFT time series. Primary = the dedicated neutral_ref checkpoints (a
+    # FIXED neutral re-measured over the run — the clean thermal-drift signal). Fallback = white-
+    # level (signal>=0.9) measurement neutrals, used only when a run emits no neutral_ref. Mid/low
+    # grayscale levels are deliberately kept OUT: their CCT is noisy and buries the drift in a cloud.
+    _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
+    _white_fallback: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
     _optimizer_history: list = field(default_factory=list)
 
     # ----------------------------------------------------------------------
@@ -429,12 +434,19 @@ class DashboardState:
         sig = data.get("signal")
         neutral = _is_neutral(rgb)
         is_probe = role == "probe" or disposition == "probe"
-        # Drift series (cross-stage TIME series): neutral MEASUREMENT reads + the dedicated
-        # neutral-ref drift checkpoints (the cleanest white-drift signal — a fixed neutral
-        # re-measured over time); never warm-up or build-probe reads.
-        if not is_probe and (role == "neutral_ref" or (neutral and role != "warmup")):
-            self._white_track.append({"elapsed_s": self._elapsed_at(ev.time),
-                                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y})
+        # Drift series (cross-stage TIME series). The dedicated neutral_ref drift checkpoints
+        # are a FIXED neutral re-measured over time — the clean signal. The whole grayscale ramp
+        # (every measurement neutral, all levels) is NOT drift: dark/mid steps have noisy CCT and
+        # turn the chart into a cloud, so they're excluded. A white-level (>=0.9) measurement
+        # neutral is a legitimate fallback for runs that emit no neutral_ref checkpoints.
+        if not is_probe:
+            sig_level = _as_float(sig[0]) if (sig and len(sig) >= 1) else None
+            sample = {"elapsed_s": self._elapsed_at(ev.time), "signal": sig_level,
+                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y}
+            if role == "neutral_ref":
+                self._white_track.append(sample)
+            elif neutral and role != "warmup" and sig_level is not None and sig_level >= 0.9:
+                self._white_fallback.append(sample)
         # Snapshot charts (latest measurement stage only): exclude warm-up, drift-ref, build-probe.
         stage = self._chart_stage(ev, data)
         if stage is None:
@@ -528,8 +540,14 @@ class DashboardState:
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
             "saturation": self._saturation(color_map, white),
             "optimizer": list(self._optimizer_history),
-            "white_track": [w for w in self._white_track if w.get("elapsed_s") is not None],
+            "white_track": [w for w in self._drift_series() if w.get("elapsed_s") is not None],
         }
+
+    def _drift_series(self) -> Deque[dict]:
+        """The white-drift time series: the dedicated neutral_ref checkpoints when the run has
+        them (a fixed neutral re-measured over time — the clean signal), else the white-level
+        measurement-neutral fallback. Never the full grayscale ramp (its low/mid CCT is noise)."""
+        return self._white_track if self._white_track else self._white_fallback
 
     def _eotf_reference(self, *, hdr: bool, gamma: float, luminance: Any) -> list[list[float]]:
         out = []

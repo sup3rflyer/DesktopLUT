@@ -372,7 +372,11 @@ let lastCharts = null;
 let lightboxKey = null;
 let lightboxReturnFocus = null;
 async function refreshCharts() {
-  if (chartsBusy || document.hidden) return;   // skip while a fetch is in flight or tab hidden
+  if (chartsBusy) return;                       // a fetch is already in flight
+  // Skip the PERIODIC poll while the tab is backgrounded (saves the fetch) — but always do the
+  // first render, and the visibilitychange handler re-renders on return, so a dashboard opened
+  // in a hidden/background tab is never stuck chart-blank.
+  if (document.hidden && lastCharts) return;
   chartsBusy = true;
   try {
     const r = await fetch("/api/charts");
@@ -550,3 +554,6 @@ wireLightboxHover();
 connect();
 refreshCharts();
 setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency
+// Returning to a backgrounded tab: refresh immediately rather than waiting up to 4 s (and this
+// is what fills the charts if the dashboard was first opened while hidden).
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCharts(); });
