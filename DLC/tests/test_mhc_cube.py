@@ -177,6 +177,44 @@ def test_peak_chroma_cap_rejects_nonpositive_peak():
         mc.peak_chroma_luminance([(0.0, 0.0, 0.0)] * 3)
 
 
+def test_adaptive_dark_floor_clean_panel_is_low():
+    # Every read sits at the same chromaticity (a clean meter/panel) → no smoothing needed → low bound.
+    reads = [(nits, 0.3127, 0.3290) for nits in (0.2, 0.5, 1.0, 5.0, 20.0, 100.0, 500.0)]
+    floor, info = mc.adaptive_dark_floor(reads, bounds=(0.1, 5.0))
+    assert floor == 0.1
+    assert info["reason"] == "clean_dark_region" and info["n_strayed"] == 0
+
+
+def test_adaptive_dark_floor_follows_dark_chroma_drift():
+    # The dim reads wander off the bright white (noise/instability); the floor rises to the
+    # brightest strayed DIM read so the per-level correction blends to identity below it.
+    reads = [
+        (0.3, 0.34, 0.30),    # dim, strayed
+        (0.8, 0.33, 0.31),    # dim, strayed
+        (2.0, 0.315, 0.328),  # dim-ish, on-white
+        (50.0, 0.3127, 0.3290),
+        (300.0, 0.3127, 0.3290),
+    ]
+    floor, info = mc.adaptive_dark_floor(reads, chroma_tolerance=0.008, bounds=(0.1, 5.0))
+    assert info["reason"] == "chroma_drift"
+    assert floor == 0.8                      # brightest strayed dim read; smooth below it
+    assert info["n_strayed"] == 2
+
+
+def test_adaptive_dark_floor_too_few_reads_falls_back():
+    floor, info = mc.adaptive_dark_floor([(1.0, 0.31, 0.33)], default_floor_nits=0.3)
+    assert floor == 0.3 and info["reason"] == "too_few_reads"
+
+
+def test_adaptive_dark_floor_respects_upper_bound():
+    # A dark region unstable well past the cap can't push the floor past the upper bound: the
+    # brightest strayed dim-half read is 6 nits, but the bound caps the floor at 3.
+    reads = [(2.0, 0.45, 0.20), (4.0, 0.20, 0.45), (6.0, 0.40, 0.40),
+             (8.0, 0.3127, 0.3290), (400.0, 0.3127, 0.3290)]
+    floor, _info = mc.adaptive_dark_floor(reads, bounds=(0.1, 3.0))
+    assert floor == 3.0
+
+
 def test_build_hdr_cube_requires_neutral():
     with pytest.raises(ValueError):
         mc.build_hdr_cube([Ti3Sample(rgb=(0.0, 0.0, 0.0), xyz=(0.0, 0.0, 0.0))],

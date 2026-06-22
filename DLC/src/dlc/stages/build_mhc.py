@@ -30,6 +30,7 @@ from ..mhc import (
     find_stage_artifact,
     parse_ti3,
     resolve_run_path,
+    xy_from_xyz,
 )
 from ..refine import Deviations, RefinementTarget, propose_correction_grayscale
 from ..runs import RunContext
@@ -83,12 +84,16 @@ def build(args, ctx: RunContext) -> StageResult:
         # a 1D LUT does the neutral axis efficiently and leaves only gamut/volumetric to the
         # cube. (The 32-point set_base_grayscale table — far too sparse for a PQ EOTF — is now
         # reserved for GS+WB post-fixes.) See dlc.mhc_cube for the grounded math.
-        from ..mhc_cube import build_hdr_cube, peak_chroma_luminance, write_1d_cube
+        from ..mhc_cube import adaptive_dark_floor, build_hdr_cube, peak_chroma_luminance, write_1d_cube
 
         # Per-channel full-drive primary XYZ (R,G,B columns of the additive display matrix, in
         # absolute nits) — the linear-share basis for both the Peak-Chroma cap and the closed-loop
         # refine. Re-derived from the SAME ramps build_curves_from_ti3 validated above.
         groups = classify_samples(samples)
+        # Adaptive dark floor: derive the smooth-to-identity luminance from the MEASURED dark-read
+        # chroma drift (sensor noise OR panel instability), not a hardcoded 0.3-nit cap.
+        grey_reads = [(s.xyz[1], *xy_from_xyz(s.xyz)) for s in groups["grey"]]
+        dark_floor_nits, dark_floor_info = adaptive_dark_floor(grey_reads)
         channel_peak_xyz = [
             list(channel_model(groups[name], idx).peak_xyz)
             for name, idx in (("red", 0), ("green", 1), ("blue", 2))
@@ -120,8 +125,10 @@ def build(args, ctx: RunContext) -> StageResult:
         base_summary = {}
         try:
             cube_curves, cube_summary = build_hdr_cube(
-                samples, measured_primaries, white_xy, target_luminance
+                samples, measured_primaries, white_xy, target_luminance,
+                dark_floor_nits=dark_floor_nits
             )
+            cube_summary["dark_floor"] = dark_floor_info
             cube_path = ctx.root / "generated" / f"mhc_base_{mode.lower()}.cube"
             write_1d_cube(cube_path, cube_curves, title=f"DLC HDR MHC base (mon {args.monitor})")
             result.add_artifact(cube_path)
@@ -208,6 +215,7 @@ def build(args, ctx: RunContext) -> StageResult:
         # The linear-share basis + Peak-Chroma cap the closed-loop refine consumes (HDR only).
         params["channel_peak_xyz"] = [[round(v, 6) for v in xyz] for xyz in channel_peak_xyz]
         params["peak_chroma"] = peak_chroma
+        params["dark_floor"] = {"nits": round(dark_floor_nits, 4), **dark_floor_info}
     params_path = ctx.root / "generated" / f"mhc_params_{mode.lower()}.json"
     params_path.parent.mkdir(parents=True, exist_ok=True)
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")

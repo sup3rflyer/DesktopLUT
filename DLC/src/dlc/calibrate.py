@@ -2577,6 +2577,9 @@ class Calibration:
             channel_peak_xyz = params.get("channel_peak_xyz")
             native_white = params.get("measured_white") or {}
             nwx, nwy = native_white.get("x"), native_white.get("y")
+            # Adaptive dark floor derived at build time from the measured dark-read chroma drift
+            # (build_mhc / mhc_cube.adaptive_dark_floor); fall back to 1.0 nit if absent.
+            dark_floor = float((params.get("dark_floor") or {}).get("nits") or 1.0)
             if not (spec.is_hdr and cube_path and cap_nits and channel_peak_xyz
                     and nwx is not None and nwy is not None):
                 return StageOutcome(
@@ -2656,7 +2659,7 @@ class Calibration:
                 measured_neutral = [(s.rgb[0], tuple(s.xyz)) for s in grey]
                 new_curves = refine_hdr_cube(
                     read_1d_cube(Path(installed)), measured_neutral, channel_peak_xyz, rowsums,
-                    peak_cap_nits=cap_nits, target_white_xy=(wx, wy))
+                    peak_cap_nits=cap_nits, target_white_xy=(wx, wy), dark_floor_nits=dark_floor)
                 new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
                 write_1d_cube(new_path, new_curves,
                               title=f"DLC HDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
