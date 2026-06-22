@@ -27,7 +27,7 @@ risk to the loop).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .colormath import XYZ_to_xy, clamp, invert3x3, matvec, rgb_to_xyz_matrix, xy_to_XYZ
 from .metrics import delta_e2000, xyz_to_lab
@@ -101,8 +101,18 @@ def propose_correction_grayscale(
     primaries: MeasuredPrimaries,
     current: Deviations | None = None,
     damping: float = 0.7,
+    noise: Mapping[float, float] | None = None,
 ) -> dict[str, Any]:
-    """Return the next correction-grayscale deviations + residual diagnostics."""
+    """Return the next correction-grayscale deviations + residual diagnostics.
+
+    ``noise`` (optional) maps a measured patch ``level`` -> the per-level chroma measurement
+    uncertainty (standard error of the mean in ``xy``, i.e. per-read σ / √reads; ``+inf`` for an
+    ``unstable`` level the panel won't hold). When given, each level's correction step is scaled by
+    :func:`dlc.mhc_cube.noise_trust` — smoothed toward the *current* deviation when the white error
+    is within the measurement noise (don't chase noise), full step when it clearly exceeds it. This
+    is the continuous generalization of the binary dark-luminance hold and the SDR analogue of the
+    HDR cube's per-level ``dark_trust_weights``. ``noise=None`` (or a level absent from it) ⇒ trust
+    1.0 ⇒ the original full-step behaviour, so existing callers are unchanged."""
     patches = sorted(measured, key=lambda p: p.level)
     n = len(patches)
     if n == 0:
@@ -113,7 +123,7 @@ def propose_correction_grayscale(
     # dark chroma drift vs the stable BRIGHTEST neutral (on SDR the peak IS the target white, so it
     # is the right reference — unlike HDR, where the brightest patch is overdrive). Falls back to
     # the old fixed DARK_LUMINANCE_FLOOR when the ramp is too sparse to derive one.
-    from .mhc_cube import adaptive_dark_floor
+    from .mhc_cube import adaptive_dark_floor, noise_trust
     dark_floor, _dark_info = adaptive_dark_floor(
         [(p.xyz[1], *XYZ_to_xy(*p.xyz)) for p in patches],
         reference_band=None, default_floor_nits=DARK_LUMINANCE_FLOOR)
@@ -143,6 +153,16 @@ def propose_correction_grayscale(
         r_meas = matvec(Pinv, M)
         r_targ = matvec(Pinv, T)
 
+        # Per-level measurement-noise trust (continuous generalization of the binary dark hold):
+        # how far the measured white sits from target vs. this level's chroma noise. trust->0 when
+        # the error is within the measurement uncertainty (don't chase noise / a chromaticity the
+        # panel won't hold) ⇒ hold near the current deviation; ->1 when it clearly exceeds it ⇒ full
+        # step. noise=None / level absent ⇒ trust 1.0 = the original full-step behaviour.
+        mx, my = XYZ_to_xy(*M)
+        chroma_err = ((mx - target.white_x) ** 2 + (my - target.white_y) ** 2) ** 0.5
+        level_sigma = noise.get(patch.level) if noise is not None else None
+        trust = noise_trust(chroma_err, level_sigma)
+
         gains: list[float] = []
         out_cols = ("r", "g", "b")
         for ch in range(3):
@@ -155,12 +175,12 @@ def propose_correction_grayscale(
                 new_dev = cur_dev  # too dark to balance; hold
             else:
                 step = ratio ** (damping / target.gamma)
-                new_dev = clamp(cur_dev * step, DEV_MIN, DEV_MAX)
+                proposed = clamp(cur_dev * step, DEV_MIN, DEV_MAX)
+                new_dev = cur_dev + (proposed - cur_dev) * trust
             getattr(next_dev, out_cols[ch])[i] = new_dev
 
         de = delta_e2000(xyz_to_lab(M, ref_white), xyz_to_lab(T, ref_white))
         de_values.append(de)
-        mx, my = XYZ_to_xy(*M)
         residuals.append(
             {
                 "level": round(patch.level, 6),
@@ -171,6 +191,7 @@ def propose_correction_grayscale(
                 "de2000": round(de, 4),
                 "channel_gains": [round(x, 4) for x in gains],
                 "held_dark": patch.xyz[1] < dark_floor,
+                "noise_trust": round(trust, 4),
             }
         )
 

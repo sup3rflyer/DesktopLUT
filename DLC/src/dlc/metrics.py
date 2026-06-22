@@ -155,12 +155,26 @@ def hue_angle(a: float, b: float) -> float:
     return angle + 360 if angle < 0 else angle
 
 
+def _finite_nonneg_xyz(xyz: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Sanitize a measured XYZ before scoring. A dropped/saturated meter read can be NaN/inf or
+    negative; scoring it directly NaN-poisons the CIEDE2000 avg/p95 (and ``max()`` can hide it).
+    Non-finite -> 0.0, finite negatives -> 0.0, so a bad read scores a large FINITE error that
+    surfaces instead. Mirrors the HDR scorer's ``nan_to_num``+clip guard in ``engine.model.score_hdr``."""
+    return tuple(max(c, 0.0) if math.isfinite(c) else 0.0 for c in xyz)  # type: ignore[return-value]
+
+
 def infer_target_luminance(samples: list[Ti3Sample]) -> float:
-    whiteish = [sample.xyz[1] for sample in samples if min(sample.rgb) >= 0.99]
+    def lum(sample: Ti3Sample) -> float:
+        y = sample.xyz[1]
+        return y if (math.isfinite(y) and y > 0.0) else 0.0
+    whiteish = [lum(s) for s in samples if min(s.rgb) >= 0.99 and lum(s) > 0.0]
     if whiteish:
         return max(whiteish)
-    grayscale = [sample.xyz[1] for sample in samples if is_grayscale(sample.rgb)]
-    return max(grayscale or [sample.xyz[1] for sample in samples])
+    grayscale = [lum(s) for s in samples if is_grayscale(s.rgb) and lum(s) > 0.0]
+    if grayscale:
+        return max(grayscale)
+    finite = [lum(s) for s in samples if lum(s) > 0.0]
+    return max(finite) if finite else 1.0  # all-dark/garbage set: safe nonzero (panel_dark caught upstream)
 
 
 def is_grayscale(rgb: tuple[float, float, float]) -> bool:
@@ -187,8 +201,9 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
         white = white_xyz(target_luminance)
     metrics: list[PatchMetric] = []
     for sample in samples:
+        meas = _finite_nonneg_xyz(sample.xyz)
         target = target_xyz_for_rgb(sample.rgb, target_luminance, gamma, matrix)
-        de = delta_e2000(xyz_to_lab(sample.xyz, white), xyz_to_lab(target, white))
+        de = delta_e2000(xyz_to_lab(meas, white), xyz_to_lab(target, white))
         metrics.append(PatchMetric(sample.rgb, sample.xyz, target, de, is_grayscale(sample.rgb)))
     return metrics, target_luminance
 

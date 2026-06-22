@@ -66,10 +66,11 @@ class Target:
     white_xy: Optional[tuple[float, float]] = None
 
     @classmethod
-    def hdr_rec2020_pq(cls, peak_nits: float = 10000.0,
-                       white_xy: Optional[tuple[float, float]] = None) -> "Target":
-        # peak_nits stays 10000 for the PQ container regardless of display peak;
-        # the display peak just bounds the patch set, not the encoding.
+    def hdr_rec2020_pq(cls, white_xy: Optional[tuple[float, float]] = None) -> "Target":
+        # The PQ container is ALWAYS 10000 nits regardless of the display's peak — the display
+        # peak bounds the patch set (`_patch_max_cv`), not the encoding. (There used to be a
+        # `peak_nits` parameter here; it was silently discarded — callers passing e.g. 1600 had
+        # no effect — so it was removed. Don't re-add it expecting it to change the container.)
         return cls("ITU-R BT.2020", "pq", peak_nits=10000.0, white_xy=white_xy)
 
     @classmethod

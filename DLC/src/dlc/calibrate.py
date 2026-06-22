@@ -3972,9 +3972,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
-                             "checkpoint surfaces a rich 'status — continue?' (run overview + events "
-                             "since the last check-in) so a long run never goes dark. Default 600 "
-                             "(10 min); live runs GATE on it, --auto/--supervised ping through; 0 disables.")
+                             "checkpoint EMITS a rich evidence packet (run overview + events since the "
+                             "last check-in) for the LLM to consume from the running spine, so a long "
+                             "run never goes dark. Default 600 (10 min). A check-in is emit-only — it "
+                             "NEVER gates or pauses the spine and carries no recommendation (all modes); "
+                             "0 disables.")
     parser.add_argument("--neutral-min-reads", type=int, default=None, dest="neutral_min_reads",
                         metavar="N",
                         help="per-patch read FLOOR on near-neutral patches (grey ramp + tube): average "

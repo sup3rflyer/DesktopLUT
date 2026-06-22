@@ -376,7 +376,9 @@ class Profile:
         spec = self.target(target_name)
         wxy = white_xy if white_xy is not None else spec.white_xy()
         if spec.is_hdr:
-            return Target.hdr_rec2020_pq(peak_nits=spec.luminance_nits, white_xy=wxy)
+            # NB: the HDR PQ container is fixed at 10000 nits; the display peak (spec.luminance_nits)
+            # bounds the patch set elsewhere, not the engine Target — so it is not passed here.
+            return Target.hdr_rec2020_pq(white_xy=wxy)
         return Target.sdr_srgb_power(gamma=spec.gamma, white_nits=spec.luminance_nits,
                                      white_xy=wxy)
 

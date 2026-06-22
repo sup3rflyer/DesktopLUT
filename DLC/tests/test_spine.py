@@ -259,6 +259,44 @@ def test_refinement_holds_dark_points():
     assert proposal["residuals"][0]["held_dark"] is True
 
 
+def test_refinement_noise_trust_holds_correction_within_noise():
+    # Per-level noise trust (SDR analogue of the HDR cube's dark_trust_weights): a bright patch
+    # whose white sits a small chroma distance off-target is CORRECTED when trusted, but HELD when
+    # the supplied per-level noise (σ) swamps that error — don't chase meter noise / a chromaticity
+    # the panel won't hold. noise=None must reproduce the original full-step behaviour.
+    D65 = (0.3127, 0.3290)
+
+    def xyz_at(x, y, Y):
+        return (x / y * Y, Y, (1 - x - y) / y * Y)
+
+    off = (0.3200, 0.3340)  # ~0.009 off D65 in xy, comfortably above the dark floor
+    patches = [GrayPatch(level=0.5, xyz=xyz_at(*off, 30.0)),
+               GrayPatch(level=1.0, xyz=xyz_at(*off, 120.0))]
+    prim = MeasuredPrimaries(0.64, 0.33, 0.30, 0.60, 0.15, 0.06, D65[0], D65[1])
+    target = RefinementTarget(white_x=D65[0], white_y=D65[1], gamma=2.2, peak_luminance=120.0)
+    cur = Deviations.identity(2)
+    err = ((off[0] - D65[0]) ** 2 + (off[1] - D65[1]) ** 2) ** 0.5
+
+    # No noise -> full step: the bright patch is corrected (deviation moves off identity).
+    free = propose_correction_grayscale(measured=patches, target=target, primaries=prim, current=cur)
+    bright_free = next(r for r in free["residuals"] if abs(r["level"] - 1.0) < 1e-6)
+    assert bright_free["noise_trust"] == 1.0
+    assert max(abs(free["deviations"][c][1] - 1.0) for c in "rgb") > 1e-3
+
+    # σ >> chroma error -> trust 0 -> the bright patch is held at the current (identity) deviation.
+    noisy = propose_correction_grayscale(measured=patches, target=target, primaries=prim,
+                                         current=cur, noise={0.5: err * 10, 1.0: err * 10})
+    bright_noisy = next(r for r in noisy["residuals"] if abs(r["level"] - 1.0) < 1e-6)
+    assert bright_noisy["noise_trust"] == 0.0
+    assert all(abs(noisy["deviations"][c][1] - 1.0) < 1e-9 for c in "rgb")
+
+    # An UNSTABLE level (σ = +inf) is also fully held.
+    unstable = propose_correction_grayscale(measured=patches, target=target, primaries=prim,
+                                            current=cur, noise={1.0: float("inf")})
+    bn = next(r for r in unstable["residuals"] if abs(r["level"] - 1.0) < 1e-6)
+    assert bn["noise_trust"] == 0.0
+
+
 def test_sdr_dark_floor_adapts_below_the_fixed_half_nit():
     # SDR uses the adaptive dark floor too: a CLEAN dark region (every read on the target white)
     # drops the floor to the low bound, so a 0.3-nit patch is CORRECTED — the old fixed 0.5-nit
