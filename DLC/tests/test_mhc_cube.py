@@ -201,6 +201,23 @@ def test_adaptive_dark_floor_follows_dark_chroma_drift():
     assert info["n_strayed"] == 2
 
 
+def test_adaptive_dark_floor_hdr_anchors_on_diffuse_white_not_overdriven_peak():
+    # HDR: the brightest patch (1000 nits) is overdriven/ABL-shifted; the diffuse-white band
+    # (100-203) is stable at D65. A dark read that tracks D65 must NOT be flagged just because it
+    # differs from the shifted peak — only the genuinely-wandering dark read sets the floor.
+    reads = [(0.3, 0.34, 0.30),       # dark, genuinely wandering
+             (0.5, 0.3127, 0.329),    # dark, on diffuse white
+             (2.0, 0.3127, 0.329),    # dark, on diffuse white
+             (120.0, 0.3127, 0.329),  # diffuse-white band
+             (180.0, 0.3127, 0.329),  # diffuse-white band
+             (1000.0, 0.300, 0.340)]  # overdriven peak (shifted)
+    band_floor, info = mc.adaptive_dark_floor(reads, reference_band=mc.HDR_REFERENCE_WHITE_BAND)
+    peak_floor, _ = mc.adaptive_dark_floor(reads)            # brightest-ref (SDR / old behaviour)
+    assert info["ref_source"] == "diffuse_white_band"
+    assert abs(band_floor - 0.3) < 1e-6                      # only the wandering read; 0.5/2.0 track D65
+    assert peak_floor > band_floor                           # anchoring on the overdriven peak over-smooths
+
+
 def test_adaptive_dark_floor_too_few_reads_falls_back():
     floor, info = mc.adaptive_dark_floor([(1.0, 0.31, 0.33)], default_floor_nits=0.3)
     assert floor == 0.3 and info["reason"] == "too_few_reads"

@@ -108,6 +108,16 @@ def propose_correction_grayscale(
     if n == 0:
         raise ValueError("no measured gray patches to refine")
 
+    # Adaptive dark floor (SDR): below this luminance a per-channel WB correction chases meter
+    # noise / panel instability, so hold the current deviation. Derived from the measured ramp's
+    # dark chroma drift vs the stable BRIGHTEST neutral (on SDR the peak IS the target white, so it
+    # is the right reference — unlike HDR, where the brightest patch is overdrive). Falls back to
+    # the old fixed DARK_LUMINANCE_FLOOR when the ramp is too sparse to derive one.
+    from .mhc_cube import adaptive_dark_floor
+    dark_floor, _dark_info = adaptive_dark_floor(
+        [(p.xyz[1], *XYZ_to_xy(*p.xyz)) for p in patches],
+        reference_band=None, default_floor_nits=DARK_LUMINANCE_FLOOR)
+
     peak_Y = target.peak_luminance or max(p.xyz[1] for p in patches) or 1.0
     P = rgb_to_xyz_matrix(
         primaries.rx, primaries.ry, primaries.gx, primaries.gy,
@@ -141,7 +151,7 @@ def propose_correction_grayscale(
             ratio = clamp(rt / rm, 0.1, 10.0) if rm > 1e-6 else 1.0
             gains.append(ratio)
             cur_dev = (cur.r, cur.g, cur.b)[ch][i]
-            if patch.xyz[1] < DARK_LUMINANCE_FLOOR:
+            if patch.xyz[1] < dark_floor:
                 new_dev = cur_dev  # too dark to balance; hold
             else:
                 step = ratio ** (damping / target.gamma)
@@ -160,7 +170,7 @@ def propose_correction_grayscale(
                 "target_Y": round(desired_Y, 4),
                 "de2000": round(de, 4),
                 "channel_gains": [round(x, 4) for x in gains],
-                "held_dark": patch.xyz[1] < DARK_LUMINANCE_FLOOR,
+                "held_dark": patch.xyz[1] < dark_floor,
             }
         )
 

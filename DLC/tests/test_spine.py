@@ -259,6 +259,27 @@ def test_refinement_holds_dark_points():
     assert proposal["residuals"][0]["held_dark"] is True
 
 
+def test_sdr_dark_floor_adapts_below_the_fixed_half_nit():
+    # SDR uses the adaptive dark floor too: a CLEAN dark region (every read on the target white)
+    # drops the floor to the low bound, so a 0.3-nit patch is CORRECTED — the old fixed 0.5-nit
+    # floor would have held it. (On SDR the brightest patch IS the stable target white reference.)
+    from dlc.refine import GrayPatch
+    D65 = (0.3127, 0.3290)
+
+    def xyz(Y):
+        return (D65[0] / D65[1] * Y, Y, (1 - D65[0] - D65[1]) / D65[1] * Y)
+    patches = [GrayPatch(level=l, xyz=xyz(Y)) for l, Y in
+               [(0.05, 0.3), (0.25, 6.0), (0.5, 30.0), (0.8, 80.0), (1.0, 120.0)]]
+    prim = MeasuredPrimaries(0.64, 0.33, 0.30, 0.60, 0.15, 0.06, D65[0], D65[1])
+    proposal = propose_correction_grayscale(
+        measured=patches,
+        target=RefinementTarget(white_x=D65[0], white_y=D65[1], gamma=2.2, peak_luminance=120.0),
+        primaries=prim, current=Deviations.identity(5))
+    dark = next(r for r in proposal["residuals"] if abs(r["level"] - 0.05) < 1e-6)
+    assert dark["measured_Y"] < 0.5          # below the OLD fixed 0.5-nit floor
+    assert dark["held_dark"] is False        # ...yet corrected, because the adaptive floor dropped
+
+
 # --------------------------------------------------------------------------
 # Item 6: runtime GS+WB tweak (shader proxy) + deterministic display mapping
 # --------------------------------------------------------------------------

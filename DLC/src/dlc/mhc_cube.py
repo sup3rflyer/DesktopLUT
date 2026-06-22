@@ -54,6 +54,7 @@ __all__ = [
     "invert_monotone",
     "peak_chroma_luminance",
     "adaptive_dark_floor",
+    "HDR_REFERENCE_WHITE_BAND",
     "mhc2_matrix",
     "build_hdr_cube",
     "refine_hdr_cube",
@@ -64,7 +65,24 @@ __all__ = [
 _D65 = (0.3127, 0.3290)
 
 
+# BT.2408 diffuse / graphics ("HDR reference") white sits at 203 nits; SDR reference ~100. This
+# band is the panel's STABLE, well-lit-but-pre-overdrive neutral — the trustworthy chromaticity to
+# judge dark drift against on HDR, where the BRIGHTEST patch is the panel in overdrive/ABL/thermal
+# limit (a moving, untrustworthy reference), not a target.
+HDR_REFERENCE_WHITE_BAND = (100.0, 203.0)
+
+
+def _median(vals: Sequence[float]) -> float:
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    m = n // 2
+    return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
+
+
 def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
+                        reference_band: tuple[float, float] | None = None,
                         chroma_tolerance: float = 0.008,
                         bounds: tuple[float, float] = (0.1, 5.0),
                         default_floor_nits: float = 0.3
@@ -74,15 +92,22 @@ def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
 
     Below some luminance the meter's chroma reading wanders (sensor noise) and/or the panel's dark
     output is unstable; either way a per-channel white-balance correction there is untrustworthy.
-    Instead of a fixed 0.3-nit floor, find that luminance from the data: take the panel's stable
-    (brightest) neutral chromaticity as the reference, then walk the DIM reads (the darker half) and
-    flag any whose chromaticity strays from it by more than ``chroma_tolerance``. The floor is the
-    brightest such strayed read's luminance — smooth to identity below it. It doesn't matter whether
-    the wander is sensor noise or display instability; the measured drift sets the floor either way.
+    Find that luminance from the data: take a TRUSTWORTHY reference chromaticity, then walk the dark
+    reads and flag any whose chromaticity strays from it by more than ``chroma_tolerance``. The floor
+    is the brightest such strayed dark read — smooth to identity below it. Noise or instability, the
+    measured drift sets the floor either way.
 
-    ``neutral_reads``: ``[(nits, x, y), ...]`` neutral measurements (any order; nits>0).
-    Returns ``(floor_nits, info)`` clamped to ``bounds``. A clean dark region (no dim read strays)
-    returns ``bounds[0]`` (little smoothing); too few reads returns ``default_floor_nits``.
+    The reference depends on the mode:
+      * ``reference_band=(lo,hi)`` (**HDR**): the median chromaticity of reads in the stable diffuse-
+        white band (default :data:`HDR_REFERENCE_WHITE_BAND`, 100-203 nits). On HDR the BRIGHTEST
+        patch is the panel pushed into overdrive/ABL/thermal limit — a shifting, untrustworthy
+        reference — so we anchor on the pre-overdrive diffuse white instead. Falls back to the
+        brightest read at/below the band (then the dimmest) when nothing lands in-band.
+      * ``None`` (**SDR**): the brightest read — on SDR the peak IS the calibration target white and
+        is stable, so it's the right anchor.
+
+    ``neutral_reads``: ``[(nits, x, y), ...]`` (any order; nits>0). Returns ``(floor_nits, info)``
+    clamped to ``bounds``; a clean dark region returns ``bounds[0]``; too few reads → ``default_floor_nits``.
     """
     reads = [(float(n), float(x), float(y)) for (n, x, y) in neutral_reads
              if n is not None and n > 0.0 and x is not None and y is not None]
@@ -90,27 +115,38 @@ def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
         return default_floor_nits, {"reason": "too_few_reads", "n_reads": len(reads)}
     reads.sort(key=lambda r: r[0])
     nits = [r[0] for r in reads]
-    ref_x, ref_y = reads[-1][1], reads[-1][2]            # brightest read = the trustworthy reference
-    median_nits = nits[len(nits) // 2]
+    if reference_band is not None:
+        lo_b, hi_b = reference_band
+        band = [r for r in reads if lo_b <= r[0] <= hi_b]
+        if band:
+            ref_x, ref_y = _median([r[1] for r in band]), _median([r[2] for r in band])
+            ref_nits, ref_source = _median([r[0] for r in band]), "diffuse_white_band"
+        else:
+            below = [r for r in reads if r[0] <= hi_b]   # avoid the overdriven peak when out-of-band
+            ref_nits, ref_x, ref_y = (below[-1] if below else reads[0])
+            ref_source = "nearest_below_band" if below else "dimmest_above_band"
+    else:
+        ref_nits, ref_x, ref_y = reads[-1]               # SDR: the brightest read = the target white
+        ref_source = "brightest"
+    # Floor candidates = the dark reads (below the reference); the bounds clamp keeps a mid-tone
+    # chroma error from inflating the floor even if it slips through.
+    cutoff = min(nits[len(nits) // 2], ref_nits)
     strayed = []
     max_drift = 0.0
     for n, x, y in reads:
         drift = ((x - ref_x) ** 2 + (y - ref_y) ** 2) ** 0.5
         max_drift = max(max_drift, drift)
-        # only the dark half are floor candidates — a bright-level chroma error is a different
-        # problem (matrix/primaries), not the dark-noise floor this guards against.
-        if n <= median_nits and drift > chroma_tolerance:
+        if n <= cutoff and drift > chroma_tolerance:
             strayed.append(n)
     lo, hi = bounds
     if not strayed:
-        floor = lo
-        reason = "clean_dark_region"
+        floor, reason = lo, "clean_dark_region"
     else:
-        floor = min(max(max(strayed), lo), hi)
-        reason = "chroma_drift"
-    return floor, {"reason": reason, "n_reads": len(reads), "ref_xy": [round(ref_x, 5), round(ref_y, 5)],
-                   "max_chroma_drift": round(max_drift, 5), "n_strayed": len(strayed),
-                   "chroma_tolerance": chroma_tolerance}
+        floor, reason = min(max(max(strayed), lo), hi), "chroma_drift"
+    return floor, {"reason": reason, "n_reads": len(reads),
+                   "ref_xy": [round(ref_x, 5), round(ref_y, 5)], "ref_nits": round(ref_nits, 3),
+                   "ref_source": ref_source, "max_chroma_drift": round(max_drift, 5),
+                   "n_strayed": len(strayed), "chroma_tolerance": chroma_tolerance}
 
 
 def mhc2_matrix(native_primaries: Mapping[str, float], native_white_xy: tuple[float, float],

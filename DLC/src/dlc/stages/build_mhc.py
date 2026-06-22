@@ -84,16 +84,25 @@ def build(args, ctx: RunContext) -> StageResult:
         # a 1D LUT does the neutral axis efficiently and leaves only gamut/volumetric to the
         # cube. (The 32-point set_base_grayscale table — far too sparse for a PQ EOTF — is now
         # reserved for GS+WB post-fixes.) See dlc.mhc_cube for the grounded math.
-        from ..mhc_cube import adaptive_dark_floor, build_hdr_cube, peak_chroma_luminance, write_1d_cube
+        from ..mhc_cube import (
+            HDR_REFERENCE_WHITE_BAND,
+            adaptive_dark_floor,
+            build_hdr_cube,
+            peak_chroma_luminance,
+            write_1d_cube,
+        )
 
         # Per-channel full-drive primary XYZ (R,G,B columns of the additive display matrix, in
         # absolute nits) — the linear-share basis for both the Peak-Chroma cap and the closed-loop
         # refine. Re-derived from the SAME ramps build_curves_from_ti3 validated above.
         groups = classify_samples(samples)
         # Adaptive dark floor: derive the smooth-to-identity luminance from the MEASURED dark-read
-        # chroma drift (sensor noise OR panel instability), not a hardcoded 0.3-nit cap.
+        # chroma drift (sensor noise OR panel instability), not a hardcoded 0.3-nit cap. On HDR the
+        # reference chromaticity is the stable diffuse-white band (100-203 nits), NOT the brightest
+        # patch (the panel in overdrive/ABL/thermal limit — a moving target, not a reference).
         grey_reads = [(s.xyz[1], *xy_from_xyz(s.xyz)) for s in groups["grey"]]
-        dark_floor_nits, dark_floor_info = adaptive_dark_floor(grey_reads)
+        dark_floor_nits, dark_floor_info = adaptive_dark_floor(
+            grey_reads, reference_band=HDR_REFERENCE_WHITE_BAND)
         channel_peak_xyz = [
             list(channel_model(groups[name], idx).peak_xyz)
             for name, idx in (("red", 0), ("green", 1), ("blue", 2))
