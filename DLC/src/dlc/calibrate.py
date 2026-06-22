@@ -505,6 +505,8 @@ class Calibration:
         neutral_min_reads: Optional[int] = None,
         neutral_chroma_span: Optional[float] = None,
         neutral_floor_min_nits: Optional[float] = None,
+        dark_min_reads: Optional[int] = None,
+        dark_floor_max_nits: Optional[float] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -524,6 +526,11 @@ class Calibration:
         self.neutral_min_reads = neutral_min_reads
         self.neutral_chroma_span = neutral_chroma_span
         self.neutral_floor_min_nits = neutral_floor_min_nits
+        # Dark near-neutral read FLOOR: take several reads on dim near-neutral patches so their
+        # read-to-read CHROMATICITY spread can be estimated — that spread drives the dark-level trust
+        # (how much to smooth a dark correction to identity). None ⇒ MeasureLoopConfig default (off).
+        self.dark_min_reads = dark_min_reads
+        self.dark_floor_max_nits = dark_floor_max_nits
         self.optimize_config = optimize_config or OptimizeConfig()
         self.characterize_config = characterize_config
         self.run_date = run_date or date.today()
@@ -1068,6 +1075,10 @@ class Calibration:
             kw["neutral_chroma_span"] = self.neutral_chroma_span
         if self.neutral_floor_min_nits is not None:
             kw["neutral_floor_min_nits"] = self.neutral_floor_min_nits
+        if self.dark_min_reads is not None:
+            kw["dark_min_reads"] = self.dark_min_reads
+        if self.dark_floor_max_nits is not None:
+            kw["dark_floor_max_nits"] = self.dark_floor_max_nits
         return MeasureLoopConfig(**kw)
 
     def _resolve_white_now(self) -> cp.WhitePointResolution:
@@ -2536,6 +2547,28 @@ class Calibration:
             strategy=f"{normalized['shadow_treatment']}/{normalized['volumetric_density']}",
             source=normalized.get("source"), confidence=normalized.get("confidence"))
 
+    def _noise_sigma_by_level(self, ti3_path: Optional[str]) -> dict[float, Optional[float]]:
+        """``{round(gray level, 6): measured chroma σ}`` from the measure loop's noise sidecar beside
+        ``ti3_path`` (the read-to-read chromaticity spread per level). Empty when single-read / absent —
+        the refine then trusts every level (the σ-driven dark smoothing simply isn't engaged)."""
+        if not ti3_path:
+            return {}
+        try:
+            from .measure_loop import noise_sidecar_path
+            p = noise_sidecar_path(Path(ti3_path))
+            if not p.exists():
+                return {}
+            by = (json.loads(p.read_text(encoding="utf-8")) or {}).get("by_level") or {}
+        except (OSError, ValueError):
+            return {}
+        out: dict[float, Optional[float]] = {}
+        for k, v in by.items():
+            try:
+                out[round(float(k), 6)] = v.get("chroma_sigma")
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return out
+
     def _grey_de_vs_white(self, samples, white_xy: tuple[float, float]) -> dict[str, Any]:
         """Average/max dE_ITP of the GRAYSCALE patches against the target white (D65) at the
         resolved HDR peak — the closed-loop refine's convergence metric. Returns
@@ -2656,7 +2689,13 @@ class Calibration:
                     break
 
                 # --- one refine step toward D65 at the Peak-Chroma cap, then reinstall ---
-                measured_neutral = [(s.rgb[0], tuple(s.xyz)) for s in grey]
+                # Attach each level's measured chroma σ (from the measure loop's noise sidecar) so
+                # the refine smooths a noisy/unstable dark level's correction toward identity.
+                sigma_by_level = self._noise_sigma_by_level(res.ti3_path)
+                measured_neutral = [
+                    (s.rgb[0], tuple(s.xyz)) + ((sigma_by_level.get(round(s.rgb[0], 6)),)
+                                                if sigma_by_level.get(round(s.rgb[0], 6)) is not None else ())
+                    for s in grey]
                 new_curves = refine_hdr_cube(
                     read_1d_cube(Path(installed)), measured_neutral, channel_peak_xyz, rowsums,
                     peak_cap_nits=cap_nits, target_white_xy=(wx, wy), dark_floor_nits=dark_floor)
@@ -3964,6 +4003,17 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "smallest measured σ (averaging buys least) and are the slowest to read + most "
                              "thermally risky (long dwell at low backlight), so gate the floor to the "
                              "brighter, faster, larger-σ near-neutral patches.")
+    parser.add_argument("--dark-min-reads", type=int, default=3, dest="dark_min_reads",
+                        metavar="N",
+                        help="per-patch read FLOOR on DIM near-neutral patches (≤ --dark-floor-max-nits): "
+                             "take ≥N reads so their read-to-read CHROMATICITY spread can be measured — "
+                             "that spread drives the dark-level trust (how much to smooth a dark "
+                             "correction to identity, since near-black chroma is the unreliable axis). "
+                             "Default 3; 1 disables.")
+    parser.add_argument("--dark-floor-max-nits", type=float, default=2.0, dest="dark_floor_max_nits",
+                        metavar="NITS",
+                        help="luminance ceiling for --dark-min-reads (default 2.0): near-neutral patches "
+                             "at or below this expected luminance get the dark read floor.")
     parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
                         help="full flow: skip the final GS+WB tweak (deferred stage targets the "
                              "wrong layer) — runs ICC→3D-LUT as one cohesive unit (one rollback "
@@ -4243,6 +4293,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         enable_watchdog=True, checkin_interval_s=args.checkin_interval,
                         require_hardware_readiness=True,
                         neutral_min_reads=args.neutral_min_reads,
+                        dark_min_reads=args.dark_min_reads,
+                        dark_floor_max_nits=args.dark_floor_max_nits,
                         neutral_chroma_span=args.neutral_chroma_span,
                         neutral_floor_min_nits=args.neutral_floor_min_nits)
     result = None

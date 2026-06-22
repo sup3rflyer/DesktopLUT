@@ -199,6 +199,15 @@ class MeasureLoopConfig:
     # to brighter near-neutral patches puts the extra reads where σ is largest and reads are fast,
     # and leaves the slow dim patches at a single read.
     neutral_floor_min_nits: float = 0.0
+    # Dark near-neutral read floor (CHROMA trust). The note above spares dim patches because their
+    # *luminance* σ is smallest — but near black the *chromaticity* is the unreliable axis (meter
+    # chroma noise + backlight contamination + coarse PQ codes), and we can only know HOW unreliable
+    # by reading the level several times. Take ≥ ``dark_min_reads`` reads on near-neutral patches at
+    # or below ``dark_floor_max_nits`` so the read-to-read chromaticity spread can be estimated; that
+    # spread drives the dark-level trust (mhc_cube.dark_trust_weights → how much to smooth to
+    # identity). Default 1 ⇒ off; complementary to neutral_min_reads (the BRIGHT region).
+    dark_min_reads: int = 1
+    dark_floor_max_nits: float = 1.0
 
     plausible_luminance_floor_nits: float = 1.0
     plausible_luminance_reference_floor_fraction: float = 0.04
@@ -226,6 +235,11 @@ class AcceptedRead:
     unstable: bool = False
     usable: bool = True          # False = a sentinel hole (no usable read) — kept OFF the .ti3
     note: Optional[str] = None
+    # Measured repeatability (≥2 reads): the standard error in dE and the read-to-read chromaticity
+    # spread in xy. These quantify sensor-noise + short-term display fluctuation, and feed the
+    # dark-level trust (mhc_cube.dark_trust_weights) — how much to smooth a dark correction to identity.
+    se_de: Optional[float] = None
+    chroma_sigma: Optional[float] = None
 
 
 @dataclass
@@ -300,6 +314,35 @@ def _median_xyz(vals: Sequence[tuple[float, float, float]]) -> tuple[float, floa
         m = len(xs) // 2
         return xs[m] if len(xs) % 2 else 0.5 * (xs[m - 1] + xs[m])
     return (med([v[0] for v in vals]), med([v[1] for v in vals]), med([v[2] for v in vals]))
+
+
+def noise_sidecar_path(ti3_path: Path) -> Path:
+    """The per-level measured-noise sidecar beside a ``.ti3`` (``<ti3>.noise.json``)."""
+    return Path(str(ti3_path) + ".noise.json")
+
+
+def _write_noise_sidecar(ti3_path: Path, accepted: Sequence[AcceptedRead]) -> None:
+    """Persist per-NEUTRAL-LEVEL measured repeatability (chroma σ + SE + reads) beside the ``.ti3``,
+    keyed by gray level (signal). Consumed by ``build_mhc`` → ``mhc_cube.dark_trust_weights`` to
+    decide how much to smooth each dark level's correction to identity. No file when nothing has
+    ≥2 reads (single-read run ⇒ no spread ⇒ the trust gate simply isn't engaged)."""
+    by_level: dict[str, dict[str, Any]] = {}
+    for r in accepted:
+        if not r.usable or r.chroma_sigma is None:
+            continue
+        s = r.patch.signal
+        if not (abs(s[0] - s[1]) < 1e-6 and abs(s[1] - s[2]) < 1e-6):
+            continue                       # neutral gray levels only (the cube's neutral axis)
+        by_level[f"{s[0]:.6f}"] = {
+            "chroma_sigma": round(r.chroma_sigma, 6),
+            "se_de": (round(r.se_de, 4) if r.se_de is not None else None),
+            "reads": r.reads_taken,
+            "unstable": bool(r.unstable),
+        }
+    if not by_level:
+        return
+    noise_sidecar_path(ti3_path).write_text(
+        json.dumps({"schema": 1, "by_level": by_level}, indent=2), encoding="utf-8")
 
 
 def write_ti3(
@@ -626,6 +669,17 @@ class _Loop:
         white = self.white_xyz or mean
         rms = math.sqrt(sum(_agreement_de(r, mean, white) ** 2 for r in reads) / n)
         return rms / math.sqrt(n)
+
+    def _chroma_sigma(self, yxys: Sequence[tuple[float, float, float]]) -> Optional[float]:
+        """RMS read-to-read chromaticity spread in ``xy`` (each ``yxy`` is ``(Y, x, y)``) — the
+        dark-level noise estimate that drives the trust (sensor noise + short-term display
+        fluctuation both show up here). ``None`` for <2 reads (no spread to estimate)."""
+        n = len(yxys)
+        if n < 2:
+            return None
+        mx = sum(p[1] for p in yxys) / n
+        my = sum(p[2] for p in yxys) / n
+        return math.sqrt(sum((p[1] - mx) ** 2 + (p[2] - my) ** 2 for p in yxys) / n)
 
     def _robust_stats(self, reads: Sequence[tuple[float, float, float]],
                       *, sigma: Optional[float] = None):
@@ -1023,10 +1077,14 @@ class _Loop:
         reads — without multiplying the slow dim patches. The DIP still escalates above this where
         measured σ demands it."""
         floor = self.cfg.min_reads
-        if (self.cfg.neutral_min_reads > floor
-                and self._is_near_neutral(patch)
-                and self._expected_patch_nits(patch) >= self.cfg.neutral_floor_min_nits):
-            floor = self.cfg.neutral_min_reads
+        if self._is_near_neutral(patch):
+            nits = self._expected_patch_nits(patch)
+            # Bright near-neutral floor (largest luminance σ, fast reads).
+            if self.cfg.neutral_min_reads > floor and nits >= self.cfg.neutral_floor_min_nits:
+                floor = self.cfg.neutral_min_reads
+            # Dark near-neutral floor (estimate the CHROMA spread that drives dark-level trust).
+            if self.cfg.dark_min_reads > floor and nits <= self.cfg.dark_floor_max_nits:
+                floor = self.cfg.dark_min_reads
         return floor
 
     def _abnormal_reads(self, target_n: Optional[int]) -> int:
@@ -1122,6 +1180,10 @@ class _Loop:
             note = note or "no usable read"
 
         self._update_white(accepted_xyz)
+        # Measured repeatability for the dark-level trust: the per-patch standard error (dE) and the
+        # read-to-read chromaticity spread (xy). Both need ≥2 reads (None otherwise).
+        accepted_se = st[1] if st else None
+        accepted_chroma_sigma = self._chroma_sigma(yxys)
         immediate = max(0, read_index - 1)
         record = self.accepted.get(patch.label)
         if record is None:
@@ -1129,6 +1191,7 @@ class _Loop:
                 patch=patch, xyz=accepted_xyz, yxy=accepted_yxy,
                 reads_taken=read_index, immediate_remeasures=immediate,
                 unstable=unstable, usable=usable, note=note,
+                se_de=accepted_se, chroma_sigma=accepted_chroma_sigma,
             )
             self.accepted[patch.label] = record
         else:
@@ -1140,6 +1203,8 @@ class _Loop:
             record.unstable = unstable
             record.usable = usable
             record.note = note
+            record.se_de = accepted_se
+            record.chroma_sigma = accepted_chroma_sigma
         return record
 
     # -- main pass ---------------------------------------------------------
@@ -1490,6 +1555,7 @@ def run_measure_loop(
     if ti3_path is not None and accepted:
         write_ti3(ti3_path, accepted)
         written_ti3 = str(ti3_path)
+        _write_noise_sidecar(ti3_path, accepted)
 
     immediate = sum(r.immediate_remeasures for r in accepted)
     appended = sum(r.appended_remeasures for r in accepted)

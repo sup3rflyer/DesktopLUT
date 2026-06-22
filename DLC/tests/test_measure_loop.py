@@ -318,6 +318,53 @@ def test_neutral_floor_defaults_off():
     assert rec.reads_taken == 1
 
 
+def test_dark_floor_reads_dim_grey_and_records_chroma_sigma():
+    # The dark read floor: a DIM near-neutral patch is read several times so its chromaticity spread
+    # can be estimated (the dark-level trust input) — and the spread is recorded on the accepted read.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0)   # gate high ⇒ dim grey floored
+    loop = _solo_loop(clean, t, cfg)
+    dim = _patch("g-lo", (102, 102, 102), t, 0)
+    assert loop._read_floor_for(dim) == 4
+    rec = loop.measure_patch(dim, phase="main")
+    assert rec.reads_taken == 4
+    assert rec.chroma_sigma is not None          # ≥2 reads ⇒ spread estimated (0.0 on a clean panel)
+    assert rec.se_de is not None
+
+
+def test_dark_floor_defaults_off_and_gated_by_nits():
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    # default off ⇒ single read on a dim grey
+    loop = _solo_loop(clean, t, MeasureLoopConfig())
+    assert loop._read_floor_for(_patch("g-lo", (102, 102, 102), t, 0)) == MeasureLoopConfig().min_reads
+    # a BRIGHT grey above the dark ceiling is NOT floored by the dark rule
+    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=2.0)
+    loop2 = _solo_loop(clean, t, cfg)
+    bright = _patch("g-hi", (922, 922, 922), t, 0)
+    assert loop2._expected_patch_nits(bright) > 2.0
+    assert loop2._read_floor_for(bright) == cfg.min_reads
+
+
+def test_noise_sidecar_records_per_level_chroma_sigma(tmp_path: Path):
+    # End-to-end: a warm + NOISY panel over a grey ramp with the dark floor on writes a noise
+    # sidecar beside the .ti3 with a positive per-level chromaticity σ (the dark-trust input).
+    from dlc.measure_loop import noise_sidecar_path
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, start_temp=1.0, cold_blue_gain=1.0, noise=0.04, seed=11)
+    ti3 = tmp_path / "raw.ti3"
+    run_measure_loop(
+        patches=_grey_ramp(t, 10), transfer=t, measure=panel,
+        config=MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0),
+        ti3_path=ti3, ndjson_path=tmp_path / "raw.ndjson")
+    sc = noise_sidecar_path(ti3)
+    assert sc.exists()
+    by_level = json.loads(sc.read_text(encoding="utf-8"))["by_level"]
+    assert by_level                                          # neutral levels recorded
+    assert any(v["chroma_sigma"] > 0.0 and v["reads"] >= 2 for v in by_level.values())
+
+
 # ---------------------------------------------------------------------------
 # interleaved drift reference → appended re-measure
 # ---------------------------------------------------------------------------

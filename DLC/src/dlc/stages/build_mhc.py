@@ -88,6 +88,7 @@ def build(args, ctx: RunContext) -> StageResult:
             HDR_REFERENCE_WHITE_BAND,
             adaptive_dark_floor,
             build_hdr_cube,
+            dark_trust_weights,
             peak_chroma_luminance,
             write_1d_cube,
         )
@@ -103,6 +104,10 @@ def build(args, ctx: RunContext) -> StageResult:
         grey_reads = [(s.xyz[1], *xy_from_xyz(s.xyz)) for s in groups["grey"]]
         dark_floor_nits, dark_floor_info = adaptive_dark_floor(
             grey_reads, reference_band=HDR_REFERENCE_WHITE_BAND)
+        # Per-level trust from MEASURED repeatability (the noise sidecar beside the raw .ti3): a dark
+        # level whose chromaticity is too noisy/unstable to trust is smoothed to identity. Reference =
+        # the measured NATIVE white (build_hdr_cube targets native-white shares; the matrix does D65).
+        level_trust = _dark_level_trust(source, groups["grey"], white_xy, dark_trust_weights, xy_from_xyz)
         channel_peak_xyz = [
             list(channel_model(groups[name], idx).peak_xyz)
             for name, idx in (("red", 0), ("green", 1), ("blue", 2))
@@ -135,9 +140,12 @@ def build(args, ctx: RunContext) -> StageResult:
         try:
             cube_curves, cube_summary = build_hdr_cube(
                 samples, measured_primaries, white_xy, target_luminance,
-                dark_floor_nits=dark_floor_nits
+                dark_floor_nits=dark_floor_nits, level_trust=level_trust
             )
             cube_summary["dark_floor"] = dark_floor_info
+            if level_trust:
+                cube_summary["dark_trust_levels"] = len(level_trust)
+                cube_summary["dark_trust_min"] = round(min(w for _s, w in level_trust), 4)
             cube_path = ctx.root / "generated" / f"mhc_base_{mode.lower()}.cube"
             write_1d_cube(cube_path, cube_curves, title=f"DLC HDR MHC base (mon {args.monitor})")
             result.add_artifact(cube_path)
@@ -262,6 +270,31 @@ def build(args, ctx: RunContext) -> StageResult:
         "reasons": ["candidate MHC params derived from a measured raw panel"],
     }
     return result
+
+
+def _dark_level_trust(source, grey_samples, reference_white_xy, dark_trust_weights, xy_from_xyz):
+    """Build per-level trust weights from the measure loop's noise sidecar (``<ti3>.noise.json``),
+    if present: each gray level's read-to-read chromaticity σ → ``mhc_cube.dark_trust_weights``.
+    Returns ``[(signal, w), ...]`` or ``None`` when there's no sidecar / no σ (single-read run)."""
+    from ..measure_loop import noise_sidecar_path
+    sidecar = noise_sidecar_path(Path(source))
+    if not sidecar.exists():
+        return None
+    try:
+        by_level = (json.loads(sidecar.read_text(encoding="utf-8")) or {}).get("by_level") or {}
+    except (OSError, ValueError):
+        return None
+    if not by_level:
+        return None
+    levels = []
+    for s in grey_samples:
+        lvl = s.rgb[0]
+        info = by_level.get(f"{lvl:.6f}")
+        sigma = info.get("chroma_sigma") if info else None
+        x, y = xy_from_xyz(s.xyz)
+        levels.append((lvl, x, y, sigma))
+    weights = dark_trust_weights(levels, reference_white_xy)
+    return weights or None
 
 
 def _white_de_from_d65(white_xy: tuple[float, float], luminance: float) -> float:
