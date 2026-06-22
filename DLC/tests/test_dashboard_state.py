@@ -122,6 +122,19 @@ def test_per_patch_de_enriches_reads_and_live_header():
     assert st.snapshot(T0 + timedelta(seconds=2))["live_de"]["n"] == 0
 
 
+def test_live_de_dedups_rereads():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", luminance=120.0, gamma=2.2,
+                  white={"xy": [0.3127, 0.329]}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:verify"))
+    # the SAME neutral patch read twice (noisy → settled) must count ONCE (latest wins), not twice
+    for i, (Y, xy) in enumerate([(60.0, [0.33, 0.33]), (120.0, [0.3127, 0.329])]):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i), stage="measure:verify", tier="stream",
+                      seq=i, role="measurement", label="w", rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0],
+                      Y=Y, xy=xy, ok=True))
+    assert st.snapshot(T0)["live_de"]["n"] == 1
+
+
 def test_warmup_reads_excluded_from_live_de():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", luminance=120.0, gamma=2.2,

@@ -194,9 +194,10 @@ class DashboardState:
     # -- live colour readout (enriched here from patch xy) -------------------
     last_white: dict[str, Any] = field(default_factory=dict)
     last_read: dict[str, Any] = field(default_factory=dict)
-    # rolling per-patch ΔE (computed live here vs each patch's target; the LIVE header reading,
-    # distinct from the per-stage authoritative `de` from metrics_scored). Reset per stage.
-    _live_de: Deque[float] = field(default_factory=lambda: deque(maxlen=128))
+    # live per-patch ΔE for the header (vs each patch's target), keyed by patch identity so a
+    # RE-READ overwrites rather than double-counts (latest-wins, like the chart accumulators);
+    # reset per stage. Distinct from the per-stage authoritative `de` from metrics_scored.
+    _live_de: dict[Any, float] = field(default_factory=dict)
 
     # -- optimizer / seams / anomalies / stall ------------------------------
     optimizer: dict[str, Any] = field(default_factory=dict)
@@ -356,10 +357,14 @@ class DashboardState:
             "neutral": _is_neutral(data.get("rgb")), "de": de,
             "disposition": data.get("disposition"), **enriched,
         }
-        # Rolling live ΔE (header reading): only settled MEASUREMENT reads, not warm-up/probe.
+        # Live ΔE (header reading): only settled MEASUREMENT reads, not warm-up/probe. Keyed by
+        # patch identity (signal → else label/seq) so a re-read overwrites instead of double-counting.
         if de is not None and data.get("role") not in ("warmup", "probe") \
                 and data.get("disposition") != "probe":
-            self._live_de.append(de)
+            sig = data.get("signal")
+            key = tuple(round(float(c), 4) for c in sig[:3]) if (sig and len(sig) >= 3) \
+                else ("seq", data.get("label"), data.get("seq"))
+            self._live_de[key] = de
         # The most recent neutral read drives the live white-point readout (needs a usable xy
         # so the readout shape stays consistent with the enrichment gate above).
         if ok and has_xy and _is_neutral(data.get("rgb")):
@@ -369,7 +374,7 @@ class DashboardState:
         """Rolling per-patch ΔE for the LIVE header (current stage). avg/max over the window +
         the run's metric label, so the header updates every patch (distinct from the per-stage
         authoritative ``de`` from metrics_scored)."""
-        vals = list(self._live_de)
+        vals = list(self._live_de.values())
         metric = "dE_ITP" if _is_hdr_header(self.header) else "CIEDE2000"
         if not vals:
             return {"avg": None, "max": None, "n": 0, "metric": metric}

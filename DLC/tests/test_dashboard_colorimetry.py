@@ -147,3 +147,14 @@ def test_patch_delta_e_hdr_matches_engine_de_itp():
         got = patch_delta_e(m.rgb, x, y, m.measured_xyz[1], is_hdr=True, white_xy=_D65)
         # dependency-free ICtCp vs colour.XYZ_to_ICtCp: agree to well under 1 JND.
         assert got == pytest.approx(m.de2000, abs=0.5), (m.rgb, got, m.de2000)
+
+
+def test_patch_delta_e_rejects_degenerate_and_nonfinite():
+    # A degenerate (y<=0) or NaN/inf read must return None — never a plausible finite ΔE that
+    # would silently poison the live rolling average (the engine sanitizes the same case).
+    assert patch_delta_e([1, 1, 1], 0.31, 0.0, 100.0, is_hdr=False, white_xy=_D65, luminance=120) is None
+    assert patch_delta_e([1, 1, 1], float("nan"), 0.33, 100.0, is_hdr=True, white_xy=_D65) is None
+    assert patch_delta_e([1, 1, 1], 0.31, 0.33, float("inf"), is_hdr=True, white_xy=_D65) is None
+    assert patch_delta_e([1, 1, 1], 0.31, -0.1, 100.0, is_hdr=True, white_xy=_D65) is None
+    # a valid read still scores
+    assert patch_delta_e([1, 1, 1], 0.3127, 0.329, 120.0, is_hdr=False, white_xy=_D65, luminance=120) is not None

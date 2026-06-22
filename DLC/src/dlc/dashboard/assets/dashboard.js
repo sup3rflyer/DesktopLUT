@@ -413,6 +413,7 @@ function openLightbox(key, title, opener) {
 function closeLightbox() {
   const wasOpen = !$("lightbox").hidden;
   lightboxKey = null;
+  $("lb-tip").hidden = true;
   $("lightbox").hidden = true;
   if (wasOpen && lightboxReturnFocus && document.contains(lightboxReturnFocus)) lightboxReturnFocus.focus();
   lightboxReturnFocus = null;
@@ -437,6 +438,35 @@ function trapLightboxTab(e) {
     e.preventDefault();
     first.focus();
   }
+}
+
+// Instant point readout on the EXPANDED tile: track the cursor and surface the hovered SVG
+// point's <title> (target / measured / deviation) without waiting for the browser tooltip.
+function wireLightboxHover() {
+  const body = $("lb-body"), tip = $("lb-tip");
+  function titleAt(el) {
+    for (let n = el; n && n !== body; n = n.parentNode) {
+      if (n.getElementsByTagName) {
+        const t = n.getElementsByTagName("title")[0];
+        if (t && t.parentNode === n) return t.textContent;
+      }
+    }
+    return null;
+  }
+  body.addEventListener("mousemove", (e) => {
+    const txt = titleAt(e.target);
+    if (!txt) { tip.hidden = true; return; }
+    tip.textContent = txt;
+    const r = body.getBoundingClientRect();
+    let x = e.clientX - r.left + 14, y = e.clientY - r.top + 14;
+    tip.hidden = false;
+    // keep the tip inside the frame
+    if (x + tip.offsetWidth > r.width) x = r.width - tip.offsetWidth - 6;
+    if (y + tip.offsetHeight > r.height) y = e.clientY - r.top - tip.offsetHeight - 10;
+    tip.style.left = Math.max(0, x) + "px";
+    tip.style.top = Math.max(0, y) + "px";
+  });
+  body.addEventListener("mouseleave", () => { tip.hidden = true; });
 }
 
 function wireLightbox() {
@@ -516,6 +546,7 @@ function wireUi() {
 
 wireUi();
 wireLightbox();
+wireLightboxHover();
 connect();
 refreshCharts();
 setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency

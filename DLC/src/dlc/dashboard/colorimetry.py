@@ -270,8 +270,14 @@ def patch_delta_e(signal: Sequence[float], x: float, y: float, big_y: float, *,
     """The per-patch ΔE of a measured patch vs its ideal target at the resolved white:
     **dE_ITP** (BT.2124) for HDR, **CIEDE2000** for SDR — the same metrics the spine scores
     with. ``signal`` is the patch's normalised RGB; ``(x,y,big_y)`` its measured chromaticity +
-    luminance (cd/m²). Returns ``None`` when it can't be computed (degenerate read / no luminance)."""
-    if big_y is None or big_y <= 0 or not signal or len(signal) < 3:
+    luminance (cd/m²). Returns ``None`` when it can't be computed — a degenerate (``y<=0``) or
+    non-finite (NaN/inf) read must NOT yield a plausible finite ΔE that silently poisons the live
+    rolling average (the engine sanitizes the same failure mode)."""
+    if not signal or len(signal) < 3 or big_y is None or x is None or y is None:
+        return None
+    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(big_y)):
+        return None
+    if y <= 0.0 or big_y <= 0.0 or not all(math.isfinite(s) for s in signal[:3]):
         return None
     meas = measured_xyz(x, y, big_y)
     wx, wy = white_xy[0], white_xy[1]
