@@ -53,12 +53,38 @@ __all__ = [
     "invert_trc",
     "invert_monotone",
     "peak_chroma_luminance",
+    "mhc2_matrix",
     "build_hdr_cube",
     "refine_hdr_cube",
     "write_1d_cube",
+    "read_1d_cube",
 ]
 
 _D65 = (0.3127, 0.3290)
+
+
+def mhc2_matrix(native_primaries: Mapping[str, float], native_white_xy: tuple[float, float],
+                target_primaries: Mapping[str, float],
+                target_white_xy: tuple[float, float] = _D65) -> list[list[float]]:
+    """The RGB->RGB MHC2 tag matrix Windows applies to linear RGB: ``inv(disp)·src``.
+
+    Mirrors ``mhc_icc.cpp`` ``ComputeMHC2Matrix`` (see [[mhc2-matrix-order-rgb-not-xyz]]):
+    ``src`` = the standard-source (e.g. Rec.2020 @ D65) linear-RGB->XYZ matrix; ``disp`` = the
+    measured native panel's linear-RGB->XYZ matrix (its primaries + native white). Both are
+    white-normalised (Y=1), so ``M @ (1,1,1)`` = the per-channel native drive that reproduces the
+    TARGET white — the post-matrix neutral signal the per-channel cube is indexed at (the
+    ``matrix_rowsums`` :func:`refine_hdr_cube` needs). Identity primaries+white => identity matrix.
+    """
+    disp = rgb_to_xyz_matrix(
+        native_primaries["rx"], native_primaries["ry"], native_primaries["gx"],
+        native_primaries["gy"], native_primaries["bx"], native_primaries["by"],
+        native_white_xy[0], native_white_xy[1], white_Y=1.0)
+    src = rgb_to_xyz_matrix(
+        target_primaries["rx"], target_primaries["ry"], target_primaries["gx"],
+        target_primaries["gy"], target_primaries["bx"], target_primaries["by"],
+        target_white_xy[0], target_white_xy[1], white_Y=1.0)
+    disp_inv = invert3x3(disp)
+    return [[sum(disp_inv[r][k] * src[k][c] for k in range(3)) for c in range(3)] for r in range(3)]
 
 
 def peak_chroma_luminance(channel_peak_xyz: Sequence[Sequence[float]],
@@ -293,12 +319,24 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
     ``measured_neutral``  : ``[(wire_signal, measured_XYZ), ...]`` from a neutral-ramp measurement
                             with the current cube applied.
     ``channel_peak_xyz``  : measured native full-drive primary XYZ (R,G,B) — the linear-share basis.
-    ``matrix_rowsums``    : ``v_c = M @ (1,1,1)`` for the installed MHC2 matrix, to index the cube at
-                            the POST-matrix signal Windows actually applies it to.
+    ``matrix_rowsums``    : ``v_c = (M @ (1,1,1))_c`` for the installed MHC2 matrix (:func:`mhc2_matrix`).
+
+    **Abscissa convention (the load-bearing detail).** Windows applies this per-channel LUT AFTER
+    the MHC2 matrix (``...-> matrix -> ReGamma -> LUT -> display``; see ``mhc_icc.cpp``), so for a wire
+    neutral of signal ``s`` channel ``c`` is driven at the *post-matrix* index
+    ``pq_oetf(rowsum_c * pq_eotf(s))`` -- NOT ``s``. The factor measured at wire ``s`` is therefore
+    stored against that post-matrix abscissa, and the cube is indexed in the SAME post-matrix space
+    (``cur[j]`` == the LUT value at post-matrix signal ``j/(N-1)``). Because the factor comes from a
+    real measurement at the real abscissa, the loop converges to measured D65 even when the matrix is
+    non-identity (the actual hardware case) -- HW-validated at 2.28 dE_ITP grey on the PA32UCXR with
+    ``rowsums = M@(1,1,1) != (1,1,1)``. (``build_hdr_cube`` seeds the cube in *wire*-signal space;
+    this measurement-driven refine corrects whatever that seed actually renders.)
+
     ``peak_cap_nits``     : the Peak-Chroma luminance cap (target white saturates here at the top).
 
-    Returns updated per-channel curves (monotone, clamped). The correction is identity below
-    ``dark_floor_nits`` (meter noise) and held flat past the measured range (no extrapolation).
+    Returns updated per-channel curves (monotone, clamped). Measured points below ``dark_floor_nits``
+    (meter noise) are dropped; the first surviving point's factor is held flat below it and the last
+    point's factor flat above it (no extrapolation), keeping the refined curve monotone through both ends.
     """
     chans = ("r", "g", "b")
     N = len(current_curves["r"])
@@ -332,7 +370,11 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
         prev = 0.0
         for j in range(N):
             sig = j / (N - 1)
-            factor = _interp(sig, xs, fs) if xs else 1.0          # 1.0 left of first point (dark)
+            # Below the first measured point, HOLD that point's factor flat (not 1.0): the seed cube
+            # already blends toward identity in the dark (build_hdr_cube dark_floor), and a flat hold
+            # keeps the refined curve monotone through the onset — snapping to 1.0 there would make
+            # the monotone clamp below mask a reduction at the first measured signal.
+            factor = _interp(sig, xs, fs) if xs else 1.0
             new_lin = pq_eotf(float(cur[j])) * factor
             val = pq_oetf(new_lin)
             val = max(prev, min(max(val, 0.0), 1.0))               # monotone, clamped
@@ -354,3 +396,25 @@ def write_1d_cube(path: Path, curves: dict[str, list[float]], *, title: str = "D
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def read_1d_cube(path: Path) -> dict[str, list[float]]:
+    """Parse an Iridas 1D ``.cube`` (the inverse of :func:`write_1d_cube`) into per-channel
+    curves ``{"r":[...], "g":[...], "b":[...]}``. Ignores TITLE/SIZE/RANGE header lines and
+    comments; each data line is an ``R G B`` triplet. Used to reload the installed base cube
+    before a closed-loop refine round."""
+    r: list[float] = []
+    g: list[float] = []
+    b: list[float] = []
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        parts = ln.split()
+        if len(parts) != 3:
+            continue
+        try:
+            vals = [float(x) for x in parts]
+        except ValueError:
+            continue   # header keyword line (TITLE/LUT_1D_SIZE/...)
+        r.append(vals[0]); g.append(vals[1]); b.append(vals[2])
+    if not r:
+        raise ValueError(f"no RGB triplets found in {path}")
+    return {"r": r, "g": g, "b": b}

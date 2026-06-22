@@ -139,10 +139,11 @@ def test_hdr_full_flow_completes_clean(tmp_path: Path):
 
     assert result.status == "completed", result.digest
     assert result.target == "rec2020_pq"
-    # ICC → 3D LUT, and GS+WB auto-skipped for HDR even without --skip-gswb.
+    # ICC → standalone-D65 refine → 3D LUT, and GS+WB auto-skipped for HDR even without --skip-gswb.
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
-        "build-install-mhc", "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify",
+        "build-install-mhc", "refine-mhc-cube", "measure:post-mhc", "build-install-3dlut",
+        "measure:verify", "verify",
     ]
     assert "gswb-tweak" not in result.stages and "measure:gray-wb" not in result.stages
     # The chosen HDR target: peak 1600 (profile pin), fixed D65, scored in dE_ITP.
@@ -565,7 +566,27 @@ def test_mhc_only_flow_is_icc_only(tmp_path: Path):
     assert "build-install-mhc" in result.stages
     assert "build-install-3dlut" not in result.stages   # ICC only
     assert "gswb-tweak" not in result.stages
+    assert "refine-mhc-cube" not in result.stages        # SDR: the closed-loop refine is HDR-only
     assert result.stages[-1] == "verify"
+
+
+def test_hdr_mhc_only_runs_standalone_d65_refine(tmp_path: Path):
+    # The standalone-ICC path: HDR mhc-only refines the base cube to D65 between the install and
+    # the verify (the closed-loop grayscale refine, mhc_cube.refine_hdr_cube).
+    calib = _make(tmp_path, "hdr_mhc_only", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    result = calib.run("mhc-only")
+    assert result.status == "completed", result.digest
+    assert result.stages == [
+        "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
+        "build-install-mhc", "refine-mhc-cube", "measure:verify", "verify",
+    ]
+    refine = calib.calib["stages"]["refine-mhc-cube"]["digest"]
+    assert refine.get("skipped") is not True
+    assert refine["cap_nits"] > 0 and refine["binding_channel"] in ("r", "g", "b")
+    # A perfect (already-D65) panel floors on the first measured round — no regression seam.
+    assert refine.get("regressed") is not True
+    # build-install-mhc surfaced the Peak-Chroma cap as standalone-D65 evidence.
+    assert calib.calib["stages"]["build-install-mhc"]["digest"]["peak_chroma"]["cap_nits"] > 0
 
 
 def test_full_flow_writes_deliverable_folder(tmp_path: Path):

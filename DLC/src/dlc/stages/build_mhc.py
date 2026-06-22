@@ -22,7 +22,15 @@ import json
 import sys
 from pathlib import Path
 
-from ..mhc import SRGB_PRIMARIES, build_curves_from_ti3, find_stage_artifact, parse_ti3, resolve_run_path
+from ..mhc import (
+    SRGB_PRIMARIES,
+    build_curves_from_ti3,
+    channel_model,
+    classify_samples,
+    find_stage_artifact,
+    parse_ti3,
+    resolve_run_path,
+)
 from ..refine import Deviations, RefinementTarget, propose_correction_grayscale
 from ..runs import RunContext
 from ..stage import StageResult
@@ -75,7 +83,32 @@ def build(args, ctx: RunContext) -> StageResult:
         # a 1D LUT does the neutral axis efficiently and leaves only gamut/volumetric to the
         # cube. (The 32-point set_base_grayscale table — far too sparse for a PQ EOTF — is now
         # reserved for GS+WB post-fixes.) See dlc.mhc_cube for the grounded math.
-        from ..mhc_cube import build_hdr_cube, write_1d_cube
+        from ..mhc_cube import build_hdr_cube, peak_chroma_luminance, write_1d_cube
+
+        # Per-channel full-drive primary XYZ (R,G,B columns of the additive display matrix, in
+        # absolute nits) — the linear-share basis for both the Peak-Chroma cap and the closed-loop
+        # refine. Re-derived from the SAME ramps build_curves_from_ti3 validated above.
+        groups = classify_samples(samples)
+        channel_peak_xyz = [
+            list(channel_model(groups[name], idx).peak_xyz)
+            for name, idx in (("red", 0), ("green", 1), ("blue", 2))
+        ]
+        # Peak-Chroma cap: the brightest D65 luminance every channel can render inside full drive
+        # (the cold channel binds). This is the luminance the standalone-D65 neutral axis holds to;
+        # the closed-loop refine (stage_refine_mhc_cube) targets D65 at this cap. EVIDENCE here —
+        # it does not alter the cube build or the resolved HDR peak (see mhc-standalone-d65-peakchroma).
+        try:
+            cap_nits, binding = peak_chroma_luminance(channel_peak_xyz)
+            native_peak = sum(channel_peak_xyz[c][1] for c in range(3))
+            peak_chroma = {
+                "cap_nits": round(cap_nits, 4),
+                "binding_channel": binding,
+                "native_peak_nits": round(native_peak, 4),
+                "headroom_loss_pct": round(100.0 * (1.0 - cap_nits / native_peak), 3)
+                if native_peak > 0 else None,
+            }
+        except ValueError as exc:
+            peak_chroma = {"error": str(exc)}
 
         # Identity 32-point base kept as harmless state plumbing; the cube is authoritative.
         n = 32
@@ -171,6 +204,10 @@ def build(args, ctx: RunContext) -> StageResult:
         "base_grayscale": base,
         "base_lut": base_lut,
     }
+    if is_hdr:
+        # The linear-share basis + Peak-Chroma cap the closed-loop refine consumes (HDR only).
+        params["channel_peak_xyz"] = [[round(v, 6) for v in xyz] for xyz in channel_peak_xyz]
+        params["peak_chroma"] = peak_chroma
     params_path = ctx.root / "generated" / f"mhc_params_{mode.lower()}.json"
     params_path.parent.mkdir(parents=True, exist_ok=True)
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
@@ -196,6 +233,8 @@ def build(args, ctx: RunContext) -> StageResult:
         "base_grayscale_max_abs_deviation": base_summary.get("max_abs_deviation"),
         "params_path": str(params_path),
     }
+    if is_hdr:
+        result.metrics["peak_chroma"] = peak_chroma
     result.note(
         "Matrix carries primaries + native-white->target-white; base grayscale is tone-only toward native white. "
         f"Target white is {params['white']['x']},{params['white']['y']} ({target_white_source}); "

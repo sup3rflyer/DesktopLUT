@@ -132,6 +132,7 @@ SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/me
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
 SEAM_HARDWARE_READY = "hardware_readiness"  # one live gate before the first meter/presenter read
+_D65_XY = (0.3127, 0.3290)          # the standard-source white the MHC matrix maps the panel to
 # NOTE: there is deliberately NO check-in seam. A §12 check-in is a NON-BLOCKING evidence packet
 # for the LLM (see _maybe_timed_checkin), never an adjudicated yes/no — it must never gate the spine.
 
@@ -2368,6 +2369,10 @@ class Calibration:
                       "measured_white": params.get("measured_white"),
                       "white_de_vs_d65": derive.metrics.get("measured_white_de2000_vs_d65"),
                       "profile_name": profile_name, "verified": verify_ok}
+            if spec.is_hdr and params.get("peak_chroma"):
+                # Standalone-D65 evidence: the cold-channel-limited Peak-Chroma luminance the
+                # closed-loop refine will hold D65 to (see stage_refine_mhc_cube).
+                digest["peak_chroma"] = params["peak_chroma"]
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
@@ -2530,6 +2535,166 @@ class Calibration:
             "adaptive-planning",
             strategy=f"{normalized['shadow_treatment']}/{normalized['volumetric_density']}",
             source=normalized.get("source"), confidence=normalized.get("confidence"))
+
+    def _grey_de_vs_white(self, samples, white_xy: tuple[float, float]) -> dict[str, Any]:
+        """Average/max dE_ITP of the GRAYSCALE patches against the target white (D65) at the
+        resolved HDR peak — the closed-loop refine's convergence metric. Returns
+        ``{"avg","max","n"}`` (``n``=0 if no grey patches / scoring failed)."""
+        try:
+            metrics, _lum = score_samples_hdr(samples, white_xy=white_xy,
+                                              peak_nits=self._hdr_target().peak_nits)
+            grey = [m.de2000 for m in metrics if m.grayscale]
+            if not grey:
+                return {"avg": None, "max": None, "n": 0}
+            return {"avg": round(sum(grey) / len(grey), 3), "max": round(max(grey), 3), "n": len(grey)}
+        except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
+            return {"avg": None, "max": None, "n": 0}
+
+    def stage_refine_mhc_cube(self, *, max_rounds: int = 3, target_de: float = 2.0,
+                              min_improvement: float = 0.3, regress_tol: float = 0.5
+                              ) -> StageOutcome:
+        """Closed-loop grayscale refine of the HDR MHC base cube toward STANDALONE D65.
+
+        Each round: measure the neutral ramp with the current cube applied, score grey vs D65
+        (dE_ITP), and — unless already floored — pull the cube toward D65 at the Peak-Chroma cap
+        (``mhc_cube.refine_hdr_cube``) and reinstall. This makes the ICC a self-sufficient D65
+        foundation (see [[mhc-standalone-d65-peakchroma]] / [[dlc-corrections-stack-independently]]),
+        independent of the optional 3D LUT.
+
+        Per the DESIGN LAW the convergence FLOOR (no further improvement, or below the
+        panel-limited ``target_de``) is a deterministic stop the spine owns; each round emits a
+        non-blocking check-in (evidence) the LLM consumes from the running spine; the FINAL
+        acceptance is the verify seam. A REGRESSION (a refine made grey worse) reverts to the
+        best measured cube and raises a seam for the LLM. HDR only; SDR / non-1D-LUT base ⇒ no-op.
+        """
+        def run() -> StageOutcome:
+            spec = self._spec()
+            params = self._state.get("mhc_params") or {}
+            base_lut = params.get("base_lut") or {}
+            cube_path = base_lut.get("cube_path")
+            peak_chroma = params.get("peak_chroma") or {}
+            cap_nits = peak_chroma.get("cap_nits")
+            channel_peak_xyz = params.get("channel_peak_xyz")
+            native_white = params.get("measured_white") or {}
+            nwx, nwy = native_white.get("x"), native_white.get("y")
+            if not (spec.is_hdr and cube_path and cap_nits and channel_peak_xyz
+                    and nwx is not None and nwy is not None):
+                return StageOutcome(
+                    "refine-mhc-cube", "done",
+                    digest={"skipped": True, "reason": (
+                        "closed-loop refine is HDR-only and needs a 1D-LUT base cube + Peak-Chroma "
+                        "cap + per-channel peaks (SDR or missing inputs)")},
+                    data={"rounds": 0})
+
+            from .mhc_cube import mhc2_matrix, read_1d_cube, refine_hdr_cube, write_1d_cube
+
+            # Post-matrix neutral drive per channel (M @ (1,1,1)) — the signal Windows applies the
+            # cube at. Source = the HDR standard gamut (Rec.2020 @ D65); display = the native panel.
+            matrix = mhc2_matrix(params["primaries"], (nwx, nwy),
+                                 build_mhc.REC2020_PRIMARIES, _D65_XY)
+            rowsums = [sum(matrix[r]) for r in range(3)]
+            wx, wy = self._white_xy()                       # target white (resolved D65)
+            gen = self.ctx.root / "generated"
+
+            # Idempotence: ALWAYS refine from the build's base cube, never a prior refine's output.
+            # build-install-mhc writes mhc_base_<mode>.cube; a successful refine repoints
+            # base_lut.cube_path at its own mhc_base_<mode>.refineN.cube. Re-running THIS stage in
+            # isolation (e.g. the reuse-raw technique pops it) would otherwise read the already-refined
+            # cube and compound the correction. Reset to the base cube up front (reinstall if needed).
+            base_cube = gen / f"mhc_base_{self.mode.lower()}.cube"
+            if base_cube.exists() and Path(cube_path).resolve() != base_cube.resolve():
+                self.controller.set_base_lut(self.monitor, self.mode,
+                                             str(base_cube.resolve()), cap_nits)
+                self.controller.apply_mhc(self.monitor, self.mode)
+                cube_path = str(base_cube)
+
+            scores: list[float] = []
+            rounds_log: list[dict[str, Any]] = []
+            installed = cube_path
+            best_path, best_avg = cube_path, float("inf")
+            flags: dict[str, bool] = {}
+
+            for rnd in range(1, max_rounds + 1):
+                res = self._measure_set(self._neutral_patches(), role=f"refine{rnd}",
+                                        ti3_name=f"refine_{rnd}.ti3",
+                                        ndjson_name=f"refine_{rnd}.ndjson")
+                samples = parse_ti3(Path(res.ti3_path)) if res.ti3_path else []
+                grey = [s for s in samples
+                        if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
+                de = self._grey_de_vs_white(samples, (wx, wy))
+                rounds_log.append({"round": rnd, "grey_avg_de_itp": de["avg"],
+                                   "grey_max_de_itp": de["max"], "grey_n": de["n"],
+                                   "cube": Path(installed).name})
+                self._maybe_timed_checkin("refine-mhc-cube")
+                if de["avg"] is None:
+                    flags["unscored"] = True
+                    break
+                scores.append(de["avg"])
+                if de["avg"] < best_avg:
+                    best_avg, best_path = de["avg"], installed
+
+                # --- deterministic stop conditions (the spine owns these) ---
+                if len(scores) >= 2 and scores[-1] > scores[-2] + regress_tol:
+                    flags["regressed"] = True
+                    if best_path != installed:        # revert to the best measured cube
+                        self.controller.set_base_lut(self.monitor, self.mode,
+                                                     str(Path(best_path).resolve()), cap_nits)
+                        self.controller.apply_mhc(self.monitor, self.mode)
+                        installed = best_path
+                    break
+                if de["avg"] <= target_de:
+                    flags["converged"] = True
+                    break
+                if len(scores) >= 2 and (scores[-2] - scores[-1]) < min_improvement:
+                    flags["floored"] = True
+                    break
+                if rnd == max_rounds:
+                    flags["budget_limited"] = True
+                    break
+
+                # --- one refine step toward D65 at the Peak-Chroma cap, then reinstall ---
+                measured_neutral = [(s.rgb[0], tuple(s.xyz)) for s in grey]
+                new_curves = refine_hdr_cube(
+                    read_1d_cube(Path(installed)), measured_neutral, channel_peak_xyz, rowsums,
+                    peak_cap_nits=cap_nits, target_white_xy=(wx, wy))
+                new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
+                write_1d_cube(new_path, new_curves,
+                              title=f"DLC HDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
+                self.controller.set_base_lut(self.monitor, self.mode,
+                                             str(new_path.resolve()), cap_nits)
+                self.controller.apply_mhc(self.monitor, self.mode)
+                installed = str(new_path)
+
+            # Point the foundation at the final (best measured) cube so the deliverable + any
+            # resume install reference the refined result.
+            if installed != cube_path:
+                base_lut["cube_path"] = str(installed)
+                params["base_lut"] = base_lut
+                self._state["mhc_params"] = params
+                _common.save_dlc_state(self.ctx, self._state)
+
+            final_avg = scores[-1] if scores else None
+            digest = {"rounds": len(rounds_log), "round_log": rounds_log,
+                      "grey_avg_de_itp": final_avg, "best_grey_avg_de_itp": (
+                          round(best_avg, 3) if best_avg != float("inf") else None),
+                      "cap_nits": cap_nits, "binding_channel": peak_chroma.get("binding_channel"),
+                      "target_de_itp": target_de, "final_cube": Path(installed).name, **flags}
+            return StageOutcome("refine-mhc-cube", "done", digest=digest,
+                                data={"rounds": len(rounds_log), "regressed": bool(flags.get("regressed")),
+                                      "final_avg": final_avg})
+
+        outcome = self._stage("refine-mhc-cube", run)
+        if outcome.data.get("regressed"):
+            # A refine round made grayscale WORSE — the best cube is already reinstalled; the LLM
+            # judges whether to accept it, extend the loop, or recheck the panel. (Not a unilateral
+            # abort: the reverted cube is still the measured-best foundation.)
+            self.adjudicate(AdjudicationRequest(
+                key="refine-mhc-cube:regression", seam=SEAM_OPTIMIZE, stage="refine-mhc-cube",
+                question=("the closed-loop grayscale refine regressed (a round made grey worse); "
+                          "the best measured cube was restored — accept it, or recheck the panel?"),
+                options=("accept", "abort"), recommendation="accept",
+                digest=outcome.digest))
+        return outcome
 
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
@@ -3048,6 +3213,10 @@ class Calibration:
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
+        if self._spec().is_hdr:
+            # Standalone-D65 foundation: pull the MHC base cube to D65 before the optional 3D LUT
+            # refines the off-gray volume (the cube owns the neutral axis; 1+1+1 layering).
+            self.stage_refine_mhc_cube()
         self.stage_adaptive_planning(raw_ti3=raw.data["ti3"])   # opt-in LLM investigation seam (#47/#49)
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
@@ -3079,6 +3248,10 @@ class Calibration:
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
+        if self._spec().is_hdr:
+            # The mhc-only flow IS the standalone-ICC path — refine the base cube to D65 so the
+            # verify scores the foundation as a self-sufficient D65 layer (no 3D LUT to lean on).
+            self.stage_refine_mhc_cube()
         ver = self.stage_measure(role="verify", patches=self._ramp_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])

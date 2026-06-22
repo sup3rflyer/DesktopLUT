@@ -260,6 +260,40 @@ def test_refine_hdr_cube_improves_monotonically():
     assert all(errs[i + 1] <= errs[i] + 1e-6 for i in range(len(errs) - 1))  # monotone
 
 
+def test_refine_hdr_cube_uses_matrix_rowsums_for_abscissa():
+    # The load-bearing non-identity-matrix case the convergence tests don't exercise: blue's
+    # correction is keyed to the POST-matrix signal pq_oetf(rowsum_b * pq_eotf(s)), so the SAME
+    # measurements under different rowsums must place blue's correction differently. A wire-keyed
+    # bug (ignoring rowsums) would produce identical blue curves for both. Blue is perfect at the
+    # low point and dim at the high point, so its factor is level-dependent (not a flat scale that
+    # would wash the abscissa out).
+    from dlc.colormath import invert3x3, matvec, xy_to_XYZ
+    peaks, smax, _emit, peak = _synthetic_panel((0.3127, 0.3290))
+    disp = [[peaks[c][row] for c in range(3)] for row in range(3)]
+    disp_inv = invert3x3(disp)
+    N = 512
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+    s_lo, s_hi = 0.40 * smax, 0.70 * smax
+    blue_scale = {s_lo: 1.0, s_hi: 0.6}                              # perfect low, 40% too dim high
+    meas = []
+    for s in (s_lo, s_hi):
+        tY = min(mc.pq_eotf(s) * 10000.0, peak)
+        ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
+        ms = [ts[0], ts[1], ts[2] * blue_scale[s]]
+        xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
+        meas.append((s, xyz))
+    base = mc.refine_hdr_cube(cube, meas, peaks, (1.0, 1.0, 1.0), peak_cap_nits=peak, dark_floor_nits=0.5)
+    shifted = mc.refine_hdr_cube(cube, meas, peaks, (1.0, 1.0, 2.0), peak_cap_nits=peak, dark_floor_nits=0.5)
+
+    # rowsum_b 1.0 vs 1.5 shifts blue's post-matrix abscissa → the blue curve must differ.
+    diff_b = max(abs(base["b"][j] - shifted["b"][j]) for j in range(N))
+    assert diff_b > 5e-3, diff_b
+    # red/green have rowsum 1.0 in both runs → bit-identical (and uncorrected: blue-only error).
+    for ch in ("r", "g"):
+        assert all(abs(base[ch][j] - shifted[ch][j]) < 1e-9 for j in range(N))
+
+
 def test_refine_hdr_cube_leaves_neutral_panel_alone():
     # A panel already at D65 needs ~no correction: the cube stays ~identity.
     peaks, smax, emit, peak = _synthetic_panel((0.3127, 0.3290))
@@ -282,3 +316,43 @@ def test_write_1d_cube_roundtrips(tmp_path):
     assert len(rows) == 8
     first = rows[0].split()
     assert len(first) == 3 and all(float(x) == 0.0 for x in first)
+
+
+def test_read_1d_cube_roundtrips_write(tmp_path):
+    # read_1d_cube is the exact inverse of write_1d_cube (skips TITLE/SIZE/RANGE header lines).
+    curves = {"r": [0.0, 0.3, 1.0], "g": [0.0, 0.5, 1.0], "b": [0.0, 0.7, 1.0]}
+    path = mc.write_1d_cube(tmp_path / "rt.cube", curves, title="DLC test")
+    got = mc.read_1d_cube(path)
+    for ch in ("r", "g", "b"):
+        assert got[ch] == pytest.approx(curves[ch], abs=1e-7)
+
+
+def test_read_1d_cube_rejects_empty(tmp_path):
+    p = tmp_path / "empty.cube"
+    p.write_text('TITLE "nothing"\nLUT_1D_SIZE 0\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        mc.read_1d_cube(p)
+
+
+# --- mhc2_matrix (the inv(disp)·src tag matrix) -----------------------------
+
+def test_mhc2_matrix_identity_when_native_equals_target():
+    # Native panel == standard source (same primaries + white) ⇒ the MHC2 matrix is identity:
+    # nothing to rotate, neutral drive (M @ (1,1,1)) is exactly (1,1,1).
+    prim = {"rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797, "bx": 0.131, "by": 0.046}
+    M = mc.mhc2_matrix(prim, _WHITE, prim, _WHITE)
+    for r in range(3):
+        for c in range(3):
+            assert M[r][c] == pytest.approx(1.0 if r == c else 0.0, abs=1e-9)
+    rowsums = [sum(M[r]) for r in range(3)]
+    assert rowsums == pytest.approx([1.0, 1.0, 1.0], abs=1e-9)
+
+
+def test_mhc2_matrix_warm_panel_needs_cooler_neutral_drive():
+    # A warm (red-biased) native panel mapped to a D65 source must DRIVE BLUE UP and RED DOWN at
+    # neutral — i.e. the post-matrix neutral drive (row-sums) has blue > red.
+    target = {"rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797, "bx": 0.131, "by": 0.046}
+    warm_white = (0.330, 0.340)   # warmer than D65 (0.3127, 0.3290)
+    M = mc.mhc2_matrix(target, warm_white, target, _WHITE)
+    rowsums = [sum(M[r]) for r in range(3)]
+    assert rowsums[2] > rowsums[0]   # blue driven harder than red to cool the white
