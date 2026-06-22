@@ -313,12 +313,18 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     // Therefore: displayRGBtoXYZ * MHC2 = srcRGBtoXYZ  (wire cancels since wire = src)
     //   MHC2 = inv(displayRGBtoXYZ) * srcRGBtoXYZ
     //
-    // But MHC2 operates in XYZ space (between the driver's RGB↔XYZ wraps):
-    //   MHC2_xyz = srcRGBtoXYZ * inv(displayRGBtoXYZ)
+    // Windows applies this MHC2 matrix DIRECTLY to (linear) RGB — there is NO XYZ wrap — so the
+    // correct transform is the RGB→RGB form derived above: inv(displayRGBtoXYZ) * srcRGBtoXYZ
+    // (= display_XYZtoRGB ∘ source_RGBtoXYZ), matching dantmnf/MHC2Gen. [Prior code used the
+    // REVERSED order srcRGBtoXYZ * inv(displayRGBtoXYZ) on a false "operates in XYZ space"
+    // assumption; verified 2026-06-21 to leave the panel's native white uncorrected — HDR white
+    // stayed ~native 0.323 vs D65 0.313 because the warm-channel reduction came out as an
+    // (impossible, no-headroom) cool-channel boost at peak. SDR masked it via the post-install
+    // refine loop; HDR has none.]
     //
-    // No Bradford adaptation - the matrix directly maps XYZ coordinates.
-    // White point changes are encoded in the displayRGBtoXYZ matrix itself
-    // (via its white point scaling), so they're naturally included.
+    // No Bradford adaptation - the matrix maps source↔native RGB linearly. The native→D65 white
+    // move is encoded in displayRGBtoXYZ, which MUST be built with the panel's MEASURED native
+    // white (so set_white carries the native display white, NOT the D65 target).
     //
     // White balance gains (optional): diagonal RGB scaling in wire space.
     // Baked into the matrix by scaling each column of srcToXYZ before the multiply:
@@ -344,11 +350,11 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
         srcToXYZ[2] *= whiteBalanceGains[2]; srcToXYZ[5] *= whiteBalanceGains[2]; srcToXYZ[8] *= whiteBalanceGains[2];
     }
 
-    // MHC2 = srcRGBtoXYZ_scaled * inv(displayRGBtoXYZ)
+    // MHC2 = inv(displayRGBtoXYZ) * srcRGBtoXYZ_scaled  (RGB->RGB: source/wire -> display-native)
     float result[9];
-    MatMul3(srcToXYZ, displayFromXYZ, result);
+    MatMul3(displayFromXYZ, srcToXYZ, result);
 
-    std::cout << "MHC2 matrix (XYZ-to-XYZ):" << std::endl;
+    std::cout << "MHC2 matrix (RGB-to-RGB, source->display):" << std::endl;
     std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
     std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
     std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
