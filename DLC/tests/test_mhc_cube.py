@@ -145,10 +145,132 @@ def test_blue_deficient_shadows_get_boosted():
     assert abs(curves["b"][-1] - curves["r"][-1]) < 2e-3
 
 
+# --- Peak-Chroma luminance cap ----------------------------------------------
+
+def _channel_peaks(white_xy, peak, scale=(1.0, 1.0, 1.0)):
+    """The 3 per-channel full-drive XYZ triples (disp columns) for a panel whose additive white is
+    `white_xy` at `peak` nits, optionally scaling a channel's luminance to make it cold."""
+    P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                          _PRIM["bx"], _PRIM["by"], white_xy[0], white_xy[1], white_Y=peak)
+    return [[P[row][c] * scale[c] for row in range(3)] for c in range(3)]
+
+
+def test_peak_chroma_cap_neutral_panel_is_uncapped():
+    # A panel whose additive white already IS D65 needs no luminance sacrifice to hold D65.
+    peaks = _channel_peaks((0.3127, 0.3290), 1000.0)
+    cap, _binding = mc.peak_chroma_luminance(peaks)
+    assert math.isclose(cap, 1000.0, rel_tol=1e-9)
+
+
+def test_peak_chroma_cap_is_limited_by_the_cold_channel():
+    # Halve blue's peak luminance -> warm white, blue can't reach D65's blue content at full drive,
+    # so blue is the binding channel and the cap drops below the (now lower) native peak.
+    peaks = _channel_peaks((0.3127, 0.3290), 1000.0, scale=(1.0, 1.0, 0.5))
+    cap, binding = mc.peak_chroma_luminance(peaks)
+    native_peak = sum(peaks[c][1] for c in range(3))
+    assert binding == "b"
+    assert cap < native_peak
+
+
+def test_peak_chroma_cap_rejects_nonpositive_peak():
+    with pytest.raises(ValueError):
+        mc.peak_chroma_luminance([(0.0, 0.0, 0.0)] * 3)
+
+
 def test_build_hdr_cube_requires_neutral():
     with pytest.raises(ValueError):
         mc.build_hdr_cube([Ti3Sample(rgb=(0.0, 0.0, 0.0), xyz=(0.0, 0.0, 0.0))],
                           _PRIM, _WHITE, _PEAK)
+
+
+# --- closed-loop HDR grayscale refine ---------------------------------------
+# A synthetic additive panel (no hardcoded magnitudes in the engine): per-channel full-drive XYZ
+# = columns of the primaries matrix at a chosen white; emit = sum of per-channel light. Driving it
+# neutral renders that white; the refine must bend the cube per-channel to land D65 from the panel's
+# OWN measurements (identity MHC2 matrix -> post-matrix signal == input signal, so v=(1,1,1)).
+
+def _synthetic_panel(white_xy, peak_nits=1000.0):
+    P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                          _PRIM["bx"], _PRIM["by"], white_xy[0], white_xy[1], white_Y=peak_nits)
+    peaks = [[P[r][c] for r in range(3)] for c in range(3)]      # peaks[c] = XYZ of channel c at full
+    smax = mc.pq_oetf(peak_nits / 10000.0)
+    def emit(drive):
+        f = [mc.pq_eotf(max(0.0, min(d, smax))) / mc.pq_eotf(smax) for d in drive]
+        return tuple(sum(P[r][c] * f[c] for c in range(3)) for r in range(3))
+    return peaks, smax, emit, peak_nits
+
+
+def _run_loop(white_xy, rounds=6):
+    peaks, smax, emit, peak = _synthetic_panel(white_xy)
+    N = 256
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}                      # identity seed
+    sigs = [f * smax for f in (0.3, 0.4, 0.5, 0.6, 0.7)]
+    def measure(cube):
+        out = []
+        for s in sigs:
+            drive = [_interp_list(grid, cube[ch], s) for ch in "rgb"]
+            out.append((s, emit(drive)))
+        return out
+    for _ in range(rounds):
+        meas = measure(cube)
+        cube = mc.refine_hdr_cube(cube, meas, peaks, (1.0, 1.0, 1.0),
+                                  peak_cap_nits=peak, dark_floor_nits=0.5)
+    return measure(cube)
+
+
+def _interp_list(xs, ys, x):
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[-1]:
+        return ys[-1]
+    for k in range(1, len(xs)):
+        if xs[k] >= x:
+            t = (x - xs[k - 1]) / (xs[k] - xs[k - 1])
+            return ys[k - 1] + (ys[k] - ys[k - 1]) * t
+    return ys[-1]
+
+
+def _xy(XYZ):
+    s = sum(XYZ)
+    return (XYZ[0] / s, XYZ[1] / s)
+
+
+def test_refine_hdr_cube_converges_warm_panel_to_d65():
+    # A warm panel (excess red) driven neutral renders ~its warm white; the refine must reach D65.
+    meas = _run_loop((0.340, 0.345), rounds=6)
+    for _s, xyz in meas:
+        x, y = _xy(xyz)
+        assert abs(x - 0.3127) < 0.004 and abs(y - 0.3290) < 0.004, (x, y)
+
+
+def test_refine_hdr_cube_improves_monotonically():
+    peaks, smax, emit, peak = _synthetic_panel((0.340, 0.345))
+    N = 256; grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+    s = 0.5 * smax
+    errs = []
+    for _ in range(5):
+        drive = [_interp_list(grid, cube[ch], s) for ch in "rgb"]
+        x, y = _xy(emit(drive))
+        errs.append(((x - 0.3127) ** 2 + (y - 0.3290) ** 2) ** 0.5)
+        cube = mc.refine_hdr_cube(cube, [(s, emit(drive))], peaks, (1.0, 1.0, 1.0),
+                                  peak_cap_nits=peak, dark_floor_nits=0.5)
+    assert errs[-1] < errs[0] * 0.25                              # error shrinks substantially
+    assert all(errs[i + 1] <= errs[i] + 1e-6 for i in range(len(errs) - 1))  # monotone
+
+
+def test_refine_hdr_cube_leaves_neutral_panel_alone():
+    # A panel already at D65 needs ~no correction: the cube stays ~identity.
+    peaks, smax, emit, peak = _synthetic_panel((0.3127, 0.3290))
+    N = 128; grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+    sigs = [f * smax for f in (0.3, 0.5, 0.7)]
+    meas = [(s, emit([_interp_list(grid, cube[ch], s) for ch in "rgb"])) for s in sigs]
+    new = mc.refine_hdr_cube(cube, meas, peaks, (1.0, 1.0, 1.0), peak_cap_nits=peak, dark_floor_nits=0.5)
+    for ch in "rgb":
+        for j in range(0, N, 8):
+            assert abs(new[ch][j] - cube[ch][j]) < 5e-3, (ch, j, new[ch][j], cube[ch][j])
 
 
 def test_write_1d_cube_roundtrips(tmp_path):

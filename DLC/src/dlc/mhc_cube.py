@@ -52,9 +52,49 @@ __all__ = [
     "pq_oetf",
     "invert_trc",
     "invert_monotone",
+    "peak_chroma_luminance",
     "build_hdr_cube",
+    "refine_hdr_cube",
     "write_1d_cube",
 ]
+
+_D65 = (0.3127, 0.3290)
+
+
+def peak_chroma_luminance(channel_peak_xyz: Sequence[Sequence[float]],
+                          target_white_xy: tuple[float, float] = _D65) -> tuple[float, str]:
+    """The brightest target-white (default D65) luminance the panel can render with EVERY channel
+    inside full drive — ColourSpace's "Peak Chroma" point.
+
+    A warm panel cannot cool its white at full drive (the cold channel has no headroom), so holding
+    the target white from 0->1 means capping peak luminance. The binding constraint is the MEASURED
+    per-channel peak luminance, NOT the chromaticity-primaries matrix: re-normalising primaries to a
+    white point discards the per-channel peak ratios (e.g. this panel's blue peaks at only ~147 nits
+    vs green ~1142), which is exactly what governs real headroom.
+
+    ``channel_peak_xyz``: the three measured full-drive primary XYZ triples (R, G, B) — the columns
+    of the additive display matrix ``disp``, in absolute nits. For a target-white of luminance ``Y``
+    the per-channel drive shares are ``disp^-1 @ XYZ(target, Y)``; they scale linearly in ``Y``, so
+    the cap is where the largest share reaches 1.0 (the channel hits full drive).
+
+    Returns ``(cap_nits, binding_channel)`` — the ADDITIVE headroom limit and the additively-binding
+    channel. NOTE this is a NOMINAL cap: it ignores non-additivity, which on a sub-additive panel
+    pushes the dim (cold) channel's real drive higher and trims the achievable cap a little further
+    (here ~1734 additive / green-edge vs ~1704 non-additive / blue-binding — the two are near-tied).
+    The closed-loop grayscale refine measures the real panel and lands the achievable D65 peak; treat
+    this as the seed, not the exact landing luminance. Native peak (all shares 1.0) bounds it above.
+    """
+    disp = [[channel_peak_xyz[c][row] for c in range(3)] for row in range(3)]  # columns = R,G,B peaks
+    native_peak = sum(channel_peak_xyz[c][1] for c in range(3))                # additive full-white Y
+    if native_peak <= 0.0:
+        raise ValueError("channel peak luminance must be positive")
+    disp_inv = invert3x3(disp)
+    shares_per_nit = matvec(disp_inv, xy_to_XYZ(target_white_xy[0], target_white_xy[1], 1.0))
+    binding = max(range(3), key=lambda c: shares_per_nit[c])
+    if shares_per_nit[binding] <= 0.0:
+        raise ValueError("degenerate primaries: non-positive target-white share")
+    cap = 1.0 / shares_per_nit[binding]
+    return min(cap, native_peak), _CHANNELS[binding]
 
 # ST 2084 (SMPTE) constants — verbatim from mhc.cpp / engine.patches (2610/16384, ...).
 _PQ_M1 = 0.1593017578125
@@ -215,6 +255,91 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     for ch in _CHANNELS:
         summary[f"{ch}_peak_share"] = round(peak_share[ch], 4)
     return curves, summary
+
+
+def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Linear interpolation of ys(xs) at x (xs ascending), clamped to the end values."""
+    if not xs:
+        return 1.0
+    if x <= xs[0]:
+        return ys[0]
+    if x >= xs[-1]:
+        return ys[-1]
+    for k in range(1, len(xs)):
+        if xs[k] >= x:
+            x0, x1, y0, y1 = xs[k - 1], xs[k], ys[k - 1], ys[k]
+            t = (x - x0) / (x1 - x0) if x1 > x0 else 0.0
+            return y0 + (y1 - y0) * t
+    return ys[-1]
+
+
+def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
+                    measured_neutral: Sequence[tuple[float, Sequence[float]]],
+                    channel_peak_xyz: Sequence[Sequence[float]],
+                    matrix_rowsums: Sequence[float],
+                    *, peak_cap_nits: float, target_white_xy: tuple[float, float] = _D65,
+                    damping: float = 0.85, dark_floor_nits: float = 1.0,
+                    ratio_clamp: tuple[float, float] = (0.5, 2.0)
+                    ) -> dict[str, list[float]]:
+    """One closed-loop grayscale-refine step on the HDR base cube — PANEL-AGNOSTIC.
+
+    Pulls the measured neutral axis toward the target white (default D65) by the proven share-ratio
+    law (same as ``refine.propose_correction_grayscale``, but for the per-channel PQ cube). Uses
+    ONLY measured inputs — no forward model, no hardcoded panel magnitudes — so it converges to
+    whatever the real panel does over a few measure->refine rounds (the production HDR analog of
+    the SDR refine loop).
+
+    ``current_curves``    : the installed per-channel cube (r/g/b signal->drive, ``lut_size`` each).
+    ``measured_neutral``  : ``[(wire_signal, measured_XYZ), ...]`` from a neutral-ramp measurement
+                            with the current cube applied.
+    ``channel_peak_xyz``  : measured native full-drive primary XYZ (R,G,B) — the linear-share basis.
+    ``matrix_rowsums``    : ``v_c = M @ (1,1,1)`` for the installed MHC2 matrix, to index the cube at
+                            the POST-matrix signal Windows actually applies it to.
+    ``peak_cap_nits``     : the Peak-Chroma luminance cap (target white saturates here at the top).
+
+    Returns updated per-channel curves (monotone, clamped). The correction is identity below
+    ``dark_floor_nits`` (meter noise) and held flat past the measured range (no extrapolation).
+    """
+    chans = ("r", "g", "b")
+    N = len(current_curves["r"])
+    if N < 2 or len(current_curves["g"]) != N or len(current_curves["b"]) != N:
+        raise ValueError("current_curves must be three equal-length channels")
+    disp = [[channel_peak_xyz[c][row] for c in range(3)] for row in range(3)]
+    disp_inv = invert3x3(disp)
+    wx, wy = target_white_xy
+
+    # gather (post-matrix signal, linear-light correction factor) per channel from the measurement
+    pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
+    for sig, xyz in sorted(measured_neutral, key=lambda p: p[0]):
+        lin = pq_eotf(sig)
+        tY = min(lin * 10000.0, peak_cap_nits)
+        if tY < dark_floor_nits:
+            continue
+        ms = matvec(disp_inv, xyz)
+        ts = matvec(disp_inv, xy_to_XYZ(wx, wy, tY))
+        for c in range(3):
+            ratio = ts[c] / ms[c] if ms[c] > 1e-9 else 1.0
+            ratio = min(max(ratio, ratio_clamp[0]), ratio_clamp[1])
+            post_sig = pq_oetf(min(max(matrix_rowsums[c] * lin, 0.0), 1.0))
+            pts[c].append((post_sig, ratio ** damping))
+
+    out: dict[str, list[float]] = {}
+    for c, ch in enumerate(chans):
+        xs = [p[0] for p in pts[c]]
+        fs = [p[1] for p in pts[c]]
+        cur = current_curves[ch]
+        curve: list[float] = []
+        prev = 0.0
+        for j in range(N):
+            sig = j / (N - 1)
+            factor = _interp(sig, xs, fs) if xs else 1.0          # 1.0 left of first point (dark)
+            new_lin = pq_eotf(float(cur[j])) * factor
+            val = pq_oetf(new_lin)
+            val = max(prev, min(max(val, 0.0), 1.0))               # monotone, clamped
+            prev = val
+            curve.append(val)
+        out[ch] = curve
+    return out
 
 
 def write_1d_cube(path: Path, curves: dict[str, list[float]], *, title: str = "DLC HDR MHC base") -> Path:
