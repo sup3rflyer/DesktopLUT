@@ -50,6 +50,52 @@ function setDe(id, v, d = 2) {
   el.textContent = num(v, d);
   el.className = deClass(v);
 }
+function deMetricLabel(metric) {
+  if (!metric) return "ΔE";
+  const m = String(metric).toUpperCase();
+  if (m.includes("ITP")) return "ΔE·ITP";       // HDR (BT.2124)
+  if (m.includes("2000")) return "ΔE2000";      // SDR (CIEDE2000)
+  return "ΔE";
+}
+// A patch's approximate on-screen colour from its normalised signal (sRGB-ish), for the swatch.
+function sigHex(sig) {
+  if (!Array.isArray(sig) || sig.length < 3) return "#1c1c20";
+  const c = (v) => Math.max(0, Math.min(255, Math.round(Number(v) * 255)));
+  return `#${[c(sig[0]), c(sig[1]), c(sig[2])].map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+// Duv sign reads as a tint: positive = green above the Planckian locus, negative = magenta below.
+function duvTint(duv) {
+  if (duv == null) return "";
+  if (duv > 0.0002) return "green";
+  if (duv < -0.0002) return "magenta";
+  return "";
+}
+function renderLivePatch(lr, header) {
+  const ok = lr.ok && lr.xy;
+  const role = lr.role || (lr.label ? "" : "—");
+  $("lp-role").textContent = [role, lr.disposition && lr.disposition !== role ? lr.disposition : ""]
+    .filter(Boolean).join(" · ") || "—";
+  $("lp-label").textContent = lr.label || "—";
+  const rgb = lr.rgb ? `[${lr.rgb.join(",")}]` : "—";
+  $("lp-rgb").textContent = rgb;
+  const sw = $("lp-swatch");
+  sw.style.background = (lr.signal ? sigHex(lr.signal) : (lr.rgb && header && header.bit_depth
+    ? sigHex(lr.rgb.map((v) => v / (Math.pow(2, header.bit_depth) - 1))) : "#1c1c20"));
+  sw.classList.toggle("nok", !ok);
+  $("lp-xy").textContent = ok ? `${num(lr.xy[0], 4)}, ${num(lr.xy[1], 4)}` : "—";
+  $("lp-Y").textContent = (lr.Y != null) ? num(lr.Y, 2) : "—";
+  // CCT / Duv only make sense for a grayscale patch (a saturated colour has no meaningful CCT).
+  const neutral = !!lr.neutral;
+  document.querySelectorAll(".rcard-patch .lp-neutral").forEach((el) => el.classList.toggle("off", !neutral));
+  if (neutral && ok) {
+    $("lp-cct").textContent = lr.cct ? `${Math.round(lr.cct)} K` : "—";
+    const tint = duvTint(lr.duv);
+    $("lp-duv").innerHTML = (lr.duv != null)
+      ? `${num(lr.duv, 4)}${tint ? ` <span class="tint ${tint}">${tint === "green" ? "▲green" : "▼magenta"}</span>` : ""}` : "—";
+    const tcct = header && header.white && header.white.cct;
+    $("lp-target").textContent = (lr.cct && tcct) ? `${(lr.cct - tcct >= 0 ? "+" : "")}${Math.round(lr.cct - tcct)} K` : "—";
+  }
+}
 function toast(msg) {
   const el = $("toast");
   el.textContent = msg;
@@ -135,19 +181,17 @@ function renderState(s) {
   tp.textContent = (lv.progress_age_s != null) ? fmtDur(lv.progress_age_s) : "—";
   tp.className = light === "stalled" ? "prog-stalled" : (light === "slow" ? "prog-slow" : "");
 
-  // dE big-numbers (from the scoring stage)
+  // dE big-numbers (from the scoring stage). The metric label tracks the run (dE_ITP for HDR,
+  // CIEDE2000 for SDR) so the distinction is explicit, not assumed.
   const de = s.de || {};
-  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}${de.metric ? " · " + de.metric : ""}` : "";
+  $("de-metric").textContent = deMetricLabel(de.metric);
+  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
   setDe("de-white", de.white);
   setDe("de-gray", de.grayscale); setDe("de-colour", de.colour);
 
-  // live white point
-  const lw = s.last_white || {};
-  $("w-cct").textContent = lw.cct ? `${Math.round(lw.cct)} K` : "—";
-  $("w-duv").textContent = (lw.duv != null) ? num(lw.duv, 4) : "—";
-  $("w-xy").textContent = lw.xy ? `${num(lw.xy[0], 4)}, ${num(lw.xy[1], 4)}` : "—";
-  $("w-Y").textContent = (lw.Y != null) ? num(lw.Y, 2) : "—";
+  // live patch — the last measured patch + a swatch; CCT/Duv only when it's a grayscale patch.
+  renderLivePatch(s.last_read || {}, h);
 
   // attention flags
   flag("flag-stall", s.stall, (d) => d.message || d.via || "tripped", true);
@@ -183,8 +227,13 @@ function fmtMsg(ev) {
       const rgb = d.rgb ? `[${d.rgb.join(",")}]` : "";
       const xy = d.xy ? `(${num(d.xy[0], 4)},${num(d.xy[1], 4)})` : "";
       const der = ev.derived || {};
-      const cct = der.cct ? ` ${kv("cct", Math.round(der.cct) + "K")}` : "";
-      return `${esc(d.role || "")} ${esc(d.label || "")} ${kv("rgb", rgb)} ${kv("Y", num(d.Y, 2))} ${kv("xy", xy)}${cct} ${okc}`;
+      // CCT/Duv only for a grayscale patch — a saturated colour has no meaningful correlated
+      // colour temperature, so showing one there is misleading.
+      const neutral = Array.isArray(d.rgb) && d.rgb.length >= 3
+        && d.rgb[0] === d.rgb[1] && d.rgb[1] === d.rgb[2] && d.rgb[0] > 0;
+      const cct = (neutral && der.cct) ? ` ${kv("cct", Math.round(der.cct) + "K")}` : "";
+      const de = (d.de != null) ? ` ${kv("ΔE", num(d.de, 2))}` : "";
+      return `${esc(d.role || "")} ${esc(d.label || "")} ${kv("rgb", rgb)} ${kv("Y", num(d.Y, 2))} ${kv("xy", xy)}${cct}${de} ${okc}`;
     }
     case "progress": return `${kv("patches", (d.patches_done || 0) + "/" + (d.patches_total || 0))} ${kv("reads", d.reads || 0)}`;
     case "heartbeat": return `alive ${kv("elapsed", num(d.elapsed_s, 0) + "s")} ${kv("age", num(d.since_progress_s, 0) + "s")}`;

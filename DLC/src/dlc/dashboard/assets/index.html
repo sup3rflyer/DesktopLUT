@@ -71,7 +71,7 @@
     </div>
 
     <div class="rcard rcard-de">
-      <h3>ΔE2000 <span class="card-sub" id="de-source"></span></h3>
+      <h3><span id="de-metric">ΔE</span> <span class="card-sub" id="de-source"></span></h3>
       <div class="bignums">
         <div class="bignum"><b id="de-avg">—</b><label>avg</label></div>
         <div class="bignum"><b id="de-p95">—</b><label>95th</label></div>
@@ -85,12 +85,22 @@
       </div>
     </div>
 
-    <div class="rcard">
-      <h3>Live white</h3>
-      <div class="kv"><span>CCT</span><b id="w-cct">—</b></div>
-      <div class="kv"><span>Duv</span><b id="w-duv">—</b></div>
-      <div class="kv"><span>xy</span><b id="w-xy">—</b></div>
-      <div class="kv"><span>Y</span><b id="w-Y">—</b></div>
+    <div class="rcard rcard-patch">
+      <h3>Live patch <span class="card-sub" id="lp-role">—</span></h3>
+      <div class="lp-top">
+        <div class="lp-swatch" id="lp-swatch" title="last measured patch"></div>
+        <div class="lp-id">
+          <b id="lp-label">—</b>
+          <span id="lp-rgb" class="lp-rgb">—</span>
+        </div>
+      </div>
+      <div class="lp-grid">
+        <div class="kv"><span>xy</span><b id="lp-xy">—</b></div>
+        <div class="kv"><span>Y</span><b id="lp-Y">—</b></div>
+        <div class="kv lp-neutral"><span>CCT</span><b id="lp-cct">—</b></div>
+        <div class="kv lp-neutral"><span>Duv</span><b id="lp-duv">—</b></div>
+        <div class="kv lp-neutral"><span>vs target</span><b id="lp-target">—</b></div>
+      </div>
     </div>
 
     <div class="rcard">

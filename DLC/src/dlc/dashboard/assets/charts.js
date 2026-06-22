@@ -54,6 +54,9 @@
   DLCCharts.cie = function (d) {
     d = d || {};
     const P = Plot({ xmin: 0, xmax: 0.75, ymin: 0, ymax: 0.85 });
+    // A lighter backdrop just for the CIE tile so dark/low-signal measured points (near-black
+    // fills) stay visible against the otherwise near-black plot area.
+    P.add(`<rect x="${fmt(P.m.l, 1)}" y="${fmt(P.m.t, 1)}" width="${fmt(P.W - P.m.l - P.m.r, 1)}" height="${fmt(P.H - P.m.t - P.m.b, 1)}" class="ch-cie-bg"/>`);
     P.gridX([0, 0.2, 0.4, 0.6], (t) => fmt(t, 1));
     P.gridY([0, 0.2, 0.4, 0.6, 0.8], (t) => fmt(t, 1));
     if (d.locus && d.locus.length) P.pathLine(d.locus, "ch-locus");
@@ -74,8 +77,12 @@
       P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}>${title(`${p.neutral ? "neutral" : "colour"} xy ${fmt(p.x, 4)}, ${fmt(p.y, 4)}`)}</circle>`);
     }
     if (d.white && d.white.length >= 2) {
-      P.add(`<circle cx="${fmt(P.px(d.white[0]), 1)}" cy="${fmt(P.py(d.white[1]), 1)}" r="4.5" class="ch-white">${title(`target white xy ${fmt(d.white[0], 4)}, ${fmt(d.white[1], 4)}`)}</circle>`);
-      P.add(`<text x="${fmt(P.px(d.white[0]) + 7, 1)}" y="${fmt(P.py(d.white[1]) - 7, 1)}" class="ch-note">white</text>`);
+      const wx = P.px(d.white[0]), wy = P.py(d.white[1]);
+      // Target white as a crosshair + ring so it reads clearly as the TARGET (not just another point).
+      P.add(`<line x1="${fmt(wx - 9, 1)}" y1="${fmt(wy, 1)}" x2="${fmt(wx + 9, 1)}" y2="${fmt(wy, 1)}" class="ch-target-cross"/>`);
+      P.add(`<line x1="${fmt(wx, 1)}" y1="${fmt(wy - 9, 1)}" x2="${fmt(wx, 1)}" y2="${fmt(wy + 9, 1)}" class="ch-target-cross"/>`);
+      P.add(`<circle cx="${fmt(wx, 1)}" cy="${fmt(wy, 1)}" r="4.5" class="ch-white">${title(`target white xy ${fmt(d.white[0], 4)}, ${fmt(d.white[1], 4)}`)}</circle>`);
+      P.add(`<text x="${fmt(wx + 8, 1)}" y="${fmt(wy - 8, 1)}" class="ch-note">target white</text>`);
     }
     return P.svg();
   };
@@ -100,7 +107,30 @@
       return best[1];
     };
     pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}`)}</circle>`));
-    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">${d.kind === "pq" ? "PQ" : "γ " + fmt(g, 2)}</text>`);
+
+    // Second interpretation: the gamma/EOTF *tracking* line — flat on the target = perfect tracking.
+    // SDR: the local gamma γ(s)=ln(Y_rel)/ln(s); HDR(PQ): measured/target luminance ratio (1.0=ideal).
+    // Drawn semi-transparent on its OWN scale so it overlays the absolute EOTF curve without fighting it.
+    const isPq = d.kind === "pq";
+    const tTarget = isPq ? 1.0 : g;
+    const tLo = isPq ? 0.7 : g - 0.6, tHi = isPq ? 1.3 : g + 0.6;
+    const ty = (v) => P.py(Math.max(0, Math.min(1, (v - tLo) / (tHi - tLo))));
+    const track = [];
+    pts.forEach((p) => {
+      if (p.signal <= 0.04) return;                  // gamma is ill-defined near black
+      const yrel = p.Y / ymax;
+      let v = null;
+      if (isPq) { const r = refAt(p.signal); v = r > 1e-4 ? yrel / r : null; }
+      else if (yrel > 0) { v = Math.log(yrel) / Math.log(p.signal); }
+      if (v != null && isFinite(v)) track.push([p.signal, v]);
+    });
+    P.add(`<line x1="${fmt(P.px(0), 1)}" y1="${fmt(ty(tTarget), 1)}" x2="${fmt(P.px(1), 1)}" y2="${fmt(ty(tTarget), 1)}" class="ch-track-ref"/>`);
+    if (track.length) {
+      P.add(`<path d="${track.map((p, i) => (i ? "L" : "M") + fmt(P.px(p[0]), 1) + " " + fmt(ty(p[1]), 1)).join(" ")}" class="ch-track" fill="none"/>`);
+      track.forEach((p) => P.add(`<circle cx="${fmt(P.px(p[0]), 1)}" cy="${fmt(ty(p[1]), 1)}" r="1.6" class="ch-track-dot">${title(`signal ${fmt(p[0], 3)} | ${isPq ? "EOTF ratio " + fmt(p[1], 3) : "local γ " + fmt(p[1], 2)} | target ${fmt(tTarget, 2)}`)}</circle>`));
+    }
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">${isPq ? "PQ" : "γ " + fmt(g, 2)}</text>`);
+    P.add(`<text x="${fmt(P.px(0) + 4, 1)}" y="${fmt(ty(tTarget) - 4, 1)}" class="ch-track-note">${isPq ? "EOTF track ·target" : "γ track @" + fmt(g, 1)}</text>`);
     return P.svg();
   };
 
@@ -123,18 +153,27 @@
     return P.svg();
   };
 
-  // ── Grayscale Duv vs signal (zero = on the Planckian locus) ──
+  // ── Grayscale Duv vs signal (zero = on the Planckian locus; +green above / −magenta below) ──
   DLCCharts.grayscaleDuv = function (d) {
     const pts = (d || []).filter((p) => p.duv != null);
     if (!pts.length) return empty("no grayscale Duv yet");
     const span = Math.max(0.005, Math.max(...pts.map((p) => Math.abs(p.duv))) * 1.2);
     const P = Plot({ xmin: 0, xmax: 1, ymin: -span, ymax: span });
+    // Tint the half-planes so the SIGN reads as a colour cast: Duv>0 = green (above the locus),
+    // Duv<0 = magenta (below). The eye should keep the trace near the zero line.
+    const xL = P.px(0), xR = P.px(1), y0 = P.py(0);
+    P.add(`<rect x="${fmt(xL, 1)}" y="${fmt(P.m.t, 1)}" width="${fmt(xR - xL, 1)}" height="${fmt(y0 - P.m.t, 1)}" class="ch-band-green"/>`);
+    P.add(`<rect x="${fmt(xL, 1)}" y="${fmt(y0, 1)}" width="${fmt(xR - xL, 1)}" height="${fmt((P.H - P.m.b) - y0, 1)}" class="ch-band-magenta"/>`);
     P.gridX([0, 0.5, 1], (t) => fmt(t, 1));
     P.gridY([-span, 0, span], (t) => fmt(t, 3));
     P.pathLine([[0, 0], [1, 0]], "ch-ref");
     P.pathLine(pts.map((p) => [p.signal, p.duv]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | target 0`)}</circle>`));
-    P.add(`<text x="${P.W - 16}" y="${fmt(P.py(0) - 5, 1)}" text-anchor="end" class="ch-note">target 0</text>`);
+    pts.forEach((p) => {
+      const cls = p.duv > 0.0002 ? "ch-dot-green" : (p.duv < -0.0002 ? "ch-dot-magenta" : "ch-dot");
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}">${title(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${p.duv > 0 ? "green" : p.duv < 0 ? "magenta" : "neutral"} | target 0`)}</circle>`);
+    });
+    P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-lab-green">▲ green (+Duv)</text>`);
+    P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.H - P.m.b - 5, 1)}" class="ch-lab-magenta">▼ magenta (−Duv)</text>`);
     return P.svg();
   };
 

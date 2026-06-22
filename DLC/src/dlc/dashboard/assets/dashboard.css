@@ -99,6 +99,20 @@ body {
 .bignum label { color: var(--ink-faint); font-size: 9px; text-transform: uppercase; }
 .de-split { display: flex; gap: 10px; border-top: 1px solid var(--edge); padding-top: 4px; }
 .de-split .kv { flex: 1; flex-direction: column; align-items: flex-start; }
+/* live patch card */
+.rcard-patch { flex: 1 1 200px; }
+.lp-top { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
+.lp-swatch { width: 34px; height: 34px; border-radius: 5px; flex: 0 0 auto;
+  background: var(--panel-2); border: 1px solid var(--edge);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,.4); }
+.lp-swatch.nok { border-color: var(--bad); }
+.lp-id { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+.lp-id b { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lp-rgb { font-family: var(--mono); color: var(--ink-faint); font-size: 10.5px; }
+.lp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.lp-neutral.off { display: none; }
+.tint { font-size: 9.5px; padding: 0 3px; border-radius: 3px; }
+.tint.green { color: #6fae5e; } .tint.magenta { color: #c06fc0; }
 .flag { display: flex; justify-content: space-between; padding: 1px 0; color: var(--ink-dim); font-size: 11px; }
 .flag span { font-family: var(--mono); color: var(--ink-faint); max-width: 130px; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
@@ -140,6 +154,22 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-axis0 { stroke: #6a6a70; stroke-width: 1; }
 .ch-note { fill: var(--ink-dim); font-size: 10px; font-family: var(--mono); }
 .ch-empty { fill: var(--ink-faint); font-size: 12px; font-family: var(--mono); }
+/* CIE: lighter backdrop + point outlines so dark/low-signal measured points stay visible */
+.ch-cie-bg { fill: #18181c; stroke: none; }
+.ch-pt { stroke: #6a6a72; stroke-width: .4; }
+.ch-pt-n { stroke: #2a2a2e; stroke-width: .4; }
+.ch-target-cross { stroke: #fff; stroke-width: .8; opacity: .8; }
+/* Grayscale Duv sign bands + sign-coloured dots (green above the locus, magenta below) */
+.ch-band-green { fill: rgba(111,174,94,.10); }
+.ch-band-magenta { fill: rgba(192,111,192,.10); }
+.ch-dot-green { fill: #6fae5e; } .ch-dot-magenta { fill: #c06fc0; }
+.ch-lab-green { fill: #6fae5e; font-size: 9.5px; font-family: var(--mono); opacity: .85; }
+.ch-lab-magenta { fill: #c06fc0; font-size: 9.5px; font-family: var(--mono); opacity: .85; }
+/* EOTF gamma/tracking line (the second interpretation) — semi-transparent on its own scale */
+.ch-track { stroke: #58a6c9; stroke-width: 1.2; opacity: .5; stroke-dasharray: 2 2; }
+.ch-track-ref { stroke: #58a6c9; stroke-width: .8; opacity: .35; }
+.ch-track-dot { fill: #58a6c9; opacity: .55; }
+.ch-track-note { fill: #58a6c9; font-size: 9px; font-family: var(--mono); opacity: .7; }
 
 /* ── lightbox (click a tile to view large) ─────────────────────── */
 .lightbox { position: fixed; inset: 0; background: transparent; z-index: 50;

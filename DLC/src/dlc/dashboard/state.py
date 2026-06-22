@@ -339,7 +339,8 @@ class DashboardState:
             self._accumulate_charts(ev, data, float(xy[0]), float(xy[1]), Y, enriched)
         self.last_read = {
             "seq": data.get("seq"), "role": data.get("role"), "label": data.get("label"),
-            "rgb": data.get("rgb"), "Y": Y, "xy": xy, "ok": ok,
+            "rgb": data.get("rgb"), "signal": data.get("signal"), "Y": Y, "xy": xy, "ok": ok,
+            "neutral": _is_neutral(data.get("rgb")),
             "disposition": data.get("disposition"), **enriched,
         }
         # The most recent neutral read drives the live white-point readout (needs a usable xy
