@@ -130,6 +130,7 @@ padding:8px;text-align:center}.bn b{display:block;font-family:var(--mono);font-s
 .chart-svg{width:100%;height:auto;display:block}
 .ch-area{fill:#0d0d0e;stroke:#242428}.ch-grid{stroke:#1c1c20;stroke-width:.5}.ch-tick{fill:#5c5c62;font-size:9px;font-family:var(--mono)}
 .ch-locus{stroke:#8a8a90;stroke-width:1;stroke-dasharray:3 2}.ch-gamut{fill:none;stroke:#4a4a50;stroke-width:1}
+.ch-gamut-native{fill:none;stroke:#c9a227;stroke-width:1;stroke-dasharray:2 2;opacity:.85}.ch-note-native{fill:#c9a227;font-size:10px;font-family:var(--mono)}
 .ch-pt{fill:#b0b0b4;opacity:.7;stroke:#6a6a72;stroke-width:.4}.ch-pt-n{fill:#e8e8ea;opacity:.85;stroke:#2a2a2e;stroke-width:.4}.ch-white{fill:#fff;stroke:#000;stroke-width:.5}
 .ch-line{stroke:var(--accent);stroke-width:1.5}.ch-line-max{stroke:#9a9aa0;stroke-width:1}.ch-ref{stroke:#8a8a90;stroke-width:1;stroke-dasharray:4 3}
 .ch-dot{fill:var(--accent)}.ch-dot-max{fill:#9a9aa0}.ch-guide{stroke:var(--accent);stroke-width:.8;stroke-dasharray:5 4;opacity:.7}

@@ -77,6 +77,27 @@ def test_non_neutral_read_does_not_move_white():
     assert st.snapshot(T0)["last_white"] == {}
 
 
+def test_native_primaries_from_raw_pure_channel_peaks():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))
+    for sig, xy in [([1.0, 0.0, 0.0], [0.69, 0.30]), ([0.0, 1.0, 0.0], [0.21, 0.71]),
+                    ([0.0, 0.0, 1.0], [0.15, 0.05])]:
+        st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0,
+                      role="measurement", rgb=[int(c * 255) for c in sig], signal=sig,
+                      Y=100.0, xy=xy, ok=True))
+    nat = st.charts()["cie"]["native"]
+    assert nat is not None
+    assert abs(nat["r"][0] - 0.69) < 1e-3 and abs(nat["g"][1] - 0.71) < 1e-3 and abs(nat["b"][0] - 0.15) < 1e-3
+
+
+def test_native_primaries_none_without_saturated_patches():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[200, 200, 200], signal=[0.78, 0.78, 0.78], Y=90.0, xy=[0.31, 0.33], ok=True))
+    assert st.charts()["cie"]["native"] is None    # neutral-only raw → no native gamut
+
+
 def test_per_patch_de_enriches_reads_and_live_header():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",

@@ -128,6 +128,8 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .charts-meta { display: flex; align-items: baseline; gap: 8px; margin: 0 2px 8px; }
 .charts-meta .cm-label { color: var(--ink-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
 .charts-meta .cm-stage { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+.charts-meta .cm-toggle { margin-left: auto; display: flex; align-items: center; gap: 5px;
+  color: var(--ink-dim); font-size: 11px; cursor: pointer; }
 /* equal tiles: every cell the same width; the shared chart viewBox makes heights match too */
 .charts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
   gap: 12px; align-items: stretch; }
@@ -145,6 +147,8 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-tick { fill: var(--ink-faint); font-size: 9px; font-family: var(--mono); }
 .ch-locus { stroke: #8a8a90; stroke-width: 1; stroke-dasharray: 3 2; }
 .ch-gamut { fill: none; stroke: #4a4a50; stroke-width: 1; }
+.ch-gamut-native { fill: none; stroke: var(--accent); stroke-width: 1; stroke-dasharray: 2 2; opacity: .85; }
+.ch-note-native { fill: var(--accent); font-size: 10px; font-family: var(--mono); }
 .ch-pt { fill: #b0b0b4; opacity: .7; }            /* coloured per-patch when data carries a colour */
 .ch-pt-n { fill: #e8e8ea; opacity: .85; }
 .ch-white { fill: #fff; stroke: #000; stroke-width: .5; }

@@ -465,6 +465,15 @@ function wireUi() {
   for (const id of ["filter-level", "filter-stage", "filter-digest", "filter-text"]) {
     $(id).addEventListener("input", scheduleRender);
   }
+  // native-gamut overlay toggle: flip the chart option and re-render the (cached) charts
+  $("toggle-native").addEventListener("change", (e) => {
+    if (window.DLCCharts) DLCCharts.opts.native = e.target.checked;
+    const header = lastState ? lastState.header : null;
+    if (window.DLCCharts && lastCharts) {
+      DLCCharts.renderInto($("charts"), lastCharts, header);
+      if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, lastCharts, header);
+    }
+  });
   $("btn-export").addEventListener("click", async () => {
     $("btn-export").disabled = true;
     try {

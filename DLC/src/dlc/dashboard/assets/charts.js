@@ -49,6 +49,9 @@
     `<svg viewBox="0 0 ${VB.w} ${VB.h}" class="chart-svg"><text x="${VB.w / 2}" y="${VB.h / 2}" text-anchor="middle" class="ch-empty">${esc(msg || "no data yet")}</text></svg>`;
 
   const DLCCharts = {};
+  // Render options the dashboard toggles. `native` overlays the panel's measured native gamut on
+  // the CIE tile (the standard target gamut is always shown — see the gamut toggle, #20).
+  DLCCharts.opts = { native: true };
 
   // ── CIE 1931: measured scatter (coloured by patch) vs sRGB gamut + locus + white ──
   DLCCharts.cie = function (d) {
@@ -67,6 +70,17 @@
       [["R", pr.r], ["G", pr.g], ["B", pr.b]].forEach(([lab, p]) => {
         P.add(`<text x="${fmt(P.px(p[0]), 1)}" y="${fmt(P.py(p[1]) - 5, 1)}" class="ch-note" text-anchor="middle">${lab}</text>`);
       });
+    }
+    // Measured native gamut overlay (the panel's real coverage vs the standard target gamut).
+    const nat = d.native;
+    if (DLCCharts.opts.native && nat && nat.r && nat.g && nat.b) {
+      const npoly = [nat.r, nat.g, nat.b].map((p) => `${fmt(P.px(p[0]), 1)},${fmt(P.py(p[1]), 1)}`).join(" ");
+      P.add(`<polygon points="${npoly}" class="ch-gamut-native">${title("measured native gamut")}</polygon>`);
+    }
+    // gamut legend: standard target (always) + native overlay (when shown + available)
+    P.add(`<text x="${fmt(P.m.l + 4, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">▱ ${esc(d.gamut_label || "target")}</text>`);
+    if (DLCCharts.opts.native && nat && nat.r) {
+      P.add(`<text x="${fmt(P.m.l + 4, 1)}" y="${fmt(P.m.t + 24, 1)}" class="ch-note-native">▱ native panel</text>`);
     }
     const pts = d.points || [];
     const cap = 2500, step = pts.length > cap ? Math.ceil(pts.length / cap) : 1;

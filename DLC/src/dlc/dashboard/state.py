@@ -506,6 +506,10 @@ class DashboardState:
                 "white": white,
                 "primaries": _REC2020_PRIMARIES if hdr else _SRGB_PRIMARIES,
                 "gamut_label": "Rec.2020" if hdr else "Rec.709 / sRGB",
+                # The panel's MEASURED native gamut (from the raw pure-channel peaks), so the
+                # frontend can overlay native coverage on the STANDARD target gamut — the
+                # "standard vs native" view (#20). None when no saturated primaries were measured.
+                "native": self._native_primaries(),
                 "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
             },
             "grayscale": gray,
@@ -576,6 +580,28 @@ class DashboardState:
                for lbl, g in groups.items()]
         out.sort(key=lambda d: (_FAMILY_ORDER.get(d["family"], 9), d["sat"]))
         return out
+
+    def _native_primaries(self) -> Optional[dict[str, list[float]]]:
+        """The panel's measured native R/G/B chromaticities — the most-saturated pure-channel
+        patch per hue from the RAW (first-measured) stage, so it's the true native gamut
+        independent of which corrected stage the scatter currently shows. ``None`` until all
+        three primaries have a saturated measured patch (e.g. a neutral-only raw ramp)."""
+        if not self._stage_seq:
+            return None
+        color_map = self._color_by_stage.get(self._stage_seq[0], {})
+        best: dict[str, tuple[int, list[float]]] = {}
+        for c in color_map.values():
+            sig, x, y = c.get("signal"), c.get("x"), c.get("y")
+            if x is None or y is None or not sig:
+                continue
+            family, sat = _classify_color(sig)
+            if family not in ("R", "G", "B") or sat <= 0:
+                continue
+            if family not in best or sat > best[family][0]:
+                best[family] = (sat, [round(x, 5), round(y, 5)])
+        if not all(f in best for f in ("R", "G", "B")):
+            return None
+        return {f.lower(): best[f][1] for f in ("R", "G", "B")}
 
     def _saturation(self, color_map: dict, white_xy: Any) -> list[dict[str, Any]]:
         """Saturation tracking per hue family: measured chroma (CIE 1976 u'v' distance from the
