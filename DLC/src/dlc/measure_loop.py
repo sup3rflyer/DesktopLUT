@@ -176,6 +176,30 @@ class MeasureLoopConfig:
     outlier_factor: float = 3.0         # a read >factor×σ from the patch median is a glitch ⇒ rejected, not averaged in
     outlier_floor_de: float = 0.5       # never reject within this ΔE of the median (a σ-independent floor)
 
+    # Near-neutral read FLOOR (chroma-critical region) ----------------------
+    # The matrix (white/chromaticity) + per-channel WB + non-additivity terms are derived from the
+    # grey ramp + the off-axis near-neutral TUBE, where a tiny chromaticity error in a single read
+    # biases the whole fit. The DIP noise model sizes reads for *luminance* SNR — which already
+    # covers the dark/noisy end — but it does NOT know that a BRIGHT near-neutral patch (low σ, so
+    # the DIP would take one read) is chroma-critical. ``neutral_min_reads`` is a per-patch read
+    # FLOOR applied ONLY to near-neutral patches so that region is always averaged; the DIP still
+    # escalates ABOVE the floor where σ demands it (``target_n = max(floor, dip_n)``). It is also the
+    # fixed-N fallback when there is no DIP. Default 1 ⇒ off (behaviour unchanged). NOT a cap — the
+    # abnormal-read FLAG is unaffected. ``neutral_chroma_span`` is the discriminator: a patch is
+    # near-neutral when ``(max-min) <= span * max`` of its signal (gray ⇒ 0; the 0.06/0.15 tube ⇒
+    # ≤0.26; any pure-channel/secondary ramp has a zero channel ⇒ 1.0, excluded). Widen it if the
+    # tube uses larger chroma offsets.
+    neutral_min_reads: int = 1
+    neutral_chroma_span: float = 0.35
+    # Luminance GATE on the floor: only raise reads on near-neutral patches whose EXPECTED
+    # luminance is at or above this (0 ⇒ no gate). The measured noise model shows σ is SMALLEST
+    # at the dim end (it grows with luminance), so dark patches benefit from averaging the LEAST —
+    # while being the SLOWEST to read (long meter integration at low light) and the most thermally
+    # risky (extended dwell at low backlight load cools the panel → drift churn). Gating the floor
+    # to brighter near-neutral patches puts the extra reads where σ is largest and reads are fast,
+    # and leaves the slow dim patches at a single read.
+    neutral_floor_min_nits: float = 0.0
+
     plausible_luminance_floor_nits: float = 1.0
     plausible_luminance_reference_floor_fraction: float = 0.04
     plausible_luminance_low_expected_nits: float = 10.0
@@ -981,6 +1005,30 @@ class _Loop:
 
     # -- one measurement patch (DIP-driven read policy) --------------------
 
+    def _is_near_neutral(self, patch: MeasurePatch) -> bool:
+        """Whether ``patch`` sits in the chroma-critical near-neutral region (grey ramp +
+        off-axis tube) that the matrix / WB / non-additivity derivation is sensitive to.
+        Relative-span test: balanced channels ⇒ near-neutral; a pure-channel or secondary
+        ramp patch has a zero channel ⇒ span == max ⇒ excluded. (See ``neutral_chroma_span``.)"""
+        sig = patch.signal
+        mx = max(sig)
+        if mx <= 0.0:
+            return False
+        return (mx - min(sig)) <= self.cfg.neutral_chroma_span * mx
+
+    def _read_floor_for(self, patch: MeasurePatch) -> int:
+        """The per-patch minimum read count: the global ``min_reads``, raised to
+        ``neutral_min_reads`` on a near-neutral patch (gated to ``neutral_floor_min_nits`` and
+        brighter) so the chroma-critical region is averaged where it pays off — fast, larger-σ
+        reads — without multiplying the slow dim patches. The DIP still escalates above this where
+        measured σ demands it."""
+        floor = self.cfg.min_reads
+        if (self.cfg.neutral_min_reads > floor
+                and self._is_near_neutral(patch)
+                and self._expected_patch_nits(patch) >= self.cfg.neutral_floor_min_nits):
+            floor = self.cfg.neutral_min_reads
+        return floor
+
     def _abnormal_reads(self, target_n: Optional[int]) -> int:
         """The read count past which a patch is *abnormal* and must be FLAGGED (not
         silently capped). Scaled off the DIP's per-luminance target so a legitimately
@@ -1032,7 +1080,10 @@ class _Loop:
                     nits = r.xyz[1]
                     sigma = self.dip.expected_sigma_de(nits) if self.dip else None
                     dip_n = self.dip.reads_for_tolerance(nits, cfg.read_tolerance_de) if self.dip else None
-                    target_n = max(cfg.min_reads, dip_n or cfg.min_reads)
+                    # Floor (global min_reads, raised on near-neutral patches), with the DIP free to
+                    # escalate ABOVE it where measured σ demands more averaging for SNR.
+                    floor = self._read_floor_for(patch)
+                    target_n = max(floor, dip_n or floor)
 
             st = self._robust_stats(reads, sigma=sigma)
             n_inliers = st[2] if st else 0

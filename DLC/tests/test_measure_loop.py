@@ -235,6 +235,90 @@ def test_unconverging_patch_is_flagged_not_silently_capped():
 
 
 # ---------------------------------------------------------------------------
+# near-neutral read floor (chroma-critical region)
+# ---------------------------------------------------------------------------
+
+def _tube_patch(level: int, frac: float, t: Transfer, direction=(1, -1, -1)) -> MeasurePatch:
+    """An off-axis near-neutral tube patch built like engine.patches.near_neutral_tube_patches:
+    one channel +d, two -d, d = round(level*frac)."""
+    d = max(1, round(level * frac))
+    cv = tuple(max(0, min(t.max_cv, level + s * d)) for s in direction)
+    return _patch("tube", cv, t, 0)  # type: ignore[arg-type]
+
+
+def test_is_near_neutral_classifies_gray_and_tube_but_not_pure_channel():
+    t = _sdr()
+    loop = _solo_loop(_ScriptedPanel([(50.0, 50.0, 55.0)]), t, MeasureLoopConfig())
+    # Grey axis: zero chroma span.
+    assert loop._is_near_neutral(_patch("g", (512, 512, 512), t)) is True
+    # Tube at both default offsets: relative span 2*frac/(1+frac) ≈ 0.11 / 0.26 — inside 0.35.
+    assert loop._is_near_neutral(_tube_patch(512, 0.06, t)) is True
+    assert loop._is_near_neutral(_tube_patch(512, 0.15, t)) is True
+    # A pure-channel ramp patch has a zero channel ⇒ span == max ⇒ excluded (at any level).
+    assert loop._is_near_neutral(_patch("r", (512, 0, 0), t)) is False
+    assert loop._is_near_neutral(_patch("r-dark", (40, 0, 0), t)) is False
+    # A secondary (two channels lit, one zero) is likewise off-axis, not near-neutral.
+    assert loop._is_near_neutral(_patch("yellow", (512, 512, 0), t)) is False
+    # Pure black has no defined chroma ⇒ not flagged.
+    assert loop._is_near_neutral(_patch("k", (0, 0, 0), t)) is False
+
+
+def test_neutral_floor_averages_the_grey_region_even_without_a_dip():
+    # No DIP ⇒ dip_n is None; the floor is the fixed-N fallback for the chroma-critical region.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])   # perfectly repeatable ⇒ SE=0, would stop at 1
+    loop = _solo_loop(clean, t, MeasureLoopConfig(neutral_min_reads=4))
+    rec = loop.measure_patch(_patch("g", (512, 512, 512), t, 0), phase="main")
+    assert rec.reads_taken == 4
+    assert rec.immediate_remeasures == 3
+    assert rec.unstable is False
+
+
+def test_neutral_floor_does_not_touch_off_axis_patches():
+    # Same config, but a pure-channel patch is NOT near-neutral ⇒ single-read default holds.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 0.0, 0.0)])
+    loop = _solo_loop(clean, t, MeasureLoopConfig(neutral_min_reads=4))
+    rec = loop.measure_patch(_patch("r", (512, 0, 0), t, 0), phase="main")
+    assert rec.reads_taken == 1
+    assert rec.immediate_remeasures == 0
+
+
+def test_dip_escalates_above_the_neutral_floor():
+    # Floor=2, but σ=0.4 @ tol 0.2 ⇒ dip_n=4. target = max(floor, dip_n) ⇒ 4, not capped at the floor.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    loop = _solo_loop(clean, t, MeasureLoopConfig(read_tolerance_de=0.2, neutral_min_reads=2),
+                      dip=_dip_for(50.0, 0.4))
+    rec = loop.measure_patch(_patch("g", (512, 512, 512), t, 0), phase="main")
+    assert rec.reads_taken == 4
+
+
+def test_neutral_floor_gated_by_luminance_skips_slow_dim_patches():
+    # A bright grey patch is floored (fast, larger σ); a dim grey patch below the nits gate is
+    # NOT (slow to read, smallest σ, thermally risky) — even though both are near-neutral.
+    t = _sdr()  # power 2.2, peak 120 nits, 10-bit
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    cfg = MeasureLoopConfig(neutral_min_reads=4, neutral_floor_min_nits=10.0)
+    loop = _solo_loop(clean, t, cfg)
+    bright = _patch("g-hi", (922, 922, 922), t, 0)   # ~0.9 signal → well above 10 nits
+    assert loop._expected_patch_nits(bright) >= 10.0
+    assert loop._read_floor_for(bright) == 4
+    dim = _patch("g-lo", (102, 102, 102), t, 0)      # ~0.1 signal → a few nits, below the gate
+    assert loop._expected_patch_nits(dim) < 10.0
+    assert loop._read_floor_for(dim) == cfg.min_reads
+
+
+def test_neutral_floor_defaults_off():
+    # Default neutral_min_reads=1 ⇒ behaviour unchanged: single read on a clean grey patch.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    loop = _solo_loop(clean, t, MeasureLoopConfig())
+    rec = loop.measure_patch(_patch("g", (512, 512, 512), t, 0), phase="main")
+    assert rec.reads_taken == 1
+
+
+# ---------------------------------------------------------------------------
 # interleaved drift reference → appended re-measure
 # ---------------------------------------------------------------------------
 

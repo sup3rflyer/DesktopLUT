@@ -501,6 +501,9 @@ class Calibration:
         enable_watchdog: bool = False,
         checkin_interval_s: float = 600.0,
         require_hardware_readiness: bool = False,
+        neutral_min_reads: Optional[int] = None,
+        neutral_chroma_span: Optional[float] = None,
+        neutral_floor_min_nits: Optional[float] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -513,6 +516,13 @@ class Calibration:
         self.display = profile.display_for(monitor)
         self.bit_depth = bit_depth if bit_depth is not None else self.display.panel.bit_depth
         self.loop_config = loop_config
+        # Near-neutral read FLOOR: guarantee the chroma-critical grey-ramp+tube region is averaged
+        # (the matrix/WB/non-additivity derivation is sensitive to single-read chromaticity noise
+        # there). Folded into the DIP-derived loop config in `_loop_config_for`; the DIP still
+        # escalates above the floor. None ⇒ leave the MeasureLoopConfig default (off).
+        self.neutral_min_reads = neutral_min_reads
+        self.neutral_chroma_span = neutral_chroma_span
+        self.neutral_floor_min_nits = neutral_floor_min_nits
         self.optimize_config = optimize_config or OptimizeConfig()
         self.characterize_config = characterize_config
         self.run_date = run_date or date.today()
@@ -1048,6 +1058,15 @@ class Calibration:
                 thr = max(thr or 0.0, dip.fluctuation_envelope)
             if thr:
                 kw["drift_threshold"] = round(thr, 6)
+        # Near-neutral read floor (chroma-critical region). Opt-in per run; the DIP still escalates
+        # ABOVE it on luminance SNR. Set independently of the DIP so it's also the no-DIP fixed-N
+        # fallback for the grey ramp + tube.
+        if self.neutral_min_reads is not None:
+            kw["neutral_min_reads"] = self.neutral_min_reads
+        if self.neutral_chroma_span is not None:
+            kw["neutral_chroma_span"] = self.neutral_chroma_span
+        if self.neutral_floor_min_nits is not None:
+            kw["neutral_floor_min_nits"] = self.neutral_floor_min_nits
         return MeasureLoopConfig(**kw)
 
     def _resolve_white_now(self) -> cp.WhitePointResolution:
@@ -3750,6 +3769,25 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "checkpoint surfaces a rich 'status — continue?' (run overview + events "
                              "since the last check-in) so a long run never goes dark. Default 600 "
                              "(10 min); live runs GATE on it, --auto/--supervised ping through; 0 disables.")
+    parser.add_argument("--neutral-min-reads", type=int, default=None, dest="neutral_min_reads",
+                        metavar="N",
+                        help="per-patch read FLOOR on near-neutral patches (grey ramp + tube): average "
+                             "at least N reads there so the chroma-critical matrix/WB/non-additivity "
+                             "region isn't biased by single-read meter noise. The DIP still escalates "
+                             "above N on luminance SNR; this is also the no-DIP fixed-N fallback. "
+                             "Default off (1).")
+    parser.add_argument("--neutral-chroma-span", type=float, default=None, dest="neutral_chroma_span",
+                        metavar="FRAC",
+                        help="near-neutral discriminator for --neutral-min-reads: a patch counts as "
+                             "near-neutral when (max-min) <= FRAC*max of its signal (default 0.35 — "
+                             "covers the 0.06/0.15 tube, excludes pure-channel/secondary ramps).")
+    parser.add_argument("--neutral-floor-min-nits", type=float, default=None, dest="neutral_floor_min_nits",
+                        metavar="NITS",
+                        help="luminance gate on --neutral-min-reads: only floor near-neutral patches at "
+                             "or above NITS expected luminance (default 0 = no gate). Dim patches have the "
+                             "smallest measured σ (averaging buys least) and are the slowest to read + most "
+                             "thermally risky (long dwell at low backlight), so gate the floor to the "
+                             "brighter, faster, larger-σ near-neutral patches.")
     parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
                         help="full flow: skip the final GS+WB tweak (deferred stage targets the "
                              "wrong layer) — runs ICC→3D-LUT as one cohesive unit (one rollback "
@@ -4027,7 +4065,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,
                         enable_watchdog=True, checkin_interval_s=args.checkin_interval,
-                        require_hardware_readiness=True)
+                        require_hardware_readiness=True,
+                        neutral_min_reads=args.neutral_min_reads,
+                        neutral_chroma_span=args.neutral_chroma_span,
+                        neutral_floor_min_nits=args.neutral_floor_min_nits)
     result = None
     paused = False
     try:
