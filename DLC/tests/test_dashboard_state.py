@@ -77,6 +77,39 @@ def test_non_neutral_read_does_not_move_white():
     assert st.snapshot(T0)["last_white"] == {}
 
 
+def test_per_patch_de_enriches_reads_and_live_header():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",
+                  luminance=120.0, gamma=2.2, white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:verify"))
+    # near-perfect white → tiny ΔE; the event-log wire + last_read carry it, the live header counts it
+    wire = st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:verify", tier="stream", seq=1,
+                         role="measurement", label="w", rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0],
+                         Y=120.0, xy=[0.3127, 0.329], ok=True))
+    assert wire["derived"]["de"] is not None and wire["derived"]["de"] < 1.0
+    snap = st.snapshot(T0)
+    assert snap["last_read"]["de"] is not None
+    assert snap["live_de"]["n"] == 1 and snap["live_de"]["metric"] == "CIEDE2000"
+    # a visibly-off red patch raises the rolling max above the near-zero white
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=1), stage="measure:verify", tier="stream",
+                  seq=2, role="measurement", label="r", rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0],
+                  Y=40.0, xy=[0.60, 0.34], ok=True))
+    snap2 = st.snapshot(T0 + timedelta(seconds=1))
+    assert snap2["live_de"]["n"] == 2 and snap2["live_de"]["max"] > 1.0
+    # a new stage clears the live ΔE window (it tracks the CURRENT stage)
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=2), stage="measure:post-mhc"))
+    assert st.snapshot(T0 + timedelta(seconds=2))["live_de"]["n"] == 0
+
+
+def test_warmup_reads_excluded_from_live_de():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", luminance=120.0, gamma=2.2,
+                  white={"xy": [0.3127, 0.329]}))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure", tier="stream", seq=0, role="warmup",
+                  rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0], Y=120.0, xy=[0.31, 0.33], ok=True))
+    assert st.snapshot(T0)["live_de"]["n"] == 0          # warm-up reads don't feed the live header
+
+
 def test_saturation_tracking_normalises_per_family():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",

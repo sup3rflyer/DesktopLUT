@@ -83,3 +83,67 @@ def test_neutral_metrics_shape_is_stable():
     assert ok["cct"] is not None
     bad = neutral_metrics(0.0, 0.0)
     assert bad == {"cct": None, "duv": None}
+
+
+# ---------------------------------------------------------------------------
+# Per-patch ΔE must MATCH the spine's scorer (the dashboard monitor is only useful
+# if its numbers agree with the authoritative metrics_scored). Cross-validate the
+# dependency-free dashboard ΔE against dlc.metrics (SDR) and the engine (HDR).
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from dlc.dashboard.colorimetry import patch_delta_e
+
+_D65 = (0.3127, 0.3290)
+_SIGS = [(1.0, 1.0, 1.0), (0.5, 0.5, 0.5), (0.25, 0.25, 0.25),
+         (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0),
+         (0.75, 0.3, 0.3), (0.6, 0.6, 0.2), (0.2, 0.5, 0.8)]
+
+
+def _xy(xyz):
+    s = sum(xyz)
+    return (xyz[0] / s, xyz[1] / s) if s > 0 else (0.0, 0.0)
+
+
+def test_patch_delta_e_sdr_matches_metrics_ciede2000():
+    # Build a tinted-measured sample set, score it with the spine's SDR scorer, and confirm the
+    # dashboard's per-patch CIEDE2000 reproduces each value (identical formula → near bit-exact).
+    from dlc.mhc import Ti3Sample
+    from dlc.metrics import score_samples, target_xyz_for_rgb, npm_for_white
+    L, gamma = 120.0, 2.2
+    npm = npm_for_white(_D65)
+    samples = []
+    for i, sig in enumerate(_SIGS):
+        ideal = target_xyz_for_rgb(sig, L, gamma, npm)
+        gain = 1.0 + 0.06 * math.sin(i)                 # a per-patch tint so dE is nonzero + varied
+        meas = (ideal[0] * gain, ideal[1] * (1.0 / gain), ideal[2] * (1.0 + 0.03 * math.cos(i)))
+        samples.append(Ti3Sample(rgb=sig, xyz=meas))
+    metrics, _lum = score_samples(samples, luminance=L, gamma=gamma, white_xy=_D65)
+    for m in metrics:
+        x, y = _xy(m.measured_xyz)
+        got = patch_delta_e(m.rgb, x, y, m.measured_xyz[1], is_hdr=False,
+                            white_xy=_D65, luminance=L, gamma=gamma)
+        assert got == pytest.approx(m.de2000, abs=1e-4), (m.rgb, got, m.de2000)
+
+
+def test_patch_delta_e_hdr_matches_engine_de_itp():
+    pytest.importorskip("numpy")
+    pytest.importorskip("colour")
+    from dlc.mhc import Ti3Sample
+    from dlc.metrics import score_samples_hdr
+    from dlc.engine.model import score_hdr
+    sigs = [s for s in _SIGS]
+    ideal = score_hdr(sigs, [(1.0, 1.0, 1.0)] * len(sigs), white_xy=_D65)["ideal_xyz"]
+    samples = []
+    for i, sig in enumerate(sigs):
+        ix, iy, iz = (float(c) for c in ideal[i])
+        gain = 1.0 + 0.05 * math.sin(i + 1)
+        meas = (ix * gain, iy * (1.0 / gain), iz * (1.0 + 0.04 * math.cos(i)))
+        samples.append(Ti3Sample(rgb=sig, xyz=meas))
+    metrics, _ = score_samples_hdr(samples, white_xy=_D65, peak_nits=1000.0)
+    for m in metrics:
+        x, y = _xy(m.measured_xyz)
+        got = patch_delta_e(m.rgb, x, y, m.measured_xyz[1], is_hdr=True, white_xy=_D65)
+        # dependency-free ICtCp vs colour.XYZ_to_ICtCp: agree to well under 1 JND.
+        assert got == pytest.approx(m.de2000, abs=0.5), (m.rgb, got, m.de2000)

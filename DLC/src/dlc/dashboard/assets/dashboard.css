@@ -97,6 +97,9 @@ body {
 .bignum { background: var(--panel-2); border-radius: 5px; padding: 5px 3px; text-align: center; }
 .bignum b { display: block; font-family: var(--mono); font-size: 15px; }
 .bignum label { color: var(--ink-faint); font-size: 9px; text-transform: uppercase; }
+.de-live { display: flex; align-items: baseline; gap: 5px; margin-bottom: 6px; font-size: 11px; color: var(--ink-dim); }
+.de-live b { font-family: var(--mono); font-size: 14px; }
+.de-live .de-live-n { margin-left: auto; color: var(--ink-faint); font-size: 10px; }
 .de-split { display: flex; gap: 10px; border-top: 1px solid var(--edge); padding-top: 4px; }
 .de-split .kv { flex: 1; flex-direction: column; align-items: flex-start; }
 /* live patch card */

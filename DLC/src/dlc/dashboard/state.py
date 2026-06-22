@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
-from .colorimetry import neutral_metrics, planckian_locus_xy
+from .colorimetry import neutral_metrics, patch_delta_e, planckian_locus_xy
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
 _SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
@@ -194,6 +194,9 @@ class DashboardState:
     # -- live colour readout (enriched here from patch xy) -------------------
     last_white: dict[str, Any] = field(default_factory=dict)
     last_read: dict[str, Any] = field(default_factory=dict)
+    # rolling per-patch ΔE (computed live here vs each patch's target; the LIVE header reading,
+    # distinct from the per-stage authoritative `de` from metrics_scored). Reset per stage.
+    _live_de: Deque[float] = field(default_factory=lambda: deque(maxlen=128))
 
     # -- optimizer / seams / anomalies / stall ------------------------------
     optimizer: dict[str, Any] = field(default_factory=dict)
@@ -256,6 +259,7 @@ class DashboardState:
             # patch counter restarts at ~0, so an ETA computed across the reset is garbage.
             self._mark_progress(ev.time)
             self._progress_marks.clear()
+            self._live_de.clear()       # the live ΔE header tracks the CURRENT stage's patches
             self._clear_alarm()
         elif name == Ev.STAGE_ABORTED:
             # keep self.stage as the failing stage for the header
@@ -345,16 +349,54 @@ class DashboardState:
             self._mark_progress(ev.time)   # a good read is forward progress
             self._clear_alarm()
             self._accumulate_charts(ev, data, float(xy[0]), float(xy[1]), Y, enriched)
+        de = self._patch_delta_e(data) if (ok and has_xy) else None
         self.last_read = {
             "seq": data.get("seq"), "role": data.get("role"), "label": data.get("label"),
             "rgb": data.get("rgb"), "signal": data.get("signal"), "Y": Y, "xy": xy, "ok": ok,
-            "neutral": _is_neutral(data.get("rgb")),
+            "neutral": _is_neutral(data.get("rgb")), "de": de,
             "disposition": data.get("disposition"), **enriched,
         }
+        # Rolling live ΔE (header reading): only settled MEASUREMENT reads, not warm-up/probe.
+        if de is not None and data.get("role") not in ("warmup", "probe") \
+                and data.get("disposition") != "probe":
+            self._live_de.append(de)
         # The most recent neutral read drives the live white-point readout (needs a usable xy
         # so the readout shape stays consistent with the enrichment gate above).
         if ok and has_xy and _is_neutral(data.get("rgb")):
             self.last_white = {"xy": xy, "Y": Y, "rgb": data.get("rgb"), **enriched}
+
+    def _live_de_summary(self) -> dict[str, Any]:
+        """Rolling per-patch ΔE for the LIVE header (current stage). avg/max over the window +
+        the run's metric label, so the header updates every patch (distinct from the per-stage
+        authoritative ``de`` from metrics_scored)."""
+        vals = list(self._live_de)
+        metric = "dE_ITP" if _is_hdr_header(self.header) else "CIEDE2000"
+        if not vals:
+            return {"avg": None, "max": None, "n": 0, "metric": metric}
+        return {"avg": round(sum(vals) / len(vals), 3), "max": round(max(vals), 3),
+                "n": len(vals), "metric": metric}
+
+    def _patch_delta_e(self, data: dict[str, Any]) -> Optional[float]:
+        """Per-patch ΔE vs the patch's ideal target at the resolved white — dE_ITP for HDR,
+        CIEDE2000 for SDR (dashboard.colorimetry.patch_delta_e, cross-validated against the
+        spine's scorer). Needs the patch's normalised ``signal`` + a good xy/Y; ``None`` otherwise."""
+        xy, Y, sig = data.get("xy"), data.get("Y"), data.get("signal")
+        if not (xy and len(xy) >= 2 and Y is not None and sig and len(sig) >= 3):
+            return None
+        x, y = _as_float(xy[0]), _as_float(xy[1])
+        big_y = _as_float(Y)
+        if x is None or y is None or big_y is None:
+            return None
+        white = (self.header.get("white") or {}).get("xy") or (0.3127, 0.3290)
+        lum = _as_float(self.header.get("luminance"))
+        gamma = _as_float(self.header.get("gamma")) or 2.2
+        try:
+            de = patch_delta_e([float(c) for c in sig[:3]], x, y, big_y,
+                               is_hdr=_is_hdr_header(self.header), white_xy=white,
+                               luminance=lum, gamma=gamma)
+        except Exception:  # noqa: BLE001 — a monitoring number must never break ingest
+            return None
+        return round(de, 3) if de is not None else None
 
     def _elapsed_at(self, iso: Optional[str]) -> Optional[float]:
         t, start = _parse_iso(iso), _parse_iso(self.run_started_iso)
@@ -583,7 +625,11 @@ class DashboardState:
             if data.get("ok") and xy and len(xy) >= 2:
                 x, y = _as_float(xy[0]), _as_float(xy[1])
                 if x is not None and y is not None:
-                    out["derived"] = neutral_metrics(x, y)
+                    derived = neutral_metrics(x, y)
+                    de = self._patch_delta_e(data)        # per-patch ΔE for the event log
+                    if de is not None:
+                        derived["de"] = de
+                    out["derived"] = derived
         return out
 
     # ----------------------------------------------------------------------
@@ -720,6 +766,7 @@ class DashboardState:
             },
             "de": self.de,
             "de_history": self.de_history,
+            "live_de": self._live_de_summary(),
             "last_white": self.last_white,
             "last_read": self.last_read,
             "optimizer": self.optimizer,

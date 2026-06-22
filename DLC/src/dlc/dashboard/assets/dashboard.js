@@ -84,6 +84,10 @@ function renderLivePatch(lr, header) {
   sw.classList.toggle("nok", !ok);
   $("lp-xy").textContent = ok ? `${num(lr.xy[0], 4)}, ${num(lr.xy[1], 4)}` : "—";
   $("lp-Y").textContent = (lr.Y != null) ? num(lr.Y, 2) : "—";
+  // per-patch ΔE vs target (all patches), coloured by quality; label tracks the run metric
+  $("lp-de-label").textContent = deMetricLabel((lastState && lastState.live_de && lastState.live_de.metric)
+    || (lastState && lastState.de && lastState.de.metric));
+  setDe("lp-de", lr.de);
   // CCT / Duv only make sense for a grayscale patch (a saturated colour has no meaningful CCT).
   const neutral = !!lr.neutral;
   document.querySelectorAll(".rcard-patch .lp-neutral").forEach((el) => el.classList.toggle("off", !neutral));
@@ -184,8 +188,13 @@ function renderState(s) {
   // dE big-numbers (from the scoring stage). The metric label tracks the run (dE_ITP for HDR,
   // CIEDE2000 for SDR) so the distinction is explicit, not assumed.
   const de = s.de || {};
-  $("de-metric").textContent = deMetricLabel(de.metric);
+  const liveMetric = (s.live_de && s.live_de.metric) || de.metric;
+  $("de-metric").textContent = deMetricLabel(liveMetric);
   $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
+  // live rolling per-patch ΔE (updates every read) — the "much more live" header reading
+  const ld = s.live_de || {};
+  setDe("de-live-avg", ld.avg); setDe("de-live-max", ld.max);
+  $("de-live-n").textContent = ld.n ? `${ld.n} patch${ld.n === 1 ? "" : "es"}` : "";
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
   setDe("de-white", de.white);
   setDe("de-gray", de.grayscale); setDe("de-colour", de.colour);
@@ -232,7 +241,7 @@ function fmtMsg(ev) {
       const neutral = Array.isArray(d.rgb) && d.rgb.length >= 3
         && d.rgb[0] === d.rgb[1] && d.rgb[1] === d.rgb[2] && d.rgb[0] > 0;
       const cct = (neutral && der.cct) ? ` ${kv("cct", Math.round(der.cct) + "K")}` : "";
-      const de = (d.de != null) ? ` ${kv("ΔE", num(d.de, 2))}` : "";
+      const de = (der.de != null) ? ` ${kv("ΔE", num(der.de, 2))}` : "";
       return `${esc(d.role || "")} ${esc(d.label || "")} ${kv("rgb", rgb)} ${kv("Y", num(d.Y, 2))} ${kv("xy", xy)}${cct}${de} ${okc}`;
     }
     case "progress": return `${kv("patches", (d.patches_done || 0) + "/" + (d.patches_total || 0))} ${kv("reads", d.reads || 0)}`;

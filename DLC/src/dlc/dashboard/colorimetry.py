@@ -15,7 +15,9 @@ which is exactly the regime a display calibration lives in.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
+
+from ..colormath import invert3x3, matvec, rgb_to_xyz_matrix
 
 # Robertson's 31 isotemperature lines (Wyszecki & Stiles, Table 1(3.11)). Columns:
 # reciprocal megakelvin (mired, i.e. 1e6 / T), CIE 1960 UCS u, v, and the slope of the
@@ -129,6 +131,163 @@ def planckian_locus_xy() -> list[Tuple[float, float]]:
     """The Planckian locus as CIE 1931 ``xy`` points (from the Robertson table, warm→cool),
     for the dashboard's CIE chart. Stdlib-only, so the chart needs no colour-science."""
     return [uv60_to_xy(u, v) for (_mired, u, v, _t) in reversed(_ROBERTSON)]
+
+
+# ---------------------------------------------------------------------------
+# Per-patch ΔE — dependency-free, CROSS-VALIDATED against dlc.metrics (SDR CIEDE2000)
+# and dlc.engine.model.score_hdr (HDR dE_ITP) in tests. The authoritative dE still rides
+# the spine as metrics_scored at verify; this is the LIVE per-patch monitor the event log,
+# the Live Patch tile, and the rolling-ΔE header read, so it must MATCH the engine's numbers.
+# ---------------------------------------------------------------------------
+
+_SRGB_PRIMARIES = ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))
+_REC2020_PRIMARIES = ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046))
+_D65_XY = (0.3127, 0.3290)
+
+# ST 2084 (verbatim from mhc.cpp / dlc.mhc_cube — pinned against colour.eotf_ST2084 in tests).
+_PQ_M1, _PQ_M2 = 0.1593017578125, 78.84375
+_PQ_C1, _PQ_C2, _PQ_C3 = 0.8359375, 18.8515625, 18.6875
+
+# BT.2100/2124 ICtCp matrices (Dolby 2016) — the exact constants colour.XYZ_to_ICtCp uses.
+_M_BT2020_RGB_TO_LMS = [[1688 / 4096, 2146 / 4096, 262 / 4096],
+                        [683 / 4096, 2951 / 4096, 462 / 4096],
+                        [99 / 4096, 309 / 4096, 3688 / 4096]]
+_M_LMS_P_TO_ICTCP = [[2048 / 4096, 2048 / 4096, 0.0],
+                     [6610 / 4096, -13613 / 4096, 7003 / 4096],
+                     [17933 / 4096, -17390 / 4096, -543 / 4096]]
+# XYZ (absolute cd/m²) → BT.2020 linear RGB (D65); BT.2020 white IS D65 so no chromatic adapt.
+_XYZ_TO_BT2020 = invert3x3(rgb_to_xyz_matrix(
+    _REC2020_PRIMARIES[0][0], _REC2020_PRIMARIES[0][1], _REC2020_PRIMARIES[1][0],
+    _REC2020_PRIMARIES[1][1], _REC2020_PRIMARIES[2][0], _REC2020_PRIMARIES[2][1],
+    _D65_XY[0], _D65_XY[1], white_Y=1.0))
+_DE_ITP_SCALE = 720.0
+
+
+def _pq_eotf_norm(s: float) -> float:
+    """PQ signal (0..1) → linear light normalised to 10000 nits (0..1)."""
+    vm = max(s, 0.0) ** (1.0 / _PQ_M2)
+    t = max(vm - _PQ_C1, 0.0) / max(_PQ_C2 - _PQ_C3 * vm, 1e-10)
+    return t ** (1.0 / _PQ_M1)
+
+
+def _pq_oetf_norm(y: float) -> float:
+    """Linear light (0..1 over 10000 nits) → PQ signal (0..1)."""
+    ym = max(y, 0.0) ** _PQ_M1
+    return ((_PQ_C1 + _PQ_C2 * ym) / (1.0 + _PQ_C3 * ym)) ** _PQ_M2
+
+
+def measured_xyz(x: float, y: float, big_y: float) -> tuple[float, float, float]:
+    """Absolute XYZ from chromaticity ``xy`` + luminance ``Y`` (the dashboard has xy + Y per read)."""
+    if y <= 0:
+        return (0.0, 0.0, 0.0)
+    return (big_y * x / y, big_y, big_y * (1.0 - x - y) / y)
+
+
+def xyz_to_lab(xyz: Sequence[float], white: Sequence[float]) -> tuple[float, float, float]:
+    """CIE XYZ → L*a*b* against ``white`` (port of dlc.metrics.xyz_to_lab; clamps negatives)."""
+    eps, kappa = 216 / 24389, 24389 / 27
+
+    def f(v: float) -> float:
+        return v ** (1 / 3) if v > eps else (kappa * v + 16) / 116
+    xr = max(0.0, xyz[0] / white[0]) if white[0] else 0.0
+    yr = max(0.0, xyz[1] / white[1]) if white[1] else 0.0
+    zr = max(0.0, xyz[2] / white[2]) if white[2] else 0.0
+    fx, fy, fz = f(xr), f(yr), f(zr)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def _hue_angle(a: float, b: float) -> float:
+    if a == 0 and b == 0:
+        return 0.0
+    ang = math.degrees(math.atan2(b, a))
+    return ang + 360 if ang < 0 else ang
+
+
+def delta_e2000(lab1: Sequence[float], lab2: Sequence[float]) -> float:
+    """CIEDE2000 (port of dlc.metrics.delta_e2000 — identical formula, kept dependency-free)."""
+    l1, a1, b1 = lab1
+    l2, a2, b2 = lab2
+    c1, c2 = math.hypot(a1, b1), math.hypot(a2, b2)
+    c_bar = (c1 + c2) / 2
+    g = 0.5 * (1 - math.sqrt((c_bar ** 7) / ((c_bar ** 7) + (25 ** 7)))) if c_bar else 0.0
+    ap1, ap2 = (1 + g) * a1, (1 + g) * a2
+    cp1, cp2 = math.hypot(ap1, b1), math.hypot(ap2, b2)
+    hp1, hp2 = _hue_angle(ap1, b1), _hue_angle(ap2, b2)
+    delta_lp = l2 - l1
+    delta_cp = cp2 - cp1
+    if cp1 * cp2 == 0:
+        delta_hp = 0.0
+    else:
+        diff = hp2 - hp1
+        diff = diff - 360 if diff > 180 else (diff + 360 if diff < -180 else diff)
+        delta_hp = diff
+    delta_hp_term = 2 * math.sqrt(cp1 * cp2) * math.sin(math.radians(delta_hp / 2))
+    l_bar = (l1 + l2) / 2
+    cp_bar = (cp1 + cp2) / 2
+    if cp1 * cp2 == 0:
+        hp_bar = hp1 + hp2
+    else:
+        diff = abs(hp1 - hp2)
+        if diff <= 180:
+            hp_bar = (hp1 + hp2) / 2
+        elif hp1 + hp2 < 360:
+            hp_bar = (hp1 + hp2 + 360) / 2
+        else:
+            hp_bar = (hp1 + hp2 - 360) / 2
+    t = (1 - 0.17 * math.cos(math.radians(hp_bar - 30)) + 0.24 * math.cos(math.radians(2 * hp_bar))
+         + 0.32 * math.cos(math.radians(3 * hp_bar + 6)) - 0.20 * math.cos(math.radians(4 * hp_bar - 63)))
+    delta_theta = 30 * math.exp(-(((hp_bar - 275) / 25) ** 2))
+    rc = 2 * math.sqrt((cp_bar ** 7) / ((cp_bar ** 7) + (25 ** 7))) if cp_bar else 0.0
+    sl = 1 + ((0.015 * ((l_bar - 50) ** 2)) / math.sqrt(20 + ((l_bar - 50) ** 2)))
+    sc = 1 + 0.045 * cp_bar
+    sh = 1 + 0.015 * cp_bar * t
+    rt = -math.sin(math.radians(2 * delta_theta)) * rc
+    value = ((delta_lp / sl) ** 2 + (delta_cp / sc) ** 2 + (delta_hp_term / sh) ** 2
+             + rt * (delta_cp / sc) * (delta_hp_term / sh))
+    return math.sqrt(max(0.0, value))
+
+
+def _xyz_to_ictcp(xyz_abs: Sequence[float]) -> tuple[float, float, float]:
+    """Absolute XYZ (cd/m²) → ICtCp (BT.2124, Dolby 2016) — matches colour.XYZ_to_ICtCp."""
+    # NB: do NOT clamp the BT.2020 RGB to >=0 — colour.XYZ_to_ICtCp lets out-of-gamut (negative)
+    # RGB flow through to LMS (the M1 mix often keeps LMS positive); only the PQ stage clamps
+    # negative light. Clamping RGB here diverges from the engine on saturated/out-of-gamut patches.
+    rgb = matvec(_XYZ_TO_BT2020, xyz_abs)
+    lms = matvec(_M_BT2020_RGB_TO_LMS, rgb)
+    lms_p = [_pq_oetf_norm(max(0.0, c) / 10000.0) for c in lms]
+    return tuple(matvec(_M_LMS_P_TO_ICTCP, lms_p))  # type: ignore[return-value]
+
+
+def _npm(primaries: tuple, white_xy: Sequence[float]) -> list[list[float]]:
+    (rx, ry), (gx, gy), (bx, by) = primaries
+    return rgb_to_xyz_matrix(rx, ry, gx, gy, bx, by, white_xy[0], white_xy[1], white_Y=1.0)
+
+
+def patch_delta_e(signal: Sequence[float], x: float, y: float, big_y: float, *,
+                  is_hdr: bool, white_xy: Sequence[float] = _D65_XY,
+                  luminance: Optional[float] = None, gamma: float = 2.2
+                  ) -> Optional[float]:
+    """The per-patch ΔE of a measured patch vs its ideal target at the resolved white:
+    **dE_ITP** (BT.2124) for HDR, **CIEDE2000** for SDR — the same metrics the spine scores
+    with. ``signal`` is the patch's normalised RGB; ``(x,y,big_y)`` its measured chromaticity +
+    luminance (cd/m²). Returns ``None`` when it can't be computed (degenerate read / no luminance)."""
+    if big_y is None or big_y <= 0 or not signal or len(signal) < 3:
+        return None
+    meas = measured_xyz(x, y, big_y)
+    wx, wy = white_xy[0], white_xy[1]
+    if is_hdr:
+        npm = _npm(_REC2020_PRIMARIES, white_xy)
+        nits = [_pq_eotf_norm(max(0.0, min(1.0, s))) * 10000.0 for s in signal[:3]]
+        ideal = matvec(npm, nits)                                  # absolute XYZ (RGB_to_XYZ·10000)
+        d = [a - b for a, b in zip(_xyz_to_ictcp(meas), _xyz_to_ictcp(ideal))]
+        return _DE_ITP_SCALE * math.sqrt(sum(c * c for c in d))
+    if luminance is None or luminance <= 0:
+        return None
+    npm = _npm(_SRGB_PRIMARIES, white_xy)
+    linear = [max(0.0, min(1.0, s)) ** gamma for s in signal[:3]]
+    ideal = [luminance * v for v in matvec(npm, linear)]
+    white = (wx / wy * luminance, luminance, (1.0 - wx - wy) / wy * luminance)
+    return delta_e2000(xyz_to_lab(meas, white), xyz_to_lab(ideal, white))
 
 
 def neutral_metrics(x: float, y: float) -> dict:
