@@ -26,8 +26,8 @@ struct DwmHookMonitorConfig {
     // Tonemap (HDR only)
     uint32_t tonemapEnabled;
     DwmHookTonemapCurve tonemapCurve;
-    float    sourcePeakNits;         // Static source peak
-    float    targetPeakNits;         // Display peak
+    float    sourcePeakNits;         // Tonemap INPUT peak (static source). WIRE CONTRACT: offset-checked
+    float    targetPeakNits;         // Tonemap OUTPUT peak (display). in test_displayconfig.cpp. docs/NAMING.md §1.
     uint32_t dynamicPeak;            // 0=static, 1=dynamic
 
     uint32_t _pad[1];               // Align to 48 bytes

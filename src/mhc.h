@@ -20,7 +20,8 @@ struct MHC2ProfileParams {
     GrayscaleData grayscale;
     bool grayscaleEnabled = false;
     bool isHDR = false;
-    float peakNits = 1000.0f;             // For HDR luminance metadata + grayscale scaling
+    float peakNits = 1000.0f;             // Dual-use config input: HDR luminance METADATA (MaxCLL) +
+                                          //   grayscale curve scaling for LUT gen. NOT a measured peak. docs/NAMING.md §1.
 
     // Per-channel TRC from ICC file (when set, overrides grayscale for LUT generation)
     // Each vector holds the display's measured transfer curve: signal(0-1) → linear(0-1)
@@ -32,7 +33,9 @@ struct MHC2ProfileParams {
     std::vector<float> corrR, corrG, corrB;
     bool hasPrecomputedCorrection = false;
 
-    // White balance gains baked into matrix (von Kries diagonal in wire RGB space)
+    // MHC white balance gains baked into matrix (von Kries diagonal in wire RGB space),
+    // derived from MHCSettings::whiteBalanceWx/Wy. Distinct from the Corrections-tab
+    // ColorCorrectionData::whiteBalanceGains (a different layer). See docs/NAMING.md §3.
     float whiteBalanceGains[3] = {1.0f, 1.0f, 1.0f};
 
     // Desktop gamma: sRGB->2.2 baked into HDR 1D LUT

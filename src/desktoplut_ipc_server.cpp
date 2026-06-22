@@ -430,6 +430,9 @@ void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
 // ===========================================================================
 void HandleStateGet(JsonValue& result) {
     result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
+    // WIRE CONTRACT (consumed by DLC). Mirrors the OVERLAY-active flag, NOT the DWM-hook state:
+    // reads false in hook mode even while a cube is live. Judge hook-mode liveness by cube_path
+    // + hook health, not this field. See docs/NAMING.md §4.
     result.set("corrections_enabled", JBool(g_shaderCorrectionsActive.load()));
     {
         std::lock_guard<std::mutex> lk(g_calibMutex);
@@ -702,7 +705,7 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
         //  * source ICC/1D-cube import: while set, primaries+TRC come from the FILE and
         //    the DLC's set_primaries is ignored — clear it so the manual path is used.
         mhc.whiteBalanceEnabled = false;
-        mhc.grayscale.enabled = false;
+        mhc.baseGrayscale.enabled = false;
         mhc.correctionGrayscale.enabled = false;
         mhc.sourceFilePath.clear();
         mhc.hasPerChannelTRC = false;
@@ -832,7 +835,7 @@ void DoMhcSetGrayscale(const JsonValue& p, JsonValue& result, std::string& error
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        ApplyGrayscalePayload(correction ? m.correctionGrayscale : m.grayscale, p);
+        ApplyGrayscalePayload(correction ? m.correctionGrayscale : m.baseGrayscale, p);
     }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("mhc", JObj());
@@ -869,8 +872,8 @@ void DoMhcSetBaseLut(const JsonValue& p, JsonValue& result, std::string& error) 
         m.sourceFilePath = cube;
         m.sourceIs1DCube = true;
         m.hasPerChannelTRC = false;
-        m.grayscale.enabled = true;            // base grayscale now comes from the cube
-        if (peakNits > 0.0) m.grayscale.peakNits = (float)peakNits;
+        m.baseGrayscale.enabled = true;            // base grayscale now comes from the cube
+        if (peakNits > 0.0) m.baseGrayscale.peakNits = (float)peakNits;
     }
     JsonValue mo = JObj();
     mo.set("source_is_1d_cube", JBool(true));

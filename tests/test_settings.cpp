@@ -257,8 +257,8 @@ TEST_CASE("CC settings: 24Gamma not persisted (moved to MHC)") {
 TEST_CASE("MHC settings: default round-trip") {
     TempIni ini;
     MHCSettings original;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
 
     SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
@@ -274,8 +274,8 @@ TEST_CASE("MHC settings: with profile path") {
     MHCSettings original;
     original.enabled = true;
     original.profilePath = L"C:\\test\\profile.icm";
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
 
     SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
@@ -291,8 +291,8 @@ TEST_CASE("MHC settings: with source file") {
     MHCSettings original;
     original.sourceFilePath = L"D:\\calibration\\test.cube";
     original.sourceIs1DCube = true;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
 
     SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
@@ -309,8 +309,8 @@ TEST_CASE("MHC settings: with metadata") {
     original.metaPrimaries = L"P3-D65";
     original.metaGamma = L"2.2";
     original.metaPeakNits = 1000.0f;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
 
     SaveMHCSettings(L"TestMon", L"HDR_", original, ini.c_str());
 
@@ -327,8 +327,8 @@ TEST_CASE("MHC settings: with primaries") {
     MHCSettings original;
     original.primariesEnabled = true;
     original.customPrimaries = {0.6800f, 0.3200f, 0.2650f, 0.6900f, 0.1500f, 0.0600f, 0.3127f, 0.3290f, L"Custom"};
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
 
     SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
@@ -468,28 +468,28 @@ TEST_CASE("MHC settings: grayscale points round-trip") {
     TempIni ini;
     MHCSettings original;
     original.enabled = true;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
-    original.grayscale.points[5] = 0.123f;
-    original.grayscale.points[10] = 0.456f;
-    original.grayscale.enabled = true;
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
+    original.baseGrayscale.points[5] = 0.123f;
+    original.baseGrayscale.points[10] = 0.456f;
+    original.baseGrayscale.enabled = true;
 
     SaveMHCSettings(L"TestMon", L"SDR_", original, ini.c_str());
 
     MHCSettings loaded;
     LoadMHCSettings(L"TestMon", L"SDR_", loaded, ini.c_str());
 
-    CHECK(loaded.grayscale.enabled == true);
-    CHECK(loaded.grayscale.pointCount == 20);
-    CHECK(loaded.grayscale.points[5] == doctest::Approx(0.123f).epsilon(0.001));
-    CHECK(loaded.grayscale.points[10] == doctest::Approx(0.456f).epsilon(0.001));
+    CHECK(loaded.baseGrayscale.enabled == true);
+    CHECK(loaded.baseGrayscale.pointCount == 20);
+    CHECK(loaded.baseGrayscale.points[5] == doctest::Approx(0.123f).epsilon(0.001));
+    CHECK(loaded.baseGrayscale.points[10] == doctest::Approx(0.456f).epsilon(0.001));
 }
 
 TEST_CASE("MHC settings: white balance round-trip") {
     TempIni ini;
     MHCSettings original;
-    original.grayscale.pointCount = 20;
-    original.grayscale.initLinear();
+    original.baseGrayscale.pointCount = 20;
+    original.baseGrayscale.initLinear();
     original.whiteBalanceEnabled = true;
     original.whiteBalanceWx = 0.3100f;
     original.whiteBalanceWy = 0.3200f;

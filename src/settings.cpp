@@ -156,15 +156,15 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
         mhc.customPrimaries.Wx, mhc.customPrimaries.Wy, iniPath);
 
     // MHC's own grayscale settings
-    WritePrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), mhc.grayscale.enabled, iniPath);
+    WritePrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), mhc.baseGrayscale.enabled, iniPath);
     wchar_t pointsBuf[8];
-    swprintf_s(pointsBuf, L"%d", mhc.grayscale.pointCount);
+    swprintf_s(pointsBuf, L"%d", mhc.baseGrayscale.pointCount);
     WritePrivateProfileStringW(section, (p + L"MHCGrayscalePoints").c_str(), pointsBuf, iniPath);
 
     std::wstring grayscaleData;
-    for (size_t j = 0; j < mhc.grayscale.points.size(); j++) {
+    for (size_t j = 0; j < mhc.baseGrayscale.points.size(); j++) {
         wchar_t val[16];
-        _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), mhc.grayscale.points[j]);
+        _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), mhc.baseGrayscale.points[j]);
         if (j > 0) grayscaleData += L"; ";
         grayscaleData += val;
     }
@@ -174,7 +174,7 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     {
         const wchar_t* devSuffix[] = { L"MHCGrayscaleDevR", L"MHCGrayscaleDevG", L"MHCGrayscaleDevB" };
         for (int ch = 0; ch < 3; ch++) {
-            auto& dev = mhc.grayscale.rgbDeviations[ch];
+            auto& dev = mhc.baseGrayscale.rgbDeviations[ch];
             if (!dev.empty()) {
                 std::wstring devData;
                 for (size_t j = 0; j < dev.size(); j++) {
@@ -189,9 +189,9 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
 
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
     if (isHDR) {
-        WritePrivateProfileFloat(section, (p + L"MHCGrayscalePeak").c_str(), mhc.grayscale.peakNits, iniPath);
+        WritePrivateProfileFloat(section, (p + L"MHCGrayscalePeak").c_str(), mhc.baseGrayscale.peakNits, iniPath);
     } else {
-        WritePrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), mhc.grayscale.use24Gamma, iniPath);
+        WritePrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), mhc.baseGrayscale.use24Gamma, iniPath);
     }
 
     // White balance settings
@@ -306,40 +306,40 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
 
     // MHC's own grayscale
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
-    mhc.grayscale.enabled = GetPrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), false, iniPath);
+    mhc.baseGrayscale.enabled = GetPrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), false, iniPath);
     int points = GetPrivateProfileIntW(section, (p + L"MHCGrayscalePoints").c_str(), 20, iniPath);
-    mhc.grayscale.pointCount = (points == 10 || points == 20 || points == 32) ? points : 20;
+    mhc.baseGrayscale.pointCount = (points == 10 || points == 20 || points == 32) ? points : 20;
 
     wchar_t grayscaleData[1024] = {};
     GetPrivateProfileStringW(section, (p + L"MHCGrayscaleData").c_str(), L"", grayscaleData, 1024, iniPath);
-    mhc.grayscale.points.clear();
+    mhc.baseGrayscale.points.clear();
     if (grayscaleData[0] != L'\0') {
         wchar_t* ctx = nullptr;
         wchar_t* token = wcstok_s(grayscaleData, L";", &ctx);
         while (token) {
             while (*token == L' ' || *token == L'\t') token++;
-            mhc.grayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
+            mhc.baseGrayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
             token = wcstok_s(nullptr, L";", &ctx);
         }
     }
     // Reinitialize on a count mismatch OR any corrupt value (NaN/Inf/out-of-[0,1]) — a
     // hand-edited or truncated INI must not feed garbage into MHC LUT generation.
-    bool gsNeedsReinit = mhc.grayscale.points.empty() ||
-                         (int)mhc.grayscale.points.size() != mhc.grayscale.pointCount;
+    bool gsNeedsReinit = mhc.baseGrayscale.points.empty() ||
+                         (int)mhc.baseGrayscale.points.size() != mhc.baseGrayscale.pointCount;
     if (!gsNeedsReinit) {
-        for (float v : mhc.grayscale.points) {
+        for (float v : mhc.baseGrayscale.points) {
             if (!std::isfinite(v) || v < 0.0f || v > 1.0f) { gsNeedsReinit = true; break; }
         }
     }
     if (gsNeedsReinit) {
-        if (!mhc.grayscale.points.empty()) {
+        if (!mhc.baseGrayscale.points.empty()) {
             std::wcerr << L"Warning: " << section << L"/" << p
                        << L"MHCGrayscaleData invalid (count/NaN/range), reinitializing to linear"
                        << std::endl;
         }
-        mhc.grayscale.points.resize(mhc.grayscale.pointCount);
-        if (isHDR) mhc.grayscale.initLinearPQ();
-        else mhc.grayscale.initLinear();
+        mhc.baseGrayscale.points.resize(mhc.baseGrayscale.pointCount);
+        if (isHDR) mhc.baseGrayscale.initLinearPQ();
+        else mhc.baseGrayscale.initLinear();
     }
 
     // Load per-channel RGB deviations for MHC grayscale
@@ -348,35 +348,35 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         for (int ch = 0; ch < 3; ch++) {
             wchar_t devBuf[1024] = {};
             GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf, 1024, iniPath);
-            mhc.grayscale.rgbDeviations[ch].clear();
+            mhc.baseGrayscale.rgbDeviations[ch].clear();
             if (devBuf[0] != L'\0') {
                 wchar_t* ctx2 = nullptr;
                 wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
                 while (token) {
                     while (*token == L' ' || *token == L'\t') token++;
-                    mhc.grayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
+                    mhc.baseGrayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
                     token = wcstok_s(nullptr, L";", &ctx2);
                 }
             }
-            bool devValid = !mhc.grayscale.rgbDeviations[ch].empty() &&
-                            (int)mhc.grayscale.rgbDeviations[ch].size() == mhc.grayscale.pointCount;
+            bool devValid = !mhc.baseGrayscale.rgbDeviations[ch].empty() &&
+                            (int)mhc.baseGrayscale.rgbDeviations[ch].size() == mhc.baseGrayscale.pointCount;
             if (devValid) {
-                for (float v : mhc.grayscale.rgbDeviations[ch]) {
+                for (float v : mhc.baseGrayscale.rgbDeviations[ch]) {
                     // Per-channel gains; reject NaN/Inf and absurd magnitudes.
                     if (!std::isfinite(v) || v < 0.0f || v > 8.0f) { devValid = false; break; }
                 }
             }
             if (!devValid) {
-                mhc.grayscale.rgbDeviations[ch].assign(mhc.grayscale.pointCount, 1.0f);
+                mhc.baseGrayscale.rgbDeviations[ch].assign(mhc.baseGrayscale.pointCount, 1.0f);
             }
         }
     }
 
     if (isHDR) {
         float peakNits = GetPrivateProfileFloat(section, (p + L"MHCGrayscalePeak").c_str(), 10000.0f, iniPath);
-        mhc.grayscale.peakNits = (peakNits >= 10.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
+        mhc.baseGrayscale.peakNits = (peakNits >= 10.0f && peakNits <= 10000.0f) ? peakNits : 10000.0f;
     } else {
-        mhc.grayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), false, iniPath);
+        mhc.baseGrayscale.use24Gamma = GetPrivateProfileBool(section, (p + L"MHCGrayscale24").c_str(), false, iniPath);
     }
 
     // White balance settings

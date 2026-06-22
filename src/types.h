@@ -269,7 +269,9 @@ struct GrayscaleData {
     float pointsR[32] = {};        // Per-channel final values (computed from points * rgbDeviations)
     float pointsG[32] = {};
     float pointsB[32] = {};
-    float peakNits = 10000.0f;     // HDR only: peak luminance for curve scaling
+    float peakNits = 10000.0f;     // HDR only: peak luminance the CURVE IS SCALED TO (config input,
+                                   //   must match the ColourSpace target the curve was authored against).
+                                   //   NOT a measured peak — see AnalysisResult::peakNits. See docs/NAMING.md §1.
     bool use24Gamma = false;       // SDR only: apply 2.2->2.4 gamma transform
 
     // ICtCp delta offsets (precomputed from per-channel PQ corrections on CPU)
@@ -306,7 +308,8 @@ struct GrayscaleData {
 
 // Analysis result structure (matches GPU buffer layout - 64 bytes aligned)
 struct AnalysisResult {
-    float peakNits = 0.0f;
+    float peakNits = 0.0f;         // MEASURED peak read off the screen (observation), NOT a target/
+                                   //   scaling input like GrayscaleData/Tonemap peaks. See docs/NAMING.md §1.
     float minNits = 0.0f;
     float avgNits = 0.0f;
     float minNonZeroNits = 0.0f;   // Min excluding near-black (<0.1 nit)
@@ -478,8 +481,8 @@ struct TonemapData {
     bool enabled = false;
     bool dynamicPeak = false;         // Detect source peak per-frame (GPU-based)
     TonemapCurve curve = TonemapCurve::BT2390;
-    float sourcePeakNits = 10000.0f;  // Content source peak (ignored when dynamicPeak=true)
-    float targetPeakNits = 1000.0f;   // Actual display capability
+    float sourcePeakNits = 10000.0f;  // Tonemapper INPUT peak: content source (ignored when dynamicPeak=true)
+    float targetPeakNits = 1000.0f;   // Tonemapper OUTPUT peak: actual display capability. See docs/NAMING.md §1.
 };
 
 // Color correction settings (used in MonitorContext and runtime)
@@ -546,7 +549,8 @@ struct MonitorContext {
     int peakStagingReadIndex = 0;                     // Alternates 0/1 for deferred readback
     int lastPeakCBWidth = 0;                          // Track last written dimensions to avoid redundant CB updates
     int lastPeakCBHeight = 0;
-    float detectedPeakNits = 0.0f;                    // Last detected peak (for analysis overlay)
+    float detectedPeakNits = 0.0f;                    // Last DETECTED/measured peak (observation, for analysis
+                                                      //   overlay) — NOT a target/scaling input. docs/NAMING.md §1.
 
     // Analysis resources (frame statistics overlay)
     ID3D11Buffer* analysisBuffer = nullptr;           // Structured buffer for results
@@ -606,7 +610,9 @@ struct MonitorContext {
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     MovableAtomic<bool> cbDirty{ true };     // True when constant buffer needs update (GUI thread sets it cross-thread)
-    bool shaderCorrActive = false;           // True when shader is applying corrections (for tray icon)
+    bool shaderCorrActive = false;           // Per-monitor: the OVERLAY shader is applying some correction
+                                             //   (prim|gs|wb|tonemap|dg|24). Feeds g_shaderCorrectionsActive /
+                                             //   IPC corrections_enabled. NOT the DWM-hook state. docs/NAMING.md §4.
     bool lastDesktopGamma = true;            // Cached atomic value
     bool lastTetrahedralInterp = false;      // Cached atomic value
     bool grayscaleICtCp = false;             // true = shader uses ICtCp offsets for HDR grayscale
@@ -644,7 +650,9 @@ struct GrayscaleSettings {
     int pointCount = 20;           // 10, 20, or 32
     std::vector<float> points;     // Size = pointCount, values 0-1
     std::vector<float> rgbDeviations[3];  // [R][G][B], size=pointCount, centered at 1.0 (no offset)
-    float peakNits = 10000.0f;     // HDR only: peak luminance for curve scaling
+    float peakNits = 10000.0f;     // HDR only: peak luminance the CURVE IS SCALED TO (config input,
+                                   //   must match the ColourSpace target the curve was authored against).
+                                   //   NOT a measured peak — see AnalysisResult::peakNits. See docs/NAMING.md §1.
     bool use24Gamma = false;       // SDR only: apply 2.2->2.4 gamma transform
 
     void initLinear() {
@@ -719,15 +727,20 @@ struct MHCSettings {
     int primariesPreset = 0;           // Index into g_presetPrimaries (0=sRGB default)
     DisplayPrimaries customPrimaries = { 0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3127f, 0.3290f, L"Custom" };
 
-    // MHC's own grayscale correction (base calibration from Edit dialog)
-    GrayscaleSettings grayscale;
+    // MHC BASE grayscale/EOTF (calibration from Edit dialog). Locks when a 1D .cube is
+    // loaded (the cube carries the TRC instead). This is the MHC layer — NOT the
+    // Corrections-tab grayscale (ColorCorrectionData::grayscale). See docs/NAMING.md §2.
+    GrayscaleSettings baseGrayscale;
 
-    // White balance (von Kries target, separate from display measured white)
+    // MHC white balance: TARGET WHITE CHROMATICITY (CIE xy), baked into the MHC matrix as
+    // von Kries gains. Distinct from the Corrections-tab WB (ColorCorrectionData::
+    // whiteBalanceGains). INI keys SDR_MHCWhiteBalance* are a wire contract. See docs/NAMING.md §3.
     bool whiteBalanceEnabled = false;
     float whiteBalanceWx = 0.3127f;  // Target white x (D65 default)
     float whiteBalanceWy = 0.3290f;  // Target white y
 
-    // Correction grayscale (fine-tuning on top of base grayscale from Edit dialog)
+    // MHC CORRECTION grayscale: fine-tune layer applied on top of the base grayscale above.
+    // Still the MHC layer — NOT the Corrections-tab grayscale. See docs/NAMING.md §2.
     GrayscaleSettings correctionGrayscale;
 
     // Desktop gamma (HDR only): sRGB->2.2 baked into 1D LUT
@@ -753,7 +766,8 @@ struct MHCSettings {
     std::wstring metaGamma;      // SDR: "2.2", "2.2→2.4", "Custom (20pt) + TRC"
                                  // HDR: "PQ", "20pt-Custom + TRC"
     std::wstring metaWhiteBalance;  // "D65", "Custom (0.3100, 0.3200)", etc.
-    float metaPeakNits = 0.0f;   // HDR only, 0 = not set
+    float metaPeakNits = 0.0f;   // HDR MHC2 luminance METADATA (MaxCLL) label; 0 = not set.
+                                 //   IPC field `peak_nits` maps here, NOT to tonemap/measured peaks. docs/NAMING.md §1.
 };
 
 // Per-monitor settings for persistence

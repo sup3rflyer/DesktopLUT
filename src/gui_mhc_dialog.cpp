@@ -65,7 +65,7 @@ static void MhcRebuildTrackbars(MhcDialogData* d) {
     d->sliders.clear();
     d->pctLabels.clear();
 
-    auto& gs = d->settings->grayscale;
+    auto& gs = d->settings->baseGrayscale;
     if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
         gs.points.resize(gs.pointCount);
         if (d->isHDR) gs.initLinearPQ();
@@ -151,7 +151,7 @@ static void MhcRebuildTrackbars(MhcDialogData* d) {
 // Read slider positions back into grayscale points
 static void MhcReadSlidersToPoints(MhcDialogData* d) {
     if (!d || d->updatingSliders) return;
-    auto& gs = d->settings->grayscale;
+    auto& gs = d->settings->baseGrayscale;
     int N = gs.pointCount;
     for (int i = 0; i < N && i < (int)d->sliders.size(); i++) {
         int pos = (int)SendMessage(d->sliders[i], TBM_GETPOS, 0, 0);
@@ -358,14 +358,14 @@ static void MhcPushLivePreview(MhcDialogData* d) {
     // Only preview grayscale if the file doesn't handle it
     // (1D cube TRC / ICC TRC can't be previewed through shader — they're baked into the ICC at Apply)
     if (!fileGrayscale) {
-        tempCC.grayscale.enabled = d->settings->grayscale.enabled;
-        tempCC.grayscale.pointCount = d->settings->grayscale.pointCount;
-        tempCC.grayscale.points = d->settings->grayscale.points;
-        tempCC.grayscale.rgbDeviations[0] = d->settings->grayscale.rgbDeviations[0];
-        tempCC.grayscale.rgbDeviations[1] = d->settings->grayscale.rgbDeviations[1];
-        tempCC.grayscale.rgbDeviations[2] = d->settings->grayscale.rgbDeviations[2];
-        tempCC.grayscale.peakNits = d->settings->grayscale.peakNits;
-        tempCC.grayscale.use24Gamma = d->settings->grayscale.use24Gamma;
+        tempCC.grayscale.enabled = d->settings->baseGrayscale.enabled;
+        tempCC.grayscale.pointCount = d->settings->baseGrayscale.pointCount;
+        tempCC.grayscale.points = d->settings->baseGrayscale.points;
+        tempCC.grayscale.rgbDeviations[0] = d->settings->baseGrayscale.rgbDeviations[0];
+        tempCC.grayscale.rgbDeviations[1] = d->settings->baseGrayscale.rgbDeviations[1];
+        tempCC.grayscale.rgbDeviations[2] = d->settings->baseGrayscale.rgbDeviations[2];
+        tempCC.grayscale.peakNits = d->settings->baseGrayscale.peakNits;
+        tempCC.grayscale.use24Gamma = d->settings->baseGrayscale.use24Gamma;
     }
 
     ColorCorrectionData data = ConvertColorCorrection(tempCC, d->isHDR);
@@ -462,7 +462,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
         case ID_MHC_GRAYSCALE_ENABLE:
             if (d->hwndGrayscaleEnable)
-                d->settings->grayscale.enabled = (SendMessage(d->hwndGrayscaleEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                d->settings->baseGrayscale.enabled = (SendMessage(d->hwndGrayscaleEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
             MhcPushLivePreview(d);
             return 0;
 
@@ -471,19 +471,19 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         case ID_MHC_GRAYSCALE_32: {
             int newCount = (LOWORD(wParam) == ID_MHC_GRAYSCALE_10) ? 10 :
                            (LOWORD(wParam) == ID_MHC_GRAYSCALE_20) ? 20 : 32;
-            if (newCount != d->settings->grayscale.pointCount) {
-                d->settings->grayscale.pointCount = newCount;
-                d->settings->grayscale.points.resize(newCount);
-                if (d->isHDR) d->settings->grayscale.initLinearPQ();
-                else d->settings->grayscale.initLinear();
+            if (newCount != d->settings->baseGrayscale.pointCount) {
+                d->settings->baseGrayscale.pointCount = newCount;
+                d->settings->baseGrayscale.points.resize(newCount);
+                if (d->isHDR) d->settings->baseGrayscale.initLinearPQ();
+                else d->settings->baseGrayscale.initLinear();
                 MhcPushLivePreview(d);
             }
             return 0;
         }
 
         case ID_MHC_GRAYSCALE_RESET:
-            if (d->isHDR) d->settings->grayscale.initLinearPQ();
-            else d->settings->grayscale.initLinear();
+            if (d->isHDR) d->settings->baseGrayscale.initLinearPQ();
+            else d->settings->baseGrayscale.initLinear();
             MhcPushLivePreview(d);
             return 0;
 
@@ -492,11 +492,11 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (d->isHDR && d->hwndGsPeak) {
                 wchar_t buf[16];
                 GetWindowText(d->hwndGsPeak, buf, 16);
-                d->settings->grayscale.peakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                if (d->settings->grayscale.peakNits < 10.0f) d->settings->grayscale.peakNits = 10.0f;
+                d->settings->baseGrayscale.peakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                if (d->settings->baseGrayscale.peakNits < 10.0f) d->settings->baseGrayscale.peakNits = 10.0f;
             }
             // Ensure points are initialized
-            auto& gs = d->settings->grayscale;
+            auto& gs = d->settings->baseGrayscale;
             if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
                 gs.points.resize(gs.pointCount);
                 if (d->isHDR) gs.initLinearPQ(); else gs.initLinear();
@@ -514,7 +514,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
         case ID_MHC_GRAYSCALE_24:
             if (d->hwndGs24)
-                d->settings->grayscale.use24Gamma = (SendMessage(d->hwndGs24, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                d->settings->baseGrayscale.use24Gamma = (SendMessage(d->hwndGs24, BM_GETCHECK, 0, 0) == BST_CHECKED);
             MhcPushLivePreview(d);
             return 0;
 
@@ -619,7 +619,7 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 // Auto-populate peak nits from ICC luminance tag (HDR only)
                 if (d->isHDR && d->hasLoadedICC && d->loadedICC.hasLuminance &&
                     d->loadedICC.luminance >= 10.0f) {
-                    d->settings->grayscale.peakNits = d->loadedICC.luminance;
+                    d->settings->baseGrayscale.peakNits = d->loadedICC.luminance;
                     if (d->hwndGsPeak) {
                         wchar_t buf[16];
                         _swprintf_s_l(buf, _countof(buf), L"%.0f", GetCLocale(), d->loadedICC.luminance);
@@ -635,10 +635,10 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     // 1D cube provides per-channel correction - mark grayscale as handled
                     gsExtracted = true;
                 } else if (d->hasLoadedICC && d->loadedICC.hasTRC) {
-                    gsExtracted = ExtractGrayscaleFromICC(d->loadedICC, d->settings->grayscale, d->isHDR);
+                    gsExtracted = ExtractGrayscaleFromICC(d->loadedICC, d->settings->baseGrayscale, d->isHDR);
                 }
                 if (gsExtracted) {
-                    d->settings->grayscale.enabled = true;
+                    d->settings->baseGrayscale.enabled = true;
                 }
 
                 // Show summary of what was extracted from the file
@@ -706,9 +706,9 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (d->hwndFileClear) ShowWindow(d->hwndFileClear, SW_HIDE);
             // Reset grayscale to linear (file extraction data is no longer valid)
             if (d->isHDR)
-                d->settings->grayscale.initLinearPQ();
+                d->settings->baseGrayscale.initLinearPQ();
             else
-                d->settings->grayscale.initLinear();
+                d->settings->baseGrayscale.initLinear();
             // Re-enable coordinate fields based on preset selection
             MhcUpdatePrimariesFields(d);
             MhcPushLivePreview(d);
@@ -723,8 +723,8 @@ static LRESULT CALLBACK MhcDialogProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (d->isHDR && d->hwndGsPeak) {
                 wchar_t buf[16];
                 GetWindowText(d->hwndGsPeak, buf, 16);
-                d->settings->grayscale.peakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                if (d->settings->grayscale.peakNits < 10.0f) d->settings->grayscale.peakNits = 10.0f;
+                d->settings->baseGrayscale.peakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                if (d->settings->baseGrayscale.peakNits < 10.0f) d->settings->baseGrayscale.peakNits = 10.0f;
             }
             // Store source file path and type for profile regeneration
             if (d->fileLoaded && !d->loadedFilePath.empty()) {
@@ -941,11 +941,11 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
     data.hwndGs24 = nullptr;
     data.hwndGsPeak = nullptr;
     data.hwndScrollPanel = nullptr;
-    settings.grayscale.enabled = true;
+    settings.baseGrayscale.enabled = true;
     // Ensure points are initialized (empty for never-configured monitors → all-zeros LUT → black screen)
-    if (settings.grayscale.points.empty() || (int)settings.grayscale.points.size() != settings.grayscale.pointCount) {
-        if (isHDR) settings.grayscale.initLinearPQ();
-        else settings.grayscale.initLinear();
+    if (settings.baseGrayscale.points.empty() || (int)settings.baseGrayscale.points.size() != settings.baseGrayscale.pointCount) {
+        if (isHDR) settings.baseGrayscale.initLinearPQ();
+        else settings.baseGrayscale.initLinear();
     }
 
     // HDR: Peak nits on first row
@@ -955,7 +955,7 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
         data.hwndGsPeak = makeCtrl(L"EDIT", L"", WS_BORDER | ES_NUMBER,
             cx + 46, gsRowY, 50, h, ID_MHC_GRAYSCALE_PEAK);
         wchar_t peakBuf[16];
-        _swprintf_s_l(peakBuf, _countof(peakBuf), L"%.0f", GetCLocale(), settings.grayscale.peakNits);
+        _swprintf_s_l(peakBuf, _countof(peakBuf), L"%.0f", GetCLocale(), settings.baseGrayscale.peakNits);
         SetWindowText(data.hwndGsPeak, peakBuf);
         SetNumericEdit(data.hwndGsPeak, 0);
         makeCtrl(L"STATIC", L"nits", 0, cx + 100, gsRowY + 2, 25, h, 0);
@@ -972,7 +972,7 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
         rbX + 90, gsRowY, 40, h, ID_MHC_GRAYSCALE_32);
 
     // Select current point count
-    int pc = settings.grayscale.pointCount;
+    int pc = settings.baseGrayscale.pointCount;
     SendMessage(data.hwndGs10, BM_SETCHECK, pc == 10 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(data.hwndGs20, BM_SETCHECK, pc == 20 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(data.hwndGs32, BM_SETCHECK, pc == 32 ? BST_CHECKED : BST_UNCHECKED, 0);

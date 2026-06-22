@@ -268,9 +268,9 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
                 const auto& ms = g_gui.monitorSettings[config.monitorIndex];
                 bool sdrActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
                 bool hdrActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
-                bool sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+                bool sdrHasGs = ms.sdrMHC.baseGrayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
                                 ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
-                bool hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+                bool hdrHasGs = ms.hdrMHC.baseGrayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
                                 ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
                                 ms.hdrMHC.desktopGammaEnabled;
                 ctx.sdrMhcPrimariesActive = sdrActive && ms.sdrMHC.primariesEnabled;
@@ -540,11 +540,11 @@ static bool HasActiveShaderCorrections() {
     bool desktopGamma = g_userDesktopGammaMode.load();
     for (const auto& ms : g_gui.monitorSettings) {
         bool sdrMhcP = ms.sdrMHC.enabled && ms.sdrMHC.primariesEnabled;
-        bool sdrMhcG = ms.sdrMHC.enabled && (ms.sdrMHC.grayscale.enabled ||
+        bool sdrMhcG = ms.sdrMHC.enabled && (ms.sdrMHC.baseGrayscale.enabled ||
                        ms.sdrMHC.correctionGrayscale.enabled ||
                        !ms.sdrMHC.sourceFilePath.empty() || ms.sdrMHC.hasPerChannelTRC);
         bool hdrMhcP = ms.hdrMHC.enabled && ms.hdrMHC.primariesEnabled;
-        bool hdrMhcG = ms.hdrMHC.enabled && (ms.hdrMHC.grayscale.enabled ||
+        bool hdrMhcG = ms.hdrMHC.enabled && (ms.hdrMHC.baseGrayscale.enabled ||
                        ms.hdrMHC.correctionGrayscale.enabled ||
                        !ms.hdrMHC.sourceFilePath.empty() || ms.hdrMHC.hasPerChannelTRC ||
                        ms.hdrMHC.desktopGammaEnabled);
@@ -572,11 +572,11 @@ bool EvalNonAnalysisShaderCorrections() {
     bool desktopGamma = g_userDesktopGammaMode.load();
     for (const auto& ms : g_gui.monitorSettings) {
         bool sdrMhcP = ms.sdrMHC.enabled && ms.sdrMHC.primariesEnabled;
-        bool sdrMhcG = ms.sdrMHC.enabled && (ms.sdrMHC.grayscale.enabled ||
+        bool sdrMhcG = ms.sdrMHC.enabled && (ms.sdrMHC.baseGrayscale.enabled ||
                        ms.sdrMHC.correctionGrayscale.enabled ||
                        !ms.sdrMHC.sourceFilePath.empty() || ms.sdrMHC.hasPerChannelTRC);
         bool hdrMhcP = ms.hdrMHC.enabled && ms.hdrMHC.primariesEnabled;
-        bool hdrMhcG = ms.hdrMHC.enabled && (ms.hdrMHC.grayscale.enabled ||
+        bool hdrMhcG = ms.hdrMHC.enabled && (ms.hdrMHC.baseGrayscale.enabled ||
                        ms.hdrMHC.correctionGrayscale.enabled ||
                        !ms.hdrMHC.sourceFilePath.empty() || ms.hdrMHC.hasPerChannelTRC ||
                        ms.hdrMHC.desktopGammaEnabled);

@@ -79,6 +79,9 @@ extern std::atomic<bool> g_consoleEnabled;     // Show console window (GUI mode 
 extern std::atomic<bool> g_showFrameTiming;    // Show frame timing in analysis overlay
 extern std::atomic<bool> g_showMotionBar;      // Show motion bar for judder detection (UFO test style)
 extern std::atomic<bool> g_overlayAutoSleep;   // true = overlay has nothing to do, windows hidden
+// true ⇔ the analysis/correction OVERLAY is active for ≥1 monitor (= anyMonitorNeedsOverlay).
+// Drives the tray icon + IPC corrections_enabled. NOT "calibration is applied" and NOT the
+// DWM-hook state: in hook mode this is FALSE even while a cube is live. See docs/NAMING.md §4.
 extern std::atomic<bool> g_shaderCorrectionsActive;  // true = shader is applying corrections (not just LUT passthrough)
 extern std::atomic<bool> g_nonAnalysisCorrectionsActive;  // true = non-analysis corrections need the overlay (cached for analysis-only thread)
 extern HANDLE g_overlayWakeEvent;              // Auto-reset event for auto-sleep wake (replaces Sleep polling)

@@ -512,9 +512,9 @@ void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
         profileName = mhc.profileName;
         bool sdrA = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
         bool hdrA = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
-        bool sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+        bool sdrHasGs = ms.sdrMHC.baseGrayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
                         ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
-        bool hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+        bool hdrHasGs = ms.hdrMHC.baseGrayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
                         ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
                         ms.hdrMHC.desktopGammaEnabled;
         sdrPrimEn = sdrA && ms.sdrMHC.primariesEnabled;

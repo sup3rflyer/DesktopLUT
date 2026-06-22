@@ -34,9 +34,9 @@ void UpdateMhcFlagsLive(int monitorIndex) {
         sdrMhcActive = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
         hdrMhcActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
         // Grayscale flag covers all MHC gamma/grayscale forms that suppress shader equivalents
-        sdrHasGs = ms.sdrMHC.grayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
+        sdrHasGs = ms.sdrMHC.baseGrayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
                    ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
-        hdrHasGs = ms.hdrMHC.grayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
+        hdrHasGs = ms.hdrMHC.baseGrayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
                    ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
                    ms.hdrMHC.desktopGammaEnabled;
         sdrPrimEnabled = ms.sdrMHC.primariesEnabled;
@@ -79,7 +79,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
         mhc.metaPrimaries = isHDR ? L"Rec.2020" : L"sRGB";
     } else if (mhc.primariesPreset == 0) {
         // Preset 0 = sRGB/Rec.709
-        if (!isHDR && mhc.grayscale.use24Gamma)
+        if (!isHDR && mhc.baseGrayscale.use24Gamma)
             mhc.metaPrimaries = L"Rec.709";
         else
             mhc.metaPrimaries = L"sRGB";
@@ -96,7 +96,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
                 fabsf(mhc.customPrimaries.Bx - p.Bx) < tol && fabsf(mhc.customPrimaries.By - p.By) < tol) {
                 mhc.metaPrimaries = p.name;
                 // Refine sRGB vs Rec.709
-                if (i == 0 && !isHDR && mhc.grayscale.use24Gamma)
+                if (i == 0 && !isHDR && mhc.baseGrayscale.use24Gamma)
                     mhc.metaPrimaries = L"Rec.709";
                 matched = true;
                 break;
@@ -110,13 +110,13 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
     // Check if grayscale points are manually adjusted from default
     // (only meaningful when per-channel TRC is NOT present, since TRC overrides grayscale in profile)
     bool hasAdjustedPoints = false;
-    if (!mhc.hasPerChannelTRC && mhc.grayscale.enabled && !mhc.grayscale.points.empty()) {
+    if (!mhc.hasPerChannelTRC && mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty()) {
         GrayscaleSettings defaultGs;
-        defaultGs.pointCount = mhc.grayscale.pointCount;
+        defaultGs.pointCount = mhc.baseGrayscale.pointCount;
         if (isHDR) defaultGs.initLinearPQ();
         else defaultGs.initLinear();
-        for (int i = 0; i < mhc.grayscale.pointCount && i < (int)mhc.grayscale.points.size(); i++) {
-            if (i < (int)defaultGs.points.size() && fabsf(mhc.grayscale.points[i] - defaultGs.points[i]) > 0.001f) {
+        for (int i = 0; i < mhc.baseGrayscale.pointCount && i < (int)mhc.baseGrayscale.points.size(); i++) {
+            if (i < (int)defaultGs.points.size() && fabsf(mhc.baseGrayscale.points[i] - defaultGs.points[i]) > 0.001f) {
                 hasAdjustedPoints = true;
                 break;
             }
@@ -127,7 +127,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
     if (isHDR) {
         if (hasAdjustedPoints) {
             wchar_t buf[32];
-            swprintf_s(buf, L"%dpt-Custom", mhc.grayscale.pointCount);
+            swprintf_s(buf, L"%dpt-Custom", mhc.baseGrayscale.pointCount);
             gammaBase = buf;
         } else {
             gammaBase = L"PQ";
@@ -135,9 +135,9 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
     } else {
         if (hasAdjustedPoints) {
             wchar_t buf[32];
-            swprintf_s(buf, L"Custom (%dpt)", mhc.grayscale.pointCount);
+            swprintf_s(buf, L"Custom (%dpt)", mhc.baseGrayscale.pointCount);
             gammaBase = buf;
-        } else if (mhc.grayscale.use24Gamma) {
+        } else if (mhc.baseGrayscale.use24Gamma) {
             gammaBase = L"2.2\u21922.4";
         } else {
             gammaBase = L"2.2";
@@ -172,7 +172,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
 
     // --- Peak nits (HDR only) ---
     if (isHDR) {
-        mhc.metaPeakNits = mhc.grayscale.peakNits;
+        mhc.metaPeakNits = mhc.baseGrayscale.peakNits;
     } else {
         mhc.metaPeakNits = 0.0f;
     }
@@ -226,35 +226,35 @@ static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex
                 params.trcB = icc.trcB;
                 params.grayscaleEnabled = true;
                 params.grayscale.enabled = true;
-                params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
+                params.grayscale.use24Gamma = mhc.baseGrayscale.use24Gamma;
             }
         }
         // Peak nits is display metadata, needed regardless of file type
-        params.peakNits = mhc.grayscale.peakNits;
-    } else if (mhc.grayscale.enabled) {
+        params.peakNits = mhc.baseGrayscale.peakNits;
+    } else if (mhc.baseGrayscale.enabled) {
         // Safety: if points are empty (e.g., dialog set enabled=true without init), use identity
-        if (mhc.grayscale.points.empty()) {
+        if (mhc.baseGrayscale.points.empty()) {
             params.grayscaleEnabled = false;
             params.grayscale.enabled = false;
         } else {
             params.grayscaleEnabled = true;
             params.grayscale.enabled = true;
-            params.grayscale.pointCount = mhc.grayscale.pointCount;
-            for (int i = 0; i < mhc.grayscale.pointCount && i < 32; i++) {
-                params.grayscale.points[i] = (i < (int)mhc.grayscale.points.size())
-                    ? mhc.grayscale.points[i] : 0.0f;
+            params.grayscale.pointCount = mhc.baseGrayscale.pointCount;
+            for (int i = 0; i < mhc.baseGrayscale.pointCount && i < 32; i++) {
+                params.grayscale.points[i] = (i < (int)mhc.baseGrayscale.points.size())
+                    ? mhc.baseGrayscale.points[i] : 0.0f;
                 // Compute per-channel values from base * deviation
                 float base = params.grayscale.points[i];
-                float devR = (i < (int)mhc.grayscale.rgbDeviations[0].size()) ? mhc.grayscale.rgbDeviations[0][i] : 1.0f;
-                float devG = (i < (int)mhc.grayscale.rgbDeviations[1].size()) ? mhc.grayscale.rgbDeviations[1][i] : 1.0f;
-                float devB = (i < (int)mhc.grayscale.rgbDeviations[2].size()) ? mhc.grayscale.rgbDeviations[2][i] : 1.0f;
+                float devR = (i < (int)mhc.baseGrayscale.rgbDeviations[0].size()) ? mhc.baseGrayscale.rgbDeviations[0][i] : 1.0f;
+                float devG = (i < (int)mhc.baseGrayscale.rgbDeviations[1].size()) ? mhc.baseGrayscale.rgbDeviations[1][i] : 1.0f;
+                float devB = (i < (int)mhc.baseGrayscale.rgbDeviations[2].size()) ? mhc.baseGrayscale.rgbDeviations[2][i] : 1.0f;
                 params.grayscale.pointsR[i] = base * devR;
                 params.grayscale.pointsG[i] = base * devG;
                 params.grayscale.pointsB[i] = base * devB;
             }
-            params.grayscale.use24Gamma = mhc.grayscale.use24Gamma;
-            params.grayscale.peakNits = mhc.grayscale.peakNits;
-            params.peakNits = mhc.grayscale.peakNits;
+            params.grayscale.use24Gamma = mhc.baseGrayscale.use24Gamma;
+            params.grayscale.peakNits = mhc.baseGrayscale.peakNits;
+            params.peakNits = mhc.baseGrayscale.peakNits;
         }
     }
 
