@@ -15,6 +15,10 @@
     <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
     <RootNamespace>DesktopLUT</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <!-- This project uses no vcpkg packages. Disable the machine-global vcpkg MSBuild
+         integration (from `vcpkg integrate install`) so its applocal step
+         (pwsh.exe applocal.ps1) doesn't run and emit a spurious error. -->
+    <VcpkgEnabled>false</VcpkgEnabled>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
