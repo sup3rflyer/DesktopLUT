@@ -177,6 +177,10 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-track-ref { stroke: #58a6c9; stroke-width: .8; opacity: .35; }
 .ch-track-dot { fill: #58a6c9; opacity: .55; }
 .ch-sat-line { stroke: #6a6a72; stroke-width: .8; opacity: .5; }
+/* The data mark nearest the cursor (set by the hover readout). Declared last so it wins the
+   specificity tie against .ch-pt / .ch-dot etc.; r: only affects circles (ignored on rects). */
+.ch-hover { stroke: var(--ink); stroke-width: 1.4; opacity: 1; }
+circle.ch-hover { r: 4; }
 .ch-track-note { fill: #58a6c9; font-size: 9px; font-family: var(--mono); opacity: .7; }
 
 /* ── lightbox (click a tile to view large) ─────────────────────── */
@@ -195,11 +199,13 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .lb-body { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; }
 .lb-body .chart-svg { width: 100%; height: 100%; }
 .lb-frame { position: relative; }
-.lb-tip { position: absolute; pointer-events: none; z-index: 60; max-width: 300px;
+/* Shared hover readout — fixed to the viewport so the one tip serves both the grid tiles and
+   the lightbox; z-index above the lightbox (50) so it shows over the expanded tile too. */
+.chart-tip { position: fixed; pointer-events: none; z-index: 70; max-width: 340px;
   background: var(--panel-2); border: 1px solid var(--accent); border-radius: 5px;
   padding: 4px 8px; font-family: var(--mono); font-size: 11px; color: var(--ink);
   box-shadow: 0 4px 16px rgba(0,0,0,.6); white-space: nowrap; }
-.lb-tip[hidden] { display: none; }
+.chart-tip[hidden] { display: none; }
 
 /* ── event log (compact footer) ────────────────────────────────── */
 #logpane { flex: 0 0 auto; height: 170px; display: flex; flex-direction: column;

@@ -417,7 +417,7 @@ function openLightbox(key, title, opener) {
 function closeLightbox() {
   const wasOpen = !$("lightbox").hidden;
   lightboxKey = null;
-  $("lb-tip").hidden = true;
+  clearHover();
   $("lightbox").hidden = true;
   if (wasOpen && lightboxReturnFocus && document.contains(lightboxReturnFocus)) lightboxReturnFocus.focus();
   lightboxReturnFocus = null;
@@ -444,33 +444,75 @@ function trapLightboxTab(e) {
   }
 }
 
-// Instant point readout on the EXPANDED tile: track the cursor and surface the hovered SVG
-// point's <title> (target / measured / deviation) without waiting for the browser tooltip.
-function wireLightboxHover() {
-  const body = $("lb-body"), tip = $("lb-tip");
-  function titleAt(el) {
-    for (let n = el; n && n !== body; n = n.parentNode) {
-      if (n.getElementsByTagName) {
-        const t = n.getElementsByTagName("title")[0];
-        if (t && t.parentNode === n) return t.textContent;
-      }
-    }
-    return null;
+/* ── chart hover: snap to the nearest data point and show its readout instantly ─────
+ * Works on the grid tiles AND the expanded lightbox. Presentation-only: the cursor is
+ * mapped into the hovered chart's viewBox and we pick the nearest titled <circle>/<rect>
+ * (geometry in SVG-pixel space — NO colour math), so you get a point's target/measured/
+ * deviation immediately and don't have to land on a 2px dot. */
+let hoverEl = null;                                    // the currently-highlighted data mark
+
+function clearHover() {
+  if (hoverEl) { hoverEl.classList.remove("ch-hover"); hoverEl = null; }
+  const tip = $("chart-tip");
+  if (tip) tip.hidden = true;
+}
+
+// Distance (in viewBox units) from a point to a data mark: centre distance for a circle,
+// 0-inside-else-edge distance for a bar rect. Infinity for anything we can't place.
+function markDist(el, lx, ly) {
+  const tag = el.tagName.toLowerCase();
+  if (tag === "circle") {
+    const cx = parseFloat(el.getAttribute("cx")), cy = parseFloat(el.getAttribute("cy"));
+    return (Number.isNaN(cx) || Number.isNaN(cy)) ? Infinity : Math.hypot(cx - lx, cy - ly);
   }
-  body.addEventListener("mousemove", (e) => {
-    const txt = titleAt(e.target);
-    if (!txt) { tip.hidden = true; return; }
-    tip.textContent = txt;
-    const r = body.getBoundingClientRect();
-    let x = e.clientX - r.left + 14, y = e.clientY - r.top + 14;
-    tip.hidden = false;
-    // keep the tip inside the frame
-    if (x + tip.offsetWidth > r.width) x = r.width - tip.offsetWidth - 6;
-    if (y + tip.offsetHeight > r.height) y = e.clientY - r.top - tip.offsetHeight - 10;
-    tip.style.left = Math.max(0, x) + "px";
-    tip.style.top = Math.max(0, y) + "px";
+  if (tag === "rect") {
+    const x = parseFloat(el.getAttribute("x")), y = parseFloat(el.getAttribute("y"));
+    const w = parseFloat(el.getAttribute("width")), h = parseFloat(el.getAttribute("height"));
+    if ([x, y, w, h].some(Number.isNaN)) return Infinity;
+    return Math.hypot(Math.max(x - lx, 0, lx - (x + w)), Math.max(y - ly, 0, ly - (y + h)));
+  }
+  return Infinity;
+}
+
+function nearestMark(svg, clientX, clientY) {
+  let ctm;
+  try { ctm = svg.getScreenCTM(); } catch (e) { return null; }
+  if (!ctm) return null;
+  const pt = svg.createSVGPoint();
+  pt.x = clientX; pt.y = clientY;
+  const loc = pt.matrixTransform(ctm.inverse());
+  let best = null, bestD = Infinity;
+  svg.querySelectorAll("circle, rect").forEach((el) => {
+    const t = el.getElementsByTagName("title")[0];     // only data marks carry a <title>
+    if (!t || t.parentNode !== el) return;
+    const d = markDist(el, loc.x, loc.y);
+    if (d < bestD) { bestD = d; best = { el, title: t.textContent }; }
   });
-  body.addEventListener("mouseleave", () => { tip.hidden = true; });
+  return best && bestD <= 22 ? best : null;             // ~22 viewBox units (charts are 400×300)
+}
+
+function wireChartHover(container) {
+  if (!container) return;
+  container.addEventListener("mousemove", (e) => {
+    const svg = e.target.closest && e.target.closest("svg");
+    const hit = svg ? nearestMark(svg, e.clientX, e.clientY) : null;
+    if (!hit) { clearHover(); return; }
+    if (hit.el !== hoverEl) {
+      if (hoverEl) hoverEl.classList.remove("ch-hover");
+      hit.el.classList.add("ch-hover");
+      hoverEl = hit.el;
+    }
+    const tip = $("chart-tip");
+    tip.textContent = hit.title;
+    tip.hidden = false;
+    const pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight;
+    let x = e.clientX + pad, y = e.clientY + pad;       // fixed-positioned, clamped to viewport
+    if (x + tw > window.innerWidth) x = e.clientX - tw - pad;
+    if (y + th > window.innerHeight) y = e.clientY - th - pad;
+    tip.style.left = Math.max(2, x) + "px";
+    tip.style.top = Math.max(2, y) + "px";
+  });
+  container.addEventListener("mouseleave", clearHover);
 }
 
 function wireLightbox() {
@@ -550,7 +592,8 @@ function wireUi() {
 
 wireUi();
 wireLightbox();
-wireLightboxHover();
+wireChartHover($("charts"));     // hover readout on the grid tiles
+wireChartHover($("lb-body"));    // …and on the expanded lightbox tile
 connect();
 refreshCharts();
 setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency
