@@ -97,7 +97,7 @@ def _near_black_signal(model: DisplayErrorModel, nits: float = 0.1) -> float:
 def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarray,
                *, fade_width: float = 0.05, max_correction: float = 0.05,
                n_iterations: int = 3, convergence_tol: float = 1e-6,
-               near_black_nits: float = 0.1) -> np.ndarray:
+               near_black_nits: float = 0.1, neutral_band: float = 0.05) -> np.ndarray:
     """Build a ``(grid_size, grid_size, grid_size, 3)`` corrected LUT.
 
     Indexed ``lut[b, g, r]`` (B slowest, R fastest) — the order :func:`write_cube`
@@ -154,6 +154,20 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
     if np.any(dark):
         t = smoothstep(max_channel[dark] / black_threshold)[:, np.newaxis]
         corrected[dark] = (1 - t) * grid[dark] + t * corrected[dark]
+
+    # Neutral-axis preservation (1+1+1: the MHC ICC owns the grey/white axis; the cube owns colour
+    # ONLY). Fade the correction to identity as the INPUT node nears the grey diagonal (R==G==B), by
+    # its signal-space saturation — the chroma-axis analogue of the near-black blend above. This pins
+    # the diagonal grid nodes to exact identity so the cube stops re-touching neutral (the HW white
+    # 0.99→4.56 / grayscale 1.18→1.62 regression: the model PREDICTS a neutral correction helps, but
+    # it does not stack additively on the MHC's already-D65 neutral, so on the panel it hurts). Colour
+    # nodes (saturation outside the band) keep their correction vectors bit-for-bit. ``0`` ⇒ off.
+    if neutral_band > 0:
+        mx = np.max(grid, axis=1)
+        mn = np.min(grid, axis=1)
+        sat = np.where(mx > 1e-9, (mx - mn) / np.maximum(mx, 1e-9), 0.0)
+        tn = smoothstep(sat / neutral_band)[:, np.newaxis]   # 0 on the diagonal → 1 outside the band
+        corrected = grid + tn * (corrected - grid)
 
     return corrected.reshape(grid_size, grid_size, grid_size, 3)
 

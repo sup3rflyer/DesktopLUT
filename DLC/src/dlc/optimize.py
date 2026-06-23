@@ -134,6 +134,12 @@ class OptimizeConfig:
     n_inner_iterations: int = 3
     fade_width: float = 0.05
     near_black_nits: float = 0.1
+    # Neutral-axis preservation: fade the cube's correction to identity as the input nears the grey
+    # diagonal (R==G==B). The DLC 3D LUT ALWAYS sits on the MHC ICC, which owns the grey/white axis
+    # (1+1+1), so the cube must own colour only; this stops it re-touching neutral (the white
+    # 0.99→4.56 HW regression). ``0`` ⇒ off — correct only for a raw panel with no MHC foundation
+    # (e.g. the synthetic-correction unit tests), where the cube legitimately must fix grey too.
+    neutral_band: float = 0.05
 
 
 @dataclass
@@ -371,6 +377,7 @@ def optimize_cube(
                 model, cfg.grid_size, signal_points=train_signals,
                 fade_width=cfg.fade_width, max_correction=budget,
                 n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
+                neutral_band=cfg.neutral_band,
             )
         except np.linalg.LinAlgError as exc:
             if snapshots:

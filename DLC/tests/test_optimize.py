@@ -96,7 +96,8 @@ def test_machine_drives_correctable_panel_below_threshold():
     measured = probe(signals)
 
     raw_max = _raw_max_de(target, probe, signals)
-    cfg = OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4)
+    cfg = OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4,
+                         neutral_band=0.0)  # raw panel, no MHC ⇒ cube must fix grey
     result = optimize_cube(target=target, probe=probe, signals=signals,
                            measured_xyz=measured, config=cfg)
 
@@ -163,7 +164,8 @@ def test_noisy_run_stops_early_instead_of_running_to_cap():
     measured = probe(signals)
     cap = 12
     result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
-                           config=OptimizeConfig(grid_size=9, threshold=2.0, max_outer=cap, floor_tol=0.3))
+                           config=OptimizeConfig(grid_size=9, threshold=2.0, max_outer=cap, floor_tol=0.3,
+                                                 neutral_band=0.0))  # raw panel, no MHC ⇒ cube must fix grey
     assert result.iterations < cap            # terminated by the stall rule, not the cap
     assert result.needs_adjudication is True   # the real floor is still surfaced
 
@@ -174,9 +176,47 @@ def test_noiseless_correctable_panel_still_converges():
     probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
     signals = _cube_signals(5)
     result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=probe(signals),
-                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=6))
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=6,
+                                                 neutral_band=0.0))  # raw panel, no MHC ⇒ cube must fix grey
     assert result.converged is True
     assert result.digest["best_max_de"] < 2.0
+
+
+def test_auto_smooth_searches_below_old_floor():
+    # The auto_smooth search range must include smoothing < 0.1. The old floor (0.1) pinned the
+    # pick there and over-smoothed (~35% worse held-out in-gamut); the CV dE is monotone decreasing
+    # below it, so on a low-noise panel the auto pick must land well under 0.1.
+    from dlc.engine.model import DisplayErrorModel
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.01, 1.02))   # noiseless ⇒ less smoothing is better
+    signals = _cube_signals(6)
+    model = DisplayErrorModel(signals, probe(signals), target)  # smoothing=None ⇒ auto
+    assert model.smoothing < 0.1
+
+
+def test_build_cube_neutral_band_pins_grey_axis():
+    # neutral_band must fade the cube's correction to identity on the grey diagonal (R==G==B inputs),
+    # so the cube stops re-touching the neutral axis the MHC owns. Colour stays corrected.
+    import numpy as np
+    from dlc.optimize import build_cube
+    from dlc.engine.model import DisplayErrorModel
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.05, 0.95))    # grey axis genuinely off
+    signals = _cube_signals(6)
+    model = DisplayErrorModel(signals, probe(signals), target, smoothing=1e-3)
+    g = 17
+    axis = np.linspace(0.0, 1.0, g)
+
+    on = build_cube(model, g, signal_points=signals, max_correction=0.5, neutral_band=0.05)
+    off = build_cube(model, g, signal_points=signals, max_correction=0.5, neutral_band=0.0)
+    # cube is indexed [b, g, r]; the grey-diagonal node lut[i,i,i] is the output for input (a,a,a).
+    for i in range(1, g - 1):
+        assert np.allclose(on[i, i, i], [axis[i]] * 3, atol=1e-9)   # neutral_band ⇒ exact identity
+    # without it, the cube DID move the grey axis (that is the regression we are preventing)...
+    assert max(float(np.abs(off[i, i, i] - axis[i]).max()) for i in range(1, g - 1)) > 1e-3
+    # ...while a fully-saturated colour node (sat=1, well outside the band) is bit-for-bit unchanged
+    j = g - 2
+    assert np.allclose(on[0, 0, j], off[0, 0, j], atol=1e-9)
 
 
 def test_adaptive_sampling_starts_focused_then_forces_full_validation():

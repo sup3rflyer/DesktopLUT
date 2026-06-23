@@ -329,7 +329,11 @@ def auto_smooth(signal: np.ndarray, delta_ictcp: np.ndarray,
     signal = np.asarray(signal, dtype=float)
     delta_ictcp = np.asarray(delta_ictcp, dtype=float)
     if search_values is None:
-        search_values = np.logspace(-1, 1.7, 12)  # 0.1 .. ~50
+        # Search 1e-4 .. ~50. The old floor was 0.1, but on a low-noise panel the CV dE_ITP is
+        # MONOTONIC decreasing well below it (measured: 0.1→4.92, 1e-4→3.19), so a 0.1 floor pinned
+        # the pick at 0.1 and over-smoothed — washing out real in-gamut structure (~35% worse
+        # held-out in-gamut dE). The curve flattens by ~1e-4, so that is the right floor.
+        search_values = np.logspace(-4, 1.7, 20)  # 1e-4 .. ~50
 
     n = len(signal)
     k = max(2, min(k, n))
