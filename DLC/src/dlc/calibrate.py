@@ -362,6 +362,10 @@ class PatchSizes:
     # — confirms grayscale tracking + the gamut hues at practical & saturated levels, normal-sized.
     verify_steps: int = 13          # verify ramp steps per channel
     verify_saturations: tuple[float, ...] = (1.0, 0.5)   # saturated + practical mid-saturation
+    # verify floors COLOUR above the shadow band (normalized signal): sub-nit chroma is
+    # meaningless to meter + panel, so the grayscale toe (low_light_steps) carries the EOTF
+    # there and colour ramps start above it. Just above low_light_signal so the two don't overlap.
+    verify_color_min_signal: float = 0.25
 
     # neutral axis (GS+WB tweak / gray-wb flow)
     neutral_steps: int = 17         # grey-axis ramp steps
@@ -390,7 +394,8 @@ class PatchSizes:
                 kw[f.name] = tuple(float(x) for x in v)
             elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
-            elif f.name in ("gamut_lum_bias", "low_light_signal", "low_light_bias"):
+            elif f.name in ("gamut_lum_bias", "low_light_signal", "low_light_bias",
+                            "verify_color_min_signal"):
                 kw[f.name] = float(v)
             elif f.name in ("raw_spacing", "volumetric_mode", "grid_type", "order"):
                 kw[f.name] = str(v)
@@ -3416,9 +3421,13 @@ class Calibration:
         return build_neutral_verify_set(self.patch_sizes, self._transfer(),
                                         warm_tau=self._warm_tau(), max_cv=self._patch_max_cv())
 
-    def _verify_patches(self) -> list[tuple[int, int, int]]:
+    def _verify_patches(self, *, gamut_aware: bool = True) -> list[tuple[int, int, int]]:
+        # The "cover all bases" QC set (see build_verify_set): dense grey/PQ + shadow toe, colour
+        # only above the shadow band, gamut-capped. gamut_aware caps saturated hues to the panel's
+        # reachable gamut (HDR; None for SDR/degenerate — falls back to uncapped).
+        caps = self._hue_sat_caps() if gamut_aware else None
         return build_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
-                                max_cv=self._patch_max_cv())
+                                max_cv=self._patch_max_cv(), hue_sat_caps=caps)
 
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
         plan = flow_patch_counts(flow, self.patch_sizes, self._transfer(),
@@ -3535,7 +3544,7 @@ class Calibration:
             # The mhc-only flow IS the standalone-ICC path — refine the base cube to D65 so the
             # verify scores the foundation as a self-sufficient D65 layer (no 3D LUT to lean on).
             self.stage_refine_mhc_cube()
-        ver = self.stage_measure(role="verify", patches=self._ramp_patches(gamut_aware=True),
+        ver = self.stage_measure(role="verify", patches=self._verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -3927,14 +3936,30 @@ def build_neutral_verify_set(ps: PatchSizes, transfer: Transfer, *,
 
 def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
                      warm_tau: Optional[int] = None,
-                     max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The verify sanity set — a LIGHTER ramp (grey + RGBCMY at full + half saturation), NOT the
-    dense volumetric build set. It confirms grayscale tracking + the gamut hues at practical and
-    saturated levels at a normal verification resolution (and feeds the dashboard's saturation
-    sweeps), instead of re-measuring the whole cube the build already used. ``max_cv`` caps the
-    range (HDR peak; so verify never asks for an above-peak highlight that would read clipped)."""
+                     max_cv: Optional[int] = None,
+                     hue_sat_caps: Optional[dict] = None) -> list[tuple[int, int, int]]:
+    """The verify QC set — a purpose-built "cover all bases" check, NOT a clone of the dense build
+    ramp. It is *not* the same shape as the run that produced the calibration: it confirms the
+    foundation across the range at verification resolution, weighted to what actually matters.
+
+      * **Grayscale / PQ ramp + shadow toe** (``low_light_steps``) — the EOTF axis, sampled into
+        the dark where it matters most. This is the priority.
+      * **Colour (RGBCMY) only ABOVE the shadow band** (``verify_color_min_signal``) — sub-nit
+        chroma is noise-dominated for both meter and panel, so we don't waste ~7 s/patch
+        re-measuring the black floor in every hue/saturation; the grey toe carries the dark EOTF.
+      * **Gamut-capped** (``hue_sat_caps``): saturated hues land on/inside the panel's reachable
+        gamut (+ one clip marker per capped hue documenting the boundary) — same as the raw verify.
+
+    ``max_cv`` caps the range (HDR peak; so verify never asks for an above-peak highlight that
+    would read clipped). Replaces the old heavy mhc-only verify (which re-ran the full build ramp,
+    ~45 % sub-nit patches at ~7 s each); the build's own dark model is untouched."""
     return ramp_patches(transfer, steps=ps.verify_steps, saturations=ps.verify_saturations,
                         spacing=ps.raw_spacing, include_secondaries=True,
+                        low_light_steps=ps.low_light_steps,
+                        low_light_signal=ps.low_light_signal,
+                        low_light_bias=ps.low_light_bias,
+                        hue_sat_caps=hue_sat_caps,
+                        color_min_signal=ps.verify_color_min_signal,
                         order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
 
 
@@ -3942,7 +3967,7 @@ def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
 # the run's size before any measurement). build-correction measures nothing through spotread.
 _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
     "full": ("raw", "post-mhc", "gray-wb", "verify"),
-    "mhc-only": ("raw", "verify-ramp"),
+    "mhc-only": ("raw", "verify"),
     "3dlut-only": ("post-mhc", "verify"),
     "gray-wb": ("gray-wb", "verify-neutral"),
 }

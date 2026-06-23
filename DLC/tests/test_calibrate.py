@@ -1465,6 +1465,29 @@ def test_patch_roles_split_grayscale_volume_and_verify():
     assert any(p[0] == p[1] == p[2] for p in verify)              # and the grayscale
 
 
+def test_verify_floors_colour_but_keeps_grayscale_toe():
+    # The "cover all bases" QC contract: verify samples the grayscale/PQ toe deep into the dark
+    # (the EOTF priority), but colour patches are floored above the shadow band — sub-nit chroma is
+    # noise-dominated and would waste ~7 s/dark read in every hue/saturation.
+    import dataclasses as dc
+    t = _transfer()
+    ps = PatchSizes()
+    cmin = round(ps.verify_color_min_signal * t.max_cv)
+    verify = build_verify_set(ps, t)
+
+    colour = [p for p in verify if len({*p}) > 1]
+    greys = [p for p in verify if p[0] == p[1] == p[2] and max(p) > 0]
+    assert colour and greys
+    # no colour below the floor; grayscale still reaches well into the toe (below the colour floor)
+    assert min(max(p) for p in colour) >= cmin
+    assert min(max(p) for p in greys) < cmin
+
+    # raising the floor drops colour patches but never touches the grayscale ramp
+    hi = build_verify_set(dc.replace(ps, verify_color_min_signal=0.5), t)
+    assert sum(1 for p in hi if len({*p}) > 1) < len(colour)
+    assert {p for p in hi if p[0] == p[1] == p[2]} == {p for p in verify if p[0] == p[1] == p[2]}
+
+
 def test_default_patch_sizes_add_low_light_density():
     t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
     old = PatchSizes(low_light_steps=0, low_light_cube_size=0)
@@ -1476,7 +1499,19 @@ def test_default_patch_sizes_add_low_light_density():
         dense = builder(new, t)
         assert len(dense) > len(base)
         assert sum(1 for p in dense if max(p) <= cap) > sum(1 for p in base if max(p) <= cap)
-    assert build_verify_set(old, t) == build_verify_set(new, t)
+
+    # verify ("cover all bases" QC) also takes the low-light toe — but only as GRAYSCALE: the
+    # EOTF dark axis is the priority, while colour is floored above the shadow band (no sub-nit
+    # chroma). So the extra shadow patches must all be neutral.
+    vbase = build_verify_set(old, t)
+    vdense = build_verify_set(new, t)
+    assert len(vdense) > len(vbase)
+    added = set(vdense) - set(vbase)
+    assert added                                                  # toe was added
+    assert all(p[0] == p[1] == p[2] for p in added)              # ...and it is all grayscale
+    # no colour patch sits below the colour floor (sub-nit chroma is excluded)
+    cmin = round(new.verify_color_min_signal * t.max_cv)
+    assert not any(len({*p}) > 1 and max(p) < cmin for p in vdense)
 
 
 def test_opting_into_raw_secondaries():

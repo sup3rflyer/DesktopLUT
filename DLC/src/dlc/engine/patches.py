@@ -352,6 +352,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  low_light_signal: float = 0.20,
                  low_light_bias: float = 2.0,
                  hue_sat_caps: Optional[dict[str, float]] = None,
+                 color_min_signal: float = 0.0,
                  warm_tau: Optional[int] = None) -> list[Patch]:
     """Grey ramp + per-channel colour ramps at each saturation (deduped, then ordered).
 
@@ -365,6 +366,11 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
     For each level ``V`` and saturation ``S``: on-channels = ``V``, off-channels
     = ``round(V*(1-S))``. ``spacing`` is ``uniform`` (even signal steps) or
     ``perceptual`` (even in ``(L/Lmax)**(1/2.2)``).
+
+    ``color_min_signal`` (verify): drop COLOUR (non-grey) patches whose on-channel
+    normalized signal is below it — sub-nit chroma is noise-dominated, so colour starts
+    above the shadow band while the grey ramp (incl. ``low_light_steps`` toe) still covers
+    the dark EOTF. ``0.0`` ⇒ no floor (the dense build ramp keeps full-range colour).
     """
     if max_cv is None:
         max_cv = transfer.max_cv
@@ -389,6 +395,9 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
 
     for v in levels:
         add((v, v, v))
+    # Colour floor: below this code value, colour patches are sub-nit / noise-dominated, so the
+    # grey ramp above already carries the dark EOTF. ``0`` ⇒ no floor (full-range colour).
+    color_min_cv = round(color_min_signal * transfer.max_cv) if color_min_signal > 0 else 0
     colors = _RAMP_COLORS if include_secondaries else _PRIMARIES
     vtop = max(levels) if levels else 0
     # Map a hue's on/off channel pattern → its cap key (R/G/B primaries + C/M/Y secondaries).
@@ -406,7 +415,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
         for sat in sorted(saturations):
             eff = sat * cap
             for v in levels:
-                if v == 0:
+                if v == 0 or v < color_min_cv:
                     continue
                 off = round(v * (1 - eff))
                 add((v if r_on else off, v if g_on else off, v if b_on else off))
