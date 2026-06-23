@@ -320,6 +320,7 @@ def optimize_cube(
     verify_signals: Optional[np.ndarray] = None,
     config: Optional[OptimizeConfig] = None,
     on_iteration: Optional[Callable[[IterationResult], None]] = None,
+    reachable_primaries: Any = None,
 ) -> OptimizeResult:
     """Run the correction machine.
 
@@ -331,7 +332,9 @@ def optimize_cube(
     """
 
     cfg = config or OptimizeConfig()
-    space = TargetSpace(target)
+    # reachable_primaries (the panel's measured native gamut) clamps the ideal target onto what the
+    # panel can physically render, so build + verify score a gamut clip as a clip, not chase it (#C3).
+    space = TargetSpace(target, reachable_primaries=reachable_primaries)
 
     train_signals = np.asarray(signals, dtype=float).reshape(-1, 3)
     train_xyz = np.maximum(np.asarray(measured_xyz, dtype=float).reshape(-1, 3), 0.0)
@@ -362,7 +365,8 @@ def optimize_cube(
 
     for it in range(1, cfg.max_outer + 1):
         try:
-            model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing)
+            model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
+                                      reachable_primaries=reachable_primaries)
             cube = build_cube(
                 model, cfg.grid_size, signal_points=train_signals,
                 fade_width=cfg.fade_width, max_correction=budget,

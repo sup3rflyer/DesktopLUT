@@ -209,7 +209,7 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
 
 
 def score_samples_hdr(samples: list[Ti3Sample], *, white_xy: tuple[float, float],
-                      peak_nits: float) -> tuple[list[PatchMetric], float]:
+                      peak_nits: float, reachable_primaries=None) -> tuple[list[PatchMetric], float]:
     """Score TI3 samples for an **HDR (PQ/Rec.2020)** run in ``dE_ITP`` (BT.2124) — the
     perceptually-uniform metric the 3D-LUT cube converges in. The heavy PQ/ICtCp math is
     lazy-imported from :mod:`dlc.engine` (numpy/colour), so importing this spine module
@@ -224,7 +224,8 @@ def score_samples_hdr(samples: list[Ti3Sample], *, white_xy: tuple[float, float]
         raise ValueError("no TI3 samples to score")
     from .engine.model import score_hdr
 
-    res = score_hdr([s.rgb for s in samples], [s.xyz for s in samples], white_xy=white_xy)
+    res = score_hdr([s.rgb for s in samples], [s.xyz for s in samples], white_xy=white_xy,
+                    reachable_primaries=reachable_primaries)
     de_itp = res["de_itp"]
     ideal_xyz = res["ideal_xyz"]
     metrics = [

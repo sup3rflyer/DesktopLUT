@@ -236,6 +236,25 @@ def test_gamut_tell_quiet_when_native_covers_target(tmp_path: Path):
     assert "warning" not in tell
 
 
+def test_reachable_primaries_is_hdr_only_and_guards_degenerate(tmp_path: Path):
+    # #C3 target clamp is HDR-only: the SDR verify (CIEDE2000/Lab) has no clamp, so clamping only the
+    # SDR build would desync build vs verify on a narrow panel; sRGB is inside any real panel anyway.
+    prim = {"R": [0.66, 0.33], "G": [0.25, 0.66], "B": [0.15, 0.07]}
+    sdr = _make(tmp_path, "reach_sdr", mode="SDR")
+    _inject_dip(sdr, native_primaries=prim)
+    assert sdr._reachable_primaries() is None          # SDR ⇒ no clamp (both build + verify unclamped)
+
+    hdr = _make(tmp_path, "reach_hdr", mode="HDR")
+    _inject_dip(hdr, native_primaries=prim)
+    got = hdr._reachable_primaries()
+    assert got is not None and set(got) == {"R", "G", "B"}
+
+    # Collinear primaries (singular NPM) ⇒ None, not a crash.
+    deg = _make(tmp_path, "reach_deg", mode="HDR")
+    _inject_dip(deg, native_primaries={"R": [0.3, 0.3], "G": [0.4, 0.4], "B": [0.5, 0.5]})
+    assert deg._reachable_primaries() is None
+
+
 def test_gamut_tell_noop_without_characterization(tmp_path: Path):
     # No characterized primaries ⇒ the tell no-ops (doesn't guess). Fresh tmp_path so the
     # cross-run DIP store is empty.

@@ -23,7 +23,7 @@ Two roles (v2-design-notes.md §7):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import colour
 import numpy as np
@@ -80,14 +80,73 @@ class Target:
                    white_xy=white_xy)
 
 
+def _native_colourspace(primaries: Any, white_xy: tuple[float, float]) -> "colour.RGB_Colourspace":
+    """A colour-space with the panel's MEASURED primaries + the target white — used ONLY to test
+    gamut membership and project onto the reachable gamut (#C3). ``primaries`` is a
+    ``{"R":[x,y],"G":..,"B":..}`` dict (the DIP's ``native_primaries``) or a (3, 2) array."""
+    if isinstance(primaries, dict):
+        prim = np.array([primaries["R"], primaries["G"], primaries["B"]], dtype=float)
+    else:
+        prim = np.asarray(primaries, dtype=float).reshape(3, 2)
+    return colour.RGB_Colourspace("panel-native", prim,
+                                  np.asarray(white_xy, dtype=float), whitepoint_name="panel")
+
+
+def _chroma_clip_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace", scale: float,
+                          *, eps: float = 1e-4, iters: int = 24) -> np.ndarray:
+    """Project absolute-XYZ targets onto the panel's reachable gamut with a CONSTANT-INTENSITY
+    (ICtCp ``I``), HUE-PRESERVING chroma clip — the projection consistent with DesktopLUT's
+    chroma-preserving ICtCp tonemap and the dE_ITP objective (vs an RGB clip, which hue-shifts). A
+    target the panel can render is returned unchanged (fast no-op); an unreachable one keeps its
+    ICtCp intensity ``I`` (the perceptual-lightness analog) and hue (the Ct:Cp direction) and has its
+    chroma magnitude pulled in to the gamut boundary, so the optimizer/verify score a clip AS a clip
+    instead of chasing an unreachable corner.
+
+    ``scale`` normalizes absolute XYZ to the colour-space's [0,1] domain (10000 for PQ, peak_nits
+    for power) — the same scale :meth:`TargetSpace.ideal_xyz` applies."""
+    xyz_abs = np.asarray(xyz_abs, dtype=float)
+    rgb = colour.XYZ_to_RGB(xyz_abs / scale, native)
+    oog = np.any(rgb < -eps, axis=1) | np.any(rgb > 1.0 + eps, axis=1)
+    if not np.any(oog):
+        return xyz_abs
+    out = xyz_abs.copy()
+    ictcp = colour.XYZ_to_ICtCp(xyz_abs[oog])
+    intensity = ictcp[:, 0:1]
+    chroma = ictcp[:, 1:3]
+    # Largest chroma scale t in [0,1] that fits the gamut, per row (t=0 is the achromatic point at
+    # this intensity — always reachable for an interior white below peak, so the search converges).
+    lo = np.zeros((ictcp.shape[0], 1))
+    hi = np.ones((ictcp.shape[0], 1))
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        test = np.concatenate([intensity, mid * chroma], axis=1)
+        rgb_t = colour.XYZ_to_RGB(colour.ICtCp_to_XYZ(test) / scale, native)
+        inside = np.all((rgb_t >= -eps) & (rgb_t <= 1.0 + eps), axis=1, keepdims=True)
+        lo = np.where(inside, mid, lo)
+        hi = np.where(inside, hi, mid)
+    clamped = colour.ICtCp_to_XYZ(np.concatenate([intensity, lo * chroma], axis=1))
+    # Safety: if even the achromatic point at this intensity exceeds the panel (luminance past peak
+    # at this hue), per-channel clip the native RGB so the result is always physically reachable.
+    # For a row the chroma search already fit, this clip is a no-op (its RGB is already in [0,1]).
+    rgb_c = np.clip(colour.XYZ_to_RGB(clamped / scale, native), 0.0, 1.0)
+    out[oog] = colour.RGB_to_XYZ(rgb_c, native) * scale
+    return out
+
+
 class TargetSpace:
     """Signal ↔ ideal-XYZ ↔ ICtCp conversions for a :class:`Target`.
 
     "Ideal" = what a perfect display hitting the target would emit. All XYZ here
     is **absolute cd/m²** (what ICtCp and the measurements use).
+
+    ``reachable_primaries`` (optional): the panel's MEASURED native primaries
+    (``{"R":[x,y],...}`` from the DIP). When given, an ideal target the panel physically
+    cannot reach is clamped onto the reachable gamut (constant-intensity hue-preserving
+    chroma clip — :func:`_chroma_clip_to_gamut`), so the cube build AND verify treat a gamut
+    clip as a clip rather than chasing it (#C3). ``None`` ⇒ no clamp (the prior behaviour).
     """
 
-    def __init__(self, target: Target):
+    def __init__(self, target: Target, *, reachable_primaries: Any = None):
         self.target = target
         base = colour.RGB_COLOURSPACES[target.colourspace]
         if target.white_xy is not None:
@@ -102,6 +161,13 @@ class TargetSpace:
         else:
             self.colourspace = base
         self.peak_nits = float(target.peak_nits)
+        # PQ normalizes XYZ by the 10000-nit container; power by the white luminance.
+        self._reach_scale = 10000.0 if target.transfer == "pq" else self.peak_nits
+        self._reachable = None
+        if reachable_primaries is not None:
+            white = (target.white_xy if target.white_xy is not None
+                     else tuple(float(c) for c in self.colourspace.whitepoint))
+            self._reachable = _native_colourspace(reachable_primaries, white)
 
     # -- signal -> ideal absolute XYZ -------------------------------------
     def ideal_xyz(self, signal_rgb: np.ndarray) -> np.ndarray:
@@ -116,6 +182,8 @@ class TargetSpace:
             xyz = colour.RGB_to_XYZ(linear, self.colourspace) * self.peak_nits
         else:
             raise ValueError(f"unknown transfer: {self.target.transfer!r}")
+        if self._reachable is not None:
+            xyz = _chroma_clip_to_gamut(xyz, self._reachable, self._reach_scale)
         return xyz.reshape(shape)
 
     # -- absolute XYZ -> signal (inverse of ideal_xyz) --------------------
@@ -162,7 +230,8 @@ def de_itp(delta_ictcp: np.ndarray) -> np.ndarray:
 
 
 def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
-              white_xy: Optional[tuple[float, float]] = None) -> dict[str, np.ndarray]:
+              white_xy: Optional[tuple[float, float]] = None,
+              reachable_primaries: Any = None) -> dict[str, np.ndarray]:
     """Per-patch HDR verify error in ``dE_ITP`` (BT.2124) — the metric the cube already
     converges in, and the right one for HDR (CIEDE2000's Lab is meaningless at 1000+ nit
     absolute luminance). Scores measured absolute XYZ against the **ideal PQ/Rec.2020
@@ -176,7 +245,7 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     the ``ideal_xyz`` (absolute cd/m²) per patch.
     """
     target = Target.hdr_rec2020_pq(white_xy=white_xy)
-    space = TargetSpace(target)
+    space = TargetSpace(target, reachable_primaries=reachable_primaries)
     sig = np.asarray(signal_rgb, dtype=float).reshape(-1, 3)
     # Sanitize the measured XYZ BEFORE ICtCp: a dropped/saturated hardware read can be NaN or
     # ±inf, which propagates through colour.XYZ_to_ICtCp to a NaN dE_ITP — and a single NaN
@@ -265,13 +334,13 @@ class DisplayErrorModel:
 
     def __init__(self, signal_rgb: np.ndarray, measured_xyz: np.ndarray,
                  target: Target, *, smoothing: Optional[float] = None,
-                 kernel: str = "thin_plate_spline"):
+                 kernel: str = "thin_plate_spline", reachable_primaries: Any = None):
         self.signal = np.asarray(signal_rgb, dtype=float)
         self.measured_xyz = np.maximum(np.asarray(measured_xyz, dtype=float), 0.0)
         if self.signal.shape != self.measured_xyz.shape or self.signal.shape[1] != 3:
             raise ValueError("signal_rgb and measured_xyz must both be (N, 3) and equal length")
         self.target = target
-        self.space = TargetSpace(target)
+        self.space = TargetSpace(target, reachable_primaries=reachable_primaries)
         self.kernel = kernel
 
         ideal_ictcp = self.space.ideal_ictcp(self.signal)

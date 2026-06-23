@@ -985,6 +985,31 @@ class Calibration:
         # The 3D-LUT correction targets the SAME resolved white the MHC/GS+WB stages do.
         return self.profile.engine_target(self.target_name, white_xy=self._white_xy())
 
+    def _reachable_primaries(self) -> Optional[dict]:
+        """The panel's MEASURED native primaries (from the DIP) used to clamp the optimizer/verify
+        target onto the physically reachable gamut (#C3) — so a saturated target the panel can't
+        render is scored as a clip, not chased toward an unreachable Rec.2020 corner. ``None`` ⇒ no
+        clamp (the prior unclamped behaviour).
+
+        HDR-ONLY by design. #C3 is the wide-gamut (Rec.2020) hazard; sRGB is inside any real panel,
+        so an SDR clamp is a no-op there — AND the SDR *verify* (``score_samples``, CIEDE2000/Lab) has
+        no clamp, so clamping only the SDR *build* would desync build vs verify on a narrow panel. The
+        HDR build and HDR verify (``score_hdr``) BOTH clamp, so HDR stays consistent end to end."""
+        if self.mode != "HDR":
+            return None
+        dip = self._dip()
+        if dip is None or not dip.native_primaries:
+            return None
+        prim = {ch: [float(xy[0]), float(xy[1])]
+                for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2}
+        if len(prim) != 3:
+            return None
+        # Guard a degenerate (collinear) primary triangle — it would make the native NPM singular and
+        # crash inside the clamp. Real panel primaries are never collinear; a near-zero area ⇒ skip.
+        (rx, ry), (gx, gy), (bx, by) = prim["R"], prim["G"], prim["B"]
+        area = abs((gx - rx) * (by - ry) - (bx - rx) * (gy - ry)) / 2.0
+        return prim if area > 1e-6 else None
+
     def _hdr_target(self):
         """The chosen HDR target (peak/undershoot/knee/fixed white) for an HDR run,
         resolved from this display+mode's DIP and the run's resolved white
@@ -2254,7 +2279,8 @@ class Calibration:
             # at mid-gray) on the dashboard's convergence trend — branch like stage_verify.
             if spec.is_hdr:
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy),
-                                                 peak_nits=self._hdr_target().peak_nits)
+                                                 peak_nits=self._hdr_target().peak_nits,
+                                                 reachable_primaries=self._reachable_primaries())
                 metric_name = "dE_ITP"
             else:
                 metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
@@ -2563,7 +2589,8 @@ class Calibration:
         ``{"avg","max","n"}`` (``n``=0 if no grey patches / scoring failed)."""
         try:
             metrics, _lum = score_samples_hdr(samples, white_xy=white_xy,
-                                              peak_nits=self._hdr_target().peak_nits)
+                                              peak_nits=self._hdr_target().peak_nits,
+                                              reachable_primaries=self._reachable_primaries())
             grey = [m.de2000 for m in metrics if m.grayscale]
             if not grey:
                 return {"avg": None, "max": None, "n": 0}
@@ -2739,7 +2766,8 @@ class Calibration:
             try:
                 result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
                                        measured_xyz=measured, config=self.optimize_config,
-                                       on_iteration=self._on_optimize_iteration)
+                                       on_iteration=self._on_optimize_iteration,
+                                       reachable_primaries=self._reachable_primaries())
             except DegenerateMeasurements as exc:
                 # The RBF model can't be built from this patch set (degenerate/collinear) —
                 # surface a clear, actionable abort instead of crashing with a numpy traceback.
@@ -2880,7 +2908,8 @@ class Calibration:
             wx, wy = self._white_xy()
             if spec.is_hdr:
                 hdr = self._hdr_target()
-                metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits)
+                metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits,
+                                                  reachable_primaries=self._reachable_primaries())
                 metric_name = "dE_ITP"
                 # Advisory HDR defaults (dE_ITP); the assistant negotiates the real target
                 # at the verify seam after the first refinement round (design §7).
