@@ -3845,6 +3845,16 @@ def run_calibration(
     return calib.run(flow)
 
 
+def _auto_on_live_measuring_run(args: Any) -> bool:
+    """``--auto`` is a pure rubber-stamp (returns the recommendation verbatim, no LLM) and is sim/CI
+    ONLY — never a hardware run (DESIGN LAW). ``main()`` always connects to the live pipe and builds a
+    real meter + presenter for any MEASURING flow, so ``--auto`` there is the forbidden autonomous
+    hardware run. True ⇒ refuse. ``build-correction`` is operator-driven ccxxmake (no autonomous
+    spotread measurement) and an ``--abort`` just reverts, so both are exempt."""
+    return bool(getattr(args, "auto", False)) and not getattr(args, "abort", False) \
+        and getattr(args, "flow", None) != "build-correction"
+
+
 def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wiring
     """Live CLI. Wires the real controller + dogegen/spotread measure seam and runs a
     flow; on an :class:`AdjudicationRequired` pause it prints the request as JSON and
@@ -4131,6 +4141,16 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         overrides["adaptive-planning:plan"] = Decision(
             "apply", note="cli plan-decision-file", payload=plan_payload)
     decisions.update(overrides)   # also seed the adjudicator (covers not-yet-recorded keys)
+    # DESIGN LAW: --auto is a pure rubber-stamp (no LLM) for sim/CI ONLY — never a live measuring run,
+    # which main() always wires (real pipe + meter + presenter). It would optimize for hours on an
+    # unadjudicated foundation (the first-HDR-run failure). sim/CI drives the in-process Orchestrator.
+    if _auto_on_live_measuring_run(args):
+        print(json.dumps({"error": (
+            "--auto (pure rubber-stamp, no LLM) must not drive a live measuring run — it would optimize "
+            "for hours on an unadjudicated foundation. It is sim/CI only. Run live without --auto (default "
+            "MappingAdjudicator routes every seam to the LLM) or with --supervised, and use the in-process "
+            "simulator for sim/CI.")}))
+        return 2
     if args.auto:
         adjudicator: Adjudicator = AutoAdjudicator()
     elif args.supervised:
@@ -4269,7 +4289,17 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                 pass
         if presenter is not None:
             try:
-                presenter.close()          # drops the dogegen socket / kills a spawned window
+                # A SocketPresenter.close() only drops OUR socket and leaves the persistent daemon +
+                # its fullscreen window running on purpose — so for a WEDGED present (main thread
+                # blocked in recv) that is a no-op against the actual blocker. The watchdog only fires
+                # on a terminal abort, so tell the daemon to quit: dogegen closes, the daemon drops the
+                # connection, and the main thread's recv returns → it unblocks and aborts at its
+                # checkpoint. A spawned (non-socket) DogegenPresenter has no daemon, so just close it.
+                shutdown_daemon = getattr(presenter, "shutdown_daemon", None)
+                if callable(shutdown_daemon):
+                    shutdown_daemon()
+                else:
+                    presenter.close()      # kills a spawned window
             except Exception:  # noqa: BLE001
                 pass
 

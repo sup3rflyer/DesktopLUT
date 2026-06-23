@@ -219,6 +219,18 @@ class MeasureLoopConfig:
     # Selective re-measure budget -------------------------------------------
     remeasure_cap: int = 256            # advisory threshold for appended re-measures; crossing it flags
 
+    # Cross-patch read-integrity guard --------------------------------------
+    # The per-read stall clock resets on ANY ok read, so two failure classes are invisible to it: a
+    # FROZEN presenter (a stuck frame reads fine + repeatably — the ~111-min dogegen freeze) and a panel
+    # that slept MID-RUN (valid ~0-nit reads). Inspect the last few MEASUREMENT reads for both signatures
+    # and surface either as a measurement-path anomaly the LLM consumes from the running spine (never a
+    # silent abort). 0 disables.
+    integrity_window: int = 4                      # consecutive measurement reads inspected for a stuck frame
+    integrity_frozen_expected_ratio: float = 2.0   # commanded peak-nits span that SHOULD move the read…
+    integrity_frozen_y_tol: float = 0.05           # …yet every measured Y within ±5% of their mean…
+    integrity_frozen_xy_tol: float = 0.003         # …and chromaticity within this xy radius ⇒ stuck frame
+    integrity_dark_run: int = 4                     # consecutive LIT patches reading sub-floor ⇒ panel dark
+
 
 @dataclass
 class AcceptedRead:
@@ -240,6 +252,11 @@ class AcceptedRead:
     # dark-level trust (mhc_cube.dark_trust_weights) — how much to smooth a dark correction to identity.
     se_de: Optional[float] = None
     chroma_sigma: Optional[float] = None
+    # Reads behind ``chroma_sigma`` THIS round (NOT the accumulated ``reads_taken``, which sums across
+    # appended re-measures). The dark-trust SE-of-mean is ``chroma_sigma / √noise_reads`` — σ and n must
+    # describe the same set of reads, else an appended re-measure divides a single-round σ by an inflated
+    # n, understating noise and OVER-trusting the dark correction the gate exists to suppress.
+    noise_reads: Optional[int] = None
 
 
 @dataclass
@@ -347,7 +364,7 @@ def read_noise_sidecar(ti3_path: Path) -> list[tuple[float, Optional[float]]]:
             noise: Optional[float] = math.inf
         else:
             sg = v.get("chroma_sigma")
-            n = v.get("reads") or 0
+            n = v.get("reads") or 0          # reads behind THIS σ (per-round), not lifetime reads_taken
             noise = (sg / math.sqrt(n)) if (sg is not None and n >= 2) else None
         out.append((lvl, noise))
     out.sort(key=lambda e: e[0])
@@ -384,7 +401,9 @@ def _write_noise_sidecar(ti3_path: Path, accepted: Sequence[AcceptedRead]) -> No
         by_level[f"{s[0]:.6f}"] = {
             "chroma_sigma": round(r.chroma_sigma, 6),
             "se_de": (round(r.se_de, 4) if r.se_de is not None else None),
-            "reads": r.reads_taken,
+            # The read count that PRODUCED chroma_sigma (this round), so the consumer's σ/√n is the SE
+            # of the same reads. reads_taken accumulates across appended re-measures — wrong divisor here.
+            "reads": (r.noise_reads if r.noise_reads is not None else r.reads_taken),
             "unstable": bool(r.unstable),
         }
     if not by_level:
@@ -549,6 +568,10 @@ class _Loop:
         self.measurement_path_compromised = False
         self.read_anomalies: list[dict[str, Any]] = []
         self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
+        # Cross-patch read-integrity state (frozen-frame / mid-run-dark detection).
+        self._integrity_recent: list[tuple[float, tuple[float, float, float]]] = []
+        self._integrity_dark_streak = 0
+        self._integrity_flagged: set[str] = set()      # each signature surfaced at most once
 
     # -- low-level read ----------------------------------------------------
 
@@ -894,6 +917,68 @@ class _Loop:
                     "retry or correct the display/meter path before trusting this run"
                 ),
             )
+
+    def _check_read_integrity(self, patch: MeasurePatch, xyz: tuple[float, float, float]) -> None:
+        """Cross-patch read-integrity guard for failures the per-read stall clock cannot see. The
+        stall clock resets on ANY ok read, so a FROZEN presenter (a stuck frame reads fine and
+        repeatably) and a panel that slept MID-RUN (valid ~0-nit reads) both keep it happy forever —
+        exactly the ~111-min dogegen-freeze class. Inspect the last few MEASUREMENT reads for two
+        signatures the stall guard is blind to and surface either as a measurement-path anomaly the
+        LLM consumes from the running spine (never a silent abort — the LLM/operator cancels)."""
+        if patch.role != "measurement" or self.cfg.integrity_window <= 0:
+            return
+        expected = self._expected_patch_nits(patch)
+        measured = float(xyz[1])
+        self._integrity_recent.append((expected, (float(xyz[0]), float(xyz[1]), float(xyz[2]))))
+        if len(self._integrity_recent) > self.cfg.integrity_window:
+            self._integrity_recent.pop(0)
+
+        # (B) Panel went dark mid-run: a run of LIT patches all reading at/under the dark floor.
+        reference = float(self.reference_xyz[1]) if self.reference_xyz else 0.0
+        lit_cut = max(self.cfg.plausible_luminance_low_expected_nits * 2.0, reference * 0.5)
+        dark_floor = max(self.cfg.plausible_luminance_floor_nits, expected * 0.02)
+        if expected >= lit_cut and measured <= dark_floor:
+            self._integrity_dark_streak += 1
+        else:
+            self._integrity_dark_streak = 0
+        if (self._integrity_dark_streak >= self.cfg.integrity_dark_run
+                and "panel_dark_mid_run" not in self._integrity_flagged):
+            self._integrity_flagged.add("panel_dark_mid_run")
+            self._flag_read_plausibility_anomaly({
+                "reason": "panel_dark_mid_run",
+                "measure_phase": self._live_phase,
+                "label": patch.label,
+                "consecutive_lit_dark_reads": self._integrity_dark_streak,
+                "expected_nits": round(expected, 4),
+                "measured_nits": round(measured, 4),
+            })
+
+        # (A) Frozen presenter: a full window of patches whose commanded peak luminance SHOULD differ
+        # a lot, yet every measured read sits within meter noise of the others (one stuck frame).
+        if (len(self._integrity_recent) >= self.cfg.integrity_window
+                and "frozen_presenter" not in self._integrity_flagged):
+            exps = [e for e, _ in self._integrity_recent if e > 0.0]
+            ys = [c[1] for _, c in self._integrity_recent]
+            mean_y = sum(ys) / len(ys)
+            if exps and min(exps) > 0.0 and mean_y > self.cfg.plausible_luminance_floor_nits:
+                span = max(exps) / min(exps)
+                y_flat = all(abs(y - mean_y) <= self.cfg.integrity_frozen_y_tol * mean_y for y in ys)
+                xys = [(c[0] / t, c[1] / t) for _, c in self._integrity_recent if (t := sum(c)) > 0.0]
+                mx = sum(p[0] for p in xys) / len(xys) if xys else 0.0
+                my = sum(p[1] for p in xys) / len(xys) if xys else 0.0
+                xy_flat = bool(xys) and all(
+                    ((p[0] - mx) ** 2 + (p[1] - my) ** 2) ** 0.5 <= self.cfg.integrity_frozen_xy_tol
+                    for p in xys)
+                if span >= self.cfg.integrity_frozen_expected_ratio and y_flat and xy_flat:
+                    self._integrity_flagged.add("frozen_presenter")
+                    self._flag_read_plausibility_anomaly({
+                        "reason": "frozen_presenter",
+                        "measure_phase": self._live_phase,
+                        "label": patch.label,
+                        "window": self.cfg.integrity_window,
+                        "expected_nits_span": round(span, 2),
+                        "measured_nits_mean": round(mean_y, 4),
+                    })
 
     def warm_up(self, *, phase: str = "warmup", existing_reference: bool = False) -> tuple[bool, int]:
         """Present the biased-neutral stimulus until ``settle_required``
@@ -1256,10 +1341,13 @@ class _Loop:
                 reads_taken=read_index, immediate_remeasures=immediate,
                 unstable=unstable, usable=usable, note=note,
                 se_de=accepted_se, chroma_sigma=accepted_chroma_sigma,
+                noise_reads=read_index,
             )
             self.accepted[patch.label] = record
         else:
-            # Overwrite in place (re-measure): keep only the final accepted read.
+            # Overwrite in place (re-measure): keep only the final accepted read. reads_taken sums
+            # across rounds (lifetime), but se_de/chroma_sigma/noise_reads describe THIS round only —
+            # so the dark-trust σ/√n divides by the matching per-round count, not the inflated lifetime.
             record.xyz = accepted_xyz
             record.yxy = accepted_yxy
             record.reads_taken += read_index
@@ -1269,6 +1357,9 @@ class _Loop:
             record.note = note
             record.se_de = accepted_se
             record.chroma_sigma = accepted_chroma_sigma
+            record.noise_reads = read_index
+        if usable:
+            self._check_read_integrity(patch, accepted_xyz)
         return record
 
     # -- main pass ---------------------------------------------------------

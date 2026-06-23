@@ -2033,6 +2033,19 @@ def test_dark_panel_escalates_to_a_judge_under_supervised(tmp_path: Path):
     assert anomalies, "a dark panel must raise a loud anomaly on the spine"
 
 
+def test_auto_is_refused_on_a_live_measuring_run():
+    # DESIGN LAW: --auto (pure rubber-stamp, no LLM) must never drive a live measuring run. main()
+    # always wires a real meter, so a measuring flow with --auto is the forbidden autonomous HW run.
+    from types import SimpleNamespace
+    from dlc.calibrate import _auto_on_live_measuring_run as forbidden
+    for flow in ("full", "mhc-only", "3dlut-only", "gray-wb"):
+        assert forbidden(SimpleNamespace(auto=True, abort=False, flow=flow)) is True
+    # Exempt: build-correction is operator-driven (no autonomous spotread); --abort just reverts.
+    assert forbidden(SimpleNamespace(auto=True, abort=False, flow="build-correction")) is False
+    assert forbidden(SimpleNamespace(auto=True, abort=True, flow="full")) is False
+    assert forbidden(SimpleNamespace(auto=False, abort=False, flow="full")) is False
+
+
 def test_catastrophic_measure_score_escalates_as_general_anomaly(tmp_path: Path):
     def bad_patch_set(_patch):
         return Reading(xyz=(100000.0, 100000.0, 100000.0),

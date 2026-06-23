@@ -391,6 +391,78 @@ def test_noise_sidecar_records_per_level_chroma_sigma(tmp_path: Path):
     assert any(v["chroma_sigma"] > 0.0 and v["reads"] >= 2 for v in by_level.values())
 
 
+def test_noise_reads_is_per_round_not_lifetime_after_remeasure(tmp_path: Path):
+    # An appended re-measure overwrites the accepted read in place: reads_taken ACCUMULATES (lifetime),
+    # but chroma_sigma + noise_reads describe ONLY the final round — so the dark-trust σ/√n divides by
+    # the matching per-round n, not the inflated lifetime sum (which would understate noise / over-trust).
+    from dlc.measure_loop import noise_sidecar_path, _write_noise_sidecar, read_noise_sidecar
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0)   # gate high ⇒ dim grey floored to 4
+    loop = _solo_loop(clean, t, cfg)
+    dim = _patch("g-lo", (102, 102, 102), t, 0)
+    rec1 = loop.measure_patch(dim, phase="main")
+    assert rec1.reads_taken == 4 and rec1.noise_reads == 4
+    rec2 = loop.measure_patch(dim, phase="main")          # re-measure SAME label → overwrite in place
+    assert rec2 is rec1
+    assert rec2.reads_taken == 8                          # lifetime sum across both rounds
+    assert rec2.noise_reads == 4                          # final round only — the σ/√n divisor
+    # And the sidecar carries the per-round count, so the consumed SE divides by √4, not √8.
+    ti3 = tmp_path / "raw.ti3"
+    _write_noise_sidecar(ti3, [rec2])
+    by_level = json.loads(noise_sidecar_path(ti3).read_text(encoding="utf-8"))["by_level"]
+    assert len(by_level) == 1
+    assert next(iter(by_level.values()))["reads"] == 4
+
+
+# ---------------------------------------------------------------------------
+# cross-patch read-integrity guard (frozen presenter / mid-run dark panel)
+# ---------------------------------------------------------------------------
+
+def test_frozen_presenter_surfaces_a_read_integrity_anomaly():
+    # A stuck frame reads fine + repeatably, so the per-read stall clock never trips. Across a window
+    # of patches whose commanded luminance SHOULD differ widely yet all read the same frame → flag it.
+    t = _sdr()
+    stuck = _ScriptedPanel([(56.0, 56.0, 58.0)])   # every patch reads the identical stuck frame
+    loop = _solo_loop(stuck, t, MeasureLoopConfig())
+    # All mid/bright (no dim, no dark) so NO per-read plausibility fires — isolates the frozen signal.
+    for i, cv in enumerate([(512, 512, 512), (1023, 1023, 1023), (724, 724, 724), (880, 880, 880)]):
+        loop.measure_patch(_patch(f"p{i}", cv, t, i), phase="main")
+    assert loop.measurement_path_compromised is True
+    assert [a["reason"] for a in loop.read_anomalies] == ["frozen_presenter"]
+
+
+def test_varied_reads_do_not_false_positive_frozen():
+    # A working panel: each patch reads a luminance that tracks its commanded level ⇒ never frozen.
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, start_temp=1.0)
+    loop = _solo_loop(panel, t, MeasureLoopConfig())
+    for i, cv in enumerate([(512, 512, 512), (1023, 1023, 1023), (724, 724, 724), (880, 880, 880)]):
+        loop.measure_patch(_patch(f"p{i}", cv, t, i), phase="main")
+    assert all(a["reason"] != "frozen_presenter" for a in loop.read_anomalies)
+
+
+def test_panel_dark_mid_run_surfaces_anomaly():
+    # The panel sleeps mid-pass: lit patches read ~0 with ok=True (the stall clock keeps resetting).
+    # A run of consecutive lit-but-dark reads surfaces a distinct panel_dark_mid_run anomaly.
+    t = _sdr()
+    dark = _ScriptedPanel([(0.0, 0.0, 0.0)])
+    loop = _solo_loop(dark, t, MeasureLoopConfig())
+    for i in range(4):
+        loop.measure_patch(_patch(f"lit{i}", (922, 922, 922), t, i), phase="main")
+    assert loop.measurement_path_compromised is True
+    assert "panel_dark_mid_run" in {a["reason"] for a in loop.read_anomalies}
+
+
+def test_read_integrity_disabled_when_window_zero():
+    t = _sdr()
+    stuck = _ScriptedPanel([(56.0, 56.0, 58.0)])
+    loop = _solo_loop(stuck, t, MeasureLoopConfig(integrity_window=0))
+    for i, cv in enumerate([(512, 512, 512), (1023, 1023, 1023), (724, 724, 724), (880, 880, 880)]):
+        loop.measure_patch(_patch(f"p{i}", cv, t, i), phase="main")
+    assert loop.read_anomalies == []
+
+
 # ---------------------------------------------------------------------------
 # interleaved drift reference → appended re-measure
 # ---------------------------------------------------------------------------
