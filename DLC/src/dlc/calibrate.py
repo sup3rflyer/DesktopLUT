@@ -4101,11 +4101,20 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="do NOT stop the persistent dogegen daemon when the run finishes "
                              "(default: a terminal run sends it `quit`, closing its window). A "
                              "pause/resume never stops it regardless.")
-    parser.add_argument("--persistent-meter", action="store_true", dest="persistent_meter",
-                        help="OPT-IN: drive ONE long-lived interactive spotread across the whole "
-                             "pass (calibrate once, one reading per trigger) instead of re-spawning "
-                             "+ re-calibrating spotread per read. ~2-3x faster per read; validate the "
-                             "raw-pipe transport against the meter once before trusting it.")
+    meter_group = parser.add_mutually_exclusive_group()
+    meter_group.add_argument("--persistent-meter", action="store_true", dest="persistent_meter",
+                             default=True,
+                             help="DEFAULT: drive ONE long-lived interactive spotread across the whole "
+                                  "pass (calibrate once, one reading per trigger) instead of re-spawning "
+                                  "+ re-calibrating spotread per read. ~4x faster on bright patches, "
+                                  "~1.2x on dark; reads agree with the per-spawn path within meter noise "
+                                  "(A/B 2026-06-23: dE2000 mean 0.030). This flag is now a no-op kept for "
+                                  "back-compat; use --legacy-meter to opt back to per-spawn.")
+    meter_group.add_argument("--legacy-meter", "--no-persistent-meter", action="store_false",
+                             dest="persistent_meter",
+                             help="OPT-OUT fallback: re-spawn + re-calibrate a fresh spotread for EVERY "
+                                  "read (the old per-patch path). ~4x slower on bright patches; use only "
+                                  "if the persistent meter misbehaves on a given box.")
     parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
                         help="record a seam decision (repeatable) then run/resume")
     parser.add_argument("--adaptive-planning", action="store_true", dest="adaptive_planning",
@@ -4386,14 +4395,28 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         store = CorrectionStore.load(correction_store_path(profile, ctx.root))
         correction = active_correction(profile, store, profile.display_for(args.monitor).name)
         ccmx = Path(correction) if correction else None
+        # DEFAULT (persistent_meter=True): hold ONE interactive spotread open across the whole
+        # pass — calibrate once, one reading per trigger. A/B-validated as a true drop-in for the
+        # per-spawn path (2026-06-23, PA32UCXR + i1Display3: dE2000 mean 0.030, max 0.087; no bias
+        # from holding spotread open) and ~4x faster on bright patches, so it is the measuring
+        # default. `--legacy-meter` opts back to the per-spawn path below.
+        #
+        # CAVEAT — one USB i1D3 cannot back two live spotread instances: anything that needs a
+        # FRESH spotread mid-run (e.g. a ccmx build via ccxxmake) must close this persistent meter
+        # first. That is structurally enforced here: the only ccmx-mint path is the
+        # `build-correction` flow, which never reaches this branch (it is gated out at
+        # `args.flow != "build-correction"` above and measures nothing through spotread) and runs
+        # ccxxmake from a PAUSED orchestrator — i.e. a separate invocation where this meter is
+        # already closed in the finally. So the persistent meter and ccxxmake never coexist.
         if args.persistent_meter:
-            # Fast path: ONE interactive spotread, identical instrument config to the one-shot
-            # (same port + correction) so it is a true drop-in to A/B against. Closed in finally.
+            # Identical instrument config to the one-shot (same port + correction) so it is a true
+            # drop-in. The caller owns its lifecycle: closed in finally + _stall_kill.
             if argyll is None:
-                raise SystemExit("--persistent-meter requires profile paths.argyll (the spotread executable)")
+                raise SystemExit("measuring flows require profile paths.argyll (the spotread executable)")
             persistent_meter = argyll.open_persistent(SpotreadRequest(port=port, ccmx_or_ccss=ccmx))
             measure = make_persistent_spotread_meter(presenter=presenter, persistent=persistent_meter)
         else:
+            # --legacy-meter: re-spawn + re-calibrate spotread per read (the old per-spawn path).
             measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
                                           output_dir=ctx.root / "measurements" / "probe",
                                           ccmx_or_ccss=ccmx)
