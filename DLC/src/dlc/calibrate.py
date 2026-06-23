@@ -2767,7 +2767,8 @@ class Calibration:
                 options=("accept", "loosen_target", "abort"), recommendation=recommendation,
                 digest={**{k: outcome.digest.get(k) for k in
                            ("best_max_de", "best_mean_de", "above_threshold", "physical_floor",
-                            "budget_limited", "converged", "probe_total")},
+                            "budget_limited", "converged", "probe_total",
+                            "neutral_count", "neutral_mean_de", "neutral_max_de")},
                         "severe_floor": severe,
                         "recommendation": recommendation})),
                 stage="build-install-3dlut", message="aborted at the 3D-LUT correction floor")
@@ -2787,6 +2788,11 @@ class Calibration:
         # Floor points and even large model residuals can be harmless if the generated cube
         # later verifies cleanly. Auto-abort only when a large share of probes still need more
         # correction than the budget can express; that is an in-flight invariant violation.
+        # NB: the neutral-axis dE is surfaced in the seam digest (neutral_mean_de/neutral_max_de)
+        # for the LLM to JUDGE — it is deliberately NOT auto-escalated here, because a neutral axis
+        # that is off at a PHYSICAL floor (e.g. a dim channel that can't reach D65) is an ordinary
+        # panel limit, indistinguishable from a cube-induced wreck by magnitude alone. Telling those
+        # two apart (and acting on a cube wreck) is the #C2 neutral-pin follow-up.
         if self._spec().is_hdr:
             return budget_frac >= 0.20 and mean_de >= 30.0
         return budget_frac >= 0.20 and mean_de >= 20.0

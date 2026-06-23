@@ -503,6 +503,13 @@ def optimize_cube(
             )
         question = " ".join(parts)
 
+    # Neutral-axis breakout. The neutral diagonal (R=G=B) is the MHC foundation's domain; the 3D LUT
+    # is meant to refine OFF-gray volume, not re-own neutral. The cube can nonetheless pull neutral
+    # off D65, and a neutral wreck with a still-modest OVERALL mean is invisible in best_mean_de — so
+    # surface the probed-neutral dE separately for the LLM (and _severe_optimizer_floor) to judge.
+    neutral_mask = (np.max(best_verify, axis=1) - np.min(best_verify, axis=1)) <= 0.015
+    neutral_de = best_de[neutral_mask]
+
     digest = {
         "converged": converged,
         "iterations": len(history),
@@ -512,6 +519,9 @@ def optimize_cube(
         "best_max_de": round(float(best_de.max()), 4),
         "best_mean_de": round(float(best_de.mean()), 4),
         "best_p95_de": round(float(np.percentile(best_de, 95)), 4),
+        "neutral_count": int(neutral_mask.sum()),
+        "neutral_max_de": round(float(neutral_de.max()), 4) if neutral_de.size else None,
+        "neutral_mean_de": round(float(neutral_de.mean()), 4) if neutral_de.size else None,
         "above_threshold": int(masks_best["above"].sum()),
         "physical_floor": int(real_floor.sum()),
         "near_black_floor": int((real_floor & masks_best["near_black"]).sum()),

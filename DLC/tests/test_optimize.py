@@ -108,6 +108,23 @@ def test_machine_drives_correctable_panel_below_threshold():
     assert result.needs_adjudication is False
 
 
+def test_digest_breaks_out_the_neutral_axis():
+    # The optimizer reports the probed neutral-diagonal (R=G=B) dE separately from the overall mean,
+    # so the LLM (and _severe_optimizer_floor) can catch a cube that wrecks the MHC-owned neutral
+    # axis even when best_mean_de stays modest.
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
+    signals = _cube_signals(5)
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=probe(signals),
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4))
+    d = result.digest
+    assert d["neutral_count"] >= 2                       # the 5-grid diagonal has neutral patches
+    assert d["neutral_max_de"] is not None and d["neutral_mean_de"] is not None
+    assert d["neutral_max_de"] >= d["neutral_mean_de"]
+    assert d["neutral_max_de"] <= d["best_max_de"] + 1e-6  # a subset of all probes
+
+
 # ---------------------------------------------------------------------------
 # the outer fold-back loop is no worse than a single build
 # ---------------------------------------------------------------------------
