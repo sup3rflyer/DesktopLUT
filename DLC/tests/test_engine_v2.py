@@ -45,16 +45,17 @@ def test_signal_saturation_caps_are_colorspace_exact_not_xy_geometry():
     from dlc import gamut
     nat = {"R": (0.6927, 0.3028), "G": (0.1825, 0.7502), "B": (0.1521, 0.0646)}  # PA32UCXR
     space = TargetSpace(Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329)))
-    caps = signal_saturation_caps(space, nat, "Rec.2020")
-    # All three Rec.2020 primaries are unreachable on this panel → capped below 1.
-    assert all(0.2 < caps[c] < 0.5 for c in "RGB"), caps
+    caps = signal_saturation_caps(space, nat)
+    # All three Rec.2020 primaries AND the C/M/Y secondaries are unreachable on this panel → all capped.
+    assert set(caps) == {"R", "G", "B", "C", "M", "Y"}
+    assert all(0.2 < caps[c] < 0.6 for c in "RGBCMY"), caps
     # The xy-line fraction would say ~0.88; PQ makes the real signal-sat cap far lower.
     xy_frac_blue = gamut.reachable_fraction((0.3127, 0.329), (0.131, 0.046),
                                             [nat["R"], nat["G"], nat["B"]])
     assert caps["B"] < 0.6 * xy_frac_blue          # exact cap is much tighter than the xy fraction
     # A panel that already covers the target → no cap (1.0 each).
     wide = {"R": (0.708, 0.292), "G": (0.170, 0.797), "B": (0.131, 0.046)}
-    assert signal_saturation_caps(space, wide, "Rec.2020") == {"R": 1.0, "G": 1.0, "B": 1.0}
+    assert signal_saturation_caps(space, wide) == {c: 1.0 for c in "RGBCMY"}
 
 
 def test_gamut_capped_ramp_lands_in_gamut_with_one_clip_marker():
@@ -63,7 +64,7 @@ def test_gamut_capped_ramp_lands_in_gamut_with_one_clip_marker():
     nat = {"R": (0.6927, 0.3028), "G": (0.1825, 0.7502), "B": (0.1521, 0.0646)}
     nt = [nat["R"], nat["G"], nat["B"]]
     space = TargetSpace(Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329)))
-    caps = signal_saturation_caps(space, nat, "Rec.2020")
+    caps = signal_saturation_caps(space, nat)
     tr = P.Transfer.pq(bit_depth=10)
 
     def txy(rgb):

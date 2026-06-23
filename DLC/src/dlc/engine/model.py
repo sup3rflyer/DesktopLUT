@@ -260,16 +260,22 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz}
 
 
-def signal_saturation_caps(space: "TargetSpace", native_primaries: dict,
-                           colorspace: Optional[str], *,
-                           level: float = 1.0, iters: int = 30) -> Optional[dict[str, float]]:
-    """Per-primary-hue MAX **signal** saturation whose ideal target chromaticity still falls
-    inside the panel's MEASURED native gamut triangle — so generated colour patches land where
-    the panel can actually render, not at an unreachable target primary.
+# The six saturated-ramp hues by which channels are ON (1) vs OFF (0) — R/G/B primaries +
+# C/M/Y secondaries. Keyed so the patch generator can look a cap up from its on-pattern.
+_HUE_PATTERNS = (("R", (1, 0, 0)), ("G", (0, 1, 0)), ("B", (0, 0, 1)),
+                 ("C", (0, 1, 1)), ("M", (1, 0, 1)), ("Y", (1, 1, 0)))
 
-    Returns ``{"R": cap, "G": cap, "B": cap}`` with ``cap`` in ``[0,1]`` (1.0 = the target
-    primary is reachable, no cap). ``None`` when the colorspace is unknown or the native
-    primaries are incomplete (caller then does not cap).
+
+def signal_saturation_caps(space: "TargetSpace", native_primaries: dict, *,
+                           level: float = 1.0, iters: int = 30) -> Optional[dict[str, float]]:
+    """Per-hue MAX **signal** saturation whose ideal target chromaticity still falls inside the
+    panel's MEASURED native gamut triangle — so generated colour patches land where the panel
+    can actually render, not at an unreachable target primary/secondary.
+
+    Returns ``{"R","G","B","C","M","Y": cap}`` with ``cap`` in ``[0,1]`` (1.0 = that hue's full
+    saturation is reachable, no cap). Covers the **secondaries** too: C/M/Y are just two-channel
+    hues, and a Rec.2020 cyan/magenta/yellow is as unreachable on a sub-Rec.2020 panel as the
+    primaries. ``None`` when the native primaries are incomplete (caller then does not cap).
 
     The cap is **colorspace-exact**, not pure xy geometry: under a steep transfer (PQ) the
     off-channels stay near-zero until the signal backs off a lot, so the xy-line fraction badly
@@ -279,8 +285,7 @@ def signal_saturation_caps(space: "TargetSpace", native_primaries: dict,
     testing it against the native triangle (the rough RGBCMY gamut model). ``level`` is the signal
     level the cap is evaluated at (the peak, where purity is highest)."""
     from .. import gamut
-    tgt = gamut.target_primaries(colorspace)
-    if not tgt or not native_primaries or not all(c in native_primaries for c in ("R", "G", "B")):
+    if not native_primaries or not all(c in native_primaries for c in ("R", "G", "B")):
         return None
     nt = [tuple(native_primaries[c]) for c in ("R", "G", "B")]
 
@@ -290,20 +295,20 @@ def signal_saturation_caps(space: "TargetSpace", native_primaries: dict,
         return (float(xyz[0]) / s, float(xyz[1]) / s) if s > 0 else (0.0, 0.0)
 
     caps: dict[str, float] = {}
-    for ch, idx in (("R", 0), ("G", 1), ("B", 2)):
-        if gamut.point_in_triangle(tuple(tgt[ch]), *nt):
-            caps[ch] = 1.0
+    for letter, ons in _HUE_PATTERNS:
+        full = [level if on else 0.0 for on in ons]                # full-saturation hue = the target primary/secondary
+        if gamut.point_in_triangle(chroma_xy(full), *nt):
+            caps[letter] = 1.0
             continue
         lo, hi = 0.0, 1.0
         for _ in range(iters):
             m = (lo + hi) / 2.0
-            sig = [level * (1.0 - m)] * 3
-            sig[idx] = level
+            sig = [level if on else level * (1.0 - m) for on in ons]
             if gamut.point_in_triangle(chroma_xy(sig), *nt):
                 lo = m
             else:
                 hi = m
-        caps[ch] = round(lo, 4)
+        caps[letter] = round(lo, 4)
     return caps
 
 

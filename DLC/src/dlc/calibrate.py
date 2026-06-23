@@ -3277,7 +3277,7 @@ class Calibration:
             return None
         try:
             from .engine.model import TargetSpace, signal_saturation_caps
-            return signal_saturation_caps(TargetSpace(self._engine_target()), native, cs)
+            return signal_saturation_caps(TargetSpace(self._engine_target()), native)
         except Exception:  # noqa: BLE001 — generation must never crash on an optional refinement
             return None
 
