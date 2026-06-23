@@ -89,6 +89,17 @@ def test_hdr_build_mhc_builds_per_channel_eotf_cube(tmp_path):
         assert col[0] <= 1e-3 and col[-1] >= 0.99
         assert all(col[i] <= col[i + 1] + 1e-6 for i in range(size - 1))
 
+    # Option-1 cube cap: the cube REPORTS the post-cube deliverable peak (= the achievable-D65
+    # Peak-Chroma cap when the cold channel binds below target, else the target) — the number that
+    # feeds DesktopLUT's tonemapTargetPeak. base_lut.peak_nits must equal that, never exceed native.
+    pc = params["peak_chroma"]
+    assert "cube_peak_nits" in pc and "capped" in pc
+    assert base_lut["peak_nits"] == pc["cube_peak_nits"]                 # reports the post-cube peak
+    assert pc["cube_peak_nits"] <= pc["native_peak_nits"] + 1e-6         # never above native peak
+    if pc["capped"]:
+        assert pc["cube_peak_nits"] == pc["cap_nits"]                    # capped to the D65-achievable peak
+        assert abs(base_lut["summary"]["white_max_nits"] - pc["cap_nits"]) < 1.0  # cube tops out there
+
     # A Rec.2020 panel does not trip the gamut tell (the reference is Rec.2020, not sRGB).
     assert not any(a.code == "wide_gamut" for a in result.anomalies)
     # The matrix still carries the measured native primaries (~Rec.2020) + a D65 white.

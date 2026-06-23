@@ -113,16 +113,24 @@ def build(args, ctx: RunContext) -> StageResult:
             for name, idx in (("red", 0), ("green", 1), ("blue", 2))
         ]
         # Peak-Chroma cap: the brightest D65 luminance every channel can render inside full drive
-        # (the cold channel binds). This is the luminance the standalone-D65 neutral axis holds to;
-        # the closed-loop refine (stage_refine_mhc_cube) targets D65 at this cap. EVIDENCE here —
-        # it does not alter the cube build or the resolved HDR peak (see mhc-standalone-d65-peakchroma).
+        # (the cold channel binds). OPTION 1 (owner, 2026-06-23): build the cube TO this cap — the
+        # standalone-D65 neutral axis tops out at the achievable-D65 peak (not native peak), so it
+        # holds D65 all the way up instead of warming near the top, and it REPORTS that post-cube
+        # peak (what the cube actually delivers) as `peak_nits` — the number DesktopLUT's
+        # tonemapTargetPeak should track. The closed-loop refine (stage_refine_mhc_cube) targets D65
+        # at this same cap, so build + refine now agree on the ceiling.
+        cube_peak = target_luminance
         try:
             cap_nits, binding = peak_chroma_luminance(channel_peak_xyz)
             native_peak = sum(channel_peak_xyz[c][1] for c in range(3))
+            if 0.0 < cap_nits < target_luminance:
+                cube_peak = cap_nits          # hold D65: cube tops out at the achievable-D65 peak
             peak_chroma = {
                 "cap_nits": round(cap_nits, 4),
                 "binding_channel": binding,
                 "native_peak_nits": round(native_peak, 4),
+                "cube_peak_nits": round(cube_peak, 4),
+                "capped": cube_peak < target_luminance,
                 "headroom_loss_pct": round(100.0 * (1.0 - cap_nits / native_peak), 3)
                 if native_peak > 0 else None,
             }
@@ -139,7 +147,7 @@ def build(args, ctx: RunContext) -> StageResult:
         base_summary = {}
         try:
             cube_curves, cube_summary = build_hdr_cube(
-                samples, measured_primaries, white_xy, target_luminance,
+                samples, measured_primaries, white_xy, cube_peak,
                 dark_floor_nits=dark_floor_nits, level_trust=level_trust
             )
             cube_summary["dark_floor"] = dark_floor_info
@@ -151,7 +159,7 @@ def build(args, ctx: RunContext) -> StageResult:
             result.add_artifact(cube_path)
             base_lut = {
                 "cube_path": str(cube_path),
-                "peak_nits": round(target_luminance, 4),
+                "peak_nits": round(cube_peak, 4),   # the POST-CUBE deliverable peak (Option 1 cap)
                 "summary": cube_summary,
             }
             result.action(

@@ -470,6 +470,53 @@ def _reading_xy(reading: Any) -> Optional[list[float]]:
     return None
 
 
+def resolve_run_spec(ctx: RunContext, state: Mapping[str, Any], *, mode: str,
+                     bit_depth: Optional[int], panel_bit_depth: Optional[int]
+                     ) -> tuple[str, int, list[dict[str, Any]]]:
+    """Reconcile the requested (mode, bit_depth) against the PERSISTED run record.
+
+    A run's mode/bit_depth are fixed when it is CREATED; on every later invocation (a
+    resume after an adjudication seam) the CLI args default back to SDR/8-bit and must NOT
+    silently override the persisted spec — doing so mislabels every digest AND (because
+    self.mode drives stage_resolve_target) re-resolves the WRONG target onto a fresh run.
+    So the persisted record is authoritative: ``manifest.mode`` (the immutable run mode,
+    mirrored as ``state['mode']``) and the persisted ``bit_depth``. The args seed only a
+    fresh run (no persisted value yet). Returns ``(mode, bit_depth, conflicts)`` where
+    conflicts lists each field the args disagreed with (surfaced, never silently resolved)."""
+    conflicts: list[dict[str, Any]] = []
+    arg_mode = normalize_mode(mode)
+    manifest_mode = getattr(getattr(ctx, "manifest", None), "mode", None)
+    persisted_mode = normalize_mode(manifest_mode) if manifest_mode else state.get("mode")
+    eff_mode = persisted_mode or arg_mode
+    if persisted_mode and persisted_mode != arg_mode:
+        conflicts.append({"field": "mode", "requested": arg_mode, "persisted": eff_mode})
+
+    persisted_bd = state.get("bit_depth")
+    if persisted_bd is None:
+        persisted_bd = (state.get("calib") or {}).get("bit_depth")
+    if persisted_bd is not None:
+        eff_bd = int(persisted_bd)
+        if bit_depth is not None and int(bit_depth) != eff_bd:
+            conflicts.append({"field": "bit_depth", "requested": int(bit_depth), "persisted": eff_bd})
+    elif bit_depth is not None:
+        eff_bd = int(bit_depth)
+    else:
+        # Fresh run, no explicit bit depth: fall back to the panel's native depth (the
+        # long-standing constructor default), or a mode default if the panel is unknown.
+        eff_bd = int(panel_bit_depth) if panel_bit_depth else (10 if eff_mode == "HDR" else 8)
+    return eff_mode, eff_bd, conflicts
+
+
+def resolve_run_flow(state: Mapping[str, Any], flow: str) -> tuple[str, Optional[dict[str, Any]]]:
+    """Reconcile the requested flow against the persisted ``calib.flow`` (the flow chosen
+    when the run started). On resume the CLI ``--flow`` defaults to ``full`` and must not
+    overwrite the persisted flow. Returns ``(flow, conflict | None)``."""
+    persisted_flow = (state.get("calib") or {}).get("flow")
+    if persisted_flow and flow and persisted_flow != flow:
+        return persisted_flow, {"field": "flow", "requested": flow, "persisted": persisted_flow}
+    return (persisted_flow or flow), None
+
+
 class Calibration:
     """One calibration run: a flow over a monitor/mode, driving the injected
     controller + measure/probe seams + adjudicator, memoising every stage in the
@@ -513,6 +560,8 @@ class Calibration:
         self.ctx = ctx
         self.profile = profile
         self.monitor = monitor
+        # Provisional — reconciled against the persisted run record once _state is loaded
+        # below (a resume must not let the CLI default override the run's fixed mode).
         self.mode = normalize_mode(mode)
         self.controller = controller
         self.measure = measure
@@ -563,6 +612,13 @@ class Calibration:
         self.calib.setdefault("stages", {})
         self.calib.setdefault("decisions", {})
         self.target_name: Optional[str] = self.calib.get("target")
+        # Reconcile mode + bit depth against the persisted run record: a resume's CLI args
+        # default to SDR/8-bit and must NOT override the run's fixed spec (which both
+        # mislabels every digest and re-resolves the wrong target). The persisted record
+        # wins; a disagreement is recorded and surfaced in run() (never silently switched).
+        self.mode, self.bit_depth, self._spec_conflicts = resolve_run_spec(
+            ctx, self._state, mode=mode, bit_depth=bit_depth,
+            panel_bit_depth=self.display.panel.bit_depth)
 
         # The unified event spine: every phase change, stage boundary, seam, and (via the
         # measure loop / optimizer) every patch read + heartbeat lands in events.jsonl, the
@@ -601,6 +657,9 @@ class Calibration:
         self._state["calib"] = self.calib
         self._state.setdefault("monitor", self.monitor)
         self._state.setdefault("mode", self.mode)
+        # Persist the resolved bit depth so a resume restores it instead of re-deriving from
+        # the CLI default (the run spec must survive across invocations — see resolve_run_spec).
+        self._state.setdefault("bit_depth", self.bit_depth)
         _common.save_dlc_state(self.ctx, self._state)
 
     # -- cooperative cancel (the actionable half of mid-run gating) --------
@@ -1641,9 +1700,15 @@ class Calibration:
             # The persistent per-display store supplies the correction's real build
             # date when present (a refresh recorded since the profile was written),
             # so staleness ages from when the correction was actually made (§10).
-            store_rec = self._correction_store().get(self.display.name)
+            corr_store = self._correction_store()
+            store_rec = corr_store.get(self.display.name)
             store_made = store_rec.correction_made if store_rec else None
-            staleness = self.profile.correction_staleness(today=self.run_date, made_override=store_made)
+            # Consult the SAME correction the meter is actually wired to (store overrides the
+            # profile YAML — active_correction), not the (possibly empty) profile YAML, so the
+            # tell can't report "no correction" while the meter is in fact corrected.
+            staleness = self.profile.correction_staleness(
+                today=self.run_date, made_override=store_made,
+                file_override=active_correction(self.profile, corr_store, self.display.name))
             # Patch-window placement guard (M3): dogegen has NO monitor-select CLI — its window
             # opens on the Windows primary and is positioned/fullscreened by hand. If the
             # calibration target isn't the primary, patches would land on the WRONG panel and
@@ -2707,7 +2772,7 @@ class Calibration:
             base_lut = params.get("base_lut") or {}
             cube_path = base_lut.get("cube_path")
             peak_chroma = params.get("peak_chroma") or {}
-            cap_nits = peak_chroma.get("cap_nits")
+            cap_nits = peak_chroma.get("cube_peak_nits") or peak_chroma.get("cap_nits")  # refine to the cube's actual top (Option 1)
             channel_peak_xyz = params.get("channel_peak_xyz")
             native_white = params.get("measured_white") or {}
             nwx, nwy = native_white.get("x"), native_white.get("y")
@@ -3212,8 +3277,23 @@ class Calibration:
     def run(self, flow: str) -> CalibrationResult:
         import time
         self._run_started_monotonic = time.monotonic()   # check-in elapsed anchor (this process)
+        # Reconcile the flow against the persisted run record (a resume's --flow defaults to
+        # `full` and must not overwrite the flow the run actually started with).
+        flow, flow_conflict = resolve_run_flow(self._state, flow)
         self.calib["flow"] = flow
         self._save()
+        # Surface any run-spec disagreement (mode/bit_depth from the constructor, flow here):
+        # the persisted spec is authoritative, but a CLI that asked for something else is a real
+        # signal (a mis-issued resume command) the LLM should see — never a silent switch.
+        conflicts = list(self._spec_conflicts) + ([flow_conflict] if flow_conflict else [])
+        if conflicts:
+            self.runlog.anomaly(
+                "run", run_spec_conflict=True, conflicts=conflicts,
+                message=("resume requested " + ", ".join(
+                    f"{c['field']}={c['requested']}" for c in conflicts) +
+                    " but the persisted run spec is " + ", ".join(
+                    f"{c['field']}={c['persisted']}" for c in conflicts) +
+                    " — kept the persisted spec (the run's mode/flow/bit_depth are fixed at creation)."))
         self._publish_active_pointer()   # let the dashboard find this run (and the next)
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
         if self._enable_watchdog:
@@ -4287,6 +4367,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # seed map alone can't — adjudicate() replays a recorded key before consulting the
     # adjudicator). See Calibration.adjudicate().
     state = _common.load_dlc_state(ctx)
+    # The LIVE meter/dogegen stack below is built BEFORE the orchestrator, so it must use the
+    # SAME spec the orchestrator will resolve — on a resume the persisted run record (not the
+    # CLI defaults) is authoritative. resolve_run_spec/flow are pure + deterministic, so these
+    # match Calibration's own reconciliation exactly. The orchestrator is still constructed from
+    # the RAW args (below) so it can detect + surface a mis-issued resume command, not silence it.
+    eff_mode, eff_bit_depth, _spec_conflicts = resolve_run_spec(
+        ctx, state, mode=args.mode, bit_depth=args.bit_depth,
+        panel_bit_depth=profile.display_for(args.monitor).panel.bit_depth)
+    eff_flow, _ = resolve_run_flow(state, args.flow)
     recorded = (state.get("calib", {}) or {}).get("decisions", {})
     decisions = {k: Decision(v["choice"], v.get("note"), payload=v.get("payload"))
                  for k, v in recorded.items()}
@@ -4354,11 +4443,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # values dogegen renders match what the patches encode (no 8/10 mismatch). SDR defaults to
     # 8-bit (dogegen "mode 8", composited — 3D-LUT-safe); --bit-depth 10 opts into 10-bit
     # ("mode 10"), which needs the TPG window borderless-fullscreened to render accurately.
-    bit_depth = args.bit_depth if args.bit_depth is not None else (10 if normalize_mode(args.mode) == "HDR" else 8)
+    bit_depth = eff_bit_depth   # resolved against the persisted run spec (see above)
     presenter = None
     persistent_meter = None
     measure: Optional[MeasureFn] = None
-    if args.flow != "build-correction":
+    if eff_flow != "build-correction":
         argyll_dir = profile.paths.get("argyll")
         argyll = Argyll(Path(argyll_dir) / "spotread.exe") if argyll_dir else None
         # resolve_spotread_instrument_port returns (port, info) — MUST unpack; passing the
@@ -4377,7 +4466,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # Floor the dwell so a fast panel (measured settle ≈ 0) still gets a paint-safe wait, while a
         # slow-ABL panel's larger measured settle is honoured. characterize keeps the default (it must
         # observe the raw step response, and its settle measurement is dwell-independent anyway).
-        if args.flow != "characterize" and dip_rec is not None and dip_rec.settle_seconds is not None:
+        if eff_flow != "characterize" and dip_rec is not None and dip_rec.settle_seconds is not None:
             presenter_settle = max(0.2, dip_rec.settle_seconds)
         else:
             presenter_settle = 0.5
@@ -4401,7 +4490,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                     (controller.query_monitors() or {}).get("monitors"), args.monitor)
             except Exception:  # noqa: BLE001 - advisory placement; never block the run
                 place_rect = None
-            presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), normalize_mode(args.mode),
+            presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), eff_mode,
                                                              bit_depth=bit_depth),
                                          settle_seconds=presenter_settle, place_rect=place_rect)
         # The active correction comes from the store first (a freshly probe-matched .ccmx)
@@ -4490,9 +4579,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              bit_depth=bit_depth)
         presenter.show(patch)
 
+    # Pass the RAW CLI mode/bit_depth (not the resolved eff_*): Calibration re-runs the same
+    # deterministic reconciliation and, seeing the raw request, surfaces a mis-issued resume
+    # (e.g. a flagless resume that asked for SDR/8 on an HDR/10 run) instead of silently switching.
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
-                        bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
+                        bit_depth=args.bit_depth, force=args.force, patch_sizes=patch_sizes,
                         characterize_config=characterize_config, decision_overrides=overrides,
                         skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,
