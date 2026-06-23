@@ -31,6 +31,11 @@ _LUMA = (0.2126, 0.7152, 0.0722)
 _LUMA_REC2020 = (0.2627, 0.6780, 0.0593)
 # Patch-family ordering for the Colour Luminance bar chart (matches HCFR's R/G/B/C/M/Y sweep).
 _FAMILY_ORDER = {"R": 0, "Y": 1, "G": 2, "C": 3, "B": 4, "M": 5, "mix": 6}
+# Native-gamut overlay (visualization only): a primary candidate this far below the brightest
+# primary read — or below this absolute Y — is a sub-noise (near-black) read whose chromaticity
+# is meaningless, so it must never be plotted as the panel's native primary.
+_NATIVE_PRIMARY_Y_FLOOR_FRAC = 0.01
+_NATIVE_PRIMARY_Y_FLOOR_ABS = 0.1
 
 
 def _sig_hex(sig) -> str:
@@ -605,26 +610,43 @@ class DashboardState:
         return out
 
     def _native_primaries(self) -> Optional[dict[str, list[float]]]:
-        """The panel's measured native R/G/B chromaticities — the most-saturated pure-channel
-        patch per hue from the RAW (first-measured) stage, so it's the true native gamut
-        independent of which corrected stage the scatter currently shows. ``None`` until all
-        three primaries have a saturated measured patch (e.g. a neutral-only raw ramp)."""
+        """The panel's measured native R/G/B chromaticities — the true full-drive primary per
+        hue from the RAW (first-measured) stage, so it's the native gamut independent of which
+        corrected stage the scatter currently shows. ``None`` until all three primaries have a
+        usable (above-noise) saturated patch (e.g. a neutral-only raw ramp).
+
+        Selection is by *highest luminance*, not saturation: every pure-channel patch
+        ([0,g,0] …) classifies as ~100% saturated, so picking by saturation alone can keep a
+        near-black read whose chromaticity is pure noise (observed: green plotted at a wild
+        (0.232, 0.466) from a Y=0.027-nit read instead of the real ~(0.183, 0.749) primary).
+        Within the most-saturated class we therefore take the brightest read — mirroring the
+        engine's ``channel_model().peak_xyz`` (highest-Y sample), which the build/scoring use."""
         if not self._stage_seq:
             return None
         color_map = self._color_by_stage.get(self._stage_seq[0], {})
-        best: dict[str, tuple[int, list[float]]] = {}
+        # family -> (saturation, Y, [x, y]); prefer the most-saturated class and, within it,
+        # the highest-luminance (true full-drive) read.
+        best: dict[str, tuple[int, float, list[float]]] = {}
         for c in color_map.values():
-            sig, x, y = c.get("signal"), c.get("x"), c.get("y")
-            if x is None or y is None or not sig:
+            sig, x, y, Y = c.get("signal"), c.get("x"), c.get("y"), c.get("Y")
+            if x is None or y is None or Y is None or not sig:
                 continue
             family, sat = _classify_color(sig)
             if family not in ("R", "G", "B") or sat <= 0:
                 continue
-            if family not in best or sat > best[family][0]:
-                best[family] = (sat, [round(x, 5), round(y, 5)])
+            prev = best.get(family)
+            if prev is None or sat > prev[0] or (sat == prev[0] and Y > prev[1]):
+                best[family] = (sat, float(Y), [round(x, 5), round(y, 5)])
         if not all(f in best for f in ("R", "G", "B")):
             return None
-        return {f.lower(): best[f][1] for f in ("R", "G", "B")}
+        # Suppress sub-noise primaries: a chosen read far below the brightest primary (or below
+        # an absolute floor) has unreliable chromaticity — hide the whole overlay rather than
+        # plot the native gamut at a meaningless point.
+        brightest = max(best[f][1] for f in ("R", "G", "B"))
+        floor = max(_NATIVE_PRIMARY_Y_FLOOR_ABS, brightest * _NATIVE_PRIMARY_Y_FLOOR_FRAC)
+        if any(best[f][1] < floor for f in ("R", "G", "B")):
+            return None
+        return {f.lower(): best[f][2] for f in ("R", "G", "B")}
 
     def _saturation(self, color_map: dict, white_xy: Any) -> list[dict[str, Any]]:
         """Saturation tracking per hue family: measured chroma (CIE 1976 u'v' distance from the

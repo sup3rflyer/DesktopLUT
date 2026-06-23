@@ -98,6 +98,44 @@ def test_native_primaries_none_without_saturated_patches():
     assert st.charts()["cie"]["native"] is None    # neutral-only raw → no native gamut
 
 
+def test_native_primaries_picks_highest_luminance_green_over_near_black():
+    """A green ramp where the near-black green ([0,0.035,0], Y=0.027) is ~100% saturated but
+    sub-noise — its chromaticity (0.232, 0.466) is meaningless. The native-green overlay must
+    come from the brightest full-drive green (mirroring channel_model().peak_xyz), NOT the
+    first/dim saturated read. Reproduces run 20260623_093924_400363 (PA32UCXR HDR)."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))
+    # Bright red + blue primaries.
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=100.0, xy=[0.69, 0.30], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 0, 255], signal=[0.0, 0.0, 1.0], Y=20.0, xy=[0.15, 0.05], ok=True))
+    # Green ramp: the dim near-black green is ingested FIRST (would win under saturation-only),
+    # then the bright full-drive green with the real primary chromaticity.
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 9, 0], signal=[0.0, 0.035, 0.0], Y=0.027, xy=[0.232, 0.466], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 195, 0], signal=[0.0, 0.764, 0.0], Y=80.0, xy=[0.183, 0.749], ok=True))
+    nat = st.charts()["cie"]["native"]
+    assert nat is not None
+    assert abs(nat["g"][0] - 0.183) < 1e-3 and abs(nat["g"][1] - 0.749) < 1e-3
+
+
+def test_native_primaries_none_when_a_primary_is_only_sub_noise():
+    """If a whole family is only ever seen as a sub-noise near-black read, its chromaticity is
+    unreliable — hide the overlay rather than plot the native gamut at a noise point."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=100.0, xy=[0.69, 0.30], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 0, 255], signal=[0.0, 0.0, 1.0], Y=20.0, xy=[0.15, 0.05], ok=True))
+    # Only a sub-noise green was ever measured.
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 9, 0], signal=[0.0, 0.035, 0.0], Y=0.027, xy=[0.232, 0.466], ok=True))
+    assert st.charts()["cie"]["native"] is None
+
+
 def test_per_patch_de_enriches_reads_and_live_header():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",
