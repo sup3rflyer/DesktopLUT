@@ -500,5 +500,9 @@ def test_mhc2_matrix_warm_panel_needs_cooler_neutral_drive():
     target = {"rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797, "bx": 0.131, "by": 0.046}
     warm_white = (0.330, 0.340)   # warmer than D65 (0.3127, 0.3290)
     M = mc.mhc2_matrix(target, warm_white, target, _WHITE)
+    # Native gamut == target gamut (only the white differs) ⇒ a pure DIAGONAL white-only move
+    # (no cross-channel gamut rotation). The native-target refine relies on this: its rowsums are
+    # the per-channel white gains, NOT cross-channel sums — so the cube abscissa matches the install.
+    assert all(abs(M[r][c]) < 1e-9 for r in range(3) for c in range(3) if r != c)
     rowsums = [sum(M[r]) for r in range(3)]
     assert rowsums[2] > rowsums[0]   # blue driven harder than red to cool the white

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 from argparse import Namespace
@@ -2525,7 +2526,22 @@ class Calibration:
             base = params["base_grayscale"]
             base_lut = params.get("base_lut")
             # Install through the controller (set primaries/white → base correction → apply → verify).
-            self.controller.set_primaries(self.monitor, self.mode, params["primaries"])
+            install_primaries = params["primaries"]
+            # OBSOLETE — native targeting is now the C++ DEFAULT for HDR. As of 2026-06-23,
+            # GenerateMHC2Profile (mhc_icc.cpp) sets srcPrim=native (panel's MEASURED primaries) for
+            # HDR, so MHC2 = inv(displayToXYZ)·srcToXYZ is already a pure diagonal white-only move
+            # (native white → D65, gamut identity) computed in the *native* basis — strictly better
+            # than this hook's BT.2020-basis approximation. So the normal path (pushing the measured
+            # native primaries below) now produces the native target directly. The DLC_SRC_NATIVE=1
+            # validation hook (which pushed BT.2020 as the *display* primaries on the old hardcoded-
+            # Rec.2020-src C++) is RETIRED: it would shadow and degrade the now-correct C++ default.
+            # Kept only as a logged tripwire so a stale env var can't silently change behavior.
+            # See the mhc-blue-red-channel-collapse memo + GenerateMHC2Profile's source-primaries note.
+            if spec.is_hdr and os.environ.get("DLC_SRC_NATIVE") == "1":
+                self.ctx.log("DLC_SRC_NATIVE=1 is OBSOLETE and now a NO-OP: native targeting is the "
+                             "C++ default (mhc_icc.cpp GenerateMHC2Profile). Ignoring; installing the "
+                             "measured native primaries (the correct native-basis target). Unset the var.")
+            self.controller.set_primaries(self.monitor, self.mode, install_primaries)
             white = self._resolved_white()
             wx, wy = white.xy
             # set_white populates DesktopLUT's customPrimaries.W — the MEASURED *display*
@@ -2799,9 +2815,14 @@ class Calibration:
             from .mhc_cube import mhc2_matrix, read_1d_cube, refine_hdr_cube, write_1d_cube
 
             # Post-matrix neutral drive per channel (M @ (1,1,1)) — the signal Windows applies the
-            # cube at. Source = the HDR standard gamut (Rec.2020 @ D65); display = the native panel.
+            # cube at. The installed MHC2 now targets the NATIVE gamut (C++ default 2026-06-23), so
+            # the matrix is the native-basis white-only move (a diagonal native-white→D65 gain), NOT
+            # the old Rec.2020-source matrix. The refine's abscissa MUST match what's installed, so
+            # compute the SAME native-target matrix here (target primaries = native too) — else the
+            # rowsums (cube abscissa) mismatch the installed diagonal matrix and the closed loop
+            # converges to the wrong post-matrix signal.
             matrix = mhc2_matrix(params["primaries"], (nwx, nwy),
-                                 build_mhc.REC2020_PRIMARIES, _D65_XY)
+                                 params["primaries"], _D65_XY)
             rowsums = [sum(matrix[r]) for r in range(3)]
             wx, wy = self._white_xy()                       # target white (resolved D65)
             gen = self.ctx.root / "generated"
