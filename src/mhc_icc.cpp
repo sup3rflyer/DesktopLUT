@@ -310,8 +310,13 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     //   displayed_XYZ = displayRGBtoXYZ * XYZtoWire * MHC2 * WireToXYZ * input_linear
     //
     // For correct colors: displayed_XYZ = srcRGBtoXYZ * input_linear
-    // Therefore: displayRGBtoXYZ * MHC2 = srcRGBtoXYZ  (wire cancels since wire = src)
+    // Therefore: displayRGBtoXYZ * MHC2 = srcRGBtoXYZ
     //   MHC2 = inv(displayRGBtoXYZ) * srcRGBtoXYZ
+    // (For SDR and the legacy BT.2020-src HDR path the wire == src so the wire factors cancel; for
+    // the native-src HDR path wire (BT.2020) != src (native) — but since Windows applies the matrix
+    // directly to linear RGB with no XYZ wrap, "src" just SELECTS how that linear RGB is interpreted.
+    // Native src ⇒ the matrix is a diagonal white-only move; the 3D LUT owns the BT.2020→native gamut.
+    // See GenerateMHC2Profile's source-primaries note.)
     //
     // Windows applies this MHC2 matrix DIRECTLY to (linear) RGB — there is NO XYZ wrap — so the
     // correct transform is the RGB→RGB form derived above: inv(displayRGBtoXYZ) * srcRGBtoXYZ
@@ -404,7 +409,44 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     outData.clear();
 
     // Compute MHC2 3x4 matrix directly from primaries (no Bradford adaptation)
-    const DisplayPrimariesData& srcPrim = params.isHDR ? g_bt2020Primaries : g_srgbPrimaries;
+    //
+    // SOURCE (target) primaries:
+    //   SDR  → sRGB. sRGB is INSIDE the panel's gamut, so it's reachable: blue maps near-identity,
+    //          desktop content clamps correctly, no near-zero-red routing.
+    //   HDR  → the panel's MEASURED NATIVE primaries (NOT BT.2020). Targeting BT.2020 asks the
+    //          MHC2 matrix to map the sub-Rec.2020 panel UP to BT.2020; that routes in-gamut /
+    //          desaturated blue (e.g. [0.54,0.54,0.729]) through a near-ZERO native-red drive, and
+    //          the panel is sub-additive at near-zero red, so it renders ~0 light there →
+    //          RED-CHANNEL COLLAPSE (in-gamut blues rendered WORSE than uncorrected; HW-measured
+    //          47-53 dE_ITP vs native ~2-9). With native src, srcRGBtoXYZ shares the panel's
+    //          chromaticities with displayRGBtoXYZ, so MHC2 = inv(displayToXYZ)·srcToXYZ degenerates
+    //          to a pure DIAGONAL white-only move (native white → D65) with GAMUT IDENTITY — no
+    //          remap, no collapse. The panel renders its native gamut at D65 grayscale; the 3D-LUT
+    //          layer owns in-gamut color volume (1+1+1 design). Validated 2026-06-23 on PA32UCXR
+    //          (via DLC_SRC_NATIVE=1): the four collapsed in-gamut blues dropped 49→13 dE_ITP,
+    //          grayscale held D65. See the mhc-blue-red-channel-collapse memo.
+    //
+    // The native HDR src carries the D65 TARGET white (like the sRGB/BT.2020 src whites); displayPrim
+    // carries the panel's MEASURED native white (via set_white, populated when primariesEnabled). The
+    // native→D65 move is exactly that src↔display white delta — building src from the native white too
+    // would make S_src == S_disp ⇒ ZERO white move (the panel's native white would pass straight
+    // through). Wire interpretation: Windows applies the matrix DIRECTLY to linear RGB (no XYZ wrap,
+    // see ComputeMHC2Matrix), so choosing native src simply REINTERPRETS the incoming BT.2020-container
+    // linear RGB as native-gamut+D65 content — the old "wire cancels since wire = src" identity no
+    // longer holds for HDR, and that is intentional (the 3D LUT, not the MHC, owns BT.2020→native).
+    DisplayPrimariesData hdrNativeSrc{};
+    const DisplayPrimariesData* srcPrimPtr;
+    if (!params.isHDR) {
+        srcPrimPtr = &g_srgbPrimaries;
+    } else if (params.primariesEnabled) {
+        hdrNativeSrc = params.displayPrimaries;  // native R/G/B chromaticities + measured native white
+        hdrNativeSrc.Wx = 0.3127f;               // ...but src TARGETS D65 (white move = src↔display delta)
+        hdrNativeSrc.Wy = 0.3290f;
+        srcPrimPtr = &hdrNativeSrc;
+    } else {
+        srcPrimPtr = &g_bt2020Primaries;  // no measured primaries → display==src → identity (old no-op)
+    }
+    const DisplayPrimariesData& srcPrim = *srcPrimPtr;
     const DisplayPrimariesData& displayPrim = params.primariesEnabled
         ? params.displayPrimaries : srcPrim;
 
