@@ -17,7 +17,7 @@ from . import _common
 
 
 def build(args, ctx: RunContext) -> StageResult:
-    mode = _common.normalize_mode(args.mode)
+    mode = _common.run_mode(args, ctx)
     result = StageResult("install-3dlut")
 
     cube_path = Path(args.cube) if args.cube else latest_3dlut_cube(ctx)

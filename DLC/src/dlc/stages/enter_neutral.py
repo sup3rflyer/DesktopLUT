@@ -21,7 +21,7 @@ from . import _common
 
 
 def build(args, ctx: RunContext) -> StageResult:
-    mode = _common.normalize_mode(args.mode)
+    mode = _common.run_mode(args, ctx)
     result = StageResult("enter-neutral")
     controller = _common.make_controller(args, ctx)
 

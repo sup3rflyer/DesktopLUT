@@ -471,8 +471,8 @@ def _reading_xy(reading: Any) -> Optional[list[float]]:
 
 
 def resolve_run_spec(ctx: RunContext, state: Mapping[str, Any], *, mode: str,
-                     bit_depth: Optional[int], panel_bit_depth: Optional[int]
-                     ) -> tuple[str, int, list[dict[str, Any]]]:
+                     bit_depth: Optional[int]
+                     ) -> tuple[str, Optional[int], list[dict[str, Any]]]:
     """Reconcile the requested (mode, bit_depth) against the PERSISTED run record.
 
     A run's mode/bit_depth are fixed when it is CREATED; on every later invocation (a
@@ -480,13 +480,18 @@ def resolve_run_spec(ctx: RunContext, state: Mapping[str, Any], *, mode: str,
     silently override the persisted spec — doing so mislabels every digest AND (because
     self.mode drives stage_resolve_target) re-resolves the WRONG target onto a fresh run.
     So the persisted record is authoritative: ``manifest.mode`` (the immutable run mode,
-    mirrored as ``state['mode']``) and the persisted ``bit_depth``. The args seed only a
-    fresh run (no persisted value yet). Returns ``(mode, bit_depth, conflicts)`` where
-    conflicts lists each field the args disagreed with (surfaced, never silently resolved)."""
+    mirrored as ``state['mode']``) and the persisted ``bit_depth``.
+
+    Returns ``(mode, bit_depth, conflicts)``. ``bit_depth`` is the persisted value (resume)
+    or the explicit arg (fresh + ``--bit-depth``), or ``None`` when there is nothing to
+    restore/override — the caller then applies its OWN fresh-run default (the orchestrator's
+    panel depth vs main()'s ``10 if HDR else 8`` differ, and unifying them here would change
+    live behavior). ``conflicts`` lists each field the args disagreed with (never silent)."""
     conflicts: list[dict[str, Any]] = []
     arg_mode = normalize_mode(mode)
     manifest_mode = getattr(getattr(ctx, "manifest", None), "mode", None)
-    persisted_mode = normalize_mode(manifest_mode) if manifest_mode else state.get("mode")
+    persisted_mode = normalize_mode(manifest_mode) if manifest_mode else (
+        normalize_mode(state["mode"]) if state.get("mode") else None)
     eff_mode = persisted_mode or arg_mode
     if persisted_mode and persisted_mode != arg_mode:
         conflicts.append({"field": "mode", "requested": arg_mode, "persisted": eff_mode})
@@ -495,15 +500,13 @@ def resolve_run_spec(ctx: RunContext, state: Mapping[str, Any], *, mode: str,
     if persisted_bd is None:
         persisted_bd = (state.get("calib") or {}).get("bit_depth")
     if persisted_bd is not None:
-        eff_bd = int(persisted_bd)
+        eff_bd: Optional[int] = int(persisted_bd)
         if bit_depth is not None and int(bit_depth) != eff_bd:
             conflicts.append({"field": "bit_depth", "requested": int(bit_depth), "persisted": eff_bd})
     elif bit_depth is not None:
         eff_bd = int(bit_depth)
     else:
-        # Fresh run, no explicit bit depth: fall back to the panel's native depth (the
-        # long-standing constructor default), or a mode default if the panel is unknown.
-        eff_bd = int(panel_bit_depth) if panel_bit_depth else (10 if eff_mode == "HDR" else 8)
+        eff_bd = None             # nothing persisted/explicit → caller keeps its own default
     return eff_mode, eff_bd, conflicts
 
 
@@ -568,6 +571,8 @@ class Calibration:
         self.adjudicator = adjudicator
         self._probe = probe
         self.display = profile.display_for(monitor)
+        # Provisional — reconciled against the persisted run record below (resolve_run_spec),
+        # alongside self.mode, so a resume restores the run's fixed bit depth.
         self.bit_depth = bit_depth if bit_depth is not None else self.display.panel.bit_depth
         self.loop_config = loop_config
         # Near-neutral read FLOOR: guarantee the chroma-critical grey-ramp+tube region is averaged
@@ -616,9 +621,12 @@ class Calibration:
         # default to SDR/8-bit and must NOT override the run's fixed spec (which both
         # mislabels every digest and re-resolves the wrong target). The persisted record
         # wins; a disagreement is recorded and surfaced in run() (never silently switched).
-        self.mode, self.bit_depth, self._spec_conflicts = resolve_run_spec(
-            ctx, self._state, mode=mode, bit_depth=bit_depth,
-            panel_bit_depth=self.display.panel.bit_depth)
+        self.mode, _eff_bd, self._spec_conflicts = resolve_run_spec(
+            ctx, self._state, mode=mode, bit_depth=bit_depth)
+        # eff_bd is None only when nothing was persisted/explicit → keep the long-standing
+        # constructor default (the panel's native depth). main() applies its own fresh-run
+        # default (10 if HDR else 8) and passes the resolved value in, so the two never diverge.
+        self.bit_depth = _eff_bd if _eff_bd is not None else self.display.panel.bit_depth
 
         # The unified event spine: every phase change, stage boundary, seam, and (via the
         # measure loop / optimizer) every patch read + heartbeat lands in events.jsonl, the
@@ -4372,9 +4380,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # CLI defaults) is authoritative. resolve_run_spec/flow are pure + deterministic, so these
     # match Calibration's own reconciliation exactly. The orchestrator is still constructed from
     # the RAW args (below) so it can detect + surface a mis-issued resume command, not silence it.
-    eff_mode, eff_bit_depth, _spec_conflicts = resolve_run_spec(
-        ctx, state, mode=args.mode, bit_depth=args.bit_depth,
-        panel_bit_depth=profile.display_for(args.monitor).panel.bit_depth)
+    # The orchestrator (constructed from the RAW args below) re-derives + SURFACES any conflict,
+    # so main only needs the resolved values to build the live stack — discard the conflict list.
+    eff_mode, _eff_bd, _ = resolve_run_spec(ctx, state, mode=args.mode, bit_depth=args.bit_depth)
     eff_flow, _ = resolve_run_flow(state, args.flow)
     recorded = (state.get("calib", {}) or {}).get("decisions", {})
     decisions = {k: Decision(v["choice"], v.get("note"), payload=v.get("payload"))
@@ -4443,7 +4451,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # values dogegen renders match what the patches encode (no 8/10 mismatch). SDR defaults to
     # 8-bit (dogegen "mode 8", composited — 3D-LUT-safe); --bit-depth 10 opts into 10-bit
     # ("mode 10"), which needs the TPG window borderless-fullscreened to render accurately.
-    bit_depth = eff_bit_depth   # resolved against the persisted run spec (see above)
+    # Resolved against the persisted run spec (see above); when nothing is persisted/explicit
+    # (_eff_bd is None) keep main()'s long-standing live default: 10-bit HDR, 8-bit SDR.
+    bit_depth = _eff_bd if _eff_bd is not None else (10 if eff_mode == "HDR" else 8)
     presenter = None
     persistent_meter = None
     measure: Optional[MeasureFn] = None
@@ -4579,12 +4589,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              bit_depth=bit_depth)
         presenter.show(patch)
 
-    # Pass the RAW CLI mode/bit_depth (not the resolved eff_*): Calibration re-runs the same
-    # deterministic reconciliation and, seeing the raw request, surfaces a mis-issued resume
-    # (e.g. a flagless resume that asked for SDR/8 on an HDR/10 run) instead of silently switching.
+    # Pass the RAW CLI mode (Calibration re-runs the same deterministic reconciliation and,
+    # seeing the raw request, surfaces a mis-issued flagless resume that asked for SDR on an HDR
+    # run instead of silently switching). bit_depth is the already-RESOLVED value so the
+    # orchestrator's patch encoding matches the meter/dogegen stack built above AND gets persisted
+    # as the run's depth — main()'s fresh default (8-bit SDR) and the orchestrator's panel-depth
+    # default differ, so passing the resolved value is what keeps the live path consistent.
     calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
                         controller=controller, measure=measure, adjudicator=adjudicator,
-                        bit_depth=args.bit_depth, force=args.force, patch_sizes=patch_sizes,
+                        bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
                         characterize_config=characterize_config, decision_overrides=overrides,
                         skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,

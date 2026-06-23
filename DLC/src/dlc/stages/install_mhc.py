@@ -16,7 +16,7 @@ from . import _common
 
 
 def build(args, ctx: RunContext) -> StageResult:
-    mode = _common.normalize_mode(args.mode)
+    mode = _common.run_mode(args, ctx)
     result = StageResult("install-mhc")
 
     state = _common.load_dlc_state(ctx)

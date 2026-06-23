@@ -200,6 +200,66 @@ def test_staleness_no_correction():
     v = p.correction_staleness(today=datetime.date(2026, 6, 16))
     assert v.has_correction is False
     assert v.stale is False  # nothing to be stale; it's a "no correction" tell, not a gate
+    assert v.present is None and v.file is None
+
+
+# ---------------------------------------------------------------------------
+# correction tell consults the RESOLVED active correction (file_override), not the
+# profile YAML — the store overrides the YAML (Finding 1). Existence-checked so a
+# configured-but-missing correction is distinct from none-configured.
+# ---------------------------------------------------------------------------
+
+def _profile_no_yaml_correction(*, made=None, argyll=None):
+    return cp.Profile(
+        meter=cp.MeterConfig(correction=cp.CorrectionInfo(file=None, made=made)),
+        displays=(cp.DisplayConfig(name="d", desktoplut_monitor=0, argyll_display=1, sdr_target="t"),),
+        targets={"t": cp.TargetSpec(name="t")},
+        paths=({"argyll": str(argyll)} if argyll else {}),
+    )
+
+
+def test_staleness_file_override_supersedes_empty_yaml():
+    # The YAML has NO correction, but the store-resolved active correction does — the tell must
+    # report has_correction=True (previously it falsely said "no correction configured").
+    p = _profile_no_yaml_correction(made="2026-05-01")
+    v = p.correction_staleness(today=datetime.date(2026, 6, 16),
+                               made_override="2026-05-01", file_override="x.ccmx")
+    assert v.has_correction is True
+    assert v.file == "x.ccmx"
+    assert v.present is None        # bare name, no argyll dir → presence unknowable (no false "missing")
+    assert v.stale is False and v.age_days == 46
+
+
+def test_staleness_explicit_none_override_is_no_correction():
+    # An explicit None (the store resolved to genuinely no correction) must read as none-configured,
+    # NOT fall back to the profile YAML — the sentinel default distinguishes these.
+    p = cp.Profile.synthetic(correction_made="2026-05-01")  # YAML has synthetic.ccmx
+    v = p.correction_staleness(today=datetime.date(2026, 6, 16), file_override=None)
+    assert v.has_correction is False
+    assert v.present is None
+
+
+def test_staleness_configured_but_missing_on_disk(tmp_path):
+    # The correction is configured AND we can check its location (argyll dir), but the file is
+    # absent → a distinct "configured-but-missing" tell, not a staleness verdict.
+    p = _profile_no_yaml_correction(made="2026-05-01", argyll=tmp_path)
+    v = p.correction_staleness(today=datetime.date(2026, 6, 16),
+                               made_override="2026-05-01", file_override="gone.ccmx")
+    assert v.has_correction is True
+    assert v.present is False
+    assert v.stale is False
+    assert "MISSING" in v.message
+
+
+def test_staleness_present_on_disk_scores_normally(tmp_path):
+    (tmp_path / "real.ccmx").write_text("CCMX", encoding="utf-8")
+    p = _profile_no_yaml_correction(made="2025-01-01", argyll=tmp_path)
+    v = p.correction_staleness(today=datetime.date(2026, 6, 16),
+                               made_override="2025-01-01", file_override="real.ccmx")
+    assert v.has_correction is True
+    assert v.present is True
+    assert v.stale is True          # old, and the file is really there → judged normally
+    assert "old" in v.message
 
 
 # ---------------------------------------------------------------------------

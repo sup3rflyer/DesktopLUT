@@ -169,6 +169,15 @@ def resolve_run(args: argparse.Namespace, *, create: bool = False) -> RunContext
     raise FileNotFoundError("no existing run under runs/; run preflight or enter-neutral first")
 
 
+def run_mode(args: argparse.Namespace, ctx: RunContext) -> str:
+    """The mode a stage should calibrate in: the run's FIXED mode (the manifest, set at
+    creation) when resuming an existing run, else the CLI ``--mode`` for a fresh run. A stage
+    CLI's ``--mode`` defaults to SDR, so without this a flagless resume of an HDR run would
+    derive the SDR target/transfer — the run-spec drift class (see calibrate.resolve_run_spec)."""
+    manifest_mode = getattr(getattr(ctx, "manifest", None), "mode", None)
+    return normalize_mode(manifest_mode or args.mode)
+
+
 # --------------------------------------------------------------------------
 # DesktopLUT controller: real pipe or file-backed simulator
 # --------------------------------------------------------------------------

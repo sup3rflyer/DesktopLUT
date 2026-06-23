@@ -2231,3 +2231,60 @@ def test_hdr_brightness_flags_a_dark_panel_despite_fixed_peak(tmp_path: Path, mo
     calib.target_name = "rec2020_pq"; calib.calib["target"] = "rec2020_pq"
     with pytest.raises(CalibrationAborted):
         calib.stage_brightness()
+
+
+# ---------------------------------------------------------------------------
+# Resume restores the persisted run spec (mode/flow/bit_depth) — a flagless resume's
+# CLI defaults (SDR/full/8) must NOT override the run's fixed spec, which would both
+# mislabel every digest and re-resolve the wrong target (Finding 2).
+# ---------------------------------------------------------------------------
+
+def test_resolve_run_spec_prefers_persisted_on_resume(tmp_path: Path):
+    from dlc.calibrate import resolve_run_flow, resolve_run_spec
+
+    ctx = create_run("HDR", display="x", run_dir=tmp_path / "spec")  # manifest mode is the truth
+    state = {"mode": "HDR", "bit_depth": 10, "calib": {"flow": "mhc-only"}}
+    mode, bd, conflicts = resolve_run_spec(ctx, state, mode="SDR", bit_depth=8)
+    assert mode == "HDR" and bd == 10
+    assert {c["field"] for c in conflicts} == {"mode", "bit_depth"}
+    flow, flow_conflict = resolve_run_flow(state, "full")
+    assert flow == "mhc-only" and flow_conflict["field"] == "flow"
+
+
+def test_resolve_run_spec_fresh_run_defers_bit_depth_and_has_no_conflict(tmp_path: Path):
+    from dlc.calibrate import resolve_run_spec
+
+    ctx = create_run("SDR", display="x", run_dir=tmp_path / "fresh")
+    # Fresh run, no persisted/explicit depth: bit_depth is None so the CALLER keeps its own
+    # legacy default (constructor → panel depth, main() → 10/8 by mode), never changed here.
+    mode, bd, conflicts = resolve_run_spec(ctx, {}, mode="SDR", bit_depth=None)
+    assert mode == "SDR" and bd is None and conflicts == []
+
+
+def test_resume_restores_spec_and_records_conflicts(tmp_path: Path):
+    # First invocation persists the HDR / 10-bit / mhc-only spec.
+    c1 = _make(tmp_path, "resume", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    c1.calib["flow"] = "mhc-only"
+    c1._save()
+    # Flagless resume: CLI args default back to SDR / 8-bit. The persisted spec must win,
+    # and the divergence is recorded (surfaced in run(), never silently switched).
+    c2 = _make(tmp_path, "resume", mode="SDR", bit_depth=8)
+    assert c2.mode == "HDR"
+    assert c2.bit_depth == 10
+    assert {c["field"] for c in c2._spec_conflicts} == {"mode", "bit_depth"}
+
+
+def test_resume_flow_conflict_surfaced_on_spine(tmp_path: Path):
+    # Persist an mhc-only flow, then "resume" asking for full (the CLI default). The persisted
+    # flow wins AND a run_spec_conflict anomaly lands on the spine for the LLM to see.
+    c1 = _make(tmp_path, "flowres", mode="SDR")
+    c1.calib["flow"] = "mhc-only"
+    c1._save()
+    c2 = _make(tmp_path, "flowres", mode="SDR")
+    result = c2.run("full")
+    assert result.flow == "mhc-only"
+    assert "build-install-3dlut" not in result.stages   # the mhc-only pipeline actually ran
+    anomalies = [e for e in read_events(c2.ctx.events_path)
+                 if e.event == Ev.ANOMALY and e.data.get("run_spec_conflict")]
+    assert anomalies, "expected a run_spec_conflict anomaly on the spine"
+    assert anomalies[0].data["conflicts"][0]["field"] == "flow"

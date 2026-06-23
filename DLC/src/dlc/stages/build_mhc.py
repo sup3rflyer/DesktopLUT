@@ -45,7 +45,7 @@ REC2020_PRIMARIES = {
 
 
 def build(args, ctx: RunContext) -> StageResult:
-    mode = _common.normalize_mode(args.mode)
+    mode = _common.run_mode(args, ctx)
     is_hdr = bool(getattr(args, "is_hdr", False))
     result = StageResult("build-mhc")
 

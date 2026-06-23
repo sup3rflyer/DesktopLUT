@@ -67,6 +67,12 @@ D65_XY: tuple[float, float] = (0.3127, 0.3290)
 # DLC package root (i.e. DLC/calibration_profile.yaml), not the cwd.
 DEFAULT_PROFILE_PATH = Path(__file__).resolve().parents[2] / "calibration_profile.yaml"
 
+# Sentinel for correction_staleness(file_override=...): distinguishes "caller did not pass a
+# file, fall back to the profile YAML" (legacy callers/tests) from an explicit ``None`` meaning
+# "the resolved active correction is genuinely none". A bare default of None can't tell these
+# apart, and the preflight tell needs to pass the store-resolved file (which may be None).
+_USE_PROFILE_FILE = object()
+
 
 # ---------------------------------------------------------------------------
 # Leaf models
@@ -271,11 +277,18 @@ class StalenessVerdict:
     stale: bool
     refreshable: Optional[bool]
     message: str
+    # The RESOLVED active correction file the meter will actually use (store overrides the
+    # profile YAML — see active_correction), and whether it exists where the meter looks:
+    # True (found), False (a known location was checked and it is absent → configured-but-
+    # missing), None (no correction configured, or no resolvable location to check).
+    file: Optional[str] = None
+    present: Optional[bool] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {"has_correction": self.has_correction, "made": self.made,
                 "age_days": self.age_days, "max_age_days": self.max_age_days,
-                "stale": self.stale, "refreshable": self.refreshable, "message": self.message}
+                "stale": self.stale, "refreshable": self.refreshable, "message": self.message,
+                "file": self.file, "present": self.present}
 
 
 @dataclass(frozen=True)
@@ -473,31 +486,71 @@ class Profile:
         return Transfer.power(gamma=spec.gamma, peak_nits=spec.luminance_nits, bit_depth=depth)
 
     # -- SPD-correction staleness (tell, don't ask) -----------------------
+    def _correction_file_present(self, file: str) -> Optional[bool]:
+        """Does the configured correction file exist *where the meter will look* —
+        the raw path, or relative to the Argyll bin dir (how spotread resolves a bare
+        ``-X`` name)? Tri-state so the tell never cries wolf: ``True`` (found), ``False``
+        (a known location WAS checked and it is absent → configured-but-missing), ``None``
+        (a bare name with no Argyll dir configured → no resolvable location, presence
+        unknown). Mirrors ``calibrate.active_correction`` → ``Path(correction)`` wiring."""
+        p = Path(file)
+        if p.is_absolute():
+            return p.exists()
+        if p.exists():            # relative to cwd
+            return True
+        argyll = self.paths.get("argyll")
+        if argyll:
+            return (Path(argyll) / file).exists()
+        return None               # bare name, no Argyll dir → cannot tell
+
     def correction_staleness(self, *, today: Optional[date] = None,
-                             made_override: Optional[str] = None) -> StalenessVerdict:
+                             made_override: Optional[str] = None,
+                             file_override: Any = _USE_PROFILE_FILE) -> StalenessVerdict:
         """The SPD-correction staleness *tell* (never a gate).
 
         ``made_override`` lets the caller supply the correction's build date from the
         persistent per-display correction store (§10) instead of the profile YAML, so
         a correction refreshed since the profile was written ages from its real date.
+
+        ``file_override`` lets the caller supply the RESOLVED active correction file
+        (``calibrate.active_correction`` — the store overrides the profile YAML), so the
+        tell consults the same correction the meter is actually wired to instead of the
+        (possibly empty) profile YAML. Omitting it keeps the legacy profile-YAML source.
+        The resolved file is also existence-checked so a configured-but-missing correction
+        is surfaced distinctly from none-configured.
         """
         c = self.meter.correction
         today = today or date.today()
-        if not c.file:
+        file = c.file if file_override is _USE_PROFILE_FILE else file_override
+        if not file:
             return StalenessVerdict(
                 has_correction=False, made=made_override or c.made, age_days=None,
                 max_age_days=c.max_age_days, stale=False, refreshable=c.spectrometer_available,
+                file=None, present=None,
                 message="no colorimeter correction configured — raw meter readings "
                         "(consider building a CCMX/CCSS for a mini-LED/QD panel).")
+        present = self._correction_file_present(file)
         made_str = made_override if made_override is not None else c.made
         try:
             made = datetime.strptime(str(made_str), "%Y-%m-%d").date() if made_str else None
         except ValueError:
             made = None
+        if present is False:
+            # Configured but the file is gone from where the meter looks: distinct from "no
+            # correction" — the meter will silently fall back to RAW readings. Age is moot when
+            # the file is missing, so this is its own tell, not a staleness verdict.
+            return StalenessVerdict(
+                has_correction=True, made=made_str,
+                age_days=((today - made).days if made else None),
+                max_age_days=c.max_age_days, stale=False, refreshable=c.spectrometer_available,
+                file=file, present=False,
+                message=(f"colorimeter correction {Path(file).name!r} is configured but the file is "
+                         f"MISSING on disk ({file}) — the meter will fall back to raw readings; "
+                         f"rebuild via `--flow build-correction`."))
         if made is None:
             return StalenessVerdict(
                 has_correction=True, made=made_str, age_days=None, max_age_days=c.max_age_days,
-                stale=False, refreshable=c.spectrometer_available,
+                stale=False, refreshable=c.spectrometer_available, file=file, present=present,
                 message="correction present but its build date is unknown — cannot judge staleness.")
         age = (today - made).days
         stale = age > c.max_age_days
@@ -508,7 +561,7 @@ class Profile:
             msg = f"colorimeter correction is {age} days old (within the {c.max_age_days}d policy)."
         return StalenessVerdict(
             has_correction=True, made=made_str, age_days=age, max_age_days=c.max_age_days,
-            stale=stale, refreshable=c.spectrometer_available, message=msg)
+            stale=stale, refreshable=c.spectrometer_available, file=file, present=present, message=msg)
 
     # -- construction -----------------------------------------------------
     @classmethod

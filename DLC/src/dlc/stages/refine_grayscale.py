@@ -22,7 +22,7 @@ from . import _common
 
 
 def build(args, ctx: RunContext) -> StageResult:
-    mode = _common.normalize_mode(args.mode)
+    mode = _common.run_mode(args, ctx)
     iteration = args.iteration
     result = StageResult("refine-grayscale")
 

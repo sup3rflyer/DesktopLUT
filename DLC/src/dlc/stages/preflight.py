@@ -73,7 +73,9 @@ def build(args, ctx: RunContext) -> StageResult:
     result.metrics = {
         "run_dir": str(ctx.root),
         "monitor": args.monitor,
-        "mode": _common.normalize_mode(args.mode),
+        # The run's mode is fixed at creation (manifest) — report THAT, not the CLI --mode
+        # which defaults to SDR and would mislabel a resumed HDR run's preflight evidence.
+        "mode": _common.normalize_mode(ctx.manifest.mode or args.mode),
         "instruments": instruments,
         "missing_required": missing_required,
         "missing_contained": payload["missing_contained"],
