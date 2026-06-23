@@ -256,6 +256,19 @@ def test_reachable_primaries_is_hdr_only_and_guards_degenerate(tmp_path: Path):
     assert deg._reachable_primaries() is None
 
 
+def test_reachable_primaries_prefers_this_runs_measured_over_dip(tmp_path: Path):
+    # The gamut-aware verify caps + the #C3 clamp use THIS run's freshly-measured native primaries
+    # (persisted to mhc_params at build) over the prior DIP — fresh, current thermal state, and no
+    # stale-DIP dependency. Before build → DIP fallback; after build → the run-measured set.
+    hdr = _make(tmp_path, "reach_pref", mode="HDR")
+    _inject_dip(hdr, native_primaries={"R": [0.64, 0.33], "G": [0.30, 0.60], "B": [0.15, 0.06]})
+    assert hdr._reachable_primaries()["G"] == [0.30, 0.60]                       # DIP fallback
+    hdr._state["mhc_params"] = {"primaries": {"rx": 0.69, "ry": 0.30, "gx": 0.18,
+                                              "gy": 0.75, "bx": 0.15, "by": 0.065}}
+    got = hdr._reachable_primaries()
+    assert got["R"] == [0.69, 0.30] and got["G"] == [0.18, 0.75]                 # this run's, not the DIP
+
+
 # ---------------------------------------------------------------------------
 # #5 — monitor↔Argyll↔panel map verified against live enumeration
 # ---------------------------------------------------------------------------

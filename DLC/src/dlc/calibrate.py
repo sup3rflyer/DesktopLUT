@@ -988,10 +988,11 @@ class Calibration:
         return self.profile.engine_target(self.target_name, white_xy=self._white_xy())
 
     def _reachable_primaries(self) -> Optional[dict]:
-        """The panel's MEASURED native primaries (from the DIP) used to clamp the optimizer/verify
-        target onto the physically reachable gamut (#C3) — so a saturated target the panel can't
-        render is scored as a clip, not chased toward an unreachable Rec.2020 corner. ``None`` ⇒ no
-        clamp (the prior unclamped behaviour).
+        """The panel's MEASURED native primaries — THIS run's (from the raw stage's channel model,
+        persisted to ``mhc_params`` at build), falling back to the prior DIP — used to clamp the
+        optimizer/verify target onto the physically reachable gamut (#C3) AND to cap the gamut-aware
+        verify ramp's saturation. A saturated target the panel can't render is scored as a clip, not
+        chased toward an unreachable Rec.2020 corner. ``None`` ⇒ no clamp/cap (prior behaviour).
 
         HDR-ONLY by design. #C3 is the wide-gamut (Rec.2020) hazard; sRGB is inside any real panel,
         so an SDR clamp is a no-op there — AND the SDR *verify* (``score_samples``, CIEDE2000/Lab) has
@@ -999,11 +1000,24 @@ class Calibration:
         HDR build and HDR verify (``score_hdr``) BOTH clamp, so HDR stays consistent end to end."""
         if self.mode != "HDR":
             return None
-        dip = self._dip()
-        if dip is None or not dip.native_primaries:
-            return None
-        prim = {ch: [float(xy[0]), float(xy[1])]
-                for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2}
+        # Prefer THIS run's freshly-measured native primaries (raw-stage channel model, persisted
+        # to mhc_params at build) over the prior DIP — same session, current thermal state, and no
+        # stale-DIP dependency for the gamut-aware verify caps + the #C3 clamp. The raw stage runs
+        # before verify, so by then this is populated; fall back to the DIP before the build has run
+        # (or a no-build flow), then None. (Self-contained gamut awareness without a probe stage —
+        # the literal post-warmup probe is only needed once RAW generation is gamut-aware too.)
+        prim: Optional[dict] = None
+        mp = (self._state.get("mhc_params") or {}).get("primaries")
+        if mp and all(k in mp for k in ("rx", "ry", "gx", "gy", "bx", "by")):
+            prim = {"R": [float(mp["rx"]), float(mp["ry"])],
+                    "G": [float(mp["gx"]), float(mp["gy"])],
+                    "B": [float(mp["bx"]), float(mp["by"])]}
+        if prim is None:
+            dip = self._dip()
+            if dip is None or not dip.native_primaries:
+                return None
+            prim = {ch: [float(xy[0]), float(xy[1])]
+                    for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2}
         if len(prim) != 3:
             return None
         # Guard a degenerate (collinear) primary triangle — it would make the native NPM singular and
