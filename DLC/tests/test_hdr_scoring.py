@@ -48,6 +48,20 @@ def test_score_hdr_undershoot_is_a_plausible_magnitude():
     assert all(1.0 < float(d) < 20.0 for d in de), list(map(float, de))
 
 
+def test_de_itp_matches_colour_itp_reference():
+    # BT.2124 dE_ITP uses the ITP triplet T = Ct/2 — i.e. 720*sqrt(dI^2 + (0.5*dCt)^2 + dCp^2).
+    # Pin our de_itp to colour.delta_E(method='ITP') so the Ct/2 halving can't silently drift
+    # back (omitting it overstated HDR error ~1.15x, which would mis-score the verify gate).
+    np, _score_hdr, _Target, _TargetSpace = _engine()
+    import colour
+    a = np.array([180.0, 200.0, 210.0])
+    b = np.array([120.0, 150.0, 260.0])
+    ia, ib = colour.XYZ_to_ICtCp(a), colour.XYZ_to_ICtCp(b)
+    from dlc.engine.model import de_itp
+    assert float(de_itp(ia - ib)) == pytest.approx(
+        float(colour.delta_E(ia, ib, method="ITP")), rel=1e-9)
+
+
 def test_score_hdr_sanitizes_non_finite_reads():
     # A dropped/saturated hardware read (NaN/inf XYZ) must score a finite, large error that
     # surfaces in the summary — not a NaN that silently poisons avg/p95 and hides in max().

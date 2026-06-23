@@ -286,6 +286,7 @@ def patch_delta_e(signal: Sequence[float], x: float, y: float, big_y: float, *,
         nits = [_pq_eotf_norm(max(0.0, min(1.0, s))) * 10000.0 for s in signal[:3]]
         ideal = matvec(npm, nits)                                  # absolute XYZ (RGB_to_XYZ·10000)
         d = [a - b for a, b in zip(_xyz_to_ictcp(meas), _xyz_to_ictcp(ideal))]
+        d[1] *= 0.5                                     # Ct -> T (BT.2124: dE_ITP uses T = Ct/2)
         return _DE_ITP_SCALE * math.sqrt(sum(c * c for c in d))
     if luminance is None or luminance <= 0:
         return None

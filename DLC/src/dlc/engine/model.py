@@ -149,9 +149,16 @@ class TargetSpace:
 
 
 def de_itp(delta_ictcp: np.ndarray) -> np.ndarray:
-    """``dE_ITP`` from ICtCp error vectors (rows of ΔI, ΔCt, ΔCp)."""
+    """``dE_ITP`` from ICtCp error vectors (rows of ΔI, ΔCt, ΔCp).
+
+    BT.2124 defines the metric over the **ITP** triplet, where ``T = Ct / 2`` — i.e.
+    ``720·sqrt(ΔI² + (0.5·ΔCt)² + ΔCp²)``. The ICtCp tristimulus we carry has the FULL
+    Ct, so the halving must be applied here; omitting it overstated HDR error ~1.15×
+    (verified against ``colour.delta_E(..., method='ITP')``)."""
     delta = np.asarray(delta_ictcp, dtype=float)
-    return DE_ITP_SCALE * np.sqrt(np.sum(delta ** 2, axis=-1))
+    itp = delta.copy()
+    itp[..., 1] *= 0.5                                   # Ct -> T (BT.2124)
+    return DE_ITP_SCALE * np.sqrt(np.sum(itp ** 2, axis=-1))
 
 
 def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
