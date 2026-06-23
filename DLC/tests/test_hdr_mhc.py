@@ -125,3 +125,59 @@ def test_sdr_build_mhc_still_derives_a_real_base_grayscale(tmp_path):
     assert result.status == "ran"
     # Perfect sRGB panel → near-identity base, but it went through the real proposal path.
     assert result.metrics["base_grayscale_max_abs_deviation"] is not None
+
+
+def test_sdr_grayscale_noise_maps_sidecar_to_propose_noise(tmp_path):
+    # _sdr_grayscale_noise feeds propose_correction_grayscale's per-level noise from the measure
+    # loop's <ti3>.noise.json: an unstable level -> +inf (held to identity), a multi-read level -> a
+    # finite SE-of-mean, a level absent from the sidecar -> not in the map (full step), no sidecar -> None.
+    import json
+    import math
+
+    from dlc.measure_loop import noise_sidecar_path
+    from dlc.refine import GrayPatch
+
+    ti3 = tmp_path / "raw.ti3"
+    patches = [GrayPatch(level=lvl, xyz=(20.0, 21.0, 22.0)) for lvl in (0.25, 0.5, 0.75, 1.0)]
+
+    assert build_mhc._sdr_grayscale_noise(ti3, patches) is None       # no sidecar -> full step
+
+    noise_sidecar_path(ti3).write_text(json.dumps({"by_level": {
+        "0.25": {"unstable": True},
+        "0.5": {"chroma_sigma": 0.002, "reads": 4},
+        "1.0": {"chroma_sigma": 0.0001, "reads": 9},
+        # 0.75 deliberately absent
+    }}), encoding="utf-8")
+
+    out = build_mhc._sdr_grayscale_noise(ti3, patches)
+    assert out is not None
+    assert out[0.25] == math.inf                 # unstable -> never trust
+    assert 0.0 < out[0.5] < math.inf             # finite SE of the mean
+    assert 0.0 < out[1.0] < math.inf
+    assert 0.75 not in out                       # absent -> propose takes the full step
+
+
+def test_sdr_build_mhc_smooths_unstable_levels_via_noise_sidecar(tmp_path):
+    # End-to-end: a sidecar marking gray levels unstable flows through build_mhc's SDR proposal and
+    # holds those levels at identity (the SDR analogue of the HDR cube's dark-trust smoothing).
+    import json
+
+    from dlc.measure_loop import noise_sidecar_path
+    from dlc.simulation import write_synthetic_ti3
+
+    ctx = create_run("SDR", display="test", run_dir=tmp_path / "run")
+    ti3 = write_synthetic_ti3(tmp_path / "raw_sdr.ti3")
+    noise_sidecar_path(ti3).write_text(
+        json.dumps({"by_level": {"0.25": {"unstable": True}, "0.5": {"unstable": True}}}),
+        encoding="utf-8")
+
+    result = build_mhc.build(_ns(ctx, mode="SDR", source_ti3=str(ti3)), ctx)
+    assert result.status == "ran"
+    assert any("smoothed toward identity" in a for a in result.actions_taken)
+    # The two unstable levels are held exactly at identity in the baked base grayscale.
+    base = _common.load_dlc_state(ctx)["mhc_params"]["base_grayscale"]
+    held = [i for i, lvl in enumerate(base["points"]) if abs(lvl - 0.25) < 1e-6 or abs(lvl - 0.5) < 1e-6]
+    assert held
+    for i in held:
+        for ch in ("r", "g", "b"):
+            assert base["deviations"][ch][i] == 1.0
