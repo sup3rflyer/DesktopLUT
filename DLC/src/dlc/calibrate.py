@@ -3257,9 +3257,29 @@ class Calibration:
             return None
         return self._transfer().nits_to_cv(self._hdr_target().peak_nits)
 
-    def _ramp_patches(self) -> list[tuple[int, int, int]]:
+    def _ramp_patches(self, *, gamut_aware: bool = False) -> list[tuple[int, int, int]]:
+        # gamut_aware=True (VERIFY only): cap colour-ramp saturation to the panel's reachable gamut
+        # so saturated verify patches land where the panel can render. RAW stays uncapped (it needs
+        # full-saturation pure channels to characterize the panel — see build_ramp_set).
+        caps = self._hue_sat_caps() if gamut_aware else None
         return build_ramp_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
-                              max_cv=self._patch_max_cv())
+                              max_cv=self._patch_max_cv(), hue_sat_caps=caps)
+
+    def _hue_sat_caps(self) -> Optional[dict]:
+        """Per-primary-hue signal-saturation caps from the panel's MEASURED native gamut (DIP) vs
+        the target colour space — so the VERIFY ramp's saturated patches land on/inside the panel's
+        reachable gamut instead of at an unreachable target primary (wasted 55-dE reads). Reuses the
+        #C3 ``_reachable_primaries`` (HDR-only, degenerate-guarded); ``None`` ⇒ no cap. Never blocks
+        a run — any failure in the (lazy) engine cap computation falls back to the uncapped ramp."""
+        native = self._reachable_primaries()
+        cs = self._target_colorspace()
+        if not native or not cs:
+            return None
+        try:
+            from .engine.model import TargetSpace, signal_saturation_caps
+            return signal_saturation_caps(TargetSpace(self._engine_target()), native, cs)
+        except Exception:  # noqa: BLE001 — generation must never crash on an optional refinement
+            return None
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:
         return build_volumetric_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
@@ -3392,7 +3412,7 @@ class Calibration:
             # The mhc-only flow IS the standalone-ICC path — refine the base cube to D65 so the
             # verify scores the foundation as a self-sufficient D65 layer (no 3D LUT to lean on).
             self.stage_refine_mhc_cube()
-        ver = self.stage_measure(role="verify", patches=self._ramp_patches(),
+        ver = self.stage_measure(role="verify", patches=self._ramp_patches(gamut_aware=True),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -3690,9 +3710,16 @@ def descriptive_cube_name(*, date: str, display: str, mode: str, colorspace: str
 
 def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
                    warm_tau: Optional[int] = None,
-                   max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+                   max_cv: Optional[int] = None,
+                   hue_sat_caps: Optional[dict] = None) -> list[tuple[int, int, int]]:
     """The MHC FOUNDATION ramp: a dense grey ramp + R/G/B (the matrix+1D fit's inputs); C/M/Y
     only if ``raw_include_secondaries`` (off by default — the volumetric set covers them).
+
+    ``hue_sat_caps`` (verify only): per-primary-hue signal-saturation caps from the panel's
+    reachable gamut (:func:`dlc.engine.model.signal_saturation_caps`) — scales each colour ramp
+    into the range the panel can render + one clip marker per capped hue. NEVER pass this for the
+    RAW characterization ramp: that needs full-saturation pure channels (off=0) to measure the
+    panel's primaries + per-channel curves; capping there would destroy the channel model.
 
     ``max_cv`` caps the top of the generated range (HDR: the target peak's code value, so no
     patch exceeds the reachable sub-peak range); ``None`` ⇒ the full bit-depth range (SDR).
@@ -3706,6 +3733,7 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
                         low_light_steps=ps.low_light_steps,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
+                        hue_sat_caps=hue_sat_caps,
                         order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
     if not ps.icc_tube_levels or ps.icc_tube_levels <= 1:
         return ramp

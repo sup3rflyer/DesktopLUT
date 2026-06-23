@@ -35,9 +35,54 @@ CR250_CSV = next(iter(COLORCAL.glob("*CR-250*.csv")), None) if COLORCAL else Non
 
 
 # ---------------------------------------------------------------------------
-# Synthetic display helpers (realistic in-gamut panel error: per-channel
-# gain + gamma, i.e. grey-tracking + mild gamma — the post-MHC residual).
+# Gamut-aware patch generation — cap the colour-ramp saturation to the panel's
+# reachable gamut so patches land where the panel can render (not at an
+# unreachable target primary). The cap is colorspace-exact (inverts through PQ).
 # ---------------------------------------------------------------------------
+
+def test_signal_saturation_caps_are_colorspace_exact_not_xy_geometry():
+    from dlc.engine.model import signal_saturation_caps
+    from dlc import gamut
+    nat = {"R": (0.6927, 0.3028), "G": (0.1825, 0.7502), "B": (0.1521, 0.0646)}  # PA32UCXR
+    space = TargetSpace(Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329)))
+    caps = signal_saturation_caps(space, nat, "Rec.2020")
+    # All three Rec.2020 primaries are unreachable on this panel → capped below 1.
+    assert all(0.2 < caps[c] < 0.5 for c in "RGB"), caps
+    # The xy-line fraction would say ~0.88; PQ makes the real signal-sat cap far lower.
+    xy_frac_blue = gamut.reachable_fraction((0.3127, 0.329), (0.131, 0.046),
+                                            [nat["R"], nat["G"], nat["B"]])
+    assert caps["B"] < 0.6 * xy_frac_blue          # exact cap is much tighter than the xy fraction
+    # A panel that already covers the target → no cap (1.0 each).
+    wide = {"R": (0.708, 0.292), "G": (0.170, 0.797), "B": (0.131, 0.046)}
+    assert signal_saturation_caps(space, wide, "Rec.2020") == {"R": 1.0, "G": 1.0, "B": 1.0}
+
+
+def test_gamut_capped_ramp_lands_in_gamut_with_one_clip_marker():
+    from dlc.engine.model import signal_saturation_caps
+    from dlc.gamut import point_in_triangle
+    nat = {"R": (0.6927, 0.3028), "G": (0.1825, 0.7502), "B": (0.1521, 0.0646)}
+    nt = [nat["R"], nat["G"], nat["B"]]
+    space = TargetSpace(Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329)))
+    caps = signal_saturation_caps(space, nat, "Rec.2020")
+    tr = P.Transfer.pq(bit_depth=10)
+
+    def txy(rgb):
+        sig = [c / tr.max_cv for c in rgb]
+        xyz = space.ideal_xyz(np.array([sig], float))[0]
+        s = float(sum(xyz))
+        return (float(xyz[0]) / s, float(xyz[1]) / s)
+
+    def blue_out(hue_caps):
+        ps = P.ramp_patches(tr, steps=13, saturations=(1.0, 0.5),
+                            include_secondaries=False, hue_sat_caps=hue_caps, order="luminance")
+        blues = [p for p in ps if p[0] == p[1] and p[2] > p[0]]
+        return sum(1 for p in blues if not point_in_triangle(txy(p), *nt)), len(blues)
+
+    out_nocap, _ = blue_out(None)
+    out_capped, n_capped = blue_out(caps)
+    assert out_nocap >= 10                          # the un-capped ramp wastes many blue patches
+    assert out_capped <= 2                          # capped: only the clip marker(s) sit out of gamut
+    assert n_capped >= 10                           # still a full ramp, just redistributed in-range
 
 def _synth_measure(space: TargetSpace, signal, *, gains=(1.0, 0.992, 0.985),
                    gammas=(1.0, 1.010, 1.018), noise=0.004, seed=3):

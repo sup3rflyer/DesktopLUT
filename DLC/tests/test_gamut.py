@@ -61,6 +61,17 @@ def test_narrow_native_undercovers_wider_target():
     assert all(d > 0 for d in cov["shortfall"].values())
 
 
+def test_reachable_fraction_caps_an_unreachable_primary():
+    # Panel ~P3 gamut; target Rec.2020 blue sits OUTSIDE it → the white→blue line exits the
+    # native triangle partway, so the reachable fraction is < 1. A reachable target → 1.0.
+    nat = [(0.6927, 0.3028), (0.1825, 0.7502), (0.1521, 0.0646)]  # measured PA32UCXR
+    white = (0.3127, 0.329)
+    f_out = gamut.reachable_fraction(white, (0.131, 0.046), nat)   # Rec.2020 blue (outside)
+    assert 0.0 < f_out < 1.0
+    f_in = gamut.reachable_fraction(white, (0.18, 0.40), nat)      # a point well inside
+    assert f_in == pytest.approx(1.0)
+
+
 def test_identical_gamut_is_full_coverage():
     p = gamut.STANDARD_PRIMARIES["Rec.709"]
     cov = gamut.gamut_coverage(p, p)

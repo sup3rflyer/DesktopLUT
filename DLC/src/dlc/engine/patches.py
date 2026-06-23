@@ -351,6 +351,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  low_light_steps: int = 0,
                  low_light_signal: float = 0.20,
                  low_light_bias: float = 2.0,
+                 hue_sat_caps: Optional[dict[str, float]] = None,
                  warm_tau: Optional[int] = None) -> list[Patch]:
     """Grey ramp + per-channel colour ramps at each saturation (deduped, then ordered).
 
@@ -389,13 +390,26 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
     for v in levels:
         add((v, v, v))
     colors = _RAMP_COLORS if include_secondaries else _PRIMARIES
+    vtop = max(levels) if levels else 0
     for _name, r_on, g_on, b_on in colors:
+        # Gamut-aware cap (``hue_sat_caps``): for a PRIMARY hue whose target primary is
+        # unreachable, scale its saturations into the panel's reachable range so each patch lands
+        # where the panel can render (not at an unreachable target = wasted measurement). Then add
+        # ONE full-saturation "clip marker" at the top level documenting the gamut boundary.
+        # Secondaries and reachable hues are unchanged (cap 1.0).
+        cap = 1.0
+        if hue_sat_caps and (int(r_on) + int(g_on) + int(b_on)) == 1:
+            ch = "R" if r_on else "G" if g_on else "B"
+            cap = hue_sat_caps.get(ch, 1.0)
         for sat in sorted(saturations):
+            eff = sat * cap
             for v in levels:
                 if v == 0:
                     continue
-                off = round(v * (1 - sat))
+                off = round(v * (1 - eff))
                 add((v if r_on else off, v if g_on else off, v if b_on else off))
+        if cap < 1.0 and vtop > 0:
+            add((vtop if r_on else 0, vtop if g_on else 0, vtop if b_on else 0))   # clip marker
 
     return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 

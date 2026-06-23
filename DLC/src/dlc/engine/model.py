@@ -260,6 +260,53 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz}
 
 
+def signal_saturation_caps(space: "TargetSpace", native_primaries: dict,
+                           colorspace: Optional[str], *,
+                           level: float = 1.0, iters: int = 30) -> Optional[dict[str, float]]:
+    """Per-primary-hue MAX **signal** saturation whose ideal target chromaticity still falls
+    inside the panel's MEASURED native gamut triangle — so generated colour patches land where
+    the panel can actually render, not at an unreachable target primary.
+
+    Returns ``{"R": cap, "G": cap, "B": cap}`` with ``cap`` in ``[0,1]`` (1.0 = the target
+    primary is reachable, no cap). ``None`` when the colorspace is unknown or the native
+    primaries are incomplete (caller then does not cap).
+
+    The cap is **colorspace-exact**, not pure xy geometry: under a steep transfer (PQ) the
+    off-channels stay near-zero until the signal backs off a lot, so the xy-line fraction badly
+    overestimates the reachable signal saturation (e.g. Rec.2020 on a P3-ish panel: xy says
+    ~0.88, the real signal-sat cap is ~0.32). So we binary-search the SIGNAL saturation, mapping
+    each candidate through the target EOTF (:meth:`TargetSpace.ideal_xyz`) to its chromaticity and
+    testing it against the native triangle (the rough RGBCMY gamut model). ``level`` is the signal
+    level the cap is evaluated at (the peak, where purity is highest)."""
+    from .. import gamut
+    tgt = gamut.target_primaries(colorspace)
+    if not tgt or not native_primaries or not all(c in native_primaries for c in ("R", "G", "B")):
+        return None
+    nt = [tuple(native_primaries[c]) for c in ("R", "G", "B")]
+
+    def chroma_xy(sig: list[float]) -> tuple[float, float]:
+        xyz = space.ideal_xyz(np.asarray([sig], dtype=float))[0]
+        s = float(xyz[0] + xyz[1] + xyz[2])
+        return (float(xyz[0]) / s, float(xyz[1]) / s) if s > 0 else (0.0, 0.0)
+
+    caps: dict[str, float] = {}
+    for ch, idx in (("R", 0), ("G", 1), ("B", 2)):
+        if gamut.point_in_triangle(tuple(tgt[ch]), *nt):
+            caps[ch] = 1.0
+            continue
+        lo, hi = 0.0, 1.0
+        for _ in range(iters):
+            m = (lo + hi) / 2.0
+            sig = [level * (1.0 - m)] * 3
+            sig[idx] = level
+            if gamut.point_in_triangle(chroma_xy(sig), *nt):
+                lo = m
+            else:
+                hi = m
+        caps[ch] = round(lo, 4)
+    return caps
+
+
 # ---------------------------------------------------------------------------
 # Cross-validated smoothing
 # ---------------------------------------------------------------------------

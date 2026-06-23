@@ -19,7 +19,7 @@ import math
 from typing import Optional
 
 __all__ = ["STANDARD_PRIMARIES", "target_primaries", "point_in_triangle",
-           "polygon_area", "clip_convex", "gamut_coverage"]
+           "polygon_area", "clip_convex", "gamut_coverage", "reachable_fraction"]
 
 Pt = tuple[float, float]
 
@@ -143,6 +143,39 @@ def _dist_point_to_triangle(p: Pt, tri: list[Pt]) -> float:
     """xy distance from ``p`` to the nearest edge of ``tri`` (how far OUTSIDE the gamut a
     given unreachable primary is — the magnitude of the shortfall)."""
     return min(_dist_point_segment(p, tri[i], tri[(i + 1) % 3]) for i in range(3))
+
+
+def reachable_fraction(white: Pt, primary: Pt, native_tri: list[Pt]) -> float:
+    """Fraction along the line ``white → primary`` that stays inside the panel's native gamut
+    triangle. ``1.0`` when the target ``primary`` is itself reachable (inside the triangle);
+    otherwise the ``[0,1]`` fraction at which the segment crosses the native boundary — i.e.
+    how far toward a target primary the panel can actually go before it clips. Used to CAP the
+    saturation of generated colour patches so the most-saturated patch lands ON the panel's
+    gamut edge instead of at an unreachable target primary (wasted measurement).
+
+    Geometry is in CIE-1931 xy. White is assumed inside the native triangle (the calibration
+    target white is, by construction); a degenerate triangle or a white-on-the-boundary edge
+    case returns ``1.0`` (no cap) rather than over-clamping."""
+    if point_in_triangle(primary, native_tri[0], native_tri[1], native_tri[2]):
+        return 1.0
+    # white→primary exits the (convex) triangle across exactly one edge; find the nearest crossing.
+    best: Optional[float] = None
+    wp2 = (primary[0] - white[0]) ** 2 + (primary[1] - white[1]) ** 2
+    if wp2 <= 1e-18:
+        return 1.0
+    for i in range(3):
+        a, b = native_tri[i], native_tri[(i + 1) % 3]
+        x = _intersect(white, primary, a, b)
+        # parameter t along white→primary, and s along the edge a→b — both must be in [0,1]
+        t = ((x[0] - white[0]) * (primary[0] - white[0]) + (x[1] - white[1]) * (primary[1] - white[1])) / wp2
+        ex, ey = b[0] - a[0], b[1] - a[1]
+        es = ex * ex + ey * ey
+        s = (((x[0] - a[0]) * ex + (x[1] - a[1]) * ey) / es) if es > 1e-18 else -1.0
+        if -1e-9 <= t <= 1.0 + 1e-9 and -1e-6 <= s <= 1.0 + 1e-6:
+            t = max(0.0, min(1.0, t))
+            if best is None or t < best:
+                best = t
+    return best if best is not None else 1.0
 
 
 def gamut_coverage(native: dict[str, Pt], target: dict[str, Pt]) -> dict:
