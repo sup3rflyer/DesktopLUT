@@ -90,6 +90,26 @@ def test_native_primaries_from_raw_pure_channel_peaks():
     assert abs(nat["r"][0] - 0.69) < 1e-3 and abs(nat["g"][1] - 0.71) < 1e-3 and abs(nat["b"][0] - 0.15) < 1e-3
 
 
+def test_grayscale_near_black_flagged_dim_for_cct_chart():
+    """A near-black neutral (0.006 nits) solves to a junk CCT (xy→noise as Y→0). The grayscale
+    CCT/Duv charts must flag it ``dim`` so they drop it from the trace + autoscale, while a normal
+    bright neutral stays solid. Reproduces the 11130 K @ 0.006-nit point on the live dashboard."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))
+    # bright neutral (above the 1-nit floor) → meaningful CCT
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0,
+                  role="measurement", rgb=[512, 512, 512], signal=[0.5, 0.5, 0.5],
+                  Y=92.0, xy=[0.3127, 0.329], ok=True))
+    # near-black neutral (0.006 nits) with a blue-shifted noise chromaticity → must be dimmed
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0,
+                  role="measurement", rgb=[7, 7, 7], signal=[0.0068, 0.0068, 0.0068],
+                  Y=0.0056, xy=[0.262, 0.305], ok=True))
+    gray = st.charts()["grayscale"]
+    by_sig = {round(p["signal"], 4): p for p in gray}
+    assert by_sig[0.5]["dim"] is False        # bright neutral: real CCT, plotted
+    assert by_sig[0.0068]["dim"] is True       # near-black: noise, excluded from trace + autoscale
+
+
 def test_native_primaries_none_without_saturated_patches():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))

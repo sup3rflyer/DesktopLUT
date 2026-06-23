@@ -36,6 +36,13 @@ _FAMILY_ORDER = {"R": 0, "Y": 1, "G": 2, "C": 3, "B": 4, "M": 5, "mix": 6}
 # is meaningless, so it must never be plotted as the panel's native primary.
 _NATIVE_PRIMARY_Y_FLOOR_FRAC = 0.01
 _NATIVE_PRIMARY_Y_FLOOR_ABS = 0.1
+# Grayscale CCT/Duv charts (visualization only): below this absolute luminance a neutral's
+# chromaticity is noise-dominated and CCT is undefined as Y→0 (e.g. a 0.006-nit read solving to
+# 11000 K). Such points are flagged ``dim`` so the chart omits them from the trace + the y-autoscale
+# (one would otherwise blow the range and bury the real ~6500 K variation) and footnotes the count.
+# They still appear on the EOTF/luminance tiles, where Y *is* meaningful. Matches the build's own
+# near-black floor (corrections blend to identity there anyway), so the chart mirrors what's used.
+_GRAY_CCT_Y_FLOOR_NITS = 1.0
 
 
 def _sig_hex(sig) -> str:
@@ -514,7 +521,13 @@ class DashboardState:
         stage = self._latest_chart_stage()
         cie_points = list(self._cie_by_stage.get(stage, ())) if stage else []
         gray_map = self._gray_by_stage.get(stage, {}) if stage else {}
-        gray = [gray_map[k] for k in sorted(gray_map)]
+        # Flag near-black neutrals (Y below the floor) as ``dim``: their CCT/Duv is noise, so the
+        # grayscale CCT/Duv charts drop them from the trace + autoscale (keeping the meaningful
+        # range legible) rather than letting an undefined-CCT near-black read dominate the y-axis.
+        gray = [{**gray_map[k],
+                 "dim": (gray_map[k].get("Y") is not None
+                         and gray_map[k]["Y"] < _GRAY_CCT_Y_FLOOR_NITS)}
+                for k in sorted(gray_map)]
         color_map = self._color_by_stage.get(stage, {}) if stage else {}
         white = (self.header.get("white") or {}).get("xy")
         gamma = self.header.get("gamma") or 2.2

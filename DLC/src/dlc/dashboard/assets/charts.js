@@ -150,8 +150,12 @@
 
   // ── Grayscale CCT vs signal (+ target white CCT reference) ──
   DLCCharts.grayscaleCct = function (d, targetCct) {
-    const pts = (d || []).filter((p) => p.cct != null);
-    if (!pts.length) return empty("no grayscale CCT yet");
+    // Near-black neutrals (server-flagged `dim`) have noise-dominated / undefined CCT — keep them
+    // off the trace AND the y-autoscale so one wild near-black read can't bury the real variation.
+    const all = (d || []).filter((p) => p.cct != null);
+    const pts = all.filter((p) => !p.dim);
+    const hidden = all.length - pts.length;
+    if (!pts.length) return empty(all.length ? "grayscale CCT near-black only — too dark to read" : "no grayscale CCT yet");
     const ccts = pts.map((p) => p.cct).concat(targetCct ? [targetCct] : []);
     let lo = Math.min(...ccts), hi = Math.max(...ccts);
     if (hi - lo < 200) { lo -= 200; hi += 200; }
@@ -164,13 +168,16 @@
     }
     P.pathLine(pts.map((p) => [p.signal, p.cct]), "ch-line");
     pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K`)}</circle>`));
+    if (hidden) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${hidden} near-black read${hidden > 1 ? "s" : ""} hidden · CCT undefined &lt;1 nit</text>`);
     return P.svg();
   };
 
   // ── Grayscale Duv vs signal (zero = on the Planckian locus; +green above / −magenta below) ──
   DLCCharts.grayscaleDuv = function (d) {
-    const pts = (d || []).filter((p) => p.duv != null);
-    if (!pts.length) return empty("no grayscale Duv yet");
+    const all = (d || []).filter((p) => p.duv != null);
+    const pts = all.filter((p) => !p.dim);           // drop near-black (noise-dominated Duv)
+    const hidden = all.length - pts.length;
+    if (!pts.length) return empty(all.length ? "grayscale Duv near-black only — too dark to read" : "no grayscale Duv yet");
     const span = Math.max(0.005, Math.max(...pts.map((p) => Math.abs(p.duv))) * 1.2);
     const P = Plot({ xmin: 0, xmax: 1, ymin: -span, ymax: span });
     // Tint the half-planes so the SIGN reads as a colour cast: Duv>0 = green (above the locus),
@@ -188,6 +195,7 @@
     });
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-lab-green">▲ green (+Duv)</text>`);
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.H - P.m.b - 5, 1)}" class="ch-lab-magenta">▼ magenta (−Duv)</text>`);
+    if (hidden) P.add(`<text x="${fmt(P.W - P.m.r, 1)}" y="${fmt(P.m.t + 12, 1)}" text-anchor="end" class="ch-note">${hidden} near-black hidden</text>`);
     return P.svg();
   };
 
