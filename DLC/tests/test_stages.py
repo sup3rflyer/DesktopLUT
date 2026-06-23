@@ -132,6 +132,35 @@ def test_build_mhc_rejects_invalid_explicit_target_white(tmp_path):
     assert result.anomalies[0].code == "invalid_target_white"
 
 
+def test_sdr_grayscale_noise_maps_levels_from_sidecar(tmp_path):
+    # The SDR analogue of the HDR dark_trust_weights: map each gray patch level to its measured
+    # chroma noise (SE of the mean, +inf when unstable) from the <ti3>.noise.json sidecar, by
+    # nearest level — so a dim level whose white error is within the noise gets smoothed to identity.
+    import json
+    from types import SimpleNamespace
+    from dlc.measure_loop import noise_sidecar_path
+    src = tmp_path / "raw.ti3"
+    src.write_text("placeholder", encoding="utf-8")
+    noise_sidecar_path(src).write_text(json.dumps({"schema": 1, "by_level": {
+        "0.100000": {"chroma_sigma": 0.004, "reads": 4, "unstable": False},   # SE = 0.002
+        "0.050000": {"chroma_sigma": 0.02, "reads": 5, "unstable": True},     # unstable → +inf
+        "0.900000": {"chroma_sigma": None, "reads": 1, "unstable": False},    # single read → no σ
+    }}), encoding="utf-8")
+    patches = [SimpleNamespace(level=lv) for lv in (0.1, 0.05, 0.9, 0.5)]
+    out = build_mhc._sdr_grayscale_noise(src, patches)
+    assert out[0.1] == 0.002          # σ/√4
+    assert out[0.05] == float("inf")  # unstable level never trusted
+    assert 0.9 not in out             # <2 reads → no usable noise → full step
+    assert 0.5 not in out             # absent from sidecar → full step
+
+
+def test_sdr_grayscale_noise_returns_none_without_sidecar(tmp_path):
+    from types import SimpleNamespace
+    src = tmp_path / "raw.ti3"
+    src.write_text("placeholder", encoding="utf-8")          # no .noise.json beside it
+    assert build_mhc._sdr_grayscale_noise(src, [SimpleNamespace(level=0.5)]) is None
+
+
 def test_build_mhc_needs_rgb_ramps(tmp_path):
     ctx = _new_run(tmp_path)
     # A grayscale-only TI3 cannot yield primaries.

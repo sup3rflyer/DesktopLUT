@@ -173,6 +173,11 @@ def build(args, ctx: RunContext) -> StageResult:
         base_summary = {}
     else:
         prim = _common.measured_primaries_from(measured_primaries, white_xy)
+        # Per-level chroma noise (SE of the mean, +inf for an unstable level) from the measure loop's
+        # sidecar beside the raw TI3, so a dark gray level whose drift from native white is within the
+        # measurement noise is smoothed toward identity instead of baked into the base grayscale — the
+        # SDR analogue of the HDR cube's dark_trust_weights. No sidecar / single-read ⇒ None ⇒ full step.
+        gray_noise = _sdr_grayscale_noise(source, gray_patches)
         # Tone-only base: target the panel's own native white so the matrix owns
         # the native-white -> D65 move.
         proposal = propose_correction_grayscale(
@@ -183,6 +188,7 @@ def build(args, ctx: RunContext) -> StageResult:
             primaries=prim,
             current=Deviations.identity(len(gray_patches)),
             damping=1.0,  # initial full estimate; refine loop fine-tunes post-install
+            noise=gray_noise,
         )
         base = {
             "point_count": proposal["point_count"],
@@ -190,7 +196,10 @@ def build(args, ctx: RunContext) -> StageResult:
             "deviations": proposal["deviations"],
         }
         base_summary = proposal["summary"]
-        result.action("derived base grayscale 1D correction (tone-only, toward native white)")
+        n_trust = sum(1 for r in proposal["residuals"] if r.get("noise_trust", 1.0) < 1.0)
+        trust_note = (f"; {n_trust} dark level(s) smoothed toward identity by measured noise"
+                      if gray_noise and n_trust else "")
+        result.action("derived base grayscale 1D correction (tone-only, toward native white)" + trust_note)
 
     # White distance from D65 and a CCT readout for the assistant.
     white_de_d65 = _white_de_from_d65(white_xy, target_luminance)
@@ -270,6 +279,24 @@ def build(args, ctx: RunContext) -> StageResult:
         "reasons": ["candidate MHC params derived from a measured raw panel"],
     }
     return result
+
+
+def _sdr_grayscale_noise(source, gray_patches):
+    """Map each SDR gray patch level → its measured chroma noise (SE of the mean, or ``+inf`` if the
+    level was flagged unstable) from the measure loop's ``<ti3>.noise.json`` sidecar, matched by
+    nearest signal. Returns ``{level: sigma}`` for the levels with usable noise, fed to
+    ``propose_correction_grayscale``'s ``noise`` param; ``None`` when there's no sidecar (single-read
+    run) — in which case the proposal takes the full step (unchanged behaviour)."""
+    from ..measure_loop import match_level_noise, read_noise_sidecar
+    entries = read_noise_sidecar(Path(source))
+    if not entries:
+        return None
+    out: dict[float, float] = {}
+    for p in gray_patches:
+        sigma = match_level_noise(entries, p.level)
+        if sigma is not None:
+            out[p.level] = sigma
+    return out or None
 
 
 def _dark_level_trust(source, grey_samples, reference_white_xy, dark_trust_weights, xy_from_xyz):
