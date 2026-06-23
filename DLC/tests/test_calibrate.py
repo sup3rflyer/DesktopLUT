@@ -30,6 +30,7 @@ from dlc.calibrate import (
     SEAM_FOUNDATION,
     SEAM_HARDWARE_READY,
     SEAM_MEASURE,
+    SEAM_MONITOR_MAP,
     AdjudicationRequest,
     AdjudicationRequired,
     AutoAdjudicator,
@@ -253,6 +254,88 @@ def test_reachable_primaries_is_hdr_only_and_guards_degenerate(tmp_path: Path):
     deg = _make(tmp_path, "reach_deg", mode="HDR")
     _inject_dip(deg, native_primaries={"R": [0.3, 0.3], "G": [0.4, 0.4], "B": [0.5, 0.5]})
     assert deg._reachable_primaries() is None
+
+
+# ---------------------------------------------------------------------------
+# #5 — monitor↔Argyll↔panel map verified against live enumeration
+# ---------------------------------------------------------------------------
+
+def test_argyll_display_from_device_name():
+    from dlc.calibrate import argyll_display_from_device_name as f
+    assert f(r"\\.\DISPLAY1") == 1
+    assert f(r"\\.\DISPLAY12") == 12
+    assert f("display3") == 3
+    assert f(None) is None
+    assert f(r"\\.\MONITOR0") is None
+
+
+def _monitors(*specs):
+    """A query_monitors payload from (index, argyll_n, hardware_id, primary) tuples."""
+    return {"monitors": [
+        {"index": i, "device_name": rf"\\.\DISPLAY{n}", "hardware_id": hw,
+         "primary": p, "color_space": "SDR"}
+        for (i, n, hw, p) in specs]}
+
+
+def test_monitor_map_passes_when_aligned(tmp_path: Path):
+    calib = _make(tmp_path, "mm_ok")          # monitor 0 → argyll_display 1 (synthetic default)
+    calib.controller.query_monitors = lambda: _monitors((0, 1, "EDID-A", True), (1, 2, "EDID-B", False))
+    mm = calib._monitor_map_check()
+    assert mm["checked"] and mm["mismatch"] is False and mm["device_argyll_display"] == 1
+
+
+def test_monitor_map_flags_absent_index(tmp_path: Path):
+    calib = _make(tmp_path, "mm_absent")      # monitor 0 not present below
+    calib.controller.query_monitors = lambda: _monitors((1, 2, "EDID-B", True), (2, 3, "EDID-C", False))
+    mm = calib._monitor_map_check()
+    assert mm["mismatch"] is True and "not among the live displays" in mm["reason"]
+
+
+def test_monitor_map_flags_argyll_disagreement(tmp_path: Path):
+    calib = _make(tmp_path, "mm_argyll")      # monitor 0 → argyll_display 1
+    # index 0 is present but it's \\.\DISPLAY3 (Argyll display 3) ≠ the profile's argyll_display 1.
+    calib.controller.query_monitors = lambda: _monitors((0, 3, "EDID-A", True))
+    mm = calib._monitor_map_check()
+    assert mm["mismatch"] is True and "argyll_display" in mm["reason"]
+
+
+def test_monitor_map_flags_edid_mismatch(tmp_path: Path):
+    calib = _make(tmp_path, "mm_edid")
+    calib.display.quirks["hardware_id"] = "EDID-EXPECTED"   # recorded panel identity
+    calib.controller.query_monitors = lambda: _monitors((0, 1, "EDID-DIFFERENT", True))
+    mm = calib._monitor_map_check()
+    assert mm["mismatch"] is True and "different panel" in mm["reason"].lower()
+
+
+def test_monitor_map_tells_not_aborts_when_unverifiable(tmp_path: Path):
+    # A query that fails CANNOT prove a mismatch ⇒ checked=False, no false abort.
+    calib = _make(tmp_path, "mm_unver")
+
+    def boom():
+        raise RuntimeError("pipe down")
+
+    calib.controller.query_monitors = boom
+    mm = calib._monitor_map_check()
+    assert mm["checked"] is False and mm.get("mismatch") is not True
+
+
+def test_preflight_raises_seam_on_monitor_map_mismatch(tmp_path: Path):
+    calib = _make(tmp_path, "mm_seam", adjudicator=MappingAdjudicator({}))
+    calib.controller.query_monitors = lambda: _monitors((1, 2, "X", True))  # monitor 0 absent
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    assert exc.value.request.seam == SEAM_MONITOR_MAP
+    assert exc.value.request.recommendation == "abort"
+
+
+def test_preflight_proceeds_when_monitor_map_mismatch_overridden(tmp_path: Path):
+    # The operator/LLM can proceed past the mismatch (e.g. a transient unplug they'll fix) — the
+    # seam recommends abort but does not force it.
+    calib = _make(tmp_path, "mm_proceed",
+                  adjudicator=MappingAdjudicator({"preflight:monitor-map": Decision("proceed")}))
+    calib.controller.query_monitors = lambda: _monitors((1, 2, "X", True))
+    outcome = calib.stage_preflight()
+    assert outcome.digest["monitor_map"]["mismatch"] is True
 
 
 def test_gamut_tell_noop_without_characterization(tmp_path: Path):

@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from argparse import Namespace
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -132,6 +133,7 @@ SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/me
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
 SEAM_HARDWARE_READY = "hardware_readiness"  # one live gate before the first meter/presenter read
+SEAM_MONITOR_MAP = "monitor_map"   # profile monitor↔Argyll↔panel map disagrees with live enumeration
 _D65_XY = (0.3127, 0.3290)          # the standard-source white the MHC matrix maps the panel to
 # NOTE: there is deliberately NO check-in seam. A §12 check-in is a NON-BLOCKING evidence packet
 # for the LLM (see _maybe_timed_checkin), never an adjudicated yes/no — it must never gate the spine.
@@ -1391,6 +1393,58 @@ class Calibration:
             out["optimizer"] = self._last_optimizer
         return out
 
+    def _monitor_map_check(self) -> dict[str, Any]:
+        """Mechanically verify the profile's monitor↔Argyll↔panel mapping against LIVE enumeration,
+        BEFORE hours of measurement. ``query_monitors`` reports each display's ``index`` (the
+        DesktopLUT monitor), ``device_name`` (``\\\\.\\DISPLAYn`` in ARGYLL order ⇒ ``n`` == the
+        Argyll ``-d`` number) and ``hardware_id`` (EDID). A wrong ``desktoplut_monitor`` /
+        ``argyll_display`` in the YAML otherwise sails through preflight and is only caught after the
+        panel reads collapse — wasting the whole run on the wrong display.
+
+        Best-effort detection, definite-only verdict: a query that fails or omits fields CANNOT prove
+        a mismatch, so it yields ``checked=False`` (a tell), never a false abort. ``mismatch=True``
+        only on POSITIVE evidence — the configured index is absent, the device's Argyll number
+        disagrees with ``argyll_display``, or a recorded EDID (``quirks['hardware_id']``) differs."""
+        try:
+            monitors = (self.controller.query_monitors() or {}).get("monitors") or []
+        except Exception as exc:  # noqa: BLE001 — can't verify ⇒ tell, never a false abort
+            return {"checked": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if not monitors:
+            return {"checked": False, "reason": "no monitor topology available"}
+        present = sorted(m.get("index") for m in monitors if m.get("index") is not None)
+        out: dict[str, Any] = {"checked": True, "desktoplut_monitor": self.monitor,
+                               "argyll_display": self.display.argyll_display,
+                               "present_indices": present, "mismatch": False}
+        target = next((m for m in monitors if m.get("index") == self.monitor), None)
+        if target is None:
+            out["mismatch"] = True
+            out["reason"] = (
+                f"profile desktoplut_monitor={self.monitor} ({self.display.name}) is not among the "
+                f"live displays {present} — wrong monitor index, or the display is unplugged/asleep. "
+                f"Every patch would be presented/measured on the wrong panel.")
+            return out
+        dev = target.get("device_name")
+        out["device_name"] = dev
+        out["hardware_id"] = target.get("hardware_id")
+        argyll_n = argyll_display_from_device_name(dev)
+        out["device_argyll_display"] = argyll_n
+        if argyll_n is not None and argyll_n != self.display.argyll_display:
+            out["mismatch"] = True
+            out["reason"] = (
+                f"monitor {self.monitor} is {dev} (Argyll display {argyll_n}), but the profile maps it "
+                f"to argyll_display={self.display.argyll_display}. spotread/ccxxmake drive the display "
+                f"by that Argyll number (`-d {self.display.argyll_display}`), so the correction would be "
+                f"built against the WRONG display.")
+            return out
+        want_hw = str(self.display.quirks.get("hardware_id") or "").strip()
+        live_hw = str(target.get("hardware_id") or "").strip()
+        if want_hw and live_hw and want_hw != live_hw:
+            out["mismatch"] = True
+            out["reason"] = (
+                f"monitor {self.monitor} reports EDID {live_hw!r}, but the profile expects {want_hw!r} "
+                f"(quirks.hardware_id) — a DIFFERENT panel is at this index than the one configured.")
+        return out
+
     def _patch_window_guard(self) -> dict[str, Any]:
         """Assert the dogegen patch window will land on the calibration target monitor.
 
@@ -1580,6 +1634,12 @@ class Calibration:
             # opens on the Windows primary and is positioned/fullscreened by hand. If the
             # calibration target isn't the primary, patches would land on the WRONG panel and
             # every measurement would be silently wrong. Assert the topology instead of assuming it.
+            # Monitor↔Argyll↔panel map vs LIVE enumeration (#5): catch a wrong desktoplut_monitor /
+            # argyll_display BEFORE measuring, not after the reads collapse. Mechanical detection here;
+            # the DECISION on a mismatch is a seam below (the LLM/operator aborts to fix, or proceeds).
+            monitor_map = self._monitor_map_check()
+            if monitor_map.get("mismatch"):
+                self.ctx.log("monitor map mismatch: " + monitor_map.get("reason", ""))
             patch_window = self._patch_window_guard()
             if patch_window.get("warning"):
                 self.ctx.log(patch_window["warning"])
@@ -1619,6 +1679,7 @@ class Calibration:
             digest = {"monitor": self.monitor, "mode": self.mode, "display": self.display.name,
                       "argyll_display": self.display.argyll_display, "mapping_ok": mapping_ok,
                       "seen_monitors": sorted(set(seen_monitors)),
+                      "monitor_map": monitor_map,
                       "correction": staleness.as_dict(),
                       "correction_from_store": store_made is not None,
                       "patch_window": patch_window,
@@ -1631,6 +1692,17 @@ class Calibration:
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
 
         outcome = self._stage("preflight", run)
+        # Monitor↔Argyll↔panel map mismatch (#5): a wrong index/display number wastes the WHOLE run on
+        # the wrong panel, so adjudicate it BEFORE measuring — recommend abort (fix the profile), but
+        # let the operator/LLM proceed if the live topology is the surprise (e.g. a transient unplug).
+        monitor_map = outcome.digest.get("monitor_map", {})
+        if monitor_map.get("mismatch"):
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="preflight:monitor-map", seam=SEAM_MONITOR_MAP, stage="preflight",
+                question=monitor_map.get("reason", "the profile's monitor↔Argyll↔panel mapping "
+                         "disagrees with the live displays — abort and fix the profile, or proceed?"),
+                options=("abort", "proceed"), recommendation="abort", digest=monitor_map)),
+                stage="preflight", message="aborted on a monitor↔Argyll↔panel map mismatch")
         staleness = outcome.digest.get("correction", {})
         # The build-correction flow IS the refresh, so don't ask about staleness there.
         if staleness.get("stale") and self.calib.get("flow") != "build-correction":
@@ -3492,6 +3564,17 @@ FLOWS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Display mode (SDR <-> HDR)
 # ---------------------------------------------------------------------------
+
+def argyll_display_from_device_name(device_name: Optional[str]) -> Optional[int]:
+    """The Argyll display number encoded in a ``query_monitors`` ``device_name``. Windows device
+    names are ``\\\\.\\DISPLAYn`` and the controller reports them in ARGYLL ORDER (per the IPC
+    contract), so ``n`` is the Argyll ``-d`` display number. Returns ``n`` or ``None`` if the name
+    doesn't carry one."""
+    if not device_name:
+        return None
+    m = re.search(r"DISPLAY(\d+)", str(device_name), re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
 
 def color_space_is_hdr(color_space: Optional[str]) -> bool:
     """True iff a query_monitors ``color_space`` is HDR. SDR and ACM_SDR are both
