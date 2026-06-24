@@ -112,25 +112,44 @@ def build(args, ctx: RunContext) -> StageResult:
             list(channel_model(groups[name], idx).peak_xyz)
             for name, idx in (("red", 0), ("green", 1), ("blue", 2))
         ]
-        # Peak-Chroma cap: the brightest D65 luminance every channel can render inside full drive
-        # (the cold channel binds). OPTION 1 (owner, 2026-06-23): build the cube TO this cap — the
-        # standalone-D65 neutral axis tops out at the achievable-D65 peak (not native peak), so it
-        # holds D65 all the way up instead of warming near the top, and it REPORTS that post-cube
-        # peak (what the cube actually delivers) as `peak_nits` — the number DesktopLUT's
-        # tonemapTargetPeak should track. The closed-loop refine (stage_refine_mhc_cube) targets D65
-        # at this same cap, so build + refine now agree on the ceiling.
-        cube_peak = target_luminance
+        # ONE SOURCE OF TRUTH for the HDR peak (Task C / peak-signal-divergence). The cube's
+        # neutral-axis ceiling and the C++ handoff peak derive from the orchestrator's RESOLVED
+        # **max-sustained** peak — the SAME number patch bounding (calibrate._patch_max_cv →
+        # _hdr_target().peak_nits) uses — NOT an independent raw-TI3 max read (which is what caused
+        # the mid-pipeline divergence). Clamp to what THIS raw set actually measured (never build a
+        # cube above measured drive). Standalone build-mhc (no orchestrator → no resolved peak, or an
+        # ungrounded cold-start placeholder) keeps the measured raw max — its own real measurement.
+        resolved_peak = getattr(args, "resolved_peak_nits", None)
+        if resolved_peak and resolved_peak > 0:
+            native_ceiling = min(float(resolved_peak), target_luminance)
+            ceiling_source = ("resolved max-sustained peak"
+                              + (" (clamped to the measured raw max)" if resolved_peak > target_luminance else ""))
+        else:
+            native_ceiling = target_luminance
+            ceiling_source = "measured raw max (no resolved peak supplied — standalone build-mhc)"
+
+        # Peak-Chroma cap: a SEPARATE, physical constraint — the brightest D65 luminance every
+        # channel can render inside full drive (the cold channel binds). OPTION 1 (owner 2026-06-23):
+        # build the cube's NEUTRAL axis TO this cap so it holds D65 all the way up instead of warming
+        # near the top, and REPORT that post-cube peak (what the cube actually delivers) as
+        # `peak_nits` — the number DesktopLUT's tonemapTargetPeak tracks. Content goes brighter (patch
+        # bounding → max-sustained); above the cap, neutral chroma-relax/roll-off is DesktopLUT's job
+        # (hdr-rolloff-division-of-labour), NOT baked here. The closed-loop refine targets D65 at this
+        # same cap, so build + refine agree on the neutral ceiling.
+        cube_peak = native_ceiling
         try:
             cap_nits, binding = peak_chroma_luminance(channel_peak_xyz)
             native_peak = sum(channel_peak_xyz[c][1] for c in range(3))
-            if 0.0 < cap_nits < target_luminance:
+            if 0.0 < cap_nits < native_ceiling:
                 cube_peak = cap_nits          # hold D65: cube tops out at the achievable-D65 peak
             peak_chroma = {
                 "cap_nits": round(cap_nits, 4),
                 "binding_channel": binding,
                 "native_peak_nits": round(native_peak, 4),
+                "resolved_peak_nits": round(native_ceiling, 4),   # the max-sustained ceiling (one source)
+                "ceiling_source": ceiling_source,
                 "cube_peak_nits": round(cube_peak, 4),
-                "capped": cube_peak < target_luminance,
+                "capped": cube_peak < native_ceiling,
                 "headroom_loss_pct": round(100.0 * (1.0 - cap_nits / native_peak), 3)
                 if native_peak > 0 else None,
             }
@@ -181,6 +200,12 @@ def build(args, ctx: RunContext) -> StageResult:
         base_summary = {}
     else:
         prim = _common.measured_primaries_from(measured_primaries, white_xy)
+        # Adaptive dark floor (SDR) — same measured-chroma-drift logic as HDR, anchored on the
+        # BRIGHTEST neutral (on SDR the peak IS the target white; reference_band=None). Persisted below
+        # for the SDR closed-loop refine (stage_refine_mhc_grayscale) to smooth dark levels to identity.
+        from ..mhc_cube import adaptive_dark_floor
+        sdr_dark_floor_nits, sdr_dark_floor_info = adaptive_dark_floor(
+            [(p.xyz[1], *xy_from_xyz(p.xyz)) for p in gray_patches], reference_band=None)
         # Per-level chroma noise (SE of the mean, +inf for an unstable level) from the measure loop's
         # sidecar beside the raw TI3, so a dark gray level whose drift from native white is within the
         # measurement noise is smoothed toward identity instead of baked into the base grayscale — the
@@ -250,6 +275,9 @@ def build(args, ctx: RunContext) -> StageResult:
         params["channel_peak_xyz"] = [[round(v, 6) for v in xyz] for xyz in channel_peak_xyz]
         params["peak_chroma"] = peak_chroma
         params["dark_floor"] = {"nits": round(dark_floor_nits, 4), **dark_floor_info}
+    elif len(gray_patches) >= 2:
+        # SDR closed-loop refine (stage_refine_mhc_grayscale) consumes the dark floor too.
+        params["dark_floor"] = {"nits": round(sdr_dark_floor_nits, 4), **sdr_dark_floor_info}
     params_path = ctx.root / "generated" / f"mhc_params_{mode.lower()}.json"
     params_path.parent.mkdir(parents=True, exist_ok=True)
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")

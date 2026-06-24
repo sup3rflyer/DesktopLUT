@@ -5,11 +5,13 @@ mapping, patch sets, measurement sequencing, the loops, integrity gates, LUT
 generation) and a **thin LLM sits only at the seams** — it never tails a stream,
 it judges *digests* at boundaries. This module is that core.
 
-A run is a **named flow** (``full`` / ``3dlut-only`` / ``gray-wb``; ``hdr`` is the
+A run is a **named flow** (``full`` / ``3dlut-only`` / ``mhc-only``; ``hdr`` is the
 later goal) expressed as an ordered list of stage methods. The pipeline is
-**ICC → 3D LUT → GS+WB**, and crucially GS+WB is the *small FINAL tweak after the
-3D LUT*, not an MHC refine loop between the two (the 3D LUT does the volumetric
-heavy lifting incl. the neutral axis).
+**MHC ICC (matrix + 1D base + closed-loop D65 grayscale refine) → 3D LUT**: the MHC
+is a STANDALONE D65 foundation that owns the neutral axis (matrix = native→D65, base
+1D LUT = native-white tone, the closed-loop refine = the per-level D65 residual), and
+the 3D LUT does the volumetric/colour refinement on top (1+1+1 layering). The former
+post-3D-LUT GS+WB tweak is removed — it re-corrected the MHC-owned neutral a 3rd time.
 
 **The LLM seam = the** :class:`Adjudicator`. At each ``⚑`` point the core hands the
 adjudicator a structured :class:`AdjudicationRequest` (a digest + a question + the
@@ -81,6 +83,7 @@ from .engine.patches import (
     ramp_patches,
     shadow_levels,
     sort_patches,
+    target_anchor_patches,
     tube_patches,
     uniform_levels,
 )
@@ -96,11 +99,10 @@ from .measure_loop import (
 )
 from .decisions import hdr_metric_thresholds
 from .metrics import percentile, score_samples, score_samples_hdr, summarize_metrics
-from .mhc import parse_ti3
+from .mhc import SRGB_PRIMARIES, parse_ti3
 from .optimize import DegenerateMeasurements, OptimizeConfig, ProbeFn, optimize_cube
 from . import patch_evidence
 from .paths import RUNS_DIR, atomic_write_text
-from .refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget, propose_correction_grayscale
 from .runs import RunContext, create_run, open_run
 from .stages import _common, build_mhc
 
@@ -127,9 +129,8 @@ SEAM_PROBE_MATCH = "probe_match"   # build-correction: operator runs ccxxmake at
 SEAM_BRIGHTNESS = "brightness"     # white luminance to target (human turns OSD)
 SEAM_MEASURE = "measure"           # loop didn't settle / unresolved patches (§6)
 SEAM_OPTIMIZE = "optimize_floor"   # physical floor / budget-limited points (§7)
-SEAM_WATCHDOG = "gswb_watchdog"    # tweak magnitude growing large → recal (§3)
 SEAM_VERIFY = "verify"             # final score vs quality targets
-SEAM_STACK = "require_stack"       # gray-wb/3dlut-only precondition unmet
+SEAM_STACK = "require_stack"       # 3dlut-only precondition unmet
 SEAM_CHARACTERIZE = "characterize" # characterization surfaced abnormal panel/meter behaviour
 SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation seam (§6a; #47/#49)
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
@@ -553,7 +554,6 @@ class Calibration:
         white_fn: Optional[cp.WhiteFn] = None,
         probe_launcher: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
         decision_overrides: Optional[dict[str, "Decision"]] = None,
-        skip_gswb: bool = False,
         adaptive_planning: bool = False,
         stall_kill_hook: Optional[Callable[[], None]] = None,
         pause_handler: Optional[Callable[[Mapping[str, Any]], None]] = None,
@@ -600,10 +600,6 @@ class Calibration:
         self.dummy_icc = dummy_icc
         self.patch_sizes = patch_sizes or PatchSizes()
         self._white_fn = white_fn
-        # Skip the FINAL GS+WB tweak in `full` (the deferred stage that targets the wrong
-        # DesktopLUT layer — see reference-dlc-gswb-target). Yields a cohesive ICC→3D-LUT run
-        # (one rollback unit, one verify gate) without baking a known-wrong grayscale tweak.
-        self.skip_gswb = skip_gswb
         # Opt-in: the LLM patch-strategy investigation seam (#47/#49). OFF ⇒ the deterministic
         # patch plan, no seam, no evidence gathering (an ordinary run is unchanged).
         self.adaptive_planning = adaptive_planning
@@ -1675,8 +1671,14 @@ class Calibration:
         colorspace = self._target_colorspace()
         try:
             spec = self.profile.target(self.target_name or self.display.target_name(self.mode))
-            target_nits, is_hdr = spec.luminance_nits, spec.is_hdr
-        except (KeyError, AttributeError):
+            is_hdr = spec.is_hdr
+            # HDR target = the resolved MAX-SUSTAINED peak (already clamped to the native ceiling),
+            # NOT the profile's viewing peak_luminance_nits (owner 2026-06-24, Task C — that moved to
+            # DesktopLUT's tonemap). So this headroom tell never fires a spurious "roll off to native"
+            # in the normal case; it only speaks if a pinned override somehow exceeds the panel. SDR =
+            # the OSD-set white luminance.
+            target_nits = self._hdr_target().peak_nits if is_hdr else spec.luminance_nits
+        except (KeyError, AttributeError, ValueError):
             target_nits, is_hdr = None, (self.mode == "HDR")
         tell: dict[str, Any] = {"checked": True, "native_white_nits": round(white, 2),
                                 "native_black_nits": (round(black, 5) if black is not None else None),
@@ -1686,8 +1688,8 @@ class Calibration:
         # HDR peak headroom: the measured peak IS the panel's HDR ceiling (not OSD-adjustable),
         # so a target peak above it can't be hit — the build must roll off / drop the ceiling.
         if is_hdr and target_nits and white < target_nits * 0.95:
-            msgs.append(f"native peak {white:.0f} nits is below the {target_nits:g}-nit target peak — "
-                        f"the build must roll off / lower the sustained ceiling to ~{white:.0f}")
+            msgs.append(f"resolved sustained peak {target_nits:g} nits exceeds the measured native "
+                        f"ceiling {white:.0f} — the calibration is capped to ~{white:.0f}")
         # Raised black / low contrast (advisory threshold, not panel-specific).
         if contrast is not None and contrast < 200:
             msgs.append(f"measured contrast ~{contrast:.0f}:1 (raised black {black:.3f} nits) — "
@@ -2521,6 +2523,15 @@ class Calibration:
             args = Namespace(run=self.ctx.root, monitor=self.monitor, mode=self.mode,
                              simulate=False, gamma=spec.gamma, source_ti3=raw_ti3,
                              is_hdr=spec.is_hdr)
+            if spec.is_hdr:
+                # ONE SOURCE OF TRUTH (Task C): hand build-mhc the SAME resolved max-sustained peak
+                # patch bounding uses (_patch_max_cv → _hdr_target().peak_nits), so the MHC cube
+                # ceiling + the C++ set_base_lut handoff agree with the patch set instead of
+                # re-deriving an independent raw-TI3 max. Skip an ungrounded cold-start placeholder
+                # (no DIP measured yet) — there the stage's own raw-TI3 max is the real measurement.
+                hdr = self._hdr_target()
+                if (hdr.provenance.get("peak") or {}).get("grounded", True):
+                    args.resolved_peak_nits = hdr.peak_nits
             derive = build_mhc.build(args, self.ctx)
             self.ctx.log(f"build-mhc: {derive.status}")
             if derive.status == "failed":
@@ -2560,10 +2571,15 @@ class Calibration:
             # (D65) here makes displayPrim.W == src white ⇒ ZERO white adaptation ⇒ the panel's
             # native white passes straight through (HW evidence 2026-06-20: peak white stayed at
             # native ~0.324 in both HDR runs). The matrix can only correct native→D65 if it knows
-            # the panel's measured white. (SDR limps to target via the post-install refine loop;
-            # HDR has none.) See mhc_icc.cpp ComputeMHC2Matrix / GenerateMHC2Profile.
+            # the panel's measured white — so BOTH modes now send it (aligning with the standalone
+            # install_mhc.py). The 1+1+1 standalone-D65 design (Task B / #C1): the MATRIX owns the
+            # bulk native→D65 move (robust 3×3, no full-input channel clamp), the native-white base
+            # 1D LUT/grayscale owns per-channel tone, and the closed-loop refine (stage_refine_mhc_*)
+            # corrects the per-level non-additivity RESIDUAL toward D65. (SDR previously sent the
+            # target white here, leaving the whole white move on the grayscale — the open-loop limp
+            # the closed-loop refine now replaces.) See mhc_icc.cpp ComputeMHC2Matrix.
             mw = (params.get("measured_white") or {})
-            if spec.is_hdr and mw.get("x") is not None and mw.get("y") is not None:
+            if mw.get("x") is not None and mw.get("y") is not None:
                 self.controller.set_white(self.monitor, self.mode, mw["x"], mw["y"])
             else:
                 self.controller.set_white(self.monitor, self.mode, wx, wy)
@@ -2571,6 +2587,10 @@ class Calibration:
             # MHC2 LUT); the 32-point set_base_grayscale table is too sparse for a PQ EOTF and is
             # reserved for GS+WB post-fixes. SDR keeps the (adequate) 32-point base.
             if spec.is_hdr and base_lut and base_lut.get("cube_path"):
+                # peak_nits = the cube's post-cap NEUTRAL ceiling (the achievable-D65 Peak-Chroma cap),
+                # derived from the one resolved max-sustained peak (Task C). This is the number a future
+                # DesktopLUT `tonemapTargetPeak` IPC (Task E4) should track so content above the cap
+                # rolls off in the shader, not the cube. The user's standard VIEWING peak lives there too.
                 self.controller.set_base_lut(self.monitor, self.mode, base_lut["cube_path"],
                                              base_lut.get("peak_nits", 0.0))
             else:
@@ -2746,7 +2766,7 @@ class Calibration:
         prior_fp = prior.get("fingerprint") if isinstance(prior, dict) else None
         if prior_fp != new_fp:
             for stale in ("measure:post-mhc", "build-install-3dlut",
-                          "measure:gray-wb", "gswb-tweak", "measure:verify", "verify"):
+                          "measure:verify", "verify"):
                 self.calib["stages"].pop(stale, None)
         self.calib["adaptive_plan"] = {"fingerprint": new_fp, "decision": normalized,
                                        "worth_investigating": evidence["worth_investigating"]}
@@ -2968,6 +2988,200 @@ class Calibration:
                 digest=outcome.digest))
         return outcome
 
+    def _grey_de_sdr(self, samples, white_xy: tuple[float, float]) -> dict[str, Any]:
+        """SDR analog of :meth:`_grey_de_vs_white` — average/max **CIEDE2000** of the GRAYSCALE
+        patches vs the resolved target white, plus the worst luminance-tracking ("gamma") error
+        along the lit grey ramp. The SDR closed-loop refine's convergence metric. Advisory only —
+        a scoring hiccup returns None rather than crashing the loop."""
+        try:
+            metrics, _lum = score_samples(samples, gamma=self._spec().gamma, white_xy=white_xy)
+            grey = [m for m in metrics if m.grayscale]
+            if not grey:
+                return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
+            de = [m.de2000 for m in grey]
+            lum_errs = [abs(m.measured_xyz[1] - m.target_xyz[1]) / m.target_xyz[1]
+                        for m in grey if m.target_xyz[1] > 0.5]
+            gamma_err = round(100.0 * max(lum_errs), 2) if lum_errs else None
+            return {"avg": round(sum(de) / len(de), 3), "max": round(max(de), 3), "n": len(de),
+                    "gamma_err_pct": gamma_err}
+        except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
+            return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
+
+    def stage_refine_mhc_grayscale(self, *, max_rounds: int = 3, target_de: float = 0.5,
+                                   min_improvement: float = 0.1, regress_tol: float = 0.3
+                                   ) -> StageOutcome:
+        """Closed-loop grayscale refine of the **SDR** MHC ``correctionGrayscale`` toward STANDALONE D65.
+
+        The SDR sibling of :meth:`stage_refine_mhc_cube` (Task B / backlog #C1). Each round: measure the
+        neutral ramp with the current MHC applied, score grey vs the resolved white (CIEDE2000), and —
+        unless already floored — pull the ``correctionGrayscale`` layer toward D65 at the POST-matrix
+        abscissa (``mhc_cube.refine_sdr_grayscale``) and reinstall. This makes the SDR ICC a
+        self-sufficient D65 foundation (the matrix owns native→D65, the base 1D LUT owns native-white
+        tone, this loop owns the per-level non-additivity residual) — independent of the 3D LUT
+        (see [[sdr-violates-1plus1plus1-hdr-upholds]] / [[dlc-corrections-stack-independently]]).
+
+        Per the DESIGN LAW the convergence FLOOR (no further improvement, or below the panel-limited
+        ``target_de``) is a deterministic stop the spine owns; each round emits a NON-BLOCKING check-in
+        the LLM consumes from the running spine; the FINAL acceptance is the verify seam. A REGRESSION
+        (a refine made grey worse) reverts to the best measured deviations and raises a seam for the LLM.
+        SDR only; HDR uses the base-cube refine. The mock panel ignores the installed correction, so sim
+        proves WIRING + math only — HW convergence validation is pending a live SDR run on monitor 0.
+        """
+        def run() -> StageOutcome:
+            spec = self._spec()
+            params = self._state.get("mhc_params") or {}
+            primaries = params.get("primaries")
+            native_white = params.get("measured_white") or {}
+            nwx, nwy = native_white.get("x"), native_white.get("y")
+            peak = params.get("target_luminance")
+            dark_floor = float((params.get("dark_floor") or {}).get("nits") or 0.5)
+            if spec.is_hdr or not (primaries and nwx is not None and nwy is not None and peak):
+                return StageOutcome(
+                    "refine-mhc-grayscale", "done",
+                    digest={"skipped": True, "reason": (
+                        "SDR-only closed-loop correctionGrayscale refine (HDR uses the base-cube "
+                        "refine; or missing primaries/measured-white/peak inputs)")},
+                    data={"rounds": 0})
+
+            from .measure_loop import match_level_noise
+            from .mhc_cube import mhc2_matrix, refine_sdr_grayscale
+
+            # Installed SDR MHC2 matrix: src = sRGB (the C++ SDR srcPrim), display = native primaries +
+            # MEASURED native white (set_white now sends native white) → M performs native→D65. rowsums
+            # = M@(1,1,1) = the native-channel neutral drive that reproduces D65 — the POST-matrix signal
+            # the per-channel correctionGrayscale LUT is keyed at. MUST match the install or the loop
+            # converges to the wrong abscissa (the HDR 3151c50 lesson, SDR edition).
+            matrix = mhc2_matrix(primaries, (nwx, nwy), SRGB_PRIMARIES, _D65_XY)
+            rowsums = [sum(matrix[r]) for r in range(3)]
+            wx, wy = self._white_xy()                       # resolved target white (D65 or SPD-derived)
+            gamma = float(spec.gamma)
+
+            # Idempotence: ALWAYS refine from the build base (identity correctionGrayscale), never a prior
+            # refine's output. Reset the correctionGrayscale layer to identity + reinstall up front so
+            # re-running this stage in isolation can't compound the correction.
+            n_points = 32
+            grid = [j / (n_points - 1) for j in range(n_points)]
+            ident = {ch: [1.0] * n_points for ch in ("r", "g", "b")}
+            self.controller.set_correction_grayscale(self.monitor, self.mode, n_points, grid, ident,
+                                                     gamma=gamma)
+            self.controller.apply_mhc(self.monitor, self.mode)
+
+            scores: list[float] = []
+            rounds_log: list[dict[str, Any]] = []
+            installed_points, installed_dev = grid, ident      # currently applied correctionGrayscale
+            best_points, best_dev, best_avg = grid, ident, float("inf")
+            flags: dict[str, bool] = {}
+
+            for rnd in range(1, max_rounds + 1):
+                res = self._measure_set(self._neutral_patches(), role=f"refine{rnd}",
+                                        ti3_name=f"refine_{rnd}.ti3",
+                                        ndjson_name=f"refine_{rnd}.ndjson")
+                samples = parse_ti3(Path(res.ti3_path)) if res.ti3_path else []
+                grey = [s for s in samples
+                        if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
+                de = self._grey_de_sdr(samples, (wx, wy))
+                rounds_log.append({"round": rnd, "grey_avg_de2000": de["avg"],
+                                   "grey_max_de2000": de["max"], "grey_n": de["n"],
+                                   "gamma_err_pct": de["gamma_err_pct"]})
+                # Feed the round's grayscale quality to the timed check-in's live metrics (non-blocking
+                # evidence) so a multi-round refine isn't metric-blind mid-run; since_last_round = the
+                # round-over-round improvement (prev - this; +ve = converging).
+                prev_avg = scores[-1] if scores else None
+                cur_best = (min(best_avg, de["avg"]) if de["avg"] is not None else best_avg)
+                self._last_refine = {
+                    "round": rnd, "grey_avg_de2000": de["avg"], "grey_max_de2000": de["max"],
+                    "gamma_err_pct": de["gamma_err_pct"], "grey_n": de["n"],
+                    "best_avg_de2000": (round(cur_best, 3) if cur_best != float("inf") else None),
+                    "since_last_round": (round(prev_avg - de["avg"], 3)
+                                         if prev_avg is not None and de["avg"] is not None else None)}
+                self._maybe_timed_checkin("refine-mhc-grayscale")
+                if de["avg"] is None:
+                    flags["unscored"] = True
+                    break
+                scores.append(de["avg"])
+                if de["avg"] < best_avg:
+                    best_avg, best_dev, best_points = de["avg"], installed_dev, installed_points
+
+                # --- deterministic stop conditions (the spine owns these). Each just sets a flag +
+                # breaks; the UNIFIED best-revert below leaves the best measured deviations installed
+                # on EVERY exit — so a within-tolerance uptick that doesn't trip the regression gate
+                # (floored/converged/budget) can't strand a worse-than-best (even worse-than-identity)
+                # correction (round 1 always measures identity, so best is identity-or-better). ---
+                if len(scores) >= 2 and scores[-1] > scores[-2] + regress_tol:
+                    flags["regressed"] = True
+                    break
+                if de["avg"] <= target_de:
+                    flags["converged"] = True
+                    break
+                if len(scores) >= 2 and (scores[-2] - scores[-1]) < min_improvement:
+                    flags["floored"] = True
+                    break
+                if rnd == max_rounds:
+                    flags["budget_limited"] = True
+                    break
+
+                # --- one refine step toward D65 at the post-matrix abscissa, then reinstall ---
+                # Attach each level's measurement noise (SE of the mean chromaticity, or +inf if the
+                # level was flagged unstable; matched by nearest signal) so the refine smooths a
+                # noisy/unstable dark level's correction toward identity.
+                noise_entries = self._dark_noise_entries(res.ti3_path)
+                measured_neutral = []
+                for s in grey:
+                    noise = match_level_noise(noise_entries, s.rgb[0]) if noise_entries else None
+                    entry = (s.rgb[0], tuple(s.xyz))
+                    measured_neutral.append(entry + (noise,) if noise is not None else entry)
+                new_points, new_dev = refine_sdr_grayscale(
+                    installed_dev, measured_neutral, primaries, (nwx, nwy), peak, rowsums,
+                    gamma=gamma, target_white_xy=(wx, wy), dark_floor_nits=dark_floor,
+                    n_points=n_points)
+                self.controller.set_correction_grayscale(self.monitor, self.mode, len(new_points),
+                                                         new_points, new_dev, gamma=gamma)
+                self.controller.apply_mhc(self.monitor, self.mode)
+                installed_points, installed_dev = new_points, new_dev
+
+            # Unified best-revert: leave (and persist) the BEST measured deviations on every terminal
+            # exit. A converged/floored/budget exit might otherwise strand a marginally-worse-than-best
+            # correction (an uptick within regress_tol never trips the regression gate); reinstalling
+            # best guarantees the standalone foundation never regresses below what was actually measured
+            # best (≥ identity, since round 1 measures identity).
+            if best_dev is not installed_dev:
+                self.controller.set_correction_grayscale(self.monitor, self.mode, len(best_points),
+                                                         best_points, best_dev, gamma=gamma)
+                self.controller.apply_mhc(self.monitor, self.mode)
+                installed_points, installed_dev = best_points, best_dev
+
+            # Persist the final (applied) correctionGrayscale so resume/report reference the refined
+            # foundation (mirrors stages/refine_grayscale.py's state shape).
+            self._state["correction_grayscale"] = {
+                "point_count": len(installed_points), "points": installed_points,
+                "deviations": installed_dev}
+            _common.save_dlc_state(self.ctx, self._state)
+
+            final_avg = scores[-1] if scores else None
+            digest = {"rounds": len(rounds_log), "round_log": rounds_log,
+                      "grey_avg_de2000": final_avg, "best_grey_avg_de2000": (
+                          round(best_avg, 3) if best_avg != float("inf") else None),
+                      "target_de2000": target_de, "rowsums": [round(v, 5) for v in rowsums],
+                      **flags}
+            return StageOutcome("refine-mhc-grayscale", "done", digest=digest,
+                                data={"rounds": len(rounds_log),
+                                      "regressed": bool(flags.get("regressed")),
+                                      "final_avg": final_avg})
+
+        outcome = self._stage("refine-mhc-grayscale", run)
+        if outcome.data.get("regressed"):
+            # A refine round made grayscale WORSE — the best deviations are already reinstalled; the
+            # LLM judges whether to accept, extend, or recheck the panel. (Not a unilateral abort: the
+            # reverted deviations are still the measured-best foundation.)
+            self.adjudicate(AdjudicationRequest(
+                key="refine-mhc-grayscale:regression", seam=SEAM_OPTIMIZE, stage="refine-mhc-grayscale",
+                question=("the SDR closed-loop grayscale refine regressed (a round made grey worse); "
+                          "the best measured correctionGrayscale was restored — accept it, or recheck "
+                          "the panel?"),
+                options=("accept", "abort"), recommendation="accept",
+                digest=outcome.digest))
+        return outcome
+
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
             target = self._engine_target()
@@ -3036,68 +3250,6 @@ class Calibration:
         if self._spec().is_hdr:
             return budget_frac >= 0.20 and mean_de >= 30.0
         return budget_frac >= 0.20 and mean_de >= 20.0
-
-    def stage_gswb_tweak(self, neutral_ti3: str) -> StageOutcome:
-        """The small FINAL GS+WB tweak, authored AFTER the 3D LUT (§4). Computes a
-        per-channel correction-grayscale + a residual white move from a neutral-axis
-        measurement, bakes them into the editable MHC controls, and runs the
-        tweak-drift **watchdog** (§3) on the magnitude + cross-run trend."""
-        def run() -> StageOutcome:
-            spec = self._spec()
-            if spec.is_hdr:
-                # Defensive: GS+WB on PQ is deferred (the cube owns the HDR neutral axis; the
-                # SDR-γ proposal would corrupt the MHC). No-op regardless of how we got here
-                # (a gray-wb flow on HDR also lands here, not just full).
-                return StageOutcome(
-                    "gswb-tweak", "done",
-                    digest={"skipped": True, "reason": "GS+WB deferred for HDR — the 3D LUT owns "
-                            "the PQ neutral axis; no MHC correction-grayscale written.",
-                            "tweak_magnitude": 0.0},
-                    data={"magnitude": 0.0, "watchdog": {}})
-            samples = parse_ti3(Path(neutral_ti3))
-            gray = [GrayPatch(level=s.rgb[0], xyz=s.xyz) for s in samples
-                    if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
-            gray.sort(key=lambda p: p.level)
-            white_xy = _xy(max(samples, key=lambda s: s.xyz[1]).xyz)
-            wx, wy = self._white_xy()
-            white_move = float(np.hypot(white_xy[0] - wx, white_xy[1] - wy))
-            if len(gray) < 2:
-                magnitude = 0.0
-                deviations = Deviations.identity(max(1, len(gray))).as_dict()
-                points = [round(p.level, 6) for p in gray] or [1.0]
-                point_count = len(points)
-            else:
-                prim_params = (self._state.get("mhc_params") or {}).get("primaries")
-                primaries = _measured_primaries(prim_params, white_xy)
-                proposal = propose_correction_grayscale(
-                    measured=gray,
-                    target=RefinementTarget(white_x=wx, white_y=wy, gamma=spec.gamma,
-                                            peak_luminance=spec.luminance_nits),
-                    primaries=primaries, current=Deviations.identity(len(gray)), damping=1.0)
-                deviations = proposal["deviations"]
-                points = proposal["points"]
-                point_count = proposal["point_count"]
-                magnitude = float(proposal["summary"].get("max_abs_deviation", 0.0))
-                self.controller.set_correction_grayscale(self.monitor, self.mode, point_count, points, deviations, gamma=spec.gamma)
-                self.controller.set_white(self.monitor, self.mode, wx, wy)
-                self.controller.apply_mhc(self.monitor, self.mode)
-            watchdog = self._watchdog(magnitude)
-            digest = {"tweak_magnitude": round(magnitude, 5), "white_move_xy": round(white_move, 5),
-                      "points": point_count, "watchdog": watchdog}
-            return StageOutcome("gswb-tweak", "done", digest=digest,
-                                data={"magnitude": magnitude, "watchdog": watchdog})
-
-        outcome = self._stage("gswb-tweak", run)
-        wd = outcome.data.get("watchdog") or {}
-        if wd.get("trips"):
-            self.adjudicate(AdjudicationRequest(
-                key="gswb-tweak:watchdog", seam=SEAM_WATCHDOG, stage="gswb-tweak",
-                question=(f"GS+WB tweak magnitude {wd.get('magnitude')} (trend {wd.get('trend')}) is "
-                          f"approaching the level that would override the 3D LUT's neutral axis — patch "
-                          f"now, or has the panel drifted enough to warrant a full recalibration?"),
-                options=("apply", "recommend_recal"), recommendation=wd.get("recommendation", "apply"),
-                digest=wd))
-        return outcome
 
     def stage_verify(self, verify_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
@@ -3196,49 +3348,6 @@ class Calibration:
         return avg >= 20.0 or p95 >= 40.0 or max_de >= 100.0 or white >= 50.0
 
     # ====================================================================
-    # Watchdog (§3) — cross-run GS+WB tweak history
-    # ====================================================================
-    def _tweak_history_path(self) -> Path:
-        """Cross-run GS+WB tweak history, persisted next to the run folders (so it
-        accumulates across runs, not per-run). The owner's per-display 'medical
-        history' the watchdog reads."""
-        base = self.ctx.root.parent if self.ctx.root.parent != self.ctx.root else self.ctx.root
-        return base / "tweak_history.json"
-
-    def _load_tweak_history(self) -> dict[str, Any]:
-        path = self._tweak_history_path()
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                return {}
-        return {}
-
-    def _watchdog(self, magnitude: float) -> dict[str, Any]:
-        """Judge the new GS+WB tweak against the per-display history. A *small* tweak
-        is fine; a magnitude (or a growing trend) approaching the level that would
-        override the 3D LUT's own neutral-axis correction → recommend a full recal."""
-        key = f"{self.display.name}:{self.mode}"
-        history = self._load_tweak_history()
-        entries = list(history.get(key, []))
-        prior = [float(e.get("magnitude", 0.0)) for e in entries]
-        # Thresholds (deviation space): a single tweak this large, or an accumulated
-        # trend this large, would start fighting the volumetric neutral-axis correction.
-        single_limit = 0.06
-        trend_limit = 0.12
-        trend = round(sum(prior) + magnitude, 5)
-        trips = magnitude >= single_limit or trend >= trend_limit
-        recommendation = "recommend_recal" if trips else "apply"
-        entries.append({"date": self.run_date.isoformat(), "magnitude": round(magnitude, 5)})
-        history[key] = entries
-        # Atomic: the cross-run tweak history is the watchdog's medical record; a truncated
-        # write would corrupt it (load is try/except-tolerant → silently empty → lost trend).
-        atomic_write_text(self._tweak_history_path(), json.dumps(history, indent=2))
-        return {"magnitude": round(magnitude, 5), "trend": trend, "single_limit": single_limit,
-                "trend_limit": trend_limit, "prior_runs": len(prior), "trips": trips,
-                "recommendation": recommendation}
-
-    # ====================================================================
     # Report + deliverable folder (§11)
     # ====================================================================
     def _results_dir(self) -> Path:
@@ -3274,14 +3383,18 @@ class Calibration:
         cube_out = None
         if cube_src and Path(cube_src).exists():
             spec = self._spec()
+            # The HDR deliverable is labelled with the CALIBRATED peak (the resolved max-sustained
+            # ceiling), not the profile's 1600 viewing peak — the cube IS the calibration to that
+            # peak (Task C / one source of truth). SDR uses its OSD-set white luminance.
+            label_nits = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
             cube_out = results_dir / descriptive_cube_name(
                 date=self.run_date.isoformat(), display=self.display.short_name, mode=self.mode,
                 colorspace=_gamut_label(spec.colorspace, is_hdr=spec.is_hdr, gamma=spec.gamma),
                 transfer=_transfer_token(is_hdr=spec.is_hdr, gamma=spec.gamma),
-                luminance_nits=spec.luminance_nits)
+                luminance_nits=label_nits)
             shutil.copy2(cube_src, cube_out)
         # Copy the verification TI3.
-        verify_ti3 = sdat("measure:verify").get("ti3") or sdat("measure:gray-wb").get("ti3")
+        verify_ti3 = sdat("measure:verify").get("ti3")
         ti3_out = None
         if verify_ti3 and Path(verify_ti3).exists():
             ti3_out = results_dir / "measurements.ti3"
@@ -3295,7 +3408,6 @@ class Calibration:
             "lut3d": {k: sd("build-install-3dlut").get(k) for k in
                       ("converged", "best_max_de", "best_mean_de", "above_threshold",
                        "physical_floor", "cube_path")} if sd("build-install-3dlut") else None,
-            "gswb": sd("gswb-tweak") or None,
             "verification": sd("verify") or None,
             "decisions": self.calib.get("decisions", {}),
             "deliverables": {"cube": str(cube_out) if cube_out else None,
@@ -3309,8 +3421,7 @@ class Calibration:
         report_html.write_text(_render_report_html(payload), encoding="utf-8")
         return StageOutcome("report", "done",
                             digest={"results_dir": str(results_dir), "report": str(report_json),
-                                    "verification": payload["verification"], "lut3d": payload["lut3d"],
-                                    "gswb_watchdog": (payload["gswb"] or {}).get("watchdog")},
+                                    "verification": payload["verification"], "lut3d": payload["lut3d"]},
                             data={"results_dir": str(results_dir), "report_path": str(report_json),
                                   "deliverable_cube": str(cube_out) if cube_out else None},
                             artifacts=[str(report_json), str(report_html)])
@@ -3373,8 +3484,6 @@ class Calibration:
                 return self._flow_mhc_only()
             if flow == "3dlut-only":
                 return self._flow_3dlut_only()
-            if flow == "gray-wb":
-                return self._flow_gray_wb()
             if flow == "build-correction":
                 return self._flow_build_correction()
             if flow == "characterize":
@@ -3437,8 +3546,13 @@ class Calibration:
             return None
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:
+        # Gamut-aware build (HDR / wide-gamut): project the bulk onto the panel's reachable gamut +
+        # add the target-gamut anchor foundation. _reachable_primaries is None for SDR (sRGB ⊂ panel)
+        # → degrades to the un-projected bulk + neutral/dark, identical to the projection-free plan
+        # preview (flow_patch_counts), so the previewed count and the fingerprint stay stable.
         return build_volumetric_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
-                                    max_cv=self._patch_max_cv())
+                                    max_cv=self._patch_max_cv(), target=self._engine_target(),
+                                    reachable_primaries=self._reachable_primaries())
 
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
         return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
@@ -3457,17 +3571,11 @@ class Calibration:
                                 max_cv=self._patch_max_cv(), hue_sat_caps=caps)
 
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
-        plan = flow_patch_counts(flow, self.patch_sizes, self._transfer(),
+        return flow_patch_counts(flow, self.patch_sizes, self._transfer(),
                                  max_cv=self._patch_max_cv())
-        if flow == "full" and (self.skip_gswb or self._spec().is_hdr) and "gray-wb" in plan["stages"]:
-            stages = dict(plan["stages"])
-            stages.pop("gray-wb", None)
-            plan = {**plan, "stages": stages, "total_patches": sum(stages.values()), "skip_gswb": True}
-        return plan
 
     def _patch_plan_record(self, flow: str) -> dict[str, Any]:
         transfer = self._transfer()
-        spec = self._spec()
         plan = self.flow_patch_counts(flow)
         record = {
             **plan,
@@ -3483,7 +3591,6 @@ class Calibration:
             # The HDR peak cap (None for SDR) is part of the plan identity: changing the target
             # peak changes which patches are measured, so it must invalidate an approved plan.
             "patch_max_cv": self._patch_max_cv(),
-            "skip_gswb": bool(self.skip_gswb or spec.is_hdr),
         }
         payload = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return {**record, "fingerprint": hashlib.sha256(payload).hexdigest()[:16]}
@@ -3532,32 +3639,30 @@ class Calibration:
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
+        # Standalone-D65 foundation (1+1+1): pull the MHC to D65 BEFORE the optional 3D LUT refines
+        # the off-gray volume — the MHC owns the neutral axis. HDR refines the base 1D cube; SDR
+        # refines the correctionGrayscale layer (Task B / #C1). The MHC is now the SOLE neutral-axis
+        # owner; the former post-3D-LUT GS+WB tweak (which re-corrected neutral a 3rd time) is removed.
         if self._spec().is_hdr:
-            # Standalone-D65 foundation: pull the MHC base cube to D65 before the optional 3D LUT
-            # refines the off-gray volume (the cube owns the neutral axis; 1+1+1 layering).
             self.stage_refine_mhc_cube()
+        else:
+            self.stage_refine_mhc_grayscale()
         self.stage_adaptive_planning(raw_ti3=raw.data["ti3"])   # opt-in LLM investigation seam (#47/#49)
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
-        # GS+WB is the small SDR neutral-axis tweak; on PQ the cube owns the HDR neutral axis
-        # and the SDR-γ proposal would bake a wrong curve (§7/§8), so HDR skips it like --skip-gswb.
-        if not self.skip_gswb and not self._spec().is_hdr:
-            gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
-                                    ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
-            self.stage_gswb_tweak(gw.data["ti3"])
         ver = self.stage_measure(role="verify", patches=self._verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
 
     def _flow_mhc_only(self) -> CalibrationResult:
-        """ICC only — MHC matrix + base 1D LUT, then verify + report. NO 3D LUT and NO
-        GS+WB tweak (those are what make ``full`` long), so this is the fast end-to-end
-        path that proves the orchestration + hardware before committing to a dense run.
-        The MHC alone is the *foundation*; without the volumetric/neutral refinement the
-        3D LUT+GS+WB add, verify may sit above the final quality targets — that's expected
-        for an ICC-only pass (accept it as a shakedown, judge it on the before/after)."""
+        """ICC only — MHC matrix + base 1D LUT + the closed-loop D65 grayscale refine, then verify +
+        report. NO 3D LUT (that is what makes ``full`` long), so this is the fast end-to-end path that
+        proves the orchestration + hardware before committing to a dense run. The MHC alone is the
+        standalone D65 *foundation*; without the volumetric/colour refinement the 3D LUT adds, verify
+        may sit above the final quality targets on saturated colour — that's expected for an ICC-only
+        pass (accept it as a shakedown, judge it on the before/after + the grayscale axis)."""
         self.stage_preflight()
         self.stage_resolve_target()
         self.stage_whitepoint()
@@ -3567,10 +3672,13 @@ class Calibration:
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
+        # The mhc-only flow IS the standalone-ICC path — refine the MHC to D65 so verify scores the
+        # foundation as a self-sufficient D65 layer (no 3D LUT to lean on). HDR: base 1D cube; SDR:
+        # the correctionGrayscale layer (Task B / #C1).
         if self._spec().is_hdr:
-            # The mhc-only flow IS the standalone-ICC path — refine the base cube to D65 so the
-            # verify scores the foundation as a self-sufficient D65 layer (no 3D LUT to lean on).
             self.stage_refine_mhc_cube()
+        else:
+            self.stage_refine_mhc_grayscale()
         ver = self.stage_measure(role="verify", patches=self._verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
@@ -3588,22 +3696,6 @@ class Calibration:
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
         ver = self.stage_measure(role="verify", patches=self._verify_patches(),
-                                 ti3_name="verify.ti3", ndjson_name="verify.ndjson")
-        self.stage_verify(ver.data["ti3"])
-        return self._finish()
-
-    def _flow_gray_wb(self) -> CalibrationResult:
-        self.stage_preflight()
-        self.stage_resolve_target()
-        self.stage_whitepoint()
-        self._require_stack(need_mhc=True, need_lut=True)
-        self._capture_inplace_baseline()   # record the restorable cube before the GS+WB tweak mutates the MHC
-        self.stage_hardware_readiness()
-        self.stage_brightness()
-        gw = self.stage_measure(role="gray-wb", patches=self._neutral_patches(),
-                                ti3_name="gray_wb.ti3", ndjson_name="gray_wb.ndjson")
-        self.stage_gswb_tweak(gw.data["ti3"])
-        ver = self.stage_measure(role="verify", patches=self._neutral_verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -3730,10 +3822,9 @@ class Calibration:
 # Flow registry (the named flows the front door maps an intent onto). HDR is the
 # later goal; v1 is SDR-first.
 FLOWS: dict[str, str] = {
-    "full": "neutral → raw → MHC → post-MHC → 3D LUT → GS+WB → verify → report",
-    "mhc-only": "raw → MHC (matrix + 1D) → verify → report (ICC only; no 3D LUT / GS+WB — shakedown)",
+    "full": "neutral → raw → MHC + D65 grayscale refine → post-MHC → 3D LUT → verify → report",
+    "mhc-only": "raw → MHC (matrix + 1D + D65 grayscale refine) → verify → report (ICC only; no 3D LUT — shakedown)",
     "3dlut-only": "verify MHC present → measure → 3D LUT → verify → report",
-    "gray-wb": "require stack → brightness → measure neutral → GS+WB tweak → verify → report",
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
     "hdr": "(post-v1) Rec.2020/PQ — SDR-first in v1",
@@ -3905,13 +3996,34 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
     return sort_patches(union, ps.order, transfer, warm_tau=warm_tau)   # re-order the whole set
 
 
-def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
-                         warm_tau: Optional[int] = None,
-                         max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The 3D-LUT sampling set. ``volumetric_mode`` picks HOW the cube interior is sampled:
-    a neutral-axis ``tube`` (default; dense where content lives), a uniform ``cube``, or a
-    content-weighted ``gamut`` shell set. ``max_cv`` caps the range (HDR peak; see
-    :func:`build_ramp_set`)."""
+# --- Volumetric BUILD set: gamut-awareness + colorimetric foundation constants -----------------
+# Sequencer philosophy (owner): always provide a standard colorimetric foundation (target-gamut
+# anchors, per-hue saturation sweeps, grayscale) but concentrate the BULK where it matters for
+# practical viewing — ~99 % of content is inside Rec.709 and most of it is in the shadows. The
+# foundation below is thin by design; the bulk density still comes from the volumetric mode.
+_ANCHOR_LEVEL_FRACS = (0.18, 0.50, 0.85)   # low / near-cusp / high luminance rungs (frac of peak cv)
+_ANCHOR_INSET = 0.95                       # just-inside anchor at inset*cap saturation
+_FOUNDATION_RAMP_STEPS = 7                 # thin grey + per-hue saturation-sweep ramp
+_FOUNDATION_SATURATIONS = (0.5, 1.0)       # sweep shells (capped to reachable); 1.0 carries the clip marker
+_FOUNDATION_TUBE_LEVELS = 9                # neutral-tube grey anchors (always present)
+_DARK_CHROMA_LEVELS = 4                    # sparse dark near-neutral chroma rungs (dark grey stays dense)
+_DARK_CHROMA_OFFSET = 0.15                 # single chroma offset for the sparse dark chroma
+_MIN_SEPARATION = 0.012                    # min signal-space spacing for projected bulk (kills micro-dupes)
+
+
+def _dedup_keep_order(patches: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+    seen: set[tuple[int, int, int]] = set()
+    out: list[tuple[int, int, int]] = []
+    for p in patches:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _volumetric_bulk(ps: PatchSizes, transfer: Transfer, *, warm_tau: Optional[int],
+                     max_cv: Optional[int]) -> list[tuple[int, int, int]]:
+    """The volume-covering bulk: the existing ``tube`` | ``cube`` | ``gamut`` sampling (unchanged)."""
     if ps.volumetric_mode == "cube":
         return cube_patches(transfer, size=ps.cube_size, order=ps.order,
                             low_light_size=ps.low_light_cube_size,
@@ -3935,6 +4047,139 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
                         warm_tau=warm_tau, max_cv=max_cv)
+
+
+def _volumetric_neutral_dark(ps: PatchSizes, transfer: Transfer, *, warm_tau: Optional[int],
+                             max_cv: Optional[int]) -> list[tuple[int, int, int]]:
+    """ALWAYS-present neutral tube + dark refinements (A2b). A near-neutral tube around the grey
+    axis, a DENSE dark grey ramp (the eye is most sensitive in the shadows), and a SPARSE dark
+    near-neutral chroma set (sub-nit chroma is noise-dominated). All in-gamut and PURE STDLIB, so
+    they never need gamut projection. They are additive (deduped): largely overlapping ``tube``
+    mode's own grey axis + neutral core, and a fuller addition for ``cube`` / ``gamut`` mode."""
+    cap = max_cv if max_cv is not None else transfer.max_cv
+    out: list[tuple[int, int, int]] = []
+    tube_levels = uniform_levels(_FOUNDATION_TUBE_LEVELS, cap)
+    out += near_neutral_tube_patches(transfer, levels=tube_levels, offsets=ps.icc_tube_offsets,
+                                     max_cv=cap, order=ps.order, warm_tau=warm_tau)
+    dark = shadow_levels(ps.low_light_steps, transfer, max_cv=cap,
+                         max_signal=ps.low_light_signal, bias=ps.low_light_bias) \
+        if ps.low_light_steps and ps.low_light_steps > 1 else []
+    out += [(v, v, v) for v in dark if v > 0]
+    if dark:
+        out += near_neutral_tube_patches(transfer, levels=dark[:_DARK_CHROMA_LEVELS],
+                                         offsets=(_DARK_CHROMA_OFFSET,), max_cv=cap,
+                                         order=ps.order, warm_tau=warm_tau)
+    return out
+
+
+def _volumetric_foundation(ps: PatchSizes, transfer: Transfer, *, target: Any,
+                           reachable_primaries: dict, warm_tau: Optional[int],
+                           max_cv: Optional[int]) -> list[tuple[int, int, int]]:
+    """The reachable colorimetric foundation (HDR / wide-gamut): target-gamut anchors that bracket
+    the reachable boundary + a per-hue saturation sweep capped to the reachable gamut + the
+    always-present neutral tube & dark refinements. Generated already-reachable, so it is exempt
+    from the bulk's gamut projection/thinning (its exact placements are preserved)."""
+    from .engine.model import TargetSpace, signal_saturation_caps
+
+    cap_cv = max_cv if max_cv is not None else transfer.max_cv
+    # signal_saturation_caps needs the RAW (un-clipped) target space so it can DETECT out-of-gamut
+    # chromaticities — a reachable-clipped space pre-projects every patch in-gamut ⇒ caps all 1.0
+    # (matches `_hue_sat_caps`, which also passes an un-clipped TargetSpace).
+    raw_space = TargetSpace(target)
+
+    # Anchors: per-LEVEL reachable caps (the cap is luminance-dependent under PQ), one bracket per hue.
+    anchor_levels = sorted({max(1, int(round(f * cap_cv))) for f in _ANCHOR_LEVEL_FRACS})
+    caps_by_level: dict[int, dict[str, float]] = {}
+    for V in anchor_levels:
+        caps = signal_saturation_caps(raw_space, reachable_primaries, level=V / transfer.max_cv)
+        if caps:
+            caps_by_level[V] = caps
+    anchors = (target_anchor_patches(transfer, levels=anchor_levels, caps_by_level=caps_by_level,
+                                     inset=_ANCHOR_INSET, include_secondaries=True,
+                                     max_cv=cap_cv, order=ps.order, warm_tau=warm_tau)
+               if caps_by_level else [])
+
+    # Per-hue saturation sweep (grey + RGBCMY, capped to reachable) — the "sat sweep" foundation.
+    peak_caps = signal_saturation_caps(raw_space, reachable_primaries, level=1.0)
+    sweep = ramp_patches(transfer, steps=_FOUNDATION_RAMP_STEPS, saturations=_FOUNDATION_SATURATIONS,
+                         spacing=ps.raw_spacing, include_secondaries=True, hue_sat_caps=peak_caps,
+                         color_min_signal=ps.low_light_signal, order=ps.order,
+                         warm_tau=warm_tau, max_cv=cap_cv)
+
+    return anchors + sweep + _volumetric_neutral_dark(ps, transfer, warm_tau=warm_tau, max_cv=max_cv)
+
+
+def _project_and_thin(patches: list[tuple[int, int, int]], *, target: Any,
+                      reachable_primaries: dict, transfer: Transfer,
+                      max_cv: Optional[int]) -> list[tuple[int, int, int]]:
+    """Project the bulk stimuli onto the panel's reachable gamut and thin micro-duplicates.
+
+    In-gamut patches round-trip to their own code value (no-op) and are kept unchanged. Out-of-gamut
+    patches are pulled to the reachable boundary (``TargetSpace.reachable_signal``); many distinct OOG
+    corners collapse onto a thin boundary surface, so the moved set is then thinned to a minimum
+    signal-space separation — which (a) kills the "50 patches on 0.001 of blue" waste, (b) makes the
+    surviving count scale with reachable gamut volume (fixed spacing × larger volume ⇒ more patches),
+    and (c) avoids the near-coincident/collinear train points that would make the RBF singular."""
+    if not patches:
+        return patches
+    import numpy as np
+    from .engine.model import TargetSpace
+
+    space = TargetSpace(target, reachable_primaries=reachable_primaries)
+    m = float(transfer.max_cv)
+    cap_cv = max_cv if max_cv is not None else transfer.max_cv
+    orig = np.asarray(patches, dtype=int)
+    proj = np.asarray(space.reachable_signal(orig.astype(float) / m), dtype=float)
+    cv = np.clip(np.rint(proj * m), 0, cap_cv).astype(int)
+    moved = np.any(cv != orig, axis=1)
+
+    kept = [tuple(int(x) for x in row) for row in orig[~moved]]   # in-gamut: untouched, in order
+    moved_cv = cv[moved]
+    if len(moved_cv):
+        order_idx = np.lexsort((moved_cv[:, 2], moved_cv[:, 1], moved_cv[:, 0]))  # deterministic
+        moved_sig = moved_cv.astype(float) / m
+        min2 = _MIN_SEPARATION ** 2
+        kept_sig: list[np.ndarray] = []
+        for i in order_idx:
+            s = moved_sig[i]
+            if kept_sig and float(np.min(np.sum((np.asarray(kept_sig) - s) ** 2, axis=1))) < min2:
+                continue
+            kept_sig.append(s)
+            kept.append(tuple(int(x) for x in moved_cv[i]))
+    return _dedup_keep_order(kept)
+
+
+def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
+                         warm_tau: Optional[int] = None,
+                         max_cv: Optional[int] = None,
+                         target: Any = None,
+                         reachable_primaries: Optional[dict] = None) -> list[tuple[int, int, int]]:
+    """The 3D-LUT sampling set. ``volumetric_mode`` picks HOW the cube interior is sampled:
+    a neutral-axis ``tube`` (default; dense where content lives), a uniform ``cube``, or a
+    content-weighted ``gamut`` shell set. ``max_cv`` caps the range (HDR peak; see
+    :func:`build_ramp_set`).
+
+    The set is always the volume-covering BULK + the always-present neutral tube & dark refinements
+    (A2b). When ``target`` AND ``reachable_primaries`` are given (HDR / wide-gamut, from
+    :meth:`Calibration._reachable_primaries`), it is additionally made GAMUT-AWARE: the bulk is
+    projected onto the panel's physically-reachable gamut + thinned (so the panel is metered where
+    it can actually render, not at unreachable Rec.2020 corners), and a reachable colorimetric
+    foundation (target-gamut anchors + a per-hue saturation sweep) is unioned in — generated
+    already-reachable and exempt from the bulk thinning. ``reachable_primaries=None`` (SDR, or the
+    projection-free plan PREVIEW via :func:`flow_patch_counts`) keeps the bulk un-projected and adds
+    no anchors — so the preview stays deterministic and the fingerprint stable."""
+    bulk = _volumetric_bulk(ps, transfer, warm_tau=warm_tau, max_cv=max_cv)
+    if target is None or not reachable_primaries:
+        union = bulk + _volumetric_neutral_dark(ps, transfer, warm_tau=warm_tau, max_cv=max_cv)
+        return sort_patches(_dedup_keep_order(union), ps.order, transfer, warm_tau=warm_tau)
+
+    bulk = _project_and_thin(bulk, target=target, reachable_primaries=reachable_primaries,
+                             transfer=transfer, max_cv=max_cv)
+    foundation = _volumetric_foundation(ps, transfer, target=target,
+                                        reachable_primaries=reachable_primaries,
+                                        warm_tau=warm_tau, max_cv=max_cv)
+    union = _dedup_keep_order(foundation + bulk)   # foundation first → its exact placements survive
+    return sort_patches(union, ps.order, transfer, warm_tau=warm_tau)
 
 
 def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
@@ -3969,6 +4214,12 @@ def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
     ramp. It is *not* the same shape as the run that produced the calibration: it confirms the
     foundation across the range at verification resolution, weighted to what actually matters.
 
+    **One fixed preset shape for BOTH SDR and HDR** (owner directive B): every run is verified by
+    the same grayscale-priority + RGBCMY sweep, parametrized only by the PatchSizes ``verify_*``
+    defaults (kept as the user's optional lever, not a per-mode branch). The reachable cap
+    (``hue_sat_caps``) is the *only* SDR/HDR difference and is a structural no-op for SDR
+    (sRGB ⊂ panel ⇒ caps are all 1.0), so the shape is identical across modes.
+
       * **Grayscale / PQ ramp + shadow toe** (``low_light_steps``) — the EOTF axis, sampled into
         the dark where it matters most. This is the priority.
       * **Colour (RGBCMY) only ABOVE the shadow band** (``verify_color_min_signal``) — sub-nit
@@ -3993,10 +4244,9 @@ def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
 # The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show
 # the run's size before any measurement). build-correction measures nothing through spotread.
 _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
-    "full": ("raw", "post-mhc", "gray-wb", "verify"),
+    "full": ("raw", "post-mhc", "verify"),
     "mhc-only": ("raw", "verify"),
     "3dlut-only": ("post-mhc", "verify"),
-    "gray-wb": ("gray-wb", "verify-neutral"),
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
                    "post-mhc": build_volumetric_set, "verify": build_verify_set,
@@ -4019,12 +4269,6 @@ def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
         stages[role] = cache[fn]
     return {"stages": stages, "total_patches": sum(stages.values()),
             "volumetric_mode": ps.volumetric_mode, "order": ps.order}
-
-
-def _measured_primaries(params: Optional[dict[str, float]], white_xy: tuple[float, float]) -> MeasuredPrimaries:
-    p = params or {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06}
-    return MeasuredPrimaries(rx=p["rx"], ry=p["ry"], gx=p["gx"], gy=p["gy"], bx=p["bx"], by=p["by"],
-                             wx=white_xy[0], wy=white_xy[1])
 
 
 def _jsonable(value: Any) -> Any:
@@ -4079,8 +4323,6 @@ def active_correction(profile: cp.Profile, store: CorrectionStore, display_name:
 def _render_report_html(p: dict[str, Any]) -> str:
     v = p.get("verification") or {}
     lut = p.get("lut3d") or {}
-    gswb = p.get("gswb") or {}
-    wd = gswb.get("watchdog") or {}
     analysis = p.get("display_analysis")
 
     # HDR scores dE_ITP, SDR CIEDE2000 — label the deliverable report with the run's actual
@@ -4095,11 +4337,6 @@ def _render_report_html(p: dict[str, Any]) -> str:
                       else "<h2>Display analysis</h2><p class='muted'>"
                            "(the calibrating assistant adds a short panel analysis here — "
                            "strengths, weaknesses, and why it behaves as it does.)</p>")
-    watchdog_block = ""
-    if wd:
-        cls = "warn" if wd.get("trips") else "ok"
-        watchdog_block = (f"<p class='{cls}'>GS+WB tweak {wd.get('magnitude')} (trend {wd.get('trend')}) — "
-                          f"watchdog: {wd.get('recommendation')}.</p>")
     return (
         "<!doctype html><meta charset='utf-8'><title>DLC report</title>"
         "<style>body{font-family:system-ui;margin:2rem;color:#1a1a1a;max-width:48rem}"
@@ -4116,7 +4353,6 @@ def _render_report_html(p: dict[str, Any]) -> str:
         + metric_row(f"White {de}", "white_de2000")
         + metric_row(f"Grayscale avg {de}", "grayscale_avg_de2000")
         + "</table>"
-        + watchdog_block
         + analysis_block
     )
 
@@ -4347,10 +4583,6 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         metavar="NITS",
                         help="luminance ceiling for --dark-min-reads (default 2.0): near-neutral patches "
                              "at or below this expected luminance get the dark read floor.")
-    parser.add_argument("--skip-gswb", action="store_true", dest="skip_gswb",
-                        help="full flow: skip the final GS+WB tweak (deferred stage targets the "
-                             "wrong layer) — runs ICC→3D-LUT as one cohesive unit (one rollback "
-                             "unit, one verify gate)")
     parser.add_argument("--force", action="store_true", help="ignore stage memoisation")
     parser.add_argument("--abort", action="store_true",
                         help="cancel: roll DesktopLUT back to the user's pre-run setup "
@@ -4672,7 +4904,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         controller=controller, measure=measure, adjudicator=adjudicator,
                         bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
                         characterize_config=characterize_config, decision_overrides=overrides,
-                        skip_gswb=args.skip_gswb, adaptive_planning=args.adaptive_planning,
+                        adaptive_planning=args.adaptive_planning,
                         stall_kill_hook=_stall_kill, pause_handler=_pause_park,
                         enable_watchdog=True, checkin_interval_s=args.checkin_interval,
                         require_hardware_readiness=True,

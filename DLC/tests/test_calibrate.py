@@ -83,7 +83,7 @@ def _fake_launch(cmds):
 
 def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None, adjudicator=None,
           probe=None, output_dir=None, probe_launcher=_fake_launch, decision_overrides=None,
-          characterize_config=None, skip_gswb=False, bit_depth=None, patch_sizes=None,
+          characterize_config=None, bit_depth=None, patch_sizes=None,
           adaptive_planning=False, checkin_interval_s=600.0,
           require_hardware_readiness=False) -> Calibration:
     run_dir = tmp_path / name
@@ -97,7 +97,7 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
         adjudicator=adjudicator or AutoAdjudicator(),
         probe=probe, optimize_config=_OPT, patch_sizes=patch_sizes or _SMALL, run_date=_DATE,
         probe_launcher=probe_launcher, decision_overrides=decision_overrides,
-        characterize_config=characterize_config, skip_gswb=skip_gswb, bit_depth=bit_depth,
+        characterize_config=characterize_config, bit_depth=bit_depth,
         adaptive_planning=adaptive_planning, checkin_interval_s=checkin_interval_s,
         require_hardware_readiness=require_hardware_readiness)
 
@@ -112,12 +112,13 @@ def test_full_flow_completes_clean(tmp_path: Path):
 
     assert result.status == "completed"
     assert result.target == "srgb_g22"
-    # the canonical pipeline ICC → 3D LUT → GS+WB, in order (whitepoint resolves the
-    # target white early, before any stage that consumes it)
+    # the canonical pipeline MHC ICC (+ closed-loop D65 grayscale refine) → 3D LUT → verify,
+    # in order (whitepoint resolves the target white early, before any stage that consumes it).
+    # GS+WB is removed — the MHC owns the neutral axis standalone (1+1+1, Task B / #C1).
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
-        "build-install-mhc", "measure:post-mhc", "build-install-3dlut", "measure:gray-wb",
-        "gswb-tweak", "measure:verify", "verify",
+        "build-install-mhc", "refine-mhc-grayscale", "measure:post-mhc", "build-install-3dlut",
+        "measure:verify", "verify",
     ]
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
@@ -133,23 +134,26 @@ def _perfect_hdr_panel() -> SyntheticPanel:
 
 def test_hdr_full_flow_completes_clean(tmp_path: Path):
     # The first HDR run, proven in simulation: the full DIP→ICC→3D-LUT pipeline runs
-    # end-to-end against a perfect PQ/Rec.2020 panel and the mock, scoring dE_ITP. No
-    # skip_gswb flag — HDR auto-skips GS+WB (the cube owns the PQ neutral axis).
+    # end-to-end against a perfect PQ/Rec.2020 panel and the mock, scoring dE_ITP.
     calib = _make(tmp_path, "hdr_full", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
     result = calib.run("full")
 
     assert result.status == "completed", result.digest
     assert result.target == "rec2020_pq"
-    # ICC → standalone-D65 refine → 3D LUT, and GS+WB auto-skipped for HDR even without --skip-gswb.
+    # ICC → standalone-D65 base-cube refine → 3D LUT (HDR refines the base 1D cube; SDR the
+    # correctionGrayscale). GS+WB is removed for all modes (the MHC owns the neutral axis).
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
         "build-install-mhc", "refine-mhc-cube", "measure:post-mhc", "build-install-3dlut",
         "measure:verify", "verify",
     ]
     assert "gswb-tweak" not in result.stages and "measure:gray-wb" not in result.stages
-    # The chosen HDR target: peak 1600 (profile pin), fixed D65, scored in dE_ITP.
+    # The chosen HDR target: no DIP injected here ⇒ the cold-start placeholder peak (1600,
+    # flagged ungrounded), fixed D65, scored in dE_ITP. (A characterized run calibrates to the
+    # measured max-sustained peak instead — see test_hdr_calibrates_to_max_sustained_peak.)
     hdr_target = calib.calib["hdr_target"]
     assert hdr_target["peak_nits"] == 1600.0
+    assert hdr_target["provenance"]["peak"]["grounded"] is False
     plan = calib.calib["patch_plan"]
     assert plan["patch_max_cv"] == calib._transfer().nits_to_cv(1600.0)  # patches capped at peak
     verify = calib.calib["stages"]["verify"]["digest"]
@@ -203,7 +207,7 @@ def test_transport_tell_warns_for_8bit_3dlut_on_a_10bit_minisled_panel(tmp_path:
 
     # not a 3D-LUT flow → nothing to say even at 8-bit
     gw = _make(tmp_path, "tellgw", bit_depth=8)
-    gw.calib["flow"] = "gray-wb"
+    gw.calib["flow"] = "mhc-only"
     assert gw._transport_tell()["checked"] is False
 
 
@@ -465,8 +469,7 @@ def test_adaptive_planning_busts_stale_downstream_on_plan_change(tmp_path: Path)
                             decision_overrides={"adaptive-planning:plan":
                                                 Decision("apply", payload={"volumetric_density": "denser"})}))
     calib.calib["adaptive_plan"] = {"fingerprint": "OLD-FINGERPRINT"}
-    for s in ("measure:post-mhc", "build-install-3dlut", "measure:gray-wb", "gswb-tweak",
-              "measure:verify", "verify"):
+    for s in ("measure:post-mhc", "build-install-3dlut", "measure:verify", "verify"):
         calib.calib["stages"][s] = {"status": "done"}
     calib.stage_adaptive_planning(raw_ti3=None)
     for s in ("measure:post-mhc", "build-install-3dlut", "verify"):
@@ -505,28 +508,6 @@ def test_intermediate_stages_emit_a_before_after_de_series(tmp_path: Path):
         for k in ("avg_de2000", "max_de2000", "white_de2000"):
             assert isinstance(e.data.get(k), (int, float))
     assert all(e.effective_tier == "digest" for e in scored)   # the LLM sees the trend too
-
-
-def test_full_flow_skip_gswb_drops_only_the_gswb_stages(tmp_path: Path):
-    # --skip-gswb: ICC → 3D LUT (one cohesive run, one verify gate) with NO GS+WB tweak —
-    # the deferred stage targets the wrong DesktopLUT layer (see reference-dlc-gswb-target).
-    calib = _make(tmp_path, "full_skip", skip_gswb=True)
-    result = calib.run("full")
-
-    assert result.status == "completed"
-    assert result.stages == [
-        "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
-        "build-install-mhc", "measure:post-mhc", "build-install-3dlut",
-        "measure:verify", "verify",
-    ]
-    # the GS+WB measure + tweak are gone; everything else (incl. the 3D LUT) stays
-    assert "gswb-tweak" not in result.stages
-    assert "measure:gray-wb" not in result.stages
-    assert "build-install-3dlut" in result.stages
-    assert "gray-wb" not in calib.calib["patch_plan"]["stages"]
-    assert calib.calib["patch_plan"]["skip_gswb"] is True
-    assert calib.calib["patch_plan"]["approved"] is True
-    assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
 
 
 def test_full_run_populates_the_event_spine(tmp_path: Path):
@@ -674,15 +655,44 @@ def test_stage_converts_runstalled_to_clean_abort(tmp_path: Path):
 
 
 def test_mhc_only_flow_is_icc_only(tmp_path: Path):
-    # The shakedown flow: MHC matrix + 1D LUT, verify, report — NO 3D LUT, NO GS+WB.
+    # The shakedown flow: MHC matrix + 1D LUT + the closed-loop D65 grayscale refine, verify,
+    # report — NO 3D LUT, NO GS+WB.
     calib = _make(tmp_path, "mhc_only")
     result = calib.run("mhc-only")
     assert result.status == "completed"
     assert "build-install-mhc" in result.stages
     assert "build-install-3dlut" not in result.stages   # ICC only
     assert "gswb-tweak" not in result.stages
-    assert "refine-mhc-cube" not in result.stages        # SDR: the closed-loop refine is HDR-only
+    # SDR refines the correctionGrayscale layer (Task B / #C1); HDR uses refine-mhc-cube.
+    assert "refine-mhc-grayscale" in result.stages
+    assert "refine-mhc-cube" not in result.stages
     assert result.stages[-1] == "verify"
+
+
+def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
+    # Loop-bookkeeping regression test (adversarial review): a refine step installs a NON-identity
+    # correction, but the next round does not improve — a within-tolerance uptick that takes the
+    # 'floored' exit WITHOUT tripping the regression gate. The unified best-revert must restore (and
+    # persist) the BEST measured deviations — here identity (round 1) — not strand the worse mid-loop
+    # install. (The bug was: converged/floored/budget exits skipped the best-revert.)
+    calib = _make(tmp_path, "sdr_floor")
+    calib.run("mhc-only")                      # seed mhc_params + resolved white, then re-run the stage
+    calib.calib["stages"].pop("refine-mhc-grayscale", None)   # bust memoisation so it re-runs
+
+    import dlc.mhc_cube as mc
+    sentinel = {ch: [1.5] * 32 for ch in ("r", "g", "b")}     # recognisably non-identity mid-loop install
+    monkeypatch.setattr(mc, "refine_sdr_grayscale",
+                        lambda *a, **k: ([j / 31 for j in range(32)], sentinel))
+    scripted = iter([{"avg": 1.0, "max": 1.5, "n": 5, "gamma_err_pct": 1.0},   # round1 > target → refine
+                     {"avg": 1.2, "max": 1.8, "n": 5, "gamma_err_pct": 1.0}])  # round2 uptick → floored
+    monkeypatch.setattr(calib, "_grey_de_sdr", lambda samples, white: next(scripted))
+
+    out = calib.stage_refine_mhc_grayscale()
+    assert out.digest.get("floored") is True   # the within-tolerance uptick path, not 'regressed'
+    assert out.digest.get("regressed") is not True
+    cg = calib._state["correction_grayscale"]
+    for ch in ("r", "g", "b"):                 # reverted to identity (best), not the 1.5 sentinel
+        assert all(abs(v - 1.0) < 1e-9 for v in cg["deviations"][ch]), (ch, cg["deviations"][ch])
 
 
 def test_hdr_mhc_only_runs_standalone_d65_refine(tmp_path: Path):
@@ -710,6 +720,35 @@ def test_hdr_mhc_only_runs_standalone_d65_refine(tmp_path: Path):
     assert snap in (calib._latest_checkin_metrics().get("refine"),)   # surfaced into the packet
     # build-install-mhc surfaced the Peak-Chroma cap as standalone-D65 evidence.
     assert calib.calib["stages"]["build-install-mhc"]["digest"]["peak_chroma"]["cap_nits"] > 0
+
+
+def test_hdr_calibrates_to_max_sustained_peak_one_source(tmp_path: Path):
+    # Task C: with a warm capture in the DIP, the run calibrates to the measured MAX-SUSTAINED
+    # peak, and patch bounding + the MHC cube ceiling + the C++ handoff all trace to that ONE
+    # resolved peak (no mid-pipeline divergence). The Peak-Chroma cap stays a separate neutral cap.
+    calib = _make(tmp_path, "hdr_sustained", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    _inject_dip(calib, native_white_nits=1840.0, sustained_peak_nits=1700.0, eotf_undershoot=-0.06)
+    result = calib.run("mhc-only")
+    assert result.status == "completed", result.digest
+
+    # 1) The resolved HDR peak is the max-sustained value (NOT the profile's 1600 viewing peak).
+    hdr_target = calib.calib["hdr_target"]
+    assert hdr_target["peak_nits"] == 1700.0
+    assert hdr_target["provenance"]["peak"]["source"] == "sustained"
+
+    # 2) Patch bounding caps at that same resolved peak.
+    assert calib.calib["patch_plan"]["patch_max_cv"] == calib._transfer().nits_to_cv(1700.0)
+
+    # 3) The MHC cube ceiling + the C++ set_base_lut handoff derive from that one resolved peak.
+    #    The cube ceiling is the resolved peak clamped to what the (resolved-bounded) raw set
+    #    actually measured — so it equals 1700 modulo the PQ quantization of the top patch, and
+    #    never exceeds it. The Peak-Chroma cap stays a SEPARATE cap on the neutral axis (cube_peak
+    #    = min(resolved, cap)).
+    pc = calib.calib["stages"]["build-install-mhc"]["digest"]["peak_chroma"]
+    assert pc["resolved_peak_nits"] <= 1700.0 + 1e-6 and pc["resolved_peak_nits"] > 1690.0
+    assert pc["cube_peak_nits"] == round(min(pc["resolved_peak_nits"], pc["cap_nits"]), 4)
+    bl = calib._state["mhc_params"]["base_lut"]
+    assert bl["peak_nits"] == pc["cube_peak_nits"]              # the C++ handoff peak
 
 
 def test_full_flow_writes_deliverable_folder(tmp_path: Path):
@@ -940,50 +979,8 @@ def test_optimize_floor_surfaces_for_adjudication(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# GS+WB tweak-drift watchdog
+# 3dlut-only stack precondition
 # ---------------------------------------------------------------------------
-
-def test_watchdog_trips_on_large_accumulated_trend(tmp_path: Path):
-    calib = _make(tmp_path, "wd")
-    # Seed a per-display history whose accumulated magnitude already sits near the
-    # 3D-LUT-override threshold; the next tweak pushes the trend over it.
-    hist_path = calib._tweak_history_path()
-    hist_path.parent.mkdir(parents=True, exist_ok=True)
-    hist_path.write_text(json.dumps({
-        "Synthetic mini-LED:SDR": [
-            {"date": "2026-01-01", "magnitude": 0.07},
-            {"date": "2026-03-01", "magnitude": 0.06},
-        ]}), encoding="utf-8")
-
-    calib.run("full")
-    wd = calib.calib["stages"]["gswb-tweak"]["digest"]["watchdog"]
-    assert wd["trips"] is True
-    assert wd["recommendation"] == "recommend_recal"
-    assert "gswb-tweak:watchdog" in calib.calib["decisions"]
-    # the new tweak was appended to the persistent history
-    history = json.loads(hist_path.read_text())
-    assert len(history["Synthetic mini-LED:SDR"]) == 3
-
-
-def test_watchdog_quiet_on_small_tweak(tmp_path: Path):
-    calib = _make(tmp_path, "wd_quiet")
-    calib.run("full")
-    wd = calib.calib["stages"]["gswb-tweak"]["digest"]["watchdog"]
-    assert wd["trips"] is False
-    assert "gswb-tweak:watchdog" not in calib.calib["decisions"]
-
-
-# ---------------------------------------------------------------------------
-# gray-wb / 3dlut-only stack precondition
-# ---------------------------------------------------------------------------
-
-def test_gray_wb_escalates_without_a_stack(tmp_path: Path):
-    calib = _make(tmp_path, "gw_empty")
-    result = calib.run("gray-wb")
-    assert result.status == "aborted"
-    assert result.digest["aborted_at"] == "require-stack"
-    assert "require-stack:missing" in calib.calib["decisions"]
-
 
 def test_3dlut_only_escalates_without_mhc(tmp_path: Path):
     calib = _make(tmp_path, "lut_empty")
@@ -993,30 +990,18 @@ def test_3dlut_only_escalates_without_mhc(tmp_path: Path):
 
 
 def _seed_stack(controller: CalibrationController, *, cube: str | None = None) -> None:
-    """Pre-install an MHC profile (+ optional 3D LUT) so the gray-wb / 3dlut-only
-    stack precondition is met."""
+    """Pre-install an MHC profile (+ optional 3D LUT) so the 3dlut-only stack
+    precondition is met."""
     controller.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06})
     controller.apply_mhc(0, "SDR")
     if cube is not None:
         controller.set_3dlut(0, "SDR", cube)
 
 
-def test_gray_wb_proceeds_with_a_seeded_stack(tmp_path: Path):
-    controller = CalibrationController.mock()
-    # Pre-install an MHC profile + a 3D LUT so the stack precondition is met.
-    _seed_stack(controller, cube=str(tmp_path / "existing.cube"))
-
-    calib = _make(tmp_path, "gw_ok", controller=controller)
-    result = calib.run("gray-wb")
-    assert result.status == "completed"
-    assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
-
-
 # ---------------------------------------------------------------------------
-# revert at the apply gate for the in-place flows (gray-wb / 3dlut-only) — these
-# never enter calibration mode, so the snapshot rollback path doesn't apply. The
-# 3D-LUT cube is restorable over the pipe; the MHC grayscale a gray-wb tweak
-# overwrites is NOT (state.get doesn't expose it), so its revert is honest-unavailable.
+# revert at the apply gate for the in-place 3dlut-only flow — it never enters
+# calibration mode, so the snapshot rollback path doesn't apply; the 3D-LUT cube
+# is restorable over the pipe.
 # ---------------------------------------------------------------------------
 
 def test_3dlut_only_revert_restores_previous_cube(tmp_path: Path):
@@ -1042,18 +1027,6 @@ def test_3dlut_only_revert_clears_cube_when_none_existed(tmp_path: Path):
     assert result.status == "reverted"
     # nothing was installed before this run, so revert leaves no cube
     assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
-
-
-def test_gray_wb_revert_is_unavailable_not_silent(tmp_path: Path):
-    ctrl = CalibrationController.mock()
-    _seed_stack(ctrl, cube=str(tmp_path / "existing.cube"))
-
-    calib = _make(tmp_path, "gw_revert", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
-    result = calib.run("gray-wb")
-
-    # the MHC grayscale/white can't be faithfully restored over the pipe — the run must
-    # NOT claim 'completed' when the operator asked to revert; it surfaces the gap honestly.
-    assert result.status == "revert_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -1436,14 +1409,18 @@ def test_patch_sizes_from_dict_and_cli_merge():
 
 
 def test_volumetric_mode_selects_generator():
-    # The user/agent chooses HOW the 3D-LUT set samples the cube — not a fixed preset.
+    # The user/agent chooses HOW the 3D-LUT set samples the cube — not a fixed preset. Every mode
+    # additionally carries the always-on neutral-tube + dark foundation (A2b), so the set is the
+    # mode's volume-covering BULK plus that foundation.
+    from dlc.engine.patches import cube_patches
     t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=8)
     cube = build_volumetric_set(PatchSizes(volumetric_mode="cube", cube_size=5,
                                            low_light_cube_size=0), t)
-    assert len(cube) == 125                          # 5^3 uniform grid
+    assert set(cube_patches(t, size=5, low_light_size=0)) <= set(cube)   # the 5^3 bulk is present
+    assert len(cube) >= 125                           # + the always-on neutral/dark foundation
     tube = build_volumetric_set(PatchSizes(volumetric_mode="tube", cube_size=5,
                                            tube_size=9, tube_radius=2), t)
-    assert len(tube) > 125                           # cube + neutral-axis core
+    assert len(tube) > len(cube)                      # cube + neutral-axis core (denser bulk)
     gamut = build_volumetric_set(PatchSizes(volumetric_mode="gamut", gamut_lum_steps=5,
                                             gamut_hues=6), t)
     assert len(gamut) > 0
@@ -1538,7 +1515,7 @@ def test_patch_sizes_drive_run_size():
     big = flow_patch_counts("full", PatchSizes(raw_ramp_steps=33, cube_size=17, tube_size=33,
                                                tube_radius=3, neutral_steps=33), t)
     assert small["total_patches"] < big["total_patches"]
-    assert set(small["stages"]) == {"raw", "post-mhc", "gray-wb", "verify"}
+    assert set(small["stages"]) == {"raw", "post-mhc", "verify"}
 
 
 def test_plan_seam_surfaces_run_size(tmp_path: Path):
@@ -1549,7 +1526,7 @@ def test_plan_seam_surfaces_run_size(tmp_path: Path):
     assert exc.value.request.seam == "plan_veto"
     pp = exc.value.request.digest["patch_plan"]
     assert pp["total_patches"] > 0
-    assert set(pp["stages"]) == {"raw", "post-mhc", "gray-wb", "verify"}
+    assert set(pp["stages"]) == {"raw", "post-mhc", "verify"}
 
 
 def test_plan_seam_persists_approved_patch_plan(tmp_path: Path):
@@ -1587,7 +1564,11 @@ def test_custom_patch_sizes_flow_through_to_measurement(tmp_path: Path):
                         adjudicator=AutoAdjudicator(), optimize_config=_OPT, patch_sizes=sizes,
                         run_date=_DATE)
     calib.target_name = profile.display_for(0).target_name("SDR")   # what resolve-target sets
-    assert len(calib._volumetric_patches()) == 27   # 3^3 cube, not the default tube
+    from dlc.engine.patches import cube_patches
+    vol = calib._volumetric_patches()
+    # cube mode (size 3) drives the BULK; SDR (sRGB ⊂ panel) adds no gamut anchors, so it's the
+    # 3^3 cube grid + the always-on neutral/dark foundation — distinct from the default tube.
+    assert set(cube_patches(calib._transfer(), size=3, low_light_size=0)) <= set(vol)
     result = calib.run("full")
     assert result.status == "completed"
 
@@ -2196,7 +2177,7 @@ def test_auto_is_refused_on_a_live_measuring_run():
     # always wires a real meter, so a measuring flow with --auto is the forbidden autonomous HW run.
     from types import SimpleNamespace
     from dlc.calibrate import _auto_on_live_measuring_run as forbidden
-    for flow in ("full", "mhc-only", "3dlut-only", "gray-wb"):
+    for flow in ("full", "mhc-only", "3dlut-only"):
         assert forbidden(SimpleNamespace(auto=True, abort=False, flow=flow)) is True
     # Exempt: build-correction is operator-driven (no autonomous spotread); --abort just reverts.
     assert forbidden(SimpleNamespace(auto=True, abort=False, flow="build-correction")) is False
