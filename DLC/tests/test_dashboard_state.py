@@ -207,6 +207,37 @@ def test_warmup_reads_excluded_from_live_de():
     assert st.snapshot(T0)["live_de"]["n"] == 0          # warm-up reads don't feed the live header
 
 
+def test_live_de_splits_in_vs_out_of_gamut():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",
+                  luminance=120.0, gamma=2.2, white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # Before native primaries are known, the split is unavailable (don't mislabel everything in-gamut).
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:raw"))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", role="measurement",
+                  label="w", rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0], Y=120.0, xy=[0.3127, 0.329], ok=True))
+    assert st.snapshot(T0)["live_de"]["gamut_known"] is False
+    # RAW pure-channel reads establish a NARROW native gamut (red pulled in to x=0.60).
+    for lab, rgb, sig, Y, xy in [("r", [255, 0, 0], [1.0, 0.0, 0.0], 50.0, [0.60, 0.34]),
+                                 ("g", [0, 255, 0], [0.0, 1.0, 0.0], 100.0, [0.29, 0.58]),
+                                 ("b", [0, 0, 255], [0.0, 0.0, 1.0], 15.0, [0.16, 0.07])]:
+        st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", role="measurement",
+                      label=lab, rgb=rgb, signal=sig, Y=Y, xy=xy, ok=True))
+    assert st._native_primaries() is not None
+    # VERIFY stage: a neutral white (target on D65 → in gamut) and a saturated red (sRGB-red target
+    # at ~0.64,0.33 → OUTSIDE the narrow native gamut → out-of-gamut, expected to clip).
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=1), stage="measure:verify"))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=1), stage="measure:verify", tier="stream",
+                  role="measurement", label="w", rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0], Y=119.0, xy=[0.313, 0.330], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=2), stage="measure:verify", tier="stream",
+                  role="measurement", label="red", rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=45.0, xy=[0.60, 0.34], ok=True))
+    ld = st.snapshot(T0 + timedelta(seconds=2))["live_de"]
+    assert ld["gamut_known"] is True and ld["n"] == 2
+    m = ld["metrics"]["de2000"]
+    assert m["in"]["n"] == 1 and m["oog"]["n"] == 1     # white in-gamut, red out-of-gamut
+    assert m["oog"]["max"] >= m["in"]["max"]            # the unreachable red clips → larger ΔE
+    assert m["last"] is not None                        # the red patch was the most recent read
+
+
 def test_saturation_tracking_normalises_per_family():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",

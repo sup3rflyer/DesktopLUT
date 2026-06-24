@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
+from ..gamut import point_in_triangle
 from .colorimetry import neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
@@ -214,9 +215,12 @@ class DashboardState:
     # live per-patch ΔE for the header (vs each patch's target), keyed by patch identity so a
     # RE-READ overwrites rather than double-counts (latest-wins, like the chart accumulators);
     # reset per stage. Distinct from the per-stage authoritative `de` from metrics_scored.
-    # Each value is a {metric: scalar} dict (dE_ITP/CIEDE2000/ΔEz) so the selectable view metric
-    # can roll its own avg/max without a server round-trip.
+    # Each value is {"m": {metric: scalar}, "tx", "ty"} (the per-metric ΔEs + the target
+    # chromaticity for the in/out-of-gamut split) so the selectable view metric can roll its own
+    # stats without a server round-trip.
     _live_de: dict[Any, dict] = field(default_factory=dict)
+    # The last MEASUREMENT patch's {metric: scalar} (drives the "last" reading in the dE tile).
+    _live_last: dict[str, float] = field(default_factory=dict)
 
     # -- optimizer / seams / anomalies / stall ------------------------------
     optimizer: dict[str, Any] = field(default_factory=dict)
@@ -285,6 +289,7 @@ class DashboardState:
             self._mark_progress(ev.time)
             self._progress_marks.clear()
             self._live_de.clear()       # the live ΔE header tracks the CURRENT stage's patches
+            self._live_last.clear()
             self._clear_alarm()
         elif name == Ev.STAGE_ABORTED:
             # keep self.stage as the failing stage for the header
@@ -390,29 +395,53 @@ class DashboardState:
             sig = data.get("signal")
             key = tuple(round(float(c), 4) for c in sig[:3]) if (sig and len(sig) >= 3) \
                 else ("seq", data.get("label"), data.get("seq"))
-            self._live_de[key] = {m: v["de"] for m, v in deltas["metrics"].items()}
+            mdict = {m: v["de"] for m, v in deltas["metrics"].items()}
+            tgt = deltas.get("target")
+            # Carry the target chromaticity so the rolling summary can classify the patch in- vs
+            # out-of-gamut against the panel's measured native gamut (done at summary time, so
+            # patches read before the native primaries are known get classified retroactively).
+            self._live_de[key] = {"m": mdict, "tx": (tgt or {}).get("x"), "ty": (tgt or {}).get("y")}
+            self._live_last = mdict
         # The most recent neutral read drives the live white-point readout (needs a usable xy
         # so the readout shape stays consistent with the enrichment gate above).
         if ok and has_xy and _is_neutral(data.get("rgb")):
             self.last_white = {"xy": xy, "Y": Y, "rgb": data.get("rgb"), **enriched}
 
     def _live_de_summary(self) -> dict[str, Any]:
-        """Rolling per-patch ΔE for the LIVE header (current stage): avg/max over the window for
-        EVERY available metric, plus which one the spine scores — so the selectable view metric
-        updates every patch client-side (distinct from the per-stage authoritative ``de`` from
-        metrics_scored)."""
+        """Rolling per-patch ΔE for the LIVE header (current stage) — updates every patch, distinct
+        from the per-stage authoritative ``de`` from metrics_scored. For every available metric it
+        carries avg/max over ALL patches, the LAST patch's value, and the same split by whether the
+        patch's target is reachable on this panel: ``in`` (the quality that matters) vs ``oog``
+        (out-of-gamut, where a large ΔE is expected clipping, not a calibration miss). ``gamut_known``
+        is False until the native primaries are measured — the client then shows the combined avg/max
+        and marks the OOG split pending rather than mislabelling everything in-gamut."""
         vals = list(self._live_de.values())
         hdr = _is_hdr_header(self.header)
         order = ("itp", "de2000", "jzazbz") if hdr else ("de2000", "jzazbz")
+        native = self._native_primaries()
+        tri = ((tuple(native["r"]), tuple(native["g"]), tuple(native["b"]))
+               if native and all(k in native for k in ("r", "g", "b")) else None)
+
+        def _stats(xs: list[float], dec: int) -> dict[str, Any]:
+            return ({"avg": round(sum(xs) / len(xs), dec), "max": round(max(xs), dec), "n": len(xs)}
+                    if xs else {"avg": None, "max": None, "n": 0})
+
         metrics: dict[str, Any] = {}
         for m in order:
-            xs = [v[m] for v in vals if v.get(m) is not None]
-            if xs:
-                dec = _DE_DECIMALS.get(m, 3)
-                metrics[m] = {"avg": round(sum(xs) / len(xs), dec), "max": round(max(xs), dec)}
-            else:
-                metrics[m] = {"avg": None, "max": None}
-        return {"scoring": "itp" if hdr else "de2000", "metrics": metrics, "n": len(vals)}
+            dec = _DE_DECIMALS.get(m, 3)
+            allv, ins, oog = [], [], []
+            for v in vals:
+                de = v["m"].get(m)
+                if de is None:
+                    continue
+                allv.append(de)
+                if tri is not None and v.get("tx") is not None and v.get("ty") is not None:
+                    (ins if point_in_triangle((v["tx"], v["ty"]), *tri) else oog).append(de)
+            last = self._live_last.get(m)
+            metrics[m] = {**_stats(allv, dec), "last": round(last, dec) if last is not None else None,
+                          "in": _stats(ins, dec), "oog": _stats(oog, dec)}
+        return {"scoring": "itp" if hdr else "de2000", "n": len(vals),
+                "gamut_known": tri is not None, "metrics": metrics}
 
     def _patch_deltas(self, data: dict[str, Any]) -> Optional[dict[str, Any]]:
         """All applicable per-patch ΔE metrics (each with its L/C/H split) vs the patch's ideal

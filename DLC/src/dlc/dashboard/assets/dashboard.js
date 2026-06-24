@@ -281,9 +281,30 @@ function renderState(s) {
   $("de-metric").textContent = deMetricLabel(vm);
   $("de-scored-metric").textContent = deMetricLabel(de.metric || scoringMetric(s));
   $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
-  // live rolling per-patch ΔE (updates every read), in the selected view metric
+  // live rolling per-patch ΔE for the CURRENT stage, in the selected view metric — split
+  // in-gamut (the quality that matters) vs out-of-gamut (expected clipping, shown muted).
   const lvm = (ld.metrics && ld.metrics[vm]) || {};
-  setDeM("de-live-avg", vm, lvm.avg); setDeM("de-live-max", vm, lvm.max);
+  $("de-live-cap").textContent = "live · " + (s.stage || s.phase || "—");
+  const ing = lvm.in || {}, oog = lvm.oog || {};
+  if (ld.gamut_known) {
+    $("de-in-lab").textContent = "in-gamut";
+    setDeM("de-in-avg", vm, ing.avg); setDeM("de-in-max", vm, ing.max);
+    $("de-oog-lab").textContent = "out-gamut";
+    $("de-oog-lab").classList.remove("pending");
+    $("de-oog-avg").textContent = num(oog.avg, 2);
+    $("de-oog-max").textContent = num(oog.max, 2);
+    const ot = oog.n ? `${oog.n} unreachable patch${oog.n === 1 ? "" : "es"} — large ΔE is expected (clips), not a miss` : "no out-of-gamut patches this stage";
+    $("de-oog-avg").title = $("de-oog-max").title = ot;
+  } else {
+    // native gamut not measured yet → show the combined avg/max, mark the split pending
+    $("de-in-lab").textContent = "all";
+    setDeM("de-in-avg", vm, lvm.avg); setDeM("de-in-max", vm, lvm.max);
+    $("de-oog-lab").textContent = "gamut pending";
+    $("de-oog-lab").classList.add("pending");
+    $("de-oog-avg").textContent = "—"; $("de-oog-max").textContent = "—";
+    $("de-oog-avg").title = $("de-oog-max").title = "the in/out-of-gamut split needs the panel's native primaries (read from the raw saturated patches)";
+  }
+  setDeM("de-live-last", vm, lvm.last);
   $("de-live-n").textContent = ld.n ? `${ld.n} patch${ld.n === 1 ? "" : "es"}` : "";
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
   setDe("de-white", de.white);

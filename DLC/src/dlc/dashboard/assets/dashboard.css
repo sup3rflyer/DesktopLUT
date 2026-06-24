@@ -100,6 +100,20 @@ body {
 .de-live { display: flex; align-items: baseline; gap: 5px; margin-bottom: 6px; font-size: 11px; color: var(--ink-dim); }
 .de-live b { font-family: var(--mono); font-size: 14px; }
 .de-live .de-live-n { margin-left: auto; color: var(--ink-faint); font-size: 10px; }
+/* live ΔE matrix: per-patch (current stage), split in-gamut vs out-of-gamut */
+.de-live2 { display: grid; grid-template-columns: auto 1fr 1fr; gap: 2px 8px;
+  align-items: baseline; margin-bottom: 6px; }
+.de-live2 b { font-family: var(--mono); font-size: 14px; text-align: right; }
+.de-live-cap { color: var(--ink-faint); font-size: 9px; text-transform: uppercase; letter-spacing: .5px; }
+.de-live-h { color: var(--ink-faint); font-size: 9px; text-transform: uppercase; text-align: right; }
+.de-row-lab { color: var(--ink-dim); font-size: 11px; }
+.de-row-lab.pending { color: var(--ink-faint); font-style: italic; }
+/* out-of-gamut ΔE is EXPECTED-large (clipping), so it reads muted — not the alarm bands */
+.de-oog-val { color: var(--ink-dim) !important; }
+.de-live-foot { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 6px;
+  border-top: 1px solid var(--edge); padding-top: 3px; margin-top: 1px; font-size: 11px; color: var(--ink-dim); }
+.de-live-foot b { font-size: 13px; }
+.de-live-foot .de-live-n { margin-left: auto; color: var(--ink-faint); font-size: 10px; }
 .de-split { display: flex; gap: 10px; border-top: 1px solid var(--edge); padding-top: 4px; }
 .de-split .kv { flex: 1; flex-direction: column; align-items: flex-start; }
 /* view-metric selector (a presentation lens; the scored block stays in the scoring metric) */

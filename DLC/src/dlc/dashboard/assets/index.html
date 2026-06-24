@@ -74,10 +74,11 @@
       <h3><span id="de-metric">ΔE</span>
         <select id="de-view" class="de-view" title="view metric for the live readout + last patch — a presentation lens. The scored block below always stays in the metric the spine optimised."></select>
         <span class="card-sub" id="de-source"></span></h3>
-      <div class="de-live" id="de-live" title="rolling per-patch ΔE for the current stage — updates every read">
-        <span>live</span><b id="de-live-avg">—</b><span>avg</span>
-        <b id="de-live-max">—</b><span>max</span>
-        <span class="de-live-n" id="de-live-n"></span>
+      <div class="de-live2" id="de-live" title="rolling per-patch ΔE for the CURRENT stage — updates every read. Split by whether the patch's target is reachable on this panel: in-gamut is the calibration quality that matters; out-of-gamut ΔE is expected clipping, not a miss.">
+        <span class="de-live-cap" id="de-live-cap">live</span><span class="de-live-h">avg</span><span class="de-live-h">max</span>
+        <span class="de-row-lab" id="de-in-lab">in-gamut</span><b id="de-in-avg">—</b><b id="de-in-max">—</b>
+        <span class="de-row-lab" id="de-oog-lab">out-gamut</span><b id="de-oog-avg" class="de-oog-val">—</b><b id="de-oog-max" class="de-oog-val">—</b>
+        <div class="de-live-foot"><span>last <b id="de-live-last">—</b></span><span class="de-live-n" id="de-live-n"></span></div>
       </div>
       <div class="de-scored-cap">scored · <span id="de-scored-metric">ΔE</span></div>
       <div class="bignums">
