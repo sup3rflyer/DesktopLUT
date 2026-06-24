@@ -506,3 +506,148 @@ def test_mhc2_matrix_warm_panel_needs_cooler_neutral_drive():
     assert all(abs(M[r][c]) < 1e-9 for r in range(3) for c in range(3) if r != c)
     rowsums = [sum(M[r]) for r in range(3)]
     assert rowsums[2] > rowsums[0]   # blue driven harder than red to cool the white
+
+
+# --- closed-loop SDR grayscale refine (correctionGrayscale, γ2.2) -----------
+# Same synthetic-additive-panel idea as the HDR refine tests, but the SDR transfer is pure power γ
+# and the refine emits per-channel correctionGrayscale DEVIATIONS (signal-domain gains, raised to ^γ
+# for the linear-light effect) on a shared POST-matrix-signal grid. With rowsums=(1,1,1) the post-
+# matrix signal == the wire signal, so the panel sim evaluates the deviation at the wire signal.
+
+_GAMMA = 2.2
+
+
+def _synthetic_sdr_panel(white_xy, peak_nits=120.0, gamma=_GAMMA):
+    P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                          _PRIM["bx"], _PRIM["by"], white_xy[0], white_xy[1], white_Y=peak_nits)
+    def emit(drive):                          # drive = per-channel SIGNAL in [0,1]
+        f = [max(0.0, min(d, 1.0)) ** gamma for d in drive]
+        return tuple(sum(P[r][c] * f[c] for c in range(3)) for r in range(3))
+    return P, emit, peak_nits
+
+
+def _run_sdr_loop(white_xy, rounds=10):
+    _P, emit, peak = _synthetic_sdr_panel(white_xy)
+    sigs = [0.3, 0.4, 0.5, 0.6, 0.7]
+    grid = None
+    dev = None
+    def measure(grid, dev):
+        out = []
+        for s in sigs:
+            if grid is None:
+                drive = [s, s, s]             # identity correctionGrayscale (round 0)
+            else:                             # rowsums=(1,1,1) ⇒ post-matrix signal == wire signal s
+                drive = [s * _interp_list(grid, dev[ch], s) for ch in "rgb"]
+            out.append((s, emit(drive)))
+        return out
+    for _ in range(rounds):
+        meas = measure(grid, dev)
+        grid, dev = mc.refine_sdr_grayscale(dev, meas, _PRIM, white_xy, peak,
+                                            (1.0, 1.0, 1.0), dark_floor_nits=0.5)
+    return measure(grid, dev)
+
+
+def test_refine_sdr_grayscale_converges_warm_panel_to_d65():
+    # A warm panel (its native white) driven neutral renders ~its warm white; the closed loop must
+    # bend the correctionGrayscale deviations until the measured neutral lands D65.
+    meas = _run_sdr_loop((0.336, 0.345), rounds=12)
+    for _s, xyz in meas:
+        x, y = _xy(xyz)
+        assert abs(x - 0.3127) < 0.004 and abs(y - 0.3290) < 0.004, (x, y)
+
+
+def test_refine_sdr_grayscale_leaves_d65_panel_alone():
+    # An already-D65 panel needs ~no correction: deviations stay ~identity (1.0).
+    _P, emit, peak = _synthetic_sdr_panel((0.3127, 0.3290))
+    sigs = [0.3, 0.5, 0.7]
+    meas = [(s, emit([s, s, s])) for s in sigs]
+    _grid, dev = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.3127, 0.3290), peak,
+                                         (1.0, 1.0, 1.0), dark_floor_nits=0.5)
+    for ch in "rgb":
+        assert all(abs(v - 1.0) < 5e-3 for v in dev[ch]), (ch, dev[ch])
+
+
+def test_refine_sdr_grayscale_idempotent_current_none_equals_identity():
+    # Passing current=None must equal passing an explicit identity map (the stage resets to identity
+    # for re-run idempotence — the two entry points must agree bit-for-bit).
+    _P, emit, peak = _synthetic_sdr_panel((0.336, 0.345))
+    sigs = [0.3, 0.5, 0.7]
+    meas = [(s, emit([s, s, s])) for s in sigs]
+    grid_a, dev_a = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.336, 0.345), peak, (1.0, 1.0, 1.0))
+    ident = {ch: [1.0] * len(grid_a) for ch in "rgb"}
+    grid_b, dev_b = mc.refine_sdr_grayscale(ident, meas, _PRIM, (0.336, 0.345), peak, (1.0, 1.0, 1.0))
+    assert grid_a == grid_b
+    for ch in "rgb":
+        assert dev_a[ch] == pytest.approx(dev_b[ch], abs=1e-12)
+
+
+def test_refine_sdr_grayscale_uses_matrix_rowsums_for_abscissa():
+    # The load-bearing trap fix: blue's deviation is keyed to the POST-matrix signal
+    # rowsum_b**(1/γ)·s, so the SAME measurements under different rowsums place blue's correction at
+    # different grid positions → different blue curves. A wire-keyed bug would produce identical
+    # curves. Red/green (rowsum 1.0 in both) stay bit-identical.
+    from dlc.colormath import invert3x3, matvec, xy_to_XYZ
+    peak = 120.0
+    disp = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                             _PRIM["bx"], _PRIM["by"], 0.3127, 0.3290, white_Y=peak)
+    disp_inv = invert3x3(disp)
+    s_lo, s_hi = 0.3, 0.5
+    blue_scale = {s_lo: 1.0, s_hi: 0.6}                  # blue perfect low, 40% dim high (level-dep)
+    meas = []
+    for s in (s_lo, s_hi):
+        tY = peak * (s ** _GAMMA)
+        ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
+        ms = [ts[0], ts[1], ts[2] * blue_scale[s]]
+        xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
+        meas.append((s, xyz))
+    _g1, base = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.3127, 0.3290), peak,
+                                        (1.0, 1.0, 1.0), dark_floor_nits=0.5)
+    _g2, shifted = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.3127, 0.3290), peak,
+                                           (1.0, 1.0, 2.0), dark_floor_nits=0.5)
+    n = len(base["b"])
+    assert max(abs(base["b"][j] - shifted["b"][j]) for j in range(n)) > 5e-3
+    for ch in ("r", "g"):
+        assert all(abs(base[ch][j] - shifted[ch][j]) < 1e-9 for j in range(n))
+
+
+def test_refine_sdr_grayscale_trust_damps_noisy_dark_level():
+    # A dark off-white level tagged with a chroma σ as large as its error → low trust → its deviation
+    # is pulled less far from identity than the same level with no σ (full correction).
+    from dlc.colormath import invert3x3, matvec, xy_to_XYZ
+    peak = 120.0
+    disp = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                             _PRIM["bx"], _PRIM["by"], 0.3127, 0.3290, white_Y=peak)
+    disp_inv = invert3x3(disp)
+    s = 0.25
+    tY = peak * (s ** _GAMMA)
+    ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
+    ms = [ts[0] * 1.3, ts[1], ts[2] * 0.7]               # warm dark read
+    xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
+    tot = sum(xyz)
+    err = ((xyz[0] / tot - 0.3127) ** 2 + (xyz[1] / tot - 0.3290) ** 2) ** 0.5
+    _g, trusted = mc.refine_sdr_grayscale(None, [(s, xyz)], _PRIM, (0.3127, 0.3290), peak,
+                                          (1.0, 1.0, 1.0), dark_floor_nits=0.1)
+    _g2, noisy = mc.refine_sdr_grayscale(None, [(s, xyz, err)], _PRIM, (0.3127, 0.3290), peak,
+                                         (1.0, 1.0, 1.0), dark_floor_nits=0.1)
+    n = len(trusted["r"])
+    move_trusted = sum(abs(trusted[ch][j] - 1.0) for ch in "rgb" for j in range(n))
+    move_noisy = sum(abs(noisy[ch][j] - 1.0) for ch in "rgb" for j in range(n))
+    assert move_noisy < move_trusted
+
+
+def test_refine_sdr_grayscale_clamps_deviations():
+    # An extreme measured error cannot drive a deviation past dev_clamp.
+    from dlc.colormath import invert3x3, matvec, xy_to_XYZ
+    peak = 120.0
+    disp = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                             _PRIM["bx"], _PRIM["by"], 0.3127, 0.3290, white_Y=peak)
+    disp_inv = invert3x3(disp)
+    s = 0.5
+    tY = peak * (s ** _GAMMA)
+    ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
+    ms = [ts[0] * 100.0, ts[1], ts[2] * 0.001]           # absurd error (ratio clamp + dev clamp kick in)
+    xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
+    _g, dev = mc.refine_sdr_grayscale(None, [(s, xyz)], _PRIM, (0.3127, 0.3290), peak,
+                                      (1.0, 1.0, 1.0), dev_clamp=(0.25, 4.0))
+    for ch in "rgb":
+        assert all(0.25 - 1e-9 <= v <= 4.0 + 1e-9 for v in dev[ch])

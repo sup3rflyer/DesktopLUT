@@ -60,6 +60,7 @@ __all__ = [
     "mhc2_matrix",
     "build_hdr_cube",
     "refine_hdr_cube",
+    "refine_sdr_grayscale",
     "write_1d_cube",
     "read_1d_cube",
 ]
@@ -547,6 +548,107 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
             curve.append(val)
         out[ch] = curve
     return out
+
+
+def refine_sdr_grayscale(current_deviations: Optional[Mapping[str, Sequence[float]]],
+                         measured_neutral: Sequence[tuple[float, Sequence[float]]],
+                         primaries: Mapping[str, float], native_white_xy: tuple[float, float],
+                         peak_luminance: float, matrix_rowsums: Sequence[float],
+                         *, gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
+                         damping: float = 0.7, dark_floor_nits: float = 0.5,
+                         n_points: int = 32, ratio_clamp: tuple[float, float] = (0.5, 2.0),
+                         dev_clamp: tuple[float, float] = (0.25, 4.0)
+                         ) -> tuple[list[float], dict[str, list[float]]]:
+    """One closed-loop grayscale-refine step on the **SDR** MHC ``correctionGrayscale`` layer.
+
+    The SDR analog of :func:`refine_hdr_cube`: pulls the measured neutral axis toward the target
+    white (default D65) by the same damped share-ratio law, but emits per-channel ``correctionGrayscale``
+    **deviations** (the MHC fine-tune layer on top of the native-white base grayscale) instead of a
+    rewritten 1D ``.cube``, and uses the **SDR power-law (γ) transfer** instead of PQ. Measurement-only
+    (no forward model) so it converges to whatever the real panel does over a few measure→refine rounds.
+
+    ``current_deviations`` : the installed ``correctionGrayscale`` deviations (``r``/``g``/``b``, each
+                             ``n_points`` long on the returned grid), or ``None`` for identity (the
+                             refine accumulates onto these — the stage resets to identity for idempotence).
+    ``measured_neutral``   : ``[(wire_signal, measured_XYZ[, chroma_sigma]), ...]`` from a neutral ramp
+                             measured with the current MHC applied. The optional 3rd element is the
+                             level's read-to-read ``xy`` spread (SE of the mean) from MULTIPLE reads;
+                             when present, that level's correction is smoothed toward identity by its
+                             measurement trust (:func:`noise_trust`) so dark/noisy levels don't bake a tint.
+    ``primaries``/``native_white_xy``/``peak_luminance`` : the measured native gamut + white + peak — the
+                             linear-share basis ``disp`` (its column normalization cancels in the
+                             share RATIO, so this is the same shares math as ``propose_correction_grayscale``).
+    ``matrix_rowsums``     : ``v_c = (M @ (1,1,1))_c`` of the INSTALLED MHC2 matrix
+                             (``mhc2_matrix(primaries, native_white, sRGB, D65)`` for SDR) — the
+                             native-channel-c neutral drive that reproduces D65.
+
+    **Abscissa convention (the load-bearing detail — the SDR derivation trap fix).** Windows applies
+    the per-channel MHC2 LUT AFTER the matrix, so for a wire neutral of signal ``s`` channel ``c`` is
+    driven at the *post-matrix* index ``oetf(v_c · eotf(s))`` — for pure power γ this is
+    ``v_c**(1/γ) · s`` — NOT ``s``. The factor measured at wire ``s`` is therefore stored against that
+    post-matrix abscissa, and all three channels are sampled on a SHARED post-matrix-signal grid. This
+    is exactly what ``propose_correction_grayscale`` gets wrong (it keys deviations at the wire signal,
+    mis-registering them along the tone axis whenever the matrix is non-trivial).
+
+    Returns ``(points, {"r","g","b"})`` — the shared post-matrix-signal grid (uniform, ``n_points``)
+    and the new per-channel signal-domain deviations (centred ~1.0, clamped to ``dev_clamp``), ready
+    for ``controller.set_correction_grayscale`` (which raises a signal deviation to ``**γ`` for the
+    linear-light gain — so the linear residual ``f_c`` enters as ``f_c**(1/γ)``).
+    """
+    chans = ("r", "g", "b")
+    N = max(2, int(n_points))
+    grid = [j / (N - 1) for j in range(N)]
+    cur: dict[str, list[float]] = {}
+    for ch in chans:
+        col = list(current_deviations.get(ch, [])) if isinstance(current_deviations, Mapping) else []
+        cur[ch] = [float(v) for v in col] if len(col) == N else [1.0] * N
+
+    if peak_luminance <= 0.0:
+        raise ValueError("peak_luminance must be positive")
+    disp = rgb_to_xyz_matrix(
+        primaries["rx"], primaries["ry"], primaries["gx"], primaries["gy"],
+        primaries["bx"], primaries["by"], native_white_xy[0], native_white_xy[1],
+        white_Y=peak_luminance)
+    disp_inv = invert3x3(disp)
+    wx, wy = target_white_xy
+    lo_dev, hi_dev = dev_clamp
+
+    # Gather (post-matrix signal, signal-domain multiplicative STEP) per channel from the measurement.
+    pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
+    for entry in sorted(measured_neutral, key=lambda p: p[0]):
+        sig, xyz = float(entry[0]), entry[1]
+        chroma_sigma = entry[2] if len(entry) > 2 else None
+        lin = sig ** gamma
+        target_Y = peak_luminance * lin
+        if target_Y < dark_floor_nits:
+            continue
+        total = sum(xyz) or 1.0
+        mx, my = xyz[0] / total, xyz[1] / total
+        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5, chroma_sigma)
+        ms = matvec(disp_inv, list(xyz))
+        ts = matvec(disp_inv, xy_to_XYZ(wx, wy, target_Y))
+        for c in range(3):
+            ratio = ts[c] / ms[c] if ms[c] > 1e-9 else 1.0
+            ratio = min(max(ratio, ratio_clamp[0]), ratio_clamp[1])
+            # Signal-domain step = f_c**(damping/γ) (same exponent as propose_correction_grayscale),
+            # blended toward identity (1.0) by (1 - w_trust) so a noisy/unstable dark level holds.
+            step = 1.0 + w_trust * (ratio ** (damping / gamma) - 1.0)
+            post_sig = (max(matrix_rowsums[c], 0.0) ** (1.0 / gamma)) * sig
+            pts[c].append((min(max(post_sig, 0.0), 1.0), step))
+
+    out: dict[str, list[float]] = {}
+    for c, ch in enumerate(chans):
+        xs = [p[0] for p in pts[c]]
+        ss = [p[1] for p in pts[c]]
+        col: list[float] = []
+        for j in range(N):
+            # Flat-hold the first/last measured step beyond the measured range (no extrapolation);
+            # _interp clamps to the end values. Compose multiplicatively onto the current deviation.
+            step = _interp(grid[j], xs, ss) if xs else 1.0
+            new_dev = cur[ch][j] * step
+            col.append(min(max(new_dev, lo_dev), hi_dev))
+        out[ch] = col
+    return grid, out
 
 
 def write_1d_cube(path: Path, curves: dict[str, list[float]], *, title: str = "DLC HDR MHC base") -> Path:
