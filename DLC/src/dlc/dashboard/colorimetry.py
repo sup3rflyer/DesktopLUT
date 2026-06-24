@@ -354,6 +354,16 @@ def _white_xyz(white_xy: Sequence[float], lum: float) -> tuple[float, float, flo
     return (wx / wy * lum, lum, (1.0 - wx - wy) / wy * lum)
 
 
+def _target_xyy(ideal_xyz: Sequence[float]) -> Optional[dict]:
+    """The patch's ideal target as ``{x, y, Y}`` (CIE 1931 chromaticity + luminance/nits) — so the
+    dashboard can put measured vs target side by side, the way calibration tools present a read.
+    ``None`` if the target is degenerate (sum ≤ 0, e.g. a pure-black patch)."""
+    s = ideal_xyz[0] + ideal_xyz[1] + ideal_xyz[2]
+    if s <= 0:
+        return None
+    return {"x": ideal_xyz[0] / s, "y": ideal_xyz[1] / s, "Y": ideal_xyz[1]}
+
+
 def _npm(primaries: tuple, white_xy: Sequence[float]) -> list[list[float]]:
     (rx, ry), (gx, gy), (bx, by) = primaries
     return rgb_to_xyz_matrix(rx, ry, gx, gy, bx, by, white_xy[0], white_xy[1], white_Y=1.0)
@@ -389,7 +399,7 @@ def patch_deltas(signal: Sequence[float], x: float, y: float, big_y: float, *,
         npm = _npm(_REC2020_PRIMARIES, white_xy)
         nits = [_pq_eotf_norm(max(0.0, min(1.0, s))) * 10000.0 for s in signal[:3]]
         ideal = matvec(npm, nits)                                  # absolute XYZ (RGB_to_XYZ·10000)
-        return {"scoring": "itp", "metrics": {
+        return {"scoring": "itp", "target": _target_xyy(ideal), "metrics": {
             "itp": _itp_metric(meas, ideal),
             "de2000": _de2000_metric(meas, ideal, _white_xyz(white_xy, _HDR_DIFFUSE_NITS)),
             "jzazbz": _jzazbz_metric(meas, ideal),
@@ -399,7 +409,7 @@ def patch_deltas(signal: Sequence[float], x: float, y: float, big_y: float, *,
     npm = _npm(_SRGB_PRIMARIES, white_xy)
     linear = [max(0.0, min(1.0, s)) ** gamma for s in signal[:3]]
     ideal = [luminance * v for v in matvec(npm, linear)]
-    return {"scoring": "de2000", "metrics": {
+    return {"scoring": "de2000", "target": _target_xyy(ideal), "metrics": {
         "de2000": _de2000_metric(meas, ideal, _white_xyz(white_xy, luminance)),
         "jzazbz": _jzazbz_metric(meas, ideal),
     }}

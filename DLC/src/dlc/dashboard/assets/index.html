@@ -102,18 +102,22 @@
           <span id="lp-rgb" class="lp-rgb">—</span>
         </div>
       </div>
-      <div class="lp-grid">
-        <div class="kv"><span>xy</span><b id="lp-xy">—</b></div>
-        <div class="kv"><span>Y</span><b id="lp-Y">—</b></div>
-        <div class="kv"><span id="lp-de-label">ΔE</span><b id="lp-de">—</b></div>
-        <div class="kv lp-neutral"><span>CCT</span><b id="lp-cct">—</b></div>
-        <div class="kv lp-neutral"><span>Duv</span><b id="lp-duv">—</b></div>
-        <div class="kv lp-neutral"><span>vs D65</span><b id="lp-target">—</b></div>
-      </div>
+      <div class="lp-de-row"><span id="lp-de-label">ΔE</span><b id="lp-de">—</b></div>
       <div class="de-split lp-split" id="lp-comp" title="error split — lightness / chroma / hue contributions to ΔE (the dominant axis is highlighted; quadrature ≈ ΔE). A big ΔE that's almost all lightness is a luminance miss, not a wrong hue.">
         <div class="kv"><span id="lp-cl-lab">ΔL</span><b id="lp-cl">—</b></div>
         <div class="kv"><span id="lp-cc-lab">ΔC</span><b id="lp-cc">—</b></div>
         <div class="kv"><span id="lp-ch-lab">ΔH</span><b id="lp-ch">—</b></div>
+      </div>
+      <div class="lp-cmp" id="lp-cmp" title="measured vs target — CIE 1931 chromaticity (x, y) and luminance/nits (Y). Δ is measured − target (ΔY shown as %).">
+        <span class="lp-cmp-h"></span><span class="lp-cmp-h">target</span><span class="lp-cmp-h">measured</span><span class="lp-cmp-h">Δ</span>
+        <span>x</span><b id="lp-tx">—</b><b id="lp-mx">—</b><b id="lp-dx">—</b>
+        <span>y</span><b id="lp-ty">—</b><b id="lp-my">—</b><b id="lp-dy">—</b>
+        <span>Y</span><b id="lp-tY">—</b><b id="lp-mY">—</b><b id="lp-dY">—</b>
+      </div>
+      <div class="lp-grid lp-neutral">
+        <div class="kv"><span>CCT</span><b id="lp-cct">—</b></div>
+        <div class="kv"><span>Duv</span><b id="lp-duv">—</b></div>
+        <div class="kv"><span>vs D65</span><b id="lp-target">—</b></div>
       </div>
     </div>
 

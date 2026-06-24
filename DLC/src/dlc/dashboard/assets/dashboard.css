@@ -125,6 +125,18 @@ body {
 .lp-rgb { font-family: var(--mono); color: var(--ink-faint); font-size: 10.5px; }
 .lp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
 .lp-neutral.off { display: none; }
+/* ΔE headline + the measured-vs-target compare table (the way calibration tools present a read) */
+.lp-de-row { display: flex; align-items: baseline; gap: 8px; margin-top: 7px; }
+.lp-de-row span { color: var(--ink-dim); font-size: 11px; }
+.lp-de-row b { font-family: var(--mono); font-size: 16px; }
+.lp-cmp { display: grid; grid-template-columns: 1.1em 1fr 1fr 1fr; gap: 1px 10px;
+  align-items: baseline; margin-top: 8px; border-top: 1px solid var(--edge); padding-top: 5px; }
+.lp-cmp > span { color: var(--ink-dim); font-size: 11px; }            /* x / y / Y row labels */
+.lp-cmp b { font-family: var(--mono); font-size: 11.5px; text-align: right; }
+.lp-cmp b[id^="lp-d"] { color: var(--ink-dim); }                     /* Δ column reads softer */
+.lp-cmp-h { color: var(--ink-faint); font-size: 9px; text-transform: uppercase;
+  letter-spacing: .5px; text-align: right; }
+.lp-neutral { margin-top: 7px; }
 .tint { font-size: 9.5px; padding: 0 3px; border-radius: 3px; }
 .tint.green { color: #6fae5e; } .tint.magenta { color: #c06fc0; }
 .flag { display: flex; justify-content: space-between; padding: 1px 0; color: var(--ink-dim); font-size: 11px; }

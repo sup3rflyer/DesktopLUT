@@ -74,6 +74,15 @@ function fmtSigned(metric, v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "—";
   return (v >= 0 ? "+" : "") + Number(v).toFixed(metricDecimals(metric));
 }
+function fmtSignedFixed(v, d) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return (v >= 0 ? "+" : "") + Number(v).toFixed(d);
+}
+// Luminance/nits: integers once we're past ~100 (HDR runs to thousands), 2 dp for dim patches.
+function fmtY(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return Number(v).toFixed(Math.abs(v) >= 100 ? 0 : 2);
+}
 
 /* ── selectable view metric (a presentation lens; the scored block stays in the scoring metric) ── */
 const DE_VIEW_KEY = "dlc.deView";
@@ -131,8 +140,20 @@ function renderLivePatch(lr, header) {
   sw.style.background = (lr.signal ? sigHex(lr.signal) : (lr.rgb && header && header.bit_depth
     ? sigHex(lr.rgb.map((v) => v / (Math.pow(2, header.bit_depth) - 1))) : "#1c1c20"));
   sw.classList.toggle("nok", !ok);
-  $("lp-xy").textContent = ok ? `${num(lr.xy[0], 4)}, ${num(lr.xy[1], 4)}` : "—";
-  $("lp-Y").textContent = (lr.Y != null) ? num(lr.Y, 2) : "—";
+  // Measured vs target — chromaticity (x,y) + luminance/nits (Y), the layout calibration tools use.
+  const tgt = lr.deltas && lr.deltas.target;
+  const mx = ok ? lr.xy[0] : null, my = ok ? lr.xy[1] : null, mY = lr.Y;
+  $("lp-mx").textContent = (mx != null) ? num(mx, 4) : "—";
+  $("lp-my").textContent = (my != null) ? num(my, 4) : "—";
+  $("lp-mY").textContent = (mY != null) ? fmtY(mY) : "—";
+  $("lp-tx").textContent = tgt ? num(tgt.x, 4) : "—";
+  $("lp-ty").textContent = tgt ? num(tgt.y, 4) : "—";
+  $("lp-tY").textContent = tgt ? fmtY(tgt.Y) : "—";
+  $("lp-dx").textContent = (tgt && mx != null) ? fmtSignedFixed(mx - tgt.x, 4) : "—";
+  $("lp-dy").textContent = (tgt && my != null) ? fmtSignedFixed(my - tgt.y, 4) : "—";
+  // ΔY as a percentage of target (the intuitive "how far off in brightness"); guard tiny targets.
+  $("lp-dY").textContent = (tgt && mY != null && tgt.Y > 1e-3)
+    ? fmtSignedFixed((mY - tgt.Y) / tgt.Y * 100, 1) + "%" : "—";
   // per-patch ΔE vs target (all patches), in the SELECTED view metric, coloured by quality.
   const vm = viewMetric(lastState);
   const comp = lr.deltas && lr.deltas.metrics && lr.deltas.metrics[vm];

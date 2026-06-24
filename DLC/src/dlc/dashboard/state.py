@@ -437,9 +437,13 @@ class DashboardState:
             return None
         if d is None:
             return None
-        return {"scoring": d["scoring"], "metrics": {
-            m: {k: round(val, _DE_DECIMALS.get(m, 3)) for k, val in metric.items()}
-            for m, metric in d["metrics"].items()}}
+        tgt = d.get("target")
+        return {"scoring": d["scoring"],
+                "target": ({"x": round(tgt["x"], 4), "y": round(tgt["y"], 4),
+                            "Y": round(tgt["Y"], 3)} if tgt else None),
+                "metrics": {
+                    m: {k: round(val, _DE_DECIMALS.get(m, 3)) for k, val in metric.items()}
+                    for m, metric in d["metrics"].items()}}
 
     def _patch_delta_e(self, data: dict[str, Any]) -> Optional[float]:
         """The single scoring-metric per-patch ΔE (dE_ITP for HDR, CIEDE2000 for SDR) — the dense

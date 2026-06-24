@@ -171,9 +171,15 @@ def test_patch_deltas_structure_and_scoring_metric():
     assert set(hdr["metrics"]) == {"itp", "de2000", "jzazbz"}
     assert hdr["metrics"]["itp"]["de"] == pytest.approx(
         patch_delta_e([0.0, 0.0, 0.6], 0.18, 0.10, 120.0, is_hdr=True, white_xy=_D65))
+    # the target's xyY rides along so the dashboard can show measured-vs-target without recomputing
+    assert set(hdr["target"]) == {"x", "y", "Y"} and hdr["target"]["Y"] > 0
     sdr = patch_deltas([0.5, 0.5, 0.55], 0.30, 0.31, 60.0, is_hdr=False, white_xy=_D65, luminance=120.0)
     assert sdr["scoring"] == "de2000"
     assert set(sdr["metrics"]) == {"de2000", "jzazbz"}
+    # a true mid-grey target sits ON the white point and at (0.5^gamma)·luminance
+    grey = patch_deltas([0.5, 0.5, 0.5], 0.3127, 0.329, 30.0, is_hdr=False, white_xy=_D65, luminance=120.0)
+    assert abs(grey["target"]["x"] - _D65[0]) < 1e-4 and abs(grey["target"]["y"] - _D65[1]) < 1e-4
+    assert grey["target"]["Y"] == pytest.approx(120.0 * 0.5 ** 2.2, rel=0.02)
     assert sdr["metrics"]["de2000"]["de"] == pytest.approx(
         patch_delta_e([0.5, 0.5, 0.55], 0.30, 0.31, 60.0, is_hdr=False, white_xy=_D65, luminance=120.0))
 
