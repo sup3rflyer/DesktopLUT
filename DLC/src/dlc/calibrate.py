@@ -2811,8 +2811,9 @@ class Calibration:
         except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
             return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
 
-    def stage_refine_mhc_cube(self, *, max_rounds: int = 3, target_de: float = 2.0,
-                              min_improvement: float = 0.3, regress_tol: float = 0.5
+    def stage_refine_mhc_cube(self, *, target_de: float = 2.0,
+                              min_improvement: float = 0.3, regress_tol: float = 0.5,
+                              floor_patience: int = 2, safety_max_rounds: int = 40
                               ) -> StageOutcome:
         """Closed-loop grayscale refine of the HDR MHC base cube toward STANDALONE D65.
 
@@ -2822,11 +2823,15 @@ class Calibration:
         foundation (see [[mhc-standalone-d65-peakchroma]] / [[dlc-corrections-stack-independently]]),
         independent of the optional 3D LUT.
 
-        Per the DESIGN LAW the convergence FLOOR (no further improvement, or below the
-        panel-limited ``target_de``) is a deterministic stop the spine owns; each round emits a
-        non-blocking check-in (evidence) the LLM consumes from the running spine; the FINAL
-        acceptance is the verify seam. A REGRESSION (a refine made grey worse) reverts to the
-        best measured cube and raises a seam for the LLM. HDR only; SDR / non-1D-LUT base ⇒ no-op.
+        **No arbitrary round cap (DESIGN LAW).** Mirrors the SDR sibling
+        (:meth:`stage_refine_mhc_grayscale`): the loop runs to the panel's *physical floor* — it
+        converges to ``target_de`` OR stops improving beyond noise for ``floor_patience`` consecutive
+        rounds (a single noisy sub-``min_improvement`` step is not the floor) — or REGRESSES (revert +
+        LLM seam). ``safety_max_rounds`` is a backstop for a pathological panel: NOT a silent cap — it
+        reverts to best and raises a seam. A UNIFIED best-revert reinstalls the best measured cube on
+        EVERY terminal exit (not just regression). Each round emits a non-blocking check-in the LLM
+        consumes (and may cancel via ``control.json``); the FINAL acceptance is the verify seam. HDR
+        only; SDR / non-1D-LUT base ⇒ no-op.
         """
         def run() -> StageOutcome:
             spec = self._spec()
@@ -2882,8 +2887,11 @@ class Calibration:
             installed = cube_path
             best_path, best_avg = cube_path, float("inf")
             flags: dict[str, bool] = {}
+            floor_streak = 0           # consecutive rounds with sub-noise improvement (→ monitor floor)
 
-            for rnd in range(1, max_rounds + 1):
+            rnd = 0
+            while True:
+                rnd += 1
                 res = self._measure_set(self._neutral_patches(), role=f"refine{rnd}",
                                         ti3_name=f"refine_{rnd}.ti3",
                                         ndjson_name=f"refine_{rnd}.ndjson")
@@ -2916,23 +2924,28 @@ class Calibration:
                 if de["avg"] < best_avg:
                     best_avg, best_path = de["avg"], installed
 
-                # --- deterministic stop conditions (the spine owns these) ---
+                # --- stop conditions. The loop runs to the PANEL'S PHYSICAL FLOOR, not an arbitrary
+                # round count (DESIGN LAW). Each just sets a flag + breaks; the UNIFIED best-revert
+                # after the loop reinstalls the best measured cube on EVERY exit. ---
                 if len(scores) >= 2 and scores[-1] > scores[-2] + regress_tol:
-                    flags["regressed"] = True
-                    if best_path != installed:        # revert to the best measured cube
-                        self.controller.set_base_lut(self.monitor, self.mode,
-                                                     str(Path(best_path).resolve()), cap_nits)
-                        self.controller.apply_mhc(self.monitor, self.mode)
-                        installed = best_path
+                    flags["regressed"] = True            # a round made grey WORSE → revert + LLM seam
                     break
                 if de["avg"] <= target_de:
-                    flags["converged"] = True
+                    flags["converged"] = True            # reached the panel-limited target
                     break
+                # Monitor floor: improvement below measurement noise for `floor_patience` consecutive
+                # rounds (a single noisy sub-threshold step is not the floor).
                 if len(scores) >= 2 and (scores[-2] - scores[-1]) < min_improvement:
-                    flags["floored"] = True
-                    break
-                if rnd == max_rounds:
-                    flags["budget_limited"] = True
+                    floor_streak += 1
+                    if floor_streak >= floor_patience:
+                        flags["floored"] = True
+                        break
+                else:
+                    floor_streak = 0
+                # Backstop for a pathological non-converging panel: NOT a silent cap — revert to best
+                # and raise a seam (handled after the stage) so the LLM adjudicates rather than code.
+                if rnd >= safety_max_rounds:
+                    flags["safety_ceiling"] = True
                     break
 
                 # --- one refine step toward D65 at the Peak-Chroma cap, then reinstall ---
@@ -2957,6 +2970,17 @@ class Calibration:
                 self.controller.apply_mhc(self.monitor, self.mode)
                 installed = str(new_path)
 
+            # Unified best-revert: reinstall the BEST measured cube on EVERY terminal exit (not just
+            # regression). A converged/floored/safety exit might otherwise strand a marginally-worse-
+            # than-best cube (an uptick within regress_tol never trips the regression gate); reinstalling
+            # best guarantees the standalone foundation never regresses below what was actually measured
+            # best (≥ the build base cube, since round 1 measures it).
+            if best_path != installed:
+                self.controller.set_base_lut(self.monitor, self.mode,
+                                             str(Path(best_path).resolve()), cap_nits)
+                self.controller.apply_mhc(self.monitor, self.mode)
+                installed = best_path
+
             # Point the foundation at the final (best measured) cube so the deliverable + any
             # resume install reference the refined result.
             if installed != cube_path:
@@ -2973,6 +2997,7 @@ class Calibration:
                       "target_de_itp": target_de, "final_cube": Path(installed).name, **flags}
             return StageOutcome("refine-mhc-cube", "done", digest=digest,
                                 data={"rounds": len(rounds_log), "regressed": bool(flags.get("regressed")),
+                                      "safety_ceiling": bool(flags.get("safety_ceiling")),
                                       "final_avg": final_avg})
 
         outcome = self._stage("refine-mhc-cube", run)
@@ -2984,6 +3009,17 @@ class Calibration:
                 key="refine-mhc-cube:regression", seam=SEAM_OPTIMIZE, stage="refine-mhc-cube",
                 question=("the closed-loop grayscale refine regressed (a round made grey worse); "
                           "the best measured cube was restored — accept it, or recheck the panel?"),
+                options=("accept", "abort"), recommendation="accept",
+                digest=outcome.digest))
+        elif outcome.data.get("safety_ceiling"):
+            # The backstop fired: many rounds without reaching the floor or target (a pathological /
+            # unstable panel). NOT silently capped — the best measured cube is installed and the LLM
+            # decides whether that foundation is good enough or the panel needs a recheck.
+            self.adjudicate(AdjudicationRequest(
+                key="refine-mhc-cube:safety-ceiling", seam=SEAM_OPTIMIZE, stage="refine-mhc-cube",
+                question=(f"the HDR grayscale refine ran {safety_max_rounds} rounds without reaching the "
+                          "monitor floor or the target — the best measured cube is installed; accept it, "
+                          "or recheck the panel?"),
                 options=("accept", "abort"), recommendation="accept",
                 digest=outcome.digest))
         return outcome

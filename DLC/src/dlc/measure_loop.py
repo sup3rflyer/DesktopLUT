@@ -1148,18 +1148,24 @@ class _Loop:
         return dip is not None and dip.thermal_regime not in (None, "compromised")
 
     def _run_soak(self, *, phase: str, max_blocks: Optional[int] = None):
-        """Drive a closed-loop :class:`~dlc.thermal.ThermalController` over THIS run's patch set.
+        """Drive a closed-loop :class:`~dlc.thermal.ThermalController` over a NEUTRAL stand-in for
+        THIS run's patch set.
 
-        Feeding the measurement set as the soak content is the whole trick: the controller glides
-        to ``k=1`` = the set's own mean backlight energy, so the panel is parked at exactly the load
-        the measurement will then sustain — no thermal step at the soak→measure boundary. Returns the
+        The soak parks the panel at the load the measurement will sustain — but the controller's
+        warm-in/convergence is judged on an interleaved NEUTRAL drift reference, so feeding *coloured*
+        content (e.g. the verify QC set) loads one channel unevenly and makes that reference read a
+        phantom channel-balance "drift" that never settles (HW 2026-06-24: verify preheat glided 17+
+        blocks on R). So we soak with a per-patch **max-channel grey** ``(m,m,m)`` instead: on a
+        white-LED/FALD panel the backlight level tracks the brightest subpixel demand, so max-channel
+        grey reproduces the SAME backlight energy (the thermal driver) while staying neutral — no
+        phantom drift, no thermal step at the soak→measure boundary. Applies to all modes. Returns the
         ``ThermalResult`` (or ``None`` when there's no content to soak with). Per-block records are
         kept off ``measurements.ndjson`` (the readout tails it and expects measurement-shaped rows);
         the caller emits a single summary marker instead."""
         from .thermal import ThermalController, ThermalConfig  # lazy: keep the module import light
 
         self._live_phase = phase
-        content = [p.rgb for p in self.patches]
+        content = [(m, m, m) for p in self.patches for m in (max(p.rgb),)]
         if not content:
             return None
         max_cv = self.transfer.max_cv
