@@ -568,9 +568,43 @@ function trapLightboxTab(e) {
  * (geometry in SVG-pixel space — NO colour math), so you get a point's target/measured/
  * deviation immediately and don't have to land on a 2px dot. */
 let hoverEl = null;                                    // the currently-highlighted data mark
+let hoverVec = null;                                   // the measured→target error vector (CIE tile)
+const SVGNS = "http://www.w3.org/2000/svg";
+
+// CIE points carry data-tx/data-ty (their target in viewBox px). On hover, draw the error vector
+// from the measured dot to where the patch SHOULD sit, with a ring at the target — so the
+// chromaticity miss is visible as a line, not just a number.
+function drawErrorVector(el) {
+  removeErrorVector();
+  const tx = el.getAttribute && el.getAttribute("data-tx");
+  const ty = el.getAttribute && el.getAttribute("data-ty");
+  if (tx == null || ty == null) return;
+  const svg = el.closest("svg");
+  if (!svg) return;
+  const cx = el.getAttribute("cx"), cy = el.getAttribute("cy");
+  const g = document.createElementNS(SVGNS, "g");
+  g.setAttribute("class", "ch-error-grp");
+  const line = document.createElementNS(SVGNS, "line");
+  line.setAttribute("x1", cx); line.setAttribute("y1", cy);
+  line.setAttribute("x2", tx); line.setAttribute("y2", ty);
+  line.setAttribute("class", "ch-error-line");
+  const ring = document.createElementNS(SVGNS, "circle");
+  ring.setAttribute("cx", tx); ring.setAttribute("cy", ty); ring.setAttribute("r", "2.6");
+  ring.setAttribute("class", "ch-error-target");
+  g.appendChild(line); g.appendChild(ring);
+  svg.appendChild(g);                                  // appended last → drawn over the scatter
+  hoverVec = g;
+}
+function removeErrorVector() {
+  // remove ALL vectors (the grid tile and the lightbox each have their own SVG, so a vector can
+  // linger in the other when the cursor crosses between them) — robust against strays.
+  document.querySelectorAll(".ch-error-grp").forEach((g) => g.remove());
+  hoverVec = null;
+}
 
 function clearHover() {
   if (hoverEl) { hoverEl.classList.remove("ch-hover"); hoverEl = null; }
+  removeErrorVector();
   const tip = $("chart-tip");
   if (tip) tip.hidden = true;
 }
@@ -619,6 +653,7 @@ function wireChartHover(container) {
       if (hoverEl) hoverEl.classList.remove("ch-hover");
       hit.el.classList.add("ch-hover");
       hoverEl = hit.el;
+      drawErrorVector(hit.el);                          // error vector to target (no-op off the CIE tile)
     }
     const tip = $("chart-tip");
     tip.textContent = hit.title;

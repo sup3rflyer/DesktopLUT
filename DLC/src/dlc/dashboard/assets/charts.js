@@ -88,7 +88,14 @@
       const p = pts[i];
       // inline style beats the CSS class fill, so a per-patch colour actually shows
       const fill = p.c ? ` style="fill:${esc(p.c)}"` : "";
-      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}>${title(`${p.neutral ? "neutral" : "colour"} xy ${fmt(p.x, 4)}, ${fmt(p.y, 4)}`)}</circle>`);
+      // target chromaticity (where this patch SHOULD sit): data-tx/ty in viewBox px let the hover
+      // draw the error vector; the title gains ΔE + the target xy so the readout is self-contained.
+      const hasT = p.tx != null && p.ty != null;
+      const tAttr = hasT ? ` data-tx="${fmt(P.px(p.tx), 1)}" data-ty="${fmt(P.py(p.ty), 1)}"` : "";
+      const lbl = p.label ? esc(p.label) + " · " : "";
+      const deTxt = p.de != null ? "ΔE " + fmt(p.de, 2) + " · " : "";
+      const tTxt = hasT ? ` → target ${fmt(p.tx, 4)}, ${fmt(p.ty, 4)}` : "";
+      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}${tAttr}>${title(`${lbl}${deTxt}${p.neutral ? "neutral" : "colour"} ${fmt(p.x, 4)}, ${fmt(p.y, 4)}${tTxt}`)}</circle>`);
     }
     if (d.white && d.white.length >= 2) {
       const wx = P.px(d.white[0]), wy = P.py(d.white[1]);

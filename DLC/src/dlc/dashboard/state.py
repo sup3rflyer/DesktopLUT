@@ -376,12 +376,14 @@ class DashboardState:
         Y = data.get("Y")
         has_xy = bool(xy) and len(xy) >= 2 and _as_float(xy[0]) is not None and _as_float(xy[1]) is not None
         enriched: dict[str, Any] = {}
+        deltas = self._patch_deltas(data) if (ok and has_xy) else None
         if ok and has_xy:
             enriched = neutral_metrics(float(xy[0]), float(xy[1]))
             self._mark_progress(ev.time)   # a good read is forward progress
             self._clear_alarm()
-            self._accumulate_charts(ev, data, float(xy[0]), float(xy[1]), Y, enriched)
-        deltas = self._patch_deltas(data) if (ok and has_xy) else None
+            # deltas carries the patch's target xy + scoring ΔE → the CIE scatter can draw each
+            # point's error vector to where it SHOULD sit and show ΔE on hover.
+            self._accumulate_charts(ev, data, float(xy[0]), float(xy[1]), Y, enriched, deltas)
         de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
         self.last_read = {
             "seq": data.get("seq"), "role": data.get("role"), "label": data.get("label"),
@@ -500,7 +502,8 @@ class DashboardState:
         return ev.phase or ev.stage or "measure"
 
     def _accumulate_charts(self, ev: Event, data: dict[str, Any], x: float, y: float,
-                           Y: Any, enriched: dict[str, Any]) -> None:
+                           Y: Any, enriched: dict[str, Any],
+                           deltas: Optional[dict[str, Any]] = None) -> None:
         """Fold a good read into the bounded chart datasets (served via /api/charts)."""
         role = data.get("role")
         disposition = data.get("disposition")
@@ -533,9 +536,14 @@ class DashboardState:
             self._gray_by_stage[stage] = {}
             self._color_by_stage[stage] = {}
             self._stage_seq.append(stage)
-        self._cie_by_stage[stage].append({"x": round(x, 5), "y": round(y, 5),
-                                          "role": role, "neutral": neutral,
-                                          "c": (None if neutral else _sig_hex(sig)) if sig else None})
+        tgt = (deltas or {}).get("target")
+        de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
+        self._cie_by_stage[stage].append({
+            "x": round(x, 5), "y": round(y, 5), "role": role, "neutral": neutral,
+            "c": (None if neutral else _sig_hex(sig)) if sig else None,
+            # target chromaticity + scoring ΔE → the scatter draws the error vector and shows ΔE on hover
+            "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
+            "de": de, "label": data.get("label")})
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             # latest measurement at this grayscale level wins (re-measures overwrite)

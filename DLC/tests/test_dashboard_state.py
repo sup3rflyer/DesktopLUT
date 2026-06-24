@@ -500,6 +500,19 @@ def test_charts_accumulate_cie_grayscale_and_drift():
     assert cd[0]["elapsed_s"] is not None
 
 
+def test_cie_points_carry_target_and_de_for_error_vectors():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:verify"))
+    # a saturated red read offset from its sRGB-red target → a real error vector
+    _read(st, 1, [255, 0, 0], [0.62, 0.34], 44.0, signal=[1.0, 0.0, 0.0])
+    pt = st.charts()["cie"]["points"][0]
+    assert pt["tx"] is not None and pt["ty"] is not None        # target chromaticity rides along
+    assert abs(pt["tx"] - 0.64) < 0.01 and abs(pt["ty"] - 0.33) < 0.01   # ~sRGB red
+    assert pt["de"] is not None and pt["de"] > 0                # scoring ΔE for the hover readout
+
+
 def test_grayscale_latest_measurement_wins_per_level():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", white={"xy": [0.3127, 0.329]}))

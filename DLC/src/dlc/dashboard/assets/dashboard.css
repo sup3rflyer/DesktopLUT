@@ -203,6 +203,10 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-pt { stroke: #6a6a72; stroke-width: .4; }
 .ch-pt-n { stroke: #2a2a2e; stroke-width: .4; }
 .ch-target-cross { stroke: #fff; stroke-width: .8; opacity: .8; }
+/* hovered CIE point → its target: the error vector + a ring at where the patch should sit */
+.ch-error-grp { pointer-events: none; }
+.ch-error-line { stroke: #e8e8ec; stroke-width: 1; stroke-dasharray: 2.5 2; opacity: .9; }
+.ch-error-target { fill: none; stroke: #e8e8ec; stroke-width: 1; opacity: .9; }
 /* Grayscale Duv sign bands + sign-coloured dots (green above the locus, magenta below) */
 .ch-band-green { fill: rgba(111,174,94,.10); }
 .ch-band-magenta { fill: rgba(192,111,192,.10); }
