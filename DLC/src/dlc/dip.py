@@ -77,7 +77,11 @@ class DisplayInstrumentProfile:
     settle_seconds: Optional[float] = None       # measured step-response settle (the conservative worst case)
     settle_by_level: Optional[dict[str, float]] = None   # {"bright": s, "dark": s}
     native_white_xy: Optional[list[float]] = None
-    native_white_nits: Optional[float] = None
+    native_white_nits: Optional[float] = None     # brief full-field peak (the absolute clip ceiling)
+    sustained_peak_nits: Optional[float] = None   # HDR: the peak the panel HOLDS under a maintained
+    #   thermal load (warm capture) — the DLC calibration peak (hdr_target.choose_peak_nits). Below
+    #   native_white_nits (the brief flash eats headroom under sustained load). None until a warm
+    #   capture lands → choose_peak_nits falls back to native_white_nits and flags it.
     native_black_nits: Optional[float] = None
     native_primaries: Optional[dict[str, list[float]]] = None    # {"R":[x,y],"G":..,"B":..}
     eotf_undershoot: Optional[float] = None       # HDR: full-field measured-vs-requested luminance error
@@ -140,6 +144,7 @@ class DisplayInstrumentProfile:
             settle_by_level=(dict(d["settle_by_level"]) if d.get("settle_by_level") else None),
             native_white_xy=_opt_xy(d.get("native_white_xy")),
             native_white_nits=_opt_float(d.get("native_white_nits")),
+            sustained_peak_nits=_opt_float(d.get("sustained_peak_nits")),
             native_black_nits=_opt_float(d.get("native_black_nits")),
             native_primaries=(dict(d["native_primaries"]) if d.get("native_primaries") else None),
             eotf_undershoot=_opt_float(d.get("eotf_undershoot")),

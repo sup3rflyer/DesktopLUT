@@ -9,15 +9,21 @@ measurements make a chosen target reachable and tell you how hard you must drive
 
 This module makes that choice, deterministically, so the orchestrator never has to:
 
-* **Peak** (``docs/hdr-target-design.md`` §1) — the highest round 200-step value
-  (:data:`PEAK_LADDER`) the panel can *sustain*, bounded by the measured ceiling. The
-  brief full-field ``native_white_nits`` (~1840 on the PA32UCXR) is the absolute clip
-  point, not the target: the undershoot correction eats headroom (lifting measured up
-  to PQ means driving harder → more heat + ABL pressure), so the sustained, correctable
-  peak sits **below** the brief read. Until a warm/sustained-load DIP capture proves
-  1800 holds, we default **conservatively to 1600** (the value ``v2-design-notes`` and
-  the synthetic profile pencil) and record what the brief ceiling *would* allow. When a
-  ``sustained_peak_nits`` is supplied, the ladder picks the highest rung it supports.
+* **Peak** (``docs/hdr-target-design.md`` §1) — **the panel's MAX-SUSTAINED peak**, the
+  brightness it can actually *hold* under a maintained thermal load (the warm-capture
+  ``sustained_peak_nits`` DIP field), clamped to the measured native ceiling. We calibrate
+  to this throughout (patch bounding, the MHC cube, the C++ handoff all agree on it — Task C,
+  the peak-signal unification). **OWNER DECISION (2026-06-24):** the conservative/"standard"
+  *viewing* peak (e.g. 1600, with the roll-off) is **no longer a DLC calibration parameter** —
+  it moves to DesktopLUT's tonemap as a target the user picks (the release-gated
+  ``tonemapTargetPeak`` IPC, §4 / HANDOFF Task E4). DLC characterizes the *full sustained
+  panel*; DesktopLUT fits content into the user's chosen viewing peak. The brief full-field
+  ``native_white_nits`` (~1840 on the PA32UCXR) is the absolute clip point and the safety
+  ceiling. If **no** warm/sustained capture exists yet, we fall back to that measured raw
+  ceiling but **flag it** (``sustained_unknown``) — a brief flash the panel may not hold
+  bakes in error, so the LLM/owner is told to get a warm capture. :data:`PEAK_LADDER` and
+  :data:`DEFAULT_TARGET_PEAK_NITS` are retained only for the *viewing*-peak rungs (now
+  DesktopLUT's job) and as a cold-start placeholder before any panel measurement exists.
 
 * **EOTF undershoot** (§2) — a multiplicative gain that lifts the panel's measured
   luminance up to the PQ reference. It is a *first-order* plan here (the real per-node
@@ -55,13 +61,16 @@ __all__ = [
     "resolve_from_dip",
 ]
 
-# The round, mastering-aligned peaks we target. Round values are portable (not tied to
-# this panel's momentary thermal/aging state) and line up with how HDR content is
-# authored, so the roll-off matches the mastering knee. (docs/hdr-target-design.md §1)
+# The round, mastering-aligned *viewing* peaks (1000·1200·1400·1600·1800). These are NO
+# LONGER the DLC calibration peak (owner 2026-06-24: calibrate to max-sustained throughout) —
+# they are the user-pickable VIEWING peak that now lives in DesktopLUT's tonemap
+# (``tonemapTargetPeak``, HANDOFF Task E4). Kept here only for reference/provenance.
 PEAK_LADDER: tuple[float, ...] = (1000.0, 1200.0, 1400.0, 1600.0, 1800.0)
 
-# The conservative default until a warm/sustained-load DIP capture settles 1600 vs 1800
-# (hdr-target-design.md open question #1; owner chose "decide from the warm DIP").
+# Cold-start placeholder ONLY — used before any panel measurement exists (no DIP, pre-
+# characterize). A real HDR calibration always has a measured native ceiling (and ideally a
+# warm sustained_peak_nits), so this value never bounds a genuine run; it just keeps the
+# resolver total for the pre-characterize cold start.
 DEFAULT_TARGET_PEAK_NITS: float = 1600.0
 
 # PQ (ST.2084) is an absolute encoding over a fixed 10 000-nit container regardless of
@@ -137,77 +146,63 @@ def undershoot_gain(eotf_undershoot: Optional[float], *,
 def choose_peak_nits(*, native_white_nits: Optional[float] = None,
                      sustained_peak_nits: Optional[float] = None,
                      pinned_peak_nits: Optional[float] = None,
-                     default: float = DEFAULT_TARGET_PEAK_NITS,
-                     ladder: tuple[float, ...] = PEAK_LADDER) -> tuple[float, dict[str, Any]]:
-    """Pick the sustained target peak + explain the choice (hdr-target-design.md §1).
+                     default: float = DEFAULT_TARGET_PEAK_NITS) -> tuple[float, dict[str, Any]]:
+    """Pick the **calibration peak = the panel's MAX-SUSTAINED peak** + explain it
+    (hdr-target-design.md §1; owner decision 2026-06-24).
 
-    Precedence:
+    We calibrate to the brightness the panel can actually *hold*, not a conservative round
+    "viewing" rung (that moved to DesktopLUT's tonemap, ``tonemapTargetPeak`` / Task E4) and
+    not the brief flash ceiling (a peak the panel can't sustain bakes in error). Precedence:
 
-    1. ``pinned_peak_nits`` — an explicit target peak (e.g. the profile's
-       ``peak_luminance_nits``), used verbatim but **never above the measured ceiling**.
-    2. ``sustained_peak_nits`` — a warm/maintained-load peak (the trustworthy ceiling):
-       the highest ladder rung at or below it.
-    3. otherwise — the conservative ``default`` (1600), clamped to the brief
-       ``native_white_nits`` ceiling if that is lower, with a note that the brief read
-       would *allow* a higher rung pending a sustained capture.
+    1. ``pinned_peak_nits`` — an explicit calibration-peak override (clamped to the measured
+       native ceiling). Reserved for deliberate overrides/tests; the profile's
+       ``peak_luminance_nits`` (the *viewing* peak) is **no longer wired here**.
+    2. ``sustained_peak_nits`` — the warm/maintained-load peak: used **directly** (clamped to
+       the native ceiling), NOT rounded to a ladder rung. This is the calibration peak.
+    3. ``native_white_nits`` only — no warm capture yet: fall back to the measured raw ceiling
+       and **flag** it (``sustained_unknown``) so the LLM/owner gets a warm capture (the brief
+       flash may not hold under sustained load).
+    4. nothing measured (cold start, pre-characterize) — the ``default`` placeholder, flagged
+       ungrounded (``grounded=False``) so callers know it rests on no measurement.
 
-    Returns ``(peak_nits, provenance)``.
+    The provenance always carries ``sustained_unknown`` (is the peak a flash, not a held value?)
+    and ``grounded`` (does it rest on a real measurement?). Returns ``(peak_nits, provenance)``.
     """
     # Normalize away non-positive / None inputs uniformly: a 0 or negative peak is invalid
-    # (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML), so it is *ignored* (falls
-    # through to the default), never used as a real ceiling or pin.
+    # (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML), so it is *ignored*, never used
+    # as a real ceiling or pin.
     pinned = float(pinned_peak_nits) if (pinned_peak_nits and pinned_peak_nits > 0) else None
     sustained = float(sustained_peak_nits) if (sustained_peak_nits and sustained_peak_nits > 0) else None
     native = float(native_white_nits) if (native_white_nits and native_white_nits > 0) else None
-    floor = min(ladder)
-    ceiling = sustained if sustained is not None else native
 
-    def clamp_to_ceiling(value: float) -> float:
-        return min(value, ceiling) if ceiling else value
-
-    def rung_or_ceiling(limit: float) -> float:
-        """Highest ladder rung at or below ``limit``; if ``limit`` is below the lowest
-        rung, the **raw limit** itself — a sub-ladder panel cannot hit a round rung, so it
-        targets its measured ceiling. NEVER a rung *above* the ceiling (that would request
-        patches the panel clips and the verify would score as huge dE_ITP)."""
-        rungs = [r for r in ladder if r <= limit + 1e-6]
-        return rungs[-1] if rungs else float(limit)
-
+    # 1. Explicit override (deliberate / tests) — verbatim, never above the measured ceiling.
     if pinned is not None:
-        peak = clamp_to_ceiling(pinned)
-        clamped = ceiling is not None and peak < pinned
-        return peak, {"source": "pinned",
-                      "note": f"target peak pinned at {pinned:g} nits"
-                              + (f", clamped to the measured ceiling {ceiling:g}" if clamped else "")}
+        peak = min(pinned, native) if native else pinned
+        clamped = native is not None and peak < pinned
+        return peak, {"source": "pinned", "sustained_unknown": False, "grounded": True,
+                      "note": f"calibration peak pinned at {pinned:g} nits (explicit override)"
+                              + (f", clamped to the measured native ceiling {native:g}" if clamped else "")}
 
+    # 2. Max-sustained capture — calibrate to it directly (clamped to the native ceiling).
     if sustained is not None:
-        peak = rung_or_ceiling(sustained)
-        below = peak < floor - 1e-6
-        note = (f"highest ladder rung ≤ the sustained-load peak {sustained:g} nits" if not below
-                else f"sustained-load peak {sustained:g} nits is below the {floor:g}-nit ladder "
-                     f"floor → target the measured ceiling {peak:g} (no round rung is reachable)")
-        return peak, {"source": "sustained", "below_ladder": below, "note": note}
+        peak = min(sustained, native) if native else sustained
+        clamped = native is not None and peak < sustained
+        return peak, {"source": "sustained", "sustained_unknown": False, "grounded": True,
+                      "note": f"calibrated to the max-sustained peak {sustained:g} nits"
+                              + (f", clamped to the measured native ceiling {native:g}" if clamped else "")}
 
-    # No sustained capture yet → conservative default, never ABOVE the brief ceiling. A
-    # peak is a round ladder rung when one fits under the ceiling; a sub-ladder panel
-    # targets its raw measured ceiling instead (never a rung it cannot reach).
-    would_allow = rung_or_ceiling(native) if native is not None else None
-    if ceiling is not None and default > ceiling:
-        peak = rung_or_ceiling(ceiling)
-        if peak < floor - 1e-6:
-            note = (f"default {default:g} exceeds the brief full-field ceiling {ceiling:g} nits, "
-                    f"which is below the {floor:g}-nit ladder floor → target the measured ceiling {peak:g}")
-        else:
-            note = (f"default {default:g} exceeds the brief full-field ceiling {ceiling:g} nits → "
-                    f"highest ladder rung {peak:g}")
-    else:
-        peak = default
-        note = (f"conservative default {default:g} nits (no sustained-load DIP capture "
-                "yet; owner chose 'decide from the warm DIP')")
-        if native is not None:
-            note += (f"; the brief full-field peak {native:g} would allow up "
-                     f"to {would_allow:g} — needs a warm capture to confirm it holds")
-    return peak, {"source": "default", "would_allow": would_allow, "note": note}
+    # 3. Only a brief/native ceiling — no warm capture yet: use it but FLAG it (may not hold).
+    if native is not None:
+        return native, {"source": "native_ceiling", "sustained_unknown": True, "grounded": True,
+                        "note": (f"no warm/sustained DIP capture — calibrating to the measured raw "
+                                 f"ceiling {native:g} nits (a brief full-field peak the panel may not "
+                                 f"hold under sustained load; capture a warm sustained_peak_nits to "
+                                 f"confirm it holds, else the un-held headroom bakes in error)")}
+
+    # 4. Nothing measured (cold start, pre-characterize) — last-resort placeholder.
+    return default, {"source": "cold_start_placeholder", "sustained_unknown": True, "grounded": False,
+                     "note": (f"no DIP measurements yet (cold start) — placeholder peak {default:g} nits "
+                              f"until a characterize run measures the panel's sustained ceiling")}
 
 
 def resolve_hdr_target(*, white_xy: tuple[float, float],
@@ -222,8 +217,10 @@ def resolve_hdr_target(*, white_xy: tuple[float, float],
     The **knee** is where boosting by ``undershoot_gain`` would exceed the panel's
     physical ceiling (``native / gain``) — above it the gain tapers to 1.0 and the
     roll-off (§4) carries the rest. When the whole [0, peak] range is boostable the knee
-    sits at the peak (no roll-off needed) — which is the expected case for a 1600 peak on
-    a ~1840-nit panel with a mild undershoot.
+    sits at the peak (no roll-off needed). Since we now calibrate to the max-sustained peak
+    (which sits at/near the native ceiling), a mild undershoot typically pushes the knee
+    just below the peak → a short roll-off at the very top (you cannot boost a panel already
+    at maximum drive), which the cube refines and DesktopLUT's tonemap continues above the cap.
     """
     peak, peak_prov = choose_peak_nits(
         native_white_nits=native_white_nits, sustained_peak_nits=sustained_peak_nits,

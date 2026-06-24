@@ -405,16 +405,28 @@ def test_engine_target_and_transfer():
     assert hdr.transfer == "pq"
 
 
-def test_resolve_hdr_target_pins_peak_from_profile_and_uses_dip():
+def test_resolve_hdr_target_calibrates_to_max_sustained_not_the_profile_viewing_peak():
+    # Owner 2026-06-24 (Task C): the profile's peak_luminance_nits (1600) is the VIEWING peak
+    # and is NO LONGER wired into the calibration peak — that comes from the panel's measured
+    # max-sustained ceiling (DesktopLUT's tonemapTargetPeak owns the viewing peak).
     from dlc.dip import DisplayInstrumentProfile
 
-    p = cp.Profile.synthetic()  # rec2020_pq pins peak_luminance_nits = 1600
-    dip = DisplayInstrumentProfile(display="d", mode="HDR", native_white_nits=1840.0,
-                                   eotf_undershoot=-0.06)
-    tgt = p.resolve_hdr_target("rec2020_pq", dip=dip)
-    assert tgt.peak_nits == 1600.0            # the profile's pin, under the ceiling
+    p = cp.Profile.synthetic()  # rec2020_pq's peak_luminance_nits = 1600 is the viewing peak
+    # A warm capture present → calibrate to the sustained peak (clamped to native), not 1600.
+    warm = DisplayInstrumentProfile(display="d", mode="HDR", native_white_nits=1840.0,
+                                    sustained_peak_nits=1700.0, eotf_undershoot=-0.06)
+    tgt = p.resolve_hdr_target("rec2020_pq", dip=warm)
+    assert tgt.peak_nits == 1700.0            # the measured max-sustained peak, NOT the 1600 pin
+    assert tgt.provenance["peak"]["source"] == "sustained"
     assert tgt.undershoot_gain > 1.0          # the measured undershoot became a gain
     assert tgt.white_xy == cp.D65_XY          # falls back to the target's own white
+
+    # No warm capture → native-ceiling fallback, flagged (still not the 1600 viewing pin).
+    cold = DisplayInstrumentProfile(display="d", mode="HDR", native_white_nits=1840.0,
+                                    eotf_undershoot=-0.06)
+    tgt2 = p.resolve_hdr_target("rec2020_pq", dip=cold)
+    assert tgt2.peak_nits == 1840.0
+    assert tgt2.provenance["peak"]["sustained_unknown"] is True
 
 
 def test_resolve_hdr_target_rejects_sdr_target():

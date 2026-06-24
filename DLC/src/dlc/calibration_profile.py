@@ -401,12 +401,18 @@ class Profile:
         from the measured DIP (``docs/hdr-target-design.md``).
 
         The DIP describes how the panel *deviates* from PQ; this turns it into a chosen
-        target: a sustained peak off the 200-step ladder (the profile's
-        ``peak_luminance_nits`` pins it; else conservative 1600 until a warm capture),
-        the first-order ``eotf_undershoot`` gain + its knee, and the single fixed white.
+        target: the panel's **max-sustained peak** (the warm-capture ``sustained_peak_nits``,
+        clamped to the measured native ceiling; flagged if no warm capture exists yet), the
+        first-order ``eotf_undershoot`` gain + its knee, and the single fixed white.
         ``white_xy`` is the run's resolved target white (from :meth:`resolve_white`); it
         falls back to the target's own white. Raises ``ValueError`` for a non-HDR target
         (the caller should not be resolving an HDR target for an SDR run).
+
+        NOTE (owner 2026-06-24, Task C): the target's ``peak_luminance_nits`` is the
+        conservative/standard **viewing** peak (e.g. 1600). It is **no longer wired into the
+        calibration peak** — that becomes a DesktopLUT TONEMAP target the user picks (the
+        release-gated ``tonemapTargetPeak`` IPC, HANDOFF Task E4). DLC calibrates the full
+        sustained panel; ``peak_luminance_nits`` stays as profile data for that future seam.
         """
         from .hdr_target import resolve_from_dip
 
@@ -414,7 +420,9 @@ class Profile:
         if not spec.is_hdr:
             raise ValueError(f"target {target_name!r} is not an HDR (PQ) target")
         wxy = white_xy if white_xy is not None else spec.white_xy()
-        return resolve_from_dip(dip, white_xy=wxy, pinned_peak_nits=spec.peak_luminance_nits)
+        # pinned_peak_nits deliberately NOT passed: the calibration peak is the measured
+        # max-sustained ceiling, not the profile's (viewing) peak_luminance_nits — see above.
+        return resolve_from_dip(dip, white_xy=wxy)
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def resolve_white(self, monitor: int, target_name: str, *,

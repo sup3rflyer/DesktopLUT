@@ -107,6 +107,49 @@ def test_hdr_build_mhc_builds_per_channel_eotf_cube(tmp_path):
     assert abs(mp["rx"] - 0.708) < 0.02 and abs(mp["gy"] - 0.797) < 0.02
 
 
+def test_hdr_build_mhc_cube_peak_follows_resolved_peak(tmp_path):
+    # Task C / one-source-of-truth: when the orchestrator hands build-mhc a RESOLVED max-sustained
+    # peak, the cube's neutral ceiling + the C++ handoff peak derive from it (NOT an independent
+    # raw-TI3 max), and the Peak-Chroma cap stays a SEPARATE cap on the neutral axis.
+    ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
+    ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr.ti3")          # perfect 1840 panel
+
+    build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3),
+                        resolved_peak_nits=1700.0), ctx)
+    params = _common.load_dlc_state(ctx)["mhc_params"]
+    pc, bl = params["peak_chroma"], params["base_lut"]
+    assert pc["resolved_peak_nits"] == 1700.0                   # the one resolved max-sustained ceiling
+    # The neutral axis tops out at min(resolved peak, the Peak-Chroma cap) — the cap is a separate,
+    # physical constraint that can pull the neutral ceiling below the resolved peak (but not above it).
+    assert pc["cube_peak_nits"] == round(min(pc["resolved_peak_nits"], pc["cap_nits"]), 4)
+    assert pc["cube_peak_nits"] <= pc["resolved_peak_nits"] + 1e-6
+    assert bl["peak_nits"] == pc["cube_peak_nits"]              # handoff = the post-cube neutral peak
+    assert abs(bl["summary"]["white_max_nits"] - pc["cube_peak_nits"]) < 1.0   # cube built to it
+
+
+def test_hdr_build_mhc_clamps_resolved_peak_to_measured_raw_max(tmp_path):
+    # A resolved peak ABOVE what THIS raw set actually measured is clamped to the raw max — never
+    # build a cube above measured drive — and the clamp is recorded in the provenance.
+    ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
+    ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr.ti3")          # ~1840 measured ceiling
+    build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3),
+                        resolved_peak_nits=9999.0), ctx)
+    pc = _common.load_dlc_state(ctx)["mhc_params"]["peak_chroma"]
+    assert pc["resolved_peak_nits"] <= pc["native_peak_nits"] + 1e-6
+    assert "clamped" in pc["ceiling_source"]
+
+
+def test_hdr_build_mhc_standalone_falls_back_to_measured_raw_max(tmp_path):
+    # No resolved peak supplied (standalone build-mhc / no orchestrator) → the stage's own measured
+    # raw max is the ceiling, exactly as before — the wiring is opt-in, not a behaviour change here.
+    ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
+    ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr.ti3")
+    build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3)), ctx)
+    pc = _common.load_dlc_state(ctx)["mhc_params"]["peak_chroma"]
+    assert "measured raw max" in pc["ceiling_source"]
+    assert pc["resolved_peak_nits"] == pc["native_peak_nits"] or pc["resolved_peak_nits"] > 1000.0
+
+
 def test_hdr_build_mhc_adapts_dense_raw_gray_to_desktoplut_mhc_shape(tmp_path):
     ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
     ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr_dense.ti3", gray_steps=40)
