@@ -426,20 +426,30 @@ def patch_delta_e(signal: Sequence[float], x: float, y: float, big_y: float, *,
     return None if d is None else d["metrics"][d["scoring"]]["de"]
 
 
-def rgb_balance(x: Optional[float], y: Optional[float], big_y: Optional[float], *,
-                is_hdr: bool, white_xy: Sequence[float] = _D65_XY) -> Optional[tuple]:
-    """Per-channel **R/G/B deviation from neutral (%)** for a measured gray, against the target
-    white — the classic grayscale RGB-balance reading. Measured XYZ → linear RGB in the target
-    colourspace (sRGB / Rec.2020) → normalise to the three-channel mean, so a perfectly neutral
-    gray reads ``(0, 0, 0)`` at ANY luminance (this is pure white balance, decoupled from the
-    luminance error the EOTF chart owns). ``None`` for a degenerate read or a non-positive mean
-    (e.g. near-black, where balance is noise)."""
+def linear_rgb(x: Optional[float], y: Optional[float], big_y: Optional[float], *,
+               is_hdr: bool, white_xy: Sequence[float] = _D65_XY) -> Optional[tuple]:
+    """A measured gray's **linear R/G/B contributions** in the target colourspace (``inv(NPM)·XYZ``)
+    — the basis for both white balance and per-channel thermal-drift tracking. ``None`` for a
+    degenerate/non-finite read."""
     if x is None or y is None or big_y is None or y <= 0 or big_y <= 0:
         return None
     if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(big_y)):
         return None
     lin = matvec(invert3x3(_npm(_REC2020_PRIMARIES if is_hdr else _SRGB_PRIMARIES, white_xy)),
                  measured_xyz(x, y, big_y))
+    return (lin[0], lin[1], lin[2])
+
+
+def rgb_balance(x: Optional[float], y: Optional[float], big_y: Optional[float], *,
+                is_hdr: bool, white_xy: Sequence[float] = _D65_XY) -> Optional[tuple]:
+    """Per-channel **R/G/B deviation from neutral (%)** for a measured gray, against the target
+    white — the classic grayscale RGB-balance reading. Linear RGB normalised to the three-channel
+    mean, so a perfectly neutral gray reads ``(0, 0, 0)`` at ANY luminance (this is pure white
+    balance, decoupled from the luminance error the EOTF chart owns). ``None`` for a degenerate
+    read or a non-positive mean (e.g. near-black, where balance is noise)."""
+    lin = linear_rgb(x, y, big_y, is_hdr=is_hdr, white_xy=white_xy)
+    if lin is None:
+        return None
     mean = (lin[0] + lin[1] + lin[2]) / 3.0
     if mean <= 0:
         return None

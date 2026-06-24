@@ -81,8 +81,9 @@ def render_report_html(snap: dict[str, Any], charts: dict[str, Any], exported_at
         f'<div data-chart="{key}"></div></figure>'
         for key, title in (("cie", "Color Accuracy · CIE 1931"), ("eotf", "Tone Response · EOTF"),
                            ("graycct", "Grayscale CCT"), ("grayduv", "Grayscale Duv"),
+                           ("graybalance", "Grayscale RGB Balance"),
                            ("colorlum", "Color Luminance"), ("saturation", "Saturation tracking"),
-                           ("optimizer", "Optimizer convergence"), ("drift", "White CCT vs time")))
+                           ("optimizer", "Optimizer convergence"), ("drift", "Channel Drift · thermal")))
 
     payload = _safe_json({"charts": charts, "header": h})
 

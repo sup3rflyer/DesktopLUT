@@ -20,7 +20,9 @@ from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
 from ..gamut import point_in_triangle
-from .colorimetry import neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance
+from .colorimetry import (
+    linear_rgb, neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance,
+)
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
 _SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
@@ -506,18 +508,21 @@ class DashboardState:
         sig = data.get("signal")
         neutral = _is_neutral(rgb)
         is_probe = role == "probe" or disposition == "probe"
-        # Drift series (cross-stage TIME series). The dedicated neutral_ref drift checkpoints
-        # are a FIXED neutral re-measured over time — the clean signal. The whole grayscale ramp
-        # (every measurement neutral, all levels) is NOT drift: dark/mid steps have noisy CCT and
-        # turn the chart into a cloud, so they're excluded. A white-level (>=0.9) measurement
-        # neutral is a legitimate fallback for runs that emit no neutral_ref checkpoints.
+        # Drift series (cross-stage TIME series) for the per-channel thermal-drift chart. A FIXED
+        # near-white neutral re-measured over time — the clean signal: the warm-up conditioning
+        # reads (when thermal drift is LARGEST) + the dedicated neutral_ref checkpoints. The whole
+        # grayscale ramp (every measurement neutral, all levels) is NOT drift: dark/mid steps are
+        # noisy and would bury the trace; a white-level (>=0.9) measurement neutral is the fallback
+        # for runs that emit no warm-up / neutral_ref reads. xy rides along so the chart can split
+        # the read into per-channel linear RGB and track which channel drifts as the panel warms.
         if not is_probe:
             sig_level = _as_float(sig[0]) if (sig and len(sig) >= 1) else None
             sample = {"elapsed_s": self._elapsed_at(ev.time), "signal": sig_level,
-                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y}
-            if role == "neutral_ref":
+                      "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y,
+                      "x": round(x, 5), "y": round(y, 5)}
+            if role in ("warmup", "neutral_ref"):
                 self._white_track.append(sample)
-            elif neutral and role != "warmup" and sig_level is not None and sig_level >= 0.9:
+            elif neutral and sig_level is not None and sig_level >= 0.9:
                 self._white_fallback.append(sample)
         # Snapshot charts (latest measurement stage only): exclude warm-up, drift-ref, build-probe.
         stage = self._chart_stage(ev, data)
@@ -625,14 +630,38 @@ class DashboardState:
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
             "saturation": self._saturation(color_map, white),
             "optimizer": list(self._optimizer_history),
-            "white_track": [w for w in self._drift_series() if w.get("elapsed_s") is not None],
+            "channel_drift": self._channel_drift(hdr, white),
         }
 
     def _drift_series(self) -> Deque[dict]:
-        """The white-drift time series: the dedicated neutral_ref checkpoints when the run has
-        them (a fixed neutral re-measured over time — the clean signal), else the white-level
-        measurement-neutral fallback. Never the full grayscale ramp (its low/mid CCT is noise)."""
+        """The thermal-drift time series: the warm-up + neutral_ref checkpoints when the run has
+        them (a fixed near-white neutral re-measured over time — the clean signal), else the
+        white-level measurement-neutral fallback. Never the full grayscale ramp (low/mid is noise)."""
         return self._white_track if self._white_track else self._white_fallback
+
+    def _channel_drift(self, hdr: bool, white: Optional[list]) -> list[dict[str, Any]]:
+        """Per-channel R/G/B drift (% from the first checkpoint) over elapsed time — the ColourSpace-
+        style thermal-stability read that exposes WHICH channel wanders as the panel warms (a cool
+        blue channel drifts up while R/G hold). Each drift-series checkpoint is split into its linear
+        RGB contributions; every channel is then referenced to its own first reading, so a flat trace
+        = settled and a climbing one = still drifting. The shared baseline means overall warm-up shows
+        as all three rising together, while a single fluctuating channel separates out."""
+        bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
+        out: list[dict[str, Any]] = []
+        base: Optional[tuple] = None
+        for s in self._drift_series():
+            if s.get("elapsed_s") is None:
+                continue
+            lin = linear_rgb(s.get("x"), s.get("y"), s.get("Y"), is_hdr=hdr, white_xy=bal_white)
+            if lin is None or min(lin) <= 0:
+                continue
+            if base is None:
+                base = lin
+            out.append({"elapsed_s": s["elapsed_s"], "cct": s.get("cct"), "Y": s.get("Y"),
+                        "r": round((lin[0] / base[0] - 1.0) * 100.0, 3),
+                        "g": round((lin[1] / base[1] - 1.0) * 100.0, 3),
+                        "b": round((lin[2] / base[2] - 1.0) * 100.0, 3)})
+        return out
 
     def _eotf_reference(self, *, hdr: bool, gamma: float, luminance: Any) -> list[list[float]]:
         out = []

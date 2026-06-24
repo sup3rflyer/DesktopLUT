@@ -211,6 +211,9 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-bal-r { stroke: #d2655f; stroke-width: 1.4; } .ch-bal-r-dot { fill: #d2655f; }
 .ch-bal-g { stroke: #5fae6f; stroke-width: 1.4; } .ch-bal-g-dot { fill: #5fae6f; }
 .ch-bal-b { stroke: #5f86d2; stroke-width: 1.4; } .ch-bal-b-dot { fill: #5f86d2; }
+.ch-bal-r-lab { fill: #d2655f; font-size: 10px; font-family: var(--mono); font-weight: 700; }
+.ch-bal-g-lab { fill: #5fae6f; font-size: 10px; font-family: var(--mono); font-weight: 700; }
+.ch-bal-b-lab { fill: #5f86d2; font-size: 10px; font-family: var(--mono); font-weight: 700; }
 .ch-lab-green { fill: #6fae5e; font-size: 9.5px; font-family: var(--mono); opacity: .85; }
 .ch-lab-magenta { fill: #c06fc0; font-size: 9.5px; font-family: var(--mono); opacity: .85; }
 /* EOTF gamma/tracking line (the second interpretation) — semi-transparent on its own scale */

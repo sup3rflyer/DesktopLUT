@@ -290,19 +290,29 @@
     return P.svg();
   };
 
-  // ── Drift: white-point CCT over elapsed time ──
-  DLCCharts.drift = function (d) {
-    const pts = (d || []).filter((p) => p.cct != null && p.elapsed_s != null);
+  // ── Channel drift: per-channel R/G/B level (% from warm-up start) over elapsed time ──
+  // The ColourSpace-style thermal-stability read — exposes WHICH channel wanders as the panel
+  // warms (a cool blue channel climbing while R/G hold). Flat = settled; a climbing trace = drifting.
+  DLCCharts.channelDrift = function (d) {
+    const pts = (d || []).filter((p) => p.elapsed_s != null && p.r != null);
     if (pts.length < 2) return empty("no drift series yet");
-    const xs = pts.map((p) => p.elapsed_s), cs = pts.map((p) => p.cct);
-    let lo = Math.min(...cs), hi = Math.max(...cs);
-    if (hi - lo < 100) { lo -= 100; hi += 100; }
-    const P = Plot({ xmin: 0, xmax: Math.max(...xs) || 1, ymin: lo, ymax: hi });
-    P.gridX(niceTicks(0, Math.max(...xs) || 1, 4), (t) => Math.round(t) + "s");
-    P.gridY(niceTicks(lo, hi, 4), (t) => Math.round(t));
-    P.pathLine(pts.map((p) => [p.elapsed_s, p.cct]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="1.8" class="ch-dot">${title(`${Math.round(p.elapsed_s)}s | CCT ${Math.round(p.cct)}K${p.Y != null ? " | Y " + fmt(p.Y, 2) : ""}`)}</circle>`));
-    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">white CCT vs time</text>`);
+    const xs = pts.map((p) => p.elapsed_s);
+    let lo = 0, hi = 0;
+    pts.forEach((p) => { lo = Math.min(lo, p.r, p.g, p.b); hi = Math.max(hi, p.r, p.g, p.b); });
+    const pad = Math.max(0.3, (hi - lo) * 0.12);
+    lo -= pad; hi += pad;
+    const xmax = Math.max(...xs) || 1;
+    const P = Plot({ xmin: 0, xmax, ymin: lo, ymax: hi });
+    P.gridX(niceTicks(0, xmax, 4), (t) => Math.round(t) + "s");
+    P.gridY(niceTicks(lo, hi, 4), (t) => (t > 0 ? "+" : "") + fmt(t, 1));
+    P.pathLine([[0, 0], [xmax, 0]], "ch-ref");        // baseline = the first (coldest) reading
+    const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
+    series.forEach(([k, cls]) => P.pathLine(pts.map((p) => [p.elapsed_s, p[k]]), cls));
+    series.forEach(([k, cls, lab]) => pts.forEach((p) =>
+      P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.6" class="${cls}-dot">${title(`${Math.round(p.elapsed_s)}s | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | CCT ${p.cct != null ? Math.round(p.cct) + "K" : "—"}`)}</circle>`)));
+    // per-channel legend so the wandering channel is identifiable at a glance
+    ["R", "G", "B"].forEach((lab, i) => P.add(`<text x="${fmt(P.m.l + 5 + i * 16, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-bal-${lab.toLowerCase()}-lab">${lab}</text>`));
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R/G/B drift vs warm-up start</text>`);
     return P.svg();
   };
 
@@ -318,7 +328,7 @@
       case "colorlum": return DLCCharts.colorLum(charts.color_lum);
       case "saturation": return DLCCharts.saturation(charts.saturation);
       case "optimizer": return DLCCharts.optimizer(charts.optimizer);
-      case "drift": return DLCCharts.drift(charts.white_track);
+      case "drift": return DLCCharts.channelDrift(charts.channel_drift);
       default: return empty();
     }
   };

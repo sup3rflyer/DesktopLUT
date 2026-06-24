@@ -238,6 +238,23 @@ def test_live_de_splits_in_vs_out_of_gamut():
     assert m["last"] is not None                        # the red patch was the most recent read
 
 
+def test_channel_drift_tracks_per_channel_warmup():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", luminance=120.0, gamma=2.2,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:warmup"))
+    # warm-up white re-measured as the panel's blue channel climbs (chromaticity drifts toward blue)
+    reads = [([0.3127, 0.3290], 100.0), ([0.3112, 0.3276], 101.0), ([0.3098, 0.3262], 102.0)]
+    for i, (xy, Y) in enumerate(reads):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i * 60), stage="measure:warmup",
+                      tier="stream", role="warmup", label="warm", rgb=[255, 255, 255],
+                      signal=[1.0, 1.0, 1.0], Y=Y, xy=xy, ok=True))
+    cd = st.charts()["channel_drift"]
+    assert len(cd) == 3                                  # warm-up reads ARE included in the drift series
+    assert cd[0]["r"] == 0.0 and cd[0]["g"] == 0.0 and cd[0]["b"] == 0.0   # baseline = first (coldest)
+    assert cd[-1]["b"] > cd[-1]["r"] and cd[-1]["b"] > 0  # blue drifted up the most → the warming channel
+
+
 def test_saturation_tracking_normalises_per_family():
     st = DashboardState()
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",
@@ -475,11 +492,12 @@ def test_charts_accumulate_cie_grayscale_and_drift():
     # grayscale keyed by signal level (neutrals only) → 2 steps, sorted
     assert [g["signal"] for g in ch["grayscale"]] == [0.5, 1.0]
     assert ch["eotf"]["gamma"] == 2.2 and len(ch["eotf"]["points"]) == 2
-    # drift/white track (no neutral_ref here) falls back to WHITE-level (signal>=0.9) neutrals
-    # only — the 0.5 grayscale step is excluded so the drift trace isn't buried in ramp noise.
-    assert len(ch["white_track"]) == 1
-    assert [w["signal"] for w in ch["white_track"]] == [1.0]
-    assert all(w["elapsed_s"] is not None for w in ch["white_track"])
+    # channel-drift series (no warm-up/neutral_ref here) falls back to WHITE-level (signal>=0.9)
+    # neutrals only — the 0.5 grayscale step is excluded so the drift trace isn't buried in ramp noise.
+    cd = ch["channel_drift"]
+    assert len(cd) == 1                                   # the single white read = the baseline
+    assert cd[0]["r"] == 0.0 and cd[0]["g"] == 0.0 and cd[0]["b"] == 0.0
+    assert cd[0]["elapsed_s"] is not None
 
 
 def test_grayscale_latest_measurement_wins_per_level():
@@ -570,8 +588,8 @@ def test_drift_reference_reads_feed_white_track_not_snapshot_charts():
     ch = st.charts()
     # When neutral_ref checkpoints exist they ARE the drift series — the mid-grayscale
     # measurement neutral at signal 0.5 is excluded (it would just add noise).
-    assert len(ch["white_track"]) == 1
-    assert ch["white_track"][0]["cct"] is not None
+    assert len(ch["channel_drift"]) == 1
+    assert ch["channel_drift"][0]["cct"] is not None
     assert len(ch["cie"]["points"]) == 1               # the drift-ref stays OFF the snapshot
     assert [g["signal"] for g in ch["grayscale"]] == [0.5]
 
@@ -591,7 +609,7 @@ def test_drift_series_excludes_grayscale_ramp_noise():
     for j, at in enumerate((6, 7, 8)):
         _read(st, at, [128, 128, 128], [0.312, 0.329], 40.0 + j, signal=[0.5, 0.5, 0.5],
               role="neutral_ref", disposition="drift_ref", phase="measure:raw")
-    track = st.charts()["white_track"]
+    track = st.charts()["channel_drift"]
     assert len(track) == 3                              # only the neutral_ref checkpoints, not the ramp
 
 
