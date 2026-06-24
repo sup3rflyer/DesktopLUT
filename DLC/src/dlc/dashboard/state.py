@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
-from .colorimetry import neutral_metrics, patch_delta_e, planckian_locus_xy
+from .colorimetry import neutral_metrics, patch_deltas, planckian_locus_xy
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
 _SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
@@ -133,6 +133,11 @@ def _median(values: list[float]) -> Optional[float]:
     return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
+# Wire precision per metric: dE_ITP/CIEDE2000 read ~0–100 (2–3 dp is plenty); raw ΔEz is ~1e-3
+# on its own native scale, so it needs more places to stay legible.
+_DE_DECIMALS = {"itp": 3, "de2000": 3, "jzazbz": 5}
+
+
 def _is_hdr_header(header: dict[str, Any]) -> bool:
     return bool(header.get("is_hdr")) or str(header.get("mode", "")).upper() == "HDR" \
         or str(header.get("transfer", "")).lower() == "pq"
@@ -209,7 +214,9 @@ class DashboardState:
     # live per-patch ΔE for the header (vs each patch's target), keyed by patch identity so a
     # RE-READ overwrites rather than double-counts (latest-wins, like the chart accumulators);
     # reset per stage. Distinct from the per-stage authoritative `de` from metrics_scored.
-    _live_de: dict[Any, float] = field(default_factory=dict)
+    # Each value is a {metric: scalar} dict (dE_ITP/CIEDE2000/ΔEz) so the selectable view metric
+    # can roll its own avg/max without a server round-trip.
+    _live_de: dict[Any, dict] = field(default_factory=dict)
 
     # -- optimizer / seams / anomalies / stall ------------------------------
     optimizer: dict[str, Any] = field(default_factory=dict)
@@ -367,41 +374,51 @@ class DashboardState:
             self._mark_progress(ev.time)   # a good read is forward progress
             self._clear_alarm()
             self._accumulate_charts(ev, data, float(xy[0]), float(xy[1]), Y, enriched)
-        de = self._patch_delta_e(data) if (ok and has_xy) else None
+        deltas = self._patch_deltas(data) if (ok and has_xy) else None
+        de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
         self.last_read = {
             "seq": data.get("seq"), "role": data.get("role"), "label": data.get("label"),
             "rgb": data.get("rgb"), "signal": data.get("signal"), "Y": Y, "xy": xy, "ok": ok,
-            "neutral": _is_neutral(data.get("rgb")), "de": de,
+            "neutral": _is_neutral(data.get("rgb")), "de": de, "deltas": deltas,
             "disposition": data.get("disposition"), **enriched,
         }
         # Live ΔE (header reading): only settled MEASUREMENT reads, not warm-up/probe. Keyed by
         # patch identity (signal → else label/seq) so a re-read overwrites instead of double-counting.
-        if de is not None and data.get("role") not in ("warmup", "probe") \
+        # Store every metric's scalar so the selectable view can roll its own avg/max client-side.
+        if deltas is not None and data.get("role") not in ("warmup", "probe") \
                 and data.get("disposition") != "probe":
             sig = data.get("signal")
             key = tuple(round(float(c), 4) for c in sig[:3]) if (sig and len(sig) >= 3) \
                 else ("seq", data.get("label"), data.get("seq"))
-            self._live_de[key] = de
+            self._live_de[key] = {m: v["de"] for m, v in deltas["metrics"].items()}
         # The most recent neutral read drives the live white-point readout (needs a usable xy
         # so the readout shape stays consistent with the enrichment gate above).
         if ok and has_xy and _is_neutral(data.get("rgb")):
             self.last_white = {"xy": xy, "Y": Y, "rgb": data.get("rgb"), **enriched}
 
     def _live_de_summary(self) -> dict[str, Any]:
-        """Rolling per-patch ΔE for the LIVE header (current stage). avg/max over the window +
-        the run's metric label, so the header updates every patch (distinct from the per-stage
-        authoritative ``de`` from metrics_scored)."""
+        """Rolling per-patch ΔE for the LIVE header (current stage): avg/max over the window for
+        EVERY available metric, plus which one the spine scores — so the selectable view metric
+        updates every patch client-side (distinct from the per-stage authoritative ``de`` from
+        metrics_scored)."""
         vals = list(self._live_de.values())
-        metric = "dE_ITP" if _is_hdr_header(self.header) else "CIEDE2000"
-        if not vals:
-            return {"avg": None, "max": None, "n": 0, "metric": metric}
-        return {"avg": round(sum(vals) / len(vals), 3), "max": round(max(vals), 3),
-                "n": len(vals), "metric": metric}
+        hdr = _is_hdr_header(self.header)
+        order = ("itp", "de2000", "jzazbz") if hdr else ("de2000", "jzazbz")
+        metrics: dict[str, Any] = {}
+        for m in order:
+            xs = [v[m] for v in vals if v.get(m) is not None]
+            if xs:
+                dec = _DE_DECIMALS.get(m, 3)
+                metrics[m] = {"avg": round(sum(xs) / len(xs), dec), "max": round(max(xs), dec)}
+            else:
+                metrics[m] = {"avg": None, "max": None}
+        return {"scoring": "itp" if hdr else "de2000", "metrics": metrics, "n": len(vals)}
 
-    def _patch_delta_e(self, data: dict[str, Any]) -> Optional[float]:
-        """Per-patch ΔE vs the patch's ideal target at the resolved white — dE_ITP for HDR,
-        CIEDE2000 for SDR (dashboard.colorimetry.patch_delta_e, cross-validated against the
-        spine's scorer). Needs the patch's normalised ``signal`` + a good xy/Y; ``None`` otherwise."""
+    def _patch_deltas(self, data: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """All applicable per-patch ΔE metrics (each with its L/C/H split) vs the patch's ideal
+        target at the resolved white — dashboard.colorimetry.patch_deltas, whose scoring metric is
+        cross-validated against the spine's scorer. Needs the patch's normalised ``signal`` + a
+        good xy/Y; ``None`` otherwise. Values are rounded per-metric for the wire."""
         xy, Y, sig = data.get("xy"), data.get("Y"), data.get("signal")
         if not (xy and len(xy) >= 2 and Y is not None and sig and len(sig) >= 3):
             return None
@@ -413,12 +430,22 @@ class DashboardState:
         lum = _as_float(self.header.get("luminance"))
         gamma = _as_float(self.header.get("gamma")) or 2.2
         try:
-            de = patch_delta_e([float(c) for c in sig[:3]], x, y, big_y,
-                               is_hdr=_is_hdr_header(self.header), white_xy=white,
-                               luminance=lum, gamma=gamma)
+            d = patch_deltas([float(c) for c in sig[:3]], x, y, big_y,
+                             is_hdr=_is_hdr_header(self.header), white_xy=white,
+                             luminance=lum, gamma=gamma)
         except Exception:  # noqa: BLE001 — a monitoring number must never break ingest
             return None
-        return round(de, 3) if de is not None else None
+        if d is None:
+            return None
+        return {"scoring": d["scoring"], "metrics": {
+            m: {k: round(val, _DE_DECIMALS.get(m, 3)) for k, val in metric.items()}
+            for m, metric in d["metrics"].items()}}
+
+    def _patch_delta_e(self, data: dict[str, Any]) -> Optional[float]:
+        """The single scoring-metric per-patch ΔE (dE_ITP for HDR, CIEDE2000 for SDR) — the dense
+        event log shows one number, not the full split."""
+        d = self._patch_deltas(data)
+        return None if d is None else d["metrics"][d["scoring"]]["de"]
 
     def _elapsed_at(self, iso: Optional[str]) -> Optional[float]:
         t, start = _parse_iso(iso), _parse_iso(self.run_started_iso)

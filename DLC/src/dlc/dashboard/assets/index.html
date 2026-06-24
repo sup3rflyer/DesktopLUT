@@ -71,12 +71,15 @@
     </div>
 
     <div class="rcard rcard-de">
-      <h3><span id="de-metric">ΔE</span> <span class="card-sub" id="de-source"></span></h3>
+      <h3><span id="de-metric">ΔE</span>
+        <select id="de-view" class="de-view" title="view metric for the live readout + last patch — a presentation lens. The scored block below always stays in the metric the spine optimised."></select>
+        <span class="card-sub" id="de-source"></span></h3>
       <div class="de-live" id="de-live" title="rolling per-patch ΔE for the current stage — updates every read">
         <span>live</span><b id="de-live-avg">—</b><span>avg</span>
         <b id="de-live-max">—</b><span>max</span>
         <span class="de-live-n" id="de-live-n"></span>
       </div>
+      <div class="de-scored-cap">scored · <span id="de-scored-metric">ΔE</span></div>
       <div class="bignums">
         <div class="bignum"><b id="de-avg">—</b><label>avg</label></div>
         <div class="bignum"><b id="de-p95">—</b><label>95th</label></div>
@@ -106,6 +109,11 @@
         <div class="kv lp-neutral"><span>CCT</span><b id="lp-cct">—</b></div>
         <div class="kv lp-neutral"><span>Duv</span><b id="lp-duv">—</b></div>
         <div class="kv lp-neutral"><span>vs D65</span><b id="lp-target">—</b></div>
+      </div>
+      <div class="de-split lp-split" id="lp-comp" title="error split — lightness / chroma / hue contributions to ΔE (the dominant axis is highlighted; quadrature ≈ ΔE). A big ΔE that's almost all lightness is a luminance miss, not a wrong hue.">
+        <div class="kv"><span id="lp-cl-lab">ΔL</span><b id="lp-cl">—</b></div>
+        <div class="kv"><span id="lp-cc-lab">ΔC</span><b id="lp-cc">—</b></div>
+        <div class="kv"><span id="lp-ch-lab">ΔH</span><b id="lp-ch">—</b></div>
       </div>
     </div>
 

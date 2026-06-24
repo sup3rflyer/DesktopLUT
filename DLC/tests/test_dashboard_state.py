@@ -168,13 +168,18 @@ def test_per_patch_de_enriches_reads_and_live_header():
     assert wire["derived"]["de"] is not None and wire["derived"]["de"] < 1.0
     snap = st.snapshot(T0)
     assert snap["last_read"]["de"] is not None
-    assert snap["live_de"]["n"] == 1 and snap["live_de"]["metric"] == "CIEDE2000"
+    # SDR scores CIEDE2000 and offers Jzazbz as a view lens; the rolling summary carries both.
+    assert snap["live_de"]["n"] == 1 and snap["live_de"]["scoring"] == "de2000"
+    assert set(snap["live_de"]["metrics"]) == {"de2000", "jzazbz"}
+    # the last patch carries the full per-metric split so the dashboard can switch view client-side
+    assert snap["last_read"]["deltas"]["scoring"] == "de2000"
+    assert all(k in snap["last_read"]["deltas"]["metrics"]["de2000"] for k in ("de", "L", "C", "H"))
     # a visibly-off red patch raises the rolling max above the near-zero white
     st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=1), stage="measure:verify", tier="stream",
                   seq=2, role="measurement", label="r", rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0],
                   Y=40.0, xy=[0.60, 0.34], ok=True))
     snap2 = st.snapshot(T0 + timedelta(seconds=1))
-    assert snap2["live_de"]["n"] == 2 and snap2["live_de"]["max"] > 1.0
+    assert snap2["live_de"]["n"] == 2 and snap2["live_de"]["metrics"]["de2000"]["max"] > 1.0
     # a new stage clears the live ΔE window (it tracks the CURRENT stage)
     st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=2), stage="measure:post-mhc"))
     assert st.snapshot(T0 + timedelta(seconds=2))["live_de"]["n"] == 0

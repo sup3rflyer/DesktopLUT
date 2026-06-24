@@ -39,23 +39,76 @@ function fmtDur(s) {
   if (m) return `${m}m ${String(sec).padStart(2, "0")}s`;
   return `${sec}s`;
 }
-function deClass(v) {
-  if (v === null || v === undefined) return "";
-  if (v <= 1.0) return "de-ok";
-  if (v <= 2.3) return "de-warn";
-  return "de-bad";
+// Severity bands are metric-specific: dE_ITP/CIEDE2000 ride the familiar 1.0/2.3 JND scale,
+// but raw ΔEz (Jzazbz) lives on its own ~1e-3 native scale (bands derived from the ITP JND anchor).
+function deClass(v, metric) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "";
+  const a = Math.abs(v);
+  if (metric === "jzazbz") return a <= 0.0015 ? "de-ok" : (a <= 0.0035 ? "de-warn" : "de-bad");
+  return a <= 1.0 ? "de-ok" : (a <= 2.3 ? "de-warn" : "de-bad");
 }
+function metricDecimals(metric) { return metric === "jzazbz" ? 4 : 2; }
+// setDe: scoring-block numbers keep the legacy 2-dp / JND-band rendering (always dE_ITP or
+// CIEDE2000). setDeM: a metric-aware cell for the selectable live + last-patch readouts.
 function setDe(id, v, d = 2) {
   const el = $(id);
   el.textContent = num(v, d);
   el.className = deClass(v);
 }
+function setDeM(id, metric, v) {
+  const el = $(id);
+  el.textContent = num(v, metricDecimals(metric));
+  el.className = deClass(v, metric);
+}
 function deMetricLabel(metric) {
   if (!metric) return "ΔE";
-  const m = String(metric).toUpperCase();
-  if (m.includes("ITP")) return "ΔE·ITP";       // HDR (BT.2124)
-  if (m.includes("2000")) return "ΔE2000";      // SDR (CIEDE2000)
+  const m = String(metric).toLowerCase();
+  if (m.includes("itp")) return "ΔE·ITP";              // HDR (BT.2124)
+  if (m.includes("jz")) return "ΔEz";                  // Jzazbz (raw, native scale)
+  if (m.includes("2000") || m === "de2000") return "ΔE2000";  // CIEDE2000
   return "ΔE";
+}
+// Component labels for the lightness/chroma/hue split — ITP is I/C/H, Lab is L*/C*/H*, Jzazbz Jz/C/H.
+function compLabels(metric) {
+  if (metric === "itp") return ["ΔI", "ΔC", "ΔH"];
+  if (metric === "jzazbz") return ["ΔJz", "ΔC", "ΔH"];
+  return ["ΔL*", "ΔC*", "ΔH*"];
+}
+function fmtSigned(metric, v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return (v >= 0 ? "+" : "") + Number(v).toFixed(metricDecimals(metric));
+}
+
+/* ── selectable view metric (a presentation lens; the scored block stays in the scoring metric) ── */
+const DE_VIEW_KEY = "dlc.deView";
+let deView = (() => { try { return localStorage.getItem(DE_VIEW_KEY) || null; } catch (e) { return null; } })();
+let deViewSig = "";   // signature of the currently-populated <select> options
+
+function availMetrics(s) {
+  const ld = s && s.live_de;
+  return (ld && ld.metrics) ? Object.keys(ld.metrics) : [];
+}
+function scoringMetric(s) {
+  return (s && s.live_de && s.live_de.scoring) || (s && s.de && s.de.metric) || "de2000";
+}
+// The metric actually shown: the user's pick if it's available this run, else the scoring metric.
+function viewMetric(s) {
+  const avail = availMetrics(s);
+  if (deView && avail.includes(deView)) return deView;
+  const sc = scoringMetric(s);
+  return avail.includes(sc) ? sc : (avail[0] || sc);
+}
+function syncDeViewSelect(s) {
+  const sel = $("de-view");
+  if (!sel) return;
+  const avail = availMetrics(s);
+  const sig = avail.join(",");
+  if (sig !== deViewSig) {                       // re-populate only when the option set changes
+    deViewSig = sig;
+    sel.innerHTML = avail.map((m) => `<option value="${m}">${deMetricLabel(m)}</option>`).join("");
+  }
+  sel.value = viewMetric(s);
+  sel.disabled = avail.length <= 1;
 }
 // A patch's approximate on-screen colour from its normalised signal (sRGB-ish), for the swatch.
 function sigHex(sig) {
@@ -84,10 +137,25 @@ function renderLivePatch(lr, header) {
   sw.classList.toggle("nok", !ok);
   $("lp-xy").textContent = ok ? `${num(lr.xy[0], 4)}, ${num(lr.xy[1], 4)}` : "—";
   $("lp-Y").textContent = (lr.Y != null) ? num(lr.Y, 2) : "—";
-  // per-patch ΔE vs target (all patches), coloured by quality; label tracks the run metric
-  $("lp-de-label").textContent = deMetricLabel((lastState && lastState.live_de && lastState.live_de.metric)
-    || (lastState && lastState.de && lastState.de.metric));
-  setDe("lp-de", lr.de);
+  // per-patch ΔE vs target (all patches), in the SELECTED view metric, coloured by quality.
+  const vm = viewMetric(lastState);
+  const comp = lr.deltas && lr.deltas.metrics && lr.deltas.metrics[vm];
+  $("lp-de-label").textContent = deMetricLabel(vm);
+  setDeM("lp-de", vm, comp ? comp.de : (vm === scoringMetric(lastState) ? lr.de : null));
+  // divided deltas: the lightness/chroma/hue split, dominant axis highlighted — so a big ΔE
+  // reads as "mostly a luminance miss" vs "a real hue error" at a glance.
+  const labs = compLabels(vm);
+  $("lp-cl-lab").textContent = labs[0];
+  $("lp-cc-lab").textContent = labs[1];
+  $("lp-ch-lab").textContent = labs[2];
+  const cells = [["lp-cl", "L"], ["lp-cc", "C"], ["lp-ch", "H"]];
+  let domI = -1, domV = -1;
+  if (comp) cells.forEach(([, k], i) => { const a = Math.abs(comp[k]); if (a > domV) { domV = a; domI = i; } });
+  cells.forEach(([id, k], i) => {
+    const el = $(id);
+    el.textContent = comp ? fmtSigned(vm, comp[k]) : "—";
+    el.classList.toggle("dom", !!comp && i === domI);
+  });
   // CCT / Duv only make sense for a grayscale patch (a saturated colour has no meaningful CCT).
   const neutral = !!lr.neutral;
   document.querySelectorAll(".rcard-patch .lp-neutral").forEach((el) => el.classList.toggle("off", !neutral));
@@ -185,15 +253,20 @@ function renderState(s) {
   tp.textContent = (lv.progress_age_s != null) ? fmtDur(lv.progress_age_s) : "—";
   tp.className = light === "stalled" ? "prog-stalled" : (light === "slow" ? "prog-slow" : "");
 
-  // dE big-numbers (from the scoring stage). The metric label tracks the run (dE_ITP for HDR,
-  // CIEDE2000 for SDR) so the distinction is explicit, not assumed.
+  // dE card. The selectable VIEW metric (dropdown) drives the headline label + the live rolling
+  // readout + the last-patch tile. The big "scored" numbers come from the scoring stage and stay
+  // in the metric the spine actually optimised (dE_ITP for HDR, CIEDE2000 for SDR) — a viewing
+  // lens must never be mistaken for a re-score.
   const de = s.de || {};
-  const liveMetric = (s.live_de && s.live_de.metric) || de.metric;
-  $("de-metric").textContent = deMetricLabel(liveMetric);
-  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
-  // live rolling per-patch ΔE (updates every read) — the "much more live" header reading
   const ld = s.live_de || {};
-  setDe("de-live-avg", ld.avg); setDe("de-live-max", ld.max);
+  syncDeViewSelect(s);
+  const vm = viewMetric(s);
+  $("de-metric").textContent = deMetricLabel(vm);
+  $("de-scored-metric").textContent = deMetricLabel(de.metric || scoringMetric(s));
+  $("de-source").textContent = de.phase ? `${de.phase}${de.iteration != null ? " #" + de.iteration : ""}` : "";
+  // live rolling per-patch ΔE (updates every read), in the selected view metric
+  const lvm = (ld.metrics && ld.metrics[vm]) || {};
+  setDeM("de-live-avg", vm, lvm.avg); setDeM("de-live-max", vm, lvm.max);
   $("de-live-n").textContent = ld.n ? `${ld.n} patch${ld.n === 1 ? "" : "es"}` : "";
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
   setDe("de-white", de.white);
@@ -548,6 +621,13 @@ function wireUi() {
   for (const id of ["filter-level", "filter-stage", "filter-digest", "filter-text"]) {
     $(id).addEventListener("input", scheduleRender);
   }
+  // view-metric selector: remember the choice and repaint the dE card + last patch from the
+  // cached state (no server round-trip — every metric is already on the wire per patch).
+  $("de-view").addEventListener("change", (e) => {
+    deView = e.target.value;
+    try { localStorage.setItem(DE_VIEW_KEY, deView); } catch (err) { /* private mode: in-memory only */ }
+    if (lastState) renderState(lastState);
+  });
   // native-gamut overlay toggle: flip the chart option and re-render the (cached) charts
   $("toggle-native").addEventListener("change", (e) => {
     if (window.DLCCharts) DLCCharts.opts.native = e.target.checked;
