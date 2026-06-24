@@ -218,6 +218,20 @@ def test_de2000_components_reconstruct_scalar_near_neutral():
     assert quad == pytest.approx(m["de"], rel=0.02), (quad, m["de"])
 
 
+def test_rgb_balance_neutral_is_zero_and_tints_read_correctly():
+    from dlc.dashboard.colorimetry import rgb_balance
+    # A gray sitting exactly on the target white reads 0/0/0 at any luminance (pure white balance).
+    for Y in (5.0, 80.0, 600.0):
+        r, g, b = rgb_balance(_D65[0], _D65[1], Y, is_hdr=False, white_xy=_D65)
+        assert abs(r) < 1e-6 and abs(g) < 1e-6 and abs(b) < 1e-6
+    # A gray pushed toward blue (lower x, slightly) lifts the blue channel above the others.
+    rb, gb, bb = rgb_balance(0.300, 0.318, 80.0, is_hdr=False, white_xy=_D65)
+    assert bb > 0 and bb > rb
+    # Degenerate / near-black → None (balance is noise there), never a bogus number.
+    assert rgb_balance(0.31, 0.0, 80.0, is_hdr=False, white_xy=_D65) is None
+    assert rgb_balance(0.31, 0.33, 0.0, is_hdr=False, white_xy=_D65) is None
+
+
 def test_patch_delta_e_rejects_degenerate_and_nonfinite():
     # A degenerate (y<=0) or NaN/inf read must return None — never a plausible finite ΔE that
     # would silently poison the live rolling average (the engine sanitizes the same case).

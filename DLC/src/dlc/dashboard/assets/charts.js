@@ -199,6 +199,28 @@
     return P.svg();
   };
 
+  // ── Grayscale RGB balance: per-channel % deviation from neutral vs signal (0 = neutral) ──
+  DLCCharts.rgbBalance = function (d) {
+    const all = (d || []).filter((p) => p.r != null && p.g != null && p.b != null);
+    const pts = all.filter((p) => !p.dim);           // drop near-black (balance is noise there)
+    const hidden = all.length - pts.length;
+    if (!pts.length) return empty(all.length ? "grayscale balance near-black only — too dark to read" : "no grayscale balance yet");
+    let span = 1.0;                                   // never tighter than ±1% so tiny errors don't look huge
+    pts.forEach((p) => { span = Math.max(span, Math.abs(p.r), Math.abs(p.g), Math.abs(p.b)); });
+    span *= 1.2;
+    const P = Plot({ xmin: 0, xmax: 1, ymin: -span, ymax: span });
+    P.gridX([0, 0.25, 0.5, 0.75, 1], (t) => Math.round(t * 100) + "%");
+    P.gridY(niceTicks(-span, span, 4), (t) => (t > 0 ? "+" : "") + fmt(t, 1));
+    P.pathLine([[0, 0], [1, 0]], "ch-ref");           // neutral axis — the eye keeps all three here
+    const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
+    series.forEach(([k, cls]) => P.pathLine(pts.map((p) => [p.signal, p[k]]), cls));
+    series.forEach(([k, cls, lab]) => pts.forEach((p) =>
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot">${title(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | target 0`)}</circle>`)));
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R / G / B balance · target 0%</text>`);
+    if (hidden) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${hidden} near-black hidden</text>`);
+    return P.svg();
+  };
+
   // ── Colour luminance: per-patch luminance error vs target, bars coloured by patch ──
   DLCCharts.colorLum = function (d) {
     const items = d || [];
@@ -292,6 +314,7 @@
       case "eotf": return DLCCharts.eotf(charts.eotf);
       case "graycct": return DLCCharts.grayscaleCct(charts.grayscale, wcct);
       case "grayduv": return DLCCharts.grayscaleDuv(charts.grayscale);
+      case "graybalance": return DLCCharts.rgbBalance(charts.grayscale);
       case "colorlum": return DLCCharts.colorLum(charts.color_lum);
       case "saturation": return DLCCharts.saturation(charts.saturation);
       case "optimizer": return DLCCharts.optimizer(charts.optimizer);

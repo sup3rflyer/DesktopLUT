@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
-from .colorimetry import neutral_metrics, patch_deltas, planckian_locus_xy
+from .colorimetry import neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance
 
 # The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
 _SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
@@ -552,17 +552,24 @@ class DashboardState:
         stage = self._latest_chart_stage()
         cie_points = list(self._cie_by_stage.get(stage, ())) if stage else []
         gray_map = self._gray_by_stage.get(stage, {}) if stage else {}
-        # Flag near-black neutrals (Y below the floor) as ``dim``: their CCT/Duv is noise, so the
-        # grayscale CCT/Duv charts drop them from the trace + autoscale (keeping the meaningful
-        # range legible) rather than letting an undefined-CCT near-black read dominate the y-axis.
-        gray = [{**gray_map[k],
-                 "dim": (gray_map[k].get("Y") is not None
-                         and gray_map[k]["Y"] < _GRAY_CCT_Y_FLOOR_NITS)}
-                for k in sorted(gray_map)]
-        color_map = self._color_by_stage.get(stage, {}) if stage else {}
-        white = (self.header.get("white") or {}).get("xy")
-        gamma = self.header.get("gamma") or 2.2
         hdr = _is_hdr_header(self.header)
+        white = (self.header.get("white") or {}).get("xy")
+        bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
+        # Flag near-black neutrals (Y below the floor) as ``dim``: their CCT/Duv is noise, so the
+        # grayscale CCT/Duv/balance charts drop them from the trace + autoscale (keeping the
+        # meaningful range legible) rather than letting an undefined near-black read dominate.
+        # Each level also carries its R/G/B balance (% deviation from neutral) for the balance chart.
+        gray = []
+        for k in sorted(gray_map):
+            g = gray_map[k]
+            bal = rgb_balance(g.get("x"), g.get("y"), g.get("Y"), is_hdr=hdr, white_xy=bal_white)
+            gray.append({**g,
+                         "dim": (g.get("Y") is not None and g["Y"] < _GRAY_CCT_Y_FLOOR_NITS),
+                         "r": round(bal[0], 2) if bal else None,
+                         "g": round(bal[1], 2) if bal else None,
+                         "b": round(bal[2], 2) if bal else None})
+        color_map = self._color_by_stage.get(stage, {}) if stage else {}
+        gamma = self.header.get("gamma") or 2.2
         luminance = self.header.get("luminance")
         return {
             "stage": stage,                       # the measurement stage these snapshot charts reflect
