@@ -9,26 +9,33 @@ faster, and steers a luminance scale ``k`` closed-loop:
 * **proactively glide ``k`` toward 1.0** each block — ease off the gas so we approach the
   operating-load equilibrium from below instead of chasing the high-``k`` equilibrium and
   overshooting;
-* **reactively re-inject** (bump ``k`` back up) if we reach ``k≈1`` while the panel is still
-  warming *directionally* (the active/cold channel still drifting one way);
-* **converge** when ``k=1.0`` AND the warm-in drift is **non-directional & in-band** — judged
-  from the **net-vs-gross** of the active channel over a sliding window, NOT a single-block
-  magnitude (a slow steady directional creep stays under any per-block band yet never settles;
-  net/gross catches it).
+* **reactively re-inject** (bump ``k`` back up) only when warm-in is **directional beyond read
+  noise** in the warm-in direction — debounced (one noisy block can never soak) and re-soak
+  rate-limited (a cooled-then-jittered panel can't saw-tooth);
+* **converge** when ``k≈1`` AND both tracked scalars — the neutral **luminance Y** and the active
+  channel's **balance** — are **zero-slope-within-self-calibrated-read-noise** over a window of
+  operating-load reads. The gate is a slope-vs-noise t-test (``|slope| ≤ z·SE(slope)``, robust
+  Theil–Sen slope), NOT a fixed magnitude band: the old ``net ≤ 3×balance_noise`` gate sat *on*
+  the read-noise floor, so a settled panel's chance excursions read as warm-in and it limit-cycled
+  to the bound (HW 2026-06-24). A residual peak-to-peak bound rejects a large oscillation whose
+  slope is momentarily flat at a turning point.
 
-The regime falls out of the same net/gross numbers:
+The regime is a DESCRIPTOR over the same numbers, plus the budget-boundary verdict:
 
-* **convergent** — sustained net drift falls in-band and gross is also small (a steady
-  temperature exists);
-* **fluctuating** — net stays in-band but gross is large (wanders around a mean, no steady
-  state — HDR): calibrate by maintaining a consistent thermal load + frequent drift checks;
-* **warming** — net stays above band and directional at the observation bound (still ramping).
+* **convergent** — slope-flat on both scalars with a bounded residual (a steady temperature exists);
+* **fluctuating** — at the budget, NON-directional but never a single steady point (wanders around a
+  mean — HDR): calibrate by maintaining a consistent thermal load + frequent drift checks;
+* **warming** — at the budget, still DIRECTIONAL (a real ramp the budget cut short).
 
-Self-activating: a warm panel reads in-band from the first block, so ``k`` decays straight to
-1.0 and it converges fast — no preheat happens. **Thresholds derive from the measured per-panel
-``balance_noise`` (≈3×), never a hardcoded constant** — so the same controller is correct on any
-panel. Flag-don't-cap: a panel that won't converge within the (generous) observation bound is
-FLAGGED with its regime, never silently truncated.
+Self-activating: a warm panel reads zero-slope from the first window, so ``k`` decays straight to
+1.0 and it converges fast — no preheat happens. **Per-quantity thresholds self-calibrate from the
+within-block back-to-back read scatter (SE-of-the-mean), or the DIP's measured ``balance_noise``,
+never a hardcoded constant** — so the same controller is correct on any panel. ABL is data-driven:
+when the reference DIMS under soak load (``Y`` falls as load rises), luminance is dropped from the
+gate (balance-only) and the run is flagged. Flag-don't-cap: a panel that won't converge inside its
+budget (small for a settled panel; extended from soak onset for a real warm-in) is not silently
+capped — it returns a **directional-vs-non-directional** evidence packet with ``needs_adjudication``
+for the LLM/user to judge, never a silent truncation or glide.
 
 Numpy-free (stdlib only): drives the single :data:`~dlc.measure_loop.MeasureFn` seam and a
 monotonic clock, so it runs in tests against :class:`~dlc.measure_loop.SyntheticPanel`
@@ -59,6 +66,50 @@ def _pstd(xs: Sequence[float]) -> float:
     return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
 
+def _median(xs: Sequence[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _theil_sen_slope(series: Sequence[float]) -> float:
+    """Median of all pairwise slopes over integer abscissa — the robust (breakdown-resistant)
+    estimate of per-block drift. Resists quantization steps and a single outlier read that would
+    swing an ordinary least-squares fit (numpy-free)."""
+    n = len(series)
+    if n < 2:
+        return 0.0
+    slopes = [(series[j] - series[i]) / (j - i)
+              for i in range(n) for j in range(i + 1, n)]
+    return _median(slopes)
+
+
+def _slope_stats(series: Sequence[float], sigma_block: float) -> tuple[float, float, float, float]:
+    """The drift-vs-noise statistic for one tracked scalar over a window.
+
+    Returns ``(slope_per_block, se_slope, zratio, signed_displacement)`` over integer abscissa
+    ``0..n-1``. ``se_slope = sigma_block / sqrt(Σ(t-t̄)²)`` is the standard error of the slope under
+    i.i.d. block-mean read noise ``sigma_block`` (the panel-independent self-calibration). The
+    ``zratio = |slope| / se_slope`` is the discriminator: ``≤ z`` ⇒ zero-slope-within-read-noise
+    (settled); ``≳ z`` ⇒ a directional drift distinguishable from noise (still warming / cooling).
+    This replaces the old ``net ≤ threshold`` gate, which sat at the read-noise floor and so could
+    not tell a stationary walk's chance excursions from a real ramp."""
+    n = len(series)
+    if n < 3:
+        return 0.0, float("inf"), 0.0, 0.0
+    slope = _theil_sen_slope(series)
+    txx = n * (n * n - 1) / 12.0          # Σ(t - t̄)² for t = 0..n-1 (evenly spaced)
+    if sigma_block > 0 and txx > 0:
+        se = sigma_block / math.sqrt(txx)
+        z = abs(slope) / se
+    else:                                 # no read noise (deterministic) ⇒ any non-zero slope is real
+        se = 0.0
+        z = float("inf") if abs(slope) > 0 else 0.0
+    return slope, se, z, slope * (n - 1)
+
+
 def net_over_gross(series: Sequence[float]) -> tuple[float, float, Optional[float]]:
     """For a 1-D series: ``net`` (|last − first|, the directional drift), ``gross``
     (Σ|consecutive Δ|, the total motion), and ``net/gross`` (→1 directional, →0 oscillating;
@@ -81,13 +132,36 @@ class ThermalConfig:
     k_decay: float = 0.7            # k <- 1 + (k-1)*k_decay each block when gliding back toward 1
     load_reads_per_block: int = 12  # scaled-content reads per block (the heat per block)
     ref_reads: int = 3              # reads of the fixed neutral sensor per block (median-ish)
-    window_blocks: int = 5          # sliding window for the net/gross judgement (~4-6)
-    net_gross_ratio: float = 0.5    # net/gross ≥ this ⇒ DIRECTIONAL (still warming)
-    drift_sigma_mult: float = 3.0   # drift threshold = max(drift_floor, mult × balance_noise)
-    drift_floor: float = 0.003      # threshold floor when balance_noise is tiny/unknown
-    fluct_gross_mult: float = 2.0   # at convergence, gross > mult × threshold ⇒ FLUCTUATING (not flat)
-    converge_blocks: int = 2        # consecutive in-band (net) blocks ⇒ converged
-    max_blocks: int = 240           # observation bound; exceeding it FLAGS (never a silent cap)
+    window_blocks: int = 5          # sliding window for the slope / net-gross judgement (~4-6)
+    # CONVERGENCE = zero-slope-within-self-calibrated-read-noise (a t-test on the per-block trend),
+    # NOT a fixed magnitude band sitting on the noise floor. ``slope_z`` is the |slope|/SE(slope)
+    # cutoff: ≤ it ⇒ flat-in-noise, ≳ it ⇒ directional. Tracked on BOTH neutral luminance Y and the
+    # active channel's balance — whichever has the larger normalized slope binds. ---
+    slope_z: float = 2.0            # |slope|/SE(slope) ≤ this ⇒ flat-in-noise; ≳ this ⇒ directional
+    converge_blocks: int = 2        # consecutive flat operating blocks ⇒ converged
+    fast_op_blocks: int = 3         # operating-load blocks needed to land when NOT recently soaked
+    # SELF-CALIBRATION of the read-noise the slope SE is keyed to. ``drift_sigma_mult``/``drift_floor``
+    # still derive the reported balance ``drift_threshold`` descriptor and floor the balance σ; the
+    # luminance σ floors at a small fraction of the commanded ref level (Y is in nits, not a ratio). ---
+    drift_sigma_mult: float = 3.0   # balance drift_threshold = max(drift_floor, mult × balance σ)
+    drift_floor: float = 0.003      # balance threshold floor when balance_noise is tiny/unknown
+    y_rel_floor: float = 0.004      # luminance σ floor as a fraction of the commanded ref nits
+    net_gross_ratio: float = 0.5    # DESCRIPTOR ONLY now: net/gross ≥ this ⇒ directional (regime label)
+    fluct_gross_mult: float = 5.0   # operating-window peak-to-peak > mult × threshold ⇒ a large oscillation,
+    #   not a settled point — blocks the clean 'converged' exit even when the slope is momentarily flat
+    #   (a triangle wave is slope-zero at its turning points). A small content-driven wobble passes.
+    # SOAK TRIGGER is the symmetric negation of convergence (directional-beyond-noise in the warm-in
+    # direction) with DEBOUNCE so one noisy block can never soak, and a re-soak rate limit so a
+    # cooled-then-jittered panel doesn't saw-tooth. ---
+    soak_debounce: int = 2          # consecutive directional warm-in blocks before the FIRST soak
+    resoak_cooldown: int = 3        # blocks since the last soak before another soak may fire
+    # BUDGET (flag-don't-cap): a settled panel must converge inside ``min_budget_blocks``; a panel
+    # that genuinely soaks earns ``warm_budget_blocks`` more from the soak onset. Exceeding the budget
+    # is NOT a silent cap or glide — it emits a directional-vs-non-directional evidence packet and
+    # PROCEEDS with needs_adjudication (the LLM/user decides). ``max_blocks`` is the hard backstop. ---
+    min_budget_blocks: int = 12     # a settled panel converges well inside this (no soak)
+    warm_budget_blocks: int = 40    # extra blocks granted from soak onset for a real warm-in + landing
+    max_blocks: int = 60            # hard backstop; exceeding it FLAGS (never a silent cap)
     peak_nits: Optional[float] = None  # clamp scaled luminance here (None ⇒ transfer/display ceiling)
     # reference-read sanity (catch a frozen / wrong display or a dislodged meter) ---
     ref_sanity_low: float = 0.33    # measured ref nits below this × commanded ⇒ implausible
@@ -188,10 +262,13 @@ class ThermalController:
         return MeasurePatch(label="thermal_ref", rgb=rgb_t, signal=sig,
                             role="neutral_ref", bit_depth=self.transfer.bit_depth)
 
-    def _read_ref(self) -> tuple[Optional[dict[Channel, float]], list[dict[Channel, float]]]:
+    def _read_ref(self) -> tuple[Optional[dict[Channel, float]], list[dict[Channel, float]],
+                                 Optional[float], list[float]]:
         """Read the fixed neutral sensor ``ref_reads`` times (back-to-back, same temperature).
-        Return the mean channel balance AND the per-read balances — the within-block scatter is
-        the read noise the threshold self-calibrates from when ``balance_noise`` isn't supplied."""
+        Return ``(mean_balance, per_read_balances, mean_Y, per_read_Y)`` — the within-block scatter
+        of BOTH tracked scalars (channel balance and luminance Y) is the read noise the per-quantity
+        slope SE self-calibrates from. Y (nits) is needed so convergence can require luminance to
+        flatten too, not just balance (a uniform warm-in moves Y while balance stays put)."""
         ref = self._ref_patch()
         xyzs = []
         for _ in range(max(1, self.cfg.ref_reads)):
@@ -199,20 +276,26 @@ class ThermalController:
             if r.xyz is not None:
                 xyzs.append(r.xyz)
         if not xyzs:
-            return None, []
+            return None, [], None, []
         n = len(xyzs)
         mean = (sum(v[0] for v in xyzs) / n, sum(v[1] for v in xyzs) / n, sum(v[2] for v in xyzs) / n)
+        per_read_y = [v[1] for v in xyzs]
         # carry absolute ref nits for the digest via attribute side-channel
         self._last_ref_nits = mean[1]
-        return normalized_channels(mean), [normalized_channels(v) for v in xyzs]
+        return normalized_channels(mean), [normalized_channels(v) for v in xyzs], mean[1], per_read_y
 
     # -- the closed loop --------------------------------------------------
     def run(self) -> ThermalResult:
         cfg = self.cfg
-        threshold = max(cfg.drift_floor,
-                        cfg.drift_sigma_mult * self.balance_noise) if self.balance_noise else cfg.drift_floor
-        noise_blocks: list[float] = []                    # within-block ref-read scatter (self-calibration)
+        n_ref = max(1, cfg.ref_reads)
+        sigma_floor_bal = cfg.drift_floor / cfg.drift_sigma_mult   # block-mean balance σ never below this
+        threshold = cfg.drift_floor                                # reported balance descriptor (set per block)
+        sigma_bal = sigma_floor_bal
+        sigma_y = cfg.y_rel_floor * (self.ref_nits or 1.0)
+        noise_bal: list[float] = []                       # within-block balance read scatter (self-calibration)
+        noise_y: list[float] = []                         # within-block luminance read scatter
         history: list[dict[Channel, float]] = []          # ref channel balance per block
+        ref_y_hist: list[float] = []                      # ref luminance (nits) per block — the 2nd tracked scalar
         first_bal: Optional[dict[Channel, float]] = None
         k = 1.0      # start at operating load; the loop raises k to SOAK only when it MEASURES warm-in
         in_band = 0
@@ -229,15 +312,24 @@ class ThermalController:
         sane_violations = 0
         compromised = False
         self._last_ref_nits = None
-        # --- landing / protection / baseline-shadow state ---
+        # --- soak debounce / decaying landing latch / protection / baseline-shadow state ---
         op_balances: list[dict[Channel, float]] = []   # ref balances measured under OPERATING load (k≈1)
+        op_ref_y: list[float] = []                      # ref luminance measured under OPERATING load
         op_streak = 0                                   # consecutive operating-load blocks (the landing gate)
-        did_soak = False                                # a SOAK overshoot happened ⇒ require a landing window
+        did_soak = False                                # a SOAK overshoot ever happened (digest/τ)
+        blocks_since_soak = cfg.resoak_cooldown         # DECAYING latch (no permanent did_soak penalty):
+        #   the full-window landing requirement applies only while this < window_blocks (overshoot still
+        #   in the evaluation window); after that the fast path resumes. Starts high so the cooldown
+        #   gate doesn't block the very first soak.
+        directional_streak = 0                          # consecutive directional warm-in blocks (soak debounce)
         ref_op_baseline: Optional[float] = None         # the reference luminance at operating load (ABL anchor)
         protection_hits = 0
         protection_limited = False
         baseline_distance: Optional[float] = None       # first operating read's distance to warm_baseline (shadow)
         emitted_cats: set[str] = set()                  # state-transition digest events emitted (once each)
+        soft_budget = cfg.min_budget_blocks             # a SETTLED panel must converge inside this; a real
+        #   soak earns warm_budget_blocks more from its onset. Exceeding it FLAGS (never a silent cap).
+        budget_exhausted = False
 
         while block < cfg.max_blocks:
             block += 1
@@ -248,8 +340,8 @@ class ThermalController:
                 self.measure(self._scaled(self.content[ci % len(self.content)], load_k))
                 ci += 1
                 content_reads += 1
-            # --- PROBE: the fixed neutral warm-in sensor ---
-            bal, per_read = self._read_ref()
+            # --- PROBE: the fixed neutral warm-in sensor (balance AND luminance) ---
+            bal, per_read, y_mean, per_read_y = self._read_ref()
             now = self.clock()
             if t0 is None:
                 t0 = now
@@ -259,6 +351,25 @@ class ThermalController:
             if first_bal is None:
                 first_bal = bal
             history.append(bal)
+            ref_y_hist.append(y_mean if y_mean is not None else 0.0)
+            blocks_since_soak += 1
+            # Self-calibrate the per-quantity read noise the slope SE is keyed to, from the within-block
+            # back-to-back scatter (the read-noise at a fixed temperature) divided by √n (SE-of-the-mean,
+            # per the project dark-noise-trust convention) — so the gate is keyed to THIS panel+meter,
+            # never a hardcoded constant. ``balance_noise``, when the DIP supplies it, is already a
+            # block-scale figure (≈ recommended_drift_threshold/3) so it's used directly.
+            if self.balance_noise is not None:
+                sigma_bal = max(self.balance_noise, sigma_floor_bal)
+            elif len(per_read) >= 2:
+                noise_bal.append(max(_pstd([b[ch] for b in per_read]) for ch in CHANNELS))
+                sigma_bal = max((sum(noise_bal) / len(noise_bal)) / math.sqrt(n_ref), sigma_floor_bal)
+            threshold = cfg.drift_sigma_mult * sigma_bal          # reported balance drift_threshold descriptor
+            y_floor = cfg.y_rel_floor * (self.ref_nits or (self._last_ref_nits or 1.0))
+            if len(per_read_y) >= 2:
+                noise_y.append(_pstd(per_read_y))
+                sigma_y = max((sum(noise_y) / len(noise_y)) / math.sqrt(n_ref), y_floor)
+            else:
+                sigma_y = y_floor
             # SANITY: the reference read luminance must be plausibly near the COMMANDED ref level.
             # A wild mismatch (e.g. reading 1156 nits when we asked for ~92) means the display/meter
             # is compromised — a frozen patch (D3D render hang), a wrong colorspace, or a dislodged
@@ -279,21 +390,13 @@ class ThermalController:
                         break
                 else:
                     sane_violations = 0
-            # Self-calibrate the threshold from the within-block read scatter (read noise at a
-            # fixed temperature) when no balance_noise was supplied — so the gate is keyed to THIS
-            # panel+meter's noise, never a hardcoded constant. Estimated once, after a couple blocks.
-            if self.balance_noise is None and len(per_read) >= 2:
-                block_sigma = max(_pstd([b[ch] for b in per_read]) for ch in CHANNELS)
-                noise_blocks.append(block_sigma)
-                if len(noise_blocks) == 2:
-                    est = sum(noise_blocks) / len(noise_blocks)
-                    threshold = max(cfg.drift_floor, cfg.drift_sigma_mult * est)
             # Operating-load bookkeeping (the landing gate): a block whose LOAD ran at operating
             # level (k≈1) contributes to convergence; soak/glide blocks do not (their probe carries
             # the overshoot transient). op_streak is the run of consecutive operating-load blocks.
             if load_operating:
                 op_streak += 1
                 op_balances.append(bal)
+                op_ref_y.append(self._last_ref_nits if self._last_ref_nits else 0.0)
                 if ref_op_baseline is None and self._last_ref_nits:
                     ref_op_baseline = self._last_ref_nits     # the reference luminance at operating load
                 # SHADOW (Phase 1): how far is the first operating read from a validated warm
@@ -316,53 +419,68 @@ class ThermalController:
                 else:
                     protection_hits = 0
             window = history[-cfg.window_blocks:]
-            # net/gross per channel over the window; the active channel is the biggest mover.
+            # The active channel is the biggest mover over the window (net/gross kept as the regime
+            # DESCRIPTOR + dashboard tick — NOT the convergence gate any more).
             net_active = gross_active = 0.0
             ratio = None
             active = None
             if len(window) >= 2:
                 best_gross = -1.0
                 for ch in CHANNELS:
-                    series = [b[ch] for b in window]
-                    net, gross, r = net_over_gross(series)
+                    net, gross, r = net_over_gross([b[ch] for b in window])
                     if gross > best_gross:
                         best_gross, active = gross, ch
                         net_active, gross_active, ratio = net, gross, r
-            # --- CONTROLLER: SOAK while we MEASURE warm-in (the active channel still rising,
-            #     directional), else GLIDE toward operating load and converge. Direction-aware:
-            #     a panel COOLING past the operating equilibrium (signed_net < 0) is NOT warming,
-            #     so it glides/settles instead of re-soaking (no sawtooth, no over-heating). The
-            #     warm-in direction = active (cold) channel rising; if a panel drifts the other
-            #     way we simply never soak and fall back to plain warm-by-waiting (fails safe). ---
-            signed_net = (window[-1][active] - window[0][active]) if (active and len(window) >= 2) else 0.0
-            warming = (ratio is not None and ratio >= cfg.net_gross_ratio
-                       and net_active > threshold and signed_net > 0.0)
-            if warming:
+            # --- SOAK TRIGGER = directional warm-in BEYOND read noise (slope-vs-noise on the active
+            #     channel's balance OR the neutral luminance), with DEBOUNCE so one noisy block can
+            #     never soak, and a re-soak cooldown so a cooled-then-jittered panel can't saw-tooth.
+            #     Direction-aware: only the warm-in direction (cold channel / luminance RISING) soaks;
+            #     a cooling panel glides + settles (the slope gate rejects the cooling transient too). ---
+            bal_series = [b[active] for b in window] if active else []
+            _, _, z_bal, disp_bal = _slope_stats(bal_series, sigma_bal)
+            _, _, z_y, disp_y = _slope_stats(ref_y_hist[-cfg.window_blocks:], sigma_y)
+            warm_bal = (z_bal >= cfg.slope_z and disp_bal > 0.0)
+            warm_y = (z_y >= cfg.slope_z and disp_y > 0.0)
+            warming_signal = warm_bal or warm_y
+            directional_streak = directional_streak + 1 if warming_signal else 0
+            can_soak = (directional_streak >= cfg.soak_debounce
+                        and (not did_soak or blocks_since_soak >= cfg.resoak_cooldown))
+            if warming_signal and can_soak:
                 k = cfg.k_start                                     # SOAK: inject heat
                 in_band = 0
                 did_soak = True
+                blocks_since_soak = 0
+                soft_budget = min(cfg.max_blocks, block + cfg.warm_budget_blocks)   # earn warm-in budget
                 state = "soak"
             else:
                 k = 1.0 + (k - 1.0) * cfg.k_decay                   # GLIDE toward operating load
                 state = "glide"
-            # LANDING-gated convergence: judge settling on a block that RAN at operating load
-            # (so its probe reflects the sustained load), over an operating window. Once we've
-            # soaked, require a FULL window of operating-load blocks (overshoot flushed out) so
-            # cooling-from-overshoot can't masquerade as flat; a never-soaked panel keeps the
-            # fast path (a couple of operating blocks suffice).
-            min_window = cfg.window_blocks if did_soak else min(cfg.window_blocks, 2)
-            in_band_now = (load_operating and op_streak >= min_window
-                           and len(window) >= min(cfg.window_blocks, 2) and net_active <= threshold)
-            if in_band_now:
+            # --- CONVERGENCE = zero-slope-within-self-calibrated-read-noise on BOTH luminance AND the
+            #     active channel's balance, judged over OPERATING-load reads only (the soak/glide probes,
+            #     which carry the overshoot/cooling transient, never enter this window). The DECAYING
+            #     landing latch requires a full operating window only while the overshoot is still in
+            #     range (blocks_since_soak < window); a never-soaked / long-settled panel keeps the fast
+            #     path. ABL drops luminance from the gate (balance-only) when the reference dimmed. ---
+            recently_soaked = did_soak and blocks_since_soak < cfg.window_blocks
+            min_op = cfg.window_blocks if recently_soaked else min(cfg.window_blocks, cfg.fast_op_blocks)
+            converged_now = False
+            if load_operating and op_streak >= min_op and len(op_balances) >= 3 and active:
+                ob_series = [b[active] for b in op_balances[-cfg.window_blocks:]]
+                _, _, ob_z, _ = _slope_stats(ob_series, sigma_bal)
+                _, _, oy_z, _ = _slope_stats(op_ref_y[-cfg.window_blocks:], sigma_y)
+                envelope_op = max(ob_series) - min(ob_series)             # peak-to-peak amplitude
+                bal_flat = ob_z <= cfg.slope_z
+                y_flat = (oy_z <= cfg.slope_z) or protection_limited      # ABL ⇒ balance-only gate
+                bounded = envelope_op <= cfg.fluct_gross_mult * threshold # not a large oscillation
+                converged_now = bal_flat and y_flat and bounded
+            if converged_now:
                 in_band += 1
                 state = f"in-band x{in_band}"
             elif load_operating:
                 in_band = 0
             if in_band >= cfg.converge_blocks:
                 converged = True
-                # flat vs wandering: gross small ⇒ convergent, gross large ⇒ fluctuating
-                regime = ("fluctuating" if gross_active > cfg.fluct_gross_mult * threshold
-                          else "convergent")
+                regime = "convergent"                                # the gate already required not-wandering
                 state = f"CONVERGED:{regime}"
             self._block_record(block, load_k, net_active, gross_active, ratio, threshold, active, state,
                                op_streak=op_streak, did_soak=did_soak,
@@ -381,6 +499,11 @@ class ThermalController:
                                   net=round(net_active, 5), threshold=round(threshold, 6),
                                   active_channel=active, op_streak=op_streak)
             if converged:
+                break
+            # BUDGET (flag-don't-cap): out of budget without convergence — break and let the post-loop
+            # hand the LLM a directional-vs-non-directional evidence packet. Never a silent cap/glide.
+            if block >= soft_budget:
+                budget_exhausted = True
                 break
 
         minutes = round((self.clock() - t0) / 60.0, 4) if t0 is not None else 0.0
@@ -404,33 +527,46 @@ class ThermalController:
             for ch in CHANNELS:
                 vals = [b[ch] for b in win]
                 envelope = max(envelope, max(vals) - min(vals))
-        # The converged OPERATING-load balance — a validated 'this is warm' fingerprint a later
-        # calibration run compares a live read against (Phase-2 fast-path). Mean of the last
-        # operating-load reads so a single noisy read can't define it; only meaningful once
-        # operating-load equilibrium was actually reached (converged or a bounded fluctuating wander).
-        warm_balance: Optional[dict[Channel, float]] = None
-        if op_balances and (converged or regime == "fluctuating"):
-            owin = op_balances[-cfg.window_blocks:]
-            warm_balance = {ch: round(sum(b[ch] for b in owin) / len(owin), 6) for ch in CHANNELS}
+        # BUDGET CLASSIFICATION (when not converged): is the residual motion DIRECTIONAL (still
+        # warming/cooling — a real ramp the budget cut short) or NON-DIRECTIONAL (settled-but-noisy —
+        # a stationary wander)? This is the slope-vs-noise verdict on the FINAL window of the tracked
+        # scalars, judged on operating-load reads when we have them. It drives the regime AND the kind
+        # of evidence packet the LLM/user adjudicates: directional ⇒ warm longer / accept a moving
+        # target; non-directional ⇒ proceeding warm is safe (freeze the warm balance).
+        fin_bal = (op_balances or history)[-cfg.window_blocks:]
+        fin_y = (op_ref_y or ref_y_hist)[-cfg.window_blocks:]
+        _, _, fz_bal, _ = _slope_stats([b[active] for b in fin_bal], sigma_bal) if active else (0.0, 0.0, 0.0, 0.0)
+        _, _, fz_y, _ = _slope_stats(fin_y, sigma_y)
+        directional = (fz_bal >= cfg.slope_z) or (fz_y >= cfg.slope_z and not protection_limited)
         if compromised:
             regime = "compromised"          # the display/meter was bad — the regime is unknowable
         elif not converged:
-            regime = "fluctuating" if (ratio is not None and ratio < cfg.net_gross_ratio) else "warming"
-        # Flag by regime, NOT just by (non-)convergence: a fluctuating panel that "converges" (a
-        # bounded wander) is the fluctuating STEADY STATE and still needs the maintain-load strategy,
-        # so it's surfaced too. A convergent panel is clean (no flag). A COMPROMISED run already has
-        # its flag from the loop — don't double-flag it as a (meaningless) regime.
-        if not compromised:
-            if regime == "fluctuating":
+            regime = "warming" if directional else "fluctuating"
+        # The converged / settled OPERATING-load balance — a validated 'this is warm' fingerprint a
+        # later calibration run compares a live read against (Phase-2 fast-path). Mean of the last
+        # operating-load reads so a single noisy read can't define it. Frozen only when the panel is
+        # genuinely settled (converged, or NON-directional at budget) — never while still ramping.
+        warm_balance: Optional[dict[Channel, float]] = None
+        if op_balances and not compromised and (converged or not directional):
+            owin = op_balances[-cfg.window_blocks:]
+            warm_balance = {ch: round(sum(b[ch] for b in owin) / len(owin), 6) for ch in CHANNELS}
+        # Flag by regime, NOT just by (non-)convergence: a convergent panel is clean (no flag). A
+        # COMPROMISED run already has its flag from the loop. The budget-exhausted packet carries the
+        # directional verdict so the LLM knows whether to warm longer or proceed-warm.
+        if not compromised and not converged:
+            if directional:   # warming — a real ramp the budget cut short
                 flags.append(
-                    f"panel never reaches a steady temperature (net/gross {ratio}, residual band "
-                    f"{round(envelope, 5)}) — thermally DYNAMIC: calibrate by maintaining a consistent "
-                    "thermal load (golden-ratio order) + aggressive drift checks, not by warming to a target")
-            elif not converged:   # warming
+                    f"panel did not thermally converge within the {soft_budget}-block budget — still "
+                    f"warming: DIRECTIONAL drift in progress (active {active} slope z={fz_bal:.1f}, "
+                    f"luminance z={fz_y:.1f} vs cutoff {cfg.slope_z}); warm longer / inject more heat, "
+                    "or accept calibrating against a moving target")
+            else:             # fluctuating — settled but noisy (stationary wander, no steady point)
                 flags.append(
-                    f"panel did not thermally converge within {cfg.max_blocks} blocks "
-                    f"(net {net_active:.4f} vs threshold {threshold:.4f}) — still warming; "
-                    "warm longer / inject more heat")
+                    f"panel settled but NOISY at the {soft_budget}-block budget with NO directional drift "
+                    f"(active {active} slope z={fz_bal:.1f}, luminance z={fz_y:.1f}; residual band "
+                    f"{round(envelope, 5)}) — thermally DYNAMIC: proceeding warm is safe, but it never "
+                    "reaches a steady temperature, so maintain a consistent load (golden-ratio order) + "
+                    "aggressive drift checks rather than warming to a target")
         # A first-order estimate of the panel's thermal time constant in content-read (≈ measurement-
         # patch) units: warm-in took ~(block − converge_blocks) blocks before it confirmed in-band,
         # and a first-order system settles in ~3τ, so τ ≈ warm-in reads / 3. Only meaningful when a
@@ -462,6 +598,12 @@ class ThermalController:
             "protection_limited": protection_limited, "reason": reason,
             "warm_balance": warm_balance,
             "baseline_distance": (round(baseline_distance, 6) if baseline_distance is not None else None),
+            # slope-vs-noise evidence the LLM adjudicates at the budget boundary (directional ⇒ warm
+            # longer; non-directional ⇒ proceed-warm safe). z-ratios are |slope|/SE on the final window.
+            "directional": (False if converged else directional),
+            "balance_slope_z": round(fz_bal, 2), "luminance_slope_z": round(fz_y, 2),
+            "slope_z_cutoff": cfg.slope_z, "luminance_sigma": round(sigma_y, 5),
+            "budget_blocks": soft_budget, "budget_exhausted": budget_exhausted,
         }
         if self.event is not None:
             self.event("INFO" if (converged and not compromised and not protection_limited) else "WARN",

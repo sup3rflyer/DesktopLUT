@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from dlc.drift import normalized_channels
@@ -262,20 +264,132 @@ def test_protection_limited_flagged_when_reference_dims_under_soak():
     DIMS below its operating baseline — active limiting, not injected heat. The flatness that follows
     must NOT read as convergence; flag it with a PROTECTION reason instead."""
     transfer = Transfer.power(gamma=2.2, peak_nits=1000.0)   # headroom so the soak drives above operating
-    st = {"last_load_nits": 0.0, "n": 0}
+    st = {"block_peak_nits": 0.0, "n": 0}
 
     def measure(patch: MeasurePatch) -> Reading:
         if patch.role == "neutral_ref":
             st["n"] += 1
             warm = min(1.0, 0.85 + 0.01 * st["n"])                  # a directional warm-in ⇒ the loop soaks
-            dim = 0.6 if st["last_load_nits"] > 150.0 else 1.0      # ABL: dim the ref under heavy soak load
+            # ABL: the backlight tracks the block's PEAK demand (the max-channel-grey soak rationale),
+            # so the reference dims whenever this block's heaviest load ran hot — not just if the very
+            # last content read happened to be bright. Reset the peak after the (end-of-block) ref read.
+            dim = 0.6 if st["block_peak_nits"] > 150.0 else 1.0
+            st["block_peak_nits"] = 0.0
             return Reading(xyz=tuple(c * 60.0 * dim for c in _xyz_for_linear_rgb(1.0, 1.0, warm)))
-        st["last_load_nits"] = transfer.cv_to_nits(max(patch.rgb))  # the (scaled) load drive in nits
+        st["block_peak_nits"] = max(st["block_peak_nits"], transfer.cv_to_nits(max(patch.rgb)))
         return Reading(xyz=tuple(c * 30.0 for c in _xyz_for_linear_rgb(1.0, 1.0, 1.0)))
 
     res = _controller(measure, transfer, max_blocks=30).run()
     assert res.protection_limited is True
     assert res.reason == "protection_limited" or any("limiting" in f for f in res.flags)
+
+
+# ----------------------------------------------------- generalized slope-vs-noise gate (redesign)
+def test_settled_panel_with_quantized_noise_converges_without_soaking():
+    """REGRESSION (HW 2026-06-24): a thermally-SETTLED panel — luminance dead-flat, only the channel
+    balance dithering ±1 LSB of quantized read noise — must converge FAST with ZERO soaks. The old
+    gate (net ≤ 3×balance_noise, sitting on the noise floor) chased that dither as phantom warm-in,
+    false-soaked, and limit-cycled to the 240-block bound. The slope-vs-noise gate sees a zero slope
+    within read noise and lands immediately."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    st = {"n": 0}
+
+    def settled(patch: MeasurePatch) -> Reading:
+        if patch.role == "neutral_ref":
+            n = st["n"]; st["n"] += 1
+            # Flat luminance; blue balance dithers over {-,0,+} 1 LSB — mean-reverting, non-monotone,
+            # so |net| over any window stays in the noise band but is never a directional ramp.
+            blue = 0.90 + 0.001 * (((n * 7) % 3) - 1)
+            return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, blue)))
+        return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, 0.90)))
+
+    rows = []
+    clock = _Clock()
+
+    def measure(patch: MeasurePatch) -> Reading:
+        clock.tick(); return settled(patch)
+
+    cfg = ThermalConfig(load_reads_per_block=8, window_blocks=5, max_blocks=240, drift_floor=0.003)
+    res = ThermalController(measure=measure, transfer=transfer, content=_grey_content(transfer),
+                            ref_nits=60.0, balance_noise=0.0008, config=cfg, clock=clock,
+                            emit=rows.append).run()
+    assert res.converged, res.flags
+    assert res.regime == "convergent"
+    assert res.blocks < 10, f"settled panel should land fast, took {res.blocks} blocks"
+    assert all(not r["did_soak"] for r in rows), "a settled panel must never soak"
+    assert not any(str(r["state"]).startswith("soak") for r in rows)
+
+
+def test_uniform_warmin_waits_for_luminance_to_flatten():
+    """A panel that warms in UNIFORMLY — luminance ramps while the channel balance never moves — must
+    NOT be called converged while the luminance is still climbing. This is what a balance-only gate
+    (the pre-redesign behaviour) gets wrong: balance is flat from block 1, so it would converge early.
+    The two-quantity slope gate waits for Y to flatten, so it takes materially longer than the same
+    panel with Y already flat."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+
+    def make(ramp: bool):
+        st = {"n": 0}
+
+        def measure(patch: MeasurePatch) -> Reading:
+            if patch.role == "neutral_ref":
+                n = st["n"]; st["n"] += 1
+                # Y rises from ~0.78× toward 1.0× of the 60-nit reference (exp warm-in); balance fixed.
+                gain = (1.0 - 0.22 * math.exp(-n / 8.0)) if ramp else 1.0
+                return Reading(xyz=tuple(c * 60.0 * gain for c in _xyz_for_linear_rgb(1.0, 1.0, 0.90)))
+            return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, 0.90)))
+        return measure
+
+    flat_res = _controller(make(ramp=False), transfer, max_blocks=240).run()
+    ramp_res = _controller(make(ramp=True), transfer, max_blocks=240).run()
+    assert flat_res.converged and ramp_res.converged, (flat_res.flags, ramp_res.flags)
+    # The luminance ramp must delay convergence — proof Y participates in the gate.
+    assert ramp_res.blocks > flat_res.blocks + 2, (ramp_res.blocks, flat_res.blocks)
+
+
+def test_budget_exhaustion_flags_directional_vs_nondirectional():
+    """Flag-don't-cap at the budget boundary: a panel that never settles within budget is NOT silently
+    capped — it returns needs_adjudication with a directional-vs-non-directional verdict the LLM judges.
+    A genuinely-cold (still-ramping) panel reads DIRECTIONAL → warming; a noisy-but-stationary panel
+    reads NON-DIRECTIONAL → fluctuating (and freezes its warm balance)."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    st = {"n": 0}
+
+    def never_settles(patch: MeasurePatch) -> Reading:
+        # Monotone blue ramp that outruns the budget — always directional, never flat.
+        if patch.role == "neutral_ref":
+            n = st["n"]; st["n"] += 1
+            blue = min(1.5, 0.80 + 0.01 * n)
+            return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, blue)))
+        return Reading(xyz=tuple(c * 60.0 for c in _xyz_for_linear_rgb(1.0, 1.0, 0.90)))
+
+    res = _controller(never_settles, transfer, max_blocks=14).run()
+    assert not res.converged
+    assert res.needs_adjudication and res.flags
+    assert res.regime == "warming"
+    assert res.digest["directional"] is True
+    assert res.digest["budget_exhausted"] is True
+
+
+def test_soak_and_convergence_never_fire_in_the_same_block():
+    """Property: the soak trigger (directional) and the convergence landing (flat) are exclusive — no
+    block record may be both a soak and a CONVERGED, on any panel."""
+    transfer = Transfer.power(gamma=2.2, peak_nits=120.0)
+    panel = SyntheticPanel(transfer=transfer, white_nits=120.0, cold_blue_gain=0.85,
+                           load_thermal=True, thermal_rate=0.06, start_temp=0.0)
+    rows = []
+    clock = _Clock()
+
+    def measure(patch: MeasurePatch) -> Reading:
+        clock.tick(); return panel(patch)
+
+    ThermalController(measure=measure, transfer=transfer, content=_grey_content(transfer),
+                      ref_nits=60.0, balance_noise=0.0008,
+                      config=ThermalConfig(load_reads_per_block=8, max_blocks=240), clock=clock,
+                      emit=rows.append).run()
+    for r in rows:
+        s = str(r["state"])
+        assert not (s.startswith("soak") and "CONVERGED" in s)
 
 
 def test_load_thermal_synthetic_heats_with_load():
