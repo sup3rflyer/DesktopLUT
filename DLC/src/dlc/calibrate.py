@@ -3007,8 +3007,9 @@ class Calibration:
         except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
             return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
 
-    def stage_refine_mhc_grayscale(self, *, max_rounds: int = 3, target_de: float = 0.5,
-                                   min_improvement: float = 0.1, regress_tol: float = 0.3
+    def stage_refine_mhc_grayscale(self, *, target_de: float = 0.5,
+                                   min_improvement: float = 0.1, regress_tol: float = 0.3,
+                                   floor_patience: int = 2, safety_max_rounds: int = 40
                                    ) -> StageOutcome:
         """Closed-loop grayscale refine of the **SDR** MHC ``correctionGrayscale`` toward STANDALONE D65.
 
@@ -3020,12 +3021,16 @@ class Calibration:
         tone, this loop owns the per-level non-additivity residual) — independent of the 3D LUT
         (see [[sdr-violates-1plus1plus1-hdr-upholds]] / [[dlc-corrections-stack-independently]]).
 
-        Per the DESIGN LAW the convergence FLOOR (no further improvement, or below the panel-limited
-        ``target_de``) is a deterministic stop the spine owns; each round emits a NON-BLOCKING check-in
-        the LLM consumes from the running spine; the FINAL acceptance is the verify seam. A REGRESSION
-        (a refine made grey worse) reverts to the best measured deviations and raises a seam for the LLM.
-        SDR only; HDR uses the base-cube refine. The mock panel ignores the installed correction, so sim
-        proves WIRING + math only — HW convergence validation is pending a live SDR run on monitor 0.
+        **No arbitrary round cap (DESIGN LAW).** The loop runs until it reaches the panel's *physical
+        floor* — it converges to ``target_de`` OR stops improving beyond measurement noise for
+        ``floor_patience`` consecutive rounds (a single noisy sub-``min_improvement`` step is NOT the
+        floor). A REGRESSION (a refine made grey worse than ``regress_tol``) reverts to the best measured
+        deviations and raises a seam for the LLM. ``safety_max_rounds`` is a backstop for a pathological
+        non-converging panel: it does NOT silently cap — it reverts to best and raises a seam so the LLM
+        adjudicates (accept the best foundation, or recheck the panel). Each round emits a NON-BLOCKING
+        check-in the LLM consumes from the running spine (and may cancel via ``control.json``); the FINAL
+        acceptance is the verify seam. SDR only; HDR uses the base-cube refine. The mock panel ignores the
+        installed correction, so sim proves WIRING + math only.
         """
         def run() -> StageOutcome:
             spec = self._spec()
@@ -3071,8 +3076,11 @@ class Calibration:
             installed_points, installed_dev = grid, ident      # currently applied correctionGrayscale
             best_points, best_dev, best_avg = grid, ident, float("inf")
             flags: dict[str, bool] = {}
+            floor_streak = 0           # consecutive rounds with sub-noise improvement (→ monitor floor)
 
-            for rnd in range(1, max_rounds + 1):
+            rnd = 0
+            while True:
+                rnd += 1
                 res = self._measure_set(self._neutral_patches(), role=f"refine{rnd}",
                                         ti3_name=f"refine_{rnd}.ti3",
                                         ndjson_name=f"refine_{rnd}.ndjson")
@@ -3102,22 +3110,32 @@ class Calibration:
                 if de["avg"] < best_avg:
                     best_avg, best_dev, best_points = de["avg"], installed_dev, installed_points
 
-                # --- deterministic stop conditions (the spine owns these). Each just sets a flag +
-                # breaks; the UNIFIED best-revert below leaves the best measured deviations installed
-                # on EVERY exit — so a within-tolerance uptick that doesn't trip the regression gate
-                # (floored/converged/budget) can't strand a worse-than-best (even worse-than-identity)
-                # correction (round 1 always measures identity, so best is identity-or-better). ---
+                # --- stop conditions. The loop runs to the PANEL'S PHYSICAL FLOOR, not an arbitrary
+                # round count (DESIGN LAW: adapt until the monitor can give no more). Each just sets a
+                # flag + breaks; the UNIFIED best-revert below leaves the best measured deviations
+                # installed on EVERY exit — so a within-tolerance uptick that doesn't trip the regression
+                # gate can't strand a worse-than-best (even worse-than-identity) correction (round 1
+                # always measures identity, so best is identity-or-better). ---
                 if len(scores) >= 2 and scores[-1] > scores[-2] + regress_tol:
-                    flags["regressed"] = True
+                    flags["regressed"] = True            # a round made grey WORSE → revert + LLM seam
                     break
                 if de["avg"] <= target_de:
-                    flags["converged"] = True
+                    flags["converged"] = True            # reached the panel-limited target
                     break
+                # Monitor floor: improvement has fallen below measurement noise. Require it to hold for
+                # `floor_patience` consecutive rounds so a single noisy sub-threshold step (or a tiny
+                # within-tolerance uptick) doesn't end convergence prematurely.
                 if len(scores) >= 2 and (scores[-2] - scores[-1]) < min_improvement:
-                    flags["floored"] = True
-                    break
-                if rnd == max_rounds:
-                    flags["budget_limited"] = True
+                    floor_streak += 1
+                    if floor_streak >= floor_patience:
+                        flags["floored"] = True
+                        break
+                else:
+                    floor_streak = 0
+                # Backstop for a pathological non-converging panel: NOT a silent cap — revert to best and
+                # raise a seam (handled after the stage) so the LLM adjudicates rather than the code.
+                if rnd >= safety_max_rounds:
+                    flags["safety_ceiling"] = True
                     break
 
                 # --- one refine step toward D65 at the post-matrix abscissa, then reinstall ---
@@ -3166,6 +3184,7 @@ class Calibration:
             return StageOutcome("refine-mhc-grayscale", "done", digest=digest,
                                 data={"rounds": len(rounds_log),
                                       "regressed": bool(flags.get("regressed")),
+                                      "safety_ceiling": bool(flags.get("safety_ceiling")),
                                       "final_avg": final_avg})
 
         outcome = self._stage("refine-mhc-grayscale", run)
@@ -3178,6 +3197,18 @@ class Calibration:
                 question=("the SDR closed-loop grayscale refine regressed (a round made grey worse); "
                           "the best measured correctionGrayscale was restored — accept it, or recheck "
                           "the panel?"),
+                options=("accept", "abort"), recommendation="accept",
+                digest=outcome.digest))
+        elif outcome.data.get("safety_ceiling"):
+            # The backstop fired: many rounds without reaching the floor or target (a pathological /
+            # unstable panel). NOT silently capped — the best measured deviations are installed and the
+            # LLM decides whether that foundation is good enough or the panel needs a recheck.
+            self.adjudicate(AdjudicationRequest(
+                key="refine-mhc-grayscale:safety-ceiling", seam=SEAM_OPTIMIZE,
+                stage="refine-mhc-grayscale",
+                question=(f"the SDR grayscale refine ran {safety_max_rounds} rounds without reaching the "
+                          "monitor floor or the target — the best measured correctionGrayscale is "
+                          "installed; accept it, or recheck the panel?"),
                 options=("accept", "abort"), recommendation="accept",
                 digest=outcome.digest))
         return outcome

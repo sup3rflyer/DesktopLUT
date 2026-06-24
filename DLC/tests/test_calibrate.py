@@ -683,12 +683,15 @@ def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
     sentinel = {ch: [1.5] * 32 for ch in ("r", "g", "b")}     # recognisably non-identity mid-loop install
     monkeypatch.setattr(mc, "refine_sdr_grayscale",
                         lambda *a, **k: ([j / 31 for j in range(32)], sentinel))
-    scripted = iter([{"avg": 1.0, "max": 1.5, "n": 5, "gamma_err_pct": 1.0},   # round1 > target → refine
-                     {"avg": 1.2, "max": 1.8, "n": 5, "gamma_err_pct": 1.0}])  # round2 uptick → floored
+    # No arbitrary round cap: the monitor floor needs the improvement to stay below `min_improvement`
+    # for floor_patience (=2) consecutive rounds, so a single sub-threshold step doesn't end early.
+    scripted = iter([{"avg": 1.0, "max": 1.5, "n": 5, "gamma_err_pct": 1.0},    # round1 > target → refine
+                     {"avg": 1.2, "max": 1.8, "n": 5, "gamma_err_pct": 1.0},    # round2 uptick → streak 1
+                     {"avg": 1.25, "max": 1.85, "n": 5, "gamma_err_pct": 1.0}])  # round3 uptick → floored
     monkeypatch.setattr(calib, "_grey_de_sdr", lambda samples, white: next(scripted))
 
     out = calib.stage_refine_mhc_grayscale()
-    assert out.digest.get("floored") is True   # the within-tolerance uptick path, not 'regressed'
+    assert out.digest.get("floored") is True   # within-tolerance upticks for floor_patience rounds
     assert out.digest.get("regressed") is not True
     cg = calib._state["correction_grayscale"]
     for ch in ("r", "g", "b"):                 # reverted to identity (best), not the 1.5 sentinel
