@@ -35,6 +35,8 @@ from scipy.interpolate import RBFInterpolator
 # and wants this same scale, so a process-global set is safe here.
 colour.utilities.set_domain_range_scale("reference")
 
+# BT.2124 ΔE_ITP = 720 · ‖ΔI, ΔT, ΔP‖ (Euclidean over the ITP triplet, where T = Ct/2).
+# The 720 factor scales the result so 1.0 ≈ one JND, matching CIEDE2000's ~1.0-per-JND feel.
 DE_ITP_SCALE = 720.0
 
 

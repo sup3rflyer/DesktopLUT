@@ -240,14 +240,23 @@ class AdjudicationRequired(Exception):
 
 
 class Adjudicator(Protocol):
+    """How a seam is answered. Three implementations, selected by CLI flag — note the trap
+    that the one you want for a real run has NO flag (it's the default). See ../docs/NAMING.md §5.
+
+        CLI flag        class                   use
+        (none)          MappingAdjudicator      LIVE hardware — every seam pauses for the LLM
+        --auto          AutoAdjudicator         sim/CI rubber-stamp only
+        --supervised    SupervisedAdjudicator   benign-auto-accept (known divergence, Task #1)
+    """
+
     def adjudicate(self, request: AdjudicationRequest) -> Decision: ...
 
 
 class AutoAdjudicator:
-    """Deterministic: take the core's recommendation. **Sim/CI ONLY — never a hardware
-    run** (see the Design Law above). It consults no LLM, so using it on hardware is a
-    headless run, which by design does not exist. For a real run use ``MappingAdjudicator``
-    (every seam reaches the LLM)."""
+    """**CLI: ``--auto``.** Deterministic: take the core's recommendation. **Sim/CI ONLY —
+    never a hardware run** (see the Design Law above). It consults no LLM, so using it on
+    hardware is a headless run, which by design does not exist. For a real run use
+    ``MappingAdjudicator`` (every seam reaches the LLM)."""
 
     def adjudicate(self, request: AdjudicationRequest) -> Decision:
         return Decision(request.recommendation, note="auto: accepted core recommendation",
@@ -255,7 +264,8 @@ class AutoAdjudicator:
 
 
 class MappingAdjudicator:
-    """Answer from a decisions map; **raise** on the first un-decided seam.
+    """**CLI: the DEFAULT (neither ``--auto`` nor ``--supervised``).** Answer from a decisions
+    map; **raise** on the first un-decided seam. This is the real hardware mode.
 
     The live LLM pause/resume seam: seed it with the decisions made so far (loaded
     from the run-record on resume); the first seam without a recorded decision
@@ -271,7 +281,7 @@ class MappingAdjudicator:
 
 
 class SupervisedAdjudicator:
-    """Escalate non-benign seams to a live judge; auto-accept benign ones.
+    """**CLI: ``--supervised``.** Escalate non-benign seams to a live judge; auto-accept benign ones.
 
     **KNOWN DIVERGENCE from the Design Law (see the module header + Task #1).** This was
     conceived as the mode for an "unattended hardware run" — but per the law *there is no
@@ -617,6 +627,31 @@ class Calibration:
         self._pause_handler = pause_handler
         self.require_hardware_readiness = require_hardware_readiness
 
+        # ---- The run-record state (dlc_state.json) — the calibration's persisted memory -------
+        # Two levels. `self._state` is the top-level run-record; `self.calib` (its "calib" sub-dict)
+        # is the orchestrator's own memo store. A resume reloads this and fast-forwards over any
+        # stage whose record is present (memoisation = crash-recovery + pause/resume).
+        #
+        #   self._state (top level)                  written by
+        #     monitor / mode / bit_depth ........... this ctor (the run's fixed spec)
+        #     mhc_params ........................... build/refine MHC stages (the matrix + 1D params)
+        #     correction_grayscale ................. the D65 refine (point_count + per-channel devs)
+        #     score_history ........................ stage_score (append-only verify/intermediate scores)
+        #     refine_history ....................... refine-grayscale stage (per-round residuals)
+        #     stages_emitted ....................... _common (stage start/done log for the state tool)
+        #     calib ⌄ .............................. this orchestrator (below)
+        #
+        #   self.calib (the "calib" sub-dict)
+        #     stages ............................... {stage_key: StageOutcome.as_record()} — the memo
+        #     decisions ............................ {seam_key: Decision.as_dict()} — recorded --decide
+        #     flow / target ........................ the resolved flow name + target name
+        #     white ................................ resolve_white() result (xy + provenance)
+        #     patch_plan ........................... the approved patch plan + its fingerprint
+        #     hdr_target ........................... the resolved HDR target (peak/curve)
+        #     backup ............................... the pre-run durable settings backup (for rollback)
+        #     inplace_baseline ..................... 3dlut-only rollback baseline (prior cube_path)
+        #     adaptive_plan ........................ opt-in --adaptive-planning decision
+        #     checkin_seq .......................... monotonic check-in counter
         self._state = _common.load_dlc_state(ctx)
         self.calib: dict[str, Any] = self._state.setdefault("calib", {})
         self.calib.setdefault("stages", {})

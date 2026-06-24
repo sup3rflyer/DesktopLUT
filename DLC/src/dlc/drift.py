@@ -83,6 +83,10 @@ def xyz_to_linear_srgb(xyz: tuple[float, float, float]) -> tuple[float, float, f
 
 
 def normalized_channels(xyz: tuple[float, float, float]) -> dict[Channel, float]:
+    """A meter XYZ reading expressed as per-channel **linear-sRGB intensities normalized to the
+    peak channel** — i.e. {"R","G","B"} each in [0, 1] with the brightest = 1.0. Converts XYZ →
+    linear sRGB (clamping negatives), then divides by the peak, so it is a hue/balance fingerprint
+    independent of overall luminance (used to find the coldest channel for drift tracking)."""
     rgb = tuple(max(0.0, value) for value in xyz_to_linear_srgb(xyz))
     peak = max(rgb)
     if peak <= 0:

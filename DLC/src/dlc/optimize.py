@@ -265,7 +265,7 @@ def _classify(verify: np.ndarray, driven: np.ndarray, de: np.ndarray,
             "high_clipped": above & high_clipped}
 
 
-def _cap_indices(indices: np.ndarray, scores: np.ndarray, cap: int) -> np.ndarray:
+def _top_unique_by_score(indices: np.ndarray, scores: np.ndarray, cap: int) -> np.ndarray:
     """Keep at most ``cap`` unique indices, preferring higher-score entries."""
     unique = np.unique(indices.astype(int))
     if cap <= 0 or unique.size <= cap:
@@ -302,7 +302,7 @@ def _adaptive_probe_indices(verify: np.ndarray, scores: np.ndarray, *, iteration
 
     low = np.where(np.max(verify, axis=1) <= cfg.low_light_signal)[0]
     if low.size:
-        picks.append(_cap_indices(low, scores, cfg.adaptive_low_light_cap))
+        picks.append(_top_unique_by_score(low, scores, cfg.adaptive_low_light_cap))
 
     if cfg.adaptive_sentinels > 0:
         # Deterministic canaries across the existing thermally-ordered sequence.
@@ -310,7 +310,7 @@ def _adaptive_probe_indices(verify: np.ndarray, scores: np.ndarray, *, iteration
         picks.append(sent)
         neutral = np.where(np.max(verify, axis=1) - np.min(verify, axis=1) <= 0.015)[0]
         if neutral.size:
-            picks.append(_cap_indices(neutral, scores, max(8, cfg.adaptive_sentinels // 4)))
+            picks.append(_top_unique_by_score(neutral, scores, max(8, cfg.adaptive_sentinels // 4)))
 
     selected = np.unique(np.concatenate(picks).astype(int))
     selected.sort()  # preserve the run's thermal ordering as much as possible
