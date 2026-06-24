@@ -39,27 +39,23 @@ function fmtDur(s) {
   if (m) return `${m}m ${String(sec).padStart(2, "0")}s`;
   return `${sec}s`;
 }
-// Severity bands are metric-specific: dE_ITP/CIEDE2000 ride the familiar 1.0/2.3 JND scale,
-// but raw ΔEz (Jzazbz) lives on its own ~1e-3 native scale (bands derived from the ITP JND anchor).
-function deClass(v, metric) {
+// Every metric rides the 1≈JND scale (ΔEz is JND-normalised server-side), so one learned band set
+// applies to all: <1 imperceptible (green), <3 acceptable (yellow), ≥3 visible (red) — the common
+// calibration convention, so the user's intuition transfers unchanged across metrics.
+function deClass(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "";
   const a = Math.abs(v);
-  if (metric === "jzazbz") return a <= 0.0015 ? "de-ok" : (a <= 0.0035 ? "de-warn" : "de-bad");
-  return a <= 1.0 ? "de-ok" : (a <= 2.3 ? "de-warn" : "de-bad");
+  return a < 1.0 ? "de-ok" : (a < 3.0 ? "de-warn" : "de-bad");
 }
-function metricDecimals(metric) { return metric === "jzazbz" ? 4 : 2; }
-// setDe: scoring-block numbers keep the legacy 2-dp / JND-band rendering (always dE_ITP or
-// CIEDE2000). setDeM: a metric-aware cell for the selectable live + last-patch readouts.
-function setDe(id, v, d = 2) {
+function metricDecimals() { return 2; }   // all metrics share the JND scale → 2 dp everywhere
+// setDe: a JND-scale ΔE cell (used by both the scoring block and the selectable live/last-patch
+// readouts — they all read on the same scale now). The metric arg is accepted for call-site clarity.
+function setDe(id, v) {
   const el = $(id);
-  el.textContent = num(v, d);
+  el.textContent = num(v, 2);
   el.className = deClass(v);
 }
-function setDeM(id, metric, v) {
-  const el = $(id);
-  el.textContent = num(v, metricDecimals(metric));
-  el.className = deClass(v, metric);
-}
+function setDeM(id, metric, v) { setDe(id, v); }
 function deMetricLabel(metric) {
   if (!metric) return "ΔE";
   const m = String(metric).toLowerCase();

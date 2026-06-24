@@ -179,9 +179,13 @@ _JZ_D, _JZ_D0 = -0.56, 1.6295499532821566e-11
 _M_XYZP_TO_LMS = [[0.41478972, 0.579999, 0.0146480],
                   [-0.2015100, 1.120649, 0.0531008],
                   [-0.0166008, 0.264800, 0.6684799]]
-# Raw ΔEz is tiny (~0.001–0.05); these severity bands are derived from the ITP JND anchor
-# (1 JND ≈ dE_ITP 1.0 ≈ ΔEz 1/660), so the dashboard can colour ΔEz on its own native scale.
-_JZ_OK, _JZ_WARN = 0.0015, 0.0035
+# Raw ΔEz is tiny (~1e-3) and has no established presentation, so users have no learned intuition
+# for it. Multiply by _JZ_SCALE so 1.0 ≈ 1 JND — ΔEz then rides the SAME scale + severity bands as
+# dE_ITP / CIEDE2000 and the user's learned "<1 invisible, <3 acceptable" intuition transfers. The
+# constant is the empirical dE_ITP/ΔEz ratio across the HDR luminance range (mean ≈662, σ≈150 —
+# Jzazbz and ITP weight chroma differently), rounded to 660. No ΔEz JND constant is standardized;
+# what IS standard is the 1≈JND interpretation, which this restores.
+_JZ_SCALE = 660.0
 
 
 def _pq_eotf_norm(s: float) -> float:
@@ -335,8 +339,8 @@ def _itp_metric(meas_xyz: Sequence[float], ideal_xyz: Sequence[float]) -> dict:
 
 def _jzazbz_metric(meas_xyz: Sequence[float], ideal_xyz: Sequence[float]) -> dict:
     jm, ji = _xyz_to_jzazbz(meas_xyz), _xyz_to_jzazbz(ideal_xyz)
-    de = math.sqrt(sum((a - b) ** 2 for a, b in zip(jm, ji)))
-    return {"de": de, **_lch_components(ji[0], (ji[1], ji[2]), jm[0], (jm[1], jm[2]))}
+    de = _JZ_SCALE * math.sqrt(sum((a - b) ** 2 for a, b in zip(jm, ji)))
+    return {"de": de, **_lch_components(ji[0], (ji[1], ji[2]), jm[0], (jm[1], jm[2]), scale=_JZ_SCALE)}
 
 
 def _de2000_metric(meas_xyz: Sequence[float], ideal_xyz: Sequence[float],
@@ -371,8 +375,9 @@ def patch_deltas(signal: Sequence[float], x: float, y: float, big_y: float, *,
     The ``scoring`` key flags the metric the spine actually optimises (dE_ITP for HDR, CIEDE2000
     for SDR); the others are *viewing lenses*. HDR also offers ``de2000`` (against the BT.2408
     203-nit diffuse white — out of CIEDE2000's SDR regime, an intuition aid only) and ``jzazbz``;
-    SDR offers ``jzazbz`` alongside the scoring CIEDE2000. dE_ITP for HDR and CIEDE2000 for SDR
-    stay bit-identical to the spine's scorer."""
+    SDR offers ``jzazbz`` alongside the scoring CIEDE2000. Every metric is reported on the 1≈JND
+    scale (``jzazbz`` is normalised by ``_JZ_SCALE``) so one set of learned severity bands applies.
+    dE_ITP for HDR and CIEDE2000 for SDR stay bit-identical to the spine's scorer."""
     if not signal or len(signal) < 3 or big_y is None or x is None or y is None:
         return None
     if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(big_y)):

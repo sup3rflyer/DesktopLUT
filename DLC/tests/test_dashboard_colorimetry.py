@@ -178,6 +178,18 @@ def test_patch_deltas_structure_and_scoring_metric():
         patch_delta_e([0.5, 0.5, 0.55], 0.30, 0.31, 60.0, is_hdr=False, white_xy=_D65, luminance=120.0))
 
 
+def test_jzazbz_is_jnd_scaled_not_raw():
+    # ΔEz is normalised (×_JZ_SCALE) to the 1≈JND scale so it shares the dashboard's severity bands
+    # and the user's learned intuition — a clearly-visible error must read in the same order as
+    # dE_ITP, NOT on the raw ~1e-3 Jzazbz scale.
+    from dlc.dashboard.colorimetry import patch_deltas, _JZ_SCALE
+    assert _JZ_SCALE == 660.0
+    d = patch_deltas([0.0, 0.0, 0.9], 0.15, 0.06, 60.0, is_hdr=True, white_xy=_D65)
+    jz, itp = d["metrics"]["jzazbz"]["de"], d["metrics"]["itp"]["de"]
+    assert jz > 1.0                        # not the sub-0.05 raw scale
+    assert 0.2 < jz / itp < 5.0            # same ballpark as ITP (both JND-anchored)
+
+
 def test_euclidean_metric_components_reconstruct_scalar_exactly():
     # ITP and Jzazbz are Euclidean: the radial/tangential chroma/hue split is an orthonormal
     # change of basis, so L²+C²+H² == ΔE exactly even for a saturated patch. This is the whole

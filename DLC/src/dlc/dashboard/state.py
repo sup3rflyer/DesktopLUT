@@ -133,9 +133,9 @@ def _median(values: list[float]) -> Optional[float]:
     return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
-# Wire precision per metric: dE_ITP/CIEDE2000 read ~0–100 (2–3 dp is plenty); raw ΔEz is ~1e-3
-# on its own native scale, so it needs more places to stay legible.
-_DE_DECIMALS = {"itp": 3, "de2000": 3, "jzazbz": 5}
+# Wire precision per metric. All three now ride the 1≈JND scale (ΔEz is normalised), so they read
+# in the same ~0–100 range and share one precision — 3 dp on the wire, 2 dp in the UI.
+_DE_DECIMALS = {"itp": 3, "de2000": 3, "jzazbz": 3}
 
 
 def _is_hdr_header(header: dict[str, Any]) -> bool:
