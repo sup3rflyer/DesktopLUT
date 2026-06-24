@@ -665,6 +665,7 @@ class Calibration:
         # re-deriving from artifacts: the most recent intermediate score + the last optimizer iter.
         self._last_scored: dict[str, Any] = {}
         self._last_optimizer: dict[str, Any] = {}
+        self._last_refine: dict[str, Any] = {}
 
     # -- persistence ------------------------------------------------------
     def _save(self) -> None:
@@ -1478,6 +1479,8 @@ class Calibration:
             out["last_scored"] = self._last_scored
         if self._last_optimizer:
             out["optimizer"] = self._last_optimizer
+        if self._last_refine:
+            out["refine"] = self._last_refine
         return out
 
     def _monitor_map_check(self) -> dict[str, Any]:
@@ -2766,17 +2769,27 @@ class Calibration:
     def _grey_de_vs_white(self, samples, white_xy: tuple[float, float]) -> dict[str, Any]:
         """Average/max dE_ITP of the GRAYSCALE patches against the target white (D65) at the
         resolved HDR peak — the closed-loop refine's convergence metric. Returns
-        ``{"avg","max","n"}`` (``n``=0 if no grey patches / scoring failed)."""
+        ``{"avg","max","n","gamma_err_pct"}``: ``gamma_err_pct`` is the worst luminance-tracking
+        error along the grey ramp (measured Y vs target Y, the grayscale EOTF/"gamma" axis dE_ITP
+        folds chroma into) over patches above a 1-nit floor — None/0 if no grey / scoring failed."""
         try:
             metrics, _lum = score_samples_hdr(samples, white_xy=white_xy,
                                               peak_nits=self._hdr_target().peak_nits,
                                               reachable_primaries=self._reachable_primaries())
-            grey = [m.de2000 for m in metrics if m.grayscale]
+            grey = [m for m in metrics if m.grayscale]
             if not grey:
-                return {"avg": None, "max": None, "n": 0}
-            return {"avg": round(sum(grey) / len(grey), 3), "max": round(max(grey), 3), "n": len(grey)}
+                return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
+            de = [m.de2000 for m in grey]
+            # Luminance-tracking error: |measured_Y - target_Y| / target_Y, worst over the lit
+            # ramp (target_Y > 1 nit avoids near-black noise blowing up the ratio). This is the
+            # grayscale "gamma" axis on its own — the LLM judges EOTF tracking apart from chroma.
+            lum_errs = [abs(m.measured_xyz[1] - m.target_xyz[1]) / m.target_xyz[1]
+                        for m in grey if m.target_xyz[1] > 1.0]
+            gamma_err = round(100.0 * max(lum_errs), 2) if lum_errs else None
+            return {"avg": round(sum(de) / len(de), 3), "max": round(max(de), 3), "n": len(de),
+                    "gamma_err_pct": gamma_err}
         except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
-            return {"avg": None, "max": None, "n": 0}
+            return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
 
     def stage_refine_mhc_cube(self, *, max_rounds: int = 3, target_de: float = 2.0,
                               min_improvement: float = 0.3, regress_tol: float = 0.5
@@ -2860,7 +2873,21 @@ class Calibration:
                 de = self._grey_de_vs_white(samples, (wx, wy))
                 rounds_log.append({"round": rnd, "grey_avg_de_itp": de["avg"],
                                    "grey_max_de_itp": de["max"], "grey_n": de["n"],
-                                   "cube": Path(installed).name})
+                                   "gamma_err_pct": de["gamma_err_pct"], "cube": Path(installed).name})
+                # Feed the round's grayscale quality to the timed check-in's live metrics so a
+                # multi-round refine isn't metric-blind mid-run (the optimizer path already does
+                # this via _last_optimizer). ``since_last_round`` = improvement over the previous
+                # round (prev_avg - this_avg; +ve = converging, -ve = regressing) so the LLM reads
+                # the trend, not a bare number it has to diff against the last check-in by hand.
+                prev_avg = scores[-1] if scores else None   # scores not yet appended this round
+                # best_avg is updated AFTER this block, so fold this round in for the snapshot.
+                cur_best = (min(best_avg, de["avg"]) if de["avg"] is not None else best_avg)
+                self._last_refine = {
+                    "round": rnd, "grey_avg_de_itp": de["avg"], "grey_max_de_itp": de["max"],
+                    "gamma_err_pct": de["gamma_err_pct"], "grey_n": de["n"],
+                    "best_avg_de_itp": (round(cur_best, 3) if cur_best != float("inf") else None),
+                    "since_last_round": (round(prev_avg - de["avg"], 3)
+                                         if prev_avg is not None and de["avg"] is not None else None)}
                 self._maybe_timed_checkin("refine-mhc-cube")
                 if de["avg"] is None:
                     flags["unscored"] = True

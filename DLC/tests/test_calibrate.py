@@ -700,6 +700,14 @@ def test_hdr_mhc_only_runs_standalone_d65_refine(tmp_path: Path):
     assert refine["cap_nits"] > 0 and refine["binding_channel"] in ("r", "g", "b")
     # A perfect (already-D65) panel floors on the first measured round — no regression seam.
     assert refine.get("regressed") is not True
+    # Each round logs the grayscale luminance-tracking ("gamma") error alongside the dE.
+    assert all("gamma_err_pct" in r for r in refine["round_log"])
+    # The per-round check-in's live metrics carry the round's grayscale quality, so a multi-round
+    # refine is not metric-blind mid-run (avg/max/gamma + best-so-far + round-over-round trend).
+    snap = calib._last_refine
+    assert snap.get("grey_avg_de_itp") is not None and snap.get("best_avg_de_itp") is not None
+    assert "gamma_err_pct" in snap and "since_last_round" in snap
+    assert snap in (calib._latest_checkin_metrics().get("refine"),)   # surfaced into the packet
     # build-install-mhc surfaced the Peak-Chroma cap as standalone-D65 evidence.
     assert calib.calib["stages"]["build-install-mhc"]["digest"]["peak_chroma"]["cap_nits"] > 0
 
