@@ -251,10 +251,17 @@ function fmtMsg(ev) {
         kv(k, typeof v === "number" ? num(v, 3) : v)).join(" ");
     case "seam": return `${kv("key", d.key || "")} ${kv("status", d.status || "")}`;
     case "anomaly": return `<span class="v">${esc(d.message || d.reason || "")}</span>`;
-    case "check_in":
-      return d.message ? `<span class="v">${esc(d.message)}</span>`
-        : `${kv("progress", d.progress != null ? Math.round(d.progress * 100) + "%" : "")} `
-          + `${kv("patches", (d.patches_done || 0) + "/" + (d.patches_total || 0))}`;
+    case "check_in": {
+      if (d.message) return `<span class="v">${esc(d.message)}</span>`;
+      const sl = d.since_last || {};
+      const since = [];
+      if (sl.reads) since.push(sl.reads + " reads");
+      if (sl.anomalies) since.push(sl.anomalies + " new anomalies");
+      if (sl.drift_episodes) since.push(sl.drift_episodes + " drift");
+      return `${kv("progress", d.progress != null ? Math.round(d.progress * 100) + "%" : "")} `
+        + `${kv("patches", (d.patches_done || 0) + "/" + (d.patches_total || 0))}`
+        + (since.length ? ` ${kv("since last", since.join(", "))}` : "");
+    }
     case "stall": return `<span class="nok">STALL</span> ${esc(d.message || "")} ${kv("via", d.via || "")}`;
     case "metrics_scored":
       return `${kv("avg", num(d.avg_de2000))} ${kv("p95", num(d.p95_de2000))} ${kv("max", num(d.max_de2000))} ${kv("white", num(d.white_de2000))}`;

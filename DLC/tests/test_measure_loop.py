@@ -894,6 +894,33 @@ def test_measure_loop_emits_quartile_check_ins_and_completion_digest(tmp_path: P
     assert completed[0].data["patch_count"] == 16 and "warm" in completed[0].data
 
 
+def test_measure_check_in_reports_deltas_not_cumulative_totals(tmp_path: Path):
+    """A check-in is "what happened since I last looked", not a restatement of the running
+    totals. Across the quartile check-ins the ``since_last`` reads must PARTITION the run (sum
+    to the final cumulative count, none double-counted) and the ``*_total`` fields are the only
+    cumulative carry."""
+    from dlc.events import RunLog, read_events, digest_projection
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, white_nits=120.0)
+    epath = tmp_path / "e.jsonl"
+    runlog = RunLog(epath, phase="measure:post-mhc")
+    run_measure_loop(patches=_grey_ramp(t, 16), transfer=t, measure=panel,
+                     config=MeasureLoopConfig(), runlog=runlog,
+                     ti3_path=tmp_path / "m.ti3", ndjson_path=tmp_path / "m.ndjson")
+
+    check_ins = [e for e in digest_projection(read_events(epath)) if e.event == "check_in"]
+    assert check_ins, "expected quartile check-ins"
+    # The per-window read deltas are disjoint and sum to the last check-in's running total.
+    deltas = [e.data["since_last"]["reads"] for e in check_ins]
+    assert all(d >= 0 for d in deltas)
+    assert sum(deltas) == check_ins[-1].data["reads_total"]
+    # The delta block carries no cumulative restatement; totals live only in the *_total fields.
+    for e in check_ins:
+        assert set(e.data["since_last"]) <= {"reads", "anomalies", "drift_episodes", "became_warm"}
+        assert "reads_total" in e.data and "drift_episodes_total" in e.data
+
+
 def test_measure_loop_wall_clock_backstop_emits_beyond_quartiles(tmp_path: Path, monkeypatch):
     """A slow / measure-only stage must still surface periodic check-ins when the 3 progress
     quartiles are sparse: the §12 wall-clock backstop (``checkin_interval_s``) fires EMIT-ONLY

@@ -568,6 +568,13 @@ class _Loop:
         self.measurement_path_compromised = False
         self.read_anomalies: list[dict[str, Any]] = []
         self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
+        # §12 measure check-in window high-water marks. Each check-in reports the DELTA since the
+        # previous one (reads / anomalies / drift that are NEW), not the cumulative totals — a
+        # check-in is "what happened since I last looked", never a restatement of old evidence.
+        self._checkin_reads_at_last = 0
+        self._checkin_anomalies_at_last = 0
+        self._checkin_drift_at_last = 0
+        self._checkin_warm_at_last = False
         # Cross-patch read-integrity state (frozen-frame / mid-run-dark detection).
         self._integrity_recent: list[tuple[float, tuple[float, float, float]]] = []
         self._integrity_dark_streak = 0
@@ -666,19 +673,43 @@ class _Loop:
             self._emit_measure_checkin(index, total, frac)
 
     def _emit_measure_checkin(self, index: int, total: int, frac: float) -> None:
-        self._last_checkin_monotonic = time.monotonic()
-        # EMIT-ONLY evidence packet for the LLM (never gates): forward motion + the warnings and
-        # repeated-measurement signals the LLM judges. ``drift_episodes`` = neutral re-reads that
-        # left the envelope; ``read_anomalies`` = non-stopper read-plausibility flags. The latest
-        # anomaly detail rides along so the LLM can judge "flagged once, recovered" vs "ongoing".
+        now = time.monotonic()
+        elapsed_since = round(now - self._last_checkin_monotonic, 1)
+        self._last_checkin_monotonic = now
+        # EMIT-ONLY evidence packet for the LLM (never gates): forward motion + what's NEW since
+        # the last check-in. ``since_last`` is the spine delta — reads/anomalies/drift accrued in
+        # THIS window only, so a clean stretch reads as zeros instead of re-stating the running
+        # totals every time (the LLM diffing cumulative counters by hand is the bug this avoids).
+        # ``drift_episodes`` = neutral re-reads that left the envelope; ``anomalies`` =
+        # non-stopper read-plausibility flags. The new-anomaly details ride along (not just the
+        # latest-ever one) so the LLM can judge "two new flags this window" vs "flagged once long
+        # ago, quiet since". Totals stay as ``*_total`` for the one-glance running tally.
+        new_anomalies = self.read_anomalies[self._checkin_anomalies_at_last:]
+        # Keep the packet readable if a window flagged a storm; the full list is on disk / in state.
+        new_anomalies_inline = new_anomalies[-25:] if len(new_anomalies) > 25 else new_anomalies
+        since_last: dict[str, Any] = {
+            "reads": self.seq_counter - self._checkin_reads_at_last,
+            "anomalies": len(new_anomalies),
+            "drift_episodes": self.drift_episodes - self._checkin_drift_at_last,
+        }
+        if self.warm and not self._checkin_warm_at_last:
+            since_last["became_warm"] = True   # the warm-up→warm transition happened this window
         self.runlog.check_in(
             "measure", progress=round(frac, 2),
             patches_done=index, patches_total=total,
-            reads=self.seq_counter, warm=self.warm,
-            drift_episodes=self.drift_episodes,
-            read_anomalies=len(self.read_anomalies),
-            last_anomaly=(self.read_anomalies[-1] if self.read_anomalies else None),
-            white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None))
+            elapsed_since_checkin_s=elapsed_since,
+            since_last=since_last,
+            new_anomalies=(new_anomalies_inline or None),   # the actual NEW flags, for the LLM to judge
+            warm=self.warm,                          # current state (position, not repeated evidence)
+            white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None),
+            reads_total=self.seq_counter,
+            anomalies_total=len(self.read_anomalies),
+            drift_episodes_total=self.drift_episodes)
+        # Advance the window high-water marks AFTER emitting, so the next check-in's delta is clean.
+        self._checkin_reads_at_last = self.seq_counter
+        self._checkin_anomalies_at_last = len(self.read_anomalies)
+        self._checkin_drift_at_last = self.drift_episodes
+        self._checkin_warm_at_last = self.warm
 
     def _read(
         self,
