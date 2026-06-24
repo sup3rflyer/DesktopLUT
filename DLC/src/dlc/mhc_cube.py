@@ -59,7 +59,9 @@ __all__ = [
     "HDR_REFERENCE_WHITE_BAND",
     "mhc2_matrix",
     "build_hdr_cube",
+    "build_sdr_cube",
     "refine_hdr_cube",
+    "refine_sdr_cube",
     "refine_sdr_grayscale",
     "write_1d_cube",
     "read_1d_cube",
@@ -437,6 +439,70 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     return curves, summary
 
 
+def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
+                   white_xy: tuple[float, float], peak_luminance: float,
+                   *, gamma: float = 2.2, lut_size: int = 1024, dark_floor_nits: float = 0.3,
+                   level_trust: Optional[Sequence[tuple[float, float]]] = None
+                   ) -> tuple[dict[str, list[float]], dict[str, float]]:
+    """Build the per-channel **SDR** EOTF+WB correction cube from a raw TI3's GRAY ramp.
+
+    The power-law (γ) analog of :func:`build_hdr_cube`: identical gray-share inversion, but the
+    transfer is ``light = signal**gamma`` instead of PQ. ``primaries`` is the measured native
+    gamut, ``white_xy`` the measured native white, ``peak_luminance`` the panel peak (= the SDR
+    target white luminance). Returns ``({"r","g","b"}, summary)``; each channel curve maps the wire
+    signal to the drive that pulls the channel's measured gray share to the native-white-proportional
+    target — neutralising per-level drift toward native white, leaving the MHC matrix to do native→D65.
+
+    Delivered via ``mhc.set_base_lut`` (``sourceIs1DCube`` → DesktopLUT's 1024-entry SDR MHC2 LUT)
+    so the neutral correction is a DLC-owned base artifact — it locks DesktopLUT's grayscale editor
+    (and its Reset button) and never squats in the user-editable ``correctionGrayscale`` fine-tune
+    slot (see [[dlc-must-not-own-mhc-user-layers]]). Raises ``ValueError`` if the gray ramp is too
+    sparse. ``dark_floor_nits`` / ``level_trust`` behave exactly as in :func:`build_hdr_cube`."""
+    if peak_luminance <= 0.0:
+        raise ValueError("peak_luminance must be positive")
+    sigs, shares = _gray_shares(samples, primaries, white_xy, peak_luminance)
+    if len(sigs) < 2:
+        raise ValueError("fewer than 2 neutral patches; cannot build a gray-ramp cube")
+    peak_share = {ch: shares[ch][-1] for ch in _CHANNELS}
+    # Signal below which a level's luminance is under the trustworthy floor (blend to identity).
+    # SDR transfer is pure power γ, so the floor luminance maps back through the inverse EOTF.
+    floor_frac = min(dark_floor_nits, peak_luminance) / peak_luminance
+    dark_sig = max(0.0, floor_frac) ** (1.0 / gamma)
+    trust_xs = [p[0] for p in level_trust] if level_trust else []
+    trust_ws = [p[1] for p in level_trust] if level_trust else []
+
+    curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
+    prev = {ch: 0.0 for ch in _CHANNELS}
+    for j in range(lut_size):
+        sig_in = j / (lut_size - 1)
+        frac = sig_in ** gamma                        # native-white-proportional target (0..1)
+        # Luminance floor ramp: 0 in the noisy deep shadows, ramping to 1 by 2x the dark-floor signal.
+        w = 0.0 if dark_sig <= 0 else min(1.0, max(0.0, (sig_in - dark_sig) / dark_sig))
+        if trust_xs:
+            w *= _interp(sig_in, trust_xs, trust_ws)
+        for ch in _CHANNELS:
+            target_share = frac * peak_share[ch]
+            corrected = invert_monotone(sigs, shares[ch], target_share)
+            val = w * corrected + (1.0 - w) * sig_in  # blend to identity in the dark
+            # Enforce monotone non-decreasing — the blend boundary or a noisy share can dip, and
+            # the MHC2 LUT must be monotone for a well-defined inverse.
+            val = max(prev[ch], min(max(val, 0.0), 1.0))
+            prev[ch] = val
+            curves[ch].append(val)
+
+    summary: dict[str, float] = {
+        "white_max_nits": round(peak_luminance, 4),
+        "gray_points": float(len(sigs)),
+        "lut_size": float(lut_size),
+        "gamma": round(gamma, 4),
+        "dark_floor_nits": round(dark_floor_nits, 4),
+        "basis": "gray-ramp",
+    }
+    for ch in _CHANNELS:
+        summary[f"{ch}_peak_share"] = round(peak_share[ch], 4)
+    return curves, summary
+
+
 def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
     """Linear interpolation of ys(xs) at x (xs ascending), clamped to the end values."""
     if not xs:
@@ -550,6 +616,97 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
     return out
 
 
+def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
+                    measured_neutral: Sequence[tuple[float, Sequence[float]]],
+                    primaries: Mapping[str, float], native_white_xy: tuple[float, float],
+                    peak_luminance: float, matrix_rowsums: Sequence[float],
+                    *, gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
+                    damping: float = 0.85, dark_floor_nits: float = 0.5,
+                    ratio_clamp: tuple[float, float] = (0.5, 2.0)
+                    ) -> dict[str, list[float]]:
+    """One closed-loop grayscale-refine step on the **SDR base cube** — PANEL-AGNOSTIC.
+
+    The power-law (γ) analog of :func:`refine_hdr_cube`, and the cube-delivered replacement for
+    :func:`refine_sdr_grayscale` (which emitted ``correctionGrayscale`` deviations — the user slot).
+    Same damped share-ratio law and post-matrix abscissa, but the transfer is ``light = signal**γ``
+    (not PQ) and the result is composed onto the installed per-channel ``.cube`` (signal→signal),
+    pushed via ``mhc.set_base_lut``. Measurement-only (no forward model) so it converges to whatever
+    the real panel does over a few measure→refine rounds.
+
+    ``current_curves``    : the installed per-channel cube (r/g/b signal→drive, ``lut_size`` each).
+    ``measured_neutral``  : ``[(wire_signal, measured_XYZ[, chroma_sigma]), ...]`` from a neutral-ramp
+                            measurement with the current cube applied. The optional 3rd element is the
+                            level's read-to-read chromaticity spread (xy SE) from MULTIPLE reads; when
+                            present, that level's correction is scaled toward identity by its measurement
+                            trust (:func:`noise_trust`) so dark/noisy levels don't bake a tint.
+    ``primaries``/``native_white_xy``/``peak_luminance`` : the measured native gamut + white + peak —
+                            the linear-share basis ``disp`` (column normalization cancels in the share
+                            RATIO, the same shares math as :func:`refine_sdr_grayscale`).
+    ``matrix_rowsums``    : ``v_c = (M @ (1,1,1))_c`` of the INSTALLED SDR MHC2 matrix
+                            (``mhc2_matrix(primaries, native_white, sRGB, D65)``).
+
+    **Abscissa convention.** Windows applies the per-channel LUT AFTER the matrix, so for a wire
+    neutral of signal ``s`` channel ``c`` is driven at the post-matrix index ``v_c**(1/γ)·s`` (the
+    pure-power form of ``oetf(v_c·eotf(s))``) — NOT ``s``. The measured factor is stored against that
+    post-matrix abscissa, and the cube is indexed in the SAME post-matrix space (``cur[j]`` == the LUT
+    value at post-matrix signal ``j/(N-1)``), exactly as :func:`refine_hdr_cube` does for PQ.
+
+    Returns updated per-channel curves (monotone, clamped). Measured points below ``dark_floor_nits``
+    (meter noise) are dropped; the first/last surviving factor is held flat beyond the measured range
+    (no extrapolation), keeping the refined curve monotone through both ends."""
+    chans = ("r", "g", "b")
+    N = len(current_curves["r"])
+    if N < 2 or len(current_curves["g"]) != N or len(current_curves["b"]) != N:
+        raise ValueError("current_curves must be three equal-length channels")
+    if peak_luminance <= 0.0:
+        raise ValueError("peak_luminance must be positive")
+    disp = rgb_to_xyz_matrix(
+        primaries["rx"], primaries["ry"], primaries["gx"], primaries["gy"],
+        primaries["bx"], primaries["by"], native_white_xy[0], native_white_xy[1],
+        white_Y=peak_luminance)
+    disp_inv = invert3x3(disp)
+    wx, wy = target_white_xy
+
+    # gather (post-matrix signal, linear-light correction factor) per channel from the measurement
+    pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
+    for entry in sorted(measured_neutral, key=lambda p: p[0]):
+        sig, xyz = float(entry[0]), entry[1]
+        chroma_sigma = entry[2] if len(entry) > 2 else None
+        lin = sig ** gamma
+        tY = peak_luminance * lin
+        if tY < dark_floor_nits:
+            continue
+        total = sum(xyz) or 1.0
+        mx, my = xyz[0] / total, xyz[1] / total
+        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5, chroma_sigma)
+        ms = matvec(disp_inv, list(xyz))
+        ts = matvec(disp_inv, xy_to_XYZ(wx, wy, tY))
+        for c in range(3):
+            ratio = ts[c] / ms[c] if ms[c] > 1e-9 else 1.0
+            ratio = min(max(ratio, ratio_clamp[0]), ratio_clamp[1])
+            damped = 1.0 + w_trust * (ratio ** damping - 1.0)   # toward identity by (1-w_trust)
+            post_sig = (max(matrix_rowsums[c], 0.0) ** (1.0 / gamma)) * sig
+            pts[c].append((min(max(post_sig, 0.0), 1.0), damped))
+
+    out: dict[str, list[float]] = {}
+    for c, ch in enumerate(chans):
+        xs = [p[0] for p in pts[c]]
+        fs = [p[1] for p in pts[c]]
+        cur = current_curves[ch]
+        curve: list[float] = []
+        prev = 0.0
+        for j in range(N):
+            sig = j / (N - 1)
+            factor = _interp(sig, xs, fs) if xs else 1.0   # flat-hold beyond the measured range
+            new_lin = (float(cur[j]) ** gamma) * factor    # compose in linear light, like refine_hdr_cube
+            val = new_lin ** (1.0 / gamma)
+            val = max(prev, min(max(val, 0.0), 1.0))        # monotone, clamped
+            prev = val
+            curve.append(val)
+        out[ch] = curve
+    return out
+
+
 def refine_sdr_grayscale(current_deviations: Optional[Mapping[str, Sequence[float]]],
                          measured_neutral: Sequence[tuple[float, Sequence[float]]],
                          primaries: Mapping[str, float], native_white_xy: tuple[float, float],
@@ -560,6 +717,11 @@ def refine_sdr_grayscale(current_deviations: Optional[Mapping[str, Sequence[floa
                          dev_clamp: tuple[float, float] = (0.25, 4.0)
                          ) -> tuple[list[float], dict[str, list[float]]]:
     """One closed-loop grayscale-refine step on the **SDR** MHC ``correctionGrayscale`` layer.
+
+    SUPERSEDED 2026-06-24 by :func:`refine_sdr_cube` — the orchestrator now delivers the SDR refine
+    as a 1D-LUT base (``set_base_lut``), NOT the user-editable ``correctionGrayscale`` slot
+    ([[dlc-must-not-own-mhc-user-layers]]). Kept for the deviation-domain math + its tests; do not
+    wire it into a hardware install.
 
     The SDR analog of :func:`refine_hdr_cube`: pulls the measured neutral axis toward the target
     white (default D65) by the same damped share-ratio law, but emits per-channel ``correctionGrayscale``

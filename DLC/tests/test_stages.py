@@ -102,11 +102,12 @@ def test_build_mhc_derives_srgb_params(tmp_path):
     assert result.status == "ran"
     mp = result.metrics["measured_primaries"]
     assert abs(mp["rx"] - 0.64) < 0.01 and abs(mp["gy"] - 0.60) < 0.01
-    # Perfect sRGB panel -> near-identity base grayscale, white near D65.
-    assert result.metrics["base_grayscale_max_abs_deviation"] < 0.01
     assert result.metrics["measured_white_de2000_vs_d65"] < 0.5
     assert 6300 <= result.metrics["measured_white_cct"] <= 6700
     state = _common.load_dlc_state(ctx)
+    # SDR rides a DLC-owned base 1D-LUT cube (set_base_lut), NOT correctionGrayscale (2026-06-24).
+    base_lut = state["mhc_params"]["base_lut"]
+    assert base_lut and Path(base_lut["cube_path"]).exists()
     assert "mhc_params" in state and "measured_primaries" in state["mhc_params"]
     assert state["mhc_params"]["white"] == {"x": 0.3127, "y": 0.329}
     assert state["mhc_params"]["white_source"] == "d65"
@@ -132,33 +133,28 @@ def test_build_mhc_rejects_invalid_explicit_target_white(tmp_path):
     assert result.anomalies[0].code == "invalid_target_white"
 
 
-def test_sdr_grayscale_noise_maps_levels_from_sidecar(tmp_path):
-    # The SDR analogue of the HDR dark_trust_weights: map each gray patch level to its measured
-    # chroma noise (SE of the mean, +inf when unstable) from the <ti3>.noise.json sidecar, by
-    # nearest level — so a dim level whose white error is within the noise gets smoothed to identity.
+def test_sdr_build_mhc_smooths_unstable_dark_levels_in_cube(tmp_path):
+    # SDR build folds the measure-loop noise sidecar into the base cube's dark-trust (via the same
+    # _dark_level_trust → dark_trust_weights path HDR uses): unstable gray levels are held ~identity in
+    # the cube instead of baking a tint. Replaces the old _sdr_grayscale_noise→propose path.
     import json
-    from types import SimpleNamespace
     from dlc.measure_loop import noise_sidecar_path
-    src = tmp_path / "raw.ti3"
-    src.write_text("placeholder", encoding="utf-8")
-    noise_sidecar_path(src).write_text(json.dumps({"schema": 1, "by_level": {
-        "0.100000": {"chroma_sigma": 0.004, "reads": 4, "unstable": False},   # SE = 0.002
-        "0.050000": {"chroma_sigma": 0.02, "reads": 5, "unstable": True},     # unstable → +inf
-        "0.900000": {"chroma_sigma": None, "reads": 1, "unstable": False},    # single read → no σ
-    }}), encoding="utf-8")
-    patches = [SimpleNamespace(level=lv) for lv in (0.1, 0.05, 0.9, 0.5)]
-    out = build_mhc._sdr_grayscale_noise(src, patches)
-    assert out[0.1] == 0.002          # σ/√4
-    assert out[0.05] == float("inf")  # unstable level never trusted
-    assert 0.9 not in out             # <2 reads → no usable noise → full step
-    assert 0.5 not in out             # absent from sidecar → full step
+    from dlc.mhc_cube import read_1d_cube
 
-
-def test_sdr_grayscale_noise_returns_none_without_sidecar(tmp_path):
-    from types import SimpleNamespace
-    src = tmp_path / "raw.ti3"
-    src.write_text("placeholder", encoding="utf-8")          # no .noise.json beside it
-    assert build_mhc._sdr_grayscale_noise(src, [SimpleNamespace(level=0.5)]) is None
+    ctx = _new_run(tmp_path)
+    ti3 = write_synthetic_ti3(tmp_path / "raw_sdr.ti3")
+    noise_sidecar_path(ti3).write_text(
+        json.dumps({"by_level": {"0.25": {"unstable": True}, "0.5": {"unstable": True}}}),
+        encoding="utf-8")
+    result = build_mhc.build(_ns(ctx, source_ti3=str(ti3)), ctx)
+    assert result.status == "ran"
+    assert any("smoothed toward identity" in a for a in result.actions_taken)
+    curves = read_1d_cube(Path(_common.load_dlc_state(ctx)["mhc_params"]["base_lut"]["cube_path"]))
+    n = len(curves["r"])
+    for sig in (0.25, 0.5):                              # unstable levels held ~identity (cube ≈ input)
+        j = round(sig * (n - 1))
+        for ch in "rgb":
+            assert abs(curves[ch][j] - sig) < 1.5e-2, (ch, sig, curves[ch][j])
 
 
 def test_build_mhc_needs_rgb_ramps(tmp_path):
@@ -206,8 +202,12 @@ def test_refine_grayscale_step(tmp_path):
     # Perfect panel -> already within thresholds -> advisory stop.
     assert result.advice["default_policy_verdict"] == "stop"
     state = _common.load_dlc_state(ctx)
-    assert "correction_grayscale" in state
     assert len(state["refine_history"]) == 1
+    # The refine drives the DLC-owned base 1D-LUT cube (set_base_lut), NOT the user-editable
+    # correctionGrayscale slot ([[dlc-must-not-own-mhc-user-layers]]).
+    assert state["mhc_params"]["base_lut"]["cube_path"].endswith("refine1.cube")
+    cg = state["correction_grayscale"]                       # left identity (the deprecated user slot)
+    assert all(abs(v - 1.0) < 1e-9 for ch in ("r", "g", "b") for v in cg["deviations"][ch])
 
 
 def test_probe_match_simulate(tmp_path):

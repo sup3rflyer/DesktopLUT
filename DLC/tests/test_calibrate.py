@@ -671,18 +671,25 @@ def test_mhc_only_flow_is_icc_only(tmp_path: Path):
 
 def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
     # Loop-bookkeeping regression test (adversarial review): a refine step installs a NON-identity
-    # correction, but the next round does not improve — a within-tolerance uptick that takes the
-    # 'floored' exit WITHOUT tripping the regression gate. The unified best-revert must restore (and
-    # persist) the BEST measured deviations — here identity (round 1) — not strand the worse mid-loop
-    # install. (The bug was: converged/floored/budget exits skipped the best-revert.)
+    # base cube, but the next round does not improve — a within-tolerance uptick that takes the
+    # 'floored' exit WITHOUT tripping the regression gate. The unified best-revert must reinstall the
+    # BEST measured cube — here the BASE cube (round 1) — not strand the worse mid-loop refine cube.
+    # (The bug was: converged/floored/budget exits skipped the best-revert.) Post-2026-06-24 the SDR
+    # refine drives a 1D-LUT base via set_base_lut, NOT the user-editable correctionGrayscale slot.
     calib = _make(tmp_path, "sdr_floor")
-    calib.run("mhc-only")                      # seed mhc_params + resolved white, then re-run the stage
+    calib.run("mhc-only")                      # seed mhc_params + base cube + resolved white, then re-run
     calib.calib["stages"].pop("refine-mhc-grayscale", None)   # bust memoisation so it re-runs
 
     import dlc.mhc_cube as mc
-    sentinel = {ch: [1.5] * 32 for ch in ("r", "g", "b")}     # recognisably non-identity mid-loop install
-    monkeypatch.setattr(mc, "refine_sdr_grayscale",
-                        lambda *a, **k: ([j / 31 for j in range(32)], sentinel))
+    # recognisably non-identity mid-loop cube (flat 0.5), same length as the installed cube.
+    monkeypatch.setattr(mc, "refine_sdr_cube",
+                        lambda cur, *a, **k: {ch: [0.5] * len(cur["r"]) for ch in ("r", "g", "b")})
+    # Record every base-cube install so we can assert WHICH cube ends up applied.
+    installs: list[str] = []
+    orig_set_base_lut = calib.controller.set_base_lut
+    monkeypatch.setattr(calib.controller, "set_base_lut",
+                        lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
+                                                           orig_set_base_lut(mon, mode, path, peak))[1])
     # No arbitrary round cap: the monitor floor needs the improvement to stay below `min_improvement`
     # for floor_patience (=2) consecutive rounds, so a single sub-threshold step doesn't end early.
     scripted = iter([{"avg": 1.0, "max": 1.5, "n": 5, "gamma_err_pct": 1.0},    # round1 > target → refine
@@ -693,8 +700,13 @@ def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
     out = calib.stage_refine_mhc_grayscale()
     assert out.digest.get("floored") is True   # within-tolerance upticks for floor_patience rounds
     assert out.digest.get("regressed") is not True
+    # A mid-loop refine cube WAS installed (so the revert is meaningful)...
+    assert any("refine1.cube" in p for p in installs), installs
+    # ...and the FINAL install reverted to the BEST (the base cube, round 1), not the worse refine cube.
+    assert installs[-1].endswith("mhc_base_sdr.cube"), installs[-1]
+    # The cube now owns the neutral correction; correctionGrayscale is left identity (the user slot).
     cg = calib._state["correction_grayscale"]
-    for ch in ("r", "g", "b"):                 # reverted to identity (best), not the 1.5 sentinel
+    for ch in ("r", "g", "b"):
         assert all(abs(v - 1.0) < 1e-9 for v in cg["deviations"][ch]), (ch, cg["deviations"][ch])
 
 

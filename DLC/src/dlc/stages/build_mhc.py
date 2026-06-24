@@ -32,7 +32,7 @@ from ..mhc import (
     resolve_run_path,
     xy_from_xyz,
 )
-from ..refine import Deviations, RefinementTarget, propose_correction_grayscale
+from ..refine import Deviations
 from ..runs import RunContext
 from ..stage import StageResult
 from . import _common
@@ -199,40 +199,61 @@ def build(args, ctx: RunContext) -> StageResult:
         }
         base_summary = {}
     else:
-        prim = _common.measured_primaries_from(measured_primaries, white_xy)
+        # SDR (γ): same 1D-LUT-base mechanism as HDR. The MHC matrix carries primaries +
+        # native-white→D65; the per-channel **tone** (neutral axis + per-level grayscale tracking)
+        # rides a DLC-owned full-resolution per-channel 1D .cube delivered over mhc.set_base_lut
+        # (sourceIs1DCube → DesktopLUT's 1024-entry SDR MHC2 LUT). This REPLACES the old
+        # set_base_grayscale + correctionGrayscale-refine path (2026-06-24): the refine must NOT
+        # squat in DesktopLUT's user-editable correctionGrayscale slot (a user "Reset Grayscale"
+        # wiped it). A loaded 1D cube locks that editor (+ its Reset button) and leaves RGBW for the
+        # matrix — see [[dlc-must-not-own-mhc-user-layers]]. build_sdr_cube is the γ analog of
+        # build_hdr_cube; the closed-loop refine (stage_refine_mhc_cube) corrects the per-level residual.
+        from ..mhc_cube import adaptive_dark_floor, build_sdr_cube, dark_trust_weights, write_1d_cube
+
         # Adaptive dark floor (SDR) — same measured-chroma-drift logic as HDR, anchored on the
         # BRIGHTEST neutral (on SDR the peak IS the target white; reference_band=None). Persisted below
-        # for the SDR closed-loop refine (stage_refine_mhc_grayscale) to smooth dark levels to identity.
-        from ..mhc_cube import adaptive_dark_floor
+        # for the SDR closed-loop refine to smooth dark levels to identity.
         sdr_dark_floor_nits, sdr_dark_floor_info = adaptive_dark_floor(
             [(p.xyz[1], *xy_from_xyz(p.xyz)) for p in gray_patches], reference_band=None)
-        # Per-level chroma noise (SE of the mean, +inf for an unstable level) from the measure loop's
-        # sidecar beside the raw TI3, so a dark gray level whose drift from native white is within the
-        # measurement noise is smoothed toward identity instead of baked into the base grayscale — the
-        # SDR analogue of the HDR cube's dark_trust_weights. No sidecar / single-read ⇒ None ⇒ full step.
-        gray_noise = _sdr_grayscale_noise(source, gray_patches)
-        # Tone-only base: target the panel's own native white so the matrix owns
-        # the native-white -> D65 move.
-        proposal = propose_correction_grayscale(
-            measured=gray_patches,
-            target=RefinementTarget(
-                white_x=white_xy[0], white_y=white_xy[1], gamma=args.gamma, peak_luminance=target_luminance
-            ),
-            primaries=prim,
-            current=Deviations.identity(len(gray_patches)),
-            damping=1.0,  # initial full estimate; refine loop fine-tunes post-install
-            noise=gray_noise,
-        )
+        # Per-level trust from MEASURED repeatability (the noise sidecar): a dark level whose
+        # chromaticity is too noisy/unstable to trust is smoothed to identity in the cube. Reference =
+        # the measured NATIVE white (build_sdr_cube targets native-white shares; the matrix does D65).
+        groups = classify_samples(samples)
+        level_trust = _dark_level_trust(source, groups["grey"], white_xy, dark_trust_weights, xy_from_xyz)
+
+        # Identity 32-point base kept as harmless state plumbing; the cube is authoritative (mirrors HDR).
+        n = 32
         base = {
-            "point_count": proposal["point_count"],
-            "points": proposal["points"],
-            "deviations": proposal["deviations"],
+            "point_count": n,
+            "points": [round(i / (n - 1), 6) for i in range(n)],
+            "deviations": Deviations.identity(n).as_dict(),
         }
-        base_summary = proposal["summary"]
-        n_trust = sum(1 for r in proposal["residuals"] if r.get("noise_trust", 1.0) < 1.0)
-        trust_note = (f"; {n_trust} dark level(s) smoothed toward identity by measured noise"
-                      if gray_noise and n_trust else "")
-        result.action("derived base grayscale 1D correction (tone-only, toward native white)" + trust_note)
+        base_summary = {}
+        try:
+            cube_curves, cube_summary = build_sdr_cube(
+                samples, measured_primaries, white_xy, target_luminance,
+                gamma=args.gamma, dark_floor_nits=sdr_dark_floor_nits, level_trust=level_trust)
+            cube_summary["dark_floor"] = sdr_dark_floor_info
+            if level_trust:
+                cube_summary["dark_trust_levels"] = len(level_trust)
+                cube_summary["dark_trust_min"] = round(min(w for _s, w in level_trust), 4)
+            cube_path = ctx.root / "generated" / f"mhc_base_{mode.lower()}.cube"
+            write_1d_cube(cube_path, cube_curves, title=f"DLC SDR MHC base (mon {args.monitor})")
+            result.add_artifact(cube_path)
+            base_lut = {
+                "cube_path": str(cube_path),
+                "peak_nits": 0.0,   # SDR: the 1024-entry LUT carries no HDR luminance metadata
+                "summary": cube_summary,
+            }
+            n_trust = sum(1 for _s, w in (level_trust or []) if w < 1.0)
+            trust_note = (f"; {n_trust} dark level(s) smoothed toward identity by measured noise"
+                          if level_trust and n_trust else "")
+            result.action(
+                f"SDR: built {int(cube_summary['lut_size'])}-point per-channel γ{args.gamma} EOTF .cube "
+                f"(tone-only, toward native white) — DLC-owned 1D-LUT base" + trust_note)
+        except ValueError as exc:
+            result.anomaly("sdr_cube_failed",
+                           f"could not build SDR EOTF cube ({exc}); base grayscale left identity", "high")
 
     # White distance from D65 and a CCT readout for the assistant.
     white_de_d65 = _white_de_from_d65(white_xy, target_luminance)
@@ -315,24 +336,6 @@ def build(args, ctx: RunContext) -> StageResult:
         "reasons": ["candidate MHC params derived from a measured raw panel"],
     }
     return result
-
-
-def _sdr_grayscale_noise(source, gray_patches):
-    """Map each SDR gray patch level → its measured chroma noise (SE of the mean, or ``+inf`` if the
-    level was flagged unstable) from the measure loop's ``<ti3>.noise.json`` sidecar, matched by
-    nearest signal. Returns ``{level: sigma}`` for the levels with usable noise, fed to
-    ``propose_correction_grayscale``'s ``noise`` param; ``None`` when there's no sidecar (single-read
-    run) — in which case the proposal takes the full step (unchanged behaviour)."""
-    from ..measure_loop import match_level_noise, read_noise_sidecar
-    entries = read_noise_sidecar(Path(source))
-    if not entries:
-        return None
-    out: dict[float, float] = {}
-    for p in gray_patches:
-        sigma = match_level_noise(entries, p.level)
-        if sigma is not None:
-            out[p.level] = sigma
-    return out or None
 
 
 def _dark_level_trust(source, grey_samples, reference_white_xy, dark_trust_weights, xy_from_xyz):

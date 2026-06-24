@@ -1,12 +1,15 @@
-"""Stage 5 — refine-grayscale: one closed-loop MHC correction-grayscale step.
+"""Stage 5 — refine-grayscale: one closed-loop MHC base-cube refine step.
 
-Reads a post-MHC verification ramp, computes the next per-channel
-``correctionGrayscale`` deviations via the refinement control law
-(``refine.propose_correction_grayscale``), pushes them, and re-bakes the MHC
-profile. Emits per-point residuals, the white shift, and a delta vs. the
-previous iteration. The assistant decides whether to loop again — the advice is
-advisory only (a channel pinned at its deviation ceiling means the panel, not
-the algorithm, is the limit; the assistant may accept a small residual tint).
+Reads a post-MHC verification ramp, scores the measured grey residual (via the
+refinement control law ``refine.propose_correction_grayscale``, for the digest +
+advice), then composes the correction onto the DLC-owned per-channel base 1D-LUT
+**cube** (``mhc_cube.refine_sdr_cube``) and reinstalls it over ``set_base_lut``.
+As of 2026-06-24 this drives a DLC-owned cube, NOT the user-editable
+``correctionGrayscale`` slot (a user "Reset Grayscale" wiped it; a loaded cube
+locks that editor) — see [[dlc-must-not-own-mhc-user-layers]]. Emits per-point
+residuals, the white shift, and a delta vs. the previous iteration. The assistant
+decides whether to loop again. (Sim-wiring stage used by the mock rehearsal; the
+hardware path is the orchestrator's ``stage_refine_mhc_grayscale``.)
 """
 
 from __future__ import annotations
@@ -14,7 +17,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from ..mhc import find_stage_artifact, parse_ti3, resolve_run_path
+from ..mhc import SRGB_PRIMARIES, find_stage_artifact, parse_ti3, resolve_run_path
+from ..mhc_cube import mhc2_matrix, read_1d_cube, refine_sdr_cube, write_1d_cube
 from ..refine import DEV_MAX, DEV_MIN, Deviations, propose_correction_grayscale
 from ..runs import RunContext
 from ..stage import StageResult
@@ -65,14 +69,31 @@ def build(args, ctx: RunContext) -> StageResult:
     summary = proposal["summary"]
     result.action(f"computed correction-grayscale step (damping={args.damping})")
 
-    # Push the new correction grayscale and re-bake.
+    # Refine the DLC-owned base 1D-LUT cube (NOT the user-editable correctionGrayscale slot —
+    # [[dlc-must-not-own-mhc-user-layers]]) and re-bake. propose_correction_grayscale above is kept
+    # ONLY to score the measured residual (summary/residuals/advice); the correction itself is composed
+    # onto the per-channel cube via refine_sdr_cube and installed over set_base_lut.
+    base_lut = params.get("base_lut") or {}
+    cube_path = base_lut.get("cube_path")
+    if not (cube_path and Path(cube_path).exists()):
+        result.fail("no_base_cube", "no SDR base 1D-LUT cube to refine (run build-mhc + install-mhc first)")
+        return result
+    gamma = float(getattr(target, "gamma", 2.2))
+    native_white = _measured_white_tuple(params)
+    peak = float(params.get("target_luminance") or 0.0)
+    matrix = mhc2_matrix(params["primaries"], native_white, SRGB_PRIMARIES, (0.3127, 0.3290))
+    rowsums = [sum(matrix[r]) for r in range(3)]
+    measured_neutral = [(g.level, tuple(g.xyz)) for g in gray]
     controller = _common.make_controller(args, ctx)
     try:
-        controller.set_correction_grayscale(
-            monitor, mode, proposal["point_count"], proposal["points"], proposal["deviations"],
-            gamma=float(getattr(target, "gamma", 2.2)),
-        )
-        result.action("pushed correction grayscale")
+        new_curves = refine_sdr_cube(read_1d_cube(Path(cube_path)), measured_neutral,
+                                     params["primaries"], native_white, peak, rowsums,
+                                     gamma=gamma, target_white_xy=(target.white_x, target.white_y))
+        new_path = ctx.root / "generated" / f"mhc_base_{mode.lower()}.refine{iteration}.cube"
+        write_1d_cube(new_path, new_curves, title=f"DLC {mode} MHC refine r{iteration} (mon {monitor})")
+        result.add_artifact(new_path)
+        controller.set_base_lut(monitor, mode, str(new_path.resolve()), 0.0)
+        result.action("pushed refined base 1D-LUT cube (set_base_lut)")
         applied = controller.apply_mhc(monitor, mode)
         result.action("re-baked MHC")
     except Exception as exc:  # noqa: BLE001
@@ -95,11 +116,15 @@ def build(args, ctx: RunContext) -> StageResult:
             "low",
         )
 
-    # Persist new correction + history, compute deltas vs previous iteration.
+    # Persist the refined base cube + history, compute deltas vs previous iteration. The cube owns the
+    # neutral correction now; correctionGrayscale is left identity (the deprecated user slot).
+    base_lut["cube_path"] = str(new_path)
+    params["base_lut"] = base_lut                  # params is state["mhc_params"]; keep the deliverable in sync
+    nid = proposal["point_count"]
     state["correction_grayscale"] = {
-        "point_count": proposal["point_count"],
+        "point_count": nid,
         "points": proposal["points"],
-        "deviations": proposal["deviations"],
+        "deviations": {ch: [1.0] * nid for ch in ("r", "g", "b")},
     }
     history = state.setdefault("refine_history", [])
     prev_summary = history[-1] if history else None

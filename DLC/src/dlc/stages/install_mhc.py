@@ -51,6 +51,8 @@ def build(args, ctx: RunContext) -> StageResult:
     display_white = params.get("measured_white") or params["white"]
     target_white = params["white"]
     base = params["base_grayscale"]
+    base_lut = params.get("base_lut")
+    gamma = float(params.get("target_gamma", 2.2))
 
     try:
         controller.set_primaries(monitor, mode, primaries)
@@ -66,11 +68,21 @@ def build(args, ctx: RunContext) -> StageResult:
                 "targets D65 (hardcoded src), so the custom target is not applied",
                 "medium",
             )
-        controller.set_base_grayscale(
-            monitor, mode, base["point_count"], base["points"], base["deviations"],
-            gamma=float(params.get("target_gamma", 2.2)),
-        )
-        result.action(f"pushed base grayscale ({base['point_count']} points)")
+        # Base EOTF/tone rides a DLC-owned per-channel 1D .cube (set_base_lut → sourceIs1DCube), which
+        # locks DesktopLUT's grayscale editor + Reset button so the refine never squats in the
+        # user-editable correctionGrayscale slot ([[dlc-must-not-own-mhc-user-layers]]). Falls back to the
+        # 32-point set_base_grayscale only when no cube was built (e.g. <2 neutral patches).
+        if base_lut and base_lut.get("cube_path"):
+            controller.set_base_lut(monitor, mode, base_lut["cube_path"], base_lut.get("peak_nits", 0.0))
+            result.action("pushed base 1D-LUT cube (set_base_lut)")
+            ncg = 32                                    # clear any legacy non-identity correctionGrayscale
+            controller.set_correction_grayscale(
+                monitor, mode, ncg, [j / (ncg - 1) for j in range(ncg)],
+                {ch: [1.0] * ncg for ch in ("r", "g", "b")}, gamma=gamma)
+        else:
+            controller.set_base_grayscale(
+                monitor, mode, base["point_count"], base["points"], base["deviations"], gamma=gamma)
+            result.action(f"pushed base grayscale ({base['point_count']} points)")
         applied = controller.apply_mhc(monitor, mode)
         result.action("applied MHC (GenerateAndInstallMhcProfile)")
         verified = controller.verify_mhc(monitor, mode)

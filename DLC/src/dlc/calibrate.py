@@ -2619,16 +2619,25 @@ class Calibration:
                 self.controller.set_white(self.monitor, self.mode, mw["x"], mw["y"])
             else:
                 self.controller.set_white(self.monitor, self.mode, wx, wy)
-            # HDR base EOTF rides a full-resolution per-channel 1D .cube (set_base_lut → 4096-entry
-            # MHC2 LUT); the 32-point set_base_grayscale table is too sparse for a PQ EOTF, so HDR
-            # does not use it for the EOTF. SDR keeps the (adequate) 32-point base.
-            if spec.is_hdr and base_lut and base_lut.get("cube_path"):
-                # peak_nits = the cube's post-cap NEUTRAL ceiling (the achievable-D65 Peak-Chroma cap),
-                # derived from the one resolved max-sustained peak (Task C). This is the number a future
-                # DesktopLUT `tonemapTargetPeak` IPC (Task E4) should track so content above the cap
-                # rolls off in the shader, not the cube. The user's standard VIEWING peak lives there too.
+            # Base EOTF/tone rides a full-resolution per-channel 1D .cube (set_base_lut → 4096-entry HDR /
+            # 1024-entry SDR MHC2 LUT). BOTH modes now use it (2026-06-24): the cube is a DLC-owned base
+            # artifact that locks DesktopLUT's grayscale editor + Reset button, so the closed-loop refine
+            # never squats in the user-editable correctionGrayscale slot ([[dlc-must-not-own-mhc-user-layers]]).
+            # The 32-point set_base_grayscale table survives only as the fallback when no cube was built
+            # (e.g. <2 neutral patches).
+            if base_lut and base_lut.get("cube_path"):
+                # HDR peak_nits = the cube's post-cap NEUTRAL ceiling (achievable-D65 Peak-Chroma cap),
+                # the number a future DesktopLUT `tonemapTargetPeak` IPC (Task E4) tracks. SDR's 1024-entry
+                # LUT carries no HDR luminance metadata, so peak_nits is 0.0 there.
                 self.controller.set_base_lut(self.monitor, self.mode, base_lut["cube_path"],
                                              base_lut.get("peak_nits", 0.0))
+                # Clear any legacy non-identity correctionGrayscale (a prior SDR run's refine slot): the
+                # bake stacks it INDEPENDENTLY of the cube, and the cube now owns the whole neutral correction.
+                ncg = 32
+                gridcg = [j / (ncg - 1) for j in range(ncg)]
+                self.controller.set_correction_grayscale(
+                    self.monitor, self.mode, ncg, gridcg,
+                    {ch: [1.0] * ncg for ch in ("r", "g", "b")}, gamma=spec.gamma)
             else:
                 self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
                                                    base["points"], base["deviations"], gamma=spec.gamma)
@@ -3083,26 +3092,28 @@ class Calibration:
                                    min_improvement: float = 0.1, regress_tol: float = 0.3,
                                    floor_patience: int = 2, safety_max_rounds: int = 40
                                    ) -> StageOutcome:
-        """Closed-loop grayscale refine of the **SDR** MHC ``correctionGrayscale`` toward STANDALONE D65.
+        """Closed-loop grayscale refine of the **SDR** MHC **base 1D-LUT cube** toward STANDALONE D65.
 
         The SDR sibling of :meth:`stage_refine_mhc_cube` (Task B / backlog #C1). Each round: measure the
         neutral ramp with the current MHC applied, score grey vs the resolved white (CIEDE2000), and —
-        unless already floored — pull the ``correctionGrayscale`` layer toward D65 at the POST-matrix
-        abscissa (``mhc_cube.refine_sdr_grayscale``) and reinstall. This makes the SDR ICC a
-        self-sufficient D65 foundation (the matrix owns native→D65, the base 1D LUT owns native-white
-        tone, this loop owns the per-level non-additivity residual) — independent of the 3D LUT
+        unless already floored — pull the per-channel **base cube** toward D65 at the POST-matrix abscissa
+        (``mhc_cube.refine_sdr_cube``) and reinstall over ``set_base_lut``. As of 2026-06-24 this drives a
+        DLC-owned 1D-LUT base, NOT the user-editable ``correctionGrayscale`` slot (a user "Reset Grayscale"
+        wiped it; a loaded cube locks that editor) — see [[dlc-must-not-own-mhc-user-layers]]. This makes
+        the SDR ICC a self-sufficient D65 foundation (the matrix owns native→D65, the base 1D LUT owns
+        native-white tone + the per-level non-additivity residual) — independent of the 3D LUT
         (see [[sdr-violates-1plus1plus1-hdr-upholds]] / [[dlc-corrections-stack-independently]]).
 
         **No arbitrary round cap (DESIGN LAW).** The loop runs until it reaches the panel's *physical
         floor* — it converges to ``target_de`` OR stops improving beyond measurement noise for
         ``floor_patience`` consecutive rounds (a single noisy sub-``min_improvement`` step is NOT the
         floor). A REGRESSION (a refine made grey worse than ``regress_tol``) reverts to the best measured
-        deviations and raises a seam for the LLM. ``safety_max_rounds`` is a backstop for a pathological
+        cube and raises a seam for the LLM. ``safety_max_rounds`` is a backstop for a pathological
         non-converging panel: it does NOT silently cap — it reverts to best and raises a seam so the LLM
         adjudicates (accept the best foundation, or recheck the panel). Each round emits a NON-BLOCKING
         check-in the LLM consumes from the running spine (and may cancel via ``control.json``); the FINAL
-        acceptance is the verify seam. SDR only; HDR uses the base-cube refine. The mock panel ignores the
-        installed correction, so sim proves WIRING + math only.
+        acceptance is the verify seam. SDR only; HDR uses its own base-cube refine. The mock panel ignores
+        the installed correction, so sim proves WIRING + math only.
         """
         def run() -> StageOutcome:
             spec = self._spec()
@@ -3116,37 +3127,52 @@ class Calibration:
                 return StageOutcome(
                     "refine-mhc-grayscale", "done",
                     digest={"skipped": True, "reason": (
-                        "SDR-only closed-loop correctionGrayscale refine (HDR uses the base-cube "
-                        "refine; or missing primaries/measured-white/peak inputs)")},
+                        "SDR-only closed-loop base-cube refine (HDR uses its own base-cube refine; "
+                        "or missing primaries/measured-white/peak inputs)")},
                     data={"rounds": 0})
 
             from .measure_loop import match_level_noise
-            from .mhc_cube import mhc2_matrix, refine_sdr_grayscale
+            from .mhc_cube import mhc2_matrix, read_1d_cube, refine_sdr_cube, write_1d_cube
 
             # Installed SDR MHC2 matrix: src = sRGB (the C++ SDR srcPrim), display = native primaries +
-            # MEASURED native white (set_white now sends native white) → M performs native→D65. rowsums
+            # MEASURED native white (set_white sends native white) → M performs native→D65. rowsums
             # = M@(1,1,1) = the native-channel neutral drive that reproduces D65 — the POST-matrix signal
-            # the per-channel correctionGrayscale LUT is keyed at. MUST match the install or the loop
-            # converges to the wrong abscissa (the HDR 3151c50 lesson, SDR edition).
+            # the per-channel base-cube LUT is keyed at. MUST match the install or the loop converges to
+            # the wrong abscissa (the HDR 3151c50 lesson, SDR edition).
             matrix = mhc2_matrix(primaries, (nwx, nwy), SRGB_PRIMARIES, _D65_XY)
             rowsums = [sum(matrix[r]) for r in range(3)]
             wx, wy = self._white_xy()                       # resolved target white (D65 or SPD-derived)
             gamma = float(spec.gamma)
+            gen = self.ctx.root / "generated"
+            base_lut = params.get("base_lut") or {}
+            base_cube = gen / f"mhc_base_{self.mode.lower()}.cube"
+            if not base_cube.exists():
+                bp = base_lut.get("cube_path")               # fall back to the recorded cube path
+                if bp and Path(bp).exists():
+                    base_cube = Path(bp)
+                else:
+                    return StageOutcome(
+                        "refine-mhc-grayscale", "done",
+                        digest={"skipped": True, "reason": "no SDR base 1D-LUT cube to refine (run build-mhc)"},
+                        data={"rounds": 0})
 
-            # Idempotence: ALWAYS refine from the build base (identity correctionGrayscale), never a prior
-            # refine's output. Reset the correctionGrayscale layer to identity + reinstall up front so
-            # re-running this stage in isolation can't compound the correction.
+            # Neutralize the legacy user-editable correctionGrayscale slot: a prior SDR run may have left a
+            # non-identity refine there, and the bake stacks it INDEPENDENTLY of the cube (gui_mhc.cpp).
+            # The cube now owns the whole neutral correction — see [[dlc-must-not-own-mhc-user-layers]].
             n_points = 32
             grid = [j / (n_points - 1) for j in range(n_points)]
             ident = {ch: [1.0] * n_points for ch in ("r", "g", "b")}
-            self.controller.set_correction_grayscale(self.monitor, self.mode, n_points, grid, ident,
-                                                     gamma=gamma)
+            self.controller.set_correction_grayscale(self.monitor, self.mode, n_points, grid, ident, gamma=gamma)
+
+            # Idempotence: ALWAYS refine from the build's base cube, never a prior refine's output (re-running
+            # this stage in isolation must not compound the correction). Reinstall the base cube up front.
+            self.controller.set_base_lut(self.monitor, self.mode, str(base_cube.resolve()), 0.0)
             self.controller.apply_mhc(self.monitor, self.mode)
 
             scores: list[float] = []
             rounds_log: list[dict[str, Any]] = []
-            installed_points, installed_dev = grid, ident      # currently applied correctionGrayscale
-            best_points, best_dev, best_avg = grid, ident, float("inf")
+            installed_path = str(base_cube)                    # currently applied base cube
+            best_path, best_avg = str(base_cube), float("inf")
             flags: dict[str, bool] = {}
             floor_streak = 0           # consecutive rounds with sub-noise improvement (→ monitor floor)
 
@@ -3180,7 +3206,7 @@ class Calibration:
                     break
                 scores.append(de["avg"])
                 if de["avg"] < best_avg:
-                    best_avg, best_dev, best_points = de["avg"], installed_dev, installed_points
+                    best_avg, best_path = de["avg"], installed_path
 
                 # --- stop conditions. The loop runs to the PANEL'S PHYSICAL FLOOR, not an arbitrary
                 # round count (DESIGN LAW: adapt until the monitor can give no more). Each just sets a
@@ -3220,31 +3246,35 @@ class Calibration:
                     noise = match_level_noise(noise_entries, s.rgb[0]) if noise_entries else None
                     entry = (s.rgb[0], tuple(s.xyz))
                     measured_neutral.append(entry + (noise,) if noise is not None else entry)
-                new_points, new_dev = refine_sdr_grayscale(
-                    installed_dev, measured_neutral, primaries, (nwx, nwy), peak, rowsums,
-                    gamma=gamma, target_white_xy=(wx, wy), dark_floor_nits=dark_floor,
-                    n_points=n_points)
-                self.controller.set_correction_grayscale(self.monitor, self.mode, len(new_points),
-                                                         new_points, new_dev, gamma=gamma)
+                new_curves = refine_sdr_cube(
+                    read_1d_cube(Path(installed_path)), measured_neutral, primaries, (nwx, nwy),
+                    peak, rowsums, gamma=gamma, target_white_xy=(wx, wy), dark_floor_nits=dark_floor)
+                new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
+                write_1d_cube(new_path, new_curves,
+                              title=f"DLC SDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
+                self.controller.set_base_lut(self.monitor, self.mode, str(new_path.resolve()), 0.0)
                 self.controller.apply_mhc(self.monitor, self.mode)
-                installed_points, installed_dev = new_points, new_dev
+                installed_path = str(new_path)
 
-            # Unified best-revert: leave (and persist) the BEST measured deviations on every terminal
-            # exit. A converged/floored/budget exit might otherwise strand a marginally-worse-than-best
-            # correction (an uptick within regress_tol never trips the regression gate); reinstalling
-            # best guarantees the standalone foundation never regresses below what was actually measured
-            # best (≥ identity, since round 1 measures identity).
-            if best_dev is not installed_dev:
-                self.controller.set_correction_grayscale(self.monitor, self.mode, len(best_points),
-                                                         best_points, best_dev, gamma=gamma)
+            # Unified best-revert: reinstall the BEST measured cube on every terminal exit. A
+            # converged/floored/safety exit might otherwise strand a marginally-worse-than-best cube (an
+            # uptick within regress_tol never trips the regression gate); reinstalling best guarantees the
+            # standalone foundation never regresses below what was actually measured best (≥ the build base
+            # cube, since round 1 measures it).
+            if best_path != installed_path:
+                self.controller.set_base_lut(self.monitor, self.mode, str(Path(best_path).resolve()), 0.0)
                 self.controller.apply_mhc(self.monitor, self.mode)
-                installed_points, installed_dev = best_points, best_dev
+                installed_path = best_path
 
-            # Persist the final (applied) correctionGrayscale so resume/report reference the refined
-            # foundation (mirrors stages/refine_grayscale.py's state shape).
+            # Point the SDR foundation at the final (best measured) cube so the deliverable + any resume
+            # install reference the refined result (mirrors stage_refine_mhc_cube). The cube owns the whole
+            # neutral correction; correctionGrayscale stays identity (the deprecated user slot).
+            if installed_path != base_lut.get("cube_path"):
+                base_lut["cube_path"] = str(installed_path)
+                params["base_lut"] = base_lut
+                self._state["mhc_params"] = params
             self._state["correction_grayscale"] = {
-                "point_count": len(installed_points), "points": installed_points,
-                "deviations": installed_dev}
+                "point_count": n_points, "points": grid, "deviations": ident}
             _common.save_dlc_state(self.ctx, self._state)
 
             final_avg = scores[-1] if scores else None

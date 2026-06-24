@@ -651,3 +651,117 @@ def test_refine_sdr_grayscale_clamps_deviations():
                                       (1.0, 1.0, 1.0), dev_clamp=(0.25, 4.0))
     for ch in "rgb":
         assert all(0.25 - 1e-9 <= v <= 4.0 + 1e-9 for v in dev[ch])
+
+
+# --- SDR base 1D-LUT cube: build + closed-loop refine (set_base_lut, γ2.2) --
+# The cube-delivered SDR path (replaces the correctionGrayscale path 2026-06-24): build_sdr_cube is
+# the γ analog of build_hdr_cube, and refine_sdr_cube composes onto a per-channel signal→signal .cube
+# (like the HDR base cube) instead of emitting deviations. Same synthetic additive γ panel.
+
+def _perfect_sdr_gray_ramp(n=40, gamma=_GAMMA):
+    # gray tracks native white + power γ exactly: equal shares = s**γ (so the cube is identity).
+    return [_gray_sample(i / (n - 1), ((i / (n - 1)) ** gamma,) * 3) for i in range(n)]
+
+
+def test_build_sdr_cube_perfect_panel_yields_identity():
+    curves, summary = mc.build_sdr_cube(_perfect_sdr_gray_ramp(), _PRIM, _WHITE, _PEAK, lut_size=512)
+    assert summary["basis"] == "gray-ramp" and summary["gamma"] == _GAMMA
+    n = 512
+    for ch in "rgb":
+        c = curves[ch]
+        assert all(c[i] <= c[i + 1] + 1e-6 for i in range(n - 1))     # monotone
+        assert c[0] <= 1e-3                                            # anchored at black
+        for sig in (0.1, 0.3, 0.5, 0.7):                              # ~identity (perfect tracking)
+            j = round(sig * (n - 1))
+            assert abs(c[j] - sig) < 5e-3, (ch, sig, c[j])
+
+
+def test_build_sdr_cube_blue_deficient_shadows_get_boosted():
+    # Blue-deficient in the shadows (gray drifts yellow), neutral at the top: the cube must BOOST blue
+    # over red above the dark floor and leave the peak alone (no fight with the matrix's white move).
+    n = 40
+    samples = []
+    for i in range(n):
+        s = i / (n - 1)
+        frac = s ** _GAMMA
+        b = frac * (0.6 + 0.4 * (i / (n - 1)))            # 40% deficient at black → neutral at peak
+        samples.append(_gray_sample(s, (frac, frac, b)))
+    curves, _ = mc.build_sdr_cube(samples, _PRIM, _WHITE, _PEAK, lut_size=512, dark_floor_nits=1.0)
+    n = 512
+    j = round(0.5 * (n - 1))
+    assert curves["b"][j] > curves["r"][j] + 1e-3, (curves["b"][j], curves["r"][j])
+    assert abs(curves["b"][-1] - curves["r"][-1]) < 2e-3    # peak: channels converge (no white override)
+
+
+def test_build_sdr_cube_requires_neutral():
+    with pytest.raises(ValueError):
+        mc.build_sdr_cube([Ti3Sample(rgb=(0.0, 0.0, 0.0), xyz=(0.0, 0.0, 0.0))],
+                          _PRIM, _WHITE, _PEAK)
+
+
+def _run_sdr_cube_loop(white_xy, rounds=14, peak=120.0):
+    _P, emit, _peak = _synthetic_sdr_panel(white_xy, peak_nits=peak)
+    N = 256
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}                          # identity seed
+    sigs = [0.3, 0.4, 0.5, 0.6, 0.7]
+    def measure(cube):
+        out = []
+        for s in sigs:                                               # rowsums=(1,1,1) ⇒ post-matrix sig == s
+            drive = [_interp_list(grid, cube[ch], s) for ch in "rgb"]
+            out.append((s, emit(drive)))
+        return out
+    for _ in range(rounds):
+        cube = mc.refine_sdr_cube(cube, measure(cube), _PRIM, white_xy, peak,
+                                  (1.0, 1.0, 1.0), dark_floor_nits=0.5)
+    return measure(cube)
+
+
+def test_refine_sdr_cube_converges_warm_panel_to_d65():
+    # A warm panel driven neutral renders ~its warm white; the closed loop must bend the base cube
+    # until the measured neutral lands D65.
+    meas = _run_sdr_cube_loop((0.336, 0.345), rounds=16)
+    for _s, xyz in meas:
+        x, y = _xy(xyz)
+        assert abs(x - 0.3127) < 0.004 and abs(y - 0.3290) < 0.004, (x, y)
+
+
+def test_refine_sdr_cube_leaves_d65_panel_alone():
+    _P, emit, peak = _synthetic_sdr_panel((0.3127, 0.3290))
+    N = 128
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+    sigs = [0.3, 0.5, 0.7]
+    meas = [(s, emit([_interp_list(grid, cube[ch], s) for ch in "rgb"])) for s in sigs]
+    new = mc.refine_sdr_cube(cube, meas, _PRIM, (0.3127, 0.3290), peak, (1.0, 1.0, 1.0), dark_floor_nits=0.5)
+    for ch in "rgb":
+        for j in range(0, N, 8):
+            assert abs(new[ch][j] - cube[ch][j]) < 5e-3, (ch, j)
+
+
+def test_refine_sdr_cube_uses_matrix_rowsums_for_abscissa():
+    # The load-bearing trap: blue's factor is keyed to the POST-matrix signal rowsum_b**(1/γ)·s, so the
+    # SAME measurements under different rowsums place blue's correction at different grid positions →
+    # different blue curves. A wire-keyed bug would produce identical curves. Red/green stay identical.
+    from dlc.colormath import invert3x3, matvec, xy_to_XYZ
+    peak = 120.0
+    disp = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                             _PRIM["bx"], _PRIM["by"], 0.3127, 0.3290, white_Y=peak)
+    disp_inv = invert3x3(disp)
+    N = 512
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+    s_lo, s_hi = 0.3, 0.5
+    blue_scale = {s_lo: 1.0, s_hi: 0.6}                              # perfect low, 40% too dim high
+    meas = []
+    for s in (s_lo, s_hi):
+        tY = peak * (s ** _GAMMA)
+        ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
+        ms = [ts[0], ts[1], ts[2] * blue_scale[s]]
+        xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
+        meas.append((s, xyz))
+    base = mc.refine_sdr_cube(cube, meas, _PRIM, (0.3127, 0.3290), peak, (1.0, 1.0, 1.0), dark_floor_nits=0.5)
+    shifted = mc.refine_sdr_cube(cube, meas, _PRIM, (0.3127, 0.3290), peak, (1.0, 1.0, 2.0), dark_floor_nits=0.5)
+    assert max(abs(base["b"][j] - shifted["b"][j]) for j in range(N)) > 5e-3
+    for ch in ("r", "g"):
+        assert all(abs(base[ch][j] - shifted[ch][j]) < 1e-9 for j in range(N))
