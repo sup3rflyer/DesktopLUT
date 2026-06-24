@@ -5,8 +5,7 @@ hardware facts that outlive a single run** — the design calls for "a persisten
 per-display correction store (with a date), not per-run." This module is that store:
 a small JSON file, keyed by display name, recording for each display the correction
 in use + its build date, the white SPD it was derived from, and the resolved target
-white (chromaticity + provenance). It is the corrections' "medical history",
-the sibling of the GS+WB ``tweak_history.json`` the watchdog keeps.
+white (chromaticity + provenance). It is the corrections' "medical history".
 
 It is **local-only / private** (display- and probe-specific, like the profile) — the
 orchestrator writes it next to the profile (or, in tests, next to the run folders).

@@ -82,8 +82,8 @@ def build(args, ctx: RunContext) -> StageResult:
         # HDR MHC2 LUT (the ColourSpace/DisplayCal import path), reached over the pipe via
         # mhc.set_base_lut. This SUPERSEDES the old "3D LUT owns the HDR neutral axis" design:
         # a 1D LUT does the neutral axis efficiently and leaves only gamut/volumetric to the
-        # cube. (The 32-point set_base_grayscale table — far too sparse for a PQ EOTF — is now
-        # reserved for GS+WB post-fixes.) See dlc.mhc_cube for the grounded math.
+        # cube. (The 32-point set_base_grayscale table is far too sparse for a PQ EOTF, so HDR
+        # does not use it for the EOTF.) See dlc.mhc_cube for the grounded math.
         from ..mhc_cube import (
             HDR_REFERENCE_WHITE_BAND,
             adaptive_dark_floor,

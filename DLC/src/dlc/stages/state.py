@@ -40,6 +40,10 @@ def build(args, ctx: RunContext) -> StageResult:
         runtime_layer = (live.get("runtime") or {}).get(runtime_key, {}) if runtime_key else {}
         runtime_3dlut_path = runtime_layer.get("cube_path") if isinstance(runtime_layer, dict) else None
         runtime_3dlut_loaded = bool(runtime_3dlut_path)
+        # The wire field `corrections_enabled` is the OVERLAY-draw flag, NOT "is a correction live"
+        # (../docs/NAMING.md §4). In DWM-hook mode the overlay is idle, so it reads FALSE even with
+        # a 3D-LUT cube live through the hook. We surface it as `overlay_path_enabled` and judge an
+        # actual live correction from `runtime_3dlut_loaded` (cube_path) instead.
         overlay_path_enabled = live.get("corrections_enabled")
 
     result.metrics = {

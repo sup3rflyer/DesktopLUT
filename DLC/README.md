@@ -8,7 +8,8 @@ the raw measurement stream), and writes the closing panel analysis. DesktopLUT
 remains the runtime colour-management engine (MHC ICC at scanout + DWM-hook 3D LUT);
 DLC steers the calibration that fills it.
 
-> v1 scope: **MHC ICC + 3D LUT + a small grayscale/white-point tweak, SDR-first.**
+> v1 scope: **MHC ICC + 3D LUT, SDR-first** — the MHC owns the neutral axis (matrix +
+> a closed-loop D65 grayscale refine), the 3D LUT owns colour (1+1+1).
 > HDR finalization is the end goal but deferred (the architecture is *aimed* at HDR —
 > PQ patch sets, ICtCp RBF, thermal handling — and proven on SDR first).
 > Design source of truth: **`docs/v2-design-notes.md`**.
@@ -28,9 +29,9 @@ judgement. **Three consumers of a live measurement, never conflated:**
 
 1. **Scripted orchestrator** (`src/dlc/calibrate.py`, `dlc-calibrate`) — a state
    machine that runs a whole calibration as a **named flow** over the canonical
-   pipeline **MHC ICC → 3D LUT → GS+WB** (the grayscale/white tweak is the small
-   *final* step after the 3D LUT). Every stage is memoised in the run-record, giving
-   crash-recovery and live pause/resume.
+   pipeline **MHC ICC → 3D LUT** (the MHC owns the neutral axis — matrix + a
+   closed-loop D65 grayscale refine — and the 3D LUT owns colour; 1+1+1). Every stage
+   is memoised in the run-record, giving crash-recovery and live pause/resume.
 2. **Front-door skill** (repo-root `.claude/skills/calibrate-display/SKILL.md`) — the
    assistant's thin operating manual: map intent → flow, adjudicate the seams the
    core surfaces, write the report.
@@ -45,14 +46,16 @@ judgement. **Three consumers of a live measurement, never conflated:**
 
 | You say | Flow | Runs |
 |---|---|---|
-| "calibrate my display" | `full` | neutral → raw → MHC build/install → post-MHC → 3D-LUT build/check/install → verify → report |
+| "calibrate my display" | `full` | neutral → raw → MHC build/install (+ D65 grayscale refine) → post-MHC → 3D-LUT build/check/install → verify → report |
+| "just the ICC, quick shakedown" | `mhc-only` | raw → MHC build/install (+ D65 refine) → verify → report (no 3D LUT) |
 | "give me a fresh 3D LUT" | `3dlut-only` | verify MHC present → measure → build/check/install cube → verify → report |
-| "quick grayscale + white-point tuning" | `gray-wb` | measure the neutral axis → short GS+WB tweak loop → verify → report (no re-profile, no cube) |
-| "calibrate for HDR" | `hdr` *(the goal; deferred)* | aborts — SDR-first in v1 |
+| "calibrate for HDR" | `--mode HDR` | not a flow — run `full`/`mhc-only` with `--mode HDR` |
 
-`full` is "calibrate the monitor" (ICC + 3D LUT together); `gray-wb` is the most-used
-day-to-day path. A cross-run **tweak-drift watchdog** tracks GS+WB tweak magnitude and
-flags when drift has grown enough to fight the 3D LUT → time for a fresh `full`.
+`full` is "calibrate the monitor" (ICC + 3D LUT together); `mhc-only` is the fast
+shakedown that proves the foundation before a dense 3D-LUT run. The MHC ICC is the
+**sole neutral-axis owner** (a closed-loop D65 grayscale refine); the post-3D-LUT GS+WB
+tweak and its `gray-wb` flow were removed 2026-06-24 (they re-corrected the MHC-owned
+neutral a third time, breaking the 1+1+1 layering).
 
 ## The correction machine
 

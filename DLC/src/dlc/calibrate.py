@@ -368,7 +368,10 @@ class PatchSizes:
     # there and colour ramps start above it. Just above low_light_signal so the two don't overlap.
     verify_color_min_signal: float = 0.25
 
-    # neutral axis (GS+WB tweak / gray-wb flow)
+    # grey-axis ramp measured by the MHC closed-loop D65 grayscale refine (writes the
+    # MHC correctionGrayscale layer — see ../docs/NAMING.md §2). NOT the removed overlay
+    # GS+WB tweak. This is a count of grey PATCHES to measure, independent of the MHC
+    # curve's point count (which the C++ side constrains to {10,20,32}).
     neutral_steps: int = 17         # grey-axis ramp steps
 
     # additive shadow density: preserve ordinary whole-range anchors, then add extra low-light
@@ -456,8 +459,8 @@ class CalibrationResult:
 # ---------------------------------------------------------------------------
 
 class CalibrationAborted(Exception):
-    """A flow ended early at the core's own invariant (e.g. gray-wb with no MHC
-    stack to tune, or HDR in an SDR-first build). Carries the partial result."""
+    """A flow ended early at the core's own invariant (e.g. 3dlut-only with no MHC
+    stack present, or HDR in an SDR-first build). Carries the partial result."""
 
     def __init__(self, outcome: StageOutcome) -> None:
         super().__init__(outcome.digest.get("message", outcome.stage))
@@ -964,14 +967,13 @@ class Calibration:
             return False
 
     def _capture_inplace_baseline(self) -> dict[str, Any]:
-        """In-place flows (gray-wb / 3dlut-only) tune the *installed* stack directly — they
-        never enter calibration mode, so there is no C++ snapshot to revert to. Record what
-        IS restorable over the pipe (the runtime 3D-LUT cube) BEFORE we mutate, so a 'revert'
-        at the apply gate can put the prior cube back. The MHC correction-grayscale/white a
-        gray-wb tweak overwrites is NOT exposed by ``state.get`` (the C++ HandleStateGet only
-        reports ``applied``/``cube_path``), so that half is not auto-revertible — the durable
-        settings backup captured at preflight is the fallback. Captured once (persists across
-        a pause/resume in the run-record)."""
+        """The in-place flow (``3dlut-only``) tunes the *installed* stack directly — it never
+        enters calibration mode, so there is no C++ snapshot to revert to. Record what IS
+        restorable over the pipe (the runtime 3D-LUT cube) BEFORE we mutate, so a 'revert' at
+        the apply gate can put the prior cube back. (The C++ ``HandleStateGet`` only reports
+        ``applied``/``cube_path``, so only the cube is auto-revertible; the durable settings
+        backup captured at preflight is the fallback for anything else.) Captured once
+        (persists across a pause/resume in the run-record)."""
         existing = self.calib.get("inplace_baseline")
         if existing is not None:
             return existing
@@ -987,12 +989,11 @@ class Calibration:
         return record
 
     def _revert_inplace(self) -> str:
-        """Revert an in-place refinement (gray-wb / 3dlut-only). 3dlut-only's only display
-        mutation is the runtime cube, so it is fully restorable — put the prior cube back
-        (or clear it if there was none). gray-wb overwrote the MHC correction-grayscale/white,
-        which ``state.get`` does not expose, so it cannot be faithfully auto-reverted: surface
-        the durable settings backup for a manual restore. Returns the terminal status
-        (``reverted`` when the display was put back, else ``revert_unavailable``)."""
+        """Revert the in-place refinement (``3dlut-only``). Its only display mutation is the
+        runtime cube, so it is fully restorable — put the prior cube back (or clear it if there
+        was none). If even that fails, surface the durable settings backup for a manual restore.
+        Returns the terminal status (``reverted`` when the display was put back, else
+        ``revert_unavailable``)."""
         baseline = self.calib.get("inplace_baseline") or {}
         flow = self.calib.get("flow")
         if flow == "3dlut-only" and baseline.get("captured"):
@@ -1010,8 +1011,8 @@ class Calibration:
         bak = self.calib.get("backup") or {}
         ref = bak.get("ini_backup") or bak.get("path")
         self.ctx.log(
-            "could not auto-revert this in-place refinement: the prior MHC grayscale/white is "
-            "not recoverable over the pipe. Restore manually from the pre-run settings backup"
+            "could not auto-revert this in-place refinement over the pipe. Restore manually "
+            "from the pre-run settings backup"
             + (f" ({ref})" if ref else " in the run folder") + ", or run a full calibration.")
         return "revert_unavailable"
 
@@ -1031,7 +1032,7 @@ class Calibration:
         and DesktopLUT persists that dead path across restarts). The deliverable is a byte-identical
         copy assembled by ``stage_report``, so the displayed image does not change — only the
         persisted path becomes stable. Apply path only, and a no-op for flows that built no cube
-        (``mhc-only`` / ``gray-wb`` leave ``deliverable_cube`` None). Best-effort: a failure leaves
+        (``mhc-only`` leaves ``deliverable_cube`` None). Best-effort: a failure leaves
         the working run-dir cube installed, which is no worse than before this re-point existed."""
         if not cube_path:
             return
@@ -1054,7 +1055,7 @@ class Calibration:
         return self.profile.transfer_for(self.target_name, bit_depth=self.bit_depth)
 
     def _engine_target(self):
-        # The 3D-LUT correction targets the SAME resolved white the MHC/GS+WB stages do.
+        # The 3D-LUT correction targets the SAME resolved white the MHC stages do.
         return self.profile.engine_target(self.target_name, white_xy=self._white_xy())
 
     def _reachable_primaries(self) -> Optional[dict]:
@@ -1895,8 +1896,8 @@ class Calibration:
         persist it to the cross-run per-display correction store. SPD/white-point
         promoted to a **first-class early stage**: the SPD does double duty (the
         colorimeter correction *and* the SPD-derived "CRT-like" D65), and the resolved
-        white flows into the MHC matrix, the 3D-LUT target, and the GS+WB tweak — all
-        three aim at the *same* white. No new ⚑ seam: the correction-staleness *tell*
+        white flows into the MHC matrix (and its closed-loop D65 grayscale refine) and the
+        3D-LUT target — both aim at the *same* white. No new ⚑ seam: the correction-staleness *tell*
         already fired in preflight; the white is reported (in the digest + report), not
         asked. Falls back to numeric D65 when no SPD is on hand, so it never blocks."""
         def run() -> StageOutcome:
@@ -2584,8 +2585,8 @@ class Calibration:
             else:
                 self.controller.set_white(self.monitor, self.mode, wx, wy)
             # HDR base EOTF rides a full-resolution per-channel 1D .cube (set_base_lut → 4096-entry
-            # MHC2 LUT); the 32-point set_base_grayscale table is too sparse for a PQ EOTF and is
-            # reserved for GS+WB post-fixes. SDR keeps the (adequate) 32-point base.
+            # MHC2 LUT); the 32-point set_base_grayscale table is too sparse for a PQ EOTF, so HDR
+            # does not use it for the EOTF. SDR keeps the (adequate) 32-point base.
             if spec.is_hdr and base_lut and base_lut.get("cube_path"):
                 # peak_nits = the cube's post-cap NEUTRAL ceiling (the achievable-D65 Peak-Chroma cap),
                 # derived from the one resolved max-sustained peak (Task C). This is the number a future
@@ -3331,8 +3332,8 @@ class Calibration:
                     "verify", "aborted",
                     digest={"message": "verify TI3 has no usable measurements to score "
                                        "(all reads failed?) — aborting before the quality gate."}))
-            # Score against the SAME resolved white the pipeline targeted (MHC matrix, 3D-LUT
-            # target, GS+WB tweak) — not textbook D65 — so a non-zero white strength is the goal
+            # Score against the SAME resolved white the pipeline targeted (MHC matrix + grayscale
+            # refine, 3D-LUT target) — not textbook D65 — so a non-zero white strength is the goal
             # here, not scored as white error. SDR scores CIEDE2000 against γ-power/sRGB; HDR
             # scores dE_ITP against PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's
             # Lab is meaningless at HDR absolute luminance), with looser, LLM-negotiated targets.
@@ -3625,10 +3626,6 @@ class Calibration:
         return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
                                  max_cv=self._patch_max_cv())
 
-    def _neutral_verify_patches(self) -> list[tuple[int, int, int]]:
-        return build_neutral_verify_set(self.patch_sizes, self._transfer(),
-                                        warm_tau=self._warm_tau(), max_cv=self._patch_max_cv())
-
     def _verify_patches(self, *, gamut_aware: bool = True) -> list[tuple[int, int, int]]:
         # The "cover all bases" QC set (see build_verify_set): dense grey/PQ + shadow toe, colour
         # only above the shadow band, gamut-capped. gamut_aware caps saturated hues to the panel's
@@ -3668,10 +3665,10 @@ class Calibration:
         # Honour the apply/revert gate. Two rollback regimes:
         #  - flows that ENTERED calibration mode (full / mhc-only) have a real C++ snapshot:
         #    'revert' restores it, 'apply' (or anything non-revert) commits the new profile.
-        #  - in-place flows (gray-wb / 3dlut-only) never entered calibration mode; the change
-        #    is already live. 'revert' is honoured as far as the pipe allows (the 3D-LUT cube
-        #    is restorable; the MHC grayscale a gray-wb tweak overwrote is not — see
-        #    _revert_inplace). Either way we must NOT silently report 'completed' on a revert.
+        #  - the in-place flow (3dlut-only) never entered calibration mode; the change is
+        #    already live. 'revert' is honoured as far as the pipe allows (the 3D-LUT cube is
+        #    restorable — see _revert_inplace). Either way we must NOT silently report
+        #    'completed' on a revert.
         choice = (self.calib.get("decisions") or {}).get("verify:accept", {}).get("choice")
         if self._entered_calibration():
             if choice == "revert":
@@ -3686,7 +3683,7 @@ class Calibration:
         if status == "completed":
             # Apply path: re-point DesktopLUT at the DURABLE deliverable cube so a cleaned
             # run folder can't break the live calibration (the build artifact lives under the
-            # gitignored run dir). No-ops when this flow built no cube (mhc-only / gray-wb).
+            # gitignored run dir). No-ops when this flow built no cube (mhc-only).
             self._install_durable_cube(rep.data.get("deliverable_cube"))
         self.runlog.run_done(status, results_dir=rep.data.get("results_dir"),
                              report_path=rep.data.get("report_path"))
@@ -3855,7 +3852,7 @@ class Calibration:
                     "dip_store": str(self._dip_store().path)})
 
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
-        """gray-wb / 3dlut-only assume an installed stack. If it's missing, escalate
+        """3dlut-only assumes an installed stack. If it's missing, escalate
         ('nothing to tune — do a full calibration first') rather than silently
         building from nothing."""
         try:
@@ -4252,8 +4249,9 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
 def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
                       warm_tau: Optional[int] = None,
                       max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The grey-axis ramp for the GS+WB tweak / gray-wb flow. ``max_cv`` caps the range
-    (HDR peak; see :func:`build_ramp_set`)."""
+    """The grey-axis ramp measured by the MHC closed-loop D65 grayscale refine (each round
+    re-measures this neutral ramp and pulls the MHC correctionGrayscale layer toward D65).
+    ``max_cv`` caps the range (HDR peak; see :func:`build_ramp_set`)."""
     cap = max_cv if max_cv is not None else transfer.max_cv
     n = ps.neutral_steps
     levels = uniform_levels(n, cap)
@@ -4261,15 +4259,6 @@ def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
         levels = sorted(set(levels) | set(shadow_levels(
             ps.low_light_steps, transfer, max_cv=cap,
             max_signal=ps.low_light_signal, bias=ps.low_light_bias)))
-    return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
-
-
-def build_neutral_verify_set(ps: PatchSizes, transfer: Transfer, *,
-                             warm_tau: Optional[int] = None,
-                             max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The compact grey-axis sanity ramp for gray-wb verification. ``max_cv`` caps the range."""
-    cap = max_cv if max_cv is not None else transfer.max_cv
-    levels = uniform_levels(ps.neutral_steps, cap)
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
@@ -4316,8 +4305,7 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
     "3dlut-only": ("post-mhc", "verify"),
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
-                   "post-mhc": build_volumetric_set, "verify": build_verify_set,
-                   "gray-wb": build_neutral_set, "verify-neutral": build_neutral_verify_set}
+                   "post-mhc": build_volumetric_set, "verify": build_verify_set}
 
 
 def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
@@ -4523,7 +4511,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     patch.add_argument("--verify-saturations", type=float, nargs="+", default=None, dest="verify_saturations",
                        help="verify saturation shells (default 1.0 0.5 — saturated + practical mid-sat).")
     patch.add_argument("--neutral-steps", type=int, default=None, dest="neutral_steps",
-                       help="grey-axis ramp steps for GS+WB / gray-wb (default 17).")
+                       help="grey-axis ramp steps measured by the MHC D65 grayscale refine "
+                            "(the correctionGrayscale closed loop; default 17).")
     patch.add_argument("--low-light-steps", type=int, default=None, dest="low_light_steps",
                        help="extra ramp/tube levels inside the shadow band (default 9).")
     patch.add_argument("--low-light-cube-size", type=int, default=None, dest="low_light_cube_size",

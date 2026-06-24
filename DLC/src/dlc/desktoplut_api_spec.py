@@ -231,9 +231,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "runtime.set_grayscale_tweak",
-            "Set the runtime shader grayscale (GS+WB) tweak — DesktopLUT's main-GUI "
-            "grayscale-correction path. The fast proxy tier for GS+WB iteration: applied "
-            "without an ICC re-bake, later baked into the editable MHC grayscale/WB controls.",
+            "Set the runtime OVERLAY grayscale tweak — the Corrections-tab / DWM-hook shader "
+            "layer (ColorCorrectionData::grayscale; see ../docs/NAMING.md S2), DISTINCT from the "
+            "MHC correctionGrayscale that DLC's D65 refine owns. Applied live without an ICC "
+            "re-bake. Not driven by the current orchestrator (its only caller was the removed "
+            "GS+WB flow); kept as pipe-API surface for the shader-fast-refine direction.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
@@ -253,7 +255,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "runtime.disable_grayscale_tweak",
-            "Disable the runtime shader grayscale (GS+WB) tweak layer.",
+            "Disable the runtime OVERLAY grayscale tweak layer (the Corrections-tab shader "
+            "layer; see ../docs/NAMING.md S2). Used by lut3d to clear it before a 3D-LUT build.",
             {"monitor": _monitor_param(), "mode": _mode_param()},
             {"monitor_mode": "string", "runtime": "object"},
             mutates_state=True,

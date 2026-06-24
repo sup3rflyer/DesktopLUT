@@ -225,7 +225,14 @@ class CalibrationController:
             {"monitor": monitor, "mode": normalize_mode(mode)},
         )
 
-    # -- runtime GS+WB tweak (fast shader proxy tier) ---------------------
+    # -- runtime OVERLAY grayscale tweak (the Corrections-tab / DWM-hook shader layer) ----
+    # IMPORTANT (../docs/NAMING.md §2): this drives ``ColorCorrectionData::grayscale`` — the
+    # OVERLAY/Corrections-tab grayscale, a DIFFERENT layer from the MHC ``correctionGrayscale``
+    # that DLC's closed-loop D65 refine owns. The orchestrator no longer drives ``set_`` here:
+    # the old "GS+WB" flow (removed 2026-06-24, when the MHC matrix + grayscale refine took sole
+    # ownership of the neutral axis) was its only caller. Kept for pipe-API completeness and the
+    # shader-fast-refine design direction. ``disable_`` IS still used — lut3d.py clears this
+    # overlay layer before a standalone 3D-LUT build.
     def set_grayscale_tweak(
         self,
         monitor: int,
@@ -234,11 +241,12 @@ class CalibrationController:
         points: list[float],
         deviations: dict[str, list[float]],
     ) -> dict[str, Any]:
-        """Set the runtime shader grayscale (GS+WB) tweak — the fast proxy tier.
-
-        Iterated without an ICC re-bake; converged values are later baked into the
-        editable MHC grayscale/WB controls (set_correction_grayscale + set_white).
+        """Set the runtime OVERLAY grayscale tweak (the Corrections-tab shader layer, NOT the
+        MHC grayscale — see ../docs/NAMING.md §2). Applied live without an ICC re-bake.
         Per-channel deviations carry both grayscale tracking and white balance.
+
+        Not driven by the current orchestrator (the removed GS+WB flow was its only caller);
+        retained as pipe-API surface for the shader-fast-refine direction.
         """
         return self.call(
             "runtime.set_grayscale_tweak",

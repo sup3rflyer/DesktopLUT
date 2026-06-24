@@ -382,7 +382,7 @@ class Profile:
 
         ``white_xy`` overrides the target's own white (the orchestrator passes the
         run's :meth:`resolve_white` result so the 3D-LUT correction targets the same
-        white the MHC/GS+WB stages do); without it, falls back to ``spec.white_xy()``.
+        white the MHC stages do); without it, falls back to ``spec.white_xy()``.
         """
         from .engine.model import Target
 

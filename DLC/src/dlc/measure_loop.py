@@ -653,8 +653,8 @@ class _Loop:
 
         PRIMARY trigger = MEASURED progress at quartiles (the owner's no-magic-cadence rule).
         BACKSTOP = a coarse wall-clock floor (§12 ``--checkin-interval``), so a slow stage —
-        or a measure-only flow (``mhc-only`` / ``gray-wb``: no optimizer ticking §12 at the
-        orchestrator) — never goes dark over a long run ("never 0 check-ins in a 3-hour run").
+        or a measure-only flow (``mhc-only``: no optimizer ticking §12 at the orchestrator) —
+        never goes dark over a long run ("never 0 check-ins in a 3-hour run").
         EMIT-ONLY: this never gates or pauses (the §12 stage-boundary seam owns the
         mode-driven continue? decision); here we only surface status. Every emit (quartile or
         backstop) resets the floor so a quartile crossing doesn't immediately re-trigger it."""

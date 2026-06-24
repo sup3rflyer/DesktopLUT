@@ -186,7 +186,7 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
     """Score TI3 samples as CIEDE2000 vs the ideal target.
 
     ``white_xy`` is the run's RESOLVED target white (what stage_whitepoint fed into the MHC
-    matrix, the 3D-LUT target, and the GS+WB tweak). When given, both the per-patch target and
+    matrix + its grayscale refine, and the 3D-LUT target). When given, both the per-patch target and
     the Lab reference white are built from sRGB primaries + that white, so a non-D65 white
     (e.g. the SPD-derived CRT-like white at strength>0) is the GOAL rather than scored as error.
     When ``None`` (legacy callers), it falls back to textbook D65 — unchanged behaviour."""
