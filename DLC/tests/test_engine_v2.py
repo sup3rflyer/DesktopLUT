@@ -85,6 +85,128 @@ def test_gamut_capped_ramp_lands_in_gamut_with_one_clip_marker():
     assert out_capped <= 2                          # capped: only the clip marker(s) sit out of gamut
     assert n_capped >= 10                           # still a full ramp, just redistributed in-range
 
+
+# ---------------------------------------------------------------------------
+# Gamut-aware VOLUMETRIC build set: project the bulk stimuli onto the reachable
+# gamut (no-op for in-gamut), bracket the boundary with target-gamut anchors,
+# always carry the neutral tube + dark refinements, and scale with gamut volume.
+# ---------------------------------------------------------------------------
+
+_NARROW = {"R": (0.6927, 0.3028), "G": (0.1825, 0.7502), "B": (0.1521, 0.0646)}   # PA32UCXR (~P3-ish)
+_WIDE = {"R": (0.708, 0.292), "G": (0.170, 0.797), "B": (0.131, 0.046)}           # covers Rec.2020
+
+
+def test_reachable_signal_is_noop_in_gamut_and_moves_oog():
+    tr = P.Transfer.pq(bit_depth=10)
+    m = float(tr.max_cv)
+    target = Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329))
+    space_none = TargetSpace(target)
+    space_reach = TargetSpace(target, reachable_primaries=_NARROW)
+    # Grey + near-neutral stimuli are inside ANY gamut → round-trip to their own code value.
+    for cv in [(512, 512, 512), (700, 680, 690), (300, 310, 305), (900, 880, 872)]:
+        s = np.array([[c / m for c in cv]], float)
+        for sp in (space_none, space_reach):
+            out = sp.reachable_signal(s)[0]
+            assert all(abs(round(o * m) - c) <= 1 for o, c in zip(out, cv)), (cv, out * m)
+    # Full-saturation blue is OOG for the narrow panel → reachable_signal pulls chroma in (off-channels
+    # rise); with no reachable_primaries it is left untouched (the exact prior behaviour).
+    blue = np.array([[0.0, 0.0, 1.0]], float)
+    assert space_none.reachable_signal(blue)[0] == pytest.approx([0.0, 0.0, 1.0], abs=1e-4)
+    moved = space_reach.reachable_signal(blue)[0]
+    assert moved[0] + moved[1] > 0.02               # chroma pulled inward toward the reachable boundary
+
+
+def test_target_anchor_patches_bracket_the_reachable_boundary():
+    from dlc.engine.model import signal_saturation_caps
+    from dlc.gamut import point_in_triangle
+    nt = [_NARROW["R"], _NARROW["G"], _NARROW["B"]]
+    tr = P.Transfer.pq(bit_depth=10)
+    target = Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329))
+    space_raw = TargetSpace(target)                 # NO clip — caps need the raw space to detect OOG
+    levels = [200, 512, 870]
+    caps_by_level = {V: signal_saturation_caps(space_raw, _NARROW, level=V / tr.max_cv) for V in levels}
+    anchors = P.target_anchor_patches(tr, levels=levels, caps_by_level=caps_by_level, order="luminance")
+
+    def raw_xy(rgb):
+        xyz = space_raw.ideal_xyz(np.array([[c / tr.max_cv for c in rgb]], float))[0]
+        s = float(sum(xyz))
+        return (float(xyz[0]) / s, float(xyz[1]) / s)
+
+    inside = [p for p in anchors if min(p) > 0]                 # just-inside anchor (off-channel lit)
+    markers = [p for p in anchors if min(p) == 0]              # OOG clip marker (off-channel == 0)
+    assert inside and markers                                   # the boundary is bracketed both sides
+    for p in inside:
+        assert point_in_triangle(raw_xy(p), *nt), p             # just-inside anchors are reachable
+    for p in markers:
+        assert not point_in_triangle(raw_xy(p), *nt), p         # clip markers sit just outside
+
+
+def test_gamut_aware_volumetric_drops_oog_keeps_interior_and_scales_with_gamut():
+    from dlc.calibrate import PatchSizes, build_volumetric_set, _volumetric_bulk, _project_and_thin
+    from dlc.gamut import point_in_triangle
+    nt = [_NARROW["R"], _NARROW["G"], _NARROW["B"]]
+    tr = P.Transfer.pq(bit_depth=10)
+    m = float(tr.max_cv)
+    target = Target.hdr_rec2020_pq(white_xy=(0.3127, 0.329))
+    space_raw = TargetSpace(target)
+    ps = PatchSizes(volumetric_mode="gamut", gamut_lum_steps=6, gamut_hues=8, low_light_steps=5)
+
+    def in_gamut(p):
+        if p[0] == p[1] == p[2]:
+            return True                                                       # grey is always reachable
+        xyz = space_raw.ideal_xyz(np.array([[c / m for c in p]], float))[0]
+        s = float(sum(xyz))
+        return s <= 0 or point_in_triangle((xyz[0] / s, xyz[1] / s), *nt)
+
+    def bright_oog_frac(pset):
+        # Chromaticity is only meaningful above the shadow band; sub-nit chroma is noise-dominated and
+        # deliberately left sparse + un-capped (the foundation's dark set), so OOG is measured on the
+        # bright chroma the projection actually operates on.
+        chroma = [p for p in pset if not (p[0] == p[1] == p[2]) and max(p) / m >= 0.25]
+        return sum(1 for p in chroma if not in_gamut(p)) / max(1, len(chroma))
+
+    # 1. Projecting the bulk onto the reachable gamut eliminates the vast majority of bright OOG reads.
+    bulk = _volumetric_bulk(ps, tr, warm_tau=None, max_cv=None)
+    proj = _project_and_thin(bulk, target=target, reachable_primaries=_NARROW, transfer=tr, max_cv=None)
+    assert bright_oog_frac(bulk) > 0.3
+    assert bright_oog_frac(proj) < 0.10
+
+    ga = build_volumetric_set(ps, tr, target=target, reachable_primaries=_NARROW)
+
+    def sat(p):
+        mx = max(p)
+        return 0.0 if mx == 0 else (mx - min(p)) / mx
+
+    # 2. Content bias preserved: the grey axis never moves (projection is a no-op on neutral), and the
+    #    near-neutral interior (where ~99 % of content lives) is not thinned away — it grows, because
+    #    the always-on neutral tube + dark foundation is added on top of the preserved bulk interior.
+    assert {p for p in bulk if p[0] == p[1] == p[2]} <= set(ga)
+    assert sum(1 for p in ga if sat(p) < 0.2) >= sum(1 for p in bulk if sat(p) < 0.2)
+    # 3. Density scales with reachable gamut volume + no micro-clusters: a uniform cube over a NARROW
+    #    panel collapses many OOG corners onto a thin boundary, so min-separation thinning sheds the
+    #    near-duplicates ("50 patches on 0.001 of blue"); over a WIDE panel projection is a no-op so
+    #    every distinct sample is kept. Fixed spacing ⇒ surviving count tracks reachable volume.
+    cube = _volumetric_bulk(PatchSizes(volumetric_mode="cube", cube_size=9, low_light_cube_size=0),
+                            tr, warm_tau=None, max_cv=None)
+    cube_narrow = _project_and_thin(cube, target=target, reachable_primaries=_NARROW, transfer=tr, max_cv=None)
+    cube_wide = _project_and_thin(cube, target=target, reachable_primaries=_WIDE, transfer=tr, max_cv=None)
+    assert len(cube_wide) == len(cube)             # wide panel ⊇ target ⇒ projection is a no-op
+    assert len(cube_narrow) < 0.7 * len(cube_wide)  # narrow panel ⇒ OOG corners collapse + thin away
+    # 4. The colorimetric foundation is present: target-gamut anchors leave OOG clip markers that
+    #    bracket the boundary (the intentionally-OOG brackets that are exempt from projection).
+    assert any(not in_gamut(p) for p in ga)
+
+
+def test_verify_is_one_fixed_preset_shape_for_both_modes():
+    # Owner directive B: one "cover all bases" verify preset for SDR and HDR. The reachable cap is the
+    # only SDR/HDR difference and is a structural no-op when the panel covers the target (caps all 1.0).
+    from dlc.calibrate import PatchSizes, build_verify_set
+    tr = P.Transfer.pq(bit_depth=10)
+    ps = PatchSizes()
+    no_cap = build_verify_set(ps, tr, hue_sat_caps=None)                       # SDR (no cap)
+    noop_cap = build_verify_set(ps, tr, hue_sat_caps={c: 1.0 for c in "RGBCMY"})  # panel ⊇ target
+    assert no_cap == noop_cap
+
 def _synth_measure(space: TargetSpace, signal, *, gains=(1.0, 0.992, 0.985),
                    gammas=(1.0, 1.010, 1.018), noise=0.004, seed=3):
     s = np.clip(np.asarray(signal, float), 0, 1)

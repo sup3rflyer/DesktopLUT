@@ -203,6 +203,24 @@ class TargetSpace:
             raise ValueError(f"unknown transfer: {self.target.transfer!r}")
         return signal.reshape(shape)
 
+    # -- signal -> reachable signal (gamut projection of a STIMULUS) ------
+    def reachable_signal(self, signal_rgb: np.ndarray) -> np.ndarray:
+        """Project a build STIMULUS onto the panel's physically-reachable gamut, in SIGNAL space.
+
+        The optimizer already clamps the *target* onto the reachable gamut (``ideal_xyz`` →
+        :func:`_chroma_clip_to_gamut`), so an out-of-gamut saturated stimulus is metered against a
+        target the panel can't reach — a wasted read. This maps such a stimulus to the signal whose
+        ideal target IS the reachable-boundary colour (same intensity + hue, chroma pulled in), so the
+        build samples a point the panel can render instead. It is the stimulus-space analogue of the
+        target clamp and uses the SAME projection, so build samples and scoring stay consistent.
+
+        **No-op for in-gamut stimuli** (and whenever ``reachable_primaries`` is ``None``): ``ideal_xyz``
+        leaves an in-gamut target unchanged and ``xyz_to_signal`` is its exact inverse, so the signal
+        round-trips to itself (to float precision). Only out-of-gamut stimuli move. The returned PQ
+        signal can slightly exceed 1.0 for the rare native⊄target hue (``xyz_to_signal`` only clamps
+        negatives on the PQ path) — the caller quantises and clips to the code-value range."""
+        return self.xyz_to_signal(self.ideal_xyz(signal_rgb))
+
     # -- absolute XYZ <-> ICtCp -------------------------------------------
     @staticmethod
     def xyz_to_ictcp(xyz_abs: np.ndarray) -> np.ndarray:

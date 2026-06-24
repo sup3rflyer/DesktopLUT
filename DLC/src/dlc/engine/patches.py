@@ -48,6 +48,7 @@ __all__ = [
     "cube_patches",
     "tube_patches",
     "gamut_patches",
+    "target_anchor_patches",
     "to_signal",
     "SATURATION_SHELLS",
 ]
@@ -342,6 +343,11 @@ _SECONDARIES = [
 ]
 _RAMP_COLORS = _PRIMARIES + _SECONDARIES
 
+# A hue's on/off channel pattern → its cap key (R/G/B primaries + C/M/Y secondaries). Shared by
+# every generator that scales saturation by a per-hue reachable cap (ramp + anchors).
+_HUE_LETTER = {(1, 0, 0): "R", (0, 1, 0): "G", (0, 0, 1): "B",
+               (0, 1, 1): "C", (1, 0, 1): "M", (1, 1, 0): "Y"}
+
 
 def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  saturations: Sequence[float] = (1.0,),
@@ -400,9 +406,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
     color_min_cv = round(color_min_signal * transfer.max_cv) if color_min_signal > 0 else 0
     colors = _RAMP_COLORS if include_secondaries else _PRIMARIES
     vtop = max(levels) if levels else 0
-    # Map a hue's on/off channel pattern → its cap key (R/G/B primaries + C/M/Y secondaries).
-    _hue_letter = {(1, 0, 0): "R", (0, 1, 0): "G", (0, 0, 1): "B",
-                   (0, 1, 1): "C", (1, 0, 1): "M", (1, 1, 0): "Y"}
+    _hue_letter = _HUE_LETTER
     for _name, r_on, g_on, b_on in colors:
         # Gamut-aware cap (``hue_sat_caps``): for any hue (primary OR secondary) whose target is
         # unreachable, scale its saturations into the panel's reachable range so each patch lands
@@ -695,6 +699,61 @@ def gamut_patches(transfer: Transfer, *, lum_steps: int = 17, hues: int = 12,
                 add(_hsv_to_rgb_cv(h, s, v))
 
     return sort_patches(patches, order, transfer, warm_tau=warm_tau)
+
+
+# ---------------------------------------------------------------------------
+# Target-gamut anchors — the colorimetric foundation at the reachable boundary
+# ---------------------------------------------------------------------------
+
+def target_anchor_patches(transfer: Transfer, *, levels: Sequence[int],
+                          caps_by_level: dict[int, dict[str, float]],
+                          inset: float = 0.95, include_secondaries: bool = True,
+                          max_cv: int | None = None, order: str = "thermal",
+                          warm_tau: Optional[int] = None) -> list[Patch]:
+    """RGBCMY anchors that BRACKET the panel's reachable gamut boundary at a few luminance levels.
+
+    For every grey ``level`` (a code value) and hue, two patches bracket the edge so the 3D-LUT's
+    RBF straddles the boundary rather than balancing on it:
+
+      * a **just-inside** anchor at ``inset × cap`` saturation (``cap`` = that hue's reachable
+        signal-saturation cap at this level, from :func:`dlc.engine.model.signal_saturation_caps`;
+        ``1.0`` = no cap). This is the most-saturated stimulus the panel can actually render here.
+      * a single **just-outside OOG clip marker** at full saturation — ONLY for a capped hue
+        (``cap < 1.0``). The panel clips it to its boundary, documenting where the edge is. A
+        reachable hue (``cap == 1.0``) gets no marker (its full-saturation primary is in gamut and
+        is covered by the saturation sweep).
+
+    This is the colorimetric-foundation analogue of the ``ramp_patches`` clip marker (whose sweep
+    samples AT the cap); the inset places the anchor a hair *inside* it. PURE STDLIB: the caps are
+    computed in the engine and passed in precomputed (``caps_by_level[level][hue_letter]``), mirroring
+    how :func:`ramp_patches` consumes ``hue_sat_caps``."""
+    if max_cv is None:
+        max_cv = transfer.max_cv
+
+    def clamp(x: float) -> int:
+        return min(max_cv, max(0, int(round(x))))
+
+    colors = _RAMP_COLORS if include_secondaries else _PRIMARIES
+    seen: set[Patch] = set()
+    out: list[Patch] = []
+
+    def add(p: Patch) -> None:
+        if p[0] == p[1] == p[2] or p in seen:   # anchors are chromatic; drop a degenerate grey/dup
+            return
+        seen.add(p)
+        out.append(p)
+
+    for V in levels:
+        if V <= 0:
+            continue
+        caps = caps_by_level.get(V) or caps_by_level.get(int(V)) or {}
+        for _name, r_on, g_on, b_on in colors:
+            cap = caps.get(_HUE_LETTER[(int(r_on), int(g_on), int(b_on))], 1.0)
+            off = clamp(V * (1.0 - inset * cap))
+            add((V if r_on else off, V if g_on else off, V if b_on else off))   # just-inside anchor
+            if cap < 1.0:
+                add((V if r_on else 0, V if g_on else 0, V if b_on else 0))      # OOG clip marker
+    return sort_patches(out, order, transfer, warm_tau=warm_tau)
 
 
 # ---------------------------------------------------------------------------
