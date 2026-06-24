@@ -635,7 +635,7 @@ function nearestMark(svg, clientX, clientY) {
   const loc = pt.matrixTransform(ctm.inverse());
   let best = null, bestD = Infinity;
   svg.querySelectorAll("circle, rect").forEach((el) => {
-    const t = el.getElementsByTagName("title")[0];     // only data marks carry a <title>
+    const t = el.getElementsByTagName("desc")[0];      // only data marks carry a <desc> (no native tooltip)
     if (!t || t.parentNode !== el) return;
     const d = markDist(el, loc.x, loc.y);
     if (d < bestD) { bestD = d; best = { el, title: t.textContent }; }
@@ -656,7 +656,14 @@ function wireChartHover(container) {
       drawErrorVector(hit.el);                          // error vector to target (no-op off the CIE tile)
     }
     const tip = $("chart-tip");
-    tip.textContent = hit.title;
+    // hover content is row-structured ("\n" rows, "\t" label/value) → render as a tile: a header
+    // line, then aligned label/value rows (ΔE / Measured / Target for the CIE scatter).
+    tip.innerHTML = String(hit.title || "").split("\n").map((r) => {
+      const ti = r.indexOf("\t");
+      return ti < 0
+        ? `<div class="ct-hdr">${esc(r)}</div>`
+        : `<div class="ct-row"><span class="ct-k">${esc(r.slice(0, ti))}</span><span class="ct-v">${esc(r.slice(ti + 1))}</span></div>`;
+    }).join("");
     tip.hidden = false;
     const pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight;
     let x = e.clientX + pad, y = e.clientY + pad;       // fixed-positioned, clamped to viewport

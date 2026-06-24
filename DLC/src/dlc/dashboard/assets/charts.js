@@ -10,7 +10,10 @@
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const fmt = (n, d) => (n == null || Number.isNaN(Number(n))) ? "" : Number(n).toFixed(d == null ? 2 : d);
   const niceTicks = (lo, hi, n) => { const o = []; for (let i = 0; i <= n; i++) o.push(lo + (hi - lo) * i / n); return o; };
-  const title = (s) => `<title>${esc(s)}</title>`;
+  // Hover data carrier. Uses <desc>, NOT <title>: <title> triggers the browser's own native
+  // tooltip (which covers our custom one); <desc> is invisible metadata with no native tooltip,
+  // and the hover code reads it the same way. Content may be multi-row ("\n") with "\t" label/value.
+  const hov = (s) => `<desc>${esc(s)}</desc>`;
 
   function Plot(o) {
     const W = o.w || VB.w, H = o.h || VB.h;
@@ -66,7 +69,7 @@
     const pr = d.primaries || {};
     if (pr.r && pr.g && pr.b) {
       const poly = [pr.r, pr.g, pr.b].map((p) => `${fmt(P.px(p[0]), 1)},${fmt(P.py(p[1]), 1)}`).join(" ");
-      P.add(`<polygon points="${poly}" class="ch-gamut">${title("target gamut: " + (d.gamut_label || "Rec.709 / sRGB"))}</polygon>`);
+      P.add(`<polygon points="${poly}" class="ch-gamut">${hov("target gamut: " + (d.gamut_label || "Rec.709 / sRGB"))}</polygon>`);
       [["R", pr.r], ["G", pr.g], ["B", pr.b]].forEach(([lab, p]) => {
         P.add(`<text x="${fmt(P.px(p[0]), 1)}" y="${fmt(P.py(p[1]) - 5, 1)}" class="ch-note" text-anchor="middle">${lab}</text>`);
       });
@@ -75,7 +78,7 @@
     const nat = d.native;
     if (DLCCharts.opts.native && nat && nat.r && nat.g && nat.b) {
       const npoly = [nat.r, nat.g, nat.b].map((p) => `${fmt(P.px(p[0]), 1)},${fmt(P.py(p[1]), 1)}`).join(" ");
-      P.add(`<polygon points="${npoly}" class="ch-gamut-native">${title("measured native gamut")}</polygon>`);
+      P.add(`<polygon points="${npoly}" class="ch-gamut-native">${hov("measured native gamut")}</polygon>`);
     }
     // gamut legend: standard target (always) + native overlay (when shown + available)
     P.add(`<text x="${fmt(P.m.l + 4, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">▱ ${esc(d.gamut_label || "target")}</text>`);
@@ -89,20 +92,22 @@
       // inline style beats the CSS class fill, so a per-patch colour actually shows
       const fill = p.c ? ` style="fill:${esc(p.c)}"` : "";
       // target chromaticity (where this patch SHOULD sit): data-tx/ty in viewBox px let the hover
-      // draw the error vector; the title gains ΔE + the target xy so the readout is self-contained.
+      // draw the error vector. The hover content is STRUCTURED ("\n" rows, "\t" label/value) so the
+      // tooltip renders as a tile — header, then ΔE / Measured / Target rows.
       const hasT = p.tx != null && p.ty != null;
       const tAttr = hasT ? ` data-tx="${fmt(P.px(p.tx), 1)}" data-ty="${fmt(P.py(p.ty), 1)}"` : "";
-      const lbl = p.label ? esc(p.label) + " · " : "";
-      const deTxt = p.de != null ? "ΔE " + fmt(p.de, 2) + " · " : "";
-      const tTxt = hasT ? ` → target ${fmt(p.tx, 4)}, ${fmt(p.ty, 4)}` : "";
-      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}${tAttr}>${title(`${lbl}${deTxt}${p.neutral ? "neutral" : "colour"} ${fmt(p.x, 4)}, ${fmt(p.y, 4)}${tTxt}`)}</circle>`);
+      const rows = [p.label || (p.neutral ? "neutral" : "colour")];
+      if (p.de != null) rows.push(`ΔE\t${fmt(p.de, 2)}`);
+      rows.push(`Measured\t${fmt(p.x, 4)}, ${fmt(p.y, 4)}`);
+      if (hasT) rows.push(`Target\t${fmt(p.tx, 4)}, ${fmt(p.ty, 4)}`);
+      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}${tAttr}>${hov(rows.join("\n"))}</circle>`);
     }
     if (d.white && d.white.length >= 2) {
       const wx = P.px(d.white[0]), wy = P.py(d.white[1]);
       // Target white as a crosshair + ring so it reads clearly as the TARGET (not just another point).
       P.add(`<line x1="${fmt(wx - 9, 1)}" y1="${fmt(wy, 1)}" x2="${fmt(wx + 9, 1)}" y2="${fmt(wy, 1)}" class="ch-target-cross"/>`);
       P.add(`<line x1="${fmt(wx, 1)}" y1="${fmt(wy - 9, 1)}" x2="${fmt(wx, 1)}" y2="${fmt(wy + 9, 1)}" class="ch-target-cross"/>`);
-      P.add(`<circle cx="${fmt(wx, 1)}" cy="${fmt(wy, 1)}" r="4.5" class="ch-white">${title(`target white xy ${fmt(d.white[0], 4)}, ${fmt(d.white[1], 4)}`)}</circle>`);
+      P.add(`<circle cx="${fmt(wx, 1)}" cy="${fmt(wy, 1)}" r="4.5" class="ch-white">${hov(`target white xy ${fmt(d.white[0], 4)}, ${fmt(d.white[1], 4)}`)}</circle>`);
       P.add(`<text x="${fmt(wx + 8, 1)}" y="${fmt(wy - 8, 1)}" class="ch-note">target white</text>`);
     }
     return P.svg();
@@ -127,7 +132,7 @@
       for (const r of ref) if (Math.abs(r[0] - s) < Math.abs(best[0] - s)) best = r;
       return best[1];
     };
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}`)}</circle>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${hov(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}`)}</circle>`));
 
     // Second interpretation: the gamma/EOTF *tracking* line — flat on the target = perfect tracking.
     // SDR: the local gamma γ(s)=ln(Y_rel)/ln(s); HDR(PQ): measured/target luminance ratio (1.0=ideal).
@@ -148,7 +153,7 @@
     P.add(`<line x1="${fmt(P.px(0), 1)}" y1="${fmt(ty(tTarget), 1)}" x2="${fmt(P.px(1), 1)}" y2="${fmt(ty(tTarget), 1)}" class="ch-track-ref"/>`);
     if (track.length) {
       P.add(`<path d="${track.map((p, i) => (i ? "L" : "M") + fmt(P.px(p[0]), 1) + " " + fmt(ty(p[1]), 1)).join(" ")}" class="ch-track" fill="none"/>`);
-      track.forEach((p) => P.add(`<circle cx="${fmt(P.px(p[0]), 1)}" cy="${fmt(ty(p[1]), 1)}" r="1.6" class="ch-track-dot">${title(`signal ${fmt(p[0], 3)} | ${isPq ? "EOTF ratio " + fmt(p[1], 3) : "local γ " + fmt(p[1], 2)} | target ${fmt(tTarget, 2)}`)}</circle>`));
+      track.forEach((p) => P.add(`<circle cx="${fmt(P.px(p[0]), 1)}" cy="${fmt(ty(p[1]), 1)}" r="1.6" class="ch-track-dot">${hov(`signal ${fmt(p[0], 3)} | ${isPq ? "EOTF ratio " + fmt(p[1], 3) : "local γ " + fmt(p[1], 2)} | target ${fmt(tTarget, 2)}`)}</circle>`));
     }
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">${isPq ? "PQ" : "γ " + fmt(g, 2)}</text>`);
     P.add(`<text x="${fmt(P.px(0) + 4, 1)}" y="${fmt(ty(tTarget) - 4, 1)}" class="ch-track-note">${isPq ? "EOTF track ·target" : "γ track @" + fmt(g, 1)}</text>`);
@@ -174,7 +179,7 @@
       P.add(`<text x="${P.W - 16}" y="${fmt(P.py(targetCct) - 5, 1)}" text-anchor="end" class="ch-note">target ${Math.round(targetCct)}K</text>`);
     }
     P.pathLine(pts.map((p) => [p.signal, p.cct]), "ch-line");
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot">${title(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K`)}</circle>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K`)}</circle>`));
     if (hidden) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${hidden} near-black read${hidden > 1 ? "s" : ""} hidden · CCT undefined &lt;1 nit</text>`);
     return P.svg();
   };
@@ -198,7 +203,7 @@
     P.pathLine(pts.map((p) => [p.signal, p.duv]), "ch-line");
     pts.forEach((p) => {
       const cls = p.duv > 0.0002 ? "ch-dot-green" : (p.duv < -0.0002 ? "ch-dot-magenta" : "ch-dot");
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}">${title(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${p.duv > 0 ? "green" : p.duv < 0 ? "magenta" : "neutral"} | target 0`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${p.duv > 0 ? "green" : p.duv < 0 ? "magenta" : "neutral"} | target 0`)}</circle>`);
     });
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-lab-green">▲ green (+Duv)</text>`);
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.H - P.m.b - 5, 1)}" class="ch-lab-magenta">▼ magenta (−Duv)</text>`);
@@ -222,7 +227,7 @@
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
     series.forEach(([k, cls]) => P.pathLine(pts.map((p) => [p.signal, p[k]]), cls));
     series.forEach(([k, cls, lab]) => pts.forEach((p) =>
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot">${title(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | target 0`)}</circle>`)));
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot">${hov(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | target 0`)}</circle>`)));
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R / G / B balance · target 0%</text>`);
     if (hidden) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${hidden} near-black hidden</text>`);
     return P.svg();
@@ -246,7 +251,7 @@
     items.forEach((it, i) => {
       const x0 = P.px(i) + bw * 0.15, w = Math.max(1, bw * 0.7);
       const yA = P.py(Math.max(0, it.error)), yB = P.py(Math.min(0, it.error));
-      P.add(`<rect x="${fmt(x0, 1)}" y="${fmt(Math.min(yA, yB), 1)}" width="${fmt(w, 1)}" height="${fmt(Math.max(1, Math.abs(yB - yA)), 1)}" fill="${esc(it.color)}" stroke="#000" stroke-width=".3">${title(`${it.label}: ${(it.error >= 0 ? "+" : "")}${fmt(it.error * 100, 1)}% luminance error, ${it.n || 1} patch(es)`)}</rect>`);
+      P.add(`<rect x="${fmt(x0, 1)}" y="${fmt(Math.min(yA, yB), 1)}" width="${fmt(w, 1)}" height="${fmt(Math.max(1, Math.abs(yB - yA)), 1)}" fill="${esc(it.color)}" stroke="#000" stroke-width=".3">${hov(`${it.label}: ${(it.error >= 0 ? "+" : "")}${fmt(it.error * 100, 1)}% luminance error, ${it.n || 1} patch(es)`)}</rect>`);
       if (showLabels) {
         const lx = P.px(i) + bw / 2, ly = P.H - P.m.b + 11;
         P.add(`<text x="${fmt(lx, 1)}" y="${fmt(ly, 1)}" transform="rotate(-60 ${fmt(lx, 1)} ${fmt(ly, 1)})" text-anchor="end" class="ch-tick">${esc(it.label)}</text>`);
@@ -270,7 +275,7 @@
     Object.keys(fams).forEach((fam) => {
       const pts = fams[fam].slice().sort((a, b) => a.target - b.target);
       P.pathLine(pts.map((p) => [p.target, p.measured]), "ch-sat-line");
-      pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.target), 1)}" cy="${fmt(P.py(p.measured), 1)}" r="2.4" style="fill:${esc(p.color)}" stroke="#000" stroke-width=".3">${title(`${esc(fam)} ${Math.round(p.target * 100)}% commanded → ${Math.round(p.measured * 100)}% measured chroma`)}</circle>`));
+      pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.target), 1)}" cy="${fmt(P.py(p.measured), 1)}" r="2.4" style="fill:${esc(p.color)}" stroke="#000" stroke-width=".3">${hov(`${esc(fam)} ${Math.round(p.target * 100)}% commanded → ${Math.round(p.measured * 100)}% measured chroma`)}</circle>`));
     });
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">measured vs commanded</text>`);
     P.add(`<text x="${P.m.l + 4}" y="${P.H - P.m.b - 5}" class="ch-note">on the line = perfect tracking</text>`);
@@ -290,8 +295,8 @@
     P.pathLine(its.map((r) => [r.iteration, r.measured_max_de]), "ch-line-max");
     P.pathLine(its.map((r) => [r.iteration, r.measured_mean_de]), "ch-line");
     its.forEach((r) => {
-      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_max_de), 1)}" r="2" class="ch-dot-max">${title(`iteration ${r.iteration}: max dE ${fmt(r.measured_max_de, 3)}, above target ${r.above_threshold || 0}`)}</circle>`);
-      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_mean_de), 1)}" r="2" class="ch-dot">${title(`iteration ${r.iteration}: mean dE ${fmt(r.measured_mean_de, 3)}`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_max_de), 1)}" r="2" class="ch-dot-max">${hov(`iteration ${r.iteration}: max dE ${fmt(r.measured_max_de, 3)}, above target ${r.above_threshold || 0}`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(r.iteration), 1)}" cy="${fmt(P.py(r.measured_mean_de), 1)}" r="2" class="ch-dot">${hov(`iteration ${r.iteration}: mean dE ${fmt(r.measured_mean_de, 3)}`)}</circle>`);
     });
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">max / mean ΔE</text>`);
     return P.svg();
@@ -316,7 +321,7 @@
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
     series.forEach(([k, cls]) => P.pathLine(pts.map((p) => [p.elapsed_s, p[k]]), cls));
     series.forEach(([k, cls, lab]) => pts.forEach((p) =>
-      P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.6" class="${cls}-dot">${title(`${Math.round(p.elapsed_s)}s | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | CCT ${p.cct != null ? Math.round(p.cct) + "K" : "—"}`)}</circle>`)));
+      P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.6" class="${cls}-dot">${hov(`${Math.round(p.elapsed_s)}s | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | CCT ${p.cct != null ? Math.round(p.cct) + "K" : "—"}`)}</circle>`)));
     // per-channel legend so the wandering channel is identifiable at a glance
     ["R", "G", "B"].forEach((lab, i) => P.add(`<text x="${fmt(P.m.l + 5 + i * 16, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-bal-${lab.toLowerCase()}-lab">${lab}</text>`));
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R/G/B drift vs warm-up start</text>`);
