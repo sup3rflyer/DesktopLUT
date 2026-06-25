@@ -184,8 +184,8 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-tick { fill: var(--ink-faint); font-size: 9px; font-family: var(--mono); }
 .ch-locus { stroke: #8a8a90; stroke-width: 1; stroke-dasharray: 3 2; }
 .ch-gamut { fill: none; stroke: #4a4a50; stroke-width: 1; }
-.ch-gamut-native { fill: none; stroke: var(--accent); stroke-width: 1; stroke-dasharray: 2 2; opacity: .85; }
-.ch-note-native { fill: var(--accent); font-size: 10px; font-family: var(--mono); }
+.ch-gamut-measured { fill: none; stroke: var(--accent); stroke-width: 1; stroke-dasharray: 2 2; opacity: .85; }
+.ch-note-measured { fill: var(--accent); font-size: 10px; font-family: var(--mono); }
 .ch-pt { fill: #b0b0b4; opacity: .7; }            /* coloured per-patch when data carries a colour */
 .ch-pt-n { fill: #e8e8ea; opacity: .85; }
 .ch-white { fill: #fff; stroke: #000; stroke-width: .5; }

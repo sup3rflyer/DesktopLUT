@@ -621,10 +621,13 @@ class DashboardState:
                 "white": white,
                 "primaries": _REC2020_PRIMARIES if hdr else _SRGB_PRIMARIES,
                 "gamut_label": "Rec.2020" if hdr else "Rec.709 / sRGB",
-                # The panel's MEASURED native gamut (from the raw pure-channel peaks), so the
-                # frontend can overlay native coverage on the STANDARD target gamut — the
-                # "standard vs native" view (#20). None when no saturated primaries were measured.
-                "native": self._native_primaries(),
+                # The panel's MEASURED primaries for the stage these charts reflect (the full-drive
+                # RGB CORNER reads), so the frontend can overlay actual coverage on the STANDARD
+                # target gamut — the "standard vs measured" view (#20). This is the CURRENT stage
+                # (post-MHC while profiling, verify once verified), matching the scatter — NOT the
+                # raw native gamut (which the OOG split below still uses). None until all three
+                # corners have an above-noise read.
+                "measured": self._corner_primaries(stage),
                 "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
             },
             "grayscale": gray,
@@ -727,44 +730,62 @@ class DashboardState:
         out.sort(key=lambda d: (_FAMILY_ORDER.get(d["family"], 9), d["sat"]))
         return out
 
-    def _native_primaries(self) -> Optional[dict[str, list[float]]]:
-        """The panel's measured native R/G/B chromaticities — the true full-drive primary per
-        hue from the RAW (first-measured) stage, so it's the native gamut independent of which
-        corrected stage the scatter currently shows. ``None`` until all three primaries have a
-        usable (above-noise) saturated patch (e.g. a neutral-only raw ramp).
+    def _corner_primaries(self, stage: Optional[str]) -> Optional[dict[str, list[float]]]:
+        """The panel's measured R/G/B primary chromaticities for ``stage`` — the full-drive pure-
+        channel CORNER reads ([1,0,0], [0,1,0], [0,0,1]). ``None`` until all three corners have a
+        usable (above-noise) read.
 
-        Selection is by *highest luminance*, not saturation: every pure-channel patch
-        ([0,g,0] …) classifies as ~100% saturated, so picking by saturation alone can keep a
-        near-black read whose chromaticity is pure noise (observed: green plotted at a wild
-        (0.232, 0.466) from a Y=0.027-nit read instead of the real ~(0.183, 0.749) primary).
-        Within the most-saturated class we therefore take the brightest read — mirroring the
-        engine's ``channel_model().peak_xyz`` (highest-Y sample), which the build/scoring use."""
-        if not self._stage_seq:
+        A "corner" is a pure-hue read (one channel non-zero, the other two ~0). Among the pure-hue
+        reads of a channel we take the HIGHEST-DRIVE one (max signal component) and, on ties, the
+        brightest — mirroring the engine's ``channel_model().peak_xyz`` (highest-Y sample). Drive
+        matters because the gamut visibly CONTRACTS with drive under panel sub-additivity, so a
+        partial-drive read sits well inside the true corner; preferring max drive snaps the vertex
+        to the real corner as soon as the full-saturation anchor is measured. Selecting by drive
+        (not bare saturation) also avoids keeping a near-black read whose chromaticity is pure noise
+        (every pure-channel patch classifies as ~100% saturated regardless of level)."""
+        if not stage:
             return None
-        color_map = self._color_by_stage.get(self._stage_seq[0], {})
-        # family -> (saturation, Y, [x, y]); prefer the most-saturated class and, within it,
-        # the highest-luminance (true full-drive) read.
-        best: dict[str, tuple[int, float, list[float]]] = {}
+        color_map = self._color_by_stage.get(stage, {})
+        # family -> (drive, Y, [x, y]); prefer the highest-drive corner and, on ties, brightest.
+        best: dict[str, tuple[float, float, list[float]]] = {}
         for c in color_map.values():
             sig, x, y, Y = c.get("signal"), c.get("x"), c.get("y"), c.get("Y")
-            if x is None or y is None or Y is None or not sig:
+            if x is None or y is None or Y is None or not sig or len(sig) < 3:
                 continue
-            family, sat = _classify_color(sig)
-            if family not in ("R", "G", "B") or sat <= 0:
+            s = [float(v) for v in sig[:3]]
+            drive = max(s)
+            if drive <= 0:
+                continue
+            nr, ng, nb = (v / drive for v in s)
+            if ng < 0.05 and nb < 0.05 and nr > 0.95:
+                family = "R"
+            elif nr < 0.05 and nb < 0.05 and ng > 0.95:
+                family = "G"
+            elif nr < 0.05 and ng < 0.05 and nb > 0.95:
+                family = "B"
+            else:
                 continue
             prev = best.get(family)
-            if prev is None or sat > prev[0] or (sat == prev[0] and Y > prev[1]):
-                best[family] = (sat, float(Y), [round(x, 5), round(y, 5)])
+            if prev is None or drive > prev[0] + 1e-6 or (abs(drive - prev[0]) <= 1e-6 and Y > prev[1]):
+                best[family] = (drive, float(Y), [round(x, 5), round(y, 5)])
         if not all(f in best for f in ("R", "G", "B")):
             return None
-        # Suppress sub-noise primaries: a chosen read far below the brightest primary (or below
-        # an absolute floor) has unreliable chromaticity — hide the whole overlay rather than
-        # plot the native gamut at a meaningless point.
+        # Suppress sub-noise corners: a chosen read far below the brightest corner (or below an
+        # absolute floor) has unreliable chromaticity — hide the whole overlay rather than plot a
+        # primary at a meaningless point.
         brightest = max(best[f][1] for f in ("R", "G", "B"))
         floor = max(_NATIVE_PRIMARY_Y_FLOOR_ABS, brightest * _NATIVE_PRIMARY_Y_FLOOR_FRAC)
         if any(best[f][1] < floor for f in ("R", "G", "B")):
             return None
         return {f.lower(): best[f][2] for f in ("R", "G", "B")}
+
+    def _native_primaries(self) -> Optional[dict[str, list[float]]]:
+        """The panel's RAW native gamut — the corner primaries from the FIRST-measured stage,
+        independent of which corrected stage the scatter currently shows. Used for the OOG ΔE
+        split (is a target reachable on this panel?), where the physical native envelope is the
+        right reference. For a ``3dlut-only`` run the first stage is already post-MHC (no raw
+        stage exists), so it degrades to that panel-through-MHC envelope."""
+        return self._corner_primaries(self._stage_seq[0] if self._stage_seq else None)
 
     def _saturation(self, color_map: dict, white_xy: Any) -> list[dict[str, Any]]:
         """Saturation tracking per hue family: measured chroma (CIE 1976 u'v' distance from the

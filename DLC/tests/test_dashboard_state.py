@@ -85,9 +85,56 @@ def test_native_primaries_from_raw_pure_channel_peaks():
         st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0,
                       role="measurement", rgb=[int(c * 255) for c in sig], signal=sig,
                       Y=100.0, xy=xy, ok=True))
-    nat = st.charts()["cie"]["native"]
+    nat = st.charts()["cie"]["measured"]
     assert nat is not None
     assert abs(nat["r"][0] - 0.69) < 1e-3 and abs(nat["g"][1] - 0.71) < 1e-3 and abs(nat["b"][0] - 0.15) < 1e-3
+
+
+def test_measured_primaries_track_current_stage_not_first():
+    """The CIE overlay shows the CURRENT stage's measured corners (post-MHC while profiling),
+    matching the scatter — NOT the first-measured stage. Regression for the 3dlut-only case where
+    the only stage is post-MHC: a wide raw stage must not shadow the corrected stage's corners."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", white={"xy": [0.3127, 0.329]}))
+    # First stage: a WIDE native gamut.
+    for sig, xy in [([1.0, 0.0, 0.0], [0.69, 0.30]), ([0.0, 1.0, 0.0], [0.18, 0.75]),
+                    ([0.0, 0.0, 1.0], [0.15, 0.05])]:
+        st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0,
+                      role="measurement", rgb=[int(c * 255) for c in sig], signal=sig,
+                      Y=100.0, xy=xy, ok=True))
+    # Later stage: the post-MHC gamut, clamped toward sRGB.
+    for sig, xy in [([1.0, 0.0, 0.0], [0.63, 0.35]), ([0.0, 1.0, 0.0], [0.32, 0.59]),
+                    ([0.0, 0.0, 1.0], [0.15, 0.08])]:
+        st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0,
+                      role="measurement", rgb=[int(c * 255) for c in sig], signal=sig,
+                      Y=100.0, xy=xy, ok=True))
+    meas = st.charts()["cie"]["measured"]
+    assert meas is not None
+    # overlay reflects the post-MHC (latest) stage, not the wide raw one
+    assert abs(meas["r"][0] - 0.63) < 1e-3 and abs(meas["g"][0] - 0.32) < 1e-3
+    # while the OOG split still references the raw native envelope (first stage)
+    nat = st._native_primaries()
+    assert nat is not None and abs(nat["g"][0] - 0.18) < 1e-3
+
+
+def test_measured_primaries_prefer_full_drive_corner():
+    """Among pure-hue reds, the overlay takes the HIGHEST-DRIVE corner (the true primary), not a
+    partial-drive read — the gamut contracts with drive under sub-additivity, so a 0.5-drive red
+    sits inside the full-drive corner."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", white={"xy": [0.3127, 0.329]}))
+    # partial-drive red (more saturated) ingested first, then the full-drive corner (less saturated)
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0, role="measurement",
+                  rgb=[128, 0, 0], signal=[0.5, 0.0, 0.0], Y=8.0, xy=[0.657, 0.328], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0, role="measurement",
+                  rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=31.0, xy=[0.628, 0.350], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 255, 0], signal=[0.0, 1.0, 0.0], Y=82.0, xy=[0.324, 0.587], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:post-mhc", tier="stream", seq=0, role="measurement",
+                  rgb=[0, 0, 255], signal=[0.0, 0.0, 1.0], Y=6.0, xy=[0.152, 0.080], ok=True))
+    meas = st.charts()["cie"]["measured"]
+    assert meas is not None
+    assert abs(meas["r"][0] - 0.628) < 1e-3 and abs(meas["r"][1] - 0.350) < 1e-3   # full-drive, not 0.657
 
 
 def test_grayscale_near_black_flagged_dim_for_cct_chart():
@@ -115,7 +162,7 @@ def test_native_primaries_none_without_saturated_patches():
     st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", white={"xy": [0.3127, 0.329]}))
     st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
                   rgb=[200, 200, 200], signal=[0.78, 0.78, 0.78], Y=90.0, xy=[0.31, 0.33], ok=True))
-    assert st.charts()["cie"]["native"] is None    # neutral-only raw → no native gamut
+    assert st.charts()["cie"]["measured"] is None    # neutral-only raw → no native gamut
 
 
 def test_native_primaries_picks_highest_luminance_green_over_near_black():
@@ -136,7 +183,7 @@ def test_native_primaries_picks_highest_luminance_green_over_near_black():
                   rgb=[0, 9, 0], signal=[0.0, 0.035, 0.0], Y=0.027, xy=[0.232, 0.466], ok=True))
     st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
                   rgb=[0, 195, 0], signal=[0.0, 0.764, 0.0], Y=80.0, xy=[0.183, 0.749], ok=True))
-    nat = st.charts()["cie"]["native"]
+    nat = st.charts()["cie"]["measured"]
     assert nat is not None
     assert abs(nat["g"][0] - 0.183) < 1e-3 and abs(nat["g"][1] - 0.749) < 1e-3
 
@@ -153,7 +200,7 @@ def test_native_primaries_none_when_a_primary_is_only_sub_noise():
     # Only a sub-noise green was ever measured.
     st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", seq=0, role="measurement",
                   rgb=[0, 9, 0], signal=[0.0, 0.035, 0.0], Y=0.027, xy=[0.232, 0.466], ok=True))
-    assert st.charts()["cie"]["native"] is None
+    assert st.charts()["cie"]["measured"] is None
 
 
 def test_per_patch_de_enriches_reads_and_live_header():

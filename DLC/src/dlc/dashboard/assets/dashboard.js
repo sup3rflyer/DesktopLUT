@@ -708,9 +708,9 @@ function wireUi() {
     try { localStorage.setItem(DE_VIEW_KEY, deView); } catch (err) { /* private mode: in-memory only */ }
     if (lastState) renderState(lastState);
   });
-  // native-gamut overlay toggle: flip the chart option and re-render the (cached) charts
-  $("toggle-native").addEventListener("change", (e) => {
-    if (window.DLCCharts) DLCCharts.opts.native = e.target.checked;
+  // measured-primaries overlay toggle: flip the chart option and re-render the (cached) charts
+  $("toggle-measured").addEventListener("change", (e) => {
+    if (window.DLCCharts) DLCCharts.opts.measured = e.target.checked;
     const header = lastState ? lastState.header : null;
     if (window.DLCCharts && lastCharts) {
       DLCCharts.renderInto($("charts"), lastCharts, header);
