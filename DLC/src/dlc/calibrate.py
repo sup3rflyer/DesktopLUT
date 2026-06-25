@@ -100,7 +100,8 @@ from .measure_loop import (
 from .decisions import hdr_metric_thresholds
 from .metrics import percentile, score_samples, score_samples_hdr, summarize_metrics
 from .mhc import SRGB_PRIMARIES, parse_ti3
-from .optimize import DegenerateMeasurements, OptimizeConfig, ProbeFn, optimize_cube
+from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
+                       optimize_cube)
 from . import patch_evidence
 from .paths import RUNS_DIR, atomic_write_text
 from .runs import RunContext, create_run, open_run
@@ -3315,6 +3316,23 @@ class Calibration:
                 digest=outcome.digest))
         return outcome
 
+    def _cube_optimize_config(self) -> OptimizeConfig:
+        """The 3D-LUT correction config, with a MODE-AWARE correction-budget ceiling.
+
+        The budget is seeded from the MEASURED residual (:func:`seed_correction_budget`, already
+        gamut-aware) and auto-escalates toward ``max_correction_cap``; the ceiling only matters when
+        the panel demands a big correction. HDR keeps the default 0.25 (the cube is a small post-MHC
+        residual — the 1D MHC base owns the neutral EOTF + per-level WB, the matrix owns native→D65).
+        SDR raises it to :data:`SDR_CORRECTION_CAP`: there the MHC does gamut+white ONLY, so the cube
+        owns ALL the colour (the whole native→target gamut compression) and 0.25 starves the seed on
+        a wide-gamut panel (HANDOFF item H; offline CV: saturated-corner benefit plateaus ~0.5).
+
+        Only the DEFAULT ceiling is lifted — a caller that pinned a custom cap is respected as-is."""
+        cfg = self.optimize_config
+        if self.mode != "HDR" and cfg.max_correction_cap == OptimizeConfig.max_correction_cap:
+            return replace(cfg, max_correction_cap=SDR_CORRECTION_CAP)
+        return cfg
+
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
             target = self._engine_target()
@@ -3324,7 +3342,7 @@ class Calibration:
             cube_path = str(self.ctx.root / "generated" / f"final_{self.mode.lower()}.cube")
             try:
                 result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
-                                       measured_xyz=measured, config=self.optimize_config,
+                                       measured_xyz=measured, config=self._cube_optimize_config(),
                                        on_iteration=self._on_optimize_iteration,
                                        reachable_primaries=self._reachable_primaries())
             except DegenerateMeasurements as exc:

@@ -67,11 +67,24 @@ __all__ = [
     "IterationResult",
     "OptimizeResult",
     "DegenerateMeasurements",
+    "SDR_CORRECTION_CAP",
     "sample_cube",
     "seed_correction_budget",
     "optimize_cube",
     "synthetic_probe",
 ]
+
+# Mode-aware ceiling for the data-derived correction budget (the orchestrator picks per mode;
+# :class:`OptimizeConfig` defaults to the HDR value). HDR: the cube is a small POST-MHC residual
+# (the 1D MHC base owns the neutral EOTF + per-level WB, the matrix owns native→D65) so 0.25 is
+# right. SDR: the MHC does gamut+white ONLY, so the cube owns ALL the colour — the whole
+# native→target gamut compression — and a 0.25 ceiling artificially starves the (gamut-aware,
+# data-derived) seed budget on a wide-gamut panel. Offline held-out CV on the PA32UCXR's post-MHC
+# reads (HANDOFF item H) shows the saturated-corner benefit plateaus by ~0.5 (corner-mean CIEDE2000
+# 3.16→2.90, neutral axis unchanged, 0.5≡1.0), so 0.5 captures the win without over-driving. NB the
+# cap is a MODEST lever: the worst corner (pure blue) is a panel/MHC gamut floor the cube cannot fix
+# at any cap. See dlc.calibrate.Calibration._cube_optimize_config.
+SDR_CORRECTION_CAP = 0.5
 
 
 class DegenerateMeasurements(Exception):

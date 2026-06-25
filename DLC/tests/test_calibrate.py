@@ -103,6 +103,33 @@ def _make(tmp_path: Path, name: str, *, mode="SDR", panel=None, controller=None,
 
 
 # ---------------------------------------------------------------------------
+# mode-aware 3D-LUT correction-budget cap (HANDOFF item H)
+# ---------------------------------------------------------------------------
+
+def test_cube_cap_is_mode_aware(tmp_path: Path):
+    from dataclasses import replace as _replace
+
+    from dlc.optimize import SDR_CORRECTION_CAP
+
+    # SDR: the MHC does gamut+white only, the cube owns ALL the colour → the default HDR-residual
+    # ceiling (0.25) is lifted to SDR_CORRECTION_CAP so a wide-gamut panel's seed isn't starved.
+    sdr = _make(tmp_path, "cap_sdr", mode="SDR")
+    assert sdr.optimize_config.max_correction_cap == 0.25            # the default the caller passed
+    assert sdr._cube_optimize_config().max_correction_cap == SDR_CORRECTION_CAP
+
+    # HDR: the cube is a small post-MHC residual → the 0.25 framing is correct, left untouched.
+    hdr = _make(tmp_path, "cap_hdr", mode="HDR")
+    assert hdr._cube_optimize_config().max_correction_cap == 0.25
+
+    # A caller that PINNED a non-default cap is respected verbatim in either mode (no silent bump).
+    pinned = _make(tmp_path, "cap_pin", mode="SDR")
+    pinned.optimize_config = _replace(pinned.optimize_config, max_correction_cap=0.33)
+    assert pinned._cube_optimize_config().max_correction_cap == 0.33
+    # everything else about the config is preserved by the mode-aware bump
+    assert sdr._cube_optimize_config().grid_size == sdr.optimize_config.grid_size
+
+
+# ---------------------------------------------------------------------------
 # full flow
 # ---------------------------------------------------------------------------
 
