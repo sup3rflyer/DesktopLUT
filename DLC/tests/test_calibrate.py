@@ -125,6 +125,9 @@ def test_cube_cap_is_mode_aware(tmp_path: Path):
     pinned = _make(tmp_path, "cap_pin", mode="SDR")
     pinned.optimize_config = _replace(pinned.optimize_config, max_correction_cap=0.33)
     assert pinned._cube_optimize_config().max_correction_cap == 0.33
+    hdr_pin = _make(tmp_path, "cap_hdr_pin", mode="HDR")
+    hdr_pin.optimize_config = _replace(hdr_pin.optimize_config, max_correction_cap=0.4)
+    assert hdr_pin._cube_optimize_config().max_correction_cap == 0.4
     # everything else about the config is preserved by the mode-aware bump
     assert sdr._cube_optimize_config().grid_size == sdr.optimize_config.grid_size
 

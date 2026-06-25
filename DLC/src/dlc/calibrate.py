@@ -3329,6 +3329,9 @@ class Calibration:
 
         Only the DEFAULT ceiling is lifted — a caller that pinned a custom cap is respected as-is."""
         cfg = self.optimize_config
+        # `== OptimizeConfig.max_correction_cap` compares to the frozen-dataclass class default
+        # (0.25) ⇒ "the caller left the cap at the default". `!= "HDR"` (not `== "SDR"`) routes any
+        # non-HDR mode to the SDR ceiling; normalize_mode guarantees mode ∈ {SDR, HDR}.
         if self.mode != "HDR" and cfg.max_correction_cap == OptimizeConfig.max_correction_cap:
             return replace(cfg, max_correction_cap=SDR_CORRECTION_CAP)
         return cfg
