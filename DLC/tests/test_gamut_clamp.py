@@ -93,3 +93,33 @@ def test_sdr_verify_can_score_against_clamped_reachable_target():
 
     assert clamped[0].de2000 < 0.05
     assert plain[0].de2000 > 1.0
+
+
+def test_xyz_to_ictcp_guards_nonphysical_inputs_without_touching_physical():
+    """colour.XYZ_to_ICtCp returns finite-but-ASTRONOMICAL values on non-physical XYZ (a positive
+    channel with collapsed luminance -> negative LMS -> PQ blow-up), which detonates dE_ITP and
+    silently corrupts cube snapshot selection (the value is finite, so NaN/inf guards miss it).
+    xyz_to_ictcp projects onto the physically-realizable (LMS>=0) cone first: bit-identical for every
+    physical colour (incl. legitimate wide-gamut OOG), bounded for non-physical extrapolations."""
+    from dlc.engine.model import _project_to_ictcp_cone, de_itp
+
+    sp = TargetSpace(Target.hdr_rec2020_pq(white_xy=D65))
+
+    physical = np.array([
+        [0.00095, 0.001, 0.001089],                          # sub-nit neutral
+        [95.047, 100.0, 108.883],                            # D65 white @ 100 cd/m^2
+        colour.RGB_to_XYZ([1.0, 0.0, 0.0], "sRGB") * 120.0,  # full red
+        colour.RGB_to_XYZ([0.0, 0.0, 1.0], "sRGB") * 100.0,  # sRGB blue (OOG on a narrow panel)
+    ], dtype=float)
+    # No-op for physical inputs: projection unchanged, ICtCp bit-identical to raw colour.
+    assert np.array_equal(_project_to_ictcp_cone(physical), physical)
+    assert np.allclose(sp.xyz_to_ictcp(physical), colour.XYZ_to_ICtCp(physical), atol=0, rtol=0)
+
+    nonphysical = np.array([[0.04, 0.0, 0.0], [0.0, 0.0, 0.04], [1.0, 0.0, 2.0]], dtype=float)
+    assert np.max(np.abs(colour.XYZ_to_ICtCp(nonphysical))) > 1e5   # the latent detonation
+    guarded = sp.xyz_to_ictcp(nonphysical)
+    assert np.all(np.isfinite(guarded)) and np.max(np.abs(guarded)) < 10.0
+    # dE_ITP against a bounded target stays bounded -> cannot poison snapshot selection.
+    target = sp.ideal_ictcp(np.array([[0.0, 0.0, 0.5]]))
+    de = de_itp(guarded - target)
+    assert np.all(np.isfinite(de)) and de.max() < 1e4

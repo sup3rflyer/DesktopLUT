@@ -35,6 +35,33 @@ from scipy.interpolate import RBFInterpolator
 # and wants this same scale, so a process-global set is safe here.
 colour.utilities.set_domain_range_scale("reference")
 
+# ICtCp physical-realizability cone. ``colour.XYZ_to_ICtCp`` goes XYZ -> Rec.2020 RGB -> LMS -> PQ ->
+# ICtCp; the PQ step on a NEGATIVE L/M/S returns finite-but-ASTRONOMICAL values (e.g.
+# XYZ_to_ICtCp([0, 0, 0.04]) ~ 5e10), which detonate dE_ITP and silently corrupt cube selection
+# (a non-physical XYZ slips past the NaN/inf guards because it is finite). A physically-realizable
+# colour (a real spectrum) always has non-negative cone responses, so we project XYZ onto the LMS>=0
+# cone before the transform: a NO-OP for every physical colour — including legitimate wide-gamut
+# out-of-gamut colours, which keep positive LMS and a meaningful large dE — clamping ONLY non-physical
+# model/measurement extrapolations. Matrices come from ``colour`` itself so the cone matches exactly.
+_ICTCP_XYZ_TO_LMS = (colour.models.rgb.ictcp.MATRIX_ICTCP_RGB_TO_LMS
+                     @ colour.RGB_COLOURSPACES["ITU-R BT.2020"].matrix_XYZ_to_RGB)
+_ICTCP_LMS_TO_XYZ = np.linalg.inv(_ICTCP_XYZ_TO_LMS)
+
+
+def _project_to_ictcp_cone(xyz_abs: np.ndarray) -> np.ndarray:
+    """Project absolute XYZ onto the physically-realizable (LMS>=0) cone of the ICtCp transform.
+
+    No-op wherever the cone responses are already non-negative (every physical colour, OOG included);
+    only rows that would otherwise blow up ``colour.XYZ_to_ICtCp``'s PQ step are clamped to the cone."""
+    xyz = np.asarray(xyz_abs, dtype=float)
+    flat = xyz.reshape(-1, 3)
+    lms = flat @ _ICTCP_XYZ_TO_LMS.T
+    neg = np.any(lms < 0.0, axis=1)
+    if np.any(neg):
+        flat = flat.copy()
+        flat[neg] = np.maximum(lms[neg], 0.0) @ _ICTCP_LMS_TO_XYZ.T
+    return flat.reshape(xyz.shape)
+
 # BT.2124 ΔE_ITP = 720 · ‖ΔI, ΔT, ΔP‖ (Euclidean over the ITP triplet, where T = Ct/2).
 # The 720 factor scales the result so 1.0 ≈ one JND, matching CIEDE2000's ~1.0-per-JND feel.
 DE_ITP_SCALE = 720.0
@@ -112,7 +139,7 @@ def _chroma_clip_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace",
     if not np.any(oog):
         return xyz_abs
     out = xyz_abs.copy()
-    ictcp = colour.XYZ_to_ICtCp(xyz_abs[oog])
+    ictcp = colour.XYZ_to_ICtCp(_project_to_ictcp_cone(xyz_abs[oog]))
     intensity = ictcp[:, 0:1]
     chroma = ictcp[:, 1:3]
     # Largest chroma scale t in [0,1] that fits the gamut, per row (t=0 is the achromatic point at
@@ -226,7 +253,9 @@ class TargetSpace:
     # -- absolute XYZ <-> ICtCp -------------------------------------------
     @staticmethod
     def xyz_to_ictcp(xyz_abs: np.ndarray) -> np.ndarray:
-        return colour.XYZ_to_ICtCp(np.asarray(xyz_abs, dtype=float))
+        # Guard the PQ step against non-physical inputs (model/measurement extrapolations) without
+        # touching any physical colour — see _project_to_ictcp_cone.
+        return colour.XYZ_to_ICtCp(_project_to_ictcp_cone(xyz_abs))
 
     @staticmethod
     def ictcp_to_xyz(ictcp: np.ndarray) -> np.ndarray:
