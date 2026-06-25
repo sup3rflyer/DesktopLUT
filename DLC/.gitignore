@@ -51,6 +51,10 @@ docs/v1-rebuild-plan.md
 docs/hdr-target-design.md
 docs/audit-2026-06-17/
 docs/audit-2026-06-19/
+# Agent entrypoints + local task briefs — same local-only class as CLAUDE.md
+# (the public face is README + CHANGELOG + code; no panel/user data leaves the box).
 CLAUDE.md
+AGENTS.md
+CODEX_LUT_ENGINE_PROMPT.md
 .claude/
 
