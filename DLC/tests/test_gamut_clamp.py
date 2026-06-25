@@ -16,6 +16,8 @@ import numpy as np
 from dlc.engine.model import (
     Target, TargetSpace, score_hdr, _native_colourspace,
 )
+from dlc.metrics import score_samples
+from dlc.mhc import Ti3Sample
 
 D65 = (0.3127, 0.3290)
 # A NARROW native panel gamut (well inside Rec.2020) — saturated Rec.2020 targets fall outside it.
@@ -77,3 +79,17 @@ def test_clamp_makes_a_gamut_clip_score_as_reachable():
     plain = score_hdr(sig, reachable_xyz, white_xy=D65)["de_itp"]
     assert clamped[0] < 1.0
     assert plain[0] > 10.0
+
+
+def test_sdr_verify_can_score_against_clamped_reachable_target():
+    tgt = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0, white_xy=D65)
+    sig = (0.0, 0.0, 1.0)   # saturated sRGB blue, outside this deliberately narrow native gamut
+    reachable_xyz = TargetSpace(tgt, reachable_primaries=NARROW).ideal_xyz(np.array([sig]))[0]
+    sample = Ti3Sample(rgb=sig, xyz=tuple(float(c) for c in reachable_xyz))
+
+    clamped, _ = score_samples([sample], gamma=2.2, white_xy=D65, luminance=120.0,
+                               reachable_primaries=NARROW)
+    plain, _ = score_samples([sample], gamma=2.2, white_xy=D65, luminance=120.0)
+
+    assert clamped[0].de2000 < 0.05
+    assert plain[0].de2000 > 1.0

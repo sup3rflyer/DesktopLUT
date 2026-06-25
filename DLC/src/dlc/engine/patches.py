@@ -45,6 +45,7 @@ __all__ = [
     "mean_patch_energy",
     "sort_patches",
     "ramp_patches",
+    "saturation_sweep_patches",
     "cube_patches",
     "tube_patches",
     "gamut_patches",
@@ -426,6 +427,46 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
         if cap < 1.0 and vtop > 0:
             add((vtop if r_on else 0, vtop if g_on else 0, vtop if b_on else 0))   # clip marker
 
+    return sort_patches(patches, order, transfer, warm_tau=warm_tau)
+
+
+# ---------------------------------------------------------------------------
+# Saturation sweep skeleton — repeated high-SNR anchors for the 3D-LUT RBF
+# ---------------------------------------------------------------------------
+
+def saturation_sweep_patches(transfer: Transfer, *,
+                             levels: Sequence[float] = (0.25, 0.50, 0.75, 1.0),
+                             repeats: int = 3,
+                             max_cv: int | None = None,
+                             include_secondaries: bool = True,
+                             order: str = "none",
+                             warm_tau: Optional[int] = None) -> list[Patch]:
+    """Repeated grey + RGBCMY skeleton at fixed signal levels.
+
+    Unlike :func:`ramp_patches`, this intentionally does not deduplicate: each skeleton
+    patch is repeated ``repeats`` times so the 3D-LUT model can average it and assign
+    higher confidence to the gamut skeleton. ``levels`` are normalized signal fractions
+    in ``[0, 1]``; values above 1 are treated as code values for advanced callers.
+    """
+    if repeats <= 0:
+        return []
+    if max_cv is None:
+        max_cv = transfer.max_cv
+    colors = _RAMP_COLORS if include_secondaries else _PRIMARIES
+
+    def to_cv(level: float) -> int:
+        v = float(level)
+        cv = round(v * max_cv) if 0.0 <= v <= 1.0 else round(v)
+        return max(0, min(max_cv, cv))
+
+    patches: list[Patch] = []
+    for level in levels:
+        v = to_cv(level)
+        base: list[Patch] = [(v, v, v)]
+        for _name, r_on, g_on, b_on in colors:
+            base.append((v if r_on else 0, v if g_on else 0, v if b_on else 0))
+        for patch in base:
+            patches.extend([patch] * repeats)
     return sort_patches(patches, order, transfer, warm_tau=warm_tau)
 
 

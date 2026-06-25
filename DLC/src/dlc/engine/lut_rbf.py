@@ -187,6 +187,9 @@ def identity_cube(grid_size: int) -> np.ndarray:
 class CubeDiagnostics:
     grid_size: int
     non_monotonic: int
+    large_reversal_count: int
+    large_reversal_threshold: float
+    worst_lattice_jump: float
     total_steps: int
     correction_median: float
     correction_p99: float
@@ -199,6 +202,9 @@ class CubeDiagnostics:
 
     def as_dict(self) -> dict[str, float | int | bool]:
         return {"grid_size": self.grid_size, "non_monotonic": self.non_monotonic,
+                "large_reversal_count": self.large_reversal_count,
+                "large_reversal_threshold": self.large_reversal_threshold,
+                "worst_lattice_jump": self.worst_lattice_jump,
                 "total_steps": self.total_steps, "monotonic": self.monotonic,
                 "correction_median": self.correction_median,
                 "correction_p99": self.correction_p99,
@@ -206,7 +212,7 @@ class CubeDiagnostics:
                 "correction_max": self.correction_max}
 
 
-def cube_diagnostics(lut: np.ndarray) -> CubeDiagnostics:
+def cube_diagnostics(lut: np.ndarray, *, large_reversal_threshold: float = 0.008) -> CubeDiagnostics:
     """Monotonicity + correction-smoothness stats — the integrity digest."""
     grid_size = lut.shape[0]
     axis = np.linspace(0.0, 1.0, grid_size)
@@ -219,17 +225,28 @@ def cube_diagnostics(lut: np.ndarray) -> CubeDiagnostics:
         np.sqrt(np.sum(np.diff(correction, axis=1) ** 2, axis=-1)).ravel(),  # along G
         np.sqrt(np.sum(np.diff(correction, axis=0) ** 2, axis=-1)).ravel(),  # along B
     ])
+    jumps = np.concatenate([
+        np.sqrt(np.sum(np.diff(lut, axis=2) ** 2, axis=-1)).ravel(),  # along R
+        np.sqrt(np.sum(np.diff(lut, axis=1) ** 2, axis=-1)).ravel(),  # along G
+        np.sqrt(np.sum(np.diff(lut, axis=0) ** 2, axis=-1)).ravel(),  # along B
+    ])
 
     # Same-channel output must increase along its own input axis.
-    nm = (int(np.sum(np.diff(lut[:, :, :, 0], axis=2) < 0))
-          + int(np.sum(np.diff(lut[:, :, :, 1], axis=1) < 0))
-          + int(np.sum(np.diff(lut[:, :, :, 2], axis=0) < 0)))
-    total = (np.diff(lut[:, :, :, 0], axis=2).size
-             + np.diff(lut[:, :, :, 1], axis=1).size
-             + np.diff(lut[:, :, :, 2], axis=0).size)
+    dr = np.diff(lut[:, :, :, 0], axis=2)
+    dg = np.diff(lut[:, :, :, 1], axis=1)
+    db = np.diff(lut[:, :, :, 2], axis=0)
+    nm = int(np.sum(dr < 0)) + int(np.sum(dg < 0)) + int(np.sum(db < 0))
+    large = (int(np.sum(dr < -large_reversal_threshold))
+             + int(np.sum(dg < -large_reversal_threshold))
+             + int(np.sum(db < -large_reversal_threshold)))
+    total = dr.size + dg.size + db.size
 
     return CubeDiagnostics(
-        grid_size=grid_size, non_monotonic=nm, total_steps=int(total),
+        grid_size=grid_size, non_monotonic=nm,
+        large_reversal_count=large,
+        large_reversal_threshold=float(large_reversal_threshold),
+        worst_lattice_jump=float(jumps.max()),
+        total_steps=int(total),
         correction_median=float(np.median(mags)),
         correction_p99=float(np.percentile(mags, 99)),
         correction_p999=float(np.percentile(mags, 99.9)),

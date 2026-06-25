@@ -9,7 +9,9 @@
 # Assume the system interpreter (do NOT vendor a venv into DLC). Bounded rather
 # than exact pins: robust across patch releases, capped below the next major.
 # Verified working set (2026-06-15): numpy 2.4.4, scipy 1.16.1, colour-science 0.4.6.
+# SciPy >=1.13 is required for the RBFInterpolator per-point smoothing array used by
+# DisplayErrorModel's confidence-weighted RBF anchors.
 
 numpy>=1.26,<3
-scipy>=1.11,<2
+scipy>=1.13,<2
 colour-science>=0.4.4,<0.5

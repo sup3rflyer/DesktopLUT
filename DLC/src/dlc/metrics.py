@@ -182,14 +182,20 @@ def is_grayscale(rgb: tuple[float, float, float]) -> bool:
 
 
 def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, gamma: float = 2.2,
-                  white_xy: tuple[float, float] | None = None) -> tuple[list[PatchMetric], float]:
+                  white_xy: tuple[float, float] | None = None,
+                  reachable_primaries=None) -> tuple[list[PatchMetric], float]:
     """Score TI3 samples as CIEDE2000 vs the ideal target.
 
     ``white_xy`` is the run's RESOLVED target white (what stage_whitepoint fed into the MHC
     matrix + its grayscale refine, and the 3D-LUT target). When given, both the per-patch target and
     the Lab reference white are built from sRGB primaries + that white, so a non-D65 white
     (e.g. the SPD-derived CRT-like white at strength>0) is the GOAL rather than scored as error.
-    When ``None`` (legacy callers), it falls back to textbook D65 — unchanged behaviour."""
+    When ``None`` (legacy callers), it falls back to textbook D65 — unchanged behaviour.
+
+    ``reachable_primaries`` optionally clamps the SDR target to the measured native gamut for
+    offline experiments. It is intentionally off in the production SDR path after CV gating found
+    that clamp worse there. It lazy-imports the engine only when used, preserving the
+    dependency-free default path."""
     if not samples:
         raise ValueError("no TI3 samples to score")
     target_luminance = luminance if luminance is not None else infer_target_luminance(samples)
@@ -199,10 +205,22 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
     else:
         matrix = SRGB_TO_XYZ_D65
         white = white_xyz(target_luminance)
+    clamped_targets = None
+    if reachable_primaries is not None:
+        from .engine.model import Target, TargetSpace
+        target_space = TargetSpace(
+            Target.sdr_srgb_power(gamma=gamma, white_nits=target_luminance, white_xy=white_xy),
+            reachable_primaries=reachable_primaries,
+        )
+        clamped_targets = target_space.ideal_xyz([s.rgb for s in samples])
+
     metrics: list[PatchMetric] = []
     for sample in samples:
         meas = _finite_nonneg_xyz(sample.xyz)
-        target = target_xyz_for_rgb(sample.rgb, target_luminance, gamma, matrix)
+        if clamped_targets is None:
+            target = target_xyz_for_rgb(sample.rgb, target_luminance, gamma, matrix)
+        else:
+            target = tuple(float(c) for c in clamped_targets[len(metrics)])
         de = delta_e2000(xyz_to_lab(meas, white), xyz_to_lab(target, white))
         metrics.append(PatchMetric(sample.rgb, sample.xyz, target, de, is_grayscale(sample.rgb)))
     return metrics, target_luminance

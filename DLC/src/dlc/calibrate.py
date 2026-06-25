@@ -81,6 +81,7 @@ from .engine.patches import (
     gamut_patches,
     near_neutral_tube_patches,
     ramp_patches,
+    saturation_sweep_patches,
     shadow_levels,
     sort_patches,
     target_anchor_patches,
@@ -98,8 +99,8 @@ from .measure_loop import (
     run_measure_loop,
 )
 from .decisions import hdr_metric_thresholds
-from .metrics import percentile, score_samples, score_samples_hdr, summarize_metrics
-from .mhc import SRGB_PRIMARIES, parse_ti3
+from .metrics import delta_e2000, percentile, score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab
+from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
 from . import patch_evidence
@@ -156,6 +157,7 @@ _BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "d
 # without this flag SupervisedAdjudicator would silently apply a sub-quality calibration).
 _SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "critical",
                    "compromised", "gate_failed", "read_anomaly", "score_anomaly")
+_BOOKEND_DRIFT_ANOMALY_DE = 1.0  # one JND-ish start-vs-end drift across repeated skeleton bookends
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +381,15 @@ class PatchSizes:
     # there and colour ramps start above it. Just above low_light_signal so the two don't overlap.
     verify_color_min_signal: float = 0.25
 
+    # 3D-LUT confidence skeleton: measured at the start and end of the post-MHC build set,
+    # and again in verify for drift QC. ``saturation_sweep_repeats`` is the number of
+    # contiguous repeated reads INSIDE EACH bookend; the full measured sequence has two
+    # bookend locations, so the default 3 means 3 start reads + 3 end reads per skeleton
+    # signal. Duplicates are intentional: stage_measure compares start-vs-end for drift
+    # first, then optimize aggregates them into averaged high-confidence RBF anchors.
+    saturation_sweep_levels: tuple[float, ...] = (0.25, 0.50, 0.75, 1.0)
+    saturation_sweep_repeats: int = 3
+
     # grey-axis ramp measured by the MHC closed-loop D65 grayscale refine (writes the
     # MHC correctionGrayscale layer — see ../docs/NAMING.md §2). NOT the removed overlay
     # GS+WB tweak. This is a count of grey PATCHES to measure, independent of the MHC
@@ -405,7 +416,8 @@ class PatchSizes:
             if f.name not in d or d[f.name] is None:
                 continue
             v = d[f.name]
-            if f.name in ("raw_saturations", "verify_saturations", "icc_tube_offsets"):
+            if f.name in ("raw_saturations", "verify_saturations", "icc_tube_offsets",
+                          "saturation_sweep_levels"):
                 kw[f.name] = tuple(float(x) for x in v)
             elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
@@ -422,7 +434,8 @@ class PatchSizes:
         """Return a copy with only the **non-None** overrides applied (CLI flags that
         were actually passed). ``raw_saturations`` is coerced to a tuple."""
         clean = {k: v for k, v in overrides.items() if v is not None}
-        for sat_key in ("raw_saturations", "verify_saturations", "icc_tube_offsets"):
+        for sat_key in ("raw_saturations", "verify_saturations", "icc_tube_offsets",
+                        "saturation_sweep_levels"):
             if sat_key in clean:
                 clean[sat_key] = tuple(float(x) for x in clean[sat_key])
         return replace(self, **clean)
@@ -701,6 +714,7 @@ class Calibration:
         self._last_scored: dict[str, Any] = {}
         self._last_optimizer: dict[str, Any] = {}
         self._last_refine: dict[str, Any] = {}
+        self._last_bookend_drift: dict[str, Any] = {}
 
     # -- persistence ------------------------------------------------------
     def _save(self) -> None:
@@ -1101,10 +1115,8 @@ class Calibration:
         verify ramp's saturation. A saturated target the panel can't render is scored as a clip, not
         chased toward an unreachable Rec.2020 corner. ``None`` ⇒ no clamp/cap (prior behaviour).
 
-        HDR-ONLY by design. #C3 is the wide-gamut (Rec.2020) hazard; sRGB is inside any real panel,
-        so an SDR clamp is a no-op there — AND the SDR *verify* (``score_samples``, CIEDE2000/Lab) has
-        no clamp, so clamping only the SDR *build* would desync build vs verify on a narrow panel. The
-        HDR build and HDR verify (``score_hdr``) BOTH clamp, so HDR stays consistent end to end."""
+        Production use is HDR/wide-gamut only. The SDR clamp experiment was CV-gated worse, so SDR
+        returns ``None`` and stays on the plain sRGB scoring/build target."""
         if self.mode != "HDR":
             return None
         # Prefer THIS run's freshly-measured native primaries (raw-stage channel model, persisted
@@ -1268,6 +1280,140 @@ class Calibration:
             runlog=self.runlog, liveness=self.liveness, dip=dip,
             checkin_interval_s=self._checkin_interval_s,
         )
+
+    def _bookend_drift_qc(self, role: str, ti3_path: Optional[str],
+                          patches: Sequence[tuple[int, int, int]]) -> Optional[dict[str, Any]]:
+        """Compare start-vs-end saturation-sweep bookends before RBF aggregation.
+
+        The bookends serve two jobs: repeated reads become high-confidence RBF knots, but
+        the start/end split is also a temporal drift witness. This helper consumes the
+        ordered measured rows while that temporal information still exists, emits a digest
+        packet/anomaly for the LLM, and only then downstream optimization may average the
+        duplicates by signal.
+        """
+        if role not in ("post-mhc", "verify") or not ti3_path:
+            return None
+        expected = _saturation_sweep_bookend(
+            self.patch_sizes, self._transfer(), max_cv=self._patch_max_cv())
+        span = len(expected)
+        if span <= 0:
+            return None
+        stage = f"measure:{role}"
+        patch_list = list(patches)
+
+        def unavailable(reason: str, **extra: Any) -> dict[str, Any]:
+            summary = {"available": False, "role": role, "reason": reason,
+                       "bookend_patch_count": span, **extra}
+            self._last_bookend_drift = summary
+            if self.runlog is not None:
+                self.runlog.emit("INFO", stage, "bookend_drift_qc", tier="digest", **summary)
+            return summary
+
+        if len(patch_list) < 2 * span:
+            return unavailable("patch_sequence_too_short", measured_patch_count=len(patch_list))
+        if patch_list[:span] != expected or patch_list[-span:] != expected:
+            return unavailable("bookend_sequence_mismatch")
+
+        try:
+            samples = parse_ti3(Path(ti3_path))
+        except Exception as exc:  # noqa: BLE001 - QC telemetry must not break a completed measure
+            return unavailable("ti3_parse_failed", error=f"{type(exc).__name__}: {exc}")
+        if len(samples) < 2 * span:
+            return unavailable("ti3_too_short", ti3_patch_count=len(samples))
+
+        start = samples[:span]
+        end = samples[-span:]
+
+        def key(rgb: tuple[float, float, float]) -> tuple[float, float, float]:
+            return tuple(round(float(c), 6) for c in rgb)
+
+        start_keys = [key(s.rgb) for s in start]
+        end_keys = [key(s.rgb) for s in end]
+        if start_keys != end_keys:
+            return unavailable("bookend_signal_mismatch")
+
+        groups: dict[tuple[float, float, float], dict[str, list[tuple[float, float, float]]]] = {}
+        order: list[tuple[float, float, float]] = []
+        for s0, s1 in zip(start, end):
+            k = key(s0.rgb)
+            if k not in groups:
+                groups[k] = {"start": [], "end": []}
+                order.append(k)
+            groups[k]["start"].append(s0.xyz)
+            groups[k]["end"].append(s1.xyz)
+
+        def mean_xyz(vals: Sequence[tuple[float, float, float]]) -> tuple[float, float, float]:
+            arr = np.asarray(vals, dtype=float)
+            m = arr.mean(axis=0)
+            return (float(m[0]), float(m[1]), float(m[2]))
+
+        spec = self._spec()
+        if spec.is_hdr:
+            from .engine.model import TargetSpace, de_itp
+            space = TargetSpace(self._engine_target())
+
+            def delta_de(a: tuple[float, float, float],
+                         b: tuple[float, float, float]) -> float:
+                ictcp = space.xyz_to_ictcp(np.asarray([a, b], dtype=float))
+                return float(de_itp(ictcp[1] - ictcp[0]))
+
+            metric_name = "dE_ITP"
+        else:
+            wx, wy = self._white_xy()
+            ref_y = max([s.xyz[1] for s in start + end if np.isfinite(s.xyz[1])] or [1.0])
+            ref_white = white_xyz(max(ref_y, 1e-6), wx, wy)
+
+            def delta_de(a: tuple[float, float, float],
+                         b: tuple[float, float, float]) -> float:
+                return float(delta_e2000(xyz_to_lab(a, ref_white), xyz_to_lab(b, ref_white)))
+
+            metric_name = "CIEDE2000"
+
+        per_signal: list[dict[str, Any]] = []
+        for k in order:
+            start_xyz = mean_xyz(groups[k]["start"])
+            end_xyz = mean_xyz(groups[k]["end"])
+            d = delta_de(start_xyz, end_xyz)
+            per_signal.append({
+                "signal": [round(c, 6) for c in k],
+                "delta_de": round(d, 4),
+                "start_reads": len(groups[k]["start"]),
+                "end_reads": len(groups[k]["end"]),
+                "start_Y": round(start_xyz[1], 4),
+                "end_Y": round(end_xyz[1], 4),
+                "delta_Y": round(end_xyz[1] - start_xyz[1], 4),
+            })
+
+        deltas = [float(p["delta_de"]) for p in per_signal]
+        worst = sorted(per_signal, key=lambda p: p["delta_de"], reverse=True)[:8]
+        max_delta = max(deltas) if deltas else 0.0
+        summary = {
+            "available": True,
+            "role": role,
+            "metric": metric_name,
+            "threshold": _BOOKEND_DRIFT_ANOMALY_DE,
+            "bookend_locations": 2,
+            "repeats_per_location": int(self.patch_sizes.saturation_sweep_repeats),
+            "bookend_patch_count": span,
+            "unique_signals": len(per_signal),
+            "mean_delta_de": round(float(sum(deltas) / len(deltas)), 4) if deltas else 0.0,
+            "p95_delta_de": round(float(percentile(deltas, 95.0)), 4) if deltas else 0.0,
+            "max_delta_de": round(float(max_delta), 4),
+            "worst": worst,
+            "per_signal": per_signal,
+        }
+        self._last_bookend_drift = summary
+        if self.runlog is not None:
+            self.runlog.emit("INFO", stage, "bookend_drift_qc", tier="digest", **summary)
+            if max_delta > _BOOKEND_DRIFT_ANOMALY_DE:
+                self.runlog.anomaly(
+                    stage, kind="bookend_drift", role=role, metric=metric_name,
+                    threshold=_BOOKEND_DRIFT_ANOMALY_DE,
+                    max_delta_de=round(float(max_delta), 4),
+                    worst=worst,
+                    message=("start/end saturation-sweep bookends drifted beyond the "
+                             f"{_BOOKEND_DRIFT_ANOMALY_DE:g} {metric_name} threshold"))
+        return summary
 
     def _liveness_threshold(self, dip: Optional[Any]) -> float:
         """The no-progress stall threshold, derived from the measured panel+meter timing
@@ -1514,6 +1660,13 @@ class Calibration:
             out["optimizer"] = self._last_optimizer
         if self._last_refine:
             out["refine"] = self._last_refine
+        if self._last_bookend_drift:
+            out["bookend_drift"] = {
+                k: self._last_bookend_drift.get(k)
+                for k in ("available", "role", "metric", "max_delta_de", "p95_delta_de",
+                          "mean_delta_de", "threshold", "unique_signals")
+                if k in self._last_bookend_drift
+            }
         return out
 
     def _monitor_map_check(self) -> dict[str, Any]:
@@ -2331,7 +2484,11 @@ class Calibration:
 
         def run() -> StageOutcome:
             res = self._measure_set(patches, role=role, ti3_name=ti3_name, ndjson_name=ndjson_name)
-            return StageOutcome(key, "done", digest=res.digest,
+            bookend_drift = self._bookend_drift_qc(role, res.ti3_path, patches)
+            digest = dict(res.digest)
+            if bookend_drift is not None:
+                digest["bookend_drift_qc"] = bookend_drift
+            return StageOutcome(key, "done", digest=digest,
                                 data={"ti3": res.ti3_path, "ndjson": res.ndjson_path,
                                       "white_xyz": list(res.white_xyz) if res.white_xyz else None,
                                       "needs_adjudication": res.needs_adjudication,
@@ -4171,6 +4328,27 @@ def _dedup_keep_order(patches: list[tuple[int, int, int]]) -> list[tuple[int, in
     return out
 
 
+def _saturation_sweep_bookend(ps: PatchSizes, transfer: Transfer, *,
+                              max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    return saturation_sweep_patches(
+        transfer,
+        levels=ps.saturation_sweep_levels,
+        repeats=ps.saturation_sweep_repeats,
+        max_cv=max_cv,
+        include_secondaries=True,
+        order="none",
+    )
+
+
+def _with_saturation_sweep_bookends(core: list[tuple[int, int, int]],
+                                    ps: PatchSizes, transfer: Transfer, *,
+                                    max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    sweep = _saturation_sweep_bookend(ps, transfer, max_cv=max_cv)
+    if not sweep:
+        return core
+    return sweep + core + sweep
+
+
 def _volumetric_bulk(ps: PatchSizes, transfer: Transfer, *, warm_tau: Optional[int],
                      max_cv: Optional[int]) -> list[tuple[int, int, int]]:
     """The volume-covering bulk: the existing ``tube`` | ``cube`` | ``gamut`` sampling (unchanged)."""
@@ -4321,7 +4499,8 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
     bulk = _volumetric_bulk(ps, transfer, warm_tau=warm_tau, max_cv=max_cv)
     if target is None or not reachable_primaries:
         union = bulk + _volumetric_neutral_dark(ps, transfer, warm_tau=warm_tau, max_cv=max_cv)
-        return sort_patches(_dedup_keep_order(union), ps.order, transfer, warm_tau=warm_tau)
+        core = sort_patches(_dedup_keep_order(union), ps.order, transfer, warm_tau=warm_tau)
+        return _with_saturation_sweep_bookends(core, ps, transfer, max_cv=max_cv)
 
     bulk = _project_and_thin(bulk, target=target, reachable_primaries=reachable_primaries,
                              transfer=transfer, max_cv=max_cv)
@@ -4329,7 +4508,8 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
                                         reachable_primaries=reachable_primaries,
                                         warm_tau=warm_tau, max_cv=max_cv)
     union = _dedup_keep_order(foundation + bulk)   # foundation first → its exact placements survive
-    return sort_patches(union, ps.order, transfer, warm_tau=warm_tau)
+    core = sort_patches(union, ps.order, transfer, warm_tau=warm_tau)
+    return _with_saturation_sweep_bookends(core, ps, transfer, max_cv=max_cv)
 
 
 def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
@@ -4373,7 +4553,7 @@ def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
     ``max_cv`` caps the range (HDR peak; so verify never asks for an above-peak highlight that
     would read clipped). Replaces the old heavy mhc-only verify (which re-ran the full build ramp,
     ~45 % sub-nit patches at ~7 s each); the build's own dark model is untouched."""
-    return ramp_patches(transfer, steps=ps.verify_steps, saturations=ps.verify_saturations,
+    core = ramp_patches(transfer, steps=ps.verify_steps, saturations=ps.verify_saturations,
                         spacing=ps.raw_spacing, include_secondaries=True,
                         low_light_steps=ps.low_light_steps,
                         low_light_signal=ps.low_light_signal,
@@ -4381,6 +4561,7 @@ def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
                         hue_sat_caps=hue_sat_caps,
                         color_min_signal=ps.verify_color_min_signal,
                         order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
+    return _with_saturation_sweep_bookends(core, ps, transfer, max_cv=max_cv)
 
 
 # The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show
@@ -4596,6 +4777,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                        help="verify sanity-ramp steps per channel (default 13 — lighter than the build).")
     patch.add_argument("--verify-saturations", type=float, nargs="+", default=None, dest="verify_saturations",
                        help="verify saturation shells (default 1.0 0.5 — saturated + practical mid-sat).")
+    patch.add_argument("--sat-sweep-levels", type=float, nargs="+", default=None,
+                       dest="saturation_sweep_levels",
+                       help="3D-LUT confidence skeleton levels as signal fractions (default 0.25 0.5 0.75 1.0).")
+    patch.add_argument("--sat-sweep-repeats", type=int, default=None,
+                       dest="saturation_sweep_repeats",
+                       help="repeated reads per saturation-sweep bookend location "
+                            "(default 3: 3 start reads + 3 end reads per skeleton signal).")
     patch.add_argument("--neutral-steps", type=int, default=None, dest="neutral_steps",
                        help="grey-axis ramp steps measured by the MHC D65 grayscale refine "
                             "(the correctionGrayscale closed loop; default 17).")

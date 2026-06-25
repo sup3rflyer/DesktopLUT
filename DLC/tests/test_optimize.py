@@ -23,6 +23,7 @@ from dlc.optimize import (
     DegenerateMeasurements,
     OptimizeConfig,
     _classify,
+    aggregate_training_samples,
     optimize_cube,
     sample_cube,
     seed_correction_budget,
@@ -85,6 +86,16 @@ def test_sample_cube_identity_is_passthrough():
     assert np.allclose(out, signals, atol=1e-6)
 
 
+def test_aggregate_training_samples_averages_duplicates_and_sums_confidence():
+    signals = np.array([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=float)
+    xyz = np.array([[10.0, 2.0, 1.0], [14.0, 4.0, 1.0], [1.0, 9.0, 2.0]], dtype=float)
+    sig_u, xyz_u, conf = aggregate_training_samples(signals, xyz)
+    assert sig_u.shape == (2, 3)
+    assert np.allclose(sig_u[0], [1.0, 0.0, 0.0])
+    assert np.allclose(xyz_u[0], [12.0, 3.0, 1.0])
+    assert conf.tolist() == [2.0, 1.0]
+
+
 # ---------------------------------------------------------------------------
 # convergence
 # ---------------------------------------------------------------------------
@@ -107,6 +118,45 @@ def test_machine_drives_correctable_panel_below_threshold():
     assert result.digest["best_max_de"] < raw_max  # the cube actually corrected it
     assert result.digest["cube_monotonic"] is True
     assert result.needs_adjudication is False
+
+
+def test_physical_engine_is_opt_in_and_reports_info():
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 0.99, 0.975), gammas=(1.0, 1.01, 0.99))
+    signals = _cube_signals(4)
+    measured = probe(signals)
+
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=5, max_outer=1,
+                                                 engine="physical", neutral_band=0.0,
+                                                 max_correction=0.25,
+                                                 adaptive_sampling=False))
+
+    assert result.digest["engine"] == "physical"
+    assert result.digest["physical_info"] is not None
+    assert result.digest["physical_info"]["metric"] == "de2000"
+    assert result.digest["best_mean_de"] < _raw_max_de(target, probe, signals)
+
+
+def test_constrained_rbf_engine_is_opt_in_and_reports_info():
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.0, 0.92))
+    signals = _cube_signals(4)
+    measured = probe(signals)
+
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=5, max_outer=1,
+                                                 engine="constrained-rbf",
+                                                 neutral_band=0.0,
+                                                 max_correction=0.35,
+                                                 adaptive_sampling=False))
+
+    assert result.digest["engine"] == "constrained-rbf"
+    assert result.digest["constrained_info"] is not None
+    assert result.digest["constrained_info"]["metric"] == "de2000"
+    assert result.digest["constrained_info"]["constrained_nodes"] > 0
 
 
 def test_digest_breaks_out_the_neutral_axis():

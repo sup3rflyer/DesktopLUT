@@ -336,10 +336,41 @@ def signal_saturation_caps(space: "TargetSpace", native_primaries: dict, *,
 # Cross-validated smoothing
 # ---------------------------------------------------------------------------
 
+def _normalised_sample_confidence(sample_confidence: Optional[np.ndarray],
+                                  n: int) -> Optional[np.ndarray]:
+    """Validate per-sample confidence and normalize its median to 1.
+
+    RBFInterpolator's ``smoothing`` can be a scalar or one value per sample. DLC treats
+    ``sample_confidence`` as inverse local smoothing: a confidence of 4 fits about four
+    times tighter than an ordinary point, while 0.25 smooths about four times more. Median
+    normalization preserves the existing scalar smoothing scale for ordinary datasets.
+    """
+    if sample_confidence is None:
+        return None
+    conf = np.asarray(sample_confidence, dtype=float).reshape(-1)
+    if conf.shape[0] != n:
+        raise ValueError("sample_confidence must be length N")
+    if not np.all(np.isfinite(conf)) or np.any(conf <= 0.0):
+        raise ValueError("sample_confidence must contain finite positive values")
+    med = float(np.median(conf))
+    if med <= 0.0 or not np.isfinite(med):
+        raise ValueError("sample_confidence median must be finite and positive")
+    return conf / med
+
+
+def _smoothing_for_confidence(base_smoothing: float,
+                              normalised_confidence: Optional[np.ndarray]) -> float | np.ndarray:
+    base = max(0.0, float(base_smoothing))
+    if normalised_confidence is None:
+        return base
+    return np.maximum(base / normalised_confidence, 0.0)
+
+
 def auto_smooth(signal: np.ndarray, delta_ictcp: np.ndarray,
                 kernel: str = "thin_plate_spline",
                 search_values: Optional[np.ndarray] = None,
-                k: int = 5, seed: int = 42) -> tuple[float, float, list[tuple[float, float]]]:
+                k: int = 5, seed: int = 42,
+                sample_confidence: Optional[np.ndarray] = None) -> tuple[float, float, list[tuple[float, float]]]:
     """Choose the RBF smoothing that minimizes k-fold CV ``dE_ITP``.
 
     Higher smoothing rejects more measurement noise (mini-LED local dimming) at
@@ -356,6 +387,7 @@ def auto_smooth(signal: np.ndarray, delta_ictcp: np.ndarray,
         search_values = np.logspace(-4, 1.7, 20)  # 1e-4 .. ~50
 
     n = len(signal)
+    confidence = _normalised_sample_confidence(sample_confidence, n)
     k = max(2, min(k, n))
     fold_size = max(1, n // k)
     idx = np.arange(n)
@@ -369,8 +401,10 @@ def auto_smooth(signal: np.ndarray, delta_ictcp: np.ndarray,
             train = np.concatenate([idx[:fold * fold_size], idx[(fold + 1) * fold_size:]])
             if len(val) == 0 or len(train) < 4:
                 continue
+            smoothing = _smoothing_for_confidence(
+                float(S), confidence[train] if confidence is not None else None)
             m = RBFInterpolator(signal[train], delta_ictcp[train],
-                                kernel=kernel, smoothing=float(S), degree=1)
+                                kernel=kernel, smoothing=smoothing, degree=1)
             err = delta_ictcp[val] - m(signal[val])
             fold_errors.append(float(np.mean(de_itp(err))))
         if fold_errors:
@@ -410,7 +444,8 @@ class DisplayErrorModel:
 
     def __init__(self, signal_rgb: np.ndarray, measured_xyz: np.ndarray,
                  target: Target, *, smoothing: Optional[float] = None,
-                 kernel: str = "thin_plate_spline", reachable_primaries: Any = None):
+                 kernel: str = "thin_plate_spline", reachable_primaries: Any = None,
+                 sample_confidence: Optional[np.ndarray] = None):
         self.signal = np.asarray(signal_rgb, dtype=float)
         self.measured_xyz = np.maximum(np.asarray(measured_xyz, dtype=float), 0.0)
         if self.signal.shape != self.measured_xyz.shape or self.signal.shape[1] != 3:
@@ -418,6 +453,7 @@ class DisplayErrorModel:
         self.target = target
         self.space = TargetSpace(target, reachable_primaries=reachable_primaries)
         self.kernel = kernel
+        self.sample_confidence = _normalised_sample_confidence(sample_confidence, len(self.signal))
 
         ideal_ictcp = self.space.ideal_ictcp(self.signal)
         self.measured_ictcp = self.space.xyz_to_ictcp(self.measured_xyz)
@@ -425,12 +461,14 @@ class DisplayErrorModel:
 
         if smoothing is None:
             self.smoothing, self.cv_error, self.cv_results = auto_smooth(
-                self.signal, self.delta_ictcp, kernel=kernel)
+                self.signal, self.delta_ictcp, kernel=kernel,
+                sample_confidence=self.sample_confidence)
         else:
             self.smoothing, self.cv_error, self.cv_results = float(smoothing), float("nan"), []
 
+        self.point_smoothing = _smoothing_for_confidence(self.smoothing, self.sample_confidence)
         self.rbf = RBFInterpolator(self.signal, self.delta_ictcp,
-                                   kernel=kernel, smoothing=self.smoothing, degree=1)
+                                   kernel=kernel, smoothing=self.point_smoothing, degree=1)
 
     # -- queries ----------------------------------------------------------
     def predict(self, signal_rgb: np.ndarray) -> np.ndarray:

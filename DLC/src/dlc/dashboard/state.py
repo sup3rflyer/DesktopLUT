@@ -638,6 +638,7 @@ class DashboardState:
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
             "saturation": self._saturation(color_map, white),
             "optimizer": list(self._optimizer_history),
+            "white_track": list(self._drift_series()),
             "channel_drift": self._channel_drift(hdr, white),
         }
 

@@ -53,13 +53,15 @@ Numpy/scipy/colour live in :mod:`dlc.engine`; importing this module pulls them
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
+from .engine.lut_constrained import build_constrained_rbf_cube
 from .engine.lut_rbf import build_cube, cube_diagnostics, identity_cube, predicted_accuracy, write_cube
 from .engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
+from .engine.physical import StructuredForwardModel, build_physical_cube
 
 __all__ = [
     "ProbeFn",
@@ -68,6 +70,7 @@ __all__ = [
     "OptimizeResult",
     "DegenerateMeasurements",
     "SDR_CORRECTION_CAP",
+    "aggregate_training_samples",
     "sample_cube",
     "seed_correction_budget",
     "optimize_cube",
@@ -144,15 +147,38 @@ class OptimizeConfig:
     adaptive_low_light_cap: int = 128
     adaptive_sentinels: int = 96
     smoothing: Optional[float] = None   # None ⇒ per-iteration k-fold CV
+    confidence_weighted_rbf: bool = True  # duplicate/skeleton samples lower local RBF smoothing
     n_inner_iterations: int = 3
     fade_width: float = 0.05
     near_black_nits: float = 0.1
     # Neutral-axis preservation: fade the cube's correction to identity as the input nears the grey
-    # diagonal (R==G==B). The DLC 3D LUT ALWAYS sits on the MHC ICC, which owns the grey/white axis
-    # (1+1+1), so the cube must own colour only; this stops it re-touching neutral (the white
+    # diagonal (R==G==B). The DWM 3D LUT feeds the MHC ICC, and the MHC owns the grey/white axis
+    # (1+1+1), so the cube must own colour only in that stacked path; this stops it re-touching neutral (the white
     # 0.99→4.56 HW regression). ``0`` ⇒ off — correct only for a raw panel with no MHC foundation
     # (e.g. the synthetic-correction unit tests), where the cube legitimately must fix grey too.
     neutral_band: float = 0.05
+    # Candidate engine selector. "rbf" is the shipping path. "constrained-rbf" and "physical"
+    # are labelled experiments: held-out CV rejected the constrained shell and the additive
+    # structured model as post-MHC/post-ICC cube replacements. Keep them opt-in for probes only.
+    engine: Literal["rbf", "constrained-rbf", "physical"] = "rbf"
+    constrained_metric: Literal["auto", "de2000", "de_itp"] = "auto"
+    constrained_hue_tolerance_degrees: float = 4.0
+    constrained_purity_slack: float = 1.03
+    constrained_shell_saturation: float = 0.68
+    constrained_shell_pressure: float = 0.20
+    constrained_screen_error_threshold: float = 1.0
+    constrained_off_channel_guard_pressure: float = 0.75
+    constrained_gamut_blend_strength: float = 0.65
+    constrained_maxiter: int = 40
+    constrained_n_jobs: int = 1
+    constrained_chunk_size: int = 128
+    physical_metric: Literal["auto", "de2000", "de_itp"] = "auto"
+    physical_uncertainty_radius: float = 0.18
+    physical_hue_tolerance_degrees: float = 4.0
+    physical_purity_slack: float = 1.03
+    # Sequential/MHC-stacked default is False: MHC remains standalone-complete and owns exact
+    # neutral. A later co-optimized shaper+cube path can opt in after neutral-dense validation.
+    allow_neutral_refinement: bool = False
 
 
 @dataclass
@@ -171,6 +197,8 @@ class IterationResult:
     worst: list[tuple[list[float], float]]   # [(signal, dE), …] top-k by dE
     smoothing: float
     cube_monotonic: bool
+    large_reversals: int
+    worst_lattice_jump: float
     train_points: int
     probed_patches: int
     probe_total: int
@@ -192,6 +220,8 @@ class IterationResult:
             "residual": self.residual,
             "smoothing": round(self.smoothing, 4),
             "cube_monotonic": self.cube_monotonic,
+            "large_reversals": self.large_reversals,
+            "worst_lattice_jump": round(self.worst_lattice_jump, 4),
             "train_points": self.train_points,
             "worst": [[[round(c, 4) for c in s], round(d, 3)] for s, d in self.worst],
             "probed_patches": self.probed_patches,
@@ -230,6 +260,52 @@ def sample_cube(cube: np.ndarray, signals: np.ndarray) -> np.ndarray:
     signals = np.asarray(signals, dtype=float)
     out = interp(signals[:, [2, 1, 0]])  # cube indexed [B, G, R]
     return np.clip(out, 0.0, 1.0)
+
+
+def aggregate_training_samples(signals: np.ndarray, measured_xyz: np.ndarray,
+                               sample_confidence: Optional[np.ndarray] = None,
+                               *, decimals: int = 6) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Average duplicate measurement rows and return per-point confidence.
+
+    Repeated start/end skeleton sweeps should not become contradictory near-duplicate
+    RBF knots. They become one high-SNR training point: XYZ is averaged, and the summed
+    repeat count becomes ``sample_confidence`` so :class:`DisplayErrorModel` lowers local
+    smoothing there while the ordinary interior remains smoothed.
+    """
+    sig = np.asarray(signals, dtype=float).reshape(-1, 3)
+    xyz = np.asarray(measured_xyz, dtype=float).reshape(-1, 3)
+    if sig.shape != xyz.shape:
+        raise ValueError("signals and measured_xyz must have matching (N, 3) shapes")
+    if sample_confidence is None:
+        conf = np.ones(len(sig), dtype=float)
+    else:
+        conf = np.asarray(sample_confidence, dtype=float).reshape(-1)
+        if conf.shape[0] != len(sig):
+            raise ValueError("sample_confidence must be length N")
+        if not np.all(np.isfinite(conf)) or np.any(conf <= 0.0):
+            raise ValueError("sample_confidence must contain finite positive values")
+
+    groups: dict[tuple[float, float, float], list[Any]] = {}
+    order: list[tuple[float, float, float]] = []
+    rounded = np.round(sig, decimals=decimals)
+    for i, key_arr in enumerate(rounded):
+        key = tuple(float(v) for v in key_arr)
+        if key not in groups:
+            groups[key] = [np.zeros(3, dtype=float), np.zeros(3, dtype=float), 0.0]
+            order.append(key)
+        groups[key][0] += sig[i] * conf[i]
+        groups[key][1] += xyz[i] * conf[i]
+        groups[key][2] += float(conf[i])
+
+    out_sig: list[np.ndarray] = []
+    out_xyz: list[np.ndarray] = []
+    out_conf: list[float] = []
+    for key in order:
+        sum_sig, sum_xyz, sum_conf = groups[key]
+        out_sig.append(sum_sig / sum_conf)
+        out_xyz.append(sum_xyz / sum_conf)
+        out_conf.append(float(sum_conf))
+    return np.vstack(out_sig), np.vstack(out_xyz), np.asarray(out_conf, dtype=float)
 
 
 def seed_correction_budget(space: TargetSpace, signals: np.ndarray, measured_xyz: np.ndarray,
@@ -355,8 +431,16 @@ def optimize_cube(
     # panel can physically render, so build + verify score a gamut clip as a clip, not chase it (#C3).
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
 
+    raw_train_count = int(np.asarray(signals).reshape(-1, 3).shape[0])
     train_signals = np.asarray(signals, dtype=float).reshape(-1, 3)
     train_xyz = np.maximum(np.asarray(measured_xyz, dtype=float).reshape(-1, 3), 0.0)
+    train_signals, train_xyz, train_confidence = aggregate_training_samples(train_signals, train_xyz)
+    if len(train_signals) < 4:
+        raise DegenerateMeasurements(
+            f"the {raw_train_count} profiling measurement(s) collapsed to "
+            f"{len(train_signals)} unique signal point(s) after averaging repeated reads; "
+            "an RBF correction model needs at least 4 non-coplanar signal points. "
+            "Re-measure with more signal variation (a fuller volumetric/ramp set), then retry.")
     verify = (np.asarray(verify_signals, dtype=float).reshape(-1, 3)
               if verify_signals is not None else train_signals.copy())
     target_ictcp = space.ideal_ictcp(verify)
@@ -383,15 +467,59 @@ def optimize_cube(
     force_full_probe = False
 
     for it in range(1, cfg.max_outer + 1):
+        physical_info = None
+        constrained_info = None
         try:
-            model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
-                                      reachable_primaries=reachable_primaries)
-            cube = build_cube(
-                model, cfg.grid_size, signal_points=train_signals,
-                fade_width=cfg.fade_width, max_correction=budget,
-                n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
-                neutral_band=cfg.neutral_band,
-            )
+            if cfg.engine == "physical":
+                # Physical candidate: clamp the target to the measured native gamut in ALL modes
+                # and solve nodes directly against signal->XYZ.
+                model = StructuredForwardModel(
+                    train_signals, train_xyz, target, reachable_primaries=reachable_primaries)
+                cube, physical_info = build_physical_cube(
+                    model, cfg.grid_size, signal_points=train_signals,
+                    metric=cfg.physical_metric, max_correction=budget,
+                    fade_width=cfg.fade_width,
+                    uncertainty_radius=cfg.physical_uncertainty_radius,
+                    hue_tolerance_degrees=cfg.physical_hue_tolerance_degrees,
+                    purity_slack=cfg.physical_purity_slack,
+                    neutral_band=cfg.neutral_band,
+                    allow_neutral_refinement=cfg.allow_neutral_refinement,
+                )
+            elif cfg.engine == "constrained-rbf":
+                model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
+                                          reachable_primaries=reachable_primaries,
+                                          sample_confidence=(train_confidence
+                                                             if cfg.confidence_weighted_rbf else None))
+                cube, constrained_info = build_constrained_rbf_cube(
+                    model, cfg.grid_size, signal_points=train_signals,
+                    reachable_primaries=reachable_primaries,
+                    metric=cfg.constrained_metric, max_correction=budget,
+                    fade_width=cfg.fade_width,
+                    n_iterations=cfg.n_inner_iterations,
+                    near_black_nits=cfg.near_black_nits,
+                    neutral_band=cfg.neutral_band,
+                    hue_tolerance_degrees=cfg.constrained_hue_tolerance_degrees,
+                    purity_slack=cfg.constrained_purity_slack,
+                    shell_saturation=cfg.constrained_shell_saturation,
+                    shell_pressure=cfg.constrained_shell_pressure,
+                    screen_error_threshold=cfg.constrained_screen_error_threshold,
+                    off_channel_guard_pressure=cfg.constrained_off_channel_guard_pressure,
+                    gamut_blend_strength=cfg.constrained_gamut_blend_strength,
+                    maxiter=cfg.constrained_maxiter,
+                    n_jobs=cfg.constrained_n_jobs,
+                    chunk_size=cfg.constrained_chunk_size,
+                )
+            else:
+                model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
+                                          reachable_primaries=reachable_primaries,
+                                          sample_confidence=(train_confidence
+                                                             if cfg.confidence_weighted_rbf else None))
+                cube = build_cube(
+                    model, cfg.grid_size, signal_points=train_signals,
+                    fade_width=cfg.fade_width, max_correction=budget,
+                    n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
+                    neutral_band=cfg.neutral_band,
+                )
         except np.linalg.LinAlgError as exc:
             if snapshots:
                 # A later iteration went singular — typically the fold-back stacked duplicate
@@ -421,27 +549,40 @@ def optimize_cube(
                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
                           low_light_signal=cfg.low_light_signal)
         diag = cube_diagnostics(cube)
+        if cfg.engine == "physical":
+            driven_full = sample_cube(cube, verify)
+            produced_full = model.forward(driven_full)
+            predicted_max = float(de_itp(space.xyz_to_ictcp(produced_full) - target_ictcp).max())
+            smoothing_value = 0.0
+        else:
+            predicted_max = float(predicted_accuracy(model, cube, verify)["max"])
+            smoothing_value = float(model.smoothing)
         order = np.argsort(de)[::-1][: cfg.top_k]
         result = IterationResult(
             iteration=it, max_correction=budget,
             measured_mean_de=float(de.mean()), measured_p95_de=float(np.percentile(de, 95)),
             measured_max_de=float(de.max()),
-            predicted_max_de=float(predicted_accuracy(model, cube, verify)["max"]),
+            predicted_max_de=predicted_max,
             above_threshold=int(masks["above"].sum()),
             budget_limited=int(masks["budget_limited"].sum()),
             signal_clipped=int(masks["signal_clipped"].sum()),
             near_black=int(masks["near_black"].sum()),
             residual=int(masks["residual"].sum()),
             worst=[(verify_probe[i].tolist(), float(de[i])) for i in order],
-            smoothing=float(model.smoothing), cube_monotonic=diag.monotonic,
+            smoothing=smoothing_value, cube_monotonic=diag.monotonic,
+            large_reversals=diag.large_reversal_count,
+            worst_lattice_jump=diag.worst_lattice_jump,
             train_points=int(len(train_signals)), probed_patches=int(len(probe_idx)),
             probe_total=int(len(verify)), sampling_mode=sampling_mode,
         )
         history.append(result)
         snapshots.append({"cube": cube, "driven": driven, "measured": measured, "de": de,
                           "budget": budget, "monotonic": diag.monotonic,
+                          "diagnostics": diag.as_dict(),
                           "verify": verify_probe, "full": full_probe,
-                          "sampling_mode": sampling_mode})
+                          "sampling_mode": sampling_mode,
+                          "physical_info": physical_info.as_dict() if physical_info else None,
+                          "constrained_info": constrained_info.as_dict() if constrained_info else None})
         if on_iteration is not None:
             on_iteration(result)
 
@@ -478,6 +619,9 @@ def optimize_cube(
         # non-improving (likely noisy) iteration breaks above WITHOUT polluting the model.
         train_signals = np.vstack([train_signals, driven])
         train_xyz = np.vstack([train_xyz, measured])
+        train_confidence = np.concatenate([train_confidence, np.ones(len(driven), dtype=float)])
+        train_signals, train_xyz, train_confidence = aggregate_training_samples(
+            train_signals, train_xyz, train_confidence)
 
     # Pick the cube to return: prefer monotonic, then lowest worst-case dE — using
     # the cached measurements (no extra probing).
@@ -537,6 +681,7 @@ def optimize_cube(
     digest = {
         "converged": converged,
         "iterations": len(history),
+        "engine": cfg.engine,
         "grid_size": cfg.grid_size,
         "threshold": cfg.threshold,
         "max_correction": round(best_budget, 4),
@@ -554,8 +699,17 @@ def optimize_cube(
         "high_side_clipped": int(masks_best["high_clipped"].sum()),
         "budget_limited": int(budget_limited.sum()),
         "cube_monotonic": bool(best["monotonic"]),
+        "large_reversals": int((best.get("diagnostics") or {}).get("large_reversal_count", 0)),
+        "worst_lattice_jump": (best.get("diagnostics") or {}).get("worst_lattice_jump"),
+        "cube_diagnostics": best.get("diagnostics"),
+        "confidence_weighted_rbf": bool(cfg.confidence_weighted_rbf),
+        "training_raw_points": raw_train_count,
+        "training_unique_points": int(len(train_confidence)),
+        "training_max_confidence": round(float(train_confidence.max()), 3) if len(train_confidence) else 0.0,
         "sampling_mode": best["sampling_mode"],
         "full_validation": bool(best["full"]),
+        "physical_info": best.get("physical_info"),
+        "constrained_info": best.get("constrained_info"),
         "best_probed_patches": int(len(best_de)),
         "probe_total": int(len(verify)),
         "needs_adjudication": needs_adjudication,

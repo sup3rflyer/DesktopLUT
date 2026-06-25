@@ -271,13 +271,13 @@ def test_gamut_tell_quiet_when_native_covers_target(tmp_path: Path):
     assert "warning" not in tell
 
 
-def test_reachable_primaries_is_hdr_only_and_guards_degenerate(tmp_path: Path):
-    # #C3 target clamp is HDR-only: the SDR verify (CIEDE2000/Lab) has no clamp, so clamping only the
-    # SDR build would desync build vs verify on a narrow panel; sRGB is inside any real panel anyway.
+def test_reachable_primaries_are_hdr_only_and_guard_degenerate(tmp_path: Path):
+    # SDR gamut-clamp was CV-gated worse, so production SDR deliberately leaves reachable primaries
+    # off. HDR still uses the measured native gamut to score true OOG Rec.2020 clips as clips.
     prim = {"R": [0.66, 0.33], "G": [0.25, 0.66], "B": [0.15, 0.07]}
     sdr = _make(tmp_path, "reach_sdr", mode="SDR")
     _inject_dip(sdr, native_primaries=prim)
-    assert sdr._reachable_primaries() is None          # SDR ⇒ no clamp (both build + verify unclamped)
+    assert sdr._reachable_primaries() is None
 
     hdr = _make(tmp_path, "reach_hdr", mode="HDR")
     _inject_dip(hdr, native_primaries=prim)
@@ -2177,6 +2177,69 @@ def test_default_interval_does_not_fire_timed_checkins_in_a_fast_run(tmp_path: P
              if e.event == "check_in" and "overview" in e.data]
     assert timed == []
     assert not any(k.startswith("checkin:") for k in calib.calib["decisions"])
+
+
+def _bookend_qc_fixture(tmp_path: Path, name: str, *, end_gain: float,
+                        repeats: int = 2) -> tuple[Calibration, list[tuple[int, int, int]]]:
+    ps = PatchSizes(
+        raw_ramp_steps=3, volumetric_mode="cube", cube_size=2,
+        tube_size=3, tube_radius=0, low_light_steps=0, low_light_cube_size=0,
+        saturation_sweep_levels=(1.0,), saturation_sweep_repeats=repeats,
+        verify_steps=3, verify_saturations=(1.0,), order="none",
+    )
+    calib = _make(tmp_path, name, patch_sizes=ps)
+    calib.target_name = "srgb_g22"
+    calib.calib["target"] = "srgb_g22"
+    patches = build_verify_set(ps, calib._transfer())
+    sweep_len = 7 * repeats
+    total = len(patches)
+
+    def panel(patch):
+        r, g, b = patch.signal
+        gain = end_gain if patch.role == "measurement" and patch.seq >= total - sweep_len else 1.0
+        xyz = (
+            gain * (2.0 + 18.0 * r),
+            gain * (8.0 + 52.0 * (0.2126 * r + 0.7152 * g + 0.0722 * b)),
+            gain * (2.0 + 18.0 * b),
+        )
+        return Reading(xyz=xyz, ok=True)
+
+    calib.measure = panel
+    return calib, patches
+
+
+def test_bookend_drift_qc_reports_repeats_without_anomaly_when_stable(tmp_path: Path):
+    calib, patches = _bookend_qc_fixture(tmp_path, "bookstable", end_gain=1.0, repeats=2)
+    outcome = calib.stage_measure(role="verify", patches=patches,
+                                  ti3_name="v.ti3", ndjson_name="v.ndjson")
+
+    qc = outcome.digest["bookend_drift_qc"]
+    assert qc["available"] is True
+    assert qc["bookend_locations"] == 2
+    assert qc["repeats_per_location"] == 2
+    assert qc["unique_signals"] == 7
+    assert qc["max_delta_de"] == 0.0
+    assert all(p["start_reads"] == 2 and p["end_reads"] == 2 for p in qc["per_signal"])
+    assert calib._latest_checkin_metrics()["bookend_drift"]["max_delta_de"] == 0.0
+    events = read_events(calib.ctx.events_path)
+    assert any(e.event == "bookend_drift_qc" for e in events)
+    assert not [e for e in events if e.event == Ev.ANOMALY
+                and (e.data or {}).get("kind") == "bookend_drift"]
+
+
+def test_bookend_drift_qc_emits_nonblocking_anomaly_for_temporal_shift(tmp_path: Path):
+    calib, patches = _bookend_qc_fixture(tmp_path, "bookdrift", end_gain=1.25, repeats=1)
+    outcome = calib.stage_measure(role="verify", patches=patches,
+                                  ti3_name="v.ti3", ndjson_name="v.ndjson")
+
+    qc = outcome.digest["bookend_drift_qc"]
+    assert qc["available"] is True
+    assert qc["max_delta_de"] > qc["threshold"]
+    assert outcome.data["needs_adjudication"] is False  # evidence packet, not a hidden seam
+    anomalies = [e for e in read_events(calib.ctx.events_path)
+                 if e.event == Ev.ANOMALY and (e.data or {}).get("kind") == "bookend_drift"]
+    assert anomalies
+    assert anomalies[-1].data["max_delta_de"] == qc["max_delta_de"]
 
 
 # ---------------------------------------------------------------------------

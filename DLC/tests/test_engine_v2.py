@@ -9,6 +9,7 @@ suite still runs on a box without the engine extra installed.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,9 @@ from dlc.engine import patches as P
 from dlc.engine import lut_rbf as L
 from dlc.engine import lut_sdr as S
 from dlc.engine import whitepoint as W
+from dlc.engine.lut_constrained import build_constrained_rbf_cube, gamut_clip_pressure, gamut_pressure
 from dlc.engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
+from dlc.engine.physical import StructuredForwardModel, build_physical_cube
 
 # Hardware-validated white-point regression against real panel captures that live
 # in a LOCAL lab dir (not in this repo). Point the DLC_COLORCAL env var at that dir
@@ -253,6 +256,16 @@ def test_ramp_anchors_and_dedup():
     assert len(ramp) == len(set(ramp))  # deduped
 
 
+def test_saturation_sweep_preserves_repeated_skeleton_reads():
+    tf = P.Transfer.power(2.2, 120.0, bit_depth=8)
+    sweep = P.saturation_sweep_patches(tf, repeats=3, order="none")
+    assert len(sweep) == 4 * 7 * 3
+    counts = Counter(sweep)
+    assert set(counts.values()) == {3}
+    assert (64, 64, 64) in counts
+    assert (255, 0, 0) in counts and (0, 255, 255) in counts
+
+
 def _is_secondary(p):
     """A C/M/Y patch: two channels equal-and-high, the third strictly lower (and not grey)."""
     hi = max(p)
@@ -432,6 +445,27 @@ def test_model_fits_synthetic_panel():
     assert float(fwd.mean()) < 2 * es.mean
 
 
+def test_model_confidence_weights_trust_repeated_skeleton_anchor():
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0)
+    space = TargetSpace(target)
+    axis = np.linspace(0.0, 1.0, 5)
+    sig = np.array([[r, g, b] for b in axis for g in axis for r in axis], dtype=float)
+    measured = _synth_measure(space, sig, gains=(1.0, 0.99, 0.98), noise=0.0)
+    red_idx = int(np.where(np.all(np.isclose(sig, [1.0, 0.0, 0.0]), axis=1))[0][0])
+    measured[red_idx] = space.ideal_xyz(np.array([[0.82, 0.08, 0.04]], dtype=float))[0]
+
+    plain = DisplayErrorModel(sig, measured, target, smoothing=2.0)
+    conf = np.ones(len(sig))
+    conf[red_idx] = 1000.0
+    weighted = DisplayErrorModel(sig, measured, target, smoothing=2.0, sample_confidence=conf)
+
+    anchor = sig[[red_idx]]
+    target_ictcp = space.xyz_to_ictcp(measured[[red_idx]])
+    plain_err = de_itp(space.xyz_to_ictcp(plain.forward(anchor)) - target_ictcp)[0]
+    weighted_err = de_itp(space.xyz_to_ictcp(weighted.forward(anchor)) - target_ictcp)[0]
+    assert weighted_err < plain_err / 4
+
+
 def test_build_cube_reduces_error_and_is_mostly_monotonic():
     target, tf = Target.hdr_rec2020_pq(), P.Transfer.pq()
     space = TargetSpace(target)
@@ -451,6 +485,99 @@ def test_build_cube_reduces_error_and_is_mostly_monotonic():
     bi, gi, ri = np.where(np.diff(cube[:, :, :, 0], axis=2) < -1e-9)
     if ri.size:
         assert max(axis[r] for r in ri) < 0.35
+
+
+def test_cube_diagnostics_report_large_reversals_and_lattice_jumps():
+    cube = L.identity_cube(5)
+    cube[0, 0, 2, 0] = cube[0, 0, 1, 0] - 0.02
+    diag = L.cube_diagnostics(cube)
+    assert diag.non_monotonic >= 1
+    assert diag.large_reversal_count >= 1
+    assert diag.large_reversal_threshold == pytest.approx(0.008)
+    assert diag.worst_lattice_jump > 0.0
+    assert diag.as_dict()["large_reversal_count"] == diag.large_reversal_count
+
+
+def test_structured_forward_model_fits_physical_xyz_panel():
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0)
+    space = TargetSpace(target)
+    sig = np.array([[r, g, b]
+                    for b in np.linspace(0, 1, 5)
+                    for g in np.linspace(0, 1, 5)
+                    for r in np.linspace(0, 1, 5)], dtype=float)
+    measured = _synth_measure(space, sig, gains=(1.0, 0.982, 0.955),
+                              gammas=(1.0, 1.015, 0.985), noise=0.0)
+    raw = de_itp(space.xyz_to_ictcp(measured) - space.ideal_ictcp(sig))
+    model = StructuredForwardModel(sig, measured, target)
+    fit = model.residual_de_itp()
+    assert float(fit.mean()) < float(raw.mean()) / 3
+    assert float(np.percentile(fit, 95)) < float(np.percentile(raw, 95))
+
+
+def test_physical_cube_reduces_model_error_and_pins_neutral():
+    from dlc.optimize import sample_cube
+
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0)
+    space = TargetSpace(target)
+    sig = np.array([[r, g, b]
+                    for b in np.linspace(0, 1, 5)
+                    for g in np.linspace(0, 1, 5)
+                    for r in np.linspace(0, 1, 5)], dtype=float)
+    measured = _synth_measure(space, sig, gains=(1.0, 0.985, 0.965),
+                              gammas=(1.0, 1.01, 0.99), noise=0.0)
+    model = StructuredForwardModel(sig, measured, target)
+    cube, info = build_physical_cube(model, 5, sig, metric="de2000", max_correction=0.25,
+                                     neutral_band=0.05, maxiter=35)
+
+    before = de_itp(space.xyz_to_ictcp(model.forward(sig)) - space.ideal_ictcp(sig))
+    driven = sample_cube(cube, sig)
+    after = de_itp(space.xyz_to_ictcp(model.forward(driven)) - space.ideal_ictcp(sig))
+    assert float(after.mean()) < float(before.mean())
+    assert info.solved_nodes == 5 ** 3 - 5
+
+    axis = np.linspace(0, 1, 5)
+    for i, a in enumerate(axis):
+        assert np.allclose(cube[i, i, i], [a, a, a], atol=1e-9)
+
+
+def test_constrained_rbf_caps_off_channel_lift_at_saturated_blue():
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0)
+    space = TargetSpace(target)
+    narrow = {"R": [0.66, 0.33], "G": [0.25, 0.66], "B": [0.15, 0.07]}
+    sig = np.array([[r, g, b]
+                    for b in np.linspace(0, 1, 5)
+                    for g in np.linspace(0, 1, 5)
+                    for r in np.linspace(0, 1, 5)], dtype=float)
+    measured = _synth_measure(space, sig, gains=(1.0, 1.0, 0.90), noise=0.0)
+    model = DisplayErrorModel(sig, measured, target, smoothing=1e-3,
+                              reachable_primaries=narrow)
+
+    cube, info = build_constrained_rbf_cube(
+        model, 5, sig, max_correction=0.35, n_iterations=2, neutral_band=0.0,
+        reachable_primaries=narrow, off_channel_lift=0.002, maxiter=30,
+    )
+
+    blue = cube[-1, 0, 0]  # cube indexed [B,G,R] for input signal [0,0,1]
+    assert info.constrained_nodes > 0
+    assert blue[0] <= 0.0021
+    assert blue[1] <= 0.0021
+
+
+def test_gamut_pressure_fires_at_reachable_boundary_even_when_measured():
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0, white_xy=(0.3127, 0.329))
+    narrow = {"R": [0.66, 0.33], "G": [0.25, 0.66], "B": [0.15, 0.07]}
+    space = TargetSpace(target, reachable_primaries=narrow)
+    pressure = gamut_pressure(space, np.array([[0.5, 0.5, 0.5], [0.0, 0.0, 1.0]]), narrow)
+    assert pressure[0] < 0.25
+    assert pressure[1] > 0.9
+
+
+def test_gamut_clip_pressure_stays_low_for_reachable_saturated_red():
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0, white_xy=(0.3127, 0.329))
+    wide = {"R": [0.70, 0.30], "G": [0.20, 0.72], "B": [0.14, 0.05]}
+    space = TargetSpace(target, reachable_primaries=wide)
+    pressure = gamut_clip_pressure(space, np.array([[1.0, 0.0, 0.0]]), wide)
+    assert pressure[0] < 0.25
 
 
 def test_write_cube_roundtrip(tmp_path):
