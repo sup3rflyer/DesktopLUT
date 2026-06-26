@@ -120,6 +120,7 @@ def test_machine_drives_correctable_panel_below_threshold():
     assert result.needs_adjudication is False
 
 
+@pytest.mark.slow
 def test_physical_engine_is_opt_in_and_reports_info():
     target = _sdr_target()
     probe = synthetic_probe(target, gains=(1.0, 0.99, 0.975), gammas=(1.0, 1.01, 0.99))

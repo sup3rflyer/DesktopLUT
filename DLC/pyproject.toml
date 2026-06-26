@@ -44,3 +44,19 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "dlc.dashboard" = ["assets/*"]
+
+[tool.pytest.ini_options]
+# Collect ONLY the tests/ tree — the working root holds scratch scripts (agent_*.py,
+# install_native_target_test.py) whose names match pytest's *_test.py glob and would
+# otherwise be collected as broken "tests".
+testpaths = ["tests"]
+# src layout: pytest puts src/ on sys.path so callers don't need `PYTHONPATH=src`.
+pythonpath = ["src"]
+# Defaults baked in so every bare `python -m pytest` is fast + clean here:
+#   -p no:cacheprovider  → .pytest_cache is permission-blocked on this box.
+#   -n auto              → fan the 788 tests across cores (xdist); ~261s → ~120s.
+# Debugging one test? Append `-n0` to disable parallelism (lets -s / pdb work).
+addopts = "-p no:cacheprovider -n auto"
+markers = [
+    "slow: heavy engine/optimizer CV tests (per-node SLSQP, dense cubes). Skip the inner loop with -m 'not slow'.",
+]

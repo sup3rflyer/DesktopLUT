@@ -15,3 +15,7 @@
 numpy>=1.26,<3
 scipy>=1.13,<2
 colour-science>=0.4.4,<0.5
+
+# Test-only: pytest-xdist parallelises the suite across cores (pyproject `-n auto`).
+# Not imported by the engine or spine — needed solely to run `python -m pytest` here.
+pytest-xdist>=3.6,<4

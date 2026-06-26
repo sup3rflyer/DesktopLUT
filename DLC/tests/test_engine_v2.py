@@ -466,6 +466,7 @@ def test_model_confidence_weights_trust_repeated_skeleton_anchor():
     assert weighted_err < plain_err / 4
 
 
+@pytest.mark.slow
 def test_build_cube_reduces_error_and_is_mostly_monotonic():
     target, tf = Target.hdr_rec2020_pq(), P.Transfer.pq()
     space = TargetSpace(target)
@@ -514,6 +515,7 @@ def test_structured_forward_model_fits_physical_xyz_panel():
     assert float(np.percentile(fit, 95)) < float(np.percentile(raw, 95))
 
 
+@pytest.mark.slow
 def test_physical_cube_reduces_model_error_and_pins_neutral():
     from dlc.optimize import sample_cube
 
@@ -540,6 +542,7 @@ def test_physical_cube_reduces_model_error_and_pins_neutral():
         assert np.allclose(cube[i, i, i], [a, a, a], atol=1e-9)
 
 
+@pytest.mark.slow
 def test_constrained_rbf_caps_off_channel_lift_at_saturated_blue():
     target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0)
     space = TargetSpace(target)
@@ -625,6 +628,7 @@ def test_sdr_identity_when_native_equals_target():
     assert float(np.max(np.abs(lut - ident))) < 0.02
 
 
+@pytest.mark.slow
 def test_sdr_wide_gamut_maps_inward_and_is_consistent():
     ramps = _synth_ramps("ITU-R BT.2020", gammas=(2.3, 2.15, 2.45))
     lut, info = S.build_sdr_cube(ramps, primaries_name="sRGB", white_xy=(0.3127, 0.3290),
