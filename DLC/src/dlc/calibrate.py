@@ -1110,27 +1110,16 @@ class Calibration:
         ``revert_unavailable``)."""
         baseline = self.calib.get("inplace_baseline") or {}
         flow = self.calib.get("flow")
-        if flow == "grayscale-wb" and baseline.get("captured"):
-            prev_tweak = baseline.get("grayscale_tweak")
+        if flow == "grayscale-wb":
+            # Live-edit revert = cancel the preview: discard the in-progress correction and restore
+            # the vanilla core ICM (matrix + base grayscale + 3D LUT untouched). Nothing was baked
+            # unless commit ran, and cancel un-engages the preview either way.
             try:
-                if prev_tweak:
-                    self.controller.set_grayscale_tweak(
-                        self.monitor, self.mode,
-                        int(prev_tweak.get("point_count") or len(prev_tweak.get("points") or [])),
-                        list(prev_tweak.get("points") or []),
-                        dict(prev_tweak.get("deviations") or {}),
-                        luminance=(list(prev_tweak.get("luminance") or [])
-                                   if prev_tweak.get("luminance") is not None else None),
-                        rgb=(dict(prev_tweak.get("rgb") or {})
-                             if prev_tweak.get("rgb") is not None else None),
-                    )
-                    self.ctx.log("reverted: restored the previous Grayscale correction")
-                else:
-                    self.controller.disable_grayscale_tweak(self.monitor, self.mode)
-                    self.ctx.log("reverted: disabled Grayscale correction (none was enabled before this run)")
+                self.controller.grayscale_cancel(self.monitor, self.mode)
+                self.ctx.log("reverted: cancelled the Grayscale touch-up (restored the vanilla core ICM)")
                 return "reverted"
             except Exception as exc:  # noqa: BLE001 - fall through to manual-backup guidance
-                self.ctx.log(f"grayscale touch-up revert failed ({type(exc).__name__}: {exc}); see settings backup")
+                self.ctx.log(f"grayscale touch-up cancel failed ({type(exc).__name__}: {exc}); see settings backup")
         if flow == "3dlut-only" and baseline.get("captured"):
             prev = baseline.get("cube_path")
             try:
@@ -3605,13 +3594,17 @@ class Calibration:
 
     def stage_grayscale_wb_touchup(self, *, target_de: float = 0.6,
                                    max_rounds_per_point: int = 6) -> StageOutcome:
-        """Patch-by-patch Corrections-tab Grayscale touch-up.
+        """Patch-by-patch main-GUI Grayscale touch-up — automates DesktopLUT's live editor.
 
-        This is the user-facing editor automation pass: disable the current user
-        Grayscale correction, measure one grey point, nudge its luminance/RGB
-        sliders, re-measure that same point, then move to the next point. It
-        tunes the active constants in place (MHC-only or MHC+3D-LUT) and leaves
-        the resulting user correction toggleable in DesktopLUT.
+        Mirrors the manual "Edit Points → adjust → OK" workflow over the pipe: ``grayscale_live_begin``
+        engages the preview shader (the MHC ``correctionGrayscale`` stacks live on top of MHC+3D-LUT so
+        the meter SEES it — render.cpp:346 ``corrGsPreviewActive`` gate), then per editor grey point we
+        measure → nudge the point's R/G/B live → re-measure, move on; ``grayscale_commit`` bakes the
+        result into the ICM on accept (the editor's "OK"), ``grayscale_cancel`` reverts on abort. This
+        is the toggleable third "+1": the core (matrix + base grayscale + 3D LUT) is never touched, and
+        the result is one-toggle revertible to the vanilla ICM. Requires the live preview path
+        (CODEX_GRAYSCALE_LIVE_EDIT_PROMPT.md); the old ``set_grayscale_tweak`` overlay was a no-op
+        under an active MHC (it wrote the wrong store, ``cc.grayscale``, suppressed by render.cpp:346).
         """
         def run() -> StageOutcome:
             from .grayscale_wb import (
@@ -3634,9 +3627,19 @@ class Calibration:
             spec = self._spec()
             cfg = GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma))
 
-            # Measure the constants, not the previously enabled user touch-up. This mirrors
-            # the operator turning the Corrections > Grayscale checkbox off before retuning.
-            self.controller.disable_grayscale_tweak(self.monitor, self.mode)
+            # Engage the live grayscale editor (the "Edit Points" path): this strips any prior
+            # correction-grayscale from the active MHC permutation and shows a live, measurable
+            # preview on top of the unchanged core (matrix + base grayscale + 3D LUT). Equivalent to
+            # the operator opening the editor with the correction reset to identity before retuning.
+            try:
+                self.controller.grayscale_live_begin(self.monitor, self.mode)
+            except Exception as exc:  # noqa: BLE001 - surface a clear, non-crashing abort
+                return StageOutcome(
+                    "grayscale-wb", "done",
+                    digest={"message": f"could not engage the live Grayscale editor: "
+                                       f"{type(exc).__name__}: {exc}",
+                            "preview_unavailable": True, "measurement_compromised": True},
+                    data={"payload": payload})
 
             has_3dlut = bool(self._active_runtime_cube())
             dip = self._dip()
@@ -3706,9 +3709,11 @@ class Calibration:
                         any_unsettled = True
                         break
                     payload, upd = update_point(payload, idx, gpatch, cfg)
-                    self.controller.set_grayscale_tweak(
+                    # Live-set the editor table (composed per-channel deviations) — the preview
+                    # shader applies it next frame, so the very next read reflects this nudge.
+                    self.controller.grayscale_set_live(
                         self.monitor, self.mode, payload["point_count"], payload["points"],
-                        payload["deviations"], luminance=payload["luminance"], rgb=payload["rgb"])
+                        payload["deviations"])
                     point_log["rounds"][-1]["update"] = upd
                     all_updates.append(upd)
                     any_capped = any_capped or bool(upd.get("capped"))
@@ -3732,10 +3737,11 @@ class Calibration:
 
             session_digest = session.finish()
 
-            # Ensure the final table is installed even if every point was already within target.
-            self.controller.set_grayscale_tweak(
+            # Ensure the final table is live in the preview even if every point was already within
+            # target (it is baked into the ICM by grayscale_commit on the accept path, below).
+            self.controller.grayscale_set_live(
                 self.monitor, self.mode, payload["point_count"], payload["points"],
-                payload["deviations"], luminance=payload["luminance"], rgb=payload["rgb"])
+                payload["deviations"])
             self.calib["grayscale_wb_touchup"] = payload
             self._state["grayscale_wb_touchup"] = payload
             self._save()
@@ -3797,6 +3803,10 @@ class Calibration:
                     "grayscale-wb", "aborted",
                     digest={"message": "aborted on large Grayscale touch-up",
                             "decision_note": decision.note, **outcome.digest}))
+        # Accept path: bake the previewed correction into the ICM (the editor's "OK") — toggleable,
+        # core untouched. Skip when nothing was previewed (no patches / preview never engaged).
+        if not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable")):
+            self.controller.grayscale_commit(self.monitor, self.mode)
         return outcome
 
     def _active_runtime_cube(self) -> Optional[str]:
@@ -4906,15 +4916,22 @@ def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
 def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
                            warm_tau: Optional[int] = None,
                            max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
-    """The Corrections-tab grayscale editor grid for the ``grayscale-wb`` touch-up.
+    """The grey points of DesktopLUT's Grayscale-correction editor — one patch per slider,
+    so each measured patch tunes the slider it sits on (NOT a uniform calibration ramp).
 
-    SDR spans the full signal range. HDR spans the user's active peak: ``max_cv`` is
-    the PQ code for that peak, and the editor's 10/20/32 points distribute across
-    that code range (matching DesktopLUT's HDR Grayscale dialog).
+    The editor maps slider ``i`` (of ``n``) to a target via ``targetVal = t*t`` for SDR and
+    ``t`` for HDR (``t = i/(n-1)``; see the editor OK handler ``gui_grayscale.cpp`` /
+    ``ID_GRAYSCALE_OK``). So the SDR grey codes are ``round(cap * t**2)`` — perceptual,
+    dense in the shadows (0,0,1,2,4,7,…,255) — and HDR is linear across the active-peak
+    code range (``max_cv`` = the peak's PQ code). Uniform spacing here mistunes every
+    interior slider.
     """
     cap = max_cv if max_cv is not None else transfer.max_cv
     n = 32
-    levels = uniform_levels(n, cap)
+    if transfer.kind == "pq":  # HDR editor: linear in code across the active peak
+        levels = uniform_levels(n, cap)
+    else:                      # SDR editor: t**2 perceptual spacing
+        levels = [round(cap * (i / (n - 1)) ** 2) for i in range(n)]
     return [(v, v, v) for v in levels]
 
 

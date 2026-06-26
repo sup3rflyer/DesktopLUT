@@ -203,6 +203,39 @@ class CalibrationController:
         new_points, new_dev = to_desktoplut_sdr_grayscale(points, deviations, gamma=gamma)
         return new_points, new_dev
 
+    # -- MHC correction-grayscale LIVE-EDIT (the toggleable third "+1" touch-up) -----------
+    # Drives DesktopLUT's main-GUI grayscale editor over the pipe (CODEX_GRAYSCALE_LIVE_EDIT_PROMPT.md):
+    # ``live_begin`` engages the preview shader (correction GS stacked on top of MHC+3D-LUT so the meter
+    # sees it — render.cpp:346 corrGsPreviewActive gate), ``set_live`` nudges the 32-point editor table
+    # live, ``commit`` bakes it into the ICM (the editor's "OK"), ``cancel`` reverts. Same store as
+    # ``set_correction_grayscale`` (``MHCSettings::correctionGrayscale``); the core (matrix + base
+    # grayscale + 3D LUT) is never touched, and the result is one-toggle revertible to the vanilla ICM.
+    def grayscale_live_begin(self, monitor: int, mode: str) -> dict[str, Any]:
+        return self.call("mhc.grayscale_live_begin",
+                         {"monitor": monitor, "mode": normalize_mode(mode)})
+
+    def grayscale_set_live(self, monitor: int, mode: str, point_count: int,
+                           points: list[float], deviations: dict[str, list[float]],
+                           gamma: float = 2.2) -> dict[str, Any]:
+        mode = normalize_mode(mode)
+        points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
+        return self.call("mhc.grayscale_set_live", {
+            "monitor": monitor, "mode": mode,
+            "grayscale": {
+                "point_count": int(len(points)),
+                "points": [float(p) for p in points],
+                "deviations": _coerce_deviations(deviations),
+            },
+        })
+
+    def grayscale_commit(self, monitor: int, mode: str) -> dict[str, Any]:
+        return self.call("mhc.grayscale_commit",
+                         {"monitor": monitor, "mode": normalize_mode(mode)})
+
+    def grayscale_cancel(self, monitor: int, mode: str) -> dict[str, Any]:
+        return self.call("mhc.grayscale_cancel",
+                         {"monitor": monitor, "mode": normalize_mode(mode)})
+
     def apply_mhc(self, monitor: int, mode: str) -> dict[str, Any]:
         return self.call("mhc.apply", {"monitor": monitor, "mode": normalize_mode(mode)})
 

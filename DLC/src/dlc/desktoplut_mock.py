@@ -230,6 +230,26 @@ class MockDesktopLutServer:
                 "points": deepcopy(params.get("points", [])),
                 "deviations": deepcopy(params.get("deviations", {})),
             }
+        elif method == "mhc.grayscale_live_begin":
+            # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
+            # stacks on top of MHC+3D-LUT and is measurable. No bake yet.
+            state["gs_preview_active"] = True
+        elif method == "mhc.grayscale_set_live":
+            gs = params.get("grayscale", {})
+            state["correction_grayscale"] = {
+                "point_count": gs.get("point_count"),
+                "points": deepcopy(gs.get("points", [])),
+                "deviations": deepcopy(gs.get("deviations", {})),
+            }
+            state["gs_preview_active"] = True
+        elif method == "mhc.grayscale_commit":
+            # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.
+            state["gs_preview_active"] = False
+            state["gs_committed"] = True
+            state["applied"] = True
+        elif method == "mhc.grayscale_cancel":
+            state["gs_preview_active"] = False
+            state.pop("correction_grayscale", None)
         elif method == "mhc.apply":
             state["applied"] = True
         elif method == "mhc.remove":

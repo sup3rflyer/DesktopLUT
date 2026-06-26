@@ -717,11 +717,14 @@ def test_grayscale_wb_flow_is_standalone_mhc_only_touchup(tmp_path: Path):
     assert digest["session"]["warm"] is True
     assert digest["session"]["warmup_reads"] > 0
     assert digest["session"]["drift_checkpoints"] > 0
-    runtime = ctrl.state()["runtime"]["0:SDR"]
-    tweak = runtime["grayscale_tweak"]
-    assert tweak["point_count"] == 32
-    assert len(tweak["luminance"]) == 32
-    assert tweak["deviations"]["r"] == pytest.approx([1.0] * 32)
+    # The touch-up live-edits the MHC correctionGrayscale (the toggleable third "+1") and bakes it
+    # into the ICM on accept — NOT a runtime overlay tweak. Core (matrix/base/3D-LUT) untouched.
+    mhc = ctrl.state()["mhc"]["0:SDR"]
+    assert mhc.get("gs_committed") is True          # grayscale_commit ran (the editor's "OK")
+    assert mhc.get("gs_preview_active") is False     # preview ended at commit
+    cg = mhc["correction_grayscale"]
+    assert set(cg["deviations"].keys()) == {"r", "g", "b"}
+    assert "0:SDR" not in (ctrl.state().get("runtime") or {})   # no runtime grayscale_tweak written
 
 
 def test_grayscale_wb_hdr_points_are_capped_to_user_peak():
