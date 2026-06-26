@@ -73,11 +73,35 @@ body {
 .ph-phase { font-family: var(--mono); font-weight: 700; color: var(--accent); font-size: 14px; }
 .ph-arrow { color: var(--ink-faint); }
 .ph-stage { font-family: var(--mono); color: var(--ink-dim); font-size: 13px; }
+.ph-mid { flex: 1 1 auto; display: flex; justify-content: center; }
+.ph-count { color: var(--ink-dim); font-family: var(--mono); font-size: 11px; letter-spacing: .3px; }
 .ph-right .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-family: var(--mono); }
 .badge.running, .badge.completed { background: #14361f; color: var(--good); }
 .badge.reverted { background: #3a2e12; color: var(--warn); }
 .badge.aborted, .badge.stalled { background: #3a1714; color: var(--bad); }
 .badge.idle, .badge.paused { background: #21262d; color: var(--ink-dim); }
+
+/* ── pipeline stepper ──────────────────────────────────────────── */
+.stepper { display: flex; align-items: center; gap: 2px; padding: 6px 14px; overflow-x: auto;
+  background: var(--panel); border-bottom: 1px solid var(--edge); flex: 0 0 auto; white-space: nowrap; }
+.stepper[hidden] { display: none; }
+.stepper::-webkit-scrollbar { height: 6px; }
+.stepper::-webkit-scrollbar-thumb { background: var(--edge); border-radius: 3px; }
+.step { display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px; flex: 0 0 auto; }
+.step-dot { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px;
+  border-radius: 50%; font-size: 9px; font-family: var(--mono); border: 1px solid var(--edge);
+  background: var(--panel-2); color: var(--ink-faint); flex: 0 0 auto; }
+.step-lab { font-size: 11px; color: var(--ink-faint); font-family: var(--mono); }
+.step-sep { color: var(--ink-faint); font-size: 11px; opacity: .5; flex: 0 0 auto; }
+.step.done .step-dot { background: #14361f; border-color: #1f5c33; color: var(--good); }
+.step.done .step-lab { color: var(--ink-dim); }
+.step.current .step-dot { background: #3a3112; border-color: var(--accent); color: var(--accent); }
+.step.current .step-lab { color: var(--ink); font-weight: 700; }
+.step.current { background: #16161a; border-radius: 6px; }
+.step.upcoming .step-dot { opacity: .7; }
+/* a stage the operator should expect to wait on (raw measure, MHC refine, 3D-LUT build, verify) */
+.step.long.current .step-dot::after { content: ""; }
+.step.long .step-lab::after { content: " ⏲"; color: var(--ink-faint); font-size: 9px; }
 
 /* ── readout strip ─────────────────────────────────────────────── */
 #readouts { display: flex; gap: 10px; padding: 10px 14px; flex: 0 0 auto; flex-wrap: wrap;
@@ -116,11 +140,6 @@ body {
 .de-live-foot .de-live-n { margin-left: auto; color: var(--ink-faint); font-size: 10px; }
 .de-split { display: flex; gap: 10px; border-top: 1px solid var(--edge); padding-top: 4px; }
 .de-split .kv { flex: 1; flex-direction: column; align-items: flex-start; }
-/* view-metric selector (a presentation lens; the scored block stays in the scoring metric) */
-.de-view { background: var(--panel); color: var(--ink); border: 1px solid var(--edge);
-  border-radius: 4px; padding: 1px 4px; font-size: 11px; font-family: var(--mono);
-  text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 4px; }
-.de-view:disabled { opacity: .5; }
 .de-scored-cap { color: var(--ink-faint); font-size: 9px; text-transform: uppercase;
   letter-spacing: 1px; margin-bottom: 3px; }
 /* divided-delta row: lightness / chroma / hue split of the live patch's ΔE */
@@ -165,8 +184,14 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .charts-meta { display: flex; align-items: baseline; gap: 8px; margin: 0 2px 8px; }
 .charts-meta .cm-label { color: var(--ink-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
 .charts-meta .cm-stage { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+.charts-meta .cm-build { color: var(--warn); font-family: var(--mono); font-size: 11px;
+  padding: 1px 7px; border: 1px solid var(--warn); border-radius: 9px; }
+.charts-meta .cm-build[hidden] { display: none; }
 .charts-meta .cm-toggle { margin-left: auto; display: flex; align-items: center; gap: 5px;
   color: var(--ink-dim); font-size: 11px; cursor: pointer; }
+/* a tile currently showing the LIVE BUILD PREVIEW (probe reads, not the final result) */
+.chart.build-preview { border-color: var(--warn); }
+.chart.build-preview figcaption::after { content: " · live build preview"; color: var(--warn); }
 /* equal tiles: every cell the same width; the shared chart viewBox makes heights match too */
 .charts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
   gap: 12px; align-items: stretch; }
@@ -194,6 +219,8 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-ref { stroke: #8a8a90; stroke-width: 1; stroke-dasharray: 4 3; }   /* target = dashed gray */
 .ch-dot { fill: var(--accent); }
 .ch-dot-max { fill: #9a9aa0; }
+/* near-black (Y<1 nit) reads: shown but de-emphasised — hollow, faded, off the autoscale */
+.ch-dot-dim { fill: #2a2a2e; stroke: var(--ink-faint); stroke-width: .7; opacity: .8; }
 .ch-guide { stroke: var(--accent); stroke-width: .8; stroke-dasharray: 5 4; opacity: .7; }  /* ±10% lines */
 .ch-axis0 { stroke: #6a6a70; stroke-width: 1; }
 .ch-note { fill: var(--ink-dim); font-size: 10px; font-family: var(--mono); }
@@ -224,7 +251,6 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-track { stroke: #58a6c9; stroke-width: 1.2; opacity: .5; stroke-dasharray: 2 2; }
 .ch-track-ref { stroke: #58a6c9; stroke-width: .8; opacity: .35; }
 .ch-track-dot { fill: #58a6c9; opacity: .55; }
-.ch-sat-line { stroke: #6a6a72; stroke-width: .8; opacity: .5; }
 /* The data mark nearest the cursor (set by the hover readout). Declared last so it wins the
    specificity tie against .ch-pt / .ch-dot etc.; r: only affects circles (ignored on rects). */
 .ch-hover { stroke: var(--ink); stroke-width: 1.4; opacity: 1; }
@@ -267,6 +293,11 @@ circle.ch-hover { r: 4; }
 .log-toolbar { display: flex; align-items: center; gap: 8px; padding: 5px 10px;
   border-bottom: 1px solid var(--edge); flex: 0 0 auto; flex-wrap: wrap; }
 .log-title { color: var(--ink-dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+/* the "now running" indicator — makes the current stage unmistakable above the firehose */
+.log-now { font-family: var(--mono); font-size: 11px; color: var(--accent); padding: 1px 8px;
+  border: 1px solid var(--accent); border-radius: 9px; }
+.log-now[hidden] { display: none; }
+.log-now b { color: var(--ink); font-weight: 700; }
 .log-toolbar select, .log-toolbar input[type=search] {
   background: var(--panel); color: var(--ink); border: 1px solid var(--edge);
   border-radius: 4px; padding: 3px 6px; font-size: 12px; font-family: var(--mono); }
@@ -285,6 +316,11 @@ circle.ch-hover { r: 4; }
 .row.ev-stall, .row.ev-stage_aborted { background: #2a1310; }
 .row.ev-anomaly { background: #241c0d; }
 .row.ev-seam, .row.ev-check_in { background: #0f1d2b; }
+/* stage boundaries read as section dividers so the log scans as "what stage are we in" */
+.row.ev-stage_start, .row.ev-stage_done { background: #12161d; border-top: 1px solid var(--edge); }
+.row.ev-stage_start .stage-banner, .row.ev-stage_done .stage-banner {
+  color: var(--accent); font-weight: 700; }
+.row.ev-note .msg .v, .row.ev-note { color: var(--ink); }
 .row .k { color: var(--ink-faint); } .row .v { color: var(--ink); }
 .row .ok { color: var(--good); } .row .nok { color: var(--bad); }
 

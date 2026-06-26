@@ -149,33 +149,20 @@ def test_patch_delta_e_hdr_matches_engine_de_itp():
         assert got == pytest.approx(m.de2000, abs=0.5), (m.rgb, got, m.de2000)
 
 
-def test_jzazbz_matches_colour_library():
-    # The hand-rolled, dependency-free Jzazbz must reproduce colour.XYZ_to_Jzazbz (the project's
-    # source of truth) — same role as the ICtCp cross-check, so ΔEz is trustworthy.
-    np = pytest.importorskip("numpy")
-    colour = pytest.importorskip("colour")
-    from dlc.dashboard.colorimetry import _xyz_to_jzazbz
-    for XYZ in ([95.047, 100.0, 108.883], [950.47, 1000.0, 1088.83],
-                [200.0, 150.0, 80.0], [10.0, 12.0, 30.0], [0.0, 0.0, 0.0]):
-        mine = np.array(_xyz_to_jzazbz(XYZ))
-        theirs = colour.XYZ_to_Jzazbz(np.array(XYZ))
-        assert np.allclose(mine, theirs, atol=1e-9), (XYZ, mine, theirs)
-
-
 def test_patch_deltas_structure_and_scoring_metric():
-    # HDR offers the scoring dE_ITP plus the dE2000 + Jzazbz lenses; SDR offers dE2000 (scoring)
-    # + Jzazbz. The scoring scalar must equal the legacy patch_delta_e (back-compat shim).
+    # ONE metric per mode: dE_ITP for HDR, CIEDE2000 for SDR (no alternate viewing lens). The
+    # scoring scalar must equal the legacy patch_delta_e (back-compat shim).
     from dlc.dashboard.colorimetry import patch_deltas, patch_delta_e
     hdr = patch_deltas([0.0, 0.0, 0.6], 0.18, 0.10, 120.0, is_hdr=True, white_xy=_D65)
     assert hdr["scoring"] == "itp"
-    assert set(hdr["metrics"]) == {"itp", "de2000", "jzazbz"}
+    assert set(hdr["metrics"]) == {"itp"}
     assert hdr["metrics"]["itp"]["de"] == pytest.approx(
         patch_delta_e([0.0, 0.0, 0.6], 0.18, 0.10, 120.0, is_hdr=True, white_xy=_D65))
     # the target's xyY rides along so the dashboard can show measured-vs-target without recomputing
     assert set(hdr["target"]) == {"x", "y", "Y"} and hdr["target"]["Y"] > 0
     sdr = patch_deltas([0.5, 0.5, 0.55], 0.30, 0.31, 60.0, is_hdr=False, white_xy=_D65, luminance=120.0)
     assert sdr["scoring"] == "de2000"
-    assert set(sdr["metrics"]) == {"de2000", "jzazbz"}
+    assert set(sdr["metrics"]) == {"de2000"}
     # a true mid-grey target sits ON the white point and at (0.5^gamma)·luminance
     grey = patch_deltas([0.5, 0.5, 0.5], 0.3127, 0.329, 30.0, is_hdr=False, white_xy=_D65, luminance=120.0)
     assert abs(grey["target"]["x"] - _D65[0]) < 1e-4 and abs(grey["target"]["y"] - _D65[1]) < 1e-4
@@ -184,28 +171,15 @@ def test_patch_deltas_structure_and_scoring_metric():
         patch_delta_e([0.5, 0.5, 0.55], 0.30, 0.31, 60.0, is_hdr=False, white_xy=_D65, luminance=120.0))
 
 
-def test_jzazbz_is_jnd_scaled_not_raw():
-    # ΔEz is normalised (×_JZ_SCALE) to the 1≈JND scale so it shares the dashboard's severity bands
-    # and the user's learned intuition — a clearly-visible error must read in the same order as
-    # dE_ITP, NOT on the raw ~1e-3 Jzazbz scale.
-    from dlc.dashboard.colorimetry import patch_deltas, _JZ_SCALE
-    assert _JZ_SCALE == 660.0
-    d = patch_deltas([0.0, 0.0, 0.9], 0.15, 0.06, 60.0, is_hdr=True, white_xy=_D65)
-    jz, itp = d["metrics"]["jzazbz"]["de"], d["metrics"]["itp"]["de"]
-    assert jz > 1.0                        # not the sub-0.05 raw scale
-    assert 0.2 < jz / itp < 5.0            # same ballpark as ITP (both JND-anchored)
-
-
 def test_euclidean_metric_components_reconstruct_scalar_exactly():
-    # ITP and Jzazbz are Euclidean: the radial/tangential chroma/hue split is an orthonormal
-    # change of basis, so L²+C²+H² == ΔE exactly even for a saturated patch. This is the whole
-    # point of the decomposition — "where is the error" must add back up to "how big is the error".
+    # ITP is Euclidean: the radial/tangential chroma/hue split is an orthonormal change of basis,
+    # so L²+C²+H² == ΔE exactly even for a saturated patch. This is the whole point of the
+    # decomposition — "where is the error" must add back up to "how big is the error".
     from dlc.dashboard.colorimetry import patch_deltas
     d = patch_deltas([0.1, 0.2, 0.7], 0.17, 0.12, 90.0, white_xy=_D65, is_hdr=True)
-    for name in ("itp", "jzazbz"):
-        m = d["metrics"][name]
-        quad = math.sqrt(m["L"] ** 2 + m["C"] ** 2 + m["H"] ** 2)
-        assert quad == pytest.approx(m["de"], rel=1e-9), (name, quad, m["de"])
+    m = d["metrics"]["itp"]
+    quad = math.sqrt(m["L"] ** 2 + m["C"] ** 2 + m["H"] ** 2)
+    assert quad == pytest.approx(m["de"], rel=1e-9), (quad, m["de"])
 
 
 def test_de2000_components_reconstruct_scalar_near_neutral():

@@ -60,14 +60,12 @@ function deMetricLabel(metric) {
   if (!metric) return "ΔE";
   const m = String(metric).toLowerCase();
   if (m.includes("itp")) return "ΔE·ITP";              // HDR (BT.2124)
-  if (m.includes("jz")) return "ΔEz";                  // Jzazbz (raw, native scale)
-  if (m.includes("2000") || m === "de2000") return "ΔE2000";  // CIEDE2000
+  if (m.includes("2000") || m === "de2000") return "ΔE2000";  // CIEDE2000 (SDR)
   return "ΔE";
 }
-// Component labels for the lightness/chroma/hue split — ITP is I/C/H, Lab is L*/C*/H*, Jzazbz Jz/C/H.
+// Component labels for the lightness/chroma/hue split — ITP is I/C/H, Lab is L*/C*/H*.
 function compLabels(metric) {
   if (metric === "itp") return ["ΔI", "ΔC", "ΔH"];
-  if (metric === "jzazbz") return ["ΔJz", "ΔC", "ΔH"];
   return ["ΔL*", "ΔC*", "ΔH*"];
 }
 function fmtSigned(metric, v) {
@@ -84,37 +82,12 @@ function fmtY(v) {
   return Number(v).toFixed(Math.abs(v) >= 100 ? 0 : 2);
 }
 
-/* ── selectable view metric (a presentation lens; the scored block stays in the scoring metric) ── */
-const DE_VIEW_KEY = "dlc.deView";
-let deView = (() => { try { return localStorage.getItem(DE_VIEW_KEY) || null; } catch (e) { return null; } })();
-let deViewSig = "";   // signature of the currently-populated <select> options
-
-function availMetrics(s) {
-  const ld = s && s.live_de;
-  return (ld && ld.metrics) ? Object.keys(ld.metrics) : [];
-}
+/* ── the run's single ΔE metric (dE_ITP for HDR, CIEDE2000 for SDR — no alternate lens) ── */
 function scoringMetric(s) {
   return (s && s.live_de && s.live_de.scoring) || (s && s.de && s.de.metric) || "de2000";
 }
-// The metric actually shown: the user's pick if it's available this run, else the scoring metric.
-function viewMetric(s) {
-  const avail = availMetrics(s);
-  if (deView && avail.includes(deView)) return deView;
-  const sc = scoringMetric(s);
-  return avail.includes(sc) ? sc : (avail[0] || sc);
-}
-function syncDeViewSelect(s) {
-  const sel = $("de-view");
-  if (!sel) return;
-  const avail = availMetrics(s);
-  const sig = avail.join(",");
-  if (sig !== deViewSig) {                       // re-populate only when the option set changes
-    deViewSig = sig;
-    sel.innerHTML = avail.map((m) => `<option value="${m}">${deMetricLabel(m)}</option>`).join("");
-  }
-  sel.value = viewMetric(s);
-  sel.disabled = avail.length <= 1;
-}
+// One metric per mode: what's shown IS the scoring metric.
+function viewMetric(s) { return scoringMetric(s); }
 // A patch's approximate on-screen colour from its normalised signal (sRGB-ish), for the swatch.
 function sigHex(sig) {
   if (!Array.isArray(sig) || sig.length < 3) return "#1c1c20";
@@ -243,11 +216,20 @@ function renderState(s) {
     ? "Resume the paused run"
     : "Pause briefly; rolls back automatically after about 3 minutes";
 
-  // phase header
+  // phase header + pipeline stepper
   $("ph-phase").textContent = s.phase || "—";
   $("ph-stage").textContent = s.stage || "—";
   const st = s.run_status || "idle";
   $("ph-status").innerHTML = `<span class="badge ${esc(st)}">${esc(st)}</span>`;
+  renderStepper(s.pipeline || {});
+  // event-log "now running" indicator — makes the current stage unmistakable in the log
+  const now = $("log-now");
+  if (s.stage && st === "running") {
+    now.hidden = false;
+    now.innerHTML = `▶ now: <b>${esc(s.stage)}</b>`;
+  } else {
+    now.hidden = true;
+  }
 
   // progress
   const c = s.counters || {};
@@ -276,7 +258,6 @@ function renderState(s) {
   // lens must never be mistaken for a re-score.
   const de = s.de || {};
   const ld = s.live_de || {};
-  syncDeViewSelect(s);
   const vm = viewMetric(s);
   $("de-metric").textContent = deMetricLabel(vm);
   $("de-scored-metric").textContent = deMetricLabel(de.metric || scoringMetric(s));
@@ -330,6 +311,31 @@ function flag(id, obj, fmt, bad) {
   el.classList.toggle("bad", !!(has && bad));
 }
 
+/* ── pipeline stepper: the whole flow as done / running / upcoming, with "stage K of N" ── */
+let stepperSig = "";   // re-render only when the step set/status actually changes
+function renderStepper(pl) {
+  const steps = pl.steps || [];
+  const box = $("stepper");
+  $("ph-count").textContent = (pl.index && pl.total) ? `stage ${pl.index} of ${pl.total}` : "";
+  if (!steps.length) { box.hidden = true; stepperSig = ""; return; }
+  box.hidden = false;
+  // signature so we don't thrash the DOM (and lose scroll) on every 2 s state tick
+  const sig = steps.map((s) => `${s.key}:${s.status}`).join("|");
+  if (sig === stepperSig) return;
+  stepperSig = sig;
+  box.innerHTML = steps.map((s, i) => {
+    const long = s.long ? " long" : "";
+    const mark = s.status === "done" ? "✓" : (s.status === "current" ? "▶" : (i + 1));
+    const tip = s.long ? `${s.label} — expect a wait` : s.label;
+    return `<div class="step ${esc(s.status)}${long}" title="${esc(tip)}">`
+      + `<span class="step-dot">${esc(String(mark))}</span>`
+      + `<span class="step-lab">${esc(s.label)}</span></div>`;
+  }).join('<span class="step-sep">›</span>');
+  // keep the running step in view on a long pipeline
+  const cur = box.querySelector(".step.current");
+  if (cur && cur.scrollIntoView) cur.scrollIntoView({ inline: "center", block: "nearest" });
+}
+
 /* ── per-event message formatting ────────────────────────────── */
 function fmtMsg(ev) {
   const d = ev.data || {};
@@ -339,8 +345,8 @@ function fmtMsg(ev) {
       return [d.target && kv("target", d.target), d.mode && kv("mode", d.mode),
               d.flow && kv("flow", d.flow), d.ccmx && kv("ccmx", d.ccmx)].filter(Boolean).join(" ");
     case "phase": return `→ <span class="v">${esc(d.phase_name || "")}</span>`;
-    case "stage_start": return "start";
-    case "stage_done": return `done ${kv("status", d.status || "")}${d.replayed ? " (replayed)" : ""}`;
+    case "stage_start": return `<span class="stage-banner">▶ start · ${esc(ev.stage || "stage")}</span>`;
+    case "stage_done": return `<span class="stage-banner">■ done · ${esc(ev.stage || "stage")}</span> ${kv("status", d.status || "")}${d.replayed ? " (replayed)" : ""}`;
     case "stage_aborted": return `<span class="nok">aborted</span> ${esc(d.message || "")}`;
     case "patch_read": {
       const okc = d.ok ? '<span class="ok">ok</span>' : '<span class="nok">FAIL</span>';
@@ -469,8 +475,12 @@ function connect() {
     lastCharts = null;
     lightboxKey = null;
     lightboxReturnFocus = null;
+    stepperSig = "";
     $("charts-stage").textContent = "—";
-    $("charts").innerHTML = "";
+    $("charts-build").hidden = true;
+    // blank the chart contents without destroying the <figure> tiles (renderInto fills them back)
+    document.querySelectorAll('#charts [data-chart]').forEach((el) => { el.innerHTML = ""; });
+    document.querySelectorAll('#charts .chart.build-preview').forEach((el) => el.classList.remove("build-preview"));
     $("lb-body").innerHTML = "";
     $("lightbox").hidden = true;
     renderState(JSON.parse(e.data));
@@ -489,6 +499,44 @@ let chartsBusy = false;
 let lastCharts = null;
 let lightboxKey = null;
 let lightboxReturnFocus = null;
+// Tiles fed by the live build preview while the 3D-LUT build is running (the rest — colour
+// luminance, channel drift — keep showing the settled stage).
+const PREVIEW_TILES = ["cie", "eotf", "graycct", "grayduv", "graybalance"];
+
+// During the build, overlay the probe-read preview onto the preview-able tiles (the settled
+// snapshot is frozen on the last real measurement stage), badged so it's never mistaken for final.
+function effectiveCharts(charts) {
+  const bp = charts && charts.build_preview;
+  if (!bp || !bp.active) return charts;
+  return Object.assign({}, charts, { cie: bp.cie, eotf: bp.eotf, grayscale: bp.grayscale });
+}
+
+function applyBuildPreviewUi(charts) {
+  const bp = charts && charts.build_preview;
+  const building = !!(bp && bp.active);
+  // badge the preview tiles
+  PREVIEW_TILES.forEach((key) => {
+    const holder = document.querySelector(`#charts [data-chart="${key}"]`);
+    const fig = holder && holder.closest(".chart");
+    if (fig) fig.classList.toggle("build-preview", building);
+  });
+  // charts-meta strip
+  const label = $("charts-meta-label"), stage = $("charts-stage"), build = $("charts-build");
+  if (building) {
+    label.textContent = "live build preview";
+    stage.textContent = bp.stage || "build";
+    const opt = (charts.optimizer && charts.optimizer.length) ? charts.optimizer[charts.optimizer.length - 1] : null;
+    build.hidden = false;
+    build.textContent = opt
+      ? `not final · iter ${opt.iteration} · max ΔE ${num(opt.measured_max_de, 2)}`
+      : "not final · converging…";
+  } else {
+    label.textContent = "snapshot charts reflect";
+    stage.textContent = (charts && charts.stage) ? charts.stage : "—";
+    build.hidden = true;
+  }
+}
+
 async function refreshCharts() {
   if (chartsBusy) return;                       // a fetch is already in flight
   // Skip the PERIODIC poll while the tab is backgrounded (saves the fetch) — but always do the
@@ -500,12 +548,11 @@ async function refreshCharts() {
     const r = await fetch("/api/charts");
     lastCharts = await r.json();
     const header = lastState ? lastState.header : null;
-    // which measurement stage the snapshot charts reflect (raw → post-mhc → verify), so the
-    // single-stage scatter is never mistaken for "all stages" — the charts show the latest.
-    $("charts-stage").textContent = lastCharts && lastCharts.stage ? lastCharts.stage : "—";
+    applyBuildPreviewUi(lastCharts);
+    const render = effectiveCharts(lastCharts);
     if (window.DLCCharts) {
-      DLCCharts.renderInto($("charts"), lastCharts, header);
-      if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, lastCharts, header);  // keep the open tile live
+      DLCCharts.renderInto($("charts"), render, header);
+      if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, render, header);  // keep the open tile live
     }
   } catch (e) { /* charts are advisory; ignore a missed poll */ }
   finally { chartsBusy = false; }
@@ -528,7 +575,7 @@ function openLightbox(key, title, opener) {
   lightboxReturnFocus = opener || document.activeElement;
   $("lb-title").textContent = title || key;
   const header = lastState ? lastState.header : null;
-  $("lb-body").innerHTML = (window.DLCCharts && lastCharts) ? DLCCharts.build(key, lastCharts, header) : "";
+  $("lb-body").innerHTML = (window.DLCCharts && lastCharts) ? DLCCharts.build(key, effectiveCharts(lastCharts), header) : "";
   $("lightbox").hidden = false;
   $("lb-frame").focus();
 }
@@ -701,20 +748,14 @@ function wireUi() {
   for (const id of ["filter-level", "filter-stage", "filter-digest", "filter-text"]) {
     $(id).addEventListener("input", scheduleRender);
   }
-  // view-metric selector: remember the choice and repaint the dE card + last patch from the
-  // cached state (no server round-trip — every metric is already on the wire per patch).
-  $("de-view").addEventListener("change", (e) => {
-    deView = e.target.value;
-    try { localStorage.setItem(DE_VIEW_KEY, deView); } catch (err) { /* private mode: in-memory only */ }
-    if (lastState) renderState(lastState);
-  });
   // measured-primaries overlay toggle: flip the chart option and re-render the (cached) charts
   $("toggle-measured").addEventListener("change", (e) => {
     if (window.DLCCharts) DLCCharts.opts.measured = e.target.checked;
     const header = lastState ? lastState.header : null;
     if (window.DLCCharts && lastCharts) {
-      DLCCharts.renderInto($("charts"), lastCharts, header);
-      if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, lastCharts, header);
+      const render = effectiveCharts(lastCharts);
+      DLCCharts.renderInto($("charts"), render, header);
+      if (lightboxKey) $("lb-body").innerHTML = DLCCharts.build(lightboxKey, render, header);
     }
   });
   $("btn-export").addEventListener("click", async () => {

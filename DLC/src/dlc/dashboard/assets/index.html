@@ -42,13 +42,17 @@
   <!-- ── phase bar ──────────────────────────────────────────────── -->
   <div class="phase-header" id="phase-header">
     <div class="ph-left">
-      <span class="ph-label">phase</span>
+      <span class="ph-label">stage</span>
       <span class="ph-phase" id="ph-phase">—</span>
       <span class="ph-arrow">›</span>
       <span class="ph-stage" id="ph-stage">—</span>
     </div>
+    <div class="ph-mid"><span class="ph-count" id="ph-count"></span></div>
     <div class="ph-right" id="ph-status"></div>
   </div>
+
+  <!-- ── pipeline stepper (stage K of N — what's done / running / upcoming) ── -->
+  <div class="stepper" id="stepper" hidden></div>
 
   <!-- ── readout strip (compact, top) ───────────────────────────── -->
   <section id="readouts">
@@ -72,7 +76,6 @@
 
     <div class="rcard rcard-de">
       <h3><span id="de-metric">ΔE</span>
-        <select id="de-view" class="de-view" title="view metric for the live readout + last patch — a presentation lens. The scored block below always stays in the metric the spine optimised."></select>
         <span class="card-sub" id="de-source"></span></h3>
       <div class="de-live2" id="de-live" title="rolling per-patch ΔE for the CURRENT stage — updates every read. Split by whether the patch's target is reachable on this panel: in-gamut is the calibration quality that matters; out-of-gamut ΔE is expected clipping, not a miss.">
         <span class="de-live-cap" id="de-live-cap">live</span><span class="de-live-h">avg</span><span class="de-live-h">max</span>
@@ -134,8 +137,9 @@
   <!-- ── charts (centerpiece) ───────────────────────────────────── -->
   <main id="charts-area">
     <div class="charts-meta">
-      <span class="cm-label">snapshot charts reflect</span>
+      <span class="cm-label" id="charts-meta-label">snapshot charts reflect</span>
       <span class="cm-stage" id="charts-stage">—</span>
+      <span class="cm-build" id="charts-build" hidden></span>
       <label class="cm-toggle" title="Overlay the panel's measured primaries (the current stage's full-drive RGB corners) on the standard target gamut (CIE tile)">
         <input type="checkbox" id="toggle-measured" checked /> measured primaries
       </label>
@@ -147,8 +151,6 @@
       <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale Duv chart"><figcaption>Grayscale Duv</figcaption><div data-chart="grayduv"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale RGB Balance chart"><figcaption>Grayscale RGB Balance</figcaption><div data-chart="graybalance"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Color Luminance chart"><figcaption>Color Luminance</figcaption><div data-chart="colorlum"></div></figure>
-      <figure class="chart" tabindex="0" role="button" aria-label="Open Saturation tracking chart"><figcaption>Saturation tracking</figcaption><div data-chart="saturation"></div></figure>
-      <figure class="chart" tabindex="0" role="button" aria-label="Open Optimizer convergence chart"><figcaption>Optimizer convergence</figcaption><div data-chart="optimizer"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Channel Drift chart"><figcaption>Channel Drift · thermal</figcaption><div data-chart="drift"></div></figure>
     </div>
   </main>
@@ -165,6 +167,7 @@
   <footer id="logpane">
     <div class="log-toolbar">
       <span class="log-title">event log</span>
+      <span class="log-now" id="log-now" hidden></span>
       <select id="filter-level" title="Minimum level">
         <option value="DEBUG">all</option>
         <option value="INFO" selected>info+</option>

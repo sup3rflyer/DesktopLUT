@@ -110,14 +110,6 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
-def _xy_to_uv76(x: float, y: float) -> tuple[Optional[float], Optional[float]]:
-    """CIE 1931 xy → CIE 1976 u'v' (the chroma space for saturation distance). None if degenerate."""
-    denom = -2.0 * x + 12.0 * y + 3.0
-    if abs(denom) < 1e-12:
-        return (None, None)
-    return (4.0 * x / denom, 9.0 * y / denom)
-
-
 def _is_neutral(rgb: Optional[list]) -> bool:
     """A grayscale/white patch: all channels equal and non-black."""
     if not rgb or len(rgb) < 3:
@@ -136,9 +128,9 @@ def _median(values: list[float]) -> Optional[float]:
     return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
-# Wire precision per metric. All three now ride the 1≈JND scale (ΔEz is normalised), so they read
-# in the same ~0–100 range and share one precision — 3 dp on the wire, 2 dp in the UI.
-_DE_DECIMALS = {"itp": 3, "de2000": 3, "jzazbz": 3}
+# Wire precision per metric. One metric per mode (dE_ITP for HDR, CIEDE2000 for SDR); both ride the
+# 1≈JND scale, so they share one precision — 3 dp on the wire, 2 dp in the UI.
+_DE_DECIMALS = {"itp": 3, "de2000": 3}
 
 
 def _is_hdr_header(header: dict[str, Any]) -> bool:
@@ -184,6 +176,14 @@ class DashboardState:
     phase: Optional[str] = None
     stage: Optional[str] = None
     run_status: str = RUN_IDLE
+    # The run's planned, ordered pipeline (from the run_header's ``stage_plan``: the exact stage
+    # sequence the chosen flow will walk, so the dashboard can show "stage K of N" with the upcoming
+    # steps — not just the current name). Each item is {"key", "label", "long"?}. Empty until the
+    # header carries it.
+    stage_plan: list[dict[str, Any]] = field(default_factory=list)
+    # Stages actually entered (in first-seen order), so the stepper can mark a planned stage done vs
+    # current vs upcoming even when a flow skips a step.
+    stages_started: list[str] = field(default_factory=list)
 
     # -- timing (ISO wall-clock from the producer; freshness math is in snapshot) -
     run_started_iso: Optional[str] = None
@@ -247,6 +247,17 @@ class DashboardState:
     _gray_by_stage: dict = field(default_factory=dict)      # stage → {level: latest neutral sample}
     _color_by_stage: dict = field(default_factory=dict)     # stage → {signal: latest colour sample}
     _stage_seq: list = field(default_factory=list)          # measurement stages, first-seen order
+    # LIVE BUILD PREVIEW. The 3D-LUT build re-measures the panel through each candidate cube as
+    # ``probe`` reads — deliberately EXCLUDED from the settled snapshot charts (transient, adaptively
+    # sampled, not a deliverable). But excluding them left the main graphs frozen for the whole
+    # (longest) phase. So probes feed a SEPARATE preview bucket here, rendered into the CIE/grayscale/
+    # EOTF tiles ONLY while building, clearly badged "build preview — not final"; the settled charts
+    # still hold the last real measurement stage and the verify reads replace the preview at the end.
+    _preview_cie: dict = field(default_factory=dict)        # probe-stage → deque[point]
+    _preview_gray: dict = field(default_factory=dict)       # probe-stage → {level: latest neutral}
+    _preview_seq: list = field(default_factory=list)        # probe (build) stages, first-seen order
+    _last_probe_iso: Optional[str] = None                   # newest probe read (build-preview freshness)
+    _last_settled_iso: Optional[str] = None                 # newest charted real measurement read
     # Cross-stage white-DRIFT time series. Primary = the dedicated neutral_ref checkpoints (a
     # FIXED neutral re-measured over the run — the clean thermal-drift signal). Fallback = white-
     # level (signal>=0.9) measurement neutrals, used only when a run emits no neutral_ref. Mid/low
@@ -273,6 +284,12 @@ class DashboardState:
             self.header = dict(data)
             self.schema_version = data.get("schema_version", self.schema_version)
             self.run_id = data.get("run_id", self.run_id)
+            # The planned pipeline (the chosen flow's ordered stage list) rides the header so the
+            # stepper can show the WHOLE run, not just the current stage. Latch the first non-empty
+            # one (early headers may predate the flow being resolved).
+            plan = data.get("stage_plan")
+            if isinstance(plan, list) and plan:
+                self.stage_plan = [p for p in plan if isinstance(p, dict)]
             # A run_header marks a run process (re)starting. Promote to RUNNING even from a
             # prior TERMINAL status — a resume appends a fresh run_header into the same events
             # stream after an earlier run_done (e.g. an aborted run resumed from a memoised
@@ -286,6 +303,8 @@ class DashboardState:
         elif name == Ev.STAGE_START:
             self.stage = ev.stage
             self.stage_started_iso = ev.time
+            if ev.stage and ev.stage not in self.stages_started:
+                self.stages_started.append(ev.stage)
             # A stage boundary is real progress and resets the per-stage rate window — the
             # patch counter restarts at ~0, so an ETA computed across the reset is garbage.
             self._mark_progress(ev.time)
@@ -421,7 +440,8 @@ class DashboardState:
         and marks the OOG split pending rather than mislabelling everything in-gamut."""
         vals = list(self._live_de.values())
         hdr = _is_hdr_header(self.header)
-        order = ("itp", "de2000", "jzazbz") if hdr else ("de2000", "jzazbz")
+        # One metric per mode — dE_ITP for HDR, CIEDE2000 for SDR (no alternate viewing lens).
+        order = ("itp",) if hdr else ("de2000",)
         native = self._native_primaries()
         tri = ((tuple(native["r"]), tuple(native["g"]), tuple(native["b"]))
                if native and all(k in native for k in ("r", "g", "b")) else None)
@@ -511,6 +531,12 @@ class DashboardState:
         sig = data.get("signal")
         neutral = _is_neutral(rgb)
         is_probe = role == "probe" or disposition == "probe"
+        if is_probe:
+            # The 3D-LUT build's re-measure-through-the-candidate-cube reads. They never touch the
+            # settled snapshot charts or the drift series (transient, adaptively sampled), but they
+            # DO feed the live build preview so the main graphs move during the longest phase.
+            self._accumulate_preview(ev, data, x, y, Y, enriched, deltas, neutral)
+            return
         # Drift series (cross-stage TIME series) for the per-channel thermal-drift chart. A FIXED
         # near-white neutral re-measured over time — the clean signal: the warm-up conditioning
         # reads (when thermal drift is LARGEST) + the dedicated neutral_ref checkpoints. The whole
@@ -531,6 +557,9 @@ class DashboardState:
         stage = self._chart_stage(ev, data)
         if stage is None:
             return
+        # A settled measurement read is newer ground truth than any build preview — once verify
+        # reads start landing, this advances past the last probe and the preview yields the tiles.
+        self._last_settled_iso = ev.time
         if stage not in self._cie_by_stage:
             self._cie_by_stage[stage] = deque(maxlen=5000)
             self._gray_by_stage[stage] = {}
@@ -559,6 +588,33 @@ class DashboardState:
                                                     "x": round(x, 5), "y": round(y, 5)}
             except (TypeError, ValueError):
                 pass
+
+    def _accumulate_preview(self, ev: Event, data: dict[str, Any], x: float, y: float,
+                            Y: Any, enriched: dict[str, Any], deltas: Optional[dict[str, Any]],
+                            neutral: bool) -> None:
+        """Fold one BUILD PROBE read into the live build-preview buckets (CIE scatter + grayscale),
+        so the main graphs animate the cube converging during the 3D-LUT build. Keyed by the build
+        stage; latest-wins per grayscale level / per CIE point identity, mirroring the snapshot
+        accumulators so the SAME chart builders render it."""
+        stage = ev.phase or ev.stage or "build"
+        if stage not in self._preview_cie:
+            self._preview_cie[stage] = deque(maxlen=5000)
+            self._preview_gray[stage] = {}
+            self._preview_seq.append(stage)
+        self._last_probe_iso = ev.time
+        sig = data.get("signal")
+        tgt = (deltas or {}).get("target")
+        de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
+        self._preview_cie[stage].append({
+            "x": round(x, 5), "y": round(y, 5), "role": "probe", "neutral": neutral,
+            "c": (None if neutral else _sig_hex(sig)) if sig else None,
+            "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
+            "de": de, "label": data.get("label")})
+        level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
+        if level is not None:
+            self._preview_gray[stage][round(level, 5)] = {
+                "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
+                "cct": enriched.get("cct"), "duv": enriched.get("duv")}
 
     def _ingest_metrics(self, ev: Event, data: dict[str, Any]) -> None:
         entry = {
@@ -639,7 +695,10 @@ class DashboardState:
                 "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
             },
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
-            "saturation": self._saturation(color_map, white),
+            # Live build preview (probe reads during the 3D-LUT build) — the main graphs keep moving
+            # through the longest phase. ``active`` tells the frontend to render it over the (frozen)
+            # snapshot tiles with a "build preview — not final" badge.
+            "build_preview": self._build_preview(hdr=hdr, white=white, gamma=gamma, luminance=luminance),
             "optimizer": list(self._optimizer_history),
             "white_track": list(self._drift_series()),
             "channel_drift": self._channel_drift(hdr, white),
@@ -787,39 +846,55 @@ class DashboardState:
         stage exists), so it degrades to that panel-through-MHC envelope."""
         return self._corner_primaries(self._stage_seq[0] if self._stage_seq else None)
 
-    def _saturation(self, color_map: dict, white_xy: Any) -> list[dict[str, Any]]:
-        """Saturation tracking per hue family: measured chroma (CIE 1976 u'v' distance from the
-        target white) vs the commanded saturation, normalised so each family's 100%-saturation
-        patch = 1.0. Ideal tracking is the identity line (commanded → measured). Dependency-free
-        geometry; no dE — a monitoring view of how saturation builds, not the authoritative score."""
-        if not white_xy or len(white_xy) < 2:
-            return []
-        wu, wv = _xy_to_uv76(white_xy[0], white_xy[1])
-        if wu is None:
-            return []
-        fams: dict[str, list[dict[str, Any]]] = {}
-        for c in color_map.values():
-            sig, x, y = c.get("signal"), c.get("x"), c.get("y")
-            if x is None or y is None or not sig:
-                continue
-            family, sat = _classify_color(sig)
-            if family == "mix" or sat <= 0:
-                continue
-            uv = _xy_to_uv76(x, y)
-            if uv[0] is None:
-                continue
-            chroma = ((uv[0] - wu) ** 2 + (uv[1] - wv) ** 2) ** 0.5
-            fams.setdefault(family, []).append({"sat": sat, "chroma": chroma, "color": _sig_hex(sig)})
-        out: list[dict[str, Any]] = []
-        for family, pts in fams.items():
-            cmax = max((p["chroma"] for p in pts), default=0.0)
-            if cmax <= 0:
-                continue
-            for p in pts:
-                out.append({"family": family, "target": round(p["sat"] / 100.0, 4),
-                            "measured": round(p["chroma"] / cmax, 4), "color": p["color"]})
-        out.sort(key=lambda d: (_FAMILY_ORDER.get(d["family"], 9), d["target"]))
-        return out
+    def _build_preview(self, *, hdr: bool, white: Any, gamma: Any,
+                       luminance: Any) -> dict[str, Any]:
+        """The live build-preview payload for the 3D-LUT build phase: the panel measured THROUGH
+        the current candidate cube (probe reads), shaped exactly like the snapshot ``cie`` /
+        ``grayscale`` / ``eotf`` keys so the same chart builders render it.
+
+        ``active`` is True only while the build is the freshest activity — i.e. the newest probe is
+        more recent than the newest settled measurement read. Once the verify stage starts landing
+        real reads, ``_last_settled_iso`` overtakes ``_last_probe_iso`` and the preview yields the
+        tiles back to the (now-updated) settled charts automatically."""
+        stage = self._preview_seq[-1] if self._preview_seq else None
+        active = (self._last_probe_iso is not None
+                  and (self._last_settled_iso is None or self._last_probe_iso > self._last_settled_iso)
+                  and self.run_status == RUN_RUNNING)
+        if stage is None:
+            return {"active": False, "stage": None}
+        cie_points = list(self._preview_cie.get(stage, ()))
+        gray_map = self._preview_gray.get(stage, {})
+        bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
+        gray = []
+        for k in sorted(gray_map):
+            g = gray_map[k]
+            bal = rgb_balance(g.get("x"), g.get("y"), g.get("Y"), is_hdr=hdr, white_xy=bal_white)
+            gray.append({**g,
+                         "dim": (g.get("Y") is not None and g["Y"] < _GRAY_CCT_Y_FLOOR_NITS),
+                         "r": round(bal[0], 2) if bal else None,
+                         "g": round(bal[1], 2) if bal else None,
+                         "b": round(bal[2], 2) if bal else None})
+        return {
+            "active": active,
+            "stage": stage,
+            "iterations": len(self._optimizer_history),
+            "cie": {
+                "points": cie_points,
+                "white": white,
+                "primaries": _REC2020_PRIMARIES if hdr else _SRGB_PRIMARIES,
+                "gamut_label": "Rec.2020" if hdr else "Rec.709 / sRGB",
+                "measured": self._corner_primaries(self._stage_seq[-1] if self._stage_seq else None),
+                "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
+            },
+            "grayscale": gray,
+            "eotf": {
+                "kind": "pq" if hdr else "power",
+                "gamma": gamma,
+                "luminance": luminance,
+                "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
+                "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
+            },
+        }
 
     # ----------------------------------------------------------------------
     def _wire(self, ev: Event, data: dict[str, Any]) -> dict[str, Any]:
@@ -928,6 +1003,38 @@ class DashboardState:
                 "progress_age_s": round(prog_age, 1) if prog_age is not None else None,
                 "last_event_iso": self.last_event_iso, "last_read_iso": self.last_read_iso}
 
+    def _pipeline_view(self) -> dict[str, Any]:
+        """The pipeline stepper payload: the planned ordered stages, each tagged done / current /
+        upcoming, plus 'stage K of N'. ``done`` = a planned stage already entered that isn't the
+        current one; ``current`` = the running stage; the rest are ``upcoming``. Resilient to a flow
+        that skips a planned stage (it just never flips to done) and to an unplanned stage (it's
+        surfaced as current with no index). Empty plan ⇒ a minimal view from the live stage only."""
+        plan = self.stage_plan
+        started = set(self.stages_started)
+        cur = self.stage
+        terminal = self.run_status in _TERMINAL_BY_STATUS.values()
+        steps: list[dict[str, Any]] = []
+        index = None
+        for i, p in enumerate(plan):
+            key = p.get("key")
+            if key == cur and not terminal:
+                status = "current"
+                index = i
+            elif key in started:
+                status = "done"
+            else:
+                status = "upcoming"
+            steps.append({"key": key, "label": p.get("label") or key,
+                          "long": bool(p.get("long")), "status": status})
+        # If the run finished, everything entered is done (no current).
+        if terminal:
+            for s in steps:
+                if s["key"] in started:
+                    s["status"] = "done"
+        return {"steps": steps, "total": len(plan),
+                "index": (index + 1) if index is not None else None,
+                "current": cur}
+
     def snapshot(self, now: Optional[datetime] = None) -> dict[str, Any]:
         """The full renderable state. ``now`` is injected for testability; the server
         passes ``datetime.now()`` so timers/liveness advance even with no new events."""
@@ -957,6 +1064,7 @@ class DashboardState:
             "phase": self.phase,
             "stage": self.stage,
             "run_status": self.run_status,
+            "pipeline": self._pipeline_view(),
             "events_seen": self.events_seen,
             "counters": {
                 "patches_done": self.patches_done,

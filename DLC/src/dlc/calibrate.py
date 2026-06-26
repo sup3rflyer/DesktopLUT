@@ -785,6 +785,59 @@ class Calibration:
                 self.runlog.phase or "run", "aborted",
                 digest={"message": "run cancelled by operator/LLM (control.json)", "cancelled": True}))
 
+    # The friendly stepper labels for every stage key the flows can walk. Keys must match the
+    # ``_stage(key, ...)`` / ``set_phase(key)`` strings exactly (that's what the dashboard sees as
+    # the live stage). ``long`` marks a stage the operator should expect to wait on.
+    _STAGE_LABELS = {
+        "preflight": ("Preflight", False),
+        "resolve-target": ("Resolve target", False),
+        "whitepoint": ("White point", False),
+        "probe-match": ("Probe match (CCMX)", True),
+        "clear-native": ("Clear to native", False),
+        "enter-neutral": ("Enter neutral", False),
+        "characterize": ("Characterize panel", True),
+        "hardware-readiness": ("Hardware readiness", False),
+        "brightness": ("Brightness", False),
+        "measure:raw": ("Measure · raw panel", True),
+        "build-install-mhc": ("Build + install MHC", False),
+        "refine-mhc-cube": ("Refine MHC (HDR cube)", True),
+        "refine-mhc-grayscale": ("Refine MHC grayscale", True),
+        "adaptive-planning": ("Adaptive planning", False),
+        "measure:post-mhc": ("Measure · post-MHC", True),
+        "build-install-3dlut": ("Build + install 3D LUT", True),
+        "measure:verify": ("Measure · verify", True),
+        "verify": ("Verify + report", False),
+    }
+
+    # The ordered stage key sequence each flow walks (mirrors the ``_flow_*`` methods). Stages that
+    # aren't announced on the spine as a phase (e.g. the 3dlut-only require-stack / inplace-baseline
+    # helpers) are intentionally omitted — the stepper tracks what the dashboard can actually see.
+    def _planned_stages(self) -> list[dict[str, Any]]:
+        """The chosen flow's ordered pipeline (key + friendly label + long-stage hint) for the
+        dashboard stepper. Empty until the flow is resolved. The HDR/SDR refine fork mirrors the
+        ``_flow_*`` methods (``self.mode``; normalize_mode pins it to SDR/HDR)."""
+        flow = self.calib.get("flow")
+        refine = "refine-mhc-cube" if self.mode == "HDR" else "refine-mhc-grayscale"
+        seqs = {
+            "full": ["preflight", "resolve-target", "whitepoint", "enter-neutral",
+                     "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
+                     refine, "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
+                     "measure:verify", "verify"],
+            "mhc-only": ["preflight", "resolve-target", "whitepoint", "enter-neutral",
+                         "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
+                         refine, "measure:verify", "verify"],
+            "3dlut-only": ["preflight", "resolve-target", "whitepoint", "hardware-readiness",
+                           "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
+                           "measure:verify", "verify"],
+            "build-correction": ["preflight", "clear-native", "probe-match"],
+        }
+        keys = seqs.get(flow or "", [])
+        out: list[dict[str, Any]] = []
+        for key in keys:
+            label, long = self._STAGE_LABELS.get(key, (key, False))
+            out.append({"key": key, "label": label, "long": long})
+        return out
+
     def _header_data(self) -> dict[str, Any]:
         """The dashboard status-bar payload: who/what is being calibrated, against what
         target, with which correction. Gathered defensively — a missing piece (target not
@@ -797,6 +850,9 @@ class Calibration:
             "flow": self.calib.get("flow"),
             "bit_depth": self.bit_depth,
         }
+        plan = self._planned_stages()
+        if plan:
+            data["stage_plan"] = plan   # the dashboard stepper's "stage K of N" pipeline
         if self.target_name:
             data["target"] = self.target_name
             try:
@@ -1894,6 +1950,9 @@ class Calibration:
     # ====================================================================
     def stage_preflight(self) -> StageOutcome:
         def run() -> StageOutcome:
+            # Surface each preflight sub-step on the spine (digest tier) so the dashboard shows what
+            # this read-only readiness stage is actually doing, not just a silent start→done.
+            self.runlog.note("preflight", "checking display topology + the DesktopLUT pipe")
             # Verify the profile's display mapping against what the controller sees.
             mapping_ok = True
             seen_monitors: list[int] = []
@@ -1916,6 +1975,7 @@ class Calibration:
             # Consult the SAME correction the meter is actually wired to (store overrides the
             # profile YAML — active_correction), not the (possibly empty) profile YAML, so the
             # tell can't report "no correction" while the meter is in fact corrected.
+            self.runlog.note("preflight", "checking colorimeter correction (CCMX/SPD) freshness")
             staleness = self.profile.correction_staleness(
                 today=self.run_date, made_override=store_made,
                 file_override=active_correction(self.profile, corr_store, self.display.name))
@@ -1943,6 +2003,7 @@ class Calibration:
             # consume the DIP's display axis (native primaries / white / black) up front, so an
             # unreachable target gamut or a raised black is surfaced before the build, not in the
             # cube residuals afterward.
+            self.runlog.note("preflight", "probing panel capabilities (gamut coverage, white/black, contrast)")
             gamut_tell = self._gamut_tell()
             if gamut_tell.get("warning"):
                 self.ctx.log(gamut_tell["warning"])
@@ -1964,6 +2025,7 @@ class Calibration:
             # Save the user's current DesktopLUT state BEFORE we touch anything, so a
             # failed/cancelled run can be rolled back to exactly this. preflight is the
             # first stage and read-only, so this captures the pristine pre-run setup.
+            self.runlog.note("preflight", "saving your current DesktopLUT setup for rollback")
             backup = self._capture_user_backup(state)
             digest = {"monitor": self.monitor, "mode": self.mode, "display": self.display.name,
                       "argyll_display": self.display.argyll_display, "mapping_ok": mapping_ok,

@@ -162,32 +162,6 @@ _XYZ_TO_BT2020 = invert3x3(rgb_to_xyz_matrix(
     _D65_XY[0], _D65_XY[1], white_Y=1.0))
 _DE_ITP_SCALE = 720.0
 
-# BT.2408 HDR reference ("diffuse"/graphics) white — the luminance dE2000's Lab is taken
-# against when we offer it on an HDR patch. CIEDE2000's dataset is SDR (<~100 nits); scoring
-# HDR against a 10000-nit white compresses L* to nothing, so we anchor to the 203 cd/m² diffuse
-# white instead and surface it only as an out-of-regime *intuition* lens, never the scorer.
-_HDR_DIFFUSE_NITS = 203.0
-
-# --- Jzazbz (Safdar, Wuerger, Cheung, Luo, Sun 2017) — an HDR+WCG-uniform space whose ΔEz
-# behaves far more intuitively across the luminance range than dE_ITP. Reproduces
-# colour.XYZ_to_Jzazbz to machine precision (pinned in tests). Constants reuse PQ's c1/c2/c3
-# and m1 (c1=PQ_C1, n=PQ_M1, p=1.7·PQ_M2) — Jzazbz and ITP share the PQ lineage.
-_JZ_B, _JZ_G = 1.15, 0.66
-_JZ_N = _PQ_M1
-_JZ_P = 1.7 * _PQ_M2
-_JZ_D, _JZ_D0 = -0.56, 1.6295499532821566e-11
-_M_XYZP_TO_LMS = [[0.41478972, 0.579999, 0.0146480],
-                  [-0.2015100, 1.120649, 0.0531008],
-                  [-0.0166008, 0.264800, 0.6684799]]
-# Raw ΔEz is tiny (~1e-3) and has no established presentation, so users have no learned intuition
-# for it. Multiply by _JZ_SCALE so 1.0 ≈ 1 JND — ΔEz then rides the SAME scale + severity bands as
-# dE_ITP / CIEDE2000 and the user's learned "<1 invisible, <3 acceptable" intuition transfers. The
-# constant is the empirical dE_ITP/ΔEz ratio across the HDR luminance range (mean ≈662, σ≈150 —
-# Jzazbz and ITP weight chroma differently), rounded to 660. No ΔEz JND constant is standardized;
-# what IS standard is the 1≈JND interpretation, which this restores.
-_JZ_SCALE = 660.0
-
-
 def _pq_eotf_norm(s: float) -> float:
     """PQ signal (0..1) → linear light normalised to 10000 nits (0..1)."""
     vm = max(s, 0.0) ** (1.0 / _PQ_M2)
@@ -291,25 +265,6 @@ def _xyz_to_ictcp(xyz_abs: Sequence[float]) -> tuple[float, float, float]:
     return tuple(matvec(_M_LMS_P_TO_ICTCP, lms_p))  # type: ignore[return-value]
 
 
-def _xyz_to_jzazbz(xyz_abs: Sequence[float]) -> tuple[float, float, float]:
-    """Absolute XYZ (cd/m²) → Jzazbz (Safdar et al. 2017) — matches colour.XYZ_to_Jzazbz."""
-    big_x, big_y, big_z = xyz_abs
-    xp = _JZ_B * big_x - (_JZ_B - 1.0) * big_z
-    yp = _JZ_G * big_y - (_JZ_G - 1.0) * big_x
-    lms = matvec(_M_XYZP_TO_LMS, [xp, yp, big_z])
-
-    def pq(v: float) -> float:
-        vn = (max(0.0, v) / 10000.0) ** _JZ_N
-        return ((_PQ_C1 + _PQ_C2 * vn) / (1.0 + _PQ_C3 * vn)) ** _JZ_P
-
-    lp, mp, sp = pq(lms[0]), pq(lms[1]), pq(lms[2])
-    iz = 0.5 * (lp + mp)
-    az = 3.524000 * lp - 4.066708 * mp + 0.542708 * sp
-    bz = 0.199076 * lp + 1.096799 * mp - 1.295875 * sp
-    jz = ((1.0 + _JZ_D) * iz) / (1.0 + _JZ_D * iz) - _JZ_D0
-    return (jz, az, bz)
-
-
 def _lch_components(l_ideal: float, plane_ideal: tuple[float, float],
                     l_meas: float, plane_meas: tuple[float, float],
                     scale: float = 1.0) -> dict:
@@ -335,12 +290,6 @@ def _itp_metric(meas_xyz: Sequence[float], ideal_xyz: Sequence[float]) -> dict:
     de = _DE_ITP_SCALE * math.sqrt(sum((a - b) ** 2 for a, b in zip(im, ii)))
     return {"de": de, **_lch_components(ii[0], (ii[1], ii[2]), im[0], (im[1], im[2]),
                                         scale=_DE_ITP_SCALE)}
-
-
-def _jzazbz_metric(meas_xyz: Sequence[float], ideal_xyz: Sequence[float]) -> dict:
-    jm, ji = _xyz_to_jzazbz(meas_xyz), _xyz_to_jzazbz(ideal_xyz)
-    de = _JZ_SCALE * math.sqrt(sum((a - b) ** 2 for a, b in zip(jm, ji)))
-    return {"de": de, **_lch_components(ji[0], (ji[1], ji[2]), jm[0], (jm[1], jm[2]), scale=_JZ_SCALE)}
 
 
 def _de2000_metric(meas_xyz: Sequence[float], ideal_xyz: Sequence[float],
@@ -373,21 +322,18 @@ def patch_deltas(signal: Sequence[float], x: float, y: float, big_y: float, *,
                  is_hdr: bool, white_xy: Sequence[float] = _D65_XY,
                  luminance: Optional[float] = None, gamma: float = 2.2
                  ) -> Optional[dict]:
-    """All applicable per-patch ΔE metrics for one measured patch vs its ideal target, each with
-    its signed lightness/chroma/hue split — the data behind the dashboard's *selectable* metric
-    view. ``signal`` is the patch's normalised RGB; ``(x,y,big_y)`` its measured chromaticity +
-    luminance (cd/m²).
+    """The per-patch ΔE for one measured patch vs its ideal target, with its signed
+    lightness/chroma/hue split. ``signal`` is the patch's normalised RGB; ``(x,y,big_y)`` its
+    measured chromaticity + luminance (cd/m²).
 
     Returns ``{"scoring": <key>, "metrics": {<key>: {"de", "L", "C", "H"}}}`` — or ``None`` for a
     degenerate (``y<=0``) / non-finite read that must NOT yield a plausible finite ΔE (it would
     silently poison the live rolling average; the engine sanitizes the same failure mode).
 
-    The ``scoring`` key flags the metric the spine actually optimises (dE_ITP for HDR, CIEDE2000
-    for SDR); the others are *viewing lenses*. HDR also offers ``de2000`` (against the BT.2408
-    203-nit diffuse white — out of CIEDE2000's SDR regime, an intuition aid only) and ``jzazbz``;
-    SDR offers ``jzazbz`` alongside the scoring CIEDE2000. Every metric is reported on the 1≈JND
-    scale (``jzazbz`` is normalised by ``_JZ_SCALE``) so one set of learned severity bands applies.
-    dE_ITP for HDR and CIEDE2000 for SDR stay bit-identical to the spine's scorer."""
+    ONE metric per mode, matching the spine's scorer exactly: **dE_ITP for HDR (PQ/Rec.2020),
+    CIEDE2000 for SDR**. There is no alternate "viewing lens" — the dashboard shows the metric the
+    run is actually optimised against, so a number on screen is never a different scale than the
+    score. dE_ITP and CIEDE2000 here stay bit-identical to ``dlc.metrics`` / ``engine.score_hdr``."""
     if not signal or len(signal) < 3 or big_y is None or x is None or y is None:
         return None
     if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(big_y)):
@@ -399,20 +345,15 @@ def patch_deltas(signal: Sequence[float], x: float, y: float, big_y: float, *,
         npm = _npm(_REC2020_PRIMARIES, white_xy)
         nits = [_pq_eotf_norm(max(0.0, min(1.0, s))) * 10000.0 for s in signal[:3]]
         ideal = matvec(npm, nits)                                  # absolute XYZ (RGB_to_XYZ·10000)
-        return {"scoring": "itp", "target": _target_xyy(ideal), "metrics": {
-            "itp": _itp_metric(meas, ideal),
-            "de2000": _de2000_metric(meas, ideal, _white_xyz(white_xy, _HDR_DIFFUSE_NITS)),
-            "jzazbz": _jzazbz_metric(meas, ideal),
-        }}
+        return {"scoring": "itp", "target": _target_xyy(ideal),
+                "metrics": {"itp": _itp_metric(meas, ideal)}}
     if luminance is None or luminance <= 0:
         return None
     npm = _npm(_SRGB_PRIMARIES, white_xy)
     linear = [max(0.0, min(1.0, s)) ** gamma for s in signal[:3]]
     ideal = [luminance * v for v in matvec(npm, linear)]
-    return {"scoring": "de2000", "target": _target_xyy(ideal), "metrics": {
-        "de2000": _de2000_metric(meas, ideal, _white_xyz(white_xy, luminance)),
-        "jzazbz": _jzazbz_metric(meas, ideal),
-    }}
+    return {"scoring": "de2000", "target": _target_xyy(ideal),
+            "metrics": {"de2000": _de2000_metric(meas, ideal, _white_xyz(white_xy, luminance))}}
 
 
 def patch_delta_e(signal: Sequence[float], x: float, y: float, big_y: float, *,

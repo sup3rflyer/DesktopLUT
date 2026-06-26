@@ -215,9 +215,9 @@ def test_per_patch_de_enriches_reads_and_live_header():
     assert wire["derived"]["de"] is not None and wire["derived"]["de"] < 1.0
     snap = st.snapshot(T0)
     assert snap["last_read"]["de"] is not None
-    # SDR scores CIEDE2000 and offers Jzazbz as a view lens; the rolling summary carries both.
+    # SDR scores CIEDE2000 — the only metric (no alternate lens); HDR would carry only dE_ITP.
     assert snap["live_de"]["n"] == 1 and snap["live_de"]["scoring"] == "de2000"
-    assert set(snap["live_de"]["metrics"]) == {"de2000", "jzazbz"}
+    assert set(snap["live_de"]["metrics"]) == {"de2000"}
     # the last patch carries the full per-metric split so the dashboard can switch view client-side
     assert snap["last_read"]["deltas"]["scoring"] == "de2000"
     assert all(k in snap["last_read"]["deltas"]["metrics"]["de2000"] for k in ("de", "L", "C", "H"))
@@ -302,27 +302,64 @@ def test_channel_drift_tracks_per_channel_warmup():
     assert cd[-1]["b"] > cd[-1]["r"] and cd[-1]["b"] > 0  # blue drifted up the most → the warming channel
 
 
-def test_saturation_tracking_normalises_per_family():
+def test_pipeline_stepper_tracks_done_current_upcoming():
+    """The run_header carries the planned stage list; the snapshot's pipeline marks each step
+    done / current / upcoming with 'stage K of N' so the stepper can show the whole flow."""
     st = DashboardState()
-    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", flow="full",
+    plan = [{"key": "preflight", "label": "Preflight", "long": False},
+            {"key": "measure:raw", "label": "Measure · raw panel", "long": True},
+            {"key": "build-install-3dlut", "label": "Build + install 3D LUT", "long": True},
+            {"key": "verify", "label": "Verify + report", "long": False}]
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", run_id="r1", stage_plan=plan))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="preflight"))
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=1), stage="measure:raw"))
+    pl = st.snapshot(T0 + timedelta(seconds=2))["pipeline"]
+    assert pl["total"] == 4 and pl["index"] == 2          # "stage 2 of 4"
+    by = {s["key"]: s["status"] for s in pl["steps"]}
+    assert by["preflight"] == "done"                       # entered then left
+    assert by["measure:raw"] == "current"
+    assert by["build-install-3dlut"] == "upcoming" and by["verify"] == "upcoming"
+    # the long-stage hint rides along so the UI can warn "expect a wait"
+    assert next(s for s in pl["steps"] if s["key"] == "build-install-3dlut")["long"] is True
+    # at run end nothing is "current"; entered stages are done
+    st.ingest(_ev(Ev.RUN_DONE, t=T0 + timedelta(seconds=3), stage="run", status="completed"))
+    pl2 = st.snapshot(T0 + timedelta(seconds=4))["pipeline"]
+    assert all(s["status"] != "current" for s in pl2["steps"])
+
+
+def test_build_probe_reads_feed_live_preview_not_snapshot():
+    """The 3D-LUT build's probe reads stay OUT of the settled snapshot charts (they keep showing
+    the last real stage) but DO populate the live build preview, with ``active`` set while the
+    build is the freshest activity."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
                   white={"xy": [0.3127, 0.329], "cct": 6504}))
-    # Three red patches sweeping saturation (secondary channels below half-max → stay family "R"),
-    # measured chroma growing with commanded saturation.
-    sweeps = [([255, 26, 26], [1.0, 0.10, 0.10], [0.52, 0.33]),    # ~100% sat, farthest from white
-              ([255, 77, 77], [1.0, 0.30, 0.30], [0.45, 0.33]),    # ~75%
-              ([255, 115, 115], [1.0, 0.45, 0.45], [0.40, 0.33])]  # ~50%, closest
-    for i, (rgb, sig, xy) in enumerate(sweeps):
-        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i), stage="measure", tier="stream",
-                      seq=i, role="measurement", label=f"r{i}", rgb=rgb, signal=sig,
-                      Y=40.0, xy=xy, ok=True))
-    sat = st.charts()["saturation"]
-    reds = [p for p in sat if p["family"] == "R"]
-    assert len(reds) == 3
-    # commanded saturation buckets recovered (50/75/100%), sorted ascending
-    assert [p["target"] for p in reds] == [0.5, 0.75, 1.0]
-    # normalised so the most-saturated red = 1.0 and chroma tracks monotonically with command
-    assert reds[-1]["measured"] == 1.0
-    assert reds[0]["measured"] < reds[1]["measured"] < reds[2]["measured"]
+    # a settled post-MHC measurement (the snapshot the build "builds on")
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:post-mhc"))
+    _read(st, 1, [255, 0, 0], [0.63, 0.34], 44.0, signal=[1.0, 0.0, 0.0], phase="measure:post-mhc")
+    # the build starts: probe reads through the candidate cube
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=2), stage="build-install-3dlut"))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=3), stage="build-install-3dlut",
+                  phase="build-install-3dlut", tier="stream", seq=0, role="probe", disposition="probe",
+                  rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=45.0, xy=[0.64, 0.33], ok=True))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=4), stage="build-install-3dlut",
+                  phase="build-install-3dlut", tier="stream", seq=1, role="probe", disposition="probe",
+                  rgb=[128, 128, 128], signal=[0.5, 0.5, 0.5], Y=30.0, xy=[0.313, 0.329], ok=True))
+    ch = st.charts()
+    # the settled snapshot is still the post-MHC stage (probes excluded)
+    assert ch["stage"] == "measure:post-mhc"
+    assert len(ch["cie"]["points"]) == 1
+    # the build preview carries the probe reads and is active (build is the freshest activity)
+    bp = ch["build_preview"]
+    assert bp["active"] is True and bp["stage"] == "build-install-3dlut"
+    assert len(bp["cie"]["points"]) == 2
+    assert [g["signal"] for g in bp["grayscale"]] == [0.5]      # the neutral probe → grayscale preview
+    # once verify reads land (newer than the probes), the preview deactivates and the snapshot moves on
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=5), stage="measure:verify"))
+    _read(st, 6, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:verify")
+    ch2 = st.charts()
+    assert ch2["stage"] == "measure:verify"
+    assert ch2["build_preview"]["active"] is False
 
 
 def test_metrics_scored_feeds_the_de_bignumbers():
