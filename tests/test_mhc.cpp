@@ -1,5 +1,6 @@
 #include "doctest.h"
 #include "mhc.h"
+#include "mhc_internal.h"   // MatInv3, MatVecMul3 (shared inline helpers)
 #include "color.h"
 #include <cmath>
 #include <algorithm>
@@ -16,6 +17,39 @@ struct TempFile {
 static constexpr DisplayPrimariesData kSRGB   = {0.6400f, 0.3300f, 0.3000f, 0.6000f, 0.1500f, 0.0600f, 0.3127f, 0.3290f};
 static constexpr DisplayPrimariesData kBT2020 = {0.7080f, 0.2920f, 0.1700f, 0.7970f, 0.1310f, 0.0460f, 0.3127f, 0.3290f};
 static constexpr DisplayPrimariesData kP3D65  = {0.6800f, 0.3200f, 0.2650f, 0.6900f, 0.1500f, 0.0600f, 0.3127f, 0.3290f};
+
+// Test-local replicas of mhc_icc.cpp's (static) NPM builder and 3x3 multiply, so the MHC2 basis
+// round-trip checks below don't depend on internals. tBuildRGBtoXYZ mirrors BuildRGBtoXYZ exactly.
+static void tMatMul3(const float a[9], const float b[9], float out[9]) {
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            out[i * 3 + j] = a[i * 3 + 0] * b[0 * 3 + j] +
+                             a[i * 3 + 1] * b[1 * 3 + j] +
+                             a[i * 3 + 2] * b[2 * 3 + j];
+}
+static void tXyToXYZ(float x, float y, float XYZ[3]) {
+    if (y < 1e-6f) y = 1e-6f;
+    XYZ[0] = x / y; XYZ[1] = 1.0f; XYZ[2] = (1.0f - x - y) / y;
+}
+static bool tBuildRGBtoXYZ(const DisplayPrimariesData& p, float out[9]) {
+    float r[3], g[3], b[3], w[3];
+    tXyToXYZ(p.Rx, p.Ry, r); tXyToXYZ(p.Gx, p.Gy, g);
+    tXyToXYZ(p.Bx, p.By, b); tXyToXYZ(p.Wx, p.Wy, w);
+    float prim[9] = { r[0], g[0], b[0], r[1], g[1], b[1], r[2], g[2], b[2] };
+    float primInv[9];
+    if (!MatInv3(prim, primInv)) return false;
+    float S[3]; MatVecMul3(primInv, w, S);
+    out[0] = r[0] * S[0]; out[1] = g[0] * S[1]; out[2] = b[0] * S[2];
+    out[3] = r[1] * S[0]; out[4] = g[1] * S[1]; out[5] = b[1] * S[2];
+    out[6] = r[2] * S[0]; out[7] = g[2] * S[1]; out[8] = b[2] * S[2];
+    return true;
+}
+// Extract the 3x3 from a 3x4 row-major MHC2 matrix (4th column dropped).
+static void tExtract3x3(const float mhc[12], float out[9]) {
+    out[0] = mhc[0]; out[1] = mhc[1];  out[2] = mhc[2];
+    out[3] = mhc[4]; out[4] = mhc[5];  out[5] = mhc[6];
+    out[6] = mhc[8]; out[7] = mhc[9];  out[8] = mhc[10];
+}
 
 // ============================================================================
 // Binary Format Helpers
@@ -175,6 +209,52 @@ TEST_CASE("MHC2 matrix: singular fallback") {
     CHECK(mhc[0]  == doctest::Approx(1.0f).epsilon(1e-6));
     CHECK(mhc[5]  == doctest::Approx(1.0f).epsilon(1e-6));
     CHECK(mhc[10] == doctest::Approx(1.0f).epsilon(1e-6));
+}
+
+TEST_CASE("MHC2 matrix: SDR emitted as XYZ-basis adjustment, round-trips to intended RGB->RGB") {
+    // SDR_MHC2_XYZ_BASIS_BUG.md: Windows consumes the SDR MHC2 tag as a CIEXYZ XYZ->XYZ adjustment,
+    // composing SrcRGBtoXYZ * Adjust * XYZtoTgtRGB; for src=tgt=sRGB the as-applied transform is
+    // inv(S)*Memit*S. The emitted matrix must therefore reconstruct the intended RGB->RGB gamut map
+    // inv(displayToXYZ)*srcToXYZ once that wrap is undone. (Regression guard for the basis conjugation.)
+    float mhc[12];
+    ComputeMHC2Matrix(kSRGB, kP3D65, false, mhc);  // SDR sRGB->P3 gamut map
+    float Memit[9]; tExtract3x3(mhc, Memit);
+
+    float S[9], Sinv[9];
+    REQUIRE(tBuildRGBtoXYZ(kSRGB, S));     // S = sRGB@D65 NPM (the spec-mandated wrap basis)
+    REQUIRE(MatInv3(S, Sinv));
+    float tmp[9], applied[9];
+    tMatMul3(Sinv, Memit, tmp);            // inv(S) * Memit
+    tMatMul3(tmp, S, applied);             // (inv(S)*Memit) * S  == as Windows applies it
+
+    float pDisp[9], pDispInv[9], pSrc[9], intended[9];
+    REQUIRE(tBuildRGBtoXYZ(kP3D65, pDisp));
+    REQUIRE(MatInv3(pDisp, pDispInv));
+    REQUIRE(tBuildRGBtoXYZ(kSRGB, pSrc));
+    tMatMul3(pDispInv, pSrc, intended);    // intended RGB->RGB transform
+
+    for (int i = 0; i < 9; i++)
+        CHECK(applied[i] == doctest::Approx(intended[i]).epsilon(2e-3));
+    // The emitted matrix is genuinely in the XYZ basis, not the raw RGB->RGB matrix.
+    CHECK(std::fabs(Memit[0] - intended[0]) > 1e-3f);
+}
+
+TEST_CASE("MHC2 matrix: HDR emitted directly (NOT XYZ-basis conjugated)") {
+    // The basis conjugation is SDR-only (!isHDR guard). HDR must keep emitting the direct RGB->RGB
+    // form inv(displayToXYZ)*srcToXYZ (near-diagonal white-only in production; conjugating it would
+    // inject ~0.016 white error). Pins the guard so a future "generalize to HDR" can't slip in blind.
+    float mhc[12];
+    ComputeMHC2Matrix(kBT2020, kP3D65, true, mhc);  // HDR, non-identity
+    float Memit[9]; tExtract3x3(mhc, Memit);
+
+    float pDisp[9], pDispInv[9], pSrc[9], intended[9];
+    REQUIRE(tBuildRGBtoXYZ(kP3D65, pDisp));
+    REQUIRE(MatInv3(pDisp, pDispInv));
+    REQUIRE(tBuildRGBtoXYZ(kBT2020, pSrc));
+    tMatMul3(pDispInv, pSrc, intended);
+
+    for (int i = 0; i < 9; i++)
+        CHECK(Memit[i] == doctest::Approx(intended[i]).epsilon(2e-3));
 }
 
 // ============================================================================
@@ -1751,20 +1831,29 @@ TEST_CASE("MHC2 matrix: white balance gains identity") {
     }
 }
 
-TEST_CASE("MHC2 matrix: white balance gains scale output") {
+TEST_CASE("MHC2 matrix: white balance gains scale the as-applied white response") {
+    // Post-fix the emitted SDR matrix is in the sRGB XYZ basis (S*intended*inv(S)), so its raw rows
+    // are NOT the white response — the gains are a clean diagonal only AFTER Windows' inv(S)*..*S
+    // wrap. With src==display==sRGB the as-applied transform is exactly diag(gains).
     float mhc[12];
     float gains[3] = { 1.1f, 1.0f, 0.9f };
     ComputeMHC2Matrix(kSRGB, kSRGB, false, mhc, gains);
-    // White input (1,1,1) → output: sum of each matrix row
-    float outR = mhc[0] + mhc[1] + mhc[2];
-    float outG = mhc[4] + mhc[5] + mhc[6];
-    float outB = mhc[8] + mhc[9] + mhc[10];
-    // R gain > 1.0 → red boosted
-    CHECK(outR > 1.0f);
-    // G gain = 1.0 → green near 1.0
-    CHECK(outG == doctest::Approx(1.0f).epsilon(0.01));
-    // B gain < 1.0 → blue reduced
-    CHECK(outB < 1.0f);
+    float Memit[9]; tExtract3x3(mhc, Memit);
+
+    float S[9], Sinv[9];
+    REQUIRE(tBuildRGBtoXYZ(kSRGB, S));
+    REQUIRE(MatInv3(S, Sinv));
+    float tmp[9], applied[9];
+    tMatMul3(Sinv, Memit, tmp);
+    tMatMul3(tmp, S, applied);
+
+    float white[3] = { 1.0f, 1.0f, 1.0f };
+    float outv[3]; MatVecMul3(applied, white, outv);
+    CHECK(outv[0] == doctest::Approx(1.1f).epsilon(2e-3));  // R gain
+    CHECK(outv[1] == doctest::Approx(1.0f).epsilon(2e-3));  // G gain
+    CHECK(outv[2] == doctest::Approx(0.9f).epsilon(2e-3));  // B gain
+    // The emitted matrix itself is non-diagonal (carries the basis conjugation).
+    CHECK(std::fabs(Memit[1]) + std::fabs(Memit[2]) > 1e-3f);
 }
 
 TEST_CASE("MHC2 matrix: white balance + primaries combined") {
