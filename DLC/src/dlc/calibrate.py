@@ -89,6 +89,7 @@ from .engine.patches import (
     uniform_levels,
 )
 from .events import Ev, EventWriter, RunLog
+from .keep_awake import keep_awake
 from .liveness import Liveness, RunCancelled, RunStalled
 from .measure_loop import (
     MeasureFn,
@@ -2480,6 +2481,16 @@ class Calibration:
 
     def stage_measure(self, *, role: str, patches: Sequence[tuple[int, int, int]],
                       ti3_name: str, ndjson_name: str) -> StageOutcome:
+        # Assert the keep-awake around EVERY measure stage (not just the whole-run wrap in
+        # run()) so a direct stage_measure / partial-flow caller — and any compute gap right
+        # before this read — can't let the box sleep mid-measure. Reentrant: when run() already
+        # holds it this is a cheap no-op; released here (incl. on a seam abort) regardless.
+        with keep_awake(reason=f"dlc measure ({role})"):
+            return self._stage_measure(role=role, patches=patches,
+                                       ti3_name=ti3_name, ndjson_name=ndjson_name)
+
+    def _stage_measure(self, *, role: str, patches: Sequence[tuple[int, int, int]],
+                       ti3_name: str, ndjson_name: str) -> StageOutcome:
         key = f"measure:{role}"
 
         def run() -> StageOutcome:
@@ -3781,8 +3792,16 @@ class Calibration:
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
         if self._enable_watchdog:
             self.liveness.start()   # backstop thread (live runs only; tests don't spin threads)
+        # Own our own keep-awake for the WHOLE run (not just the measure stages): the
+        # compute-bound 3D-LUT build phase presents no patch, so the fullscreen presenter
+        # can't be relied on to hold the display lock there — a gap that on this rig's
+        # aggressive power plan (display off 5 min, sleep 15 min) blanks the panel mid-run
+        # and corrupts the next read. Released in finally (incl. on a seam abort) so the
+        # request never leaks past the run; no-op on non-Windows. stage_measure asserts it
+        # again per-stage (reentrant) as defence-in-depth for direct/partial-flow callers.
         try:
-            return self._run_flow(flow)
+            with keep_awake(reason=f"dlc calibration run ({flow})"):
+                return self._run_flow(flow)
         finally:
             if self._enable_watchdog:
                 self.liveness.stop()

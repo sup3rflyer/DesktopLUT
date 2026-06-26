@@ -2031,6 +2031,56 @@ def test_supervised_full_flow_completes_without_pausing(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# Keep-awake: the spine must own the system/display power request itself (no
+# dependence on Resolve holding the lock or the user's power plan) — asserted
+# around every measure stage and released even when the stage aborts at a seam.
+# ---------------------------------------------------------------------------
+
+def test_stage_measure_holds_keep_awake_around_the_read(tmp_path: Path, monkeypatch):
+    from dlc import keep_awake as ka
+
+    calls: list[int] = []
+    monkeypatch.setattr(ka, "_depth", 0)
+    monkeypatch.setattr(ka, "_set_execution_state", lambda flags: (calls.append(flags), True)[1])
+
+    calib = _make(tmp_path, "kawake")
+    # The keep-awake must be HELD while the measurement runs (the read is where a sleeping
+    # box corrupts data). Capture is_active() from inside the mocked stage body.
+    held_during_read: list[bool] = []
+
+    def fake_stage(key, run):
+        held_during_read.append(ka.is_active())
+        return StageOutcome(key, "done",
+                            digest={}, data={"ti3": None, "ndjson": None, "needs_adjudication": False})
+
+    monkeypatch.setattr(calib, "_stage", fake_stage)
+
+    assert not ka.is_active()
+    calib.stage_measure(role="raw", patches=[(0, 0, 0)], ti3_name="r.ti3", ndjson_name="r.ndjson")
+
+    assert held_during_read == [True]          # acquired around the read
+    assert not ka.is_active()                  # released after the stage returns
+    assert calls[0] == ka.ES_CONTINUOUS | ka.ES_SYSTEM_REQUIRED | ka.ES_DISPLAY_REQUIRED
+    assert calls[-1] == ka.ES_CONTINUOUS       # last call cleared the request
+
+
+def test_stage_measure_releases_keep_awake_on_a_seam_abort(tmp_path: Path, monkeypatch):
+    # A measure stage that aborts at a seam (here, the foundation collapse) must STILL release
+    # the keep-awake — the request can't leak past a pause/abort.
+    from dlc import keep_awake as ka
+
+    monkeypatch.setattr(ka, "_depth", 0)
+    monkeypatch.setattr(ka, "_set_execution_state", lambda flags: True)
+
+    calib = _make(tmp_path, "kawake_abort")
+    _drive_post_mhc_collapse(calib, monkeypatch)
+    with pytest.raises(CalibrationAborted):
+        calib.stage_measure(role="post-mhc", patches=[(0, 0, 0)],
+                            ti3_name="p.ti3", ndjson_name="p.ndjson")
+    assert not ka.is_active()
+
+
+# ---------------------------------------------------------------------------
 # Audit follow-ups: HDR foundation reference (false-positive fix), the verify
 # gate escalating any quality-gate failure under supervised, and the foundation
 # seam no longer offering an unhonoured "retry".
