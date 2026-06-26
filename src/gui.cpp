@@ -50,10 +50,12 @@ const GUID GUID_CONSOLE_DISPLAY_STATE_GUI =
 // Start overlay/processing for MHC live preview if not already running.
 // Sets livePreview=true if monitor mode matches isHDR, and sets the
 // startedForPreview / startedOverlayForPreview flags accordingly.
-static void EnsureProcessingForPreview(int monIdx, bool isHDR,
-                                       bool& livePreview,
-                                       bool& startedForPreview,
-                                       bool& startedOverlayForPreview) {
+// Declared in gui_mhc.h so the calibration IPC server can drive the same
+// live-edit preview the MHC grayscale editor uses (grayscale_live_begin).
+void EnsureProcessingForPreview(int monIdx, bool isHDR,
+                                bool& livePreview,
+                                bool& startedForPreview,
+                                bool& startedOverlayForPreview) {
     livePreview = false;
     startedForPreview = false;
     startedOverlayForPreview = false;

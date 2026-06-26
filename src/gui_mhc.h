@@ -8,6 +8,16 @@
 
 struct MHCSettings;
 
+// Start overlay/processing for MHC live preview if not already running (defined
+// in gui.cpp). Sets livePreview=true only when the running monitor's mode matches
+// isHDR; startedForPreview / startedOverlayForPreview report what this call spun up
+// so the caller can tear it back down. Drives the correction-grayscale live editor
+// from both the GUI and the calibration IPC server.
+void EnsureProcessingForPreview(int monIdx, bool isHDR,
+                                bool& livePreview,
+                                bool& startedForPreview,
+                                bool& startedOverlayForPreview);
+
 // Update MHC flags on the running MonitorContext
 void UpdateMhcFlagsLive(int monitorIndex);
 
