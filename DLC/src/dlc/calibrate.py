@@ -92,6 +92,7 @@ from .events import Ev, EventWriter, RunLog
 from .keep_awake import keep_awake
 from .liveness import Liveness, RunCancelled, RunStalled
 from .measure_loop import (
+    IncrementalMeasureSession,
     MeasureFn,
     MeasureLoopConfig,
     MeasurePatch,
@@ -805,6 +806,7 @@ class Calibration:
         "adaptive-planning": ("Adaptive planning", False),
         "measure:post-mhc": ("Measure · post-MHC", True),
         "build-install-3dlut": ("Build + install 3D LUT", True),
+        "grayscale-wb": ("Grayscale touch-up", True),
         "measure:verify": ("Measure · verify", True),
         "verify": ("Verify + report", False),
     }
@@ -829,6 +831,8 @@ class Calibration:
             "3dlut-only": ["preflight", "resolve-target", "whitepoint", "hardware-readiness",
                            "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
                            "measure:verify", "verify"],
+            "grayscale-wb": ["preflight", "resolve-target", "whitepoint", "hardware-readiness",
+                             "grayscale-wb", "measure:verify", "verify"],
             "build-correction": ["preflight", "clear-native", "probe-match"],
         }
         keys = seqs.get(flow or "", [])
@@ -1087,8 +1091,11 @@ class Calibration:
         ck = f"{self.monitor}:{self.mode}"
         try:
             state = self.controller.state()
-            cube = ((state.get("runtime") or {}).get(ck) or {}).get("cube_path")
-            record: dict[str, Any] = {"captured": True, "cube_path": cube}
+            runtime = ((state.get("runtime") or {}).get(ck) or {})
+            cube = runtime.get("cube_path")
+            tweak = runtime.get("grayscale_tweak")
+            record: dict[str, Any] = {"captured": True, "cube_path": cube,
+                                      "grayscale_tweak": tweak}
         except Exception as exc:  # noqa: BLE001 - a down pipe shouldn't crash the flow
             record = {"captured": False, "error": f"{type(exc).__name__}: {exc}"}
         self.calib["inplace_baseline"] = record
@@ -1103,6 +1110,27 @@ class Calibration:
         ``revert_unavailable``)."""
         baseline = self.calib.get("inplace_baseline") or {}
         flow = self.calib.get("flow")
+        if flow == "grayscale-wb" and baseline.get("captured"):
+            prev_tweak = baseline.get("grayscale_tweak")
+            try:
+                if prev_tweak:
+                    self.controller.set_grayscale_tweak(
+                        self.monitor, self.mode,
+                        int(prev_tweak.get("point_count") or len(prev_tweak.get("points") or [])),
+                        list(prev_tweak.get("points") or []),
+                        dict(prev_tweak.get("deviations") or {}),
+                        luminance=(list(prev_tweak.get("luminance") or [])
+                                   if prev_tweak.get("luminance") is not None else None),
+                        rgb=(dict(prev_tweak.get("rgb") or {})
+                             if prev_tweak.get("rgb") is not None else None),
+                    )
+                    self.ctx.log("reverted: restored the previous Grayscale correction")
+                else:
+                    self.controller.disable_grayscale_tweak(self.monitor, self.mode)
+                    self.ctx.log("reverted: disabled Grayscale correction (none was enabled before this run)")
+                return "reverted"
+            except Exception as exc:  # noqa: BLE001 - fall through to manual-backup guidance
+                self.ctx.log(f"grayscale touch-up revert failed ({type(exc).__name__}: {exc}); see settings backup")
         if flow == "3dlut-only" and baseline.get("captured"):
             prev = baseline.get("cube_path")
             try:
@@ -3546,6 +3574,210 @@ class Calibration:
                 digest=outcome.digest))
         return outcome
 
+    def stage_grayscale_wb_touchup(self, *, target_de: float = 0.6,
+                                   max_rounds_per_point: int = 6) -> StageOutcome:
+        """Patch-by-patch Corrections-tab Grayscale touch-up.
+
+        This is the user-facing editor automation pass: disable the current user
+        Grayscale correction, measure one grey point, nudge its luminance/RGB
+        sliders, re-measure that same point, then move to the next point. It
+        tunes the active constants in place (MHC-only or MHC+3D-LUT) and leaves
+        the resulting user correction toggleable in DesktopLUT.
+        """
+        def run() -> StageOutcome:
+            from .grayscale_wb import (
+                GrayTouchupConfig,
+                GrayTouchupPatch,
+                identity_payload,
+                point_error,
+                summarize_errors,
+                update_point,
+            )
+
+            patches = self._grayscale_wb_patches()
+            if not patches:
+                return StageOutcome("grayscale-wb", "done",
+                                    digest={"skipped": True, "reason": "no grayscale patches"})
+            points = [i / (len(patches) - 1) if len(patches) > 1 else 1.0
+                      for i in range(len(patches))]
+            payload = identity_payload(points)
+            transfer = self._transfer()
+            spec = self._spec()
+            cfg = GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma))
+
+            # Measure the constants, not the previously enabled user touch-up. This mirrors
+            # the operator turning the Corrections > Grayscale checkbox off before retuning.
+            self.controller.disable_grayscale_tweak(self.monitor, self.mode)
+
+            has_3dlut = bool(self._active_runtime_cube())
+            dip = self._dip()
+            loop_cfg = self.loop_config or self._loop_config_for(dip)
+            self.liveness.set_stall_after(self._liveness_threshold(dip))
+            session = IncrementalMeasureSession(
+                patches=patches,
+                transfer=transfer,
+                measure=self.measure,
+                config=loop_cfg,
+                ndjson_path=self.ctx.root / "measurements" / "grayscale_wb.ndjson",
+                runlog=self.runlog,
+                liveness=self.liveness,
+                dip=dip,
+                checkin_interval_s=self._checkin_interval_s,
+            )
+            session_start = session.start()
+            if session_start.get("panel_dark"):
+                return StageOutcome(
+                    "grayscale-wb", "done",
+                    digest={"message": "panel appears dark/asleep during Grayscale touch-up warmup",
+                            "measurement_compromised": True, **session_start},
+                    data={"payload": payload})
+
+            per_point: list[dict[str, Any]] = []
+            before_errors: list[dict[str, Any]] = []
+            after_errors: list[dict[str, Any]] = []
+            all_updates: list[dict[str, Any]] = []
+            any_capped = False
+            any_large = False
+            any_large_y = False
+            any_unsettled = False
+
+            for idx, patch in enumerate(patches):
+                target_y = transfer.cv_to_nits(patch[0])
+                point_log: dict[str, Any] = {
+                    "index": idx,
+                    "point": round(points[idx], 6),
+                    "code": int(patch[0]),
+                    "target_Y": round(target_y, 5),
+                    "rounds": [],
+                }
+                latest_error: dict[str, Any] | None = None
+                for rnd in range(1, max_rounds_per_point + 1):
+                    try:
+                        accepted = session.measure_index(idx)
+                    except RuntimeError as exc:
+                        point_log["rounds"].append({"round": rnd, "error": str(exc)})
+                        any_unsettled = True
+                        break
+                    if not accepted.usable:
+                        point_log["rounds"].append({"round": rnd, "unusable": True,
+                                                    "note": accepted.note})
+                        any_unsettled = True
+                        break
+                    gpatch = GrayTouchupPatch(level=points[idx], measured_xyz=tuple(accepted.xyz),
+                                              target_y=target_y)
+                    latest_error = point_error(gpatch, cfg)
+                    if rnd == 1:
+                        before_errors.append(latest_error)
+                    point_log["rounds"].append({"round": rnd, **latest_error})
+                    y_tol = max(0.15, target_y * 0.01)
+                    if (latest_error["de2000"] <= target_de
+                            and abs(latest_error["delta_Y"]) <= y_tol):
+                        break
+                    if rnd >= max_rounds_per_point:
+                        any_unsettled = True
+                        break
+                    payload, upd = update_point(payload, idx, gpatch, cfg)
+                    self.controller.set_grayscale_tweak(
+                        self.monitor, self.mode, payload["point_count"], payload["points"],
+                        payload["deviations"], luminance=payload["luminance"], rgb=payload["rgb"])
+                    point_log["rounds"][-1]["update"] = upd
+                    all_updates.append(upd)
+                    any_capped = any_capped or bool(upd.get("capped"))
+                    any_large = any_large or bool(upd.get("large_correction"))
+                    any_large_y = any_large_y or bool(upd.get("large_luminance_correction"))
+                    if upd.get("capped"):
+                        any_unsettled = True
+                        break
+                if latest_error is not None:
+                    after_errors.append(latest_error)
+                per_point.append(point_log)
+                self._last_refine = {
+                    "stage": "grayscale-wb",
+                    "point": idx + 1,
+                    "points": len(patches),
+                    "latest": latest_error,
+                    "capped": any_capped,
+                    "large_correction": any_large,
+                }
+                self._maybe_timed_checkin("grayscale-wb")
+
+            session_digest = session.finish()
+
+            # Ensure the final table is installed even if every point was already within target.
+            self.controller.set_grayscale_tweak(
+                self.monitor, self.mode, payload["point_count"], payload["points"],
+                payload["deviations"], luminance=payload["luminance"], rgb=payload["rgb"])
+            self.calib["grayscale_wb_touchup"] = payload
+            self._state["grayscale_wb_touchup"] = payload
+            self._save()
+
+            max_abs_delta = max(
+                [abs(v - 1.0) for col in payload["deviations"].values() for v in col] or [0.0])
+            max_lum_delta = max([abs(v - 1.0) for v in payload["luminance"]] or [0.0])
+            digest = {
+                "point_count": payload["point_count"],
+                "mode": self.mode,
+                "stack": "mhc+3dlut" if has_3dlut else "mhc-only",
+                "hdr_peak_code": (patches[-1][0] if self._spec().is_hdr else None),
+                "target_de2000": target_de,
+                "max_rounds_per_point": max_rounds_per_point,
+                "before": summarize_errors(before_errors),
+                "after": summarize_errors(after_errors),
+                "max_abs_deviation": round(max_abs_delta, 6),
+                "max_abs_luminance": round(max_lum_delta, 6),
+                "large_correction": any_large,
+                "large_luminance_correction": any_large_y,
+                "capped": any_capped,
+                "unsettled": any_unsettled,
+                "session": session_digest,
+                "measurement_compromised": bool(session_digest.get("needs_adjudication")),
+                "compromised": bool(any_capped or (has_3dlut and any_large_y)
+                                    or session_digest.get("needs_adjudication")),
+                "per_point": per_point,
+                "updates": all_updates,
+            }
+            return StageOutcome("grayscale-wb", "done", digest=digest, data={"payload": payload})
+
+        outcome = self._stage("grayscale-wb", run)
+        if outcome.digest.get("measurement_compromised"):
+            decision = self.adjudicate(AdjudicationRequest(
+                key="grayscale-wb:measurement", seam=SEAM_MEASURE, stage="grayscale-wb",
+                question=("the Grayscale touch-up measurement session had warmup/drift/preheat "
+                          "evidence that may compromise the patch edits; accept the touch-up, "
+                          "or abort and rerun after the panel settles?"),
+                options=("accept", "abort"), recommendation="abort",
+                digest=outcome.digest))
+            if decision.choice == "abort":
+                self._revert_inplace()
+                raise CalibrationAborted(StageOutcome(
+                    "grayscale-wb", "aborted",
+                    digest={"message": "aborted on Grayscale touch-up measurement session",
+                            "decision_note": decision.note, **outcome.digest}))
+        if outcome.digest.get("large_correction") or outcome.digest.get("capped"):
+            recommendation = "abort" if outcome.digest.get("capped") else "accept"
+            decision = self.adjudicate(AdjudicationRequest(
+                key="grayscale-wb:touchup-size", seam=SEAM_OPTIMIZE, stage="grayscale-wb",
+                question=("the Grayscale correction is large enough to risk invalidating the "
+                          "current constants/3D LUT; accept this touch-up, or abort and redo "
+                          "the calibration constants instead?"),
+                options=("accept", "abort"), recommendation=recommendation,
+                digest=outcome.digest))
+            if decision.choice == "abort":
+                self._revert_inplace()
+                raise CalibrationAborted(StageOutcome(
+                    "grayscale-wb", "aborted",
+                    digest={"message": "aborted on large Grayscale touch-up",
+                            "decision_note": decision.note, **outcome.digest}))
+        return outcome
+
+    def _active_runtime_cube(self) -> Optional[str]:
+        try:
+            state = self.controller.state()
+            key = f"{self.monitor}:{self.mode}"
+            return (((state.get("runtime") or {}).get(key) or {}).get("cube_path") or None)
+        except Exception:  # noqa: BLE001 - advisory, never block a touch-up
+            return None
+
     def _cube_optimize_config(self) -> OptimizeConfig:
         """The 3D-LUT correction config, with a MODE-AWARE correction-budget ceiling.
 
@@ -3876,6 +4108,8 @@ class Calibration:
                 return self._flow_mhc_only()
             if flow == "3dlut-only":
                 return self._flow_3dlut_only()
+            if flow == "grayscale-wb":
+                return self._flow_grayscale_wb()
             if flow == "build-correction":
                 return self._flow_build_correction()
             if flow == "characterize":
@@ -3949,6 +4183,9 @@ class Calibration:
     def _neutral_patches(self) -> list[tuple[int, int, int]]:
         return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
                                  max_cv=self._patch_max_cv())
+
+    def _grayscale_wb_patches(self) -> list[tuple[int, int, int]]:
+        return build_grayscale_wb_set(self.patch_sizes, self._transfer(), max_cv=self._patch_max_cv())
 
     def _verify_patches(self, *, gamut_aware: bool = True) -> list[tuple[int, int, int]]:
         # The "cover all bases" QC set (see build_verify_set): dense grey/PQ + shadow toe, colour
@@ -4088,6 +4325,19 @@ class Calibration:
         self.stage_verify(ver.data["ti3"])
         return self._finish()
 
+    def _flow_grayscale_wb(self) -> CalibrationResult:
+        self.stage_preflight()
+        self.stage_resolve_target()
+        self.stage_whitepoint()
+        self._require_stack(need_mhc=True, need_lut=False)
+        self._capture_inplace_baseline()
+        self.stage_hardware_readiness()
+        self.stage_grayscale_wb_touchup()
+        ver = self.stage_measure(role="verify", patches=self._grayscale_wb_patches(),
+                                 ti3_name="verify.ti3", ndjson_name="verify.ndjson")
+        self.stage_verify(ver.data["ti3"])
+        return self._finish()
+
     def _flow_build_correction(self) -> CalibrationResult:
         """Mint (refresh) the colorimeter correction via ccxxmake, standalone — run this
         BEFORE a calibration when the correction is stale/missing (the calibration's meter
@@ -4213,6 +4463,7 @@ FLOWS: dict[str, str] = {
     "full": "neutral → raw → MHC + D65 grayscale refine → post-MHC → 3D LUT → verify → report",
     "mhc-only": "raw → MHC (matrix + 1D + D65 grayscale refine) → verify → report (ICC only; no 3D LUT — shakedown)",
     "3dlut-only": "verify MHC present → measure → 3D LUT → verify → report",
+    "grayscale-wb": "verify MHC present -> patch-by-patch user Grayscale correction -> grey-ramp verify",
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
     "hdr": "(post-v1) Rec.2020/PQ — SDR-first in v1",
@@ -4609,6 +4860,21 @@ def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 
+def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
+                           warm_tau: Optional[int] = None,
+                           max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The Corrections-tab grayscale editor grid for the ``grayscale-wb`` touch-up.
+
+    SDR spans the full signal range. HDR spans the user's active peak: ``max_cv`` is
+    the PQ code for that peak, and the editor's 10/20/32 points distribute across
+    that code range (matching DesktopLUT's HDR Grayscale dialog).
+    """
+    cap = max_cv if max_cv is not None else transfer.max_cv
+    n = 32
+    levels = uniform_levels(n, cap)
+    return [(v, v, v) for v in levels]
+
+
 def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
                      warm_tau: Optional[int] = None,
                      max_cv: Optional[int] = None,
@@ -4651,9 +4917,11 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
     "full": ("raw", "post-mhc", "verify"),
     "mhc-only": ("raw", "verify"),
     "3dlut-only": ("post-mhc", "verify"),
+    "grayscale-wb": ("grayscale-wb", "grayscale-wb-verify"),
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
-                   "post-mhc": build_volumetric_set, "verify": build_verify_set}
+                   "post-mhc": build_volumetric_set, "grayscale-wb": build_grayscale_wb_set,
+                   "grayscale-wb-verify": build_grayscale_wb_set, "verify": build_verify_set}
 
 
 def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,

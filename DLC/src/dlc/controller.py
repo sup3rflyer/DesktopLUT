@@ -240,6 +240,9 @@ class CalibrationController:
         point_count: int,
         points: list[float],
         deviations: dict[str, list[float]],
+        *,
+        luminance: list[float] | None = None,
+        rgb: dict[str, list[float]] | None = None,
     ) -> dict[str, Any]:
         """Set the runtime OVERLAY grayscale tweak (the Corrections-tab shader layer, NOT the
         MHC grayscale — see ../docs/NAMING.md §2). Applied live without an ICC re-bake.
@@ -256,6 +259,8 @@ class CalibrationController:
                 "grayscale_tweak": {
                     "point_count": int(point_count),
                     "points": [float(p) for p in points],
+                    **({"luminance": [float(v) for v in luminance]} if luminance is not None else {}),
+                    **({"rgb": _coerce_deviations(rgb)} if rgb is not None else {}),
                     "deviations": _coerce_deviations(deviations),
                 },
             },

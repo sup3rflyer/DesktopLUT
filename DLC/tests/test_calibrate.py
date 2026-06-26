@@ -43,6 +43,7 @@ from dlc.calibrate import (
     SupervisedAdjudicator,
     apply_set_hdr,
     build_neutral_set,
+    build_grayscale_wb_set,
     build_ramp_set,
     build_verify_set,
     build_volumetric_set,
@@ -697,6 +698,42 @@ def test_mhc_only_flow_is_icc_only(tmp_path: Path):
     assert "refine-mhc-grayscale" in result.stages
     assert "refine-mhc-cube" not in result.stages
     assert result.stages[-1] == "verify"
+
+
+def test_grayscale_wb_flow_is_standalone_mhc_only_touchup(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
+                                  "bx": 0.15, "by": 0.06})
+    ctrl.apply_mhc(0, "SDR")
+    calib = _make(tmp_path, "gray_wb", controller=ctrl)
+
+    result = calib.run("grayscale-wb")
+
+    assert result.status == "completed"
+    assert "grayscale-wb" in result.stages
+    assert "build-install-mhc" not in result.stages
+    assert "build-install-3dlut" not in result.stages
+    digest = calib.calib["stages"]["grayscale-wb"]["digest"]
+    assert digest["session"]["warm"] is True
+    assert digest["session"]["warmup_reads"] > 0
+    assert digest["session"]["drift_checkpoints"] > 0
+    runtime = ctrl.state()["runtime"]["0:SDR"]
+    tweak = runtime["grayscale_tweak"]
+    assert tweak["point_count"] == 32
+    assert len(tweak["luminance"]) == 32
+    assert tweak["deviations"]["r"] == pytest.approx([1.0] * 32)
+
+
+def test_grayscale_wb_hdr_points_are_capped_to_user_peak():
+    transfer = Transfer.pq(bit_depth=10)
+    peak_cv = transfer.nits_to_cv(1600.0)
+
+    patches = build_grayscale_wb_set(PatchSizes(), transfer, max_cv=peak_cv)
+
+    assert len(patches) == 32
+    assert patches[0] == (0, 0, 0)
+    assert patches[-1] == (peak_cv, peak_cv, peak_cv)
+    assert peak_cv < transfer.max_cv
 
 
 def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
@@ -2335,7 +2372,7 @@ def test_auto_is_refused_on_a_live_measuring_run():
     # always wires a real meter, so a measuring flow with --auto is the forbidden autonomous HW run.
     from types import SimpleNamespace
     from dlc.calibrate import _auto_on_live_measuring_run as forbidden
-    for flow in ("full", "mhc-only", "3dlut-only"):
+    for flow in ("full", "mhc-only", "3dlut-only", "grayscale-wb"):
         assert forbidden(SimpleNamespace(auto=True, abort=False, flow=flow)) is True
     # Exempt: build-correction is operator-driven (no autonomous spotread); --abort just reverts.
     assert forbidden(SimpleNamespace(auto=True, abort=False, flow="build-correction")) is False

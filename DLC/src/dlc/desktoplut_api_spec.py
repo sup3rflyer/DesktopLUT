@@ -243,9 +243,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                     "object",
                     description=(
                         "Grayscale payload {point_count:int, points:[ascending [0,1]], "
-                        "deviations:{r:[],g:[],b:[]} multiplicative, centered at 1.0}. The "
-                        "per-channel deviations carry both grayscale tracking (their shape) "
-                        "and white balance (their DC component)."
+                        "luminance:[] optional common slider, rgb:{r:[],g:[],b:[]} optional "
+                        "balance sliders, deviations:{r:[],g:[],b:[]} composed multiplicative "
+                        "values centered at 1.0}. The composed deviations carry both grayscale "
+                        "tracking (their shape) and white balance (their DC component)."
                     ),
                 ),
             },
@@ -352,4 +353,3 @@ def write_desktoplut_api_spec(output: Path) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(spec, indent=2), encoding="utf-8")
     return spec
-

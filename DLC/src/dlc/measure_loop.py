@@ -63,6 +63,7 @@ __all__ = [
     "MeasureLoopConfig",
     "AcceptedRead",
     "MeasureLoopResult",
+    "IncrementalMeasureSession",
     "run_measure_loop",
     "biased_neutral",
     "write_ti3",
@@ -1682,6 +1683,124 @@ class _Loop:
 
     def ordered_accepted(self) -> list[AcceptedRead]:
         return sorted(self.accepted.values(), key=lambda r: r.patch.seq)
+
+
+class IncrementalMeasureSession:
+    """A persistent measurement loop for interactive patch-by-patch workflows.
+
+    ``run_measure_loop`` owns ordinary batch measurement. The Grayscale touch-up
+    flow needs a different rhythm: warm/preheat once, measure a point, let the
+    caller mutate DesktopLUT's editor state, re-measure the same point, then move
+    on. This wrapper reuses the same private ``_Loop`` so the warm reference,
+    drift checkpoints, adaptive neutral interval, and rewarm behavior stay
+    continuous across those caller-driven reads.
+    """
+
+    def __init__(
+        self,
+        *,
+        patches: Sequence[Patch],
+        transfer: Transfer,
+        measure: MeasureFn,
+        config: Optional[MeasureLoopConfig] = None,
+        ndjson_path: Optional[Path] = None,
+        events: Optional[EventWriter] = None,
+        runlog: Optional[RunLog] = None,
+        liveness: Optional[Liveness] = None,
+        dip: Optional[DisplayInstrumentProfile] = None,
+        checkin_interval_s: float = 0.0,
+    ) -> None:
+        self.cfg = config or MeasureLoopConfig()
+        self.ndjson = _NdjsonWriter(ndjson_path)
+        self.loop = _Loop(
+            patches=patches,
+            transfer=transfer,
+            measure=measure,
+            config=self.cfg,
+            ndjson=self.ndjson,
+            events=events,
+            runlog=runlog,
+            liveness=liveness,
+            dip=dip,
+            checkin_interval_s=checkin_interval_s,
+        )
+        self.preheat_digest: Optional[dict[str, Any]] = None
+        self.preheat_compromised = False
+        self.started = False
+        self.measure_count = 0
+        self.pending: list[str] = []
+        self._warmup_patch: Optional[MeasurePatch] = None
+
+    def start(self) -> dict[str, Any]:
+        if self.started:
+            return self.digest()
+        self.preheat_digest = self.loop.preheat()
+        self.preheat_compromised = bool(self.preheat_digest and self.preheat_digest.get("compromised"))
+        self.loop.warm_up()
+        self._warmup_patch = self.loop._warmup_patch()
+        self.started = True
+        return self.digest()
+
+    def measure_index(self, index: int) -> AcceptedRead:
+        if not self.started:
+            self.start()
+        if self.loop.panel_dark:
+            raise RuntimeError("panel dark during incremental measurement session")
+        patch = self.loop.patches[index]
+        self.loop.measure_patch(patch, phase="main")
+        accepted = self.loop.accepted[patch.label]
+        self.pending.append(patch.label)
+        self.measure_count += 1
+        self.loop._maybe_checkin(min(self.measure_count, max(1, len(self.loop.patches))))
+        interval = self.loop.neutral_interval_current
+        if interval > 0 and self.measure_count % interval == 0 and self._warmup_patch is not None:
+            self.loop._neutral_checkpoint(self._warmup_patch, self.pending,
+                                          patch_index=self.measure_count)
+        return accepted
+
+    def finish(self) -> dict[str, Any]:
+        if self.started and self.pending and self._warmup_patch is not None:
+            self.loop._neutral_checkpoint(self._warmup_patch, self.pending,
+                                          final=True, patch_index=self.measure_count)
+        # In a caller-mutated session, a drift episode means the prior editor
+        # measurements may no longer describe the same display state. Keep the
+        # evidence instead of silently appending re-measures under different
+        # correction settings; the caller/LLM adjudicates from this digest.
+        return self.digest()
+
+    def digest(self) -> dict[str, Any]:
+        drift_summary = self.loop._recent_drift_summary()
+        needs_adjudication = (
+            self.loop.panel_dark
+            or self.preheat_compromised
+            or self.loop.measurement_path_compromised
+            or (not self.loop.warm)
+            or self.loop.remeasure_budget_exceeded
+            or self.loop.drift_density_exceeded
+            or self.loop.drift_episodes > 0
+        )
+        return {
+            "warm": self.loop.warm,
+            "preheat_compromised": self.preheat_compromised,
+            "panel_dark": self.loop.panel_dark,
+            "dark_reference_nits": (round(self.loop.dark_reference_nits, 4)
+                                    if self.loop.dark_reference_nits is not None else None),
+            "warmup_reads": self.loop.warmup_reads,
+            "reference_xyz": [round(c, 4) for c in self.loop.reference_xyz] if self.loop.reference_xyz else None,
+            "read_count": self.loop.seq_counter,
+            "patch_measurements": self.measure_count,
+            "drift_episodes": self.loop.drift_episodes,
+            "drift_checkpoints": drift_summary["checkpoints"],
+            "drift_recent_repeats": drift_summary["recent_repeats"],
+            "drift_repeat_density": drift_summary["repeat_density"],
+            "drift_regime": self.loop.drift_regime,
+            "drift_density_exceeded": self.loop.drift_density_exceeded,
+            "neutral_interval_initial": self.cfg.neutral_interval,
+            "neutral_interval_final": self.loop.neutral_interval_current,
+            "neutral_interval_adjustments": self.loop.neutral_interval_adjustments,
+            "preheat": self.preheat_digest,
+            "needs_adjudication": needs_adjudication,
+        }
 
 
 def run_measure_loop(

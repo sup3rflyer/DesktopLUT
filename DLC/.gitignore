@@ -55,6 +55,6 @@ docs/audit-2026-06-19/
 # (the public face is README + CHANGELOG + code; no panel/user data leaves the box).
 CLAUDE.md
 AGENTS.md
-CODEX_LUT_ENGINE_PROMPT.md
+CODEX_*.md
 .claude/
 
