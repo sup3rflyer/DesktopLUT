@@ -104,6 +104,11 @@ class DegenerateMeasurements(Exception):
 # measured absolute XYZ (N, 3). The cube is sampled by the machine, so the probe
 # is "raw" — it never knows about the LUT.
 ProbeFn = Callable[[np.ndarray], np.ndarray]
+# Optional re-scorer for the LLM/user-facing numbers ONLY: (signal_rgb, measured_xyz) -> per-patch
+# dE in the REPORT metric. The cube always CONVERGES in dE_ITP (the perceptually-uniform space the
+# RBF inverts); this just relabels the surfaced digest/curve so an SDR run never shows dE_ITP as if it
+# were CIEDE2000. ``None`` ⇒ the report metric IS dE_ITP (HDR / back-compat: numbers unchanged).
+ReportScorer = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -203,11 +208,16 @@ class IterationResult:
     probed_patches: int
     probe_total: int
     sampling_mode: str
+    # The metric the measured/predicted dE above are expressed in (display label). The loop always
+    # CONVERGES in dE_ITP; this is "CIEDE2000" for an SDR run whose surfaced numbers were re-scored,
+    # else "dE_ITP". Defaulted so any external constructor / older caller stays valid.
+    metric: str = "dE_ITP"
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "iteration": self.iteration,
             "max_correction": round(self.max_correction, 4),
+            "metric": self.metric,
             "measured_mean_de": round(self.measured_mean_de, 4),
             "measured_p95_de": round(self.measured_p95_de, 4),
             "measured_max_de": round(self.measured_max_de, 4),
@@ -416,6 +426,8 @@ def optimize_cube(
     config: Optional[OptimizeConfig] = None,
     on_iteration: Optional[Callable[[IterationResult], None]] = None,
     reachable_primaries: Any = None,
+    report_scorer: Optional[ReportScorer] = None,
+    report_metric: str = "dE_ITP",
 ) -> OptimizeResult:
     """Run the correction machine.
 
@@ -424,9 +436,34 @@ def optimize_cube(
     at arbitrary driven signals (the fidelity-ladder seam). Returns the best cube
     plus a per-iteration history and an LLM-facing digest that separates real floors
     from a too-small correction budget.
+
+    The loop always **converges in dE_ITP** (the perceptually-uniform space the RBF
+    inverts) — convergence, classification, the correction budget, and the returned-cube
+    ranking are unchanged regardless of ``report_scorer``. ``report_scorer`` only re-scores
+    the **surfaced** numbers (the per-iteration curve, the digest, the seam question) into
+    the run's report metric so an SDR build never feeds the LLM/user dE_ITP as if it were
+    CIEDE2000; ``report_metric`` labels them. ``None`` ⇒ report metric IS dE_ITP (HDR /
+    back-compat: every surfaced number is byte-identical to before).
     """
 
     cfg = config or OptimizeConfig()
+
+    def _report_de(signal_rgb: np.ndarray, measured_xyz: np.ndarray,
+                   fallback_itp: np.ndarray) -> np.ndarray:
+        """Per-patch dE in the REPORT metric (display only). ``None`` scorer ⇒ the dE_ITP
+        fallback (the optimize metric). A misbehaving scorer must never break a multi-hour
+        build, so any failure / shape-or-finiteness mismatch falls back to dE_ITP."""
+        if report_scorer is None:
+            return fallback_itp
+        try:
+            out = np.asarray(report_scorer(np.asarray(signal_rgb, dtype=float).reshape(-1, 3),
+                                           np.asarray(measured_xyz, dtype=float).reshape(-1, 3)),
+                             dtype=float).reshape(-1)
+        except Exception:  # noqa: BLE001 - display metric must never break the build
+            return fallback_itp
+        if out.shape[0] != fallback_itp.shape[0] or not np.all(np.isfinite(out)):
+            return fallback_itp
+        return out
     # reachable_primaries (the panel's measured native gamut) clamps the ideal target onto what the
     # panel can physically render, so build + verify score a gamut clip as a clip, not chase it (#C3).
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
@@ -542,8 +579,13 @@ def optimize_cube(
 
         driven = sample_cube(cube, verify_probe)
         measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
+        # Optimization score (dE_ITP) — drives score_hint, _classify, convergence, budget, and the
+        # returned-cube ranking. NEVER swapped for the report metric (philosophy: optimize in the
+        # uniform/invertible ICtCp space; report per-mode).
         de = de_itp(space.xyz_to_ictcp(measured) - target_probe)
         score_hint[probe_idx] = de
+        # Display score (report metric) — the numbers the LLM/user actually see this iteration.
+        de_report = _report_de(verify_probe, measured, de)
 
         masks = _classify(verify_probe, driven, de, cfg.threshold, budget,
                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
@@ -555,20 +597,30 @@ def optimize_cube(
             predicted_max = float(de_itp(space.xyz_to_ictcp(produced_full) - target_ictcp).max())
             smoothing_value = 0.0
         else:
+            produced_full = None
             predicted_max = float(predicted_accuracy(model, cube, verify)["max"])
             smoothing_value = float(model.smoothing)
-        order = np.argsort(de)[::-1][: cfg.top_k]
+        # Predicted accuracy in the report metric (model-vs-reality gap stays single-metric so it
+        # remains meaningful). No-op when report_scorer is None (predicted_report == predicted_max).
+        if report_scorer is None:
+            predicted_report = predicted_max
+        else:
+            if produced_full is None:
+                produced_full = model.forward(sample_cube(cube, verify))
+            pred_itp = de_itp(space.xyz_to_ictcp(produced_full) - target_ictcp)
+            predicted_report = float(_report_de(verify, produced_full, pred_itp).max())
+        order = np.argsort(de_report)[::-1][: cfg.top_k]
         result = IterationResult(
             iteration=it, max_correction=budget,
-            measured_mean_de=float(de.mean()), measured_p95_de=float(np.percentile(de, 95)),
-            measured_max_de=float(de.max()),
-            predicted_max_de=predicted_max,
+            measured_mean_de=float(de_report.mean()), measured_p95_de=float(np.percentile(de_report, 95)),
+            measured_max_de=float(de_report.max()),
+            predicted_max_de=predicted_report, metric=report_metric,
             above_threshold=int(masks["above"].sum()),
             budget_limited=int(masks["budget_limited"].sum()),
             signal_clipped=int(masks["signal_clipped"].sum()),
             near_black=int(masks["near_black"].sum()),
             residual=int(masks["residual"].sum()),
-            worst=[(verify_probe[i].tolist(), float(de[i])) for i in order],
+            worst=[(verify_probe[i].tolist(), float(de_report[i])) for i in order],
             smoothing=smoothing_value, cube_monotonic=diag.monotonic,
             large_reversals=diag.large_reversal_count,
             worst_lattice_jump=diag.worst_lattice_jump,
@@ -577,6 +629,7 @@ def optimize_cube(
         )
         history.append(result)
         snapshots.append({"cube": cube, "driven": driven, "measured": measured, "de": de,
+                          "de_report": de_report,
                           "budget": budget, "monotonic": diag.monotonic,
                           "diagnostics": diag.as_dict(),
                           "verify": verify_probe, "full": full_probe,
@@ -632,6 +685,7 @@ def optimize_cube(
     best_cube, best_de, best_driven, best_budget = (best["cube"], best["de"],
                                                     best["driven"], best["budget"])
     best_verify = best["verify"]
+    best_de_report = best["de_report"]   # display metric (== best_de when report_scorer is None)
     final = history[-1]
 
     masks_best = _classify(best_verify, best_driven, best_de, cfg.threshold, best_budget,
@@ -640,7 +694,9 @@ def optimize_cube(
     # Real floors = physically clipped + model residual (more budget won't help).
     real_floor = masks_best["signal_clipped"] | masks_best["residual"]
     budget_limited = masks_best["budget_limited"]
-    floor_points = [(best_verify[i].tolist(), float(best_de[i])) for i in np.where(real_floor)[0]]
+    # Floor membership comes from the dE_ITP classification (masks_best); the dE VALUE shown is the
+    # report metric so the seam question/floor list never quote dE_ITP during an SDR run.
+    floor_points = [(best_verify[i].tolist(), float(best_de_report[i])) for i in np.where(real_floor)[0]]
     floor_points.sort(key=lambda p: p[1], reverse=True)
 
     needs_adjudication = bool(real_floor.any() or budget_limited.any())
@@ -659,7 +715,7 @@ def optimize_cube(
             boundary_clause = f", {', '.join(boundary_bits)}" if boundary_bits else ""
             parts.append(
                 f"{int(real_floor.sum())} patch(es) at the panel's physical floor/limit{near_clause} "
-                f"(worst dE {worst_de:.1f} at signal {[round(c, 3) for c in worst_sig]}, "
+                f"(worst {report_metric} {worst_de:.1f} at signal {[round(c, 3) for c in worst_sig]}, "
                 f"{'boundary: ' if boundary_clause else ''}{boundary_clause.lstrip(', ') or 'interior residual'}) "
                 "— accept as the panel limit, refine the model, or loosen the target?"
             )
@@ -676,7 +732,8 @@ def optimize_cube(
     # off D65, and a neutral wreck with a still-modest OVERALL mean is invisible in best_mean_de — so
     # surface the probed-neutral dE separately for the LLM (and _severe_optimizer_floor) to judge.
     neutral_mask = (np.max(best_verify, axis=1) - np.min(best_verify, axis=1)) <= 0.015
-    neutral_de = best_de[neutral_mask]
+    neutral_de = best_de[neutral_mask]                  # dE_ITP
+    neutral_de_report = best_de_report[neutral_mask]    # report metric (display)
 
     digest = {
         "converged": converged,
@@ -685,12 +742,22 @@ def optimize_cube(
         "grid_size": cfg.grid_size,
         "threshold": cfg.threshold,
         "max_correction": round(best_budget, 4),
+        # The cube CONVERGES in dE_ITP; the *_de fields below are that optimize metric (consumed by
+        # the convergence/floor logic). The *_de_report fields are the SAME patches re-scored in the
+        # run's report metric (``metric``) for the LLM/user — equal to *_de when report_scorer is None.
+        "metric": report_metric,
+        "optimize_metric": "dE_ITP",
         "best_max_de": round(float(best_de.max()), 4),
         "best_mean_de": round(float(best_de.mean()), 4),
         "best_p95_de": round(float(np.percentile(best_de, 95)), 4),
+        "best_max_de_report": round(float(best_de_report.max()), 4),
+        "best_mean_de_report": round(float(best_de_report.mean()), 4),
+        "best_p95_de_report": round(float(np.percentile(best_de_report, 95)), 4),
         "neutral_count": int(neutral_mask.sum()),
         "neutral_max_de": round(float(neutral_de.max()), 4) if neutral_de.size else None,
         "neutral_mean_de": round(float(neutral_de.mean()), 4) if neutral_de.size else None,
+        "neutral_max_de_report": round(float(neutral_de_report.max()), 4) if neutral_de_report.size else None,
+        "neutral_mean_de_report": round(float(neutral_de_report.mean()), 4) if neutral_de_report.size else None,
         "above_threshold": int(masks_best["above"].sum()),
         "physical_floor": int(real_floor.sum()),
         "near_black_floor": int((real_floor & masks_best["near_black"]).sum()),

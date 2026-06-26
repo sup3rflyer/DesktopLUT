@@ -272,6 +272,43 @@ def test_score_perfect_panel(tmp_path):
     assert result.advice["default_policy_verdict"] == "stop"
 
 
+def test_score_hdr_run_reports_de_itp_not_ciede2000(tmp_path):
+    # The original bug: the stages CLI was unconditionally CIEDE2000, so an HDR run scored its
+    # PQ/Rec.2020 data against an sRGB γ-power target (~30+ dE garbage). The fix mode-gates exactly
+    # like calibrate.py: HDR → dE_ITP, SDR → CIEDE2000 (off the run's FIXED manifest mode).
+    hdr_ctx = create_run("HDR", display="test", run_dir=tmp_path / "hdr")
+    sdr_ctx = create_run("SDR", display="test", run_dir=tmp_path / "sdr")
+    ti3 = write_synthetic_ti3(tmp_path / "v.ti3")  # a perfect SDR panel (≈D65 @ ~100 nits)
+
+    hdr = score.build(_ns(hdr_ctx, stage="3dlut-verification", source_ti3=str(ti3)), hdr_ctx)
+    sdr = score.build(_ns(sdr_ctx, stage="3dlut-verification", source_ti3=str(ti3)), sdr_ctx)
+
+    assert hdr.status == "ran" and sdr.status == "ran"
+    assert hdr.metrics["metric"] == "dE_ITP"          # HDR labels + scores in ITP
+    assert sdr.metrics["metric"] == "CIEDE2000"        # SDR unchanged
+    # Genuinely a different computation, not just a relabel: the SDR-panel data is ~perfect under
+    # CIEDE2000 but a large mismatch when scored as PQ/Rec.2020 in dE_ITP.
+    assert sdr.metrics["avg_de2000"] < 0.01
+    assert hdr.metrics["avg_de2000"] > 1.0
+
+
+def test_report_score_ti3_mode_gates_metric_and_labels(tmp_path):
+    from dlc.mhc import D65_X, D65_Y
+
+    ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
+    ti3 = write_synthetic_ti3(tmp_path / "v.ti3")
+    white = (D65_X, D65_Y)
+
+    sdr = report._score_ti3(ctx, ti3, "verification", 2.2, white, is_hdr=False)
+    hdr = report._score_ti3(ctx, ti3, "verification", 2.2, white, is_hdr=True)
+    assert sdr["metric"] == "CIEDE2000" and hdr["metric"] == "dE_ITP"
+    assert hdr["avg_de2000"] != sdr["avg_de2000"]
+
+    # The HTML labels off the run metric — an HDR report never prints dE_ITP numbers under "dE2000".
+    html = report._render_html({"metric": "dE_ITP", "before": None, "after": hdr})
+    assert "dE_ITP" in html and "dE2000" not in html
+
+
 def test_score_uses_run_record_target_white_when_present(tmp_path):
     ctx = _new_run(tmp_path)
     measure.build(_ns(ctx, stage="raw-mhc"), ctx)

@@ -1230,6 +1230,35 @@ class Calibration:
         area = abs((gx - rx) * (by - ry) - (bx - rx) * (gy - ry)) / 2.0
         return prim if area > 1e-6 else None
 
+    def _optimizer_report_scorer(self):
+        """The metric the 3D-LUT optimizer's SURFACED numbers are re-scored into for the LLM/user:
+        CIEDE2000 for SDR, dE_ITP for HDR. The cube still CONVERGES in dE_ITP either way (the engine
+        is untouched) — this only relabels the build digest/convergence curve so an SDR run never
+        feeds dE_ITP as if it were CIEDE2000 (dE_ITP HDR-only / CIEDE2000 SDR-only, owner directive).
+        Returns ``(scorer | None, metric_name)``; HDR returns ``(None, "dE_ITP")`` so the optimizer
+        keeps its native numbers. The SDR scorer reuses the SAME ``score_samples`` machinery (sRGB
+        γ-power, resolved white, no native-gamut clamp) the SDR verify stage uses, so the build and
+        verify stages quote one consistent CIEDE2000."""
+        target = self._engine_target()
+        if getattr(target, "transfer", None) == "pq":
+            return None, "dE_ITP"
+        from .metrics import score_samples
+        from .mhc import Ti3Sample
+        wx, wy = self._white_xy()
+        gamma = float(getattr(target, "gamma", 2.2))
+        luminance = float(getattr(target, "peak_nits", 0.0)) or None  # SDR white nits (None ⇒ infer)
+
+        def scorer(signals, measured_xyz):
+            samples = [
+                Ti3Sample(rgb=(float(s[0]), float(s[1]), float(s[2])),
+                          xyz=(float(x[0]), float(x[1]), float(x[2])))
+                for s, x in zip(signals, measured_xyz)
+            ]
+            metrics, _ = score_samples(samples, luminance=luminance, gamma=gamma, white_xy=(wx, wy))
+            return [m.de2000 for m in metrics]
+
+        return scorer, "CIEDE2000"
+
     def _hdr_target(self):
         """The chosen HDR target (peak/undershoot/knee/fixed white) for an HDR run,
         resolved from this display+mode's DIP and the run's resolved white
@@ -3801,6 +3830,7 @@ class Calibration:
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
             target = self._engine_target()
+            report_scorer, report_metric = self._optimizer_report_scorer()
             samples = parse_ti3(Path(post_ti3))
             signals = np.array([s.rgb for s in samples], dtype=float)
             measured = np.array([s.xyz for s in samples], dtype=float)
@@ -3809,7 +3839,8 @@ class Calibration:
                 result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
                                        measured_xyz=measured, config=self._cube_optimize_config(),
                                        on_iteration=self._on_optimize_iteration,
-                                       reachable_primaries=self._reachable_primaries())
+                                       reachable_primaries=self._reachable_primaries(),
+                                       report_scorer=report_scorer, report_metric=report_metric)
             except DegenerateMeasurements as exc:
                 # The RBF model can't be built from this patch set (degenerate/collinear) —
                 # surface a clear, actionable abort instead of crashing with a numpy traceback.
@@ -3835,10 +3866,21 @@ class Calibration:
                 key="build-install-3dlut:floor", seam=SEAM_OPTIMIZE, stage="build-install-3dlut",
                 question=outcome.data.get("question") or "the correction machine hit a floor — accept or loosen?",
                 options=("accept", "loosen_target", "abort"), recommendation=recommendation,
-                digest={**{k: outcome.digest.get(k) for k in
-                           ("best_max_de", "best_mean_de", "above_threshold", "physical_floor",
-                            "budget_limited", "converged", "probe_total",
-                            "neutral_count", "neutral_mean_de", "neutral_max_de")},
+                # Surface the report-metric numbers (CIEDE2000 for SDR / dE_ITP for HDR) under the
+                # keys the LLM reads, tagged by `metric`; the cube CONVERGED in `optimize_metric`
+                # (dE_ITP), whose values stay available under *_itp. (_severe_optimizer_floor reads the
+                # full outcome.digest, which keeps best_*_de in dE_ITP — its thresholds are ITP-scaled.)
+                digest={"metric": outcome.digest.get("metric"),
+                        "optimize_metric": outcome.digest.get("optimize_metric"),
+                        "best_max_de": outcome.digest.get("best_max_de_report"),
+                        "best_mean_de": outcome.digest.get("best_mean_de_report"),
+                        "neutral_mean_de": outcome.digest.get("neutral_mean_de_report"),
+                        "neutral_max_de": outcome.digest.get("neutral_max_de_report"),
+                        **{k: outcome.digest.get(k) for k in
+                           ("above_threshold", "physical_floor", "budget_limited", "converged",
+                            "probe_total", "neutral_count")},
+                        "best_max_de_itp": outcome.digest.get("best_max_de"),
+                        "best_mean_de_itp": outcome.digest.get("best_mean_de"),
                         "severe_floor": severe,
                         "recommendation": recommendation})),
                 stage="build-install-3dlut", message="aborted at the 3D-LUT correction floor")
@@ -4022,7 +4064,8 @@ class Calibration:
             "whitepoint": sd("whitepoint") or None,
             "mhc": sd("build-install-mhc") or None,
             "lut3d": {k: sd("build-install-3dlut").get(k) for k in
-                      ("converged", "best_max_de", "best_mean_de", "above_threshold",
+                      ("converged", "best_max_de", "best_mean_de", "best_max_de_report",
+                       "best_mean_de_report", "metric", "optimize_metric", "above_threshold",
                        "physical_floor", "cube_path")} if sd("build-install-3dlut") else None,
             "verification": sd("verify") or None,
             "decisions": self.calib.get("decisions", {}),
@@ -5000,6 +5043,10 @@ def _render_report_html(p: dict[str, Any]) -> str:
     # metric (the verify digest carries it) so dE_ITP numbers are never shown as "dE2000".
     metric = v.get("metric", "CIEDE2000")
     de = "dE_ITP" if metric == "dE_ITP" else "dE2000"
+    # The 3D-LUT line shows the optimizer's BEST residual in the same report metric (the cube
+    # converges in dE_ITP but SDR surfaces CIEDE2000). Fall back to the run metric for old summaries.
+    lut_metric = lut.get("metric") or metric
+    lut_de = "dE_ITP" if lut_metric == "dE_ITP" else "dE2000"
 
     def metric_row(label: str, key: str) -> str:
         return f"<tr><td>{label}</td><td>{v.get(key, '—')}</td></tr>"
@@ -5016,7 +5063,7 @@ def _render_report_html(p: dict[str, Any]) -> str:
         f"<h1>DesktopLUT Calibrator — {p.get('display')} · {p.get('mode')} · {p.get('flow')}</h1>"
         f"<p>Target <code>{p.get('target')}</code> · {p.get('date')} · "
         f"3D LUT {'converged' if lut.get('converged') else 'best-effort'} "
-        f"(max dE {lut.get('best_max_de', '—')})</p>"
+        f"(max {lut_de} {lut.get('best_max_de_report', lut.get('best_max_de', '—'))})</p>"
         f"<h2>Verification ({metric})</h2><table><tr><th>Metric</th><th>After</th></tr>"
         + metric_row(f"Average {de}", "avg_de2000")
         + metric_row(f"P95 {de}", "p95_de2000")

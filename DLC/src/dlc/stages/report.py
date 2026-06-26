@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..metrics import score_samples, summarize_metrics
+from ..metrics import score_samples, score_samples_hdr, summarize_metrics
 from ..mhc import find_stage_artifact, parse_ti3, resolve_run_path
 from ..runs import RunContext
 from ..stage import StageResult
@@ -20,11 +20,19 @@ from . import _common
 
 
 def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
-               white_xy: tuple[float, float]) -> dict[str, Any] | None:
+               white_xy: tuple[float, float], *, is_hdr: bool = False,
+               peak_nits: float = 1000.0) -> dict[str, Any] | None:
     if not ti3.exists():
         return None
     samples = parse_ti3(ti3)
-    patch_metrics, lum = score_samples(samples, gamma=gamma, white_xy=white_xy)
+    # Mode-gate the metric like calibrate.py (dE_ITP HDR-only / CIEDE2000 SDR-only). before/after must
+    # use the SAME metric for the improvement delta to mean anything — both flow from the run's mode.
+    if is_hdr:
+        patch_metrics, lum = score_samples_hdr(samples, white_xy=white_xy, peak_nits=peak_nits)
+        metric_name = "dE_ITP"
+    else:
+        patch_metrics, lum = score_samples(samples, gamma=gamma, white_xy=white_xy)
+        metric_name = "CIEDE2000"
     # This report only extracts the dE numbers below — it writes no metrics/patch JSON, so
     # metrics_path/patches_path stay None rather than masquerading as the TI3 path.
     summary = summarize_metrics(
@@ -33,8 +41,10 @@ def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
         source=ti3,
         patch_metrics=patch_metrics,
         target_luminance=lum,
+        metric=metric_name,
     )
     return {
+        "metric": metric_name,
         "avg_de2000": round(summary.avg_de2000, 4),
         "p95_de2000": round(summary.p95_de2000, 4),
         "max_de2000": round(summary.max_de2000, 4),
@@ -53,15 +63,20 @@ def build(args, ctx: RunContext) -> StageResult:
         result.fail("invalid_target_white", str(exc))
         return result
 
+    is_hdr = _common.run_mode(args, ctx) == "HDR"
+    peak_nits = float((dl.get("mhc_params") or {}).get("target_luminance") or 1000.0)
+    metric_name = "dE_ITP" if is_hdr else "CIEDE2000"
+
     raw_ti3 = find_stage_artifact(ctx, "raw-mhc", "ti3")
     before = _score_ti3(ctx, resolve_run_path(ctx, Path(raw_ti3)), "raw-mhc",
-                        args.gamma, target_white_xy) if raw_ti3 else None
+                        args.gamma, target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits) if raw_ti3 else None
 
     after = None
     for stage in ("3dlut-verification", "mhc-verification", "verification"):
         ti3 = find_stage_artifact(ctx, stage, "ti3")
         if ti3:
-            after = _score_ti3(ctx, resolve_run_path(ctx, Path(ti3)), stage, args.gamma, target_white_xy)
+            after = _score_ti3(ctx, resolve_run_path(ctx, Path(ti3)), stage, args.gamma,
+                               target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits)
             if after:
                 after["stage"] = stage
                 break
@@ -87,6 +102,7 @@ def build(args, ctx: RunContext) -> StageResult:
         "target_white_source": target_white_source,
         "target_luminance": params.get("target_luminance"),
         "refine_iterations": len(dl.get("refine_history", [])),
+        "metric": metric_name,
         "before": before,
         "after": after,
         "improvement": improvement,
@@ -112,13 +128,17 @@ def build(args, ctx: RunContext) -> StageResult:
     }
     if after:
         result.note(
-            f"final avg dE {after.get('avg_de2000')}, white dE {after.get('white_de2000')}"
+            f"final avg {metric_name} {after.get('avg_de2000')}, white {metric_name} {after.get('white_de2000')}"
             + (f" (CCT ~{_common.cct_mccamy(*params['measured_white'].values()):.0f}K native)" if params.get("measured_white") else "")
         )
     return result
 
 
 def _render_html(p: dict[str, Any]) -> str:
+    # Label the rows with the run's actual metric (dE_ITP for HDR, dE2000 for SDR) so an HDR
+    # report never prints dE_ITP numbers under a "dE2000" header.
+    de = "dE_ITP" if p.get("metric") == "dE_ITP" else "dE2000"
+
     def row(label: str, key: str) -> str:
         b = (p["before"] or {}).get(key)
         a = (p["after"] or {}).get(key)
@@ -131,11 +151,11 @@ def _render_html(p: dict[str, Any]) -> str:
         "th{background:#f4f4f4}</style>"
         f"<h1>DesktopLUT Calibrator — {p.get('mode')} monitor {p.get('monitor')}</h1>"
         f"<p>Run: <code>{p.get('run_dir')}</code> · refine iterations: {p.get('refine_iterations')}</p>"
-        "<table><tr><th>Metric</th><th>Before (raw)</th><th>After (final)</th></tr>"
-        + row("Average dE2000", "avg_de2000")
-        + row("Max dE2000", "max_de2000")
-        + row("White dE2000", "white_de2000")
-        + row("Grayscale avg dE2000", "grayscale_avg_de2000")
+        f"<table><tr><th>Metric ({de})</th><th>Before (raw)</th><th>After (final)</th></tr>"
+        + row(f"Average {de}", "avg_de2000")
+        + row(f"Max {de}", "max_de2000")
+        + row(f"White {de}", "white_de2000")
+        + row(f"Grayscale avg {de}", "grayscale_avg_de2000")
         + "</table>"
     )
 

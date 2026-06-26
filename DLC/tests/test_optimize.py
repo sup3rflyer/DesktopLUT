@@ -431,3 +431,45 @@ def test_synthetic_probe_is_deterministic():
     p2 = synthetic_probe(target, gains=(1.0, 1.01, 1.02), noise=0.01, seed=5)
     s = _cube_signals(4)
     assert np.allclose(p1(s), p2(s))
+
+
+# ---------------------------------------------------------------------------
+# report_scorer: re-label the surfaced numbers WITHOUT touching the optimization
+# ---------------------------------------------------------------------------
+
+def test_report_scorer_relabels_surfaced_numbers_without_changing_optimization():
+    # A report_scorer re-scores ONLY the surfaced numbers (digest/curve) into the run's report
+    # metric and labels them; the cube still CONVERGES in dE_ITP. A constant scorer makes the
+    # *_de_report fields take its value while the optimize-metric (dE_ITP) fields + the returned
+    # cube stay byte-identical to a no-scorer run — proof the optimization is untouched.
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
+    signals = _cube_signals(5)
+    measured = probe(signals)
+    cfg = OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4, neutral_band=0.0)
+
+    base = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured, config=cfg)
+
+    def const_scorer(sig, xyz):
+        return np.full(len(sig), 0.5)
+
+    rep = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured, config=cfg,
+                        report_scorer=const_scorer, report_metric="CIEDE2000")
+
+    # Optimization untouched: identical convergence, identical dE_ITP decision fields, identical cube.
+    assert rep.converged == base.converged
+    assert rep.digest["best_max_de"] == base.digest["best_max_de"]    # dE_ITP carrier (decision field)
+    assert rep.digest["best_mean_de"] == base.digest["best_mean_de"]
+    assert np.allclose(rep.cube, base.cube)
+    # Surfaced numbers carry the scorer's value + the report-metric label.
+    assert rep.digest["metric"] == "CIEDE2000"
+    assert rep.digest["optimize_metric"] == "dE_ITP"
+    assert rep.digest["best_max_de_report"] == pytest.approx(0.5)
+    assert rep.digest["best_mean_de_report"] == pytest.approx(0.5)
+    assert rep.history[0].metric == "CIEDE2000"
+    assert rep.history[0].measured_max_de == pytest.approx(0.5)
+    # Back-compat: no scorer ⇒ report fields equal the dE_ITP fields and label dE_ITP (HDR path).
+    assert base.digest["metric"] == "dE_ITP"
+    assert base.digest["optimize_metric"] == "dE_ITP"
+    assert base.digest["best_max_de_report"] == base.digest["best_max_de"]
+    assert base.history[0].metric == "dE_ITP"

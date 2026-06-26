@@ -1,8 +1,13 @@
-"""Stages 5/8 — score: CIEDE2000 of a verification TI3 against the target.
+"""Stages 5/8 — score: a verification TI3 against the target.
 
 The numbers-only end gate: avg/p95/max/white/grayscale dE plus a delta vs. the
 previous score for the same stage and an advisory stop/continue verdict. The
 assistant decides acceptance.
+
+Mode-gated exactly like the live ``calibrate.py`` path (owner directive: dE_ITP for
+HDR only, CIEDE2000 for SDR only). An HDR run scores ``dE_ITP`` (BT.2124) against the
+PQ/Rec.2020 target — CIEDE2000's Lab is meaningless at HDR absolute luminance, so the
+old unconditional-CIEDE2000 path produced ~30+ dE garbage on HDR data.
 """
 
 from __future__ import annotations
@@ -11,12 +16,12 @@ import json
 import sys
 from pathlib import Path
 
-from ..metrics import score_samples, summarize_metrics
+from ..metrics import score_samples, score_samples_hdr, summarize_metrics
 from ..mhc import parse_ti3, resolve_run_path
 from ..runs import RunContext
 from ..stage import StageResult
 from . import _common
-from ..decisions import metric_thresholds_for_run
+from ..decisions import hdr_metric_thresholds, metric_thresholds_for_run
 
 
 def build(args, ctx: RunContext) -> StageResult:
@@ -45,9 +50,27 @@ def build(args, ctx: RunContext) -> StageResult:
         return result
 
     samples = parse_ti3(source)
-    patch_metrics, target_luminance = score_samples(
-        samples, luminance=args.luminance, gamma=args.gamma, white_xy=target_white_xy
-    )
+    # Mode-gate the metric exactly like calibrate.py (dE_ITP HDR-only / CIEDE2000 SDR-only). The run's
+    # FIXED mode comes from the manifest (run_mode), not the SDR-defaulting --mode flag, so a flagless
+    # resume of an HDR run still scores in dE_ITP.
+    is_hdr = _common.run_mode(args, ctx) == "HDR"
+    if is_hdr:
+        # peak_nits is a reported number only (PQ is absolute) — the dE_ITP math needs just the white.
+        peak = (args.luminance
+                or (dl_state.get("mhc_params") or {}).get("target_luminance") or 1000.0)
+        patch_metrics, target_luminance = score_samples_hdr(
+            samples, white_xy=target_white_xy, peak_nits=float(peak)
+        )
+        metric_name = "dE_ITP"
+        thresholds = hdr_metric_thresholds(
+            ctx.manifest.desktoplut.get("quality_policy") if ctx else None
+        )
+    else:
+        patch_metrics, target_luminance = score_samples(
+            samples, luminance=args.luminance, gamma=args.gamma, white_xy=target_white_xy
+        )
+        metric_name = "CIEDE2000"
+        thresholds = metric_thresholds_for_run(ctx, args.stage)
     metrics_path = ctx.root / "reports" / f"score_{args.stage}_iter{args.iteration:02d}.json"
     patches_path = ctx.root / "reports" / f"score_{args.stage}_iter{args.iteration:02d}_patches.json"
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,31 +82,34 @@ def build(args, ctx: RunContext) -> StageResult:
         target_luminance=target_luminance,
         metrics_path=metrics_path,
         patches_path=patches_path,
+        metric=metric_name,
     )
     metrics_path.write_text(json.dumps(summary.as_dict(), indent=2), encoding="utf-8")
     result.add_artifact(metrics_path)
     result.action(
-        f"scored {summary.patch_count} patches vs gamma {args.gamma} / "
-        f"white {target_white_xy[0]:.6f},{target_white_xy[1]:.6f} ({target_white_source})"
+        f"scored {summary.patch_count} patches ({metric_name}) vs "
+        + ("PQ/Rec.2020" if is_hdr else f"gamma {args.gamma}")
+        + f" / white {target_white_xy[0]:.6f},{target_white_xy[1]:.6f} ({target_white_source})"
     )
 
-    # Worst offenders, for the assistant to inspect.
+    # Worst offenders, for the assistant to inspect. (`de2000` is the generic ΔE carrier field — it
+    # holds dE_ITP for an HDR run; the `metric` label below names the units.)
     worst = sorted(patch_metrics, key=lambda m: m.de2000, reverse=True)[:5]
     result.raw["worst_patches"] = [
         {"rgb": [round(c, 4) for c in m.rgb], "de2000": round(m.de2000, 3), "grayscale": m.grayscale}
         for m in worst
     ]
-    thresholds = metric_thresholds_for_run(ctx, args.stage)
     if summary.max_de2000 > thresholds.max_de2000:
         result.anomaly(
             "large_max_de",
-            f"max dE {summary.max_de2000:.2f} exceeds {thresholds.max_de2000:.2f}",
+            f"max {metric_name} {summary.max_de2000:.2f} exceeds {thresholds.max_de2000:.2f}",
             "medium",
         )
 
     metrics = {
         "stage": args.stage,
         "iteration": args.iteration,
+        "metric": metric_name,
         "avg_de2000": round(summary.avg_de2000, 4),
         "p95_de2000": round(summary.p95_de2000, 4),
         "max_de2000": round(summary.max_de2000, 4),
@@ -120,7 +146,7 @@ def build(args, ctx: RunContext) -> StageResult:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _common.base_parser("DLC score: CIEDE2000 of a verification TI3")
+    parser = _common.base_parser("DLC score: verification TI3 (CIEDE2000 SDR / dE_ITP HDR)")
     parser.add_argument("--stage", default="3dlut-verification", help="measure stage whose TI3 to score")
     parser.add_argument("--iteration", type=int, default=1)
     parser.add_argument("--source-ti3", default=None, dest="source_ti3")
