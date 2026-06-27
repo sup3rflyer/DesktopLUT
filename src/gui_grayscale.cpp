@@ -289,7 +289,7 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
         int sliderW = 38;
         int sliderH = 150;
-        int rgbLabelH = 16;   // Code value at top (8-bit SDR, 10-bit HDR)
+        int rgbLabelH = 16;   // Code value at top (at the working bit depth: data->codeCap)
         int pctLabelH = 16;   // Input percentage below slider
         int editH = 20;
         int pad = 4;
@@ -313,8 +313,10 @@ LRESULT CALLBACK GrayscaleEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             float t = (float)i / (float)(data->pointCount - 1);
             float inputNorm = data->isHDR ? (t * pqPeak) : (t * t);
 
-            // Top label: code value
-            int codeValue = data->isHDR ? (int)(inputNorm * 1023.0f + 0.5f) : (int)(inputNorm * 255.0f + 0.5f);
+            // Top label: the patch code at the working bit depth (data->codeCap: 255 legacy SDR,
+            // 1023 ACM SDR / HDR). Computed straight from the signal position, so it's the exact
+            // nearest integer code at that depth — present this value and it lands on this slider.
+            int codeValue = (int)(inputNorm * (float)data->codeCap + 0.5f);
             wchar_t rgbLabel[8];
             swprintf_s(rgbLabel, L"%d", codeValue);
             CreateWindow(L"STATIC", rgbLabel, WS_CHILD | WS_VISIBLE | SS_CENTER,
@@ -768,6 +770,21 @@ void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHD
     data.points = settings.points.data();
     data.isHDR = isHDR;
     data.peakNits = settings.peakNits;
+    // Top-label code cap = the working bit depth's max code, so the printed number IS the actual
+    // patch code you'd present at that depth. HDR scanout is 10-bit PQ; SDR is 10-bit on ACM
+    // (FP16 scRGB) and 8-bit on legacy. The slider's true position is the continuous signal t²;
+    // we quantize it to the working depth directly (8- and 10-bit code grids don't align).
+    data.codeCap = 1023;
+    if (!isHDR) {
+        data.codeCap = 255;  // legacy 8-bit SDR
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        for (const auto& ctx : g_monitors) {
+            if (ctx.index == g_gui.currentMonitor) {
+                if (ctx.isFP16SDR) data.codeCap = 1023;  // ACM SDR scans out 10-bit
+                break;
+            }
+        }
+    }
     data.originalPoints.assign(settings.points.begin(), settings.points.end());
     data.liveUpdateCallback = liveUpdateCallback;
     data.selectedChannel = 0;  // Default to Red

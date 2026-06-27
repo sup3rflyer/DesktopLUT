@@ -54,8 +54,10 @@ static int EffectiveGrayscalePointCount(const GrayscaleData& gs) {
     return std::clamp(gs.pointCount, 2, 32);
 }
 
-// Evaluate SDR grayscale correction (matches shader's ApplyGrayscaleCorrectionLinear)
-// Input/output are linear light values (0-1)
+// Evaluate SDR grayscale correction (matches the shader's ApplyGrayscaleCorrection).
+// Domain-agnostic sqrt-index/sqrt-interp: the caller now passes the SIGNAL (the bake
+// corrects in signal domain, so slider i sits at signal t² = code cap·t²). The param
+// keeps the name Y_linear for diff hygiene but carries a 0-1 signal value here.
 float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs) {
     if (Y_linear <= 0.0f) return 0.0f;
 
@@ -151,7 +153,7 @@ float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqP
 
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize) {
     for (int j = 0; j < lutSize; j++) {
-        float t = (float)j / (float)(lutSize - 1);  // sRGB-encoded input position
+        float t = (float)j / (float)(lutSize - 1);  // scanout signal (sRGB-encoded)
 
         if (!gs.enabled) {
             // Identity LUT - linear ramp
@@ -159,19 +161,22 @@ void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize) {
             continue;
         }
 
-        // Decode to linear light
-        float Y_linear = SrgbEOTF(t);
+        // SIGNAL-domain grayscale: index the slots by sqrt(signal) and correct in signal
+        // (mirrors the shader's ApplyGrayscaleCorrection). The editor's points are signal-
+        // domain (identity t²), so slider i sits at signal t² i.e. code cap·t² — dense in the
+        // shadows — and the slider's value IS the patch code that drives it. EvalGrayscaleSDR's
+        // sqrt-index/sqrt-interp math is domain-agnostic; we just feed it the signal, not the
+        // sRGB-decoded linear light.
+        float corrected = EvalGrayscaleSDR(t, gs);
 
-        // Apply grayscale correction (sqrt-domain interpolation, matches shader)
-        float Y_corrected = EvalGrayscaleSDR(Y_linear, gs);
-
-        // 2.2->2.4 gamma transform (BT.1886): pow(L, 2.4/2.2) in linear, darker midtones
+        // 2.2->2.4 gamma (BT.1886) is a linear-light transform: decode, pow, re-encode.
         if (gs.use24Gamma) {
-            Y_corrected = powf((std::max)(Y_corrected, 0.0f), 2.4f / 2.2f);
+            float lin = SrgbEOTF((std::max)(corrected, 0.0f));
+            lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
+            corrected = SrgbOETF((std::max)(lin, 0.0f));
         }
 
-        // Encode back to sRGB signal
-        outLUT[j] = std::clamp(SrgbOETF((std::max)(Y_corrected, 0.0f)), 0.0f, 1.0f);
+        outLUT[j] = std::clamp(corrected, 0.0f, 1.0f);
     }
 }
 
@@ -197,14 +202,16 @@ void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT,
 // Per-channel LUT generators: uses pointsR/G/B for per-channel corrections
 void GenerateMHC2LUT_SDR_Channel(const GrayscaleData& gs, float* outLUT, int lutSize, int channel) {
     for (int j = 0; j < lutSize; j++) {
-        float t = (float)j / (float)(lutSize - 1);
+        float t = (float)j / (float)(lutSize - 1);  // scanout signal
         if (!gs.enabled) { outLUT[j] = t; continue; }
-        float Y_linear = SrgbEOTF(t);
-        float Y_corrected = EvalGrayscaleSDR_Channel(Y_linear, gs, channel);
+        // Signal-domain (see GenerateMHC2LUT_SDR): index by sqrt(signal), correct in signal.
+        float corrected = EvalGrayscaleSDR_Channel(t, gs, channel);
         if (gs.use24Gamma) {
-            Y_corrected = powf((std::max)(Y_corrected, 0.0f), 2.4f / 2.2f);
+            float lin = SrgbEOTF((std::max)(corrected, 0.0f));
+            lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
+            corrected = SrgbOETF((std::max)(lin, 0.0f));
         }
-        outLUT[j] = std::clamp(SrgbOETF((std::max)(Y_corrected, 0.0f)), 0.0f, 1.0f);
+        outLUT[j] = std::clamp(corrected, 0.0f, 1.0f);
     }
 }
 

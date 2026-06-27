@@ -934,6 +934,8 @@ struct GrayscaleEditorData {
     bool updatingFromEdit = false;
     bool isHDR = false;      // true if editing HDR grayscale, false for SDR
     float peakNits = 10000.0f;  // HDR peak for label calculation (must match ColourSpace target)
+    int codeCap = 1023;      // Max code for the top label = the working bit depth (255 legacy SDR,
+                             // 1023 ACM SDR / HDR), so the printed number IS the patch code at that depth.
     std::function<void()> liveUpdateCallback;  // If set, called instead of UpdateColorCorrectionLive
     // Per-channel RGB deviations
     float* rgbDeviations[3] = {};          // Pointers to settings rgbDeviations data

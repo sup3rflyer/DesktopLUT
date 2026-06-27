@@ -597,15 +597,19 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
                 } else {
                     // SDR: LUT output is sRGB signal
 
-                    // Correction grayscale (fine-tuning on top of base)
+                    // Correction grayscale (fine-tuning on top of base). SIGNAL-domain
+                    // (mirrors GenerateMHC2LUT_SDR_Channel / the shader): feed the signal `v`
+                    // straight into the eval — NO sRGB decode/encode around it, or the slot
+                    // index would land on the wrong slider and disagree with the live preview.
                     if (hasCorrGS) {
-                        float Y_linear = SrgbEOTF(v);
-                        float Y_corrected = EvalGrayscaleSDR_Channel(Y_linear, params.correctionGrayscale, ch);
-                        // Optional 2.2→2.4 gamma from correction grayscale
+                        float corrected = EvalGrayscaleSDR_Channel(v, params.correctionGrayscale, ch);
+                        // Optional 2.2→2.4 gamma is a linear-light transform: decode, pow, re-encode.
                         if (params.correctionGrayscale.use24Gamma) {
-                            Y_corrected = powf((std::max)(Y_corrected, 0.0f), 2.4f / 2.2f);
+                            float lin = SrgbEOTF((std::max)(corrected, 0.0f));
+                            lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
+                            corrected = SrgbOETF((std::max)(lin, 0.0f));
                         }
-                        v = SrgbOETF((std::max)(Y_corrected, 0.0f));
+                        v = corrected;
                     }
                 }
 

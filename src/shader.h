@@ -110,17 +110,18 @@ float3 sRGB_EOTF3(float3 rgb) {
         srgbEotfLUT.SampleLevel(linearSampler, float2(uv.z, 0.5f), 0));
 }
 
-// Linear-domain helpers for SDR grayscale + 2.4 gamma (match MHC 1D LUT pipeline).
-// Both operate in linear light so the shader preview matches the MHC ICC profile.
-// Called from a single sRGB decode/encode roundtrip in the SDR pipeline.
+// SDR grayscale + 2.4 gamma. Grayscale is SIGNAL-domain (index slots by sqrt(signal),
+// correct in signal), matching the baked MHC 1D LUT exactly (GenerateMHC2LUT_SDR_Channel).
+// The editor's points are signal-domain (identity t²) so slider i sits at signal t² = code
+// cap·t² (dense in the shadows) and the slider's value IS the patch code that drives it.
 
-// Grayscale: per-channel sqrt-domain correction in linear space
-// Input/output are linear light; matches MHC's EvalGrayscaleSDR_Channel exactly.
-float3 ApplyGrayscaleCorrectionLinear(float3 lin) {
+// Grayscale: per-channel sqrt-domain correction in SIGNAL space.
+// Input/output are the sRGB-encoded signal; matches MHC's EvalGrayscaleSDR_Channel exactly.
+float3 ApplyGrayscaleCorrection(float3 rgb) {
     float pointCount = max(2.0f, grayscalePoints);
-    float Y = dot(lin, float3(0.2126f, 0.7152f, 0.0722f));
-    if (Y < 1e-6f) return lin;
-    // sqrt distribution: index = sqrt(Y_linear) * (N-1), curve stores linear Y values
+    float Y = dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));   // signal luma
+    if (Y < 1e-6f) return rgb;
+    // sqrt distribution: index = sqrt(signal) * (N-1), curve stores signal values
     float idx = sqrt(saturate(Y)) * (pointCount - 1.0f);
     int i0 = (int)floor(idx);
     int i1 = min(i0 + 1, (int)pointCount - 1);
@@ -135,8 +136,8 @@ float3 ApplyGrayscaleCorrectionLinear(float3 lin) {
     float sB0 = sqrt(max(grayscaleB[i0/4][i0%4], 0.0f));
     float sB1 = sqrt(max(grayscaleB[i1/4][i1%4], 0.0f));
     float corrB = lerp(sB0, sB1, t); corrB *= corrB;
-    // Scale each channel by its own correction relative to luminance
-    return float3(lin.r * corrR / Y, lin.g * corrG / Y, lin.b * corrB / Y);
+    // Scale each channel by its own correction relative to signal luma
+    return float3(rgb.r * corrR / Y, rgb.g * corrG / Y, rgb.b * corrB / Y);
 }
 
 // 2.4 gamma: pow(Y, 2.4/2.2) in linear space via LUT ratio
@@ -151,14 +152,17 @@ float3 Apply24GammaLinear(float3 lin) {
     return lin * ratio;
 }
 
-// Combined SDR corrections: single sRGB decode/encode roundtrip for both grayscale + 2.4 gamma.
-// Called when either correction is active. Matches the MHC 1D LUT pipeline:
-//   SrgbEOTF → grayscale correction → pow(2.4/2.2) → SrgbOETF
+// Combined SDR corrections. Grayscale runs in SIGNAL domain (no decode), matching the baked
+// MHC 1D LUT. 2.4 gamma stays a linear-light transform, so it's wrapped in a decode/encode
+// roundtrip applied AFTER the signal-domain grayscale (mirrors GenerateMHC2LUT_SDR).
 float3 ApplySDRCorrections(float3 rgb) {
-    float3 lin = sRGB_EOTF3(rgb);
-    if (grayscaleEnabled > 0.5) lin = ApplyGrayscaleCorrectionLinear(lin);
-    if (grayscale24 > 0.5f) lin = Apply24GammaLinear(lin);
-    return sRGB_OETF3(max(lin, 0.0));
+    if (grayscaleEnabled > 0.5) rgb = ApplyGrayscaleCorrection(rgb);
+    if (grayscale24 > 0.5f) {
+        float3 lin = sRGB_EOTF3(rgb);
+        lin = Apply24GammaLinear(lin);
+        rgb = sRGB_OETF3(max(lin, 0.0));
+    }
+    return rgb;
 }
 )"
 // Part 2b: ICTCP color space infrastructure (Dolby ICtCp for HDR)
