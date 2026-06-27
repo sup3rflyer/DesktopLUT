@@ -3620,10 +3620,14 @@ class Calibration:
             if not patches:
                 return StageOutcome("grayscale-wb", "done",
                                     digest={"skipped": True, "reason": "no grayscale patches"})
-            points = [i / (len(patches) - 1) if len(patches) > 1 else 1.0
-                      for i in range(len(patches))]
-            payload = identity_payload(points)
             transfer = self._transfer()
+            cap = self._patch_max_cv() or transfer.max_cv
+            # The slot abscissa = each patch's SIGNAL level (code/cap), so the grayscale bridge node-
+            # aligns correction[i] onto the slot whose luminance we actually measured (see
+            # build_grayscale_wb_set). The old uniform [i/(n-1)] index was the mis-mapping that made
+            # every per-point correction land on the wrong slot → flat reads.
+            points = [patch[0] / cap for patch in patches]
+            payload = identity_payload(points)
             spec = self._spec()
             cfg = GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma))
 
@@ -3709,13 +3713,18 @@ class Calibration:
                         any_unsettled = True
                         break
                     payload, upd = update_point(payload, idx, gpatch, cfg)
+                    point_log["rounds"][-1]["update"] = upd
+                    all_updates.append(upd)
+                    if upd.get("held_dark"):
+                        # Below the dark floor: update_point holds the point (no correction is
+                        # possible at this luminance), so re-measuring can't improve it — break
+                        # instead of burning the whole round budget on an unchanged table.
+                        break
                     # Live-set the editor table (composed per-channel deviations) — the preview
                     # shader applies it next frame, so the very next read reflects this nudge.
                     self.controller.grayscale_set_live(
                         self.monitor, self.mode, payload["point_count"], payload["points"],
                         payload["deviations"])
-                    point_log["rounds"][-1]["update"] = upd
-                    all_updates.append(upd)
                     any_capped = any_capped or bool(upd.get("capped"))
                     any_large = any_large or bool(upd.get("large_correction"))
                     any_large_y = any_large_y or bool(upd.get("large_luminance_correction"))
@@ -4930,8 +4939,14 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
     n = 32
     if transfer.kind == "pq":  # HDR editor: linear in code across the active peak
         levels = uniform_levels(n, cap)
-    else:                      # SDR editor: t**2 perceptual spacing
-        levels = [round(cap * (i / (n - 1)) ** 2) for i in range(n)]
+    else:
+        # SDR: the shader addresses the 32 correction-grayscale slots by sqrt(linear-Y), so slot i
+        # sits at linear-Y (i/(n-1))². Present the SIGNAL code whose linear-Y is that — code =
+        # cap·(i/(n-1))^(2/γ) — so patch i lands on slot i (node-aligned through the grayscale bridge).
+        # NB: this is NOT the editor's displayed code (that label is the linear-Y value, 255·(i/(n-1))²);
+        # it's the signal that produces that slot's luminance.
+        gamma = float(getattr(transfer, "gamma", 2.2)) or 2.2
+        levels = [round(cap * (i / (n - 1)) ** (2.0 / gamma)) for i in range(n)]
     return [(v, v, v) for v in levels]
 
 
