@@ -103,6 +103,7 @@ from .measure_loop import (
 from .decisions import hdr_metric_thresholds
 from .metrics import delta_e2000, percentile, score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
+from .mhc_grayscale import srgb_oetf
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
 from . import patch_evidence
@@ -4928,25 +4929,24 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
     """The grey points of DesktopLUT's Grayscale-correction editor — one patch per slider,
     so each measured patch tunes the slider it sits on (NOT a uniform calibration ramp).
 
-    The editor maps slider ``i`` (of ``n``) to a target via ``targetVal = t*t`` for SDR and
-    ``t`` for HDR (``t = i/(n-1)``; see the editor OK handler ``gui_grayscale.cpp`` /
-    ``ID_GRAYSCALE_OK``). So the SDR grey codes are ``round(cap * t**2)`` — perceptual,
-    dense in the shadows (0,0,1,2,4,7,…,255) — and HDR is linear across the active-peak
-    code range (``max_cv`` = the peak's PQ code). Uniform spacing here mistunes every
-    interior slider.
+    DesktopLUT addresses the SDR grayscale slots by ``sqrt(linear-Y)`` and decodes a
+    framebuffer code with the **sRGB-piecewise** EOTF before indexing — so slider ``i`` (of
+    ``n``) sits at linear-Y ``(i/(n-1))²`` and is driven by the SIGNAL code
+    ``cap·SrgbOETF((i/(n-1))²)``. We present exactly that code so patch i lands on slot i
+    (HW-probed sRGB across N=10/20/32, 2026-06-27 — 6/6 slots, decisive in the shadows). The
+    2.2 panel gamma is the OUTPUT target (``target_Y`` in the touch-up loop), a separate axis —
+    NOT the code placement. HDR is linear across the active-peak PQ code range (``max_cv``).
+    Uniform spacing here mistunes every interior slider.
     """
     cap = max_cv if max_cv is not None else transfer.max_cv
     n = 32
     if transfer.kind == "pq":  # HDR editor: linear in code across the active peak
         levels = uniform_levels(n, cap)
     else:
-        # SDR: the shader addresses the 32 correction-grayscale slots by sqrt(linear-Y), so slot i
-        # sits at linear-Y (i/(n-1))². Present the SIGNAL code whose linear-Y is that — code =
-        # cap·(i/(n-1))^(2/γ) — so patch i lands on slot i (node-aligned through the grayscale bridge).
-        # NB: this is NOT the editor's displayed code (that label is the linear-Y value, 255·(i/(n-1))²);
-        # it's the signal that produces that slot's luminance.
-        gamma = float(getattr(transfer, "gamma", 2.2)) or 2.2
-        levels = [round(cap * (i / (n - 1)) ** (2.0 / gamma)) for i in range(n)]
+        # SDR: the sRGB signal code that lands on slot i (see docstring). sRGB, NOT the old
+        # cap·t^(2/γ): the γ2.2-power placement put shadow patches several codes off their slot
+        # because the shader decodes sRGB-piecewise, not a pure power. HW-probed 2026-06-27.
+        levels = [round(cap * srgb_oetf((i / (n - 1)) ** 2)) for i in range(n)]
     return [(v, v, v) for v in levels]
 
 

@@ -24,8 +24,14 @@ effect is ``d**gamma``.
 The conversion therefore:
   * emits ``points[i] = t_i**2`` (the sqrt-distributed linear-light identity), and
   * resamples each signal-domain deviation curve onto DesktopLUT's sample
-    positions (sample i sits at signal ``L_i = (t_i**2)**(1/gamma)``) and raises
-    it to ``**gamma`` to land in the linear-light gain domain.
+    positions. Sample i sits at signal ``L_i = SrgbOETF(t_i**2)`` — the shader
+    decodes a framebuffer code with the **sRGB-piecewise** EOTF before indexing the
+    slot, so the slot<->code mapping is sRGB, NOT a 2.2 power (HW-probed across
+    N=10/20/32, 2026-06-27; the old ``(t_i**2)**(1/gamma)`` x-grid put shadow patches
+    several codes off their slot). The deviation is still raised to ``**gamma`` for the
+    linear-light gain — that exponent is not a transfer choice, it round-trips
+    ``update_point``'s ``**(1/gamma)`` step (panel luminance ``~input**gamma`` is the
+    OUTPUT target, a separate axis from the sRGB code<->slot mapping).
 
 HDR (PQ) uses a different, linear convention (``points[i] = t_i``; the eval
 indexes linearly and does not square — ``types.h``: ``points[i] = t``) and is
@@ -36,9 +42,21 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
-__all__ = ["to_desktoplut_sdr_grayscale"]
+__all__ = ["to_desktoplut_sdr_grayscale", "srgb_oetf"]
 
 _CHANNELS = ("r", "g", "b")
+
+
+def srgb_oetf(v: float) -> float:
+    """sRGB encode: linear light -> signal. Inverse of the sRGB-piecewise EOTF the
+    DesktopLUT SDR shader applies to a framebuffer code BEFORE it indexes the grayscale
+    slot by ``sqrt(linear-Y)`` (``shader.h`` ``sRGB_EOTF3`` -> ``ApplyGrayscaleCorrection-
+    Linear``; baked path ``GenerateMHC2LUT_SDR``). So the slot<->code mapping is sRGB-
+    piecewise, NOT a 2.2 power. HW-probed across N=10/20/32 (2026-06-27): 6/6 slots landed
+    on the sRGB code, not the power-law code (decisive in the shadows)."""
+    if v <= 0.0031308:
+        return 12.92 * v
+    return 1.055 * (v ** (1.0 / 2.4)) - 0.055
 
 
 def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
@@ -93,17 +111,22 @@ def to_desktoplut_sdr_grayscale(
         base = sig[0] * sig[0]
         return [base], {ch: [dev_in[ch][0] ** gamma] for ch in _CHANNELS}
 
-    inv_gamma = 1.0 / gamma
     out_points: list[float] = []
     out_dev: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     for i in range(n):
         t = i / (n - 1)
-        y_linear = t * t                              # DesktopLUT identity base
-        # Signal level whose ideal linear light is y_linear, used to resample the
-        # DLC's signal-domain deviation curve onto this sample position.
-        signal_level = y_linear ** inv_gamma if y_linear > 0.0 else 0.0
+        y_linear = t * t                              # DesktopLUT identity base (sqrt-distributed)
+        # The framebuffer SIGNAL that lands a pixel on this slot. The shader decodes a
+        # code with the sRGB-piecewise EOTF before indexing by sqrt(linear-Y), so the
+        # slot's signal is SrgbOETF(y_linear) -- NOT y_linear**(1/gamma). (HW-probed sRGB
+        # across N=10/20/32, 2026-06-27.) Used to resample the DLC's signal-domain
+        # deviation curve onto this sample position.
+        signal_level = srgb_oetf(y_linear)
         out_points.append(y_linear)
         for ch in _CHANNELS:
             d_signal = _interp(signal_level, sig, dev_in[ch])
-            out_dev[ch].append(d_signal ** gamma)     # signal gain -> linear-light gain
+            # Signal gain -> linear-light gain. The gamma here is NOT a transfer choice:
+            # it round-trips update_point's step = linear_ratio**(damping/gamma), so the
+            # pair nets to the (damped) linear ratio. Left as-is (orthogonal to alignment).
+            out_dev[ch].append(d_signal ** gamma)
     return out_points, out_dev
