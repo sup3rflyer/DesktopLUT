@@ -1203,10 +1203,22 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // so the shader can preview correction GS on top of the base calibration.
                 bool hadProfile = mhc.enabled && !mhc.profileName.empty();
                 uint8_t savedPerm = mhc.activePerm;
+                std::wstring sdrPassthroughName;   // realization-A transient identity profile (SDR)
+                bool fullPreview = false;
                 if (livePreview && hadProfile) {
-                    // Swap to permutation with correction GS stripped out
                     uint8_t previewPerm = savedPerm & ~MHCSettings::PERM_GS;
-                    if (previewPerm != savedPerm) {
+                    float previewResult9[9] = { 1,0,0, 0,1,0, 0,0,1 };
+                    std::vector<float> previewBaseLut[3];
+                    // SDR (realization A): neutralize scanout to identity + shader reproduces the
+                    // whole MHC2 transform, so the preview is bit-identical to the bake (incl. WB).
+                    if (!isHDR &&
+                        ComputeSdrPreviewScanout(monIdx, previewPerm, previewResult9,
+                                                 previewBaseLut[0], previewBaseLut[1], previewBaseLut[2])) {
+                        sdrPassthroughName = EngageSdrPassthroughScanout(monIdx);
+                        fullPreview = !sdrPassthroughName.empty();
+                    }
+                    // Legacy path (HDR, or SDR full-preview unavailable): strip PERM_GS from scanout.
+                    if (!fullPreview && previewPerm != savedPerm) {
                         SwapMhcToPermutation(monIdx, isHDR, previewPerm);
                     }
                     // Enable corrGsPreviewActive so shader GS passes through MHC suppression
@@ -1215,6 +1227,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         for (auto& ctx : g_monitors) {
                             if (ctx.index == monIdx) {
                                 ctx.corrGsPreviewActive = true;
+                                if (fullPreview) {
+                                    memcpy(ctx.previewResult, previewResult9, sizeof(previewResult9));
+                                    for (int ch = 0; ch < 3; ch++) ctx.previewBaseLut[ch] = std::move(previewBaseLut[ch]);
+                                    ctx.previewBaseLutSize = 1024;
+                                    ctx.previewBaseLutDirty = true;
+                                    ctx.corrGsFullPreviewActive = true;
+                                }
                                 ctx.cbDirty = true;
                                 break;
                             }
@@ -1254,6 +1273,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     for (auto& ctx : g_monitors) {
                         if (ctx.index == monIdx) {
                             ctx.corrGsPreviewActive = false;
+                            ctx.corrGsFullPreviewActive = false;   // realization-A full-preview off
                             ctx.cbDirty = true;
                             break;
                         }
@@ -1261,6 +1281,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 // Regenerate ICC profile with updated correction GS (clears stale perm cache)
                 RegenerateMhcIfActive(monIdx, isHDR);
+                // realization A: real profile re-associated; drop the transient passthrough (after).
+                if (!sdrPassthroughName.empty()) DisengageSdrPassthroughScanout(monIdx, sdrPassthroughName);
                 if (livePreview) {
                     UpdateMhcFlagsLive(monIdx);
                     if (!startedForPreview) {

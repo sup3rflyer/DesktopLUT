@@ -378,6 +378,7 @@ struct GsLiveState {
     bool startedForPreview = false;        // this preview started full processing
     bool startedOverlayForPreview = false; // this preview started the DWM-hook overlay
     GrayscaleSettings savedCorrectionGs;   // pre-begin correctionGrayscale, for cancel/abort restore
+    std::wstring sdrPassthroughName;       // realization-A: transient identity scanout profile (SDR full-preview)
 };
 std::map<std::pair<int, bool>, GsLiveState> g_gsLive;  // keyed by (monitor, isHDR)
 
@@ -394,7 +395,12 @@ void FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
     {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
         for (auto& ctx : g_monitors)
-            if (ctx.index == mon) { ctx.corrGsPreviewActive = false; ctx.cbDirty = true; break; }
+            if (ctx.index == mon) {
+                ctx.corrGsPreviewActive = false;
+                ctx.corrGsFullPreviewActive = false;   // realization-A full-preview off
+                ctx.cbDirty = true;
+                break;
+            }
     }
     if (!bake) {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
@@ -408,6 +414,9 @@ void FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
     // full permutation. No-op if MHC isn't active (no profileName).
     RegenerateMhcIfActive(mon, isHDR);
     UpdateMhcFlagsLive(mon);
+    // realization-A: now the real profile is re-associated, drop the transient passthrough
+    // (remove association + delete the .icm). Done AFTER the real reassoc to avoid a no-profile flash.
+    if (!st.sdrPassthroughName.empty()) DisengageSdrPassthroughScanout(mon, st.sdrPassthroughName);
     // If the overlay was already running (we didn't spin it up), flush the transient
     // preview push by re-queuing the REAL shader CC (correctionGrayscale lives in the
     // ICC now, not the shader). UpdateColorCorrectionLive reads sdr/hdrColorCorrection,
@@ -1150,15 +1159,40 @@ void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& er
         hadProfile = m.enabled && !m.profileName.empty();
     }
 
-    // Swap to a permutation WITHOUT correction GS so the shader previews it on top
-    // of the base calibration. Only meaningful when MHC is active with a profile.
-    if (hadProfile && (st.savedPerm & MHCSettings::PERM_GS))
+    // Engage the live preview. SDR (realization A; CODEX_PREVIEW_BAKE_PROMPT.md): neutralize
+    // scanout to IDENTITY (transient passthrough profile) and have the shader reproduce the WHOLE
+    // MHC2 transform + the live correction, so the preview is bit-identical to the bake (incl.
+    // per-channel / white balance). HDR keeps the legacy path (strip PERM_GS; full-preview is
+    // out of scope for HDR). Falls back to the legacy strip if scanout reproduction is unavailable.
+    bool fullPreview = false;
+    float previewResult9[9] = { 1,0,0, 0,1,0, 0,0,1 };
+    std::vector<float> previewBaseLut[3];
+    if (!isHDR && hadProfile) {
+        uint8_t strippedPerm = (uint8_t)(st.savedPerm & ~MHCSettings::PERM_GS);
+        if (ComputeSdrPreviewScanout(mon, strippedPerm, previewResult9,
+                                     previewBaseLut[0], previewBaseLut[1], previewBaseLut[2])) {
+            st.sdrPassthroughName = EngageSdrPassthroughScanout(mon);
+            fullPreview = !st.sdrPassthroughName.empty();
+        }
+    }
+    if (!fullPreview && hadProfile && (st.savedPerm & MHCSettings::PERM_GS))
         SwapMhcToPermutation(mon, isHDR, (uint8_t)(st.savedPerm & ~MHCSettings::PERM_GS));
 
     {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
         for (auto& ctx : g_monitors)
-            if (ctx.index == mon) { ctx.corrGsPreviewActive = true; ctx.cbDirty = true; break; }
+            if (ctx.index == mon) {
+                ctx.corrGsPreviewActive = true;
+                if (fullPreview) {
+                    memcpy(ctx.previewResult, previewResult9, sizeof(previewResult9));
+                    for (int ch = 0; ch < 3; ch++) ctx.previewBaseLut[ch] = std::move(previewBaseLut[ch]);
+                    ctx.previewBaseLutSize = 1024;
+                    ctx.previewBaseLutDirty = true;
+                    ctx.corrGsFullPreviewActive = true;
+                }
+                ctx.cbDirty = true;
+                break;
+            }
     }
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);

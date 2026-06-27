@@ -183,7 +183,7 @@ bool InitD3D() {
 
     // Create constant buffer for shader parameters
     D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = 544;  // 136 floats (34 float4s) - grayscaleR/G/B[8] + motion bar
+    cbDesc.ByteWidth = 576;  // 144 floats (36 float4s) - grayscaleR/G/B[8] + motion bar + full-preview matrix (132-143)
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -434,7 +434,30 @@ bool InitD3D() {
         hr = g_device->CreateShaderResourceView(g_wbGammaTexture, nullptr, &g_wbGammaSRV);
         if (FAILED(hr)) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; return false; }
 
-        std::cout << "SDR transfer LUTs: enabled (sRGB OETF/EOTF + gamma ratio + WB gamma)" << std::endl;
+        // Per-channel SDR base 1D LUT for the grayscale FULL-PREVIEW (realization A;
+        // CODEX_PREVIEW_BAKE_PROMPT.md). DYNAMIC — the render thread re-uploads it on each
+        // full-preview begin so the shader can reproduce the MHC base calibration before the
+        // live correction. R32_FLOAT (matches the other transfer LUTs — filterable on target HW).
+        D3D11_TEXTURE2D_DESC baseLutDesc = {};
+        baseLutDesc.Width = 1024;
+        baseLutDesc.Height = 1;
+        baseLutDesc.MipLevels = 1;
+        baseLutDesc.ArraySize = 1;
+        baseLutDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        baseLutDesc.SampleDesc.Count = 1;
+        baseLutDesc.Usage = D3D11_USAGE_DYNAMIC;
+        baseLutDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        baseLutDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Texture2D** baseTex[3] = { &g_baseLutPreviewTexR, &g_baseLutPreviewTexG, &g_baseLutPreviewTexB };
+        ID3D11ShaderResourceView** baseSrv[3] = { &g_baseLutPreviewSRV_R, &g_baseLutPreviewSRV_G, &g_baseLutPreviewSRV_B };
+        for (int ch = 0; ch < 3; ch++) {
+            hr = g_device->CreateTexture2D(&baseLutDesc, nullptr, baseTex[ch]);
+            if (FAILED(hr)) { std::cerr << "Failed to create base-LUT preview texture\n"; return false; }
+            hr = g_device->CreateShaderResourceView(*baseTex[ch], nullptr, baseSrv[ch]);
+            if (FAILED(hr)) { (*baseTex[ch])->Release(); *baseTex[ch] = nullptr; return false; }
+        }
+
+        std::cout << "SDR transfer LUTs: enabled (sRGB OETF/EOTF + gamma ratio + WB gamma + base-preview)" << std::endl;
     }
 
     return true;
@@ -638,6 +661,12 @@ void ReleaseSharedD3DResources() {
     if (g_gammaRatioTexture) { g_gammaRatioTexture->Release(); g_gammaRatioTexture = nullptr; }
     if (g_wbGammaSRV) { g_wbGammaSRV->Release(); g_wbGammaSRV = nullptr; }
     if (g_wbGammaTexture) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; }
+    if (g_baseLutPreviewSRV_R) { g_baseLutPreviewSRV_R->Release(); g_baseLutPreviewSRV_R = nullptr; }
+    if (g_baseLutPreviewTexR) { g_baseLutPreviewTexR->Release(); g_baseLutPreviewTexR = nullptr; }
+    if (g_baseLutPreviewSRV_G) { g_baseLutPreviewSRV_G->Release(); g_baseLutPreviewSRV_G = nullptr; }
+    if (g_baseLutPreviewTexG) { g_baseLutPreviewTexG->Release(); g_baseLutPreviewTexG = nullptr; }
+    if (g_baseLutPreviewSRV_B) { g_baseLutPreviewSRV_B->Release(); g_baseLutPreviewSRV_B = nullptr; }
+    if (g_baseLutPreviewTexB) { g_baseLutPreviewTexB->Release(); g_baseLutPreviewTexB = nullptr; }
     if (g_constantBuffer) { g_constantBuffer->Release(); g_constantBuffer = nullptr; }
     if (g_samplerPoint) { g_samplerPoint->Release(); g_samplerPoint = nullptr; }
     if (g_samplerLinear) { g_samplerLinear->Release(); g_samplerLinear = nullptr; }

@@ -500,6 +500,84 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// SDR grayscale FULL-PREVIEW scanout support (realization A — see
+// CODEX_PREVIEW_BAKE_PROMPT.md). During the SDR correction-grayscale live edit we
+// neutralize scanout to IDENTITY (via a transient passthrough profile) and have the
+// overlay shader reproduce the WHOLE MHC2 transform + the live correction, so the
+// preview is bit-identical to the bake (including per-channel / white-balance).
+// ----------------------------------------------------------------------------
+
+// Compute the matrix + base 1D LUT the full-preview shader must reproduce, for the
+// PERM_GS-stripped SDR perm (corrGS off — the shader applies it live). SDR only.
+bool ComputeSdrPreviewScanout(int monitorIndex, uint8_t strippedPerm,
+                              float outResult9[9],
+                              std::vector<float>& outBaseLutR,
+                              std::vector<float>& outBaseLutG,
+                              std::vector<float>& outBaseLutB) {
+    MHCSettings mhcCopy;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        mhcCopy = g_gui.monitorSettings[monitorIndex].sdrMHC;
+    }
+    MHC2ProfileParams params;
+    BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/false, monitorIndex, strippedPerm, params);
+    return ComputeSdrScanoutForShader(params, outResult9, outBaseLutR, outBaseLutG, outBaseLutB);
+}
+
+// Install + associate a transient identity (passthrough) SDR MHC profile so scanout
+// contributes IDENTITY during the full-preview. Returns the installed profile name (for
+// teardown) or empty on failure. The real profile name in MHCSettings is left untouched
+// so FinishGsLive's RegenerateMhcIfActive can re-associate the real profile on exit.
+std::wstring EngageSdrPassthroughScanout(int monitorIndex) {
+    if (!IsMHC2ApiAvailable()) return L"";
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return L"";
+
+    // All-default SDR params ⇒ primaries off (identity matrix) + grayscale off (identity 1D LUT)
+    // + WB off + corrGS off ⇒ a true passthrough profile.
+    MHC2ProfileParams params;
+    params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
+        ? g_gui.monitorNames[monitorIndex] : L"Monitor";
+    params.isHDR = false;
+
+    std::vector<uint8_t> profileData;
+    if (!GenerateMHC2Profile(params, profileData)) return L"";
+
+    wchar_t monTag[8];
+    swprintf_s(monTag, L"Mon%d", monitorIndex);
+    std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag)
+        + L"_SDR_Passthru_" + std::to_wstring(GetTickCount64()) + L".icm";
+    wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring tempPath = std::wstring(tempDir) + profileName;
+    if (!WriteMHC2Profile(profileData, tempPath)) return L"";
+
+    // InstallMHC2Profile copies to the system color dir AND associates as the active default.
+    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, false)) {
+        DeleteFileW(tempPath.c_str());
+        return L"";
+    }
+    DeleteFileW(tempPath.c_str());
+    std::cout << "MHC: engaged SDR passthrough scanout for monitor " << monitorIndex << std::endl;
+    return profileName;
+}
+
+// Disassociate + delete the transient passthrough profile. Scanout is restored to the real
+// profile separately (RegenerateMhcIfActive re-associates it). Safe to call with empty name.
+void DisengageSdrPassthroughScanout(int monitorIndex, const std::wstring& passthroughName) {
+    if (passthroughName.empty()) return;
+    DisplayInfo displayInfo;
+    if (GetDisplayInfoForMonitor(monitorIndex, displayInfo)) {
+        RemoveMHC2Profile(passthroughName, displayInfo.adapterId, displayInfo.sourceId, false);
+    }
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectory(sysDir, MAX_PATH);
+    DeleteFileW((std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + passthroughName).c_str());
+    std::cout << "MHC: disengaged SDR passthrough scanout for monitor " << monitorIndex << std::endl;
+}
+
 void SwapDgForAllMonitors(bool dgEnabled) {
     // First pass: auto-generate identity MHC profiles for monitors that have
     // DG enabled in settings but no MHC profile yet (DG needs MHC to carry it)

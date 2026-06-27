@@ -1599,6 +1599,100 @@ TEST_CASE("MHC LUT SDR per-channel: R/G/B differ") {
     CHECK(lutG[128] < lutB[128]);
 }
 
+// ============================================================================
+// SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md)
+// ============================================================================
+
+TEST_CASE("SDR full-preview: ComputeSdrScanoutForShader mirrors the bake building blocks") {
+    // The overlay shader reproduces the MHC2 scanout (matrix + base 1D LUT) from these outputs,
+    // then composes the live correction per-channel. Lock the helper to the SAME matrix + base
+    // LUT the real bake (ComputeMHC2Matrix / GenerateMHC2LUT_SDR_Channel) produces.
+
+    // (1) primaries OFF + no base GS => identity matrix + identity base LUT.
+    {
+        MHC2ProfileParams p; p.isHDR = false;
+        float r9[9]; std::vector<float> bR, bG, bB;
+        REQUIRE(ComputeSdrScanoutForShader(p, r9, bR, bG, bB));
+        CHECK(r9[0] == doctest::Approx(1.0f).epsilon(1e-4));
+        CHECK(r9[1] == doctest::Approx(0.0f).epsilon(1e-4));
+        CHECK(r9[4] == doctest::Approx(1.0f).epsilon(1e-4));
+        CHECK(r9[8] == doctest::Approx(1.0f).epsilon(1e-4));
+        REQUIRE(bR.size() == 1024u);
+        for (int j : {0, 256, 512, 1023}) {
+            float expect = (float)j / 1023.0f;
+            CHECK(bR[j] == doctest::Approx(expect).epsilon(0.01));
+            CHECK(bG[j] == doctest::Approx(expect).epsilon(0.01));
+            CHECK(bB[j] == doctest::Approx(expect).epsilon(0.01));
+        }
+    }
+
+    // (2) primaries ON (sRGB->P3) => as-applied matrix matches ComputeMHC2Matrix's result.
+    {
+        MHC2ProfileParams p; p.isHDR = false; p.primariesEnabled = true; p.displayPrimaries = kP3D65;
+        float r9[9]; std::vector<float> bR, bG, bB;
+        REQUIRE(ComputeSdrScanoutForShader(p, r9, bR, bG, bB));
+        float mhc[12], expect9[9];
+        ComputeMHC2Matrix(kSRGB, kP3D65, false, mhc, nullptr, expect9);
+        for (int i = 0; i < 9; i++) CHECK(r9[i] == doctest::Approx(expect9[i]).epsilon(1e-4));
+    }
+
+    // (3) base GS on => base LUT matches GenerateMHC2LUT_SDR_Channel.
+    {
+        MHC2ProfileParams p; p.isHDR = false;
+        p.grayscaleEnabled = true; p.grayscale.enabled = true; p.grayscale.pointCount = 32;
+        for (int i = 0; i < 32; i++) {
+            float sig = (float)i / 31.0f; sig = sig * sig;
+            p.grayscale.points[i]  = sig;
+            p.grayscale.pointsR[i] = sig * 0.97f;
+            p.grayscale.pointsG[i] = sig;
+            p.grayscale.pointsB[i] = sig * 1.03f;
+        }
+        float r9[9]; std::vector<float> bR, bG, bB;
+        REQUIRE(ComputeSdrScanoutForShader(p, r9, bR, bG, bB));
+        std::vector<float> refR(1024);
+        GenerateMHC2LUT_SDR_Channel(p.grayscale, refR.data(), 1024, 0);
+        for (int j : {0, 200, 512, 800, 1023})
+            CHECK(bR[j] == doctest::Approx(refR[j]).epsilon(1e-4));
+    }
+}
+
+TEST_CASE("SDR full-preview: per-channel correction model (not luma-ratio)") {
+    // The shader's full-preview composes the correction PER-CHANNEL (EvalGrayscaleSDR_Channel),
+    // exactly like the bake — NOT the luma-ratio ApplyGrayscaleCorrection (which only matches for
+    // gray). A red-only slam at a dark red over a bright green/blue must be caught by the
+    // per-channel model and MISSED by the luma model — proving why the per-channel form is needed.
+    GrayscaleData corr; corr.enabled = true; corr.pointCount = 32;
+    for (int i = 0; i < 32; i++) {
+        float sig = (float)i / 31.0f; sig = sig * sig;
+        corr.points[i] = sig; corr.pointsR[i] = sig; corr.pointsG[i] = sig; corr.pointsB[i] = sig;
+    }
+    corr.pointsR[8] = std::clamp(corr.pointsR[8] * 1.5f, 0.0f, 1.0f);  // red-only slam at slot 8
+
+    // Post-base per-channel signals: dark red (~slot 8), bright green/blue (~slot 20+).
+    float vR = 0.07f, vG = 0.5f, vB = 0.5f;
+
+    // Per-channel direct model (bake == shader full-preview).
+    float bakeR = EvalGrayscaleSDR_Channel(vR, corr, 0);
+    float bakeG = EvalGrayscaleSDR_Channel(vG, corr, 1);
+    float bakeB = EvalGrayscaleSDR_Channel(vB, corr, 2);
+
+    // Old luma-ratio model (ApplyGrayscaleCorrection): single luma index + ratio scaling.
+    float Y = 0.2126f * vR + 0.7152f * vG + 0.0722f * vB;
+    float idx = std::sqrt(std::clamp(Y, 0.0f, 1.0f)) * 31.0f;
+    int i0 = (int)std::floor(idx), i1 = std::min(i0 + 1, 31); float t = idx - std::floor(idx);
+    float s0 = std::sqrt(std::max(corr.pointsR[i0], 0.0f)), s1 = std::sqrt(std::max(corr.pointsR[i1], 0.0f));
+    float cR = s0 + (s1 - s0) * t; cR *= cR;
+    float lumaR = vR * cR / Y;
+
+    // Per-channel R sees the slot-8 slam (its own index ~8); luma indexes by Y (~slot 20) and misses it.
+    CHECK(bakeR > vR * 1.2f);                       // per-channel catches the slam
+    CHECK(lumaR == doctest::Approx(vR).epsilon(0.05));  // luma model misses it
+    CHECK(std::fabs(bakeR - lumaR) > 0.005f);       // the two models genuinely diverge
+    // Green/blue identity curves are unaffected by the red slam.
+    CHECK(bakeG == doctest::Approx(vG).epsilon(0.02));
+    CHECK(bakeB == doctest::Approx(vB).epsilon(0.02));
+}
+
 TEST_CASE("MHC LUT HDR per-channel: R/G/B differ") {
     GrayscaleData gs;
     gs.enabled = true;

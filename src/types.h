@@ -608,6 +608,16 @@ struct MonitorContext {
     MovableAtomic<bool> hdrMhcGrayscaleActive{ false };   // HDR MHC grayscale installed at GPU scanout
     MovableAtomic<bool> corrGsPreviewActive{ false };    // Correction GS preview: let shader GS through MHC suppression
 
+    // SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md). When engaged,
+    // SDR scanout is the transient passthrough (identity) profile and the overlay shader
+    // reproduces the WHOLE MHC2 transform (previewResult matrix + previewBaseLut) before the
+    // live correction, so the preview is bit-identical to the bake (incl. per-channel/WB).
+    MovableAtomic<bool> corrGsFullPreviewActive{ false };
+    float previewResult[9] = { 1,0,0, 0,1,0, 0,0,1 };    // net as-applied RGB->RGB matrix (row-major)
+    std::vector<float> previewBaseLut[3];                // per-channel base 1D LUT staged for t11 upload
+    int previewBaseLutSize = 1024;                       // entries per channel in previewBaseLut
+    MovableAtomic<bool> previewBaseLutDirty{ false };    // render thread uploads previewBaseLut to t11 when set
+
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     MovableAtomic<bool> cbDirty{ true };     // True when constant buffer needs update (GUI thread sets it cross-thread)
     bool shaderCorrActive = false;           // Per-monitor: the OVERLAY shader is applying some correction

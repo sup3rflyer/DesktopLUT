@@ -301,7 +301,8 @@ static const float g_bradfordD65toD50[9] = {
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
                        bool isHDR, float outMHC[12],
-                       const float* whiteBalanceGains) {
+                       const float* whiteBalanceGains,
+                       float* outAsAppliedRGB) {
     // The MHC2 driver pipeline:
     //   wire → DeGamma → RGBtoXYZ → [MHC2 matrix] → XYZtoRGB → ReGamma → LUT → display
     //
@@ -376,6 +377,12 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
     std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
 
+    // Capture the NET as-applied RGB->RGB transform (WB baked in) BEFORE the SDR basis
+    // conjugation below overwrites `result` with the emitted tag. This pre-conjugation
+    // `result` is what the panel sees (Windows applies inv(S)*emit*S == result for SDR),
+    // and what the live grayscale full-preview shader reproduces. (mhc_icc.cpp:306 pipeline.)
+    if (outAsAppliedRGB) memcpy(outAsAppliedRGB, result, sizeof(float) * 9);
+
     // SDR-only basis conjugation (SDR_MHC2_XYZ_BASIS_BUG.md). Windows consumes the SDR MHC2 matrix as
     // a CIEXYZ "3x4 XYZ→XYZ adjustment", composing SrcRGBtoXYZ * Adjust * XYZtoTgtRGB; for src=tgt=sRGB
     // the as-applied transform is inv(S)*result*S (see basis note above). `result` is a direct RGB→RGB
@@ -402,6 +409,62 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     outMHC[0]  = result[0]; outMHC[1]  = result[1]; outMHC[2]  = result[2]; outMHC[3]  = 0.0f;
     outMHC[4]  = result[3]; outMHC[5]  = result[4]; outMHC[6]  = result[5]; outMHC[7]  = 0.0f;
     outMHC[8]  = result[6]; outMHC[9]  = result[7]; outMHC[10] = result[8]; outMHC[11] = 0.0f;
+}
+
+// Compute the SDR scanout (net as-applied matrix + per-channel base 1D LUT) the live grayscale
+// full-preview shader reproduces. Mirrors the SDR matrix + base-LUT generation in
+// GenerateMHC2Profile (srcPrim=sRGB; displayPrim=params.displayPrimaries when primariesEnabled;
+// LUT source = 1D-cube corr / per-channel TRC / base grayscale, in that priority). corrGS is NOT
+// composed here — the shader applies it live (params should be built for the PERM_GS-stripped perm).
+bool ComputeSdrScanoutForShader(const MHC2ProfileParams& params,
+                                float outResult9[9],
+                                std::vector<float>& outBaseLutR,
+                                std::vector<float>& outBaseLutG,
+                                std::vector<float>& outBaseLutB) {
+    if (params.isHDR) return false;
+    const int lutSize = 1024;
+
+    // SDR source/display primaries — identical derivation to GenerateMHC2Profile (SDR branch).
+    const DisplayPrimariesData& srcPrim = g_srgbPrimaries;
+    const DisplayPrimariesData& displayPrim = params.primariesEnabled
+        ? params.displayPrimaries : g_srgbPrimaries;
+    bool hasWB = (params.whiteBalanceGains[0] != 1.0f || params.whiteBalanceGains[1] != 1.0f
+                  || params.whiteBalanceGains[2] != 1.0f);
+    const float* wbGains = hasWB ? params.whiteBalanceGains : nullptr;
+
+    float mhcMatrix[12];
+    ComputeMHC2Matrix(srcPrim, displayPrim, false, mhcMatrix, wbGains, outResult9);
+
+    outBaseLutR.assign(lutSize, 0.0f);
+    outBaseLutG.assign(lutSize, 0.0f);
+    outBaseLutB.assign(lutSize, 0.0f);
+
+    auto resampleCurve = [](const std::vector<float>& src, float* dst, int dstSize) {
+        for (int j = 0; j < dstSize; j++) {
+            float t = (float)j / (float)(dstSize - 1);
+            float srcIdx = t * (float)(src.size() - 1);
+            int i0 = (int)srcIdx;
+            int i1 = (std::min)(i0 + 1, (int)src.size() - 1);
+            float frac = srcIdx - floorf(srcIdx);
+            dst[j] = std::clamp(src[i0] + (src[i1] - src[i0]) * frac, 0.0f, 1.0f);
+        }
+    };
+
+    if (params.hasPrecomputedCorrection && !params.corrR.empty() && !params.corrG.empty() && !params.corrB.empty()) {
+        resampleCurve(params.corrR, outBaseLutR.data(), lutSize);
+        resampleCurve(params.corrG, outBaseLutG.data(), lutSize);
+        resampleCurve(params.corrB, outBaseLutB.data(), lutSize);
+    } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
+        float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
+        GenerateMHC2LUT_FromTRC_SDR(params.trcR, outBaseLutR.data(), lutSize, targetGamma);
+        GenerateMHC2LUT_FromTRC_SDR(params.trcG, outBaseLutG.data(), lutSize, targetGamma);
+        GenerateMHC2LUT_FromTRC_SDR(params.trcB, outBaseLutB.data(), lutSize, targetGamma);
+    } else {
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, outBaseLutR.data(), lutSize, 0);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, outBaseLutG.data(), lutSize, 1);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, outBaseLutB.data(), lutSize, 2);
+    }
+    return true;
 }
 
 // ============================================================================

@@ -469,6 +469,23 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         }
         cbData[130] = useICtCp ? 1.0f : 0.0f;  // grayscaleICtCp
         cbData[131] = 0.0f;  // reserved
+        // Rows 33-35 (cbData[132..143]): SDR grayscale FULL-PREVIEW matrix + flags (realization A).
+        // Active SDR only; when off, the flag (.w of row0) is 0 and the shader ignores this block.
+        bool corrGsFullPreview = ctx->corrGsFullPreviewActive.load() && !ctx->isHDREnabled;
+        cbData[132] = ctx->previewResult[0];
+        cbData[133] = ctx->previewResult[1];
+        cbData[134] = ctx->previewResult[2];
+        cbData[135] = corrGsFullPreview ? 1.0f : 0.0f;          // corrPreviewMatRow0.w = flag
+        cbData[136] = ctx->previewResult[3];
+        cbData[137] = ctx->previewResult[4];
+        cbData[138] = ctx->previewResult[5];
+        cbData[139] = (float)ctx->previewBaseLutSize;           // corrPreviewMatRow1.w = base LUT size
+        cbData[140] = ctx->previewResult[6];
+        cbData[141] = ctx->previewResult[7];
+        cbData[142] = ctx->previewResult[8];
+        // corrPreviewMatRow2.w = correction-grayscale use24Gamma (full-preview applies it per-channel,
+        // independent of the shared grayscale24 suppression which doesn't apply in this path).
+        cbData[143] = (corrGsFullPreview && cc.grayscale.use24Gamma) ? 1.0f : 0.0f;
         g_context->Unmap(g_constantBuffer, 0);
 
         // Only clear dirty flag and update cached atomics AFTER successful write.
@@ -619,6 +636,26 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     g_context->PSSetShaderResources(8, 1, &g_srgbEotfSRV);       // sRGB EOTF (sRGB->Linear)
     g_context->PSSetShaderResources(9, 1, &g_gammaRatioSRV);     // pow(Y, 1/11) for 2.4 gamma
     g_context->PSSetShaderResources(10, 1, &g_wbGammaSRV);       // pow(gain, 1/2.2) for WB
+    // SDR grayscale full-preview base LUTs (t11-t13). Re-upload once per begin (atomic dirty
+    // handshake; begin is the only writer and is serialized per editor session). Harmless when
+    // the full-preview flag is off — the shader ignores t11-t13.
+    if (ctx->previewBaseLutDirty.load()) {
+        int n = ctx->previewBaseLutSize;
+        ID3D11Texture2D* baseTex[3] = { g_baseLutPreviewTexR, g_baseLutPreviewTexG, g_baseLutPreviewTexB };
+        for (int ch = 0; ch < 3; ch++) {
+            if (baseTex[ch] && (int)ctx->previewBaseLut[ch].size() >= n) {
+                D3D11_MAPPED_SUBRESOURCE bm;
+                if (SUCCEEDED(g_context->Map(baseTex[ch], 0, D3D11_MAP_WRITE_DISCARD, 0, &bm))) {
+                    memcpy(bm.pData, ctx->previewBaseLut[ch].data(), (size_t)n * sizeof(float));
+                    g_context->Unmap(baseTex[ch], 0);
+                }
+            }
+        }
+        ctx->previewBaseLutDirty = false;
+    }
+    g_context->PSSetShaderResources(11, 1, &g_baseLutPreviewSRV_R);  // SDR full-preview base LUT (R)
+    g_context->PSSetShaderResources(12, 1, &g_baseLutPreviewSRV_G);  // (G)
+    g_context->PSSetShaderResources(13, 1, &g_baseLutPreviewSRV_B);  // (B)
 
     ID3D11SamplerState* samplers[] = { g_samplerPoint, g_samplerLinear, g_samplerWrap };
     g_context->PSSetSamplers(0, 3, samplers);

@@ -92,10 +92,27 @@ struct MHCProfileState {
 // outMHC is 12 floats: 3x4 row-major (4th column = 0)
 // whiteBalanceGains: optional diagonal RGB gains baked into matrix (von Kries)
 //   When non-null, scales each column of srcToXYZ before final multiply
+// outAsAppliedRGB: optional 9 floats (row-major 3x3). When non-null, receives the NET
+//   as-applied RGB->RGB transform the panel actually sees (the PRE-conjugation `result`,
+//   NOT the emitted S*M*inv(S) SDR tag). This is what a shader must reproduce to predict
+//   the bake (used by the live grayscale full-preview). WB gains are already baked in.
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
                        bool isHDR, float outMHC[12],
-                       const float* whiteBalanceGains = nullptr);
+                       const float* whiteBalanceGains = nullptr,
+                       float* outAsAppliedRGB = nullptr);
+
+// Compute the SDR scanout transform a live grayscale FULL-PREVIEW shader must reproduce:
+//   outResult9   = net as-applied RGB->RGB matrix (row-major 3x3, WB baked in, pre-conjugation)
+//   outBaseLut*  = per-channel base 1D LUT (1024 entries, sRGB signal), correctionGrayscale OFF
+// Mirrors GenerateMHC2Profile's SDR matrix + base-LUT generation EXACTLY for the given params
+// (build them for the PERM_GS-stripped perm so corrGS is off — the shader applies corrGS live).
+// SDR only; returns false if params.isHDR. See docs realization-A (CODEX_PREVIEW_BAKE_PROMPT.md).
+bool ComputeSdrScanoutForShader(const MHC2ProfileParams& params,
+                                float outResult9[9],
+                                std::vector<float>& outBaseLutR,
+                                std::vector<float>& outBaseLutG,
+                                std::vector<float>& outBaseLutB);
 
 // Generate MHC2 1D LUT for SDR (1024 entries, sRGB signal domain)
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize = 1024);

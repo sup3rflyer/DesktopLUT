@@ -64,3 +64,21 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm);
 // Toggle the DG bit in the active permutation for all HDR monitors.
 // Called by hotkey handlers and whitelist when desktop gamma changes at runtime.
 void SwapDgForAllMonitors(bool dgEnabled);
+
+// ============================================================================
+// SDR grayscale FULL-PREVIEW scanout (realization A; CODEX_PREVIEW_BAKE_PROMPT.md)
+// ============================================================================
+#include <vector>
+
+// Compute the matrix (row-major 3x3) + per-channel base 1D LUT the full-preview shader
+// reproduces, for the PERM_GS-stripped SDR perm. SDR only; false on failure.
+bool ComputeSdrPreviewScanout(int monitorIndex, uint8_t strippedPerm,
+                              float outResult9[9],
+                              std::vector<float>& outBaseLutR,
+                              std::vector<float>& outBaseLutG,
+                              std::vector<float>& outBaseLutB);
+
+// Engage/disengage a transient identity SDR scanout profile during the full-preview.
+// Engage returns the installed passthrough profile name (empty on failure).
+std::wstring EngageSdrPassthroughScanout(int monitorIndex);
+void DisengageSdrPassthroughScanout(int monitorIndex, const std::wstring& passthroughName);

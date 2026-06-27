@@ -54,6 +54,11 @@ cbuffer LUTParams : register(b0) {
     float motionBarPosition;
     float grayscaleICtCp;          // HDR: use ICtCp offsets instead of PQ per-channel gains
     float motionBarPad1;
+    // SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md). xyz = net
+    // as-applied MHC2 RGB->RGB matrix rows; w packs flags.
+    float4 corrPreviewMatRow0;     // xyz = result row 0; w = corrGsFullPreview (0/1)
+    float4 corrPreviewMatRow1;     // xyz = result row 1; w = base-LUT size (entries)
+    float4 corrPreviewMatRow2;     // xyz = result row 2; w = reserved
 };
 
 Texture2D<float4> captureTexture : register(t0);
@@ -67,6 +72,9 @@ Texture2D<float> srgbOetfLUT : register(t7);      // sRGB OETF: Linear->sRGB (10
 Texture2D<float> srgbEotfLUT : register(t8);      // sRGB EOTF: sRGB->Linear (1024x1)
 Texture2D<float> gammaRatioLUT : register(t9);     // pow(Y, 1/11) ratio for 2.4 gamma (1024x1)
 Texture2D<float> wbGammaLUT : register(t10);       // pow(gain, 1/2.2) for WB gains [0,2] (512x1)
+Texture2D<float> baseLutPreviewR : register(t11);  // SDR grayscale full-preview base 1D LUT (R)
+Texture2D<float> baseLutPreviewG : register(t12);  // SDR grayscale full-preview base 1D LUT (G)
+Texture2D<float> baseLutPreviewB : register(t13);  // SDR grayscale full-preview base 1D LUT (B)
 SamplerState pointSampler : register(s0);
 SamplerState linearSampler : register(s1);
 SamplerState wrapSampler : register(s2);
@@ -163,6 +171,72 @@ float3 ApplySDRCorrections(float3 rgb) {
         rgb = sRGB_OETF3(max(lin, 0.0));
     }
     return rgb;
+}
+
+// Sample the per-channel SDR base 1D LUT (full-preview). Size = corrPreviewMatRow1.w.
+float sampleBaseLutPreview(float v, int ch) {
+    float n = max(corrPreviewMatRow1.w, 2.0f);
+    float scale = (n - 1.0f) / n;
+    float bias = 0.5f / n;
+    float u = saturate(v) * scale + bias;
+    if (ch == 0) return baseLutPreviewR.SampleLevel(linearSampler, float2(u, 0.5f), 0);
+    if (ch == 1) return baseLutPreviewG.SampleLevel(linearSampler, float2(u, 0.5f), 0);
+    return baseLutPreviewB.SampleLevel(linearSampler, float2(u, 0.5f), 0);
+}
+
+// Per-channel correction, mirroring the bake's EvalGrayscaleSDR_Channel EXACTLY (mhc.cpp:107):
+// index by sqrt(this channel's value), interpolate the channel curve in sqrt domain, square.
+// This is NOT the luma-ratio ApplyGrayscaleCorrection — that only matches the bake for gray; the
+// bake composes per-channel curves into the LUT, so per-channel/WB corrections need this form.
+float evalCorrChannelPreview(float v, int ch) {
+    if (v <= 0.0f) return 0.0f;
+    float pc = max(2.0f, grayscalePoints);
+    float idx = sqrt(saturate(v)) * (pc - 1.0f);
+    int i0 = (int)floor(idx);
+    int i1 = min(i0 + 1, (int)pc - 1);
+    float t = idx - floor(idx);
+    float v0, v1;
+    if (ch == 0)      { v0 = grayscaleR[i0/4][i0%4]; v1 = grayscaleR[i1/4][i1%4]; }
+    else if (ch == 1) { v0 = grayscaleG[i0/4][i0%4]; v1 = grayscaleG[i1/4][i1%4]; }
+    else              { v0 = grayscaleB[i0/4][i0%4]; v1 = grayscaleB[i1/4][i1%4]; }
+    float s0 = sqrt(max(v0, 0.0f));
+    float s1 = sqrt(max(v1, 0.0f));
+    float cs = lerp(s0, s1, t);
+    return cs * cs;
+}
+
+// SDR grayscale FULL-PREVIEW (realization A): reproduce the ENTIRE MHC2 SDR scanout
+// (sRGB-decode -> as-applied matrix -> sRGB-encode -> base 1D LUT), then apply the live
+// correction LAST (per-channel, signal-domain, post base LUT) — exactly as the bake composes
+// it. Scanout is the identity passthrough during preview, so the shader output IS the panel
+// signal (no inversion). Input/output: sRGB-encoded signal. Matches GenerateMHC2Profile.
+// corrPreviewMatRow2.w = correctionGrayscale.use24Gamma (per-channel 2.2->2.4, like the bake).
+float3 ApplyFullGsPreviewSDR(float3 sig) {
+    float3x3 M = float3x3(corrPreviewMatRow0.xyz, corrPreviewMatRow1.xyz, corrPreviewMatRow2.xyz);
+    // Reproduce scanout up to the base-LUT output (the signal the bake corrects).
+    float3 lin = sRGB_EOTF3(sig);
+    float3 mlin = max(mul(M, lin), 0.0f);
+    float3 vbase = sRGB_OETF3(mlin);
+    vbase = float3(sampleBaseLutPreview(vbase.r, 0),
+                   sampleBaseLutPreview(vbase.g, 1),
+                   sampleBaseLutPreview(vbase.b, 2));
+    // Per-channel correction, exactly as the bake composes EvalGrayscaleSDR_Channel.
+    float3 outSig = float3(evalCorrChannelPreview(vbase.r, 0),
+                           evalCorrChannelPreview(vbase.g, 1),
+                           evalCorrChannelPreview(vbase.b, 2));
+    // Correction-grayscale 2.4 gamma — PER-CHANNEL pow(lin, 2.4/2.2) (mhc_icc.cpp compose),
+    // realized as lin * pow(lin, 1/11) via gammaRatioLUT. Not the luma-based Apply24GammaLinear.
+    if (corrPreviewMatRow2.w > 0.5f) {
+        float gscale = 1023.0f / 1024.0f;
+        float gbias = 0.5f / 1024.0f;
+        float3 l = sRGB_EOTF3(outSig);
+        float3 ratio = float3(
+            gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(l.x) * gscale + gbias, 0.5f), 0),
+            gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(l.y) * gscale + gbias, 0.5f), 0),
+            gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(l.z) * gscale + gbias, 0.5f), 0));
+        outSig = sRGB_OETF3(max(l * ratio, 0.0f));
+    }
+    return saturate(outSig);   // bake clamps each composed LUT entry to [0,1]
 }
 )"
 // Part 2b: ICTCP color space infrastructure (Dolby ICtCp for HDR)
@@ -782,7 +856,11 @@ R"(
         // STAGE 3: Linear-space corrections (matches MHC 1D LUT pipeline)
         // Single sRGB decode/encode roundtrip for grayscale + 2.4 gamma
         // ═══════════════════════════════════════════════════════════════════════
-        if (grayscaleEnabled > 0.5 || grayscale24 > 0.5)
+        if (corrPreviewMatRow0.w > 0.5)
+            // Full-preview (realization A): scanout is identity passthrough; reproduce the
+            // WHOLE MHC2 transform + live correction so preview is bit-identical to the bake.
+            input = ApplyFullGsPreviewSDR(input);
+        else if (grayscaleEnabled > 0.5 || grayscale24 > 0.5)
             input = ApplySDRCorrections(input);
 
         float3 corrected;

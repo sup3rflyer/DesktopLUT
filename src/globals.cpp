@@ -46,6 +46,12 @@ ID3D11Texture2D* g_gammaRatioTexture = nullptr;
 ID3D11ShaderResourceView* g_gammaRatioSRV = nullptr;
 ID3D11Texture2D* g_wbGammaTexture = nullptr;
 ID3D11ShaderResourceView* g_wbGammaSRV = nullptr;
+ID3D11Texture2D* g_baseLutPreviewTexR = nullptr;
+ID3D11ShaderResourceView* g_baseLutPreviewSRV_R = nullptr;
+ID3D11Texture2D* g_baseLutPreviewTexG = nullptr;
+ID3D11ShaderResourceView* g_baseLutPreviewSRV_G = nullptr;
+ID3D11Texture2D* g_baseLutPreviewTexB = nullptr;
+ID3D11ShaderResourceView* g_baseLutPreviewSRV_B = nullptr;
 
 // ============================================================================
 // Monitor State
