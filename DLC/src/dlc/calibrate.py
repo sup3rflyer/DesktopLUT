@@ -103,7 +103,6 @@ from .measure_loop import (
 from .decisions import hdr_metric_thresholds
 from .metrics import delta_e2000, percentile, score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
-from .mhc_grayscale import srgb_oetf
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
 from . import patch_evidence
@@ -4929,13 +4928,11 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
     """The grey points of DesktopLUT's Grayscale-correction editor — one patch per slider,
     so each measured patch tunes the slider it sits on (NOT a uniform calibration ramp).
 
-    DesktopLUT addresses the SDR grayscale slots by ``sqrt(linear-Y)`` and decodes a
-    framebuffer code with the **sRGB-piecewise** EOTF before indexing — so slider ``i`` (of
-    ``n``) sits at linear-Y ``(i/(n-1))²`` and is driven by the SIGNAL code
-    ``cap·SrgbOETF((i/(n-1))²)``. We present exactly that code so patch i lands on slot i
-    (HW-probed sRGB across N=10/20/32, 2026-06-27 — 6/6 slots, decisive in the shadows). The
-    2.2 panel gamma is the OUTPUT target (``target_Y`` in the touch-up loop), a separate axis —
-    NOT the code placement. HDR is linear across the active-peak PQ code range (``max_cv``).
+    DesktopLUT's SDR grayscale is SIGNAL-domain: the slots are indexed by ``sqrt(signal)``, so
+    slider ``i`` (of ``n``) sits at signal ``(i/(n-1))²`` — i.e. code ``round(cap·(i/(n-1))²)``,
+    dense in the shadows. We present exactly that code, so patch i lands on slot i AND the
+    slider's value IS the patch code (HW-probed across N=10/20/32, 2026-06-27 — 6/6 slots,
+    decisive in the shadows). HDR is linear across the active-peak PQ code range (``max_cv``).
     Uniform spacing here mistunes every interior slider.
     """
     cap = max_cv if max_cv is not None else transfer.max_cv
@@ -4943,10 +4940,9 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
     if transfer.kind == "pq":  # HDR editor: linear in code across the active peak
         levels = uniform_levels(n, cap)
     else:
-        # SDR: the sRGB signal code that lands on slot i (see docstring). sRGB, NOT the old
-        # cap·t^(2/γ): the γ2.2-power placement put shadow patches several codes off their slot
-        # because the shader decodes sRGB-piecewise, not a pure power. HW-probed 2026-06-27.
-        levels = [round(cap * srgb_oetf((i / (n - 1)) ** 2)) for i in range(n)]
+        # SDR: signal-domain placement -- slot i sits at signal t², so its code is cap·t²
+        # (dense low, sparse high). The slider's number is exactly this code.
+        levels = [round(cap * (i / (n - 1)) ** 2) for i in range(n)]
     return [(v, v, v) for v in levels]
 
 

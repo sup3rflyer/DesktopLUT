@@ -6,32 +6,24 @@ and getting the translation wrong silently destroys the calibration (it bakes a
 ``Y**0.5`` de-gamma into the MHC2 1D LUT, collapsing a 2.2 panel to ~1.0 and
 over-desaturating the primaries — see docs/HANDOFF.md).
 
-DesktopLUT's SDR MHC2 grayscale (DesktopLUT ``types.h`` / ``mhc.cpp``):
-  * ``points[i]`` is the *linear-light* output at a **sqrt-distributed** sample i;
-    the identity curve is ``points[i] = t_i**2`` where ``t_i = i/(N-1)``
+DesktopLUT's SDR MHC2 grayscale is **SIGNAL-domain** (``types.h`` / ``mhc.cpp``,
+``ApplyGrayscaleCorrection`` / ``GenerateMHC2LUT_SDR_Channel``):
+  * the slots are indexed by ``sqrt(signal)`` and the curve stores **signal** values,
+    so slot i sits at signal ``t_i**2`` (``t_i = i/(N-1)``) — i.e. code ``cap·t_i**2``,
+    dense in the shadows, and the slider's value IS the patch code that drives it.
+  * ``points[i]`` is the *signal* output at slot i; identity is ``points[i] = t_i**2``
     (``types.h``: ``points[i] = t * t``).
-  * per-channel ``deviations`` multiply that linear-light base directly:
-    ``pointsCh[i] = points[i] * dev[ch][i]`` — a **linear-light** gain.
-  * the curve is evaluated by indexing with ``sqrt(Y_linear)`` and squaring the
-    interpolated value (``EvalGrayscaleSDR_Channel``), so sample i corresponds to
-    an input linear light of ``Y_i = t_i**2``.
+  * per-channel ``deviations`` multiply that signal base directly:
+    ``pointsCh[i] = points[i] * dev[ch][i]`` — a **signal** gain.
 
-The DLC's refinement law works in the **signal** domain: a deviation ``d`` at a
-gray level ``L`` multiplies that channel's input signal (``effective_in = L*d``)
-and panel luminance follows ``~input**gamma`` — so ``d``'s luminance (linear)
-effect is ``d**gamma``.
-
-The conversion therefore:
-  * emits ``points[i] = t_i**2`` (the sqrt-distributed linear-light identity), and
-  * resamples each signal-domain deviation curve onto DesktopLUT's sample
-    positions. Sample i sits at signal ``L_i = SrgbOETF(t_i**2)`` — the shader
-    decodes a framebuffer code with the **sRGB-piecewise** EOTF before indexing the
-    slot, so the slot<->code mapping is sRGB, NOT a 2.2 power (HW-probed across
-    N=10/20/32, 2026-06-27; the old ``(t_i**2)**(1/gamma)`` x-grid put shadow patches
-    several codes off their slot). The deviation is still raised to ``**gamma`` for the
-    linear-light gain — that exponent is not a transfer choice, it round-trips
-    ``update_point``'s ``**(1/gamma)`` step (panel luminance ``~input**gamma`` is the
-    OUTPUT target, a separate axis from the sRGB code<->slot mapping).
+The DLC's refinement law also works in the **signal** domain: ``update_point`` pre-raises
+the measured linear ratio to ``**(1/gamma)`` to get the signal gain to apply, and the
+panel's ``~signal**gamma`` response turns that signal gain back into the intended linear
+effect. So the bridge is a near pass-through:
+  * emits ``points[i] = t_i**2`` (the signal identity), and
+  * resamples each signal-domain deviation curve onto the slots' signal positions (``t_i**2``).
+  No transfer power is applied — both sides are signal-domain. (HW-probed across N=10/20/32,
+  2026-06-27: 6/6 slots land on code ``cap·t**2``, decisive in the shadows.)
 
 HDR (PQ) uses a different, linear convention (``points[i] = t_i``; the eval
 indexes linearly and does not square — ``types.h``: ``points[i] = t``) and is
@@ -42,21 +34,9 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
-__all__ = ["to_desktoplut_sdr_grayscale", "srgb_oetf"]
+__all__ = ["to_desktoplut_sdr_grayscale"]
 
 _CHANNELS = ("r", "g", "b")
-
-
-def srgb_oetf(v: float) -> float:
-    """sRGB encode: linear light -> signal. Inverse of the sRGB-piecewise EOTF the
-    DesktopLUT SDR shader applies to a framebuffer code BEFORE it indexes the grayscale
-    slot by ``sqrt(linear-Y)`` (``shader.h`` ``sRGB_EOTF3`` -> ``ApplyGrayscaleCorrection-
-    Linear``; baked path ``GenerateMHC2LUT_SDR``). So the slot<->code mapping is sRGB-
-    piecewise, NOT a 2.2 power. HW-probed across N=10/20/32 (2026-06-27): 6/6 slots landed
-    on the sRGB code, not the power-law code (decisive in the shadows)."""
-    if v <= 0.0031308:
-        return 12.92 * v
-    return 1.055 * (v ** (1.0 / 2.4)) - 0.055
 
 
 def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
@@ -85,14 +65,14 @@ def to_desktoplut_sdr_grayscale(
     *,
     gamma: float = 2.2,
 ) -> tuple[list[float], dict[str, list[float]]]:
-    """Convert (signal-level points, signal-domain deviations) to DesktopLUT's
-    SDR MHC2 convention (sqrt-distributed linear-light points + linear-light
-    deviations).
+    """Resample (signal-level points, signal-domain deviations) onto DesktopLUT's SDR MHC2
+    grayscale slots (sqrt-distributed in signal: slot i at signal ``t_i**2`` = code ``cap·t_i**2``).
+    Both sides are signal-domain, so this is a near pass-through (no transfer power).
 
-    ``points`` are the DLC's measured gray *signal* levels (the x-grid the
-    deviation curves are defined on). ``deviations`` maps each of ``r``/``g``/``b``
-    to a multiplicative signal-domain gain per level. Returns the new
-    ``(points, deviations)`` to hand to ``mhc.set_*_grayscale``.
+    ``points`` are the DLC's measured gray *signal* levels (the x-grid the deviation curves are
+    defined on). ``deviations`` maps each of ``r``/``g``/``b`` to a multiplicative signal-domain
+    gain per level. ``gamma`` is unused for SDR (kept for signature/HDR-passthrough compat).
+    Returns the new ``(points, deviations)`` to hand to ``mhc.set_*_grayscale``.
     """
     n = len(points)
     sig = [float(p) for p in points]
@@ -106,27 +86,23 @@ def to_desktoplut_sdr_grayscale(
     if n == 0:
         return [], {ch: [] for ch in _CHANNELS}
     if n == 1:
-        # Degenerate (DesktopLUT indexes sample 0 for all inputs); a single point
-        # cannot define a ramp. Keep it as a flat linear-light gain and bail.
-        base = sig[0] * sig[0]
-        return [base], {ch: [dev_in[ch][0] ** gamma] for ch in _CHANNELS}
+        # Degenerate (DesktopLUT indexes sample 0 for all inputs); a single point cannot
+        # define a ramp. Pass the signal gain through unchanged and bail.
+        return [sig[0]], {ch: [dev_in[ch][0]] for ch in _CHANNELS}
 
     out_points: list[float] = []
     out_dev: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     for i in range(n):
         t = i / (n - 1)
-        y_linear = t * t                              # DesktopLUT identity base (sqrt-distributed)
-        # The framebuffer SIGNAL that lands a pixel on this slot. The shader decodes a
-        # code with the sRGB-piecewise EOTF before indexing by sqrt(linear-Y), so the
-        # slot's signal is SrgbOETF(y_linear) -- NOT y_linear**(1/gamma). (HW-probed sRGB
-        # across N=10/20/32, 2026-06-27.) Used to resample the DLC's signal-domain
-        # deviation curve onto this sample position.
-        signal_level = srgb_oetf(y_linear)
-        out_points.append(y_linear)
+        # DesktopLUT's SDR grayscale is SIGNAL-domain: slot i sits at signal t² (= code
+        # cap·t²) and the per-channel deviation multiplies the signal directly. So this is a
+        # near pass-through: emit the signal-identity points (t²) and resample the DLC's
+        # signal-domain deviation curve onto each slot's signal position (also t²). NO
+        # transfer power -- the editor applies the gain in signal and the panel's gamma turns
+        # it into the linear effect; update_point already pre-raised the linear ratio to
+        # **(1/gamma) to get this signal gain.
+        y_signal = t * t
+        out_points.append(y_signal)
         for ch in _CHANNELS:
-            d_signal = _interp(signal_level, sig, dev_in[ch])
-            # Signal gain -> linear-light gain. The gamma here is NOT a transfer choice:
-            # it round-trips update_point's step = linear_ratio**(damping/gamma), so the
-            # pair nets to the (damped) linear ratio. Left as-is (orthogonal to alignment).
-            out_dev[ch].append(d_signal ** gamma)
+            out_dev[ch].append(_interp(y_signal, sig, dev_in[ch]))
     return out_points, out_dev

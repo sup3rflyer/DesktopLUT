@@ -1,16 +1,15 @@
 """Lock the DLC -> DesktopLUT grayscale convention bridge.
 
 The bug this guards against: the DLC used to ship the grayscale ``points`` array
-as the *signal* ramp ``t = [0, 1/(N-1), ... 1]``. DesktopLUT's SDR MHC2 grayscale
-expects ``points`` to be *linear-light* values at **sqrt-distributed** samples
-(identity ``points[i] = t_i**2``), and ``EvalGrayscaleSDR_Channel`` indexes by
-``sqrt(Y)`` and squares the interpolation. Feeding the signal ramp into that eval
-bakes a ``Y**0.5`` de-gamma into the 1D LUT — collapsing a 2.2 panel to ~1.0 and
-over-desaturating the primaries.
+as the *signal* ramp ``t = [0, 1/(N-1), ... 1]``. DesktopLUT's SDR MHC2 grayscale is
+SIGNAL-domain — the slots are indexed by ``sqrt(signal)`` and the identity curve is
+``points[i] = t_i**2`` (slot i at signal ``t_i**2`` = code ``cap·t_i**2``). Feeding the
+raw signal ramp ``points=t`` into that eval bakes a ``signal**0.5`` de-gamma into the 1D
+LUT — collapsing a 2.2 panel to ~1.0 and over-desaturating the primaries.
 
-These tests replicate the relevant C++ (DesktopLUT ``mhc.cpp``) faithfully and
-assert that the bridge restores an identity LUT (gamma preserved) and maps signal
-deviations to the correct linear-light gains.
+These tests replicate the relevant C++ (DesktopLUT ``mhc.cpp``) faithfully and assert that
+the bridge restores an identity LUT (gamma preserved) and passes signal-domain deviations
+through unchanged (the panel's gamma turns the signal gain into the linear-light effect).
 """
 
 from __future__ import annotations
@@ -26,15 +25,6 @@ from dlc.mhc_grayscale import to_desktoplut_sdr_grayscale
 # --------------------------------------------------------------------------
 # Faithful replica of DesktopLUT C++ (src/mhc.cpp) SDR grayscale -> 1D LUT.
 # --------------------------------------------------------------------------
-def _srgb_eotf(v: float) -> float:
-    return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
-
-
-def _srgb_oetf(v: float) -> float:
-    v = max(v, 0.0)
-    return v * 12.92 if v <= 0.0031308 else 1.055 * v ** (1 / 2.4) - 0.055
-
-
 def _eval_grayscale_sdr_channel(y_linear: float, pts: list[float], n: int) -> float:
     """Port of EvalGrayscaleSDR_Channel: sqrt-domain index + squared interp."""
     if y_linear <= 0.0:
@@ -52,13 +42,13 @@ def _eval_grayscale_sdr_channel(y_linear: float, pts: list[float], n: int) -> fl
 
 
 def _generate_mhc2_lut_sdr_channel(pts_ch: list[float], n: int, lut_size: int = 1024) -> list[float]:
-    """Port of GenerateMHC2LUT_SDR_Channel (identity grayscale -> identity LUT)."""
+    """Port of GenerateMHC2LUT_SDR_Channel (SIGNAL-domain: index sqrt(signal), correct in
+    signal — no sRGB decode/encode roundtrip; identity grayscale -> identity LUT)."""
     out = []
     for j in range(lut_size):
-        t = j / (lut_size - 1)
-        y_linear = _srgb_eotf(t)
-        y_corrected = _eval_grayscale_sdr_channel(y_linear, pts_ch, n)
-        out.append(min(max(_srgb_oetf(max(y_corrected, 0.0)), 0.0), 1.0))
+        t = j / (lut_size - 1)  # scanout signal
+        corrected = _eval_grayscale_sdr_channel(t, pts_ch, n)
+        out.append(min(max(corrected, 0.0), 1.0))
     return out
 
 
@@ -103,20 +93,24 @@ def test_bridge_restores_identity_lut():
             assert _lut_signal_gamma(lut, frac) == pytest.approx(1.0, abs=0.02)
 
 
-def test_bridge_maps_signal_deviation_to_linear_gain():
-    """A signal-domain deviation d must land as a linear-light gain d**gamma."""
+def test_bridge_passes_signal_deviation_through():
+    """Signal-domain: a signal-domain deviation passes THROUGH unchanged (no **gamma). The LUT
+    then scales the SIGNAL by it, and the panel's ~gamma response turns that into the intended
+    d**gamma linear-light effect."""
     gamma = 2.2
-    # Want the channel's linear light scaled by 0.9 everywhere: signal dev = 0.9**(1/gamma)
+    # A signal gain whose linear-light effect (after the panel's gamma) is 0.9.
     d_signal = 0.9 ** (1.0 / gamma)
     dev = {"r": [d_signal] * N, "g": [1.0] * N, "b": [1.0] * N}
     points, out = to_desktoplut_sdr_grayscale(T, dev, gamma=gamma)
-    # converted deviation should be ~0.9 (linear-light gain)
-    assert out["r"][6] == pytest.approx(0.9, abs=1e-3)
-    # and the eval at 50% signal yields 0.9x the input linear light
+    # bridge is a pass-through in signal domain — NOT raised to **gamma
+    assert out["r"][6] == pytest.approx(d_signal, abs=1e-3)
+    # the LUT scales the signal by d_signal at 50% signal...
     pts_ch = _build_points_ch(points, out["r"])
-    y_in = _srgb_eotf(0.5)
-    y_out = _eval_grayscale_sdr_channel(y_in, pts_ch, N)
-    assert y_out / y_in == pytest.approx(0.9, abs=0.02)
+    s_in = 0.5
+    s_out = _eval_grayscale_sdr_channel(s_in, pts_ch, N)
+    assert s_out / s_in == pytest.approx(d_signal, abs=0.01)
+    # ...and the panel's gamma turns that signal gain into the intended 0.9 linear-light effect
+    assert (s_out / s_in) ** gamma == pytest.approx(0.9, abs=0.01)
 
 
 def test_controller_bridges_sdr_passes_hdr_through():
