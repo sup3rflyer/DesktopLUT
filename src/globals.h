@@ -103,6 +103,7 @@ extern std::atomic<int> g_frameBufferIdleMs;   // Idle timeout before buffer eng
 extern std::atomic<bool> g_dwmHookMode;        // Use DWM hook injection instead of overlay for LUT
 extern std::atomic<bool> g_calibrationControlEnabled;  // Arm the opt-in DLC calibration IPC server (default off)
 extern int g_dwmHookWatchdogRetries;           // Consecutive re-injection failures (GUI thread only)
+extern int g_dwmHookReinjectCount;             // Total re-injection cycles this run — flap detector (GUI thread only)
 extern int g_dwmHookConfigResends;             // Countdown of extra shared-config resends after a topology
                                                // change so the hook's monitor-shrink debounce can converge
                                                // (GUI thread only — watchdog timer decrements it)

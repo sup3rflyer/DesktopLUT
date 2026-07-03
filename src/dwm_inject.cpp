@@ -427,6 +427,27 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     // --- Copy DwmHook.dll to %SYSTEMROOT%\Temp\ ---
     std::wstring dllSrc = GetExeDirectory() + kDllName;
     std::wcout << L"[DWM Hook] Copying DLL: " << dllSrc << L" -> " << dllDest << std::endl;
+
+    // The most common failure here is the DLL simply not being present next to
+    // DesktopLUT.exe — either the user downloaded only the .exe, or antivirus
+    // quarantined DwmHook.dll (it injects into dwm.exe, which AV flags). Detect
+    // that up front and return actionable guidance instead of a bare Win32 code.
+    if (GetFileAttributesW(dllSrc.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        DWORD e = GetLastError();
+        std::wcout << L"[DWM Hook] DwmHook.dll not found at " << dllSrc
+                   << L" (" << GetLastErrorString() << L")" << std::endl;
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) {
+            return L"DwmHook.dll was not found next to DesktopLUT.exe.\n\n"
+                   L"Make sure both DesktopLUT.exe and DwmHook.dll from the release "
+                   L"are in the same folder. If they are, your antivirus may have "
+                   L"quarantined DwmHook.dll (it injects into dwm.exe, which AV often "
+                   L"flags) — restore it and add an exclusion, or re-download the release.\n\n"
+                   L"You can keep using overlay mode by turning off DWM Hook Mode in Settings.";
+        }
+        // Some other reason we can't see the file (permissions, etc.)
+        return L"Cannot access DwmHook.dll next to DesktopLUT.exe: " + GetLastErrorString();
+    }
+
     if (!CopyFileW(dllSrc.c_str(), dllDest.c_str(), FALSE)) {
         std::wcout << L"[DWM Hook] DLL copy FAILED: " << GetLastErrorString() << std::endl;
         return L"Failed to copy DwmHook.dll to staging: " + GetLastErrorString();

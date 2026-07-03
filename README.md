@@ -137,6 +137,7 @@ Hotkeys can be disabled or remapped in the **Settings** tab.
 - Some UI elements (such as Start menu animations) may remain uncorrected
 - DWM Hook Mode disables DirectFlip/iFlip when LUT or tonemapping is active — fullscreen/borderless games lose VRR (use Passthrough Mode to restore it for specific apps)
 - DWM Hook Mode is experimental and may need repair after Windows updates
+- DWM Hook Mode is tuned for Windows 11 and can be unstable on Windows 10 (the hook may repeatedly detach, briefly flashing the screen); DesktopLUT now detects this and disables the hook automatically after a few attempts. If this happens, turn off DWM Hook Mode in Settings and use overlay mode instead.
 
 ## Building from source
 
