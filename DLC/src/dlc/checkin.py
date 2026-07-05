@@ -31,6 +31,18 @@ from typing import Any
 # threshold ping, a read-plausibility anomaly is the most routine of the three.
 _WARNING_SEVERITY = {"stall": 0, "anomaly": 1, "read_plausibility_anomaly": 2}
 
+# The NO-DARK-WINDOW ceiling (owner rule, 2026-07-05 / fable Phase 8): on an
+# LLM-ADJUDICATED run (anything but the sim/CI AutoAdjudicator) there must never be a
+# window longer than this without a check-in while the spine is executing — a 5-hour
+# measure phase that is only looked at at its start and end is exactly what §12 exists
+# to prevent. Enforced at the Calibration ctor: a disabled (0) or longer interval is
+# clamped to this ceiling on adjudicated runs (--auto keeps the free choice — a
+# rubber-stamped sim run has no LLM watching). The cadence is delivered by wall-clock
+# backstops on EVERY long path: the measure loop's read funnel + soak blocks
+# (measure_loop._Loop), the optimizer's per-probe-read hook, and characterize's
+# instrumented reads (calibrate.py).
+NO_DARK_WINDOW_CEILING_S = 1200.0
+
 __all__ = [
     "maybe_timed_checkin",
     "checkin_digest",

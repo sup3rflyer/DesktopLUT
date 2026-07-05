@@ -958,6 +958,31 @@ def test_measure_loop_wall_clock_backstop_emits_beyond_quartiles(tmp_path: Path,
     assert {0.25, 0.5, 0.75} <= {round(e.data["progress"], 2) for e in check_ins}  # quartiles still present
 
 
+def test_wall_clock_backstop_ticks_during_warmup_too(tmp_path: Path, monkeypatch):
+    """NO-DARK-WINDOW rule (fable Phase 8): the wall-clock backstop lives on the loop's
+    single read funnel (_read), so warm-up — before ANY patch is accepted and before the
+    main pass's quartile arm exists — ticks the §12 clock too. (The same backstop hook
+    also fires per preheat/rewarm soak block, whose reads bypass _read.)"""
+    import dlc.measure_loop as ml
+    from dlc.events import RunLog, read_events, digest_projection
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ml.time, "monotonic",
+                        lambda: clock.__setitem__("t", clock["t"] + 60.0) or clock["t"])
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, warm_tau=0.06)   # cold start → several warm-up reads
+    epath = tmp_path / "e.jsonl"
+    runlog = RunLog(epath, phase="measure:raw")
+    run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=panel,
+                     config=MeasureLoopConfig(), runlog=runlog,
+                     ti3_path=tmp_path / "m.ti3", ndjson_path=tmp_path / "m.ndjson",
+                     checkin_interval_s=120.0)
+    check_ins = [e for e in digest_projection(read_events(epath)) if e.event == "check_in"]
+    # at least one packet was emitted with ZERO accepted patches — i.e. during warm-up
+    assert any(e.data.get("patches_done") == 0 for e in check_ins)
+
+
 def test_write_ti3_excludes_unusable_holes(tmp_path: Path):
     """A sentinel hole (no usable read → (0,0,0)) must never reach the .ti3 — the MHC /
     cube builders parse it with no knowledge of `unstable`, so a black row would poison

@@ -2566,12 +2566,73 @@ def test_timed_checkin_never_gates_and_carries_no_recommendation(tmp_path: Path)
     assert "evidence" in data and "overview" in data
 
 
-def test_timed_checkin_disabled_at_interval_zero(tmp_path: Path):
-    calib = _make(tmp_path, "ckoff", adjudicator=MappingAdjudicator({}), checkin_interval_s=0.0)
+def test_timed_checkin_disabled_at_interval_zero_is_auto_only(tmp_path: Path):
+    # Interval 0 disables check-ins ONLY under --auto (sim/CI, no LLM watching). An
+    # adjudicated run is governed by the no-dark-window rule (companion tests below).
+    calib = _make(tmp_path, "ckoff", checkin_interval_s=0.0)   # AutoAdjudicator default
     calib._maybe_timed_checkin("preflight")
     _due(calib)
     calib._maybe_timed_checkin("build-install-3dlut")   # disabled → never emits
     assert calib.runlog.tally.get("check_in", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# NO-DARK-WINDOW rule (owner, 2026-07-05): on an LLM-adjudicated run there is never a
+# window longer than the check-in interval (hard ceiling 20 min) without a check-in
+# while the spine executes — a 5-hour measure phase must not be looked at only at its
+# start and end. The ceiling is enforced at the ctor; wall-clock backstops tick inside
+# every long phase (measure read funnel + soak blocks, probe batches, characterize).
+# ---------------------------------------------------------------------------
+
+def test_no_dark_window_interval_is_clamped_on_adjudicated_runs(tmp_path: Path):
+    from dlc.checkin import NO_DARK_WINDOW_CEILING_S
+
+    # disabled → clamped to the ceiling (an adjudicated run may not go dark)
+    off = _make(tmp_path, "ndw_off", adjudicator=MappingAdjudicator({}), checkin_interval_s=0.0)
+    assert off._checkin_interval_s == NO_DARK_WINDOW_CEILING_S
+    # longer than the ceiling → clamped
+    long = _make(tmp_path, "ndw_long", adjudicator=SupervisedAdjudicator(), checkin_interval_s=3600.0)
+    assert long._checkin_interval_s == NO_DARK_WINDOW_CEILING_S
+    # a compliant interval is respected verbatim
+    ok = _make(tmp_path, "ndw_ok", adjudicator=MappingAdjudicator({}), checkin_interval_s=300.0)
+    assert ok._checkin_interval_s == 300.0
+    # --auto (sim/CI) keeps the free choice, including fully disabled
+    auto = _make(tmp_path, "ndw_auto", checkin_interval_s=0.0)
+    assert auto._checkin_interval_s == 0.0
+    auto_long = _make(tmp_path, "ndw_auto_long", checkin_interval_s=7200.0)
+    assert auto_long._checkin_interval_s == 7200.0
+
+
+def test_probe_batch_ticks_the_checkin_clock_per_read(tmp_path: Path):
+    # The optimizer's probe pass is the run's longest phase; between-iteration check-ins
+    # alone left a single pass digest-dark for its whole duration. The per-read tick must
+    # emit once the floor elapses MID-batch.
+    import numpy as np
+
+    calib = _make(tmp_path, "probeck", checkin_interval_s=1.0)
+    calib.calib["flow"] = "full"
+    calib.target_name = "srgb_g22"
+    calib.calib["target"] = "srgb_g22"
+    calib._maybe_timed_checkin("anchor")            # anchor the clock
+    _due(calib)                                     # floor elapsed mid-batch
+    probe = calib._probe_fn()
+    probe(np.array([[0.5, 0.5, 0.5], [0.25, 0.25, 0.25]]))
+    timed = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "check_in" and "overview" in e.data]
+    assert timed and timed[-1].data["overview"]["stage"] == "build-install-3dlut"
+
+
+def test_characterize_ticks_timed_checkins(tmp_path: Path):
+    # Characterize reads the panel outside the measure loop and previously emitted NO
+    # check-ins at all — its thermal phase can run for hours. With a tiny floor, the
+    # per-read tick must emit timed packets during the learning run.
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "charck", controller=ctrl, characterize_config=_CHAR,
+                  checkin_interval_s=1e-9)
+    assert calib.run("characterize").status == "completed"
+    timed = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "check_in" and "overview" in e.data]
+    assert timed and any(e.data["overview"]["stage"] == "characterize" for e in timed)
 
 
 def test_default_interval_does_not_fire_timed_checkins_in_a_fast_run(tmp_path: Path):

@@ -673,6 +673,22 @@ class _Loop:
                 and time.monotonic() - self._last_checkin_monotonic >= self._checkin_interval_s:
             self._emit_measure_checkin(index, total, frac)
 
+    def _maybe_checkin_backstop(self) -> None:
+        """The wall-clock arm ALONE, callable from ANY read path — warm-up, preheat/rewarm
+        soak blocks, re-measures, incremental sessions — not just the main pass (fable
+        Phase 8, the owner's NO-DARK-WINDOW rule: an adjudicated run must never go
+        ``checkin_interval_s`` without an evidence packet while the meter is working).
+        ``_maybe_checkin`` (main pass) keeps the progress-quartile arm on top of this.
+        Progress is reported as accepted-so-far over the planned set — approximate during
+        warm-up/soak (0 of N), exact once the main pass runs."""
+        if self.runlog is None or self._checkin_interval_s <= 0:
+            return
+        if time.monotonic() - self._last_checkin_monotonic < self._checkin_interval_s:
+            return
+        total = max(1, len(self.patches))
+        done = len(self.accepted)
+        self._emit_measure_checkin(done, total, done / total)
+
     def _emit_measure_checkin(self, index: int, total: int, frac: float) -> None:
         now = time.monotonic()
         elapsed_since = round(now - self._last_checkin_monotonic, 1)
@@ -754,6 +770,9 @@ class _Loop:
         self._mirror_patch_read(record)          # live firehose + per-read liveness on the spine
         if phase != "soak" and read_index == 0 and patch.role == "measurement":
             self._emit_progress()                # one coarse tick per new patch (counters / ETA)
+        # NO-DARK-WINDOW backstop on the loop's single read funnel: warm-up, re-measures,
+        # and incremental sessions tick the §12 clock too, not just the main pass.
+        self._maybe_checkin_backstop()
         return reading
 
     def _update_white(self, xyz: tuple[float, float, float]) -> None:
@@ -1206,6 +1225,11 @@ class _Loop:
             self.runlog.progress(self._live_phase, **{k: rec.get(k) for k in
                 ("block", "k", "net", "gross", "state", "ref_nits", "active_channel",
                  "op_streak", "protection_limited")})
+        # The soak's ThermalController reads the meter directly (bypassing _read), and its
+        # per-block mirror above is STREAM tier — dropped from the LLM digest. Without this
+        # backstop a long preheat is the one spell that can go digest-dark past the §12
+        # floor (NO-DARK-WINDOW rule, fable Phase 8).
+        self._maybe_checkin_backstop()
 
     def preheat(self) -> Optional[dict[str, Any]]:
         """Run the closed-loop thermal controller to bring the panel to its operating equilibrium

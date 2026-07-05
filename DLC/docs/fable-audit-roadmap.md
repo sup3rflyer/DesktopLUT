@@ -99,7 +99,11 @@ fixable, and leave a written trail. Nothing is one-shotted.
   measure `unresolved_detail` σ-vs-DIP, verify `before_scores` trajectory,
   `caps_unavailable` tell, preflight `store_health`); envelope contract pinned on
   `AdjudicationRequest` + coherence test. R4 deferred per its own condition. Leads
-  added to Phases 10/11/12.
+  added to Phases 10/11/12. Same-session owner rule landed: **NO-DARK-WINDOW** — an
+  LLM-adjudicated run never goes >20 min without a check-in while the spine executes
+  (`checkin.NO_DARK_WINDOW_CEILING_S`; ctor-clamped interval, wall-clock backstops on
+  the measure read funnel + soak blocks + probe batches + characterize reads — the
+  probe pass and characterize were previously digest-dark for their whole duration).
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.

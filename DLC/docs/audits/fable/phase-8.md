@@ -11,7 +11,7 @@
   and fix the gaps in-phase with tests. Design-Law changes got owner sign-off in-session
   (Task #1, §2 below).
 - **Baseline (pre-phase, this container):** `918 collected: 915 passed, 3 skipped`.
-- **Post-phase:** `932 collected: 929 passed, 3 skipped` (+14 tests).
+- **Post-phase:** `936 collected: 933 passed, 3 skipped` (+18 tests).
 - **Headline:** Task #1 — the codebase's one self-documented KNOWN DIVERGENCE from the
   DESIGN LAW — is **resolved** (owner-approved design: supervised benign auto-accepts
   become *vetoable judgment packets* on the digest). Plus a real decision-plumbing bug
@@ -141,6 +141,30 @@ upgrades in the new module:
 
 `max_dE` + worst patch + the since-last tally were already the right evidence; kept.
 
+**F8-13 — the NO-DARK-WINDOW rule (owner, in-session):** *on an LLM-adjudicated run
+there must never be a ~20-minute window without a check-in — a 5-hour measure phase
+looked at only at its start and end is exactly what §12 exists to prevent.* Audit of
+where check-ins could actually fire found three real dark windows:
+
+1. **The optimizer probe batch** — the run's longest phase — only checked in *between*
+   outer iterations; a single probe pass (hundreds of reads) could run 30–90+ minutes
+   digest-dark. Fixed: the per-read probe loop ticks `_maybe_timed_checkin` (cheap
+   early-return until the floor elapses).
+2. **Characterize** emitted no check-ins at all (it reads the panel outside the measure
+   loop; its thermal-observation phase is bounded at 240 blocks — hours). Fixed: the
+   instrumented per-read wrapper ticks the §12 clock.
+3. **Measure-loop warm-up and preheat/rewarm soaks**: the wall-clock backstop lived only
+   in the main pass, and the soak's per-block mirror is stream-tier (dropped from the
+   digest). Fixed: `_maybe_checkin_backstop` (the wall-clock arm alone) now hangs on the
+   loop's single read funnel (`_read`) **and** the soak block hook, so every phase of
+   the loop ticks.
+
+Enforcement: `checkin.NO_DARK_WINDOW_CEILING_S = 1200` (20 min). The `Calibration` ctor
+clamps a disabled (0) or longer interval to the ceiling for any adjudicator except the
+sim/CI `AutoAdjudicator` (interval-0-disables is now an `--auto`-only affordance —
+test-pinned both ways). The default stays 600 s. Documented in the CLI help + the
+README's autonomy section.
+
 ## 5. Seam digest sufficiency — the review and the fixes
 
 All 22 seam call sites reviewed against "decidable from the digest alone". Most passed —
@@ -253,7 +277,9 @@ for `--attended` and `--decide KEY=CHOICE=REASON` (§6).
 
 ## 10. Test delta
 
-915 → 929 passed (+14, 3 skipped unchanged): worst-first/counted check-in evidence (2),
+915 → 933 passed (+18, 3 skipped unchanged): no-dark-window ceiling clamp + probe-batch
+tick + characterize tick + warm-up backstop (4, F8-13; the interval-0-disables pin is
+reworked to its now-`--auto`-only contract), worst-first/counted check-in evidence (2),
 decision validation across all three sources + valid-override precedence (4),
 `parse_decide_flag` (1), envelope coherence over three clean flows (1), judgment packet
 emitted + judged-decision negative (2), before-scores trajectory (1), store health

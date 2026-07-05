@@ -108,7 +108,12 @@ LAW there governs what may be decided without a judge):
 Off-vocabulary decisions (`--decide verify:accept=aply`) are rejected loudly and the
 seam pauses — a typo can never silently apply/misroute. §12 check-ins are **not**
 seams: they are non-blocking evidence packets on the digest tier and never gate the
-spine, in every mode.
+spine, in every mode. **No-dark-window rule:** on an LLM-adjudicated run
+(`--attended`/`--supervised`) the digest never goes more than `--checkin-interval`
+seconds (default 600, hard ceiling 1200 — a disabled or longer interval is clamped)
+without a check-in while the spine executes; wall-clock backstops tick inside every
+long phase (measure warm-up/soak/main pass, the optimizer's probe batches,
+characterize), not just at stage boundaries.
 
 ## Install & dependencies
 

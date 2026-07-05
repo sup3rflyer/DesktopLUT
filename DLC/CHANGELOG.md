@@ -180,7 +180,14 @@ request, adjudicates ambiguous results on digests, and writes the report.
   The §12 check-in assembly moved to `dlc/checkin.py` (7b RFC R2) and its evidence
   packet truncates worst-first with pre-truncation per-type counts. The digest
   envelope contract is pinned on `AdjudicationRequest` + an envelope-coherence test.
-  915 → 929 passed, 3 skipped.
+  **NO-DARK-WINDOW rule** (owner): an LLM-adjudicated run never goes more than 20
+  minutes without a check-in while the spine executes — the check-in interval is
+  ctor-clamped to ≤1200 s on `--attended`/`--supervised` (0-disables is now
+  `--auto`-only), and wall-clock backstops tick inside every long phase: the measure
+  loop's read funnel (warm-up/re-measures included) + preheat/rewarm soak blocks, the
+  optimizer's per-probe-read hook (a single probe pass could previously run an hour
+  digest-dark between iteration check-ins), and characterize's instrumented reads
+  (previously emitted no check-ins at all). 915 → 933 passed, 3 skipped.
 - **Fable audit Phase 7b — the orchestrator spine, structure**
   (`docs/audits/fable/phase-7b.md`): zero-behaviour-change decomposition of
   `calibrate.py` (6,095 → 5,474 lines). The LLM seam layer — seam ids, the

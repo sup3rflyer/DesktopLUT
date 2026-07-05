@@ -449,6 +449,20 @@ class Calibration:
         # so a multi-hour run never goes dark. monotonic so it is immune to wall-clock changes;
         # reset on each resume (a fresh process), which is fine — a resume is itself a status point.
         self._checkin_interval_s = max(0.0, float(checkin_interval_s))
+        # NO-DARK-WINDOW rule (owner, 2026-07-05): an LLM-adjudicated run must never go
+        # more than checkin.NO_DARK_WINDOW_CEILING_S without a check-in while the spine
+        # executes. A disabled (0) or longer interval is clamped here for any adjudicator
+        # but the sim/CI AutoAdjudicator; the wall-clock backstops in the measure loop /
+        # probe batch / characterize deliver the cadence inside long phases.
+        if not isinstance(adjudicator, AutoAdjudicator) and not (
+                0.0 < self._checkin_interval_s <= checkin.NO_DARK_WINDOW_CEILING_S):
+            requested = self._checkin_interval_s
+            self._checkin_interval_s = checkin.NO_DARK_WINDOW_CEILING_S
+            self.ctx.log(
+                f"check-in interval {requested:g}s "
+                f"{'(disabled)' if requested <= 0 else ''} exceeds the no-dark-window rule "
+                f"for an LLM-adjudicated run — clamped to {self._checkin_interval_s:g}s "
+                "(only --auto sim/CI runs may disable check-ins)")
         self._last_checkin_monotonic: Optional[float] = None
         self._last_checkin_tally: dict[str, int] = {}
         self._last_checkin_pos: int = 0   # events.jsonl byte offset at the last check-in (evidence window)
@@ -1402,6 +1416,10 @@ class Calibration:
                 # restarting each outer pass so the bar visibly pulses = clearly alive.
                 self.runlog.progress("build-install-3dlut", patches_done=i + 1,
                                      patches_total=total, iteration=batch["n"])
+                # NO-DARK-WINDOW rule (fable Phase 8): a single probe pass can run for the
+                # better part of an hour, and the between-iterations check-in alone left it
+                # digest-dark. Tick the §12 clock per read (cheap early-return until due).
+                self._maybe_timed_checkin("build-install-3dlut")
             return out
 
         return probe
@@ -2278,6 +2296,11 @@ class Calibration:
                 reading = self.measure(patch)
                 if reading.ok:
                     live.progress("characterize")
+                # NO-DARK-WINDOW rule (fable Phase 8): characterize reads the panel directly
+                # (not via the instrumented measure loop), and its thermal-observation phase
+                # can run for hours — it emitted NO check-ins at all. Tick the §12 clock per
+                # read here (cheap early-return until due).
+                self._maybe_timed_checkin("characterize")
                 return reading
 
             result = run_characterization(
@@ -5051,8 +5074,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "checkpoint EMITS a rich evidence packet (run overview + events since the "
                              "last check-in) for the LLM to consume from the running spine, so a long "
                              "run never goes dark. Default 600 (10 min). A check-in is emit-only — it "
-                             "NEVER gates or pauses the spine and carries no recommendation (all modes); "
-                             "0 disables.")
+                             "NEVER gates or pauses the spine and carries no recommendation (all modes). "
+                             "0 disables — on --auto (sim/CI) ONLY: an LLM-adjudicated run "
+                             "(--attended/--supervised) enforces the no-dark-window rule, clamping a "
+                             "disabled or >1200 s interval to 1200 s (20 min).")
     parser.add_argument("--neutral-min-reads", type=int, default=None, dest="neutral_min_reads",
                         metavar="N",
                         help="per-patch read FLOOR on near-neutral patches (grey ramp + tube): average "
