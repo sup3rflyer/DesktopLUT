@@ -743,7 +743,8 @@ def optimize_cube(
                 f"{int(real_floor.sum())} patch(es) at the panel's physical floor/limit{near_clause} "
                 f"(worst {report_metric} {worst_de:.1f} at signal {[round(c, 3) for c in worst_sig]}, "
                 f"{'boundary: ' if boundary_clause else ''}{boundary_clause.lstrip(', ') or 'interior residual'}) "
-                "— accept as the panel limit, refine the model, or loosen the target?"
+                "— accept as the panel limit (the verify gate still judges the result), "
+                "or abort and investigate?"
             )
         if budget_limited.any():
             parts.append(

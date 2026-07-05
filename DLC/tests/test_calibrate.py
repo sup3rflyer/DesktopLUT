@@ -1304,6 +1304,98 @@ def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
     assert resumed.calib["decisions"]["verify:accept"]["choice"] == "revert"
 
 
+# ---------------------------------------------------------------------------
+# Decision durability (fable Phase 8): every decision — --decide override, recorded
+# record, adjudicator-returned — is validated against the seam's declared option
+# vocabulary. An off-vocabulary choice previously fell through the callers' string
+# comparisons and silently behaved as the unmatched branch (verify:accept=aply APPLIED).
+# ---------------------------------------------------------------------------
+
+def test_invalid_decide_override_is_rejected_and_pauses_the_seam(tmp_path: Path):
+    # A typo'd --decide (verify:accept=aply) must NOT silently apply: the override is
+    # rejected loudly and the un-decided seam pauses for a real judge.
+    calib = _make(tmp_path, "badov", adjudicator=MappingAdjudicator({}),
+                  decision_overrides={"verify:accept": Decision("aply", note="cli")})
+    with pytest.raises(AdjudicationRequired):
+        calib.adjudicate(_verify_request())
+    events = [e for e in read_events(calib.ctx.events_path) if e.event == "seam"]
+    invalid = [e for e in events if e.data.get("status") == "invalid_decision"]
+    assert invalid and invalid[0].data["choice"] == "aply"
+    assert invalid[0].data["valid_options"] == ["apply", "revert"]
+    assert invalid[0].data["source"] == "--decide override"
+    # nothing was recorded for the seam — the record still awaits a valid decision
+    assert "verify:accept" not in calib.calib["decisions"]
+
+
+def test_invalid_recorded_decision_falls_through_to_the_adjudicator(tmp_path: Path):
+    # A hand-edited/legacy run record with an off-vocabulary choice must not replay as a
+    # silent misroute — the seam consults the adjudicator again (a live run pauses).
+    calib = _make(tmp_path, "badrec")
+    calib.calib["decisions"]["verify:accept"] = {"choice": "abort", "note": "stale"}
+    d = calib.adjudicate(_verify_request())      # AutoAdjudicator re-decides
+    assert d.choice == "apply"
+    assert calib.calib["decisions"]["verify:accept"]["choice"] == "apply"
+
+
+def test_invalid_seeded_adjudicator_choice_pauses_instead_of_misrouting(tmp_path: Path):
+    # A seed map carrying an off-vocabulary choice (e.g. verify:accept=abort — abort is NOT
+    # in the verify vocabulary and previously meant silent APPLY) pauses the run instead.
+    calib = _make(tmp_path, "badseed",
+                  adjudicator=MappingAdjudicator({"verify:accept": Decision("abort")}))
+    with pytest.raises(AdjudicationRequired):
+        calib.adjudicate(_verify_request())
+
+
+def test_valid_decide_override_still_wins_after_validation(tmp_path: Path):
+    # The validation must not break the documented override precedence.
+    calib = _make(tmp_path, "goodov",
+                  decision_overrides={"verify:accept": Decision("revert", note="cli")})
+    assert calib.adjudicate(_verify_request()).choice == "revert"
+
+
+def test_parse_decide_flag_supports_an_optional_reason():
+    from dlc.calibrate import parse_decide_flag
+    key, d = parse_decide_flag("verify:accept=revert")
+    assert (key, d.choice, d.note) == ("verify:accept", "revert", "cli")
+    key, d = parse_decide_flag("verify:accept=revert=white cast visible = obvious")
+    assert (key, d.choice) == ("verify:accept", "revert")
+    assert d.note == "white cast visible = obvious"       # reason may itself contain '='
+    key, d = parse_decide_flag(" measure:raw:escalation = accept = panel limit ")
+    assert (key, d.choice, d.note) == ("measure:raw:escalation", "accept", "panel limit")
+
+
+def test_every_seam_request_on_clean_runs_is_envelope_coherent(tmp_path: Path):
+    # Envelope pin (fable Phase 8): every AdjudicationRequest raised on clean sim runs
+    # carries a decidable form — the recommendation is IN the options (otherwise the
+    # auto/supervised default would itself be an invalid decision), the key is stage-
+    # scoped, the question is non-empty, and the digest is JSON-serializable (it is
+    # printed to the paused LLM verbatim).
+    import json as _json
+
+    class Recording:
+        def __init__(self):
+            self.requests = []
+
+        def adjudicate(self, request):
+            self.requests.append(request)
+            return Decision(request.recommendation, note="recorded",
+                            payload=request.recommended_payload)
+
+    for mode, flow in (("SDR", "full"), ("HDR", "mhc-only"), ("SDR", "grayscale-wb")):
+        rec = Recording()
+        name = f"env_{mode}_{flow}"
+        calib = _make(tmp_path, name, mode=mode, adjudicator=rec)
+        if flow == "grayscale-wb":
+            calib.controller.set_base_lut(0, mode, "base.cube", 0.0)   # satisfy require-stack
+        calib.run(flow)
+        assert rec.requests, f"no seams reached on {mode}/{flow}"
+        for req in rec.requests:
+            assert req.recommendation in req.options, req.key
+            assert req.options and req.question.strip(), req.key
+            assert req.key.startswith(req.stage), (req.key, req.stage)
+            _json.dumps(req.digest, default=str)
+
+
 def test_patch_window_guard_quiet_when_target_is_primary(tmp_path: Path):
     # The mock topology makes monitor 0 the primary; calibrating monitor 0 ⇒ no warning.
     calib = _make(tmp_path, "pw_ok")

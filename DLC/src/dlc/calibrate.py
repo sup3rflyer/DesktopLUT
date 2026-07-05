@@ -683,8 +683,18 @@ class Calibration:
         an already-recorded decision, so a resumed run can change a recorded seam (notably the
         terminal ``verify:accept`` apply↔revert gate) without ``--force`` discarding all stage
         memoisation. A recorded decision is otherwise replayed as-is; only an un-decided seam
-        consults the adjudicator (which may pause the run)."""
+        consults the adjudicator (which may pause the run).
+
+        Every decision — override, recorded, or adjudicator-returned — is VALIDATED against
+        the seam's declared option vocabulary (fable Phase 8): an off-vocabulary choice
+        (``--decide verify:accept=aply``) previously fell through each caller's string
+        comparisons and silently behaved as whatever the *unmatched* branch did (at the
+        verify gate: APPLY). Now it is surfaced on the spine and treated as un-decided —
+        the seam pauses (or the adjudicator re-decides) instead of misfiring."""
         override = self.decision_overrides.get(request.key)
+        if override is not None and not self.force:
+            if not self._valid_choice(request, override, source="--decide override"):
+                override = None   # fall through: recorded decision, then the adjudicator
         if override is not None and not self.force:
             recorded = self.calib["decisions"].get(request.key)
             if (recorded is None or recorded.get("choice") != override.choice
@@ -699,7 +709,11 @@ class Calibration:
             return Decision(override.choice, override.note, payload=override.payload)
         if request.key in self.calib["decisions"] and not self.force:
             d = self.calib["decisions"][request.key]
-            return Decision(d["choice"], d.get("note"), payload=d.get("payload"))
+            rec = Decision(d["choice"], d.get("note"), payload=d.get("payload"))
+            if self._valid_choice(request, rec, source="recorded decision"):
+                return rec
+            # else: fall through to the adjudicator (a live run pauses; the record stays
+            # until a valid decision overwrites it).
         try:
             decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
         except AdjudicationRequired:
@@ -708,8 +722,29 @@ class Calibration:
             self.runlog.seam(request.stage, key=request.key, status="paused",
                              question=request.question, options=list(request.options))
             raise
+        if not self._valid_choice(request, decision, source="adjudicator"):
+            # A seeded/custom adjudicator answered outside the vocabulary — re-asking it
+            # would loop, so pause the run for a real judge instead.
+            self.runlog.seam(request.stage, key=request.key, status="paused",
+                             question=request.question, options=list(request.options))
+            raise AdjudicationRequired(request)
         self._record_decision(request, decision)
         return decision
+
+    def _valid_choice(self, request: AdjudicationRequest, decision: Decision, *,
+                      source: str) -> bool:
+        """Is ``decision.choice`` in the seam's declared option vocabulary? An off-vocabulary
+        choice is surfaced LOUDLY on the spine (log + digest-tier seam event) and rejected —
+        the callers' string comparisons would otherwise silently route it down whatever branch
+        matches nothing (fable Phase 8, decision-durability audit)."""
+        if decision.choice in request.options:
+            return True
+        self.ctx.log(f"seam {request.key}: invalid {source} choice {decision.choice!r} "
+                     f"(valid: {', '.join(request.options)}) — ignored")
+        self.runlog.seam(request.stage, key=request.key, status="invalid_decision",
+                         choice=decision.choice, valid_options=list(request.options),
+                         source=source, question=request.question)
+        return False
 
     def _record_decision(self, request: AdjudicationRequest, decision: Decision,
                          *, overridden: bool = False) -> None:
@@ -3759,8 +3794,14 @@ class Calibration:
             recommendation = "abort" if severe else "accept"
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="build-install-3dlut:floor", seam=SEAM_OPTIMIZE, stage="build-install-3dlut",
-                question=outcome.data.get("question") or "the correction machine hit a floor — accept or loosen?",
-                options=("accept", "loosen_target", "abort"), recommendation=recommendation,
+                # Options are accept/abort only (fable Phase 8): the seam previously offered
+                # "loosen_target" but NO code path honoured it — the string fell through every
+                # comparison and silently behaved as accept (a phantom option is worse than a
+                # missing one at a judgment surface). Quality targets are advisory and the
+                # verify seam is where acceptance is negotiated; an abort here is the lever
+                # for re-running with a raised cap / different target.
+                question=outcome.data.get("question") or "the correction machine hit a floor — accept or abort?",
+                options=("accept", "abort"), recommendation=recommendation,
                 # Surface the report-metric numbers (CIEDE2000 for SDR / dE_ITP for HDR) under the
                 # keys the LLM reads, tagged by `metric`; the cube CONVERGED in `optimize_metric`
                 # (dE_ITP), whose values stay available under *_itp. (_severe_optimizer_floor reads the
@@ -4748,6 +4789,16 @@ def run_calibration(
     return calib.run(flow)
 
 
+def parse_decide_flag(spec: str) -> tuple[str, Decision]:
+    """Parse one ``--decide`` value: ``KEY=CHOICE`` or ``KEY=CHOICE=REASON``. The optional
+    free-text REASON lands in the decision's ``note`` — the audit trail the run record,
+    the seam event, and the report's panel analysis all carry (fable Phase 8: the LLM
+    should record *why* it decided, not just what). No reason ⇒ the ``"cli"`` marker."""
+    key, _, rest = spec.partition("=")
+    choice, _, reason = rest.partition("=")
+    return key.strip(), Decision(choice.strip(), note=(reason.strip() or "cli"))
+
+
 def _auto_on_live_measuring_run(args: Any) -> bool:
     """``--auto`` is a pure rubber-stamp (returns the recommendation verbatim, no LLM) and is sim/CI
     ONLY — never a hardware run (DESIGN LAW). ``main()`` always connects to the live pipe and builds a
@@ -4886,8 +4937,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              help="OPT-OUT fallback: re-spawn + re-calibrate a fresh spotread for EVERY "
                                   "read (the old per-patch path). ~4x slower on bright patches; use only "
                                   "if the persistent meter misbehaves on a given box.")
-    parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
-                        help="record a seam decision (repeatable) then run/resume")
+    parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE[=REASON]",
+                        help="record a seam decision (repeatable) then run/resume. The choice is "
+                             "validated against the seam's declared options (an off-vocabulary "
+                             "choice pauses the seam instead of silently misrouting). An optional "
+                             "free-text =REASON is kept in the audit trail (run record + seam "
+                             "event + report), e.g. --decide 'verify:accept=revert=white cast "
+                             "visible on the desktop'.")
     parser.add_argument("--adaptive-planning", action="store_true", dest="adaptive_planning",
                         help="OPT-IN, EXPERIMENTAL (value unproven — a synthetic A/B found denser "
                              "sampling does not beat the optimizer's fold-back; see patch_evidence.py): "
@@ -5054,8 +5110,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                  for k, v in recorded.items()}
     overrides: dict[str, Decision] = {}
     for spec in args.decide:
-        key, _, choice = spec.partition("=")
-        overrides[key.strip()] = Decision(choice.strip(), note="cli")
+        key, decision = parse_decide_flag(spec)
+        overrides[key] = decision
     # The adaptive-planning seam answers with a structured decision file, not a one-of-N choice.
     if args.plan_decision_file is not None:
         try:
