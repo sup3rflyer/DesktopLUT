@@ -2546,3 +2546,82 @@ def test_probe_match_is_planned_only_in_build_correction(tmp_path: Path):
         assert ("probe-match" in keys) == (flow == "build-correction"), flow
         if flow != "build-correction":
             assert any(k.startswith("measure") or k == "grayscale-wb" for k in keys)
+
+
+class _RecordingAuto(AutoAdjudicator):
+    """AutoAdjudicator that records every seam request it answers (Phase 4 refine-contract tests)."""
+
+    def __init__(self):
+        self.requests: list[AdjudicationRequest] = []
+
+    def adjudicate(self, request):  # noqa: D401
+        self.requests.append(request)
+        return super().adjudicate(request)
+
+
+def test_sdr_refine_safety_ceiling_reverts_to_best_and_raises_seam(tmp_path: Path, monkeypatch):
+    # The safety_max_rounds backstop is NOT a silent cap (DESIGN LAW): on a pathological
+    # non-converging panel it must (a) reinstall the BEST measured cube — not the last one —
+    # and (b) raise the SEAM_OPTIMIZE adjudication so the LLM judges the foundation.
+    adj = _RecordingAuto()
+    calib = _make(tmp_path, "sdr_safety", adjudicator=adj)
+    calib.run("mhc-only")                       # seed mhc_params + base cube + resolved white
+    calib.calib["stages"].pop("refine-mhc-grayscale", None)   # bust memoisation so it re-runs
+
+    import dlc.mhc_cube as mc
+    monkeypatch.setattr(mc, "refine_sdr_cube",
+                        lambda cur, *a, **k: {ch: [0.5] * len(cur["r"]) for ch in ("r", "g", "b")})
+    installs: list[str] = []
+    orig_set_base_lut = calib.controller.set_base_lut
+    monkeypatch.setattr(calib.controller, "set_base_lut",
+                        lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
+                                                           orig_set_base_lut(mon, mode, path, peak))[1])
+    # r1: 10.0 (base) -> refine1; r2: 8.0 (best, improving) -> refine2; r3: 8.25 — a within-
+    # regress_tol uptick (no regression), improvement < min_improvement (streak 1 < patience 2),
+    # and rnd == safety_max_rounds -> safety ceiling with best (refine1) NOT currently installed.
+    scripted = iter([{"avg": 10.0, "max": 12.0, "n": 5, "gamma_err_pct": 1.0},
+                     {"avg": 8.0, "max": 10.0, "n": 5, "gamma_err_pct": 1.0},
+                     {"avg": 8.25, "max": 10.2, "n": 5, "gamma_err_pct": 1.0}])
+    monkeypatch.setattr(calib, "_grey_de_sdr", lambda samples, white: next(scripted))
+
+    seen_before = len(adj.requests)
+    out = calib.stage_refine_mhc_grayscale(safety_max_rounds=3)
+    assert out.digest.get("safety_ceiling") is True
+    assert out.digest.get("regressed") is not True and out.digest.get("floored") is not True
+    # The unified best-revert reinstalled the BEST measured cube (refine1, avg 8.0) — not refine2.
+    assert installs[-1].endswith("refine1.cube"), installs
+    # ...and the seam reached the adjudicator (accept/abort with the digest as evidence).
+    seams = [r for r in adj.requests[seen_before:] if r.key == "refine-mhc-grayscale:safety-ceiling"]
+    assert len(seams) == 1
+    assert seams[0].options == ("accept", "abort")
+    assert seams[0].digest.get("safety_ceiling") is True
+
+
+def test_hdr_refine_safety_ceiling_reverts_to_best_and_raises_seam(tmp_path: Path, monkeypatch):
+    # HDR twin of the SDR safety-ceiling contract (the loops are per-mode siblings — both must
+    # revert to best and raise the seam; neither may silently cap).
+    adj = _RecordingAuto()
+    calib = _make(tmp_path, "hdr_safety", mode="HDR", panel=_perfect_hdr_panel(),
+                  bit_depth=10, adjudicator=adj)
+    calib.run("mhc-only")
+    calib.calib["stages"].pop("refine-mhc-cube", None)
+
+    import dlc.mhc_cube as mc
+    monkeypatch.setattr(mc, "refine_hdr_cube",
+                        lambda cur, *a, **k: {ch: [0.5] * len(cur["r"]) for ch in ("r", "g", "b")})
+    installs: list[str] = []
+    orig_set_base_lut = calib.controller.set_base_lut
+    monkeypatch.setattr(calib.controller, "set_base_lut",
+                        lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
+                                                           orig_set_base_lut(mon, mode, path, peak))[1])
+    scripted = iter([{"avg": 10.0, "max": 12.0, "n": 5, "gamma_err_pct": 1.0},
+                     {"avg": 8.0, "max": 10.0, "n": 5, "gamma_err_pct": 1.0},
+                     {"avg": 8.4, "max": 10.4, "n": 5, "gamma_err_pct": 1.0}])
+    monkeypatch.setattr(calib, "_grey_de_vs_white", lambda samples, white: next(scripted))
+
+    seen_before = len(adj.requests)
+    out = calib.stage_refine_mhc_cube(safety_max_rounds=3)
+    assert out.digest.get("safety_ceiling") is True
+    assert installs[-1].endswith("refine1.cube"), installs
+    seams = [r for r in adj.requests[seen_before:] if r.key == "refine-mhc-cube:safety-ceiling"]
+    assert len(seams) == 1 and seams[0].options == ("accept", "abort")

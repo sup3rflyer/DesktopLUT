@@ -101,7 +101,9 @@ def build(args, ctx: RunContext) -> StageResult:
         # chroma drift (sensor noise OR panel instability), not a hardcoded 0.3-nit cap. On HDR the
         # reference chromaticity is the stable diffuse-white band (100-203 nits), NOT the brightest
         # patch (the panel in overdrive/ABL/thermal limit — a moving target, not a reference).
-        grey_reads = [(s.xyz[1], *xy_from_xyz(s.xyz)) for s in groups["grey"]]
+        # Each read carries its measured repeatability (noise sidecar) so a REAL, stable dark drift
+        # — the disease the cube corrects — is not mistaken for noise and smoothed away.
+        grey_reads = _grey_reads_with_noise(source, groups["grey"], xy_from_xyz)
         dark_floor_nits, dark_floor_info = adaptive_dark_floor(
             grey_reads, reference_band=HDR_REFERENCE_WHITE_BAND)
         # Per-level trust from MEASURED repeatability (the noise sidecar beside the raw .ti3): a dark
@@ -142,6 +144,13 @@ def build(args, ctx: RunContext) -> StageResult:
             native_peak = sum(channel_peak_xyz[c][1] for c in range(3))
             if 0.0 < cap_nits < native_ceiling:
                 cube_peak = cap_nits          # hold D65: cube tops out at the achievable-D65 peak
+            # P16 diagnostics: the cap above is NOMINAL-ADDITIVE (per-channel peaks summed). A
+            # sub-additive FALD panel's real achievable-D65 peak sits a little lower; the measured
+            # full-drive WHITE vs the additive channel sum is the first-order non-additivity factor
+            # (recorded HW: additive ~1734 vs true ~1704, a +1.8% overshoot). Diagnostic only — the
+            # closed-loop refine measures the real panel at the cap and lands the achievable D65;
+            # these fields make the honest number visible at the seams.
+            nonadd = (target_luminance / native_peak) if native_peak > 0 else None
             peak_chroma = {
                 "cap_nits": round(cap_nits, 4),
                 "binding_channel": binding,
@@ -152,6 +161,9 @@ def build(args, ctx: RunContext) -> StageResult:
                 "capped": cube_peak < native_ceiling,
                 "headroom_loss_pct": round(100.0 * (1.0 - cap_nits / native_peak), 3)
                 if native_peak > 0 else None,
+                "measured_peak_nonadditivity": round(nonadd, 4) if nonadd is not None else None,
+                "cap_nits_nonadditive_est": round(cap_nits * min(nonadd, 1.0), 4)
+                if nonadd is not None else None,
             }
         except ValueError as exc:
             peak_chroma = {"error": str(exc)}
@@ -163,7 +175,6 @@ def build(args, ctx: RunContext) -> StageResult:
             "points": [round(i / (n - 1), 6) for i in range(n)],
             "deviations": Deviations.identity(n).as_dict(),
         }
-        base_summary = {}
         try:
             cube_curves, cube_summary = build_hdr_cube(
                 samples, measured_primaries, white_xy, cube_peak,
@@ -197,7 +208,6 @@ def build(args, ctx: RunContext) -> StageResult:
             "points": [round(p.level, 6) for p in gray_patches] or [1.0],
             "deviations": Deviations.identity(n).as_dict(),
         }
-        base_summary = {}
     else:
         # SDR (γ): same 1D-LUT-base mechanism as HDR. The MHC matrix carries primaries +
         # native-white→D65; the per-channel **tone** (neutral axis + per-level grayscale tracking)
@@ -212,9 +222,10 @@ def build(args, ctx: RunContext) -> StageResult:
 
         # Adaptive dark floor (SDR) — same measured-chroma-drift logic as HDR, anchored on the
         # BRIGHTEST neutral (on SDR the peak IS the target white; reference_band=None). Persisted below
-        # for the SDR closed-loop refine to smooth dark levels to identity.
+        # for the SDR closed-loop refine to smooth dark levels to identity. Reads carry their measured
+        # repeatability (noise sidecar) so a real, stable dark drift is corrected, not smoothed away.
         sdr_dark_floor_nits, sdr_dark_floor_info = adaptive_dark_floor(
-            [(p.xyz[1], *xy_from_xyz(p.xyz)) for p in gray_patches], reference_band=None)
+            _grey_reads_with_noise(source, gray_patches, xy_from_xyz), reference_band=None)
         # Per-level trust from MEASURED repeatability (the noise sidecar): a dark level whose
         # chromaticity is too noisy/unstable to trust is smoothed to identity in the cube. Reference =
         # the measured NATIVE white (build_sdr_cube targets native-white shares; the matrix does D65).
@@ -228,7 +239,6 @@ def build(args, ctx: RunContext) -> StageResult:
             "points": [round(i / (n - 1), 6) for i in range(n)],
             "deviations": Deviations.identity(n).as_dict(),
         }
-        base_summary = {}
         try:
             cube_curves, cube_summary = build_sdr_cube(
                 samples, measured_primaries, white_xy, target_luminance,
@@ -321,7 +331,6 @@ def build(args, ctx: RunContext) -> StageResult:
         "target_white_source": target_white_source,
         "target_luminance": params["target_luminance"],
         "gamut_drift_vs_target": gamut_drift,
-        "base_grayscale_max_abs_deviation": base_summary.get("max_abs_deviation"),
         "params_path": str(params_path),
     }
     if is_hdr:
@@ -336,6 +345,22 @@ def build(args, ctx: RunContext) -> StageResult:
         "reasons": ["candidate MHC params derived from a measured raw panel"],
     }
     return result
+
+
+def _grey_reads_with_noise(source, grey_samples, xy_from_xyz):
+    """``[(nits, x, y, noise), ...]`` for :func:`mhc_cube.adaptive_dark_floor`: each gray read plus
+    its measured repeatability from the noise sidecar (SE of the mean chromaticity; ``+inf`` for an
+    unstable level; ``None`` when single-read / no sidecar — the floor then stays conservative).
+    Accepts ``Ti3Sample`` (``.rgb``) or ``refine.GrayPatch`` (``.level``) gray entries."""
+    from ..measure_loop import match_level_noise, read_noise_sidecar
+    entries = read_noise_sidecar(Path(source))
+    reads = []
+    for s in grey_samples:
+        level = s.rgb[0] if hasattr(s, "rgb") else s.level
+        noise = match_level_noise(entries, level) if entries else None
+        x, y = xy_from_xyz(s.xyz)
+        reads.append((s.xyz[1], x, y, noise))
+    return reads
 
 
 def _dark_level_trust(source, grey_samples, reference_white_xy, dark_trust_weights, xy_from_xyz):

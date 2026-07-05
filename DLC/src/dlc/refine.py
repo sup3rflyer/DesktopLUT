@@ -122,10 +122,13 @@ def propose_correction_grayscale(
     # noise / panel instability, so hold the current deviation. Derived from the measured ramp's
     # dark chroma drift vs the stable BRIGHTEST neutral (on SDR the peak IS the target white, so it
     # is the right reference — unlike HDR, where the brightest patch is overdrive). Falls back to
-    # the old fixed DARK_LUMINANCE_FLOOR when the ramp is too sparse to derive one.
+    # the old fixed DARK_LUMINANCE_FLOOR when the ramp is too sparse to derive one. Each read
+    # carries its measured repeatability (``noise``) so a REAL, stable dark drift — the thing this
+    # solver exists to correct — is not classified as noise and held to the current deviation.
     from .mhc_cube import adaptive_dark_floor, noise_trust
     dark_floor, _dark_info = adaptive_dark_floor(
-        [(p.xyz[1], *XYZ_to_xy(*p.xyz)) for p in patches],
+        [(p.xyz[1], *XYZ_to_xy(*p.xyz),
+          (noise.get(p.level) if noise is not None else None)) for p in patches],
         reference_band=None, default_floor_nits=DARK_LUMINANCE_FLOOR)
 
     peak_Y = target.peak_luminance or max(p.xyz[1] for p in patches) or 1.0

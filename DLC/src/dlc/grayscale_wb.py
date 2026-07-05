@@ -6,6 +6,17 @@ an editor-shaped table: one common luminance slider plus per-channel RGB balance
 sliders at each grey point. For wire compatibility, the composed RGB deviations
 are also included; older DesktopLUT IPC builds can apply the same correction as
 per-channel deviations even if they ignore the explicit luminance field.
+
+Mode note (Phase 4 audit): the ``grayscale-wb`` flow runs this touch-up in BOTH
+modes (the HDR editor patch set is linear-in-code across the active peak — see
+``calibrate.build_grayscale_wb_set``), but the solver's internals are SDR-shaped:
+the per-channel basis is a hardcoded sRGB matrix and the step exponent is the
+power-γ law (``ratio**(damping/γ)``), while ``point_error`` scores in Lab/ΔE2000.
+That is SAFE here because the loop is fully closed (every nudge is re-measured
+and per-step capped at ``per_iteration_cap``, so the basis/exponent only shape
+step SIZE, never the fixed point) — but the reported ``de2000`` is a Lab number
+even on HDR, and whether DesktopLUT's live editor semantics match on HDR is a
+C++-side contract question (Phase 9 touchpoint), not established here.
 """
 
 from __future__ import annotations
@@ -38,6 +49,11 @@ class GrayTouchupConfig:
     max_abs_delta: float = 0.15
     warn_abs_delta: float = 0.07
     warn_luminance_delta: float = 0.05
+    # 0.25 nit (P5 provenance, Phase 4 audit): the touch-up HOLDS a point below this rather than
+    # correcting it (update_point returns held_dark), so the cost of a too-low floor is one wasted
+    # nudge attempt — unlike the build/refine floors (0.3 fallback / adaptive), where a wrong dark
+    # correction is BAKED into the foundation. A slightly more permissive floor is therefore safe,
+    # and lets the editor's darkest slider still be tuned on a meter good to ~0.3 nit.
     dark_floor_nits: float = 0.25
 
 
