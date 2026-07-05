@@ -69,7 +69,7 @@ __all__ = [
     "build_sdr_cube",
     "refine_hdr_cube",
     "refine_sdr_cube",
-    "refine_sdr_grayscale",
+    "refine_sdr_grayscale_legacy",
     "write_1d_cube",
     "read_1d_cube",
 ]
@@ -93,7 +93,7 @@ def _median(vals: Sequence[float]) -> float:
     return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
 
 
-def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
+def adaptive_dark_floor(neutral_reads: Sequence[Sequence[float]], *,
                         reference_band: tuple[float, float] | None = None,
                         chroma_tolerance: float = 0.008,
                         bounds: tuple[float, float] = (0.1, 5.0),
@@ -106,8 +106,18 @@ def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
     output is unstable; either way a per-channel white-balance correction there is untrustworthy.
     Find that luminance from the data: take a TRUSTWORTHY reference chromaticity, then walk the dark
     reads and flag any whose chromaticity strays from it by more than ``chroma_tolerance``. The floor
-    is the brightest such strayed dark read — smooth to identity below it. Noise or instability, the
-    measured drift sets the floor either way.
+    is the brightest such strayed dark read — smooth to identity below it.
+
+    **σ-aware stray classification (the repeatability tiebreaker).** A strayed dark read can be
+    three different things: sensor noise, panel instability — or a REAL, repeatable dark drift,
+    which is exactly the disease this cube exists to correct (HW 2026-06-20: dy +0.099 at sig
+    0.09). Chroma distance alone cannot tell them apart; measured repeatability can. When a read
+    carries its measurement noise (4th element: the standard error of the mean chromaticity from
+    MULTIPLE reads, ``+inf`` for an ``unstable`` level), a strayed read whose drift CLEARLY exceeds
+    that noise (:func:`noise_trust` == 1) is a real signal and does NOT raise the floor — the
+    per-level ``dark_trust_weights`` machinery governs it instead. A σ-less (single-read) or
+    unstable/noisy strayed read keeps the conservative behaviour and raises the floor. Without any
+    σ data this function is unchanged.
 
     The reference depends on the mode:
       * ``reference_band=(lo,hi)`` (**HDR**): the median chromaticity of reads in the stable diffuse-
@@ -118,11 +128,15 @@ def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
       * ``None`` (**SDR**): the brightest read — on SDR the peak IS the calibration target white and
         is stable, so it's the right anchor.
 
-    ``neutral_reads``: ``[(nits, x, y), ...]`` (any order; nits>0). Returns ``(floor_nits, info)``
-    clamped to ``bounds``; a clean dark region returns ``bounds[0]``; too few reads → ``default_floor_nits``.
+    ``neutral_reads``: ``[(nits, x, y), ...]`` or ``[(nits, x, y, noise), ...]`` (any order;
+    nits>0; ``noise`` optional per-read chroma SE as above, ``None`` = unknown). Returns
+    ``(floor_nits, info)`` clamped to ``bounds``; a clean dark region returns ``bounds[0]``;
+    too few reads → ``default_floor_nits``.
     """
-    reads = [(float(n), float(x), float(y)) for (n, x, y) in neutral_reads
-             if n is not None and n > 0.0 and x is not None and y is not None]
+    reads = [(float(r[0]), float(r[1]), float(r[2]),
+              (float(r[3]) if len(r) > 3 and r[3] is not None else None))
+             for r in neutral_reads
+             if r[0] is not None and r[0] > 0.0 and r[1] is not None and r[2] is not None]
     if len(reads) < 3:
         return default_floor_nits, {"reason": "too_few_reads", "n_reads": len(reads)}
     reads.sort(key=lambda r: r[0])
@@ -135,21 +149,28 @@ def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
             ref_nits, ref_source = _median([r[0] for r in band]), "diffuse_white_band"
         else:
             below = [r for r in reads if r[0] <= hi_b]   # avoid the overdriven peak when out-of-band
-            ref_nits, ref_x, ref_y = (below[-1] if below else reads[0])
+            ref_nits, ref_x, ref_y = (below[-1] if below else reads[0])[:3]
             ref_source = "nearest_below_band" if below else "dimmest_above_band"
     else:
-        ref_nits, ref_x, ref_y = reads[-1]               # SDR: the brightest read = the target white
+        ref_nits, ref_x, ref_y = reads[-1][:3]           # SDR: the brightest read = the target white
         ref_source = "brightest"
     # Floor candidates = the dark reads (below the reference); the bounds clamp keeps a mid-tone
     # chroma error from inflating the floor even if it slips through.
     cutoff = min(nits[len(nits) // 2], ref_nits)
     strayed = []
+    real_drift = []
     max_drift = 0.0
-    for n, x, y in reads:
+    for n, x, y, sigma in reads:
         drift = ((x - ref_x) ** 2 + (y - ref_y) ** 2) ** 0.5
         max_drift = max(max_drift, drift)
         if n <= cutoff and drift > chroma_tolerance:
-            strayed.append(n)
+            # σ-aware: drift clearly above the measured repeatability = a real, CORRECTABLE
+            # signal — don't smooth it away. noise_trust(drift, +inf) == 0, so an `unstable`
+            # level stays strayed; σ=None (single read) stays conservative.
+            if sigma is not None and noise_trust(drift, sigma) >= 1.0:
+                real_drift.append(n)
+            else:
+                strayed.append(n)
     lo, hi = bounds
     if not strayed:
         floor, reason = lo, "clean_dark_region"
@@ -158,7 +179,8 @@ def adaptive_dark_floor(neutral_reads: Sequence[tuple[float, float, float]], *,
     return floor, {"reason": reason, "n_reads": len(reads),
                    "ref_xy": [round(ref_x, 5), round(ref_y, 5)], "ref_nits": round(ref_nits, 3),
                    "ref_source": ref_source, "max_chroma_drift": round(max_drift, 5),
-                   "n_strayed": len(strayed), "chroma_tolerance": chroma_tolerance}
+                   "n_strayed": len(strayed), "n_real_drift": len(real_drift),
+                   "chroma_tolerance": chroma_tolerance}
 
 
 def mhc2_matrix(native_primaries: Mapping[str, float], native_white_xy: tuple[float, float],
@@ -337,9 +359,9 @@ def _gray_shares(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     for s in samples:
         rgb = s.rgb
         if abs(rgb[0] - rgb[1]) < eps and abs(rgb[1] - rgb[2]) < eps:
-            sig = rgb[0]
-            if sig not in pts or sig == rgb[0]:  # last write wins; gray reads are unique per level
-                pts[sig] = matvec(Pinv, s.xyz)
+            # Last write wins on a duplicate level (gray reads are unique per level in every
+            # production set; a re-measured patch overwrites its .ti3 row upstream).
+            pts[rgb[0]] = matvec(Pinv, s.xyz)
     sigs = sorted(pts)
     shares: dict[str, list[float]] = {"r": [], "g": [], "b": []}
     prev = {"r": 0.0, "g": 0.0, "b": 0.0}
@@ -547,6 +569,14 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
     Returns updated per-channel curves (monotone, clamped). Measured points below ``dark_floor_nits``
     (meter noise) are dropped; the first surviving point's factor is held flat below it and the last
     point's factor flat above it (no extrapolation), keeping the refined curve monotone through both ends.
+
+    Constants provenance (Phase 4 audit, P5/P6): ``dark_floor_nits=1.0`` is a FALLBACK-ONLY default —
+    the orchestrator passes the build's measured ADAPTIVE floor (``mhc_cube.adaptive_dark_floor``,
+    typically 0.1–0.3 on a clean panel); 1.0 nit is the conservative no-data value for HDR, where a
+    FALD panel's near-black output is least stable and a wrongly-kept dark point bakes a tint into
+    the standalone foundation. ``damping=0.85``: the cube refines compose in linear light on a dense
+    (≥1024-point) curve where registration error is negligible, so they afford a faster step than
+    the legacy 0.7 deviation-domain law (see :func:`refine_sdr_grayscale_legacy`).
     """
     chans = ("r", "g", "b")
     N = len(current_curves["r"])
@@ -562,7 +592,7 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
         sig, xyz = entry[0], entry[1]
         chroma_sigma = entry[2] if len(entry) > 2 else None   # per-level read-to-read xy spread, if measured
         lin = pq_eotf(sig)
-        tY = min(lin * 10000.0, peak_cap_nits)
+        tY = min(lin * _PQ_CONTAINER_NITS, peak_cap_nits)
         if tY < dark_floor_nits:
             continue
         # Measurement-trust: if MULTIPLE reads gave a chromaticity spread, scale this level's whole
@@ -614,7 +644,7 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
     """One closed-loop grayscale-refine step on the **SDR base cube** — PANEL-AGNOSTIC.
 
     The power-law (γ) analog of :func:`refine_hdr_cube`, and the cube-delivered replacement for
-    :func:`refine_sdr_grayscale` (which emitted ``correctionGrayscale`` deviations — the user slot).
+    :func:`refine_sdr_grayscale_legacy` (which emitted ``correctionGrayscale`` deviations — the user slot).
     Same damped share-ratio law and post-matrix abscissa, but the transfer is ``light = signal**γ``
     (not PQ) and the result is composed onto the installed per-channel ``.cube`` (signal→signal),
     pushed via ``mhc.set_base_lut``. Measurement-only (no forward model) so it converges to whatever
@@ -628,7 +658,7 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
                             trust (:func:`noise_trust`) so dark/noisy levels don't bake a tint.
     ``primaries``/``native_white_xy``/``peak_luminance`` : the measured native gamut + white + peak —
                             the linear-share basis ``disp`` (column normalization cancels in the share
-                            RATIO, the same shares math as :func:`refine_sdr_grayscale`).
+                            RATIO, the same shares math as :func:`refine_sdr_grayscale_legacy`).
     ``matrix_rowsums``    : ``v_c = (M @ (1,1,1))_c`` of the INSTALLED SDR MHC2 matrix
                             (``mhc2_matrix(primaries, native_white, sRGB, D65)``).
 
@@ -640,7 +670,13 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
 
     Returns updated per-channel curves (monotone, clamped). Measured points below ``dark_floor_nits``
     (meter noise) are dropped; the first/last surviving factor is held flat beyond the measured range
-    (no extrapolation), keeping the refined curve monotone through both ends."""
+    (no extrapolation), keeping the refined curve monotone through both ends.
+
+    Constants provenance (Phase 4 audit, P5/P6): ``dark_floor_nits=0.5`` is a FALLBACK-ONLY default —
+    the orchestrator passes the build's measured ADAPTIVE floor; 0.5 nit is the legacy SDR
+    ``refine.DARK_LUMINANCE_FLOOR`` value, kept for the no-data case (an SDR panel's near-black is
+    steadier than HDR FALD, hence lower than the HDR refine's 1.0 fallback). ``damping=0.85``: same
+    rationale as :func:`refine_hdr_cube` (dense linear-light composition vs the coarse-grid legacy 0.7)."""
     chans = ("r", "g", "b")
     N = len(current_curves["r"])
     if N < 2 or len(current_curves["g"]) != N or len(current_curves["b"]) != N:
@@ -694,21 +730,28 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
     return out
 
 
-def refine_sdr_grayscale(current_deviations: Optional[Mapping[str, Sequence[float]]],
-                         measured_neutral: Sequence[tuple[float, Sequence[float]]],
-                         primaries: Mapping[str, float], native_white_xy: tuple[float, float],
-                         peak_luminance: float, matrix_rowsums: Sequence[float],
-                         *, gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
-                         damping: float = 0.7, dark_floor_nits: float = 0.5,
-                         n_points: int = 32, ratio_clamp: tuple[float, float] = (0.5, 2.0),
-                         dev_clamp: tuple[float, float] = (0.25, 4.0)
-                         ) -> tuple[list[float], dict[str, list[float]]]:
+def refine_sdr_grayscale_legacy(current_deviations: Optional[Mapping[str, Sequence[float]]],
+                                measured_neutral: Sequence[tuple[float, Sequence[float]]],
+                                primaries: Mapping[str, float], native_white_xy: tuple[float, float],
+                                peak_luminance: float, matrix_rowsums: Sequence[float],
+                                *, gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
+                                damping: float = 0.7, dark_floor_nits: float = 0.5,
+                                n_points: int = 32, ratio_clamp: tuple[float, float] = (0.5, 2.0),
+                                dev_clamp: tuple[float, float] = (0.25, 4.0)
+                                ) -> tuple[list[float], dict[str, list[float]]]:
     """One closed-loop grayscale-refine step on the **SDR** MHC ``correctionGrayscale`` layer.
 
     SUPERSEDED 2026-06-24 by :func:`refine_sdr_cube` — the orchestrator now delivers the SDR refine
     as a 1D-LUT base (``set_base_lut``), NOT the user-editable ``correctionGrayscale`` slot
-    ([[dlc-must-not-own-mhc-user-layers]]). Kept for the deviation-domain math + its tests; do not
-    wire it into a hardware install.
+    ([[dlc-must-not-own-mhc-user-layers]]). Kept ONLY for the deviation-domain math + its tests;
+    quarantined under the ``_legacy`` suffix (Phase 4 audit) so it cannot be wired into a hardware
+    install without the rename showing up in review. It has zero production callers.
+
+    Constants provenance: ``damping=0.7`` (vs 0.85 in the cube refines) — the deviation law applies
+    ``ratio**(damping/γ)`` on a COARSE 32-point signal-domain grid, where mis-registration between a
+    measured level and its grid slot is likelier, so the legacy loop ran more damped; the cube
+    refines compose in linear light on a dense (≥1024-point) grid and afford 0.85.
+    ``dark_floor_nits=0.5`` matches the legacy ``refine.DARK_LUMINANCE_FLOOR``.
 
     The SDR analog of :func:`refine_hdr_cube`: pulls the measured neutral axis toward the target
     white (default D65) by the same damped share-ratio law, but emits per-channel ``correctionGrayscale``

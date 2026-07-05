@@ -153,6 +153,28 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Fixed
+- **Fable audit Phase 4 — the MHC layer** (`docs/audits/fable/phase-4.md`): the adaptive
+  dark floor is now **σ-aware** — a strayed dark gray read whose chroma drift clearly
+  exceeds its measured repeatability (noise sidecar) is treated as the REAL, correctable
+  drift the gray-ramp cube exists to fix, instead of raising the floor and smoothing its
+  own correction to identity (previously the σ-driven trust said "correct" while the
+  drift-driven floor said "identity", and the floor won); threaded through both build-mhc
+  mode branches and the SDR control law — single-read runs are unchanged (HW-4 queued).
+  The post-matrix abscissa convention was independently verified END-TO-END (full
+  wire→matrix→ReGamma→LUT→panel simulation with a non-identity matrix + a per-level
+  channel defect; both modes converge every measured neutral above the floor to D65,
+  pinned). The Peak-Chroma cap's nominal-additive overshoot was quantified (+1.76 % on
+  the recorded FALD pair) and the honest numbers now ride `peak_chroma`
+  (`measured_peak_nonadditivity`, `cap_nits_nonadditive_est`) — the cap itself stays the
+  documented seed the closed-loop refine lands (HW-5 compares). The superseded SDR
+  deviation-domain refine is quarantined as `refine_sdr_grayscale_legacy`; the refine
+  loops' `safety_max_rounds` backstop is now contract-pinned in both modes (reverts to
+  the best measured cube AND raises the seam — never a silent cap); `mhc.py`'s live
+  parser tier is banner-separated from its zero-caller legacy candidate builder and its
+  private 3×3-inverse/matvec copies now delegate to `colormath`; dark-floor/damping
+  constants carry per-value provenance (parity P5/P6 → intentional); `grayscale_wb` is
+  documented as mode-shared-but-SDR-shaped (closed-loop safe; C++ HDR editor contract →
+  Phase 9). 10 new tests.
 - **Fable audit Phase 3 — the measurement stack** (`docs/audits/fable/phase-3.md`):
   a failed appended re-measure round (meter dies mid-queue) no longer destroys the
   previously accepted read with a sentinel hole — the prior value is retained and the

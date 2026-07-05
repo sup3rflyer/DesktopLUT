@@ -542,7 +542,7 @@ def _run_sdr_loop(white_xy, rounds=10):
         return out
     for _ in range(rounds):
         meas = measure(grid, dev)
-        grid, dev = mc.refine_sdr_grayscale(dev, meas, _PRIM, white_xy, peak,
+        grid, dev = mc.refine_sdr_grayscale_legacy(dev, meas, _PRIM, white_xy, peak,
                                             (1.0, 1.0, 1.0), dark_floor_nits=0.5)
     return measure(grid, dev)
 
@@ -561,7 +561,7 @@ def test_refine_sdr_grayscale_leaves_d65_panel_alone():
     _P, emit, peak = _synthetic_sdr_panel((0.3127, 0.3290))
     sigs = [0.3, 0.5, 0.7]
     meas = [(s, emit([s, s, s])) for s in sigs]
-    _grid, dev = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.3127, 0.3290), peak,
+    _grid, dev = mc.refine_sdr_grayscale_legacy(None, meas, _PRIM, (0.3127, 0.3290), peak,
                                          (1.0, 1.0, 1.0), dark_floor_nits=0.5)
     for ch in "rgb":
         assert all(abs(v - 1.0) < 5e-3 for v in dev[ch]), (ch, dev[ch])
@@ -573,9 +573,9 @@ def test_refine_sdr_grayscale_idempotent_current_none_equals_identity():
     _P, emit, peak = _synthetic_sdr_panel((0.336, 0.345))
     sigs = [0.3, 0.5, 0.7]
     meas = [(s, emit([s, s, s])) for s in sigs]
-    grid_a, dev_a = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.336, 0.345), peak, (1.0, 1.0, 1.0))
+    grid_a, dev_a = mc.refine_sdr_grayscale_legacy(None, meas, _PRIM, (0.336, 0.345), peak, (1.0, 1.0, 1.0))
     ident = {ch: [1.0] * len(grid_a) for ch in "rgb"}
-    grid_b, dev_b = mc.refine_sdr_grayscale(ident, meas, _PRIM, (0.336, 0.345), peak, (1.0, 1.0, 1.0))
+    grid_b, dev_b = mc.refine_sdr_grayscale_legacy(ident, meas, _PRIM, (0.336, 0.345), peak, (1.0, 1.0, 1.0))
     assert grid_a == grid_b
     for ch in "rgb":
         assert dev_a[ch] == pytest.approx(dev_b[ch], abs=1e-12)
@@ -600,9 +600,9 @@ def test_refine_sdr_grayscale_uses_matrix_rowsums_for_abscissa():
         ms = [ts[0], ts[1], ts[2] * blue_scale[s]]
         xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
         meas.append((s, xyz))
-    _g1, base = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.3127, 0.3290), peak,
+    _g1, base = mc.refine_sdr_grayscale_legacy(None, meas, _PRIM, (0.3127, 0.3290), peak,
                                         (1.0, 1.0, 1.0), dark_floor_nits=0.5)
-    _g2, shifted = mc.refine_sdr_grayscale(None, meas, _PRIM, (0.3127, 0.3290), peak,
+    _g2, shifted = mc.refine_sdr_grayscale_legacy(None, meas, _PRIM, (0.3127, 0.3290), peak,
                                            (1.0, 1.0, 2.0), dark_floor_nits=0.5)
     n = len(base["b"])
     assert max(abs(base["b"][j] - shifted["b"][j]) for j in range(n)) > 5e-3
@@ -625,9 +625,9 @@ def test_refine_sdr_grayscale_trust_damps_noisy_dark_level():
     xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
     tot = sum(xyz)
     err = ((xyz[0] / tot - 0.3127) ** 2 + (xyz[1] / tot - 0.3290) ** 2) ** 0.5
-    _g, trusted = mc.refine_sdr_grayscale(None, [(s, xyz)], _PRIM, (0.3127, 0.3290), peak,
+    _g, trusted = mc.refine_sdr_grayscale_legacy(None, [(s, xyz)], _PRIM, (0.3127, 0.3290), peak,
                                           (1.0, 1.0, 1.0), dark_floor_nits=0.1)
-    _g2, noisy = mc.refine_sdr_grayscale(None, [(s, xyz, err)], _PRIM, (0.3127, 0.3290), peak,
+    _g2, noisy = mc.refine_sdr_grayscale_legacy(None, [(s, xyz, err)], _PRIM, (0.3127, 0.3290), peak,
                                          (1.0, 1.0, 1.0), dark_floor_nits=0.1)
     n = len(trusted["r"])
     move_trusted = sum(abs(trusted[ch][j] - 1.0) for ch in "rgb" for j in range(n))
@@ -647,7 +647,7 @@ def test_refine_sdr_grayscale_clamps_deviations():
     ts = matvec(disp_inv, xy_to_XYZ(0.3127, 0.3290, tY))
     ms = [ts[0] * 100.0, ts[1], ts[2] * 0.001]           # absurd error (ratio clamp + dev clamp kick in)
     xyz = tuple(sum(disp[r][c] * ms[c] for c in range(3)) for r in range(3))
-    _g, dev = mc.refine_sdr_grayscale(None, [(s, xyz)], _PRIM, (0.3127, 0.3290), peak,
+    _g, dev = mc.refine_sdr_grayscale_legacy(None, [(s, xyz)], _PRIM, (0.3127, 0.3290), peak,
                                       (1.0, 1.0, 1.0), dev_clamp=(0.25, 4.0))
     for ch in "rgb":
         assert all(0.25 - 1e-9 <= v <= 4.0 + 1e-9 for v in dev[ch])
@@ -765,3 +765,168 @@ def test_refine_sdr_cube_uses_matrix_rowsums_for_abscissa():
     assert max(abs(base["b"][j] - shifted["b"][j]) for j in range(N)) > 5e-3
     for ch in ("r", "g"):
         assert all(abs(base[ch][j] - shifted[ch][j]) < 1e-9 for j in range(N))
+
+
+# --- σ-aware adaptive dark floor (Phase 4: real drift is not noise) ----------
+
+def test_adaptive_dark_floor_stable_real_drift_does_not_raise_floor():
+    # A REAL, repeatable dark drift (drift >> its measured σ) is the disease the cube exists to
+    # correct — it must NOT raise the floor and smooth its own correction away. The per-level
+    # trust machinery (dark_trust_weights) governs it instead.
+    reads = [
+        (0.5, 0.3127, 0.3290, 0.0005),   # deep dark, clean, stable
+        (1.0, 0.315, 0.345, 0.0005),     # REAL drift (|dxy| ~0.016), σ tiny -> correctable signal
+        (3.0, 0.314, 0.342, 0.0005),     # REAL drift, stable
+        (20.0, 0.3127, 0.3290, 0.0005),
+        (150.0, 0.3127, 0.3290, 0.0005),
+        (400.0, 0.3127, 0.3290, 0.0005),
+    ]
+    floor, info = mc.adaptive_dark_floor(reads, reference_band=None, bounds=(0.1, 5.0))
+    assert floor == 0.1, (floor, info)                       # nothing untrustworthy -> low bound
+    assert info["n_strayed"] == 0 and info["n_real_drift"] == 2
+
+
+def test_adaptive_dark_floor_unstable_dark_read_still_raises_floor():
+    # An `unstable` level (σ=+inf: the loop couldn't pin it) stays untrustworthy — floor rises.
+    reads = [
+        (0.5, 0.3127, 0.3290, 0.0005),
+        (1.0, 0.315, 0.345, math.inf),   # strayed AND unstable -> raise the floor over it
+        (20.0, 0.3127, 0.3290, 0.0005),
+        (150.0, 0.3127, 0.3290, 0.0005),
+        (400.0, 0.3127, 0.3290, 0.0005),
+    ]
+    floor, info = mc.adaptive_dark_floor(reads, reference_band=None, bounds=(0.1, 5.0))
+    assert floor == 1.0 and info["reason"] == "chroma_drift"
+    assert info["n_strayed"] == 1 and info["n_real_drift"] == 0
+
+
+def test_adaptive_dark_floor_sigma_less_strays_stay_conservative():
+    # Without σ (single-read run / no sidecar) a strayed dark read keeps the old conservative
+    # behaviour: noise and real drift are indistinguishable, so the floor rises (3-tuples and
+    # 4-tuples with noise=None behave identically).
+    reads3 = [(0.3, 0.34, 0.30), (0.8, 0.33, 0.31), (2.0, 0.315, 0.328),
+              (50.0, 0.3127, 0.3290), (300.0, 0.3127, 0.3290)]
+    reads4 = [(n, x, y, None) for (n, x, y) in reads3]
+    f3, i3 = mc.adaptive_dark_floor(reads3, chroma_tolerance=0.008, bounds=(0.1, 5.0))
+    f4, i4 = mc.adaptive_dark_floor(reads4, chroma_tolerance=0.008, bounds=(0.1, 5.0))
+    assert f3 == f4 == 0.8
+    assert i3["n_strayed"] == i4["n_strayed"] == 2
+
+
+# --- gray-share monotone enforcement on NON-monotone measured shares ---------
+
+def test_nonmonotone_measured_shares_still_yield_monotone_invertible_cube():
+    # A noisy gray ramp whose blue share DIPS mid-ramp (non-monotone measured data). The
+    # monotone enforcement in _gray_shares must keep the inversion well-defined and the cube
+    # monotone — no oscillation leaks through to the curves.
+    samples = []
+    smax = mc.pq_oetf(_PEAK / 10000.0)
+    n = 24
+    for i in range(n):
+        s = smax * i / (n - 1)
+        frac = min(mc.pq_eotf(s) * 10000.0 / _PEAK, 1.0)
+        b = frac
+        if 8 <= i <= 10:                     # a mid-ramp dip: measured blue share goes DOWN
+            b = frac * 0.55
+        samples.append(_gray_sample(s, (frac, frac, b)))
+    curves, _ = mc.build_hdr_cube(samples, _PRIM, _WHITE, _PEAK, lut_size=256, dark_floor_nits=0.3)
+    for ch in "rgb":
+        c = curves[ch]
+        assert all(c[i] <= c[i + 1] + 1e-9 for i in range(len(c) - 1)), ch   # strictly monotone out
+        assert 0.0 <= min(c) and max(c) <= 1.0
+
+
+# --- END-TO-END abscissa verification (Phase 4 seeded lead #1) ---------------
+# Simulate the FULL Windows pipeline — wire -> DeGamma -> MHC2 matrix (linear RGB) -> ReGamma ->
+# per-channel 1D LUT -> panel — with a NON-identity matrix (warm native white) and a per-level
+# channel defect the matrix cannot fix. The refine, fed the production rowsums, must land every
+# measured neutral above the dark floor on D65. This independently verifies the post-matrix
+# abscissa convention (factor stored at oetf(rowsum·eotf(s)), cube indexed in the same space).
+
+def _mid_sag(d, top):
+    """A per-level defect: the channel's drive->light response sags up to 30% mid-range
+    (clean at black and full drive) — per-level tracking error only the cube can fix."""
+    t = max(0.0, min(d / top, 1.0))
+    return 1.0 - 0.30 * (4.0 * t * (1.0 - t)) ** 2
+
+
+def test_refine_hdr_cube_end_to_end_converges_through_nonidentity_matrix():
+    peak = 1000.0
+    warm = (0.336, 0.345)                                    # warm native white -> rowsums != 1
+    P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                          _PRIM["bx"], _PRIM["by"], warm[0], warm[1], white_Y=peak)
+    peaks = [[P[r][c] for r in range(3)] for c in range(3)]
+    smax = mc.pq_oetf(peak / 10000.0)
+
+    def emit(drive):
+        f = [mc.pq_eotf(max(0.0, min(d, smax))) / mc.pq_eotf(smax) for d in drive]
+        f[2] *= _mid_sag(drive[2], smax)                      # blue mid-range sag
+        return tuple(sum(P[r][c] * f[c] for c in range(3)) for r in range(3))
+
+    # Installed HDR matrix: native-target white-only move (the C++ default) — diagonal, rowsums != 1.
+    M = mc.mhc2_matrix(_PRIM, warm, _PRIM, (0.3127, 0.3290))
+    rowsums = [sum(M[r]) for r in range(3)]
+    assert max(abs(v - 1.0) for v in rowsums) > 0.05          # genuinely non-identity
+    cap, _b = mc.peak_chroma_luminance(peaks)
+
+    N = 512
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+
+    def render(cube, s):
+        """wire s (neutral) -> matrix on linear RGB -> ReGamma -> 1D LUT -> panel."""
+        lin = mc.pq_eotf(s)
+        drive = []
+        for c, ch in enumerate("rgb"):
+            post = mc.pq_oetf(min(max(rowsums[c] * lin, 0.0), 1.0))
+            drive.append(_interp_list(grid, cube[ch], post))
+        return emit(drive)
+
+    sigs = [f * smax for f in (0.3, 0.45, 0.6, 0.75, 0.9)]    # all above the 0.5-nit floor
+    for _ in range(6):
+        meas = [(s, render(cube, s)) for s in sigs]
+        cube = mc.refine_hdr_cube(cube, meas, peaks, rowsums,
+                                  peak_cap_nits=cap, dark_floor_nits=0.5)
+    for s in sigs:
+        xyz = render(cube, s)
+        x, y = _xy(xyz)
+        assert abs(x - 0.3127) < 0.002 and abs(y - 0.3290) < 0.002, (s, x, y)
+
+
+def test_refine_sdr_cube_end_to_end_converges_through_nonidentity_matrix():
+    peak = 120.0
+    warm = (0.336, 0.345)
+    SRGB = {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06}
+    P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                          _PRIM["bx"], _PRIM["by"], warm[0], warm[1], white_Y=peak)
+
+    def emit(drive):
+        f = [max(0.0, min(d, 1.0)) ** _GAMMA for d in drive]
+        f[2] *= _mid_sag(drive[2], 1.0)
+        return tuple(sum(P[r][c] * f[c] for c in range(3)) for r in range(3))
+
+    # Installed SDR matrix: src = sRGB@D65, display = native + warm white (full 3x3).
+    M = mc.mhc2_matrix(_PRIM, warm, SRGB, (0.3127, 0.3290))
+    rowsums = [sum(M[r]) for r in range(3)]
+    assert max(abs(v - 1.0) for v in rowsums) > 0.05
+
+    N = 512
+    grid = [j / (N - 1) for j in range(N)]
+    cube = {ch: list(grid) for ch in "rgb"}
+
+    def render(cube, s):
+        lin = s ** _GAMMA
+        drive = []
+        for c, ch in enumerate("rgb"):
+            post = min(max(rowsums[c] * lin, 0.0), 1.0) ** (1.0 / _GAMMA)
+            drive.append(_interp_list(grid, cube[ch], post))
+        return emit(drive)
+
+    sigs = [0.3, 0.45, 0.6, 0.75, 0.9]
+    for _ in range(10):
+        meas = [(s, render(cube, s)) for s in sigs]
+        cube = mc.refine_sdr_cube(cube, meas, _PRIM, warm, peak, rowsums,
+                                  gamma=_GAMMA, dark_floor_nits=0.2)
+    for s in sigs:
+        x, y = _xy(render(cube, s))
+        assert abs(x - 0.3127) < 0.002 and abs(y - 0.3290) < 0.002, (s, x, y)
