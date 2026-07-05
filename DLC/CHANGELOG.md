@@ -153,6 +153,41 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Changed
+- **Fable audit Phase 8 — LLM seams and intelligence**
+  (`docs/audits/fable/phase-8.md`): **Task #1 resolved** (owner-approved) — the
+  `SupervisedAdjudicator`'s benign auto-accepts are no longer silent: every benign
+  default it takes is marked (`Decision.auto_accepted`) and emitted as a **vetoable
+  judgment packet** on the digest tier (a `seam` event with `status="auto_accepted"`
+  carrying the full request — question/options/recommendation/digest — plus the veto
+  lever: `--cancel` mid-run, `--decide KEY=CHOICE` on resume), so the observing LLM
+  sees exactly what a paused run would have printed; a clean run still never pauses.
+  The real-run adjudicator gets an explicit flag: `--attended` (== the default
+  MappingAdjudicator), mutually exclusive with `--auto`/`--supervised`; the README
+  documents the three autonomy modes. Seam decisions are now **validated against the
+  seam's option vocabulary** from every source (`--decide` override / recorded record /
+  adjudicator) — an off-vocabulary choice (`--decide verify:accept=abort` previously
+  silently APPLIED the calibration) surfaces as an `invalid_decision` seam event and
+  pauses instead of misrouting; `--decide` accepts an optional audit-trail reason
+  (`KEY=CHOICE=REASON`); the phantom `loosen_target` option (offered, honoured nowhere)
+  is removed from the optimizer-floor seam. Digest sufficiency: the optimizer-floor
+  seam carries structured `floor_offenders` (worst-first with kind/boundary/near-black/
+  neutral zone context — reachability corner vs §0 core damage is decidable at the
+  seam); the measure escalation carries `unresolved_detail` (observed SE vs loop
+  tolerance vs the DIP's expected σ at that luminance); the verify seam carries
+  `before_scores` (raw → after-ICC trajectory); a failed reachable-saturation cap
+  computation WARNs (`caps_unavailable`) instead of silently uncapping the HDR ramp;
+  preflight surfaces `store_health` (DipStore/CorrectionStore `.corrupt`/`.dropped`).
+  The §12 check-in assembly moved to `dlc/checkin.py` (7b RFC R2) and its evidence
+  packet truncates worst-first with pre-truncation per-type counts. The digest
+  envelope contract is pinned on `AdjudicationRequest` + an envelope-coherence test.
+  **NO-DARK-WINDOW rule** (owner): an LLM-adjudicated run never goes more than 20
+  minutes without a check-in while the spine executes — the check-in interval is
+  ctor-clamped to ≤1200 s on `--attended`/`--supervised` (0-disables is now
+  `--auto`-only), and wall-clock backstops tick inside every long phase: the measure
+  loop's read funnel (warm-up/re-measures included) + preheat/rewarm soak blocks, the
+  optimizer's per-probe-read hook (a single probe pass could previously run an hour
+  digest-dark between iteration check-ins), and characterize's instrumented reads
+  (previously emitted no check-ins at all). 915 → 933 passed, 3 skipped.
 - **Fable audit Phase 7b — the orchestrator spine, structure**
   (`docs/audits/fable/phase-7b.md`): zero-behaviour-change decomposition of
   `calibrate.py` (6,095 → 5,474 lines). The LLM seam layer — seam ids, the

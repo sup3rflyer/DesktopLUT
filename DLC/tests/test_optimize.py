@@ -451,6 +451,18 @@ def test_infeasible_correction_surfaces_only_real_floors():
     assert result.question is not None and "physical floor" in result.question
     # the worst floor point is a bright, blue-bearing stimulus
     assert max(result.floor_points[0][0]) > 0.5
+    # Structured floor offenders WITH zone context (fable Phase 8, digest-sufficiency):
+    # each carries kind/boundary/near_black/neutral so the seam is decidable from the
+    # digest alone (reachability corner vs core wreck), worst first.
+    offenders = result.digest["floor_offenders"]
+    assert offenders and len(offenders) <= 8
+    assert offenders[0]["de"] == max(o["de"] for o in offenders)
+    for o in offenders:
+        assert set(o) == {"signal", "de", "kind", "boundary", "near_black", "neutral"}
+        assert o["kind"] in ("signal_clipped", "residual")
+        assert o["boundary"] in ("low", "high", "interior")
+    # this scenario's floors are genuine signal clips at the drive rail
+    assert offenders[0]["kind"] == "signal_clipped"
 
 
 def test_clamp_limited_points_are_not_labelled_a_panel_floor():

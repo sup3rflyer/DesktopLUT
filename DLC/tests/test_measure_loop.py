@@ -687,6 +687,15 @@ def test_persistent_flaky_patch_surfaces_as_unresolved(tmp_path: Path):
     assert "p0003" in res.unresolved
     assert res.needs_adjudication is True
     assert res.question is not None and "stabilise" in res.question
+    # Digest-sufficiency (fable Phase 8): "would not stabilise" is judgeable only with the
+    # numbers next to it — observed SE vs the loop tolerance vs the DIP's expected σ at
+    # that luminance, and the reads burned trying.
+    detail = {d["label"]: d for d in res.digest["unresolved_detail"]}
+    d = detail["p0003"]
+    assert d["tolerance_de"] == 0.2
+    assert d["dip_expected_sigma_de"] is not None      # the DIP context rides along
+    assert d["reads_taken"] >= 6                       # hit the abnormal bound
+    assert d["nits"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +956,31 @@ def test_measure_loop_wall_clock_backstop_emits_beyond_quartiles(tmp_path: Path,
     check_ins = [e for e in digest_projection(read_events(epath)) if e.event == "check_in"]
     assert len(check_ins) > 3                                       # backstop fired beyond the 3 quartiles
     assert {0.25, 0.5, 0.75} <= {round(e.data["progress"], 2) for e in check_ins}  # quartiles still present
+
+
+def test_wall_clock_backstop_ticks_during_warmup_too(tmp_path: Path, monkeypatch):
+    """NO-DARK-WINDOW rule (fable Phase 8): the wall-clock backstop lives on the loop's
+    single read funnel (_read), so warm-up — before ANY patch is accepted and before the
+    main pass's quartile arm exists — ticks the §12 clock too. (The same backstop hook
+    also fires per preheat/rewarm soak block, whose reads bypass _read.)"""
+    import dlc.measure_loop as ml
+    from dlc.events import RunLog, read_events, digest_projection
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(ml.time, "monotonic",
+                        lambda: clock.__setitem__("t", clock["t"] + 60.0) or clock["t"])
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, warm_tau=0.06)   # cold start → several warm-up reads
+    epath = tmp_path / "e.jsonl"
+    runlog = RunLog(epath, phase="measure:raw")
+    run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=panel,
+                     config=MeasureLoopConfig(), runlog=runlog,
+                     ti3_path=tmp_path / "m.ti3", ndjson_path=tmp_path / "m.ndjson",
+                     checkin_interval_s=120.0)
+    check_ins = [e for e in digest_projection(read_events(epath)) if e.event == "check_in"]
+    # at least one packet was emitted with ZERO accepted patches — i.e. during warm-up
+    assert any(e.data.get("patches_done") == 0 for e in check_ins)
 
 
 def test_write_ti3_excludes_unusable_holes(tmp_path: Path):

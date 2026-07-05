@@ -30,12 +30,15 @@ allowed choices + the *core's recommendation*) and gets back a :class:`Decision`
   stage is **memoised** in the run-record, so measurements are never repeated) to
   the seam and proceeds. The memoisation also gives free crash-recovery.
 * :class:`SupervisedAdjudicator` is the middle ground for an *unattended hardware*
-  run: it auto-accepts **benign** recommendations (a clean run never pauses) but
-  **escalates safety-critical seams to the LLM** — exactly when the core's own
+  run: it takes **benign** recommendations without pausing (a clean run never pauses)
+  but **escalates safety-critical seams to the LLM** — exactly when the core's own
   recommendation turns non-benign (``abort``/``revert``/``retry``/…) or the digest
-  flags a severe/critical state. This is the answer to "the overnight run had no LLM
-  at the seams": auto-mode is *safe* only if recommendations are conservative, but
-  supervised-mode is *judged* at the boundaries that matter.
+  flags a severe/critical state. Every benign default it takes is emitted as a
+  **vetoable judgment packet** on the digest (seam ``status="auto_accepted"`` with the
+  full request + the veto lever), so the observing LLM still sees — and can override —
+  every judgment (Task #1, resolved fable Phase 8). This is the answer to "the
+  overnight run had no LLM at the seams": auto-mode is *safe* only if recommendations
+  are conservative, but supervised-mode is *judged* at the boundaries that matter.
 
 **Where the LLM judges (the seam) vs what the core decides (mechanics).** *Detecting*
 an anomaly — a collapsed post-foundation luminance envelope, an optimizer floor, a
@@ -95,6 +98,7 @@ from .adjudication import (
     SupervisedAdjudicator,
 )
 from . import calibration_profile as cp
+from . import checkin
 from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
@@ -445,6 +449,20 @@ class Calibration:
         # so a multi-hour run never goes dark. monotonic so it is immune to wall-clock changes;
         # reset on each resume (a fresh process), which is fine — a resume is itself a status point.
         self._checkin_interval_s = max(0.0, float(checkin_interval_s))
+        # NO-DARK-WINDOW rule (owner, 2026-07-05): an LLM-adjudicated run must never go
+        # more than checkin.NO_DARK_WINDOW_CEILING_S without a check-in while the spine
+        # executes. A disabled (0) or longer interval is clamped here for any adjudicator
+        # but the sim/CI AutoAdjudicator; the wall-clock backstops in the measure loop /
+        # probe batch / characterize deliver the cadence inside long phases.
+        if not isinstance(adjudicator, AutoAdjudicator) and not (
+                0.0 < self._checkin_interval_s <= checkin.NO_DARK_WINDOW_CEILING_S):
+            requested = self._checkin_interval_s
+            self._checkin_interval_s = checkin.NO_DARK_WINDOW_CEILING_S
+            self.ctx.log(
+                f"check-in interval {requested:g}s "
+                f"{'(disabled)' if requested <= 0 else ''} exceeds the no-dark-window rule "
+                f"for an LLM-adjudicated run — clamped to {self._checkin_interval_s:g}s "
+                "(only --auto sim/CI runs may disable check-ins)")
         self._last_checkin_monotonic: Optional[float] = None
         self._last_checkin_tally: dict[str, int] = {}
         self._last_checkin_pos: int = 0   # events.jsonl byte offset at the last check-in (evidence window)
@@ -682,8 +700,18 @@ class Calibration:
         an already-recorded decision, so a resumed run can change a recorded seam (notably the
         terminal ``verify:accept`` apply↔revert gate) without ``--force`` discarding all stage
         memoisation. A recorded decision is otherwise replayed as-is; only an un-decided seam
-        consults the adjudicator (which may pause the run)."""
+        consults the adjudicator (which may pause the run).
+
+        Every decision — override, recorded, or adjudicator-returned — is VALIDATED against
+        the seam's declared option vocabulary (fable Phase 8): an off-vocabulary choice
+        (``--decide verify:accept=aply``) previously fell through each caller's string
+        comparisons and silently behaved as whatever the *unmatched* branch did (at the
+        verify gate: APPLY). Now it is surfaced on the spine and treated as un-decided —
+        the seam pauses (or the adjudicator re-decides) instead of misfiring."""
         override = self.decision_overrides.get(request.key)
+        if override is not None and not self.force:
+            if not self._valid_choice(request, override, source="--decide override"):
+                override = None   # fall through: recorded decision, then the adjudicator
         if override is not None and not self.force:
             recorded = self.calib["decisions"].get(request.key)
             if (recorded is None or recorded.get("choice") != override.choice
@@ -698,7 +726,11 @@ class Calibration:
             return Decision(override.choice, override.note, payload=override.payload)
         if request.key in self.calib["decisions"] and not self.force:
             d = self.calib["decisions"][request.key]
-            return Decision(d["choice"], d.get("note"), payload=d.get("payload"))
+            rec = Decision(d["choice"], d.get("note"), payload=d.get("payload"))
+            if self._valid_choice(request, rec, source="recorded decision"):
+                return rec
+            # else: fall through to the adjudicator (a live run pauses; the record stays
+            # until a valid decision overwrites it).
         try:
             decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
         except AdjudicationRequired:
@@ -707,8 +739,29 @@ class Calibration:
             self.runlog.seam(request.stage, key=request.key, status="paused",
                              question=request.question, options=list(request.options))
             raise
+        if not self._valid_choice(request, decision, source="adjudicator"):
+            # A seeded/custom adjudicator answered outside the vocabulary — re-asking it
+            # would loop, so pause the run for a real judge instead.
+            self.runlog.seam(request.stage, key=request.key, status="paused",
+                             question=request.question, options=list(request.options))
+            raise AdjudicationRequired(request)
         self._record_decision(request, decision)
         return decision
+
+    def _valid_choice(self, request: AdjudicationRequest, decision: Decision, *,
+                      source: str) -> bool:
+        """Is ``decision.choice`` in the seam's declared option vocabulary? An off-vocabulary
+        choice is surfaced LOUDLY on the spine (log + digest-tier seam event) and rejected —
+        the callers' string comparisons would otherwise silently route it down whatever branch
+        matches nothing (fable Phase 8, decision-durability audit)."""
+        if decision.choice in request.options:
+            return True
+        self.ctx.log(f"seam {request.key}: invalid {source} choice {decision.choice!r} "
+                     f"(valid: {', '.join(request.options)}) — ignored")
+        self.runlog.seam(request.stage, key=request.key, status="invalid_decision",
+                         choice=decision.choice, valid_options=list(request.options),
+                         source=source, question=request.question)
+        return False
 
     def _record_decision(self, request: AdjudicationRequest, decision: Decision,
                          *, overridden: bool = False) -> None:
@@ -719,9 +772,24 @@ class Calibration:
         self.ctx.log(f"seam {request.key}: {decision.choice}"
                      + (" (override)" if overridden else "")
                      + (f" ({decision.note})" if decision.note else ""))
-        self.runlog.seam(request.stage, key=request.key, status="decided",
-                         choice=decision.choice, note=decision.note,
-                         question=request.question, overridden=overridden)
+        if decision.auto_accepted:
+            # DESIGN LAW (Task #1, resolved fable Phase 8 — owner-approved): a benign default
+            # taken by CODE (SupervisedAdjudicator) is still a judgment the LLM must see, so it
+            # goes on the digest as a FULL judgment packet — everything a paused run would have
+            # printed (question/options/recommendation/digest) plus the veto lever — not a bare
+            # "decided" line. The observing LLM applies judgment out of band and intervenes only
+            # if it disagrees; the run does not pause.
+            self.runlog.seam(request.stage, key=request.key, status="auto_accepted",
+                             choice=decision.choice, note=decision.note,
+                             question=request.question, options=list(request.options),
+                             recommendation=request.recommendation, digest=request.digest,
+                             veto=(f"--cancel mid-run, or --decide {request.key}=<choice> "
+                                   f"--run {self.ctx.root.name} on resume (an override beats "
+                                   "this recorded decision without --force)"))
+        else:
+            self.runlog.seam(request.stage, key=request.key, status="decided",
+                             choice=decision.choice, note=decision.note,
+                             question=request.question, overridden=overridden)
         self._save()
 
     def _abort_if(self, decision: Decision, *, stage: str, message: str) -> Decision:
@@ -1348,6 +1416,10 @@ class Calibration:
                 # restarting each outer pass so the bar visibly pulses = clearly alive.
                 self.runlog.progress("build-install-3dlut", patches_done=i + 1,
                                      patches_total=total, iteration=batch["n"])
+                # NO-DARK-WINDOW rule (fable Phase 8): a single probe pass can run for the
+                # better part of an hour, and the between-iterations check-in alone left it
+                # digest-dark. Tick the §12 clock per read (cheap early-return until due).
+                self._maybe_timed_checkin("build-install-3dlut")
             return out
 
         return probe
@@ -1396,149 +1468,33 @@ class Calibration:
                     pass
 
     # -- §12 timed check-in (NON-BLOCKING evidence packet) ------------------
+    # -- §12 timed check-ins — assembly lives in dlc.checkin (fable Phase 8, R2) ---------
+    # The check-in STATE (window clock, tally snapshot, events byte offset, latest-metric
+    # snapshots) stays on this orchestrator where the stages that feed it live; the packet
+    # assembly + the DESIGN LAW (emit-only, never a gate) moved to dlc/checkin.py. These
+    # delegators keep every call site + test name stable.
     def _maybe_timed_checkin(self, trigger: str) -> None:
-        """Emit a rich evidence packet for the overseeing LLM once the wall-clock floor has
-        elapsed (§12). Disabled at interval 0; the first checkpoint only anchors the clock.
-
-        DESIGN LAW (do not regress): a check-in NEVER pauses the spine and carries NO
-        recommendation/accept for anyone to rubber-stamp. It is the spine collecting the
-        evidence since the last check-in — warnings, the max ΔE actually read, re-read /
-        repeated patches, non-stopper anomalies — and handing it to the LLM EVERY TIME so the
-        LLM applies judgment ("ΔE high but that's the panel limit"; "patch re-read twice but
-        the latest read is normal → self-corrected") and intervenes ONLY if it sees a real
-        problem. Run-stoppers are a SEPARATE mechanism (adjudicated seams). The LLM consumes
-        this from the running (background) spine out of band — emit-only, no exit-10 gate. This
-        is the point of DLC: LLM intelligence consuming tools+data, not a deterministic program.
-        """
-        import time
-        if self._checkin_interval_s <= 0 or self.runlog is None:
-            return
-        now = time.monotonic()
-        if self._last_checkin_monotonic is None:
-            # First checkpoint just anchors the clock — no immediate ping at second 0.
-            self._last_checkin_monotonic = now
-            self._last_checkin_tally = dict(self.runlog.tally)
-            self._last_checkin_pos = self._events_size()
-            return
-        if now - self._last_checkin_monotonic < self._checkin_interval_s:
-            return
-        elapsed_since = now - self._last_checkin_monotonic
-        seq = int(self.calib.get("checkin_seq", 0)) + 1
-        self.calib["checkin_seq"] = seq
-        digest = self._checkin_digest(trigger, seq=seq, elapsed_since_checkin_s=round(elapsed_since, 1))
-        # Reset the window AFTER building the digest, BEFORE emitting, so the next window starts
-        # clean and the check_in event itself isn't counted into it.
-        self._last_checkin_monotonic = now
-        self._last_checkin_tally = dict(self.runlog.tally)
-        self._last_checkin_pos = self._events_size()
-        self.runlog.check_in(trigger, **digest)   # EMIT-ONLY: evidence for the LLM, never a gate
+        checkin.maybe_timed_checkin(self, trigger)
 
     def _checkin_digest(self, trigger: str, *, seq: int = 0,
                         elapsed_since_checkin_s: float = 0.0) -> dict[str, Any]:
-        """The rich check-in payload: the run overview, what happened since the last check-in,
-        and the latest live metrics — exactly what a supervising LLM needs to judge "continue?"."""
-        return {
-            "seq": seq,
-            "elapsed_since_checkin_s": elapsed_since_checkin_s,
-            "overview": self._run_overview(trigger),
-            "since_last": self._events_since_last_checkin(),
-            "evidence": self._checkin_evidence(),
-            "metrics": self._latest_checkin_metrics(),
-        }
+        return checkin.checkin_digest(self, trigger, seq=seq,
+                                      elapsed_since_checkin_s=elapsed_since_checkin_s)
 
     def _events_size(self) -> int:
-        """Current byte size of events.jsonl (the check-in evidence window high-water mark)."""
-        try:
-            return self.runlog.path.stat().st_size if self.runlog else 0
-        except OSError:
-            return 0
+        return checkin.events_size(self)
 
     def _checkin_evidence(self) -> dict[str, Any]:
-        """The REAL evidence since the last check-in, read back from the events.jsonl window:
-        every warning/anomaly (with detail), the max ΔE actually read + which patch, and the
-        read count. This is data for the LLM to JUDGE — deliberately NOT a verdict and NOT a
-        recommendation. The full firehose is always on disk; this is the at-a-glance packet."""
-        import json as _json
-        out: dict[str, Any] = {"reads": 0, "max_dE": None, "max_dE_patch": None, "warnings": []}
-        if self.runlog is None:
-            return out
-        try:
-            with self.runlog.path.open("r", encoding="utf-8") as fh:
-                fh.seek(self._last_checkin_pos or 0)
-                lines = fh.readlines()
-        except OSError:
-            return out
-        for ln in lines:
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                e = _json.loads(ln)
-            except ValueError:
-                continue
-            ev = e.get("event")
-            data = e.get("data") or {}
-            if ev == "patch_read":
-                out["reads"] += 1
-                de = data.get("dE")
-                if isinstance(de, (int, float)) and (out["max_dE"] is None or de > out["max_dE"]):
-                    out["max_dE"] = round(de, 3)
-                    out["max_dE_patch"] = data.get("label") or data.get("role") or data.get("signal")
-            elif ev in ("anomaly", "read_plausibility_anomaly", "stall"):
-                w = {"event": ev, "stage": e.get("stage")}
-                for k in ("kind", "label", "reason", "message", "detail", "attempt"):
-                    if k in data:
-                        w[k] = data[k]
-                out["warnings"].append(w)
-        # Cap the inline warning list so the packet stays readable; the full log is on disk.
-        if len(out["warnings"]) > 25:
-            extra = len(out["warnings"]) - 25
-            out["warnings"] = out["warnings"][:25] + [{"truncated": extra, "note": "see events.jsonl"}]
-        return out
+        return checkin.checkin_evidence(self)
 
     def _run_overview(self, trigger: str) -> dict[str, Any]:
-        import time
-        stages = self.calib.get("stages") or {}
-        done = [k for k, v in stages.items() if (v or {}).get("status") == "done"]
-        elapsed = None
-        if self._run_started_monotonic is not None:
-            elapsed = round(time.monotonic() - self._run_started_monotonic, 1)
-        return {
-            "run": self.ctx.root.name,
-            "flow": self.calib.get("flow"),
-            "mode": self.mode,
-            "target": self.target_name,
-            "phase": self.runlog.phase if self.runlog else None,
-            "stage": trigger,
-            "stages_done": len(done),
-            "completed": done,
-            "elapsed_s": elapsed,
-        }
+        return checkin.run_overview(self, trigger)
 
     def _events_since_last_checkin(self) -> dict[str, int]:
-        """Per-event-name counts emitted since the previous check-in (anomalies, seams, reads,
-        optimizer iterations, …) — the spine delta, computed from the RunLog tally, no disk read."""
-        cur = self.runlog.tally if self.runlog else {}
-        prev = self._last_checkin_tally or {}
-        return {name: cur[name] - prev.get(name, 0)
-                for name in cur if cur[name] - prev.get(name, 0) > 0}
+        return checkin.events_since_last_checkin(self)
 
     def _latest_checkin_metrics(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        if self._last_scored:
-            out["last_scored"] = self._last_scored
-        if self._last_optimizer:
-            out["optimizer"] = self._last_optimizer
-        if self._last_refine:
-            out["refine"] = self._last_refine
-        if self._last_bookend_drift:
-            out["bookend_drift"] = {
-                k: self._last_bookend_drift.get(k)
-                for k in ("available", "role", "metric", "max_delta_de", "p95_delta_de",
-                          "mean_delta_de", "threshold", "unique_signals")
-                if k in self._last_bookend_drift
-            }
-        return out
+        return checkin.latest_checkin_metrics(self)
 
     def _monitor_map_check(self) -> dict[str, Any]:
         """Mechanically verify the profile's monitor↔Argyll↔panel mapping against LIVE enumeration,
@@ -1851,6 +1807,28 @@ class Calibration:
                 self.ctx.log("no fresh Display+Instrument Profile for this display — run "
                              "`--flow characterize` to learn panel+meter behaviour "
                              "(calibration falls back to a single adaptive-integration read meanwhile).")
+            # Store HEALTH (fable Phase 8, from the Phase 3 lead): the stores carry .corrupt
+            # (file present but unparseable) and .dropped (individual records lost to schema
+            # drift / hand-editing) but nothing outside tests consumed either — so "your DIP
+            # was silently dropped, this run measures single-read" was invisible. Surface both
+            # in the preflight tell; decision-relevant, never a gate (the stores are tolerant
+            # by design).
+            dip_store = self._dip_store()
+            store_health = {
+                "correction_store": {"corrupt": corr_store.corrupt,
+                                     "dropped": list(corr_store.dropped)},
+                "dip_store": {"corrupt": dip_store.corrupt,
+                              "dropped": list(dip_store.dropped)},
+            }
+            for store_name, health in store_health.items():
+                if health["corrupt"]:
+                    self.ctx.log(f"{store_name} file is CORRUPT (unparseable) — running as if "
+                                 "empty; re-characterize / rebuild the correction to repopulate, "
+                                 "or restore the file from backup.")
+                elif health["dropped"]:
+                    self.ctx.log(f"{store_name} dropped record(s) {health['dropped']} (schema "
+                                 "drift / hand-edit?) — those displays run without their stored "
+                                 "profile until refreshed.")
             # Save the user's current DesktopLUT state BEFORE we touch anything, so a
             # failed/cancelled run can be rolled back to exactly this. preflight is the
             # first stage and read-only, so this captures the pristine pre-run setup.
@@ -1868,6 +1846,7 @@ class Calibration:
                       "gamut": gamut_tell,
                       "panel_limits": panel_limits,
                       "dip": dip_status,
+                      "store_health": store_health,
                       "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
@@ -2317,6 +2296,11 @@ class Calibration:
                 reading = self.measure(patch)
                 if reading.ok:
                     live.progress("characterize")
+                # NO-DARK-WINDOW rule (fable Phase 8): characterize reads the panel directly
+                # (not via the instrumented measure loop), and its thermal-observation phase
+                # can run for hours — it emitted NO check-ins at all. Tick the §12 clock per
+                # read here (cheap early-return until due).
+                self._maybe_timed_checkin("characterize")
                 return reading
 
             result = run_characterization(
@@ -2672,6 +2656,15 @@ class Calibration:
             self._last_scored = {"label": label, "metric": metric_name,
                                  "avg": round(summary.avg_de2000, 3), "max": round(summary.max_de2000, 3),
                                  "white": round(summary.white_de2000, 3)}
+            # Persist the compact per-stage score in the run record so the TERMINAL verify seam
+            # can show the before→after trajectory (raw → after ICC → verify) in ITS digest —
+            # "avg 1.9" reads differently when raw was 8.4 vs when raw was 2.0 (fable Phase 8,
+            # digest-sufficiency). Durable across resume; same metric branch as stage_verify.
+            self.calib.setdefault("stage_scores", {})[role] = {
+                "label": label, "metric": metric_name,
+                "avg": round(summary.avg_de2000, 3), "p95": round(summary.p95_de2000, 3),
+                "max": round(summary.max_de2000, 3), "white": round(summary.white_de2000, 3)}
+            self._save()
             # Canonical event shape (metrics.metrics_scored_payload, P4) — same keys every
             # producer emits, so the dashboard ΔE panel renders live and stage-CLI runs alike.
             self.runlog.metrics_scored(
@@ -3874,8 +3867,14 @@ class Calibration:
             recommendation = "abort" if severe else "accept"
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="build-install-3dlut:floor", seam=SEAM_OPTIMIZE, stage="build-install-3dlut",
-                question=outcome.data.get("question") or "the correction machine hit a floor — accept or loosen?",
-                options=("accept", "loosen_target", "abort"), recommendation=recommendation,
+                # Options are accept/abort only (fable Phase 8): the seam previously offered
+                # "loosen_target" but NO code path honoured it — the string fell through every
+                # comparison and silently behaved as accept (a phantom option is worse than a
+                # missing one at a judgment surface). Quality targets are advisory and the
+                # verify seam is where acceptance is negotiated; an abort here is the lever
+                # for re-running with a raised cap / different target.
+                question=outcome.data.get("question") or "the correction machine hit a floor — accept or abort?",
+                options=("accept", "abort"), recommendation=recommendation,
                 # Surface the report-metric numbers (CIEDE2000 for SDR / dE_ITP for HDR) under the
                 # keys the LLM reads, tagged by `metric`; the cube CONVERGED in `optimize_metric`
                 # (dE_ITP), whose values stay available under *_itp. (_severe_optimizer_floor reads the
@@ -3886,6 +3885,10 @@ class Calibration:
                         "best_mean_de": outcome.digest.get("best_mean_de_report"),
                         "neutral_mean_de": outcome.digest.get("neutral_mean_de_report"),
                         "neutral_max_de": outcome.digest.get("neutral_max_de_report"),
+                        # Worst floor points WITH zone context (kind/boundary/near_black/
+                        # neutral) so in-gamut core damage vs a reachability corner is
+                        # decidable from the digest alone (fable Phase 8).
+                        "floor_offenders": outcome.digest.get("floor_offenders"),
                         **{k: outcome.digest.get(k) for k in
                            ("above_threshold", "physical_floor", "budget_limited", "converged",
                             "probe_total", "neutral_count")},
@@ -4012,7 +4015,11 @@ class Calibration:
             # severe → recommend revert (auto/sim reverts a catastrophic result). gate_failed flag
             # → even a NON-severe quality-gate miss escalates under SupervisedAdjudicator, so an
             # unattended run never silently applies a sub-quality calibration at this terminal gate.
-            digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within)}))
+            # before_scores: the persisted raw/post-mhc intermediate scores, so apply-vs-revert is
+            # judged on the TRAJECTORY (did the calibration improve the panel?), not one absolute
+            # number (fable Phase 8, digest-sufficiency).
+            digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within),
+                    "before_scores": self.calib.get("stage_scores") or None}))
         return outcome
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
@@ -4256,7 +4263,20 @@ class Calibration:
         try:
             from .engine.model import TargetSpace, signal_saturation_caps
             return signal_saturation_caps(TargetSpace(self._engine_target()), native)
-        except Exception:  # noqa: BLE001 — generation must never crash on an optional refinement
+        except Exception as exc:  # noqa: BLE001 — generation must never crash on an optional refinement
+            # …but a SILENT fallback is invisible in every digest (fable Phase 8, from the 7a
+            # lead): an HDR verify ramp losing its reachable-saturation cap means saturated
+            # patches land at unreachable target primaries and read as inflated frontier dE.
+            # Tell the spine once so the LLM/dashboard can attribute the frontier numbers
+            # (per-patch gamut_clamped flags still label them in scoring).
+            if not getattr(self, "_caps_unavailable_noted", False):
+                self._caps_unavailable_noted = True
+                self.runlog.note(
+                    self.runlog.phase or "run",
+                    "caps_unavailable: reachable-saturation caps could not be computed "
+                    f"({type(exc).__name__}: {exc}) — saturated ramp/verify patches are UNCAPPED "
+                    "this run; expect inflated dE at unreachable target primaries (reachability, "
+                    "not calibration error)", level="WARN")
             return None
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:
@@ -4863,6 +4883,16 @@ def run_calibration(
     return calib.run(flow)
 
 
+def parse_decide_flag(spec: str) -> tuple[str, Decision]:
+    """Parse one ``--decide`` value: ``KEY=CHOICE`` or ``KEY=CHOICE=REASON``. The optional
+    free-text REASON lands in the decision's ``note`` — the audit trail the run record,
+    the seam event, and the report's panel analysis all carry (fable Phase 8: the LLM
+    should record *why* it decided, not just what). No reason ⇒ the ``"cli"`` marker."""
+    key, _, rest = spec.partition("=")
+    choice, _, reason = rest.partition("=")
+    return key.strip(), Decision(choice.strip(), note=(reason.strip() or "cli"))
+
+
 def _auto_on_live_measuring_run(args: Any) -> bool:
     """``--auto`` is a pure rubber-stamp (returns the recommendation verbatim, no LLM) and is sim/CI
     ONLY — never a hardware run (DESIGN LAW). ``main()`` always connects to the live pipe and builds a
@@ -5001,8 +5031,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              help="OPT-OUT fallback: re-spawn + re-calibrate a fresh spotread for EVERY "
                                   "read (the old per-patch path). ~4x slower on bright patches; use only "
                                   "if the persistent meter misbehaves on a given box.")
-    parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE",
-                        help="record a seam decision (repeatable) then run/resume")
+    parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE[=REASON]",
+                        help="record a seam decision (repeatable) then run/resume. The choice is "
+                             "validated against the seam's declared options (an off-vocabulary "
+                             "choice pauses the seam instead of silently misrouting). An optional "
+                             "free-text =REASON is kept in the audit trail (run record + seam "
+                             "event + report), e.g. --decide 'verify:accept=revert=white cast "
+                             "visible on the desktop'.")
     parser.add_argument("--adaptive-planning", action="store_true", dest="adaptive_planning",
                         help="OPT-IN, EXPERIMENTAL (value unproven — a synthetic A/B found denser "
                              "sampling does not beat the optimizer's fold-back; see patch_evidence.py): "
@@ -5013,21 +5048,36 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="resume the adaptive-planning seam with a structured decision JSON file "
                              "(keys: shadow_treatment, volumetric_density, patch_size_overrides, "
                              "reason, confidence). Validated + clamped to bounds before it is applied.")
-    parser.add_argument("--auto", action="store_true",
-                        help="auto-adjudicate EVERY seam by its recommendation (no pauses, no LLM) — "
-                             "for sim/CI/reproducible runs, NOT an unattended hardware run")
-    parser.add_argument("--supervised", action="store_true",
-                        help="autonomous, but PAUSE for a live judge at safety-critical seams "
-                             "(foundation collapse / optimizer floor / failed verify) — the mode for "
-                             "an unattended HARDWARE run; a clean run never pauses")
+    # The adjudicator: one explicit, mutually-exclusive choice. --attended (== the default)
+    # exists so the REAL-run mode has a flag of its own (fable Phase 8: the mode you want
+    # for a hardware run was previously selectable only by NOT passing the other two —
+    # an invisible default is a trap at the one switch that decides who judges the run).
+    adj_group = parser.add_mutually_exclusive_group()
+    adj_group.add_argument("--attended", action="store_true",
+                           help="the DEFAULT (explicit form): every seam without a recorded "
+                                "decision PAUSES for the LLM/operator (exit 10 + the request as "
+                                "JSON; resume with --decide KEY=CHOICE). The real hardware-run "
+                                "mode — use this flag to say so explicitly.")
+    adj_group.add_argument("--auto", action="store_true",
+                           help="auto-adjudicate EVERY seam by its recommendation (no pauses, no LLM) — "
+                                "for sim/CI/reproducible runs, NOT an unattended hardware run "
+                                "(refused on live measuring flows)")
+    adj_group.add_argument("--supervised", action="store_true",
+                           help="autonomous, but PAUSE for a live judge at safety-critical seams "
+                                "(foundation collapse / optimizer floor / failed verify) — the mode for "
+                                "an unattended HARDWARE run; a clean run never pauses. Benign defaults "
+                                "are taken as VISIBLE, vetoable judgment packets on the digest "
+                                "(seam status=auto_accepted, full request + veto lever), never silently.")
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
                              "checkpoint EMITS a rich evidence packet (run overview + events since the "
                              "last check-in) for the LLM to consume from the running spine, so a long "
                              "run never goes dark. Default 600 (10 min). A check-in is emit-only — it "
-                             "NEVER gates or pauses the spine and carries no recommendation (all modes); "
-                             "0 disables.")
+                             "NEVER gates or pauses the spine and carries no recommendation (all modes). "
+                             "0 disables — on --auto (sim/CI) ONLY: an LLM-adjudicated run "
+                             "(--attended/--supervised) enforces the no-dark-window rule, clamping a "
+                             "disabled or >1200 s interval to 1200 s (20 min).")
     parser.add_argument("--neutral-min-reads", type=int, default=None, dest="neutral_min_reads",
                         metavar="N",
                         help="per-patch read FLOOR on near-neutral patches (grey ramp + tube): average "
@@ -5169,8 +5219,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                  for k, v in recorded.items()}
     overrides: dict[str, Decision] = {}
     for spec in args.decide:
-        key, _, choice = spec.partition("=")
-        overrides[key.strip()] = Decision(choice.strip(), note="cli")
+        key, decision = parse_decide_flag(spec)
+        overrides[key] = decision
     # The adaptive-planning seam answers with a structured decision file, not a one-of-N choice.
     if args.plan_decision_file is not None:
         try:
@@ -5187,8 +5237,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     if _auto_on_live_measuring_run(args):
         print(json.dumps({"error": (
             "--auto (pure rubber-stamp, no LLM) must not drive a live measuring run — it would optimize "
-            "for hours on an unadjudicated foundation. It is sim/CI only. Run live without --auto (default "
-            "MappingAdjudicator routes every seam to the LLM) or with --supervised, and use the in-process "
+            "for hours on an unadjudicated foundation. It is sim/CI only. Run live with --attended (the "
+            "default: every seam pauses for the LLM) or with --supervised, and use the in-process "
             "simulator for sim/CI.")}))
         return 2
     if args.auto:

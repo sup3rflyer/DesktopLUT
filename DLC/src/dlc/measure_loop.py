@@ -673,6 +673,22 @@ class _Loop:
                 and time.monotonic() - self._last_checkin_monotonic >= self._checkin_interval_s:
             self._emit_measure_checkin(index, total, frac)
 
+    def _maybe_checkin_backstop(self) -> None:
+        """The wall-clock arm ALONE, callable from ANY read path — warm-up, preheat/rewarm
+        soak blocks, re-measures, incremental sessions — not just the main pass (fable
+        Phase 8, the owner's NO-DARK-WINDOW rule: an adjudicated run must never go
+        ``checkin_interval_s`` without an evidence packet while the meter is working).
+        ``_maybe_checkin`` (main pass) keeps the progress-quartile arm on top of this.
+        Progress is reported as accepted-so-far over the planned set — approximate during
+        warm-up/soak (0 of N), exact once the main pass runs."""
+        if self.runlog is None or self._checkin_interval_s <= 0:
+            return
+        if time.monotonic() - self._last_checkin_monotonic < self._checkin_interval_s:
+            return
+        total = max(1, len(self.patches))
+        done = len(self.accepted)
+        self._emit_measure_checkin(done, total, done / total)
+
     def _emit_measure_checkin(self, index: int, total: int, frac: float) -> None:
         now = time.monotonic()
         elapsed_since = round(now - self._last_checkin_monotonic, 1)
@@ -754,6 +770,9 @@ class _Loop:
         self._mirror_patch_read(record)          # live firehose + per-read liveness on the spine
         if phase != "soak" and read_index == 0 and patch.role == "measurement":
             self._emit_progress()                # one coarse tick per new patch (counters / ETA)
+        # NO-DARK-WINDOW backstop on the loop's single read funnel: warm-up, re-measures,
+        # and incremental sessions tick the §12 clock too, not just the main pass.
+        self._maybe_checkin_backstop()
         return reading
 
     def _update_white(self, xyz: tuple[float, float, float]) -> None:
@@ -1206,6 +1225,11 @@ class _Loop:
             self.runlog.progress(self._live_phase, **{k: rec.get(k) for k in
                 ("block", "k", "net", "gross", "state", "ref_nits", "active_channel",
                  "op_streak", "protection_limited")})
+        # The soak's ThermalController reads the meter directly (bypassing _read), and its
+        # per-block mirror above is STREAM tier — dropped from the LLM digest. Without this
+        # backstop a long preheat is the one spell that can go digest-dark past the §12
+        # floor (NO-DARK-WINDOW rule, fable Phase 8).
+        self._maybe_checkin_backstop()
 
     def preheat(self) -> Optional[dict[str, Any]]:
         """Run the closed-loop thermal controller to bring the panel to its operating equilibrium
@@ -1885,6 +1909,26 @@ def run_measure_loop(
     # The appended remeasure cap is advisory: crossing it triggers adjudication, but the loop
     # keeps remeasuring the finite queue so the downstream engines get the best data available.
     unresolved_all = sorted(set(unresolved) | set(unstable_labels))
+    # Per-patch noise context for the escalation seam (fable Phase 8, digest-sufficiency):
+    # "would not stabilise" is judgeable only with the numbers next to it — the observed
+    # standard error vs the loop's tolerance, the DIP's expected per-read σ at that
+    # luminance (is this patch noisier than this panel+meter normally IS here, or is the
+    # DIP itself predicting a noisy band?), and how many reads were burned trying.
+    unresolved_detail: list[dict[str, Any]] = []
+    for r in accepted:
+        if not r.unstable or len(unresolved_detail) >= 8:
+            continue
+        nits = float(r.xyz[1]) if r.xyz else None
+        unresolved_detail.append({
+            "label": r.patch.label,
+            "nits": (round(nits, 3) if nits is not None else None),
+            "observed_se_de": (round(r.se_de, 4) if r.se_de is not None else None),
+            "tolerance_de": cfg.read_tolerance_de,
+            "dip_expected_sigma_de": (round(loop.dip.expected_sigma_de(nits), 4)
+                                      if loop.dip and nits is not None else None),
+            "reads_taken": r.reads_taken,
+            "note": r.note,
+        })
     drift_summary = loop._recent_drift_summary()
 
     needs_adjudication = (
@@ -1992,6 +2036,7 @@ def run_measure_loop(
         "neutral_interval_final": loop.neutral_interval_current,
         "neutral_interval_adjustments": loop.neutral_interval_adjustments,
         "unresolved": unresolved_all,
+        "unresolved_detail": unresolved_detail,
         "white_xyz": [round(c, 4) for c in loop.white_xyz] if loop.white_xyz else None,
         "white_nits": round(loop.white_xyz[1], 3) if loop.white_xyz else None,
         "preheat": preheat_digest,

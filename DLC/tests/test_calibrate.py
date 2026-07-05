@@ -1304,6 +1304,170 @@ def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
     assert resumed.calib["decisions"]["verify:accept"]["choice"] == "revert"
 
 
+# ---------------------------------------------------------------------------
+# Decision durability (fable Phase 8): every decision — --decide override, recorded
+# record, adjudicator-returned — is validated against the seam's declared option
+# vocabulary. An off-vocabulary choice previously fell through the callers' string
+# comparisons and silently behaved as the unmatched branch (verify:accept=aply APPLIED).
+# ---------------------------------------------------------------------------
+
+def test_invalid_decide_override_is_rejected_and_pauses_the_seam(tmp_path: Path):
+    # A typo'd --decide (verify:accept=aply) must NOT silently apply: the override is
+    # rejected loudly and the un-decided seam pauses for a real judge.
+    calib = _make(tmp_path, "badov", adjudicator=MappingAdjudicator({}),
+                  decision_overrides={"verify:accept": Decision("aply", note="cli")})
+    with pytest.raises(AdjudicationRequired):
+        calib.adjudicate(_verify_request())
+    events = [e for e in read_events(calib.ctx.events_path) if e.event == "seam"]
+    invalid = [e for e in events if e.data.get("status") == "invalid_decision"]
+    assert invalid and invalid[0].data["choice"] == "aply"
+    assert invalid[0].data["valid_options"] == ["apply", "revert"]
+    assert invalid[0].data["source"] == "--decide override"
+    # nothing was recorded for the seam — the record still awaits a valid decision
+    assert "verify:accept" not in calib.calib["decisions"]
+
+
+def test_invalid_recorded_decision_falls_through_to_the_adjudicator(tmp_path: Path):
+    # A hand-edited/legacy run record with an off-vocabulary choice must not replay as a
+    # silent misroute — the seam consults the adjudicator again (a live run pauses).
+    calib = _make(tmp_path, "badrec")
+    calib.calib["decisions"]["verify:accept"] = {"choice": "abort", "note": "stale"}
+    d = calib.adjudicate(_verify_request())      # AutoAdjudicator re-decides
+    assert d.choice == "apply"
+    assert calib.calib["decisions"]["verify:accept"]["choice"] == "apply"
+
+
+def test_invalid_seeded_adjudicator_choice_pauses_instead_of_misrouting(tmp_path: Path):
+    # A seed map carrying an off-vocabulary choice (e.g. verify:accept=abort — abort is NOT
+    # in the verify vocabulary and previously meant silent APPLY) pauses the run instead.
+    calib = _make(tmp_path, "badseed",
+                  adjudicator=MappingAdjudicator({"verify:accept": Decision("abort")}))
+    with pytest.raises(AdjudicationRequired):
+        calib.adjudicate(_verify_request())
+
+
+def test_valid_decide_override_still_wins_after_validation(tmp_path: Path):
+    # The validation must not break the documented override precedence.
+    calib = _make(tmp_path, "goodov",
+                  decision_overrides={"verify:accept": Decision("revert", note="cli")})
+    assert calib.adjudicate(_verify_request()).choice == "revert"
+
+
+def test_parse_decide_flag_supports_an_optional_reason():
+    from dlc.calibrate import parse_decide_flag
+    key, d = parse_decide_flag("verify:accept=revert")
+    assert (key, d.choice, d.note) == ("verify:accept", "revert", "cli")
+    key, d = parse_decide_flag("verify:accept=revert=white cast visible = obvious")
+    assert (key, d.choice) == ("verify:accept", "revert")
+    assert d.note == "white cast visible = obvious"       # reason may itself contain '='
+    key, d = parse_decide_flag(" measure:raw:escalation = accept = panel limit ")
+    assert (key, d.choice, d.note) == ("measure:raw:escalation", "accept", "panel limit")
+
+
+def test_every_seam_request_on_clean_runs_is_envelope_coherent(tmp_path: Path):
+    # Envelope pin (fable Phase 8): every AdjudicationRequest raised on clean sim runs
+    # carries a decidable form — the recommendation is IN the options (otherwise the
+    # auto/supervised default would itself be an invalid decision), the key is stage-
+    # scoped, the question is non-empty, and the digest is JSON-serializable (it is
+    # printed to the paused LLM verbatim).
+    import json as _json
+
+    class Recording:
+        def __init__(self):
+            self.requests = []
+
+        def adjudicate(self, request):
+            self.requests.append(request)
+            return Decision(request.recommendation, note="recorded",
+                            payload=request.recommended_payload)
+
+    for mode, flow in (("SDR", "full"), ("HDR", "mhc-only"), ("SDR", "grayscale-wb")):
+        rec = Recording()
+        name = f"env_{mode}_{flow}"
+        calib = _make(tmp_path, name, mode=mode, adjudicator=rec)
+        if flow == "grayscale-wb":
+            calib.controller.set_base_lut(0, mode, "base.cube", 0.0)   # satisfy require-stack
+        calib.run(flow)
+        assert rec.requests, f"no seams reached on {mode}/{flow}"
+        for req in rec.requests:
+            assert req.recommendation in req.options, req.key
+            assert req.options and req.question.strip(), req.key
+            assert req.key.startswith(req.stage), (req.key, req.stage)
+            _json.dumps(req.digest, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Digest sufficiency (fable Phase 8): the seams/tells must be decidable from the
+# digest alone — before/after trajectory at the verify gate, store health at
+# preflight, a loud tell when the gamut caps silently degrade.
+# ---------------------------------------------------------------------------
+
+def test_verify_seam_digest_carries_the_before_scores_trajectory(tmp_path: Path):
+    # apply-vs-revert is judged on the TRAJECTORY: the verify request must carry the
+    # persisted raw/post-mhc intermediate scores next to the verify numbers.
+    seen: dict[str, "AdjudicationRequest"] = {}
+
+    class Recording(AutoAdjudicator):
+        def adjudicate(self, request):
+            seen[request.key] = request
+            return super().adjudicate(request)
+
+    calib = _make(tmp_path, "before_after", adjudicator=Recording())
+    assert calib.run("full").status == "completed"
+    req = seen["verify:accept"]
+    before = req.digest["before_scores"]
+    assert set(before) >= {"raw", "post-mhc"}
+    for role in ("raw", "post-mhc"):
+        assert before[role]["metric"] == req.digest["metric"]
+        assert {"avg", "p95", "max", "white", "label"} <= set(before[role])
+    # and the persisted copy survives in the run record (resume-durable)
+    assert calib.calib["stage_scores"]["raw"] == before["raw"]
+
+
+def test_preflight_surfaces_store_health(tmp_path: Path):
+    from dlc.calibrate import correction_store_path, dip_store_path
+
+    calib = _make(tmp_path, "storehealth")
+    # A corrupt (unparseable) correction store + a DIP store with one dropped record.
+    correction_store_path(calib.profile, calib.ctx.root).write_text("{not json", encoding="utf-8")
+    dip_store_path(calib.profile, calib.ctx.root).write_text(
+        json.dumps({"displays": {"synthetic": "not-a-record"}}), encoding="utf-8")
+    calib.stage_preflight()
+    health = calib.calib["stages"]["preflight"]["digest"]["store_health"]
+    assert health["correction_store"]["corrupt"] is True
+    assert health["dip_store"]["corrupt"] is False
+    assert health["dip_store"]["dropped"] == ["synthetic"]
+
+
+def test_healthy_stores_read_clean_in_the_preflight_tell(tmp_path: Path):
+    calib = _make(tmp_path, "storeok")
+    calib.stage_preflight()
+    health = calib.calib["stages"]["preflight"]["digest"]["store_health"]
+    assert health == {"correction_store": {"corrupt": False, "dropped": []},
+                      "dip_store": {"corrupt": False, "dropped": []}}
+
+
+def test_hue_sat_caps_failure_emits_a_caps_unavailable_tell_once(tmp_path: Path, monkeypatch):
+    # The 7a lead: an HDR ramp silently losing its reachable-saturation cap was invisible
+    # in every digest. A cap-computation failure must WARN the spine (once), then still
+    # fall back to the uncapped ramp (never blocks generation).
+    calib = _make(tmp_path, "capsfail", mode="HDR")
+    monkeypatch.setattr(calib, "_reachable_primaries",
+                        lambda: {"R": (0.68, 0.32), "G": (0.265, 0.69), "B": (0.15, 0.06)})
+    monkeypatch.setattr(calib, "_target_colorspace", lambda: "rec2020")
+    import dlc.engine.model as _model
+
+    def _boom(*a, **k):
+        raise RuntimeError("engine unavailable")
+
+    monkeypatch.setattr(_model, "signal_saturation_caps", _boom)
+    assert calib._hue_sat_caps() is None
+    assert calib._hue_sat_caps() is None                       # second call: no re-spam
+    warns = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "note" and "caps_unavailable" in str(e.data.get("message"))]
+    assert len(warns) == 1 and warns[0].level == "WARN"
+
+
 def test_patch_window_guard_quiet_when_target_is_primary(tmp_path: Path):
     # The mock topology makes monitor 0 the primary; calibrating monitor 0 ⇒ no warning.
     calib = _make(tmp_path, "pw_ok")
@@ -2148,6 +2312,45 @@ def test_supervised_full_flow_completes_without_pausing(tmp_path: Path):
     assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
 
 
+def test_supervised_benign_auto_accept_emits_a_vetoable_judgment_packet(tmp_path: Path):
+    # Task #1 (resolved fable Phase 8, owner-approved): a benign default taken by CODE is
+    # still a judgment the LLM must see. Every supervised auto-accept must land on the
+    # digest as a FULL judgment packet — the question/options/recommendation/digest a
+    # paused run would have printed, plus the veto lever — never a bare "decided" line.
+    calib = _make(tmp_path, "suppacket", adjudicator=SupervisedAdjudicator())
+    assert calib.run("full").status == "completed"
+    seams = [e for e in read_events(calib.ctx.events_path) if e.event == "seam"]
+    auto = {e.data.get("key"): e.data for e in seams if e.data.get("status") == "auto_accepted"}
+    # The terminal verify gate — THE judgment seam — was auto-applied, so its packet exists…
+    v = auto.get("verify:accept")
+    assert v is not None
+    # …and carries everything a paused run would have shown, plus how to override.
+    assert v["choice"] == "apply" and v["recommendation"] == "apply"
+    assert v["options"] == ["apply", "revert"]
+    assert v["question"] and "Apply this calibration" in v["question"]
+    assert isinstance(v["digest"], dict) and "avg_de2000" in v["digest"]
+    assert "--decide verify:accept=" in v["veto"] and "--cancel" in v["veto"]
+    # every auto-taken decision in the record is marked and has a packet on the spine
+    for key, rec in calib.calib["decisions"].items():
+        if rec.get("auto_accepted"):
+            assert key in auto, f"auto-accepted {key} has no judgment packet"
+    assert calib.calib["decisions"]["verify:accept"]["auto_accepted"] is True
+    # the packet is evidence-with-default, not a pause: digest-tier, no exit-10
+    assert all(e.effective_tier == "digest" for e in seams)
+
+
+def test_judged_decisions_do_not_carry_the_auto_accepted_packet(tmp_path: Path):
+    # A decision a judge actually made (seeded Mapping = the LLM's recorded answer) stays a
+    # plain "decided" seam event — no auto_accepted mark, no veto packet.
+    calib = _make(tmp_path, "judged",
+                  adjudicator=MappingAdjudicator({"verify:accept": Decision("apply", note="LLM: clean")}))
+    calib.adjudicate(_verify_request())
+    seams = [e for e in read_events(calib.ctx.events_path) if e.event == "seam"]
+    assert [e.data.get("status") for e in seams] == ["decided"]
+    assert "veto" not in seams[0].data
+    assert calib.calib["decisions"]["verify:accept"].get("auto_accepted") is None
+
+
 # ---------------------------------------------------------------------------
 # Keep-awake: the spine must own the system/display power request itself (no
 # dependence on Resolve holding the lock or the user's power plan) — asserted
@@ -2293,6 +2496,43 @@ def test_checkin_digest_carries_overview_delta_and_metrics(tmp_path: Path):
     assert d["metrics"]["last_scored"]["avg"] == 1.2
 
 
+def test_checkin_evidence_is_worst_first_with_pretruncation_counts(tmp_path: Path):
+    # The inline warning list truncates at 25 — the packet must (a) keep the MOST severe
+    # events (a stall must never be buried under routine read anomalies by arrival order)
+    # and (b) carry per-type totals computed BEFORE truncation, so the LLM sees the scale
+    # ("25 shown of 400" is a different judgment than "25 of 26").
+    calib = _make(tmp_path, "ckworst", checkin_interval_s=1.0)
+    calib._last_checkin_pos = calib._events_size()
+    for i in range(30):
+        calib.runlog.emit("WARN", "measure:raw", "read_plausibility_anomaly",
+                          label=f"p{i}", reason="implausible")
+    calib.runlog.stall("measure:raw", message="no progress for 900s")
+    calib.runlog.anomaly("measure:raw", kind="score_anomaly", message="catastrophic dE")
+    ev = calib._checkin_evidence()
+    # Totals reflect everything in the window, not just the 25 kept inline.
+    assert ev["warning_counts"] == {"read_plausibility_anomaly": 30, "stall": 1, "anomaly": 1}
+    # Worst-first: the stall and the anomaly lead even though they arrived LAST.
+    assert ev["warnings"][0]["event"] == "stall"
+    assert ev["warnings"][1]["event"] == "anomaly"
+    # Cap intact: 25 inline + the truncation marker with the dropped count.
+    assert len(ev["warnings"]) == 26
+    assert ev["warnings"][-1]["truncated"] == 32 - 25
+
+
+def test_checkin_evidence_preserves_arrival_order_within_a_severity_class(tmp_path: Path):
+    # The severity sort is stable: same-class warnings keep chronology, so the "re-read
+    # twice but the latest read is normal → self-corrected" judgment still reads in order.
+    calib = _make(tmp_path, "ckorder", checkin_interval_s=1.0)
+    calib._last_checkin_pos = calib._events_size()
+    calib.runlog.anomaly("measure:raw", kind="first", message="a")
+    calib.runlog.emit("WARN", "measure:raw", "read_plausibility_anomaly", label="pX")
+    calib.runlog.anomaly("measure:raw", kind="second", message="b")
+    ev = calib._checkin_evidence()
+    assert [w["event"] for w in ev["warnings"]] == [
+        "anomaly", "anomaly", "read_plausibility_anomaly"]
+    assert [w.get("kind") for w in ev["warnings"][:2]] == ["first", "second"]
+
+
 def test_timed_checkin_anchors_then_emits_when_due(tmp_path: Path):
     calib = _make(tmp_path, "ckfire", checkin_interval_s=1.0)
     # First call only anchors — no check-in event yet.
@@ -2326,12 +2566,73 @@ def test_timed_checkin_never_gates_and_carries_no_recommendation(tmp_path: Path)
     assert "evidence" in data and "overview" in data
 
 
-def test_timed_checkin_disabled_at_interval_zero(tmp_path: Path):
-    calib = _make(tmp_path, "ckoff", adjudicator=MappingAdjudicator({}), checkin_interval_s=0.0)
+def test_timed_checkin_disabled_at_interval_zero_is_auto_only(tmp_path: Path):
+    # Interval 0 disables check-ins ONLY under --auto (sim/CI, no LLM watching). An
+    # adjudicated run is governed by the no-dark-window rule (companion tests below).
+    calib = _make(tmp_path, "ckoff", checkin_interval_s=0.0)   # AutoAdjudicator default
     calib._maybe_timed_checkin("preflight")
     _due(calib)
     calib._maybe_timed_checkin("build-install-3dlut")   # disabled → never emits
     assert calib.runlog.tally.get("check_in", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# NO-DARK-WINDOW rule (owner, 2026-07-05): on an LLM-adjudicated run there is never a
+# window longer than the check-in interval (hard ceiling 20 min) without a check-in
+# while the spine executes — a 5-hour measure phase must not be looked at only at its
+# start and end. The ceiling is enforced at the ctor; wall-clock backstops tick inside
+# every long phase (measure read funnel + soak blocks, probe batches, characterize).
+# ---------------------------------------------------------------------------
+
+def test_no_dark_window_interval_is_clamped_on_adjudicated_runs(tmp_path: Path):
+    from dlc.checkin import NO_DARK_WINDOW_CEILING_S
+
+    # disabled → clamped to the ceiling (an adjudicated run may not go dark)
+    off = _make(tmp_path, "ndw_off", adjudicator=MappingAdjudicator({}), checkin_interval_s=0.0)
+    assert off._checkin_interval_s == NO_DARK_WINDOW_CEILING_S
+    # longer than the ceiling → clamped
+    long = _make(tmp_path, "ndw_long", adjudicator=SupervisedAdjudicator(), checkin_interval_s=3600.0)
+    assert long._checkin_interval_s == NO_DARK_WINDOW_CEILING_S
+    # a compliant interval is respected verbatim
+    ok = _make(tmp_path, "ndw_ok", adjudicator=MappingAdjudicator({}), checkin_interval_s=300.0)
+    assert ok._checkin_interval_s == 300.0
+    # --auto (sim/CI) keeps the free choice, including fully disabled
+    auto = _make(tmp_path, "ndw_auto", checkin_interval_s=0.0)
+    assert auto._checkin_interval_s == 0.0
+    auto_long = _make(tmp_path, "ndw_auto_long", checkin_interval_s=7200.0)
+    assert auto_long._checkin_interval_s == 7200.0
+
+
+def test_probe_batch_ticks_the_checkin_clock_per_read(tmp_path: Path):
+    # The optimizer's probe pass is the run's longest phase; between-iteration check-ins
+    # alone left a single pass digest-dark for its whole duration. The per-read tick must
+    # emit once the floor elapses MID-batch.
+    import numpy as np
+
+    calib = _make(tmp_path, "probeck", checkin_interval_s=1.0)
+    calib.calib["flow"] = "full"
+    calib.target_name = "srgb_g22"
+    calib.calib["target"] = "srgb_g22"
+    calib._maybe_timed_checkin("anchor")            # anchor the clock
+    _due(calib)                                     # floor elapsed mid-batch
+    probe = calib._probe_fn()
+    probe(np.array([[0.5, 0.5, 0.5], [0.25, 0.25, 0.25]]))
+    timed = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "check_in" and "overview" in e.data]
+    assert timed and timed[-1].data["overview"]["stage"] == "build-install-3dlut"
+
+
+def test_characterize_ticks_timed_checkins(tmp_path: Path):
+    # Characterize reads the panel outside the measure loop and previously emitted NO
+    # check-ins at all — its thermal phase can run for hours. With a tiny floor, the
+    # per-read tick must emit timed packets during the learning run.
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "charck", controller=ctrl, characterize_config=_CHAR,
+                  checkin_interval_s=1e-9)
+    assert calib.run("characterize").status == "completed"
+    timed = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "check_in" and "overview" in e.data]
+    assert timed and any(e.data["overview"]["stage"] == "characterize" for e in timed)
 
 
 def test_default_interval_does_not_fire_timed_checkins_in_a_fast_run(tmp_path: Path):
