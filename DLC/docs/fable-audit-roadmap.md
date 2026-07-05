@@ -60,6 +60,17 @@ fixable, and leave a written trail. Nothing is one-shotted.
   P3 provenance documented (re-derivation → HW-1/HW-7); P11 ticket scoped
   (DesktopLUT-side Advanced Color dummy); `de2000` stays the generic carrier with a
   mandatory `metric` label (rename decision recorded). HW-7 queued.
+- **Updated:** 2026-07-05, Phase 7a complete on `claude/fable-audit-phase-7a-3y6rsm`
+  (report: `docs/audits/fable/phase-7a.md`). Spine correctness audited; P12+P13 closed
+  (mode/target coherence guard at resolve-target; the `hdr` stub now explains `--mode
+  HDR`); crash-resume matrix landed (crash at every `full` stage → identical outcome);
+  `dlc_state_version` stamp; remeasure seed-map loop fixed; resume score-dedupe;
+  `_planned_stages` drift (characterize was missing) fixed + pinned per flow; backup
+  failure is a seam; watchdog no longer kills a legit pause; main() ctor-leak +
+  silent-rollback-failure fixed; check-cube zero-monotonicity-allowance VERIFIED
+  correct empirically (Phase 6 aside downgraded; `test_lut_integrity.py` is new).
+  BLE001 sweep classified (46 sites: 5 fixed, 26 surfaced, 15 accepted-with-rationale).
+  Leads to 7b/8/9/10/11; grayscale-wb revert-after-commit → Phase 9 (owner input §7).
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -214,13 +225,14 @@ Classification: **I** = intentional (keep, ensure documented), **S** = suspect
 | P9 | 3D-LUT correction cap | 0.5 | 0.25 | I | 5 — *re-verified: provenance documented at `SDR_CORRECTION_CAP` + `_cube_optimize_config` (post-MHC residual vs cube-owns-all-colour; HANDOFF item H CV plateau ~0.5; only the DEFAULT ceiling is mode-lifted); the empirical single-panel-CV side re-verifies with HW-1's before/after scores* |
 | P10 | Grayscale bridge domain (`mhc_grayscale`) | signal-domain t² resample | pass-through | I | 4 — *audit-verified against the replicated C++ convention (test_mhc_grayscale)* |
 | P11 | Dummy ICC | Argyll sRGB.icm | Rec2020.icm **placeholder** (`profiles.py:46`) | I (ticketed) | 6 — *Phase 6 scoped: the proper fix is a DesktopLUT-side Advanced Color dummy (MHC2-capable ICC + `ColorProfileSetDisplayDefaultAssociation` install, name exposed over IPC) — cross-repo ticket text in phase-6.md; the DLC placeholder stays, correctly labelled. Phase 12's endgame item points at that ticket.* |
-| P12 | Refine-stage dispatch | `_flow_*` switches on `_spec().is_hdr`; `_planned_stages` switches on `self.mode` — can diverge | same | S | 7 |
-| P13 | `hdr` named flow | n/a | stub that aborts (`calibrate.py:4179`) while `--mode HDR` on full/mhc-only works | S (confusing surface) | 7 |
+| P12 | Refine-stage dispatch | `_flow_*` switches on `_spec().is_hdr`; `_planned_stages` switches on `self.mode` — can diverge | same | I (closed) | 7 — *Phase 7a: `_reject_mode_target_mismatch` aborts loudly at resolve-target (and characterize) when a profile slot's target transfer disagrees with the run mode — past that gate the two predicates are provably interchangeable. Test-pinned both flows; the stepper map is additionally pinned equal to the announced phases per flow.* |
+| P13 | `hdr` named flow | n/a | signpost stub: explains `--mode HDR --flow full/…` | I (closed) | 7 — *Phase 7a: the stub's stale "post-v1/SDR-first" text replaced with directions to the real surface; deliberately non-routing (run mode is fixed at creation — auto-switching would be run-spec drift). FLOWS registry + module docstring updated.* |
 | P14 | RGBW peak codes | 242 (8-bit) magic | 712 (10-bit) magic (`dogegen.py:12`) | I | 3 — *verified: per-mode luminance choices (94.9% signal vs PQ ≈ 598 nit), NOT one value rescaled by depth; documented at the code table. RGBW measurement path itself has no production caller → Phase 11 disposition* |
 | P15 | Patch spacing | perceptual (power) option | uniform PQ | I | 2 — *Phase 2 verified: rationale documented at `calibrate.py:5403-5412` (PQ is already Barten-uniform; layering γ2.2 shoves samples into highlights)* |
 | P16 | Peak-Chroma cap on neutral axis | n/a (peak = target white) | nominal-additive cap that ignores measured non-additivity (`mhc_cube.py:198`) | I | 4 — *Phase 4: overshoot quantified (+1.76 % on the recorded panel); cap stays the documented seed (the closed-loop refine measures the real panel at it); honest diagnostics (`measured_peak_nonadditivity`, `cap_nits_nonadditive_est`) landed in `peak_chroma`; HW-5 compares the estimate to the refine's landed peak* |
 | P17 | Thermal/regime handling | falls out of measured regime classifier, not a mode branch | same | I | 3 — *Phase 3 verified: zero mode branches in thermal.py/characterize.py/preheat; regime discovered, never assumed* |
 | P18 | Superseded `refine_sdr_grayscale` + deprecated `correctionGrayscale` slot | SDR-only legacy retained | n/a | I (closed) | 4 — *quarantined as `refine_sdr_grayscale_legacy` (zero production callers; tests keep the deviation-domain math); the remaining production `correctionGrayscale` writes are identity-CLEARING only (deliberate); final delete-vs-keep = Phase 11* |
+| P19 | Fresh-run bit-depth fallback | CLI: 8-bit (composited dogegen default) | CLI: 10-bit; ctor fallback (both modes): panel depth | I | 7 — *Phase 7a: intentional — depth is a property of the presenter TRANSPORT, not the panel; the CLI decides it where the presenter is built and always passes the resolved value in; in-process callers present at panel depth. Persisted run spec + surfaced conflicts make it drift-proof. Documented at the ctor.* |
 
 ---
 
@@ -662,6 +674,11 @@ core so the auditor knows what every stage should do.
   closed-loop refine stages, `main()`'s wiring (~570 lines), the checkin/digest
   assembly (`:1631-1758`), flows registry. Extract only what tests already pin;
   no behaviour change in the same commit as a move.
+- *(Phase 7a)* `_planned_stages` and the `_flow_*` methods are now test-pinned equal
+  per flow (`test_planned_stages_match_announced_phases_per_flow`) — the decomposition
+  should derive one from the other (a declarative flow table) so the pin becomes a
+  tautology. `main()` gained no structure in 7a (the ctor-leak/rollback-print fixes
+  were minimal edits); it remains the biggest extraction candidate.
 
 **Parity:** P12, P13 (make `--mode HDR` vs `hdr`-flow surface coherent — either the
 stub routes or it explains).
@@ -723,6 +740,11 @@ actually gives an LLM what it needs to decide well.
   review should judge whether SEAM_OPTIMIZE's floor digest adopts the same zone split
   (its `neutral_{mean,max}_de_report` already covers the tube), and whether the plan
   seam's new `hdr_target_warnings` (clamped gain / ungrounded peak) reads decidable.
+- *(Phase 7a)* `_checkin_evidence` caps the inline warning list at 25 in ARRIVAL order —
+  confirm worst-first (by severity / max ΔE) wouldn't read better for the LLM. And
+  `_hue_sat_caps`' silent fallback (an HDR verify ramp silently loses its reachable
+  saturation cap on any engine hiccup) is invisible in every digest — consider a
+  `caps_unavailable` tell.
 - *(Phase 3)* Store health is invisible at the seams: `DipStore`/`CorrectionStore` carry
   `.corrupt` (file unparseable) and `.dropped` (individual records lost to schema drift /
   hand-editing) but nothing outside tests consumes either — surface them in the preflight
@@ -769,6 +791,12 @@ review; decision validation landed.
 - `_bridge_grayscale:195` SDR sqrt-distributed points vs HDR pass-through — verify
   against DesktopLUT's MHC2 convention (cross-check with `shared/dwm_hook_config.h`
   and the recent bit-faithful-preview commits on the C++ side).
+- *(Phase 7a)* **grayscale-wb revert-after-commit:** `stage_grayscale_wb_touchup` bakes
+  the touch-up (`grayscale_commit`) on the accept path BEFORE `measure:verify` + the
+  `verify:accept` gate; a later `revert` calls `grayscale_cancel` — whether cancel
+  restores a *committed* ICM is a C++ contract question (`_revert_inplace` assumes
+  "nothing was baked unless commit ran", and here commit ran). Confirm at the C++
+  touchpoint, or move the commit after the verify gate.
 - *(Phase 4)* `install_mhc.py:99` `install_ok` treats ANY dict response without `ok: false`
   as success (`applied.get("ok") is not False`) — same swallowed-error class as the
   `controller.call` lead above; audit together. And: does the C++ live grayscale editor
@@ -834,9 +862,13 @@ audit these as NEW SURFACE, don't rediscover them as drift:
   guards a real 53-minute failure class — property-test the state transitions over
   synthetic heartbeat/progress sequences (some exist; extend to pause/soak edges).
 - Schema evolution: `schema_version` is stored but never branched on; `dashboard.js`
-  handles a `run_created` event that doesn't exist in `Ev`; vestigial multi-metric
-  params (`setDeM`, `metricDecimals`) — still present after the extension. Sweep
-  the JS against the actual event vocabulary; delete vestiges.
+  handles a `run_created` event that doesn't exist in `Ev` (it IS emitted — as a raw
+  string by `runs.create_run`; reconcile the vocabulary, Phase 7a note); vestigial
+  multi-metric params (`setDeM`, `metricDecimals`) — still present after the extension.
+  Sweep the JS against the actual event vocabulary; delete vestiges.
+- *(Phase 7a)* resumed runs no longer duplicate `metrics_scored` for memoised
+  raw/post-mhc stages (F7a-5) — if the dashboard grew latest-wins dedupe for that,
+  it can likely be simplified; verify while sweeping.
 - Server hardening (already good: CSRF + Origin + host allow-list): verify the
   mutation auth against a hostile-LAN model (dashboard binds non-localhost?),
   SSE slow-client shedding under a flood, and `_tail_loop` behaviour across run
@@ -879,6 +911,10 @@ new-surface leads dispositioned.
 `preflight.py`, `tools.py`, README/CHANGELOG accuracy, repo-wide dead-code sweep.
 
 **Seeded leads:**
+- *(Phase 7a)* `lut_integrity` now has a dedicated test file (`test_lut_integrity.py`)
+  — off the gap list. `StageResult.write` is non-atomic (`write_text`); the
+  `dlc_stages/` artifacts are advisory but a truncated JSON confuses the state tool —
+  consider `atomic_write_text` in the hygiene pass.
 - **Coverage gaps (no dedicated test file):** `argyll` (680 lines, parsing-heavy —
   highest-value gap), `controller`, `metrics` (transitively covered only), `refine`,
   `colormath`, `drift`, `lut3d`, `mhc`, `profile_plan`, `probe_match`,
@@ -1059,7 +1095,8 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 - [x] Phase 4 — MHC layer (matrix, base cube, refines, bridges) *(2026-07-05, `claude/fable-audit-phase-4-ev6mkc` — see `docs/audits/fable/phase-4.md`)*
 - [x] Phase 5 — Correction machine & 3D-LUT engine *(2026-07-05, `claude/charming-hamilton-0xf1g9` — see `docs/audits/fable/phase-5.md`)*
 - [x] Phase 6 — Scoring, verify gates, reporting truth *(2026-07-05, `claude/fable-audit-phase-6-m92yrr` — see `docs/audits/fable/phase-6.md`)*
-- [ ] Phase 7 — Orchestrator spine (7a correctness · 7b structure)
+- [x] Phase 7a — Orchestrator spine: correctness *(2026-07-05, `claude/fable-audit-phase-7a-3y6rsm` — see `docs/audits/fable/phase-7a.md`)*
+- [ ] Phase 7b — Orchestrator spine: structure (decomposition RFC + safest extractions)
 - [ ] Phase 8 — LLM seams & intelligence
 - [ ] Phase 9 — IPC contract & mock fidelity
 - [ ] Phase 10 — Dashboard & observability

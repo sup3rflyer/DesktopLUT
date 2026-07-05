@@ -153,6 +153,27 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Fixed
+- **Fable audit Phase 7a — the orchestrator spine, correctness**
+  (`docs/audits/fable/phase-7a.md`): a mis-configured profile (SDR slot → PQ target or
+  vice versa) is now rejected loudly at resolve-target instead of running an incoherent
+  hybrid (P12 closed); the `hdr` flow stub explains the real surface — HDR is
+  `--mode HDR` on the normal flows (P13 closed). A `remeasure` seam decision now buys
+  exactly one re-measure (the adjudicator's seed map previously re-answered itself
+  forever on an unsettling panel); a resume no longer duplicates the intermediate
+  `metrics_scored` convergence points; the dashboard stepper map gained the missing
+  `characterize` flow and stops listing stages a run never enters, pinned equal to the
+  announced phases per flow. Crash-resume is now a test matrix: dying inside ANY stage
+  of `full` and resuming reproduces the uncrashed run's verify digest byte-for-byte.
+  `dlc_state.json` carries a schema version; a half-created run dir is adoptable
+  instead of bricked; the watchdog no longer force-kills the meter during a legitimate
+  operator pause; a failed pre-run settings backup raises a seam (proceed/abort)
+  instead of a log line; a failed terminal rollback prints `rollback_failed` with the
+  manual-restore pointer instead of exiting mute; the live CLI no longer orphans the
+  persistent spotread/dogegen stack if the orchestrator constructor fails on a corrupt
+  run record. check-cube's zero monotonicity allowance was verified empirically
+  (realistic optimizer cubes carry zero violations; new `tests/test_lut_integrity.py`
+  pins it). 46 broad-except sites classified (5 fixed, 26 already surfaced, 15
+  accepted with rationale).
 - **Fable audit Phase 5 — the correction machine & 3D-LUT engine**
   (`docs/audits/fable/phase-5.md`): the **gamut-aware (#C3) correction was internally
   inconsistent** — the error model trained its delta against the reachable-CLAMPED ideal

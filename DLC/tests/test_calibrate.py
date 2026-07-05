@@ -1160,14 +1160,47 @@ def test_3dlut_only_revert_clears_cube_when_none_existed(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# HDR is SDR-first in v1
+# 'hdr' is not a flow — HDR is a MODE (P13)
 # ---------------------------------------------------------------------------
 
-def test_hdr_flow_aborts_sdr_first(tmp_path: Path):
+def test_hdr_flow_stub_explains_the_mode_surface(tmp_path: Path):
+    # The 'hdr' registry entry is a signpost, not a flow: it aborts with directions to the
+    # real surface (`--mode HDR --flow full/...`) instead of the stale "post-v1" claim.
     calib = _make(tmp_path, "hdr")
     result = calib.run("hdr")
     assert result.status == "aborted"
-    assert "SDR-first" in result.digest["message"]
+    msg = result.digest["message"]
+    assert "--mode HDR" in msg and "not a flow" in msg
+    from dlc.calibrate import FLOWS
+    assert "--mode HDR" in FLOWS["hdr"]
+
+
+def test_mode_target_mismatch_is_rejected_loudly(tmp_path: Path):
+    # P12 guard: a profile that maps a display's SDR slot to a PQ target (or vice versa) must
+    # abort at resolve-target — the refine fork keys on spec.is_hdr while the stepper and the
+    # gamut clamp key on self.mode, so letting it through runs an incoherent hybrid.
+    from dataclasses import replace as _replace
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
+    display = _replace(profile.displays[0], sdr_target="rec2020_pq")   # SDR slot → PQ target
+    profile = _replace(profile, displays=(display,))
+    ctx = create_run("SDR", display="mismatch", run_dir=tmp_path / "mismatch")
+    calib = Calibration(ctx=ctx, profile=profile, monitor=0, mode="SDR",
+                        controller=CalibrationController.mock(), measure=_perfect_panel(),
+                        adjudicator=AutoAdjudicator(), optimize_config=_OPT,
+                        patch_sizes=_SMALL, run_date=_DATE)
+    result = calib.run("full")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "resolve-target"
+    assert "mismatched target" in result.digest["message"]
+    # The characterize flow drives the panel through the same target's transfer — same guard.
+    ctx2 = create_run("SDR", display="mismatch2", run_dir=tmp_path / "mismatch2")
+    calib2 = Calibration(ctx=ctx2, profile=profile, monitor=0, mode="SDR",
+                         controller=CalibrationController.mock(), measure=_perfect_panel(),
+                         adjudicator=AutoAdjudicator(), optimize_config=_OPT,
+                         patch_sizes=_SMALL, run_date=_DATE)
+    result2 = calib2.run("characterize")
+    assert result2.status == "aborted"
+    assert "mismatched target" in result2.digest["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -2670,3 +2703,219 @@ def test_hdr_refine_safety_ceiling_reverts_to_best_and_raises_seam(tmp_path: Pat
     assert installs[-1].endswith("refine1.cube"), installs
     seams = [r for r in adj.requests[seen_before:] if r.key == "refine-mhc-cube:safety-ceiling"]
     assert len(seams) == 1 and seams[0].options == ("accept", "abort")
+
+
+# ---------------------------------------------------------------------------
+# fable Phase 7a — orchestrator-spine correctness pins
+# (P12 mode/target coherence · stepper-vs-flow drift · crash-resume matrix ·
+#  remeasure loop bound · resume score dedupe · backup seam · state version)
+# ---------------------------------------------------------------------------
+
+class _Boom(Exception):
+    """Simulated process death (an exception no orchestrator handler catches)."""
+
+
+def _fake_unsettled_result():
+    from dlc.measure_loop import MeasureLoopResult
+    return MeasureLoopResult(
+        warm=True, warmup_reads=0, reference_xyz=None, patch_count=1, total_reads=1,
+        immediate_remeasures=0, appended_remeasures=0, drift_episodes=0, unresolved=["p0"],
+        white_xyz=None, ti3_path=None, ndjson_path=None,
+        needs_adjudication=True, question="measurement did not settle",
+        digest={"remeasure_budget_exceeded": True})
+
+
+def test_remeasure_decision_buys_exactly_one_remeasure(tmp_path: Path, monkeypatch):
+    # A seeded 'remeasure' answer must be consumed by the re-measure it buys: if the SECOND
+    # pass still escalates, the run must pause for the LLM again — not silently re-answer
+    # itself 'remeasure' from the adjudicator's seed map forever (an unbounded hardware loop).
+    calib = _make(tmp_path, "remeasure_once",
+                  adjudicator=MappingAdjudicator(
+                      {"measure:raw:escalation": Decision("remeasure", note="seeded")}))
+    calls = {"n": 0}
+
+    def fake_measure_set(patches, *, role, ti3_name, ndjson_name):
+        calls["n"] += 1
+        assert calls["n"] <= 4, "remeasure loop did not terminate"
+        return _fake_unsettled_result()
+
+    monkeypatch.setattr(calib, "_measure_set", fake_measure_set)
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=[(0, 0, 0)],
+                            ti3_name="raw.ti3", ndjson_name="raw.ndjson")
+    assert exc.value.request.key == "measure:raw:escalation"
+    assert calls["n"] == 2   # the seeded decision bought exactly one re-measure
+
+
+def _announced_phases(ctx) -> list[str]:
+    return [e.data.get("phase_name") for e in read_events(ctx.events_path)
+            if e.event == Ev.PHASE]
+
+
+def test_planned_stages_match_announced_phases_per_flow(tmp_path: Path):
+    # _planned_stages is a hand-maintained mirror of the _flow_* graph; drift here corrupts
+    # the dashboard stepper silently (7a lead — 'characterize' was already missing when this
+    # pin landed). Walk every flow under the simulator and assert the announced phase
+    # sequence IS the plan.
+    from dlc.characterize import CharacterizeConfig as _CC
+
+    def run_and_check(name, flow, *, mode="SDR", panel=None, bit_depth=None,
+                      controller=None, decision_overrides=None, characterize_config=None):
+        calib = _make(tmp_path, name, mode=mode, panel=panel, bit_depth=bit_depth,
+                      controller=controller, decision_overrides=decision_overrides,
+                      characterize_config=characterize_config,
+                      require_hardware_readiness=True)
+        result = calib.run(flow)
+        assert result.status == "completed", (flow, result.digest)
+        planned = [s["key"] for s in calib._planned_stages()]
+        assert _announced_phases(calib.ctx) == planned, flow
+        return calib
+
+    char_cfg = _CC(noise_levels=(1.0, 0.2), noise_reads=4, black_reads=2,
+                   primary_reads=2, creep_reads=3, settle_observe_reads=6,
+                   warmup_max_minutes=0.0, eotf_reads=0)
+
+    full = run_and_check("ps_full", "full")
+    run_and_check("ps_hdr_full", "full", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    run_and_check("ps_mhc", "mhc-only")
+    run_and_check("ps_char", "characterize", characterize_config=char_cfg)
+    run_and_check("ps_bc", "build-correction",
+                  decision_overrides={"probe-match:build": Decision("skip")})
+    # in-place flows need an installed stack — reuse the full run's controller
+    run_and_check("ps_3dlut", "3dlut-only", controller=full.controller)
+    run_and_check("ps_gswb", "grayscale-wb", controller=full.controller)
+
+
+def test_crash_resume_matrix_replays_to_identical_outcome(tmp_path: Path):
+    # The 7a resume matrix: crash (an unhandled exception — simulated process death) inside
+    # EVERY stage of the full flow, resume the run dir fresh, and require (a) completion,
+    # (b) every stage recorded before the crash replays from the memo (never re-measured),
+    # (c) the final verify digest is IDENTICAL to an uncrashed baseline run's.
+    baseline = _make(tmp_path, "crash_baseline")
+    assert baseline.run("full").status == "completed"
+    base_verify = baseline.calib["stages"]["verify"]["digest"]
+
+    crash_points = ["preflight", "whitepoint", "enter-neutral", "brightness",
+                    "measure:raw", "build-install-mhc", "refine-mhc-grayscale",
+                    "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify"]
+    for key in crash_points:
+        name = f"crash_{key.replace(':', '_')}"
+        calib = _make(tmp_path, name)
+        orig = calib._stage
+
+        def boom(k, fn, _target=key, _orig=orig):
+            if k == _target:
+                raise _Boom(k)          # dies mid-stage: nothing memoised for this stage
+            return _orig(k, fn)
+
+        calib._stage = boom
+        with pytest.raises(_Boom):
+            calib.run("full")
+        done_before = {k for k, v in calib.calib["stages"].items()
+                       if (v or {}).get("status") == "done"}
+
+        resumed = _make(tmp_path, name)
+        result = resumed.run("full")
+        assert result.status == "completed", key
+        replayed = {e.stage for e in read_events(resumed.ctx.events_path)
+                    if e.event == Ev.STAGE_DONE and e.data.get("replayed")}
+        assert done_before <= replayed, key
+        assert resumed.calib["stages"]["verify"]["digest"] == base_verify, key
+
+
+def test_resume_after_report_crash_replays_over_existing_artifacts(tmp_path: Path):
+    # Crash AFTER verify completed (during report): the resume memo-replays verify over its
+    # already-persisted reports/verification_iter00_* artifacts (idempotent overwrite, no
+    # re-measure) and the run finishes with the deliverable in place.
+    calib = _make(tmp_path, "report_crash")
+    calib.stage_report = lambda **kw: (_ for _ in ()).throw(_Boom("report"))
+    with pytest.raises(_Boom):
+        calib.run("full")
+    assert list((calib.ctx.root / "reports").glob("verification_iter00_*")), \
+        "verify persisted its scored artifacts before the crash"
+
+    resumed = _make(tmp_path, "report_crash")
+    result = resumed.run("full")
+    assert result.status == "completed"
+    assert result.report_path and Path(result.report_path).exists()
+
+
+def test_resume_does_not_reemit_intermediate_scores(tmp_path: Path):
+    # _score_stage runs OUTSIDE the memoised _stage; before the replayed-flag fix a resume
+    # re-scored + re-emitted metrics_scored for every done raw/post-mhc stage, duplicating
+    # the dashboard's convergence history (events.jsonl is append-only across resumes).
+    calib = _make(tmp_path, "score_once")
+    assert calib.run("full").status == "completed"
+
+    def scored(ctx):
+        return [e.stage for e in read_events(ctx.events_path)
+                if e.event == "metrics_scored" and e.stage.startswith("measure:")]
+
+    first = scored(calib.ctx)
+    assert first, "fresh run emits intermediate scores"
+    resumed = _make(tmp_path, "score_once")
+    assert resumed.run("full").status == "completed"
+    assert scored(resumed.ctx) == first   # replay added none
+
+
+def test_score_stage_failure_is_logged_not_swallowed(tmp_path: Path, monkeypatch):
+    # The _score_stage broad-except guards the score-anomaly escalation (it once ate a real
+    # NameError): a scoring failure must stay non-fatal but land a traceback in workflow.log
+    # AND a WARN on the spine — never vanish.
+    calib = _make(tmp_path, "score_boom")
+    assert calib.run("mhc-only").status == "completed"
+    ti3 = calib.calib["stages"]["measure:raw"]["data"]["ti3"]
+
+    import dlc.calibrate as calmod
+
+    def raise_nameerror(*a, **k):
+        raise NameError("boom")
+
+    monkeypatch.setattr(calmod, "score_samples", raise_nameerror)
+    assert calib._score_stage("raw", ti3, label="raw (native)") is None   # non-fatal
+    log = (calib.ctx.root / "workflow.log").read_text(encoding="utf-8")
+    assert "intermediate scoring" in log and "NameError" in log
+    warns = [e for e in read_events(calib.ctx.events_path)
+             if e.event == Ev.NOTE and e.level == "WARN"
+             and "scoring failed" in (e.data.get("message") or "")]
+    assert warns and warns[0].data.get("error")
+
+
+def test_backup_capture_failure_raises_a_seam(tmp_path: Path, monkeypatch):
+    # A failed pre-run settings backup is a judgment call (run un-backed-up or fix first),
+    # not a log line: it must raise a compromised-flagged seam that even the supervised
+    # adjudicator escalates. An explicit 'proceed' decision lets the run continue.
+    controller = CalibrationController.mock()
+    # json.dumps chokes on the sentinel → _capture_user_backup records captured=False
+    monkeypatch.setattr(controller, "state",
+                        lambda: {"mhc": {}, "runtime": {}, "unserializable": object()})
+    calib = _make(tmp_path, "backup_seam", controller=controller,
+                  adjudicator=SupervisedAdjudicator({}))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    assert exc.value.request.key == "preflight:backup"
+    assert exc.value.request.digest.get("compromised") is True
+    assert exc.value.request.recommendation == "proceed"
+
+    calib2 = _make(tmp_path, "backup_seam2", controller=controller,
+                   adjudicator=SupervisedAdjudicator({}),
+                   decision_overrides={"preflight:backup": Decision("proceed")})
+    assert calib2.stage_preflight().status == "done"
+
+
+def test_dlc_state_carries_a_schema_version(tmp_path: Path):
+    # Every save stamps dlc_state_version; a legacy stamp-less record still loads + resumes
+    # (tolerant reader — the stamp exists so the NEXT breaking change has a number to branch on).
+    from dlc.stages._common import DLC_STATE_VERSION
+    calib = _make(tmp_path, "state_ver")
+    assert calib.run("mhc-only").status == "completed"
+    state_path = calib.ctx.root / "dlc_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state.get("dlc_state_version") == DLC_STATE_VERSION
+
+    state.pop("dlc_state_version")
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    resumed = _make(tmp_path, "state_ver")
+    assert resumed.run("mhc-only").status == "completed"
+    assert json.loads(state_path.read_text(encoding="utf-8")
+                      ).get("dlc_state_version") == DLC_STATE_VERSION

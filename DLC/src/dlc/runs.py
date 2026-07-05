@@ -48,7 +48,13 @@ class RunContext:
         return self.root / "events.jsonl"
 
     def ensure_dirs(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=False)
+        # exist_ok: a crash between this mkdir and the first manifest save leaves a
+        # half-created run dir that would otherwise brick BOTH paths — open_run refuses it
+        # (no manifest.json) and create_run could not re-create it (exist_ok=False raised).
+        # Adopting a manifest-less dir is safe: every create_run caller (main, resolve_run)
+        # checks for manifest.json first, so a real run is never clobbered; fresh names are
+        # microsecond-timestamped so collisions do not occur in practice.
+        self.root.mkdir(parents=True, exist_ok=True)
         for name in [
             "preflight",
             "probe_match",
@@ -57,7 +63,7 @@ class RunContext:
             "generated",
             "reports",
         ]:
-            (self.root / name).mkdir()
+            (self.root / name).mkdir(exist_ok=True)
 
     def save(self) -> None:
         atomic_write_text(

@@ -48,3 +48,18 @@ def test_run_manifest_save_uses_atomic_writer(tmp_path):
     assert ctx.manifest_path.exists()
     reopened = open_run(ctx.root)
     assert reopened.manifest.name == "run"
+
+
+def test_create_run_adopts_a_half_created_run_dir(tmp_path):
+    # fable Phase 7a: a crash between the root mkdir and the first manifest save used to
+    # brick the dir — open_run refuses it (no manifest.json) and create_run's
+    # mkdir(exist_ok=False) raised. A manifest-less dir is adoptable by construction
+    # (every caller checks for manifest.json before choosing create_run).
+    from dlc.runs import create_run
+
+    half = tmp_path / "half_created"
+    half.mkdir()
+    (half / "measurements").mkdir()      # some subdirs may exist too
+    ctx = create_run("SDR", display="adopt", run_dir=half)
+    assert ctx.manifest_path.exists()
+    assert (half / "generated").is_dir() and (half / "reports").is_dir()

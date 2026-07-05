@@ -214,3 +214,39 @@ def test_pause_timeout_rolls_back_as_cancel(tmp_path):
     events = read_events(tmp_path / "e.jsonl")
     assert any(e.event == Ev.SEAM and e.data.get("status") == "paused" for e in events)
     assert any(e.event == Ev.NOTE and e.data.get("rollback") for e in events)
+
+
+def test_pause_loop_keeps_the_progress_clock_fresh_for_the_watchdog(tmp_path):
+    # fable Phase 7a: a legitimate operator pause must not read as a wedge. The pause poll
+    # loop is proof the main thread is alive, so each iteration resets the shared progress
+    # clock — otherwise a pause stacked on prior progress age crosses the WATCHDOG threshold
+    # (2x stall_after) mid-pause and the watchdog force-kills the meter during the hold.
+    clk = _Clock()
+    controls = iter([{"action": "pause", "timeout_s": 200}]
+                    + [{"action": "pause"}] * 3        # ignored while paused (not resume/cancel)
+                    + [{"action": "resume"}])
+    ages = []
+    live = Liveness(
+        RunLog(tmp_path / "e.jsonl"),
+        stall_after_s=30.0,                            # watchdog threshold would be 60s
+        control_check=lambda: next(controls),
+        clock=clk,
+        sleep=lambda dt: clk.advance(45.0),            # each poll tick ages 45s (total hold 180s)
+    )
+    live.progress("measure")
+    clk.advance(25.0)                                  # pre-pause progress age near the limit
+
+    orig_sleep = live._sleep
+
+    def sampling_sleep(dt):
+        # what the watchdog thread would see mid-pause: the since-progress age
+        ages.append(clk() - live._last_progress)
+        orig_sleep(dt)
+
+    live._sleep = sampling_sleep
+    live.check("measure")                              # enters the pause loop, then resumes
+
+    # every mid-pause sample stays far below the 60s watchdog threshold (fresh each poll)
+    assert ages and max(ages) < 30.0, ages
+    # and after resume the checkpoint guard sees fresh progress too
+    live.check("measure")
