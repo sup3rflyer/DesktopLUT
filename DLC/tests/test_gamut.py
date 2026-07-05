@@ -89,3 +89,56 @@ def test_partial_coverage_some_primaries_reachable():
     assert cov["reachable"]["G"] is False
     assert set(cov["shortfall"]) == {"G"}
     assert 0.8 < cov["coverage_ratio"] < 1.0
+
+
+# --------------------------------------------------------------- degenerate honesty
+def test_gamut_coverage_degenerate_native_is_reported_not_covered():
+    # A corrupt characterization (all primaries coincident, or collinear) must be
+    # reported as degenerate/uncovered. Without the guard, the winding-agnostic
+    # membership test scores a POINT native gamut as covering every target primary
+    # (all cross products ~ 0) — a broken measurement read as a perfect panel.
+    target = gamut.STANDARD_PRIMARIES["Rec.709"]
+    point = {"R": (0.3, 0.3), "G": (0.3, 0.3), "B": (0.3, 0.3)}
+    collinear = {"R": (0.1, 0.1), "G": (0.5, 0.5), "B": (0.9, 0.9)}
+    for native in (point, collinear):
+        cov = gamut.gamut_coverage(native, target)
+        assert cov["degenerate"] is True
+        assert cov["covered"] is False
+        assert cov["coverage_ratio"] == 0.0
+        assert not any(cov["reachable"].values())
+        assert set(cov["shortfall"]) == {"R", "G", "B"}
+
+
+def test_gamut_coverage_real_triangles_are_not_degenerate():
+    cov = gamut.gamut_coverage(gamut.STANDARD_PRIMARIES["Display P3"],
+                               gamut.STANDARD_PRIMARIES["Rec.709"])
+    assert cov["degenerate"] is False
+    assert cov["covered"] is True
+
+
+# --------------------------------------------------------------- fuzz-lite reference
+def test_reachable_fraction_matches_bisection_reference():
+    # Cross-validate the analytic segment/edge intersection against a blind
+    # inside/outside bisection along the same segment (seeded, deterministic).
+    import math
+    import random
+    rng = random.Random(20260705)
+    checked = 0
+    while checked < 25:
+        tri = [(rng.uniform(0.0, 0.8), rng.uniform(0.0, 0.9)) for _ in range(3)]
+        if gamut.polygon_area(tri) < 0.01:
+            continue
+        w = (sum(p[0] for p in tri) / 3.0, sum(p[1] for p in tri) / 3.0)  # centroid: inside
+        ang = rng.uniform(0.0, 2.0 * math.pi)
+        prim = (w[0] + 2.0 * math.cos(ang), w[1] + 2.0 * math.sin(ang))   # far outside
+        got = gamut.reachable_fraction(w, prim, tri)
+        lo, hi = 0.0, 1.0
+        for _ in range(50):
+            mid = (lo + hi) / 2.0
+            q = (w[0] + mid * (prim[0] - w[0]), w[1] + mid * (prim[1] - w[1]))
+            if gamut.point_in_triangle(q, *tri, eps=0.0):
+                lo = mid
+            else:
+                hi = mid
+        assert got == pytest.approx(lo, abs=1e-3)
+        checked += 1

@@ -153,6 +153,23 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Fixed
+- **Fable audit Phase 2 — patch generation, transfers, targets**
+  (`docs/audits/fable/phase-2.md`): input-side invariants verified and pinned.
+  A corrupt negative DIP ceiling can no longer produce a negative HDR roll-off knee
+  (`resolve_hdr_target` now normalizes the ceiling like `choose_peak_nits`); a
+  clamped implausible undershoot gain is now FLAGGED in the target provenance
+  (`clamped: true` + a re-characterize note) instead of quoted as a plausible 1.5×;
+  `gamut_coverage` reports a degenerate (corrupt) native-primary triangle honestly
+  (`degenerate: true`, nothing covered) instead of scoring a point-gamut as 100 %
+  coverage; the dispread port-resolution gate derives its sibling spotread with the
+  plan's own suffix convention (POSIX plans no longer fail enumeration on a
+  hardcoded `.exe`); `white_from_spd_file`'s default strength is now 0 (numeric
+  D65), matching `target_white` — the perceptual correction stays opt-in. Pinned by
+  10 new tests, including the owner's pure-power-law-never-piecewise-sRGB rule at
+  the `Transfer` level and the verify colour-floor's absolute-PQ domain + no-overlap
+  invariant. The §0 patch-geography density artifact (where the patches go, per
+  luminance × saturation band, both modes) lands as `docs/audits/fable/phase-2.md`
+  §2 + its generator script.
 - **Fable audit Phase 0 (2026-07-05, `docs/audits/fable/phase-0.md`):** the suite is
   now deterministic on any box — green-or-skipped, never red-for-environment.
   `resolve_dispread_instrument_port` no longer silently no-ops on POSIX (its

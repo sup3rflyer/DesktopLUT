@@ -363,6 +363,14 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
     normalized signal is below it — sub-nit chroma is noise-dominated, so colour starts
     above the shadow band while the grey ramp (incl. ``low_light_steps`` toe) still covers
     the dark EOTF. ``0.0`` ⇒ no floor (the dense build ramp keeps full-range colour).
+
+    Domain note: the floor is a fraction of the transfer's FULL-scale signal
+    (``transfer.max_cv``), deliberately NOT of a ``max_cv`` peak cap — under PQ the
+    full-scale signal is absolute (0.25 ≈ 1 nit regardless of the target peak), which is
+    what a *noise-floor* rationale wants. The ``low_light_*`` shadow band, by contrast,
+    scales with ``max_cv`` (a perceptual-region rationale). Since any cap satisfies
+    ``max_cv <= transfer.max_cv``, the floor always sits at-or-above where a cap-relative
+    floor would, so the no-overlap invariant with the grey toe holds either way.
     """
     if max_cv is None:
         max_cv = transfer.max_cv
