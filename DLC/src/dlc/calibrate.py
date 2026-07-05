@@ -95,6 +95,7 @@ from .adjudication import (
     SupervisedAdjudicator,
 )
 from . import calibration_profile as cp
+from . import checkin
 from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
 from .correction_store import CorrectionRecord, CorrectionStore
@@ -1396,149 +1397,33 @@ class Calibration:
                     pass
 
     # -- §12 timed check-in (NON-BLOCKING evidence packet) ------------------
+    # -- §12 timed check-ins — assembly lives in dlc.checkin (fable Phase 8, R2) ---------
+    # The check-in STATE (window clock, tally snapshot, events byte offset, latest-metric
+    # snapshots) stays on this orchestrator where the stages that feed it live; the packet
+    # assembly + the DESIGN LAW (emit-only, never a gate) moved to dlc/checkin.py. These
+    # delegators keep every call site + test name stable.
     def _maybe_timed_checkin(self, trigger: str) -> None:
-        """Emit a rich evidence packet for the overseeing LLM once the wall-clock floor has
-        elapsed (§12). Disabled at interval 0; the first checkpoint only anchors the clock.
-
-        DESIGN LAW (do not regress): a check-in NEVER pauses the spine and carries NO
-        recommendation/accept for anyone to rubber-stamp. It is the spine collecting the
-        evidence since the last check-in — warnings, the max ΔE actually read, re-read /
-        repeated patches, non-stopper anomalies — and handing it to the LLM EVERY TIME so the
-        LLM applies judgment ("ΔE high but that's the panel limit"; "patch re-read twice but
-        the latest read is normal → self-corrected") and intervenes ONLY if it sees a real
-        problem. Run-stoppers are a SEPARATE mechanism (adjudicated seams). The LLM consumes
-        this from the running (background) spine out of band — emit-only, no exit-10 gate. This
-        is the point of DLC: LLM intelligence consuming tools+data, not a deterministic program.
-        """
-        import time
-        if self._checkin_interval_s <= 0 or self.runlog is None:
-            return
-        now = time.monotonic()
-        if self._last_checkin_monotonic is None:
-            # First checkpoint just anchors the clock — no immediate ping at second 0.
-            self._last_checkin_monotonic = now
-            self._last_checkin_tally = dict(self.runlog.tally)
-            self._last_checkin_pos = self._events_size()
-            return
-        if now - self._last_checkin_monotonic < self._checkin_interval_s:
-            return
-        elapsed_since = now - self._last_checkin_monotonic
-        seq = int(self.calib.get("checkin_seq", 0)) + 1
-        self.calib["checkin_seq"] = seq
-        digest = self._checkin_digest(trigger, seq=seq, elapsed_since_checkin_s=round(elapsed_since, 1))
-        # Reset the window AFTER building the digest, BEFORE emitting, so the next window starts
-        # clean and the check_in event itself isn't counted into it.
-        self._last_checkin_monotonic = now
-        self._last_checkin_tally = dict(self.runlog.tally)
-        self._last_checkin_pos = self._events_size()
-        self.runlog.check_in(trigger, **digest)   # EMIT-ONLY: evidence for the LLM, never a gate
+        checkin.maybe_timed_checkin(self, trigger)
 
     def _checkin_digest(self, trigger: str, *, seq: int = 0,
                         elapsed_since_checkin_s: float = 0.0) -> dict[str, Any]:
-        """The rich check-in payload: the run overview, what happened since the last check-in,
-        and the latest live metrics — exactly what a supervising LLM needs to judge "continue?"."""
-        return {
-            "seq": seq,
-            "elapsed_since_checkin_s": elapsed_since_checkin_s,
-            "overview": self._run_overview(trigger),
-            "since_last": self._events_since_last_checkin(),
-            "evidence": self._checkin_evidence(),
-            "metrics": self._latest_checkin_metrics(),
-        }
+        return checkin.checkin_digest(self, trigger, seq=seq,
+                                      elapsed_since_checkin_s=elapsed_since_checkin_s)
 
     def _events_size(self) -> int:
-        """Current byte size of events.jsonl (the check-in evidence window high-water mark)."""
-        try:
-            return self.runlog.path.stat().st_size if self.runlog else 0
-        except OSError:
-            return 0
+        return checkin.events_size(self)
 
     def _checkin_evidence(self) -> dict[str, Any]:
-        """The REAL evidence since the last check-in, read back from the events.jsonl window:
-        every warning/anomaly (with detail), the max ΔE actually read + which patch, and the
-        read count. This is data for the LLM to JUDGE — deliberately NOT a verdict and NOT a
-        recommendation. The full firehose is always on disk; this is the at-a-glance packet."""
-        import json as _json
-        out: dict[str, Any] = {"reads": 0, "max_dE": None, "max_dE_patch": None, "warnings": []}
-        if self.runlog is None:
-            return out
-        try:
-            with self.runlog.path.open("r", encoding="utf-8") as fh:
-                fh.seek(self._last_checkin_pos or 0)
-                lines = fh.readlines()
-        except OSError:
-            return out
-        for ln in lines:
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                e = _json.loads(ln)
-            except ValueError:
-                continue
-            ev = e.get("event")
-            data = e.get("data") or {}
-            if ev == "patch_read":
-                out["reads"] += 1
-                de = data.get("dE")
-                if isinstance(de, (int, float)) and (out["max_dE"] is None or de > out["max_dE"]):
-                    out["max_dE"] = round(de, 3)
-                    out["max_dE_patch"] = data.get("label") or data.get("role") or data.get("signal")
-            elif ev in ("anomaly", "read_plausibility_anomaly", "stall"):
-                w = {"event": ev, "stage": e.get("stage")}
-                for k in ("kind", "label", "reason", "message", "detail", "attempt"):
-                    if k in data:
-                        w[k] = data[k]
-                out["warnings"].append(w)
-        # Cap the inline warning list so the packet stays readable; the full log is on disk.
-        if len(out["warnings"]) > 25:
-            extra = len(out["warnings"]) - 25
-            out["warnings"] = out["warnings"][:25] + [{"truncated": extra, "note": "see events.jsonl"}]
-        return out
+        return checkin.checkin_evidence(self)
 
     def _run_overview(self, trigger: str) -> dict[str, Any]:
-        import time
-        stages = self.calib.get("stages") or {}
-        done = [k for k, v in stages.items() if (v or {}).get("status") == "done"]
-        elapsed = None
-        if self._run_started_monotonic is not None:
-            elapsed = round(time.monotonic() - self._run_started_monotonic, 1)
-        return {
-            "run": self.ctx.root.name,
-            "flow": self.calib.get("flow"),
-            "mode": self.mode,
-            "target": self.target_name,
-            "phase": self.runlog.phase if self.runlog else None,
-            "stage": trigger,
-            "stages_done": len(done),
-            "completed": done,
-            "elapsed_s": elapsed,
-        }
+        return checkin.run_overview(self, trigger)
 
     def _events_since_last_checkin(self) -> dict[str, int]:
-        """Per-event-name counts emitted since the previous check-in (anomalies, seams, reads,
-        optimizer iterations, …) — the spine delta, computed from the RunLog tally, no disk read."""
-        cur = self.runlog.tally if self.runlog else {}
-        prev = self._last_checkin_tally or {}
-        return {name: cur[name] - prev.get(name, 0)
-                for name in cur if cur[name] - prev.get(name, 0) > 0}
+        return checkin.events_since_last_checkin(self)
 
     def _latest_checkin_metrics(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        if self._last_scored:
-            out["last_scored"] = self._last_scored
-        if self._last_optimizer:
-            out["optimizer"] = self._last_optimizer
-        if self._last_refine:
-            out["refine"] = self._last_refine
-        if self._last_bookend_drift:
-            out["bookend_drift"] = {
-                k: self._last_bookend_drift.get(k)
-                for k in ("available", "role", "metric", "max_delta_de", "p95_delta_de",
-                          "mean_delta_de", "threshold", "unique_signals")
-                if k in self._last_bookend_drift
-            }
-        return out
+        return checkin.latest_checkin_metrics(self)
 
     def _monitor_map_check(self) -> dict[str, Any]:
         """Mechanically verify the profile's monitor↔Argyll↔panel mapping against LIVE enumeration,
