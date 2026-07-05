@@ -34,6 +34,24 @@ def build(args, ctx: RunContext) -> StageResult:
             "medium",
         )
 
+    # 0) Stale-calibration-mode tell (fable Phase 9): if a previous run never exited,
+    # the C++ DoEnterNeutral will re-snapshot the already-CLEARED state — after this
+    # call, exit(restore_snapshot=True) can no longer restore the user's pre-run setup;
+    # only the durable settings backup can. Surface it as evidence; entering proceeds.
+    stale_calibration = False
+    try:
+        stale_calibration = bool(controller.calibration_status().get("active"))
+    except Exception:  # noqa: BLE001 - advisory probe; a dead pipe fails loudly at enter below
+        pass
+    if stale_calibration:
+        result.anomaly(
+            "stale_calibration_mode",
+            "DesktopLUT was already in calibration mode (a previous run did not exit); the pipe's "
+            "restore snapshot will now capture the cleared state — treat the pre-run settings "
+            "backup as the authoritative restore",
+            "medium",
+        )
+
     # 1) Clear DesktopLUT's MHC + 3D LUT + shader layers and associate the dummy.
     try:
         enter = controller.enter_neutral(args.monitor, mode, dummy_path, reason="DLC enter-neutral")
@@ -98,6 +116,7 @@ def build(args, ctx: RunContext) -> StageResult:
         "simulated": simulated,
         "neutral_confirmed": neutral_confirmed,
         "gamma_ramp_loaded": ramp_identity,
+        "stale_calibration_mode": stale_calibration,
     }
     if simulated:
         result.note(

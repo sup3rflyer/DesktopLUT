@@ -12,6 +12,38 @@ from typing import Any, Callable, Protocol
 
 DEFAULT_PIPE_NAME = r"\\.\pipe\DesktopLUT.Calibration"
 
+# The wire-contract version DLC speaks (the API spec's `version`). Servers advertise
+# theirs via an optional `contract_version` field in the `state.get` result; a server
+# that omits it predates versioning and is treated as v1 (today's C++ builds — the
+# server-side field is a DesktopLUT ticket, fable Phase 9). Bump ONLY for a change a
+# tolerant client cannot absorb; additive fields never require a bump.
+CONTRACT_VERSION = 1
+
+
+def contract_version_mismatch(state_result: Any) -> str | None:
+    """Return a human-readable mismatch description, or ``None`` when compatible.
+
+    ``state_result`` is a ``state.get`` result payload. An absent field means a
+    pre-versioning server and is compatible by definition (v1). This exists so a
+    future contract bump surfaces at preflight as a clear "update DLC / update
+    DesktopLUT" message instead of a cryptic ``unknown method`` mid-run.
+    """
+    if not isinstance(state_result, dict):
+        return None
+    raw = state_result.get("contract_version")
+    if raw is None:
+        return None
+    try:
+        version = int(raw)
+    except (TypeError, ValueError):
+        return f"DesktopLUT reported an unparseable contract_version {raw!r} (DLC speaks v{CONTRACT_VERSION})"
+    if version == CONTRACT_VERSION:
+        return None
+    newer = "update DLC" if version > CONTRACT_VERSION else "update DesktopLUT"
+    return (f"DesktopLUT speaks calibration-API contract v{version} but DLC expects "
+            f"v{CONTRACT_VERSION} — {newer} before running (mismatched methods would "
+            "otherwise surface as 'unknown method' mid-run)")
+
 
 @dataclass(frozen=True)
 class DesktopLutCommand:
@@ -92,7 +124,18 @@ class NamedPipeTransport:
 
 def _call_with_timeout(fn: Callable[[], DesktopLutResponse], *, timeout_s: float,
                        label: str) -> DesktopLutResponse:
-    """Run blocking pipe IO behind a bounded wait so the calibrator never wedges forever."""
+    """Run blocking pipe IO behind a bounded wait so the calibrator never wedges forever.
+
+    On timeout the worker thread is ORPHANED, not killed: Windows file IO on the pipe has
+    no portable cancel, so the daemon thread stays blocked in ``open``/``readline`` until
+    the server responds or the process exits. Two consequences callers must own (fable
+    Phase 9): (1) the request may still be APPLIED server-side after the client gave up —
+    every ``mhc.set_*``/``apply``/``set_3dlut`` is idempotent so a retry is safe, but
+    ``calibration.enter`` is NOT (a second enter overwrites the C++ restore snapshot with
+    the already-cleared state; see the API spec's timeout_and_retries note); (2) the C++
+    pipe is single-instance, so until the orphan's connection completes a retry fails fast
+    with a pipe-busy ``OSError`` rather than reaching the server.
+    """
     q: queue.Queue[tuple[bool, DesktopLutResponse | BaseException]] = queue.Queue(maxsize=1)
 
     def worker() -> None:
@@ -101,7 +144,7 @@ def _call_with_timeout(fn: Callable[[], DesktopLutResponse], *, timeout_s: float
         except BaseException as exc:  # noqa: BLE001 - propagate transport failures unchanged
             q.put((False, exc))
 
-    thread = threading.Thread(target=worker, name="desktoplut-pipe-request", daemon=True)
+    thread = threading.Thread(target=worker, name=f"desktoplut-pipe-request ({label})", daemon=True)
     thread.start()
     try:
         ok, value = q.get(timeout=max(0.001, timeout_s))

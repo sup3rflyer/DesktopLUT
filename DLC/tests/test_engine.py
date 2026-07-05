@@ -1140,7 +1140,10 @@ class DesktopLutApiTests(unittest.TestCase):
     def test_mock_calibration_mode_resets_layers(self) -> None:
         transport = MockDesktopLutTransport()
         client = DesktopLutClient(transport=transport)
-        client.send(client.set_3dlut(0, "SDR", "old.cube"))
+        with tempfile.NamedTemporaryFile(suffix=".cube", delete=False) as fh:
+            fh.write(b'TITLE "x"\n')
+            old_cube = fh.name
+        client.send(client.set_3dlut(0, "SDR", old_cube))
         response = client.send(client.enter_calibration_mode(0, "SDR", "dummy.icc"))
         self.assertTrue(response.ok)
         state = client.send(client.state_get()).result or {}

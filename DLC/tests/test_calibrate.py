@@ -925,6 +925,7 @@ def test_apply_installs_the_durable_results_cube_not_the_run_dir_artifact(tmp_pa
 
 def test_3dlut_only_apply_installs_the_durable_results_cube(tmp_path: Path):
     ctrl = CalibrationController.mock()
+    (tmp_path / "previous.cube").write_text('TITLE "x"\n', encoding="utf-8")
     _seed_stack(ctrl, cube=str(tmp_path / "previous.cube"))
     calib = _make(tmp_path, "durable_cube_3dlut", controller=ctrl, output_dir=tmp_path / "deliverables")
     result = calib.run("3dlut-only")
@@ -1137,6 +1138,7 @@ def _seed_stack(controller: CalibrationController, *, cube: str | None = None) -
 def test_3dlut_only_revert_restores_previous_cube(tmp_path: Path):
     ctrl = CalibrationController.mock()
     prev_cube = str(tmp_path / "previous.cube")
+    (tmp_path / "previous.cube").write_text('TITLE "x"\n', encoding="utf-8")
     _seed_stack(ctrl, cube=prev_cube)
 
     calib = _make(tmp_path, "lut_revert", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
@@ -1386,7 +1388,9 @@ def test_every_seam_request_on_clean_runs_is_envelope_coherent(tmp_path: Path):
         name = f"env_{mode}_{flow}"
         calib = _make(tmp_path, name, mode=mode, adjudicator=rec)
         if flow == "grayscale-wb":
-            calib.controller.set_base_lut(0, mode, "base.cube", 0.0)   # satisfy require-stack
+            base_cube = tmp_path / "base.cube"
+            base_cube.write_text("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n", encoding="utf-8")
+            calib.controller.set_base_lut(0, mode, str(base_cube), 0.0)   # satisfy require-stack
         calib.run(flow)
         assert rec.requests, f"no seams reached on {mode}/{flow}"
         for req in rec.requests:

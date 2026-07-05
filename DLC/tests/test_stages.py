@@ -377,13 +377,15 @@ def test_report_before_after(tmp_path):
 # --------------------------------------------------------------------------
 def test_file_backed_mock_persists_across_controllers(tmp_path):
     path = tmp_path / "sim_state.json"
+    first_cube = tmp_path / "first.cube"
+    first_cube.write_text('TITLE "x"\n', encoding="utf-8")
     c1 = CalibrationController.with_transport(FileBackedMockTransport(path))
     c1.enter_neutral(0, "SDR", "dummy.icm")
-    c1.set_3dlut(0, "SDR", "first.cube")
+    c1.set_3dlut(0, "SDR", str(first_cube))
 
     c2 = CalibrationController.with_transport(FileBackedMockTransport(path))
     state = c2.state()
-    assert state["runtime"]["0:SDR"]["cube_path"] == "first.cube"
+    assert state["runtime"]["0:SDR"]["cube_path"] == str(first_cube)
     assert state["calibration_mode"]["active"] is True
 
 

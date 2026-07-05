@@ -101,6 +101,7 @@ from . import calibration_profile as cp
 from . import checkin
 from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
+from .desktoplut_client import contract_version_mismatch
 from .correction_store import CorrectionRecord, CorrectionStore
 from . import gamut
 from .dip import DipStore, DisplayInstrumentProfile
@@ -1739,8 +1740,16 @@ class Calibration:
             pipe_ok = True
             pipe_error: Optional[str] = None
             seen_monitors: list[int] = []
+            contract_mismatch: Optional[str] = None
             try:
                 state = self.controller.state()
+                # Wire-contract version check (fable Phase 9): the server MAY advertise
+                # contract_version in state.get (absent = pre-versioning v1 build). A
+                # mismatch surfaces HERE as "update DLC/DesktopLUT", not as a cryptic
+                # `unknown method` failure mid-run. Tell-only: the LLM/operator decides.
+                contract_mismatch = contract_version_mismatch(state)
+                if contract_mismatch:
+                    self.ctx.log(f"pipe contract mismatch: {contract_mismatch}")
                 for key in (state.get("mhc") or {}).keys():
                     seen_monitors.append(int(str(key).split(":")[0]))
                 for key in (state.get("runtime") or {}).keys():
@@ -1837,6 +1846,7 @@ class Calibration:
             digest = {"monitor": self.monitor, "mode": self.mode, "display": self.display.name,
                       "argyll_display": self.display.argyll_display, "mapping_ok": mapping_ok,
                       "pipe_ok": pipe_ok, "pipe_error": pipe_error,
+                      "contract_mismatch": contract_mismatch,
                       "seen_monitors": sorted(set(seen_monitors)),
                       "monitor_map": monitor_map,
                       "correction": staleness.as_dict(),
@@ -2258,10 +2268,30 @@ class Calibration:
 
     def stage_enter_neutral(self) -> StageOutcome:
         def run() -> StageOutcome:
+            # Stale-calibration-mode tell (fable Phase 9): if a PREVIOUS run died without
+            # exiting calibration mode, the C++ DoEnterNeutral re-snapshots unconditionally —
+            # its single restore slot then holds the already-CLEARED state, so a later
+            # exit(restore_snapshot=True) cannot bring back the user's pre-run setup. Surface
+            # it so the digest reader knows the preflight settings backup is the authoritative
+            # restore for this run. Tell-only; entering is still correct.
+            stale_calibration = False
+            try:
+                stale_calibration = bool(self.controller.calibration_status().get("active"))
+            except Exception:  # noqa: BLE001 - status probe is advisory; enter itself will surface a dead pipe
+                pass
+            if stale_calibration:
+                self.ctx.log("DesktopLUT was already in calibration mode (a previous run did not "
+                             "exit) — the pipe's restore snapshot now captures that cleared state; "
+                             "treat the preflight settings backup as the authoritative restore")
             res = self.controller.enter_neutral(self.monitor, self.mode, self.dummy_icc,
                                                 reason="DLC v2 calibration")
+            digest: dict[str, Any] = {"entered": True}
+            if stale_calibration:
+                digest["stale_calibration_mode"] = True
+                digest["note"] = ("snapshot-restore now reflects a cleared state; "
+                                  "preflight backup is the authoritative rollback")
             return StageOutcome("enter-neutral", "done",
-                                digest={"entered": True}, data={"raw": _jsonable(res)})
+                                digest=digest, data={"raw": _jsonable(res)})
         return self._stage("enter-neutral", run)
 
     # ====================================================================
@@ -3549,8 +3579,17 @@ class Calibration:
             # (which is a no-op once commit has run) and durable across a DesktopLUT restart (the
             # snapshot lives in dlc_state.json, not DesktopLUT's in-memory GsLiveState). None ⇒ no
             # prior correction (revert clears to identity).
-            self.calib["grayscale_wb_prior"] = self._snapshot_correction_grayscale()
+            self.calib["grayscale_wb_prior"] = prior_snapshot = self._snapshot_correction_grayscale()
             self._save()
+            if prior_snapshot is None:
+                # Honesty tell (fable Phase 9): None means EITHER no prior correction exists OR
+                # this DesktopLUT build doesn't expose correction_grayscale in state.get (the
+                # current C++ reports only applied/profile_name — exposing it is a ticketed
+                # DesktopLUT change). Either way a later `revert` clears the touch-up to
+                # identity rather than restoring a pre-existing correction — say so up front.
+                self.ctx.log("no prior correctionGrayscale captured over the pipe (none exists, or "
+                             "this DesktopLUT build does not expose it in state.get) — a revert of "
+                             "this touch-up will clear to identity, not restore a prior correction")
 
             # Engage the live grayscale editor (the "Edit Points" path): this strips any prior
             # correction-grayscale from the active MHC permutation and shows a live, measurable

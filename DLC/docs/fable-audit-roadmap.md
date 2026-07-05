@@ -104,6 +104,23 @@ fixable, and leave a written trail. Nothing is one-shotted.
   (`checkin.NO_DARK_WINDOW_CEILING_S`; ctor-clamped interval, wall-clock backstops on
   the measure read funnel + soak blocks + probe batches + characterize reads — the
   probe pass and characterize were previously digest-dark for their whole duration).
+- **Updated:** 2026-07-05, Phase 9 complete on `claude/fable-audit-phase-9-6a6b8v`
+  (report: `docs/audits/fable/phase-9.md`). The contract is now pinned three ways
+  (`tests/test_ipc_contract.py`: mock ⇄ spec response shapes, spec ⇄ C++ reverse
+  existence + static result-shape + threading conformance, controller ⇄ spec) — the
+  spec had been missing FIVE methods the C++ and controller already speak
+  (`windows.set_hdr` + the grayscale live-edit quartet). Real bug fixed: `install-mhc`'s
+  `install_ok` was structurally always True (dead envelope-key clause; profile_name also
+  read from the wrong nesting for the C++ shape). Mock fidelity raised where sim could
+  pass what hardware fails (verify_mhc now requires an APPLIED profile; cube paths
+  validated; monitor/mode vocabulary enforced; hardware-shaped gamma-ramp evidence;
+  apply carries profile_name). Version handshake landed client-side (`contract_version`
+  in state.get, checked at preflight). C++ hazards ticketed (T1–T4 in phase-9.md §5,
+  incl. the re-enter snapshot overwrite — now surfaced as a `stale_calibration_mode`
+  tell — and state.get not exposing correction_grayscale, which silently degrades the
+  Design-B grayscale-wb revert on hardware; honesty tell landed). P10 re-verified
+  against the shipped C++; F4-12 closed (HDR live-edit honoured, mode-match gated).
+  HW-8 queued (`windows.set_hdr` live flip).
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -256,7 +273,7 @@ Classification: **I** = intentional (keep, ensure documented), **S** = suspect
 | P7 | Refine convergence target | 0.5 ΔE2000 | 2.0 dE_ITP | I (units differ) | 4 — *re-verified: ~1.0 ≈ 1 JND in both scales; the stop logic (floor/regress/safety), not the target, is the guarantee* |
 | P8 | Deep-shadow reference anchor | brightest patch | 100–203 nit diffuse-white band | I | 4 — *audit-verified + pre-existing test pin* |
 | P9 | 3D-LUT correction cap | 0.5 | 0.25 | I | 5 — *re-verified: provenance documented at `SDR_CORRECTION_CAP` + `_cube_optimize_config` (post-MHC residual vs cube-owns-all-colour; HANDOFF item H CV plateau ~0.5; only the DEFAULT ceiling is mode-lifted); the empirical single-panel-CV side re-verifies with HW-1's before/after scores* |
-| P10 | Grayscale bridge domain (`mhc_grayscale`) | signal-domain t² resample | pass-through | I | 4 — *audit-verified against the replicated C++ convention (test_mhc_grayscale)* |
+| P10 | Grayscale bridge domain (`mhc_grayscale`) | signal-domain t² resample | pass-through | I | 4 — *audit-verified against the replicated C++ convention (test_mhc_grayscale). Phase 9 re-verified against the SHIPPED C++ (`mhc.cpp EvalGrayscaleSDR/HDR` + ipc `ApplyGrayscalePayload`): SDR sqrt-indexed signal-domain slots (identity t², sqrt-interp), HDR linear (identity t); the C++ 32-point clamp is unreachable (DLC sends ≤32 everywhere, documented in the API spec)* |
 | P11 | Dummy ICC | Argyll sRGB.icm | Rec2020.icm **placeholder** (`profiles.py:46`) | I (ticketed) | 6 — *Phase 6 scoped: the proper fix is a DesktopLUT-side Advanced Color dummy (MHC2-capable ICC + `ColorProfileSetDisplayDefaultAssociation` install, name exposed over IPC) — cross-repo ticket text in phase-6.md; the DLC placeholder stays, correctly labelled. Phase 12's endgame item points at that ticket.* |
 | P12 | Refine-stage dispatch | `_flow_*` switches on `_spec().is_hdr`; `_planned_stages` switches on `self.mode` — can diverge | same | I (closed) | 7 — *Phase 7a: `_reject_mode_target_mismatch` aborts loudly at resolve-target (and characterize) when a profile slot's target transfer disagrees with the run mode — past that gate the two predicates are provably interchangeable. Test-pinned both flows; the stepper map is additionally pinned equal to the announced phases per flow.* |
 | P13 | `hdr` named flow | n/a | signpost stub: explains `--mode HDR --flow full/…` | I (closed) | 7 — *Phase 7a: the stub's stale "post-v1/SDR-first" text replaced with directions to the real surface; deliberately non-routing (run mode is fixed at creation — auto-switching would be run-spec drift). FLOWS registry + module docstring updated.* |
@@ -942,6 +959,10 @@ audit these as NEW SURFACE, don't rediscover them as drift:
   JS with shimmed `EventSource`/`fetch` — consider committing it under `tools/` as
   the dashboard's frontend fixture; Phase 10 would get headless UI verification
   for free.
+- *(Phase 9)* three new preflight/stage digest fields are free dashboard/report material:
+  `contract_mismatch` (preflight — wire-contract version handshake),
+  `stale_calibration_mode` (enter-neutral — "the pipe snapshot can't restore; the
+  settings backup is authoritative"), and the `apply_unconfirmed` anomaly (install-mhc).
 - *(Phase 8)* render `seam` events with `status="auto_accepted"` distinctly (they land
   in `last_seam` without `awaiting_decision` — correct, but a "auto-decided · vetoable"
   chip + the packet's `veto` command would make --supervised legible in the UI); the
@@ -976,7 +997,8 @@ new-surface leads dispositioned.
   `dlc_stages/` artifacts are advisory but a truncated JSON confuses the state tool —
   consider `atomic_write_text` in the hygiene pass.
 - **Coverage gaps (no dedicated test file):** `argyll` (680 lines, parsing-heavy —
-  highest-value gap), `controller`, `metrics` (transitively covered only), `refine`,
+  highest-value gap), ~~`controller`~~ *(Phase 9: `test_ipc_contract.py` now pins the
+  controller ⇄ spec ⇄ mock ⇄ C++ contract)*, `metrics` (transitively covered only), `refine`,
   `colormath`, `drift`, `lut3d`, `mhc`, `profile_plan`, `probe_match`,
   `measure_rgbw`, `preflight`, `simulation`, `stage`, `tools`. Thinnest: 
   `grayscale_wb` (2 tests). Phases 1–10 will have added many; this phase fills the
@@ -1056,6 +1078,12 @@ items the CHANGELOG names as goals.
   Peak-Chroma non-additivity decision (Phase 4), HDR dummy ICC (Phase 6 ticket),
   `hdr` flow surface (Phase 7), sustained-peak capture guidance surfaced at the
   brightness/hardware-readiness seams (Phase 8).
+- **DesktopLUT-side ticket batch** (schedule BEFORE the hardware campaign so HW-1
+  exercises the fixed behaviour): phase-9.md §5 T1–T4 (`contract_version` in state.get;
+  re-enter snapshot preservation; `correction_grayscale` exposed in state.get for the
+  Design-B revert; dead verify_mhc GUI branch) + the Phase 6 P11 Advanced-Color dummy
+  ICC ticket. `test_ipc_contract.py`'s `CPP_TICKETED_RESULT_KEYS` auto-arms shape
+  enforcement as each state.get ticket lands.
 - **§0 acceptance:** the campaign's pass/fail criteria are the practically-weighted
   scores (Phase 6), not the raw averages — a calibration "passes" when the neutral
   axis, low-mid range, and 709 core hit target on hardware; frontier residuals are
@@ -1114,6 +1142,7 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-5 | F4-3 (P16): compare `peak_chroma.cap_nits_nonadditive_est` against the HDR refine's actually-landed D65 peak — decides whether the Peak-Chroma cap should adopt the first-order non-additivity correction | Phase 4 |
 | HW-6 | F5-1 (gamut-aware delta fix): on the next HDR box run, compare 3D-LUT frontier-corner residuals + optimizer floor counts/classifications vs the recorded baseline — reachable-boundary corners should improve or hold, previously-reported near-boundary "floors" may partially resolve; in-gamut and SDR numbers unchanged | Phase 5 |
 | HW-7 | Practical split on hardware: record the HDR verify `practical` block (core/limits/clamped) next to the raw numbers — expect `core.avg` materially below the overall avg (the 3.26 baseline was gamut-floor-inflated) and `clamped.n` ≈ the panel's known unreachable Rec.2020 corners; then re-derive the P3 HDR thresholds from the post-P1 core numbers (folds into HW-1's capture) | Phase 6 |
+| HW-8 | `windows.set_hdr` live flip on the box: toggle monitor 0 SDR→HDR→SDR over the pipe; confirm the OS flip, DesktopLUT's MHC reapply on WM_DISPLAYCHANGE, and `query_monitors` tracking `hdr_active`/`color_space`; then one `--mode HDR` run end-to-end without touching Windows Settings | Phase 9 |
 | — | *(phases append here)* | |
 
 ## 8. v3 horizon — packaging & interface (parked)
@@ -1173,7 +1202,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 - [x] Phase 7a — Orchestrator spine: correctness *(2026-07-05, `claude/fable-audit-phase-7a-3y6rsm` — see `docs/audits/fable/phase-7a.md`)*
 - [x] Phase 7b — Orchestrator spine: structure *(2026-07-05, same branch (restarted from main post-7a-merge) — see `docs/audits/fable/phase-7b.md`; RFC items R1–R6 routed to Phases 8/11/12)*
 - [x] Phase 8 — LLM seams & intelligence *(2026-07-05, `claude/fable-audit-phase-8-59q599` — see `docs/audits/fable/phase-8.md`; Task #1 resolved owner-approved)*
-- [ ] Phase 9 — IPC contract & mock fidelity
+- [x] Phase 9 — IPC contract & mock fidelity *(2026-07-05, `claude/fable-audit-phase-9-6a6b8v` — see `docs/audits/fable/phase-9.md`; C++ tickets T1–T4 routed to Phase 12's DesktopLUT-side batch)*
 - [ ] Phase 10 — Dashboard & observability
 - [ ] Phase 11 — Tests, packaging, docs, hygiene
 - [ ] Phase 12 — Integration, HDR endgame, hardware campaign
