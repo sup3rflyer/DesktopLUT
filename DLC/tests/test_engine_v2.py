@@ -20,7 +20,7 @@ pytest.importorskip("colour")
 
 from dlc.engine import patches as P
 from dlc.engine import lut_rbf as L
-from dlc.engine import lut_sdr as S
+from dlc.engine import lut_sdr_reference as S
 from dlc.engine import whitepoint as W
 from dlc.engine.lut_constrained import build_constrained_rbf_cube, gamut_clip_pressure, gamut_pressure
 from dlc.engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
@@ -605,7 +605,7 @@ def test_hull_distance_degenerate_is_safe():
 
 
 # ===========================================================================
-# lut_sdr
+# lut_sdr_reference (production-unreachable reference port — Phase 5 disposition)
 # ===========================================================================
 
 def _synth_ramps(native_cs_name, *, white_nits=120.0, gammas=(2.2, 2.2, 2.2), levels=21):

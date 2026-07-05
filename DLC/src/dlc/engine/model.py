@@ -484,8 +484,21 @@ class DisplayErrorModel:
         self.kernel = kernel
         self.sample_confidence = _normalised_sample_confidence(sample_confidence, len(self.signal))
 
-        ideal_ictcp = self.space.ideal_ictcp(self.signal)
-        self.measured_ictcp = self.space.xyz_to_ictcp(self.measured_xyz)
+        # The error field is trained against the UNCLAMPED ideal, even when the run is
+        # gamut-aware (#C3). The reachable clamp belongs on the TARGET side only (what the
+        # node/verify aims at — ``self.space.ideal_ictcp``); baking it into delta breaks the
+        # LUT builder's inversion step, which solves ``ideal(s*) = target - delta(s*)`` with
+        # the raw (unclamped, invertible) ``xyz_to_signal``. With a clamped delta that fixed
+        # point is inconsistent wherever the target clips: on a sub-gamut synthetic panel the
+        # "correction" desaturated reachable boundary colours from ~7 to ~29 dE_ITP. With the
+        # raw delta the fixed point is exactly ``panel(s*) = clamped_target`` — reachable by
+        # construction, and delta stays smooth (no kink at the gamut boundary) so the RBF and
+        # its CV smoothing search behave. In-gamut behaviour is identical either way (the
+        # clamp is a no-op there), and ``reachable_primaries=None`` is untouched.
+        self._raw_space = (TargetSpace(target) if reachable_primaries is not None
+                           else self.space)
+        ideal_ictcp = self._raw_space.ideal_ictcp(self.signal)
+        self.measured_ictcp = self._raw_space.xyz_to_ictcp(self.measured_xyz)
         self.delta_ictcp = self.measured_ictcp - ideal_ictcp
 
         if smoothing is None:
@@ -511,15 +524,20 @@ class DisplayErrorModel:
         """Simulate the panel: predicted **absolute XYZ** for a driven signal.
 
         ``ideal(signal) + predicted_error(signal)``, back in XYZ. This is the
-        tier-1 simulator the correction machine iterates against.
+        tier-1 simulator the correction machine iterates against. Uses the same
+        UNCLAMPED ideal the delta was trained against (the panel does not know
+        about the target's reachable clamp); score the result against the
+        clamped ``self.space`` targets.
         """
         signal_rgb = np.asarray(signal_rgb, dtype=float)
-        ideal_ictcp = self.space.ideal_ictcp(signal_rgb)
+        ideal_ictcp = self._raw_space.ideal_ictcp(signal_rgb)
         produced_ictcp = ideal_ictcp + self.predict(signal_rgb)
         return self.space.ictcp_to_xyz(produced_ictcp)
 
     def raw_error(self) -> np.ndarray:
-        """``dE_ITP`` of the measured display error at the measurement points."""
+        """``dE_ITP`` of the measured display error at the measurement points
+        (vs the UNCLAMPED ideal — the panel's error against the pure target,
+        including any unreachable-gamut component)."""
         return de_itp(self.delta_ictcp)
 
     def residuals(self) -> np.ndarray:

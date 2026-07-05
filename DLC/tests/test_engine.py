@@ -1326,6 +1326,18 @@ class Lut3dTests(unittest.TestCase):
             reopened = open_run(ctx.root)
             self.assertEqual(reopened.manifest.stages[-1]["stage"], "apply_3dlut")
 
+    def test_apply_3dlut_without_any_cube_raises_not_sends_cwd(self) -> None:
+        # No cube argument and no build_3dlut stage recorded: must raise a clear
+        # FileNotFoundError. (Regression: the old Path("") fallback resolved to the
+        # cwd — a directory that EXISTS — and was sent to DesktopLUT as the cube.)
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            with self.assertRaises(FileNotFoundError):
+                apply_3dlut_candidate(
+                    ctx=ctx,
+                    client=DesktopLutClient(transport=MockDesktopLutTransport()),
+                )
+
     def test_apply_3dlut_records_source_iteration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")

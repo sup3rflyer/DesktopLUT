@@ -75,6 +75,66 @@ def test_duplicate_measurements_raise_degenerate():
                       measured_xyz=measured, config=OptimizeConfig(grid_size=9, max_outer=2))
 
 
+def test_singular_later_build_keeps_best_cube_instead_of_crashing(monkeypatch):
+    # The other DegenerateMeasurements path: a LATER model build going singular (fold-back
+    # stacked collinear/duplicate driven points) must not crash or raise — the loop keeps
+    # the best cube built so far and returns normally.
+    import dlc.optimize as O
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
+    signals = _cube_signals(5)
+    measured = probe(signals)
+
+    real_model = O.DisplayErrorModel
+    calls = {"n": 0}
+
+    def flaky_model(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise np.linalg.LinAlgError("synthetic singular matrix")
+        return real_model(*args, **kwargs)
+
+    monkeypatch.setattr(O, "DisplayErrorModel", flaky_model)
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=9, threshold=0.05, max_outer=4,
+                                                 adaptive_sampling=False, neutral_band=0.0))
+    assert calls["n"] >= 2                      # the second build really was attempted
+    assert result.iterations == 1               # only the first build produced a snapshot
+    assert result.cube.shape == (9, 9, 9, 3)    # ...and that cube is returned intact
+
+
+def test_unchanged_training_set_reuses_model_instead_of_rebuilding(monkeypatch):
+    # The force-full-validation path re-probes the SAME cube on the full set without folding
+    # new measurements or escalating the budget — the deterministic model/cube must be reused,
+    # not rebuilt (a rebuild re-pays the full k-fold CV for a bit-identical result).
+    import dlc.optimize as O
+    target = _sdr_target()
+    # Infeasible floor so focused passes stall (no improvement, no escalation headroom).
+    probe = synthetic_probe(target, gains=(1.0, 1.0, 0.88))
+    signals = _cube_signals(6)
+    measured = probe(signals)
+
+    real_model = O.DisplayErrorModel
+    calls = {"n": 0}
+
+    def counting_model(*args, **kwargs):
+        calls["n"] += 1
+        return real_model(*args, **kwargs)
+
+    monkeypatch.setattr(O, "DisplayErrorModel", counting_model)
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=9, threshold=2.0, max_outer=6,
+                                                 max_correction=0.25, auto_escalate=False,
+                                                 adaptive_sampling=True, adaptive_min_full=64,
+                                                 adaptive_initial_worst=24, adaptive_sentinels=16,
+                                                 adaptive_low_light_cap=16, neutral_band=0.0))
+    # At least one iteration ran on the cached model (a stalled focused pass followed by the
+    # forced full validation of the same training set).
+    assert calls["n"] < result.iterations
+    modes = [h.sampling_mode for h in result.history]
+    assert "full" in modes                     # the forced full validation really happened
+
+
 # ---------------------------------------------------------------------------
 # sample_cube
 # ---------------------------------------------------------------------------
@@ -270,6 +330,28 @@ def test_build_cube_neutral_band_pins_grey_axis():
     assert np.allclose(on[0, 0, j], off[0, 0, j], atol=1e-9)
 
 
+def test_build_cube_preserves_black_and_blends_near_black_to_identity():
+    # build_cube's dark-end invariants: the black node is EXACT [0,0,0] (never corrected),
+    # and nodes whose ideal luminance sits below near_black_nits are blended toward
+    # identity (the probe is unreliable there, so the model must not drive them).
+    from dlc.optimize import build_cube
+    from dlc.engine.model import DisplayErrorModel
+    target = _sdr_target()
+    probe = synthetic_probe(target, gains=(1.0, 1.05, 0.9))  # big error everywhere
+    signals = _cube_signals(6)
+    model = DisplayErrorModel(signals, probe(signals), target, smoothing=1e-3)
+    g = 17
+    lut = build_cube(model, g, signal_points=signals, max_correction=0.5,
+                     neutral_band=0.0, near_black_nits=0.1)
+    assert np.array_equal(lut[0, 0, 0], [0.0, 0.0, 0.0])
+    # the first off-black grey node (signal 1/16 ≈ 0.36 nit ideal at 120-nit γ2.2 is above
+    # the 0.1-nit knee, so use a coloured deep-shadow node under the knee instead:
+    # signal (1/16, 0, 0) has ideal luminance ≈ 0.05 nit < 0.1 ⇒ mostly identity.
+    axis = np.linspace(0.0, 1.0, g)
+    node = lut[0, 0, 1]  # input (1/16, 0, 0)
+    assert abs(node[0] - axis[1]) < 0.02 and abs(node[1]) < 0.02 and abs(node[2]) < 0.02
+
+
 def test_adaptive_sampling_starts_focused_then_forces_full_validation():
     target = _sdr_target()
     probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
@@ -410,8 +492,131 @@ def test_seed_budget_scales_with_measured_residual():
 
 
 # ---------------------------------------------------------------------------
+# gamut-aware (#C3) correction: clamped targets are corrected TO, not chased
+# ---------------------------------------------------------------------------
+
+def _sub_gamut_panel():
+    """A panel whose native primaries sit well inside the sRGB target — every
+    saturated target clips, so the reachable clamp is live everywhere it matters."""
+    import colour
+    srgb = colour.RGB_COLOURSPACES["sRGB"]
+    w = srgb.whitepoint
+    prim = {k: (np.asarray(p) * 0.72 + np.asarray(w) * 0.28).tolist()
+            for k, p in zip("RGB", srgb.primaries)}
+    native = colour.RGB_Colourspace("sub-gamut panel",
+                                    np.array([prim[c] for c in "RGB"]),
+                                    np.asarray(w), whitepoint_name="native")
+
+    def probe(signals: np.ndarray) -> np.ndarray:
+        s = np.clip(np.asarray(signals, dtype=float).reshape(-1, 3), 0.0, 1.0)
+        return np.maximum(colour.RGB_to_XYZ(s ** 2.2, native) * 120.0, 0.0)
+
+    return prim, probe
+
+
+def test_gamut_clamped_targets_are_corrected_not_worsened():
+    # Regression pin (Phase 5, F5-1): the error model must train its delta against the
+    # UNCLAMPED ideal even when reachable_primaries clamps the targets. With the delta
+    # trained against the clamped ideal, build_cube's inversion (raw xyz_to_signal) was
+    # inconsistent with it and the "correction" DESATURATED reachable boundary colours —
+    # a ~7 dE_ITP patch came back at ~29 post-cube. The machine must drive the panel TO
+    # the clamped target, never away from it.
+    target = _sdr_target()
+    prim, probe = _sub_gamut_panel()
+    signals = _cube_signals(5)
+    measured = probe(signals)
+
+    space = TargetSpace(target, reachable_primaries=prim)
+    raw_de = de_itp(space.xyz_to_ictcp(measured) - space.ideal_ictcp(signals))
+
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4,
+                                                 max_correction_cap=0.5),
+                           reachable_primaries=prim)
+
+    # The machine corrects the clamped-target error field, hard: the raw panel is tens of
+    # dE off its reachable targets, the corrected one lands in the low single digits.
+    assert result.digest["best_mean_de"] < 0.25 * float(raw_de.mean())
+    assert result.digest["best_max_de"] < 0.5 * float(raw_de.max())
+
+    # And the boundary patch the bug used to WORSEN specifically improves.
+    idx = int(np.argmax(np.all(np.isclose(signals, [1.0, 0.0, 0.25]), axis=1)))
+    driven = sample_cube(result.cube, signals[idx:idx + 1])
+    post = de_itp(space.xyz_to_ictcp(np.maximum(probe(driven), 0.0))
+                  - space.ideal_ictcp(signals[idx:idx + 1]))
+    assert float(post[0]) < float(raw_de[idx])
+
+
+def test_unreachable_targets_without_clamp_surface_as_floors():
+    # The honesty contract on the same sub-gamut panel WITHOUT reachable_primaries:
+    # the machine chases the unreachable pure targets into the signal rails and must
+    # report physical floors (never budget limits once escalation is done) — the
+    # adversarial "pure gamut floor" case from the Phase 5 brief.
+    target = _sdr_target()
+    prim, probe = _sub_gamut_panel()
+    signals = _cube_signals(5)
+    measured = probe(signals)
+
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=6,
+                                                 max_correction_cap=0.5))
+    assert result.converged is False
+    assert result.needs_adjudication is True
+    assert result.digest["physical_floor"] > 0
+    assert result.digest["budget_limited"] == 0   # a gamut floor is never sold as a budget cap
+    assert result.question is not None and "physical floor" in result.question
+
+
+# ---------------------------------------------------------------------------
 # cube output
 # ---------------------------------------------------------------------------
+
+def test_cube_indexing_convention_is_r_fastest_everywhere(tmp_path: Path):
+    # ONE cross-pin for the `.cube` ordering convention (Phase 5): the standard IRIDAS
+    # order is R-fastest, and four independent code paths each hard-code it —
+    # lut_rbf.write_cube / identity_cube, lut_integrity.parse_cube (flat index
+    # b·s²+g·s+r), simulation.write_identity_cube, and optimize.sample_cube (cube
+    # indexed [b,g,r], sampled at signals[:, [2,1,0]]). An R↔B transposition in any
+    # one of them silently swaps red and blue; this test fails instead.
+    from dlc.engine.lut_rbf import identity_cube, write_cube
+    from dlc.lut_integrity import parse_cube
+    from dlc.simulation import write_identity_cube
+
+    size = 5
+    # An ASYMMETRIC cube: identity with the red output warped (r²) — any axis
+    # transposition breaks equality, unlike a pure identity.
+    cube = identity_cube(size)
+    cube[..., 0] = cube[..., 0] ** 2
+
+    path = tmp_path / "warped.cube"
+    write_cube(cube, str(path))
+    parsed = parse_cube(path)
+    assert parsed.size == size and not parsed.parse_errors
+    ax = np.linspace(0.0, 1.0, size)
+    for b in (0, 2, 4):
+        for g in (0, 1, 3):
+            for r in (0, 3, 4):
+                flat = parsed.values[(b * size * size) + (g * size) + r]
+                assert np.allclose(flat, [ax[r] ** 2, ax[g], ax[b]], atol=1e-6), \
+                    f"write_cube/parse_cube disagree at (r={r}, g={g}, b={b})"
+
+    # simulation.write_identity_cube must agree with lut_rbf.identity_cube node-for-node.
+    id_path = tmp_path / "id.cube"
+    write_identity_cube(id_path, size=size)
+    parsed_id = parse_cube(id_path)
+    ident = identity_cube(size)
+    for i, val in enumerate(parsed_id.values):
+        b, rem = divmod(i, size * size)
+        g, r = divmod(rem, size)
+        assert np.allclose(val, ident[b, g, r], atol=1e-7)
+
+    # sample_cube must read the warped cube back with the same convention: a pure red
+    # input returns (r², 0, 0) — an R↔B swap would return (0, 0, r²) instead.
+    out = sample_cube(cube, np.array([[1.0, 0.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.5]]))
+    assert np.allclose(out[0], [1.0, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(out[1], [0.25, 0.0, 0.0], atol=1e-6)
+    assert np.allclose(out[2], [0.0, 0.0, 0.5], atol=1e-6)
+
 
 def test_result_writes_a_parseable_cube(tmp_path: Path):
     target = _sdr_target()

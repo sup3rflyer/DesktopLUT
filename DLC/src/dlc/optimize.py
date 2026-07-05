@@ -502,74 +502,92 @@ def optimize_cube(
     best_seen_max: Optional[float] = None  # best worst-case dE so far (noise-robust stop)
     converged = False
     force_full_probe = False
+    # Model/cube build cache. The build is deterministic in (training set, budget) — auto_smooth
+    # uses a fixed CV seed — so when an iteration neither folded new measurements nor escalated
+    # the budget (the focused-pass → force-full-validation path), rebuilding would recompute the
+    # IDENTICAL model and cube while re-paying the full k-fold CV (~10-40 s CPU at real fold-back
+    # sizes). Reuse instead; behaviour is bit-identical.
+    train_version = 0
+    built_key: Optional[tuple[int, float]] = None
+    model: Any = None
+    cube: Any = None
+    physical_info = None
+    constrained_info = None
+
+    def _build_model_and_cube() -> tuple[Any, np.ndarray, Any, Any]:
+        if cfg.engine == "physical":
+            # Physical candidate: clamp the target to the measured native gamut in ALL modes
+            # and solve nodes directly against signal->XYZ.
+            model = StructuredForwardModel(
+                train_signals, train_xyz, target, reachable_primaries=reachable_primaries)
+            cube, physical_info = build_physical_cube(
+                model, cfg.grid_size, signal_points=train_signals,
+                metric=cfg.physical_metric, max_correction=budget,
+                fade_width=cfg.fade_width,
+                uncertainty_radius=cfg.physical_uncertainty_radius,
+                hue_tolerance_degrees=cfg.physical_hue_tolerance_degrees,
+                purity_slack=cfg.physical_purity_slack,
+                neutral_band=cfg.neutral_band,
+                allow_neutral_refinement=cfg.allow_neutral_refinement,
+            )
+            return model, cube, physical_info, None
+        if cfg.engine == "constrained-rbf":
+            model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
+                                      reachable_primaries=reachable_primaries,
+                                      sample_confidence=(train_confidence
+                                                         if cfg.confidence_weighted_rbf else None))
+            cube, constrained_info = build_constrained_rbf_cube(
+                model, cfg.grid_size, signal_points=train_signals,
+                reachable_primaries=reachable_primaries,
+                metric=cfg.constrained_metric, max_correction=budget,
+                fade_width=cfg.fade_width,
+                n_iterations=cfg.n_inner_iterations,
+                near_black_nits=cfg.near_black_nits,
+                neutral_band=cfg.neutral_band,
+                hue_tolerance_degrees=cfg.constrained_hue_tolerance_degrees,
+                purity_slack=cfg.constrained_purity_slack,
+                shell_saturation=cfg.constrained_shell_saturation,
+                shell_pressure=cfg.constrained_shell_pressure,
+                screen_error_threshold=cfg.constrained_screen_error_threshold,
+                off_channel_guard_pressure=cfg.constrained_off_channel_guard_pressure,
+                gamut_blend_strength=cfg.constrained_gamut_blend_strength,
+                maxiter=cfg.constrained_maxiter,
+                n_jobs=cfg.constrained_n_jobs,
+                chunk_size=cfg.constrained_chunk_size,
+            )
+            return model, cube, None, constrained_info
+        model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
+                                  reachable_primaries=reachable_primaries,
+                                  sample_confidence=(train_confidence
+                                                     if cfg.confidence_weighted_rbf else None))
+        cube = build_cube(
+            model, cfg.grid_size, signal_points=train_signals,
+            fade_width=cfg.fade_width, max_correction=budget,
+            n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
+            neutral_band=cfg.neutral_band,
+        )
+        return model, cube, None, None
 
     for it in range(1, cfg.max_outer + 1):
-        physical_info = None
-        constrained_info = None
-        try:
-            if cfg.engine == "physical":
-                # Physical candidate: clamp the target to the measured native gamut in ALL modes
-                # and solve nodes directly against signal->XYZ.
-                model = StructuredForwardModel(
-                    train_signals, train_xyz, target, reachable_primaries=reachable_primaries)
-                cube, physical_info = build_physical_cube(
-                    model, cfg.grid_size, signal_points=train_signals,
-                    metric=cfg.physical_metric, max_correction=budget,
-                    fade_width=cfg.fade_width,
-                    uncertainty_radius=cfg.physical_uncertainty_radius,
-                    hue_tolerance_degrees=cfg.physical_hue_tolerance_degrees,
-                    purity_slack=cfg.physical_purity_slack,
-                    neutral_band=cfg.neutral_band,
-                    allow_neutral_refinement=cfg.allow_neutral_refinement,
-                )
-            elif cfg.engine == "constrained-rbf":
-                model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
-                                          reachable_primaries=reachable_primaries,
-                                          sample_confidence=(train_confidence
-                                                             if cfg.confidence_weighted_rbf else None))
-                cube, constrained_info = build_constrained_rbf_cube(
-                    model, cfg.grid_size, signal_points=train_signals,
-                    reachable_primaries=reachable_primaries,
-                    metric=cfg.constrained_metric, max_correction=budget,
-                    fade_width=cfg.fade_width,
-                    n_iterations=cfg.n_inner_iterations,
-                    near_black_nits=cfg.near_black_nits,
-                    neutral_band=cfg.neutral_band,
-                    hue_tolerance_degrees=cfg.constrained_hue_tolerance_degrees,
-                    purity_slack=cfg.constrained_purity_slack,
-                    shell_saturation=cfg.constrained_shell_saturation,
-                    shell_pressure=cfg.constrained_shell_pressure,
-                    screen_error_threshold=cfg.constrained_screen_error_threshold,
-                    off_channel_guard_pressure=cfg.constrained_off_channel_guard_pressure,
-                    gamut_blend_strength=cfg.constrained_gamut_blend_strength,
-                    maxiter=cfg.constrained_maxiter,
-                    n_jobs=cfg.constrained_n_jobs,
-                    chunk_size=cfg.constrained_chunk_size,
-                )
-            else:
-                model = DisplayErrorModel(train_signals, train_xyz, target, smoothing=cfg.smoothing,
-                                          reachable_primaries=reachable_primaries,
-                                          sample_confidence=(train_confidence
-                                                             if cfg.confidence_weighted_rbf else None))
-                cube = build_cube(
-                    model, cfg.grid_size, signal_points=train_signals,
-                    fade_width=cfg.fade_width, max_correction=budget,
-                    n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
-                    neutral_band=cfg.neutral_band,
-                )
-        except np.linalg.LinAlgError as exc:
-            if snapshots:
-                # A later iteration went singular — typically the fold-back stacked duplicate
-                # or collinear driven points onto the training set. Keep the best cube built so
-                # far rather than crashing; the loop's job is done.
-                break
-            # First build failed: there is no usable model at all. Convert the raw numpy error
-            # into a typed, actionable signal for the orchestrator (re-measure with more variation).
-            raise DegenerateMeasurements(
-                f"the {len(train_signals)} profiling measurement(s) cannot build an RBF "
-                f"correction model (singular interpolation matrix: {exc}). The patch set is "
-                f"degenerate — duplicate or collinear signals. Re-measure with more signal "
-                f"variation (a fuller volumetric/ramp set), then retry.") from exc
+        if built_key != (train_version, budget):
+            # (An unchanged key means neither the training set nor the budget moved — the
+            # force-full-validation path — and the previous model/cube are exact; skip.)
+            try:
+                model, cube, physical_info, constrained_info = _build_model_and_cube()
+            except np.linalg.LinAlgError as exc:
+                if snapshots:
+                    # A later iteration went singular — typically the fold-back stacked duplicate
+                    # or collinear driven points onto the training set. Keep the best cube built so
+                    # far rather than crashing; the loop's job is done.
+                    break
+                # First build failed: there is no usable model at all. Convert the raw numpy error
+                # into a typed, actionable signal for the orchestrator (re-measure with more variation).
+                raise DegenerateMeasurements(
+                    f"the {len(train_signals)} profiling measurement(s) cannot build an RBF "
+                    f"correction model (singular interpolation matrix: {exc}). The patch set is "
+                    f"degenerate — duplicate or collinear signals. Re-measure with more signal "
+                    f"variation (a fuller volumetric/ramp set), then retry.") from exc
+            built_key = (train_version, budget)
         probe_idx, sampling_mode = _adaptive_probe_indices(
             verify, score_hint, iteration=it, cfg=cfg, force_full=force_full_probe)
         force_full_probe = False
@@ -675,9 +693,17 @@ def optimize_cube(
         train_confidence = np.concatenate([train_confidence, np.ones(len(driven), dtype=float)])
         train_signals, train_xyz, train_confidence = aggregate_training_samples(
             train_signals, train_xyz, train_confidence)
+        train_version += 1
 
     # Pick the cube to return: prefer monotonic, then lowest worst-case dE — using
     # the cached measurements (no extra probing).
+    # §0 note (Phase 5 audit): worst-case-first selection was evaluated for core-vs-corner
+    # trading on synthetic corner-floor/noisy panels — the snapshots' PRACTICAL-CORE spread
+    # (neutral+near-neutral band) measured ≤0.3 dE_ITP, because the neutral fade pins the
+    # diagonal, all snapshots share one progressively-refined model, and full-validation
+    # snapshots are preferred. Sub-JND mean-dE differences between tied snapshots are the
+    # residual exposure; a practically-weighted rank (if ever wanted) must reuse Phase 6's
+    # core/frontier zone definitions, not invent its own.
     def _rank(s: dict[str, Any]) -> tuple[int, float]:
         return (0 if s["monotonic"] else 1, float(s["de"].max()))
     full_snapshots = [s for s in snapshots if s["full"]]
