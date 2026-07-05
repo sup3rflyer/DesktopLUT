@@ -54,7 +54,7 @@ from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, 
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
 from .liveness import Liveness
-from .metrics import delta_e2000, xyz_to_lab
+from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 
 __all__ = [
     "MeasurePatch",
@@ -2293,12 +2293,9 @@ def make_persistent_spotread_meter(
 # ---------------------------------------------------------------------------
 
 # sRGB (Rec.709) primaries → XYZ at D65, white Y normalized to 1.0. Multiplying
-# by white_nits gives an absolute white at signal (1,1,1).
-_SRGB_TO_XYZ_D65 = (
-    (0.4124564, 0.3575761, 0.1804375),
-    (0.2126729, 0.7151522, 0.0721750),
-    (0.0193339, 0.1191920, 0.9503041),
-)
+# by white_nits gives an absolute white at signal (1,1,1). One canonical copy
+# (Phase 1 audit): metrics.py owns the literal.
+_SRGB_TO_XYZ_D65 = SRGB_TO_XYZ_D65
 
 # Rec.2020 primaries → XYZ at D65, white Y normalized to 1.0 (canonical NPM; matches
 # colour's ITU-R BT.2020 to ~1e-7). The HDR synthetic panel emits through these — the
