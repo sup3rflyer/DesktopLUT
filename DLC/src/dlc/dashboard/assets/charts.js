@@ -54,10 +54,17 @@
 
   // JND colour class for a ΔE value (same bands as the readout cards: <1 ok, <3 warn, ≥3 bad)
   const deCls = (v) => v == null ? "" : (Math.abs(v) < 1 ? "ch-de-ok" : (Math.abs(v) < 3 ? "ch-de-warn" : "ch-de-bad"));
-  // A near-black point's honest hover: CCT/Duv is noise there, but "can you see the tint?"
-  // has an answer — the ΔE vs the neutral target (which correctly down-weights chroma near black).
-  const dimHov = (de) => de == null ? "near-black &lt;1 nit — CCT unreliable"
-    : `near-black — ΔE ${fmt(de, 2)} vs neutral (${de < 1 ? "tint not visible" : de < 3 ? "borderline" : "visible tint"})`;
+  // A near-black point's honest hover ROWS (structured "\t" label/value — the tooltip renders
+  // them as a compact tile, never one overflowing line): CCT/Duv is noise there, but "can you
+  // see the tint?" has an answer — the ΔE vs the neutral target. Content passes through esc(),
+  // so plain "<1" here (a literal entity would double-escape and display as "&lt;1").
+  const dimRows = (p) => {
+    const rows = [];
+    if (p.Y != null) rows.push(`Y\t${fmt(p.Y, 3)} nit`);
+    rows.push(p.de == null ? "near-black\t<1 nit — CCT unreliable"
+      : `ΔE vs neutral\t${fmt(p.de, 2)} · ${p.de < 1 ? "tint not visible" : p.de < 3 ? "borderline" : "visible tint"}`);
+    return rows;
+  };
   // Norm corridor: the shaded "normal" band. The scale is never allowed tighter than the band,
   // so a trace inside the corridor reads as healthy at ANY zoom; when data escapes it the caller
   // shows an explicit alert tag — autoscale can stretch, but never silently.
@@ -223,13 +230,22 @@
         P.add(whisker(P, p.signal, p.cct_lo, p.cct_hi));
     });
     P.pathLine(bright.map((p) => [p.signal, p.cct]), "ch-line");
-    bright.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K${p.n > 1 ? ` | median of ${p.n} (${Math.round(p.cct_lo)}–${Math.round(p.cct_hi)}K)` : ""}${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`));
+    bright.forEach((p) => {
+      const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
+                    `CCT\t${Math.round(p.cct)} K`];
+      if (p.n > 1) rows.push(`median of ${p.n}\t${Math.round(p.cct_lo)}–${Math.round(p.cct_hi)} K`);
+      if (p.carried) rows.push("status\tawaiting re-measure");
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
+    });
     const cctCarried = bright.filter((p) => p.carried).length;
     if (cctCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${cctCarried} from previous stage</text>`);
     dim.forEach((p) => {
       const off = p.cct < lo || p.cct > hi;
       const cy = P.py(Math.max(lo, Math.min(hi, p.cct)));
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim ${deCls(p.de)}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K | ${dimHov(p.de)}${off ? " · off-scale" : ""}`)}</circle>`);
+      const rows = [`signal ${fmt(p.signal, 3)} · near-black`,
+                    `CCT\t${Math.round(p.cct)} K (noise)${off ? " · off-scale" : ""}`,
+                    ...dimRows(p)];
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim ${deCls(p.de)}${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
     });
     if (dim.length) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${dim.length} near-black · dot colour = ΔE visibility</text>`);
     return P.svg();
@@ -270,14 +286,22 @@
     bright.forEach((p) => {
       const dev = p.duv - t0;                          // cast vs the TARGET, not vs the locus
       const cls = dev > 0.0002 ? "ch-dot-green" : (dev < -0.0002 ? "ch-dot-magenta" : "ch-dot");
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${fmtSignedDuv(dev)} vs target (${dev > 0.0002 ? "greener" : dev < -0.0002 ? "more magenta" : "on target"})${p.n > 1 ? ` | median of ${p.n}` : ""}${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`);
+      const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
+                    `Duv\t${fmt(p.duv, 5)}`,
+                    `vs target\t${fmtSignedDuv(dev)} · ${dev > 0.0002 ? "greener" : dev < -0.0002 ? "more magenta" : "on target"}`];
+      if (p.n > 1) rows.push(`median of\t${p.n} reads`);
+      if (p.carried) rows.push("status\tawaiting re-measure");
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
     });
     const duvCarried = bright.filter((p) => p.carried).length;
     if (duvCarried) P.add(`<text x="${fmt(P.W - P.m.r, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" text-anchor="end" class="ch-note">◌ ${duvCarried} from previous stage</text>`);
     dim.forEach((p) => {
       const off = Math.abs(p.duv) > span;
       const cy = P.py(Math.max(-span, Math.min(span, p.duv)));
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim ${deCls(p.de)}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${dimHov(p.de)}${off ? " · off-scale" : ""}`)}</circle>`);
+      const rows = [`signal ${fmt(p.signal, 3)} · near-black`,
+                    `Duv\t${fmt(p.duv, 5)} (noise)${off ? " · off-scale" : ""}`,
+                    ...dimRows(p)];
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim ${deCls(p.de)}${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
     });
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-lab-green">▲ green (+Duv)</text>`);
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.H - P.m.b - 5, 1)}" class="ch-lab-magenta">▼ magenta (−Duv)</text>`);
@@ -306,12 +330,21 @@
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
     const clamp = (v) => Math.max(-span, Math.min(span, v));
     series.forEach(([k, cls]) => P.pathLine(bright.map((p) => [p.signal, p[k]]), cls));
-    series.forEach(([k, cls, lab]) => bright.forEach((p) =>
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | target 0${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`)));
+    series.forEach(([k, cls, lab]) => bright.forEach((p) => {
+      const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
+                    `${lab}\t${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% · target 0%`];
+      if (p.n > 1) rows.push(`median of\t${p.n} reads`);
+      if (p.carried) rows.push("status\tawaiting re-measure");
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
+    }));
     const balCarried = bright.filter((p) => p.carried).length;
     if (balCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${balCarried} from previous stage</text>`);
-    series.forEach(([k, , lab]) => dim.forEach((p) =>
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(clamp(p[k])), 1)}" r="1.6" class="ch-dot-dim">${hov(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | near-black &lt;1 nit — noisy${Math.abs(p[k]) > span ? " · off-scale" : ""}`)}</circle>`)));
+    series.forEach(([k, , lab]) => dim.forEach((p) => {
+      const rows = [`signal ${fmt(p.signal, 3)} · near-black`,
+                    `${lab}\t${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% (noise)${Math.abs(p[k]) > span ? " · off-scale" : ""}`,
+                    ...dimRows(p)];
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(clamp(p[k])), 1)}" r="1.6" class="ch-dot-dim">${hov(rows.join("\n"))}</circle>`);
+    }));
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R / G / B balance · target 0%</text>`);
     if (dim.length) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${dim.length} near-black faded</text>`);
     return P.svg();

@@ -101,6 +101,39 @@ function etaText(s, dt) {
     return `iter ${s.optimizer.iteration}`;
   return "—";
 }
+/* ── phase spotlight ──────────────────────────────────────────────
+ * The in-between stages get a narrative + the one chart that answers them: during warm-up the
+ * Channel Drift tile is promoted (double width) and the strip carries the SETTLING VERDICT the
+ * server fits from the drift checkpoints — "blue still climbing +0.8%/10 min" beats eyeballing
+ * a flat-ish line. Preflight gets a calm narrative line. */
+function applySpotlightUi(s) {
+  const el = $("charts-spot");
+  const holder = document.querySelector('#charts [data-chart="drift"]');
+  const driftFig = holder && holder.closest(".chart");
+  const w = s.warmup || {};
+  const st = s.run_status || "idle";
+  let text = "", cls = "";
+  if (w.active) {
+    if (w.settled === true) {
+      text = `warm-up · panel settled — drift ${Math.abs(w.slope_pct_per_10min).toFixed(2)}%/10 min over ${w.window_min} min`;
+      cls = "ok";
+    } else if (w.settled === false) {
+      const ch = { r: "red", g: "green", b: "blue" }[w.channel] || w.channel;
+      text = `warm-up · ${ch} still ${w.slope_pct_per_10min > 0 ? "climbing" : "falling"} ${fmtSignedFixed(w.slope_pct_per_10min, 2)}%/10 min — not settled`;
+      cls = "warn";
+    } else {
+      text = "warm-up · conditioning the panel…";
+    }
+  } else if (st === "running" && s.stage === "preflight") {
+    text = "preflight · checking display, meter and mode…";
+  }
+  el.hidden = !text;
+  el.textContent = text;
+  el.classList.toggle("spot-ok", cls === "ok");
+  el.classList.toggle("spot-warn", cls === "warn");
+  if (driftFig) driftFig.classList.toggle("spotlight", !!w.active);
+}
+
 // What remains AFTER the current stage, from the run's stage plan — so "ETA · stage" can never
 // be mistaken for "ETA · run".
 function afterStageText(s) {
@@ -369,6 +402,9 @@ function renderState(s) {
 
   // live patch — the last measured patch + a swatch; CCT/Duv only when it's a grayscale patch.
   renderLivePatch(s.last_read || {}, h);
+
+  // phase spotlight (warm-up settling verdict / preflight narrative + drift-tile promotion)
+  applySpotlightUi(s);
 
   // attention flags
   flag("flag-stall", s.stall, (d) => d.message || d.via || "tripped", true);

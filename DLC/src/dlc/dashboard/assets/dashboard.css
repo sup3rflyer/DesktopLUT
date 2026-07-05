@@ -201,6 +201,19 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .charts-meta .cm-cont { color: var(--ink-dim); font-family: var(--mono); font-size: 11px;
   padding: 1px 7px; border: 1px solid var(--edge); border-radius: 9px; }
 .charts-meta .cm-cont[hidden] { display: none; }
+/* phase spotlight strip: warm-up settling verdict / preflight narrative */
+.charts-meta .cm-spot { color: var(--ink-dim); font-family: var(--mono); font-size: 11px;
+  padding: 1px 8px; border: 1px solid var(--edge); border-radius: 9px; }
+.charts-meta .cm-spot[hidden] { display: none; }
+.charts-meta .cm-spot.spot-warn { color: var(--warn); border-color: var(--warn); }
+.charts-meta .cm-spot.spot-ok { color: var(--good); border-color: #1f5c33; }
+/* the spotlighted tile (Channel Drift during warm-up): double width so the phase's one
+   relevant chart is unmissable; falls back to normal width on a single-column layout */
+@media (min-width: 720px) {
+  .chart.spotlight { grid-column: span 2; }
+}
+.chart.spotlight { border-color: var(--accent); }
+.chart.spotlight figcaption::after { content: " · phase spotlight"; color: var(--accent); }
 .charts-meta .cm-toggle { margin-left: auto; display: flex; align-items: center; gap: 5px;
   color: var(--ink-dim); font-size: 11px; cursor: pointer; }
 /* a tile currently showing the LIVE BUILD PREVIEW (probe reads, not the final result) */

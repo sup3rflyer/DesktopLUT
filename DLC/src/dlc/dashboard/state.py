@@ -55,6 +55,10 @@ _GRAY_SAMPLES = 9
 # "Core" content zone reference white for HDR (BT.2408 diffuse/graphics white). ~99% of graded
 # content lives at or below this and within Rec.709 — the practical-priority ΔE split headline.
 _HDR_REF_WHITE_NITS = 203.0
+# Warm-up settling: the panel counts as settled when its fastest-moving channel drifts less than
+# this (percent per 10 minutes) over the trailing window of drift checkpoints.
+_SETTLE_SLOPE_PCT_PER_10MIN = 0.15
+_SETTLE_WINDOW_S = 600.0
 
 
 def _sig_hex(sig) -> str:
@@ -1199,6 +1203,36 @@ class DashboardState:
                 "progress_age_s": round(prog_age, 1) if prog_age is not None else None,
                 "last_event_iso": self.last_event_iso, "last_read_iso": self.last_read_iso}
 
+    def _warmup_view(self) -> dict[str, Any]:
+        """The warm-up SETTLING VERDICT for the phase spotlight: is the panel still moving, and
+        how fast? Fits the trailing window of drift checkpoints (the fixed re-read neutral) and
+        reports the fastest-moving channel's slope in %/10 min — so the dashboard can say
+        "blue still climbing +0.8%/10 min" or "settled" instead of leaving the operator to
+        eyeball a flat-ish line. ``active`` (the spotlight trigger) is True while warm-up
+        conditioning reads are the run's latest activity."""
+        active = (self.run_status == RUN_RUNNING
+                  and (self.last_read or {}).get("role") == "warmup")
+        hdr = _is_hdr_header(self.header)
+        white = (self.header.get("white") or {}).get("xy")
+        drift = self._channel_drift(hdr, white)
+        if len(drift) < 2:
+            return {"active": active, "settled": None}
+        t1 = drift[-1]["elapsed_s"]
+        window = [p for p in drift if p["elapsed_s"] >= t1 - _SETTLE_WINDOW_S]
+        if len(window) < 2:
+            window = drift[-2:]
+        dt_min = (window[-1]["elapsed_s"] - window[0]["elapsed_s"]) / 60.0
+        if dt_min <= 0:
+            return {"active": active, "settled": None}
+        slopes = {c: (window[-1][c] - window[0][c]) / dt_min * 10.0 for c in ("r", "g", "b")}
+        worst = max(slopes, key=lambda c: abs(slopes[c]))
+        return {"active": active,
+                "settled": abs(slopes[worst]) < _SETTLE_SLOPE_PCT_PER_10MIN,
+                "channel": worst,
+                "slope_pct_per_10min": round(slopes[worst], 2),
+                "window_min": round(dt_min, 1),
+                "checkpoints": len(window)}
+
     def _pipeline_view(self) -> dict[str, Any]:
         """The pipeline stepper payload: the planned ordered stages, each tagged done / current /
         upcoming, plus 'stage K of N'. ``done`` = a planned stage already entered that isn't the
@@ -1269,6 +1303,7 @@ class DashboardState:
             "stage": self.stage,
             "run_status": self.run_status,
             "pipeline": self._pipeline_view(),
+            "warmup": self._warmup_view(),
             "events_seen": self.events_seen,
             "counters": {
                 "patches_done": self.patches_done,

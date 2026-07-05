@@ -302,6 +302,34 @@ def test_channel_drift_tracks_per_channel_warmup():
     assert cd[-1]["b"] > cd[-1]["r"] and cd[-1]["b"] > 0  # blue drifted up the most → the warming channel
 
 
+def test_warmup_settling_verdict():
+    """The phase spotlight's verdict: while warm-up reads are the latest activity the view is
+    ``active``; a fast-moving channel reads not-settled with its slope in %/10 min; once the
+    checkpoints flatten (and measurement takes over) it flips to settled and inactive."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:raw"))
+    # blue climbing hard across three warm-up checkpoints (2 min span)
+    for i, (xy, Y) in enumerate([([0.3127, 0.3290], 100.0), ([0.3112, 0.3276], 101.0),
+                                 ([0.3098, 0.3262], 102.0)]):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i * 60), stage="measure:raw",
+                      tier="stream", role="warmup", label="warm", rgb=[255, 255, 255],
+                      signal=[1.0, 1.0, 1.0], Y=Y, xy=xy, ok=True))
+    w = st.snapshot(T0 + timedelta(seconds=130))["warmup"]
+    assert w["active"] is True
+    assert w["settled"] is False and w["channel"] == "b" and w["slope_pct_per_10min"] > 0
+    # much later, two flat checkpoints → settled; a measurement read ends the warm-up spotlight
+    for at in (1200, 1500):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=at), stage="measure:raw",
+                      tier="stream", role="neutral_ref", disposition="drift_ref", label="ref",
+                      rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0], Y=102.1,
+                      xy=[0.3098, 0.3262], ok=True))
+    w2 = st.snapshot(T0 + timedelta(seconds=1510))["warmup"]
+    assert w2["active"] is False                       # latest read is no longer warm-up
+    assert w2["settled"] is True and abs(w2["slope_pct_per_10min"]) < 0.15
+
+
 def test_pipeline_stepper_tracks_done_current_upcoming():
     """The run_header carries the planned stage list; the snapshot's pipeline marks each step
     done / current / upcoming with 'stage K of N' so the stepper can show the whole flow."""
