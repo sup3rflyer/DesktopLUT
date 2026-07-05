@@ -2935,49 +2935,101 @@ def _gswb_controller():
     return ctrl
 
 
-def test_grayscale_wb_commit_happens_after_the_verify_gate(tmp_path: Path):
-    # The bake must wait for verify:accept — committing earlier erases the C++ side's saved
-    # pre-begin correctionGrayscale, making a later revert a silent no-op. The verify measure
-    # therefore sees the LIVE preview (the same light the bake produces).
+def test_grayscale_wb_bakes_in_stage_so_verify_scores_the_real_result(tmp_path: Path):
+    # Design B (fable Phase 7a, gs-wb adversarial finding 4): the bake happens at the END of the
+    # touch-up STAGE — BEFORE measure:verify — so verify scores the real baked ICC, not the live
+    # preview (which is only bit-identical to the bake on the SDR realization-A path; HDR differs).
     ctrl = _gswb_controller()
-    calib = _make(tmp_path, "gswb_commit_late", controller=ctrl)
+    calib = _make(tmp_path, "gswb_bake_in_stage", controller=ctrl)
     seen: dict = {}
     orig_commit = ctrl.grayscale_commit
 
     def commit(mon, mode):
-        seen["verify_done_at_commit"] = (
-            (calib.calib["stages"].get("verify") or {}).get("status") == "done")
-        seen["preview_live_at_commit"] = ctrl.state()["mhc"]["0:SDR"].get("gs_preview_active")
+        seen["verify_started"] = "measure:verify" in calib.calib["stages"]
+        seen["preview_live"] = ctrl.state()["mhc"]["0:SDR"].get("gs_preview_active")
         return orig_commit(mon, mode)
 
     ctrl.grayscale_commit = commit
     result = calib.run("grayscale-wb")
     assert result.status == "completed"
-    assert seen == {"verify_done_at_commit": True, "preview_live_at_commit": True}
+    # committed inside the touch-up stage, before verify measured, with the preview still live
+    assert seen == {"verify_started": False, "preview_live": True}
     mhc = ctrl.state()["mhc"]["0:SDR"]
     assert mhc.get("gs_committed") is True and mhc.get("gs_preview_active") is False
 
 
 def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path):
-    # verify:accept = revert → grayscale_cancel, which (per the C++ contract, now mirrored
-    # by the mock) restores the USER'S pre-begin correctionGrayscale — not bare identity,
-    # and nothing was ever baked because the commit waits for the gate.
+    # verify:accept = revert → _revert_inplace re-applies the DLC-owned pre-begin snapshot
+    # (set_correction_grayscale + apply_mhc), restoring the USER'S prior correctionGrayscale —
+    # NOT relying on the C++ grayscale_cancel (a no-op once the stage committed).
     ctrl = _gswb_controller()
     ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
                                   {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
                                   gamma=2.2)
     # The controller's SDR bridge resamples on the way in — the pre-existing correction, as
-    # DesktopLUT actually STORES it, is what cancel must bring back:
+    # DesktopLUT actually STORES it, is what revert must bring back:
     prior_stored = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     assert prior_stored["deviations"]["r"] != [1.0] * len(prior_stored["points"])  # non-identity
     calib = _make(tmp_path, "gswb_revert", controller=ctrl,
                   decision_overrides={"verify:accept": Decision("revert")})
     result = calib.run("grayscale-wb")
     assert result.status == "reverted"
+    # DLC snapshotted the prior correction before touching anything
+    assert calib.calib["grayscale_wb_prior"]["deviations"]["r"] == prior_stored["deviations"]["r"]
     mhc = ctrl.state()["mhc"]["0:SDR"]
-    assert not mhc.get("gs_committed")                       # never baked
     assert mhc.get("gs_preview_active") is False             # preview torn down
     assert mhc.get("correction_grayscale") == prior_stored   # pre-existing correction is back
+
+
+def test_grayscale_wb_revert_clears_when_no_prior_correction(tmp_path: Path):
+    # No pre-existing correction → revert clears the touch-up to identity (empty snapshot).
+    ctrl = _gswb_controller()
+    calib = _make(tmp_path, "gswb_revert_clear", controller=ctrl,
+                  decision_overrides={"verify:accept": Decision("revert")})
+    result = calib.run("grayscale-wb")
+    assert result.status == "reverted"
+    assert calib.calib["grayscale_wb_prior"] is None
+    devs = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["deviations"]
+    assert all(abs(v - 1.0) < 1e-9 for col in devs.values() for v in col)  # identity
+
+
+def test_grayscale_wb_bake_lost_after_restart_is_surfaced(tmp_path: Path):
+    # gs-wb adversarial finding 1: if the C++ live session is gone at commit (DesktopLUT
+    # restarted mid-run), grayscale_commit returns baked:false — DLC must surface it as a
+    # compromised seam, not log a bake that never happened.
+    ctrl = _gswb_controller()
+    orig_commit = ctrl.grayscale_commit
+
+    def commit_lost(mon, mode):
+        orig_commit(mon, mode)                       # tears down the (real) session
+        return {"monitor_mode": "0:SDR", "baked": False}   # simulate a lost session
+
+    ctrl.grayscale_commit = commit_lost
+    calib = _make(tmp_path, "gswb_bake_lost", controller=ctrl,
+                  adjudicator=SupervisedAdjudicator())
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("grayscale-wb")
+    assert exc.value.request.key == "grayscale-wb:bake-lost"
+    assert exc.value.request.digest.get("bake_lost") is True
+
+
+def test_calibration_exit_cleans_up_an_orphaned_gs_preview(tmp_path: Path):
+    # gs-wb adversarial finding 2 (mock fidelity): the C++ CleanupActiveGsLive runs on
+    # calibration.exit — an orphaned live preview (client died between begin and commit) is
+    # reverted to its pre-begin correction so it can't leak past the run.
+    ctrl = _gswb_controller()
+    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                  {"r": [1.0, 1.02, 0.98, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
+                                  gamma=2.2)
+    prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    ctrl.grayscale_live_begin(0, "SDR")
+    ctrl.grayscale_set_live(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                            {"r": [1.0, 1.5, 0.5, 1.0], "g": [1.0] * 4, "b": [1.0] * 4})  # mid-edit
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"] != prior
+    ctrl.exit_calibration(restore_snapshot=False)   # crash-cleanup path
+    st = ctrl.state()["mhc"]["0:SDR"]
+    assert st.get("gs_live_active") in (None, False) and st.get("gs_preview_active") is False
+    assert st["correction_grayscale"] == prior       # reverted to pre-begin
 
 
 def test_preflight_pipe_down_aborts_before_anything_happens(tmp_path: Path, monkeypatch):
@@ -3013,6 +3065,72 @@ def test_preflight_pipe_down_proceed_override_is_honoured(tmp_path: Path, monkey
     outcome = calib.stage_preflight()
     assert outcome.status == "done"
     assert calib.calib["decisions"]["preflight:pipe"]["choice"] == "proceed"
+
+
+def test_dead_pipe_preflight_is_not_memoised_and_reheals_on_resume(tmp_path: Path):
+    # Adversarial findings F7a-A1/A2: a dead-pipe preflight must NOT stay memoised, or a resume
+    # after the pipe is fixed would replay a stale pipe_ok:false digest (false re-pause) and never
+    # re-capture the durable backup. Run 1 (pipe down) pauses; run 2 (pipe up) re-runs preflight
+    # clean and captures the backup.
+    down = {"v": True}
+
+    class _Flaky(CalibrationController):
+        pass
+
+    ctrl = CalibrationController.mock()
+    real_state = ctrl.state
+
+    def flaky_state():
+        if down["v"]:
+            raise ConnectionError("pipe not armed")
+        return real_state()
+
+    ctrl.state = flaky_state
+    run_dir = tmp_path / "reheal"
+    ctx = create_run("SDR", display="reheal", run_dir=run_dir)
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
+
+    def build(adj):
+        return Calibration(ctx=open_run(run_dir), profile=profile, monitor=0, mode="SDR",
+                           controller=ctrl, measure=_perfect_panel(), adjudicator=adj,
+                           optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+
+    calib1 = build(MappingAdjudicator())
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib1.run("full")
+    assert exc.value.request.key == "preflight:pipe"
+    # the dead-pipe preflight was NOT left memoised
+    assert "preflight" not in calib1.calib["stages"]
+
+    # pipe comes back; resume proceeds — preflight re-runs fresh, no stale re-pause, backup captured.
+    # AutoAdjudicator completes the remaining (already-clean) seams; the pipe seam never fires.
+    down["v"] = False
+    calib2 = build(AutoAdjudicator())
+    result = calib2.run("full")
+    assert result.status == "completed"
+    assert "preflight:pipe" not in calib2.calib["decisions"]     # seam never fired (pipe healthy)
+    assert calib2.calib["stages"]["preflight"]["digest"]["pipe_ok"] is True
+    assert (calib2.calib.get("backup") or {}).get("captured") is True   # durable backup recovered
+
+
+def test_dead_pipe_backup_keeps_the_ini_copy(tmp_path: Path, monkeypatch):
+    # Adversarial finding F7a-A3: the INI copy needs only the filesystem, not the pipe, so a dead
+    # pipe must NOT discard it (the first honest-backup guard threw the good half away).
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text("[settings]\nfoo=1\n", encoding="utf-8")
+    profile = cp.Profile.synthetic(output_dir=str(tmp_path / "results"))
+    from dataclasses import replace as _replace
+    profile = _replace(profile, paths={**profile.paths, "desktoplut_ini": str(ini)})
+    ctrl = CalibrationController.mock()
+    monkeypatch.setattr(ctrl, "state", lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    ctx = create_run("SDR", display="inibak", run_dir=tmp_path / "inibak")
+    calib = Calibration(ctx=ctx, profile=profile, monitor=0, mode="SDR", controller=ctrl,
+                        measure=_perfect_panel(), adjudicator=AutoAdjudicator(),
+                        optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE)
+    rec = calib._capture_user_backup({"error": "ConnectionError: down"})
+    assert rec.get("ini_backup") and Path(rec["ini_backup"]).exists()   # ini half survived
+    assert rec.get("captured") is True and rec.get("partial") is True    # partial (no state JSON)
+    assert rec.get("path") is None
 
 
 def test_build_correction_is_exempt_from_the_pipe_gate(tmp_path: Path, monkeypatch):

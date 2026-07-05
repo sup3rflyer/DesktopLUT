@@ -9,6 +9,9 @@
 - **Post-phase:** `905 collected: 902 passed, 3 skipped` (+15 tests, all green).
 - **Post-addendum (owner review, same session — §7):** `910 collected: 907 passed,
   3 skipped` (+5 more).
+- **Post-adversarial-pass (four refuting agents, same session — §10):** further fixes
+  incl. a gs-wb REDESIGN (Design B), the pipe stale-memo/backup fixes, and the F7a-15
+  correction. **Final: `918 collected: 915 passed, 3 skipped`** (green).
 
 ## 1. Findings and fixes
 
@@ -28,7 +31,7 @@
 | F7a-12 | **A half-created run dir bricked both resume and re-create.** A crash between `create_run`'s root mkdir and the first manifest save leaves a dir `open_run` refuses (no manifest) and `create_run` cannot re-create (`mkdir(exist_ok=False)` raised) — an unresumable, unrecreatable run path. | Robustness | **Fixed**: `ensure_dirs` adopts manifest-less dirs (`exist_ok=True`); safe because every `create_run` caller checks for `manifest.json` first (a real run is never clobbered) and fresh names are microsecond-timestamped. Test: `test_create_run_adopts_a_half_created_run_dir`. |
 | F7a-13 | **A FAILED terminal rollback was silent.** `main()`'s finally prints `rolled_back` on success but `pass`ed on failure — the one teardown failure that can cost the user their display setup (run died half-applied AND the snapshot restore failed) exited mute. | Robustness (teardown) | **Fixed**: prints `rollback_failed` with the error, the durable backup pointer, and the manual-restore hint (`--abort --run <dir>`). |
 | F7a-14 | **`_on_optimize_iteration`'s silent except could dark the longest stage.** It wraps BOTH the optimizer convergence events and the timed check-in; a persistent failure silenced both for the entire (multi-hour) build with zero trace. | Robustness | **Fixed**: first failure logs its traceback to `workflow.log` (once — no per-iteration spam), then stays quiet. |
-| F7a-15 | **check-cube `monotonicity_violations_allowed=0` (Phase 6 verification-pass lead) — verified, KEPT.** The Phase 6 aside claimed realistic cubes carry near-black non-monotonic steps. Measured (six synthetic-panel configs — perfect / blue-deficient / ±noise / cold-drifting — through the real `optimize_cube` → `write` → `parse_cube`, 17³ and 33³): realistic cubes carry **zero** violations at the 1e-8 epsilon. Only a pathological combination (3 % read noise + severe unwarmed drift — a run the preheat/score-anomaly guards flag anyway) produced reversals: 32, shallow (median 0.12× grid pitch, max 0.63×), mid-range — NOT near-black. | Correctness (evidence over anecdote) | **No gate change** — zero-allowance stands on evidence; the Phase 6 aside is downgraded. Pinned so a smoothness regression (or a parser/indexing bug) trips a test: new `tests/test_lut_integrity.py` (realistic + noisy cubes pass defaults; a deep tear fails; the Phase 6 pitch-derived neighbour ceiling formula). Also the module's first dedicated test file (Phase 11 gap list shrinks by one). |
+| F7a-15 | **check-cube `monotonicity_violations_allowed=0` (Phase 6 lead) — first KEPT, then CORRECTED by the adversarial pass.** My initial experiment (six synthetic panels through the real optimizer, 17³/33³) found zero violations and I kept the zero-allowance gate. An adversarial agent falsified that with a stronger experiment: the **production** training set (`build_volumetric_set`, 1721 patches) on a **raised-black** SDR panel (0.15-nit blue-tinted leakage — a routine edge-lit LCD) at the **production default grid 33** deterministically produces 3 near-black monotonicity violations, all shallow (max 0.003 = **0.10× grid pitch**), flipping `integrity['ok']` to False. That matters: `decisions._3dlut_next_params` coarsens the grid + adds patches on an `ok:false`, so a legitimate raised-black cube would trigger a pointless rebuild. **My KEEP was wrong** (under-powered training set, no raised black). | Correctness (evidence corrected evidence) | **Fixed — principled depth tolerance.** `cube_axis_checks` now counts a backward step as a violation only if it is DEEPER than `default_monotonicity_epsilon(size) = 0.25/(size−1)` — a quarter of the identity grid step, ≈2.5× above the measured fit noise and ≈4× below a real tear (a transposed axis / corrupt write reverses by ~a full step). The zero-**count** default is unchanged and now means "zero STRUCTURAL reversals"; the raised-black cases report 0 and pass, a 0.5×-pitch tear still fails. Re-verified across all configs incl. the agent's exact S2/S3 repro. `tests/test_lut_integrity.py` extended (`test_monotonicity_epsilon_ignores_shallow_wiggles_but_not_tears`); the epsilon is surfaced in the integrity summary. |
 | F7a-16 | **Bit-depth fallback divergence (Phase 2 lead) — INTENTIONAL, documented.** `main()` defaults 10-bit HDR / 8-bit SDR; the `Calibration` ctor falls back to the panel's native depth. | Parity (disposition) | Depth is a property of the presenter TRANSPORT, not the panel: the CLI decides it where the presenter is built (composited 8-bit is the 3D-LUT-safe dogegen SDR default) and always passes the resolved value in; an in-process caller presents through its injected measure fn at the panel's own depth. The persisted run spec makes either choice sticky (`resolve_run_spec`), and a conflicting resume is surfaced, never silent. Rationale now recorded at the ctor. |
 
 ### Verified-correct (no change needed)
@@ -211,3 +214,70 @@ native). Tests: `test_preflight_pipe_down_aborts_before_anything_happens`,
   under `dlc_stages/` are advisory, but a truncated JSON there confuses the state
   tool; consider `atomic_write_text` in the hygiene pass. `test_lut_integrity.py`
   removes one entry from the no-dedicated-tests list.
+
+## 10. Adversarial verification pass (four refuting agents, same session)
+
+After the addendum the owner asked for an adversarial pass on the phase's changes. Four
+agents were tasked to REFUTE (not praise): (A) the gs-wb commit reordering, (B) the pipe
+seam + backup honesty, (C) the resume/memoisation fixes, (D) liveness/stepper/runs + the
+F7a-15 empirical claim. Results and the fixes that landed:
+
+### Clean (survived the attack, no change)
+- **(C) resume/memoisation** — all four (remeasure seed-pop, `replayed` gate,
+  score-anomaly persist, mode/target guard) survived. One crash-window and one
+  `--force` interaction traced explicitly safe; `spec.is_hdr ⇔ transfer=="pq"` confirmed
+  the only two transfer types (no HLG / SDR-in-HDR workflow the guard could forbid).
+- **(D) liveness `_pause` progress tick** — sound: `_pause` only runs on the main thread
+  between reads (no meter read in flight to mask), and a wedge inside the loop still trips
+  the watchdog one iteration later.
+- **(D) `_planned_stages` consumers** — no stepper "K of N" breakage (index is derived by
+  matching the live stage, no hardcoded length); re-emit-once-resolved confirmed.
+
+### Found and fixed
+- **F7a-15 CORRECTED (D):** my KEEP of the zero monotonicity allowance was falsified —
+  see the F7a-15 row above. Fixed with a principled pitch-derived depth tolerance.
+- **gs-wb REDESIGNED → Design B (A):** the agent confirmed my late-commit change created
+  a real regression — for **HDR** (and any SDR full-preview fallback) the live preview
+  provably differs from the bake (`types.h:611`; HDR never gets realization-A), so
+  `measure:verify` would score a preview, shipping an **unverified** deliverable — plus a
+  restart during the unbounded verify-gate pause silently lost the touch-up while DLC
+  ignored the C++ `baked` flag and reported "completed". **Design B** replaces the
+  late-commit: the touch-up is baked at the END of its stage (so verify scores the REAL
+  result, all modes), and revert is DLC-owned — the pre-begin `correctionGrayscale` is
+  snapshotted to `dlc_state.json` before the edit and `_revert_inplace` re-applies it
+  (`set_correction_grayscale` + `apply_mhc`), independent of the C++ `cancel`-after-commit
+  no-op and durable across a DesktopLUT restart. `grayscale_commit` now reads the `baked`
+  flag and escalates a lost bake. Mock fidelity raised to the verified C++ contract: the
+  `baked`/`canceled` response keys, the double-begin "already active" error, and
+  `CleanupActiveGsLive` on `calibration.exit`/`corrections.disable_all` (so the crash-
+  cleanup path is testable). Tests: `test_grayscale_wb_bakes_in_stage_so_verify_scores_the_real_result`,
+  `..._revert_restores_the_pre_existing_correction`, `..._revert_clears_when_no_prior_correction`,
+  `..._bake_lost_after_restart_is_surfaced`, `test_calibration_exit_cleans_up_an_orphaned_gs_preview`.
+- **pipe stale-memo + lost backup (B, the worst pipe finding):** a dead-pipe preflight
+  memoised `done` with `pipe_ok:false`; on the live pause path a resume after the operator
+  fixed the pipe replayed the stale digest (false re-pause) and never re-ran
+  `_capture_user_backup`, permanently losing the durable rollback for a run healthy from
+  enter-neutral on. **Fixed:** a `pipe_ok:false` preflight is not memoised — every
+  invocation re-probes the live pipe and re-attempts the backup until it succeeds. Test:
+  `test_dead_pipe_preflight_is_not_memoised_and_reheals_on_resume`.
+- **INI backup discarded on a dead pipe (B):** my first honest-backup guard early-returned
+  before the `DesktopLUT.ini` copy — but that copy needs only the filesystem, not the pipe.
+  **Fixed:** the ini is copied first, unconditionally; a dead pipe yields a `partial` backup
+  that still carries the ini. Test: `test_dead_pipe_backup_keeps_the_ini_copy`.
+- **pipe seam message + characterize (B):** the seam question named enter-neutral/install
+  (false for characterize, which clears-native + restores). **Fixed:** flow-accurate wording.
+- **spurious `rollback_failed` on a clean early-fail (B):** `main()`'s terminal rollback ran
+  `exit_calibration` over the dead pipe even when calibration was never entered. **Fixed:**
+  gated on `_entered_calibration()`/`inplace_baseline` (nothing entered ⇒ nothing to roll back).
+- **`create_run` foreign-dir scatter (D, low severity):** `exist_ok=True` removed the
+  emptiness guard, so `--run ~/some-folder` would scatter run files into it. **Fixed:**
+  `ensure_dirs` adopts only empty-or-scaffolding dirs; a populated foreign dir raises
+  `FileExistsError`. Test: `test_create_run_refuses_a_populated_foreign_directory`.
+
+### Accepted / noted (no code change)
+- **(A) crash cleanup reaches `CleanupActiveGsLive`** — confirmed OK (runs unconditionally
+  on `calibration.exit`); Design B further shrinks the exposure (commit is in-stage, not
+  across an unbounded pause). The lingering hard-kill-between-begin-and-commit corner is
+  covered by the C++ cleanup on the next `calibration.exit` (the CLI rollback finally).
+- **gs-wb finding 7 (preview leaks into `SaveSettings` during an unbounded pause)** —
+  eliminated by Design B (no unbounded live-preview window; commit is in-stage).

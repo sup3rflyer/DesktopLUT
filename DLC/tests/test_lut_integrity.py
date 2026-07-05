@@ -105,3 +105,42 @@ def test_neighbor_allowance_scales_with_grid_pitch():
     assert default_neighbor_delta_allowed(33) == pytest.approx(2.0 / 32 + 0.5)
     assert default_neighbor_delta_allowed(17) == pytest.approx(2.0 / 16 + 0.5)
     assert default_neighbor_delta_allowed(1) == 1.0
+
+
+def test_monotonicity_epsilon_ignores_shallow_wiggles_but_not_tears(tmp_path: Path):
+    # fable Phase 7a F7a-15 (corrected): a raised-black panel's near-black RBF fit wiggles a
+    # fraction of the grid step (measured ≤0.10x pitch); those are NOT structural tears and must
+    # not false-fail the zero-allowance gate into a pointless grid-coarsening rebuild. The depth
+    # tolerance is a quarter of the identity pitch — above the fit noise, below a real reversal.
+    from dlc.lut_integrity import default_monotonicity_epsilon
+    assert default_monotonicity_epsilon(33) == pytest.approx(0.25 / 32)
+    assert default_monotonicity_epsilon(17) == pytest.approx(0.25 / 16)
+
+    # A synthetic monotone cube with one SHALLOW backward step (0.1x pitch, below epsilon) passes;
+    # the same cube with a DEEP step (0.5x pitch, above epsilon) fails.
+    size = 17
+    pitch = 1.0 / (size - 1)
+
+    def ramp_cube(reversal_depth: float) -> Path:
+        vals = []
+        for b in range(size):
+            for g in range(size):
+                for r in range(size):
+                    vals.append((r / (size - 1), g / (size - 1), b / (size - 1)))
+        # dent one interior R node backward by reversal_depth (flat index r fastest)
+        i = (2 * size * size) + (2 * size) + 6
+        r0, g0, b0 = vals[i]
+        prev = vals[i - 1]
+        vals[i] = (prev[0] - reversal_depth, g0, b0)
+        lines = ["LUT_3D_SIZE 17"] + [f"{a:.6f} {b:.6f} {c:.6f}" for a, b, c in vals]
+        p = tmp_path / f"dent_{reversal_depth}.cube"
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return p
+
+    shallow = summarize_lut_integrity(cube=parse_cube(ramp_cube(0.10 * pitch)), phase="t",
+                                      iteration=1, integrity_path=tmp_path / "a.json")
+    assert shallow.monotonicity_violations == 0 and shallow.ok
+
+    deep = summarize_lut_integrity(cube=parse_cube(ramp_cube(0.50 * pitch)), phase="t",
+                                   iteration=1, integrity_path=tmp_path / "b.json")
+    assert deep.monotonicity_violations >= 1 and not deep.ok

@@ -1050,15 +1050,38 @@ class Calibration:
         The live rollback still uses DesktopLUT's in-memory snapshot; this file copy is the
         complete durable safety net. Captured once."""
         existing = self.calib.get("backup")
-        if existing and existing.get("captured"):
+        # partial=True marks an ini-only capture made while the pipe was dead — re-attemptable
+        # (only via the pre-mutation pipe-heal path in stage_preflight, which re-runs preflight
+        # fresh; a complete capture is final).
+        if existing and existing.get("captured") and not existing.get("partial"):
             return existing
         record: dict[str, Any] = {"captured": False}
+        # The complete settings file — the REAL durable backup — needs only the filesystem,
+        # never the pipe, so copy it FIRST, unconditionally (adversarial finding F7a-A3: the
+        # first honest-backup guard threw this good half away with the garbage state JSON).
+        ini_dest: Optional[str] = None
+        ini_src: Optional[str] = None
+        try:
+            ini = self._resolve_desktoplut_ini()
+            if ini is not None:
+                dest = self.ctx.root / "desktoplut_settings_backup.ini"
+                shutil.copy2(ini, dest)
+                ini_dest, ini_src = str(dest), str(ini)
+                self.ctx.log(f"backed up full DesktopLUT settings: {ini} → {dest.name}")
+            else:
+                self.ctx.log("DesktopLUT.ini not found — set paths.desktoplut_ini in the profile "
+                             "for a complete settings backup")
+        except Exception as exc:  # noqa: BLE001 - backup is best-effort, never blocks the run
+            self.ctx.log(f"could not copy the DesktopLUT.ini backup: {exc}")
         # A dead pipe yields state == {"error": ...} — writing THAT as the "backup" would
-        # record captured=True over garbage (fable Phase 7a). No state ⇒ nothing to back up;
-        # say so honestly (the pipe-down seam in preflight is the decision surface).
+        # record captured=True over garbage (fable Phase 7a). No state ⇒ no state JSON to
+        # back up; the ini half above still counts (the pipe-down seam is the decision surface).
         if not state or ("error" in state and "mhc" not in state and "runtime" not in state):
-            record = {"captured": False,
-                      "error": f"no DesktopLUT state to back up ({(state or {}).get('error', 'empty state')})"}
+            record = {"captured": bool(ini_dest), "partial": True,
+                      "ini_backup": ini_dest, "ini_source": ini_src, "path": None,
+                      "error": ("no DesktopLUT state JSON to back up "
+                                f"({(state or {}).get('error', 'empty state')})"
+                                + ("" if ini_dest else "; no DesktopLUT.ini configured either"))}
             self.calib["backup"] = record
             self._save()
             return record
@@ -1070,23 +1093,14 @@ class Calibration:
             atomic_write_text(path, json.dumps(state, indent=2))   # the durable pre-run safety net
             record = {"captured": True, "path": str(path),
                       "active_profile": active_profile,
-                      "had_mhc": bool(active_profile)}
-            # The complete settings file — the real durable backup.
-            ini = self._resolve_desktoplut_ini()
-            if ini is not None:
-                dest = self.ctx.root / "desktoplut_settings_backup.ini"
-                shutil.copy2(ini, dest)
-                record["ini_backup"] = str(dest)
-                record["ini_source"] = str(ini)
-                self.ctx.log(f"backed up full DesktopLUT settings: {ini} → {dest.name}")
-            else:
-                record["ini_backup"] = None
-                self.ctx.log("DesktopLUT.ini not found — set paths.desktoplut_ini in the profile "
-                             "for a complete settings backup (state.get JSON saved as a fallback)")
+                      "had_mhc": bool(active_profile),
+                      "ini_backup": ini_dest, "ini_source": ini_src}
             self.ctx.log(f"backed up user's DesktopLUT state → {path.name}"
                          + (f" (active MHC: {active_profile})" if active_profile else " (no MHC active)"))
         except Exception as exc:  # noqa: BLE001 - backup is best-effort, never blocks the run
-            record = {"captured": False, "error": f"{type(exc).__name__}: {exc}"}
+            record = {"captured": bool(ini_dest), "partial": bool(ini_dest),
+                      "ini_backup": ini_dest, "ini_source": ini_src,
+                      "error": f"{type(exc).__name__}: {exc}"}
             self.ctx.log(f"could not back up DesktopLUT state: {exc}")
         self.calib["backup"] = record
         self._save()
@@ -1145,17 +1159,21 @@ class Calibration:
         baseline = self.calib.get("inplace_baseline") or {}
         flow = self.calib.get("flow")
         if flow == "grayscale-wb":
-            # Live-edit revert = cancel the preview: the C++ side restores the PRE-BEGIN
-            # correctionGrayscale (savedCorrectionGs — the user's pre-existing correction, not
-            # bare identity) and regenerates the core ICM (matrix + base + 3D LUT untouched).
-            # Nothing is baked until _finish commits AFTER the verify gate (fable Phase 7a), so
-            # cancel here always has the live session to revert.
+            # Design B revert (fable Phase 7a): the touch-up was BAKED in its stage, so the C++
+            # live session is gone and grayscale_cancel would be a no-op. Re-apply the DLC-owned
+            # pre-begin snapshot instead (set_correction_grayscale + apply_mhc) — this restores
+            # the user's PRE-EXISTING correction (or clears to identity if there was none) and is
+            # robust across a DesktopLUT restart (the snapshot is in dlc_state.json). Also cancel
+            # any still-open preview first, for the corner where the stage aborted BEFORE baking.
             try:
-                self.controller.grayscale_cancel(self.monitor, self.mode)
-                self.ctx.log("reverted: cancelled the Grayscale touch-up (restored the vanilla core ICM)")
+                self.controller.grayscale_cancel(self.monitor, self.mode)   # no-op after commit
+            except Exception:  # noqa: BLE001 - best-effort; the explicit restore below is authoritative
+                pass
+            if self._restore_correction_grayscale():
+                prior = self.calib.get("grayscale_wb_prior")
+                self.ctx.log("reverted: restored the pre-existing Grayscale correction"
+                             if prior else "reverted: cleared the Grayscale touch-up to identity")
                 return "reverted"
-            except Exception as exc:  # noqa: BLE001 - fall through to manual-backup guidance
-                self.ctx.log(f"grayscale touch-up cancel failed ({type(exc).__name__}: {exc}); see settings backup")
         if flow == "3dlut-only" and baseline.get("captured"):
             prev = baseline.get("cube_path")
             try:
@@ -2149,6 +2167,16 @@ class Calibration:
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
 
         outcome = self._stage("preflight", run)
+        # A dead-pipe preflight must NOT stay memoised (adversarial finding F7a-A1/A2): if it did,
+        # a resume after the operator fixes the pipe would replay the "done" record with the stale
+        # pipe_ok:false digest — re-firing this seam with a now-false question AND never re-running
+        # _capture_user_backup (callable only inside the memoised stage), permanently losing the
+        # durable rollback for a run whose pipe is healthy from enter-neutral on. Drop the memo so
+        # every invocation re-probes the live pipe and re-attempts the backup until it succeeds;
+        # once the pipe is up, preflight memoises normally.
+        if outcome.digest.get("pipe_ok") is False:
+            self.calib["stages"].pop("preflight", None)
+            self._save()
         # Dead pipe (fable Phase 7a, owner-approved early fail): every flow except build-correction
         # needs the pipe for something load-bearing (enter-neutral/install/require-stack/clear-native
         # before a DIP), and without it the run dies one stage later with a raw exception AND no
@@ -2156,15 +2184,23 @@ class Calibration:
         # judge knows better (e.g. the pipe is momentarily restarting). build-correction is exempt
         # by design — it is deliberately pipe-optional (operator can hold the panel at native).
         if outcome.digest.get("pipe_ok") is False and self.calib.get("flow") != "build-correction":
+            flow = self.calib.get("flow")
+            # Flow-accurate reason (finding F7a-A6): characterize drives the panel to native over
+            # the pipe and restores it (it does not install/enter-neutral); the calibrating flows
+            # enter neutral / install / roll back. Both are load-bearing and both lose the durable
+            # backup without the pipe.
+            need = ("cannot clear the panel to native for a valid characterization, or restore "
+                    "your setup afterwards" if flow == "characterize" else
+                    "cannot enter neutral, install a correction, or roll back")
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="preflight:pipe", seam=SEAM_PIPE, stage="preflight",
                 question=(f"the DesktopLUT calibration pipe is unreachable "
-                          f"({outcome.digest.get('pipe_error')}) — this flow cannot enter neutral, "
-                          "install, or roll back without it, and no pre-run backup could be "
-                          "captured. Abort (start DesktopLUT / arm the pipe first), or proceed?"),
+                          f"({outcome.digest.get('pipe_error')}) — this {flow} flow {need} without "
+                          "it, and no pre-run backup could be captured. Abort (start DesktopLUT / "
+                          "arm the pipe first), or proceed?"),
                 options=("abort", "proceed"), recommendation="abort",
                 digest={"pipe_error": outcome.digest.get("pipe_error"),
-                        "flow": self.calib.get("flow"),
+                        "flow": flow,
                         "backup": outcome.digest.get("backup")})),
                 stage="preflight", message="aborted — DesktopLUT pipe unreachable at preflight")
         # Monitor↔Argyll↔panel map mismatch (#5): a wrong index/display number wastes the WHOLE run on
@@ -3770,13 +3806,16 @@ class Calibration:
         Mirrors the manual "Edit Points → adjust → OK" workflow over the pipe: ``grayscale_live_begin``
         engages the preview shader (the MHC ``correctionGrayscale`` stacks live on top of MHC+3D-LUT so
         the meter SEES it — render.cpp:346 ``corrGsPreviewActive`` gate), then per editor grey point we
-        measure → nudge the point's R/G/B live → re-measure, move on. The preview then stays LIVE
-        through ``measure:verify``; ``grayscale_commit`` (the editor's "OK") bakes the result into the
-        ICM only in ``_finish``, AFTER the ``verify:accept`` gate says apply — commit erases the C++
-        side's saved pre-begin correction, so committing earlier made a revert at the gate a silent
-        no-op (fable Phase 7a). ``grayscale_cancel`` reverts on abort/revert, restoring the user's
-        pre-existing correctionGrayscale. This is the toggleable third "+1": the core (matrix + base
-        grayscale + 3D LUT) is never touched, and the result is one-toggle revertible to the vanilla ICM. Requires the live preview path
+        measure → nudge the point's R/G/B live → re-measure, move on; ``grayscale_commit`` (the
+        editor's "OK") bakes the result into the ICM at the END of this stage so ``measure:verify``
+        scores the REAL baked result (the live preview is only bit-identical to the bake on the SDR
+        realization-A path — HDR previews light that differs, so verifying the preview would ship an
+        unverified deliverable). Revert is DLC-owned (fable Phase 7a, Design B): the pre-begin
+        correctionGrayscale is snapshotted to dlc_state before the edit, and ``verify:accept =
+        revert`` re-applies it (``_restore_correction_grayscale``) rather than relying on the C++
+        ``grayscale_cancel`` (a no-op once commit has run) — robust across a DesktopLUT restart.
+        This is the toggleable third "+1": the core (matrix + base grayscale + 3D LUT) is never
+        touched, and the result is one-toggle revertible to the user's prior correction. Requires the live preview path
         (CODEX_GRAYSCALE_LIVE_EDIT_PROMPT.md); the old ``set_grayscale_tweak`` overlay was a no-op
         under an active MHC (it wrote the wrong store, ``cc.grayscale``, suppressed by render.cpp:346).
         """
@@ -3804,6 +3843,15 @@ class Calibration:
             payload = identity_payload(points)
             spec = self._spec()
             cfg = GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma))
+
+            # DLC-OWNED revert snapshot (fable Phase 7a, Design B): read the user's PRE-BEGIN
+            # correctionGrayscale off the live state and persist it BEFORE we touch anything, so a
+            # `revert` at the verify gate restores exactly that — independent of the C++ cancel path
+            # (which is a no-op once commit has run) and durable across a DesktopLUT restart (the
+            # snapshot lives in dlc_state.json, not DesktopLUT's in-memory GsLiveState). None ⇒ no
+            # prior correction (revert clears to identity).
+            self.calib["grayscale_wb_prior"] = self._snapshot_correction_grayscale()
+            self._save()
 
             # Engage the live grayscale editor (the "Edit Points" path): this strips any prior
             # correction-grayscale from the active MHC permutation and shows a live, measurable
@@ -3921,8 +3969,8 @@ class Calibration:
             session_digest = session.finish()
 
             # Ensure the final table is live in the preview even if every point was already within
-            # target. The preview then stays engaged through measure:verify; the bake
-            # (grayscale_commit) happens in _finish, only after the verify:accept gate says apply.
+            # target — it is baked into the ICM by the grayscale_commit at the end of this stage
+            # (Design B), so measure:verify then scores the real result.
             self.controller.grayscale_set_live(
                 self.monitor, self.mode, payload["point_count"], payload["points"],
                 payload["deviations"])
@@ -3987,15 +4035,73 @@ class Calibration:
                     "grayscale-wb", "aborted",
                     digest={"message": "aborted on large Grayscale touch-up",
                             "decision_note": decision.note, **outcome.digest}))
-        # NOTE (fable Phase 7a, C++-verified): the bake is deliberately NOT here. The commit
-        # erases the C++ side's saved pre-begin correctionGrayscale (DoGrayscaleCommit pops the
-        # GsLiveState; a later grayscale_cancel is a tolerated NO-OP), so committing before the
-        # verify gate made `verify:accept = revert` unable to undo the touch-up. The preview
-        # stays LIVE through measure:verify (the meter sees exactly the stack a bake would
-        # produce — bit-identical for SDR by the realization-A preview design) and _finish
-        # commits on apply / cancels on revert, where cancel restores the user's pre-existing
-        # correctionGrayscale (st.savedCorrectionGs) — the behaviour the owner asked for.
+        # Bake the touch-up into the ICM NOW (Design B, fable Phase 7a) — so measure:verify
+        # measures the REAL baked result, not the live preview. The preview is only bit-identical
+        # to the bake for the SDR realization-A path; HDR (and any SDR full-preview fallback)
+        # previews light that provably differs from the bake, so verifying the preview would ship
+        # an unverified deliverable. Committing here also makes the touch-up durable across a
+        # DesktopLUT restart (it is in the ICM, not the in-memory preview). `revert` at the verify
+        # gate does NOT depend on the C++ cancel-after-commit (a no-op): _revert_inplace re-applies
+        # the DLC-owned pre-begin snapshot captured above. Skip when nothing was previewed.
+        if not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable")):
+            baked = self.controller.grayscale_commit(self.monitor, self.mode)
+            # The C++ returns baked:false if the live session was lost (e.g. DesktopLUT restarted
+            # mid-run) — surface it as a compromised seam rather than logging a bake that did not
+            # happen. A dict without an explicit baked:false is treated as success (older builds
+            # may omit the key). (gs-wb adversarial finding: the flag was previously unread.)
+            if isinstance(baked, dict) and baked.get("baked") is False:
+                self.runlog.anomaly(
+                    "grayscale-wb", bake_lost=True,
+                    message="grayscale_commit reported no live session to bake (DesktopLUT "
+                            "restarted mid-run?) — the touch-up was NOT applied")
+                self._abort_if(self.adjudicate(AdjudicationRequest(
+                    key="grayscale-wb:bake-lost", seam=SEAM_MEASURE, stage="grayscale-wb",
+                    question=("the Grayscale touch-up could not be baked — DesktopLUT reported no "
+                              "live edit session (it may have restarted mid-run). Re-run the "
+                              "touch-up after restarting it, or abort?"),
+                    options=("abort",), recommendation="abort",
+                    digest={**outcome.digest, "bake_lost": True, "compromised": True})),
+                    stage="grayscale-wb", message="grayscale touch-up bake lost (no live session)")
+            else:
+                self.ctx.log("baked the Grayscale touch-up into the ICM")
         return outcome
+
+    def _snapshot_correction_grayscale(self) -> Optional[dict[str, Any]]:
+        """The live correctionGrayscale for this monitor/mode from ``state.get`` (the user's
+        current correction), or ``None`` if absent/unreadable — the DLC-owned revert snapshot
+        for the grayscale touch-up (Design B). Best-effort: a down pipe just yields None (the
+        touch-up won't proceed far without the pipe anyway)."""
+        try:
+            state = self.controller.state()
+            key = f"{self.monitor}:{self.mode}"
+            cg = (((state.get("mhc") or {}).get(key) or {}).get("correction_grayscale"))
+            return dict(cg) if isinstance(cg, dict) and cg.get("points") else None
+        except Exception:  # noqa: BLE001 - advisory snapshot; revert falls back to clearing
+            return None
+
+    def _restore_correction_grayscale(self) -> bool:
+        """Re-apply the DLC-owned pre-begin correctionGrayscale snapshot and regenerate the ICM
+        (Design B revert). Restores the user's prior correction if one was captured, else clears
+        to identity — either way it does NOT rely on the C++ cancel-after-commit no-op. Returns
+        whether the restore call chain succeeded."""
+        prior = self.calib.get("grayscale_wb_prior")
+        try:
+            if prior and prior.get("points"):
+                self.controller.set_correction_grayscale(
+                    self.monitor, self.mode, prior["point_count"], prior["points"],
+                    prior["deviations"], gamma=float(self._spec().gamma))
+            else:
+                n = 32
+                grid = [j / (n - 1) for j in range(n)]
+                self.controller.set_correction_grayscale(
+                    self.monitor, self.mode, n, grid,
+                    {ch: [1.0] * n for ch in ("r", "g", "b")}, gamma=float(self._spec().gamma))
+            self.controller.apply_mhc(self.monitor, self.mode)
+            return True
+        except Exception as exc:  # noqa: BLE001 - fall through to the manual-backup guidance
+            self.ctx.log(f"grayscale touch-up revert failed ({type(exc).__name__}: {exc}); "
+                         "see settings backup")
+            return False
 
     def _active_runtime_cube(self) -> Optional[str]:
         try:
@@ -4516,23 +4622,10 @@ class Calibration:
         elif self.calib.get("inplace_baseline") is not None:
             if choice == "revert":
                 status = self._revert_inplace()
-            elif self.calib.get("flow") == "grayscale-wb":
-                # Apply path: bake the still-live previewed touch-up into the ICM (the editor's
-                # "OK") — ONLY now, after the verify gate, so a revert above could still cancel
-                # back to the user's pre-existing correctionGrayscale (fable Phase 7a; commit
-                # erases the C++ side's saved pre-begin state, making a later cancel a no-op).
-                # C++ tolerates a commit with no live session (a resumed already-completed run)
-                # as a no-op, so this is safe to reach twice.
-                gs = (self.calib["stages"].get("grayscale-wb") or {}).get("digest") or {}
-                if not (gs.get("skipped") or gs.get("preview_unavailable")):
-                    try:
-                        self.controller.grayscale_commit(self.monitor, self.mode)
-                        self.ctx.log("baked the Grayscale touch-up into the ICM (verify gate passed)")
-                    except Exception as exc:  # noqa: BLE001 - surfaced; the preview stays live
-                        self.ctx.log(f"grayscale commit failed ({type(exc).__name__}: {exc}); "
-                                     "the touch-up is still previewing — commit from the DesktopLUT "
-                                     "editor or re-run the flow")
-            # else: the in-place refinement is already applied; nothing to commit.
+            # else: the in-place refinement is already applied; nothing to commit. The
+            # grayscale-wb touch-up was baked in its stage (Design B, fable Phase 7a) so
+            # measure:verify scored the real result; apply keeps it, revert (above →
+            # _revert_inplace) re-applies the DLC-owned pre-begin snapshot.
         if status == "completed":
             # Apply path: re-point DesktopLUT at the DURABLE deliverable cube so a cleaned
             # run folder can't break the live calibration (the build artifact lives under the
@@ -5899,6 +5992,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
 
     result = None
     paused = False
+    calib = None   # bound inside the try; the finally checks `is not None` (ctor may raise)
     try:
         # Constructed INSIDE the teardown guard (fable Phase 7a): the persistent spotread child
         # + presenter were opened above, and the ctor can raise (a corrupt dlc_state.json fails
@@ -5965,7 +6059,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         if not paused:
             handled = result is not None and getattr(result, "status", None) in (
                 "completed", "reverted", "revert_unavailable")
-            if not handled:
+            # Nothing to roll back if the run never entered calibration mode / never mutated the
+            # display — e.g. a clean early-fail at the pipe/plan/backup seam (finding F7a-A8).
+            # Skipping avoids a spurious `rollback_failed` (exit_calibration over the very pipe
+            # that was down) on a run the seam itself advertised as "nothing measured or mutated".
+            entered = False
+            try:
+                entered = calib is not None and (
+                    calib._entered_calibration()
+                    or calib.calib.get("inplace_baseline") is not None)
+            except Exception:  # noqa: BLE001 - defensive; fall back to attempting rollback
+                entered = True
+            if not handled and entered:
                 try:
                     controller.exit_calibration(restore_snapshot=True)
                     print(json.dumps({"status": "rolled_back",

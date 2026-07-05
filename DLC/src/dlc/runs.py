@@ -47,13 +47,29 @@ class RunContext:
     def events_path(self) -> Path:
         return self.root / "events.jsonl"
 
+    # The names ensure_dirs / a run's own machinery may leave in a run root. A pre-existing dir
+    # is adoptable (half-created run) ONLY if it contains nothing outside this set — so pointing
+    # --run at an arbitrary populated folder is refused instead of scattering run files into it
+    # (fable Phase 7a finding F7a-A-runs; the old exist_ok=False raised, which was the guard).
+    _RUN_DIR_ALLOWED = frozenset({
+        "preflight", "probe_match", "sequences", "measurements", "generated", "reports",
+        "manifest.json", "workflow.log", "events.jsonl", "dlc_state.json",
+    })
+
     def ensure_dirs(self) -> None:
         # exist_ok: a crash between this mkdir and the first manifest save leaves a
         # half-created run dir that would otherwise brick BOTH paths — open_run refuses it
         # (no manifest.json) and create_run could not re-create it (exist_ok=False raised).
-        # Adopting a manifest-less dir is safe: every create_run caller (main, resolve_run)
-        # checks for manifest.json first, so a real run is never clobbered; fresh names are
-        # microsecond-timestamped so collisions do not occur in practice.
+        # Adopting a manifest-less dir is safe ONLY when it looks like a half-created run: an
+        # empty dir, or one holding only our own scaffolding. A populated foreign dir (e.g.
+        # `--run ~/Documents`) is refused so run files are never scattered into the user's data.
+        if self.root.exists():
+            stray = [p.name for p in self.root.iterdir() if p.name not in self._RUN_DIR_ALLOWED]
+            if stray:
+                raise FileExistsError(
+                    f"{self.root} already exists and is not a DLC run "
+                    f"(no manifest.json; unexpected entries: {sorted(stray)[:5]}). Point --run at "
+                    "a new or existing run directory, not an arbitrary folder.")
         self.root.mkdir(parents=True, exist_ok=True)
         for name in [
             "preflight",

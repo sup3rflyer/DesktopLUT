@@ -40,6 +40,7 @@ class LutIntegritySummary:
     avg_neighbor_delta: float
     max_neighbor_delta_allowed: float
     monotonicity_violations_allowed: int
+    monotonicity_epsilon: float
     integrity_path: str
     notes: list[str]
 
@@ -103,6 +104,22 @@ def parse_triplet(parts: list[str]) -> tuple[float, float, float]:
 _MAX_LEGITIMATE_CORRECTION = 0.5
 
 
+def default_monotonicity_epsilon(size: int) -> float:
+    """The depth below which a BACKWARD neighbour step is fit/quantization noise, not a
+    structural reversal (fable Phase 7a, F7a-15 corrected). The optimizer builds the cube from
+    an RBF fit + soft clamp; on a raised-black panel the near-black fit wiggles by a fraction of
+    the grid step (measured: ≤0.10× the identity pitch across production-training-set cubes at
+    grid 17/33). A real tear — a transposed axis, a corrupt write, a garbage parse — reverses by
+    ~a full grid step or more. A quarter of the identity pitch cleanly separates the two (≈2.5×
+    above the observed fit noise, ≈4× below a real tear) and scales with grid density like the
+    neighbour-delta ceiling. Counting steps shallower than this as "monotonicity violations" was
+    the F7a-15 error: it false-failed legitimate raised-black-panel cubes into pointless rebuilds
+    (`decisions._3dlut_next_params` coarsens the grid on `integrity['ok']` False)."""
+    if size <= 1:
+        return 1e-8
+    return 0.25 / (size - 1)
+
+
 def default_neighbor_delta_allowed(size: int) -> float:
     """The grid-pitch-derived structural ceiling for a neighbour step (fable Phase 6, from
     the Phase 5 lead): the old fixed default of 1.0 admitted a FULL-RANGE jump between
@@ -125,10 +142,13 @@ def summarize_lut_integrity(
     integrity_path: Path,
     max_neighbor_delta_allowed: float | None = None,
     monotonicity_violations_allowed: int = 0,
+    monotonicity_epsilon: float | None = None,
     bounds_epsilon: float = 1e-6,
 ) -> LutIntegritySummary:
     if max_neighbor_delta_allowed is None:
         max_neighbor_delta_allowed = default_neighbor_delta_allowed(cube.size)
+    if monotonicity_epsilon is None:
+        monotonicity_epsilon = default_monotonicity_epsilon(cube.size)
     expected_entries = cube.size**3 if cube.size > 0 else 0
     notes: list[str] = []
     if expected_entries != len(cube.values):
@@ -143,7 +163,7 @@ def summarize_lut_integrity(
     if out_of_bounds_count:
         notes.append(f"{out_of_bounds_count} output channels are outside 0..1")
 
-    monotonicity_violations, neighbor_deltas = cube_axis_checks(cube)
+    monotonicity_violations, neighbor_deltas = cube_axis_checks(cube, epsilon=monotonicity_epsilon)
     if monotonicity_violations > monotonicity_violations_allowed:
         notes.append(f"{monotonicity_violations} monotonic axis violations exceed allowance {monotonicity_violations_allowed}")
 
@@ -180,15 +200,21 @@ def summarize_lut_integrity(
         avg_neighbor_delta=avg_neighbor_delta,
         max_neighbor_delta_allowed=max_neighbor_delta_allowed,
         monotonicity_violations_allowed=monotonicity_violations_allowed,
+        monotonicity_epsilon=monotonicity_epsilon,
         integrity_path=str(integrity_path),
         notes=notes,
     )
 
 
-def cube_axis_checks(cube: CubeData) -> tuple[int, list[float]]:
+def cube_axis_checks(cube: CubeData, *, epsilon: float | None = None) -> tuple[int, list[float]]:
     size = cube.size
     if size <= 1 or len(cube.values) != size**3:
         return (0, [])
+    # A backward step counts as a violation only if it is DEEPER than epsilon — a fit/quantization
+    # noise floor tied to grid pitch (default_monotonicity_epsilon), so shallow near-black RBF
+    # wiggles on a raised-black panel don't read as structural tears (fable Phase 7a, F7a-15).
+    if epsilon is None:
+        epsilon = default_monotonicity_epsilon(size)
 
     def value_at(r: int, g: int, b: int) -> tuple[float, float, float]:
         # Standard .cube order is R-fastest (write_cube / DesktopLUT LoadLUT write
@@ -205,17 +231,17 @@ def cube_axis_checks(cube: CubeData) -> tuple[int, list[float]]:
                 if r + 1 < size:
                     nxt = value_at(r + 1, g, b)
                     neighbor_deltas.append(max(abs(nxt[i] - current[i]) for i in range(3)))
-                    if nxt[0] + 1e-8 < current[0]:
+                    if nxt[0] + epsilon < current[0]:
                         violations += 1
                 if g + 1 < size:
                     nxt = value_at(r, g + 1, b)
                     neighbor_deltas.append(max(abs(nxt[i] - current[i]) for i in range(3)))
-                    if nxt[1] + 1e-8 < current[1]:
+                    if nxt[1] + epsilon < current[1]:
                         violations += 1
                 if b + 1 < size:
                     nxt = value_at(r, g, b + 1)
                     neighbor_deltas.append(max(abs(nxt[i] - current[i]) for i in range(3)))
-                    if nxt[2] + 1e-8 < current[2]:
+                    if nxt[2] + epsilon < current[2]:
                         violations += 1
     return violations, neighbor_deltas
 

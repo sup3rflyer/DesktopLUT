@@ -181,7 +181,19 @@ request, adjudicates ambiguous results on digests, and writes the report.
   correction (mock fidelity raised to the verified contract). And a dead DesktopLUT
   pipe now fails EARLY at preflight (an adjudicated seam recommending abort, before
   anything is measured or mutated; `build-correction` stays pipe-optional) instead
-  of dying one stage later after recording a garbage "backup".
+  of dying one stage later after recording a garbage "backup". Adversarial-pass
+  hardening (four refuting agents): the grayscale-wb touch-up was REDESIGNED — it
+  bakes at the end of its own stage so `measure:verify` scores the real result for
+  ALL modes (the earlier "verify the live preview" approach shipped an unverified HDR
+  deliverable, since the HDR preview provably differs from the bake), and revert is
+  now DLC-owned (the pre-begin correction is snapshotted and re-applied on revert,
+  robust across a DesktopLUT restart, no longer depending on the C++ cancel). A
+  dead-pipe preflight no longer stays memoised (a fixed pipe re-heals on resume and
+  recaptures the durable backup instead of a permanent loss), the `DesktopLUT.ini`
+  backup is kept even when the pipe is down, and the check-cube monotonicity gate
+  gained a principled grid-pitch-derived depth tolerance so a raised-black panel's
+  shallow near-black fit wiggles no longer false-fail a legitimate cube into a
+  pointless rebuild.
 - **Fable audit Phase 5 — the correction machine & 3D-LUT engine**
   (`docs/audits/fable/phase-5.md`): the **gamut-aware (#C3) correction was internally
   inconsistent** — the error model trained its delta against the reachable-CLAMPED ideal
