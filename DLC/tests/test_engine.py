@@ -41,7 +41,7 @@ from dlc.dogegen import DogegenPatchDisplay
 from dlc.drift import adaptive_gray_patch, coldest_channel_from_xyz, evaluate_drift, write_drift_plan
 from dlc.events import EventWriter, read_events
 from dlc.human_actions import acknowledge_human_action, has_human_action
-from dlc.lut3d import apply_3dlut_candidate, execute_3dlut_build_plan, write_3dlut_build_plan
+from dlc.lut3d import apply_3dlut_candidate, default_source_icc, execute_3dlut_build_plan, write_3dlut_build_plan
 from dlc.lut_integrity import parse_cube, write_lut_integrity
 from dlc.measure_rgbw import plan_rgbw_measurement, resolve_spotread_instrument_port, run_rgbw_measurement
 from dlc.metrics import score_samples, write_metrics
@@ -751,8 +751,17 @@ class ProfilePathTests(unittest.TestCase):
         self.assertTrue(hdr.contained)
 
     def test_resolve_profile_path_keeps_absolute(self) -> None:
-        path = Path(r"C:\Windows\System32\spool\drivers\color\sRGB.icm")
+        # Platform-native absolute path: a C:\ drive path is only absolute on Windows,
+        # and the contract under test is "absolute in, unchanged out" on the current OS.
+        path = Path(tempfile.gettempdir()).resolve() / "spool" / "sRGB.icm"
+        self.assertTrue(path.is_absolute())
         self.assertEqual(resolve_profile_path(path), path)
+
+    def test_resolve_profile_path_anchors_missing_relative_to_project(self) -> None:
+        relative = Path("profiles") / "definitely_missing_fixture.icm"
+        resolved = resolve_profile_path(relative)
+        self.assertTrue(resolved.is_absolute())
+        self.assertEqual(resolved.parts[-2:], ("profiles", "definitely_missing_fixture.icm"))
 
 
 class ProfilePlanTests(unittest.TestCase):
@@ -879,6 +888,22 @@ class ProfilePlanTests(unittest.TestCase):
         self.assertFalse(evidence["changed"])
         self.assertIn("multiple instruments", evidence["reason"])
         self.assertEqual(resolved, argv)
+
+    def test_dispread_port_resolution_gate_handles_both_path_conventions(self) -> None:
+        # Plans carry Windows-style contained-tool paths; the resolution logic also runs
+        # on POSIX (tests, CI). The executable gate must recognise dispread in both path
+        # conventions — pathlib alone treats "C:\...\dispread.exe" as ONE component on POSIX,
+        # which silently disabled the whole resolution off-Windows.
+        enumerator = lambda _spotread: [Instrument(port=1, description="i1 Display Pro")]
+        for exe in (r"C:\Argyll\dispread.exe", "/opt/argyll/dispread"):
+            argv = [exe, "-v", "-c", "2", "measurement"]
+            _resolved, evidence = resolve_dispread_instrument_port(argv, instrument_enumerator=enumerator)
+            self.assertTrue(evidence["applicable"], exe)
+            self.assertTrue(evidence["changed"], exe)
+            self.assertEqual(evidence["resolved_port"], 1, exe)
+        argv = [r"C:\Argyll\targen.exe", "-c", "2", "measurement"]
+        _resolved, evidence = resolve_dispread_instrument_port(argv, instrument_enumerator=enumerator)
+        self.assertFalse(evidence["applicable"])
 
     def test_profile_execute_records_instrument_resolution_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1153,13 +1178,49 @@ class MhcCandidateTests(unittest.TestCase):
             self.assertTrue(Path(candidate.cube_path).exists())
 
 
+def write_fake_3dlut_inputs(ctx) -> tuple[Path, Path]:
+    """Hermetic stand-ins for the collink inputs.
+
+    The contained Argyll ref profiles (third_party/argyll/3.3.0/ref/*.icm) are
+    gitignored — present on the production box, absent in a fresh clone — so tests
+    that exercise plan/execute mechanics supply their own source ICC instead of
+    depending on the vendored default (pinned separately, skip-gated on presence).
+    """
+    source_icc = ctx.root / "measurements" / "ref_source.icm"
+    source_icc.parent.mkdir(parents=True, exist_ok=True)
+    source_icc.write_bytes(b"fake source icc")
+    display_icc = ctx.root / "measurements" / "post-mhc_iter01_sdr.icc"
+    display_icc.write_bytes(b"fake display icc")
+    return source_icc, display_icc
+
+
 class Lut3dTests(unittest.TestCase):
-    def test_plan_3dlut_uses_collink_cube_output(self) -> None:
+    def test_default_source_icc_is_project_anchored(self) -> None:
+        sdr = default_source_icc("SDR")
+        hdr = default_source_icc("HDR")
+        self.assertTrue(sdr.is_absolute())
+        self.assertTrue(hdr.is_absolute())
+        self.assertEqual(sdr.parts[-5:], ("third_party", "argyll", "3.3.0", "ref", "Rec709.icm"))
+        self.assertEqual(hdr.parts[-5:], ("third_party", "argyll", "3.3.0", "ref", "Rec2020.icm"))
+
+    @unittest.skipUnless(
+        default_source_icc("SDR").exists(),
+        "contained Argyll ref profiles (third_party/argyll/3.3.0/ref) are vendored on the production box, not in a fresh clone",
+    )
+    def test_plan_3dlut_defaults_to_contained_rec709_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
             display_icc = ctx.root / "measurements" / "post-mhc_iter01_sdr.icc"
+            display_icc.parent.mkdir(parents=True, exist_ok=True)
             display_icc.write_bytes(b"fake display icc")
-            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), display_icc=display_icc, grid_size=17)
+            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), display_icc=display_icc)
+            self.assertTrue(plan.source_icc.endswith("Rec709.icm"))
+
+    def test_plan_3dlut_uses_collink_cube_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
+            source_icc, display_icc = write_fake_3dlut_inputs(ctx)
+            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), source_icc=source_icc, display_icc=display_icc, grid_size=17)
             self.assertIn("collink.exe", plan.command)
             self.assertIn("-3c", plan.command_argv)
             self.assertIn("-r17", plan.command_argv)
@@ -1170,9 +1231,8 @@ class Lut3dTests(unittest.TestCase):
     def test_3dlut_execute_dry_run_records_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
-            display_icc = ctx.root / "measurements" / "post-mhc_iter01_sdr.icc"
-            display_icc.write_bytes(b"fake display icc")
-            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), display_icc=display_icc)
+            source_icc, display_icc = write_fake_3dlut_inputs(ctx)
+            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), source_icc=source_icc, display_icc=display_icc)
             result = execute_3dlut_build_plan(ctx=open_run(ctx.root), plan_path=Path(plan.artifacts["plan"]), dry_run=True)
             self.assertTrue(result.ok)
             self.assertTrue(Path(result.result_path).exists())
@@ -1182,9 +1242,8 @@ class Lut3dTests(unittest.TestCase):
     def test_3dlut_execute_simulation_writes_identity_cube(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
-            display_icc = ctx.root / "measurements" / "post-mhc_iter01_sdr.icc"
-            display_icc.write_bytes(b"fake display icc")
-            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), display_icc=display_icc, grid_size=17)
+            source_icc, display_icc = write_fake_3dlut_inputs(ctx)
+            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), source_icc=source_icc, display_icc=display_icc, grid_size=17)
             result = execute_3dlut_build_plan(
                 ctx=open_run(ctx.root),
                 plan_path=Path(plan.artifacts["plan"]),
@@ -1213,9 +1272,8 @@ class Lut3dTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
-            display_icc = ctx.root / "measurements" / "post-mhc_iter01_sdr.icc"
-            display_icc.write_bytes(b"fake display icc")
-            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), display_icc=display_icc, grid_size=17)
+            source_icc, display_icc = write_fake_3dlut_inputs(ctx)
+            plan = write_3dlut_build_plan(ctx=ctx, tools=make_fake_tools(), source_icc=source_icc, display_icc=display_icc, grid_size=17)
             write_identity_cube(Path(plan.artifacts["cube"]))
 
             with patch("dlc.lut3d.subprocess.Popen", return_value=FakeProcess()):

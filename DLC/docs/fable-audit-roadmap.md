@@ -73,11 +73,14 @@ DesktopLUT/DLC production box is Windows). Consequences:
   decision hinges on the design notes, record the question in the phase report
   instead of inventing the answer.
 
-**Baseline on this container (2026-07-05):** `790 collected: 780 passed, 8 failed,
-2 skipped`. All 8 failures are environment artifacts in `tests/test_engine.py`
-(ProfilePath/ProfilePlan/Lut3d) — missing gitignored `third_party/argyll/3.3.0/ref/*.icm`
-plus `C:\...` path fixtures that are non-absolute on POSIX. The 2 skips are the
-`DLC_COLORCAL` lab-integration tests. Phase 0 makes this baseline deterministic.
+**Baseline on this container (2026-07-05, post-Phase 0):** green-or-skipped —
+`805 collected: 802 passed, 0 failed, 3 skipped` (2 × opt-in `DLC_COLORCAL` lab
+tests, 1 × contained-Argyll-ref test that only runs where `third_party/argyll/
+3.3.0/ref/` is vendored). The pre-Phase-0 state was `800 collected: 790 passed,
+8 failed, 2 skipped`; 3 of the 8 "environment" failures turned out to be a real
+POSIX portability bug in `resolve_dispread_instrument_port` (fixed), the rest
+were vendored-ref/fixture portability (made hermetic). Coverage baseline and
+details: `docs/audits/fable/phase-0.md`.
 
 **HW-validation queue:** any finding whose fix changes behaviour that only hardware
 can confirm (meter timing, FALD behaviour, live pipe, thermal) gets a `HW:` entry in
@@ -339,6 +342,10 @@ transports + probe-match)** if session budget demands.
   its seam), keep gated, or quarantine.
 - One-USB-i1D3 mutual exclusion (persistent meter vs ccxxmake) enforced only by flow
   routing (`calibrate.py:5576`) — make structural (a lock/ownership object) or pin.
+- *(Phase 0, N-0.3)* `probe_match.py:76` sibling-spotread derivation via
+  `Path.with_name` — same platform-assumption class as the F-0.1 dispread-gate
+  bug (fixed in Phase 0); fine today because it operates on discovered ToolSet
+  paths, but re-check while auditing this stack.
 
 **Parity:** P14 (derive 242/712 from bit depth), P17 (regime classifier stays
 mode-blind), HDR sustained-peak/ABL handling vs SDR brightness stage.
@@ -767,8 +774,13 @@ new-surface leads dispositioned.
   unreachable production paths remain (the recon list: lut_sdr, lut_constrained,
   physical, refine_sdr_grayscale, mhc candidate path, set_grayscale_tweak,
   DLC_SRC_NATIVE tripwire, drift.build_drift_plan future-path).
-- Packaging: `pip install -e .` / `.[engine]` / `.[meter]` on Linux + Windows
-  expectations; `test_packaging.py` scope; wheel build sanity.
+- Packaging: `pip install -e .` / `.[engine]` / `.[meter]` / `.[test]` on Linux +
+  Windows expectations; `test_packaging.py` scope; wheel build sanity — including
+  the Phase 0 notes: `paths.PROJECT_DIR` anchors `runs/`/`third_party/` via
+  `__file__` (wrong under a wheel install, N-0.4), and `vendor.py`'s
+  copy/plan/manifest-write helpers are human-invoked only since the `dlc` CLI
+  removal (document-or-quarantine, N-0.1; non-atomic write + naive timestamp,
+  N-0.2).
 
 **Exit:** coverage report vs Phase 0 baseline (target: every parsing/IO module has
 direct tests); docs truthful; dead code zero-or-documented.
@@ -885,7 +897,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 
 ## 9. Phase checklist
 
-- [ ] Phase 0 — Baseline, harness, determinism
+- [x] Phase 0 — Baseline, harness, determinism *(2026-07-05, `docs/audits/fable/phase-0.md`)*
 - [ ] Phase 1 — Colour-math foundations & duplication
 - [ ] Phase 2 — Patch generation, transfers, targets
 - [ ] Phase 3 — Measurement stack (3a loop/DIP/thermal · 3b meter/transports)

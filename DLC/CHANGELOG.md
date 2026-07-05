@@ -142,6 +142,17 @@ request, adjudicates ambiguous results on digests, and writes the report.
   (`<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n.cube`) installed from the stable
   `results/` folder, not the gitignored run-dir build artifact.
 
+### Fixed
+- **Fable audit Phase 0 (2026-07-05, `docs/audits/fable/phase-0.md`):** the suite is
+  now deterministic on any box — green-or-skipped, never red-for-environment.
+  `resolve_dispread_instrument_port` no longer silently no-ops on POSIX (its
+  executable gate mis-parsed the plans' Windows-style tool paths off-Windows);
+  `lut3d.default_source_icc` is PROJECT_DIR-anchored instead of cwd-relative; the
+  Lut3d/ProfilePath tests are hermetic (no dependence on gitignored vendored ICCs
+  or Windows-only absolute paths); a `[test]` extra declares the suite tooling the
+  baked-in `-n auto` addopts require, with `requirements.txt` synced (adds the
+  missing PyYAML/pytest); README test-count and vendoring notes de-staled.
+
 ### Validated
 - **First clean full SDR calibration on hardware (2026-06-19, ASUS ProArt PA32UCXR):**
   a whole `full` flow ran end-to-end over the Resolve daemon — DLC verify avg ΔE2000

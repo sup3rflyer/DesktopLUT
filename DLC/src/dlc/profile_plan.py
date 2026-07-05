@@ -269,8 +269,12 @@ def resolve_dispread_instrument_port(
     }
     if not argv:
         return argv, evidence
-    executable = Path(argv[0])
-    if executable.name.lower() not in {"dispread.exe", "dispread"} or "-c" not in argv:
+    # Plans carry contained-tool paths in Windows form (C:\...\dispread.exe) while this
+    # verification logic also runs — and is unit-tested — on POSIX, where pathlib treats
+    # the whole string as a single component. Split on both separator conventions so the
+    # gate (and the port-resolution logic behind it) behaves identically on every OS.
+    executable_name = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if executable_name.lower() not in {"dispread.exe", "dispread"} or "-c" not in argv:
         return argv, evidence
     port_index = argv.index("-c") + 1
     if port_index >= len(argv):
@@ -282,7 +286,8 @@ def resolve_dispread_instrument_port(
         evidence.update({"ok": False, "applicable": True, "reason": f"dispread command has non-numeric port: {argv[port_index]}"})
         return argv, evidence
 
-    spotread = executable.with_name("spotread.exe")
+    # Sibling spotread in the same directory, preserving the plan's separator convention.
+    spotread = Path(argv[0][: len(argv[0]) - len(executable_name)] + "spotread.exe")
     enumerator = instrument_enumerator or (lambda path: Argyll(path).enumerate_instruments())
     try:
         instruments = enumerator(spotread)

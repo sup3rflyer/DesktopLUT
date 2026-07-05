@@ -58,3 +58,9 @@ AGENTS.md
 CODEX_*.md
 .claude/
 
+
+# Python packaging/test artifacts (pip install -e ., pytest --cov)
+src/*.egg-info/
+.coverage
+.coverage.*
+coverage.json
