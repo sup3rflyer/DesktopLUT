@@ -40,3 +40,7 @@ nul
 *.log
 *.bak
 *.obj
+
+# Python bytecode (stray test cache)
+__pycache__/
+*.pyc
