@@ -5,8 +5,9 @@ mapping, patch sets, measurement sequencing, the loops, integrity gates, LUT
 generation) and a **thin LLM sits only at the seams** — it never tails a stream,
 it judges *digests* at boundaries. This module is that core.
 
-A run is a **named flow** (``full`` / ``3dlut-only`` / ``mhc-only``; ``hdr`` is the
-later goal) expressed as an ordered list of stage methods. The pipeline is
+A run is a **named flow** (``full`` / ``3dlut-only`` / ``mhc-only`` / …) over a run
+MODE (SDR or HDR — the mode picks the target/transfer/refine stages; there is no
+separate ``hdr`` flow) expressed as an ordered list of stage methods. The pipeline is
 **MHC ICC (matrix + 1D base + closed-loop D65 grayscale refine) → 3D LUT**: the MHC
 is a STANDALONE D65 foundation that owns the neutral axis (matrix = native→D65, base
 1D LUT = native-white tone, the closed-loop refine = the per-level D65 residual), and
@@ -101,7 +102,9 @@ from .measure_loop import (
     run_measure_loop,
 )
 from .decisions import hdr_metric_thresholds
-from .metrics import delta_e2000, percentile, score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab
+from . import metrics as metrics_mod
+from .metrics import (delta_e2000, metrics_scored_payload, percentile, practical_summary,
+                      score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab)
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
@@ -140,6 +143,8 @@ SEAM_PLANNING = "adaptive_planning" # opt-in LLM patch-strategy investigation se
 SEAM_FOUNDATION = "foundation_collapse"  # a foundation install collapsed bright-neutral luminance (§7)
 SEAM_HARDWARE_READY = "hardware_readiness"  # one live gate before the first meter/presenter read
 SEAM_MONITOR_MAP = "monitor_map"   # profile monitor↔Argyll↔panel map disagrees with live enumeration
+SEAM_BACKUP = "backup_capture"     # the pre-run durable settings backup could not be captured
+SEAM_PIPE = "pipe_down"            # the DesktopLUT calibration pipe is unreachable at preflight
 _D65_XY = (0.3127, 0.3290)          # the standard-source white the MHC matrix maps the panel to
 # NOTE: there is deliberately NO check-in seam. A §12 check-in is a NON-BLOCKING evidence packet
 # for the LLM (see _maybe_timed_checkin), never an adjudicated yes/no — it must never gate the spine.
@@ -450,6 +455,11 @@ class StageOutcome:
     digest: dict[str, Any] = field(default_factory=dict)
     data: dict[str, Any] = field(default_factory=dict)   # JSON-friendly handoff
     artifacts: list[str] = field(default_factory=list)
+    # True when this outcome came back from the run-record memo instead of fresh work (set by
+    # Calibration._stage on replay; NOT persisted — a record is by definition not-replayed until
+    # it is read back). Lets post-stage telemetry (e.g. the intermediate _score_stage) run once
+    # per fresh execution instead of re-emitting on every resume.
+    replayed: bool = False
 
     def as_record(self) -> dict[str, Any]:
         return {"stage": self.stage, "status": self.status, "digest": self.digest,
@@ -682,6 +692,11 @@ class Calibration:
         # eff_bd is None only when nothing was persisted/explicit → keep the long-standing
         # constructor default (the panel's native depth). main() applies its own fresh-run
         # default (10 if HDR else 8) and passes the resolved value in, so the two never diverge.
+        # Audited (fable Phase 7a): the two fallbacks are INTENTIONALLY different, because bit
+        # depth is a property of the presenter TRANSPORT, not the panel — the CLI picks it where
+        # the presenter is built (composited 8-bit is the 3D-LUT-safe dogegen SDR default) and
+        # passes it in; an in-process caller presents through its injected measure fn at the
+        # panel's own depth. The persisted run spec makes the choice sticky either way.
         self.bit_depth = _eff_bd if _eff_bd is not None else self.display.panel.bit_depth
 
         # The unified event spine: every phase change, stage boundary, seam, and (via the
@@ -834,8 +849,17 @@ class Calibration:
             "grayscale-wb": ["preflight", "resolve-target", "whitepoint", "hardware-readiness",
                              "grayscale-wb", "measure:verify", "verify"],
             "build-correction": ["preflight", "clear-native", "probe-match"],
+            "characterize": ["preflight", "clear-native", "hardware-readiness", "characterize"],
         }
         keys = seqs.get(flow or "", [])
+        # adaptive-planning only announces itself when the opt-in seam is ON (stage_adaptive_planning
+        # returns before set_phase otherwise) — don't show the stepper a stage the run never enters.
+        if not self.adaptive_planning:
+            keys = [k for k in keys if k != "adaptive-planning"]
+        # hardware-readiness likewise short-circuits (no phase announced) unless the gate is
+        # required — main() always requires it live, so the live stepper is unchanged.
+        if not self.require_hardware_readiness:
+            keys = [k for k in keys if k != "hardware-readiness"]
         out: list[dict[str, Any]] = []
         for key in keys:
             label, long = self._STAGE_LABELS.get(key, (key, False))
@@ -909,6 +933,7 @@ class Calibration:
         rec = self.calib["stages"].get(key)
         if rec and rec.get("status") == "done" and not self.force:
             outcome = StageOutcome.from_record(rec)
+            outcome.replayed = True   # post-stage telemetry keys off this (no re-emit on resume)
             self.runlog.stage_done(key, status=outcome.status, replayed=True)
             return outcome
         try:
@@ -1025,9 +1050,41 @@ class Calibration:
         The live rollback still uses DesktopLUT's in-memory snapshot; this file copy is the
         complete durable safety net. Captured once."""
         existing = self.calib.get("backup")
-        if existing and existing.get("captured"):
+        # partial=True marks an ini-only capture made while the pipe was dead — re-attemptable
+        # (only via the pre-mutation pipe-heal path in stage_preflight, which re-runs preflight
+        # fresh; a complete capture is final).
+        if existing and existing.get("captured") and not existing.get("partial"):
             return existing
         record: dict[str, Any] = {"captured": False}
+        # The complete settings file — the REAL durable backup — needs only the filesystem,
+        # never the pipe, so copy it FIRST, unconditionally (adversarial finding F7a-A3: the
+        # first honest-backup guard threw this good half away with the garbage state JSON).
+        ini_dest: Optional[str] = None
+        ini_src: Optional[str] = None
+        try:
+            ini = self._resolve_desktoplut_ini()
+            if ini is not None:
+                dest = self.ctx.root / "desktoplut_settings_backup.ini"
+                shutil.copy2(ini, dest)
+                ini_dest, ini_src = str(dest), str(ini)
+                self.ctx.log(f"backed up full DesktopLUT settings: {ini} → {dest.name}")
+            else:
+                self.ctx.log("DesktopLUT.ini not found — set paths.desktoplut_ini in the profile "
+                             "for a complete settings backup")
+        except Exception as exc:  # noqa: BLE001 - backup is best-effort, never blocks the run
+            self.ctx.log(f"could not copy the DesktopLUT.ini backup: {exc}")
+        # A dead pipe yields state == {"error": ...} — writing THAT as the "backup" would
+        # record captured=True over garbage (fable Phase 7a). No state ⇒ no state JSON to
+        # back up; the ini half above still counts (the pipe-down seam is the decision surface).
+        if not state or ("error" in state and "mhc" not in state and "runtime" not in state):
+            record = {"captured": bool(ini_dest), "partial": True,
+                      "ini_backup": ini_dest, "ini_source": ini_src, "path": None,
+                      "error": ("no DesktopLUT state JSON to back up "
+                                f"({(state or {}).get('error', 'empty state')})"
+                                + ("" if ini_dest else "; no DesktopLUT.ini configured either"))}
+            self.calib["backup"] = record
+            self._save()
+            return record
         try:
             mhc = (state or {}).get("mhc") or {}
             key = f"{self.monitor}:{self.mode}"
@@ -1036,23 +1093,14 @@ class Calibration:
             atomic_write_text(path, json.dumps(state, indent=2))   # the durable pre-run safety net
             record = {"captured": True, "path": str(path),
                       "active_profile": active_profile,
-                      "had_mhc": bool(active_profile)}
-            # The complete settings file — the real durable backup.
-            ini = self._resolve_desktoplut_ini()
-            if ini is not None:
-                dest = self.ctx.root / "desktoplut_settings_backup.ini"
-                shutil.copy2(ini, dest)
-                record["ini_backup"] = str(dest)
-                record["ini_source"] = str(ini)
-                self.ctx.log(f"backed up full DesktopLUT settings: {ini} → {dest.name}")
-            else:
-                record["ini_backup"] = None
-                self.ctx.log("DesktopLUT.ini not found — set paths.desktoplut_ini in the profile "
-                             "for a complete settings backup (state.get JSON saved as a fallback)")
+                      "had_mhc": bool(active_profile),
+                      "ini_backup": ini_dest, "ini_source": ini_src}
             self.ctx.log(f"backed up user's DesktopLUT state → {path.name}"
                          + (f" (active MHC: {active_profile})" if active_profile else " (no MHC active)"))
         except Exception as exc:  # noqa: BLE001 - backup is best-effort, never blocks the run
-            record = {"captured": False, "error": f"{type(exc).__name__}: {exc}"}
+            record = {"captured": bool(ini_dest), "partial": bool(ini_dest),
+                      "ini_backup": ini_dest, "ini_source": ini_src,
+                      "error": f"{type(exc).__name__}: {exc}"}
             self.ctx.log(f"could not back up DesktopLUT state: {exc}")
         self.calib["backup"] = record
         self._save()
@@ -1111,15 +1159,21 @@ class Calibration:
         baseline = self.calib.get("inplace_baseline") or {}
         flow = self.calib.get("flow")
         if flow == "grayscale-wb":
-            # Live-edit revert = cancel the preview: discard the in-progress correction and restore
-            # the vanilla core ICM (matrix + base grayscale + 3D LUT untouched). Nothing was baked
-            # unless commit ran, and cancel un-engages the preview either way.
+            # Design B revert (fable Phase 7a): the touch-up was BAKED in its stage, so the C++
+            # live session is gone and grayscale_cancel would be a no-op. Re-apply the DLC-owned
+            # pre-begin snapshot instead (set_correction_grayscale + apply_mhc) — this restores
+            # the user's PRE-EXISTING correction (or clears to identity if there was none) and is
+            # robust across a DesktopLUT restart (the snapshot is in dlc_state.json). Also cancel
+            # any still-open preview first, for the corner where the stage aborted BEFORE baking.
             try:
-                self.controller.grayscale_cancel(self.monitor, self.mode)
-                self.ctx.log("reverted: cancelled the Grayscale touch-up (restored the vanilla core ICM)")
+                self.controller.grayscale_cancel(self.monitor, self.mode)   # no-op after commit
+            except Exception:  # noqa: BLE001 - best-effort; the explicit restore below is authoritative
+                pass
+            if self._restore_correction_grayscale():
+                prior = self.calib.get("grayscale_wb_prior")
+                self.ctx.log("reverted: restored the pre-existing Grayscale correction"
+                             if prior else "reverted: cleared the Grayscale touch-up to identity")
                 return "reverted"
-            except Exception as exc:  # noqa: BLE001 - fall through to manual-backup guidance
-                self.ctx.log(f"grayscale touch-up cancel failed ({type(exc).__name__}: {exc}); see settings backup")
         if flow == "3dlut-only" and baseline.get("captured"):
             prev = baseline.get("cube_path")
             try:
@@ -1199,25 +1253,23 @@ class Calibration:
         # before verify, so by then this is populated; fall back to the DIP before the build has run
         # (or a no-build flow), then None. (Self-contained gamut awareness without a probe stage —
         # the literal post-warmup probe is only needed once RAW generation is gamut-aware too.)
-        prim: Optional[dict] = None
-        mp = (self._state.get("mhc_params") or {}).get("primaries")
-        if mp and all(k in mp for k in ("rx", "ry", "gx", "gy", "bx", "by")):
-            prim = {"R": [float(mp["rx"]), float(mp["ry"])],
-                    "G": [float(mp["gx"]), float(mp["gy"])],
-                    "B": [float(mp["bx"]), float(mp["by"])]}
+        # Conversion + degenerate guard shared with the stage tools (metrics.py), so a
+        # stage-CLI score clamps against exactly the same measured gamut this run does (P1).
+        # DELIBERATE behaviour change vs the pre-Phase-6 code (verification pass, B5): a
+        # DEGENERATE-but-complete mhc_params.primaries (corrupt fresh raw measurement) now
+        # falls through to the prior DIP's sane gamut instead of disabling the clamp
+        # entirely — a real previous measurement beats clamping against nothing. The stage
+        # tools have no DIP access, so they skip the clamp in that corner (surfaced as
+        # gamut_aware:false); the corner requires a corrupt build record to reach at all.
+        prim = metrics_mod.reachable_primaries_from_mhc_params(self._state.get("mhc_params"))
         if prim is None:
             dip = self._dip()
             if dip is None or not dip.native_primaries:
                 return None
-            prim = {ch: [float(xy[0]), float(xy[1])]
-                    for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2}
-        if len(prim) != 3:
-            return None
-        # Guard a degenerate (collinear) primary triangle — it would make the native NPM singular and
-        # crash inside the clamp. Real panel primaries are never collinear; a near-zero area ⇒ skip.
-        (rx, ry), (gx, gy), (bx, by) = prim["R"], prim["G"], prim["B"]
-        area = abs((gx - rx) * (by - ry) - (bx - rx) * (gy - ry)) / 2.0
-        return prim if area > 1e-6 else None
+            prim = metrics_mod.sanitize_reachable_primaries(
+                {ch: [float(xy[0]), float(xy[1])]
+                 for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2})
+        return prim
 
     def _optimizer_report_scorer(self):
         """The metric the 3D-LUT optimizer's SURFACED numbers are re-scored into for the LLM/user:
@@ -1295,8 +1347,7 @@ class Calibration:
         """This display+mode's DIP, if one has been characterized (else ``None`` → the measure
         loop falls back to its single-read default; runs are leaner, just not noise-aware). Falls
         back to a mode-less record for back-compat with DIPs written before mode-keying."""
-        store = self._dip_store()
-        return store.get(self._dip_key()) or store.get(self.display.name)
+        return dip_record_for(self._dip_store(), self.display.name, self.mode)
 
     def _loop_config_for(self, dip: Optional[DisplayInstrumentProfile]) -> MeasureLoopConfig:
         """Build the measure-loop config, preferring DIP-*measured* values over the profile's
@@ -1625,7 +1676,18 @@ class Calibration:
             # between iterations so a multi-hour optimize never goes dark for the LLM.
             self._maybe_timed_checkin("build-install-3dlut")
         except Exception:  # noqa: BLE001 - telemetry must never break the build
-            pass
+            # …but a persistent failure here silences BOTH the optimizer convergence events and
+            # the timed check-ins for the run's longest stage — log the first traceback so a
+            # dark build is diagnosable (workflow.log), then stay quiet (no per-iteration spam).
+            if not getattr(self, "_optimizer_telemetry_failed", False):
+                self._optimizer_telemetry_failed = True
+                import traceback
+                try:
+                    self.ctx.log("optimizer telemetry failed (build continues; convergence events "
+                                 "and check-ins may be missing for this stage):\n"
+                                 + traceback.format_exc())
+                except Exception:  # noqa: BLE001 - the fallback logger must not raise
+                    pass
 
     # -- §12 timed check-in (NON-BLOCKING evidence packet) ------------------
     def _maybe_timed_checkin(self, trigger: str) -> None:
@@ -1934,7 +1996,18 @@ class Calibration:
         tell: dict[str, Any] = {"checked": True, "colorspace": colorspace,
                                 "coverage_ratio": round(cov["coverage_ratio"], 4),
                                 "reachable": cov["reachable"], "shortfall": cov["shortfall"],
+                                "degenerate": cov.get("degenerate", False),
                                 "native_primaries": native}
+        if cov.get("degenerate"):
+            # A collinear/point native triangle is a CORRUPT characterization, never a real
+            # panel — without this branch the all-unreachable result below would read as
+            # "target outside the panel's gamut", sending the operator to gamut-map a panel
+            # whose measurement is simply broken. Say what it is: re-characterize.
+            tell["warning"] = (
+                "the stored native primaries are DEGENERATE (collinear/coincident — a corrupt "
+                "or botched characterization, not a real panel gamut). Coverage cannot be "
+                "assessed; re-run `--flow characterize` before trusting any gamut decision.")
+            return tell
         unreachable = [ch for ch, ok in cov["reachable"].items() if not ok]
         if unreachable:
             chans = "/".join(unreachable)
@@ -2001,6 +2074,8 @@ class Calibration:
             self.runlog.note("preflight", "checking display topology + the DesktopLUT pipe")
             # Verify the profile's display mapping against what the controller sees.
             mapping_ok = True
+            pipe_ok = True
+            pipe_error: Optional[str] = None
             seen_monitors: list[int] = []
             try:
                 state = self.controller.state()
@@ -2009,9 +2084,11 @@ class Calibration:
                 for key in (state.get("runtime") or {}).keys():
                     seen_monitors.append(int(str(key).split(":")[0]))
                 mapping_ok = (not seen_monitors) or (self.monitor in set(seen_monitors))
-            except Exception as exc:  # noqa: BLE001 - surfaced in the digest
-                state = {"error": f"{type(exc).__name__}: {exc}"}
+            except Exception as exc:  # noqa: BLE001 - surfaced in the digest + the pipe seam below
+                pipe_error = f"{type(exc).__name__}: {exc}"
+                state = {"error": pipe_error}
                 mapping_ok = False
+                pipe_ok = False
             # The persistent per-display store supplies the correction's real build
             # date when present (a refresh recorded since the profile was written),
             # so staleness ages from when the correction was actually made (§10).
@@ -2075,6 +2152,7 @@ class Calibration:
             backup = self._capture_user_backup(state)
             digest = {"monitor": self.monitor, "mode": self.mode, "display": self.display.name,
                       "argyll_display": self.display.argyll_display, "mapping_ok": mapping_ok,
+                      "pipe_ok": pipe_ok, "pipe_error": pipe_error,
                       "seen_monitors": sorted(set(seen_monitors)),
                       "monitor_map": monitor_map,
                       "correction": staleness.as_dict(),
@@ -2089,6 +2167,42 @@ class Calibration:
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
 
         outcome = self._stage("preflight", run)
+        # A dead-pipe preflight must NOT stay memoised (adversarial finding F7a-A1/A2): if it did,
+        # a resume after the operator fixes the pipe would replay the "done" record with the stale
+        # pipe_ok:false digest — re-firing this seam with a now-false question AND never re-running
+        # _capture_user_backup (callable only inside the memoised stage), permanently losing the
+        # durable rollback for a run whose pipe is healthy from enter-neutral on. Drop the memo so
+        # every invocation re-probes the live pipe and re-attempts the backup until it succeeds;
+        # once the pipe is up, preflight memoises normally.
+        if outcome.digest.get("pipe_ok") is False:
+            self.calib["stages"].pop("preflight", None)
+            self._save()
+        # Dead pipe (fable Phase 7a, owner-approved early fail): every flow except build-correction
+        # needs the pipe for something load-bearing (enter-neutral/install/require-stack/clear-native
+        # before a DIP), and without it the run dies one stage later with a raw exception AND no
+        # usable rollback backup. Abort here, where nothing has been measured or mutated, unless a
+        # judge knows better (e.g. the pipe is momentarily restarting). build-correction is exempt
+        # by design — it is deliberately pipe-optional (operator can hold the panel at native).
+        if outcome.digest.get("pipe_ok") is False and self.calib.get("flow") != "build-correction":
+            flow = self.calib.get("flow")
+            # Flow-accurate reason (finding F7a-A6): characterize drives the panel to native over
+            # the pipe and restores it (it does not install/enter-neutral); the calibrating flows
+            # enter neutral / install / roll back. Both are load-bearing and both lose the durable
+            # backup without the pipe.
+            need = ("cannot clear the panel to native for a valid characterization, or restore "
+                    "your setup afterwards" if flow == "characterize" else
+                    "cannot enter neutral, install a correction, or roll back")
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="preflight:pipe", seam=SEAM_PIPE, stage="preflight",
+                question=(f"the DesktopLUT calibration pipe is unreachable "
+                          f"({outcome.digest.get('pipe_error')}) — this {flow} flow {need} without "
+                          "it, and no pre-run backup could be captured. Abort (start DesktopLUT / "
+                          "arm the pipe first), or proceed?"),
+                options=("abort", "proceed"), recommendation="abort",
+                digest={"pipe_error": outcome.digest.get("pipe_error"),
+                        "flow": flow,
+                        "backup": outcome.digest.get("backup")})),
+                stage="preflight", message="aborted — DesktopLUT pipe unreachable at preflight")
         # Monitor↔Argyll↔panel map mismatch (#5): a wrong index/display number wastes the WHOLE run on
         # the wrong panel, so adjudicate it BEFORE measuring — recommend abort (fix the profile), but
         # let the operator/LLM proceed if the live topology is the surprise (e.g. a transient unplug).
@@ -2100,6 +2214,24 @@ class Calibration:
                          "disagrees with the live displays — abort and fix the profile, or proceed?"),
                 options=("abort", "proceed"), recommendation="abort", digest=monitor_map)),
                 stage="preflight", message="aborted on a monitor↔Argyll↔panel map mismatch")
+        # A failed pre-run backup means a failed/cancelled run may have NO durable rollback
+        # (the in-memory C++ snapshot is the live net, but it dies with DesktopLUT). That is a
+        # judgment call, not a log line (fable Phase 7a, from the BLE001 sweep): recommend
+        # proceed (the snapshot usually suffices) but flag compromised so a supervised run
+        # escalates and a live judge decides whether to run un-backed-up.
+        # (Gated on pipe_ok: a dead pipe already surfaced the missing backup in ITS seam above —
+        # one cause must not pause the run twice.)
+        backup = outcome.digest.get("backup") or {}
+        if backup and not backup.get("captured") and outcome.digest.get("pipe_ok") is not False:
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="preflight:backup", seam=SEAM_BACKUP, stage="preflight",
+                question=(f"the pre-run DesktopLUT settings backup could not be captured "
+                          f"({backup.get('error', 'unknown error')}) — a failed run would have no "
+                          "durable rollback beyond the in-memory snapshot. Proceed without a "
+                          "backup, or abort and fix (paths.desktoplut_ini / pipe)?"),
+                options=("proceed", "abort"), recommendation="proceed",
+                digest={**backup, "compromised": True})),
+                stage="preflight", message="aborted — pre-run settings backup could not be captured")
         staleness = outcome.digest.get("correction", {})
         # The build-correction flow IS the refresh, so don't ask about staleness there.
         if staleness.get("stale") and self.calib.get("flow") != "build-correction":
@@ -2118,6 +2250,24 @@ class Calibration:
                                        "active correction), then re-run this calibration."}))
         return outcome
 
+    def _reject_mode_target_mismatch(self, stage: str, target: str, spec: cp.TargetSpec) -> None:
+        """P12 guard (fable Phase 7a): the run MODE and the resolved target's transfer must
+        agree. The refine fork in ``_flow_full``/``_flow_mhc_only`` switches on ``spec.is_hdr``
+        while ``_planned_stages`` (the dashboard stepper) and ``_reachable_primaries`` switch on
+        ``self.mode`` — a profile that maps a display's SDR slot to a PQ target (or vice versa)
+        would otherwise run an incoherent hybrid (HDR refine + SDR gamut clamp, a stepper showing
+        the other mode's stages) with nothing surfacing why. Reject it loudly at resolve time —
+        the two predicates are then provably interchangeable for the rest of the run."""
+        if spec.is_hdr != (self.mode == "HDR"):
+            raise CalibrationAborted(StageOutcome(
+                stage, "aborted",
+                digest={"message": (
+                    f"target {target!r} is a {'PQ/HDR' if spec.is_hdr else 'power-law/SDR'} target "
+                    f"but the run mode is {self.mode} — the profile maps display {self.monitor}'s "
+                    f"{self.mode} slot ({'hdr_target' if self.mode == 'HDR' else 'sdr_target'}) to a "
+                    f"mismatched target. Fix the profile before running."),
+                    "target": target, "target_is_hdr": spec.is_hdr, "run_mode": self.mode}))
+
     def stage_resolve_target(self) -> StageOutcome:
         # This stage owns its own adjudication (the plan seam) and so bypasses _stage —
         # announce it on the spine directly so the dashboard phase header still tracks it.
@@ -2129,6 +2279,7 @@ class Calibration:
                 "resolve-target", "aborted",
                 digest={"message": f"display {self.monitor} has no {self.mode} target configured"}))
         spec = self.profile.target(target)
+        self._reject_mode_target_mismatch("resolve-target", target, spec)
         self.target_name = target
         self.calib["target"] = target
         self._save()
@@ -2170,15 +2321,34 @@ class Calibration:
                   "colorspace": spec.colorspace, "transfer": transfer_label,
                   "white": f"{spec.white.intent} ({spec.white.method})",
                   "white_nits": target_nits, "patch_plan": self.calib["patch_plan"]}
+        plan_warnings: list[str] = []
         if hdr:
             digest["hdr_target"] = hdr.as_dict()
+            # Surface the HdrTarget provenance FLAGS in the seam question itself, not three
+            # levels deep in the digest — each one means "re-characterize", and the plan
+            # seam is the veto point where that is still cheap (fable Phase 6, Phase 2 lead).
+            prov = hdr.provenance or {}
+            if (prov.get("undershoot") or {}).get("clamped"):
+                plan_warnings.append(
+                    "the measured EOTF undershoot implies an implausible boost — the gain was "
+                    f"CLAMPED to {hdr.undershoot_gain:.3f}×; suspect characterization, consider "
+                    "re-measuring before calibrating to it")
+            if (prov.get("peak") or {}).get("sustained_unknown"):
+                plan_warnings.append(
+                    "the target peak rests on no warm/sustained capture "
+                    f"({(prov.get('peak') or {}).get('source', 'unknown source')}) — a peak the "
+                    "panel cannot hold bakes in error; a characterize run grounds it")
+        if plan_warnings:
+            digest["hdr_target_warnings"] = plan_warnings
         self._abort_if(self.adjudicate(AdjudicationRequest(
             key="resolve-target:plan", seam=SEAM_PLAN, stage="resolve-target",
             question=(f"Plan: {flow} calibration of monitor {self.monitor} "
                       f"({self.display.name}) to target '{target}' "
                       f"({transfer_label}, {spec.white.intent}, {nits_label}) — "
                       f"{patch_plan['total_patches']} patches "
-                      f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). Proceed?"),
+                      f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). "
+                      + ("".join(f"⚠ {w}. " for w in plan_warnings))
+                      + "Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
         self.calib["patch_plan"] = {**patch_plan, "approved": True}
@@ -2639,7 +2809,10 @@ class Calibration:
         # Before→after dE trend on the spine (#8): score the INTERMEDIATE measures so the
         # dashboard's ΔE panel + de_history show the run converging (native → after ICC → after
         # 3D LUT) instead of a single verify point. verify does its own richer scoring at the gate.
-        if role in ("raw", "post-mhc") and outcome.status == "done":
+        # Fresh executions only: a memoised replay already put its metrics_scored on the spine in
+        # the invocation that measured it (events.jsonl is append-only across resumes), so
+        # re-scoring here would duplicate the convergence history on every resume.
+        if role in ("raw", "post-mhc") and outcome.status == "done" and not outcome.replayed:
             score_anomaly = self._score_stage(
                 role, outcome.data.get("ti3"),
                 label="raw (native)" if role == "raw" else "after ICC")
@@ -2659,6 +2832,14 @@ class Calibration:
                     f"max {score_anomaly['max_de2000']}); data needs adjudication"
                 )
                 outcome.data["question"] = f"{score_q}; {base_q}" if base_q else score_q
+                # Persist the mutated record BEFORE adjudicating (fable Phase 7a): the escalation
+                # seam below may PAUSE the run (AdjudicationRequired exits the process without a
+                # save), and a resume replays this stage from the record WITHOUT re-scoring (the
+                # replayed gate above) — an unpersisted anomaly would silently skip the seam the
+                # LLM never answered. _stage stored this same outcome's record, so re-recording
+                # is a cheap idempotent overwrite carrying the anomaly flags.
+                self.calib["stages"][key] = outcome.as_record()
+                self._save()
         if outcome.data.get("needs_adjudication"):
             panel_dark = bool(outcome.digest.get("panel_dark"))
             if panel_dark:
@@ -2694,6 +2875,14 @@ class Calibration:
                 self.calib["stages"].pop(key, None)
                 self.calib.get("decisions", {}).pop(f"{key}:escalation", None)
                 self.decision_overrides.pop(f"{key}:escalation", None)
+                # Also drop the copy in the adjudicator's SEED map (Mapping/Supervised are seeded
+                # from the run-record + --decide at process start). Without this, a re-measure
+                # that STILL escalates re-answers itself "remeasure" from the seed — an unbounded
+                # silent hardware re-measure loop that never re-reaches the LLM. One remeasure
+                # decision buys exactly one re-measure; a second escalation pauses again.
+                seed = getattr(self.adjudicator, "decisions", None)
+                if isinstance(seed, dict):
+                    seed.pop(f"{key}:escalation", None)
                 self._save()
                 return self.stage_measure(role=role, patches=patches,
                                           ti3_name=ti3_name, ndjson_name=ndjson_name)
@@ -2760,31 +2949,28 @@ class Calibration:
             # HDR scores dE_ITP vs PQ/Rec.2020; SDR CIEDE2000 vs γ-power. Scoring HDR PQ data
             # as an SDR power target (the old unconditional path) produced garbage dE2000 (~30+
             # at mid-gray) on the dashboard's convergence trend — branch like stage_verify.
+            reachable = self._reachable_primaries() if spec.is_hdr else None
             if spec.is_hdr:
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy),
                                                  peak_nits=self._hdr_target().peak_nits,
-                                                 reachable_primaries=self._reachable_primaries())
+                                                 reachable_primaries=reachable)
                 metric_name = "dE_ITP"
             else:
                 metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
                 metric_name = "CIEDE2000"
             summary = summarize_metrics(phase=label, iteration=0, source=p,
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
-            colour_de = [m.de2000 for m in metrics if not m.grayscale]
-            all_de = [m.de2000 for m in metrics]
-            p99 = percentile(all_de, 99.0)
+            practical = practical_summary(metrics, is_hdr=spec.is_hdr,
+                                          gamut_aware=reachable is not None)
             # Snapshot for the timed check-in's live metrics (most recent intermediate score).
             self._last_scored = {"label": label, "metric": metric_name,
                                  "avg": round(summary.avg_de2000, 3), "max": round(summary.max_de2000, 3),
                                  "white": round(summary.white_de2000, 3)}
+            # Canonical event shape (metrics.metrics_scored_payload, P4) — same keys every
+            # producer emits, so the dashboard ΔE panel renders live and stage-CLI runs alike.
             self.runlog.metrics_scored(
-                f"measure:{role}", label=label, iteration=0, metric=metric_name,
-                avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
-                p99_de2000=round(p99, 3),
-                max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
-                grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
-                colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
-                patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
+                f"measure:{role}",
+                **metrics_scored_payload(summary, label=label, practical=practical))
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
             high_spikes = [m for m in metrics if m.de2000 >= 100.0]
             high_fraction = len(high_spikes) / len(metrics) if metrics else 0.0
@@ -2805,14 +2991,15 @@ class Calibration:
                     "metric": metric_name,
                     "avg_de2000": round(summary.avg_de2000, 3),
                     "p95_de2000": round(summary.p95_de2000, 3),
-                    "p99_de2000": round(p99, 3),
+                    "p99_de2000": round(summary.p99_de2000, 3),
                     "max_de2000": round(summary.max_de2000, 3),
                     "white_de2000": round(summary.white_de2000, 3),
                     "high_spike_count": len(high_spikes),
                     "high_spike_fraction": round(high_fraction, 4),
                     "patch_count": summary.patch_count,
                     "worst": [{"rgb": [round(c, 4) for c in m.rgb],
-                               "de2000": round(m.de2000, 3)} for m in worst],
+                               "de2000": round(m.de2000, 3),
+                               "gamut_clamped": m.gamut_clamped} for m in worst],
                 }
                 self.runlog.anomaly(
                     f"measure:{role}",
@@ -2826,6 +3013,20 @@ class Calibration:
                 return anomaly
             return None
         except Exception:  # noqa: BLE001 - advisory telemetry; a scoring hiccup never breaks the flow
+            # …but this guard swallowed a real NameError during Phase 6's own development, and it
+            # protects the score-anomaly escalation — the exact signal it can eat. Log the full
+            # traceback (workflow.log) and put a WARN on the spine so the LLM/dashboard see that
+            # the intermediate score is MISSING, instead of the failure vanishing without a trace.
+            import traceback
+            self.ctx.log(f"intermediate scoring for measure:{role} failed (advisory, flow continues):\n"
+                         + traceback.format_exc())
+            try:
+                self.runlog.note(f"measure:{role}",
+                                 "intermediate scoring failed — no metrics_scored for this stage; "
+                                 "traceback in workflow.log", level="WARN",
+                                 error=traceback.format_exc(limit=3))
+            except Exception:  # noqa: BLE001 - the fallback logger must not raise
+                pass
             return None
 
     def stage_build_install_mhc(self, raw_ti3: str) -> StageOutcome:
@@ -2933,8 +3134,14 @@ class Calibration:
                       "profile_name": profile_name, "verified": verify_ok}
             if spec.is_hdr and params.get("peak_chroma"):
                 # Standalone-D65 evidence: the cold-channel-limited Peak-Chroma luminance the
-                # closed-loop refine will hold D65 to (see stage_refine_mhc_cube).
+                # closed-loop refine will hold D65 to (see stage_refine_mhc_cube). Carries the
+                # P16 honesty fields (measured_peak_nonadditivity / cap_nits_nonadditive_est)
+                # so the adjudicator sees how far the nominal-additive cap overshoots (HW-5).
                 digest["peak_chroma"] = params["peak_chroma"]
+            if params.get("dark_floor"):
+                # The σ-aware adaptive dark floor's verdict (Phase 4, F4-1/HW-4): nits + how
+                # many strayed dark reads were σ-verified REAL drift (corrected) vs smoothed.
+                digest["dark_floor"] = params["dark_floor"]
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
@@ -3599,10 +3806,16 @@ class Calibration:
         Mirrors the manual "Edit Points → adjust → OK" workflow over the pipe: ``grayscale_live_begin``
         engages the preview shader (the MHC ``correctionGrayscale`` stacks live on top of MHC+3D-LUT so
         the meter SEES it — render.cpp:346 ``corrGsPreviewActive`` gate), then per editor grey point we
-        measure → nudge the point's R/G/B live → re-measure, move on; ``grayscale_commit`` bakes the
-        result into the ICM on accept (the editor's "OK"), ``grayscale_cancel`` reverts on abort. This
-        is the toggleable third "+1": the core (matrix + base grayscale + 3D LUT) is never touched, and
-        the result is one-toggle revertible to the vanilla ICM. Requires the live preview path
+        measure → nudge the point's R/G/B live → re-measure, move on; ``grayscale_commit`` (the
+        editor's "OK") bakes the result into the ICM at the END of this stage so ``measure:verify``
+        scores the REAL baked result (the live preview is only bit-identical to the bake on the SDR
+        realization-A path — HDR previews light that differs, so verifying the preview would ship an
+        unverified deliverable). Revert is DLC-owned (fable Phase 7a, Design B): the pre-begin
+        correctionGrayscale is snapshotted to dlc_state before the edit, and ``verify:accept =
+        revert`` re-applies it (``_restore_correction_grayscale``) rather than relying on the C++
+        ``grayscale_cancel`` (a no-op once commit has run) — robust across a DesktopLUT restart.
+        This is the toggleable third "+1": the core (matrix + base grayscale + 3D LUT) is never
+        touched, and the result is one-toggle revertible to the user's prior correction. Requires the live preview path
         (CODEX_GRAYSCALE_LIVE_EDIT_PROMPT.md); the old ``set_grayscale_tweak`` overlay was a no-op
         under an active MHC (it wrote the wrong store, ``cc.grayscale``, suppressed by render.cpp:346).
         """
@@ -3630,6 +3843,15 @@ class Calibration:
             payload = identity_payload(points)
             spec = self._spec()
             cfg = GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma))
+
+            # DLC-OWNED revert snapshot (fable Phase 7a, Design B): read the user's PRE-BEGIN
+            # correctionGrayscale off the live state and persist it BEFORE we touch anything, so a
+            # `revert` at the verify gate restores exactly that — independent of the C++ cancel path
+            # (which is a no-op once commit has run) and durable across a DesktopLUT restart (the
+            # snapshot lives in dlc_state.json, not DesktopLUT's in-memory GsLiveState). None ⇒ no
+            # prior correction (revert clears to identity).
+            self.calib["grayscale_wb_prior"] = self._snapshot_correction_grayscale()
+            self._save()
 
             # Engage the live grayscale editor (the "Edit Points" path): this strips any prior
             # correction-grayscale from the active MHC permutation and shows a live, measurable
@@ -3747,7 +3969,8 @@ class Calibration:
             session_digest = session.finish()
 
             # Ensure the final table is live in the preview even if every point was already within
-            # target (it is baked into the ICM by grayscale_commit on the accept path, below).
+            # target — it is baked into the ICM by the grayscale_commit at the end of this stage
+            # (Design B), so measure:verify then scores the real result.
             self.controller.grayscale_set_live(
                 self.monitor, self.mode, payload["point_count"], payload["points"],
                 payload["deviations"])
@@ -3812,11 +4035,73 @@ class Calibration:
                     "grayscale-wb", "aborted",
                     digest={"message": "aborted on large Grayscale touch-up",
                             "decision_note": decision.note, **outcome.digest}))
-        # Accept path: bake the previewed correction into the ICM (the editor's "OK") — toggleable,
-        # core untouched. Skip when nothing was previewed (no patches / preview never engaged).
+        # Bake the touch-up into the ICM NOW (Design B, fable Phase 7a) — so measure:verify
+        # measures the REAL baked result, not the live preview. The preview is only bit-identical
+        # to the bake for the SDR realization-A path; HDR (and any SDR full-preview fallback)
+        # previews light that provably differs from the bake, so verifying the preview would ship
+        # an unverified deliverable. Committing here also makes the touch-up durable across a
+        # DesktopLUT restart (it is in the ICM, not the in-memory preview). `revert` at the verify
+        # gate does NOT depend on the C++ cancel-after-commit (a no-op): _revert_inplace re-applies
+        # the DLC-owned pre-begin snapshot captured above. Skip when nothing was previewed.
         if not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable")):
-            self.controller.grayscale_commit(self.monitor, self.mode)
+            baked = self.controller.grayscale_commit(self.monitor, self.mode)
+            # The C++ returns baked:false if the live session was lost (e.g. DesktopLUT restarted
+            # mid-run) — surface it as a compromised seam rather than logging a bake that did not
+            # happen. A dict without an explicit baked:false is treated as success (older builds
+            # may omit the key). (gs-wb adversarial finding: the flag was previously unread.)
+            if isinstance(baked, dict) and baked.get("baked") is False:
+                self.runlog.anomaly(
+                    "grayscale-wb", bake_lost=True,
+                    message="grayscale_commit reported no live session to bake (DesktopLUT "
+                            "restarted mid-run?) — the touch-up was NOT applied")
+                self._abort_if(self.adjudicate(AdjudicationRequest(
+                    key="grayscale-wb:bake-lost", seam=SEAM_MEASURE, stage="grayscale-wb",
+                    question=("the Grayscale touch-up could not be baked — DesktopLUT reported no "
+                              "live edit session (it may have restarted mid-run). Re-run the "
+                              "touch-up after restarting it, or abort?"),
+                    options=("abort",), recommendation="abort",
+                    digest={**outcome.digest, "bake_lost": True, "compromised": True})),
+                    stage="grayscale-wb", message="grayscale touch-up bake lost (no live session)")
+            else:
+                self.ctx.log("baked the Grayscale touch-up into the ICM")
         return outcome
+
+    def _snapshot_correction_grayscale(self) -> Optional[dict[str, Any]]:
+        """The live correctionGrayscale for this monitor/mode from ``state.get`` (the user's
+        current correction), or ``None`` if absent/unreadable — the DLC-owned revert snapshot
+        for the grayscale touch-up (Design B). Best-effort: a down pipe just yields None (the
+        touch-up won't proceed far without the pipe anyway)."""
+        try:
+            state = self.controller.state()
+            key = f"{self.monitor}:{self.mode}"
+            cg = (((state.get("mhc") or {}).get(key) or {}).get("correction_grayscale"))
+            return dict(cg) if isinstance(cg, dict) and cg.get("points") else None
+        except Exception:  # noqa: BLE001 - advisory snapshot; revert falls back to clearing
+            return None
+
+    def _restore_correction_grayscale(self) -> bool:
+        """Re-apply the DLC-owned pre-begin correctionGrayscale snapshot and regenerate the ICM
+        (Design B revert). Restores the user's prior correction if one was captured, else clears
+        to identity — either way it does NOT rely on the C++ cancel-after-commit no-op. Returns
+        whether the restore call chain succeeded."""
+        prior = self.calib.get("grayscale_wb_prior")
+        try:
+            if prior and prior.get("points"):
+                self.controller.set_correction_grayscale(
+                    self.monitor, self.mode, prior["point_count"], prior["points"],
+                    prior["deviations"], gamma=float(self._spec().gamma))
+            else:
+                n = 32
+                grid = [j / (n - 1) for j in range(n)]
+                self.controller.set_correction_grayscale(
+                    self.monitor, self.mode, n, grid,
+                    {ch: [1.0] * n for ch in ("r", "g", "b")}, gamma=float(self._spec().gamma))
+            self.controller.apply_mhc(self.monitor, self.mode)
+            return True
+        except Exception as exc:  # noqa: BLE001 - fall through to the manual-backup guidance
+            self.ctx.log(f"grayscale touch-up revert failed ({type(exc).__name__}: {exc}); "
+                         "see settings backup")
+            return False
 
     def _active_runtime_cube(self) -> Optional[str]:
         try:
@@ -3947,14 +4232,17 @@ class Calibration:
             # scores dE_ITP against PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's
             # Lab is meaningless at HDR absolute luminance), with looser, LLM-negotiated targets.
             wx, wy = self._white_xy()
+            reachable = self._reachable_primaries() if spec.is_hdr else None
             if spec.is_hdr:
                 hdr = self._hdr_target()
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits,
-                                                  reachable_primaries=self._reachable_primaries())
+                                                  reachable_primaries=reachable)
                 metric_name = "dE_ITP"
-                # Advisory HDR defaults (dE_ITP); the assistant negotiates the real target
-                # at the verify seam after the first refinement round (design §7).
-                q = hdr_metric_thresholds()
+                # Advisory HDR defaults (dE_ITP), overlaid by the profile's optional
+                # ``quality: {hdr: {...}}`` block — the same policy source the stage-CLI
+                # scorer reads — then negotiated by the assistant at the verify seam after
+                # the first refinement round (design §7).
+                q = hdr_metric_thresholds(self.profile.quality_policy)
             else:
                 metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
                 metric_name = "CIEDE2000"
@@ -3963,20 +4251,26 @@ class Calibration:
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
                       and summary.max_de2000 <= q.max_de2000 and summary.white_de2000 <= q.white_de2000)
+            # The §0 practically-weighted view (metrics.practical_summary): core (Rec.709 ≤
+            # ref-white, reachable) is the practical verdict; `clamped` isolates residuals at
+            # the panel's gamut floor so they are read as reachability, never calibration error.
+            practical = practical_summary(metrics, is_hdr=spec.is_hdr,
+                                          gamut_aware=reachable is not None)
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
+            # Persist the scored evidence (reports/verification_iter00_{metrics,patch_metrics}.json —
+            # the artifact the dashboard's /api/patch_metrics serves) via the one shared writer;
+            # the event is emitted below through the phase-stamped runlog instead (emit_event=False).
+            metrics_mod.write_metrics(
+                ctx=self.ctx, phase="verification", iteration=0, source=Path(verify_ti3),
+                patch_metrics=metrics, target_luminance=lum, metric=metric_name,
+                practical=practical, emit_event=False)
             # Put the scored dE summary on the spine so the dashboard's ΔE big-numbers
             # panel (and the LLM digest) get it — the rich digest below only reaches the
-            # adjudicator, not events.jsonl. One event carries the whole panel: the
-            # percentiles plus the grayscale-vs-colour split.
-            colour_de = [m.de2000 for m in metrics if not m.grayscale]
+            # adjudicator, not events.jsonl. One event carries the whole panel, in the
+            # canonical shape every producer emits (metrics.metrics_scored_payload, P4).
             self.runlog.metrics_scored(
-                "verify", label="verification", iteration=0, metric=metric_name,
-                avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
-                p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
-                max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
-                grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
-                colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
-                patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
+                "verify", **metrics_scored_payload(summary, label="verification",
+                                                   practical=practical))
             digest = {"avg_de2000": round(summary.avg_de2000, 3), "p95_de2000": round(summary.p95_de2000, 3),
                       "max_de2000": round(summary.max_de2000, 3), "white_de2000": round(summary.white_de2000, 3),
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
@@ -3988,7 +4282,10 @@ class Calibration:
                       "metric": metric_name, "optimize_metric": "dE_ITP",
                       "target_white_xy": [round(wx, 5), round(wy, 5)],
                       "white_provenance": self._resolved_white().provenance,
-                      "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2)} for m in worst]}
+                      "gamut_aware": reachable is not None,
+                      "practical": practical,
+                      "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2),
+                                 "gamut_clamped": m.gamut_clamped} for m in worst]}
             return StageOutcome("verify", "done", digest=digest,
                                 data={"within_quality": within, "metrics": {
                                     "avg_de2000": summary.avg_de2000, "p95_de2000": summary.p95_de2000,
@@ -4013,6 +4310,20 @@ class Calibration:
         return outcome
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
+        """Is a failed verify CATASTROPHIC (recommend revert) rather than merely
+        sub-quality (recommend apply, escalate via gate_failed)? These are not quality
+        thresholds — they answer "is the panel visibly WORSE than uncalibrated?".
+
+        Provenance (fable audit Phase 6, P3): each constant is ~10× its mode's advisory
+        acceptance target (SDR avg 20 vs gate 1.5→severe at ~13×, p95 40 vs 3.0; HDR avg
+        30 vs 3.0, p95 60 vs 6.0) — an order of magnitude past the gate is a broken
+        install (wrong LUT, collapsed channel, scoring mismatch), never a marginal miss.
+        The recorded hardware baselines sit two orders below (SDR 0.41 avg; HDR 3.26
+        grayscale WITH gamut-floor patches counted, pre-P1). max/white at 100 ≈ "a
+        primary/white read as a different colour entirely" (full-scale Lab/ITP error);
+        SDR white at 50 is tighter because a mid-double-digit ΔE2000 white cast is
+        already unmistakably broken on any SDR desktop. Deliberately blunt: the severe
+        path only flips the RECOMMENDATION to revert — the seam still decides."""
         if outcome.data.get("within_quality"):
             return False
         d = outcome.digest or {}
@@ -4177,9 +4488,18 @@ class Calibration:
             if flow == "characterize":
                 return self._flow_characterize()
             if flow == "hdr":
+                # P13 (fable Phase 7a): HDR is a MODE, not a flow — `--mode HDR` on the normal
+                # flows runs the full HDR pipeline (PQ target, HDR refine, dE_ITP verify). This
+                # signpost stub explains that instead of the stale "post-v1" claim it used to
+                # carry; it deliberately does NOT auto-route, because the run's mode is fixed at
+                # creation (the manifest) and silently switching it here would be run-spec drift.
                 raise CalibrationAborted(StageOutcome(
                     "resolve-target", "aborted",
-                    digest={"message": "HDR is the post-v1 goal; v1 is SDR-first. Use 'full' on an SDR target."}))
+                    digest={"message": (
+                        "'hdr' is not a flow — HDR is a MODE. Run the normal flows in HDR: "
+                        "`--mode HDR --flow full` (or mhc-only / 3dlut-only / characterize). "
+                        "The mode selects the display's hdr_target, the PQ transfer, and the "
+                        "HDR refine stages.")}))
             raise ValueError(f"unknown flow {flow!r} (have: {sorted(FLOWS)})")
         except CalibrationAborted as exc:
             self.calib["stages"][exc.outcome.stage] = exc.outcome.as_record()
@@ -4302,7 +4622,10 @@ class Calibration:
         elif self.calib.get("inplace_baseline") is not None:
             if choice == "revert":
                 status = self._revert_inplace()
-            # else: the in-place refinement is already applied; nothing to commit.
+            # else: the in-place refinement is already applied; nothing to commit. The
+            # grayscale-wb touch-up was baked in its stage (Design B, fable Phase 7a) so
+            # measure:verify scored the real result; apply keeps it, revert (above →
+            # _revert_inplace) re-applies the DLC-owned pre-begin snapshot.
         if status == "completed":
             # Apply path: re-point DesktopLUT at the DURABLE deliverable cube so a cleaned
             # run folder can't break the live calibration (the build artifact lives under the
@@ -4439,7 +4762,12 @@ class Calibration:
                 digest={"message": f"display {self.monitor} has no {self.mode} target — needed only "
                                    "for the patch transfer (bit depth); add one to the profile."}))
         spec = self.profile.target(target)
-        # HDR characterization IS allowed (unlike HDR *calibration*, which is post-v1): it only
+        # Same P12 coherence guard as resolve-target: characterize drives the native panel
+        # through this target's TRANSFER (bit depth + signal↔nits map), so a mismatched slot
+        # (e.g. an HDR slot pointing at a power-law target) would measure every level at the
+        # wrong code↔luminance mapping and bake it into the DIP.
+        self._reject_mode_target_mismatch("characterize", target, spec)
+        # HDR characterization is routine (like HDR calibration via --mode HDR): it only
         # measures the native panel + restores, and HDR is exactly where learning the thermal
         # regime matters most (the backlight is content-driven and may never reach steady state).
         if spec.is_hdr:
@@ -4519,8 +4847,8 @@ class Calibration:
                 raise CalibrationAborted(StageOutcome("require-stack", "aborted", digest=digest))
 
 
-# Flow registry (the named flows the front door maps an intent onto). HDR is the
-# later goal; v1 is SDR-first.
+# Flow registry (the named flows the front door maps an intent onto). HDR is a run
+# MODE (--mode HDR), orthogonal to the flow — the "hdr" entry is a signpost stub.
 FLOWS: dict[str, str] = {
     "full": "neutral → raw → MHC + D65 grayscale refine → post-MHC → 3D LUT → verify → report",
     "mhc-only": "raw → MHC (matrix + 1D + D65 grayscale refine) → verify → report (ICC only; no 3D LUT — shakedown)",
@@ -4528,7 +4856,7 @@ FLOWS: dict[str, str] = {
     "grayscale-wb": "verify MHC present -> patch-by-patch user Grayscale correction -> grey-ramp verify",
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
-    "hdr": "(post-v1) Rec.2020/PQ — SDR-first in v1",
+    "hdr": "(not a flow — signpost) HDR is a MODE: use --mode HDR with full / mhc-only / 3dlut-only",
 }
 
 
@@ -5045,6 +5373,20 @@ def dip_store_path(profile: cp.Profile, ctx_root: Path) -> Path:
     return base / "dip_store.json"
 
 
+def dip_record_for(store: DipStore, display_name: str,
+                   mode: Optional[str]) -> Optional[DisplayInstrumentProfile]:
+    """Look up a display's DIP the way the store is KEYED: ``display:mode`` first (the
+    characterize flow stores mode-keyed records — panel thermal/noise behaviour differs by
+    mode), falling back to a bare mode-less record for back-compat. Every consumer must use
+    this two-key lookup — a bare ``store.get(name)`` silently misses every mode-keyed DIP
+    (Calibration._dip does the same dance; this is the module-level twin for ``main()``)."""
+    if mode:
+        rec = store.get(f"{display_name}:{mode}")
+        if rec is not None:
+            return rec
+    return store.get(display_name)
+
+
 def _render_cmd(argv: Sequence[Any]) -> str:
     """Render an argv list as a copy-pasteable command line (Windows quoting)."""
     import subprocess
@@ -5530,8 +5872,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # DIP) over the guessed 0.5 s — a fast panel runs leaner, a slow mini-LED waits long
         # enough. EXCEPT during `characterize` itself, which must observe the raw step response
         # (waiting out a prior settle estimate would hide it), so it keeps the paint-safe default.
-        dip_rec = DipStore.load(dip_store_path(profile, ctx.root)).get(
-            profile.display_for(args.monitor).name)
+        dip_rec = dip_record_for(DipStore.load(dip_store_path(profile, ctx.root)),
+                                 profile.display_for(args.monitor).name, eff_mode)
         # Floor the dwell so a fast panel (measured settle ≈ 0) still gets a paint-safe wait, while a
         # slow-ABL panel's larger measured settle is honoured. characterize keeps the default (it must
         # observe the raw step response, and its settle measurement is dwell-independent anyway).
@@ -5648,28 +5990,34 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              bit_depth=bit_depth)
         presenter.show(patch)
 
-    # Pass the RAW CLI mode (Calibration re-runs the same deterministic reconciliation and,
-    # seeing the raw request, surfaces a mis-issued flagless resume that asked for SDR on an HDR
-    # run instead of silently switching). bit_depth is the already-RESOLVED value so the
-    # orchestrator's patch encoding matches the meter/dogegen stack built above AND gets persisted
-    # as the run's depth — main()'s fresh default (8-bit SDR) and the orchestrator's panel-depth
-    # default differ, so passing the resolved value is what keeps the live path consistent.
-    calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
-                        controller=controller, measure=measure, adjudicator=adjudicator,
-                        bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
-                        characterize_config=characterize_config, decision_overrides=overrides,
-                        adaptive_planning=args.adaptive_planning,
-                        stall_kill_hook=_stall_kill, pause_handler=_pause_park,
-                        enable_watchdog=True, checkin_interval_s=args.checkin_interval,
-                        require_hardware_readiness=True,
-                        neutral_min_reads=args.neutral_min_reads,
-                        dark_min_reads=args.dark_min_reads,
-                        dark_floor_max_nits=args.dark_floor_max_nits,
-                        neutral_chroma_span=args.neutral_chroma_span,
-                        neutral_floor_min_nits=args.neutral_floor_min_nits)
     result = None
     paused = False
+    calib = None   # bound inside the try; the finally checks `is not None` (ctor may raise)
     try:
+        # Constructed INSIDE the teardown guard (fable Phase 7a): the persistent spotread child
+        # + presenter were opened above, and the ctor can raise (a corrupt dlc_state.json fails
+        # its bare json.loads on resume) — outside this try that orphaned the spotread process
+        # and the dogegen window with no rollback.
+        #
+        # Pass the RAW CLI mode (Calibration re-runs the same deterministic reconciliation and,
+        # seeing the raw request, surfaces a mis-issued flagless resume that asked for SDR on an HDR
+        # run instead of silently switching). bit_depth is the already-RESOLVED value so the
+        # orchestrator's patch encoding matches the meter/dogegen stack built above AND gets persisted
+        # as the run's depth — main()'s fresh default (8-bit SDR) and the orchestrator's panel-depth
+        # default differ, so passing the resolved value is what keeps the live path consistent.
+        calib = Calibration(ctx=ctx, profile=profile, monitor=args.monitor, mode=args.mode,
+                            controller=controller, measure=measure, adjudicator=adjudicator,
+                            bit_depth=bit_depth, force=args.force, patch_sizes=patch_sizes,
+                            characterize_config=characterize_config, decision_overrides=overrides,
+                            adaptive_planning=args.adaptive_planning,
+                            stall_kill_hook=_stall_kill, pause_handler=_pause_park,
+                            enable_watchdog=True, checkin_interval_s=args.checkin_interval,
+                            require_hardware_readiness=True,
+                            neutral_min_reads=args.neutral_min_reads,
+                            dark_min_reads=args.dark_min_reads,
+                            dark_floor_max_nits=args.dark_floor_max_nits,
+                            neutral_chroma_span=args.neutral_chroma_span,
+                            neutral_floor_min_nits=args.neutral_floor_min_nits)
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:
@@ -5711,14 +6059,36 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         if not paused:
             handled = result is not None and getattr(result, "status", None) in (
                 "completed", "reverted", "revert_unavailable")
-            if not handled:
+            # Nothing to roll back if the run never entered calibration mode / never mutated the
+            # display — e.g. a clean early-fail at the pipe/plan/backup seam (finding F7a-A8).
+            # Skipping avoids a spurious `rollback_failed` (exit_calibration over the very pipe
+            # that was down) on a run the seam itself advertised as "nothing measured or mutated".
+            entered = False
+            try:
+                entered = calib is not None and (
+                    calib._entered_calibration()
+                    or calib.calib.get("inplace_baseline") is not None)
+            except Exception:  # noqa: BLE001 - defensive; fall back to attempting rollback
+                entered = True
+            if not handled and entered:
                 try:
                     controller.exit_calibration(restore_snapshot=True)
                     print(json.dumps({"status": "rolled_back",
                                       "reason": "run did not complete; restored pre-run setup",
                                       "run": str(ctx.root)}, indent=2))
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001 - but a FAILED rollback must never be silent
+                    # The one teardown failure that can cost the user their display setup: the
+                    # run died half-applied AND the snapshot restore failed. Say so, and point
+                    # at the durable backup captured at preflight, instead of exiting mute.
+                    bak = (state.get("calib", {}) or {}).get("backup", {})
+                    print(json.dumps({
+                        "status": "rollback_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "run": str(ctx.root),
+                        "backup": bak,
+                        "hint": "restore manually: `dlc-calibrate --abort --run <dir>` once the "
+                                "pipe is back, or re-import the settings backup from the run dir",
+                    }, indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover

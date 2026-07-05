@@ -12,6 +12,7 @@ from .argyll import command_for_log
 from .desktoplut_client import DesktopLutClient
 from .events import EventWriter
 from .mhc import resolve_run_path
+from .profiles import argyll_ref_profile
 from .runs import RunContext
 from .simulation import write_identity_cube, write_placeholder_icc
 from .tools import ToolSet
@@ -57,9 +58,12 @@ class Lut3dBuildResult:
 
 
 def default_source_icc(mode: str) -> Path:
+    # PROJECT_DIR-anchored (absolute), so the default does not silently depend on
+    # the caller's cwd — a relative path here only resolved when the orchestrator
+    # happened to be launched from the DLC directory.
     if mode.upper() == "SDR":
-        return Path("third_party") / "argyll" / "3.3.0" / "ref" / "Rec709.icm"
-    return Path("third_party") / "argyll" / "3.3.0" / "ref" / "Rec2020.icm"
+        return argyll_ref_profile("Rec709.icm")
+    return argyll_ref_profile("Rec2020.icm")
 
 
 def latest_post_mhc_icc(ctx: RunContext) -> Path | None:
@@ -386,8 +390,14 @@ def apply_3dlut_candidate(
     cube_path: Path | None = None,
     monitor: int = 0,
 ) -> dict[str, Any]:
-    cube = resolve_run_path(ctx, cube_path or latest_3dlut_cube(ctx) or Path(""))
-    if not cube.exists():
+    candidate = cube_path or latest_3dlut_cube(ctx)
+    if candidate is None:
+        # NB: falling through to a placeholder like Path("") is not safe here — it resolves
+        # to the cwd, a directory that EXISTS, and would be sent to DesktopLUT as the cube.
+        raise FileNotFoundError(
+            "no 3D LUT cube recorded in this run; run build-3dlut or pass cube_path")
+    cube = resolve_run_path(ctx, candidate)
+    if not cube.is_file():
         raise FileNotFoundError(f"3D LUT cube not found: {cube}")
     commands = [
         client.disable_grayscale_tweak(monitor, ctx.manifest.mode),

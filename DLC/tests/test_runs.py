@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from dlc.runs import create_run, make_run_name, open_run
 
 
@@ -48,3 +50,39 @@ def test_run_manifest_save_uses_atomic_writer(tmp_path):
     assert ctx.manifest_path.exists()
     reopened = open_run(ctx.root)
     assert reopened.manifest.name == "run"
+
+
+def test_create_run_adopts_a_half_created_run_dir(tmp_path):
+    # fable Phase 7a: a crash between the root mkdir and the first manifest save used to
+    # brick the dir — open_run refuses it (no manifest.json) and create_run's
+    # mkdir(exist_ok=False) raised. A manifest-less dir is adoptable by construction
+    # (every caller checks for manifest.json before choosing create_run).
+    from dlc.runs import create_run
+
+    half = tmp_path / "half_created"
+    half.mkdir()
+    (half / "measurements").mkdir()      # some subdirs may exist too
+    ctx = create_run("SDR", display="adopt", run_dir=half)
+    assert ctx.manifest_path.exists()
+    assert (half / "generated").is_dir() and (half / "reports").is_dir()
+
+
+def test_create_run_refuses_a_populated_foreign_directory(tmp_path):
+    # fable Phase 7a finding F7a-A-runs: exist_ok=True must not scatter run files into an
+    # arbitrary populated folder (e.g. --run ~/Documents). A dir with entries outside the
+    # run scaffolding is refused; a half-created run (only our subdirs) is still adopted.
+    from dlc.runs import create_run
+
+    foreign = tmp_path / "my_documents"
+    foreign.mkdir()
+    (foreign / "resume.pdf").write_text("mine", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        create_run("SDR", display="x", run_dir=foreign)
+    assert (foreign / "resume.pdf").exists() and not (foreign / "manifest.json").exists()
+
+    # a half-created run dir (only scaffolding) is still adoptable
+    half = tmp_path / "half"
+    half.mkdir()
+    (half / "measurements").mkdir()
+    ctx = create_run("SDR", display="x", run_dir=half)
+    assert ctx.manifest_path.exists()

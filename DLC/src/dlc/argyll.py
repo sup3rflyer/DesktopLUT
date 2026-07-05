@@ -166,9 +166,19 @@ def parse_spotread_instruments(text: str) -> list[Instrument]:
         re.compile(r"^\s*(\d+)\)\s*(.+?)\s*$"),
     ]
 
+    # Hardware-token allow-list: spotread's usage text is full of "N = ..." lines that are
+    # NOT instruments (display-type presets, flag enums), so a line must name recognisable
+    # meter hardware before the port patterns apply. The list covers the Argyll-supported
+    # vendor/family vocabulary — an unknown meter would otherwise be SILENTLY dropped and
+    # report as "no instruments attached" (misleading at the resolution gate).
+    _METER_TOKENS = [
+        "i1", "color", "munki", "display", "spectro", "x-rite", "xrite",
+        "klein", "spyder", "datacolor", "jeti", "specbos", "dtp", "huey",
+        "smile", "chroma", "minolta", "konica", "cr-", "k-10", "colorhug",
+    ]
     for line in text.splitlines():
         lowered = line.lower()
-        if not any(token in lowered for token in ["i1", "color", "munki", "display", "spectro", "x-rite", "xrite"]):
+        if not any(token in lowered for token in _METER_TOKENS):
             continue
         for pattern in patterns:
             match = pattern.match(line)

@@ -53,6 +53,7 @@ class MockDesktopLutServer:
             if method == "state.get":
                 return self.ok(self.state.as_dict())
             if method == "corrections.disable_all":
+                self._cleanup_active_gs_live()   # C++ CleanupActiveGsLive runs here too
                 self.state.corrections_enabled = False
                 return self.ok({"corrections_enabled": False})
             if method.startswith("calibration."):
@@ -172,6 +173,19 @@ class MockDesktopLutServer:
         self.state.hdr = {int(k): bool(v) for k, v in deepcopy(snapshot.get("hdr", {})).items()}
         return self.ok({"snapshot_id": snapshot_id, "restored": True})
 
+    def _cleanup_active_gs_live(self) -> None:
+        """Mirror the C++ ``CleanupActiveGsLive``: any monitor/mode with an active live-edit
+        preview is reverted to its pre-begin correctionGrayscale and the session torn down.
+        Called from ``calibration.exit`` / ``corrections.disable_all`` — the crash-cleanup path."""
+        for st in self.state.mhc.values():
+            if st.pop("gs_live_active", False):
+                saved = st.pop("gs_live_saved", None)
+                st["gs_preview_active"] = False
+                if saved is not None:
+                    st["correction_grayscale"] = saved
+                else:
+                    st.pop("correction_grayscale", None)
+
     def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
         if method == "calibration.status":
             return self.ok({"active": self.state.calibration_mode is not None, "state": deepcopy(self.state.calibration_mode)})
@@ -192,6 +206,10 @@ class MockDesktopLutServer:
             }
             return self.ok(deepcopy(self.state.calibration_mode))
         if method == "calibration.exit":
+            # C++ DoExitCalibration runs CleanupActiveGsLive() unconditionally first — an
+            # orphaned live-edit preview (client died between begin and commit) is reverted to
+            # its pre-begin correction so it can't leak past the run (fable Phase 7a fidelity).
+            self._cleanup_active_gs_live()
             current = deepcopy(self.state.calibration_mode)
             restore = bool(params.get("restore_snapshot", False))
             if restore and current and current.get("snapshot_id") in self.state.snapshots:
@@ -232,9 +250,23 @@ class MockDesktopLutServer:
             }
         elif method == "mhc.grayscale_live_begin":
             # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
-            # stacks on top of MHC+3D-LUT and is measurable. No bake yet.
+            # stacks on top of MHC+3D-LUT and is measurable. No bake yet. Mirrors the C++
+            # DoGrayscaleLiveBegin contract (fable Phase 7a): the PRE-BEGIN correctionGrayscale
+            # is snapshotted (savedCorrectionGs) so cancel can restore the user's prior
+            # correction, and the live-session marker gates set_live/commit/cancel semantics.
+            # C++ errors if a session is already active (ipc_server.cpp:1133) — mirror it so the
+            # SIGKILL-then-re-run orphaned-preview corner is testable.
+            if state.get("gs_live_active"):
+                return DesktopLutResponse(
+                    ok=False, error="grayscale live preview already active for this monitor/mode")
             state["gs_preview_active"] = True
+            state["gs_live_active"] = True
+            state["gs_live_saved"] = deepcopy(state.get("correction_grayscale"))
         elif method == "mhc.grayscale_set_live":
+            # C++ DoGrayscaleSetLive errors without an active begin.
+            if not state.get("gs_live_active"):
+                return DesktopLutResponse(
+                    ok=False, error="no active grayscale live preview (call mhc.grayscale_live_begin first)")
             gs = params.get("grayscale", {})
             state["correction_grayscale"] = {
                 "point_count": gs.get("point_count"),
@@ -244,12 +276,31 @@ class MockDesktopLutServer:
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.
+            # C++ DoGrayscaleCommit pops the GsLiveState (savedCorrectionGs is GONE — a later
+            # cancel is a tolerated NO-OP) and returns baked:false when there was no live session
+            # (e.g. DesktopLUT restarted mid-run) so the caller can detect a lost bake.
             state["gs_preview_active"] = False
-            state["gs_committed"] = True
-            state["applied"] = True
+            baked = bool(state.pop("gs_live_active", False))
+            if baked:
+                state.pop("gs_live_saved", None)
+                state["gs_committed"] = True
+                state["applied"] = True
+            return self.ok({"monitor_mode": key, "baked": baked,
+                            "mhc": deepcopy(self.state.mhc.get(key, {}))})
         elif method == "mhc.grayscale_cancel":
+            # C++ DoGrayscaleCancel: restore the PRE-BEGIN correctionGrayscale (the user's
+            # prior correction, not bare identity) and tear down the preview; a cancel with
+            # no live session (incl. after a commit) is a tolerated no-op returning canceled:false.
             state["gs_preview_active"] = False
-            state.pop("correction_grayscale", None)
+            canceled = bool(state.pop("gs_live_active", False))
+            if canceled:
+                saved = state.pop("gs_live_saved", None)
+                if saved is not None:
+                    state["correction_grayscale"] = saved
+                else:
+                    state.pop("correction_grayscale", None)
+            return self.ok({"monitor_mode": key, "canceled": canceled,
+                            "mhc": deepcopy(self.state.mhc.get(key, {}))})
         elif method == "mhc.apply":
             state["applied"] = True
         elif method == "mhc.remove":

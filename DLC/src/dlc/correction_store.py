@@ -75,13 +75,16 @@ class CorrectionStore:
     """
 
     def __init__(self, path: Path | str, records: Optional[dict[str, CorrectionRecord]] = None,
-                 *, corrupt: bool = False) -> None:
+                 *, corrupt: bool = False, dropped: Optional[list[str]] = None) -> None:
         self.path = Path(path)
         self._records: dict[str, CorrectionRecord] = dict(records or {})
         # True iff the file existed but did not parse — distinct from "absent" (a clean first
         # run). Lets a caller surface real corruption (vs silently falling back to the stale
         # YAML correction), while the store itself stays tolerant (never a gate).
         self.corrupt = corrupt
+        # Names of records present in the file but individually unparseable (schema drift /
+        # hand-editing) — dropped, but visibly so, mirroring DipStore.dropped.
+        self.dropped: list[str] = list(dropped or [])
 
     # -- loading ----------------------------------------------------------
     @classmethod
@@ -89,6 +92,7 @@ class CorrectionStore:
         p = Path(path)
         records: dict[str, CorrectionRecord] = {}
         corrupt = False
+        dropped: list[str] = []
         if p.exists():
             try:
                 raw = json.loads(p.read_text(encoding="utf-8"))
@@ -98,8 +102,9 @@ class CorrectionStore:
                 try:
                     records[name] = CorrectionRecord.from_dict({**rec, "display": rec.get("display", name)})
                 except (KeyError, TypeError, ValueError):
+                    dropped.append(str(name))
                     continue
-        return cls(p, records, corrupt=corrupt)
+        return cls(p, records, corrupt=corrupt, dropped=dropped)
 
     # -- access -----------------------------------------------------------
     def get(self, display: str) -> Optional[CorrectionRecord]:
@@ -117,7 +122,10 @@ class CorrectionStore:
         return rec
 
     def save(self) -> None:
-        payload = {"displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
+        # "schema" is a version stamp for forward drift (loaders tolerate unknown shapes via
+        # per-record try/except + the dropped list; a future breaking change bumps this).
+        payload = {"schema": 1,
+                   "displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
         # Atomic: a crash mid-write must not truncate the store and silently drop a
         # freshly-minted CCMX/SPD (the load is corruption-tolerant, so a truncated file would
         # fall back to the stale YAML correction with no error). See paths.atomic_write_text.

@@ -1,4 +1,19 @@
-"""MHC candidate generation and application."""
+"""TI3 parsing + primaries/peak extraction, plus a SUPERSEDED MHC candidate builder.
+
+Two distinct tiers live here (Phase 4 audit):
+
+* **Live parsing/extraction** — :func:`parse_ti3` (the one CGATS ``.ti3`` reader every consumer
+  uses), :func:`classify_samples` / :func:`channel_model` / :func:`build_curves_from_ti3` (the
+  measured-primaries + peak-luminance extraction ``stages/build_mhc`` is built on; the 1D curve it
+  returns is discarded there), and the small helpers (``xy_from_xyz``, ``white_xyz``,
+  ``find_stage_artifact``, ``resolve_run_path``).
+* **LEGACY candidate builder** — everything from :class:`MhcCandidate` down
+  (``build_mhc_candidate`` / ``identity_curves`` / ``write_cube`` / ``write_summary`` /
+  ``load_mhc_candidate``): the v0 iteration-numbered "MHC candidate" artifact flow. It has ZERO
+  production callers (tests only) and is superseded by ``stages/build_mhc`` +
+  ``mhc_cube.write_1d_cube``. Do not wire it into anything new — final disposition is the
+  Phase 11 dead-code sweep.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +22,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .colormath import invert3x3 as _invert3x3
+from .colormath import matvec as _matvec
 from .events import EventWriter
 from .runs import RunContext
 
@@ -35,6 +52,7 @@ class ChannelModel:
     peak_xyz: tuple[float, float, float]
 
 
+# --- LEGACY candidate builder below (zero production callers; see module docstring) ---------
 @dataclass(frozen=True)
 class MhcCandidate:
     iteration: int
@@ -177,21 +195,17 @@ def invert_y_to_level(model: ChannelModel, target_y: float) -> float:
 
 
 def invert_3x3(matrix: list[list[float]]) -> list[list[float]]:
-    a, b, c = matrix[0]
-    d, e, f = matrix[1]
-    g, h, i = matrix[2]
-    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
-    if abs(det) < 1e-12:
-        raise ValueError("native primary matrix is singular")
-    return [
-        [(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
-        [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
-        [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det],
-    ]
+    """:func:`dlc.colormath.invert3x3` with this module's historical domain error message
+    (surfaced in the build-mhc stage-fail text). One implementation, not a fourth copy —
+    the Phase 1 duplication rule."""
+    try:
+        return _invert3x3(matrix)
+    except ValueError:
+        raise ValueError("native primary matrix is singular") from None
 
 
 def matvec(matrix: list[list[float]], vector: tuple[float, float, float]) -> tuple[float, float, float]:
-    return tuple(sum(row[i] * vector[i] for i in range(3)) for row in matrix)  # type: ignore[return-value]
+    return _matvec(matrix, vector)
 
 
 def build_curves_from_ti3(samples: list[Ti3Sample], *, size: int, gamma: float) -> tuple[list[tuple[float, float, float]], dict[str, float], float]:

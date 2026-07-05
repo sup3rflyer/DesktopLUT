@@ -290,8 +290,12 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
 
     ``signal_rgb`` / ``measured_xyz`` are ``(N, 3)`` (or flattenable to it); the latter
     is absolute cd/m². Patches are assumed bounded to the reachable sub-peak range (the
-    roll-off region above the target peak is a later refinement). Returns ``de_itp`` and
-    the ``ideal_xyz`` (absolute cd/m²) per patch.
+    roll-off region above the target peak is a later refinement). Returns ``de_itp``,
+    the ``ideal_xyz`` (absolute cd/m²) per patch, and ``gamut_clamped`` — a per-patch
+    boolean mask marking targets the reachable-gamut clamp actually MOVED (the patch is
+    scored against the panel's gamut boundary, not the raw target — an "at the gamut
+    floor" residual, which summaries must report separately from in-gamut error, §0).
+    All-``False`` when ``reachable_primaries`` is ``None`` (no clamp).
     """
     target = Target.hdr_rec2020_pq(white_xy=white_xy)
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
@@ -305,8 +309,20 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
                          nan=0.0, posinf=0.0, neginf=0.0)
     meas = np.maximum(meas, 0.0)
     ideal_xyz = space.ideal_xyz(sig)
+    if reachable_primaries is not None:
+        # The clamp gap identifies the frontier patches: re-derive the raw (unclamped) ideal
+        # and mark rows the chroma clip moved. Tolerance is absolute cd/m². A true no-op can
+        # never flag because _chroma_clip_to_gamut returns in-gamut rows BIT-IDENTICAL (it
+        # only rewrites OOG rows) — the gap there is exactly 0. On the other side, its own
+        # eps=1e-4 in-gamut short-circuit makes near-boundary targets exact no-ops too, so
+        # the smallest real clamp gap is discontinuously large (measured ≥ ~0.5 nit across
+        # hue/level sweeps) — 1e-3 sits in the dead zone between 0 and any real clip.
+        raw_ideal = TargetSpace(target).ideal_xyz(sig)
+        gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > 1e-3, axis=1)
+    else:
+        gamut_clamped = np.zeros(len(sig), dtype=bool)
     delta = space.xyz_to_ictcp(meas) - space.xyz_to_ictcp(ideal_xyz)
-    return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz}
+    return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz, "gamut_clamped": gamut_clamped}
 
 
 # The six saturated-ramp hues by which channels are ON (1) vs OFF (0) — R/G/B primaries +
@@ -484,8 +500,21 @@ class DisplayErrorModel:
         self.kernel = kernel
         self.sample_confidence = _normalised_sample_confidence(sample_confidence, len(self.signal))
 
-        ideal_ictcp = self.space.ideal_ictcp(self.signal)
-        self.measured_ictcp = self.space.xyz_to_ictcp(self.measured_xyz)
+        # The error field is trained against the UNCLAMPED ideal, even when the run is
+        # gamut-aware (#C3). The reachable clamp belongs on the TARGET side only (what the
+        # node/verify aims at — ``self.space.ideal_ictcp``); baking it into delta breaks the
+        # LUT builder's inversion step, which solves ``ideal(s*) = target - delta(s*)`` with
+        # the raw (unclamped, invertible) ``xyz_to_signal``. With a clamped delta that fixed
+        # point is inconsistent wherever the target clips: on a sub-gamut synthetic panel the
+        # "correction" desaturated reachable boundary colours from ~7 to ~29 dE_ITP. With the
+        # raw delta the fixed point is exactly ``panel(s*) = clamped_target`` — reachable by
+        # construction, and delta stays smooth (no kink at the gamut boundary) so the RBF and
+        # its CV smoothing search behave. In-gamut behaviour is identical either way (the
+        # clamp is a no-op there), and ``reachable_primaries=None`` is untouched.
+        self._raw_space = (TargetSpace(target) if reachable_primaries is not None
+                           else self.space)
+        ideal_ictcp = self._raw_space.ideal_ictcp(self.signal)
+        self.measured_ictcp = self._raw_space.xyz_to_ictcp(self.measured_xyz)
         self.delta_ictcp = self.measured_ictcp - ideal_ictcp
 
         if smoothing is None:
@@ -511,15 +540,20 @@ class DisplayErrorModel:
         """Simulate the panel: predicted **absolute XYZ** for a driven signal.
 
         ``ideal(signal) + predicted_error(signal)``, back in XYZ. This is the
-        tier-1 simulator the correction machine iterates against.
+        tier-1 simulator the correction machine iterates against. Uses the same
+        UNCLAMPED ideal the delta was trained against (the panel does not know
+        about the target's reachable clamp); score the result against the
+        clamped ``self.space`` targets.
         """
         signal_rgb = np.asarray(signal_rgb, dtype=float)
-        ideal_ictcp = self.space.ideal_ictcp(signal_rgb)
+        ideal_ictcp = self._raw_space.ideal_ictcp(signal_rgb)
         produced_ictcp = ideal_ictcp + self.predict(signal_rgb)
         return self.space.ictcp_to_xyz(produced_ictcp)
 
     def raw_error(self) -> np.ndarray:
-        """``dE_ITP`` of the measured display error at the measurement points."""
+        """``dE_ITP`` of the measured display error at the measurement points
+        (vs the UNCLAMPED ideal — the panel's error against the pure target,
+        including any unreachable-gamut component)."""
         return de_itp(self.delta_ictcp)
 
     def residuals(self) -> np.ndarray:

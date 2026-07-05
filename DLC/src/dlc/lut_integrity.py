@@ -40,6 +40,7 @@ class LutIntegritySummary:
     avg_neighbor_delta: float
     max_neighbor_delta_allowed: float
     monotonicity_violations_allowed: int
+    monotonicity_epsilon: float
     integrity_path: str
     notes: list[str]
 
@@ -96,16 +97,58 @@ def parse_triplet(parts: list[str]) -> tuple[float, float, float]:
     return (float(parts[0]), float(parts[1]), float(parts[2]))
 
 
+# The largest per-node correction the optimizer may express, in signal units — the SDR
+# 3D-LUT cap (`calibrate.SDR_CORRECTION_CAP`, 0.5; HDR caps tighter at 0.25). Used only to
+# derive the structural neighbour-delta ceiling below; duplicating the constant would drift,
+# so it is named for what it means here: the correction budget a legitimate cube can spend.
+_MAX_LEGITIMATE_CORRECTION = 0.5
+
+
+def default_monotonicity_epsilon(size: int) -> float:
+    """The depth below which a BACKWARD neighbour step is fit/quantization noise, not a
+    structural reversal (fable Phase 7a, F7a-15 corrected). The optimizer builds the cube from
+    an RBF fit + soft clamp; on a raised-black panel the near-black fit wiggles by a fraction of
+    the grid step (measured: ≤0.10× the identity pitch across production-training-set cubes at
+    grid 17/33). A real tear — a transposed axis, a corrupt write, a garbage parse — reverses by
+    ~a full grid step or more. A quarter of the identity pitch cleanly separates the two (≈2.5×
+    above the observed fit noise, ≈4× below a real tear) and scales with grid density like the
+    neighbour-delta ceiling. Counting steps shallower than this as "monotonicity violations" was
+    the F7a-15 error: it false-failed legitimate raised-black-panel cubes into pointless rebuilds
+    (`decisions._3dlut_next_params` coarsens the grid on `integrity['ok']` False)."""
+    if size <= 1:
+        return 1e-8
+    return 0.25 / (size - 1)
+
+
+def default_neighbor_delta_allowed(size: int) -> float:
+    """The grid-pitch-derived structural ceiling for a neighbour step (fable Phase 6, from
+    the Phase 5 lead): the old fixed default of 1.0 admitted a FULL-RANGE jump between
+    adjacent nodes — toothless, since an identity step on a 33-grid is ~0.031 and the
+    optimizer's soft clamp bounds any legitimate correction to ±0.5 (SDR cap; HDR 0.25).
+    A legitimate neighbour step is therefore at most the identity pitch plus the largest
+    correction swing the caps allow; anything beyond that cannot come from a capped
+    correction on top of identity — it is a tear (corrupt write, transposed axis, garbage
+    parse). 2× pitch adds slack for domain-scaled cubes. ~0.56 at 33³, ~0.63 at 17³."""
+    if size <= 1:
+        return 1.0
+    return min(1.0, 2.0 / (size - 1) + _MAX_LEGITIMATE_CORRECTION)
+
+
 def summarize_lut_integrity(
     *,
     cube: CubeData,
     phase: str,
     iteration: int,
     integrity_path: Path,
-    max_neighbor_delta_allowed: float = 1.0,
+    max_neighbor_delta_allowed: float | None = None,
     monotonicity_violations_allowed: int = 0,
+    monotonicity_epsilon: float | None = None,
     bounds_epsilon: float = 1e-6,
 ) -> LutIntegritySummary:
+    if max_neighbor_delta_allowed is None:
+        max_neighbor_delta_allowed = default_neighbor_delta_allowed(cube.size)
+    if monotonicity_epsilon is None:
+        monotonicity_epsilon = default_monotonicity_epsilon(cube.size)
     expected_entries = cube.size**3 if cube.size > 0 else 0
     notes: list[str] = []
     if expected_entries != len(cube.values):
@@ -120,7 +163,7 @@ def summarize_lut_integrity(
     if out_of_bounds_count:
         notes.append(f"{out_of_bounds_count} output channels are outside 0..1")
 
-    monotonicity_violations, neighbor_deltas = cube_axis_checks(cube)
+    monotonicity_violations, neighbor_deltas = cube_axis_checks(cube, epsilon=monotonicity_epsilon)
     if monotonicity_violations > monotonicity_violations_allowed:
         notes.append(f"{monotonicity_violations} monotonic axis violations exceed allowance {monotonicity_violations_allowed}")
 
@@ -157,15 +200,21 @@ def summarize_lut_integrity(
         avg_neighbor_delta=avg_neighbor_delta,
         max_neighbor_delta_allowed=max_neighbor_delta_allowed,
         monotonicity_violations_allowed=monotonicity_violations_allowed,
+        monotonicity_epsilon=monotonicity_epsilon,
         integrity_path=str(integrity_path),
         notes=notes,
     )
 
 
-def cube_axis_checks(cube: CubeData) -> tuple[int, list[float]]:
+def cube_axis_checks(cube: CubeData, *, epsilon: float | None = None) -> tuple[int, list[float]]:
     size = cube.size
     if size <= 1 or len(cube.values) != size**3:
         return (0, [])
+    # A backward step counts as a violation only if it is DEEPER than epsilon — a fit/quantization
+    # noise floor tied to grid pitch (default_monotonicity_epsilon), so shallow near-black RBF
+    # wiggles on a raised-black panel don't read as structural tears (fable Phase 7a, F7a-15).
+    if epsilon is None:
+        epsilon = default_monotonicity_epsilon(size)
 
     def value_at(r: int, g: int, b: int) -> tuple[float, float, float]:
         # Standard .cube order is R-fastest (write_cube / DesktopLUT LoadLUT write
@@ -182,17 +231,17 @@ def cube_axis_checks(cube: CubeData) -> tuple[int, list[float]]:
                 if r + 1 < size:
                     nxt = value_at(r + 1, g, b)
                     neighbor_deltas.append(max(abs(nxt[i] - current[i]) for i in range(3)))
-                    if nxt[0] + 1e-8 < current[0]:
+                    if nxt[0] + epsilon < current[0]:
                         violations += 1
                 if g + 1 < size:
                     nxt = value_at(r, g + 1, b)
                     neighbor_deltas.append(max(abs(nxt[i] - current[i]) for i in range(3)))
-                    if nxt[1] + 1e-8 < current[1]:
+                    if nxt[1] + epsilon < current[1]:
                         violations += 1
                 if b + 1 < size:
                     nxt = value_at(r, g, b + 1)
                     neighbor_deltas.append(max(abs(nxt[i] - current[i]) for i in range(3)))
-                    if nxt[2] + 1e-8 < current[2]:
+                    if nxt[2] + epsilon < current[2]:
                         violations += 1
     return violations, neighbor_deltas
 
@@ -203,7 +252,7 @@ def write_lut_integrity(
     cube_path: Path,
     phase: str = "3dlut",
     iteration: int = 1,
-    max_neighbor_delta_allowed: float = 1.0,
+    max_neighbor_delta_allowed: float | None = None,
     monotonicity_violations_allowed: int = 0,
 ) -> LutIntegritySummary:
     cube_path = resolve_run_path(ctx, cube_path)

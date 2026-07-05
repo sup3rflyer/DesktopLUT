@@ -9,6 +9,15 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
+# RGBW probe-match codes (parity ledger P14 — deliberate per-mode luminance choices, NOT
+# one value rescaled by bit depth; converting one to the other's depth would be nonsense):
+#   SDR 242 (8-bit)  = 94.9% signal ≈ 89% luminance at γ2.2 — near-peak for SNR while
+#                      staying below the clip/ABL region a full 255 field can enter.
+#   HDR 712 (10-bit) = PQ code ≈ 598 nits — an absolute sustained-luminance level bright
+#                      enough for a stable colorimeter/spectro comparison but below the
+#                      peak-window/ABL territory where FALD panels dim mid-measurement.
+# The codes are in dogegen's mode-default bit depth (mode 8 / mode 10_hdr, see _depth) —
+# consumers that force a non-default depth must rescale the signal fraction, not the code.
 RGBW_SDR = {
     "red": (242, 0, 0),
     "green": (0, 242, 0),

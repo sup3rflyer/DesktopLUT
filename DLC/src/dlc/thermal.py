@@ -239,6 +239,9 @@ class ThermalController:
         if not self.content:
             raise ValueError("ThermalController needs at least one content patch")
         self._peak = self.cfg.peak_nits or self.transfer.cv_to_nits(self.transfer.max_cv)
+        # Absolute nits of the latest reference read (attribute side-channel from _read_ref
+        # into the block records/digest); initialized here so it exists before run().
+        self._last_ref_nits: Optional[float] = None
 
     # -- patch builders ---------------------------------------------------
     def _scaled(self, base: Patch, k: float) -> MeasurePatch:

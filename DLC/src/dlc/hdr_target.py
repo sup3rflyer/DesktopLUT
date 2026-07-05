@@ -46,6 +46,7 @@ parameters that bound and shape it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -168,12 +169,23 @@ def choose_peak_nits(*, native_white_nits: Optional[float] = None,
     The provenance always carries ``sustained_unknown`` (is the peak a flash, not a held value?)
     and ``grounded`` (does it rest on a real measurement?). Returns ``(peak_nits, provenance)``.
     """
-    # Normalize away non-positive / None inputs uniformly: a 0 or negative peak is invalid
-    # (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML), so it is *ignored*, never used
-    # as a real ceiling or pin.
-    pinned = float(pinned_peak_nits) if (pinned_peak_nits and pinned_peak_nits > 0) else None
-    sustained = float(sustained_peak_nits) if (sustained_peak_nits and sustained_peak_nits > 0) else None
-    native = float(native_white_nits) if (native_white_nits and native_white_nits > 0) else None
+    # Normalize away non-positive / non-finite / None inputs uniformly: a 0, negative, NaN
+    # or infinite peak is invalid (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML,
+    # or a corrupt DIP field), so it is *ignored*, never used as a real ceiling or pin. The
+    # finiteness guard matters downstream: the resolved peak becomes the verify summary's
+    # ``target_luminance``, which is serialized with ``allow_nan=False`` — a non-finite peak
+    # here would crash the terminal verify stage instead of falling back (fable Phase 6
+    # verification pass).
+    def _valid(nits) -> Optional[float]:
+        try:
+            v = float(nits) if nits is not None else None
+        except (TypeError, ValueError):
+            return None
+        return v if (v is not None and math.isfinite(v) and v > 0) else None
+
+    pinned = _valid(pinned_peak_nits)
+    sustained = _valid(sustained_peak_nits)
+    native = _valid(native_white_nits)
 
     # 1. Explicit override (deliberate / tests) — verbatim, never above the measured ceiling.
     if pinned is not None:
@@ -226,13 +238,23 @@ def resolve_hdr_target(*, white_xy: tuple[float, float],
         native_white_nits=native_white_nits, sustained_peak_nits=sustained_peak_nits,
         pinned_peak_nits=pinned_peak_nits, default=default_peak_nits)
     gain = undershoot_gain(eotf_undershoot)
+    # Was the gain CLAMPED (the "clamp and flag" policy on MAX_UNDERSHOOT_GAIN)? A raw
+    # boost above the cap — or a non-positive denominator — means the characterization,
+    # not the panel, is suspect; the provenance must say so, not silently quote 1.5.
+    raw_denom = (1.0 + float(eotf_undershoot)) if eotf_undershoot is not None else 1.0
+    gain_clamped = raw_denom <= 0.0 or (raw_denom < 1.0 and 1.0 / raw_denom > MAX_UNDERSHOOT_GAIN)
 
     # Knee: the requested luminance above which corrected drive (requested × gain) would
     # exceed the panel's native ceiling and clip. Below the knee the gain is fully
     # applied; above it, taper to the roll-off. With no boost (gain == 1) or no measured
-    # ceiling, there is nothing to clip → the knee is the peak.
-    if gain > 1.0 and native_white_nits:
-        knee = min(peak, float(native_white_nits) / gain)
+    # ceiling, there is nothing to clip → the knee is the peak. The ceiling is normalized
+    # exactly as choose_peak_nits normalizes it (non-positive / non-finite / None ⇒ no
+    # ceiling), so a corrupt DIP value can never produce a negative or infinite knee.
+    native = (float(native_white_nits)
+              if (native_white_nits and math.isfinite(float(native_white_nits))
+                  and native_white_nits > 0) else None)
+    if gain > 1.0 and native:
+        knee = min(peak, native / gain)
     else:
         knee = peak
 
@@ -241,17 +263,22 @@ def resolve_hdr_target(*, white_xy: tuple[float, float],
         "undershoot": {
             "eotf_undershoot": eotf_undershoot,
             "gain": round(gain, 5),
+            "clamped": gain_clamped,
             "note": ("no measured undershoot → no first-order gain (the cube still "
                      "corrects per node)" if gain == 1.0 else
-                     f"first-order gain {gain:.4f}× toward PQ from a measured "
-                     f"{eotf_undershoot:+.3f} undershoot (the cube refines per node)"),
+                     (f"gain CLAMPED to {gain:.4f}× (MAX_UNDERSHOOT_GAIN): the measured "
+                      f"{eotf_undershoot:+.3f} undershoot implies an implausible boost — "
+                      f"suspect characterization, re-measure the EOTF undershoot"
+                      if gain_clamped else
+                      f"first-order gain {gain:.4f}× toward PQ from a measured "
+                      f"{eotf_undershoot:+.3f} undershoot (the cube refines per node)")),
         },
         "knee": {
             "knee_start_nits": round(knee, 2),
             "note": ("whole range boostable — no roll-off within the target peak"
                      if knee >= peak - 1e-6 else
                      f"gain tapers to roll-off above {knee:.0f} nits (boosting past there "
-                     f"would clip the ~{native_white_nits:g}-nit panel)"),
+                     f"would clip the ~{native:g}-nit panel)"),
         },
         "white": {
             "white_xy": [white_xy[0], white_xy[1]],

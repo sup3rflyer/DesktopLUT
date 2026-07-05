@@ -217,3 +217,93 @@ def test_sdr_build_mhc_smooths_unstable_levels_via_noise_sidecar(tmp_path):
         j = round(sig * (n - 1))
         for ch in ("r", "g", "b"):
             assert abs(curves[ch][j] - sig) < 1.5e-2, (ch, sig, curves[ch][j])
+
+
+def _write_sdr_drifted_dark_ti3(path: Path, *, drift_dy: float = 0.021) -> Path:
+    """A synthetic SDR raw TI3 (γ2.2, ~D65 native, 100-nit peak) whose 0.1-signal gray
+    (~0.63 nits) carries a REAL chromaticity drift (+drift_dy in y) — the correctable disease.
+    All other grays track the native white exactly."""
+    from dlc.colormath import rgb_to_xyz_matrix, xy_to_XYZ
+
+    peak = 100.0
+    prim = {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06}
+    P = rgb_to_xyz_matrix(prim["rx"], prim["ry"], prim["gx"], prim["gy"],
+                          prim["bx"], prim["by"], 0.3127, 0.3290, white_Y=peak)
+    rows = []
+
+    def emit_row(rgb, xyz):
+        rows.append(f"{rgb[0] * 100:.6f} {rgb[1] * 100:.6f} {rgb[2] * 100:.6f} "
+                    f"{xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f}")
+
+    for s in (0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0):
+        frac = s ** 2.2
+        xyz = tuple(sum(P[r][c] * frac for c in range(3)) for r in range(3))
+        if s == 0.1:                                      # real, repeatable greenish dark drift
+            xyz = xy_to_XYZ(0.3127, 0.3290 + drift_dy, xyz[1])
+        emit_row((s, s, s), xyz)
+    for c in range(3):                                    # per-channel ramps for the primaries
+        for s in (0.5, 1.0):
+            rgb = [0.0, 0.0, 0.0]
+            rgb[c] = s
+            frac = s ** 2.2
+            xyz = tuple(P[r][c] * frac for r in range(3))
+            emit_row(tuple(rgb), xyz)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join([
+        "CTI3", "# Synthetic SDR raw with a real (stable) dark drift",
+        "BEGIN_DATA_FORMAT", "RGB_R RGB_G RGB_B XYZ_X XYZ_Y XYZ_Z", "END_DATA_FORMAT",
+        f"NUMBER_OF_SETS {len(rows)}", "BEGIN_DATA", *rows, "END_DATA", "",
+    ]), encoding="utf-8")
+    return path
+
+
+def test_sdr_build_mhc_stable_dark_drift_is_corrected_not_smoothed(tmp_path):
+    # Phase 4 (σ-aware adaptive dark floor): a REAL, repeatable dark drift — strayed chromaticity
+    # with a tiny measured σ in the noise sidecar — must NOT raise the adaptive floor and smooth
+    # its own correction to identity. Without the sidecar (single-read run) the same drift keeps
+    # the old conservative behaviour: the floor rises over it and the cube holds ~identity there.
+    import json
+
+    from dlc.measure_loop import noise_sidecar_path
+    from dlc.mhc_cube import read_1d_cube
+
+    # -- with a sidecar proving the drifted level is STABLE (σ tiny over 4 reads) --
+    ctx = create_run("SDR", display="test", run_dir=tmp_path / "run_sigma")
+    ti3 = _write_sdr_drifted_dark_ti3(tmp_path / "raw_drift.ti3")
+    noise_sidecar_path(ti3).write_text(
+        json.dumps({"by_level": {f"{0.1:.6f}": {"chroma_sigma": 0.001, "reads": 4}}}),
+        encoding="utf-8")
+    result = build_mhc.build(_ns(ctx, mode="SDR", source_ti3=str(ti3)), ctx)
+    assert result.status == "ran"
+    df = _common.load_dlc_state(ctx)["mhc_params"]["dark_floor"]
+    assert df["nits"] == 0.1 and df["n_real_drift"] >= 1, df   # floor stays at the low bound
+    curves = read_1d_cube(Path(_common.load_dlc_state(ctx)["mhc_params"]["base_lut"]["cube_path"]))
+    n = len(curves["g"])
+    j = round(0.1 * (n - 1))
+    corrected_dev = abs(curves["g"][j] - 0.1)                  # green pulled to fix the green drift
+
+    # -- same panel, NO sidecar: noise and drift are indistinguishable -> conservative floor --
+    ctx2 = create_run("SDR", display="test", run_dir=tmp_path / "run_bare")
+    ti32 = _write_sdr_drifted_dark_ti3(tmp_path / "raw_drift2.ti3")
+    build_mhc.build(_ns(ctx2, mode="SDR", source_ti3=str(ti32)), ctx2)
+    df2 = _common.load_dlc_state(ctx2)["mhc_params"]["dark_floor"]
+    assert df2["nits"] > 0.5, df2                              # floor rose over the ~0.63-nit read
+    curves2 = read_1d_cube(Path(_common.load_dlc_state(ctx2)["mhc_params"]["base_lut"]["cube_path"]))
+    held_dev = abs(curves2["g"][j] - 0.1)
+
+    assert corrected_dev > 0.0025, corrected_dev              # the stable drift IS corrected
+    assert held_dev < corrected_dev / 3, (held_dev, corrected_dev)   # σ-less stays held ~identity
+
+
+def test_hdr_build_mhc_reports_peak_chroma_nonadditivity_diagnostics(tmp_path):
+    # P16: the Peak-Chroma cap is nominal-additive; the build now reports the measured full-white
+    # non-additivity factor + the first-order corrected cap estimate as DIAGNOSTICS (the cap itself
+    # stays the documented seed — the closed-loop refine lands the real achievable D65).
+    ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
+    ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr.ti3")
+    build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3)), ctx)
+    pc = _common.load_dlc_state(ctx)["mhc_params"]["peak_chroma"]
+    assert pc["measured_peak_nonadditivity"] is not None
+    # the synthetic panel is perfectly additive -> factor ~1, estimate ~= the additive cap
+    assert abs(pc["measured_peak_nonadditivity"] - 1.0) < 0.02
+    assert pc["cap_nits_nonadditive_est"] <= pc["cap_nits"] + 1e-6

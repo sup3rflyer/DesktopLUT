@@ -141,6 +141,152 @@ request, adjudicates ambiguous results on digests, and writes the report.
 - **Descriptive, durable deliverable cube** — a self-describing, sortable cube name
   (`<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n.cube`) installed from the stable
   `results/` folder, not the gitignored run-dir build artifact.
+- **Fable audit Phase 1 — colour-math foundations** (`docs/audits/fable/phase-1.md`):
+  every hand-rolled colour-math copy cross-verified against published references
+  (Sharma 2005 CIEDE2000 vectors, ST 2084 rationals, BT.2124 ITP, Robertson 1968)
+  and colour-science — zero numeric defects. The four verbatim PQ ports consolidated
+  into one shared stdlib `dlc/_pq.py`; the sRGB→XYZ(D65) literal reduced to one
+  canonical copy (metrics.py); the experimental builders' duplicated Lab/ΔE helpers
+  deduplicated. A golden-vector cross-pin suite (`tests/test_color_goldens.py`)
+  locks every copy against the references and each other, so drift is a test
+  failure instead of a silent chart-vs-score disagreement. Per-patch metric JSON
+  artifacts are now strict-JSON-safe when a meter read is NaN/inf.
+
+### Fixed
+- **Fable audit Phase 7a — the orchestrator spine, correctness**
+  (`docs/audits/fable/phase-7a.md`): a mis-configured profile (SDR slot → PQ target or
+  vice versa) is now rejected loudly at resolve-target instead of running an incoherent
+  hybrid (P12 closed); the `hdr` flow stub explains the real surface — HDR is
+  `--mode HDR` on the normal flows (P13 closed). A `remeasure` seam decision now buys
+  exactly one re-measure (the adjudicator's seed map previously re-answered itself
+  forever on an unsettling panel); a resume no longer duplicates the intermediate
+  `metrics_scored` convergence points; the dashboard stepper map gained the missing
+  `characterize` flow and stops listing stages a run never enters, pinned equal to the
+  announced phases per flow. Crash-resume is now a test matrix: dying inside ANY stage
+  of `full` and resuming reproduces the uncrashed run's verify digest byte-for-byte.
+  `dlc_state.json` carries a schema version; a half-created run dir is adoptable
+  instead of bricked; the watchdog no longer force-kills the meter during a legitimate
+  operator pause; a failed pre-run settings backup raises a seam (proceed/abort)
+  instead of a log line; a failed terminal rollback prints `rollback_failed` with the
+  manual-restore pointer instead of exiting mute; the live CLI no longer orphans the
+  persistent spotread/dogegen stack if the orchestrator constructor fails on a corrupt
+  run record. check-cube's zero monotonicity allowance was verified empirically
+  (realistic optimizer cubes carry zero violations; new `tests/test_lut_integrity.py`
+  pins it). 46 broad-except sites classified (5 fixed, 26 already surfaced, 15
+  accepted with rationale). Owner-review addendum (same session): the grayscale-wb
+  touch-up now bakes AFTER the verify gate — the C++ contract (verified at the
+  source) erases its saved pre-begin correction on commit, so the old
+  commit-before-verify made a `revert` at the gate a silent no-op; verify now
+  measures the live preview and revert restores the user's PRE-EXISTING grayscale
+  correction (mock fidelity raised to the verified contract). And a dead DesktopLUT
+  pipe now fails EARLY at preflight (an adjudicated seam recommending abort, before
+  anything is measured or mutated; `build-correction` stays pipe-optional) instead
+  of dying one stage later after recording a garbage "backup". Adversarial-pass
+  hardening (four refuting agents): the grayscale-wb touch-up was REDESIGNED — it
+  bakes at the end of its own stage so `measure:verify` scores the real result for
+  ALL modes (the earlier "verify the live preview" approach shipped an unverified HDR
+  deliverable, since the HDR preview provably differs from the bake), and revert is
+  now DLC-owned (the pre-begin correction is snapshotted and re-applied on revert,
+  robust across a DesktopLUT restart, no longer depending on the C++ cancel). A
+  dead-pipe preflight no longer stays memoised (a fixed pipe re-heals on resume and
+  recaptures the durable backup instead of a permanent loss), the `DesktopLUT.ini`
+  backup is kept even when the pipe is down, and the check-cube monotonicity gate
+  gained a principled grid-pitch-derived depth tolerance so a raised-black panel's
+  shallow near-black fit wiggles no longer false-fail a legitimate cube into a
+  pointless rebuild.
+- **Fable audit Phase 5 — the correction machine & 3D-LUT engine**
+  (`docs/audits/fable/phase-5.md`): the **gamut-aware (#C3) correction was internally
+  inconsistent** — the error model trained its delta against the reachable-CLAMPED ideal
+  while the LUT builder's steering inverted the raw UNCLAMPED map, so wherever a target
+  clipped, the fixed point was wrong by the clamp gap: on a synthetic sub-gamut panel the
+  machine drove a reachable boundary colour from 7 to 29 dE_ITP and then misreported the
+  survivors as panel floors. The delta now trains against the raw ideal and the clamp
+  stays on the target side only, making the fixed point `panel(s*) = clamped_target` —
+  post-fix the same panel goes 119 → 16 above-threshold and the honesty contract holds
+  (a pure gamut floor reports `physical_floor`, never `budget_limited`); in-gamut and
+  `reachable_primaries=None` behaviour is bit-identical, so the live effect is HDR
+  frontier corners (HW-6 queued). The outer loop now **reuses the deterministic
+  model/cube when neither the training set nor the budget changed** (the
+  force-full-validation path re-paid the full k-fold CV — measured 9–43 s CPU at real
+  fold-back sizes — for a bit-identical rebuild); `auto_smooth`'s 1e-4 search floor was
+  re-derived as correct and its CV cost measured-and-documented (search narrowing
+  rejected: path-dependence for ~1 % wall clock). `apply_3dlut_candidate` no longer
+  resolves a missing cube to the *current directory* and sends it to DesktopLUT (clear
+  `FileNotFoundError` instead). The orphaned `engine/lut_sdr.py` (zero production
+  callers, name-collided with the live `mhc_cube.build_sdr_cube`) is quarantined as
+  `engine/lut_sdr_reference.py`; `lut_constrained`/`physical` stay as documented opt-in
+  probe engines. §0 evaluations quantified: the returned-cube ranking cannot trade the
+  practical core for a corner win (snapshot core spread ≤ 0.3 dE_ITP; neutral fade pins
+  the diagonal) and adaptive sampling matches full sampling on the core within 0.04
+  dE_ITP. The `.cube` R-fastest ordering convention (4 independent hard-codings), the
+  singular-later-build keep-best path, and `build_cube`'s black/near-black invariants
+  are now test-pinned. 7 new tests.
+- **Fable audit Phase 4 — the MHC layer** (`docs/audits/fable/phase-4.md`): the adaptive
+  dark floor is now **σ-aware** — a strayed dark gray read whose chroma drift clearly
+  exceeds its measured repeatability (noise sidecar) is treated as the REAL, correctable
+  drift the gray-ramp cube exists to fix, instead of raising the floor and smoothing its
+  own correction to identity (previously the σ-driven trust said "correct" while the
+  drift-driven floor said "identity", and the floor won); threaded through both build-mhc
+  mode branches and the SDR control law — single-read runs are unchanged (HW-4 queued).
+  The post-matrix abscissa convention was independently verified END-TO-END (full
+  wire→matrix→ReGamma→LUT→panel simulation with a non-identity matrix + a per-level
+  channel defect; both modes converge every measured neutral above the floor to D65,
+  pinned). The Peak-Chroma cap's nominal-additive overshoot was quantified (+1.76 % on
+  the recorded FALD pair) and the honest numbers now ride `peak_chroma`
+  (`measured_peak_nonadditivity`, `cap_nits_nonadditive_est`) — the cap itself stays the
+  documented seed the closed-loop refine lands (HW-5 compares). The superseded SDR
+  deviation-domain refine is quarantined as `refine_sdr_grayscale_legacy`; the refine
+  loops' `safety_max_rounds` backstop is now contract-pinned in both modes (reverts to
+  the best measured cube AND raises the seam — never a silent cap); `mhc.py`'s live
+  parser tier is banner-separated from its zero-caller legacy candidate builder and its
+  private 3×3-inverse/matvec copies now delegate to `colormath`; dark-floor/damping
+  constants carry per-value provenance (parity P5/P6 → intentional); `grayscale_wb` is
+  documented as mode-shared-but-SDR-shaped (closed-loop safe; C++ HDR editor contract →
+  Phase 9). 10 new tests.
+- **Fable audit Phase 3 — the measurement stack** (`docs/audits/fable/phase-3.md`):
+  a failed appended re-measure round (meter dies mid-queue) no longer destroys the
+  previously accepted read with a sentinel hole — the prior value is retained and the
+  patch is loudly flagged `unresolved` for adjudication; `main()`'s presenter-settle
+  lookup now finds mode-keyed DIPs (the measured `settle_seconds` was silently ignored
+  and the dwell stuck at the guessed 0.5 s — shared `dip_record_for` helper, HW-2 queued);
+  probe-match's sibling-spotread derivation inherits the plan's own separator + suffix
+  conventions (same portability class as F-0.1/F2-3; POSIX plans no longer derive a
+  nonexistent `spotread.exe`); `characterize.warm_up`'s runs-first ordering invariant is
+  now structural (loud `RuntimeError`) instead of comment-only; `DipStore`/
+  `CorrectionStore` surface individually-unparseable records in a visible `.dropped`
+  list and stamp `"schema": 1` (a hand-edited DIP no longer vanishes silently);
+  `parse_spotread_instruments` recognises non-X-Rite meters (Klein/Spyder/JETI/
+  Konica-Minolta…) instead of silently reporting "no instruments attached". Also:
+  RGBW probe codes documented (242 = 94.9 % signal; 712 = PQ ≈ 598 nit — parity P14
+  closed as intentional), `STAGE_PRESETS` documented as the Argyll-flow alternate, the
+  one-USB ccxxmake/persistent-meter exclusion pinned by test, and the thermal
+  controller's ref-nits side-channel initialised in the constructor. 12 new tests.
+- **Fable audit Phase 2 — patch generation, transfers, targets**
+  (`docs/audits/fable/phase-2.md`): input-side invariants verified and pinned.
+  A corrupt negative DIP ceiling can no longer produce a negative HDR roll-off knee
+  (`resolve_hdr_target` now normalizes the ceiling like `choose_peak_nits`); a
+  clamped implausible undershoot gain is now FLAGGED in the target provenance
+  (`clamped: true` + a re-characterize note) instead of quoted as a plausible 1.5×;
+  `gamut_coverage` reports a degenerate (corrupt) native-primary triangle honestly
+  (`degenerate: true`, nothing covered) instead of scoring a point-gamut as 100 %
+  coverage; the dispread port-resolution gate derives its sibling spotread with the
+  plan's own suffix convention (POSIX plans no longer fail enumeration on a
+  hardcoded `.exe`); `white_from_spd_file`'s default strength is now 0 (numeric
+  D65), matching `target_white` — the perceptual correction stays opt-in. Pinned by
+  10 new tests, including the owner's pure-power-law-never-piecewise-sRGB rule at
+  the `Transfer` level and the verify colour-floor's absolute-PQ domain + no-overlap
+  invariant. The §0 patch-geography density artifact (where the patches go, per
+  luminance × saturation band, both modes) lands as `docs/audits/fable/phase-2.md`
+  §2 + its generator script.
+- **Fable audit Phase 0 (2026-07-05, `docs/audits/fable/phase-0.md`):** the suite is
+  now deterministic on any box — green-or-skipped, never red-for-environment.
+  `resolve_dispread_instrument_port` no longer silently no-ops on POSIX (its
+  executable gate mis-parsed the plans' Windows-style tool paths off-Windows);
+  `lut3d.default_source_icc` is PROJECT_DIR-anchored instead of cwd-relative; the
+  Lut3d/ProfilePath tests are hermetic (no dependence on gitignored vendored ICCs
+  or Windows-only absolute paths); a `[test]` extra declares the suite tooling the
+  baked-in `-n auto` addopts require, with `requirements.txt` synced (adds the
+  missing PyYAML/pytest); README test-count and vendoring notes de-staled.
 
 ### Validated
 - **First clean full SDR calibration on hardware (2026-06-19, ASUS ProArt PA32UCXR):**

@@ -54,7 +54,7 @@ from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, 
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
 from .liveness import Liveness
-from .metrics import delta_e2000, xyz_to_lab
+from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 
 __all__ = [
     "MeasurePatch",
@@ -1372,6 +1372,7 @@ class _Loop:
         accepted_se = st[1] if st else None
         accepted_chroma_sigma = self._chroma_sigma(reads, sigma=sigma)
         immediate = max(0, read_index - 1)
+        round_usable = usable                       # whether THIS round produced a usable value
         record = self.accepted.get(patch.label)
         if record is None:
             record = AcceptedRead(
@@ -1382,6 +1383,15 @@ class _Loop:
                 noise_reads=read_index,
             )
             self.accepted[patch.label] = record
+        elif not round_usable and record.usable:
+            # A re-measure round that produced NOTHING usable (e.g. the meter died mid-queue)
+            # must not destroy the prior accepted read: a cold-but-real value beats a sentinel
+            # hole that drops the patch from the .ti3 entirely. Keep the prior XYZ + its noise
+            # stats, accumulate the read count, and FLAG the patch (unstable → unresolved →
+            # adjudication) so the failure is loud, not silently data-erasing.
+            record.reads_taken += read_index
+            record.unstable = True
+            record.note = "re-measure produced no usable read; prior accepted value retained"
         else:
             # Overwrite in place (re-measure): keep only the final accepted read. reads_taken sums
             # across rounds (lifetime), but se_de/chroma_sigma/noise_reads describe THIS round only —
@@ -1396,7 +1406,7 @@ class _Loop:
             record.se_de = accepted_se
             record.chroma_sigma = accepted_chroma_sigma
             record.noise_reads = read_index
-        if usable:
+        if round_usable:
             self._check_read_integrity(patch, accepted_xyz)
         return record
 
@@ -2293,12 +2303,9 @@ def make_persistent_spotread_meter(
 # ---------------------------------------------------------------------------
 
 # sRGB (Rec.709) primaries → XYZ at D65, white Y normalized to 1.0. Multiplying
-# by white_nits gives an absolute white at signal (1,1,1).
-_SRGB_TO_XYZ_D65 = (
-    (0.4124564, 0.3575761, 0.1804375),
-    (0.2126729, 0.7151522, 0.0721750),
-    (0.0193339, 0.1191920, 0.9503041),
-)
+# by white_nits gives an absolute white at signal (1,1,1). One canonical copy
+# (Phase 1 audit): metrics.py owns the literal.
+_SRGB_TO_XYZ_D65 = SRGB_TO_XYZ_D65
 
 # Rec.2020 primaries → XYZ at D65, white Y normalized to 1.0 (canonical NPM; matches
 # colour's ITU-R BT.2020 to ~1e-7). The HDR synthetic panel emits through these — the

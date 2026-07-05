@@ -1089,3 +1089,54 @@ def test_dark_guard_disabled_at_floor_zero_measures_the_ramp(tmp_path: Path):
     res = run_measure_loop(patches=_grey_ramp(t, 6), transfer=t, measure=_dark,
                            config=MeasureLoopConfig(dark_floor_nits=0.0), ndjson_path=tmp_path / "m.ndjson")
     assert res.digest["panel_dark"] is False
+
+
+# ---------------------------------------------------------------------------
+# re-measure must never destroy a previously accepted read (fable audit F3-1)
+# ---------------------------------------------------------------------------
+
+class _DiesAfterFirstRead:
+    """One clean read, then the meter is gone (every read fails)."""
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def __call__(self, patch: MeasurePatch) -> Reading:
+        self.n += 1
+        if self.n <= 1:
+            return Reading(xyz=(50.0, 50.0, 55.0), yxy=(50.0, 0.31, 0.33), ok=True)
+        return Reading(xyz=None, ok=False, error="meter died")
+
+
+def test_failed_remeasure_round_keeps_the_prior_accepted_read():
+    # An appended re-measure round where the meter dies must NOT erase the previously
+    # accepted read: a cold-but-real value beats a sentinel hole that silently drops the
+    # patch from the .ti3. The failure is still loud — the record flags unstable, which
+    # lands the label in `unresolved` for adjudication.
+    t = _sdr()
+    loop = _solo_loop(_DiesAfterFirstRead(), t, MeasureLoopConfig())
+    p = _patch("p0", (512, 512, 512), t, 0)
+    rec = loop.measure_patch(p, phase="main")
+    assert rec.usable is True and rec.xyz == (50.0, 50.0, 55.0)
+
+    rec2 = loop.measure_patch(p, phase="remeasure", disposition="appended")
+    assert rec2 is rec
+    assert rec2.usable is True                      # prior value retained → stays in the .ti3
+    assert rec2.xyz == (50.0, 50.0, 55.0)
+    assert rec2.unstable is True                    # ...but loudly flagged for adjudication
+    assert "retained" in (rec2.note or "")
+    assert rec2.reads_taken > 1                     # the failed round's reads still count
+
+
+def test_fresh_patch_with_no_usable_read_is_still_a_sentinel_hole():
+    # The F3-1 preservation only applies when there IS prior data: a patch whose very
+    # first round produces nothing usable remains an unusable hole (kept off the .ti3).
+    t = _sdr()
+
+    class _AlwaysDead:
+        def __call__(self, patch: MeasurePatch) -> Reading:
+            return Reading(xyz=None, ok=False, error="dead")
+
+    loop = _solo_loop(_AlwaysDead(), t, MeasureLoopConfig())
+    rec = loop.measure_patch(_patch("p0", (512, 512, 512), t, 0), phase="main")
+    assert rec.usable is False and rec.unstable is True

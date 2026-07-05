@@ -78,8 +78,8 @@ cd DLC
 # Rehearse the whole loop on the in-process simulator (no hardware, no pipe):
 PYTHONPATH=src python -m dlc.stages.simulate --run runs/_rehearsal     # -> "Ding"
 
-# Run the suite (no hardware):
-PYTHONPATH=src python -m pytest -q -p no:cacheprovider
+# Run the suite (no hardware; needs the test extra — see Install):
+PYTHONPATH=src python -m pytest -q
 
 # Live mission-control dashboard (follows runs/active.json):
 PYTHONPATH=src python -m dlc.dashboard --open
@@ -102,8 +102,10 @@ imported lazily:
 
 ```bash
 pip install -e .            # spine + controller only
-pip install -e .[engine]    # + numpy / scipy / colour-science (the LUT/RBF engine)
+pip install -e .[engine]    # + numpy / scipy / colour-science / PyYAML (the LUT/RBF engine)
 pip install -e .[meter]     # + pywinpty (the persistent-spotread ConPTY transport)
+pip install -e .[test]      # + pytest / pytest-xdist / pytest-cov (the suite's addopts
+                            #   pass `-n auto`, so bare pytest without xdist won't run)
 ```
 
 System Python 3.11+ (3.13 on this box). Contained binaries for real runs go under
@@ -112,13 +114,18 @@ System Python 3.11+ (3.13 on this box). Contained binaries for real runs go unde
 ## Tests
 
 ```bash
-PYTHONPATH=src python -m pytest -q -p no:cacheprovider     # 519 passed, 2 skipped
+PYTHONPATH=src python -m pytest -q     # ~800 tests; green-or-skipped on any box
 ```
 
-The 2 skips are opt-in lab integration tests (`test_engine_v2.py`, gated on the
-`DLC_COLORCAL` env var pointing at the local colour-lab data). The suite covers the
-orchestrator, the colour engine, the adaptive measure loop, the correction machine,
-the event spine + liveness supervisor, the dashboard, and the IPC contract.
+The suite is deterministic on any machine: every environment-dependent test skips
+with an explicit reason instead of failing. Expected skips: the opt-in lab
+integration tests (`test_engine_v2.py`, gated on the `DLC_COLORCAL` env var pointing
+at the local colour-lab data) and, on a fresh clone, the tests that need the
+gitignored contained Argyll reference ICCs (`third_party/argyll/3.3.0/ref/`). The
+suite covers the orchestrator, the colour engine, the adaptive measure loop, the
+correction machine, the event spine + liveness supervisor, the dashboard, and the
+IPC contract. The audit's canonical per-phase baselines live in
+`docs/audits/fable/`.
 
 ## Layout
 
@@ -130,7 +137,7 @@ DLC/
                       lut_rbf, lut_sdr, whitepoint
   src/dlc/stages/     stage tools + the end-to-end mock simulator
   src/dlc/dashboard/  mission-control live view + HTML report (stdlib-only)
-  tests/              the pytest suite (519 tests)
+  tests/              the pytest suite (~800 tests)
   docs/               v2-design-notes.md (SOT), HANDOFF.md (state), design notes
   runs/               per-run records (gitignored)
   results/            clean deliverable folders per run (gitignored)

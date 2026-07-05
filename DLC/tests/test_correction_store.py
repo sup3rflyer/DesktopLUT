@@ -106,3 +106,28 @@ def test_record_without_save_is_in_memory_only(tmp_path: Path):
     store.record(_rec(), save=False)
     assert store.get("Panel One") is not None     # visible in memory
     assert not path.exists()                       # but not persisted
+
+
+def test_malformed_record_is_dropped_visibly_not_silently(tmp_path):
+    # Mirrors DipStore.dropped (fable audit F3-5): a hand-edited/drifted record is
+    # dropped tolerantly but the loss is surfaced, never silent.
+    import json
+    p = tmp_path / "correction_store.json"
+    good = {"display": "Panel One", "correction_file": "a.ccmx"}
+    bad = {"display": "Panel Two", "strength": "not-a-number"}
+    p.write_text(json.dumps({"displays": {"Panel One": good, "Panel Two": bad}}),
+                 encoding="utf-8")
+    store = CorrectionStore.load(p)
+    assert store.get("Panel One") is not None
+    assert store.get("Panel Two") is None
+    assert store.dropped == ["Panel Two"]
+    assert store.corrupt is False
+
+
+def test_save_stamps_a_schema_version(tmp_path):
+    import json
+    store = CorrectionStore(tmp_path / "correction_store.json")
+    store.record(CorrectionRecord(display="Panel One", correction_file="a.ccmx"))
+    payload = json.loads((tmp_path / "correction_store.json").read_text(encoding="utf-8"))
+    assert payload["schema"] == 1
+    assert CorrectionStore.load(tmp_path / "correction_store.json").get("Panel One") is not None

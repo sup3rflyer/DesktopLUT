@@ -385,3 +385,20 @@ def test_thermal_phase_records_warm_balance_and_streams_to_spine(tmp_path):
     assert any(e.event == "thermal_block" and e.effective_tier == "stream" for e in evs)
     # the regime summary is DIGEST tier (the LLM sees it)
     assert any(e.event == "thermal_regime" and e.effective_tier == "digest" for e in evs)
+
+
+def test_warm_up_ordering_invariant_is_structural_not_comment_only():
+    # warm_up reuses the measure loop, whose ndjson seq numbering starts at 0 — running it
+    # after other characterize reads would collide seq numbers in the shared stream. The
+    # invariant ("warm_up runs exactly once, first") must fail LOUDLY, not corrupt the
+    # stream (fable audit F3-4).
+    import pytest
+    from dlc.characterize import _Characterizer
+    from dlc.measure_loop import _NdjsonWriter
+
+    ch = _Characterizer(measure=_perfect_panel(), transfer=_transfer(),
+                        config=CharacterizeConfig(), ndjson=_NdjsonWriter(None), events=None,
+                        clock=lambda: 0.0, injected_clock=True, cold_channel=None)
+    ch._seq = 5   # pretend another phase already read
+    with pytest.raises(RuntimeError, match="FIRST phase"):
+        ch.warm_up()

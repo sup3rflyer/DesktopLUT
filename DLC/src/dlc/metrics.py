@@ -10,7 +10,8 @@ from typing import Any
 
 from .colormath import rgb_to_xyz_matrix
 from .events import EventWriter
-from .mhc import Ti3Sample, parse_ti3, resolve_run_path, white_xyz
+from .gamut import point_in_triangle
+from .mhc import Ti3Sample, white_xyz
 from .runs import RunContext
 
 
@@ -23,6 +24,67 @@ SRGB_TO_XYZ_D65 = (
 # sRGB / Rec.709 primaries — the gamut the pipeline targets (same primaries the engine's
 # colour.RGB_COLOURSPACES["sRGB"] uses in optimize).
 SRGB_PRIMARIES = ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))
+
+# ---------------------------------------------------------------------------
+# The §0 practical-core content zone — ONE definition, shared by the SCORED
+# practical summary below and the dashboard's live ΔE core/limits split
+# (dashboard.state imports these), so the scored number and the live number can
+# never disagree about what "core" means (fable roadmap §0 / Phase 6).
+# ---------------------------------------------------------------------------
+# BT.2408 diffuse/graphics reference white: ~99% of graded content lives at or
+# below this luminance and within Rec.709.
+HDR_REF_WHITE_NITS = 203.0
+# Small headroom so a target sitting exactly ON reference white classifies core.
+CORE_Y_HEADROOM = 1.02
+# Saturation ceiling of the near-neutral "tube" ((max-min)/max on the signal) —
+# the same band the patch generator's near_neutral_tube_patches occupy and the
+# Phase 2 density artifact reports (phase-2.md §2).
+TUBE_SATURATION_MAX = 0.20
+# Luminance-band edges (absolute cd/m²) — the Phase 2 density-artifact bands, so
+# score buckets line up with the measured patch investment.
+PRACTICAL_BAND_EDGES_NITS = (1.0, 10.0, 100.0, HDR_REF_WHITE_NITS)
+PRACTICAL_BAND_LABELS = ("<1", "1-10", "10-100", "100-203", ">203")
+
+
+def is_core_target(target_xy: tuple[float, float] | None, target_y_nits: float | None) -> bool:
+    """Is a patch's TARGET in the §0 practical core — inside Rec.709 at/below the
+    BT.2408 diffuse-white band (≤ ~203 nit)? ``target_y_nits=None`` (unknown luminance)
+    counts as core when the chromaticity is inside Rec.709 — matching the dashboard's
+    live split, which classifies retroactively as data arrives. ``target_xy=None``
+    (degenerate chromaticity, e.g. a black target) counts as core: a neutral dark
+    target is the practical core by definition."""
+    if target_xy is None:
+        return True
+    if not point_in_triangle(target_xy, *SRGB_PRIMARIES):
+        return False
+    return target_y_nits is None or target_y_nits <= HDR_REF_WHITE_NITS * CORE_Y_HEADROOM
+
+
+def sanitize_reachable_primaries(prim: dict | None) -> dict | None:
+    """Degenerate-guard a ``{"R": [x, y], "G": [...], "B": [...]}`` native-primaries dict
+    (#C3): a collinear/point triangle would make the native NPM singular inside the gamut
+    clamp, and real panel primaries are never collinear — so near-zero area ⇒ ``None``
+    (no clamp) rather than a crash. Shared by the live orchestrator and the stage tools."""
+    if not prim or len(prim) != 3 or not all(ch in prim for ch in ("R", "G", "B")):
+        return None
+    (rx, ry), (gx, gy), (bx, by) = prim["R"], prim["G"], prim["B"]
+    area = abs((gx - rx) * (by - ry) - (bx - rx) * (gy - ry)) / 2.0
+    return prim if area > 1e-6 else None
+
+
+def reachable_primaries_from_mhc_params(mhc_params: dict | None) -> dict | None:
+    """The panel's measured native primaries from a run record's ``mhc_params`` block
+    (``dlc_state.json``, persisted at build), in the ``{"R": [x, y], ...}`` shape the
+    engine's gamut clamp takes — or ``None`` when absent/degenerate. This is the SAME
+    first-preference source the live orchestrator's ``_reachable_primaries`` uses, so a
+    stage-CLI score and the live verify clamp against the same measured gamut (P1)."""
+    mp = (mhc_params or {}).get("primaries")
+    if not mp or not all(k in mp for k in ("rx", "ry", "gx", "gy", "bx", "by")):
+        return None
+    prim = {"R": [float(mp["rx"]), float(mp["ry"])],
+            "G": [float(mp["gx"]), float(mp["gy"])],
+            "B": [float(mp["bx"]), float(mp["by"])]}
+    return sanitize_reachable_primaries(prim)
 
 
 def npm_for_white(white_xy: tuple[float, float],
@@ -38,15 +100,23 @@ def npm_for_white(white_xy: tuple[float, float],
 
 @dataclass(frozen=True)
 class PatchMetric:
+    """One scored patch. ``de2000`` is the generic primary-ΔE carrier (CIEDE2000 on SDR,
+    dE_ITP on HDR — the summary's ``metric`` label names the units). ``gamut_clamped``
+    marks a target the reachable-gamut clamp MOVED — the patch is scored against the
+    panel's gamut boundary ("at the gamut floor"), not the raw target."""
     rgb: tuple[float, float, float]
     measured_xyz: tuple[float, float, float]
     target_xyz: tuple[float, float, float]
     de2000: float
     grayscale: bool
+    gamut_clamped: bool = False
 
 
 @dataclass(frozen=True)
 class MetricsSummary:
+    """The scored-run summary every producer (live verify, intermediate stage scores,
+    the score/report stage CLIs) emits in ONE shape (P4). The ``*_de2000`` field names
+    are the generic ΔE carrier — ``metric`` names the actual units (CIEDE2000 / dE_ITP)."""
     phase: str
     iteration: int
     source: str
@@ -62,6 +132,8 @@ class MetricsSummary:
     grayscale_max_de2000: float
     metrics_path: str | None
     patches_path: str | None
+    p99_de2000: float = 0.0
+    colour_avg_de2000: float | None = None   # None when the set has no colour patches
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -206,23 +278,30 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
         matrix = SRGB_TO_XYZ_D65
         white = white_xyz(target_luminance)
     clamped_targets = None
+    clamped_mask: list[bool] | None = None
     if reachable_primaries is not None:
         from .engine.model import Target, TargetSpace
-        target_space = TargetSpace(
-            Target.sdr_srgb_power(gamma=gamma, white_nits=target_luminance, white_xy=white_xy),
-            reachable_primaries=reachable_primaries,
-        )
-        clamped_targets = target_space.ideal_xyz([s.rgb for s in samples])
+        target = Target.sdr_srgb_power(gamma=gamma, white_nits=target_luminance, white_xy=white_xy)
+        signals = [s.rgb for s in samples]
+        clamped_targets = TargetSpace(target, reachable_primaries=reachable_primaries).ideal_xyz(signals)
+        # Which targets did the clamp MOVE? In-gamut rows come back bit-identical (the clip
+        # is a no-op there), so any real difference marks an at-the-gamut-floor patch.
+        raw_targets = TargetSpace(target).ideal_xyz(signals)
+        clamped_mask = [bool(max(abs(float(a) - float(b)) for a, b in zip(row_c, row_r)) > 1e-6)
+                        for row_c, row_r in zip(clamped_targets, raw_targets)]
 
     metrics: list[PatchMetric] = []
     for sample in samples:
         meas = _finite_nonneg_xyz(sample.xyz)
         if clamped_targets is None:
             target = target_xyz_for_rgb(sample.rgb, target_luminance, gamma, matrix)
+            clamped = False
         else:
             target = tuple(float(c) for c in clamped_targets[len(metrics)])
+            clamped = clamped_mask[len(metrics)] if clamped_mask else False
         de = delta_e2000(xyz_to_lab(meas, white), xyz_to_lab(target, white))
-        metrics.append(PatchMetric(sample.rgb, sample.xyz, target, de, is_grayscale(sample.rgb)))
+        metrics.append(PatchMetric(sample.rgb, sample.xyz, target, de, is_grayscale(sample.rgb),
+                                   gamut_clamped=clamped))
     return metrics, target_luminance
 
 
@@ -246,9 +325,11 @@ def score_samples_hdr(samples: list[Ti3Sample], *, white_xy: tuple[float, float]
                     reachable_primaries=reachable_primaries)
     de_itp = res["de_itp"]
     ideal_xyz = res["ideal_xyz"]
+    clamped = res.get("gamut_clamped")
     metrics = [
         PatchMetric(s.rgb, s.xyz, tuple(float(c) for c in ideal_xyz[i]),
-                    float(de_itp[i]), is_grayscale(s.rgb))
+                    float(de_itp[i]), is_grayscale(s.rgb),
+                    gamut_clamped=bool(clamped[i]) if clamped is not None else False)
         for i, s in enumerate(samples)
     ]
     return metrics, float(peak_nits)
@@ -265,9 +346,10 @@ def summarize_metrics(
     patches_path: Path | None = None,
     metric: str = "CIEDE2000",
 ) -> MetricsSummary:
-    values = [metric.de2000 for metric in patch_metrics]
-    grayscale = [metric.de2000 for metric in patch_metrics if metric.grayscale]
-    white_patch = max(patch_metrics, key=lambda metric: sum(metric.rgb))
+    values = [m.de2000 for m in patch_metrics]
+    grayscale = [m.de2000 for m in patch_metrics if m.grayscale]
+    colour = [m.de2000 for m in patch_metrics if not m.grayscale]
+    white_patch = max(patch_metrics, key=lambda m: sum(m.rgb))
     return MetricsSummary(
         phase=phase,
         iteration=iteration,
@@ -278,10 +360,12 @@ def summarize_metrics(
         target_luminance=target_luminance,
         avg_de2000=sum(values) / len(values),
         p95_de2000=percentile(values, 95),
+        p99_de2000=percentile(values, 99),
         max_de2000=max(values),
         white_de2000=white_patch.de2000,
         grayscale_avg_de2000=(sum(grayscale) / len(grayscale)) if grayscale else 0.0,
         grayscale_max_de2000=max(grayscale) if grayscale else 0.0,
+        colour_avg_de2000=(sum(colour) / len(colour)) if colour else None,
         metrics_path=str(metrics_path) if metrics_path is not None else None,
         patches_path=str(patches_path) if patches_path is not None else None,
     )
@@ -302,18 +386,140 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
+def _signal_saturation(rgb: tuple[float, float, float]) -> float:
+    """Signal-space saturation ``(max-min)/max`` — the Phase 2 density artifact's measure
+    (0 = grey axis, 1 = a pure primary/secondary). 0 for black (max <= 0)."""
+    mx = max(rgb)
+    return 0.0 if mx <= 0 else (mx - min(rgb)) / mx
+
+
+def _bucket_stats(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"avg": None, "p95": None, "max": None, "n": 0}
+    return {"avg": round(sum(values) / len(values), 3),
+            "p95": round(percentile(values, 95), 3),
+            "max": round(max(values), 3), "n": len(values)}
+
+
+def practical_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
+                      gamut_aware: bool = False) -> dict[str, Any]:
+    """The §0 practically-weighted view of a scored set — the content-priority split that
+    rides ALONGSIDE the raw avg/p95/max in every summary, so the number a human/LLM sees
+    reads the run the way content does: neutral axis and the Rec.709-volume core first,
+    reachability frontier last, and never traded against each other.
+
+    The weighting IS the measured patch investment: DLC's patch geography already spends
+    its budget where content lives (the neutral tube, the shadow toe, the low-mid bands —
+    phase-2.md §2), so an equal-per-patch average WITHIN each zone is already
+    luminance-frequency weighted by construction; no invented scalar weights.
+
+    Zones (targets classified with the SAME constants the dashboard's live core/limits
+    split uses — :func:`is_core_target`):
+
+    * ``core``    — target inside Rec.709 at/below diffuse white (~203 nit), reachable.
+      **The practical verdict.** For an SDR run every unclamped target is core by
+      construction (sRGB targets at the OSD-set white).
+    * ``limits``  — reachable but outside the core (wide-gamut and/or >203 nit): honest,
+      rarely-hit territory; never the headline.
+    * ``clamped`` — the target itself is beyond the panel's measured gamut and was scored
+      against the reachable boundary ("at the gamut floor"): a reachability fact, not a
+      calibration miss. Empty unless ``gamut_aware`` (the HDR #C3 clamp).
+
+    Plus the two §0 honesty breakdowns that keep a flattering average from hiding a
+    visible defect: ``tube`` (neutral + near-neutral ≤ 0.20 saturation — where a cast is
+    most visible) and ``bands`` (the Phase 2 luminance bands — a low-light drift shows up
+    in ``<1``/``1-10`` no matter how good the overall average looks)."""
+    zones: dict[str, list[float]] = {"core": [], "limits": [], "clamped": []}
+    tube: list[float] = []
+    bands: dict[str, list[float]] = {label: [] for label in PRACTICAL_BAND_LABELS}
+    for m in patch_metrics:
+        x, y, z = m.target_xyz
+        total = x + y + z
+        target_xy = (x / total, y / total) if total > 1e-9 else None
+        target_y = y
+        if m.gamut_clamped:
+            zones["clamped"].append(m.de2000)
+        elif not is_hdr or is_core_target(target_xy, target_y):
+            zones["core"].append(m.de2000)
+        else:
+            zones["limits"].append(m.de2000)
+        if m.grayscale or _signal_saturation(m.rgb) <= TUBE_SATURATION_MAX:
+            tube.append(m.de2000)
+        band_idx = sum(1 for edge in PRACTICAL_BAND_EDGES_NITS if target_y > edge)
+        bands[PRACTICAL_BAND_LABELS[band_idx]].append(m.de2000)
+    return {
+        "gamut_aware": bool(gamut_aware),
+        "core": _bucket_stats(zones["core"]),
+        "limits": _bucket_stats(zones["limits"]),
+        "clamped": _bucket_stats(zones["clamped"]),
+        "tube": _bucket_stats(tube),
+        "bands": {label: _bucket_stats(vals) for label, vals in bands.items()},
+    }
+
+
+def metrics_scored_payload(summary: MetricsSummary, *, label: str,
+                           practical: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The ONE ``metrics_scored`` event shape every producer emits (P4) — the live
+    orchestrator passes it to ``runlog.metrics_scored``, the stage tools to
+    ``EventWriter`` — so the dashboard's ΔE panel/history render identically whichever
+    path scored the run. Keys ride the generic ``*_de2000`` carrier; ``metric`` names
+    the units; ``practical`` (when given) carries the §0 core/limits/clamped split."""
+    payload: dict[str, Any] = {
+        "label": label,
+        "iteration": summary.iteration,
+        "metric": summary.metric,
+        "avg_de2000": round(summary.avg_de2000, 3),
+        "p95_de2000": round(summary.p95_de2000, 3),
+        "p99_de2000": round(summary.p99_de2000, 3),
+        "max_de2000": round(summary.max_de2000, 3),
+        "white_de2000": round(summary.white_de2000, 3),
+        "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
+        "colour_avg_de2000": (round(summary.colour_avg_de2000, 3)
+                              if summary.colour_avg_de2000 is not None else None),
+        "patch_count": summary.patch_count,
+        "grayscale_count": summary.grayscale_count,
+    }
+    if practical is not None:
+        payload["practical"] = practical
+    return payload
+
+
+def _strict_json_patch_rows(patch_metrics: list[PatchMetric]) -> list[dict[str, Any]]:
+    """Per-patch rows safe for STRICT JSON. ``measured_xyz`` is the RAW meter read (kept
+    raw on purpose — the artifact is evidence), so a dropped/saturated read can carry
+    NaN/inf; ``json.dumps`` would emit bare ``NaN`` tokens, which Python re-parses but a
+    browser's ``JSON.parse`` (the dashboard's ``/api/patch_metrics``) throws on. Map
+    non-finite components to ``null`` — an honest "no usable number" — and leave every
+    finite value untouched. The scored ``de2000`` is always finite (it is computed from
+    the sanitized copy — see ``_finite_nonneg_xyz``)."""
+    rows = []
+    for metric in patch_metrics:
+        row = asdict(metric)
+        row["measured_xyz"] = tuple(c if math.isfinite(c) else None for c in metric.measured_xyz)
+        rows.append(row)
+    return rows
+
+
 def write_metrics(
     *,
     ctx: RunContext,
     phase: str,
     iteration: int,
-    source_ti3: Path,
-    gamma: float = 2.2,
-    luminance: float | None = None,
+    source: Path,
+    patch_metrics: list[PatchMetric],
+    target_luminance: float,
+    metric: str = "CIEDE2000",
+    practical: dict[str, Any] | None = None,
+    label: str | None = None,
+    emit_event: bool = True,
 ) -> MetricsSummary:
-    source_ti3 = resolve_run_path(ctx, source_ti3)
-    samples = parse_ti3(source_ti3)
-    patch_metrics, target_luminance = score_samples(samples, luminance=luminance, gamma=gamma)
+    """Persist a scored set as the run's metrics artifacts + spine event — the ONE
+    producer of the ``*_metrics.json`` / ``*_patch_metrics.json`` shapes (the dashboard's
+    ``/api/patch_metrics`` globs for the latter) and of the canonical ``metrics_scored``
+    event (P4). Takes PRE-SCORED patch metrics so every caller keeps its own mode-gated
+    scorer (CIEDE2000 SDR / dE_ITP HDR, resolved white, gamut clamp) — this function only
+    summarizes, serializes, and emits. ``emit_event=False`` for callers that emit through
+    their own phase-stamped :class:`RunLog` (the live orchestrator) to avoid a double event."""
     output_dir = ctx.root / "reports"
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / f"{phase}_iter{iteration:02d}_metrics.json"
@@ -321,14 +527,22 @@ def write_metrics(
     summary = summarize_metrics(
         phase=phase,
         iteration=iteration,
-        source=source_ti3,
+        source=source,
         patch_metrics=patch_metrics,
         target_luminance=target_luminance,
         metrics_path=metrics_path,
         patches_path=patches_path,
+        metric=metric,
     )
-    metrics_path.write_text(json.dumps(summary.as_dict(), indent=2), encoding="utf-8")
-    patches_path.write_text(json.dumps([asdict(metric) for metric in patch_metrics], indent=2), encoding="utf-8")
+    # allow_nan=False: if a non-finite ever reaches these artifacts again it fails HERE,
+    # loudly, instead of writing JSON a browser cannot parse.
+    doc = summary.as_dict()
+    if practical is not None:
+        doc["practical"] = practical
+    metrics_path.write_text(json.dumps(doc, indent=2, allow_nan=False), encoding="utf-8")
+    patches_path.write_text(
+        json.dumps(_strict_json_patch_rows(patch_metrics), indent=2, allow_nan=False),
+        encoding="utf-8")
     ctx.manifest.stages.append(
         {
             "stage": f"{phase}_metrics",
@@ -343,15 +557,13 @@ def write_metrics(
     )
     ctx.save()
     ctx.log(f"Scored {phase} metrics iteration {iteration}")
-    EventWriter(ctx.events_path).write(
-        "INFO",
-        f"{phase}_metrics",
-        "metrics_scored",
-        iteration=iteration,
-        avg_de2000=summary.avg_de2000,
-        p95_de2000=summary.p95_de2000,
-        max_de2000=summary.max_de2000,
-        white_de2000=summary.white_de2000,
-    )
+    if emit_event:
+        EventWriter(ctx.events_path).write(
+            "INFO",
+            f"{phase}_metrics",
+            "metrics_scored",
+            tier="digest",
+            **metrics_scored_payload(summary, label=label or phase, practical=practical),
+        )
     return summary
 

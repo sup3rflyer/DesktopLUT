@@ -28,6 +28,14 @@ class ProfileStagePreset:
     profile_type: str
 
 
+# DISPOSITION (fable audit Phase 3): STAGE_PRESETS parameterize the Argyll targen/dispread
+# measurement path (this module + stages/measure.py) — a documented ALTERNATE to the live
+# orchestrator, kept for Argyll-native workflows and offline plan/execute runs. The counts
+# are historical Argyll-flow choices (96 ≈ targen quick-profile default band, 729 = 9³
+# volumetric grid, 256 ≈ verification sweep; -g33/-s9/-s17 are the matching targen args),
+# NOT derived from the DIP noise model, and deliberately disjoint from the live
+# orchestrator's PatchSizes sets (engine/patches.py) — do not cross-tune one against the
+# other. If this path is ever promoted beyond an alternate, re-derive these from the DIP.
 STAGE_PRESETS: dict[str, ProfileStagePreset] = {
     "raw-mhc": ProfileStagePreset(
         stage="raw-mhc",
@@ -269,8 +277,12 @@ def resolve_dispread_instrument_port(
     }
     if not argv:
         return argv, evidence
-    executable = Path(argv[0])
-    if executable.name.lower() not in {"dispread.exe", "dispread"} or "-c" not in argv:
+    # Plans carry contained-tool paths in Windows form (C:\...\dispread.exe) while this
+    # verification logic also runs — and is unit-tested — on POSIX, where pathlib treats
+    # the whole string as a single component. Split on both separator conventions so the
+    # gate (and the port-resolution logic behind it) behaves identically on every OS.
+    executable_name = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if executable_name.lower() not in {"dispread.exe", "dispread"} or "-c" not in argv:
         return argv, evidence
     port_index = argv.index("-c") + 1
     if port_index >= len(argv):
@@ -282,7 +294,11 @@ def resolve_dispread_instrument_port(
         evidence.update({"ok": False, "applicable": True, "reason": f"dispread command has non-numeric port: {argv[port_index]}"})
         return argv, evidence
 
-    spotread = executable.with_name("spotread.exe")
+    # Sibling spotread in the same directory, preserving the plan's separator convention
+    # AND its suffix convention (a POSIX plan carries "dispread", not "dispread.exe" —
+    # hardcoding the .exe here would derive a nonexistent sibling and fail enumeration).
+    sibling = "spotread.exe" if executable_name.lower().endswith(".exe") else "spotread"
+    spotread = Path(argv[0][: len(argv[0]) - len(executable_name)] + sibling)
     enumerator = instrument_enumerator or (lambda path: Argyll(path).enumerate_instruments())
     try:
         instruments = enumerator(spotread)

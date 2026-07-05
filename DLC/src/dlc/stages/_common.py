@@ -36,6 +36,12 @@ from ..stage import StageResult
 # resume" from rebuild plan §10.6: just enough memory to chain stages and
 # compute deltas between iterations.
 DLC_STATE_FILE = "dlc_state.json"
+# Schema version stamped into dlc_state.json on every save (fable Phase 7a). Consumers stay
+# TOLERANT (unknown fields are ignored; resolve_run_spec already reads bit_depth from both its
+# historical locations), so the stamp exists for the next drift: a reader that must branch on a
+# breaking layout change has a number to branch on, and a human inspecting a run dir can tell
+# which era wrote it. Bump only for a change a tolerant reader cannot absorb.
+DLC_STATE_VERSION = 1
 # Where the file-backed simulator persists its state across --simulate process
 # invocations (the real pipe is a long-lived process, so cross-call state is
 # free there; the mock needs a file to mimic it).
@@ -249,6 +255,9 @@ def save_dlc_state(ctx: RunContext, state: dict[str, Any]) -> Path:
     # Atomic write: the run-record is rewritten after every stage/decision; a crash mid-write
     # must leave the prior complete record (load_dlc_state does a bare json.loads), never a
     # truncated one that loses the run's memoised stages/decisions/backup pointer.
+    # Every save stamps the schema version (setdefault: a record written by a NEWER schema and
+    # merely re-saved here keeps its own stamp rather than being silently down-labelled).
+    state.setdefault("dlc_state_version", DLC_STATE_VERSION)
     path = ctx.root / DLC_STATE_FILE
     return atomic_write_text(path, json.dumps(state, indent=2))
 

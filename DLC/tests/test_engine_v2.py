@@ -20,7 +20,7 @@ pytest.importorskip("colour")
 
 from dlc.engine import patches as P
 from dlc.engine import lut_rbf as L
-from dlc.engine import lut_sdr as S
+from dlc.engine import lut_sdr_reference as S
 from dlc.engine import whitepoint as W
 from dlc.engine.lut_constrained import build_constrained_rbf_cube, gamut_clip_pressure, gamut_pressure
 from dlc.engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
@@ -605,7 +605,7 @@ def test_hull_distance_degenerate_is_safe():
 
 
 # ===========================================================================
-# lut_sdr
+# lut_sdr_reference (production-unreachable reference port — Phase 5 disposition)
 # ===========================================================================
 
 def _synth_ramps(native_cs_name, *, white_nits=120.0, gammas=(2.2, 2.2, 2.2), levels=21):
@@ -737,3 +737,60 @@ def test_cross_instrument_metameric_offset_agrees():
     d_own = W.observer_offset(own, "2015_2")
     d_cr = W.observer_offset(cr["white"], "2015_2")
     assert abs(d_own[0] - d_cr[0]) < 0.002 and abs(d_own[1] - d_cr[1]) < 0.002
+
+
+# ---------------------------------------------------------------------------
+# Fable audit Phase 2 — input-side invariants (transfers, colour floor, white default)
+# ---------------------------------------------------------------------------
+
+def test_transfer_power_is_pure_power_never_piecewise_srgb():
+    # Owner hard requirement: SDR is a pure power law, NEVER the piecewise sRGB EOTF.
+    # Pin the exact formula and pin that it DIFFERS from piecewise sRGB at mid-signal
+    # (so a future "helpful" swap to colour-science's sRGB cctf fails loudly).
+    t = P.Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+    for cv in (64, 256, 512, 767, 1023):
+        s = cv / t.max_cv
+        assert t.cv_to_nits(cv) == pytest.approx(120.0 * s ** 2.2, rel=1e-12)
+    s = 0.5
+    piecewise = ((s + 0.055) / 1.055) ** 2.4          # sRGB EOTF at 0.5
+    assert abs(0.5 ** 2.2 - piecewise) > 1e-3          # the two curves genuinely differ here
+    assert t.cv_to_nits(round(s * t.max_cv)) != pytest.approx(120.0 * piecewise, rel=1e-3)
+
+
+def test_ramp_color_floor_is_full_scale_and_never_overlaps_grey_toe():
+    # color_min_signal is a fraction of the FULL-scale signal (absolute under PQ:
+    # 0.25 ~ 1 nit for any target peak), deliberately not of the HDR max_cv peak cap;
+    # and the floored colour never dips into the low_light grey toe band.
+    tr = P.Transfer.pq(bit_depth=10)
+    cap = tr.nits_to_cv(1600.0)                        # HDR peak cap < full scale
+    floor_signal, toe_signal = 0.25, 0.20
+    ramp = P.ramp_patches(tr, steps=13, saturations=(1.0,), max_cv=cap,
+                          low_light_steps=9, low_light_signal=toe_signal,
+                          color_min_signal=floor_signal, order="none")
+    colour_patches = [p for p in ramp if not (p[0] == p[1] == p[2])]
+    greys = [p[0] for p in ramp if p[0] == p[1] == p[2]]
+    floor_cv = round(floor_signal * tr.max_cv)         # full-scale domain (the pin)
+    assert min(max(p) for p in colour_patches) >= floor_cv
+    # the grey toe still covers the dark EOTF below the colour floor
+    toe_top = round(toe_signal * cap)                  # cap-relative shadow band
+    assert any(0 < g <= toe_top for g in greys)
+    assert floor_cv > toe_top                          # no-overlap invariant
+
+
+def test_white_from_spd_file_default_is_numeric_d65(tmp_path):
+    # The default strength must match target_white's (0 = numeric D65) — a silent
+    # full-strength perceptual correction is never a default.
+    wl = np.arange(380, 731, 5.0)
+
+    def gauss(c, w, a):
+        return a * np.exp(-0.5 * ((wl - c) / w) ** 2)
+
+    vals = gauss(450, 12, 1.0) + gauss(530, 12, 1.0) + gauss(620, 14, 1.2)
+    sp = tmp_path / "white.sp"
+    sp.write_text(
+        'CGATS.17\nSPECTRAL_BANDS "%d"\nSPECTRAL_START_NM "380"\nSPECTRAL_END_NM "730"\n'
+        "BEGIN_DATA\n" % len(vals) + " ".join("%.6f" % v for v in vals) + "\nEND_DATA\n",
+        encoding="utf-8")
+    res = W.white_from_spd_file(sp)                    # no strength argument
+    assert res["xy"] == pytest.approx(W.LEGACY_D65_XY, abs=1e-9)
+    assert res["strength"] == 0.0

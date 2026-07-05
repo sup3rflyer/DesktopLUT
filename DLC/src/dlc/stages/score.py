@@ -7,16 +7,24 @@ assistant decides acceptance.
 Mode-gated exactly like the live ``calibrate.py`` path (owner directive: dE_ITP for
 HDR only, CIEDE2000 for SDR only). An HDR run scores ``dE_ITP`` (BT.2124) against the
 PQ/Rec.2020 target — CIEDE2000's Lab is meaningless at HDR absolute luminance, so the
-old unconditional-CIEDE2000 path produced ~30+ dE garbage on HDR data.
+old unconditional-CIEDE2000 path produced ~30+ dE garbage on HDR data. Also GAMUT-AWARE
+exactly like the live verify (P1): the HDR target is clamped onto the panel's measured
+native gamut from the run record, and every summary carries the §0 practical split
+(core / limits / at-the-gamut-floor) alongside the raw numbers.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
-from ..metrics import score_samples, score_samples_hdr, summarize_metrics
+from ..metrics import (
+    practical_summary,
+    reachable_primaries_from_mhc_params,
+    score_samples,
+    score_samples_hdr,
+    write_metrics,
+)
 from ..mhc import parse_ti3, resolve_run_path
 from ..runs import RunContext
 from ..stage import StageResult
@@ -58,45 +66,60 @@ def build(args, ctx: RunContext) -> StageResult:
         # peak_nits is a reported number only (PQ is absolute) — the dE_ITP math needs just the white.
         peak = (args.luminance
                 or (dl_state.get("mhc_params") or {}).get("target_luminance") or 1000.0)
+        # Gamut-aware exactly like the live verify (P1): clamp the target onto the panel's
+        # MEASURED native gamut from the run record (the same mhc_params.primaries the live
+        # path prefers), so a stage-CLI HDR score never counts an unreachable BT.2020 corner
+        # as calibration error while the live run doesn't. No build yet ⇒ no clamp — surfaced
+        # as gamut_aware=false below, never silently.
+        reachable = reachable_primaries_from_mhc_params(dl_state.get("mhc_params"))
         patch_metrics, target_luminance = score_samples_hdr(
-            samples, white_xy=target_white_xy, peak_nits=float(peak)
+            samples, white_xy=target_white_xy, peak_nits=float(peak),
+            reachable_primaries=reachable,
         )
         metric_name = "dE_ITP"
         thresholds = hdr_metric_thresholds(
             ctx.manifest.desktoplut.get("quality_policy") if ctx else None
         )
     else:
+        reachable = None   # production SDR never clamps (CV-gated worse; see score_samples)
         patch_metrics, target_luminance = score_samples(
             samples, luminance=args.luminance, gamma=args.gamma, white_xy=target_white_xy
         )
         metric_name = "CIEDE2000"
         thresholds = metric_thresholds_for_run(ctx, args.stage)
-    metrics_path = ctx.root / "reports" / f"score_{args.stage}_iter{args.iteration:02d}.json"
-    patches_path = ctx.root / "reports" / f"score_{args.stage}_iter{args.iteration:02d}_patches.json"
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    summary = summarize_metrics(
-        phase=args.stage,
+    gamut_aware = reachable is not None
+    practical = practical_summary(patch_metrics, is_hdr=is_hdr, gamut_aware=gamut_aware)
+    # One producer shape (P4): write_metrics owns the artifacts (metrics + per-patch rows —
+    # the file the dashboard's /api/patch_metrics globs for) and the canonical
+    # metrics_scored event, so a stage-CLI run fills the same dashboard ΔE panel a live
+    # run does (previously: no event, blank cells; a declared patches_path never written).
+    summary = write_metrics(
+        ctx=ctx,
+        phase=f"score_{args.stage}",
         iteration=args.iteration,
         source=source,
         patch_metrics=patch_metrics,
         target_luminance=target_luminance,
-        metrics_path=metrics_path,
-        patches_path=patches_path,
         metric=metric_name,
+        practical=practical,
+        label=args.stage,
     )
-    metrics_path.write_text(json.dumps(summary.as_dict(), indent=2), encoding="utf-8")
-    result.add_artifact(metrics_path)
+    result.add_artifact(Path(summary.metrics_path))
+    result.add_artifact(Path(summary.patches_path))
     result.action(
         f"scored {summary.patch_count} patches ({metric_name}) vs "
         + ("PQ/Rec.2020" if is_hdr else f"gamma {args.gamma}")
         + f" / white {target_white_xy[0]:.6f},{target_white_xy[1]:.6f} ({target_white_source})"
+        + (f" / gamut-aware (native primaries from the run record)" if gamut_aware else "")
     )
 
     # Worst offenders, for the assistant to inspect. (`de2000` is the generic ΔE carrier field — it
-    # holds dE_ITP for an HDR run; the `metric` label below names the units.)
+    # holds dE_ITP for an HDR run; the `metric` label names the units.) `gamut_clamped` marks a
+    # patch scored against the panel's gamut boundary — a reachability floor, not a cube miss.
     worst = sorted(patch_metrics, key=lambda m: m.de2000, reverse=True)[:5]
     result.raw["worst_patches"] = [
-        {"rgb": [round(c, 4) for c in m.rgb], "de2000": round(m.de2000, 3), "grayscale": m.grayscale}
+        {"rgb": [round(c, 4) for c in m.rgb], "de2000": round(m.de2000, 3),
+         "grayscale": m.grayscale, "gamut_clamped": m.gamut_clamped}
         for m in worst
     ]
     if summary.max_de2000 > thresholds.max_de2000:
@@ -112,13 +135,18 @@ def build(args, ctx: RunContext) -> StageResult:
         "metric": metric_name,
         "avg_de2000": round(summary.avg_de2000, 4),
         "p95_de2000": round(summary.p95_de2000, 4),
+        "p99_de2000": round(summary.p99_de2000, 4),
         "max_de2000": round(summary.max_de2000, 4),
         "white_de2000": round(summary.white_de2000, 4),
         "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 4),
         "grayscale_max_de2000": round(summary.grayscale_max_de2000, 4),
+        "colour_avg_de2000": (round(summary.colour_avg_de2000, 4)
+                              if summary.colour_avg_de2000 is not None else None),
         "target_luminance": round(summary.target_luminance, 4),
         "target_white_xy": [round(target_white_xy[0], 6), round(target_white_xy[1], 6)],
         "target_white_source": target_white_source,
+        "gamut_aware": gamut_aware,
+        "practical": practical,
     }
 
     # Delta vs previous score for the same stage + history for the report.

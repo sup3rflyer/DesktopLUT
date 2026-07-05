@@ -12,7 +12,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..metrics import score_samples, score_samples_hdr, summarize_metrics
+from ..metrics import (
+    practical_summary,
+    reachable_primaries_from_mhc_params,
+    score_samples,
+    score_samples_hdr,
+    summarize_metrics,
+)
 from ..mhc import find_stage_artifact, parse_ti3, resolve_run_path
 from ..runs import RunContext
 from ..stage import StageResult
@@ -21,14 +27,17 @@ from . import _common
 
 def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
                white_xy: tuple[float, float], *, is_hdr: bool = False,
-               peak_nits: float = 1000.0) -> dict[str, Any] | None:
+               peak_nits: float = 1000.0, reachable: dict | None = None) -> dict[str, Any] | None:
     if not ti3.exists():
         return None
     samples = parse_ti3(ti3)
     # Mode-gate the metric like calibrate.py (dE_ITP HDR-only / CIEDE2000 SDR-only). before/after must
     # use the SAME metric for the improvement delta to mean anything — both flow from the run's mode.
+    # The HDR gamut clamp (`reachable`, P1) is likewise applied to BOTH sides, so the improvement
+    # delta compares like with like (an unreachable corner is a reachability floor on either side).
     if is_hdr:
-        patch_metrics, lum = score_samples_hdr(samples, white_xy=white_xy, peak_nits=peak_nits)
+        patch_metrics, lum = score_samples_hdr(samples, white_xy=white_xy, peak_nits=peak_nits,
+                                               reachable_primaries=reachable)
         metric_name = "dE_ITP"
     else:
         patch_metrics, lum = score_samples(samples, gamma=gamma, white_xy=white_xy)
@@ -51,6 +60,8 @@ def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
         "white_de2000": round(summary.white_de2000, 4),
         "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 4),
         "target_luminance": round(summary.target_luminance, 4),
+        "practical": practical_summary(patch_metrics, is_hdr=is_hdr,
+                                       gamut_aware=reachable is not None),
     }
 
 
@@ -66,22 +77,32 @@ def build(args, ctx: RunContext) -> StageResult:
     is_hdr = _common.run_mode(args, ctx) == "HDR"
     peak_nits = float((dl.get("mhc_params") or {}).get("target_luminance") or 1000.0)
     metric_name = "dE_ITP" if is_hdr else "CIEDE2000"
+    # Gamut-aware like the live verify + the score stage (P1): HDR targets clamp onto the
+    # panel's measured native gamut from the run record; None for SDR (never clamps).
+    reachable = reachable_primaries_from_mhc_params(dl.get("mhc_params")) if is_hdr else None
 
     raw_ti3 = find_stage_artifact(ctx, "raw-mhc", "ti3")
     before = _score_ti3(ctx, resolve_run_path(ctx, Path(raw_ti3)), "raw-mhc",
-                        args.gamma, target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits) if raw_ti3 else None
+                        args.gamma, target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits,
+                        reachable=reachable) if raw_ti3 else None
 
     after = None
     for stage in ("3dlut-verification", "mhc-verification", "verification"):
         ti3 = find_stage_artifact(ctx, stage, "ti3")
         if ti3:
             after = _score_ti3(ctx, resolve_run_path(ctx, Path(ti3)), stage, args.gamma,
-                               target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits)
+                               target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits,
+                               reachable=reachable)
             if after:
                 after["stage"] = stage
                 break
     if after is None and dl.get("score_history"):
-        after = dict(dl["score_history"][-1])
+        # Fall back to the last recorded score ONLY if it was scored in this run's metric —
+        # a cross-metric before/after "improvement" (CIEDE2000 minus dE_ITP) is meaningless
+        # and worse than an honest "no final score".
+        last = dict(dl["score_history"][-1])
+        if last.get("metric") == metric_name:
+            after = last
 
     params = dl.get("mhc_params", {})
     improvement = None
@@ -144,6 +165,15 @@ def _render_html(p: dict[str, Any]) -> str:
         a = (p["after"] or {}).get(key)
         return f"<tr><td>{label}</td><td>{b if b is not None else '—'}</td><td>{a if a is not None else '—'}</td></tr>"
 
+    def zone_row(label: str, zone: str, stat: str) -> str:
+        # The §0 practical split (core = the verdict; clamped = at the panel's gamut floor).
+        def get(side: str):
+            return (((p[side] or {}).get("practical") or {}).get(zone) or {}).get(stat)
+        b, a = get("before"), get("after")
+        if b is None and a is None:
+            return ""
+        return f"<tr><td>{label}</td><td>{b if b is not None else '—'}</td><td>{a if a is not None else '—'}</td></tr>"
+
     return (
         "<!doctype html><meta charset='utf-8'><title>DLC report</title>"
         "<style>body{font-family:system-ui;margin:2rem;color:#222}"
@@ -156,6 +186,9 @@ def _render_html(p: dict[str, Any]) -> str:
         + row(f"Max {de}", "max_de2000")
         + row(f"White {de}", "white_de2000")
         + row(f"Grayscale avg {de}", "grayscale_avg_de2000")
+        + zone_row(f"Practical core avg {de} (Rec.709 ≤ ref-white)", "core", "avg")
+        + zone_row(f"Practical core max {de}", "core", "max")
+        + zone_row(f"At gamut floor avg {de} (unreachable targets)", "clamped", "avg")
         + "</table>"
     )
 

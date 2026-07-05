@@ -15,8 +15,10 @@ pull numpy. Import the specific engine module you need instead::
     from dlc.engine import patches              # numpy-free (pure stdlib)
     from dlc.engine.model import DisplayErrorModel
     from dlc.engine.lut_rbf import build_cube
-    from dlc.engine.lut_sdr import build_sdr_cube
     from dlc.engine import whitepoint
+
+(``lut_sdr_reference`` is a production-unreachable reference port — see its module
+banner; the live SDR base-cube builder is ``dlc.mhc_cube.build_sdr_cube``.)
 
 Install the engine dependencies with::
 

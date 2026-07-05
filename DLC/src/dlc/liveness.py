@@ -204,6 +204,13 @@ class Liveness:
                 self.runlog.note(stage, "pause requested but neutral park failed",
                                  level="WARN", paused=True, error=f"{type(exc).__name__}: {exc}")
         while True:
+            # Each poll iteration proves the main thread is alive and cooperating (paused, not
+            # wedged), so reset the shared progress clock — otherwise a pause stacked on prior
+            # progress age could cross the WATCHDOG threshold mid-pause and force-kill the
+            # meter/presenter during a legitimate operator hold. If the pause itself wedges
+            # (e.g. on_pause's neutral park blocks before the loop), no ticks happen and the
+            # watchdog still fires — exactly the case it exists for.
+            self.progress(stage)
             now = self._clock()
             elapsed = now - start
             if elapsed >= timeout_s:

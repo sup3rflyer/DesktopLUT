@@ -302,6 +302,34 @@ def test_channel_drift_tracks_per_channel_warmup():
     assert cd[-1]["b"] > cd[-1]["r"] and cd[-1]["b"] > 0  # blue drifted up the most → the warming channel
 
 
+def test_warmup_settling_verdict():
+    """The phase spotlight's verdict: while warm-up reads are the latest activity the view is
+    ``active``; a fast-moving channel reads not-settled with its slope in %/10 min; once the
+    checkpoints flatten (and measurement takes over) it flips to settled and inactive."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:raw"))
+    # blue climbing hard across three warm-up checkpoints (2 min span)
+    for i, (xy, Y) in enumerate([([0.3127, 0.3290], 100.0), ([0.3112, 0.3276], 101.0),
+                                 ([0.3098, 0.3262], 102.0)]):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i * 60), stage="measure:raw",
+                      tier="stream", role="warmup", label="warm", rgb=[255, 255, 255],
+                      signal=[1.0, 1.0, 1.0], Y=Y, xy=xy, ok=True))
+    w = st.snapshot(T0 + timedelta(seconds=130))["warmup"]
+    assert w["active"] is True
+    assert w["settled"] is False and w["channel"] == "b" and w["slope_pct_per_10min"] > 0
+    # much later, two flat checkpoints → settled; a measurement read ends the warm-up spotlight
+    for at in (1200, 1500):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=at), stage="measure:raw",
+                      tier="stream", role="neutral_ref", disposition="drift_ref", label="ref",
+                      rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0], Y=102.1,
+                      xy=[0.3098, 0.3262], ok=True))
+    w2 = st.snapshot(T0 + timedelta(seconds=1510))["warmup"]
+    assert w2["active"] is False                       # latest read is no longer warm-up
+    assert w2["settled"] is True and abs(w2["slope_pct_per_10min"]) < 0.15
+
+
 def test_pipeline_stepper_tracks_done_current_upcoming():
     """The run_header carries the planned stage list; the snapshot's pipeline marks each step
     done / current / upcoming with 'stage K of N' so the stepper can show the whole flow."""
@@ -597,14 +625,28 @@ def test_cie_points_carry_target_and_de_for_error_vectors():
     assert pt["de"] is not None and pt["de"] > 0                # scoring ΔE for the hover readout
 
 
-def test_grayscale_latest_measurement_wins_per_level():
+def test_grayscale_rereads_median_with_spread_within_a_stage():
+    """Re-reads at the same level within a stage form a SAMPLE RING: the chart shows the
+    median (one noisy sample can't swing the trace — the ColourSpace-style taming) and the
+    CCT spread rides along as the uncertainty whisker. A fresh read in a NEW stage resets
+    the ring (a re-measure through a new correction is a different population)."""
     st = DashboardState()
-    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", white={"xy": [0.3127, 0.329]}))
-    _read(st, 1, [128, 128, 128], [0.30, 0.34], 40.0, signal=[0.5, 0.5, 0.5])
-    _read(st, 9, [128, 128, 128], [0.313, 0.329], 41.0, signal=[0.5, 0.5, 0.5])  # re-measure
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329]}))
+    _read(st, 1, [128, 128, 128], [0.30, 0.34], 40.0, signal=[0.5, 0.5, 0.5], phase="measure:raw")
+    _read(st, 9, [128, 128, 128], [0.313, 0.329], 41.0, signal=[0.5, 0.5, 0.5], phase="measure:raw")
+    _read(st, 12, [128, 128, 128], [0.313, 0.329], 41.0, signal=[0.5, 0.5, 0.5], phase="measure:raw")
     gray = st.charts()["grayscale"]
     assert len(gray) == 1
-    assert gray[0]["x"] == 0.313     # the later read overwrote the earlier one
+    assert gray[0]["n"] == 3
+    assert gray[0]["x"] == 0.313                 # median of 3 — the outlier can't drag it
+    assert gray[0]["cct_lo"] is not None and gray[0]["cct_hi"] > gray[0]["cct_lo"]  # spread kept
+    assert gray[0]["de"] is not None             # ΔE vs the neutral target rides along
+    # a new stage: the first fresh read REPLACES the carried ring, never averages with it
+    _read(st, 20, [128, 128, 128], [0.3127, 0.329], 41.5, signal=[0.5, 0.5, 0.5],
+          phase="measure:verify")
+    gray2 = st.charts()["grayscale"]
+    assert gray2[0]["n"] == 1 and gray2[0]["x"] == 0.3127 and not gray2[0].get("carried")
 
 
 def test_color_luminance_error_vs_target():
@@ -638,6 +680,82 @@ def test_hdr_header_drives_rec2020_pq_charts():
     assert ch["eotf"]["reference"][20][1] < 0.1
     cl = {c["label"]: c for c in ch["color_lum"]}
     assert "R100" in cl and abs(cl["R100"]["error"]) < 0.01
+
+
+def test_charts_carry_forward_previous_stage_until_remeasured():
+    """A stage boundary must not blank the charts: the new stage's view is SEEDED from the
+    previous stage's points (flagged ``carried``), and each patch flips to fresh as it's
+    re-measured — the graphs update in place instead of restarting."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # raw stage: one colour + one neutral
+    _read(st, 1, [255, 0, 0], [0.66, 0.32], 40.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    _read(st, 2, [128, 128, 128], [0.30, 0.34], 35.0, signal=[0.5, 0.5, 0.5], phase="measure:raw")
+    # verify stage: only the red has been re-measured so far
+    _read(st, 3, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:verify")
+    ch = st.charts()
+    assert ch["stage"] == "measure:verify"
+    assert ch["continuity"] == {"from": "measure:raw", "carried": 1, "fresh": 1}
+    assert len(ch["cie"]["points"]) == 2                     # red (fresh) + neutral (carried)
+    red = next(p for p in ch["cie"]["points"] if not p["neutral"])
+    gray_pt = next(p for p in ch["cie"]["points"] if p["neutral"])
+    assert not red.get("carried") and red["x"] == 0.64       # fresh verify read replaced raw
+    assert gray_pt.get("carried") is True and gray_pt["x"] == 0.30   # still the raw reading, faded
+    # the grayscale/EOTF view carries the flag too
+    gray = ch["grayscale"]
+    assert [g["signal"] for g in gray] == [0.5] and gray[0].get("carried") is True
+    assert ch["eotf"]["points"][0]["carried"] is True
+    # ... and re-measuring the neutral clears its carried flag + updates the value
+    _read(st, 4, [128, 128, 128], [0.313, 0.329], 36.0, signal=[0.5, 0.5, 0.5], phase="measure:verify")
+    ch2 = st.charts()
+    assert ch2["continuity"] == {"from": "measure:raw", "carried": 0, "fresh": 2}
+    assert ch2["grayscale"][0]["x"] == 0.313 and not ch2["grayscale"][0].get("carried")
+
+
+def test_cie_scatter_dedups_rereads_within_a_stage():
+    """The CIE scatter is keyed by patch identity (latest-wins): a re-read replaces the same
+    patch's dot instead of piling a second one on top."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, white={"xy": [0.3127, 0.329]}))
+    _read(st, 1, [255, 0, 0], [0.62, 0.34], 40.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    _read(st, 2, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    pts = st.charts()["cie"]["points"]
+    assert len(pts) == 1 and pts[0]["x"] == 0.64             # the later read won
+
+
+def test_build_preview_seeded_from_settled_stage():
+    """The build preview starts from the last settled stage's points (carried), so the tiles
+    show what the cube is correcting FROM and morph as probes land — not a blank restart."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:post-mhc"))
+    _read(st, 1, [255, 0, 0], [0.63, 0.34], 44.0, signal=[1.0, 0.0, 0.0], phase="measure:post-mhc")
+    _read(st, 2, [128, 128, 128], [0.312, 0.329], 30.0, signal=[0.5, 0.5, 0.5], phase="measure:post-mhc")
+    # first probe: a GREEN patch — the red + neutral show as carried alongside it
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=3), stage="build-install-3dlut",
+                  phase="build-install-3dlut", tier="stream", seq=0, role="probe", disposition="probe",
+                  rgb=[0, 255, 0], signal=[0.0, 1.0, 0.0], Y=80.0, xy=[0.30, 0.60], ok=True))
+    bp = st.charts()["build_preview"]
+    assert bp["active"] is True
+    assert len(bp["cie"]["points"]) == 3                     # 2 carried + 1 fresh probe
+    assert sum(1 for p in bp["cie"]["points"] if p.get("carried")) == 2
+    assert bp["grayscale"][0].get("carried") is True         # the seeded neutral, faded
+    # a probe at the SAME identity replaces its carried twin (latest-wins, no double-plot)
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=4), stage="build-install-3dlut",
+                  phase="build-install-3dlut", tier="stream", seq=1, role="probe", disposition="probe",
+                  rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=45.0, xy=[0.64, 0.33], ok=True))
+    bp2 = st.charts()["build_preview"]
+    assert len(bp2["cie"]["points"]) == 3
+    red = next(p for p in bp2["cie"]["points"] if p["x"] == 0.64)
+    assert not red.get("carried")
+
+
+def test_snapshot_carries_server_now_for_client_ticking():
+    st = DashboardState()
+    snap = st.snapshot(T0)
+    assert snap["now_iso"] == "2026-06-18T12:00:00"
 
 
 def test_charts_show_latest_measurement_stage_not_all_overlaid():
@@ -708,6 +826,101 @@ def test_drift_series_excludes_grayscale_ramp_noise():
               role="neutral_ref", disposition="drift_ref", phase="measure:raw")
     track = st.charts()["channel_drift"]
     assert len(track) == 3                              # only the neutral_ref checkpoints, not the ramp
+
+
+def test_charts_carry_target_white_duv():
+    """D65 sits ≈ +0.003 ABOVE the Planckian locus — the Duv chart's corridor must centre on the
+    target white's own Duv, or a perfectly calibrated D65 panel reads as a green cast."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", white={"xy": [0.3127, 0.329], "cct": 6504}))
+    tduv = st.charts()["target_duv"]
+    assert tduv is not None and 0.002 < tduv < 0.0045
+
+
+def test_offenders_rank_worst_patches_with_swatches():
+    """The worst-patches payload: current-stage fresh reads ranked by ΔE (carried misses belong
+    to the previous stage's story), each with intended + measured swatch colours."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # raw stage read (will be carried into verify — must NOT appear in verify's offenders)
+    _read(st, 1, [0, 255, 0], [0.35, 0.55], 60.0, signal=[0.0, 1.0, 0.0], phase="measure:raw")
+    # verify: a near-perfect white and a visibly-off red
+    _read(st, 2, [255, 255, 255], [0.3127, 0.329], 120.0, signal=[1.0, 1.0, 1.0], phase="measure:verify")
+    _read(st, 3, [255, 0, 0], [0.60, 0.34], 40.0, signal=[1.0, 0.0, 0.0], phase="measure:verify")
+    off = st.charts()["offenders"]
+    assert len(off) == 2                              # the carried green is excluded
+    assert off[0]["de"] >= off[1]["de"]               # worst first
+    assert off[0]["sc"] == "#ff0000"                  # intended colour swatch
+    assert off[0]["mc"] is not None and off[0]["mc"].startswith("#")   # measured swatch
+
+
+def test_convergence_merges_build_iterations_and_scored_passes():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run"))
+    st.ingest(_ev(Ev.OPTIMIZER_ITER, t=T0 + timedelta(seconds=10), stage="build",
+                  iteration=0, measured_mean_de=1.4, measured_max_de=3.2))
+    st.ingest(_ev(Ev.OPTIMIZER_ITER, t=T0 + timedelta(seconds=20), stage="build",
+                  iteration=1, measured_mean_de=0.8, measured_max_de=1.9))
+    st.ingest(_ev("metrics_scored", t=T0 + timedelta(seconds=30), stage="verify",
+                  label="verification", avg_de2000=0.4, max_de2000=1.2))
+    conv = st.charts()["convergence"]
+    assert [c["kind"] for c in conv] == ["build", "build", "scored"]   # time order
+    assert conv[0]["avg"] == 1.4 and conv[-1]["max"] == 1.2
+    assert all(c["elapsed_s"] is not None for c in conv)
+
+
+def test_hdr_live_de_splits_core_content_zone_from_limits():
+    """The practical-priority split: an HDR run's live ΔE separates the CORE content zone
+    (target within Rec.709 at/below ~203-nit reference white — where content lives) from the
+    reachable-but-extreme 'limits' (wide-gamut / high-nit). SDR runs don't carry the split."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", is_hdr=True, transfer="pq",
+                  luminance=1000.0, gamma=2.2, white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:raw"))
+    # native corners (wide — the Rec.2020 red target must sit INSIDE) → the gamut becomes known
+    for sig, xy, Y in [([1.0, 0, 0], [0.72, 0.29], 160.0), ([0, 1.0, 0], [0.19, 0.74], 620.0),
+                       ([0, 0, 1.0], [0.13, 0.05], 60.0)]:
+        st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure:raw", tier="stream", role="measurement",
+                      rgb=[int(c * 1023) for c in sig], signal=sig, Y=Y, xy=xy, ok=True))
+    st.ingest(_ev(Ev.STAGE_START, t=T0 + timedelta(seconds=1), stage="measure:verify"))
+    # a mid-gray (core: neutral target well under 203 nits, inside 709)
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=2), stage="measure:verify", tier="stream",
+                  role="measurement", label="g50", rgb=[512] * 3, signal=[0.5] * 3,
+                  Y=90.0, xy=[0.3127, 0.329], ok=True))
+    # a full-drive Rec.2020 red (in native gamut but far outside Rec.709 → limits)
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=3), stage="measure:verify", tier="stream",
+                  role="measurement", label="red", rgb=[1023, 0, 0], signal=[1.0, 0.0, 0.0],
+                  Y=150.0, xy=[0.68, 0.31], ok=True))
+    ld = st.snapshot(T0 + timedelta(seconds=4))["live_de"]
+    m = ld["metrics"]["itp"]
+    assert ld["gamut_known"] is True
+    assert m["core"]["n"] == 1 and m["ext"]["n"] == 1   # gray = core, 2020-red = limits
+    # SDR: no core/ext keys at all
+    st2 = DashboardState()
+    st2.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                   white={"xy": [0.3127, 0.329]}))
+    st2.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure", tier="stream", role="measurement",
+                   rgb=[255, 255, 255], signal=[1.0, 1.0, 1.0], Y=120.0, xy=[0.3127, 0.329], ok=True))
+    assert "core" not in st2.snapshot(T0)["live_de"]["metrics"]["de2000"]
+
+
+def test_eta_range_widens_with_slow_reads():
+    """The honest ETA: with a fat tail of slow reads, eta_hi_s > eta_s (p85/median pace)."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure"))
+    st.ingest(_ev(Ev.PROGRESS, t=T0, stage="measure", patches_done=0, patches_total=40))
+    # 10 reads: mostly 2 s apart, two 8 s stragglers → spread ratio > 1
+    at = 0.0
+    for i, gap in enumerate([2, 2, 2, 8, 2, 2, 2, 8, 2, 2]):
+        at += gap
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=at), stage="measure", tier="stream",
+                      seq=i, rgb=[128] * 3, signal=[0.5] * 3, Y=40.0, xy=[0.31, 0.33], ok=True))
+    st.ingest(_ev(Ev.PROGRESS, t=T0 + timedelta(seconds=at), stage="measure",
+                  patches_done=10, patches_total=40))
+    timers = st.snapshot(T0 + timedelta(seconds=at))["timers"]
+    assert timers["eta_s"] is not None and timers["eta_hi_s"] is not None
+    assert timers["eta_hi_s"] > timers["eta_s"]
 
 
 def test_check_in_event_surfaces_in_snapshot():

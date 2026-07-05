@@ -15,7 +15,13 @@
 numpy>=1.26,<3
 scipy>=1.13,<2
 colour-science>=0.4.4,<0.5
+# calibration_profile.py loads the per-display YAML profile (lazy import; the
+# synthetic() path runs without it). Mirrors the pyproject `engine` extra.
+PyYAML>=6,<7
 
-# Test-only: pytest-xdist parallelises the suite across cores (pyproject `-n auto`).
-# Not imported by the engine or spine — needed solely to run `python -m pytest` here.
+# Test-only (mirrors the pyproject `test` extra): the baked-in pytest addopts pass
+# `-n auto`, so pytest without xdist fails to even parse arguments; pytest-cov backs
+# the audit coverage baselines. Not imported by the engine or spine.
+pytest>=8,<10
 pytest-xdist>=3.6,<4
+pytest-cov>=5,<8

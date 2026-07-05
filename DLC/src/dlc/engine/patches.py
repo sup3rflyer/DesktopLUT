@@ -28,10 +28,11 @@ pipeline.
 
 from __future__ import annotations
 
-import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Sequence
+
+from .._pq import CONTAINER_NITS, eotf_norm, oetf_norm
 
 __all__ = [
     "Transfer",
@@ -57,39 +58,23 @@ __all__ = [
 Patch = tuple[int, int, int]
 
 # ---------------------------------------------------------------------------
-# PQ (ST.2084) — verbatim from generate_patches.py (proven)
+# PQ (ST.2084) — code-value edge over dlc._pq (the one shared stdlib transfer)
 # ---------------------------------------------------------------------------
-
-_M1 = 0.1593017578125    # 2610/16384
-_M2 = 78.84375           # 2523/32
-_C1 = 0.8359375          # 3424/4096
-_C2 = 18.8515625         # 2413/128
-_C3 = 18.6875            # 2392/128
-
 
 def luminance_to_pq(nits: float, bit_depth: int = 10) -> int:
     """Luminance (nits) → PQ code value at ``bit_depth``."""
     if nits <= 0:
         return 0
-    Y = nits / 10000.0
-    Ym1 = Y ** _M1
-    V = ((_C1 + _C2 * Ym1) / (1.0 + _C3 * Ym1)) ** _M2
     max_cv = (1 << bit_depth) - 1
-    return min(round(V * max_cv), max_cv)
+    return min(round(oetf_norm(nits / CONTAINER_NITS) * max_cv), max_cv)
 
 
 def pq_to_luminance(cv: float, bit_depth: int = 10) -> float:
     """PQ code value → luminance (nits)."""
     max_cv = (1 << bit_depth) - 1
-    V = cv / max_cv
-    if V <= 0:
+    if cv <= 0:
         return 0.0
-    Vm2inv = V ** (1.0 / _M2)
-    numerator = max(Vm2inv - _C1, 0)
-    denominator = _C2 - _C3 * Vm2inv
-    if denominator <= 0:
-        return 0.0
-    return ((numerator / denominator) ** (1.0 / _M1)) * 10000.0
+    return eotf_norm(cv / max_cv) * CONTAINER_NITS
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +363,14 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
     normalized signal is below it — sub-nit chroma is noise-dominated, so colour starts
     above the shadow band while the grey ramp (incl. ``low_light_steps`` toe) still covers
     the dark EOTF. ``0.0`` ⇒ no floor (the dense build ramp keeps full-range colour).
+
+    Domain note: the floor is a fraction of the transfer's FULL-scale signal
+    (``transfer.max_cv``), deliberately NOT of a ``max_cv`` peak cap — under PQ the
+    full-scale signal is absolute (0.25 ≈ 1 nit regardless of the target peak), which is
+    what a *noise-floor* rationale wants. The ``low_light_*`` shadow band, by contrast,
+    scales with ``max_cv`` (a perceptual-region rationale). Since any cap satisfies
+    ``max_cv <= transfer.max_cv``, the floor always sits at-or-above where a cap-relative
+    floor would, so the no-overlap invariant with the grey toe holds either way.
     """
     if max_cv is None:
         max_cv = transfer.max_cv

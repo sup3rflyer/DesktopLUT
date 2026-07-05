@@ -171,3 +171,75 @@ def test_resolve_from_dip_uses_sustained_field_when_present():
     tgt = ht.resolve_from_dip(dip, white_xy=D65)
     assert tgt.peak_nits == 1700.0
     assert tgt.provenance["peak"]["source"] == "sustained"
+
+
+# ---------------------------------------------------------------------------
+# Fable audit Phase 2 — defensive-input + provenance-honesty pins
+# ---------------------------------------------------------------------------
+
+def test_negative_native_ceiling_never_produces_a_negative_knee():
+    # A corrupt DIP with a negative native_white_nits must be normalized away for the
+    # KNEE exactly as choose_peak_nits normalizes it for the peak — before the fix the
+    # raw value leaked into `native / gain` and yielded a negative knee_start_nits.
+    tgt = ht.resolve_hdr_target(white_xy=D65, native_white_nits=-5.0,
+                                eotf_undershoot=-0.06)
+    assert tgt.knee_start_nits == tgt.peak_nits          # no ceiling ⇒ knee at peak
+    assert not tgt.has_rolloff
+    assert tgt.knee_start_nits > 0
+
+
+def test_clamped_gain_is_flagged_in_provenance():
+    # MAX_UNDERSHOOT_GAIN's contract is "clamp AND flag": an implausible measured
+    # undershoot must be visible as a suspect characterization, not quoted as a
+    # plausible 1.5x boost.
+    tgt = ht.resolve_hdr_target(white_xy=D65, native_white_nits=1800.0,
+                                eotf_undershoot=-0.45)
+    u = tgt.provenance["undershoot"]
+    assert math.isclose(tgt.undershoot_gain, ht.MAX_UNDERSHOOT_GAIN)
+    assert u["clamped"] is True
+    assert "CLAMPED" in u["note"]
+    # ... and a non-positive denominator (undershoot <= -1) is also a clamp
+    tgt2 = ht.resolve_hdr_target(white_xy=D65, native_white_nits=1800.0,
+                                 eotf_undershoot=-1.2)
+    assert tgt2.provenance["undershoot"]["clamped"] is True
+
+
+def test_ordinary_gain_is_not_flagged_as_clamped():
+    tgt = ht.resolve_hdr_target(white_xy=D65, native_white_nits=1840.0,
+                                eotf_undershoot=-0.06)
+    u = tgt.provenance["undershoot"]
+    assert u["clamped"] is False
+    assert "CLAMPED" not in u["note"]
+    tgt_none = ht.resolve_hdr_target(white_xy=D65, native_white_nits=1840.0)
+    assert tgt_none.provenance["undershoot"]["clamped"] is False
+
+
+def test_non_finite_peak_inputs_are_ignored_like_non_positive_ones():
+    # Fable Phase 6 verification pass: the resolved peak becomes the verify summary's
+    # target_luminance, serialized with allow_nan=False — a corrupt inf/NaN DIP field
+    # reaching choose_peak_nits would crash the terminal verify stage. Non-finite inputs
+    # must be IGNORED (fall through the precedence chain) exactly like 0/negative ones.
+    inf, nan = float("inf"), float("nan")
+
+    # inf sustained with no ceiling: falls all the way to the flagged placeholder
+    peak, prov = ht.choose_peak_nits(sustained_peak_nits=inf)
+    assert math.isfinite(peak) and prov["source"] == "cold_start_placeholder"
+
+    # inf sustained with a real native ceiling: native-ceiling fallback, not min(inf, ...)
+    peak, prov = ht.choose_peak_nits(sustained_peak_nits=inf, native_white_nits=1800.0)
+    assert peak == 1800.0 and prov["source"] == "native_ceiling"
+
+    # NaN native alongside a good sustained capture: sustained wins, unclamped
+    peak, prov = ht.choose_peak_nits(sustained_peak_nits=1500.0, native_white_nits=nan)
+    assert peak == 1500.0 and prov["source"] == "sustained"
+
+    # inf pin is invalid, never honoured verbatim
+    peak, prov = ht.choose_peak_nits(pinned_peak_nits=inf, native_white_nits=1800.0)
+    assert prov["source"] != "pinned" and math.isfinite(peak)
+
+    # end to end: a fully corrupt DIP still resolves a finite, JSON-strict-safe target
+    tgt = ht.resolve_hdr_target(white_xy=D65, native_white_nits=inf,
+                                sustained_peak_nits=nan, eotf_undershoot=-0.06)
+    assert math.isfinite(tgt.peak_nits) and math.isfinite(tgt.knee_start_nits)
+    import json as _json
+    _json.dumps(tgt.as_dict(), allow_nan=False)   # must not raise
