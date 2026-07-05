@@ -687,6 +687,15 @@ def test_persistent_flaky_patch_surfaces_as_unresolved(tmp_path: Path):
     assert "p0003" in res.unresolved
     assert res.needs_adjudication is True
     assert res.question is not None and "stabilise" in res.question
+    # Digest-sufficiency (fable Phase 8): "would not stabilise" is judgeable only with the
+    # numbers next to it — observed SE vs the loop tolerance vs the DIP's expected σ at
+    # that luminance, and the reads burned trying.
+    detail = {d["label"]: d for d in res.digest["unresolved_detail"]}
+    d = detail["p0003"]
+    assert d["tolerance_de"] == 0.2
+    assert d["dip_expected_sigma_de"] is not None      # the DIP context rides along
+    assert d["reads_taken"] >= 6                       # hit the abnormal bound
+    assert d["nits"] is not None
 
 
 # ---------------------------------------------------------------------------

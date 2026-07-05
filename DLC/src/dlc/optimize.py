@@ -762,6 +762,23 @@ def optimize_cube(
     neutral_de = best_de[neutral_mask]                  # dE_ITP
     neutral_de_report = best_de_report[neutral_mask]    # report metric (display)
 
+    # Structured worst floor offenders WITH zone context for the seam digest (fable Phase 8,
+    # digest-sufficiency): a bare (signal, dE) list is not decidable — the LLM needs to see
+    # whether each floor point is a gamut/drive-rail corner (reachability), the near-black
+    # band, or the neutral axis (a §0 core wreck) to judge accept-vs-abort from the digest
+    # alone. `kind` separates a hard signal clip from an interior model residual.
+    floor_idx = sorted((int(i) for i in np.where(real_floor)[0]),
+                       key=lambda i: float(best_de_report[i]), reverse=True)
+    floor_offenders = [{
+        "signal": [round(float(c), 4) for c in best_verify[i]],
+        "de": round(float(best_de_report[i]), 3),
+        "kind": ("signal_clipped" if masks_best["signal_clipped"][i] else "residual"),
+        "boundary": ("low" if masks_best["low_clipped"][i]
+                     else "high" if masks_best["high_clipped"][i] else "interior"),
+        "near_black": bool(masks_best["near_black"][i]),
+        "neutral": bool(neutral_mask[i]),
+    } for i in floor_idx[: cfg.top_k]]
+
     digest = {
         "converged": converged,
         "iterations": len(history),
@@ -792,6 +809,7 @@ def optimize_cube(
         "low_side_clipped": int(masks_best["low_clipped"].sum()),
         "high_side_clipped": int(masks_best["high_clipped"].sum()),
         "budget_limited": int(budget_limited.sum()),
+        "floor_offenders": floor_offenders,
         "cube_monotonic": bool(best["monotonic"]),
         "large_reversals": int((best.get("diagnostics") or {}).get("large_reversal_count", 0)),
         "worst_lattice_jump": (best.get("diagnostics") or {}).get("worst_lattice_jump"),

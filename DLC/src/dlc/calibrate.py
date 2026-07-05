@@ -1789,6 +1789,28 @@ class Calibration:
                 self.ctx.log("no fresh Display+Instrument Profile for this display — run "
                              "`--flow characterize` to learn panel+meter behaviour "
                              "(calibration falls back to a single adaptive-integration read meanwhile).")
+            # Store HEALTH (fable Phase 8, from the Phase 3 lead): the stores carry .corrupt
+            # (file present but unparseable) and .dropped (individual records lost to schema
+            # drift / hand-editing) but nothing outside tests consumed either — so "your DIP
+            # was silently dropped, this run measures single-read" was invisible. Surface both
+            # in the preflight tell; decision-relevant, never a gate (the stores are tolerant
+            # by design).
+            dip_store = self._dip_store()
+            store_health = {
+                "correction_store": {"corrupt": corr_store.corrupt,
+                                     "dropped": list(corr_store.dropped)},
+                "dip_store": {"corrupt": dip_store.corrupt,
+                              "dropped": list(dip_store.dropped)},
+            }
+            for store_name, health in store_health.items():
+                if health["corrupt"]:
+                    self.ctx.log(f"{store_name} file is CORRUPT (unparseable) — running as if "
+                                 "empty; re-characterize / rebuild the correction to repopulate, "
+                                 "or restore the file from backup.")
+                elif health["dropped"]:
+                    self.ctx.log(f"{store_name} dropped record(s) {health['dropped']} (schema "
+                                 "drift / hand-edit?) — those displays run without their stored "
+                                 "profile until refreshed.")
             # Save the user's current DesktopLUT state BEFORE we touch anything, so a
             # failed/cancelled run can be rolled back to exactly this. preflight is the
             # first stage and read-only, so this captures the pristine pre-run setup.
@@ -1806,6 +1828,7 @@ class Calibration:
                       "gamut": gamut_tell,
                       "panel_limits": panel_limits,
                       "dip": dip_status,
+                      "store_health": store_health,
                       "backup": backup}
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
@@ -2610,6 +2633,15 @@ class Calibration:
             self._last_scored = {"label": label, "metric": metric_name,
                                  "avg": round(summary.avg_de2000, 3), "max": round(summary.max_de2000, 3),
                                  "white": round(summary.white_de2000, 3)}
+            # Persist the compact per-stage score in the run record so the TERMINAL verify seam
+            # can show the before→after trajectory (raw → after ICC → verify) in ITS digest —
+            # "avg 1.9" reads differently when raw was 8.4 vs when raw was 2.0 (fable Phase 8,
+            # digest-sufficiency). Durable across resume; same metric branch as stage_verify.
+            self.calib.setdefault("stage_scores", {})[role] = {
+                "label": label, "metric": metric_name,
+                "avg": round(summary.avg_de2000, 3), "p95": round(summary.p95_de2000, 3),
+                "max": round(summary.max_de2000, 3), "white": round(summary.white_de2000, 3)}
+            self._save()
             # Canonical event shape (metrics.metrics_scored_payload, P4) — same keys every
             # producer emits, so the dashboard ΔE panel renders live and stage-CLI runs alike.
             self.runlog.metrics_scored(
@@ -3830,6 +3862,10 @@ class Calibration:
                         "best_mean_de": outcome.digest.get("best_mean_de_report"),
                         "neutral_mean_de": outcome.digest.get("neutral_mean_de_report"),
                         "neutral_max_de": outcome.digest.get("neutral_max_de_report"),
+                        # Worst floor points WITH zone context (kind/boundary/near_black/
+                        # neutral) so in-gamut core damage vs a reachability corner is
+                        # decidable from the digest alone (fable Phase 8).
+                        "floor_offenders": outcome.digest.get("floor_offenders"),
                         **{k: outcome.digest.get(k) for k in
                            ("above_threshold", "physical_floor", "budget_limited", "converged",
                             "probe_total", "neutral_count")},
@@ -3956,7 +3992,11 @@ class Calibration:
             # severe → recommend revert (auto/sim reverts a catastrophic result). gate_failed flag
             # → even a NON-severe quality-gate miss escalates under SupervisedAdjudicator, so an
             # unattended run never silently applies a sub-quality calibration at this terminal gate.
-            digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within)}))
+            # before_scores: the persisted raw/post-mhc intermediate scores, so apply-vs-revert is
+            # judged on the TRAJECTORY (did the calibration improve the panel?), not one absolute
+            # number (fable Phase 8, digest-sufficiency).
+            digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within),
+                    "before_scores": self.calib.get("stage_scores") or None}))
         return outcome
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
@@ -4200,7 +4240,20 @@ class Calibration:
         try:
             from .engine.model import TargetSpace, signal_saturation_caps
             return signal_saturation_caps(TargetSpace(self._engine_target()), native)
-        except Exception:  # noqa: BLE001 — generation must never crash on an optional refinement
+        except Exception as exc:  # noqa: BLE001 — generation must never crash on an optional refinement
+            # …but a SILENT fallback is invisible in every digest (fable Phase 8, from the 7a
+            # lead): an HDR verify ramp losing its reachable-saturation cap means saturated
+            # patches land at unreachable target primaries and read as inflated frontier dE.
+            # Tell the spine once so the LLM/dashboard can attribute the frontier numbers
+            # (per-patch gamut_clamped flags still label them in scoring).
+            if not getattr(self, "_caps_unavailable_noted", False):
+                self._caps_unavailable_noted = True
+                self.runlog.note(
+                    self.runlog.phase or "run",
+                    "caps_unavailable: reachable-saturation caps could not be computed "
+                    f"({type(exc).__name__}: {exc}) — saturated ramp/verify patches are UNCAPPED "
+                    "this run; expect inflated dE at unreachable target primaries (reachability, "
+                    "not calibration error)", level="WARN")
             return None
 
     def _volumetric_patches(self) -> list[tuple[int, int, int]]:

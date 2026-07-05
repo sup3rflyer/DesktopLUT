@@ -1396,6 +1396,78 @@ def test_every_seam_request_on_clean_runs_is_envelope_coherent(tmp_path: Path):
             _json.dumps(req.digest, default=str)
 
 
+# ---------------------------------------------------------------------------
+# Digest sufficiency (fable Phase 8): the seams/tells must be decidable from the
+# digest alone — before/after trajectory at the verify gate, store health at
+# preflight, a loud tell when the gamut caps silently degrade.
+# ---------------------------------------------------------------------------
+
+def test_verify_seam_digest_carries_the_before_scores_trajectory(tmp_path: Path):
+    # apply-vs-revert is judged on the TRAJECTORY: the verify request must carry the
+    # persisted raw/post-mhc intermediate scores next to the verify numbers.
+    seen: dict[str, "AdjudicationRequest"] = {}
+
+    class Recording(AutoAdjudicator):
+        def adjudicate(self, request):
+            seen[request.key] = request
+            return super().adjudicate(request)
+
+    calib = _make(tmp_path, "before_after", adjudicator=Recording())
+    assert calib.run("full").status == "completed"
+    req = seen["verify:accept"]
+    before = req.digest["before_scores"]
+    assert set(before) >= {"raw", "post-mhc"}
+    for role in ("raw", "post-mhc"):
+        assert before[role]["metric"] == req.digest["metric"]
+        assert {"avg", "p95", "max", "white", "label"} <= set(before[role])
+    # and the persisted copy survives in the run record (resume-durable)
+    assert calib.calib["stage_scores"]["raw"] == before["raw"]
+
+
+def test_preflight_surfaces_store_health(tmp_path: Path):
+    from dlc.calibrate import correction_store_path, dip_store_path
+
+    calib = _make(tmp_path, "storehealth")
+    # A corrupt (unparseable) correction store + a DIP store with one dropped record.
+    correction_store_path(calib.profile, calib.ctx.root).write_text("{not json", encoding="utf-8")
+    dip_store_path(calib.profile, calib.ctx.root).write_text(
+        json.dumps({"displays": {"synthetic": "not-a-record"}}), encoding="utf-8")
+    calib.stage_preflight()
+    health = calib.calib["stages"]["preflight"]["digest"]["store_health"]
+    assert health["correction_store"]["corrupt"] is True
+    assert health["dip_store"]["corrupt"] is False
+    assert health["dip_store"]["dropped"] == ["synthetic"]
+
+
+def test_healthy_stores_read_clean_in_the_preflight_tell(tmp_path: Path):
+    calib = _make(tmp_path, "storeok")
+    calib.stage_preflight()
+    health = calib.calib["stages"]["preflight"]["digest"]["store_health"]
+    assert health == {"correction_store": {"corrupt": False, "dropped": []},
+                      "dip_store": {"corrupt": False, "dropped": []}}
+
+
+def test_hue_sat_caps_failure_emits_a_caps_unavailable_tell_once(tmp_path: Path, monkeypatch):
+    # The 7a lead: an HDR ramp silently losing its reachable-saturation cap was invisible
+    # in every digest. A cap-computation failure must WARN the spine (once), then still
+    # fall back to the uncapped ramp (never blocks generation).
+    calib = _make(tmp_path, "capsfail", mode="HDR")
+    monkeypatch.setattr(calib, "_reachable_primaries",
+                        lambda: {"R": (0.68, 0.32), "G": (0.265, 0.69), "B": (0.15, 0.06)})
+    monkeypatch.setattr(calib, "_target_colorspace", lambda: "rec2020")
+    import dlc.engine.model as _model
+
+    def _boom(*a, **k):
+        raise RuntimeError("engine unavailable")
+
+    monkeypatch.setattr(_model, "signal_saturation_caps", _boom)
+    assert calib._hue_sat_caps() is None
+    assert calib._hue_sat_caps() is None                       # second call: no re-spam
+    warns = [e for e in read_events(calib.ctx.events_path)
+             if e.event == "note" and "caps_unavailable" in str(e.data.get("message"))]
+    assert len(warns) == 1 and warns[0].level == "WARN"
+
+
 def test_patch_window_guard_quiet_when_target_is_primary(tmp_path: Path):
     # The mock topology makes monitor 0 the primary; calibrating monitor 0 ⇒ no warning.
     calib = _make(tmp_path, "pw_ok")
