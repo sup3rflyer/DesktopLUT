@@ -10,6 +10,7 @@ import json
 import sys
 
 from ..argyll import Argyll
+from ..desktoplut_client import contract_version_mismatch
 from ..preflight import build_tool_preflight_payload
 from ..runs import RunContext
 from ..stage import StageResult
@@ -55,8 +56,15 @@ def build(args, ctx: RunContext) -> StageResult:
     # DesktopLUT pipe reachability.
     controller = _common.make_controller(args, ctx)
     pipe_alive, state, pipe_error = _common.ping_controller(controller)
+    contract_mismatch = None
     if pipe_alive:
         result.action("pinged DesktopLUT controller (state.get)")
+        # Wire-contract version tell (fable Phase 9): absent field = pre-versioning v1
+        # build (compatible); a mismatch must read "update DLC/DesktopLUT" here, not
+        # "unknown method" mid-run.
+        contract_mismatch = contract_version_mismatch(state)
+        if contract_mismatch:
+            result.anomaly("contract_version_mismatch", contract_mismatch, "high")
     else:
         result.anomaly(
             "pipe_unreachable",
@@ -80,8 +88,9 @@ def build(args, ctx: RunContext) -> StageResult:
         "missing_required": missing_required,
         "missing_contained": payload["missing_contained"],
         "app_running": bool(state.get("running")) if isinstance(state, dict) else None,
+        "contract_mismatch": contract_mismatch,
     }
-    ready = tools_ready and meter_attached and pipe_alive
+    ready = tools_ready and meter_attached and pipe_alive and contract_mismatch is None
     result.advice = {
         "default_policy_verdict": "proceed" if ready else "block",
         "reasons": [

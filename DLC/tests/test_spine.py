@@ -145,7 +145,7 @@ def test_stage_block_and_fail():
 # --------------------------------------------------------------------------
 # CalibrationController round-trip against the in-process simulator
 # --------------------------------------------------------------------------
-def test_controller_full_contract_roundtrip():
+def test_controller_full_contract_roundtrip(tmp_path):
     ctrl = CalibrationController.mock()
 
     state = ctrl.state()
@@ -166,7 +166,10 @@ def test_controller_full_contract_roundtrip():
 
     assert ctrl.verify_mhc(0, "SDR")["verified"] is True
 
-    ctrl.set_3dlut(0, "SDR", "C:/run/generated/final.cube")
+    # The mock now validates cube existence exactly as the C++ DoSet3dlut does.
+    cube = tmp_path / "final.cube"
+    cube.write_text('TITLE "x"\n', encoding="utf-8")
+    ctrl.set_3dlut(0, "SDR", str(cube))
     state = ctrl.state()
     assert state["runtime"]["0:SDR"]["cube_path"].endswith("final.cube")
 
@@ -343,12 +346,14 @@ def test_grayscale_tweak_proxy_roundtrip():
     assert "grayscale_tweak" not in ctrl.state()["runtime"].get("0:SDR", {})
 
 
-def test_grayscale_tweak_independent_of_3dlut():
+def test_grayscale_tweak_independent_of_3dlut(tmp_path):
     """The GS+WB tweak (final, after the 3D LUT) coexists with the runtime cube
     on the same runtime layer without clobbering it."""
     ctrl = CalibrationController.mock()
     ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
-    ctrl.set_3dlut(0, "SDR", "C:/run/generated/final.cube")
+    cube = tmp_path / "final.cube"
+    cube.write_text('TITLE "x"\n', encoding="utf-8")
+    ctrl.set_3dlut(0, "SDR", str(cube))
     ctrl.set_grayscale_tweak(0, "SDR", 2, [0.0, 1.0], {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 0.99]})
 
     runtime = ctrl.state()["runtime"]["0:SDR"]

@@ -153,6 +153,35 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Changed
+- **Fable audit Phase 9 — IPC contract and mock fidelity**
+  (`docs/audits/fable/phase-9.md`): the wire contract is now pinned three ways
+  (`tests/test_ipc_contract.py`): mock ⇄ spec response shapes, spec ⇄ C++ reverse
+  existence + static result-shape + threading conformance, controller ⇄ spec. The
+  published API spec gained the five methods the C++ and controller already speak
+  (`windows.set_hdr` + the `mhc.grayscale_live_*` quartet), a `status` field
+  (`runtime.set_grayscale_tweak` formally legacy), the corrected `verify_mhc`
+  threading flag, an honest `calibration.enter` purpose (the dummy ICC is recorded,
+  not associated), and documented timeout/retry + versioning semantics. **Fixed:**
+  `install-mhc`'s `install_ok` was structurally always True (dead envelope-key
+  clause; `profile_name` also read from the wrong nesting for the C++ response) —
+  an unconfirmed apply now raises `apply_unconfirmed`. **Mock fidelity raised**
+  where a `--simulate` run could pass what hardware would fail: `verify_mhc` now
+  requires an APPLIED profile (was: any staged dict), cube paths are validated
+  (existence; 1D parse for `set_base_lut` — the Phase-5 phantom-path bug class now
+  fails under sim too), monitor/mode vocabulary is enforced (C++ `ParseMonitorMode`
+  parity), `query_gamma_ramp` returns hardware-shaped identity-ramp evidence (the
+  enter-neutral ramp branch is now exercisable under sim), and `mhc.apply` carries a
+  simulated `profile_name`. **Version handshake:** optional `contract_version` in
+  `state.get` (absent = v1), `desktoplut_client.CONTRACT_VERSION` +
+  `contract_version_mismatch()` checked at both preflights. **Hazards surfaced:**
+  re-entering calibration mode overwrites the C++'s single restore snapshot with the
+  already-cleared state — now a `stale_calibration_mode` tell at enter-neutral
+  ("the preflight settings backup is the authoritative restore") and a DesktopLUT
+  ticket; `state.get` doesn't expose `correction_grayscale`, so the grayscale-wb
+  Design-B revert degrades to clear-to-identity on hardware — honesty tell landed +
+  ticket (phase-9.md §5, T1–T4). P10 re-verified against the shipped C++ evals;
+  Phase-4's F4-12 closed (the C++ live grayscale editor honours HDR, gated on the
+  monitor's live mode matching).
 - **Fable audit Phase 8 — LLM seams and intelligence**
   (`docs/audits/fable/phase-8.md`): **Task #1 resolved** (owner-approved) — the
   `SupervisedAdjudicator`'s benign auto-accepts are no longer silent: every benign

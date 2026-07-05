@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .desktoplut_client import DEFAULT_PIPE_NAME
+from .desktoplut_client import CONTRACT_VERSION, DEFAULT_PIPE_NAME
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,11 @@ class ApiMethodSpec:
     result: dict[str, str]
     mutates_state: bool
     gui_thread_required: bool
+    # Contract disposition (fable Phase 9): "active" = driven by the current DLC;
+    # "legacy" = retained pipe surface with no current DLC caller (kept for
+    # completeness / a documented future direction — do not remove server-side
+    # without checking this spec's description).
+    status: str = "active"
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -57,10 +62,18 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {},
             {
                 "running": "boolean",
-                "corrections_enabled": "boolean",
+                "corrections_enabled": "boolean (the OVERLAY-draw flag, NOT 'a correction is live' — "
+                                       "false in DWM-hook mode even with a cube loaded; see ../docs/NAMING.md S4)",
                 "calibration_mode": "object or null",
-                "mhc": "object keyed by '<monitor>:<MODE>'",
-                "runtime": "object keyed by '<monitor>:<MODE>'",
+                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string}. "
+                       "DLC ALSO wants correction_grayscale {point_count,points,deviations} exposed here "
+                       "(the Design-B grayscale-wb revert snapshot source) — a DesktopLUT-side ticket; "
+                       "until then the snapshot degrades to clear-to-identity on hardware (fable Phase 9)",
+                "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
+                "contract_version": "integer (optional): the wire-contract version the server speaks. "
+                                    "Absent = pre-versioning build = 1. DLC checks this at preflight so a "
+                                    "mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
+                                    "mid-run. Server-side field is a DesktopLUT ticket (fable Phase 9).",
             },
             mutates_state=False,
             gui_thread_required=False,
@@ -75,7 +88,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "calibration.enter",
-            "Enter calibration mode: snapshot state, associate dummy ICC, and reset correction layers.",
+            "Enter calibration mode: snapshot the monitor's settings and reset every correction "
+            "layer (MHC removed+disabled, 3D LUTs and shader layers cleared). The dummy ICC path "
+            "is RECORDED but not associated (deferred; neutrality comes from the cleared layers "
+            "plus DLC's own dispwin -c). NOT retry-safe: re-entering while a session is active "
+            "re-snapshots the already-cleared state (see transport.timeout_and_retries).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
@@ -141,7 +158,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
                 "point_count": ApiParamSpec("integer", description="Number of grayscale control points."),
-                "points": ApiParamSpec("array", description="Ascending input levels in [0,1]."),
+                "points": ApiParamSpec("array", description="Ascending input levels in [0,1]. Server "
+                                       "clamps to 32 points (index-resampled above that); DLC always sends <=32."),
                 "deviations": ApiParamSpec(
                     "object", description="Per-channel multiplicative deviations centered at 1.0: {r:[],g:[],b:[]}."
                 ),
@@ -176,7 +194,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
                 "point_count": ApiParamSpec("integer", description="Number of grayscale control points."),
-                "points": ApiParamSpec("array", description="Ascending input levels in [0,1]."),
+                "points": ApiParamSpec("array", description="Ascending input levels in [0,1]. Server "
+                                       "clamps to 32 points (index-resampled above that); DLC always sends <=32."),
                 "deviations": ApiParamSpec(
                     "object", description="Per-channel multiplicative deviations centered at 1.0: {r:[],g:[],b:[]}."
                 ),
@@ -203,11 +222,15 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "maintenance.verify_mhc",
-            "Report whether DesktopLUT has a coherent applied MHC state.",
+            "Report whether DesktopLUT has a coherent applied MHC state (enabled AND a baked "
+            "profile_name — staged-but-unapplied params do not verify).",
             {"monitor": _monitor_param(), "mode": _mode_param()},
             {"verified": "boolean"},
             mutates_state=False,
-            gui_thread_required=True,
+            # Served on the pipe thread (Dispatch handles it before the GUI marshal;
+            # the settings mutex makes the read safe off-thread) — fable Phase 9 fixed
+            # this flag, which wrongly claimed a GUI-thread dependency.
+            gui_thread_required=False,
         ),
         ApiMethodSpec(
             "runtime.set_3dlut",
@@ -253,6 +276,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {"monitor_mode": "string", "runtime": "object with grayscale_tweak=true"},
             mutates_state=True,
             gui_thread_required=True,
+            status="legacy",
         ),
         ApiMethodSpec(
             "runtime.disable_grayscale_tweak",
@@ -262,6 +286,77 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {"monitor_mode": "string", "runtime": "object"},
             mutates_state=True,
             gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "mhc.grayscale_live_begin",
+            "Engage the correction-grayscale LIVE-EDIT preview (the GUI editor's 'Edit Points' "
+            "over the pipe): the correction GS stacks on top of MHC+3D-LUT so the meter sees it. "
+            "Snapshots the pre-begin correctionGrayscale for cancel/abort restore. Errors if a "
+            "session (or the GUI editor) is already active for this monitor/mode.",
+            {"monitor": _monitor_param(), "mode": _mode_param()},
+            {"monitor_mode": "string", "preview": "boolean true"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "mhc.grayscale_set_live",
+            "Nudge the live-edit correction grayscale (per-patch, no ICC re-bake); the next frame "
+            "reflects it. Errors without an active grayscale_live_begin session.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "grayscale": ApiParamSpec(
+                    "object",
+                    description="Grayscale payload {point_count:int, points:[ascending [0,1]], "
+                                "deviations:{r:[],g:[],b:[]} multiplicative centered at 1.0}. "
+                                "Server clamps to 32 points (index-resampled above that).",
+                ),
+            },
+            {"monitor_mode": "string"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "mhc.grayscale_commit",
+            "The live editor's 'OK': bake the previewed correctionGrayscale into the ICM and tear "
+            "down the preview. baked:false when no live session existed (e.g. DesktopLUT restarted "
+            "mid-run) so the caller can detect a lost bake. A later cancel is a tolerated no-op.",
+            {"monitor": _monitor_param(), "mode": _mode_param()},
+            {"monitor_mode": "string", "baked": "boolean"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "mhc.grayscale_cancel",
+            "Abort the live-edit preview without baking: restore the PRE-BEGIN correctionGrayscale "
+            "(the user's prior correction, not bare identity) and regenerate the vanilla core ICM. "
+            "canceled:false (no-op) when no live session exists, including after a commit.",
+            {"monitor": _monitor_param(), "mode": _mode_param()},
+            {"monitor_mode": "string", "canceled": "boolean"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "windows.set_hdr",
+            "Switch a monitor's OS advanced-color (HDR) state — the HDR-toggle hotkey's flip, "
+            "targeted at an explicit monitor + desired state so DLC can drive SDR/HDR "
+            "characterize/calibrate modes. Idempotent (no-op when already in the requested "
+            "state); omit 'enable' to toggle. Errors when enabling on a non-HDR-capable monitor.",
+            {
+                "monitor": _monitor_param(),
+                "enable": ApiParamSpec("boolean", required=False,
+                                       description="Desired HDR state; absent means toggle. Accepts bool or 0/1."),
+            },
+            {
+                "monitor": "integer",
+                "hdr_capable": "boolean",
+                "was_active": "boolean",
+                "now_active": "boolean (re-read after the flip — authoritative, not intent)",
+                "changed": "boolean",
+            },
+            mutates_state=True,
+            # Thread-agnostic DisplayConfig calls; runs off the GUI thread in the C++.
+            gui_thread_required=False,
         ),
         ApiMethodSpec(
             "windows.query_profiles",
@@ -300,8 +395,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
     ]
 
     # The per-phase acceptance sequence DLC runs against the live pipe (and the
-    # mock). Final contract: MHC is staged via primaries + white + base grayscale
-    # (no 1D-cube import), then applied/verified, then the runtime 3D LUT is set.
+    # mock). It exercises the 32-point base-grayscale FALLBACK staging path; the
+    # current orchestrator prefers mhc.set_base_lut (a dense DLC-owned 1D .cube)
+    # and falls back to set_base_grayscale only when no cube was built. Executing
+    # the sequence verbatim requires real cube files for the path-validated
+    # methods (set_base_lut / set_3dlut check existence server-side AND in the mock).
     _m, _mode = 0, "SDR"
     _grayscale = {"point_count": 2, "points": [0.0, 1.0], "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}}
     sequence_steps = [
@@ -323,12 +421,31 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
 
     return {
         "name": "DesktopLUT Calibrator API",
-        "version": 1,
+        "version": CONTRACT_VERSION,
         "transport": {
             "default_pipe": DEFAULT_PIPE_NAME,
             "framing": "one UTF-8 JSON object per line; one request per named-pipe connection",
             "request_envelope": {"method": "string", "params": "object"},
             "response_envelope": {"ok": "boolean", "result": "object when ok", "error": "string when not ok"},
+            "versioning": (
+                "state.get result SHOULD carry contract_version (integer; absent = 1, i.e. a "
+                "pre-versioning build). The client checks it at preflight (desktoplut_client."
+                "contract_version_mismatch) so a mismatch reads 'update DLC/DesktopLUT' instead "
+                "of 'unknown method' mid-run. Additive fields never bump the version."
+            ),
+            "timeout_and_retries": (
+                "The pipe is SINGLE-INSTANCE and the client timeout (default 75s) exceeds the "
+                "server's GUI marshal timeout (60s), so a client-side timeout usually means the "
+                "GUI thread is wedged mid-mutation. The timed-out request may still be APPLIED "
+                "server-side, and a retry fails pipe-busy until the orphaned connection drains. "
+                "Retry-safety: every mhc.set_*/mhc.apply/runtime.* call is idempotent (same "
+                "params => same state); calibration.enter is NOT retry-safe — a re-enter "
+                "overwrites the single C++ restore snapshot with the already-cleared state "
+                "(DesktopLUT ticket, fable Phase 9), so DLC surfaces a stale active calibration "
+                "mode before entering and treats the preflight settings backup as the "
+                "authoritative restore; mhc.grayscale_commit retried after a real commit "
+                "returns baked:false (detectable, surfaced as a seam)."
+            ),
         },
         "threading": {
             "pipe_thread": "decode request and marshal GUI mutations",

@@ -93,10 +93,20 @@ def build(args, ctx: RunContext) -> StageResult:
 
     result.raw["apply"] = applied
     result.raw["verify"] = verified
-    profile_name = applied.get("profile_name") if isinstance(applied, dict) else None
-    mhc_applied = bool(applied.get("mhc", {}).get("applied")) if isinstance(applied, dict) else False
-    # mock returns {"mhc": {"applied": True}}; the C++ returns {profile_name, ...}.
-    install_ok = mhc_applied or bool(profile_name) or (isinstance(applied, dict) and applied.get("ok") is not False)
+    # Both the C++ DoMhcApply and the mock return {"monitor_mode", "mhc": {"applied": true,
+    # "profile_name": ...}} — read applied/profile_name from the mhc object (top-level
+    # profile_name kept as a tolerant fallback). fable Phase 9: the previous logic ended with
+    # `applied.get("ok") is not False`, which is True for ANY result dict (the ok/error
+    # envelope never reaches here — controller.call raises on error), so install_ok could
+    # never be False; a response that doesn't confirm application must NOT read as installed.
+    mhc_obj = applied.get("mhc") if isinstance(applied, dict) else None
+    mhc_obj = mhc_obj if isinstance(mhc_obj, dict) else {}
+    profile_name = mhc_obj.get("profile_name") or (applied.get("profile_name") if isinstance(applied, dict) else None)
+    mhc_applied = bool(mhc_obj.get("applied"))
+    install_ok = mhc_applied or bool(profile_name)
+    if not install_ok:
+        result.anomaly("apply_unconfirmed",
+                       "mhc.apply returned ok but did not confirm an applied profile", "high")
     verify_ok = bool(verified.get("verified")) if isinstance(verified, dict) else False
     if not verify_ok:
         result.anomaly("verify_failed", "maintenance.verify_mhc did not confirm an applied profile", "high")
