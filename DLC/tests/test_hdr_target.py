@@ -212,3 +212,34 @@ def test_ordinary_gain_is_not_flagged_as_clamped():
     assert "CLAMPED" not in u["note"]
     tgt_none = ht.resolve_hdr_target(white_xy=D65, native_white_nits=1840.0)
     assert tgt_none.provenance["undershoot"]["clamped"] is False
+
+
+def test_non_finite_peak_inputs_are_ignored_like_non_positive_ones():
+    # Fable Phase 6 verification pass: the resolved peak becomes the verify summary's
+    # target_luminance, serialized with allow_nan=False — a corrupt inf/NaN DIP field
+    # reaching choose_peak_nits would crash the terminal verify stage. Non-finite inputs
+    # must be IGNORED (fall through the precedence chain) exactly like 0/negative ones.
+    inf, nan = float("inf"), float("nan")
+
+    # inf sustained with no ceiling: falls all the way to the flagged placeholder
+    peak, prov = ht.choose_peak_nits(sustained_peak_nits=inf)
+    assert math.isfinite(peak) and prov["source"] == "cold_start_placeholder"
+
+    # inf sustained with a real native ceiling: native-ceiling fallback, not min(inf, ...)
+    peak, prov = ht.choose_peak_nits(sustained_peak_nits=inf, native_white_nits=1800.0)
+    assert peak == 1800.0 and prov["source"] == "native_ceiling"
+
+    # NaN native alongside a good sustained capture: sustained wins, unclamped
+    peak, prov = ht.choose_peak_nits(sustained_peak_nits=1500.0, native_white_nits=nan)
+    assert peak == 1500.0 and prov["source"] == "sustained"
+
+    # inf pin is invalid, never honoured verbatim
+    peak, prov = ht.choose_peak_nits(pinned_peak_nits=inf, native_white_nits=1800.0)
+    assert prov["source"] != "pinned" and math.isfinite(peak)
+
+    # end to end: a fully corrupt DIP still resolves a finite, JSON-strict-safe target
+    tgt = ht.resolve_hdr_target(white_xy=D65, native_white_nits=inf,
+                                sustained_peak_nits=nan, eotf_undershoot=-0.06)
+    assert math.isfinite(tgt.peak_nits) and math.isfinite(tgt.knee_start_nits)
+    import json as _json
+    _json.dumps(tgt.as_dict(), allow_nan=False)   # must not raise

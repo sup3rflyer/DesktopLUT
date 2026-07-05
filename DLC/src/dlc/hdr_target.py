@@ -46,6 +46,7 @@ parameters that bound and shape it.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -168,12 +169,23 @@ def choose_peak_nits(*, native_white_nits: Optional[float] = None,
     The provenance always carries ``sustained_unknown`` (is the peak a flash, not a held value?)
     and ``grounded`` (does it rest on a real measurement?). Returns ``(peak_nits, provenance)``.
     """
-    # Normalize away non-positive / None inputs uniformly: a 0 or negative peak is invalid
-    # (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML), so it is *ignored*, never used
-    # as a real ceiling or pin.
-    pinned = float(pinned_peak_nits) if (pinned_peak_nits and pinned_peak_nits > 0) else None
-    sustained = float(sustained_peak_nits) if (sustained_peak_nits and sustained_peak_nits > 0) else None
-    native = float(native_white_nits) if (native_white_nits and native_white_nits > 0) else None
+    # Normalize away non-positive / non-finite / None inputs uniformly: a 0, negative, NaN
+    # or infinite peak is invalid (e.g. an unfilled ``peak_luminance_nits: 0`` in the YAML,
+    # or a corrupt DIP field), so it is *ignored*, never used as a real ceiling or pin. The
+    # finiteness guard matters downstream: the resolved peak becomes the verify summary's
+    # ``target_luminance``, which is serialized with ``allow_nan=False`` — a non-finite peak
+    # here would crash the terminal verify stage instead of falling back (fable Phase 6
+    # verification pass).
+    def _valid(nits) -> Optional[float]:
+        try:
+            v = float(nits) if nits is not None else None
+        except (TypeError, ValueError):
+            return None
+        return v if (v is not None and math.isfinite(v) and v > 0) else None
+
+    pinned = _valid(pinned_peak_nits)
+    sustained = _valid(sustained_peak_nits)
+    native = _valid(native_white_nits)
 
     # 1. Explicit override (deliberate / tests) — verbatim, never above the measured ceiling.
     if pinned is not None:
@@ -236,10 +248,11 @@ def resolve_hdr_target(*, white_xy: tuple[float, float],
     # exceed the panel's native ceiling and clip. Below the knee the gain is fully
     # applied; above it, taper to the roll-off. With no boost (gain == 1) or no measured
     # ceiling, there is nothing to clip → the knee is the peak. The ceiling is normalized
-    # exactly as choose_peak_nits normalizes it (non-positive / None ⇒ no ceiling), so a
-    # corrupt negative DIP value can never produce a negative knee.
+    # exactly as choose_peak_nits normalizes it (non-positive / non-finite / None ⇒ no
+    # ceiling), so a corrupt DIP value can never produce a negative or infinite knee.
     native = (float(native_white_nits)
-              if (native_white_nits and native_white_nits > 0) else None)
+              if (native_white_nits and math.isfinite(float(native_white_nits))
+                  and native_white_nits > 0) else None)
     if gain > 1.0 and native:
         knee = min(peak, native / gain)
     else:

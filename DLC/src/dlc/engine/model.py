@@ -311,8 +311,12 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     ideal_xyz = space.ideal_xyz(sig)
     if reachable_primaries is not None:
         # The clamp gap identifies the frontier patches: re-derive the raw (unclamped) ideal
-        # and mark rows the chroma clip moved. Tolerance is absolute cd/m² — the clip's own
-        # bisection converges far tighter than 1e-3 nit, so a true no-op never flags.
+        # and mark rows the chroma clip moved. Tolerance is absolute cd/m². A true no-op can
+        # never flag because _chroma_clip_to_gamut returns in-gamut rows BIT-IDENTICAL (it
+        # only rewrites OOG rows) — the gap there is exactly 0. On the other side, its own
+        # eps=1e-4 in-gamut short-circuit makes near-boundary targets exact no-ops too, so
+        # the smallest real clamp gap is discontinuously large (measured ≥ ~0.5 nit across
+        # hue/level sweeps) — 1e-3 sits in the dead zone between 0 and any real clip.
         raw_ideal = TargetSpace(target).ideal_xyz(sig)
         gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > 1e-3, axis=1)
     else:
