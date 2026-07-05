@@ -228,16 +228,22 @@ class DipStore:
 
     def __init__(self, path: Path | str,
                  records: Optional[dict[str, DisplayInstrumentProfile]] = None,
-                 *, corrupt: bool = False) -> None:
+                 *, corrupt: bool = False, dropped: Optional[list[str]] = None) -> None:
         self.path = Path(path)
         self._records: dict[str, DisplayInstrumentProfile] = dict(records or {})
         self.corrupt = corrupt
+        # Names of records that were PRESENT in the file but failed to parse (schema drift /
+        # hand-editing). Distinct from `corrupt` (whole file unparseable): the store stays
+        # tolerant (never a gate), but a caller can surface "your DIP for X was dropped"
+        # instead of silently running with no priors for that display.
+        self.dropped: list[str] = list(dropped or [])
 
     @classmethod
     def load(cls, path: Path | str) -> "DipStore":
         p = Path(path)
         records: dict[str, DisplayInstrumentProfile] = {}
         corrupt = False
+        dropped: list[str] = []
         if p.exists():
             try:
                 raw = json.loads(p.read_text(encoding="utf-8"))
@@ -248,8 +254,9 @@ class DipStore:
                     records[name] = DisplayInstrumentProfile.from_dict(
                         {**rec, "display": rec.get("display", name)})
                 except (KeyError, TypeError, ValueError):
+                    dropped.append(str(name))
                     continue
-        return cls(p, records, corrupt=corrupt)
+        return cls(p, records, corrupt=corrupt, dropped=dropped)
 
     def get(self, display: str) -> Optional[DisplayInstrumentProfile]:
         return self._records.get(display)
@@ -273,7 +280,10 @@ class DipStore:
         return existed
 
     def save(self) -> None:
-        payload = {"displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
+        # "schema" is a version stamp for forward drift (loaders today tolerate any shape via
+        # per-record try/except + the dropped list; a future breaking change bumps this).
+        payload = {"schema": 1,
+                   "displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
         atomic_write_text(self.path, json.dumps(payload, indent=2))
 
 

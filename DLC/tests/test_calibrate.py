@@ -2510,3 +2510,39 @@ def test_resume_flow_conflict_surfaced_on_spine(tmp_path: Path):
                  if e.event == Ev.ANOMALY and e.data.get("run_spec_conflict")]
     assert anomalies, "expected a run_spec_conflict anomaly on the spine"
     assert anomalies[0].data["conflicts"][0]["field"] == "flow"
+
+
+# ---------------------------------------------------------------------------
+# fable audit Phase 3: DIP lookup keying + the one-USB probe-match exclusion
+# ---------------------------------------------------------------------------
+
+def test_dip_record_for_prefers_the_mode_keyed_record_and_falls_back():
+    # The DIP store is keyed display:mode by the characterize flow; a bare-name lookup
+    # silently misses every mode-keyed DIP (main()'s presenter-settle bug, F3-3). The
+    # module-level helper must do the same two-key dance Calibration._dip does.
+    from dlc.calibrate import dip_record_for
+    from dlc.dip import DipStore
+
+    hdr = DisplayInstrumentProfile(display="P", mode="HDR", settle_seconds=1.5)
+    bare = DisplayInstrumentProfile(display="P", settle_seconds=0.3)
+    store = DipStore("unused.json", {"P:HDR": hdr, "P": bare})
+
+    assert dip_record_for(store, "P", "HDR") is hdr       # mode-keyed record wins
+    assert dip_record_for(store, "P", "SDR") is bare      # no SDR record → bare fallback
+    assert dip_record_for(store, "P", None) is bare       # mode-less caller → bare
+    assert dip_record_for(store, "Q", "HDR") is None
+
+
+def test_probe_match_is_planned_only_in_build_correction(tmp_path: Path):
+    # One-USB mutual exclusion pin: a single i1D3 cannot back two live spotread
+    # instances, so ccxxmake (probe-match) must never share a run with the persistent
+    # meter. main() wires the meter stack only for flows != build-correction, and
+    # stage_probe_match's only caller is _flow_build_correction — the flow routing IS
+    # the exclusion. Pin that no measuring flow ever plans a probe-match stage.
+    calib = _make(tmp_path, "probe_excl")
+    for flow in ("full", "mhc-only", "3dlut-only", "grayscale-wb", "build-correction"):
+        calib.calib["flow"] = flow
+        keys = [s["key"] for s in calib._planned_stages()]
+        assert ("probe-match" in keys) == (flow == "build-correction"), flow
+        if flow != "build-correction":
+            assert any(k.startswith("measure") or k == "grayscale-wb" for k in keys)

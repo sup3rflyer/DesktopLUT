@@ -1409,3 +1409,51 @@ class MetricsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeMatchSiblingSpotreadTests(unittest.TestCase):
+    """The inventory's sibling-spotread derivation must inherit the plan's own path
+    separator + suffix conventions (fable audit F3-2 — same portability class as the
+    dispread gate, F-0.1/F2-3)."""
+
+    @staticmethod
+    def _plan(argv0: str):
+        from dlc.probe_match import ProbeMatchPlan
+        return ProbeMatchPlan(
+            kind="ccmx", mode="SDR", iteration=1, display_tech="u", output="out.ccmx",
+            artifacts={}, command_argv=[argv0, "-v"], command=argv0,
+            measurement_mode="live", required_human_actions=[], notes=[])
+
+    def _derived(self, argv0: str) -> str:
+        seen = {}
+
+        def enum(spotread_path):
+            seen["path"] = str(spotread_path)
+            return [Instrument(port=1, description="ColorChecker Studio"),
+                    Instrument(port=2, description="i1 DisplayPro")]
+
+        inventory = probe_match_instrument_inventory(self._plan(argv0), instrument_enumerator=enum)
+        self.assertTrue(inventory["ok"])
+        return seen["path"]
+
+    def test_posix_plan_derives_suffixless_sibling(self) -> None:
+        self.assertEqual(self._derived("/opt/argyll/ccxxmake"), "/opt/argyll/spotread")
+
+    def test_windows_plan_derives_exe_sibling_even_on_posix(self) -> None:
+        # A Windows-form contained-tool path parsed on POSIX is ONE path component;
+        # the derivation must still land next to ccxxmake, not in the cwd.
+        self.assertEqual(self._derived("C:\\Argyll\\ccxxmake.exe"), "C:\\Argyll\\spotread.exe")
+
+
+class ArgyllMeterTokenTests(unittest.TestCase):
+    def test_parse_spotread_instruments_recognises_non_xrite_meters(self) -> None:
+        # The hardware-token allow-list must not silently drop supported non-X-Rite
+        # meters — a dropped line reads as "no instruments attached" at the gate.
+        text = """
+          1 = 'Klein K-10A'
+          2 = 'Datacolor Spyder5'
+          3 = 'JETI specbos 1211-2'
+          4 = 'Konica Minolta CS-200'
+        """
+        ports = [i.port for i in parse_spotread_instruments(text)]
+        self.assertEqual(ports, [1, 2, 3, 4])

@@ -1295,8 +1295,7 @@ class Calibration:
         """This display+mode's DIP, if one has been characterized (else ``None`` → the measure
         loop falls back to its single-read default; runs are leaner, just not noise-aware). Falls
         back to a mode-less record for back-compat with DIPs written before mode-keying."""
-        store = self._dip_store()
-        return store.get(self._dip_key()) or store.get(self.display.name)
+        return dip_record_for(self._dip_store(), self.display.name, self.mode)
 
     def _loop_config_for(self, dip: Optional[DisplayInstrumentProfile]) -> MeasureLoopConfig:
         """Build the measure-loop config, preferring DIP-*measured* values over the profile's
@@ -5045,6 +5044,20 @@ def dip_store_path(profile: cp.Profile, ctx_root: Path) -> Path:
     return base / "dip_store.json"
 
 
+def dip_record_for(store: DipStore, display_name: str,
+                   mode: Optional[str]) -> Optional[DisplayInstrumentProfile]:
+    """Look up a display's DIP the way the store is KEYED: ``display:mode`` first (the
+    characterize flow stores mode-keyed records — panel thermal/noise behaviour differs by
+    mode), falling back to a bare mode-less record for back-compat. Every consumer must use
+    this two-key lookup — a bare ``store.get(name)`` silently misses every mode-keyed DIP
+    (Calibration._dip does the same dance; this is the module-level twin for ``main()``)."""
+    if mode:
+        rec = store.get(f"{display_name}:{mode}")
+        if rec is not None:
+            return rec
+    return store.get(display_name)
+
+
 def _render_cmd(argv: Sequence[Any]) -> str:
     """Render an argv list as a copy-pasteable command line (Windows quoting)."""
     import subprocess
@@ -5530,8 +5543,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # DIP) over the guessed 0.5 s — a fast panel runs leaner, a slow mini-LED waits long
         # enough. EXCEPT during `characterize` itself, which must observe the raw step response
         # (waiting out a prior settle estimate would hide it), so it keeps the paint-safe default.
-        dip_rec = DipStore.load(dip_store_path(profile, ctx.root)).get(
-            profile.display_for(args.monitor).name)
+        dip_rec = dip_record_for(DipStore.load(dip_store_path(profile, ctx.root)),
+                                 profile.display_for(args.monitor).name, eff_mode)
         # Floor the dwell so a fast panel (measured settle ≈ 0) still gets a paint-safe wait, while a
         # slow-ABL panel's larger measured settle is honoured. characterize keeps the default (it must
         # observe the raw step response, and its settle measurement is dwell-independent anyway).
