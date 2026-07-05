@@ -87,6 +87,19 @@ fixable, and leave a written trail. Nothing is one-shotted.
   (Phase 11), check-in assembly + preflight tells move WITH Phase 8, the three refine
   stages deliberately stay, one `FlowDef` registry (`flows.py`) pairs with Phase 12's
   simulator matrix. Suite identical before/after: 915 passed, 3 skipped.
+- **Updated:** 2026-07-05, Phase 8 complete on `claude/fable-audit-phase-8-59q599`
+  (report: `docs/audits/fable/phase-8.md`). Task #1 RESOLVED (owner-approved in-session:
+  supervised benign auto-accepts become vetoable judgment packets on the digest —
+  `Decision.auto_accepted` + full-request seam events with the veto lever; the v3 policy
+  tier promoted early). Plus: `--attended` explicit flag (the Mapping trap closed);
+  off-vocabulary decision validation (a `--decide verify:accept=abort` typo silently
+  APPLIED before); phantom `loosen_target` option removed; `--decide KEY=CHOICE=REASON`;
+  R2 executed (`dlc/checkin.py`) + check-in evidence worst-first with pre-truncation
+  counts; five digest-sufficiency fixes (optimizer `floor_offenders` with zone context,
+  measure `unresolved_detail` σ-vs-DIP, verify `before_scores` trajectory,
+  `caps_unavailable` tell, preflight `store_health`); envelope contract pinned on
+  `AdjudicationRequest` + coherence test. R4 deferred per its own condition. Leads
+  added to Phases 10/11/12.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -925,6 +938,12 @@ audit these as NEW SURFACE, don't rediscover them as drift:
   JS with shimmed `EventSource`/`fetch` — consider committing it under `tools/` as
   the dashboard's frontend fixture; Phase 10 would get headless UI verification
   for free.
+- *(Phase 8)* render `seam` events with `status="auto_accepted"` distinctly (they land
+  in `last_seam` without `awaiting_decision` — correct, but a "auto-decided · vetoable"
+  chip + the packet's `veto` command would make --supervised legible in the UI); the
+  new digest payloads (`before_scores` at the verify seam, `floor_offenders` at the
+  optimizer seam, preflight `store_health`, `unresolved_detail` in the measure-loop
+  completed event) are free material for the report/tiles.
 
 **Parity:** HDR chart rendering asserted at the same depth as SDR (state tests
 now cover the HDR core/limits split; extend to per-chart assertions).
@@ -993,6 +1012,13 @@ new-surface leads dispositioned.
   `set_3dlut`, stage CLI uses `install_3dlut.py`) — final dispositions here.
   `lut_constrained`/`physical` were DECIDED in Phase 5: keep, opt-in probes
   (wired via `OptimizeConfig.engine`, tested, CV-rejection documented).
+- *(Phase 8)* `human_actions.acknowledge_human_action` (the WRITE side) has zero
+  production callers — only `has_human_action` is consumed (stage-CLI probe-match
+  plan); the acknowledgement flow's writer died with the autopilot. Dispose here.
+  Also: R4 (preflight tells → own module) remains open (Phase 8 didn't edit the tell
+  functions' text, so the RFC's move condition wasn't met), and R1's `build_parser()`
+  split should carry a parser-level test for the `--attended`/`--auto`/`--supervised`
+  mutual-exclusion group.
 - Packaging: `pip install -e .` / `.[engine]` / `.[meter]` / `.[test]` on Linux +
   Windows expectations; `test_packaging.py` scope; wheel build sanity — including
   the Phase 0 notes: `paths.PROJECT_DIR` anchors `runs/`/`third_party/` via
@@ -1016,7 +1042,9 @@ items the CHANGELOG names as goals.
 - **Simulator matrix:** `full`/`mhc-only`/`3dlut-only`/`grayscale-wb`/
   `build-correction`/`characterize` × SDR/HDR × (clean run / crash-resume at each
   boundary / pause-decide-resume) — scripted, repeatable, in-container. Any cell
-  that can't run under sim gets an explicit reason.
+  that can't run under sim gets an explicit reason. *(Phase 8)* add a `--supervised`
+  dimension asserting every auto-taken decision on a clean run emitted its vetoable
+  judgment packet (the unit pin exists; the matrix holds it across flows × modes).
 - **Parity ledger closure:** every row I/S/G resolved — intentional rows get a
   one-line rationale in code or docs; no row left "suspect".
 - **HDR endgame checklist** (items this roadmap deliberately routed here after
@@ -1140,7 +1168,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 - [x] Phase 6 — Scoring, verify gates, reporting truth *(2026-07-05, `claude/fable-audit-phase-6-m92yrr` — see `docs/audits/fable/phase-6.md`)*
 - [x] Phase 7a — Orchestrator spine: correctness *(2026-07-05, `claude/fable-audit-phase-7a-3y6rsm` — see `docs/audits/fable/phase-7a.md`)*
 - [x] Phase 7b — Orchestrator spine: structure *(2026-07-05, same branch (restarted from main post-7a-merge) — see `docs/audits/fable/phase-7b.md`; RFC items R1–R6 routed to Phases 8/11/12)*
-- [ ] Phase 8 — LLM seams & intelligence
+- [x] Phase 8 — LLM seams & intelligence *(2026-07-05, `claude/fable-audit-phase-8-59q599` — see `docs/audits/fable/phase-8.md`; Task #1 resolved owner-approved)*
 - [ ] Phase 9 — IPC contract & mock fidelity
 - [ ] Phase 10 — Dashboard & observability
 - [ ] Phase 11 — Tests, packaging, docs, hygiene
