@@ -9,6 +9,7 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const fmt = (n, d) => (n == null || Number.isNaN(Number(n))) ? "" : Number(n).toFixed(d == null ? 2 : d);
+  const fmtSignedDuv = (v) => (v >= 0 ? "+" : "") + Number(v).toFixed(4);
   const niceTicks = (lo, hi, n) => { const o = []; for (let i = 0; i <= n; i++) o.push(lo + (hi - lo) * i / n); return o; };
   // Hover data carrier. Uses <desc>, NOT <title>: <title> triggers the browser's own native
   // tooltip (which covers our custom one); <desc> is invisible metadata with no native tooltip,
@@ -50,6 +51,26 @@
   }
   const empty = (msg) =>
     `<svg viewBox="0 0 ${VB.w} ${VB.h}" class="chart-svg"><text x="${VB.w / 2}" y="${VB.h / 2}" text-anchor="middle" class="ch-empty">${esc(msg || "no data yet")}</text></svg>`;
+
+  // JND colour class for a ΔE value (same bands as the readout cards: <1 ok, <3 warn, ≥3 bad)
+  const deCls = (v) => v == null ? "" : (Math.abs(v) < 1 ? "ch-de-ok" : (Math.abs(v) < 3 ? "ch-de-warn" : "ch-de-bad"));
+  // A near-black point's honest hover: CCT/Duv is noise there, but "can you see the tint?"
+  // has an answer — the ΔE vs the neutral target (which correctly down-weights chroma near black).
+  const dimHov = (de) => de == null ? "near-black &lt;1 nit — CCT unreliable"
+    : `near-black — ΔE ${fmt(de, 2)} vs neutral (${de < 1 ? "tint not visible" : de < 3 ? "borderline" : "visible tint"})`;
+  // Norm corridor: the shaded "normal" band. The scale is never allowed tighter than the band,
+  // so a trace inside the corridor reads as healthy at ANY zoom; when data escapes it the caller
+  // shows an explicit alert tag — autoscale can stretch, but never silently.
+  const bandY = (P, lo, hi) =>
+    `<rect x="${fmt(P.m.l, 1)}" y="${fmt(P.py(hi), 1)}" width="${fmt(P.W - P.m.l - P.m.r, 1)}" height="${fmt(Math.max(0, P.py(lo) - P.py(hi)), 1)}" class="ch-norm-band"/>`;
+  const alertTag = (P, msg, anchor, row) => {
+    const mid = anchor === "mid";
+    return `<text x="${fmt(mid ? P.W / 2 : P.W - P.m.r, 1)}" y="${fmt(P.m.t + 12 * (row || 1), 1)}" text-anchor="${mid ? "middle" : "end"}" class="ch-alert">▲ ${esc(msg)}</text>`;
+  };
+  // Uncertainty whisker for a level with re-reads: the retained sample spread, drawn only when
+  // it's wide enough to matter on this scale.
+  const whisker = (P, x, lo, hi) =>
+    `<line x1="${fmt(P.px(x), 1)}" y1="${fmt(P.py(lo), 1)}" x2="${fmt(P.px(x), 1)}" y2="${fmt(P.py(hi), 1)}" class="ch-whisker"/>`;
 
   const DLCCharts = {};
   // Render options the dashboard toggles. `measured` overlays the panel's measured primaries (the
@@ -169,73 +190,98 @@
   };
 
   // ── Grayscale CCT vs signal (+ target white CCT reference) ──
-  // Near-black neutrals (server-flagged `dim`) have noise-dominated CCT (a 0.006-nit read can solve
-  // to 11000 K). We DON'T hide them — we plot them faded and OFF the y-autoscale (so one wild read
-  // can't bury the real variation), clamped into the visible range with an "off-scale" hover when
-  // they'd peg past the axis. You still see there was a near-black read and roughly where it sat.
+  // Norm-banded scale: a ±150 K corridor around the target is always visible and the scale never
+  // zooms tighter than it — a trace inside the shaded band is healthy at any zoom, and when data
+  // escapes it the chart says so explicitly instead of silently rescaling.
+  // Near-black neutrals (server-flagged `dim`, off the autoscale) are judged in the ΔE domain:
+  // CCT is a ratio of noise down there, but "can you see the tint?" still has an answer, so the
+  // dot is coloured by its ΔE vs the neutral target rather than dismissed as unreliable.
   DLCCharts.grayscaleCct = function (d, targetCct) {
+    const NORM_K = 150;
     const all = (d || []).filter((p) => p.cct != null);
     if (!all.length) return empty("no grayscale CCT yet");
     const bright = all.filter((p) => !p.dim);
     const dim = all.filter((p) => p.dim);
     const scaleSrc = bright.length ? bright : dim;     // autoscale from real reads; dim-only as fallback
-    const ccts = scaleSrc.map((p) => p.cct).concat(targetCct ? [targetCct] : []);
+    const ccts = scaleSrc.map((p) => p.cct);
     let lo = Math.min(...ccts), hi = Math.max(...ccts);
-    if (hi - lo < 200) { lo -= 200; hi += 200; }
+    if (targetCct) { lo = Math.min(lo, targetCct - NORM_K); hi = Math.max(hi, targetCct + NORM_K); }
+    const pad = Math.max(40, (hi - lo) * 0.08);
+    lo -= pad; hi += pad;
     const P = Plot({ xmin: 0, xmax: 1, ymin: lo, ymax: hi });
+    if (targetCct) P.add(bandY(P, targetCct - NORM_K, targetCct + NORM_K));
     P.gridX([0, 0.5, 1], (t) => fmt(t, 1));
     P.gridY(niceTicks(lo, hi, 4), (t) => Math.round(t));
     if (targetCct) {
       P.pathLine([[0, targetCct], [1, targetCct]], "ch-ref");
-      P.add(`<text x="${P.W - 16}" y="${fmt(P.py(targetCct) - 5, 1)}" text-anchor="end" class="ch-note">target ${Math.round(targetCct)}K</text>`);
+      P.add(`<text x="${P.W - 16}" y="${fmt(P.py(targetCct) - 5, 1)}" text-anchor="end" class="ch-note">target ${Math.round(targetCct)}K ±${NORM_K}</text>`);
+      if (bright.some((p) => Math.abs(p.cct - targetCct) > NORM_K))
+        P.add(alertTag(P, `exceeds ±${NORM_K} K`));
     }
+    bright.forEach((p) => {
+      if (p.cct_lo != null && p.cct_hi != null && p.cct_hi - p.cct_lo > (hi - lo) * 0.015)
+        P.add(whisker(P, p.signal, p.cct_lo, p.cct_hi));
+    });
     P.pathLine(bright.map((p) => [p.signal, p.cct]), "ch-line");
-    bright.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`));
+    bright.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K${p.n > 1 ? ` | median of ${p.n} (${Math.round(p.cct_lo)}–${Math.round(p.cct_hi)}K)` : ""}${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`));
     const cctCarried = bright.filter((p) => p.carried).length;
     if (cctCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${cctCarried} from previous stage</text>`);
     dim.forEach((p) => {
       const off = p.cct < lo || p.cct > hi;
       const cy = P.py(Math.max(lo, Math.min(hi, p.cct)));
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K | near-black &lt;1 nit — noisy${off ? " · off-scale" : ""}`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim ${deCls(p.de)}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K | ${dimHov(p.de)}${off ? " · off-scale" : ""}`)}</circle>`);
     });
-    if (dim.length) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${dim.length} near-black &lt;1 nit shown faded (CCT noisy)</text>`);
+    if (dim.length) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${dim.length} near-black · dot colour = ΔE visibility</text>`);
     return P.svg();
   };
 
   // ── Grayscale Duv vs signal (zero = on the Planckian locus; +green above / −magenta below) ──
-  // Near-black reads (server `dim`) are noise-dominated but NOT hidden — plotted faded, off the
-  // autoscale, clamped into range when they'd peg past the axis.
-  DLCCharts.grayscaleDuv = function (d) {
+  // Norm-banded AROUND THE TARGET WHITE'S OWN DUV: D65 sits ≈ +0.003 above the Planckian locus,
+  // so a perfect D65 panel reads +0.003 — the corridor centres on the target, not on zero, and
+  // the scale never zooms tighter than it. Near-black reads (server `dim`, off the autoscale)
+  // are judged in the ΔE domain — coloured by tint visibility, not dismissed.
+  DLCCharts.grayscaleDuv = function (d, targetDuv) {
+    const NORM = 0.003;
+    const t0 = targetDuv != null ? targetDuv : 0;
     const all = (d || []).filter((p) => p.duv != null);
     if (!all.length) return empty("no grayscale Duv yet");
     const bright = all.filter((p) => !p.dim);
     const dim = all.filter((p) => p.dim);
     const scaleSrc = bright.length ? bright : dim;
-    const span = Math.max(0.005, Math.max(...scaleSrc.map((p) => Math.abs(p.duv))) * 1.2);
+    const span = Math.max(Math.abs(t0) + NORM * 1.25,
+                          Math.max(...scaleSrc.map((p) => Math.abs(p.duv))) * 1.2);
     const P = Plot({ xmin: 0, xmax: 1, ymin: -span, ymax: span });
-    // Tint the half-planes so the SIGN reads as a colour cast: Duv>0 = green (above the locus),
-    // Duv<0 = magenta (below). The eye should keep the trace near the zero line.
-    const xL = P.px(0), xR = P.px(1), y0 = P.py(0);
+    // Tint the half-planes so the SIGN reads as a colour cast relative to the TARGET:
+    // above the target's Duv = greener than intended, below = more magenta.
+    const xL = P.px(0), xR = P.px(1), y0 = P.py(t0);
     P.add(`<rect x="${fmt(xL, 1)}" y="${fmt(P.m.t, 1)}" width="${fmt(xR - xL, 1)}" height="${fmt(y0 - P.m.t, 1)}" class="ch-band-green"/>`);
     P.add(`<rect x="${fmt(xL, 1)}" y="${fmt(y0, 1)}" width="${fmt(xR - xL, 1)}" height="${fmt((P.H - P.m.b) - y0, 1)}" class="ch-band-magenta"/>`);
+    P.add(bandY(P, t0 - NORM, t0 + NORM));
     P.gridX([0, 0.5, 1], (t) => fmt(t, 1));
     P.gridY([-span, 0, span], (t) => fmt(t, 3));
-    P.pathLine([[0, 0], [1, 0]], "ch-ref");
+    P.pathLine([[0, t0], [1, t0]], "ch-ref");
+    if (t0) P.add(`<text x="${P.W - 16}" y="${fmt(P.py(t0) - 4, 1)}" text-anchor="end" class="ch-note">target ${fmtSignedDuv(t0)} (locus offset of the target white)</text>`);
+    if (bright.some((p) => Math.abs(p.duv - t0) > NORM)) P.add(alertTag(P, `exceeds target ±${NORM}`, "mid", 2));
+    bright.forEach((p) => {
+      if (p.duv_lo != null && p.duv_hi != null && p.duv_hi - p.duv_lo > span * 0.03)
+        P.add(whisker(P, p.signal, p.duv_lo, p.duv_hi));
+    });
     P.pathLine(bright.map((p) => [p.signal, p.duv]), "ch-line");
     bright.forEach((p) => {
-      const cls = p.duv > 0.0002 ? "ch-dot-green" : (p.duv < -0.0002 ? "ch-dot-magenta" : "ch-dot");
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${p.duv > 0 ? "green" : p.duv < 0 ? "magenta" : "neutral"} | target 0${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`);
+      const dev = p.duv - t0;                          // cast vs the TARGET, not vs the locus
+      const cls = dev > 0.0002 ? "ch-dot-green" : (dev < -0.0002 ? "ch-dot-magenta" : "ch-dot");
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${fmtSignedDuv(dev)} vs target (${dev > 0.0002 ? "greener" : dev < -0.0002 ? "more magenta" : "on target"})${p.n > 1 ? ` | median of ${p.n}` : ""}${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`);
     });
     const duvCarried = bright.filter((p) => p.carried).length;
     if (duvCarried) P.add(`<text x="${fmt(P.W - P.m.r, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" text-anchor="end" class="ch-note">◌ ${duvCarried} from previous stage</text>`);
     dim.forEach((p) => {
       const off = Math.abs(p.duv) > span;
       const cy = P.py(Math.max(-span, Math.min(span, p.duv)));
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | near-black &lt;1 nit — noisy${off ? " · off-scale" : ""}`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(cy, 1)}" r="2.0" class="ch-dot-dim ${deCls(p.de)}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${dimHov(p.de)}${off ? " · off-scale" : ""}`)}</circle>`);
     });
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-lab-green">▲ green (+Duv)</text>`);
     P.add(`<text x="${fmt(xL + 5, 1)}" y="${fmt(P.H - P.m.b - 5, 1)}" class="ch-lab-magenta">▼ magenta (−Duv)</text>`);
-    if (dim.length) P.add(`<text x="${fmt(P.W - P.m.r, 1)}" y="${fmt(P.m.t + 12, 1)}" text-anchor="end" class="ch-note">${dim.length} near-black faded</text>`);
+    if (dim.length) P.add(`<text x="${fmt(P.W - P.m.r, 1)}" y="${fmt(P.m.t + 12, 1)}" text-anchor="end" class="ch-note">${dim.length} near-black by ΔE</text>`);
     return P.svg();
   };
 
@@ -246,13 +292,17 @@
     if (!all.length) return empty("no grayscale balance yet");
     const bright = all.filter((p) => !p.dim);
     const dim = all.filter((p) => p.dim);
-    let span = 1.0;                                   // never tighter than ±1% so tiny errors don't look huge
+    const NORM = 1.0;                                 // ±1% corridor — the norm band; scale never tighter
+    let span = NORM;
     (bright.length ? bright : dim).forEach((p) => { span = Math.max(span, Math.abs(p.r), Math.abs(p.g), Math.abs(p.b)); });
     span *= 1.2;
     const P = Plot({ xmin: 0, xmax: 1, ymin: -span, ymax: span });
+    P.add(bandY(P, -NORM, NORM));
     P.gridX([0, 0.25, 0.5, 0.75, 1], (t) => Math.round(t * 100) + "%");
     P.gridY(niceTicks(-span, span, 4), (t) => (t > 0 ? "+" : "") + fmt(t, 1));
     P.pathLine([[0, 0], [1, 0]], "ch-ref");           // neutral axis — the eye keeps all three here
+    if (bright.some((p) => Math.max(Math.abs(p.r), Math.abs(p.g), Math.abs(p.b)) > NORM))
+      P.add(alertTag(P, "exceeds ±1%", "mid", 2));
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
     const clamp = (v) => Math.max(-span, Math.min(span, v));
     series.forEach(([k, cls]) => P.pathLine(bright.map((p) => [p.signal, p[k]]), cls));
@@ -271,14 +321,13 @@
   DLCCharts.colorLum = function (d) {
     const items = d || [];
     if (!items.length) return empty("no colour patches yet");
-    const maxAbs = Math.max(0.12, ...items.map((i) => Math.abs(i.error)));
+    const NORM = 0.10;                                // ±10% luminance corridor
+    const maxAbs = Math.max(NORM * 1.2, ...items.map((i) => Math.abs(i.error)));
     const span = Math.min(0.5, maxAbs * 1.15);
     const P = Plot({ mb: 50, xmin: 0, xmax: items.length, ymin: -span, ymax: span });
+    P.add(bandY(P, -NORM, NORM));
     P.gridY(niceTicks(-span, span, 4), (t) => (t > 0 ? "+" : "") + Math.round(t * 100) + "%");
-    [-0.1, 0.1].forEach((gv) => {
-      if (Math.abs(gv) <= span)
-        P.add(`<line x1="${P.px(0)}" y1="${fmt(P.py(gv), 1)}" x2="${P.px(items.length)}" y2="${fmt(P.py(gv), 1)}" class="ch-guide"/>`);
-    });
+    if (items.some((i) => Math.abs(i.error) > NORM)) P.add(alertTag(P, "exceeds ±10%", "mid"));
     P.add(`<line x1="${P.px(0)}" y1="${fmt(P.py(0), 1)}" x2="${P.px(items.length)}" y2="${fmt(P.py(0), 1)}" class="ch-axis0"/>`);
     const bw = P.px(1) - P.px(0);
     const showLabels = items.length <= 48;
@@ -299,18 +348,22 @@
   // The ColourSpace-style thermal-stability read — exposes WHICH channel wanders as the panel
   // warms (a cool blue channel climbing while R/G hold). Flat = settled; a climbing trace = drifting.
   DLCCharts.channelDrift = function (d) {
+    const NORM = 0.5;                                 // ±0.5% — a settled panel stays inside this
     const pts = (d || []).filter((p) => p.elapsed_s != null && p.r != null);
     if (pts.length < 2) return empty("no drift series yet");
     const xs = pts.map((p) => p.elapsed_s);
-    let lo = 0, hi = 0;
+    let lo = -NORM, hi = NORM;
     pts.forEach((p) => { lo = Math.min(lo, p.r, p.g, p.b); hi = Math.max(hi, p.r, p.g, p.b); });
-    const pad = Math.max(0.3, (hi - lo) * 0.12);
+    const pad = Math.max(0.15, (hi - lo) * 0.12);
     lo -= pad; hi += pad;
     const xmax = Math.max(...xs) || 1;
     const P = Plot({ xmin: 0, xmax, ymin: lo, ymax: hi });
+    P.add(bandY(P, -NORM, NORM));
     P.gridX(niceTicks(0, xmax, 4), (t) => Math.round(t) + "s");
     P.gridY(niceTicks(lo, hi, 4), (t) => (t > 0 ? "+" : "") + fmt(t, 1));
     P.pathLine([[0, 0], [xmax, 0]], "ch-ref");        // baseline = the first (coldest) reading
+    if (pts.some((p) => Math.max(Math.abs(p.r), Math.abs(p.g), Math.abs(p.b)) > NORM))
+      P.add(alertTag(P, "drift exceeds ±0.5%", "mid", 2));
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
     series.forEach(([k, cls]) => P.pathLine(pts.map((p) => [p.elapsed_s, p[k]]), cls));
     series.forEach(([k, cls, lab]) => pts.forEach((p) =>
@@ -321,16 +374,143 @@
     return P.svg();
   };
 
+  // ── Shadow tracking: the EOTF in log/log — where the low-light story actually lives ──
+  // The linear EOTF tile gives the bottom 5% of the curve 5% of the pixels; content lives in the
+  // mids and shadows, so this tile gives the shadows the room. Straight reference line (power
+  // gamma is linear in log/log); dots coloured by their ΔE vs neutral where near black.
+  DLCCharts.shadowEotf = function (d) {
+    d = d || {};
+    const lg = Math.log10;
+    const raw = (d.points || []).filter((p) => p.Y != null && p.signal > 0).sort((a, b) => a.signal - b.signal);
+    if (raw.length < 2) return empty("no grayscale reads yet");
+    const ymaxY = Math.max(...raw.map((p) => p.Y)) || 1;
+    const pts = raw.map((p) => ({ s: p.signal, yr: p.Y / ymaxY, de: p.de, carried: p.carried }))
+      .filter((p) => p.yr > 0);
+    if (pts.length < 2) return empty("no above-black reads yet");
+    const X0 = -3;                                     // 0.1% … 100% signal
+    const ys = pts.map((p) => lg(p.yr));
+    const Y0 = Math.max(-5, Math.min(Math.floor(Math.min(...ys)) - 0.4, -2));
+    const P = Plot({ ml: 56, xmin: X0, xmax: 0, ymin: Y0, ymax: 0 });
+    const pctLab = (t) => { const v = Math.pow(10, t) * 100; return v >= 1 ? Math.round(v) + "%" : (v >= 0.1 ? v.toFixed(1) : v.toFixed(2)) + "%"; };
+    P.gridX([-3, -2, -1, 0], pctLab);
+    const yts = []; for (let t = Math.ceil(Y0); t <= 0; t++) yts.push(t);
+    P.gridY(yts, pctLab);
+    const g = d.gamma || 2.2;
+    if (d.kind === "pq") {
+      const ref = (d.reference || []).filter((r) => r[0] > 0 && r[1] > 0).map((r) => [lg(r[0]), lg(r[1])]);
+      P.pathLine(ref.filter((r) => r[0] >= X0 && r[1] >= Y0), "ch-ref");
+    } else {
+      const xs = Math.max(X0, Y0 / g);                 // clip the straight γ line to the plot
+      P.pathLine([[xs, xs * g], [0, 0]], "ch-ref");
+    }
+    P.pathLine(pts.map((p) => [Math.max(X0, lg(p.s)), Math.max(Y0, lg(p.yr))]), "ch-line");
+    pts.forEach((p) => {
+      const dark = p.yr * ymaxY < 1.0;                 // sub-1-nit: colour by tint visibility
+      const cls = `ch-dot${dark ? " " + deCls(p.de) : ""}${p.carried ? " ch-carried" : ""}`;
+      P.add(`<circle cx="${fmt(P.px(Math.max(X0, lg(p.s))), 1)}" cy="${fmt(P.py(Math.max(Y0, lg(p.yr))), 1)}" r="2.2" class="${cls}">${hov(`signal ${pctLab(lg(p.s))} | Y ${pctLab(lg(p.yr))} of white (${fmt(p.yr * ymaxY, 3)} nit)${p.de != null ? ` | ΔE ${fmt(p.de, 2)}` : ""}${p.carried ? " | prev stage" : ""}`)}</circle>`);
+    });
+    const below = raw.length - pts.length;
+    if (below) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${below} read${below === 1 ? "" : "s"} at 0 nit (below meter floor)</text>`);
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">log/log · ${d.kind === "pq" ? "PQ" : "γ " + fmt(g, 2)}</text>`);
+    return P.svg();
+  };
+
+  // ── ΔE distribution (ECDF): the whole verdict, not three summary points ──
+  // "94% under 1 JND, 3 visible misses" is what avg/p95/max are trying to say. JND bands shaded;
+  // carried (previous-stage) points excluded — this is THIS stage's distribution.
+  DLCCharts.deDist = function (cie) {
+    const des = (((cie || {}).points) || []).filter((p) => p.de != null && !p.carried)
+      .map((p) => p.de).sort((a, b) => a - b);
+    if (des.length < 3) return empty("no per-patch ΔE yet");
+    const xmax = Math.max(3.2, des[des.length - 1] * 1.08);
+    const P = Plot({ xmin: 0, xmax, ymin: 0, ymax: 1 });
+    const stripX = (a, b, cls) =>
+      P.add(`<rect x="${fmt(P.px(a), 1)}" y="${fmt(P.m.t, 1)}" width="${fmt(Math.max(0, P.px(Math.min(b, xmax)) - P.px(a)), 1)}" height="${fmt(P.H - P.m.t - P.m.b, 1)}" class="${cls}"/>`);
+    stripX(0, 1, "ch-zone-ok"); stripX(1, 3, "ch-zone-warn"); stripX(3, xmax, "ch-zone-bad");
+    P.gridX(niceTicks(0, xmax, 4), (t) => fmt(t, 1));
+    P.gridY([0, 0.25, 0.5, 0.75, 1], (t) => Math.round(t * 100) + "%");
+    let path = `M${fmt(P.px(0), 1)} ${fmt(P.py(0), 1)}`;
+    des.forEach((v, i) => {
+      path += ` L${fmt(P.px(Math.min(v, xmax)), 1)} ${fmt(P.py(i / des.length), 1)}`
+        + ` L${fmt(P.px(Math.min(v, xmax)), 1)} ${fmt(P.py((i + 1) / des.length), 1)}`;
+    });
+    path += ` L${fmt(P.px(xmax), 1)} ${fmt(P.py(1), 1)}`;
+    P.add(`<path d="${path}" class="ch-line" fill="none"/>`);
+    // median + p95 markers, hoverable
+    [[0.5, "median"], [0.95, "95th"]].forEach(([q, lab]) => {
+      const v = des[Math.min(des.length - 1, Math.floor(q * des.length))];
+      P.add(`<circle cx="${fmt(P.px(Math.min(v, xmax)), 1)}" cy="${fmt(P.py(q), 1)}" r="2.6" class="ch-dot">${hov(`${lab} ΔE ${fmt(v, 2)}`)}</circle>`);
+    });
+    const under1 = des.filter((v) => v < 1).length, over3 = des.filter((v) => v >= 3).length;
+    P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${Math.round(under1 / des.length * 100)}% &lt; 1 JND · ${over3 ? `${over3} visible (≥3)` : "none visible"} · ${des.length} patches</text>`);
+    return P.svg();
+  };
+
+  // ── Convergence: ΔE avg/max over the whole run (build iterations + scored passes) ──
+  // The "watch it get better" chart — each build iteration and each scored verify lands as a
+  // point, so improvement (or a regression) is a shape, not a memory.
+  DLCCharts.convergence = function (d) {
+    const pts = (d || []).filter((p) => p.elapsed_s != null && (p.avg != null || p.max != null));
+    if (pts.length < 2) return empty("no scored iterations yet");
+    const xmax = Math.max(...pts.map((p) => p.elapsed_s)) || 1;
+    const vals = pts.flatMap((p) => [p.avg, p.max]).filter((v) => v != null);
+    const ymax = Math.max(3.2, Math.max(...vals) * 1.15);
+    const P = Plot({ xmin: 0, xmax, ymin: 0, ymax });
+    const stripY = (a, b, cls) =>
+      P.add(`<rect x="${fmt(P.m.l, 1)}" y="${fmt(P.py(Math.min(b, ymax)), 1)}" width="${fmt(P.W - P.m.l - P.m.r, 1)}" height="${fmt(Math.max(0, P.py(a) - P.py(Math.min(b, ymax))), 1)}" class="${cls}"/>`);
+    stripY(0, 1, "ch-zone-ok"); stripY(1, 3, "ch-zone-warn"); stripY(3, ymax, "ch-zone-bad");
+    P.gridX(niceTicks(0, xmax, 4), (t) => Math.round(t) + "s");
+    P.gridY(niceTicks(0, ymax, 4), (t) => fmt(t, 1));
+    P.pathLine(pts.filter((p) => p.max != null).map((p) => [p.elapsed_s, Math.min(p.max, ymax)]), "ch-line-max");
+    P.pathLine(pts.filter((p) => p.avg != null).map((p) => [p.elapsed_s, p.avg]), "ch-line");
+    pts.forEach((p) => {
+      const build = p.kind === "build";
+      if (p.max != null) P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(Math.min(p.max, ymax)), 1)}" r="1.8" class="${build ? "ch-dot-hollow" : "ch-dot-max"}">${hov(`${p.label || p.kind} | max ΔE ${fmt(p.max, 2)}${build ? " (build probe)" : " (scored)"}`)}</circle>`);
+      if (p.avg != null) P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p.avg), 1)}" r="${build ? 2.0 : 2.6}" class="${build ? "ch-dot-hollow" : "ch-dot"}">${hov(`${p.label || p.kind} | avg ΔE ${fmt(p.avg, 2)}${build ? " (build probe)" : " (scored)"}`)}</circle>`);
+    });
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">avg (amber) · max (gray) · ○ build iterations</text>`);
+    return P.svg();
+  };
+
+  // ── Worst patches: intended vs measured, side by side — the miss you can SEE ──
+  // The intuitive kernel of "patch chart" displays without fake geometry: the largest ΔEs of the
+  // CURRENT stage as split swatches. Measured colour is an approximation for the eye; the ΔE
+  // number stays the authority.
+  DLCCharts.offenders = function (list) {
+    const items = (list || []).filter((o) => o.de != null).slice(0, 6);
+    if (!items.length) return empty("no scored patches yet");
+    const W = VB.w, H = VB.h, left = 16, top = 40, sw = 62;
+    const rh = Math.min(42, (H - top - 8) / items.length);
+    const parts = [
+      `<text x="${left}" y="18" class="ch-note">largest ΔE this stage — lower rows should be rare</text>`,
+      `<text x="${left}" y="${top - 7}" class="ch-tick">intended</text>`,
+      `<text x="${left + sw + 4}" y="${top - 7}" class="ch-tick">measured</text>`,
+    ];
+    items.forEach((o, i) => {
+      const y = top + i * rh, h = rh - 7;
+      const name = o.label || (o.neutral ? "neutral" : "colour");
+      parts.push(`<rect x="${left}" y="${fmt(y, 1)}" width="${sw}" height="${fmt(h, 1)}" rx="2" class="ch-sw" style="fill:${esc(o.sc || "#444")}">${hov(`${name}\nintended\t${o.sc || "—"}\nΔE\t${fmt(o.de, 2)}`)}</rect>`);
+      parts.push(`<rect x="${left + sw + 4}" y="${fmt(y, 1)}" width="${sw}" height="${fmt(h, 1)}" rx="2" class="ch-sw" style="fill:${esc(o.mc || "#444")}">${hov(`${name}\nmeasured (approx.)\t${o.mc || "—"}\nΔE\t${fmt(o.de, 2)}`)}</rect>`);
+      parts.push(`<text x="${left + 2 * sw + 18}" y="${fmt(y + h / 2 + 4, 1)}" class="ch-off-lab">${esc(name)}</text>`);
+      parts.push(`<text x="${W - 18}" y="${fmt(y + h / 2 + 4, 1)}" text-anchor="end" class="ch-off-de ${deCls(o.de)}">${fmt(o.de, 2)}</text>`);
+    });
+    return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="chart-svg">${parts.join("")}</svg>`;
+  };
+
   // One SVG per data-chart key — the live dashboard and the report both call this.
   DLCCharts.build = function (key, charts, header) {
     const wcct = header && header.white && header.white.cct;
     switch (key) {
       case "cie": return DLCCharts.cie(charts.cie);
       case "eotf": return DLCCharts.eotf(charts.eotf);
+      case "shadow": return DLCCharts.shadowEotf(charts.eotf);
       case "graycct": return DLCCharts.grayscaleCct(charts.grayscale, wcct);
-      case "grayduv": return DLCCharts.grayscaleDuv(charts.grayscale);
+      case "grayduv": return DLCCharts.grayscaleDuv(charts.grayscale, charts.target_duv);
       case "graybalance": return DLCCharts.rgbBalance(charts.grayscale);
       case "colorlum": return DLCCharts.colorLum(charts.color_lum);
+      case "dist": return DLCCharts.deDist(charts.cie);
+      case "offenders": return DLCCharts.offenders(charts.offenders);
+      case "convergence": return DLCCharts.convergence(charts.convergence);
       case "drift": return DLCCharts.channelDrift(charts.channel_drift);
       default: return empty();
     }

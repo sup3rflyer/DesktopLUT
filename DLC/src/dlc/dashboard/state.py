@@ -41,13 +41,20 @@ _NATIVE_PRIMARY_Y_FLOOR_FRAC = 0.01
 _NATIVE_PRIMARY_Y_FLOOR_ABS = 0.1
 # Grayscale CCT/Duv charts (visualization only): below this absolute luminance a neutral's
 # chromaticity is noise-dominated and CCT is undefined as Y→0 (e.g. a 0.006-nit read solving to
-# 11000 K). Such points are flagged ``dim`` so the chart omits them from the trace + the y-autoscale
-# (one would otherwise blow the range and bury the real ~6500 K variation) and footnotes the count.
-# They still appear on the EOTF/luminance tiles, where Y *is* meaningful. Matches the build's own
-# near-black floor (corrections blend to identity there anyway), so the chart mirrors what's used.
+# 11000 K). Such points are flagged ``dim``; the charts keep them OFF the y-autoscale (one wild
+# read would bury the real ~6500 K variation) but render them in the ΔE domain — coloured by
+# their ΔE vs the neutral target, which correctly down-weights chroma near black, so the chart
+# answers "is the tint visible?" instead of hiding the read. Matches the build's own near-black
+# floor (corrections blend to identity there anyway), so the chart mirrors what's used.
 _GRAY_CCT_Y_FLOOR_NITS = 1.0
 # Bound on the per-stage CIE scatter (keyed latest-wins; oldest-inserted evicted past the cap).
 _CIE_CAP = 5000
+# Re-reads kept per grayscale level (median + spread beats a single noisy sample — the
+# ColourSpace-style taming of low-light swings, done honestly: the whisker shows the spread).
+_GRAY_SAMPLES = 9
+# "Core" content zone reference white for HDR (BT.2408 diffuse/graphics white). ~99% of graded
+# content lives at or below this and within Rec.709 — the practical-priority ΔE split headline.
+_HDR_REF_WHITE_NITS = 203.0
 
 
 def _sig_hex(sig) -> str:
@@ -144,6 +151,19 @@ def _median(values: list[float]) -> Optional[float]:
     if n % 2:
         return ordered[mid]
     return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _fold_gray_sample(gray_map: dict, level: float, sample: dict) -> None:
+    """Fold one neutral read into a level's SAMPLE RING (median-of-N, not latest-wins): repeat
+    reads at the same level tame meter noise — the dominant term near black — and the retained
+    spread becomes the chart's uncertainty whisker. A fresh read on a ``carried`` entry (seeded
+    from the previous stage) starts a NEW ring: a re-measure through a new correction state is a
+    different population, never averaged with the old one."""
+    cur = gray_map.get(level)
+    if cur is None or cur.get("carried"):
+        gray_map[level] = {"signal": level, "samples": [sample]}
+    else:
+        cur["samples"] = (cur.get("samples") or [])[-(_GRAY_SAMPLES - 1):] + [sample]
 
 
 # Wire precision per metric. One metric per mode (dE_ITP for HDR, CIEDE2000 for SDR); both ride the
@@ -362,7 +382,7 @@ class DashboardState:
             self._mark_progress(ev.time)
         elif name == Ev.OPTIMIZER_ITER:
             self.optimizer = dict(data)
-            self._optimizer_history.append(dict(data))
+            self._optimizer_history.append({**data, "elapsed_s": self._elapsed_at(ev.time)})
             if len(self._optimizer_history) > 256:
                 self._optimizer_history = self._optimizer_history[-256:]
             self._mark_progress(ev.time)
@@ -441,10 +461,12 @@ class DashboardState:
             key = _patch_key(data)
             mdict = {m: v["de"] for m, v in deltas["metrics"].items()}
             tgt = deltas.get("target")
-            # Carry the target chromaticity so the rolling summary can classify the patch in- vs
-            # out-of-gamut against the panel's measured native gamut (done at summary time, so
-            # patches read before the native primaries are known get classified retroactively).
-            self._live_de[key] = {"m": mdict, "tx": (tgt or {}).get("x"), "ty": (tgt or {}).get("y")}
+            # Carry the target chromaticity + luminance so the rolling summary can classify the
+            # patch in- vs out-of-gamut against the panel's measured native gamut, and (HDR)
+            # core vs limits against the content zone (done at summary time, so patches read
+            # before the native primaries are known get classified retroactively).
+            self._live_de[key] = {"m": mdict, "tx": (tgt or {}).get("x"),
+                                  "ty": (tgt or {}).get("y"), "tY": (tgt or {}).get("Y")}
             self._live_last = mdict
         # The most recent neutral read drives the live white-point readout (needs a usable xy
         # so the readout shape stays consistent with the enrichment gate above).
@@ -471,20 +493,40 @@ class DashboardState:
             return ({"avg": round(sum(xs) / len(xs), dec), "max": round(max(xs), dec), "n": len(xs)}
                     if xs else {"avg": None, "max": None, "n": 0})
 
+        # HDR "core" content zone: within Rec.709 AND at/below the diffuse/graphics reference
+        # white (BT.2408, ~203 nits) — where ~99% of graded content lives. The core numbers are
+        # the practical verdict; the in-gamut remainder is "limits" (impressive, rarely hit).
+        # SDR targets are all sRGB-inside by construction, so the split is HDR-only.
+        tri709 = (tuple(_SRGB_PRIMARIES["r"]), tuple(_SRGB_PRIMARIES["g"]),
+                  tuple(_SRGB_PRIMARIES["b"]))
+        core_y_cap = _HDR_REF_WHITE_NITS * 1.02   # small headroom so ref-white itself is core
+
         metrics: dict[str, Any] = {}
         for m in order:
             dec = _DE_DECIMALS.get(m, 3)
-            allv, ins, oog = [], [], []
+            allv, ins, oog, core, ext = [], [], [], [], []
             for v in vals:
                 de = v["m"].get(m)
                 if de is None:
                     continue
                 allv.append(de)
                 if tri is not None and v.get("tx") is not None and v.get("ty") is not None:
-                    (ins if point_in_triangle((v["tx"], v["ty"]), *tri) else oog).append(de)
+                    txy = (v["tx"], v["ty"])
+                    if point_in_triangle(txy, *tri):
+                        ins.append(de)
+                        if hdr:
+                            t_y = v.get("tY")
+                            is_core = point_in_triangle(txy, *tri709) \
+                                and (t_y is None or t_y <= core_y_cap)
+                            (core if is_core else ext).append(de)
+                    else:
+                        oog.append(de)
             last = self._live_last.get(m)
             metrics[m] = {**_stats(allv, dec), "last": round(last, dec) if last is not None else None,
                           "in": _stats(ins, dec), "oog": _stats(oog, dec)}
+            if hdr and tri is not None:
+                metrics[m]["core"] = _stats(core, dec)
+                metrics[m]["ext"] = _stats(ext, dec)
         return {"scoring": "itp" if hdr else "de2000", "n": len(vals),
                 "gamut_known": tri is not None, "metrics": metrics}
 
@@ -592,15 +634,16 @@ class DashboardState:
         cie[key] = {
             "x": round(x, 5), "y": round(y, 5), "role": role, "neutral": neutral,
             "c": (None if neutral else _sig_hex(sig)) if sig else None,
+            # intended (signal) + measured display colour → the worst-patches split swatches
+            "sc": _sig_hex(sig) if sig else None, "mc": self._measured_hex(x, y, Y),
             # target chromaticity + scoring ΔE → the scatter draws the error vector and shows ΔE on hover
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
             "de": de, "label": data.get("label")}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
-            # latest measurement at this grayscale level wins (re-measures overwrite)
-            self._gray_by_stage[stage][round(level, 5)] = {
-                "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
-                "cct": enriched.get("cct"), "duv": enriched.get("duv")}
+            _fold_gray_sample(self._gray_by_stage[stage], round(level, 5), {
+                "Y": Y, "x": round(x, 5), "y": round(y, 5),
+                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de})
         elif not neutral and sig and len(sig) >= 3 and Y is not None:
             # a colour patch: keep the latest measured Y per distinct signal for the
             # Colour Luminance chart (luminance error vs target is derived in charts()).
@@ -621,7 +664,10 @@ class DashboardState:
         if prev is not None:
             self._cie_by_stage[stage] = {k: {**p, "carried": True}
                                          for k, p in self._cie_by_stage[prev].items()}
-            self._gray_by_stage[stage] = {k: {**g, "carried": True}
+            # sample rings are copied, not shared — a late read in the source stage must
+            # never silently mutate the carried snapshot
+            self._gray_by_stage[stage] = {k: {**g, "samples": list(g.get("samples") or []),
+                                              "carried": True}
                                           for k, g in self._gray_by_stage[prev].items()}
             self._color_by_stage[stage] = {k: {**c, "carried": True}
                                            for k, c in self._color_by_stage[prev].items()}
@@ -646,7 +692,8 @@ class DashboardState:
             self._preview_cie[stage] = ({k: {**p, "carried": True}
                                          for k, p in self._cie_by_stage[settled].items()}
                                         if settled else {})
-            self._preview_gray[stage] = ({k: {**g, "carried": True}
+            self._preview_gray[stage] = ({k: {**g, "samples": list(g.get("samples") or []),
+                                              "carried": True}
                                           for k, g in self._gray_by_stage[settled].items()}
                                          if settled else {})
             self._preview_seq.append(stage)
@@ -661,17 +708,39 @@ class DashboardState:
         cie[key] = {
             "x": round(x, 5), "y": round(y, 5), "role": "probe", "neutral": neutral,
             "c": (None if neutral else _sig_hex(sig)) if sig else None,
+            "sc": _sig_hex(sig) if sig else None, "mc": self._measured_hex(x, y, Y),
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
             "de": de, "label": data.get("label")}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
-            self._preview_gray[stage][round(level, 5)] = {
-                "signal": round(level, 5), "Y": Y, "x": round(x, 5), "y": round(y, 5),
-                "cct": enriched.get("cct"), "duv": enriched.get("duv")}
+            _fold_gray_sample(self._preview_gray[stage], round(level, 5), {
+                "Y": Y, "x": round(x, 5), "y": round(y, 5),
+                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de})
+
+    def _measured_hex(self, x: float, y: float, Y: Any) -> Optional[str]:
+        """The patch's APPROXIMATE on-screen colour as actually measured (xyY → target-space RGB →
+        gamma-encoded hex, normalised to the header's reference luminance). A swatch, not
+        colorimetry: good enough to SEE a miss next to the intended colour in the worst-patches
+        tile; the numbers next to it stay the authority."""
+        big_y = _as_float(Y)
+        if big_y is None:
+            return None
+        hdr = _is_hdr_header(self.header)
+        white = (self.header.get("white") or {}).get("xy") or (0.3127, 0.3290)
+        ref = _as_float(self.header.get("luminance")) or (1000.0 if hdr else 120.0)
+        if hdr:
+            ref = min(ref, _HDR_REF_WHITE_NITS)   # swatches keyed to diffuse white, not peak
+        lin = linear_rgb(x, y, big_y, is_hdr=hdr, white_xy=tuple(white[:2]))
+        if lin is None or ref <= 0:
+            return None
+        chans = [max(0, min(255, int(round((max(0.0, min(1.0, c / ref)) ** (1 / 2.2)) * 255))))
+                 for c in lin]
+        return "#{:02x}{:02x}{:02x}".format(*chans)
 
     def _ingest_metrics(self, ev: Event, data: dict[str, Any]) -> None:
         entry = {
             "phase": data.get("label") or data.get("phase") or ev.stage,
+            "elapsed_s": self._elapsed_at(ev.time),
             "iteration": data.get("iteration"),
             "metric": data.get("metric"),
             "avg": data.get("avg_de2000"),
@@ -694,6 +763,47 @@ class DashboardState:
         state: raw while profiling, verify once verified)."""
         return self._stage_seq[-1] if self._stage_seq else None
 
+    def _gray_rows(self, gray_map: dict, *, hdr: bool, bal_white: tuple) -> list[dict[str, Any]]:
+        """Chart-ready grayscale rows from a level→sample-ring map: the MEDIAN of each level's
+        retained re-reads (one noisy sample can no longer swing the trace) plus the CCT/Duv
+        spread (``*_lo``/``*_hi`` → the uncertainty whisker, only when n > 1) and the level's
+        ΔE vs its neutral target — the perceptually honest number for near-black levels, where
+        CCT is a ratio of noise but "can you see the tint?" still has an answer."""
+        rows: list[dict[str, Any]] = []
+        for k in sorted(gray_map):
+            e = gray_map[k]
+            ss = e.get("samples") or []
+            if not ss:
+                continue
+
+            def med(key: str) -> Optional[float]:
+                return _median([s[key] for s in ss if s.get(key) is not None])
+
+            x, y, Y = med("x"), med("y"), med("Y")
+            bal = rgb_balance(x, y, Y, is_hdr=hdr, white_xy=bal_white)
+            ccts = [s["cct"] for s in ss if s.get("cct") is not None]
+            duvs = [s["duv"] for s in ss if s.get("duv") is not None]
+            de = med("de")
+            row = {"signal": e["signal"], "Y": round(Y, 4) if Y is not None else None,
+                   "x": round(x, 5) if x is not None else None,
+                   "y": round(y, 5) if y is not None else None,
+                   "cct": round(med("cct"), 1) if ccts else None,
+                   "duv": round(med("duv"), 5) if duvs else None,
+                   "de": round(de, 3) if de is not None else None,
+                   "n": len(ss),
+                   "cct_lo": round(min(ccts), 1) if len(ccts) > 1 else None,
+                   "cct_hi": round(max(ccts), 1) if len(ccts) > 1 else None,
+                   "duv_lo": round(min(duvs), 5) if len(duvs) > 1 else None,
+                   "duv_hi": round(max(duvs), 5) if len(duvs) > 1 else None,
+                   "dim": (Y is not None and Y < _GRAY_CCT_Y_FLOOR_NITS),
+                   "r": round(bal[0], 2) if bal else None,
+                   "g": round(bal[1], 2) if bal else None,
+                   "b": round(bal[2], 2) if bal else None}
+            if e.get("carried"):
+                row["carried"] = True
+            rows.append(row)
+        return rows
+
     def charts(self) -> dict[str, Any]:
         """Chart-ready datasets, built from the bounded accumulators. Served via
         /api/charts (NOT the SSE state) so the heavy scatter stays off the fast path.
@@ -710,25 +820,18 @@ class DashboardState:
         hdr = _is_hdr_header(self.header)
         white = (self.header.get("white") or {}).get("xy")
         bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
-        # Flag near-black neutrals (Y below the floor) as ``dim``: their CCT/Duv is noise, so the
-        # grayscale CCT/Duv/balance charts drop them from the trace + autoscale (keeping the
-        # meaningful range legible) rather than letting an undefined near-black read dominate.
-        # Each level also carries its R/G/B balance (% deviation from neutral) for the balance chart.
-        gray = []
-        for k in sorted(gray_map):
-            g = gray_map[k]
-            bal = rgb_balance(g.get("x"), g.get("y"), g.get("Y"), is_hdr=hdr, white_xy=bal_white)
-            gray.append({**g,
-                         "dim": (g.get("Y") is not None and g["Y"] < _GRAY_CCT_Y_FLOOR_NITS),
-                         "r": round(bal[0], 2) if bal else None,
-                         "g": round(bal[1], 2) if bal else None,
-                         "b": round(bal[2], 2) if bal else None})
+        gray = self._gray_rows(gray_map, hdr=hdr, bal_white=bal_white)
         color_map = self._color_by_stage.get(stage, {}) if stage else {}
         gamma = self.header.get("gamma") or 2.2
         luminance = self.header.get("luminance")
         return {
             "stage": stage,                       # the measurement stage these snapshot charts reflect
             "stages": list(self._stage_seq),
+            # The TARGET white's own Duv. D65 sits ≈ +0.003 ABOVE the Planckian locus, so a
+            # perfectly calibrated panel does NOT read Duv 0 — the Duv chart's norm corridor
+            # must centre here, or a perfect D65 white gets flagged as a green cast.
+            "target_duv": (neutral_metrics(float(white[0]), float(white[1])).get("duv")
+                           if white and len(white) >= 2 else None),
             "continuity": {"from": self._carried_from.get(stage) if stage else None,
                            "carried": carried_n, "fresh": len(cie_points) - carried_n},
             "cie": {
@@ -751,7 +854,8 @@ class DashboardState:
                 "gamma": gamma,
                 "luminance": luminance,
                 "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
-                "points": [{"signal": g["signal"], "Y": g["Y"], "carried": bool(g.get("carried"))}
+                "points": [{"signal": g["signal"], "Y": g["Y"], "de": g.get("de"),
+                            "carried": bool(g.get("carried"))}
                            for g in gray if g.get("Y") is not None],
             },
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
@@ -762,6 +866,26 @@ class DashboardState:
             "optimizer": list(self._optimizer_history),
             "white_track": list(self._drift_series()),
             "channel_drift": self._channel_drift(hdr, white),
+            # Worst patches THIS stage (fresh reads only — a carried miss belongs to the previous
+            # stage's story): intended vs measured swatch + ΔE, largest first.
+            "offenders": sorted(
+                ({"label": p.get("label"), "de": p["de"], "sc": p.get("sc"),
+                  "mc": p.get("mc"), "neutral": bool(p.get("neutral"))}
+                 for p in cie_points if p.get("de") is not None and not p.get("carried")),
+                key=lambda o: -o["de"])[:6],
+            # ΔE-over-the-run series for the convergence tile: build-iteration measurements +
+            # scored verify passes, merged in time order — the "watch it get better" chart.
+            "convergence": sorted(
+                [{"elapsed_s": o.get("elapsed_s"),
+                  "avg": _as_float(o.get("measured_mean_de")),
+                  "max": _as_float(o.get("measured_max_de")),
+                  "kind": "build", "label": f"iter {o.get('iteration')}"}
+                 for o in self._optimizer_history]
+                + [{"elapsed_s": d.get("elapsed_s"), "avg": _as_float(d.get("avg")),
+                    "max": _as_float(d.get("max")), "kind": "scored",
+                    "label": str(d.get("phase") or "scored")}
+                   for d in self.de_history],
+                key=lambda e: e.get("elapsed_s") or 0.0),
         }
 
     def _drift_series(self) -> Deque[dict]:
@@ -925,15 +1049,7 @@ class DashboardState:
         cie_points = list(self._preview_cie.get(stage, {}).values())
         gray_map = self._preview_gray.get(stage, {})
         bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
-        gray = []
-        for k in sorted(gray_map):
-            g = gray_map[k]
-            bal = rgb_balance(g.get("x"), g.get("y"), g.get("Y"), is_hdr=hdr, white_xy=bal_white)
-            gray.append({**g,
-                         "dim": (g.get("Y") is not None and g["Y"] < _GRAY_CCT_Y_FLOOR_NITS),
-                         "r": round(bal[0], 2) if bal else None,
-                         "g": round(bal[1], 2) if bal else None,
-                         "b": round(bal[2], 2) if bal else None})
+        gray = self._gray_rows(gray_map, hdr=hdr, bal_white=bal_white)
         return {
             "active": active,
             "stage": stage,
@@ -952,7 +1068,8 @@ class DashboardState:
                 "gamma": gamma,
                 "luminance": luminance,
                 "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
-                "points": [{"signal": g["signal"], "Y": g["Y"], "carried": bool(g.get("carried"))}
+                "points": [{"signal": g["signal"], "Y": g["Y"], "de": g.get("de"),
+                            "carried": bool(g.get("carried"))}
                            for g in gray if g.get("Y") is not None],
             },
         }
@@ -986,6 +1103,24 @@ class DashboardState:
         diffs = [(times[i] - times[i - 1]).total_seconds() for i in range(1, len(times))]
         diffs = [d for d in diffs if 0.0 < d < 600.0]  # drop pauses/soak gaps
         return _median(diffs)
+
+    def _read_spread_ratio(self) -> Optional[float]:
+        """How much slower the SLOW reads run vs the typical read (p85/median of the recent
+        read-interval window, clamped to [1, 2.5]). Scales the point ETA into an honest upper
+        bound — a single number implies precision the meter doesn't deliver (retries, dark-patch
+        integration, settling all stretch individual reads)."""
+        times = list(self._read_times)
+        if len(times) < 5:
+            return None
+        diffs = sorted((times[i] - times[i - 1]).total_seconds() for i in range(1, len(times)))
+        diffs = [d for d in diffs if 0.0 < d < 600.0]
+        if len(diffs) < 4:
+            return None
+        med = _median(diffs)
+        if not med or med <= 0:
+            return None
+        p85 = diffs[min(len(diffs) - 1, int(round(0.85 * (len(diffs) - 1))))]
+        return max(1.0, min(2.5, p85 / med))
 
     def _rolling_s_per_patch(self) -> Optional[float]:
         marks = list(self._progress_marks)
@@ -1117,6 +1252,11 @@ class DashboardState:
         spp = self._rolling_s_per_patch()
         remaining = max(0, self.patches_total - self.patches_done) if self.patches_total else 0
         eta = remaining * spp if (spp and remaining and self.run_status == RUN_RUNNING) else None
+        # Honest range: the point ETA assumes every read runs at the median pace; the upper
+        # bound scales by the observed slow-read ratio. The ETA covers the CURRENT STAGE only
+        # (the client labels it so and states what remains after it from the stage plan).
+        spread = self._read_spread_ratio()
+        eta_hi = eta * spread if (eta is not None and spread is not None) else None
 
         return {
             "run_id": self.run_id,
@@ -1143,6 +1283,7 @@ class DashboardState:
                 "s_per_read": round(spr, 2) if spr is not None else None,
                 "s_per_patch": round(spp, 2) if spp is not None else None,
                 "eta_s": round(eta, 1) if eta is not None else None,
+                "eta_hi_s": round(eta_hi, 1) if eta_hi is not None else None,
                 "run_started_iso": self.run_started_iso,
                 "ended_iso": self.ended_iso,
             },

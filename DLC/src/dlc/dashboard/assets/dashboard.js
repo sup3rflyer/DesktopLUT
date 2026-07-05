@@ -83,6 +83,35 @@ function fmtY(v) {
   return Number(v).toFixed(Math.abs(v) >= 100 ? 0 : 2);
 }
 
+/* ── honest timing ────────────────────────────────────────────────
+ * The ETA covers the CURRENT STAGE only and says so; it widens into a range when slow reads
+ * (retries, dark-patch integration) make the point estimate optimistic; during the 3D-LUT build
+ * (no patch counters) it shows the iteration instead of a fake countdown. `dt` is the local
+ * seconds since the state arrived, so the ticker can count the same claim down. */
+function etaText(s, dt) {
+  const t = s.timers || {};
+  if ((s.run_status || "idle") !== "running") return "—";
+  if (t.eta_s != null) {
+    const lo = Math.max(0, t.eta_s - dt);
+    if (t.eta_hi_s != null && t.eta_hi_s > t.eta_s * 1.15)
+      return `${fmtDur(lo)}–${fmtDur(Math.max(0, t.eta_hi_s - dt))}`;
+    return fmtDur(lo);
+  }
+  if ((s.stage || "").includes("build") && s.optimizer && s.optimizer.iteration != null)
+    return `iter ${s.optimizer.iteration}`;
+  return "—";
+}
+// What remains AFTER the current stage, from the run's stage plan — so "ETA · stage" can never
+// be mistaken for "ETA · run".
+function afterStageText(s) {
+  const steps = ((s.pipeline || {}).steps) || [];
+  if (!steps.length) return "—";
+  const up = steps.filter((x) => x.status === "upcoming");
+  if (!up.length) return (s.run_status === "running") ? "last stage" : "—";
+  const nLong = up.filter((x) => x.long).length;
+  return `${up.length} stage${up.length === 1 ? "" : "s"}${nLong ? ` · ${nLong} long ⏲` : ""}`;
+}
+
 /* ── the run's single ΔE metric (dE_ITP for HDR, CIEDE2000 for SDR — no alternate lens) ── */
 function scoringMetric(s) {
   return (s && s.live_de && s.live_de.scoring) || (s && s.de && s.de.metric) || "de2000";
@@ -152,7 +181,10 @@ function renderLivePatch(lr, header) {
   document.querySelectorAll(".rcard-patch .lp-neutral").forEach((el) => el.classList.toggle("off", !neutral));
   if (neutral && ok) {
     $("lp-cct").textContent = lr.cct ? `${Math.round(lr.cct)} K` : "—";
-    const tint = duvTint(lr.duv);
+    // tint vs the TARGET white's own Duv (D65 sits ≈ +0.003 above the locus — a perfect D65
+    // read must NOT show a green arrow)
+    const tduv = (lastCharts && lastCharts.target_duv) || 0;
+    const tint = duvTint(lr.duv != null ? lr.duv - tduv : null);
     $("lp-duv").innerHTML = (lr.duv != null)
       ? `${num(lr.duv, 4)}${tint ? ` <span class="tint ${tint}">${tint === "green" ? "▲green" : "▼magenta"}</span>` : ""}` : "—";
     const tcct = header && header.white && header.white.cct;
@@ -259,7 +291,8 @@ function renderState(s) {
     $("ph-bar-fill").style.width = pct + "%";
     $("ph-pct").textContent = Math.round(pct) + "%";
     $("ph-patches").textContent = `${c.patches_done || 0}/${c.patches_total}`;
-    $("ph-eta").textContent = (s.timers && s.timers.eta_s != null) ? "ETA " + fmtDur(s.timers.eta_s) : "";
+    const phEta = etaText(s, 0);
+    $("ph-eta").textContent = phEta !== "—" ? "ETA " + phEta : "";
   } else {
     phLive.hidden = true;
   }
@@ -269,7 +302,8 @@ function renderState(s) {
   const t = s.timers || {};
   $("t-run").textContent = fmtDur(t.run_elapsed_s);
   $("t-stage").textContent = fmtDur(t.stage_elapsed_s);
-  $("t-eta").textContent = (st === "running") ? fmtDur(t.eta_s) : "—";
+  $("t-eta").textContent = etaText(s, 0);
+  $("t-after").textContent = afterStageText(s);
   $("t-sread").textContent = (t.s_per_read != null) ? num(t.s_per_read, 2) + "s" : "—";
   $("t-spatch").textContent = (t.s_per_patch != null) ? num(t.s_per_patch, 1) + "s" : "—";
   // "since progress" — the wedge tell: it keeps growing if the run is alive but stuck,
@@ -293,9 +327,24 @@ function renderState(s) {
   const lvm = (ld.metrics && ld.metrics[vm]) || {};
   $("de-live-cap").textContent = "live · " + (s.stage || s.phase || "—");
   const ing = lvm.in || {}, oog = lvm.oog || {};
+  // Content-first framing (HDR): headline the CORE zone — targets within Rec.709 at or below
+  // reference white, where ~99% of graded content lives. The in-gamut remainder becomes
+  // "limits": reachable but extreme, where a miss matters far less. SDR targets are all
+  // core by construction, so the split only appears for HDR runs.
+  const core = lvm.core, ext = lvm.ext;
+  const showCore = !!(ld.gamut_known && core && (core.n || (ext && ext.n)));
+  document.querySelectorAll(".de-core-row").forEach((el) => { el.hidden = !showCore; });
   if (ld.gamut_known) {
-    $("de-in-lab").textContent = "in-gamut";
-    setDeM("de-in-avg", vm, ing.avg); setDeM("de-in-max", vm, ing.max);
+    if (showCore) {
+      setDeM("de-core-avg", vm, core.avg); setDeM("de-core-max", vm, core.max);
+      $("de-in-lab").textContent = "limits";
+      $("de-in-lab").title = "reachable but extreme targets — wide-gamut or above reference white. Content rarely lives here; core is the verdict that matters.";
+      setDeM("de-in-avg", vm, (ext || {}).avg); setDeM("de-in-max", vm, (ext || {}).max);
+    } else {
+      $("de-in-lab").textContent = "in-gamut";
+      $("de-in-lab").title = "";
+      setDeM("de-in-avg", vm, ing.avg); setDeM("de-in-max", vm, ing.max);
+    }
     $("de-oog-lab").textContent = "out-gamut";
     $("de-oog-lab").classList.remove("pending");
     $("de-oog-avg").textContent = num(oog.avg, 2);
@@ -305,6 +354,7 @@ function renderState(s) {
   } else {
     // native gamut not measured yet → show the combined avg/max, mark the split pending
     $("de-in-lab").textContent = "all";
+    $("de-in-lab").title = "";
     setDeM("de-in-avg", vm, lvm.avg); setDeM("de-in-max", vm, lvm.max);
     $("de-oog-lab").textContent = "gamut pending";
     $("de-oog-lab").classList.add("pending");
@@ -367,10 +417,10 @@ function localTick() {
     if (t.run_elapsed_s != null) $("t-run").textContent = fmtDur(t.run_elapsed_s + dt);
     if (t.stage_elapsed_s != null) $("t-stage").textContent = fmtDur(t.stage_elapsed_s + dt);
   }
-  if (running && t.eta_s != null) {
-    const eta = Math.max(0, t.eta_s - dt);
-    $("t-eta").textContent = fmtDur(eta);
-    if (!$("ph-live").hidden) $("ph-eta").textContent = "ETA " + fmtDur(eta);
+  if (running) {
+    const et = etaText(s, dt);
+    $("t-eta").textContent = et;
+    if (!$("ph-live").hidden) $("ph-eta").textContent = et !== "—" ? "ETA " + et : "";
   }
   if (lv.age_s != null) $("live-age").textContent = `${Math.round(lv.age_s + dt)}s ago`;
   if (lv.progress_age_s != null) $("t-progress").textContent = fmtDur(lv.progress_age_s + dt);
@@ -566,8 +616,8 @@ let lastCharts = null;
 let lightboxKey = null;
 let lightboxReturnFocus = null;
 // Tiles fed by the live build preview while the 3D-LUT build is running (the rest — colour
-// luminance, channel drift — keep showing the settled stage).
-const PREVIEW_TILES = ["cie", "eotf", "graycct", "grayduv", "graybalance"];
+// luminance, channel drift, convergence — keep showing the settled stage / whole run).
+const PREVIEW_TILES = ["cie", "eotf", "shadow", "dist", "graycct", "grayduv", "graybalance"];
 
 // During the build, overlay the probe-read preview onto the preview-able tiles (the settled
 // snapshot is frozen on the last real measurement stage), badged so it's never mistaken for final.

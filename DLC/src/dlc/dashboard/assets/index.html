@@ -78,7 +78,8 @@
       <div class="kv"><span>run</span><b id="t-run">—</b></div>
       <div class="kv"><span>stage</span><b id="t-stage">—</b></div>
       <div class="kv"><span>since prog.</span><b id="t-progress">—</b></div>
-      <div class="kv"><span>ETA</span><b id="t-eta">—</b></div>
+      <div class="kv" title="this stage only — the range spans typical vs slow read pace. What comes after is the line below."><span>ETA · stage</span><b id="t-eta">—</b></div>
+      <div class="kv" title="what remains after the current stage, from the run's stage plan"><span>after stage</span><b id="t-after">—</b></div>
       <div class="kv"><span>s / read</span><b id="t-sread">—</b></div>
       <div class="kv"><span>s / patch</span><b id="t-spatch">—</b></div>
     </div>
@@ -88,6 +89,7 @@
         <span class="card-sub" id="de-source"></span></h3>
       <div class="de-live2" id="de-live" title="rolling per-patch ΔE for the CURRENT stage — updates every read. Split by whether the patch's target is reachable on this panel: in-gamut is the calibration quality that matters; out-of-gamut ΔE is expected clipping, not a miss.">
         <span class="de-live-cap" id="de-live-cap">live</span><span class="de-live-h">avg</span><span class="de-live-h">max</span>
+        <span class="de-row-lab de-core-row" id="de-core-lab" hidden title="the content zone: targets within Rec.709 at or below reference white (~203 nit) — where ~99% of graded content lives. This is the practical verdict.">core</span><b id="de-core-avg" class="de-core-row" hidden>—</b><b id="de-core-max" class="de-core-row" hidden>—</b>
         <span class="de-row-lab" id="de-in-lab">in-gamut</span><b id="de-in-avg">—</b><b id="de-in-max">—</b>
         <span class="de-row-lab" id="de-oog-lab">out-gamut</span><b id="de-oog-avg" class="de-oog-val">—</b><b id="de-oog-max" class="de-oog-val">—</b>
         <div class="de-live-foot"><span>last <b id="de-live-last">—</b></span><span class="de-live-n" id="de-live-n"></span></div>
@@ -157,10 +159,14 @@
     <div class="charts-grid" id="charts">
       <figure class="chart" tabindex="0" role="button" aria-label="Open Color Accuracy chart"><figcaption>Color Accuracy · CIE 1931</figcaption><div data-chart="cie"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Tone Response chart"><figcaption>Tone Response · EOTF</figcaption><div data-chart="eotf"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Shadow Tracking chart"><figcaption>Shadow Tracking · log EOTF</figcaption><div data-chart="shadow"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale CCT chart"><figcaption>Grayscale CCT</figcaption><div data-chart="graycct"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale Duv chart"><figcaption>Grayscale Duv</figcaption><div data-chart="grayduv"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Grayscale RGB Balance chart"><figcaption>Grayscale RGB Balance</figcaption><div data-chart="graybalance"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Color Luminance chart"><figcaption>Color Luminance</figcaption><div data-chart="colorlum"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Delta E Distribution chart"><figcaption>ΔE Distribution</figcaption><div data-chart="dist"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Worst Patches chart"><figcaption>Worst Patches</figcaption><div data-chart="offenders"></div></figure>
+      <figure class="chart" tabindex="0" role="button" aria-label="Open Convergence chart"><figcaption>Convergence · ΔE over run</figcaption><div data-chart="convergence"></div></figure>
       <figure class="chart" tabindex="0" role="button" aria-label="Open Channel Drift chart"><figcaption>Channel Drift · thermal</figcaption><div data-chart="drift"></div></figure>
     </div>
   </main>

@@ -264,6 +264,25 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-bal-b-lab { fill: #5f86d2; font-size: 10px; font-family: var(--mono); font-weight: 700; }
 .ch-lab-green { fill: #6fae5e; font-size: 9.5px; font-family: var(--mono); opacity: .85; }
 .ch-lab-magenta { fill: #c06fc0; font-size: 9.5px; font-family: var(--mono); opacity: .85; }
+/* Norm corridor + explicit out-of-norm tag: the scale never zooms tighter than the shaded band,
+   so "inside the corridor" reads as healthy at ANY zoom; escaping data gets an explicit tag
+   instead of a silent rescale. */
+.ch-norm-band { fill: rgba(111,174,94,.07); stroke: rgba(111,174,94,.28); stroke-width: .4; }
+.ch-alert { fill: var(--warn); font-size: 10px; font-family: var(--mono); font-weight: 700; }
+/* re-read spread at a grayscale level (median-of-N accumulator) — the uncertainty whisker */
+.ch-whisker { stroke: var(--ink-faint); stroke-width: 1.1; opacity: .85; }
+/* near-black dots re-coloured by tint VISIBILITY (ΔE vs neutral) — declared after .ch-dot-dim
+   so the ΔE verdict wins the fill; text.* variants serve the worst-patches ΔE numbers */
+.ch-de-ok { fill: #47663f; } .ch-de-warn { fill: #8a7320; } .ch-de-bad { fill: #c2564b; }
+text.ch-de-ok { fill: var(--good); } text.ch-de-warn { fill: var(--warn); } text.ch-de-bad { fill: var(--bad); }
+/* JND zone strips (ΔE distribution / convergence): <1 fine, 1–3 borderline, ≥3 visible */
+.ch-zone-ok { fill: rgba(111,174,94,.06); } .ch-zone-warn { fill: rgba(201,162,39,.05); }
+.ch-zone-bad { fill: rgba(194,86,75,.07); }
+.ch-dot-hollow { fill: none; stroke: var(--accent); stroke-width: 1; }
+/* worst-patches split swatches */
+.ch-sw { stroke: #000; stroke-width: .5; }
+.ch-off-lab { fill: var(--ink); font-size: 11px; font-family: var(--mono); }
+.ch-off-de { font-size: 13px; font-family: var(--mono); font-weight: 700; }
 /* EOTF gamma/tracking line (the second interpretation) — semi-transparent on its own scale */
 .ch-track { stroke: #58a6c9; stroke-width: 1.2; opacity: .5; stroke-dasharray: 2 2; }
 .ch-track-ref { stroke: #58a6c9; stroke-width: .8; opacity: .35; }
