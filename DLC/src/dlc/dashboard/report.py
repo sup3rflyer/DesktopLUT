@@ -80,9 +80,13 @@ def render_report_html(snap: dict[str, Any], charts: dict[str, Any], exported_at
         f'<figure class="chart"><figcaption>{html.escape(title)}</figcaption>'
         f'<div data-chart="{key}"></div></figure>'
         for key, title in (("cie", "Color Accuracy · CIE 1931"), ("eotf", "Tone Response · EOTF"),
+                           ("shadow", "Shadow Tracking · log EOTF"),
                            ("graycct", "Grayscale CCT"), ("grayduv", "Grayscale Duv"),
                            ("graybalance", "Grayscale RGB Balance"),
-                           ("colorlum", "Color Luminance"), ("drift", "Channel Drift · thermal")))
+                           ("colorlum", "Color Luminance"), ("dist", "ΔE Distribution"),
+                           ("offenders", "Worst Patches"),
+                           ("convergence", "Convergence · ΔE over run"),
+                           ("drift", "Channel Drift · thermal")))
 
     payload = _safe_json({"charts": charts, "header": h})
 
@@ -143,13 +147,28 @@ padding:8px;text-align:center}.bn b{display:block;font-family:var(--mono);font-s
 .ch-gamut-measured{fill:none;stroke:#c9a227;stroke-width:1;stroke-dasharray:2 2;opacity:.85}.ch-note-measured{fill:#c9a227;font-size:10px;font-family:var(--mono)}
 .ch-pt{fill:#b0b0b4;opacity:.7;stroke:#6a6a72;stroke-width:.4}.ch-pt-n{fill:#e8e8ea;opacity:.85;stroke:#2a2a2e;stroke-width:.4}.ch-white{fill:#fff;stroke:#000;stroke-width:.5}
 .ch-line{stroke:var(--accent);stroke-width:1.5}.ch-line-max{stroke:#9a9aa0;stroke-width:1}.ch-ref{stroke:#8a8a90;stroke-width:1;stroke-dasharray:4 3}
-.ch-dot{fill:var(--accent)}.ch-dot-max{fill:#9a9aa0}.ch-dot-dim{fill:#2a2a2e;stroke:#5c5c62;stroke-width:.7;opacity:.8}.ch-guide{stroke:var(--accent);stroke-width:.8;stroke-dasharray:5 4;opacity:.7}
+.ch-dot{fill:var(--accent)}.ch-dot-max{fill:#9a9aa0}.ch-dot-dim{fill:#2a2a2e;stroke:#5c5c62;stroke-width:.7;opacity:.8}.ch-carried{opacity:.25}.ch-guide{stroke:var(--accent);stroke-width:.8;stroke-dasharray:5 4;opacity:.7}
 .ch-axis0{stroke:#6a6a70;stroke-width:1}.ch-note{fill:#9a9aa0;font-size:10px;font-family:var(--mono)}
 .ch-empty{fill:#5c5c62;font-size:12px;font-family:var(--mono)}
 .ch-cie-bg{fill:#18181c;stroke:none}.ch-target-cross{stroke:#fff;stroke-width:.8;opacity:.8}
 .ch-band-green{fill:rgba(111,174,94,.10)}.ch-band-magenta{fill:rgba(192,111,192,.10)}
 .ch-dot-green{fill:#6fae5e}.ch-dot-magenta{fill:#c06fc0}
+.ch-bal-r{stroke:#d2655f;stroke-width:1.4}.ch-bal-r-dot{fill:#d2655f}.ch-bal-g{stroke:#5fae6f;stroke-width:1.4}.ch-bal-g-dot{fill:#5fae6f}
+.ch-bal-b{stroke:#5f86d2;stroke-width:1.4}.ch-bal-b-dot{fill:#5f86d2}
+.ch-bal-r-lab{fill:#d2655f;font-size:10px;font-family:var(--mono);font-weight:700}
+.ch-bal-g-lab{fill:#5fae6f;font-size:10px;font-family:var(--mono);font-weight:700}
+.ch-bal-b-lab{fill:#5f86d2;font-size:10px;font-family:var(--mono);font-weight:700}
 .ch-lab-green{fill:#6fae5e;font-size:9.5px;font-family:var(--mono);opacity:.85}.ch-lab-magenta{fill:#c06fc0;font-size:9.5px;font-family:var(--mono);opacity:.85}
 .ch-track{stroke:#58a6c9;stroke-width:1.2;opacity:.5;stroke-dasharray:2 2}.ch-track-ref{stroke:#58a6c9;stroke-width:.8;opacity:.35}
 .ch-track-dot{fill:#58a6c9;opacity:.55}.ch-track-note{fill:#58a6c9;font-size:9px;font-family:var(--mono);opacity:.7}
+.ch-norm-band{fill:rgba(111,174,94,.07);stroke:rgba(111,174,94,.28);stroke-width:.4}
+.ch-alert{fill:#c9a227;font-size:10px;font-family:var(--mono);font-weight:700}
+.ch-whisker{stroke:#5c5c62;stroke-width:1.1;opacity:.85}
+.ch-de-ok{fill:#47663f}.ch-de-warn{fill:#8a7320}.ch-de-bad{fill:#c2564b}
+text.ch-de-ok{fill:#6fae5e}text.ch-de-warn{fill:#c9a227}text.ch-de-bad{fill:#c2564b}
+.ch-zone-ok{fill:rgba(111,174,94,.06)}.ch-zone-warn{fill:rgba(201,162,39,.05)}.ch-zone-bad{fill:rgba(194,86,75,.07)}
+.ch-dot-hollow{fill:none;stroke:#c9a227;stroke-width:1}
+.ch-sw{stroke:#000;stroke-width:.5}
+.ch-off-lab{fill:#e8e8ea;font-size:11px;font-family:var(--mono)}
+.ch-off-de{font-size:13px;font-family:var(--mono);font-weight:700}
 """

@@ -13,6 +13,7 @@ let logData = [];           // {time, level, stage, event, phase, tier, data, de
 let knownStages = new Set();
 let renderQueued = false;
 let lastState = null;
+let lastStateAtMs = 0;      // Date.now() when lastState arrived — anchors the 1 Hz local ticker
 let csrfToken = null;
 
 /* ── helpers ─────────────────────────────────────────────────── */
@@ -80,6 +81,68 @@ function fmtSignedFixed(v, d) {
 function fmtY(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "—";
   return Number(v).toFixed(Math.abs(v) >= 100 ? 0 : 2);
+}
+
+/* ── honest timing ────────────────────────────────────────────────
+ * The ETA covers the CURRENT STAGE only and says so; it widens into a range when slow reads
+ * (retries, dark-patch integration) make the point estimate optimistic; during the 3D-LUT build
+ * (no patch counters) it shows the iteration instead of a fake countdown. `dt` is the local
+ * seconds since the state arrived, so the ticker can count the same claim down. */
+function etaText(s, dt) {
+  const t = s.timers || {};
+  if ((s.run_status || "idle") !== "running") return "—";
+  if (t.eta_s != null) {
+    const lo = Math.max(0, t.eta_s - dt);
+    if (t.eta_hi_s != null && t.eta_hi_s > t.eta_s * 1.15)
+      return `${fmtDur(lo)}–${fmtDur(Math.max(0, t.eta_hi_s - dt))}`;
+    return fmtDur(lo);
+  }
+  if ((s.stage || "").includes("build") && s.optimizer && s.optimizer.iteration != null)
+    return `iter ${s.optimizer.iteration}`;
+  return "—";
+}
+/* ── phase spotlight ──────────────────────────────────────────────
+ * The in-between stages get a narrative + the one chart that answers them: during warm-up the
+ * Channel Drift tile is promoted (double width) and the strip carries the SETTLING VERDICT the
+ * server fits from the drift checkpoints — "blue still climbing +0.8%/10 min" beats eyeballing
+ * a flat-ish line. Preflight gets a calm narrative line. */
+function applySpotlightUi(s) {
+  const el = $("charts-spot");
+  const holder = document.querySelector('#charts [data-chart="drift"]');
+  const driftFig = holder && holder.closest(".chart");
+  const w = s.warmup || {};
+  const st = s.run_status || "idle";
+  let text = "", cls = "";
+  if (w.active) {
+    if (w.settled === true) {
+      text = `warm-up · panel settled — drift ${Math.abs(w.slope_pct_per_10min).toFixed(2)}%/10 min over ${w.window_min} min`;
+      cls = "ok";
+    } else if (w.settled === false) {
+      const ch = { r: "red", g: "green", b: "blue" }[w.channel] || w.channel;
+      text = `warm-up · ${ch} still ${w.slope_pct_per_10min > 0 ? "climbing" : "falling"} ${fmtSignedFixed(w.slope_pct_per_10min, 2)}%/10 min — not settled`;
+      cls = "warn";
+    } else {
+      text = "warm-up · conditioning the panel…";
+    }
+  } else if (st === "running" && s.stage === "preflight") {
+    text = "preflight · checking display, meter and mode…";
+  }
+  el.hidden = !text;
+  el.textContent = text;
+  el.classList.toggle("spot-ok", cls === "ok");
+  el.classList.toggle("spot-warn", cls === "warn");
+  if (driftFig) driftFig.classList.toggle("spotlight", !!w.active);
+}
+
+// What remains AFTER the current stage, from the run's stage plan — so "ETA · stage" can never
+// be mistaken for "ETA · run".
+function afterStageText(s) {
+  const steps = ((s.pipeline || {}).steps) || [];
+  if (!steps.length) return "—";
+  const up = steps.filter((x) => x.status === "upcoming");
+  if (!up.length) return (s.run_status === "running") ? "last stage" : "—";
+  const nLong = up.filter((x) => x.long).length;
+  return `${up.length} stage${up.length === 1 ? "" : "s"}${nLong ? ` · ${nLong} long ⏲` : ""}`;
 }
 
 /* ── the run's single ΔE metric (dE_ITP for HDR, CIEDE2000 for SDR — no alternate lens) ── */
@@ -151,7 +214,10 @@ function renderLivePatch(lr, header) {
   document.querySelectorAll(".rcard-patch .lp-neutral").forEach((el) => el.classList.toggle("off", !neutral));
   if (neutral && ok) {
     $("lp-cct").textContent = lr.cct ? `${Math.round(lr.cct)} K` : "—";
-    const tint = duvTint(lr.duv);
+    // tint vs the TARGET white's own Duv (D65 sits ≈ +0.003 above the locus — a perfect D65
+    // read must NOT show a green arrow)
+    const tduv = (lastCharts && lastCharts.target_duv) || 0;
+    const tint = duvTint(lr.duv != null ? lr.duv - tduv : null);
     $("lp-duv").innerHTML = (lr.duv != null)
       ? `${num(lr.duv, 4)}${tint ? ` <span class="tint ${tint}">${tint === "green" ? "▲green" : "▼magenta"}</span>` : ""}` : "—";
     const tcct = header && header.white && header.white.cct;
@@ -188,6 +254,7 @@ async function postJson(path) {
 /* ── status bar + sidebar (from `state`) ─────────────────────── */
 function renderState(s) {
   lastState = s;
+  lastStateAtMs = Date.now();
   const h = s.header || {};
   $("f-run").textContent = h.run_id || s.run_id || "—";
   $("f-display").textContent = h.display || "—";
@@ -199,6 +266,16 @@ function renderState(s) {
   const w = h.white || {};
   const wxy = w.xy ? `${num(w.xy[0], 4)},${num(w.xy[1], 4)}` : "";
   $("f-white").textContent = w.cct ? `${Math.round(w.cct)}K${wxy ? " · " + wxy : ""}` : (wxy || "—");
+  // live measured white — the latest neutral read's CCT/Duv, so the header answers "where is
+  // the white point RIGHT NOW" without hunting through the tiles (vs the target to its left).
+  const lw = s.last_white || {};
+  if (lw.cct != null) {
+    const dK = w.cct ? ` (${lw.cct - w.cct >= 0 ? "+" : ""}${Math.round(lw.cct - w.cct)})` : "";
+    $("f-white-live").textContent = `${Math.round(lw.cct)}K${dK}`
+      + (lw.duv != null ? ` · ${fmtSignedFixed(lw.duv, 4)}` : "");
+  } else {
+    $("f-white-live").textContent = "—";
+  }
   $("f-ccmx").textContent = h.ccmx || "—";
   $("f-spd").textContent = h.spd || "—";
 
@@ -239,11 +316,27 @@ function renderState(s) {
   $("prog-reads").textContent = c.reads || 0;
   $("prog-okfail").innerHTML = `<span class="ok">${c.reads_ok || 0}</span> / <span class="${(c.reads_failed) ? "nok" : ""}">${c.reads_failed || 0}</span>`;
 
+  // live phase-bar readout — percent, patches, ETA right where the eye already is, so the
+  // header answers "how far along and how much longer" without scanning the cards below.
+  const phLive = $("ph-live");
+  if (st === "running" && c.patches_total) {
+    phLive.hidden = false;
+    $("ph-bar-fill").style.width = pct + "%";
+    $("ph-pct").textContent = Math.round(pct) + "%";
+    $("ph-patches").textContent = `${c.patches_done || 0}/${c.patches_total}`;
+    const phEta = etaText(s, 0);
+    $("ph-eta").textContent = phEta !== "—" ? "ETA " + phEta : "";
+  } else {
+    phLive.hidden = true;
+  }
+  updateTitle();
+
   // timers
   const t = s.timers || {};
   $("t-run").textContent = fmtDur(t.run_elapsed_s);
   $("t-stage").textContent = fmtDur(t.stage_elapsed_s);
-  $("t-eta").textContent = (st === "running") ? fmtDur(t.eta_s) : "—";
+  $("t-eta").textContent = etaText(s, 0);
+  $("t-after").textContent = afterStageText(s);
   $("t-sread").textContent = (t.s_per_read != null) ? num(t.s_per_read, 2) + "s" : "—";
   $("t-spatch").textContent = (t.s_per_patch != null) ? num(t.s_per_patch, 1) + "s" : "—";
   // "since progress" — the wedge tell: it keeps growing if the run is alive but stuck,
@@ -267,9 +360,24 @@ function renderState(s) {
   const lvm = (ld.metrics && ld.metrics[vm]) || {};
   $("de-live-cap").textContent = "live · " + (s.stage || s.phase || "—");
   const ing = lvm.in || {}, oog = lvm.oog || {};
+  // Content-first framing (HDR): headline the CORE zone — targets within Rec.709 at or below
+  // reference white, where ~99% of graded content lives. The in-gamut remainder becomes
+  // "limits": reachable but extreme, where a miss matters far less. SDR targets are all
+  // core by construction, so the split only appears for HDR runs.
+  const core = lvm.core, ext = lvm.ext;
+  const showCore = !!(ld.gamut_known && core && (core.n || (ext && ext.n)));
+  document.querySelectorAll(".de-core-row").forEach((el) => { el.hidden = !showCore; });
   if (ld.gamut_known) {
-    $("de-in-lab").textContent = "in-gamut";
-    setDeM("de-in-avg", vm, ing.avg); setDeM("de-in-max", vm, ing.max);
+    if (showCore) {
+      setDeM("de-core-avg", vm, core.avg); setDeM("de-core-max", vm, core.max);
+      $("de-in-lab").textContent = "limits";
+      $("de-in-lab").title = "reachable but extreme targets — wide-gamut or above reference white. Content rarely lives here; core is the verdict that matters.";
+      setDeM("de-in-avg", vm, (ext || {}).avg); setDeM("de-in-max", vm, (ext || {}).max);
+    } else {
+      $("de-in-lab").textContent = "in-gamut";
+      $("de-in-lab").title = "";
+      setDeM("de-in-avg", vm, ing.avg); setDeM("de-in-max", vm, ing.max);
+    }
     $("de-oog-lab").textContent = "out-gamut";
     $("de-oog-lab").classList.remove("pending");
     $("de-oog-avg").textContent = num(oog.avg, 2);
@@ -279,6 +387,7 @@ function renderState(s) {
   } else {
     // native gamut not measured yet → show the combined avg/max, mark the split pending
     $("de-in-lab").textContent = "all";
+    $("de-in-lab").title = "";
     setDeM("de-in-avg", vm, lvm.avg); setDeM("de-in-max", vm, lvm.max);
     $("de-oog-lab").textContent = "gamut pending";
     $("de-oog-lab").classList.add("pending");
@@ -293,6 +402,9 @@ function renderState(s) {
 
   // live patch — the last measured patch + a swatch; CCT/Duv only when it's a grayscale patch.
   renderLivePatch(s.last_read || {}, h);
+
+  // phase spotlight (warm-up settling verdict / preflight narrative + drift-tile promotion)
+  applySpotlightUi(s);
 
   // attention flags
   flag("flag-stall", s.stall, (d) => d.message || d.via || "tripped", true);
@@ -309,6 +421,45 @@ function flag(id, obj, fmt, bad) {
   span.textContent = has ? fmt(obj) : "—";
   el.classList.toggle("hot", !!has);
   el.classList.toggle("bad", !!(has && bad));
+}
+
+/* ── realtime header: browser-tab title + a 1 Hz local ticker ──────────────
+ * The server pushes state every ~2 s; between pushes the ticker advances every
+ * time-derived readout (elapsed, ETA countdown, "Xs ago", since-progress) by the
+ * local wall-clock delta since the last push — so the header reads as a live
+ * instrument, not a display that jumps every couple of seconds. Each server push
+ * re-anchors the numbers, so local-clock drift never accumulates. */
+function updateTitle() {
+  const s = lastState;
+  if (!s) { document.title = "DLC · mission control"; return; }
+  const st = s.run_status || "idle", c = s.counters || {};
+  if (st === "running") {
+    const pct = c.patches_total ? Math.round(100 * c.patches_done / c.patches_total) : null;
+    document.title = `${pct != null ? pct + "% · " : ""}${s.stage || s.phase || "running"} · DLC`;
+  } else if (st !== "idle") {
+    document.title = `${st} · DLC`;
+  } else {
+    document.title = "DLC · mission control";
+  }
+}
+
+function localTick() {
+  const s = lastState;
+  if (!s) return;
+  const dt = Math.max(0, (Date.now() - lastStateAtMs) / 1000);
+  const t = s.timers || {}, lv = s.liveness || {};
+  const running = (s.run_status || "idle") === "running";
+  if (!t.ended_iso) {   // the clocks freeze at run end (mirrors the server)
+    if (t.run_elapsed_s != null) $("t-run").textContent = fmtDur(t.run_elapsed_s + dt);
+    if (t.stage_elapsed_s != null) $("t-stage").textContent = fmtDur(t.stage_elapsed_s + dt);
+  }
+  if (running) {
+    const et = etaText(s, dt);
+    $("t-eta").textContent = et;
+    if (!$("ph-live").hidden) $("ph-eta").textContent = et !== "—" ? "ETA " + et : "";
+  }
+  if (lv.age_s != null) $("live-age").textContent = `${Math.round(lv.age_s + dt)}s ago`;
+  if (lv.progress_age_s != null) $("t-progress").textContent = fmtDur(lv.progress_age_s + dt);
 }
 
 /* ── pipeline stepper: the whole flow as done / running / upcoming, with "stage K of N" ── */
@@ -478,6 +629,7 @@ function connect() {
     stepperSig = "";
     $("charts-stage").textContent = "—";
     $("charts-build").hidden = true;
+    $("charts-cont").hidden = true;
     // blank the chart contents without destroying the <figure> tiles (renderInto fills them back)
     document.querySelectorAll('#charts [data-chart]').forEach((el) => { el.innerHTML = ""; });
     document.querySelectorAll('#charts .chart.build-preview').forEach((el) => el.classList.remove("build-preview"));
@@ -500,8 +652,8 @@ let lastCharts = null;
 let lightboxKey = null;
 let lightboxReturnFocus = null;
 // Tiles fed by the live build preview while the 3D-LUT build is running (the rest — colour
-// luminance, channel drift — keep showing the settled stage).
-const PREVIEW_TILES = ["cie", "eotf", "graycct", "grayduv", "graybalance"];
+// luminance, channel drift, convergence — keep showing the settled stage / whole run).
+const PREVIEW_TILES = ["cie", "eotf", "shadow", "dist", "graycct", "grayduv", "graybalance"];
 
 // During the build, overlay the probe-read preview onto the preview-able tiles (the settled
 // snapshot is frozen on the last real measurement stage), badged so it's never mistaken for final.
@@ -509,6 +661,17 @@ function effectiveCharts(charts) {
   const bp = charts && charts.build_preview;
   if (!bp || !bp.active) return charts;
   return Object.assign({}, charts, { cie: bp.cie, eotf: bp.eotf, grayscale: bp.grayscale });
+}
+
+// "N re-measured · M from <prev>" — how much of the current stage's charts is fresh vs still
+// carried (faded) from the previous stage. Hidden during the build preview (its badge wins).
+function applyContinuityUi(charts) {
+  const el = $("charts-cont");
+  const cont = charts && charts.continuity;
+  const bp = charts && charts.build_preview;
+  const show = !!(cont && cont.from && cont.carried > 0 && !(bp && bp.active));
+  el.hidden = !show;
+  if (show) el.textContent = `updating · ${cont.fresh} re-measured · ${cont.carried} from ${cont.from}`;
 }
 
 function applyBuildPreviewUi(charts) {
@@ -549,6 +712,7 @@ async function refreshCharts() {
     lastCharts = await r.json();
     const header = lastState ? lastState.header : null;
     applyBuildPreviewUi(lastCharts);
+    applyContinuityUi(lastCharts);
     const render = effectiveCharts(lastCharts);
     if (window.DLCCharts) {
       DLCCharts.renderInto($("charts"), render, header);
@@ -805,6 +969,7 @@ wireChartHover($("lb-body"));    // …and on the expanded lightbox tile
 connect();
 refreshCharts();
 setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency
+setInterval(localTick, 1000);       // realtime header: tick timers/ages between state pushes
 // Returning to a backgrounded tab: refresh immediately rather than waiting up to 4 s (and this
 // is what fills the charts if the dashboard was first opened while hidden).
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCharts(); });
