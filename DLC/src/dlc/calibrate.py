@@ -549,32 +549,15 @@ class Calibration:
         "verify": ("Verify + report", False),
     }
 
-    # The ordered stage key sequence each flow walks (mirrors the ``_flow_*`` methods). Stages that
-    # aren't announced on the spine as a phase (e.g. the 3dlut-only require-stack / inplace-baseline
-    # helpers) are intentionally omitted — the stepper tracks what the dashboard can actually see.
     def _planned_stages(self) -> list[dict[str, Any]]:
         """The chosen flow's ordered pipeline (key + friendly label + long-stage hint) for the
-        dashboard stepper. Empty until the flow is resolved. The HDR/SDR refine fork mirrors the
+        dashboard stepper, from the declarative ``_FLOW_STAGE_SEQUENCES`` table (defined next
+        to ``FLOWS``). Empty until the flow is resolved. The HDR/SDR refine fork mirrors the
         ``_flow_*`` methods (``self.mode``; normalize_mode pins it to SDR/HDR)."""
         flow = self.calib.get("flow")
         refine = "refine-mhc-cube" if self.mode == "HDR" else "refine-mhc-grayscale"
-        seqs = {
-            "full": ["preflight", "resolve-target", "whitepoint", "enter-neutral",
-                     "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
-                     refine, "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
-                     "measure:verify", "verify"],
-            "mhc-only": ["preflight", "resolve-target", "whitepoint", "enter-neutral",
-                         "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
-                         refine, "measure:verify", "verify"],
-            "3dlut-only": ["preflight", "resolve-target", "whitepoint", "hardware-readiness",
-                           "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
-                           "measure:verify", "verify"],
-            "grayscale-wb": ["preflight", "resolve-target", "whitepoint", "hardware-readiness",
-                             "grayscale-wb", "measure:verify", "verify"],
-            "build-correction": ["preflight", "clear-native", "probe-match"],
-            "characterize": ["preflight", "clear-native", "hardware-readiness", "characterize"],
-        }
-        keys = seqs.get(flow or "", [])
+        keys = [refine if k == _REFINE_FORK else k
+                for k in _FLOW_STAGE_SEQUENCES.get(flow or "", ())]
         # adaptive-planning only announces itself when the opt-in seam is ON (stage_adaptive_planning
         # returns before set_phase otherwise) — don't show the stepper a stage the run never enters.
         if not self.adaptive_planning:
@@ -4569,6 +4552,33 @@ class Calibration:
             if decision.choice != "proceed_anyway":
                 raise CalibrationAborted(StageOutcome("require-stack", "aborted", digest=digest))
 
+
+# The ordered stage keys each flow walks/announces on the spine — the DECLARATIVE mirror of
+# the imperative ``_flow_*`` methods, consumed by ``Calibration._planned_stages`` (the
+# dashboard stepper). Pinned equal to the phases each flow actually announces, per flow and
+# both modes, by ``test_planned_stages_match_announced_phases_per_flow`` — edit a ``_flow_*``
+# method and this table together or that pin trips. ``_REFINE_FORK`` marks the one mode fork
+# (HDR refines the MHC base 1D cube, SDR the correctionGrayscale layer). Stages that never
+# announce a phase (require-stack, inplace-baseline) are deliberately absent — the stepper
+# tracks what the dashboard can see; opt-in stages (adaptive-planning, hardware-readiness)
+# are listed here and filtered out by ``_planned_stages`` when their gate is off.
+_REFINE_FORK = "{refine}"
+_FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "full": ("preflight", "resolve-target", "whitepoint", "enter-neutral",
+             "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
+             _REFINE_FORK, "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
+             "measure:verify", "verify"),
+    "mhc-only": ("preflight", "resolve-target", "whitepoint", "enter-neutral",
+                 "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
+                 _REFINE_FORK, "measure:verify", "verify"),
+    "3dlut-only": ("preflight", "resolve-target", "whitepoint", "hardware-readiness",
+                   "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
+                   "measure:verify", "verify"),
+    "grayscale-wb": ("preflight", "resolve-target", "whitepoint", "hardware-readiness",
+                     "grayscale-wb", "measure:verify", "verify"),
+    "build-correction": ("preflight", "clear-native", "probe-match"),
+    "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
+}
 
 # Flow registry (the named flows the front door maps an intent onto). HDR is a run
 # MODE (--mode HDR), orthogonal to the flow — the "hdr" entry is a signpost stub.
