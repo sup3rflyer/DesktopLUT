@@ -8,7 +8,7 @@ fixable, and leave a written trail. Nothing is one-shotted.
 - **Written:** 2026-07-05, against commit `b9c930d` on `claude/focused-hopper-adlmjd`.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
-  brief. When a phase completes, check it off in §8 and commit the phase report.
+  brief. When a phase completes, check it off in §9 and commit the phase report.
 - **This is a living document.** Phases may add leads to later phases and rows to
   the parity ledger (§4). Update it in the same commit as the phase report.
 
@@ -777,7 +777,52 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-1 | Baseline re-run of `full` SDR + HDR mhc-only/3dlut on audited code; compare verify scores to 0.41 ΔE2000 / 3.26 dE_ITP baselines | Phase 12 |
 | — | *(phases append here)* | |
 
-## 8. Phase checklist
+## 8. v3 horizon — packaging & interface (parked)
+
+**Status: parked, deliberately.** v2 — this audit, and confidence in what's been
+built — is the focus for the foreseeable future. No marketing considerations
+apply at this stage. This section exists for one reason: Phases 6, 8, and 10
+should be run knowing what they eventually feed, so nothing gets designed twice.
+
+**The core insight v3 builds on:** the seam layer is adjudicator-agnostic.
+`AdjudicationRequest` is a form (key / question / options / recommendation /
+digest), not a prompt — anything can fill it in. That yields three autonomy tiers
+without new architecture:
+
+1. **Attended** — seams pause; the human decides in the dashboard. The seam UI is
+   presentation work: render the request, wire decide buttons to the existing
+   `--decide`/control-file plumbing. No LLM dependency.
+2. **Policy** — explicit, user-visible auto-decide rules for benign seams,
+   escalate the rest. This *resolves Task #1 by promotion*: the
+   SupervisedAdjudicator's divergence becomes a configurable feature instead of a
+   known deviation from the design law.
+3. **Unattended (LLM)** — the night-shift operator, bring-your-own-key, driven
+   through the skill. The differentiator, never the requirement.
+
+**Delivery-path tiering (C++ side, recorded here for context):** DesktopLUT has
+two fully-owned shader routes plus the scanout layer — MHC ICC (official Windows
+API), the Desktop Duplication **overlay** shader (100% ours, no injection), and
+the **DWM hook** (injected into dwm.exe; exists to serve games and a wider
+hardware range — overlay-free, no tearline). For the professional/colorist
+audience, MHC + the overlay shader path is arguably the better story precisely
+because it is fully controlled and injection-free; the hook remains the
+gamer/reach option with its own signing/AV implications. Any future packaging
+leads with the controlled paths and makes the hook opt-in.
+
+**Workstreams, when the time comes:** the seam UI; the policy config surface; a
+first-run wizard (the productization of the `calibration_profile.yaml`
+skill⊥user-data boundary — meter onboarding via probe-match, monitor mapping,
+target selection); packaging mechanics (installer, updates — and the licence
+sorting this implies: Argyll redistribution, pywinpty, dogegen); public docs
+distilled from the local-only design notes.
+
+**Audit tie-ins (do these with the v3 hat on, change nothing else):** Phase 6's
+practically-weighted score is the number a future interface shows; Phase 8's
+digest envelope is the seam UI's data contract; Phase 10's dashboard is the
+interface skeleton. Rule: nothing in this section justifies a shortcut in a v2
+phase — v3 inherits whatever confidence v2 earns, and only that.
+
+## 9. Phase checklist
 
 - [ ] Phase 0 — Baseline, harness, determinism
 - [ ] Phase 1 — Colour-math foundations & duplication
