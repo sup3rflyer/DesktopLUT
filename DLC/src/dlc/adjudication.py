@@ -129,7 +129,21 @@ class Decision:
 class AdjudicationRequest:
     """What the core hands the LLM at a seam — a digest, a question, the allowed
     choices, and the core's own recommendation (so :class:`AutoAdjudicator` can
-    rubber-stamp it and a human/LLM has a sensible default)."""
+    rubber-stamp it and a human/LLM has a sensible default).
+
+    **The digest envelope contract** (fable Phase 8; pinned by
+    ``test_every_seam_request_on_clean_runs_is_envelope_coherent``): a request must be
+    decidable from this form ALONE — no repo access, no raw stream. Concretely:
+    ``question`` states the situation AND the consequence of each option; ``options``
+    is the complete honest vocabulary (never offer a choice no code path honours);
+    ``recommendation`` ∈ ``options``; ``key`` is stage-scoped and stable across resume;
+    ``digest`` is JSON-serializable evidence — numbers WITH their reference points
+    (observed vs expected/tolerance; before vs after; core vs frontier zone context),
+    severity flags (``_SEVERITY_FLAGS``) where an unattended run must escalate. Seams
+    needing more than one-of-N return a structured payload: declare a schema in the
+    digest + a conservative ``recommended_payload``, and VALIDATE the answer against
+    bounds before applying (the :mod:`dlc.patch_evidence` pattern — ``DECISION_SCHEMA``
+    + ``KNOB_BOUNDS`` + ``validate_decision`` — is the template)."""
 
     key: str                       # stable, unique per occurrence (stage-scoped)
     seam: str                      # the seam type (SEAM_*)
