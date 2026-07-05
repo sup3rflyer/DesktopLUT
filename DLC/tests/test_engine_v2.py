@@ -145,7 +145,9 @@ def test_target_anchor_patches_bracket_the_reachable_boundary():
 
 
 def test_gamut_aware_volumetric_drops_oog_keeps_interior_and_scales_with_gamut():
-    from dlc.calibrate import PatchSizes, build_volumetric_set, _volumetric_bulk, _project_and_thin
+    # _volumetric_bulk/_project_and_thin are patch_sets internals (moved there in fable
+    # Phase 7b); the public names stay importable from dlc.calibrate via the re-export shim.
+    from dlc.patch_sets import PatchSizes, build_volumetric_set, _volumetric_bulk, _project_and_thin
     from dlc.gamut import point_in_triangle
     nt = [_NARROW["R"], _NARROW["G"], _NARROW["B"]]
     tr = P.Transfer.pq(bit_depth=10)

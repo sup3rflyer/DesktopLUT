@@ -152,6 +152,22 @@ request, adjudicates ambiguous results on digests, and writes the report.
   failure instead of a silent chart-vs-score disagreement. Per-patch metric JSON
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
+### Changed
+- **Fable audit Phase 7b — the orchestrator spine, structure**
+  (`docs/audits/fable/phase-7b.md`): zero-behaviour-change decomposition of
+  `calibrate.py` (6,095 → 5,474 lines). The LLM seam layer — seam ids, the
+  `Decision`/`AdjudicationRequest` forms, the three adjudicators, and the adjudication
+  DESIGN LAW — extracted verbatim to `dlc/adjudication.py`; `PatchSizes` + the
+  patch-set builders (`build_ramp_set` … `build_verify_set`, `flow_patch_counts`) to
+  `dlc/patch_sets.py`; the dashboard stepper's per-flow stage sequences are now a
+  declarative module table (`_FLOW_STAGE_SEQUENCES`) next to `FLOWS`. `dlc.calibrate`
+  re-exports every moved name, so all existing imports keep working;
+  `patch_evidence`'s lazy import cycle through the orchestrator is gone. The remaining
+  decomposition is specified as a ranked RFC (phase-7b.md §3: `main()` → `cli.py`
+  blocked on test pinning; check-in assembly + preflight tells move with Phase 8; the
+  three closed-loop refine stages deliberately stay; a single `FlowDef` registry pairs
+  with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
+
 ### Fixed
 - **Fable audit Phase 7a — the orchestrator spine, correctness**
   (`docs/audits/fable/phase-7a.md`): a mis-configured profile (SDR slot → PQ target or
