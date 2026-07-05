@@ -1203,6 +1203,12 @@ class Calibration:
         # the literal post-warmup probe is only needed once RAW generation is gamut-aware too.)
         # Conversion + degenerate guard shared with the stage tools (metrics.py), so a
         # stage-CLI score clamps against exactly the same measured gamut this run does (P1).
+        # DELIBERATE behaviour change vs the pre-Phase-6 code (verification pass, B5): a
+        # DEGENERATE-but-complete mhc_params.primaries (corrupt fresh raw measurement) now
+        # falls through to the prior DIP's sane gamut instead of disabling the clamp
+        # entirely — a real previous measurement beats clamping against nothing. The stage
+        # tools have no DIP access, so they skip the clamp in that corner (surfaced as
+        # gamut_aware:false); the corner requires a corrupt build record to reach at all.
         prim = metrics_mod.reachable_primaries_from_mhc_params(self._state.get("mhc_params"))
         if prim is None:
             dip = self._dip()

@@ -644,6 +644,14 @@ core so the auditor knows what every stage should do.
   in the BLE001 sweep make it log its traceback. Also: `stage_verify` now persists
   `verification_iter00_*` report artifacts inside the stage — the resume matrix should
   cover a memo-replay over pre-existing files (write is idempotent-overwrite).
+- *(Phase 6 verification pass)* two more for 7a: (a) intermediate `_score_stage` runs
+  OUTSIDE the memoised `_stage`, so a resume re-emits its `metrics_scored` events
+  (raw/post-mhc; events-only, no artifact duplication) — decide dedupe-or-document with
+  the resume matrix; (b) `check-cube`'s `monotonicity_violations_allowed=0` is now the
+  *actually-tight* integrity arm (empirical: realistic cubes can carry a handful of
+  near-black non-monotonic steps while legit neighbour deltas sit at ~half the derived
+  allowance) — verify against real cubes and derive a principled allowance if the zero
+  default false-fails.
 - *(Phase 2)* bit-depth fallback divergence: `main()` defaults 10-bit HDR / 8-bit SDR
   while the `Calibration` ctor's fallback is `display.panel.bit_depth` (= the panel's
   depth, 10) — a direct API caller on SDR gets 10 where the CLI gets 8. Latent (main

@@ -167,7 +167,59 @@ live-vs-stage numbers now agree for the right reason.
   tests, 1 extended), `tests/test_engine.py` (write_metrics test reworked to the new
   signature + canonical-event assertions).
 
-## 7. Leads filed to later phases
+## 7. Adversarial verification pass (post-commit, same session)
+
+Because this phase ran long and touched more surfaces than usual, three independent
+review agents (opus) were run against commit `ae5e423` with instructions to REFUTE
+the riskiest clusters. Outcome: **one real regression found and fixed** (`a2edb53`),
+one deliberate-behaviour-change documented, everything else confirmed.
+
+- **Scoring math (practical_summary / clamp mask / dashboard classifier): confirmed
+  correct.** The dashboard classifier refactor is behaviour-identical over 200k
+  randomized inputs + hand-picked boundaries; the `gamut_clamped` 1e-3-nit tolerance
+  has no false positives (in-gamut rows return bit-identical, gap exactly 0) and no
+  meaningful false negatives (smallest constructible real clamp gap ≈ 0.5 nit); the
+  SDR production path is bit-identical to pre-commit. Framing nuances, recorded
+  honestly: the practical `<1` band collapses phase-2's finer `<0.1`/`0.1-1` bands
+  and buckets by target XYZ-Y rather than phase-2's Rec.709-weighted signal-nits
+  (same intent, not literally the same quantity); signal-space saturation is a loose
+  proxy for perceptual chroma under PQ (consistent with phase-2 by design); an
+  above-panel-peak neutral target would be flagged `clamped` by the safety
+  luminance clip (unreachable — the patch sets are peak-capped by construction).
+- **P4 rewiring: one REAL regression (fixed, `a2edb53`).** `write_metrics`'
+  `allow_nan=False` serializes `target_luminance` = the resolved HDR peak, and
+  `choose_peak_nits` normalized non-positive but not non-finite inputs — a corrupt
+  DIP `sustained_peak_nits=inf` with no native ceiling crashed the terminal verify
+  stage uncaught (no `run_done`, spine stuck "running"). Root-cause fix: non-finite
+  peak inputs are now invalid-and-ignored exactly like non-positive ones (both
+  normalization sites), with an end-to-end strict-JSON regression test. Confirmed
+  otherwise: `write_metrics` is memoisation-safe on resume (1 manifest entry, with a
+  narrow harmless crash-window shared by pre-existing stages); events emit exactly
+  once on live and stage paths; old events.jsonl replays and the dashboard JS are
+  compatible; zero consumers of the old score-artifact names repo-wide; SDR is
+  immune (luminance is inferred/guarded finite). Pre-existing, NOT this phase:
+  intermediate `_score_stage` re-emits `metrics_scored` on resume (raw/post-mhc) —
+  events-only, no artifact duplication.
+- **Cube gate + calibrate.py re-application drift: gate concern REFUTED.** Empirical
+  stress (production `build_cube`, tube-trained auto-smoothed models, channel gains
+  to 0.72, full caps): worst legitimate `max_neighbor_delta` ≈ 0.30 at 33³ / 0.35 at
+  17³ — about half the derived allowance (0.5625 / 0.625); the neutral-band fade is
+  confirmed as the dominant local-gradient source. Deltas above the allowance
+  (0.73–0.77) were only reachable with pathological non-smooth fields that already
+  fail the monotonicity gate independently. Thin-margin caveat: a very warm HDR
+  panel at 33³ reached 0.53 vs 0.5625 (~0.03 slack; the theoretical opposite-sign
+  bound is 2·cap + pitch) — the `--max-neighbor-delta` override exists if a real
+  panel ever brushes it. Re-application drift: all hunks verified coherent; ONE
+  genuine non-equivalence found in `_reachable_primaries` — a degenerate-but-complete
+  `mhc_params.primaries` now falls through to the DIP gamut where the old code
+  disabled the clamp; kept as the better behaviour and documented at the code site
+  (a real prior measurement beats clamping against nothing; stage tools surface the
+  same corner as `gamut_aware:false`). Incidental find, filed to Phase 7a: the
+  `monotonicity_violations_allowed=0` arm is now the *actually-tight* integrity gate
+  — realistic cubes can show a handful of near-black non-monotonic steps, so
+  `integrity["ok"]` is more likely gated by monotonicity than by neighbour delta.
+
+## 8. Leads filed to later phases
 
 - **Phase 7a:** the `_score_stage` broad-except swallow hid a real NameError during
   this phase (F6-13) — when classifying the ~60 BLE001 sites, this one should log
