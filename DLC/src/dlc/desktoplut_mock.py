@@ -232,9 +232,18 @@ class MockDesktopLutServer:
             }
         elif method == "mhc.grayscale_live_begin":
             # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
-            # stacks on top of MHC+3D-LUT and is measurable. No bake yet.
+            # stacks on top of MHC+3D-LUT and is measurable. No bake yet. Mirrors the C++
+            # DoGrayscaleLiveBegin contract (fable Phase 7a): the PRE-BEGIN correctionGrayscale
+            # is snapshotted (savedCorrectionGs) so cancel can restore the user's prior
+            # correction, and the live-session marker gates set_live/commit/cancel semantics.
             state["gs_preview_active"] = True
+            state["gs_live_active"] = True
+            state["gs_live_saved"] = deepcopy(state.get("correction_grayscale"))
         elif method == "mhc.grayscale_set_live":
+            # C++ DoGrayscaleSetLive errors without an active begin.
+            if not state.get("gs_live_active"):
+                return DesktopLutResponse(
+                    ok=False, error="no active grayscale live preview (call mhc.grayscale_live_begin first)")
             gs = params.get("grayscale", {})
             state["correction_grayscale"] = {
                 "point_count": gs.get("point_count"),
@@ -244,12 +253,24 @@ class MockDesktopLutServer:
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.
+            # C++ DoGrayscaleCommit pops the GsLiveState (savedCorrectionGs is GONE — a later
+            # cancel is a tolerated NO-OP) and tolerates a commit with no live session.
             state["gs_preview_active"] = False
-            state["gs_committed"] = True
-            state["applied"] = True
+            if state.pop("gs_live_active", False):
+                state.pop("gs_live_saved", None)
+                state["gs_committed"] = True
+                state["applied"] = True
         elif method == "mhc.grayscale_cancel":
+            # C++ DoGrayscaleCancel: restore the PRE-BEGIN correctionGrayscale (the user's
+            # prior correction, not bare identity) and tear down the preview; a cancel with
+            # no live session (incl. after a commit) is a tolerated no-op.
             state["gs_preview_active"] = False
-            state.pop("correction_grayscale", None)
+            if state.pop("gs_live_active", False):
+                saved = state.pop("gs_live_saved", None)
+                if saved is not None:
+                    state["correction_grayscale"] = saved
+                else:
+                    state.pop("correction_grayscale", None)
         elif method == "mhc.apply":
             state["applied"] = True
         elif method == "mhc.remove":

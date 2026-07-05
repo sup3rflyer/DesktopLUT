@@ -173,7 +173,15 @@ request, adjudicates ambiguous results on digests, and writes the report.
   run record. check-cube's zero monotonicity allowance was verified empirically
   (realistic optimizer cubes carry zero violations; new `tests/test_lut_integrity.py`
   pins it). 46 broad-except sites classified (5 fixed, 26 already surfaced, 15
-  accepted with rationale).
+  accepted with rationale). Owner-review addendum (same session): the grayscale-wb
+  touch-up now bakes AFTER the verify gate — the C++ contract (verified at the
+  source) erases its saved pre-begin correction on commit, so the old
+  commit-before-verify made a `revert` at the gate a silent no-op; verify now
+  measures the live preview and revert restores the user's PRE-EXISTING grayscale
+  correction (mock fidelity raised to the verified contract). And a dead DesktopLUT
+  pipe now fails EARLY at preflight (an adjudicated seam recommending abort, before
+  anything is measured or mutated; `build-correction` stays pipe-optional) instead
+  of dying one stage later after recording a garbage "backup".
 - **Fable audit Phase 5 — the correction machine & 3D-LUT engine**
   (`docs/audits/fable/phase-5.md`): the **gamut-aware (#C3) correction was internally
   inconsistent** — the error model trained its delta against the reachable-CLAMPED ideal

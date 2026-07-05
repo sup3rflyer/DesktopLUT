@@ -6,7 +6,9 @@
   `keep_awake.py` (102). 7a = correctness (state machine, resume, seams-as-plumbing,
   teardown); decomposition/structure is 7b.
 - **Baseline (pre-phase, this container):** `890 collected: 887 passed, 3 skipped`.
-- **Post-phase:** `906 collected: 903 passed, 3 skipped` (+16 tests, all green).
+- **Post-phase:** `905 collected: 902 passed, 3 skipped` (+15 tests, all green).
+- **Post-addendum (owner review, same session — §7):** `910 collected: 907 passed,
+  3 skipped` (+5 more).
 
 ## 1. Findings and fixes
 
@@ -124,18 +126,49 @@ None new. The teardown truth table's crashed/stall live rows fold into HW-1's ne
 box run (watch: dogegen daemon actually quits on a terminal abort; `rollback_failed`
 JSON appears if the pipe is down at teardown).
 
-## 7. Needs owner input
+## 7. Needs owner input — RESOLVED (same session, owner reviewed)
 
-- **grayscale-wb revert-after-commit (filed to Phase 9):** `stage_grayscale_wb_touchup`
-  bakes the touch-up (`grayscale_commit`) on the accept path BEFORE `measure:verify` +
-  the `verify:accept` gate; a later `revert` calls `grayscale_cancel` — whether cancel
-  restores a *committed* ICM is a C++ contract question this container cannot answer
-  (`_revert_inplace`'s comment assumes "nothing was baked unless commit ran", and here
-  commit ran). Phase 9's IPC conformance pass should confirm or move the commit after
-  the verify gate.
-- **Down-pipe preflight (noted at F7a-7):** should a dead pipe at preflight abort
-  before enter-neutral instead of "capturing" a `{"error": …}` JSON as the backup?
-  Today it fails loudly one stage later; cheap to gate earlier if the owner prefers.
+Both §7 questions were answered by the owner and landed as a same-session addendum
+(F7a-17/-18 below); nothing remains open from this phase.
+
+### F7a-17 — grayscale-wb: bake moved AFTER the verify gate (C++-verified)
+
+The C++ side answered the contract question directly (`desktoplut_ipc_server.cpp`):
+`DoGrayscaleLiveBegin` snapshots the **pre-begin** `correctionGrayscale`
+(`st.savedCorrectionGs`) and `DoGrayscaleCancel` → `FinishGsLive(bake=false)`
+**restores the user's pre-existing correction** and regenerates the ICM — exactly the
+behaviour the owner wanted. But `DoGrayscaleCommit` POPS the `GsLiveState` (the saved
+correction is gone; a later cancel is a documented tolerated **no-op**) — so DLC's
+commit-before-verify made `verify:accept = revert` silently unable to undo the
+touch-up. **Fixed (DLC side):** `stage_grayscale_wb_touchup` no longer commits; the
+preview stays LIVE through `measure:verify` (the meter sees the stack a bake would
+produce — bit-identical for SDR per the realization-A preview design), and `_finish`
+commits on apply / `_revert_inplace` cancels on revert (which now always has the live
+session, and restores the pre-existing correction, not bare identity). A commit on a
+resumed already-completed run is a C++-tolerated no-op. Crash safety: the C++
+`CleanupActiveGsLive` (run by `calibration.exit`, which the CLI's rollback finally
+issues) reverts an orphaned preview. **Mock fidelity raised to match the verified C++
+contract** (begin saves the pre-begin table; cancel restores it; cancel-after-commit
+and commit-without-begin are no-ops; set_live without begin errors) so the pins test
+the real semantics, not the old divergent mock. Tests:
+`test_grayscale_wb_commit_happens_after_the_verify_gate`,
+`test_grayscale_wb_revert_restores_the_pre_existing_correction`.
+
+### F7a-18 — dead pipe fails early at preflight (owner-approved)
+
+New `SEAM_PIPE` (`preflight:pipe`, options abort/proceed, recommendation **abort**):
+every flow except `build-correction` needs the pipe for something load-bearing
+(enter-neutral / install / require-stack / clear-native-before-DIP), and without it
+the run previously died one stage later with a raw exception AND recorded a garbage
+`{"error": …}` JSON as a "captured" backup. Now: preflight surfaces `pipe_ok`/
+`pipe_error`, the backup capture is honest on a dead pipe (`captured: false`, "no
+DesktopLUT state to back up"), the pipe seam fires before anything is measured or
+mutated (a judge can still proceed — e.g. a pipe mid-restart), and the backup seam is
+gated on `pipe_ok` so one cause never pauses the run twice. `build-correction` is
+exempt by design (deliberately pipe-optional — the operator can hold the panel at
+native). Tests: `test_preflight_pipe_down_aborts_before_anything_happens`,
+`test_preflight_pipe_down_proceed_override_is_honoured`,
+`test_build_correction_is_exempt_from_the_pipe_gate`.
 
 ## 8. Files changed
 
@@ -150,6 +183,9 @@ JSON appears if the pipe is down at teardown).
 - `tests/test_liveness.py`, `tests/test_runs.py` — 1 pin each.
 - `tests/test_lut_integrity.py` — NEW (4 tests; first dedicated coverage for the module).
 - `docs/fable-audit-roadmap.md` — §9 checkbox, ledger rows, Phase 7b/8/9/10/11 leads.
+- *(addendum)* `src/dlc/calibrate.py` — F7a-17 (commit after gate) + F7a-18 (pipe seam,
+  honest backup); `src/dlc/desktoplut_mock.py` — live-editor semantics matched to the
+  verified C++ contract; `tests/test_calibrate.py` — 5 addendum pins.
 
 ## 9. Leads filed to later phases
 
@@ -162,8 +198,12 @@ JSON appears if the pipe is down at teardown).
   **in arrival order** — the digest-sufficiency review should confirm worst-first
   would not read better; `_hue_sat_caps`' silent fallback (uncapped verify ramp) is
   invisible in any digest — consider a `caps_unavailable` tell.
-- **Phase 9:** grayscale-wb revert-after-commit (see §7); `controller.call` swallowed
-  ok/error distinction interacts with several best-effort paths catalogued in §3.
+- **Phase 9:** ~~grayscale-wb revert-after-commit~~ RESOLVED in-session (F7a-17 —
+  C++-verified, mock fidelity raised to the verified contract; Phase 9's conformance
+  pass should keep the new mock semantics pinned against the C++ handlers).
+  `controller.call`'s swallowed ok/error distinction interacts with several
+  best-effort paths catalogued in §3 (e.g. a `grayscale_set_live` without a begin
+  errors on the wire but reads as `{}` through the controller).
 - **Phase 10:** `runs.py` emits raw `"run_created"` (not in `Ev`) — reconcile with the
   JS vocabulary sweep; duplicate `metrics_scored` suppression (F7a-5) means the
   dashboard no longer needs latest-wins dedupe for resumed runs (verify assumption).

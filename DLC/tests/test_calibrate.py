@@ -2919,3 +2919,109 @@ def test_dlc_state_carries_a_schema_version(tmp_path: Path):
     assert resumed.run("mhc-only").status == "completed"
     assert json.loads(state_path.read_text(encoding="utf-8")
                       ).get("dlc_state_version") == DLC_STATE_VERSION
+
+
+# ---------------------------------------------------------------------------
+# fable Phase 7a addendum (owner review): grayscale-wb bake AFTER the verify
+# gate (C++-verified: commit erases savedCorrectionGs → cancel-after-commit is
+# a no-op) · dead-pipe early fail at preflight (build-correction exempt)
+# ---------------------------------------------------------------------------
+
+def _gswb_controller():
+    ctrl = CalibrationController.mock()
+    ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
+                                  "bx": 0.15, "by": 0.06})
+    ctrl.apply_mhc(0, "SDR")
+    return ctrl
+
+
+def test_grayscale_wb_commit_happens_after_the_verify_gate(tmp_path: Path):
+    # The bake must wait for verify:accept — committing earlier erases the C++ side's saved
+    # pre-begin correctionGrayscale, making a later revert a silent no-op. The verify measure
+    # therefore sees the LIVE preview (the same light the bake produces).
+    ctrl = _gswb_controller()
+    calib = _make(tmp_path, "gswb_commit_late", controller=ctrl)
+    seen: dict = {}
+    orig_commit = ctrl.grayscale_commit
+
+    def commit(mon, mode):
+        seen["verify_done_at_commit"] = (
+            (calib.calib["stages"].get("verify") or {}).get("status") == "done")
+        seen["preview_live_at_commit"] = ctrl.state()["mhc"]["0:SDR"].get("gs_preview_active")
+        return orig_commit(mon, mode)
+
+    ctrl.grayscale_commit = commit
+    result = calib.run("grayscale-wb")
+    assert result.status == "completed"
+    assert seen == {"verify_done_at_commit": True, "preview_live_at_commit": True}
+    mhc = ctrl.state()["mhc"]["0:SDR"]
+    assert mhc.get("gs_committed") is True and mhc.get("gs_preview_active") is False
+
+
+def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path):
+    # verify:accept = revert → grayscale_cancel, which (per the C++ contract, now mirrored
+    # by the mock) restores the USER'S pre-begin correctionGrayscale — not bare identity,
+    # and nothing was ever baked because the commit waits for the gate.
+    ctrl = _gswb_controller()
+    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
+                                  gamma=2.2)
+    # The controller's SDR bridge resamples on the way in — the pre-existing correction, as
+    # DesktopLUT actually STORES it, is what cancel must bring back:
+    prior_stored = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert prior_stored["deviations"]["r"] != [1.0] * len(prior_stored["points"])  # non-identity
+    calib = _make(tmp_path, "gswb_revert", controller=ctrl,
+                  decision_overrides={"verify:accept": Decision("revert")})
+    result = calib.run("grayscale-wb")
+    assert result.status == "reverted"
+    mhc = ctrl.state()["mhc"]["0:SDR"]
+    assert not mhc.get("gs_committed")                       # never baked
+    assert mhc.get("gs_preview_active") is False             # preview torn down
+    assert mhc.get("correction_grayscale") == prior_stored   # pre-existing correction is back
+
+
+def test_preflight_pipe_down_aborts_before_anything_happens(tmp_path: Path, monkeypatch):
+    # Owner-approved early fail: a dead pipe means no enter-neutral, no install, no rollback,
+    # AND no usable backup — abort at preflight (recommendation), where nothing is mutated.
+    ctrl = CalibrationController.mock()
+
+    def dead_state():
+        raise ConnectionError("pipe not armed")
+
+    monkeypatch.setattr(ctrl, "state", dead_state)
+    calib = _make(tmp_path, "pipe_down", controller=ctrl)
+    result = calib.run("full")
+    assert result.status == "aborted"
+    assert result.digest["aborted_at"] == "preflight"
+    assert "pipe" in result.digest["message"].lower()
+    assert "enter-neutral" not in result.stages
+    # the backup record is honest: no garbage {"error": ...} JSON recorded as captured
+    # (read calib["backup"] — the seam abort overwrites the preflight STAGE record)
+    backup = calib.calib.get("backup") or {}
+    assert backup.get("captured") is False
+    assert "no DesktopLUT state" in (backup.get("error") or "")
+    # one cause, one pause: the backup seam did not ALSO fire
+    assert "preflight:backup" not in calib.calib["decisions"]
+
+
+def test_preflight_pipe_down_proceed_override_is_honoured(tmp_path: Path, monkeypatch):
+    # A judge who knows the pipe is momentarily down can still proceed explicitly.
+    ctrl = CalibrationController.mock()
+    monkeypatch.setattr(ctrl, "state", lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    calib = _make(tmp_path, "pipe_down_proceed", controller=ctrl,
+                  decision_overrides={"preflight:pipe": Decision("proceed")})
+    outcome = calib.stage_preflight()
+    assert outcome.status == "done"
+    assert calib.calib["decisions"]["preflight:pipe"]["choice"] == "proceed"
+
+
+def test_build_correction_is_exempt_from_the_pipe_gate(tmp_path: Path, monkeypatch):
+    # build-correction is deliberately pipe-optional (clear-native is best-effort; the
+    # operator can hold the panel at native) — a dead pipe must not gate it.
+    ctrl = CalibrationController.mock()
+    monkeypatch.setattr(ctrl, "state", lambda: (_ for _ in ()).throw(ConnectionError("down")))
+    calib = _make(tmp_path, "bc_pipe_down", controller=ctrl,
+                  decision_overrides={"probe-match:build": Decision("skip")})
+    result = calib.run("build-correction")
+    assert result.status == "completed"
+    assert "preflight:pipe" not in calib.calib["decisions"]

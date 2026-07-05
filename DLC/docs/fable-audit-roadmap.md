@@ -70,7 +70,12 @@ fixable, and leave a written trail. Nothing is one-shotted.
   silent-rollback-failure fixed; check-cube zero-monotonicity-allowance VERIFIED
   correct empirically (Phase 6 aside downgraded; `test_lut_integrity.py` is new).
   BLE001 sweep classified (46 sites: 5 fixed, 26 surfaced, 15 accepted-with-rationale).
-  Leads to 7b/8/9/10/11; grayscale-wb revert-after-commit → Phase 9 (owner input §7).
+  Leads to 7b/8/10/11. Same-session owner review resolved both §7 questions:
+  grayscale-wb now bakes AFTER the verify gate (C++-verified: commit erases the saved
+  pre-begin correction, so cancel-after-commit was a no-op; revert now restores the
+  user's pre-existing grayscale) with mock fidelity raised to the verified contract,
+  and a dead pipe fails EARLY at preflight (SEAM_PIPE, recommend abort;
+  build-correction exempt; backup capture honest on a dead pipe).
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -791,12 +796,15 @@ review; decision validation landed.
 - `_bridge_grayscale:195` SDR sqrt-distributed points vs HDR pass-through — verify
   against DesktopLUT's MHC2 convention (cross-check with `shared/dwm_hook_config.h`
   and the recent bit-faithful-preview commits on the C++ side).
-- *(Phase 7a)* **grayscale-wb revert-after-commit:** `stage_grayscale_wb_touchup` bakes
-  the touch-up (`grayscale_commit`) on the accept path BEFORE `measure:verify` + the
-  `verify:accept` gate; a later `revert` calls `grayscale_cancel` — whether cancel
-  restores a *committed* ICM is a C++ contract question (`_revert_inplace` assumes
-  "nothing was baked unless commit ran", and here commit ran). Confirm at the C++
-  touchpoint, or move the commit after the verify gate.
+- *(Phase 7a — RESOLVED in-session, keep pinned here)* grayscale-wb revert-after-commit:
+  C++-verified (`DoGrayscaleCommit` pops the GsLiveState incl. `savedCorrectionGs`, so
+  cancel-after-commit is a tolerated no-op; cancel-with-session restores the PRE-BEGIN
+  correction). DLC now commits only after the verify gate (phase-7a.md F7a-17) and the
+  MOCK was upgraded to the verified contract (begin saves / cancel restores /
+  post-commit cancel no-op / set_live-without-begin errors) — this phase's
+  contract-shape tests should pin the mock against the C++ handlers so they can't
+  re-diverge. Related: `grayscale_set_live` without a begin errors on the wire but
+  reads as `{}` through `controller.call` (the swallowed ok/error lead above).
 - *(Phase 4)* `install_mhc.py:99` `install_ok` treats ANY dict response without `ok: false`
   as success (`applied.get("ok") is not False`) — same swallowed-error class as the
   `controller.call` lead above; audit together. And: does the C++ live grayscale editor
