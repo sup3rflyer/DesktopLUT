@@ -28,3 +28,15 @@ def test_dashboard_assets_are_included_as_package_data() -> None:
 def test_engine_extra_includes_yaml_profile_loader_dependency() -> None:
     engine = _pyproject()["project"]["optional-dependencies"]["engine"]
     assert any(dep.lower().startswith("pyyaml") for dep in engine)
+
+
+def test_test_extra_covers_the_baked_in_addopts() -> None:
+    # The pytest addopts hardwire `-n auto`; a box that installs bare pytest gets an
+    # argument-parsing error, not a verdict. The `test` extra must therefore carry
+    # xdist (and the rest of the advertised suite tooling) so `pip install -e .[test]`
+    # is sufficient to run the suite anywhere.
+    project = _pyproject()
+    assert "-n auto" in project["tool"]["pytest"]["ini_options"]["addopts"]
+    test_extra = project["project"]["optional-dependencies"]["test"]
+    names = {dep.split(">")[0].split("<")[0].split("=")[0].strip().lower() for dep in test_extra}
+    assert {"pytest", "pytest-xdist", "pytest-cov"} <= names

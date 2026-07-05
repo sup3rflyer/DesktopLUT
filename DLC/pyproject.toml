@@ -26,6 +26,14 @@ engine = [
 meter = [
     "pywinpty>=2.0; platform_system == 'Windows'",
 ]
+# Everything the suite needs on a fresh box: the baked-in pytest addopts pass
+# `-n auto`, so a bare pytest without xdist fails to even parse arguments.
+# pytest-cov backs the audit's coverage baselines (docs/audits/fable/).
+test = [
+    "pytest>=8,<10",
+    "pytest-xdist>=3.6,<4",
+    "pytest-cov>=5,<8",
+]
 
 # The harness has no single CLI entry point: the arbitrating assistant invokes
 # each stage tool as `python -m dlc.stages.<tool>`. The old `dlc = dlc.cli:main`

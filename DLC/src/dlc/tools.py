@@ -100,7 +100,7 @@ def _contained_or_fallback(name: str, contained: Path, fallback: Path | None) ->
             name=name,
             path=fallback,
             contained=False,
-            note="using migration fallback; run `dlc vendor-tools --copy` for contained runs",
+            note="using migration fallback; copy into third_party/ for contained runs (see third_party/README.md / dlc.vendor helpers)",
         )
     return ToolPath(name=name, path=None, contained=False, note="not found")
 

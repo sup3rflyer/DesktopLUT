@@ -5,7 +5,10 @@ This directory is for contained calibration tools used by DesktopLUT Calibrator.
 Expected layout:
 
 ```text
-third_party/argyll/3.3.0/bin/
+third_party/argyll/3.3.0/bin/   the ArgyllCMS executables
+third_party/argyll/3.3.0/ref/   Argyll's reference ICCs — DLC reads sRGB.icm and
+                                Rec2020.icm (calibration-mode dummy profiles) and
+                                Rec709.icm / Rec2020.icm (default 3D-LUT source)
 third_party/dogegen/dogegen.exe
 ```
 

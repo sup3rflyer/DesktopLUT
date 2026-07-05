@@ -12,6 +12,7 @@ from .argyll import command_for_log
 from .desktoplut_client import DesktopLutClient
 from .events import EventWriter
 from .mhc import resolve_run_path
+from .profiles import argyll_ref_profile
 from .runs import RunContext
 from .simulation import write_identity_cube, write_placeholder_icc
 from .tools import ToolSet
@@ -57,9 +58,12 @@ class Lut3dBuildResult:
 
 
 def default_source_icc(mode: str) -> Path:
+    # PROJECT_DIR-anchored (absolute), so the default does not silently depend on
+    # the caller's cwd — a relative path here only resolved when the orchestrator
+    # happened to be launched from the DLC directory.
     if mode.upper() == "SDR":
-        return Path("third_party") / "argyll" / "3.3.0" / "ref" / "Rec709.icm"
-    return Path("third_party") / "argyll" / "3.3.0" / "ref" / "Rec2020.icm"
+        return argyll_ref_profile("Rec709.icm")
+    return argyll_ref_profile("Rec2020.icm")
 
 
 def latest_post_mhc_icc(ctx: RunContext) -> Path | None:
