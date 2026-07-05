@@ -242,7 +242,7 @@ def estimate_patch_plan(patch_sizes: dict[str, Any], transfer: Any, *,
     overrides on the defaults), plus a rough wall-time estimate when the DIP supplies a
     per-read overhead. Lets the LLM weigh "denser" against the time it costs BEFORE
     committing. Lazily reuses the orchestrator's own generators so the count is exact."""
-    from .calibrate import PatchSizes, flow_patch_counts
+    from .patch_sets import PatchSizes, flow_patch_counts
 
     ps = PatchSizes.from_dict(patch_sizes) if isinstance(patch_sizes, dict) else patch_sizes
     counts = flow_patch_counts(flow, ps, transfer)
