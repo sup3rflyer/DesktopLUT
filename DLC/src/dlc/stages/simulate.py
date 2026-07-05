@@ -59,7 +59,7 @@ _DEFAULTS: dict[str, Any] = {
     "grid_size": 17,
     "quality": "h",
     "cube": None,
-    "max_neighbor_delta": 1.0,
+    "max_neighbor_delta": None,   # None ⇒ the grid-pitch-derived structural default
     "max_monotonicity_violations": 0,
     "luminance": None,
     "target_white_xy": None,

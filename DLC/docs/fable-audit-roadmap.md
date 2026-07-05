@@ -50,6 +50,16 @@ fixable, and leave a written trail. Nothing is one-shotted.
   `lut_sdr_reference` (name-collided with the live `mhc_cube.build_sdr_cube`),
   §0 `_rank`/adaptive-probe evaluations quantified (core spread ≤0.3 dE_ITP — no
   corner-trading found), R-fastest indexing cross-pinned. P9 re-verified I.
+- **Updated:** 2026-07-05, Phase 6 complete on `claude/fable-audit-phase-6-m92yrr`
+  (report: `docs/audits/fable/phase-6.md`). P1 + P4 closed (gamut-aware scoring unified
+  live↔stage via shared run-record helpers; ONE `metrics_scored` shape/artifact writer —
+  stage-CLI runs now fill the dashboard ΔE panel and `/api/patch_metrics` has producers);
+  the §0 practically-weighted score landed (`metrics.practical_summary`:
+  core/limits/at-gamut-floor + tube + Phase-2 luminance bands, zone classifier SHARED
+  with the dashboard by import); check-cube neighbour gate now grid-pitch-derived;
+  P3 provenance documented (re-derivation → HW-1/HW-7); P11 ticket scoped
+  (DesktopLUT-side Advanced Color dummy); `de2000` stays the generic carrier with a
+  mandatory `metric` label (rename decision recorded). HW-7 queued.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -193,17 +203,17 @@ Classification: **I** = intentional (keep, ensure documented), **S** = suspect
 
 | # | Behaviour | SDR | HDR | Class | Phase |
 |---|---|---|---|---|---|
-| P1 | Gamut-aware clamp/scoring (`reachable_primaries`) | never (CV-gated worse) | inline verify yes; **standalone `stages/score.py` end-gate NO** | S+G | 6 |
-| P2 | Verify metric | CIEDE2000 | dE_ITP (BT.2124) | I | 6 — *Phase 1 verified both stacks sanitize non-finite reads identically (pinned, `test_color_goldens.py`)* |
-| P3 | Quality thresholds | avg 1.5 / max 5.0 | avg 3.0 / max 10.0 (`decisions.py:135`) | S (re-derive from HW results) | 6 |
-| P4 | `metrics_scored` extras `p99_de2000`, `colour_avg_de2000` | live orchestrator only — stage-CLI runs leave dashboard cells blank | same | G | 6/10 — *Phase 1 evidence: `write_metrics` has zero production callers yet is the only `*_patch_metrics.json` writer; `/api/patch_metrics` has no producer and no JS consumer; `stages/score.py` declares a `patches_path` it never writes* |
+| P1 | Gamut-aware clamp/scoring (`reachable_primaries`) | never (CV-gated worse) | inline verify yes; **standalone `stages/score.py` end-gate NO** | I (closed) | 6 — *Phase 6 fixed: score/report stage tools clamp from the run record via shared `metrics.reachable_primaries_from_mhc_params` (the live path's first-preference source); no-primaries ⇒ `gamut_aware:false` surfaced, never silent; per-patch `gamut_clamped` flags + core/limits/clamped split in every summary. SDR stays deliberately unclamped (CV-gated).* |
+| P2 | Verify metric | CIEDE2000 | dE_ITP (BT.2124) | I | 6 — *Phase 1 verified both stacks sanitize non-finite reads identically (pinned, `test_color_goldens.py`). Phase 6: every producer payload now carries the mandatory `metric` label (incl. grayscale_wb Lab summaries); `de2000` stays the documented generic carrier (rename decision recorded in phase-6.md).* |
+| P3 | Quality thresholds | avg 1.5 / max 5.0 | avg 3.0 / max 10.0 (`decisions.py`) | I (documented) | 6 — *Phase 6: provenance documented at the numbers (SDR JND-anchored with 0.41-avg HW baseline at ~3.5× margin; HDR grounded in the floor-inflated 3.26 baseline, LLM-negotiated, expected to negotiate DOWN post-P1; severe = ~10× gate, recommendation-only). Profile `quality:{hdr:...}` now reaches the live gate. True re-derivation = HW-1/HW-7.* |
+| P4 | `metrics_scored` extras `p99_de2000`, `colour_avg_de2000` | live orchestrator only — stage-CLI runs leave dashboard cells blank | same | I (closed) | 6 — *Phase 6 fixed: p99/colour moved into `summarize_metrics`; canonical `metrics_scored_payload` emitted by all producers; `write_metrics` repurposed as the single artifact writer (stage CLI + live verify both persist `*_patch_metrics.json` — `/api/patch_metrics` has producers). Phase 10 wires the JS consumer + a stage-CLI event-shape dashboard test.* |
 | P5 | Dark-floor defaults | build 0.3 / refine 0.5 / touch-up 0.25 nit | build 0.3 / refine 1.0 nit | I | 4 — *Phase 4: live paths are ADAPTIVE (measured chroma drift, now σ-aware); the constants are fallback guards, each documented with provenance at its definition (phase-4.md F4-5)* |
 | P6 | Refine damping | cube 0.85, legacy grayscale 0.7 | cube 0.85 | I | 4 — *Phase 4: 0.7 belongs to the coarse 32-point deviation-domain law (mis-registration risk), 0.85 to dense linear-light cube composition; both closed-loop (F4-6)* |
 | P7 | Refine convergence target | 0.5 ΔE2000 | 2.0 dE_ITP | I (units differ) | 4 — *re-verified: ~1.0 ≈ 1 JND in both scales; the stop logic (floor/regress/safety), not the target, is the guarantee* |
 | P8 | Deep-shadow reference anchor | brightest patch | 100–203 nit diffuse-white band | I | 4 — *audit-verified + pre-existing test pin* |
 | P9 | 3D-LUT correction cap | 0.5 | 0.25 | I | 5 — *re-verified: provenance documented at `SDR_CORRECTION_CAP` + `_cube_optimize_config` (post-MHC residual vs cube-owns-all-colour; HANDOFF item H CV plateau ~0.5; only the DEFAULT ceiling is mode-lifted); the empirical single-panel-CV side re-verifies with HW-1's before/after scores* |
 | P10 | Grayscale bridge domain (`mhc_grayscale`) | signal-domain t² resample | pass-through | I | 4 — *audit-verified against the replicated C++ convention (test_mhc_grayscale)* |
-| P11 | Dummy ICC | Argyll sRGB.icm | Rec2020.icm **placeholder** (`profiles.py:46`) | G | 6 |
+| P11 | Dummy ICC | Argyll sRGB.icm | Rec2020.icm **placeholder** (`profiles.py:46`) | I (ticketed) | 6 — *Phase 6 scoped: the proper fix is a DesktopLUT-side Advanced Color dummy (MHC2-capable ICC + `ColorProfileSetDisplayDefaultAssociation` install, name exposed over IPC) — cross-repo ticket text in phase-6.md; the DLC placeholder stays, correctly labelled. Phase 12's endgame item points at that ticket.* |
 | P12 | Refine-stage dispatch | `_flow_*` switches on `_spec().is_hdr`; `_planned_stages` switches on `self.mode` — can diverge | same | S | 7 |
 | P13 | `hdr` named flow | n/a | stub that aborts (`calibrate.py:4179`) while `--mode HDR` on full/mhc-only works | S (confusing surface) | 7 |
 | P14 | RGBW peak codes | 242 (8-bit) magic | 712 (10-bit) magic (`dogegen.py:12`) | I | 3 — *verified: per-mode luminance choices (94.9% signal vs PQ ≈ 598 nit), NOT one value rescaled by depth; documented at the code table. RGBW measurement path itself has no production caller → Phase 11 disposition* |
@@ -629,6 +639,19 @@ core so the auditor knows what every stage should do.
   for the paused-vs-terminal daemon-keep distinction (`:5682-5697`).
 - `--auto` refusal on live measuring runs (`:5145`, `:5466`) — pin with a test; it's
   the documented first-HDR-run failure fix.
+- *(Phase 6)* the `_score_stage` broad-except swallowed a real NameError during Phase 6's
+  own development (it guards the score-anomaly escalation — the exact signal it can eat);
+  in the BLE001 sweep make it log its traceback. Also: `stage_verify` now persists
+  `verification_iter00_*` report artifacts inside the stage — the resume matrix should
+  cover a memo-replay over pre-existing files (write is idempotent-overwrite).
+- *(Phase 6 verification pass)* two more for 7a: (a) intermediate `_score_stage` runs
+  OUTSIDE the memoised `_stage`, so a resume re-emits its `metrics_scored` events
+  (raw/post-mhc; events-only, no artifact duplication) — decide dedupe-or-document with
+  the resume matrix; (b) `check-cube`'s `monotonicity_violations_allowed=0` is now the
+  *actually-tight* integrity arm (empirical: realistic cubes can carry a handful of
+  near-black non-monotonic steps while legit neighbour deltas sit at ~half the derived
+  allowance) — verify against real cubes and derive a principled allowance if the zero
+  default false-fails.
 - *(Phase 2)* bit-depth fallback divergence: `main()` defaults 10-bit HDR / 8-bit SDR
   while the `Calibration` ctor's fallback is `display.panel.bit_depth` (= the panel's
   depth, 10) — a direct API caller on SDR gets 10 where the CLI gets 8. Latent (main
@@ -695,6 +718,11 @@ actually gives an LLM what it needs to decide well.
   envelope.
 - Autonomy modes documentation: auto (sim only, refused on live measuring) /
   supervised (divergent) / mapping (default) — one table in the README, tested.
+- *(Phase 6)* the verify seam digest now carries `practical` (core/limits/clamped + tube
+  + bands), `gamut_aware`, and per-offender `gamut_clamped` — the digest-sufficiency
+  review should judge whether SEAM_OPTIMIZE's floor digest adopts the same zone split
+  (its `neutral_{mean,max}_de_report` already covers the tube), and whether the plan
+  seam's new `hdr_target_warnings` (clamped gain / ungrounded peak) reads decidable.
 - *(Phase 3)* Store health is invisible at the seams: `DipStore`/`CorrectionStore` carry
   `.corrupt` (file unparseable) and `.dropped` (individual records lost to schema drift /
   hand-editing) but nothing outside tests consumes either — surface them in the preflight
@@ -796,8 +824,12 @@ audit these as NEW SURFACE, don't rediscover them as drift:
   the Channel Drift tile promoted during warm-up.
 
 **Seeded leads (revised for the above):**
-- **P4 consumer side:** blank p99/colour cells on stage-CLI runs — lands with
-  Phase 6's producer fix; add a dashboard test covering the stage-CLI event shape.
+- **P4 consumer side:** blank p99/colour cells on stage-CLI runs — Phase 6 LANDED the
+  producer fix (canonical `metrics_scored` from every producer; `practical` carried
+  through `_ingest_metrics`; `/api/patch_metrics` now has producers on both live and
+  stage paths); remaining here: wire the `practical` payload into the JS ΔE panel
+  (the exported report's server-rendered card already shows it), decide the
+  `/api/patch_metrics` JS consumer, add the stage-CLI event-shape dashboard test.
 - `state.py` liveness (`_liveness`): the alive-but-wedged amber→red distinction
   guards a real 53-minute failure class — property-test the state transitions over
   synthetic heartbeat/progress sequences (some exist; extend to pause/soak edges).
@@ -876,6 +908,12 @@ new-surface leads dispositioned.
   `build_mhc_candidate`, `identity_curves`, `write_cube`, `write_summary`,
   `load_mhc_candidate` — now banner-separated from the live parser tier) and
   `mhc_cube.refine_sdr_grayscale_legacy` are tests-only. Final delete-vs-keep here.
+- *(Phase 6)* primary-constant inventory: `metrics.SRGB_PRIMARIES` (tuple — now the
+  dashboard state's source), `mhc.SRGB_PRIMARIES` (flat rx..by dict, different shape),
+  `dashboard/colorimetry._SRGB_PRIMARIES` (tuple copy, Phase 1 cross-pinned) — fold the
+  remaining copies onto `metrics` where the tier boundary allows. Also sweep docs/skill
+  text for the score stage's OLD artifact names (now `score_<stage>_iterNN_metrics.json`
+  via `write_metrics`).
 - *(Phase 5, confirmed)* `engine/lut_sdr_reference.py` (quarantine-renamed from `lut_sdr.py`;
   the orphaned additive matrix+curve 3D builder — needs the design-notes §8 check, phase-5.md
   §7) and `lut3d.apply_3dlut_candidate` (zero production callers; orchestrator uses
@@ -964,6 +1002,7 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-4 | F4-1 (σ-aware adaptive dark floor): on the next multi-read box run, confirm dark-drift correction engages in the ~0.3–5-nit band where reads are repeatable (previously smoothed to identity); spot-check no noise-chasing regression; sanity-check `dark_floor` info (`n_strayed`/`n_real_drift`) against the panel's known behaviour | Phase 4 |
 | HW-5 | F4-3 (P16): compare `peak_chroma.cap_nits_nonadditive_est` against the HDR refine's actually-landed D65 peak — decides whether the Peak-Chroma cap should adopt the first-order non-additivity correction | Phase 4 |
 | HW-6 | F5-1 (gamut-aware delta fix): on the next HDR box run, compare 3D-LUT frontier-corner residuals + optimizer floor counts/classifications vs the recorded baseline — reachable-boundary corners should improve or hold, previously-reported near-boundary "floors" may partially resolve; in-gamut and SDR numbers unchanged | Phase 5 |
+| HW-7 | Practical split on hardware: record the HDR verify `practical` block (core/limits/clamped) next to the raw numbers — expect `core.avg` materially below the overall avg (the 3.26 baseline was gamut-floor-inflated) and `clamped.n` ≈ the panel's known unreachable Rec.2020 corners; then re-derive the P3 HDR thresholds from the post-P1 core numbers (folds into HW-1's capture) | Phase 6 |
 | — | *(phases append here)* | |
 
 ## 8. v3 horizon — packaging & interface (parked)
@@ -1019,7 +1058,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 - [x] Phase 3 — Measurement stack *(2026-07-05, `claude/fable-audit-phase-3-ofaaap` — see `docs/audits/fable/phase-3.md`; ran as one session, no 3a/3b split needed)*
 - [x] Phase 4 — MHC layer (matrix, base cube, refines, bridges) *(2026-07-05, `claude/fable-audit-phase-4-ev6mkc` — see `docs/audits/fable/phase-4.md`)*
 - [x] Phase 5 — Correction machine & 3D-LUT engine *(2026-07-05, `claude/charming-hamilton-0xf1g9` — see `docs/audits/fable/phase-5.md`)*
-- [ ] Phase 6 — Scoring, verify gates, reporting truth
+- [x] Phase 6 — Scoring, verify gates, reporting truth *(2026-07-05, `claude/fable-audit-phase-6-m92yrr` — see `docs/audits/fable/phase-6.md`)*
 - [ ] Phase 7 — Orchestrator spine (7a correctness · 7b structure)
 - [ ] Phase 8 — LLM seams & intelligence
 - [ ] Phase 9 — IPC contract & mock fidelity

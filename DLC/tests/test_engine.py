@@ -1388,7 +1388,9 @@ class MetricsTests(unittest.TestCase):
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")
             ti3 = ctx.root / "measurements" / "verification.ti3"
             write_synthetic_ti3(ti3)
-            summary = write_metrics(ctx=ctx, phase="mhc", iteration=1, source_ti3=ti3)
+            patch_metrics, lum = score_samples(parse_ti3(ti3))
+            summary = write_metrics(ctx=ctx, phase="mhc", iteration=1, source=ti3,
+                                    patch_metrics=patch_metrics, target_luminance=lum)
             self.assertEqual(summary.metric, "CIEDE2000")
             self.assertGreater(summary.patch_count, 10)
             self.assertGreaterEqual(summary.max_de2000, summary.avg_de2000)
@@ -1396,6 +1398,14 @@ class MetricsTests(unittest.TestCase):
             self.assertTrue(Path(summary.patches_path).exists())
             reopened = open_run(ctx.root)
             self.assertEqual(reopened.manifest.stages[-1]["stage"], "mhc_metrics")
+            # The canonical metrics_scored event landed on the spine with the P4 shape.
+            events = read_events(ctx.events_path)
+            scored = [e for e in events if e.event == "metrics_scored"]
+            self.assertTrue(scored)
+            for key in ("metric", "avg_de2000", "p95_de2000", "p99_de2000", "max_de2000",
+                        "white_de2000", "grayscale_avg_de2000", "colour_avg_de2000",
+                        "patch_count"):
+                self.assertIn(key, scored[-1].data)
 
     def test_perfect_white_scores_near_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
