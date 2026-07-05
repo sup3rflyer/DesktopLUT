@@ -76,6 +76,17 @@ fixable, and leave a written trail. Nothing is one-shotted.
   user's pre-existing grayscale) with mock fidelity raised to the verified contract,
   and a dead pipe fails EARLY at preflight (SEAM_PIPE, recommend abort;
   build-correction exempt; backup capture honest on a dead pipe).
+- **Updated:** 2026-07-05, Phase 7b complete (report: `docs/audits/fable/phase-7b.md`).
+  Structure phase, zero behaviour change: the adjudication layer extracted to
+  `dlc/adjudication.py` (seam ids + forms + the three adjudicators + the DESIGN LAW
+  block; calibrate re-exports everything), `PatchSizes` + the patch-set builders to
+  `dlc/patch_sets.py` (patch_evidence's lazy import cycle removed), and the stepper's
+  flow-stage sequences made a declarative module table next to `FLOWS`
+  (`_FLOW_STAGE_SEQUENCES`). calibrate.py 6,095 → 5,474 lines. The rest is an RFC with
+  ranked items R1–R6 (phase-7b.md §3): `main()` → `cli.py` blocked on pinning
+  (Phase 11), check-in assembly + preflight tells move WITH Phase 8, the three refine
+  stages deliberately stay, one `FlowDef` registry (`flows.py`) pairs with Phase 12's
+  simulator matrix. Suite identical before/after: 915 passed, 3 skipped.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -674,16 +685,20 @@ core so the auditor knows what every stage should do.
   depth, 10) — a direct API caller on SDR gets 10 where the CLI gets 8. Latent (main
   always passes explicitly); unify on one convention while auditing the spine.
 
-**Seeded leads (7b):**
+**Seeded leads (7b):** *(phase complete — dispositions in phase-7b.md §2–3)*
 - Decomposition proposal only *after* 7a: candidate seams — the three ~200-line
   closed-loop refine stages, `main()`'s wiring (~570 lines), the checkin/digest
   assembly (`:1631-1758`), flows registry. Extract only what tests already pin;
-  no behaviour change in the same commit as a move.
+  no behaviour change in the same commit as a move. *(Done: adjudication + patch_sets
+  extracted; refine stages deliberately stay (R3); main() blocked on pinning → R1 to
+  Phase 11; check-in assembly → R2 to Phase 8.)*
 - *(Phase 7a)* `_planned_stages` and the `_flow_*` methods are now test-pinned equal
   per flow (`test_planned_stages_match_announced_phases_per_flow`) — the decomposition
   should derive one from the other (a declarative flow table) so the pin becomes a
   tautology. `main()` gained no structure in 7a (the ctor-leak/rollback-print fixes
-  were minimal edits); it remains the biggest extraction candidate.
+  were minimal edits); it remains the biggest extraction candidate. *(Partially done:
+  the sequences are now the declarative `_FLOW_STAGE_SEQUENCES` module table (E3); full
+  derivation — the pin as tautology — is R6 (`flows.py`), paired with Phase 12.)*
 
 **Parity:** P12, P13 (make `--mode HDR` vs `hdr`-flow surface coherent — either the
 stub routes or it explains).
@@ -696,7 +711,8 @@ safest extractions landed.
 
 ### Phase 8 — LLM seams and intelligence *(the "intelligence" phase)*
 
-**Scope:** the three adjudicators (`calibrate.py:196-327`), every `SEAM_*` call site
+**Scope:** the three adjudicators (`dlc/adjudication.py` since Phase 7b — seam ids,
+request/decision forms, and the DESIGN LAW block live there now), every `SEAM_*` call site
 (inventory in the recon: 18 sites), `AdjudicationRequest` digests, check-in packets
 (`:1631-1758`), `digest.py`, `decisions.py` advisory layer, `human_actions.py`,
 `patch_evidence.py` decision schema, the front-door skill contract
@@ -754,6 +770,12 @@ actually gives an LLM what it needs to decide well.
   `.corrupt` (file unparseable) and `.dropped` (individual records lost to schema drift /
   hand-editing) but nothing outside tests consumes either — surface them in the preflight
   tell / relevant digests ("your DIP for X was dropped" is decision-relevant).
+- *(Phase 7b)* Open the phase with RFC item R2: move the check-in assembly
+  (`_maybe_timed_checkin` … `_latest_checkin_metrics`, a narrow-coupling ~140-line block)
+  to `dlc/checkin.py` BEFORE redesigning the evidence packet / digest envelope, so the
+  redesign lands in a fresh module instead of churning calibrate.py twice. Consider the
+  preflight tells (R4, `_monitor_map_check` … `_panel_limits_tell`) in the same sweep iff
+  this phase edits their digest text anyway. (phase-7b.md §3)
 
 **Parity:** seams are mode-shared; verify HDR-specific digests (peak provenance,
 Peak-Chroma cap, gamut-floor classification) reach the seams that need them.
@@ -919,6 +941,13 @@ new-surface leads dispositioned.
 `preflight.py`, `tools.py`, README/CHANGELOG accuracy, repo-wide dead-code sweep.
 
 **Seeded leads:**
+- *(Phase 7b)* RFC item R1: pin `main()` (≈590 lines, `pragma: no cover`) by splitting a
+  testable `build_parser()` / `build_live_stack(args, profile, ctx)` seam pair driven with
+  injected fakes (the 7a teardown/rollback ladder becomes testable), THEN move the lot to
+  `dlc/cli.py` with `calibrate.main` kept as a shim. Also R5: the store-path/naming
+  helpers (`correction_store_path`/`dip_store_path`/`dip_record_for`/`active_correction`,
+  cube-naming trio, `_render_report_html`) are weak-cohesion hygiene candidates.
+  (phase-7b.md §3)
 - *(Phase 7a)* `lut_integrity` now has a dedicated test file (`test_lut_integrity.py`)
   — off the gap list. `StageResult.write` is non-atomic (`write_text`); the
   `dlc_stages/` artifacts are advisory but a truncated JSON confuses the state tool —
@@ -1008,6 +1037,12 @@ items the CHANGELOG names as goals.
   *(Phase 3)* while characterizing, capture the real i1D3 dark-noise bands — the
   DIP read policy is quadratic in dark σ ((σ/0.2)² reads/patch; phase-3.md §3),
   so the measured bands ground the `full`-flow wall-clock estimate.
+- *(Phase 7b)* RFC item R6 pairs with the simulator matrix: one `FlowDef` registry
+  (`flows.py`) owning the three per-flow tables (`FLOWS` descriptions,
+  `_FLOW_STAGE_SEQUENCES` stepper plan, `patch_sets._FLOW_PATCH_STAGES` measure roles)
+  with `_run_flow` dispatch derived from it — turns the 7a stepper pin into a tautology.
+  Requires expressing the `_flow_*` methods' argument plumbing as data (ti3 handoffs,
+  pre-steps), so do it where every flow × mode is already being exercised. (phase-7b.md §3)
 - Final audit report: one document rolling up all phase reports, findings fixed vs
   ticketed, and the delta between the pre-audit and post-audit baselines.
 
@@ -1104,7 +1139,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 - [x] Phase 5 — Correction machine & 3D-LUT engine *(2026-07-05, `claude/charming-hamilton-0xf1g9` — see `docs/audits/fable/phase-5.md`)*
 - [x] Phase 6 — Scoring, verify gates, reporting truth *(2026-07-05, `claude/fable-audit-phase-6-m92yrr` — see `docs/audits/fable/phase-6.md`)*
 - [x] Phase 7a — Orchestrator spine: correctness *(2026-07-05, `claude/fable-audit-phase-7a-3y6rsm` — see `docs/audits/fable/phase-7a.md`)*
-- [ ] Phase 7b — Orchestrator spine: structure (decomposition RFC + safest extractions)
+- [x] Phase 7b — Orchestrator spine: structure *(2026-07-05, same branch (restarted from main post-7a-merge) — see `docs/audits/fable/phase-7b.md`; RFC items R1–R6 routed to Phases 8/11/12)*
 - [ ] Phase 8 — LLM seams & intelligence
 - [ ] Phase 9 — IPC contract & mock fidelity
 - [ ] Phase 10 — Dashboard & observability
