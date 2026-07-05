@@ -26,6 +26,11 @@ import json
 import time
 from typing import Any
 
+# Severity rank for the evidence packet's warning list (lower = more severe = kept first
+# when the inline cap truncates): a stall is a run-threatening event, an anomaly is a
+# threshold ping, a read-plausibility anomaly is the most routine of the three.
+_WARNING_SEVERITY = {"stall": 0, "anomaly": 1, "read_plausibility_anomaly": 2}
+
 __all__ = [
     "maybe_timed_checkin",
     "checkin_digest",
@@ -123,7 +128,19 @@ def checkin_evidence(cal: Any) -> dict[str, Any]:
                 if k in data:
                     w[k] = data[k]
             out["warnings"].append(w)
-    # Cap the inline warning list so the packet stays readable; the full log is on disk.
+    # Per-type totals BEFORE any truncation, so the cap can never hide the SCALE of a
+    # problem (25 shown of 400 read-anomalies is a different judgment than 25 of 26).
+    counts: dict[str, int] = {}
+    for w in out["warnings"]:
+        counts[w["event"]] = counts.get(w["event"], 0) + 1
+    if counts:
+        out["warning_counts"] = counts
+    # Worst-first, then cap (fable Phase 8, from the 7a lead): a stall outranks an anomaly
+    # outranks a read-plausibility ping, so truncation drops the LEAST severe events — the
+    # old arrival-order cap could bury the one stall under 25 routine read anomalies. The
+    # sort is stable, so chronology is preserved within each severity class (the "re-read
+    # twice but the latest is normal" judgment still reads in order).
+    out["warnings"].sort(key=lambda w: _WARNING_SEVERITY.get(w.get("event"), 9))
     if len(out["warnings"]) > 25:
         extra = len(out["warnings"]) - 25
         out["warnings"] = out["warnings"][:25] + [{"truncated": extra, "note": "see events.jsonl"}]

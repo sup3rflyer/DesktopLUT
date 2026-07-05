@@ -2293,6 +2293,43 @@ def test_checkin_digest_carries_overview_delta_and_metrics(tmp_path: Path):
     assert d["metrics"]["last_scored"]["avg"] == 1.2
 
 
+def test_checkin_evidence_is_worst_first_with_pretruncation_counts(tmp_path: Path):
+    # The inline warning list truncates at 25 — the packet must (a) keep the MOST severe
+    # events (a stall must never be buried under routine read anomalies by arrival order)
+    # and (b) carry per-type totals computed BEFORE truncation, so the LLM sees the scale
+    # ("25 shown of 400" is a different judgment than "25 of 26").
+    calib = _make(tmp_path, "ckworst", checkin_interval_s=1.0)
+    calib._last_checkin_pos = calib._events_size()
+    for i in range(30):
+        calib.runlog.emit("WARN", "measure:raw", "read_plausibility_anomaly",
+                          label=f"p{i}", reason="implausible")
+    calib.runlog.stall("measure:raw", message="no progress for 900s")
+    calib.runlog.anomaly("measure:raw", kind="score_anomaly", message="catastrophic dE")
+    ev = calib._checkin_evidence()
+    # Totals reflect everything in the window, not just the 25 kept inline.
+    assert ev["warning_counts"] == {"read_plausibility_anomaly": 30, "stall": 1, "anomaly": 1}
+    # Worst-first: the stall and the anomaly lead even though they arrived LAST.
+    assert ev["warnings"][0]["event"] == "stall"
+    assert ev["warnings"][1]["event"] == "anomaly"
+    # Cap intact: 25 inline + the truncation marker with the dropped count.
+    assert len(ev["warnings"]) == 26
+    assert ev["warnings"][-1]["truncated"] == 32 - 25
+
+
+def test_checkin_evidence_preserves_arrival_order_within_a_severity_class(tmp_path: Path):
+    # The severity sort is stable: same-class warnings keep chronology, so the "re-read
+    # twice but the latest read is normal → self-corrected" judgment still reads in order.
+    calib = _make(tmp_path, "ckorder", checkin_interval_s=1.0)
+    calib._last_checkin_pos = calib._events_size()
+    calib.runlog.anomaly("measure:raw", kind="first", message="a")
+    calib.runlog.emit("WARN", "measure:raw", "read_plausibility_anomaly", label="pX")
+    calib.runlog.anomaly("measure:raw", kind="second", message="b")
+    ev = calib._checkin_evidence()
+    assert [w["event"] for w in ev["warnings"]] == [
+        "anomaly", "anomaly", "read_plausibility_anomaly"]
+    assert [w.get("kind") for w in ev["warnings"][:2]] == ["first", "second"]
+
+
 def test_timed_checkin_anchors_then_emits_when_due(tmp_path: Path):
     calib = _make(tmp_path, "ckfire", checkin_interval_s=1.0)
     # First call only anchors — no check-in event yet.
