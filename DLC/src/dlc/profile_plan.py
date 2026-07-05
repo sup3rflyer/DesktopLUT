@@ -286,8 +286,11 @@ def resolve_dispread_instrument_port(
         evidence.update({"ok": False, "applicable": True, "reason": f"dispread command has non-numeric port: {argv[port_index]}"})
         return argv, evidence
 
-    # Sibling spotread in the same directory, preserving the plan's separator convention.
-    spotread = Path(argv[0][: len(argv[0]) - len(executable_name)] + "spotread.exe")
+    # Sibling spotread in the same directory, preserving the plan's separator convention
+    # AND its suffix convention (a POSIX plan carries "dispread", not "dispread.exe" —
+    # hardcoding the .exe here would derive a nonexistent sibling and fail enumeration).
+    sibling = "spotread.exe" if executable_name.lower().endswith(".exe") else "spotread"
+    spotread = Path(argv[0][: len(argv[0]) - len(executable_name)] + sibling)
     enumerator = instrument_enumerator or (lambda path: Argyll(path).enumerate_instruments())
     try:
         instruments = enumerator(spotread)

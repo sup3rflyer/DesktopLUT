@@ -905,6 +905,23 @@ class ProfilePlanTests(unittest.TestCase):
         _resolved, evidence = resolve_dispread_instrument_port(argv, instrument_enumerator=enumerator)
         self.assertFalse(evidence["applicable"])
 
+    def test_dispread_port_resolution_derives_sibling_spotread_with_matching_suffix(self) -> None:
+        # The sibling spotread must inherit dispread's OWN suffix convention: a POSIX plan
+        # carries "dispread" (no .exe) — hardcoding "spotread.exe" derived a nonexistent
+        # sibling and failed enumeration off-Windows.
+        seen: list[str] = []
+
+        def enumerator(spotread: Path) -> list[Instrument]:
+            seen.append(str(spotread))
+            return [Instrument(port=1, description="i1 Display Pro")]
+
+        resolve_dispread_instrument_port(
+            [r"C:\Argyll\dispread.exe", "-c", "2", "m"], instrument_enumerator=enumerator)
+        resolve_dispread_instrument_port(
+            ["/opt/argyll/dispread", "-c", "2", "m"], instrument_enumerator=enumerator)
+        self.assertEqual(seen[0], r"C:\Argyll\spotread.exe")
+        self.assertEqual(seen[1], "/opt/argyll/spotread")
+
     def test_profile_execute_records_instrument_resolution_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = create_run("SDR", "DISPLAY_MODEL", Path(tmp) / "run")

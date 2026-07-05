@@ -226,13 +226,22 @@ def resolve_hdr_target(*, white_xy: tuple[float, float],
         native_white_nits=native_white_nits, sustained_peak_nits=sustained_peak_nits,
         pinned_peak_nits=pinned_peak_nits, default=default_peak_nits)
     gain = undershoot_gain(eotf_undershoot)
+    # Was the gain CLAMPED (the "clamp and flag" policy on MAX_UNDERSHOOT_GAIN)? A raw
+    # boost above the cap — or a non-positive denominator — means the characterization,
+    # not the panel, is suspect; the provenance must say so, not silently quote 1.5.
+    raw_denom = (1.0 + float(eotf_undershoot)) if eotf_undershoot is not None else 1.0
+    gain_clamped = raw_denom <= 0.0 or (raw_denom < 1.0 and 1.0 / raw_denom > MAX_UNDERSHOOT_GAIN)
 
     # Knee: the requested luminance above which corrected drive (requested × gain) would
     # exceed the panel's native ceiling and clip. Below the knee the gain is fully
     # applied; above it, taper to the roll-off. With no boost (gain == 1) or no measured
-    # ceiling, there is nothing to clip → the knee is the peak.
-    if gain > 1.0 and native_white_nits:
-        knee = min(peak, float(native_white_nits) / gain)
+    # ceiling, there is nothing to clip → the knee is the peak. The ceiling is normalized
+    # exactly as choose_peak_nits normalizes it (non-positive / None ⇒ no ceiling), so a
+    # corrupt negative DIP value can never produce a negative knee.
+    native = (float(native_white_nits)
+              if (native_white_nits and native_white_nits > 0) else None)
+    if gain > 1.0 and native:
+        knee = min(peak, native / gain)
     else:
         knee = peak
 
@@ -241,17 +250,22 @@ def resolve_hdr_target(*, white_xy: tuple[float, float],
         "undershoot": {
             "eotf_undershoot": eotf_undershoot,
             "gain": round(gain, 5),
+            "clamped": gain_clamped,
             "note": ("no measured undershoot → no first-order gain (the cube still "
                      "corrects per node)" if gain == 1.0 else
-                     f"first-order gain {gain:.4f}× toward PQ from a measured "
-                     f"{eotf_undershoot:+.3f} undershoot (the cube refines per node)"),
+                     (f"gain CLAMPED to {gain:.4f}× (MAX_UNDERSHOOT_GAIN): the measured "
+                      f"{eotf_undershoot:+.3f} undershoot implies an implausible boost — "
+                      f"suspect characterization, re-measure the EOTF undershoot"
+                      if gain_clamped else
+                      f"first-order gain {gain:.4f}× toward PQ from a measured "
+                      f"{eotf_undershoot:+.3f} undershoot (the cube refines per node)")),
         },
         "knee": {
             "knee_start_nits": round(knee, 2),
             "note": ("whole range boostable — no roll-off within the target peak"
                      if knee >= peak - 1e-6 else
                      f"gain tapers to roll-off above {knee:.0f} nits (boosting past there "
-                     f"would clip the ~{native_white_nits:g}-nit panel)"),
+                     f"would clip the ~{native:g}-nit panel)"),
         },
         "white": {
             "white_xy": [white_xy[0], white_xy[1]],

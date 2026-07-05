@@ -182,15 +182,28 @@ def gamut_coverage(native: dict[str, Pt], target: dict[str, Pt]) -> dict:
     """How well a measured native gamut covers a target. Returns ``coverage_ratio`` (exact
     overlap area / target area, in [0,1]), ``reachable`` (per target primary inside the
     native triangle?), ``shortfall`` (xy distance outside, per unreachable primary), and the
-    triangle areas. ``covered`` ⇒ every target primary is reachable."""
+    triangle areas. ``covered`` ⇒ every target primary is reachable.
+
+    A DEGENERATE native triangle (collinear / coincident primaries — a corrupt or botched
+    characterization, never a real panel) is reported honestly: ``degenerate=True``,
+    nothing covered, coverage 0. Without the guard the sign-agnostic geometry above would
+    score a point-gamut as covering everything (all cross products ≈ 0 ⇒ every membership
+    test passes) — the tell must never report a broken measurement as a perfect panel."""
     nt = [native["R"], native["G"], native["B"]]
     tt = [target["R"], target["G"], target["B"]]
-    reachable = {ch: point_in_triangle(target[ch], *nt) for ch in ("R", "G", "B")}
     tgt_area = polygon_area(tt)
+    native_area = polygon_area(nt)
+    if native_area <= 1e-6:   # same guard as calibrate._reachable_primaries (#C3)
+        return {"covered": False, "coverage_ratio": 0.0,
+                "reachable": {ch: False for ch in ("R", "G", "B")},
+                "shortfall": {ch: round(_dist_point_to_triangle(target[ch], nt), 5)
+                              for ch in ("R", "G", "B")},
+                "native_area": native_area, "target_area": tgt_area, "degenerate": True}
+    reachable = {ch: point_in_triangle(target[ch], *nt) for ch in ("R", "G", "B")}
     inter_area = polygon_area(clip_convex(tt, nt))
     cov = max(0.0, min(1.0, inter_area / tgt_area)) if tgt_area > 0 else 0.0
     shortfall = {ch: round(_dist_point_to_triangle(target[ch], nt), 5)
                  for ch in ("R", "G", "B") if not reachable[ch]}
     return {"covered": all(reachable.values()), "coverage_ratio": cov,
             "reachable": reachable, "shortfall": shortfall,
-            "native_area": polygon_area(nt), "target_area": tgt_area}
+            "native_area": native_area, "target_area": tgt_area, "degenerate": False}

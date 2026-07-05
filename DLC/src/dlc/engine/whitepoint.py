@@ -315,7 +315,7 @@ def _load_white(path: str | Path) -> "colour.SpectralDistribution":
     return load_sp(p)
 
 
-def white_from_spd_file(path: str | Path, *, strength: float = 1.0,
+def white_from_spd_file(path: str | Path, *, strength: float = 0.0,
                         observer: str = DEFAULT_OBSERVER, anchor: str = "reference",
                         illuminant: str = "D65") -> dict:
     """Resolve the 1931-colorimeter target white for a display from its white SPD
@@ -324,7 +324,10 @@ def white_from_spd_file(path: str | Path, *, strength: float = 1.0,
 
     Loads the measured white SPD, applies the observer-metamerism correction at
     ``strength`` (:func:`corrected_white_xy` — ``0`` = numeric D65, ``1`` = full
-    perceptual correction), and returns the target chromaticity plus its CCT/Duv::
+    perceptual correction), and returns the target chromaticity plus its CCT/Duv.
+    **Default is numeric D65** (``strength=0``), matching :func:`target_white` —
+    the perceptual correction is an opt-in dial, never a silent default (every
+    production caller passes ``strength`` explicitly)::
 
         {"xy": (x, y), "cct": K, "duv": d, "observer": ..., "anchor": ..., "strength": ...}
 

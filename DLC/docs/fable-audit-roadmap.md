@@ -18,6 +18,12 @@ fixable, and leave a written trail. Nothing is one-shotted.
   (`tests/test_color_goldens.py`). Phases 0 and 1 ran in PARALLEL sessions and
   merged 0-then-1, so the Phase 1 report's baseline numbers predate Phase 0's
   fixes; the reconciled post-merge baseline is recorded in §1 above.
+- **Updated:** 2026-07-05, Phase 2 complete on `claude/fable-audit-phase-2-5zoyx9`
+  (report: `docs/audits/fable/phase-2.md`). Input-side invariants verified + pinned;
+  5 fixes (negative-knee guard, clamp provenance flag, sibling-spotread suffix,
+  degenerate-gamut honesty, whitepoint default alignment); §0 patch-geography
+  density artifact produced (phase-2.md §2 — Phase 6's weighted score should reuse
+  its bands). P15 verified intentional+documented. Leads added to Phases 3/6/7a/11.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -175,7 +181,7 @@ Classification: **I** = intentional (keep, ensure documented), **S** = suspect
 | P12 | Refine-stage dispatch | `_flow_*` switches on `_spec().is_hdr`; `_planned_stages` switches on `self.mode` — can diverge | same | S | 7 |
 | P13 | `hdr` named flow | n/a | stub that aborts (`calibrate.py:4179`) while `--mode HDR` on full/mhc-only works | S (confusing surface) | 7 |
 | P14 | RGBW peak codes | 242 (8-bit) magic | 712 (10-bit) magic (`dogegen.py:12`) | S (derive from bit depth) | 3 |
-| P15 | Patch spacing | perceptual (power) option | uniform PQ | I | 2 |
+| P15 | Patch spacing | perceptual (power) option | uniform PQ | I | 2 — *Phase 2 verified: rationale documented at `calibrate.py:5403-5412` (PQ is already Barten-uniform; layering γ2.2 shoves samples into highlights)* |
 | P16 | Peak-Chroma cap on neutral axis | n/a (peak = target white) | nominal-additive cap that ignores measured non-additivity (`mhc_cube.py:198`) | S | 4 |
 | P17 | Thermal/regime handling | falls out of measured regime classifier, not a mode branch | same | I (verify it stays that way) | 3 |
 | P18 | Superseded `refine_sdr_grayscale` + deprecated `correctionGrayscale` slot | SDR-only legacy retained | n/a | S (quarantine) | 4 |
@@ -352,7 +358,14 @@ transports + probe-match)** if session budget demands.
 - *(Phase 0, N-0.3)* `probe_match.py:76` sibling-spotread derivation via
   `Path.with_name` — same platform-assumption class as the F-0.1 dispread-gate
   bug (fixed in Phase 0); fine today because it operates on discovered ToolSet
-  paths, but re-check while auditing this stack.
+  paths, but re-check while auditing this stack. *(Phase 2 fixed the same class
+  in `profile_plan.resolve_dispread_instrument_port` — hardcoded `spotread.exe`
+  sibling, F2-3.)*
+- *(Phase 2)* `profile_plan.py` + `stages/measure.py` are the ONLY consumers of the
+  Argyll targen/dispread measurement path; `STAGE_PRESETS` (96/729/256 patches,
+  `-g33`, `-s9/17`) are historical Argyll-flow constants, disjoint from the live
+  orchestrator's `PatchSizes` sets and not DIP-derived. Decide the stage-CLI path's
+  disposition (document-as-alternate vs quarantine) alongside the argyll.py audit.
 
 **Parity:** P14 (derive 242/712 from bit depth), P17 (regime classifier stays
 mode-blind), HDR sustained-peak/ABL handling vs SDR brightness stage.
@@ -525,6 +538,15 @@ with them — this is what the user and the LLM actually see.
   Color dummy needs (likely a DesktopLUT-side item; record the cross-repo ticket).
 - `report.py` before/after: verify metric-consistency guard (both sides same mode)
   and behaviour when baseline TI3 is missing.
+- *(Phase 2)* `gamut_coverage` now carries a `degenerate` flag (corrupt/collinear
+  native primaries) — surface it in the preflight tell's digest text. `HdrTarget`
+  undershoot provenance now carries `clamped` — the brightness/hardware-readiness
+  seam should surface it (a clamped gain means "re-characterize", not "boost 1.5×").
+- *(Phase 2, §0)* the practically-weighted score should reuse the Phase 2 density
+  artifact's bands (`docs/audits/fable/phase-2.md` §2: luminance bands ×
+  neutral/near-neutral(≤0.20)/mid(≤0.60)/edge saturation, frontier = >203 nit /
+  unreachable) so score weights match the measured patch investment — and share the
+  dashboard's core/limits zone constants per the 2026-07-05 note above.
 
 **Parity:** P1–P4, P11 — this phase closes or tickets the biggest parity gaps.
 
@@ -567,6 +589,10 @@ core so the auditor knows what every stage should do.
   for the paused-vs-terminal daemon-keep distinction (`:5682-5697`).
 - `--auto` refusal on live measuring runs (`:5145`, `:5466`) — pin with a test; it's
   the documented first-HDR-run failure fix.
+- *(Phase 2)* bit-depth fallback divergence: `main()` defaults 10-bit HDR / 8-bit SDR
+  while the `Calibration` ctor's fallback is `display.panel.bit_depth` (= the panel's
+  depth, 10) — a direct API caller on SDR gets 10 where the CLI gets 8. Latent (main
+  always passes explicitly); unify on one convention while auditing the spine.
 
 **Seeded leads (7b):**
 - Decomposition proposal only *after* 7a: candidate seams — the three ~200-line
@@ -788,6 +814,10 @@ new-surface leads dispositioned.
   unreachable production paths remain (the recon list: lut_sdr, lut_constrained,
   physical, refine_sdr_grayscale, mhc candidate path, set_grayscale_tweak,
   DLC_SRC_NATIVE tripwire, drift.build_drift_plan future-path).
+- *(Phase 2)* `patch_presenter.load_patch_sequence`/`load_drift_plan` are two more
+  hand-written from-dict ladders (same schema-drift class as the Phase 3 store
+  items); `run_tk_presenter` is a desktop-preview path unreachable in production
+  flows — confirm dispositions.
 - Packaging: `pip install -e .` / `.[engine]` / `.[meter]` / `.[test]` on Linux +
   Windows expectations; `test_packaging.py` scope; wheel build sanity — including
   the Phase 0 notes: `paths.PROJECT_DIR` anchors `runs/`/`third_party/` via
@@ -913,7 +943,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 
 - [x] Phase 0 — Baseline, harness, determinism *(2026-07-05, `docs/audits/fable/phase-0.md`)*
 - [x] Phase 1 — Colour-math foundations & duplication *(2026-07-05, `claude/fable-audit-phase-1-78qq6b` — see `docs/audits/fable/phase-1.md`; ran in a parallel session to Phase 0, so its report's baseline numbers predate Phase 0's fixes)*
-- [ ] Phase 2 — Patch generation, transfers, targets
+- [x] Phase 2 — Patch generation, transfers, targets *(2026-07-05, `claude/fable-audit-phase-2-5zoyx9` — see `docs/audits/fable/phase-2.md`)*
 - [ ] Phase 3 — Measurement stack (3a loop/DIP/thermal · 3b meter/transports)
 - [ ] Phase 4 — MHC layer (matrix, base cube, refines, bridges)
 - [ ] Phase 5 — Correction machine & 3D-LUT engine
