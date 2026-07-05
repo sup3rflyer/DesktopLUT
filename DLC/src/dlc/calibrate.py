@@ -30,12 +30,15 @@ allowed choices + the *core's recommendation*) and gets back a :class:`Decision`
   stage is **memoised** in the run-record, so measurements are never repeated) to
   the seam and proceeds. The memoisation also gives free crash-recovery.
 * :class:`SupervisedAdjudicator` is the middle ground for an *unattended hardware*
-  run: it auto-accepts **benign** recommendations (a clean run never pauses) but
-  **escalates safety-critical seams to the LLM** — exactly when the core's own
+  run: it takes **benign** recommendations without pausing (a clean run never pauses)
+  but **escalates safety-critical seams to the LLM** — exactly when the core's own
   recommendation turns non-benign (``abort``/``revert``/``retry``/…) or the digest
-  flags a severe/critical state. This is the answer to "the overnight run had no LLM
-  at the seams": auto-mode is *safe* only if recommendations are conservative, but
-  supervised-mode is *judged* at the boundaries that matter.
+  flags a severe/critical state. Every benign default it takes is emitted as a
+  **vetoable judgment packet** on the digest (seam ``status="auto_accepted"`` with the
+  full request + the veto lever), so the observing LLM still sees — and can override —
+  every judgment (Task #1, resolved fable Phase 8). This is the answer to "the
+  overnight run had no LLM at the seams": auto-mode is *safe* only if recommendations
+  are conservative, but supervised-mode is *judged* at the boundaries that matter.
 
 **Where the LLM judges (the seam) vs what the core decides (mechanics).** *Detecting*
 an anomaly — a collapsed post-foundation luminance envelope, an optimizer floor, a
@@ -755,9 +758,24 @@ class Calibration:
         self.ctx.log(f"seam {request.key}: {decision.choice}"
                      + (" (override)" if overridden else "")
                      + (f" ({decision.note})" if decision.note else ""))
-        self.runlog.seam(request.stage, key=request.key, status="decided",
-                         choice=decision.choice, note=decision.note,
-                         question=request.question, overridden=overridden)
+        if decision.auto_accepted:
+            # DESIGN LAW (Task #1, resolved fable Phase 8 — owner-approved): a benign default
+            # taken by CODE (SupervisedAdjudicator) is still a judgment the LLM must see, so it
+            # goes on the digest as a FULL judgment packet — everything a paused run would have
+            # printed (question/options/recommendation/digest) plus the veto lever — not a bare
+            # "decided" line. The observing LLM applies judgment out of band and intervenes only
+            # if it disagrees; the run does not pause.
+            self.runlog.seam(request.stage, key=request.key, status="auto_accepted",
+                             choice=decision.choice, note=decision.note,
+                             question=request.question, options=list(request.options),
+                             recommendation=request.recommendation, digest=request.digest,
+                             veto=(f"--cancel mid-run, or --decide {request.key}=<choice> "
+                                   f"--run {self.ctx.root.name} on resume (an override beats "
+                                   "this recorded decision without --force)"))
+        else:
+            self.runlog.seam(request.stage, key=request.key, status="decided",
+                             choice=decision.choice, note=decision.note,
+                             question=request.question, overridden=overridden)
         self._save()
 
     def _abort_if(self, decision: Decision, *, stage: str, message: str) -> Decision:
@@ -4954,13 +4972,26 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="resume the adaptive-planning seam with a structured decision JSON file "
                              "(keys: shadow_treatment, volumetric_density, patch_size_overrides, "
                              "reason, confidence). Validated + clamped to bounds before it is applied.")
-    parser.add_argument("--auto", action="store_true",
-                        help="auto-adjudicate EVERY seam by its recommendation (no pauses, no LLM) — "
-                             "for sim/CI/reproducible runs, NOT an unattended hardware run")
-    parser.add_argument("--supervised", action="store_true",
-                        help="autonomous, but PAUSE for a live judge at safety-critical seams "
-                             "(foundation collapse / optimizer floor / failed verify) — the mode for "
-                             "an unattended HARDWARE run; a clean run never pauses")
+    # The adjudicator: one explicit, mutually-exclusive choice. --attended (== the default)
+    # exists so the REAL-run mode has a flag of its own (fable Phase 8: the mode you want
+    # for a hardware run was previously selectable only by NOT passing the other two —
+    # an invisible default is a trap at the one switch that decides who judges the run).
+    adj_group = parser.add_mutually_exclusive_group()
+    adj_group.add_argument("--attended", action="store_true",
+                           help="the DEFAULT (explicit form): every seam without a recorded "
+                                "decision PAUSES for the LLM/operator (exit 10 + the request as "
+                                "JSON; resume with --decide KEY=CHOICE). The real hardware-run "
+                                "mode — use this flag to say so explicitly.")
+    adj_group.add_argument("--auto", action="store_true",
+                           help="auto-adjudicate EVERY seam by its recommendation (no pauses, no LLM) — "
+                                "for sim/CI/reproducible runs, NOT an unattended hardware run "
+                                "(refused on live measuring flows)")
+    adj_group.add_argument("--supervised", action="store_true",
+                           help="autonomous, but PAUSE for a live judge at safety-critical seams "
+                                "(foundation collapse / optimizer floor / failed verify) — the mode for "
+                                "an unattended HARDWARE run; a clean run never pauses. Benign defaults "
+                                "are taken as VISIBLE, vetoable judgment packets on the digest "
+                                "(seam status=auto_accepted, full request + veto lever), never silently.")
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
@@ -5128,8 +5159,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     if _auto_on_live_measuring_run(args):
         print(json.dumps({"error": (
             "--auto (pure rubber-stamp, no LLM) must not drive a live measuring run — it would optimize "
-            "for hours on an unadjudicated foundation. It is sim/CI only. Run live without --auto (default "
-            "MappingAdjudicator routes every seam to the LLM) or with --supervised, and use the in-process "
+            "for hours on an unadjudicated foundation. It is sim/CI only. Run live with --attended (the "
+            "default: every seam pauses for the LLM) or with --supervised, and use the in-process "
             "simulator for sim/CI.")}))
         return 2
     if args.auto:

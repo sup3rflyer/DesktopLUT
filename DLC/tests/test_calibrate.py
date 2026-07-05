@@ -2240,6 +2240,45 @@ def test_supervised_full_flow_completes_without_pausing(tmp_path: Path):
     assert calib.calib["stages"]["verify"]["digest"]["within_quality"] is True
 
 
+def test_supervised_benign_auto_accept_emits_a_vetoable_judgment_packet(tmp_path: Path):
+    # Task #1 (resolved fable Phase 8, owner-approved): a benign default taken by CODE is
+    # still a judgment the LLM must see. Every supervised auto-accept must land on the
+    # digest as a FULL judgment packet — the question/options/recommendation/digest a
+    # paused run would have printed, plus the veto lever — never a bare "decided" line.
+    calib = _make(tmp_path, "suppacket", adjudicator=SupervisedAdjudicator())
+    assert calib.run("full").status == "completed"
+    seams = [e for e in read_events(calib.ctx.events_path) if e.event == "seam"]
+    auto = {e.data.get("key"): e.data for e in seams if e.data.get("status") == "auto_accepted"}
+    # The terminal verify gate — THE judgment seam — was auto-applied, so its packet exists…
+    v = auto.get("verify:accept")
+    assert v is not None
+    # …and carries everything a paused run would have shown, plus how to override.
+    assert v["choice"] == "apply" and v["recommendation"] == "apply"
+    assert v["options"] == ["apply", "revert"]
+    assert v["question"] and "Apply this calibration" in v["question"]
+    assert isinstance(v["digest"], dict) and "avg_de2000" in v["digest"]
+    assert "--decide verify:accept=" in v["veto"] and "--cancel" in v["veto"]
+    # every auto-taken decision in the record is marked and has a packet on the spine
+    for key, rec in calib.calib["decisions"].items():
+        if rec.get("auto_accepted"):
+            assert key in auto, f"auto-accepted {key} has no judgment packet"
+    assert calib.calib["decisions"]["verify:accept"]["auto_accepted"] is True
+    # the packet is evidence-with-default, not a pause: digest-tier, no exit-10
+    assert all(e.effective_tier == "digest" for e in seams)
+
+
+def test_judged_decisions_do_not_carry_the_auto_accepted_packet(tmp_path: Path):
+    # A decision a judge actually made (seeded Mapping = the LLM's recorded answer) stays a
+    # plain "decided" seam event — no auto_accepted mark, no veto packet.
+    calib = _make(tmp_path, "judged",
+                  adjudicator=MappingAdjudicator({"verify:accept": Decision("apply", note="LLM: clean")}))
+    calib.adjudicate(_verify_request())
+    seams = [e for e in read_events(calib.ctx.events_path) if e.event == "seam"]
+    assert [e.data.get("status") for e in seams] == ["decided"]
+    assert "veto" not in seams[0].data
+    assert calib.calib["decisions"]["verify:accept"].get("auto_accepted") is None
+
+
 # ---------------------------------------------------------------------------
 # Keep-awake: the spine must own the system/display power request itself (no
 # dependence on Resolve holding the lock or the user's power plan) — asserted

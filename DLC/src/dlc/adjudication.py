@@ -52,10 +52,13 @@ SEAM_PIPE = "pipe_down"            # the DesktopLUT calibration pipe is unreacha
 # recommendation OUTSIDE this set means the deterministic core wants to stop/redo something.
 # CAUTION (Design Law, see below): "benign" means *the core has a sensible default*,
 # NOT *no LLM needed*. A benign ``accept`` on a passing verify is still a judgment the LLM must
-# make. ``SupervisedAdjudicator`` currently auto-accepts these — the known divergence Task #1
-# fixes (escalate benign judgment seams to the LLM). The default ``MappingAdjudicator`` already
-# routes every seam, benign or not, to the LLM. (Check-ins are NOT seams — they are non-blocking
-# evidence packets the LLM consumes out of band; see ``Calibration._maybe_timed_checkin``.)
+# make. ``SupervisedAdjudicator`` takes these defaults, but every such auto-accept is marked
+# (``Decision.auto_accepted``) and the orchestrator emits it as a VETOABLE JUDGMENT PACKET on
+# the digest tier — the full request + the veto lever — so the judgment reaches the observing
+# LLM with a default applied, never as a silent rubber-stamp (Task #1, resolved fable Phase 8,
+# owner-approved). The default ``MappingAdjudicator`` routes every seam, benign or not, to the
+# LLM by pausing. (Check-ins are NOT seams — they are non-blocking evidence packets the LLM
+# consumes out of band; see ``dlc.checkin``.)
 _BENIGN_RECOMMENDATIONS = frozenset({"approve", "proceed", "accept", "apply", "done", "continue"})
 # Digest flags that, even under a benign recommendation, mark a seam worth a judge's eyes.
 # ``gate_failed`` is the verify gate's "outside quality targets" signal: a benign ``apply``
@@ -72,12 +75,15 @@ _SEVERITY_FLAGS = ("severe_floor", "severe_failure", "foundation_critical", "cri
 # together by a spine the LLM adjudicates. There is NO headless/unattended/autonomous
 # hardware run; every run is LLM-overseen throughout. Anything that is not a
 # 100%-deterministic yes/no goes to the LLM to decide or to raise with the user; only
-# provably-mechanical facts stay in code. Auto-accepting / rubber-stamping / silently
+# provably-mechanical facts stay in code. SILENTLY auto-accepting / rubber-stamping /
 # logging a non-trivial decision is a VIOLATION. A "benign" recommendation is a default
 # the LLM may take, not a licence for code to skip the LLM. ``AutoAdjudicator`` is sim/CI
-# ONLY. The ``SupervisedAdjudicator`` benign-auto-accept below is a KNOWN DIVERGENCE from
-# this law (it silently accepts judgment seams like a passing verify); the fix — escalate
-# those to the LLM — is tracked as Task #1.
+# ONLY. ``SupervisedAdjudicator`` may take a benign default WITHOUT pausing only because
+# every such decision is emitted as a vetoable judgment packet on the digest tier (the
+# full request — question/options/recommendation/digest — plus the veto lever: --decide
+# on resume, --cancel mid-run), so the judgment still reaches the observing LLM. That is
+# the Task #1 resolution (fable Phase 8, owner-approved: the v3 "policy tier" promoted
+# early); removing the packet, or auto-accepting without it, regresses to the violation.
 #
 # CHECK-INS ARE NOT SEAMS. A §12 check-in (``Calibration._maybe_timed_checkin`` / the
 # measure-loop quartile ping) NEVER pauses the spine and carries NO recommendation. It is the
@@ -98,16 +104,24 @@ class Decision:
     one-of-N choice — notably the adaptive-planning seam, where the LLM returns a
     full patch strategy (shadow/volumetric tiers + validated overrides). It is
     persisted in the decision record and replayed verbatim on resume, so the run
-    re-applies the exact plan the LLM chose."""
+    re-applies the exact plan the LLM chose.
+
+    ``auto_accepted`` marks a decision NO judge made — :class:`SupervisedAdjudicator`
+    taking a benign default. The orchestrator turns such a decision into a **vetoable
+    judgment packet** on the digest tier (the full request + how to override), so the
+    judgment still reaches the LLM (fable Phase 8, Task #1 — owner-approved)."""
 
     choice: str
     note: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
+    auto_accepted: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"choice": self.choice, "note": self.note}
         if self.payload is not None:
             d["payload"] = self.payload
+        if self.auto_accepted:
+            d["auto_accepted"] = True
         return d
 
 
@@ -148,13 +162,16 @@ class AdjudicationRequired(Exception):
 
 
 class Adjudicator(Protocol):
-    """How a seam is answered. Three implementations, selected by CLI flag — note the trap
-    that the one you want for a real run has NO flag (it's the default). See ../docs/NAMING.md §5.
+    """How a seam is answered. Three implementations, selected by one mutually-exclusive
+    CLI flag. The real-run mode has an EXPLICIT flag (``--attended``, fable Phase 8) as
+    well as being the default, so it is no longer selectable only by omission.
+    See ../docs/NAMING.md §5.
 
-        CLI flag        class                   use
-        (none)          MappingAdjudicator      LIVE hardware — every seam pauses for the LLM
-        --auto          AutoAdjudicator         sim/CI rubber-stamp only
-        --supervised    SupervisedAdjudicator   benign-auto-accept (known divergence, Task #1)
+        CLI flag              class                   use
+        --attended (default)  MappingAdjudicator      LIVE hardware — every seam pauses for the LLM
+        --auto                AutoAdjudicator         sim/CI rubber-stamp only
+        --supervised          SupervisedAdjudicator   unattended: benign defaults taken as
+                                                      vetoable judgment packets; severe pauses
     """
 
     def adjudicate(self, request: AdjudicationRequest) -> Decision: ...
@@ -172,8 +189,9 @@ class AutoAdjudicator:
 
 
 class MappingAdjudicator:
-    """**CLI: the DEFAULT (neither ``--auto`` nor ``--supervised``).** Answer from a decisions
-    map; **raise** on the first un-decided seam. This is the real hardware mode.
+    """**CLI: ``--attended`` — also the DEFAULT (neither ``--auto`` nor ``--supervised``).**
+    Answer from a decisions map; **raise** on the first un-decided seam. This is the real
+    hardware mode.
 
     The live LLM pause/resume seam: seed it with the decisions made so far (loaded
     from the run-record on resume); the first seam without a recorded decision
@@ -189,24 +207,25 @@ class MappingAdjudicator:
 
 
 class SupervisedAdjudicator:
-    """**CLI: ``--supervised``.** Escalate non-benign seams to a live judge; auto-accept benign ones.
+    """**CLI: ``--supervised``.** Escalate non-benign seams to a live judge; take benign
+    defaults as **visible, vetoable judgment packets** (Task #1, resolved fable Phase 8).
 
-    **KNOWN DIVERGENCE from the Design Law (see above + Task #1).** This was
-    conceived as the mode for an "unattended hardware run" — but per the law *there is no
-    unattended run*. A benign ``continue``/``accept`` is still a judgment the LLM must make,
-    so silently auto-accepting benign **judgment** seams (timed check-ins, a passing verify)
-    is the bug the law corrects: those must reach the LLM, not land silently on the spine.
+    The unattended-hardware mode, now law-compliant: a recorded decision replays; a seam
+    **raises** :class:`AdjudicationRequired` when the core's recommendation is non-benign
+    (``abort``/``revert``/``retry``/…) or the digest flags a severe/critical state (that
+    half closed the gap that sank the first HDR run, where ``--auto`` plowed through a
+    foundation collapse for hours). A *benign* seam is auto-accepted — but the returned
+    :class:`Decision` is marked ``auto_accepted``, and the orchestrator emits the FULL
+    request (question/options/recommendation/digest) as a ``seam`` event with
+    ``status="auto_accepted"`` + the veto lever, so the observing LLM gets exactly what a
+    paused run would have printed and intervenes only if it disagrees (``--cancel``
+    mid-run; ``--decide KEY=CHOICE`` on resume — the override precedence exists precisely
+    so a recorded ``verify:accept`` can be re-decided without ``--force``).
 
-    What it does today: a recorded decision replays; otherwise a seam **raises**
-    :class:`AdjudicationRequired` only when the core's recommendation is non-benign
-    (``abort``/``revert``/``retry``/…) or the digest flags a severe/critical state — every
-    *benign* seam is auto-accepted. That half is correct (it closes the gap that sank the
-    first HDR run, where ``--auto`` plowed through a foundation collapse for hours); the
-    other half (auto-accepting benign judgment seams) is what Task #1 makes escalate.
-
-    Until Task #1 lands, prefer the default ``MappingAdjudicator`` for a hardware run so
-    every seam genuinely reaches the LLM. Seed with decisions-so-far (loaded on resume) so a
-    recorded judgment replays verbatim and only a genuinely new seam pauses."""
+    For a run where every judgment should PAUSE for the LLM instead, use
+    ``MappingAdjudicator`` (``--attended``, the default). Seed with decisions-so-far
+    (loaded on resume) so a recorded judgment replays verbatim and only a genuinely new
+    seam pauses."""
 
     def __init__(self, decisions: Optional[dict[str, Decision]] = None) -> None:
         self.decisions = dict(decisions or {})
@@ -216,9 +235,12 @@ class SupervisedAdjudicator:
             return self.decisions[request.key]
         if self._needs_a_judge(request):
             raise AdjudicationRequired(request)
+        # auto_accepted=True is the contract with the orchestrator: this benign default was
+        # taken by CODE, not a judge, so it must be emitted as a vetoable judgment packet
+        # (full request + veto lever) on the digest tier — never a silent rubber-stamp.
         return Decision(request.recommendation,
                         note="supervised: auto-accepted benign recommendation",
-                        payload=request.recommended_payload)
+                        payload=request.recommended_payload, auto_accepted=True)
 
     @staticmethod
     def _needs_a_judge(request: AdjudicationRequest) -> bool:

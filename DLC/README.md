@@ -90,9 +90,25 @@ A **real** run mutates the live display and is driven by the orchestrator
 launched with the calibration pipe enabled (opt-in): an empty
 `DesktopLUT_Calibration.flag` next to the exe, `DESKTOPLUT_CALIBRATION=1`, or the
 in-app "Calibration control" toggle. A pause/resume seam exits 10 so the assistant can
-decide and resume (`--decide KEY=CHOICE --run <dir>`). This is a deliberate,
+decide and resume (`--decide KEY=CHOICE[=REASON] --run <dir>`). This is a deliberate,
 user-involved step — see `docs/HANDOFF.md` for the live bring-up procedure; normally
 the assistant drives it through the `calibrate-display` skill.
+
+### Autonomy modes (who answers a seam)
+
+One mutually-exclusive flag picks the adjudicator (`dlc/adjudication.py`; the DESIGN
+LAW there governs what may be decided without a judge):
+
+| Flag | Adjudicator | Behaviour | Use |
+|---|---|---|---|
+| `--attended` *(default)* | `MappingAdjudicator` | every seam without a recorded decision **pauses** (exit 10, request printed as JSON); resume with `--decide KEY=CHOICE[=REASON]` | **live hardware runs** — every judgment reaches the LLM/operator |
+| `--supervised` | `SupervisedAdjudicator` | benign recommendations auto-accept **as visible, vetoable judgment packets on the digest**; non-benign recommendations and severity-flagged digests pause | unattended hardware runs; a clean run never pauses |
+| `--auto` | `AutoAdjudicator` | rubber-stamps every recommendation, no LLM | **sim/CI only** — refused on live measuring flows |
+
+Off-vocabulary decisions (`--decide verify:accept=aply`) are rejected loudly and the
+seam pauses — a typo can never silently apply/misroute. §12 check-ins are **not**
+seams: they are non-blocking evidence packets on the digest tier and never gate the
+spine, in every mode.
 
 ## Install & dependencies
 
