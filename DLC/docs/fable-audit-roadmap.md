@@ -12,6 +12,12 @@ fixable, and leave a written trail. Nothing is one-shotted.
   core-vs-frontier split now partially EXISTS in the dashboard (see the Phase 6/10
   notes) — Phase 6's practically-weighted score should reuse its definitions rather
   than invent parallel ones.
+- **Updated:** 2026-07-05, Phase 1 complete on `claude/fable-audit-phase-1-78qq6b`
+  (report: `docs/audits/fable/phase-1.md`). All colour math verified correct; PQ
+  consolidated into `dlc/_pq.py`; golden cross-pin suite landed
+  (`tests/test_color_goldens.py`). Phases 0 and 1 ran in PARALLEL sessions and
+  merged 0-then-1, so the Phase 1 report's baseline numbers predate Phase 0's
+  fixes; the reconciled post-merge baseline is recorded in §1 above.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -80,7 +86,8 @@ tests, 1 × contained-Argyll-ref test that only runs where `third_party/argyll/
 8 failed, 2 skipped`; 3 of the 8 "environment" failures turned out to be a real
 POSIX portability bug in `resolve_dispread_instrument_port` (fixed), the rest
 were vendored-ref/fixture portability (made hermetic). Coverage baseline and
-details: `docs/audits/fable/phase-0.md`.
+details: `docs/audits/fable/phase-0.md`. *Post-Phase-1 merge:* `835 collected:
+832 passed, 0 failed, 3 skipped` (adds the 30 `test_color_goldens.py` cross-pins).
 
 **HW-validation queue:** any finding whose fix changes behaviour that only hardware
 can confirm (meter timing, FALD behaviour, live pipe, thermal) gets a `HW:` entry in
@@ -155,9 +162,9 @@ Classification: **I** = intentional (keep, ensure documented), **S** = suspect
 | # | Behaviour | SDR | HDR | Class | Phase |
 |---|---|---|---|---|---|
 | P1 | Gamut-aware clamp/scoring (`reachable_primaries`) | never (CV-gated worse) | inline verify yes; **standalone `stages/score.py` end-gate NO** | S+G | 6 |
-| P2 | Verify metric | CIEDE2000 | dE_ITP (BT.2124) | I | 6 |
+| P2 | Verify metric | CIEDE2000 | dE_ITP (BT.2124) | I | 6 — *Phase 1 verified both stacks sanitize non-finite reads identically (pinned, `test_color_goldens.py`)* |
 | P3 | Quality thresholds | avg 1.5 / max 5.0 | avg 3.0 / max 10.0 (`decisions.py:135`) | S (re-derive from HW results) | 6 |
-| P4 | `metrics_scored` extras `p99_de2000`, `colour_avg_de2000` | live orchestrator only — stage-CLI runs leave dashboard cells blank | same | G | 6/10 |
+| P4 | `metrics_scored` extras `p99_de2000`, `colour_avg_de2000` | live orchestrator only — stage-CLI runs leave dashboard cells blank | same | G | 6/10 — *Phase 1 evidence: `write_metrics` has zero production callers yet is the only `*_patch_metrics.json` writer; `/api/patch_metrics` has no producer and no JS consumer; `stages/score.py` declares a `patches_path` it never writes* |
 | P5 | Dark-floor defaults | build 0.3 / refine 0.5 / touch-up 0.25 nit | build 0.3 / refine 1.0 nit | S (justify each or unify) | 4 |
 | P6 | Refine damping | cube 0.85, legacy grayscale 0.7 | cube 0.85 | S | 4 |
 | P7 | Refine convergence target | 0.5 ΔE2000 | 2.0 dE_ITP | I (units differ) | 4 |
@@ -497,7 +504,14 @@ with them — this is what the user and the LLM actually see.
   never disagree about what "core" means.
 - **P4:** `p99_de2000`/`colour_avg_de2000` emitted only by the live orchestrator —
   move into `summarize_metrics` so every producer (live, stage CLI, report) emits
-  the same `metrics_scored` shape the dashboard reads.
+  the same `metrics_scored` shape the dashboard reads. *Phase 1 groundwork:*
+  `metrics.write_metrics` currently has ZERO production callers (test-covered only)
+  yet is the sole writer of the `*_patch_metrics.json` the dashboard's
+  `/api/patch_metrics` globs for (an endpoint no JS fetches today), and
+  `stages/score.py` declares a `patches_path` it never writes. Use `write_metrics`
+  as the unification point (its serialization is strict-JSON-safe since Phase 1)
+  or delete it — one producer shape either way; Phase 10 wires or removes the
+  orphan endpoint.
 - `de2000` field reused as generic ΔE carrier for dE_ITP — rename or alias
   (`de` + `metric` label) so downstream consumers can't mislabel; coordinate with
   dashboard (Phase 10).
@@ -898,7 +912,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 ## 9. Phase checklist
 
 - [x] Phase 0 — Baseline, harness, determinism *(2026-07-05, `docs/audits/fable/phase-0.md`)*
-- [ ] Phase 1 — Colour-math foundations & duplication
+- [x] Phase 1 — Colour-math foundations & duplication *(2026-07-05, `claude/fable-audit-phase-1-78qq6b` — see `docs/audits/fable/phase-1.md`; ran in a parallel session to Phase 0, so its report's baseline numbers predate Phase 0's fixes)*
 - [ ] Phase 2 — Patch generation, transfers, targets
 - [ ] Phase 3 — Measurement stack (3a loop/DIP/thermal · 3b meter/transports)
 - [ ] Phase 4 — MHC layer (matrix, base cube, refines, bridges)

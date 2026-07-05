@@ -47,6 +47,13 @@ from typing import Mapping, Optional, Sequence
 from .colormath import invert3x3, matvec, rgb_to_xyz_matrix, xy_to_XYZ
 from .mhc import Ti3Sample
 
+# ST 2084 lives in dlc._pq (the one shared stdlib copy — the Phase 1 audit consolidated
+# the four verbatim ports of mhc.cpp PqEOTF/PqOETF). Re-exported here because the cube
+# math and its tests speak `mhc_cube.pq_eotf`/`pq_oetf`.
+from ._pq import CONTAINER_NITS as _PQ_CONTAINER_NITS
+from ._pq import eotf_norm as pq_eotf
+from ._pq import oetf_norm as pq_oetf
+
 __all__ = [
     "pq_eotf",
     "pq_oetf",
@@ -213,28 +220,8 @@ def peak_chroma_luminance(channel_peak_xyz: Sequence[Sequence[float]],
     cap = 1.0 / shares_per_nit[binding]
     return min(cap, native_peak), _CHANNELS[binding]
 
-# ST 2084 (SMPTE) constants — verbatim from mhc.cpp / engine.patches (2610/16384, ...).
-_PQ_M1 = 0.1593017578125
-_PQ_M2 = 78.84375
-_PQ_C1 = 0.8359375
-_PQ_C2 = 18.8515625
-_PQ_C3 = 18.6875
 
-_PQ_CONTAINER_NITS = 10000.0
 _CHANNELS = ("r", "g", "b")
-
-
-def pq_eotf(pq: float) -> float:
-    """PQ signal (0..1) -> linear light (0..1 normalised to 10000 nits). Port of ``mhc.cpp`` PqEOTF."""
-    vm = max(pq, 1e-10) ** (1.0 / _PQ_M2)
-    t = max(vm - _PQ_C1, 0.0) / max(_PQ_C2 - _PQ_C3 * vm, 1e-10)
-    return t ** (1.0 / _PQ_M1)
-
-
-def pq_oetf(y: float) -> float:
-    """Linear light (0..1 over 10000 nits) -> PQ signal (0..1). Port of ``mhc.cpp`` PqOETF."""
-    ym = max(y, 0.0) ** _PQ_M1
-    return ((_PQ_C1 + _PQ_C2 * ym) / (1.0 + _PQ_C3 * ym)) ** _PQ_M2
 
 
 def noise_trust(error: float, noise: Optional[float], *,

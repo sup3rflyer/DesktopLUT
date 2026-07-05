@@ -4,12 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
-SRGB_TO_XYZ_D65 = (
-    (0.4124564, 0.3575761, 0.1804375),
-    (0.2126729, 0.7151522, 0.0721750),
-    (0.0193339, 0.1191920, 0.9503041),
-)
+# One canonical copy of the sRGB→XYZ(D65) literal (Phase 1 audit): metrics.py owns it.
+from .metrics import SRGB_TO_XYZ_D65
 
 
 def _target_xyz(rgb: tuple[float, float, float], *, luminance: float = 100.0, gamma: float = 2.2) -> tuple[float, float, float]:

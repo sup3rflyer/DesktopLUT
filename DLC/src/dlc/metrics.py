@@ -302,6 +302,22 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
+def _strict_json_patch_rows(patch_metrics: list[PatchMetric]) -> list[dict[str, Any]]:
+    """Per-patch rows safe for STRICT JSON. ``measured_xyz`` is the RAW meter read (kept
+    raw on purpose — the artifact is evidence), so a dropped/saturated read can carry
+    NaN/inf; ``json.dumps`` would emit bare ``NaN`` tokens, which Python re-parses but a
+    browser's ``JSON.parse`` (the dashboard's ``/api/patch_metrics``) throws on. Map
+    non-finite components to ``null`` — an honest "no usable number" — and leave every
+    finite value untouched. The scored ``de2000`` is always finite (it is computed from
+    the sanitized copy — see ``_finite_nonneg_xyz``)."""
+    rows = []
+    for metric in patch_metrics:
+        row = asdict(metric)
+        row["measured_xyz"] = tuple(c if math.isfinite(c) else None for c in metric.measured_xyz)
+        rows.append(row)
+    return rows
+
+
 def write_metrics(
     *,
     ctx: RunContext,
@@ -327,8 +343,12 @@ def write_metrics(
         metrics_path=metrics_path,
         patches_path=patches_path,
     )
-    metrics_path.write_text(json.dumps(summary.as_dict(), indent=2), encoding="utf-8")
-    patches_path.write_text(json.dumps([asdict(metric) for metric in patch_metrics], indent=2), encoding="utf-8")
+    # allow_nan=False: if a non-finite ever reaches these artifacts again it fails HERE,
+    # loudly, instead of writing JSON a browser cannot parse.
+    metrics_path.write_text(json.dumps(summary.as_dict(), indent=2, allow_nan=False), encoding="utf-8")
+    patches_path.write_text(
+        json.dumps(_strict_json_patch_rows(patch_metrics), indent=2, allow_nan=False),
+        encoding="utf-8")
     ctx.manifest.stages.append(
         {
             "stage": f"{phase}_metrics",

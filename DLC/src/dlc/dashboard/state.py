@@ -20,6 +20,8 @@ from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
 from ..gamut import point_in_triangle
+from .._pq import CONTAINER_NITS as _PQ_CONTAINER_NITS
+from .._pq import eotf_norm as _pq_eotf_norm
 from .colorimetry import (
     linear_rgb, neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance,
 )
@@ -181,15 +183,11 @@ def _is_hdr_header(header: dict[str, Any]) -> bool:
 
 
 def _pq_eotf(signal: float, peak: Optional[float]) -> float:
-    """ST.2084 EOTF from normalized signal to absolute nits, clamped to target peak."""
-    s = max(0.0, min(1.0, float(signal)))
-    m1 = 2610.0 / 16384.0
-    m2 = 2523.0 / 32.0
-    c1 = 3424.0 / 4096.0
-    c2 = 2413.0 / 128.0
-    c3 = 2392.0 / 128.0
-    p = s ** (1.0 / m2)
-    nits = 10000.0 * (max(p - c1, 0.0) / max(c2 - c3 * p, 1e-9)) ** (1.0 / m1)
+    """ST.2084 EOTF from normalized signal to absolute nits, clamped to target peak.
+
+    The transfer itself lives in dlc._pq (the one shared stdlib copy); this wrapper
+    owns the dashboard-specific clamps (signal to [0,1], nits to the target peak)."""
+    nits = _PQ_CONTAINER_NITS * _pq_eotf_norm(max(0.0, min(1.0, float(signal))))
     return min(nits, float(peak)) if peak and peak > 0 else nits
 
 

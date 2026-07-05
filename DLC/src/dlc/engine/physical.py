@@ -23,6 +23,10 @@ from scipy.spatial import cKDTree
 from .lut_rbf import compute_hull_distance, identity_cube, smoothstep
 from .model import Target, TargetSpace, de_itp
 
+# Shared with the other experimental builder — one copy (Phase 1 audit); both are
+# CV-rejected experiments and Phase 5 decides their fate together.
+from .lut_constrained import _hue_chroma, _metric_error
+
 
 MetricName = Literal["auto", "de2000", "de_itp"]
 
@@ -183,39 +187,6 @@ class StructuredForwardModel:
             return np.ones(len(sig))
         dist, _ = self._tree.query(sig, k=1)
         return smoothstep(np.asarray(dist, dtype=float) / max(radius, 1e-6))
-
-
-def _white_xyz(space: TargetSpace) -> np.ndarray:
-    return space.ideal_xyz(np.ones((1, 3)))[0]
-
-
-def _lab(space: TargetSpace, xyz: np.ndarray) -> np.ndarray:
-    white = _white_xyz(space)
-    xyz = np.maximum(np.asarray(xyz, dtype=float), 0.0)
-    eps, kappa = 216 / 24389, 24389 / 27
-    ratio = np.divide(xyz, white, out=np.zeros(3, dtype=float), where=white > 0)
-    f = np.where(ratio > eps, np.cbrt(ratio), (kappa * ratio + 16) / 116)
-    return np.array([116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])], dtype=float)
-
-
-def _de2000(space: TargetSpace, xyz_a: np.ndarray, xyz_b: np.ndarray) -> float:
-    lab_a = _lab(space, xyz_a)
-    lab_b = _lab(space, xyz_b)
-    return float(colour.delta_E(lab_a, lab_b, method="CIE 2000"))
-
-
-def _metric_error(space: TargetSpace, metric: MetricName, produced_xyz: np.ndarray, target_xyz: np.ndarray) -> float:
-    if metric == "auto":
-        metric = "de_itp" if space.target.transfer == "pq" else "de2000"
-    if metric == "de2000":
-        return _de2000(space, produced_xyz, target_xyz)
-    delta = space.xyz_to_ictcp(np.asarray([produced_xyz])) - space.xyz_to_ictcp(np.asarray([target_xyz]))
-    return float(de_itp(delta)[0])
-
-
-def _hue_chroma(space: TargetSpace, xyz: np.ndarray) -> tuple[float, float]:
-    ictcp = space.xyz_to_ictcp(np.asarray([xyz]))[0]
-    return math.atan2(float(ictcp[2]), float(ictcp[1])), math.hypot(float(ictcp[1]), float(ictcp[2]))
 
 
 @dataclass

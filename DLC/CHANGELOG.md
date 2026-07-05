@@ -141,6 +141,16 @@ request, adjudicates ambiguous results on digests, and writes the report.
 - **Descriptive, durable deliverable cube** — a self-describing, sortable cube name
   (`<date>_DLC_<model>_<mode>_<gamut>_<eotf>_<lum>n.cube`) installed from the stable
   `results/` folder, not the gitignored run-dir build artifact.
+- **Fable audit Phase 1 — colour-math foundations** (`docs/audits/fable/phase-1.md`):
+  every hand-rolled colour-math copy cross-verified against published references
+  (Sharma 2005 CIEDE2000 vectors, ST 2084 rationals, BT.2124 ITP, Robertson 1968)
+  and colour-science — zero numeric defects. The four verbatim PQ ports consolidated
+  into one shared stdlib `dlc/_pq.py`; the sRGB→XYZ(D65) literal reduced to one
+  canonical copy (metrics.py); the experimental builders' duplicated Lab/ΔE helpers
+  deduplicated. A golden-vector cross-pin suite (`tests/test_color_goldens.py`)
+  locks every copy against the references and each other, so drift is a test
+  failure instead of a silent chart-vs-score disagreement. Per-patch metric JSON
+  artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Fixed
 - **Fable audit Phase 0 (2026-07-05, `docs/audits/fable/phase-0.md`):** the suite is

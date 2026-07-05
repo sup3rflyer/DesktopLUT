@@ -19,6 +19,12 @@ from typing import Optional, Sequence, Tuple
 
 from ..colormath import invert3x3, matvec, rgb_to_xyz_matrix
 
+# ST 2084 comes from dlc._pq — the one shared stdlib copy (pinned against
+# colour.eotf_ST2084 in the golden tests), so the dashboard's PQ can never
+# disagree with the cube/patch math.
+from .._pq import eotf_norm as _pq_eotf_norm
+from .._pq import oetf_norm as _pq_oetf_norm
+
 # Robertson's 31 isotemperature lines (Wyszecki & Stiles, Table 1(3.11)). Columns:
 # reciprocal megakelvin (mired, i.e. 1e6 / T), CIE 1960 UCS u, v, and the slope of the
 # isotemperature line at that point. The locus runs from infinite temperature (mired 0)
@@ -144,10 +150,6 @@ _SRGB_PRIMARIES = ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))
 _REC2020_PRIMARIES = ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046))
 _D65_XY = (0.3127, 0.3290)
 
-# ST 2084 (verbatim from mhc.cpp / dlc.mhc_cube — pinned against colour.eotf_ST2084 in tests).
-_PQ_M1, _PQ_M2 = 0.1593017578125, 78.84375
-_PQ_C1, _PQ_C2, _PQ_C3 = 0.8359375, 18.8515625, 18.6875
-
 # BT.2100/2124 ICtCp matrices (Dolby 2016) — the exact constants colour.XYZ_to_ICtCp uses.
 _M_BT2020_RGB_TO_LMS = [[1688 / 4096, 2146 / 4096, 262 / 4096],
                         [683 / 4096, 2951 / 4096, 462 / 4096],
@@ -161,18 +163,6 @@ _XYZ_TO_BT2020 = invert3x3(rgb_to_xyz_matrix(
     _REC2020_PRIMARIES[1][1], _REC2020_PRIMARIES[2][0], _REC2020_PRIMARIES[2][1],
     _D65_XY[0], _D65_XY[1], white_Y=1.0))
 _DE_ITP_SCALE = 720.0
-
-def _pq_eotf_norm(s: float) -> float:
-    """PQ signal (0..1) → linear light normalised to 10000 nits (0..1)."""
-    vm = max(s, 0.0) ** (1.0 / _PQ_M2)
-    t = max(vm - _PQ_C1, 0.0) / max(_PQ_C2 - _PQ_C3 * vm, 1e-10)
-    return t ** (1.0 / _PQ_M1)
-
-
-def _pq_oetf_norm(y: float) -> float:
-    """Linear light (0..1 over 10000 nits) → PQ signal (0..1)."""
-    ym = max(y, 0.0) ** _PQ_M1
-    return ((_PQ_C1 + _PQ_C2 * ym) / (1.0 + _PQ_C3 * ym)) ** _PQ_M2
 
 
 def measured_xyz(x: float, y: float, big_y: float) -> tuple[float, float, float]:
