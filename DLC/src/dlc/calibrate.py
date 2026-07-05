@@ -2796,6 +2796,14 @@ class Calibration:
                     f"max {score_anomaly['max_de2000']}); data needs adjudication"
                 )
                 outcome.data["question"] = f"{score_q}; {base_q}" if base_q else score_q
+                # Persist the mutated record BEFORE adjudicating (fable Phase 7a): the escalation
+                # seam below may PAUSE the run (AdjudicationRequired exits the process without a
+                # save), and a resume replays this stage from the record WITHOUT re-scoring (the
+                # replayed gate above) — an unpersisted anomaly would silently skip the seam the
+                # LLM never answered. _stage stored this same outcome's record, so re-recording
+                # is a cheap idempotent overwrite carrying the anomaly flags.
+                self.calib["stages"][key] = outcome.as_record()
+                self._save()
         if outcome.data.get("needs_adjudication"):
             panel_dark = bool(outcome.digest.get("panel_dark"))
             if panel_dark:

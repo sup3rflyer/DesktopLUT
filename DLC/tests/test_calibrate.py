@@ -3025,3 +3025,40 @@ def test_build_correction_is_exempt_from_the_pipe_gate(tmp_path: Path, monkeypat
     result = calib.run("build-correction")
     assert result.status == "completed"
     assert "preflight:pipe" not in calib.calib["decisions"]
+
+
+def test_score_anomaly_pause_survives_resume_without_rescoring(tmp_path: Path):
+    # Regression (found adversarially in-phase, against F7a-5 itself): the score-anomaly
+    # flags are added to the outcome AFTER _stage memoised it, and a pause at the escalation
+    # seam exits the process without a save. With replay no longer re-scoring, the flags must
+    # be PERSISTED before adjudicating — otherwise a resume replays a clean-looking record
+    # and silently skips the seam the LLM never answered.
+    def bad_patch_set(_patch):
+        return Reading(xyz=(100000.0, 100000.0, 100000.0),
+                       yxy=(100000.0, 0.333, 0.333), ok=True)
+
+    calib = _make(tmp_path, "scoreanom_resume", mode="HDR", panel=bad_patch_set,
+                  adjudicator=MappingAdjudicator(), bit_depth=10)
+    calib.target_name = calib.display.target_name("HDR")
+    calib.calib["target"] = calib.target_name
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=calib._ramp_patches(),
+                            ti3_name="r.ti3", ndjson_name="r.ndjson")
+    key = exc.value.request.key
+    assert key == "measure:raw:escalation"
+
+    reads = {"n": 0}
+
+    def counting_bad(patch):
+        reads["n"] += 1
+        return bad_patch_set(patch)
+
+    resumed = _make(tmp_path, "scoreanom_resume", mode="HDR", panel=counting_bad,
+                    adjudicator=MappingAdjudicator({key: Decision("accept", note="judged")}),
+                    bit_depth=10)
+    outcome = resumed.stage_measure(role="raw", patches=resumed._ramp_patches(),
+                                    ti3_name="r.ti3", ndjson_name="r.ndjson")
+    assert outcome.replayed is True
+    assert reads["n"] == 0                                        # memo replay — no re-measure
+    assert outcome.digest.get("score_anomaly") is True            # flags survived via the record
+    assert resumed.calib["decisions"][key]["choice"] == "accept"  # the seam WAS re-reached + decided
