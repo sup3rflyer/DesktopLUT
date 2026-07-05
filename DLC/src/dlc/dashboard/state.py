@@ -46,6 +46,8 @@ _NATIVE_PRIMARY_Y_FLOOR_ABS = 0.1
 # They still appear on the EOTF/luminance tiles, where Y *is* meaningful. Matches the build's own
 # near-black floor (corrections blend to identity there anyway), so the chart mirrors what's used.
 _GRAY_CCT_Y_FLOOR_NITS = 1.0
+# Bound on the per-stage CIE scatter (keyed latest-wins; oldest-inserted evicted past the cap).
+_CIE_CAP = 5000
 
 
 def _sig_hex(sig) -> str:
@@ -115,6 +117,22 @@ def _is_neutral(rgb: Optional[list]) -> bool:
     if not rgb or len(rgb) < 3:
         return False
     return rgb[0] == rgb[1] == rgb[2] and rgb[0] > 0
+
+
+def _patch_key(data: dict[str, Any]) -> tuple:
+    """A patch's identity for the latest-wins accumulators (live ΔE, CIE scatter): the
+    normalised signal when present (stable across re-reads AND across stages, so a verify
+    read replaces the same patch's raw read), else label+rgb, else label+seq."""
+    sig = data.get("signal")
+    if sig and len(sig) >= 3:
+        try:
+            return ("sig",) + tuple(round(float(c), 4) for c in sig[:3])
+        except (TypeError, ValueError):
+            pass
+    rgb = data.get("rgb")
+    if rgb and len(rgb) >= 3:
+        return ("rgb", data.get("label"), tuple(rgb[:3]))
+    return ("seq", data.get("label"), data.get("seq"))
 
 
 def _median(values: list[float]) -> Optional[float]:
@@ -243,17 +261,22 @@ class DashboardState:
     # so the dashboard shows the LATEST stage (the corrected result) instead of raw + post-MHC +
     # verify + build-probe reads overlaid into one unreadable cloud. Warm-up + 3D-LUT build-probe
     # reads are excluded entirely (panel-conditioning / transient, not a settled measurement).
-    _cie_by_stage: dict = field(default_factory=dict)       # stage → deque[point]
+    # CONTINUITY: a new stage's buckets are SEEDED from the previous stage's points, each flagged
+    # ``carried`` — the charts never restart empty at a stage boundary; every patch visibly
+    # morphs from its old reading to its new one as it's re-measured (carried entries render
+    # faded and are overwritten latest-wins, keyed by patch identity).
+    _cie_by_stage: dict = field(default_factory=dict)       # stage → {patch key: latest point}
     _gray_by_stage: dict = field(default_factory=dict)      # stage → {level: latest neutral sample}
     _color_by_stage: dict = field(default_factory=dict)     # stage → {signal: latest colour sample}
     _stage_seq: list = field(default_factory=list)          # measurement stages, first-seen order
+    _carried_from: dict = field(default_factory=dict)       # stage → the stage it was seeded from
     # LIVE BUILD PREVIEW. The 3D-LUT build re-measures the panel through each candidate cube as
     # ``probe`` reads — deliberately EXCLUDED from the settled snapshot charts (transient, adaptively
     # sampled, not a deliverable). But excluding them left the main graphs frozen for the whole
     # (longest) phase. So probes feed a SEPARATE preview bucket here, rendered into the CIE/grayscale/
     # EOTF tiles ONLY while building, clearly badged "build preview — not final"; the settled charts
     # still hold the last real measurement stage and the verify reads replace the preview at the end.
-    _preview_cie: dict = field(default_factory=dict)        # probe-stage → deque[point]
+    _preview_cie: dict = field(default_factory=dict)        # probe-stage → {patch key: latest point}
     _preview_gray: dict = field(default_factory=dict)       # probe-stage → {level: latest neutral}
     _preview_seq: list = field(default_factory=list)        # probe (build) stages, first-seen order
     _last_probe_iso: Optional[str] = None                   # newest probe read (build-preview freshness)
@@ -415,9 +438,7 @@ class DashboardState:
         # Store every metric's scalar so the selectable view can roll its own avg/max client-side.
         if deltas is not None and data.get("role") not in ("warmup", "probe") \
                 and data.get("disposition") != "probe":
-            sig = data.get("signal")
-            key = tuple(round(float(c), 4) for c in sig[:3]) if (sig and len(sig) >= 3) \
-                else ("seq", data.get("label"), data.get("seq"))
+            key = _patch_key(data)
             mdict = {m: v["de"] for m, v in deltas["metrics"].items()}
             tgt = deltas.get("target")
             # Carry the target chromaticity so the rolling summary can classify the patch in- vs
@@ -561,18 +582,19 @@ class DashboardState:
         # reads start landing, this advances past the last probe and the preview yields the tiles.
         self._last_settled_iso = ev.time
         if stage not in self._cie_by_stage:
-            self._cie_by_stage[stage] = deque(maxlen=5000)
-            self._gray_by_stage[stage] = {}
-            self._color_by_stage[stage] = {}
-            self._stage_seq.append(stage)
+            self._open_stage_bucket(stage)
         tgt = (deltas or {}).get("target")
         de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
-        self._cie_by_stage[stage].append({
+        cie = self._cie_by_stage[stage]
+        key = _patch_key(data)
+        if key not in cie and len(cie) >= _CIE_CAP:
+            cie.pop(next(iter(cie)))
+        cie[key] = {
             "x": round(x, 5), "y": round(y, 5), "role": role, "neutral": neutral,
             "c": (None if neutral else _sig_hex(sig)) if sig else None,
             # target chromaticity + scoring ΔE → the scatter draws the error vector and shows ΔE on hover
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
-            "de": de, "label": data.get("label")})
+            "de": de, "label": data.get("label")}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             # latest measurement at this grayscale level wins (re-measures overwrite)
@@ -589,27 +611,58 @@ class DashboardState:
             except (TypeError, ValueError):
                 pass
 
+    def _open_stage_bucket(self, stage: str) -> None:
+        """Open a new measurement stage's chart buckets, SEEDED from the previous stage's points
+        (each flagged ``carried``) — the graphs don't restart at a stage boundary; they morph.
+        A fresh read at the same patch identity / grayscale level overwrites its carried twin
+        (written without the flag), so the charts visibly converge to the new stage's state and
+        the ``continuity`` payload can report how much has been re-measured so far."""
+        prev = self._stage_seq[-1] if self._stage_seq else None
+        if prev is not None:
+            self._cie_by_stage[stage] = {k: {**p, "carried": True}
+                                         for k, p in self._cie_by_stage[prev].items()}
+            self._gray_by_stage[stage] = {k: {**g, "carried": True}
+                                          for k, g in self._gray_by_stage[prev].items()}
+            self._color_by_stage[stage] = {k: {**c, "carried": True}
+                                           for k, c in self._color_by_stage[prev].items()}
+            self._carried_from[stage] = prev
+        else:
+            self._cie_by_stage[stage] = {}
+            self._gray_by_stage[stage] = {}
+            self._color_by_stage[stage] = {}
+        self._stage_seq.append(stage)
+
     def _accumulate_preview(self, ev: Event, data: dict[str, Any], x: float, y: float,
                             Y: Any, enriched: dict[str, Any], deltas: Optional[dict[str, Any]],
                             neutral: bool) -> None:
         """Fold one BUILD PROBE read into the live build-preview buckets (CIE scatter + grayscale),
         so the main graphs animate the cube converging during the 3D-LUT build. Keyed by the build
         stage; latest-wins per grayscale level / per CIE point identity, mirroring the snapshot
-        accumulators so the SAME chart builders render it."""
+        accumulators so the SAME chart builders render it. Seeded from the last SETTLED stage
+        (flagged ``carried``) so the preview starts from what the cube is correcting, not blank."""
         stage = ev.phase or ev.stage or "build"
         if stage not in self._preview_cie:
-            self._preview_cie[stage] = deque(maxlen=5000)
-            self._preview_gray[stage] = {}
+            settled = self._stage_seq[-1] if self._stage_seq else None
+            self._preview_cie[stage] = ({k: {**p, "carried": True}
+                                         for k, p in self._cie_by_stage[settled].items()}
+                                        if settled else {})
+            self._preview_gray[stage] = ({k: {**g, "carried": True}
+                                          for k, g in self._gray_by_stage[settled].items()}
+                                         if settled else {})
             self._preview_seq.append(stage)
         self._last_probe_iso = ev.time
         sig = data.get("signal")
         tgt = (deltas or {}).get("target")
         de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
-        self._preview_cie[stage].append({
+        cie = self._preview_cie[stage]
+        key = _patch_key(data)
+        if key not in cie and len(cie) >= _CIE_CAP:
+            cie.pop(next(iter(cie)))
+        cie[key] = {
             "x": round(x, 5), "y": round(y, 5), "role": "probe", "neutral": neutral,
             "c": (None if neutral else _sig_hex(sig)) if sig else None,
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
-            "de": de, "label": data.get("label")})
+            "de": de, "label": data.get("label")}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             self._preview_gray[stage][round(level, 5)] = {
@@ -648,8 +701,12 @@ class DashboardState:
         the drift chart is the cross-stage time series. Everything is already numeric/derived
         — the browser only draws SVG."""
         stage = self._latest_chart_stage()
-        cie_points = list(self._cie_by_stage.get(stage, ())) if stage else []
+        cie_points = list(self._cie_by_stage.get(stage, {}).values()) if stage else []
         gray_map = self._gray_by_stage.get(stage, {}) if stage else {}
+        # Continuity: how much of this stage's view is still carried from the previous stage vs
+        # already re-measured — the frontend shows "N re-measured · M from <prev>" and fades the
+        # carried marks, so a stage boundary reads as the graphs UPDATING, not restarting.
+        carried_n = sum(1 for p in cie_points if p.get("carried"))
         hdr = _is_hdr_header(self.header)
         white = (self.header.get("white") or {}).get("xy")
         bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
@@ -672,6 +729,8 @@ class DashboardState:
         return {
             "stage": stage,                       # the measurement stage these snapshot charts reflect
             "stages": list(self._stage_seq),
+            "continuity": {"from": self._carried_from.get(stage) if stage else None,
+                           "carried": carried_n, "fresh": len(cie_points) - carried_n},
             "cie": {
                 "points": cie_points,
                 "white": white,
@@ -692,7 +751,8 @@ class DashboardState:
                 "gamma": gamma,
                 "luminance": luminance,
                 "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
-                "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
+                "points": [{"signal": g["signal"], "Y": g["Y"], "carried": bool(g.get("carried"))}
+                           for g in gray if g.get("Y") is not None],
             },
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
             # Live build preview (probe reads during the 3D-LUT build) — the main graphs keep moving
@@ -862,7 +922,7 @@ class DashboardState:
                   and self.run_status == RUN_RUNNING)
         if stage is None:
             return {"active": False, "stage": None}
-        cie_points = list(self._preview_cie.get(stage, ()))
+        cie_points = list(self._preview_cie.get(stage, {}).values())
         gray_map = self._preview_gray.get(stage, {})
         bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
         gray = []
@@ -892,7 +952,8 @@ class DashboardState:
                 "gamma": gamma,
                 "luminance": luminance,
                 "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
-                "points": [{"signal": g["signal"], "Y": g["Y"]} for g in gray if g.get("Y") is not None],
+                "points": [{"signal": g["signal"], "Y": g["Y"], "carried": bool(g.get("carried"))}
+                           for g in gray if g.get("Y") is not None],
             },
         }
 
@@ -1060,6 +1121,9 @@ class DashboardState:
         return {
             "run_id": self.run_id,
             "schema_version": self.schema_version,
+            # The server's clock at snapshot time — lets the browser tick timers/ages locally
+            # (1 Hz, between the 2 s pushes) without trusting the client clock's absolute value.
+            "now_iso": now.isoformat(timespec="seconds"),
             "header": self.header,
             "phase": self.phase,
             "stage": self.stage,

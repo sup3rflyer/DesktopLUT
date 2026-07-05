@@ -89,8 +89,10 @@
     }
     const pts = d.points || [];
     const cap = 2500, step = pts.length > cap ? Math.ceil(pts.length / cap) : 1;
+    let carried = 0;
     for (let i = 0; i < pts.length; i += step) {
       const p = pts[i];
+      if (p.carried) carried++;
       // inline style beats the CSS class fill, so a per-patch colour actually shows
       const fill = p.c ? ` style="fill:${esc(p.c)}"` : "";
       // target chromaticity (where this patch SHOULD sit): data-tx/ty in viewBox px let the hover
@@ -98,12 +100,14 @@
       // tooltip renders as a tile — header, then ΔE / Measured / Target rows.
       const hasT = p.tx != null && p.ty != null;
       const tAttr = hasT ? ` data-tx="${fmt(P.px(p.tx), 1)}" data-ty="${fmt(P.py(p.ty), 1)}"` : "";
-      const rows = [p.label || (p.neutral ? "neutral" : "colour")];
+      const rows = [(p.label || (p.neutral ? "neutral" : "colour")) + (p.carried ? " · prev stage" : "")];
       if (p.de != null) rows.push(`ΔE\t${fmt(p.de, 2)}`);
       rows.push(`Measured\t${fmt(p.x, 4)}, ${fmt(p.y, 4)}`);
       if (hasT) rows.push(`Target\t${fmt(p.tx, 4)}, ${fmt(p.ty, 4)}`);
-      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}"${fill}${tAttr}>${hov(rows.join("\n"))}</circle>`);
+      if (p.carried) rows.push(`Status\tawaiting re-measure`);
+      P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}${p.carried ? " ch-carried" : ""}"${fill}${tAttr}>${hov(rows.join("\n"))}</circle>`);
     }
+    if (carried) P.add(`<text x="${fmt(P.m.l + 4, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${carried} from previous stage</text>`);
     if (d.white && d.white.length >= 2) {
       const wx = P.px(d.white[0]), wy = P.py(d.white[1]);
       // Target white as a crosshair + ring so it reads clearly as the TARGET (not just another point).
@@ -134,7 +138,9 @@
       for (const r of ref) if (Math.abs(r[0] - s) < Math.abs(best[0] - s)) best = r;
       return best[1];
     };
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot">${hov(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}`)}</circle>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`));
+    const eotfCarried = pts.filter((p) => p.carried).length;
+    if (eotfCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">◌ ${eotfCarried} from previous stage</text>`);
 
     // Second interpretation: the gamma/EOTF *tracking* line — flat on the target = perfect tracking.
     // SDR: the local gamma γ(s)=ln(Y_rel)/ln(s); HDR(PQ): measured/target luminance ratio (1.0=ideal).
@@ -184,7 +190,9 @@
       P.add(`<text x="${P.W - 16}" y="${fmt(P.py(targetCct) - 5, 1)}" text-anchor="end" class="ch-note">target ${Math.round(targetCct)}K</text>`);
     }
     P.pathLine(bright.map((p) => [p.signal, p.cct]), "ch-line");
-    bright.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K`)}</circle>`));
+    bright.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | CCT ${Math.round(p.cct)}K${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`));
+    const cctCarried = bright.filter((p) => p.carried).length;
+    if (cctCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${cctCarried} from previous stage</text>`);
     dim.forEach((p) => {
       const off = p.cct < lo || p.cct > hi;
       const cy = P.py(Math.max(lo, Math.min(hi, p.cct)));
@@ -216,8 +224,10 @@
     P.pathLine(bright.map((p) => [p.signal, p.duv]), "ch-line");
     bright.forEach((p) => {
       const cls = p.duv > 0.0002 ? "ch-dot-green" : (p.duv < -0.0002 ? "ch-dot-magenta" : "ch-dot");
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${p.duv > 0 ? "green" : p.duv < 0 ? "magenta" : "neutral"} | target 0`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | Duv ${fmt(p.duv, 5)} | ${p.duv > 0 ? "green" : p.duv < 0 ? "magenta" : "neutral"} | target 0${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`);
     });
+    const duvCarried = bright.filter((p) => p.carried).length;
+    if (duvCarried) P.add(`<text x="${fmt(P.W - P.m.r, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" text-anchor="end" class="ch-note">◌ ${duvCarried} from previous stage</text>`);
     dim.forEach((p) => {
       const off = Math.abs(p.duv) > span;
       const cy = P.py(Math.max(-span, Math.min(span, p.duv)));
@@ -247,7 +257,9 @@
     const clamp = (v) => Math.max(-span, Math.min(span, v));
     series.forEach(([k, cls]) => P.pathLine(bright.map((p) => [p.signal, p[k]]), cls));
     series.forEach(([k, cls, lab]) => bright.forEach((p) =>
-      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot">${hov(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | target 0`)}</circle>`)));
+      P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | target 0${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`)));
+    const balCarried = bright.filter((p) => p.carried).length;
+    if (balCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${balCarried} from previous stage</text>`);
     series.forEach(([k, , lab]) => dim.forEach((p) =>
       P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(clamp(p[k])), 1)}" r="1.6" class="ch-dot-dim">${hov(`signal ${fmt(p.signal, 3)} | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | near-black &lt;1 nit — noisy${Math.abs(p[k]) > span ? " · off-scale" : ""}`)}</circle>`)));
     P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R / G / B balance · target 0%</text>`);

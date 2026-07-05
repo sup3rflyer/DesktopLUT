@@ -73,8 +73,18 @@ body {
 .ph-phase { font-family: var(--mono); font-weight: 700; color: var(--accent); font-size: 14px; }
 .ph-arrow { color: var(--ink-faint); }
 .ph-stage { font-family: var(--mono); color: var(--ink-dim); font-size: 13px; }
-.ph-mid { flex: 1 1 auto; display: flex; justify-content: center; }
+.ph-mid { flex: 1 1 auto; display: flex; justify-content: center; align-items: baseline; gap: 14px; }
 .ph-count { color: var(--ink-dim); font-family: var(--mono); font-size: 11px; letter-spacing: .3px; }
+/* live progress readout in the phase bar: mini bar + % + patches + a ticking ETA */
+.ph-live { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11px; }
+.ph-live[hidden] { display: none; }
+.ph-bar { width: 110px; height: 5px; background: #0a0e13; border: 1px solid var(--edge);
+  border-radius: 3px; overflow: hidden; display: inline-block; }
+.ph-bar-fill { display: block; height: 100%; width: 0%;
+  background: linear-gradient(90deg, #8a7320, var(--accent)); transition: width .4s; }
+.ph-pct { color: var(--ink); font-weight: 700; }
+.ph-patches { color: var(--ink-dim); }
+.ph-eta { color: var(--accent); }
 .ph-right .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-family: var(--mono); }
 .badge.running, .badge.completed { background: #14361f; color: var(--good); }
 .badge.reverted { background: #3a2e12; color: var(--warn); }
@@ -187,6 +197,10 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .charts-meta .cm-build { color: var(--warn); font-family: var(--mono); font-size: 11px;
   padding: 1px 7px; border: 1px solid var(--warn); border-radius: 9px; }
 .charts-meta .cm-build[hidden] { display: none; }
+/* chart continuity: how much of the current stage is re-measured vs carried from the previous */
+.charts-meta .cm-cont { color: var(--ink-dim); font-family: var(--mono); font-size: 11px;
+  padding: 1px 7px; border: 1px solid var(--edge); border-radius: 9px; }
+.charts-meta .cm-cont[hidden] { display: none; }
 .charts-meta .cm-toggle { margin-left: auto; display: flex; align-items: center; gap: 5px;
   color: var(--ink-dim); font-size: 11px; cursor: pointer; }
 /* a tile currently showing the LIVE BUILD PREVIEW (probe reads, not the final result) */
@@ -221,6 +235,9 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 .ch-dot-max { fill: #9a9aa0; }
 /* near-black (Y<1 nit) reads: shown but de-emphasised — hollow, faded, off the autoscale */
 .ch-dot-dim { fill: #2a2a2e; stroke: var(--ink-faint); stroke-width: .7; opacity: .8; }
+/* a point CARRIED from the previous stage (not yet re-measured this stage): faded, so a stage
+   boundary reads as the chart UPDATING in place — each mark solidifies as its patch is re-read */
+.ch-carried { opacity: .25; }
 .ch-guide { stroke: var(--accent); stroke-width: .8; stroke-dasharray: 5 4; opacity: .7; }  /* ±10% lines */
 .ch-axis0 { stroke: #6a6a70; stroke-width: 1; }
 .ch-note { fill: var(--ink-dim); font-size: 10px; font-family: var(--mono); }

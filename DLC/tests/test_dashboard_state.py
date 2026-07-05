@@ -640,6 +640,82 @@ def test_hdr_header_drives_rec2020_pq_charts():
     assert "R100" in cl and abs(cl["R100"]["error"]) < 0.01
 
 
+def test_charts_carry_forward_previous_stage_until_remeasured():
+    """A stage boundary must not blank the charts: the new stage's view is SEEDED from the
+    previous stage's points (flagged ``carried``), and each patch flips to fresh as it's
+    re-measured — the graphs update in place instead of restarting."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # raw stage: one colour + one neutral
+    _read(st, 1, [255, 0, 0], [0.66, 0.32], 40.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    _read(st, 2, [128, 128, 128], [0.30, 0.34], 35.0, signal=[0.5, 0.5, 0.5], phase="measure:raw")
+    # verify stage: only the red has been re-measured so far
+    _read(st, 3, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:verify")
+    ch = st.charts()
+    assert ch["stage"] == "measure:verify"
+    assert ch["continuity"] == {"from": "measure:raw", "carried": 1, "fresh": 1}
+    assert len(ch["cie"]["points"]) == 2                     # red (fresh) + neutral (carried)
+    red = next(p for p in ch["cie"]["points"] if not p["neutral"])
+    gray_pt = next(p for p in ch["cie"]["points"] if p["neutral"])
+    assert not red.get("carried") and red["x"] == 0.64       # fresh verify read replaced raw
+    assert gray_pt.get("carried") is True and gray_pt["x"] == 0.30   # still the raw reading, faded
+    # the grayscale/EOTF view carries the flag too
+    gray = ch["grayscale"]
+    assert [g["signal"] for g in gray] == [0.5] and gray[0].get("carried") is True
+    assert ch["eotf"]["points"][0]["carried"] is True
+    # ... and re-measuring the neutral clears its carried flag + updates the value
+    _read(st, 4, [128, 128, 128], [0.313, 0.329], 36.0, signal=[0.5, 0.5, 0.5], phase="measure:verify")
+    ch2 = st.charts()
+    assert ch2["continuity"] == {"from": "measure:raw", "carried": 0, "fresh": 2}
+    assert ch2["grayscale"][0]["x"] == 0.313 and not ch2["grayscale"][0].get("carried")
+
+
+def test_cie_scatter_dedups_rereads_within_a_stage():
+    """The CIE scatter is keyed by patch identity (latest-wins): a re-read replaces the same
+    patch's dot instead of piling a second one on top."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", gamma=2.2, white={"xy": [0.3127, 0.329]}))
+    _read(st, 1, [255, 0, 0], [0.62, 0.34], 40.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    _read(st, 2, [255, 0, 0], [0.64, 0.33], 45.0, signal=[1.0, 0.0, 0.0], phase="measure:raw")
+    pts = st.charts()["cie"]["points"]
+    assert len(pts) == 1 and pts[0]["x"] == 0.64             # the later read won
+
+
+def test_build_preview_seeded_from_settled_stage():
+    """The build preview starts from the last settled stage's points (carried), so the tiles
+    show what the cube is correcting FROM and morph as probes land — not a blank restart."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", gamma=2.2, luminance=120.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.STAGE_START, t=T0, stage="measure:post-mhc"))
+    _read(st, 1, [255, 0, 0], [0.63, 0.34], 44.0, signal=[1.0, 0.0, 0.0], phase="measure:post-mhc")
+    _read(st, 2, [128, 128, 128], [0.312, 0.329], 30.0, signal=[0.5, 0.5, 0.5], phase="measure:post-mhc")
+    # first probe: a GREEN patch — the red + neutral show as carried alongside it
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=3), stage="build-install-3dlut",
+                  phase="build-install-3dlut", tier="stream", seq=0, role="probe", disposition="probe",
+                  rgb=[0, 255, 0], signal=[0.0, 1.0, 0.0], Y=80.0, xy=[0.30, 0.60], ok=True))
+    bp = st.charts()["build_preview"]
+    assert bp["active"] is True
+    assert len(bp["cie"]["points"]) == 3                     # 2 carried + 1 fresh probe
+    assert sum(1 for p in bp["cie"]["points"] if p.get("carried")) == 2
+    assert bp["grayscale"][0].get("carried") is True         # the seeded neutral, faded
+    # a probe at the SAME identity replaces its carried twin (latest-wins, no double-plot)
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=4), stage="build-install-3dlut",
+                  phase="build-install-3dlut", tier="stream", seq=1, role="probe", disposition="probe",
+                  rgb=[255, 0, 0], signal=[1.0, 0.0, 0.0], Y=45.0, xy=[0.64, 0.33], ok=True))
+    bp2 = st.charts()["build_preview"]
+    assert len(bp2["cie"]["points"]) == 3
+    red = next(p for p in bp2["cie"]["points"] if p["x"] == 0.64)
+    assert not red.get("carried")
+
+
+def test_snapshot_carries_server_now_for_client_ticking():
+    st = DashboardState()
+    snap = st.snapshot(T0)
+    assert snap["now_iso"] == "2026-06-18T12:00:00"
+
+
 def test_charts_show_latest_measurement_stage_not_all_overlaid():
     # raw (uncorrected) then verify (corrected) measurements of the same patch set: the CIE
     # scatter must show the LATEST stage's points only, not both clouds superimposed.

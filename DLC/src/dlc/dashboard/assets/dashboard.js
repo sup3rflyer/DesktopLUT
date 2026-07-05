@@ -13,6 +13,7 @@ let logData = [];           // {time, level, stage, event, phase, tier, data, de
 let knownStages = new Set();
 let renderQueued = false;
 let lastState = null;
+let lastStateAtMs = 0;      // Date.now() when lastState arrived — anchors the 1 Hz local ticker
 let csrfToken = null;
 
 /* ── helpers ─────────────────────────────────────────────────── */
@@ -188,6 +189,7 @@ async function postJson(path) {
 /* ── status bar + sidebar (from `state`) ─────────────────────── */
 function renderState(s) {
   lastState = s;
+  lastStateAtMs = Date.now();
   const h = s.header || {};
   $("f-run").textContent = h.run_id || s.run_id || "—";
   $("f-display").textContent = h.display || "—";
@@ -199,6 +201,16 @@ function renderState(s) {
   const w = h.white || {};
   const wxy = w.xy ? `${num(w.xy[0], 4)},${num(w.xy[1], 4)}` : "";
   $("f-white").textContent = w.cct ? `${Math.round(w.cct)}K${wxy ? " · " + wxy : ""}` : (wxy || "—");
+  // live measured white — the latest neutral read's CCT/Duv, so the header answers "where is
+  // the white point RIGHT NOW" without hunting through the tiles (vs the target to its left).
+  const lw = s.last_white || {};
+  if (lw.cct != null) {
+    const dK = w.cct ? ` (${lw.cct - w.cct >= 0 ? "+" : ""}${Math.round(lw.cct - w.cct)})` : "";
+    $("f-white-live").textContent = `${Math.round(lw.cct)}K${dK}`
+      + (lw.duv != null ? ` · ${fmtSignedFixed(lw.duv, 4)}` : "");
+  } else {
+    $("f-white-live").textContent = "—";
+  }
   $("f-ccmx").textContent = h.ccmx || "—";
   $("f-spd").textContent = h.spd || "—";
 
@@ -238,6 +250,20 @@ function renderState(s) {
   $("prog-patches").textContent = `${c.patches_done || 0} / ${c.patches_total || 0}`;
   $("prog-reads").textContent = c.reads || 0;
   $("prog-okfail").innerHTML = `<span class="ok">${c.reads_ok || 0}</span> / <span class="${(c.reads_failed) ? "nok" : ""}">${c.reads_failed || 0}</span>`;
+
+  // live phase-bar readout — percent, patches, ETA right where the eye already is, so the
+  // header answers "how far along and how much longer" without scanning the cards below.
+  const phLive = $("ph-live");
+  if (st === "running" && c.patches_total) {
+    phLive.hidden = false;
+    $("ph-bar-fill").style.width = pct + "%";
+    $("ph-pct").textContent = Math.round(pct) + "%";
+    $("ph-patches").textContent = `${c.patches_done || 0}/${c.patches_total}`;
+    $("ph-eta").textContent = (s.timers && s.timers.eta_s != null) ? "ETA " + fmtDur(s.timers.eta_s) : "";
+  } else {
+    phLive.hidden = true;
+  }
+  updateTitle();
 
   // timers
   const t = s.timers || {};
@@ -309,6 +335,45 @@ function flag(id, obj, fmt, bad) {
   span.textContent = has ? fmt(obj) : "—";
   el.classList.toggle("hot", !!has);
   el.classList.toggle("bad", !!(has && bad));
+}
+
+/* ── realtime header: browser-tab title + a 1 Hz local ticker ──────────────
+ * The server pushes state every ~2 s; between pushes the ticker advances every
+ * time-derived readout (elapsed, ETA countdown, "Xs ago", since-progress) by the
+ * local wall-clock delta since the last push — so the header reads as a live
+ * instrument, not a display that jumps every couple of seconds. Each server push
+ * re-anchors the numbers, so local-clock drift never accumulates. */
+function updateTitle() {
+  const s = lastState;
+  if (!s) { document.title = "DLC · mission control"; return; }
+  const st = s.run_status || "idle", c = s.counters || {};
+  if (st === "running") {
+    const pct = c.patches_total ? Math.round(100 * c.patches_done / c.patches_total) : null;
+    document.title = `${pct != null ? pct + "% · " : ""}${s.stage || s.phase || "running"} · DLC`;
+  } else if (st !== "idle") {
+    document.title = `${st} · DLC`;
+  } else {
+    document.title = "DLC · mission control";
+  }
+}
+
+function localTick() {
+  const s = lastState;
+  if (!s) return;
+  const dt = Math.max(0, (Date.now() - lastStateAtMs) / 1000);
+  const t = s.timers || {}, lv = s.liveness || {};
+  const running = (s.run_status || "idle") === "running";
+  if (!t.ended_iso) {   // the clocks freeze at run end (mirrors the server)
+    if (t.run_elapsed_s != null) $("t-run").textContent = fmtDur(t.run_elapsed_s + dt);
+    if (t.stage_elapsed_s != null) $("t-stage").textContent = fmtDur(t.stage_elapsed_s + dt);
+  }
+  if (running && t.eta_s != null) {
+    const eta = Math.max(0, t.eta_s - dt);
+    $("t-eta").textContent = fmtDur(eta);
+    if (!$("ph-live").hidden) $("ph-eta").textContent = "ETA " + fmtDur(eta);
+  }
+  if (lv.age_s != null) $("live-age").textContent = `${Math.round(lv.age_s + dt)}s ago`;
+  if (lv.progress_age_s != null) $("t-progress").textContent = fmtDur(lv.progress_age_s + dt);
 }
 
 /* ── pipeline stepper: the whole flow as done / running / upcoming, with "stage K of N" ── */
@@ -478,6 +543,7 @@ function connect() {
     stepperSig = "";
     $("charts-stage").textContent = "—";
     $("charts-build").hidden = true;
+    $("charts-cont").hidden = true;
     // blank the chart contents without destroying the <figure> tiles (renderInto fills them back)
     document.querySelectorAll('#charts [data-chart]').forEach((el) => { el.innerHTML = ""; });
     document.querySelectorAll('#charts .chart.build-preview').forEach((el) => el.classList.remove("build-preview"));
@@ -509,6 +575,17 @@ function effectiveCharts(charts) {
   const bp = charts && charts.build_preview;
   if (!bp || !bp.active) return charts;
   return Object.assign({}, charts, { cie: bp.cie, eotf: bp.eotf, grayscale: bp.grayscale });
+}
+
+// "N re-measured · M from <prev>" — how much of the current stage's charts is fresh vs still
+// carried (faded) from the previous stage. Hidden during the build preview (its badge wins).
+function applyContinuityUi(charts) {
+  const el = $("charts-cont");
+  const cont = charts && charts.continuity;
+  const bp = charts && charts.build_preview;
+  const show = !!(cont && cont.from && cont.carried > 0 && !(bp && bp.active));
+  el.hidden = !show;
+  if (show) el.textContent = `updating · ${cont.fresh} re-measured · ${cont.carried} from ${cont.from}`;
 }
 
 function applyBuildPreviewUi(charts) {
@@ -549,6 +626,7 @@ async function refreshCharts() {
     lastCharts = await r.json();
     const header = lastState ? lastState.header : null;
     applyBuildPreviewUi(lastCharts);
+    applyContinuityUi(lastCharts);
     const render = effectiveCharts(lastCharts);
     if (window.DLCCharts) {
       DLCCharts.renderInto($("charts"), render, header);
@@ -805,6 +883,7 @@ wireChartHover($("lb-body"));    // …and on the expanded lightbox tile
 connect();
 refreshCharts();
 setInterval(refreshCharts, 4000);   // relaxed cadence — charts don't need 2 s latency
+setInterval(localTick, 1000);       // realtime header: tick timers/ages between state pushes
 // Returning to a backgrounded tab: refresh immediately rather than waiting up to 4 s (and this
 // is what fills the charts if the dashboard was first opened while hidden).
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCharts(); });

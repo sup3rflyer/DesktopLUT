@@ -22,6 +22,7 @@
       <div class="field"><label>bits</label><span id="f-bits">—</span></div>
       <div class="field"><label>target</label><span id="f-target">—</span></div>
       <div class="field"><label>white</label><span id="f-white">—</span></div>
+      <div class="field" title="live measured white — the most recent neutral read's CCT/Duv (vs the target white field to its left)"><label>white · live</label><span id="f-white-live">—</span></div>
       <div class="field"><label>ccmx</label><span id="f-ccmx">—</span></div>
       <div class="field"><label>spd</label><span id="f-spd">—</span></div>
     </div>
@@ -47,7 +48,15 @@
       <span class="ph-arrow">›</span>
       <span class="ph-stage" id="ph-stage">—</span>
     </div>
-    <div class="ph-mid"><span class="ph-count" id="ph-count"></span></div>
+    <div class="ph-mid">
+      <span class="ph-count" id="ph-count"></span>
+      <span class="ph-live" id="ph-live" hidden>
+        <span class="ph-bar"><span class="ph-bar-fill" id="ph-bar-fill"></span></span>
+        <span class="ph-pct" id="ph-pct"></span>
+        <span class="ph-patches" id="ph-patches"></span>
+        <span class="ph-eta" id="ph-eta"></span>
+      </span>
+    </div>
     <div class="ph-right" id="ph-status"></div>
   </div>
 
@@ -140,6 +149,7 @@
       <span class="cm-label" id="charts-meta-label">snapshot charts reflect</span>
       <span class="cm-stage" id="charts-stage">—</span>
       <span class="cm-build" id="charts-build" hidden></span>
+      <span class="cm-cont" id="charts-cont" hidden title="chart continuity — faded points are carried from the previous stage and are replaced as each patch is re-measured"></span>
       <label class="cm-toggle" title="Overlay the panel's measured primaries (the current stage's full-drive RGB corners) on the standard target gamut (CIE tile)">
         <input type="checkbox" id="toggle-measured" checked /> measured primaries
       </label>
