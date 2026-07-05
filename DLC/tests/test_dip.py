@@ -129,3 +129,31 @@ def test_upsert_by_display_name(tmp_path):
     store.record(_dip(settle_seconds=0.9))   # same display → overwrite
     assert len(store.records()) == 1
     assert store.get("Test Panel").settle_seconds == 0.9
+
+
+def test_malformed_record_is_dropped_visibly_not_silently(tmp_path):
+    # A per-record parse failure (schema drift / hand-editing) drops ONLY that record —
+    # but visibly (store.dropped), so a caller can say "your DIP for X was dropped"
+    # instead of silently running with no priors for that display (fable audit F3-5).
+    import json
+    p = tmp_path / "dip_store.json"
+    good = _dip().as_dict()
+    bad = {"display": "Bad Panel", "noise_model": [{"nits": "not-a-number"}]}
+    p.write_text(json.dumps({"displays": {"Test Panel": good, "Bad Panel": bad}}),
+                 encoding="utf-8")
+    store = DipStore.load(p)
+    assert store.get("Test Panel") is not None       # the good record survives
+    assert store.get("Bad Panel") is None
+    assert store.dropped == ["Bad Panel"]            # the loss is visible, not silent
+    assert store.corrupt is False                    # file-level corruption is a separate flag
+
+
+def test_save_stamps_a_schema_version_and_reloads_clean(tmp_path):
+    import json
+    store = DipStore(tmp_path / "dip_store.json")
+    store.record(_dip())
+    payload = json.loads((tmp_path / "dip_store.json").read_text(encoding="utf-8"))
+    assert payload["schema"] == 1
+    reloaded = DipStore.load(tmp_path / "dip_store.json")
+    assert reloaded.dropped == [] and reloaded.corrupt is False
+    assert reloaded.get("Test Panel") is not None

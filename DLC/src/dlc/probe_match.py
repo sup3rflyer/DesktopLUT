@@ -72,8 +72,15 @@ def probe_match_instrument_inventory(
             "instruments": [],
             "reason": "probe-match plan uses existing TI3 files and does not need live instruments",
         }
-    ccxxmake = Path(plan.command_argv[0]) if plan.command_argv else Path("ccxxmake.exe")
-    spotread = ccxxmake.with_name("spotread.exe")
+    # The sibling spotread next to the plan's ccxxmake, preserving the plan's separator
+    # convention AND its suffix convention (same portability class as profile_plan's
+    # dispread gate, F-0.1/F2-3): plans carry contained-tool paths in Windows form, and a
+    # POSIX plan carries "ccxxmake", not "ccxxmake.exe" — hardcoding ".exe" here would
+    # derive a nonexistent sibling and fail enumeration with a misleading reason.
+    raw = str(plan.command_argv[0]) if plan.command_argv else "ccxxmake.exe"
+    executable_name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    sibling = "spotread.exe" if executable_name.lower().endswith(".exe") else "spotread"
+    spotread = Path(raw[: len(raw) - len(executable_name)] + sibling)
     enumerator = instrument_enumerator or (lambda path: Argyll(path).enumerate_instruments())
     try:
         instruments = enumerator(spotread)

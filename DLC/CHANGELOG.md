@@ -153,6 +153,24 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Fixed
+- **Fable audit Phase 3 — the measurement stack** (`docs/audits/fable/phase-3.md`):
+  a failed appended re-measure round (meter dies mid-queue) no longer destroys the
+  previously accepted read with a sentinel hole — the prior value is retained and the
+  patch is loudly flagged `unresolved` for adjudication; `main()`'s presenter-settle
+  lookup now finds mode-keyed DIPs (the measured `settle_seconds` was silently ignored
+  and the dwell stuck at the guessed 0.5 s — shared `dip_record_for` helper, HW-2 queued);
+  probe-match's sibling-spotread derivation inherits the plan's own separator + suffix
+  conventions (same portability class as F-0.1/F2-3; POSIX plans no longer derive a
+  nonexistent `spotread.exe`); `characterize.warm_up`'s runs-first ordering invariant is
+  now structural (loud `RuntimeError`) instead of comment-only; `DipStore`/
+  `CorrectionStore` surface individually-unparseable records in a visible `.dropped`
+  list and stamp `"schema": 1` (a hand-edited DIP no longer vanishes silently);
+  `parse_spotread_instruments` recognises non-X-Rite meters (Klein/Spyder/JETI/
+  Konica-Minolta…) instead of silently reporting "no instruments attached". Also:
+  RGBW probe codes documented (242 = 94.9 % signal; 712 = PQ ≈ 598 nit — parity P14
+  closed as intentional), `STAGE_PRESETS` documented as the Argyll-flow alternate, the
+  one-USB ccxxmake/persistent-meter exclusion pinned by test, and the thermal
+  controller's ref-nits side-channel initialised in the constructor. 12 new tests.
 - **Fable audit Phase 2 — patch generation, transfers, targets**
   (`docs/audits/fable/phase-2.md`): input-side invariants verified and pinned.
   A corrupt negative DIP ceiling can no longer produce a negative HDR roll-off knee

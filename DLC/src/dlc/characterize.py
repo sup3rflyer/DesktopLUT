@@ -301,6 +301,13 @@ class _Characterizer:
         *discovered* cold channel, and the warm reference. A panel that won't settle
         within the (generous) observation bound is FLAGGED, not capped."""
         cfg = self.cfg
+        # STRUCTURAL guard for the ordering invariant below (previously comment-only): the
+        # reused loop numbers ITS ndjson reads from 0, so running warm_up with reads already
+        # emitted would collide seq numbers in the shared stream. Fail loudly instead.
+        if self._seq != 0:
+            raise RuntimeError(
+                "characterize warm_up must run exactly once, as the FIRST phase "
+                f"(ndjson seq counter is already at {self._seq})")
         warm_cfg = MeasureLoopConfig(
             cold_channel=self.cold_channel,
             settle_threshold=cfg.warmup_settle_threshold,
@@ -317,8 +324,8 @@ class _Characterizer:
         # Keep the shared ndjson seq monotonic. The reused loop numbered its warm-up reads
         # 0..loop.seq_counter-1; advance our counter past them so our own reads continue
         # without collision. INVARIANT: warm_up runs exactly once, as the FIRST phase (so our
-        # counter is still 0 here) — run_characterization enforces that order.
-        self._seq = max(self._seq, 0) + loop.seq_counter
+        # counter is still 0 here) — enforced structurally by the guard at the top.
+        self._seq = loop.seq_counter
         if not settled:
             self.flags.append(f"panel did not settle within {cfg.warmup_observe_reads} warm-up reads "
                               f"(cold channel {loop.cold_channel}) — abnormally slow warm-up or an unstable panel")

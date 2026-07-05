@@ -28,6 +28,14 @@ class ProfileStagePreset:
     profile_type: str
 
 
+# DISPOSITION (fable audit Phase 3): STAGE_PRESETS parameterize the Argyll targen/dispread
+# measurement path (this module + stages/measure.py) — a documented ALTERNATE to the live
+# orchestrator, kept for Argyll-native workflows and offline plan/execute runs. The counts
+# are historical Argyll-flow choices (96 ≈ targen quick-profile default band, 729 = 9³
+# volumetric grid, 256 ≈ verification sweep; -g33/-s9/-s17 are the matching targen args),
+# NOT derived from the DIP noise model, and deliberately disjoint from the live
+# orchestrator's PatchSizes sets (engine/patches.py) — do not cross-tune one against the
+# other. If this path is ever promoted beyond an alternate, re-derive these from the DIP.
 STAGE_PRESETS: dict[str, ProfileStagePreset] = {
     "raw-mhc": ProfileStagePreset(
         stage="raw-mhc",

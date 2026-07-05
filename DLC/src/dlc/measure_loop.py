@@ -1372,6 +1372,7 @@ class _Loop:
         accepted_se = st[1] if st else None
         accepted_chroma_sigma = self._chroma_sigma(reads, sigma=sigma)
         immediate = max(0, read_index - 1)
+        round_usable = usable                       # whether THIS round produced a usable value
         record = self.accepted.get(patch.label)
         if record is None:
             record = AcceptedRead(
@@ -1382,6 +1383,15 @@ class _Loop:
                 noise_reads=read_index,
             )
             self.accepted[patch.label] = record
+        elif not round_usable and record.usable:
+            # A re-measure round that produced NOTHING usable (e.g. the meter died mid-queue)
+            # must not destroy the prior accepted read: a cold-but-real value beats a sentinel
+            # hole that drops the patch from the .ti3 entirely. Keep the prior XYZ + its noise
+            # stats, accumulate the read count, and FLAG the patch (unstable → unresolved →
+            # adjudication) so the failure is loud, not silently data-erasing.
+            record.reads_taken += read_index
+            record.unstable = True
+            record.note = "re-measure produced no usable read; prior accepted value retained"
         else:
             # Overwrite in place (re-measure): keep only the final accepted read. reads_taken sums
             # across rounds (lifetime), but se_de/chroma_sigma/noise_reads describe THIS round only —
@@ -1396,7 +1406,7 @@ class _Loop:
             record.se_de = accepted_se
             record.chroma_sigma = accepted_chroma_sigma
             record.noise_reads = read_index
-        if usable:
+        if round_usable:
             self._check_read_integrity(patch, accepted_xyz)
         return record
 
