@@ -96,16 +96,39 @@ def parse_triplet(parts: list[str]) -> tuple[float, float, float]:
     return (float(parts[0]), float(parts[1]), float(parts[2]))
 
 
+# The largest per-node correction the optimizer may express, in signal units — the SDR
+# 3D-LUT cap (`calibrate.SDR_CORRECTION_CAP`, 0.5; HDR caps tighter at 0.25). Used only to
+# derive the structural neighbour-delta ceiling below; duplicating the constant would drift,
+# so it is named for what it means here: the correction budget a legitimate cube can spend.
+_MAX_LEGITIMATE_CORRECTION = 0.5
+
+
+def default_neighbor_delta_allowed(size: int) -> float:
+    """The grid-pitch-derived structural ceiling for a neighbour step (fable Phase 6, from
+    the Phase 5 lead): the old fixed default of 1.0 admitted a FULL-RANGE jump between
+    adjacent nodes — toothless, since an identity step on a 33-grid is ~0.031 and the
+    optimizer's soft clamp bounds any legitimate correction to ±0.5 (SDR cap; HDR 0.25).
+    A legitimate neighbour step is therefore at most the identity pitch plus the largest
+    correction swing the caps allow; anything beyond that cannot come from a capped
+    correction on top of identity — it is a tear (corrupt write, transposed axis, garbage
+    parse). 2× pitch adds slack for domain-scaled cubes. ~0.56 at 33³, ~0.63 at 17³."""
+    if size <= 1:
+        return 1.0
+    return min(1.0, 2.0 / (size - 1) + _MAX_LEGITIMATE_CORRECTION)
+
+
 def summarize_lut_integrity(
     *,
     cube: CubeData,
     phase: str,
     iteration: int,
     integrity_path: Path,
-    max_neighbor_delta_allowed: float = 1.0,
+    max_neighbor_delta_allowed: float | None = None,
     monotonicity_violations_allowed: int = 0,
     bounds_epsilon: float = 1e-6,
 ) -> LutIntegritySummary:
+    if max_neighbor_delta_allowed is None:
+        max_neighbor_delta_allowed = default_neighbor_delta_allowed(cube.size)
     expected_entries = cube.size**3 if cube.size > 0 else 0
     notes: list[str] = []
     if expected_entries != len(cube.values):
@@ -203,7 +226,7 @@ def write_lut_integrity(
     cube_path: Path,
     phase: str = "3dlut",
     iteration: int = 1,
-    max_neighbor_delta_allowed: float = 1.0,
+    max_neighbor_delta_allowed: float | None = None,
     monotonicity_violations_allowed: int = 0,
 ) -> LutIntegritySummary:
     cube_path = resolve_run_path(ctx, cube_path)

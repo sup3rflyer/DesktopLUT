@@ -22,6 +22,22 @@ from .runs import RunContext
 
 @dataclass(frozen=True)
 class MetricThresholds:
+    """Advisory SDR acceptance targets + iteration-control knobs.
+
+    Provenance of the SDR dE numbers (CIEDE2000; fable audit Phase 6, P3): 1.0 ΔE2000 ≈
+    one JND, so avg 1.5 ≈ "typical patch at/below ~1.5 JND" — the conventional pro-
+    calibration acceptance band — with p95 3.0 / max 5.0 allowing the tail a couple of
+    JND at isolated patches and white held tighter (2.0) because a white cast is the
+    most visible single error. The recorded hardware baseline (PA32UCXR SDR verify:
+    0.41 avg ΔE2000) passes these with ~3.5× margin — the gate is deliberately looser
+    than the panel's demonstrated ability so it flags regressions, not noise. Tunable
+    per profile/phase via ``quality_policy`` (``metric_thresholds_from_policy``);
+    advisory only — the assistant owns acceptance (plan §1.4).
+
+    ``max_lut_neighbor_delta=1.0`` is a last-resort ceiling only (a full-range jump);
+    the effective structural gate is the grid-pitch-derived default inside
+    ``lut_integrity.summarize_lut_integrity`` (its ``ok`` verdict), which
+    ``decide_iteration`` already consumes via ``integrity['ok']``."""
     avg_de2000: float = 1.5
     p95_de2000: float = 3.0
     max_de2000: float = 5.0
@@ -131,7 +147,21 @@ def metric_thresholds_for_run(
 # SDR CIEDE2000 gate and **LLM-negotiated after the first refinement round**
 # (v2-design-notes §7: "HDR — looser and LLM-negotiated"). The MetricThresholds fields
 # keep their ``*_de2000`` names as the generic ΔE carrier; the run's ``metric`` label
-# ("dE_ITP") names the units. Tunable per profile via a ``quality_policy['hdr']`` block.
+# ("dE_ITP") names the units. Tunable per profile via a ``quality_policy['hdr']`` block
+# (read from BOTH the profile YAML `quality: {hdr: ...}` — live verify — and the run
+# manifest's quality_policy — stage CLI).
+#
+# Provenance (fable audit Phase 6, P3): the 2× factor over SDR (avg 3.0 vs 1.5, max 10
+# vs 5) is grounded in the recorded hardware baseline, not derived from first
+# principles — the PA32UCXR HDR run verified at 3.26 dE_ITP grayscale average with the
+# residual dominated by patches AT the panel's gamut/luminance floor (reachability, not
+# correctable error), so a 1.5-JND-style average gate would flag every honest HDR run on
+# sub-BT.2020 hardware. With gamut-aware scoring (P1, this phase) clamping targets onto
+# the measured gamut, the floor component shrinks and these defaults become genuinely
+# negotiable downward — re-derivation against post-audit hardware scores is queued as
+# HW-1; until then the numbers stay the recorded-baseline-compatible defaults. The §0
+# practical split (metrics.practical_summary) is the intended negotiation evidence:
+# judge `core` against SDR-like expectations, `clamped` as reachability.
 HDR_VERIFY_THRESHOLD_DEFAULTS: dict[str, float] = {
     "avg_de2000": 3.0,
     "p95_de2000": 6.0,
@@ -298,16 +328,19 @@ def decide_iteration(
                 next_params=_3dlut_next_params(metrics, thresholds, integrity),
             )
 
-    assert metrics.avg_de2000 is not None
-    assert metrics.p95_de2000 is not None
-    assert metrics.max_de2000 is not None
-    assert metrics.white_de2000 is not None
+    # Explicit coercion, not `assert` (stripped under -O): the missing-metrics check above
+    # guarantees these are numbers by this point; float() keeps that guarantee enforced at
+    # runtime in every interpreter mode (a None here would raise TypeError loudly).
+    avg = float(metrics.avg_de2000)
+    p95 = float(metrics.p95_de2000)
+    max_de = float(metrics.max_de2000)
+    white = float(metrics.white_de2000)
 
     passing = (
-        metrics.avg_de2000 <= thresholds.avg_de2000
-        and metrics.p95_de2000 <= thresholds.p95_de2000
-        and metrics.max_de2000 <= thresholds.max_de2000
-        and metrics.white_de2000 <= thresholds.white_de2000
+        avg <= thresholds.avg_de2000
+        and p95 <= thresholds.p95_de2000
+        and max_de <= thresholds.max_de2000
+        and white <= thresholds.white_de2000
     )
     if passing:
         return Decision(

@@ -343,6 +343,11 @@ class Profile:
     displays: tuple[DisplayConfig, ...]
     targets: dict[str, TargetSpec]
     quality: QualityTargets = field(default_factory=QualityTargets)
+    # The RAW profile `quality:` block (empty dict when absent). `quality` above bakes the
+    # SDR acceptance targets; this keeps the sub-blocks (`hdr`, per-phase overrides) so HDR
+    # verify can read `quality: {hdr: {...}}` via decisions.hdr_metric_thresholds — the same
+    # policy source the stage-CLI scorer reads from the run manifest.
+    quality_policy: dict[str, Any] = field(default_factory=dict)
     paths: dict[str, str] = field(default_factory=dict)
     # Durable per-profile patch-sequence defaults (the user's run-size preference). A raw
     # dict mirroring PatchSizes fields — kept as a dict here (not a PatchSizes) so the
@@ -741,5 +746,6 @@ def load_profile(path: Optional[Path | str] = None) -> Profile:
     quality = QualityTargets(**metric_thresholds_from_policy(q, "default").as_dict())
 
     return Profile(meter=meter, displays=displays, targets=targets, quality=quality,
+                   quality_policy=dict(q) if isinstance(q, dict) else {},
                    paths=dict(raw.get("paths", {}) or {}),
                    patches=dict(raw.get("patches", {}) or {}), source_path=str(p))

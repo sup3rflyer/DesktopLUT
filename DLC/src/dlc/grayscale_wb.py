@@ -227,6 +227,9 @@ def summarize_errors(errors: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     delta_y = [abs(float(e.get("delta_Y", 0.0))) for e in usable]
     return {
         "n": len(usable),
+        # The touch-up flow is mode-shared but this module scores in Lab — label the units
+        # so an HDR run's digest can never read these as dE_ITP (fable Phase 6, P2/P4 lead).
+        "metric": "CIEDE2000",
         "avg_de2000": round(sum(de) / len(de), 5),
         "max_de2000": round(max(de), 5),
         "avg_C": round(sum(chroma) / len(chroma), 5),

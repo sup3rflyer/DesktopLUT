@@ -20,14 +20,19 @@ from typing import Any, Deque, Optional
 
 from ..events import Ev, Event
 from ..gamut import point_in_triangle
+from ..metrics import HDR_REF_WHITE_NITS as _SHARED_HDR_REF_WHITE_NITS
+from ..metrics import SRGB_PRIMARIES as _SHARED_SRGB_PRIMARIES
+from ..metrics import is_core_target
 from .._pq import CONTAINER_NITS as _PQ_CONTAINER_NITS
 from .._pq import eotf_norm as _pq_eotf_norm
 from .colorimetry import (
     linear_rgb, neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance,
 )
 
-# The target gamut the charts draw the reference triangle against (sRGB / Rec.709 primaries).
-_SRGB_PRIMARIES = {"r": [0.64, 0.33], "g": [0.30, 0.60], "b": [0.15, 0.06]}
+# The target gamut the charts draw the reference triangle against (sRGB / Rec.709
+# primaries) — derived from the ONE definition in dlc.metrics (shared with the scored
+# practical summary, fable Phase 6), reshaped for the chart wire format.
+_SRGB_PRIMARIES = {ch: list(xy) for ch, xy in zip("rgb", _SHARED_SRGB_PRIMARIES)}
 _REC2020_PRIMARIES = {"r": [0.708, 0.292], "g": [0.170, 0.797], "b": [0.131, 0.046]}
 # Rec.709/sRGB luminance weights — enough to compute a colour patch's TARGET relative
 # luminance (Kr·r^γ + Kg·g^γ + Kb·b^γ) without the full primary matrix, so the Colour
@@ -56,7 +61,9 @@ _CIE_CAP = 5000
 _GRAY_SAMPLES = 9
 # "Core" content zone reference white for HDR (BT.2408 diffuse/graphics white). ~99% of graded
 # content lives at or below this and within Rec.709 — the practical-priority ΔE split headline.
-_HDR_REF_WHITE_NITS = 203.0
+# ONE definition, shared with the scored practical summary (dlc.metrics — fable Phase 6): the
+# live number and the scored number can never disagree about what "core" means.
+_HDR_REF_WHITE_NITS = _SHARED_HDR_REF_WHITE_NITS
 # Warm-up settling: the panel counts as settled when its fastest-moving channel drifts less than
 # this (percent per 10 minutes) over the trailing window of drift checkpoints.
 _SETTLE_SLOPE_PCT_PER_10MIN = 0.15
@@ -499,10 +506,8 @@ class DashboardState:
         # white (BT.2408, ~203 nits) — where ~99% of graded content lives. The core numbers are
         # the practical verdict; the in-gamut remainder is "limits" (impressive, rarely hit).
         # SDR targets are all sRGB-inside by construction, so the split is HDR-only.
-        tri709 = (tuple(_SRGB_PRIMARIES["r"]), tuple(_SRGB_PRIMARIES["g"]),
-                  tuple(_SRGB_PRIMARIES["b"]))
-        core_y_cap = _HDR_REF_WHITE_NITS * 1.02   # small headroom so ref-white itself is core
-
+        # Classified by the SHARED metrics.is_core_target — the same zone the scored
+        # practical summary uses, so live and scored can never disagree (fable Phase 6).
         metrics: dict[str, Any] = {}
         for m in order:
             dec = _DE_DECIMALS.get(m, 3)
@@ -517,10 +522,7 @@ class DashboardState:
                     if point_in_triangle(txy, *tri):
                         ins.append(de)
                         if hdr:
-                            t_y = v.get("tY")
-                            is_core = point_in_triangle(txy, *tri709) \
-                                and (t_y is None or t_y <= core_y_cap)
-                            (core if is_core else ext).append(de)
+                            (core if is_core_target(txy, v.get("tY")) else ext).append(de)
                     else:
                         oog.append(de)
             last = self._live_last.get(m)
@@ -752,6 +754,9 @@ class DashboardState:
             "white": data.get("white_de2000"),
             "grayscale": data.get("grayscale_avg_de2000"),
             "colour": data.get("colour_avg_de2000"),
+            # The §0 practical split (core/limits/clamped/tube/bands) when the producer
+            # sent it — carried through so the ΔE panel/report can show core-vs-frontier.
+            "practical": data.get("practical"),
         }
         self.de = entry
         self.de_history.append(entry)

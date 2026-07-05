@@ -290,8 +290,12 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
 
     ``signal_rgb`` / ``measured_xyz`` are ``(N, 3)`` (or flattenable to it); the latter
     is absolute cd/m². Patches are assumed bounded to the reachable sub-peak range (the
-    roll-off region above the target peak is a later refinement). Returns ``de_itp`` and
-    the ``ideal_xyz`` (absolute cd/m²) per patch.
+    roll-off region above the target peak is a later refinement). Returns ``de_itp``,
+    the ``ideal_xyz`` (absolute cd/m²) per patch, and ``gamut_clamped`` — a per-patch
+    boolean mask marking targets the reachable-gamut clamp actually MOVED (the patch is
+    scored against the panel's gamut boundary, not the raw target — an "at the gamut
+    floor" residual, which summaries must report separately from in-gamut error, §0).
+    All-``False`` when ``reachable_primaries`` is ``None`` (no clamp).
     """
     target = Target.hdr_rec2020_pq(white_xy=white_xy)
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
@@ -305,8 +309,16 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
                          nan=0.0, posinf=0.0, neginf=0.0)
     meas = np.maximum(meas, 0.0)
     ideal_xyz = space.ideal_xyz(sig)
+    if reachable_primaries is not None:
+        # The clamp gap identifies the frontier patches: re-derive the raw (unclamped) ideal
+        # and mark rows the chroma clip moved. Tolerance is absolute cd/m² — the clip's own
+        # bisection converges far tighter than 1e-3 nit, so a true no-op never flags.
+        raw_ideal = TargetSpace(target).ideal_xyz(sig)
+        gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > 1e-3, axis=1)
+    else:
+        gamut_clamped = np.zeros(len(sig), dtype=bool)
     delta = space.xyz_to_ictcp(meas) - space.xyz_to_ictcp(ideal_xyz)
-    return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz}
+    return {"de_itp": de_itp(delta), "ideal_xyz": ideal_xyz, "gamut_clamped": gamut_clamped}
 
 
 # The six saturated-ramp hues by which channels are ON (1) vs OFF (0) — R/G/B primaries +

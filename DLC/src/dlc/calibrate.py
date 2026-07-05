@@ -101,7 +101,9 @@ from .measure_loop import (
     run_measure_loop,
 )
 from .decisions import hdr_metric_thresholds
-from .metrics import delta_e2000, percentile, score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab
+from . import metrics as metrics_mod
+from .metrics import (delta_e2000, metrics_scored_payload, percentile, practical_summary,
+                      score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab)
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
@@ -1199,25 +1201,17 @@ class Calibration:
         # before verify, so by then this is populated; fall back to the DIP before the build has run
         # (or a no-build flow), then None. (Self-contained gamut awareness without a probe stage —
         # the literal post-warmup probe is only needed once RAW generation is gamut-aware too.)
-        prim: Optional[dict] = None
-        mp = (self._state.get("mhc_params") or {}).get("primaries")
-        if mp and all(k in mp for k in ("rx", "ry", "gx", "gy", "bx", "by")):
-            prim = {"R": [float(mp["rx"]), float(mp["ry"])],
-                    "G": [float(mp["gx"]), float(mp["gy"])],
-                    "B": [float(mp["bx"]), float(mp["by"])]}
+        # Conversion + degenerate guard shared with the stage tools (metrics.py), so a
+        # stage-CLI score clamps against exactly the same measured gamut this run does (P1).
+        prim = metrics_mod.reachable_primaries_from_mhc_params(self._state.get("mhc_params"))
         if prim is None:
             dip = self._dip()
             if dip is None or not dip.native_primaries:
                 return None
-            prim = {ch: [float(xy[0]), float(xy[1])]
-                    for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2}
-        if len(prim) != 3:
-            return None
-        # Guard a degenerate (collinear) primary triangle — it would make the native NPM singular and
-        # crash inside the clamp. Real panel primaries are never collinear; a near-zero area ⇒ skip.
-        (rx, ry), (gx, gy), (bx, by) = prim["R"], prim["G"], prim["B"]
-        area = abs((gx - rx) * (by - ry) - (bx - rx) * (gy - ry)) / 2.0
-        return prim if area > 1e-6 else None
+            prim = metrics_mod.sanitize_reachable_primaries(
+                {ch: [float(xy[0]), float(xy[1])]
+                 for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2})
+        return prim
 
     def _optimizer_report_scorer(self):
         """The metric the 3D-LUT optimizer's SURFACED numbers are re-scored into for the LLM/user:
@@ -1933,7 +1927,18 @@ class Calibration:
         tell: dict[str, Any] = {"checked": True, "colorspace": colorspace,
                                 "coverage_ratio": round(cov["coverage_ratio"], 4),
                                 "reachable": cov["reachable"], "shortfall": cov["shortfall"],
+                                "degenerate": cov.get("degenerate", False),
                                 "native_primaries": native}
+        if cov.get("degenerate"):
+            # A collinear/point native triangle is a CORRUPT characterization, never a real
+            # panel — without this branch the all-unreachable result below would read as
+            # "target outside the panel's gamut", sending the operator to gamut-map a panel
+            # whose measurement is simply broken. Say what it is: re-characterize.
+            tell["warning"] = (
+                "the stored native primaries are DEGENERATE (collinear/coincident — a corrupt "
+                "or botched characterization, not a real panel gamut). Coverage cannot be "
+                "assessed; re-run `--flow characterize` before trusting any gamut decision.")
+            return tell
         unreachable = [ch for ch, ok in cov["reachable"].items() if not ok]
         if unreachable:
             chans = "/".join(unreachable)
@@ -2169,15 +2174,34 @@ class Calibration:
                   "colorspace": spec.colorspace, "transfer": transfer_label,
                   "white": f"{spec.white.intent} ({spec.white.method})",
                   "white_nits": target_nits, "patch_plan": self.calib["patch_plan"]}
+        plan_warnings: list[str] = []
         if hdr:
             digest["hdr_target"] = hdr.as_dict()
+            # Surface the HdrTarget provenance FLAGS in the seam question itself, not three
+            # levels deep in the digest — each one means "re-characterize", and the plan
+            # seam is the veto point where that is still cheap (fable Phase 6, Phase 2 lead).
+            prov = hdr.provenance or {}
+            if (prov.get("undershoot") or {}).get("clamped"):
+                plan_warnings.append(
+                    "the measured EOTF undershoot implies an implausible boost — the gain was "
+                    f"CLAMPED to {hdr.undershoot_gain:.3f}×; suspect characterization, consider "
+                    "re-measuring before calibrating to it")
+            if (prov.get("peak") or {}).get("sustained_unknown"):
+                plan_warnings.append(
+                    "the target peak rests on no warm/sustained capture "
+                    f"({(prov.get('peak') or {}).get('source', 'unknown source')}) — a peak the "
+                    "panel cannot hold bakes in error; a characterize run grounds it")
+        if plan_warnings:
+            digest["hdr_target_warnings"] = plan_warnings
         self._abort_if(self.adjudicate(AdjudicationRequest(
             key="resolve-target:plan", seam=SEAM_PLAN, stage="resolve-target",
             question=(f"Plan: {flow} calibration of monitor {self.monitor} "
                       f"({self.display.name}) to target '{target}' "
                       f"({transfer_label}, {spec.white.intent}, {nits_label}) — "
                       f"{patch_plan['total_patches']} patches "
-                      f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). Proceed?"),
+                      f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). "
+                      + ("".join(f"⚠ {w}. " for w in plan_warnings))
+                      + "Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
         self.calib["patch_plan"] = {**patch_plan, "approved": True}
@@ -2759,31 +2783,28 @@ class Calibration:
             # HDR scores dE_ITP vs PQ/Rec.2020; SDR CIEDE2000 vs γ-power. Scoring HDR PQ data
             # as an SDR power target (the old unconditional path) produced garbage dE2000 (~30+
             # at mid-gray) on the dashboard's convergence trend — branch like stage_verify.
+            reachable = self._reachable_primaries() if spec.is_hdr else None
             if spec.is_hdr:
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy),
                                                  peak_nits=self._hdr_target().peak_nits,
-                                                 reachable_primaries=self._reachable_primaries())
+                                                 reachable_primaries=reachable)
                 metric_name = "dE_ITP"
             else:
                 metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
                 metric_name = "CIEDE2000"
             summary = summarize_metrics(phase=label, iteration=0, source=p,
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
-            colour_de = [m.de2000 for m in metrics if not m.grayscale]
-            all_de = [m.de2000 for m in metrics]
-            p99 = percentile(all_de, 99.0)
+            practical = practical_summary(metrics, is_hdr=spec.is_hdr,
+                                          gamut_aware=reachable is not None)
             # Snapshot for the timed check-in's live metrics (most recent intermediate score).
             self._last_scored = {"label": label, "metric": metric_name,
                                  "avg": round(summary.avg_de2000, 3), "max": round(summary.max_de2000, 3),
                                  "white": round(summary.white_de2000, 3)}
+            # Canonical event shape (metrics.metrics_scored_payload, P4) — same keys every
+            # producer emits, so the dashboard ΔE panel renders live and stage-CLI runs alike.
             self.runlog.metrics_scored(
-                f"measure:{role}", label=label, iteration=0, metric=metric_name,
-                avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
-                p99_de2000=round(p99, 3),
-                max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
-                grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
-                colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
-                patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
+                f"measure:{role}",
+                **metrics_scored_payload(summary, label=label, practical=practical))
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
             high_spikes = [m for m in metrics if m.de2000 >= 100.0]
             high_fraction = len(high_spikes) / len(metrics) if metrics else 0.0
@@ -2804,14 +2825,15 @@ class Calibration:
                     "metric": metric_name,
                     "avg_de2000": round(summary.avg_de2000, 3),
                     "p95_de2000": round(summary.p95_de2000, 3),
-                    "p99_de2000": round(p99, 3),
+                    "p99_de2000": round(summary.p99_de2000, 3),
                     "max_de2000": round(summary.max_de2000, 3),
                     "white_de2000": round(summary.white_de2000, 3),
                     "high_spike_count": len(high_spikes),
                     "high_spike_fraction": round(high_fraction, 4),
                     "patch_count": summary.patch_count,
                     "worst": [{"rgb": [round(c, 4) for c in m.rgb],
-                               "de2000": round(m.de2000, 3)} for m in worst],
+                               "de2000": round(m.de2000, 3),
+                               "gamut_clamped": m.gamut_clamped} for m in worst],
                 }
                 self.runlog.anomaly(
                     f"measure:{role}",
@@ -2932,8 +2954,14 @@ class Calibration:
                       "profile_name": profile_name, "verified": verify_ok}
             if spec.is_hdr and params.get("peak_chroma"):
                 # Standalone-D65 evidence: the cold-channel-limited Peak-Chroma luminance the
-                # closed-loop refine will hold D65 to (see stage_refine_mhc_cube).
+                # closed-loop refine will hold D65 to (see stage_refine_mhc_cube). Carries the
+                # P16 honesty fields (measured_peak_nonadditivity / cap_nits_nonadditive_est)
+                # so the adjudicator sees how far the nominal-additive cap overshoots (HW-5).
                 digest["peak_chroma"] = params["peak_chroma"]
+            if params.get("dark_floor"):
+                # The σ-aware adaptive dark floor's verdict (Phase 4, F4-1/HW-4): nits + how
+                # many strayed dark reads were σ-verified REAL drift (corrected) vs smoothed.
+                digest["dark_floor"] = params["dark_floor"]
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
@@ -3946,14 +3974,17 @@ class Calibration:
             # scores dE_ITP against PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's
             # Lab is meaningless at HDR absolute luminance), with looser, LLM-negotiated targets.
             wx, wy = self._white_xy()
+            reachable = self._reachable_primaries() if spec.is_hdr else None
             if spec.is_hdr:
                 hdr = self._hdr_target()
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits,
-                                                  reachable_primaries=self._reachable_primaries())
+                                                  reachable_primaries=reachable)
                 metric_name = "dE_ITP"
-                # Advisory HDR defaults (dE_ITP); the assistant negotiates the real target
-                # at the verify seam after the first refinement round (design §7).
-                q = hdr_metric_thresholds()
+                # Advisory HDR defaults (dE_ITP), overlaid by the profile's optional
+                # ``quality: {hdr: {...}}`` block — the same policy source the stage-CLI
+                # scorer reads — then negotiated by the assistant at the verify seam after
+                # the first refinement round (design §7).
+                q = hdr_metric_thresholds(self.profile.quality_policy)
             else:
                 metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
                 metric_name = "CIEDE2000"
@@ -3962,20 +3993,26 @@ class Calibration:
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
                       and summary.max_de2000 <= q.max_de2000 and summary.white_de2000 <= q.white_de2000)
+            # The §0 practically-weighted view (metrics.practical_summary): core (Rec.709 ≤
+            # ref-white, reachable) is the practical verdict; `clamped` isolates residuals at
+            # the panel's gamut floor so they are read as reachability, never calibration error.
+            practical = practical_summary(metrics, is_hdr=spec.is_hdr,
+                                          gamut_aware=reachable is not None)
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
+            # Persist the scored evidence (reports/verification_iter00_{metrics,patch_metrics}.json —
+            # the artifact the dashboard's /api/patch_metrics serves) via the one shared writer;
+            # the event is emitted below through the phase-stamped runlog instead (emit_event=False).
+            metrics_mod.write_metrics(
+                ctx=self.ctx, phase="verification", iteration=0, source=Path(verify_ti3),
+                patch_metrics=metrics, target_luminance=lum, metric=metric_name,
+                practical=practical, emit_event=False)
             # Put the scored dE summary on the spine so the dashboard's ΔE big-numbers
             # panel (and the LLM digest) get it — the rich digest below only reaches the
-            # adjudicator, not events.jsonl. One event carries the whole panel: the
-            # percentiles plus the grayscale-vs-colour split.
-            colour_de = [m.de2000 for m in metrics if not m.grayscale]
+            # adjudicator, not events.jsonl. One event carries the whole panel, in the
+            # canonical shape every producer emits (metrics.metrics_scored_payload, P4).
             self.runlog.metrics_scored(
-                "verify", label="verification", iteration=0, metric=metric_name,
-                avg_de2000=round(summary.avg_de2000, 3), p95_de2000=round(summary.p95_de2000, 3),
-                p99_de2000=round(percentile([m.de2000 for m in metrics], 99.0), 3),
-                max_de2000=round(summary.max_de2000, 3), white_de2000=round(summary.white_de2000, 3),
-                grayscale_avg_de2000=round(summary.grayscale_avg_de2000, 3),
-                colour_avg_de2000=(round(sum(colour_de) / len(colour_de), 3) if colour_de else None),
-                patch_count=summary.patch_count, grayscale_count=summary.grayscale_count)
+                "verify", **metrics_scored_payload(summary, label="verification",
+                                                   practical=practical))
             digest = {"avg_de2000": round(summary.avg_de2000, 3), "p95_de2000": round(summary.p95_de2000, 3),
                       "max_de2000": round(summary.max_de2000, 3), "white_de2000": round(summary.white_de2000, 3),
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
@@ -3987,7 +4024,10 @@ class Calibration:
                       "metric": metric_name, "optimize_metric": "dE_ITP",
                       "target_white_xy": [round(wx, 5), round(wy, 5)],
                       "white_provenance": self._resolved_white().provenance,
-                      "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2)} for m in worst]}
+                      "gamut_aware": reachable is not None,
+                      "practical": practical,
+                      "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2),
+                                 "gamut_clamped": m.gamut_clamped} for m in worst]}
             return StageOutcome("verify", "done", digest=digest,
                                 data={"within_quality": within, "metrics": {
                                     "avg_de2000": summary.avg_de2000, "p95_de2000": summary.p95_de2000,
@@ -4012,6 +4052,20 @@ class Calibration:
         return outcome
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
+        """Is a failed verify CATASTROPHIC (recommend revert) rather than merely
+        sub-quality (recommend apply, escalate via gate_failed)? These are not quality
+        thresholds — they answer "is the panel visibly WORSE than uncalibrated?".
+
+        Provenance (fable audit Phase 6, P3): each constant is ~10× its mode's advisory
+        acceptance target (SDR avg 20 vs gate 1.5→severe at ~13×, p95 40 vs 3.0; HDR avg
+        30 vs 3.0, p95 60 vs 6.0) — an order of magnitude past the gate is a broken
+        install (wrong LUT, collapsed channel, scoring mismatch), never a marginal miss.
+        The recorded hardware baselines sit two orders below (SDR 0.41 avg; HDR 3.26
+        grayscale WITH gamut-floor patches counted, pre-P1). max/white at 100 ≈ "a
+        primary/white read as a different colour entirely" (full-scale Lab/ITP error);
+        SDR white at 50 is tighter because a mid-double-digit ΔE2000 white cast is
+        already unmistakably broken on any SDR desktop. Deliberately blunt: the severe
+        path only flips the RECOMMENDATION to revert — the seam still decides."""
         if outcome.data.get("within_quality"):
             return False
         d = outcome.digest or {}

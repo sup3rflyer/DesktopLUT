@@ -33,7 +33,21 @@ def _de_table(de: dict[str, Any]) -> str:
              ("grayscale", de.get("grayscale")), ("colour", de.get("colour"))]
     tds = "".join(f"<div class='bn'><b>{_num(v)}</b><label>{html.escape(k)}</label></div>" for k, v in cells)
     src = de.get("phase") or ""
-    return f"<div class='bignums'>{tds}</div><p class='muted'>source: {html.escape(str(src))}</p>"
+    # The §0 practical split when the scored event carried it: core (Rec.709 ≤ ref-white,
+    # reachable) is the practical verdict; "gamut floor" isolates unreachable-target
+    # residuals so the headline is never frontier-dominated.
+    practical = de.get("practical") or {}
+    extra = ""
+    core = practical.get("core") or {}
+    clamped = practical.get("clamped") or {}
+    if core.get("n"):
+        extra += (f"<p class='muted'>practical core (Rec.709 ≤ ref-white): "
+                  f"avg {_num(core.get('avg'))} · max {_num(core.get('max'))} "
+                  f"over {core.get('n')} patches</p>")
+    if clamped.get("n"):
+        extra += (f"<p class='muted'>at gamut floor (unreachable targets): "
+                  f"avg {_num(clamped.get('avg'))} over {clamped.get('n')} patches</p>")
+    return f"<div class='bignums'>{tds}</div><p class='muted'>source: {html.escape(str(src))}</p>{extra}"
 
 
 def _safe_json(obj: Any) -> str:

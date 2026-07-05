@@ -72,7 +72,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = _common.base_parser("DLC check-cube: 3D LUT structural integrity")
     parser.add_argument("--cube", default=None, help="cube to check (default: latest built)")
     parser.add_argument("--iteration", type=int, default=1)
-    parser.add_argument("--max-neighbor-delta", type=float, default=1.0, dest="max_neighbor_delta")
+    parser.add_argument(
+        "--max-neighbor-delta", type=float, default=None, dest="max_neighbor_delta",
+        help="structural ceiling for a neighbour step (default: derived from the grid pitch "
+             "— see lut_integrity.default_neighbor_delta_allowed)")
     parser.add_argument(
         "--max-monotonicity-violations", type=int, default=0, dest="max_monotonicity_violations"
     )

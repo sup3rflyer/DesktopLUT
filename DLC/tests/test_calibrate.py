@@ -272,6 +272,41 @@ def test_gamut_tell_quiet_when_native_covers_target(tmp_path: Path):
     assert "warning" not in tell
 
 
+def test_gamut_tell_names_a_degenerate_characterization(tmp_path: Path):
+    # A collinear native triangle is a CORRUPT characterization — the tell must say
+    # "re-characterize", not "target outside the panel's gamut" (which would send the
+    # operator to gamut-map a panel whose measurement is simply broken). Fable Phase 6.
+    calib = _make(tmp_path, "gamutdeg")
+    calib.target_name = "srgb_g22"
+    _inject_dip(calib, native_primaries={"R": [0.3, 0.3], "G": [0.4, 0.4], "B": [0.5, 0.5]})
+    tell = calib._gamut_tell()
+    assert tell["checked"] and tell["degenerate"] is True
+    assert "characteriz" in tell["warning"].lower()
+    assert "unreachable" not in tell["warning"].lower()
+
+
+def test_hdr_plan_seam_surfaces_target_provenance_warnings(tmp_path: Path):
+    # HdrTarget provenance flags (clamped undershoot gain / ungrounded peak) must reach
+    # the plan seam's QUESTION, where a veto is still cheap — not sit three levels deep
+    # in the digest (fable Phase 6, from the Phase 2 lead).
+    # no DIP at all → placeholder peak, flagged ungrounded (checked FIRST — the DIP store
+    # is shared across runs in this tmp dir, so inject only after this case)
+    ungrounded = _make(tmp_path, "planwarn2", mode="HDR")
+    outcome2 = ungrounded.stage_resolve_target()
+    warnings2 = outcome2.digest.get("hdr_target_warnings")
+    assert warnings2 and any("cold_start_placeholder" in w for w in warnings2)
+
+    calib = _make(tmp_path, "planwarn", mode="HDR")
+    # −0.5 undershoot ⇒ raw boost 2.0× > MAX_UNDERSHOOT_GAIN ⇒ clamped+flagged provenance
+    _inject_dip(calib, native_white_nits=1800.0, sustained_peak_nits=1500.0,
+                eotf_undershoot=-0.5)
+    outcome = calib.stage_resolve_target()
+    warnings = outcome.digest.get("hdr_target_warnings")
+    assert warnings and any("CLAMPED" in w for w in warnings)
+    # grounded, sustained-captured peak ⇒ no peak warning alongside
+    assert not any("sustained" in w and "capture" in w for w in warnings)
+
+
 def test_reachable_primaries_are_hdr_only_and_guard_degenerate(tmp_path: Path):
     # SDR gamut-clamp was CV-gated worse, so production SDR deliberately leaves reachable primaries
     # off. HDR still uses the measured native gamut to score true OOG Rec.2020 clips as clips.
@@ -598,6 +633,16 @@ def test_verify_emits_scored_metrics_onto_the_spine(tmp_path: Path):
     # it must reach the LLM (digest tier), not just the dashboard
     assert scored[-1].effective_tier == "digest"
     assert scored[-1] in digest_projection(events)
+    # the §0 practical split rides the same event (fable Phase 6): core is the verdict
+    practical = d.get("practical")
+    assert practical and practical["core"]["n"] > 0
+    # ...and the verify digest + persisted artifacts carry it too (one shape everywhere)
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert verify["practical"]["core"]["n"] == practical["core"]["n"]
+    assert "gamut_aware" in verify
+    reports = calib.ctx.root / "reports"
+    assert (reports / "verification_iter00_metrics.json").exists()
+    assert (reports / "verification_iter00_patch_metrics.json").exists()
 
 
 def test_verify_aborts_cleanly_on_empty_ti3(tmp_path: Path):
