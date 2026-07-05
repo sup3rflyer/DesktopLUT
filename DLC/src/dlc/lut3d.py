@@ -390,8 +390,14 @@ def apply_3dlut_candidate(
     cube_path: Path | None = None,
     monitor: int = 0,
 ) -> dict[str, Any]:
-    cube = resolve_run_path(ctx, cube_path or latest_3dlut_cube(ctx) or Path(""))
-    if not cube.exists():
+    candidate = cube_path or latest_3dlut_cube(ctx)
+    if candidate is None:
+        # NB: falling through to a placeholder like Path("") is not safe here — it resolves
+        # to the cwd, a directory that EXISTS, and would be sent to DesktopLUT as the cube.
+        raise FileNotFoundError(
+            "no 3D LUT cube recorded in this run; run build-3dlut or pass cube_path")
+    cube = resolve_run_path(ctx, candidate)
+    if not cube.is_file():
         raise FileNotFoundError(f"3D LUT cube not found: {cube}")
     commands = [
         client.disable_grayscale_tweak(monitor, ctx.manifest.mode),

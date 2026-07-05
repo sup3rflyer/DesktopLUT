@@ -153,6 +153,33 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Fixed
+- **Fable audit Phase 5 — the correction machine & 3D-LUT engine**
+  (`docs/audits/fable/phase-5.md`): the **gamut-aware (#C3) correction was internally
+  inconsistent** — the error model trained its delta against the reachable-CLAMPED ideal
+  while the LUT builder's steering inverted the raw UNCLAMPED map, so wherever a target
+  clipped, the fixed point was wrong by the clamp gap: on a synthetic sub-gamut panel the
+  machine drove a reachable boundary colour from 7 to 29 dE_ITP and then misreported the
+  survivors as panel floors. The delta now trains against the raw ideal and the clamp
+  stays on the target side only, making the fixed point `panel(s*) = clamped_target` —
+  post-fix the same panel goes 119 → 16 above-threshold and the honesty contract holds
+  (a pure gamut floor reports `physical_floor`, never `budget_limited`); in-gamut and
+  `reachable_primaries=None` behaviour is bit-identical, so the live effect is HDR
+  frontier corners (HW-6 queued). The outer loop now **reuses the deterministic
+  model/cube when neither the training set nor the budget changed** (the
+  force-full-validation path re-paid the full k-fold CV — measured 9–43 s CPU at real
+  fold-back sizes — for a bit-identical rebuild); `auto_smooth`'s 1e-4 search floor was
+  re-derived as correct and its CV cost measured-and-documented (search narrowing
+  rejected: path-dependence for ~1 % wall clock). `apply_3dlut_candidate` no longer
+  resolves a missing cube to the *current directory* and sends it to DesktopLUT (clear
+  `FileNotFoundError` instead). The orphaned `engine/lut_sdr.py` (zero production
+  callers, name-collided with the live `mhc_cube.build_sdr_cube`) is quarantined as
+  `engine/lut_sdr_reference.py`; `lut_constrained`/`physical` stay as documented opt-in
+  probe engines. §0 evaluations quantified: the returned-cube ranking cannot trade the
+  practical core for a corner win (snapshot core spread ≤ 0.3 dE_ITP; neutral fade pins
+  the diagonal) and adaptive sampling matches full sampling on the core within 0.04
+  dE_ITP. The `.cube` R-fastest ordering convention (4 independent hard-codings), the
+  singular-later-build keep-best path, and `build_cube`'s black/near-black invariants
+  are now test-pinned. 7 new tests.
 - **Fable audit Phase 4 — the MHC layer** (`docs/audits/fable/phase-4.md`): the adaptive
   dark floor is now **σ-aware** — a strayed dark gray read whose chroma drift clearly
   exceeds its measured repeatability (noise sidecar) is treated as the REAL, correctable

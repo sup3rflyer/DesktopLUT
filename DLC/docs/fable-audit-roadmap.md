@@ -39,6 +39,17 @@ fixable, and leave a written trail. Nothing is one-shotted.
   both modes), P16 quantified (+1.76 % nominal-cap overshoot) with honest diagnostics
   landed, P18 quarantined (`refine_sdr_grayscale_legacy`), safety-ceiling contract pinned
   both modes. P5/P6 → I (documented); P7/P8/P10 re-verified. Leads added to Phases 6/9/11.
+- **Updated:** 2026-07-05, Phase 5 complete on `claude/charming-hamilton-0xf1g9`
+  (report: `docs/audits/fable/phase-5.md`). The headline: a real correctness bug in the
+  gamut-aware (#C3) path — the error model trained its delta against the CLAMPED ideal
+  while the builder inverted the UNCLAMPED map, so reachable boundary colours were driven
+  AWAY from their clamped targets (7→29 dE on a synthetic sub-gamut panel) and misreported
+  as floors; fixed (delta now trains raw, clamp stays on the target side) — HW-6 queued.
+  Plus: exact model/cube reuse on the force-full path (CV cost measured, search narrowing
+  rejected), `apply_3dlut_candidate` cwd-as-cube bug fixed, `lut_sdr` quarantined as
+  `lut_sdr_reference` (name-collided with the live `mhc_cube.build_sdr_cube`),
+  §0 `_rank`/adaptive-probe evaluations quantified (core spread ≤0.3 dE_ITP — no
+  corner-trading found), R-fastest indexing cross-pinned. P9 re-verified I.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -190,7 +201,7 @@ Classification: **I** = intentional (keep, ensure documented), **S** = suspect
 | P6 | Refine damping | cube 0.85, legacy grayscale 0.7 | cube 0.85 | I | 4 — *Phase 4: 0.7 belongs to the coarse 32-point deviation-domain law (mis-registration risk), 0.85 to dense linear-light cube composition; both closed-loop (F4-6)* |
 | P7 | Refine convergence target | 0.5 ΔE2000 | 2.0 dE_ITP | I (units differ) | 4 — *re-verified: ~1.0 ≈ 1 JND in both scales; the stop logic (floor/regress/safety), not the target, is the guarantee* |
 | P8 | Deep-shadow reference anchor | brightest patch | 100–203 nit diffuse-white band | I | 4 — *audit-verified + pre-existing test pin* |
-| P9 | 3D-LUT correction cap | 0.5 | 0.25 | I (documented; single-panel CV — re-verify) | 5 |
+| P9 | 3D-LUT correction cap | 0.5 | 0.25 | I | 5 — *re-verified: provenance documented at `SDR_CORRECTION_CAP` + `_cube_optimize_config` (post-MHC residual vs cube-owns-all-colour; HANDOFF item H CV plateau ~0.5; only the DEFAULT ceiling is mode-lifted); the empirical single-panel-CV side re-verifies with HW-1's before/after scores* |
 | P10 | Grayscale bridge domain (`mhc_grayscale`) | signal-domain t² resample | pass-through | I | 4 — *audit-verified against the replicated C++ convention (test_mhc_grayscale)* |
 | P11 | Dummy ICC | Argyll sRGB.icm | Rec2020.icm **placeholder** (`profiles.py:46`) | G | 6 |
 | P12 | Refine-stage dispatch | `_flow_*` switches on `_spec().is_hdr`; `_planned_stages` switches on `self.mode` — can diverge | same | S | 7 |
@@ -563,6 +574,14 @@ with them — this is what the user and the LLM actually see.
   `peak_chroma.measured_peak_nonadditivity` / `cap_nits_nonadditive_est` (P16) and
   `dark_floor.n_real_drift` (how many strayed dark reads were σ-verified REAL drift and
   therefore corrected, not smoothed).
+- *(Phase 5)* the optimize digest already breaks out the neutral axis in the report metric
+  (`neutral_{mean,max}_de_report`) — the practically-weighted score can consume it as-is.
+  F5-1 (gamut-aware delta fix) makes the model consistent with gamut-aware scoring, so the
+  P1 unification's live-vs-stage numbers will agree for the right reason. Also: the
+  `check-cube` structural gate's smoothness arm is toothless at defaults
+  (`max_neighbor_delta_allowed=1.0` admits a full-range jump; a 33-grid identity step is
+  ~0.031 and `cube_diagnostics` calls 0.008 a large reversal) — derive a principled default
+  from grid pitch when unifying the gates.
 - *(Phase 2, §0)* the practically-weighted score should reuse the Phase 2 density
   artifact's bands (`docs/audits/fable/phase-2.md` §2: luminance bands ×
   neutral/near-neutral(≤0.20)/mid(≤0.60)/edge saturation, frontier = >203 nit /
@@ -857,6 +876,12 @@ new-surface leads dispositioned.
   `build_mhc_candidate`, `identity_curves`, `write_cube`, `write_summary`,
   `load_mhc_candidate` — now banner-separated from the live parser tier) and
   `mhc_cube.refine_sdr_grayscale_legacy` are tests-only. Final delete-vs-keep here.
+- *(Phase 5, confirmed)* `engine/lut_sdr_reference.py` (quarantine-renamed from `lut_sdr.py`;
+  the orphaned additive matrix+curve 3D builder — needs the design-notes §8 check, phase-5.md
+  §7) and `lut3d.apply_3dlut_candidate` (zero production callers; orchestrator uses
+  `set_3dlut`, stage CLI uses `install_3dlut.py`) — final dispositions here.
+  `lut_constrained`/`physical` were DECIDED in Phase 5: keep, opt-in probes
+  (wired via `OptimizeConfig.engine`, tested, CV-rejection documented).
 - Packaging: `pip install -e .` / `.[engine]` / `.[meter]` / `.[test]` on Linux +
   Windows expectations; `test_packaging.py` scope; wheel build sanity — including
   the Phase 0 notes: `paths.PROJECT_DIR` anchors `runs/`/`third_party/` via
@@ -938,6 +963,7 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-3 | ConPTY persistent-spotread specifics stay box-validated-only: trigger keystroke delivery, `cols=1000` no-wrap, i1d3 startup-calibration handshake (quiescence fallback) | Phase 3 |
 | HW-4 | F4-1 (σ-aware adaptive dark floor): on the next multi-read box run, confirm dark-drift correction engages in the ~0.3–5-nit band where reads are repeatable (previously smoothed to identity); spot-check no noise-chasing regression; sanity-check `dark_floor` info (`n_strayed`/`n_real_drift`) against the panel's known behaviour | Phase 4 |
 | HW-5 | F4-3 (P16): compare `peak_chroma.cap_nits_nonadditive_est` against the HDR refine's actually-landed D65 peak — decides whether the Peak-Chroma cap should adopt the first-order non-additivity correction | Phase 4 |
+| HW-6 | F5-1 (gamut-aware delta fix): on the next HDR box run, compare 3D-LUT frontier-corner residuals + optimizer floor counts/classifications vs the recorded baseline — reachable-boundary corners should improve or hold, previously-reported near-boundary "floors" may partially resolve; in-gamut and SDR numbers unchanged | Phase 5 |
 | — | *(phases append here)* | |
 
 ## 8. v3 horizon — packaging & interface (parked)
@@ -992,7 +1018,7 @@ phase — v3 inherits whatever confidence v2 earns, and only that.
 - [x] Phase 2 — Patch generation, transfers, targets *(2026-07-05, `claude/fable-audit-phase-2-5zoyx9` — see `docs/audits/fable/phase-2.md`)*
 - [x] Phase 3 — Measurement stack *(2026-07-05, `claude/fable-audit-phase-3-ofaaap` — see `docs/audits/fable/phase-3.md`; ran as one session, no 3a/3b split needed)*
 - [x] Phase 4 — MHC layer (matrix, base cube, refines, bridges) *(2026-07-05, `claude/fable-audit-phase-4-ev6mkc` — see `docs/audits/fable/phase-4.md`)*
-- [ ] Phase 5 — Correction machine & 3D-LUT engine
+- [x] Phase 5 — Correction machine & 3D-LUT engine *(2026-07-05, `claude/charming-hamilton-0xf1g9` — see `docs/audits/fable/phase-5.md`)*
 - [ ] Phase 6 — Scoring, verify gates, reporting truth
 - [ ] Phase 7 — Orchestrator spine (7a correctness · 7b structure)
 - [ ] Phase 8 — LLM seams & intelligence

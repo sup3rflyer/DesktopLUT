@@ -1,4 +1,14 @@
-"""SDR matrix + per-channel-curve 3D LUT builder.
+"""SDR matrix + per-channel-curve 3D LUT builder — PRODUCTION-UNREACHABLE REFERENCE.
+
+**Do not wire into a flow.** This module has zero production callers (Phase 5 audit,
+2026-07-05): the shipping SDR path is ``mhc_cube.build_sdr_cube`` (the per-channel 1D
+base cube — a DIFFERENT function that previously shared this one's module name via
+``engine.lut_sdr``) for the MHC foundation, plus ``optimize.optimize_cube`` (the RBF
+correction machine) for the 3D LUT. It is kept only as the decoupled port of the
+lab's ``generate_sdr_lut.py`` (the conservative additive matrix+curve model,
+v2-design-notes §8) with its tests pinning the math; the ``_reference`` module name
+makes accidental wiring visible at the import site. Final delete-vs-keep is
+Phase 11's sweep, pending the design-notes check (Phase 5 report, needs-owner-input).
 
 Ported from the ColorCalibration lab's ``generate_sdr_lut.py`` and decoupled from
 the ColourSpace ``.bcs`` reader: the builder consumes DLC's own measured channel
