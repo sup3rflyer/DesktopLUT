@@ -232,6 +232,9 @@ const int DEVICE_CHANGE_TIMER_ID = 104;    // Debounce WM_DEVICECHANGE
 const int DWM_HOOK_WATCHDOG_TIMER_ID = 105; // Periodic health check for DWM hook injection
 const int DWM_HOOK_WATCHDOG_INTERVAL_MS = 5000; // Check every 5 seconds
 const int DWM_HOOK_WATCHDOG_MAX_RETRIES = 3;    // Max consecutive re-injection failures before giving up
+const int DWM_HOOK_WATCHDOG_MAX_REINJECTS = 5;  // Max total re-injection cycles before declaring the hook unstable
+                                                // (guards against a succeed-then-lose flap loop that flashes the
+                                                // screen black — seen on some Windows 10 builds, see issue #3)
 const int MHC_VERIFY_TIMER_ID = 106;            // Periodic re-assertion of MHC ICC profile associations
 const int MHC_VERIFY_INTERVAL_MS = 15000;       // Check every 15s — catches silent profile drops by Windows
 const int MHC_BLIND_KICK_TIMER_ID = 107;        // Periodic unconditional reload of hardware MHC2 state

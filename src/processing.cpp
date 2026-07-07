@@ -918,7 +918,14 @@ void StartProcessing() {
             std::wstring err = InjectDwmHook(dwmMonitors);
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
-                SetStatus(err.c_str());
+                // Status bar can only show a single short line — surface the full,
+                // actionable detail (e.g. the DwmHook.dll-missing guidance) in a dialog.
+                std::wstring firstLine = err.substr(0, err.find(L'\n'));
+                SetStatus(firstLine.c_str());
+                if (g_gui.hwndMain) {
+                    MessageBoxW(g_gui.hwndMain, err.c_str(),
+                                L"DesktopLUT — DWM Hook", MB_OK | MB_ICONWARNING);
+                }
                 return;
             }
         }
@@ -1002,6 +1009,7 @@ void StartProcessing() {
 
         // Start DWM hook watchdog timer (detects DWM restart / hook loss)
         g_dwmHookWatchdogRetries = 0;
+        g_dwmHookReinjectCount = 0;
         if (g_gui.hwndMain)
             SetTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID, DWM_HOOK_WATCHDOG_INTERVAL_MS, nullptr);
 
