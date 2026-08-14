@@ -11,6 +11,14 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Verify quality gate scores the practical buckets, not the OOG-inflated overall**
+  (owner directive, 2026-08-14: out-of-gamut patches are a framework, not the meat).
+  `within_quality` now judges core avg/p95/max + neutral-tube avg + white against the
+  acceptance targets; gamut-limit/clamped patches remain reported context. The seam
+  question leads with the gated numbers, the digest carries a `gate` basis with
+  per-check verdicts, and the severe-failure heuristic judges the same basis (a huge
+  OOG residual over a clean core no longer reads as a catastrophic install). Legacy
+  overall gate is the fallback for a degenerate set with no core patches.
 - **Scripted calibration orchestrator** (`dlc/calibrate.py`, `dlc-calibrate`) — the
   state machine that runs a whole calibration as a **named flow** (`full` /
   `3dlut-only` / `gray-wb`; HDR is the later goal), wiring the controller, the

@@ -3548,3 +3548,82 @@ def test_score_anomaly_pause_survives_resume_without_rescoring(tmp_path: Path):
     assert reads["n"] == 0                                        # memo replay — no re-measure
     assert outcome.digest.get("score_anomaly") is True            # flags survived via the record
     assert resumed.calib["decisions"][key]["choice"] == "accept"  # the seam WAS re-reached + decided
+
+
+# ---------------------------------------------------------------------------
+# _quality_gate — the D3 practical gate (2026-08-14): OOG is framework, not meat
+# ---------------------------------------------------------------------------
+
+def _summary(avg=1.0, p95=2.0, mx=3.0, white=1.0, n=100):
+    from dlc.metrics import MetricsSummary
+    return MetricsSummary(phase="verification", iteration=0, source="t.ti3", metric="dE_ITP",
+                          patch_count=n, grayscale_count=10, target_luminance=100.0,
+                          avg_de2000=avg, p95_de2000=p95, max_de2000=mx, white_de2000=white,
+                          grayscale_avg_de2000=1.0, grayscale_max_de2000=2.0,
+                          metrics_path=None, patches_path=None)
+
+
+def _q(avg=3.0, p95=6.0, mx=10.0, white=4.0):
+    import types
+    return types.SimpleNamespace(avg_de2000=avg, p95_de2000=p95, max_de2000=mx, white_de2000=white)
+
+
+def test_quality_gate_scores_practical_core_not_oog_inflated_overall():
+    """The 2026-08-14 HDR shape: overall avg 6.77 (OOG-inflated) but core 1.01 —
+    the gate passes on the practical buckets; the overall is framework context."""
+    practical = {"gamut_aware": True,
+                 "core": {"avg": 1.008, "p95": 2.283, "max": 5.682, "n": 86},
+                 "tube": {"avg": 1.377, "p95": 4.119, "max": 7.48, "n": 99},
+                 "limits": {"avg": 8.1, "p95": 30.0, "max": 30.2, "n": 103},
+                 "clamped": {"avg": 9.9, "p95": 62.8, "max": 62.9, "n": 114}}
+    within, basis = Calibration._quality_gate(_summary(avg=6.772, p95=30.1, mx=62.9, white=3.9),
+                                              practical, _q())
+    assert within is True
+    assert basis["basis"].startswith("practical")
+    assert all(basis["checks"].values())
+    assert basis["scored"]["core_avg"] == 1.008
+
+
+def test_quality_gate_core_failure_still_fails():
+    practical = {"core": {"avg": 5.0, "p95": 8.0, "max": 12.0, "n": 50},
+                 "tube": {"avg": 1.0, "p95": 2.0, "max": 3.0, "n": 20}}
+    within, basis = Calibration._quality_gate(_summary(), practical, _q())
+    assert within is False
+    assert basis["checks"]["core_avg"] is False
+
+
+def test_quality_gate_white_and_tube_guard_the_neutral_axis():
+    core_ok = {"avg": 1.0, "p95": 2.0, "max": 3.0, "n": 50}
+    # white over target → fail even with a clean core
+    within, basis = Calibration._quality_gate(
+        _summary(white=4.5), {"core": core_ok, "tube": {"avg": 1.0, "n": 20, "p95": 2.0, "max": 3.0}}, _q())
+    assert within is False and basis["checks"]["white"] is False
+    # a colour-only set (no tube bucket) must NOT vacuously pass the cast check
+    within, basis = Calibration._quality_gate(
+        _summary(), {"core": core_ok, "tube": {"n": 0}}, _q())
+    assert within is False and basis["checks"]["tube_avg"] is False
+
+
+def test_quality_gate_empty_core_falls_back_to_legacy_overall():
+    within, basis = Calibration._quality_gate(
+        _summary(avg=1.0, p95=2.0, mx=3.0, white=1.0), {"core": {"n": 0}, "tube": {"n": 0}}, _q())
+    assert within is True
+    assert basis["basis"].startswith("overall")
+    within, _ = Calibration._quality_gate(
+        _summary(avg=99.0), {"core": {"n": 0}}, _q())
+    assert within is False
+
+
+def test_severe_verify_failure_uses_gate_basis_core_not_overall():
+    """A fine core under a huge OOG residual must not read as a catastrophic install."""
+    calib = object.__new__(Calibration)  # _severe_verify_failure touches no instance state
+    digest = {"metric": "dE_ITP", "avg_de2000": 35.0, "p95_de2000": 70.0, "max_de2000": 90.0,
+              "white_de2000": 3.0,
+              "gate": {"basis": "practical core+tube+white (D3)"},
+              "practical": {"core": {"avg": 1.2, "p95": 2.5, "max": 6.0, "n": 60}}}
+    outcome = StageOutcome("verify", "done", digest=digest, data={"within_quality": False})
+    assert Calibration._severe_verify_failure(calib, outcome) is False
+    # legacy basis (no practical gate) keeps the blunt overall check
+    digest_legacy = dict(digest, gate={"basis": "overall (legacy fallback: empty core bucket)"})
+    outcome = StageOutcome("verify", "done", digest=digest_legacy, data={"within_quality": False})
+    assert Calibration._severe_verify_failure(calib, outcome) is True

@@ -4065,13 +4065,20 @@ class Calibration:
                 q = self.profile.quality
             summary = summarize_metrics(phase="verification", iteration=0, source=Path(verify_ti3),
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
-            within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
-                      and summary.max_de2000 <= q.max_de2000 and summary.white_de2000 <= q.white_de2000)
             # The §0 practically-weighted view (metrics.practical_summary): core (Rec.709 ≤
             # ref-white, reachable) is the practical verdict; `clamped` isolates residuals at
             # the panel's gamut floor so they are read as reachability, never calibration error.
             practical = practical_summary(metrics, is_hdr=spec.is_hdr,
                                           gamut_aware=reachable is not None)
+            # QUALITY GATE (owner directive D3, 2026-08-14): OOG patches are a FRAMEWORK, not
+            # the meat — the deterministic gate scores the practical core/tube/white buckets,
+            # never the OOG-inflated overall. On the first full HDR run the overall avg (6.77)
+            # could NEVER pass the 3.0 target because 217/303 verify patches were limits/
+            # clamped Rec.2020 targets, while the core sat at 1.01 — the gate said "fail" about
+            # reachability, not calibration. SDR is unchanged by construction (every unclamped
+            # SDR target is core). Fallback to the legacy overall gate if core is empty (a
+            # degenerate set — e.g. a truncated verify — must not vacuously pass).
+            within, gate_basis = self._quality_gate(summary, practical, q)
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
             # Persist the scored evidence (reports/verification_iter00_{metrics,patch_metrics}.json —
             # the artifact the dashboard's /api/patch_metrics serves) via the one shared writer;
@@ -4091,6 +4098,10 @@ class Calibration:
                       "max_de2000": round(summary.max_de2000, 3), "white_de2000": round(summary.white_de2000, 3),
                       "grayscale_avg_de2000": round(summary.grayscale_avg_de2000, 3),
                       "patch_count": summary.patch_count, "within_quality": within,
+                      # What the gate actually scored (practical core/tube/white vs legacy
+                      # overall) + the per-check verdicts, so the seam shows WHY, not just
+                      # pass/fail (D3, 2026-08-14).
+                      "gate": gate_basis,
                       # Only the dE acceptance targets — not the iteration-control knobs that
                       # share MetricThresholds — so the verify seam (the LLM's judgment surface)
                       # sees quality criteria, not loop knobs.
@@ -4111,10 +4122,21 @@ class Calibration:
         d = outcome.digest
         within = outcome.data.get("within_quality")
         severe = self._severe_verify_failure(outcome)
+        # The question quotes the numbers the GATE scored (practical core/tube/white when
+        # available — D3) with the overall avg as context, so the seam's first line no
+        # longer leads with an OOG-inflated headline the digest then has to walk back.
+        scored = (d.get("gate") or {}).get("scored") or {}
+        if scored:
+            reads = (f"core avg {scored.get('core_avg')} (p95 {scored.get('core_p95')}, "
+                     f"max {scored.get('core_max')}), tube {scored.get('tube_avg')}, "
+                     f"white {scored.get('white')} {d.get('metric', 'ΔE')} "
+                     f"(overall avg {d.get('avg_de2000')} incl. gamut-limit/OOG framework)")
+        else:
+            reads = (f"avg {d.get('metric', 'ΔE')} {d.get('avg_de2000')} "
+                     f"(white {d.get('white_de2000')}, max {d.get('max_de2000')})")
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
-            question=(f"The new calibration reads avg {d.get('metric', 'ΔE')} {d.get('avg_de2000')} "
-                      f"(white {d.get('white_de2000')}, max {d.get('max_de2000')}) — "
+            question=(f"The new calibration reads {reads} — "
                       f"{'within' if within else 'outside'} the quality targets. "
                       "Apply this calibration, or revert to the previous display setup?"),
             options=("apply", "revert"),
@@ -4128,6 +4150,47 @@ class Calibration:
             digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within),
                     "before_scores": self.calib.get("stage_scores") or None}))
         return outcome
+
+    @staticmethod
+    def _quality_gate(summary, practical: dict, q) -> tuple[bool, dict]:
+        """The deterministic verify quality gate (D3, 2026-08-14): score the practical
+        core/tube/white buckets against the acceptance targets — OOG/limits patches are
+        reachability framework, never gate inputs. Returns ``(within, gate_basis)`` where
+        ``gate_basis`` records what was scored and each check's verdict (seam evidence).
+
+        * ``core``  — avg/p95/max vs the mode's acceptance targets (the practical verdict).
+        * ``tube``  — avg vs the avg target (a neutral cast must not hide behind core colour).
+        * ``white`` — the summary white vs the white target (unchanged).
+        * Fallback: an empty core bucket (degenerate/truncated set) uses the legacy overall
+          summary gate — a gate must never pass vacuously.
+        """
+        core = (practical or {}).get("core") or {}
+        tube = (practical or {}).get("tube") or {}
+        if not core.get("n"):
+            within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
+                      and summary.max_de2000 <= q.max_de2000
+                      and summary.white_de2000 <= q.white_de2000)
+            return within, {"basis": "overall (legacy fallback: empty core bucket)",
+                            "checks": {"avg": summary.avg_de2000 <= q.avg_de2000,
+                                       "p95": summary.p95_de2000 <= q.p95_de2000,
+                                       "max": summary.max_de2000 <= q.max_de2000,
+                                       "white": summary.white_de2000 <= q.white_de2000}}
+        checks = {
+            "core_avg": core["avg"] <= q.avg_de2000,
+            "core_p95": core["p95"] <= q.p95_de2000,
+            "core_max": core["max"] <= q.max_de2000,
+            # No tube bucket (a colour-only set) must not vacuously pass the cast check —
+            # but DLC sequences always carry the neutral tube, so treat missing as pass
+            # only when core itself covered neutrals is unknowable; be strict instead.
+            "tube_avg": bool(tube.get("n")) and tube["avg"] <= q.avg_de2000,
+            "white": summary.white_de2000 <= q.white_de2000,
+        }
+        basis = {"basis": "practical core+tube+white (D3)", "checks": checks,
+                 "scored": {"core_avg": core["avg"], "core_p95": core["p95"],
+                            "core_max": core["max"], "core_n": core["n"],
+                            "tube_avg": tube.get("avg"), "tube_n": tube.get("n"),
+                            "white": summary.white_de2000}}
+        return all(checks.values()), basis
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
         """Is a failed verify CATASTROPHIC (recommend revert) rather than merely
@@ -4147,9 +4210,16 @@ class Calibration:
         if outcome.data.get("within_quality"):
             return False
         d = outcome.digest or {}
-        avg = _as_float_local(d.get("avg_de2000")) or 0.0
-        p95 = _as_float_local(d.get("p95_de2000")) or 0.0
-        max_de = _as_float_local(d.get("max_de2000")) or 0.0
+        # Judge severity on the SAME basis the gate scored (D3): when the practical gate
+        # ran, a huge OOG/limits residual must not read as "catastrophic install" while
+        # the core is fine — core stats carry the severity check; white stays the summary
+        # white either way.
+        core = {}
+        if str((d.get("gate") or {}).get("basis", "")).startswith("practical"):
+            core = (d.get("practical") or {}).get("core") or {}
+        avg = _as_float_local(core.get("avg") if core.get("n") else d.get("avg_de2000")) or 0.0
+        p95 = _as_float_local(core.get("p95") if core.get("n") else d.get("p95_de2000")) or 0.0
+        max_de = _as_float_local(core.get("max") if core.get("n") else d.get("max_de2000")) or 0.0
         white = _as_float_local(d.get("white_de2000")) or 0.0
         if d.get("metric") == "dE_ITP":
             return avg >= 30.0 or p95 >= 60.0 or max_de >= 100.0 or white >= 100.0
