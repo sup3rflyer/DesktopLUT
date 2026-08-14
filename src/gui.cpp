@@ -47,6 +47,20 @@ const GUID GUID_CONSOLE_DISPLAY_STATE_GUI =
 // SECTION: Utilities
 // ============================================================================
 
+// Pure gate decision — see gui_mhc.h for the contract. Kept free of Win32/global
+// state so the doctest suite can pin the truth table.
+PreviewModeGate EvaluatePreviewModeGate(bool requestedHDR, bool ctxHDR,
+                                        bool freshQueryOk, bool freshHDR) {
+    if (freshQueryOk) {
+        if (freshHDR != requestedHDR) return PreviewModeGate::Mismatch;
+        return (ctxHDR == requestedHDR) ? PreviewModeGate::Ready
+                                        : PreviewModeGate::StaleCtx;
+    }
+    // No fresh answer available — trust the cached context mode (legacy behavior).
+    return (ctxHDR == requestedHDR) ? PreviewModeGate::Ready
+                                    : PreviewModeGate::Mismatch;
+}
+
 // Start overlay/processing for MHC live preview if not already running.
 // Sets livePreview=true if monitor mode matches isHDR, and sets the
 // startedForPreview / startedOverlayForPreview flags accordingly.
@@ -60,12 +74,73 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
     startedForPreview = false;
     startedOverlayForPreview = false;
 
+    // OS-truth mode for this monitor via a fresh DXGI factory query — the same
+    // source windows.query_monitors and the capture path use. DXGI state cached
+    // from before a runtime HDR toggle (including MonitorContext::isHDREnabled
+    // while the overlay auto-sleeps) reports the pre-toggle mode, so the gate
+    // must not trust the cached context mode alone.
+    bool freshOk = false, freshHDR = false;
+    if (monIdx >= 0 && monIdx < (int)g_gui.monitors.size() && g_gui.monitors[monIdx]) {
+        DXGI_OUTPUT_DESC1 freshDesc;
+        if (QueryFreshOutputDesc(g_gui.monitors[monIdx], freshDesc)) {
+            freshOk = true;
+            freshHDR = (freshDesc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        }
+    }
+    // Monitor genuinely is not in the requested mode: no spin-up or resync can
+    // make the preview valid — fail before starting anything. (Also blocks the
+    // inverse stale failure: a begin for the PRE-toggle mode "succeeding" against
+    // a stale context and previewing in the wrong mode.)
+    if (freshOk && freshHDR != isHDR) return;
+
     // Case 1: Already running with full overlay (not analysis-only) — check mode match
     if (g_gui.isRunning && g_gui.processingThread.joinable() && !g_analysisOnlyMode.load()) {
-        std::lock_guard<std::mutex> lk(g_monitorsMutex);
-        for (const auto& ctx : g_monitors) {
-            if (ctx.index == monIdx) {
-                livePreview = (ctx.isHDREnabled == isHDR);
+        bool ctxFound = false, ctxHDR = false;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            for (const auto& ctx : g_monitors) {
+                if (ctx.index == monIdx) {
+                    ctxFound = true;
+                    ctxHDR = ctx.isHDREnabled;
+                    break;
+                }
+            }
+        }
+        if (ctxFound) {
+            switch (EvaluatePreviewModeGate(isHDR, ctxHDR, freshOk, freshHDR)) {
+            case PreviewModeGate::Ready:
+                livePreview = true;
+                break;
+            case PreviewModeGate::Mismatch:
+                break;
+            case PreviewModeGate::StaleCtx:
+                // The context slept through a runtime HDR toggle: an auto-slept
+                // overlay never pumps AcquireNextFrame, so it never sees the
+                // ACCESS_LOST/format change that re-derives isHDREnabled
+                // (render.cpp auto-sleep skips straight back to the wake wait).
+                // Kick the same full reinit resume-from-sleep uses and wait for
+                // the capture path to converge on the actual mode.
+                g_forceReinit.store(true);
+                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+                // Forced reinit sleeps 500ms before re-deriving the mode; wait up
+                // to ~3s with message pumping (mirrors the Case-2 wait below).
+                for (int waitI = 0; waitI < 300 && !livePreview; waitI++) {
+                    MSG pumpMsg;
+                    while (PeekMessage(&pumpMsg, nullptr, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&pumpMsg);
+                        DispatchMessage(&pumpMsg);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                        for (const auto& ctx : g_monitors) {
+                            if (ctx.index == monIdx) {
+                                livePreview = (ctx.isHDREnabled == isHDR);
+                                break;
+                            }
+                        }
+                    }
+                    if (!livePreview) Sleep(10);
+                }
                 break;
             }
         }

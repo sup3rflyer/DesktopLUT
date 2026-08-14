@@ -8,11 +8,33 @@
 
 struct MHCSettings;
 
+// Outcome of the live-preview mode gate (see EvaluatePreviewModeGate).
+enum class PreviewModeGate {
+    Ready,     // context mode matches the requested mode — preview can engage
+    Mismatch,  // monitor genuinely is not in the requested mode — fail the gate
+    StaleCtx,  // OS is in the requested mode but the cached context mode predates
+               // a runtime HDR toggle — force a duplication reinit, then re-check
+};
+
+// Pure decision for the live-preview mode gate (defined in gui.cpp, exposed for
+// tests). requestedHDR = the mode the caller wants to preview in; ctxHDR = the
+// processing thread's cached MonitorContext::isHDREnabled; freshQueryOk/freshHDR =
+// result of a fresh-factory DXGI query of the monitor's actual color space (the
+// same source windows.query_monitors uses). The cached context mode goes stale
+// when the overlay sleeps through a runtime HDR toggle: an auto-slept render loop
+// never pumps AcquireNextFrame, so it never sees the ACCESS_LOST/format change
+// that re-derives the mode. Trusting the cache alone therefore both false-fails
+// the monitor's actual mode and false-passes the stale one; the fresh query is
+// authoritative when available, with the cache as fallback.
+PreviewModeGate EvaluatePreviewModeGate(bool requestedHDR, bool ctxHDR,
+                                        bool freshQueryOk, bool freshHDR);
+
 // Start overlay/processing for MHC live preview if not already running (defined
-// in gui.cpp). Sets livePreview=true only when the running monitor's mode matches
-// isHDR; startedForPreview / startedOverlayForPreview report what this call spun up
-// so the caller can tear it back down. Drives the correction-grayscale live editor
-// from both the GUI and the calibration IPC server.
+// in gui.cpp). Sets livePreview=true only when the monitor's actual mode matches
+// isHDR (verified against a fresh DXGI query, resyncing a stale running context
+// if needed); startedForPreview / startedOverlayForPreview report what this call
+// spun up so the caller can tear it back down. Drives the correction-grayscale
+// live editor from both the GUI and the calibration IPC server.
 void EnsureProcessingForPreview(int monIdx, bool isHDR,
                                 bool& livePreview,
                                 bool& startedForPreview,

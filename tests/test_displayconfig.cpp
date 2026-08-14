@@ -193,3 +193,55 @@ TEST_CASE("DwmHookSharedConfig: zero-initialized is safe default") {
         CHECK(cfg.monitors[i].sourcePeakNits == 0.0f);
     }
 }
+
+// ============================================================================
+// Live-preview mode gate (EnsureProcessingForPreview decision seam)
+// ============================================================================
+// Regression: after Windows toggled HDR off while DesktopLUT ran with the
+// overlay auto-slept (DWM hook mode), MonitorContext::isHDREnabled stayed at the
+// pre-toggle mode — the slept render loop never pumps AcquireNextFrame, so it
+// never sees the mode change. The gate then rejected grayscale_live_begin for
+// the monitor's ACTUAL mode (SDR) and wrongly accepted the STALE mode (HDR),
+// while windows.query_monitors (fresh DXGI factory query) reported the truth.
+// The gate now consults the same fresh query; this truth table pins it.
+#include "gui_mhc.h"
+
+TEST_CASE("PreviewModeGate: fresh query agrees with context — Ready") {
+    // SDR request on an SDR monitor with an SDR context
+    CHECK(EvaluatePreviewModeGate(false, false, true, false) == PreviewModeGate::Ready);
+    // HDR request on an HDR monitor with an HDR context
+    CHECK(EvaluatePreviewModeGate(true, true, true, true) == PreviewModeGate::Ready);
+}
+
+TEST_CASE("PreviewModeGate: monitor genuinely in the other mode — Mismatch") {
+    // HDR request but monitor actually SDR (context agrees with OS)
+    CHECK(EvaluatePreviewModeGate(true, false, true, false) == PreviewModeGate::Mismatch);
+    // SDR request but monitor actually HDR (context agrees with OS)
+    CHECK(EvaluatePreviewModeGate(false, true, true, true) == PreviewModeGate::Mismatch);
+}
+
+TEST_CASE("PreviewModeGate: context slept through an HDR toggle — StaleCtx") {
+    // The 2026-08-14 repro: HDR toggled off, OS says SDR, context still says HDR.
+    // SDR request must NOT be rejected — it needs a resync, not a failure.
+    CHECK(EvaluatePreviewModeGate(false, true, true, false) == PreviewModeGate::StaleCtx);
+    // Inverse flip (HDR toggled on while asleep): HDR request resyncs too.
+    CHECK(EvaluatePreviewModeGate(true, false, true, true) == PreviewModeGate::StaleCtx);
+}
+
+TEST_CASE("PreviewModeGate: stale context must not false-pass the old mode") {
+    // Same repro, other direction: an HDR begin against the stale HDR context
+    // used to SUCCEED even though the monitor was already SDR. The fresh query
+    // must veto it.
+    CHECK(EvaluatePreviewModeGate(true, true, true, false) == PreviewModeGate::Mismatch);
+    CHECK(EvaluatePreviewModeGate(false, false, true, true) == PreviewModeGate::Mismatch);
+}
+
+TEST_CASE("PreviewModeGate: fresh query unavailable — fall back to cached mode") {
+    // freshHDR is meaningless when freshQueryOk=false; both values must not matter.
+    for (bool junk : {false, true}) {
+        CHECK(EvaluatePreviewModeGate(false, false, false, junk) == PreviewModeGate::Ready);
+        CHECK(EvaluatePreviewModeGate(true, true, false, junk) == PreviewModeGate::Ready);
+        CHECK(EvaluatePreviewModeGate(true, false, false, junk) == PreviewModeGate::Mismatch);
+        CHECK(EvaluatePreviewModeGate(false, true, false, junk) == PreviewModeGate::Mismatch);
+    }
+}
