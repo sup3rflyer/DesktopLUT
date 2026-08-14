@@ -192,6 +192,69 @@ def test_hdr_full_flow_completes_clean(tmp_path: Path):
     assert verify["within_quality"] is True
 
 
+# ---------------------------------------------------------------------------
+# calibration-mode enter/exit must not eat the OTHER mode's runtime layers
+# (2026-08-14 field regression: a clean full HDR run dropped the 0:SDR cube)
+# ---------------------------------------------------------------------------
+
+def _write_cube_file(path: Path) -> str:
+    path.write_text('TITLE "sim"\nLUT_3D_SIZE 2\n' + "0 0 0\n" * 8, encoding="utf-8")
+    return str(path)
+
+
+def test_full_run_preserves_other_modes_runtime_cube(tmp_path: Path):
+    """End-to-end pin of the 2026-08-14 field regression: during a clean full HDR run
+    (verify:accept=apply, exit 0), calibration.enter used to clear BOTH modes' runtime
+    layers and the apply-path exit restores nothing — the user's SDR runtime cube was
+    permanently dropped. After a full HDR run the pre-existing 0:SDR cube must still
+    be installed alongside the freshly built 0:HDR one."""
+    ctrl = CalibrationController.mock()
+    sdr_cube = _write_cube_file(tmp_path / "user_sdr.cube")
+    ctrl.set_3dlut(0, "SDR", sdr_cube)
+
+    calib = _make(tmp_path, "keep_sdr", mode="HDR", panel=_perfect_hdr_panel(),
+                  bit_depth=10, controller=ctrl)
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+
+    runtime = ctrl.state()["runtime"]
+    assert (runtime.get("0:SDR") or {}).get("cube_path") == sdr_cube  # survived the run
+    assert (runtime.get("0:HDR") or {}).get("cube_path")              # the new build is live
+
+
+def test_commit_restores_runtime_pairs_dropped_by_old_desktoplut(tmp_path: Path):
+    """Belt-and-braces for DesktopLUT builds older than the per-mode-clear fix, whose
+    calibration.enter cleared every runtime pair on the monitor: stage_enter_neutral
+    captures the pre-enter runtime map (persisted in the run record) and the commit
+    re-applies any non-calibrated pair the server dropped. The calibrated pair — the
+    freshly built cube — is never touched."""
+    ctrl = CalibrationController.mock()
+    sdr_cube = _write_cube_file(tmp_path / "user_sdr.cube")
+    ctrl.set_3dlut(0, "SDR", sdr_cube)
+
+    calib = _make(tmp_path, "old_server", mode="HDR", panel=_perfect_hdr_panel(),
+                  bit_depth=10, controller=ctrl)
+    calib.stage_enter_neutral()
+    prior = calib.calib["runtime_prior"]
+    assert prior["captured"] is True
+    assert prior["runtime"]["0:SDR"]["cube_path"] == sdr_cube
+
+    # Emulate the legacy server: wipe EVERY runtime pair (the fixed mock above only
+    # cleared the calibrated 0:HDR pair at enter).
+    ctrl.client.transport.server.state.runtime.clear()
+
+    new_hdr = _write_cube_file(tmp_path / "new_hdr.cube")
+    ctrl.set_3dlut(0, "HDR", new_hdr)  # the freshly built calibration lands
+    calib._commit_calibration()        # apply path: exit without snapshot restore
+
+    runtime = ctrl.state()["runtime"]
+    assert (runtime.get("0:SDR") or {}).get("cube_path") == sdr_cube  # restored by the guard
+    assert (runtime.get("0:HDR") or {}).get("cube_path") == new_hdr   # fresh build untouched
+    # And with a healthy (fixed) server nothing was missing — the guard must not have
+    # touched the calibrated pair to "restore" the pre-run state.
+    assert calib.calib["runtime_prior"]["runtime"].get("0:HDR") is None
+
+
 def test_control_json_cancels_the_run(tmp_path: Path):
     # The actionable half of mid-run gating: an LLM/operator drops control.json and the run
     # aborts cleanly at its next stage boundary (here, immediately at preflight).

@@ -977,6 +977,59 @@ class Calibration:
             self.ctx.log("applied the new calibration (left calibration mode, profile kept)")
         except Exception as exc:  # noqa: BLE001
             self.ctx.log(f"commit (exit calibration) failed: {exc}")
+        self._restore_other_mode_runtime()
+
+    def _restore_other_mode_runtime(self) -> None:
+        """Apply-path guard: re-apply runtime layers of NON-calibrated mode:monitor pairs
+        that were live before enter-neutral and are gone now. DesktopLUT builds before
+        2026-08-14 cleared BOTH modes' runtime layers on the monitor at calibration.enter,
+        and the apply path exits WITHOUT the snapshot restore — the 2026-08-14 HDR run
+        permanently dropped the user's SDR cube exactly this way. The server now clears
+        only the calibrated pair, so on fixed builds this is a no-op. Best-effort: a
+        failure is logged (with the path, so the operator can re-apply by hand), never
+        fatal to the commit."""
+        prior = self.calib.get("runtime_prior") or {}
+        if not prior.get("captured"):
+            return
+        own = f"{self.monitor}:{self.mode}"
+        try:
+            current = (self.controller.state() or {}).get("runtime") or {}
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.log(f"could not re-check runtime layers after commit ({exc}); if another "
+                         "mode's 3D LUT is missing, re-apply it from the pre-run map in the "
+                         "run record (runtime_prior)")
+            return
+        for pair, entry in (prior.get("runtime") or {}).items():
+            if pair == own or not isinstance(entry, dict):
+                continue  # the calibrated pair now owns the fresh build — never touch it
+            try:
+                mon_str, pair_mode = pair.split(":", 1)
+                mon = int(mon_str)
+            except ValueError:
+                continue
+            have = current.get(pair) or {}
+            cube = entry.get("cube_path")
+            if cube and not have.get("cube_path"):
+                try:
+                    self.controller.set_3dlut(mon, pair_mode, cube)
+                    self.ctx.log(f"re-applied the {pair} runtime 3D LUT that calibration.enter "
+                                 f"had dropped ({cube})")
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.log(f"could not re-apply the {pair} runtime 3D LUT ({cube}): {exc} "
+                                 "— re-apply it manually (Set 3D LUT in DesktopLUT)")
+            # C++ state.get reports only cube_path, so on hardware there is nothing to
+            # restore here; the simulator DOES report the tweak, so put back exactly what
+            # was captured (verbatim payload — runtime.set_grayscale_tweak is advertised).
+            tweak = entry.get("grayscale_tweak")
+            if tweak and not have.get("grayscale_tweak"):
+                try:
+                    self.controller.call("runtime.set_grayscale_tweak",
+                                         {"monitor": mon, "mode": pair_mode,
+                                          "grayscale_tweak": tweak})
+                    self.ctx.log(f"re-applied the {pair} runtime grayscale tweak that "
+                                 "calibration.enter had dropped")
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.log(f"could not re-apply the {pair} runtime grayscale tweak: {exc}")
 
     def _install_durable_cube(self, cube_path: Optional[str]) -> None:
         """Re-point DesktopLUT at the DURABLE deliverable cube (under ``results/``) rather
@@ -2283,6 +2336,21 @@ class Calibration:
                 self.ctx.log("DesktopLUT was already in calibration mode (a previous run did not "
                              "exit) — the pipe's restore snapshot now captures that cleared state; "
                              "treat the preflight settings backup as the authoritative restore")
+            # Capture the PRE-ENTER runtime layer map (every mode:monitor pair), persisted in
+            # the run record. DesktopLUT builds before 2026-08-14 cleared BOTH modes' runtime
+            # layers on this monitor at calibration.enter, and the apply path exits WITHOUT the
+            # snapshot restore — so the 2026-08-14 HDR run permanently dropped the user's SDR
+            # cube. _commit_calibration re-applies any non-calibrated pair the server dropped;
+            # on fixed builds (per-mode clear) that restore is a no-op.
+            if self.calib.get("runtime_prior") is None:
+                try:
+                    state = self.controller.state()
+                    self.calib["runtime_prior"] = {
+                        "captured": True, "runtime": _jsonable(state.get("runtime") or {})}
+                except Exception as exc:  # noqa: BLE001 - advisory; the run must not die here
+                    self.calib["runtime_prior"] = {
+                        "captured": False, "error": f"{type(exc).__name__}: {exc}"}
+                self._save()
             res = self.controller.enter_neutral(self.monitor, self.mode, self.dummy_icc,
                                                 reason="DLC v2 calibration")
             digest: dict[str, Any] = {"entered": True}

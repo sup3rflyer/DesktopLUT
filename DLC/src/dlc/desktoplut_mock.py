@@ -223,7 +223,7 @@ class MockDesktopLutServer:
         if method == "calibration.status":
             return self.ok({"active": self.state.calibration_mode is not None, "state": deepcopy(self.state.calibration_mode)})
         if method == "calibration.enter":
-            self.key(params)  # C++ ParseMonitorMode: validate monitor index + mode vocabulary
+            key = self.key(params)  # C++ ParseMonitorMode: validate monitor index + mode vocabulary
             # NOTE (fable Phase 9): mirrors a real C++ hazard — DoEnterNeutral snapshots
             # unconditionally, so a RE-enter while calibration is already active captures the
             # already-cleared state; a later exit(restore_snapshot=True) then restores that
@@ -234,8 +234,13 @@ class MockDesktopLutServer:
             snapshot_id = f"snapshot-{len(self.state.snapshots) + 1}"
             self.state.snapshots[snapshot_id] = self.state.as_dict()
             self.state.corrections_enabled = False
-            self.state.mhc.clear()
-            self.state.runtime.clear()
+            # C++ DoEnterNeutral clears ONLY the calibrated mode:monitor pair's layers.
+            # Other pairs are preserved — the mock used to clear everything (and old C++
+            # builds cleared both modes of the monitor), which permanently dropped the
+            # non-calibrated mode's runtime cube on the apply path (exit without restore):
+            # the 2026-08-14 HDR run lost the user's SDR cube exactly this way.
+            self.state.mhc.pop(key, None)
+            self.state.runtime.pop(key, None)
             self.state.calibration_mode = {
                 "active": True,
                 "snapshot_id": snapshot_id,

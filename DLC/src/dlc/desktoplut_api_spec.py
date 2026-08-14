@@ -88,11 +88,15 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "calibration.enter",
-            "Enter calibration mode: snapshot the monitor's settings and reset every correction "
-            "layer (MHC removed+disabled, 3D LUTs and shader layers cleared). The dummy ICC path "
-            "is RECORDED but not associated (deferred; neutrality comes from the cleared layers "
-            "plus DLC's own dispwin -c). NOT retry-safe: re-entering while a session is active "
-            "re-snapshots the already-cleared state (see transport.timeout_and_retries).",
+            "Enter calibration mode: snapshot the monitor's settings and reset the CALIBRATED "
+            "mode's correction layers (MHC removed+disabled, runtime 3D LUT and shader layers "
+            "cleared). Other mode:monitor pairs are PRESERVED — builds before 2026-08-14 cleared "
+            "both modes of the monitor, permanently dropping the non-calibrated mode's runtime "
+            "cube on the apply path (exit without restore); the orchestrator's commit re-applies "
+            "dropped pairs as a guard for those builds. The dummy ICC path is RECORDED but not "
+            "associated (deferred; neutrality comes from the cleared layers plus DLC's own "
+            "dispwin -c). NOT retry-safe: re-entering while a session is active re-snapshots the "
+            "already-cleared state (see transport.timeout_and_retries).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

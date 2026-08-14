@@ -266,6 +266,37 @@ def test_reenter_overwrites_restore_snapshot_hazard(tmp_path):
     assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
 
 
+def test_enter_neutral_clears_only_the_calibrated_pair(tmp_path):
+    """C++ DoEnterNeutral clears ONLY the calibrated mode:monitor pair's runtime layers
+    (2026-08-14 field regression: enter cleared BOTH modes on the monitor and the
+    apply-path exit restores nothing, so a clean HDR run permanently dropped the user's
+    SDR runtime cube). Other pairs — the same monitor's other mode AND other monitors —
+    must survive enter + apply-path exit untouched."""
+    ctrl = CalibrationController.mock()
+    sdr_cube = _write_3d_cube(tmp_path / "user_sdr.cube")
+    hdr_cube = _write_3d_cube(tmp_path / "user_hdr.cube")
+    mon1_cube = _write_3d_cube(tmp_path / "mon1_sdr.cube")
+    ctrl.set_3dlut(0, "SDR", str(sdr_cube))
+    ctrl.set_3dlut(0, "HDR", str(hdr_cube))
+    ctrl.set_3dlut(1, "SDR", str(mon1_cube))
+
+    ctrl.enter_neutral(0, "HDR", "C:/dlc/sRGB.icm")
+    runtime = ctrl.state()["runtime"]
+    assert "cube_path" not in (runtime.get("0:HDR") or {})                 # calibrated pair cleared
+    assert (runtime.get("0:SDR") or {}).get("cube_path") == str(sdr_cube)  # other mode preserved
+    assert (runtime.get("1:SDR") or {}).get("cube_path") == str(mon1_cube)  # other monitor preserved
+
+    # A fresh build lands, the operator accepts: exit WITHOUT the snapshot restore.
+    new_hdr = _write_3d_cube(tmp_path / "new_hdr.cube")
+    ctrl.set_3dlut(0, "HDR", str(new_hdr))
+    out = ctrl.exit_calibration(restore_snapshot=False)
+    assert out["restored"] is False
+    runtime = ctrl.state()["runtime"]
+    assert (runtime.get("0:HDR") or {}).get("cube_path") == str(new_hdr)
+    assert (runtime.get("0:SDR") or {}).get("cube_path") == str(sdr_cube)
+    assert (runtime.get("1:SDR") or {}).get("cube_path") == str(mon1_cube)
+
+
 def test_state_get_carries_contract_version_and_mismatch_helper():
     ctrl = CalibrationController.mock()
     state = ctrl.state()
