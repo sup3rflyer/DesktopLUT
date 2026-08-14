@@ -940,3 +940,51 @@ def test_optimizer_history_accumulates():
     opt = st.charts()["optimizer"]
     assert [r["iteration"] for r in opt] == [0, 1, 2]
     assert opt[-1]["measured_max_de"] == 2.0 - 0.6
+
+
+def test_drift_series_excludes_non_drift_neutral_ref_dispositions():
+    """F8 (2026-08-14): the post-MHC ``foundation_sanity`` white — a DIFFERENT patch read
+    through a DIFFERENT stack — must never enter the drift series (it drew a false +1917% R
+    spike at the install boundary on the first full HDR run)."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", luminance=1800.0,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure", phase="measure:raw", tier="stream",
+                  role="neutral_ref", label="warmup", rgb=[512, 512, 532],
+                  signal=[0.5, 0.5, 0.52], Y=93.2, xy=[0.3002, 0.3034], ok=True,
+                  disposition="drift_ref"))
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=60), stage="build-install-mhc",
+                  phase="build-install-mhc", tier="stream",
+                  role="neutral_ref", label="post-mhc-white-sanity", rgb=[837, 837, 837],
+                  signal=[0.818, 0.818, 0.818], Y=1784.4, xy=[0.3231, 0.3286], ok=True,
+                  disposition="foundation_sanity"))
+    track = st.charts()["white_track"]
+    assert len(track) == 1                       # the sanity read stayed OUT
+    assert track[0]["Y"] == 93.2
+
+
+def test_channel_drift_rebaselines_per_stage_segment():
+    """F8: a stage boundary changes the stack (MHC install) and may change the drift-ref
+    patch — the drift chart re-baselines there (new segment, first point = 0%) instead of
+    charting the stack change as thermal drift."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", luminance=120.0, gamma=2.2,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # raw-stage drift refs on the neutral panel
+    for i, (xy, Y) in enumerate([([0.3002, 0.3034], 93.0), ([0.3000, 0.3030], 94.0)]):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i * 60), stage="measure",
+                      phase="measure:raw", tier="stream", role="neutral_ref", label="warmup",
+                      rgb=[128, 128, 133], signal=[0.5, 0.5, 0.52], Y=Y, xy=xy, ok=True,
+                      disposition="drift_ref"))
+    # refine-stage drift refs THROUGH the fresh MHC — hugely different values
+    for i, (xy, Y) in enumerate([([0.3127, 0.3290], 60.0), ([0.3125, 0.3288], 60.5)]):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=180 + i * 60), stage="measure",
+                      phase="refine-mhc-cube", tier="stream", role="neutral_ref", label="warmup",
+                      rgb=[128, 128, 128], signal=[0.5, 0.5, 0.5], Y=Y, xy=xy, ok=True,
+                      disposition="drift_ref"))
+    cd = st.charts()["channel_drift"]
+    assert len(cd) == 4
+    assert cd[0]["seg"] == 0 and cd[2]["seg"] == 1          # stage boundary = new segment
+    assert cd[2]["r"] == 0.0 and cd[2]["g"] == 0.0 and cd[2]["b"] == 0.0  # re-baselined
+    # within-segment drift stays small — the ~35% cross-stack Y change never charts as drift
+    assert all(abs(cd[i][k]) < 5.0 for i in range(4) for k in ("r", "g", "b"))

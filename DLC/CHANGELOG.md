@@ -11,6 +11,14 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Dashboard truth wave** (owner directives after the first full HDR run, 2026-08-14):
+  previous-stage chart series now draw as their own semi-transparent underlay beneath the
+  current stage's line (no more mixed-stack sawtooth); the thermal-drift chart takes only
+  genuine drift-ref checkpoints and re-baselines per stage/stack transition (a post-MHC
+  sanity read no longer charts as a false +1900% "drift" spike); worst-patch rows whose
+  target is out of the panel gamut are labelled OOG and muted (live ΔE is vs the unclamped
+  plan target; the scored report is gamut-aware); the optimizer floor seam's budget-cap
+  copy is flow-neutral (no more "run MHC first" inside a full flow that just ran it).
 - **Verify quality gate scores the practical buckets, not the OOG-inflated overall**
   (owner directive, 2026-08-14: out-of-gamut patches are a framework, not the meat).
   `within_quality` now judges core avg/p95/max + neutral-tube avg + white against the

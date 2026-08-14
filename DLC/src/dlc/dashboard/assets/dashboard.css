@@ -251,6 +251,11 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
 /* a point CARRIED from the previous stage (not yet re-measured this stage): faded, so a stage
    boundary reads as the chart UPDATING in place — each mark solidifies as its patch is re-read */
 .ch-carried { opacity: .25; }
+/* D1 (owner, 2026-08-14): the previous stage's LINE renders as its own semi-transparent underlay
+   beneath the current stage's line — never interleaved into it (the sawtooth). */
+.ch-line-prev { opacity: .3; stroke-width: 1.1; }
+/* F4: worst-patch rows whose target is out of the panel gamut — expected clipping, muted */
+.ch-off-oog { fill: var(--ink-faint); }
 .ch-guide { stroke: var(--accent); stroke-width: .8; stroke-dasharray: 5 4; opacity: .7; }  /* ±10% lines */
 .ch-axis0 { stroke: #6a6a70; stroke-width: 1; }
 .ch-note { fill: var(--ink-dim); font-size: 10px; font-family: var(--mono); }

@@ -747,10 +747,15 @@ def optimize_cube(
                 "or abort and investigate?"
             )
         if budget_limited.any():
+            # Flow-neutral remediation copy (F5, 2026-08-14): the old "or run MHC first" read
+            # as a diagnosis inside a full flow whose MHC had just run. Budget-limiting means
+            # the cube is asked to do more than a post-MHC residual THERE — the remedies are
+            # config/foundation follow-ups, not options at this seam.
             parts.append(
                 f"{int(budget_limited.sum())} patch(es) still need a correction beyond the "
-                f"budget cap ({cfg.max_correction_cap:g}); raise the cap (the 3D LUT is doing "
-                f"more than a post-MHC residual) or run MHC first."
+                f"budget cap ({cfg.max_correction_cap:g}) — the cube is doing more than a "
+                f"post-MHC residual there. If it recurs, the follow-ups are raising the mode's "
+                f"cap (max_correction_cap) or strengthening the MHC foundation in that region."
             )
         question = " ".join(parts)
 

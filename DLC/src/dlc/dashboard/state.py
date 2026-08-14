@@ -615,8 +615,17 @@ class DashboardState:
             sig_level = _as_float(sig[0]) if (sig and len(sig) >= 1) else None
             sample = {"elapsed_s": self._elapsed_at(ev.time), "signal": sig_level,
                       "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y,
-                      "x": round(x, 5), "y": round(y, 5)}
-            if role in ("warmup", "neutral_ref"):
+                      "x": round(x, 5), "y": round(y, 5),
+                      # Segmentation key for the drift chart (F8, 2026-08-14): a stage boundary
+                      # can change BOTH the correction stack (MHC install) and the drift-ref
+                      # patch itself, so cross-stage deltas are stack changes, not thermal drift.
+                      "phase": ev.phase or ev.stage}
+            # Drift checkpoints ONLY (F8): a neutral_ref read with a non-drift disposition —
+            # e.g. the post-MHC `foundation_sanity` white, a DIFFERENT patch through a
+            # DIFFERENT stack — polluted the series and drew a false +1917% R spike at the
+            # install boundary (2026-08-14 run). The spine's own drift model was never fooled.
+            if role == "warmup" or (role == "neutral_ref"
+                                    and disposition in (None, "drift_ref")):
                 self._white_track.append(sample)
             elif neutral and sig_level is not None and sig_level >= 0.9:
                 self._white_fallback.append(sample)
@@ -874,12 +883,13 @@ class DashboardState:
             "white_track": list(self._drift_series()),
             "channel_drift": self._channel_drift(hdr, white),
             # Worst patches THIS stage (fresh reads only — a carried miss belongs to the previous
-            # stage's story): intended vs measured swatch + ΔE, largest first.
-            "offenders": sorted(
-                ({"label": p.get("label"), "de": p["de"], "sc": p.get("sc"),
-                  "mc": p.get("mc"), "neutral": bool(p.get("neutral"))}
-                 for p in cie_points if p.get("de") is not None and not p.get("carried")),
-                key=lambda o: -o["de"])[:6],
+            # stage's story): intended vs measured swatch + ΔE, largest first. Each row carries
+            # the same reachability classification the live split uses (F4, 2026-08-14): a live
+            # per-read ΔE is scored vs the UNCLAMPED plan target, so an unreachable patch tops
+            # this list at a huge value (62–93 on the first HDR run) while the scored report is
+            # gamut-aware — the flag lets the tile mute/label those rows instead of presenting
+            # expected clipping as the worst calibration misses.
+            "offenders": self._offenders(cie_points),
             # ΔE-over-the-run series for the convergence tile: build-iteration measurements +
             # scored verify passes, merged in time order — the "watch it get better" chart.
             "convergence": sorted(
@@ -894,6 +904,25 @@ class DashboardState:
                    for d in self.de_history],
                 key=lambda e: e.get("elapsed_s") or 0.0),
         }
+
+    def _offenders(self, cie_points) -> list[dict[str, Any]]:
+        """Worst fresh reads this stage, flagged by target reachability (F4): ``oog`` mirrors
+        the live in/out-of-gamut split (native-primaries triangle) so the tile can mute the
+        expected-clipping rows; None while the native gamut is still unmeasured."""
+        native = self._native_primaries()
+        tri = ((tuple(native["r"]), tuple(native["g"]), tuple(native["b"]))
+               if native and all(k in native for k in ("r", "g", "b")) else None)
+
+        def _oog(p) -> Optional[bool]:
+            if tri is None or p.get("tx") is None or p.get("ty") is None:
+                return None
+            return not point_in_triangle((p["tx"], p["ty"]), *tri)
+
+        return sorted(
+            ({"label": p.get("label"), "de": p["de"], "sc": p.get("sc"),
+              "mc": p.get("mc"), "neutral": bool(p.get("neutral")), "oog": _oog(p)}
+             for p in cie_points if p.get("de") is not None and not p.get("carried")),
+            key=lambda o: -o["de"])[:6]
 
     def _drift_series(self) -> Deque[dict]:
         """The thermal-drift time series: the warm-up + neutral_ref checkpoints when the run has
@@ -911,15 +940,23 @@ class DashboardState:
         bal_white = tuple(white) if (white and len(white) >= 2) else (0.3127, 0.3290)
         out: list[dict[str, Any]] = []
         base: Optional[tuple] = None
+        # Re-baseline per (phase, drift-ref signal) segment (F8, 2026-08-14): a stage boundary
+        # swaps the correction stack (e.g. the MHC install) and may swap the drift-ref patch
+        # itself, so a cross-segment delta is a STACK change, never thermal drift. Each segment
+        # references its own first reading; `seg` lets the chart break the trace between them.
+        seg_key: Any = object()
+        seg = -1
         for s in self._drift_series():
             if s.get("elapsed_s") is None:
                 continue
             lin = linear_rgb(s.get("x"), s.get("y"), s.get("Y"), is_hdr=hdr, white_xy=bal_white)
             if lin is None or min(lin) <= 0:
                 continue
-            if base is None:
-                base = lin
+            key = (s.get("phase"), s.get("signal"))
+            if key != seg_key:
+                seg_key, base, seg = key, lin, seg + 1
             out.append({"elapsed_s": s["elapsed_s"], "cct": s.get("cct"), "Y": s.get("Y"),
+                        "seg": seg,
                         "r": round((lin[0] / base[0] - 1.0) * 100.0, 3),
                         "g": round((lin[1] / base[1] - 1.0) * 100.0, 3),
                         "b": round((lin[2] / base[2] - 1.0) * 100.0, 3)})

@@ -78,6 +78,15 @@
   // it's wide enough to matter on this scale.
   const whisker = (P, x, lo, hi) =>
     `<line x1="${fmt(P.px(x), 1)}" y1="${fmt(P.py(lo), 1)}" x2="${fmt(P.px(x), 1)}" y2="${fmt(P.py(hi), 1)}" class="ch-whisker"/>`;
+  // D1 (owner, 2026-08-14): previous-stage (carried) points draw as their OWN faded underlay
+  // line beneath the current stage's line — one line through interleaved mixed-stack points
+  // rendered a sawtooth that read as measurement noise. (The HCFR-style "patch updates in
+  // place" rationale doesn't fit DLC's distributed, per-stage-different sequences.)
+  const splitPathLine = (P, pts, toXY, cls) => {
+    const prev = pts.filter((p) => p.carried), cur = pts.filter((p) => !p.carried);
+    if (prev.length > 1) P.pathLine(prev.map(toXY), `${cls} ch-line-prev`);
+    if (cur.length > 1 || !prev.length) P.pathLine(cur.map(toXY), cls);
+  };
 
   const DLCCharts = {};
   // Render options the dashboard toggles. `measured` overlays the panel's measured primaries (the
@@ -159,7 +168,7 @@
     const g = d.gamma || 2.2;
     const ref = d.reference && d.reference.length ? d.reference : niceTicks(0, 1, 40).map((s) => [s, Math.pow(s, g)]);
     P.pathLine(ref, "ch-ref");
-    P.pathLine(pts.map((p) => [p.signal, p.Y / ymax]), "ch-line");
+    splitPathLine(P, pts, (p) => [p.signal, p.Y / ymax], "ch-line");
     const refAt = (s) => {
       if (!ref.length) return Math.pow(s, g);
       let best = ref[0];
@@ -229,7 +238,7 @@
       if (p.cct_lo != null && p.cct_hi != null && p.cct_hi - p.cct_lo > (hi - lo) * 0.015)
         P.add(whisker(P, p.signal, p.cct_lo, p.cct_hi));
     });
-    P.pathLine(bright.map((p) => [p.signal, p.cct]), "ch-line");
+    splitPathLine(P, bright, (p) => [p.signal, p.cct], "ch-line");
     bright.forEach((p) => {
       const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
                     `CCT\t${Math.round(p.cct)} K`];
@@ -282,7 +291,7 @@
       if (p.duv_lo != null && p.duv_hi != null && p.duv_hi - p.duv_lo > span * 0.03)
         P.add(whisker(P, p.signal, p.duv_lo, p.duv_hi));
     });
-    P.pathLine(bright.map((p) => [p.signal, p.duv]), "ch-line");
+    splitPathLine(P, bright, (p) => [p.signal, p.duv], "ch-line");
     bright.forEach((p) => {
       const dev = p.duv - t0;                          // cast vs the TARGET, not vs the locus
       const cls = dev > 0.0002 ? "ch-dot-green" : (dev < -0.0002 ? "ch-dot-magenta" : "ch-dot");
@@ -329,7 +338,7 @@
       P.add(alertTag(P, "exceeds ±1%", "mid", 2));
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
     const clamp = (v) => Math.max(-span, Math.min(span, v));
-    series.forEach(([k, cls]) => P.pathLine(bright.map((p) => [p.signal, p[k]]), cls));
+    series.forEach(([k, cls]) => splitPathLine(P, bright, (p) => [p.signal, p[k]], cls));
     series.forEach(([k, cls, lab]) => bright.forEach((p) => {
       const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
                     `${lab}\t${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% · target 0%`];
@@ -398,12 +407,16 @@
     if (pts.some((p) => Math.max(Math.abs(p.r), Math.abs(p.g), Math.abs(p.b)) > NORM))
       P.add(alertTag(P, "drift exceeds ±0.5%", "mid", 2));
     const series = [["r", "ch-bal-r", "R"], ["g", "ch-bal-g", "G"], ["b", "ch-bal-b", "B"]];
-    series.forEach(([k, cls]) => P.pathLine(pts.map((p) => [p.elapsed_s, p[k]]), cls));
+    // Segments (F8): the server re-baselines per (stage, drift-ref) — a stack change (e.g. the
+    // MHC install) starts a NEW trace instead of drawing a false cross-stage "drift" jump.
+    const segs = [...new Set(pts.map((p) => p.seg || 0))];
+    series.forEach(([k, cls]) => segs.forEach((s) =>
+      P.pathLine(pts.filter((p) => (p.seg || 0) === s).map((p) => [p.elapsed_s, p[k]]), cls)));
     series.forEach(([k, cls, lab]) => pts.forEach((p) =>
       P.add(`<circle cx="${fmt(P.px(p.elapsed_s), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.6" class="${cls}-dot">${hov(`${Math.round(p.elapsed_s)}s | ${lab} ${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% | CCT ${p.cct != null ? Math.round(p.cct) + "K" : "—"}`)}</circle>`)));
     // per-channel legend so the wandering channel is identifiable at a glance
     ["R", "G", "B"].forEach((lab, i) => P.add(`<text x="${fmt(P.m.l + 5 + i * 16, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-bal-${lab.toLowerCase()}-lab">${lab}</text>`));
-    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R/G/B drift vs warm-up start</text>`);
+    P.add(`<text x="${P.W - 16}" y="22" text-anchor="end" class="ch-note">R/G/B drift vs warm-up start${segs.length > 1 ? " · re-baselined per stage" : ""}</text>`);
     return P.svg();
   };
 
@@ -436,7 +449,7 @@
       const xs = Math.max(X0, Y0 / g);                 // clip the straight γ line to the plot
       P.pathLine([[xs, xs * g], [0, 0]], "ch-ref");
     }
-    P.pathLine(pts.map((p) => [Math.max(X0, lg(p.s)), Math.max(Y0, lg(p.yr))]), "ch-line");
+    splitPathLine(P, pts, (p) => [Math.max(X0, lg(p.s)), Math.max(Y0, lg(p.yr))], "ch-line");
     pts.forEach((p) => {
       const dark = p.yr * ymaxY < 1.0;                 // sub-1-nit: colour by tint visibility
       const cls = `ch-dot${dark ? " " + deCls(p.de) : ""}${p.carried ? " ch-carried" : ""}`;
@@ -514,18 +527,23 @@
     if (!items.length) return empty("no scored patches yet");
     const W = VB.w, H = VB.h, left = 16, top = 40, sw = 62;
     const rh = Math.min(42, (H - top - 8) / items.length);
+    // F4 (2026-08-14): live ΔE is scored vs the UNCLAMPED plan target — an unreachable (OOG)
+    // patch is expected clipping, not a calibration miss (the scored report is gamut-aware and
+    // clamps it). OOG rows are labelled + muted so they never present as the worst misses.
+    const anyOog = items.some((o) => o.oog);
     const parts = [
-      `<text x="${left}" y="18" class="ch-note">largest ΔE this stage — lower rows should be rare</text>`,
+      `<text x="${left}" y="18" class="ch-note">largest ΔE this stage${anyOog ? " · vs plan targets (OOG = expected clip)" : " — lower rows should be rare"}</text>`,
       `<text x="${left}" y="${top - 7}" class="ch-tick">intended</text>`,
       `<text x="${left + sw + 4}" y="${top - 7}" class="ch-tick">measured</text>`,
     ];
     items.forEach((o, i) => {
       const y = top + i * rh, h = rh - 7;
-      const name = o.label || (o.neutral ? "neutral" : "colour");
-      parts.push(`<rect x="${left}" y="${fmt(y, 1)}" width="${sw}" height="${fmt(h, 1)}" rx="2" class="ch-sw" style="fill:${esc(o.sc || "#444")}">${hov(`${name}\nintended\t${o.sc || "—"}\nΔE\t${fmt(o.de, 2)}`)}</rect>`);
-      parts.push(`<rect x="${left + sw + 4}" y="${fmt(y, 1)}" width="${sw}" height="${fmt(h, 1)}" rx="2" class="ch-sw" style="fill:${esc(o.mc || "#444")}">${hov(`${name}\nmeasured (approx.)\t${o.mc || "—"}\nΔE\t${fmt(o.de, 2)}`)}</rect>`);
-      parts.push(`<text x="${left + 2 * sw + 18}" y="${fmt(y + h / 2 + 4, 1)}" class="ch-off-lab">${esc(name)}</text>`);
-      parts.push(`<text x="${W - 18}" y="${fmt(y + h / 2 + 4, 1)}" text-anchor="end" class="ch-off-de ${deCls(o.de)}">${fmt(o.de, 2)}</text>`);
+      const name = (o.label || (o.neutral ? "neutral" : "colour")) + (o.oog ? " · OOG" : "");
+      const oogNote = o.oog ? "\ntarget out of panel gamut — large ΔE is expected clipping (scored report clamps it)" : "";
+      parts.push(`<rect x="${left}" y="${fmt(y, 1)}" width="${sw}" height="${fmt(h, 1)}" rx="2" class="ch-sw" style="fill:${esc(o.sc || "#444")}">${hov(`${name}\nintended\t${o.sc || "—"}\nΔE\t${fmt(o.de, 2)}${oogNote}`)}</rect>`);
+      parts.push(`<rect x="${left + sw + 4}" y="${fmt(y, 1)}" width="${sw}" height="${fmt(h, 1)}" rx="2" class="ch-sw" style="fill:${esc(o.mc || "#444")}">${hov(`${name}\nmeasured (approx.)\t${o.mc || "—"}\nΔE\t${fmt(o.de, 2)}${oogNote}`)}</rect>`);
+      parts.push(`<text x="${left + 2 * sw + 18}" y="${fmt(y + h / 2 + 4, 1)}" class="ch-off-lab${o.oog ? " ch-off-oog" : ""}">${esc(name)}</text>`);
+      parts.push(`<text x="${W - 18}" y="${fmt(y + h / 2 + 4, 1)}" text-anchor="end" class="ch-off-de ${o.oog ? "ch-off-oog" : deCls(o.de)}">${fmt(o.de, 2)}</text>`);
     });
     return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="chart-svg">${parts.join("")}</svg>`;
   };
