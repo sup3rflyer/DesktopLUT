@@ -963,6 +963,37 @@ def test_drift_series_excludes_non_drift_neutral_ref_dispositions():
     assert track[0]["Y"] == 93.2
 
 
+def test_channel_drift_rebaselines_on_cold_channel_bias_swap():
+    """ADVERSARIAL (F8 refutation, 2026-08-14): within ONE stage the warm-up patch itself
+    changes — read 1 goes out unbiased ([0.5,0.5,0.5]) because ``cold_channel`` is still None,
+    then ``coldest_channel_from_xyz`` fires and every later warm-up/drift-ref patch carries the
+    +0.02-signal bias on the cold channel (measure_loop._warmup_patch). For a G/B cold channel
+    (blue is this project's canonical one) ``signal[0]`` is UNCHANGED, so the F8 segmentation
+    key (phase, signal[0]) does NOT re-baseline — the ~+9% linear-blue step from the patch swap
+    charts as thermal drift, the exact artifact class F8 claims to prevent (state.py:619-622
+    'may swap the drift-ref patch itself')."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="SDR", luminance=120.0, gamma=2.2,
+                  white={"xy": [0.3127, 0.329], "cct": 6504}))
+    # read 1: unbiased neutral warm-up patch (cold_channel not yet detected)
+    st.ingest(_ev(Ev.PATCH_READ, t=T0, stage="measure", phase="measure-raw", tier="stream",
+                  role="warmup", label="warmup", rgb=[512, 512, 512],
+                  signal=[0.5, 0.5, 0.5], Y=45.0, xy=[0.3127, 0.3290], ok=True))
+    # reads 2+: SAME phase, blue-biased patch (+0.02 signal on B → ~+9% linear B at γ2.2).
+    # xy/Y computed exactly for linear RGB (1, 1, 1.09) through the sRGB NPM.
+    for i in (1, 2):
+        st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=i * 30), stage="measure",
+                      phase="measure-raw", tier="stream", role="warmup", label="warmup",
+                      rgb=[512, 512, 532], signal=[0.5, 0.5, 0.52], Y=45.293,
+                      xy=[0.30712, 0.31975], ok=True))
+    cd = st.charts()["channel_drift"]
+    assert len(cd) == 3
+    # The patch swap must start a new segment with its own baseline (first biased read = 0%);
+    # otherwise the +9% B step renders as drift and trips the ±0.5% alert.
+    assert cd[1]["seg"] == 1, f"patch swap not re-baselined: seg={cd[1]['seg']}"
+    assert abs(cd[1]["b"]) < 0.5, f"bias step charted as drift: b={cd[1]['b']}%"
+
+
 def test_channel_drift_rebaselines_per_stage_segment():
     """F8: a stage boundary changes the stack (MHC install) and may change the drift-ref
     patch — the drift chart re-baselines there (new segment, first point = 0%) instead of

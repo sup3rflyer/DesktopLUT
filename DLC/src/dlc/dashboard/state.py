@@ -616,10 +616,15 @@ class DashboardState:
             sample = {"elapsed_s": self._elapsed_at(ev.time), "signal": sig_level,
                       "cct": enriched.get("cct"), "duv": enriched.get("duv"), "Y": Y,
                       "x": round(x, 5), "y": round(y, 5),
-                      # Segmentation key for the drift chart (F8, 2026-08-14): a stage boundary
+                      # Segmentation keys for the drift chart (F8, 2026-08-14): a stage boundary
                       # can change BOTH the correction stack (MHC install) and the drift-ref
                       # patch itself, so cross-stage deltas are stack changes, not thermal drift.
-                      "phase": ev.phase or ev.stage}
+                      # sig_key is the FULL signal tuple (adversarial finding: the warm-up
+                      # cold-channel bias adds +0.02 to G/B only — signal[0] alone missed the
+                      # patch swap and charted the bias as a false +9% channel step).
+                      "phase": ev.phase or ev.stage,
+                      "sig_key": ([round(_as_float(c) or 0.0, 6) for c in sig]
+                                  if sig else None)}
             # Drift checkpoints ONLY (F8): a neutral_ref read with a non-drift disposition —
             # e.g. the post-MHC `foundation_sanity` white, a DIFFERENT patch through a
             # DIFFERENT stack — polluted the series and drew a false +1917% R spike at the
@@ -627,7 +632,14 @@ class DashboardState:
             if role == "warmup" or (role == "neutral_ref"
                                     and disposition in (None, "drift_ref")):
                 self._white_track.append(sample)
-            elif neutral and sig_level is not None and sig_level >= 0.9:
+            elif (role not in ("warmup", "neutral_ref")
+                  and neutral and sig_level is not None and sig_level >= 0.9):
+                # White-level MEASUREMENT neutrals only — a non-drift neutral_ref (e.g. an
+                # SDR foundation_sanity white at signal 1.0) must not sneak into the fallback
+                # either (adversarial finding). Note the fallback's per-(phase, signal)
+                # segments only yield drift signal when a level is RE-read — distinct-level
+                # singleton segments draw dots at 0%, which is honest: absent repeated reads
+                # there is no drift evidence (the old cross-level absolute compare was noise).
                 self._white_fallback.append(sample)
         # Snapshot charts (latest measurement stage only): exclude warm-up, drift-ref, build-probe.
         stage = self._chart_stage(ev, data)
@@ -952,7 +964,8 @@ class DashboardState:
             lin = linear_rgb(s.get("x"), s.get("y"), s.get("Y"), is_hdr=hdr, white_xy=bal_white)
             if lin is None or min(lin) <= 0:
                 continue
-            key = (s.get("phase"), s.get("signal"))
+            sig_id = s.get("sig_key")
+            key = (s.get("phase"), tuple(sig_id) if sig_id else s.get("signal"))
             if key != seg_key:
                 seg_key, base, seg = key, lin, seg + 1
             out.append({"elapsed_s": s["elapsed_s"], "cct": s.get("cct"), "Y": s.get("Y"),

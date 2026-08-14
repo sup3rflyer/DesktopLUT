@@ -85,7 +85,9 @@
   const splitPathLine = (P, pts, toXY, cls) => {
     const prev = pts.filter((p) => p.carried), cur = pts.filter((p) => !p.carried);
     if (prev.length > 1) P.pathLine(prev.map(toXY), `${cls} ch-line-prev`);
-    if (cur.length > 1 || !prev.length) P.pathLine(cur.map(toXY), cls);
+    // A lone point (either series) draws no line — its dot still shows; connecting a stale
+    // point to a fresh one is exactly the mixed-stack artifact this exists to prevent.
+    if (cur.length > 1) P.pathLine(cur.map(toXY), cls);
   };
 
   const DLCCharts = {};

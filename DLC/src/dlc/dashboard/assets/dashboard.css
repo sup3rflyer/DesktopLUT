@@ -252,10 +252,9 @@ b.prog-slow { color: var(--warn); } b.prog-stalled { color: var(--bad); }
    boundary reads as the chart UPDATING in place — each mark solidifies as its patch is re-read */
 .ch-carried { opacity: .25; }
 /* D1 (owner, 2026-08-14): the previous stage's LINE renders as its own semi-transparent underlay
-   beneath the current stage's line — never interleaved into it (the sawtooth). */
-.ch-line-prev { opacity: .3; stroke-width: 1.1; }
-/* F4: worst-patch rows whose target is out of the panel gamut — expected clipping, muted */
-.ch-off-oog { fill: var(--ink-faint); }
+   beneath the current stage's line — never interleaved into it (the sawtooth). Element+class
+   specificity so the per-channel .ch-bal-* stroke-widths can't out-cascade the underlay. */
+path.ch-line-prev { opacity: .3; stroke-width: 1.1; }
 .ch-guide { stroke: var(--accent); stroke-width: .8; stroke-dasharray: 5 4; opacity: .7; }  /* ±10% lines */
 .ch-axis0 { stroke: #6a6a70; stroke-width: 1; }
 .ch-note { fill: var(--ink-dim); font-size: 10px; font-family: var(--mono); }
@@ -301,6 +300,10 @@ text.ch-de-ok { fill: var(--good); } text.ch-de-warn { fill: var(--warn); } text
 .ch-sw { stroke: #000; stroke-width: .5; }
 .ch-off-lab { fill: var(--ink); font-size: 11px; font-family: var(--mono); }
 .ch-off-de { font-size: 13px; font-family: var(--mono); font-weight: 700; }
+/* F4: worst-patch rows whose target is out of the panel gamut — expected clipping, muted.
+   Declared AFTER .ch-off-lab/.ch-off-de so it wins the equal-specificity cascade
+   (adversarial finding: declared earlier, the label mute was dead on arrival). */
+.ch-off-oog { fill: var(--ink-faint); }
 /* EOTF gamma/tracking line (the second interpretation) — semi-transparent on its own scale */
 .ch-track { stroke: #58a6c9; stroke-width: 1.2; opacity: .5; stroke-dasharray: 2 2; }
 .ch-track-ref { stroke: #58a6c9; stroke-width: .8; opacity: .35; }
