@@ -45,7 +45,7 @@ import json
 import math
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Optional, Protocol, Sequence
@@ -88,7 +88,11 @@ class MeasurePatch:
     """One stimulus to present + read. ``rgb`` are integer code values at
     ``bit_depth``; ``signal`` is the normalized ``[0, 1]`` triple (the LUT /
     target domain). ``role`` is ``measurement`` | ``warmup`` | ``neutral_ref``.
-    ``seq`` is the position in the main pass (``-1`` for warm-up / reference)."""
+    ``seq`` is the position in the main pass (``-1`` for warm-up / reference).
+    ``settle_bump_s`` is EXTRA presenter dwell for this one presentation, on top of
+    the presenter's own settle — set by the loop's luminance-jump settle bump when
+    the presented luminance drops sharply (FALD zone decay/glow after a bright
+    patch); presenters honor it, synthetic measure fns are free to ignore it."""
 
     label: str
     rgb: tuple[int, int, int]
@@ -96,6 +100,7 @@ class MeasurePatch:
     role: str = "measurement"
     bit_depth: int = 10
     seq: int = -1
+    settle_bump_s: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -210,6 +215,20 @@ class MeasureLoopConfig:
     # identity). Default 1 ⇒ off; complementary to neutral_min_reads (the BRIGHT region).
     dark_min_reads: int = 1
     dark_floor_max_nits: float = 1.0
+
+    # Luminance-jump settle bump (gs-wb outside-in ordering, D4) ------------
+    # The outside-in alternating orders swing dark↔bright on nearly every transition. A local-
+    # dimming panel needs a moment after a sharp luminance DROP before a dark read is clean
+    # (FALD zone decay / residual glow from the bright patch contaminates the first dark read;
+    # the rise direction responds fast). When the newly-presented patch's EXPECTED luminance
+    # falls by more than ``jump_settle_ratio`` from the previously-presented one (and the
+    # previous patch was at least ``jump_settle_floor_nits`` — a drop between two already-dark
+    # patches has no glow worth waiting out), the presentation carries ``jump_settle_s`` of
+    # extra dwell via ``MeasurePatch.settle_bump_s`` (presenters honor it; synthetic fns
+    # ignore it). Repeat reads of an unchanged patch never pay it. 0 disables.
+    jump_settle_s: float = 1.0
+    jump_settle_ratio: float = 8.0
+    jump_settle_floor_nits: float = 10.0
 
     plausible_luminance_floor_nits: float = 1.0
     plausible_luminance_reference_floor_fraction: float = 0.04
@@ -590,6 +609,11 @@ class _Loop:
         self._integrity_recent: list[tuple[float, tuple[float, float, float]]] = []
         self._integrity_dark_streak = 0
         self._integrity_flagged: set[str] = set()      # each signature surfaced at most once
+        # Luminance-jump settle bump state: the last PRESENTED patch (label, expected nits)
+        # across every presentation funnel (_read + the drift checkpoint), and how many
+        # presentations carried the bump.
+        self._last_presented: Optional[tuple[str, float]] = None
+        self.jump_settles = 0
 
     def _reference_read_guard(self) -> ContextManager[None]:
         """The caller-supplied fixed-display-state guard for reference reads (identity
@@ -743,6 +767,38 @@ class _Loop:
         self._checkin_drift_at_last = self.drift_episodes
         self._checkin_warm_at_last = self.warm
 
+    def _jump_settle_bump(self, patch: MeasurePatch) -> float:
+        """Extra presenter dwell for THIS presentation of ``patch`` (0.0 when none is
+        warranted), and update the last-presented tracking. A bump fires only when the
+        presented patch CHANGES and its expected luminance drops sharply from the previous
+        presentation (``jump_settle_ratio``), from a bright-enough level for FALD zone
+        decay/glow to matter (``jump_settle_floor_nits``) — the dark↔bright swings the
+        outside-in alternating order introduces. Repeat reads of an unchanged patch and
+        rising transitions never pay it."""
+        cfg = self.cfg
+        expected = self._expected_patch_nits(patch)
+        prev = self._last_presented
+        self._last_presented = (patch.label, expected)
+        if cfg.jump_settle_s <= 0 or prev is None:
+            return 0.0
+        prev_label, prev_nits = prev
+        if prev_label == patch.label:
+            return 0.0
+        if prev_nits < cfg.jump_settle_floor_nits:
+            return 0.0
+        if prev_nits < cfg.jump_settle_ratio * max(expected, 1e-6):
+            return 0.0
+        self.jump_settles += 1
+        return cfg.jump_settle_s
+
+    def _present_and_measure(self, patch: MeasurePatch) -> tuple[Reading, float]:
+        """The single presentation funnel: apply the luminance-jump settle bump (as
+        ``settle_bump_s`` on the presented patch — honored by the real presenters,
+        ignored by synthetic measure fns) and read. Returns ``(reading, bump_s)``."""
+        bump = self._jump_settle_bump(patch)
+        presented = replace(patch, settle_bump_s=bump) if bump > 0.0 else patch
+        return self.measure(presented), bump
+
     def _read(
         self,
         patch: MeasurePatch,
@@ -756,7 +812,7 @@ class _Loop:
         disposition: Optional[str] = None,
         note: Optional[str] = None,
     ) -> Reading:
-        reading = self.measure(patch)
+        reading, jump_settle_s = self._present_and_measure(patch)
         seq = self.seq_counter
         self.seq_counter += 1
         record: dict[str, Any] = {
@@ -779,6 +835,8 @@ class _Loop:
             "disposition": disposition,
             "note": note,
         }
+        if jump_settle_s > 0.0:
+            record["jump_settle_s"] = jump_settle_s
         if reading.error:
             record["error"] = reading.error
         self.ndjson.emit(record)
@@ -1606,8 +1664,12 @@ class _Loop:
         # rather than via _read, which emits atomically on measure). The read runs
         # under the caller's fixed-display-state guard so an in-session edit of the
         # patch it sits on cannot masquerade as panel drift.
+        # The drift-ref read pays the same luminance-jump settle bump as a measurement
+        # read: under an alternating order the checkpoint often lands right after a
+        # bright patch, and reading the mid-grey through residual zone glow would
+        # register as phantom drift.
         with self._reference_read_guard():
-            reading = self.measure(warmup_patch)
+            reading, _ = self._present_and_measure(warmup_patch)
         seq = self.seq_counter
         self.seq_counter += 1
         if reading.xyz is None:
@@ -1848,6 +1910,12 @@ class IncrementalMeasureSession:
             "reference_xyz": [round(c, 4) for c in self.loop.reference_xyz] if self.loop.reference_xyz else None,
             "read_count": self.loop.seq_counter,
             "patch_measurements": self.measure_count,
+            # The alternating-order watch pair (D4): how often reads within a patch had to
+            # repeat (glow/noise churn shows up here first) and how many presentations paid
+            # the luminance-jump settle bump.
+            "immediate_remeasures": sum(r.immediate_remeasures
+                                        for r in self.loop.accepted.values()),
+            "jump_settles": self.loop.jump_settles,
             "drift_episodes": self.loop.drift_episodes,
             "drift_checkpoints": drift_summary["checkpoints"],
             "drift_recent_repeats": drift_summary["recent_repeats"],
@@ -2048,6 +2116,7 @@ def run_measure_loop(
         "total_reads": loop.seq_counter,
         "immediate_remeasures": immediate,
         "appended_remeasures": appended,
+        "jump_settles": loop.jump_settles,
         "remeasure_cap": cfg.remeasure_cap,
         "remeasure_budget_remaining": max(0, loop.remeasure_budget),
         "remeasure_budget_exceeded": loop.remeasure_budget_exceeded,
@@ -2157,7 +2226,10 @@ class DogegenPresenter:
     def show(self, patch: MeasurePatch) -> None:
         proc = self._ensure()
         r, g, b = patch.rgb
-        self.display.send(proc, f"window {self.patch_size} {r} {g} {b}", settle_seconds=self.settle_seconds)
+        # settle_bump_s: per-presentation extra dwell from the loop's luminance-jump
+        # settle bump (FALD zone decay/glow after a sharp drop) — 0.0 normally.
+        self.display.send(proc, f"window {self.patch_size} {r} {g} {b}",
+                          settle_seconds=self.settle_seconds + patch.settle_bump_s)
 
     def close(self) -> None:
         if self._proc is None:
@@ -2214,8 +2286,10 @@ class SocketPresenter:
         ack = self._recv_line(s)
         if not ack.startswith("ok"):
             raise RuntimeError(f"dogegen-server did not ack patch ({r},{g},{b}): {ack!r}")
-        if self.settle_seconds:
-            time.sleep(self.settle_seconds)
+        # per-presentation extra dwell from the loop's luminance-jump settle bump
+        dwell = self.settle_seconds + patch.settle_bump_s
+        if dwell:
+            time.sleep(dwell)
 
     def close(self) -> None:
         # Drop our connection ONLY — the daemon (and its fullscreen window) persists across

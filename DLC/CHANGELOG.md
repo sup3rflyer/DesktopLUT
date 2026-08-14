@@ -30,6 +30,15 @@ request, adjudicates ambiguous results on digests, and writes the report.
     noise-floor stop: when a nudge moves the reading by no more than the measured
     repeatability, the point stops instead of chasing local-dimming zone noise for
     the full round budget.
+- **Grayscale touch-up point ordering** (owner directive D4, 2026-08-14): the tune and
+  grey-ramp verify visit the 32 grey points outside-in alternating (darkest, brightest,
+  next-darkest, …) instead of dark-to-bright, so the panel's average load stays steady
+  across the sweep instead of cooling through the dark half and re-heating at the end.
+  Full drive is measured right after black, so the panel's real achievable peak bounds
+  every brighter point's target from the start (previously only the last point could
+  discover it). New dark↔bright transitions get a short extra settle before reading a
+  dark patch right after a bright one, so local-dimming afterglow never contaminates
+  the read.
 - **Dashboard truth wave** (owner directives after the first full HDR run, 2026-08-14):
   previous-stage chart series now draw as their own semi-transparent underlay beneath the
   current stage's line (no more mixed-stack sawtooth); the thermal-drift chart takes only
