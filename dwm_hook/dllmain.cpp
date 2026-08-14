@@ -223,9 +223,143 @@ static int g_hookLevel = 4;
 // Saved original bytes for OverlaysEnabled inline-patch (restored on detach)
 static unsigned char g_overlaysEnabledOrigBytes[17] = {0};
 static unsigned char* g_overlaysEnabledPatchAddr = NULL;
-// Offset from m_dwOverlayTestMode to m_fDisableIndependentFlip in CCommonRegistryData.
-// Derived from PDB analysis of dwmcore.dll (Build 26200): RVA 0x3FE3F8 - 0x3FE3E4 = 0x14.
-static const int kOverlayTestModeToDisableIFlipOffset = 0x14;
+// --- Registry-backed DWM globals: located by value name, never by fixed offset ---
+//
+// m_dwOverlayTestMode and m_fDisableIndependentFlip are neighbours in
+// CCommonRegistryData, but their spacing is NOT stable: dwmcore 10.0.26100.9168
+// inserted a 4-byte field between them (0x14 -> 0x18). A fixed-offset guess then
+// writes 1 to an unrelated field while still reporting success, which leaves
+// independent flip live *and* patches OverlaysEnabled to return TRUE — DWM then
+// composites through real overlay planes with OverlayTestMode=5 active and paints
+// its debug tint (cyan/magenta/yellow) over the whole desktop.
+//
+// Registry *value names* are stable across builds where struct offsets are not,
+// so both globals are resolved by finding their name string and following the
+// store that consumes the registry read:
+//     lea  r8, [rip+<L"OverlayTestMode">]   ; 48/4C 8D /r  mod=00 rm=101
+//     call [rip+<registry read helper>]
+//     mov  dword ptr [rip+<global>], eax    ; 89 /r       mod=00 rm=101
+
+static const unsigned char* FindBytesInImage(const unsigned char* hay, size_t haySize,
+                                             const unsigned char* pat, size_t patLen)
+{
+	if (patLen == 0 || haySize < patLen) return NULL;
+	const unsigned char first = pat[0];
+	for (size_t i = 0; i + patLen <= haySize; i++) {
+		if (hay[i] != first) continue;
+		size_t k = 1;
+		for (; k < patLen; k++) if (hay[i + k] != pat[k]) break;
+		if (k == patLen) return hay + i;
+	}
+	return NULL;
+}
+
+// Window (in bytes) after the name-string lea in which the storing instruction
+// must appear. Generous enough to clear the argument setup and the call, tight
+// enough that it cannot wander into an unrelated store.
+static const size_t kRegistryStoreWindow = 0x80;
+
+static int* DeriveRegistryGlobalInner(const unsigned char* modBase, size_t modSize,
+                                      const unsigned char* nameUtf16, size_t nameBytes)
+{
+	// nameBytes includes the wide NUL, so this only matches whole value names.
+	const unsigned char* str = FindBytesInImage(modBase, modSize, nameUtf16, nameBytes);
+	if (str == NULL) return NULL;
+
+	for (size_t i = 0; i + 7 <= modSize; i++) {
+		const unsigned char* p = modBase + i;
+		if ((p[0] != 0x48 && p[0] != 0x4C) || p[1] != 0x8D || (p[2] & 0xC7) != 0x05)
+			continue;
+		if (p + 7 + *(const int*)(p + 3) != str)
+			continue;
+
+		const unsigned char* q   = p + 7;
+		const unsigned char* lim = q + kRegistryStoreWindow;
+		if (lim > modBase + modSize - 6) lim = modBase + modSize - 6;
+		for (; q < lim; q++) {
+			if (q[0] != 0x89 || (q[1] & 0xC7) != 0x05) continue;
+			const unsigned char* tgt = q + 6 + *(const int*)(q + 2);
+			if (tgt >= modBase && tgt + sizeof(int) <= modBase + modSize)
+				return (int*)tgt;
+			break;
+		}
+	}
+	return NULL;
+}
+
+static int* DeriveRegistryGlobal(const unsigned char* modBase, size_t modSize,
+                                 const unsigned char* nameUtf16, size_t nameBytes)
+{
+	int* result = NULL;
+	__try { result = DeriveRegistryGlobalInner(modBase, modSize, nameUtf16, nameBytes); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { result = NULL; }
+	return result;
+}
+
+// Publish m_fDisableIndependentFlip to g_pDisableIndependentFlip, or leave it NULL.
+// NULL is the safe outcome: OverlaysEnabled is then patched to return FALSE, which
+// forces composition instead of trusting a write we could not verify.
+static void ResolveDisableIndependentFlip(const unsigned char* modBase, size_t modSize,
+                                          int* overlayTestMode)
+{
+	static const wchar_t kOtmName[] = L"OverlayTestMode";
+	static const wchar_t kDifName[] = L"DisableIndependentFlip";
+
+	// Cross-check the technique on this build before trusting it: derive
+	// m_dwOverlayTestMode by name and require it to land on the same address the
+	// OverlaysEnabled AOB already produced. Two independent methods agreeing is
+	// what licenses us to apply the same derivation to the sibling field.
+	int* otmByName = DeriveRegistryGlobal(modBase, modSize,
+		(const unsigned char*)kOtmName, sizeof(kOtmName));
+	if (otmByName == NULL || otmByName != overlayTestMode) {
+		log_to_file("DisableIndependentFlip: name-derivation cross-check FAILED — leaving unpatched");
+		return;
+	}
+
+	int* dif = DeriveRegistryGlobal(modBase, modSize,
+		(const unsigned char*)kDifName, sizeof(kDifName));
+	if (dif == NULL) {
+		log_to_file("DisableIndependentFlip: value name not found — leaving unpatched");
+		return;
+	}
+
+	// Plausibility: same registry-data struct, and DWORD-aligned.
+	INT_PTR delta = (INT_PTR)((const unsigned char*)dif - (const unsigned char*)overlayTestMode);
+	INT_PTR absDelta = delta < 0 ? -delta : delta;
+	if (absDelta > 0x200 || ((ULONG_PTR)dif & 3) != 0) {
+		char msg[160];
+		snprintf(msg, sizeof(msg),
+			"DisableIndependentFlip: implausible location (delta 0x%llX) — leaving unpatched",
+			(unsigned long long)absDelta);
+		log_to_file(msg);
+		return;
+	}
+
+	__try {
+		int curVal = *dif;
+		if (curVal != 0 && curVal != 1) {
+			char msg[160];
+			snprintf(msg, sizeof(msg),
+				"DisableIndependentFlip: non-boolean value %d at delta 0x%llX — leaving unpatched",
+				curVal, (unsigned long long)absDelta);
+			log_to_file(msg);
+			return;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		log_to_file("DisableIndependentFlip: candidate not readable — leaving unpatched");
+		return;
+	}
+
+	g_pDisableIndependentFlip = dif;
+	{
+		char msg[128];
+		snprintf(msg, sizeof(msg),
+			"DisableIndependentFlip resolved by name (delta 0x%llX from OverlayTestMode)",
+			(unsigned long long)absDelta);
+		log_to_file(msg);
+	}
+}
 
 // --- Heartbeat event: signals to host that the DWM hook is active ---
 static HANDLE g_heartbeatEvent = NULL;
@@ -980,27 +1114,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						{
 							g_pOverlayTestMode = candidatePtr;
 
-							// m_fDisableIndependentFlip lives at a known offset from
-							// m_dwOverlayTestMode in the CCommonRegistryData global.
-							int* iflipCandidate = (int*)((char*)candidatePtr + kOverlayTestModeToDisableIFlipOffset);
-							if ((unsigned char*)iflipCandidate >= (unsigned char*)dwmcore &&
-								(unsigned char*)iflipCandidate + sizeof(int) <= (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
-							{
-								__try {
-									int curVal = *iflipCandidate;
-									if (curVal == 0 || curVal == 1) {
-										g_pDisableIndependentFlip = iflipCandidate;
-									} else {
-										char msg[128];
-										snprintf(msg, sizeof(msg),
-											"WARNING: DisableIndependentFlip candidate has unexpected value %d — skipped", curVal);
-										log_to_file(msg);
-									}
-								}
-								__except (EXCEPTION_EXECUTE_HANDLER) {
-									log_to_file("WARNING: DisableIndependentFlip candidate not readable — skipped");
-								}
-							}
+							ResolveDisableIndependentFlip((const unsigned char*)dwmcore,
+								moduleInfo.SizeOfImage, candidatePtr);
 						}
 						else
 						{
@@ -1043,17 +1158,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 								    (unsigned char*)otmCandidate < (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
 								{
 									g_pOverlayTestMode = otmCandidate;
-									int* iflipCandidate = (int*)((char*)otmCandidate + kOverlayTestModeToDisableIFlipOffset);
-									if ((unsigned char*)iflipCandidate >= (unsigned char*)dwmcore &&
-									    (unsigned char*)iflipCandidate + sizeof(int) <= (unsigned char*)dwmcore + moduleInfo.SizeOfImage)
-									{
-										__try {
-											int curVal = *iflipCandidate;
-											if (curVal == 0 || curVal == 1)
-												g_pDisableIndependentFlip = iflipCandidate;
-										}
-										__except (EXCEPTION_EXECUTE_HANDLER) {}
-									}
+									ResolveDisableIndependentFlip((const unsigned char*)dwmcore,
+										moduleInfo.SizeOfImage, otmCandidate);
 								}
 								break;
 							}
