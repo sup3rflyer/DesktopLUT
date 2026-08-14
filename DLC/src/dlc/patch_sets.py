@@ -39,6 +39,7 @@ __all__ = [
     "build_grayscale_wb_set",
     "build_verify_set",
     "flow_patch_counts",
+    "outside_in_indices",
 ]
 
 
@@ -445,6 +446,31 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
         # (dense low, sparse high). The slider's number is exactly this code.
         levels = [round(cap * (i / (n - 1)) ** 2) for i in range(n)]
     return [(v, v, v) for v in levels]
+
+
+def outside_in_indices(n: int) -> list[int]:
+    """Outside-in alternating MEASUREMENT order over an ascending set: 0, n-1, 1, n-2, …
+
+    The grayscale-wb tune + grey-ramp verify order (owner directive D4, 2026-08-14): pairing
+    each dark point with a bright one keeps the running-average APL roughly flat across the
+    sweep — a *static* band-stabilizer (the fixed-schedule special case of the deferred
+    warming-patch-scheduler design) instead of the luminance-ascending sweep whose ~5 min of
+    dark patches cooled the panel before the bright tail re-heated it. It also measures FULL
+    DRIVE second (right after black), so the panel's achievable ceiling anchors bright-point
+    target bounds from round one rather than only firing at the last point.
+
+    This is an ordering of INDICES into an ascending list — the list itself (slot mapping,
+    editor abscissa) stays ascending; only the visit order changes.
+    """
+    order: list[int] = []
+    lo, hi = 0, n - 1
+    while lo <= hi:
+        order.append(lo)
+        if hi != lo:
+            order.append(hi)
+        lo += 1
+        hi -= 1
+    return order
 
 
 def build_verify_set(ps: PatchSizes, transfer: Transfer, *,

@@ -1252,3 +1252,114 @@ def test_reference_guard_shields_drift_ref_from_live_edit():
     digest = session.finish()
     assert digest["drift_episodes"] == 0
     assert digest["needs_adjudication"] is False
+
+
+# ---------------------------------------------------------------------------
+# luminance-jump settle bump (D4: outside-in alternating order support)
+# ---------------------------------------------------------------------------
+
+class _BumpRecorder:
+    """A perfect warm panel that records each presentation's ``settle_bump_s``."""
+
+    def __init__(self, transfer: Transfer) -> None:
+        self.panel = SyntheticPanel(transfer=transfer, start_temp=1.0, cold_blue_gain=1.0)
+        self.seen: list[tuple[str, float]] = []
+
+    def __call__(self, patch: MeasurePatch) -> Reading:
+        self.seen.append((patch.label, patch.settle_bump_s))
+        return self.panel(patch)
+
+
+def test_jump_settle_bump_fires_only_on_sharp_luminance_drops():
+    t = _sdr()  # 120-nit peak
+    rec = _BumpRecorder(t)
+    cfg = MeasureLoopConfig(jump_settle_s=1.5, jump_settle_ratio=8.0,
+                            jump_settle_floor_nits=10.0)
+    loop = _solo_loop(rec, t, cfg)
+
+    bright = _patch("bright", (1023, 1023, 1023), t, 0)      # 120 nits
+    dark = _patch("dark", (116, 116, 116), t, 1)             # ~1 nit
+    dark2 = _patch("dark2", (140, 140, 140), t, 2)           # ~1.5 nits
+    mid = _patch("mid", (724, 724, 724), t, 3)               # ~56 nits (drop ratio ~2)
+
+    loop.measure_patch(bright, phase="main")   # nothing presented before → no bump
+    loop.measure_patch(dark, phase="main")     # 120 → ~1 nit: sharp drop → bump
+    loop.measure_patch(dark2, phase="main")    # dark → dark: prev below floor → no bump
+    loop.measure_patch(bright, phase="main")   # rise → no bump
+    loop.measure_patch(mid, phase="main")      # drop ratio ≈ 2.1 < 8 → no bump
+
+    bumps = {label: bump for label, bump in rec.seen}
+    assert bumps["bright"] == 0.0
+    assert bumps["dark"] == 1.5
+    assert bumps["dark2"] == 0.0
+    assert bumps["mid"] == 0.0
+    assert loop.jump_settles == 1
+
+
+def test_jump_settle_repeat_reads_of_one_patch_pay_no_bump():
+    # The DIP demands several averaged reads of the same dark patch after a bright one:
+    # only the FIRST presentation (the actual transition) pays the bump.
+    t = _sdr()
+    rec = _BumpRecorder(t)
+    loop = _solo_loop(rec, t, MeasureLoopConfig(read_tolerance_de=0.2, jump_settle_s=1.0),
+                      dip=_dip_for(1.0, 0.4))   # σ=0.4 @ tol 0.2 ⇒ 4 reads
+    loop.measure_patch(_patch("bright", (1023, 1023, 1023), t, 0), phase="main")
+    dark = loop.measure_patch(_patch("dark", (116, 116, 116), t, 1), phase="main")
+    assert dark.reads_taken == 4
+    dark_bumps = [b for label, b in rec.seen if label == "dark"]
+    assert dark_bumps[0] == 1.0
+    assert all(b == 0.0 for b in dark_bumps[1:])
+    assert loop.jump_settles == 1
+
+
+def test_jump_settle_zero_disables_the_bump():
+    t = _sdr()
+    rec = _BumpRecorder(t)
+    loop = _solo_loop(rec, t, MeasureLoopConfig(jump_settle_s=0.0))
+    loop.measure_patch(_patch("bright", (1023, 1023, 1023), t, 0), phase="main")
+    loop.measure_patch(_patch("dark", (116, 116, 116), t, 1), phase="main")
+    assert all(b == 0.0 for _, b in rec.seen)
+    assert loop.jump_settles == 0
+
+
+def test_jump_settle_covers_the_drift_reference_read(tmp_path: Path):
+    # Under an alternating order the drift checkpoint often lands right after a bright
+    # patch — the mid-grey reference read must pay the same bump, or residual zone glow
+    # reads as phantom drift. neutral_interval=1 forces a checkpoint after each patch.
+    t = _sdr()
+    rec = _BumpRecorder(t)
+    cfg = MeasureLoopConfig(neutral_interval=1, jump_settle_s=2.0, jump_settle_ratio=3.0,
+                            jump_settle_floor_nits=10.0)
+    session = IncrementalMeasureSession(
+        patches=[(1023, 1023, 1023), (116, 116, 116)], transfer=t, measure=rec,
+        config=cfg, ndjson_path=tmp_path / "s.ndjson")
+    session.start()
+    session.measure_index(0)          # bright patch
+    # checkpoint after the bright patch: 120 → ~26-nit reference, ratio ≈ 4.6 ≥ 3 → bump
+    ref_bumps = [b for label, b in rec.seen if label.startswith("warmup")]
+    assert any(b == 2.0 for b in ref_bumps)
+    digest = session.finish()
+    assert digest["jump_settles"] >= 1
+    assert "immediate_remeasures" in digest
+
+
+def test_presenters_honor_the_per_presentation_settle_bump():
+    from dlc.measure_loop import DogegenPresenter
+
+    class _FakeDisplay:
+        def __init__(self):
+            self.sent: list[tuple[str, float]] = []
+
+        def start(self):
+            return object()
+
+        def send(self, proc, cmd, settle_seconds=0.0):
+            self.sent.append((cmd, settle_seconds))
+
+    disp = _FakeDisplay()
+    pres = DogegenPresenter(disp, settle_seconds=0.5)
+    pres.show(MeasurePatch(label="a", rgb=(10, 10, 10), signal=(0.01, 0.01, 0.01)))
+    pres.show(MeasurePatch(label="b", rgb=(10, 10, 10), signal=(0.01, 0.01, 0.01),
+                           settle_bump_s=1.25))
+    assert disp.sent[0][1] == 0.5           # no bump → the presenter's own settle only
+    assert disp.sent[1][1] == 1.75          # bump rides on top for this one presentation

@@ -51,6 +51,7 @@ from dlc.calibrate import (
     descriptive_cube_name,
     flow_patch_counts,
     main,
+    outside_in_indices,
     run_calibration,
 )
 from dlc.controller import CalibrationController
@@ -825,6 +826,13 @@ def test_grayscale_wb_flow_is_standalone_mhc_only_touchup(tmp_path: Path):
     assert digest["session"]["warm"] is True
     assert digest["session"]["warmup_reads"] > 0
     assert digest["session"]["drift_checkpoints"] > 0
+    # D4 watch: the outside-in alternating order adds NO read-policy churn — this mock's
+    # immediate re-measure rate is identical under monotonic and alternating visit order
+    # (18 = 9 bright points × the 3-read floor's 2 extra reads; the pre-floor monotonic
+    # baseline was 14). The dark↔bright swings are absorbed by the luminance-jump settle
+    # bump (extra presenter dwell), never by extra reads.
+    assert digest["session"]["immediate_remeasures"] <= 18
+    assert digest["session"]["jump_settles"] > 0
     # The touch-up live-edits the MHC correctionGrayscale (the toggleable third "+1") and bakes it
     # into the ICM on accept — NOT a runtime overlay tweak. Core (matrix/base/3D-LUT) untouched.
     mhc = ctrl.state()["mhc"]["0:SDR"]
@@ -922,7 +930,9 @@ def test_grayscale_wb_decomposed_sliders_and_unreachable_top_target(tmp_path: Pa
     assert top["index"] == payload["point_count"] - 1
     assert top["achievable_Y"] < top["requested_target_Y"]
     assert payload["luminance"][-1] == pytest.approx(1.0, abs=0.02)   # held, not +cap
-    top_log = digest["per_point"][-1]
+    # per_point is in VISIT order (outside-in, D4): the top point is visited second,
+    # not last — find it by its ascending slot index.
+    top_log = next(p for p in digest["per_point"] if p["index"] == payload["point_count"] - 1)
     assert top_log["unreachable_target"]["requested_target_Y"] == top["requested_target_Y"]
     assert len(top_log["rounds"]) < digest["max_rounds_per_point"]    # budget not burned
 
@@ -997,6 +1007,107 @@ def test_grayscale_wb_noise_floor_stops_chasing_bright_point_noise(tmp_path: Pat
         assert stop["round_delta_de"] <= 2.0 * stop["repeatability_de"]
     # the quiet dim/mid points converged normally (no stop recorded there)
     assert any("noise_floor_stop" not in p and p["rounds"] for p in digest["per_point"])
+
+
+# ---------------------------------------------------------------------------
+# D4 (2026-08-14): outside-in alternating point order + achievable-ceiling bound.
+# The tune and grey-ramp verify no longer sweep luminance-ascending (~5 min of dark
+# patches cooled the panel before the bright tail re-heated it): 0, 31, 1, 30, …
+# keeps average APL roughly flat and measures full drive SECOND, so its round-1
+# reading bounds every later bright point's target against the panel's real ceiling.
+# ---------------------------------------------------------------------------
+
+def test_outside_in_indices_shape():
+    order = outside_in_indices(32)
+    assert order[:6] == [0, 31, 1, 30, 2, 29]
+    assert order[-2:] == [15, 16]
+    assert sorted(order) == list(range(32))          # a permutation — nothing dropped
+    assert outside_in_indices(5) == [0, 4, 1, 3, 2]  # odd n: middle visited once, last
+    assert outside_in_indices(1) == [0]
+    # band-stabilizer property: each dark/bright PAIR's mean signal level stays near the
+    # set average, so no window of consecutive patches is systematically dark or bright
+    n = 32
+    levels = [(i / (n - 1)) ** 2 for i in range(n)]  # the SDR t² editor grid
+    set_avg = sum(levels) / n
+    for k in range(0, n, 2):
+        pair_avg = (levels[order[k]] + levels[order[k + 1]]) / 2
+        assert abs(pair_avg - set_avg) < 0.20
+
+
+def test_grayscale_wb_outside_in_visit_order_and_ceiling_bound(tmp_path: Path):
+    """Mock E2E: a panel whose light output CLIPS at 100 nits (a warm sustained ceiling
+    under the resolved 120-nit target). The tune must visit the points outside-in (full
+    drive second), record that first full-drive reading as the achievable ceiling, and
+    bound every later bright point whose target exceeds it — instead of only discovering
+    the wall at the last point and ramping sliders against physics on the way."""
+    from dataclasses import replace as _replace
+
+    ctrl = CalibrationController.mock()
+    ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
+                                  "bx": 0.15, "by": 0.06})
+    ctrl.apply_mhc(0, "SDR")
+    calib = _make(tmp_path, "gswb_order", controller=ctrl)
+    calib.target_name = "srgb_g22"
+    inner = _editor_responsive_panel(ctrl, calib._transfer(), white_nits=120.0)
+    visited: list[int] = []
+
+    def clipped_measure(patch):
+        if patch.role == "measurement":
+            visited.append(int(patch.rgb[0]))
+        reading = inner(patch)
+        x, y, z = reading.xyz
+        if y > 100.0:                                   # the panel's sustained ceiling
+            s = 100.0 / y
+            x, y, z = x * s, 100.0, z * s
+            total = x + y + z
+            reading = _replace(reading, xyz=(x, y, z), yxy=(y, x / total, y / total))
+        return reading
+
+    calib.measure = clipped_measure
+    outcome = calib.stage_grayscale_wb_touchup()
+    assert outcome.status == "done"
+    digest = outcome.digest
+
+    # Visit order: first appearances of measured codes = the outside-in permutation of
+    # the ascending editor set (the set/payload themselves stay ascending).
+    patches = calib._grayscale_wb_patches()
+    codes = [p[0] for p in patches]
+    first_seen = list(dict.fromkeys(visited))
+    assert first_seen == [codes[i] for i in outside_in_indices(len(codes))]
+    assert first_seen[1] == codes[-1]                 # full drive measured second
+
+    # The full-drive point trips the existing top-point cap (120 asked, 100 delivered)…
+    unreachable = {u["index"]: u for u in digest["unreachable_targets"]}
+    n = len(codes)
+    assert n - 1 in unreachable
+    assert not unreachable[n - 1].get("bounded_by_ceiling")
+    assert unreachable[n - 1]["achievable_Y"] == pytest.approx(100.0, abs=0.5)
+    # …and its measured ceiling bounds the next bright point (index 30: target ≈ 103.9
+    # exceeds the 100-nit ceiling) BEFORE its first round, from round one.
+    assert n - 2 in unreachable
+    bounded = unreachable[n - 2]
+    assert bounded["bounded_by_ceiling"] is True
+    assert bounded["achievable_Y"] == pytest.approx(100.0, abs=0.5)
+    assert bounded["requested_target_Y"] > bounded["achievable_Y"]
+    # ceiling entries appear in visit order: the top point (visited second) first
+    assert digest["unreachable_targets"][0]["index"] == n - 1
+    # the bounded point measures AT the ceiling → its bounded target is satisfied
+    # immediately: no round budget burned ramping the luminance slider against the clip
+    bounded_log = next(p for p in digest["per_point"] if p["index"] == n - 2)
+    assert len(bounded_log["rounds"]) == 1
+    payload = calib.calib["grayscale_wb_touchup"]
+    assert payload["luminance"][n - 2] == pytest.approx(1.0, abs=0.02)
+    assert digest["capped"] is False
+
+
+def test_grayscale_wb_verify_set_is_outside_in(tmp_path: Path):
+    calib = _make(tmp_path, "gswb_vorder")
+    calib.target_name = "srgb_g22"
+    tune = calib._grayscale_wb_patches()
+    verify = calib._grayscale_wb_verify_patches()
+    assert verify == [tune[i] for i in outside_in_indices(len(tune))]
+    assert sorted(verify) == sorted(tune)             # same points, different rhythm
+    assert tune == sorted(tune)                       # the tune/editor set stays ascending
 
 
 def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):

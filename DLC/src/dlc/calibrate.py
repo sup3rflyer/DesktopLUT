@@ -138,6 +138,7 @@ from .patch_sets import (
     build_verify_set,
     build_volumetric_set,
     flow_patch_counts,
+    outside_in_indices,
 )
 from .paths import RUNS_DIR, atomic_write_text
 from .runs import RunContext, create_run, open_run
@@ -3749,7 +3750,15 @@ class Calibration:
             any_large_y = False
             any_unsettled = False
 
-            for idx, patch in enumerate(patches):
+            # Outside-in alternating visit order (owner directive D4, 2026-08-14): 0, n-1,
+            # 1, n-2, … keeps the running-average APL roughly flat (static band-stabilizer —
+            # the old luminance-ascending sweep spent ~5 min in the dark cooling the panel
+            # before the bright tail re-heated it) AND measures full drive second, so the
+            # achievable ceiling below can bound every later bright point from round one.
+            # The patches/points/payload lists stay ascending — only the visit order changes.
+            achievable_ceiling_y: float | None = None
+            for pos, idx in enumerate(outside_in_indices(len(patches))):
+                patch = patches[idx]
                 target_y = transfer.cv_to_nits(patch[0])
                 at_full_drive = int(patch[0]) >= int(cap)
                 point_log: dict[str, Any] = {
@@ -3759,6 +3768,29 @@ class Calibration:
                     "target_Y": round(target_y, 5),
                     "rounds": [],
                 }
+                # Achievable-ceiling bound (D4 extension of the top-point cap): the panel
+                # cannot out-shine its own measured full-drive output at ANY lower drive, so
+                # a bright point whose resolved target exceeds that ceiling is unreachable
+                # for the same physics reason as the top point — bound it to the ceiling up
+                # front instead of ramping the slider against it for the round budget.
+                if (achievable_ceiling_y is not None and not at_full_drive
+                        and achievable_ceiling_y + max(0.15, target_y * 0.01) < target_y):
+                    info = {
+                        "index": idx,
+                        "code": int(patch[0]),
+                        "requested_target_Y": round(target_y, 5),
+                        "achievable_Y": round(achievable_ceiling_y, 5),
+                        "shortfall_pct": round(100.0 * (1.0 - achievable_ceiling_y / target_y), 3),
+                        "bounded_by_ceiling": True,
+                    }
+                    unreachable_targets.append(info)
+                    point_log["unreachable_target"] = info
+                    target_y = achievable_ceiling_y
+                    self.runlog.anomaly(
+                        "grayscale-wb", kind="unreachable_target", **info,
+                        message=("grey point target exceeds the panel's measured full-drive "
+                                 "ceiling — target bounded to the achievable ceiling; tuning "
+                                 "chroma against the achievable target"))
                 # F12 (2026-08-14 HW): a point must never END worse than it was FOUND. Capture
                 # the pre-tune editor values so a regressed point can be restored (the tuner
                 # traded chroma for ΔY against a thermally-shifted bright end and left an
@@ -3781,6 +3813,11 @@ class Calibration:
                         any_unsettled = True
                         break
                     y_tol = max(0.15, target_y * 0.01)
+                    if rnd == 1 and at_full_drive:
+                        # First-round full-drive measurement IS the panel's achievable
+                        # ceiling — visited second under the outside-in order, so it
+                        # anchors the bright-point target bounds above from round one.
+                        achievable_ceiling_y = float(accepted.xyz[1])
                     if rnd == 1 and at_full_drive and accepted.xyz[1] + y_tol < target_y:
                         # Unreachable top-point target (2026-08-14 HDR run, the D2
                         # ungrounded-peak issue in a second flow): the resolved target asks
@@ -3897,7 +3934,9 @@ class Calibration:
                 per_point.append(point_log)
                 self._last_refine = {
                     "stage": "grayscale-wb",
-                    "point": idx + 1,
+                    # progress = visit position (outside-in), not the ascending slot index
+                    "point": pos + 1,
+                    "index": idx,
                     "points": len(patches),
                     "latest": latest_error,
                     "capped": any_capped,
@@ -4640,6 +4679,14 @@ class Calibration:
     def _grayscale_wb_patches(self) -> list[tuple[int, int, int]]:
         return build_grayscale_wb_set(self.patch_sizes, self._transfer(), max_cv=self._patch_max_cv())
 
+    def _grayscale_wb_verify_patches(self) -> list[tuple[int, int, int]]:
+        """The grey-ramp verify sequence: the SAME points as the tune set, visited in the
+        outside-in alternating order (D4) so the verify holds the same roughly-flat APL as
+        the tune instead of cooling through an ascending dark half. Scoring is per-patch
+        (order-independent), so only the measurement rhythm changes."""
+        patches = self._grayscale_wb_patches()
+        return [patches[i] for i in outside_in_indices(len(patches))]
+
     def _verify_patches(self, *, gamut_aware: bool = True) -> list[tuple[int, int, int]]:
         # The "cover all bases" QC set (see build_verify_set): dense grey/PQ + shadow toe, colour
         # only above the shadow band, gamut-capped. gamut_aware caps saturated hues to the panel's
@@ -4789,7 +4836,7 @@ class Calibration:
         self._capture_inplace_baseline()
         self.stage_hardware_readiness()
         self.stage_grayscale_wb_touchup()
-        ver = self.stage_measure(role="verify", patches=self._grayscale_wb_patches(),
+        ver = self.stage_measure(role="verify", patches=self._grayscale_wb_verify_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
