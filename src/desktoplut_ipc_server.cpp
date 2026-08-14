@@ -796,15 +796,21 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
         mhc.hasPerChannelTRC = false;
         mhc.sourceIs1DCube = false;
         mhc.desktopGammaEnabled = false;
-        // Clear runtime 3D LUTs.
-        ms.sdrPath.clear();
-        ms.hdrPath.clear();
-        // Zero shader correction layers.
-        ms.sdrColorCorrection.primariesEnabled = false;
-        ms.sdrColorCorrection.grayscale.enabled = false;
-        ms.hdrColorCorrection.primariesEnabled = false;
-        ms.hdrColorCorrection.grayscale.enabled = false;
-        ms.hdrColorCorrection.tonemap.enabled = false;
+        // Clear the runtime 3D LUT + shader correction layers for the CALIBRATED mode
+        // only. The other mode's layers are inert while the display is in the calibrated
+        // mode, and clearing them here destroyed them on the apply path: exit with
+        // restore_snapshot=false keeps the cleared state, so an HDR calibration
+        // permanently dropped the user's SDR runtime cube (DLC field report 2026-08-14).
+        if (isHDR) {
+            ms.hdrPath.clear();
+            ms.hdrColorCorrection.primariesEnabled = false;
+            ms.hdrColorCorrection.grayscale.enabled = false;
+            ms.hdrColorCorrection.tonemap.enabled = false;
+        } else {
+            ms.sdrPath.clear();
+            ms.sdrColorCorrection.primariesEnabled = false;
+            ms.sdrColorCorrection.grayscale.enabled = false;
+        }
     }
     SaveSettings();
     UpdateMhcFlagsLive(mon);

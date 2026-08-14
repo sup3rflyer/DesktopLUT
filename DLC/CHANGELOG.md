@@ -233,6 +233,12 @@ request, adjudicates ambiguous results on digests, and writes the report.
   with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
 
 ### Fixed
+- **A calibration run no longer drops the OTHER mode's 3D LUT.** Entering calibration
+  mode cleared both SDR and HDR runtime layers on the monitor, and accepting the new
+  calibration exits without the snapshot restore — so a clean HDR run permanently
+  removed the installed SDR cube (and vice versa). DesktopLUT now clears only the
+  mode being calibrated, and DLC additionally re-applies any other-mode cube an older
+  DesktopLUT build dropped when the run commits.
 - **Fable audit Phase 7a — the orchestrator spine, correctness**
   (`docs/audits/fable/phase-7a.md`): a mis-configured profile (SDR slot → PQ target or
   vice versa) is now rejected loudly at resolve-target instead of running an incoherent
