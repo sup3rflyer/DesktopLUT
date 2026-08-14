@@ -3621,6 +3621,7 @@ class Calibration:
             from .grayscale_wb import (
                 GrayTouchupConfig,
                 GrayTouchupPatch,
+                compose_payload,
                 identity_payload,
                 point_error,
                 summarize_errors,
@@ -3742,6 +3743,7 @@ class Calibration:
             all_updates: list[dict[str, Any]] = []
             unreachable_targets: list[dict[str, Any]] = []
             noise_floor_stops = 0
+            regression_holds = 0
             any_capped = False
             any_large = False
             any_large_y = False
@@ -3757,6 +3759,13 @@ class Calibration:
                     "target_Y": round(target_y, 5),
                     "rounds": [],
                 }
+                # F12 (2026-08-14 HW): a point must never END worse than it was FOUND. Capture
+                # the pre-tune editor values so a regressed point can be restored (the tuner
+                # traded chroma for ΔY against a thermally-shifted bright end and left an
+                # already-good ramp worse, 1.39 → 2.42 avg).
+                pre_lum = float(payload["luminance"][idx])
+                pre_rgb = {ch: float(payload["rgb"][ch][idx]) for ch in ("r", "g", "b")}
+                first_error: dict[str, Any] | None = None
                 latest_error: dict[str, Any] | None = None
                 prev_xyz: tuple[float, float, float] | None = None
                 for rnd in range(1, max_rounds_per_point + 1):
@@ -3804,6 +3813,7 @@ class Calibration:
                     latest_error = point_error(gpatch, cfg)
                     if rnd == 1:
                         before_errors.append(latest_error)
+                        first_error = latest_error
                     point_log["rounds"].append({"round": rnd, **latest_error})
                     if (latest_error["de2000"] <= target_de
                             and abs(latest_error["delta_Y"]) <= y_tol):
@@ -3859,6 +3869,29 @@ class Calibration:
                     if upd.get("capped"):
                         any_unsettled = True
                         break
+                # F12 hold-on-regression: if the point ends measurably worse than its
+                # round-1 state, restore the pre-tune editor values for this point and
+                # live-set them — the restored state's error IS the round-1 measurement.
+                # (Restoring is never harmful: it returns exactly what round 1 measured.)
+                if (first_error is not None and latest_error is not None
+                        and latest_error is not first_error
+                        and latest_error["de2000"] > first_error["de2000"]):
+                    lum = list(payload["luminance"])
+                    rgb = {ch: list(payload["rgb"][ch]) for ch in ("r", "g", "b")}
+                    lum[idx] = pre_lum
+                    for ch in ("r", "g", "b"):
+                        rgb[ch][idx] = pre_rgb[ch]
+                    payload = compose_payload(payload["points"], lum, rgb)
+                    self.controller.grayscale_set_live(
+                        self.monitor, self.mode, payload["point_count"], payload["points"],
+                        payload["deviations"], luminance=payload["luminance"],
+                        rgb=payload["rgb"])
+                    point_log["held_regression"] = {
+                        "round1_de2000": round(first_error["de2000"], 5),
+                        "final_de2000": round(latest_error["de2000"], 5),
+                    }
+                    regression_holds += 1
+                    latest_error = first_error
                 if latest_error is not None:
                     after_errors.append(latest_error)
                 per_point.append(point_log)
@@ -3905,6 +3938,7 @@ class Calibration:
                 "unsettled": any_unsettled,
                 "unreachable_targets": unreachable_targets,
                 "noise_floor_stops": noise_floor_stops,
+                "regression_holds": regression_holds,
                 "session": session_digest,
                 "measurement_compromised": bool(session_digest.get("needs_adjudication")),
                 "compromised": bool(any_capped or (has_3dlut and any_large_y)
@@ -3953,26 +3987,43 @@ class Calibration:
         # gate does NOT depend on the C++ cancel-after-commit (a no-op): _revert_inplace re-applies
         # the DLC-owned pre-begin snapshot captured above. Skip when nothing was previewed.
         if not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable")):
-            baked = self.controller.grayscale_commit(self.monitor, self.mode)
-            # The C++ returns baked:false if the live session was lost (e.g. DesktopLUT restarted
-            # mid-run) — surface it as a compromised seam rather than logging a bake that did not
-            # happen. A dict without an explicit baked:false is treated as success (older builds
-            # may omit the key). (gs-wb adversarial finding: the flag was previously unread.)
-            if isinstance(baked, dict) and baked.get("baked") is False:
-                self.runlog.anomaly(
-                    "grayscale-wb", bake_lost=True,
-                    message="grayscale_commit reported no live session to bake (DesktopLUT "
-                            "restarted mid-run?) — the touch-up was NOT applied")
-                self._abort_if(self.adjudicate(AdjudicationRequest(
-                    key="grayscale-wb:bake-lost", seam=SEAM_MEASURE, stage="grayscale-wb",
-                    question=("the Grayscale touch-up could not be baked — DesktopLUT reported no "
-                              "live edit session (it may have restarted mid-run). Re-run the "
-                              "touch-up after restarting it, or abort?"),
-                    options=("abort",), recommendation="abort",
-                    digest={**outcome.digest, "bake_lost": True, "compromised": True})),
-                    stage="grayscale-wb", message="grayscale touch-up bake lost (no live session)")
+            # F13 (2026-08-14 HW): the bake outcome is MEMOISED in the run record. This block
+            # sits outside the memoised stage, so it re-runs on every resume — and after the
+            # verify-seam pause the process exits, the C++ live session is already committed
+            # and closed, so a re-issued grayscale_commit truthfully reports no live session.
+            # Without the record, the resume misread ALREADY-BAKED as bake-lost and the
+            # only-option-abort seam forced abandoning a valid bake regardless of the verify
+            # decision. A recorded successful bake short-circuits the re-check; bake-lost only
+            # escalates when the record AND the C++ agree no bake happened.
+            if (self.calib.get("grayscale_wb_baked") or {}).get("baked"):
+                self.ctx.log("Grayscale touch-up already baked this run (memoised) — not re-committing")
             else:
-                self.ctx.log("baked the Grayscale touch-up into the ICM")
+                baked = self.controller.grayscale_commit(self.monitor, self.mode)
+                # The C++ returns baked:false if the live session was lost (e.g. DesktopLUT
+                # restarted mid-run) — surface it as a compromised seam rather than logging a
+                # bake that did not happen. A dict without an explicit baked:false is treated as
+                # success (older builds may omit the key). (gs-wb adversarial finding: the flag
+                # was previously unread.)
+                if isinstance(baked, dict) and baked.get("baked") is False:
+                    self.runlog.anomaly(
+                        "grayscale-wb", bake_lost=True,
+                        message="grayscale_commit reported no live session to bake (DesktopLUT "
+                                "restarted mid-run?) — the touch-up was NOT applied")
+                    self._abort_if(self.adjudicate(AdjudicationRequest(
+                        key="grayscale-wb:bake-lost", seam=SEAM_MEASURE, stage="grayscale-wb",
+                        question=("the Grayscale touch-up could not be baked — DesktopLUT reported no "
+                                  "live edit session (it may have restarted mid-run). Re-run the "
+                                  "touch-up after restarting it, or abort?"),
+                        options=("abort",), recommendation="abort",
+                        digest={**outcome.digest, "bake_lost": True, "compromised": True})),
+                        stage="grayscale-wb", message="grayscale touch-up bake lost (no live session)")
+                else:
+                    self.calib["grayscale_wb_baked"] = {
+                        "baked": True,
+                        "response": baked if isinstance(baked, dict) else None,
+                    }
+                    self._save()
+                    self.ctx.log("baked the Grayscale touch-up into the ICM")
         return outcome
 
     def _snapshot_correction_grayscale(self) -> Optional[dict[str, Any]]:

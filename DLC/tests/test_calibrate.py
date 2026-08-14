@@ -3821,3 +3821,98 @@ def test_quality_gate_sdr_tube_check_is_deliberately_stricter():
     assert within is False
     assert basis["checks"]["tube_avg"] is False
     assert all(v for k, v in basis["checks"].items() if k != "tube_avg")
+
+
+def test_grayscale_wb_holds_points_that_regress(tmp_path: Path):
+    """F12 (2026-08-14 HW): a point must never END worse than it was FOUND. An
+    over-responding panel (loop gain > 1: every nudge overshoots ~3x) makes the tuner
+    diverge — each such point must be restored to its pre-tune editor values, with the
+    hold recorded, so the after-state is never worse than the round-1 state."""
+    from dataclasses import replace as _replace
+
+    from dlc.measure_loop import SyntheticPanel
+
+    ctrl = CalibrationController.mock()
+    ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
+                                  "bx": 0.15, "by": 0.06})
+    ctrl.apply_mhc(0, "SDR")
+    calib = _make(tmp_path, "gswb_regress_hold", controller=ctrl)
+    calib.target_name = "srgb_g22"
+    transfer = calib._transfer()
+    panel = SyntheticPanel(transfer=transfer, start_temp=1.0, cold_blue_gain=1.0,
+                           white_nits=120.0)
+
+    def overreacting_measure(patch):
+        st = (ctrl.state().get("mhc") or {}).get("0:SDR") or {}
+        cg = st.get("correction_grayscale") or {}
+        pts = cg.get("points") or []
+        dev = cg.get("deviations") or {}
+        level = max(patch.signal)
+        gains = [1.0, 1.0, 1.0]
+        if st.get("gs_preview_active") and pts:
+            # over-response: the panel applies every editor deviation ~3x (gain**3),
+            # so the damped tuner overshoots and oscillates instead of converging
+            gains = [_interp_editor_col(level, pts, dev.get(ch) or []) ** 3 for ch in "rgb"]
+        # a mild tint so the tuner has something real to chase into the overshoot
+        tint = (1.0, 1.015, 0.99)
+        sig = tuple(min(1.0, max(0.0, s * g * t)) for s, g, t in zip(patch.signal, gains, tint))
+        return panel(_replace(patch, signal=sig))
+
+    calib.measure = overreacting_measure
+    outcome = calib.stage_grayscale_wb_touchup()
+    assert outcome.status == "done"
+    digest = outcome.digest
+
+    # every per-point outcome is no worse than its round-1 measurement...
+    for log in digest["per_point"]:
+        rounds = [r for r in log["rounds"] if "de2000" in r]
+        if not rounds:
+            continue
+        first = rounds[0]["de2000"]
+        final = rounds[-1]["de2000"]
+        if "held_regression" in log:
+            assert log["held_regression"]["final_de2000"] > log["held_regression"]["round1_de2000"]
+        else:
+            assert final <= first + 1e-9
+    # ...and the aggregate can never regress (the 2026-08-14 failure shape: 1.39 -> 2.42)
+    assert digest["after"]["avg_de2000"] <= digest["before"]["avg_de2000"] + 1e-9
+    # the perverse panel must actually have provoked at least one hold for this test to bite
+    assert digest["regression_holds"] >= 1
+
+
+def test_grayscale_wb_bake_memoised_across_resume(tmp_path: Path):
+    """F13 (2026-08-14 HW): Design B bakes before the verify seam; the pause exits the
+    process and the resume re-ran the commit — DesktopLUT truthfully reported no live
+    session (already committed) and DLC misread ALREADY-BAKED as bake-lost, force-aborting
+    a valid bake. The bake outcome is now memoised in the run record: a resume never
+    re-commits and never fires bake-lost when the record shows a successful bake."""
+    ctrl = _gswb_controller()
+    commits = {"n": 0}
+    orig_commit = ctrl.grayscale_commit
+
+    def counting_commit(mon, mode):
+        commits["n"] += 1
+        if commits["n"] == 1:
+            return orig_commit(mon, mode)            # real first commit
+        return {"monitor_mode": "0:SDR", "baked": False}   # any re-commit sees no session
+
+    ctrl.grayscale_commit = counting_commit
+    # First process: pause at the verify seam AFTER the bake (the F13 shape).
+    calib = _make(tmp_path, "gswb_bake_memo", controller=ctrl,
+                  adjudicator=MappingAdjudicator({"resolve-target:plan": Decision("approve")}))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("grayscale-wb")
+    assert exc.value.request.key == "verify:accept"
+    assert commits["n"] == 1
+    assert calib.calib["grayscale_wb_baked"]["baked"] is True
+
+    # Resume (same run dir = same record): decide apply. The memoised bake short-circuits
+    # the re-check — no second commit, no bake-lost seam, the run completes.
+    resumed = _make(tmp_path, "gswb_bake_memo", controller=ctrl,
+                    adjudicator=MappingAdjudicator({"resolve-target:plan": Decision("approve"),
+                                                    "verify:accept": Decision("apply")}))
+    result = resumed.run("grayscale-wb")
+    assert result.status == "completed"
+    assert commits["n"] == 1                          # never re-committed
+    mhc = ctrl.state()["mhc"]["0:SDR"]
+    assert mhc.get("gs_committed") is True            # the bake is still the applied state
