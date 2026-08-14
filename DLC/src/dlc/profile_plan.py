@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from .argyll import Argyll, Instrument, command_for_log
@@ -298,7 +298,11 @@ def resolve_dispread_instrument_port(
     # AND its suffix convention (a POSIX plan carries "dispread", not "dispread.exe" —
     # hardcoding the .exe here would derive a nonexistent sibling and fail enumeration).
     sibling = "spotread.exe" if executable_name.lower().endswith(".exe") else "spotread"
-    spotread = Path(argv[0][: len(argv[0]) - len(executable_name)] + sibling)
+    # A concrete Path would re-render the string in the host OS's separator (a POSIX
+    # plan inspected on Windows becomes \opt\argyll\spotread), so pick the pure-path
+    # flavor from the plan path's own separators instead.
+    path_cls = PureWindowsPath if "\\" in argv[0] else PurePosixPath
+    spotread = path_cls(argv[0][: len(argv[0]) - len(executable_name)] + sibling)
     enumerator = instrument_enumerator or (lambda path: Argyll(path).enumerate_instruments())
     try:
         instruments = enumerator(spotread)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Literal
 
 from .argyll import Argyll, Instrument, command_for_log
@@ -80,7 +80,11 @@ def probe_match_instrument_inventory(
     raw = str(plan.command_argv[0]) if plan.command_argv else "ccxxmake.exe"
     executable_name = raw.replace("\\", "/").rsplit("/", 1)[-1]
     sibling = "spotread.exe" if executable_name.lower().endswith(".exe") else "spotread"
-    spotread = Path(raw[: len(raw) - len(executable_name)] + sibling)
+    # A concrete Path would re-render the string in the host OS's separator (a POSIX
+    # plan inspected on Windows becomes \opt\argyll\spotread), so pick the pure-path
+    # flavor from the plan path's own separators instead.
+    path_cls = PureWindowsPath if "\\" in raw else PurePosixPath
+    spotread = path_cls(raw[: len(raw) - len(executable_name)] + sibling)
     enumerator = instrument_enumerator or (lambda path: Argyll(path).enumerate_instruments())
     try:
         instruments = enumerator(spotread)
