@@ -3627,3 +3627,45 @@ def test_severe_verify_failure_uses_gate_basis_core_not_overall():
     digest_legacy = dict(digest, gate={"basis": "overall (legacy fallback: empty core bucket)"})
     outcome = StageOutcome("verify", "done", digest=digest_legacy, data={"within_quality": False})
     assert Calibration._severe_verify_failure(calib, outcome) is True
+
+
+def test_severe_verify_failure_catches_reachable_limits_wreck():
+    """Adversarial finding (2026-08-14): `limits` is REACHABLE wide-gamut territory — a
+    catastrophic wreck confined there (clean core, poisoned wide-gamut cube nodes) must
+    still read severe. Only `clamped` (expected clip markers) stays out of the check."""
+    calib = object.__new__(Calibration)
+    digest = {"metric": "dE_ITP", "avg_de2000": 40.0, "p95_de2000": 90.0, "max_de2000": 200.0,
+              "white_de2000": 2.0,
+              "gate": {"basis": "practical core+tube+white (D3)"},
+              "practical": {"core": {"avg": 1.0, "p95": 2.0, "max": 4.0, "n": 80},
+                            "limits": {"avg": 80.0, "p95": 150.0, "max": 200.0, "n": 100},
+                            "clamped": {"avg": 60.0, "p95": 90.0, "max": 95.0, "n": 50}}}
+    outcome = StageOutcome("verify", "done", digest=digest, data={"within_quality": True})
+    # within_quality True short-circuits severe — the wreck scenario has the gate passing
+    # (core clean), so severity is judged on the not-within variant:
+    outcome = StageOutcome("verify", "done", digest=digest, data={"within_quality": False})
+    assert Calibration._severe_verify_failure(calib, outcome) is True
+    # ...but a merely-high limits residual (the real 2026-08-14 run: 8.15/29.95/30.16)
+    # stays NON-severe — reachability-frontier difficulty is not a catastrophe.
+    digest_ok = dict(digest, practical={"core": {"avg": 1.0, "p95": 2.3, "max": 5.7, "n": 86},
+                                        "limits": {"avg": 8.15, "p95": 29.95, "max": 30.16, "n": 103},
+                                        "clamped": {"avg": 9.9, "p95": 62.8, "max": 62.9, "n": 114}})
+    outcome = StageOutcome("verify", "done", digest=digest_ok, data={"within_quality": False})
+    assert Calibration._severe_verify_failure(calib, outcome) is False
+
+
+def test_quality_gate_sdr_tube_check_is_deliberately_stricter():
+    """PINNED INTENT (2026-08-14): the tube check is NEW for SDR — a grey-ramp cast (the
+    most visible defect) must not hide behind a colour-diluted overall average. A set whose
+    overall passes but whose neutral tube exceeds the avg target now gate-fails (escalation
+    only — the seam still decides, recommendation stays apply)."""
+    # 30 neutrals at 2.0 + 70 colours at 1.0: overall avg 1.3 passes the SDR-ish targets,
+    # tube avg 2.0 exceeds avg target 1.5 → the new gate fails where the old one passed.
+    practical = {"core": {"avg": 1.3, "p95": 2.0, "max": 2.0, "n": 100},
+                 "tube": {"avg": 2.0, "p95": 2.0, "max": 2.0, "n": 30}}
+    within, basis = Calibration._quality_gate(
+        _summary(avg=1.3, p95=2.0, mx=2.0, white=1.0),
+        practical, _q(avg=1.5, p95=3.0, mx=5.0, white=2.0))
+    assert within is False
+    assert basis["checks"]["tube_avg"] is False
+    assert all(v for k, v in basis["checks"].items() if k != "tube_avg")

@@ -293,6 +293,12 @@ def list_prior_runs(runs_dir: Any, display: Optional[str] = None, *, limit: int 
             dg = verify.get("digest", {})
             rec["verify"] = {k: dg.get(k) for k in
                              ("avg_de2000", "max_de2000", "within_quality") if k in dg}
+            # Gate basis disambiguates cross-era comparisons (2026-08-14): a pre-D3 run's
+            # within_quality judged the OOG-inflated overall; a post-D3 run judges practical
+            # core+tube+white — without the basis, identical panels read as a quality change.
+            basis = (dg.get("gate") or {}).get("basis")
+            if basis:
+                rec["verify"]["gate_basis"] = basis
         out.append(rec)
         if len(out) >= limit:
             break

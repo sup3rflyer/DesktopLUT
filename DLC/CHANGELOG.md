@@ -27,6 +27,13 @@ request, adjudicates ambiguous results on digests, and writes the report.
   per-check verdicts, and the severe-failure heuristic judges the same basis (a huge
   OOG residual over a clean core no longer reads as a catastrophic install). Legacy
   overall gate is the fallback for a degenerate set with no core patches.
+  **Hardened same day after adversarial review:** the severe-failure check spans ALL
+  reachable buckets (core + limits — a wreck confined to reachable wide-gamut territory
+  reads severe again; only expected clip markers stay out), the stage-CLI advisory
+  verdict judges the same practical basis as the live gate, prior-run evidence carries
+  the gate basis for cross-era comparability, and the (deliberate) new SDR tube check
+  is documented + pinned by test: a grey-ramp cast can no longer hide behind a
+  colour-diluted overall average.
 - **Scripted calibration orchestrator** (`dlc/calibrate.py`, `dlc-calibrate`) — the
   state machine that runs a whole calibration as a **named flow** (`full` /
   `3dlut-only` / `gray-wb`; HDR is the later goal), wiring the controller, the

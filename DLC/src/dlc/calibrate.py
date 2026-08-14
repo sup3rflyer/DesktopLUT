@@ -4075,9 +4075,13 @@ class Calibration:
             # never the OOG-inflated overall. On the first full HDR run the overall avg (6.77)
             # could NEVER pass the 3.0 target because 217/303 verify patches were limits/
             # clamped Rec.2020 targets, while the core sat at 1.01 — the gate said "fail" about
-            # reachability, not calibration. SDR is unchanged by construction (every unclamped
-            # SDR target is core). Fallback to the legacy overall gate if core is empty (a
-            # degenerate set — e.g. a truncated verify — must not vacuously pass).
+            # reachability, not calibration. SDR: core == overall (every unclamped SDR target is
+            # core) but the TUBE check is deliberately NEW for SDR too — a grey-ramp cast is the
+            # most visible defect and must not hide behind a colour-diluted average (adversarial
+            # review 2026-08-14; escalation-only: recommendation stays apply). `limits` (reachable
+            # wide-gamut) is quality-ungated but catastrophe-checked in _severe_verify_failure.
+            # Fallback to the legacy overall gate if core is empty (a degenerate set — e.g. a
+            # truncated verify — must not vacuously pass).
             within, gate_basis = self._quality_gate(summary, practical, q)
             worst = sorted(metrics, key=lambda m: m.de2000, reverse=True)[:5]
             # Persist the scored evidence (reports/verification_iter00_{metrics,patch_metrics}.json —
@@ -4127,8 +4131,9 @@ class Calibration:
         # longer leads with an OOG-inflated headline the digest then has to walk back.
         scored = (d.get("gate") or {}).get("scored") or {}
         if scored:
+            tube_txt = scored.get('tube_avg') if scored.get('tube_avg') is not None else "— (none measured)"
             reads = (f"core avg {scored.get('core_avg')} (p95 {scored.get('core_p95')}, "
-                     f"max {scored.get('core_max')}), tube {scored.get('tube_avg')}, "
+                     f"max {scored.get('core_max')}), tube {tube_txt}, "
                      f"white {scored.get('white')} {d.get('metric', 'ΔE')} "
                      f"(overall avg {d.get('avg_de2000')} incl. gamut-limit/OOG framework)")
         else:
@@ -4211,15 +4216,24 @@ class Calibration:
             return False
         d = outcome.digest or {}
         # Judge severity on the SAME basis the gate scored (D3): when the practical gate
-        # ran, a huge OOG/limits residual must not read as "catastrophic install" while
-        # the core is fine — core stats carry the severity check; white stays the summary
-        # white either way.
-        core = {}
+        # ran, an OOG/CLAMPED residual must not read as "catastrophic install" while the
+        # core is fine — but `limits` is REACHABLE territory (wide-gamut/bright targets
+        # inside the measured native gamut), i.e. honest calibration signal, so the
+        # catastrophe check spans core AND limits (adversarial finding, 2026-08-14: a
+        # poisoned cube whose wreck lives entirely outside Rec.709-core must not pass as
+        # non-severe). Only `clamped` — expected clip markers — stays out. White stays
+        # the summary white either way.
+        reach: dict = {}
         if str((d.get("gate") or {}).get("basis", "")).startswith("practical"):
-            core = (d.get("practical") or {}).get("core") or {}
-        avg = _as_float_local(core.get("avg") if core.get("n") else d.get("avg_de2000")) or 0.0
-        p95 = _as_float_local(core.get("p95") if core.get("n") else d.get("p95_de2000")) or 0.0
-        max_de = _as_float_local(core.get("max") if core.get("n") else d.get("max_de2000")) or 0.0
+            practical = d.get("practical") or {}
+            buckets = [b for b in (practical.get("core"), practical.get("limits"))
+                       if b and b.get("n")]
+            if buckets:
+                reach = {k: max(_as_float_local(b.get(k)) or 0.0 for b in buckets)
+                         for k in ("avg", "p95", "max")}
+        avg = reach.get("avg", _as_float_local(d.get("avg_de2000")) or 0.0)
+        p95 = reach.get("p95", _as_float_local(d.get("p95_de2000")) or 0.0)
+        max_de = reach.get("max", _as_float_local(d.get("max_de2000")) or 0.0)
         white = _as_float_local(d.get("white_de2000")) or 0.0
         if d.get("metric") == "dE_ITP":
             return avg >= 30.0 or p95 >= 60.0 or max_de >= 100.0 or white >= 100.0

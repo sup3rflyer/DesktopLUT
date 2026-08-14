@@ -364,6 +364,47 @@ def policy_advice(
     white = metrics.get("white_de2000")
 
     reasons: list[str] = []
+    # Same basis as the live verify gate (D3, 2026-08-14 — adversarial-review alignment):
+    # when the practical split is present with a non-empty core, advise on core avg/p95/max
+    # + tube avg + white, so the CLI's advisory verdict can never contradict the run gate
+    # by re-inflating the verdict with OOG/limits framework patches.
+    practical = metrics.get("practical") or {}
+    core = practical.get("core") or {}
+    tube = practical.get("tube") or {}
+    if core.get("n"):
+        checks = {
+            "core_avg_de2000": (core.get("avg"), th.avg_de2000),
+            "core_p95_de2000": (core.get("p95"), th.p95_de2000),
+            "core_max_de2000": (core.get("max"), th.max_de2000),
+            "tube_avg_de2000": (tube.get("avg") if tube.get("n") else None, th.avg_de2000),
+            "white_de2000": (white, th.white_de2000),
+        }
+        reasons.append("basis: practical core+tube+white (OOG/limits are framework, not verdict)")
+        missing = [name for name, (value, _) in checks.items() if value is None]
+        if missing:
+            return {
+                "default_policy_verdict": "continue",
+                "reasons": reasons + [f"missing metrics: {', '.join(missing)}"],
+                "thresholds": asdict(th),
+            }
+        over = [f"{name}={value:.3f}>{limit:.3f}"
+                for name, (value, limit) in checks.items() if value > limit]
+        if not over:
+            verdict = "stop"
+            reasons.append("core/tube/white dE within default thresholds")
+        elif (previous_avg is not None and avg is not None
+              and (previous_avg - avg) < th.min_improvement):
+            # Diminishing-returns stop mirrors the legacy path (improvement tracked on the
+            # overall avg — the quantity score_history records across iterations).
+            verdict = "stop"
+            reasons.append(
+                f"improvement {previous_avg - avg:.3f} dE below minimum {th.min_improvement:.3f}; diminishing returns"
+            )
+            reasons.append("metrics still above thresholds: " + ", ".join(over))
+        else:
+            verdict = "continue"
+            reasons.append("metrics above default thresholds: " + ", ".join(over))
+        return {"default_policy_verdict": verdict, "reasons": reasons, "thresholds": asdict(th)}
     checks = {
         "avg_de2000": (avg, th.avg_de2000),
         "p95_de2000": (p95, th.p95_de2000),
