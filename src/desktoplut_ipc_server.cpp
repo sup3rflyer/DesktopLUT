@@ -492,6 +492,17 @@ void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
     std::vector<float> r = ReadFloatArray(dev ? dev->find("r") : nullptr);
     std::vector<float> g = ReadFloatArray(dev ? dev->find("g") : nullptr);
     std::vector<float> b = ReadFloatArray(dev ? dev->find("b") : nullptr);
+    // Decomposed editor sliders (optional): luminance[] is the common (main) slider
+    // per point, rgb{r,g,b} the per-channel balance strips; deviations stays the
+    // composed back-compat form (luminance*rgb). When present, the decomposition is
+    // authoritative: luminance scales the points curve — exactly what the editor's
+    // main slider edits — and rgb lands on rgbDeviations, so opening the editor shows
+    // the solver's split instead of a zero main slider with common-mode R/G/B.
+    std::vector<float> lum = ReadFloatArray(p.find("luminance"));
+    const JsonValue* rgb = p.find("rgb");
+    std::vector<float> balR = ReadFloatArray(rgb ? rgb->find("r") : nullptr);
+    std::vector<float> balG = ReadFloatArray(rgb ? rgb->find("g") : nullptr);
+    std::vector<float> balB = ReadFloatArray(rgb ? rgb->find("b") : nullptr);
     if (pc <= 0) pc = (int)pts.size();
     if (pc <= 0) pc = (int)gs.points.size();
     if (pc <= 0) pc = 20;
@@ -501,12 +512,28 @@ void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
     }
     auto fix = [pc](std::vector<float>& v) { if ((int)v.size() != pc) v.assign(pc, 1.0f); };
     fix(r); fix(g); fix(b);
+    bool haveLum = (int)lum.size() == pc;
+    bool haveRgb = (int)balR.size() == pc && (int)balG.size() == pc && (int)balB.size() == pc;
+    if (haveLum && !haveRgb) {
+        // Luminance without balance: recover the balance from the composed deviations
+        // (deviations = luminance*rgb) so the split still lands on the right controls.
+        balR.assign(pc, 1.0f); balG.assign(pc, 1.0f); balB.assign(pc, 1.0f);
+        for (int k = 0; k < pc; ++k) {
+            float l = lum[k];
+            if (fabsf(l) > 1e-6f) { balR[k] = r[k] / l; balG[k] = g[k] / l; balB[k] = b[k] / l; }
+        }
+        haveRgb = true;
+    }
     int dstPc = std::clamp(pc, 2, kMaxMhcGrayscalePoints);
     gs.pointCount = dstPc;
     gs.points = ResampleUniform(pts, dstPc, 0.0f);
-    gs.rgbDeviations[0] = ResampleUniform(r, dstPc, 1.0f);
-    gs.rgbDeviations[1] = ResampleUniform(g, dstPc, 1.0f);
-    gs.rgbDeviations[2] = ResampleUniform(b, dstPc, 1.0f);
+    if (haveLum) {
+        std::vector<float> lumR = ResampleUniform(lum, dstPc, 1.0f);
+        for (int k = 0; k < dstPc; ++k) gs.points[k] *= lumR[k];
+    }
+    gs.rgbDeviations[0] = ResampleUniform(haveRgb ? balR : r, dstPc, 1.0f);
+    gs.rgbDeviations[1] = ResampleUniform(haveRgb ? balG : g, dstPc, 1.0f);
+    gs.rgbDeviations[2] = ResampleUniform(haveRgb ? balB : b, dstPc, 1.0f);
     gs.enabled = true;
 }
 

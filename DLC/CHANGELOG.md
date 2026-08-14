@@ -11,6 +11,25 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Grayscale touch-up hardening** (four defects from the 2026-08-14 HDR grayscale-wb
+  run, fixed offline against mock/contract tests):
+  - The editor sliders now arrive DECOMPOSED over the pipe: the luminance correction
+    lands on the editor's main slider and the R/G/B values carry only the colour
+    balance, instead of a zero main slider with the common mode pushed into all three
+    channels. (Wire: `mhc.grayscale_set_live` carries `luminance[]` + `rgb{r,g,b}[]`
+    alongside the composed `deviations` for older builds; C++ maps them onto the
+    points curve / balance values; contract + mock pinned.)
+  - The top grey point no longer chases a target brighter than the panel can produce
+    at full drive: the first-round measurement caps the target, the point is held at
+    its achievable luminance (chroma still tuned), and the shortfall is surfaced as a
+    warning in the digest instead of burning the round budget ramping the slider.
+  - The drift reference now reads through the IDENTITY editor table (suspend →
+    read → restore), so the touch-up's own live edits can no longer masquerade as a
+    panel-drift excursion and falsely compromise the measurement session.
+  - Bright points get per-round read averaging (3-read floor at high luminance) and a
+    noise-floor stop: when a nudge moves the reading by no more than the measured
+    repeatability, the point stops instead of chasing local-dimming zone noise for
+    the full round budget.
 - **Dashboard truth wave** (owner directives after the first full HDR run, 2026-08-14):
   previous-stage chart series now draw as their own semi-transparent underlay beneath the
   current stage's line (no more mixed-stack sawtooth); the thermal-drift chart takes only

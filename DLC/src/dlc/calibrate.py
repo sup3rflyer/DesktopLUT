@@ -66,6 +66,7 @@ import os
 import re
 import shutil
 from argparse import Namespace
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -3676,7 +3677,45 @@ class Calibration:
             has_3dlut = bool(self._active_runtime_cube())
             dip = self._dip()
             loop_cfg = self.loop_config or self._loop_config_for(dip)
+            # Bright-point read averaging (2026-08-14 HDR run): high-luminance points on a
+            # local-dimming panel oscillate read-to-read far beyond the DIP's luminance-σ
+            # model (zone behaviour, not shot noise), and a single read per round had the
+            # tuner chasing that noise for its whole round budget. Raise the per-round read
+            # FLOOR to 3 on the bright portion of the ramp (gated by expected nits so the
+            # slow dim reads stay single); the DIP still escalates above the floor.
+            peak_nits = transfer.cv_to_nits(cap)
+            bright_floor_nits = 0.25 * peak_nits
+            if loop_cfg.neutral_floor_min_nits > 0:
+                bright_floor_nits = min(loop_cfg.neutral_floor_min_nits, bright_floor_nits)
+            loop_cfg = replace(
+                loop_cfg,
+                neutral_min_reads=max(loop_cfg.neutral_min_reads, 3),
+                neutral_floor_min_nits=bright_floor_nits,
+            )
             self.liveness.set_stall_after(self._liveness_threshold(dip))
+
+            # Drift-ref self-perturbation guard (2026-08-14 HDR run): the drift/neutral
+            # reference patch renders THROUGH the live editor table being tuned, so nudging
+            # the point the reference sits on (the mid-ramp grey) moved the reference read
+            # and tripped a false 'excursion' drift episode → measurement_compromised.
+            # Present every reference-establishing/-comparing read through the IDENTITY
+            # table — the state the warm reference was established in — then restore the
+            # current live table. Edits therefore never masquerade as panel drift.
+            ident = identity_payload(points)
+
+            @contextmanager
+            def reference_identity_guard():
+                self.controller.grayscale_set_live(
+                    self.monitor, self.mode, ident["point_count"], ident["points"],
+                    ident["deviations"], luminance=ident["luminance"], rgb=ident["rgb"])
+                try:
+                    yield
+                finally:
+                    self.controller.grayscale_set_live(
+                        self.monitor, self.mode, payload["point_count"], payload["points"],
+                        payload["deviations"], luminance=payload["luminance"],
+                        rgb=payload["rgb"])
+
             session = IncrementalMeasureSession(
                 patches=patches,
                 transfer=transfer,
@@ -3687,6 +3726,7 @@ class Calibration:
                 liveness=self.liveness,
                 dip=dip,
                 checkin_interval_s=self._checkin_interval_s,
+                reference_guard=reference_identity_guard,
             )
             session_start = session.start()
             if session_start.get("panel_dark"):
@@ -3700,6 +3740,8 @@ class Calibration:
             before_errors: list[dict[str, Any]] = []
             after_errors: list[dict[str, Any]] = []
             all_updates: list[dict[str, Any]] = []
+            unreachable_targets: list[dict[str, Any]] = []
+            noise_floor_stops = 0
             any_capped = False
             any_large = False
             any_large_y = False
@@ -3707,6 +3749,7 @@ class Calibration:
 
             for idx, patch in enumerate(patches):
                 target_y = transfer.cv_to_nits(patch[0])
+                at_full_drive = int(patch[0]) >= int(cap)
                 point_log: dict[str, Any] = {
                     "index": idx,
                     "point": round(points[idx], 6),
@@ -3715,6 +3758,7 @@ class Calibration:
                     "rounds": [],
                 }
                 latest_error: dict[str, Any] | None = None
+                prev_xyz: tuple[float, float, float] | None = None
                 for rnd in range(1, max_rounds_per_point + 1):
                     try:
                         accepted = session.measure_index(idx)
@@ -3727,19 +3771,71 @@ class Calibration:
                                                     "note": accepted.note})
                         any_unsettled = True
                         break
+                    y_tol = max(0.15, target_y * 0.01)
+                    if rnd == 1 and at_full_drive and accepted.xyz[1] + y_tol < target_y:
+                        # Unreachable top-point target (2026-08-14 HDR run, the D2
+                        # ungrounded-peak issue in a second flow): the resolved target asks
+                        # for more light than the panel is delivering AT FULL DRIVE — a
+                        # positive luminance correction cannot exceed 100% drive, so chasing
+                        # it just ramps the slider to its cap against physics (the warm
+                        # panel's sustained ceiling sits under the resolved cold ceiling).
+                        # Hold luminance at what the panel actually achieves — first-round
+                        # measured IS the achievable ceiling here — and keep tuning chroma
+                        # against that achievable target instead of burning the round budget.
+                        capped_y = float(accepted.xyz[1])
+                        info = {
+                            "index": idx,
+                            "code": int(patch[0]),
+                            "requested_target_Y": round(target_y, 5),
+                            "achievable_Y": round(capped_y, 5),
+                            "shortfall_pct": round(100.0 * (1.0 - capped_y / target_y), 3),
+                        }
+                        unreachable_targets.append(info)
+                        point_log["unreachable_target"] = info
+                        target_y = capped_y
+                        y_tol = max(0.15, target_y * 0.01)
+                        self.runlog.anomaly(
+                            "grayscale-wb", kind="unreachable_target", **info,
+                            message=("top grey point target exceeds the panel's achievable "
+                                     "luminance at full drive — luminance correction held at "
+                                     "measured; tuning chroma against the achievable target"))
                     gpatch = GrayTouchupPatch(level=points[idx], measured_xyz=tuple(accepted.xyz),
                                               target_y=target_y)
                     latest_error = point_error(gpatch, cfg)
                     if rnd == 1:
                         before_errors.append(latest_error)
                     point_log["rounds"].append({"round": rnd, **latest_error})
-                    y_tol = max(0.15, target_y * 0.01)
                     if (latest_error["de2000"] <= target_de
                             and abs(latest_error["delta_Y"]) <= y_tol):
                         break
                     if rnd >= max_rounds_per_point:
                         any_unsettled = True
                         break
+                    # Noise-floor stop (2026-08-14 HDR run): when the previous nudge moved
+                    # the measurement by no more than this round's measured repeatability,
+                    # further rounds are chasing read noise (bright local-dimming points
+                    # oscillated ±dE at the zone level), not correcting — stop and record
+                    # why instead of burning the round budget.
+                    if prev_xyz is not None:
+                        repeat_floor = accepted.se_de
+                        if repeat_floor is None and dip is not None:
+                            sigma = dip.expected_sigma_de(accepted.xyz[1])
+                            if sigma:
+                                repeat_floor = sigma / max(1, accepted.noise_reads) ** 0.5
+                        if repeat_floor:
+                            ref = white_xyz(max(target_y, accepted.xyz[1], prev_xyz[1], 1e-6),
+                                            cfg.white_xy[0], cfg.white_xy[1])
+                            round_delta = delta_e2000(xyz_to_lab(tuple(accepted.xyz), ref),
+                                                      xyz_to_lab(prev_xyz, ref))
+                            if round_delta <= 2.0 * repeat_floor:
+                                point_log["noise_floor_stop"] = {
+                                    "round": rnd,
+                                    "round_delta_de": round(round_delta, 5),
+                                    "repeatability_de": round(float(repeat_floor), 5),
+                                }
+                                noise_floor_stops += 1
+                                break
+                    prev_xyz = tuple(accepted.xyz)
                     payload, upd = update_point(payload, idx, gpatch, cfg)
                     point_log["rounds"][-1]["update"] = upd
                     all_updates.append(upd)
@@ -3748,11 +3844,15 @@ class Calibration:
                         # possible at this luminance), so re-measuring can't improve it — break
                         # instead of burning the whole round budget on an unchanged table.
                         break
-                    # Live-set the editor table (composed per-channel deviations) — the preview
-                    # shader applies it next frame, so the very next read reflects this nudge.
+                    # Live-set the editor table — the preview shader applies it next frame, so
+                    # the very next read reflects this nudge. The DECOMPOSED sliders ride the
+                    # wire (luminance = the editor's main slider, rgb = the balance strips)
+                    # alongside the composed deviations (back-compat), so the editor shows the
+                    # solver's split instead of common-mode R/G/B under a zero main slider.
                     self.controller.grayscale_set_live(
                         self.monitor, self.mode, payload["point_count"], payload["points"],
-                        payload["deviations"])
+                        payload["deviations"], luminance=payload["luminance"],
+                        rgb=payload["rgb"])
                     any_capped = any_capped or bool(upd.get("capped"))
                     any_large = any_large or bool(upd.get("large_correction"))
                     any_large_y = any_large_y or bool(upd.get("large_luminance_correction"))
@@ -3776,10 +3876,11 @@ class Calibration:
 
             # Ensure the final table is live in the preview even if every point was already within
             # target — it is baked into the ICM by the grayscale_commit at the end of this stage
-            # (Design B), so measure:verify then scores the real result.
+            # (Design B), so measure:verify then scores the real result. Decomposed sliders ride
+            # along so the committed editor state shows the luminance/balance split.
             self.controller.grayscale_set_live(
                 self.monitor, self.mode, payload["point_count"], payload["points"],
-                payload["deviations"])
+                payload["deviations"], luminance=payload["luminance"], rgb=payload["rgb"])
             self.calib["grayscale_wb_touchup"] = payload
             self._state["grayscale_wb_touchup"] = payload
             self._save()
@@ -3802,6 +3903,8 @@ class Calibration:
                 "large_luminance_correction": any_large_y,
                 "capped": any_capped,
                 "unsettled": any_unsettled,
+                "unreachable_targets": unreachable_targets,
+                "noise_floor_stops": noise_floor_stops,
                 "session": session_digest,
                 "measurement_compromised": bool(session_digest.get("needs_adjudication")),
                 "compromised": bool(any_capped or (has_3dlut and any_large_y)

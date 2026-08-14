@@ -847,6 +847,158 @@ def test_grayscale_wb_hdr_points_are_capped_to_user_peak():
     assert peak_cv < transfer.max_cv
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-14 HDR grayscale-wb run defects: decomposed sliders on the wire (1),
+# unreachable top-point target held not ramped (2), drift ref shielded from the
+# live edit (3), bright-point noise-floor stop (4). Offline mock E2E coverage.
+# ---------------------------------------------------------------------------
+
+def _interp_editor_col(x: float, xs: list, ys: list) -> float:
+    if not xs:
+        return 1.0
+    if x <= xs[0]:
+        return float(ys[0])
+    if x >= xs[-1]:
+        return float(ys[-1])
+    for k in range(1, len(xs)):
+        if xs[k] >= x:
+            x0, x1, y0, y1 = xs[k - 1], xs[k], ys[k - 1], ys[k]
+            return float(y0) if x1 <= x0 else float(y0 + (y1 - y0) * (x - x0) / (x1 - x0))
+    return float(ys[-1])
+
+
+def _editor_responsive_panel(ctrl, transfer, *, white_nits: float, tint=(1.0, 1.0, 1.0)):
+    """A warm panel that renders THROUGH the mock's live correction-grayscale table —
+    the closed loop the real preview shader provides: a set_live nudge changes the very
+    next read (measurement AND drift reference), like hardware."""
+    from dataclasses import replace as _replace
+
+    from dlc.measure_loop import SyntheticPanel
+
+    panel = SyntheticPanel(transfer=transfer, start_temp=1.0, cold_blue_gain=1.0,
+                           white_nits=white_nits)
+
+    def measure(patch):
+        st = (ctrl.state().get("mhc") or {}).get("0:SDR") or {}
+        cg = st.get("correction_grayscale") or {}
+        pts = cg.get("points") or []
+        dev = cg.get("deviations") or {}
+        level = max(patch.signal)
+        gains = [1.0, 1.0, 1.0]
+        if st.get("gs_preview_active") and pts:
+            gains = [_interp_editor_col(level, pts, dev.get(ch) or []) for ch in "rgb"]
+        sig = tuple(min(1.0, max(0.0, s * g * t)) for s, g, t in zip(patch.signal, gains, tint))
+        return panel(_replace(patch, signal=sig))
+
+    return measure
+
+
+def test_grayscale_wb_decomposed_sliders_and_unreachable_top_target(tmp_path: Path):
+    """Mock E2E: a uniformly dim (-8%), slightly green panel. The common-mode deficit
+    must land on the LUMINANCE slider (not pushed into all three RGB values), the rgb
+    balance must carry only the differential; the top point — already at full drive —
+    must be HELD at its achievable luminance instead of ramping the slider against
+    physics; and the touch-up's own edits must not read as panel drift."""
+    ctrl = CalibrationController.mock()
+    ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
+                                  "bx": 0.15, "by": 0.06})
+    ctrl.apply_mhc(0, "SDR")
+    calib = _make(tmp_path, "gswb_decomp", controller=ctrl)
+    calib.target_name = "srgb_g22"
+    measure = _editor_responsive_panel(ctrl, calib._transfer(), white_nits=110.0,
+                                       tint=(1.0, 1.02, 1.0))
+    calib.measure = measure
+
+    outcome = calib.stage_grayscale_wb_touchup()
+
+    assert outcome.status == "done"
+    digest = outcome.digest
+    payload = calib.calib["grayscale_wb_touchup"]
+
+    # Defect 2: the top point's resolved target (120 nits) exceeds what the panel
+    # delivers at full drive (~110) — held at achievable, luminance NOT ramped.
+    assert digest["unreachable_targets"], "top-point unreachable target went undetected"
+    top = digest["unreachable_targets"][0]
+    assert top["index"] == payload["point_count"] - 1
+    assert top["achievable_Y"] < top["requested_target_Y"]
+    assert payload["luminance"][-1] == pytest.approx(1.0, abs=0.02)   # held, not +cap
+    top_log = digest["per_point"][-1]
+    assert top_log["unreachable_target"]["requested_target_Y"] == top["requested_target_Y"]
+    assert len(top_log["rounds"]) < digest["max_rounds_per_point"]    # budget not burned
+
+    # Defect 1: the common-mode deficit rides the luminance slider; rgb carries only
+    # the (green) differential — near-unit geometric mean per point.
+    corrected = [i for i, v in enumerate(payload["luminance"]) if abs(v - 1.0) > 0.01]
+    assert corrected, "no luminance correction landed on the luminance slider"
+    assert any(payload["luminance"][i] > 1.01 for i in corrected)     # dim panel → raise
+    for i in corrected:
+        gmean = (payload["rgb"]["r"][i] * payload["rgb"]["g"][i] * payload["rgb"]["b"][i]) ** (1 / 3)
+        assert gmean == pytest.approx(1.0, abs=0.02)                  # zero-mean balance
+    # The wire/mock carries the decomposition (SDR-bridged: resampled onto the exact
+    # t² slot grid, so equal to the payload within resampling tolerance) and maps
+    # luminance onto the editor points curve — the main slider — exactly.
+    cg = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert cg["luminance"] == pytest.approx(payload["luminance"], abs=5e-3)
+    for ch in ("r", "g", "b"):
+        assert cg["rgb"][ch] == pytest.approx(payload["rgb"][ch], abs=5e-3)
+    assert cg["editor_points"] == pytest.approx(
+        [p * l for p, l in zip(cg["points"], cg["luminance"])])
+
+    # Defect 3: the touch-up's own edits never masqueraded as panel drift — the
+    # reference reads ran through the identity table (the guard), so this closed-loop
+    # editing session stays clean.
+    assert digest["session"]["drift_episodes"] == 0
+    assert digest["measurement_compromised"] is False
+
+
+def test_grayscale_wb_noise_floor_stops_chasing_bright_point_noise(tmp_path: Path):
+    """Mock E2E for defect 4: bright points oscillate chroma read-to-read (local-dimming
+    zone behaviour) around a residual the correction cannot beat. The per-round read
+    floor (3 at high luminance) measures that repeatability, and the tuner stops when a
+    nudge moves the reading by no more than it — instead of burning the round budget."""
+    from dataclasses import replace as _replace
+
+    from dlc.measure_loop import SyntheticPanel
+
+    ctrl = CalibrationController.mock()
+    ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
+                                  "bx": 0.15, "by": 0.06})
+    ctrl.apply_mhc(0, "SDR")
+    calib = _make(tmp_path, "gswb_noise", controller=ctrl)
+    calib.target_name = "srgb_g22"
+    transfer = calib._transfer()
+    panel = SyntheticPanel(transfer=transfer, start_temp=1.0, cold_blue_gain=1.0)
+    state = {"toggle": 0}
+
+    def measure(patch):
+        reading = panel(patch)
+        if reading.xyz is None or reading.xyz[1] < 60.0:
+            return reading                      # dim/mid points: perfect and quiet
+        x, y, z = reading.xyz
+        x *= 1.05                               # persistent chroma residual (dE >> target)
+        state["toggle"] ^= 1
+        x *= 1.003 if state["toggle"] else 0.997    # read-to-read zone oscillation
+        return _replace(reading, xyz=(x, y, z),
+                        yxy=(y, x / (x + y + z), y / (x + y + z)))
+
+    calib.measure = measure
+    outcome = calib.stage_grayscale_wb_touchup()
+
+    assert outcome.status == "done"
+    digest = outcome.digest
+    assert digest["noise_floor_stops"] >= 1
+    noisy_logs = [p for p in digest["per_point"] if "noise_floor_stop" in p]
+    assert noisy_logs, "no point recorded a noise-floor stop"
+    for plog in noisy_logs:
+        # stopped as soon as the nudge effect fell within measured repeatability —
+        # the round budget was NOT burned chasing zone noise.
+        assert len(plog["rounds"]) < digest["max_rounds_per_point"]
+        stop = plog["noise_floor_stop"]
+        assert stop["round_delta_de"] <= 2.0 * stop["repeatability_de"]
+    # the quiet dim/mid points converged normally (no stop recorded there)
+    assert any("noise_floor_stop" not in p and p["rounds"] for p in digest["per_point"])
+
+
 def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
     # Loop-bookkeeping regression test (adversarial review): a refine step installs a NON-identity
     # base cube, but the next round does not improve — a within-tolerance uptick that takes the

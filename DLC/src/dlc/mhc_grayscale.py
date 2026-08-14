@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Mapping, Sequence
 
-__all__ = ["to_desktoplut_sdr_grayscale"]
+__all__ = ["to_desktoplut_sdr_grayscale", "to_desktoplut_sdr_grayscale_decomposed"]
 
 _CHANNELS = ("r", "g", "b")
 
@@ -106,3 +106,42 @@ def to_desktoplut_sdr_grayscale(
         for ch in _CHANNELS:
             out_dev[ch].append(_interp(y_signal, sig, dev_in[ch]))
     return out_points, out_dev
+
+
+def to_desktoplut_sdr_grayscale_decomposed(
+    points: Sequence[float],
+    luminance: Sequence[float],
+    rgb: Mapping[str, Sequence[float]],
+) -> tuple[list[float], list[float], dict[str, list[float]]]:
+    """Decomposed-slider variant of :func:`to_desktoplut_sdr_grayscale`: resample the
+    common ``luminance`` curve (the editor's main slider) and the per-channel ``rgb``
+    balance curves onto DesktopLUT's SDR slots the same way the composed deviations
+    are resampled — each curve interpolated independently at the slot signal ``t²``.
+    Returns ``(points, luminance, rgb)``; the caller re-composes the back-compat
+    ``deviations`` from the resampled pair so the wire invariant
+    ``deviations == luminance*rgb`` holds exactly per slot.
+    """
+    n = len(points)
+    sig = [float(p) for p in points]
+    lum_in = [float(v) for v in luminance] if len(luminance) == n else [1.0] * n
+    rgb_in: dict[str, list[float]] = {}
+    for ch in _CHANNELS:
+        vals = list(rgb.get(ch, []) or [])
+        rgb_in[ch] = [float(v) for v in vals] if len(vals) == n else [1.0] * n
+
+    if n == 0:
+        return [], [], {ch: [] for ch in _CHANNELS}
+    if n == 1:
+        return [sig[0]], [lum_in[0]], {ch: [rgb_in[ch][0]] for ch in _CHANNELS}
+
+    out_points: list[float] = []
+    out_lum: list[float] = []
+    out_rgb: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
+    for i in range(n):
+        t = i / (n - 1)
+        y_signal = t * t
+        out_points.append(y_signal)
+        out_lum.append(_interp(y_signal, sig, lum_in))
+        for ch in _CHANNELS:
+            out_rgb[ch].append(_interp(y_signal, sig, rgb_in[ch]))
+    return out_points, out_lum, out_rgb

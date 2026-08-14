@@ -44,10 +44,11 @@ from __future__ import annotations
 import json
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, Sequence
+from typing import Any, Callable, ContextManager, Optional, Protocol, Sequence
 
 from .dip import DisplayInstrumentProfile
 from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, normalized_channels
@@ -509,11 +510,20 @@ class _Loop:
         liveness: Optional[Liveness] = None,
         dip: Optional[DisplayInstrumentProfile] = None,
         checkin_interval_s: float = 0.0,
+        reference_guard: Optional[Callable[[], ContextManager[None]]] = None,
     ) -> None:
         self.transfer = transfer
         self.cfg = config
         self.ndjson = ndjson
         self.events = events
+        # Optional caller-supplied context manager held around every read that ESTABLISHES
+        # or COMPARES AGAINST the warm/drift reference (warm-up settle, re-settle after a
+        # drift episode, the interleaved neutral checkpoint). A caller that mutates the
+        # display between reads (the grayscale touch-up live-editing the correction table)
+        # uses it to present those reads through a FIXED display state (identity table), so
+        # its own edits can never masquerade as panel drift (2026-08-14 HDR run: nudging
+        # the mid-ramp grey moved the drift reference and tripped a false excursion).
+        self.reference_guard = reference_guard
         # The shared run spine (preferred over `events`): mirrors a compact patch_read +
         # progress onto events.jsonl so the dashboard sees the firehose live, phase-stamped.
         self.runlog = runlog
@@ -580,6 +590,11 @@ class _Loop:
         self._integrity_recent: list[tuple[float, tuple[float, float, float]]] = []
         self._integrity_dark_streak = 0
         self._integrity_flagged: set[str] = set()      # each signature surfaced at most once
+
+    def _reference_read_guard(self) -> ContextManager[None]:
+        """The caller-supplied fixed-display-state guard for reference reads (identity
+        editor table during the grayscale touch-up), or a no-op when none was given."""
+        return self.reference_guard() if self.reference_guard is not None else nullcontext()
 
     # -- low-level read ----------------------------------------------------
 
@@ -1048,64 +1063,69 @@ class _Loop:
         last_good: Optional[tuple[float, float, float]] = None
         reads = 0
 
-        for attempt in range(1, cfg.max_warmup_reads + 1):
-            patch = self._warmup_patch()
-            consecutive_for_record = consecutive
-            reading = self._read(
-                patch,
-                phase=phase,
-                read_index=attempt - 1,
-                accepted=False,
-                settle={"warm": settled, "consecutive": consecutive_for_record},
-            )
-            reads += 1
-            if reading.xyz is None:
-                prev = None
-                consecutive = 0
-                continue
-
-            # Dark-panel guard: a MID-grey reference reading ~no light means the panel is asleep /
-            # off / on the wrong input. Settle "agreement" on black (0≈0) is meaningless, so don't
-            # adopt it as the reference and don't let it count toward warm. After a couple of
-            # sub-floor reads, declare the panel dark, flag it loudly, and stop — the caller
-            # escalates instead of falsely settling and then metering a dark panel for minutes.
-            dark_floor = self._dark_floor_for(patch)
-            if dark_floor > 0 and reading.xyz[1] < dark_floor:
-                dark_reads += 1
-                self.dark_reference_nits = float(reading.xyz[1])
-                if dark_reads >= cfg.dark_required:
-                    self.panel_dark = True
-                    self._emit_event("WARN", "panel_dark",
-                                     reference_nits=round(float(reading.xyz[1]), 4),
-                                     floor_nits=round(dark_floor, 4), reads=reads)
-                    break
-                prev = None
-                consecutive = 0
-                continue
-            dark_reads = 0
-
-            last_good = reading.xyz
-            # Auto-detect the cold channel from the first usable read, then
-            # re-bias subsequent warm-up patches toward it.
-            if self.cold_channel is None:
-                self.cold_channel = coldest_channel_from_xyz(reading.xyz)
-                self._emit_event("INFO", "cold_channel_detected", channel=self.cold_channel)
-
-            if prev is not None:
-                ev = evaluate_drift(
-                    stabilized_xyz=prev,
-                    current_xyz=reading.xyz,
-                    delta_threshold=cfg.settle_threshold,
+        # Reference reads run under the caller's fixed-display-state guard (identity
+        # editor table during the touch-up) so the reference is comparable with the
+        # later drift-checkpoint reads regardless of in-session edits.
+        with self._reference_read_guard():
+            for attempt in range(1, cfg.max_warmup_reads + 1):
+                patch = self._warmup_patch()
+                consecutive_for_record = consecutive
+                reading = self._read(
+                    patch,
+                    phase=phase,
+                    read_index=attempt - 1,
+                    accepted=False,
+                    settle={"warm": settled, "consecutive": consecutive_for_record},
                 )
-                if not ev.repeat:
-                    consecutive += 1
-                else:
+                reads += 1
+                if reading.xyz is None:
+                    prev = None
                     consecutive = 0
-                if consecutive >= cfg.settle_required:
-                    settled = True
-                    prev = reading.xyz
-                    break
-            prev = reading.xyz
+                    continue
+
+                # Dark-panel guard: a MID-grey reference reading ~no light means the panel is
+                # asleep / off / on the wrong input. Settle "agreement" on black (0≈0) is
+                # meaningless, so don't adopt it as the reference and don't let it count toward
+                # warm. After a couple of sub-floor reads, declare the panel dark, flag it
+                # loudly, and stop — the caller escalates instead of falsely settling and then
+                # metering a dark panel for minutes.
+                dark_floor = self._dark_floor_for(patch)
+                if dark_floor > 0 and reading.xyz[1] < dark_floor:
+                    dark_reads += 1
+                    self.dark_reference_nits = float(reading.xyz[1])
+                    if dark_reads >= cfg.dark_required:
+                        self.panel_dark = True
+                        self._emit_event("WARN", "panel_dark",
+                                         reference_nits=round(float(reading.xyz[1]), 4),
+                                         floor_nits=round(dark_floor, 4), reads=reads)
+                        break
+                    prev = None
+                    consecutive = 0
+                    continue
+                dark_reads = 0
+
+                last_good = reading.xyz
+                # Auto-detect the cold channel from the first usable read, then
+                # re-bias subsequent warm-up patches toward it.
+                if self.cold_channel is None:
+                    self.cold_channel = coldest_channel_from_xyz(reading.xyz)
+                    self._emit_event("INFO", "cold_channel_detected", channel=self.cold_channel)
+
+                if prev is not None:
+                    ev = evaluate_drift(
+                        stabilized_xyz=prev,
+                        current_xyz=reading.xyz,
+                        delta_threshold=cfg.settle_threshold,
+                    )
+                    if not ev.repeat:
+                        consecutive += 1
+                    else:
+                        consecutive = 0
+                    if consecutive >= cfg.settle_required:
+                        settled = True
+                        prev = reading.xyz
+                        break
+                prev = reading.xyz
 
         if last_good is not None:
             self._update_white(last_good)
@@ -1583,8 +1603,11 @@ class _Loop:
             return
         # One physical read → one enriched ndjson line carrying the drift verdict
         # (we need the XYZ before we can compute the verdict, so emit inline
-        # rather than via _read, which emits atomically on measure).
-        reading = self.measure(warmup_patch)
+        # rather than via _read, which emits atomically on measure). The read runs
+        # under the caller's fixed-display-state guard so an in-session edit of the
+        # patch it sits on cannot masquerade as panel drift.
+        with self._reference_read_guard():
+            reading = self.measure(warmup_patch)
         seq = self.seq_counter
         self.seq_counter += 1
         if reading.xyz is None:
@@ -1743,6 +1766,7 @@ class IncrementalMeasureSession:
         liveness: Optional[Liveness] = None,
         dip: Optional[DisplayInstrumentProfile] = None,
         checkin_interval_s: float = 0.0,
+        reference_guard: Optional[Callable[[], ContextManager[None]]] = None,
     ) -> None:
         self.cfg = config or MeasureLoopConfig()
         self.ndjson = _NdjsonWriter(ndjson_path)
@@ -1757,6 +1781,7 @@ class IncrementalMeasureSession:
             liveness=liveness,
             dip=dip,
             checkin_interval_s=checkin_interval_s,
+            reference_guard=reference_guard,
         )
         self.preheat_digest: Optional[dict[str, Any]] = None
         self.preheat_compromised = False
