@@ -16,6 +16,7 @@ from pathlib import Path
 from dlc.engine.patches import Transfer, to_signal
 from dlc.measure_loop import (
     AcceptedRead,
+    IncrementalMeasureSession,
     MeasureLoopConfig,
     MeasurePatch,
     Reading,
@@ -1174,3 +1175,80 @@ def test_fresh_patch_with_no_usable_read_is_still_a_sentinel_hole():
     loop = _solo_loop(_AlwaysDead(), t, MeasureLoopConfig())
     rec = loop.measure_patch(_patch("p0", (512, 512, 512), t, 0), phase="main")
     assert rec.usable is False and rec.unstable is True
+
+
+# ---------------------------------------------------------------------------
+# drift-ref self-perturbation guard (2026-08-14 HDR grayscale-wb run, defect 3)
+# ---------------------------------------------------------------------------
+
+def _live_edited_panel(transfer: Transfer, gains: dict):
+    """A perfect warm panel whose light passes through a mutable per-channel SIGNAL
+    gain table — the live grayscale-editor tweak the touch-up flow mutates between
+    reads. Every read (measurement AND drift reference) renders through it, exactly
+    like the real preview shader."""
+    from dataclasses import replace as _replace
+
+    panel = SyntheticPanel(transfer=transfer, start_temp=1.0, cold_blue_gain=1.0)
+
+    def measure(patch: MeasurePatch) -> Reading:
+        g = gains["rgb"]
+        sig = tuple(min(1.0, s * gi) for s, gi in zip(patch.signal, g))
+        return panel(_replace(patch, signal=sig))
+
+    return measure
+
+
+def _incremental_session(transfer: Transfer, measure, *, reference_guard=None):
+    return IncrementalMeasureSession(
+        patches=_grey_ramp(transfer, 9),
+        transfer=transfer,
+        measure=measure,
+        config=MeasureLoopConfig(neutral_interval=2, preheat="never"),
+        reference_guard=reference_guard,
+    )
+
+
+def test_live_edit_perturbs_drift_ref_without_guard():
+    # The failure mode on record (2026-08-14 HDR run): the drift-reference patch renders
+    # THROUGH the live editor table, so a chromatic nudge between reads moved the
+    # reference and read as an 'excursion' drift episode → measurement_compromised.
+    t = _sdr()
+    gains = {"rgb": (1.0, 1.0, 1.0)}
+    session = _incremental_session(t, _live_edited_panel(t, gains))
+    session.start()
+    session.measure_index(4)
+    gains["rgb"] = (1.07, 1.0, 1.0)     # tune the mid grey: +7% red differential
+    session.measure_index(5)            # interval-2 → neutral checkpoint fires here
+    digest = session.finish()
+    assert digest["drift_episodes"] >= 1          # the FALSE episode
+    assert digest["needs_adjudication"] is True
+
+
+def test_reference_guard_shields_drift_ref_from_live_edit():
+    # Same edit, but reference reads run under the caller's fixed-display-state guard
+    # (identity table) — the edit can no longer masquerade as panel drift.
+    from contextlib import contextmanager
+
+    t = _sdr()
+    gains = {"rgb": (1.0, 1.0, 1.0)}
+
+    @contextmanager
+    def identity_guard():
+        saved = gains["rgb"]
+        gains["rgb"] = (1.0, 1.0, 1.0)
+        try:
+            yield
+        finally:
+            gains["rgb"] = saved
+
+    session = _incremental_session(t, _live_edited_panel(t, gains),
+                                   reference_guard=identity_guard)
+    session.start()
+    session.measure_index(4)
+    gains["rgb"] = (1.07, 1.0, 1.0)
+    session.measure_index(5)
+    # the guard restores the live table after each reference read
+    assert gains["rgb"] == (1.07, 1.0, 1.0)
+    digest = session.finish()
+    assert digest["drift_episodes"] == 0
+    assert digest["needs_adjudication"] is False

@@ -19,7 +19,7 @@ from .desktoplut_client import (
     DesktopLutTransport,
     NamedPipeTransport,
 )
-from .mhc_grayscale import to_desktoplut_sdr_grayscale
+from .mhc_grayscale import to_desktoplut_sdr_grayscale, to_desktoplut_sdr_grayscale_decomposed
 
 
 def normalize_mode(mode: str) -> str:
@@ -216,16 +216,43 @@ class CalibrationController:
 
     def grayscale_set_live(self, monitor: int, mode: str, point_count: int,
                            points: list[float], deviations: dict[str, list[float]],
-                           gamma: float = 2.2) -> dict[str, Any]:
+                           gamma: float = 2.2,
+                           *,
+                           luminance: list[float] | None = None,
+                           rgb: dict[str, list[float]] | None = None) -> dict[str, Any]:
+        """Nudge the live editor table. When the solver's DECOMPOSED sliders are given
+        (``luminance`` = the common/main slider per point, ``rgb`` = the per-channel
+        balance strips), they ride the wire alongside the composed ``deviations``
+        (back-compat: deviations == luminance*rgb per point), so the DesktopLUT editor
+        shows the same luminance/balance split the solver produced instead of a zero
+        main slider with the common mode pushed into all three RGB values."""
         mode = normalize_mode(mode)
-        points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
-        return self.call("mhc.grayscale_set_live", {
-            "monitor": monitor, "mode": mode,
-            "grayscale": {
+        gs: dict[str, Any]
+        if luminance is not None and rgb is not None:
+            if mode == "SDR":
+                points, luminance, rgb = to_desktoplut_sdr_grayscale_decomposed(
+                    points, luminance, rgb)
+            lum = [float(v) for v in luminance]
+            bal = _coerce_deviations(rgb)
+            gs = {
+                "point_count": int(len(points)),
+                "points": [float(p) for p in points],
+                "luminance": lum,
+                "rgb": bal,
+                # Composed from the (bridged) decomposition so the wire invariant
+                # deviations == luminance*rgb holds exactly for legacy consumers.
+                "deviations": {ch: [lum[i] * bal[ch][i] for i in range(len(lum))]
+                               for ch in ("r", "g", "b")},
+            }
+        else:
+            points, deviations = self._bridge_grayscale(mode, points, deviations, gamma)
+            gs = {
                 "point_count": int(len(points)),
                 "points": [float(p) for p in points],
                 "deviations": _coerce_deviations(deviations),
-            },
+            }
+        return self.call("mhc.grayscale_set_live", {
+            "monitor": monitor, "mode": mode, "grayscale": gs,
         })
 
     def grayscale_commit(self, monitor: int, mode: str) -> dict[str, Any]:

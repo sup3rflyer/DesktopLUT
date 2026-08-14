@@ -334,11 +334,26 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(
                     ok=False, error="no active grayscale live preview (call mhc.grayscale_live_begin first)")
             gs = params.get("grayscale", {})
-            state["correction_grayscale"] = {
+            staged = {
                 "point_count": gs.get("point_count"),
                 "points": deepcopy(gs.get("points", [])),
                 "deviations": deepcopy(gs.get("deviations", {})),
             }
+            # Decomposed editor sliders (C++ ApplyGrayscalePayload): luminance[] is the
+            # common/main slider, rgb{r,g,b} the balance strips; when present they are
+            # authoritative — luminance scales the points curve (what the editor's main
+            # slider shows) and rgb lands on the RGB balance values. Mirror the mapping so
+            # a --simulate run exercises the same editor-visible split as hardware.
+            lum = gs.get("luminance")
+            rgb = gs.get("rgb")
+            n = len(staged["points"])
+            if isinstance(lum, list) and len(lum) == n:
+                staged["luminance"] = deepcopy(lum)
+                staged["editor_points"] = [float(p) * float(v)
+                                           for p, v in zip(staged["points"], lum)]
+            if isinstance(rgb, dict):
+                staged["rgb"] = deepcopy(rgb)
+            state["correction_grayscale"] = staged
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.

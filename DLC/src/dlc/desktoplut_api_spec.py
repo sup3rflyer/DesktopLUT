@@ -312,8 +312,14 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "grayscale": ApiParamSpec(
                     "object",
                     description="Grayscale payload {point_count:int, points:[ascending [0,1]], "
-                                "deviations:{r:[],g:[],b:[]} multiplicative centered at 1.0}. "
-                                "Server clamps to 32 points (index-resampled above that).",
+                                "luminance:[] optional common/main-slider values, rgb:{r:[],g:[],b:[]} "
+                                "optional per-channel balance values, deviations:{r:[],g:[],b:[]} "
+                                "composed multiplicative centered at 1.0 (back-compat; == "
+                                "luminance*rgb when the decomposition is sent)}. When luminance/rgb "
+                                "are present they are authoritative: luminance scales the points "
+                                "curve (the editor's main slider) and rgb lands on the RGB balance "
+                                "values, so the editor shows the solver's split. Server clamps to "
+                                "32 points (index-resampled above that).",
                 ),
             },
             {"monitor_mode": "string"},

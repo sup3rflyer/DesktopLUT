@@ -311,6 +311,87 @@ def test_state_get_carries_contract_version_and_mismatch_helper():
     assert msg and "unparseable" in msg
 
 
+def test_grayscale_set_live_carries_decomposed_sliders_on_the_wire():
+    """2026-08-14 HDR run defect 1: the solver decomposes luminance (main slider) from
+    the chromatic differential (rgb balance), but only the composed deviations rode the
+    wire — the DesktopLUT editor showed a zero main slider with the common mode pushed
+    into all three RGB values. Pin the extended contract: grayscale_set_live carries
+    luminance[] + rgb{r,g,b}[] per point ALONGSIDE deviations (back-compat), with the
+    wire invariant deviations == luminance*rgb, and the mock maps luminance onto the
+    points curve exactly as the C++ ApplyGrayscalePayload does."""
+    ctrl = CalibrationController.mock()
+    transport = ctrl.client.transport
+    ctrl.grayscale_live_begin(0, "HDR")
+
+    points = [0.0, 0.5, 1.0]
+    luminance = [1.0, 1.05, 1.0]
+    rgb = {"r": [1.0, 1.02, 1.0], "g": [1.0, 0.99, 1.0], "b": [1.0, 1.0, 1.0]}
+    deviations = {ch: [l * v for l, v in zip(luminance, rgb[ch])] for ch in ("r", "g", "b")}
+    ctrl.grayscale_set_live(0, "HDR", 3, points, deviations,
+                            luminance=luminance, rgb=rgb)
+
+    wire = [r for r in transport.requests if r.method == "mhc.grayscale_set_live"][-1]
+    gs = wire.params["grayscale"]
+    # HDR passes through unbridged: the decomposition arrives verbatim...
+    assert gs["luminance"] == luminance
+    assert gs["rgb"] == rgb
+    # ...and the composed back-compat deviations satisfy the wire invariant exactly.
+    for ch in ("r", "g", "b"):
+        for i in range(3):
+            assert gs["deviations"][ch][i] == pytest.approx(luminance[i] * rgb[ch][i])
+    # Mock fidelity (mirrors C++ ApplyGrayscalePayload): the decomposition is stored and
+    # luminance scales the points curve — what the editor's main slider displays.
+    cg = ctrl.state()["mhc"]["0:HDR"]["correction_grayscale"]
+    assert cg["luminance"] == luminance
+    assert cg["rgb"] == rgb
+    assert cg["editor_points"] == pytest.approx([p * l for p, l in zip(gs["points"], luminance)])
+
+    # Legacy composed-only call still works (no decomposition on the wire).
+    ctrl.grayscale_set_live(0, "HDR", 3, points, deviations)
+    wire = [r for r in transport.requests if r.method == "mhc.grayscale_set_live"][-1]
+    assert "luminance" not in wire.params["grayscale"]
+    assert "rgb" not in wire.params["grayscale"]
+
+
+def test_grayscale_set_live_decomposed_sdr_bridge_keeps_invariant():
+    """SDR: the decomposed curves are resampled onto DesktopLUT's sqrt-distributed
+    signal slots the same way the composed deviations are, and the composed wire
+    deviations are re-derived from the RESAMPLED pair — so deviations == luminance*rgb
+    holds exactly per slot even after the bridge."""
+    ctrl = CalibrationController.mock()
+    ctrl.grayscale_live_begin(0, "SDR")
+    points = [0.0, 0.25, 1.0]
+    luminance = [1.0, 1.08, 1.02]
+    rgb = {"r": [1.0, 1.03, 1.0], "g": [1.0, 1.0, 0.98], "b": [1.0, 0.97, 1.0]}
+    deviations = {ch: [l * v for l, v in zip(luminance, rgb[ch])] for ch in ("r", "g", "b")}
+    ctrl.grayscale_set_live(0, "SDR", 3, points, deviations,
+                            luminance=luminance, rgb=rgb)
+    wire = [r for r in ctrl.client.transport.requests
+            if r.method == "mhc.grayscale_set_live"][-1]
+    gs = wire.params["grayscale"]
+    n = gs["point_count"]
+    assert len(gs["luminance"]) == n and all(len(gs["rgb"][ch]) == n for ch in "rgb")
+    # slots sit at signal t² (the SDR editor convention)
+    assert gs["points"] == pytest.approx([(i / (n - 1)) ** 2 for i in range(n)])
+    for ch in ("r", "g", "b"):
+        for i in range(n):
+            assert gs["deviations"][ch][i] == pytest.approx(
+                gs["luminance"][i] * gs["rgb"][ch][i])
+
+
+def test_cpp_grayscale_payload_reads_decomposed_sliders():
+    """Static C++ pin: ApplyGrayscalePayload must parse the optional luminance[] +
+    rgb{r,g,b} decomposition (shared by mhc.grayscale_set_live and
+    runtime.set_grayscale_tweak) — removing it silently regresses the editor split
+    back to common-mode R/G/B under a zero main slider."""
+    text = _cpp_text()
+    m = re.search(r'void\s+ApplyGrayscalePayload\([^)]*\)\s*\{(.*?)\n\}', text, re.DOTALL)
+    assert m, "ApplyGrayscalePayload not found in the C++ IPC server"
+    body = m.group(1)
+    assert 'find("luminance")' in body, "C++ no longer reads the luminance[] decomposition"
+    assert 'find("rgb")' in body, "C++ no longer reads the rgb{} decomposition"
+
+
 def test_gamma_ramp_evidence_is_shaped_like_hardware():
     """The simulated panel reports a real (identity) ramp readback so enter-neutral's
     ramp-evidence branch is exercised under sim (was available:false — untestable)."""
