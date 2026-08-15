@@ -104,8 +104,9 @@ extern std::atomic<bool> g_dwmHookMode;        // Use DWM hook injection instead
 extern std::atomic<bool> g_calibrationControlEnabled;  // Arm the opt-in DLC calibration IPC server (default off)
 extern int g_dwmHookWatchdogRetries;           // Consecutive re-injection failures (GUI thread only)
 extern int g_dwmHookConfigResends;             // Countdown of extra shared-config resends after a topology
-                                               // change so the hook's monitor-shrink debounce can converge
-                                               // (GUI thread only — watchdog timer decrements it)
+                                               // change or HDR/SDR mode flip so the hook's suspicious-change
+                                               // debounce can converge (GUI thread only —
+                                               // DWM_HOOK_RESEND_TIMER_ID decrements it)
 extern std::atomic<bool> g_hookOnlyHotkeys;    // Hotkeys registered on GUI window (hook-only mode)
 extern std::atomic<bool> g_analysisOnlyMode;   // Lightweight analysis-only thread running (no overlay)
 

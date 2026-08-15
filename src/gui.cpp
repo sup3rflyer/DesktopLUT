@@ -672,6 +672,21 @@ static void StartMhcTransitionBurst(HWND hwnd, const char* reason) {
     SetTimer(hwnd, MHC_BURST_TIMER_ID, MHC_BURST_DELAYS_MS[0], nullptr);
 }
 
+// Push a fresh monitor snapshot to the DWM hook and start the resend pump.
+// The hook debounces HDR-flag flips / monitor-set shrinks over 3 consecutive
+// shared-config updates, so a single push after a mode switch would be held
+// forever — the hook would keep routing the FP16 backbuffer through the old
+// mode's pipeline (SDR math on HDR scRGB = flattened desktop). Each resend
+// invalidates the DXGI cache so late-settling transition state is re-read,
+// preventing a stale pre-transition snapshot from being pumped to acceptance.
+static void StartDwmHookConfigResends(HWND hwnd) {
+    InvalidateDxgiMonitorCache();
+    UpdateDwmHookSharedConfig();
+    g_dwmHookConfigResends = 3;
+    KillTimer(hwnd, DWM_HOOK_RESEND_TIMER_ID);
+    SetTimer(hwnd, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_RESEND_INTERVAL_MS, nullptr);
+}
+
 // ============================================================================
 // SECTION: Main Window Procedure
 // ============================================================================
@@ -1757,6 +1772,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // The immediate reapply above can race Windows' own transition
             // processing — follow up with the staggered burst either way.
             StartMhcTransitionBurst(hwnd, "ImmersiveColorSet");
+            // An HDR/SDR toggle flips monitor color spaces without changing the
+            // monitor set — the DWM hook must get a fresh snapshot or it keeps
+            // classifying the FP16 backbuffer under the previous mode.
+            if (g_dwmHookMode.load() && g_gui.isRunning) {
+                StartDwmHookConfigResends(hwnd);
+            }
             return 0;
         }
         if (wParam == DEVICE_CHANGE_TIMER_ID) {
@@ -1817,14 +1838,25 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
                 }
             } else {
-                // Hook is healthy — reset retry counter
+                // Hook is healthy — reset retry counter. (Config resends after a
+                // topology/mode change run on DWM_HOOK_RESEND_TIMER_ID, not here —
+                // the 5s watchdog cadence left the hook's debounce unconverged for
+                // up to 15s of visibly wrong rendering after an HDR flip.)
                 g_dwmHookWatchdogRetries = 0;
-                // Drive the hook's monitor-state debounce to convergence after a topology
-                // change by re-sending the shared config a few times (see WM_DISPLAYCHANGE).
-                if (g_dwmHookConfigResends > 0) {
-                    UpdateDwmHookSharedConfig();
-                    g_dwmHookConfigResends--;
-                }
+            }
+            return 0;
+        }
+        if (wParam == DWM_HOOK_RESEND_TIMER_ID) {
+            // Resend pump started by StartDwmHookConfigResends. Re-enumerate fresh
+            // each tick: if the first snapshot raced the mode transition, later
+            // resends must carry the settled state, not pump the stale one.
+            if (g_dwmHookConfigResends > 0 && g_dwmHookMode.load() && g_gui.isRunning) {
+                InvalidateDxgiMonitorCache();
+                UpdateDwmHookSharedConfig();
+                g_dwmHookConfigResends--;
+            }
+            if (g_dwmHookConfigResends <= 0) {
+                KillTimer(hwnd, DWM_HOOK_RESEND_TIMER_ID);
             }
             return 0;
         }
@@ -1961,19 +1993,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, g_gui.currentMonitor, 0);
 
-            // Update shared memory with new monitor positions/HDR state
-            if (g_dwmHookMode.load() && g_gui.isRunning) {
-                InvalidateDxgiMonitorCache();
-                UpdateDwmHookSharedConfig();
-                // Schedule additional resends over the next few watchdog ticks. The hook
-                // debounces monitor-set shrinks / HDR flips over 3 consecutive shared-config
-                // updates; a single WM_DISPLAYCHANGE resend would never reach that threshold,
-                // so a *persistent* shrink would never be applied by the hook. These bounded
-                // resends drive the debounce to convergence for a real change while a transient
-                // glitch (which recovers within the window) still gets rejected.
-                g_dwmHookConfigResends = 3;
-            }
-
             // Force reinit if processing is running, or restart if it exited
             if (g_gui.isRunning) {
                 g_forceReinit.store(true);
@@ -1988,6 +2007,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // directly since g_forceMhcReapply is only read by the render loop.
                 VerifyAndRestoreMhcProfiles();
             }
+        }
+
+        // Refresh the DWM hook's monitor snapshot on EVERY modeset, not only when
+        // the monitor set changed: an HDR/SDR toggle keeps the same HMONITORs
+        // (`changed` stays false) but flips the color space the hook keys its
+        // FP16 pipeline selection on. Gating this on `changed` left the hook
+        // running the stale mode's pipeline until it was manually re-toggled.
+        // Runs after the `changed` block so a topology update lands first.
+        if (g_dwmHookMode.load() && g_gui.isRunning) {
+            StartDwmHookConfigResends(hwnd);
         }
         return 0;
     }
