@@ -95,6 +95,8 @@ int g_dwmHookWatchdogRetries = 0;              // Consecutive re-injection failu
 int g_dwmHookConfigResends = 0;                // Extra shared-config resends after a topology/mode change (GUI thread only)
 std::atomic<bool> g_hookOnlyHotkeys{ false };  // Hotkeys registered on GUI window (hook-only mode)
 std::atomic<bool> g_analysisOnlyMode{ false }; // Lightweight analysis-only thread running (no overlay)
+std::atomic<unsigned> g_analysisThreadGen{ 0 }; // Analysis-only thread generation (zombie guard, see globals.h)
+std::atomic<int> g_analysisThreadAlive{ 0 };   // Count of analysis-only threads currently executing
 
 // ============================================================================
 // Hotkey Settings

@@ -109,6 +109,13 @@ extern int g_dwmHookConfigResends;             // Countdown of extra shared-conf
                                                // DWM_HOOK_RESEND_TIMER_ID decrements it)
 extern std::atomic<bool> g_hookOnlyHotkeys;    // Hotkeys registered on GUI window (hook-only mode)
 extern std::atomic<bool> g_analysisOnlyMode;   // Lightweight analysis-only thread running (no overlay)
+extern std::atomic<unsigned> g_analysisThreadGen; // Analysis-only thread generation. A thread whose captured
+                                               // generation goes stale (bumped on detach or by a successor
+                                               // start) exits its loop and skips shared-state teardown, so a
+                                               // detached zombie can't corrupt g_monitors/shared D3D under a
+                                               // newly started thread
+extern std::atomic<int> g_analysisThreadAlive; // Count of analysis-only threads currently executing (normally
+                                               // 0/1; >0 while a detached zombie is still winding down)
 
 // ============================================================================
 // Hotkey Settings

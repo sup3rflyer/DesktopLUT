@@ -608,16 +608,33 @@ static bool HasNonAnalysisShaderCorrections() {
     return result;
 }
 
+// Invalidate any detached (zombie) analysis-only thread and wait briefly for it
+// to finish before a successor touches g_monitors / shared D3D state. A stale
+// thread sees the generation bump, exits its loop, and skips shared-state
+// teardown. Returns the new generation for the thread about to start.
+// GUI thread only.
+static unsigned RetireStaleAnalysisThread() {
+    unsigned gen = g_analysisThreadGen.fetch_add(1) + 1;
+    DWORD start = GetTickCount();
+    while (g_analysisThreadAlive.load() > 0 && GetTickCount() - start < 1000)
+        Sleep(10);
+    if (g_analysisThreadAlive.load() > 0)
+        std::cerr << "[Analysis-only] Stale analysis thread still alive after 1s wait; "
+                     "proceeding (generation guard keeps it from touching shared state)" << std::endl;
+    return gen;
+}
+
 // Start the lightweight analysis-only thread (DWM hook mode).
 // Keeps hotkeys on g_gui.hwndMain (no overlay window to register them on).
 static void StartAnalysisOnlyMode() {
     if (g_gui.processingThread.joinable()) {
         g_gui.processingThread.join();
     }
+    unsigned gen = RetireStaleAnalysisThread();
     CreateAnalysisOverlay(GetModuleHandle(nullptr));
     g_analysisOnlyMode.store(true);
     g_running.store(true);
-    g_gui.processingThread = std::thread(AnalysisOnlyThreadFunc);
+    g_gui.processingThread = std::thread(AnalysisOnlyThreadFunc, gen);
     std::cout << "[DWM Hook] Analysis-only mode started (no overlay)" << std::endl;
 }
 
@@ -632,6 +649,9 @@ static void StopAnalysisOnlyMode() {
             DWORD elapsed = GetTickCount() - startTime;
             if (elapsed >= timeout) {
                 g_gui.processingThread.detach();
+                // Invalidate the zombie's generation so it exits even if
+                // g_running is re-armed by a subsequent start before it notices
+                g_analysisThreadGen.fetch_add(1);
                 break;
             }
             DWORD waitTime = (100 < timeout - elapsed) ? 100 : (timeout - elapsed);
@@ -650,9 +670,14 @@ static void StopAnalysisOnlyMode() {
     std::cout << "[DWM Hook] Analysis-only mode stopped" << std::endl;
 }
 
-void AnalysisOnlyThreadFunc() {
+void AnalysisOnlyThreadFunc(unsigned generation) {
     // Lightweight processing thread: DD capture + analysis compute shader only.
     // No overlay windows, no swapchain, no pixel shader, no frame pacer.
+    // `generation` guards against detached-zombie overlap: if it goes stale
+    // (a stop timed out and detached us, or a successor thread started), exit
+    // promptly and leave shared state to the current owner.
+    g_analysisThreadAlive.fetch_add(1);
+    struct AliveGuard { ~AliveGuard() { g_analysisThreadAlive.fetch_sub(1); } } aliveGuard;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -687,13 +712,14 @@ void AnalysisOnlyThreadFunc() {
     ctx.width = mi.rcMonitor.right - mi.rcMonitor.left;
     ctx.height = mi.rcMonitor.bottom - mi.rcMonitor.top;
 
-    // Init Desktop Duplication (captures desktop frames — no overlay needed)
+    // Init Desktop Duplication (captures desktop frames — no overlay needed).
+    // On failure (e.g. started while the display is powered off) don't exit —
+    // the WM_ANALYSIS_ONLY_EXITED handler would immediately restart us into
+    // the same failure, churning start cycles. Fall through with
+    // ctx.duplication null; the main loop's re-init guard retries with backoff
+    // until the display returns.
     if (!InitDesktopDuplication(&ctx)) {
-        std::cerr << "[Analysis-only] Failed to init Desktop Duplication" << std::endl;
-        ReleaseSharedD3DResources();
-        CoUninitialize();
-        PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, 0, 0);
-        return;
+        std::cerr << "[Analysis-only] Desktop Duplication init failed, retrying in loop" << std::endl;
     }
 
     // Populate tonemap settings for TM indicator in analysis display
@@ -709,6 +735,9 @@ void AnalysisOnlyThreadFunc() {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
         g_monitors.push_back(std::move(ctx));
     }
+    // Reference stays valid for the thread's lifetime: only this thread mutates
+    // g_monitors while its generation is current, and successor threads retire
+    // stale generations before touching the vector
     auto& mon = g_monitors[0];
 
     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -716,13 +745,56 @@ void AnalysisOnlyThreadFunc() {
               << (mon.isHDREnabled ? " HDR" : " SDR") << ")" << std::endl;
 
     int consecutiveErrors = 0;
+    int ddReinitAttempts = 0;
 
     // Main analysis loop — blocking AcquireNextFrame for natural compositor-rate sync
-    while (g_running.load() && g_analysisEnabled.load()) {
+    while (g_running.load() && g_analysisEnabled.load() &&
+           g_analysisThreadGen.load() == generation) {
         // Check if we need to transition to full overlay (MHC editor or corrections)
         if (g_mhcEditDialogOpen.load() || HasNonAnalysisShaderCorrections()) {
             std::cout << "[Analysis-only] Full overlay needed, transitioning" << std::endl;
             break;
+        }
+
+        // Desktop Duplication lost (display power-off, mode switch, driver
+        // reset) or never came up: re-init with backoff instead of exiting —
+        // init keeps failing while the display is off (possibly for hours), so
+        // exiting would just make the GUI churn restart cycles. AcquireNextFrame
+        // below is only ever reached with a live duplication (calling it through
+        // a null one was the 0xc0000005 that killed the app when the primary
+        // display powered off).
+        if (!mon.duplication) {
+            DWORD backoffMs = (ddReinitAttempts < 20) ? 100 : 1000;
+            for (DWORD slept = 0; slept < backoffMs; slept += 100) {
+                if (!g_running.load() || !g_analysisEnabled.load()) break;
+                Sleep(100);
+            }
+            if (!g_running.load() || !g_analysisEnabled.load() ||
+                g_analysisThreadGen.load() != generation)
+                break;
+            // A power cycle can hand the primary a new HMONITOR — re-resolve
+            // instead of retrying a dead handle forever
+            HMONITOR hPrimary = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+            if (hPrimary && hPrimary != mon.monitor) {
+                std::cout << "[Analysis-only] Primary HMONITOR changed, re-targeting" << std::endl;
+                mon.monitor = hPrimary;
+            }
+            MONITORINFO nmi = { sizeof(nmi) };
+            if (GetMonitorInfo(mon.monitor, &nmi)) {
+                mon.x = nmi.rcMonitor.left;
+                mon.y = nmi.rcMonitor.top;
+                mon.width = nmi.rcMonitor.right - nmi.rcMonitor.left;
+                mon.height = nmi.rcMonitor.bottom - nmi.rcMonitor.top;
+            }
+            if (!InitDesktopDuplication(&mon)) {
+                ddReinitAttempts++;
+                if (ddReinitAttempts == 20)
+                    std::cout << "[Analysis-only] DD re-init still failing (display off?), backing off to 1s retries" << std::endl;
+                continue;
+            }
+            ddReinitAttempts = 0;
+            consecutiveErrors = 0;
+            std::cout << "[Analysis-only] Desktop Duplication (re-)initialized" << std::endl;
         }
 
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
@@ -755,12 +827,7 @@ void AnalysisOnlyThreadFunc() {
                     mon.duplication->Release();
                     mon.duplication = nullptr;
                     mon.lastCaptureTexture = nullptr;
-                    Sleep(100);
-                    if (!InitDesktopDuplication(&mon)) {
-                        std::cerr << "[Analysis-only] DD re-init failed after format change" << std::endl;
-                        break;
-                    }
-                    continue;
+                    continue;  // top-of-loop re-init guard retries with backoff
                 }
 
                 D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -800,17 +867,7 @@ void AnalysisOnlyThreadFunc() {
             if (mon.duplication) { mon.duplication->Release(); mon.duplication = nullptr; }
             if (mon.captureSRV) { mon.captureSRV->Release(); mon.captureSRV = nullptr; }
             mon.lastCaptureTexture = nullptr;
-            Sleep(100);
-            if (!InitDesktopDuplication(&mon)) {
-                consecutiveErrors++;
-                if (consecutiveErrors > 10) {
-                    std::cerr << "[Analysis-only] DD re-init failed " << consecutiveErrors << " times, exiting" << std::endl;
-                    break;
-                }
-                continue;  // mon.duplication is null — retry before AcquireNextFrame
-            } else {
-                consecutiveErrors = 0;
-            }
+            // top-of-loop re-init guard retries with backoff
         } else {
             std::cerr << "[Analysis-only] AcquireNextFrame failed: 0x" << std::hex << hr << std::dec << std::endl;
             consecutiveErrors++;
@@ -821,6 +878,16 @@ void AnalysisOnlyThreadFunc() {
 
     // Determine exit reason for GUI handler
     bool needsFullOverlay = g_mhcEditDialogOpen.load() || HasNonAnalysisShaderCorrections();
+
+    // If our generation went stale we are a detached zombie: a successor thread
+    // may already own g_monitors and the shared D3D globals, and the `mon`
+    // reference may dangle. Touching any of it would corrupt the successor —
+    // leak our objects instead (rare escape-hatch path) and exit quietly.
+    if (g_analysisThreadGen.load() != generation) {
+        std::cerr << "[Analysis-only] Stale thread exiting, skipping shared-state cleanup" << std::endl;
+        CoUninitialize();
+        return;
+    }
 
     // Cleanup per-monitor resources
     if (mon.duplication) { mon.duplication->Release(); mon.duplication = nullptr; }
@@ -940,6 +1007,7 @@ void StartProcessing() {
             g_gui.isRunning = true;
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+            RetireStaleAnalysisThread();  // full overlay owns g_monitors too
             g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
         } else if (needOverlay && !needFullOverlay) {
             // Only analysis active — use lightweight analysis-only mode (no overlay windows)
@@ -1012,6 +1080,7 @@ void StartProcessing() {
     g_gui.isRunning = true;
     g_gui.restartRetryCount = 0;  // Reset backoff on successful start
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+    RetireStaleAnalysisThread();  // full overlay owns g_monitors too
     g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
 
     // Directly set button states - don't call UpdateGUIState which may re-enable via SettingsChanged
@@ -1064,8 +1133,12 @@ void StopProcessing() {
                     DispatchMessage(&msg);
                 }
             }
-            if (g_gui.processingThread.joinable())
+            if (g_gui.processingThread.joinable()) {
                 g_gui.processingThread.detach();
+                // Invalidate the zombie's generation so it exits even if
+                // g_running is re-armed by a subsequent start before it notices
+                g_analysisThreadGen.fetch_add(1);
+            }
         }
         g_analysisOnlyMode.store(false);
         DestroyAnalysisOverlay();
@@ -1174,6 +1247,7 @@ void DwmHookReevaluateOverlay() {
                 configs.push_back(config);
             }
             g_running = true;
+            RetireStaleAnalysisThread();  // full overlay owns g_monitors too
             g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
         }
     } else if (needAnalysis) {

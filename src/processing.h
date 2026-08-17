@@ -22,7 +22,7 @@ void StopProcessing();
 void DwmHookReevaluateOverlay();
 
 // Lightweight analysis-only thread (DWM hook mode: DD capture + analysis compute, no overlay)
-void AnalysisOnlyThreadFunc();
+void AnalysisOnlyThreadFunc(unsigned generation);
 
 // Update color correction for a running monitor in real-time
 // ictcpMode: when true (HDR editing), shader uses ICtCp offsets for perceptually accurate preview
