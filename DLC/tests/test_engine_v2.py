@@ -258,6 +258,37 @@ def test_ramp_anchors_and_dedup():
     assert len(ramp) == len(set(ramp))  # deduped
 
 
+def test_headroom_levels_extends_above_cap_to_full_drive():
+    lv = P.headroom_levels(713, 1023, steps=6)
+    assert lv and lv[-1] == 1023           # reaches full drive
+    assert all(v > 713 for v in lv)        # strictly above the cap (713 already present)
+    assert lv == sorted(lv) and len(lv) == len(set(lv))
+    assert P.headroom_levels(1023, 1023) == []   # nothing above full drive
+    assert P.headroom_levels(800, 700) == []     # to<=from
+
+
+def test_ramp_extend_to_cv_adds_grey_headroom_only():
+    # The RAW full-drive headroom extension (LG C6 WRGB fix): GREY levels go above the peak-code
+    # cap to full drive so the neutral roll-off is measured; COLOUR ramps stay bounded at the cap
+    # (full-drive primaries would storm the white-referenced plausibility envelope).
+    tr = P.Transfer.pq(bit_depth=10)
+    cap = tr.nits_to_cv(1600.0)                        # HDR peak cap < full scale (1023)
+    base = P.ramp_patches(tr, steps=13, saturations=(1.0,), max_cv=cap, order="none")
+    ext = P.ramp_patches(tr, steps=13, saturations=(1.0,), max_cv=cap,
+                         extend_to_cv=tr.max_cv, order="none")
+    base_greys = {p[0] for p in base if p[0] == p[1] == p[2]}
+    ext_greys = {p[0] for p in ext if p[0] == p[1] == p[2]}
+    # New grey levels appear above the cap, up to full drive.
+    assert ext_greys > base_greys
+    assert max(ext_greys) == tr.max_cv and max(base_greys) <= cap
+    assert all(g <= cap for g in base_greys)
+    # Colour patches are unchanged — none introduced above the cap.
+    base_colours = {p for p in base if not (p[0] == p[1] == p[2])}
+    ext_colours = {p for p in ext if not (p[0] == p[1] == p[2])}
+    assert base_colours == ext_colours
+    assert all(max(p) <= cap for p in ext_colours)
+
+
 def test_saturation_sweep_preserves_repeated_skeleton_reads():
     tf = P.Transfer.power(2.2, 120.0, bit_depth=8)
     sweep = P.saturation_sweep_patches(tf, repeats=3, order="none")

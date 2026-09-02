@@ -4027,3 +4027,77 @@ def test_grayscale_wb_bake_memoised_across_resume(tmp_path: Path):
     assert commits["n"] == 1                          # never re-committed
     mhc = ctrl.state()["mhc"]["0:SDR"]
     assert mhc.get("gs_committed") is True            # the bake is still the applied state
+
+
+# ---------------------------------------------------------------------------
+# measure escalation: repeatability-aware recommendation + present-stall seam
+# (2026-09-02 C6 run, items #2/#4)
+# ---------------------------------------------------------------------------
+
+def test_measure_escalation_recommendation_flips_on_repeatability():
+    from dlc.calibrate import _measure_escalation_recommendation as rec
+
+    # Stable-but-implausible, all too-DIM, nothing else wrong ⇒ suggest accept (retry would
+    # re-measure the same dim patch and re-fail forever) — with the basis spelled out.
+    stable = {"measurement_path_compromised": True,
+              "read_anomaly_repeatability": {"classification": "stable",
+                                             "all_low_luminance": True}}
+    choice, basis = rec(stable)
+    assert choice == "accept" and basis and "repeatable" in basis
+
+    # Divergent reads ⇒ transient fault ⇒ retry.
+    noisy = {"measurement_path_compromised": True,
+             "read_anomaly_repeatability": {"classification": "noisy",
+                                            "all_low_luminance": True}}
+    assert rec(noisy)[0] == "retry"
+
+    # No repeatability evidence ⇒ conservative retry (unchanged behaviour).
+    assert rec({"measurement_path_compromised": True})[0] == "retry"
+
+    # A run-stopper (present-stall / dark panel) ALWAYS retries — a stuck frame is perfectly
+    # "repeatable" and must never be argued into accept.
+    assert rec({**stable, "present_stall": True})[0] == "retry"
+    assert rec({**stable, "panel_dark": True})[0] == "retry"
+    assert rec({**stable, "remeasure_budget_exceeded": True})[0] == "retry"
+
+    # A stable TOO-BRIGHT read is never panel physics (attenuation only reduces light).
+    bright = {"measurement_path_compromised": True,
+              "read_anomaly_repeatability": {"classification": "stable",
+                                             "all_low_luminance": False}}
+    assert rec(bright)[0] == "retry"
+
+    # Benign escalations (not-warm / unresolved only) keep the accept recommendation.
+    assert rec({})[0] == "accept"
+
+
+def test_present_stall_pauses_the_measure_seam_with_retry(tmp_path: Path):
+    # Integration (#2): a presenter that freezes mid-pass halts measurement at the stall and
+    # pauses the run at the escalation seam recommending retry — a REAL seam, not a check-in.
+    stuck_xyz = (53.2, 56.0, 61.0)
+
+    def stalls_after_two(patch):
+        if patch.role != "measurement":
+            y = max(0.05, 120.0 * (max(patch.rgb) / 1023.0) ** 2.2)
+            return Reading(xyz=(y * 0.95, y, y * 1.09), yxy=(y, 0.313, 0.329), ok=True)
+        if patch.seq < 2:
+            y = 20.0 + patch.seq * 3.0
+            return Reading(xyz=(y * 0.95, y, y * 1.09), yxy=(y, 0.313, 0.329), ok=True)
+        return Reading(xyz=stuck_xyz, yxy=(56.0, 0.31, 0.331), ok=True)
+
+    patches = [(700, 0, 0), (0, 700, 0), (0, 0, 700), (700, 0, 700), (0, 700, 700),
+               (700, 700, 0), (900, 900, 900), (500, 500, 500)]
+    calib = _make(tmp_path, "stall_seam", panel=stalls_after_two,
+                  adjudicator=MappingAdjudicator())
+    calib.target_name = calib.display.target_name("SDR")
+    calib.calib["target"] = calib.target_name
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=patches,
+                            ti3_name="s.ti3", ndjson_name="s.ndjson")
+    req = exc.value.request
+    assert req.key == "measure:raw:escalation"
+    assert req.recommendation == "retry"
+    assert req.digest.get("present_stall") is True
+    assert req.digest.get("compromised") is True
+    assert "retry" in req.options
+    # halted at the stall — the frozen tail was never measured out
+    assert req.digest.get("patch_count") < len(patches)

@@ -1263,7 +1263,35 @@ class Calibration:
             ti3_path=meas_dir / ti3_name, ndjson_path=meas_dir / ndjson_name,
             runlog=self.runlog, liveness=self.liveness, dip=dip,
             checkin_interval_s=self._checkin_interval_s,
+            **self._plausibility_context(role, dip),
         )
+
+    def _plausibility_context(self, role: str, dip) -> dict[str, Any]:
+        """Gamut/correction context for the measure loop's luminance-plausibility envelope
+        (2026-09-02 C6 run, item #3): the MEASURED per-channel full-drive peaks from this
+        display's ``mhc_params`` (a full-drive blue on a blue-weak WOLED is expected near its
+        OWN 18.6-nit peak, never the 604-nit white peak), the DIP's real (WRGB non-additive)
+        white for near-neutral headroom, and — once the MHC is installed (every role but the
+        raw characterization) — the Peak-Chroma cap, whose clamp legitimately dims commanded
+        targets above it. Empty dict (container fallback, previous behaviour) when the panel
+        has no measured channel peaks yet — e.g. the first raw pass of a fresh display."""
+        params = self._state.get("mhc_params") or {}
+        peaks = params.get("channel_peak_xyz")
+        try:
+            ys = tuple(float(p[1]) for p in peaks) if peaks else ()
+        except (TypeError, ValueError, IndexError):
+            return {}
+        if len(ys) != 3 or min(ys) <= 0.0:
+            return {}
+        ctxkw: dict[str, Any] = {"channel_peak_y": ys}
+        white = _as_float_local(getattr(dip, "native_white_nits", None)) if dip else None
+        if white is not None and white > sum(ys):
+            ctxkw["white_peak_y"] = white
+        if role != "raw":
+            cap = _as_float_local((params.get("peak_chroma") or {}).get("cap_nits"))
+            if cap is not None and cap > 0.0:
+                ctxkw["correction_max_nits"] = cap
+        return ctxkw
 
     def _bookend_drift_qc(self, role: str, ti3_path: Optional[str],
                           patches: Sequence[tuple[int, int, int]]) -> Optional[dict[str, Any]]:
@@ -2644,20 +2672,22 @@ class Calibration:
             score_anomaly = bool(outcome.digest.get("score_anomaly"))
             # A dark panel, compromised preheat, or a blown remeasure/drift budget is non-benign:
             # recommend retry (not accept), offer it, and flag compromised so SupervisedAdjudicator
-            # escalates rather than rubber-stamping black/garbage data.
-            retry_recommended = bool(outcome.digest.get("remeasure_budget_exceeded")
-                                     or outcome.digest.get("drift_density_exceeded")
-                                     or panel_dark
-                                     or preheat_compromised
-                                     or measurement_path_compromised)
+            # escalates rather than rubber-stamping black/garbage data. The RECOMMENDATION (never
+            # a decision — the seam still judges) also weighs read-repeatability: stable-but-
+            # implausible envelope reads are real panel/correction behaviour a retry would just
+            # re-measure and re-fail (item #4, 2026-09-02 C6 run).
+            recommendation, basis = _measure_escalation_recommendation(outcome.digest)
+            retry_recommended = recommendation == "retry"
             options = (("accept", "suppress", "remeasure", "retry", "abort")
-                       if (retry_recommended or score_anomaly) else ("accept", "suppress", "abort"))
+                       if (retry_recommended or score_anomaly or measurement_path_compromised)
+                       else ("accept", "suppress", "abort"))
             decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:escalation", seam=SEAM_MEASURE, stage=key,
                 question=outcome.data.get("question") or "measurement did not fully settle - accept or retry?",
                 options=options,
-                recommendation=("retry" if retry_recommended else "accept"),
+                recommendation=recommendation,
                 digest={**outcome.digest,
+                        **({"recommendation_basis": basis} if basis else {}),
                         "compromised": (panel_dark or preheat_compromised
                                         or measurement_path_compromised
                                         or score_anomaly)}))
@@ -2934,8 +2964,9 @@ class Calibration:
             if spec.is_hdr and params.get("peak_chroma"):
                 # Standalone-D65 evidence: the cold-channel-limited Peak-Chroma luminance the
                 # closed-loop refine will hold D65 to (see stage_refine_mhc_cube). Carries the
-                # P16 honesty fields (measured_peak_nonadditivity / cap_nits_nonadditive_est)
-                # so the adjudicator sees how far the nominal-additive cap overshoots (HW-5).
+                # WRGB-gate fields (drive_matched_nonadditivity / cap_policy / wrgb_nonadditive /
+                # full_drive_grounded) so the adjudicator sees whether the additive cap was applied
+                # or bypassed for a W-subpixel panel, and whether the ceiling is full-drive-grounded.
                 digest["peak_chroma"] = params["peak_chroma"]
             if params.get("dark_floor"):
                 # The σ-aware adaptive dark floor's verdict (Phase 4, F4-1/HW-4): nits + how
@@ -4626,13 +4657,29 @@ class Calibration:
             return None
         return self._transfer().nits_to_cv(self._hdr_target().peak_nits)
 
-    def _ramp_patches(self, *, gamut_aware: bool = False) -> list[tuple[int, int, int]]:
+    def _raw_extend_to_cv(self) -> Optional[int]:
+        """Full-drive headroom extension for the RAW characterization ramp (HDR only): the code
+        range between the target-peak cap and full drive, measured sparsely (GREY only) so the
+        build sees the panel's native near-peak NEUTRAL roll-off. On a panel that renders the peak
+        CODE below the peak NITS (LG C6 2026-09-02: 603.6-nit code → 477 read, full drive → 575),
+        a cube fitted only up to the peak code can never invert the roll-off (``invert_monotone``
+        is bounded by the measured signal range) and the measured ceiling is bound too low.
+        ``None`` when the ramp is already unbounded (SDR) — nothing to extend."""
+        if self._patch_max_cv() is None:
+            return None
+        return self._transfer().max_cv
+
+    def _ramp_patches(self, *, gamut_aware: bool = False,
+                      extend_full_drive: bool = False) -> list[tuple[int, int, int]]:
         # gamut_aware=True (VERIFY only): cap colour-ramp saturation to the panel's reachable gamut
         # so saturated verify patches land where the panel can render. RAW stays uncapped (it needs
-        # full-saturation pure channels to characterize the panel — see build_ramp_set).
+        # full-saturation pure channels to characterize the panel — see build_ramp_set) and passes
+        # extend_full_drive=True (the headroom extension above the peak-code cap; _raw_extend_to_cv).
         caps = self._hue_sat_caps() if gamut_aware else None
+        extend = self._raw_extend_to_cv() if extend_full_drive else None
         return build_ramp_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
-                              max_cv=self._patch_max_cv(), hue_sat_caps=caps)
+                              max_cv=self._patch_max_cv(), hue_sat_caps=caps,
+                              extend_to_cv=extend)
 
     def _hue_sat_caps(self) -> Optional[dict]:
         """Per-primary-hue signal-saturation caps from the panel's MEASURED native gamut (DIP) vs
@@ -4697,7 +4744,8 @@ class Calibration:
 
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
         return flow_patch_counts(flow, self.patch_sizes, self._transfer(),
-                                 max_cv=self._patch_max_cv())
+                                 max_cv=self._patch_max_cv(),
+                                 raw_extend_to_cv=self._raw_extend_to_cv())
 
     def _patch_plan_record(self, flow: str) -> dict[str, Any]:
         transfer = self._transfer()
@@ -4764,7 +4812,7 @@ class Calibration:
         self.stage_enter_neutral()
         self.stage_hardware_readiness()
         self.stage_brightness()
-        raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
+        raw = self.stage_measure(role="raw", patches=self._ramp_patches(extend_full_drive=True),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
         # Standalone-D65 foundation (1+1+1): pull the MHC to D65 BEFORE the optional 3D LUT refines
@@ -4797,7 +4845,7 @@ class Calibration:
         self.stage_enter_neutral()
         self.stage_hardware_readiness()
         self.stage_brightness()
-        raw = self.stage_measure(role="raw", patches=self._ramp_patches(),
+        raw = self.stage_measure(role="raw", patches=self._ramp_patches(extend_full_drive=True),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
         self.stage_build_install_mhc(raw.data["ti3"])
         # The mhc-only flow IS the standalone-ICC path — refine the MHC to D65 so verify scores the
@@ -5060,6 +5108,45 @@ def _as_float_local(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _measure_escalation_recommendation(digest: dict[str, Any]) -> tuple[str, Optional[str]]:
+    """``(recommendation, basis)`` for the measure escalation seam — a SUGGESTION to the LLM
+    judge, never an auto-action (Design Law: the seam decides; ``--auto`` is sim/CI only and
+    Supervised still escalates on the unchanged ``compromised`` flag).
+
+    Retry for the non-benign compromise signals (dark panel, present-stall, compromised
+    preheat/path, blown remeasure/drift budgets) — EXCEPT the one case retry provably cannot
+    fix (item #4, 2026-09-02 C6 run): when the ONLY compromise is plausibility-envelope
+    anomalies, all of them too-DIM reads (``lit_drive_low_luminance`` — what a correction or a
+    gamut-limited channel legitimately produces; a stable too-BRIGHT read is never panel
+    physics), and the flagged reads are REPEATABLE (the digest's read-repeatability evidence:
+    the same stimulus re-read to the same implausible value). That is stable-but-implausible =
+    real panel/correction behaviour; a retry re-measures the same dim patch and re-fails
+    forever, so the recommendation flips to accept — with the basis spelled out for the judge."""
+    hard = bool(digest.get("panel_dark")
+                or digest.get("present_stall")
+                or digest.get("preheat_compromised")
+                or digest.get("remeasure_budget_exceeded")
+                or digest.get("drift_density_exceeded"))
+    path_compromised = bool(digest.get("measurement_path_compromised"))
+    if hard:
+        return "retry", None
+    if not path_compromised:
+        return "accept", None
+    repeat = digest.get("read_anomaly_repeatability") or {}
+    if repeat.get("classification") == "stable" and repeat.get("all_low_luminance") is True:
+        return "accept", (
+            "anomalous reads are repeatable (stable-but-implausible, all low-luminance) — "
+            "consistent with real panel/correction behaviour, e.g. a gamut-limited channel or an "
+            "installed correction's attenuation; a retry would re-measure the same values"
+        )
+    if repeat.get("classification") == "noisy":
+        return "retry", (
+            "anomalous reads are divergent across re-reads — consistent with a transient "
+            "meter/display fault a retry should clear"
+        )
+    return "retry", None
 
 
 def _fmt_elapsed(seconds: Any) -> str:

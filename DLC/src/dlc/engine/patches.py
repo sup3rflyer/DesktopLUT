@@ -260,6 +260,29 @@ def uniform_levels(n: int, max_cv: int) -> list[int]:
     return [round(i * max_cv / (n - 1)) for i in range(n)]
 
 
+_HEADROOM_STEPS = 6
+
+
+def headroom_levels(from_cv: int, to_cv: int, steps: int = _HEADROOM_STEPS) -> list[int]:
+    """Sparse code values ABOVE a peak-bounded ramp's top, up to ``to_cv`` (full drive).
+
+    A panel whose native EOTF rolls off approaching its peak renders the target-peak CODE
+    below the target-peak NITS (LG C6 2026-09-02: the 603.6-nit code read 477 while full
+    drive read 575) — so a characterization ramp bounded at the peak code never measures
+    the drive range the 1D correction cube must map INTO to reach the real peak
+    (``invert_monotone`` cannot exceed the measured signal range), and the per-channel
+    full-drive peaks (``channel_peak_xyz``) get read at sub-peak drive. These few extra
+    levels close that gap. Excludes ``from_cv`` (already present), includes ``to_cv``."""
+    if to_cv <= from_cv or steps < 1:
+        return []
+    out: list[int] = []
+    for i in range(1, steps + 1):
+        v = round(from_cv + i * (to_cv - from_cv) / steps)
+        if v > from_cv and v not in out:
+            out.append(v)
+    return out
+
+
 def perceptual_levels(n: int, transfer: Transfer, *, max_cv: int | None = None,
                       space_gamma: float = 2.2) -> list[int]:
     """``n`` code values spaced uniformly in a ``(L/Lmax)**(1/space_gamma)`` space.
@@ -345,6 +368,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
                  low_light_bias: float = 2.0,
                  hue_sat_caps: Optional[dict[str, float]] = None,
                  color_min_signal: float = 0.0,
+                 extend_to_cv: int | None = None,
                  warm_tau: Optional[int] = None) -> list[Patch]:
     """Grey ramp + per-channel colour ramps at each saturation (deduped, then ordered).
 
@@ -384,6 +408,19 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
         levels = _merge_levels(levels, shadow_levels(
             low_light_steps, transfer, max_cv=max_cv,
             max_signal=low_light_signal, bias=low_light_bias))
+    # Full-drive headroom extension (RAW characterization only — see headroom_levels): a few
+    # sparse GREY levels above the peak-code cap so the neutral ramp measures through the panel's
+    # native near-peak roll-off up to full drive. This grounds the true full-drive white (the
+    # cube's neutral ceiling) — a panel that renders the peak CODE below the peak NITS otherwise
+    # bounds the measured ceiling too low (LG C6 2026-09-02). Grey-only by design: full-drive
+    # PRIMARY patches read far below the white-referenced plausibility envelope (a full blue is
+    # ~its own primary peak, not white peak), so extending colour ramps to full drive would storm
+    # the read-plausibility detector until it is made gamut/channel-aware. The bounded colour
+    # ramps still characterise the primaries; the neutral axis is what needs the drive range.
+    # Verify never passes this (patches above the target peak score as clipped highlights).
+    grey_levels = levels
+    if extend_to_cv is not None and extend_to_cv > max_cv:
+        grey_levels = _merge_levels(levels, headroom_levels(max_cv, extend_to_cv))
 
     seen: set[Patch] = set()
     patches: list[Patch] = []
@@ -393,7 +430,7 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
             seen.add(p)
             patches.append(p)
 
-    for v in levels:
+    for v in grey_levels:
         add((v, v, v))
     # Colour floor: below this code value, colour patches are sub-nit / noise-dominated, so the
     # grey ramp above already carries the dark EOTF. ``0`` ⇒ no floor (full-range colour).

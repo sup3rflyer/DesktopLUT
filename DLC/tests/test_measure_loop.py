@@ -155,7 +155,7 @@ def test_warmup_escalates_when_it_never_settles(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 def _solo_loop(panel, transfer: Transfer, cfg: MeasureLoopConfig,
-               dip: DisplayInstrumentProfile | None = None) -> _Loop:
+               dip: DisplayInstrumentProfile | None = None, **kw) -> _Loop:
     return _Loop(
         patches=[],
         transfer=transfer,
@@ -164,6 +164,7 @@ def _solo_loop(panel, transfer: Transfer, cfg: MeasureLoopConfig,
         ndjson=_NdjsonWriter(None),
         events=None,
         dip=dip,
+        **kw,
     )
 
 
@@ -458,10 +459,263 @@ def test_panel_dark_mid_run_surfaces_anomaly():
 def test_read_integrity_disabled_when_window_zero():
     t = _sdr()
     stuck = _ScriptedPanel([(56.0, 56.0, 58.0)])
-    loop = _solo_loop(stuck, t, MeasureLoopConfig(integrity_window=0))
+    loop = _solo_loop(stuck, t, MeasureLoopConfig(integrity_window=0, stall_reads=0))
     for i, cv in enumerate([(512, 512, 512), (1023, 1023, 1023), (724, 724, 724), (880, 880, 880)]):
         loop.measure_patch(_patch(f"p{i}", cv, t, i), phase="main")
     assert loop.read_anomalies == []
+
+
+# ---------------------------------------------------------------------------
+# fast present-stall detector (stuck frame — run-stopper; 2026-09-02 C6 event)
+# ---------------------------------------------------------------------------
+
+# The frozen ~402-nit white the LG C6's auto-power-off left on screen (real event values).
+_STUCK_XYZ = (377.4, 402.19, 437.9)
+
+
+def _stuck_read(_patch: MeasurePatch) -> Reading:
+    return Reading(xyz=_STUCK_XYZ, yxy=(402.19, 0.31019, 0.33063), ok=True)
+
+
+def test_present_stall_fires_on_the_real_stuck_frame_sequence():
+    # Modeled on the 2026-09-02 event: dim magenta commanded twice (verify bookend repeat), then
+    # a different colour — every read returns the identical frozen ~402-nit white. Three
+    # near-identical reads across two genuinely different commanded colours ⇒ run-stopper.
+    t = Transfer.pq(bit_depth=10)
+    loop = _solo_loop(_stuck_read, t, MeasureLoopConfig())
+    loop.reference_xyz = (95.0, 102.29, 111.0)     # the run's warm mid-grey reference
+    for i, cv in enumerate([(178, 0, 178), (178, 0, 178), (0, 178, 178)]):
+        loop.measure_patch(_patch(f"p{i}", cv, t, i), phase="main")
+    assert loop.present_stall is True
+    stall = [a for a in loop.read_anomalies if a["reason"] == "present_stall"]
+    assert len(stall) == 1
+    assert stall[0]["severity"] == "run_stopper"
+    assert stall[0]["distinct_commands"] >= 2
+    assert loop.measurement_path_compromised is True
+
+
+def test_present_stall_counts_the_drift_checkpoint_read():
+    # In the real event the third stuck read WAS the drift-checkpoint mid-grey (the two flagged
+    # magentas alone can't prove a stall — one commanded colour). The checkpoint read must join
+    # the streak and fire the run-stopper INSTEAD of poisoning the drift verdict.
+    t = Transfer.pq(bit_depth=10)
+    loop = _solo_loop(_stuck_read, t, MeasureLoopConfig())
+    loop.reference_xyz = (95.0, 102.29, 111.0)
+    loop.warm = True
+    for i in range(2):   # the two magenta bookend repeats — one commanded colour so far
+        loop.measure_patch(_patch(f"p{i}", (178, 0, 178), t, i), phase="main")
+    assert loop.present_stall is False
+    drift_before = loop.drift_episodes
+    loop._neutral_checkpoint(loop._warmup_patch(), ["p0", "p1"], patch_index=2)
+    assert loop.present_stall is True                  # mid-grey vs magenta = 2nd distinct colour
+    assert loop.drift_episodes == drift_before         # NO drift episode off the frozen frame
+    assert loop.appended_queue == []                   # nothing queued for cold-remeasure
+
+
+def test_present_stall_ignores_repeated_and_near_black_patches():
+    t = Transfer.pq(bit_depth=10)
+    # Repeated identical commands reading identically = a verify bookend, NOT a stall.
+    loop = _solo_loop(_stuck_read, t, MeasureLoopConfig())
+    for i in range(6):
+        loop.measure_patch(_patch(f"b{i}", (0, 0, 713), t, i), phase="main")
+    assert loop.present_stall is False
+    # Distinct sub-1-nit darks all reading ~0 = legitimate near-black, NOT a stall.
+    dark = _ScriptedPanel([(0.004, 0.005, 0.006)])
+    loop2 = _solo_loop(dark, t, MeasureLoopConfig())
+    for i, cv in enumerate([(60, 0, 0), (0, 60, 0), (0, 0, 60), (40, 40, 0)]):
+        loop2.measure_patch(_patch(f"d{i}", cv, t, i), phase="main")
+    assert loop2.present_stall is False
+
+
+def test_present_stall_not_fired_by_a_luminance_clamp_plateau():
+    # Above-cap neutrals (Peak-Chroma cap / ABL) legitimately equalize LUMINANCE across different
+    # commanded grey levels — same commanded chromaticity DIRECTION, so never a stall.
+    t = Transfer.pq(bit_depth=10)
+    clamped = _ScriptedPanel([(118.0, 127.0, 138.0)])   # every grey clamps to ~127 nits
+    loop = _solo_loop(clamped, t, MeasureLoopConfig())
+    for i, cv in enumerate([(650, 650, 650), (700, 700, 700), (769, 769, 769),
+                            (820, 820, 820), (900, 900, 900)]):
+        loop.measure_patch(_patch(f"g{i}", cv, t, i), phase="main")
+    assert loop.present_stall is False
+
+
+def test_present_stall_halts_the_main_pass_and_reaches_the_digest(tmp_path: Path):
+    # End-to-end: the pass stops AT the stall (no garbage tail), and the digest carries the
+    # run-stopper for the escalation seam.
+    t = Transfer.pq(bit_depth=10)
+    reads = {"n": 0}
+
+    def freezes_after_two(patch: MeasurePatch) -> Reading:
+        if patch.role != "measurement" or patch.seq < 2:
+            lin = (max(patch.rgb) / t.max_cv) if patch.role != "measurement" else 0.3
+            y = 120.0 * lin if patch.role != "measurement" else 30.0 + patch.seq
+            return Reading(xyz=(y * 0.95, y, y * 1.09), yxy=(y, 0.313, 0.329), ok=True)
+        reads["n"] += 1
+        return _stuck_read(patch)
+
+    patches = [(700, 0, 0), (0, 700, 0), (0, 0, 700), (700, 0, 700), (0, 700, 700),
+               (700, 700, 0), (600, 600, 600), (200, 0, 0), (0, 200, 0), (0, 0, 200)]
+    res = run_measure_loop(patches=patches, transfer=t, measure=freezes_after_two,
+                           config=MeasureLoopConfig(neutral_interval=0),
+                           ndjson_path=tmp_path / "m.ndjson")
+    assert res.digest["present_stall"] is True
+    assert "present_stall" in res.digest["anomaly_reasons"]
+    assert res.needs_adjudication is True
+    assert "PRESENT-STALL" in (res.question or "")
+    # halted at the stall: the frozen frame was read only a handful of times, not the whole tail
+    assert res.patch_count < len(patches)
+    assert reads["n"] <= MeasureLoopConfig().stall_reads + 2
+
+
+def test_present_stall_disabled_at_zero_reads():
+    t = Transfer.pq(bit_depth=10)
+    loop = _solo_loop(_stuck_read, t, MeasureLoopConfig(stall_reads=0))
+    for i, cv in enumerate([(178, 0, 178), (0, 178, 178), (178, 178, 0), (713, 0, 0)]):
+        loop.measure_patch(_patch(f"p{i}", cv, t, i), phase="main")
+    assert loop.present_stall is False
+
+
+# ---------------------------------------------------------------------------
+# gamut/correction-aware plausibility envelope (2026-09-02 C6 run, item #3)
+# ---------------------------------------------------------------------------
+
+# The LG C6 42 WOLED's measured facts (mhc_params of the 2026-09-02 run): per-channel full-drive
+# peaks R 69.3 / G 236.0 / B 18.6 nits (additive 324), REAL white 603.75 (WRGB non-additive),
+# HDR MHC Peak-Chroma cap 178.3 nits, warm mid-grey reference ~69.5 nits.
+_C6_PEAKS = (69.308346, 235.958932, 18.590022)
+_C6_WHITE = 603.75
+_C6_CAP = 178.3425
+_C6_REF = (63.9, 69.4546, 76.0)
+
+
+def _c6_loop(cfg: MeasureLoopConfig | None = None, *, cap: float | None = _C6_CAP) -> _Loop:
+    t = Transfer.pq(bit_depth=10)
+    loop = _solo_loop(_ScriptedPanel([(50.0, 50.0, 55.0)]), t, cfg or MeasureLoopConfig(),
+                      channel_peak_y=_C6_PEAKS, white_peak_y=_C6_WHITE,
+                      correction_max_nits=cap)
+    loop.reference_xyz = _C6_REF
+    return loop
+
+
+def test_channel_envelope_passes_the_real_dim_full_blue():
+    # The 7 false lit_drive_low anomalies of the real run: full-drive blue (0,0,713) measured
+    # ~8.1 nits with "expected 603.75" (the panel-white container). Against the MEASURED blue
+    # peak (18.6) that read is plausible — no anomaly.
+    t = Transfer.pq(bit_depth=10)
+    blue = _patch("p0072", (0, 0, 713), t, 0)
+    for cap in (_C6_CAP, None):     # with the installed-MHC cap and bare-panel alike
+        loop = _c6_loop(cap=cap)
+        for measured_y in (8.14, 18.0):
+            xyz = (1.9, measured_y, 41.0)
+            assert loop._read_plausibility_anomaly(blue, xyz, phase="main", read_index=0) is None
+
+
+def test_channel_envelope_still_flags_a_genuinely_dark_red():
+    # Red peaks at 69.3 nits on this panel — a full-drive red reading 5 nits is NOT explained
+    # by the gamut (nor by the 178-nit cap) and must still flag.
+    t = Transfer.pq(bit_depth=10)
+    red = _patch("r0", (713, 0, 0), t, 0)
+    loop = _c6_loop()
+    anomaly = loop._read_plausibility_anomaly(red, (9.0, 5.0, 1.0), phase="main", read_index=0)
+    assert anomaly is not None and anomaly["reason"] == "lit_drive_low_luminance"
+    assert anomaly["envelope"] == "channel_peaks"
+    # …while a plausibly-attenuated red (post-MHC) passes the wide band.
+    assert loop._read_plausibility_anomaly(red, (80.0, 45.0, 5.0), phase="main", read_index=0) is None
+
+
+def test_channel_envelope_allows_wrgb_white_headroom_on_near_neutrals():
+    # WRGB non-additivity: the additive RGB sum is 324 nits but the REAL white is 603.75 (the W
+    # subpixel). A near-neutral full-drive patch reading ~604 must be INSIDE the envelope —
+    # the upper bound derives from the measured white, not the additive sum.
+    t = Transfer.pq(bit_depth=10)
+    loop = _c6_loop(cap=None)          # bare panel (raw role — no correction installed)
+    white = _patch("w0", (1023, 1023, 1023), t, 0)
+    expected, envelope = loop._plausible_expected_nits(white)
+    assert envelope == "channel_peaks"
+    assert abs(expected - _C6_WHITE) < 1.0
+    assert loop._read_plausibility_anomaly(
+        white, (571.0, 603.75, 657.0), phase="main", read_index=0) is None
+
+
+def test_channel_envelope_respects_the_correction_cap_on_neutrals():
+    # With the Peak-Chroma-capped MHC installed, commanded neutrals above the cap legitimately
+    # read at/near the cap (the real run's ~127-nit clamped greys) — inside the envelope.
+    t = Transfer.pq(bit_depth=10)
+    loop = _c6_loop()
+    grey = _patch("g0", (769, 769, 769), t, 0)     # commanded ~604-nit neutral
+    expected, _ = loop._plausible_expected_nits(grey)
+    assert expected <= _C6_CAP + 1e-6
+    assert loop._read_plausibility_anomaly(
+        grey, (119.0, 127.0, 139.0), phase="main", read_index=0) is None
+
+
+def test_channel_envelope_still_catches_the_stuck_bright_frame():
+    # The envelope relaxation must NOT eat the true stall signal: a dim commanded magenta
+    # reading the frozen ~402-nit white still violates the upper bound.
+    t = Transfer.pq(bit_depth=10)
+    loop = _c6_loop()
+    magenta = _patch("p0222", (178, 0, 178), t, 0)
+    anomaly = loop._read_plausibility_anomaly(magenta, _STUCK_XYZ, phase="main", read_index=0)
+    assert anomaly is not None and anomaly["reason"] == "low_drive_high_luminance"
+
+
+def test_container_fallback_without_channel_peaks_is_unchanged():
+    # No measured channel peaks (fresh display, first raw pass) ⇒ the previous container
+    # behaviour — which DOES false-flag the dim blue (the documented reason the context exists).
+    t = Transfer.pq(bit_depth=10)
+    loop = _solo_loop(_ScriptedPanel([(50.0, 50.0, 55.0)]), t, MeasureLoopConfig())
+    loop.reference_xyz = _C6_REF
+    blue = _patch("p0072", (0, 0, 713), t, 0)
+    anomaly = loop._read_plausibility_anomaly(blue, (1.9, 8.14, 41.0), phase="main", read_index=0)
+    assert anomaly is not None and anomaly["reason"] == "lit_drive_low_luminance"
+    assert anomaly["envelope"] == "container"
+
+
+# ---------------------------------------------------------------------------
+# read-anomaly repeatability → escalation-recommendation evidence (item #4)
+# ---------------------------------------------------------------------------
+
+def _blue_anomaly(label: str, nits: float, reason: str = "lit_drive_low_luminance") -> dict:
+    return {"reason": reason, "label": label, "rgb": [0, 0, 713], "measured_nits": nits}
+
+
+def test_repeatable_anomalies_classify_stable():
+    from dlc.measure_loop import _read_anomaly_repeatability
+    # The real event: 7 flagged reads of the same commanded blue, spread ~1.4% — stable.
+    anomalies = [_blue_anomaly(f"p{i}", y) for i, y in enumerate(
+        (8.1439, 8.1369, 8.1365, 8.0295, 8.1361, 8.1257, 8.1258))]
+    rep = _read_anomaly_repeatability(anomalies, {}, MeasureLoopConfig())
+    assert rep is not None
+    assert rep["classification"] == "stable"
+    assert rep["all_low_luminance"] is True
+    assert rep["groups"][0]["flagged_reads"] == 7
+    assert rep["groups"][0]["rel_spread"] < 0.02
+
+
+def test_divergent_anomalies_classify_noisy():
+    from dlc.measure_loop import _read_anomaly_repeatability
+    anomalies = [_blue_anomaly("p0", 8.14), _blue_anomaly("p1", 3.2), _blue_anomaly("p2", 14.8)]
+    rep = _read_anomaly_repeatability(anomalies, {}, MeasureLoopConfig())
+    assert rep["classification"] == "noisy"
+
+
+def test_singleton_anomaly_without_spread_is_unknown_and_stall_is_excluded():
+    from dlc.measure_loop import _read_anomaly_repeatability
+    rep = _read_anomaly_repeatability([_blue_anomaly("p0", 8.14)], {}, MeasureLoopConfig())
+    assert rep["classification"] == "unknown"
+    # Run-stopper reasons never contribute (a stuck frame is perfectly "repeatable").
+    stall = {"reason": "present_stall", "label": "p1", "rgb": [178, 0, 178],
+             "measured_nits": 402.19}
+    assert _read_anomaly_repeatability([stall], {}, MeasureLoopConfig()) is None
+
+
+def test_high_luminance_anomalies_never_argue_all_low():
+    from dlc.measure_loop import _read_anomaly_repeatability
+    anomalies = [_blue_anomaly("p0", 402.19, reason="low_drive_high_luminance"),
+                 _blue_anomaly("p1", 402.0, reason="low_drive_high_luminance")]
+    rep = _read_anomaly_repeatability(anomalies, {}, MeasureLoopConfig())
+    assert rep["classification"] == "stable"        # evidence is honest…
+    assert rep["all_low_luminance"] is False        # …but can never argue "accept" downstream
 
 
 # ---------------------------------------------------------------------------

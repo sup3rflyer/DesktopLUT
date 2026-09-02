@@ -88,8 +88,11 @@ _P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
 
 def _gray_sample(sig, shares):
     """A gray patch (rgb=(sig,sig,sig)) whose measured XYZ decomposes to the given linear
-    RGB shares (each 0..1 of peak) under the builder's primaries matrix."""
-    xyz = matvec(_P, [s * _PEAK for s in shares])
+    RGB shares (each 0..1 of peak) under the builder's primaries matrix. _P already scales
+    (1,1,1)→white at _PEAK, so the shares ARE the fractions — xyz is then physical nits
+    (Y up to _PEAK), matching the peak_luminance the builder is called with (a prior fixture
+    double-scaled by _PEAK, giving non-physical 1e6-nit whites that masked ceiling-scale bugs)."""
+    xyz = matvec(_P, list(shares))
     return Ti3Sample(rgb=(sig, sig, sig), xyz=(xyz[0], xyz[1], xyz[2]))
 
 
@@ -930,3 +933,120 @@ def test_refine_sdr_cube_end_to_end_converges_through_nonidentity_matrix():
     for s in sigs:
         x, y = _xy(render(cube, s))
         assert abs(x - 0.3127) < 0.002 and abs(y - 0.3290) < 0.002, (s, x, y)
+
+
+# --- WRGB neutral-law fix: resolve_cube_peak + full_drive_neutral_max ---------
+# (LG C6 2026-09-02: the additive Peak-Chroma cap crushed a 604-nit WRGB panel to ~127 nits.
+#  These pin the additivity gate that switches the cap off for WRGB while leaving FALD unchanged.)
+
+def test_resolve_cube_peak_wrgb_uncaps():
+    # C6: additive white 324, real white ~604 (nonadd ~1.86), blue-limited cap 178, ceiling 604.
+    cube_peak, policy, wrgb = mc.resolve_cube_peak(178.3, 604.0, 1.86)
+    assert wrgb is True
+    assert cube_peak == 604.0            # runs to the ceiling, NOT the 178-nit blue floor
+    assert policy == "wrgb-nonadditive-uncapped"
+
+
+def test_resolve_cube_peak_additive_fald_keeps_cap():
+    # FALD (PA32UCXR-class): cap 1704 vs additive ~1734, nonadd ~1.06 — exact-D65 cap unchanged.
+    cube_peak, policy, wrgb = mc.resolve_cube_peak(1704.0, 1835.0, 1.06)
+    assert wrgb is False
+    assert cube_peak == 1704.0
+    assert policy == "additive-d65-cap"
+
+
+def test_resolve_cube_peak_ceiling_below_cap():
+    # When the resolved ceiling is already below the cap, the ceiling binds regardless of gate.
+    cube_peak, policy, wrgb = mc.resolve_cube_peak(1704.0, 900.0, 1.06)
+    assert cube_peak == 900.0 and policy == "ceiling-within-cap"
+
+
+def test_resolve_cube_peak_threshold_boundary():
+    # Just under threshold ⇒ additive (capped); just over ⇒ WRGB (uncapped).
+    assert mc.resolve_cube_peak(200.0, 600.0, 1.19)[2] is False
+    assert mc.resolve_cube_peak(200.0, 600.0, 1.21)[2] is True
+
+
+def test_resolve_cube_peak_none_nonadditivity_defaults_additive():
+    # No grounded full-drive read (nonadd None) ⇒ do NOT assume WRGB (keep the cap).
+    cube_peak, _policy, wrgb = mc.resolve_cube_peak(200.0, 600.0, None)
+    assert wrgb is False and cube_peak == 200.0
+
+
+def test_full_drive_neutral_max_picks_full_drive_white():
+    samples = [
+        Ti3Sample(rgb=(0.5, 0.5, 0.5), xyz=(90.0, 100.0, 110.0)),   # mid grey — ignored
+        Ti3Sample(rgb=(1.0, 1.0, 1.0), xyz=(540.0, 575.0, 600.0)),  # full drive
+        Ti3Sample(rgb=(0.997, 0.997, 0.997), xyz=(500.0, 560.0, 590.0)),  # ~full drive (>=0.995)
+        Ti3Sample(rgb=(1.0, 0.0, 0.0), xyz=(69.0, 35.0, 1.0)),      # pure red — not neutral
+    ]
+    assert mc.full_drive_neutral_max(samples) == 575.0
+
+
+def test_full_drive_neutral_max_none_when_bounded():
+    # A peak-code-bounded ramp (no full-drive neutral) ⇒ None, so callers don't re-resolve
+    # the peak from a sub-full-drive read.
+    samples = [Ti3Sample(rgb=(0.7, 0.7, 0.7), xyz=(400.0, 477.0, 520.0))]
+    assert mc.full_drive_neutral_max(samples) is None
+
+
+# --- Adversarial-review follow-ups (2026-09-02): drive-matched gate + peak_share@ceiling ------
+
+def test_drive_matched_nonadditivity_isolates_w_subpixel():
+    # Grey vs additive RGB at the SAME (colour-top) drive. Colour ramps top at signal 0.7; the
+    # grey at 0.7 reads 480 while R+G+B peaks (at 0.7) sum to 320 → ~1.5 (a WRGB W boost). The
+    # extra full-drive grey at signal 1.0 (990 nits) must NOT enter the ratio (that would fold in
+    # near-peak roll-off, defect #1).
+    cpx = [[60.0, 70.0, 1.0], [90.0, 235.0, 20.0], [35.0, 15.0, 180.0]]  # sum Y = 320
+    samples = [
+        Ti3Sample(rgb=(0.7, 0.7, 0.7), xyz=(455.0, 480.0, 500.0)),   # grey at colour top
+        Ti3Sample(rgb=(1.0, 1.0, 1.0), xyz=(940.0, 990.0, 1030.0)),  # full-drive headroom grey
+        Ti3Sample(rgb=(0.7, 0.0, 0.0), xyz=(60.0, 70.0, 1.0)),        # primaries define colour top
+        Ti3Sample(rgb=(0.0, 0.7, 0.0), xyz=(90.0, 235.0, 20.0)),
+        Ti3Sample(rgb=(0.0, 0.0, 0.7), xyz=(35.0, 15.0, 180.0)),
+    ]
+    r = mc.drive_matched_nonadditivity(samples, cpx)
+    assert abs(r - 480.0 / 320.0) < 1e-6      # 1.5, from the drive-MATCHED grey, not full drive
+
+
+def test_drive_matched_nonadditivity_additive_panel_near_one():
+    # An RGB-additive panel: grey ≈ sum of primaries at the same drive ⇒ ratio ~1 (below the gate).
+    cpx = [[100.0, 100.0, 0.0], [0.0, 300.0, 0.0], [0.0, 0.0, 100.0]]   # sum Y = 400
+    samples = [
+        Ti3Sample(rgb=(0.8, 0.8, 0.8), xyz=(380.0, 405.0, 410.0)),     # ~sum, slight sub-additivity
+        Ti3Sample(rgb=(0.8, 0.0, 0.0), xyz=(100.0, 100.0, 0.0)),
+        Ti3Sample(rgb=(0.0, 0.8, 0.0), xyz=(0.0, 300.0, 0.0)),
+        Ti3Sample(rgb=(0.0, 0.0, 0.8), xyz=(0.0, 0.0, 100.0)),
+    ]
+    r = mc.drive_matched_nonadditivity(samples, cpx)
+    assert r is not None and r < 1.2          # additive ⇒ stays capped
+
+
+def test_drive_matched_nonadditivity_none_without_matched_grey():
+    # No grey at/below the colour top ⇒ None (caller keeps the conservative additive policy).
+    cpx = [[60.0, 70.0, 1.0], [90.0, 235.0, 20.0], [35.0, 15.0, 180.0]]
+    samples = [Ti3Sample(rgb=(0.7, 0.0, 0.0), xyz=(60.0, 70.0, 1.0)),
+               Ti3Sample(rgb=(1.0, 1.0, 1.0), xyz=(940.0, 990.0, 1030.0))]  # grey only ABOVE top
+    assert mc.drive_matched_nonadditivity(samples, cpx) is None
+
+
+def test_peak_share_at_ceiling_ignores_above_ceiling_samples():
+    grey_y = [100.0, 300.0, 500.0, 600.0]     # last two are headroom, above a 400-nit ceiling
+    share = [0.2, 0.6, 1.0, 1.2]
+    # At ceiling 400 (between 300 and 500), interpolate: 0.6 + (1.0-0.6)*(100/200) = 0.8
+    assert abs(mc._peak_share_at_ceiling(grey_y, share, 400.0) - 0.8) < 1e-9
+    # Ceiling at/above the brightest sample ⇒ top share; at/below dimmest ⇒ first.
+    assert mc._peak_share_at_ceiling(grey_y, share, 700.0) == 1.2
+    assert mc._peak_share_at_ceiling(grey_y, share, 50.0) == 0.2
+
+
+def test_build_hdr_cube_peak_share_unity_when_ceiling_below_full_drive():
+    # #3 regression: with headroom grey ABOVE the ceiling, peak_share must stay ~1 (not inflate to
+    # the brightest sample's share). Build a perfect ramp to 1000 nits, then append a full-drive
+    # 1400-nit grey, and cap the cube at 1000 — peak_share must be ~1.0, not ~1.4.
+    ramp = _perfect_gray_ramp(40)
+    smax = mc.pq_oetf(1400.0 / 10000.0)
+    ramp.append(_gray_sample(smax, (1400.0 / _PEAK, 1400.0 / _PEAK, 1400.0 / _PEAK)))
+    _curves, summary = mc.build_hdr_cube(ramp, _PRIM, _WHITE, _PEAK, lut_size=256)  # ceiling = 1000
+    for ch in "rgb":
+        assert abs(summary[f"{ch}_peak_share"] - 1.0) < 0.05, summary

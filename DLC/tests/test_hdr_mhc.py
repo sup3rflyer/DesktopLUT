@@ -295,15 +295,19 @@ def test_sdr_build_mhc_stable_dark_drift_is_corrected_not_smoothed(tmp_path):
     assert held_dev < corrected_dev / 3, (held_dev, corrected_dev)   # σ-less stays held ~identity
 
 
-def test_hdr_build_mhc_reports_peak_chroma_nonadditivity_diagnostics(tmp_path):
-    # P16: the Peak-Chroma cap is nominal-additive; the build now reports the measured full-white
-    # non-additivity factor + the first-order corrected cap estimate as DIAGNOSTICS (the cap itself
-    # stays the documented seed — the closed-loop refine lands the real achievable D65).
+def test_hdr_build_mhc_reports_wrgb_gate_diagnostics(tmp_path):
+    # The WRGB gate (2026-09-02): the build reports the DRIVE-MATCHED non-additivity (grey vs
+    # additive RGB at the same drive), the chosen cap policy, and whether the ceiling is full-drive
+    # grounded. A perfectly-additive synthetic panel must read ~1.0 and stay on the additive cap
+    # (NOT be misclassified WRGB) — the FALD regression guard.
     ctx = create_run("HDR", display="test", run_dir=tmp_path / "run")
     ti3 = _write_hdr_raw_ti3(tmp_path / "raw_hdr.ti3")
     build_mhc.build(_ns(ctx, mode="HDR", is_hdr=True, source_ti3=str(ti3)), ctx)
     pc = _common.load_dlc_state(ctx)["mhc_params"]["peak_chroma"]
-    assert pc["measured_peak_nonadditivity"] is not None
-    # the synthetic panel is perfectly additive -> factor ~1, estimate ~= the additive cap
-    assert abs(pc["measured_peak_nonadditivity"] - 1.0) < 0.02
-    assert pc["cap_nits_nonadditive_est"] <= pc["cap_nits"] + 1e-6
+    assert pc["drive_matched_nonadditivity"] is not None
+    assert abs(pc["drive_matched_nonadditivity"] - 1.0) < 0.05    # additive ⇒ ~1
+    assert pc["wrgb_nonadditive"] is False                        # NOT misclassified WRGB
+    assert pc["cap_policy"] in ("additive-d65-cap", "ceiling-within-cap")
+    # The synthetic ramp reaches full drive (grey at cv max), so the ceiling is grounded.
+    assert pc["full_drive_grounded"] is True
+    assert pc["full_drive_white_nits"] is not None

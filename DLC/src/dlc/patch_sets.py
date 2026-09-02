@@ -164,7 +164,8 @@ class PatchSizes:
 def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
                    warm_tau: Optional[int] = None,
                    max_cv: Optional[int] = None,
-                   hue_sat_caps: Optional[dict] = None) -> list[tuple[int, int, int]]:
+                   hue_sat_caps: Optional[dict] = None,
+                   extend_to_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The MHC FOUNDATION ramp: a dense grey ramp + R/G/B (the matrix+1D fit's inputs); C/M/Y
     only if ``raw_include_secondaries`` (off by default — the volumetric set covers them).
 
@@ -177,6 +178,13 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
     ``max_cv`` caps the top of the generated range (HDR: the target peak's code value, so no
     patch exceeds the reachable sub-peak range); ``None`` ⇒ the full bit-depth range (SDR).
 
+    ``extend_to_cv`` (RAW characterization only): a few sparse GREY levels ABOVE ``max_cv`` up
+    to full drive (``engine.patches.headroom_levels``) so the build measures through the panel's
+    native near-peak neutral roll-off (the drive range the cube must map into). Grey-only —
+    full-drive primaries read below the white-referenced plausibility envelope; the bounded
+    colour ramps still characterise them. The near-neutral tube stays bounded at ``max_cv``
+    (off-axis non-additivity data matters below the peak, not in the clip region).
+
     When ``icc_tube_levels`` > 1 the foundation also carries a near-neutral TUBE (off-axis samples
     around the grey axis) so the matrix + per-channel-1D white-balance correction has the off-axis
     non-additivity data the grey diagonal alone can't provide. The tube is merged into the ramp set
@@ -186,7 +194,7 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
                         low_light_steps=ps.low_light_steps,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
-                        hue_sat_caps=hue_sat_caps,
+                        hue_sat_caps=hue_sat_caps, extend_to_cv=extend_to_cv,
                         order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
     if not ps.icc_tube_levels or ps.icc_tube_levels <= 1:
         return ramp
@@ -523,18 +531,25 @@ _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
 
 
 def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
-                      max_cv: Optional[int] = None) -> dict[str, Any]:
+                      max_cv: Optional[int] = None,
+                      raw_extend_to_cv: Optional[int] = None) -> dict[str, Any]:
     """Per-stage patch counts for ``flow`` from a PatchSizes + Transfer — the run's size, so
     the agent/user can judge time/cost up front. Cheap (pure-stdlib generation); each distinct
     builder is generated once. ``max_cv`` caps the range (HDR peak), so the previewed counts
-    match what the run actually measures."""
+    match what the run actually measures; ``raw_extend_to_cv`` mirrors the raw stage's
+    full-drive headroom extension so the preview counts that stage exactly."""
     roles = _FLOW_PATCH_STAGES.get(flow, ())
     cache: dict[Any, int] = {}
     stages: dict[str, int] = {}
     for role in roles:
         fn = _PATCH_BUILDERS[role]
-        if fn not in cache:
-            cache[fn] = len(fn(ps, transfer, max_cv=max_cv))
-        stages[role] = cache[fn]
+        extend = raw_extend_to_cv if role == "raw" else None
+        key = (fn, extend)
+        if key not in cache:
+            kwargs: dict[str, Any] = {"max_cv": max_cv}
+            if extend is not None:
+                kwargs["extend_to_cv"] = extend
+            cache[key] = len(fn(ps, transfer, **kwargs))
+        stages[role] = cache[key]
     return {"stages": stages, "total_patches": sum(stages.values()),
             "volumetric_mode": ps.volumetric_mode, "order": ps.order}

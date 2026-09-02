@@ -246,6 +246,49 @@ def peak_chroma_luminance(channel_peak_xyz: Sequence[Sequence[float]],
 _CHANNELS = ("r", "g", "b")
 
 
+def full_drive_neutral_max(samples: Sequence[Ti3Sample], *,
+                           min_signal: float = 0.995, eps: float = 1e-4) -> Optional[float]:
+    """Max measured luminance (Y, nits) among FULL-DRIVE neutral samples (r≈g≈b ≥ ``min_signal``).
+
+    The grounded in-run peak: what the panel ACTUALLY renders at full drive in this run's
+    thermal state. ``None`` when the set has no full-drive neutral read (e.g. a peak-code-bounded
+    ramp without the headroom extension) — callers must not re-resolve from a sub-full-drive read."""
+    best: Optional[float] = None
+    for s in samples:
+        r, g, b = s.rgb
+        if r < min_signal or abs(r - g) > eps or abs(g - b) > eps:
+            continue
+        y = float(s.xyz[1])
+        if best is None or y > best:
+            best = y
+    return best
+
+
+def resolve_cube_peak(cap_nits: float, native_ceiling: float, nonadd: Optional[float],
+                      *, wrgb_threshold: float = 1.2) -> tuple[float, str, bool]:
+    """Decide the HDR cube's neutral-axis ceiling from the Peak-Chroma cap vs panel additivity.
+
+    Returns ``(cube_peak, cap_policy, wrgb_nonadditive)``. ``nonadd`` = measured full-drive
+    white Y / additive per-channel sum — the W-subpixel signature. On an (approximately)
+    additive panel (FALD: PA32UCXR 1835/1734 ≈ 1.06) the additive share model is valid, and
+    Option 1 holds exact D65 by capping the neutral at ``cap_nits`` (the two are near-tied
+    there). On a WRGB panel (LG C6 2026-09-02: 1.47–1.86) white luminance is dominated by the
+    W subpixel the RGB-additive model cannot see: the "cap" is a fiction that crushed a 604-nit
+    panel to ~127 nits (verify white 118 dE_ITP, run reverted). Above ``wrgb_threshold`` the
+    cap becomes DIAGNOSTIC-ONLY: the neutral runs to ``native_ceiling`` and the closed-loop
+    refine's share-ratio law produces the correct behaviour emergently — exact D65 where the
+    per-channel drives can realise it, and above that knee the unreachable channel saturates
+    while the others trim, drifting gracefully toward native white (which on the C6 is only
+    dxy ≈ 0.010 off D65). Saturated-COLOUR relax above the cap stays in DesktopLUT's tonemap
+    ([[hdr-rolloff-division-of-labour]]), not here."""
+    wrgb = nonadd is not None and nonadd > wrgb_threshold
+    if not (0.0 < cap_nits < native_ceiling):
+        return native_ceiling, "ceiling-within-cap", wrgb
+    if wrgb:
+        return native_ceiling, "wrgb-nonadditive-uncapped", True
+    return cap_nits, "additive-d65-cap", False
+
+
 def noise_trust(error: float, noise: Optional[float], *,
                 lo_snr: float = 1.0, hi_snr: float = 3.0) -> float:
     """How much to trust a measured correction of magnitude ``error`` against the per-reading
@@ -340,30 +383,94 @@ def invert_monotone(xs: Sequence[float], ys: Sequence[float], target: float) -> 
     return xs[-1]
 
 
+def _peak_share_at_ceiling(grey_y: Sequence[float], share: Sequence[float],
+                           ceiling_nits: float) -> float:
+    """The channel share at the neutral CEILING (``ceiling_nits``), interpolated against measured
+    grey luminance — the normalization reference for the tone curve. Above the brightest measured
+    grey it holds the top share flat (the extension already measured to full drive); below the
+    dimmest it holds the first. Immune to headroom samples above the ceiling."""
+    if not grey_y:
+        return share[-1] if share else 1.0
+    if ceiling_nits >= grey_y[-1]:
+        return share[-1]
+    if ceiling_nits <= grey_y[0]:
+        return share[0]
+    for k in range(1, len(grey_y)):
+        if grey_y[k] >= ceiling_nits:
+            y0, y1, s0, s1 = grey_y[k - 1], grey_y[k], share[k - 1], share[k]
+            t = (ceiling_nits - y0) / (y1 - y0) if y1 > y0 else 0.0
+            return s0 + (s1 - s0) * t
+    return share[-1]
+
+
+def drive_matched_nonadditivity(samples: Sequence[Ti3Sample],
+                                channel_peak_xyz: Sequence[Sequence[float]],
+                                *, eps: float = 1e-4) -> Optional[float]:
+    """Measured neutral-vs-additive-RGB ratio at ONE shared drive level — the W-subpixel signature,
+    isolated from near-peak EOTF roll-off.
+
+    ``resolve_cube_peak``'s gate needs "is the neutral brighter than the sum of the primaries?"
+    Comparing a FULL-drive white (raw ramp's headroom extension) against per-channel peaks measured
+    at the bounded colour-ramp top mixes TWO effects — the W boost AND the neutral's near-peak lift
+    between the colour cap and full drive — inflating the ratio on an additive panel and narrowing
+    the FALD safety margin (adversarial review 2026-09-02, defect #1). This compares grey and
+    primaries at the SAME drive: the brightest grey AT-OR-BELOW the colour ramp's top signal (where
+    the per-channel peaks were read) over the additive per-channel sum. On an RGB-additive panel
+    that ratio is ~1 (+ small sub-additivity); a WRGB panel's W subpixel pushes it well above 1
+    regardless of the peak cap. ``None`` when there is no grey at/below the colour top or the
+    additive sum is degenerate — the caller then keeps the conservative (additive) policy."""
+    native_peak = sum(channel_peak_xyz[c][1] for c in range(3))
+    if native_peak <= 0.0:
+        return None
+    colour_top = 0.0
+    for s in samples:
+        rgb = s.rgb
+        if not (abs(rgb[0] - rgb[1]) < eps and abs(rgb[1] - rgb[2]) < eps):
+            colour_top = max(colour_top, max(rgb))       # brightest on-channel drive among colours
+    if colour_top <= 0.0:
+        return None
+    grey_y_at_top: Optional[float] = None
+    best_sig = -1.0
+    for s in samples:
+        rgb = s.rgb
+        if abs(rgb[0] - rgb[1]) < eps and abs(rgb[1] - rgb[2]) < eps and rgb[0] <= colour_top + eps:
+            if rgb[0] > best_sig:
+                best_sig, grey_y_at_top = rgb[0], float(s.xyz[1])
+    if grey_y_at_top is None:
+        return None
+    return grey_y_at_top / native_peak
+
+
 def _gray_shares(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
                  white_xy: tuple[float, float], peak_luminance: float,
-                 *, eps: float = 1e-4) -> tuple[list[float], dict[str, list[float]]]:
+                 *, eps: float = 1e-4) -> tuple[list[float], dict[str, list[float]], list[float]]:
     """Per-channel LINEAR shares along the measured gray ramp, via the primaries matrix.
 
     ``share_c(s) = (P^-1 · M(s))_c`` where ``P`` reproduces the native white at ``peak_luminance``
     for RGB=(1,1,1). Because the gray patches are measured with all channels lit, non-additivity
-    is already in the data. Returns ``(signals, {"r":[...], "g":[...], "b":[...]})`` sorted by
-    signal, each channel monotone-enforced (so it inverts cleanly). The shares are ~equal where
-    the panel tracks native white and diverge where it drifts."""
+    is already in the data. Returns ``(signals, {"r":[...], "g":[...], "b":[...]}, grey_Y)`` sorted
+    by signal, each channel monotone-enforced (so it inverts cleanly). The shares are ~equal where
+    the panel tracks native white and diverge where it drifts. ``grey_Y`` is the measured grey
+    luminance (nits) per signal, so the caller can locate the share AT the cube ceiling — not at the
+    brightest measured sample, which the full-drive headroom extension pushes ABOVE the ceiling on a
+    peak-bounded run (else ``peak_share`` inflates and the whole tone curve over-drives)."""
     P = rgb_to_xyz_matrix(
         primaries["rx"], primaries["ry"], primaries["gx"], primaries["gy"],
         primaries["bx"], primaries["by"], white_xy[0], white_xy[1], white_Y=peak_luminance,
     )
     Pinv = invert3x3(P)
     pts: dict[float, tuple[float, float, float]] = {}
+    ys: dict[float, float] = {}
     for s in samples:
         rgb = s.rgb
         if abs(rgb[0] - rgb[1]) < eps and abs(rgb[1] - rgb[2]) < eps:
             # Last write wins on a duplicate level (gray reads are unique per level in every
             # production set; a re-measured patch overwrites its .ti3 row upstream).
             pts[rgb[0]] = matvec(Pinv, s.xyz)
+            ys[rgb[0]] = float(s.xyz[1])
     sigs = sorted(pts)
     shares: dict[str, list[float]] = {"r": [], "g": [], "b": []}
+    grey_y = [ys[sig] for sig in sigs]
     prev = {"r": 0.0, "g": 0.0, "b": 0.0}
     for sig in sigs:
         v = pts[sig]
@@ -371,7 +478,7 @@ def _gray_shares(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
             x = max(prev[ch], v[ci])      # enforce monotone non-decreasing for a clean inverse
             shares[ch].append(x)
             prev[ch] = x
-    return sigs, shares
+    return sigs, shares, grey_y
 
 
 def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
@@ -403,11 +510,16 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     measurement-driven dark logic; the ``dark_floor_nits`` ramp remains as a luminance guard/fallback."""
     if peak_luminance <= 0.0:
         raise ValueError("peak_luminance must be positive")
-    sigs, shares = _gray_shares(samples, primaries, white_xy, peak_luminance)
+    sigs, shares, grey_y = _gray_shares(samples, primaries, white_xy, peak_luminance)
     if len(sigs) < 2:
         raise ValueError("fewer than 2 neutral patches; cannot build a gray-ramp cube")
-    # Peak linear share per channel (≈1.0 each by construction of P at the native white).
-    peak_share = {ch: shares[ch][-1] for ch in _CHANNELS}
+    # Peak linear share per channel = the share at the CUBE CEILING (peak_luminance), ≈1.0 by
+    # construction of P at the native white. NOT shares[-1]: the RAW full-drive headroom extension
+    # adds grey samples ABOVE the ceiling on a peak-bounded run, so the brightest sample's share
+    # can exceed 1 and would inflate every target_share (the r/g/b_peak_share=2.68 pathology). The
+    # ceiling share is found by interpolating each channel's share against the measured grey Y.
+    peak_share = {ch: _peak_share_at_ceiling(grey_y, shares[ch], peak_luminance)
+                  for ch in _CHANNELS}
     # Signal below which a level's luminance is under the trustworthy floor (blend to identity).
     dark_sig = pq_oetf(min(dark_floor_nits, peak_luminance) / _PQ_CONTAINER_NITS)
     # Measurement-driven per-level trust (sig→w), interpolated to the grid; 1.0 everywhere when absent.
@@ -469,10 +581,13 @@ def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     sparse. ``dark_floor_nits`` / ``level_trust`` behave exactly as in :func:`build_hdr_cube`."""
     if peak_luminance <= 0.0:
         raise ValueError("peak_luminance must be positive")
-    sigs, shares = _gray_shares(samples, primaries, white_xy, peak_luminance)
+    sigs, shares, grey_y = _gray_shares(samples, primaries, white_xy, peak_luminance)
     if len(sigs) < 2:
         raise ValueError("fewer than 2 neutral patches; cannot build a gray-ramp cube")
-    peak_share = {ch: shares[ch][-1] for ch in _CHANNELS}
+    # Share at the ceiling (not the brightest sample) — see build_hdr_cube. SDR is not headroom-
+    # extended today, so this equals shares[-1] on a normal SDR ramp; robust if that ever changes.
+    peak_share = {ch: _peak_share_at_ceiling(grey_y, shares[ch], peak_luminance)
+                  for ch in _CHANNELS}
     # Signal below which a level's luminance is under the trustworthy floor (blend to identity).
     # SDR transfer is pure power γ, so the floor luminance maps back through the inverse EOTF.
     floor_frac = min(dark_floor_nits, peak_luminance) / peak_luminance

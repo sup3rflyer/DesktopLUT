@@ -89,7 +89,10 @@ def build(args, ctx: RunContext) -> StageResult:
             adaptive_dark_floor,
             build_hdr_cube,
             dark_trust_weights,
+            drive_matched_nonadditivity,
+            full_drive_neutral_max,
             peak_chroma_luminance,
+            resolve_cube_peak,
             write_1d_cube,
         )
 
@@ -138,19 +141,31 @@ def build(args, ctx: RunContext) -> StageResult:
         # bounding → max-sustained); above the cap, neutral chroma-relax/roll-off is DesktopLUT's job
         # (hdr-rolloff-division-of-labour), NOT baked here. The closed-loop refine targets D65 at this
         # same cap, so build + refine agree on the neutral ceiling.
+        #
+        # WRGB GATE (2026-09-02, LG C6 run 1): Option 1 assumes the RGB-ADDITIVE share model is a
+        # fair picture of white — true on the FALD panels it was designed on (cap 1704 vs additive
+        # 1734, near-tied), catastrophically false on a WRGB OLED where the W subpixel carries ~half
+        # of white luminance (measured white 1.47–1.86× the additive sum; the blue-limited "cap" of
+        # 178 nits crushed a 604-nit panel to ~127 → verify white 118 dE_ITP, run REVERTED). The
+        # additivity test + policy decision live in mhc_cube.resolve_cube_peak; above the threshold
+        # the cap is DIAGNOSTIC-ONLY and the neutral runs to the ceiling (the refine's share-ratio
+        # law then holds exact D65 below the achievable knee and drifts gracefully above it).
         cube_peak = native_ceiling
         try:
             cap_nits, binding = peak_chroma_luminance(channel_peak_xyz)
             native_peak = sum(channel_peak_xyz[c][1] for c in range(3))
-            if 0.0 < cap_nits < native_ceiling:
-                cube_peak = cap_nits          # hold D65: cube tops out at the achievable-D65 peak
-            # P16 diagnostics: the cap above is NOMINAL-ADDITIVE (per-channel peaks summed). A
-            # sub-additive FALD panel's real achievable-D65 peak sits a little lower; the measured
-            # full-drive WHITE vs the additive channel sum is the first-order non-additivity factor
-            # (recorded HW: additive ~1734 vs true ~1704, a +1.8% overshoot). Diagnostic only — the
-            # closed-loop refine measures the real panel at the cap and lands the achievable D65;
-            # these fields make the honest number visible at the seams.
-            nonadd = (target_luminance / native_peak) if native_peak > 0 else None
+            # W-subpixel non-additivity gate (WRGB OLED): compare the neutral against the additive
+            # RGB sum at the SAME drive level (drive_matched_nonadditivity) — NOT full-drive-white
+            # over peak-code-primaries, which conflates the W boost with near-peak EOTF roll-off and
+            # narrows the additive-panel margin (adversarial review 2026-09-02 #1). This is robust on
+            # a peak-bounded ti3 too (the gate no longer needs the full-drive extension), so a WRGB
+            # panel measured without the headroom levels still detects correctly instead of silently
+            # re-crushing (#2). full_drive_neutral_max is the explicit grounded-peak witness: None ⇒
+            # the ramp never reached full drive, surfaced so the seam sees an ungrounded ceiling.
+            nonadd = drive_matched_nonadditivity(samples, channel_peak_xyz)
+            full_drive_white = full_drive_neutral_max(samples)
+            cube_peak, cap_policy, wrgb_nonadditive = resolve_cube_peak(
+                cap_nits, native_ceiling, nonadd)
             peak_chroma = {
                 "cap_nits": round(cap_nits, 4),
                 "binding_channel": binding,
@@ -159,11 +174,14 @@ def build(args, ctx: RunContext) -> StageResult:
                 "ceiling_source": ceiling_source,
                 "cube_peak_nits": round(cube_peak, 4),
                 "capped": cube_peak < native_ceiling,
+                "cap_policy": cap_policy,
+                "wrgb_nonadditive": wrgb_nonadditive,
+                "drive_matched_nonadditivity": round(nonadd, 4) if nonadd is not None else None,
+                "full_drive_white_nits": round(full_drive_white, 4)
+                if full_drive_white is not None else None,
+                "full_drive_grounded": full_drive_white is not None,
                 "headroom_loss_pct": round(100.0 * (1.0 - cap_nits / native_peak), 3)
                 if native_peak > 0 else None,
-                "measured_peak_nonadditivity": round(nonadd, 4) if nonadd is not None else None,
-                "cap_nits_nonadditive_est": round(cap_nits * min(nonadd, 1.0), 4)
-                if nonadd is not None else None,
             }
         except ValueError as exc:
             peak_chroma = {"error": str(exc)}

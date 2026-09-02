@@ -252,6 +252,51 @@ class MeasureLoopConfig:
     integrity_frozen_xy_tol: float = 0.003         # …and chromaticity within this xy radius ⇒ stuck frame
     integrity_dark_run: int = 4                     # consecutive LIT patches reading sub-floor ⇒ panel dark
 
+    # Fast present-stall (stuck-frame) detector — RUN-STOPPER (2026-09-02 C6 run, item #2) ----
+    # The TV's auto-power-off froze the presented frame mid-verify; reads kept completing (the
+    # stall clock never trips) and the frozen_presenter window above needs a commanded-LUMINANCE
+    # span it may never see. The specific stuck-frame signal is stronger: consecutive reads that
+    # are IDENTICAL to within meter noise while the commanded COLOURS genuinely differ. Nothing
+    # on a working present path produces that outside near-black — a luminance clamp (peak cap /
+    # ABL) can equalize same-direction commands, but only a stuck frame equalizes XYZ across
+    # different commanded chromaticity directions. Fires ONCE, halts the pass (further reads are
+    # garbage), and surfaces as a run-stopper anomaly the escalation seam adjudicates.
+    #   stall_reads             — flat-streak length before judging (3: two could conceivably be a
+    #                             metameric/clamp coincidence; three across distinct colours cannot)
+    #   stall_distinct_commands — meaningfully-different commanded directions the streak must span
+    #   stall_direction_delta   — per-channel delta (max-normalized signal) that makes two
+    #                             commands "different colours" (0.25 keeps the whole grey ramp +
+    #                             near-neutral tube as ONE direction — clamp-safe)
+    #   tolerance               — reads count as identical within max(stall_floor_de,
+    #                             stall_sigma_factor × DIP per-read σ at that luminance): the
+    #                             meter-noise band, scaled from the MEASURED noise model
+    #   stall_min_nits          — near-black exclusion: below this, distinct colours legitimately
+    #                             read indistinguishably (sub-noise). 0/negative stall_reads disables.
+    stall_reads: int = 3
+    stall_distinct_commands: int = 2
+    stall_direction_delta: float = 0.25
+    stall_sigma_factor: float = 4.0
+    stall_floor_de: float = 0.5
+    stall_min_nits: float = 5.0
+
+    # Channel-aware plausibility envelope (2026-09-02 C6 run, item #3) ----------------------
+    # With measured per-channel peaks (mhc_params.channel_peak_xyz via the orchestrator), the
+    # envelope's expected luminance is an ADDITIVE combination of the commanded drives against
+    # per-channel peak Y — a full-drive blue on a WOLED whose blue peaks at 18.6 nits is
+    # expected near 18.6, never near the 604-nit white peak. The lower plausibility bound then
+    # tightens from the container fraction (2%) to this fraction of the channel-aware expected
+    # (wide band: a plausibility envelope, not a model). Without channel peaks the envelope
+    # falls back to the container behaviour above.
+    plausible_channel_low_fraction: float = 0.25
+
+    # Read-anomaly repeatability (escalation-recommendation evidence, item #4) --------------
+    # Envelope-anomalous reads that REPEAT (same commanded RGB re-read across the pass /
+    # bookends within this relative luminance spread) are stable-but-implausible — real panel
+    # or correction behaviour, not a transient fault. Rides the digest as evidence; the
+    # orchestrator only uses it to pick the seam's RECOMMENDATION (accept vs retry) — the LLM
+    # still judges.
+    anomaly_stable_spread: float = 0.05
+
 
 @dataclass
 class AcceptedRead:
@@ -530,11 +575,28 @@ class _Loop:
         dip: Optional[DisplayInstrumentProfile] = None,
         checkin_interval_s: float = 0.0,
         reference_guard: Optional[Callable[[], ContextManager[None]]] = None,
+        channel_peak_y: Optional[tuple[float, float, float]] = None,
+        white_peak_y: Optional[float] = None,
+        correction_max_nits: Optional[float] = None,
+        correction_channel_scale: Optional[tuple[float, float, float]] = None,
     ) -> None:
         self.transfer = transfer
         self.cfg = config
         self.ndjson = ndjson
         self.events = events
+        # Plausibility-envelope context (all optional; None ⇒ container fallback):
+        #   channel_peak_y          — measured full-drive per-channel Y (R, G, B), cd/m²
+        #   white_peak_y            — measured REAL white peak (WRGB non-additive headroom on
+        #                             near-neutral drives; the W subpixel exceeds the RGB sum)
+        #   correction_max_nits     — an installed correction's luminance cap (e.g. the MHC
+        #                             Peak-Chroma cap): commanded targets above it legitimately
+        #                             read at/near the cap
+        #   correction_channel_scale — per-channel linear transmittance of an installed
+        #                             correction, when known (attenuation shrinks the envelope)
+        self.channel_peak_y = channel_peak_y
+        self.white_peak_y = white_peak_y
+        self.correction_max_nits = correction_max_nits
+        self.correction_channel_scale = correction_channel_scale
         # Optional caller-supplied context manager held around every read that ESTABLISHES
         # or COMPARES AGAINST the warm/drift reference (warm-up settle, re-settle after a
         # drift episode, the interleaved neutral checkpoint). A caller that mutates the
@@ -609,6 +671,10 @@ class _Loop:
         self._integrity_recent: list[tuple[float, tuple[float, float, float]]] = []
         self._integrity_dark_streak = 0
         self._integrity_flagged: set[str] = set()      # each signature surfaced at most once
+        # Present-stall (stuck-frame) state: the running flat streak of bright reads that agree
+        # within meter noise — (commanded direction, xyz, label) — and the run-stopper latch.
+        self._stall_streak: list[tuple[tuple[float, float, float], tuple[float, float, float], str]] = []
+        self.present_stall = False
         # Luminance-jump settle bump state: the last PRESENTED patch (label, expected nits)
         # across every presentation funnel (_read + the drift checkpoint), and how many
         # presentations carried the bump.
@@ -951,6 +1017,51 @@ class _Loop:
         except Exception:
             return 0.0
 
+    def _plausible_expected_nits(self, patch: MeasurePatch) -> tuple[float, str]:
+        """The plausibility envelope's expected luminance for ``patch`` and where it came from
+        (``"channel_peaks"`` | ``"container"``).
+
+        With measured per-channel peaks (item #3, 2026-09-02 C6 run): an ADDITIVE combination of
+        the commanded per-channel drives against per-channel peak Y — the commanded absolute track
+        (``cv_to_nits``) apportioned to each channel by its share of the additive white, capped at
+        that channel's peak. A full-drive blue on a WOLED whose blue peaks at 18.6 nits expects
+        ~18.6, never the 604-nit white peak. On near-neutral drives the W subpixel exceeds the
+        additive RGB sum, so ``white_peak_y`` headroom is allowed in proportion to how fully all
+        three channels are driven (WRGB non-additivity). An installed correction bounds the
+        commanded track (``correction_max_nits`` — targets above the cap read at the cap) and may
+        attenuate channels (``correction_channel_scale``). This is an ENVELOPE, not a model — the
+        caller wraps it in wide tolerance bands. Without channel peaks: the container expectation
+        (max per-channel ``cv_to_nits``), i.e. the previous behaviour."""
+        container = self._expected_patch_nits(patch)
+        peaks = self.channel_peak_y
+        if not peaks or len(peaks) != 3 or min(peaks) <= 0.0:
+            return container, "container"
+        total = sum(peaks)
+        scale = self.correction_channel_scale or (1.0, 1.0, 1.0)
+        cap = self.correction_max_nits
+        contribs: list[float] = []
+        for c in range(3):
+            try:
+                track = self.transfer.cv_to_nits(patch.rgb[c])
+            except Exception:
+                track = 0.0
+            if cap is not None and cap > 0.0:
+                track = min(track, cap)
+            ceiling = peaks[c] * max(0.0, scale[c])
+            contribs.append(min(track * (peaks[c] / total) * max(0.0, scale[c]), ceiling))
+        expected = sum(contribs)
+        # WRGB headroom: only as neutral as the LEAST-driven channel allows (a pure primary gets
+        # none; a fully-driven white gets the whole measured-white surplus over the additive sum).
+        if self.white_peak_y is not None and self.white_peak_y > total:
+            neutralness = 1.0
+            for c in range(3):
+                ceiling = peaks[c] * max(0.0, scale[c])
+                neutralness = min(neutralness, (contribs[c] / ceiling) if ceiling > 0.0 else 0.0)
+            expected += max(0.0, neutralness) * (self.white_peak_y - total)
+        if cap is not None and cap > 0.0:
+            expected = min(expected, cap)     # a capped correction never emits above its cap
+        return min(expected, container), "channel_peaks"
+
     def _read_plausibility_anomaly(
         self,
         patch: MeasurePatch,
@@ -962,9 +1073,24 @@ class _Loop:
         if patch.role != "measurement":
             return None
         measured = float(xyz[1])
-        expected = self._expected_patch_nits(patch)
+        expected, envelope = self._plausible_expected_nits(patch)
         reference = float(self.reference_xyz[1]) if self.reference_xyz else 0.0
         signal_peak = max(patch.signal) if patch.signal else 0.0
+
+        def detail(reason: str, threshold: float) -> dict[str, Any]:
+            return {
+                "reason": reason,
+                "measure_phase": phase,
+                "read_index": read_index,
+                "label": patch.label,
+                "rgb": list(patch.rgb),
+                "signal": [round(s, 6) for s in patch.signal],
+                "expected_nits": round(expected, 4),
+                "envelope": envelope,
+                "measured_nits": round(measured, 4),
+                "reference_nits": round(reference, 4),
+                "threshold_nits": round(threshold, 4),
+            }
 
         low_expected_cut = max(
             self.cfg.plausible_luminance_low_expected_nits,
@@ -981,66 +1107,130 @@ class _Loop:
             or signal_peak <= self.cfg.plausible_luminance_low_signal
         )
         if low_drive and measured >= high_for_low_cut:
-            return {
-                "reason": "low_drive_high_luminance",
-                "measure_phase": phase,
-                "read_index": read_index,
-                "label": patch.label,
-                "rgb": list(patch.rgb),
-                "signal": [round(s, 6) for s in patch.signal],
-                "expected_nits": round(expected, 4),
-                "measured_nits": round(measured, 4),
-                "reference_nits": round(reference, 4),
-                "threshold_nits": round(high_for_low_cut, 4),
-            }
+            return detail("low_drive_high_luminance", high_for_low_cut)
 
         lit_cut = max(
             self.cfg.plausible_luminance_low_expected_nits * 2.0,
             reference * 0.5,
         )
+        # Container expectations wildly overestimate a gamut-limited channel (a full-drive blue
+        # "expects" the panel white), so the container fraction must be tiny (2%). A channel-aware
+        # expectation is honest, so the bound tightens to plausible_channel_low_fraction of it —
+        # a genuinely dark primary is caught while a legitimately dim one (blue on a blue-weak
+        # WOLED) passes: its expectation IS dim.
+        low_fraction = (self.cfg.plausible_channel_low_fraction
+                        if envelope == "channel_peaks" else 0.02)
         low_for_lit_cut = max(
             self.cfg.plausible_luminance_floor_nits,
             reference * self.cfg.plausible_luminance_reference_floor_fraction,
-            expected * 0.02,
+            expected * low_fraction,
         )
         if expected >= lit_cut and measured <= low_for_lit_cut:
-            return {
-                "reason": "lit_drive_low_luminance",
-                "measure_phase": phase,
-                "read_index": read_index,
-                "label": patch.label,
-                "rgb": list(patch.rgb),
-                "signal": [round(s, 6) for s in patch.signal],
-                "expected_nits": round(expected, 4),
-                "measured_nits": round(measured, 4),
-                "reference_nits": round(reference, 4),
-                "threshold_nits": round(low_for_lit_cut, 4),
-            }
+            return detail("lit_drive_low_luminance", low_for_lit_cut)
 
         return None
 
     def _flag_read_plausibility_anomaly(self, anomaly: dict[str, Any]) -> None:
         self.measurement_path_compromised = True
         self.read_anomalies.append(anomaly)
+        if anomaly.get("reason") == "present_stall":
+            message = (
+                "presented frame appears STUCK: consecutive reads across different commanded "
+                "colours returned identical XYZ (TV sleep / screensaver / frozen presenter); "
+                "measurement halted — run-stopper, adjudicate before trusting this run"
+            )
+        else:
+            message = (
+                "meter reading is outside the plausible luminance envelope for the presented patch; "
+                "measurement path requires adjudication"
+            )
         self._emit_event(
             "WARN",
             "read_plausibility_anomaly",
             **anomaly,
-            message=(
-                "meter reading is outside the plausible luminance envelope for the presented patch; "
-                "measurement path requires adjudication"
-            ),
+            message=message,
         )
         if self.runlog is not None:
             self.runlog.anomaly(
                 "measure",
                 kind="read_plausibility_anomaly",
                 **anomaly,
-                message=(
-                    "meter reading is outside the plausible luminance envelope for the presented patch; "
-                    "retry or correct the display/meter path before trusting this run"
-                ),
+                message=message,
             )
+
+    def _check_present_stall(self, patch: MeasurePatch, xyz: tuple[float, float, float]) -> None:
+        """Fast stuck-frame detector — RUN-STOPPER (2026-09-02 C6 auto-power-off, item #2).
+
+        A frozen presented frame keeps producing *valid, repeatable* reads, so the per-read stall
+        clock and the luminance-span frozen_presenter window can both stay quiet (the real event:
+        a stuck ~402-nit white read "successfully" for dim magenta patches, then poisoned the
+        drift checkpoint). The unambiguous signature is a streak of reads IDENTICAL to within
+        meter noise while the commanded colours genuinely differ in chromaticity DIRECTION —
+        a luminance clamp (Peak-Chroma cap / ABL) can equalize same-direction commands, but only
+        a stuck frame equalizes XYZ across different commanded directions. Near-black is excluded
+        (distinct colours legitimately read indistinguishably there). Fires at most once, latches
+        ``present_stall`` (the pass halts — further reads are garbage) and flags a run-stopper
+        anomaly for the escalation seam. Fed by every accepted measurement read AND the
+        drift-checkpoint reference read (which in the real event was the third stuck read)."""
+        cfg = self.cfg
+        if cfg.stall_reads <= 0 or self.present_stall:
+            return
+        mx = max(patch.signal) if patch.signal else 0.0
+        if mx <= 0.0:
+            return   # a commanded black has no chromaticity direction — the low_drive_high
+            #          envelope owns "black reads bright"; it neither joins nor breaks a streak
+        y = float(xyz[1])
+        if y < cfg.stall_min_nits:
+            self._stall_streak = []
+            return
+        direction = tuple(s / mx for s in patch.signal)
+        entry = (direction, (float(xyz[0]), float(xyz[1]), float(xyz[2])), patch.label)
+        if self._stall_streak:
+            anchor = self._stall_streak[0][1]
+            white = self.white_xyz or anchor
+            sigma = self.dip.expected_sigma_de(y) if self.dip else None
+            tol = max(cfg.stall_floor_de, cfg.stall_sigma_factor * (sigma or 0.0))
+            if _agreement_de(entry[1], anchor, white) > tol:
+                self._stall_streak = [entry]     # the frame moved — a fresh streak starts here
+                return
+        self._stall_streak.append(entry)
+        if len(self._stall_streak) < cfg.stall_reads:
+            return
+        # Meaningfully-distinct commanded directions in the streak (greedy clustering: a command
+        # joins the first cluster within stall_direction_delta per channel, else founds one).
+        clusters: list[tuple[float, float, float]] = []
+        for d, _, _ in self._stall_streak:
+            if all(max(abs(d[i] - c[i]) for i in range(3)) >= cfg.stall_direction_delta
+                   for c in clusters):
+                clusters.append(d)
+        if len(clusters) < cfg.stall_distinct_commands:
+            # A legitimate clamp plateau (same-direction commands equalized by a cap) may run
+            # long; keep the streak bounded rather than growing without limit.
+            if len(self._stall_streak) > 4 * cfg.stall_reads:
+                self._stall_streak.pop(0)
+            return
+        self.present_stall = True
+        # The streak's accepted values are reads of a frozen frame, not of their patches —
+        # flag them unstable so they surface in `unresolved` (they stay in the .ti3 only if
+        # the seam's judge explicitly accepts a stalled run, which the digest argues against).
+        for _, _, lbl in self._stall_streak:
+            rec = self.accepted.get(lbl)
+            if rec is not None:
+                rec.unstable = True
+                rec.note = "present_stall: read a stuck frame, value untrustworthy"
+        ys = [e[1][1] for e in self._stall_streak]
+        self._flag_read_plausibility_anomaly({
+            "reason": "present_stall",
+            "severity": "run_stopper",
+            "measure_phase": self._live_phase,
+            "label": patch.label,
+            "reads": len(self._stall_streak),
+            "distinct_commands": len(clusters),
+            "labels": [e[2] for e in self._stall_streak][-8:],
+            "rgb": list(patch.rgb),
+            "measured_nits_mean": round(sum(ys) / len(ys), 4),
+            "measured_nits_span": round(max(ys) - min(ys), 4),
+        })
 
     def _check_read_integrity(self, patch: MeasurePatch, xyz: tuple[float, float, float]) -> None:
         """Cross-patch read-integrity guard for failures the per-read stall clock cannot see. The
@@ -1049,15 +1239,23 @@ class _Loop:
         exactly the ~111-min dogegen-freeze class. Inspect the last few MEASUREMENT reads for two
         signatures the stall guard is blind to and surface either as a measurement-path anomaly the
         LLM consumes from the running spine (never a silent abort — the LLM/operator cancels)."""
-        if patch.role != "measurement" or self.cfg.integrity_window <= 0:
+        if patch.role != "measurement":
             return
-        expected = self._expected_patch_nits(patch)
+        # (C) Present-stall (stuck frame): the FAST run-stopper signature — identical XYZ across
+        # genuinely different commanded colours. Checked first; the window guards below are the
+        # slower, luminance-span-based belt-and-braces.
+        self._check_present_stall(patch, xyz)
+        if self.cfg.integrity_window <= 0:
+            return
+        expected, _envelope = self._plausible_expected_nits(patch)
         measured = float(xyz[1])
         self._integrity_recent.append((expected, (float(xyz[0]), float(xyz[1]), float(xyz[2]))))
         if len(self._integrity_recent) > self.cfg.integrity_window:
             self._integrity_recent.pop(0)
 
         # (B) Panel went dark mid-run: a run of LIT patches all reading at/under the dark floor.
+        # Channel-aware expected: a gamut-limited primary (dim by physics) never counts as "lit",
+        # so it can't stack a false dark streak on a WOLED whose blue peaks in the teens.
         reference = float(self.reference_xyz[1]) if self.reference_xyz else 0.0
         lit_cut = max(self.cfg.plausible_luminance_low_expected_nits * 2.0, reference * 0.5)
         dark_floor = max(self.cfg.plausible_luminance_floor_nits, expected * 0.02)
@@ -1522,11 +1720,25 @@ class _Loop:
 
         for index, patch in enumerate(self.patches, start=1):
             self.measure_patch(patch, phase="main")
+            if self.present_stall:
+                # Run-stopper: the presented frame is stuck — every further read would be the
+                # same frozen frame (the 2026-09-02 event corrupted the verify tail + poisoned
+                # the drift checkpoint this way). Halt the pass HERE; the escalation seam
+                # adjudicates immediately instead of after N more garbage patches.
+                self._emit_event("WARN", "present_stall_halt",
+                                 measured=len(self.accepted), total=len(self.patches),
+                                 label=patch.label)
+                return
             pending.append(patch.label)
             self._maybe_checkin(index)   # coarse digest check-in at quartiles (LLM visibility)
 
             if next_checkpoint is not None and index >= next_checkpoint:
                 self._neutral_checkpoint(warmup_patch, pending, patch_index=index)
+                if self.present_stall:
+                    self._emit_event("WARN", "present_stall_halt",
+                                     measured=len(self.accepted), total=len(self.patches),
+                                     label=patch.label)
+                    return
                 next_checkpoint = index + self.neutral_interval_current if self.neutral_interval_current > 0 else None
 
         # Final checkpoint for the tail of the pass.
@@ -1685,6 +1897,26 @@ class _Loop:
             self._mirror_patch_read(record)   # a failed drift checkpoint is still a (failed) read
             return
         self._update_white(reading.xyz)
+        # The drift-reference read joins the present-stall streak: in the 2026-09-02 event it
+        # WAS the third stuck read (mid-grey commanded, same frozen ~402-nit white measured) —
+        # and a stuck frame makes the drift verdict below garbage (the real event queued 7 good
+        # patches for cold-remeasure off the frozen reference). On a stall: record the read for
+        # the audit stream, skip the drift evaluation, and let the run-stopper seam decide.
+        self._check_present_stall(warmup_patch, reading.xyz)
+        if self.present_stall:
+            record = {
+                "t": _now(), "seq": seq, "phase": "main", "role": "neutral_ref",
+                "label": warmup_patch.label, "rgb": list(warmup_patch.rgb),
+                "signal": [round(s, 6) for s in warmup_patch.signal], "read_index": 0,
+                "xyz": list(reading.xyz),
+                "yxy": list(reading.yxy) if reading.yxy is not None else None,
+                "nits": reading.nits, "ok": True, "accepted": False,
+                "agreement_de": None, "drift": None, "settle": None,
+                "disposition": "drift_ref", "note": "present_stall",
+            }
+            self.ndjson.emit(record)
+            self._mirror_patch_read(record)
+            return
         ev = evaluate_drift(
             stabilized_xyz=self.reference_xyz,
             current_xyz=reading.xyz,
@@ -1829,6 +2061,10 @@ class IncrementalMeasureSession:
         dip: Optional[DisplayInstrumentProfile] = None,
         checkin_interval_s: float = 0.0,
         reference_guard: Optional[Callable[[], ContextManager[None]]] = None,
+        channel_peak_y: Optional[tuple[float, float, float]] = None,
+        white_peak_y: Optional[float] = None,
+        correction_max_nits: Optional[float] = None,
+        correction_channel_scale: Optional[tuple[float, float, float]] = None,
     ) -> None:
         self.cfg = config or MeasureLoopConfig()
         self.ndjson = _NdjsonWriter(ndjson_path)
@@ -1844,6 +2080,10 @@ class IncrementalMeasureSession:
             dip=dip,
             checkin_interval_s=checkin_interval_s,
             reference_guard=reference_guard,
+            channel_peak_y=channel_peak_y,
+            white_peak_y=white_peak_y,
+            correction_max_nits=correction_max_nits,
+            correction_channel_scale=correction_channel_scale,
         )
         self.preheat_digest: Optional[dict[str, Any]] = None
         self.preheat_compromised = False
@@ -1904,6 +2144,7 @@ class IncrementalMeasureSession:
             "warm": self.loop.warm,
             "preheat_compromised": self.preheat_compromised,
             "panel_dark": self.loop.panel_dark,
+            "present_stall": self.loop.present_stall,
             "dark_reference_nits": (round(self.loop.dark_reference_nits, 4)
                                     if self.loop.dark_reference_nits is not None else None),
             "warmup_reads": self.loop.warmup_reads,
@@ -1930,6 +2171,82 @@ class IncrementalMeasureSession:
         }
 
 
+# The non-stopper plausibility-envelope reasons (item #4): repeatability can argue "accept" only
+# for these. lit_drive_low is the one a correction/gamut limit legitimately produces; a stable
+# TOO-BRIGHT read (low_drive_high) is never panel physics (attenuation only reduces light) — it
+# is classified for evidence but the orchestrator never downgrades retry on it. Run-stopper
+# reasons (present_stall, panel_dark_mid_run, frozen_presenter) are excluded entirely: a stuck
+# frame is perfectly "repeatable".
+_ENVELOPE_ANOMALY_REASONS = ("lit_drive_low_luminance", "low_drive_high_luminance")
+
+
+def _read_anomaly_repeatability(
+    anomalies: Sequence[dict[str, Any]],
+    accepted: dict[str, AcceptedRead],
+    cfg: MeasureLoopConfig,
+) -> Optional[dict[str, Any]]:
+    """Repeatability evidence over the ENVELOPE anomalies for the escalation seam (item #4,
+    2026-09-02 C6 run): group flagged reads by commanded RGB (verify bookends re-read the same
+    stimulus at start + end, so a real limit shows up as the SAME implausible value again) and
+    measure the relative luminance spread within each group; a singleton group falls back to the
+    patch's own multi-read standard error when it has one. ``classification``:
+
+    * ``stable``  — every judged group repeats within ``anomaly_stable_spread`` (and at least one
+      group could be judged): stable-but-implausible ⇒ real panel/correction behaviour.
+    * ``noisy``   — any judged group diverges: transient meter/display fault; retry should clear it.
+    * ``mixed``   — stable evidence next to unjudgeable singletons.
+    * ``unknown`` — no group re-read and no per-patch spread: nothing to argue from.
+
+    Evidence for the LLM (and the seam's RECOMMENDATION) — never a decision. ``None`` when no
+    envelope anomalies were flagged."""
+    env = [a for a in anomalies if a.get("reason") in _ENVELOPE_ANOMALY_REASONS]
+    if not env:
+        return None
+    groups: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    for a in env:
+        groups.setdefault(tuple(a.get("rgb") or ()), []).append(a)
+    out_groups: list[dict[str, Any]] = []
+    verdicts: list[str] = []
+    for rgb, items in groups.items():
+        ys = [float(a.get("measured_nits") or 0.0) for a in items]
+        labels = sorted({a.get("label") for a in items if a.get("label")})
+        mean = sum(ys) / len(ys)
+        spread = max(ys) - min(ys)
+        rel = (spread / mean) if mean > 0.0 else math.inf
+        group: dict[str, Any] = {
+            "rgb": list(rgb),
+            "flagged_reads": len(ys),
+            "mean_nits": round(mean, 4),
+            "spread_nits": round(spread, 4),
+            "rel_spread": (round(rel, 4) if math.isfinite(rel) else None),
+            "labels": labels[:6],
+        }
+        if len(ys) >= 2:
+            group["verdict"] = "stable" if rel <= cfg.anomaly_stable_spread else "noisy"
+        else:
+            rec = accepted.get(labels[0]) if labels else None
+            if rec is not None and rec.se_de is not None and (rec.noise_reads or 0) >= 2:
+                group["se_de"] = round(rec.se_de, 4)
+                group["verdict"] = ("stable" if rec.se_de <= 2.0 * cfg.read_tolerance_de
+                                    else "noisy")
+            else:
+                group["verdict"] = "unknown"
+        verdicts.append(group["verdict"])
+        out_groups.append(group)
+    if "noisy" in verdicts:
+        classification = "noisy"
+    elif "stable" in verdicts:
+        classification = "stable" if "unknown" not in verdicts else "mixed"
+    else:
+        classification = "unknown"
+    return {
+        "classification": classification,
+        "all_low_luminance": all(a.get("reason") == "lit_drive_low_luminance" for a in env),
+        "stable_spread_threshold": cfg.anomaly_stable_spread,
+        "groups": out_groups[:8],
+    }
+
+
 def run_measure_loop(
     *,
     patches: Sequence[Patch],
@@ -1943,6 +2260,10 @@ def run_measure_loop(
     liveness: Optional[Liveness] = None,
     dip: Optional[DisplayInstrumentProfile] = None,
     checkin_interval_s: float = 0.0,
+    channel_peak_y: Optional[tuple[float, float, float]] = None,
+    white_peak_y: Optional[float] = None,
+    correction_max_nits: Optional[float] = None,
+    correction_channel_scale: Optional[tuple[float, float, float]] = None,
 ) -> MeasureLoopResult:
     """Run the adaptive measurement loop over ``patches`` (code-value triples,
     already thermally ordered by the caller via :mod:`dlc.engine.patches`).
@@ -1959,6 +2280,11 @@ def run_measure_loop(
     current phase, so the firehose is dashboard-only (stream tier) while the LLM
     keeps reading just the digest. ``events`` stays as the legacy event-only seam
     (characterize, tests); ``runlog`` supersedes it when both are present.
+
+    ``channel_peak_y`` / ``white_peak_y`` / ``correction_max_nits`` /
+    ``correction_channel_scale`` are the OPTIONAL plausibility-envelope context (measured
+    per-channel peaks, WRGB white headroom, an installed correction's cap/attenuation) — see
+    :meth:`_Loop._plausible_expected_nits`. Absent ⇒ the container fallback (previous behaviour).
     """
 
     cfg = config or MeasureLoopConfig()
@@ -1974,6 +2300,10 @@ def run_measure_loop(
         liveness=liveness,
         dip=dip,
         checkin_interval_s=checkin_interval_s,
+        channel_peak_y=channel_peak_y,
+        white_peak_y=white_peak_y,
+        correction_max_nits=correction_max_nits,
+        correction_channel_scale=correction_channel_scale,
     )
 
     preheat_digest = loop.preheat()
@@ -1986,7 +2316,10 @@ def run_measure_loop(
         unresolved: list[str] = []
     else:
         loop.main_pass()
-        unresolved = loop.drain_appended()
+        # A present-stall halts the pass mid-way; the appended queue was built against a live
+        # panel and re-measuring it through a frozen frame just multiplies garbage — skip it
+        # and let the run-stopper seam decide (retry re-measures everything anyway).
+        unresolved = loop.drain_appended() if not loop.present_stall else []
 
     accepted = loop.ordered_accepted()
     written_ti3: Optional[str] = None
@@ -2023,6 +2356,9 @@ def run_measure_loop(
             "note": r.note,
         })
     drift_summary = loop._recent_drift_summary()
+    # Escalation-recommendation evidence (item #4): are the envelope-anomalous reads REPEATABLE
+    # (stable-but-implausible ⇒ real panel/correction behaviour) or divergent (transient fault)?
+    anomaly_repeatability = _read_anomaly_repeatability(loop.read_anomalies, loop.accepted, cfg)
 
     needs_adjudication = (
         loop.panel_dark
@@ -2036,6 +2372,7 @@ def run_measure_loop(
     anomaly_reasons = [
         name for name, active in (
             ("panel_dark", loop.panel_dark),
+            ("present_stall", loop.present_stall),
             ("preheat_compromised", preheat_compromised),
             ("measurement_path_compromised", loop.measurement_path_compromised),
             ("not_warm", not loop.warm),
@@ -2048,6 +2385,15 @@ def run_measure_loop(
     question = None
     if needs_adjudication:
         bits = []
+        if loop.present_stall:
+            st = next((a for a in loop.read_anomalies if a.get("reason") == "present_stall"), {})
+            bits.append(
+                f"PRESENT-STALL (run-stopper): {st.get('reads', '?')} consecutive reads across "
+                f"{st.get('distinct_commands', '?')} different commanded colours returned identical "
+                f"XYZ (~{st.get('measured_nits_mean', '?')} cd/m^2) — the presented frame appears "
+                f"STUCK (TV auto-sleep/screensaver/frozen presenter); the pass was halted at "
+                f"{len(accepted)}/{len(loop.patches)} patches; wake/fix the display path, then retry"
+            )
         if loop.panel_dark:
             ref = loop.dark_reference_nits if loop.dark_reference_nits is not None else 0.0
             bits.append(
@@ -2061,7 +2407,7 @@ def run_measure_loop(
                 "(wrong colorspace/frozen patch/meter issue); measurement continued and this "
                 "data needs adjudication"
             )
-        if loop.measurement_path_compromised:
+        if loop.measurement_path_compromised and not loop.present_stall:
             anomaly = loop.read_anomalies[0] if loop.read_anomalies else {}
             bits.append(
                 "a patch read was outside the plausible luminance envelope "
@@ -2071,6 +2417,22 @@ def run_measure_loop(
                 f"{anomaly.get('expected_nits', 'n/a')} cd/m^2); measurement continued "
                 "and this data needs adjudication"
             )
+            # Repeatability verdict rides the question so the seam's judge sees WHY the
+            # recommendation leans accept (stable ⇒ real behaviour) or retry (divergent ⇒
+            # transient) — evidence, not a decision.
+            if anomaly_repeatability is not None:
+                cls = anomaly_repeatability["classification"]
+                if cls == "stable":
+                    bits.append(
+                        "the anomalous reads are REPEATABLE across re-reads of the same stimulus "
+                        "(stable-but-implausible) — usually real panel/correction behaviour, not "
+                        "a transient fault; a retry would re-measure the same values"
+                    )
+                elif cls == "noisy":
+                    bits.append(
+                        "the anomalous reads are DIVERGENT across re-reads of the same stimulus — "
+                        "consistent with a transient meter/display fault; a retry should clear it"
+                    )
         if not loop.warm and not loop.panel_dark:
             bits.append(
                 f"panel did not settle within {cfg.max_warmup_reads} warm-up reads "
@@ -2104,9 +2466,11 @@ def run_measure_loop(
     digest = {
         "warm": loop.warm,
         "panel_dark": loop.panel_dark,
+        "present_stall": loop.present_stall,
         "preheat_compromised": preheat_compromised,
         "measurement_path_compromised": loop.measurement_path_compromised,
         "read_anomalies": loop.read_anomalies[:8],
+        "read_anomaly_repeatability": anomaly_repeatability,
         "dark_reference_nits": (round(loop.dark_reference_nits, 4)
                                 if loop.dark_reference_nits is not None else None),
         "warmup_reads": loop.warmup_reads,
