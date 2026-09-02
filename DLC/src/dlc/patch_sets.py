@@ -61,6 +61,14 @@ class PatchSizes:
     raw_saturations: tuple[float, ...] = (1.0,)   # primary saturation shells (breadth)
     raw_include_secondaries: bool = False   # add C/M/Y ramps too? Off ⇒ grey + R/G/B only (the foundation)
     raw_spacing: str = "uniform"    # uniform | perceptual (even-signal vs even-perceptual)
+    # RAW colour-ramp luminance floor, in NITS (mode-aware by construction: converted through the
+    # run's transfer). Colour patches whose on-channel drive sits below it are dropped; the GREY ramp
+    # (incl. the low_light toe) is untouched. The MHC foundation consumes the R/G/B ramps ONLY through
+    # each channel's PEAK read (``channel_model.peak_xyz`` → matrix / channel_peak_xyz) plus a
+    # discarded size-2 curve, so sub-nit colour reads feed nothing — while costing the most (LG C6
+    # 2026-09-02: 71 of 417 raw reads were sub-nit primaries at ~8 s each ≈ 10 min, 0 information).
+    # 1 nit ≈ the colorimeter chroma floor (the same rationale as verify_color_min_signal). 0 ⇒ off.
+    raw_color_min_nits: float = 1.0
 
     # near-neutral tube (MHC FOUNDATION): off-axis samples around the grey axis (R≠G≠B but close
     # to neutral) along the six hue directions. Characterizes the OFF-AXIS non-additivity / white-
@@ -136,7 +144,7 @@ class PatchSizes:
             elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
             elif f.name in ("gamut_lum_bias", "low_light_signal", "low_light_bias",
-                            "verify_color_min_signal"):
+                            "verify_color_min_signal", "raw_color_min_nits"):
                 kw[f.name] = float(v)
             elif f.name in ("raw_spacing", "volumetric_mode", "grid_type", "order"):
                 kw[f.name] = str(v)
@@ -189,12 +197,20 @@ def build_ramp_set(ps: PatchSizes, transfer: Transfer, *,
     around the grey axis) so the matrix + per-channel-1D white-balance correction has the off-axis
     non-additivity data the grey diagonal alone can't provide. The tube is merged into the ramp set
     and the union is re-ordered together for drift safety."""
+    # RAW colour floor: nits → full-scale signal fraction through THIS run's transfer (PQ: absolute;
+    # power-law: relative to the SDR white), so "1 nit" means 1 nit in either mode. Grey is exempt
+    # inside ramp_patches (the toe still carries the dark EOTF); saturation stays UNCAPPED (raw needs
+    # the pure channels at full drive — this is a luminance floor, not a gamut cap).
+    raw_color_min_signal = 0.0
+    if ps.raw_color_min_nits and ps.raw_color_min_nits > 0.0:
+        raw_color_min_signal = transfer.nits_to_cv(ps.raw_color_min_nits) / transfer.max_cv
     ramp = ramp_patches(transfer, steps=ps.raw_ramp_steps, saturations=ps.raw_saturations,
                         spacing=ps.raw_spacing, include_secondaries=ps.raw_include_secondaries,
                         low_light_steps=ps.low_light_steps,
                         low_light_signal=ps.low_light_signal,
                         low_light_bias=ps.low_light_bias,
                         hue_sat_caps=hue_sat_caps, extend_to_cv=extend_to_cv,
+                        color_min_signal=raw_color_min_signal,
                         order=ps.order, warm_tau=warm_tau, max_cv=max_cv)
     if not ps.icc_tube_levels or ps.icc_tube_levels <= 1:
         return ramp

@@ -215,6 +215,15 @@ class MeasureLoopConfig:
     # identity). Default 1 ⇒ off; complementary to neutral_min_reads (the BRIGHT region).
     dark_min_reads: int = 1
     dark_floor_max_nits: float = 1.0
+    # Early stop for the DARK read floor: once this many reads AGREE (a clean cluster — no outliers,
+    # SE within read_tolerance_de — and the DIP's own SNR target is met) the floor is satisfied and
+    # the remaining ``dark_min_reads`` reads are skipped. The floor exists to ESTIMATE the read-to-read
+    # chromaticity spread; two agreeing reads already give one (σ/√2 — slightly LESS trust than
+    # σ/√3, i.e. the conservative direction), while a third identical ~8 s low-light read adds no
+    # information (LG C6 2026-09-02: 44 dark patches × 2 redundant reads ≈ 12 min of a 50-min raw
+    # pass; the owner had already flagged the "redundant 3× stable reads"). Disagreeing reads keep
+    # reading to the floor and beyond exactly as before. 0 ⇒ always take the full floor.
+    dark_agree_reads: int = 2
 
     # Luminance-jump settle bump (gs-wb outside-in ordering, D4) ------------
     # The outside-in alternating orders swing dark↔bright on nearly every transition. A local-
@@ -1521,11 +1530,20 @@ class _Loop:
         # controller's own outcome agree it was warm? Recorded for the Phase-2 decision; not acted on.
         would_fast_path = (res.baseline_distance is not None
                            and res.baseline_distance <= res.drift_threshold)
+        # The converged operating-load balance + the threshold it was judged against ride the digest
+        # too: they are the evidence a SESSION warm-baseline fast-path (stage N+1 anchored on stage N's
+        # converged balance, not the cold characterize baseline the Phase-1 shadow compared against —
+        # LG C6 2026-09-02: distance 0.12-0.15 vs threshold, "would_fast_path" False on a panel that
+        # then converged in the minimum 4 blocks every stage) needs before it can be enabled.
         digest = {"regime": res.regime, "reason": res.reason, "converged": res.converged,
                   "blocks": res.blocks, "content_reads": res.content_reads, "final_k": res.final_k,
                   "compromised": res.compromised, "protection_limited": res.protection_limited,
                   "active_channel": res.active_channel, "baseline_distance": res.baseline_distance,
-                  "shadow_would_fast_path": would_fast_path}
+                  "shadow_would_fast_path": would_fast_path,
+                  "warm_balance": ({str(k): round(float(v), 6) for k, v in res.warm_balance.items()}
+                                   if res.warm_balance else None),
+                  "drift_threshold": (round(float(res.drift_threshold), 6)
+                                      if res.drift_threshold is not None else None)}
         self.ndjson.emit({"t": _now(), "phase": "preheat", "role": "preheat_complete", **digest})
         self._emit_event("INFO" if (res.converged and not res.compromised and not res.protection_limited)
                          else "WARN", "preheat_complete", **digest)
@@ -1574,6 +1592,19 @@ class _Loop:
                 floor = self.cfg.dark_min_reads
         return floor
 
+    def _dark_floor_binds(self, patch: MeasurePatch) -> bool:
+        """True when the DARK read floor is what raised this patch's read count above the global
+        minimum — the only floor ``dark_agree_reads`` may satisfy early (the bright near-neutral
+        floor averages for SNR and is never shortened)."""
+        if not self._is_near_neutral(patch):
+            return False
+        nits = self._expected_patch_nits(patch)
+        if not (self.cfg.dark_min_reads > self.cfg.min_reads and nits <= self.cfg.dark_floor_max_nits):
+            return False
+        bright_floor = (self.cfg.neutral_min_reads
+                        if nits >= self.cfg.neutral_floor_min_nits else self.cfg.min_reads)
+        return self.cfg.dark_min_reads > bright_floor
+
     def _abnormal_reads(self, target_n: Optional[int]) -> int:
         """The read count past which a patch is *abnormal* and must be FLAGGED (not
         silently capped). Scaled off the DIP's per-luminance target so a legitimately
@@ -1592,6 +1623,8 @@ class _Loop:
         reads: list[tuple[float, float, float]] = []
         yxys: list[tuple[float, float, float]] = []
         target_n: Optional[int] = None          # DIP-predicted reads for SNR (set on first valid read)
+        dip_n: Optional[int] = None             # the DIP's own SNR read target (None ⇒ no DIP)
+        dark_bound = False                      # the DARK floor set target_n (⇒ dark_agree_reads may satisfy it early)
         sigma: Optional[float] = None           # DIP per-read σ at this luminance (drives outlier rejection)
         read_index = 0
         unstable = False
@@ -1629,11 +1662,24 @@ class _Loop:
                     # escalate ABOVE it where measured σ demands more averaging for SNR.
                     floor = self._read_floor_for(patch)
                     target_n = max(floor, dip_n or floor)
+                    # The dark floor is the binding target only when the DIP itself wanted fewer.
+                    dark_bound = self._dark_floor_binds(patch) and (dip_n or 0) < floor
 
             st = self._robust_stats(reads, sigma=sigma)
             n_inliers = st[2] if st else 0
             se = st[1] if st else None
             outliers = st[3] if st else 0
+
+            # Dark-floor early stop: the floor's job is a chroma-spread ESTIMATE, which two agreeing
+            # reads already provide (conservatively). Requires a clean cluster (no outliers), the
+            # DIP's own SNR target met, and agreement within tolerance — a disagreeing pair keeps
+            # reading to the floor and beyond exactly as before. Never shortens the BRIGHT floor.
+            if (dark_bound and cfg.dark_agree_reads > 0
+                    and n_inliers >= cfg.dark_agree_reads
+                    and n_inliers >= (dip_n or 0)
+                    and outliers == 0
+                    and se is not None and se <= cfg.read_tolerance_de):
+                break
 
             # Converge only on a CLEAN cluster: enough inlier reads at the SNR target,
             # agreeing within tolerance, AND not too many reads rejected as glitches. A

@@ -386,7 +386,9 @@ def ramp_patches(transfer: Transfer, *, steps: int = 21,
     ``color_min_signal`` (verify): drop COLOUR (non-grey) patches whose on-channel
     normalized signal is below it — sub-nit chroma is noise-dominated, so colour starts
     above the shadow band while the grey ramp (incl. ``low_light_steps`` toe) still covers
-    the dark EOTF. ``0.0`` ⇒ no floor (the dense build ramp keeps full-range colour).
+    the dark EOTF. ``0.0`` ⇒ no floor. The RAW foundation ramp passes a nits-derived floor
+    too (``PatchSizes.raw_color_min_nits``): the MHC build reads each colour ramp only at its
+    peak, so sub-nit colour there is pure cost.
 
     Domain note: the floor is a fraction of the transfer's FULL-scale signal
     (``transfer.max_cv``), deliberately NOT of a ``max_cv`` peak cap — under PQ the

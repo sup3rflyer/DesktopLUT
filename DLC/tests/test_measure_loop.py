@@ -323,9 +323,11 @@ def test_neutral_floor_defaults_off():
 def test_dark_floor_reads_dim_grey_and_records_chroma_sigma():
     # The dark read floor: a DIM near-neutral patch is read several times so its chromaticity spread
     # can be estimated (the dark-level trust input) — and the spread is recorded on the accepted read.
+    # dark_agree_reads=0 pins the FULL floor (no early stop) — the pre-2026-09-02 behaviour.
     t = _sdr()
     clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
-    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0)   # gate high ⇒ dim grey floored
+    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0,   # gate high ⇒ dim grey floored
+                            dark_agree_reads=0)
     loop = _solo_loop(clean, t, cfg)
     dim = _patch("g-lo", (102, 102, 102), t, 0)
     assert loop._read_floor_for(dim) == 4
@@ -333,6 +335,60 @@ def test_dark_floor_reads_dim_grey_and_records_chroma_sigma():
     assert rec.reads_taken == 4
     assert rec.chroma_sigma is not None          # ≥2 reads ⇒ spread estimated (0.0 on a clean panel)
     assert rec.se_de is not None
+
+
+def test_dark_floor_early_stop_on_agreeing_reads():
+    # 2026-09-02 (LG C6): the dark floor's job is a chroma-spread ESTIMATE; two agreeing reads give
+    # one, so the default dark_agree_reads=2 stops there instead of burning a third ~8 s low-light
+    # read. The spread and SE are still recorded (≥2 reads).
+    t = _sdr()
+    # A PLAUSIBLE dim read for a cv-102 grey (~0.76 nits expected): a 50-nit read would trip the
+    # luminance-plausibility envelope and flag the patch unstable regardless of the read policy.
+    clean = _ScriptedPanel([(0.75, 0.80, 0.88)])
+    cfg = MeasureLoopConfig(dark_min_reads=3, dark_floor_max_nits=120.0)      # default dark_agree_reads=2
+    loop = _solo_loop(clean, t, cfg)
+    dim = _patch("g-lo", (102, 102, 102), t, 0)
+    assert loop._read_floor_for(dim) == 3 and loop._dark_floor_binds(dim)
+    rec = loop.measure_patch(dim, phase="main")
+    assert rec.reads_taken == 2
+    assert rec.noise_reads == 2                  # the dark-trust σ/√n divides by the reads actually taken
+    assert rec.chroma_sigma is not None and rec.se_de is not None
+    assert rec.unstable is False
+
+
+def test_dark_floor_early_stop_needs_agreement():
+    # A DISAGREEING pair does not satisfy the floor: the loop reads on to the floor (and beyond, via
+    # the normal SE convergence) exactly as before — no early exit on a noisy dark level.
+    t = _sdr()
+    noisy = _ScriptedPanel([(0.75, 0.80, 0.88), (0.75, 1.30, 0.88), (0.75, 0.80, 0.88),
+                            (0.75, 0.80, 0.88), (0.75, 0.80, 0.88)])   # plausible dim reads, 2nd disagrees
+    cfg = MeasureLoopConfig(dark_min_reads=3, dark_floor_max_nits=120.0, read_tolerance_de=0.2)
+    loop = _solo_loop(noisy, t, cfg)
+    rec = loop.measure_patch(_patch("g-lo", (102, 102, 102), t, 0), phase="main")
+    assert rec.reads_taken >= 3                  # never fewer than the floor when the pair disagrees
+
+
+def test_dark_floor_early_stop_never_shortens_bright_floor():
+    # The BRIGHT near-neutral floor averages for SNR — it is never the dark floor and is untouched.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    cfg = MeasureLoopConfig(neutral_min_reads=4, dark_min_reads=3, dark_floor_max_nits=1.0)
+    loop = _solo_loop(clean, t, cfg)
+    bright = _patch("g", (512, 512, 512), t, 0)
+    assert not loop._dark_floor_binds(bright)
+    rec = loop.measure_patch(bright, phase="main")
+    assert rec.reads_taken == 4
+
+
+def test_dark_floor_early_stop_respects_dip_target():
+    # When the DIP's own SNR model wants MORE reads than the dark floor, the DIP target binds and the
+    # early stop does not apply (dark_bound is False) — SNR is never traded for speed.
+    t = _sdr()
+    clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
+    cfg = MeasureLoopConfig(dark_min_reads=2, dark_floor_max_nits=120.0, read_tolerance_de=0.2)
+    loop = _solo_loop(clean, t, cfg, dip=_dip_for(50.0, 0.4))      # DIP: σ 0.4 ⇒ 4 reads for 0.2 SE
+    rec = loop.measure_patch(_patch("g-lo", (102, 102, 102), t, 0), phase="main")
+    assert rec.reads_taken == 4
 
 
 def test_dark_floor_defaults_off_and_gated_by_nits():
@@ -400,7 +456,10 @@ def test_noise_reads_is_per_round_not_lifetime_after_remeasure(tmp_path: Path):
     from dlc.measure_loop import noise_sidecar_path, _write_noise_sidecar, read_noise_sidecar
     t = _sdr()
     clean = _ScriptedPanel([(50.0, 50.0, 55.0)])
-    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0)   # gate high ⇒ dim grey floored to 4
+    # dark_agree_reads=0 pins the FULL 4-read floor: this test is about per-round accounting, not
+    # the floor's early-stop (covered by test_dark_floor_early_stop_*).
+    cfg = MeasureLoopConfig(dark_min_reads=4, dark_floor_max_nits=120.0,   # gate high ⇒ dim grey floored to 4
+                            dark_agree_reads=0)
     loop = _solo_loop(clean, t, cfg)
     dim = _patch("g-lo", (102, 102, 102), t, 0)
     rec1 = loop.measure_patch(dim, phase="main")

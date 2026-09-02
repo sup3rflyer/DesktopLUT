@@ -2156,6 +2156,29 @@ def test_default_patch_sizes_add_low_light_density():
     assert not any(len({*p}) > 1 and max(p) < cmin for p in vdense)
 
 
+def test_raw_colour_floor_drops_sub_nit_colour_keeps_grey_toe_and_full_drive_primaries():
+    # 2026-09-02 (LG C6): the MHC foundation reads each colour ramp ONLY at its peak (channel_model
+    # .peak_xyz) — sub-nit colour reads feed nothing yet cost ~8 s each. The nits-based
+    # raw_color_min_nits floor (default 1 nit) drops them; the grey ramp/toe and the full-drive
+    # primaries are untouched. Mode-aware: the floor is converted through the run's transfer.
+    import dataclasses as dc
+    for t in (Transfer.pq(bit_depth=10), Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)):
+        ps = PatchSizes()
+        floor_cv = t.nits_to_cv(ps.raw_color_min_nits)
+        assert floor_cv > 0
+        raw = build_ramp_set(ps, t)
+        colour = [p for p in raw if len({*p}) > 1]
+        greys = [p for p in raw if p[0] == p[1] == p[2] and max(p) > 0]
+        assert colour and greys
+        assert min(max(p) for p in colour) >= floor_cv                 # no colour below the floor
+        assert min(max(p) for p in greys) < floor_cv                   # grey toe still reaches below it
+        assert (t.max_cv, 0, 0) in raw and (0, t.max_cv, 0) in raw and (0, 0, t.max_cv) in raw
+        # 0 ⇒ off: full-range colour returns; the grey set is identical either way.
+        off = build_ramp_set(dc.replace(ps, raw_color_min_nits=0.0), t)
+        assert sum(1 for p in off if len({*p}) > 1) > len(colour)
+        assert {p for p in off if p[0] == p[1] == p[2]} == {p for p in raw if p[0] == p[1] == p[2]}
+
+
 def test_opting_into_raw_secondaries():
     t = _transfer()
     base = build_ramp_set(PatchSizes(), t)
