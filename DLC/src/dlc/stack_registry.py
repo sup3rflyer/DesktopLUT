@@ -205,6 +205,12 @@ def registry_path(profile: Any, ctx_root: Path) -> Path:
     return base / REGISTRY_FILE
 
 
+def _norm_path(p: Any) -> Optional[str]:
+    if not p:
+        return None
+    return str(p).replace("\\", "/").lower().rstrip("/")
+
+
 def check_against_pipe(rec: Optional[StackRecord], pipe_state: Optional[dict[str, Any]],
                        monitor: int, mode: str) -> dict[str, Any]:
     """Evidence packet: does the pipe's current profile match the registry's record?
@@ -224,21 +230,40 @@ def check_against_pipe(rec: Optional[StackRecord], pipe_state: Optional[dict[str
         out["hdr_peak"] = rec.hdr_peak
         out["cube"] = rec.cube
     pipe_profile = None
+    pipe_source = None
     if isinstance(pipe_state, dict):
         entry = (pipe_state.get("mhc") or {}).get(f"{monitor}:{mode}") or {}
         pipe_profile = entry.get("profile_name") if isinstance(entry, dict) else None
+        pipe_source = entry.get("source_file") if isinstance(entry, dict) else None
     out["pipe_profile"] = pipe_profile
+    out["pipe_source_file"] = pipe_source
     if rec is None:
         out["reason"] = "no applied-stack record for this display/mode (MHC applied before the " \
                         "registry existed, or by another tool) — its cap is unknown"
         return out
     if pipe_profile and rec.profile_name and pipe_profile != rec.profile_name:
-        out["matches"] = False
-        out["reason"] = (f"pipe reports MHC {pipe_profile!r} but the registry recorded "
-                         f"{rec.profile_name!r} (run {rec.run_id}) — the stack changed outside DLC; "
-                         "not pinning to a possibly stale cap")
-        return out
-    out["matches"] = True if (pipe_profile and rec.profile_name) else None
+        # The profile NAME churns with every WB/DG/GS permutation re-bake; the DLC base
+        # artifact the profile was generated from (state.get `source_file`, the base 1D
+        # .cube handed over set_base_lut) is the stable identity. Same artifact ⇒ same stack.
+        rec_base = _norm_path((rec.mhc or {}).get("base_lut"))
+        if pipe_source and rec_base and _norm_path(pipe_source) == rec_base:
+            out["matches"] = True
+            out["matched_by"] = "source_file"
+            out["note"] = (f"pipe profile {pipe_profile!r} differs from the recorded "
+                           f"{rec.profile_name!r} (a GUI-layer permutation re-bake) but is generated "
+                           "from the same DLC base LUT")
+        else:
+            out["matches"] = False
+            out["reason"] = (f"pipe reports MHC {pipe_profile!r} but the registry recorded "
+                             f"{rec.profile_name!r} (run {rec.run_id})"
+                             + (f" from a different base artifact ({pipe_source})" if pipe_source else
+                                " and the server reports no source_file to identify it by")
+                             + " — the stack changed outside DLC; not pinning to a possibly stale cap")
+            return out
+    if out.get("matches") is None:
+        out["matches"] = True if (pipe_profile and rec.profile_name) else None
+        if out["matches"]:
+            out["matched_by"] = "profile_name"
     cap = rec.cube_peak_nits
     if cap is None:
         out["reason"] = "record carries no HDR cap (SDR stack, or an MHC applied before the cap was recorded)"

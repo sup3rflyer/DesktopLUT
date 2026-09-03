@@ -4246,6 +4246,10 @@ def test_hardware_readiness_refuses_gui_layers_left_on_after_enter_neutral(tmp_p
                   require_hardware_readiness=True)
     calib.profile.paths["desktoplut_ini"] = str(ini)
     calib.stage_enter_neutral()
+    # Something re-enabled the layers between enter-neutral and the first read (the pipe is the
+    # authority; the ini above agrees). The run's own capture is memoised, so nothing re-clears.
+    calib.controller.client.transport.server.state.layers["0:SDR"] = {
+        "tonemap": False, "desktop_gamma": True, "white_balance": True, "grayscale": False}
     with pytest.raises(StageError) as exc:
         calib.stage_hardware_readiness()
     msg = exc.value.outcome.digest["message"]
@@ -4290,13 +4294,30 @@ def test_hardware_readiness_without_enter_neutral_is_evidence_only(tmp_path: Pat
     ini.write_text(_ini_with(0, "SDR", MHCWhiteBalanceEnabled="true"), encoding="utf-8")
     calib = _make(tmp_path, "ready_stack")
     calib.profile.paths["desktoplut_ini"] = str(ini)
+    calib.controller.client.transport.server.state.layers["0:SDR"] = {
+        "tonemap": False, "desktop_gamma": False, "white_balance": True, "grayscale": False}
     out = calib.stage_hardware_readiness()
     assert out.status == "done"
     audit = out.digest["neutral_audit"]
     assert audit["after_enter_neutral"] is False
-    assert audit["gui_layers_enabled"] == ["GUI white balance"]
-    assert "GUI white balance" in audit["warning"]
+    # The run switched the user's WB OFF before the audit (captured for restore) — so the audit
+    # sees a clean stack and the evidence of what was done rides the digest instead.
+    assert out.digest["viewing_layers"]["disabled"] == ["white_balance"]
+    assert out.digest["viewing_layers"]["before"]["white_balance"] is True
+    assert audit["gui_layers_source"] == "pipe" and audit["gui_layers_enabled"] == []
+    assert "warning" not in audit
     assert audit["neutral_profile"] is None
+    # A server WITHOUT layers support (pre-layers.set build): the ini flags are the evidence and
+    # a layer ON is surfaced as a warning for the LLM, never a refusal.
+    old = _make(tmp_path, "ready_stack_old")
+    old.profile.paths["desktoplut_ini"] = str(ini)
+    real_state = old.controller.state
+    old.controller.state = lambda: {k: v for k, v in real_state().items() if k != "layers"}
+    out2 = old.stage_hardware_readiness()
+    audit2 = out2.digest["neutral_audit"]
+    assert out2.digest["viewing_layers"]["supported"] is False
+    assert audit2["gui_layers_source"] == "ini" and audit2["gui_layers_enabled"] == ["GUI white balance"]
+    assert "GUI white balance" in audit2["warning"]
 
 
 # ---------------------------------------------------------------------------
@@ -4568,3 +4589,142 @@ def test_repin_provenance_survives_a_resume_of_resolve_target(tmp_path: Path):
     assert plan["fingerprint"] == fp and plan["approved"] is True
     assert plan["repinned_from"] and "1500" in plan["repin_reason"]
 
+
+# ---------------------------------------------------------------------------
+# viewing layers (plan item 0b): captured before the first read, OFF for the run, restored at
+# the terminal end — the user never manages tonemap / DG / WB / GS around a pipeline run
+# ---------------------------------------------------------------------------
+
+def _layers_on(ctrl: CalibrationController, key: str, **on: bool) -> None:
+    """Seed the mock's viewing layers for monitor:mode (what the user was viewing with)."""
+    ctrl.client.transport.server.state.layers[key] = {
+        "tonemap": False, "desktop_gamma": False, "white_balance": False, "grayscale": False, **on}
+
+
+def _layers(ctrl: CalibrationController, key: str) -> dict:
+    return dict(ctrl.state()["layers"].get(key) or {})
+
+
+def test_3dlut_only_measures_with_the_viewing_layers_off_and_restores_them(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    prof = _seed_hdr_stack(ctrl)
+    _layers_on(ctrl, "0:HDR", tonemap=True, white_balance=True, desktop_gamma=True)
+    calib = _make(tmp_path, "layers3d", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10, controller=ctrl,
+                  require_hardware_readiness=True)
+    _inject_dip(calib, native_white_nits=1840.0)
+    _record_installed_mhc(calib, profile_name=prof, cap=1500.0)
+    seen: list[dict] = []
+    orig_measure = calib.measure
+
+    def spy(patch):
+        seen.append(_layers(ctrl, "0:HDR"))
+        return orig_measure(patch)
+
+    calib.measure = spy
+    result = calib.run("3dlut-only")
+    assert result.status == "completed", result.digest
+    # every read happened with all four layers OFF
+    assert seen and all(not any(l.values()) for l in seen)
+    rec = calib.calib["viewing_layers"]
+    assert rec["captured"] is True and rec["supported"] is True
+    assert rec["before"] == {"tonemap": True, "desktop_gamma": True, "white_balance": True, "grayscale": False}
+    assert rec["disabled"] == ["desktop_gamma", "tonemap", "white_balance"]
+    assert rec["regenerated"] is True                # WB/DG are MHC permutation bits → re-bake
+    # the readiness digest carried it, the audit saw the pipe's (cleared) layers
+    hw = calib.calib["stages"]["hardware-readiness"]["digest"]
+    assert hw["viewing_layers"]["disabled"] == rec["disabled"]
+    assert hw["neutral_audit"]["gui_layers_source"] == "pipe"
+    assert hw["neutral_audit"]["gui_layers_enabled"] == []
+    # restored at the end, on the applied stack
+    assert rec["restored"] is True
+    assert _layers(ctrl, "0:HDR") == {"tonemap": True, "desktop_gamma": True, "white_balance": True, "grayscale": False}
+    # the peak pin survived the permutation re-bake: the profile name churned but the source
+    # artifact identity matched (the registry cross-check keyed on it)
+    assert calib.calib["hdr_target"]["peak_nits"] == 1500.0
+
+
+def test_full_run_restores_the_viewing_layers_on_apply_and_on_revert(tmp_path: Path):
+    for label, adjudicator, expect_status in (("apply", None, "completed"),
+                                              ("revert", _AutoExceptVerify("revert"), "reverted")):
+        ctrl = CalibrationController.mock()
+        _layers_on(ctrl, "0:SDR", white_balance=True, grayscale=True)
+        calib = _make(tmp_path, f"layers_full_{label}", controller=ctrl, adjudicator=adjudicator)
+        result = calib.run("full")
+        assert result.status == expect_status, (label, result.digest)
+        rec = calib.calib["viewing_layers"]
+        assert rec["before"]["white_balance"] is True and rec["restored"] is True, label
+        assert _layers(ctrl, "0:SDR")["white_balance"] is True and _layers(ctrl, "0:SDR")["grayscale"] is True, label
+
+
+def test_viewing_layers_stay_off_across_a_pause_and_restore_after_the_resume(tmp_path: Path):
+    """A seam pause (exit 10) is not the end of the run: the panel stays in the measurement
+    state; the resume finishes the run and THEN restores."""
+    ctrl = CalibrationController.mock()
+    _layers_on(ctrl, "0:SDR", white_balance=True)
+    class _PauseAtVerify:
+        def adjudicate(self, request):
+            if request.key == "verify:accept":
+                raise _AdjRequired(request)
+            return Decision(request.recommendation, note="auto")
+
+    calib = _make(tmp_path, "layers_pause", controller=ctrl, adjudicator=_PauseAtVerify())
+    with pytest.raises(_AdjRequired):
+        calib.run("full")
+    assert calib.calib["viewing_layers"]["captured"] is True
+    assert calib.calib["viewing_layers"]["restored"] is False
+    assert _layers(ctrl, "0:SDR")["white_balance"] is False       # still the measurement state
+    resumed = _make(tmp_path, "layers_pause", controller=ctrl, adjudicator=AutoAdjudicator())
+    result = resumed.run("full")
+    assert result.status == "completed", result.digest
+    assert resumed.calib["viewing_layers"]["restored"] is True
+    assert _layers(ctrl, "0:SDR")["white_balance"] is True
+
+
+def test_viewing_layers_unsupported_server_is_evidence_not_a_crash(tmp_path: Path, monkeypatch):
+    ctrl = CalibrationController.mock()
+    real_state = ctrl.state
+
+    def old_server_state():
+        st = real_state()
+        st.pop("layers", None)          # a pre-layers.set build
+        return st
+
+    monkeypatch.setattr(ctrl, "state", old_server_state)
+    calib = _make(tmp_path, "layers_old", controller=ctrl)
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+    rec = calib.calib["viewing_layers"]
+    assert rec["captured"] is False and rec["supported"] is False and "ini" in rec["note"]
+
+
+def test_neutral_audit_prefers_the_pipe_layers_over_the_ini(tmp_path: Path):
+    from dlc import neutral_audit as na
+    ctrl = CalibrationController.mock()
+    _seed_hdr_stack(ctrl)
+    _layers_on(ctrl, "0:HDR", tonemap=True)
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text("[Monitor0]\nHDR_TonemapEnabled=false\nHDR_MHCWhiteBalanceEnabled=true\n"
+                   "HDR_MHCDesktopGamma=false\nHDR_MHCCorrGSEnabled=false\n", encoding="utf-8")
+    audit = na.neutral_state_audit(ctrl, 0, "HDR", ini_path=ini)
+    assert audit["gui_layers_source"] == "pipe"
+    assert audit["gui_layers_enabled"] == ["HDR tonemap"]
+    assert any("disagree" in n for n in audit["notes"])
+    assert na.neutral_violations(audit, require_profile=False) == ["HDR tonemap is still ON for 0:HDR in DesktopLUT.ini after enter-neutral"] \
+        or na.neutral_violations(audit, require_profile=False)[0].startswith("HDR tonemap is still ON")
+
+
+def test_registry_cross_check_survives_a_permutation_rebake(tmp_path: Path):
+    """The profile NAME churns on every WB/DG/GS toggle; the DLC base LUT (source_file) is the
+    stable identity the pin rests on."""
+    rec = _sr.StackRecord(display="P", mode="HDR", monitor=0, run_id="r", applied_at="t",
+                          profile_name="DesktopLUT_Mon0_HDR_1.icm",
+                          mhc={"base_lut": r"H:\runs\r\generated\mhc_base_hdr.refine1.cube"},
+                          hdr_peak={"cube_peak_nits": 1805.2})
+    pipe = {"mhc": {"0:HDR": {"applied": True, "profile_name": "DesktopLUT_Mon0_HDR_2.icm",
+                              "source_file": "h:/runs/r/generated/MHC_BASE_HDR.refine1.cube"}}}
+    ev = _sr.check_against_pipe(rec, pipe, 0, "HDR")
+    assert ev["matches"] is True and ev["matched_by"] == "source_file" and ev["pin_nits"] == 1805.2
+    other = {"mhc": {"0:HDR": {"applied": True, "profile_name": "DesktopLUT_Mon0_HDR_2.icm",
+                               "source_file": "h:/runs/OTHER/generated/mhc_base_hdr.cube"}}}
+    ev2 = _sr.check_against_pipe(rec, other, 0, "HDR")
+    assert ev2["matches"] is False and ev2["pin_nits"] is None and "different base artifact" in ev2["reason"]

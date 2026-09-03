@@ -79,6 +79,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("windows.set_hdr", {"monitor": 0, "enable": True}),
         ("windows.set_hdr", {"monitor": 0, "enable": False}),
         ("corrections.disable_all", {}),
+        ("layers.set", {**mm, "white_balance": False, "grayscale": False}),
         ("calibration.enter", {**mm, "dummy_icc_path": "C:/dlc/sRGB.icm", "reason": "contract test"}),
         ("calibration.status", {}),
         ("mhc.set_primaries", {**mm, "primaries": {"rx": 0.64, "ry": 0.33, "gx": 0.30,

@@ -181,9 +181,12 @@ def test_audit_reads_gui_layer_flags_from_the_ini(tmp_path: Path):
     ini.write_text(_INI, encoding="utf-8")
     ctrl = CalibrationController.mock()
     _associate(ctrl, 0, "HDR")
+    real_state = ctrl.state
+    ctrl.state = lambda: {k: v for k, v in real_state().items() if k != "layers"}   # pre-layers build
     audit = na.neutral_state_audit(ctrl, 0, "HDR", ini_path=ini)
     assert audit["ini_path"] == str(ini)
     assert audit["flags"]["TonemapEnabled"] == "true"
+    assert audit["gui_layers_source"] == "ini"
     assert audit["gui_layers_enabled"] == ["HDR tonemap", "Desktop Gamma"]
     assert audit["ini_profile"] == "DesktopLUT-Mon0-HDR.icm"
     assert audit["notes"] == []

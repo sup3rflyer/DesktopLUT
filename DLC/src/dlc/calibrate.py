@@ -1050,6 +1050,95 @@ class Calibration:
                 except Exception as exc:  # noqa: BLE001
                     self.ctx.log(f"could not re-apply the {pair} runtime grayscale tweak: {exc}")
 
+    # -- viewing layers: capture → measure without → restore (plan item 0b) -------------
+    def _enter_measurement_layers(self) -> Optional[dict[str, Any]]:
+        """Before the first live read: capture the user's viewing layers for the calibrated
+        pair (HDR tonemap / Desktop Gamma / GUI white balance / GUI grayscale) from the pipe
+        and switch OFF the ones that are on — a calibration measures the stack it builds on,
+        never through the user's viewing tweaks (the 19:14 WB permutation of 2026-09-03 would
+        have been baked under the cube). The user never manages these around a run: what was
+        captured is restored at the run's terminal end (:meth:`_restore_viewing_layers`),
+        apply or revert. Memoised in ``calib['viewing_layers']`` (a resume must not re-capture
+        the already-cleared state as "the user's"). Servers without ``layers`` in ``state.get``
+        (pre-2026-09-03 builds) yield ``supported: False`` — the ini audit stays the evidence."""
+        rec = self.calib.get("viewing_layers")
+        if isinstance(rec, dict) and rec.get("captured"):
+            return rec
+        try:
+            state = self.controller.state() or {}
+        except Exception as exc:  # noqa: BLE001
+            rec = {"captured": False, "supported": None,
+                   "error": f"state.get unavailable: {type(exc).__name__}: {exc}"}
+            self.calib["viewing_layers"] = rec
+            self._save()
+            return rec
+        before = CalibrationController.layers_from_state(state, self.monitor, self.mode)
+        if before is None:
+            rec = {"captured": False, "supported": False,
+                   "note": "server reports no viewing layers (pre-layers.set build) — the ini flags "
+                           "are the only evidence; disable tonemap/DG/WB/GS by hand if ON"}
+            self.calib["viewing_layers"] = rec
+            self._save()
+            return rec
+        to_clear = {name: False for name, on in before.items() if on}
+        rec = {"captured": True, "supported": True, "before": before, "disabled": sorted(to_clear),
+               "restored": False}
+        if to_clear:
+            try:
+                res = self.controller.set_layers(self.monitor, self.mode, **to_clear)
+                rec["after"] = res.get("after")
+                rec["regenerated"] = bool(res.get("regenerated"))
+                rec["profile_after"] = res.get("profile_name")
+                self.ctx.log(f"viewing layers OFF for the run: {', '.join(rec['disabled'])} "
+                             f"(captured for restore; profile now {res.get('profile_name')})")
+            except Exception as exc:  # noqa: BLE001 - surfaced, the readiness audit still judges
+                rec["error"] = f"layers.set failed: {type(exc).__name__}: {exc}"
+                self.runlog.anomaly("hardware-readiness", kind="viewing_layers",
+                                    message=f"could not switch the viewing layers off: {rec['error']}")
+        self.calib["viewing_layers"] = rec
+        self._save()
+        self.runlog.note("hardware-readiness",
+                         "viewing layers captured" + (f"; OFF: {', '.join(rec['disabled'])}" if to_clear
+                                                     else " (all already off)"),
+                         **{k: rec.get(k) for k in ("before", "disabled", "regenerated")})
+        return rec
+
+    def _restore_viewing_layers(self) -> Optional[dict[str, Any]]:
+        """Terminal end of the run (completed / reverted / aborted — never a pause): put back
+        the viewing layers captured by :meth:`_enter_measurement_layers`. On a revert of a flow
+        that entered calibration mode the C++ snapshot already restored them; re-asserting the
+        captured values is idempotent. On apply the layers land on the NEW stack (a WB/GS/DG
+        change re-bakes the new profile's permutation — the user's viewing preference on top
+        of the fresh foundation). Best-effort, recorded on the run record."""
+        rec = self.calib.get("viewing_layers")
+        if not isinstance(rec, dict) or not rec.get("captured") or rec.get("restored"):
+            return rec
+        want = {name: bool(on) for name, on in (rec.get("before") or {}).items() if on}
+        if not want:
+            rec["restored"] = True
+            rec["restore_note"] = "nothing was on"
+            self.calib["viewing_layers"] = rec
+            self._save()
+            return rec
+        try:
+            res = self.controller.set_layers(self.monitor, self.mode, **want)
+            rec["restored"] = True
+            rec["restore_after"] = res.get("after")
+            rec["restore_profile"] = res.get("profile_name")
+            self.ctx.log(f"viewing layers restored: {', '.join(sorted(want))} back ON "
+                         f"(profile now {res.get('profile_name')})")
+        except Exception as exc:  # noqa: BLE001
+            rec["restored"] = False
+            rec["restore_error"] = f"{type(exc).__name__}: {exc}"
+            self.ctx.log(f"could not restore the viewing layers ({rec['restore_error']}); "
+                         f"re-enable by hand: {', '.join(sorted(want))}")
+            self.runlog.anomaly("run", kind="viewing_layers",
+                                message=f"viewing layers NOT restored: {rec['restore_error']}; "
+                                        f"re-enable {', '.join(sorted(want))} in DesktopLUT")
+        self.calib["viewing_layers"] = rec
+        self._save()
+        return rec
+
     def _record_applied_stack(self, deliverable_cube: Optional[str]) -> None:
         """Apply path: persist what this run left installed to the per-display applied-stack
         registry (``stack_registry.py``) — the MHC's calibrated top for a later ``3dlut-only`` to
@@ -2511,6 +2600,9 @@ class Calibration:
         carry ``{monitor, mode, P, P_source, profile_name}``; the stage refuses (:class:`StageError`)
         when the association does not land. HDR and SDR alike."""
         def run() -> StageOutcome:
+            # Capture the user's viewing layers BEFORE calibration.enter clears them (the C++
+            # snapshot restores them only on revert; the apply path used to leave them off).
+            self._enter_measurement_layers()
             # Stale-calibration-mode tell (fable Phase 9): if a PREVIOUS run died without
             # exiting calibration mode, the C++ DoEnterNeutral re-snapshots unconditionally —
             # its single restore slot then holds the already-CLEARED state, so a later
@@ -2783,6 +2875,7 @@ class Calibration:
         only. When the operator gate is not required (sim/CI) the audit + refusal still run
         (pipe + ini reads only — no seam)."""
         key = "hardware-readiness"
+        self._enter_measurement_layers()
 
         def audit_and_refuse() -> dict[str, Any]:
             audit = self._neutral_state_audit()
@@ -2817,7 +2910,8 @@ class Calibration:
         if not self.require_hardware_readiness:
             audit = audit_and_refuse()
             return StageOutcome(key, "done", digest={"required": False, "neutral_audit": audit,
-                                                     "installed_stack": self.calib.get("installed_stack")})
+                                                     "installed_stack": self.calib.get("installed_stack"),
+                                                     "viewing_layers": self.calib.get("viewing_layers")})
 
         def run() -> StageOutcome:
             audit = audit_and_refuse()
@@ -2833,7 +2927,8 @@ class Calibration:
                 digest={"required": True, "monitor": self.monitor, "mode": self.mode,
                         "bit_depth": self.bit_depth, "dogegen_required": True,
                         "neutral_audit": audit,
-                        "installed_stack": self.calib.get("installed_stack")}))
+                        "installed_stack": self.calib.get("installed_stack"),
+                        "viewing_layers": self.calib.get("viewing_layers")}))
             if decision.choice == "abort":
                 raise CalibrationAborted(StageOutcome(
                     key, "aborted",
@@ -2843,7 +2938,8 @@ class Calibration:
                                 digest={"required": True, "confirmed": True,
                                         "decision_note": decision.note,
                                         "neutral_audit": audit,
-                                        "installed_stack": self.calib.get("installed_stack")})
+                                        "installed_stack": self.calib.get("installed_stack"),
+                                        "viewing_layers": self.calib.get("viewing_layers")})
 
         return self._stage(key, run)
 
@@ -5024,10 +5120,17 @@ class Calibration:
         # again per-stage (reentrant) as defence-in-depth for direct/partial-flow callers.
         try:
             with keep_awake(reason=f"dlc calibration run ({flow})"):
-                return self._run_flow(flow)
+                result = self._run_flow(flow)
+        except AdjudicationRequired:
+            raise          # a PAUSE: the run continues later in the measurement state
+        except BaseException:
+            self._restore_viewing_layers()   # any other exit is terminal for this run
+            raise
         finally:
             if self._enable_watchdog:
                 self.liveness.stop()
+        self._restore_viewing_layers()       # completed / reverted / aborted (result returned)
+        return result
 
     def _run_flow(self, flow: str) -> CalibrationResult:
         try:

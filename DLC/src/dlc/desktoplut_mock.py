@@ -25,6 +25,10 @@ class MockDesktopLutState:
     # Live HDR-active state per monitor index (the OS advanced-color flip
     # windows.set_hdr drives). Absent ⇒ SDR. Capability is fixed (see HDR_CAPABLE).
     hdr: dict[int, bool] = field(default_factory=dict)
+    # Viewing layers per "monitor:MODE" (C++ HandleStateGet "layers"): the MHC's white
+    # balance / correction grayscale / Desktop Gamma bits + the HDR tonemap shader flag.
+    # Absent key = all OFF (a fresh install).
+    layers: dict[str, dict[str, bool]] = field(default_factory=dict)
     command_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
@@ -36,6 +40,10 @@ class MockDesktopLutState:
             "mhc": deepcopy(self.mhc),
             "runtime": deepcopy(self.runtime),
             "hdr": deepcopy(self.hdr),
+            # C++ reports every monitor:mode pair (absent = a fresh install, all OFF)
+            "layers": {k: {"tonemap": False, "desktop_gamma": False, "white_balance": False,
+                           "grayscale": False, **(self.layers.get(k) or {})}
+                       for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "command_count": self.command_count,
         }
 
@@ -65,6 +73,12 @@ class MockDesktopLutServer:
                 self._cleanup_active_gs_live()   # C++ CleanupActiveGsLive runs here too
                 self.state.corrections_enabled = False
                 return self.ok({"corrections_enabled": False})
+            if method == "layers.set":
+                return self.handle_layers_set(params)
+            if method == "layers.set":
+                return self.handle_layers_set(params)
+            if method == "layers.set":
+                return self.handle_layers_set(params)
             if method.startswith("calibration."):
                 return self.handle_calibration(method, params)
             if method.startswith("mhc."):
@@ -204,6 +218,7 @@ class MockDesktopLutServer:
         self.state.mhc = deepcopy(snapshot.get("mhc", {}))
         self.state.runtime = deepcopy(snapshot.get("runtime", {}))
         self.state.hdr = {int(k): bool(v) for k, v in deepcopy(snapshot.get("hdr", {})).items()}
+        self.state.layers = deepcopy(snapshot.get("layers", {}))
         return self.ok({"snapshot_id": snapshot_id, "restored": True})
 
     def _cleanup_active_gs_live(self) -> None:
@@ -218,6 +233,99 @@ class MockDesktopLutServer:
                     st["correction_grayscale"] = saved
                 else:
                     st.pop("correction_grayscale", None)
+
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+
+    def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
+        """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
+        an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
+        client saw before the toggle is gone, its source_file identity is not)."""
+        key = self.key(params)
+        is_hdr = key.endswith(":HDR")
+        cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
+        before = dict(cur)
+        mhc_changed = False
+        for name in self.LAYER_NAMES:
+            if name in params:
+                val = bool(params[name])
+                if not is_hdr and name in ("desktop_gamma", "tonemap"):
+                    if val:
+                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap are HDR-only layers")
+                    continue
+                if cur.get(name) != val:
+                    cur[name] = val
+                    if name != "tonemap":
+                        mhc_changed = True
+        self.state.layers[key] = cur
+        entry = self.state.mhc.get(key) or {}
+        regenerated = False
+        if mhc_changed and entry.get("applied") and entry.get("profile_name"):
+            entry["profile_name"] = f"DesktopLUT-sim-{key.replace(':', '-')}-perm{self.state.command_count}.icm"
+            regenerated = True
+        return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
+                        "regenerated": regenerated, "profile_name": entry.get("profile_name")})
+
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+
+    def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
+        """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
+        an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
+        client saw before the toggle is gone, its source_file identity is not)."""
+        key = self.key(params)
+        is_hdr = key.endswith(":HDR")
+        cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
+        before = dict(cur)
+        mhc_changed = False
+        for name in self.LAYER_NAMES:
+            if name in params:
+                val = bool(params[name])
+                if not is_hdr and name in ("desktop_gamma", "tonemap"):
+                    if val:
+                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap are HDR-only layers")
+                    continue
+                if cur.get(name) != val:
+                    cur[name] = val
+                    if name != "tonemap":
+                        mhc_changed = True
+        self.state.layers[key] = cur
+        entry = self.state.mhc.get(key) or {}
+        regenerated = False
+        if mhc_changed and entry.get("applied") and entry.get("profile_name"):
+            entry["profile_name"] = f"DesktopLUT-sim-{key.replace(':', '-')}-perm{self.state.command_count}.icm"
+            regenerated = True
+        return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
+                        "regenerated": regenerated, "profile_name": entry.get("profile_name")})
+
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+
+    def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
+        """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
+        an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
+        client saw before the toggle is gone, its source_file identity is not)."""
+        key = self.key(params)
+        is_hdr = key.endswith(":HDR")
+        cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
+        before = dict(cur)
+        mhc_changed = False
+        for name in self.LAYER_NAMES:
+            if name in params:
+                val = bool(params[name])
+                if not is_hdr and name in ("desktop_gamma", "tonemap"):
+                    if val:
+                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap are HDR-only layers")
+                    continue
+                if cur.get(name) != val:
+                    cur[name] = val
+                    if name != "tonemap":
+                        mhc_changed = True
+        self.state.layers[key] = cur
+        entry = self.state.mhc.get(key) or {}
+        regenerated = False
+        if mhc_changed and entry.get("applied") and entry.get("profile_name"):
+            entry["profile_name"] = f"DesktopLUT-sim-{key.replace(':', '-')}-perm{self.state.command_count}.icm"
+            regenerated = True
+        return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
+                        "regenerated": regenerated, "profile_name": entry.get("profile_name")})
 
     def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
         if method == "calibration.status":
@@ -241,6 +349,8 @@ class MockDesktopLutServer:
             # the 2026-08-14 HDR run lost the user's SDR cube exactly this way.
             self.state.mhc.pop(key, None)
             self.state.runtime.pop(key, None)
+            # C++ clears WB/GS/DG + tonemap for the pair (the snapshot above keeps the user's)
+            self.state.layers[key] = {n: False for n in self.LAYER_NAMES}
             self.state.calibration_mode = {
                 "active": True,
                 "snapshot_id": snapshot_id,

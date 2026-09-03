@@ -49,6 +49,8 @@ GUI_LAYER_KEYS: tuple[str, ...] = (
 
 # ini key → human label for the refusal message. Every one of these is a layer the C++
 # DoEnterNeutral is supposed to clear for the calibrated mode.
+_PIPE_LAYER_LABELS = {"tonemap": "HDR tonemap", "desktop_gamma": "Desktop Gamma",
+                      "white_balance": "GUI white balance", "grayscale": "GUI grayscale correction"}
 _LAYER_LABELS: dict[str, str] = {
     "TonemapEnabled": "HDR tonemap",
     "MHCDesktopGamma": "Desktop Gamma",
@@ -189,10 +191,13 @@ def neutral_state_audit(controller: Any, monitor: int, mode: str, *,
         out["notes"].append(f"calibration.status unavailable: {type(exc).__name__}: {exc}")
     mhc_entry: dict[str, Any] = {}
     runtime_entry: dict[str, Any] = {}
+    pipe_layers: Optional[dict[str, Any]] = None
     try:
         state = controller.state() or {}
         mhc_entry = dict((state.get("mhc") or {}).get(key) or {})
         runtime_entry = dict((state.get("runtime") or {}).get(key) or {})
+        pl = (state.get("layers") or {}).get(key)
+        pipe_layers = dict(pl) if isinstance(pl, dict) else None
         out["state_ok"] = True
     except Exception as exc:  # noqa: BLE001
         out["state_ok"] = False
@@ -208,7 +213,20 @@ def neutral_state_audit(controller: Any, monitor: int, mode: str, *,
     out["flags"] = flags
     if note:
         out["notes"].append(note)
-    out["gui_layers_enabled"] = [label for k, label in _LAYER_LABELS.items() if ini_true(flags.get(k, "false"))]
+    ini_on = [label for k, label in _LAYER_LABELS.items() if ini_true(flags.get(k, "false"))]
+    out["pipe_layers"] = pipe_layers
+    if pipe_layers is not None:
+        # The live server reports the layers (2026-09-03 `layers` in state.get): that is the
+        # truth — the ini is written on change but can lag or belong to a previous session.
+        pipe_on = [label for name, label in _PIPE_LAYER_LABELS.items() if pipe_layers.get(name)]
+        out["gui_layers_enabled"] = pipe_on
+        out["gui_layers_source"] = "pipe"
+        if flags and sorted(pipe_on) != sorted(ini_on):
+            out["notes"].append(f"ini layer flags ({', '.join(ini_on) or 'none'} ON) disagree with the "
+                                f"pipe ({', '.join(pipe_on) or 'none'} ON) — the pipe is authoritative")
+    else:
+        out["gui_layers_enabled"] = ini_on
+        out["gui_layers_source"] = "ini"
     if flags:
         out["ini_profile"] = (flags.get("MHCProfilePath") or "").replace("\\", "/").split("/")[-1] or None
     return out

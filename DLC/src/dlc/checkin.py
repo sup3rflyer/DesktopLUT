@@ -181,6 +181,9 @@ def run_overview(cal: Any, trigger: str) -> dict[str, Any]:
         # Flows that keep the installed MHC: the registry cross-check the HDR peak pin rests on
         # (pin_nits / matches / reason) — None for flows that build their own MHC.
         "installed_stack": cal.calib.get("installed_stack"),
+        # The user's viewing layers captured before the first read (what is OFF for the run
+        # and will be restored at the end) — or why they could not be handled.
+        "viewing_layers": cal.calib.get("viewing_layers"),
         # The HDR target peak the run is bounding + scoring against right now (re-pinned to the
         # MHC's cap after a capped build) and where it came from.
         "hdr_peak": _hdr_peak_summary(cal.calib.get("hdr_target")),

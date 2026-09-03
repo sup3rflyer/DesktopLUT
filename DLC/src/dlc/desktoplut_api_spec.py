@@ -70,6 +70,12 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                        "(the Design-B grayscale-wb revert snapshot source) — a DesktopLUT-side ticket; "
                        "until then the snapshot degrades to clear-to-identity on hardware (fable Phase 9)",
                 "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
+                "layers": "object keyed by '<monitor>:<MODE>' for EVERY pair: the viewing layers a run "
+                          "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap: bool"
+                          "; HDR adds tonemap_dynamic, tonemap_target_peak}. mhc entries also carry "
+                          "source_file (the DLC base 1D .cube the profile was generated from — the "
+                          "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
+                          "Absent on pre-2026-09-03 builds (then the ini is the only layer evidence).",
                 "contract_version": "integer (optional): the wire-contract version the server speaks. "
                                     "Absent = pre-versioning build = 1. DLC checks this at preflight so a "
                                     "mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
@@ -83,6 +89,28 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "Disable all runtime correction layers for a clean measurement baseline.",
             {},
             {"corrections_enabled": "boolean false"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "layers.set",
+            "Toggle the viewing layers of one monitor:mode exactly as the GUI checkboxes do: the "
+            "MHC's white balance / correction grayscale / Desktop Gamma permutation bits (an MHC "
+            "re-bake under a new profile name) and the HDR tonemap shader flag. Omitted layers are "
+            "kept. DLC captures the user's layers before a run, measures with them OFF, and "
+            "restores them at the run's terminal end — the user never manages corrections around "
+            "a pipeline run (plan item 0b, 2026-09-03).",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "white_balance": ApiParamSpec("boolean", required=False, description="MHC white balance bit (optional)"),
+                "grayscale": ApiParamSpec("boolean", required=False, description="MHC correction-grayscale bit (optional)"),
+                "desktop_gamma": ApiParamSpec("boolean", required=False, description="Desktop Gamma bit, HDR only (optional)"),
+                "tonemap": ApiParamSpec("boolean", required=False, description="HDR tonemap shader flag, HDR only (optional)"),
+            },
+            {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap}",
+             "after": "object (same shape)", "regenerated": "boolean (MHC profile re-baked)",
+             "profile_name": "string (the profile now associated)"},
             mutates_state=True,
             gui_thread_required=True,
         ),
