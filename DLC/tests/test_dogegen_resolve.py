@@ -43,6 +43,37 @@ def test_patch_xml_bits_default_is_10():
     assert b'bits="8"' in resolve_patch_xml(1, 2, 3, bits=8)
 
 
+def test_patch_xml_windowed_geometry_is_two_rects_bg_first():
+    # OLED/ABL path: a centered window instead of full-field. dogegen paints rectangles
+    # sequentially (later on top) and never clears the frame itself (HW-verified: a lone
+    # windowed rect sits on garbage — green on a YCbCr link). The windowed form MUST be
+    # full-field black first, then the patch window.
+    xml = resolve_patch_xml(940, 941, 942, geometry=(0.3814, 0.2891, 0.2373, 0.4219)).decode("ascii")
+    bg = xml.index('<rectangle><color red="0" green="0" blue="0"')
+    win = xml.index('<rectangle><color red="940" green="941" blue="942"')
+    assert bg < win, "background rectangle must be painted before the patch window"
+    # per-rectangle attribute ordering still applies (getAttr substring hazard)
+    tail = xml[win:]
+    assert tail.index('x="') < tail.index('cx="')
+    assert 'x="0.3814"' in tail and 'y="0.2891"' in tail
+    assert 'cx="0.2373"' in tail and 'cy="0.4219"' in tail
+
+
+def test_resolve_dogegen_show_uses_configured_geometry():
+    rdg = ResolveDogegen("dogegen.exe", geometry=(0.25, 0.25, 0.5, 0.5))
+    sent = []
+
+    class FakeConn:
+        def sendall(self, data):
+            sent.append(bytes(data))
+
+    rdg._conn = FakeConn()
+    rdg.show(1, 2, 3)
+    payload = sent[0][4:].decode("ascii")
+    assert '<geometry x="0.25" y="0.25" cx="0.5" cy="0.5"/>' in payload
+    assert payload.index('red="0"') < payload.index('red="1"')  # black bg painted first
+
+
 def test_frame_prefixes_big_endian_int32_length():
     payload = b"hello world"
     framed = frame(payload)

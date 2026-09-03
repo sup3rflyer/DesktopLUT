@@ -34,16 +34,36 @@ from pathlib import Path
 from typing import Optional
 
 
-def resolve_patch_xml(r: int, g: int, b: int, *, bits: int = 10) -> bytes:
-    """Full-field Resolve calibration XML for one patch (ASCII bytes, unframed).
+def resolve_patch_xml(r: int, g: int, b: int, *, bits: int = 10,
+                      geometry: Optional[tuple[float, float, float, float]] = None) -> bytes:
+    """Resolve calibration XML for one patch (ASCII bytes, unframed).
 
-    ``r``/``g``/``b`` are integer code values in ``0..2**bits-1``. Geometry is full-field
-    (x=0 y=0 cx=1 cy=1). Attribute order is deliberate — see the module docstring."""
+    ``r``/``g``/``b`` are integer code values in ``0..2**bits-1``. ``geometry`` is
+    ``(x, y, cx, cy)`` in normalized [0,1] — the patch window dogegen draws (the rest of
+    the render target stays black). ``None`` = full-field (x=0 y=0 cx=1 cy=1), the
+    mini-LED default; a WINDOWED patch is what an OLED needs (ABL dims a large bright
+    field mid-read). Attribute order is deliberate — see the module docstring."""
+    if geometry is None:
+        xml = (
+            "<calibration>"
+            f'<color red="{int(r)}" green="{int(g)}" blue="{int(b)}" bits="{int(bits)}"/>'
+            '<geometry x="0" y="0" cx="1" cy="1"/>'
+            "</calibration>"
+        )
+        return xml.encode("ascii")
+    # Windowed patch — TWO rectangles, painter's order (HW-verified 2026-09-02 on the
+    # LG C6): dogegen draws rectangles sequentially, later on top, and does NOT clear
+    # the frame to black on its own (a lone windowed rect leaves garbage — a green
+    # field on the YCbCr link — behind it). So paint a full-field black background
+    # first, then the patch window.
+    x, y, cx, cy = (float(v) for v in geometry)
     xml = (
-        "<calibration>"
-        f'<color red="{int(r)}" green="{int(g)}" blue="{int(b)}" bits="{int(bits)}"/>'
-        '<geometry x="0" y="0" cx="1" cy="1"/>'
-        "</calibration>"
+        "<calibration><shapes>"
+        f'<rectangle><color red="0" green="0" blue="0" bits="{int(bits)}"/>'
+        '<geometry x="0" y="0" cx="1" cy="1"/></rectangle>'
+        f'<rectangle><color red="{int(r)}" green="{int(g)}" blue="{int(b)}" bits="{int(bits)}"/>'
+        f'<geometry x="{x:g}" y="{y:g}" cx="{cx:g}" cy="{cy:g}"/></rectangle>'
+        "</shapes></calibration>"
     )
     return xml.encode("ascii")
 
@@ -62,10 +82,12 @@ class ResolveDogegen:
 
     def __init__(self, executable, *, is_hdr: bool = True, bits: int = 10,
                  host: str = "127.0.0.1", port: int = 20002,
-                 connect_timeout: float = 15.0, io_timeout: float = 10.0) -> None:
+                 connect_timeout: float = 15.0, io_timeout: float = 10.0,
+                 geometry: Optional[tuple[float, float, float, float]] = None) -> None:
         self.executable = Path(executable)
         self.is_hdr = is_hdr
         self.bits = bits
+        self.geometry = geometry          # (x, y, cx, cy) normalized; None = full-field
         self.host = host
         self.port = port
         self.connect_timeout = connect_timeout
@@ -102,10 +124,12 @@ class ResolveDogegen:
         return self.proc
 
     def show(self, r: int, g: int, b: int) -> None:
-        """Display a full-field patch at code values ``(r, g, b)``."""
+        """Display a patch at code values ``(r, g, b)`` in the configured geometry
+        (full-field unless a window was given)."""
         if self._conn is None:
             raise RuntimeError("ResolveDogegen is not started")
-        self._conn.sendall(frame(resolve_patch_xml(r, g, b, bits=self.bits)))
+        self._conn.sendall(frame(resolve_patch_xml(r, g, b, bits=self.bits,
+                                                   geometry=self.geometry)))
 
     def close(self) -> None:
         """Tell dogegen to close (length 0), drop the sockets, and stop the process. Idempotent."""

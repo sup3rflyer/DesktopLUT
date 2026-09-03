@@ -81,8 +81,25 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
     orchestrator-facing line protocol on ``host:port`` is identical either way; only how the daemon
     talks to dogegen changes."""
     if resolve:
+        # patch_size is a LINEAR percent of the monitor's short side (matches
+        # patch_presenter's convention): the patch is a centered square of
+        # min(w,h)*size/100 pixels. 100 (or more) = full-field, the mini-LED
+        # default. A windowed patch (e.g. 42 ≈ 10% of a 16:9 screen's AREA — the
+        # TV-cal "10% window") is what OLED/ABL panels need.
+        geometry = None
+        if patch_size < 100:
+            if monitor_rect is not None:
+                w, h = float(monitor_rect[2]), float(monitor_rect[3])   # Rect = (x, y, w, h)
+            else:
+                w, h = 3840.0, 2160.0     # aspect fallback; geometry is normalized anyway
+            side = min(w, h) * patch_size / 100.0
+            cx, cy = side / w, side / h
+            geometry = ((1.0 - cx) / 2.0, (1.0 - cy) / 2.0, cx, cy)
+            print(f"[dogegen-server] windowed patch: {patch_size}% of short side "
+                  f"(geometry x={geometry[0]:.4f} y={geometry[1]:.4f} cx={cx:.4f} cy={cy:.4f})",
+                  flush=True)
         rdg = ResolveDogegen(Path(dogegen_path), is_hdr=(mode.upper() == "HDR"),
-                             bits=bit_depth, port=resolve_port)
+                             bits=bit_depth, port=resolve_port, geometry=geometry)
         proc = rdg.start()                 # we listen, launch dogegen, accept its connection
         print(f"[dogegen-server] dogegen up via Resolve ({rdg.startup_command}) pid {proc.pid}",
               flush=True)
