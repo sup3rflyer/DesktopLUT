@@ -125,6 +125,8 @@ from .metrics import (delta_e2000, metrics_scored_payload, percentile, practical
                       score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab)
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
 from . import neutral_audit
+from . import stack_registry
+from . import thermal_align
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
 from . import patch_evidence
@@ -345,6 +347,7 @@ class Calibration:
         neutral_floor_min_nits: Optional[float] = None,
         dark_min_reads: Optional[int] = None,
         dark_floor_max_nits: Optional[float] = None,
+        thermal_align: str = "auto",
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -373,6 +376,10 @@ class Calibration:
         # (how much to smooth a dark correction to identity). None ⇒ MeasureLoopConfig default (off).
         self.dark_min_reads = dark_min_reads
         self.dark_floor_max_nits = dark_floor_max_nits
+        # Thermal-state alignment policy for the raw / post-MHC datasets (plan item 3):
+        # 'auto' = evidence every stage, SEAM when the reference track's drift is significant;
+        # 'end'/'start'/'mid' = pre-decided (applied, reported, no pause); 'none' = evidence only.
+        self.thermal_align = (thermal_align or "auto").lower()
         self.optimize_config = optimize_config or OptimizeConfig()
         self.characterize_config = characterize_config
         self.run_date = run_date or date.today()
@@ -1043,6 +1050,40 @@ class Calibration:
                 except Exception as exc:  # noqa: BLE001
                     self.ctx.log(f"could not re-apply the {pair} runtime grayscale tweak: {exc}")
 
+    def _record_applied_stack(self, deliverable_cube: Optional[str]) -> None:
+        """Apply path: persist what this run left installed to the per-display applied-stack
+        registry (``stack_registry.py``) — the MHC's calibrated top for a later ``3dlut-only`` to
+        pin its peak to, and the durable cube path. Best-effort: never a gate on the run."""
+        flow = self.calib.get("flow")
+        try:
+            reg = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root))
+            try:
+                pipe = self.controller.state() or {}
+                pipe_profile = ((pipe.get("mhc") or {}).get(f"{self.monitor}:{self.mode}") or {}).get("profile_name")
+            except Exception:  # noqa: BLE001
+                pipe_profile = None
+            cube = deliverable_cube or (
+                (self.calib["stages"].get("build-install-3dlut") or {}).get("digest") or {}).get("cube_path")
+            params = self._state.get("mhc_params") or {}
+            if flow in ("full", "mhc-only") and params:
+                rec = stack_registry.record_from_mhc_params(
+                    display=self.display.name, mode=self.mode, monitor=self.monitor,
+                    run_id=self.ctx.root.name, profile_name=pipe_profile, mhc_params=params,
+                    target_white_xy=self._white_xy())
+                if cube:
+                    rec.cube = {"cube_path": cube, "run_id": self.ctx.root.name,
+                                "applied_at": rec.applied_at}
+                reg.record(rec)
+                self.ctx.log(f"applied-stack registry: {rec.key} <- run {rec.run_id} "
+                             f"(profile {pipe_profile}, top {rec.cube_peak_nits})")
+            elif flow == "3dlut-only":
+                rec = reg.record_cube(display=self.display.name, mode=self.mode, monitor=self.monitor,
+                                      run_id=self.ctx.root.name, cube_path=cube, profile_name=pipe_profile)
+                self.ctx.log(f"applied-stack registry: {rec.key} cube <- run {self.ctx.root.name}")
+        except Exception as exc:  # noqa: BLE001 - registry is priors for the next run, never a gate
+            self.ctx.log(f"applied-stack registry not updated ({type(exc).__name__}: {exc})")
+
     def _install_durable_cube(self, cube_path: Optional[str]) -> None:
         """Re-point DesktopLUT at the DURABLE deliverable cube (under ``results/``) rather
         than leaving it aimed at the run-dir build artifact (``runs/<run>/generated/final_*.cube``,
@@ -1160,11 +1201,96 @@ class Calibration:
                 # A truncated / hand-edited dlc_state.json must not crash the run with an
                 # opaque KeyError — re-derive from the DIP + resolved white and overwrite.
                 pass
+        pin = self._installed_stack_evidence()
+        pin_nits = pin.get("pin_nits") if pin else None
         tgt = self.profile.resolve_hdr_target(self.target_name, dip=self._dip(),
-                                              white_xy=self._white_xy())
+                                              white_xy=self._white_xy(),
+                                              pinned_peak_nits=pin_nits)
+        if pin_nits:
+            # Provenance says WHY the peak is the installed cap (the plan seam quotes it).
+            prov = dict(tgt.provenance or {})
+            prov["peak"] = {**(prov.get("peak") or {}), "source": "installed_mhc_cap",
+                            "grounded": True, "sustained_unknown": False,
+                            "note": pin.get("reason"),
+                            "installed_stack": {k: pin.get(k) for k in
+                                                ("run_id", "recorded_profile", "pipe_profile", "matches")}}
+            tgt = replace(tgt, provenance=prov)
         self.calib["hdr_target"] = tgt.as_dict()
         self._save()
         return tgt
+
+    _FLOWS_KEEPING_MHC = ("3dlut-only", "grayscale-wb")
+    _REPIN_MIN_SHORTFALL = 0.005    # cap must sit > 0.5 % under the resolved peak to re-pin
+
+    def _installed_stack_evidence(self) -> Optional[dict[str, Any]]:
+        """For flows that KEEP the installed MHC: what the applied-stack registry recorded for
+        this display+mode, cross-checked against the pipe's current profile name — the evidence
+        the HDR peak pin rests on (``pin_nits`` set only when the record is trustworthy). Memoised
+        in the run record (a resume must see the same pin the plan was approved with). ``None``
+        for flows that build their own MHC (the cap is decided in-run and re-pinned there)."""
+        if self.calib.get("flow") not in self._FLOWS_KEEPING_MHC:
+            return None
+        cached = self.calib.get("installed_stack")
+        if isinstance(cached, dict):
+            return cached
+        try:
+            reg = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root))
+            rec = reg.get(self.display.name, self.mode)
+        except Exception as exc:  # noqa: BLE001 - priors, never a gate
+            rec, reg = None, None
+            self.ctx.log(f"stack registry unreadable ({type(exc).__name__}: {exc}); peak not pinned")
+        try:
+            pipe_state = self.controller.state()
+        except Exception:  # noqa: BLE001
+            pipe_state = None
+        evidence = stack_registry.check_against_pipe(rec, pipe_state, self.monitor, self.mode)
+        if reg is not None and (reg.corrupt or reg.dropped):
+            evidence["registry_warning"] = (f"registry corrupt={reg.corrupt} dropped={reg.dropped}")
+        self.calib["installed_stack"] = evidence
+        self._save()
+        return evidence
+
+    def _pin_hdr_peak_to_cap(self, outcome: "StageOutcome") -> None:
+        """After an HDR MHC build in THIS run: when the Peak-Chroma policy capped the base cube
+        below the resolved peak, the stack's calibrated top IS the cap — re-pin the run's HDR
+        target to it so every post-MHC stage (volumetric patches, the cube's targets, verify)
+        bounds and scores against what the stack holds, not a luminance it deliberately gave up
+        (one source of truth, Task C). The plan is re-fingerprinted with the new cap (a
+        deterministic consequence of the adjudicated build, recorded as such — not a re-approval
+        the LLM never saw). Idempotent on replay."""
+        pc = (outcome.digest or {}).get("peak_chroma") or {}
+        cap = _as_float_local(pc.get("cube_peak_nits"))
+        if cap is None or cap <= 0 or not pc.get("capped"):
+            return
+        hdr = self._hdr_target()
+        # A real cap, not the top patch's PQ quantization: the build reports ``capped`` whenever
+        # the cube top sits under the resolved peak at all, and the highest measured code lands
+        # ~0.3 % under the peak on a 10-bit PQ ramp. Below _REPIN_MIN_SHORTFALL the stack holds
+        # the resolved peak to within a code step — nothing to re-target.
+        if cap >= hdr.peak_nits * (1.0 - self._REPIN_MIN_SHORTFALL):
+            return
+        prior_fp = (self.calib.get("patch_plan") or {}).get("fingerprint")
+        prov = dict(hdr.provenance or {})
+        prov["peak"] = {**(prov.get("peak") or {}), "source": "mhc_cap", "grounded": True,
+                        "resolved_peak_nits": hdr.peak_nits,
+                        "cap_policy": pc.get("cap_policy"), "binding_channel": pc.get("binding_channel"),
+                        "note": (f"re-pinned from {hdr.peak_nits:.1f} to the MHC's calibrated top "
+                                 f"{cap:.1f} nits ({pc.get('cap_policy') or 'cap'}, binding "
+                                 f"{pc.get('binding_channel')}) — post-MHC stages target what the stack holds")}
+        pinned = replace(hdr, peak_nits=float(cap), knee_start_nits=min(hdr.knee_start_nits, float(cap)),
+                         provenance=prov)
+        self.calib["hdr_target"] = pinned.as_dict()
+        plan = self._patch_plan_record(self.calib.get("flow"))
+        self.calib["patch_plan"] = {**plan, "approved": True, "repinned_from": prior_fp,
+                                    "repin_reason": f"HDR peak {hdr.peak_nits:.1f} -> {cap:.1f} nits (MHC cap)"}
+        self._save()
+        self.ctx.log(f"HDR target peak re-pinned to the MHC's calibrated top: {hdr.peak_nits:.1f} -> "
+                     f"{cap:.1f} nits; post-MHC patch cap cv {self._patch_max_cv()}")
+        self.runlog.note("build-install-mhc",
+                         f"HDR peak re-pinned {hdr.peak_nits:.1f} -> {cap:.1f} nits (MHC cap)",
+                         peak_from=hdr.peak_nits, peak_to=cap, patch_max_cv=self._patch_max_cv(),
+                         plan_fingerprint_from=prior_fp, plan_fingerprint_to=self.calib["patch_plan"].get("fingerprint"))
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def _correction_store(self) -> CorrectionStore:
@@ -2096,7 +2222,11 @@ class Calibration:
                     "approved_patch_plan": existing_plan,
                     "current_patch_plan": patch_plan,
                 }))
-        self.calib["patch_plan"] = {**patch_plan, "approved": bool(
+        # Keep the re-pin provenance (_pin_hdr_peak_to_cap) across resumes — the fresh record
+        # has no memory of WHY the fingerprint moved.
+        carried = {k: existing_plan[k] for k in ("repinned_from", "repin_reason")
+                   if isinstance(existing_plan, dict) and k in existing_plan}
+        self.calib["patch_plan"] = {**carried, **patch_plan, "approved": bool(
             isinstance(existing_plan, dict)
             and existing_plan.get("approved")
             and existing_plan.get("fingerprint") == patch_plan.get("fingerprint")
@@ -2126,6 +2256,18 @@ class Calibration:
                     "the target peak rests on no warm/sustained capture "
                     f"({(prov.get('peak') or {}).get('source', 'unknown source')}) — a peak the "
                     "panel cannot hold bakes in error; a characterize run grounds it")
+            if flow in self._FLOWS_KEEPING_MHC:
+                stack = self.calib.get("installed_stack") or {}
+                digest["installed_stack"] = stack
+                if not stack.get("pin_nits"):
+                    plan_warnings.append(
+                        "the installed MHC's calibrated top is UNKNOWN ("
+                        + str(stack.get("reason") or "no registry evidence")
+                        + f") — the target peak falls back to {hdr.peak_nits:.0f} nits; if the "
+                        "installed MHC caps D65 lower, every patch above its cap reads as a "
+                        "plateau the cube cannot lift and the white scores that shortfall. "
+                        "Backfill with `python -m dlc.stack_registry import-run --run <applying "
+                        "run> --profile-name <pipe profile>` and restart, or approve knowingly")
         if plan_warnings:
             digest["hdr_target_warnings"] = plan_warnings
         self._abort_if(self.adjudicate(AdjudicationRequest(
@@ -2139,7 +2281,7 @@ class Calibration:
                       + "Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
             stage="resolve-target", message="plan vetoed by the operator")
-        self.calib["patch_plan"] = {**patch_plan, "approved": True}
+        self.calib["patch_plan"] = {**carried, **patch_plan, "approved": True}
         self._save()
         self.runlog.stage_done("resolve-target", target=target)
         self._emit_header()   # the target is now known — enrich the dashboard status bar
@@ -2674,7 +2816,8 @@ class Calibration:
 
         if not self.require_hardware_readiness:
             audit = audit_and_refuse()
-            return StageOutcome(key, "done", digest={"required": False, "neutral_audit": audit})
+            return StageOutcome(key, "done", digest={"required": False, "neutral_audit": audit,
+                                                     "installed_stack": self.calib.get("installed_stack")})
 
         def run() -> StageOutcome:
             audit = audit_and_refuse()
@@ -2689,7 +2832,8 @@ class Calibration:
                 options=("ready", "abort"), recommendation="ready",
                 digest={"required": True, "monitor": self.monitor, "mode": self.mode,
                         "bit_depth": self.bit_depth, "dogegen_required": True,
-                        "neutral_audit": audit}))
+                        "neutral_audit": audit,
+                        "installed_stack": self.calib.get("installed_stack")}))
             if decision.choice == "abort":
                 raise CalibrationAborted(StageOutcome(
                     key, "aborted",
@@ -2698,7 +2842,8 @@ class Calibration:
             return StageOutcome(key, "done",
                                 digest={"required": True, "confirmed": True,
                                         "decision_note": decision.note,
-                                        "neutral_audit": audit})
+                                        "neutral_audit": audit,
+                                        "installed_stack": self.calib.get("installed_stack")})
 
         return self._stage(key, run)
 
@@ -2819,6 +2964,7 @@ class Calibration:
                                         or measurement_path_compromised
                                         or score_anomaly)}))
             if decision.choice == "remeasure":
+                self._invalidate_thermal_align(key, outcome.data.get("ti3"))
                 self.calib["stages"].pop(key, None)
                 self.calib.get("decisions", {}).pop(f"{key}:escalation", None)
                 self.decision_overrides.pop(f"{key}:escalation", None)
@@ -2839,6 +2985,157 @@ class Calibration:
                             digest={"message": "measurement retry requested at LLM seam",
                                     "retry_requested": True, **outcome.digest}))
             self._abort_if(decision, stage=key, message="aborted on unsettled measurement")
+        if role in ("raw", "post-mhc") and outcome.status == "done":
+            outcome = self._thermal_align_gate(key, role, outcome)
+        return outcome
+
+    # -- thermal-state alignment (plan item 3) ----------------------------
+    def _invalidate_thermal_align(self, key: str, ti3: Optional[str] = None) -> None:
+        """A measure stage is about to be RE-MEASURED into the same files (escalation
+        ``remeasure`` / adaptive-planning invalidation): drop its alignment record, the memoised
+        seam decision (the LLM must judge the NEW data), and the on-disk backup/note — otherwise
+        the fresh dataset is consumed unaligned while the record claims alignment (adversarial
+        review, 2026-09-03)."""
+        store = self.calib.get("thermal_align") or {}
+        store.pop(key, None)
+        self.calib["thermal_align"] = store
+        dkey = f"{key}:thermal-align"
+        (self.calib.get("decisions") or {}).pop(dkey, None)
+        self.decision_overrides.pop(dkey, None)
+        seed = getattr(self.adjudicator, "decisions", None)
+        if isinstance(seed, dict):
+            seed.pop(dkey, None)
+        if ti3:
+            try:
+                thermal_align.discard_backup(Path(ti3))
+            except OSError as exc:
+                self.ctx.log(f"could not discard the stale thermal-align backup for {key}: {exc}")
+
+    def _thermal_align_basis(self) -> Optional[tuple[dict[str, Any], tuple[float, float]]]:
+        """The linear basis the alignment gains live in: this run's measured MHC primaries +
+        native white when the build has run, else the DIP's native primaries, else the target
+        colour space (any consistent basis near the panel's works — the gain is per channel)."""
+        params = self._state.get("mhc_params") or {}
+        prim = params.get("primaries")
+        mw = params.get("measured_white") or {}
+        if prim and all(k in prim for k in ("rx", "ry", "gx", "gy", "bx", "by")) and mw.get("x"):
+            return dict(prim), (float(mw["x"]), float(mw["y"]))
+        dip = self._dip()
+        if dip is not None and dip.native_primaries and getattr(dip, "native_white_xy", None):
+            npr = dip.native_primaries
+            if all(ch in npr and npr[ch] and len(npr[ch]) >= 2 for ch in ("R", "G", "B")):
+                return ({"rx": npr["R"][0], "ry": npr["R"][1], "gx": npr["G"][0], "gy": npr["G"][1],
+                         "bx": npr["B"][0], "by": npr["B"][1]},
+                        (float(dip.native_white_xy[0]), float(dip.native_white_xy[1])))
+        cs = gamut.STANDARD_PRIMARIES["Rec.2020" if self.mode == "HDR" else "Rec.709"]
+        try:
+            white = self._white_xy()
+        except Exception:  # noqa: BLE001 - no resolved target yet (direct stage use): D65 basis
+            white = (0.3127, 0.3290)
+        return ({"rx": cs["R"][0], "ry": cs["R"][1], "gx": cs["G"][0], "gy": cs["G"][1],
+                 "bx": cs["B"][0], "by": cs["B"][1]}, white)
+
+    def _thermal_align_gate(self, key: str, role: str, outcome: StageOutcome) -> StageOutcome:
+        """Evidence every time, a SEAM when it matters (Design Law): the stage's interleaved
+        reference track is turned into an alignment evidence packet (span vs the reference's own
+        read noise, and the |Δx| each option would move the dataset by). Below the significance
+        threshold the packet rides the record/check-in and nothing is touched; above it the LLM
+        chooses the state the dataset is aligned to (end / mid / start / none) — or the operator
+        pre-decided it with ``--thermal-align``. The chosen alignment rewrites the stage TI3 in
+        place (original kept as ``.orig``, idempotent) BEFORE the build consumes it."""
+        ti3, nd = outcome.data.get("ti3"), outcome.data.get("ndjson")
+        if not ti3 or not nd:
+            return outcome
+        basis = self._thermal_align_basis()
+        if basis is None:
+            return outcome
+        store = self.calib.setdefault("thermal_align", {})
+        rec = dict(store.get(key) or {})
+        evidence = rec.get("evidence")
+        # Belt and braces: the memoised evidence/decision must describe THIS file. If the stage
+        # was re-measured into the same path by a route the invalidation sites do not cover,
+        # the content no longer matches the evidence's sha nor an aligned output of it.
+        if isinstance(evidence, dict) and evidence.get("available"):
+            state = thermal_align.backup_state(Path(ti3))
+            cur_sha = None
+            try:
+                cur_sha = thermal_align._sha(Path(ti3).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+            if state == "stale" or (state == "none" and cur_sha and evidence.get("ti3_sha")
+                                    and cur_sha != evidence.get("ti3_sha")):
+                self.ctx.log(f"{key}: dataset changed since the thermal-align evidence was taken — "
+                             "re-evaluating (stale record/backup discarded)")
+                self._invalidate_thermal_align(key, ti3)
+                rec, evidence = {}, None
+        if not isinstance(evidence, dict):
+            try:
+                evidence = thermal_align.evaluate(nd, ti3, basis[0], basis[1])
+            except Exception as exc:  # noqa: BLE001 - evidence must never crash the spine
+                evidence = {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+            rec["evidence"] = evidence
+            store[key] = rec
+            self._save()
+        if not evidence.get("available"):
+            outcome.digest["thermal_align"] = {"available": False, "reason": evidence.get("reason")}
+            return outcome
+        track = evidence.get("track") or {}
+        policy = self.thermal_align
+        if policy in ("end", "start", "mid", "none"):
+            choice, decided_by = policy, "cli"
+        elif evidence.get("significant"):
+            opts = evidence.get("options") or {}
+
+            def _opt(name: str) -> str:
+                o = opts.get(name) or {}
+                return f"{name}: |dx| mean {o.get('dx_mean', 0):.4f} max {o.get('dx_max', 0):.4f}"
+
+            decision = self.adjudicate(AdjudicationRequest(
+                key=f"{key}:thermal-align", seam=SEAM_MEASURE, stage=key,
+                question=(f"The {role} dataset was measured across a thermal drift: the interleaved "
+                          f"reference (rgb {track.get('reference_rgb')}) moved {track.get('drift_x'):+.4f} x "
+                          f"(span {track.get('span_x'):.4f}) over {track.get('minutes')} min, vs its own read "
+                          f"noise {track.get('noise_x'):.5f} (threshold {evidence.get('threshold_x'):.4f}). "
+                          "Aligning rewrites each read to ONE reference state before the build "
+                          f"({_opt('end')}; {_opt('mid')}; {_opt('start')}). align-end = the state the "
+                          "next stage starts in (build consistent with its refine/verify minutes later); "
+                          "align-mid = the middle-ground state (a stack viewed under average load); "
+                          "align-start = the cold end; none = build on the unaligned data (the drift "
+                          "bakes into the correction as ripple along the ramp). Which state?"),
+                options=("align-end", "align-mid", "align-start", "none"),
+                recommendation="align-" + str(evidence.get("recommendation") or "end"),
+                digest={"role": role, **evidence}))
+            choice = decision.choice.replace("align-", "")
+            decided_by = "seam"
+        else:
+            choice, decided_by = "none", "auto:flat"
+        applied = rec.get("applied")
+        if choice != "none" or applied:
+            try:
+                applied = thermal_align.apply(ti3, nd, basis[0], basis[1], choice,
+                                              decided_by=decided_by)
+            except Exception as exc:  # noqa: BLE001
+                self.runlog.anomaly(key, kind="thermal_align",
+                                    message=f"thermal alignment '{choice}' failed: {type(exc).__name__}: {exc}")
+                applied = {"align": choice, "error": f"{type(exc).__name__}: {exc}"}
+        rec.update({"choice": choice, "decided_by": decided_by, "applied": applied})
+        store[key] = rec
+        summary = {"choice": choice, "decided_by": decided_by,
+                   "significant": bool(evidence.get("significant")),
+                   "span_x": track.get("span_x"), "drift_x": track.get("drift_x"),
+                   "noise_x": track.get("noise_x"), "threshold_x": evidence.get("threshold_x"),
+                   "minutes": track.get("minutes")}
+        if applied:
+            summary["rows_corrected"] = applied.get("rows_corrected")
+            summary["dx_mean"] = applied.get("dx_mean")
+            summary["dx_max"] = applied.get("dx_max")
+        outcome.digest["thermal_align"] = summary
+        self.calib["stages"][key] = outcome.as_record()
+        self._save()
+        self.runlog.note(key, f"thermal-align {role}: {choice} ({decided_by}); reference span "
+                              f"{track.get('span_x')} x over {track.get('minutes')} min"
+                              + (f"; {applied.get('rows_corrected')} rows re-aligned" if applied and applied.get("rows_corrected") else ""),
+                         **summary)
         return outcome
 
     def _measurement_foundation_collapse(self, role: str, outcome: StageOutcome) -> Optional[dict[str, Any]]:
@@ -3126,6 +3423,8 @@ class Calibration:
                     digest={**outcome.digest, "message": sanity.get("message"),
                             "recommendation": "abort_and_recheck_mhc", "decision_note": decision.note}))
             self.ctx.log(f"MHC foundation sanity critical but ACCEPTED at the seam: {decision.note}")
+        if outcome.status == "done" and self._spec().is_hdr:
+            self._pin_hdr_peak_to_cap(outcome)
         return outcome
 
     def _mhc_foundation_sanity_check(self) -> dict[str, Any]:
@@ -3253,7 +3552,9 @@ class Calibration:
         if prior_fp != new_fp:
             for stale in ("measure:post-mhc", "build-install-3dlut",
                           "measure:verify", "verify"):
-                self.calib["stages"].pop(stale, None)
+                rec = self.calib["stages"].pop(stale, None)
+                if stale.startswith("measure:"):
+                    self._invalidate_thermal_align(stale, ((rec or {}).get("data") or {}).get("ti3"))
         self.calib["adaptive_plan"] = {"fingerprint": new_fp, "decision": normalized,
                                        "worth_investigating": evidence["worth_investigating"]}
         self._save()
@@ -4924,6 +5225,7 @@ class Calibration:
             # run folder can't break the live calibration (the build artifact lives under the
             # gitignored run dir). No-ops when this flow built no cube (mhc-only).
             self._install_durable_cube(rep.data.get("deliverable_cube"))
+            self._record_applied_stack(rep.data.get("deliverable_cube"))
         self.runlog.run_done(status, results_dir=rep.data.get("results_dir"),
                              report_path=rep.data.get("report_path"))
         return CalibrationResult(
@@ -5650,6 +5952,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "pause after the ICC and let the LLM investigate the panel/run (evidence "
                              "packet + `python -m dlc.patch_evidence` tools) and choose the patch "
                              "strategy. Autonomous (--auto) runs use a conservative fallback.")
+    parser.add_argument("--thermal-align", choices=("auto", "none", "end", "start", "mid"), default="auto",
+                        dest="thermal_align",
+                        help="thermal-state alignment of the raw / post-MHC datasets to ONE reference state "
+                             "before the build (plan item 3). auto (default): evidence packet every stage, "
+                             "a SEAM (measure:<role>:thermal-align) when the interleaved reference's drift "
+                             "is significant vs its own noise; end/start/mid: pre-decided (applied without "
+                             "a pause, reported); none: evidence only, never rewrite.")
     parser.add_argument("--plan-decision-file", type=Path, default=None, dest="plan_decision_file",
                         help="resume the adaptive-planning seam with a structured decision JSON file "
                              "(keys: shadow_treatment, volumetric_density, patch_size_overrides, "
@@ -6052,7 +6361,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             dark_min_reads=args.dark_min_reads,
                             dark_floor_max_nits=args.dark_floor_max_nits,
                             neutral_chroma_span=args.neutral_chroma_span,
-                            neutral_floor_min_nits=args.neutral_floor_min_nits)
+                            neutral_floor_min_nits=args.neutral_floor_min_nits,
+                            thermal_align=args.thermal_align)
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:

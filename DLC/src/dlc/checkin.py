@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Optional
 
 # Severity rank for the evidence packet's warning list (lower = more severe = kept first
 # when the inline cap truncates): a stall is a run-threatening event, an anomaly is a
@@ -178,7 +178,27 @@ def run_overview(cal: Any, trigger: str) -> dict[str, Any]:
         # The identity MHC profile enter-neutral associated (what the raw reads measure
         # THROUGH) — None before enter-neutral / in flows that keep the user's stack.
         "neutral_profile": cal.calib.get("neutral_profile"),
+        # Flows that keep the installed MHC: the registry cross-check the HDR peak pin rests on
+        # (pin_nits / matches / reason) — None for flows that build their own MHC.
+        "installed_stack": cal.calib.get("installed_stack"),
+        # The HDR target peak the run is bounding + scoring against right now (re-pinned to the
+        # MHC's cap after a capped build) and where it came from.
+        "hdr_peak": _hdr_peak_summary(cal.calib.get("hdr_target")),
+        # Per measured stage: the thermal-alignment verdict (choice / who decided / drift span).
+        "thermal_align": {k: {kk: v.get(kk) for kk in ("choice", "decided_by")}
+                          | {"span_x": ((v.get("evidence") or {}).get("track") or {}).get("span_x"),
+                             "significant": (v.get("evidence") or {}).get("significant")}
+                          for k, v in (cal.calib.get("thermal_align") or {}).items()
+                          if isinstance(v, dict)} or None,
     }
+
+
+def _hdr_peak_summary(hdr: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(hdr, dict):
+        return None
+    peak = (hdr.get("provenance") or {}).get("peak") or {}
+    return {"peak_nits": hdr.get("peak_nits"), "source": peak.get("source"),
+            "resolved_peak_nits": peak.get("resolved_peak_nits")}
 
 
 def events_since_last_checkin(cal: Any) -> dict[str, int]:

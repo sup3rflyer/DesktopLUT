@@ -4297,3 +4297,274 @@ def test_hardware_readiness_without_enter_neutral_is_evidence_only(tmp_path: Pat
     assert audit["gui_layers_enabled"] == ["GUI white balance"]
     assert "GUI white balance" in audit["warning"]
     assert audit["neutral_profile"] is None
+
+
+# ---------------------------------------------------------------------------
+# applied-stack registry + HDR peak pin, and the thermal-state alignment gate (2026-09-03)
+# ---------------------------------------------------------------------------
+from dlc import stack_registry as _sr
+from dlc import thermal_align as _ta
+from dlc.adjudication import AdjudicationRequired as _AdjRequired, MappingAdjudicator as _Mapping
+from dlc.calibrate import StageOutcome as _StageOutcome
+
+
+def _seed_hdr_stack(ctrl: CalibrationController) -> str:
+    ctrl.set_primaries(0, "HDR", {"rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797, "bx": 0.131, "by": 0.046})
+    ctrl.apply_mhc(0, "HDR")
+    return ctrl.state()["mhc"]["0:HDR"].get("profile_name")
+
+
+def _registry_for(calib) -> _sr.StackRegistry:
+    return _sr.StackRegistry.load(_sr.registry_path(calib.profile, calib.ctx.root))
+
+
+def _record_installed_mhc(calib, *, profile_name: str | None, cap: float) -> None:
+    _registry_for(calib).record(_sr.StackRecord(
+        display=calib.display.name, mode="HDR", monitor=0, run_id="prior_mhc_run",
+        applied_at="2026-09-03T18:06:56", profile_name=profile_name,
+        hdr_peak={"cube_peak_nits": cap, "capped": True, "cap_policy": "additive-d65-cap",
+                  "binding_channel": "g", "resolved_peak_nits": 1835.0}))
+
+
+def test_3dlut_only_pins_the_hdr_peak_to_the_installed_mhc_cap(tmp_path: Path):
+    """A 3dlut-only run must target the top the INSTALLED MHC holds (its Peak-Chroma cap), not
+    the DIP's native ceiling — patch bounding, the cube's targets and verify all follow the pin;
+    the evidence rides the plan + hardware-readiness digests; the cube apply lands on the registry."""
+    ctrl = CalibrationController.mock()
+    prof = _seed_hdr_stack(ctrl)
+    calib = _make(tmp_path, "pin3d", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10, controller=ctrl,
+                  require_hardware_readiness=True)     # so the readiness digest is on the record
+    _inject_dip(calib, native_white_nits=1840.0)
+    _record_installed_mhc(calib, profile_name=prof, cap=1500.0)
+    result = calib.run("3dlut-only")
+    assert result.status == "completed", result.digest
+    hdr = calib.calib["hdr_target"]
+    assert hdr["peak_nits"] == 1500.0
+    assert hdr["provenance"]["peak"]["source"] == "installed_mhc_cap"
+    assert hdr["provenance"]["peak"]["installed_stack"]["run_id"] == "prior_mhc_run"
+    assert calib.calib["patch_plan"]["patch_max_cv"] == calib._transfer().nits_to_cv(1500.0)
+    stack = calib.calib["installed_stack"]
+    assert stack["pin_nits"] == 1500.0 and stack["matches"] is True
+    hw = calib.calib["stages"]["hardware-readiness"]["digest"]
+    assert hw["installed_stack"]["pin_nits"] == 1500.0
+    rec = _registry_for(calib).get(calib.display.name, "HDR")
+    assert rec.cube and rec.cube["run_id"] == calib.ctx.root.name
+    assert rec.cube_peak_nits == 1500.0          # the MHC record is kept, the cube entry added
+
+
+def test_3dlut_only_does_not_pin_when_the_pipe_profile_differs(tmp_path: Path):
+    """The registry says one profile, the pipe another (stack changed outside DLC): the cap is
+    NOT trusted — the peak falls back to the DIP ceiling and the plan seam says the top is unknown."""
+    ctrl = CalibrationController.mock()
+    _seed_hdr_stack(ctrl)
+    calib = _make(tmp_path, "pin3d_mismatch", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10,
+                  controller=ctrl)
+    _inject_dip(calib, native_white_nits=1840.0)
+    _record_installed_mhc(calib, profile_name="DesktopLUT_Mon0_HDR_stale.icm", cap=1500.0)
+    calib.calib["flow"] = "3dlut-only"
+    calib.stage_preflight()
+    outcome = calib.stage_resolve_target()
+    assert calib.calib["hdr_target"]["peak_nits"] == 1840.0
+    assert calib.calib["installed_stack"]["matches"] is False
+    assert calib.calib["installed_stack"]["pin_nits"] is None
+    warnings = outcome.digest.get("hdr_target_warnings") or []
+    assert any("UNKNOWN" in w and "outside DLC" in w for w in warnings), warnings
+    assert outcome.digest["installed_stack"]["reason"]
+
+
+def test_full_hdr_run_records_the_applied_stack(tmp_path: Path):
+    calib = _make(tmp_path, "regfull", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10,
+                  output_dir=tmp_path / "deliverables")
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+    rec = _registry_for(calib).get(calib.display.name, "HDR")
+    assert rec is not None and rec.run_id == calib.ctx.root.name
+    assert rec.profile_name == calib.controller.state()["mhc"]["0:HDR"].get("profile_name")
+    assert rec.cube_peak_nits == calib._state["mhc_params"]["base_lut"]["peak_nits"]
+    assert rec.cube and rec.cube["cube_path"] == calib.controller.state()["runtime"]["0:HDR"]["cube_path"]
+    # full flows do NOT consult the registry for their own peak (the cap is decided in-run)
+    assert calib.calib.get("installed_stack") is None
+
+
+def test_mhc_policy_cap_repins_the_hdr_peak_for_post_mhc_stages(tmp_path: Path):
+    calib = _make(tmp_path, "repin", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    _inject_dip(calib, native_white_nits=1840.0)
+    calib.calib["flow"] = "full"
+    calib.stage_preflight()
+    calib.stage_resolve_target()
+    fp0 = calib.calib["patch_plan"]["fingerprint"]
+    assert calib._hdr_target().peak_nits == 1840.0
+    # the top patch's PQ quantization (a few nits under, NOT a policy cap) is not a new top
+    calib._pin_hdr_peak_to_cap(_StageOutcome("build-install-mhc", "done", digest={
+        "peak_chroma": {"cube_peak_nits": 1835.0, "capped": False}}))
+    assert calib._hdr_target().peak_nits == 1840.0
+    assert calib.calib["patch_plan"]["fingerprint"] == fp0
+    # a policy cap re-pins: peak, knee, patch bound, provenance, and the plan is re-fingerprinted
+    calib._pin_hdr_peak_to_cap(_StageOutcome("build-install-mhc", "done", digest={
+        "peak_chroma": {"cube_peak_nits": 1500.0, "capped": True, "cap_policy": "additive-d65-cap",
+                        "binding_channel": "g"}}))
+    hdr = calib._hdr_target()
+    assert hdr.peak_nits == 1500.0 and hdr.knee_start_nits <= 1500.0
+    assert hdr.provenance["peak"]["source"] == "mhc_cap"
+    assert hdr.provenance["peak"]["resolved_peak_nits"] == 1840.0
+    assert calib._patch_max_cv() == calib._transfer().nits_to_cv(1500.0)
+    plan = calib.calib["patch_plan"]
+    assert plan["approved"] is True and plan["repinned_from"] == fp0 and plan["fingerprint"] != fp0
+    assert plan["patch_max_cv"] == calib._transfer().nits_to_cv(1500.0)
+    # idempotent on replay
+    calib._pin_hdr_peak_to_cap(_StageOutcome("build-install-mhc", "done", digest={
+        "peak_chroma": {"cube_peak_nits": 1500.0, "capped": True}}))
+    assert calib._hdr_target().peak_nits == 1500.0
+    # a later stage re-reading the plan with the pinned peak sees a CONSISTENT fingerprint
+    assert calib._patch_plan_record("full")["fingerprint"] == plan["fingerprint"]
+
+
+def _fake_evidence(significant: bool, span: float = 0.003) -> dict:
+    return {"available": True, "significant": significant, "threshold_x": 0.0008,
+            "recommendation": "end" if significant else None,
+            "track": {"reference_rgb": [512, 512, 532], "n": 20, "minutes": 12.0, "span_x": span,
+                      "drift_x": span, "noise_x": 0.0001, "start_xy": [0.30, 0.30], "end_xy": [0.303, 0.30]},
+            "options": {"end": {"dx_mean": 0.0005, "dx_max": 0.003, "rows_matched": 40},
+                        "mid": {"dx_mean": 0.0004, "dx_max": 0.002, "rows_matched": 40},
+                        "start": {"dx_mean": 0.001, "dx_max": 0.003, "rows_matched": 40}}}
+
+
+def _measure_outcome(tmp_path: Path) -> _StageOutcome:
+    (tmp_path / "raw.ti3").write_text("x", encoding="utf-8")
+    (tmp_path / "raw.ndjson").write_text("", encoding="utf-8")
+    return _StageOutcome("measure:raw", "done", digest={},
+                         data={"ti3": str(tmp_path / "raw.ti3"), "ndjson": str(tmp_path / "raw.ndjson")})
+
+
+def test_thermal_align_gate_seams_on_significant_drift_and_applies_the_decision(tmp_path: Path, monkeypatch):
+    calib = _make(tmp_path, "ta_seam", adjudicator=_Mapping())
+    monkeypatch.setattr(_ta, "evaluate", lambda *a, **k: _fake_evidence(True))
+    applied: dict = {}
+
+    def fake_apply(ti3, nd, prim, white, align, **kw):
+        applied.update(align=align, decided_by=kw.get("decided_by"))
+        return {"align": align, "rows_corrected": 40, "dx_mean": 0.0005, "dx_max": 0.003}
+
+    monkeypatch.setattr(_ta, "apply", fake_apply)
+    with pytest.raises(_AdjRequired) as ei:
+        calib._thermal_align_gate("measure:raw", "raw", _measure_outcome(tmp_path))
+    req = ei.value.request
+    assert req.key == "measure:raw:thermal-align" and req.stage == "measure:raw"
+    assert set(req.options) == {"align-end", "align-mid", "align-start", "none"}
+    assert req.recommendation == "align-end" and req.recommendation in req.options
+    assert req.digest["track"]["span_x"] == 0.003 and req.digest["role"] == "raw"
+    assert "align-mid" in req.question and "none" in req.question
+    assert not applied                                   # nothing touched before the decision
+    # the evidence is memoised in the run record for the resume
+    assert calib.calib["thermal_align"]["measure:raw"]["evidence"]["significant"] is True
+    # resume with the LLM's decision → applied to the dataset, reported on the stage digest
+    resumed = _make(tmp_path, "ta_seam",
+                    adjudicator=_Mapping({"measure:raw:thermal-align": Decision("align-mid", note="viewing state")}))
+    out = resumed._thermal_align_gate("measure:raw", "raw", _measure_outcome(tmp_path))
+    assert applied == {"align": "mid", "decided_by": "seam"}
+    ta = out.digest["thermal_align"]
+    assert ta["choice"] == "mid" and ta["decided_by"] == "seam" and ta["rows_corrected"] == 40
+    assert resumed.calib["thermal_align"]["measure:raw"]["choice"] == "mid"
+    assert resumed.calib["stages"]["measure:raw"]["digest"]["thermal_align"]["choice"] == "mid"
+
+
+def test_thermal_align_gate_is_evidence_only_when_the_track_is_flat(tmp_path: Path, monkeypatch):
+    calib = _make(tmp_path, "ta_flat", adjudicator=_Mapping())    # would RAISE on any seam
+    monkeypatch.setattr(_ta, "evaluate", lambda *a, **k: _fake_evidence(False, span=0.0003))
+    monkeypatch.setattr(_ta, "apply", lambda *a, **k: pytest.fail("apply must not run on a flat track"))
+    out = calib._thermal_align_gate("measure:raw", "raw", _measure_outcome(tmp_path))
+    ta = out.digest["thermal_align"]
+    assert ta["choice"] == "none" and ta["decided_by"] == "auto:flat" and ta["significant"] is False
+    assert ta["span_x"] == 0.0003 and "rows_corrected" not in ta
+
+
+def test_thermal_align_cli_policy_applies_without_a_seam(tmp_path: Path, monkeypatch):
+    calib = _make(tmp_path, "ta_cli", adjudicator=_Mapping())
+    calib.thermal_align = "end"
+    monkeypatch.setattr(_ta, "evaluate", lambda *a, **k: _fake_evidence(True))
+    seen: dict = {}
+    monkeypatch.setattr(_ta, "apply", lambda ti3, nd, p, w, align, **kw: seen.update(align=align, by=kw.get("decided_by"))
+                        or {"align": align, "rows_corrected": 3, "dx_mean": 0.0002, "dx_max": 0.001})
+    out = calib._thermal_align_gate("measure:post-mhc", "post-mhc", _measure_outcome(tmp_path))
+    assert seen == {"align": "end", "by": "cli"}
+    assert out.digest["thermal_align"]["choice"] == "end" and out.digest["thermal_align"]["decided_by"] == "cli"
+
+
+def test_thermal_align_evidence_rides_every_real_measure_stage(tmp_path: Path):
+    """End-to-end on the synthetic panel: the gate runs the real evaluator on the real NDJSON/TI3
+    of raw + post-MHC and leaves its evidence on the stage digests (flat panel → no seam)."""
+    calib = _make(tmp_path, "ta_e2e")
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+    for key in ("measure:raw", "measure:post-mhc"):
+        ta = calib.calib["stages"][key]["digest"].get("thermal_align")
+        assert ta is not None, key
+        if ta.get("available", True):
+            assert ta["choice"] == "none" and ta["decided_by"] == "auto:flat"
+
+
+def test_thermal_align_invalidation_drops_record_decision_and_backup(tmp_path: Path, monkeypatch):
+    """A re-measure (escalation 'remeasure' / adaptive-planning invalidation) must clear the
+    stage's alignment record, the memoised seam decision and the on-disk backup, so the LLM
+    judges the NEW data and the fresh dataset is never consumed under a stale 'aligned' claim."""
+    calib = _make(tmp_path, "ta_inval",
+                  adjudicator=_Mapping({"measure:raw:thermal-align": Decision("align-end", note="old data")}))
+    monkeypatch.setattr(_ta, "evaluate", lambda *a, **k: _fake_evidence(True))
+    monkeypatch.setattr(_ta, "apply", lambda ti3, nd, p, w, align, **kw: {"align": align, "rows_corrected": 5,
+                                                                            "dx_mean": 0.0005, "dx_max": 0.003})
+    outcome = _measure_outcome(tmp_path)
+    out = calib._thermal_align_gate("measure:raw", "raw", outcome)
+    assert out.digest["thermal_align"]["choice"] == "end"
+    assert calib.calib["decisions"]["measure:raw:thermal-align"]["choice"] == "align-end"
+    (tmp_path / "raw.ti3.orig").write_text("stale", encoding="utf-8")
+    (tmp_path / "raw_thermal_align.json").write_text("{}", encoding="utf-8")
+    calib._invalidate_thermal_align("measure:raw", str(tmp_path / "raw.ti3"))
+    assert "measure:raw" not in calib.calib["thermal_align"]
+    assert "measure:raw:thermal-align" not in calib.calib["decisions"]
+    assert "measure:raw:thermal-align" not in calib.adjudicator.decisions
+    assert not (tmp_path / "raw.ti3.orig").exists() and not (tmp_path / "raw_thermal_align.json").exists()
+    # the next gate on the re-measured data has no memoised answer → it seams again
+    with pytest.raises(_AdjRequired) as ei:
+        calib._thermal_align_gate("measure:raw", "raw", _measure_outcome(tmp_path))
+    assert ei.value.request.key == "measure:raw:thermal-align"
+
+
+def test_thermal_align_gate_detects_a_changed_dataset_under_a_memoised_record(tmp_path: Path, monkeypatch):
+    """Belt and braces: even without an explicit invalidation, evidence stamped with the TI3's
+    content hash is re-taken (and the old decision dropped) when the file content changed."""
+    calib = _make(tmp_path, "ta_sha", adjudicator=_Mapping())
+    calls = {"n": 0}
+
+    def fake_eval(nd, ti3, *a, **k):
+        calls["n"] += 1
+        ev = _fake_evidence(False)
+        ev["ti3_sha"] = _ta._sha(Path(ti3).read_text(encoding="utf-8"))
+        return ev
+
+    monkeypatch.setattr(_ta, "evaluate", fake_eval)
+    calib._thermal_align_gate("measure:raw", "raw", _measure_outcome(tmp_path))
+    assert calls["n"] == 1
+    calib._thermal_align_gate("measure:raw", "raw", _measure_outcome(tmp_path))
+    assert calls["n"] == 1                                     # same content → memoised
+    (tmp_path / "raw.ti3").write_text("re-measured", encoding="utf-8")
+    calib._thermal_align_gate("measure:raw", "raw", _StageOutcome(
+        "measure:raw", "done", digest={}, data={"ti3": str(tmp_path / "raw.ti3"),
+                                                 "ndjson": str(tmp_path / "raw.ndjson")}))
+    assert calls["n"] == 2                                     # changed content → re-evaluated
+
+
+def test_repin_provenance_survives_a_resume_of_resolve_target(tmp_path: Path):
+    calib = _make(tmp_path, "repin_resume", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    _inject_dip(calib, native_white_nits=1840.0)
+    calib.calib["flow"] = "full"
+    calib.stage_preflight()
+    calib.stage_resolve_target()
+    calib._pin_hdr_peak_to_cap(_StageOutcome("build-install-mhc", "done", digest={
+        "peak_chroma": {"cube_peak_nits": 1500.0, "capped": True, "cap_policy": "additive-d65-cap",
+                        "binding_channel": "g"}}))
+    fp = calib.calib["patch_plan"]["fingerprint"]
+    calib.stage_resolve_target()                               # a resume re-runs it (not memoised)
+    plan = calib.calib["patch_plan"]
+    assert plan["fingerprint"] == fp and plan["approved"] is True
+    assert plan["repinned_from"] and "1500" in plan["repin_reason"]
+

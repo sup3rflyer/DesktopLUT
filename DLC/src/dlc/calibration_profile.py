@@ -401,7 +401,8 @@ class Profile:
                                      white_xy=wxy)
 
     def resolve_hdr_target(self, target_name: str, *, dip: Any = None,
-                           white_xy: Optional[tuple[float, float]] = None):
+                           white_xy: Optional[tuple[float, float]] = None,
+                           pinned_peak_nits: Optional[float] = None):
         """Resolve the chosen :class:`~dlc.hdr_target.HdrTarget` for a named PQ target
         from the measured DIP (``docs/hdr-target-design.md``).
 
@@ -425,9 +426,11 @@ class Profile:
         if not spec.is_hdr:
             raise ValueError(f"target {target_name!r} is not an HDR (PQ) target")
         wxy = white_xy if white_xy is not None else spec.white_xy()
-        # pinned_peak_nits deliberately NOT passed: the calibration peak is the measured
-        # max-sustained ceiling, not the profile's (viewing) peak_luminance_nits — see above.
-        return resolve_from_dip(dip, white_xy=wxy)
+        # The profile's (viewing) peak_luminance_nits is deliberately NOT the pin — see above.
+        # ``pinned_peak_nits`` is the one legitimate pin: the calibrated top of an ALREADY
+        # INSTALLED MHC (its Peak-Chroma cap, from the applied-stack registry) for flows that
+        # keep it (3dlut-only / grayscale-wb), so post-MHC stages target what the stack holds.
+        return resolve_from_dip(dip, white_xy=wxy, pinned_peak_nits=pinned_peak_nits)
 
     # -- white-point resolution (HANDOFF item 7) --------------------------
     def resolve_white(self, monitor: int, target_name: str, *,
