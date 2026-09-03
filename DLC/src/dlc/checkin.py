@@ -175,6 +175,9 @@ def run_overview(cal: Any, trigger: str) -> dict[str, Any]:
         "stages_done": len(done),
         "completed": done,
         "elapsed_s": elapsed,
+        # The identity MHC profile enter-neutral associated (what the raw reads measure
+        # THROUGH) — None before enter-neutral / in flows that keep the user's stack.
+        "neutral_profile": cal.calib.get("neutral_profile"),
     }
 
 

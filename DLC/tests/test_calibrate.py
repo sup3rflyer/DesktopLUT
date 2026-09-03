@@ -4124,3 +4124,176 @@ def test_present_stall_pauses_the_measure_seam_with_retry(tmp_path: Path):
     assert "retry" in req.options
     # halted at the stall — the frozen tail was never measured out
     assert req.digest.get("patch_count") < len(patches)
+
+
+# ---------------------------------------------------------------------------
+# enter-neutral: identity MHC association + the hardware-readiness neutral-state refusal
+# (HW-proven 2026-09-03: Windows keeps the last MHC2 transform after calibration.enter)
+# ---------------------------------------------------------------------------
+
+_REC709_P = {"rx": 0.640, "ry": 0.330, "gx": 0.300, "gy": 0.600, "bx": 0.150, "by": 0.060}
+_REC2020_P = {"rx": 0.708, "ry": 0.292, "gx": 0.170, "gy": 0.797, "bx": 0.131, "by": 0.046}
+
+
+def test_enter_neutral_associates_identity_profile_sdr_bootstrap(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "neutral_sdr", controller=ctrl)
+    outcome = calib.stage_enter_neutral()
+    assert outcome.status == "done"
+    rec = calib.calib["neutral_profile"]
+    assert rec == outcome.digest["neutral_profile"]
+    assert rec["monitor"] == 0 and rec["mode"] == "SDR"
+    assert rec["P_source"] == "bootstrap" and rec["P"] == _REC709_P
+    assert rec["profile_name"] == "DesktopLUT-sim-0-SDR.icm"
+    # the mock saw the real association sequence: primaries → D65 white → apply
+    entry = ctrl.state()["mhc"]["0:SDR"]
+    assert entry["primaries"] == _REC709_P
+    assert entry["white"] == {"x": 0.3127, "y": 0.3290}
+    assert entry["applied"] is True and entry["profile_name"] == rec["profile_name"]
+    assert ctrl.calibration_status()["active"] is True   # still IN calibration mode
+    # the check-in overview carries it (trivially available evidence for the LLM)
+    from dlc import checkin
+    assert checkin.run_overview(calib, "x")["neutral_profile"] == rec
+
+
+def test_enter_neutral_hdr_uses_dip_native_primaries_else_rec2020(tmp_path: Path):
+    native = {"R": [0.6745, 0.3121], "G": [0.2110, 0.7250], "B": [0.1480, 0.0520]}
+    with_dip = _make(tmp_path, "neutral_hdr_dip", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    _inject_dip(with_dip, native_primaries=native)
+    rec = with_dip.stage_enter_neutral().digest["neutral_profile"]
+    assert rec["P_source"] == "dip"
+    assert rec["P"] == {"rx": 0.6745, "ry": 0.3121, "gx": 0.2110, "gy": 0.7250, "bx": 0.1480, "by": 0.0520}
+    assert with_dip.controller.state()["mhc"]["0:HDR"]["primaries"] == rec["P"]
+
+    # separate tmp root: the DIP store is profile-adjacent / runs-parent, so it would be shared
+    no_dip = _make(tmp_path / "nodip", "neutral_hdr_boot", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    rec = no_dip.stage_enter_neutral().digest["neutral_profile"]
+    assert rec["P_source"] == "bootstrap" and rec["P"] == _REC2020_P
+
+
+def test_enter_neutral_sdr_ignores_dip_native_primaries(tmp_path: Path):
+    # mhc_icc.cpp pins the SDR source to sRGB: identity needs P = Rec.709, so an SDR run with a
+    # characterized DIP must NOT push the native primaries (that would bake native→sRGB).
+    calib = _make(tmp_path, "neutral_sdr_dip")
+    _inject_dip(calib, native_primaries={"R": [0.68, 0.32], "G": [0.265, 0.69], "B": [0.15, 0.06]})
+    rec = calib.stage_enter_neutral().digest["neutral_profile"]
+    assert rec["P_source"] == "bootstrap" and rec["P"] == _REC709_P
+
+
+def test_enter_neutral_refuses_when_the_association_does_not_land(tmp_path: Path):
+    from dlc.calibrate import StageError
+
+    ctrl = CalibrationController.mock()
+    # A server whose apply "succeeds" but leaves no profile behind (the pre-fix reality:
+    # nothing associated ⇒ Windows keeps the last MHC2 transform).
+    ctrl.apply_mhc = lambda monitor, mode: {"monitor_mode": f"{monitor}:{mode}", "mhc": {}}
+    calib = _make(tmp_path, "neutral_fail", controller=ctrl)
+    with pytest.raises(StageError) as exc:
+        calib.stage_enter_neutral()
+    out = exc.value.outcome
+    assert out.stage == "enter-neutral" and out.status == "aborted"
+    assert "did not land" in out.digest["message"] and "not neutral" in out.digest["message"]
+    assert out.digest["primaries_source"] == "bootstrap"
+    assert "neutral_profile" not in calib.calib
+    assert "enter-neutral" not in calib.calib["stages"]   # not memoised done — a resume retries
+
+
+def _ini_with(monitor: int, mode: str, **flags: str) -> str:
+    lines = [f"[Monitor{monitor}]"] + [f"{mode}_{k}={v}" for k, v in flags.items()]
+    return "\n".join(lines) + "\n"
+
+
+def test_hardware_readiness_carries_the_neutral_audit(tmp_path: Path):
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text(_ini_with(0, "SDR", TonemapEnabled="false", MHCDesktopGamma="false",
+                             MHCWhiteBalanceEnabled="false", MHCCorrGSEnabled="false",
+                             MHCEnabled="true", MHCProfilePath=r"C:\x\DesktopLUT-Mon0-SDR.icm"),
+                   encoding="utf-8")
+    calib = _make(tmp_path, "ready_audit", adjudicator=SupervisedAdjudicator(),
+                  require_hardware_readiness=True)
+    calib.profile.paths["desktoplut_ini"] = str(ini)
+    calib.stage_enter_neutral()
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_hardware_readiness()
+    audit = exc.value.request.digest["neutral_audit"]
+    assert audit["after_enter_neutral"] is True
+    assert audit["mhc_associated"] is True
+    assert audit["profile_name"] == "DesktopLUT-sim-0-SDR.icm"
+    assert audit["neutral_profile"]["P_source"] == "bootstrap"
+    assert audit["flags"]["MHCWhiteBalanceEnabled"] == "false"
+    assert audit["gui_layers_enabled"] == [] and "warning" not in audit
+    assert audit["ini_profile"] == "DesktopLUT-Mon0-SDR.icm"
+    assert audit["calibration_status"]["active"] is True
+
+    # the sim/CI path (gate not required) still audits, degrading gracefully with no ini
+    sim = _make(tmp_path, "ready_audit_sim")
+    sim.stage_enter_neutral()
+    out = sim.stage_hardware_readiness()
+    assert out.status == "done" and out.digest["required"] is False
+    assert out.digest["neutral_audit"]["mhc_associated"] is True
+    assert out.digest["neutral_audit"]["flags"] == {}
+    assert any("no DesktopLUT.ini" in n for n in out.digest["neutral_audit"]["notes"])
+
+
+def test_hardware_readiness_refuses_gui_layers_left_on_after_enter_neutral(tmp_path: Path):
+    from dlc.calibrate import StageError
+
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text(_ini_with(0, "SDR", TonemapEnabled="false", MHCDesktopGamma="true",
+                             MHCWhiteBalanceEnabled="true", MHCCorrGSEnabled="false"),
+                   encoding="utf-8")
+    calib = _make(tmp_path, "ready_refuse", adjudicator=SupervisedAdjudicator(),
+                  require_hardware_readiness=True)
+    calib.profile.paths["desktoplut_ini"] = str(ini)
+    calib.stage_enter_neutral()
+    with pytest.raises(StageError) as exc:
+        calib.stage_hardware_readiness()
+    msg = exc.value.outcome.digest["message"]
+    assert "NOT neutral" in msg and "Desktop Gamma is still ON" in msg and "GUI white balance is still ON" in msg
+    assert exc.value.outcome.digest["violations"] and exc.value.outcome.digest["neutral_audit"]["mhc_associated"]
+    assert "hardware-readiness" not in calib.calib["stages"]
+    events = read_events(calib.ctx.root / "events.jsonl")
+    anomalies = [e for e in events if e.event == "anomaly" and (e.data or {}).get("kind") == "neutral_state"]
+    assert len(anomalies) == 2
+
+    # A RESUME (enter-neutral replayed, fresh process) re-reads the pipe: a missing association
+    # is surfaced as a warning for the seam, not a mechanical refusal (the ini flags still are).
+    ini.write_text(_ini_with(0, "SDR", MHCDesktopGamma="false", MHCWhiteBalanceEnabled="false"),
+                   encoding="utf-8")
+    resumed = _make(tmp_path, "ready_refuse", adjudicator=SupervisedAdjudicator(),
+                    require_hardware_readiness=True)   # fresh mock: nothing associated
+    resumed.profile.paths["desktoplut_ini"] = str(ini)
+    assert resumed.stage_enter_neutral().replayed is True
+    with pytest.raises(AdjudicationRequired) as exc2:
+        resumed.stage_hardware_readiness()
+    audit = exc2.value.request.digest["neutral_audit"]
+    assert audit["mhc_associated"] is False and "NO MHC profile associated" in audit["warning"]
+
+
+def test_hardware_readiness_refuses_when_no_profile_is_associated_after_enter_neutral(tmp_path: Path):
+    from dlc.calibrate import StageError
+
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "ready_noprofile", controller=ctrl)
+    calib.stage_enter_neutral()
+    # Emulate Windows/DesktopLUT losing the association between enter-neutral and the first read.
+    ctrl.remove_mhc(0, "SDR")
+    with pytest.raises(StageError) as exc:
+        calib.stage_hardware_readiness()
+    assert "no MHC profile is associated for 0:SDR" in exc.value.outcome.digest["message"]
+
+
+def test_hardware_readiness_without_enter_neutral_is_evidence_only(tmp_path: Path):
+    # 3dlut-only / grayscale-wb keep the user's stack live: GUI layers ON are surfaced as a
+    # warning in the audit for the LLM, never a refusal (and no association is demanded).
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text(_ini_with(0, "SDR", MHCWhiteBalanceEnabled="true"), encoding="utf-8")
+    calib = _make(tmp_path, "ready_stack")
+    calib.profile.paths["desktoplut_ini"] = str(ini)
+    out = calib.stage_hardware_readiness()
+    assert out.status == "done"
+    audit = out.digest["neutral_audit"]
+    assert audit["after_enter_neutral"] is False
+    assert audit["gui_layers_enabled"] == ["GUI white balance"]
+    assert "GUI white balance" in audit["warning"]
+    assert audit["neutral_profile"] is None
