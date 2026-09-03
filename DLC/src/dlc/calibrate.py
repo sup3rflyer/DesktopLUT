@@ -124,6 +124,7 @@ from . import metrics as metrics_mod
 from .metrics import (delta_e2000, metrics_scored_payload, percentile, practical_summary,
                       score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab)
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
+from . import neutral_audit
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
 from . import patch_evidence
@@ -231,6 +232,16 @@ class CalibrationAborted(Exception):
     def __init__(self, outcome: StageOutcome) -> None:
         super().__init__(outcome.digest.get("message", outcome.stage))
         self.outcome = outcome
+
+
+class StageError(CalibrationAborted):
+    """A stage REFUSED on a provably-mechanical invariant (e.g. the identity MHC association
+    did not land, a GUI layer is still ON after enter-neutral). A :class:`CalibrationAborted`
+    so the run rolls back through the normal path; the stage is recorded ``aborted`` with a
+    clear ``message`` + the evidence that tripped it — never a silent continue."""
+
+    def __init__(self, stage: str, message: str, **digest: Any) -> None:
+        super().__init__(StageOutcome(stage, "aborted", digest={"message": message, **digest}))
 
 
 def _reading_xy(reading: Any) -> Optional[list[float]]:
@@ -382,6 +393,9 @@ class Calibration:
         self._probe_launcher = probe_launcher or self._default_launch_ccxxmake
         self._pause_handler = pause_handler
         self.require_hardware_readiness = require_hardware_readiness
+        # True once stage_enter_neutral associated the identity MHC profile IN THIS PROCESS
+        # (a resume replaying the record leaves it False — see stage_hardware_readiness).
+        self._neutral_associated_live = False
 
         # ---- The run-record state (dlc_state.json) — the calibration's persisted memory -------
         # Two levels. `self._state` is the top-level run-record; `self.calib` (its "calib" sub-dict)
@@ -806,16 +820,12 @@ class Calibration:
     # -- backup / restore (rollback guard) --------------------------------
     def _resolve_desktoplut_ini(self) -> Optional[Path]:
         """Locate the user's DesktopLUT.ini (the complete persisted settings) from the
-        profile's ``paths.desktoplut_ini`` (absolute, or relative to the cwd). Returns None
-        if unset/missing — the backup then falls back to the lighter state.get JSON."""
-        configured = self.profile.paths.get("desktoplut_ini")
-        if not configured:
-            return None
-        p = Path(configured)
-        if not p.is_absolute():
-            p = Path.cwd() / p
+        profile's ``paths.desktoplut_ini`` (absolute, or relative to the cwd; else beside
+        ``paths.desktoplut_exe``). Returns None if unset/missing — the backup then falls back
+        to the lighter state.get JSON, and the neutral-state audit reports the flags unknown.
+        One resolution shared with :mod:`dlc.neutral_audit`."""
         try:
-            return p if p.exists() else None
+            return neutral_audit.resolve_desktoplut_ini(self.profile.paths or {})
         except Exception:  # noqa: BLE001
             return None
 
@@ -2350,6 +2360,14 @@ class Calibration:
         return self._stage("clear-native", run)
 
     def stage_enter_neutral(self) -> StageOutcome:
+        """Put the calibrated monitor/mode into a TRUE neutral before the first raw read:
+        ``calibration.enter`` (the C++ clears WB / GS / tonemap / Desktop Gamma and removes the
+        ICM) FOLLOWED BY the association of an identity MHC2 profile through the normal path
+        (:meth:`_associate_identity_profile`) — because Windows keeps the LAST associated MHC2
+        transform after a removal, ``enter`` alone left every pre-2026-09-03 raw stage
+        measuring through the previously applied stack. The digest + ``calib['neutral_profile']``
+        carry ``{monitor, mode, P, P_source, profile_name}``; the stage refuses (:class:`StageError`)
+        when the association does not land. HDR and SDR alike."""
         def run() -> StageOutcome:
             # Stale-calibration-mode tell (fable Phase 9): if a PREVIOUS run died without
             # exiting calibration mode, the C++ DoEnterNeutral re-snapshots unconditionally —
@@ -2383,14 +2401,69 @@ class Calibration:
                 self._save()
             res = self.controller.enter_neutral(self.monitor, self.mode, self.dummy_icc,
                                                 reason="DLC v2 calibration")
-            digest: dict[str, Any] = {"entered": True}
+            # calibration.enter cleared the layers + REMOVED the ICM — but Windows keeps the
+            # LAST associated MHC2 transform, so the panel is still driven through whatever
+            # was applied before (HW-proven 2026-09-03). Associate an IDENTITY profile
+            # through the normal path so the raw stages measure the bare panel.
+            neutral_profile = self._associate_identity_profile()
+            digest: dict[str, Any] = {"entered": True, "neutral_profile": neutral_profile}
             if stale_calibration:
                 digest["stale_calibration_mode"] = True
                 digest["note"] = ("snapshot-restore now reflects a cleared state; "
                                   "preflight backup is the authoritative rollback")
             return StageOutcome("enter-neutral", "done",
                                 digest=digest, data={"raw": _jsonable(res)})
-        return self._stage("enter-neutral", run)
+        outcome = self._stage("enter-neutral", run)
+        # Did THIS process associate the identity profile (vs a resume replaying the record)?
+        # The readiness refusal on "no profile associated" is mechanical only right after a
+        # live association; on a resume the pipe's state is re-read and surfaced as evidence.
+        self._neutral_associated_live = not outcome.replayed
+        return outcome
+
+    def _associate_identity_profile(self) -> dict[str, Any]:
+        """Bake + associate an IDENTITY MHC2 profile for this monitor/mode (``set_primaries(P)``
+        → ``set_white(D65)`` → ``apply``) so a TRUE neutral replaces the stale transform Windows
+        keeps after ``calibration.enter``. ``P`` per :func:`dlc.neutral_audit.identity_primaries`:
+        HDR uses the DIP's measured ``native_primaries`` (the C++ sets src = P, so the matrix is
+        identity and the 1D LUT is identity with no base LUT staged; HW-verified: the identity
+        leg read the native white), Rec.2020 bootstrap without a DIP; SDR MUST push Rec.709
+        (the C++ pins src = sRGB — the DIP native there would bake a real gamut matrix).
+
+        Records ``self.calib['neutral_profile']`` = ``{monitor, mode, P, P_source, profile_name}``
+        (``profile_name`` read back from ``state()`` after apply, NOT trusted from the apply
+        reply). Raises :class:`StageError` when ``state()`` shows no MHC profile for the key
+        afterwards — a silent continue here would re-create the very bug this fixes."""
+        dip = self._dip()
+        native = dip.native_primaries if dip is not None else None
+        primaries, source = neutral_audit.identity_primaries(self.mode, native)
+        self.controller.set_primaries(self.monitor, self.mode, primaries)
+        self.controller.set_white(self.monitor, self.mode, *neutral_audit.D65_XY)
+        applied = self.controller.apply_mhc(self.monitor, self.mode)
+        key = f"{self.monitor}:{self.mode}"
+        try:
+            state = self.controller.state() or {}
+        except Exception as exc:  # noqa: BLE001 - the association can't be confirmed → refuse
+            raise StageError("enter-neutral",
+                             f"identity MHC association for {key} could not be confirmed: "
+                             f"state.get failed ({type(exc).__name__}: {exc})",
+                             identity_primaries=primaries, primaries_source=source) from exc
+        entry = (state.get("mhc") or {}).get(key) or {}
+        profile_name = entry.get("profile_name")
+        if not (profile_name or entry.get("applied") or entry.get("enabled")):
+            raise StageError("enter-neutral",
+                             f"identity MHC association for {key} did not land: state() shows no "
+                             f"MHC profile after mhc.apply (reply: {_jsonable(applied)!r}) — the panel "
+                             "is still driven through the last MHC2 transform Windows kept; not neutral",
+                             identity_primaries=primaries, primaries_source=source,
+                             mhc_entry=_jsonable(entry))
+        record = {"monitor": self.monitor, "mode": self.mode,
+                  "P": primaries, "P_source": source, "profile_name": profile_name}
+        self.calib["neutral_profile"] = record
+        self._save()
+        self.ctx.log(f"identity MHC associated for {key}: P={source} "
+                     f"({'DIP native' if source == 'dip' else 'bootstrap ' + ('Rec.2020' if self.mode == 'HDR' else 'Rec.709')})"
+                     f", white=D65, profile={profile_name or '(unnamed)'}")
+        return record
 
     # ====================================================================
     # Characterize (Display+Instrument Profile GENERATION) — the learning run
@@ -2546,13 +2619,65 @@ class Calibration:
                          else "aborted on out-of-range white luminance"))
         return outcome
 
+    def _neutral_state_audit(self) -> dict[str, Any]:
+        """The pipe + DesktopLUT.ini neutral-state audit for this monitor/mode (see
+        :func:`dlc.neutral_audit.neutral_state_audit`); degrades to notes (never raises) on the
+        mock / a profile without ``paths.desktoplut_ini``."""
+        audit = neutral_audit.neutral_state_audit(
+            self.controller, self.monitor, self.mode, ini_path=self._resolve_desktoplut_ini())
+        audit["neutral_profile"] = self.calib.get("neutral_profile")
+        return _jsonable(audit)
+
     def stage_hardware_readiness(self) -> StageOutcome:
-        """One operator/LLM gate before the first live meter read."""
+        """One operator/LLM gate before the first live meter read.
+
+        Carries the neutral-state audit in its digest — the identity MHC profile name and the
+        GUI-layer flags (tonemap / Desktop Gamma / WB / GS) read from the live DesktopLUT.ini —
+        so the LLM sees what the meter is about to measure THROUGH. After an ``enter-neutral``
+        in this run the stage REFUSES (:class:`StageError`) on the mechanical violations: a GUI
+        layer still ON for the calibrated mode, or no MHC profile associated (the identity
+        association did not land ⇒ Windows is still driving the last MHC2 transform). Flows
+        that keep the user's stack (3dlut-only / grayscale-wb) get the same audit as evidence
+        only. When the operator gate is not required (sim/CI) the audit + refusal still run
+        (pipe + ini reads only — no seam)."""
         key = "hardware-readiness"
+
+        def audit_and_refuse() -> dict[str, Any]:
+            audit = self._neutral_state_audit()
+            stages = self.calib.get("stages") or {}
+            after_neutral = (stages.get("enter-neutral") or {}).get("status") == "done"
+            audit["after_enter_neutral"] = after_neutral
+            # "No profile associated" is a MECHANICAL refusal only right after a live
+            # association in this process; on a resume (enter-neutral replayed) the pipe's
+            # current state is evidence the seam judges (a restarted DesktopLUT loses it).
+            live_assoc = bool(getattr(self, "_neutral_associated_live", False))
+            violations = neutral_audit.neutral_violations(audit, require_profile=live_assoc) \
+                if after_neutral else []
+            if violations:
+                for v in violations:
+                    self.runlog.anomaly(key, kind="neutral_state", message=v)
+                raise StageError(
+                    key, "panel is NOT neutral after enter-neutral — refusing the first read: "
+                    + "; ".join(violations), neutral_audit=audit, violations=violations)
+            warnings: list[str] = []
+            if audit.get("gui_layers_enabled"):
+                # Not after enter-neutral (the user's stack is deliberately live) — evidence only.
+                warnings.append("GUI layers ON for the calibrated mode: "
+                                + ", ".join(audit["gui_layers_enabled"]))
+            if after_neutral and not audit.get("mhc_associated"):
+                warnings.append("resumed run: state() shows NO MHC profile associated for "
+                                f"{audit.get('key')} — the identity neutral may have been lost "
+                                "(DesktopLUT restarted?); judge before the first read")
+            if warnings:
+                audit["warning"] = "; ".join(warnings)
+            return audit
+
         if not self.require_hardware_readiness:
-            return StageOutcome(key, "done", digest={"required": False})
+            audit = audit_and_refuse()
+            return StageOutcome(key, "done", digest={"required": False, "neutral_audit": audit})
 
         def run() -> StageOutcome:
+            audit = audit_and_refuse()
             decision = self.adjudicate(AdjudicationRequest(
                 key=f"{key}:confirm", seam=SEAM_HARDWARE_READY, stage=key,
                 question=(
@@ -2563,7 +2688,8 @@ class Calibration:
                 ),
                 options=("ready", "abort"), recommendation="ready",
                 digest={"required": True, "monitor": self.monitor, "mode": self.mode,
-                        "bit_depth": self.bit_depth, "dogegen_required": True}))
+                        "bit_depth": self.bit_depth, "dogegen_required": True,
+                        "neutral_audit": audit}))
             if decision.choice == "abort":
                 raise CalibrationAborted(StageOutcome(
                     key, "aborted",
@@ -2571,7 +2697,8 @@ class Calibration:
                             "decision_note": decision.note}))
             return StageOutcome(key, "done",
                                 digest={"required": True, "confirmed": True,
-                                        "decision_note": decision.note})
+                                        "decision_note": decision.note,
+                                        "neutral_audit": audit})
 
         return self._stage(key, run)
 
