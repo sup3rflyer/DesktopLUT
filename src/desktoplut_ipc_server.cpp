@@ -26,6 +26,8 @@
 #include "displayconfig.h"
 #include "settings.h"
 #include "processing.h"
+#include "gui.h"
+#include "dwm_inject.h"
 
 #pragma comment(lib, "Advapi32.lib")
 
@@ -562,6 +564,7 @@ void HandleStateGet(JsonValue& result) {
     }
     JsonValue mhc = JObj();
     JsonValue runtime = JObj();
+    JsonValue layers = JObj();
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         for (size_t idx = 0; idx < g_gui.monitorSettings.size(); ++idx) {
@@ -574,6 +577,12 @@ void HandleStateGet(JsonValue& result) {
                     JsonValue e = JObj();
                     e.set("applied", JBool(true));
                     e.set("profile_name", JStr(WideToUtf8(m.profileName)));
+                    // The DLC-owned base artifact the profile was generated from (a 1D .cube
+                    // handed over set_base_lut). Stable across the WB/DG/GS permutation
+                    // re-bakes that churn profile_name — the identity a client keys on.
+                    if (!m.sourceFilePath.empty())
+                        e.set("source_file", JStr(WideToUtf8(m.sourceFilePath)));
+                    e.set("active_perm", JNum(m.activePerm));
                     mhc.set(key, e);
                 }
                 const std::wstring& path = isHDR ? s.hdrPath : s.sdrPath;
@@ -582,11 +591,26 @@ void HandleStateGet(JsonValue& result) {
                     e.set("cube_path", JStr(WideToUtf8(path)));
                     runtime.set(key, e);
                 }
+                // Viewing layers (the GUI toggles a calibration must measure WITHOUT): the
+                // MHC's white balance / correction grayscale / Desktop Gamma (HDR) permutation
+                // bits and the HDR tonemap shader flag. Reported for every pair so a client can
+                // capture the user's state before a run and restore it after (layers.set).
+                JsonValue l = JObj();
+                l.set("white_balance", JBool(m.whiteBalanceEnabled));
+                l.set("grayscale", JBool(m.correctionGrayscale.enabled));
+                l.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
+                l.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
+                if (isHDR) {
+                    l.set("tonemap_dynamic", JBool(s.hdrColorCorrection.tonemap.dynamicPeak));
+                    l.set("tonemap_target_peak", JNum(s.hdrColorCorrection.tonemap.targetPeakNits));
+                }
+                layers.set(key, l);
             }
         }
     }
     result.set("mhc", mhc);
     result.set("runtime", runtime);
+    result.set("layers", layers);
 }
 
 void HandleCalibStatus(JsonValue& result) {
@@ -894,6 +918,102 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
     }
     result.set("active", JBool(false));
     result.set("restored", JBool(restored));
+}
+
+// layers.set — toggle the viewing layers of one monitor:mode over the pipe, exactly as the
+// GUI checkboxes do (DLC captures them before a run, measures with them OFF, restores after;
+// the user should never have to manage corrections around a pipeline run). Params: monitor,
+// mode, and any of white_balance / grayscale / desktop_gamma / tonemap (bool; omitted = keep).
+//   * white_balance / grayscale / desktop_gamma live in the MHC layer: set the flags, then ONE
+//     RegenerateMhcIfActive (BuildMHC2Params bakes all three), like ID_MHC_*_WB_ENABLE /
+//     ID_MHC_*_GS_ENABLE. Desktop Gamma also drives the live gamma atomics (ID_MHC_HDR_DG_ENABLE).
+//   * tonemap (HDR) is the shader flag: ID_CORR_TONEMAP_ENABLE's live update path.
+// Result: {monitor_mode, before:{...}, after:{...}, regenerated, profile_name}.
+static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
+    const MHCSettings& m = isHDR ? s.hdrMHC : s.sdrMHC;
+    out.set("white_balance", JBool(m.whiteBalanceEnabled));
+    out.set("grayscale", JBool(m.correctionGrayscale.enabled));
+    out.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
+    out.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
+}
+
+void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    auto want = [&](const char* name, bool& has, bool& val) {
+        const JsonValue* v = p.find(name);
+        has = (v && v->type == JsonValue::Bool);
+        if (has) val = v->b;
+    };
+    bool hasWb, wb, hasGs, gs, hasDg, dg, hasTm, tm;
+    want("white_balance", hasWb, wb);
+    want("grayscale", hasGs, gs);
+    want("desktop_gamma", hasDg, dg);
+    want("tonemap", hasTm, tm);
+    if (!isHDR && (hasDg || hasTm)) {
+        // Both are HDR-only layers; asking to change them in SDR is a client error, asking
+        // for them OFF is a harmless no-op (a "disable everything" client).
+        if ((hasDg && dg) || (hasTm && tm)) { error = "desktop_gamma / tonemap are HDR-only layers"; return; }
+        hasDg = hasTm = false;
+    }
+    JsonValue before = JObj(), after = JObj();
+    bool mhcChanged = false, tmChanged = false, dgChanged = false, mhcEnabled = false, profileNamed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MonitorSettings& ms = g_gui.monitorSettings[mon];
+        MHCSettings& m = isHDR ? ms.hdrMHC : ms.sdrMHC;
+        LayersJson(ms, isHDR, before);
+        if (hasWb && m.whiteBalanceEnabled != wb) { m.whiteBalanceEnabled = wb; mhcChanged = true; }
+        if (hasGs && m.correctionGrayscale.enabled != gs) {
+            m.correctionGrayscale.enabled = gs;
+            if (gs && m.correctionGrayscale.points.empty()) {
+                if (isHDR) m.correctionGrayscale.initLinearPQ(); else m.correctionGrayscale.initLinear();
+            }
+            mhcChanged = true;
+        }
+        if (hasDg && m.desktopGammaEnabled != dg) { m.desktopGammaEnabled = dg; mhcChanged = true; dgChanged = true; }
+        if (hasTm && ms.hdrColorCorrection.tonemap.enabled != tm) { ms.hdrColorCorrection.tonemap.enabled = tm; tmChanged = true; }
+        mhcEnabled = m.enabled;
+        profileNamed = !m.profileName.empty();
+    }
+    bool regenerated = false;
+    if (mhcChanged && profileNamed) {
+        // Without g_monitorSettingsMutex held (RegenerateMhcIfActive snapshots under it).
+        RegenerateMhcIfActive(mon, isHDR);
+        regenerated = true;
+    }
+    if (dgChanged) {
+        bool dgActive = dg && mhcEnabled;
+        g_userDesktopGammaMode.store(dgActive);
+        if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(dgActive);
+    }
+    if (tmChanged) {
+        if (g_gui.isRunning) {
+            UpdateColorCorrectionLive(mon, true);
+            if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
+            else DwmHookReevaluateOverlay();
+        } else if (tm) {
+            StartProcessing();
+        }
+    }
+    if (mhcChanged || tmChanged) {
+        UpdateMhcFlagsLive(mon);
+        SaveSettings();
+        UpdateGUIState();
+        UpdateColorCorrectionControls();   // the GUI checkboxes follow the pipe
+    }
+    std::string profileName;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        const MonitorSettings& ms = g_gui.monitorSettings[mon];
+        LayersJson(ms, isHDR, after);
+        profileName = WideToUtf8((isHDR ? ms.hdrMHC : ms.sdrMHC).profileName);
+    }
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("before", before);
+    result.set("after", after);
+    result.set("regenerated", JBool(regenerated));
+    result.set("profile_name", JStr(profileName));
 }
 
 void DoDisableAll(const JsonValue& /*p*/, JsonValue& result, std::string& /*error*/) {
@@ -1311,7 +1431,7 @@ void DoGrayscaleCancel(const JsonValue& p, JsonValue& result, std::string& error
 
 bool IsMutatingMethod(const std::string& m) {
     return m == "calibration.enter" || m == "calibration.exit" ||
-           m == "corrections.disable_all" || m.rfind("mhc.", 0) == 0 ||
+           m == "corrections.disable_all" || m == "layers.set" || m.rfind("mhc.", 0) == 0 ||
            m.rfind("runtime.", 0) == 0;  // set_3dlut / clear_3dlut / *_grayscale_tweak
 }
 
@@ -1502,6 +1622,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         if (m == "calibration.enter") DoEnterNeutral(*r->params, *r->result, *r->error);
         else if (m == "calibration.exit") DoExitCalibration(*r->params, *r->result, *r->error);
         else if (m == "corrections.disable_all") DoDisableAll(*r->params, *r->result, *r->error);
+        else if (m == "layers.set") DoLayersSet(*r->params, *r->result, *r->error);
         else if (m == "mhc.set_primaries") DoMhcSetPrimaries(*r->params, *r->result, *r->error);
         else if (m == "mhc.set_white") DoMhcSetWhite(*r->params, *r->result, *r->error);
         else if (m == "mhc.set_base_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, false);
