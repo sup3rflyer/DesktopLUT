@@ -311,3 +311,40 @@ def test_hdr_build_mhc_reports_wrgb_gate_diagnostics(tmp_path):
     # The synthetic ramp reaches full drive (grey at cv max), so the ceiling is grounded.
     assert pc["full_drive_grounded"] is True
     assert pc["full_drive_white_nits"] is not None
+
+
+def test_cube_max_drive_is_peak_code_under_additive_policy_only():
+    from dlc.mhc_cube import pq_oetf
+    from dlc.stages.build_mhc import cube_max_drive
+    assert cube_max_drive(resolved_peak_nits=1835.1, wrgb_nonadditive=False) == pq_oetf(1835.1 / 10000.0)
+    assert cube_max_drive(resolved_peak_nits=1835.1, wrgb_nonadditive=True) is None
+    assert cube_max_drive(resolved_peak_nits=None, wrgb_nonadditive=False) is None
+
+
+def test_build_hdr_cube_max_drive_pins_top_on_a_saturating_plateau():
+    """A FALD-style raw ramp that saturates at the cap (flat +-1-nit plateau above the peak code):
+    unbounded, the plateau noise can send the top drive above the peak code; with ``max_drive`` the
+    top is pinned at the peak code while the mid-tones are untouched."""
+    from dlc.mhc import Ti3Sample
+    from dlc.mhc_cube import build_hdr_cube, matvec, pq_eotf, pq_oetf, rgb_to_xyz_matrix
+    prim = {"rx": 0.685, "ry": 0.309, "gx": 0.183, "gy": 0.750, "bx": 0.152, "by": 0.065}
+    wxy = (0.3185, 0.3287)
+    P = rgb_to_xyz_matrix(prim["rx"], prim["ry"], prim["gx"], prim["gy"], prim["bx"], prim["by"],
+                          wxy[0], wxy[1], white_Y=1.0)
+    cap = 1757.0
+    peak_sig = pq_oetf(1835.0 / 10000.0)
+    samples = []
+    for i in range(1, 41):
+        sig = i / 40.0
+        y = min(pq_eotf(sig) * 10000.0, cap)
+        if sig > peak_sig:
+            y = cap + (1.0 if i % 2 else -1.0)   # plateau noise +-1 nit above the peak code
+        samples.append(Ti3Sample((sig, sig, sig), tuple(v * y for v in matvec(P, (1.0, 1.0, 1.0)))))
+    free, _ = build_hdr_cube(samples, prim, wxy, cap, dark_floor_nits=0.1)
+    pinned, summary = build_hdr_cube(samples, prim, wxy, cap, dark_floor_nits=0.1, max_drive=peak_sig)
+    n = len(pinned["r"])
+    assert summary["max_drive"] == round(peak_sig, 6)
+    for ch in ("r", "g", "b"):
+        assert pinned[ch][n - 1] <= peak_sig + 1e-9
+        assert free[ch][n - 1] >= pinned[ch][n - 1]
+        assert abs(pinned[ch][n // 2] - free[ch][n // 2]) < 1e-9

@@ -193,10 +193,17 @@ def build(args, ctx: RunContext) -> StageResult:
             "points": [round(i / (n - 1), 6) for i in range(n)],
             "deviations": Deviations.identity(n).as_dict(),
         }
+        # Under the ADDITIVE cap policy the cube may never drive above the peak code - see
+        # `cube_max_drive` (the RAW headroom greys still feed the basis + diagnostics above).
+        max_drive = cube_max_drive(
+            resolved_peak_nits=resolved_peak,
+            wrgb_nonadditive=bool(peak_chroma.get("wrgb_nonadditive")))
+        if max_drive is not None:
+            peak_chroma["cube_max_drive"] = round(max_drive, 6)
         try:
             cube_curves, cube_summary = build_hdr_cube(
                 samples, measured_primaries, white_xy, cube_peak,
-                dark_floor_nits=dark_floor_nits, level_trust=level_trust
+                dark_floor_nits=dark_floor_nits, level_trust=level_trust, max_drive=max_drive
             )
             cube_summary["dark_floor"] = dark_floor_info
             if level_trust:
@@ -424,3 +431,23 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def cube_max_drive(*, resolved_peak_nits, wrgb_nonadditive):
+    """Drive ceiling (PQ signal) for the HDR base cube, or ``None`` (unbounded).
+
+    The RAW full-drive headroom greys above the peak code (``_raw_extend_to_cv``, 0d37207) exist
+    for two things: the WRGB non-additivity gate, and a WRGB OLED's near-peak ROLL-OFF where grey Y
+    keeps RISING to full drive (LG C6: peak code 477 nits -> full drive 575) - there the cube needs
+    that drive range to linearize the top, so the WRGB (uncapped) policy stays unbounded. On an
+    ADDITIVE (FALD) panel whose grey Y SATURATES at the cap those samples are a flat +-1-nit
+    plateau; inverting the running-max share against a ceiling interpolated INSIDE that noise band
+    sends the cube's top to an arbitrary plateau drive (PA32UCXR 2026-09-03: cv 981 = a 6784-nit
+    request; the panel clipped, the closed-loop refine had no gradient at the top node and left
+    white at 1827 nits, x 0.322 - reddish, 4% over the cap, declared "converged" by 24 good
+    mid-levels). Under the additive-d65-cap policy the top is therefore bounded at the peak-code
+    signal - the HW-validated 2026-08-14 behaviour (refine converged to 1758 nits, x 0.316)."""
+    if wrgb_nonadditive or not resolved_peak_nits or resolved_peak_nits <= 0:
+        return None
+    from ..mhc_cube import _PQ_CONTAINER_NITS, pq_oetf   # lazy: engine-side module
+    return pq_oetf(min(float(resolved_peak_nits), _PQ_CONTAINER_NITS) / _PQ_CONTAINER_NITS)

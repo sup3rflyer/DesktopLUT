@@ -484,9 +484,20 @@ def _gray_shares(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
 def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
                    white_xy: tuple[float, float], peak_luminance: float,
                    *, lut_size: int = 1024, dark_floor_nits: float = 0.3,
-                   level_trust: Optional[Sequence[tuple[float, float]]] = None
+                   level_trust: Optional[Sequence[tuple[float, float]]] = None,
+                   max_drive: Optional[float] = None
                    ) -> tuple[dict[str, list[float]], dict[str, float]]:
     """Build the per-channel HDR EOTF+WB correction cube from a raw TI3's GRAY ramp.
+
+    ``max_drive`` (optional, PQ signal 0..1): hard ceiling on every channel's DRIVE. Under the
+    ADDITIVE cap policy the orchestrator passes the peak-code signal so the RAW full-drive headroom
+    greys (measured for the WRGB gate / a WRGB roll-off) cannot send the top of the cube above the
+    peak code: on a FALD panel whose grey Y SATURATES at the cap they form a flat +-1-nit plateau,
+    and inverting the running-max share against a ceiling interpolated INSIDE that noise band
+    lands the top at an arbitrary plateau drive (PA32UCXR 2026-09-03: cv 981 = a 6784-nit
+    request; the panel clipped, the closed-loop refine had no gradient at the top node and left
+    white at 1827 nits, x 0.322). The shares/basis still use every sample (the plateau-interpolated
+    peak share ~1.0); only the drive is bounded - the HW-validated 2026-08-14 top (0.818).
 
     ``primaries`` is the measured native gamut (``rx..by``), ``white_xy`` the measured native
     white, ``peak_luminance`` the panel peak (brightest neutral). Returns
@@ -541,6 +552,8 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         for ch in _CHANNELS:
             target_share = frac * peak_share[ch]
             corrected = invert_monotone(sigs, shares[ch], target_share)
+            if max_drive is not None:
+                corrected = min(corrected, max_drive)   # never drive above the peak code (additive policy)
             val = w * corrected + (1.0 - w) * pq_in   # blend to identity in the dark
             # Enforce monotone non-decreasing — the blend boundary or a noisy share can dip,
             # and the MHC2 LUT must be monotone for a well-defined inverse.
@@ -552,6 +565,7 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         "white_max_nits": round(peak_luminance, 4),
         "gray_points": float(len(sigs)),
         "lut_size": float(lut_size),
+        "max_drive": round(max_drive, 6) if max_drive is not None else None,
         "dark_floor_nits": round(dark_floor_nits, 4),
         "basis": "gray-ramp",
     }
