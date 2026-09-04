@@ -366,6 +366,68 @@ def part2(panels, out):
     return lines, results
 
 
+# ------------------------------------------- part 3: main = PA gets the SPD WB, C6 matched to PA
+BT2020_XYZ_TO_RGB = np.linalg.inv(np.array([[0.636958, 0.144617, 0.168881],
+                                            [0.262700, 0.677998, 0.059302],
+                                            [0.000000, 0.028073, 1.060985]]))
+
+
+def wb_gains_bt2020(x, y):
+    """DesktopLUT MHC-WB gain derivation (HDR): g = M_XYZ->RGB(BT.2020) · (x/y, 1, (1-x-y)/y)."""
+    return BT2020_XYZ_TO_RGB @ np.array([x / y, 1.0, (1 - x - y) / y])
+
+
+def approx_xyz_from_lms(obs):
+    """Chromaticity space for the 4°/7° observers: least-squares LMS->XYZ map fitted on the 2° pair."""
+    M, *_ = np.linalg.lstsq(CONE["CIE 2015 2°"], CMF["CIE 2015 2°"], rcond=None)
+    return lambda S: lms(S, obs) @ M
+
+
+def part3(panels, results):
+    lines = ["## Part 3 — the plan: PA (main) gets the SPD WB target, C6 is matched to the PA", ""]
+    PA, C6 = panels["PA32UCXR"], panels["LG C6 42"]
+    basis_pa = np.stack([PA["red"], PA["green"], PA["blue"]])
+    basis_c6 = np.stack([C6["red"], C6["green"], C6["blue"]])
+    chroma = {o: (lambda S, o=o: xyz(S, o)) for o in ("CIE 2015 2°", "CIE 2015 10°")}
+    chroma["CIE 2006 4°"] = approx_xyz_from_lms("CIE 2006 4°")
+    chroma["CIE 2006 7°"] = approx_xyz_from_lms("CIE 2006 7°")
+
+    def pair_mismatch(Sa, Sb):
+        return {o: np.hypot(*(upvp(f(Sa)) - upvp(f(Sb)))) * 1e3 for o, f in chroma.items()}
+
+    lines.append("Step 2 — MHC-WB target for the PA32UCXR (deviation from D65 expressed as CIE 1931 xy) and the "
+                 "BT.2020-basis gains DesktopLUT derives from it (>1 = that channel is boosted; no headroom normalisation):")
+    lines.append("")
+    lines.append("| observer | PA WB target x, y | g_R g_G g_B |")
+    lines.append("|---|---|---|")
+    for obs in CONE_ORDER:
+        x_, y_ = xy(xyz(results[("PA32UCXR", obs)]))
+        g = wb_gains_bt2020(x_, y_)
+        lines.append(f"| {obs} | {x_:.4f}, {y_:.4f} | {g[0]:.4f} {g[1]:.4f} {g[2]:.4f} |")
+    lines.append("")
+    lines.append("Step 3 — C6 WB target that matches the PA's white (as set in step 2) under the same observer. "
+                 "Pair mismatch = Δu'v'×1e3 between the two whites as seen by each observer (4°/7° via an "
+                 "LMS→XYZ map fitted on the 2° pair). Baseline row = both panels left at CIE 1931 D65.")
+    lines.append("")
+    lines.append("| PA set for | C6 target (RGB basis) | C6 target (white-anchored) | pair mismatch 2° / 4° / 7° / 10° (RGB-basis C6) |")
+    lines.append("|---|---|---|---|")
+    base = pair_mismatch(results[("PA32UCXR", "1931")], results[("LG C6 42", "1931")])
+    lines.append("| baseline: both at 1931 D65 | 0.3127, 0.3290 | – | " +
+                 " / ".join(f"{base[o]:.2f}" for o in CONE_ORDER) + " |")
+    for obs in CONE_ORDER:
+        S_pa = results[("PA32UCXR", obs)]
+        t = lms(S_pa, obs)
+        w = solve_mixture(basis_c6, t, lambda S, o=obs: lms(S, o))
+        S_c6 = w @ basis_c6
+        S_c6_wa, _ = white_anchored(C6["white"], basis_c6, lambda S, o=obs: lms(S, o), t)
+        a, b = xy(xyz(S_c6)), xy(xyz(S_c6_wa))
+        mm = pair_mismatch(S_pa, S_c6)
+        lines.append(f"| {obs} | **{a[0]:.4f}, {a[1]:.4f}** | {b[0]:.4f}, {b[1]:.4f} | " +
+                     " / ".join(f"{mm[o]:.2f}" for o in CONE_ORDER) + " |")
+    lines.append("")
+    return lines
+
+
 # ------------------------------------------------------------------------- plots
 def plots(panels, results, out: Path):
     import matplotlib
@@ -438,6 +500,7 @@ def main():
     lines += part1(panels, out)
     p2, results = part2(panels, out)
     lines += p2
+    lines += part3(panels, results)
     plots(panels, results, out)
     lines.append(f"Plots: `{out / 'spd_pa32ucxr_vs_c6_blur.png'}`, `{out / 'perceptual_d65_targets_xy.png'}`")
     report = "\n".join(lines)
