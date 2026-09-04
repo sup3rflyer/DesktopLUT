@@ -1322,11 +1322,16 @@ void DoHookSetRouting(const JsonValue& p, JsonValue& result, std::string& error)
             if (ctx.empty() || !lv || !tv || lv->type != JsonValue::Num || tv->type != JsonValue::Num) {
                 error = "each entry needs ctx, left, top"; return;
             }
+            int left = (int)std::llround(lv->num), top = (int)std::llround(tv->num);
+            bool onTopology = false;
+            for (const auto& m : r.monitors)
+                if (m.left == left && m.top == top) { onTopology = true; break; }
+            if (!onTopology) { error = "position is not in the hook's recorded topology: " + ctx; return; }
             bool found = false;
             for (auto& e : r.entries) {
                 if (e.ctx != ctx) continue;
-                e.left = (int)std::llround(lv->num);
-                e.top = (int)std::llround(tv->num);
+                e.left = left;
+                e.top = top;
                 found = true;
             }
             if (!found) { error = "unknown context " + ctx; return; }
@@ -1340,13 +1345,17 @@ void DoHookSetRouting(const JsonValue& p, JsonValue& result, std::string& error)
     }
     if (reinject) {
         // Eject + re-inject: the DLL reloads the (rewritten / deleted) routing file at attach
-        // and rewrites it as it re-resolves each context. Give it a moment so the state we
-        // report reflects the NEW assignment, not the file we just wrote.
+        // and rewrites it as it re-resolves each context. Wait (bounded) for the DLL's OWN
+        // rewrite — every entry the host wrote resolved and none left as a fresh roll — so the
+        // state we report is the new assignment, not the file we just wrote.
+        size_t written = ReadDwmHookRouting().entries.size();
         ReapplyProcessing();
-        for (int i = 0; i < 20; ++i) {
+        reinject = g_gui.isRunning.load();   // nothing to re-inject when no correction is active
+        for (int i = 0; reinject && i < 30; ++i) {
             Sleep(50);
             DwmHookRouting now = ReadDwmHookRouting();
-            bool settled = now.present;
+            if (!now.present) continue;
+            bool settled = (action == "clear") ? !now.entries.empty() : now.entries.size() >= written;
             for (const auto& e : now.entries)
                 if (e.method == "order" && action != "clear") settled = false;
             if (settled) break;
