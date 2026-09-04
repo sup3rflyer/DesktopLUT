@@ -95,6 +95,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("mhc.grayscale_commit", mm),
         ("mhc.grayscale_cancel", mm),           # post-commit cancel: tolerated no-op, canceled:false
         ("runtime.set_3dlut", {**mm, "cube_path": str(cube_3d)}),
+        ("hook.set_routing", {"action": "confirm"}),   # the DWM-hook twin-routing verb (2026-09-03)
         ("runtime.clear_3dlut", mm),
         ("runtime.set_grayscale_tweak", {**mm, "grayscale_tweak": gs}),
         ("runtime.disable_grayscale_tweak", mm),
@@ -129,6 +130,13 @@ def test_controller_only_speaks_advertised_methods():
 # --------------------------------------------------------------------------
 # 2. spec ⇄ C++ (static conformance; skips when the C++ tree is absent)
 # --------------------------------------------------------------------------
+# A wire-method dispatch comparison in the C++: a BARE `m == "x"` / `method == "x"` (the
+# Dispatch tables). The negative look-behind excludes member accesses such as the hook-routing
+# code's `e.method == "order"` (a routing-entry FIELD, not a wire method) — without it the
+# reverse pin reported `order`/`pinned` as unadvertised server methods (2026-09-04).
+_CPP_DISPATCH_RE = r'(?<![.\w])(?:m|method)\s*==\s*"([^"]+)"'
+
+
 def _cpp_text() -> str:
     if not CPP_SERVER.exists():
         pytest.skip(f"C++ IPC server not found at {CPP_SERVER}")
@@ -140,7 +148,7 @@ def test_every_cpp_handled_method_is_advertised():
     doesn't advertise is silent contract drift (this is how windows.set_hdr and the
     grayscale live-edit quartet went missing from the spec — fable Phase 9)."""
     text = _cpp_text()
-    handled = set(re.findall(r'(?:\bm|\bmethod)\s*==\s*"([^"]+)"', text))
+    handled = set(re.findall(_CPP_DISPATCH_RE, text))
     advertised = set(_spec_methods())
     unadvertised = sorted(handled - advertised)
     assert not unadvertised, f"C++ serves methods the spec does not advertise: {unadvertised}"
@@ -151,7 +159,7 @@ def _cpp_handler_bodies() -> dict[str, str]:
     text = _cpp_text()
     # Dispatch tables: `if (method == "x") { HandleX(...)` and `if (m == "x") DoX(...)`.
     method_to_fn: dict[str, str] = {}
-    for method, fn in re.findall(r'(?:\bm|\bmethod)\s*==\s*"([^"]+)"\s*\)\s*\{?\s*(\w+)\(', text):
+    for method, fn in re.findall(_CPP_DISPATCH_RE + r'\s*\)\s*\{?\s*(\w+)\(', text):
         method_to_fn.setdefault(method, fn)
     bodies: dict[str, str] = {}
     for method, fn in method_to_fn.items():

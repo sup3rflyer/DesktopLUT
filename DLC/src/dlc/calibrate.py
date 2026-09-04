@@ -124,6 +124,7 @@ from . import metrics as metrics_mod
 from .metrics import (delta_e2000, metrics_scored_payload, percentile, practical_summary,
                       score_samples, score_samples_hdr, summarize_metrics, xyz_to_lab)
 from .mhc import SRGB_PRIMARIES, parse_ti3, white_xyz
+from . import hook_routing
 from . import neutral_audit
 from . import stack_registry
 from . import thermal_align
@@ -348,6 +349,7 @@ class Calibration:
         dark_min_reads: Optional[int] = None,
         dark_floor_max_nits: Optional[float] = None,
         thermal_align: str = "auto",
+        hook_routing_policy: str = "auto",
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -380,6 +382,11 @@ class Calibration:
         # 'auto' = evidence every stage, SEAM when the reference track's drift is significant;
         # 'end'/'start'/'mid' = pre-decided (applied, reported, no pause); 'none' = evidence only.
         self.thermal_align = (thermal_align or "auto").lower()
+        # DWM-hook LUT routing self-check policy (cube flows; 2026-09-03 incident — the hook
+        # order-matched twin panels and a whole 3dlut-only run measured an uncorrected display):
+        # 'auto' = optical proof only when the hook's routing report is ambiguous/unconfirmed/
+        # absent; 'always' = prove it every run; 'never' = operator pre-decided (evidence only).
+        self.hook_routing_policy = (hook_routing_policy or "auto").lower()
         self.optimize_config = optimize_config or OptimizeConfig()
         self.characterize_config = characterize_config
         self.run_date = run_date or date.today()
@@ -1187,6 +1194,7 @@ class Calibration:
         try:
             self.controller.set_3dlut(self.monitor, self.mode, cube_path)
             self.ctx.log(f"installed the durable 3D LUT (DesktopLUT now points at {cube_path})")
+            self._hook_routing_evidence_after_install("apply")
         except Exception as exc:  # noqa: BLE001 - durability nicety, never a gate on the run
             self.ctx.log(
                 f"could not re-point at the durable cube ({type(exc).__name__}: {exc}); the run-dir "
@@ -2862,6 +2870,99 @@ class Calibration:
         audit["neutral_profile"] = self.calib.get("neutral_profile")
         return _jsonable(audit)
 
+    _CUBE_FLOWS = ("full", "3dlut-only")
+
+    def _hook_routing_pending(self) -> dict[str, Any]:
+        """Pre-read evidence for the readiness seam: what the hook reports now and whether the
+        optical self-check will run once the operator says ``ready`` (no meter read here)."""
+        try:
+            hook = self.controller.hook_state()
+        except Exception as exc:  # noqa: BLE001
+            return {"hook": None, "will_check": None, "reason": f"hook state unavailable: {exc}"}
+        flow = self.calib.get("flow")
+        needed, reason = hook_routing.routing_needs_check(hook, self.monitor, self.hook_routing_policy)
+        return {"hook": hook, "will_check": bool(needed and flow in self._CUBE_FLOWS and self.measure is not None),
+                "reason": reason, "policy": self.hook_routing_policy}
+
+    def _hook_routing_self_check(self, key: str) -> dict[str, Any]:
+        """The DWM-hook LUT-routing self-check for cube-installing flows (dlc.hook_routing).
+
+        2026-09-03: the hook order-matches twin panels and re-rolled on every set_3dlut, so a
+        3dlut-only run's probes + verify measured the UNCORRECTED panel. Mechanics here: when the
+        hook's own report cannot prove the assignment (policy ``auto``: order/pinned-matched and
+        unconfirmed, stale, absent, or an old build) a magenta probe cube is installed on the
+        calibrated slot and the meter must see it move; no effect => swap the twin pairing once;
+        still none => :class:`StageError` (a cube flow must not measure through a cube that is not
+        there). A needed swap is an ANOMALY the LLM sees at the readiness seam + check-ins (the
+        previous roll was wrong — anything measured under it is suspect); the verdict lands in the
+        stage digest either way. Flows that install no cube get the decision only (no reads)."""
+        flow = self.calib.get("flow")
+        try:
+            hook = self.controller.hook_state()
+        except Exception as exc:  # noqa: BLE001 - old build / mock without state: evidence, not a crash
+            self.ctx.log(f"{key}: hook state unavailable ({type(exc).__name__}: {exc})")
+            hook = None
+        needed, reason = hook_routing.routing_needs_check(hook, self.monitor, self.hook_routing_policy)
+        if flow not in self._CUBE_FLOWS:
+            return {"checked": False, "required": False, "flow": flow,
+                    "reason": f"flow {flow!r} installs no cube ({reason})", "hook": hook}
+        if not needed:
+            self.runlog.note(key, f"hook routing self-check not needed: {reason}", hook=hook)
+            return {"checked": False, "required": False, "flow": flow, "reason": reason, "hook": hook}
+        if self.measure is None:
+            self.runlog.anomaly(key, kind="hook_routing", hook=hook,
+                                message=f"hook routing needs an optical check ({reason}) but this run has "
+                                        "no meter — the cube may render on another panel; judge before "
+                                        "trusting any cube-flow result")
+            return {"checked": False, "required": True, "flow": flow, "reason": reason, "hook": hook}
+        self.runlog.note(key, f"hook routing self-check: {reason}", hook=hook)
+        try:
+            result = hook_routing.run_hook_routing_check(
+                self.controller, self.monitor, self.mode, self.bit_depth, self.measure,
+                self.ctx.root / "generated", policy=self.hook_routing_policy,
+                log=lambda msg: self.ctx.log(f"{key}: hook routing: {msg}"))
+        except hook_routing.HookRoutingError as exc:
+            digest = exc.result.as_dict()
+            self.runlog.anomaly(key, kind="hook_routing", message=str(exc), hook_routing=digest)
+            raise StageError(
+                key, f"DWM hook does not render a cube on the calibrated display: {exc}",
+                hook_routing=digest) from exc
+        digest = result.as_dict()
+        digest["required"] = True
+        if result.swapped:
+            self.runlog.anomaly(
+                key, kind="hook_routing", hook_routing=digest,
+                message=(f"hook routing was CROSSED for monitor {self.monitor}: the probe cube did not "
+                         "reach the calibrated panel until the twin assignment was swapped (now "
+                         f"{'confirmed' if result.confirmed else 'swapped but unconfirmed'}). Anything "
+                         "measured under the previous assignment rendered on the other panel."))
+        elif result.checked:
+            self.runlog.note(key, f"hook routing proven through the meter ({result.verdict})",
+                             hook_routing=digest)
+        for note in result.notes:
+            self.runlog.note(key, f"hook routing: {note}")
+        return digest
+
+    def _hook_routing_evidence_after_install(self, stage: str) -> None:
+        """Evidence only, right after a ``set_3dlut``: every install re-injects the hook DLL, and
+        if the DWM session changed underneath (a dwm.exe restart re-rolls the twin order-match)
+        the report flips back to ambiguous — the cube may now render on the other panel. Never
+        blocks; the LLM judges it from the check-in stream. Degrades to a log line on a build
+        without hook reporting."""
+        try:
+            hook = self.controller.hook_state()
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.log(f"{stage}: hook state unavailable after the cube install ({type(exc).__name__}: {exc})")
+            return
+        if hook is None:
+            self.ctx.log(f"{stage}: no hook routing report after the cube install (old DesktopLUT build?)")
+            return
+        if hook.get("needs_check"):
+            self.runlog.anomaly(
+                stage, kind="hook_routing", hook=hook,
+                message="hook routing became ambiguous/unconfirmed after a cube install (DWM session "
+                        "changed?) — the cube may be rendering on another panel")
+
     def stage_hardware_readiness(self) -> StageOutcome:
         """One operator/LLM gate before the first live meter read.
 
@@ -2909,7 +3010,9 @@ class Calibration:
 
         if not self.require_hardware_readiness:
             audit = audit_and_refuse()
+            routing = self._hook_routing_self_check(key)
             return StageOutcome(key, "done", digest={"required": False, "neutral_audit": audit,
+                                                     "hook_routing": routing,
                                                      "installed_stack": self.calib.get("installed_stack"),
                                                      "viewing_layers": self.calib.get("viewing_layers")})
 
@@ -2927,6 +3030,7 @@ class Calibration:
                 digest={"required": True, "monitor": self.monitor, "mode": self.mode,
                         "bit_depth": self.bit_depth, "dogegen_required": True,
                         "neutral_audit": audit,
+                        "hook_routing_pending": self._hook_routing_pending(),
                         "installed_stack": self.calib.get("installed_stack"),
                         "viewing_layers": self.calib.get("viewing_layers")}))
             if decision.choice == "abort":
@@ -2934,10 +3038,17 @@ class Calibration:
                     key, "aborted",
                     digest={"message": "hardware readiness aborted by operator/LLM",
                             "decision_note": decision.note}))
+            # The optical routing proof (a probe cube on a mid grey) is the run's FIRST meter
+            # read, so it runs AFTER the operator confirmed the meter is aimed at the patch —
+            # probing an unaimed meter would read "no effect" twice and refuse a healthy rig.
+            # A resume replays the recorded decision, so a live run pays for this exactly once;
+            # the verdict lands in this stage's digest and a needed swap is an anomaly in the
+            # spine (check-ins) before the first raw measure.
+            routing = self._hook_routing_self_check(key)
             return StageOutcome(key, "done",
                                 digest={"required": True, "confirmed": True,
                                         "decision_note": decision.note,
-                                        "neutral_audit": audit,
+                                        "neutral_audit": audit, "hook_routing": routing,
                                         "installed_stack": self.calib.get("installed_stack"),
                                         "viewing_layers": self.calib.get("viewing_layers")})
 
@@ -4708,6 +4819,7 @@ class Calibration:
                             "degenerate": True, "measurement_count": int(len(signals))}))
             result.write(cube_path, title=f"DLC {self.mode} 3D LUT")
             self.controller.set_3dlut(self.monitor, self.mode, cube_path)
+            self._hook_routing_evidence_after_install("build-install-3dlut")
             digest = {**result.digest, "cube_path": cube_path}
             return StageOutcome("build-install-3dlut", "done", digest=digest,
                                 data={"cube_path": cube_path,
@@ -6062,6 +6174,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "a SEAM (measure:<role>:thermal-align) when the interleaved reference's drift "
                              "is significant vs its own noise; end/start/mid: pre-decided (applied without "
                              "a pause, reported); none: evidence only, never rewrite.")
+    parser.add_argument("--hook-routing-check", choices=("auto", "always", "never"), default="auto",
+                        dest="hook_routing_policy",
+                        help="DWM-hook LUT routing self-check for cube flows (full / 3dlut-only). The hook "
+                             "order-matches twin panels on 25H2 (2026-09-03: a whole run measured the "
+                             "uncorrected panel). auto (default): prove the routing through the meter "
+                             "(probe cube on a mid grey) only when the hook's report is ambiguous/"
+                             "unconfirmed/absent; always: prove it every run; never: evidence only. No "
+                             "effect after one twin swap REFUSES the run.")
     parser.add_argument("--plan-decision-file", type=Path, default=None, dest="plan_decision_file",
                         help="resume the adaptive-planning seam with a structured decision JSON file "
                              "(keys: shadow_treatment, volumetric_density, patch_size_overrides, "
@@ -6465,7 +6585,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             dark_floor_max_nits=args.dark_floor_max_nits,
                             neutral_chroma_span=args.neutral_chroma_span,
                             neutral_floor_min_nits=args.neutral_floor_min_nits,
-                            thermal_align=args.thermal_align)
+                            thermal_align=args.thermal_align,
+                            hook_routing_policy=args.hook_routing_policy)
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:

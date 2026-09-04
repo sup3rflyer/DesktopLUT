@@ -80,9 +80,46 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                                     "Absent = pre-versioning build = 1. DLC checks this at preflight so a "
                                     "mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
                                     "mid-run. Server-side field is a DesktopLUT ticket (fable Phase 9).",
+                "hook": "object {active:bool (DWM hook DLL injected), needs_check:bool (an entry is "
+                        "order/pinned-matched and unconfirmed, or the routing session is stale), "
+                        "routing?: {session:'<pid>-<createtime>' (the dwm.exe identity; changes on a "
+                        "DWM restart), stale:bool, confirmed:bool (a client confirmed via "
+                        "hook.set_routing confirm; the DLL resets it whenever it order-matches a NEW "
+                        "context), entries:[{ctx:str, left:int, top:int, method:'unique'|'bpc'|'scan'|"
+                        "'pinned'|'order'|'legacy', monitor:int|null}]}}. routing is ABSENT until the "
+                        "hook has assigned a twin (unknown). The DLL cannot read a monitor position from "
+                        "the DWM overlay context on 25H2, so identical panels are matched by first-present "
+                        "ORDER — a coin toss the 2026-09-03 3dlut-only run lost (cube on the twin); the "
+                        "assignment is now sticky per DWM session and dlc.hook_routing proves it through "
+                        "the meter. Absent on older builds (treat as unknown: cube flows self-check).",
             },
             mutates_state=False,
             gui_thread_required=False,
+        ),
+        ApiMethodSpec(
+            "hook.set_routing",
+            "Manage the DWM hook's sticky context->monitor LUT routing (state.get 'hook'). "
+            "'swap': the calibrated monitor trades positions with its single same-size/same-bpc "
+            "twin (error unless exactly one twin) — rewrites the routing file and re-injects, the "
+            "DLL then honours the PINNED assignment; 'confirm': mark the assignment meter-verified "
+            "(confirmed=true, no re-inject); 'clear': delete the file and re-inject (fresh roll); "
+            "'assign': pin explicit entries and re-inject. DLC's hardware-readiness self-check "
+            "installs a magenta probe cube, proves through the meter that it changes the calibrated "
+            "panel, swaps ONCE if it does not, and refuses the run if it still does not.",
+            {
+                "action": ApiParamSpec("string", description="Routing operation.",
+                                       values=["swap", "confirm", "clear", "assign"]),
+                "monitor": ApiParamSpec("integer", required=False,
+                                        description="swap only: the calibrated DesktopLUT monitor index."),
+                "entries": ApiParamSpec("array", required=False,
+                                        description="assign only: [{ctx:str, left:int, top:int}] — the "
+                                                    "DWM overlay context handle and the desktop origin it "
+                                                    "must paint."),
+            },
+            {"hook": "object (the same object state.get reports under 'hook', after the change)",
+             "reinjected": "boolean (swap/assign/clear re-inject the DLL; confirm does not)"},
+            mutates_state=True,
+            gui_thread_required=True,
         ),
         ApiMethodSpec(
             "corrections.disable_all",

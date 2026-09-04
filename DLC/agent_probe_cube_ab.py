@@ -43,6 +43,27 @@ def xy(xyz):
     return (xyz[0] / s, xyz[1] / s) if s > 0 else (0.0, 0.0)
 
 
+def log_hook_state(ctrl, tag):
+    """Best effort: the DWM hook's twin routing report (state.get 'hook'), None on a build that
+    predates it. The routing is the whole reason this probe exists (2026-09-03: order-matched
+    twins put the cube on the other panel), so show it around every leg; the assignment is
+    sticky per DWM session now, but a swap/clear or a dwm.exe restart still changes it."""
+    try:
+        hook = ctrl.hook_state()
+    except Exception as exc:  # noqa: BLE001
+        log(f"[hook {tag}] unavailable: {exc}")
+        return
+    if hook is None:
+        log(f"[hook {tag}] no routing report (old DesktopLUT build)")
+        return
+    routing = hook.get("routing") or {}
+    log(f"[hook {tag}] active={hook.get('active')} needs_check={hook.get('needs_check')} "
+        f"session={routing.get('session')} stale={routing.get('stale')} confirmed={routing.get('confirmed')}")
+    for e in routing.get("entries") or []:
+        log(f"[hook {tag}]   ctx {e.get('ctx')} @({e.get('left')},{e.get('top')}) "
+            f"{e.get('method')} -> monitor {e.get('monitor')}")
+
+
 def main() -> int:
     profile = cp.load_profile()
     argyll = Argyll(Path(profile.paths["argyll"]) / "spotread.exe")
@@ -71,6 +92,7 @@ def main() -> int:
             log(f"  [{tag}] {label:9s} Y {rd.xyz[1]:8.2f}  x {x:.4f} y {y:.4f}")
         return out
 
+    log_hook_state(ctrl, "before")
     try:
         log("[leg 1] cube ON (as installed)")
         on1 = read_all("on1")
@@ -100,6 +122,7 @@ def main() -> int:
                 log("[restore] cube re-installed")
         except Exception as exc:  # noqa: BLE001
             log("[restore] FAILED:", exc)
+        log_hook_state(ctrl, "after")
         try:
             presenter.present(MeasurePatch(label="park", rgb=(0, 0, 0), signal=(0.0,) * 3,
                                            role="warmup", bit_depth=BIT, seq=0))

@@ -29,6 +29,19 @@ class MockDesktopLutState:
     # balance / correction grayscale / Desktop Gamma bits + the HDR tonemap shader flag.
     # Absent key = all OFF (a fresh install).
     layers: dict[str, dict[str, bool]] = field(default_factory=dict)
+    # DWM-hook LUT routing (C++ HandleStateGet "hook"): the sticky per-DWM-session
+    # context->monitor assignment. ``hook_twins`` = the first two monitors are same-size/
+    # same-bpc so the DLL had to ORDER-match them (the 2026-09-03 coin toss); ``hook_routing_
+    # crossed`` = that order-match landed the calibrated monitor's cube on the twin (invisible
+    # in the routing report — only the meter can tell, which is why dlc.hook_routing exists);
+    # ``hook_pinned`` = a client swap/assign rewrote the file (entries report "pinned");
+    # ``hook_confirmed`` = a client confirmed the assignment through the meter.
+    hook_twins: bool = False
+    hook_routing_crossed: bool = False
+    hook_pinned: bool = False
+    hook_confirmed: bool = False
+    hook_routing_present: bool = True
+    hook_session: str = "4242-133700000000000000"
     command_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
@@ -68,7 +81,10 @@ class MockDesktopLutServer:
                 # spec defines (optional on the wire; absent = a pre-versioning C++ build).
                 out = self.state.as_dict()
                 out["contract_version"] = CONTRACT_VERSION
+                out["hook"] = self.hook_view()
                 return self.ok(out)
+            if method == "hook.set_routing":
+                return self.handle_hook_set_routing(params)
             if method == "corrections.disable_all":
                 self._cleanup_active_gs_live()   # C++ CleanupActiveGsLive runs here too
                 self.state.corrections_enabled = False
@@ -327,6 +343,78 @@ class MockDesktopLutServer:
         return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
                         "regenerated": regenerated, "profile_name": entry.get("profile_name")})
 
+    # -- DWM-hook LUT routing (C++ HandleStateGet "hook" + DoHookSetRouting) ------------------
+    def hook_view(self) -> dict[str, Any]:
+        """The ``hook`` object of ``state.get``: one DWM overlay context per simulated monitor.
+        Twins (``hook_twins``) report ``order`` until a swap/assign pins them; ``needs_check``
+        follows the C++ rule — an order/pinned entry that is not confirmed, or a stale session.
+        A CROSSED assignment is deliberately invisible here (the entries still claim their own
+        monitor): the routing file cannot know which physical panel a context paints, so the
+        report is identical either way — exactly the 2026-09-03 failure mode."""
+        st = self.state
+        view: dict[str, Any] = {"active": True, "needs_check": False}
+        if not st.hook_routing_present:
+            return view
+        entries = []
+        for m in self.query_monitors()["monitors"]:
+            idx = int(m["index"])
+            twin = st.hook_twins and idx in (0, 1)
+            method = ("pinned" if st.hook_pinned else "order") if twin else "unique"
+            entries.append({"ctx": f"0x{0x1F3A0000 + idx:X}", "left": int(m["rect"]["x"]),
+                            "top": int(m["rect"]["y"]), "method": method, "monitor": idx})
+        stale = False
+        ambiguous = any(e["method"] in ("order", "pinned") for e in entries)
+        view["needs_check"] = bool(stale or (ambiguous and not st.hook_confirmed))
+        view["routing"] = {"session": st.hook_session, "stale": stale,
+                           "confirmed": bool(st.hook_confirmed), "entries": entries}
+        return view
+
+    def handle_hook_set_routing(self, params: dict[str, Any]) -> DesktopLutResponse:
+        """C++ DoHookSetRouting: ``swap`` trades the calibrated monitor's position with its
+        single same-size/same-bpc twin and re-injects (the DLL then honours the PINNED file);
+        ``confirm`` marks the assignment meter-verified without re-injecting; ``clear``
+        deletes the file and re-injects (a fresh roll); ``assign`` pins explicit entries."""
+        st = self.state
+        action = str(params.get("action") or "")
+        if action == "confirm":
+            if not st.hook_routing_present:
+                return DesktopLutResponse(ok=False, error="no hook routing to confirm")
+            st.hook_confirmed = True
+            return self.ok({"hook": self.hook_view(), "reinjected": False})
+        if action == "swap":
+            if "monitor" not in params:
+                return DesktopLutResponse(ok=False, error="missing parameter: monitor")
+            mon = int(params["monitor"])
+            if mon not in self.HDR_CAPABLE:
+                return DesktopLutResponse(ok=False, error="monitor index out of range")
+            if not (st.hook_twins and mon in (0, 1)):
+                return DesktopLutResponse(
+                    ok=False, error=f"monitor {mon} has no single same-size/same-bpc twin to swap with")
+            # The swap moves the crossed pairing to the other pairing: the DLL now paints the
+            # calibrated monitor's cube on the panel the previous roll gave the twin.
+            st.hook_routing_crossed = not st.hook_routing_crossed
+            st.hook_pinned = True
+            st.hook_confirmed = False
+            return self.ok({"hook": self.hook_view(), "reinjected": True})
+        if action == "clear":
+            st.hook_routing_present = True
+            st.hook_pinned = False
+            st.hook_confirmed = False
+            st.hook_routing_crossed = False    # deterministic "fresh roll" for the simulator
+            return self.ok({"hook": self.hook_view(), "reinjected": True})
+        if action == "assign":
+            entries = params.get("entries")
+            if not isinstance(entries, list) or not entries:
+                return DesktopLutResponse(ok=False, error="missing parameter: entries")
+            for e in entries:
+                if not isinstance(e, dict) or not all(k in e for k in ("ctx", "left", "top")):
+                    return DesktopLutResponse(ok=False, error="entries must be [{ctx, left, top}]")
+            st.hook_routing_present = True
+            st.hook_pinned = True
+            st.hook_confirmed = False
+            return self.ok({"hook": self.hook_view(), "reinjected": True})
+        return DesktopLutResponse(ok=False, error="action must be swap, confirm, clear or assign")
+
     def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
         if method == "calibration.status":
             return self.ok({"active": self.state.calibration_mode is not None, "state": deepcopy(self.state.calibration_mode)})
@@ -536,3 +624,24 @@ class MockDesktopLutTransport:
     def request(self, command: DesktopLutCommand) -> DesktopLutResponse:
         self.requests.append(command)
         return self.server.handle(command)
+
+    # Test-settable hook-routing knobs (see MockDesktopLutState): ``hook_twins`` makes the
+    # first two monitors an order-matched twin pair; ``hook_routing_crossed`` is the coin
+    # toss landing the calibrated monitor's cube on the twin. A synthetic panel that wants
+    # to model the 2026-09-03 failure reads these to decide whether the cube reaches the
+    # measured patch; a swap flips ``hook_routing_crossed``.
+    @property
+    def hook_twins(self) -> bool:
+        return self.server.state.hook_twins
+
+    @hook_twins.setter
+    def hook_twins(self, value: bool) -> None:
+        self.server.state.hook_twins = bool(value)
+
+    @property
+    def hook_routing_crossed(self) -> bool:
+        return self.server.state.hook_routing_crossed
+
+    @hook_routing_crossed.setter
+    def hook_routing_crossed(self, value: bool) -> None:
+        self.server.state.hook_routing_crossed = bool(value)

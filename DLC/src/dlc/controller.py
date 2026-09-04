@@ -360,6 +360,34 @@ class CalibrationController:
             {"monitor": monitor, "mode": normalize_mode(mode)},
         )
 
+    # -- DWM-hook LUT routing (twin-panel order-match) -------------------------------
+    # The hook DLL cannot read a monitor position from the DWM overlay context on 25H2, so
+    # two identical panels are matched by FIRST-PRESENT ORDER — a coin toss that used to
+    # re-roll on every set_3dlut/clear_3dlut (each one re-injects). On 2026-09-03 a whole
+    # 3dlut-only run measured an uncorrected panel because the cube rendered on the twin.
+    # The host now keeps the assignment sticky per DWM session, exposes it as
+    # state()["hook"], and lets a client SWAP/confirm it; dlc.hook_routing proves the
+    # assignment through the meter.
+    def hook_state(self) -> Optional[dict[str, Any]]:
+        """``state()["hook"]`` — ``{active, needs_check, routing?}`` — or ``None`` on a
+        DesktopLUT build that predates hook-routing reporting (then the assignment is
+        unknown and a cube flow must self-check)."""
+        hook = self.state().get("hook")
+        return hook if isinstance(hook, dict) else None
+
+    def set_hook_routing(self, action: str, monitor: int | None = None,
+                         entries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """``hook.set_routing``: ``swap`` (the calibrated ``monitor`` trades places with its
+        single same-size/same-bpc twin; re-injects), ``confirm`` (mark the assignment
+        meter-verified; no re-inject), ``clear`` (fresh roll; re-injects) or ``assign``
+        (explicit ``entries`` [{ctx,left,top}]; re-injects). Returns ``{hook, reinjected}``."""
+        params: dict[str, Any] = {"action": str(action)}
+        if monitor is not None:
+            params["monitor"] = int(monitor)
+        if entries is not None:
+            params["entries"] = [dict(e) for e in entries]
+        return self.call("hook.set_routing", params)
+
     # -- runtime OVERLAY grayscale tweak (the Corrections-tab / DWM-hook shader layer) ----
     # IMPORTANT (../docs/NAMING.md §2): this drives ``ColorCorrectionData::grayscale`` — the
     # OVERLAY/Corrections-tab grayscale, a DIFFERENT layer from the MHC ``correctionGrayscale``
