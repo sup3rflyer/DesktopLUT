@@ -16,6 +16,8 @@
 #include <cmath>
 #include <mutex>
 #include <atomic>
+#include <cstdio>
+#include <cctype>
 
 static std::recursive_mutex g_dwmInjectMutex;
 
@@ -902,6 +904,138 @@ void CloseDwmHookSharedMemory()
         g_sharedMemHandle = nullptr;
     }
     g_sharedMemVersion = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Twin-panel routing file (25H2) — the DLL writes it, the host reads/rewrites it.
+// Plain text, one record per line (format documented in dwm_hook_config.h).
+// ---------------------------------------------------------------------------
+static std::wstring RoutingFilePath()
+{
+    return ExpandEnv(DWM_HOOK_ROUTING_FILE_W);
+}
+
+// Is the dwm.exe that wrote the file still the running one? Context pointers only mean
+// something inside that process' lifetime.
+static bool DwmSessionAlive(unsigned long pid, unsigned long high, unsigned long low)
+{
+    for (DWORD p : FindProcessesByName(L"dwm.exe")) {
+        if (p != pid) continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p);
+        if (!h) return true;   // exists but cannot be queried — do not call it stale on a guess
+        FILETIME c = {}, e = {}, k = {}, u = {};
+        bool ok = GetProcessTimes(h, &c, &e, &k, &u) != 0;
+        CloseHandle(h);
+        if (!ok) return true;
+        return c.dwHighDateTime == high && c.dwLowDateTime == low;
+    }
+    return false;
+}
+
+static std::string NormalizeCtx(std::string s)
+{
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s = s.substr(2);
+    for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+    return s;
+}
+
+DwmHookRouting ReadDwmHookRouting()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    DwmHookRouting r;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, RoutingFilePath().c_str(), L"r") != 0 || !f) return r;
+    char line[256];
+    unsigned long pid = 0, high = 0, low = 0;
+    bool haveSession = false;
+    while (fgets(line, sizeof(line), f)) {
+        int version = 0, l = 0, t = 0, w = 0, h = 0, bpc = 0, confirmed = 0;
+        char ctx[40] = {0}, method[16] = {0};
+        if (sscanf_s(line, DWM_HOOK_ROUTING_MAGIC " %d", &version) == 1) continue;
+        if (sscanf_s(line, "session %lu %lu %lu", &pid, &high, &low) == 3) { haveSession = true; continue; }
+        if (sscanf_s(line, "mon %d %d %d %d %d", &l, &t, &w, &h, &bpc) == 5) {
+            r.monitors.push_back({l, t, w, h, bpc});
+            continue;
+        }
+        if (sscanf_s(line, "confirmed %d", &confirmed) == 1) { r.confirmed = confirmed != 0; continue; }
+        int n = sscanf_s(line, "ctx %39s %d %d %15s", ctx, (unsigned)sizeof(ctx), &l, &t, method, (unsigned)sizeof(method));
+        if (n >= 3) {
+            DwmHookRoutingEntry e;
+            e.ctx = NormalizeCtx(ctx);
+            e.left = l; e.top = t;
+            e.method = n >= 4 ? method : "unknown";
+            r.entries.push_back(e);
+            continue;
+        }
+    }
+    fclose(f);
+    if (!haveSession) return r;   // not a routing file we understand
+    r.present = true;
+    r.session = std::to_string(pid) + "-" + std::to_string(high) + "-" + std::to_string(low);
+    r.stale = !DwmSessionAlive(pid, high, low);
+    return r;
+}
+
+bool WriteDwmHookRouting(const DwmHookRouting& r)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    unsigned long pid = 0, high = 0, low = 0;
+    if (sscanf_s(r.session.c_str(), "%lu-%lu-%lu", &pid, &high, &low) != 3) return false;
+    std::wstring path = RoutingFilePath();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"w") != 0 || !f) {
+        std::wcerr << L"[DWM Hook] WARNING: cannot rewrite " << path << std::endl;
+        return false;
+    }
+    fprintf(f, "%s 1\n", DWM_HOOK_ROUTING_MAGIC);
+    fprintf(f, "session %lu %lu %lu\n", pid, high, low);
+    for (const auto& m : r.monitors)
+        fprintf(f, "mon %d %d %d %d %d\n", m.left, m.top, m.width, m.height, m.bpc);
+    fprintf(f, "confirmed %d\n", r.confirmed ? 1 : 0);
+    for (const auto& e : r.entries)
+        fprintf(f, "ctx %s %d %d %s\n", e.ctx.c_str(), e.left, e.top, e.method.c_str());
+    fclose(f);
+    // dwm.exe (Window Manager/DWM-n, not an administrator) must be able to rewrite what we
+    // just wrote — same reason the staged LUT files get a null DACL.
+    ClearDACL(path);
+    return true;
+}
+
+bool ClearDwmHookRouting()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    std::wstring path = RoutingFilePath();
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+    return DeleteFileW(path.c_str()) != 0;
+}
+
+std::wstring SwapDwmHookRouting(DwmHookRouting& r, int left, int top)
+{
+    const DwmHookRoutingMon* self = nullptr;
+    for (const auto& m : r.monitors)
+        if (m.left == left && m.top == top) { self = &m; break; }
+    if (!self)
+        return L"monitor at (" + std::to_wstring(left) + L"," + std::to_wstring(top) +
+               L") is not in the hook's recorded topology";
+    std::vector<const DwmHookRoutingMon*> twins;
+    for (const auto& m : r.monitors) {
+        if (&m == self) continue;
+        if (m.width == self->width && m.height == self->height && m.bpc == self->bpc) twins.push_back(&m);
+    }
+    if (twins.empty())
+        return L"monitor has no indistinguishable twin — its routing is not an order-match";
+    if (twins.size() > 1)
+        return L"monitor has " + std::to_wstring(twins.size()) +
+               L" indistinguishable twins — use action 'assign' with explicit entries";
+    const DwmHookRoutingMon* other = twins[0];
+    int moved = 0;
+    for (auto& e : r.entries) {
+        if (e.left == self->left && e.top == self->top) { e.left = other->left; e.top = other->top; moved++; }
+        else if (e.left == other->left && e.top == other->top) { e.left = self->left; e.top = self->top; moved++; }
+    }
+    if (moved == 0)
+        return L"no overlay context is recorded at either position — nothing to swap";
+    return {};
 }
 
 void InvalidateDxgiMonitorCache()

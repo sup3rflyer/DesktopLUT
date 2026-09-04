@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include "../shared/dwm_hook_config.h"
@@ -40,4 +41,31 @@ void CloseDwmHookSharedMemory();
 
 // Invalidate cached DXGI monitor info (call on WM_DISPLAYCHANGE).
 void InvalidateDxgiMonitorCache();
+
+// --- Twin-panel routing (25H2 first-present order-match) ---------------------
+// The hook DLL persists its overlay-context -> monitor assignment in
+// DWM_HOOK_ROUTING_FILE_W (see dwm_hook_config.h). The host reads it for state.get
+// and rewrites it for hook.set_routing; the DLL honours the rewritten pins on its
+// next injection of the same dwm.exe.
+struct DwmHookRoutingMon { int left = 0, top = 0, width = 0, height = 0, bpc = 0; };
+struct DwmHookRoutingEntry {
+    std::string ctx;      // hex pointer, lower-case, no 0x (as the DLL writes it)
+    int left = 0, top = 0;
+    std::string method;   // unique|bpc|scan|pinned|order|legacy|unknown
+};
+struct DwmHookRouting {
+    bool present = false;          // a routing file exists and parsed
+    std::string session;           // "<pid>-<createHigh>-<createLow>" of the dwm.exe that wrote it
+    bool stale = false;            // that dwm.exe is no longer running (DWM restarted since)
+    bool confirmed = false;        // a client verified the assignment through a meter
+    std::vector<DwmHookRoutingMon> monitors;
+    std::vector<DwmHookRoutingEntry> entries;
+};
+DwmHookRouting ReadDwmHookRouting();
+bool WriteDwmHookRouting(const DwmHookRouting& r);   // rewrites the file (keeps the DLL's session key)
+bool ClearDwmHookRouting();                          // deletes it — the next injection re-rolls
+// Swap the assignment of the monitor at (left, top) with its single indistinguishable twin
+// (same size + bpc): every context recorded at either position moves to the other one.
+// Returns an error message (empty on success). The caller re-injects.
+std::wstring SwapDwmHookRouting(DwmHookRouting& r, int left, int top);
 

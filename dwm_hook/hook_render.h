@@ -49,17 +49,43 @@ extern MonitorHdrState g_monitorHdrStates[16];
 extern int g_numMonitorHdrStates;
 extern bool g_hdrStatesDetected;
 
+// How a context's monitor position was resolved (persisted in the routing file for the host)
+enum CtxPosMethod : int {
+    CTXPOS_UNKNOWN = 0,
+    CTXPOS_UNIQUE  = 1,   // only one monitors.dat entry has this back-buffer size
+    CTXPOS_BPC     = 2,   // same-size candidates told apart by bit depth
+    CTXPOS_SCAN    = 3,   // monitor rect found inside the DWM context object (reserved; scan is diagnostic-only today)
+    CTXPOS_PINNED  = 4,   // taken from the persisted routing file (same dwm.exe, same topology)
+    CTXPOS_ORDER   = 5,   // first-present order among indistinguishable twins — a coin toss
+    CTXPOS_LEGACY  = 6,   // pre-25H2 path (swapchain GetContainingOutput / struct offset)
+};
+const char* CtxPosMethodName(int method);
+
 // Context position cache
 struct ContextPositionCache {
     void* context;
     int left, top;
+    int method;           // CtxPosMethod
 };
 extern ContextPositionCache g_contextPosCache[16];
 extern int g_numContextPosCache;
 
+// Twin-panel routing persistence (DWM_HOOK_ROUTING_FILE_A in dwm_hook_config.h)
+struct RoutingPin {
+    void* context;
+    int left, top;
+};
+extern RoutingPin g_routingPins[16];
+extern int g_numRoutingPins;
+extern bool g_routingPinsValid;     // pins were written by THIS dwm.exe for THIS monitors.dat topology
+extern bool g_routingConfirmed;     // host-set; the DLL clears it whenever it has to order-match
+void LoadRoutingPins();             // once at attach, after monitors.dat is loaded
+void SaveRoutingState();            // rewrite the file from the context cache
+
 // Monitor state functions
 bool IsMonitorHdr(int left, int top);
-void CacheContextPosition(void* context, int left, int top);
+void CacheContextPosition(void* context, int left, int top);                    // method left as-is / unknown
+void CacheContextPositionEx(void* context, int left, int top, int method);
 void GetMonitorPositionFromContext(void* context, int& left, int& top);
 
 // Tonemap lookup (defined in dllmain.cpp)

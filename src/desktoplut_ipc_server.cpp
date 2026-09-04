@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -540,6 +541,63 @@ void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
 }
 
 // ===========================================================================
+// DWM hook twin-panel routing (25H2 first-present order-match)
+// ===========================================================================
+// WIRE CONTRACT (consumed by DLC's hook-routing self-check). On 25H2 the hook DLL cannot
+// read a monitor position from a DWM overlay context; two identical panels are assigned by
+// first-present ORDER, re-rolled on every injection (2026-09-03: a whole 3dlut-only run
+// measured the wrong panel). The DLL now persists its assignment per dwm.exe lifetime; this
+// reports it and lets a client swap / confirm / clear it.
+//   hook: { active, needs_check, routing?: { session, stale, confirmed, entries: [
+//           { ctx, left, top, method: unique|bpc|scan|pinned|order|legacy, monitor|null } ] } }
+// needs_check = an entry was assigned by order (or is a pin of one) and no client confirmed
+// it through a meter, or the recorded dwm.exe is gone. No routing file yet => no `routing`
+// key (the client treats that as unknown).
+JsonValue BuildHookStateJson() {
+    JsonValue hook = JObj();
+    hook.set("active", JBool(IsDwmHookActive()));
+    DwmHookRouting r = ReadDwmHookRouting();
+    bool needsCheck = false;
+    if (r.present) {
+        JsonValue routing = JObj();
+        routing.set("session", JStr(r.session));
+        routing.set("stale", JBool(r.stale));
+        routing.set("confirmed", JBool(r.confirmed));
+        // Monitor index by desktop origin — the same lookup UpdateDwmHookSharedConfig uses.
+        std::vector<std::pair<int, int>> origins;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+            for (size_t mi = 0; mi < g_gui.monitors.size(); ++mi) {
+                MONITORINFO info = { sizeof(info) };
+                if (GetMonitorInfo(g_gui.monitors[mi], &info))
+                    origins.emplace_back((int)info.rcMonitor.left, (int)info.rcMonitor.top);
+                else
+                    origins.emplace_back(INT_MIN, INT_MIN);
+            }
+        }
+        JsonValue entries = JArr();
+        for (const auto& e : r.entries) {
+            JsonValue j = JObj();
+            j.set("ctx", JStr("0x" + e.ctx));
+            j.set("left", JNum(e.left));
+            j.set("top", JNum(e.top));
+            j.set("method", JStr(e.method));
+            int idx = -1;
+            for (size_t i = 0; i < origins.size(); ++i)
+                if (origins[i].first == e.left && origins[i].second == e.top) { idx = (int)i; break; }
+            j.set("monitor", idx >= 0 ? JNum(idx) : JsonValue());
+            entries.arr.push_back(j);
+            if ((e.method == "order" || e.method == "pinned") && !r.confirmed) needsCheck = true;
+        }
+        if (r.stale) needsCheck = true;
+        routing.set("entries", entries);
+        hook.set("routing", routing);
+    }
+    hook.set("needs_check", JBool(needsCheck));
+    return hook;
+}
+
+// ===========================================================================
 // Read-only handlers (served on the pipe thread)
 // ===========================================================================
 void HandleStateGet(JsonValue& result) {
@@ -611,6 +669,7 @@ void HandleStateGet(JsonValue& result) {
     result.set("mhc", mhc);
     result.set("runtime", runtime);
     result.set("layers", layers);
+    result.set("hook", BuildHookStateJson());
 }
 
 void HandleCalibStatus(JsonValue& result) {
@@ -1210,6 +1269,93 @@ void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("runtime", rt);
 }
 
+// hook.set_routing {action: swap|confirm|clear|assign, monitor?, entries?} — see BuildHookStateJson.
+// swap: the monitor's position and its single same-size/same-bpc twin's exchange every recorded
+//       context, then re-inject (the DLL honours the pins). confirm: mark the current assignment
+//       meter-verified (no re-inject). clear: delete the file and re-inject (a fresh roll).
+//       assign: explicit {ctx,left,top} list for rigs with more than one twin.
+void DoHookSetRouting(const JsonValue& p, JsonValue& result, std::string& error) {
+    std::string action = p.getStr("action");
+    bool reinject = false;
+    if (action == "confirm") {
+        DwmHookRouting r = ReadDwmHookRouting();
+        if (!r.present) { error = "no hook routing state to confirm (the hook has not assigned any context yet)"; return; }
+        if (r.stale) { error = "hook routing state is stale (dwm.exe restarted) - re-check before confirming"; return; }
+        r.confirmed = true;
+        if (!WriteDwmHookRouting(r)) { error = "failed to rewrite the hook routing file"; return; }
+    } else if (action == "clear") {
+        if (!ClearDwmHookRouting()) { error = "failed to delete the hook routing file"; return; }
+        reinject = true;
+    } else if (action == "swap") {
+        const JsonValue* mv = p.find("monitor");
+        if (!mv || mv->type != JsonValue::Num) { error = "missing parameter: monitor"; return; }
+        int mon = (int)std::llround(mv->num);
+        int left = 0, top = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+            if (mon < 0 || mon >= (int)g_gui.monitors.size()) { error = "monitor index out of range"; return; }
+            MONITORINFO info = { sizeof(info) };
+            if (!GetMonitorInfo(g_gui.monitors[mon], &info)) { error = "GetMonitorInfo failed"; return; }
+            left = info.rcMonitor.left;
+            top = info.rcMonitor.top;
+        }
+        DwmHookRouting r = ReadDwmHookRouting();
+        if (!r.present) { error = "no hook routing state to swap (the hook has not assigned any context yet)"; return; }
+        if (r.stale) { error = "hook routing state is stale (dwm.exe restarted) - re-inject first"; return; }
+        std::wstring err = SwapDwmHookRouting(r, left, top);
+        if (!err.empty()) { error = WideToUtf8(err); return; }
+        r.confirmed = false;
+        if (!WriteDwmHookRouting(r)) { error = "failed to rewrite the hook routing file"; return; }
+        reinject = true;
+    } else if (action == "assign") {
+        const JsonValue* ev = p.find("entries");
+        if (!ev || ev->type != JsonValue::Arr || ev->arr.empty()) { error = "missing parameter: entries"; return; }
+        DwmHookRouting r = ReadDwmHookRouting();
+        if (!r.present) { error = "no hook routing state to assign (the hook has not assigned any context yet)"; return; }
+        if (r.stale) { error = "hook routing state is stale (dwm.exe restarted) - re-inject first"; return; }
+        for (const auto& item : ev->arr) {
+            std::string ctx = item.getStr("ctx");
+            if (ctx.size() > 2 && ctx[0] == '0' && (ctx[1] == 'x' || ctx[1] == 'X')) ctx = ctx.substr(2);
+            for (auto& ch : ctx) ch = (char)tolower((unsigned char)ch);
+            const JsonValue* lv = item.find("left");
+            const JsonValue* tv = item.find("top");
+            if (ctx.empty() || !lv || !tv || lv->type != JsonValue::Num || tv->type != JsonValue::Num) {
+                error = "each entry needs ctx, left, top"; return;
+            }
+            bool found = false;
+            for (auto& e : r.entries) {
+                if (e.ctx != ctx) continue;
+                e.left = (int)std::llround(lv->num);
+                e.top = (int)std::llround(tv->num);
+                found = true;
+            }
+            if (!found) { error = "unknown context " + ctx; return; }
+        }
+        r.confirmed = false;
+        if (!WriteDwmHookRouting(r)) { error = "failed to rewrite the hook routing file"; return; }
+        reinject = true;
+    } else {
+        error = "unknown action (swap|confirm|clear|assign)";
+        return;
+    }
+    if (reinject) {
+        // Eject + re-inject: the DLL reloads the (rewritten / deleted) routing file at attach
+        // and rewrites it as it re-resolves each context. Give it a moment so the state we
+        // report reflects the NEW assignment, not the file we just wrote.
+        ReapplyProcessing();
+        for (int i = 0; i < 20; ++i) {
+            Sleep(50);
+            DwmHookRouting now = ReadDwmHookRouting();
+            bool settled = now.present;
+            for (const auto& e : now.entries)
+                if (e.method == "order" && action != "clear") settled = false;
+            if (settled) break;
+        }
+    }
+    result.set("hook", BuildHookStateJson());
+    result.set("reinjected", JBool(reinject));
+}
+
 void DoClear3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -1432,7 +1578,8 @@ void DoGrayscaleCancel(const JsonValue& p, JsonValue& result, std::string& error
 bool IsMutatingMethod(const std::string& m) {
     return m == "calibration.enter" || m == "calibration.exit" ||
            m == "corrections.disable_all" || m == "layers.set" || m.rfind("mhc.", 0) == 0 ||
-           m.rfind("runtime.", 0) == 0;  // set_3dlut / clear_3dlut / *_grayscale_tweak
+           m.rfind("runtime.", 0) == 0 ||  // set_3dlut / clear_3dlut / *_grayscale_tweak
+           m.rfind("hook.", 0) == 0;       // set_routing (re-injects => GUI thread)
 }
 
 // ===========================================================================
@@ -1637,6 +1784,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "maintenance.verify_mhc") DoVerifyMhc(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_3dlut") DoSet3dlut(*r->params, *r->result, *r->error);
         else if (m == "runtime.clear_3dlut") DoClear3dlut(*r->params, *r->result, *r->error);
+        else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);
         else *r->error = "unknown method: " + m;

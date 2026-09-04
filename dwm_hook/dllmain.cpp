@@ -584,6 +584,11 @@ static void UpdateLocalTonemapFromShared() {
 
 		if (topologyChanged) {
 			g_numContextPosCache = 0;
+			// Pins were validated against the attach-time topology; a different one makes them
+			// meaningless (and the routing file's mon lines will no longer match).
+			g_routingPinsValid = false;
+			g_numRoutingPins = 0;
+			g_routingConfirmed = false;
 		}
 	}
 
@@ -1018,6 +1023,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					log_to_file("WARNING: monitors.dat not found, position matching disabled");
 				}
 				g_hdrStatesDetected = true;
+				// Twin-panel routing pins persisted by this dwm.exe's previous injection (25H2).
+				LoadRoutingPins();
 			}
 
 			// Open shared memory for live IPC from host

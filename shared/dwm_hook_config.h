@@ -51,3 +51,25 @@ struct DwmHookSharedConfig {
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
 #pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// Twin-panel routing state (Windows 11 25H2)
+// ---------------------------------------------------------------------------
+// On 25H2 the hook cannot read a monitor position from a DWM overlay context; it matches a
+// context to monitors.dat by back-buffer size, then bit depth, then FIRST-PRESENT ORDER. Two
+// identical panels (3840x2160 10-bit FP16) are therefore a coin toss, re-rolled on every
+// injection — and every LUT set/clear re-injects (2026-09-03: a whole calibration run measured
+// the wrong panel). The DLL persists its context->position assignment in this file, keyed by
+// the dwm.exe process identity, and honours it on the next injection of the SAME dwm.exe; the
+// host reads it for state.get and rewrites it for hook.set_routing (swap / assign / confirm /
+// clear). Text, one record per line:
+//   DesktopLUT-hook-routing 1
+//   session <dwmPid> <createTimeHigh> <createTimeLow>
+//   mon <left> <top> <width> <height> <bpc>       one per monitors.dat entry (topology guard)
+//   confirmed <0|1>                               a client verified the assignment through a meter;
+//                                                 the DLL clears it on any fresh order-match
+//   ctx <hex pointer> <left> <top> <method>       method: unique|bpc|scan|pinned|order|legacy
+// Lives OUTSIDE the LUT staging dir (which is wiped on every injection).
+#define DWM_HOOK_ROUTING_FILE_A  "%SYSTEMROOT%\\Temp\\DesktopLUT_hook_routing.dat"
+#define DWM_HOOK_ROUTING_FILE_W L"%SYSTEMROOT%\\Temp\\DesktopLUT_hook_routing.dat"
+#define DWM_HOOK_ROUTING_MAGIC   "DesktopLUT-hook-routing"

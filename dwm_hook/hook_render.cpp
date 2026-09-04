@@ -10,6 +10,8 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 // Defined in dllmain.cpp
 extern bool isWindows11;
@@ -74,18 +76,152 @@ bool IsMonitorHdr(int left, int top) {
 ContextPositionCache g_contextPosCache[16] = {};
 int g_numContextPosCache = 0;
 
-void CacheContextPosition(void* context, int left, int top) {
+void CacheContextPositionEx(void* context, int left, int top, int method) {
 	for (int i = 0; i < g_numContextPosCache; i++) {
 		if (g_contextPosCache[i].context == context) {
 			g_contextPosCache[i].left = left;
 			g_contextPosCache[i].top = top;
+			if (method != CTXPOS_UNKNOWN) g_contextPosCache[i].method = method;
 			return;
 		}
 	}
 	if (g_numContextPosCache < 16) {
-		g_contextPosCache[g_numContextPosCache++] = { context, left, top };
+		g_contextPosCache[g_numContextPosCache++] = { context, left, top, method };
 	}
 }
+
+void CacheContextPosition(void* context, int left, int top) {
+	CacheContextPositionEx(context, left, top, CTXPOS_UNKNOWN);
+}
+
+// ---------------------------------------------------------------------------
+// Twin-panel routing persistence (25H2) — see DWM_HOOK_ROUTING_FILE_A in dwm_hook_config.h.
+// Two identical panels are only told apart by first-present order, re-rolled on every
+// injection. The DLL records what it assigned; the next injection of the SAME dwm.exe reuses
+// it (pins), and the host can rewrite the file (swap) after verifying through a meter.
+// Everything here is plain C I/O on a tiny file — same cost class as log_to_file, and only
+// touched when a context is seen for the first time after injection.
+// ---------------------------------------------------------------------------
+RoutingPin g_routingPins[16] = {};
+int g_numRoutingPins = 0;
+bool g_routingPinsValid = false;
+bool g_routingConfirmed = false;
+
+const char* CtxPosMethodName(int method) {
+	switch (method) {
+	case CTXPOS_UNIQUE: return "unique";
+	case CTXPOS_BPC:    return "bpc";
+	case CTXPOS_SCAN:   return "scan";
+	case CTXPOS_PINNED: return "pinned";
+	case CTXPOS_ORDER:  return "order";
+	case CTXPOS_LEGACY: return "legacy";
+	default:            return "unknown";
+	}
+}
+
+static const char* RoutingFilePath() {
+	static char path[MAX_PATH] = {0};
+	if (path[0] == '\0')
+		ExpandEnvironmentStringsA(DWM_HOOK_ROUTING_FILE_A, path, sizeof(path));
+	return path;
+}
+
+// This dwm.exe's identity: pid + creation time. Context pointers are only meaningful inside
+// one DWM process lifetime, so pins from a previous DWM are ignored.
+static void DwmSessionKey(DWORD& pid, DWORD& high, DWORD& low) {
+	pid = GetCurrentProcessId();
+	FILETIME c = {}, e = {}, k = {}, u = {};
+	if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+		high = c.dwHighDateTime;
+		low = c.dwLowDateTime;
+	} else {
+		high = low = 0;
+	}
+}
+
+void LoadRoutingPins() {
+	g_numRoutingPins = 0;
+	g_routingPinsValid = false;
+	g_routingConfirmed = false;
+	FILE* f = fopen(RoutingFilePath(), "r");
+	if (!f) {
+		log_to_file("routing: no persisted state (first injection for this dwm.exe, or cleared)");
+		return;
+	}
+	DWORD myPid = 0, myHigh = 0, myLow = 0;
+	DwmSessionKey(myPid, myHigh, myLow);
+	bool sessionOk = false;
+	int monLines = 0, monMatched = 0, confirmed = 0, version = 0;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long pid = 0, high = 0, low = 0;
+		int l = 0, t = 0, w = 0, h = 0, bpc = 0;
+		unsigned long long ptr = 0;
+		char method[16] = {0};
+		if (sscanf(line, DWM_HOOK_ROUTING_MAGIC " %d", &version) == 1) continue;
+		if (sscanf(line, "session %lu %lu %lu", &pid, &high, &low) == 3) {
+			sessionOk = (pid == myPid && high == myHigh && low == myLow);
+			continue;
+		}
+		if (sscanf(line, "mon %d %d %d %d %d", &l, &t, &w, &h, &bpc) == 5) {
+			monLines++;
+			for (int m = 0; m < g_numMonitorHdrStates; m++) {
+				const MonitorHdrState& ms = g_monitorHdrStates[m];
+				if (ms.left == l && ms.top == t && (int)ms.width == w && (int)ms.height == h && (int)ms.bpc == bpc) {
+					monMatched++;
+					break;
+				}
+			}
+			continue;
+		}
+		if (sscanf(line, "confirmed %d", &confirmed) == 1) continue;
+		if (sscanf(line, "ctx %llx %d %d %15s", &ptr, &l, &t, method) >= 3) {
+			if (g_numRoutingPins < 16)
+				g_routingPins[g_numRoutingPins++] = { (void*)(uintptr_t)ptr, l, t };
+			continue;
+		}
+	}
+	fclose(f);
+	bool topologyOk = (monLines == g_numMonitorHdrStates) && (monMatched == monLines);
+	g_routingPinsValid = sessionOk && topologyOk && g_numRoutingPins > 0;
+	g_routingConfirmed = g_routingPinsValid && confirmed != 0;
+	char msg[256];
+	snprintf(msg, sizeof(msg), "routing: persisted state %s (session %s, topology %s, %d pins, confirmed=%d)",
+		g_routingPinsValid ? "HONOURED" : "ignored", sessionOk ? "match" : "MISMATCH",
+		topologyOk ? "match" : "MISMATCH", g_numRoutingPins, confirmed);
+	log_to_file(msg);
+	if (!g_routingPinsValid) g_numRoutingPins = 0;
+}
+
+void SaveRoutingState() {
+	FILE* f = fopen(RoutingFilePath(), "w");
+	if (!f) {
+		log_to_file("routing: WARNING cannot write the routing state file");
+		return;
+	}
+	DWORD pid = 0, high = 0, low = 0;
+	DwmSessionKey(pid, high, low);
+	fprintf(f, "%s 1\n", DWM_HOOK_ROUTING_MAGIC);
+	fprintf(f, "session %lu %lu %lu\n", (unsigned long)pid, (unsigned long)high, (unsigned long)low);
+	for (int m = 0; m < g_numMonitorHdrStates; m++) {
+		const MonitorHdrState& ms = g_monitorHdrStates[m];
+		fprintf(f, "mon %d %d %u %u %u\n", ms.left, ms.top, ms.width, ms.height, ms.bpc);
+	}
+	fprintf(f, "confirmed %d\n", g_routingConfirmed ? 1 : 0);
+	for (int c = 0; c < g_numContextPosCache; c++) {
+		const ContextPositionCache& e = g_contextPosCache[c];
+		fprintf(f, "ctx %llx %d %d %s\n", (unsigned long long)(uintptr_t)e.context, e.left, e.top,
+			CtxPosMethodName(e.method));
+	}
+	fclose(f);
+}
+
+// NOTE (2026-09-04, HW-probed on 25H2 build 26200): a guarded value scan of each overlay context
+// (ctx+0..0xA000 and *(void**)ctx+0..0x9000) for the candidate monitors' desktop rects found ONLY
+// device-space rects (0,0,3840,2160) in BOTH twin contexts and never the second panel's
+// (-3840,485,...) rect; ctx+0x7698 (the documented 25H2 DeviceClipBox) read (0,1,0,3840)/(0,1,0,0).
+// There is no monitor identity to read from the context object on 25H2 — hence the persisted
+// pins above + the host's meter-verified swap, instead of another struct offset.
 
 static bool LookupContextPosition(void* context, int& left, int& top) {
 	for (int i = 0; i < g_numContextPosCache; i++) {
@@ -853,13 +989,14 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 				if (SUCCEEDED(swapChain->GetContainingOutput(&output))) {
 					DXGI_OUTPUT_DESC desc;
 					if (SUCCEEDED(output->GetDesc(&desc))) {
-						CacheContextPosition(cOverlayContext, desc.DesktopCoordinates.left, desc.DesktopCoordinates.top);
+						CacheContextPositionEx(cOverlayContext, desc.DesktopCoordinates.left, desc.DesktopCoordinates.top, CTXPOS_LEGACY);
 						char msg[256];
 						snprintf(msg, sizeof(msg), "Cached context %p position from swapchain: (%ld,%ld) %ldx%ld",
 							cOverlayContext, desc.DesktopCoordinates.left, desc.DesktopCoordinates.top,
 							desc.DesktopCoordinates.right - desc.DesktopCoordinates.left,
 							desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
 						log_to_file(msg);
+						SaveRoutingState();
 					}
 					output->Release();
 				} else {
@@ -943,7 +1080,7 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 
 				if (numMatches == 1) {
 					auto& ms = g_monitorHdrStates[matchIndices[0]];
-					CacheContextPosition(cOverlayContext, ms.left, ms.top);
+					CacheContextPositionEx(cOverlayContext, ms.left, ms.top, CTXPOS_UNIQUE);
 					char msg[256];
 					snprintf(msg, sizeof(msg), "25H2: Cached ctx %p pos (%d,%d) unique match (%ux%u fmt=%d)",
 						cOverlayContext, ms.left, ms.top, bbDesc.Width, bbDesc.Height, (int)bbDesc.Format);
@@ -970,27 +1107,62 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 									bestIdx = i;
 							}
 						}
-					} else {
-						// Same BPC — assign by order, skipping already-cached positions
-						for (int i = 0; i < numMatches; i++) {
-							auto& ms = g_monitorHdrStates[matchIndices[i]];
-							bool alreadyUsed = false;
-							for (int c = 0; c < g_numContextPosCache; c++) {
-								if (g_contextPosCache[c].left == ms.left && g_contextPosCache[c].top == ms.top) {
-									alreadyUsed = true; break;
+					}
+
+					int method = bpcVaries ? CTXPOS_BPC : CTXPOS_ORDER;
+					if (!bpcVaries) {
+						// Same size AND same BPC: 25H2 gives no identity, so first-present ORDER decides —
+						// a coin toss re-rolled on every injection (2026-09-03: the ProArt's cube rendered on
+						// the LG C6 for a whole calibration run). Honour the assignment this dwm.exe made
+						// on its previous injection (possibly swapped by the host after a meter check);
+						// only a context never seen before falls back to order.
+						if (g_routingPinsValid) {
+							for (int p = 0; p < g_numRoutingPins; p++) {
+								if (g_routingPins[p].context != cOverlayContext) continue;
+								for (int i = 0; i < numMatches; i++) {
+									auto& pm = g_monitorHdrStates[matchIndices[i]];
+									if (pm.left == g_routingPins[p].left && pm.top == g_routingPins[p].top) {
+										bestIdx = i;
+										method = CTXPOS_PINNED;
+										break;
+									}
 								}
+								break;
 							}
-							if (!alreadyUsed) { bestIdx = i; break; }
 						}
-						if (bestIdx < 0) bestIdx = 0;
+						if (bestIdx < 0) {
+							// Assign by order, skipping positions already cached AND positions a pin
+							// reserves for a context that has not presented yet.
+							for (int i = 0; i < numMatches; i++) {
+								auto& om = g_monitorHdrStates[matchIndices[i]];
+								bool alreadyUsed = false;
+								for (int c = 0; c < g_numContextPosCache; c++) {
+									if (g_contextPosCache[c].left == om.left && g_contextPosCache[c].top == om.top) {
+										alreadyUsed = true; break;
+									}
+								}
+								if (!alreadyUsed && g_routingPinsValid) {
+									for (int p = 0; p < g_numRoutingPins; p++) {
+										if (g_routingPins[p].context != cOverlayContext &&
+										    g_routingPins[p].left == om.left && g_routingPins[p].top == om.top) {
+											alreadyUsed = true; break;
+										}
+									}
+								}
+								if (!alreadyUsed) { bestIdx = i; break; }
+							}
+							if (bestIdx < 0) bestIdx = 0;
+							// A fresh roll: whatever a client verified through the meter no longer holds.
+							g_routingConfirmed = false;
+						}
 					}
 
 					auto& ms = g_monitorHdrStates[matchIndices[bestIdx]];
-					CacheContextPosition(cOverlayContext, ms.left, ms.top);
+					CacheContextPositionEx(cOverlayContext, ms.left, ms.top, method);
 					char msg[256];
 					snprintf(msg, sizeof(msg), "25H2: Cached ctx %p pos (%d,%d) %s (bpc=%u, fp16=%d, %d candidates)",
 						cOverlayContext, ms.left, ms.top,
-						bpcVaries ? "bpc-match" : "order-match",
+						method == CTXPOS_BPC ? "bpc-match" : (method == CTXPOS_PINNED ? "pinned" : "order-match"),
 						ms.bpc, isFP16 ? 1 : 0, numMatches);
 					log_to_file(msg);
 				} else {
@@ -1000,6 +1172,10 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 					log_to_file(msg);
 				}
 				if (numCached < 16) cachedContexts[numCached++] = cOverlayContext;
+				// Persist the assignment for the next injection of this dwm.exe (and for the host's
+				// state.get / hook.set_routing). Also written for unique/bpc so the host can tell an
+				// unambiguous rig from one it has no evidence about.
+				if (numMatches >= 1) SaveRoutingState();
 			}
 		}
 
