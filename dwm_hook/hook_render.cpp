@@ -121,9 +121,30 @@ const char* CtxPosMethodName(int method) {
 
 static const char* RoutingFilePath() {
 	static char path[MAX_PATH] = {0};
-	if (path[0] == '\0')
-		ExpandEnvironmentStringsA(DWM_HOOK_ROUTING_FILE_A, path, sizeof(path));
+	if (path[0] == '\0') {
+		char pattern[MAX_PATH] = {0};
+		snprintf(pattern, sizeof(pattern), DWM_HOOK_ROUTING_FILE_FMT_A, (unsigned long)GetCurrentProcessId());
+		ExpandEnvironmentStringsA(pattern, path, sizeof(path));
+	}
 	return path;
+}
+
+// Set when THIS injection had to order-match a context (a fresh roll); only then may the
+// DLL lower the host's meter-verified `confirmed` flag (F3: any other first-encounter —
+// a fullscreen swapchain, a monitor wake — must preserve what the host wrote).
+static bool g_routingRolled = false;
+
+static int ReadConfirmedFromFile() {
+	FILE* f = fopen(RoutingFilePath(), "r");
+	if (!f) return 0;
+	int confirmed = 0;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		int v = 0;
+		if (sscanf(line, "confirmed %d", &v) == 1) { confirmed = v; break; }
+	}
+	fclose(f);
+	return confirmed;
 }
 
 // This dwm.exe's identity: pid + creation time. Context pointers are only meaningful inside
@@ -143,6 +164,7 @@ void LoadRoutingPins() {
 	g_numRoutingPins = 0;
 	g_routingPinsValid = false;
 	g_routingConfirmed = false;
+	g_routingRolled = false;
 	FILE* f = fopen(RoutingFilePath(), "r");
 	if (!f) {
 		log_to_file("routing: no persisted state (first injection for this dwm.exe, or cleared)");
@@ -208,12 +230,34 @@ void SaveRoutingState() {
 		fprintf(f, "mon %d %d %u %u %u\n", ms.left, ms.top, ms.width, ms.height, ms.bpc);
 	}
 	fprintf(f, "confirmed %d\n", g_routingConfirmed ? 1 : 0);
-	for (int c = 0; c < g_numContextPosCache; c++) {
+	int written = 0;
+	for (int c = 0; c < g_numContextPosCache && written < 16; c++, written++) {
 		const ContextPositionCache& e = g_contextPosCache[c];
 		fprintf(f, "ctx %llx %d %d %s\n", (unsigned long long)(uintptr_t)e.context, e.left, e.top,
 			CtxPosMethodName(e.method));
 	}
+	// Pins for contexts that have not presented yet this injection stay on disk (F2): a
+	// re-injection can come seconds after this one (every set_3dlut), before the second twin
+	// draws a frame — dropping its pin would re-roll it.
+	if (g_routingPinsValid) {
+		for (int p = 0; p < g_numRoutingPins && written < 16; p++) {
+			bool seen = false;
+			for (int c = 0; c < g_numContextPosCache; c++)
+				if (g_contextPosCache[c].context == g_routingPins[p].context) { seen = true; break; }
+			if (seen) continue;
+			fprintf(f, "ctx %llx %d %d %s\n", (unsigned long long)(uintptr_t)g_routingPins[p].context,
+				g_routingPins[p].left, g_routingPins[p].top, CtxPosMethodName(CTXPOS_PINNED));
+			written++;
+		}
+	}
 	fclose(f);
+}
+
+// The file is the host's channel too: it writes `confirmed 1` after a meter check while we are
+// injected. Re-read it before every rewrite unless this injection rolled (F3).
+static void RefreshConfirmedBeforeSave() {
+	if (g_routingRolled) { g_routingConfirmed = false; return; }
+	g_routingConfirmed = ReadConfirmedFromFile() != 0;
 }
 
 // NOTE (2026-09-04, HW-probed on 25H2 build 26200): a guarded value scan of each overlay context
@@ -996,6 +1040,7 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 							desc.DesktopCoordinates.right - desc.DesktopCoordinates.left,
 							desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
 						log_to_file(msg);
+						RefreshConfirmedBeforeSave();
 						SaveRoutingState();
 					}
 					output->Release();
@@ -1131,28 +1176,33 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 							}
 						}
 						if (bestIdx < 0) {
-							// Assign by order, skipping positions already cached AND positions a pin
-							// reserves for a context that has not presented yet.
-							for (int i = 0; i < numMatches; i++) {
-								auto& om = g_monitorHdrStates[matchIndices[i]];
-								bool alreadyUsed = false;
-								for (int c = 0; c < g_numContextPosCache; c++) {
-									if (g_contextPosCache[c].left == om.left && g_contextPosCache[c].top == om.top) {
-										alreadyUsed = true; break;
-									}
-								}
-								if (!alreadyUsed && g_routingPinsValid) {
-									for (int p = 0; p < g_numRoutingPins; p++) {
-										if (g_routingPins[p].context != cOverlayContext &&
-										    g_routingPins[p].left == om.left && g_routingPins[p].top == om.top) {
+							// Assign by order. Pass 1 skips positions already cached AND positions a pin
+							// reserves for a context that has not presented yet; pass 2 (F1: a stale pin
+							// for a context DWM recreated at a new address) skips only cached positions —
+							// a live context beats a reservation for one that may never come; then 0.
+							for (int pass = 0; pass < 2 && bestIdx < 0; pass++) {
+								for (int i = 0; i < numMatches; i++) {
+									auto& om = g_monitorHdrStates[matchIndices[i]];
+									bool alreadyUsed = false;
+									for (int c = 0; c < g_numContextPosCache; c++) {
+										if (g_contextPosCache[c].left == om.left && g_contextPosCache[c].top == om.top) {
 											alreadyUsed = true; break;
 										}
 									}
+									if (!alreadyUsed && pass == 0 && g_routingPinsValid) {
+										for (int p = 0; p < g_numRoutingPins; p++) {
+											if (g_routingPins[p].context != cOverlayContext &&
+											    g_routingPins[p].left == om.left && g_routingPins[p].top == om.top) {
+												alreadyUsed = true; break;
+											}
+										}
+									}
+									if (!alreadyUsed) { bestIdx = i; break; }
 								}
-								if (!alreadyUsed) { bestIdx = i; break; }
 							}
 							if (bestIdx < 0) bestIdx = 0;
 							// A fresh roll: whatever a client verified through the meter no longer holds.
+							g_routingRolled = true;
 							g_routingConfirmed = false;
 						}
 					}
@@ -1175,7 +1225,7 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 				// Persist the assignment for the next injection of this dwm.exe (and for the host's
 				// state.get / hook.set_routing). Also written for unique/bpc so the host can tell an
 				// unambiguous rig from one it has no evidence about.
-				if (numMatches >= 1) SaveRoutingState();
+				if (numMatches >= 1) { RefreshConfirmedBeforeSave(); SaveRoutingState(); }
 			}
 		}
 

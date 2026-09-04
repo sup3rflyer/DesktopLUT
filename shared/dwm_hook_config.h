@@ -69,7 +69,11 @@ static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 4
 //   confirmed <0|1>                               a client verified the assignment through a meter;
 //                                                 the DLL clears it on any fresh order-match
 //   ctx <hex pointer> <left> <top> <method>       method: unique|bpc|scan|pinned|order|legacy
-// Lives OUTSIDE the LUT staging dir (which is wiped on every injection).
-#define DWM_HOOK_ROUTING_FILE_A  "%SYSTEMROOT%\\Temp\\DesktopLUT_hook_routing.dat"
-#define DWM_HOOK_ROUTING_FILE_W L"%SYSTEMROOT%\\Temp\\DesktopLUT_hook_routing.dat"
+// Lives OUTSIDE the LUT staging dir (which is wiped on every injection). One file PER dwm.exe
+// (pid-suffixed): the host injects into every dwm.exe on the machine (fast-user-switch / RDP /
+// lock-screen sessions each have one) and they must not overwrite each other's pins; the host
+// reads the file of the dwm.exe in its own session.
+// printf-style (the env var's percent signs are escaped for the formatter, expanded afterwards).
+#define DWM_HOOK_ROUTING_FILE_FMT_A  "%%SYSTEMROOT%%\\Temp\\DesktopLUT_hook_routing_%lu.dat"
+#define DWM_HOOK_ROUTING_FILE_FMT_W L"%%SYSTEMROOT%%\\Temp\\DesktopLUT_hook_routing_%lu.dat"
 #define DWM_HOOK_ROUTING_MAGIC   "DesktopLUT-hook-routing"

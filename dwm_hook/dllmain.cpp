@@ -585,7 +585,9 @@ static void UpdateLocalTonemapFromShared() {
 		if (topologyChanged) {
 			g_numContextPosCache = 0;
 			// Pins were validated against the attach-time topology; a different one makes them
-			// meaningless (and the routing file's mon lines will no longer match).
+			// meaningless (and the routing file's mon lines will no longer match). NOTE: contexts
+			// already seen by ApplyLUTDirect are NOT re-resolved until re-injection (its static
+			// cachedContexts[] is not reset here — pre-existing behaviour).
 			g_routingPinsValid = false;
 			g_numRoutingPins = 0;
 			g_routingConfirmed = false;

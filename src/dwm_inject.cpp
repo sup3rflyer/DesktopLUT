@@ -910,9 +910,26 @@ void CloseDwmHookSharedMemory()
 // Twin-panel routing file (25H2) — the DLL writes it, the host reads/rewrites it.
 // Plain text, one record per line (format documented in dwm_hook_config.h).
 // ---------------------------------------------------------------------------
+// The dwm.exe of the host's own session (each interactive session has one; the host injects into
+// all of them, and each keeps its own pid-suffixed routing file).
+static DWORD SessionDwmPid()
+{
+    DWORD mine = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &mine);
+    DWORD fallback = 0;
+    for (DWORD p : FindProcessesByName(L"dwm.exe")) {
+        DWORD sid = 0;
+        if (ProcessIdToSessionId(p, &sid) && sid == mine) return p;
+        if (!fallback) fallback = p;
+    }
+    return fallback;
+}
+
 static std::wstring RoutingFilePath()
 {
-    return ExpandEnv(DWM_HOOK_ROUTING_FILE_W);
+    wchar_t pattern[MAX_PATH];
+    swprintf_s(pattern, DWM_HOOK_ROUTING_FILE_FMT_W, (unsigned long)SessionDwmPid());
+    return ExpandEnv(pattern);
 }
 
 // Is the dwm.exe that wrote the file still the running one? Context pointers only mean
@@ -995,9 +1012,9 @@ bool WriteDwmHookRouting(const DwmHookRouting& r)
     for (const auto& e : r.entries)
         fprintf(f, "ctx %s %d %d %s\n", e.ctx.c_str(), e.left, e.top, e.method.c_str());
     fclose(f);
-    // dwm.exe (Window Manager/DWM-n, not an administrator) must be able to rewrite what we
-    // just wrote — same reason the staged LUT files get a null DACL.
-    ClearDACL(path);
+    // Truncating the DWM-created file keeps its security descriptor (dwm.exe stays the owner
+    // and keeps write access); no DACL widening needed — a null DACL would let any local
+    // user redirect LUT routing.
     return true;
 }
 
