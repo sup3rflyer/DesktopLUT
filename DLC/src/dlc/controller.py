@@ -143,56 +143,6 @@ class CalibrationController:
             return None
         return {name: bool(entry.get(name, False)) for name in cls.LAYER_NAMES}
 
-    # -- viewing layers (GUI toggles a run must measure WITHOUT) ----------------
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
-
-    def set_layers(self, monitor: int, mode: str, **layers: bool) -> dict[str, Any]:
-        """Toggle the viewing layers of ``monitor:mode`` exactly as the GUI checkboxes do
-        (``layers.set``): the MHC's white balance / correction grayscale / Desktop Gamma
-        permutation bits and the HDR tonemap shader flag. Omitted layers are kept. Returns
-        ``{monitor_mode, before, after, regenerated, profile_name}`` — the MHC profile is
-        re-baked (new name) when an MHC-layer bit changed."""
-        params: dict[str, Any] = {"monitor": int(monitor), "mode": normalize_mode(mode)}
-        for name, value in layers.items():
-            if name not in self.LAYER_NAMES:
-                raise ValueError(f"unknown viewing layer {name!r} (have {self.LAYER_NAMES})")
-            params[name] = bool(value)
-        return self.call("layers.set", params)
-
-    @classmethod
-    def layers_from_state(cls, state: dict[str, Any], monitor: int, mode: str) -> Optional[dict[str, bool]]:
-        """The four viewing-layer flags for ``monitor:mode`` from a ``state()`` reply, or
-        ``None`` on a server that predates ``layers`` (then the ini is the only evidence)."""
-        entry = (state.get("layers") or {}).get(f"{int(monitor)}:{normalize_mode(mode)}")
-        if not isinstance(entry, dict):
-            return None
-        return {name: bool(entry.get(name, False)) for name in cls.LAYER_NAMES}
-
-    # -- viewing layers (GUI toggles a run must measure WITHOUT) ----------------
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
-
-    def set_layers(self, monitor: int, mode: str, **layers: bool) -> dict[str, Any]:
-        """Toggle the viewing layers of ``monitor:mode`` exactly as the GUI checkboxes do
-        (``layers.set``): the MHC's white balance / correction grayscale / Desktop Gamma
-        permutation bits and the HDR tonemap shader flag. Omitted layers are kept. Returns
-        ``{monitor_mode, before, after, regenerated, profile_name}`` — the MHC profile is
-        re-baked (new name) when an MHC-layer bit changed."""
-        params: dict[str, Any] = {"monitor": int(monitor), "mode": normalize_mode(mode)}
-        for name, value in layers.items():
-            if name not in self.LAYER_NAMES:
-                raise ValueError(f"unknown viewing layer {name!r} (have {self.LAYER_NAMES})")
-            params[name] = bool(value)
-        return self.call("layers.set", params)
-
-    @classmethod
-    def layers_from_state(cls, state: dict[str, Any], monitor: int, mode: str) -> Optional[dict[str, bool]]:
-        """The four viewing-layer flags for ``monitor:mode`` from a ``state()`` reply, or
-        ``None`` on a server that predates ``layers`` (then the ini is the only evidence)."""
-        entry = (state.get("layers") or {}).get(f"{int(monitor)}:{normalize_mode(mode)}")
-        if not isinstance(entry, dict):
-            return None
-        return {name: bool(entry.get(name, False)) for name in cls.LAYER_NAMES}
-
     # -- MHC staging + apply ----------------------------------------------
     def set_primaries(self, monitor: int, mode: str, primaries: dict[str, float]) -> dict[str, Any]:
         return self.call(
