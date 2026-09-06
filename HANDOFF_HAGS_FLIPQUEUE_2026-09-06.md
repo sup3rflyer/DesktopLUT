@@ -3,11 +3,12 @@
 **For:** a DesktopLUT session. **Goal:** make the DWM hook coexist with Windows
 Hardware-Accelerated GPU Scheduling (HAGS) so the LUT keeps applying to every DWM client
 (mpv included) while HAGS stays ON (needed for DLSS Frame Generation on the LG 4K120).
-**Status (updated 2026-09-06 evening):** BISECTED + FIXED + DEPLOYED — see §9. The culprit
-was the 25H2 `OverlaysEnabled` force-TRUE inline patch; OverlaysEnabled is now left original
-when `DisableIndependentFlip=1` is written. Open: idle-GPU re-verification, HAGS-off regression
-check (reboot), LUT-coverage spot-check for games/browser video. Sections 1–8 are the original
-handoff, kept verbatim (note §9.1's correction to row C).
+**Status (updated 2026-09-06 late):** BISECTED — and the first conclusion (§9) was WRONG, see
+§10. Not a hook defect: with HAGS on, DWM compositing mpv paces badly even with the DLL fully
+inert. The hook only decides whether a full-monitor window is composited (LUT applied, bad
+pacing under HAGS) or bypasses DWM (clean pacing, no LUT). Production stays at the old
+behaviour (`4ode`); `4od` is an opt-in bypass for a client that applies the cube itself.
+Sections 1–8 are the original handoff, kept verbatim.
 
 ---
 
@@ -161,7 +162,7 @@ CRU exact 47.952048 mode; LG 4K120 secondary; mpv = AnimeJaNai v3.5.0 fork libmp
 
 ---
 
-## 9. RESULT (2026-09-06 evening session) — bisected, fixed, deployed
+## 9. FIRST RESULT (2026-09-06 evening) — SUPERSEDED BY §10, kept for the data
 
 **Culprit: the 25H2 `OverlaysEnabled` inline patch that forces TRUE (`mov al,1; ret`).**
 Not the present-path work (L1), not the DirectFlip denials (L2/L3), not `OverlayTestMode=5`,
@@ -260,3 +261,56 @@ contradiction. This also removes the "cyan/magenta tint" hazard in `DWM_HOOK_REP
   `pm_mn_hagson2.csv` never existed. `logman stop <name> -ets` both before a `-Pm` run.
 - `powershell -File script.ps1 -Levels 4o,4d,4e` passes ONE string; use
   `-Command "& 'script' -Levels @('4o','4d','4e')"`.
+
+---
+
+## 10. CORRECTION (2026-09-06 late) — the §9 fix was a coverage regression, not a pacing fix
+
+Owner test with a red↔green swap LUT under the §9 build: LUT applied windowed, **gone on
+maximize and on fullscreen**. On 25H2 an un-forced `OverlaysEnabled` lets any full-monitor
+window bypass DWM composition, and PresentMon still labels it `Composed: Flip` — so every
+"clean + composed" row in §9.1 (`hl_4d`, `hl2_4od`, `fix_*`) was a DWM bypass, and every run
+where DWM really composited mpv (`hl_4`, `hl2_4de`) was bad. GDI screen capture cannot detect
+this (a pure-red image captured red while the panel showed green): DWM renders captures from
+the window surfaces, not from the hooked scanout buffer. Only eyes / a meter count.
+
+Three runs then separated "DWM compositing under HAGS" from "the hook":
+
+| tag | config | window | mode | jitter | delayed/min | holds/min |
+|-----|--------|--------|------|--------|-------------|-----------|
+| win_0 | DLL inert (level 0) | windowed (always composited) | Composed | **0.494** | **262** | **264** |
+| win_4ode | old production | windowed | Composed | 0.632 | 257 | 309 |
+| fs_4oden | old production, Present hook pass-through (no LUT draw) | fullscreen | Composed | 0.219 | 44.6 | 124.8 |
+| win3_0 | DLL inert, CLEAN rerun (owner hands off, GPU idle, 48.000 Hz) | windowed | Composed | **0.678** | **262** | **290** |
+| win3_4od | OverlaysEnabled original (LUT applies windowed) | windowed | Composed | 0.615 | 257 | 653 |
+| hagsoff_full (§1 row A) | old production, HAGS off | fullscreen | Composed | 0.00006 | 0 | 1.7 |
+
+`win_0` was contaminated (owner toggling LUT/hook in the GUI during it) and a first rerun
+landed on 60 Hz (windowed runs do not trigger change-refresh; 3:2 cadence makes the counters
+meaningless — `est_disp_fps` ≈ 57 is the tell). `win3_*` is the clean rerun at 48.000 Hz
+(`set-refresh.ps1 -Hz 47` gives the 47.952 CRU mode, `-Hz 48` an exact 48.000 one; the
+2:2 cadence is what matters). GPU idle for all (the `lada-cli` jobs had finished; 44–49 %). **DWM compositing this
+client under the HAGS flip queue is bad with no hook at all.** The hook's only lever is whether
+full-monitor windows get composited (LUT) or bypass (no LUT) — there is nothing in it to fix.
+
+What changed back: `g_l4OverlaysEnabledForceTrue` defaults to true again (production =
+`4ode`, identical to the pre-session behaviour). Kept: the per-write flag letters (`o`/`d`/`e`,
+plus `n` = keep all patches, skip the LUT draw), the `HwSchMode` log field, the per-monitor
+`TM DIAG` fix, the harness driver `hook-level-bisect.ps1`, and `4od` as an explicit opt-in
+bypass. The §6 "HAGS-aware mode switch" is not built: there is no hook behaviour that gives
+both LUT coverage and clean pacing under HAGS.
+
+Options that remain (owner's call):
+1. HAGS off when watching (row A is clean) — loses DLSS FG.
+2. Route 2 (§7): run the hook at `4od` so fullscreen mpv bypasses DWM (clean, Independent-Flip
+   class), and have mpv apply the calibration cube itself (`--target-lut`, PQ-domain parity to
+   verify with the meter). Every other full-monitor window (games, other players) then also
+   loses the LUT — acceptable only if that is understood.
+3. A per-window exemption in the hook (deny composition bypass for everything except a chosen
+   window) — new feature; the 25H2 DirectFlip decision for the un-forced path is inlined, so
+   this would have to be done through `OverlaysEnabled`'s per-context `this`, unexplored.
+4. Investigate DWM's own compositor pacing under the flip queue (why a composited 48 Hz
+   client on a 47.952 Hz mode misses target times with HAGS) — outside this codebase.
+
+Open, unchanged: HAGS-off regression check of the current build is moot (behaviour is the
+pre-session one); idle-GPU re-verification is moot for the same reason.

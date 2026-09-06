@@ -218,29 +218,35 @@ static bool g_disableIndependentFlipPatched = false;
 // Hook level controls which hooks are activated. Default 4.
 // Overridable via DesktopLUT_HookLevel.flag file content (0-5).
 // 0=none (inert diagnostic), 1=Present only, 2=+IsCandidateDirectFlip,
-// 3=+fallback DirectFlip hooks, 4=+OverlayTestMode=5 (+DisableIndependentFlip=1 on
-// 25H2; OverlaysEnabled left original there, MinHook-hooked on older builds),
+// 3=+fallback DirectFlip hooks, 4=+OverlayTestMode=5 +OverlaysEnabled (inline-patch
+// TRUE on 25H2 together with DisableIndependentFlip=1, MinHook on older builds),
 // 5=force OverlaysEnabled via MinHook (UNSAFE on 25H2+). Optional letters after the
 // digit select the level-4 writes individually — see g_l4* below.
 static int g_hookLevel = 4;
 // Level-4 sub-selection (diagnostic bisect). Flag file may carry letters after the
-// digit: 'o' = OverlayTestMode=5, 'd' = DisableIndependentFlip=1, 'e' = the LEGACY
+// digit: 'o' = OverlayTestMode=5, 'd' = DisableIndependentFlip=1, 'e' = the
 // OverlaysEnabled "mov al,1; ret" (force TRUE) inline patch on 25H2.
-// "4" alone (or no letters) = production: 'o' + 'd', OverlaysEnabled left ORIGINAL.
+// "4" alone (or no letters) = production = all three ("4ode").
 //
-// Why 'e' is off by default (2026-09-06, HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md): with
-// Hardware-Accelerated GPU Scheduling on (WDDM hardware flip queue), forcing
-// OverlaysEnabled to TRUE made every DWM-composed client pace badly (mpv
-// display-resample vsync-jitter 0.13-0.15 vs 0.0001, 17-26 delayed frames/min,
-// 46-184 two-vsync glass holds/min). Bisected per write: DisableIndependentFlip=1
-// alone, and DisableIndependentFlip+OverlayTestMode=5, were clean AND kept mpv
-// composed (LUT applied); adding the TRUE patch reproduced the bad numbers. The
-// original OverlaysEnabled already consults m_dwOverlayTestMode (its first
-// instruction is `cmp [OverlayTestMode],5`), so with OverlayTestMode=5 it returns
-// the overlays-disabled answer on its own — the TRUE patch contradicted it.
+// History (2026-09-06, HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md §9–10): with
+// Hardware-Accelerated GPU Scheduling on (WDDM hardware flip queue), mpv composed
+// through DWM paces badly (display-resample vsync-jitter 0.13–0.6, hundreds of
+// two-vsync glass holds/min). A per-write bisect first blamed the force-TRUE patch,
+// because "4od" gave clean numbers — but on 25H2 an un-forced OverlaysEnabled lets
+// any full-monitor window BYPASS DWM composition (PresentMon still reports
+// "Composed: Flip"; the LUT visibly stops applying on maximize/fullscreen). Windowed
+// mpv with this DLL fully inert, and fullscreen mpv with all patches but no LUT
+// draw ('n'), pace just as badly: DWM compositing this client under the HAGS flip
+// queue is bad by itself and the hook cannot fix it. So the TRUE patch stays
+// (LUT coverage). "4od" remains an opt-in bypass for a client that applies the cube
+// itself (e.g. mpv --target-lut) and wants Independent-Flip-class pacing.
 static bool g_l4OverlayTestMode = true;
 static bool g_l4DisableIFlip = true;
-static bool g_l4OverlaysEnabledForceTrue = false;
+static bool g_l4OverlaysEnabledForceTrue = true;
+// Diagnostic only ('n' letter): keep every hook/patch installed but make the Present hook
+// a pure pass-through (no LUT draw). Separates "DWM composing the client under HAGS" from
+// "the LUT pass inside DWM's present".
+static bool g_diagNoLutDraw = false;
 // HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode at injection
 // (2 = HAGS on, 1 = off, -1 = unreadable). Logged for diagnosis; see
 // HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md.
@@ -724,6 +730,9 @@ static bool ReadOverlaySwapChainInfo(void* overlaySwapChain, bool& hwProtected, 
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
+	if (g_diagNoLutDraw)
+		return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
+
 	// Check for shared memory updates (live tonemap param changes from host)
 	UpdateLocalTonemapFromShared();
 
@@ -1368,6 +1377,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 							bool o = strchr(buf + 1, 'o') != NULL;
 							bool d = strchr(buf + 1, 'd') != NULL;
 							bool e = strchr(buf + 1, 'e') != NULL;
+							g_diagNoLutDraw = strchr(buf + 1, 'n') != NULL;
 							if (o || d || e) {
 								g_l4OverlayTestMode = o;
 								g_l4DisableIFlip = d;
@@ -1385,9 +1395,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					}
 					char msg[192];
 					snprintf(msg, sizeof(msg),
-						"DIAG: hookLevel=%d (0=none..5=all) l4: otm=%d diflip=%d ovEnForceTrue=%d | HwSchMode=%d",
+						"DIAG: hookLevel=%d (0=none..5=all) l4: otm=%d diflip=%d ovEnForceTrue=%d noDraw=%d | HwSchMode=%d",
 						g_hookLevel, g_l4OverlayTestMode ? 1 : 0, g_l4DisableIFlip ? 1 : 0,
-						g_l4OverlaysEnabledForceTrue ? 1 : 0, g_hwSchMode);
+						g_l4OverlaysEnabledForceTrue ? 1 : 0, g_diagNoLutDraw ? 1 : 0, g_hwSchMode);
 					log_to_file(msg);
 				}
 
@@ -1559,17 +1569,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				}
 				else if (isWindows11_25h2 && g_hookLevel >= 4 && g_disableIndependentFlipPatched && !g_l4OverlaysEnabledForceTrue)
 				{
-					// 25H2 production path: DisableIndependentFlip=1 suppresses iFlip/MPO globally and
-					// the ORIGINAL OverlaysEnabled honours OverlayTestMode=5 by itself. Do NOT force it
-					// to TRUE — that patch is what broke DWM's flip-queue pacing under HAGS
-					// (see g_l4OverlaysEnabledForceTrue; 'e' in the level flag re-enables it for diagnosis).
-					LOG_ONLY_ONCE("OverlaysEnabled left ORIGINAL (DisableIndependentFlip active; TRUE-patch disabled — HAGS pacing)")
+					// Opt-in "4od": OverlaysEnabled left original. On 25H2 this lets full-monitor windows
+					// bypass DWM composition — the LUT no longer applies to them, but they get
+					// Independent-Flip-class pacing under HAGS. NOT production (see the
+					// g_l4OverlaysEnabledForceTrue comment); only for clients that apply the cube themselves.
+					LOG_ONLY_ONCE("OverlaysEnabled left ORIGINAL (opt-in '4od': full-monitor windows bypass DWM — no LUT on them)")
 				}
 				else if (isWindows11_25h2 && g_hookLevel >= 4 && COverlayContext_OverlaysEnabled_orig != NULL)
 				{
-					// 25H2: inline-patch OverlaysEnabled. MinHook trampoline crashes on KB5089549+.
-					// If DisableIndependentFlip was patched (only reachable with the 'e' diagnostic
-					// letter): return TRUE — the legacy behaviour, known to break pacing under HAGS.
+					// 25H2 production: inline-patch OverlaysEnabled. MinHook trampoline crashes on KB5089549+.
+					// If DisableIndependentFlip was patched: return TRUE (iFlip suppressed globally;
+					// full-monitor windows stay composed so the LUT covers them).
 					// If not: return FALSE (fail-safe: force composition, same effect as the
 					// pre-25H2 MinHook hook).
 					unsigned char* func = (unsigned char*)COverlayContext_OverlaysEnabled_orig;
