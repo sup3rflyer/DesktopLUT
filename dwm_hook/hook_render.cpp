@@ -939,14 +939,38 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		cb.pad1 = 0.0f;
 		cb.pad2 = 0.0f;
 
-		// Diagnostic: log tonemap CB state only when values change (avoids per-frame spam)
+		// Diagnostic: log tonemap CB state only when values change FOR THIS MONITOR.
+		// The previous-state must be per monitor: with two HDR panels at different
+		// targets a single shared prev-state alternated on every Present and turned
+		// this into a synchronous fopen/append/fclose inside DWM's present path on
+		// every frame (see HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md).
 		if (tmEnabled) {
-			static int prevCurve = -1;
-			static float prevPqSrc = -1.0f, prevPqTgt = -1.0f;
-			if (cb.tonemapCurve != prevCurve || cb.pqSourcePeak != prevPqSrc || cb.pqTargetPeak != prevPqTgt) {
-				prevCurve = cb.tonemapCurve;
-				prevPqSrc = cb.pqSourcePeak;
-				prevPqTgt = cb.pqTargetPeak;
+			struct TmDiagPrev { bool used; int left, top, curve; float pqSrc, pqTgt; };
+			static TmDiagPrev prevByMon[MAX_DWM_HOOK_MONITORS] = {};
+			TmDiagPrev* prev = NULL;
+			for (int i = 0; i < MAX_DWM_HOOK_MONITORS; i++) {
+				if (prevByMon[i].used && prevByMon[i].left == tp->left && prevByMon[i].top == tp->top) {
+					prev = &prevByMon[i];
+					break;
+				}
+			}
+			if (!prev) {
+				for (int i = 0; i < MAX_DWM_HOOK_MONITORS; i++) {
+					if (!prevByMon[i].used) {
+						prev = &prevByMon[i];
+						prev->used = true;
+						prev->left = tp->left;
+						prev->top = tp->top;
+						prev->curve = -1;
+						prev->pqSrc = prev->pqTgt = -1.0f;
+						break;
+					}
+				}
+			}
+			if (prev && (cb.tonemapCurve != prev->curve || cb.pqSourcePeak != prev->pqSrc || cb.pqTargetPeak != prev->pqTgt)) {
+				prev->curve = cb.tonemapCurve;
+				prev->pqSrc = cb.pqSourcePeak;
+				prev->pqTgt = cb.pqTargetPeak;
 				char diagMsg[256];
 				snprintf(diagMsg, sizeof(diagMsg), "TM DIAG: tmEn=%d dyn=%d curve=%d pqSrc=%.4f pqTgt=%.4f tgtNits=%.0f srcNits=%.0f csOK=%d uavOK=%d",
 					cb.tonemapEnabled, cb.tonemapDynamic, cb.tonemapCurve,

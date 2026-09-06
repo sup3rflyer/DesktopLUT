@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <cmath>
 #include <clocale>
+#include <cstring>
 #pragma comment (lib, "d3d11.lib")
 #pragma comment (lib, "d3dcompiler.lib")
 #pragma comment (lib, "dxgi.lib")
@@ -217,9 +218,33 @@ static bool g_disableIndependentFlipPatched = false;
 // Hook level controls which hooks are activated. Default 4.
 // Overridable via DesktopLUT_HookLevel.flag file content (0-5).
 // 0=none (inert diagnostic), 1=Present only, 2=+IsCandidateDirectFlip,
-// 3=+fallback DirectFlip hooks, 4=+OverlayTestMode+OverlaysEnabled (inline-patch
-// on 25H2, MinHook on older), 5=force OverlaysEnabled via MinHook (UNSAFE on 25H2+)
+// 3=+fallback DirectFlip hooks, 4=+OverlayTestMode=5 (+DisableIndependentFlip=1 on
+// 25H2; OverlaysEnabled left original there, MinHook-hooked on older builds),
+// 5=force OverlaysEnabled via MinHook (UNSAFE on 25H2+). Optional letters after the
+// digit select the level-4 writes individually — see g_l4* below.
 static int g_hookLevel = 4;
+// Level-4 sub-selection (diagnostic bisect). Flag file may carry letters after the
+// digit: 'o' = OverlayTestMode=5, 'd' = DisableIndependentFlip=1, 'e' = the LEGACY
+// OverlaysEnabled "mov al,1; ret" (force TRUE) inline patch on 25H2.
+// "4" alone (or no letters) = production: 'o' + 'd', OverlaysEnabled left ORIGINAL.
+//
+// Why 'e' is off by default (2026-09-06, HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md): with
+// Hardware-Accelerated GPU Scheduling on (WDDM hardware flip queue), forcing
+// OverlaysEnabled to TRUE made every DWM-composed client pace badly (mpv
+// display-resample vsync-jitter 0.13-0.15 vs 0.0001, 17-26 delayed frames/min,
+// 46-184 two-vsync glass holds/min). Bisected per write: DisableIndependentFlip=1
+// alone, and DisableIndependentFlip+OverlayTestMode=5, were clean AND kept mpv
+// composed (LUT applied); adding the TRUE patch reproduced the bad numbers. The
+// original OverlaysEnabled already consults m_dwOverlayTestMode (its first
+// instruction is `cmp [OverlayTestMode],5`), so with OverlayTestMode=5 it returns
+// the overlays-disabled answer on its own — the TRUE patch contradicted it.
+static bool g_l4OverlayTestMode = true;
+static bool g_l4DisableIFlip = true;
+static bool g_l4OverlaysEnabledForceTrue = false;
+// HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode at injection
+// (2 = HAGS on, 1 = off, -1 = unreadable). Logged for diagnosis; see
+// HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md.
+static int g_hwSchMode = -1;
 // Saved original bytes for OverlaysEnabled inline-patch (restored on detach)
 static unsigned char g_overlaysEnabledOrigBytes[17] = {0};
 static unsigned char* g_overlaysEnabledPatchAddr = NULL;
@@ -1336,13 +1361,33 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						hlPath, sizeof(hlPath));
 					FILE* hlf = fopen(hlPath, "r");
 					if (hlf) {
-						char c = 0;
-						if (fread(&c, 1, 1, hlf) == 1 && c >= '0' && c <= '5')
-							g_hookLevel = c - '0';
+						char buf[16] = {0};
+						size_t n = fread(buf, 1, sizeof(buf) - 1, hlf);
+						if (n >= 1 && buf[0] >= '0' && buf[0] <= '5') {
+							g_hookLevel = buf[0] - '0';
+							bool o = strchr(buf + 1, 'o') != NULL;
+							bool d = strchr(buf + 1, 'd') != NULL;
+							bool e = strchr(buf + 1, 'e') != NULL;
+							if (o || d || e) {
+								g_l4OverlayTestMode = o;
+								g_l4DisableIFlip = d;
+								g_l4OverlaysEnabledForceTrue = e;
+							}
+						}
 						fclose(hlf);
 					}
-					char msg[128];
-					snprintf(msg, sizeof(msg), "DIAG: hookLevel=%d (0=none..5=all)", g_hookLevel);
+					{
+						DWORD v = 0, cb = sizeof(v);
+						if (RegGetValueW(HKEY_LOCAL_MACHINE,
+						        L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+						        L"HwSchMode", RRF_RT_REG_DWORD, NULL, &v, &cb) == ERROR_SUCCESS)
+							g_hwSchMode = (int)v;
+					}
+					char msg[192];
+					snprintf(msg, sizeof(msg),
+						"DIAG: hookLevel=%d (0=none..5=all) l4: otm=%d diflip=%d ovEnForceTrue=%d | HwSchMode=%d",
+						g_hookLevel, g_l4OverlayTestMode ? 1 : 0, g_l4DisableIFlip ? 1 : 0,
+						g_l4OverlaysEnabledForceTrue ? 1 : 0, g_hwSchMode);
 					log_to_file(msg);
 				}
 
@@ -1475,7 +1520,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					}
 				}
 
-				if (g_pOverlayTestMode != NULL && g_hookLevel >= 4)
+				if (g_pOverlayTestMode != NULL && g_hookLevel >= 4 && g_l4OverlayTestMode)
 				{
 					__try { g_savedOverlayTestMode = *g_pOverlayTestMode; *g_pOverlayTestMode = 5; g_overlayTestModePatched = true; }
 					__except (EXCEPTION_EXECUTE_HANDLER) { g_pOverlayTestMode = NULL; }
@@ -1487,7 +1532,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				// DisableIndependentFlip: 25H2-only (replaces 4 removed DirectFlip functions).
 				// Validate page is writable before patching.
-				if (g_pDisableIndependentFlip != NULL && isWindows11_25h2 && g_hookLevel >= 4)
+				if (g_pDisableIndependentFlip != NULL && isWindows11_25h2 && g_hookLevel >= 4 && g_l4DisableIFlip)
 				{
 					MEMORY_BASIC_INFORMATION mbi = {};
 					if (VirtualQuery(g_pDisableIndependentFlip, &mbi, sizeof(mbi)) &&
@@ -1512,11 +1557,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						LOG_ONLY_ONCE("Hook L5: OverlaysEnabled (MinHook)")
 					}
 				}
+				else if (isWindows11_25h2 && g_hookLevel >= 4 && g_disableIndependentFlipPatched && !g_l4OverlaysEnabledForceTrue)
+				{
+					// 25H2 production path: DisableIndependentFlip=1 suppresses iFlip/MPO globally and
+					// the ORIGINAL OverlaysEnabled honours OverlayTestMode=5 by itself. Do NOT force it
+					// to TRUE — that patch is what broke DWM's flip-queue pacing under HAGS
+					// (see g_l4OverlaysEnabledForceTrue; 'e' in the level flag re-enables it for diagnosis).
+					LOG_ONLY_ONCE("OverlaysEnabled left ORIGINAL (DisableIndependentFlip active; TRUE-patch disabled — HAGS pacing)")
+				}
 				else if (isWindows11_25h2 && g_hookLevel >= 4 && COverlayContext_OverlaysEnabled_orig != NULL)
 				{
 					// 25H2: inline-patch OverlaysEnabled. MinHook trampoline crashes on KB5089549+.
-					// If DisableIndependentFlip was patched: return TRUE (iFlip suppressed globally).
-					// If not: return FALSE (force composition, same effect as pre-25H2 MinHook hook).
+					// If DisableIndependentFlip was patched (only reachable with the 'e' diagnostic
+					// letter): return TRUE — the legacy behaviour, known to break pacing under HAGS.
+					// If not: return FALSE (fail-safe: force composition, same effect as the
+					// pre-25H2 MinHook hook).
 					unsigned char* func = (unsigned char*)COverlayContext_OverlaysEnabled_orig;
 					if (func[0] == 0x83 && func[1] == 0x3D && func[6] == 0x05 &&
 					    func[7] == 0x74 && func[8] == 0x09)
