@@ -1110,6 +1110,12 @@ void DoMhcSetPrimaries(const JsonValue& p, JsonValue& result, std::string& error
         m.customPrimaries.Bx = (float)prim->getNum("bx", m.customPrimaries.Bx);
         m.customPrimaries.By = (float)prim->getNum("by", m.customPrimaries.By);
         m.primariesEnabled = true;
+        // BuildMHC2Params resolves the display primaries through primariesPreset and only
+        // reads customPrimaries for the "Custom" slot. Leaving the preset where the GUI last
+        // put it (0 = sRGB on a fresh monitor) silently baked sRGB+D65 as the display
+        // primaries — an IDENTITY matrix — and ignored both these values and set_white
+        // (LG C6 HDR, 2026-09-04: measured primaries stored, profile still identity).
+        m.primariesPreset = g_numPresetPrimaries - 1;
     }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("mhc", JObj());
@@ -1197,6 +1203,17 @@ void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
         error = "GenerateAndInstallMhcProfile failed";
         return;
     }
+    {
+        // Refresh the Display Calibration panel's "Primaries / Gamma / Peak" labels the way
+        // the GUI Apply button does (gui.cpp ID_MHC_*_APPLY); a pipe apply used to leave them
+        // describing the previous profile (e.g. "Rec.2020 / PQ / 10000" over a DLC install).
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        ComputeMhcMetadata(m, isHDR);
+    }
+    // Pipe handlers run on the GUI thread (WM_CALIB_CMD marshalling), so the panel can be
+    // repainted directly, exactly as the GUI Apply path does.
+    UpdateMhcInfoDisplay(mon, isHDR);
     UpdateMhcFlagsLive(mon);
     SaveSettings();
     JsonValue m = JObj();
