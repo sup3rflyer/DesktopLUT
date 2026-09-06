@@ -314,3 +314,94 @@ Options that remain (owner's call):
 
 Open, unchanged: HAGS-off regression check of the current build is moot (behaviour is the
 pre-session one); idle-GPU re-verification is moot for the same reason.
+
+---
+
+## 11. NEXT LEAD (2026-09-06 late): deny the hardware flip queue, keep HAGS
+
+Two facts established after §10:
+
+- `D3DKMTIsFeatureEnabled` (user mode, no admin) on this adapter: **HWSCH Enabled=1 and
+  HWFLIPQUEUE Enabled=1** (driver 32.0.16.1656, WDDM_2_7_CAPS HwSchEnabled=1). So the flip
+  queue really is live under HAGS here. Query script: `jitter\wddm-feature-state.ps1`.
+- Microsoft documents a per-adapter, per-feature registry override
+  (`…\Class\{4d36e968-…} 2\Features\Enabled = 0`, feature 1 = HWFLIPQUEUE) that makes
+  the OS report the feature unsupported; the driver then must not enable it. HAGS (feature 0)
+  is untouched, so DLSS FG's requirement (HwSchMode=2) stays satisfied. Script:
+  `jitterlipqueue-override.ps1 -Off` (elevated) → reboot → `wddm-feature-state.ps1` must show
+  HWFLIPQUEUE Enabled=0 → rerun the fullscreen production capture
+  (`hook-level-bisect.ps1 -Levels @('4') -Prefix 'fq0_'`) and a windowed inert one
+  (`-Levels @('0') -Prefix 'fq0win_' -FsAt 0`, after `set-refresh.ps1 -Hz 47`). `-Undo` restores.
+  Doc: https://learn.microsoft.com/en-us/windows-hardware/drivers/display/querying-wddm-feature-support-and-enablement
+
+Also tried: Windows "Variable refresh rate" optimisation off (`VRROptimizeEnable=0`, user was ON)
+without re-logon → no change (`vrr0_4`: 0.214 / 39 delayed). DWM may only read it at logon, so
+it is not fully excluded; test it as a SECOND variable only if the flip-queue denial alone does
+not fix it. Setting restored to 1.
+
+If the flip-queue denial fixes it: the hook needs no change; document it as the HAGS+hook
+prerequisite (and check DLSS FG still engages). If it does not: remaining suspects are the
+NVIDIA-side windowed G-Sync ("Enable for windowed and full screen mode") and DWM's compositor
+scheduling under HAGS itself.
+
+---
+
+## 12. RESULT of §11 + the actual answer (2026-09-06, after reboot with the flip queue denied)
+
+`wddm-feature-state.ps1` after reboot: HWSCH Enabled=1, **HWFLIPQUEUE Enabled=0** (override works,
+HAGS untouched). Then, all HAGS on, hook at production (`4ode`, LUT path), GPU idle:
+
+| tag | client | window | mode | jitter | delayed/min | holds/min | DCstdev |
+|-----|--------|--------|------|--------|-------------|-----------|---------|
+| fq0_4 | mpv.net | fullscreen | Composed | 0.300 | 66.9 | 246.8 | 7.44 |
+| fq0win_0 (DLL inert) | mpv.net | windowed 47.952 | Composed | 0.647 | 255 | 361 | 10.1 |
+| var_bitblt / var_bitblt2 | mpv.net `--d3d11-flip=no` | fullscreen | Composed: Copy | 0.012 / 0.014 | 0 / 0 | 46 / 75 | 2.8 / 4.0 (est_fps 50.1 = broken vsync feedback) |
+| var_depth8 | mpv.net `--swapchain-depth=8` | fullscreen | Composed | 0.794 | 105 | 254 | — |
+| var_vulkan | mpv.net `--gpu-api=vulkan` | fullscreen | Composed | 1.08 | 149 | 637 | — |
+| **host2_lut** | **top-level libmpv host** (`tools/mpv_host.py`, DPI-aware 4K) | fullscreen | **Composed: Flip 100 %** | **0.00005** | **0** | **0.0** | **0.04** |
+| **host3_lut** | same, repeat | fullscreen | Composed: Flip 100 % | 0.00004 | 0 | 0.0 | 0.01 |
+| (host_hagson_lut, §1 row E, flip queue ON, Twitch running) | same | fullscreen | Composed | 0.045 | 0 | 1.8 | 3.24 |
+
+So:
+1. **The hardware flip queue is not the cause** for mpv.net (denied → unchanged). Whether the
+   denial is what turned row E's 0.045/3.24 into host2/3's 0.00005/0.04 is NOT separated
+   (different day, Twitch stream was running in row E). Worth one more cycle: `-Undo` + reboot +
+   `run-host.ps1 -Tag host4_lut` with the hook running. If still clean, drop the override for good.
+2. **The composited-through-the-hook path under HAGS is clean for a plain top-level libmpv
+   window** — LUT applied (DirectFlip denied by the hook, PresentMon 100 % Composed: Flip),
+   47.952 Hz 2:2, zero holds. The acceptance criterion of §6 is met by this client.
+3. **mpv.net is the client that paces badly under HAGS**, hook or no hook, windowed or full:
+   a WPF top-level window hosting libmpv in a child HWND, i.e. DWM composes a flip-model child
+   swapchain inside another window's visual tree. Under HAGS that path scatters (holds every
+   few frames); under legacy scheduling it was fine. Nothing in DesktopLUT can change how DWM
+   composes a child swapchain; the hook only decides composited-vs-bypass.
+4. Mitigations on the mpv side that were measured and are NOT good enough: bitblt swapchain
+   (mpv's vsync estimate breaks → 46–75 holds/min), deeper swapchain, Vulkan.
+
+PresentMon columns show no HAGS signature on the GPU side (GPUWait/GPUBusy/GPULatency
+equal with HAGS off), so it is a composition-scheduling matter, not GPU starvation.
+
+**Recommendation:** watch through a top-level libmpv window (the python host, or a plain
+`mpv.exe` matching the `libmpv-2.dll` in `H:\mpv-AnimeJaNai`; mpv.net's own window is the
+problem), keep the hook at production (LUT covers it), keep HAGS for DLSS FG. Visual LUT
+coverage in the host: owner eyeball with the swap LUT (pending at time of writing).
+Untested and now low-priority: NVIDIA windowed G-Sync mode (the host result argues against it).
+
+### 12.1 Validation of the top-level-window recipe (21:03–21:13)
+
+| tag | window | mode | jitter | delayed/min | holds/min | DCstdev |
+|-----|--------|------|--------|-------------|-----------|---------|
+| hostwin_lut | top-level host, **windowed** 50 %, 47.952 | Composed: Flip | 0.256 | 283 | 233 | 5.83 |
+| hostlg_lut | top-level host, fullscreen **LG** (screen 1) | Composed: Flip | 0.00002 | 0 | 0.0 | 0.01 (median 20.85 ms) |
+| hostsoak_lut | top-level host, fullscreen ProArt, **300 s** | Composed: Flip | 0.00004 | 0 | 0.0 | 0.68 (max 25.7 ms, no hold) |
+| hostload_lut | same + stock mpv playing windowed on the LG | Composed: Flip | 0.00004 | 0 | 0.0 | 0.02 |
+
+So the clean path is precisely *monitor-covering top-level window + hook* (DIF=1 + OTM=5 +
+OverlaysEnabled→TRUE make DWM composite that window as a plane on the app's cadence). A
+non-covering window — any client — is regular desktop composition, which HAGS paces badly;
+mpv.net's "fullscreen" is still that case because its swapchain lives in a child HWND.
+Consequence for the hook: the TRUE patch is not just coverage, it is what makes the
+fullscreen composited path pace under HAGS. Launcher for daily use:
+`H:\mpv-AnimeJaNai\mpv-toplevel.cmd`; mpv-side handoff:
+`H:\mpv-AnimeJaNai\HANDOFF_HAGS_TOPLEVEL_2026-09-06.md`. Still open: §12 point 1
+(flip-queue override confound — undo + reboot + one host run).
