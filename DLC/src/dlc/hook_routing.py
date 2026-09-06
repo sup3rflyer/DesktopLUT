@@ -47,9 +47,12 @@ EFFECT_MIN_DX = 0.01
 EFFECT_MIN_DY_REL = 0.10
 
 POLICIES = ("auto", "always", "never")
-# Routing methods the DLL could only guess (order) or a client dictated (pinned): both need the
-# meter to confirm before a cube flow may trust them.
-AMBIGUOUS_METHODS = ("order", "pinned")
+# Routing methods the DLL could only guess (order), a client dictated (pinned), or the DLL
+# inferred from liveness after DWM recreated a twin's context (replaced): all need the meter
+# to confirm before a cube flow may trust them. A `provisional` entry is a replacement guess the
+# DLL has not settled yet — never trusted, confirmed or not (the host flags needs_check for it).
+AMBIGUOUS_METHODS = ("order", "pinned", "replaced")
+UNSETTLED_METHODS = ("provisional",)
 
 LogFn = Callable[[str], None]
 
@@ -131,6 +134,10 @@ def routing_needs_check(hook: Optional[dict[str, Any]], monitor: int,
                       "which is not the running dwm.exe) — assignment unknown")
     mine = entries_for_monitor(hook, monitor)
     ambiguous = [e for e in mine if str(e.get("method")) in AMBIGUOUS_METHODS]
+    unsettled = [e for e in mine if str(e.get("method")) in UNSETTLED_METHODS]
+    if unsettled:
+        desc = ", ".join(f"ctx {e.get('ctx')} @({e.get('left')},{e.get('top')})" for e in unsettled)
+        return True, (f"monitor {monitor} has a provisional (unsettled replacement) routing entry: {desc}")
     if hook.get("needs_check"):
         if ambiguous and not routing.get("confirmed"):
             desc = ", ".join(f"ctx {e.get('ctx')} @({e.get('left')},{e.get('top')}) {e.get('method')}"
@@ -140,7 +147,7 @@ def routing_needs_check(hook: Optional[dict[str, Any]], monitor: int,
         if not mine:
             return True, (f"hook flags needs_check and no routing entry maps to monitor {monitor} "
                           "(desktop origin not matched) — assignment unknown")
-        return True, "hook flags needs_check (an unconfirmed order/pinned twin assignment exists)"
+        return True, "hook flags needs_check (an unconfirmed or provisional twin assignment exists)"
     if not mine:
         # Unambiguous elsewhere, but nothing paints THIS monitor's origin: the hook may not
         # have seen the calibrated output yet. The meter is the only witness.

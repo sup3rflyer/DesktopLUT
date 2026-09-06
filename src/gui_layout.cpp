@@ -778,7 +778,7 @@ void CreateGUILayout(HWND hwnd) {
     // Experimental group
     innerY += 51;
     ctrl = CreateWindow(L"BUTTON", L"Experimental", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 68, panel3, nullptr, nullptr, nullptr);
+        innerX, innerY, groupW, 118, panel3, nullptr, nullptr, nullptr);
     g_gui.tab3Controls.push_back(ctrl);
 
     g_gui.hwndSettingsDwmHook = CreateWindow(L"BUTTON", L"DWM Hook Mode (requires admin)",
@@ -795,7 +795,25 @@ void CreateGUILayout(HWND hwnd) {
     g_gui.tab3Controls.push_back(g_gui.hwndSettingsCalibration);
     SendMessage(g_gui.hwndSettingsCalibration, BM_SETCHECK, g_calibrationControlEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    g_gui.contentHeight[3] = innerY + 68 + 8;  // Track content height
+    // DWM-hook LUT routing (identical twin panels on 25H2): which monitor each overlay context
+    // paints, how it was decided, and the two user actions — identify (positive, via the
+    // identity beacon) and a manual swap for the selected monitor.
+    g_gui.hwndSettingsHookRouting = CreateWindow(L"STATIC", L"LUT routing: -",
+        WS_CHILD | SS_LEFT | SS_ENDELLIPSIS,
+        innerX + 10, innerY + 66, groupW - 20, h, panel3, nullptr, nullptr, nullptr);
+    g_gui.tab3Controls.push_back(g_gui.hwndSettingsHookRouting);
+
+    g_gui.hwndSettingsHookIdentify = CreateWindow(L"BUTTON", L"Identify monitors",
+        WS_CHILD | BS_OWNERDRAW,
+        innerX + 10, innerY + 88, 130, h, panel3, (HMENU)ID_SETTINGS_HOOK_IDENTIFY, nullptr, nullptr);
+    g_gui.tab3Controls.push_back(g_gui.hwndSettingsHookIdentify);
+
+    g_gui.hwndSettingsHookSwap = CreateWindow(L"BUTTON", L"Swap with twin",
+        WS_CHILD | BS_OWNERDRAW,
+        innerX + 150, innerY + 88, 130, h, panel3, (HMENU)ID_SETTINGS_HOOK_SWAP, nullptr, nullptr);
+    g_gui.tab3Controls.push_back(g_gui.hwndSettingsHookSwap);
+
+    g_gui.contentHeight[3] = innerY + 118 + 8;  // Track content height
 
     // Show all controls inside scroll panels (panels control visibility, not individual controls)
     for (HWND hCtrl : g_gui.tab0Controls) ShowWindow(hCtrl, SW_SHOW);

@@ -76,6 +76,7 @@ struct MovableAtomic {
 #define WM_SHADER_STATE_CHANGED  (WM_USER + 103)
 #define WM_ANALYSIS_ONLY_EXITED  (WM_USER + 104)
 #define WM_SHOW_OSD              (WM_USER + 105)
+#define WM_DWMHOOK_INJECTED      (WM_USER + 106)  // DwmHook.dll loaded into dwm.exe: run an identity-beacon session
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003
@@ -146,6 +147,8 @@ struct MovableAtomic {
 #define ID_SETTINGS_VRR_WHITELIST_BTN     409
 #define ID_SETTINGS_DWM_HOOK             411
 #define ID_SETTINGS_CALIBRATION          412
+#define ID_SETTINGS_HOOK_IDENTIFY        413   // run the DWM-hook identity beacon now
+#define ID_SETTINGS_HOOK_SWAP            414   // manual twin swap for the selected monitor
 
 // MHC Settings dialog control IDs
 #define ID_MHC_PRIMARIES_ENABLE  7001
@@ -235,6 +238,9 @@ const int DWM_HOOK_WATCHDOG_MAX_RETRIES = 3;    // Max consecutive re-injection 
 const int DWM_HOOK_RESEND_TIMER_ID = 110;       // Drives shared-config resends after a modeset/HDR flip
 const int DWM_HOOK_RESEND_INTERVAL_MS = 2000;   // Resend spacing — hook needs 3 consecutive updates to
                                                 // accept an HDR flip; each resend re-enumerates DXGI fresh
+const int DWM_HOOK_BEACON_TIMER_ID = 111;       // Identity-beacon session: repaints the beacon squares
+const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
+const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
 const int MHC_VERIFY_TIMER_ID = 106;            // Periodic re-assertion of MHC ICC profile associations
 const int MHC_VERIFY_INTERVAL_MS = 15000;       // Check every 15s — catches silent profile drops by Windows
 const int MHC_BLIND_KICK_TIMER_ID = 107;        // Periodic unconditional reload of hardware MHC2 state
@@ -928,6 +934,9 @@ struct GUIState {
     HWND hwndSettingsVrrWhitelistBtn = nullptr;
     HWND hwndSettingsDwmHook = nullptr;
     HWND hwndSettingsCalibration = nullptr;  // DLC calibration-control IPC server arm/disarm
+    HWND hwndSettingsHookRouting = nullptr;  // DWM-hook LUT routing status line (twin panels, 25H2)
+    HWND hwndSettingsHookIdentify = nullptr; // "Identify monitors" — runs the identity beacon
+    HWND hwndSettingsHookSwap = nullptr;     // "Swap with twin" — manual override for the selected monitor
 
     int panelHeight = 0;  // Visible height of scroll panels
 

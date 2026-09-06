@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <climits>
 
 // Defined in dllmain.cpp
 extern bool isWindows11;
@@ -76,18 +77,45 @@ bool IsMonitorHdr(int left, int top) {
 ContextPositionCache g_contextPosCache[16] = {};
 int g_numContextPosCache = 0;
 
+// ApplyLUTDirect call counter: the liveness clock for twin routing (a present per monitor per
+// composed frame). Wraps after ~10^19 calls — never.
+static unsigned long long g_presentSerial = 0;
+
+static int FindCacheIndex(void* context) {
+	for (int i = 0; i < g_numContextPosCache; i++)
+		if (g_contextPosCache[i].context == context) return i;
+	return -1;
+}
+
 void CacheContextPositionEx(void* context, int left, int top, int method) {
-	for (int i = 0; i < g_numContextPosCache; i++) {
-		if (g_contextPosCache[i].context == context) {
-			g_contextPosCache[i].left = left;
-			g_contextPosCache[i].top = top;
-			if (method != CTXPOS_UNKNOWN) g_contextPosCache[i].method = method;
-			return;
-		}
+	int i = FindCacheIndex(context);
+	if (i >= 0) {
+		g_contextPosCache[i].left = left;
+		g_contextPosCache[i].top = top;
+		if (method != CTXPOS_UNKNOWN) g_contextPosCache[i].method = method;
+		g_contextPosCache[i].placedTick = GetTickCount64();
+		return;
 	}
 	if (g_numContextPosCache < 16) {
-		g_contextPosCache[g_numContextPosCache++] = { context, left, top, method };
+		ContextPositionCache e = {};
+		e.context = context;
+		e.left = left;
+		e.top = top;
+		e.method = method;
+		e.firstSeenSerial = e.lastPresentSerial = g_presentSerial;
+		e.placedTick = GetTickCount64();
+		g_contextPosCache[g_numContextPosCache++] = e;
 	}
+}
+
+static void EvictContext(int cacheIndex) {
+	for (int i = cacheIndex; i + 1 < g_numContextPosCache; i++)
+		g_contextPosCache[i] = g_contextPosCache[i + 1];
+	if (g_numContextPosCache > 0) g_numContextPosCache--;
+}
+
+void ResetContextRouting() {
+	g_numContextPosCache = 0;
 }
 
 void CacheContextPosition(void* context, int left, int top) {
@@ -115,6 +143,9 @@ const char* CtxPosMethodName(int method) {
 	case CTXPOS_PINNED: return "pinned";
 	case CTXPOS_ORDER:  return "order";
 	case CTXPOS_LEGACY: return "legacy";
+	case CTXPOS_PROVISIONAL: return "provisional";
+	case CTXPOS_REPLACED:    return "replaced";
+	case CTXPOS_BEACON:      return "beacon";
 	default:            return "unknown";
 	}
 }
@@ -173,7 +204,7 @@ void LoadRoutingPins() {
 	DWORD myPid = 0, myHigh = 0, myLow = 0;
 	DwmSessionKey(myPid, myHigh, myLow);
 	bool sessionOk = false;
-	int monLines = 0, monMatched = 0, confirmed = 0, version = 0;
+	int monLines = 0, monMatched = 0, confirmed = 0, version = 0, provisionalSkipped = 0;
 	char line[256];
 	while (fgets(line, sizeof(line), f)) {
 		unsigned long pid = 0, high = 0, low = 0;
@@ -198,12 +229,41 @@ void LoadRoutingPins() {
 		}
 		if (sscanf(line, "confirmed %d", &confirmed) == 1) continue;
 		if (sscanf(line, "ctx %llx %d %d %15s", &ptr, &l, &t, method) >= 3) {
+			// A provisional entry was a GUESS that had not been settled by liveness evidence
+			// when the file was last written; it must not become a pin (the next injection
+			// re-derives it — a dead twin never presents, so the vacant position is the free one).
+			if (strcmp(method, "provisional") == 0) { provisionalSkipped++; continue; }
 			if (g_numRoutingPins < 16)
 				g_routingPins[g_numRoutingPins++] = { (void*)(uintptr_t)ptr, l, t };
 			continue;
 		}
 	}
 	fclose(f);
+	// Two pins on one position cannot both be right (the 2026-09-06 file: a replacement context
+	// blind-assigned onto a position already held, then persisted as a pin — both panels rendered
+	// monitor 0's LUT on every re-injection). Nothing says which is right: drop every pin at a
+	// shared position and let them re-resolve; the rest stay honoured.
+	int dropped = 0;
+	for (int i = 0; i < g_numRoutingPins; i++) {
+		bool dup = false;
+		for (int j = 0; j < g_numRoutingPins; j++)
+			if (j != i && g_routingPins[j].left == g_routingPins[i].left && g_routingPins[j].top == g_routingPins[i].top) { dup = true; break; }
+		if (dup) g_routingPins[i].context = NULL;
+	}
+	{
+		int w = 0;
+		for (int i = 0; i < g_numRoutingPins; i++) {
+			if (g_routingPins[i].context) g_routingPins[w++] = g_routingPins[i];
+			else dropped++;
+		}
+		g_numRoutingPins = w;
+	}
+	if (dropped > 0 || provisionalSkipped > 0) {
+		char dmsg[160];
+		snprintf(dmsg, sizeof(dmsg), "routing: %d pin(s) dropped (shared a position), %d provisional entr%s not pinned",
+			dropped, provisionalSkipped, provisionalSkipped == 1 ? "y" : "ies");
+		log_to_file(dmsg);
+	}
 	bool topologyOk = (monLines == g_numMonitorHdrStates) && (monMatched == monLines);
 	g_routingPinsValid = sessionOk && topologyOk && g_numRoutingPins > 0;
 	g_routingConfirmed = g_routingPinsValid && confirmed != 0;
@@ -231,20 +291,28 @@ void SaveRoutingState() {
 	}
 	fprintf(f, "confirmed %d\n", g_routingConfirmed ? 1 : 0);
 	int written = 0;
-	for (int c = 0; c < g_numContextPosCache && written < 16; c++, written++) {
+	for (int c = 0; c < g_numContextPosCache && written < 16; c++) {
 		const ContextPositionCache& e = g_contextPosCache[c];
+		if (e.left == INT_MIN) continue;   // no monitors.dat entry matches this context's back buffer
 		fprintf(f, "ctx %llx %d %d %s\n", (unsigned long long)(uintptr_t)e.context, e.left, e.top,
 			CtxPosMethodName(e.method));
+		written++;
 	}
 	// Pins for contexts that have not presented yet this injection stay on disk (F2): a
 	// re-injection can come seconds after this one (every set_3dlut), before the second twin
 	// draws a frame — dropping its pin would re-roll it.
 	if (g_routingPinsValid) {
 		for (int p = 0; p < g_numRoutingPins && written < 16; p++) {
-			bool seen = false;
-			for (int c = 0; c < g_numContextPosCache; c++)
+			bool seen = false, positionTaken = false;
+			for (int c = 0; c < g_numContextPosCache; c++) {
 				if (g_contextPosCache[c].context == g_routingPins[p].context) { seen = true; break; }
+				if (!g_contextPosCache[c].provisional && g_contextPosCache[c].left == g_routingPins[p].left &&
+				    g_contextPosCache[c].top == g_routingPins[p].top) positionTaken = true;
+			}
 			if (seen) continue;
+			// A live context settled on this pin's position: the pinned one is dead (or an extra)
+			// and persisting it would put two pins on one position (dropped on the next load).
+			if (positionTaken) continue;
 			fprintf(f, "ctx %llx %d %d %s\n", (unsigned long long)(uintptr_t)g_routingPins[p].context,
 				g_routingPins[p].left, g_routingPins[p].top, CtxPosMethodName(CTXPOS_PINNED));
 			written++;
@@ -669,6 +737,7 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(peakUAV)
 	RELEASE_IF_NOT_NULL(peakSRV)
 	RELEASE_IF_NOT_NULL(peakCB)
+	ReleaseBeaconProbes();
 	// Snapshot + clear first so a concurrent reader sees an empty list before we free.
 	int oldNumLuts = numLuts;
 	lutData* oldLuts = luts;
@@ -1111,6 +1180,355 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Provisional (replacement) contexts — liveness evidence
+// ---------------------------------------------------------------------------
+// A twin context that arrived while every candidate position was held is a replacement for a
+// context DWM destroyed. The dead one never presents again; the survivor keeps presenting. So:
+//   * the provisional's position shows a SETTLED holder presenting after the provisional
+//     arrived  => it is misplaced: move it to a candidate position whose holders have all been
+//     silent since (none => a genuine extra context; it stays put);
+//   * every OTHER candidate position has presented since, its own has stayed silent for
+//     ROUTING_SETTLE_MS => settled: the silent holders are dead (evicted, pins dropped) and the
+//     context becomes `replaced` — a deterministic assignment, persisted as a pin. It still
+//     lowers `confirmed`: the meter is the only witness that the inference was right.
+// An idle monitor may not compose for a while, which is what the settle window is for; a
+// wrong guess is corrected the first time the survivor presents (a frame or two).
+static const unsigned long long ROUTING_SETTLE_MS = 1000;
+static bool g_anyProvisional = false;
+
+// Index of a settled (non-provisional) cached context at (l,t) other than `self`, or -1.
+static int SettledHolderAt(int l, int t, void* self) {
+	for (int i = 0; i < g_numContextPosCache; i++) {
+		const ContextPositionCache& e = g_contextPosCache[i];
+		if (e.context != self && !e.provisional && e.left == l && e.top == t) return i;
+	}
+	return -1;
+}
+
+static bool ProvisionalAt(int l, int t, void* self) {
+	for (int i = 0; i < g_numContextPosCache; i++) {
+		const ContextPositionCache& e = g_contextPosCache[i];
+		if (e.context != self && e.provisional && e.left == l && e.top == t) return true;
+	}
+	return false;
+}
+
+// Newest present serial among settled holders of (l,t) other than `self`; 0 when none.
+static unsigned long long NewestSettledPresentAt(int l, int t, void* self) {
+	unsigned long long newest = 0;
+	for (int i = 0; i < g_numContextPosCache; i++) {
+		const ContextPositionCache& e = g_contextPosCache[i];
+		if (e.context != self && !e.provisional && e.left == l && e.top == t && e.lastPresentSerial > newest)
+			newest = e.lastPresentSerial;
+	}
+	return newest;
+}
+
+static void DropRoutingPin(void* context) {
+	int w = 0;
+	for (int p = 0; p < g_numRoutingPins; p++)
+		if (g_routingPins[p].context != context) g_routingPins[w++] = g_routingPins[p];
+	g_numRoutingPins = w;
+}
+
+static void ResolveProvisionalContexts() {
+	bool any = false;
+	for (int i = 0; i < g_numContextPosCache; i++) {
+		ContextPositionCache& e = g_contextPosCache[i];
+		if (!e.provisional) continue;
+		any = true;
+		const unsigned long long since = e.firstSeenSerial;
+		char msg[256];
+
+		if (NewestSettledPresentAt(e.left, e.top, e.context) > since) {
+			// Misplaced: the holder of the guessed position is alive. Move to the quietest
+			// silent candidate position that no other provisional already claims.
+			int best = -1;
+			unsigned long long bestLast = ULLONG_MAX;
+			for (int m = 0; m < g_numMonitorHdrStates; m++) {
+				const MonitorHdrState& ms = g_monitorHdrStates[m];
+				if (ms.width != e.candW || ms.height != e.candH || ms.bpc != e.candBpc) continue;
+				if (ms.left == e.left && ms.top == e.top) continue;
+				if (ProvisionalAt(ms.left, ms.top, e.context)) continue;
+				unsigned long long last = NewestSettledPresentAt(ms.left, ms.top, e.context);
+				if (last > since) continue;   // alive too
+				if (last < bestLast) { bestLast = last; best = m; }
+			}
+			if (best >= 0) {
+				snprintf(msg, sizeof(msg), "routing: provisional ctx %p misplaced at (%d,%d) (holder alive) - moved to (%d,%d)",
+					e.context, e.left, e.top, g_monitorHdrStates[best].left, g_monitorHdrStates[best].top);
+				log_to_file(msg);
+				e.left = g_monitorHdrStates[best].left;
+				e.top = g_monitorHdrStates[best].top;
+				e.placedTick = GetTickCount64();
+				RefreshConfirmedBeforeSave();
+				SaveRoutingState();
+				break;   // one change per present; indices stay simple
+			}
+			continue;   // every twin position is alive: a genuine extra context - leave it
+		}
+
+		// Own position silent since arrival. Settled once every other candidate position has
+		// presented since and the silence has lasted the window.
+		bool othersAlive = true, anyOther = false;
+		for (int m = 0; m < g_numMonitorHdrStates; m++) {
+			const MonitorHdrState& ms = g_monitorHdrStates[m];
+			if (ms.width != e.candW || ms.height != e.candH || ms.bpc != e.candBpc) continue;
+			if (ms.left == e.left && ms.top == e.top) continue;
+			anyOther = true;
+			if (NewestSettledPresentAt(ms.left, ms.top, e.context) <= since) { othersAlive = false; break; }
+		}
+		if (!anyOther || !othersAlive) continue;
+		if (GetTickCount64() - e.placedTick < ROUTING_SETTLE_MS) continue;
+
+		void* self = e.context;
+		int l = e.left, t = e.top;
+		for (int j = 0; j < g_numContextPosCache; ) {
+			const ContextPositionCache& h = g_contextPosCache[j];
+			if (h.context != self && !h.provisional && h.left == l && h.top == t) {
+				snprintf(msg, sizeof(msg), "routing: ctx %p at (%d,%d) silent while its twin kept presenting - dead, evicted (replaced by %p)",
+					h.context, l, t, self);
+				log_to_file(msg);
+				DropRoutingPin(h.context);
+				EvictContext(j);
+			} else {
+				j++;
+			}
+		}
+		int k = FindCacheIndex(self);
+		if (k >= 0) {
+			g_contextPosCache[k].provisional = false;
+			g_contextPosCache[k].method = CTXPOS_REPLACED;
+		}
+		snprintf(msg, sizeof(msg), "routing: provisional ctx %p settled at (%d,%d) as replacement", self, l, t);
+		log_to_file(msg);
+		// The inference is sound but unwitnessed: a client's meter confirmation no longer holds.
+		g_routingRolled = true;
+		g_routingConfirmed = false;
+		SaveRoutingState();
+		break;
+	}
+	g_anyProvisional = any;
+}
+
+// ---------------------------------------------------------------------------
+// Identity beacon — positive twin identification
+// ---------------------------------------------------------------------------
+// While the host shows its beacon windows (one solid colour per monitor at the top-left corner,
+// DwmHookBeaconRGB), copy that corner of the context's back buffer into a tiny staging texture
+// and read it back on the NEXT present with DO_NOT_WAIT — never a GPU sync in DWM's present
+// path. A recognised colour names the monitor outright: no order, no pin, no liveness
+// inference, and it survives reboots because the host runs a session after every injection.
+// Once per context per beacon generation; a context whose corner never shows a beacon colour
+// (secure desktop, the corner not composed) keeps its other assignment. Cost while active: one
+// beaconSize^2 CopySubresourceRegion per present per unidentified twin context; nothing when off.
+BeaconColor g_beaconColors[16] = {};
+int g_numBeaconColors = 0;
+unsigned int g_beaconActive = 0, g_beaconGeneration = 0, g_beaconSize = 0;
+
+struct BeaconProbe {
+	void* context;
+	ID3D11Texture2D* staging;
+	DXGI_FORMAT format;
+	unsigned int size;
+	bool pending;          // a copy is in flight; Map on the next present
+	unsigned int gen;      // generation the pending copy belongs to
+};
+static BeaconProbe g_beaconProbes[16] = {};
+static int g_numBeaconProbes = 0;
+
+void ReleaseBeaconProbes() {
+	for (int i = 0; i < g_numBeaconProbes; i++) RELEASE_IF_NOT_NULL(g_beaconProbes[i].staging)
+	g_numBeaconProbes = 0;
+}
+
+static unsigned int BeaconColorAt(int left, int top) {
+	for (int i = 0; i < g_numBeaconColors; i++)
+		if (g_beaconColors[i].left == left && g_beaconColors[i].top == top) return g_beaconColors[i].colorId;
+	return 0;
+}
+
+static float HalfToFloat(unsigned short h) {
+	unsigned int sign = (h >> 15) & 1, exp = (h >> 10) & 0x1F, mant = h & 0x3FF, f;
+	if (exp == 0) {
+		if (mant == 0) {
+			f = sign << 31;
+		} else {
+			exp = 113;
+			while (!(mant & 0x400)) { mant <<= 1; exp--; }
+			mant &= 0x3FF;
+			f = (sign << 31) | (exp << 23) | (mant << 13);
+		}
+	} else if (exp == 31) {
+		f = (sign << 31) | 0x7F800000u | (mant << 13);
+	} else {
+		f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+	}
+	float out;
+	memcpy(&out, &f, sizeof(out));
+	return out;
+}
+
+// Average the staging pixels into RGB on a 0..1-ish scale (UNORM normalised; FP16 as stored).
+static bool ReadBeaconSample(const D3D11_MAPPED_SUBRESOURCE& m, DXGI_FORMAT fmt, unsigned int size,
+                             float& r, float& g, float& b) {
+	double sr = 0, sg = 0, sb = 0;
+	unsigned int n = 0;
+	for (unsigned int y = 0; y < size; y++) {
+		const unsigned char* row = (const unsigned char*)m.pData + (size_t)y * m.RowPitch;
+		for (unsigned int x = 0; x < size; x++, n++) {
+			switch (fmt) {
+			case DXGI_FORMAT_B8G8R8A8_UNORM:
+			case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+				sb += row[x * 4 + 0] / 255.0; sg += row[x * 4 + 1] / 255.0; sr += row[x * 4 + 2] / 255.0;
+				break;
+			case DXGI_FORMAT_R8G8B8A8_UNORM:
+			case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+				sr += row[x * 4 + 0] / 255.0; sg += row[x * 4 + 1] / 255.0; sb += row[x * 4 + 2] / 255.0;
+				break;
+			case DXGI_FORMAT_R10G10B10A2_UNORM: {
+				unsigned int v;
+				memcpy(&v, row + x * 4, 4);
+				sr += (v & 0x3FF) / 1023.0; sg += ((v >> 10) & 0x3FF) / 1023.0; sb += ((v >> 20) & 0x3FF) / 1023.0;
+				break;
+			}
+			case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+				unsigned short hv[3];
+				memcpy(hv, row + x * 8, 6);
+				sr += HalfToFloat(hv[0]); sg += HalfToFloat(hv[1]); sb += HalfToFloat(hv[2]);
+				break;
+			}
+			default:
+				return false;
+			}
+		}
+	}
+	if (n == 0) return false;
+	r = (float)(sr / n);
+	g = (float)(sg / n);
+	b = (float)(sb / n);
+	return true;
+}
+
+static void ApplyBeaconIdentity(int ci, int left, int top, unsigned int id, float r, float g, float b) {
+	ContextPositionCache& e = g_contextPosCache[ci];
+	bool moved = (e.left != left || e.top != top);
+	char msg[256];
+	// Whatever settled context already sits on the identified position is wrong — dead, an
+	// extra, or a stale pin. Demote it to provisional; liveness sorts it out.
+	for (int j = 0; j < g_numContextPosCache; j++) {
+		ContextPositionCache& h = g_contextPosCache[j];
+		if (j == ci || h.provisional || h.left != left || h.top != top) continue;
+		snprintf(msg, sizeof(msg), "beacon: ctx %p held (%d,%d) but ctx %p shows its beacon - demoted to provisional",
+			h.context, left, top, e.context);
+		log_to_file(msg);
+		h.provisional = true;
+		h.method = CTXPOS_PROVISIONAL;
+		h.placedTick = GetTickCount64();
+		g_anyProvisional = true;
+	}
+	e.left = left;
+	e.top = top;
+	e.provisional = false;
+	e.method = CTXPOS_BEACON;
+	e.beaconGen = g_beaconGeneration;
+	e.placedTick = GetTickCount64();
+	snprintf(msg, sizeof(msg), "beacon: ctx %p identified as (%d,%d) colour %u (rgb %.3f %.3f %.3f)%s",
+		e.context, left, top, id, r, g, b, moved ? " - REASSIGNED" : "");
+	log_to_file(msg);
+	if (moved) {
+		// A client's meter confirmation described the old assignment.
+		g_routingRolled = true;
+		g_routingConfirmed = false;
+	} else {
+		RefreshConfirmedBeforeSave();
+	}
+	SaveRoutingState();
+}
+
+static void ProbeBeacon(void* ctx, ID3D11Texture2D* backBuffer) {
+	int ci = FindCacheIndex(ctx);
+	if (ci < 0) return;
+	if (g_contextPosCache[ci].candW == 0) return;                      // not a twin: nothing to identify
+	if (g_contextPosCache[ci].beaconGen == g_beaconGeneration) return;  // done this session
+	if (!device || !deviceContext) return;
+
+	D3D11_TEXTURE2D_DESC bb;
+	backBuffer->GetDesc(&bb);
+	unsigned int size = g_beaconSize;
+	if (size < 1) size = 1;
+	if (size > 32) size = 32;
+	if (size > bb.Width || size > bb.Height) return;
+
+	int pi = -1;
+	for (int i = 0; i < g_numBeaconProbes; i++)
+		if (g_beaconProbes[i].context == ctx) { pi = i; break; }
+	if (pi < 0) {
+		if (g_numBeaconProbes >= 16) return;
+		pi = g_numBeaconProbes++;
+		g_beaconProbes[pi] = {};
+		g_beaconProbes[pi].context = ctx;
+	}
+	BeaconProbe& p = g_beaconProbes[pi];
+	if (p.staging && (p.format != bb.Format || p.size != size)) {
+		p.staging->Release();
+		p.staging = NULL;
+		p.pending = false;
+	}
+	if (!p.staging) {
+		D3D11_TEXTURE2D_DESC sd = {};
+		sd.Width = size;
+		sd.Height = size;
+		sd.MipLevels = 1;
+		sd.ArraySize = 1;
+		sd.Format = bb.Format;
+		sd.SampleDesc.Count = 1;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(device->CreateTexture2D(&sd, NULL, &p.staging)) || !p.staging) {
+			p.staging = NULL;
+			LOG_ONLY_ONCE("beacon: staging texture creation failed - beacon identification unavailable")
+			return;
+		}
+		p.format = bb.Format;
+		p.size = size;
+		p.pending = false;
+	}
+
+	if (p.pending && p.gen == g_beaconGeneration) {
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		HRESULT hr = deviceContext->Map(p.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;   // GPU not done; ask again next present
+		p.pending = false;
+		if (FAILED(hr)) return;
+		float r = 0, g = 0, b = 0;
+		bool ok = ReadBeaconSample(m, p.format, p.size, r, g, b);
+		deviceContext->Unmap(p.staging, 0);
+		if (ok) {
+			unsigned int id = DwmHookBeaconClassify(r, g, b, 0.15f);
+			if (id) {
+				const ContextPositionCache& e = g_contextPosCache[ci];
+				for (int mi = 0; mi < g_numMonitorHdrStates; mi++) {
+					const MonitorHdrState& ms = g_monitorHdrStates[mi];
+					if (ms.width != e.candW || ms.height != e.candH || ms.bpc != e.candBpc) continue;
+					if (BeaconColorAt(ms.left, ms.top) != id) continue;
+					ApplyBeaconIdentity(ci, ms.left, ms.top, id, r, g, b);
+					return;
+				}
+				// A beacon colour no twin candidate carries: stray content, or the host's colour
+				// table is from another session. Keep probing.
+			}
+		}
+	}
+
+	D3D11_BOX box = { 0, 0, 0, size, size, 1 };
+	deviceContext->CopySubresourceRegion(p.staging, 0, 0, 0, 0, backBuffer, 0, &box);
+	p.pending = true;
+	p.gen = g_beaconGeneration;
+}
+
 bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects)
 {
 	try
@@ -1124,15 +1542,17 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 			dev->Release();
 		}
 
-		// 25H2: Cache context position using monitor data from monitors.dat
+		// 25H2: resolve this context's monitor position — monitors.dat by back-buffer size, then
+		// bit depth, then pins, then first-present order; a context arriving while every twin
+		// position is already held REPLACES a destroyed one and is settled by liveness evidence.
+		// Every present costs one 16-entry scan (the liveness clock); resolution work only runs
+		// on a first encounter or while a provisional context exists.
 		{
-			static void* cachedContexts[16] = {};
-			static int numCached = 0;
-			bool alreadyCached = false;
-			for (int c = 0; c < numCached; c++) {
-				if (cachedContexts[c] == cOverlayContext) { alreadyCached = true; break; }
-			}
-			if (!alreadyCached) {
+			g_presentSerial++;
+			int ci = FindCacheIndex(cOverlayContext);
+			if (ci >= 0) {
+				g_contextPosCache[ci].lastPresentSerial = g_presentSerial;
+			} else {
 				D3D11_TEXTURE2D_DESC bbDesc;
 				backBuffer->GetDesc(&bbDesc);
 				bool isFP16 = (bbDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
@@ -1190,11 +1610,37 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 								if (g_routingPins[p].context != cOverlayContext) continue;
 								for (int i = 0; i < numMatches; i++) {
 									auto& pm = g_monitorHdrStates[matchIndices[i]];
-									if (pm.left == g_routingPins[p].left && pm.top == g_routingPins[p].top) {
+									if (pm.left != g_routingPins[p].left || pm.top != g_routingPins[p].top) continue;
+									// A pin whose position a different settled context already holds cannot
+									// be right (DWM recycled the address, or the file held two pins on one
+									// position): a second context there would paint that monitor's LUT on
+									// both panels. Ignore it and resolve like a never-seen context.
+									int holder = SettledHolderAt(pm.left, pm.top, cOverlayContext);
+									if (holder >= 0 && g_contextPosCache[holder].method == CTXPOS_ORDER) {
+										// The holder only took this position because it looked free
+										// (pass 2: a live context beat this pin's reservation while its
+										// owner was idle). The pin is the stronger evidence: it keeps the
+										// position; the guess becomes provisional and liveness relocates it.
+										char cmsg[256];
+										snprintf(cmsg, sizeof(cmsg), "routing: pin for ctx %p at (%d,%d) displaces order-matched ctx %p (now provisional)",
+											cOverlayContext, pm.left, pm.top, g_contextPosCache[holder].context);
+										log_to_file(cmsg);
+										g_contextPosCache[holder].provisional = true;
+										g_contextPosCache[holder].method = CTXPOS_PROVISIONAL;
+										g_contextPosCache[holder].placedTick = GetTickCount64();
+										g_anyProvisional = true;
+										holder = -1;
+									}
+									if (holder >= 0) {
+										char cmsg[256];
+										snprintf(cmsg, sizeof(cmsg), "routing: pin for ctx %p at (%d,%d) conflicts with live ctx %p - ignored",
+											cOverlayContext, pm.left, pm.top, g_contextPosCache[holder].context);
+										log_to_file(cmsg);
+									} else {
 										bestIdx = i;
 										method = CTXPOS_PINNED;
-										break;
 									}
+									break;
 								}
 								break;
 							}
@@ -1203,7 +1649,7 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 							// Assign by order. Pass 1 skips positions already cached AND positions a pin
 							// reserves for a context that has not presented yet; pass 2 (F1: a stale pin
 							// for a context DWM recreated at a new address) skips only cached positions —
-							// a live context beats a reservation for one that may never come; then 0.
+							// a live context beats a reservation for one that may never come.
 							for (int pass = 0; pass < 2 && bestIdx < 0; pass++) {
 								for (int i = 0; i < numMatches; i++) {
 									auto& om = g_monitorHdrStates[matchIndices[i]];
@@ -1224,33 +1670,65 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 									if (!alreadyUsed) { bestIdx = i; break; }
 								}
 							}
-							if (bestIdx < 0) bestIdx = 0;
-							// A fresh roll: whatever a client verified through the meter no longer holds.
-							g_routingRolled = true;
-							g_routingConfirmed = false;
+							if (bestIdx >= 0) {
+								// A fresh roll: whatever a client verified through the meter no longer holds.
+								g_routingRolled = true;
+								g_routingConfirmed = false;
+							} else {
+								// Every candidate position is held by a context that presented this
+								// injection: DWM destroyed one of them and this context is its replacement
+								// (a mode change / HDR toggle recreates the overlay context; the 2026-09-06
+								// file shows the old blind `bestIdx = 0` stacking the replacement onto
+								// monitor 0). Guess the position whose holders presented least recently
+								// (the dead one stopped first) that no other provisional already claims;
+								// ResolveProvisionalContexts settles or moves it once the survivors speak.
+								unsigned long long bestLast = ULLONG_MAX;
+								for (int pass = 0; pass < 2 && bestIdx < 0; pass++) {
+									for (int i = 0; i < numMatches; i++) {
+										auto& om = g_monitorHdrStates[matchIndices[i]];
+										if (pass == 0 && ProvisionalAt(om.left, om.top, cOverlayContext)) continue;
+										unsigned long long last = NewestSettledPresentAt(om.left, om.top, cOverlayContext);
+										if (last < bestLast) { bestLast = last; bestIdx = i; }
+									}
+								}
+								method = CTXPOS_PROVISIONAL;
+							}
 						}
 					}
 
 					auto& ms = g_monitorHdrStates[matchIndices[bestIdx]];
 					CacheContextPositionEx(cOverlayContext, ms.left, ms.top, method);
+					int ni = FindCacheIndex(cOverlayContext);
+					if (ni >= 0) {
+						g_contextPosCache[ni].candW = bbDesc.Width;
+						g_contextPosCache[ni].candH = bbDesc.Height;
+						g_contextPosCache[ni].candBpc = ms.bpc;
+						g_contextPosCache[ni].provisional = (method == CTXPOS_PROVISIONAL);
+						if (method == CTXPOS_PROVISIONAL) g_anyProvisional = true;
+					}
 					char msg[256];
 					snprintf(msg, sizeof(msg), "25H2: Cached ctx %p pos (%d,%d) %s (bpc=%u, fp16=%d, %d candidates)",
 						cOverlayContext, ms.left, ms.top,
-						method == CTXPOS_BPC ? "bpc-match" : (method == CTXPOS_PINNED ? "pinned" : "order-match"),
+						method == CTXPOS_BPC ? "bpc-match" : (method == CTXPOS_PINNED ? "pinned" :
+						(method == CTXPOS_PROVISIONAL ? "PROVISIONAL (replacement guess)" : "order-match")),
 						ms.bpc, isFP16 ? 1 : 0, numMatches);
 					log_to_file(msg);
 				} else {
+					// Remembered (position INT_MIN) so this is not re-logged every frame; a topology
+					// change resets the cache and re-resolves it. RenderLUT finds no LUT there.
+					CacheContextPositionEx(cOverlayContext, INT_MIN, INT_MIN, CTXPOS_UNKNOWN);
 					char msg[128];
 					snprintf(msg, sizeof(msg), "25H2: No output match for ctx %p (%ux%u fmt=%d)",
 						cOverlayContext, bbDesc.Width, bbDesc.Height, (int)bbDesc.Format);
 					log_to_file(msg);
 				}
-				if (numCached < 16) cachedContexts[numCached++] = cOverlayContext;
 				// Persist the assignment for the next injection of this dwm.exe (and for the host's
 				// state.get / hook.set_routing). Also written for unique/bpc so the host can tell an
 				// unambiguous rig from one it has no evidence about.
 				if (numMatches >= 1) { RefreshConfirmedBeforeSave(); SaveRoutingState(); }
 			}
+			if (g_beaconActive) ProbeBeacon(cOverlayContext, backBuffer);
+			if (g_anyProvisional) ResolveProvisionalContexts();
 		}
 
 		return RenderLUT(cOverlayContext, backBuffer, rects, numRects);

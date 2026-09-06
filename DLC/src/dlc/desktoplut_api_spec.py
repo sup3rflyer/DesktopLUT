@@ -81,12 +81,19 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                                     "mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
                                     "mid-run. Server-side field is a DesktopLUT ticket (fable Phase 9).",
                 "hook": "object {active:bool (DWM hook DLL injected), needs_check:bool (an entry is "
-                        "order/pinned-matched and unconfirmed, or the routing session is stale), "
+                        "order/pinned/replaced-matched and unconfirmed, or provisional, or the routing "
+                        "session is stale), "
                         "routing?: {session:'<pid>-<createtime>' (the dwm.exe identity; changes on a "
                         "DWM restart), stale:bool, confirmed:bool (a client confirmed via "
                         "hook.set_routing confirm; the DLL resets it whenever it order-matches a NEW "
                         "context), entries:[{ctx:str, left:int, top:int, method:'unique'|'bpc'|'scan'|"
-                        "'pinned'|'order'|'legacy', monitor:int|null}]}}. routing is ABSENT until the "
+                        "'pinned'|'order'|'legacy'|'provisional'|'replaced'|'beacon', monitor:int|null}]}}. "
+                        "beacon = identified positively by the host's identity beacon (a colour the DLL read "
+                        "from the context's back-buffer corner) - unambiguous, runs after every injection; "
+                        "hook.set_routing {action:'identify'} runs one on demand. "
+                        "provisional = a twin context that arrived while both positions were held (DWM "
+                        "recreated one): the DLL's replacement guess, settled by liveness into "
+                        "replaced (pinned; confirmed cleared). routing is ABSENT until the "
                         "hook has assigned a twin (unknown). The DLL cannot read a monitor position from "
                         "the DWM overlay context on 25H2, so identical panels are matched by first-present "
                         "ORDER — a coin toss the 2026-09-03 3dlut-only run lost (cube on the twin); the "
@@ -103,12 +110,14 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "twin (error unless exactly one twin) — rewrites the routing file and re-injects, the "
             "DLL then honours the PINNED assignment; 'confirm': mark the assignment meter-verified "
             "(confirmed=true, no re-inject); 'clear': delete the file and re-inject (fresh roll); "
-            "'assign': pin explicit entries and re-inject. DLC's hardware-readiness self-check "
+            "'assign': pin explicit entries and re-inject; 'identify': run an identity-beacon session "
+            "(blocking, <= 2 s, no re-inject) and report the positive assignment it produced. "
+            "DLC's hardware-readiness self-check "
             "installs a magenta probe cube, proves through the meter that it changes the calibrated "
             "panel, swaps ONCE if it does not, and refuses the run if it still does not.",
             {
                 "action": ApiParamSpec("string", description="Routing operation.",
-                                       values=["swap", "confirm", "clear", "assign"]),
+                                       values=["swap", "confirm", "clear", "assign", "identify"]),
                 "monitor": ApiParamSpec("integer", required=False,
                                         description="swap only: the calibrated DesktopLUT monitor index."),
                 "entries": ApiParamSpec("array", required=False,

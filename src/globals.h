@@ -103,6 +103,8 @@ extern std::atomic<int> g_frameBufferIdleMs;   // Idle timeout before buffer eng
 extern std::atomic<bool> g_dwmHookMode;        // Use DWM hook injection instead of overlay for LUT
 extern std::atomic<bool> g_calibrationControlEnabled;  // Arm the opt-in DLC calibration IPC server (default off)
 extern int g_dwmHookWatchdogRetries;           // Consecutive re-injection failures (GUI thread only)
+extern std::atomic<bool> g_hookBeaconActive;       // Identity-beacon session running (beacon windows shown)
+extern std::atomic<uint32_t> g_hookBeaconGeneration; // Incremented per session; the DLL probes each twin once per generation
 extern int g_dwmHookConfigResends;             // Countdown of extra shared-config resends after a topology
                                                // change or HDR/SDR mode flip so the hook's suspicious-change
                                                // debounce can converge (GUI thread only —

@@ -30,7 +30,11 @@ struct DwmHookMonitorConfig {
     float    targetPeakNits;         // Tonemap OUTPUT peak (display). in test_displayconfig.cpp. docs/NAMING.md §1.
     uint32_t dynamicPeak;            // 0=static, 1=dynamic
 
-    uint32_t _pad[1];               // Align to 48 bytes
+    // Identity beacon (25H2 twin routing): while DwmHookSharedConfig::beaconActive, the host
+    // shows a beaconSize x beaconSize solid window at this monitor's top-left corner painted
+    // DwmHookBeaconRGB(beaconColorId); the DLL reads that corner of each overlay context's
+    // back buffer and assigns the context to the monitor whose colour it sees. 0 = no beacon.
+    uint32_t beaconColorId;
 };
 static_assert(sizeof(DwmHookMonitorConfig) == 48, "DwmHookMonitorConfig must be 48 bytes");
 
@@ -47,10 +51,59 @@ struct DwmHookSharedConfig {
 
     DwmHookMonitorConfig monitors[MAX_DWM_HOOK_MONITORS];
 
-    uint32_t _reserved[16];          // Future expansion
+    // Identity beacon session (see DwmHookMonitorConfig::beaconColorId). The host raises
+    // beaconActive with a new beaconGeneration for every session; the DLL probes each twin
+    // context once per generation and drops the flag's effect when it clears.
+    uint32_t beaconActive;           // 1 while the beacon windows are shown
+    uint32_t beaconGeneration;       // increments per beacon session
+    uint32_t beaconSize;             // beacon square edge in device pixels (host default 8)
+
+    uint32_t _reserved[13];          // Future expansion
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
 #pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// Identity beacon palette — shared by the host (paints) and the DLL (classifies)
+// ---------------------------------------------------------------------------
+// Six saturated primaries/secondaries: any transfer function or white-level scaling DWM
+// applies when composing the window into the back buffer (8-bit, 10-bit, or scRGB FP16 in
+// HDR / ACM) keeps each channel either "on" or "off", so classification is by channel
+// dominance, not absolute value. Id 0 = none. Monitor i gets id (i % 6) + 1.
+#define DWM_HOOK_BEACON_COLORS  6
+#define DWM_HOOK_BEACON_SIZE    8
+
+static inline uint32_t DwmHookBeaconColorIdForMonitor(uint32_t monitorIndex) {
+    return (monitorIndex % DWM_HOOK_BEACON_COLORS) + 1;
+}
+
+// 0/1 per channel for a colour id (1..6 = R, G, B, C, M, Y); all zero for id 0 / out of range.
+static inline void DwmHookBeaconRGB(uint32_t id, int* r, int* g, int* b) {
+    static const int tbl[7][3] = { {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1}, {0,1,1}, {1,0,1}, {1,1,0} };
+    if (id > DWM_HOOK_BEACON_COLORS) id = 0;
+    *r = tbl[id][0]; *g = tbl[id][1]; *b = tbl[id][2];
+}
+
+// Classify a linear-or-encoded RGB sample (any positive scale) into a beacon id, 0 when it is
+// not a beacon colour (black, white, grey, a pastel, or a dim sample below `minLevel`).
+// "on" channels must be >= 60% of the brightest channel, "off" channels <= 25% of it.
+static inline uint32_t DwmHookBeaconClassify(float r, float g, float b, float minLevel) {
+    float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    if (!(mx >= minLevel)) return 0;   // also rejects NaN
+    int on[3] = { r >= 0.6f * mx, g >= 0.6f * mx, b >= 0.6f * mx };
+    int off[3] = { r <= 0.25f * mx, g <= 0.25f * mx, b <= 0.25f * mx };
+    for (uint32_t id = 1; id <= DWM_HOOK_BEACON_COLORS; id++) {
+        int er, eg, eb;
+        DwmHookBeaconRGB(id, &er, &eg, &eb);
+        int e[3] = { er, eg, eb };
+        int ok = 1;
+        for (int c = 0; c < 3; c++) {
+            if (e[c] ? !on[c] : !off[c]) { ok = 0; break; }
+        }
+        if (ok) return id;
+    }
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Twin-panel routing state (Windows 11 25H2)
@@ -68,7 +121,18 @@ static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 4
 //   mon <left> <top> <width> <height> <bpc>       one per monitors.dat entry (topology guard)
 //   confirmed <0|1>                               a client verified the assignment through a meter;
 //                                                 the DLL clears it on any fresh order-match
-//   ctx <hex pointer> <left> <top> <method>       method: unique|bpc|scan|pinned|order|legacy
+//   ctx <hex pointer> <left> <top> <method>       method: unique|bpc|scan|pinned|order|legacy|
+//                                                 provisional|replaced. `provisional` = a context
+//                                                 that arrived while every twin position was held
+//                                                 (DWM recreated one): a replacement GUESS, never
+//                                                 loaded as a pin; `replaced` = that guess settled
+//                                                 by liveness (the twin kept presenting, the old
+//                                                 holder went silent) - a pin, `confirmed` cleared.
+//                                                 On load, pins sharing a position are all dropped.
+//                                                 `beacon` = identified positively by the identity
+//                                                 beacon (colour read from the back buffer corner):
+//                                                 authoritative, overrides pins/order, never a coin
+//                                                 toss; loaded as a pin by the next injection.
 // Lives OUTSIDE the LUT staging dir (which is wiped on every injection). One file PER dwm.exe
 // (pid-suffixed): the host injects into every dwm.exe on the machine (fast-user-switch / RDP /
 // lock-screen sessions each have one) and they must not overwrite each other's pins; the host

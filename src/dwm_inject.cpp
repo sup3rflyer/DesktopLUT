@@ -664,6 +664,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     // Injection succeeded — keep the staged DLL (dwm.exe has it loaded)
     dllGuard.disarm();
     std::wcout << L"[DWM Hook] Injection successful" << std::endl;
+    // Twin panels: name them positively (identity beacon on the GUI thread) instead of
+    // trusting the DLL's first-present order / persisted pins.
+    if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_DWMHOOK_INJECTED, 0, 0);
     return {};
 }
 
@@ -845,6 +848,10 @@ void UpdateDwmHookSharedConfig()
     DwmHookSharedConfig cfg = {};
     cfg.hostPid = GetCurrentProcessId();
     cfg.lutReloadFlag = g_sharedMemPtr->lutReloadFlag;
+    const bool beacon = g_hookBeaconActive.load();
+    cfg.beaconActive = beacon ? 1u : 0u;
+    cfg.beaconGeneration = g_hookBeaconGeneration.load();
+    cfg.beaconSize = DWM_HOOK_BEACON_SIZE;
 
     // Use cached DXGI monitor info (refreshed on inject and WM_DISPLAYCHANGE)
     const auto& mons = EnumerateDxgiMonitors();
@@ -873,6 +880,7 @@ void UpdateDwmHookSharedConfig()
                         mc.sourcePeakNits = tm.sourcePeakNits;
                         mc.targetPeakNits = tm.targetPeakNits;
                         mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
+                        mc.beaconColorId = beacon ? DwmHookBeaconColorIdForMonitor(static_cast<uint32_t>(mi)) : 0;
                         break;
                     }
                 }
@@ -1059,4 +1067,14 @@ void InvalidateDxgiMonitorCache()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     g_dxgiCacheValid = false;
+}
+
+bool DwmHookHasTwinMonitors()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    const auto& mons = EnumerateDxgiMonitors();
+    for (size_t i = 0; i < mons.size(); i++)
+        for (size_t j = i + 1; j < mons.size(); j++)
+            if (mons[i].w == mons[j].w && mons[i].h == mons[j].h && mons[i].bpc == mons[j].bpc) return true;
+    return false;
 }

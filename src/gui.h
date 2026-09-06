@@ -45,6 +45,12 @@ BOOL CALLBACK GUIMonitorEnumProc(HMONITOR hMonitor, HDC hdc, LPRECT lprcMonitor,
 extern HPOWERNOTIFY g_guiDisplayPowerNotify;
 extern const GUID GUID_CONSOLE_DISPLAY_STATE_GUI;
 
+// DWM-hook identity beacon (twin-panel LUT routing) — gui.cpp
+void StartDwmHookBeacon(HWND hwnd, const char* why);      // timer-driven session; no-op without twins / hook mode
+void RunDwmHookBeaconBlocking(HWND hwnd, const char* why); // same, ticked in place (calibration-pipe handlers)
+void StopDwmHookBeacon(HWND hwnd);
+void RefreshHookRoutingLabel();                             // Settings tab status line
+
 // Main GUI window procedure
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 

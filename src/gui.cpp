@@ -25,6 +25,7 @@
 #include <wtsapi32.h>
 #include <dbt.h>
 #include <taskschd.h>
+#include <climits>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Wtsapi32.lib")
@@ -688,6 +689,215 @@ static void StartDwmHookConfigResends(HWND hwnd) {
 }
 
 // ============================================================================
+// SECTION: DWM-hook identity beacon (twin-panel LUT routing, 25H2)
+// ============================================================================
+// The hook cannot tell two identical panels apart from a DWM overlay context, so it used to
+// assign them by first-present order — a coin toss per dwm.exe lifetime, i.e. per reboot.
+// A beacon session makes the answer positive: one tiny solid-colour window per monitor at
+// its top-left corner (palette shared with the DLL in dwm_hook_config.h), repainted every
+// tick so DWM composes a frame on every monitor; the DLL reads that corner of each overlay
+// context's back buffer and pins the context to the monitor whose colour it sees. Runs after
+// every injection and after the resend pump of a display change; ends as soon as the routing
+// file shows every twin identified, or after DWM_HOOK_BEACON_MAX_MS. Skipped on rigs with no
+// indistinguishable twins (nothing to tell apart, no flash).
+static std::vector<HWND> g_beaconWindows;
+static int g_beaconElapsedMs = 0;
+static bool g_beaconClassRegistered = false;
+
+static LRESULT CALLBACK BeaconWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        // USERDATA: colour in the low 24 bits, a phase bit above. The phase alternates between
+        // full and ~92% intensity so every tick changes pixels (DWM composes only dirty output);
+        // both phases classify identically (on-channels stay >= 60% of the maximum).
+        LONG_PTR ud = GetWindowLongPtr(hwnd, GWLP_USERDATA);
+        COLORREF c = (COLORREF)(ud & 0xFFFFFF);
+        if (ud & (1LL << 24))
+            c = RGB(GetRValue(c) * 235 / 255, GetGValue(c) * 235 / 255, GetBValue(c) * 235 / 255);
+        HBRUSH br = CreateSolidBrush(c);
+        FillRect(hdc, &ps.rcPaint, br);
+        DeleteObject(br);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+void StopDwmHookBeacon(HWND hwnd) {
+    KillTimer(hwnd, DWM_HOOK_BEACON_TIMER_ID);
+    for (HWND w : g_beaconWindows) if (w) DestroyWindow(w);
+    g_beaconWindows.clear();
+    if (g_hookBeaconActive.load()) {
+        g_hookBeaconActive.store(false);
+        UpdateDwmHookSharedConfig();
+        std::cout << "[DWM Hook] Identity beacon session ended after " << g_beaconElapsedMs << " ms" << std::endl;
+    }
+    // The routing line carries the outcome ("identified" / "guessed" / ...); the status bar
+    // is left to the processing state.
+    RefreshHookRoutingLabel();
+}
+
+// True when every twin monitor (one that shares size + bit depth with another) has a routing
+// entry identified by the beacon: the session has done its job. Counted per monitor, not per
+// entry, because the file may also carry pins of contexts DWM already destroyed (kept on
+// purpose for re-injections) which no session can ever identify.
+static bool BeaconRoutingComplete() {
+    DwmHookRouting r = ReadDwmHookRouting();
+    if (!r.present || r.stale) return false;
+    int twinMonitors = 0, identified = 0;
+    for (size_t a = 0; a < r.monitors.size(); a++) {
+        bool twin = false;
+        for (size_t b = 0; b < r.monitors.size() && !twin; b++) {
+            if (a == b) continue;
+            twin = r.monitors[a].width == r.monitors[b].width && r.monitors[a].height == r.monitors[b].height &&
+                   r.monitors[a].bpc == r.monitors[b].bpc;
+        }
+        if (!twin) continue;
+        twinMonitors++;
+        for (const auto& e : r.entries) {
+            if (e.left == r.monitors[a].left && e.top == r.monitors[a].top && e.method == "beacon") { identified++; break; }
+        }
+    }
+    return twinMonitors > 0 && identified == twinMonitors;
+}
+
+void StartDwmHookBeacon(HWND hwnd, const char* why) {
+    if (!g_dwmHookMode.load() || !g_gui.isRunning) return;
+    if (!DwmHookHasTwinMonitors()) return;
+    StopDwmHookBeacon(hwnd);
+    if (!g_beaconClassRegistered) {
+        WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
+        wc.lpfnWndProc = BeaconWndProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"DesktopLUT_Beacon";
+        g_beaconClassRegistered = RegisterClassEx(&wc) != 0;
+        if (!g_beaconClassRegistered) return;
+    }
+    for (size_t i = 0; i < g_gui.monitors.size(); i++) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfo(g_gui.monitors[i], &mi)) continue;
+        int r = 0, g = 0, b = 0;
+        DwmHookBeaconRGB(DwmHookBeaconColorIdForMonitor((uint32_t)i), &r, &g, &b);
+        HWND w = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            L"DesktopLUT_Beacon", L"", WS_POPUP,
+            mi.rcMonitor.left, mi.rcMonitor.top, DWM_HOOK_BEACON_SIZE, DWM_HOOK_BEACON_SIZE,
+            nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+        if (!w) continue;
+        SetWindowLongPtr(w, GWLP_USERDATA, (LONG_PTR)RGB(r * 255, g * 255, b * 255));
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        UpdateWindow(w);
+        g_beaconWindows.push_back(w);
+    }
+    if (g_beaconWindows.empty()) return;
+    g_beaconElapsedMs = 0;
+    g_hookBeaconGeneration.fetch_add(1);
+    g_hookBeaconActive.store(true);
+    UpdateDwmHookSharedConfig();
+    std::cout << "[DWM Hook] Identity beacon session " << g_hookBeaconGeneration.load()
+              << " (" << why << ")" << std::endl;
+    if (g_gui.hwndSettingsHookRouting)
+        SetWindowText(g_gui.hwndSettingsHookRouting, L"LUT routing: identifying monitors...");
+    SetTimer(hwnd, DWM_HOOK_BEACON_TIMER_ID, DWM_HOOK_BEACON_TICK_MS, nullptr);
+}
+
+// One tick: repaint every beacon (a composed frame per monitor), poll the DLL's verdict.
+static void TickDwmHookBeacon(HWND hwnd) {
+    if (!g_hookBeaconActive.load()) return;
+    g_beaconElapsedMs += DWM_HOOK_BEACON_TICK_MS;
+    for (HWND w : g_beaconWindows) {
+        LONG_PTR ud = GetWindowLongPtr(w, GWLP_USERDATA);
+        SetWindowLongPtr(w, GWLP_USERDATA, ud ^ (1LL << 24));
+        InvalidateRect(w, nullptr, FALSE);
+        UpdateWindow(w);
+    }
+    bool done = (g_beaconElapsedMs % 200 == 0) && BeaconRoutingComplete();
+    if (done || g_beaconElapsedMs >= DWM_HOOK_BEACON_MAX_MS || !g_gui.isRunning) {
+        if (!done)
+            std::cout << "[DWM Hook] Identity beacon: not every twin was identified within the session" << std::endl;
+        StopDwmHookBeacon(hwnd);
+    }
+}
+
+// Synchronous variant for the calibration pipe (its handlers run on the GUI thread, so the
+// timer cannot drive the session while the handler waits): ticks in place until the session
+// ends. UpdateWindow delivers WM_PAINT directly, so no message pump is needed.
+void RunDwmHookBeaconBlocking(HWND hwnd, const char* why) {
+    StartDwmHookBeacon(hwnd, why);
+    if (!g_hookBeaconActive.load()) return;
+    KillTimer(hwnd, DWM_HOOK_BEACON_TIMER_ID);
+    while (g_hookBeaconActive.load()) {
+        Sleep(DWM_HOOK_BEACON_TICK_MS);
+        TickDwmHookBeacon(hwnd);
+    }
+}
+
+void RefreshHookRoutingLabel() {
+    if (!g_gui.hwndSettingsHookRouting) return;
+    std::wstring text;
+    if (!g_dwmHookMode.load()) {
+        text = L"LUT routing: DWM hook mode is off";
+    } else {
+        DwmHookRouting r = ReadDwmHookRouting();
+        if (!r.present || r.stale) {
+            text = L"LUT routing: not assigned yet";
+        } else {
+            text = L"LUT routing:";
+            bool any = false;
+            for (size_t mi = 0; mi < g_gui.monitors.size(); ++mi) {
+                MONITORINFO info = { sizeof(info) };
+                if (!GetMonitorInfo(g_gui.monitors[mi], &info)) continue;
+                std::wstring how;
+                for (const auto& e : r.entries) {
+                    if (e.left != info.rcMonitor.left || e.top != info.rcMonitor.top) continue;
+                    std::wstring m(e.method.begin(), e.method.end());
+                    if (m == L"beacon") m = L"identified";
+                    else if (m == L"unique" || m == L"bpc" || m == L"legacy") m = L"unambiguous";
+                    else if (m == L"order") m = L"guessed";
+                    else if (m == L"replaced") m = L"inferred";
+                    if (how.find(m) != std::wstring::npos) continue;
+                    if (!how.empty()) how += L"/";
+                    how += m;
+                }
+                if (how.empty()) continue;
+                any = true;
+                text += L"  Mon " + std::to_wstring(mi) + L": " + how;
+            }
+            if (!any) text = L"LUT routing: no overlay context assigned yet";
+        }
+    }
+    SetWindowText(g_gui.hwndSettingsHookRouting, text.c_str());
+}
+
+// Manual override for the selected monitor: exchange its assignment with its twin's and
+// re-inject. The identity beacon runs after the injection; where it can see the monitors it
+// is the authority, so a manual swap only holds where identification is impossible.
+static void SwapDwmHookRoutingForCurrentMonitor(HWND hwnd) {
+    (void)hwnd;
+    int mon = g_gui.currentMonitor;
+    if (mon < 0 || mon >= (int)g_gui.monitors.size()) return;
+    MONITORINFO info = { sizeof(info) };
+    if (!GetMonitorInfo(g_gui.monitors[mon], &info)) return;
+    DwmHookRouting r = ReadDwmHookRouting();
+    if (!r.present || r.stale) { SetStatus(L"LUT routing: nothing assigned yet to swap"); return; }
+    std::wstring err = SwapDwmHookRouting(r, info.rcMonitor.left, info.rcMonitor.top);
+    if (!err.empty()) { SetStatus((L"LUT routing: " + err).c_str()); return; }
+    r.confirmed = false;
+    if (!WriteDwmHookRouting(r)) { SetStatus(L"LUT routing: failed to rewrite the routing file"); return; }
+    StopProcessing();
+    StartProcessing();
+    SetStatus(L"LUT routing swapped and re-injected");
+    RefreshHookRoutingLabel();
+}
+
+// ============================================================================
 // SECTION: Main Window Procedure
 // ============================================================================
 
@@ -746,6 +956,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ShowWindow(g_gui.hwndScrollPanel[i], i == newTab ? SW_SHOW : SW_HIDE);
             }
             g_gui.currentTab = newTab;
+            if (newTab == 3) RefreshHookRoutingLabel();
         }
         break;
     }
@@ -1546,6 +1757,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SendMessage(g_gui.hwndSettingsCalibration, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
+        case ID_SETTINGS_HOOK_IDENTIFY:
+            StartDwmHookBeacon(hwnd, "user");
+            if (!g_hookBeaconActive.load() && g_gui.hwndSettingsHookRouting)
+                SetWindowText(g_gui.hwndSettingsHookRouting,
+                    L"LUT routing: identification needs DWM hook mode running on identical monitors");
+            return 0;
+
+        case ID_SETTINGS_HOOK_SWAP:
+            SwapDwmHookRoutingForCurrentMonitor(hwnd);
+            return 0;
+
         case ID_SETTINGS_VRR_WHITELIST_CHECK:
             g_vrrWhitelistEnabled.store(SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             SaveSettings();
@@ -1591,6 +1813,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             SetForegroundWindow(hwnd);
         }
+        return 0;
+
+    case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively
+        StartDwmHookBeacon(hwnd, "injection");
         return 0;
 
     case WM_SHADER_STATE_CHANGED:  // Shader active state changed (from render thread)
@@ -1846,6 +2072,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (wParam == DWM_HOOK_BEACON_TIMER_ID) {
+            TickDwmHookBeacon(hwnd);
+            return 0;
+        }
         if (wParam == DWM_HOOK_RESEND_TIMER_ID) {
             // Resend pump started by StartDwmHookConfigResends. Re-enumerate fresh
             // each tick: if the first snapshot raced the mode transition, later
@@ -1857,6 +2087,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (g_dwmHookConfigResends <= 0) {
                 KillTimer(hwnd, DWM_HOOK_RESEND_TIMER_ID);
+                // The mode change has settled (DWM recreates overlay contexts on a modeset /
+                // HDR flip): re-identify the twins positively rather than trust liveness alone.
+                StartDwmHookBeacon(hwnd, "display change settled");
             }
             return 0;
         }
@@ -2130,6 +2363,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DESTROY:
         StopCalibrationIpcServer();
+        StopDwmHookBeacon(hwnd);
         StopProcessing();
         RemoveTrayIcon();
         // Unregister session change notifications

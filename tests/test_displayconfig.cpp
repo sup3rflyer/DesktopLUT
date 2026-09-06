@@ -159,6 +159,7 @@ TEST_CASE("DwmHookMonitorConfig: size and alignment") {
     CHECK((reinterpret_cast<uintptr_t>(&cfg.sourcePeakNits) - base) == 32);
     CHECK((reinterpret_cast<uintptr_t>(&cfg.targetPeakNits) - base) == 36);
     CHECK((reinterpret_cast<uintptr_t>(&cfg.dynamicPeak) - base) == 40);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.beaconColorId) - base) == 44);
 }
 
 TEST_CASE("DwmHookSharedConfig: size and layout") {
@@ -171,6 +172,41 @@ TEST_CASE("DwmHookSharedConfig: size and layout") {
     CHECK((reinterpret_cast<uintptr_t>(&cfg.lutReloadFlag) - base) == 12);
     CHECK((reinterpret_cast<uintptr_t>(&cfg.monitors[0]) - base) == 16);
     CHECK((reinterpret_cast<uintptr_t>(&cfg.monitors[1]) - base) == 16 + 48);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.beaconActive) - base) == 16 + 48 * MAX_DWM_HOOK_MONITORS);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.beaconGeneration) - base) == 16 + 48 * MAX_DWM_HOOK_MONITORS + 4);
+    CHECK((reinterpret_cast<uintptr_t>(&cfg.beaconSize) - base) == 16 + 48 * MAX_DWM_HOOK_MONITORS + 8);
+}
+
+TEST_CASE("DwmHookBeacon: palette and classifier agree across encodings") {
+    // Monitor index -> colour id wraps over the six-colour palette, never 0.
+    CHECK(DwmHookBeaconColorIdForMonitor(0) == 1);
+    CHECK(DwmHookBeaconColorIdForMonitor(5) == 6);
+    CHECK(DwmHookBeaconColorIdForMonitor(6) == 1);
+    // Every palette colour round-trips through the classifier at any positive scale
+    // (8-bit normalised, 10-bit normalised, scRGB FP16 with SDR white-level gain).
+    for (uint32_t id = 1; id <= DWM_HOOK_BEACON_COLORS; id++) {
+        int r, g, b;
+        DwmHookBeaconRGB(id, &r, &g, &b);
+        CHECK((r | g | b) != 0);
+        for (float scale : { 1.0f, 0.5f, 3.75f, 12.5f }) {
+            CHECK(DwmHookBeaconClassify(r * scale, g * scale, b * scale, 0.15f) == id);
+            // A little leakage into the "off" channels (composition rounding) is tolerated.
+            CHECK(DwmHookBeaconClassify(r * scale + 0.1f * scale, g * scale + 0.1f * scale, b * scale + 0.1f * scale, 0.15f) == id);
+        }
+    }
+    // Non-beacon content is rejected: black, white, grey, a pastel, a dim sample, NaN.
+    CHECK(DwmHookBeaconClassify(0.0f, 0.0f, 0.0f, 0.15f) == 0);
+    CHECK(DwmHookBeaconClassify(1.0f, 1.0f, 1.0f, 0.15f) == 0);
+    CHECK(DwmHookBeaconClassify(0.5f, 0.5f, 0.5f, 0.15f) == 0);
+    CHECK(DwmHookBeaconClassify(1.0f, 0.5f, 0.5f, 0.15f) == 0);
+    CHECK(DwmHookBeaconClassify(0.1f, 0.0f, 0.0f, 0.15f) == 0);
+    CHECK(DwmHookBeaconClassify(std::nanf(""), 0.0f, 0.0f, 0.15f) == 0);
+    // Id 0 / out-of-range ids paint nothing.
+    int r = 1, g = 1, b = 1;
+    DwmHookBeaconRGB(0, &r, &g, &b);
+    CHECK((r | g | b) == 0);
+    DwmHookBeaconRGB(99, &r, &g, &b);
+    CHECK((r | g | b) == 0);
 }
 
 TEST_CASE("DwmHookTonemapCurve: enum values match host app") {

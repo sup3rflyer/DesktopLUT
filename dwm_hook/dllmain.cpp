@@ -540,6 +540,24 @@ static void UpdateLocalTonemapFromShared() {
 	// Clamp numMonitors to prevent OOB from shared memory
 	uint32_t numMons = (local.numMonitors < MAX_DWM_HOOK_MONITORS) ? local.numMonitors : MAX_DWM_HOOK_MONITORS;
 
+	// Identity beacon session state — applied immediately, never debounced (a session is a
+	// short host-driven burst; the colour table is only meaningful while it is active).
+	if (local.beaconActive && !g_beaconActive) {
+		char bmsg[96];
+		snprintf(bmsg, sizeof(bmsg), "beacon: session %u active (size %u)", local.beaconGeneration, local.beaconSize);
+		log_to_file(bmsg);
+	}
+	g_beaconActive = local.beaconActive;
+	g_beaconGeneration = local.beaconGeneration;
+	g_beaconSize = local.beaconSize;
+	g_numBeaconColors = 0;
+	for (uint32_t i = 0; i < numMons && g_numBeaconColors < 16; i++) {
+		g_beaconColors[g_numBeaconColors].left = local.monitors[i].left;
+		g_beaconColors[g_numBeaconColors].top = local.monitors[i].top;
+		g_beaconColors[g_numBeaconColors].colorId = local.monitors[i].beaconColorId;
+		g_numBeaconColors++;
+	}
+
 	// Classify this update as suspicious if:
 	//  (a) monitor count shrank, or
 	//  (b) a monitor at a position present in both old and new state flipped HDR flag.
@@ -614,11 +632,10 @@ static void UpdateLocalTonemapFromShared() {
 		}
 
 		if (topologyChanged) {
-			g_numContextPosCache = 0;
+			// Every context re-resolves on its next present (the cache is the only "seen" list).
+			ResetContextRouting();
 			// Pins were validated against the attach-time topology; a different one makes them
-			// meaningless (and the routing file's mon lines will no longer match). NOTE: contexts
-			// already seen by ApplyLUTDirect are NOT re-resolved until re-injection (its static
-			// cachedContexts[] is not reset here — pre-existing behaviour).
+			// meaningless (and the routing file's mon lines will no longer match).
 			g_routingPinsValid = false;
 			g_numRoutingPins = 0;
 			g_routingConfirmed = false;

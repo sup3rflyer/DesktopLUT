@@ -549,10 +549,16 @@ void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
 // measured the wrong panel). The DLL now persists its assignment per dwm.exe lifetime; this
 // reports it and lets a client swap / confirm / clear it.
 //   hook: { active, needs_check, routing?: { session, stale, confirmed, entries: [
-//           { ctx, left, top, method: unique|bpc|scan|pinned|order|legacy, monitor|null } ] } }
-// needs_check = an entry was assigned by order (or is a pin of one) and no client confirmed
-// it through a meter, or the recorded dwm.exe is gone. No routing file yet => no `routing`
-// key (the client treats that as unknown).
+//           { ctx, left, top, method: unique|bpc|scan|pinned|order|legacy|provisional|replaced|beacon,
+//             monitor|null } ] } }
+// `beacon` = identified positively by the host's identity beacon (a colour the DLL read from
+// the context's back-buffer corner): unambiguous, so it never sets needs_check. The host runs a
+// beacon session after every injection; hook.set_routing {action:"identify"} runs one on demand.
+// needs_check = an entry was assigned by order (or is a pin of one), or replaced a context DWM
+// destroyed (`replaced`: inferred from which twin kept presenting), and no client confirmed it
+// through a meter; or an entry is still `provisional` (a replacement guess the DLL has not yet
+// settled — always unverified); or the recorded dwm.exe is gone. No routing file yet => no
+// `routing` key (the client treats that as unknown).
 JsonValue BuildHookStateJson() {
     JsonValue hook = JObj();
     hook.set("active", JBool(IsDwmHookActive()));
@@ -587,7 +593,8 @@ JsonValue BuildHookStateJson() {
                 if (origins[i].first == e.left && origins[i].second == e.top) { idx = (int)i; break; }
             j.set("monitor", idx >= 0 ? JNum(idx) : JsonValue());
             entries.arr.push_back(j);
-            if ((e.method == "order" || e.method == "pinned") && !r.confirmed) needsCheck = true;
+            if ((e.method == "order" || e.method == "pinned" || e.method == "replaced") && !r.confirmed) needsCheck = true;
+            if (e.method == "provisional") needsCheck = true;
         }
         if (r.stale) needsCheck = true;
         routing.set("entries", entries);
@@ -1286,7 +1293,9 @@ void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("runtime", rt);
 }
 
-// hook.set_routing {action: swap|confirm|clear|assign, monitor?, entries?} — see BuildHookStateJson.
+// hook.set_routing {action: swap|confirm|clear|assign|identify, monitor?, entries?} — see BuildHookStateJson.
+// identify: run an identity-beacon session (blocking, <= DWM_HOOK_BEACON_MAX_MS) and report the
+//       routing it produced; no re-injection.
 // swap: the monitor's position and its single same-size/same-bpc twin's exchange every recorded
 //       context, then re-inject (the DLL honours the pins). confirm: mark the current assignment
 //       meter-verified (no re-inject). clear: delete the file and re-inject (a fresh roll).
@@ -1303,6 +1312,10 @@ void DoHookSetRouting(const JsonValue& p, JsonValue& result, std::string& error)
     } else if (action == "clear") {
         if (!ClearDwmHookRouting()) { error = "failed to delete the hook routing file"; return; }
         reinject = true;
+    } else if (action == "identify") {
+        if (!g_dwmHookMode.load() || !g_gui.isRunning) { error = "DWM hook mode is not running"; return; }
+        if (!DwmHookHasTwinMonitors()) { error = "no indistinguishable twin monitors - nothing to identify"; return; }
+        RunDwmHookBeaconBlocking(g_gui.hwndMain, "hook.set_routing identify");
     } else if (action == "swap") {
         const JsonValue* mv = p.find("monitor");
         if (!mv || mv->type != JsonValue::Num) { error = "missing parameter: monitor"; return; }
@@ -1357,7 +1370,7 @@ void DoHookSetRouting(const JsonValue& p, JsonValue& result, std::string& error)
         if (!WriteDwmHookRouting(r)) { error = "failed to rewrite the hook routing file"; return; }
         reinject = true;
     } else {
-        error = "unknown action (swap|confirm|clear|assign)";
+        error = "unknown action (swap|confirm|clear|assign|identify)";
         return;
     }
     if (reinject) {
@@ -1368,13 +1381,15 @@ void DoHookSetRouting(const JsonValue& p, JsonValue& result, std::string& error)
         size_t written = ReadDwmHookRouting().entries.size();
         ReapplyProcessing();
         reinject = g_gui.isRunning.load();   // nothing to re-inject when no correction is active
-        for (int i = 0; reinject && i < 30; ++i) {
+        for (int i = 0; reinject && i < 60; ++i) {
             Sleep(50);
             DwmHookRouting now = ReadDwmHookRouting();
             if (!now.present) continue;
             bool settled = (action == "clear") ? !now.entries.empty() : now.entries.size() >= written;
-            for (const auto& e : now.entries)
+            for (const auto& e : now.entries) {
                 if (e.method == "order" && action != "clear") settled = false;
+                if (e.method == "provisional") settled = false;   // a replacement guess still being resolved
+            }
             if (settled) break;
         }
     }

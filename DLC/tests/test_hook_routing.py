@@ -28,7 +28,7 @@ MAGENTA_XYZ = (80.0, 55.0, 95.0)        # the probe's green-halved grey (x 0.348
 def _twin_hook(*, confirmed=False, method="order", stale=False, monitor_map=(0, 1)) -> dict:
     entries = [{"ctx": f"0x1F3A000{i}", "left": 3840 * i, "top": 0, "method": method, "monitor": m}
                for i, m in enumerate(monitor_map)]
-    needs = stale or (method in ("order", "pinned") and not confirmed)
+    needs = stale or (method in ("order", "pinned", "replaced") and not confirmed) or method == "provisional"
     return {"active": True, "needs_check": needs,
             "routing": {"session": "4242-1337", "stale": stale, "confirmed": confirmed, "entries": entries}}
 
@@ -217,6 +217,10 @@ def test_confirm_verb_missing_on_old_build_is_a_note_not_a_failure(tmp_path):
     (_twin_hook(method="order"), 0, "auto", True, "order-matched"),
     (_twin_hook(method="pinned"), 0, "auto", True, "pinned-matched"),
     (_twin_hook(method="order", confirmed=True), 0, "auto", False, "confirmed"),
+    (_twin_hook(method="replaced"), 0, "auto", True, "replaced-matched"),
+    (_twin_hook(method="replaced", confirmed=True), 0, "auto", False, "confirmed"),
+    (_twin_hook(method="provisional"), 0, "auto", True, "provisional"),
+    (_twin_hook(method="provisional", confirmed=True), 0, "auto", True, "provisional"),
     (_twin_hook(method="unique"), 0, "auto", False, "unambiguous"),
     (_twin_hook(method="unique"), 1, "auto", False, "unambiguous"),
     (_twin_hook(method="unique", monitor_map=(1, None)), 0, "auto", True, "no routing entry maps to monitor 0"),

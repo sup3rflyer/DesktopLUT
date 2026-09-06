@@ -92,6 +92,8 @@ std::atomic<int> g_frameBufferIdleMs{ 3000 };  // Idle timeout before buffer eng
 std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (default: off, experimental)
 std::atomic<bool> g_calibrationControlEnabled{ false };  // DLC calibration IPC server arm (default: off — normal DesktopLUT exposes nothing)
 int g_dwmHookWatchdogRetries = 0;              // Consecutive re-injection failures (GUI thread only)
+std::atomic<bool> g_hookBeaconActive{false};   // Identity-beacon session running (GUI thread drives it)
+std::atomic<uint32_t> g_hookBeaconGeneration{0};
 int g_dwmHookConfigResends = 0;                // Extra shared-config resends after a topology/mode change (GUI thread only)
 std::atomic<bool> g_hookOnlyHotkeys{ false };  // Hotkeys registered on GUI window (hook-only mode)
 std::atomic<bool> g_analysisOnlyMode{ false }; // Lightweight analysis-only thread running (no overlay)

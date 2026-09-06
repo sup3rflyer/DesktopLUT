@@ -42,6 +42,10 @@ void CloseDwmHookSharedMemory();
 // Invalidate cached DXGI monitor info (call on WM_DISPLAYCHANGE).
 void InvalidateDxgiMonitorCache();
 
+// True when at least two monitors are indistinguishable to the hook (same size + bit depth):
+// the only rigs where the identity beacon has anything to tell apart.
+bool DwmHookHasTwinMonitors();
+
 // --- Twin-panel routing (25H2 first-present order-match) ---------------------
 // The hook DLL persists its overlay-context -> monitor assignment in
 // DWM_HOOK_ROUTING_FILE_W (see dwm_hook_config.h). The host reads it for state.get
@@ -51,7 +55,7 @@ struct DwmHookRoutingMon { int left = 0, top = 0, width = 0, height = 0, bpc = 0
 struct DwmHookRoutingEntry {
     std::string ctx;      // hex pointer, lower-case, no 0x (as the DLL writes it)
     int left = 0, top = 0;
-    std::string method;   // unique|bpc|scan|pinned|order|legacy|unknown
+    std::string method;   // unique|bpc|scan|pinned|order|legacy|provisional|replaced|beacon|unknown
 };
 struct DwmHookRouting {
     bool present = false;          // a routing file exists and parsed
