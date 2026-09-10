@@ -59,6 +59,10 @@ class FaldParams:
                                           # error in the compensation map (model-free analysis 2026-09-10
                                           # found ≈ −40 px, i.e. half a cell to the left)
     est_phase_py: float = 0.0
+    est_aniso: float = 1.0                # vertical/horizontal scale of the ESTIMATE kernel (1 = isotropic
+                                          # in mm; 45/80 = isotropic in cells → shorter vertical reach)
+    est_support_cells: int = 0            # >0: the estimate only sums cells within ±N cells in each axis
+                                          # (a box support in CELL units: 4 cells = 320 px wide, 180 px tall)
     # panel
     white_nits: float = 1040.0            # white at full drive, full transmittance (as measured)
     chan_weights: tuple[float, float, float] = (0.305, 0.596, 0.099)   # R,G,B share of white
@@ -165,12 +169,12 @@ class FaldModel:
 
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
-                 phase_mm: tuple[float, float] = (0.0, 0.0)):
+                 phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0):
         """Per-sub-offset kernels. ``kind``: "exp" (1/e = scale_mm), "gauss" (sigma = scale_mm),
         "mix" ((1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/scale_mm)). ``phase_mm`` shifts
         the SAMPLE point: the field is evaluated at (p + phase) and attributed to p."""
         key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
-               round(phase_mm[0], 4), round(phase_mm[1], 4))
+               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells))
         if key in self._kern_cache:
             return self._kern_cache[key]
         p = self.p
@@ -192,7 +196,7 @@ class FaldModel:
                 # +phase adds phase to it.
                 dx = (ii[None, :] + (ox + 0.5) / sub - 0.5) * cwmm + phase_mm[0]
                 dy = (jj[:, None] + (oy + 0.5) / sub - 0.5) * chmm + phase_mm[1]
-                d = np.sqrt(dx * dx + dy * dy)
+                d = np.sqrt(dx * dx + (dy / max(aniso, 1e-3)) ** 2)   # aniso < 1: shorter vertical reach
                 if kind == "exp":
                     k = np.exp(-d / scale_mm)
                 elif kind == "gauss":
@@ -203,6 +207,8 @@ class FaldModel:
                     k = (1.0 - tail_frac) * core / core.sum() + tail_frac * tail / tail.sum()
                 else:
                     raise ValueError(kind)
+                if support_cells > 0:
+                    k = k * ((np.abs(ii[None, :]) <= support_cells) & (np.abs(jj[:, None]) <= support_cells))
                 row.append(k)
             kern.append(row)
         # normalise: a fully driven infinite field must give B = 1 at any sample point
@@ -213,11 +219,12 @@ class FaldModel:
 
     def backlight(self, drives: np.ndarray, kind: str, scale_mm: float,
                   core_mm: float = 0.0, tail_frac: float = 0.0,
-                  phase_px: tuple[float, float] = (0.0, 0.0)) -> np.ndarray:
+                  phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
+                  support_cells: int = 0) -> np.ndarray:
         """B on the reduced-res pixel grid (h, w), from cell drives (rows, cols)."""
         p = self.p
         kern = self._kernels(kind, scale_mm, core_mm, tail_frac,
-                             (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm))
+                             (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm), aniso, support_cells)
         sub = p.sub
         fine = np.zeros((p.rows * sub, p.cols * sub))
         for oy in range(sub):
@@ -238,9 +245,11 @@ class FaldModel:
         b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac)
         phase = (p.est_phase_px, p.est_phase_py)
         if p.est_kind == "mix":
-            b_est = self.backlight(drives, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase)
+            b_est = self.backlight(drives, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase,
+                                   p.est_aniso, p.est_support_cells)
         else:
-            b_est = self.backlight(drives, p.est_kind, p.est_scale_mm, phase_px=phase)
+            b_est = self.backlight(drives, p.est_kind, p.est_scale_mm, phase_px=phase, aniso=p.est_aniso,
+                                   support_cells=p.est_support_cells)
         return b_true, b_est
 
     def forward_img(self, img: np.ndarray) -> dict:
