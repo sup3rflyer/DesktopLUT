@@ -56,6 +56,22 @@ def parse_shapes_command(cmd: str) -> list:
     return shapes
 
 
+def shapes_to_stdin_pattern(shapes) -> str:
+    """Translate a shapes list into dogegen's stdin pattern grammar: a ``;``-separated list of
+    ``window``/``draw`` commands, painted in order (a new pattern replaces the old one). A
+    full-field shape becomes ``window 100 r g b``; any other rectangle becomes
+    ``draw x0 y0 x1 y1 r g b`` in Direct3D NDC (top-left = −1 1, bottom-right = 1 −1)."""
+    parts = []
+    for (r, g, b), (x, y, cx, cy) in shapes:
+        if x <= 0.0 and y <= 0.0 and cx >= 1.0 and cy >= 1.0:
+            parts.append(f"window 100 {int(r)} {int(g)} {int(b)}")
+        else:
+            x0 = 2.0 * x - 1.0; x1 = 2.0 * (x + cx) - 1.0
+            y0 = 1.0 - 2.0 * y; y1 = 1.0 - 2.0 * (y + cy)
+            parts.append(f"draw {x0:.6f} {y0:.6f} {x1:.6f} {y1:.6f} {int(r)} {int(g)} {int(b)}")
+    return "; ".join(parts)
+
+
 def dispatch(cmd: str, *, show: Callable[[int, int, int], None],
              show_shapes: Optional[Callable[[list], None]] = None) -> Tuple[str, bool]:
     """Handle one protocol line. Returns ``(reply, keep_running)``; ``reply`` empty ⇒
@@ -154,7 +170,11 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
         def show(r: int, g: int, b: int) -> None:
             disp.send(proc, f"window {patch_size} {r} {g} {b}", settle_seconds=0.0)
 
-        show_shapes = None   # legacy stdin path has no multi-rect frame
+        def show_shapes(shapes) -> None:
+            # The stdin path is the ONLY transport that draws an arbitrary rectangle list: the
+            # Resolve XML parser takes just the first <rectangle> after the background (HW-seen
+            # 2026-09-10: a 3-shape frame rendered like its first two).
+            disp.send(proc, shapes_to_stdin_pattern(shapes), settle_seconds=0.0)
 
         def teardown() -> None:
             try:

@@ -208,3 +208,16 @@ def test_dispatch_shapes_malformed_errors_without_painting():
     assert dispatch("1 2 3", show=lambda r, g, b: shown.append((r, g, b)),
                     show_shapes=got.append) == ("ok", True)
     assert shown == [(1, 2, 3)]
+
+
+def test_shapes_to_stdin_pattern_translates_full_field_and_ndc_rects():
+    from dlc.dogegen_server import shapes_to_stdin_pattern
+    s = shapes_to_stdin_pattern([((300, 300, 300), (0.0, 0.0, 1.0, 1.0)),
+                                 ((1023, 1023, 1023), (0.5, 0.5, 0.25, 0.5))])
+    parts = s.split("; ")
+    assert parts[0] == "window 100 300 300 300"
+    # x: 0.5→0.0, 0.75→0.5 ; y: 0.5→0.0 (top), 1.0→-1.0 (bottom)
+    assert parts[1].startswith("draw 0.000000 0.000000 0.500000 -1.000000 1023 1023 1023")
+    # top-left quadrant example from the dogegen README
+    assert shapes_to_stdin_pattern([((255, 255, 255), (0.0, 0.0, 0.5, 0.5))]) == \
+        "draw -1.000000 1.000000 0.000000 0.000000 255 255 255"
