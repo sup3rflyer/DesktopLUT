@@ -230,15 +230,24 @@ class FaldModel:
 
     # ------------------------------------------------------------------ full forward
     def forward(self, shapes: Sequence[Shape]) -> dict:
+        return self.forward_img(self.render(shapes))
+
+    def backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map."""
         p = self.p
-        img = self.render(shapes)
-        drives = self.cell_drives(img)
         b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac)
         phase = (p.est_phase_px, p.est_phase_py)
         if p.est_kind == "mix":
             b_est = self.backlight(drives, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase)
         else:
             b_est = self.backlight(drives, p.est_kind, p.est_scale_mm, phase_px=phase)
+        return b_true, b_est
+
+    def forward_img(self, img: np.ndarray) -> dict:
+        """Forward model on a rendered request image ``img`` (3, h, w) of as-if-white nits."""
+        p = self.p
+        drives = self.cell_drives(img)
+        b_true, b_est = self.backlights(drives)
         lmax = p.white_nits * np.array(p.chan_weights)[:, None, None]
         # per-channel target luminance: a code's PQ decode is its "as-if-white" nits, the channel
         # contributes its share of white → target_ch = w_ch · EOTF(code_ch)
@@ -252,7 +261,17 @@ class FaldModel:
     def meter(self, shapes: Sequence[Shape], meter_px: tuple[float, float],
               aperture_px: Optional[float] = None) -> np.ndarray:
         """Per-channel luminance the meter reads: mean of y over the aperture disc. Returns (3,)."""
-        out = self.forward(shapes)
+        return self.meter_img(self.render(shapes), meter_px, aperture_px)
+
+    def aperture_mask(self, meter_px: tuple[float, float], aperture_px: Optional[float] = None) -> np.ndarray:
+        r = (aperture_px if aperture_px is not None else self.p.aperture_px) / self.p.scale
+        mx, my = meter_px[0] / self.p.scale, meter_px[1] / self.p.scale
+        yy, xx = np.mgrid[0:self.h, 0:self.w]
+        return ((xx + 0.5 - mx) ** 2 + (yy + 0.5 - my) ** 2) <= r * r
+
+    def meter_img(self, img: np.ndarray, meter_px: tuple[float, float],
+                  aperture_px: Optional[float] = None) -> np.ndarray:
+        out = self.forward_img(img)
         r = (aperture_px if aperture_px is not None else self.p.aperture_px) / self.p.scale
         mx, my = meter_px[0] / self.p.scale, meter_px[1] / self.p.scale
         yy, xx = np.mgrid[0:self.h, 0:self.w]

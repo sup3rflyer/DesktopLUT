@@ -114,3 +114,39 @@ def test_est_phase_shifts_the_estimate_not_the_truth():
         t1 = m1.backlight(d, "mix", p1.tail_mm, p1.core_mm, p1.tail_frac)[y, x]
         assert t0 == pytest.approx(t1)
         assert (e1 < e0) if expect == "drop" else (e1 > e0)
+
+
+# ---------------------------------------------------------------------------
+# the inverse (dlc.fald.correct)
+# ---------------------------------------------------------------------------
+
+def test_correction_is_identity_on_a_uniform_field():
+    from dlc.fald.correct import correct_image, reference_pedestal
+    p = FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3)
+    m = FaldModel(p)
+    img = m.render([((307, 307, 307), FULL)])
+    res = correct_image(m, img)
+    mask = m.aperture_mask(METER)
+    # uniform field: B_est == B_true away from the edges → the only change is pedestal bookkeeping,
+    # which cancels because the reference pedestal IS the field's own pedestal
+    assert abs(res["req"][:, mask].mean() / img[:, mask].mean() - 1.0) < 0.01
+    assert not res["clipped"][:, mask].any() and not res["floored"][:, mask].any()
+
+
+def test_correction_removes_the_ring_in_the_model():
+    from dlc.fald.correct import correct_image, reference_pedestal
+    p = FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3)
+    m = FaldModel(p)
+    bg = ((307, 307, 307), FULL)
+    shapes = [bg, (WHITE, rect(1950 - 110 - 200, 1110 - 100, 200, 200))]     # one-cell-gap dark ring
+    base = m.render([bg]); img = m.render(shapes)
+    w = np.array(p.chan_weights)[:, None, None]; mask = m.aperture_mask(METER)
+    target = (base * w)[:, mask].sum(0).mean() + reference_pedestal(m, base)[mask].mean()
+    before = m.meter_img(img, METER).sum() / target
+    after = m.meter_img(correct_image(m, img)["req"], METER).sum() / target
+    assert before < 0.9, "the test pattern must show a dark ring to begin with"
+    assert abs(after - 1.0) < 0.005
+    # the highlight itself is untouched (saturated: original request kept)
+    res = correct_image(m, img)
+    hi = m.render(shapes)[0] > 5000
+    assert np.allclose(res["req"][0][hi], img[0][hi])
