@@ -189,3 +189,56 @@ def test_resolve_dogegen_does_not_leave_output_pipes_unread(monkeypatch):
         assert captured["stderr"] is subprocess.DEVNULL
     finally:
         rdg.close()
+
+
+# ---------------------------------------------------------------------------
+# shapes frames (spatial probes: arbitrary background + positioned rectangles)
+# ---------------------------------------------------------------------------
+
+def test_shapes_xml_paints_in_order_with_arbitrary_background():
+    from dlc.dogegen_resolve import FULL_FIELD, resolve_shapes_xml
+    xml = resolve_shapes_xml([((300, 300, 300), FULL_FIELD),
+                              ((1023, 1023, 1023), (0.52, 0.5, 0.05, 0.09))]).decode("ascii")
+    bg = xml.index('red="300"')
+    win = xml.index('red="1023"')
+    assert bg < win
+    assert xml.startswith("<calibration><shapes>") and xml.endswith("</shapes></calibration>")
+    tail = xml[win:]
+    assert tail.index('x="') < tail.index('cx="')          # getAttr substring hazard
+    assert 'x="0.52"' in tail and 'cx="0.05"' in tail and 'cy="0.09"' in tail
+
+
+def test_shapes_xml_windowed_patch_is_the_two_rect_special_case():
+    from dlc.dogegen_resolve import FULL_FIELD, resolve_shapes_xml
+    geo = (0.3814, 0.2891, 0.2373, 0.4219)
+    assert resolve_patch_xml(940, 941, 942, geometry=geo) == \
+        resolve_shapes_xml([((0, 0, 0), FULL_FIELD), ((940, 941, 942), geo)])
+
+
+def test_shapes_xml_rejects_empty():
+    from dlc.dogegen_resolve import resolve_shapes_xml
+    with pytest.raises(ValueError):
+        resolve_shapes_xml([])
+
+
+def test_show_shapes_frames_payload_and_ignores_configured_geometry():
+    from dlc.dogegen_resolve import FULL_FIELD
+    rdg = ResolveDogegen("dogegen.exe", geometry=(0.25, 0.25, 0.5, 0.5))
+    sent = []
+
+    class FakeConn:
+        def sendall(self, data):
+            sent.append(bytes(data))
+
+    rdg._conn = FakeConn()
+    rdg.show_shapes([((100, 100, 100), FULL_FIELD), ((1023, 0, 0), (0.6, 0.6, 0.1, 0.1))])
+    declared = struct.unpack("!i", sent[0][:4])[0]
+    body = sent[0][4:].decode("ascii")
+    assert declared == len(body)
+    assert 'x="0.25"' not in body                          # configured window geometry unused
+    assert body.index('red="100"') < body.index('red="1023"')
+
+
+def test_show_shapes_before_start_raises():
+    with pytest.raises(RuntimeError):
+        ResolveDogegen("dogegen.exe").show_shapes([((0, 0, 0), (0, 0, 1, 1))])

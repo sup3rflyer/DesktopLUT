@@ -176,3 +176,35 @@ def test_shutdown_daemon_is_safe_when_unreachable():
     # No daemon listening: shutdown_daemon must be a no-op, not raise.
     pres = SocketPresenter("127.0.0.1", 1, settle_seconds=0.0)  # port 1: nothing there
     pres.shutdown_daemon()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# shapes command (Resolve transport only)
+# ---------------------------------------------------------------------------
+
+def test_dispatch_shapes_parses_ordered_rectangles():
+    from dlc.dogegen_server import parse_shapes_command
+    got = []
+    reply, keep = dispatch("shapes 200 200 200 0 0 1 1 ; 1023 1023 1023 0.52 0.5 0.05 0.09",
+                           show=lambda *a: None, show_shapes=got.append)
+    assert (reply, keep) == ("ok", True)
+    assert got == [[((200, 200, 200), (0.0, 0.0, 1.0, 1.0)),
+                    ((1023, 1023, 1023), (0.52, 0.5, 0.05, 0.09))]]
+    assert parse_shapes_command("shapes 1 2 3 0 0 1 1") == [((1, 2, 3), (0.0, 0.0, 1.0, 1.0))]
+
+
+def test_dispatch_shapes_refused_without_transport_support():
+    reply, keep = dispatch("shapes 0 0 0 0 0 1 1", show=lambda *a: None)
+    assert reply.startswith("err") and "unsupported" in reply and keep is True
+
+
+def test_dispatch_shapes_malformed_errors_without_painting():
+    got = []
+    for bad in ("shapes", "shapes 1 2 3 0 0 1", "shapes 1 2 3 0 0 1 2", "shapes a b c 0 0 1 1"):
+        reply, keep = dispatch(bad, show=lambda *a: None, show_shapes=got.append)
+        assert reply.startswith("err") and keep is True, bad
+    assert got == []
+    shown = []
+    assert dispatch("1 2 3", show=lambda r, g, b: shown.append((r, g, b)),
+                    show_shapes=got.append) == ("ok", True)
+    assert shown == [(1, 2, 3)]

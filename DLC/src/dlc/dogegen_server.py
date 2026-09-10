@@ -35,10 +35,33 @@ from .dogegen_resolve import ResolveDogegen
 from .dogegen_window import Rect, place_dogegen, resolve_monitor_rect
 
 
-def dispatch(cmd: str, *, show: Callable[[int, int, int], None]) -> Tuple[str, bool]:
+def parse_shapes_command(cmd: str) -> list:
+    """Parse ``shapes r g b x y cx cy [; r g b x y cx cy ...]`` into a list of
+    ``((r, g, b), (x, y, cx, cy))`` shapes (painter's order). Raises ``ValueError`` on
+    malformed input. Geometry is normalized [0, 1]; code values are at the daemon's depth."""
+    body = cmd.strip()[len("shapes"):].strip()
+    if not body:
+        raise ValueError("shapes: no rectangles given")
+    shapes = []
+    for chunk in body.split(";"):
+        parts = chunk.split()
+        if len(parts) != 7:
+            raise ValueError(f"shapes: expected 'r g b x y cx cy', got {chunk.strip()!r}")
+        r, g, b = (int(p) for p in parts[:3])
+        x, y, cx, cy = (float(p) for p in parts[3:])
+        for v in (x, y, cx, cy):
+            if not (0.0 <= v <= 1.0):
+                raise ValueError(f"shapes: geometry out of [0,1]: {chunk.strip()!r}")
+        shapes.append(((r, g, b), (x, y, cx, cy)))
+    return shapes
+
+
+def dispatch(cmd: str, *, show: Callable[[int, int, int], None],
+             show_shapes: Optional[Callable[[list], None]] = None) -> Tuple[str, bool]:
     """Handle one protocol line. Returns ``(reply, keep_running)``; ``reply`` empty ⇒
-    send nothing. ``show(r, g, b)`` paints a full-field patch. Pure of any socket/dogegen
-    detail so it is unit-testable."""
+    send nothing. ``show(r, g, b)`` paints a full-field patch; ``show_shapes(shapes)`` paints
+    an ordered rectangle list (``shapes …`` lines — Resolve transport only; ``None`` ⇒ the
+    command is refused). Pure of any socket/dogegen detail so it is unit-testable."""
     cmd = cmd.strip()
     if not cmd:
         return ("", True)
@@ -46,6 +69,15 @@ def dispatch(cmd: str, *, show: Callable[[int, int, int], None]) -> Tuple[str, b
         return ("pong", True)
     if cmd == "quit":
         return ("bye", False)
+    if cmd.split(None, 1)[0] == "shapes":
+        if show_shapes is None:
+            return ("err shapes unsupported on this transport (needs Resolve)", True)
+        try:
+            shapes = parse_shapes_command(cmd)
+        except ValueError as exc:
+            return (f"err {exc}", True)
+        show_shapes(shapes)
+        return ("ok", True)
     parts = cmd.split()
     if len(parts) == 3 and all(p.lstrip("-").isdigit() for p in parts):
         r, g, b = (int(p) for p in parts)
@@ -110,6 +142,8 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
         def show(r: int, g: int, b: int) -> None:
             rdg.show(r, g, b)
 
+        show_shapes = rdg.show_shapes
+
         def teardown() -> None:
             rdg.close()
     else:
@@ -119,6 +153,8 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
 
         def show(r: int, g: int, b: int) -> None:
             disp.send(proc, f"window {patch_size} {r} {g} {b}", settle_seconds=0.0)
+
+        show_shapes = None   # legacy stdin path has no multi-rect frame
 
         def teardown() -> None:
             try:
@@ -164,14 +200,22 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         try:
-                            reply, keep = dispatch(line.decode("ascii", "ignore"), show=show)
+                            reply, keep = dispatch(line.decode("ascii", "ignore"), show=show,
+                                                   show_shapes=show_shapes)
                         except OSError as exc:
                             # The dogegen child died (broken stdin pipe) — report it cleanly to the
                             # client instead of crashing the daemon, so the caller gets a clear error
                             # (not an empty ack) and the daemon stays up to accept a restart.
                             reply, keep = (f"err dogegen unavailable: {exc}", True)
                         if reply:
-                            conn.sendall((reply + "\n").encode("ascii"))
+                            try:
+                                conn.sendall((reply + "\n").encode("ascii"))
+                            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                                # Client closed between its command and our ack (HW-seen
+                                # 2026-09-10: a probe's final idle frame + immediate close took
+                                # the daemon down). Same policy as a recv failure: KEEP dogegen,
+                                # accept the next run.
+                                break
                         if not keep:
                             running = False
                             done = True

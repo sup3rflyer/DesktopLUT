@@ -34,6 +34,35 @@ from pathlib import Path
 from typing import Optional
 
 
+Shape = tuple[tuple[int, int, int], tuple[float, float, float, float]]
+"""One painted rectangle: ``((r, g, b), (x, y, cx, cy))`` — integer code values at the frame's
+bit depth, geometry normalized [0, 1]. Shapes paint in list order (later on top)."""
+
+FULL_FIELD: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+
+
+def _rect_xml(rgb: tuple[int, int, int], geometry: tuple[float, float, float, float], bits: int) -> str:
+    r, g, b = (int(v) for v in rgb)
+    x, y, cx, cy = (float(v) for v in geometry)
+    # Attribute order is deliberate — x/y BEFORE cx/cy (dogegen's getAttr substring hazard).
+    return (f'<rectangle><color red="{r}" green="{g}" blue="{b}" bits="{int(bits)}"/>'
+            f'<geometry x="{x:g}" y="{y:g}" cx="{cx:g}" cy="{cy:g}"/></rectangle>')
+
+
+def resolve_shapes_xml(shapes: list[Shape] | tuple[Shape, ...], *, bits: int = 10) -> bytes:
+    """Resolve calibration XML painting ``shapes`` in order (ASCII bytes, unframed).
+
+    dogegen draws rectangles sequentially, later on top, and does NOT clear the frame to
+    black on its own (HW-verified 2026-09-02: a lone windowed rect sits on garbage), so the
+    FIRST shape should normally be a full-field background — any level, not just black.
+    This is the general form behind :func:`resolve_patch_xml`; spatial probes (FALD leak /
+    halo profiles: a grey field + a bright window at an arbitrary position) use it directly."""
+    if not shapes:
+        raise ValueError("resolve_shapes_xml needs at least one shape")
+    body = "".join(_rect_xml(rgb, geo, bits) for rgb, geo in shapes)
+    return f"<calibration><shapes>{body}</shapes></calibration>".encode("ascii")
+
+
 def resolve_patch_xml(r: int, g: int, b: int, *, bits: int = 10,
                       geometry: Optional[tuple[float, float, float, float]] = None) -> bytes:
     """Resolve calibration XML for one patch (ASCII bytes, unframed).
@@ -52,20 +81,8 @@ def resolve_patch_xml(r: int, g: int, b: int, *, bits: int = 10,
         )
         return xml.encode("ascii")
     # Windowed patch — TWO rectangles, painter's order (HW-verified 2026-09-02 on the
-    # LG C6): dogegen draws rectangles sequentially, later on top, and does NOT clear
-    # the frame to black on its own (a lone windowed rect leaves garbage — a green
-    # field on the YCbCr link — behind it). So paint a full-field black background
-    # first, then the patch window.
-    x, y, cx, cy = (float(v) for v in geometry)
-    xml = (
-        "<calibration><shapes>"
-        f'<rectangle><color red="0" green="0" blue="0" bits="{int(bits)}"/>'
-        '<geometry x="0" y="0" cx="1" cy="1"/></rectangle>'
-        f'<rectangle><color red="{int(r)}" green="{int(g)}" blue="{int(b)}" bits="{int(bits)}"/>'
-        f'<geometry x="{x:g}" y="{y:g}" cx="{cx:g}" cy="{cy:g}"/></rectangle>'
-        "</shapes></calibration>"
-    )
-    return xml.encode("ascii")
+    # LG C6): full-field black background first, then the patch window.
+    return resolve_shapes_xml([((0, 0, 0), FULL_FIELD), ((r, g, b), tuple(geometry))], bits=bits)
 
 
 def frame(payload: bytes) -> bytes:
@@ -130,6 +147,14 @@ class ResolveDogegen:
             raise RuntimeError("ResolveDogegen is not started")
         self._conn.sendall(frame(resolve_patch_xml(r, g, b, bits=self.bits,
                                                    geometry=self.geometry)))
+
+    def show_shapes(self, shapes: list[Shape] | tuple[Shape, ...]) -> None:
+        """Paint an arbitrary ordered list of rectangles (see :func:`resolve_shapes_xml`).
+        Ignores the configured ``geometry`` — the caller owns the whole frame, background
+        included (put a full-field shape first)."""
+        if self._conn is None:
+            raise RuntimeError("ResolveDogegen is not started")
+        self._conn.sendall(frame(resolve_shapes_xml(shapes, bits=self.bits)))
 
     def close(self) -> None:
         """Tell dogegen to close (length 0), drop the sockets, and stop the process. Idempotent."""
