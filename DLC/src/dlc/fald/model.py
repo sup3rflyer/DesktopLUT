@@ -50,7 +50,8 @@ class FaldParams:
     # mean inside a SUPPRESSION box at (sup_box) px relative to the cell's top-left — content in the
     # cell's bottom-left quadrant (and the neighbours left/below) pulls the LED down by up to ~35 %)
     stat_kind: str = "winmax"
-    stat_gain: float = 3.73
+    stat_gain: float = 3.73               # used only when stat_area0_px2 == 0 (the rejected gain×mean form)
+    stat_area0_px2: float = 980.0         # area law: stat = mean(lit) × min(1, lit area / A0); 0 = off
     stat_cap: float = 1.185
     sup_strength: float = 0.346
     sup_box: tuple[float, float, float, float] = (-40.0, 40.0, 20.0, 67.5)   # x0, x1, y0, y1 (px)
@@ -186,10 +187,20 @@ class FaldModel:
         hs = drive_curve(1040 · h) and h = max over ``sup_window_px`` windows inside the suppression
         box of the window mean (as a fraction of white)."""
         p = self.p
-        # cell means
-        cells = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3).mean(axis=(2, 3))
-        d_pre = self._curve_ext(cells * p.stat_gain)
-        d_pre = np.minimum(d_pre, p.stat_cap)
+        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)
+        cells = blocks.mean(axis=(2, 3))
+        if p.stat_area0_px2 > 0:
+            # AREA law (agent fit 2026-09-10): stat = mean of the LIT pixels × min(1, lit area / A0).
+            # Any lit area ≥ A0 (≈ 33 px²) behaves as its mean (fields, big windows); slivers follow
+            # the √-area law through the drive curve. Replaces gain × cell-mean, which over-drove fields.
+            lit = blocks > p.drive_floor_nits
+            n_lit = lit.sum(axis=(2, 3))
+            l_lit = np.where(n_lit > 0, (blocks * lit).sum(axis=(2, 3)) / np.maximum(n_lit, 1), 0.0)
+            area_px2 = n_lit * (p.scale ** 2)
+            stat = l_lit * np.minimum(1.0, area_px2 / p.stat_area0_px2)
+        else:
+            stat = cells * p.stat_gain
+        d_pre = np.minimum(self._curve_ext(stat), p.stat_cap)
         # suppression: box-blur (sup_window) of the white-fraction image, then per cell the max over
         # the suppression box [x0,x1)×[y0,y1) px relative to the cell's top-left corner
         frac = s / p.white_nits
