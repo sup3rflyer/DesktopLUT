@@ -67,6 +67,7 @@ class FaldParams:
     aperture_px: float = 80.0
     drive_dim: float = 0.0                # relative drive at the dimmest curve point (fitted; a zero
                                           # meter read only bounds it, see review 2026-09-10 #6)
+    drive_gamma: float = 0.5              # power-law continuation below the first curve point
     # rendering
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
@@ -125,7 +126,11 @@ class FaldModel:
         xs = np.array([n for n, _ in self.p.drive_curve]); ys = np.array([d for _, d in self.p.drive_curve], dtype=float)
         ys[0] = max(ys[0], self.p.drive_dim)                  # dim end is a fitted parameter
         lx = np.log(np.maximum(s_nits, 1e-3))
-        d = np.interp(lx, np.log(xs), ys, left=0.0, right=ys[-1])
+        d = np.interp(lx, np.log(xs), ys, left=ys[0], right=ys[-1])
+        # below the first curve point: power-law continuation (model-free analysis 2026-09-10:
+        # the field's own drive scales ≈ L^0.5 down to 2 nits, it does not collapse)
+        below = s_nits < xs[0]
+        d = np.where(below, ys[0] * (np.maximum(s_nits, 1e-3) / xs[0]) ** self.p.drive_gamma, d)
         d = np.maximum(d, self.p.drive_min_gain * s_nits / self.p.white_nits)   # LCD can't exceed 100 %
         d = np.where(s_nits < self.p.drive_floor_nits, 0.0, np.minimum(d, 1.0))
         return d
