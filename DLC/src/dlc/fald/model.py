@@ -44,6 +44,17 @@ class FaldParams:
     blur_px: float = 32.0                 # statistic footprint (box)
     drive_curve: Sequence[tuple[float, float]] = field(default_factory=lambda: [
         (10.0, 0.0), (30.0, 0.17), (100.0, 0.24), (300.0, 0.47), (600.0, 0.73), (1000.0, 1.0)])
+    # statistic kind: "winmax" (max of in-cell sliding-window means, the original) or
+    # "mean_gain_switch" (fitted 2026-09-10 on all coverage data: cell MEAN × stat_gain through the
+    # drive curve, capped at stat_cap, then × (1 − sup_strength·h) where h is the max 10-px-window
+    # mean inside a SUPPRESSION box at (sup_box) px relative to the cell's top-left — content in the
+    # cell's bottom-left quadrant (and the neighbours left/below) pulls the LED down by up to ~35 %)
+    stat_kind: str = "winmax"
+    stat_gain: float = 3.73
+    stat_cap: float = 1.185
+    sup_strength: float = 0.346
+    sup_box: tuple[float, float, float, float] = (-40.0, 40.0, 20.0, 67.5)   # x0, x1, y0, y1 (px)
+    sup_window_px: float = 10.0
     drive_floor_nits: float = 0.5         # below this a cell is off (black)
     drive_min_gain: float = 1.1           # a cell always drives ≥ gain·L/white (LCD can't exceed 100 %)
     # spread: real kernel = (1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/tail_mm), isotropic in mm
@@ -147,6 +158,8 @@ class FaldModel:
         p = self.p
         s = np.max(img, axis=0)                               # brightest channel, requested nits
         s = np.minimum(s, p.white_nits)
+        if p.stat_kind == "mean_gain_switch":
+            return self._drives_mean_gain_switch(s)
         cells = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)   # (R, C, ch, cw)
         # integral image per cell with a zero border
         S = np.zeros((p.rows, p.cols, self.ch + 1, self.cw + 1))
@@ -166,6 +179,42 @@ class FaldModel:
         k0 = int(np.floor(kf)); f = kf - k0
         best = stat(k0) if f < 1e-6 else (1.0 - f) * stat(k0) + f * stat(k0 + 1)
         return self.drive_of(best)
+
+    def _drives_mean_gain_switch(self, s: np.ndarray) -> np.ndarray:
+        """Fitted statistic (2026-09-10, all coverage data to ≈5 % RMS): per cell
+        d_pre = min(cap, curve_ext(gain · cell-mean nits)); drive = min(1, d_pre · (1 − k·hs)) where
+        hs = drive_curve(1040 · h) and h = max over ``sup_window_px`` windows inside the suppression
+        box of the window mean (as a fraction of white)."""
+        p = self.p
+        # cell means
+        cells = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3).mean(axis=(2, 3))
+        d_pre = self._curve_ext(cells * p.stat_gain)
+        d_pre = np.minimum(d_pre, p.stat_cap)
+        # suppression: box-blur (sup_window) of the white-fraction image, then per cell the max over
+        # the suppression box [x0,x1)×[y0,y1) px relative to the cell's top-left corner
+        frac = s / p.white_nits
+        k = max(1, int(round(p.sup_window_px / p.scale)))
+        blur = self._box_blur(frac, k)
+        x0, x1, y0, y1 = (v / p.scale for v in p.sup_box)
+        ox0, ox1 = int(np.floor(x0)), int(np.ceil(x1)); oy0, oy1 = int(np.floor(y0)), int(np.ceil(y1))
+        padw = max(0, -ox0, ox1 - self.cw) + 1; padh = max(0, -oy0, oy1 - self.ch) + 1
+        bp = np.pad(blur, ((padh, padh), (padw, padw)), mode="constant")
+        h = np.zeros((p.rows, p.cols))
+        for r in range(p.rows):
+            ys = slice(padh + r * self.ch + oy0, padh + r * self.ch + oy1)
+            for c in range(p.cols):
+                xs = slice(padw + c * self.cw + ox0, padw + c * self.cw + ox1)
+                h[r, c] = bp[ys, xs].max()
+        hs = self.drive_of(np.minimum(h, 1.0) * p.white_nits)
+        d = d_pre * (1.0 - p.sup_strength * hs)
+        d = np.where(cells < p.drive_floor_nits, 0.0, np.clip(d, 0.0, 1.0))
+        return d
+
+    def _curve_ext(self, nits: np.ndarray) -> np.ndarray:
+        """Drive curve with a linear continuation above its last point (no clip; the cap clips)."""
+        xs = np.array([n for n, _ in self.p.drive_curve]); top = xs[-1]
+        d = self.drive_of(np.minimum(nits, top))
+        return np.where(nits > top, nits / top, d)
 
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
