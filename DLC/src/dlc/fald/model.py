@@ -79,6 +79,10 @@ class FaldParams:
                                           # in mm; 45/80 = isotropic in cells → shorter vertical reach)
     est_support_cells: int = 0            # >0: the estimate only sums cells within ±N cells in each axis
                                           # (a box support in CELL units: 4 cells = 320 px wide, 180 px tall)
+    est_cell: bool = False                # the monitor's map is computed at CELL resolution (one value per cell
+                                          # from cell-centre distances) and each pixel samples it at p + phase
+                                          # (native near-field staircase, doc §26/§27); False = pixel-domain kernel
+    est_interp: str = "nearest"           # cell map → pixels: "nearest" (blocky) or "bilinear" (between centres)
     # panel
     white_nits: float = 1842.0            # native full-field white at code 1023 (2026-09-11; 1040 was the stack's)
     chan_weights: tuple[float, float, float] = (0.305, 0.596, 0.099)   # R,G,B share of white
@@ -206,16 +210,16 @@ class FaldModel:
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
                  phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0,
-                 pnorm: float = 2.0):
+                 pnorm: float = 2.0, sub: Optional[int] = None):
         """Per-sub-offset kernels. ``kind``: "exp" (1/e = scale_mm), "gauss" (sigma = scale_mm),
         "mix" ((1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/scale_mm)). ``phase_mm`` shifts
         the SAMPLE point: the field is evaluated at (p + phase) and attributed to p."""
+        p = self.p
+        sub = p.sub if sub is None else int(sub)
         key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
-               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4))
+               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub)
         if key in self._kern_cache:
             return self._kern_cache[key]
-        p = self.p
-        sub = p.sub
         cwmm, chmm = p.cell_w * p.px_mm, p.cell_h * p.px_mm
         reach_c = int(np.ceil(7 * scale_mm / cwmm)) + 1
         reach_r = int(np.ceil(7 * scale_mm / chmm)) + 1
@@ -285,6 +289,8 @@ class FaldModel:
         p = self.p
         b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm)
         phase = (p.est_phase_px, p.est_phase_py)
+        if p.est_cell:
+            return b_true, self.backlight_cell(drives)
         if p.est_kind == "mix":
             b_est = self.backlight(drives, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase,
                                    p.est_aniso, p.est_support_cells)
@@ -292,6 +298,22 @@ class FaldModel:
             b_est = self.backlight(drives, p.est_kind, p.est_scale_mm, phase_px=phase, aniso=p.est_aniso,
                                    support_cells=p.est_support_cells)
         return b_true, b_est
+
+    def backlight_cell(self, drives: np.ndarray) -> np.ndarray:
+        """Cell-resolution estimate: E_c = Σ_c' d_c' k(centre_c − centre_c') (one kernel, no sub-cell
+        offsets), then every pixel reads the cell map at (p + phase) — nearest cell (blocky, the native
+        staircase) or bilinear between cell centres."""
+        p = self.p
+        kern = self._kernels(p.est_kind, p.est_scale_mm, p.est_core_mm, p.est_tail_frac, (0.0, 0.0),
+                             p.est_aniso, p.est_support_cells, 2.0, sub=1)[0][0]
+        E = fftconvolve(drives, kern, mode="same")                     # (rows, cols)
+        # pixel centres (reduced-res) shifted by the phase, in cell units
+        xs = ((np.arange(self.w) + 0.5) * p.scale + p.est_phase_px) / p.cell_w
+        ys = ((np.arange(self.h) + 0.5) * p.scale + p.est_phase_py) / p.cell_h
+        if p.est_interp == "nearest":
+            ix = np.clip(np.floor(xs).astype(int), 0, p.cols - 1); iy = np.clip(np.floor(ys).astype(int), 0, p.rows - 1)
+            return E[np.ix_(iy, ix)]
+        return _bilinear(E, ys - 0.5, xs - 0.5)                        # cell-centre coordinates
 
     def forward_img(self, img: np.ndarray) -> dict:
         """Forward model on a rendered request image ``img`` (3, h, w) of as-if-white nits."""

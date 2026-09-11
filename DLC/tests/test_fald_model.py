@@ -192,3 +192,22 @@ def test_kernel_pnorm_diamond_decays_faster_on_the_diagonal():
     # both kernels are normalised to unit integral (a lit field → B = 1), so compare SHAPES: at equal Euclidean
     # distance (240 px on axis vs 170,170 px diagonal) the L1 kernel puts relatively less light on the diagonal
     assert b1[diag] / b1[axial] < 0.8 * (b2[diag] / b2[axial])
+
+
+def test_cell_domain_estimate_is_one_on_fields_and_blocky_around_a_cell():
+    pn = FaldParams(est_cell=True, est_interp="nearest", est_scale_mm=13.0, est_phase_px=-18.0, est_phase_py=-24.0)
+    pb = FaldParams(est_cell=True, est_interp="bilinear", est_scale_mm=13.0)
+    for p in (pn, pb):
+        m = FaldModel(p)
+        f = m.forward([((700, 700, 700), FULL)])
+        inner = (slice(150, 280), slice(250, 520))                          # the true tail reaches ~7 cells in
+        assert np.allclose(f["b_est"][inner], f["b_true"][inner], atol=2e-3)  # a uniform field: estimate = truth
+        y = m.meter_y([((307, 307, 307), FULL)], METER)
+        assert abs(y - 10.0) < 0.5                                            # uniform grey reproduced
+    m = FaldModel(pn)
+    f = m.forward([((0, 0, 0), FULL), (WHITE, rect(2080, 1080, 80, 45))])
+    row = f["b_est"][int(1102.5 / 5)]                                        # the meter row, all columns
+    # nearest sampling: piecewise constant across each 80-px cell (16 reduced px), steps only at boundaries
+    span = row[int(1760 / 5):int(2000 / 5)]                                 # three cells (the steps sit 18 px
+    vals = np.unique(np.round(span, 9))                                     # right of the boundaries: the phase)
+    assert 3 <= len(vals) <= 4 and np.all(np.diff(vals) > 0)
