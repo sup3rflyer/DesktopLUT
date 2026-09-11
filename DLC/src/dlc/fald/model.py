@@ -51,7 +51,8 @@ class FaldParams:
     # left/below, the SUPPRESSION box sup_box in px from the cell's top-left) pulls the LED down by
     # up to sup_strength; a fully lit cell in a lit field then sits at stat_cap·(1−sup_strength) = 0.76
     # of the LED maximum and an unsuppressed sliver can reach 1/0.76 = 1.32× the field level (HW 1.30).
-    stat_kind: str = "winmax"
+    stat_kind: str = "winmax"             # "winmax" | "area" (min(peak, Σ nits·px²/A0) → curve; single-cell
+                                          # coverage law, HW §15/§20, no box) | "area_switch" (legacy, with the box)
     stat_window: bool = False             # area_switch ceiling = winmax window mean instead of the peak px
     stat_area0_px2: float = 1199.0        # area law: stat = mean(lit px) × min(1, lit area / A0)   (fit 2026-09-11)
     stat_cap: float = 1.114               # LED headroom above the measured curve (harness "cap")
@@ -62,7 +63,8 @@ class FaldParams:
     # CODE at pixels (lattice_px·k + phase); a cell whose lattice pixel carries near-peak code is held at
     # the normal (full-white) drive, otherwise the LED may use lattice_boost headroom (PA32UCXR: 0.30,
     # i.e. an isolated white half-cell drives 1.30× the whole cell). lattice_boost = 0 disables it.
-    lattice_boost: float = 0.0
+    lattice_boost: float = 0.0            # headroom at saturation (HW 0.30)
+    lattice_boost_small: float = 0.0      # headroom below saturation (HW 0.45 at 180-900 px²); 0 = use lattice_boost
     lattice_px: float = 48.0
     lattice_phase_px: tuple[float, float] = (0.0, 0.0)
     lattice_ramp: Sequence[tuple[float, float]] = field(default_factory=lambda: [   # (10-bit code, weight)
@@ -181,6 +183,8 @@ class FaldModel:
             d = self._drives_area_switch(s)
         elif p.stat_kind == "winmax":
             d = self.drive_of(self._winmax_stat(s))
+        elif p.stat_kind == "area":
+            d = self.drive_of(self._area_stat(s))
         else:
             raise ValueError(f"unknown stat_kind {p.stat_kind!r}")
         if p.lattice_boost > 0:
@@ -236,12 +240,31 @@ class FaldModel:
                 cx = np.clip(np.floor((lx + ex) / p.cell_w).astype(int), 0, p.cols - 1)
                 cy = np.clip(np.floor((ly + ey) / p.cell_h).astype(int), 0, p.rows - 1)
                 np.maximum.at(w_cell, (np.repeat(cy, len(cx)), np.tile(cx, len(cy))), samp.ravel())
-        # reference = the code of the cell's own winmax statistic (NOT its peak code: a white 10-px
-        # dot in a code-700 cell must not fire 1.30 on the whole cell — review #4); a uniform field
-        # then has w_ref = w_cell → factor 1, a white half-cell has w_ref = 1, w_cell = 0 → 1 + b.
-        w_ref = self._ramp(self._winmax_stat(code))
-        b = p.lattice_boost
+        # reference = the cell's PEAK requested code: every white-on-black pattern measured (§15, §17,
+        # §20: whole 1.0, half 1.30, off-sample 400 px² 1.45×, on-sample 1.0×) has the curve value
+        # c(area-law stat) as its LIMITED state, so the reference state of near-peak content is S; a
+        # uniform field has w_ref = w_cell → factor 1. UNMEASURED: a code-700 cell with a white dot off
+        # its sample (this rule fires 1.30 there; the statistic-code rule would not) — in the HW matrix.
+        w_ref = self._ramp(code.reshape(p.rows, self.ch, p.cols, self.cw).max(axis=(1, 3)))
+        # HW: boosted/normal = 1.45 below saturation, 1.30 at it (B = min(1.30, 1.45·S) in units of the
+        # normal full-cell drive) → per-cell headroom b(S) = min(1 + b_sat, (1 + b_small)·S)/S − 1
+        b_sat = p.lattice_boost; b_small = p.lattice_boost_small if p.lattice_boost_small > 0 else b_sat
+        s_norm = np.clip(self.drive_of(self._stat(np.minimum(s_req, p.white_nits))), 1e-6, None)   # clip BEFORE the stat
+        b = np.minimum(1.0 + b_sat, (1.0 + b_small) * s_norm) / s_norm - 1.0
         return (1.0 + b * (1.0 - w_cell)) / (1.0 + b * (1.0 - w_ref))
+
+    def _area_stat(self, s: np.ndarray) -> np.ndarray:
+        """Single-cell coverage law without any box: stat = min(brightest lit px, Σ lit nits·px² / A0) —
+        level × min(1, area/A0) on one level, the level on a uniform field, monotone in the image."""
+        p = self.p
+        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)
+        lit = blocks > p.drive_floor_nits
+        peak = (blocks * lit).max(axis=(2, 3))
+        tot = (blocks * lit).sum(axis=(2, 3)) * float(p.scale ** 2)
+        return np.minimum(peak, tot / p.stat_area0_px2)
+
+    def _stat(self, s: np.ndarray) -> np.ndarray:
+        return self._area_stat(s) if self.p.stat_kind == "area" else self._winmax_stat(s)
 
     def _winmax_stat(self, s: np.ndarray) -> np.ndarray:
         """Max over sliding windows (footprint ``blur_px``, fractional) inside each cell of the window

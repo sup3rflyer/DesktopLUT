@@ -280,10 +280,44 @@ def test_lattice_geometry_pinned_by_strips_and_the_top_half():
     assert abs(f(1120, 1774, 80, 4) / f(1120, 1778, 80, 4) - 1 / 1.30) < 1e-6
 
 
-def test_lattice_reference_is_the_statistic_not_the_peak():
-    # a white 10-px dot OFF the lattice pixel inside a code-700 cell leaves the cell in the boosted
-    # state it already had (the measured curve contains it) → no extra 1.30 (review #4)
-    p = FaldParams(lattice_boost=0.30); p0 = FaldParams(lattice_boost=0.0)
+def test_lattice_reference_is_the_peak_code():
+    # near-peak content's reference state is S (limited): a white 400 px² square OFF its sample is
+    # 1.45× its on-sample twin; sub-peak content (code 690 whole vs half) has no boost at all.
+    p = FaldParams(lattice_boost=0.30, lattice_boost_small=0.45); p0 = FaldParams()
+    black = ((0, 0, 0), FULL)
     cell = (39, 14)
-    shapes = [((0, 0, 0), FULL), ((700, 700, 700), rect(1120, 1755, 80, 45)), (WHITE, rect(1180, 1785, 10, 10))]
-    assert abs(_drives(p, shapes)[cell] / _drives(p0, shapes)[cell] - 1.0) < 1e-6
+    def f(shapes):
+        return _drives(p, shapes)[cell] / _drives(p0, shapes)[cell]
+    assert abs(f([black, (WHITE, rect(1160, 1778, 20, 20))]) / f([black, (WHITE, rect(1142, 1766, 20, 20))]) - 1.45) < 1e-6
+    for shape in (rect(1120, 1755, 80, 45), rect(1160, 1755, 40, 45)):
+        assert abs(f([black, ((690,) * 3, shape)]) - 1.0) < 1e-9
+
+
+def test_area_stat_equals_level_on_uniform_fields_and_follows_the_area_law():
+    pw = FaldParams(stat_kind="winmax"); pa = FaldParams(stat_kind="area")
+    for code in (307, 700, 1023):
+        assert np.allclose(_drives(pw, [((code,) * 3, FULL)]), _drives(pa, [((code,) * 3, FULL)]), atol=1e-9)
+    black = ((0, 0, 0), FULL)
+    cell = (39, 14)
+    whole = _drives(pa, [black, (WHITE, rect(1120, 1755, 80, 45))])[cell]
+    strip = _drives(pa, [black, (WHITE, rect(1120, 1778, 80, 5))])[cell]       # 400 px², no lattice px
+    square = _drives(pa, [black, (WHITE, rect(1160, 1778, 20, 20))])[cell]     # 400 px², no lattice px
+    assert abs(whole - 1.0) < 1e-9 and abs(strip - square) < 1e-6              # area law: shape-independent
+    assert 0.40 < square < 0.60                                                # HW normal state 0.51 (A0 ≈ 1200-1350)
+
+
+def test_lattice_area_dependent_headroom():
+    # B = min(1.30, 1.45·S): a 400 px² boosted square is 1.45× its normal state, a half cell 1.30×
+    p = FaldParams(stat_kind="area", lattice_boost=0.30, lattice_boost_small=0.45)
+    p0 = FaldParams(stat_kind="area")
+    black = ((0, 0, 0), FULL)
+    cell = (39, 14)
+    def f(x, y, w, h):
+        sh = [black, (WHITE, rect(x, y, w, h))]
+        return _drives(p, sh)[cell] / _drives(p0, sh)[cell]
+    assert abs(f(1160, 1778, 20, 20) - 1.45) < 1e-6      # off-sample small square: boosted, below saturation
+    assert abs(f(1160, 1755, 40, 45) - 1.30) < 1e-6      # off-sample half cell: boosted at saturation
+    assert abs(f(1120, 1755, 80, 45) - 1.00) < 1e-6      # whole cell: limited
+    assert abs(f(1142, 1766, 20, 20) - 1.00) < 1e-6      # on-sample small square: limited
+    for code in (307, 850, 1023):                        # fields unchanged
+        assert np.allclose(_drives(p, [((code,) * 3, FULL)]), _drives(p0, [((code,) * 3, FULL)]), rtol=1e-9)
