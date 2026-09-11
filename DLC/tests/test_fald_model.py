@@ -162,3 +162,18 @@ def test_area_statistic_is_shape_independent_and_matches_winmax_on_fields():
     d = lambda x, y, w, h: m.cell_drives(m.render([black, (WHITE, rect(x, y, w, h))]))[cell]
     a, b, c = d(2120, 1100, 40, 10), d(2140, 1095, 20, 20), d(2150, 1085, 10, 40)
     assert abs(a - b) < 1e-9 and abs(b - c) < 1e-9 and 0 < a < d(2080, 1080, 80, 45)
+
+
+def test_area_win_statistic_bounds():
+    # min(winmax, area): equals both on uniform fields; ≤ each of them everywhere; on 20/20 px stripes at
+    # 40 nits it follows the window mean (≈ 20 nits), not the area law (40 nits)
+    pw, pa, ph = (FaldParams(stat_kind=k) for k in ("winmax", "area", "area_win"))
+    mw, ma, mh = FaldModel(pw), FaldModel(pa), FaldModel(ph)
+    field = [((520, 520, 520), FULL)]
+    assert np.allclose(mh.cell_drives(mh.render(field)), mw.cell_drives(mw.render(field)), atol=1e-9)
+    c40 = 466                                              # ≈ 40 nits
+    stripes = [((0, 0, 0), FULL)] + [((c40, c40, c40), rect(0, y, 3840, 20)) for y in range(0, 2160, 40)]
+    img = mh.render(stripes)
+    dh, dw, da = mh.cell_drives(img), mw.cell_drives(mw.render(stripes)), ma.cell_drives(ma.render(stripes))
+    assert np.all(dh <= dw + 1e-12) and np.all(dh <= da + 1e-12)
+    assert abs(dh[24, 24] - dw[24, 24]) < 1e-9 and da[24, 24] > dh[24, 24] * 1.1

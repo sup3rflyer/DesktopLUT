@@ -47,6 +47,9 @@ class FaldParams:
     # NATIVE single-cell law (2026-09-11, doc §22: the sliver matrix on clean data depends on AREA only —
     # 40×10 = 20×20 = 10×40 to 0.5 %): stat_kind "area" = min(brightest lit px, Σ lit nits·px² / stat_area0_px2),
     # i.e. level × min(1, area/A0) on one level and the level itself on a uniform field. "winmax" = the original.
+    # "area_win" = min(winmax window mean, Σ/A0): the area law governs small contiguous content, the
+    # window mean governs fine texture (native stripes 20/20 px read like their mean; a pure area law
+    # over-drives them 14 %).
     stat_kind: str = "winmax"
     stat_area0_px2: float = 1150.0
     # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
@@ -158,6 +161,8 @@ class FaldModel:
         s = np.minimum(np.max(img, axis=0), p.white_nits)      # brightest channel, requested nits
         if p.stat_kind == "area":
             return self.drive_of(self._area_stat(s))
+        if p.stat_kind == "area_win":
+            return self.drive_of(np.minimum(self._winmax_stat(s), self._area_stat(s)))
         if p.stat_kind != "winmax":
             raise ValueError(f"unknown stat_kind {p.stat_kind!r}")
         return self.drive_of(self._winmax_stat(s))
