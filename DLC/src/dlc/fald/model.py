@@ -44,8 +44,11 @@ class FaldParams:
     # window mean. (2026-09-11: the coverage-law / sample-grid variants modelled DesktopLUT's dynamic
     # tonemap sampler, not the panel — removed; doc §21.)
     blur_px: float = 32.0                 # statistic footprint (box)
+    # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
+    # to code 1023 = 1842 nits). The 2026-09-10 curve had the same shape but was normalised to 1000 nits
+    # because the DesktopLUT stack showed code 1023 at ≈ 1000 nits.
     drive_curve: Sequence[tuple[float, float]] = field(default_factory=lambda: [
-        (10.0, 0.0), (30.0, 0.17), (100.0, 0.24), (300.0, 0.47), (600.0, 0.73), (1000.0, 1.0)])
+        (10.0, 0.0), (30.0, 0.131), (100.0, 0.180), (300.0, 0.362), (600.0, 0.544), (1000.0, 0.745), (1842.0, 1.0)])
     drive_floor_nits: float = 0.5         # below this a cell is off (black)
     drive_min_gain: float = 1.1           # a cell always drives ≥ gain·L/white (LCD can't exceed 100 %)
     # spread: real kernel = (1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/tail_mm), isotropic in mm
@@ -66,7 +69,7 @@ class FaldParams:
     est_support_cells: int = 0            # >0: the estimate only sums cells within ±N cells in each axis
                                           # (a box support in CELL units: 4 cells = 320 px wide, 180 px tall)
     # panel
-    white_nits: float = 1040.0            # white at full drive, full transmittance (as measured)
+    white_nits: float = 1842.0            # native full-field white at code 1023 (2026-09-11; 1040 was the stack's)
     chan_weights: tuple[float, float, float] = (0.305, 0.596, 0.099)   # R,G,B share of white
     tmin: float = 3.0e-4                  # closed-LCD transmittance (pedestal = Lmax·B·tmin)
     # meter
