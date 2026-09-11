@@ -27,7 +27,7 @@ from typing import Optional, Sequence
 import numpy as np
 from scipy.signal import fftconvolve
 
-from dlc._pq import eotf_norm
+from dlc._pq import eotf_norm, oetf_norm
 
 Shape = tuple[tuple[int, int, int], tuple[float, float, float, float]]
 
@@ -58,6 +58,15 @@ class FaldParams:
     sup_strength: float = 0.319
     sup_box: tuple[float, float, float, float] = (-40.0, 40.0, 20.0, 67.5)   # x0, x1, y0, y1 (px)
     sup_window_px: float = 10.0
+    # coarse sample lattice + peak limiter (HW 2026-09-11, doc §20): the firmware samples the requested
+    # CODE at pixels (lattice_px·k + phase); a cell whose lattice pixel carries near-peak code is held at
+    # the normal (full-white) drive, otherwise the LED may use lattice_boost headroom (PA32UCXR: 0.30,
+    # i.e. an isolated white half-cell drives 1.30× the whole cell). lattice_boost = 0 disables it.
+    lattice_boost: float = 0.0
+    lattice_px: float = 48.0
+    lattice_phase_px: tuple[float, float] = (0.0, 0.0)
+    lattice_ramp: Sequence[tuple[float, float]] = field(default_factory=lambda: [   # (10-bit code, weight)
+        (800.0, 0.0), (850.0, 0.23), (900.0, 0.62), (950.0, 0.79), (1000.0, 0.95), (1023.0, 1.0)])
     drive_floor_nits: float = 0.5         # below this a cell is off (black)
     drive_min_gain: float = 1.1           # a cell always drives ≥ gain·L/white (LCD can't exceed 100 %)
     # spread: real kernel = (1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/tail_mm), isotropic in mm
@@ -159,13 +168,53 @@ class FaldModel:
         nothing leaks across a cell boundary (HW: a window whose edge sits exactly on a boundary
         does not drive the next cell at all)."""
         p = self.p
-        s = np.max(img, axis=0)                               # brightest channel, requested nits
-        s = np.minimum(s, p.white_nits)
+        s_req = np.max(img, axis=0)                           # brightest channel, requested nits (unclipped)
+        s = np.minimum(s_req, p.white_nits)
         if p.stat_kind == "area_switch":
-            return self._drives_area_switch(s)
-        if p.stat_kind != "winmax":
+            d = self._drives_area_switch(s)
+        elif p.stat_kind == "winmax":
+            d = self.drive_of(self._winmax_stat(s))
+        else:
             raise ValueError(f"unknown stat_kind {p.stat_kind!r}")
-        return self.drive_of(self._winmax_stat(s))
+        if p.lattice_boost > 0:
+            d = d * self.lattice_factor(s_req)
+        return d
+
+    # ------------------------------------------------------------------ coarse lattice / peak limiter
+    def _ramp(self, code: np.ndarray) -> np.ndarray:
+        xs = np.array([c for c, _ in self.p.lattice_ramp]); ys = np.array([w for _, w in self.p.lattice_ramp])
+        return np.interp(code, xs, ys, left=ys[0], right=ys[-1])
+
+    def lattice_factor(self, s_req: np.ndarray) -> np.ndarray:
+        """Per-cell factor (1 + b·(1 − w_cell)) / (1 + b·(1 − w_ref)): w_cell = the detector weight of the
+        brightest requested code at the lattice pixels whose coarse block overlaps the cell, w_ref = the
+        weight of the cell's own peak code. A uniform
+        field has w_cell = w_ref → factor 1 (the measured drive curve already contains the limiter's state);
+        a near-peak highlight that misses every lattice pixel of its cell drives 1 + b times more (HW 1.30)."""
+        p = self.p
+        code = 1023.0 * np.vectorize(oetf_norm)(np.clip(s_req / 10000.0, 0.0, 1.0))
+        # lattice pixels (full-res) → reduced-res samples → per-cell max weight
+        kx = np.arange(int(np.ceil(-p.lattice_phase_px[0] / p.lattice_px)), int(p.width // p.lattice_px) + 1)
+        ky = np.arange(int(np.ceil(-p.lattice_phase_px[1] / p.lattice_px)), int(p.height // p.lattice_px) + 1)
+        lx = p.lattice_px * kx + p.lattice_phase_px[0]; ly = p.lattice_px * ky + p.lattice_phase_px[1]
+        lx = lx[(lx >= 0) & (lx < p.width)]; ly = ly[(ly >= 0) & (ly < p.height)]
+        ix = np.floor(lx / p.scale).astype(int); iy = np.floor(ly / p.scale).astype(int)
+        samp = self._ramp(code[np.ix_(iy, ix)])                              # (len(ly), len(lx))
+        # each sample governs every LED cell its 48×48 BLOCK overlaps (the sample pixel itself may lie
+        # just outside the cell: row 31's sample sits 3 px above it — dark on black → boosted, as HW
+        # measured; lit on a field → no boost, so uniform fields stay band-free). Cross-cell coupling
+        # (white at a neighbour cell's pixel limiting this LED) is the model's prediction, untested.
+        L = p.lattice_px
+        w_cell = np.zeros((p.rows, p.cols))
+        for ex in (0.0, L - 1e-6):
+            for ey in (0.0, L - 1e-6):
+                cx = np.clip(np.floor((lx + ex) / p.cell_w).astype(int), 0, p.cols - 1)
+                cy = np.clip(np.floor((ly + ey) / p.cell_h).astype(int), 0, p.rows - 1)
+                np.maximum.at(w_cell, (np.repeat(cy, len(cx)), np.tile(cx, len(cy))), samp.ravel())
+        blocks = code.reshape(p.rows, self.ch, p.cols, self.cw)
+        w_ref = self._ramp(blocks.max(axis=(1, 3)))
+        b = p.lattice_boost
+        return (1.0 + b * (1.0 - w_cell)) / (1.0 + b * (1.0 - w_ref))
 
     def _winmax_stat(self, s: np.ndarray) -> np.ndarray:
         """Max over sliding windows (footprint ``blur_px``, fractional) inside each cell of the window

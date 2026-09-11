@@ -223,3 +223,37 @@ def test_area_switch_suppression_box_geometry():
     assert abs(d(sliver, rect(2000, 1105, 20, 15)) / whole - 1.32) < 0.03     # left neighbour, outside
     assert abs(d(sliver, rect(2100, 1130, 20, 10)) / whole - 1.00) < 0.03     # cell below, in the box
     assert abs(d(sliver, rect(2100, 1160, 20, 10)) / whole - 1.32) < 0.03     # cell below, outside
+
+
+# ---------------------------------------------------------------- coarse lattice / peak limiter (doc §20)
+def test_lattice_factor_is_one_on_uniform_fields():
+    p0 = FaldParams(lattice_boost=0.0); p1 = FaldParams(lattice_boost=0.30)
+    for code in (307, 700, 850, 950, 1023):
+        d0 = _drives(p0, [((code,) * 3, FULL)]); d1 = _drives(p1, [((code,) * 3, FULL)])
+        assert np.allclose(d0, d1, rtol=1e-9), code
+
+
+def test_lattice_white_half_cell_drives_1p3_times_the_whole_cell():
+    # HW 2026-09-11: cell (14,39) x 1120-1200 y 1755-1800 holds the lattice pixel (1152,1776); the right
+    # half misses it → 1.30× the whole cell; the left half covers it → same as the whole cell.
+    p = FaldParams(lattice_boost=0.30)
+    black = ((0, 0, 0), FULL)
+    cell = (39, 14)
+    whole = _drives(p, [black, (WHITE, rect(1120, 1755, 80, 45))])[cell]
+    right = _drives(p, [black, (WHITE, rect(1160, 1755, 40, 45))])[cell]
+    left = _drives(p, [black, (WHITE, rect(1120, 1755, 40, 45))])[cell]
+    assert abs(whole - 1.0) < 1e-9
+    assert abs(right / whole - 1.30) < 1e-6 and abs(left / whole - 1.0) < 1e-6
+
+
+def test_lattice_free_row_31_is_boosted_and_sub_peak_content_is_not_limited():
+    p = FaldParams(lattice_boost=0.30)
+    black = ((0, 0, 0), FULL)
+    # row 31 (y 1395-1440) holds no lattice pixel → the whole cell itself sits in the boosted state
+    whole31 = _drives(p, [black, (WHITE, rect(1120, 1395, 80, 45))])[31, 14]
+    whole39 = _drives(p, [black, (WHITE, rect(1120, 1755, 80, 45))])[39, 14]
+    assert abs(whole31 / whole39 - 1.30) < 1e-6
+    # a code-690 (≈300 nit) whole cell vs half: both below the detector's ramp → same factor as the field curve
+    p0 = FaldParams(lattice_boost=0.0)
+    for shape in (rect(1120, 1755, 80, 45), rect(1160, 1755, 40, 45)):
+        assert abs(_drives(p, [black, ((690,) * 3, shape)])[39, 14] - _drives(p0, [black, ((690,) * 3, shape)])[39, 14]) < 1e-9
