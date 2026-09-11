@@ -64,6 +64,8 @@ class FaldParams:
     core_mm: float = 6.0
     tail_mm: float = 24.0
     tail_frac: float = 0.3
+    kernel_pnorm: float = 2.0             # distance metric of the TRUE kernel: 2 = radial (Euclidean), 1 = L1
+                                          # "diamond" (native diagonal leaks fall faster than radial, doc §27)
     est_kind: str = "exp"                 # monitor's assumed kernel: "exp" | "gauss" | "mix"
     est_scale_mm: float = 24.0            # its 1/e length (exp) or sigma (gauss)
     est_core_mm: float = 6.0              # "mix": own core / tail / fraction
@@ -203,12 +205,13 @@ class FaldModel:
 
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
-                 phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0):
+                 phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0,
+                 pnorm: float = 2.0):
         """Per-sub-offset kernels. ``kind``: "exp" (1/e = scale_mm), "gauss" (sigma = scale_mm),
         "mix" ((1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/scale_mm)). ``phase_mm`` shifts
         the SAMPLE point: the field is evaluated at (p + phase) and attributed to p."""
         key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
-               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells))
+               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4))
         if key in self._kern_cache:
             return self._kern_cache[key]
         p = self.p
@@ -230,7 +233,11 @@ class FaldModel:
                 # +phase adds phase to it.
                 dx = (ii[None, :] + (ox + 0.5) / sub - 0.5) * cwmm + phase_mm[0]
                 dy = (jj[:, None] + (oy + 0.5) / sub - 0.5) * chmm + phase_mm[1]
-                d = np.sqrt(dx * dx + (dy / max(aniso, 1e-3)) ** 2)   # aniso < 1: shorter vertical reach
+                dya = dy / max(aniso, 1e-3)                            # aniso < 1: shorter vertical reach
+                if abs(pnorm - 2.0) < 1e-9:
+                    d = np.sqrt(dx * dx + dya * dya)
+                else:                                                  # p-norm distance: p=1 → diamond
+                    d = (np.abs(dx) ** pnorm + np.abs(dya) ** pnorm) ** (1.0 / pnorm)
                 if kind == "exp":
                     k = np.exp(-d / scale_mm)
                 elif kind == "gauss":
@@ -254,11 +261,11 @@ class FaldModel:
     def backlight(self, drives: np.ndarray, kind: str, scale_mm: float,
                   core_mm: float = 0.0, tail_frac: float = 0.0,
                   phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
-                  support_cells: int = 0) -> np.ndarray:
+                  support_cells: int = 0, pnorm: float = 2.0) -> np.ndarray:
         """B on the reduced-res pixel grid (h, w), from cell drives (rows, cols)."""
         p = self.p
         kern = self._kernels(kind, scale_mm, core_mm, tail_frac,
-                             (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm), aniso, support_cells)
+                             (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm), aniso, support_cells, pnorm)
         sub = p.sub
         fine = np.zeros((p.rows * sub, p.cols * sub))
         for oy in range(sub):
@@ -276,7 +283,7 @@ class FaldModel:
     def backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map."""
         p = self.p
-        b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac)
+        b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm)
         phase = (p.est_phase_px, p.est_phase_py)
         if p.est_kind == "mix":
             b_est = self.backlight(drives, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase,

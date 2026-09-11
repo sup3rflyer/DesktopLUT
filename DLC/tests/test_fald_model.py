@@ -177,3 +177,18 @@ def test_area_win_statistic_bounds():
     dh, dw, da = mh.cell_drives(img), mw.cell_drives(mw.render(stripes)), ma.cell_drives(ma.render(stripes))
     assert np.all(dh <= dw + 1e-12) and np.all(dh <= da + 1e-12)
     assert abs(dh[24, 24] - dw[24, 24]) < 1e-9 and da[24, 24] > dh[24, 24] * 1.1
+
+
+def test_kernel_pnorm_diamond_decays_faster_on_the_diagonal():
+    # p = 2 reproduces the radial kernel exactly; p = 1 (L1) gives the same on-axis leak but less on the diagonal
+    p2 = FaldParams(kernel_pnorm=2.0); p1 = FaldParams(kernel_pnorm=1.0); pd = FaldParams()
+    m2, m1, md = FaldModel(p2), FaldModel(p1), FaldModel(pd)
+    black = ((0, 0, 0), FULL)
+    src = [black, (WHITE, rect(2080, 1080, 80, 45))]                # cell (26,24)
+    assert np.allclose(m2.forward(src)["b_true"], md.forward(src)["b_true"])
+    b2, b1 = m2.forward(src)["b_true"], m1.forward(src)["b_true"]
+    m = FaldModel(pd)
+    axial = (int(1102.5 / 5), int((2120 + 240) / 5)); diag = (int((1102.5 + 170) / 5), int((2120 + 170) / 5))
+    # both kernels are normalised to unit integral (a lit field → B = 1), so compare SHAPES: at equal Euclidean
+    # distance (240 px on axis vs 170,170 px diagonal) the L1 kernel puts relatively less light on the diagonal
+    assert b1[diag] / b1[axial] < 0.8 * (b2[diag] / b2[axial])
