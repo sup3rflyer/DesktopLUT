@@ -50,7 +50,8 @@ class FaldParams:
     # "area_win" = min(winmax window mean, Σ/A0): the area law governs small contiguous content, the
     # window mean governs fine texture (native stripes 20/20 px read like their mean; a pure area law
     # over-drives them 14 %).
-    stat_kind: str = "winmax"
+    stat_kind: str = "area"               # native verdict 2026-09-11 (doc §24): area best on every absolute set,
+                                          # superposition and slivers; winmax only wins on 20-px periodic stripes
     stat_area0_px2: float = 1150.0
     # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
     # to code 1023 = 1842 nits). The 2026-09-10 curve had the same shape but was normalised to 1000 nits
