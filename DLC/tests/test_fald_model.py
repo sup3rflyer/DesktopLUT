@@ -155,7 +155,7 @@ def test_correction_removes_the_ring_in_the_model():
 # ---------------------------------------------------------------- area_switch drive statistic
 def _drives(p: FaldParams, shapes):
     m = FaldModel(p)
-    return m.cell_drives(m.render(shapes))
+    return m.cell_drives(m.render(shapes), m.lattice_codes(shapes))
 
 
 def test_area_switch_equals_winmax_on_uniform_fields():
@@ -257,3 +257,33 @@ def test_lattice_free_row_31_is_boosted_and_sub_peak_content_is_not_limited():
     p0 = FaldParams(lattice_boost=0.0)
     for shape in (rect(1120, 1755, 80, 45), rect(1160, 1755, 40, 45)):
         assert abs(_drives(p, [black, ((690,) * 3, shape)])[39, 14] - _drives(p0, [black, ((690,) * 3, shape)])[39, 14]) < 1e-9
+
+
+def test_lattice_geometry_pinned_by_strips_and_the_top_half():
+    # review 2026-09-11: the 1/5 render loses the sample row at 1776 for a half ending at 1777; exact
+    # lattice codes fix it. Strips 4 px either side of the pixel pin the phase to ±2 px.
+    p = FaldParams(lattice_boost=0.30); p0 = FaldParams(lattice_boost=0.0)
+    black = ((0, 0, 0), FULL)
+    cell = (39, 14)
+    def d(x, y, w, h):
+        return _drives(p, [black, (WHITE, rect(x, y, w, h))])[cell]
+    def f(x, y, w, h):                                            # the lattice factor alone
+        return d(x, y, w, h) / _drives(p0, [black, (WHITE, rect(x, y, w, h))])[cell]
+    # HW pins the RATIO limited/boosted = 1/1.30 between a pattern covering the sample and the same
+    # pattern shifted off it (the absolute level of thin content is the statistic's business — winmax
+    # under-reads a 22-px white strip, a separate known residual)
+    assert abs(f(1120, 1755, 80, 45) - 1.00) < 1e-6                              # whole cell → limited
+    assert abs(f(1120, 1755, 80, 22) / f(1120, 1778, 80, 22) - 1 / 1.30) < 1e-6  # top (covers 1776) vs bottom
+    assert abs(f(1150, 1755, 4, 45) / f(1146, 1755, 4, 45) - 1 / 1.30) < 1e-6    # x strips 1150-1154 vs 1146-1150
+    assert abs(f(1150, 1755, 4, 45) / f(1154, 1755, 4, 45) - 1 / 1.30) < 1e-6
+    assert abs(f(1120, 1774, 80, 4) / f(1120, 1770, 80, 4) - 1 / 1.30) < 1e-6    # y strips 1774-1778 vs 1770-1774
+    assert abs(f(1120, 1774, 80, 4) / f(1120, 1778, 80, 4) - 1 / 1.30) < 1e-6
+
+
+def test_lattice_reference_is_the_statistic_not_the_peak():
+    # a white 10-px dot OFF the lattice pixel inside a code-700 cell leaves the cell in the boosted
+    # state it already had (the measured curve contains it) → no extra 1.30 (review #4)
+    p = FaldParams(lattice_boost=0.30); p0 = FaldParams(lattice_boost=0.0)
+    cell = (39, 14)
+    shapes = [((0, 0, 0), FULL), ((700, 700, 700), rect(1120, 1755, 80, 45)), (WHITE, rect(1180, 1785, 10, 10))]
+    assert abs(_drives(p, shapes)[cell] / _drives(p0, shapes)[cell] - 1.0) < 1e-6

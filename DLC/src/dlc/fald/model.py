@@ -27,7 +27,7 @@ from typing import Optional, Sequence
 import numpy as np
 from scipy.signal import fftconvolve
 
-from dlc._pq import eotf_norm, oetf_norm
+from dlc._pq import eotf_norm
 
 Shape = tuple[tuple[int, int, int], tuple[float, float, float, float]]
 
@@ -108,6 +108,13 @@ class FaldParams:
         return self.height / self.rows
 
 
+def _oetf_code(nits: np.ndarray, bits: int = 10) -> np.ndarray:
+    """PQ OETF, vectorised: as-if-white nits → 10-bit code (clipped at the container)."""
+    y = np.clip(np.asarray(nits, dtype=np.float64) / 10000.0, 0.0, 1.0) ** 0.1593017578125
+    e = ((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y)) ** 78.84375
+    return e * ((1 << bits) - 1)
+
+
 def _eotf_nits(code: np.ndarray, bits: int = 10) -> np.ndarray:
     v = np.vectorize(eotf_norm)(np.clip(code / ((1 << bits) - 1), 0.0, 1.0))
     return v * 10000.0
@@ -162,7 +169,7 @@ class FaldModel:
         d = np.where(s_nits < self.p.drive_floor_nits, 0.0, np.minimum(d, 1.0))
         return d
 
-    def cell_drives(self, img: np.ndarray) -> np.ndarray:
+    def cell_drives(self, img: np.ndarray, lattice_codes: Optional[np.ndarray] = None) -> np.ndarray:
         """Per-cell statistic = max over sliding windows (footprint ``blur_px``) that lie INSIDE
         the cell of the window mean — features smaller than the footprint count partially, and
         nothing leaks across a cell boundary (HW: a window whose edge sits exactly on a boundary
@@ -177,7 +184,7 @@ class FaldModel:
         else:
             raise ValueError(f"unknown stat_kind {p.stat_kind!r}")
         if p.lattice_boost > 0:
-            d = d * self.lattice_factor(s_req)
+            d = d * self.lattice_factor(s_req, lattice_codes)
         return d
 
     # ------------------------------------------------------------------ coarse lattice / peak limiter
@@ -185,21 +192,39 @@ class FaldModel:
         xs = np.array([c for c, _ in self.p.lattice_ramp]); ys = np.array([w for _, w in self.p.lattice_ramp])
         return np.interp(code, xs, ys, left=ys[0], right=ys[-1])
 
-    def lattice_factor(self, s_req: np.ndarray) -> np.ndarray:
+    def _lattice_axes(self) -> tuple[np.ndarray, np.ndarray]:
+        p = self.p
+        kx = np.arange(int(np.ceil(-p.lattice_phase_px[0] / p.lattice_px)), int(p.width // p.lattice_px) + 1)
+        ky = np.arange(int(np.ceil(-p.lattice_phase_px[1] / p.lattice_px)), int(p.height // p.lattice_px) + 1)
+        lx = p.lattice_px * kx + p.lattice_phase_px[0]; ly = p.lattice_px * ky + p.lattice_phase_px[1]
+        return lx[(lx >= 0) & (lx < p.width)], ly[(ly >= 0) & (ly < p.height)]
+
+    def lattice_codes(self, shapes: Sequence[Shape]) -> np.ndarray:
+        """Requested max-channel code at the EXACT lattice pixels (full resolution, paint order) —
+        the 1/5 render drops up to 4 px at a rectangle edge, enough to miss a sample (review #1)."""
+        lx, ly = self._lattice_axes()
+        p = self.p
+        codes = np.zeros((len(ly), len(lx)))
+        for (r, g, b), (x, y, cx, cy) in shapes:
+            x0 = int(round(x * p.width)); y0 = int(round(y * p.height))
+            x1 = max(int(round((x + cx) * p.width)), x0 + 1); y1 = max(int(round((y + cy) * p.height)), y0 + 1)
+            mx = (lx >= x0) & (lx < x1); my = (ly >= y0) & (ly < y1)
+            codes[np.ix_(my, mx)] = float(max(r, g, b))
+        return codes
+
+    def lattice_factor(self, s_req: np.ndarray, lattice_codes: Optional[np.ndarray] = None) -> np.ndarray:
         """Per-cell factor (1 + b·(1 − w_cell)) / (1 + b·(1 − w_ref)): w_cell = the detector weight of the
         brightest requested code at the lattice pixels whose coarse block overlaps the cell, w_ref = the
         weight of the cell's own peak code. A uniform
         field has w_cell = w_ref → factor 1 (the measured drive curve already contains the limiter's state);
         a near-peak highlight that misses every lattice pixel of its cell drives 1 + b times more (HW 1.30)."""
         p = self.p
-        code = 1023.0 * np.vectorize(oetf_norm)(np.clip(s_req / 10000.0, 0.0, 1.0))
-        # lattice pixels (full-res) → reduced-res samples → per-cell max weight
-        kx = np.arange(int(np.ceil(-p.lattice_phase_px[0] / p.lattice_px)), int(p.width // p.lattice_px) + 1)
-        ky = np.arange(int(np.ceil(-p.lattice_phase_px[1] / p.lattice_px)), int(p.height // p.lattice_px) + 1)
-        lx = p.lattice_px * kx + p.lattice_phase_px[0]; ly = p.lattice_px * ky + p.lattice_phase_px[1]
-        lx = lx[(lx >= 0) & (lx < p.width)]; ly = ly[(ly >= 0) & (ly < p.height)]
-        ix = np.floor(lx / p.scale).astype(int); iy = np.floor(ly / p.scale).astype(int)
-        samp = self._ramp(code[np.ix_(iy, ix)])                              # (len(ly), len(lx))
+        code = _oetf_code(s_req)
+        lx, ly = self._lattice_axes()
+        if lattice_codes is None:                       # fallback: sample the 1/scale render (±4 px)
+            ix = np.floor(lx / p.scale).astype(int); iy = np.floor(ly / p.scale).astype(int)
+            lattice_codes = code[np.ix_(iy, ix)]
+        samp = self._ramp(lattice_codes)                                     # (len(ly), len(lx))
         # each sample governs every LED cell its 48×48 BLOCK overlaps (the sample pixel itself may lie
         # just outside the cell: row 31's sample sits 3 px above it — dark on black → boosted, as HW
         # measured; lit on a field → no boost, so uniform fields stay band-free). Cross-cell coupling
@@ -211,8 +236,10 @@ class FaldModel:
                 cx = np.clip(np.floor((lx + ex) / p.cell_w).astype(int), 0, p.cols - 1)
                 cy = np.clip(np.floor((ly + ey) / p.cell_h).astype(int), 0, p.rows - 1)
                 np.maximum.at(w_cell, (np.repeat(cy, len(cx)), np.tile(cx, len(cy))), samp.ravel())
-        blocks = code.reshape(p.rows, self.ch, p.cols, self.cw)
-        w_ref = self._ramp(blocks.max(axis=(1, 3)))
+        # reference = the code of the cell's own winmax statistic (NOT its peak code: a white 10-px
+        # dot in a code-700 cell must not fire 1.30 on the whole cell — review #4); a uniform field
+        # then has w_ref = w_cell → factor 1, a white half-cell has w_ref = 1, w_cell = 0 → 1 + b.
+        w_ref = self._ramp(self._winmax_stat(code))
         b = p.lattice_boost
         return (1.0 + b * (1.0 - w_cell)) / (1.0 + b * (1.0 - w_ref))
 
@@ -362,7 +389,7 @@ class FaldModel:
 
     # ------------------------------------------------------------------ full forward
     def forward(self, shapes: Sequence[Shape]) -> dict:
-        return self.forward_img(self.render(shapes))
+        return self.forward_img(self.render(shapes), self.lattice_codes(shapes))
 
     def backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map."""
@@ -377,10 +404,10 @@ class FaldModel:
                                    support_cells=p.est_support_cells)
         return b_true, b_est
 
-    def forward_img(self, img: np.ndarray) -> dict:
+    def forward_img(self, img: np.ndarray, lattice_codes: Optional[np.ndarray] = None) -> dict:
         """Forward model on a rendered request image ``img`` (3, h, w) of as-if-white nits."""
         p = self.p
-        drives = self.cell_drives(img)
+        drives = self.cell_drives(img, lattice_codes)
         b_true, b_est = self.backlights(drives)
         lmax = p.white_nits * np.array(p.chan_weights)[:, None, None]
         # per-channel target luminance: a code's PQ decode is its "as-if-white" nits, the channel
@@ -395,7 +422,7 @@ class FaldModel:
     def meter(self, shapes: Sequence[Shape], meter_px: tuple[float, float],
               aperture_px: Optional[float] = None) -> np.ndarray:
         """Per-channel luminance the meter reads: mean of y over the aperture disc. Returns (3,)."""
-        return self.meter_img(self.render(shapes), meter_px, aperture_px)
+        return self.meter_img(self.render(shapes), meter_px, aperture_px, self.lattice_codes(shapes))
 
     def aperture_mask(self, meter_px: tuple[float, float], aperture_px: Optional[float] = None) -> np.ndarray:
         r = (aperture_px if aperture_px is not None else self.p.aperture_px) / self.p.scale
@@ -404,8 +431,8 @@ class FaldModel:
         return ((xx + 0.5 - mx) ** 2 + (yy + 0.5 - my) ** 2) <= r * r
 
     def meter_img(self, img: np.ndarray, meter_px: tuple[float, float],
-                  aperture_px: Optional[float] = None) -> np.ndarray:
-        out = self.forward_img(img)
+                  aperture_px: Optional[float] = None, lattice_codes: Optional[np.ndarray] = None) -> np.ndarray:
+        out = self.forward_img(img, lattice_codes)
         r = (aperture_px if aperture_px is not None else self.p.aperture_px) / self.p.scale
         mx, my = meter_px[0] / self.p.scale, meter_px[1] / self.p.scale
         yy, xx = np.mgrid[0:self.h, 0:self.w]
