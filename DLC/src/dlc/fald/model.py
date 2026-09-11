@@ -44,6 +44,11 @@ class FaldParams:
     # window mean. (2026-09-11: the coverage-law / sample-grid variants modelled DesktopLUT's dynamic
     # tonemap sampler, not the panel — removed; doc §21.)
     blur_px: float = 32.0                 # statistic footprint (box)
+    # NATIVE single-cell law (2026-09-11, doc §22: the sliver matrix on clean data depends on AREA only —
+    # 40×10 = 20×20 = 10×40 to 0.5 %): stat_kind "area" = min(brightest lit px, Σ lit nits·px² / stat_area0_px2),
+    # i.e. level × min(1, area/A0) on one level and the level itself on a uniform field. "winmax" = the original.
+    stat_kind: str = "winmax"
+    stat_area0_px2: float = 1150.0
     # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
     # to code 1023 = 1842 nits). The 2026-09-10 curve had the same shape but was normalised to 1000 nits
     # because the DesktopLUT stack showed code 1023 at ≈ 1000 nits.
@@ -151,7 +156,21 @@ class FaldModel:
         does not drive the next cell at all)."""
         p = self.p
         s = np.minimum(np.max(img, axis=0), p.white_nits)      # brightest channel, requested nits
+        if p.stat_kind == "area":
+            return self.drive_of(self._area_stat(s))
+        if p.stat_kind != "winmax":
+            raise ValueError(f"unknown stat_kind {p.stat_kind!r}")
         return self.drive_of(self._winmax_stat(s))
+
+    def _area_stat(self, s: np.ndarray) -> np.ndarray:
+        """min(brightest lit px, Σ lit nits·px² / A0): the native single-cell area law (monotone; a
+        uniform field gives its level)."""
+        p = self.p
+        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)
+        lit = blocks > p.drive_floor_nits
+        peak = (blocks * lit).max(axis=(2, 3))
+        tot = (blocks * lit).sum(axis=(2, 3)) * float(p.scale ** 2)
+        return np.minimum(peak, tot / p.stat_area0_px2)
 
     def _winmax_stat(self, s: np.ndarray) -> np.ndarray:
         """Max over sliding windows (footprint ``blur_px``, fractional) inside each cell of the window

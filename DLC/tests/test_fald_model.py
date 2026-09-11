@@ -150,3 +150,15 @@ def test_correction_removes_the_ring_in_the_model():
     res = correct_image(m, img)
     hi = m.render(shapes)[0] > 5000
     assert np.allclose(res["req"][0][hi], img[0][hi])
+
+
+def test_area_statistic_is_shape_independent_and_matches_winmax_on_fields():
+    # native sliver matrix 2026-09-11: 40x10, 20x20 and 10x40 white slivers read identically (area law)
+    pa = FaldParams(stat_kind="area"); pw = FaldParams(stat_kind="winmax")
+    for code in (307, 700, 1023):
+        ma, mw = FaldModel(pa), FaldModel(pw)
+        assert np.allclose(ma.cell_drives(ma.render([((code,) * 3, FULL)])), mw.cell_drives(mw.render([((code,) * 3, FULL)])), atol=1e-9)
+    m = FaldModel(pa); black = ((0, 0, 0), FULL); cell = (24, 26)
+    d = lambda x, y, w, h: m.cell_drives(m.render([black, (WHITE, rect(x, y, w, h))]))[cell]
+    a, b, c = d(2120, 1100, 40, 10), d(2140, 1095, 20, 20), d(2150, 1085, 10, 40)
+    assert abs(a - b) < 1e-9 and abs(b - c) < 1e-9 and 0 < a < d(2080, 1080, 80, 45)
