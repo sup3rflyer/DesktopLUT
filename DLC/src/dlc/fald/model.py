@@ -45,15 +45,17 @@ class FaldParams:
     drive_curve: Sequence[tuple[float, float]] = field(default_factory=lambda: [
         (10.0, 0.0), (30.0, 0.17), (100.0, 0.24), (300.0, 0.47), (600.0, 0.73), (1000.0, 1.0)])
     # statistic kind: "winmax" (max of in-cell sliding-window means, the original) or
-    # "mean_gain_switch" (fitted 2026-09-10 on all coverage data: cell MEAN × stat_gain through the
-    # drive curve, capped at stat_cap, then × (1 − sup_strength·h) where h is the max 10-px-window
-    # mean inside a SUPPRESSION box at (sup_box) px relative to the cell's top-left — content in the
-    # cell's bottom-left quadrant (and the neighbours left/below) pulls the LED down by up to ~35 %)
+    # "area_switch" (the single-cell coverage law fitted 2026-09-10 on all coverage data — harness
+    # hyp_e2, 5 % RMS — re-expressed so a uniform field drives exactly the measured curve; see
+    # FaldModel._drives_area_switch). Content in the cell's bottom-left quadrant (and the neighbours
+    # left/below, the SUPPRESSION box sup_box in px from the cell's top-left) pulls the LED down by
+    # up to sup_strength; a fully lit cell in a lit field then sits at stat_cap·(1−sup_strength) = 0.76
+    # of the LED maximum and an unsuppressed sliver can reach 1/0.76 = 1.32× the field level (HW 1.30).
     stat_kind: str = "winmax"
-    stat_gain: float = 3.73               # used only when stat_area0_px2 == 0 (the rejected gain×mean form)
-    stat_area0_px2: float = 980.0         # area law: stat = mean(lit) × min(1, lit area / A0); 0 = off
-    stat_cap: float = 1.185
-    sup_strength: float = 0.346
+    stat_window: bool = False             # area_switch ceiling = winmax window mean instead of the peak px
+    stat_area0_px2: float = 1199.0        # area law: stat = mean(lit px) × min(1, lit area / A0)   (fit 2026-09-11)
+    stat_cap: float = 1.114               # LED headroom above the measured curve (harness "cap")
+    sup_strength: float = 0.319
     sup_box: tuple[float, float, float, float] = (-40.0, 40.0, 20.0, 67.5)   # x0, x1, y0, y1 (px)
     sup_window_px: float = 10.0
     drive_floor_nits: float = 0.5         # below this a cell is off (black)
@@ -159,8 +161,16 @@ class FaldModel:
         p = self.p
         s = np.max(img, axis=0)                               # brightest channel, requested nits
         s = np.minimum(s, p.white_nits)
-        if p.stat_kind == "mean_gain_switch":
-            return self._drives_mean_gain_switch(s)
+        if p.stat_kind == "area_switch":
+            return self._drives_area_switch(s)
+        if p.stat_kind != "winmax":
+            raise ValueError(f"unknown stat_kind {p.stat_kind!r}")
+        return self.drive_of(self._winmax_stat(s))
+
+    def _winmax_stat(self, s: np.ndarray) -> np.ndarray:
+        """Max over sliding windows (footprint ``blur_px``, fractional) inside each cell of the window
+        mean of ``s`` (nits) — the winmax statistic before the drive curve."""
+        p = self.p
         cells = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)   # (R, C, ch, cw)
         # integral image per cell with a zero border
         S = np.zeros((p.rows, p.cols, self.ch + 1, self.cw + 1))
@@ -178,36 +188,48 @@ class FaldModel:
         # fractional footprint: blend the two integer window sizes so blur_px has a gradient
         kf = p.blur_px / p.scale
         k0 = int(np.floor(kf)); f = kf - k0
-        best = stat(k0) if f < 1e-6 else (1.0 - f) * stat(k0) + f * stat(k0 + 1)
-        return self.drive_of(best)
+        return stat(k0) if f < 1e-6 else (1.0 - f) * stat(k0) + f * stat(k0 + 1)
 
-    def _drives_mean_gain_switch(self, s: np.ndarray) -> np.ndarray:
-        """Fitted statistic (2026-09-10, all coverage data to ≈5 % RMS): per cell
-        d_pre = min(cap, curve_ext(gain · cell-mean nits)); drive = min(1, d_pre · (1 − k·hs)) where
-        hs = drive_curve(1040 · h) and h = max over ``sup_window_px`` windows inside the suppression
-        box of the window mean (as a fraction of white)."""
+    def _drives_area_switch(self, s: np.ndarray) -> np.ndarray:
+        """The single-cell coverage law (harness ``stat_fit/fald_stat_fit.py`` hyp_e2, fitted
+        2026-09-10 on sliver / posmatrix / mirror / camera / LDA-ramp data to 5 % RMS), written so
+        that a uniform field of level L drives exactly ``drive_of(L)`` — the measured curve:
+
+          stat  = min(brightest lit px, Σ lit nits·px² / stat_area0_px2)               (area law)
+          h     = max ``sup_window_px`` sliding-window mean of the LIT MASK over windows fully inside
+                  the suppression box ``sup_box`` (px from the cell's top-left);  hs = drive_of(white·h)
+          d_led = min(1, stat_cap · drive_of(stat) · (1 − sup_strength · hs))        (LED current ≤ 1)
+          drive = d_led / D0,   D0 = stat_cap · (1 − sup_strength)                   (lit field = 1)
+
+        On single-level content the stat is level × min(1, area/A0): hyp_e2 up to the area constant
+        (cap·curve(W·A/A0) ≈ curve(W·A/964) over the sliver range; refit through this model on all
+        five coverage datasets 2026-09-11: A0 1199 px², cap 1.114, s 0.319, RMS 0.053 vs harness 0.050).
+        A fully lit cell inside a lit field runs at D0 = cap·(1−s) = 0.76 of the LED maximum; an
+        unsuppressed sliver in the right/top of the cell reaches 1/D0 = 1.32× (HW 1.30).
+        ASSUMPTION (untested below white): the suppression depends on what is lit in the box, not on
+        its level — the only choice under which every uniform field stays on the measured curve."""
         p = self.p
-        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)
-        cells = blocks.mean(axis=(2, 3))
-        if p.stat_area0_px2 > 0:
-            # AREA law (agent fit 2026-09-10): stat = mean of the LIT pixels × min(1, lit area / A0).
-            # Any lit area ≥ A0 (≈ 33 px²) behaves as its mean (fields, big windows); slivers follow
-            # the √-area law through the drive curve. Replaces gain × cell-mean, which over-drove fields.
-            lit = blocks > p.drive_floor_nits
-            n_lit = lit.sum(axis=(2, 3))
-            l_lit = np.where(n_lit > 0, (blocks * lit).sum(axis=(2, 3)) / np.maximum(n_lit, 1), 0.0)
-            area_px2 = n_lit * (p.scale ** 2)
-            stat = l_lit * np.minimum(1.0, area_px2 / p.stat_area0_px2)
+        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)   # (R, C, ch, cw)
+        lit = blocks > p.drive_floor_nits
+        n_lit = lit.sum(axis=(2, 3))
+        if p.stat_window:      # hybrid: the ceiling is the winmax window mean (= winmax on any lit field)
+            peak = self._winmax_stat(s)
         else:
-            stat = cells * p.stat_gain
-        d_pre = np.minimum(self._curve_ext(stat), p.stat_cap)
-        # suppression: box-blur (sup_window) of the white-fraction image, then per cell the max over
-        # the suppression box [x0,x1)×[y0,y1) px relative to the cell's top-left corner
-        frac = s / p.white_nits
+            peak = (blocks * lit).max(axis=(2, 3))                                # brightest lit px (nits)
+        tot_nits_px2 = (blocks * lit).sum(axis=(2, 3)) * float(p.scale ** 2)       # Σ lit nits · px²
+        # min(peak, Σ/A0): on single-level content = level × min(1, area/A0); on a uniform field = the
+        # level; MONOTONE in the image (a mean-of-lit form is not: grey around a highlight diluted it —
+        # review 2026-09-11 #1, a sliver in a 10-nit field fell to 0.68 instead of 1.0)
+        stat = np.minimum(peak, tot_nits_px2 / p.stat_area0_px2)
+        demand = p.stat_cap * self.drive_of(stat)
+        # suppression: sliding-window mean of the lit mask; per cell the max over windows that lie
+        # fully inside the box [x0,x1)×[y0,y1) px relative to the cell's top-left corner
+        mask = (s > p.drive_floor_nits).astype(np.float64)
         k = max(1, int(round(p.sup_window_px / p.scale)))
-        blur = self._box_blur(frac, k)
+        blur = self._box_blur(mask, k)                        # window [i−k//2, i−k//2+k) at pixel i
         x0, x1, y0, y1 = (v / p.scale for v in p.sup_box)
-        ox0, ox1 = int(np.floor(x0)), int(np.ceil(x1)); oy0, oy1 = int(np.floor(y0)), int(np.ceil(y1))
+        ox0, ox1 = int(np.floor(x0)) + k // 2, int(np.ceil(x1)) - k + k // 2 + 1
+        oy0, oy1 = int(np.floor(y0)) + k // 2, int(np.ceil(y1)) - k + k // 2 + 1
         padw = max(0, -ox0, ox1 - self.cw) + 1; padh = max(0, -oy0, oy1 - self.ch) + 1
         bp = np.pad(blur, ((padh, padh), (padw, padw)), mode="constant")
         h = np.zeros((p.rows, p.cols))
@@ -215,17 +237,11 @@ class FaldModel:
             ys = slice(padh + r * self.ch + oy0, padh + r * self.ch + oy1)
             for c in range(p.cols):
                 xs = slice(padw + c * self.cw + ox0, padw + c * self.cw + ox1)
-                h[r, c] = bp[ys, xs].max()
+                h[r, c] = bp[ys, xs].max() if ox1 > ox0 and oy1 > oy0 else 0.0
         hs = self.drive_of(np.minimum(h, 1.0) * p.white_nits)
-        d = d_pre * (1.0 - p.sup_strength * hs)
-        d = np.where(cells < p.drive_floor_nits, 0.0, np.clip(d, 0.0, 1.0))
-        return d
-
-    def _curve_ext(self, nits: np.ndarray) -> np.ndarray:
-        """Drive curve with a linear continuation above its last point (no clip; the cap clips)."""
-        xs = np.array([n for n, _ in self.p.drive_curve]); top = xs[-1]
-        d = self.drive_of(np.minimum(nits, top))
-        return np.where(nits > top, nits / top, d)
+        d_led = np.minimum(1.0, demand * (1.0 - p.sup_strength * hs))
+        d0 = p.stat_cap * (1.0 - p.sup_strength)
+        return np.where(n_lit == 0, 0.0, np.maximum(d_led / d0, 0.0))
 
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,

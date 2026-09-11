@@ -150,3 +150,76 @@ def test_correction_removes_the_ring_in_the_model():
     res = correct_image(m, img)
     hi = m.render(shapes)[0] > 5000
     assert np.allclose(res["req"][0][hi], img[0][hi])
+
+
+# ---------------------------------------------------------------- area_switch drive statistic
+def _drives(p: FaldParams, shapes):
+    m = FaldModel(p)
+    return m.cell_drives(m.render(shapes))
+
+
+def test_area_switch_equals_winmax_on_uniform_fields():
+    # the coverage law is normalised so that ANY uniform field stays on the measured drive curve
+    pw = FaldParams(stat_kind="winmax"); pa = FaldParams(stat_kind="area_switch")
+    for code in (307, 520, 769, 1023):                      # ≈ 10 / 100 / 500 / white nits
+        dw = _drives(pw, [((code, code, code), FULL)]); da = _drives(pa, [((code, code, code), FULL)])
+        assert np.allclose(da, dw, atol=1e-9), code
+
+
+def test_area_switch_single_cell_coverage_law():
+    # HW 2026-09-10 (sliver / posmatrix / mirror / camera): a sliver in the RIGHT half of a cell drives
+    # ≈1.30× the whole cell, the LEFT half drives the same as the whole cell, and a 20 px square in the
+    # bottom-left quadrant drives ~0.51× (elsewhere ~0.77×).
+    p = FaldParams(stat_kind="area_switch")
+    black = ((0, 0, 0), FULL)
+    cell = (24, 26)                                          # x 2080–2160, y 1080–1125
+    def d(x, y, w, h):
+        return _drives(p, [black, (WHITE, rect(x, y, w, h))])[cell]
+    whole = d(2080, 1080, 80, 45)
+    assert abs(whole - 1.0) < 1e-9                           # a fully lit cell = 1 (field normalisation)
+    assert abs(d(2120, 1080, 40, 45) / whole - 1.32) < 0.03  # right half: unsuppressed, at the LED max
+    assert abs(d(2080, 1080, 40, 45) / whole - 1.00) < 0.02  # left half: suppressed like the whole
+    bl = d(2100, 1095, 20, 20) / whole; tr = d(2140, 1080, 20, 20) / whole
+    assert 0.45 < bl < 0.57 and 0.70 < tr < 0.85 and bl < tr
+
+
+def test_area_switch_unknown_kind_rejected():
+    with pytest.raises(ValueError):
+        _drives(FaldParams(stat_kind="bogus"), [((0, 0, 0), FULL)])
+
+
+def test_area_switch_is_monotone_in_the_image_and_isolated_cell_is_one():
+    # review 2026-09-11 #1: grey around a highlight must not LOWER the LED (a mean-of-lit form did)
+    p = FaldParams(stat_kind="area_switch")
+    cell = (24, 26)
+    def d(left_code):
+        return _drives(p, [((0, 0, 0), FULL), ((left_code,) * 3, rect(2080, 1080, 40, 45)),
+                           (WHITE, rect(2120, 1080, 40, 45))])[cell]
+    on_black, grey10, white = d(0), d(307), d(1023)
+    assert on_black >= grey10 >= white
+    assert abs(grey10 - 1.0) < 1e-6 and abs(white - 1.0) < 1e-6      # suppressed → the field state
+    # sliver inside a uniform 10-nit field: winmax and area_switch agree (both 1.0 — the whole-cell state)
+    field = [((307, 307, 307), FULL), (WHITE, rect(2120, 1080, 40, 45))]
+    assert abs(_drives(p, field)[cell] - _drives(FaldParams(stat_kind="winmax"), field)[cell]) < 1e-6
+    iso = _drives(p, [((0, 0, 0), FULL), (WHITE, rect(2080, 1080, 80, 45))])
+    assert abs(iso[cell] - 1.0) < 1e-9 and iso.sum() == iso[cell]     # isolated cell = 1, nothing else lit
+
+
+def test_area_switch_suppression_box_geometry():
+    # HW ratios (posmatrix/mirror, cell 26 row 24): a 20 px square at the cell's bottom-left (x 2100,
+    # y 1093) reads 0.51× the whole cell, at the top-left (y 1082) 0.77×; content in the LEFT neighbour's
+    # right half (x −40..0 of the box) also suppresses, content beyond it (x < −40) does not.
+    p = FaldParams(stat_kind="area_switch")
+    cell = (24, 26)
+    black = ((0, 0, 0), FULL)
+    def d(*rects):
+        return _drives(p, [black] + [(WHITE, r) for r in rects])[cell]
+    whole = d(rect(2080, 1080, 80, 45))
+    assert abs(d(rect(2100, 1095, 20, 20)) / whole - 0.52) < 0.04
+    assert abs(d(rect(2100, 1080, 20, 20)) / whole - 0.77) < 0.04
+    sliver = rect(2120, 1080, 40, 45)
+    assert abs(d(sliver) / whole - 1.32) < 0.03
+    assert abs(d(sliver, rect(2050, 1105, 20, 15)) / whole - 1.00) < 0.03     # left neighbour, in the box
+    assert abs(d(sliver, rect(2000, 1105, 20, 15)) / whole - 1.32) < 0.03     # left neighbour, outside
+    assert abs(d(sliver, rect(2100, 1130, 20, 10)) / whole - 1.00) < 0.03     # cell below, in the box
+    assert abs(d(sliver, rect(2100, 1160, 20, 10)) / whole - 1.32) < 0.03     # cell below, outside
