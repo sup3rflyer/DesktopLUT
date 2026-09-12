@@ -4,6 +4,7 @@
 #include "processing.h"
 #include "globals.h"
 #include "lut.h"
+#include "fald.h"
 #include "color.h"
 #include "render.h"
 #include "framepacer.h"
@@ -37,6 +38,7 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
     ColorCorrectionData dst;
     dst.primariesEnabled = src.primariesEnabled;
     dst.primariesPreset = src.primariesPreset;
+    dst.fald = src.fald;
     dst.customPrimaries.Rx = src.customPrimaries.Rx;
     dst.customPrimaries.Ry = src.customPrimaries.Ry;
     dst.customPrimaries.Gx = src.customPrimaries.Gx;
@@ -203,6 +205,7 @@ static DWORD WINAPI TopmostHelperThread(LPVOID) {
 }
 
 void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
+    FaldTrace("ProcessingThread: begin");
     // Initialize COM for this thread (separate apartment from GUI thread)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -383,6 +386,7 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
             std::lock_guard<std::mutex> lk(g_monitorsMutex);
             g_monitors.push_back(ctx);
         }
+        FaldTrace("ProcessingThread: monitor context pushed");
     }
 
     if (g_monitors.empty()) {
@@ -560,6 +564,7 @@ static bool HasActiveShaderCorrections() {
         if (hdr.primariesEnabled && !hdrMhcP) return true;
         if (hdr.grayscale.enabled && !hdrMhcG) return true;
         if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
+        if (hdr.fald.enabled && !g_dwmHookMode.load()) return true;
         if (desktopGamma && ms.hdrMHC.desktopGammaEnabled && !hdrMhcG) return true;
     }
     return false;
@@ -590,6 +595,7 @@ bool EvalNonAnalysisShaderCorrections() {
         if (hdr.primariesEnabled && !hdrMhcP) return true;
         if (hdr.grayscale.enabled && !hdrMhcG) return true;
         if (hdr.tonemap.enabled && !g_dwmHookMode.load()) return true;
+        if (hdr.fald.enabled && !g_dwmHookMode.load()) return true;
         // Desktop gamma is HDR-only. Check per-monitor desktopGammaEnabled (not global
         // g_desktopGammaMode) to avoid false positives on SDR monitors.
         if (desktopGamma && ms.hdrMHC.desktopGammaEnabled && !hdrMhcG) return true;
@@ -920,7 +926,21 @@ void StartProcessing() {
     // This handles the case where the thread exited (e.g., watchdog timeout)
     // but wasn't joined through StopProcessing()
     if (g_gui.processingThread.joinable()) {
-        g_gui.processingThread.join();
+        // A joinable thread with isRunning == false is normally one that has already exited (watchdog
+        // or failure path) and only needs joining. But a STALE WM_PROCESSING_EXITED — posted by a
+        // previous thread just before it died and dispatched after a quick stop/start — clears
+        // isRunning while the NEW thread is alive; joining that one unbounded froze the GUI thread
+        // (2026-09-12, DLC neutral entry/exit). Detect a live thread and stop it properly first.
+        HANDLE h = (HANDLE)g_gui.processingThread.native_handle();
+        if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) {
+            FaldTrace("StartProcessing: leftover thread is ALIVE -> StopProcessing first");
+            std::cerr << "StartProcessing: a processing thread is still alive while isRunning is false — stopping it first" << std::endl;
+            g_gui.isRunning = true;          // let StopProcessing do its bounded stop/join
+            StopProcessing();
+        } else {
+            FaldTrace("StartProcessing: joining an exited leftover thread");
+            g_gui.processingThread.join();
+        }
     }
 
     // Build config from all monitors with SDR LUT or color correction configured
@@ -933,7 +953,8 @@ void StartProcessing() {
                                      ms.sdrColorCorrection.grayscale.use24Gamma;
         bool hasHdrColorCorrection = ms.hdrColorCorrection.primariesEnabled ||
                                      ms.hdrColorCorrection.grayscale.enabled ||
-                                     ms.hdrColorCorrection.tonemap.enabled;
+                                     ms.hdrColorCorrection.tonemap.enabled ||
+                                     (ms.hdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
         bool hasDesktopGamma = g_userDesktopGammaMode.load();
 
         if (hasLUT || hasSdrColorCorrection || hasHdrColorCorrection || hasDesktopGamma) {
@@ -957,6 +978,16 @@ void StartProcessing() {
 
     // Save current settings as active (for comparison to detect changes)
     g_gui.activeSettings = g_gui.monitorSettings;
+
+    FaldTrace("StartProcessing: before stale-hook check");
+    if (!g_dwmHookMode.load() && IsDwmHookActive()) {
+        FaldTrace("StartProcessing: stale hook -> uninject");
+        // Overlay mode but a DwmHook.dll is still resident in dwm.exe (left by a previous session or
+        // a mode switch that did not eject it): it would process the composed frame — overlay output
+        // included — on top of the overlay's own layers. Eject it before starting the overlay.
+        std::wcout << L"[DWM Hook] Stale hook resident in overlay mode — uninjecting" << std::endl;
+        UninjectDwmHook();
+    }
 
     if (g_dwmHookMode.load()) {
         // DWM Hook Mode: inject DLL into dwm.exe for LUT application
@@ -1090,6 +1121,7 @@ void StartProcessing() {
 }
 
 void StopProcessing() {
+    FaldTrace("StopProcessing: enter");
     // Cancel any pending auto-restart (user explicitly wants stopped)
     g_gui.restartRetryCount = 0;
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
@@ -1149,14 +1181,21 @@ void StopProcessing() {
         DestroyAnalysisOverlay();
     }
 
-    // Uninject DWM hook if in DWM hook mode (always try — harmless if not injected)
-    if (g_dwmHookMode.load()) {
+    // Uninject DWM hook if in DWM hook mode OR if the DLL is still resident. The GUI toggle stores
+    // the new mode BEFORE calling StopProcessing, so switching hook mode OFF used to leave the DLL
+    // injected: dwm.exe kept applying LUT/tonemap to the composed frame — including the overlay's
+    // own output — while the overlay applied its layers too (double processing, 2026-09-12).
+    FaldTrace("StopProcessing: before hook check");
+    if (g_dwmHookMode.load() || IsDwmHookActive()) {
         std::cout << "[DWM Hook] Stopping — uninjecting from dwm.exe" << std::endl;
+        FaldTrace("StopProcessing: UninjectDwmHook begin");
         UninjectDwmHook();
+        FaldTrace("StopProcessing: UninjectDwmHook end");
     }
 
     // Signal wake event to unblock any CompClock/WaitForSingleObject in the render loop
     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+    FaldTrace("StopProcessing: joining render thread");
 
     if (g_gui.processingThread.joinable()) {
         // Wait for thread with timeout to prevent GUI freeze
@@ -1193,6 +1232,7 @@ void StopProcessing() {
         }
     }
 
+    FaldTrace("StopProcessing: joined/detached");
     g_gui.isRunning = false;
     g_gui.activeSettings.clear();  // No longer running, clear active settings
     g_shaderCorrectionsActive.store(false);

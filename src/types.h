@@ -124,6 +124,12 @@ struct MovableAtomic {
 #define ID_CORR_MAXTML_EDIT      527
 #define ID_CORR_MAXTML_APPLY     528
 
+// FALD compensation layer (Experimental, HDR, overlay path)
+#define ID_CORR_FALD_ENABLE      529
+#define ID_CORR_FALD_PATH        530
+#define ID_CORR_FALD_BROWSE      531
+#define ID_CORR_FALD_DEBUG       532
+
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
 #define ID_MHC_TAB_REMOVE   552
@@ -484,6 +490,15 @@ inline int TonemapCurveToDropdownIndex(TonemapCurve curve) {
     return 0;
 }
 
+// FALD (mini-LED local dimming) context-dependence correction layer (HDR only, overlay path).
+// Parameter file = output of DLC `python -m dlc.fald.export` (see src/fald.h). Same struct serves
+// the GUI settings and the runtime ColorCorrectionData.
+struct FaldSettings {
+    bool enabled = false;
+    std::wstring paramsPath;
+    unsigned int debugMode = 0;   // 0 = correct, 1 = show gain-1, 2 = show B_true, 3 = show B_est, 4 = identity passthrough (not persisted)
+};
+
 // Tonemapping settings (HDR only)
 // Source peak is user-specified or dynamically detected
 struct TonemapData {
@@ -503,6 +518,7 @@ struct ColorCorrectionData {
     float whiteBalanceGains[3] = { 1.0f, 1.0f, 1.0f };    // Diagonal RGB gains from white point (von Kries)
     GrayscaleData grayscale;
     TonemapData tonemap;  // HDR tonemapping (only used in HDR mode)
+    FaldSettings fald;    // FALD correction layer (HDR only)
 };
 
 // Per-monitor context (holds all state for one monitor)
@@ -638,6 +654,12 @@ struct MonitorContext {
 
     // Thread-safe visibility requests (whitelist thread → render thread)
     MovableAtomic<int> requestedVisibility{0};  // 0=no change, 1=show, -1=hide
+
+    // FALD correction layer (src/fald.h): heap-owned GPU resources, created lazily on the render
+    // thread, released with the monitor's D3D resources / on resize. Dump request = IPC debug path.
+    struct FaldResources* fald = nullptr;
+    MovableAtomic<bool> faldDumpRequested{false};
+    std::wstring faldDumpDir;
 };
 
 // Per-monitor LUT configuration from command line
@@ -725,6 +747,7 @@ struct ColorCorrectionSettings {
     float primariesMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };  // Identity
     GrayscaleSettings grayscale;
     TonemapSettings tonemap;  // HDR tonemapping (only used in HDR mode)
+    FaldSettings fald;        // FALD correction layer (HDR only)
 };
 
 // MHC profile state (per-monitor, per-mode)
@@ -862,6 +885,12 @@ struct GUIState {
     HWND hwndMaxTmlCombo = nullptr;
     HWND hwndMaxTmlEdit = nullptr;
     HWND hwndMaxTmlApply = nullptr;
+
+    // FALD compensation (Experimental) controls
+    HWND hwndFaldEnable = nullptr;
+    HWND hwndFaldPath = nullptr;
+    HWND hwndFaldBrowse = nullptr;
+    HWND hwndFaldDebug = nullptr;
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

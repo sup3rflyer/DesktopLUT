@@ -7,6 +7,7 @@
 #include "color.h"
 #include "capture.h"
 #include "osd.h"
+#include "fald.h"
 #include "analysis.h"
 #include "displayconfig.h"
 #include "processing.h"
@@ -380,6 +381,7 @@ bool InitDirectComposition(MonitorContext* ctx) {
 }
 
 bool ResizeSwapChain(MonitorContext* ctx, int width, int height) {
+    FaldReleaseResources(ctx);   // resolution-dependent; recreated lazily
     if (ctx->rtv) {
         ctx->rtv->Release();
         ctx->rtv = nullptr;
@@ -443,6 +445,7 @@ bool ResizeSwapChain(MonitorContext* ctx, int width, int height) {
 }
 
 bool RecreateSwapchain(MonitorContext* ctx) {
+    FaldReleaseResources(ctx);   // format/size-dependent; recreated lazily
     // Hide window and reset to fully transparent during recreation to prevent black flash
     if (ctx->hwnd) {
         if (IsWindowVisible(ctx->hwnd)) {

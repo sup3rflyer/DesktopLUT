@@ -110,6 +110,8 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         WritePrivateProfileFloat(section, (p + L"TonemapSourcePeak").c_str(), cc.tonemap.sourcePeakNits, iniPath);
         WritePrivateProfileFloat(section, (p + L"TonemapTargetPeak").c_str(), cc.tonemap.targetPeakNits, iniPath);
         WritePrivateProfileBool(section, (p + L"TonemapDynamic").c_str(), cc.tonemap.dynamicPeak, iniPath);
+        WritePrivateProfileBool(section, (p + L"FaldEnabled").c_str(), cc.fald.enabled, iniPath);
+        WritePrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
     }
 }
 
@@ -129,6 +131,10 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         cc.tonemap.sourcePeakNits = (srcPeak >= 10.0f && srcPeak <= 10000.0f) ? srcPeak : 10000.0f;
         cc.tonemap.targetPeakNits = (tgtPeak >= 10.0f && tgtPeak <= 10000.0f) ? tgtPeak : 1000.0f;
         cc.tonemap.dynamicPeak = GetPrivateProfileBool(section, (p + L"TonemapDynamic").c_str(), false, iniPath);
+        cc.fald.enabled = GetPrivateProfileBool(section, (p + L"FaldEnabled").c_str(), false, iniPath);
+        wchar_t faldBuf[1024] = {};
+        GetPrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), L"", faldBuf, 1024, iniPath);
+        cc.fald.paramsPath = faldBuf;
     }
 }
 

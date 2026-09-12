@@ -9,6 +9,7 @@
 #include "render.h"
 #include "processing.h"
 #include "mhc.h"
+#include "fald.h"
 #include <d3dcompiler.h>
 #include <iostream>
 
@@ -144,6 +145,11 @@ bool InitD3D() {
                 std::cout << "Analysis compute shader: enabled" << std::endl;
             }
         }
+    }
+
+    // FALD correction shaders (non-fatal: the layer just stays unavailable)
+    if (!InitFaldShaders()) {
+        std::cerr << "Warning: FALD correction shaders unavailable" << std::endl;
     }
 
     // Create samplers
@@ -568,6 +574,7 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     if (ctx->peakTexture) { ctx->peakTexture->Release(); ctx->peakTexture = nullptr; }
     if (ctx->peakStagingTexture) { ctx->peakStagingTexture->Release(); ctx->peakStagingTexture = nullptr; }
     if (ctx->peakStagingTexture2) { ctx->peakStagingTexture2->Release(); ctx->peakStagingTexture2 = nullptr; }
+    FaldReleaseResources(ctx);
     // Frame buffer resources
     if (ctx->bufferRTV) { ctx->bufferRTV->Release(); ctx->bufferRTV = nullptr; }
     if (ctx->bufferTexture) { ctx->bufferTexture->Release(); ctx->bufferTexture = nullptr; }
@@ -671,6 +678,7 @@ void ReleaseSharedD3DResources() {
     if (g_samplerPoint) { g_samplerPoint->Release(); g_samplerPoint = nullptr; }
     if (g_samplerLinear) { g_samplerLinear->Release(); g_samplerLinear = nullptr; }
     if (g_samplerWrap) { g_samplerWrap->Release(); g_samplerWrap = nullptr; }
+    ReleaseFaldShaders();
     if (g_peakDetectCS) { g_peakDetectCS->Release(); g_peakDetectCS = nullptr; }
     if (g_peakCB) { g_peakCB->Release(); g_peakCB = nullptr; }
     if (g_analysisCS) { g_analysisCS->Release(); g_analysisCS = nullptr; }

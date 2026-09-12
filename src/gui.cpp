@@ -234,6 +234,35 @@ void SetStatus(const wchar_t* text) {
     }
 }
 
+static bool BrowseForFaldPanelFile(HWND hwndParent, wchar_t* path, size_t pathSize) {
+    OPENFILENAME ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwndParent;
+    ofn.lpstrFilter = L"FALD panel files (*.bin)\0*.bin\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = (DWORD)pathSize;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.lpstrTitle = L"Select FALD panel parameter file";
+    return GetOpenFileName(&ofn) == TRUE;
+}
+
+// FALD layer setting changed for the current monitor: push to the render thread and persist.
+static void ApplyFaldSettingChange(bool enabledNow) {
+    if (g_gui.isRunning) {
+        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+        if (g_dwmHookMode.load())
+            UpdateDwmHookSharedConfig();
+        else
+            DwmHookReevaluateOverlay();
+    } else if (enabledNow) {
+        StartProcessing();
+    }
+    SaveSettings();
+    UpdateGUIState();
+    if (enabledNow && g_dwmHookMode.load())
+        SetStatus(L"FALD compensation runs in overlay mode only (DWM hook mode is on)");
+}
+
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
     OPENFILENAME ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -278,6 +307,15 @@ void UpdateColorCorrectionControls() {
     SendMessage(g_gui.hwndTonemapDynamic, BM_SETCHECK,
         hdrCC.tonemap.dynamicPeak ? BST_CHECKED : BST_UNCHECKED, 0);
     EnableWindow(g_gui.hwndTonemapSource, !hdrCC.tonemap.dynamicPeak);
+
+    // FALD compensation (Experimental)
+    SendMessage(g_gui.hwndFaldEnable, BM_SETCHECK,
+        hdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowText(g_gui.hwndFaldPath, hdrCC.fald.paramsPath.c_str());
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(hdrCC.fald.debugMode <= 4 ? hdrCC.fald.debugMode : 0), 0);
+    // The layer runs in the overlay path only: in DWM hook mode the checkbox is inert, so grey it out.
+    EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldDebug, !g_dwmHookMode.load());
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1074,6 +1112,66 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        // FALD compensation (Experimental, HDR, overlay path). Same propagation as tonemap.
+        case ID_CORR_FALD_ENABLE:
+            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                bool enabled = (SendMessage(g_gui.hwndFaldEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                if (enabled && fald.paramsPath.empty()) {
+                    SendMessage(g_gui.hwndFaldEnable, BM_SETCHECK, BST_UNCHECKED, 0);
+                    SetStatus(L"FALD compensation needs a panel parameter file (…)");
+                    return 0;
+                }
+                fald.enabled = enabled;
+                ApplyFaldSettingChange(enabled);
+            }
+            return 0;
+
+        case ID_CORR_FALD_DEBUG:
+            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
+                    auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                    fald.debugMode = (sel >= 0 && sel <= 4) ? (unsigned int)sel : 0u;
+                    ApplyFaldSettingChange(fald.enabled);
+                }
+            }
+            return 0;
+
+        case ID_CORR_FALD_BROWSE:
+            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                wchar_t path[1024] = {};
+                if (BrowseForFaldPanelFile(hwnd, path, 1024)) {
+                    bool enabledNow;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
+                        auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                        fald.paramsPath = path;
+                        enabledNow = fald.enabled;
+                    }
+                    SetWindowText(g_gui.hwndFaldPath, path);
+                    ApplyFaldSettingChange(enabledNow);
+                }
+            }
+            return 0;
+
+        case ID_CORR_FALD_PATH:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    wchar_t path[1024] = {};
+                    GetWindowText(g_gui.hwndFaldPath, path, 1024);
+                    bool changed = false, enabledNow = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
+                        auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                        if (fald.paramsPath != path) { fald.paramsPath = path; changed = true; }
+                        enabledNow = fald.enabled;
+                    }
+                    if (changed) ApplyFaldSettingChange(enabledNow);
+                }
+            }
+            return 0;
+
         case ID_CORR_TONEMAP_CURVE:
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
@@ -1744,6 +1842,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool enable = (SendMessage(g_gui.hwndSettingsDwmHook, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 g_dwmHookMode.store(enable);
                 SaveSettings();
+                UpdateColorCorrectionControls();   // FALD controls are overlay-only
                 // If processing is running, restart so the new mode takes effect immediately
                 if (g_gui.isRunning) {
                     StopProcessing();
@@ -1846,6 +1945,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_PROCESSING_EXITED:  // Processing thread exited
+        // Stale-message guard: the thread that posted this may already have been joined and REPLACED
+        // by a new one (quick StopProcessing/StartProcessing, e.g. the DLC neutral entry). If the
+        // current processing thread is still alive, this message is not about it — ignore it, or we
+        // clear isRunning under a live thread and the next Start joins it forever (2026-09-12).
+        // (A legitimately exiting thread posts this a few instructions before it returns, so give it
+        // 200 ms to finish before calling the message stale.)
+        if (g_gui.processingThread.joinable() &&
+            WaitForSingleObject((HANDLE)g_gui.processingThread.native_handle(), 200) == WAIT_TIMEOUT) {
+            std::cout << "[GUI] stale WM_PROCESSING_EXITED ignored (current processing thread is alive)" << std::endl;
+            return 0;
+        }
         // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
         // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
         if (g_dwmHookMode.load() && g_running.load()) {
@@ -2470,7 +2580,8 @@ int RunGUI() {
             settings.sdrColorCorrection.grayscale.use24Gamma ||
             settings.hdrColorCorrection.primariesEnabled ||
             settings.hdrColorCorrection.grayscale.enabled ||
-            settings.hdrColorCorrection.tonemap.enabled) {
+            settings.hdrColorCorrection.tonemap.enabled ||
+            settings.hdrColorCorrection.fald.enabled) {
             hasAnyCorrection = true;
             break;
         }

@@ -687,7 +687,42 @@ void CreateGUILayout(HWND hwnd) {
     g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlApply);
 
 
-    g_gui.contentHeight[2] = innerY + 48 + 8;  // HDR-only: Tonemapping + MaxTML
+    // FALD compensation group (Experimental; HDR, overlay path only). The panel file comes from the
+    // DLC probe/fit (python -m dlc.fald.export). Debug views show the layer's own fields on the panel.
+    innerY += 53;
+    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental)", WS_CHILD | BS_GROUPBOX,
+        innerX, innerY, groupW, 72, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+
+    g_gui.hwndFaldEnable = CreateWindow(L"BUTTON", L"Enable",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_FALD_ENABLE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldEnable);
+
+    ctrl = CreateWindow(L"STATIC", L"View:", WS_CHILD, innerX + 80, innerY + 20, 35, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldDebug = CreateWindow(L"COMBOBOX", nullptr,
+        WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        innerX + 115, innerY + 18, 120, 120, panel2, (HMENU)ID_CORR_FALD_DEBUG, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldDebug);
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Corrected image");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Gain map");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Real backlight");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Panel estimate");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Passthrough (identity)");
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
+
+    int faldY = innerY + 45;
+    ctrl = CreateWindow(L"STATIC", L"Panel file:", WS_CHILD, innerX + 10, faldY + 2, 60, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldPath = CreateWindow(L"EDIT", L"", WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        innerX + 70, faldY, groupW - 70 - 55, h, panel2, (HMENU)ID_CORR_FALD_PATH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldPath);
+    g_gui.hwndFaldBrowse = CreateWindow(L"BUTTON", L"...",
+        WS_CHILD | BS_OWNERDRAW, innerX + groupW - 50, faldY, 40, h, panel2, (HMENU)ID_CORR_FALD_BROWSE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldBrowse);
+
+    g_gui.contentHeight[2] = innerY + 72 + 8;  // HDR-only: Tonemapping + MaxTML + FALD
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);

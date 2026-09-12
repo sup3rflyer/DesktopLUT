@@ -1,6 +1,7 @@
 // DesktopLUT - gui_mhc.cpp
 // MHC settings dialog and helpers
 
+#include "fald.h"
 #include "gui_mhc.h"
 #include "gui_shared.h"
 #include "gui.h"
@@ -48,8 +49,10 @@ void UpdateMhcFlagsLive(int monitorIndex) {
     // traversal against a concurrent build/teardown (the snapshot lock above is
     // already released, so there is no nesting with g_monitorSettingsMutex).
     bool found = false;
+    FaldTrace("UpdateMhcFlagsLive: acquiring g_monitorsMutex");
     {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        FaldTrace("UpdateMhcFlagsLive: got g_monitorsMutex");
         for (auto& ctx : g_monitors) {
             if (ctx.index == monitorIndex) {
                 ctx.sdrMhcPrimariesActive = sdrMhcActive && sdrPrimEnabled;

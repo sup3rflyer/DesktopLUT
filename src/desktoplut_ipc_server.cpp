@@ -24,6 +24,7 @@
 #include "gui_mhc.h"
 #include "gui_shared.h"
 #include "mhc.h"
+#include "fald.h"
 #include "displayconfig.h"
 #include "settings.h"
 #include "processing.h"
@@ -453,7 +454,7 @@ bool AnyCorrectionActive() {
             s.sdrMHC.enabled || s.hdrMHC.enabled ||
             s.sdrColorCorrection.primariesEnabled || s.sdrColorCorrection.grayscale.enabled ||
             s.hdrColorCorrection.primariesEnabled || s.hdrColorCorrection.grayscale.enabled ||
-            s.hdrColorCorrection.tonemap.enabled)
+            s.hdrColorCorrection.tonemap.enabled || s.hdrColorCorrection.fald.enabled)
             return true;
     }
     return false;
@@ -463,7 +464,9 @@ bool AnyCorrectionActive() {
 // take effect, mirroring what the GUI's Apply path does.
 void ReapplyProcessing() {
     StopProcessing();
-    if (AnyCorrectionActive()) StartProcessing();
+    FaldTrace("ReapplyProcessing: AnyCorrectionActive?");
+    if (AnyCorrectionActive()) { FaldTrace("ReapplyProcessing: StartProcessing"); StartProcessing(); }
+    FaldTrace("ReapplyProcessing: end");
 }
 
 constexpr int kMaxMhcGrayscalePoints = 32;
@@ -665,9 +668,12 @@ void HandleStateGet(JsonValue& result) {
                 l.set("grayscale", JBool(m.correctionGrayscale.enabled));
                 l.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
                 l.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
+                l.set("fald", JBool(isHDR && s.hdrColorCorrection.fald.enabled));
                 if (isHDR) {
                     l.set("tonemap_dynamic", JBool(s.hdrColorCorrection.tonemap.dynamicPeak));
                     l.set("tonemap_target_peak", JNum(s.hdrColorCorrection.tonemap.targetPeakNits));
+                    l.set("fald_params_path", JStr(WideToUtf8(s.hdrColorCorrection.fald.paramsPath)));
+                    l.set("fald_debug_mode", JNum((double)s.hdrColorCorrection.fald.debugMode));
                 }
                 layers.set(key, l);
             }
@@ -875,6 +881,7 @@ void HandleSetHdr(const JsonValue& p, JsonValue& result, std::string& error) {
 // Mutating handlers (run on the GUI thread via WM_CALIB_CMD)
 // ===========================================================================
 void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
+    FaldTrace("EnterNeutral: begin");
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     std::wstring dummy = Utf8ToWide(p.getStr("dummy_icc_path"));
@@ -923,15 +930,20 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
             ms.hdrColorCorrection.primariesEnabled = false;
             ms.hdrColorCorrection.grayscale.enabled = false;
             ms.hdrColorCorrection.tonemap.enabled = false;
+            ms.hdrColorCorrection.fald.enabled = false;   // a meter must not read through the FALD layer
         } else {
             ms.sdrPath.clear();
             ms.sdrColorCorrection.primariesEnabled = false;
             ms.sdrColorCorrection.grayscale.enabled = false;
         }
     }
+    FaldTrace("EnterNeutral: settings cleared, SaveSettings");
     SaveSettings();
+    FaldTrace("EnterNeutral: UpdateMhcFlagsLive");
     UpdateMhcFlagsLive(mon);
+    FaldTrace("EnterNeutral: ReapplyProcessing");
     ReapplyProcessing();
+    FaldTrace("EnterNeutral: ReapplyProcessing done");
     // NOTE: dummy-ICC association is deferred to live bring-up; neutrality here
     // comes from MHC removal + cleared layers, plus DLC's own `dispwin -c`.
 
@@ -1001,9 +1013,12 @@ static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
     out.set("grayscale", JBool(m.correctionGrayscale.enabled));
     out.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
     out.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
+    out.set("fald", JBool(isHDR && s.hdrColorCorrection.fald.enabled));
+    if (isHDR) out.set("fald_params_path", JStr(WideToUtf8(s.hdrColorCorrection.fald.paramsPath)));
 }
 
 void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
+    FaldTrace("LayersSet: begin");
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     auto want = [&](const char* name, bool& has, bool& val) {
@@ -1011,16 +1026,18 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         has = (v && v->type == JsonValue::Bool);
         if (has) val = v->b;
     };
-    bool hasWb, wb, hasGs, gs, hasDg, dg, hasTm, tm;
+    bool hasWb = false, wb = false, hasGs = false, gs = false, hasDg = false, dg = false,
+         hasTm = false, tm = false, hasFd = false, fd = false;
     want("white_balance", hasWb, wb);
     want("grayscale", hasGs, gs);
     want("desktop_gamma", hasDg, dg);
     want("tonemap", hasTm, tm);
-    if (!isHDR && (hasDg || hasTm)) {
-        // Both are HDR-only layers; asking to change them in SDR is a client error, asking
+    want("fald", hasFd, fd);
+    if (!isHDR && (hasDg || hasTm || hasFd)) {
+        // HDR-only layers; asking to change them in SDR is a client error, asking
         // for them OFF is a harmless no-op (a "disable everything" client).
-        if ((hasDg && dg) || (hasTm && tm)) { error = "desktop_gamma / tonemap are HDR-only layers"; return; }
-        hasDg = hasTm = false;
+        if ((hasDg && dg) || (hasTm && tm) || (hasFd && fd)) { error = "desktop_gamma / tonemap / fald are HDR-only layers"; return; }
+        hasDg = hasTm = hasFd = false;
     }
     JsonValue before = JObj(), after = JObj();
     bool mhcChanged = false, tmChanged = false, dgChanged = false, mhcEnabled = false, profileNamed = false;
@@ -1039,9 +1056,11 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         }
         if (hasDg && m.desktopGammaEnabled != dg) { m.desktopGammaEnabled = dg; mhcChanged = true; dgChanged = true; }
         if (hasTm && ms.hdrColorCorrection.tonemap.enabled != tm) { ms.hdrColorCorrection.tonemap.enabled = tm; tmChanged = true; }
+        if (hasFd && ms.hdrColorCorrection.fald.enabled != fd) { ms.hdrColorCorrection.fald.enabled = fd; tmChanged = true; }   // same propagation as tonemap
         mhcEnabled = m.enabled;
         profileNamed = !m.profileName.empty();
     }
+    FaldTrace("LayersSet: settings updated");
     bool regenerated = false;
     if (mhcChanged && profileNamed) {
         // Without g_monitorSettingsMutex held (RegenerateMhcIfActive snapshots under it).
@@ -1054,19 +1073,28 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(dgActive);
     }
     if (tmChanged) {
+        FaldTrace(g_gui.isRunning ? "LayersSet: tm/fald changed, running -> UpdateColorCorrectionLive" : "LayersSet: tm/fald changed, not running");
         if (g_gui.isRunning) {
             UpdateColorCorrectionLive(mon, true);
+            FaldTrace("LayersSet: after UpdateColorCorrectionLive");
             if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
             else DwmHookReevaluateOverlay();
-        } else if (tm) {
+            FaldTrace("LayersSet: after reevaluate");
+        } else if ((hasTm && tm) || (hasFd && fd)) {
+            FaldTrace("LayersSet: StartProcessing");
             StartProcessing();
         }
     }
     if (mhcChanged || tmChanged) {
+        FaldTrace("LayersSet: UpdateMhcFlagsLive");
         UpdateMhcFlagsLive(mon);
+        FaldTrace("LayersSet: SaveSettings");
         SaveSettings();
+        FaldTrace("LayersSet: UpdateGUIState");
         UpdateGUIState();
+        FaldTrace("LayersSet: UpdateColorCorrectionControls");
         UpdateColorCorrectionControls();   // the GUI checkboxes follow the pipe
+        FaldTrace("LayersSet: controls updated");
     }
     std::string profileName;
     {
@@ -1094,6 +1122,7 @@ void DoDisableAll(const JsonValue& /*p*/, JsonValue& result, std::string& /*erro
             s.hdrColorCorrection.primariesEnabled = false;
             s.hdrColorCorrection.grayscale.enabled = false;
             s.hdrColorCorrection.tonemap.enabled = false;
+            s.hdrColorCorrection.fald.enabled = false;
         }
     }
     SaveSettings();
@@ -1262,6 +1291,81 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
         verified = m.enabled && !m.profileName.empty();
     }
     result.set("verified", JBool(verified));
+}
+
+// FALD correction layer (HDR only). runtime.set_fald_params {monitor, mode:"HDR", params_path}:
+// the per-panel parameter file (DLC `python -m dlc.fald.export`). runtime.fald_debug {monitor, mode,
+// debug_mode 0..3}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est (not persisted).
+// runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/frame dumps to dir
+// (reference comparison against the Python model).
+static void FaldPropagate(int mon) {
+    FaldTrace("FaldPropagate: begin");
+    if (g_gui.isRunning) {
+        UpdateColorCorrectionLive(mon, true);
+        if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
+        else DwmHookReevaluateOverlay();
+    }
+    FaldTrace("FaldPropagate: UpdateColorCorrectionControls");
+    UpdateColorCorrectionControls();   // the GUI's View combo / Panel file box follow the pipe
+    FaldTrace("FaldPropagate: end");
+}
+
+void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    if (!isHDR) { error = "fald is an HDR-only layer"; return; }
+    std::wstring path = Utf8ToWide(p.getStr("params_path"));
+    if (path.empty()) { error = "missing parameter: params_path"; return; }
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) { error = "params_path is not a file"; return; }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        g_gui.monitorSettings[mon].hdrColorCorrection.fald.paramsPath = path;
+    }
+    SaveSettings();
+    FaldPropagate(mon);
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("params_path", JStr(WideToUtf8(path)));
+}
+
+void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    if (!isHDR) { error = "fald is an HDR-only layer"; return; }
+    const JsonValue* v = p.find("debug_mode");
+    if (!v || v->type != JsonValue::Num) { error = "missing parameter: debug_mode (0..4)"; return; }
+    unsigned int mode = (unsigned int)(v->num < 0 ? 0 : (v->num > 4 ? 4 : v->num));
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        g_gui.monitorSettings[mon].hdrColorCorrection.fald.debugMode = mode;
+    }
+    FaldPropagate(mon);
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("debug_mode", JNum((double)mode));
+}
+
+void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    std::wstring dir = Utf8ToWide(p.getStr("dir"));
+    if (dir.empty()) { error = "missing parameter: dir"; return; }
+    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) { error = "dir does not exist"; return; }
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorsMutex);
+        for (auto& ctx : g_monitors) {
+            if (ctx.index == mon) {
+                if (ctx.faldDumpRequested.load()) { error = "a fald dump is still pending for this monitor"; return; }
+                ctx.faldDumpDir = dir;                                            // written before the flag ...
+                ctx.faldDumpRequested.store(true, std::memory_order_release);     // ... which publishes it
+                found = true; break;
+            }
+        }
+    }
+    if (!found) { error = "monitor context not running"; return; }
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("dir", JStr(WideToUtf8(dir)));
+    result.set("note", JStr("written by the render thread on the next frame the FALD layer runs; look for fald_dump.txt"));
 }
 
 void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1825,6 +1929,9 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "maintenance.verify_mhc") DoVerifyMhc(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_3dlut") DoSet3dlut(*r->params, *r->result, *r->error);
         else if (m == "runtime.clear_3dlut") DoClear3dlut(*r->params, *r->result, *r->error);
+        else if (m == "runtime.set_fald_params") DoSetFaldParams(*r->params, *r->result, *r->error);
+        else if (m == "runtime.fald_debug") DoFaldDebug(*r->params, *r->result, *r->error);
+        else if (m == "runtime.fald_dump") DoFaldDump(*r->params, *r->result, *r->error);
         else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);

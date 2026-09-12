@@ -13,6 +13,7 @@
 #include "processing.h"
 #include "mhc.h"
 #include "gui_mhc.h"
+#include "fald.h"
 #include <dwmapi.h>
 #include <avrt.h>
 #include <iostream>
@@ -609,7 +610,14 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Render — choose render target based on buffer mode
     // Buffer mode: render to intermediate texture (presented next cycle for consistent timing)
     // Normal mode: render directly to swapchain backbuffer
-    ID3D11RenderTargetView* renderTarget = (useFrameBuffer) ? ctx->bufferRTV : ctx->rtv;
+    ID3D11RenderTargetView* finalTarget = (useFrameBuffer) ? ctx->bufferRTV : ctx->rtv;
+
+    // FALD correction layer (HDR, overlay path only — in hook mode the hook owns the panel-bound
+    // frame): the main shader renders into the layer's intermediate, the layer's passes then write
+    // the corrected frame to the real target. Falls back to the plain path when resources fail.
+    bool faldOn = ctx->isHDREnabled && cc.fald.enabled && !g_dwmHookMode.load() &&
+                  FaldEnsureResources(ctx, cc.fald.paramsPath);
+    ID3D11RenderTargetView* renderTarget = faldOn ? ctx->fald->interRTV : finalTarget;
 
     float clearColor[4] = { 0, 0, 0, 0 };
     g_context->ClearRenderTargetView(renderTarget, clearColor);
@@ -662,6 +670,10 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
 
     g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_context->Draw(3, 0);
+
+    if (faldOn) {
+        FaldRunPasses(ctx, finalTarget);   // leaves finalTarget bound, PS SRVs cleared
+    }
 
     // Analysis overlay (primary monitor only) — always renders to backbuffer
     if (ctx->index == 0 && g_analysisEnabled.load()) {
@@ -1093,12 +1105,14 @@ void RenderAll(FramePacer* fp) {
         bool hasWB = cc2.primariesEnabled && !mhcP &&
             (cc2.whiteBalanceGains[0] != 1.0f || cc2.whiteBalanceGains[1] != 1.0f || cc2.whiteBalanceGains[2] != 1.0f);
         bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled && !g_dwmHookMode.load();
+        bool hasFald = ctx.isHDREnabled && cc2.fald.enabled && !cc2.fald.paramsPath.empty() &&
+                       FaldShadersReady() && !g_dwmHookMode.load();   // never keep the overlay awake for a layer that cannot run
         bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;
         bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only
         bool hasMhcPreview = g_mhcEditDialogOpen.load();                  // MHC/grayscale editor live preview
         ctx.shaderCorrActive = hasPrim || hasGs || hasWB || hasTonemap || hasDG || has24
-                               || hasAnalysis || hasMhcPreview;
+                               || hasFald || hasAnalysis || hasMhcPreview;
     }
 
     // Auto-sleep: hide overlay when no monitor needs processing (e.g., only MHC ICC active)
