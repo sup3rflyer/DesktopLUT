@@ -76,6 +76,9 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         t = np.clip((b_est - p.fade_lo) / max(p.fade_hi - p.fade_lo, 1e-9), 0.0, 1.0)
         wfade = t * t * (3.0 - 2.0 * t)
         gain = 1.0 + (gain - 1.0) * wfade
+        if p.gain_smooth_cells > 0:
+            from scipy.ndimage import gaussian_filter
+            gain = gaussian_filter(gain, sigma=(p.gain_smooth_cells * model.ch, p.gain_smooth_cells * model.cw), mode="nearest")
         ped = lmax * b_true[None] * p.tmin                     # per channel, nits, actual context
         # Pedestal term, HUE-PRESERVING (2026-09-12, live A/B showed blue rims on dark edges): the
         # panel adds the same leak to all three channels, so the correction subtracts the same

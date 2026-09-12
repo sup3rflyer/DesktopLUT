@@ -78,6 +78,9 @@ class FaldParams:
     est_aniso: float = 1.0                # vertical/horizontal scale of the ESTIMATE kernel (1 = isotropic
                                           # in mm; 45/80 = isotropic in cells → shorter vertical reach)
     est_support_cells: int = 0            # >0: the estimate only sums cells within ±N cells in each axis
+    est_support_soft: float = 0.0         # >0: the support edge rolls off smoothly over ±soft cells around ±N
+                                          #   (0 = hard box, the fitted default; a hard edge imprints a cell-periodic
+                                          #   lattice on smooth gradients)
                                           # (a box support in CELL units: 4 cells = 320 px wide, 180 px tall)
     est_cell: bool = False                # the monitor's map is computed at CELL resolution (one value per cell
                                           # from cell-centre distances) and each pixel samples it at p + phase
@@ -95,6 +98,10 @@ class FaldParams:
     # rendering
     flat_norm: bool = True               # divide both fields by the flat-lattice response (flat in → gain 1)
     fade_lo: float = 0.004               # correction fades to identity where the panel's ESTIMATE is ~0:
+    gain_smooth_cells: float = 0.35      # Gaussian sigma (in cells) applied to the GAIN field before use: the
+                                         #   estimate kernel is narrower than a cell, so the raw gain inherits the
+                                         #   per-cell steps of the drive map — structure the meter cannot verify
+                                         #   and the owner sees as a grid (2026-09-12). 0 = off.
     fade_hi: float = 0.03                #   weight = smoothstep(fade_lo, fade_hi, B_est). Deep shadows far from
                                          #   any light were never measured; there the LCD-ceiling rule split
                                          #   channels/neighbours (contours + colour fringes, live 2026-09-12).
@@ -215,14 +222,16 @@ class FaldModel:
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
                  phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0,
-                 pnorm: float = 2.0, sub: Optional[int] = None):
+                 pnorm: float = 2.0, sub: Optional[int] = None, support_soft: Optional[float] = None):
         """Per-sub-offset kernels. ``kind``: "exp" (1/e = scale_mm), "gauss" (sigma = scale_mm),
         "mix" ((1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/scale_mm)). ``phase_mm`` shifts
         the SAMPLE point: the field is evaluated at (p + phase) and attributed to p."""
         p = self.p
         sub = p.sub if sub is None else int(sub)
+        support_soft = p.est_support_soft if support_soft is None else float(support_soft)
         key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
-               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub)
+               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub,
+               round(support_soft, 4))
         if key in self._kern_cache:
             return self._kern_cache[key]
         cwmm, chmm = p.cell_w * p.px_mm, p.cell_h * p.px_mm
@@ -258,7 +267,12 @@ class FaldModel:
                 else:
                     raise ValueError(kind)
                 if support_cells > 0:
-                    k = k * ((np.abs(ii[None, :]) <= support_cells) & (np.abs(jj[:, None]) <= support_cells))
+                    if support_soft > 0:
+                        wx = np.clip((support_cells + support_soft - np.abs(ii[None, :])) / (2.0 * support_soft), 0.0, 1.0)
+                        wy = np.clip((support_cells + support_soft - np.abs(jj[:, None])) / (2.0 * support_soft), 0.0, 1.0)
+                        k = k * (wx * wx * (3 - 2 * wx)) * (wy * wy * (3 - 2 * wy))
+                    else:
+                        k = k * ((np.abs(ii[None, :]) <= support_cells) & (np.abs(jj[:, None]) <= support_cells))
                 row.append(k)
             kern.append(row)
         # normalise: a fully driven infinite field must give B = 1 at any sample point

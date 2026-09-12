@@ -16,6 +16,7 @@ Usage: PYTHONPATH="src;." FALD_NATIVE=1 python fald_ramp_probe.py
 """
 import json, os, subprocess, sys, time
 from pathlib import Path
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,7 +43,7 @@ class MpvPresenter:
         self.pending = None
         self.proc = subprocess.Popen(["mpv", "--vo=gpu-next", "--target-colorspace-hint=yes", "--fs", f"--screen={screen}",
                                       "--image-display-duration=inf", "--keep-open=yes", "--idle=yes", "--osc=no", "--osd-level=0",
-                                      "--no-terminal", "--cursor-autohide=always", f"--input-ipc-server={PIPE}",
+                                      "--no-terminal", "--ontop", "--cursor-autohide=always", f"--input-ipc-server={PIPE}",
                                       "--vf=format=gamma=pq:primaries=bt.2020"])
         self.pipe = None
         for _ in range(50):
@@ -52,16 +53,46 @@ class MpvPresenter:
                 time.sleep(0.2)
         if self.pipe is None:
             raise RuntimeError("mpv IPC pipe did not appear")
+        self.cmd("disable_event", "all")
 
     def cmd(self, *args):
-        self.pipe.write((json.dumps({"command": list(args)}) + "\n").encode())
-        try:
-            self.pipe.readline()
-        except OSError:
-            pass
+        """Send one command and return its reply (skipping event lines). Events are disabled at start so
+        the pipe cannot fill up and stall mpv (the 2026-09-12 run stuck on one frame after ~10 loads)."""
+        self._rid = getattr(self, "_rid", 0) + 1
+        rid = self._rid
+        self.pipe.write((json.dumps({"command": list(args), "request_id": rid}) + "\n").encode())
+        for _ in range(50):
+            try:
+                line = self.pipe.readline()
+            except OSError:
+                return None
+            if not line:
+                return None
+            try:
+                msg = json.loads(line.decode("utf-8", "ignore"))
+            except ValueError:
+                continue
+            if msg.get("request_id") == rid:
+                return msg
+        return None
+
+    def wait_loaded(self, path: str, timeout: float = 6.0) -> bool:
+        """Poll until mpv reports the requested file as current (and not idle)."""
+        t0 = time.time()
+        want = str(path).replace("/", "\\").lower()
+        while time.time() - t0 < timeout:
+            r = self.cmd("get_property", "path")
+            cur = str((r or {}).get("data") or "").replace("/", "\\").lower()
+            idle = (self.cmd("get_property", "idle-active") or {}).get("data")
+            if cur == want and not idle:
+                return True
+            time.sleep(0.1)
+        return False
 
     def show(self, patch: MeasurePatch) -> None:
         self.cmd("loadfile", str(self.pending), "replace")
+        if not self.wait_loaded(str(self.pending)):
+            raise RuntimeError(f"mpv did not load {self.pending}")
         time.sleep(SETTLE + patch.settle_bump_s)
 
     def close(self):
@@ -73,7 +104,8 @@ class MpvPresenter:
 
 def main():
     meter_xy = tuple(int(v) for v in os.environ.get("FALD_METER", "1988,1120").split(","))
-    kinds = os.environ.get("FALD_RAMP_KINDS", "h,hsteep,v").split(",")
+    kinds = os.environ.get("FALD_RAMP_KINDS", "flat,h,hsteep,v,step300_50,step100_20,stepv300_50").split(",")
+    if "flat" not in kinds: kinds = ["flat"] + kinds          # the flat-field baseline is always measured first
     spec = json.loads((SIM / "ramp" / "frames.json").read_text())
     if tuple(spec["meter"]) != meter_xy:
         P.log(f"[ramp] WARNING frames were generated for meter {spec['meter']}, running with {meter_xy}")
@@ -97,9 +129,12 @@ def main():
     meter = argyll.open_persistent(SpotreadRequest(port=port, ccmx_or_ccss=Path(ccmx) if ccmx else None))
     measure = make_persistent_spotread_meter(presenter=presenter, persistent=meter)
 
-    def set_fald(on: bool):
+    def set_fald(on: bool, identity: bool = False):
+        """identity=True: layer ON but debug mode 4 (passthrough) — the overlay path without the correction."""
+        ctrl.call("runtime.fald_debug", {"monitor": MON, "mode": "HDR", "debug_mode": 4 if identity else 0})
         ctrl.call("layers.set", {"monitor": MON, "mode": "HDR", "fald": on})
-        time.sleep(0.5)
+        time.sleep(0.6)
+    three_way = os.environ.get("FALD_THREE_WAY", "1") == "1"
 
     def read(label, png):
         presenter.pending = png
@@ -114,21 +149,43 @@ def main():
         for f in frames:
             png = SIM / "ramp" / f"{f['name']}.png"
             y_off = read(f["name"] + " OFF", png)
+            y_id = None
+            if three_way:
+                set_fald(True, identity=True)
+                y_id = read(f["name"] + " ID", png)
             set_fald(True)
             y_on = read(f["name"] + " ON", png)
             set_fald(False)
             exp = f["expected_nits"]
             e_off = (y_off / exp - 1) if y_off else None; e_on = (y_on / exp - 1) if y_on else None
-            results.append({**f, "y_off": y_off, "y_on": y_on, "err_off": e_off, "err_on": e_on})
+            e_id = (y_id / exp - 1) if y_id else None
+            results.append({**f, "y_off": y_off, "y_id": y_id, "y_on": y_on, "err_off": e_off, "err_id": e_id, "err_on": e_on})
             P.log(f"   {f['name']:<16} exp {exp:6.1f}  OFF {y_off if y_off else float('nan'):7.2f} ({100*(e_off or 0):+6.2f} %, model {100*f['pred_err_off']:+6.2f})"
-                  f"   ON {y_on if y_on else float('nan'):7.2f} ({100*(e_on or 0):+6.2f} %, model {100*f['pred_err_on']:+6.2f})")
+                  + (f"   ID {y_id if y_id else float('nan'):7.2f} ({100*(e_id or 0):+6.2f} %)" if three_way else "")
+                  + f"   ON {y_on if y_on else float('nan'):7.2f} ({100*(e_on or 0):+6.2f} %, model {100*f['pred_err_on']:+6.2f})")
+        # flat-field baseline: measured/expected of uniform fields vs nits (log-log interpolation) — the native
+        # EOTF offset; ramp/step reads are then reported RELATIVE to a flat field of the same nits (the ring
+        # metric), which is what the layer is meant to fix.
+        import statistics as st
+        flats = sorted([r for r in results if r["kind"] == "flat" and r["y_off"]], key=lambda r: r["expected_nits"])
+        if len(flats) >= 2:
+            fx = np.log([r["expected_nits"] for r in flats]); fy = np.log([r["y_off"] / r["expected_nits"] for r in flats])
+            base = lambda nits: float(np.exp(np.interp(np.log(nits), fx, fy)))
+            P.log("[ramp] flat baseline meas/exp: " + "  ".join(f"{r['expected_nits']:.0f}n {r['y_off']/r['expected_nits']:.4f}" for r in flats)
+                  + "  (ON/OFF on flats: " + "  ".join(f"{r['y_on']/r['y_off']:.4f}" for r in flats if r["y_on"]) + ")"
+                  + ("  (ID/OFF on flats: " + "  ".join(f"{r['y_id']/r['y_off']:.4f}" for r in flats if r.get("y_id")) + ")" if any(r.get("y_id") for r in flats) else ""))
+            for r in results:
+                if r["kind"] != "flat" and r["err_off"] is not None:
+                    b = base(r["expected_nits"])
+                    r["rel_off"] = (1 + r["err_off"]) / b - 1
+                    r["rel_on"] = (1 + r["err_on"]) / b - 1 if r["err_on"] is not None else None
         for kind in kinds:
-            rs = [r for r in results if r["kind"] == kind and r["err_off"] is not None and r["err_on"] is not None]
+            rs = [r for r in results if r["kind"] == kind and r.get("rel_off") is not None and r.get("rel_on") is not None]
             if not rs: continue
-            import statistics as st
-            off = [r["err_off"] for r in rs]; on = [r["err_on"] for r in rs]
-            P.log(f"[ramp] {kind}: lattice amplitude (p-p across shifts) OFF {100*(max(off)-min(off)):5.2f} %  ON {100*(max(on)-min(on)):5.2f} %"
-                  f" | mean offset OFF {100*st.mean(off):+5.2f} %  ON {100*st.mean(on):+5.2f} %")
+            off = [r["rel_off"] for r in rs]; on = [r["rel_on"] for r in rs]
+            mo = [r["pred_err_off"] for r in rs]; mn = [r["pred_err_on"] for r in rs]
+            P.log(f"[ramp] {kind}: vs flat field — OFF mean {100*st.mean(off):+5.2f} % (model {100*st.mean(mo):+5.2f}), p-p across shifts {100*(max(off)-min(off)):5.2f} % (model {100*(max(mo)-min(mo)):5.2f})"
+                  f" | ON mean {100*st.mean(on):+5.2f} % (model {100*st.mean(mn):+5.2f}), p-p {100*(max(on)-min(on)):5.2f} %")
     finally:
         set_fald(False)
         presenter.close()
