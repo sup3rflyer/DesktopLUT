@@ -22,6 +22,8 @@ struct FaldPanelParams {
     float curveLogMin = 0, curveLogMax = 0, estPhasePx = 0, estPhasePy = 0;
     float fadeLo = 0.004f, fadeHi = 0.03f;   // correction fades to identity where B_est < fadeHi (0 at fadeLo)
     float gainSmoothCells = 0.35f;           // Gaussian sigma of the gain low-pass, in cells (0 = off)
+    float lumFadeLo = 0.5f, lumFadeHi = 5.0f; // pixel-luminance fade (as-if-white nits of the pixel's max channel):
+                                             // the model has no baseline below ~1 nit (dark-halo probe 2026-09-12)
     std::vector<float> curve, kTrue, kEst;
 };
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err);

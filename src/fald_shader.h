@@ -26,6 +26,7 @@ cbuffer FaldCB : register(b0) {
     float gainMax; float driveFloor; float curveLogMin; float curveLogMax;
     uint debugMode; uint originX; uint originY; uint blurDir;      // blurDir: 0 = horizontal, 1 = vertical pass
     float fadeLo; float fadeHi; float gainSmoothFine; float _pad2;  // gainSmoothFine: Gaussian sigma in fine samples (0 = off)
+    float lumFadeLo; float lumFadeHi; float _pad3; float _pad4;     // pixel-luminance fade, as-if-white nits (lo = hi = 0: off)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -99,10 +100,18 @@ float RawGain(float bTrue, float bEst) {
 // correct.py::correct_image for one pixel. img = as-if-white nits per channel (original frame);
 // gain = the (smoothed) gain sampled at the pixel.
 float3 Correct(float3 img, float bTrue, float bEst, float gain) {
-    float s = min(max(img.r, max(img.g, img.b)), white);
+    float maxc = max(img.r, max(img.g, img.b));
+    float s = min(maxc, white);
     bTrue = max(bTrue, 0.0f);
     // deep-dark fade: the model is trusted only where the panel's estimate is not ~zero
     float wfade = smoothstep(fadeLo, fadeHi, bEst);
+    // pixel-luminance fade (doc S33): no baseline below ~1 nit -> the correction ramps in over lumFadeLo..lumFadeHi
+    // of the pixel's own level (applied after the gain low-pass, per pixel; gainTex/debug view stay unfaded)
+    if (lumFadeHi > lumFadeLo) {
+        float wlum = smoothstep(lumFadeLo, lumFadeHi, maxc);
+        gain = 1.0f + (gain - 1.0f) * wlum;
+        wfade *= wlum;
+    }
     float pedRef = white * DriveOf(s) * tmin;      // pedestal a uniform field of this level carries
     float ped = white * bTrue * tmin;              // pedestal in THIS context (as-if-white)
     // Hue-preserving pedestal term: subtract the same amount from all channels, limited by the
