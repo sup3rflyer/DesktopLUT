@@ -94,6 +94,10 @@ class FaldParams:
     drive_gamma: float = 0.5              # power-law continuation below the first curve point
     # rendering
     flat_norm: bool = True               # divide both fields by the flat-lattice response (flat in → gain 1)
+    fade_lo: float = 0.004               # correction fades to identity where the panel's ESTIMATE is ~0:
+    fade_hi: float = 0.03                #   weight = smoothstep(fade_lo, fade_hi, B_est). Deep shadows far from
+                                         #   any light were never measured; there the LCD-ceiling rule split
+                                         #   channels/neighbours (contours + colour fringes, live 2026-09-12).
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
 

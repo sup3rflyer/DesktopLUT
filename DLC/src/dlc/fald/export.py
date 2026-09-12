@@ -16,7 +16,8 @@ File layout (little-endian, all float32 unless noted; header is 32 uint32/float3
   word 19  f: gain_min     word 20  f: gain_max    word 21  f: drive_floor_nits
   word 22  f: curve_log_min  word 23  f: curve_log_max   (natural log of nits at LUT ends)
   word 24  f: est_phase_px   word 25  f: est_phase_py   (informational; already baked into K_est)
-  words 26-31 reserved (0)
+  word 26  f: fade_lo       word 27  f: fade_hi      (correction fades to identity for B_est below; 0,0 = loader defaults)
+  words 28-31 reserved (0)
   then: curve[curve_n]                                  drive vs ln(nits), linear in ln(nits)
   then: k_true[sub][sub][2*reach_true_r+1][2*reach_true_c+1]   index order (oy, ox, j, i)
   then: k_est [sub][sub][2*reach_est_r+1][2*reach_est_c+1]
@@ -64,7 +65,7 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
               rt_c, rt_r, re_c, re_r, len(curve)]
     floats = [p.white_nits, p.tmin, p.stat_area0_px2, *p.chan_weights, gain_clip[0], gain_clip[1],
               p.drive_floor_nits, CURVE_LOG_MIN, CURVE_LOG_MAX, p.est_phase_px, p.est_phase_py]
-    buf = struct.pack("<13I", *header) + struct.pack("<13f", *floats) + struct.pack("<6I", *([0] * 6))
+    buf = struct.pack("<13I", *header) + struct.pack("<13f", *floats) + struct.pack("<2f", p.fade_lo, p.fade_hi) + struct.pack("<4I", *([0] * 4))
     assert len(buf) == 32 * 4
     buf += curve.tobytes() + np.ascontiguousarray(kt).tobytes() + np.ascontiguousarray(ke).tobytes()
     Path(path).write_bytes(buf)

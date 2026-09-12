@@ -72,6 +72,10 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         b_true, b_est = model.backlights(drives)
         b_true = np.maximum(b_true, 0.0)
         gain = np.clip(b_est / np.maximum(b_true, 1e-9), gain_clip[0], gain_clip[1])
+        # deep-dark fade: trust the model only where the panel's estimate is not ~zero (FaldParams.fade_*)
+        t = np.clip((b_est - p.fade_lo) / max(p.fade_hi - p.fade_lo, 1e-9), 0.0, 1.0)
+        wfade = t * t * (3.0 - 2.0 * t)
+        gain = 1.0 + (gain - 1.0) * wfade
         ped = lmax * b_true[None] * p.tmin                     # per channel, nits, actual context
         # Pedestal term, HUE-PRESERVING (2026-09-12, live A/B showed blue rims on dark edges): the
         # panel adds the same leak to all three channels, so the correction subtracts the same
@@ -82,12 +86,12 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         delta = ped_ref - ped / w                              # as-if-white, identical for R/G/B
         darkest = img.min(axis=0, keepdims=True)
         floored_amt = np.maximum(-delta - darkest, 0.0)        # part of the subtraction the pixel cannot take
-        adj = np.where(delta < 0.0, delta + floored_amt, delta)
+        adj = np.where(delta < 0.0, delta + floored_amt, delta) * wfade
         req = (img + adj) * gain[None]
         floored = np.broadcast_to(floored_amt > 0.0, req.shape)
         req = np.maximum(req, 0.0)
         cap = p.white_nits * np.maximum(b_est, 1e-9)[None]     # T ≤ 1  ⇔  req ≤ white·B_est
-        clipped = req > cap
+        clipped = (req > cap) & (wfade[None] >= 1.0)           # only where the model is trusted
         req = np.where(clipped, np.maximum(img, cap), req)     # saturated highlight: keep the original
         cur = req
     return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored}
