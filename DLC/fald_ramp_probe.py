@@ -39,9 +39,9 @@ MON = 0
 class MpvPresenter:
     """Presenter for make_persistent_spotread_meter: shows ``pending`` (a PNG path) in mpv."""
 
-    def __init__(self, screen: int):
+    def __init__(self, screen: int, extra_args=()):
         self.pending = None
-        self.proc = subprocess.Popen(["mpv", "--vo=gpu-next", "--target-colorspace-hint=yes", "--fs", f"--screen={screen}",
+        self.proc = subprocess.Popen(["mpv", *extra_args, "--vo=gpu-next", "--target-colorspace-hint=yes", "--fs", f"--screen={screen}",
                                       "--image-display-duration=inf", "--keep-open=yes", "--idle=yes", "--osc=no", "--osd-level=0",
                                       "--no-terminal", "--ontop", "--cursor-autohide=always", f"--input-ipc-server={PIPE}",
                                       "--vf=format=gamma=pq:primaries=bt.2020"])
