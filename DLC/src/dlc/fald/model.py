@@ -93,6 +93,7 @@ class FaldParams:
                                           # meter read only bounds it, see review 2026-09-10 #6)
     drive_gamma: float = 0.5              # power-law continuation below the first curve point
     # rendering
+    flat_norm: bool = True               # divide both fields by the flat-lattice response (flat in → gain 1)
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
 
@@ -284,8 +285,7 @@ class FaldModel:
     def forward(self, shapes: Sequence[Shape]) -> dict:
         return self.forward_img(self.render(shapes))
 
-    def backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map."""
+    def _raw_backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         p = self.p
         b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm)
         phase = (p.est_phase_px, p.est_phase_py)
@@ -298,6 +298,30 @@ class FaldModel:
             b_est = self.backlight(drives, p.est_kind, p.est_scale_mm, phase_px=phase, aniso=p.est_aniso,
                                    support_cells=p.est_support_cells)
         return b_true, b_est
+
+    def flat_response(self) -> tuple[np.ndarray, np.ndarray]:
+        """(B_true, B_est) of a fully driven lattice — the per-pixel normalisation that makes a flat
+        field map to gain 1 everywhere. Cached per parameter set."""
+        key = tuple(sorted((k, tuple(v) if isinstance(v, (list, tuple)) else v) for k, v in self.p.__dict__.items()
+                           if not isinstance(v, (list, tuple)) or k != "drive_curve"))
+        if getattr(self, "_flat_key", None) != key:
+            ones = np.ones((self.p.rows, self.p.cols))
+            self._flat = self._raw_backlights(ones)
+            self._flat_key = key
+        return self._flat
+
+    def backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map. With ``flat_norm`` (default)
+        both fields are divided by their flat-lattice response: the native panel shows a uniform field
+        as uniform (posmatrix 2026-09-11: no sub-cell position dependence), so whatever the estimate does
+        at cell sub-positions and at the frame border must cancel for uniform input. Without it the
+        mean-normalised estimate kernel left a ~2 % sub-cell sawtooth and a border ramp on a flat field
+        (the grid the owner saw on a white window, 2026-09-12)."""
+        b_true, b_est = self._raw_backlights(drives)
+        if not self.p.flat_norm:
+            return b_true, b_est
+        f_true, f_est = self.flat_response()
+        return b_true / np.maximum(f_true, 1e-6), b_est / np.maximum(f_est, 1e-6)
 
     def backlight_cell(self, drives: np.ndarray) -> np.ndarray:
         """Cell-resolution estimate: E_c = Σ_c' d_c' k(centre_c − centre_c') (one kernel, no sub-cell

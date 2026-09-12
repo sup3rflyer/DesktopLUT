@@ -211,3 +211,18 @@ def test_cell_domain_estimate_is_one_on_fields_and_blocky_around_a_cell():
     span = row[int(1760 / 5):int(2000 / 5)]                                 # three cells (the steps sit 18 px
     vals = np.unique(np.round(span, 9))                                     # right of the boundaries: the phase)
     assert 3 <= len(vals) <= 4 and np.all(np.diff(vals) > 0)
+
+
+def test_flat_field_gives_unit_gain_everywhere():
+    """A uniform field must leave every pixel untouched (flat-response normalisation), including the
+    sub-cell sawtooth of the mean-normalised estimate kernel and the frame border."""
+    from dlc.fald.model import FaldModel, FaldParams
+    m = FaldModel(FaldParams(est_phase_px=-18.0, est_phase_py=-24.5, est_aniso=0.85, est_support_cells=5,
+                             kernel_pnorm=1.75, core_mm=10.8, tail_mm=32.4, tail_frac=0.45))
+    img = np.full((3, m.h, m.w), 200.0)
+    b_true, b_est = m.backlights(m.cell_drives(img))
+    gain = b_est / b_true
+    assert np.abs(gain - 1.0).max() < 1e-6
+    # and the fields themselves are the flat drive level (normalised to the drive of the field)
+    d = float(m.cell_drives(img)[0, 0])
+    assert np.allclose(b_true, d, atol=1e-6) and np.allclose(b_est, d, atol=1e-6)
