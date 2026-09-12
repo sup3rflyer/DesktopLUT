@@ -119,7 +119,7 @@ class CalibrationController:
         return self.call("corrections.disable_all")
 
     # -- viewing layers (GUI toggles a run must measure WITHOUT) ----------------
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
 
     def set_layers(self, monitor: int, mode: str, **layers: bool) -> dict[str, Any]:
         """Toggle the viewing layers of ``monitor:mode`` exactly as the GUI checkboxes do
@@ -144,7 +144,7 @@ class CalibrationController:
         return {name: bool(entry.get(name, False)) for name in cls.LAYER_NAMES}
 
     # -- viewing layers (GUI toggles a run must measure WITHOUT) ----------------
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
 
     def set_layers(self, monitor: int, mode: str, **layers: bool) -> dict[str, Any]:
         """Toggle the viewing layers of ``monitor:mode`` exactly as the GUI checkboxes do
@@ -169,7 +169,7 @@ class CalibrationController:
         return {name: bool(entry.get(name, False)) for name in cls.LAYER_NAMES}
 
     # -- viewing layers (GUI toggles a run must measure WITHOUT) ----------------
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
 
     def set_layers(self, monitor: int, mode: str, **layers: bool) -> dict[str, Any]:
         """Toggle the viewing layers of ``monitor:mode`` exactly as the GUI checkboxes do

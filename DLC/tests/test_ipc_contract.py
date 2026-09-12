@@ -99,6 +99,9 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.clear_3dlut", mm),
         ("runtime.set_grayscale_tweak", {**mm, "grayscale_tweak": gs}),
         ("runtime.disable_grayscale_tweak", mm),
+        ("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(cube_3d)}),   # any existing file
+        ("runtime.fald_debug", {"monitor": 0, "mode": "HDR", "debug_mode": 1}),
+        ("runtime.fald_dump", {"monitor": 0, "mode": "HDR", "dir": str(tmp_path)}),
         ("mhc.remove", mm),
         ("calibration.exit", {"restore_snapshot": False}),
     ]

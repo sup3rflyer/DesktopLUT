@@ -4627,7 +4627,7 @@ def test_3dlut_only_measures_with_the_viewing_layers_off_and_restores_them(tmp_p
     assert seen and all(not any(l.values()) for l in seen)
     rec = calib.calib["viewing_layers"]
     assert rec["captured"] is True and rec["supported"] is True
-    assert rec["before"] == {"tonemap": True, "desktop_gamma": True, "white_balance": True, "grayscale": False}
+    assert rec["before"] == {"tonemap": True, "desktop_gamma": True, "white_balance": True, "grayscale": False, "fald": False}
     assert rec["disabled"] == ["desktop_gamma", "tonemap", "white_balance"]
     assert rec["regenerated"] is True                # WB/DG are MHC permutation bits → re-bake
     # the readiness digest carried it, the audit saw the pipe's (cleared) layers
@@ -4637,7 +4637,7 @@ def test_3dlut_only_measures_with_the_viewing_layers_off_and_restores_them(tmp_p
     assert hw["neutral_audit"]["gui_layers_enabled"] == []
     # restored at the end, on the applied stack
     assert rec["restored"] is True
-    assert _layers(ctrl, "0:HDR") == {"tonemap": True, "desktop_gamma": True, "white_balance": True, "grayscale": False}
+    assert _layers(ctrl, "0:HDR") == {"tonemap": True, "desktop_gamma": True, "white_balance": True, "grayscale": False, "fald": False}
     # the peak pin survived the permutation re-bake: the profile name churned but the source
     # artifact identity matched (the registry cross-check keyed on it)
     assert calib.calib["hdr_target"]["peak_nits"] == 1500.0

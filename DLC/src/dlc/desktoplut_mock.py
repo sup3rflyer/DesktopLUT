@@ -54,7 +54,7 @@ class MockDesktopLutState:
             "runtime": deepcopy(self.runtime),
             "hdr": deepcopy(self.hdr),
             # C++ reports every monitor:mode pair (absent = a fresh install, all OFF)
-            "layers": {k: {"tonemap": False, "desktop_gamma": False, "white_balance": False,
+            "layers": {k: {"tonemap": False, "fald": False, "desktop_gamma": False, "white_balance": False,
                            "grayscale": False, **(self.layers.get(k) or {})}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "command_count": self.command_count,
@@ -250,7 +250,7 @@ class MockDesktopLutServer:
                 else:
                     st.pop("correction_grayscale", None)
 
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
 
     def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
         """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
@@ -281,7 +281,7 @@ class MockDesktopLutServer:
         return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
                         "regenerated": regenerated, "profile_name": entry.get("profile_name")})
 
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
 
     def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
         """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
@@ -312,7 +312,7 @@ class MockDesktopLutServer:
         return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
                         "regenerated": regenerated, "profile_name": entry.get("profile_name")})
 
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale")
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
 
     def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
         """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
@@ -611,6 +611,34 @@ class MockDesktopLutServer:
             state["grayscale_tweak"] = deepcopy(params.get("grayscale_tweak", {}))
         elif method == "runtime.disable_grayscale_tweak":
             state.pop("grayscale_tweak", None)
+        elif method == "runtime.set_fald_params":
+            # C++ DoSetFaldParams: HDR only, the file must exist and not be a directory.
+            if params.get("mode") != "HDR":
+                return DesktopLutResponse(ok=False, error="fald is an HDR-only layer")
+            path = str(params.get("params_path") or "")
+            if not path:
+                return DesktopLutResponse(ok=False, error="missing parameter: params_path")
+            if not Path(path).is_file():
+                return DesktopLutResponse(ok=False, error="params_path is not a file")
+            state["fald_params_path"] = path
+            return self.ok({"monitor_mode": key, "params_path": path})
+        elif method == "runtime.fald_debug":
+            if params.get("mode") != "HDR":
+                return DesktopLutResponse(ok=False, error="fald is an HDR-only layer")
+            mode = params.get("debug_mode")
+            if not isinstance(mode, (int, float)):
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..3)")
+            mode = int(min(3, max(0, mode)))
+            state["fald_debug_mode"] = mode
+            return self.ok({"monitor_mode": key, "debug_mode": mode})
+        elif method == "runtime.fald_dump":
+            d = str(params.get("dir") or "")
+            if not d:
+                return DesktopLutResponse(ok=False, error="missing parameter: dir")
+            if not Path(d).is_dir():
+                return DesktopLutResponse(ok=False, error="dir does not exist")
+            return self.ok({"monitor_mode": key, "dir": d,
+                            "note": "mock: no render thread; nothing is written"})
         else:
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         return self.ok({"monitor_mode": key, "runtime": deepcopy(self.state.runtime.get(key, {}))})

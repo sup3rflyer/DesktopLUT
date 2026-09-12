@@ -153,8 +153,9 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "grayscale": ApiParamSpec("boolean", required=False, description="MHC correction-grayscale bit (optional)"),
                 "desktop_gamma": ApiParamSpec("boolean", required=False, description="Desktop Gamma bit, HDR only (optional)"),
                 "tonemap": ApiParamSpec("boolean", required=False, description="HDR tonemap shader flag, HDR only (optional)"),
+                "fald": ApiParamSpec("boolean", required=False, description="FALD compensation layer (Experimental), HDR only, overlay path (optional)"),
             },
-            {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap}",
+            {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap,fald}",
              "after": "object (same shape)", "regenerated": "boolean (MHC profile re-baked)",
              "profile_name": "string (the profile now associated)"},
             mutates_state=True,
@@ -327,6 +328,47 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "Clear the runtime 3D LUT for the target monitor/mode.",
             {"monitor": _monitor_param(), "mode": _mode_param()},
             {"monitor_mode": "string", "runtime": "object"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.set_fald_params",
+            "FALD compensation layer (Experimental, HDR only, overlay path): set the per-panel parameter "
+            "file produced by `python -m dlc.fald.export` for the target monitor. Toggle the layer with "
+            "layers.set {fald}.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "params_path": ApiParamSpec("string", description="Absolute path to the panel parameter file (*.bin)."),
+            },
+            {"monitor_mode": "string", "params_path": "string"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.fald_debug",
+            "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map, 2 real "
+            "backlight, 3 panel estimate). Not persisted.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "debug_mode": ApiParamSpec("number", description="0..3"),
+            },
+            {"monitor_mode": "string", "debug_mode": "number"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.fald_dump",
+            "FALD compensation layer: on the next frame the layer runs, dump its drive map, both "
+            "backlight fields and the frame it saw into `dir` (reference comparison against the Python "
+            "model, see results/.../sim/fald_compare_dump.py).",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "dir": ApiParamSpec("string", description="Existing directory to write fald_*.f32 / fald_frame.rgba16f / fald_dump.txt into."),
+            },
+            {"monitor_mode": "string", "dir": "string", "note": "string"},
             mutates_state=True,
             gui_thread_required=True,
         ),
