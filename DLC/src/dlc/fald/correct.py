@@ -79,6 +79,15 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         if p.gain_smooth_cells > 0:
             from scipy.ndimage import gaussian_filter
             gain = gaussian_filter(gain, sigma=(p.gain_smooth_cells * model.ch, p.gain_smooth_cells * model.cw), mode="nearest")
+        # pixel-luminance fade (2026-09-12, doc S33): the model has no baseline below ~1 nit (drive floor), and the
+        # dark-halo probe showed the correction wrong in sign on 0.5-nit grey next to a bright stroke (the owner's
+        # dark band around text). Weight 0 -> 1 over lum_fade_lo -> lum_fade_hi of the pixel's own max channel,
+        # applied per pixel AFTER the gain low-pass (the gain field stays smooth; the fade follows the content).
+        if p.lum_fade_hi > p.lum_fade_lo >= 0:
+            tl = np.clip((img.max(axis=0) - p.lum_fade_lo) / (p.lum_fade_hi - p.lum_fade_lo), 0.0, 1.0)
+            wlum = tl * tl * (3.0 - 2.0 * tl)
+            gain = 1.0 + (gain - 1.0) * wlum
+            wfade = wfade * wlum
         ped = lmax * b_true[None] * p.tmin                     # per channel, nits, actual context
         # Pedestal term, HUE-PRESERVING (2026-09-12, live A/B showed blue rims on dark edges): the
         # panel adds the same leak to all three channels, so the correction subtracts the same

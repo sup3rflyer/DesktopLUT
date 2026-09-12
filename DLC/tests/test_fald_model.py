@@ -231,3 +231,27 @@ def test_flat_field_gives_unit_gain_everywhere():
     # and the fields themselves are the flat drive level (normalised to the drive of the field)
     d = float(m.cell_drives(img)[0, 0])
     assert np.allclose(b_true, d, atol=1e-6) and np.allclose(b_est, d, atol=1e-6)
+
+
+def test_lum_fade_leaves_near_black_untouched():
+    """Pixel-luminance fade (doc S33): on a 0.3-nit field next to a bright bar the correction must be identity
+    outside the bar (the model has no baseline there); at 20 nits the same geometry must still be corrected."""
+    import numpy as np
+    from dataclasses import replace
+    from dlc.fald.model import FaldModel, FaldParams
+    from dlc.fald.correct import correct_image
+    p = FaldParams()                     # scale 5 -> integer reduced cells (16 x 9)
+    m = FaldModel(p)
+    h, w = m.h, m.w
+    def frame(grey):
+        img = np.full((3, h, w), grey, np.float64)
+        img[:, h // 2 - 40:h // 2 + 40, w // 2 - 12:w // 2 - 4] = 600.0
+        return img
+    dark = frame(0.3); req_dark = correct_image(m, dark, iters=1)["req"]
+    bar = dark[0] >= 600.0
+    assert np.allclose(req_dark[:, ~bar], dark[:, ~bar]), "0.3-nit surround must be untouched by the layer"
+    mid = frame(20.0); req_mid = correct_image(m, mid, iters=1)["req"]
+    assert np.abs(req_mid[:, ~bar] / mid[:, ~bar] - 1).max() > 0.02, "20-nit surround must still be corrected"
+    off = replace(p, lum_fade_lo=0.0, lum_fade_hi=0.0)
+    req_off = correct_image(FaldModel(off), dark, iters=1)["req"]
+    assert np.abs(req_off[:, ~bar] / np.maximum(dark[:, ~bar], 1e-9) - 1).max() > 0.02, "fade off -> correction present"

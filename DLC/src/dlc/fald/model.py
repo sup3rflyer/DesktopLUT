@@ -105,6 +105,11 @@ class FaldParams:
     fade_hi: float = 0.03                #   weight = smoothstep(fade_lo, fade_hi, B_est). Deep shadows far from
                                          #   any light were never measured; there the LCD-ceiling rule split
                                          #   channels/neighbours (contours + colour fringes, live 2026-09-12).
+    lum_fade_lo: float = 0.5             # second fade on the PIXEL'S OWN level (as-if-white nits, max channel):
+    lum_fade_hi: float = 5.0             #   weight = smoothstep(lo, hi, max(img)). Below ~1 nit the model is out of
+                                         #   its fitted domain (drive floor -> flat = 0, reference pedestal 0) and the
+                                         #   dark-halo probe (doc S33, 2026-09-12) showed it wrong in sign there: the
+                                         #   owner's dark band around white text on 0.5-nit grey. lo = hi = 0 -> off.
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
 
