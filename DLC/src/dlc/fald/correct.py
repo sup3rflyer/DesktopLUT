@@ -96,6 +96,8 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     lmax = p.white_nits * w
     tv = p.tmin_vec()[:, None, None]                          # per-channel closed-LCD transmittance
     ped_ref = reference_pedestal_rgb(model, img)               # as-if-white, per channel
+    ped_ref_w = reference_pedestal(model, img)[None]           # the white pedestal (luminance) for the split
+    tv_w = p.tmin * np.ones((3, 1, 1))
     cur = img.copy()
     gain = np.ones_like(img[0])
     for _ in range(max(1, iters)):
@@ -106,6 +108,7 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         # deep-dark fade: trust the model only where the panel's estimate is not ~zero (FaldParams.fade_*)
         t = np.clip((b_est - p.fade_lo) / max(p.fade_hi - p.fade_lo, 1e-9), 0.0, 1.0)
         wfade = t * t * (3.0 - 2.0 * t)
+        wbest = wfade                                          # B_est fade alone (the colour part keeps it)
         gain = 1.0 + (gain - 1.0) * wfade
         if p.gain_smooth_cells > 0:
             from scipy.ndimage import gaussian_filter
@@ -129,7 +132,20 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         #   "channel" (2026-09-13, coloured pedestal): each channel floors independently.
         delta = ped_ref - ped / w                              # as-if-white, per channel
         adj, floored_px = pedestal_adjust(delta, img, p.ped_mode)
-        req = (img + adj * wfade) * gain[None]
+        if p.ped_mode == "channel" and (p.ped_chroma_gain != 1.0 or p.ped_chroma_lum_fade is not None):
+            # split: white part (the "white" rule on the white pedestal) faded as before; colour part
+            # (adj − adj_white, luminance-neutral) × ped_chroma_gain × its own pixel-luminance fade
+            adj_w, _ = pedestal_adjust(ped_ref_w - lmax * b_true[None] * tv_w / w, img, "white")
+            clo, chi = p.chroma_lum_fade()
+            if chi > clo >= 0:
+                tc = np.clip((img.max(axis=0) - clo) / (chi - clo), 0.0, 1.0)
+                wchroma = wbest * (tc * tc * (3.0 - 2.0 * tc))
+            else:
+                wchroma = wbest
+            term = adj_w * wfade + (adj - adj_w) * p.ped_chroma_gain * wchroma[None]
+        else:
+            term = adj * wfade
+        req = (img + term) * gain[None]
         floored = np.broadcast_to(floored_px[None], req.shape)
         req = np.maximum(req, 0.0)
         cap = p.white_nits * np.maximum(b_est, 1e-9)[None]     # T ≤ 1  ⇔  req ≤ white·B_est

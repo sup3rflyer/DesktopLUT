@@ -134,3 +134,37 @@ def test_export_writes_fld1_without_a_colour_and_fld2_with_one(tmp_path):
     export_panel_params(FaldModel(FaldParams(**kw, tmin_rgb=m)), tmp_path / "p3.bin")
     b3 = (tmp_path / "p3.bin").read_bytes()
     assert struct.unpack("<I", b3[:4])[0] == MAGIC2 and struct.unpack("<I", b3[140:144])[0] == 0
+
+
+def test_colour_part_split_defaults_to_plain_channel_mode_and_unfades_on_request():
+    bg = ((code_of(0.5),) * 3, FULL)                            # 0.5-nit grey: inside the lum fade (weight ~0)
+    shapes = [bg, (WHITE, rect(1988 + 110, 1120 - 100, 200, 200))]
+    base = dict(BASE, gain_smooth_cells=0.0, tmin_rgb=_norm(M_RGB), ped_mode="channel")
+    m_plain = FaldModel(FaldParams(**base))
+    m_same = FaldModel(FaldParams(**base, ped_chroma_gain=1.0, ped_chroma_lum_fade=None))
+    m_free = FaldModel(FaldParams(**base, ped_chroma_gain=3.0, ped_chroma_lum_fade=(0.0, 0.0)))
+    img = m_plain.render(shapes); mask = m_plain.aperture_mask(METER)
+    r_plain = correct_image(m_plain, img)["req"]; r_same = correct_image(m_same, img)["req"]; r_free = correct_image(m_free, img)["req"]
+    assert np.allclose(r_plain, r_same), "gain 1 + fade None is the plain channel mode"
+    d_plain = (r_plain - img)[:, mask].mean(axis=1); d_free = (r_free - img)[:, mask].mean(axis=1)
+    assert np.abs(d_plain).max() < 0.02, "at 0.5 nits the faded correction does ~nothing"
+    assert d_free[2] < -0.02 and d_free[0] > 0.0, "un-faded colour part: blue down, red up on the dark grey"
+    w = np.array(m_free.p.chan_weights)
+    # luminance-neutral up to the per-channel floor (blue cannot go below 0 on a dark pixel) and the gain
+    assert abs(float(w @ (d_free - d_plain))) < 0.1 * np.abs(d_free - d_plain).max(), "the colour part is ~luminance-neutral"
+
+
+def test_export_colour_part_words(tmp_path):
+    kw = dict(est_phase_px=-18.0, est_phase_py=-24.5, est_aniso=0.85, est_support_cells=5, kernel_pnorm=1.75,
+              core_mm=10.8, tail_mm=32.4, tail_frac=0.45, tmin_rgb=_norm(M_RGB), ped_mode="channel")
+    export_panel_params(FaldModel(FaldParams(**kw)), tmp_path / "d.bin")
+    assert struct.unpack("<3f", (tmp_path / "d.bin").read_bytes()[144:156]) == (0.0, 0.0, 0.0)       # defaults
+    export_panel_params(FaldModel(FaldParams(**kw, ped_chroma_gain=3.0, ped_chroma_lum_fade=(0.0, 0.0))), tmp_path / "n.bin")
+    assert struct.unpack("<3f", (tmp_path / "n.bin").read_bytes()[144:156]) == pytest.approx((3.0, 0.0, 0.0))
+    export_panel_params(FaldModel(FaldParams(**kw, ped_chroma_lum_fade=(0.2, 1.0))), tmp_path / "f.bin")
+    assert struct.unpack("<3f", (tmp_path / "f.bin").read_bytes()[144:156]) == pytest.approx((1.0, 0.2, 1.0))
+
+
+def code_of(nits):
+    from dlc._pq import oetf_norm
+    return int(round(oetf_norm(nits / 10000.0) * 1023))

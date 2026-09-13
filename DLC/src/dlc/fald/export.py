@@ -27,7 +27,10 @@ FLD2 (magic 0x464C4432, written when the fit carries a pedestal colour, tmin_rgb
                                                        "per-channel pedestal" toggle decides whether the
                                                        shader uses them — off = white pedestal, as FLD1)
   word 35  ped_mode the fit was validated with: 0 = white, 1 = channel (informational; the GUI setting rules)
-  words 36-39  reserved (0)
+  word 36  f: ped_chroma_gain   (0 = default 1: the colour part of the pedestal term at model strength)
+  word 37  f: chroma_lum_fade_lo  word 38  f: chroma_lum_fade_hi   (pixel-luminance fade of the COLOUR part only;
+           both 0 with word 36 > 0 = NO fade; word 36 == 0 = follow lum_fade words 29/30)
+  word 39  reserved (0)
 The C++ reader is LoadFaldPanelParams (src/fald.cpp; tests/test_fald.cpp); words 26-30 are optional —
 zero means 'loader default' so older files stay loadable; an FLD1 file loads with m = (1, 1, 1).
 Keep the two in step when adding a word.
@@ -85,8 +88,10 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
            + struct.pack("<f", p.gain_smooth_cells) + struct.pack("<2f", p.lum_fade_lo, p.lum_fade_hi) + struct.pack("<I", 0))
     assert len(buf) == 32 * 4
     if v2:
+        custom = p.ped_chroma_gain != 1.0 or p.ped_chroma_lum_fade is not None
+        clo, chi = p.chroma_lum_fade() if p.ped_chroma_lum_fade is not None else (0.0, 0.0)
         buf += (struct.pack("<3f", *(float(x) for x in p.tmin_rgb)) + struct.pack("<I", PED_MODE_CODES[p.ped_mode])
-                + struct.pack("<4I", 0, 0, 0, 0))
+                + struct.pack("<3f", float(p.ped_chroma_gain) if custom else 0.0, float(clo), float(chi)) + struct.pack("<I", 0))
         assert len(buf) == 40 * 4
     buf += curve.tobytes() + np.ascontiguousarray(kt).tobytes() + np.ascontiguousarray(ke).tobytes()
     Path(path).write_bytes(buf)

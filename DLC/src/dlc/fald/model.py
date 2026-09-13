@@ -116,6 +116,16 @@ class FaldParams:
     #               independently (the least-error inverse once the colour is right; the residual where a
     #               channel floors is the pedestal's own colour, which no request can remove).
     ped_mode: str = "white"
+    # The COLOUR part of the pedestal term (adj_channel − adj_white: luminance-neutral, takes blue out / puts red
+    # back) can run with its own strength and its own pixel-luminance fade (2026-09-13 late, owner: "so it actually
+    # has an effect"): the white part + gain keep lum_fade_*; the colour part uses ped_chroma_gain × its own fade.
+    # gain 1 + fade None (= lum_fade) reproduces the plain "channel" mode. fade (0, 0) = NO pixel-luminance fade on
+    # the colour part (the B_est deep-dark fade still applies). Only meaningful in ped_mode "channel".
+    ped_chroma_gain: float = 1.0
+    ped_chroma_lum_fade: Optional[tuple[float, float]] = None
+
+    def chroma_lum_fade(self) -> tuple[float, float]:
+        return (self.lum_fade_lo, self.lum_fade_hi) if self.ped_chroma_lum_fade is None else tuple(self.ped_chroma_lum_fade)
     # meter
     aperture_px: float = 80.0
     drive_dim: float = 0.0                # relative drive at the dimmest curve point (fitted; a zero

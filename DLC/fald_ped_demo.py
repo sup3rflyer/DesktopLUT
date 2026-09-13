@@ -6,7 +6,7 @@ on DIM SATURATED colours with one channel at zero next to a bright object: the w
 there (the darkest channel is 0, so the common factor is 0), the per-channel rule subtracts the red/green excess.
 
 Frame (PQ PNG, 3840x2160): three full-white (code 1023, ~1842-nit) bars (200 px wide, at x = 960 / 1920 / 2880) and between them four
-zones at 2 / 5 / 20 / 2 nits; eight horizontal colour rows (270 px each) run across the whole width: grey, yellow,
+zones at 0.5 / 1 / 2 / 5 nits (the dark regime the colour part is about); eight horizontal colour rows (270 px each) run across the whole width: grey, yellow,
 orange, red, green, cyan, magenta, blue (max channel = the zone level, other channels 0 or 0.4), so every colour
 touches every bar. The influence reaches ~5 cells (400 px) from a bar, i.e. most of each 760-px zone.
 
@@ -24,6 +24,12 @@ Usage (DesktopLUT running on a build >= 2026-09-13 evening, HDR, overlay path, m
   PYTHONPATH="src;." python fald_ped_demo.py view <0..6>     set the debug view (5 pedestal term, 6 influence)
   PYTHONPATH="src;." python fald_ped_demo.py predict         offline: the model's influence image (|req_ch - req_wh| x100)
                                                               and per-stripe numbers -> results/.../ped_colour/demo_*
+  PYTHONPATH="src;." python fald_ped_demo.py chroma <gain> [lo hi]
+                                                              re-export the chanped panel file IN PLACE with the colour
+                                                              part of the pedestal term at <gain> x model strength and its
+                                                              own pixel-luminance fade lo..hi nits (omit = NO fade); the
+                                                              running app rebuilds within ~2 s. 1 = model strength (about
+                                                              3x what the 0.5-nit dark-halo rows measured); try 3, 10.
   PYTHONPATH="src;." python fald_ped_demo.py restore         put the previous panel file back, layer as it was
 The demo does NOT enter native (the other layers stay as they are: this is an eye test through the normal stack).
 Env: FALD_MPV_SCREEN (0), FALD_DEMO_BIN (the FLD2 panel file), FALD_OUT.
@@ -45,7 +51,7 @@ W, H = 3840, 2160
 MON = 0
 BAR_NITS = 1842.0                                                     # code 1023 = native peak: the strongest leak
 BARS = ((960, 1160), (1920, 2120), (2880, 3080))                        # x0, x1 of the three white bars
-ZONES = ((2.0, 0, 960), (5.0, 1160, 1920), (20.0, 2120, 2880), (2.0, 3080, 3840))   # level, x0, x1
+ZONES = ((0.5, 0, 960), (1.0, 1160, 1920), (2.0, 2120, 2880), (5.0, 3080, 3840))   # level, x0, x1 (the dark regime)
 STRIPES = [("grey", (1, 1, 1)), ("yellow", (1, 1, 0)), ("orange", (1, 0.4, 0)), ("red", (1, 0, 0)),
            ("green", (0, 1, 0)), ("cyan", (0, 1, 1)), ("magenta", (1, 0, 1)), ("blue", (0, 0, 1))]
 ROW_H = H // len(STRIPES)
@@ -127,6 +133,25 @@ def cmd_view(mode: int):
     print(json.dumps(c.call("runtime.fald_debug", {"monitor": MON, "mode": "HDR", "debug_mode": int(mode)}), indent=1))
 
 
+def cmd_chroma(gain: float, lo=None, hi=None):
+    """Re-export the FLD2 demo file with the colour-part gain/fade and tell the app to reload it."""
+    from dataclasses import replace
+    from dlc.fald.model import FaldModel
+    from dlc.fald.correct import load_fitted_params
+    from dlc.fald.export import export_panel_params
+    p = load_fitted_params(FIT)
+    fade = (0.0, 0.0) if lo is None else (float(lo), float(hi))
+    p = replace(p, ped_mode="channel", ped_chroma_gain=float(gain), ped_chroma_lum_fade=fade)
+    info = export_panel_params(FaldModel(p), BIN)
+    print(f"[demo] exported {BIN.name}: colour part x{gain:g}, fade {fade} ({info['format']}, {info['bytes']} bytes)")
+    try:
+        c = controller()
+        print("[demo] reload ->", c.call("runtime.set_fald_params", {"monitor": MON, "mode": "HDR", "params_path": str(BIN)}))
+        print("[demo] ped ->", c.call("runtime.fald_debug", {"monitor": MON, "mode": "HDR", "ped_mode": 1}))
+    except Exception as exc:  # noqa: BLE001
+        print("[demo] app not reachable, file written only:", exc)
+
+
 def cmd_restore():
     c = controller()
     if not STATE.exists():
@@ -148,6 +173,13 @@ def cmd_predict():
     from dlc.fald.correct import load_fitted_params, correct_image
     import fald_ab_frames as AB
     p_ch = load_fitted_params(FIT); p_wh = replace(p_ch, ped_mode="white")
+    import struct
+    if BIN.exists():                                              # mirror the demo file's colour-part knob
+        hdr = BIN.read_bytes()[:160]
+        if len(hdr) >= 160 and struct.unpack("<I", hdr[:4])[0] == 0x464C4432:
+            g, lo, hi = struct.unpack("<3f", hdr[144:156])
+            if g > 0: p_ch = replace(p_ch, ped_chroma_gain=g, ped_chroma_lum_fade=(lo, hi))
+    print(f"[predict] colour part: gain x{p_ch.ped_chroma_gain:g}, fade {p_ch.chroma_lum_fade()}")
     frame_png()                                                      # the frame itself, next to the prediction
     scale = 5
     m_ch, m_wh = FaldModel(replace(p_ch, scale=scale)), FaldModel(replace(p_wh, scale=scale))
@@ -179,10 +211,12 @@ def cmd_predict():
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "show"
+    if cmd == "chroma" and len(argv) == 4: raise SystemExit("chroma <gain> [lo hi]: give both fade bounds or neither")
     if cmd == "show": cmd_show()
     elif cmd == "ab": cmd_ab(float(argv[2]) if len(argv) > 2 else 3.0, int(argv[3]) if len(argv) > 3 else 6)
     elif cmd == "view": cmd_view(int(argv[2]))
     elif cmd == "predict": cmd_predict()
+    elif cmd == "chroma": cmd_chroma(float(argv[2]), *(argv[3:5] if len(argv) > 4 else ()))
     elif cmd == "restore": cmd_restore()
     else: raise SystemExit(__doc__)
 
