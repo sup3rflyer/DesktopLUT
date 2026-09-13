@@ -224,6 +224,18 @@ TEST_CASE("FALD loader: implausible pedestal colour words are refused") {
     }
 }
 
+TEST_CASE("FALD panel file pedestal-colour peek") {
+    FaldTempFile tf(L"test_fald_peek1.bin");
+    WriteBytes(tf.path, Image::Valid().Bytes());
+    CHECK_FALSE(FaldPanelFileHasPedColour(tf.path));
+    FaldTempFile tf2(L"test_fald_peek2.bin");
+    Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+    im.SetF(32, 1.0f); im.SetF(33, 1.0f); im.SetF(34, 1.0f);
+    WriteBytes(tf2.path, im.Bytes());
+    CHECK(FaldPanelFileHasPedColour(tf2.path));
+    CHECK_FALSE(FaldPanelFileHasPedColour(L"test_fald_peek_missing.bin"));
+}
+
 TEST_CASE("FALD constant buffer is 40 words") {
     // FillCB writes words up to index 39 (pedMode); the HLSL cbuffer FaldCB declares 10 float4 rows.
     CHECK(FALD_CB_BYTES == 160u);

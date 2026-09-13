@@ -27,7 +27,7 @@ cbuffer FaldCB : register(b0) {
     uint debugMode; uint originX; uint originY; uint blurDir;      // blurDir: 0 = horizontal, 1 = vertical pass
     float fadeLo; float fadeHi; float gainSmoothFine; float _pad2;  // gainSmoothFine: Gaussian sigma in fine samples (0 = off)
     float lumFadeLo; float lumFadeHi; float _pad3; float _pad4;     // pixel-luminance fade, as-if-white nits (lo = hi = 0: off)
-    float tminR; float tminG; float tminB; uint pedMode;            // per-channel closed-LCD transmittance (= tmin when white);
+    float tminR; float tminG; float tminB; uint pedMode;            // tmin * the panel file's leak colour (= tmin for FLD1);
                                                                     // pedMode 0 = white pedestal, common-factor subtraction;
                                                                     // 1 = coloured pedestal, per-channel floor (GUI toggle)
 };
@@ -100,6 +100,32 @@ float RawGain(float bTrue, float bEst) {
     return 1.0f + (gain - 1.0f) * wfade;
 }
 
+// Pedestal term per channel (correct.py pedestal_adjust), as-if-white nits, BEFORE the fades. mode 0 = "white":
+// tminV = tmin on all channels, one common factor on the subtraction vector so no channel goes below zero (the
+// 2026-09-12 rule: the same amount from all channels, limited by the darkest one; a per-channel clip of a WHITE
+// pedestal zeroed R/G and left B -> blue rims on dark edges). mode 1 = "channel": tminV = tmin * the file's leak
+// colour, each channel floors on its own. delta_c = ref - actual (uniform field of the pixel's own level vs this
+// context); delta > 0 is a plain lift.
+float3 PedestalAdjust(float3 img, float s, float bTrue, uint mode) {
+    float3 tminV = (mode == 1) ? float3(tminR, tminG, tminB) : float3(tmin, tmin, tmin);
+    float3 pedRef = white * DriveOf(s) * tminV;    // pedestal a uniform field of this level carries
+    float3 ped = white * bTrue * tminV;            // pedestal in THIS context
+    float3 delta = pedRef - ped;
+    if (mode == 1) return max(delta, -img);
+    float f = 1.0f;
+    if (delta.r < 0.0f) f = min(f, img.r / -delta.r);
+    if (delta.g < 0.0f) f = min(f, img.g / -delta.g);
+    if (delta.b < 0.0f) f = min(f, img.b / -delta.b);
+    return delta * f;
+}
+
+// The fade weight the correction applies at this pixel (deep-dark fade on B_est x pixel-luminance fade).
+float FadeWeight(float maxc, float bEst) {
+    float wfade = smoothstep(fadeLo, fadeHi, bEst);
+    if (lumFadeHi > lumFadeLo) wfade *= smoothstep(lumFadeLo, lumFadeHi, maxc);
+    return wfade;
+}
+
 // correct.py::correct_image for one pixel. img = as-if-white nits per channel (original frame);
 // gain = the (smoothed) gain sampled at the pixel.
 float3 Correct(float3 img, float bTrue, float bEst, float gain) {
@@ -115,25 +141,7 @@ float3 Correct(float3 img, float bTrue, float bEst, float gain) {
         gain = 1.0f + (gain - 1.0f) * wlum;
         wfade *= wlum;
     }
-    // Pedestal term per channel (correct.py pedestal_adjust). tminV = tmin * m_c: white (all equal) with the
-    // GUI toggle off or an FLD1 file; the measured leak colour with it on. delta_c = ref - actual (as-if-white).
-    float3 tminV = float3(tminR, tminG, tminB);
-    float3 pedRef = white * DriveOf(s) * tminV;    // pedestal a uniform field of this level carries
-    float3 ped = white * bTrue * tminV;            // pedestal in THIS context
-    float3 delta = pedRef - ped;
-    float3 adj;
-    if (pedMode == 1) {
-        adj = max(delta, -img);                    // "channel": each channel floors on its own
-    } else {
-        // "white": one common factor on the whole vector so no channel goes below zero (with equal deltas
-        // this is the 2026-09-12 rule: the same amount from all channels, limited by the darkest one;
-        // a per-channel clip of a WHITE pedestal zeroed R/G and left B -> blue rims on dark edges)
-        float f = 1.0f;
-        if (delta.r < 0.0f) f = min(f, img.r / -delta.r);
-        if (delta.g < 0.0f) f = min(f, img.g / -delta.g);
-        if (delta.b < 0.0f) f = min(f, img.b / -delta.b);
-        adj = delta * f;
-    }
+    float3 adj = PedestalAdjust(img, s, bTrue, pedMode);   // GUI toggle: 0 white, 1 per-channel
     float3 req = max((img + adj * wfade) * gain, 0.0f);
     if (wfade < 1.0f) return req;                  // ceiling rule only where the model is trusted
     float cap = white * max(bEst, 1e-9f);          // LCD cannot open past 100 %
@@ -257,7 +265,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 // Pass 3: per-pixel correction of the ORIGINAL processed frame with the final fields.
 // debugMode 1 = visualise gain-1 (grey 0.5 = no change, +-25 % full scale), 2 = B_true, 3 = B_est,
-// 4 = identity passthrough (the layer runs its passes but outputs the source: isolates the overlay path itself).
+// 4 = identity passthrough (the layer runs its passes but outputs the source: isolates the overlay path itself),
+// 5 = the pedestal term actually applied (|adj| * fade, per channel, x100: 1 nit of subtraction shows as 100 nits;
+//     the colour is the colour of what is subtracted or lifted), 6 = the influence of the per-channel toggle:
+//     |adj_channel - adj_white| * fade, x100 (what changes on screen when the toggle flips; black = nothing).
 inline const char* g_faldPixelSource = R"(
 struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -274,6 +285,15 @@ float4 main(PS_INPUT i) : SV_Target {
     }
     if (debugMode == 2) { float v = saturate(bT) * (100.0f / 80.0f); return float4(v, v, v, 1.0f); }
     if (debugMode == 3) { float v = saturate(bE) * (100.0f / 80.0f); return float4(v, v, v, 1.0f); }
+    if (debugMode == 5 || debugMode == 6) {
+        float maxc = max(img.r, max(img.g, img.b));
+        float s = min(maxc, white);
+        float w = FadeWeight(maxc, bE);
+        float3 a1 = PedestalAdjust(img, s, max(bT, 0.0f), 1u);
+        float3 a0 = PedestalAdjust(img, s, max(bT, 0.0f), 0u);
+        float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? a1 : a0) : abs(a1 - a0);
+        return float4(PanelNitsToScRGB(min(shown * w * 100.0f, white)), 1.0f);   // x100 nits per nit
+    }
     float3 req = Correct(img, bT, bE, gain);
     return float4(PanelNitsToScRGB(req), src.a);
 }

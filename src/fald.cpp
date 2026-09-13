@@ -92,6 +92,14 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     return true;
 }
 
+bool FaldPanelFileHasPedColour(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint32_t magic = 0;
+    f.read(reinterpret_cast<char*>(&magic), 4);
+    return f.gcount() == 4 && magic == FALD_MAGIC2;
+}
+
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height) {
     if (width <= 0 || height <= 0) return false;
     unsigned long long right = (unsigned long long)p.originX + (unsigned long long)p.cols * p.cellW;
@@ -337,11 +345,10 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     u[24] = r->debugMode; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
     f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
-    // per-channel pedestal (GUI toggle): tmin * m_c when on, tmin (white) when off or for an FLD1 file
+    // the panel file's leak colour (tmin * m_c; = tmin for FLD1) is always in the CB so the debug views can show the
+    // toggle's influence; pedMode selects it in Correct() (1 only when the file has a colour, else it is a no-op)
     const bool perChannel = (r->pedMode == 1) && p.hasPedColour;
-    f[36] = p.tmin * (perChannel ? p.pedRGB[0] : 1.0f);
-    f[37] = p.tmin * (perChannel ? p.pedRGB[1] : 1.0f);
-    f[38] = p.tmin * (perChannel ? p.pedRGB[2] : 1.0f);
+    f[36] = p.tmin * p.pedRGB[0]; f[37] = p.tmin * p.pedRGB[1]; f[38] = p.tmin * p.pedRGB[2];
     u[39] = perChannel ? 1u : 0u;
     g_context->Unmap(r->cb, 0);
 }

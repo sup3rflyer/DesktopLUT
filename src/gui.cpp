@@ -2,6 +2,7 @@
 // Main GUI window and controls
 
 #include "gui.h"
+#include "fald.h"
 #include "gui_shared.h"
 #include "gui_mhc.h"
 #include "gui_whitelist.h"
@@ -312,7 +313,7 @@ void UpdateColorCorrectionControls() {
     SendMessage(g_gui.hwndFaldEnable, BM_SETCHECK,
         hdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldPath, hdrCC.fald.paramsPath.c_str());
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(hdrCC.fald.debugMode <= 4 ? hdrCC.fald.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(hdrCC.fald.debugMode <= 6 ? hdrCC.fald.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, hdrCC.fald.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
     // The layer runs in the overlay path only: in DWM hook mode the checkbox is inert, so grey it out.
     EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
@@ -1134,7 +1135,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
                     auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
-                    fald.debugMode = (sel >= 0 && sel <= 4) ? (unsigned int)sel : 0u;
+                    fald.debugMode = (sel >= 0 && sel <= 6) ? (unsigned int)sel : 0u;
                     ApplyFaldSettingChange(fald.enabled);
                 }
             }
@@ -1147,6 +1148,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
                     fald.pedMode = on ? 1u : 0u;
                     ApplyFaldSettingChange(fald.enabled);
+                    if (on && !FaldPanelFileHasPedColour(fald.paramsPath))
+                        SetStatus(L"Per-channel pedestal: this panel file carries no leak colour (FLD1) - the toggle has no effect");
                 }
             }
             return 0;

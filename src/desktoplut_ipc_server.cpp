@@ -675,6 +675,7 @@ void HandleStateGet(JsonValue& result) {
                     l.set("fald_params_path", JStr(WideToUtf8(s.hdrColorCorrection.fald.paramsPath)));
                     l.set("fald_debug_mode", JNum((double)s.hdrColorCorrection.fald.debugMode));
                     l.set("fald_ped_mode", JNum((double)s.hdrColorCorrection.fald.pedMode));
+                    l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(s.hdrColorCorrection.fald.paramsPath)));
                 }
                 layers.set(key, l);
             }
@@ -1304,8 +1305,8 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // FALD correction layer (HDR only). runtime.set_fald_params {monitor, mode:"HDR", params_path}:
 // the per-panel parameter file (DLC `python -m dlc.fald.export`); re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
-// debug_mode 0..4}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est, 4 identity passthrough
-// (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
+// debug_mode 0..6}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
+// x100, 6 per-channel-vs-white influence x100 (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
 // FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
@@ -1352,7 +1353,7 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = g_gui.monitorSettings[mon].hdrColorCorrection.fald;
-        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 4 ? 4 : v->num));
+        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 6 ? 6 : v->num));
         if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
         mode = fs.debugMode; ped = fs.pedMode;
     }
@@ -1361,6 +1362,9 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("debug_mode", JNum((double)mode));
     result.set("ped_mode", JNum((double)ped));
+    std::wstring pathNow;
+    { std::lock_guard<std::mutex> lk(g_monitorSettingsMutex); pathNow = g_gui.monitorSettings[mon].hdrColorCorrection.fald.paramsPath; }
+    result.set("ped_colour_in_file", JBool(FaldPanelFileHasPedColour(pathNow)));   // false = an FLD1 file: ped_mode 1 is a no-op
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {

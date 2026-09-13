@@ -39,6 +39,8 @@ struct FaldPanelParams {
     std::vector<float> curve, kTrue, kEst;
 };
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err);
+// Cheap header peek: does the file at `path` carry a pedestal colour (FLD2)? false for FLD1, unreadable or missing.
+bool FaldPanelFileHasPedColour(const std::wstring& path);
 // The panel lattice (origin + cols*cellW x rows*cellH) must lie inside the monitor's frame.
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height);
 
