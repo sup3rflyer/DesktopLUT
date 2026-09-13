@@ -177,7 +177,7 @@ HDR processing uses the Dolby ICtCp color space for perceptually accurate tonema
 
 **Processing Order**: Grayscale is per-channel in Rec.2020 BEFORE ICtCp conversion. Tonemapping operates on I channel inside ICtCp. This separation allows independent R/G/B grayscale correction (display calibration) while preserving ICtCp's hue-preserving tonemapping. Combined into a single ICtCp pass (grayscale feeds directly into the Rec.2020→LMS→PQ→ICtCp chain, avoiding separate PQ encode/decode round-trips).
 
-**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). All transfer functions use precomputed 1D LUT textures — zero analytical pow() in the pixel shader hot path. BT.2446A remains linear-space (4 pow() due to complex gamma operations that resist tabulation). Guards: BT.2390 KS≥1 singularity passthrough, BT.2446A 1-nit division floor. Dynamic mode: BT.2390/BT.2446A get target-relative breathing room (1.0×–1.5× floor scaling with target nits) for guaranteed compression headroom on high-nit displays. 3% PQ hysteresis crossfade prevents flicker when detected peak oscillates near target.
+**Tonemapping**: PQ-native curves for both static and dynamic modes (BT.2390 per ITU-R spec). All transfer functions use precomputed 1D LUT textures — zero analytical pow() in the pixel shader hot path. BT.2446A remains linear-space (4 pow() due to complex gamma operations that resist tabulation). Guards: BT.2390 KS≥1 singularity passthrough, BT.2446A 1-nit division floor. Dynamic mode: BT.2390/BT.2446A get target-relative breathing room (1.0×–1.5× floor scaling with target nits) for guaranteed compression headroom on high-nit displays. 3% PQ hysteresis crossfade prevents flicker when detected peak oscillates near target. Dynamic peak detection (overlay path, 2026-09-13): every 4th pixel in both axes (960×540 samples at 4K) in one 16×16-thread group per 64×64-px tile, atomic max, then a one-thread pass for the temporal smoothing (exponential rise/fall + slew limit, unchanged). Until then it sampled an 80×45 lattice (pixels 48k, 48m): a highlight between the samples was shown uncompressed and a highlight's compression depended on where it sat against a 48-px grid. The DWM hook still uses the 80×45 lattice until it is ported.
 
 Negative scRGB values (wide-gamut) are clipped during LMS→PQ encoding (no valid PQ for negative light).
 
@@ -364,7 +364,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
 
 **Frame timing note**: These metrics measure Desktop Duplication frame delivery timing, not actual display presentation. Values fluctuate based on desktop activity and are useful for debugging the render loop, not for assessing VRR behavior or presentation quality.
 
-Implementation: Compute shader samples 3600 pixels (80x45 grid), async readback with 2-frame delay.
+Implementation: the analysis statistics sample 3600 pixels (80x45 grid), async readback with 2-frame delay. (The tonemapper's dynamic peak detector is dense — see HDR Color Pipeline; the overlay's *Peak* statistic here is still the sparse grid and can read lower than the detector on small highlights.)
 
 ## Performance
 

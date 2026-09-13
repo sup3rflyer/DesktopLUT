@@ -916,11 +916,19 @@ R"(
 }
 )";
 
-// Compute shader for dynamic peak detection
-// Single-pass sparse sampling + reduction + temporal smoothing
-inline const char* g_csSource = R"(
+// Compute shaders for dynamic peak detection — two dispatches per frame (overlay path):
+//   1. g_peakReduceCSSource: every PEAK_STRIDE-th pixel in both axes (960x540 samples at 4K), one 16x16
+//      group per 64x64-px tile, group max -> InterlockedMax into a raw uint (positive floats order as
+//      uints). Replaces the 80x45 lattice that sampled pixels (48k, 48m): a highlight between its samples
+//      was shown uncompressed, and a highlight's compression depended on its phase against a 48-px grid
+//      (up to x1.8 in luminance). Found by the DLC FALD probe on 2026-09-11 (probe doc S21), where it
+//      manufactured a false "panel peak limiter" — this is a DesktopLUT tonemap defect, not the panel.
+//      The DWM hook's copy (dwm_hook/hook_shader.h) still samples 80x45; port it when the hook is rebuilt.
+//   2. g_peakSmoothCSSource: one thread — the same temporal smoothing + slew limit as before on the raw
+//      max, writes the PQ-encoded peak the pixel shader reads (t3), resets the raw max for the next frame.
+inline const char* g_peakReduceCSSource = R"(
 Texture2D<float4> inputTexture : register(t0);
-RWTexture2D<float> peakOutput : register(u0);
+RWTexture2D<uint> peakRaw : register(u1);
 
 cbuffer PeakParams : register(b0) {
     uint frameWidth;
@@ -932,91 +940,96 @@ cbuffer PeakParams : register(b0) {
     float2 _padding;
 };
 
+#define PEAK_STRIDE 4
+
 groupshared float sharedMax[256];
 
-// Single pass: sparse sample + reduction + temporal smoothing
-// Dispatch with (1, 1, 1) groups, 256 threads
-[numthreads(256, 1, 1)]
-void main(uint3 GTid : SV_GroupThreadID) {
-    // Each thread samples a grid of pixels across the image
-    // 80x45 = 3600 samples in 16:9 aspect ratio
-    float localMax = 0.0f;
-
-    uint gridX = 80, gridY = 45;
-    uint totalSamples = gridX * gridY;  // 3600
-    uint samplesPerThread = (totalSamples + 255) / 256;  // 15 (ceil)
-
-    for (uint i = 0; i < samplesPerThread; i++) {
-        uint sampleIdx = GTid.x * samplesPerThread + i;
-        if (sampleIdx >= totalSamples) break;
-
-        uint gx = sampleIdx % gridX;
-        uint gy = sampleIdx / gridX;
-
-        uint px = (gx * frameWidth) / gridX;
-        uint py = (gy * frameHeight) / gridY;
-
-        if (px < frameWidth && py < frameHeight) {
-            float4 pixel = inputTexture.Load(int3(px, py, 0));
-            float Y = dot(pixel.rgb, float3(0.2126f, 0.7152f, 0.0722f));
-            float nits = Y * 80.0f;
-            localMax = max(localMax, nits);
-        }
+[numthreads(16, 16, 1)]
+void main(uint3 DTid : SV_DispatchThreadID, uint GI : SV_GroupIndex) {
+    uint px = DTid.x * PEAK_STRIDE;
+    uint py = DTid.y * PEAK_STRIDE;
+    float nits = 0.0f;
+    if (px < frameWidth && py < frameHeight) {
+        float4 pixel = inputTexture.Load(int3(px, py, 0));
+        float Y = dot(pixel.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+        nits = max(Y * 80.0f, 0.0f);   // scRGB: 1.0 = 80 nits; a negative (out-of-gamut) Y never counts
     }
-
-    sharedMax[GTid.x] = localMax;
+    sharedMax[GI] = nits;
     GroupMemoryBarrierWithGroupSync();
 
-    // Parallel reduction
+    // Parallel reduction inside the group
     for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (GTid.x < stride) {
-            sharedMax[GTid.x] = max(sharedMax[GTid.x], sharedMax[GTid.x + stride]);
+        if (GI < stride) {
+            sharedMax[GI] = max(sharedMax[GI], sharedMax[GI + stride]);
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
-    // Thread 0 applies temporal smoothing with slew limiting
-    if (GTid.x == 0) {
-        float framePeak = sharedMax[0];  // nits from reduction
-
-        // Read previous smoothed peak (stored as PQ) and convert back to nits
-        // peakOutput stores PQ-encoded values for the pixel shader, but smoothing
-        // must happen in nits domain (slew limits are nits-based)
-        float prevPQ = peakOutput[uint2(0, 0)];
-        float prevPeak;
-        if (prevPQ <= 0.0f) {
-            prevPeak = framePeak;  // Initialize on first frame
-        } else {
-            // PQ EOTF: PQ → linear → nits (inverse of encoding below)
-            float Np = pow(prevPQ, 1.0f / 78.84375f);
-            float L = pow(max(Np - 0.8359375f, 0.0f) / max(18.8515625f - 18.6875f * Np, 1e-10f), 1.0f / 0.1593017578125f);
-            prevPeak = L * 10000.0f;
-        }
-
-        // Hybrid: exponential smoothing + slew rate limiting (all in nits)
-        // Exponential gives smooth small changes, slew limit prevents jarring jumps
-        float target;
-        float maxDelta;
-        if (framePeak > prevPeak) {
-            target = lerp(prevPeak, framePeak, riseRate);
-            maxDelta = maxRisePerFrame;
-        } else {
-            target = lerp(prevPeak, framePeak, fallRate);
-            maxDelta = maxFallPerFrame;
-        }
-
-        // Apply slew limit - smooth transitions even for large peak changes
-        float smoothedPeak = clamp(target, prevPeak - maxDelta, prevPeak + maxDelta);
-
-        // Upper clamp prevents overflow from corrupted frames
-        smoothedPeak = clamp(smoothedPeak, 0.0f, 10000.0f);
-
-        // Convert smoothed nits to PQ for storage (pixel shader reads as PQ)
-        // PQ OETF: nits → linear → PQ (runs once per frame, 1 thread)
-        float Y = max(smoothedPeak / 10000.0f, 1e-10f);
-        float Ym = pow(Y, 0.1593017578125f);
-        peakOutput[uint2(0, 0)] = pow((0.8359375f + 18.8515625f * Ym) / (1.0f + 18.6875f * Ym), 78.84375f);
+    // One atomic per group: non-negative floats compare like their bit patterns
+    if (GI == 0) {
+        InterlockedMax(peakRaw[uint2(0, 0)], asuint(sharedMax[0]));
     }
+}
+)";
+
+inline const char* g_peakSmoothCSSource = R"(
+RWTexture2D<float> peakOutput : register(u0);
+RWTexture2D<uint> peakRaw : register(u1);
+
+cbuffer PeakParams : register(b0) {
+    uint frameWidth;
+    uint frameHeight;
+    float riseRate;    // Exponential rise rate (e.g., 0.3)
+    float fallRate;    // Exponential fall rate (e.g., 0.05)
+    float maxRisePerFrame;  // Slew limit for rise (nits/frame, e.g., 100)
+    float maxFallPerFrame;  // Slew limit for fall (nits/frame, e.g., 50)
+    float2 _padding;
+};
+
+// Dispatch with (1, 1, 1) groups after the reduction pass
+[numthreads(1, 1, 1)]
+void main() {
+    float framePeak = asfloat(peakRaw[uint2(0, 0)]);  // nits: this frame's max over the sample lattice
+    peakRaw[uint2(0, 0)] = 0;                          // reset for the next frame's reduction
+
+
+    // Read previous smoothed peak (stored as PQ) and convert back to nits
+    // peakOutput stores PQ-encoded values for the pixel shader, but smoothing
+    // must happen in nits domain (slew limits are nits-based)
+    float prevPQ = peakOutput[uint2(0, 0)];
+    float prevPeak;
+    if (prevPQ <= 0.0f) {
+        prevPeak = framePeak;  // Initialize on first frame
+    } else {
+        // PQ EOTF: PQ → linear → nits (inverse of encoding below)
+        float Np = pow(prevPQ, 1.0f / 78.84375f);
+        float L = pow(max(Np - 0.8359375f, 0.0f) / max(18.8515625f - 18.6875f * Np, 1e-10f), 1.0f / 0.1593017578125f);
+        prevPeak = L * 10000.0f;
+    }
+
+    // Hybrid: exponential smoothing + slew rate limiting (all in nits)
+    // Exponential gives smooth small changes, slew limit prevents jarring jumps
+    float target;
+    float maxDelta;
+    if (framePeak > prevPeak) {
+        target = lerp(prevPeak, framePeak, riseRate);
+        maxDelta = maxRisePerFrame;
+    } else {
+        target = lerp(prevPeak, framePeak, fallRate);
+        maxDelta = maxFallPerFrame;
+    }
+
+    // Apply slew limit - smooth transitions even for large peak changes
+    float smoothedPeak = clamp(target, prevPeak - maxDelta, prevPeak + maxDelta);
+
+    // Upper clamp prevents overflow from corrupted frames
+    smoothedPeak = clamp(smoothedPeak, 0.0f, 10000.0f);
+
+    // Convert smoothed nits to PQ for storage (pixel shader reads as PQ)
+    // PQ OETF: nits → linear → PQ (runs once per frame, 1 thread)
+    float Y = max(smoothedPeak / 10000.0f, 1e-10f);
+    float Ym = pow(Y, 0.1593017578125f);
+    peakOutput[uint2(0, 0)] = pow((0.8359375f + 18.8515625f * Ym) / (1.0f + 18.6875f * Ym), 78.84375f);
 }
 )";
 

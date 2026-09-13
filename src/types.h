@@ -571,6 +571,8 @@ struct MonitorContext {
     ID3D11Texture2D* peakTexture = nullptr;           // 1x1 R32_FLOAT for smoothed peak
     ID3D11UnorderedAccessView* peakUAV = nullptr;     // UAV for compute shader write
     ID3D11ShaderResourceView* peakSRV = nullptr;      // SRV for pixel shader read
+    ID3D11Texture2D* peakRawTexture = nullptr;        // 1x1 R32_UINT: this frame's raw max (InterlockedMax target)
+    ID3D11UnorderedAccessView* peakRawUAV = nullptr;  //   ... reset by the smoothing pass every frame
     ID3D11Texture2D* peakStagingTexture = nullptr;    // Staging texture for CPU readback
     ID3D11Texture2D* peakStagingTexture2 = nullptr;  // Second staging for double-buffered readback
     int peakStagingReadIndex = 0;                     // Alternates 0/1 for deferred readback

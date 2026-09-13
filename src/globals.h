@@ -19,7 +19,8 @@ extern ID3D11Device* g_device;
 extern ID3D11DeviceContext* g_context;
 extern ID3D11VertexShader* g_vs;
 extern ID3D11PixelShader* g_ps;
-extern ID3D11ComputeShader* g_peakDetectCS;  // Compute shader for dynamic peak detection
+extern ID3D11ComputeShader* g_peakDetectCS;  // Compute shader for dynamic peak detection (dense reduction pass)
+extern ID3D11ComputeShader* g_peakSmoothCS;  // ... second pass: temporal smoothing of the raw max -> PQ peak
 extern ID3D11Buffer* g_peakCB;               // Constant buffer for peak detection parameters
 extern ID3D11ComputeShader* g_analysisCS;    // Compute shader for frame analysis
 extern ID3D11Buffer* g_analysisCB;           // Constant buffer for analysis parameters

@@ -76,7 +76,7 @@ bool InitD3D() {
 
     // Compile compute shader for dynamic peak detection
     ID3DBlob* csBlob = nullptr;
-    hr = D3DCompile(g_csSource, strlen(g_csSource), "CS", nullptr, nullptr,
+    hr = D3DCompile(g_peakReduceCSSource, strlen(g_peakReduceCSSource), "PeakReduceCS", nullptr, nullptr,
         "main", "cs_5_0", 0, 0, &csBlob, &errorBlob);
     if (FAILED(hr)) {
         if (errorBlob) {
@@ -94,6 +94,31 @@ bool InitD3D() {
             g_peakDetectCS = nullptr;
         }
 
+        // Second pass (temporal smoothing of the raw max). Both or neither: the pixel shader's
+        // dynamic-peak input is only valid when the smoothing pass ran.
+        if (g_peakDetectCS) {
+            ID3DBlob* smBlob = nullptr;
+            hr = D3DCompile(g_peakSmoothCSSource, strlen(g_peakSmoothCSSource), "PeakSmoothCS", nullptr, nullptr,
+                "main", "cs_5_0", 0, 0, &smBlob, &errorBlob);
+            if (FAILED(hr)) {
+                if (errorBlob) {
+                    std::cerr << "CS Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+                    errorBlob->Release(); errorBlob = nullptr;
+                }
+                std::cerr << "Warning: peak smoothing shader compilation failed, dynamic peak detection disabled" << std::endl;
+                g_peakDetectCS->Release(); g_peakDetectCS = nullptr;
+            } else {
+                if (errorBlob) { errorBlob->Release(); errorBlob = nullptr; }
+                hr = g_device->CreateComputeShader(smBlob->GetBufferPointer(), smBlob->GetBufferSize(), nullptr, &g_peakSmoothCS);
+                smBlob->Release();
+                if (FAILED(hr)) {
+                    std::cerr << "Failed to create peak smoothing compute shader: 0x" << std::hex << hr << std::dec << std::endl;
+                    g_peakSmoothCS = nullptr;
+                    g_peakDetectCS->Release(); g_peakDetectCS = nullptr;
+                }
+            }
+        }
+
         // Create constant buffer for peak detection parameters (only if shader succeeded)
         if (g_peakDetectCS) {
             D3D11_BUFFER_DESC peakCbDesc = {};
@@ -106,6 +131,7 @@ bool InitD3D() {
                 std::cerr << "Failed to create peak CB: 0x" << std::hex << hr << std::endl;
                 g_peakDetectCS->Release();
                 g_peakDetectCS = nullptr;
+                if (g_peakSmoothCS) { g_peakSmoothCS->Release(); g_peakSmoothCS = nullptr; }
             }
         }
     }
@@ -572,6 +598,8 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     if (ctx->peakSRV) { ctx->peakSRV->Release(); ctx->peakSRV = nullptr; }
     if (ctx->peakUAV) { ctx->peakUAV->Release(); ctx->peakUAV = nullptr; }
     if (ctx->peakTexture) { ctx->peakTexture->Release(); ctx->peakTexture = nullptr; }
+    if (ctx->peakRawUAV) { ctx->peakRawUAV->Release(); ctx->peakRawUAV = nullptr; }
+    if (ctx->peakRawTexture) { ctx->peakRawTexture->Release(); ctx->peakRawTexture = nullptr; }
     if (ctx->peakStagingTexture) { ctx->peakStagingTexture->Release(); ctx->peakStagingTexture = nullptr; }
     if (ctx->peakStagingTexture2) { ctx->peakStagingTexture2->Release(); ctx->peakStagingTexture2 = nullptr; }
     FaldReleaseResources(ctx);
@@ -680,6 +708,7 @@ void ReleaseSharedD3DResources() {
     if (g_samplerWrap) { g_samplerWrap->Release(); g_samplerWrap = nullptr; }
     ReleaseFaldShaders();
     if (g_peakDetectCS) { g_peakDetectCS->Release(); g_peakDetectCS = nullptr; }
+    if (g_peakSmoothCS) { g_peakSmoothCS->Release(); g_peakSmoothCS = nullptr; }
     if (g_peakCB) { g_peakCB->Release(); g_peakCB = nullptr; }
     if (g_analysisCS) { g_analysisCS->Release(); g_analysisCS = nullptr; }
     if (g_analysisCB) { g_analysisCB->Release(); g_analysisCB = nullptr; }

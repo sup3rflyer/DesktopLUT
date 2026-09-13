@@ -12,6 +12,7 @@ ID3D11DeviceContext* g_context = nullptr;
 ID3D11VertexShader* g_vs = nullptr;
 ID3D11PixelShader* g_ps = nullptr;
 ID3D11ComputeShader* g_peakDetectCS = nullptr;
+ID3D11ComputeShader* g_peakSmoothCS = nullptr;
 ID3D11Buffer* g_peakCB = nullptr;
 ID3D11ComputeShader* g_analysisCS = nullptr;
 ID3D11Buffer* g_analysisCB = nullptr;

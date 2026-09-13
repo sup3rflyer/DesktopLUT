@@ -528,7 +528,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             CreatePeakDetectionResources(ctx);
         }
 
-        if (ctx->peakTexture && ctx->peakUAV) {
+        if (ctx->peakTexture && ctx->peakUAV && ctx->peakRawUAV && g_peakSmoothCS) {
             // Update peak constant buffer only when dimensions change (static values stay valid)
             if (ctx->width != ctx->lastPeakCBWidth || ctx->height != ctx->lastPeakCBHeight) {
                 D3D11_MAPPED_SUBRESOURCE mapped;
@@ -550,16 +550,20 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
                 }
             }
 
-            // Dispatch compute shader
+            // Pass 1: dense reduction (every 4th pixel, one 16x16 group per 64x64-px tile) -> raw max;
+            // pass 2: temporal smoothing on one thread -> PQ peak. u0 = smoothed PQ peak, u1 = raw max.
+            ID3D11UnorderedAccessView* uavs[2] = { ctx->peakUAV, ctx->peakRawUAV };
             g_context->CSSetShader(g_peakDetectCS, nullptr, 0);
             g_context->CSSetConstantBuffers(0, 1, &g_peakCB);
             g_context->CSSetShaderResources(0, 1, &ctx->captureSRV);
-            g_context->CSSetUnorderedAccessViews(0, 1, &ctx->peakUAV, nullptr);
+            g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+            g_context->Dispatch((UINT)((ctx->width + 63) / 64), (UINT)((ctx->height + 63) / 64), 1);
+            g_context->CSSetShader(g_peakSmoothCS, nullptr, 0);
             g_context->Dispatch(1, 1, 1);
 
-            // Unbind UAV to allow SRV binding
-            ID3D11UnorderedAccessView* nullUAV = nullptr;
-            g_context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+            // Unbind UAVs to allow SRV binding
+            ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
+            g_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
             ID3D11ShaderResourceView* nullSRV = nullptr;
             g_context->CSSetShaderResources(0, 1, &nullSRV);
 

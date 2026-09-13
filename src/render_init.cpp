@@ -94,8 +94,8 @@ void UnregisterDisplayPowerNotification() {
 
 // Create peak detection resources for dynamic tonemapping
 bool CreatePeakDetectionResources(MonitorContext* ctx) {
-    if (!g_peakDetectCS || !g_peakCB) {
-        return false;  // Compute shader not available
+    if (!g_peakDetectCS || !g_peakSmoothCS || !g_peakCB) {
+        return false;  // Compute shaders not available
     }
 
     // Create 1x1 R32_FLOAT texture for peak storage
@@ -137,6 +137,26 @@ bool CreatePeakDetectionResources(MonitorContext* ctx) {
         ctx->peakTexture = nullptr;
         return false;
     }
+
+    // Raw per-frame max (uint bit pattern of the nits float) for the dense reduction pass; the
+    // smoothing pass reads and resets it, so it must start at zero.
+    D3D11_TEXTURE2D_DESC rawDesc = texDesc;
+    rawDesc.Format = DXGI_FORMAT_R32_UINT;
+    rawDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    hr = g_device->CreateTexture2D(&rawDesc, nullptr, &ctx->peakRawTexture);
+    if (SUCCEEDED(hr)) hr = g_device->CreateUnorderedAccessView(ctx->peakRawTexture, nullptr, &ctx->peakRawUAV);
+    if (FAILED(hr)) {
+        std::cerr << "Monitor " << ctx->index << " failed to create peak raw-max texture/UAV: 0x"
+                  << std::hex << hr << std::dec << std::endl;
+        if (ctx->peakRawUAV) { ctx->peakRawUAV->Release(); ctx->peakRawUAV = nullptr; }
+        if (ctx->peakRawTexture) { ctx->peakRawTexture->Release(); ctx->peakRawTexture = nullptr; }
+        ctx->peakSRV->Release(); ctx->peakSRV = nullptr;
+        ctx->peakUAV->Release(); ctx->peakUAV = nullptr;
+        ctx->peakTexture->Release(); ctx->peakTexture = nullptr;
+        return false;
+    }
+    const UINT zero[4] = { 0, 0, 0, 0 };
+    g_context->ClearUnorderedAccessViewUint(ctx->peakRawUAV, zero);
 
     std::cout << "Monitor " << ctx->index << " peak detection resources created" << std::endl;
     return true;
