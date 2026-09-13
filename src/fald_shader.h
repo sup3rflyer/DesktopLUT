@@ -30,6 +30,8 @@ cbuffer FaldCB : register(b0) {
     float tminR; float tminG; float tminB; uint pedMode;            // tmin * the panel file's leak colour (= tmin for FLD1);
                                                                     // pedMode 0 = white pedestal, common-factor subtraction;
                                                                     // 1 = coloured pedestal, per-channel floor (GUI toggle)
+    float chromaGain; float chromaLo; float chromaHi; float _pad5;  // colour part of the pedestal term: strength + its own
+                                                                    // pixel-luminance fade (lo = hi = 0: none)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -126,6 +128,19 @@ float FadeWeight(float maxc, float bEst) {
     return wfade;
 }
 
+// The pedestal term as applied (as-if-white nits, fades included). pedMode 1 splits it: the white part (the "white"
+// rule) keeps the correction's fade, the COLOUR part (adj_channel - adj_white, luminance-neutral) runs at chromaGain
+// with its own pixel-luminance fade (chromaLo/Hi; 0/0 = none) on top of the B_est deep-dark fade.
+float3 PedestalTerm(float3 img, float s, float bTrue, float bEst, float maxc, uint mode) {
+    float3 a0 = PedestalAdjust(img, s, bTrue, 0u);
+    float wfade = FadeWeight(maxc, bEst);
+    if (mode != 1) return a0 * wfade;
+    float3 a1 = PedestalAdjust(img, s, bTrue, 1u);
+    float wchroma = smoothstep(fadeLo, fadeHi, bEst);
+    if (chromaHi > chromaLo) wchroma *= smoothstep(chromaLo, chromaHi, maxc);
+    return a0 * wfade + (a1 - a0) * chromaGain * wchroma;
+}
+
 // correct.py::correct_image for one pixel. img = as-if-white nits per channel (original frame);
 // gain = the (smoothed) gain sampled at the pixel.
 float3 Correct(float3 img, float bTrue, float bEst, float gain) {
@@ -141,8 +156,8 @@ float3 Correct(float3 img, float bTrue, float bEst, float gain) {
         gain = 1.0f + (gain - 1.0f) * wlum;
         wfade *= wlum;
     }
-    float3 adj = PedestalAdjust(img, s, bTrue, pedMode);   // GUI toggle: 0 white, 1 per-channel
-    float3 req = max((img + adj * wfade) * gain, 0.0f);
+    float3 term = PedestalTerm(img, s, bTrue, bEst, maxc, pedMode);   // GUI toggle: 0 white, 1 per-channel
+    float3 req = max((img + term) * gain, 0.0f);
     if (wfade < 1.0f) return req;                  // ceiling rule only where the model is trusted
     float cap = white * max(bEst, 1e-9f);          // LCD cannot open past 100 %
     float3 keep = max(img, cap);                   // saturated highlight: keep the original request
@@ -288,11 +303,10 @@ float4 main(PS_INPUT i) : SV_Target {
     if (debugMode == 5 || debugMode == 6) {
         float maxc = max(img.r, max(img.g, img.b));
         float s = min(maxc, white);
-        float w = FadeWeight(maxc, bE);
-        float3 a1 = PedestalAdjust(img, s, max(bT, 0.0f), 1u);
-        float3 a0 = PedestalAdjust(img, s, max(bT, 0.0f), 0u);
-        float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? a1 : a0) : abs(a1 - a0);
-        return float4(PanelNitsToScRGB(min(shown * w * 100.0f, white)), 1.0f);   // x100 nits per nit
+        float3 t1 = PedestalTerm(img, s, max(bT, 0.0f), bE, maxc, 1u);   // per-channel, as applied (gain + fades)
+        float3 t0 = PedestalTerm(img, s, max(bT, 0.0f), bE, maxc, 0u);   // white
+        float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? t1 : t0) : abs(t1 - t0);
+        return float4(PanelNitsToScRGB(min(shown * 100.0f, white)), 1.0f);   // x100 nits per nit
     }
     float3 req = Correct(img, bT, bE, gain);
     return float4(PanelNitsToScRGB(req), src.a);

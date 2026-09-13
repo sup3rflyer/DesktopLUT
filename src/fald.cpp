@@ -67,6 +67,13 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     if (u[0] == FALD_MAGIC2) {                                                              // words 32-34: pedestal colour, 35: validated mode
         out.pedRGB[0] = fl[32]; out.pedRGB[1] = fl[33]; out.pedRGB[2] = fl[34];
         out.pedModeFile = u[35]; out.hasPedColour = true;
+        if (u[36] != 0) {                                                                   // word 36: colour-part gain (0 = default)
+            out.chromaGain = fl[36];
+            if (!(out.chromaGain > 0.0f && out.chromaGain <= 100.0f)) { err = "implausible pedestal chroma gain"; return false; }
+            if (u[37] == 0 && u[38] == 0) { out.chromaLo = 0.0f; out.chromaHi = 0.0f; }   // no fade on the colour part
+            else if (fl[38] > fl[37] && fl[37] >= 0.0f) { out.chromaLo = fl[37]; out.chromaHi = fl[38]; }
+            else { err = "implausible pedestal chroma fade words"; return false; }
+        }
         float lum = out.w[0] * out.pedRGB[0] + out.w[1] * out.pedRGB[1] + out.w[2] * out.pedRGB[2];
         if (!(out.pedRGB[0] >= 0.0f && out.pedRGB[1] >= 0.0f && out.pedRGB[2] >= 0.0f) ||
             !(out.pedRGB[0] <= 8.0f && out.pedRGB[1] <= 8.0f && out.pedRGB[2] <= 8.0f) ||
@@ -277,7 +284,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 40 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 44 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -350,6 +357,10 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     const bool perChannel = (r->pedMode == 1) && p.hasPedColour;
     f[36] = p.tmin * p.pedRGB[0]; f[37] = p.tmin * p.pedRGB[1]; f[38] = p.tmin * p.pedRGB[2];
     u[39] = perChannel ? 1u : 0u;
+    // colour-part strength + its own pixel-luminance fade (-1 = follow lumFade): words 40-42
+    f[40] = p.chromaGain;
+    f[41] = (p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo;
+    f[42] = (p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi;
     g_context->Unmap(r->cb, 0);
 }
 
@@ -502,6 +513,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\nout_file " << (bpp == 8 ? "fald_out.rgba16f" : "fald_out.rgb10a2") << " (same format; the layer's OUTPUT, debug mode " << r->debugMode << ")"
          << "\nped_mode " << (((r->pedMode == 1) && p.hasPedColour) ? "channel" : "white")
          << "\nped_rgb " << p.pedRGB[0] << " " << p.pedRGB[1] << " " << p.pedRGB[2] << (p.hasPedColour ? " (FLD2)" : " (FLD1, white)")
+         << "\nped_chroma_gain " << p.chromaGain << " fade " << ((p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo) << " " << ((p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi)
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }

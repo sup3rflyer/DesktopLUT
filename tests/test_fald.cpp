@@ -236,8 +236,44 @@ TEST_CASE("FALD panel file pedestal-colour peek") {
     CHECK_FALSE(FaldPanelFileHasPedColour(L"test_fald_peek_missing.bin"));
 }
 
-TEST_CASE("FALD constant buffer is 40 words") {
-    // FillCB writes words up to index 39 (pedMode); the HLSL cbuffer FaldCB declares 10 float4 rows.
-    CHECK(FALD_CB_BYTES == 160u);
+TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
+    FaldPanelParams p; std::string err;
+    {
+        FaldTempFile tf(L"test_fald_chroma_default.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, 1.0f); im.SetF(33, 1.0f); im.SetF(34, 1.0f);                 // word 36 == 0: defaults
+        WriteBytes(tf.path, im.Bytes());
+        REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(p.chromaGain == doctest::Approx(1.0f)); CHECK(p.chromaLo < 0.0f); CHECK(p.chromaHi < 0.0f);
+    }
+    {
+        FaldTempFile tf(L"test_fald_chroma_nofade.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, 1.0f); im.SetF(33, 1.0f); im.SetF(34, 1.0f); im.SetF(36, 3.0f);   // gain 3, no fade
+        WriteBytes(tf.path, im.Bytes());
+        REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(p.chromaGain == doctest::Approx(3.0f)); CHECK(p.chromaLo == doctest::Approx(0.0f)); CHECK(p.chromaHi == doctest::Approx(0.0f));
+    }
+    {
+        FaldTempFile tf(L"test_fald_chroma_fade.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, 1.0f); im.SetF(33, 1.0f); im.SetF(34, 1.0f); im.SetF(36, 2.0f); im.SetF(37, 0.2f); im.SetF(38, 1.0f);
+        WriteBytes(tf.path, im.Bytes());
+        REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(p.chromaLo == doctest::Approx(0.2f)); CHECK(p.chromaHi == doctest::Approx(1.0f));
+    }
+    {
+        FaldTempFile tf(L"test_fald_chroma_bad.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, 1.0f); im.SetF(33, 1.0f); im.SetF(34, 1.0f); im.SetF(36, 2.0f); im.SetF(37, 1.0f); im.SetF(38, 0.2f);   // lo > hi
+        WriteBytes(tf.path, im.Bytes());
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("chroma") != std::string::npos);
+    }
+}
+
+TEST_CASE("FALD constant buffer is 44 words") {
+    // FillCB writes words up to index 42 (chromaHi); the HLSL cbuffer FaldCB declares 11 float4 rows.
+    CHECK(FALD_CB_BYTES == 176u);
     CHECK(FALD_CB_BYTES % 16 == 0);
 }

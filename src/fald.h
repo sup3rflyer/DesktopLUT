@@ -15,8 +15,8 @@
 struct MonitorContext;
 struct FaldSettings;
 
-// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 40 words.
-constexpr unsigned int FALD_CB_BYTES = 160;
+// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 44 words.
+constexpr unsigned int FALD_CB_BYTES = 176;
 
 // Parsed panel parameter file.
 struct FaldPanelParams {
@@ -35,6 +35,9 @@ struct FaldPanelParams {
     float pedRGB[3] = { 1.0f, 1.0f, 1.0f };   // pedestal colour multipliers m_c on tmin (FLD2 words 32-34; sum w*m = 1).
                                              // FLD1 = white (1,1,1). Used only with FaldSettings::pedMode == 1.
     unsigned int pedModeFile = 0;            // FLD2 word 35: the mode the fit was validated with (informational)
+    float chromaGain = 1.0f;                 // FLD2 word 36: strength of the COLOUR part of the pedestal term (channel mode)
+    float chromaLo = -1.0f, chromaHi = -1.0f; // FLD2 words 37/38: its own pixel-luminance fade; -1/-1 = follow lumFade;
+                                             // 0/0 = no pixel-luminance fade on the colour part (experiment knob)
     bool hasPedColour = false;               // FLD2 file (the loader saw words 32-34)
     std::vector<float> curve, kTrue, kEst;
 };
