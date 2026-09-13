@@ -327,6 +327,33 @@ Input → Grayscale → Primaries → 3D LUT → Output
   - Avoids undulations that smoothstep can cause in gradients
   - Each slider affects only immediate neighbors (predictable)
 
+## FALD Compensation (Experimental)
+
+Per-pixel correction of a mini-LED (full-array local dimming) panel's *context-dependent* errors: the grey
+next to a highlight that reads 6–20 % off because the panel's own backlight compensation mis-estimates the
+light spread. The layer predicts the panel's real backlight and the panel's own estimate from the frame and
+pre-distorts each pixel so it lands where it would in a flat field of its own level.
+
+- **Overlay path, HDR only.** Off in DWM hook mode (the status line says so when you enable it there).
+- **Needs a per-panel parameter file** (Corrections tab → *Panel file*; INI `HDR_FaldParamsPath`), produced by
+  the DLC calibrator's spatial probe + `python -m dlc.fald.export`. Only the ASUS PA32UCXR has one
+  (`DLC/results/fald_native_2026-09-11/pa32ucxr_fald_panel.bin`, local); another panel needs its own probe
+  (~3 h with a meter — the code is panel-agnostic, the numbers are not). The layer refuses, logging once,
+  when the file's zone lattice does not fit the monitor's resolution.
+- **Not a bloom remover.** Light leaking through a closed LCD (the blue pedestal under black beside a
+  highlight), the peak loss of small highlights (a 160 px window on the PA32UCXR reaches 47 % of full-field
+  white) and content below the LED floor (~0.5 nit) are panel physics a pixel shader cannot change.
+- **Calibrate with the layer OFF.** Calibration mode (`calibration.enter`) clears it; a meter reading through
+  it depends on the surround, not just the patch.
+- *View* combo: 0 correct, 1 gain map (grey 0.5 = no change), 2 / 3 predicted backlight (true / panel's
+  estimate), 4 identity passthrough (the A/B baseline — the awake overlay itself differs from the sleeping
+  overlay by 0.5–2 % at low levels, so compare against 4, not against OFF).
+- INI per monitor: `HDR_FaldEnabled`, `HDR_FaldParamsPath`. Pipe: `layers.set {fald}`, `runtime.set_fald_params`,
+  `runtime.fald_debug`, `runtime.fald_dump` (writes the model fields, the input and the output frame for a
+  reference comparison). Settings changes re-process the last frame, so they show on a static desktop.
+- Cost: four small compute passes on the zone grid (48×48 × 2 sub-cells on the PA32UCXR) plus one full-screen
+  pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
+
 ## Analysis Overlay (Win+Shift+X)
 
 - Luminance: Peak, Min, Min>0, Average nits, APL, %HDR

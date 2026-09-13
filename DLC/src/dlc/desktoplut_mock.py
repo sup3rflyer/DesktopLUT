@@ -82,6 +82,9 @@ class MockDesktopLutServer:
                 out = self.state.as_dict()
                 out["contract_version"] = CONTRACT_VERSION
                 out["hook"] = self.hook_view()
+                # C++ 2026-09-13: which path renders the frame (overlay awake unless nothing needs
+                # it; the sim is never in DWM-hook mode)
+                out["overlay"] = {"awake": bool(self.state.corrections_enabled), "dwm_hook_mode": False}
                 return self.ok(out)
             if method == "hook.set_routing":
                 return self.handle_hook_set_routing(params)

@@ -45,17 +45,22 @@ GUI_LAYER_KEYS: tuple[str, ...] = (
     "TonemapEnabled", "TonemapDynamic", "MaxTmlEnabled", "MaxTmlPeak",
     "MHCDesktopGamma", "MHCWhiteBalanceEnabled", "MHCCorrGSEnabled",
     "MHCEnabled", "MHCProfilePath", "MHCSourceFile",
+    "FaldEnabled", "FaldParamsPath",
 )
 
 # ini key → human label for the refusal message. Every one of these is a layer the C++
 # DoEnterNeutral is supposed to clear for the calibrated mode.
+# The FALD compensation layer (2026-09-12, HDR overlay path) is context-dependent: a patch read
+# through it depends on the surround, so DLC must never measure with it on (fald-lessons items 7/8).
 _PIPE_LAYER_LABELS = {"tonemap": "HDR tonemap", "desktop_gamma": "Desktop Gamma",
-                      "white_balance": "GUI white balance", "grayscale": "GUI grayscale correction"}
+                      "white_balance": "GUI white balance", "grayscale": "GUI grayscale correction",
+                      "fald": "FALD compensation layer"}
 _LAYER_LABELS: dict[str, str] = {
     "TonemapEnabled": "HDR tonemap",
     "MHCDesktopGamma": "Desktop Gamma",
     "MHCWhiteBalanceEnabled": "GUI white balance",
     "MHCCorrGSEnabled": "GUI grayscale correction",
+    "FaldEnabled": "FALD compensation layer",
 }
 
 _BOOTSTRAP_COLORSPACE = {"HDR": "Rec.2020", "SDR": "Rec.709"}
@@ -180,7 +185,12 @@ def neutral_state_audit(controller: Any, monitor: int, mode: str, *,
     * ``profile_name`` / ``mhc_associated`` — is an MHC profile associated for the key
     * ``flags`` — the ini GUI-layer flags (``{}`` + note when unavailable)
     * ``gui_layers_enabled`` — the labels of layers the ini says are ON (subset of
-      tonemap / Desktop Gamma / WB / GS); empty when the ini is unavailable
+      tonemap / Desktop Gamma / WB / GS / FALD); empty when the ini is unavailable
+    * ``hook`` / ``overlay`` — which path renders the frame the meter sees: the DWM hook's
+      ``{active, needs_check}`` and the overlay's ``{awake, dwm_hook_mode}`` (``None`` on a build
+      that does not report them). Evidence, not a verdict: the awake overlay reads 0.5-2.4 %
+      below the sleeping one at low levels (fald-lessons item 5), so the run record must say
+      which path the calibration was measured through.
     """
     key = f"{int(monitor)}:{str(mode).upper()}"
     out: dict[str, Any] = {"key": key, "notes": []}
@@ -198,6 +208,11 @@ def neutral_state_audit(controller: Any, monitor: int, mode: str, *,
         runtime_entry = dict((state.get("runtime") or {}).get(key) or {})
         pl = (state.get("layers") or {}).get(key)
         pipe_layers = dict(pl) if isinstance(pl, dict) else None
+        hook = state.get("hook")
+        out["hook"] = ({"active": bool(hook.get("active")), "needs_check": bool(hook.get("needs_check"))}
+                       if isinstance(hook, dict) else None)
+        overlay = state.get("overlay")
+        out["overlay"] = dict(overlay) if isinstance(overlay, dict) else None
         out["state_ok"] = True
     except Exception as exc:  # noqa: BLE001
         out["state_ok"] = False

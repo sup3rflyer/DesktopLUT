@@ -683,6 +683,13 @@ void HandleStateGet(JsonValue& result) {
     result.set("runtime", runtime);
     result.set("layers", layers);
     result.set("hook", BuildHookStateJson());
+    // Which path renders what a meter sees (DLC readiness evidence, fald-lessons item 5): the
+    // awake FP16 overlay reads 0.5-2.4 % below the sleeping one at low levels; in hook mode the
+    // overlay-only layers (tonemap, FALD) are off regardless of their flags.
+    JsonValue overlay = JObj();
+    overlay.set("awake", JBool(g_gui.isRunning && !g_overlayAutoSleep.load()));
+    overlay.set("dwm_hook_mode", JBool(g_dwmHookMode.load()));
+    result.set("overlay", overlay);
 }
 
 void HandleCalibStatus(JsonValue& result) {
@@ -1294,10 +1301,12 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 }
 
 // FALD correction layer (HDR only). runtime.set_fald_params {monitor, mode:"HDR", params_path}:
-// the per-panel parameter file (DLC `python -m dlc.fald.export`). runtime.fald_debug {monitor, mode,
-// debug_mode 0..3}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est (not persisted).
-// runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/frame dumps to dir
-// (reference comparison against the Python model).
+// the per-panel parameter file (DLC `python -m dlc.fald.export`); re-setting the SAME path bumps
+// reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
+// debug_mode 0..4}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est, 4 identity passthrough
+// (not persisted). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
+// frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
+// Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
 static void FaldPropagate(int mon) {
     FaldTrace("FaldPropagate: begin");
     if (g_gui.isRunning) {
@@ -1320,7 +1329,9 @@ void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) 
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) { error = "params_path is not a file"; return; }
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        g_gui.monitorSettings[mon].hdrColorCorrection.fald.paramsPath = path;
+        FaldSettings& fs = g_gui.monitorSettings[mon].hdrColorCorrection.fald;
+        fs.paramsPath = path;
+        fs.reloadSeq++;   // same path re-set = "reload the file" (HW 2026-09-13: it did not rebuild before)
     }
     SaveSettings();
     FaldPropagate(mon);
@@ -1358,6 +1369,7 @@ void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
                 if (ctx.faldDumpRequested.load()) { error = "a fald dump is still pending for this monitor"; return; }
                 ctx.faldDumpDir = dir;                                            // written before the flag ...
                 ctx.faldDumpRequested.store(true, std::memory_order_release);     // ... which publishes it
+                ctx.redrawRequested.store(true);                                  // fire on a static desktop too
                 found = true; break;
             }
         }

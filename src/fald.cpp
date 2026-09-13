@@ -18,6 +18,7 @@ static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
 static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1'
+static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
 
@@ -75,6 +76,22 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     out.curve.assign(p, p + out.curveN); p += out.curveN;
     out.kTrue.assign(p, p + nTrue); p += nTrue;
     out.kEst.assign(p, p + nEst);
+    return true;
+}
+
+bool FaldLatticeFits(const FaldPanelParams& p, int width, int height) {
+    if (width <= 0 || height <= 0) return false;
+    unsigned long long right = (unsigned long long)p.originX + (unsigned long long)p.cols * p.cellW;
+    unsigned long long bottom = (unsigned long long)p.originY + (unsigned long long)p.rows * p.cellH;
+    return right <= (unsigned long long)width && bottom <= (unsigned long long)height;
+}
+
+// Size + last-write stamp of the params file (false when it cannot be read).
+static bool FileStamp(const std::wstring& path, unsigned long long& size, unsigned long long& mtime) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return false;
+    size = ((unsigned long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    mtime = ((unsigned long long)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
     return true;
 }
 
@@ -196,10 +213,13 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     ReleaseAll(r);
     r->paramsPath = path;
     r->width = ctx->width; r->height = ctx->height;
+    r->fileSize = r->fileMtime = 0;
+    FileStamp(path, r->fileSize, r->fileMtime);   // taken before the read: a write racing the load re-triggers a rebuild
+    r->fileCheckCounter = 0;
     std::string err;
     if (!LoadFaldPanelParams(path, r->params, err)) { r->lastError = "params: " + err; return false; }
     const FaldPanelParams& p = r->params;
-    if ((int)(p.originX + p.cols * p.cellW) > ctx->width || (int)(p.originY + p.rows * p.cellH) > ctx->height) {
+    if (!FaldLatticeFits(p, ctx->width, ctx->height)) {
         r->lastError = "panel lattice (" + std::to_string(p.cols * p.cellW) + "x" + std::to_string(p.rows * p.cellH) +
                        ") does not fit the monitor (" + std::to_string(ctx->width) + "x" + std::to_string(ctx->height) + ")";
         return false;
@@ -236,7 +256,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 144;   // 36 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 36 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -248,12 +268,25 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     return true;
 }
 
-bool FaldEnsureResources(MonitorContext* ctx, const std::wstring& paramsPath) {
+bool FaldEnsureResources(MonitorContext* ctx, const FaldSettings& settings) {
+    const std::wstring& paramsPath = settings.paramsPath;
     if (!ctx || !FaldShadersReady() || paramsPath.empty()) return false;
     if (!ctx->fald) { ctx->fald = new FaldResources(); FaldTrace("EnsureResources: new FaldResources"); }
     FaldResources* r = ctx->fald;
-    bool stale = r->paramsPath != paramsPath || r->width != ctx->width || r->height != ctx->height;
+    bool stale = r->paramsPath != paramsPath || r->width != ctx->width || r->height != ctx->height ||
+                 r->reloadSeq != settings.reloadSeq;
+    if (r->valid && !stale && ++r->fileCheckCounter >= FALD_FILE_POLL_FRAMES) {
+        // A panel file re-exported IN PLACE (same path) must not keep the old tables on the GPU
+        // (HW 2026-09-13: neither a same-path set_fald_params nor an off/on toggle rebuilt).
+        r->fileCheckCounter = 0;
+        unsigned long long size = 0, mtime = 0;
+        if (FileStamp(paramsPath, size, mtime) && (size != r->fileSize || mtime != r->fileMtime)) {
+            FaldTrace("EnsureResources: params file changed on disk -> rebuild");
+            stale = true;
+        }
+    }
     if (r->valid && !stale) return true;
+    r->reloadSeq = settings.reloadSeq;
     // A failed build (bad/partially written params file, transient resource failure) is retried
     // every ~300 frames so a re-exported file or a recovered device picks the layer up again;
     // each distinct error is logged once.
@@ -281,7 +314,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g_context->Map(r->cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
     uint32_t* u = (uint32_t*)m.pData; float* f = (float*)m.pData;
-    memset(m.pData, 0, 144);
+    memset(m.pData, 0, FALD_CB_BYTES);
     u[0] = (uint32_t)r->width; u[1] = (uint32_t)r->height; u[2] = p.cols; u[3] = p.rows;
     u[4] = p.sub; u[5] = p.cellW; u[6] = p.cellH; u[7] = roundIdx;
     u[8] = p.reachTrueC; u[9] = p.reachTrueR; u[10] = p.reachEstC; u[11] = p.reachEstR;
@@ -412,8 +445,9 @@ static void DumpTexture(ID3D11Texture2D* tex, const std::wstring& file, UINT w, 
     st->Release();
 }
 
-static void MaybeDump(MonitorContext* ctx, FaldResources* r) {
-    if (!ctx->faldDumpRequested.load(std::memory_order_acquire)) return;
+// Consume a pending dump request: the directory (with a trailing separator) or "" when none.
+static std::wstring TakeDumpRequest(MonitorContext* ctx) {
+    if (!ctx->faldDumpRequested.load(std::memory_order_acquire)) return L"";
     std::wstring dir;
     {
         // the IPC handler writes faldDumpDir under g_monitorsMutex before publishing the flag
@@ -421,9 +455,13 @@ static void MaybeDump(MonitorContext* ctx, FaldResources* r) {
         dir = ctx->faldDumpDir;
     }
     ctx->faldDumpRequested.store(false, std::memory_order_release);
+    if (!dir.empty() && dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+    return dir;
+}
+
+// Fields + the INPUT frame (the main pass output the layer reads), after the compute passes.
+static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring& dir) {
     const FaldPanelParams& p = r->params;
-    if (dir.empty()) return;
-    if (dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
     DumpTexture(r->driveTex, dir + L"fald_drive.f32", p.cols, p.rows, 4);
     DumpTexture(r->bTrueTex, dir + L"fald_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->bEstTex, dir + L"fald_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
@@ -435,8 +473,24 @@ static void MaybeDump(MonitorContext* ctx, FaldResources* r) {
     std::ofstream meta(dir + L"fald_dump.txt");
     meta << "width " << r->width << "\nheight " << r->height << "\ncols " << p.cols << "\nrows " << p.rows
          << "\nsub " << p.sub << "\nframe_format " << (bpp == 8 ? "R16G16B16A16_FLOAT scRGB linear (1.0 = 80 nits)" : "R10G10B10A2_UNORM")
+         << "\nout_file " << (bpp == 8 ? "fald_out.rgba16f" : "fald_out.rgb10a2") << " (same format; the layer's OUTPUT, debug mode " << r->debugMode << ")"
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
+}
+
+// The OUTPUT frame (what the pixel pass wrote into the real target), after the Draw. With debug
+// mode 4 (identity) it must equal fald_frame.* bit for bit — the H4 check of the work guide.
+static void DumpOutput(MonitorContext* ctx, FaldResources* r, ID3D11RenderTargetView* finalRT, const std::wstring& dir) {
+    ID3D11Resource* res = nullptr;
+    finalRT->GetResource(&res);
+    if (!res) return;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&tex))) && tex) {
+        UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
+        DumpTexture(tex, dir + (bpp == 8 ? L"fald_out.rgba16f" : L"fald_out.rgb10a2"), r->width, r->height, bpp);
+        tex->Release();
+    }
+    res->Release();
 }
 
 void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
@@ -455,7 +509,8 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
     RunConv(r);
     RunGain(r);
     r->framesRun++;
-    MaybeDump(ctx, r);
+    const std::wstring dumpDir = TakeDumpRequest(ctx);
+    if (!dumpDir.empty()) DumpFields(ctx, r, dumpDir);
 
     // pixel pass: inter + fields -> finalRT (fullscreen triangle; g_vs already bound by the caller)
     FillCB(r, 1);
@@ -468,4 +523,5 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
     g_context->Draw(3, 0);
     ID3D11ShaderResourceView* nullSrv[10] = {};
     g_context->PSSetShaderResources(0, 10, nullSrv);
+    if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);
 }

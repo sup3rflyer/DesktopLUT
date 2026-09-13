@@ -99,6 +99,12 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                         "ORDER — a coin toss the 2026-09-03 3dlut-only run lost (cube on the twin); the "
                         "assignment is now sticky per DWM session and dlc.hook_routing proves it through "
                         "the meter. Absent on older builds (treat as unknown: cube flows self-check).",
+                "overlay": "object {awake:bool (the overlay render path is running and not auto-asleep), "
+                           "dwm_hook_mode:bool}: which path renders what a meter sees. The awake FP16 "
+                           "overlay reads 0.5-2.4 % below the sleeping one at low levels (DLC fald-lessons "
+                           "item 5); in hook mode the overlay-only layers (tonemap, fald) are off regardless "
+                           "of their flags. Recorded in the readiness neutral audit. Absent on pre-2026-09-13 "
+                           "builds (None in the audit).",
             },
             mutates_state=False,
             gui_thread_required=False,

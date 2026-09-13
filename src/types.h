@@ -497,6 +497,8 @@ struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
     unsigned int debugMode = 0;   // 0 = correct, 1 = show gain-1, 2 = show B_true, 3 = show B_est, 4 = identity passthrough (not persisted)
+    unsigned int reloadSeq = 0;   // runtime only (not persisted): bumped by runtime.set_fald_params so a panel file
+                                  // re-exported at the SAME path rebuilds the GPU tables (fald.cpp FaldEnsureResources)
 };
 
 // Tonemapping settings (HDR only)
@@ -660,6 +662,13 @@ struct MonitorContext {
     struct FaldResources* fald = nullptr;
     MovableAtomic<bool> faldDumpRequested{false};
     std::wstring faldDumpDir;
+
+    // Overlay path: re-process the last captured desktop frame even though Desktop Duplication
+    // reports no new frame. Set when a setting that changes the rendered output lands on the render
+    // thread (colour-correction update: layer toggles, FALD params/debug, tonemap) and by a FALD dump
+    // request — on a static desktop (paused video, test pattern) the change would otherwise not reach
+    // the screen until the next desktop frame (DLC fald work guide C2, 2026-09-13).
+    MovableAtomic<bool> redrawRequested{false};
 };
 
 // Per-monitor LUT configuration from command line

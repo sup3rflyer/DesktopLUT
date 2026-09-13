@@ -142,7 +142,16 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         }
     }
 
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+    // Re-process request (a setting that changes the rendered output landed while the desktop is
+    // static — layer toggle, FALD params/debug/dump, tonemap): render the last captured frame again
+    // instead of waiting for the next desktop change. Desktop Duplication hands out the same texture
+    // object every frame and keeps the last desktop image in it, so the cached SRV IS the current
+    // desktop. Only when a frame has been cached; otherwise the request waits for the first frame.
+    bool reprocess = false;
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT && ctx->captureSRV && ctx->lastCaptureTexture &&
+        ctx->redrawRequested.exchange(false)) {
+        reprocess = true;   // fall through to the render with the cached frame (no ReleaseFrame)
+    } else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         // Truly no new content this cycle (content static or frame rate < display rate).
         if (fp && ctx->index == 0) FramePacerNotifyTimeout(fp);
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -198,7 +207,10 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Skip mouse-only frames (no desktop pixels changed, just cursor position update).
     // Desktop Duplication delivers a frame for every cursor update even when no desktop
     // pixels changed. No additional sync needed — next iteration starts with compositor sync.
-    if (frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0) {
+    // (a pending re-process request renders the cursor-only frame instead: its texture is the
+    // desktop, and a continuously moving cursor would otherwise starve the request of timeouts)
+    if (!reprocess && frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0
+        && !ctx->redrawRequested.load()) {
         desktopResource->Release();
         ctx->duplication->ReleaseFrame();
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
@@ -206,102 +218,106 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     }
 
     // Reset consecutive failures on successful frame acquisition
-    ctx->consecutiveFailures = 0;
+    if (!reprocess) ctx->consecutiveFailures = 0;
 
     // Update frame pacer composition offset EMA.
     // Pass LastPresentTime as the preferred measurement point — it is the exact QPC when DWM
     // finished compositing, eliminating the variable latency between DD availability and our
     // AcquireNextFrame call. Falls back to preAcquireQpc when LastPresentTime is zero
     // (cursor-only updates with no desktop pixel change).
-    if (fp && ctx->index == 0)
+    if (fp && ctx->index == 0 && !reprocess)
         FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed,
                                      frameInfo.LastPresentTime.QuadPart);
 
-    // Got a new frame - get the texture
-    ID3D11Texture2D* frameTexture = nullptr;
-    hr = desktopResource->QueryInterface(IID_PPV_ARGS(&frameTexture));
-    desktopResource->Release();
+    if (!reprocess) {
+        // Got a new frame - get the texture
+        ID3D11Texture2D* frameTexture = nullptr;
+        hr = desktopResource->QueryInterface(IID_PPV_ARGS(&frameTexture));
+        desktopResource->Release();
 
-    if (FAILED(hr)) {
-        ctx->duplication->ReleaseFrame();
-        return;
-    }
-
-    // Check if size changed
-    D3D11_TEXTURE2D_DESC texDesc;
-    frameTexture->GetDesc(&texDesc);
-
-    if ((int)texDesc.Width != ctx->width || (int)texDesc.Height != ctx->height) {
-        ctx->width = texDesc.Width;
-        ctx->height = texDesc.Height;
-        if (!ResizeSwapChain(ctx, ctx->width, ctx->height)) {
-            frameTexture->Release();
+        if (FAILED(hr)) {
             ctx->duplication->ReleaseFrame();
-            g_forceReinit = true;
             return;
         }
 
-        // Also resize window
-        SetWindowPos(ctx->hwnd, nullptr, 0, 0, ctx->width, ctx->height,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
+        // Check if size changed
+        D3D11_TEXTURE2D_DESC texDesc;
+        frameTexture->GetDesc(&texDesc);
 
-    // Check if capture format changed (Windows HDR toggle can change format without ACCESS_LOST)
-    if (texDesc.Format != ctx->captureFormat) {
-        std::cout << "Monitor " << ctx->index << " capture format changed, forcing full reinit..." << std::endl;
-        frameTexture->Release();
-        ctx->duplication->ReleaseFrame();
-        if (ctx->duplication) {
-            ctx->duplication->Release();
-            ctx->duplication = nullptr;
-        }
-        ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache
-        if (ReinitDesktopDuplication(ctx)) {
-            // HDR state changed - update swapchain and settings
-            bool hasApplicableLUT = ctx->isHDREnabled
-                ? (ctx->lutSRV_HDR != nullptr)
-                : (ctx->lutSRV_SDR != nullptr);
-            ctx->usePassthrough = !hasApplicableLUT;
-            RecreateSwapchain(ctx);
-            ApplyMaxTmlSettings();
-            // Reapply MHC ICC profiles only if display mode actually changed
-            if (ctx->isHDREnabled != ctx->wasHDREnabled) {
-                ReapplyMhcProfilesOnModeSwitch(ctx);
+        if ((int)texDesc.Width != ctx->width || (int)texDesc.Height != ctx->height) {
+            ctx->width = texDesc.Width;
+            ctx->height = texDesc.Height;
+            if (!ResizeSwapChain(ctx, ctx->width, ctx->height)) {
+                frameTexture->Release();
+                ctx->duplication->ReleaseFrame();
+                g_forceReinit = true;
+                return;
             }
-            ctx->wasHDREnabled = ctx->isHDREnabled;
-            ctx->cbDirty = true;
-            std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
-        }
-        return;
-    }
 
-    // Create SRV for captured frame (reuse if same texture pointer — common case)
-    if (frameTexture != ctx->lastCaptureTexture) {
-        if (ctx->captureSRV) {
-            ctx->captureSRV->Release();
-            ctx->captureSRV = nullptr;
+            // Also resize window
+            SetWindowPos(ctx->hwnd, nullptr, 0, 0, ctx->width, ctx->height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = texDesc.Format;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        hr = g_device->CreateShaderResourceView(frameTexture, &srvDesc, &ctx->captureSRV);
-        // Only cache the weak ref on success. Caching it after a failed Create would
-        // poison the comparison: DD reuses the same texture object every frame, so the
-        // next frame would skip recreation, leave hr stale-success, and render with a
-        // NULL captureSRV -> shader samples 0 -> opaque black TOPMOST overlay that
-        // Present still succeeds on (watchdog never fires). Leave lastCaptureTexture
-        // unchanged on failure so the next frame retries the Create.
-        if (SUCCEEDED(hr)) {
-            ctx->lastCaptureTexture = frameTexture;  // Weak ref for comparison (not AddRef'd)
-        }
-    }
-    frameTexture->Release();
 
-    if (FAILED(hr) || !ctx->captureSRV) {
-        ctx->duplication->ReleaseFrame();
-        return;
+        // Check if capture format changed (Windows HDR toggle can change format without ACCESS_LOST)
+        if (texDesc.Format != ctx->captureFormat) {
+            std::cout << "Monitor " << ctx->index << " capture format changed, forcing full reinit..." << std::endl;
+            frameTexture->Release();
+            ctx->duplication->ReleaseFrame();
+            if (ctx->duplication) {
+                ctx->duplication->Release();
+                ctx->duplication = nullptr;
+            }
+            ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache
+            if (ReinitDesktopDuplication(ctx)) {
+                // HDR state changed - update swapchain and settings
+                bool hasApplicableLUT = ctx->isHDREnabled
+                    ? (ctx->lutSRV_HDR != nullptr)
+                    : (ctx->lutSRV_SDR != nullptr);
+                ctx->usePassthrough = !hasApplicableLUT;
+                RecreateSwapchain(ctx);
+                ApplyMaxTmlSettings();
+                // Reapply MHC ICC profiles only if display mode actually changed
+                if (ctx->isHDREnabled != ctx->wasHDREnabled) {
+                    ReapplyMhcProfilesOnModeSwitch(ctx);
+                }
+                ctx->wasHDREnabled = ctx->isHDREnabled;
+                ctx->cbDirty = true;
+                std::cout << "Monitor " << ctx->index << " switched to " << (ctx->isHDREnabled ? "HDR" : "SDR") << " mode" << std::endl;
+            }
+            return;
+        }
+
+        // Create SRV for captured frame (reuse if same texture pointer — common case)
+        if (frameTexture != ctx->lastCaptureTexture) {
+            if (ctx->captureSRV) {
+                ctx->captureSRV->Release();
+                ctx->captureSRV = nullptr;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = texDesc.Format;
+            srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+            hr = g_device->CreateShaderResourceView(frameTexture, &srvDesc, &ctx->captureSRV);
+            // Only cache the weak ref on success. Caching it after a failed Create would
+            // poison the comparison: DD reuses the same texture object every frame, so the
+            // next frame would skip recreation, leave hr stale-success, and render with a
+            // NULL captureSRV -> shader samples 0 -> opaque black TOPMOST overlay that
+            // Present still succeeds on (watchdog never fires). Leave lastCaptureTexture
+            // unchanged on failure so the next frame retries the Create.
+            if (SUCCEEDED(hr)) {
+                ctx->lastCaptureTexture = frameTexture;  // Weak ref for comparison (not AddRef'd)
+            }
+        }
+        frameTexture->Release();
+
+        if (FAILED(hr) || !ctx->captureSRV) {
+            ctx->duplication->ReleaseFrame();
+            return;
+        }
     }
+    // Any rendered frame satisfies a pending re-process request.
+    ctx->redrawRequested.store(false);
 
     // Check if atomic toggles changed → mark constant buffer dirty
     // Cache values are updated only AFTER successful constant buffer write (below)
@@ -616,7 +632,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // frame): the main shader renders into the layer's intermediate, the layer's passes then write
     // the corrected frame to the real target. Falls back to the plain path when resources fail.
     bool faldOn = ctx->isHDREnabled && cc.fald.enabled && !g_dwmHookMode.load() &&
-                  FaldEnsureResources(ctx, cc.fald.paramsPath);
+                  FaldEnsureResources(ctx, cc.fald);
     ID3D11RenderTargetView* renderTarget = faldOn ? ctx->fald->interRTV : finalTarget;
 
     float clearColor[4] = { 0, 0, 0, 0 };
@@ -778,8 +794,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     }
 
     // Release DD frame after rendering — SRV references DD's texture directly (not a copy),
-    // so the frame must be held until all GPU draw commands are queued.
-    ctx->duplication->ReleaseFrame();
+    // so the frame must be held until all GPU draw commands are queued. (A re-process of the
+    // cached frame acquired nothing, so there is nothing to release.)
+    if (!reprocess) ctx->duplication->ReleaseFrame();
 }
 
 // ============================================================================
@@ -1072,6 +1089,7 @@ void RenderAll(FramePacer* fp) {
                         ctx.hdrMhcGrayscaleActive = false;
                     }
                     ctx.cbDirty = true;
+                    ctx.redrawRequested.store(true);   // reach the screen on a static desktop too
                     std::cout << "[Render] Applied CC: mon=" << ctx.index
                               << " isHDR=" << update.isHDR
                               << " mhcPrim=" << (ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive : ctx.sdrMhcPrimariesActive)

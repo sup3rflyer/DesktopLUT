@@ -51,7 +51,12 @@ class FaldParams:
     # window mean governs fine texture (native stripes 20/20 px read like their mean; a pure area law
     # over-drives them 14 %).
     stat_kind: str = "area"               # native verdict 2026-09-11 (doc §24): area best on every absolute set,
-                                          # superposition and slivers; winmax only wins on 20-px periodic stripes
+                                          # superposition and slivers; winmax only wins on 20-px periodic stripes.
+                                          # OFFLINE-ONLY branches kept for science (docs/fald-work-guide.md P6):
+                                          # "winmax" / "area_win" here, est_cell/est_interp below, the stack-era
+                                          # lattice comments. The GPU export tabulates ONLY stat "area" + est_kind
+                                          # exp|mix|knots; do not select another branch from a panel file meant for
+                                          # the shader without an H1-class meter gate.
     stat_area0_px2: float = 1150.0
     # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
     # to code 1023 = 1842 nits). The 2026-09-10 curve had the same shape but was normalised to 1000 nits

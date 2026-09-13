@@ -219,3 +219,46 @@ def test_audit_with_a_dead_pipe_is_a_note_and_an_unconfirmable_association():
     assert any("state.get unavailable" in n for n in audit["notes"])
     v = na.neutral_violations(audit)
     assert len(v) == 1 and "cannot confirm the identity MHC association" in v[0]
+
+
+def test_audit_flags_the_fald_layer_and_records_the_render_path():
+    """2026-09-13: the FALD compensation layer is context-dependent (a patch read through it depends
+    on the surround), so it is a layer the readiness stage must refuse after enter-neutral — and the
+    audit says which path (hook / overlay awake) the meter is looking through."""
+    ctrl = CalibrationController.mock()
+    _associate(ctrl, 0, "HDR")
+    ctrl.set_layers(0, "HDR", fald=True)
+    audit = na.neutral_state_audit(ctrl, 0, "HDR")
+    assert audit["gui_layers_source"] == "pipe"
+    assert audit["gui_layers_enabled"] == ["FALD compensation layer"]
+    assert audit["pipe_layers"]["fald"] is True
+    assert audit["hook"] == {"active": True, "needs_check": False}
+    assert audit["overlay"] == {"awake": True, "dwm_hook_mode": False}
+    assert na.neutral_violations(audit) == \
+        ["FALD compensation layer is still ON for 0:HDR in DesktopLUT.ini after enter-neutral"]
+
+    ctrl.set_layers(0, "HDR", fald=False)
+    clean = na.neutral_state_audit(ctrl, 0, "HDR")
+    assert clean["gui_layers_enabled"] == [] and na.neutral_violations(clean) == []
+
+    # a pre-2026-09-13 build reports neither field: None, never a crash
+    real_state = ctrl.state
+    ctrl.state = lambda: {k: v for k, v in real_state().items() if k not in ("hook", "overlay")}
+    old = na.neutral_state_audit(ctrl, 0, "HDR")
+    assert old["hook"] is None and old["overlay"] is None
+
+
+def test_ini_fald_flag_is_a_layer_too(tmp_path: Path):
+    ini = ("[Monitor0]\nHDR_FaldEnabled=true\nHDR_FaldParamsPath=C:\\\\p\\\\panel.bin\n"
+           "HDR_MHCProfilePath=C:\\\\p\\\\DesktopLUT-Mon0-HDR.icm\n")
+    flags = na.parse_ini_flags(ini, 0, "HDR")
+    assert flags["FaldEnabled"] == "true" and flags["FaldParamsPath"].endswith("panel.bin")
+    ctrl = CalibrationController.mock()
+    _associate(ctrl, 0, "HDR")
+    real_state = ctrl.state
+    ctrl.state = lambda: {k: v for k, v in real_state().items() if k != "layers"}   # ini is the only evidence
+    p = tmp_path / "DesktopLUT.ini"
+    p.write_text(ini, encoding="utf-8")
+    audit = na.neutral_state_audit(ctrl, 0, "HDR", ini_path=p)
+    assert audit["gui_layers_source"] == "ini"
+    assert audit["gui_layers_enabled"] == ["FALD compensation layer"]

@@ -19,7 +19,9 @@ File layout (little-endian, all float32 unless noted; header is 32 uint32/float3
   word 26  f: fade_lo       word 27  f: fade_hi      (correction fades to identity for B_est below; 0,0 = loader defaults)
   word 28  f: gain_smooth_cells (Gaussian sigma of the gain low-pass, cells; 0 = off)
   word 29  f: lum_fade_lo   word 30  f: lum_fade_hi   (pixel-luminance fade, as-if-white nits; 0,0 = loader defaults)
-  words 29-31 reserved (0)
+  word 31  reserved (0)
+The C++ reader is LoadFaldPanelParams (src/fald.cpp; tests/test_fald.cpp); words 26-30 are optional —
+zero means 'loader default' so older files stay loadable. Keep the two in step when adding a word.
   then: curve[curve_n]                                  drive vs ln(nits), linear in ln(nits)
   then: k_true[sub][sub][2*reach_true_r+1][2*reach_true_c+1]   index order (oy, ox, j, i)
   then: k_est [sub][sub][2*reach_est_r+1][2*reach_est_c+1]
