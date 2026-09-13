@@ -1,5 +1,6 @@
 // FALD panel-parameter loader + lattice check (src/fald.cpp). The file layout is the DLC exporter's
-// (DLC/src/dlc/fald/export.py docstring): 32-word header, curve[curve_n], k_true, k_est. No D3D here —
+// (DLC/src/dlc/fald/export.py docstring): 32-word header (FLD1) or 40-word (FLD2, + pedestal colour),
+// curve[curve_n], k_true, k_est. No D3D here —
 // the GPU passes are checked against the Python reference by DLC's fald_compare_dump on a live dump.
 #include "doctest.h"
 #include "../src/fald.h"
@@ -162,8 +163,69 @@ TEST_CASE("FALD lattice must lie inside the monitor frame") {
     CHECK_FALSE(FaldLatticeFits(p, 0, 2160));
 }
 
-TEST_CASE("FALD constant buffer is 36 words") {
-    // FillCB writes words up to index 33 (lumFadeHi); the HLSL cbuffer FaldCB declares 9 float4 rows.
-    CHECK(FALD_CB_BYTES == 144u);
+TEST_CASE("FALD loader: an FLD1 file has a white pedestal; FLD2 carries the pedestal colour") {
+    FaldTempFile tf(L"test_fald_fld1_ped.bin");
+    WriteBytes(tf.path, Image::Valid().Bytes());
+    FaldPanelParams p; std::string err;
+    REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+    CHECK_FALSE(p.hasPedColour);
+    CHECK(p.pedRGB[0] == doctest::Approx(1.0f)); CHECK(p.pedRGB[1] == doctest::Approx(1.0f)); CHECK(p.pedRGB[2] == doctest::Approx(1.0f));
+    CHECK(p.pedModeFile == 0u);
+
+    // FLD2: the same 32 words + 8 (m_r m_g m_b, mode, 4 reserved); tables follow at byte 160
+    FaldTempFile tf2(L"test_fald_fld2_ped.bin");
+    Image im = Image::Valid();
+    im.header[0] = 0x464C4432u;                                  // 'FLD2'
+    im.header.resize(40, 0);
+    // weights 0.2/0.7/0.1: sum(w * m) = 0.2*0.756 + 0.7*1.057 + 0.1*1.366 = 1.0277 (within the 0.9..1.1 gate)
+    im.SetF(32, 0.756f); im.SetF(33, 1.057f); im.SetF(34, 1.366f); im.header[35] = 1u;
+    WriteBytes(tf2.path, im.Bytes());
+    FaldPanelParams q;
+    REQUIRE(LoadFaldPanelParams(tf2.path, q, err));
+    CHECK(q.hasPedColour);
+    CHECK(q.pedRGB[0] == doctest::Approx(0.756f)); CHECK(q.pedRGB[2] == doctest::Approx(1.366f));
+    CHECK(q.pedModeFile == 1u);
+    CHECK(q.curve.size() == 16); CHECK(q.kEst[5] == doctest::Approx(0.10f));   // tables read from the 160-byte offset
+    CHECK(q.tmin == doctest::Approx(0.001f));
+}
+
+TEST_CASE("FALD loader: implausible pedestal colour words are refused") {
+    FaldPanelParams p; std::string err;
+    {
+        FaldTempFile tf(L"test_fald_fld2_neg.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, -0.1f); im.SetF(33, 1.2f); im.SetF(34, 1.3f);   // a negative channel
+        WriteBytes(tf.path, im.Bytes());
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("pedestal") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld2_lum.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, 2.0f); im.SetF(33, 2.0f); im.SetF(34, 2.0f);      // luminance share 2.0: not normalised
+        WriteBytes(tf.path, im.Bytes());
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("pedestal") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld2_mode.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u; im.header.resize(40, 0);
+        im.SetF(32, 1.0f); im.SetF(33, 1.0f); im.SetF(34, 1.0f); im.header[35] = 7u;   // unknown mode
+        WriteBytes(tf.path, im.Bytes());
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("pedestal") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld2_short.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4432u;         // FLD2 magic on a 32-word file: words 32-34 are
+        WriteBytes(tf.path, im.Bytes());                                // curve samples -> implausible colour (or size mismatch)
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK((err.find("pedestal") != std::string::npos || err.find("size mismatch") != std::string::npos));
+    }
+}
+
+TEST_CASE("FALD constant buffer is 40 words") {
+    // FillCB writes words up to index 39 (pedMode); the HLSL cbuffer FaldCB declares 10 float4 rows.
+    CHECK(FALD_CB_BYTES == 160u);
     CHECK(FALD_CB_BYTES % 16 == 0);
 }

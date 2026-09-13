@@ -112,6 +112,7 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         WritePrivateProfileBool(section, (p + L"TonemapDynamic").c_str(), cc.tonemap.dynamicPeak, iniPath);
         WritePrivateProfileBool(section, (p + L"FaldEnabled").c_str(), cc.fald.enabled, iniPath);
         WritePrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
+        WritePrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), cc.fald.pedMode == 1, iniPath);
     }
 }
 
@@ -135,6 +136,7 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         wchar_t faldBuf[1024] = {};
         GetPrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), L"", faldBuf, 1024, iniPath);
         cc.fald.paramsPath = faldBuf;
+        cc.fald.pedMode = GetPrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), false, iniPath) ? 1u : 0u;
     }
 }
 

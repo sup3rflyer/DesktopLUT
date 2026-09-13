@@ -129,6 +129,7 @@ struct MovableAtomic {
 #define ID_CORR_FALD_PATH        530
 #define ID_CORR_FALD_BROWSE      531
 #define ID_CORR_FALD_DEBUG       532
+#define ID_CORR_FALD_PEDMODE     533
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -497,6 +498,9 @@ struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
     unsigned int debugMode = 0;   // 0 = correct, 1 = show gain-1, 2 = show B_true, 3 = show B_est, 4 = identity passthrough (not persisted)
+    unsigned int pedMode = 0;     // pedestal colour (persisted, GUI "Per-channel pedestal"): 0 = white pedestal, hue-preserving
+                                  // subtraction (pre-2026-09-13 behaviour); 1 = the panel file's per-channel pedestal colour
+                                  // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.
     unsigned int reloadSeq = 0;   // runtime only (not persisted): bumped by runtime.set_fald_params so a panel file
                                   // re-exported at the SAME path rebuilds the GPU tables (fald.cpp FaldEnsureResources)
 };
@@ -902,6 +906,7 @@ struct GUIState {
     HWND hwndFaldPath = nullptr;
     HWND hwndFaldBrowse = nullptr;
     HWND hwndFaldDebug = nullptr;
+    HWND hwndFaldPedMode = nullptr;
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

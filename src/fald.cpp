@@ -17,7 +17,8 @@ static ID3D11ComputeShader* g_faldBlurCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
-static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1'
+static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1' (32-word header)
+static const uint32_t FALD_MAGIC2 = 0x464C4432u;  // 'FLD2' (40-word header: + pedestal colour, DLC export.py)
 static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
@@ -46,7 +47,9 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     if (buf.size() < 128) { err = "params file too short"; return false; }
     const uint32_t* u = reinterpret_cast<const uint32_t*>(buf.data());
     const float* fl = reinterpret_cast<const float*>(buf.data());
-    if (u[0] != FALD_MAGIC) { err = "bad magic (expected FLD1)"; return false; }
+    if (u[0] != FALD_MAGIC && u[0] != FALD_MAGIC2) { err = "bad magic (expected FLD1 or FLD2)"; return false; }
+    const size_t headerBytes = (u[0] == FALD_MAGIC2) ? 160 : 128;
+    if (buf.size() < headerBytes) { err = "params file too short"; return false; }
     out.cols = u[1]; out.rows = u[2]; out.sub = u[3]; out.cellW = u[4]; out.cellH = u[5];
     out.originX = u[6]; out.originY = u[7];
     out.reachTrueC = u[8]; out.reachTrueR = u[9]; out.reachEstC = u[10]; out.reachEstR = u[11];
@@ -61,6 +64,16 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
         if (fl[30] > fl[29] && fl[29] >= 0.0f) { out.lumFadeLo = fl[29]; out.lumFadeHi = fl[30]; }
         else { err = "implausible lum_fade words"; return false; }
     }
+    if (u[0] == FALD_MAGIC2) {                                                              // words 32-34: pedestal colour, 35: validated mode
+        out.pedRGB[0] = fl[32]; out.pedRGB[1] = fl[33]; out.pedRGB[2] = fl[34];
+        out.pedModeFile = u[35]; out.hasPedColour = true;
+        float lum = out.w[0] * out.pedRGB[0] + out.w[1] * out.pedRGB[1] + out.w[2] * out.pedRGB[2];
+        if (!(out.pedRGB[0] >= 0.0f && out.pedRGB[1] >= 0.0f && out.pedRGB[2] >= 0.0f) ||
+            !(out.pedRGB[0] <= 8.0f && out.pedRGB[1] <= 8.0f && out.pedRGB[2] <= 8.0f) ||
+            !(lum > 0.9f && lum < 1.1f) || out.pedModeFile > 1) {
+            err = "implausible pedestal colour words"; return false;
+        }
+    }
     if (out.cols == 0 || out.rows == 0 || out.sub == 0 || out.sub > 16 || out.cellW == 0 || out.cellH == 0 ||
         out.curveN < 16 || out.curveN > 16384 || out.white <= 0 || out.cols > 512 || out.rows > 512 ||
         out.reachTrueC > 64 || out.reachTrueR > 64 || out.reachEstC > 64 || out.reachEstR > 64 ||
@@ -70,9 +83,9 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     }
     size_t nTrue = (size_t)out.sub * out.sub * (2 * out.reachTrueR + 1) * (2 * out.reachTrueC + 1);
     size_t nEst = (size_t)out.sub * out.sub * (2 * out.reachEstR + 1) * (2 * out.reachEstC + 1);
-    size_t need = 128 + 4 * ((size_t)out.curveN + nTrue + nEst);
+    size_t need = headerBytes + 4 * ((size_t)out.curveN + nTrue + nEst);
     if (buf.size() != need) { err = "size mismatch (" + std::to_string(buf.size()) + " vs " + std::to_string(need) + ")"; return false; }
-    const float* p = reinterpret_cast<const float*>(buf.data() + 128);
+    const float* p = reinterpret_cast<const float*>(buf.data() + headerBytes);
     out.curve.assign(p, p + out.curveN); p += out.curveN;
     out.kTrue.assign(p, p + nTrue); p += nTrue;
     out.kEst.assign(p, p + nEst);
@@ -256,7 +269,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 36 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 40 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -324,6 +337,12 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     u[24] = r->debugMode; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
     f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
+    // per-channel pedestal (GUI toggle): tmin * m_c when on, tmin (white) when off or for an FLD1 file
+    const bool perChannel = (r->pedMode == 1) && p.hasPedColour;
+    f[36] = p.tmin * (perChannel ? p.pedRGB[0] : 1.0f);
+    f[37] = p.tmin * (perChannel ? p.pedRGB[1] : 1.0f);
+    f[38] = p.tmin * (perChannel ? p.pedRGB[2] : 1.0f);
+    u[39] = perChannel ? 1u : 0u;
     g_context->Unmap(r->cb, 0);
 }
 
@@ -474,6 +493,8 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     meta << "width " << r->width << "\nheight " << r->height << "\ncols " << p.cols << "\nrows " << p.rows
          << "\nsub " << p.sub << "\nframe_format " << (bpp == 8 ? "R16G16B16A16_FLOAT scRGB linear (1.0 = 80 nits)" : "R10G10B10A2_UNORM")
          << "\nout_file " << (bpp == 8 ? "fald_out.rgba16f" : "fald_out.rgb10a2") << " (same format; the layer's OUTPUT, debug mode " << r->debugMode << ")"
+         << "\nped_mode " << (((r->pedMode == 1) && p.hasPedColour) ? "channel" : "white")
+         << "\nped_rgb " << p.pedRGB[0] << " " << p.pedRGB[1] << " " << p.pedRGB[2] << (p.hasPedColour ? " (FLD2)" : " (FLD1, white)")
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -497,6 +518,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
     FaldResources* r = ctx ? ctx->fald : nullptr;
     if (!r || !r->valid || !finalRT) return;
     r->debugMode = ctx->hdrColorCorrection.fald.debugMode;
+    r->pedMode = ctx->hdrColorCorrection.fald.pedMode;
     // the main pass rendered into r->inter with finalRT unbound; make sure the RTV is off before
     // the intermediate is read as an SRV
     ID3D11RenderTargetView* nullRT = nullptr;

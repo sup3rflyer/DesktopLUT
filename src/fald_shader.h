@@ -27,6 +27,9 @@ cbuffer FaldCB : register(b0) {
     uint debugMode; uint originX; uint originY; uint blurDir;      // blurDir: 0 = horizontal, 1 = vertical pass
     float fadeLo; float fadeHi; float gainSmoothFine; float _pad2;  // gainSmoothFine: Gaussian sigma in fine samples (0 = off)
     float lumFadeLo; float lumFadeHi; float _pad3; float _pad4;     // pixel-luminance fade, as-if-white nits (lo = hi = 0: off)
+    float tminR; float tminG; float tminB; uint pedMode;            // per-channel closed-LCD transmittance (= tmin when white);
+                                                                    // pedMode 0 = white pedestal, common-factor subtraction;
+                                                                    // 1 = coloured pedestal, per-channel floor (GUI toggle)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -112,14 +115,26 @@ float3 Correct(float3 img, float bTrue, float bEst, float gain) {
         gain = 1.0f + (gain - 1.0f) * wlum;
         wfade *= wlum;
     }
-    float pedRef = white * DriveOf(s) * tmin;      // pedestal a uniform field of this level carries
-    float ped = white * bTrue * tmin;              // pedestal in THIS context (as-if-white)
-    // Hue-preserving pedestal term: subtract the same amount from all channels, limited by the
-    // darkest one (a per-channel clip zeroes R/G and leaves B -> blue rims on dark edges).
-    float delta = pedRef - ped;
-    float darkest = min(img.r, min(img.g, img.b));
-    float adj = ((delta < 0.0f) ? -min(-delta, darkest) : delta) * wfade;
-    float3 req = max((img + adj) * gain, 0.0f);
+    // Pedestal term per channel (correct.py pedestal_adjust). tminV = tmin * m_c: white (all equal) with the
+    // GUI toggle off or an FLD1 file; the measured leak colour with it on. delta_c = ref - actual (as-if-white).
+    float3 tminV = float3(tminR, tminG, tminB);
+    float3 pedRef = white * DriveOf(s) * tminV;    // pedestal a uniform field of this level carries
+    float3 ped = white * bTrue * tminV;            // pedestal in THIS context
+    float3 delta = pedRef - ped;
+    float3 adj;
+    if (pedMode == 1) {
+        adj = max(delta, -img);                    // "channel": each channel floors on its own
+    } else {
+        // "white": one common factor on the whole vector so no channel goes below zero (with equal deltas
+        // this is the 2026-09-12 rule: the same amount from all channels, limited by the darkest one;
+        // a per-channel clip of a WHITE pedestal zeroed R/G and left B -> blue rims on dark edges)
+        float f = 1.0f;
+        if (delta.r < 0.0f) f = min(f, img.r / -delta.r);
+        if (delta.g < 0.0f) f = min(f, img.g / -delta.g);
+        if (delta.b < 0.0f) f = min(f, img.b / -delta.b);
+        adj = delta * f;
+    }
+    float3 req = max((img + adj * wfade) * gain, 0.0f);
     if (wfade < 1.0f) return req;                  // ceiling rule only where the model is trusted
     float cap = white * max(bEst, 1e-9f);          // LCD cannot open past 100 %
     float3 keep = max(img, cap);                   // saturated highlight: keep the original request

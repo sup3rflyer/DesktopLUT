@@ -15,8 +15,8 @@
 struct MonitorContext;
 struct FaldSettings;
 
-// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 36 words.
-constexpr unsigned int FALD_CB_BYTES = 144;
+// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 40 words.
+constexpr unsigned int FALD_CB_BYTES = 160;
 
 // Parsed panel parameter file.
 struct FaldPanelParams {
@@ -32,6 +32,10 @@ struct FaldPanelParams {
     float gainSmoothCells = 0.35f;           // Gaussian sigma of the gain low-pass, in cells (0 = off)
     float lumFadeLo = 0.5f, lumFadeHi = 5.0f; // pixel-luminance fade (as-if-white nits of the pixel's max channel):
                                              // the model has no baseline below ~1 nit (dark-halo probe 2026-09-12)
+    float pedRGB[3] = { 1.0f, 1.0f, 1.0f };   // pedestal colour multipliers m_c on tmin (FLD2 words 32-34; sum w*m = 1).
+                                             // FLD1 = white (1,1,1). Used only with FaldSettings::pedMode == 1.
+    unsigned int pedModeFile = 0;            // FLD2 word 35: the mode the fit was validated with (informational)
+    bool hasPedColour = false;               // FLD2 file (the loader saw words 32-34)
     std::vector<float> curve, kTrue, kEst;
 };
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err);
@@ -69,6 +73,7 @@ struct FaldResources {
     ID3D11Texture2D* flatEstTex = nullptr;  ID3D11UnorderedAccessView* flatEstUAV = nullptr;  ID3D11ShaderResourceView* flatEstSRV = nullptr;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
+    uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)
     unsigned long long framesRun = 0;
     unsigned int retryCounter = 0;     // frames since the last failed Build (retry every few seconds)
     std::string lastLoggedError;       // log each distinct failure once

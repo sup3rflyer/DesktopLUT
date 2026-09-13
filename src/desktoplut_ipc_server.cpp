@@ -674,6 +674,7 @@ void HandleStateGet(JsonValue& result) {
                     l.set("tonemap_target_peak", JNum(s.hdrColorCorrection.tonemap.targetPeakNits));
                     l.set("fald_params_path", JStr(WideToUtf8(s.hdrColorCorrection.fald.paramsPath)));
                     l.set("fald_debug_mode", JNum((double)s.hdrColorCorrection.fald.debugMode));
+                    l.set("fald_ped_mode", JNum((double)s.hdrColorCorrection.fald.pedMode));
                 }
                 layers.set(key, l);
             }
@@ -1304,7 +1305,8 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // the per-panel parameter file (DLC `python -m dlc.fald.export`); re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
 // debug_mode 0..4}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est, 4 identity passthrough
-// (not persisted). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
+// (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
+// FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
 static void FaldPropagate(int mon) {
@@ -1344,15 +1346,21 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     if (!isHDR) { error = "fald is an HDR-only layer"; return; }
     const JsonValue* v = p.find("debug_mode");
-    if (!v || v->type != JsonValue::Num) { error = "missing parameter: debug_mode (0..4)"; return; }
-    unsigned int mode = (unsigned int)(v->num < 0 ? 0 : (v->num > 4 ? 4 : v->num));
+    const JsonValue* pm = p.find("ped_mode");
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..4) or ped_mode (0|1)"; return; }
+    unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        g_gui.monitorSettings[mon].hdrColorCorrection.fald.debugMode = mode;
+        FaldSettings& fs = g_gui.monitorSettings[mon].hdrColorCorrection.fald;
+        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 4 ? 4 : v->num));
+        if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
+        mode = fs.debugMode; ped = fs.pedMode;
     }
+    if (pm && pm->type == JsonValue::Num) SaveSettings();   // ped_mode is a persisted setting, the debug view is not
     FaldPropagate(mon);
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("debug_mode", JNum((double)mode));
+    result.set("ped_mode", JNum((double)ped));
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {

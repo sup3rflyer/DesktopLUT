@@ -712,6 +712,15 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Passthrough (identity)");
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
 
+    // Per-channel pedestal (2026-09-13, DLC work guide H2): the panel file (FLD2) carries the measured colour of the
+    // closed-LCD leak; this toggle decides whether the shader subtracts it per channel (on) or treats the pedestal
+    // as white (off = the previous behaviour, byte-identical). Removable: this control + FaldSettings::pedMode + the
+    // pedMode branch in fald_shader.h Correct().
+    g_gui.hwndFaldPedMode = CreateWindow(L"BUTTON", L"Per-channel pedestal",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 245, innerY + 18, 140, h, panel2, (HMENU)ID_CORR_FALD_PEDMODE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldPedMode);
+
     int faldY = innerY + 45;
     ctrl = CreateWindow(L"STATIC", L"Panel file:", WS_CHILD, innerX + 10, faldY + 2, 60, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
