@@ -66,8 +66,16 @@ class FaldParams:
     tail_frac: float = 0.3
     kernel_pnorm: float = 2.0             # distance metric of the TRUE kernel: 2 = radial (Euclidean), 1 = L1
                                           # "diamond" (native diagonal leaks fall faster than radial, doc §27)
-    est_kind: str = "exp"                 # monitor's assumed kernel: "exp" | "gauss" | "mix"
+    est_kind: str = "exp"                 # monitor's assumed kernel: "exp" | "gauss" | "mix" | "knots"
     est_scale_mm: float = 24.0            # its 1/e length (exp) or sigma (gauss)
+    # "knots": FREE-FORM radial profile of the ESTIMATE kernel (2026-09-12, doc §26/§31a/§33: a single-scale exp
+    # cannot fit step-edge rings and gradients together; the 120-px dark ring is modelled 3-8 pp too deep).
+    # log-weight is linear in radius between knots (radii in CELL WIDTHS → mm via cell_w·px_mm), continued
+    # exponentially beyond the last knot with the last segment's slope; then the same aniso / support /
+    # normalisation as "exp". est_knot_logw empty = derive from exp(−r/est_scale_mm) → reproduces "exp" exactly.
+    # Monotonicity is NOT enforced here (the fit parametrises decrements, see knot_logw_from_decrements).
+    est_knot_cells: tuple[float, ...] = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0)
+    est_knot_logw: tuple[float, ...] = ()
     est_core_mm: float = 6.0              # "mix": own core / tail / fraction
     est_tail_mm: float = 24.0
     est_tail_frac: float = 0.3
@@ -127,6 +135,33 @@ def _eotf_nits(code: np.ndarray, bits: int = 10) -> np.ndarray:
     return v * 10000.0
 
 
+# ------------------------------------------------------------------ "knots" estimate profile helpers
+def exp_knot_logw(scale_mm: float, knot_cells: Sequence[float], cell_mm: float) -> tuple[float, ...]:
+    """Log kernel weight at each knot for the exponential exp(−r/scale_mm): the profile the "knots" kind
+    starts from (and reproduces exactly when est_knot_logw is left empty)."""
+    return tuple(float(-c * cell_mm / scale_mm) for c in knot_cells)
+
+
+def _softplus(z: np.ndarray) -> np.ndarray:
+    return np.logaddexp(0.0, z)
+
+
+def knot_logw_from_decrements(z: Sequence[float]) -> tuple[float, ...]:
+    """Fit parametrisation of a MONOTONE non-increasing profile: logw_0 = 0 (the normalisation removes any
+    constant), logw_i = logw_{i−1} − softplus(z_i) for the len(z) following knots. Any real z gives a
+    monotone profile; the model itself never enforces monotonicity."""
+    dec = _softplus(np.asarray(z, dtype=float))
+    return tuple(float(v) for v in np.concatenate([[0.0], -np.cumsum(dec)]))
+
+
+def knot_decrements_of(logw: Sequence[float]) -> np.ndarray:
+    """Inverse of :func:`knot_logw_from_decrements` (inverse softplus of the per-segment drops; a drop
+    ≤ 0 maps to a very negative z)."""
+    d = -np.diff(np.asarray(logw, dtype=float))
+    d = np.maximum(d, 1e-9)
+    return np.log(np.expm1(d))
+
+
 class FaldModel:
     def __init__(self, p: FaldParams):
         self.p = p
@@ -138,6 +173,19 @@ class FaldModel:
             "choose a scale giving integer reduced-res cells"
         self.cw, self.ch = int(round(self.cw)), int(round(self.ch))
         self._kern_cache: dict = {}
+
+    def est_knots(self) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """(knot radii in mm, log-weights) of the "knots" estimate profile from the params; an empty
+        est_knot_logw derives the exponential's values at est_scale_mm."""
+        p = self.p
+        cell_mm = p.cell_w * p.px_mm
+        cells = tuple(float(c) for c in p.est_knot_cells)
+        logw = tuple(float(v) for v in p.est_knot_logw) if len(p.est_knot_logw) else exp_knot_logw(p.est_scale_mm, cells, cell_mm)
+        if len(logw) != len(cells) or len(cells) < 2:
+            raise ValueError(f"est_knot_logw needs one value per knot ({len(cells)} knots, {len(logw)} weights)")
+        if np.any(np.diff(cells) <= 0):
+            raise ValueError("est_knot_cells must be strictly increasing")
+        return tuple(c * cell_mm for c in cells), logw
 
     # ------------------------------------------------------------------ pattern → targets
     def render(self, shapes: Sequence[Shape]) -> np.ndarray:
@@ -227,21 +275,39 @@ class FaldModel:
     # ------------------------------------------------------------------ spread
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
                  phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0,
-                 pnorm: float = 2.0, sub: Optional[int] = None, support_soft: Optional[float] = None):
+                 pnorm: float = 2.0, sub: Optional[int] = None, support_soft: Optional[float] = None,
+                 knots: Optional[tuple[Sequence[float], Sequence[float]]] = None):
         """Per-sub-offset kernels. ``kind``: "exp" (1/e = scale_mm), "gauss" (sigma = scale_mm),
-        "mix" ((1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/scale_mm)). ``phase_mm`` shifts
-        the SAMPLE point: the field is evaluated at (p + phase) and attributed to p."""
+        "mix" ((1−tail_frac)·exp(−d/core_mm) + tail_frac·exp(−d/scale_mm)), "knots" (free-form radial
+        log-weight profile ``knots`` = (radii_mm, logw), default from the params — see
+        :meth:`est_knots`). ``phase_mm`` shifts the SAMPLE point: the field is evaluated at (p + phase)
+        and attributed to p."""
         p = self.p
         sub = p.sub if sub is None else int(sub)
         support_soft = p.est_support_soft if support_soft is None else float(support_soft)
+        knots_key = None
+        if kind == "knots":
+            r_knot, lw_knot = self.est_knots() if knots is None else knots
+            r_knot = np.asarray(r_knot, dtype=float); lw_knot = np.asarray(lw_knot, dtype=float)
+            knots_key = (tuple(np.round(r_knot, 4)), tuple(np.round(lw_knot, 6)))
         key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
                round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub,
-               round(support_soft, 4))
+               round(support_soft, 4), knots_key)
         if key in self._kern_cache:
             return self._kern_cache[key]
         cwmm, chmm = p.cell_w * p.px_mm, p.cell_h * p.px_mm
         reach_c = int(np.ceil(7 * scale_mm / cwmm)) + 1
         reach_r = int(np.ceil(7 * scale_mm / chmm)) + 1
+        if kind == "knots":
+            # reach must cover the knots and the exponential continuation (slope of the last segment); inside a
+            # hard/soft support the mask zeroes everything beyond it, so cap the table there (smaller GPU table)
+            slope = (lw_knot[-1] - lw_knot[-2]) / max(r_knot[-1] - r_knot[-2], 1e-9)
+            cont_mm = min(60.0, -1.0 / slope) if slope < -1e-6 else 60.0
+            reach_c = max(reach_c, int(np.ceil(7 * cont_mm / cwmm)) + 1, int(np.ceil(r_knot[-1] / cwmm)) + 1)
+            reach_r = max(reach_r, int(np.ceil(7 * cont_mm / chmm)) + 1, int(np.ceil(r_knot[-1] / chmm)) + 1)
+            if support_cells > 0:
+                lim = int(np.ceil(support_cells + support_soft)) + 1
+                reach_c, reach_r = min(reach_c, lim), min(reach_r, lim)
         ii = np.arange(-reach_c, reach_c + 1)
         jj = np.arange(-reach_r, reach_r + 1)
         kern = []
@@ -269,6 +335,11 @@ class FaldModel:
                     core = np.exp(-d / max(core_mm, 1e-3)); tail = np.exp(-d / scale_mm)
                     # each component normalised to unit sum before mixing so tail_frac is an ENERGY share
                     k = (1.0 - tail_frac) * core / core.sum() + tail_frac * tail / tail.sum()
+                elif kind == "knots":
+                    lw = np.interp(d, r_knot, lw_knot)                     # linear log-weight between knots
+                    beyond = d > r_knot[-1]                                # exponential continuation past the last
+                    lw = np.where(beyond, lw_knot[-1] + slope * (d - r_knot[-1]), lw)
+                    k = np.exp(lw)
                 else:
                     raise ValueError(kind)
                 if support_cells > 0:

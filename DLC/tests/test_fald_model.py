@@ -255,3 +255,56 @@ def test_lum_fade_leaves_near_black_untouched():
     off = replace(p, lum_fade_lo=0.0, lum_fade_hi=0.0)
     req_off = correct_image(FaldModel(off), dark, iters=1)["req"]
     assert np.abs(req_off[:, ~bar] / np.maximum(dark[:, ~bar], 1e-9) - 1).max() > 0.02, "fade off -> correction present"
+
+
+# ---------------------------------------------------------------------------
+# the free-form ("knots") estimate profile
+# ---------------------------------------------------------------------------
+
+def test_knots_from_exponential_reproduce_exp_estimate():
+    """est_kind="knots" with the log-weights of exp(−r/est_scale_mm) (explicit, or left empty → derived) must
+    give the same B_est as est_kind="exp" on a random drive map — with the shipped geometry (phase, aniso,
+    ±5-cell support) and with the bare defaults (no support)."""
+    from dataclasses import replace
+    from dlc.fald.model import exp_knot_logw
+    rng = np.random.default_rng(7)
+    for base in (FaldParams(est_kind="exp", est_scale_mm=12.76, est_phase_px=-18.0, est_phase_py=-24.5, est_aniso=0.85,
+                            est_support_cells=5, kernel_pnorm=1.75, core_mm=10.8, tail_mm=32.4, tail_frac=0.45),
+                 FaldParams(est_kind="exp")):
+        d = rng.uniform(0.0, 1.0, size=(base.rows, base.cols)); d[rng.uniform(size=d.shape) < 0.6] = 0.0
+        m_exp = FaldModel(base)
+        t_exp, e_exp = m_exp.backlights(d)
+        cell_mm = base.cell_w * base.px_mm
+        explicit = exp_knot_logw(base.est_scale_mm, base.est_knot_cells, cell_mm)
+        for logw in ((), explicit):
+            m_k = FaldModel(replace(base, est_kind="knots", est_knot_logw=logw))
+            t_k, e_k = m_k.backlights(d)
+            assert np.abs(t_k - t_exp).max() < 1e-12
+            assert np.abs(e_k - e_exp).max() < 1e-6, np.abs(e_k - e_exp).max()
+        # a genuinely different profile (flat core out to one cell) changes the estimate
+        bent = list(explicit); bent[1] = bent[0]; bent[2] = bent[0]
+        e_b = FaldModel(replace(base, est_kind="knots", est_knot_logw=tuple(bent))).backlights(d)[1]
+        assert np.abs(e_b - e_exp).max() > 1e-3
+    # a flat field is still flat (flat-response normalisation applies to the knots kind too)
+    m = FaldModel(replace(base, est_kind="knots", est_knot_logw=tuple(bent), est_support_cells=5))
+    img = np.full((3, m.h, m.w), 200.0)
+    b_true, b_est = m.backlights(m.cell_drives(img))
+    assert np.abs(b_est / b_true - 1.0).max() < 1e-6
+
+
+def test_knot_decrement_parametrisation_is_monotone_and_round_trips():
+    from dlc.fald.model import exp_knot_logw, knot_logw_from_decrements, knot_decrements_of
+    cells = FaldParams().est_knot_cells
+    prof = exp_knot_logw(12.76, cells, 80 * 0.1845)
+    z = knot_decrements_of(prof)
+    assert len(z) == len(cells) - 1
+    back = knot_logw_from_decrements(z)
+    assert np.allclose(back, np.array(prof) - prof[0], atol=1e-9)      # logw_0 pinned at 0 (normalisation)
+    rng = np.random.default_rng(3)
+    for _ in range(50):                                                  # fitting-style perturbations of z
+        zz = z + rng.normal(0.0, 2.0, size=z.shape)
+        lw = np.array(knot_logw_from_decrements(zz))
+        assert lw[0] == 0.0 and np.all(np.diff(lw) <= 0.0)
+    # a strongly negative z gives a (near-)plateau, never a rise
+    lw = np.array(knot_logw_from_decrements([-20.0] * 7))
+    assert np.all(np.diff(lw) <= 0.0) and lw[-1] > -1e-6
