@@ -47,11 +47,41 @@ def load_fitted_params(path: Path) -> FaldParams:
 
 
 def reference_pedestal(model: FaldModel, img: np.ndarray) -> np.ndarray:
-    """Per-pixel pedestal (as-if-white nits) a UNIFORM field of the pixel's own level would carry:
-    white · drive_curve(max channel) · tmin. Shape (h, w)."""
+    """Per-pixel pedestal (as-if-white nits, LUMINANCE-equivalent) a UNIFORM field of the pixel's own
+    level would carry: white · drive_curve(max channel) · tmin. Shape (h, w). With a coloured pedestal
+    (``ped_mode == "channel"``) this is still the luminance (Σ w_c·m_c = 1); see :func:`reference_pedestal_rgb`."""
     p = model.p
     s = np.minimum(np.max(img, axis=0), p.white_nits)
     return p.white_nits * model.drive_of(s) * p.tmin
+
+
+def pedestal_multipliers(model: FaldModel) -> np.ndarray:
+    """m_c (3,): the pedestal colour in effect — tmin_rgb in "channel" mode, (1, 1, 1) otherwise."""
+    return model.p.tmin_vec() / max(model.p.tmin, 1e-30)
+
+
+def reference_pedestal_rgb(model: FaldModel, img: np.ndarray) -> np.ndarray:
+    """Per-channel reference pedestal (3, h, w), as-if-white nits per channel: ref · m_c."""
+    return reference_pedestal(model, img)[None] * pedestal_multipliers(model)[:, None, None]
+
+
+def pedestal_adjust(delta: np.ndarray, img: np.ndarray, ped_mode: str) -> tuple[np.ndarray, np.ndarray]:
+    """The pedestal term the correction adds to ``img`` (as-if-white, per channel) given the per-channel
+    excess ``delta`` = ref − actual (< 0: this context leaks MORE than a uniform field → subtract).
+
+    ``"white"``: subtract the delta vector scaled by ONE common factor so no channel goes below zero (with the
+    white pedestal of this mode = the 2026-09-12 rule: the same amount from all channels, limited by the
+    darkest). ``"channel"``: subtract each channel's own excess, floored at 0 per channel (the least-error
+    inverse; the residual where a channel floors is the pedestal's own colour). Returns (adj, floored (h, w))."""
+    if ped_mode == "channel":
+        adj = np.maximum(delta, -img)
+        return adj, (adj > delta + 1e-12).any(axis=0)
+    if ped_mode != "white":
+        raise ValueError(f"ped_mode must be 'white' or 'channel', got {ped_mode!r}")
+    neg = delta < 0.0
+    frac = np.where(neg, np.minimum(1.0, img / np.where(neg, -delta, 1.0)), 1.0)   # fraction each channel can take
+    f = frac.min(axis=0)
+    return delta * f[None], f < 1.0
 
 
 def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
@@ -64,7 +94,8 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     p = model.p
     w = np.array(p.chan_weights)[:, None, None]
     lmax = p.white_nits * w
-    ped_ref = reference_pedestal(model, img)[None]             # as-if-white, same for all channels
+    tv = p.tmin_vec()[:, None, None]                          # per-channel closed-LCD transmittance
+    ped_ref = reference_pedestal_rgb(model, img)               # as-if-white, per channel
     cur = img.copy()
     gain = np.ones_like(img[0])
     for _ in range(max(1, iters)):
@@ -88,19 +119,18 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
             wlum = tl * tl * (3.0 - 2.0 * tl)
             gain = 1.0 + (gain - 1.0) * wlum
             wfade = wfade * wlum
-        ped = lmax * b_true[None] * p.tmin                     # per channel, nits, actual context
-        # Pedestal term, HUE-PRESERVING (2026-09-12, live A/B showed blue rims on dark edges): the
-        # panel adds the same leak to all three channels, so the correction subtracts the same
-        # amount from all three — limited by the darkest channel. What cannot be removed stays as
-        # white desaturation (the physical residual) instead of a per-channel clip that zeroes R/G
-        # and leaves B (a hue rotation). delta > 0 (uniform field leaks more than this context) is
-        # a plain lift and never clips.
-        delta = ped_ref - ped / w                              # as-if-white, identical for R/G/B
-        darkest = img.min(axis=0, keepdims=True)
-        floored_amt = np.maximum(-delta - darkest, 0.0)        # part of the subtraction the pixel cannot take
-        adj = np.where(delta < 0.0, delta + floored_amt, delta) * wfade
-        req = (img + adj) * gain[None]
-        floored = np.broadcast_to(floored_amt > 0.0, req.shape)
+        ped = lmax * b_true[None] * tv                         # per channel, nits, actual context
+        # Pedestal term. delta_c = ref − actual per channel (as-if-white); in "white" mode the three are
+        # identical. delta > 0 (uniform field leaks more than this context) is a plain lift and never clips;
+        # delta < 0 is limited by what the pixel can take, per FaldParams.ped_mode:
+        #   "white"   (2026-09-12, live A/B showed blue rims when a WHITE pedestal was clipped per channel):
+        #             one common factor on the whole vector, so what cannot be removed stays as desaturation
+        #             instead of a hue rotation;
+        #   "channel" (2026-09-13, coloured pedestal): each channel floors independently.
+        delta = ped_ref - ped / w                              # as-if-white, per channel
+        adj, floored_px = pedestal_adjust(delta, img, p.ped_mode)
+        req = (img + adj * wfade) * gain[None]
+        floored = np.broadcast_to(floored_px[None], req.shape)
         req = np.maximum(req, 0.0)
         cap = p.white_nits * np.maximum(b_est, 1e-9)[None]     # T ≤ 1  ⇔  req ≤ white·B_est
         clipped = (req > cap) & (wfade[None] >= 1.0)           # only where the model is trusted
@@ -136,8 +166,9 @@ def corrected_patch_code(model: FaldModel, shapes, meter_px: tuple[float, float]
         drives = model.cell_drives(frame)
         b_true, b_est = model.backlights(drives)
         g = (b_est / np.maximum(b_true, 1e-9))[mask]
-        ped = (p.white_nits * np.maximum(b_true, 0.0) * p.tmin)[mask]      # as-if-white
-        req = ((field[:, None] + ped_ref - ped[None]) * g[None]).mean(axis=1)
+        ped = (p.white_nits * np.maximum(b_true, 0.0) * p.tmin)[mask]      # as-if-white (luminance)
+        mch = pedestal_multipliers(model)[:, None]                         # pedestal colour in effect
+        req = ((field[:, None] + (ped_ref - ped[None]) * mch) * g[None]).mean(axis=1)
         gain = float(g.mean())
         codes = tuple(corrected_code(v) for v in np.maximum(req, 0.0))
     return {"codes": codes, "req_nits": req, "orig_nits": field, "gain": gain,

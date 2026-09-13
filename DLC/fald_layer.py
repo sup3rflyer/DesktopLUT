@@ -6,6 +6,8 @@
   python fald_layer.py debug <0..4>              0 correct, 1 show gain-1 (grey 0.5 = no change), 2 B_true, 3 B_est,
                                                  4 identity passthrough (the A/B baseline — not OFF: the awake overlay
                                                  itself dips 0.5-2.4 % vs the sleeping one)
+  python fald_layer.py ped <0|1>                 pedestal colour: 0 white (default, pre-2026-09-13), 1 per-channel
+                                                 (the FLD2 panel file's measured leak colour; the GUI checkbox)
   python fald_layer.py dump <dir>                next frame dumps drive/B_true/B_est/frame (input) + fald_out (output)
                                                  to <dir>; with debug 4 fald_out must equal fald_frame bit for bit
   python fald_layer.py ab <seconds> [n]          alternate off/on every <seconds>, n cycles (default 6)
@@ -24,7 +26,7 @@ from dlc.controller import CalibrationController
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["status", "params", "on", "off", "debug", "dump", "ab"])
+    ap.add_argument("cmd", choices=["status", "params", "on", "off", "debug", "ped", "dump", "ab"])
     ap.add_argument("arg", nargs="?")
     ap.add_argument("n", nargs="?", type=int, default=6)
     ap.add_argument("--monitor", type=int, default=0)
@@ -42,6 +44,8 @@ def main(argv=None):
         print(json.dumps(c.call("layers.set", {"monitor": mon, "mode": mode, "fald": a.cmd == "on"}), indent=1))
     elif a.cmd == "debug":
         print(json.dumps(c.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "debug_mode": int(a.arg)}), indent=1))
+    elif a.cmd == "ped":
+        print(json.dumps(c.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "ped_mode": int(a.arg)}), indent=1))
     elif a.cmd == "dump":
         d = Path(a.arg).resolve(); d.mkdir(parents=True, exist_ok=True)
         print(json.dumps(c.call("runtime.fald_dump", {"monitor": mon, "mode": mode, "dir": str(d)}), indent=1))

@@ -20,8 +20,17 @@ File layout (little-endian, all float32 unless noted; header is 32 uint32/float3
   word 28  f: gain_smooth_cells (Gaussian sigma of the gain low-pass, cells; 0 = off)
   word 29  f: lum_fade_lo   word 30  f: lum_fade_hi   (pixel-luminance fade, as-if-white nits; 0,0 = loader defaults)
   word 31  reserved (0)
+FLD2 (magic 0x464C4432, written when the fit carries a pedestal colour, tmin_rgb): the same 32 words, then
+8 more (header = 40 words = 160 bytes):
+  word 32  f: m_r  word 33  f: m_g  word 34  f: m_b   (pedestal colour multipliers on tmin; Σ w_c·m_c = 1 keeps
+                                                       the luminance fit; the LOADER stores them, the GUI
+                                                       "per-channel pedestal" toggle decides whether the
+                                                       shader uses them — off = white pedestal, as FLD1)
+  word 35  ped_mode the fit was validated with: 0 = white, 1 = channel (informational; the GUI setting rules)
+  words 36-39  reserved (0)
 The C++ reader is LoadFaldPanelParams (src/fald.cpp; tests/test_fald.cpp); words 26-30 are optional —
-zero means 'loader default' so older files stay loadable. Keep the two in step when adding a word.
+zero means 'loader default' so older files stay loadable; an FLD1 file loads with m = (1, 1, 1).
+Keep the two in step when adding a word.
   then: curve[curve_n]                                  drive vs ln(nits), linear in ln(nits)
   then: k_true[sub][sub][2*reach_true_r+1][2*reach_true_c+1]   index order (oy, ox, j, i)
   then: k_est [sub][sub][2*reach_est_r+1][2*reach_est_c+1]
@@ -38,6 +47,8 @@ import numpy as np
 from .model import FaldModel, FaldParams
 
 MAGIC = 0x464C4431
+MAGIC2 = 0x464C4432          # 'FLD2': 40-word header (pedestal colour multipliers + validated mode)
+PED_MODE_CODES = {"white": 0, "channel": 1}
 CURVE_N = 1024
 CURVE_LOG_MIN, CURVE_LOG_MAX = float(np.log(1e-2)), float(np.log(10000.0))
 
@@ -65,17 +76,23 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
     curve = drive_curve_lut(model)
     rt_r, rt_c = (kt.shape[2] - 1) // 2, (kt.shape[3] - 1) // 2
     re_r, re_c = (ke.shape[2] - 1) // 2, (ke.shape[3] - 1) // 2
-    header = [MAGIC, p.cols, p.rows, p.sub, int(round(p.cell_w)), int(round(p.cell_h)), 0, 0,
+    v2 = p.tmin_rgb is not None
+    header = [MAGIC2 if v2 else MAGIC, p.cols, p.rows, p.sub, int(round(p.cell_w)), int(round(p.cell_h)), 0, 0,
               rt_c, rt_r, re_c, re_r, len(curve)]
     floats = [p.white_nits, p.tmin, p.stat_area0_px2, *p.chan_weights, gain_clip[0], gain_clip[1],
               p.drive_floor_nits, CURVE_LOG_MIN, CURVE_LOG_MAX, p.est_phase_px, p.est_phase_py]
     buf = (struct.pack("<13I", *header) + struct.pack("<13f", *floats) + struct.pack("<2f", p.fade_lo, p.fade_hi)
            + struct.pack("<f", p.gain_smooth_cells) + struct.pack("<2f", p.lum_fade_lo, p.lum_fade_hi) + struct.pack("<I", 0))
     assert len(buf) == 32 * 4
+    if v2:
+        buf += (struct.pack("<3f", *(float(x) for x in p.tmin_rgb)) + struct.pack("<I", PED_MODE_CODES[p.ped_mode])
+                + struct.pack("<4I", 0, 0, 0, 0))
+        assert len(buf) == 40 * 4
     buf += curve.tobytes() + np.ascontiguousarray(kt).tobytes() + np.ascontiguousarray(ke).tobytes()
     Path(path).write_bytes(buf)
     return {"path": str(path), "bytes": len(buf), "k_true_shape": kt.shape, "k_est_shape": ke.shape,
-            "curve_n": len(curve), "header_ints": header, "header_floats": floats}
+            "curve_n": len(curve), "header_ints": header, "header_floats": floats,
+            "format": "FLD2" if v2 else "FLD1", "header_bytes": 160 if v2 else 128}
 
 
 def main(argv=None):

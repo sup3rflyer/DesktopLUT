@@ -628,12 +628,15 @@ class MockDesktopLutServer:
         elif method == "runtime.fald_debug":
             if params.get("mode") != "HDR":
                 return DesktopLutResponse(ok=False, error="fald is an HDR-only layer")
-            mode = params.get("debug_mode")
-            if not isinstance(mode, (int, float)):
-                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..3)")
-            mode = int(min(3, max(0, mode)))
-            state["fald_debug_mode"] = mode
-            return self.ok({"monitor_mode": key, "debug_mode": mode})
+            mode = params.get("debug_mode"); ped = params.get("ped_mode")
+            if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..4) or ped_mode (0|1)")
+            if isinstance(mode, (int, float)):
+                state["fald_debug_mode"] = int(min(4, max(0, mode)))
+            if isinstance(ped, (int, float)):
+                state["fald_ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
+            return self.ok({"monitor_mode": key, "debug_mode": state.get("fald_debug_mode", 0),
+                            "ped_mode": state.get("fald_ped_mode", 0)})
         elif method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

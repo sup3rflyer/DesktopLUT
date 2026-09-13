@@ -102,7 +102,20 @@ class FaldParams:
     # panel
     white_nits: float = 1842.0            # native full-field white at code 1023 (2026-09-11; 1040 was the stack's)
     chan_weights: tuple[float, float, float] = (0.305, 0.596, 0.099)   # R,G,B share of white
-    tmin: float = 3.0e-4                  # closed-LCD transmittance (pedestal = Lmax·B·tmin)
+    tmin: float = 3.0e-4                  # closed-LCD transmittance (pedestal = Lmax·B·tmin), LUMINANCE-fitted
+    # Pedestal COLOUR (2026-09-13, work-guide H2 / owner: "channel subtractive mode"): the closed-LCD leak is bluer
+    # than the panel's white (native black-field leak, doc §22 logs: xy ≈ 0.273/0.299 vs white 0.3235/0.3283).
+    # tmin_rgb = per-channel multipliers m_c on tmin, normalised so Σ_c w_c·m_c = 1 (the luminance fit is kept):
+    # pedestal_c = Lmax_c · B_true · tmin · m_c. None = white pedestal (the pre-2026-09-13 behaviour).
+    tmin_rgb: Optional[tuple[float, float, float]] = None
+    # Pedestal MODE — one switch, mirrored by the DesktopLUT GUI "per-channel pedestal" toggle (CB pedMode):
+    #   "white"   = tmin_rgb IGNORED: white pedestal, subtract the same as-if-white amount from all channels,
+    #               limited by the darkest one (the 2026-09-12 rule; a per-channel clip of a WHITE pedestal
+    #               zeroed R/G and left B → blue rims). Byte-identical to the pre-2026-09-13 layer.
+    #   "channel" = the coloured pedestal (tmin_rgb) is subtracted per channel, each channel floored at 0
+    #               independently (the least-error inverse once the colour is right; the residual where a
+    #               channel floors is the pedestal's own colour, which no request can remove).
+    ped_mode: str = "white"
     # meter
     aperture_px: float = 80.0
     drive_dim: float = 0.0                # relative drive at the dimmest curve point (fitted; a zero
@@ -133,6 +146,15 @@ class FaldParams:
     @property
     def cell_h(self) -> float:
         return self.height / self.rows
+
+    def tmin_vec(self) -> np.ndarray:
+        """Per-channel closed-LCD transmittance (3,): tmin · m_c. m = tmin_rgb only in ped_mode "channel";
+        in "white" mode (or with no measured colour) the pedestal is white, m = (1, 1, 1)."""
+        if self.ped_mode == "channel" and self.tmin_rgb is not None:
+            return self.tmin * np.asarray(self.tmin_rgb, dtype=float)
+        if self.ped_mode not in ("white", "channel"):
+            raise ValueError(f"ped_mode must be 'white' or 'channel', got {self.ped_mode!r}")
+        return self.tmin * np.ones(3)
 
 
 def _eotf_nits(code: np.ndarray, bits: int = 10) -> np.ndarray:
@@ -450,7 +472,7 @@ class FaldModel:
         # monitor's request: T = target / (Lmax · B_est), clamped to [0, 1]
         t_req = target / np.maximum(lmax * np.maximum(b_est, 1e-6)[None], 1e-9)
         t = np.clip(t_req, 0.0, 1.0)
-        y = lmax * b_true[None] * t + lmax * b_true[None] * p.tmin
+        y = lmax * b_true[None] * t + lmax * b_true[None] * p.tmin_vec()[:, None, None]   # per-channel pedestal
         return {"img": img, "drives": drives, "b_true": b_true, "b_est": b_est, "t": t, "y": y}
 
     def meter(self, shapes: Sequence[Shape], meter_px: tuple[float, float],

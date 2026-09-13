@@ -354,13 +354,16 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ApiMethodSpec(
             "runtime.fald_debug",
             "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map, 2 real "
-            "backlight, 3 panel estimate). Not persisted.",
+            "backlight, 3 panel estimate, 4 identity passthrough; not persisted) and/or the pedestal mode "
+            "(ped_mode 0 = white pedestal, 1 = the FLD2 panel file's per-channel leak colour; persisted, "
+            "= the GUI 'Per-channel pedestal' checkbox). At least one of the two.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "debug_mode": ApiParamSpec("number", description="0..3"),
+                "debug_mode": ApiParamSpec("number", required=False, description="0..4"),
+                "ped_mode": ApiParamSpec("number", required=False, description="0 | 1"),
             },
-            {"monitor_mode": "string", "debug_mode": "number"},
+            {"monitor_mode": "string", "debug_mode": "number", "ped_mode": "number"},
             mutates_state=True,
             gui_thread_required=True,
         ),
