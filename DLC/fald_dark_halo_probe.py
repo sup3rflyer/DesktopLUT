@@ -67,7 +67,9 @@ def frame(mx, my, grey, kind, gap=0):
 
 def main():
     mx, my = (int(v) for v in os.environ.get("FALD_METER", "1988,1120").split(","))
-    model = FaldModel(replace(load_fitted_params(F.PARAMS), scale=1)); p = model.p
+    fit_json = Path(os.environ.get("FALD_FIT_JSON", str(F.PARAMS)))     # FALD_FIT_JSON: alternative fit (e.g. the knots candidate)
+    P.log(f"[halo] model params: {fit_json}")
+    model = FaldModel(replace(load_fitted_params(fit_json), scale=1)); p = model.p
     mask = model.aperture_mask((mx, my))
     specs = []
     for g in GREYS:
