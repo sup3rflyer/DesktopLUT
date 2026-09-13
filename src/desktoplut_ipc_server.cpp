@@ -1305,7 +1305,7 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // FALD correction layer (HDR only). runtime.set_fald_params {monitor, mode:"HDR", params_path}:
 // the per-panel parameter file (DLC `python -m dlc.fald.export`); re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
-// debug_mode 0..6}: 0 correct, 1 show gain-1 grey ramp, 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
+// debug_mode 0..6}: 0 correct, 1 gain map (white 0, red brighten, blue darken, +-25 %), 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
 // x100, 6 per-channel-vs-white influence x100 (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
 // FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).

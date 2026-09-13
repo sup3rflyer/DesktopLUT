@@ -3,7 +3,8 @@
   python fald_layer.py status                    layers + fald params path for monitor 0 HDR
   python fald_layer.py params <panel.bin>        set the per-panel parameter file (dlc.fald.export output)
   python fald_layer.py on | off                  toggle the layer
-  python fald_layer.py debug <0..6>              0 correct, 1 show gain-1 (grey 0.5 = no change), 2 B_true, 3 B_est,
+  python fald_layer.py debug <0..6>              0 correct, 1 gain map (white = no change, red = brighten, blue = darken,
+                                                 +-25 % full scale), 2 B_true, 3 B_est,
                                                  4 identity passthrough (the A/B baseline — not OFF: the awake overlay
                                                  itself dips 0.5-2.4 % vs the sleeping one), 5 pedestal term x100,
                                                  6 per-channel-vs-white influence x100 (black = the toggle changes nothing)

@@ -279,7 +279,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 )";
 
 // Pass 3: per-pixel correction of the ORIGINAL processed frame with the final fields.
-// debugMode 1 = visualise gain-1 (grey 0.5 = no change, +-25 % full scale), 2 = B_true, 3 = B_est,
+// debugMode 1 = visualise gain-1 (white = no change, red = brighten, blue = darken, +-25 % full scale), 2 = B_true, 3 = B_est,
 // 4 = identity passthrough (the layer runs its passes but outputs the source: isolates the overlay path itself),
 // 5 = the pedestal term actually applied (|adj| * fade, per channel, x100: 1 nit of subtraction shows as 100 nits;
 //     the colour is the colour of what is subtracted or lifted), 6 = the influence of the per-channel toggle:
@@ -295,8 +295,11 @@ float4 main(PS_INPUT i) : SV_Target {
     float bT, bE; SampleFields(float2(px), bT, bE);
     float gain = gainTex.SampleLevel(linearClamp, FineUV(float2(px)), 0);
     if (debugMode == 1) {
-        float v = saturate(0.5f + 2.0f * (gain - 1.0f)) * (100.0f / 80.0f);     // 100-nit grey ramp, +-25 % full scale
-        return float4(v, v, v, 1.0f);
+        // diverging map, the DLC analysis convention: white = no change, red = brighten, blue = darken,
+        // +-25 % full scale (saturated red/blue), on a 100-nit white
+        float t = saturate(abs(gain - 1.0f) * 4.0f);
+        float3 c = (gain >= 1.0f) ? float3(1.0f, 1.0f - t, 1.0f - t) : float3(1.0f - t, 1.0f - t, 1.0f);
+        return float4(c * (100.0f / 80.0f), 1.0f);
     }
     if (debugMode == 2) { float v = saturate(bT) * (100.0f / 80.0f); return float4(v, v, v, 1.0f); }
     if (debugMode == 3) { float v = saturate(bE) * (100.0f / 80.0f); return float4(v, v, v, 1.0f); }

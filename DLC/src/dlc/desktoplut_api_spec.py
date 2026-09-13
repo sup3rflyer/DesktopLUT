@@ -353,7 +353,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "runtime.fald_debug",
-            "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map, 2 real "
+            "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map white/red +/blue -, 2 real "
             "backlight, 3 panel estimate, 4 identity passthrough, 5 pedestal term x100, 6 per-channel-vs-white "
             "influence x100; not persisted) and/or the pedestal mode "
             "(ped_mode 0 = white pedestal, 1 = the FLD2 panel file's per-channel leak colour; persisted, "

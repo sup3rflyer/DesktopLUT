@@ -706,7 +706,7 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 115, innerY + 18, 120, 120, panel2, (HMENU)ID_CORR_FALD_DEBUG, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldDebug);
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Corrected image");
-    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Gain map");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Gain map (red +, blue -)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Real backlight");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Panel estimate");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Passthrough (identity)");
