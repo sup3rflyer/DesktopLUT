@@ -46,6 +46,7 @@ void FaldTrace(const char* msg) {
 // Parameter file
 // ---------------------------------------------------------------------------------------------
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err) {
+    out = FaldPanelParams{};   // Build loads into long-lived resources: an earlier FLD3 must not leave transfer=gamma behind
     std::ifstream f(path, std::ios::binary);
     if (!f) { err = "cannot open params file"; return false; }
     std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -283,21 +284,24 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     r->paramsPath = path;
     r->width = ctx->width; r->height = ctx->height;
     r->builtForHdr = ctx->isHDREnabled;
+    r->refusedByFile = false;
     r->fileSize = r->fileMtime = 0;
     FileStamp(path, r->fileSize, r->fileMtime);   // taken before the read: a write racing the load re-triggers a rebuild
     r->fileCheckCounter = 0;
     std::string err;
-    if (!LoadFaldPanelParams(path, r->params, err)) { r->lastError = "params: " + err; return false; }
+    if (!LoadFaldPanelParams(path, r->params, err)) { r->lastError = "params: " + err; r->refusedByFile = true; return false; }
     const FaldPanelParams& p = r->params;
     if (!FaldTransferMatchesMode(p.transfer, ctx->isHDREnabled)) {
         // The fit's code domain is the panel's: a PQ (HDR) file cannot serve an ACM SDR desktop and vice versa.
         r->lastError = std::string("panel file transfer is ") + (p.transfer == FALD_TRANSFER_GAMMA ? "gamma (SDR fit)" : "PQ (HDR fit)") +
                        " but the monitor is in " + (ctx->isHDREnabled ? "HDR" : "SDR (ACM)") + " - use a file profiled in this mode";
+        r->refusedByFile = true;
         return false;
     }
     if (!FaldLatticeFits(p, ctx->width, ctx->height)) {
         r->lastError = "panel lattice (" + std::to_string(p.cols * p.cellW) + "x" + std::to_string(p.rows * p.cellH) +
                        ") does not fit the monitor (" + std::to_string(ctx->width) + "x" + std::to_string(ctx->height) + ")";
+        r->refusedByFile = true;
         return false;
     }
     // intermediate (swapchain format so the main shader writes it unchanged)
@@ -367,8 +371,16 @@ bool FaldEnsureResources(MonitorContext* ctx, const FaldSettings& settings) {
     r->reloadSeq = settings.reloadSeq;
     // A failed build (bad/partially written params file, transient resource failure) is retried
     // every ~300 frames so a re-exported file or a recovered device picks the layer up again;
-    // each distinct error is logged once.
-    if (!stale && !r->lastError.empty() && (++r->retryCounter % 300) != 0) return false;
+    // each distinct error is logged once. A refusal caused by the FILE is only retried when the
+    // file's size/mtime changed (no periodic re-read of a file known to be wrong for this mode).
+    if (!stale && !r->lastError.empty()) {
+        if ((++r->retryCounter % 300) != 0) return false;
+        if (r->refusedByFile) {
+            unsigned long long size = 0, mtime = 0;
+            bool readable = FileStamp(paramsPath, size, mtime);
+            if (readable == (r->fileSize != 0 || r->fileMtime != 0) && size == r->fileSize && mtime == r->fileMtime) return false;
+        }
+    }
     FaldTrace("EnsureResources: Build begin");
     if (!Build(ctx, r, paramsPath)) {
         FaldTrace("EnsureResources: Build FAILED");
@@ -381,6 +393,14 @@ bool FaldEnsureResources(MonitorContext* ctx, const FaldSettings& settings) {
     }
     r->lastLoggedError.clear();
     FaldTrace("EnsureResources: Build ok");
+    return true;
+}
+
+bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings) {
+    const FaldResources* r = ctx ? ctx->fald : nullptr;
+    if (!r || r->valid || !r->refusedByFile) return false;
+    if (r->paramsPath != settings.paramsPath || r->reloadSeq != settings.reloadSeq || r->builtForHdr != ctx->isHDREnabled ||
+        r->width != ctx->width || r->height != ctx->height) return false;   // something changed: let the next frame retry
     return true;
 }
 

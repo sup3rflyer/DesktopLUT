@@ -71,8 +71,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                        "until then the snapshot degrades to clear-to-identity on hardware (fable Phase 9)",
                 "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
                 "layers": "object keyed by '<monitor>:<MODE>' for EVERY pair: the viewing layers a run "
-                          "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap: bool"
-                          "; HDR adds tonemap_dynamic, tonemap_target_peak}. mhc entries also carry "
+                          "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"
+                          "; HDR adds tonemap_dynamic, tonemap_target_peak; every pair (HDR and SDR, the FALD "
+                          "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
+                          "fald_ped_mode, fald_ped_colour_in_file, and fald_file_transfer 'pq'|'gamma' when the "
+                          "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
                           "Absent on pre-2026-09-03 builds (then the ini is the only layer evidence).",

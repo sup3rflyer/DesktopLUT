@@ -4602,7 +4602,9 @@ def _layers_on(ctrl: CalibrationController, key: str, **on: bool) -> None:
 
 
 def _layers(ctrl: CalibrationController, key: str) -> dict:
-    return dict(ctrl.state()["layers"].get(key) or {})
+    # the flags only: the pipe (and the mock, like the C++) also reports settings such as fald_params_path per pair
+    entry = ctrl.state()["layers"].get(key) or {}
+    return {n: v for n, v in entry.items() if n in CalibrationController.LAYER_NAMES}
 
 
 def test_3dlut_only_measures_with_the_viewing_layers_off_and_restores_them(tmp_path: Path):

@@ -112,7 +112,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.disable_grayscale_tweak", mm),
         ("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(cube_3d)}),   # any existing file (unclassifiable: accepted)
         ("runtime.fald_debug", {"monitor": 0, "mode": "HDR", "debug_mode": 1}),
-        ("runtime.fald_dump", {"monitor": 0, "mode": "HDR", "dir": str(tmp_path)}),
+        ("runtime.fald_dump", {"monitor": 0, "mode": "SDR", "dir": str(tmp_path)}),   # the live mode (set_hdr off above)
         ("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(_write_fald_panel(tmp_path / "sdr.bin", "gamma"))}),
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
         ("layers.set", {**mm, "fald": True}),
@@ -272,17 +272,36 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert ok.ok and ok.result["transfer"] == "pq"
     bad = client.send(DesktopLutCommand("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(pq)}),
                       raise_on_error=False)
-    assert bad.ok is False and "does not match mode SDR" in (bad.error or "")
+    assert bad.ok is False and bad.error == "panel file transfer pq (HDR fit) does not match mode SDR"   # C++ text
     bad = client.send(DesktopLutCommand("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(gamma)}),
                       raise_on_error=False)
-    assert bad.ok is False and "does not match mode HDR" in (bad.error or "")
+    assert bad.ok is False and bad.error == "panel file transfer gamma (SDR fit) does not match mode HDR"
     # per-mode toggle + state
     r = client.call("layers.set", {"monitor": 0, "mode": "SDR", "fald": True})
     assert r.ok and r.result["after"]["fald"] is True and r.result["regenerated"] is False
+    assert r.result["after"]["fald_params_path"] == str(gamma)          # C++ LayersJson carries the path
     st = client.call("state.get", {}).result
     assert st["layers"]["0:SDR"]["fald"] is True and st["layers"]["0:HDR"]["fald"] is False
+    # the C++ reports the fald settings inside layers[key] for every pair — never under runtime
+    assert st["layers"]["0:SDR"]["fald_params_path"] == str(gamma) and st["layers"]["0:SDR"]["fald_file_transfer"] == "gamma"
+    assert st["layers"]["0:HDR"]["fald_params_path"] == str(pq) and st["layers"]["0:HDR"]["fald_file_transfer"] == "pq"
+    assert "fald_file_transfer" not in st["layers"]["1:SDR"] and st["layers"]["1:SDR"]["fald_params_path"] == ""
+    assert "0:SDR" not in st["runtime"]
     dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})
     assert dbg.ok and dbg.result["debug_mode"] == 4
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_debug_mode"] == 4
+    # fald_dump is of the live mode (the monitor is in SDR here)
+    bad = client.send(DesktopLutCommand("runtime.fald_dump", {"monitor": 0, "mode": "HDR", "dir": str(tmp_path)}),
+                      raise_on_error=False)
+    assert bad.ok is False and bad.error == "monitor is in SDR, not HDR"
+    assert client.call("runtime.fald_dump", {"monitor": 0, "mode": "SDR", "dir": str(tmp_path)}).ok
+    # calibration.enter clears the flag of the calibrated pair but keeps the panel file (C++ DoEnterNeutral)
+    client.call("calibration.enter", {"monitor": 0, "mode": "SDR", "dummy_icc_path": "C:/dlc/sRGB.icm"})
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald"] is False and st["layers"]["0:SDR"]["fald_params_path"] == str(gamma)
+    client.call("calibration.exit", {"restore_snapshot": True})
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald"] is True and set(server.state.layers["0:SDR"]) <= set(server.LAYER_NAMES)
     # desktop_gamma / tonemap stay HDR-only in SDR
     bad = client.send(DesktopLutCommand("layers.set", {"monitor": 0, "mode": "SDR", "tonemap": True}), raise_on_error=False)
     assert bad.ok is False and "HDR-only" in (bad.error or "")

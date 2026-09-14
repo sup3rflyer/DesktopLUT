@@ -11,15 +11,9 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
-- **FALD layer in SDR under Windows ACM + ACM detection** (2026-09-14, work guide P7/C8): the DesktopLUT FALD
-  compensation layer now runs on the SDR desktop when "Automatically manage color for apps" is on (per-mode
-  settings and GUI row, `SDR_Fald*` INI keys, pipe `mode: SDR` for `runtime.set_fald_params` / `fald_debug` /
-  `fald_dump` and `layers.set {fald}`). A `transfer: "gamma"` fit exports as **FLD3** (header words 40/41:
-  transfer + `sdr_gamma`); the shader decodes the SDR frame as `white × sRGB_OETF(scRGB)^sdr_gamma`
-  (`FaldParams.scrgb_to_nits` is the reference), and a panel file is refused on the wrong mode.
-  `windows.query_monitors.color_space` reports `ACM_SDR` via DisplayConfig (`color_mode_source` names the
-  query); the profile flow's `verify` phase runs in SDR (and under `--simulate`). Hardware verify on the
-  PA32UCXR in SDR is owed.
+- **FALD compensation on SDR desktops** (2026-09-14): the mini-LED compensation layer now also works in SDR
+  when Windows "Automatically manage color for apps" is on, with its own panel file; the profiling flow can
+  verify an SDR profile, and DesktopLUT now reports whether that Windows setting is on.
 - **FALD profile flow** (`dlc.stages.fald_profile`, 2026-09-14): the user-facing, meter-only mini-LED
   profiling pass — one sensor spot, ≈ 40 min, no camera. Spec-sheet zone count + diagonal in; phases
   preflight (native state + ACM/HDR check) → register (sensor self-registration, transport check) → grid

@@ -2,7 +2,9 @@
 transfer, and FaldParams.scrgb_to_nits is the reference the HLSL PanelNits must match in both modes."""
 from __future__ import annotations
 
+import re
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -51,12 +53,38 @@ def test_export_refuses_a_gamma_outside_the_loader_gate(tmp_path):
         export_panel_params(FaldModel(_params(transfer="nonsense")), tmp_path / "bad2.bin")
 
 
-def test_srgb_transfer_round_trips_and_matches_the_hlsl_constants():
+_SHADER = Path(__file__).resolve().parents[2] / "src" / "fald_shader.h"
+
+
+def test_srgb_transfer_round_trips():
     v = np.linspace(0.0, 1.0, 1001)
     assert np.allclose(srgb_eotf(srgb_oetf(v)), v, atol=1e-12)
-    assert abs(srgb_oetf(0.0031308) - 12.92 * 0.0031308) < 1e-9     # the HLSL SrgbOetf knee
-    assert abs(srgb_eotf(0.04045) - 0.04045 / 12.92) < 1e-9
     assert srgb_oetf(-0.5) == 0.0 and abs(srgb_oetf(2.0) - 1.0) < 1e-12   # composition clip, as the shader's saturate
+
+
+@pytest.mark.skipif(not _SHADER.exists(), reason="DesktopLUT C++ tree not next to DLC")
+def test_python_reference_constants_match_the_hlsl_source():
+    """Reads src/fald_shader.h: the sRGB knees/exponents and both BT.709<->BT.2020 matrices in SrgbOetf /
+    SrgbEotf / PanelNits must be the ones model.py uses, and PanelNits must branch on transfer 1 = gamma."""
+    from dlc.fald import model as M
+    src = _SHADER.read_text(encoding="utf-8")
+    oetf = re.search(r"float SrgbOetf\(float L\) \{(.*?)\n\}", src, re.S).group(1)
+    eotf = re.search(r"float SrgbEotf\(float V\) \{(.*?)\n\}", src, re.S).group(1)
+    assert "0.0031308f" in oetf and "12.92f" in oetf and "1.055f" in oetf and "1.0f / 2.4f" in oetf and "0.055f" in oetf
+    assert "0.04045f" in eotf and "12.92f" in eotf and "0.055f" in eotf and "1.055f" in eotf and "2.4f" in eotf
+    assert abs(M.srgb_oetf(0.0031308) - 12.92 * 0.0031308) < 1e-9 and abs(M.srgb_eotf(0.04045) - 0.04045 / 12.92) < 1e-9
+
+    def matrix(name):
+        body = re.search(name + r" = float3x3\((.*?)\);", src, re.S).group(1)
+        return np.array([float(x.rstrip("f")) for x in re.findall(r"-?\d+\.\d+f", body)]).reshape(3, 3)
+    assert np.array_equal(matrix("BT709_TO_BT2020"), M.BT709_TO_BT2020)
+    assert np.array_equal(matrix("BT2020_TO_BT709"), M.BT2020_TO_BT709)
+    panel = re.search(r"float3 PanelNits\(float3 scrgb\) \{(.*?)\n\}", src, re.S).group(1)
+    assert "transfer == 1u" in panel and "pow(" in panel and "sdrGamma" in panel and "80.0f" in panel
+    # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43)
+    cb = re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", src, re.S).group(1)
+    fields = re.findall(r"(?:uint|float) (\w+);", cb)
+    assert len(fields) == 44 and fields[31] == "transfer" and fields[43] == "sdrGamma"
 
 
 def test_scrgb_to_nits_gamma_equals_code_to_nits_of_the_composed_code():

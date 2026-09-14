@@ -14,6 +14,9 @@
 // scRGB -> the 8/10-bit sRGB code (sRGB_OETF, the same encode the main SDR shader assumes) and the panel
 // shows it with its own power law, as-if-white nits = white x sRGB_OETF(scRGB)^sdrGamma (DLC
 // FaldParams.code_to_nits with transfer "gamma"; the reference formula is FaldParams.scrgb_to_nits).
+// That recovers the panel-bound code only under the output profile the panel file was profiled with (DLC's
+// native state: sRGB / identity); an SDR MHC2 calibration changes the per-channel code at scanout (HDR: same
+// limit with an HDR MHC).
 //
 // Passes per frame (overlay path, on the processed frame, after tonemap/LUT/WB):
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)

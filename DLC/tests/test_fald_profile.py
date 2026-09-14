@@ -233,6 +233,18 @@ def test_stage_measuring_phases_emit_checkins_and_honour_cancel(tmp_path):
     assert rings.status == "failed" and rings.anomalies[0].code == "cancelled"
 
 
+def test_acm_off_is_graded_by_the_pipe_build():
+    """C8 (2026-09-14): a build that reads ACM through DisplayConfig (color_mode_source present) and still says
+    SDR means ACM is really off -> high; an older build (no color_mode_source) cannot see ACM -> advisory."""
+    new_off = fald_profile.acm_off_anomaly("SDR", {"color_space": "SDR", "color_mode_source": "displayconfig2"})
+    assert new_off and new_off[0] == "acm_off" and new_off[2] == "high"
+    old = fald_profile.acm_off_anomaly("SDR", {"color_space": "SDR"})
+    assert old and old[0] == "acm_off" and old[2] == "medium" and "false positive" in old[1]
+    assert fald_profile.acm_off_anomaly("SDR", {"color_space": "ACM_SDR", "color_mode_source": "displayconfig2"}) is None
+    assert fald_profile.acm_off_anomaly("HDR", {"color_space": "SDR", "color_mode_source": "dxgi"}) is None
+    assert fald_profile.acm_off_anomaly("SDR", {"color_space": "HDR"}) is None     # mode_mismatch handles that
+
+
 @pytest.mark.slow
 def test_stage_chain_sdr_to_export_and_verify(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")

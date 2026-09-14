@@ -827,12 +827,13 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
             if (QueryFreshOutputDesc(snaps[i].hmon, desc)) {
                 bool hdrActive = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
                 bool dxgiFp16Sdr = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
-                e.set("hdr_active", JBool(hdrActive));
                 // ACM ("Automatically manage color for apps") is invisible to DXGI: the output colour
                 // space stays G22_P709 with ACM on (HW 2026-09-14, work guide C8), so SDR vs ACM_SDR
                 // comes from DisplayConfig (24H2 activeColorMode; older: advancedColorEnabled && !HDR).
                 DisplayColorModeResult cm = haveDi ? QueryDisplayColorMode(di, hdrActive, dxgiFp16Sdr)
                                                    : ClassifyDisplayColorMode(hdrActive, dxgiFp16Sdr, false, 0, false, false);
+                // hdr_active and color_space from ONE verdict (DisplayConfig can see HDR a moment before DXGI does)
+                e.set("hdr_active", JBool(cm.mode == DisplayColorMode::HDR));
                 e.set("color_space", JStr(DisplayColorModeName(cm.mode)));
                 e.set("color_mode_source", JStr(cm.source));
             }
@@ -1355,7 +1356,7 @@ void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) 
     const bool known = FaldPanelFileTransfer(path, transfer);
     if (known && !FaldTransferMatchesMode(transfer, isHDR)) {
         error = std::string("panel file transfer ") + (transfer == FALD_TRANSFER_GAMMA ? "gamma (SDR fit)" : "pq (HDR fit)") +
-                " does not match mode " + (isHDR ? "HDR" : "SDR");
+                " does not match mode " + (isHDR ? "HDR" : "SDR");   // DLC mock: identical text
         return;
     }
     {
@@ -1376,7 +1377,7 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* v = p.find("debug_mode");
     const JsonValue* pm = p.find("ped_mode");
-    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..4) or ped_mode (0|1)"; return; }
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..6) or ped_mode (0|1)"; return; }
     unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
@@ -1409,6 +1410,12 @@ void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
         for (auto& ctx : g_monitors) {
             if (ctx.index == mon) {
+                // the dump is of the layer that runs, i.e. the monitor's live mode: a request for the other mode would
+                // silently dump the wrong settings/file
+                if (ctx.isHDREnabled != isHDR) {
+                    error = std::string("monitor is in ") + (ctx.isHDREnabled ? "HDR" : "SDR") + ", not " + (isHDR ? "HDR" : "SDR");
+                    return;
+                }
                 if (ctx.faldDumpRequested.load()) { error = "a fald dump is still pending for this monitor"; return; }
                 ctx.faldDumpDir = dir;                                            // written before the flag ...
                 ctx.faldDumpRequested.store(true, std::memory_order_release);     // ... which publishes it

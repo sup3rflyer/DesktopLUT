@@ -638,8 +638,10 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Runs in HDR and in SDR under Windows ACM (isFP16SDR: the duplicated frame is FP16 scRGB, the
     // domain the shader decodes); a plain 8-bit SDR desktop never enables it. The panel file's
     // transfer must match the mode (FaldEnsureResources refuses otherwise).
-    bool faldOn = (ctx->isHDREnabled || ctx->isFP16SDR) && cc.fald.enabled && !g_dwmHookMode.load() &&
-                  FaldEnsureResources(ctx, cc.fald);
+    // The swapchain must be FP16 too (the intermediate is created at its format; a stale R10G10B10A2 swapchain
+    // would clamp scRGB at 1.0 — capture.cpp SwapchainModeChanged keeps them in step, this is the belt).
+    bool faldOn = (ctx->isHDREnabled || ctx->isFP16SDR) && ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                  cc.fald.enabled && !g_dwmHookMode.load() && FaldEnsureResources(ctx, cc.fald);
     ID3D11RenderTargetView* renderTarget = faldOn ? ctx->fald->interRTV : finalTarget;
 
     float clearColor[4] = { 0, 0, 0, 0 };
@@ -1088,7 +1090,8 @@ void RenderAll(FramePacer* fp) {
                     } else {
                         ctx.sdrColorCorrection = update.data;
                     }
-                    ctx.grayscaleICtCp = update.ictcpMode;
+                    if (update.isHDR) ctx.grayscaleICtCp = update.ictcpMode;   // HDR-only flag: an SDR push must not
+                                                                                  // knock an open HDR ICtCp preview out
                     if (update.clearMhcFlags) {
                         ctx.sdrMhcPrimariesActive = false;
                         ctx.sdrMhcGrayscaleActive = false;
@@ -1131,7 +1134,8 @@ void RenderAll(FramePacer* fp) {
             (cc2.whiteBalanceGains[0] != 1.0f || cc2.whiteBalanceGains[1] != 1.0f || cc2.whiteBalanceGains[2] != 1.0f);
         bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled && !g_dwmHookMode.load();
         bool hasFald = (ctx.isHDREnabled || ctx.isFP16SDR) && cc2.fald.enabled && !cc2.fald.paramsPath.empty() &&
-                       FaldShadersReady() && !g_dwmHookMode.load();   // never keep the overlay awake for a layer that cannot run
+                       FaldShadersReady() && !g_dwmHookMode.load() &&   // never keep the overlay awake for a layer that cannot run:
+                       !FaldLayerRefused(&ctx, cc2.fald);               // a panel file refused for this path/mode counts as "cannot"
         bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;
         bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only

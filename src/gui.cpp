@@ -265,15 +265,32 @@ static bool CurrentMonitorIsHDR() {
     return true;
 }
 
-// A panel file's transfer (PQ = HDR fit, gamma = SDR fit) must match the row it is set on; the render
-// side refuses a mismatch, so say so up front. Returns true when the file is a readable panel file
-// whose transfer does NOT match (the status line carries the message).
+// A panel file's transfer (PQ = HDR fit, gamma = SDR fit) must match the row it is set on (the pipe and
+// the render side refuse a mismatch too). Returns true when the file is a readable panel file whose
+// transfer does NOT match; the status line carries the message and the caller refuses the file.
 static bool WarnFaldTransferMismatch(const std::wstring& path, bool isHDR) {
     uint32_t transfer = 0;
     if (path.empty() || !FaldPanelFileTransfer(path, transfer) || FaldTransferMatchesMode(transfer, isHDR)) return false;
     SetStatus(isHDR ? L"FALD: this panel file is an SDR (gamma) fit - the HDR row needs a PQ fit profiled in HDR"
                     : L"FALD: this panel file is an HDR (PQ) fit - the SDR (ACM) row needs a gamma fit profiled in SDR");
     return true;
+}
+
+// View / pedestal changed: they are mirrored in both modes' settings, so push both, persist once.
+static void ApplyFaldSharedSettingChange() {
+    const bool anyEnabled = FaldSlot(true).enabled || FaldSlot(false).enabled;
+    if (g_gui.isRunning) {
+        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+        UpdateColorCorrectionLive(g_gui.currentMonitor, false);
+        if (g_dwmHookMode.load())
+            UpdateDwmHookSharedConfig();
+        else
+            DwmHookReevaluateOverlay();
+    } else if (anyEnabled) {
+        StartProcessing();
+    }
+    SaveSettings();
+    UpdateGUIState();
 }
 
 // FALD layer setting changed for the current monitor (one mode): push to the render thread and persist.
@@ -1166,9 +1183,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                     : L"FALD compensation (SDR) needs a panel parameter file profiled in SDR under ACM (…)");
                     return 0;
                 }
-                fald.enabled = enabled;
+                if (enabled && WarnFaldTransferMismatch(fald.paramsPath, isHDR)) {   // a stored path of the wrong mode
+                    SendMessage(box, BM_SETCHECK, BST_UNCHECKED, 0);
+                    return 0;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads it
+                    fald.enabled = enabled;
+                }
                 ApplyFaldSettingChange(enabled, isHDR);
-                if (enabled) WarnFaldTransferMismatch(fald.paramsPath, isHDR);
             }
             return 0;
 
@@ -1177,10 +1200,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
                     unsigned int mode = (sel >= 0 && sel <= 6) ? (unsigned int)sel : 0u;
-                    FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
-                    FaldSlot(false).debugMode = mode;
-                    ApplyFaldSettingChange(FaldSlot(true).enabled, true);
-                    ApplyFaldSettingChange(FaldSlot(false).enabled, false);
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads these
+                        FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
+                        FaldSlot(false).debugMode = mode;
+                    }
+                    ApplyFaldSharedSettingChange();
                 }
             }
             return 0;
@@ -1189,10 +1214,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == BN_CLICKED) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     bool on = (SendMessage(g_gui.hwndFaldPedMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    FaldSlot(true).pedMode = on ? 1u : 0u;
-                    FaldSlot(false).pedMode = on ? 1u : 0u;
-                    ApplyFaldSettingChange(FaldSlot(true).enabled, true);
-                    ApplyFaldSettingChange(FaldSlot(false).enabled, false);
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        FaldSlot(true).pedMode = on ? 1u : 0u;
+                        FaldSlot(false).pedMode = on ? 1u : 0u;
+                    }
+                    ApplyFaldSharedSettingChange();
                     const std::wstring& live = FaldSlot(CurrentMonitorIsHDR()).paramsPath;
                     if (on && !FaldPanelFileHasPedColour(live))
                         SetStatus(L"Per-channel pedestal: this panel file carries no leak colour - the toggle has no effect");
@@ -1206,16 +1233,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_BROWSE);
                 wchar_t path[1024] = {};
                 if (BrowseForFaldPanelFile(hwnd, path, 1024)) {
+                    if (WarnFaldTransferMismatch(path, isHDR)) return 0;   // refused: the row keeps its file
                     bool enabledNow;
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
                         auto& fald = FaldSlot(isHDR);
                         fald.paramsPath = path;
+                        fald.reloadSeq++;   // re-browsing the same (re-exported) file = reload, as runtime.set_fald_params
                         enabledNow = fald.enabled;
                     }
                     SetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path);
                     ApplyFaldSettingChange(enabledNow, isHDR);
-                    WarnFaldTransferMismatch(path, isHDR);
                 }
             }
             return 0;
@@ -1227,6 +1255,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_PATH);
                     wchar_t path[1024] = {};
                     GetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path, 1024);
+                    if (WarnFaldTransferMismatch(path, isHDR)) {   // refused: restore the row's file
+                        SetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, FaldSlot(isHDR).paramsPath.c_str());
+                        return 0;
+                    }
                     bool changed = false, enabledNow = false;
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
@@ -1234,7 +1266,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (fald.paramsPath != path) { fald.paramsPath = path; changed = true; }
                         enabledNow = fald.enabled;
                     }
-                    if (changed) { ApplyFaldSettingChange(enabledNow, isHDR); WarnFaldTransferMismatch(path, isHDR); }
+                    if (changed) ApplyFaldSettingChange(enabledNow, isHDR);
                 }
             }
             return 0;

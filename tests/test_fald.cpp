@@ -4,6 +4,7 @@
 // the GPU passes are checked against the Python reference by DLC's fald_compare_dump on a live dump.
 #include "doctest.h"
 #include "../src/fald.h"
+#include "../src/types.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -366,11 +367,78 @@ TEST_CASE("FALD loader: implausible FLD3 transfer words are refused, not default
         CHECK(err.find("sdr_gamma") != std::string::npos);
     }
     {
+        // FLD3 magic but the file ends before the 192-byte header: refused as short, not parsed from table bytes
         FaldTempFile tf(L"test_fald_fld3_short.bin");
-        Image im = Image::Valid(); im.header[0] = 0x464C4433u;      // FLD3 magic on a 32-word file
+        std::vector<char> b = Fld3Image(1u, 2.2f).Bytes();
+        b.resize(180);
+        WriteBytes(tf.path, b);
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("too short") != std::string::npos);
+    }
+    {
+        // full FLD3 header, one float missing from the tables
+        FaldTempFile tf(L"test_fald_fld3_size.bin");
+        Image im = Fld3Image(1u, 2.2f);
+        im.kTrue.pop_back();
         WriteBytes(tf.path, im.Bytes());
         CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("size mismatch") != std::string::npos);
     }
+}
+
+TEST_CASE("FALD loader: nothing of a previously loaded file survives the next load") {
+    // Build loads into long-lived resources (FaldResources::params): an SDR (FLD3, gamma, coloured pedestal)
+    // file followed by an HDR FLD1 file must come back as a plain PQ file with loader defaults.
+    FaldTempFile tf3(L"test_fald_reset_fld3.bin");
+    Image im3 = Fld3Image(1u, 2.4f);
+    im3.SetF(29, 1.0f); im3.SetF(30, 8.0f);
+    im3.SetF(32, 0.756f); im3.SetF(33, 1.057f); im3.SetF(34, 1.366f); im3.header[35] = 1u;
+    WriteBytes(tf3.path, im3.Bytes());
+    FaldTempFile tf1(L"test_fald_reset_fld1.bin");
+    WriteBytes(tf1.path, Image::Valid().Bytes());
+
+    FaldPanelParams p; std::string err;
+    REQUIRE(LoadFaldPanelParams(tf3.path, p, err));
+    REQUIRE(p.transfer == FALD_TRANSFER_GAMMA);
+    REQUIRE(p.hasPedColour);
+    REQUIRE(LoadFaldPanelParams(tf1.path, p, err));
+    CHECK(p.transfer == FALD_TRANSFER_PQ);
+    CHECK_FALSE(p.hasTransfer);
+    CHECK(p.sdrGamma == doctest::Approx(0.0f));
+    CHECK_FALSE(p.hasPedColour);
+    CHECK(p.pedRGB[2] == doctest::Approx(1.0f));
+    CHECK(p.lumFadeLo == doctest::Approx(0.5f)); CHECK(p.lumFadeHi == doctest::Approx(5.0f));
+    // a failed load leaves defaults too, not the old file
+    REQUIRE(LoadFaldPanelParams(tf3.path, p, err));
+    CHECK_FALSE(LoadFaldPanelParams(L"test_fald_reset_missing.bin", p, err));
+    CHECK(p.transfer == FALD_TRANSFER_PQ);
+    CHECK(p.curve.empty());
+}
+
+TEST_CASE("FALD refused-file state: keeps the overlay asleep only while nothing changed") {
+    MonitorContext ctx;
+    ctx.width = 3840; ctx.height = 2160; ctx.isHDREnabled = false;
+    FaldSettings s; s.enabled = true; s.paramsPath = L"C:\\panels\\hdr_fit.bin"; s.reloadSeq = 3;
+    CHECK_FALSE(FaldLayerRefused(&ctx, s));                  // no resources yet: let the render thread try
+    FaldResources* r = new FaldResources();
+    ctx.fald = r;
+    r->paramsPath = s.paramsPath; r->reloadSeq = 3; r->builtForHdr = false; r->width = 3840; r->height = 2160;
+    r->valid = false; r->lastError = "panel file transfer is PQ (HDR fit) but the monitor is in SDR (ACM)";
+    CHECK_FALSE(FaldLayerRefused(&ctx, s));                  // failed, but not on the file (e.g. a resource failure)
+    r->refusedByFile = true;
+    CHECK(FaldLayerRefused(&ctx, s));
+    FaldSettings s2 = s; s2.reloadSeq = 4;
+    CHECK_FALSE(FaldLayerRefused(&ctx, s2));                 // set_fald_params / GUI browse: retry
+    s2 = s; s2.paramsPath = L"C:\\panels\\sdr_fit.bin";
+    CHECK_FALSE(FaldLayerRefused(&ctx, s2));                 // another file: retry
+    ctx.isHDREnabled = true;
+    CHECK_FALSE(FaldLayerRefused(&ctx, s));                  // mode switch: the same file may now be right
+    ctx.isHDREnabled = false; ctx.width = 2560;
+    CHECK_FALSE(FaldLayerRefused(&ctx, s));                  // resize
+    ctx.width = 3840; r->valid = true;
+    CHECK_FALSE(FaldLayerRefused(&ctx, s));
+    ctx.fald = nullptr;
+    delete r;
 }
 
 TEST_CASE("FALD panel file transfer peek + mode match") {
@@ -387,6 +455,11 @@ TEST_CASE("FALD panel file transfer peek + mode match") {
     WriteBytes(tf3.path, Fld3Image(1u, 2.2f).Bytes());
     t = 99; CHECK(FaldPanelFileTransfer(tf3.path, t)); CHECK(t == FALD_TRANSFER_GAMMA);
     CHECK(FaldPanelFileHasPedColour(tf3.path) == false);            // FLD3 without a colour block
+    FaldTempFile tf3c(L"test_fald_peek_xfer3c.bin");
+    Image im3c = Fld3Image(1u, 2.2f);
+    im3c.SetF(32, 1.0f); im3c.SetF(33, 1.0f); im3c.SetF(34, 1.0f);
+    WriteBytes(tf3c.path, im3c.Bytes());
+    CHECK(FaldPanelFileHasPedColour(tf3c.path));                   // FLD3 with a colour block
     FaldTempFile tf4(L"test_fald_peek_xfer4.bin");
     Image im4 = Image::Valid(); im4.header[0] = 0x31444C46u;        // not a panel file
     WriteBytes(tf4.path, im4.Bytes());

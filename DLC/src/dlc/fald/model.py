@@ -202,7 +202,8 @@ class FaldParams:
         the LAST axis). THE reference for the HLSL ``PanelNits`` (src/fald_shader.h): "pq" = the panel receives
         the BT.2020 PQ code Windows composes, nits = max(rec2020, 0) x 80; "gamma" = the panel receives the sRGB
         code Windows encodes (code = sRGB_OETF(scRGB), values outside 0..1 clipped like the composition does) and
-        shows white x code^sdr_gamma — i.e. :meth:`code_to_nits` of that code."""
+        shows white x code^sdr_gamma — i.e. :meth:`code_to_nits` of that code. Valid under the output profile
+        the fit was profiled with (native: sRGB / identity); an active SDR MHC2 calibration changes the code."""
         lin = np.asarray(scrgb, dtype=np.float64)
         if self.transfer == "pq":
             return np.maximum(lin @ BT709_TO_BT2020.T, 0.0) * 80.0

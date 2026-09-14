@@ -55,6 +55,7 @@ struct FaldPanelParams {
     bool hasTransfer = false;                // FLD3 file (the loader saw words 40/41)
     std::vector<float> curve, kTrue, kEst;
 };
+// Resets `out` first: nothing of a previously loaded file (transfer, pedestal colour, optional words) survives.
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err);
 // Cheap header peek: does the file at `path` carry a pedestal colour (FLD2/FLD3)? false for FLD1, unreadable or missing.
 bool FaldPanelFileHasPedColour(const std::wstring& path);
@@ -76,6 +77,9 @@ struct FaldResources {
     unsigned int fileCheckCounter = 0;       // frames since the stamp was last polled
     int width = 0, height = 0;
     bool builtForHdr = false;                // monitor mode the resources were built for (transfer check)
+    bool refusedByFile = false;              // the last Build failed on the FILE (unreadable, bad header, transfer/mode
+                                             // mismatch, lattice does not fit): deterministic until the file, the path,
+                                             // the mode or reloadSeq changes — no periodic re-read, no awake overlay
     bool valid = false;
     std::string lastError;
     // full-resolution intermediate: the main shader renders here, the FALD pixel pass reads it
@@ -118,6 +122,10 @@ bool FaldShadersReady();
 // when the path changes, when runtime.set_fald_params re-sets it (settings.reloadSeq), or when the
 // file's size/mtime changes (polled every ~2 s) — a panel file re-exported in place is picked up.
 bool FaldEnsureResources(MonitorContext* ctx, const FaldSettings& settings);
+// True when the layer is configured but its panel file was refused for THIS path / reloadSeq / mode and the file
+// is unchanged since: the render loop must not keep the overlay awake for it (render thread only). A new
+// set_fald_params / GUI path (reloadSeq or path change), a mode switch or a resize retries.
+bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // Run the compute passes on ctx->fald->inter and draw the corrected frame into finalRT.
 // Handles a pending debug dump (ctx->faldDumpRequested): the fields + input frame before the pixel
 // pass, the OUTPUT frame (fald_out.*) after it.

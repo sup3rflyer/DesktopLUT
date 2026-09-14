@@ -314,7 +314,7 @@ DisplayColorModeResult ClassifyDisplayColorMode(bool dxgiHdrActive, bool dxgiFp1
                                                 bool legacyOk, bool legacyAdvancedColorEnabled) {
     DisplayColorModeResult r;
     if (dxgiHdrActive) { r.mode = DisplayColorMode::HDR; r.source = "dxgi"; return r; }   // the established HDR check
-    if (info2Ok) {
+    if (info2Ok && activeColorMode <= 2u) {   // a value a future Windows adds falls through to the legacy query
         r.source = "displayconfig2";
         r.mode = (activeColorMode == 2u) ? DisplayColorMode::HDR
                : (activeColorMode == 1u) ? DisplayColorMode::AcmSdr : DisplayColorMode::SDR;
@@ -339,7 +339,7 @@ DisplayColorModeResult QueryDisplayColorMode(const DisplayInfo& display, bool dx
     info2.header.id = display.targetId;
     bool info2Ok = (DisplayConfigGetDeviceInfo(&info2.header) == ERROR_SUCCESS);
     bool legacyOk = false, legacyEnabled = false;
-    if (!info2Ok) {
+    if (!info2Ok || info2.activeColorMode > 2u) {
         DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO ci = {};
         ci.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
         ci.header.size = sizeof(ci);

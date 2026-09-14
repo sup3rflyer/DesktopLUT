@@ -1,5 +1,6 @@
 #include "doctest.h"
 #include "displayconfig.h"
+#include "capture.h"
 #include "fixtures/edid_samples.h"
 #include <cmath>
 #include <string>
@@ -255,6 +256,23 @@ TEST_CASE("DisplayColorMode: 24H2 activeColorMode classifies SDR vs ACM (the DXG
     // DisplayConfig 2 reports HDR while the DXGI query missed it: trust DisplayConfig
     auto hdr = ClassifyDisplayColorMode(false, false, true, 2u, false, false);
     CHECK(hdr.mode == DisplayColorMode::HDR);
+}
+
+TEST_CASE("DisplayColorMode: an activeColorMode value this build does not know falls back to the legacy query") {
+    auto r = ClassifyDisplayColorMode(false, false, true, 7u, true, true);
+    CHECK(r.mode == DisplayColorMode::AcmSdr);
+    CHECK(std::string(r.source) == "displayconfig");
+    auto d = ClassifyDisplayColorMode(false, false, true, 7u, false, false);
+    CHECK(std::string(d.source) == "dxgi");
+}
+
+TEST_CASE("Swapchain rebuild follows SDR <-> ACM SDR as well as SDR <-> HDR") {
+    CHECK_FALSE(SwapchainModeChanged(false, false, false, false));   // plain SDR, unchanged
+    CHECK(SwapchainModeChanged(false, false, false, true));          // ACM switched on at runtime (the 2026-09-14 audit)
+    CHECK(SwapchainModeChanged(false, true, false, false));          // ACM switched off
+    CHECK(SwapchainModeChanged(false, true, true, false));           // ACM SDR -> HDR
+    CHECK(SwapchainModeChanged(true, false, false, false));          // HDR -> plain SDR
+    CHECK_FALSE(SwapchainModeChanged(true, false, true, false));      // HDR, unchanged
 }
 
 TEST_CASE("DisplayColorMode: pre-24H2 fallback = advancedColorEnabled && !HDR") {
