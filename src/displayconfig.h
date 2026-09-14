@@ -7,6 +7,7 @@
 #include <dxgi1_6.h>
 #include <string>
 #include <vector>
+#include "types.h"  // DisplayIdentity
 
 // Display info for MaxTML operations
 struct DisplayInfo {
@@ -65,3 +66,24 @@ MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex);
 // EDID parsing (exposed for testing)
 bool ParseEDIDChromaticity(const BYTE* edid, size_t edidSize, MonitorPrimaries& primaries);
 std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath);
+
+// Serial number from an EDID block: the ASCII serial descriptor (tag 0xFF) when present,
+// else the 32-bit ID serial (bytes 12-15) in decimal when non-zero. Returns false (out
+// empty) when the EDID carries no serial at all. Exposed for testing.
+bool ParseEDIDSerial(const BYTE* edid, size_t edidSize, std::wstring& outSerial);
+
+// \\?\DISPLAY#<hwid>#<instance>#{guid}  ->  DISPLAY\<hwid>\<instance>  (SetupAPI instance id).
+// Returns empty if the path does not have that shape. Exposed for testing.
+std::wstring DeviceInstanceIdFromPath(const std::wstring& devicePath);
+
+// Resolve the DisplayInfo of an HMONITOR by its GDI device name (\\.\DISPLAYn), which is
+// exact — unlike position matching, it cannot confuse two displays during a modeset.
+bool GetDisplayInfoForHMonitor(HMONITOR hMonitor, DisplayInfo& outInfo);
+
+// Read the raw EDID of the exact monitor device named by a device path (instance-id match,
+// so twin panels of the same model are never confused).
+bool ReadEDIDForDevicePath(const std::wstring& devicePath, std::vector<BYTE>& edidData);
+
+// Stable identity of the display an HMONITOR currently shows. False when the device path
+// could not be resolved (mid-transition); a partial identity is never returned.
+bool QueryDisplayIdentity(HMONITOR hMonitor, DisplayIdentity& outIdentity);

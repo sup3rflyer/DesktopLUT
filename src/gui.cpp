@@ -16,6 +16,7 @@
 #include "dwm_inject.h"
 #include "analysis.h"
 #include "desktoplut_ipc_server.h"
+#include "monitor_identity.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -943,6 +944,91 @@ static void SwapDwmHookRoutingForCurrentMonitor(HWND hwnd) {
 // ============================================================================
 
 static UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+
+// ============================================================================
+// SECTION: Identity-keyed settings re-attach on display changes
+// ============================================================================
+//
+// g_gui.monitorSettings holds one entry per LIVE monitor, in enumeration order, and
+// every consumer indexes it by monitor index. When the monitor set changes, the
+// entries are re-attached to the new enumeration by display identity (device path /
+// EDID), so a panel keeps its settings wherever Windows enumerates it and a different
+// panel on the same connector starts from defaults. Two cases defer the re-attach:
+//   - an MHC/grayscale editor dialog holds an MHCSettings& into the vector across its
+//     modal loop, so entries must not move until it closes (g_mhcEditDialogOpen);
+//   - a display's identity query can fail transiently mid-modeset; that display keeps
+//     the entry at its index and the query is retried a few times.
+
+static const UINT MONITOR_IDENTITY_RETRY_MS = 3000;
+static const int  MONITOR_IDENTITY_MAX_RETRIES = 5;
+static int g_monitorIdentityRetries = 0;
+
+static void ReattachMonitorSettings(HWND hwnd, const char* why) {
+    if (g_mhcEditDialogOpen.load()) {
+        // Keep index alignment with placeholders (never identified, so never persisted)
+        // and come back once the dialog has closed.
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            if (g_gui.monitors.size() > g_gui.monitorSettings.size()) {
+                g_gui.monitorSettings.resize(g_gui.monitors.size());
+            }
+        }
+        std::cout << "[Monitor identity] " << why << ": editor dialog open, re-attach deferred" << std::endl;
+        SetTimer(hwnd, MONITOR_IDENTITY_TIMER_ID, MONITOR_IDENTITY_RETRY_MS, nullptr);
+        return;
+    }
+
+    std::cout << "[Monitor identity] re-attaching settings (" << why << ")" << std::endl;
+    bool allIdentified = ResolveMonitorSettings(g_gui.monitors);
+
+    // A display that arrives with desktop gamma enabled turns the mode on, exactly as
+    // it would have at startup. Never turns it off: that is the hotkey's decision.
+    bool anyDG = false;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        for (const auto& ms : g_gui.monitorSettings) {
+            if (ms.hdrMHC.desktopGammaEnabled) { anyDG = true; break; }
+        }
+    }
+    if (anyDG && !g_userDesktopGammaMode.load()) {
+        g_userDesktopGammaMode.store(true);
+        if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(true);
+    }
+
+    // The entry under the current selection may now belong to another panel.
+    if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+        SetPathText(g_gui.hwndSdrPath, g_gui.monitorSettings[g_gui.currentMonitor].sdrPath.c_str());
+        SetPathText(g_gui.hwndHdrPath, g_gui.monitorSettings[g_gui.currentMonitor].hdrPath.c_str());
+        UpdateColorCorrectionControls();
+    }
+
+    // A legacy [Monitor<N>] section adopted just now (a display first seen by this
+    // build) is persisted as its identity section immediately, not on the next edit.
+    {
+        bool migrated = false;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            for (const auto& ms : g_gui.monitorSettings) {
+                if (ms.legacyIndex >= 0 && !ms.identity.empty()) { migrated = true; break; }
+            }
+        }
+        if (migrated) SaveSettings();
+    }
+
+    if (!allIdentified && g_monitorIdentityRetries < MONITOR_IDENTITY_MAX_RETRIES) {
+        g_monitorIdentityRetries++;
+        std::cout << "[Monitor identity] a display could not be identified yet, retry "
+                  << g_monitorIdentityRetries << "/" << MONITOR_IDENTITY_MAX_RETRIES << std::endl;
+        SetTimer(hwnd, MONITOR_IDENTITY_TIMER_ID, MONITOR_IDENTITY_RETRY_MS, nullptr);
+    } else {
+        if (!allIdentified) {
+            std::cout << "[Monitor identity] giving up on identifying a display; its settings "
+                         "stay attached by index and are not persisted" << std::endl;
+        }
+        g_monitorIdentityRetries = 0;
+        KillTimer(hwnd, MONITOR_IDENTITY_TIMER_ID);
+    }
+}
 
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // Re-add tray icon when explorer restarts or finishes initializing
@@ -2202,6 +2288,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             TickDwmHookBeacon(hwnd);
             return 0;
         }
+        if (wParam == MONITOR_IDENTITY_TIMER_ID) {
+            KillTimer(hwnd, MONITOR_IDENTITY_TIMER_ID);
+            ReattachMonitorSettings(hwnd, "deferred/retry");
+            return 0;
+        }
         if (wParam == DWM_HOOK_RESEND_TIMER_ID) {
             // Resend pump started by StartDwmHookConfigResends. Re-enumerate fresh
             // each tick: if the first snapshot raced the mode transition, later
@@ -2309,15 +2400,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                       << " -> " << newMonitors.size() << std::endl;
             g_gui.monitors = newMonitors;
 
-            // Grow monitorSettings if needed — never shrink, to preserve settings for
-            // monitors that may temporarily disappear (physical power-off, KVM switch).
-            // Render/whitelist threads bounds-check via monitor index.
-            {
-                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-                if (newMonitors.size() > g_gui.monitorSettings.size()) {
-                    g_gui.monitorSettings.resize(newMonitors.size());
-                }
-            }
+            // Re-attach settings to the new enumeration by display identity: a panel
+            // keeps its settings wherever it is enumerated, a departed panel is parked
+            // (never dropped), a new panel starts from defaults. Render/whitelist
+            // threads bounds-check via monitor index and reinit right after this.
+            g_monitorIdentityRetries = 0;
+            ReattachMonitorSettings(hwnd, "display change");
 
             // Update monitor names and combo box
             g_gui.monitorNames.clear();

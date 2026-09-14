@@ -3,6 +3,8 @@
 
 #include "settings.h"
 #include "globals.h"
+#include "monitor_identity.h"
+#include <algorithm>
 #include <cwchar>
 #include <cmath>
 #include <iostream>
@@ -583,6 +585,170 @@ static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key
     }
 }
 
+// ============================================================================
+// SECTION: Per-monitor sections (identity-keyed [Display<slot>] + legacy [Monitor<N>])
+// ============================================================================
+
+static std::vector<std::wstring> ListIniSections(const wchar_t* iniPath) {
+    // GetPrivateProfileSectionNamesW returns a double-NUL-terminated list; a
+    // return of size-2 means truncation, so grow until it fits.
+    std::vector<std::wstring> names;
+    std::vector<wchar_t> buf(4096);
+    for (;;) {
+        DWORD ret = GetPrivateProfileSectionNamesW(buf.data(), (DWORD)buf.size(), iniPath);
+        if (ret < buf.size() - 2) break;
+        if (buf.size() >= (1u << 20)) return names;  // 1MB safety cap — treat as unreadable
+        buf.resize(buf.size() * 2);
+    }
+    const wchar_t* p = buf.data();
+    while (*p) {
+        names.emplace_back(p);
+        p += names.back().size() + 1;
+    }
+    return names;
+}
+
+std::vector<int> EnumerateSavedSectionIndices(const wchar_t* prefix, const wchar_t* iniPath) {
+    std::vector<int> out;
+    const std::wstring pre(prefix);
+    for (const std::wstring& name : ListIniSections(iniPath)) {
+        // Exact form "<prefix><digits>" — no sign, no whitespace, no other suffix.
+        if (name.size() <= pre.size() || name.compare(0, pre.size(), pre) != 0) continue;
+        std::wstring digits = name.substr(pre.size());
+        bool allDigits = true;
+        for (wchar_t c : digits) if (c < L'0' || c > L'9') { allDigits = false; break; }
+        if (!allDigits || digits.size() > 6) continue;
+        int idx = (int)wcstoul(digits.c_str(), nullptr, 10);
+        if (idx >= (int)kMaxSavedMonitorSections) {
+            std::wcout << L"Settings: ignoring out-of-range INI section [" << name << L"]" << std::endl;
+            continue;
+        }
+        out.push_back(idx);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static std::wstring SectionName(const wchar_t* prefix, int n) {
+    return std::wstring(prefix) + std::to_wstring(n);
+}
+
+void LoadMonitorSettings(const wchar_t* section, MonitorSettings& ms, const wchar_t* iniPath) {
+    wchar_t sdrPath[MAX_PATH] = {};
+    wchar_t hdrPath[MAX_PATH] = {};
+
+    GetPrivateProfileStringW(section, L"LUT_SDR", L"", sdrPath, MAX_PATH, iniPath);
+    GetPrivateProfileStringW(section, L"LUT_HDR", L"", hdrPath, MAX_PATH, iniPath);
+
+    ms.sdrPath = sdrPath;
+    ms.hdrPath = hdrPath;
+
+    // Load color correction settings for both SDR and HDR
+    LoadColorCorrectionSettings(section, L"SDR_", ms.sdrColorCorrection, iniPath);
+    LoadColorCorrectionSettings(section, L"HDR_", ms.hdrColorCorrection, iniPath);
+
+    // Load MaxTML settings
+    ms.maxTml.enabled = GetPrivateProfileBool(section, L"MaxTmlEnabled", false, iniPath);
+    float rawPeak = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath);
+    ms.maxTml.peakNits = (std::min)(10000.0f, (std::max)(10.0f, rawPeak));
+
+    // Load MHC settings (with own primaries and grayscale)
+    LoadMHCSettings(section, L"SDR_", ms.sdrMHC, iniPath);
+    LoadMHCSettings(section, L"HDR_", ms.hdrMHC, iniPath);
+}
+
+void SaveMonitorSettings(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
+    WritePrivateProfileStringW(section, L"LUT_SDR", ms.sdrPath.c_str(), iniPath);
+    WritePrivateProfileStringW(section, L"LUT_HDR", ms.hdrPath.c_str(), iniPath);
+
+    // Save color correction settings for both SDR and HDR
+    SaveColorCorrectionSettings(section, L"SDR_", ms.sdrColorCorrection, iniPath);
+    SaveColorCorrectionSettings(section, L"HDR_", ms.hdrColorCorrection, iniPath);
+
+    // Save MaxTML settings
+    WritePrivateProfileBool(section, L"MaxTmlEnabled", ms.maxTml.enabled, iniPath);
+    WritePrivateProfileFloat(section, L"MaxTmlPeak", ms.maxTml.peakNits, iniPath);
+
+    // Save MHC settings (with own primaries and grayscale)
+    SaveMHCSettings(section, L"SDR_", ms.sdrMHC, iniPath);
+    SaveMHCSettings(section, L"HDR_", ms.hdrMHC, iniPath);
+}
+
+static void LoadIdentityKeys(const wchar_t* section, DisplayIdentity& id, const wchar_t* iniPath) {
+    id.devicePath   = ReadLongINIString(section, L"DevicePath", iniPath);
+    id.edidId       = ReadLongINIString(section, L"EdidId", iniPath);
+    id.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
+}
+
+static void SaveIdentityKeys(const wchar_t* section, const DisplayIdentity& id, const wchar_t* iniPath) {
+    WritePrivateProfileStringW(section, L"DevicePath", id.devicePath.c_str(), iniPath);
+    WritePrivateProfileStringW(section, L"EdidId", id.edidId.c_str(), iniPath);
+    WritePrivateProfileStringW(section, L"DisplayName", id.friendlyName.c_str(), iniPath);
+}
+
+void LoadMonitorSettingsPool(std::vector<MonitorSettings>& pool, const wchar_t* iniPath) {
+    pool.clear();
+
+    // Identity-keyed sections: one per display ever seen.
+    for (int slot : EnumerateSavedSectionIndices(kDisplaySectionPrefix, iniPath)) {
+        MonitorSettings ms;
+        std::wstring section = SectionName(kDisplaySectionPrefix, slot);
+        LoadMonitorSettings(section.c_str(), ms, iniPath);
+        LoadIdentityKeys(section.c_str(), ms.identity, iniPath);
+        ms.slot = slot;
+        if (ms.identity.empty()) {
+            // Hand-edited or truncated: nothing can ever match it, but never discard
+            // a user's settings silently — it is kept parked and re-saved as is.
+            std::wcout << L"Settings: [" << section << L"] has no display identity" << std::endl;
+        }
+        pool.push_back(std::move(ms));
+    }
+
+    // Pre-identity sections: adopted by enumeration index the first time a display
+    // shows up at that index, then retired by SaveSettings. Sections whose display is
+    // not connected right now stay untouched until it is.
+    for (int n : EnumerateSavedSectionIndices(kLegacySectionPrefix, iniPath)) {
+        MonitorSettings ms;
+        std::wstring section = SectionName(kLegacySectionPrefix, n);
+        LoadMonitorSettings(section.c_str(), ms, iniPath);
+        ms.legacyIndex = n;
+        pool.push_back(std::move(ms));
+    }
+}
+
+// Write every known display (live + parked). Returns the number of sections written.
+static int SaveMonitorSettingsPool(std::vector<MonitorSettings>& live,
+                                   std::vector<MonitorSettings>& parked,
+                                   const wchar_t* iniPath) {
+    int written = 0;
+    auto saveOne = [&](MonitorSettings& ms) {
+        if (ms.identity.empty() || ms.slot < 0) {
+            // Unclaimed legacy entry: its [Monitor<N>] section is still on disk, untouched.
+            // Anonymous live entry (identity query never succeeded): nothing to key it by.
+            if (ms.legacyIndex < 0) {
+                std::wcout << L"Settings: skipping an unidentified display's settings (not persisted)"
+                           << std::endl;
+            }
+            return;
+        }
+        std::wstring section = SectionName(kDisplaySectionPrefix, ms.slot);
+        SaveIdentityKeys(section.c_str(), ms.identity, iniPath);
+        SaveMonitorSettings(section.c_str(), ms, iniPath);
+        written++;
+        if (ms.legacyIndex >= 0) {
+            // Migrated: retire the pre-identity section so it can never be adopted twice.
+            std::wstring legacy = SectionName(kLegacySectionPrefix, ms.legacyIndex);
+            WritePrivateProfileStringW(legacy.c_str(), nullptr, nullptr, iniPath);
+            std::wcout << L"Settings: migrated [" << legacy << L"] -> [" << section << L"]" << std::endl;
+            ms.legacyIndex = -1;
+        }
+    };
+    for (auto& ms : live) saveOne(ms);
+    for (auto& ms : parked) saveOne(ms);
+    return written;
+}
+
 void SaveSettings() {
     std::wstring iniPath = GetIniPath();
 
@@ -622,26 +788,9 @@ void SaveSettings() {
     // Save startup settings
     WritePrivateProfileBool(L"General", L"StartMinimized", g_startMinimized.load(), iniPath.c_str());
 
-    // Save per-monitor settings
-    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        wchar_t section[32];
-        swprintf_s(section, L"Monitor%d", (int)i);
-
-        WritePrivateProfileStringW(section, L"LUT_SDR", g_gui.monitorSettings[i].sdrPath.c_str(), iniPath.c_str());
-        WritePrivateProfileStringW(section, L"LUT_HDR", g_gui.monitorSettings[i].hdrPath.c_str(), iniPath.c_str());
-
-        // Save color correction settings for both SDR and HDR
-        SaveColorCorrectionSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrColorCorrection, iniPath.c_str());
-        SaveColorCorrectionSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrColorCorrection, iniPath.c_str());
-
-        // Save MaxTML settings
-        WritePrivateProfileBool(section, L"MaxTmlEnabled", g_gui.monitorSettings[i].maxTml.enabled, iniPath.c_str());
-        WritePrivateProfileFloat(section, L"MaxTmlPeak", g_gui.monitorSettings[i].maxTml.peakNits, iniPath.c_str());
-
-        // Save MHC settings (with own primaries and grayscale)
-        SaveMHCSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrMHC, iniPath.c_str());
-        SaveMHCSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrMHC, iniPath.c_str());
-    }
+    // Save per-display settings: live displays and parked (currently disconnected) ones,
+    // each under its identity-keyed [Display<slot>] section.
+    SaveMonitorSettingsPool(g_gui.monitorSettings, g_gui.parkedSettings, iniPath.c_str());
 }
 
 void LoadSettings() {
@@ -686,35 +835,19 @@ void LoadSettings() {
     // Load startup settings
     g_startMinimized.store(GetPrivateProfileBool(L"General", L"StartMinimized", false, iniPath.c_str()));
 
-    // Load per-monitor settings
-    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        wchar_t section[32];
-        swprintf_s(section, L"Monitor%d", (int)i);
-
-        wchar_t sdrPath[MAX_PATH] = {};
-        wchar_t hdrPath[MAX_PATH] = {};
-
-        GetPrivateProfileStringW(section, L"LUT_SDR", L"", sdrPath, MAX_PATH, iniPath.c_str());
-        GetPrivateProfileStringW(section, L"LUT_HDR", L"", hdrPath, MAX_PATH, iniPath.c_str());
-
-        g_gui.monitorSettings[i].sdrPath = sdrPath;
-        g_gui.monitorSettings[i].hdrPath = hdrPath;
-
-        // Load color correction settings for both SDR and HDR
-        LoadColorCorrectionSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrColorCorrection, iniPath.c_str());
-        LoadColorCorrectionSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrColorCorrection, iniPath.c_str());
-
-        // Load MaxTML settings
-        g_gui.monitorSettings[i].maxTml.enabled = GetPrivateProfileBool(section, L"MaxTmlEnabled", false, iniPath.c_str());
-        float rawPeak = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath.c_str());
-        g_gui.monitorSettings[i].maxTml.peakNits = (std::min)(10000.0f, (std::max)(10.0f, rawPeak));
-
-        // Load MHC settings (with own primaries and grayscale)
-        LoadMHCSettings(section, L"SDR_", g_gui.monitorSettings[i].sdrMHC, iniPath.c_str());
-        LoadMHCSettings(section, L"HDR_", g_gui.monitorSettings[i].hdrMHC, iniPath.c_str());
+    // Per-display settings: read every saved display into the parked pool, then attach
+    // each live monitor's entry by identity. A display that is powered off right now
+    // simply stays parked — its settings (and its MHC profile files) are held until it
+    // returns, and they follow the panel if Windows enumerates it at another index.
+    std::vector<MonitorSettings> pool;
+    LoadMonitorSettingsPool(pool, iniPath.c_str());
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        g_gui.parkedSettings = std::move(pool);
     }
+    ResolveMonitorSettings(g_gui.monitors);
 
-    // Derive desktop gamma global from per-monitor MHC settings.
+    // Derive desktop gamma global from the live monitors' MHC settings.
     // DG is user intent — if desktopGammaEnabled is set, flag it active.
     // Processing init will auto-generate an identity MHC profile if needed.
     bool anyDG = false;
@@ -723,3 +856,4 @@ void LoadSettings() {
     g_userDesktopGammaMode.store(anyDG);
     g_desktopGammaMode.store(anyDG);
 }
+

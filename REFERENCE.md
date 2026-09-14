@@ -48,7 +48,16 @@ FramePacerLog=0        ; 1 = write per-frame CSV (framepacer.csv) for diagnostic
 
 StartMinimized=0       ; 1 = start minimized to system tray
 
-[Monitor0]
+; One section per physical display ever seen, keyed by identity — NOT by the order
+; Windows enumerates displays. Settings follow the panel if it is enumerated at
+; another index, a panel that is disconnected keeps its section, and a different
+; panel on the same connector starts from defaults. The slot number is just storage.
+; Pre-1.x [Monitor0], [Monitor1] ... sections are migrated on first load: adopted by
+; index the first time a display appears at that index, then deleted on the next save.
+[Display0]
+DevicePath=\\?\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}
+EdidId=AUS322A-S4LMSB007317  ; EDID manufacturer+product code, "-" serial (matches the same panel on another connector)
+DisplayName=PA32UCXR          ; informational only
 LUT_SDR=C:\path\to\sdr.cube   ; 3D LUT for SDR (applied by DWM hook in DwmHookMode)
 LUT_HDR=C:\path\to\hdr.cube   ; 3D LUT for HDR
 

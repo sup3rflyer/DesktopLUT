@@ -281,3 +281,102 @@ TEST_CASE("PreviewModeGate: fresh query unavailable — fall back to cached mode
         CHECK(EvaluatePreviewModeGate(false, true, false, junk) == PreviewModeGate::Mismatch);
     }
 }
+
+// ============================================================================
+// Display identity: EDID serial + device path parsing
+// ============================================================================
+
+namespace {
+// A valid-header EDID with an optional ID serial (bytes 12-15) and an optional
+// ASCII serial descriptor (tag 0xFF) in the first descriptor block at byte 54.
+struct EdidBuilder {
+    uint8_t bytes[128] = {};
+    EdidBuilder() {
+        const uint8_t hdr[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+        memcpy(bytes, hdr, 8);
+    }
+    EdidBuilder& idSerial(uint32_t s) {
+        bytes[12] = (uint8_t)(s & 0xFF);
+        bytes[13] = (uint8_t)((s >> 8) & 0xFF);
+        bytes[14] = (uint8_t)((s >> 16) & 0xFF);
+        bytes[15] = (uint8_t)((s >> 24) & 0xFF);
+        return *this;
+    }
+    EdidBuilder& asciiSerial(const char* s, int block = 0) {
+        uint8_t* d = bytes + 54 + 18 * block;
+        d[0] = d[1] = d[2] = 0; d[3] = 0xFF; d[4] = 0;
+        int k = 5;
+        for (; k < 18 && *s; k++, s++) d[k] = (uint8_t)*s;
+        if (k < 18) d[k++] = 0x0A;
+        for (; k < 18; k++) d[k] = 0x20;
+        return *this;
+    }
+};
+}  // namespace
+
+TEST_CASE("EDID serial: ASCII serial descriptor wins over the ID serial") {
+    EdidBuilder e; e.idSerial(16843009).asciiSerial("S4LMSB007317");
+    std::wstring s;
+    REQUIRE(ParseEDIDSerial(e.bytes, 128, s));
+    CHECK(s == L"S4LMSB007317");
+}
+
+TEST_CASE("EDID serial: descriptor may sit in any of the four blocks") {
+    EdidBuilder e; e.asciiSerial("ET99K01234", 2);
+    std::wstring s;
+    REQUIRE(ParseEDIDSerial(e.bytes, 128, s));
+    CHECK(s == L"ET99K01234");
+}
+
+TEST_CASE("EDID serial: 13-char serial with no terminator, padding trimmed") {
+    EdidBuilder e; e.asciiSerial("ABCDEFGHIJKLM");   // fills all 13 payload bytes
+    std::wstring s;
+    REQUIRE(ParseEDIDSerial(e.bytes, 128, s));
+    CHECK(s == L"ABCDEFGHIJKLM");
+
+    EdidBuilder p; p.asciiSerial("AB  ");
+    REQUIRE(ParseEDIDSerial(p.bytes, 128, s));
+    CHECK(s == L"AB");
+}
+
+TEST_CASE("EDID serial: falls back to the numeric ID serial") {
+    EdidBuilder e; e.idSerial(16843009);   // 0x01010101 — LG's well-known placeholder
+    std::wstring s;
+    REQUIRE(ParseEDIDSerial(e.bytes, 128, s));
+    CHECK(s == L"16843009");
+}
+
+TEST_CASE("EDID serial: none present, bad header, too short") {
+    EdidBuilder e;
+    std::wstring s = L"stale";
+    CHECK_FALSE(ParseEDIDSerial(e.bytes, 128, s));
+    CHECK(s.empty());
+
+    EdidBuilder bad; bad.idSerial(7); bad.bytes[1] = 0x00;
+    CHECK_FALSE(ParseEDIDSerial(bad.bytes, 128, s));
+
+    EdidBuilder shortE; shortE.idSerial(7);
+    CHECK_FALSE(ParseEDIDSerial(shortE.bytes, 100, s));
+    CHECK_FALSE(ParseEDIDSerial(nullptr, 128, s));
+}
+
+TEST_CASE("EDID serial: control and non-ASCII bytes are never emitted") {
+    EdidBuilder e; e.asciiSerial("AB");
+    e.bytes[54 + 5 + 2] = 0x01;   // control byte inside the payload, before the terminator
+    e.bytes[54 + 5 + 3] = 0xC3;   // high byte
+    e.bytes[54 + 5 + 4] = 'C';
+    e.bytes[54 + 5 + 5] = 0x0A;
+    std::wstring s;
+    REQUIRE(ParseEDIDSerial(e.bytes, 128, s));
+    CHECK(s == L"ABC");
+}
+
+TEST_CASE("Device instance id from a monitor device path") {
+    CHECK(DeviceInstanceIdFromPath(L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}")
+          == L"DISPLAY\\GSM84CD\\5&14ca04b&2&UID4352");
+    CHECK(DeviceInstanceIdFromPath(L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353") == L"DISPLAY\\AUS322A\\5&14ca04b&2&UID4353");
+    CHECK(DeviceInstanceIdFromPath(L"\\\\?\\DISPLAY#AUS322A#").empty());
+    CHECK(DeviceInstanceIdFromPath(L"\\\\?\\DISPLAY##abc#{g}").empty());
+    CHECK(DeviceInstanceIdFromPath(L"\\\\?\\PCI#VEN_10DE").empty());
+    CHECK(DeviceInstanceIdFromPath(L"").empty());
+}

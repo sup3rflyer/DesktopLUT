@@ -964,11 +964,22 @@ void CreateGUILayout(HWND hwnd) {
         }
         SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)name);
         g_gui.monitorNames.push_back(name);
-        g_gui.monitorSettings.push_back({});  // Empty settings for each monitor
     }
 
-    // Load saved settings from INI
+    // Load saved settings from INI. Per-monitor settings are keyed by display identity:
+    // LoadSettings reads every saved display and attaches each live monitor's entry
+    // (g_gui.monitorSettings, one per g_gui.monitors) by device path / EDID.
     LoadSettings();
+
+    // First run on an INI written in the old index-keyed format: persist the migration
+    // right away so the identity sections exist on disk before anything else happens.
+    {
+        bool migrated = false;
+        for (const auto& ms : g_gui.monitorSettings) {
+            if (ms.legacyIndex >= 0 && !ms.identity.empty()) { migrated = true; break; }
+        }
+        if (migrated) SaveSettings();
+    }
 
     // Update checkboxes from loaded settings
     SendMessage(g_gui.hwndTetrahedralCheck, BM_SETCHECK,

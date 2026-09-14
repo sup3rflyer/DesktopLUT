@@ -543,9 +543,31 @@ std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath) {
     return devicePath.substr(startPos, endPos - startPos);
 }
 
-// Read EDID from registry via SetupAPI for a specific monitor
-static bool ReadEDIDFromRegistry(const wchar_t* targetHardwareId, std::vector<BYTE>& edidData) {
-    // Get device info set for monitors
+static std::wstring ToLowerW(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(), ::towlower);
+    return s;
+}
+
+std::wstring DeviceInstanceIdFromPath(const std::wstring& devicePath) {
+    // \\?\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{e6f07b5f-...}  ->  DISPLAY\GSM84CD\5&14ca04b&2&UID4352
+    size_t displayPos = devicePath.find(L"DISPLAY#");
+    if (displayPos == std::wstring::npos) return L"";
+    size_t hwStart = displayPos + 8;
+    size_t hwEnd = devicePath.find(L'#', hwStart);
+    if (hwEnd == std::wstring::npos || hwEnd == hwStart) return L"";
+    size_t instStart = hwEnd + 1;
+    size_t instEnd = devicePath.find(L'#', instStart);
+    if (instEnd == std::wstring::npos) instEnd = devicePath.size();
+    if (instEnd == instStart) return L"";
+    return L"DISPLAY\\" + devicePath.substr(hwStart, hwEnd - hwStart)
+         + L"\\" + devicePath.substr(instStart, instEnd - instStart);
+}
+
+// Read the EDID (registry, via SetupAPI) of the first present monitor device whose
+// instance id satisfies `matches`. Instance ID format: DISPLAY\<HardwareID>\<UID>,
+// e.g. DISPLAY\DELA1EE\5&2a3b4c5d&0&UID12345.
+template <typename Pred>
+static bool ReadEDIDMatching(Pred matches, std::vector<BYTE>& edidData) {
     HDEVINFO devInfo = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_MONITOR, nullptr, nullptr,
                                              DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (devInfo == INVALID_HANDLE_VALUE) {
@@ -557,35 +579,12 @@ static bool ReadEDIDFromRegistry(const wchar_t* targetHardwareId, std::vector<BY
     SP_DEVINFO_DATA devInfoData = {};
     devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
 
-    // Enumerate all monitor devices
     for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &devInfoData); i++) {
-        // Get device instance ID
         wchar_t instanceId[256] = {};
         if (!SetupDiGetDeviceInstanceIdW(devInfo, &devInfoData, instanceId, 256, nullptr)) {
             continue;
         }
-
-        // Instance ID format: DISPLAY\<HardwareID>\<UID>
-        // Example: DISPLAY\DELA1EE\5&2a3b4c5d&0&UID12345
-        std::wstring instIdStr(instanceId);
-
-        // Extract hardware ID from instance ID
-        size_t firstSlash = instIdStr.find(L'\\');
-        if (firstSlash == std::wstring::npos) continue;
-        size_t secondSlash = instIdStr.find(L'\\', firstSlash + 1);
-        if (secondSlash == std::wstring::npos) secondSlash = instIdStr.length();
-
-        std::wstring hwId = instIdStr.substr(firstSlash + 1, secondSlash - firstSlash - 1);
-
-        // Compare with target (case-insensitive)
-        std::wstring targetLower(targetHardwareId);
-        std::wstring hwIdLower = hwId;
-        std::transform(targetLower.begin(), targetLower.end(), targetLower.begin(), ::towlower);
-        std::transform(hwIdLower.begin(), hwIdLower.end(), hwIdLower.begin(), ::towlower);
-
-        if (hwIdLower != targetLower) {
-            continue;
-        }
+        if (!matches(std::wstring(instanceId))) continue;
 
         // Found matching device - open registry key for EDID
         HKEY hKey = SetupDiOpenDevRegKey(devInfo, &devInfoData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
@@ -617,6 +616,27 @@ static bool ReadEDIDFromRegistry(const wchar_t* targetHardwareId, std::vector<BY
     return found;
 }
 
+// EDID of the first present monitor with this hardware id (EDID manufacturer + product
+// code). Ambiguous for twin panels — prefer ReadEDIDForDevicePath when a path is known.
+static bool ReadEDIDFromRegistry(const wchar_t* targetHardwareId, std::vector<BYTE>& edidData) {
+    std::wstring targetLower = ToLowerW(targetHardwareId);
+    return ReadEDIDMatching([&](const std::wstring& instanceId) {
+        size_t firstSlash = instanceId.find(L'\\');
+        if (firstSlash == std::wstring::npos) return false;
+        size_t secondSlash = instanceId.find(L'\\', firstSlash + 1);
+        if (secondSlash == std::wstring::npos) secondSlash = instanceId.length();
+        return ToLowerW(instanceId.substr(firstSlash + 1, secondSlash - firstSlash - 1)) == targetLower;
+    }, edidData);
+}
+
+bool ReadEDIDForDevicePath(const std::wstring& devicePath, std::vector<BYTE>& edidData) {
+    std::wstring wanted = ToLowerW(DeviceInstanceIdFromPath(devicePath));
+    if (wanted.empty()) return false;
+    return ReadEDIDMatching([&](const std::wstring& instanceId) {
+        return ToLowerW(instanceId) == wanted;
+    }, edidData);
+}
+
 MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex) {
     MonitorPrimaries result = {};
 
@@ -634,13 +654,15 @@ MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex) {
         return result;
     }
 
-    std::wcout << L"Looking for EDID with hardware ID: " << hardwareId << std::endl;
-
-    // Read EDID from registry
+    // Read EDID from registry: the exact device instance first (twin panels of one model
+    // have distinct instance ids), the hardware id as a fallback.
     std::vector<BYTE> edidData;
-    if (!ReadEDIDFromRegistry(hardwareId.c_str(), edidData)) {
-        std::cerr << "Could not read EDID from registry" << std::endl;
-        return result;
+    if (!ReadEDIDForDevicePath(displayInfo.devicePath, edidData)) {
+        std::wcout << L"Looking for EDID with hardware ID: " << hardwareId << std::endl;
+        if (!ReadEDIDFromRegistry(hardwareId.c_str(), edidData)) {
+            std::cerr << "Could not read EDID from registry" << std::endl;
+            return result;
+        }
     }
 
     std::cout << "Found EDID data: " << edidData.size() << " bytes" << std::endl;
@@ -660,4 +682,121 @@ MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex) {
     std::cout << "  W(" << result.Wx << ", " << result.Wy << ")" << std::endl;
 
     return result;
+}
+
+// ============================================================================
+// Display identity (settings keyed by physical display, not enumeration index)
+// ============================================================================
+
+bool ParseEDIDSerial(const BYTE* edid, size_t edidSize, std::wstring& outSerial) {
+    outSerial.clear();
+    if (!edid || edidSize < 128) return false;
+    static const BYTE kHeader[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    if (memcmp(edid, kHeader, 8) != 0) return false;
+
+    // Monitor descriptor blocks: 4 x 18 bytes at 54, 72, 90, 108. A descriptor whose
+    // first three bytes are zero is a monitor descriptor; byte 3 is its tag, 0xFF = serial.
+    // The 13 payload bytes (5..17) are ASCII, terminated by 0x0A and padded with spaces.
+    for (size_t off = 54; off + 18 <= 126; off += 18) {
+        const BYTE* d = edid + off;
+        if (d[0] != 0 || d[1] != 0 || d[2] != 0 || d[3] != 0xFF) continue;
+        std::wstring s;
+        for (int k = 5; k < 18; k++) {
+            if (d[k] == 0x0A || d[k] == 0x00) break;
+            if (d[k] < 0x20 || d[k] > 0x7E) continue;  // never emit control/non-ASCII bytes
+            s.push_back((wchar_t)d[k]);
+        }
+        while (!s.empty() && s.back() == L' ') s.pop_back();
+        size_t lead = s.find_first_not_of(L' ');
+        if (lead != std::wstring::npos && lead > 0) s.erase(0, lead);
+        if (!s.empty()) { outSerial = s; return true; }
+    }
+
+    // ID serial number, bytes 12-15 little-endian. Zero means "not provided".
+    uint32_t idSerial = (uint32_t)edid[12] | ((uint32_t)edid[13] << 8)
+                      | ((uint32_t)edid[14] << 16) | ((uint32_t)edid[15] << 24);
+    if (idSerial != 0) {
+        outSerial = std::to_wstring(idSerial);
+        return true;
+    }
+    return false;
+}
+
+bool GetDisplayInfoForHMonitor(HMONITOR hMonitor, DisplayInfo& outInfo) {
+    if (!hMonitor) return false;
+    MONITORINFOEXW mi;
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMonitor, &mi)) return false;
+    std::wstring gdiName = ToLowerW(mi.szDevice);   // \\.\DISPLAYn
+    if (gdiName.empty()) return false;
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActivePaths(paths, modes)) return false;
+
+    for (const auto& path : paths) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sourceName = {};
+        sourceName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sourceName.header.size = sizeof(sourceName);
+        sourceName.header.adapterId = path.sourceInfo.adapterId;
+        sourceName.header.id = path.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sourceName.header) != ERROR_SUCCESS) continue;
+        if (ToLowerW(sourceName.viewGdiDeviceName) != gdiName) continue;
+
+        DISPLAYCONFIG_TARGET_DEVICE_NAME targetName = {};
+        targetName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        targetName.header.size = sizeof(targetName);
+        targetName.header.adapterId = path.targetInfo.adapterId;
+        targetName.header.id = path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&targetName.header) != ERROR_SUCCESS) return false;
+
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO colorInfo = {};
+        colorInfo.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        colorInfo.header.size = sizeof(colorInfo);
+        colorInfo.header.adapterId = path.targetInfo.adapterId;
+        colorInfo.header.id = path.targetInfo.id;
+        bool isHdrCapable = false;
+        if (DisplayConfigGetDeviceInfo(&colorInfo.header) == ERROR_SUCCESS) {
+            isHdrCapable = (colorInfo.value & 0x1) != 0;
+        }
+
+        outInfo = DisplayInfo{};
+        outInfo.name = targetName.monitorFriendlyDeviceName;
+        outInfo.devicePath = targetName.monitorDevicePath;
+        outInfo.adapterId = path.targetInfo.adapterId;
+        outInfo.targetId = path.targetInfo.id;
+        outInfo.sourceId = path.sourceInfo.id;
+        outInfo.isHdrCapable = isHdrCapable;
+        return !outInfo.devicePath.empty();
+    }
+    return false;
+}
+
+bool QueryDisplayIdentity(HMONITOR hMonitor, DisplayIdentity& outIdentity) {
+    outIdentity = DisplayIdentity{};
+
+    DisplayInfo info;
+    if (!GetDisplayInfoForHMonitor(hMonitor, info)) {
+        // The GDI-name match is exact but needs the source-name query to succeed for
+        // this path; during a modeset it can transiently fail. Position matching is
+        // the same correlation GetDisplayInfoForMonitor relies on for ICC association.
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfo(hMonitor, &mi)) return false;
+        POINT pt = { mi.rcMonitor.left, mi.rcMonitor.top };
+        if (!GetDisplayInfoAtPoint(pt, info) || info.devicePath.empty()) return false;
+    }
+
+    outIdentity.devicePath = info.devicePath;
+    outIdentity.friendlyName = info.name;
+
+    std::wstring hardwareId = ExtractHardwareIdFromPath(info.devicePath);
+    std::vector<BYTE> edid;
+    std::wstring serial;
+    if (!hardwareId.empty() && ReadEDIDForDevicePath(info.devicePath, edid)) {
+        ParseEDIDSerial(edid.data(), edid.size(), serial);
+    }
+    if (!hardwareId.empty()) {
+        outIdentity.edidId = serial.empty() ? hardwareId : hardwareId + L"-" + serial;
+    }
+    return true;
 }

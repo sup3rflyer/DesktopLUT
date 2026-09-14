@@ -246,6 +246,7 @@ const int DWM_HOOK_RESEND_TIMER_ID = 110;       // Drives shared-config resends 
 const int DWM_HOOK_RESEND_INTERVAL_MS = 2000;   // Resend spacing — hook needs 3 consecutive updates to
                                                 // accept an HDR flip; each resend re-enumerates DXGI fresh
 const int DWM_HOOK_BEACON_TIMER_ID = 111;       // Identity-beacon session: repaints the beacon squares
+const int MONITOR_IDENTITY_TIMER_ID = 112;      // Deferred/retried settings re-attach after a display change
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
 const int MHC_VERIFY_TIMER_ID = 106;            // Periodic re-assertion of MHC ICC profile associations
@@ -828,6 +829,16 @@ struct MHCSettings {
 };
 
 // Per-monitor settings for persistence
+// Stable identity of a physical display, independent of Windows' enumeration order.
+// Matching precedence (see MatchMonitorSettings): devicePath (exact panel on the exact
+// connector) first, then edidId (the same panel moved to another connector).
+struct DisplayIdentity {
+    std::wstring devicePath;    // \\?\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid} (QueryDisplayConfig target)
+    std::wstring edidId;        // EDID hardware id + serial, e.g. "GSM84CD-16843009"; hardware id alone if no serial
+    std::wstring friendlyName;  // e.g. "LG TV SSCR2" — informational only, never used for matching
+    bool empty() const { return devicePath.empty() && edidId.empty(); }
+};
+
 struct MonitorSettings {
     std::wstring sdrPath;
     std::wstring hdrPath;
@@ -836,6 +847,13 @@ struct MonitorSettings {
     MaxTmlSettings maxTml;                       // Display Peak Override settings
     MHCSettings sdrMHC;                          // MHC profile for SDR mode
     MHCSettings hdrMHC;                          // MHC profile for HDR mode
+
+    // Identity-keyed persistence. Settings are stored as [Display<slot>] INI sections
+    // and re-attached to the live enumeration by identity on every display change.
+    DisplayIdentity identity;
+    int slot = -1;          // Persistent storage slot ([Display<slot>]); -1 = not yet assigned
+    int legacyIndex = -1;   // Loaded from a pre-identity [Monitor<N>] section; claimed (and the
+                            // old section deleted) once a display identity is stamped on it
 };
 
 // GUI state
@@ -853,7 +871,8 @@ struct GUIState {
     std::thread processingThread;
     std::vector<HMONITOR> monitors;
     std::vector<std::wstring> monitorNames;
-    std::vector<MonitorSettings> monitorSettings;  // Per-monitor LUT paths (editable)
+    std::vector<MonitorSettings> monitorSettings;  // Settings of the LIVE displays, in enumeration order (editable)
+    std::vector<MonitorSettings> parkedSettings;   // Known displays not currently connected (kept for re-attach + save)
     std::vector<MonitorSettings> activeSettings;   // Settings currently running (for comparison)
     int currentMonitor = 0;  // Currently selected monitor in list
 

@@ -1,5 +1,7 @@
 #include "doctest.h"
 #include "settings.h"
+#include "globals.h"
+#include "monitor_identity.h"
 #include <cstdio>
 #include <cmath>
 #include <string>
@@ -525,3 +527,280 @@ TEST_CASE("CC settings: grayscale deviations not persisted (moved to MHC)") {
     CHECK(loaded.grayscale.enabled == false);
     CHECK(loaded.grayscale.rgbDeviations[0].empty());
 }
+
+// ============================================================================
+// Per-display sections: identity-keyed [Display<slot>] + legacy [Monitor<N>]
+// ============================================================================
+
+TEST_CASE("Sections: none saved yields an empty index list") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"General", L"StartMinimized", L"true", ini.c_str());
+    CHECK(EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini.c_str()).empty());
+    CHECK(EnumerateSavedSectionIndices(kLegacySectionPrefix, ini.c_str()).empty());
+}
+
+TEST_CASE("Sections: indices come back sorted, unique, per prefix") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"General", L"StartMinimized", L"true", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor1", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Display3", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Display0", L"LUT_SDR", L"", ini.c_str());
+
+    auto legacy = EnumerateSavedSectionIndices(kLegacySectionPrefix, ini.c_str());
+    REQUIRE(legacy.size() == 2);
+    CHECK(legacy[0] == 0);
+    CHECK(legacy[1] == 1);
+
+    auto display = EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini.c_str());
+    REQUIRE(display.size() == 2);
+    CHECK(display[0] == 0);
+    CHECK(display[1] == 3);
+}
+
+TEST_CASE("Sections: only exact <prefix><digits> names count") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Monitors", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"MonitorX", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor 7", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor-1", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor2b", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"monitor5", L"LUT_SDR", L"", ini.c_str());  // case-sensitive
+    WritePrivateProfileStringW(L"Display1", L"LUT_SDR", L"", ini.c_str());  // other prefix
+    auto legacy = EnumerateSavedSectionIndices(kLegacySectionPrefix, ini.c_str());
+    REQUIRE(legacy.size() == 1);
+    CHECK(legacy[0] == 0);
+}
+
+TEST_CASE("Sections: out-of-range index is ignored, not clamped") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display1", L"LUT_SDR", L"", ini.c_str());
+    WritePrivateProfileStringW(L"Display99999", L"LUT_SDR", L"", ini.c_str());
+    auto display = EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini.c_str());
+    REQUIRE(display.size() == 1);
+    CHECK(display[0] == 1);
+}
+
+TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") {
+    TempIni ini;
+    MonitorSettings original;
+    original.hdrPath = L"C:\\luts\\mon1_hdr.cube";
+    original.maxTml.enabled = true;
+    original.maxTml.peakNits = 800.0f;
+    original.hdrMHC.enabled = true;
+    original.hdrMHC.profilePath = L"C:\\WINDOWS\\system32\\spool\\drivers\\color\\DesktopLUT_Mon1_HDR_1.icm";
+    original.hdrMHC.desktopGammaEnabled = true;
+    original.hdrMHC.whiteBalanceEnabled = true;
+    original.hdrMHC.whiteBalanceWx = 0.3100f;
+    original.hdrMHC.whiteBalanceWy = 0.3200f;
+    original.hdrMHC.activePerm = MHCSettings::PERM_WB | MHCSettings::PERM_DG;
+    original.hdrMHC.permPaths[original.hdrMHC.activePerm] = original.hdrMHC.profilePath;
+    original.hdrMHC.baseGrayscale.pointCount = 20;
+    original.hdrMHC.baseGrayscale.initLinear();
+    original.sdrMHC.baseGrayscale.pointCount = 20;
+    original.sdrMHC.baseGrayscale.initLinear();
+
+    SaveMonitorSettings(L"Display7", original, ini.c_str());
+
+    MonitorSettings ms;
+    LoadMonitorSettings(L"Display7", ms, ini.c_str());
+    CHECK(ms.sdrPath.empty());
+    CHECK(ms.hdrPath == L"C:\\luts\\mon1_hdr.cube");
+    CHECK(ms.maxTml.enabled == true);
+    CHECK(ms.maxTml.peakNits == doctest::Approx(800.0f).epsilon(0.001));
+    CHECK(ms.hdrMHC.enabled == true);
+    CHECK(ms.hdrMHC.profileName == L"DesktopLUT_Mon1_HDR_1.icm");
+    CHECK(ms.hdrMHC.desktopGammaEnabled == true);
+    CHECK(ms.hdrMHC.whiteBalanceEnabled == true);
+    CHECK(ms.hdrMHC.whiteBalanceWx == doctest::Approx(0.3100f).epsilon(0.001));
+    CHECK(ms.hdrMHC.whiteBalanceWy == doctest::Approx(0.3200f).epsilon(0.001));
+    CHECK(ms.hdrMHC.activePerm == (MHCSettings::PERM_WB | MHCSettings::PERM_DG));
+    CHECK(ms.hdrMHC.permNames[ms.hdrMHC.activePerm] == L"DesktopLUT_Mon1_HDR_1.icm");
+    CHECK(ms.sdrMHC.enabled == false);
+    // Bookkeeping is not part of the per-monitor keys.
+    CHECK(ms.slot == -1);
+    CHECK(ms.legacyIndex == -1);
+    CHECK(ms.identity.empty());
+
+    // A section that does not exist is a clean default, not a partial copy of a neighbor.
+    MonitorSettings none;
+    LoadMonitorSettings(L"Display8", none, ini.c_str());
+    CHECK(none.hdrPath.empty());
+    CHECK(none.hdrMHC.enabled == false);
+    CHECK(none.hdrMHC.desktopGammaEnabled == false);
+}
+
+TEST_CASE("Pool: loads identity-keyed displays and unclaimed legacy sections") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display3", L"DevicePath", L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}", ini.c_str());
+    WritePrivateProfileStringW(L"Display3", L"EdidId", L"GSM84CD-16843009", ini.c_str());
+    WritePrivateProfileStringW(L"Display3", L"DisplayName", L"LG TV SSCR2", ini.c_str());
+    WritePrivateProfileStringW(L"Display3", L"LUT_SDR", L"C:\\luts\\lg.cube", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\mon0.cube", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor1", L"LUT_SDR", L"C:\\luts\\mon1.cube", ini.c_str());
+
+    std::vector<MonitorSettings> pool;
+    LoadMonitorSettingsPool(pool, ini.c_str());
+    REQUIRE(pool.size() == 3);
+
+    CHECK(pool[0].slot == 3);
+    CHECK(pool[0].legacyIndex == -1);
+    CHECK(pool[0].identity.devicePath == L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}");
+    CHECK(pool[0].identity.edidId == L"GSM84CD-16843009");
+    CHECK(pool[0].identity.friendlyName == L"LG TV SSCR2");
+    CHECK(pool[0].sdrPath == L"C:\\luts\\lg.cube");
+
+    CHECK(pool[1].slot == -1);
+    CHECK(pool[1].legacyIndex == 0);
+    CHECK(pool[1].identity.empty());
+    CHECK(pool[1].sdrPath == L"C:\\luts\\mon0.cube");
+
+    CHECK(pool[2].legacyIndex == 1);
+    CHECK(pool[2].sdrPath == L"C:\\luts\\mon1.cube");
+}
+
+TEST_CASE("Pool: a [Display] section without identity is kept, not discarded") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display0", L"LUT_SDR", L"C:\\luts\\x.cube", ini.c_str());
+    std::vector<MonitorSettings> pool;
+    LoadMonitorSettingsPool(pool, ini.c_str());
+    REQUIRE(pool.size() == 1);
+    CHECK(pool[0].slot == 0);
+    CHECK(pool[0].identity.empty());
+    CHECK(pool[0].sdrPath == L"C:\\luts\\x.cube");
+}
+
+// Integration through the real INI path (next to the test executable). Only runs
+// when no real INI is there, so a developer's config is never clobbered.
+namespace {
+struct AppIniGuard {
+    std::wstring path = GetIniPath();
+    bool usable = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+    ~AppIniGuard() { if (usable) _wremove(path.c_str()); }
+};
+DisplayIdentity AsusId() {
+    DisplayIdentity d;
+    d.devicePath = L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{guid}";
+    d.edidId = L"AUS322A-S4LMSB007317";
+    d.friendlyName = L"PA32UCXR";
+    return d;
+}
+}  // namespace
+
+TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sections once matched") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+
+    WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\asus.cube", ini);
+    {
+        MHCSettings hdr;
+        hdr.enabled = true;
+        hdr.profilePath = L"C:\\color\\DesktopLUT_Mon1_HDR_2.icm";
+        hdr.desktopGammaEnabled = true;
+        hdr.whiteBalanceEnabled = true;
+        hdr.baseGrayscale.pointCount = 20;
+        hdr.baseGrayscale.initLinear();
+        SaveMHCSettings(L"Monitor1", L"HDR_", hdr, ini);
+    }
+
+    // No live monitors in the test process: everything loads parked, nothing attaches.
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    LoadSettings();
+    CHECK(g_gui.monitorSettings.empty());
+    REQUIRE(g_gui.parkedSettings.size() == 2);
+    CHECK(g_gui.parkedSettings[0].legacyIndex == 0);
+    CHECK(g_gui.parkedSettings[1].legacyIndex == 1);
+    CHECK(g_gui.parkedSettings[1].hdrMHC.profileName == L"DesktopLUT_Mon1_HDR_2.icm");
+    // Nothing is live, so a parked display's DG must not switch the global mode on.
+    CHECK(g_userDesktopGammaMode.load() == false);
+
+    // Saving with nothing claimed leaves the legacy sections untouched and writes no Display section.
+    SaveSettings();
+    CHECK(EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini).empty());
+    REQUIRE(EnumerateSavedSectionIndices(kLegacySectionPrefix, ini).size() == 2);
+
+    // The ASUS shows up at index 0: it adopts [Monitor0]; the LG's [Monitor1] stays parked.
+    LiveDisplay asus;
+    asus.hmon = (HMONITOR)1;
+    asus.identity = AsusId();
+    asus.identified = true;
+    MonitorMatchResult r = MatchMonitorSettings({ asus }, g_gui.monitorSettings, g_gui.parkedSettings);
+    g_gui.monitorSettings = r.live;
+    g_gui.parkedSettings = r.parked;
+    REQUIRE(g_gui.monitorSettings.size() == 1);
+    CHECK(g_gui.monitorSettings[0].sdrPath == L"C:\\luts\\asus.cube");
+    CHECK(g_gui.monitorSettings[0].legacyIndex == 0);
+    CHECK(g_gui.monitorSettings[0].slot == 0);
+
+    SaveSettings();
+    auto display = EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini);
+    REQUIRE(display.size() == 1);
+    CHECK(display[0] == 0);
+    auto legacy = EnumerateSavedSectionIndices(kLegacySectionPrefix, ini);
+    REQUIRE(legacy.size() == 1);
+    CHECK(legacy[0] == 1);   // [Monitor0] retired, [Monitor1] still waiting for the LG
+    CHECK(g_gui.monitorSettings[0].legacyIndex == -1);
+
+    wchar_t buf[512] = {};
+    GetPrivateProfileStringW(L"Display0", L"EdidId", L"", buf, 512, ini);
+    CHECK(std::wstring(buf) == L"AUS322A-S4LMSB007317");
+    GetPrivateProfileStringW(L"Display0", L"DevicePath", L"", buf, 512, ini);
+    CHECK(std::wstring(buf) == L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{guid}");
+    GetPrivateProfileStringW(L"Display0", L"LUT_SDR", L"", buf, 512, ini);
+    CHECK(std::wstring(buf) == L"C:\\luts\\asus.cube");
+
+    // Reload from disk: the identity section and the unclaimed legacy one both come back.
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    LoadSettings();
+    REQUIRE(g_gui.parkedSettings.size() == 2);
+    CHECK(g_gui.parkedSettings[0].slot == 0);
+    CHECK(g_gui.parkedSettings[0].identity.edidId == L"AUS322A-S4LMSB007317");
+    CHECK(g_gui.parkedSettings[0].sdrPath == L"C:\\luts\\asus.cube");
+    CHECK(g_gui.parkedSettings[1].legacyIndex == 1);
+    CHECK(g_gui.parkedSettings[1].hdrMHC.desktopGammaEnabled == true);
+
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+}
+
+TEST_CASE("SaveSettings: parked displays are written, anonymous entries are not") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+
+    MonitorSettings parkedLg;
+    parkedLg.identity.devicePath = L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}";
+    parkedLg.identity.edidId = L"GSM84CD-16843009";
+    parkedLg.identity.friendlyName = L"LG TV SSCR2";
+    parkedLg.slot = 4;
+    parkedLg.hdrMHC.whiteBalanceEnabled = true;
+    parkedLg.hdrMHC.baseGrayscale.pointCount = 20;
+    parkedLg.hdrMHC.baseGrayscale.initLinear();
+    parkedLg.sdrMHC.baseGrayscale.pointCount = 20;
+    parkedLg.sdrMHC.baseGrayscale.initLinear();
+
+    MonitorSettings anonymous;   // identity query never succeeded for this live display
+    anonymous.sdrPath = L"C:\\luts\\unknown.cube";
+
+    g_gui.monitors.clear();
+    g_gui.monitorSettings = { anonymous };
+    g_gui.parkedSettings = { parkedLg };
+    SaveSettings();
+
+    auto display = EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini);
+    REQUIRE(display.size() == 1);
+    CHECK(display[0] == 4);
+    wchar_t buf[64] = {};
+    GetPrivateProfileStringW(L"Display4", L"HDR_MHCWhiteBalanceEnabled", L"", buf, 64, ini);
+    CHECK(std::wstring(buf) == L"true");
+
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+}
+

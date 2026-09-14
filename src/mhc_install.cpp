@@ -220,7 +220,9 @@ void CleanupOrphanedMhcProfiles() {
     std::set<std::wstring> activeProfiles;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        for (const auto& ms : g_gui.monitorSettings) {
+        // Live AND parked displays: a panel that is powered off right now still owns
+        // its profile files, and must find them intact when it comes back.
+        auto collect = [&](const MonitorSettings& ms) {
             // Keep the active profile name explicitly (mirrors SweepStaleMhcAssociations).
             // The profileName == permNames[activePerm] invariant holds by convention, but a
             // stale or hand-edited INI can break it; without this the active profile's file
@@ -234,7 +236,9 @@ void CleanupOrphanedMhcProfiles() {
                 if (!ms.hdrMHC.permNames[k].empty())
                     activeProfiles.insert(ms.hdrMHC.permNames[k]);
             }
-        }
+        };
+        for (const auto& ms : g_gui.monitorSettings) collect(ms);
+        for (const auto& ms : g_gui.parkedSettings) collect(ms);
     }
 
     // Scan system color directory for DesktopLUT_*.icm files
@@ -292,14 +296,16 @@ void SweepStaleMhcAssociations() {
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         monitorCount = g_gui.monitorSettings.size();
-        for (const auto& ms : g_gui.monitorSettings) {
+        auto collect = [&](const MonitorSettings& ms) {
             for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
                 if (!ms.sdrMHC.permNames[k].empty()) keep.insert(ms.sdrMHC.permNames[k]);
                 if (!ms.hdrMHC.permNames[k].empty()) keep.insert(ms.hdrMHC.permNames[k]);
             }
             if (!ms.sdrMHC.profileName.empty()) keep.insert(ms.sdrMHC.profileName);
             if (!ms.hdrMHC.profileName.empty()) keep.insert(ms.hdrMHC.profileName);
-        }
+        };
+        for (const auto& ms : g_gui.monitorSettings) collect(ms);
+        for (const auto& ms : g_gui.parkedSettings) collect(ms);  // absent panels keep their names
     }
 
     int swept = 0;

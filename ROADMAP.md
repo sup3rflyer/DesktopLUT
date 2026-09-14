@@ -2,15 +2,19 @@
 
 Open items, roughly by leverage. Each entry says what the user sees today, what should change, and where it lives.
 
-## Key per-monitor settings by display identity, not enumeration index
+## Show and manage parked displays
 
-**Today:** settings are saved as `[Monitor0]`, `[Monitor1]` … in the INI, keyed by the order Windows enumerates displays (`EnumDisplayMonitors`). Adding, removing, or re-plugging a display can change that order, and the LUT / MHC profile / corrections configured for "Monitor 1" then follow the index to whatever display is now second. The DWM-hook identity beacon (2026-09-06) only answers "which overlay context paints the display at position X"; it cannot tell which physical panel moved to X.
+**Done 2026-09-08:** per-monitor settings are keyed by display identity (`[Display<slot>]` with `DevicePath` / `EdidId`; `src/monitor_identity.cpp`), re-attached on every display change, and a disconnected panel's settings are parked in memory and on disk. Legacy `[Monitor<N>]` sections migrate by index on first sight and are retired on save.
 
-**Change:** key each monitor's settings by a stable identity — the display's device path from `QueryDisplayConfig` (`DISPLAYCONFIG_TARGET_DEVICE_NAME.monitorDevicePath`) or the EDID manufacturer + product code + serial — and resolve index → identity at enumeration time. Migrate existing `MonitorN` sections on first load (assign them to the identities present at that moment, keep the old sections as a fallback for one release). The identity also belongs in the routing file's `mon` lines so the hook's topology guard survives a re-shuffle.
+**Today:** parked displays are invisible in the GUI. There is no way to see which panels DesktopLUT remembers, to forget one (its `[Display<slot>]` section and cached MHC profile files stay forever), or to hand a parked configuration to a new panel of the same model.
 
-**Where:** `src/settings.cpp` (Save/LoadSettings, sections), `src/types.h` (`MonitorSettings` gains an identity field), `src/gui.cpp` WM_DISPLAYCHANGE (re-map settings to the new enumeration instead of growing the vector), `src/displayconfig.cpp` (identity lookup), `src/dwm_inject.cpp` (`monitors.dat` / routing file).
+**Change:** a "Remembered displays" list in the Settings tab (name, EDID id, last seen, connected or parked) with Forget and Copy-settings-to actions; forgetting also deletes that display's `DesktopLUT_*` profile files. Optionally carry the identity into the DWM-hook routing file's `mon` lines so twin-panel routing survives a re-shuffle without the beacon.
+
+**Where:** `src/gui_layout.cpp` (Settings tab list), `src/gui.cpp` (actions), `src/settings.cpp` (delete section), `src/mhc_install.cpp` (per-display profile cleanup), `src/dwm_inject.cpp` (routing file).
 
 ## Tell the user when the 3D LUT is not being applied
+
+**Also covers the MHC layer (2026-09-08):** the NVIDIA driver can stop honouring MHC2 on every display while the profile stays associated as default, the Calibration Loader reports success, and the gamma ramps read identity — every existing defence (verify, blind kick, transition burst, remove+re-add) is blind to it. Only a driver restart (CRU `restart64.exe`, or Win+Ctrl+Shift+B) cleared it. The app needs a positive "MHC applied" signal (a measured or read-back check, e.g. compare the scanout output of a known pattern against the profile's expected transform via Desktop Duplication, or a DXGI/driver query if one surfaces) and a "restart the display driver" action next to the warning.
 
 **Today:** the hook can be injected and healthy while no LUT reaches the screen — a full-monitor window bypassing composition, a monitor whose overlay context was never matched (`No output match`), a twin routed to the wrong panel before the beacon runs, a cube that failed to parse (`AddLUTs` skips it), or hook mode silently falling back after a Windows update breaks a pattern. The only signals are the hook log and the Settings-tab routing line; the tray icon and status bar say "Active".
 

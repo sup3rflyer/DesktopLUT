@@ -765,7 +765,7 @@ void HandleQueryGammaRamp(const JsonValue& p, JsonValue& result) {
 // display query APIs OUTSIDE the lock — mirrors HandleQueryGammaRamp and keeps
 // the slow DXGI work off the settings mutex.
 void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
-    struct MonSnap { HMONITOR hmon; std::wstring friendly; };
+    struct MonSnap { HMONITOR hmon; std::wstring friendly; DisplayIdentity identity; int slot; };
     std::vector<MonSnap> snaps;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
@@ -774,6 +774,11 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
             MonSnap s;
             s.hmon = g_gui.monitors[i];
             s.friendly = (i < g_gui.monitorNames.size()) ? g_gui.monitorNames[i] : std::wstring();
+            s.slot = -1;
+            if (i < g_gui.monitorSettings.size()) {
+                s.identity = g_gui.monitorSettings[i].identity;
+                s.slot = g_gui.monitorSettings[i].slot;
+            }
             snaps.push_back(std::move(s));
         }
     }
@@ -783,6 +788,12 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
         JsonValue e = JObj();
         e.set("index", JNum((double)i));
         e.set("friendly_name", JStr(WideToUtf8(snaps[i].friendly)));
+        // Identity the settings are keyed by (stable across enumeration reorders).
+        if (!snaps[i].identity.empty()) {
+            e.set("edid_id", JStr(WideToUtf8(snaps[i].identity.edidId)));
+            e.set("identity_name", JStr(WideToUtf8(snaps[i].identity.friendlyName)));
+        }
+        e.set("settings_slot", JNum((double)snaps[i].slot));
 
         if (snaps[i].hmon) {
             MONITORINFOEXW mi;
