@@ -11,6 +11,16 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **FALD profile flow** (`dlc.stages.fald_profile`, 2026-09-14): the user-facing, meter-only mini-LED
+  profiling pass — one sensor spot, ≈ 40 min, no camera. Spec-sheet zone count + diagonal in; phases
+  preflight (native state + ACM/HDR check) → register (sensor self-registration, transport check) → grid
+  (origin-phase evidence) → drive (white, primaries, SDR gamma, drive curve, area, hole, peaks) → leak →
+  rings → fit (two-stage + gated knots) → heldout (predictions frozen before reading) → export (`.bin`) →
+  verify (OFF / identity / ON scorecard) → restore. One StageResult per phase (the seam), `check_in`
+  evidence packets on the run's event spine, `control.json` cancel, `--simulate` synthetic panel.
+  `FaldParams` gained `transfer` (`pq` | `gamma`), `code_bits`, `sdr_gamma` so an SDR desktop can be
+  profiled (the C++ layer itself is still HDR-only — work guide P7). `dlc/fald/shapes.py` carries the
+  multi-rectangle frame presenter for the dogegen daemon (`--stdin`).
 - **Grayscale touch-up hardening** (four defects from the 2026-08-14 HDR grayscale-wb
   run, fixed offline against mock/contract tests):
   - The editor sliders now arrive DECOMPOSED over the pipe: the luminance correction

@@ -27,7 +27,7 @@ from typing import Optional, Sequence
 import numpy as np
 from scipy.signal import fftconvolve
 
-from dlc._pq import eotf_norm
+from dlc._pq import eotf_norm, oetf_norm
 
 Shape = tuple[tuple[int, int, int], tuple[float, float, float, float]]
 
@@ -101,6 +101,14 @@ class FaldParams:
     est_interp: str = "nearest"           # cell map → pixels: "nearest" (blocky) or "bilinear" (between centres)
     # panel
     white_nits: float = 1842.0            # native full-field white at code 1023 (2026-09-11; 1040 was the stack's)
+    # Signal transfer of the pattern codes (2026-09-14, the user-facing profiling flow): "pq" = the codes are PQ
+    # (HDR; requested nits = EOTF_PQ(code) over the 10000-nit container, white_nits is only the panel's full-field
+    # ceiling) or "gamma" = SDR power law, requested nits = white_nits · (code/max)^sdr_gamma (the panel's own
+    # EOTF, measured by the flat-field sweep of the profiling pass — never the piecewise sRGB curve, DLC-wide rule).
+    # code_bits = the depth the codes are given in (the dogegen daemon's mode: 10 for HDR, 8 or 10 for SDR).
+    transfer: str = "pq"
+    code_bits: int = 10
+    sdr_gamma: float = 2.2
     chan_weights: tuple[float, float, float] = (0.305, 0.596, 0.099)   # R,G,B share of white
     tmin: float = 3.0e-4                  # closed-LCD transmittance (pedestal = Lmax·B·tmin), LUMINANCE-fitted
     # Pedestal COLOUR (2026-09-13, work-guide H2 / owner: "channel subtractive mode"): the closed-LCD leak is bluer
@@ -156,6 +164,28 @@ class FaldParams:
     @property
     def cell_h(self) -> float:
         return self.height / self.rows
+
+    def code_to_nits(self, code: np.ndarray) -> np.ndarray:
+        """Requested linear nits per code value under this panel's ``transfer`` (see the field)."""
+        mx = float((1 << int(self.code_bits)) - 1)
+        v = np.clip(np.asarray(code, dtype=np.float64) / mx, 0.0, 1.0)
+        if self.transfer == "pq":
+            return np.vectorize(eotf_norm)(v) * 10000.0
+        if self.transfer == "gamma":
+            return self.white_nits * np.power(v, float(self.sdr_gamma))
+        raise ValueError(f"transfer must be 'pq' or 'gamma', got {self.transfer!r}")
+
+    def nits_to_code(self, nits: float) -> int:
+        """Inverse of :meth:`code_to_nits` (rounded, clipped to the code range)."""
+        mx = (1 << int(self.code_bits)) - 1
+        n = max(float(nits), 0.0)
+        if self.transfer == "pq":
+            v = oetf_norm(n / 10000.0)
+        elif self.transfer == "gamma":
+            v = (min(n, self.white_nits) / self.white_nits) ** (1.0 / float(self.sdr_gamma))
+        else:
+            raise ValueError(f"transfer must be 'pq' or 'gamma', got {self.transfer!r}")
+        return int(round(min(max(v, 0.0), 1.0) * mx))
 
     def tmin_vec(self) -> np.ndarray:
         """Per-channel closed-LCD transmittance (3,): tmin · m_c. m = tmin_rgb only in ped_mode "channel";
@@ -232,7 +262,7 @@ class FaldModel:
             x0 = int(round(x * self.w)); y0 = int(round(y * self.h))
             x1 = int(round((x + cx) * self.w)); y1 = int(round((y + cy) * self.h))
             x1 = max(x1, x0 + 1); y1 = max(y1, y0 + 1)
-            vals = _eotf_nits(np.array([r, g, b], dtype=np.float64))
+            vals = self.p.code_to_nits(np.array([r, g, b], dtype=np.float64))
             img[:, y0:y1, x0:x1] = vals[:, None, None]
         return img
 

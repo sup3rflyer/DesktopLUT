@@ -336,10 +336,12 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
 
 - **Overlay path, HDR only.** Off in DWM hook mode (the status line says so when you enable it there).
 - **Needs a per-panel parameter file** (Corrections tab → *Panel file*; INI `HDR_FaldParamsPath`), produced by
-  the DLC calibrator's spatial probe + `python -m dlc.fald.export`. Only the ASUS PA32UCXR has one
-  (`DLC/results/fald_native_2026-09-11/pa32ucxr_fald_panel.bin`, local); another panel needs its own probe
-  (~3 h with a meter — the code is panel-agnostic, the numbers are not). The layer refuses, logging once,
-  when the file's zone lattice does not fit the monitor's resolution.
+  the DLC calibrator's profiling pass (`python -m dlc.stages.fald_profile`, one colorimeter spot, ≈ 40 min,
+  no camera: it needs the panel's zone count and diagonal from the spec sheet, and ends with a verify pass
+  of the file on your unit — `DLC/docs/fald-profile-flow.md`). Only the ASUS PA32UCXR has one
+  (`DLC/results/fald_native_2026-09-11/pa32ucxr_fald_panel.bin`, local); the code is panel-agnostic, the
+  numbers are not. The layer refuses, logging once, when the file's zone lattice does not fit the monitor's
+  resolution.
 - **Not a bloom remover.** Light leaking through a closed LCD (the blue pedestal under black beside a
   highlight), the peak loss of small highlights (a 160 px window on the PA32UCXR reaches 47 % of full-field
   white) and content below the LED floor (~0.5 nit) are panel physics a pixel shader cannot change.

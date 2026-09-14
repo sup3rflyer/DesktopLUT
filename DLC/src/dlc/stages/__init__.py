@@ -29,4 +29,5 @@ __all__ = [
     "state",
     "report",
     "simulate",
+    "fald_profile",
 ]
