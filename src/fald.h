@@ -1,4 +1,5 @@
-// FALD (mini-LED local dimming) context-dependence correction — overlay-path layer.
+// FALD (mini-LED local dimming) context-dependence correction — overlay-path layer (HDR, and SDR under
+// Windows ACM where the overlay frame is FP16 scRGB too; never in DWM hook mode).
 // Design + measurements: DLC/docs/fald-shader-design.md, DLC/docs/fald-spatial-probe-2026-09-10.md.
 // The per-panel parameter file (*.bin) is produced by `python -m dlc.fald.export <fit.json> <out.bin>`
 // (layout documented there); the shaders live in fald_shader.h.
@@ -17,6 +18,10 @@ struct FaldSettings;
 
 // Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 44 words.
 constexpr unsigned int FALD_CB_BYTES = 176;
+
+// Panel-file signal transfer (FLD3 header word 40; see FaldPanelParams::transfer).
+constexpr uint32_t FALD_TRANSFER_PQ = 0;      // HDR: PQ codes (FLD1/FLD2 files are implicitly PQ)
+constexpr uint32_t FALD_TRANSFER_GAMMA = 1;   // SDR under ACM: gamma-encoded codes, panel EOTF = power law
 
 // Parsed panel parameter file.
 struct FaldPanelParams {
@@ -38,12 +43,26 @@ struct FaldPanelParams {
     float chromaGain = 1.0f;                 // FLD2 word 36: strength of the COLOUR part of the pedestal term (channel mode)
     float chromaLo = -1.0f, chromaHi = -1.0f; // FLD2 words 37/38: its own pixel-luminance fade; -1/-1 = follow lumFade;
                                              // 0/0 = no pixel-luminance fade on the colour part (experiment knob)
-    bool hasPedColour = false;               // FLD2 file (the loader saw words 32-34)
+    bool hasPedColour = false;               // FLD2/FLD3 file carrying a pedestal colour (words 32-35 non-zero)
+    // Signal transfer of the panel-bound codes (FLD3 words 40/41; FLD1/FLD2 = PQ). 0 = PQ: the panel receives a
+    // BT.2020 PQ code (HDR), as-if-white nits = rec2020_c x 80 nits of the scRGB frame. 1 = gamma: the panel
+    // receives an 8/10-bit gamma-encoded code (SDR under Windows ACM, FP16 scRGB composition), as-if-white nits =
+    // white x code^sdrGamma with code = sRGB_OETF(scRGB) (Windows' own scRGB -> SDR encode). DLC reference:
+    // FaldParams.code_to_nits / scrgb_to_nits (dlc/fald/model.py). A file's transfer must match the monitor's
+    // mode (Build refuses otherwise): an SDR fit decoded as PQ would be wrong by orders of magnitude.
+    uint32_t transfer = FALD_TRANSFER_PQ;
+    float sdrGamma = 0.0f;                   // the panel's own power-law EOTF exponent (transfer 1 only; measured by DLC)
+    bool hasTransfer = false;                // FLD3 file (the loader saw words 40/41)
     std::vector<float> curve, kTrue, kEst;
 };
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err);
-// Cheap header peek: does the file at `path` carry a pedestal colour (FLD2)? false for FLD1, unreadable or missing.
+// Cheap header peek: does the file at `path` carry a pedestal colour (FLD2/FLD3)? false for FLD1, unreadable or missing.
 bool FaldPanelFileHasPedColour(const std::wstring& path);
+// Cheap header peek: the file's signal transfer (FALD_TRANSFER_PQ / FALD_TRANSFER_GAMMA) without loading the
+// tables. false when the file is unreadable or not a FALD panel file (then `transfer` is left untouched).
+bool FaldPanelFileTransfer(const std::wstring& path, uint32_t& transfer);
+// Does a file with this transfer belong to this monitor mode? (PQ <-> HDR, gamma <-> SDR/ACM.)
+bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr);
 // The panel lattice (origin + cols*cellW x rows*cellH) must lie inside the monitor's frame.
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height);
 
@@ -56,6 +75,7 @@ struct FaldResources {
     unsigned long long fileSize = 0, fileMtime = 0;   // stamp of the params file at Build (re-export in place -> rebuild)
     unsigned int fileCheckCounter = 0;       // frames since the stamp was last polled
     int width = 0, height = 0;
+    bool builtForHdr = false;                // monitor mode the resources were built for (transfer check)
     bool valid = false;
     std::string lastError;
     // full-resolution intermediate: the main shader renders here, the FALD pixel pass reads it

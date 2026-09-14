@@ -1,6 +1,6 @@
 // FALD panel-parameter loader + lattice check (src/fald.cpp). The file layout is the DLC exporter's
-// (DLC/src/dlc/fald/export.py docstring): 32-word header (FLD1) or 40-word (FLD2, + pedestal colour),
-// curve[curve_n], k_true, k_est. No D3D here —
+// (DLC/src/dlc/fald/export.py docstring): 32-word header (FLD1), 40-word (FLD2, + pedestal colour) or
+// 48-word (FLD3, + signal transfer words 40/41 for SDR/ACM gamma fits), curve[curve_n], k_true, k_est. No D3D here —
 // the GPU passes are checked against the Python reference by DLC's fald_compare_dump on a live dump.
 #include "doctest.h"
 #include "../src/fald.h"
@@ -273,7 +273,128 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
 }
 
 TEST_CASE("FALD constant buffer is 44 words") {
-    // FillCB writes words up to index 42 (chromaHi); the HLSL cbuffer FaldCB declares 11 float4 rows.
+    // FillCB writes words up to index 43 (sdrGamma; word 31 = transfer); the HLSL cbuffer FaldCB declares 11 float4 rows.
     CHECK(FALD_CB_BYTES == 176u);
     CHECK(FALD_CB_BYTES % 16 == 0);
+}
+
+// FLD3: the 40 FLD2 words + 8 (word 40 transfer, 41 sdr_gamma, 42-47 reserved); tables follow at byte 192.
+// Words 32-35 all zero = no pedestal colour (an SDR fit without one still needs the transfer words).
+static Image Fld3Image(uint32_t transfer, float gamma) {
+    Image im = Image::Valid();
+    im.header[0] = 0x464C4433u;                                  // 'FLD3'
+    im.header.resize(48, 0);
+    im.header[40] = transfer;
+    im.SetF(41, gamma);
+    return im;
+}
+
+TEST_CASE("FALD loader: FLD1/FLD2 files are PQ (HDR) fits; FLD3 carries the signal transfer") {
+    FaldPanelParams p; std::string err;
+    {
+        FaldTempFile tf(L"test_fald_fld1_transfer.bin");
+        WriteBytes(tf.path, Image::Valid().Bytes());
+        REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(p.transfer == FALD_TRANSFER_PQ);
+        CHECK_FALSE(p.hasTransfer);
+        CHECK(p.sdrGamma == doctest::Approx(0.0f));
+    }
+    {
+        // an SDR (ACM) fit: gamma codes, the panel's own power law 2.27 (the PA32UCXR 2026-09-14 value)
+        FaldTempFile tf(L"test_fald_fld3_gamma.bin");
+        WriteBytes(tf.path, Fld3Image(1u, 2.2709f).Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf.path, q, err));
+        CHECK(q.hasTransfer);
+        CHECK(q.transfer == FALD_TRANSFER_GAMMA);
+        CHECK(q.sdrGamma == doctest::Approx(2.2709f));
+        CHECK_FALSE(q.hasPedColour);                                // words 32-35 zero: white pedestal, as FLD1
+        CHECK(q.pedRGB[0] == doctest::Approx(1.0f)); CHECK(q.pedRGB[2] == doctest::Approx(1.0f));
+        CHECK(q.white == doctest::Approx(1842.0f));
+        CHECK(q.curve.size() == 16); CHECK(q.kEst[5] == doctest::Approx(0.10f));   // tables read from the 192-byte offset
+        CHECK(q.kTrue.size() == 36);
+    }
+    {
+        // FLD3 with transfer 0 is a PQ fit that happens to use the long header (word 41 ignored)
+        FaldTempFile tf(L"test_fald_fld3_pq.bin");
+        WriteBytes(tf.path, Fld3Image(0u, 9.0f).Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf.path, q, err));
+        CHECK(q.hasTransfer);
+        CHECK(q.transfer == FALD_TRANSFER_PQ);
+        CHECK(q.sdrGamma == doctest::Approx(0.0f));
+    }
+    {
+        // FLD3 with a pedestal colour block: both features at once
+        FaldTempFile tf(L"test_fald_fld3_colour.bin");
+        Image im = Fld3Image(1u, 2.2f);
+        im.SetF(32, 0.756f); im.SetF(33, 1.057f); im.SetF(34, 1.366f); im.header[35] = 1u;
+        WriteBytes(tf.path, im.Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf.path, q, err));
+        CHECK(q.hasPedColour);
+        CHECK(q.pedRGB[2] == doctest::Approx(1.366f));
+        CHECK(q.transfer == FALD_TRANSFER_GAMMA);
+        CHECK(q.sdrGamma == doctest::Approx(2.2f));
+    }
+}
+
+TEST_CASE("FALD loader: implausible FLD3 transfer words are refused, not defaulted") {
+    FaldPanelParams p; std::string err;
+    {
+        FaldTempFile tf(L"test_fald_fld3_badxfer.bin");
+        WriteBytes(tf.path, Fld3Image(2u, 2.2f).Bytes());          // unknown transfer code
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("transfer") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld3_gamma_lo.bin");
+        WriteBytes(tf.path, Fld3Image(1u, 0.5f).Bytes());          // gamma below 1
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("sdr_gamma") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld3_gamma_hi.bin");
+        WriteBytes(tf.path, Fld3Image(1u, 5.0f).Bytes());          // gamma above 4
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("sdr_gamma") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld3_gamma_zero.bin");
+        WriteBytes(tf.path, Fld3Image(1u, 0.0f).Bytes());          // gamma word missing on a gamma fit
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("sdr_gamma") != std::string::npos);
+    }
+    {
+        FaldTempFile tf(L"test_fald_fld3_short.bin");
+        Image im = Image::Valid(); im.header[0] = 0x464C4433u;      // FLD3 magic on a 32-word file
+        WriteBytes(tf.path, im.Bytes());
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+    }
+}
+
+TEST_CASE("FALD panel file transfer peek + mode match") {
+    uint32_t t = 99;
+    FaldTempFile tf1(L"test_fald_peek_xfer1.bin");
+    WriteBytes(tf1.path, Image::Valid().Bytes());
+    CHECK(FaldPanelFileTransfer(tf1.path, t)); CHECK(t == FALD_TRANSFER_PQ);
+    FaldTempFile tf2(L"test_fald_peek_xfer2.bin");
+    Image im2 = Image::Valid(); im2.header[0] = 0x464C4432u; im2.header.resize(40, 0);
+    im2.SetF(32, 1.0f); im2.SetF(33, 1.0f); im2.SetF(34, 1.0f);
+    WriteBytes(tf2.path, im2.Bytes());
+    t = 99; CHECK(FaldPanelFileTransfer(tf2.path, t)); CHECK(t == FALD_TRANSFER_PQ);
+    FaldTempFile tf3(L"test_fald_peek_xfer3.bin");
+    WriteBytes(tf3.path, Fld3Image(1u, 2.2f).Bytes());
+    t = 99; CHECK(FaldPanelFileTransfer(tf3.path, t)); CHECK(t == FALD_TRANSFER_GAMMA);
+    CHECK(FaldPanelFileHasPedColour(tf3.path) == false);            // FLD3 without a colour block
+    FaldTempFile tf4(L"test_fald_peek_xfer4.bin");
+    Image im4 = Image::Valid(); im4.header[0] = 0x31444C46u;        // not a panel file
+    WriteBytes(tf4.path, im4.Bytes());
+    t = 99; CHECK_FALSE(FaldPanelFileTransfer(tf4.path, t)); CHECK(t == 99u);   // left untouched
+    CHECK_FALSE(FaldPanelFileTransfer(L"test_fald_peek_xfer_missing.bin", t));
+
+    CHECK(FaldTransferMatchesMode(FALD_TRANSFER_PQ, true));
+    CHECK_FALSE(FaldTransferMatchesMode(FALD_TRANSFER_PQ, false));
+    CHECK(FaldTransferMatchesMode(FALD_TRANSFER_GAMMA, false));
+    CHECK_FALSE(FaldTransferMatchesMode(FALD_TRANSFER_GAMMA, true));
 }

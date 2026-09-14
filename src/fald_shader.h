@@ -8,7 +8,14 @@
 // here mirrors that code; the drive curve and the two sub-cell kernel tables are TABULATED by the
 // Python exporter (dlc.fald.export) so no kernel math is duplicated on the GPU.
 //
-// Passes per frame (HDR overlay path, on the processed frame, after tonemap/LUT/WB):
+// Signal domain: the processed frame is FP16 scRGB linear BT.709 (1.0 = 80 nits) in HDR and in SDR under
+// Windows ACM alike; what differs is the CODE the panel receives. transfer 0 (PQ, HDR): Windows composes
+// scRGB -> BT.2020 PQ, as-if-white nits = rec2020_c x 80. transfer 1 (gamma, ACM SDR): Windows encodes
+// scRGB -> the 8/10-bit sRGB code (sRGB_OETF, the same encode the main SDR shader assumes) and the panel
+// shows it with its own power law, as-if-white nits = white x sRGB_OETF(scRGB)^sdrGamma (DLC
+// FaldParams.code_to_nits with transfer "gamma"; the reference formula is FaldParams.scrgb_to_nits).
+//
+// Passes per frame (overlay path, on the processed frame, after tonemap/LUT/WB):
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)
 //   CS conv           : drives (x) K_true, drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
 //   CS stat  (round 1): same statistic on the CORRECTED frame (the correction moves the drives)
@@ -25,13 +32,15 @@ cbuffer FaldCB : register(b0) {
     float wR; float wG; float wB; float gainMin;
     float gainMax; float driveFloor; float curveLogMin; float curveLogMax;
     uint debugMode; uint originX; uint originY; uint blurDir;      // blurDir: 0 = horizontal, 1 = vertical pass
-    float fadeLo; float fadeHi; float gainSmoothFine; float _pad2;  // gainSmoothFine: Gaussian sigma in fine samples (0 = off)
+    float fadeLo; float fadeHi; float gainSmoothFine; uint transfer; // gainSmoothFine: Gaussian sigma in fine samples (0 = off);
+                                                                    // transfer: 0 = PQ codes (HDR), 1 = gamma codes (ACM SDR)
     float lumFadeLo; float lumFadeHi; float _pad3; float _pad4;     // pixel-luminance fade, as-if-white nits (lo = hi = 0: off)
     float tminR; float tminG; float tminB; uint pedMode;            // tmin * the panel file's leak colour (= tmin for FLD1);
                                                                     // pedMode 0 = white pedestal, common-factor subtraction;
                                                                     // 1 = coloured pedestal, per-channel floor (GUI toggle)
-    float chromaGain; float chromaLo; float chromaHi; float _pad5;  // colour part of the pedestal term: strength + its own
-                                                                    // pixel-luminance fade (lo = hi = 0: none)
+    float chromaGain; float chromaLo; float chromaHi; float sdrGamma; // colour part of the pedestal term: strength + its own
+                                                                    // pixel-luminance fade (lo = hi = 0: none); sdrGamma: the
+                                                                    // panel's EOTF exponent (transfer 1 only)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -54,16 +63,44 @@ static const float3x3 BT2020_TO_BT709 = float3x3(
    -0.1245505f,  1.1328999f, -0.0083494f,
    -0.0181508f, -0.1005789f,  1.1187297f);
 
-// Per-channel "as-if-white" nits of the panel-bound signal: the PQ code the panel receives for a
-// channel decodes to rec2020_c * 80 nits (Windows composes scRGB -> BT.2020 PQ). The physical
+// The sRGB piecewise transfer (IEC 61966-2-1) — Windows' scRGB <-> 8/10-bit SDR composition encode under ACM,
+// NOT the panel's EOTF (that is the measured power law sdrGamma). Analytic, so a code round-trips exactly.
+float SrgbOetf(float L) {
+    L = saturate(L);
+    return (L <= 0.0031308f) ? 12.92f * L : 1.055f * pow(L, 1.0f / 2.4f) - 0.055f;
+}
+float SrgbEotf(float V) {
+    V = saturate(V);
+    return (V <= 0.04045f) ? V / 12.92f : pow((V + 0.055f) / 1.055f, 2.4f);
+}
+
+// Per-channel "as-if-white" nits of the panel-bound signal. transfer 0 (HDR): the PQ code the panel
+// receives for a channel decodes to rec2020_c * 80 nits (Windows composes scRGB -> BT.2020 PQ).
+// transfer 1 (ACM SDR): the panel receives code = sRGB_OETF(scRGB_c) and shows white * code^sdrGamma
+// (values outside 0..1 are clipped by the composition; saturate mirrors that). The physical
 // contribution of channel c is w_c times this; the model works in as-if-white units throughout.
 float3 PanelNits(float3 scrgb) {
-    float3 rec2020 = mul(BT709_TO_BT2020, scrgb);
-    return max(rec2020, 0.0f) * 80.0f;
+    float3 nits;
+    if (transfer == 1u) {
+        float3 code = float3(SrgbOetf(scrgb.r), SrgbOetf(scrgb.g), SrgbOetf(scrgb.b));   // 0..1 by construction
+        nits = white * pow(max(code, 0.0f), sdrGamma);
+    } else {
+        nits = max(mul(BT709_TO_BT2020, scrgb), 0.0f) * 80.0f;
+    }
+    return nits;
 }
 float3 PanelNitsToScRGB(float3 nits) {
-    return mul(BT2020_TO_BT709, nits / 80.0f);
+    float3 scrgb;
+    if (transfer == 1u) {
+        float3 code = pow(saturate(nits / white), 1.0f / sdrGamma);
+        scrgb = float3(SrgbEotf(code.r), SrgbEotf(code.g), SrgbEotf(code.b));
+    } else {
+        scrgb = mul(BT2020_TO_BT709, nits / 80.0f);
+    }
+    return scrgb;
 }
+// scRGB value of a debug grey: 100 nits in HDR; the SDR white (1.0) under ACM.
+float DebugWhite() { return (transfer == 1u) ? 1.0f : (100.0f / 80.0f); }
 
 // Panel LED drive for a cell statistic (nits). LUT is linear in ln(nits); below the first knot the
 // table already holds the floor (0 below driveFloor) exactly as FaldModel.drive_of does.
@@ -299,10 +336,10 @@ float4 main(PS_INPUT i) : SV_Target {
         // +-25 % full scale (saturated red/blue), on a 100-nit white
         float t = saturate(abs(gain - 1.0f) * 4.0f);
         float3 c = (gain >= 1.0f) ? float3(1.0f, 1.0f - t, 1.0f - t) : float3(1.0f - t, 1.0f - t, 1.0f);
-        return float4(c * (100.0f / 80.0f), 1.0f);
+        return float4(c * DebugWhite(), 1.0f);
     }
-    if (debugMode == 2) { float v = saturate(bT) * (100.0f / 80.0f); return float4(v, v, v, 1.0f); }
-    if (debugMode == 3) { float v = saturate(bE) * (100.0f / 80.0f); return float4(v, v, v, 1.0f); }
+    if (debugMode == 2) { float v = saturate(bT) * DebugWhite(); return float4(v, v, v, 1.0f); }
+    if (debugMode == 3) { float v = saturate(bE) * DebugWhite(); return float4(v, v, v, 1.0f); }
     if (debugMode == 5 || debugMode == 6) {
         float maxc = max(img.r, max(img.g, img.b));
         float s = min(maxc, white);

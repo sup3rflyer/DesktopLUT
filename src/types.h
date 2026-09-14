@@ -124,12 +124,15 @@ struct MovableAtomic {
 #define ID_CORR_MAXTML_EDIT      527
 #define ID_CORR_MAXTML_APPLY     528
 
-// FALD compensation layer (Experimental, HDR, overlay path)
-#define ID_CORR_FALD_ENABLE      529
+// FALD compensation layer (Experimental, overlay path; one row per mode — HDR and SDR under ACM)
+#define ID_CORR_FALD_ENABLE      529   // HDR row
 #define ID_CORR_FALD_PATH        530
 #define ID_CORR_FALD_BROWSE      531
-#define ID_CORR_FALD_DEBUG       532
+#define ID_CORR_FALD_DEBUG       532   // View combo + pedestal toggle apply to both modes
 #define ID_CORR_FALD_PEDMODE     533
+#define ID_CORR_FALD_SDR_ENABLE  534   // SDR (ACM) row
+#define ID_CORR_FALD_SDR_PATH    535
+#define ID_CORR_FALD_SDR_BROWSE  536
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -491,9 +494,11 @@ inline int TonemapCurveToDropdownIndex(TonemapCurve curve) {
     return 0;
 }
 
-// FALD (mini-LED local dimming) context-dependence correction layer (HDR only, overlay path).
-// Parameter file = output of DLC `python -m dlc.fald.export` (see src/fald.h). Same struct serves
-// the GUI settings and the runtime ColorCorrectionData.
+// FALD (mini-LED local dimming) context-dependence correction layer (overlay path; per mode: HDR, and
+// SDR when Windows ACM composes the desktop in FP16 scRGB — a plain 8-bit SDR desktop never runs it).
+// Parameter file = output of DLC `python -m dlc.fald.export` (see src/fald.h); its transfer (PQ / gamma)
+// must match the mode the settings belong to. Same struct serves the GUI settings and the runtime
+// ColorCorrectionData; lives in both sdrColorCorrection and hdrColorCorrection (INI SDR_/HDR_ prefix).
 struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
@@ -524,7 +529,7 @@ struct ColorCorrectionData {
     float whiteBalanceGains[3] = { 1.0f, 1.0f, 1.0f };    // Diagonal RGB gains from white point (von Kries)
     GrayscaleData grayscale;
     TonemapData tonemap;  // HDR tonemapping (only used in HDR mode)
-    FaldSettings fald;    // FALD correction layer (HDR only)
+    FaldSettings fald;    // FALD correction layer (per mode: HDR, or SDR under ACM)
 };
 
 // Per-monitor context (holds all state for one monitor)
@@ -762,7 +767,7 @@ struct ColorCorrectionSettings {
     float primariesMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };  // Identity
     GrayscaleSettings grayscale;
     TonemapSettings tonemap;  // HDR tonemapping (only used in HDR mode)
-    FaldSettings fald;        // FALD correction layer (HDR only)
+    FaldSettings fald;        // FALD correction layer (per mode: HDR, or SDR under ACM)
 };
 
 // MHC profile state (per-monitor, per-mode)
@@ -901,10 +906,13 @@ struct GUIState {
     HWND hwndMaxTmlEdit = nullptr;
     HWND hwndMaxTmlApply = nullptr;
 
-    // FALD compensation (Experimental) controls
-    HWND hwndFaldEnable = nullptr;
+    // FALD compensation (Experimental) controls: one Enable + panel-file row per mode, shared View / pedestal
+    HWND hwndFaldEnable = nullptr;      // HDR row
     HWND hwndFaldPath = nullptr;
     HWND hwndFaldBrowse = nullptr;
+    HWND hwndFaldSdrEnable = nullptr;   // SDR (ACM) row
+    HWND hwndFaldSdrPath = nullptr;
+    HWND hwndFaldSdrBrowse = nullptr;
     HWND hwndFaldDebug = nullptr;
     HWND hwndFaldPedMode = nullptr;
 

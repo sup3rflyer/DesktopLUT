@@ -159,7 +159,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "grayscale": ApiParamSpec("boolean", required=False, description="MHC correction-grayscale bit (optional)"),
                 "desktop_gamma": ApiParamSpec("boolean", required=False, description="Desktop Gamma bit, HDR only (optional)"),
                 "tonemap": ApiParamSpec("boolean", required=False, description="HDR tonemap shader flag, HDR only (optional)"),
-                "fald": ApiParamSpec("boolean", required=False, description="FALD compensation layer (Experimental), HDR only, overlay path (optional)"),
+                "fald": ApiParamSpec("boolean", required=False, description="FALD compensation layer (Experimental), overlay path, per mode: HDR, or SDR under Windows ACM (optional)"),
             },
             {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap,fald}",
              "after": "object (same shape)", "regenerated": "boolean (MHC profile re-baked)",
@@ -339,15 +339,18 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "runtime.set_fald_params",
-            "FALD compensation layer (Experimental, HDR only, overlay path): set the per-panel parameter "
-            "file produced by `python -m dlc.fald.export` for the target monitor. Toggle the layer with "
-            "layers.set {fald}.",
+            "FALD compensation layer (Experimental, overlay path; per mode since 2026-09-14: HDR, or SDR under "
+            "Windows ACM): set the per-panel parameter file produced by `python -m dlc.fald.export` for the target "
+            "monitor:mode. The file's transfer must match the mode (FLD1/FLD2 = PQ = HDR fit; FLD3 with transfer "
+            "gamma = SDR fit) — a mismatch is refused (`panel file transfer ... does not match mode ...`); a file "
+            "the header peek cannot classify is accepted here and refused by the GPU loader. Toggle the layer with "
+            "layers.set {fald}. Builds before 2026-09-14 refuse mode SDR (`fald is an HDR-only layer`).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
                 "params_path": ApiParamSpec("string", description="Absolute path to the panel parameter file (*.bin)."),
             },
-            {"monitor_mode": "string", "params_path": "string"},
+            {"monitor_mode": "string", "params_path": "string", "transfer": "'pq' | 'gamma' | 'unknown' (absent on pre-2026-09-14 builds)"},
             mutates_state=True,
             gui_thread_required=True,
         ),
@@ -522,7 +525,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                     "array of {index:int, device_name:'\\\\.\\DISPLAYn' (Argyll order), friendly_name:string, "
                     "rect:{x,y,width,height}, primary:boolean, device_path:string, hardware_id:string (EDID), "
                     "source_id:int, target_id:int, adapter_id:{low,high}, hdr_capable:boolean, hdr_active:boolean, "
-                    "color_space:'SDR'|'ACM_SDR'|'HDR'}"
+                    "color_space:'SDR'|'ACM_SDR'|'HDR' (ACM_SDR = Windows 'Automatically manage color for apps' on: "
+                    "FP16 scRGB composition at SDR luminance — the mode the SDR FALD layer needs; read through "
+                    "DisplayConfig since 2026-09-14 (work guide C8) because the DXGI colour space cannot see ACM), "
+                    "color_mode_source:'dxgi'|'displayconfig2'|'displayconfig' (which query decided; ABSENT on "
+                    "builds before 2026-09-14, whose color_space never says ACM_SDR)}"
                 ),
             },
             mutates_state=False,

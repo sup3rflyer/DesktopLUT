@@ -2,6 +2,7 @@
 #include "displayconfig.h"
 #include "fixtures/edid_samples.h"
 #include <cmath>
+#include <string>
 
 // ============================================================================
 // EDID Chromaticity Parsing
@@ -228,6 +229,49 @@ TEST_CASE("DwmHookSharedConfig: zero-initialized is safe default") {
         CHECK(cfg.monitors[i].isHdr == 0);
         CHECK(cfg.monitors[i].sourcePeakNits == 0.0f);
     }
+}
+
+// ============================================================================
+// Display colour mode (ACM detection, DLC work guide C8)
+// ============================================================================
+
+TEST_CASE("DisplayColorMode: DXGI HDR verdict always wins") {
+    auto r = ClassifyDisplayColorMode(true, false, true, 1u, true, true);   // DisplayConfig says WCG, DXGI says HDR
+    CHECK(r.mode == DisplayColorMode::HDR);
+    CHECK(std::string(r.source) == "dxgi");
+    CHECK(std::string(DisplayColorModeName(r.mode)) == "HDR");
+}
+
+TEST_CASE("DisplayColorMode: 24H2 activeColorMode classifies SDR vs ACM (the DXGI colour space cannot)") {
+    // ACM on (owner's machine 2026-09-14): DXGI still says G22_P709, DisplayConfig 2 says WCG
+    auto acm = ClassifyDisplayColorMode(false, false, true, 1u, true, true);
+    CHECK(acm.mode == DisplayColorMode::AcmSdr);
+    CHECK(std::string(acm.source) == "displayconfig2");
+    CHECK(std::string(DisplayColorModeName(acm.mode)) == "ACM_SDR");
+    // ACM off: plain SDR
+    auto sdr = ClassifyDisplayColorMode(false, false, true, 0u, true, false);
+    CHECK(sdr.mode == DisplayColorMode::SDR);
+    CHECK(std::string(DisplayColorModeName(sdr.mode)) == "SDR");
+    // DisplayConfig 2 reports HDR while the DXGI query missed it: trust DisplayConfig
+    auto hdr = ClassifyDisplayColorMode(false, false, true, 2u, false, false);
+    CHECK(hdr.mode == DisplayColorMode::HDR);
+}
+
+TEST_CASE("DisplayColorMode: pre-24H2 fallback = advancedColorEnabled && !HDR") {
+    auto acm = ClassifyDisplayColorMode(false, false, false, 0u, true, true);
+    CHECK(acm.mode == DisplayColorMode::AcmSdr);
+    CHECK(std::string(acm.source) == "displayconfig");
+    auto sdr = ClassifyDisplayColorMode(false, false, false, 0u, true, false);
+    CHECK(sdr.mode == DisplayColorMode::SDR);
+}
+
+TEST_CASE("DisplayColorMode: no DisplayConfig answer at all falls back to the DXGI colour space") {
+    auto sdr = ClassifyDisplayColorMode(false, false, false, 0u, false, false);
+    CHECK(sdr.mode == DisplayColorMode::SDR);
+    CHECK(std::string(sdr.source) == "dxgi");
+    auto fp16 = ClassifyDisplayColorMode(false, true, false, 0u, false, false);   // a driver that does report G10_P709
+    CHECK(fp16.mode == DisplayColorMode::AcmSdr);
+    CHECK(std::string(DisplayColorModeName(DisplayColorMode::Unknown)) == "UNKNOWN");
 }
 
 // ============================================================================

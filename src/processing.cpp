@@ -558,6 +558,7 @@ static bool HasActiveShaderCorrections() {
         if (sdr.primariesEnabled && !sdrMhcP) return true;
         if (sdr.grayscale.enabled && !sdrMhcG) return true;
         if (sdr.grayscale.use24Gamma && !sdrMhcG) return true;
+        if (sdr.fald.enabled && !g_dwmHookMode.load()) return true;   // runs under ACM (render gate checks the frame format)
 
         // HDR: tonemapping is the primary shader correction; DG only active if MHC not handling it
         const auto& hdr = ms.hdrColorCorrection;
@@ -590,6 +591,7 @@ bool EvalNonAnalysisShaderCorrections() {
         if (sdr.primariesEnabled && !sdrMhcP) return true;
         if (sdr.grayscale.enabled && !sdrMhcG) return true;
         if (sdr.grayscale.use24Gamma && !sdrMhcG) return true;
+        if (sdr.fald.enabled && !g_dwmHookMode.load()) return true;
 
         const auto& hdr = ms.hdrColorCorrection;
         if (hdr.primariesEnabled && !hdrMhcP) return true;
@@ -950,7 +952,8 @@ void StartProcessing() {
         bool hasLUT = !ms.sdrPath.empty() || !ms.hdrPath.empty();
         bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
                                      ms.sdrColorCorrection.grayscale.enabled ||
-                                     ms.sdrColorCorrection.grayscale.use24Gamma;
+                                     ms.sdrColorCorrection.grayscale.use24Gamma ||
+                                     (ms.sdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
         bool hasHdrColorCorrection = ms.hdrColorCorrection.primariesEnabled ||
                                      ms.hdrColorCorrection.grayscale.enabled ||
                                      ms.hdrColorCorrection.tonemap.enabled ||

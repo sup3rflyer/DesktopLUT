@@ -290,10 +290,19 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         result.block("mode_mismatch", f"run mode SDR but monitor {args.monitor} is in HDR")
         return
     if mode == "SDR" and cs == "SDR" and not args.simulate:
-        result.anomaly("acm_off", "the pipe reports SDR without Windows ACM (auto colour management): DesktopLUT's FP16 "
-                       "overlay path needs ACM on — confirm 'Automatically manage color for apps' is on. NOTE the pipe's "
-                       "detection reads the DXGI output colour space, which does not change with ACM (work guide C8): "
-                       "with ACM verified on by the user this flag is a false positive", "medium")
+        # Builds from 2026-09-14 (work guide C8) read ACM through DisplayConfig and say so with
+        # color_mode_source; on those, SDR means ACM really is off and the SDR FALD layer cannot run
+        # (the overlay frame is 8-bit). Older builds read the DXGI colour space, which never sees ACM.
+        result.preconditions["color_mode_source"] = mon.get("color_mode_source")
+        if mon.get("color_mode_source"):
+            result.anomaly("acm_off", "the pipe reports SDR with Windows ACM OFF: DesktopLUT's FP16 overlay path (and the "
+                           "SDR FALD layer this pass profiles for) needs 'Automatically manage color for apps' on — "
+                           "turn it on and re-run preflight", "high")
+        else:
+            result.anomaly("acm_off", "the pipe reports SDR; this DesktopLUT build reads the DXGI output colour space, "
+                           "which does not change with ACM (work guide C8, fixed 2026-09-14): with ACM verified on by "
+                           "the user this flag is a false positive — confirm 'Automatically manage color for apps' is on",
+                           "medium")
     # zones + physical size
     try:
         cols, rows = (int(v) for v in str(args.zones).lower().split("x"))
@@ -655,9 +664,8 @@ def phase_export(s: Session, result: StageResult) -> None:
     s.st["fald"]["bin_path"] = str(bin_path)
     s.st["fald"]["phases"]["export"] = {"status": "done", "at": time.time()}
     if params.transfer != "pq":
-        result.note("SDR (gamma) panel file: the DesktopLUT shader currently applies the layer in HDR only (render.cpp gates on "
-                    "isHDREnabled and decodes as-if-white nits from PQ) — an SDR/ACM port of the layer is needed before this "
-                    "file can be applied; the fit itself is valid")
+        result.note("SDR (gamma) panel file, FLD3: applies on the DesktopLUT SDR (ACM) FALD row (builds from 2026-09-14, "
+                    "work guide P7); older builds refuse the FLD3 magic, and any build refuses it on an HDR monitor")
     result.advice = {"default_policy_verdict": "proceed_to_verify",
                      "reasons": [f"{info['format']} written ({info['bytes']} bytes); verify reads OFF / identity / ON on this unit"]}
 
@@ -680,7 +688,8 @@ def phase_verify(s: Session, result: StageResult) -> None:
         r = ctl.call("runtime.set_fald_params", {"monitor": s.args.monitor, "mode": mode, "params_path": bin_path})
         result.raw["set_fald_params"] = r
     except Exception as exc:  # noqa: BLE001
-        result.block("layer_unavailable", f"runtime.set_fald_params refused: {exc} (the layer is HDR/overlay-only today)")
+        result.block("layer_unavailable", f"runtime.set_fald_params refused: {exc} (a DesktopLUT build before the 2026-09-14 "
+                     "SDR/ACM port, DWM hook mode, or a panel file whose transfer does not match the mode)")
         return
 
     def set_fald(on: bool, identity: bool = False):

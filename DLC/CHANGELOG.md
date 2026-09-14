@@ -11,6 +11,15 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **FALD layer in SDR under Windows ACM + ACM detection** (2026-09-14, work guide P7/C8): the DesktopLUT FALD
+  compensation layer now runs on the SDR desktop when "Automatically manage color for apps" is on (per-mode
+  settings and GUI row, `SDR_Fald*` INI keys, pipe `mode: SDR` for `runtime.set_fald_params` / `fald_debug` /
+  `fald_dump` and `layers.set {fald}`). A `transfer: "gamma"` fit exports as **FLD3** (header words 40/41:
+  transfer + `sdr_gamma`); the shader decodes the SDR frame as `white × sRGB_OETF(scRGB)^sdr_gamma`
+  (`FaldParams.scrgb_to_nits` is the reference), and a panel file is refused on the wrong mode.
+  `windows.query_monitors.color_space` reports `ACM_SDR` via DisplayConfig (`color_mode_source` names the
+  query); the profile flow's `verify` phase runs in SDR (and under `--simulate`). Hardware verify on the
+  PA32UCXR in SDR is owed.
 - **FALD profile flow** (`dlc.stages.fald_profile`, 2026-09-14): the user-facing, meter-only mini-LED
   profiling pass — one sensor spot, ≈ 40 min, no camera. Spec-sheet zone count + diagonal in; phases
   preflight (native state + ACM/HDR check) → register (sensor self-registration, transport check) → grid
@@ -19,7 +28,7 @@ request, adjudicates ambiguous results on digests, and writes the report.
   verify (OFF / identity / ON scorecard) → restore. One StageResult per phase (the seam), `check_in`
   evidence packets on the run's event spine, `control.json` cancel, `--simulate` synthetic panel.
   `FaldParams` gained `transfer` (`pq` | `gamma`), `code_bits`, `sdr_gamma` so an SDR desktop can be
-  profiled (the C++ layer itself is still HDR-only — work guide P7). `dlc/fald/shapes.py` carries the
+  profiled (the C++ layer applies it since the same day's P7 port, above). `dlc/fald/shapes.py` carries the
   multi-rectangle frame presenter for the dogegen daemon (`--stdin`).
 - **Grayscale touch-up hardening** (four defects from the 2026-08-14 HDR grayscale-wb
   run, fixed offline against mock/contract tests):

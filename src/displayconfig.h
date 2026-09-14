@@ -39,6 +39,27 @@ bool QueryFreshOutputDesc(HMONITOR hMonitor, DXGI_OUTPUT_DESC1& outDesc);
 bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled);
 bool SetDisplayHdrState(const DisplayInfo& display, bool enable);
 
+// Live colour MODE of a display target (DLC work guide C8, 2026-09-14): SDR (8-bit composition),
+// ACM SDR (Windows "Automatically manage color for apps": FP16 scRGB composition at SDR luminance)
+// or HDR. The DXGI output colour space cannot see ACM (it stays G22_P709 with ACM on), so this asks
+// DisplayConfig: DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2 (Windows 11 24H2+, activeColorMode
+// SDR / WCG / HDR) with the older GET_ADVANCED_COLOR_INFO as the fallback (advancedColorEnabled and
+// not HDR = ACM SDR). The FALD overlay layer runs in HDR and in ACM SDR, never on a plain SDR desktop.
+enum class DisplayColorMode { Unknown = 0, SDR, AcmSdr, HDR };
+struct DisplayColorModeResult {
+    DisplayColorMode mode = DisplayColorMode::Unknown;
+    const char* source = "none";   // "dxgi" | "displayconfig2" | "displayconfig": which query decided
+};
+// dxgiHdrActive / dxgiFp16Sdr = the caller's fresh DXGI verdict (G2084_P2020 / G10_P709): HDR always
+// wins; the DisplayConfig queries classify SDR vs ACM SDR.
+DisplayColorModeResult QueryDisplayColorMode(const DisplayInfo& display, bool dxgiHdrActive, bool dxgiFp16Sdr = false);
+// Pure classification (exposed for tests). info2Ok / activeColorMode: GET_ADVANCED_COLOR_INFO_2
+// (0 = SDR, 1 = WCG i.e. ACM, 2 = HDR); legacyOk / legacyAdvancedColorEnabled: GET_ADVANCED_COLOR_INFO.
+DisplayColorModeResult ClassifyDisplayColorMode(bool dxgiHdrActive, bool dxgiFp16Sdr,
+                                                bool info2Ok, unsigned int activeColorMode,
+                                                bool legacyOk, bool legacyAdvancedColorEnabled);
+const char* DisplayColorModeName(DisplayColorMode mode);   // "SDR" | "ACM_SDR" | "HDR" | "UNKNOWN"
+
 // Toggle HDR on the monitor containing the focused window
 // Returns true if toggled, false if failed (e.g., monitor not HDR-capable)
 bool ToggleHdrOnFocusedMonitor();

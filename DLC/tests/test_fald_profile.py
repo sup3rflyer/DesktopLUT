@@ -234,7 +234,7 @@ def test_stage_measuring_phases_emit_checkins_and_honour_cancel(tmp_path):
 
 
 @pytest.mark.slow
-def test_stage_chain_sdr_to_export_and_verify_is_blocked(tmp_path):
+def test_stage_chain_sdr_to_export_and_verify(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
     for ph in ("preflight", "register", "grid", "drive", "leak", "rings"):
         res = _run(ctx, ph)
@@ -245,8 +245,9 @@ def test_stage_chain_sdr_to_export_and_verify_is_blocked(tmp_path):
     held = _run(ctx, "heldout")
     assert held.status == "ran" and (ctx.root / "fald" / "heldout_predictions.json").exists()
     exp = _run(ctx, "export", out=str(tmp_path / "export"))
-    assert exp.status == "ran" and exp.metrics["format"] == "FLD1" and (tmp_path / "export" / "sim_sdr_fald_panel.bin").exists()
-    assert any("HDR only" in n for n in exp.notes)
-    ver = _run(ctx, "verify")
-    assert ver.status == "blocked" and ver.anomalies[0].code == "layer_unavailable"     # the mock mirrors the C++: HDR-only
+    assert exp.status == "ran" and exp.metrics["format"] == "FLD3" and (tmp_path / "export" / "sim_sdr_fald_panel.bin").exists()
+    assert exp.metrics["transfer"] == "gamma" and any("FLD3" in n for n in exp.notes)
+    ver = _run(ctx, "verify")                       # the mock accepts mode SDR since the 2026-09-14 port (work guide P7)
+    assert ver.status == "ran", ver.as_dict()
+    assert "scorecard" in ver.metrics and ver.raw["set_fald_params"]["transfer"] == "gamma"
     assert _run(ctx, "restore").status == "ran"

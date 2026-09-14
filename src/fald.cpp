@@ -19,6 +19,11 @@ static ID3D11SamplerState* g_faldSampler = nullptr;
 
 static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1' (32-word header)
 static const uint32_t FALD_MAGIC2 = 0x464C4432u;  // 'FLD2' (40-word header: + pedestal colour, DLC export.py)
+static const uint32_t FALD_MAGIC3 = 0x464C4433u;  // 'FLD3' (48-word header: + signal transfer words 40/41; SDR/ACM fits)
+
+static size_t FaldHeaderBytes(uint32_t magic) {
+    return magic == FALD_MAGIC3 ? 192 : (magic == FALD_MAGIC2 ? 160 : 128);
+}
 static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
@@ -47,8 +52,8 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     if (buf.size() < 128) { err = "params file too short"; return false; }
     const uint32_t* u = reinterpret_cast<const uint32_t*>(buf.data());
     const float* fl = reinterpret_cast<const float*>(buf.data());
-    if (u[0] != FALD_MAGIC && u[0] != FALD_MAGIC2) { err = "bad magic (expected FLD1 or FLD2)"; return false; }
-    const size_t headerBytes = (u[0] == FALD_MAGIC2) ? 160 : 128;
+    if (u[0] != FALD_MAGIC && u[0] != FALD_MAGIC2 && u[0] != FALD_MAGIC3) { err = "bad magic (expected FLD1, FLD2 or FLD3)"; return false; }
+    const size_t headerBytes = FaldHeaderBytes(u[0]);
     if (buf.size() < headerBytes) { err = "params file too short"; return false; }
     out.cols = u[1]; out.rows = u[2]; out.sub = u[3]; out.cellW = u[4]; out.cellH = u[5];
     out.originX = u[6]; out.originY = u[7];
@@ -64,7 +69,11 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
         if (fl[30] > fl[29] && fl[29] >= 0.0f) { out.lumFadeLo = fl[29]; out.lumFadeHi = fl[30]; }
         else { err = "implausible lum_fade words"; return false; }
     }
-    if (u[0] == FALD_MAGIC2) {                                                              // words 32-34: pedestal colour, 35: validated mode
+    // words 32-34: pedestal colour, 35: validated mode. Always present in FLD2; in FLD3 all-zero words 32-35 mean
+    // "no pedestal colour" (an SDR fit without one still needs the transfer words, so the block is optional there).
+    const bool pedBlock = (u[0] == FALD_MAGIC2) ||
+                          (u[0] == FALD_MAGIC3 && (u[32] != 0 || u[33] != 0 || u[34] != 0 || u[35] != 0));
+    if (pedBlock) {
         out.pedRGB[0] = fl[32]; out.pedRGB[1] = fl[33]; out.pedRGB[2] = fl[34];
         out.pedModeFile = u[35]; out.hasPedColour = true;
         if (u[36] != 0) {                                                                   // word 36: colour-part gain (0 = default)
@@ -79,6 +88,18 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
             !(out.pedRGB[0] <= 8.0f && out.pedRGB[1] <= 8.0f && out.pedRGB[2] <= 8.0f) ||
             !(lum > 0.9f && lum < 1.1f) || out.pedModeFile > 1) {
             err = "implausible pedestal colour words"; return false;
+        }
+    }
+    if (u[0] == FALD_MAGIC3) {                                                              // words 40/41: signal transfer + SDR gamma
+        out.hasTransfer = true;
+        out.transfer = u[40];
+        if (out.transfer == FALD_TRANSFER_GAMMA) {
+            out.sdrGamma = fl[41];
+            if (!(out.sdrGamma >= 1.0f && out.sdrGamma <= 4.0f)) { err = "implausible sdr_gamma word"; return false; }
+        } else if (out.transfer == FALD_TRANSFER_PQ) {
+            out.sdrGamma = 0.0f;                                                            // word 41 unused for PQ
+        } else {
+            err = "unknown transfer word (expected 0 = PQ or 1 = gamma)"; return false;
         }
     }
     if (out.cols == 0 || out.rows == 0 || out.sub == 0 || out.sub > 16 || out.cellW == 0 || out.cellH == 0 ||
@@ -102,9 +123,29 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
 bool FaldPanelFileHasPedColour(const std::wstring& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    uint32_t magic = 0;
-    f.read(reinterpret_cast<char*>(&magic), 4);
-    return f.gcount() == 4 && magic == FALD_MAGIC2;
+    uint32_t head[36] = {};
+    f.read(reinterpret_cast<char*>(head), sizeof(head));
+    if (f.gcount() < 4) return false;
+    if (head[0] == FALD_MAGIC2) return true;
+    if (head[0] == FALD_MAGIC3 && f.gcount() == (std::streamsize)sizeof(head))
+        return head[32] != 0 || head[33] != 0 || head[34] != 0 || head[35] != 0;
+    return false;
+}
+
+bool FaldPanelFileTransfer(const std::wstring& path, uint32_t& transfer) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint32_t head[41] = {};
+    f.read(reinterpret_cast<char*>(head), sizeof(head));
+    if (f.gcount() < 4) return false;
+    if (head[0] == FALD_MAGIC || head[0] == FALD_MAGIC2) { transfer = FALD_TRANSFER_PQ; return true; }
+    if (head[0] == FALD_MAGIC3 && f.gcount() == (std::streamsize)sizeof(head) &&
+        (head[40] == FALD_TRANSFER_PQ || head[40] == FALD_TRANSFER_GAMMA)) { transfer = head[40]; return true; }
+    return false;
+}
+
+bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr) {
+    return monitorHdr ? (transfer == FALD_TRANSFER_PQ) : (transfer == FALD_TRANSFER_GAMMA);
 }
 
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height) {
@@ -241,12 +282,19 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     ReleaseAll(r);
     r->paramsPath = path;
     r->width = ctx->width; r->height = ctx->height;
+    r->builtForHdr = ctx->isHDREnabled;
     r->fileSize = r->fileMtime = 0;
     FileStamp(path, r->fileSize, r->fileMtime);   // taken before the read: a write racing the load re-triggers a rebuild
     r->fileCheckCounter = 0;
     std::string err;
     if (!LoadFaldPanelParams(path, r->params, err)) { r->lastError = "params: " + err; return false; }
     const FaldPanelParams& p = r->params;
+    if (!FaldTransferMatchesMode(p.transfer, ctx->isHDREnabled)) {
+        // The fit's code domain is the panel's: a PQ (HDR) file cannot serve an ACM SDR desktop and vice versa.
+        r->lastError = std::string("panel file transfer is ") + (p.transfer == FALD_TRANSFER_GAMMA ? "gamma (SDR fit)" : "PQ (HDR fit)") +
+                       " but the monitor is in " + (ctx->isHDREnabled ? "HDR" : "SDR (ACM)") + " - use a file profiled in this mode";
+        return false;
+    }
     if (!FaldLatticeFits(p, ctx->width, ctx->height)) {
         r->lastError = "panel lattice (" + std::to_string(p.cols * p.cellW) + "x" + std::to_string(p.rows * p.cellH) +
                        ") does not fit the monitor (" + std::to_string(ctx->width) + "x" + std::to_string(ctx->height) + ")";
@@ -291,7 +339,9 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     r->lastError.clear();
     ComputeFlatResponse(r);
     std::cout << "[FALD] Monitor " << ctx->index << " resources ready: " << p.cols << "x" << p.rows << " cells of "
-              << p.cellW << "x" << p.cellH << " px, sub " << p.sub << ", white " << p.white << " nits, kernels "
+              << p.cellW << "x" << p.cellH << " px, sub " << p.sub << ", white " << p.white << " nits, transfer "
+              << (p.transfer == FALD_TRANSFER_GAMMA ? "gamma " + std::to_string(p.sdrGamma) : std::string("PQ"))
+              << " (" << (ctx->isHDREnabled ? "HDR" : "ACM SDR") << "), kernels "
               << (2 * p.reachTrueC + 1) << "x" << (2 * p.reachTrueR + 1) << " / " << (2 * p.reachEstC + 1) << "x" << (2 * p.reachEstR + 1) << std::endl;
     return true;
 }
@@ -302,7 +352,7 @@ bool FaldEnsureResources(MonitorContext* ctx, const FaldSettings& settings) {
     if (!ctx->fald) { ctx->fald = new FaldResources(); FaldTrace("EnsureResources: new FaldResources"); }
     FaldResources* r = ctx->fald;
     bool stale = r->paramsPath != paramsPath || r->width != ctx->width || r->height != ctx->height ||
-                 r->reloadSeq != settings.reloadSeq;
+                 r->reloadSeq != settings.reloadSeq || r->builtForHdr != ctx->isHDREnabled;
     if (r->valid && !stale && ++r->fileCheckCounter >= FALD_FILE_POLL_FRAMES) {
         // A panel file re-exported IN PLACE (same path) must not keep the old tables on the GPU
         // (HW 2026-09-13: neither a same-path set_fald_params nor an off/on toggle rebuilt).
@@ -351,6 +401,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     f[20] = p.gainMax; f[21] = p.driveFloor; f[22] = p.curveLogMin; f[23] = p.curveLogMax;
     u[24] = r->debugMode; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
     f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
+    u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
     // the panel file's leak colour (tmin * m_c; = tmin for FLD1) is always in the CB so the debug views can show the
     // toggle's influence; pedMode selects it in Correct() (1 only when the file has a colour, else it is a no-op)
@@ -361,6 +412,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     f[40] = p.chromaGain;
     f[41] = (p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo;
     f[42] = (p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi;
+    f[43] = p.sdrGamma;                                                             // panel EOTF exponent (transfer 1)
     g_context->Unmap(r->cb, 0);
 }
 
@@ -510,6 +562,8 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     std::ofstream meta(dir + L"fald_dump.txt");
     meta << "width " << r->width << "\nheight " << r->height << "\ncols " << p.cols << "\nrows " << p.rows
          << "\nsub " << p.sub << "\nframe_format " << (bpp == 8 ? "R16G16B16A16_FLOAT scRGB linear (1.0 = 80 nits)" : "R10G10B10A2_UNORM")
+         << "\nmode " << (r->builtForHdr ? "HDR" : "SDR_ACM")
+         << "\ntransfer " << (p.transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq") << "\nsdr_gamma " << p.sdrGamma << "\nwhite_nits " << p.white
          << "\nout_file " << (bpp == 8 ? "fald_out.rgba16f" : "fald_out.rgb10a2") << " (same format; the layer's OUTPUT, debug mode " << r->debugMode << ")"
          << "\nped_mode " << (((r->pedMode == 1) && p.hasPedColour) ? "channel" : "white")
          << "\nped_rgb " << p.pedRGB[0] << " " << p.pedRGB[1] << " " << p.pedRGB[2] << (p.hasPedColour ? " (FLD2)" : " (FLD1, white)")
@@ -536,8 +590,9 @@ static void DumpOutput(MonitorContext* ctx, FaldResources* r, ID3D11RenderTarget
 void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
     FaldResources* r = ctx ? ctx->fald : nullptr;
     if (!r || !r->valid || !finalRT) return;
-    r->debugMode = ctx->hdrColorCorrection.fald.debugMode;
-    r->pedMode = ctx->hdrColorCorrection.fald.pedMode;
+    const FaldSettings& fs = ctx->isHDREnabled ? ctx->hdrColorCorrection.fald : ctx->sdrColorCorrection.fald;
+    r->debugMode = fs.debugMode;
+    r->pedMode = fs.pedMode;
     // the main pass rendered into r->inter with finalRT unbound; make sure the RTV is off before
     // the intermediate is read as an SRV
     ID3D11RenderTargetView* nullRT = nullptr;

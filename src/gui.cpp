@@ -247,10 +247,39 @@ static bool BrowseForFaldPanelFile(HWND hwndParent, wchar_t* path, size_t pathSi
     return GetOpenFileName(&ofn) == TRUE;
 }
 
-// FALD layer setting changed for the current monitor: push to the render thread and persist.
-static void ApplyFaldSettingChange(bool enabledNow) {
+// The current monitor's FALD settings for one mode (HDR row / SDR (ACM) row of the Corrections tab).
+static FaldSettings& FaldSlot(bool isHDR) {
+    auto& ms = g_gui.monitorSettings[g_gui.currentMonitor];
+    return isHDR ? ms.hdrColorCorrection.fald : ms.sdrColorCorrection.fald;
+}
+
+// OS-truth mode of the current monitor (fresh DXGI query, the same source the capture path and
+// windows.query_monitors use); HDR when the query fails, so the HDR row's values are shown by default.
+static bool CurrentMonitorIsHDR() {
+    int monIdx = g_gui.currentMonitor;
+    if (monIdx >= 0 && monIdx < (int)g_gui.monitors.size() && g_gui.monitors[monIdx]) {
+        DXGI_OUTPUT_DESC1 desc;
+        if (QueryFreshOutputDesc(g_gui.monitors[monIdx], desc))
+            return desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    }
+    return true;
+}
+
+// A panel file's transfer (PQ = HDR fit, gamma = SDR fit) must match the row it is set on; the render
+// side refuses a mismatch, so say so up front. Returns true when the file is a readable panel file
+// whose transfer does NOT match (the status line carries the message).
+static bool WarnFaldTransferMismatch(const std::wstring& path, bool isHDR) {
+    uint32_t transfer = 0;
+    if (path.empty() || !FaldPanelFileTransfer(path, transfer) || FaldTransferMatchesMode(transfer, isHDR)) return false;
+    SetStatus(isHDR ? L"FALD: this panel file is an SDR (gamma) fit - the HDR row needs a PQ fit profiled in HDR"
+                    : L"FALD: this panel file is an HDR (PQ) fit - the SDR (ACM) row needs a gamma fit profiled in SDR");
+    return true;
+}
+
+// FALD layer setting changed for the current monitor (one mode): push to the render thread and persist.
+static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
     if (g_gui.isRunning) {
-        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
+        UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
         if (g_dwmHookMode.load())
             UpdateDwmHookSharedConfig();
         else
@@ -309,14 +338,21 @@ void UpdateColorCorrectionControls() {
         hdrCC.tonemap.dynamicPeak ? BST_CHECKED : BST_UNCHECKED, 0);
     EnableWindow(g_gui.hwndTonemapSource, !hdrCC.tonemap.dynamicPeak);
 
-    // FALD compensation (Experimental)
+    // FALD compensation (Experimental): HDR row + SDR (ACM) row; View / pedestal are mirrored in both modes
+    // (the GUI writes them to both, the pipe can set them per mode — show the mode the monitor is in).
+    const auto& sdrCC = settings.sdrColorCorrection;
     SendMessage(g_gui.hwndFaldEnable, BM_SETCHECK,
         hdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldPath, hdrCC.fald.paramsPath.c_str());
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(hdrCC.fald.debugMode <= 6 ? hdrCC.fald.debugMode : 0), 0);
-    SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, hdrCC.fald.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
-    // The layer runs in the overlay path only: in DWM hook mode the checkbox is inert, so grey it out.
+    SendMessage(g_gui.hwndFaldSdrEnable, BM_SETCHECK,
+        sdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowText(g_gui.hwndFaldSdrPath, sdrCC.fald.paramsPath.c_str());
+    const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 6 ? shown.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+    // The layer runs in the overlay path only: in DWM hook mode the checkboxes are inert, so grey them out.
     EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldSdrEnable, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldDebug, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldPedMode, !g_dwmHookMode.load());
 
@@ -1115,18 +1151,24 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // FALD compensation (Experimental, HDR, overlay path). Same propagation as tonemap.
+        // FALD compensation (Experimental, overlay path; HDR row and SDR (ACM) row). Same propagation as
+        // tonemap, per mode.
         case ID_CORR_FALD_ENABLE:
+        case ID_CORR_FALD_SDR_ENABLE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndFaldEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_ENABLE);
+                HWND box = isHDR ? g_gui.hwndFaldEnable : g_gui.hwndFaldSdrEnable;
+                bool enabled = (SendMessage(box, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                auto& fald = FaldSlot(isHDR);
                 if (enabled && fald.paramsPath.empty()) {
-                    SendMessage(g_gui.hwndFaldEnable, BM_SETCHECK, BST_UNCHECKED, 0);
-                    SetStatus(L"FALD compensation needs a panel parameter file (…)");
+                    SendMessage(box, BM_SETCHECK, BST_UNCHECKED, 0);
+                    SetStatus(isHDR ? L"FALD compensation (HDR) needs a panel parameter file (…)"
+                                    : L"FALD compensation (SDR) needs a panel parameter file profiled in SDR under ACM (…)");
                     return 0;
                 }
                 fald.enabled = enabled;
-                ApplyFaldSettingChange(enabled);
+                ApplyFaldSettingChange(enabled, isHDR);
+                if (enabled) WarnFaldTransferMismatch(fald.paramsPath, isHDR);
             }
             return 0;
 
@@ -1134,9 +1176,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
-                    auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
-                    fald.debugMode = (sel >= 0 && sel <= 6) ? (unsigned int)sel : 0u;
-                    ApplyFaldSettingChange(fald.enabled);
+                    unsigned int mode = (sel >= 0 && sel <= 6) ? (unsigned int)sel : 0u;
+                    FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
+                    FaldSlot(false).debugMode = mode;
+                    ApplyFaldSettingChange(FaldSlot(true).enabled, true);
+                    ApplyFaldSettingChange(FaldSlot(false).enabled, false);
                 }
             }
             return 0;
@@ -1145,45 +1189,52 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == BN_CLICKED) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     bool on = (SendMessage(g_gui.hwndFaldPedMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
-                    fald.pedMode = on ? 1u : 0u;
-                    ApplyFaldSettingChange(fald.enabled);
-                    if (on && !FaldPanelFileHasPedColour(fald.paramsPath))
-                        SetStatus(L"Per-channel pedestal: this panel file carries no leak colour (FLD1) - the toggle has no effect");
+                    FaldSlot(true).pedMode = on ? 1u : 0u;
+                    FaldSlot(false).pedMode = on ? 1u : 0u;
+                    ApplyFaldSettingChange(FaldSlot(true).enabled, true);
+                    ApplyFaldSettingChange(FaldSlot(false).enabled, false);
+                    const std::wstring& live = FaldSlot(CurrentMonitorIsHDR()).paramsPath;
+                    if (on && !FaldPanelFileHasPedColour(live))
+                        SetStatus(L"Per-channel pedestal: this panel file carries no leak colour - the toggle has no effect");
                 }
             }
             return 0;
 
         case ID_CORR_FALD_BROWSE:
+        case ID_CORR_FALD_SDR_BROWSE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_BROWSE);
                 wchar_t path[1024] = {};
                 if (BrowseForFaldPanelFile(hwnd, path, 1024)) {
                     bool enabledNow;
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
-                        auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                        auto& fald = FaldSlot(isHDR);
                         fald.paramsPath = path;
                         enabledNow = fald.enabled;
                     }
-                    SetWindowText(g_gui.hwndFaldPath, path);
-                    ApplyFaldSettingChange(enabledNow);
+                    SetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path);
+                    ApplyFaldSettingChange(enabledNow, isHDR);
+                    WarnFaldTransferMismatch(path, isHDR);
                 }
             }
             return 0;
 
         case ID_CORR_FALD_PATH:
+        case ID_CORR_FALD_SDR_PATH:
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_PATH);
                     wchar_t path[1024] = {};
-                    GetWindowText(g_gui.hwndFaldPath, path, 1024);
+                    GetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path, 1024);
                     bool changed = false, enabledNow = false;
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
-                        auto& fald = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.fald;
+                        auto& fald = FaldSlot(isHDR);
                         if (fald.paramsPath != path) { fald.paramsPath = path; changed = true; }
                         enabledNow = fald.enabled;
                     }
-                    if (changed) ApplyFaldSettingChange(enabledNow);
+                    if (changed) { ApplyFaldSettingChange(enabledNow, isHDR); WarnFaldTransferMismatch(path, isHDR); }
                 }
             }
             return 0;
@@ -2597,7 +2648,8 @@ int RunGUI() {
             settings.hdrColorCorrection.primariesEnabled ||
             settings.hdrColorCorrection.grayscale.enabled ||
             settings.hdrColorCorrection.tonemap.enabled ||
-            settings.hdrColorCorrection.fald.enabled) {
+            settings.hdrColorCorrection.fald.enabled ||
+            settings.sdrColorCorrection.fald.enabled) {
             hasAnyCorrection = true;
             break;
         }

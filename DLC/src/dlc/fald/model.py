@@ -29,6 +29,28 @@ from scipy.signal import fftconvolve
 
 from dlc._pq import eotf_norm, oetf_norm
 
+# The scRGB frame DesktopLUT's overlay sees (FP16 linear BT.709, 1.0 = 80 nits) is the same in HDR and in SDR
+# under Windows ACM; the CODE the panel receives differs. These are the HLSL PanelNits / PanelNitsToScRGB
+# constants (src/fald_shader.h) — keep them identical.
+BT709_TO_BT2020 = np.array([[0.6274040, 0.3292820, 0.0433136],
+                            [0.0690970, 0.9195400, 0.0113612],
+                            [0.0163916, 0.0880132, 0.8955950]])
+BT2020_TO_BT709 = np.array([[1.6604910, -0.5876411, -0.0728499],
+                            [-0.1245505, 1.1328999, -0.0083494],
+                            [-0.0181508, -0.1005789, 1.1187297]])
+
+
+def srgb_oetf(lin):
+    """IEC 61966-2-1 piecewise encode — Windows' scRGB -> 8/10-bit SDR composition encode under ACM (NOT a panel EOTF)."""
+    v = np.clip(np.asarray(lin, dtype=np.float64), 0.0, 1.0)
+    return np.where(v <= 0.0031308, 12.92 * v, 1.055 * np.power(v, 1.0 / 2.4) - 0.055)
+
+
+def srgb_eotf(code):
+    """Inverse of :func:`srgb_oetf` (the decode Windows applies to an 8-bit sRGB app surface under ACM)."""
+    v = np.clip(np.asarray(code, dtype=np.float64), 0.0, 1.0)
+    return np.where(v <= 0.04045, v / 12.92, np.power((v + 0.055) / 1.055, 2.4))
+
 Shape = tuple[tuple[int, int, int], tuple[float, float, float, float]]
 
 
@@ -173,6 +195,29 @@ class FaldParams:
             return np.vectorize(eotf_norm)(v) * 10000.0
         if self.transfer == "gamma":
             return self.white_nits * np.power(v, float(self.sdr_gamma))
+        raise ValueError(f"transfer must be 'pq' or 'gamma', got {self.transfer!r}")
+
+    def scrgb_to_nits(self, scrgb: np.ndarray) -> np.ndarray:
+        """As-if-white nits per channel from the FP16 scRGB frame the DesktopLUT overlay processes (channels on
+        the LAST axis). THE reference for the HLSL ``PanelNits`` (src/fald_shader.h): "pq" = the panel receives
+        the BT.2020 PQ code Windows composes, nits = max(rec2020, 0) x 80; "gamma" = the panel receives the sRGB
+        code Windows encodes (code = sRGB_OETF(scRGB), values outside 0..1 clipped like the composition does) and
+        shows white x code^sdr_gamma — i.e. :meth:`code_to_nits` of that code."""
+        lin = np.asarray(scrgb, dtype=np.float64)
+        if self.transfer == "pq":
+            return np.maximum(lin @ BT709_TO_BT2020.T, 0.0) * 80.0
+        if self.transfer == "gamma":
+            return self.white_nits * np.power(srgb_oetf(lin), float(self.sdr_gamma))
+        raise ValueError(f"transfer must be 'pq' or 'gamma', got {self.transfer!r}")
+
+    def nits_to_scrgb(self, nits: np.ndarray) -> np.ndarray:
+        """Inverse of :meth:`scrgb_to_nits` (the HLSL ``PanelNitsToScRGB``); "gamma" clips at the panel's white."""
+        n = np.asarray(nits, dtype=np.float64)
+        if self.transfer == "pq":
+            return (n / 80.0) @ BT2020_TO_BT709.T
+        if self.transfer == "gamma":
+            code = np.power(np.clip(n / self.white_nits, 0.0, 1.0), 1.0 / float(self.sdr_gamma))
+            return srgb_eotf(code)
         raise ValueError(f"transfer must be 'pq' or 'gamma', got {self.transfer!r}")
 
     def nits_to_code(self, nits: float) -> int:

@@ -31,9 +31,18 @@ FLD2 (magic 0x464C4432, written when the fit carries a pedestal colour, tmin_rgb
   word 37  f: chroma_lum_fade_lo  word 38  f: chroma_lum_fade_hi   (pixel-luminance fade of the COLOUR part only;
            both 0 with word 36 > 0 = NO fade; word 36 == 0 = follow lum_fade words 29/30)
   word 39  reserved (0)
+FLD3 (magic 0x464C4433, written when the fit's ``transfer`` is "gamma" — an SDR desktop profiled under Windows
+ACM): the 40 FLD2 words (words 32-39 all ZERO when the fit has no pedestal colour: the loader then keeps the
+FLD1 white pedestal), then 8 more (header = 48 words = 192 bytes):
+  word 40  transfer: 0 = PQ codes (HDR), 1 = gamma codes (SDR under ACM; the panel's own power-law EOTF)
+  word 41  f: sdr_gamma  (the exponent, transfer 1 only; the C++ loader refuses values outside 1..4)
+  words 42-47 reserved (0)
+A PQ fit stays FLD1/FLD2 byte for byte. An exe from before 2026-09-14 refuses the FLD3 magic — deliberately:
+it would decode an SDR fit's codes as PQ. The C++ side refuses a transfer/mode mismatch (a gamma file on an
+HDR monitor or the reverse) both at runtime.set_fald_params and when the GPU tables are built.
 The C++ reader is LoadFaldPanelParams (src/fald.cpp; tests/test_fald.cpp); words 26-30 are optional —
 zero means 'loader default' so older files stay loadable; an FLD1 file loads with m = (1, 1, 1).
-Keep the two in step when adding a word.
+Keep the two in step when adding a word (the work guide forbids a header word without a C++ test).
   then: curve[curve_n]                                  drive vs ln(nits), linear in ln(nits)
   then: k_true[sub][sub][2*reach_true_r+1][2*reach_true_c+1]   index order (oy, ox, j, i)
   then: k_est [sub][sub][2*reach_est_r+1][2*reach_est_c+1]
@@ -51,6 +60,8 @@ from .model import FaldModel, FaldParams
 
 MAGIC = 0x464C4431
 MAGIC2 = 0x464C4432          # 'FLD2': 40-word header (pedestal colour multipliers + validated mode)
+MAGIC3 = 0x464C4433          # 'FLD3': 48-word header (+ signal transfer words 40/41; every "gamma" fit)
+TRANSFER_CODES = {"pq": 0, "gamma": 1}
 PED_MODE_CODES = {"white": 0, "channel": 1}
 CURVE_N = 1024
 CURVE_LOG_MIN, CURVE_LOG_MAX = float(np.log(1e-2)), float(np.log(10000.0))
@@ -79,8 +90,13 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
     curve = drive_curve_lut(model)
     rt_r, rt_c = (kt.shape[2] - 1) // 2, (kt.shape[3] - 1) // 2
     re_r, re_c = (ke.shape[2] - 1) // 2, (ke.shape[3] - 1) // 2
+    if p.transfer not in TRANSFER_CODES:
+        raise ValueError(f"transfer must be 'pq' or 'gamma', got {p.transfer!r}")
     v2 = p.tmin_rgb is not None
-    header = [MAGIC2 if v2 else MAGIC, p.cols, p.rows, p.sub, int(round(p.cell_w)), int(round(p.cell_h)), 0, 0,
+    v3 = p.transfer == "gamma"                       # an SDR/ACM fit always carries its transfer (FLD3)
+    if v3 and not (1.0 <= float(p.sdr_gamma) <= 4.0):
+        raise ValueError(f"sdr_gamma {p.sdr_gamma!r} outside the loader's 1..4 gate")
+    header = [MAGIC3 if v3 else (MAGIC2 if v2 else MAGIC), p.cols, p.rows, p.sub, int(round(p.cell_w)), int(round(p.cell_h)), 0, 0,
               rt_c, rt_r, re_c, re_r, len(curve)]
     floats = [p.white_nits, p.tmin, p.stat_area0_px2, *p.chan_weights, gain_clip[0], gain_clip[1],
               p.drive_floor_nits, CURVE_LOG_MIN, CURVE_LOG_MAX, p.est_phase_px, p.est_phase_py]
@@ -93,11 +109,19 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
         buf += (struct.pack("<3f", *(float(x) for x in p.tmin_rgb)) + struct.pack("<I", PED_MODE_CODES[p.ped_mode])
                 + struct.pack("<3f", float(p.ped_chroma_gain) if custom else 0.0, float(clo), float(chi)) + struct.pack("<I", 0))
         assert len(buf) == 40 * 4
+    elif v3:
+        buf += struct.pack("<8I", *([0] * 8))          # no pedestal colour: words 32-39 zero (white pedestal, as FLD1)
+        assert len(buf) == 40 * 4
+    if v3:
+        buf += struct.pack("<I", TRANSFER_CODES[p.transfer]) + struct.pack("<f", float(p.sdr_gamma)) + struct.pack("<6I", *([0] * 6))
+        assert len(buf) == 48 * 4
     buf += curve.tobytes() + np.ascontiguousarray(kt).tobytes() + np.ascontiguousarray(ke).tobytes()
     Path(path).write_bytes(buf)
+    fmt = "FLD3" if v3 else ("FLD2" if v2 else "FLD1")
     return {"path": str(path), "bytes": len(buf), "k_true_shape": kt.shape, "k_est_shape": ke.shape,
             "curve_n": len(curve), "header_ints": header, "header_floats": floats,
-            "format": "FLD2" if v2 else "FLD1", "header_bytes": 160 if v2 else 128}
+            "format": fmt, "header_bytes": {"FLD1": 128, "FLD2": 160, "FLD3": 192}[fmt],
+            "transfer": p.transfer, "sdr_gamma": float(p.sdr_gamma) if v3 else None}
 
 
 def main(argv=None):

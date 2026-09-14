@@ -632,10 +632,13 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Normal mode: render directly to swapchain backbuffer
     ID3D11RenderTargetView* finalTarget = (useFrameBuffer) ? ctx->bufferRTV : ctx->rtv;
 
-    // FALD correction layer (HDR, overlay path only — in hook mode the hook owns the panel-bound
-    // frame): the main shader renders into the layer's intermediate, the layer's passes then write
-    // the corrected frame to the real target. Falls back to the plain path when resources fail.
-    bool faldOn = ctx->isHDREnabled && cc.fald.enabled && !g_dwmHookMode.load() &&
+    // FALD correction layer (overlay path only — in hook mode the hook owns the panel-bound frame):
+    // the main shader renders into the layer's intermediate, the layer's passes then write the
+    // corrected frame to the real target. Falls back to the plain path when resources fail.
+    // Runs in HDR and in SDR under Windows ACM (isFP16SDR: the duplicated frame is FP16 scRGB, the
+    // domain the shader decodes); a plain 8-bit SDR desktop never enables it. The panel file's
+    // transfer must match the mode (FaldEnsureResources refuses otherwise).
+    bool faldOn = (ctx->isHDREnabled || ctx->isFP16SDR) && cc.fald.enabled && !g_dwmHookMode.load() &&
                   FaldEnsureResources(ctx, cc.fald);
     ID3D11RenderTargetView* renderTarget = faldOn ? ctx->fald->interRTV : finalTarget;
 
@@ -1127,7 +1130,7 @@ void RenderAll(FramePacer* fp) {
         bool hasWB = cc2.primariesEnabled && !mhcP &&
             (cc2.whiteBalanceGains[0] != 1.0f || cc2.whiteBalanceGains[1] != 1.0f || cc2.whiteBalanceGains[2] != 1.0f);
         bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled && !g_dwmHookMode.load();
-        bool hasFald = ctx.isHDREnabled && cc2.fald.enabled && !cc2.fald.paramsPath.empty() &&
+        bool hasFald = (ctx.isHDREnabled || ctx.isFP16SDR) && cc2.fald.enabled && !cc2.fald.paramsPath.empty() &&
                        FaldShadersReady() && !g_dwmHookMode.load();   // never keep the overlay awake for a layer that cannot run
         bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;

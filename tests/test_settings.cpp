@@ -237,6 +237,37 @@ TEST_CASE("CC settings: HDR tonemap round-trip") {
     CHECK(loaded.tonemap.dynamicPeak == true);
 }
 
+TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)") {
+    for (const wchar_t* prefix : { L"SDR_", L"HDR_" }) {
+        TempIni ini;
+        ColorCorrectionSettings original;
+        original.fald.enabled = true;
+        original.fald.paramsPath = L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin";
+        original.fald.pedMode = 1;
+        original.fald.debugMode = 4;    // runtime only: must NOT persist
+        SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
+
+        ColorCorrectionSettings loaded;
+        LoadColorCorrectionSettings(L"TestMon", prefix, loaded, ini.c_str());
+        CHECK(loaded.fald.enabled == true);
+        CHECK(loaded.fald.paramsPath == L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin");
+        CHECK(loaded.fald.pedMode == 1u);
+        CHECK(loaded.fald.debugMode == 0u);
+    }
+    // the two modes are independent keys: an SDR save never touches the HDR slot
+    TempIni ini;
+    ColorCorrectionSettings sdr, hdr;
+    sdr.fald.enabled = true; sdr.fald.paramsPath = L"sdr.bin";
+    SaveColorCorrectionSettings(L"TestMon", L"SDR_", sdr, ini.c_str());
+    SaveColorCorrectionSettings(L"TestMon", L"HDR_", hdr, ini.c_str());
+    ColorCorrectionSettings loadedSdr, loadedHdr;
+    LoadColorCorrectionSettings(L"TestMon", L"SDR_", loadedSdr, ini.c_str());
+    LoadColorCorrectionSettings(L"TestMon", L"HDR_", loadedHdr, ini.c_str());
+    CHECK(loadedSdr.fald.enabled == true);
+    CHECK(loadedHdr.fald.enabled == false);
+    CHECK(loadedHdr.fald.paramsPath.empty());
+}
+
 TEST_CASE("CC settings: 24Gamma not persisted (moved to MHC)") {
     TempIni ini;
     ColorCorrectionSettings original;
