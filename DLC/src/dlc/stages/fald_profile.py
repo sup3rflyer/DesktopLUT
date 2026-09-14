@@ -56,8 +56,8 @@ def _check_in(events: EventWriter, **data: Any) -> None:
 
 def _anomaly(events: EventWriter, **data: Any) -> None:
     events.write("WARN", STAGE, "anomaly", tier="digest", **data)
-PHASES = ("preflight", "aid", "register", "grid", "drive", "leak", "rings", "fit", "heldout", "export", "verify", "restore")
-MEASURE_PHASES = ("register", "grid", "drive", "leak", "rings", "heldout", "verify")
+PHASES = ("preflight", "aid", "register", "grid", "drive", "leak", "rings", "augment", "fit", "heldout", "export", "verify", "restore")
+MEASURE_PHASES = ("register", "grid", "drive", "leak", "rings", "augment", "heldout", "verify")
 CHECKIN_EVERY_S = 180.0                 # wall-clock check-in cadence inside a measuring phase
 CHECKIN_FRACTIONS = (0.25, 0.5, 0.75)   # plus progress check-ins (short phases never go dark)
 FLOOR_SNR = 3.0
@@ -192,12 +192,19 @@ def _open_session(args, ctx: RunContext, st: dict[str, Any], *, need_meter: bool
     return Session(args, ctx, st, controller, read, events, close, False, presenter)
 
 
-def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *, extra_per_read=None) -> dict:
-    """Present + read every pattern; write the phase file (patterns + reads) incrementally; emit
-    check-in evidence packets on cadence; honour cancel. Returns name → Read."""
+def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *, extra_per_read=None,
+                  states: tuple = (None,), set_state: Optional[Callable[[Any], None]] = None) -> dict:
+    """Present + read every pattern; write the phase file (patterns + reads + the sensor position they were read at)
+    incrementally; emit check-in evidence packets on cadence; honour cancel. Returns name → Read.
+
+    ``states`` (e.g. ("off", "id")) reads every pattern once per state, INTERLEAVED (``set_state(state)`` before each
+    read, so drift cancels between them); the first state's reads go to ``<phase>.json``, the others to
+    ``<phase>_<state>.json``, and the return value is then {state: {name: Read}}."""
     from ..fald.profile import Read
-    reads: dict[str, Read] = {}
-    path = _phase_file(s.ctx, phase)
+    by_state: dict[Any, dict[str, Read]] = {st: {} for st in states}
+    reads = by_state[states[0]]
+    paths = {st: _phase_file(s.ctx, phase if k == 0 else f"{phase}_{st}") for k, st in enumerate(states)}
+    meter = list(s.st["fald"]["geometry"]["meter"])
     t0 = time.time()
     last_ci = t0
     n = len(patterns)
@@ -207,9 +214,11 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
     dark_prev = False
 
     def flush(complete: bool = False):
-        atomic_write_text(path, json.dumps({"phase": phase, "complete": complete, "patterns": [p.as_dict() for p in patterns],
-                                            "reads": [r.as_dict() for r in reads.values()], "elapsed_s": round(time.time() - t0, 1)},
-                                           indent=1))
+        for st in states:
+            atomic_write_text(paths[st], json.dumps({"phase": phase, "state": st, "complete": complete, "meter": meter,
+                                                     "patterns": [p.as_dict() for p in patterns],
+                                                     "reads": [r.as_dict() for r in by_state[st].values()],
+                                                     "elapsed_s": round(time.time() - t0, 1)}, indent=1))
 
     def checkin(trigger: str, i: int):
         nonlocal seq, last_ci
@@ -225,26 +234,31 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
         if _cancel_requested(s.ctx):
             result.fail("cancelled", f"control.json cancel honoured after {len(reads)} reads")
             flush()
-            return reads
+            return by_state if len(states) > 1 else reads
         settle_bump = 2.0 if (p.field == (0, 0, 0) and not dark_prev) else 0.0   # zone decay after bright content
         dark_prev = p.field == (0, 0, 0)
-        label = p.name
-        xyz, dt, err = s.read(label, p.shapes, p.field, settle_bump)
-        if xyz is None:
-            xyz, dt, err = s.read(label, p.shapes, p.field, settle_bump)         # one retry
-        rd = Read(p.name, xyz, round(dt + settle_bump, 2), err)
-        reads[p.name] = rd
-        if xyz is None:
-            warnings.append({"kind": "no_read", "name": p.name, "error": err})
-            _anomaly(s.events, phase=phase, kind="no_read", name=p.name, error=err)
-        elif p.kind == "aux" and p.name.endswith("_end") and p.name[:-4] in reads and reads[p.name[:-4]].y:
-            a, b = reads[p.name[:-4]].y, rd.y
-            if a and b and a > 0.05 and abs(b / a - 1.0) > 0.03:        # floor-level references (black) are noise
-                warnings.append({"kind": "drift", "name": p.name, "start": a, "end": b, "frac": b / a - 1.0})
-                _anomaly(s.events, phase=phase, kind="reference_drift", name=p.name, start=a, end=b)
-        if extra_per_read:
-            extra_per_read(p, rd)
-        print(f"   {p.name:<26} Y={rd.y if rd.y is not None else float('nan'):10.4f} nits  [{dt:4.1f}s] {p.note}", file=sys.stderr, flush=True)
+        for k, st in enumerate(states):
+            if set_state is not None:
+                set_state(st)
+            label = p.name if st is None else f"{p.name} [{st}]"
+            bump = settle_bump if k == 0 else 0.0
+            xyz, dt, err = s.read(label, p.shapes, p.field, bump)
+            if xyz is None:
+                xyz, dt, err = s.read(label, p.shapes, p.field, bump)             # one retry
+            rd = Read(p.name, xyz, round(dt + bump, 2), err)
+            sr = by_state[st]
+            sr[p.name] = rd
+            if xyz is None:
+                warnings.append({"kind": "no_read", "name": label, "error": err})
+                _anomaly(s.events, phase=phase, kind="no_read", name=label, error=err)
+            elif p.kind == "aux" and p.name.endswith("_end") and p.name[:-4] in sr and sr[p.name[:-4]].y:
+                a, b = sr[p.name[:-4]].y, rd.y
+                if a and b and a > 0.05 and abs(b / a - 1.0) > 0.03:        # floor-level references (black) are noise
+                    warnings.append({"kind": "drift", "name": label, "start": a, "end": b, "frac": b / a - 1.0})
+                    _anomaly(s.events, phase=phase, kind="reference_drift", name=label, start=a, end=b)
+            if extra_per_read:
+                extra_per_read(p, rd)
+            print(f"   {label:<30} Y={rd.y if rd.y is not None else float('nan'):10.4f} nits  [{dt:4.1f}s] {p.note}", file=sys.stderr, flush=True)
         if i % 5 == 4 or i == n - 1:
             flush()
         frac = (i + 1) / n
@@ -256,10 +270,11 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
             checkin("timed", i)
     flush(complete=True)
     result.raw["warnings"] = warnings
-    result.metrics["reads"] = len(reads)
+    result.metrics["reads"] = sum(len(v) for v in by_state.values())
     result.metrics["elapsed_s"] = round(time.time() - t0, 1)
-    result.add_artifact(path)
-    return reads
+    for st in states:
+        result.add_artifact(paths[st])
+    return by_state if len(states) > 1 else reads
 
 
 # ----------------------------------------------------------------------------- phases
@@ -293,24 +308,36 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
     acm = acm_off_anomaly(mode, mon) if not args.simulate else None
     if acm:
         result.anomaly(*acm)
-    # zones + physical size
-    try:
-        cols, rows = (int(v) for v in str(args.zones).lower().split("x"))
-    except ValueError:
-        result.block("zones_arg", "--zones must be COLSxROWS (e.g. 48x48 for the PA32UCXR's 2304 zones)")
-        return
-    if args.px_mm:
-        px_mm = float(args.px_mm)
-    elif args.diagonal_in:
-        px_mm = float(args.diagonal_in) * 25.4 / math.hypot(width, height)
+    # zones + physical size — or, re-entering an existing run (augment / re-verify), the MEASURED geometry as it is
+    # (white, SDR gamma, bit depth, sensor position): re-deriving it from the CLI would drop the measurements
+    if getattr(args, "keep_geometry", False) and st["fald"].get("geometry"):
+        g = _geometry(st)
+        if (g.width, g.height) != (width, height):
+            result.block("geometry_changed", f"the run was profiled at {g.width}x{g.height}; monitor {args.monitor} is now {width}x{height}")
+            return
+        cols, rows, px_mm, meter, bit_depth = g.cols, g.rows, g.px_mm, g.meter, g.bit_depth
+        if str(g.transfer) != ("pq" if mode == "HDR" else "gamma"):
+            result.block("mode_mismatch", f"the run was profiled with transfer {g.transfer}; this is {mode}")
+            return
+        result.action("kept the run's measured geometry (--keep-geometry)")
     else:
-        result.block("size_arg", "give --diagonal-in (panel diagonal, inches) or --px-mm")
-        return
-    meter = tuple(int(v) for v in str(args.meter or f"{width // 2 - 30},{height // 2 + 30}").split(","))
-    bit_depth = int(args.bit_depth or (10 if mode == "HDR" else 8))
-    g = PanelGeometry(width=width, height=height, cols=cols, rows=rows, px_mm=px_mm, meter=meter,
-                      transfer="pq" if mode == "HDR" else "gamma", bit_depth=bit_depth,
-                      white_nits=float(args.white_nits or (1000.0 if mode == "HDR" else 120.0)))
+        try:
+            cols, rows = (int(v) for v in str(args.zones).lower().split("x"))
+        except ValueError:
+            result.block("zones_arg", "--zones must be COLSxROWS (e.g. 48x48 for the PA32UCXR's 2304 zones)")
+            return
+        if args.px_mm:
+            px_mm = float(args.px_mm)
+        elif args.diagonal_in:
+            px_mm = float(args.diagonal_in) * 25.4 / math.hypot(width, height)
+        else:
+            result.block("size_arg", "give --diagonal-in (panel diagonal, inches) or --px-mm")
+            return
+        meter = tuple(int(v) for v in str(args.meter or f"{width // 2 - 30},{height // 2 + 30}").split(","))
+        bit_depth = int(args.bit_depth or (10 if mode == "HDR" else 8))
+        g = PanelGeometry(width=width, height=height, cols=cols, rows=rows, px_mm=px_mm, meter=meter,
+                          transfer="pq" if mode == "HDR" else "gamma", bit_depth=bit_depth,
+                          white_nits=float(args.white_nits or (1000.0 if mode == "HDR" else 120.0)))
     st["fald"]["geometry"] = g.as_dict()
     st["fald"]["mode"] = mode
     st["fald"]["monitor"] = args.monitor
@@ -554,20 +581,32 @@ def phase_rings(s: Session, result: StageResult) -> None:
 
 
 def _collect_items(s: Session):
-    from ..fald.profile import build_items
+    """Fit items from every measured phase file, each built at the sensor position ITS reads were taken at (a file
+    stamps ``meter``; files from before the stamp use ``legacy_meter`` or the geometry's). ``--augment-regime id``
+    takes the augment patterns read through the awake overlay in identity instead of with the layer off."""
+    from ..fald.profile import build_items, choose_scale, weight_items
     g = _geometry(s.st)
-    pats, reads = [], {}
-    incomplete = []
-    for phase in ("register", "drive", "leak", "rings", "heldout"):
-        f = _phase_file(s.ctx, phase)
-        if f.exists():
-            if not json.loads(f.read_text(encoding="utf-8")).get("complete", True):
-                incomplete.append(phase)
-            pats += _patterns_from_file(f)
-            reads.update(_reads_from_file(f))
-    s.st["fald"]["_incomplete_phases"] = incomplete
+    _, cw, ch = choose_scale(g.width, g.height, g.cols, g.rows)
+    legacy = tuple(s.st["fald"].get("legacy_meter") or g.meter)
+    regime = getattr(s.args, "augment_regime", "off") or "off"
+    pats, reads, items = [], {}, []
+    incomplete, meters = [], {}
     floor = float(s.st["fald"].get("floor_nits") or 0.004)
-    return g, pats, reads, build_items(pats, reads, g.canvas_meter(), floor_nits=FLOOR_SNR * max(floor, 0.004))
+    for phase in ("drive", "leak", "rings", "augment", "heldout"):
+        f = _phase_file(s.ctx, "augment_id" if (phase == "augment" and regime == "id") else phase)
+        if not f.exists():
+            continue
+        raw = json.loads(f.read_text(encoding="utf-8"))
+        if not raw.get("complete", True):
+            incomplete.append(f.stem)
+        m = tuple(raw.get("meter") or legacy)
+        meters[f.stem] = list(m)
+        fp, fr = _patterns_from_file(f), _reads_from_file(f)
+        pats += fp; reads.update(fr)
+        items += build_items(fp, fr, (m[0] * cw / g.width, m[1] * ch / g.height), floor_nits=FLOOR_SNR * max(floor, 0.004), weight=False)
+    s.st["fald"]["_incomplete_phases"] = incomplete
+    s.st["fald"]["_item_meters"] = meters
+    return g, pats, reads, weight_items(items)
 
 
 def phase_fit(s: Session, result: StageResult) -> None:
@@ -576,6 +615,8 @@ def phase_fit(s: Session, result: StageResult) -> None:
     if not any(i["group"] == "rings" for i in items):
         result.block("no_rings_data", "run the rings phase first")
         return
+    result.metrics["item_meters"] = s.st["fald"].pop("_item_meters", {})
+    result.metrics["augment_regime"] = getattr(s.args, "augment_regime", "off")
     for ph in s.st["fald"].pop("_incomplete_phases", []):
         result.anomaly("partial_data", f"phase file {ph}.json is INCOMPLETE (cancelled or crashed mid-phase) — the fit uses "
                        "what is there; re-run that phase for a shippable fit", "medium")
@@ -588,6 +629,8 @@ def phase_fit(s: Session, result: StageResult) -> None:
     res = run_fit(base, items, quick=quick, knots=s.args.knots, fit_drive_k=not dc, log=log)
     fit_path = _out_dir(s.ctx) / "fald_fit_result.json"
     payload = {"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": res["knots"], "params": res["params"],
+               "drive_floor": res.get("drive_floor"), "by_level": res.get("by_level"),
+               "augment_regime": getattr(s.args, "augment_regime", "off"),
                "heldout": {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in res["heldout"].items()},
                "geometry": s.st["fald"]["geometry"], "mode": s.st["fald"].get("mode"), "n_items": res["n_items"],
                "elapsed_s": res["elapsed_s"], "quick": quick}
@@ -596,7 +639,8 @@ def phase_fit(s: Session, result: StageResult) -> None:
     summary = {k: {kk: round(vv, 3) if isinstance(vv, float) else vv for kk, vv in v.items() if kk != "rows"} for k, v in res["heldout"].items()}
     result.metrics.update({"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": {k: v for k, v in (res["knots"] or {}).items() if k != "heldout"},
                            "heldout": summary, "in_sample": {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in {**res.get("stage_a_report", {}), **res.get("stage_b_report", {})}.items()},
-                           "n_items": res["n_items"], "area0_source": res.get("area0_source"), "elapsed_s": round(time.time() - t0, 1)})
+                           "n_items": res["n_items"], "area0_source": res.get("area0_source"), "drive_floor": res.get("drive_floor"),
+                           "by_level": res.get("by_level"), "elapsed_s": round(time.time() - t0, 1)})
     s.st["fald"]["fit_path"] = str(fit_path)
     s.st["fald"]["phases"]["fit"] = {"status": "done", "at": time.time()}
     worst = max((v["mean_abs"] for v in res["heldout"].values() if v.get("mean_abs") is not None), default=None)
@@ -643,6 +687,16 @@ def phase_export(s: Session, result: StageResult) -> None:
         return
     fit = json.loads(Path(fit_path).read_text(encoding="utf-8"))
     params = params_from_dict(fit["params"])
+    if getattr(s.args, "lum_fade", None):
+        from dataclasses import replace as _replace
+        lo, hi = (float(v) for v in str(s.args.lum_fade).split(","))
+        if not (0.0 <= lo < hi):
+            result.block("lum_fade_arg", "--lum-fade LO,HI needs 0 <= LO < HI (as-if-white nits of the pixel's own level)")
+            return
+        params = _replace(params, lum_fade_lo=lo, lum_fade_hi=hi)
+        fit["params"]["lum_fade_lo"], fit["params"]["lum_fade_hi"] = lo, hi
+        fit["lum_fade_chosen"] = {"lo": lo, "hi": hi, "by": "LLM seam from the fit's by_level report"}
+        result.action(f"pixel-luminance fade set to {lo:g}..{hi:g} nits")
     short = s.args.name or "panel"
     mode = str(s.st["fald"].get("mode") or "HDR").lower()
     out_dir = Path(s.args.out) if s.args.out else (Path("results") / f"fald_profile_{short}_{mode}_{time.strftime('%Y-%m-%d')}")
@@ -656,12 +710,90 @@ def phase_export(s: Session, result: StageResult) -> None:
     result.metrics.update({"bin": str(bin_path), "fit_json": str(json_path), "format": info["format"], "bytes": info["bytes"],
                            "transfer": params.transfer, "white_nits": params.white_nits})
     s.st["fald"]["bin_path"] = str(bin_path)
+    s.st["fald"]["export_fit_json"] = str(Path(json_path).resolve())
     s.st["fald"]["phases"]["export"] = {"status": "done", "at": time.time()}
     if params.transfer != "pq":
         result.note("SDR (gamma) panel file, FLD3: applies on the DesktopLUT SDR (ACM) FALD row (builds from 2026-09-14, "
                     "work guide P7); older builds refuse the FLD3 magic, and any build refuses it on an HDR monitor")
     result.advice = {"default_policy_verdict": "proceed_to_verify",
                      "reasons": [f"{info['format']} written ({info['bytes']} bytes); verify reads OFF / identity / ON on this unit"]}
+
+
+def phase_augment(s: Session, result: StageResult) -> None:
+    """Near-field + dim-end patterns (profile.plan_augment), each read with the layer OFF and in IDENTITY (the layer on,
+    debug 4 — the awake overlay without the correction), interleaved. SDR 2026-09-14: the verify data showed ring
+    ratios differing between OFF and identity by up to 2.6 pp at 5 nits (HDR: none) — the regime the layer runs in
+    is identity, so the fit must be able to use it. Without an exported panel file only OFF is read."""
+    from ..fald.profile import plan_augment, ref_means
+    g = _geometry(s.st)
+    mode = str(s.st["fald"].get("mode") or "HDR")
+    mon = s.args.monitor
+    ctl = s.controller
+    bin_path = s.st["fald"].get("bin_path")
+    states: tuple = ("off",)
+    if bin_path:
+        try:
+            ctl.call("runtime.set_fald_params", {"monitor": mon, "mode": mode, "params_path": bin_path})
+            states = ("off", "id")
+        except Exception as exc:  # noqa: BLE001
+            result.anomaly("identity_unavailable", f"runtime.set_fald_params refused ({exc}) — reading layer-OFF only", "medium")
+    else:
+        result.note("no exported panel file yet: identity (awake overlay) reads skipped")
+
+    def set_state(state):
+        if state == "id":
+            ctl.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "debug_mode": 4})
+            ctl.set_layers(mon, mode, fald=True)
+        else:
+            ctl.set_layers(mon, mode, fald=False)
+        if not s.simulated:
+            time.sleep(0.6)
+
+    pats = plan_augment(g)
+    try:
+        out = _run_patterns(s, "augment", pats, result, states=states, set_state=set_state if len(states) > 1 else None)
+    finally:
+        if len(states) > 1:
+            try:
+                ctl.set_layers(mon, mode, fald=False)
+            except Exception as exc:  # noqa: BLE001
+                result.anomaly("fald_left_on", f"layers.set fald=false failed: {exc} — switch the FALD layer off by hand", "high")
+            try:
+                ctl.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "debug_mode": 0})
+            except Exception:  # noqa: BLE001
+                pass
+    if result.status != "ran":
+        return
+    by_state = out if len(states) > 1 else {"off": out}
+    refs = {st: ref_means(pats, rd) for st, rd in by_state.items()}
+    groups: dict[str, dict[str, list]] = {}
+    for p in pats:
+        if p.kind != "ratio":
+            continue
+        row = {}
+        for st, rd in by_state.items():
+            r, ref = rd.get(p.name), refs[st].get(p.ref or "")
+            if r is not None and r.y is not None and ref:
+                row[st] = 100.0 * (r.y / ref - 1.0)
+        groups.setdefault(p.group, {}).setdefault("rows", []).append({"name": p.name, **{k: round(v, 2) for k, v in row.items()}})
+    summary = {}
+    for grp, gd in groups.items():
+        rows = gd["rows"]
+        off = [r["off"] for r in rows if "off" in r]
+        entry = {"n": len(rows), "mean_abs_ring_off_pp": round(float(sum(abs(v) for v in off) / len(off)), 2) if off else None}
+        diffs = [r["id"] - r["off"] for r in rows if "id" in r and "off" in r]
+        if diffs:
+            entry["mean_id_minus_off_pp"] = round(sum(diffs) / len(diffs), 2)
+            entry["max_abs_id_minus_off_pp"] = round(max(abs(d) for d in diffs), 2)
+        summary[grp] = entry
+    result.metrics["groups"] = summary
+    result.raw["rows"] = {grp: gd["rows"] for grp, gd in groups.items()}
+    result.metrics["states"] = list(states)
+    s.st["fald"]["phases"]["augment"] = {"status": "done", "at": time.time(), "states": list(states)}
+    result.advice = {"default_policy_verdict": "judge_regime_then_fit",
+                     "reasons": ["compare ring ratios OFF vs identity per group: if identity differs materially, refit with "
+                                 "--augment-regime id (the layer runs on the awake overlay)",
+                                 "then `fit` (the by_level report is the evidence for --lum-fade at export)"]}
 
 
 def acm_off_anomaly(mode: str, mon: dict[str, Any]) -> Optional[tuple[str, str, str]]:
@@ -685,7 +817,7 @@ def acm_off_anomaly(mode: str, mon: dict[str, Any]) -> Optional[tuple[str, str, 
 def phase_verify(s: Session, result: StageResult) -> None:
     from ..fald.correct import correct_image
     from ..fald.model import FaldModel
-    from ..fald.profile import params_from_dict, plan_verify, ref_means
+    from ..fald.profile import params_from_dict, plan_verify, plan_verify_extended, ref_means
     g = _geometry(s.st)
     mode = str(s.st["fald"].get("mode") or "HDR")
     # --bin / --fit-json: read the SAME verify patterns through another panel file (e.g. the research file) for an
@@ -695,7 +827,8 @@ def phase_verify(s: Session, result: StageResult) -> None:
     if not bin_path:
         result.block("no_bin", "run the export phase first")
         return
-    fit_src = getattr(s.args, "fit_json", None) or (None if alt_bin else s.st["fald"].get("fit_path"))
+    # the exported copy of the fit carries the fade chosen at export (--lum-fade); the model columns must use it
+    fit_src = getattr(s.args, "fit_json", None) or (None if alt_bin else (s.st["fald"].get("export_fit_json") or s.st["fald"].get("fit_path")))
     if not fit_src:
         result.block("no_fit_json", "--bin needs --fit-json (the fit result that file was exported from) for the model columns")
         return
@@ -719,7 +852,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
         if not s.simulated:
             time.sleep(0.6)
 
-    pats = plan_verify(g)
+    pats = plan_verify_extended(g) if getattr(s.args, "extended", False) else plan_verify(g)
     rows = []
     try:
         for i, p in enumerate(pats):
@@ -761,7 +894,8 @@ def phase_verify(s: Session, result: StageResult) -> None:
         card.append({"name": r["name"], "off_vs_flat": r["off"] / f["off"] - 1.0, "id_vs_flat": r["id"] / f["id"] - 1.0,
                      "on_vs_flat": r["on"] / f["on"] - 1.0, "model_off": r["pred_off"] / f["pred_off"] - 1.0,
                      "model_on": r["pred_on"] / f["pred_on"] - 1.0})
-    vpath = _out_dir(s.ctx) / ("verify.json" if not alt_bin else f"verify_{Path(bin_path).stem}.json")
+    tag = ("_ext" if getattr(s.args, "extended", False) else "")
+    vpath = _out_dir(s.ctx) / (f"verify{tag}.json" if not alt_bin else f"verify{tag}_{Path(bin_path).stem}.json")
     atomic_write_text(vpath, json.dumps({"rows": rows, "scorecard": card}, indent=1, default=float))
     result.add_artifact(vpath)
     result.metrics["scorecard"] = card
@@ -815,6 +949,7 @@ def build(args, ctx: RunContext) -> StageResult:
         return result
     try:
         fn = {"register": phase_register, "grid": phase_grid, "drive": phase_drive, "leak": phase_leak, "rings": phase_rings,
+              "augment": phase_augment,
               "fit": phase_fit, "heldout": phase_heldout, "export": phase_export, "verify": phase_verify, "restore": phase_restore}[phase]
         fn(s, result)
     except Exception as exc:  # noqa: BLE001
@@ -843,6 +978,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="fit: print every iteration")
     parser.add_argument("--name", default=None, help="export: panel short name for the file names")
     parser.add_argument("--out", default=None, help="export: output directory (default results/fald_profile_<name>_<mode>_<date>)")
+    parser.add_argument("--keep-geometry", action="store_true", dest="keep_geometry",
+                        help="preflight on an existing run: keep its measured geometry (white, gamma, sensor) — for augment / re-verify")
+    parser.add_argument("--augment-regime", default="off", choices=("off", "id"), dest="augment_regime",
+                        help="fit: use the augment patterns read layer-OFF (default) or through the awake overlay in identity")
+    parser.add_argument("--lum-fade", default=None, dest="lum_fade",
+                        help="export: pixel-luminance fade LO,HI in as-if-white nits (chosen from the fit's by_level report)")
+    parser.add_argument("--extended", action="store_true", help="verify: add 1-nit rings, thin bars and steep ramps to the set")
     parser.add_argument("--bin", default=None, help="verify: read through THIS panel file instead of the exported one (A/B)")
     parser.add_argument("--fit-json", default=None, dest="fit_json", help="verify with --bin: that file's fit result JSON (model columns)")
     args = parser.parse_args(argv)

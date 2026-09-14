@@ -498,6 +498,92 @@ def plan_verify(g: PanelGeometry, levels: Sequence[float] = (5.0, 20.0)) -> list
     return pats
 
 
+def plan_verify_extended(g: PanelGeometry) -> list[Pattern]:
+    """The standard verify set + the regimes the augment phase targets: 1-nit rings (dark-theme greys, inside the old
+    fade), thin white bars at 120 px on 2 / 5 nits (the text halo), and the steep downward ramps through the sensor.
+    Same OFF / identity / ON protocol; every ratio has its own flat in the set."""
+    pats = plan_verify(g)
+    aug = {p.name: p for p in plan_augment.__wrapped__(g)}
+    keep = ["LOW1:ref", "LOW1:L120", "LOW1:R120", "BAR2:ref", "BAR2:L120", "BAR5:ref", "BAR5:L120", "RAMP:ref", "RAMP:hdown", "RAMP:vdown"]
+    for name in keep:
+        a = aug[name]
+        pats.append(Pattern("VX:" + a.name, "verify", a.shapes, a.field, a.kind, ("VX:" + a.ref) if a.ref else None, a.note, dict(a.meta)))
+    return _drop_offpanel(pats)
+
+
+LOW_GREYS = (0.5, 1.0, 2.0)          # nits: the dim end (dark-theme UI greys) — sets the drive floor + the fade
+HALO_GREYS = (2.0, 5.0, 20.0)
+HALO_GAPS = (120, 240, 480)
+RAMP_STRIP_PX = 8
+
+
+def plan_augment(g: PanelGeometry) -> list[Pattern]:
+    """The near-field regime the short pass missed (HDR 2026-09-14: the short-pass model got a thin 40x600 bar at
+    120 px wrong by 7 pp) and the dim end the fade has to be chosen from:
+
+    * low-grey rings at 0.5 / 1 / 2 nits (L/R 120 + 240 fitted, D/U held out) — the drive floor + dim drive curve;
+    * thin bright bars (40 x 600 px, full white) LEFT of the sensor at 120 / 240 / 480 px on 2 / 5 / 20-nit greys
+      (fitted) + a RIGHT bar at 120 px on 5 / 20 nits (held out) — the text / UI-edge halo;
+    * steep ramps through the sensor (lo 2 nits -> hi 0.45 x white over 320 px, 8-px strips), horizontal and
+      vertical, both directions, ratio to a flat at the ramp's value at the sensor — the gradient regime.
+    Every ratio's model baseline is its reference field (``meta.base_code`` for the ramps, whose background is not
+    the reference)."""
+    W = g.white
+    size = 200
+    mx, my = g.meter
+    pats: list[Pattern] = []
+    for nits in LOW_GREYS:
+        fc = g.grey(nits); bg = _bg(fc); ref = f"LOW{nits:g}:ref"
+        pats.append(Pattern(ref, "rings@low", [bg], fc, "aux", note="field alone", meta={"nits": nits}))
+        gv = max(240, g.min_gap_v)
+        for side, gap, grp in (("L", 120, "rings@low"), ("R", 120, "rings@low"), ("L", 240, "rings@low"),
+                               ("R", 240, "rings@low"), ("D", gv, "rings@lowheld"), ("U", gv, "rings@lowheld")):
+            if gap < (g.min_gap_h if side in "LR" else g.min_gap_v):
+                continue
+            pats.append(Pattern(f"LOW{nits:g}:{side}{gap}", grp, [bg, (W, g.window(gap, size, side))], fc, "ratio", ref,
+                                note=f"{nits:g}-nit grey, window {side} {gap}", meta={"side": side, "gap": gap, "nits": nits}))
+        pats.append(Pattern(ref + "_end", "rings@low", [bg], fc, "aux", note="drift", meta={"nits": nits}))
+    for nits in HALO_GREYS:
+        fc = g.grey(nits); bg = _bg(fc); ref = f"BAR{nits:g}:ref"
+        pats.append(Pattern(ref, "halo", [bg], fc, "aux", note="field alone", meta={"nits": nits}))
+        for gap in HALO_GAPS:
+            if gap < g.min_gap_h:
+                continue
+            pats.append(Pattern(f"BAR{nits:g}:L{gap}", "halo", [bg, (W, g.rect(mx - gap - 40, my - 300, 40, 600))], fc, "ratio", ref,
+                                note=f"40x600 white bar, near edge {gap} px left", meta={"side": "L", "gap": gap, "nits": nits}))
+        if nits >= 5.0:
+            pats.append(Pattern(f"BAR{nits:g}:R120", "halo@held", [bg, (W, g.rect(mx + max(120, g.min_gap_h), my - 300, 40, 600))], fc,
+                                "ratio", ref, note="40x600 white bar, near edge 120 px right", meta={"side": "R", "gap": 120, "nits": nits}))
+        pats.append(Pattern(ref + "_end", "halo", [bg], fc, "aux", note="drift", meta={"nits": nits}))
+    lo, hi, span = 2.0, 0.45 * g.white_nits, 320
+    mid = 0.5 * (lo + hi)
+    mc = g.code(mid)
+    ref = "RAMP:ref"
+    pats.append(Pattern(ref, "ramp", [_bg((mc, mc, mc))], (mc, mc, mc), "aux", note=f"flat at the ramp's value at the sensor ({mid:.1f} nits)",
+                        meta={"nits": mid}))
+    n = span // RAMP_STRIP_PX
+    for axis in ("h", "v"):
+        for direction in ("up", "down"):
+            lo_c, hi_c = (g.grey(lo), W if False else g.grey(hi))
+            first, last = (lo, hi) if direction == "up" else (hi, lo)
+            shapes = [_bg(g.grey(first))]
+            if axis == "h":
+                shapes.append((g.grey(last), g.rect(mx + span / 2, 0, g.width, g.height)))
+            else:
+                shapes.append((g.grey(last), g.rect(0, my + span / 2, g.width, g.height)))
+            for i in range(n):
+                v = first + (last - first) * (i + 0.5) / n
+                if axis == "h":
+                    shapes.append((g.grey(v), g.rect(mx - span / 2 + i * RAMP_STRIP_PX, 0, RAMP_STRIP_PX, g.height)))
+                else:
+                    shapes.append((g.grey(v), g.rect(0, my - span / 2 + i * RAMP_STRIP_PX, g.width, RAMP_STRIP_PX)))
+            pats.append(Pattern(f"RAMP:{axis}{direction}", "ramp", shapes, (mc, mc, mc), "ratio", ref,
+                                note=f"{axis} ramp {first:.0f}->{last:.0f} nits over {span} px through the sensor",
+                                meta={"axis": axis, "direction": direction, "nits": mid, "base_code": mc}))
+    pats.append(Pattern(ref + "_end", "ramp", [_bg((mc, mc, mc))], (mc, mc, mc), "aux", note="drift", meta={"nits": mid}))
+    return pats
+
+
 def _dropping(fn):
     def wrapped(g, *a, **kw):
         return _drop_offpanel(fn(g, *a, **kw))
@@ -514,10 +600,11 @@ plan_leak = _dropping(plan_leak)
 plan_rings = _dropping(plan_rings)
 plan_heldout = _dropping(plan_heldout)
 plan_verify = _dropping(plan_verify)
+plan_augment = _dropping(plan_augment)
 
 PLANS: dict[str, Callable[..., list[Pattern]]] = {
     "register": plan_register, "grid": plan_grid, "drive": plan_drive, "leak": plan_leak,
-    "rings": plan_rings, "heldout": plan_heldout, "verify": plan_verify,
+    "rings": plan_rings, "heldout": plan_heldout, "verify": plan_verify, "augment": plan_augment,
 }
 
 
@@ -550,7 +637,7 @@ def ref_means(patterns: Sequence[Pattern], reads: dict[str, Read]) -> dict[str, 
 
 
 def build_items(patterns: Sequence[Pattern], reads: dict[str, Read], meter: tuple[float, float],
-                floor_nits: float = 0.012) -> list[dict[str, Any]]:
+                floor_nits: float = 0.012, weight: bool = True) -> list[dict[str, Any]]:
     """Fit items ``{group, name, shapes, y, base, meter, w}`` (the fald_fit.py shape): absolute reads
     above the meter floor, ring ratios to their reference. Aux patterns are skipped."""
     refs = ref_means(patterns, reads)
@@ -569,14 +656,41 @@ def build_items(patterns: Sequence[Pattern], reads: dict[str, Read], meter: tupl
             yref = refs.get(p.ref or "")
             if not yref or yref < floor_nits:
                 continue
-            items.append({"group": p.group, "name": p.name, "shapes": p.shapes, "y": rd.y / yref, "base": [p.shapes[0]],
-                          "meter": tuple(meter), "w": 1.0})
+            bc = p.meta.get("base_code")
+            base = [((bc, bc, bc), FULL)] if bc is not None else [p.shapes[0]]
+            items.append({"group": p.group, "name": p.name, "shapes": p.shapes, "y": rd.y / yref, "base": base,
+                          "meter": tuple(meter), "w": 1.0, "level": p.meta.get("nits")})
+    return weight_items(items) if weight else items
+
+
+def weight_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """w = 1/sqrt(n_group): equalise group influence (fald_fit.py). Call once on the MERGED item list."""
     counts: dict[str, int] = {}
     for it in items:
         counts[it["group"]] = counts.get(it["group"], 0) + 1
     for it in items:
-        it["w"] = 1.0 / math.sqrt(counts[it["group"]])       # equalise group influence (fald_fit.py)
+        it["w"] = 1.0 / math.sqrt(counts[it["group"]])
     return items
+
+
+def level_report(ev: "Evaluator", items) -> list[dict[str, Any]]:
+    """Per (group, grey level): mean |err| in pp and how often the model gets the SIGN of the ring right where the
+    measured ring is > 0.5 pp — the evidence the low-luminance fade is chosen from (below the level where the sign
+    agreement breaks, the correction would push the wrong way: the 2026-09-12 dark band)."""
+    rows: dict[tuple, list] = {}
+    for it in items:
+        if it.get("level") is None or it["base"] is None:
+            continue
+        pred = ev.predict(it)
+        rows.setdefault((it["group"], float(it["level"])), []).append((it["y"] - 1.0, pred - 1.0))
+    out = []
+    for (grp, lvl), rs in sorted(rows.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        errs = [100 * abs(pr - me) for me, pr in rs]
+        signed = [(me, pr) for me, pr in rs if abs(me) > 0.005]
+        agree = sum(1 for me, pr in signed if (me > 0) == (pr > 0))
+        out.append({"group": grp, "nits": lvl, "n": len(rs), "mean_abs_pp": float(np.mean(errs)), "max_abs_pp": float(np.max(errs)),
+                    "sign_agree": f"{agree}/{len(signed)}", "mean_meas_pp": float(np.mean([100 * me for me, _ in rs]))})
+    return out
 
 
 # ---------------------------------------------------------------------------- derived panel facts
@@ -776,8 +890,10 @@ def group_report(ev: Evaluator, items) -> dict[str, dict[str, Any]]:
 
 
 STAGE_A_GROUPS = ("leak0", "leak0@diag", "hole", "lda_lum", "lda_size", "sliver", "peak")
-STAGE_B_GROUPS = ("rings", "rings@fine", "rings@area", "rings@drive")
-HELD_GROUPS = ("rings@held", "rings@diag", "superpose", "comp", "orange")
+STAGE_B_GROUPS = ("rings", "rings@fine", "rings@area", "rings@drive", "rings@low", "halo", "ramp")
+HELD_GROUPS = ("rings@held", "rings@diag", "superpose", "comp", "orange", "rings@lowheld", "halo@held")
+NEAR_FIELD_GROUPS = ("rings@fine", "halo")
+DRIVE_FLOOR_CANDIDATES = (0.05, 0.15, 0.3, 0.5, 1.0)
 
 
 def fit_stage_a(ev: Evaluator, items, *, quick: bool = False, log=print) -> dict[str, float]:
@@ -911,22 +1027,44 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
         out["stage_b_report"] = group_report(ev, b_items)
     else:
         out["stage_b"] = None
+    # drive floor (cells off below it): a threshold, so a small grid on the dim items instead of the optimiser
+    dim_items = [d for d in by("rings@low", "halo") if d.get("level") is not None and d["level"] <= 2.0]
+    out["drive_floor"] = None
+    if dim_items and b_items:
+        table = []
+        for fl in DRIVE_FLOOR_CANDIDATES:
+            ev.set(drive_floor_nits=fl)
+            r = residuals(ev, dim_items)
+            table.append({"floor_nits": fl, "rms": float(math.sqrt(np.mean(r * r)))})
+            log(f"   floor {fl:g} nits: dim-item rms {table[-1]['rms']:.4f}")
+        # a floor BELOW the dimmest measured grey is unidentifiable (identical rms): take the HIGHEST floor within 1 %
+        # of the best — never assume LEDs light below the data (HDR evidence: LEDs off < 0.5 nit)
+        rmin = min(t["rms"] for t in table)
+        best = max(t["floor_nits"] for t in table if t["rms"] <= rmin * 1.01 + 1e-12)
+        ev.set(drive_floor_nits=best)
+        out["drive_floor"] = {"table": table, "chosen_nits": best, "n_dim_items": len(dim_items)}
+        out["stage_b_report"] = group_report(ev, b_items)
     exp_params = ev.params
     held_exp = group_report(ev, held) if held else {}
     out["heldout_exp"] = held_exp
     out["knots"] = None
     if knots != "never" and b_items:
+        near = [g for g in NEAR_FIELD_GROUPS if by(g)]
+        near_exp = {g: out["stage_b_report"].get(g, {}).get("mean_abs") for g in near}
         kres = fit_knots(ev, b_items, quick=quick, log=log)
         held_k = group_report(ev, held) if held else {}
-        fine_exp = out["stage_b_report"].get("rings@fine", {}).get("mean_abs")
-        fine_k = group_report(ev, by("rings@fine")).get("rings@fine", {}).get("mean_abs") if by("rings@fine") else None
+        near_k = {g: group_report(ev, by(g)).get(g, {}).get("mean_abs") for g in near}
         degraded = [g for g in held_exp if held_k.get(g, {}).get("mean_abs", 0) > held_exp[g]["mean_abs"] + 0.3]
-        improved = fine_exp is not None and fine_k is not None and fine_k < fine_exp - 0.2
+        near_worse = [g for g in near if near_k[g] is not None and near_exp[g] is not None and near_k[g] > near_exp[g] + 0.2]
+        gain = sum((near_exp[g] - near_k[g]) for g in near if near_k[g] is not None and near_exp[g] is not None)
+        improved = gain > 0.2 and not near_worse
         keep = knots == "always" or (not degraded and improved)
-        out["knots"] = {**kres, "heldout": held_k, "fine_exp_pp": fine_exp, "fine_knots_pp": fine_k,
-                        "degraded_groups": degraded, "kept": keep}
+        out["knots"] = {**kres, "heldout": held_k, "near_field_exp_pp": near_exp, "near_field_knots_pp": near_k,
+                        "fine_exp_pp": near_exp.get("rings@fine"), "fine_knots_pp": near_k.get("rings@fine"),
+                        "degraded_groups": degraded, "near_field_worse": near_worse, "kept": keep}
         if not keep:
             ev = Evaluator(exp_params)
+    out["by_level"] = level_report(ev, b_items + held)
     out["heldout"] = group_report(ev, held) if held else {}
     out["params"] = params_dict(ev.params)
     out["elapsed_s"] = round(time.time() - t0, 1)

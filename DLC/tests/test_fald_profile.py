@@ -184,7 +184,8 @@ def test_quick_fit_recovers_the_hidden_estimate():
 # ----------------------------------------------------------------------------- the stage tool under --simulate
 _DEFAULTS = dict(monitor=1, mode="SDR", simulate=True, pipe="", zones="32x18", diagonal_in=32.0, px_mm=None, meter=None,
                  bit_depth=None, white_nits=1000.0, dogegen_server="127.0.0.1:28930", settle=0.0, profile=None,
-                 no_native=False, quick=True, knots="never", verbose=False, name="sim", out=None, bin=None, fit_json=None)
+                 no_native=False, quick=True, knots="never", verbose=False, name="sim", out=None, bin=None, fit_json=None,
+                 keep_geometry=False, augment_regime="off", lum_fade=None, extended=False)
 
 
 def _ns(ctx, **over):
@@ -263,3 +264,46 @@ def test_stage_chain_sdr_to_export_and_verify(tmp_path):
     assert ver.status == "ran", ver.as_dict()
     assert "scorecard" in ver.metrics and ver.raw["set_fald_params"]["transfer"] == "gamma"
     assert _run(ctx, "restore").status == "ran"
+
+
+def test_augment_plan_ramps_use_their_flat_as_model_base():
+    g = _geo()
+    pats = P.plan_augment(g)
+    groups = {p.group for p in pats}
+    assert {"rings@low", "rings@lowheld", "halo", "halo@held", "ramp"} <= groups
+    ramps = [p for p in pats if p.group == "ramp" and p.kind == "ratio"]
+    assert len(ramps) == 4 and all("base_code" in p.meta for p in ramps)
+    panel = P.SyntheticFaldPanel.hidden(g)
+    reads = {p.name: P.Read(p.name, panel.read(p.shapes, g.meter)) for p in pats}
+    items = P.build_items(pats, reads, g.meter)
+    for it in items:
+        if it["group"] == "ramp":
+            bc = it["base"][0][0][0]
+            assert it["base"] == [((bc, bc, bc), P.FULL)]
+        assert it.get("level") is not None
+    # the truth model reproduces its own ratios, level report carries every grey
+    rep = P.level_report(P.Evaluator(panel.params), items)
+    # the hidden panel's LEDs are off below 0.5 nit: that level can drop out at the read floor, the others must be there
+    assert {1.0, 2.0} <= {r["nits"] for r in rep if r["group"] == "rings@low"}
+
+
+def test_stage_augment_reads_off_and_identity_interleaved(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    assert _run(ctx, "preflight").status == "ran"
+    st = _common.load_dlc_state(ctx)
+    res = _run(ctx, "augment")                                  # no exported file yet: OFF only
+    assert res.status == "ran", res.as_dict()
+    assert res.metrics["states"] == ["off"]
+    raw = json.loads((ctx.root / "fald" / "augment.json").read_text(encoding="utf-8"))
+    assert raw["complete"] and raw["meter"] == st["fald"]["geometry"]["meter"]
+    assert "halo" in res.metrics["groups"] and "ramp" in res.metrics["groups"]
+
+
+def test_extended_verify_set_refs_resolve():
+    g = _geo()
+    pats = P.plan_verify_extended(g)
+    names = {p.name for p in pats}
+    assert {"VX:BAR2:L120", "VX:LOW1:R120", "VX:RAMP:hdown"} <= names
+    for p in pats:
+        if p.kind == "ratio":
+            assert p.ref in names
