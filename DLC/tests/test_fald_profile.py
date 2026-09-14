@@ -210,7 +210,7 @@ def test_stage_preflight_records_geometry_and_enters_native(tmp_path):
 def test_stage_refuses_measuring_before_preflight(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
     res = _run(ctx, "rings")
-    assert res.status == "blocked" and res.anomalies[0].code == "no_preflight"
+    assert res.status == "blocked" and res.anomalies[0].code == "no_preflight" and ":" not in res.stage
 
 
 def test_stage_preflight_rejects_bad_zones(tmp_path):

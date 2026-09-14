@@ -92,10 +92,12 @@ def make_shapes_reader(presenter: ShapesPresenter, measure: Callable[[MeasurePat
 
 
 def transport_check_frame(width: int, height: int, meter: tuple[int, int], max_code: int, mid_code: int) -> list:
-    """[black, a far dark rect, a mid-grey 400-px square ON the meter]: the meter must read the
-    third rectangle. A first-rectangle-only transport reads ≈ 0."""
+    """[black, a far dark rect, a mid-grey 600-px square ON the meter]: the meter must read the
+    third rectangle. A first-rectangle-only transport reads ≈ 0 (600 px rather than 400 so the mini-LED
+    small-window crush leaves more of the request)."""
     def rect(x0, y0, w, h):
-        return (max(0.0, x0 / width), max(0.0, y0 / height), min(1.0, w / width), min(1.0, h / height))
+        x0 = min(max(0.0, x0), float(width)); y0 = min(max(0.0, y0), float(height))
+        return (x0 / width, y0 / height, min(1.0, (width - x0) / width, w / width), min(1.0, (height - y0) / height, h / height))
     return [((0, 0, 0), (0.0, 0.0, 1.0, 1.0)),
             ((max_code // 3, max_code // 3, max_code // 3), rect(200, 200, 100, 100)),
-            ((mid_code, mid_code, mid_code), rect(meter[0] - 200, meter[1] - 200, 400, 400))]
+            ((mid_code, mid_code, mid_code), rect(meter[0] - 300, meter[1] - 300, 600, 600))]

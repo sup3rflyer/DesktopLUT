@@ -408,8 +408,12 @@ def phase_register(s: Session, result: StageResult) -> None:
     mid = g.code(0.3 * g.white_nits)
     frame = transport_check_frame(g.width, g.height, g.meter, g.max_code, mid)
     xyz, _, err = s.read("REG:transport", frame, (mid, mid, mid))
+    if xyz is None:
+        xyz, _, err = s.read("REG:transport", frame, (mid, mid, mid))      # one retry (a first read after a mode switch can time out)
     expect = 0.3 * g.white_nits
-    ok = xyz is not None and xyz[1] > 0.25 * expect
+    # a first-rectangle-only transport leaves the meter on black (≈ 0); the window itself may read well under its
+    # request on a mini-LED (HDR: a 600-px window on black reads ~40 % — the small-highlight crush), so 10 % is the bar
+    ok = xyz is not None and xyz[1] > 0.10 * expect
     result.preconditions["transport_ok"] = ok
     result.raw["transport"] = {"read_nits": xyz[1] if xyz else None, "expect_nits": expect, "error": err}
     if not ok:
@@ -765,7 +769,7 @@ def phase_restore(s: Session, result: StageResult) -> None:
 # ----------------------------------------------------------------------------- entry
 def build(args, ctx: RunContext) -> StageResult:
     phase = args.phase
-    result = StageResult(f"{STAGE}:{phase}")
+    result = StageResult(f"{STAGE}-{phase}")        # no ":" — on Windows it would write an NTFS alternate data stream
     st = _state(ctx)
     if phase == "preflight":
         phase_preflight(args, ctx, st, result)
