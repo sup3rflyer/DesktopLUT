@@ -454,7 +454,8 @@ bool AnyCorrectionActive() {
             s.sdrMHC.enabled || s.hdrMHC.enabled ||
             s.sdrColorCorrection.primariesEnabled || s.sdrColorCorrection.grayscale.enabled ||
             s.hdrColorCorrection.primariesEnabled || s.hdrColorCorrection.grayscale.enabled ||
-            s.hdrColorCorrection.tonemap.enabled || s.hdrColorCorrection.fald.enabled)
+            s.hdrColorCorrection.tonemap.enabled || s.hdrColorCorrection.fald.enabled ||
+            s.sdrColorCorrection.fald.enabled)
             return true;
     }
     return false;
@@ -668,15 +669,20 @@ void HandleStateGet(JsonValue& result) {
                 l.set("grayscale", JBool(m.correctionGrayscale.enabled));
                 l.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
                 l.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
-                l.set("fald", JBool(isHDR && s.hdrColorCorrection.fald.enabled));
                 if (isHDR) {
                     l.set("tonemap_dynamic", JBool(s.hdrColorCorrection.tonemap.dynamicPeak));
                     l.set("tonemap_target_peak", JNum(s.hdrColorCorrection.tonemap.targetPeakNits));
-                    l.set("fald_params_path", JStr(WideToUtf8(s.hdrColorCorrection.fald.paramsPath)));
-                    l.set("fald_debug_mode", JNum((double)s.hdrColorCorrection.fald.debugMode));
-                    l.set("fald_ped_mode", JNum((double)s.hdrColorCorrection.fald.pedMode));
-                    l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(s.hdrColorCorrection.fald.paramsPath)));
                 }
+                // FALD is per mode (HDR, and SDR under ACM — 2026-09-14, work guide P7)
+                const FaldSettings& fs = isHDR ? s.hdrColorCorrection.fald : s.sdrColorCorrection.fald;
+                l.set("fald", JBool(fs.enabled));
+                l.set("fald_params_path", JStr(WideToUtf8(fs.paramsPath)));
+                l.set("fald_debug_mode", JNum((double)fs.debugMode));
+                l.set("fald_ped_mode", JNum((double)fs.pedMode));
+                l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
+                uint32_t transfer = 0;
+                if (FaldPanelFileTransfer(fs.paramsPath, transfer))
+                    l.set("fald_file_transfer", JStr(transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq"));
                 layers.set(key, l);
             }
         }
@@ -812,7 +818,8 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
         }
 
         DisplayInfo di;
-        if (GetDisplayInfoForMonitor((int)i, di)) {
+        const bool haveDi = GetDisplayInfoForMonitor((int)i, di);
+        if (haveDi) {
             e.set("device_path", JStr(WideToUtf8(di.devicePath)));
             e.set("hardware_id", JStr(WideToUtf8(ExtractHardwareIdFromPath(di.devicePath))));
             e.set("source_id", JNum((double)di.sourceId));
@@ -830,9 +837,16 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
             DXGI_OUTPUT_DESC1 desc;
             if (QueryFreshOutputDesc(snaps[i].hmon, desc)) {
                 bool hdrActive = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-                bool acmSdr = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
-                e.set("hdr_active", JBool(hdrActive));
-                e.set("color_space", JStr(hdrActive ? "HDR" : (acmSdr ? "ACM_SDR" : "SDR")));
+                bool dxgiFp16Sdr = (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+                // ACM ("Automatically manage color for apps") is invisible to DXGI: the output colour
+                // space stays G22_P709 with ACM on (HW 2026-09-14, work guide C8), so SDR vs ACM_SDR
+                // comes from DisplayConfig (24H2 activeColorMode; older: advancedColorEnabled && !HDR).
+                DisplayColorModeResult cm = haveDi ? QueryDisplayColorMode(di, hdrActive, dxgiFp16Sdr)
+                                                   : ClassifyDisplayColorMode(hdrActive, dxgiFp16Sdr, false, 0, false, false);
+                // hdr_active and color_space from ONE verdict (DisplayConfig can see HDR a moment before DXGI does)
+                e.set("hdr_active", JBool(cm.mode == DisplayColorMode::HDR));
+                e.set("color_space", JStr(DisplayColorModeName(cm.mode)));
+                e.set("color_mode_source", JStr(cm.source));
             }
         }
 
@@ -955,6 +969,7 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
             ms.sdrPath.clear();
             ms.sdrColorCorrection.primariesEnabled = false;
             ms.sdrColorCorrection.grayscale.enabled = false;
+            ms.sdrColorCorrection.fald.enabled = false;   // the SDR (ACM) FALD layer likewise
         }
     }
     FaldTrace("EnterNeutral: settings cleared, SaveSettings");
@@ -1026,6 +1041,7 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
 //     RegenerateMhcIfActive (BuildMHC2Params bakes all three), like ID_MHC_*_WB_ENABLE /
 //     ID_MHC_*_GS_ENABLE. Desktop Gamma also drives the live gamma atomics (ID_MHC_HDR_DG_ENABLE).
 //   * tonemap (HDR) is the shader flag: ID_CORR_TONEMAP_ENABLE's live update path.
+//   * fald is the shader flag of the addressed mode (HDR, or SDR under ACM): ID_CORR_FALD_[SDR_]ENABLE's path.
 // Result: {monitor_mode, before:{...}, after:{...}, regenerated, profile_name}.
 static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
     const MHCSettings& m = isHDR ? s.hdrMHC : s.sdrMHC;
@@ -1033,8 +1049,9 @@ static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
     out.set("grayscale", JBool(m.correctionGrayscale.enabled));
     out.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
     out.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
-    out.set("fald", JBool(isHDR && s.hdrColorCorrection.fald.enabled));
-    if (isHDR) out.set("fald_params_path", JStr(WideToUtf8(s.hdrColorCorrection.fald.paramsPath)));
+    const FaldSettings& fs = isHDR ? s.hdrColorCorrection.fald : s.sdrColorCorrection.fald;   // per mode
+    out.set("fald", JBool(fs.enabled));
+    out.set("fald_params_path", JStr(WideToUtf8(fs.paramsPath)));
 }
 
 void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1053,11 +1070,11 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     want("desktop_gamma", hasDg, dg);
     want("tonemap", hasTm, tm);
     want("fald", hasFd, fd);
-    if (!isHDR && (hasDg || hasTm || hasFd)) {
+    if (!isHDR && (hasDg || hasTm)) {
         // HDR-only layers; asking to change them in SDR is a client error, asking
-        // for them OFF is a harmless no-op (a "disable everything" client).
-        if ((hasDg && dg) || (hasTm && tm) || (hasFd && fd)) { error = "desktop_gamma / tonemap / fald are HDR-only layers"; return; }
-        hasDg = hasTm = hasFd = false;
+        // for them OFF is a harmless no-op (a "disable everything" client). fald is per mode.
+        if ((hasDg && dg) || (hasTm && tm)) { error = "desktop_gamma / tonemap are HDR-only layers"; return; }
+        hasDg = hasTm = false;
     }
     JsonValue before = JObj(), after = JObj();
     bool mhcChanged = false, tmChanged = false, dgChanged = false, mhcEnabled = false, profileNamed = false;
@@ -1076,7 +1093,8 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         }
         if (hasDg && m.desktopGammaEnabled != dg) { m.desktopGammaEnabled = dg; mhcChanged = true; dgChanged = true; }
         if (hasTm && ms.hdrColorCorrection.tonemap.enabled != tm) { ms.hdrColorCorrection.tonemap.enabled = tm; tmChanged = true; }
-        if (hasFd && ms.hdrColorCorrection.fald.enabled != fd) { ms.hdrColorCorrection.fald.enabled = fd; tmChanged = true; }   // same propagation as tonemap
+        FaldSettings& fs = isHDR ? ms.hdrColorCorrection.fald : ms.sdrColorCorrection.fald;
+        if (hasFd && fs.enabled != fd) { fs.enabled = fd; tmChanged = true; }   // same propagation as tonemap, for the addressed mode
         mhcEnabled = m.enabled;
         profileNamed = !m.profileName.empty();
     }
@@ -1095,7 +1113,7 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     if (tmChanged) {
         FaldTrace(g_gui.isRunning ? "LayersSet: tm/fald changed, running -> UpdateColorCorrectionLive" : "LayersSet: tm/fald changed, not running");
         if (g_gui.isRunning) {
-            UpdateColorCorrectionLive(mon, true);
+            UpdateColorCorrectionLive(mon, isHDR);   // tonemap is HDR-only; fald follows the addressed mode
             FaldTrace("LayersSet: after UpdateColorCorrectionLive");
             if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
             else DwmHookReevaluateOverlay();
@@ -1143,6 +1161,7 @@ void DoDisableAll(const JsonValue& /*p*/, JsonValue& result, std::string& /*erro
             s.hdrColorCorrection.grayscale.enabled = false;
             s.hdrColorCorrection.tonemap.enabled = false;
             s.hdrColorCorrection.fald.enabled = false;
+            s.sdrColorCorrection.fald.enabled = false;
         }
     }
     SaveSettings();
@@ -1313,18 +1332,20 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("verified", JBool(verified));
 }
 
-// FALD correction layer (HDR only). runtime.set_fald_params {monitor, mode:"HDR", params_path}:
-// the per-panel parameter file (DLC `python -m dlc.fald.export`); re-setting the SAME path bumps
+// FALD correction layer, per mode (HDR, and SDR under Windows ACM — 2026-09-14, work guide P7).
+// runtime.set_fald_params {monitor, mode:"HDR"|"SDR", params_path}: the per-panel parameter file (DLC
+// `python -m dlc.fald.export`) for that mode; its transfer must match (PQ file <-> HDR, gamma file
+// <-> SDR: refused otherwise — the render side would refuse it too). Re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
 // debug_mode 0..6}: 0 correct, 1 gain map (white 0, red brighten, blue darken, +-25 %), 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
 // x100, 6 per-channel-vs-white influence x100 (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
 // FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
-static void FaldPropagate(int mon) {
+static void FaldPropagate(int mon, bool isHDR) {
     FaldTrace("FaldPropagate: begin");
     if (g_gui.isRunning) {
-        UpdateColorCorrectionLive(mon, true);
+        UpdateColorCorrectionLive(mon, isHDR);
         if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
         else DwmHookReevaluateOverlay();
     }
@@ -1336,45 +1357,56 @@ static void FaldPropagate(int mon) {
 void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    if (!isHDR) { error = "fald is an HDR-only layer"; return; }
     std::wstring path = Utf8ToWide(p.getStr("params_path"));
     if (path.empty()) { error = "missing parameter: params_path"; return; }
     DWORD attrs = GetFileAttributesW(path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) { error = "params_path is not a file"; return; }
+    // A readable panel file must be a fit for this mode (FLD1/FLD2 = PQ = HDR; FLD3 word 40 = 1 = gamma = SDR
+    // under ACM). A file the peek cannot classify is accepted here and refused by the loader (logged once).
+    uint32_t transfer = 0;
+    const bool known = FaldPanelFileTransfer(path, transfer);
+    if (known && !FaldTransferMatchesMode(transfer, isHDR)) {
+        error = std::string("panel file transfer ") + (transfer == FALD_TRANSFER_GAMMA ? "gamma (SDR fit)" : "pq (HDR fit)") +
+                " does not match mode " + (isHDR ? "HDR" : "SDR");   // DLC mock: identical text
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        FaldSettings& fs = g_gui.monitorSettings[mon].hdrColorCorrection.fald;
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
         fs.paramsPath = path;
         fs.reloadSeq++;   // same path re-set = "reload the file" (HW 2026-09-13: it did not rebuild before)
     }
     SaveSettings();
-    FaldPropagate(mon);
+    FaldPropagate(mon, isHDR);
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("params_path", JStr(WideToUtf8(path)));
+    result.set("transfer", JStr(known ? (transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq") : "unknown"));
 }
 
 void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    if (!isHDR) { error = "fald is an HDR-only layer"; return; }
     const JsonValue* v = p.find("debug_mode");
     const JsonValue* pm = p.find("ped_mode");
-    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..4) or ped_mode (0|1)"; return; }
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..6) or ped_mode (0|1)"; return; }
     unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        FaldSettings& fs = g_gui.monitorSettings[mon].hdrColorCorrection.fald;
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
         if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 6 ? 6 : v->num));
         if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
         mode = fs.debugMode; ped = fs.pedMode;
     }
     if (pm && pm->type == JsonValue::Num) SaveSettings();   // ped_mode is a persisted setting, the debug view is not
-    FaldPropagate(mon);
+    FaldPropagate(mon, isHDR);
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("debug_mode", JNum((double)mode));
     result.set("ped_mode", JNum((double)ped));
     std::wstring pathNow;
-    { std::lock_guard<std::mutex> lk(g_monitorSettingsMutex); pathNow = g_gui.monitorSettings[mon].hdrColorCorrection.fald.paramsPath; }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        pathNow = (isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald).paramsPath;
+    }
     result.set("ped_colour_in_file", JBool(FaldPanelFileHasPedColour(pathNow)));   // false = an FLD1 file: ped_mode 1 is a no-op
 }
 
@@ -1389,6 +1421,12 @@ void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
         for (auto& ctx : g_monitors) {
             if (ctx.index == mon) {
+                // the dump is of the layer that runs, i.e. the monitor's live mode: a request for the other mode would
+                // silently dump the wrong settings/file
+                if (ctx.isHDREnabled != isHDR) {
+                    error = std::string("monitor is in ") + (ctx.isHDREnabled ? "HDR" : "SDR") + ", not " + (isHDR ? "HDR" : "SDR");
+                    return;
+                }
                 if (ctx.faldDumpRequested.load()) { error = "a fald dump is still pending for this monitor"; return; }
                 ctx.faldDumpDir = dir;                                            // written before the flag ...
                 ctx.faldDumpRequested.store(true, std::memory_order_release);     // ... which publishes it

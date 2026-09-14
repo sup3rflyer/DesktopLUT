@@ -32,7 +32,7 @@ from dlc.desktoplut_client import (
     DesktopLutCommand,
     contract_version_mismatch,
 )
-from dlc.desktoplut_mock import MockDesktopLutTransport
+from dlc.desktoplut_mock import MockDesktopLutServer, MockDesktopLutTransport
 
 CPP_SERVER = Path(__file__).resolve().parents[1].parent / "src" / "desktoplut_ipc_server.cpp"
 
@@ -50,6 +50,17 @@ def _spec_methods() -> dict[str, dict]:
 
 def _write_1d_cube(path: Path) -> Path:
     path.write_text("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n", encoding="utf-8")
+    return path
+
+
+def _write_fald_panel(path: Path, transfer: str) -> Path:
+    """A header-only stand-in for a FALD panel file: the mock (like the C++ set_fald_params peek) reads only
+    the magic + FLD3 word 40. 'pq' -> FLD1, 'gamma' -> FLD3 with transfer 1 / sdr_gamma 2.27."""
+    import struct
+    if transfer == "pq":
+        path.write_bytes(struct.pack("<I", 0x464C4431) + bytes(31 * 4))
+    else:
+        path.write_bytes(struct.pack("<I", 0x464C4433) + bytes(39 * 4) + struct.pack("<If", 1, 2.27) + bytes(6 * 4))
     return path
 
 
@@ -99,9 +110,13 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.clear_3dlut", mm),
         ("runtime.set_grayscale_tweak", {**mm, "grayscale_tweak": gs}),
         ("runtime.disable_grayscale_tweak", mm),
-        ("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(cube_3d)}),   # any existing file
+        ("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(cube_3d)}),   # any existing file (unclassifiable: accepted)
         ("runtime.fald_debug", {"monitor": 0, "mode": "HDR", "debug_mode": 1}),
-        ("runtime.fald_dump", {"monitor": 0, "mode": "HDR", "dir": str(tmp_path)}),
+        ("runtime.fald_dump", {"monitor": 0, "mode": "SDR", "dir": str(tmp_path)}),   # the live mode (set_hdr off above)
+        ("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(_write_fald_panel(tmp_path / "sdr.bin", "gamma"))}),
+        ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
+        ("layers.set", {**mm, "fald": True}),
+        ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),
         ("calibration.exit", {"restore_snapshot": False}),
     ]
@@ -240,6 +255,67 @@ def test_cube_path_validation_matches_cpp(tmp_path):
         ctrl.set_base_lut(0, "SDR", str(not_1d))
     ok_1d = _write_1d_cube(tmp_path / "1d.cube")
     assert ctrl.set_base_lut(0, "SDR", str(ok_1d))["mhc"]["base_lut"]["cube_path"] == str(ok_1d)
+
+
+def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
+    """2026-09-14 (work guide P7/C8): the FALD layer runs in HDR and in SDR under ACM. The mock mirrors the
+    C++: set_fald_params accepts both modes but refuses a panel file whose transfer does not match (an HDR
+    PQ fit on the SDR row or the reverse), layers.set toggles fald per mode, state.get reports it per pair,
+    and query_monitors tells ACM_SDR from SDR (which the DXGI colour space could not)."""
+    server = MockDesktopLutServer()
+    client = DesktopLutClient(transport=MockDesktopLutTransport(server))
+    pq = _write_fald_panel(tmp_path / "hdr_pq.bin", "pq")
+    gamma = _write_fald_panel(tmp_path / "sdr_gamma.bin", "gamma")
+    ok = client.call("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(gamma)})
+    assert ok.ok and ok.result["transfer"] == "gamma" and ok.result["monitor_mode"] == "0:SDR"
+    ok = client.call("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(pq)})
+    assert ok.ok and ok.result["transfer"] == "pq"
+    bad = client.send(DesktopLutCommand("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(pq)}),
+                      raise_on_error=False)
+    assert bad.ok is False and bad.error == "panel file transfer pq (HDR fit) does not match mode SDR"   # C++ text
+    bad = client.send(DesktopLutCommand("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(gamma)}),
+                      raise_on_error=False)
+    assert bad.ok is False and bad.error == "panel file transfer gamma (SDR fit) does not match mode HDR"
+    # per-mode toggle + state
+    r = client.call("layers.set", {"monitor": 0, "mode": "SDR", "fald": True})
+    assert r.ok and r.result["after"]["fald"] is True and r.result["regenerated"] is False
+    assert r.result["after"]["fald_params_path"] == str(gamma)          # C++ LayersJson carries the path
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald"] is True and st["layers"]["0:HDR"]["fald"] is False
+    # the C++ reports the fald settings inside layers[key] for every pair — never under runtime
+    assert st["layers"]["0:SDR"]["fald_params_path"] == str(gamma) and st["layers"]["0:SDR"]["fald_file_transfer"] == "gamma"
+    assert st["layers"]["0:HDR"]["fald_params_path"] == str(pq) and st["layers"]["0:HDR"]["fald_file_transfer"] == "pq"
+    assert "fald_file_transfer" not in st["layers"]["1:SDR"] and st["layers"]["1:SDR"]["fald_params_path"] == ""
+    assert "0:SDR" not in st["runtime"]
+    dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})
+    assert dbg.ok and dbg.result["debug_mode"] == 4
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_debug_mode"] == 4
+    # fald_dump is of the live mode (the monitor is in SDR here)
+    bad = client.send(DesktopLutCommand("runtime.fald_dump", {"monitor": 0, "mode": "HDR", "dir": str(tmp_path)}),
+                      raise_on_error=False)
+    assert bad.ok is False and bad.error == "monitor is in SDR, not HDR"
+    assert client.call("runtime.fald_dump", {"monitor": 0, "mode": "SDR", "dir": str(tmp_path)}).ok
+    # calibration.enter clears the flag of the calibrated pair but keeps the panel file (C++ DoEnterNeutral)
+    client.call("calibration.enter", {"monitor": 0, "mode": "SDR", "dummy_icc_path": "C:/dlc/sRGB.icm"})
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald"] is False and st["layers"]["0:SDR"]["fald_params_path"] == str(gamma)
+    client.call("calibration.exit", {"restore_snapshot": True})
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald"] is True and set(server.state.layers["0:SDR"]) <= set(server.LAYER_NAMES)
+    # desktop_gamma / tonemap stay HDR-only in SDR
+    bad = client.send(DesktopLutCommand("layers.set", {"monitor": 0, "mode": "SDR", "tonemap": True}), raise_on_error=False)
+    assert bad.ok is False and "HDR-only" in (bad.error or "")
+    # disable_all clears the shader flags in both modes
+    assert client.call("corrections.disable_all", {}).ok
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald"] is False
+    # ACM detection (C8): the pipe now distinguishes ACM_SDR from a plain SDR desktop
+    mons = client.call("windows.query_monitors", {}).result["monitors"]
+    assert mons[0]["color_space"] == "SDR" and "color_mode_source" in mons[0]
+    server.state.acm[0] = True
+    mons = client.call("windows.query_monitors", {}).result["monitors"]
+    assert mons[0]["color_space"] == "ACM_SDR" and mons[0]["hdr_active"] is False
+    client.call("windows.set_hdr", {"monitor": 0, "enable": True})
+    assert client.call("windows.query_monitors", {}).result["monitors"][0]["color_space"] == "HDR"
 
 
 def test_monitor_and_mode_vocabulary_matches_cpp():

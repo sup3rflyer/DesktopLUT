@@ -343,8 +343,13 @@ next to a highlight that reads 6–20 % off because the panel's own backlight co
 light spread. The layer predicts the panel's real backlight and the panel's own estimate from the frame and
 pre-distorts each pixel so it lands where it would in a flat field of its own level.
 
-- **Overlay path, HDR only.** Off in DWM hook mode (the status line says so when you enable it there).
-- **Needs a per-panel parameter file** (Corrections tab → *Panel file*; INI `HDR_FaldParamsPath`), produced by
+- **Overlay path only; HDR, and SDR when Windows "Automatically manage color for apps" (ACM) is on** — the ACM
+  desktop is composed in FP16 scRGB like HDR, a plain 8-bit SDR desktop never runs the layer. Off in DWM hook
+  mode (the status line says so when you enable it there). The Corrections tab has one *Enable* + *panel file*
+  row per mode (HDR / SDR (ACM)); a panel file belongs to the mode it was profiled in (an HDR fit is a PQ file,
+  an SDR fit a gamma file) and is refused on the other row. The correction is exact for the colour state the
+  panel was profiled in; with a different MHC calibration active it is approximate.
+- **Needs a per-panel parameter file** (Corrections tab → the mode's row; INI `HDR_FaldParamsPath` / `SDR_FaldParamsPath`), produced by
   the DLC calibrator's profiling pass (`python -m dlc.stages.fald_profile`, one colorimeter spot, ≈ 40 min,
   no camera: it needs the panel's zone count and diagonal from the spec sheet, and ends with a verify pass
   of the file on your unit — `DLC/docs/fald-profile-flow.md`). Only the ASUS PA32UCXR has one
@@ -359,9 +364,12 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
 - *View* combo: 0 correct, 1 gain map (grey 0.5 = no change), 2 / 3 predicted backlight (true / panel's
   estimate), 4 identity passthrough (the A/B baseline — the awake overlay itself differs from the sleeping
   overlay by 0.5–2 % at low levels, so compare against 4, not against OFF).
-- INI per monitor: `HDR_FaldEnabled`, `HDR_FaldParamsPath`. Pipe: `layers.set {fald}`, `runtime.set_fald_params`,
+- INI per monitor and mode: `HDR_FaldEnabled`, `HDR_FaldParamsPath`, `SDR_FaldEnabled`, `SDR_FaldParamsPath`
+  (+ `…FaldPerChannelPedestal`). Pipe, per `monitor:mode`: `layers.set {fald}`, `runtime.set_fald_params`,
   `runtime.fald_debug`, `runtime.fald_dump` (writes the model fields, the input and the output frame for a
-  reference comparison). Settings changes re-process the last frame, so they show on a static desktop.
+  reference comparison). `windows.query_monitors` reports `color_space` `ACM_SDR` when ACM is on (read through
+  DisplayConfig — the DXGI colour space cannot see ACM). Settings changes re-process the last frame, so they
+  show on a static desktop.
 - Cost: four small compute passes on the zone grid (48×48 × 2 sub-cells on the PA32UCXR) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
 

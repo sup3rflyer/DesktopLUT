@@ -168,6 +168,7 @@ bool ReinitDesktopDuplication(MonitorContext* ctx) {
     }
 
     bool wasHDR = ctx->isHDREnabled;
+    bool wasFP16SDR = ctx->isFP16SDR;
 
     if (!InitDesktopDuplication(ctx)) {
         return false;
@@ -192,12 +193,20 @@ bool ReinitDesktopDuplication(MonitorContext* ctx) {
         : (ctx->lutSRV_SDR != nullptr);
     ctx->usePassthrough = !hasApplicableLUT;
 
-    // Only the SDR<->HDR transition needs a new swapchain (different backbuffer format).
-    if (ctx->isHDREnabled != wasHDR) {
+    // A new swapchain when the backbuffer format changes: SDR <-> HDR, and plain SDR <-> ACM SDR
+    // (toggling "Automatically manage color for apps" at runtime changes isFP16SDR only; the old
+    // HDR-only check left an R10G10B10A2/G22 swapchain under an FP16 scRGB capture — wrong image,
+    // and the FALD layer's intermediate clamped at 1.0).
+    if (SwapchainModeChanged(wasHDR, wasFP16SDR, ctx->isHDREnabled, ctx->isFP16SDR)) {
         RecreateSwapchain(ctx);
+        ctx->cbDirty = true;   // cbData[29] (isFP16SDR) must follow
     }
 
     return true;
+}
+
+bool SwapchainModeChanged(bool wasHDR, bool wasFP16SDR, bool isHDR, bool isFP16SDR) {
+    return wasHDR != isHDR || wasFP16SDR != isFP16SDR;
 }
 
 void DetectHDRCapability(MonitorContext* ctx, IDXGIOutput* output) {

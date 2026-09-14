@@ -286,6 +286,71 @@ bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled) {
     return true;
 }
 
+// DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 (Windows 11 24H2, SDK 10.0.26100 wingdi.h), declared locally
+// with its exact layout (36 bytes) so the project builds on older SDKs; the OS answers
+// ERROR_INVALID_PARAMETER for the type on builds that do not know it, which is the fallback trigger.
+struct DlutAdvancedColorInfo2 {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    UINT32 value;                  // bit 0 advancedColorSupported, 1 advancedColorActive, 3 limitedByPolicy,
+                                   // 4 hdrSupported, 5 hdrUserEnabled, 6 wcgSupported, 7 wcgUserEnabled
+    DISPLAYCONFIG_COLOR_ENCODING colorEncoding;
+    UINT32 bitsPerColorChannel;
+    UINT32 activeColorMode;        // DISPLAYCONFIG_ADVANCED_COLOR_MODE: 0 SDR, 1 WCG (= ACM), 2 HDR
+};
+static const DISPLAYCONFIG_DEVICE_INFO_TYPE DLUT_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2 = (DISPLAYCONFIG_DEVICE_INFO_TYPE)15;
+static_assert(sizeof(DlutAdvancedColorInfo2) == 36, "DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 layout");
+
+const char* DisplayColorModeName(DisplayColorMode mode) {
+    switch (mode) {
+        case DisplayColorMode::SDR:    return "SDR";
+        case DisplayColorMode::AcmSdr: return "ACM_SDR";
+        case DisplayColorMode::HDR:    return "HDR";
+        default:                       return "UNKNOWN";
+    }
+}
+
+DisplayColorModeResult ClassifyDisplayColorMode(bool dxgiHdrActive, bool dxgiFp16Sdr,
+                                                bool info2Ok, unsigned int activeColorMode,
+                                                bool legacyOk, bool legacyAdvancedColorEnabled) {
+    DisplayColorModeResult r;
+    if (dxgiHdrActive) { r.mode = DisplayColorMode::HDR; r.source = "dxgi"; return r; }   // the established HDR check
+    if (info2Ok && activeColorMode <= 2u) {   // a value a future Windows adds falls through to the legacy query
+        r.source = "displayconfig2";
+        r.mode = (activeColorMode == 2u) ? DisplayColorMode::HDR
+               : (activeColorMode == 1u) ? DisplayColorMode::AcmSdr : DisplayColorMode::SDR;
+        return r;
+    }
+    if (legacyOk) {
+        // advancedColorEnabled is true for HDR and for ACM alike; DXGI already said "not HDR".
+        r.source = "displayconfig";
+        r.mode = legacyAdvancedColorEnabled ? DisplayColorMode::AcmSdr : DisplayColorMode::SDR;
+        return r;
+    }
+    r.source = "dxgi";
+    r.mode = dxgiFp16Sdr ? DisplayColorMode::AcmSdr : DisplayColorMode::SDR;
+    return r;
+}
+
+DisplayColorModeResult QueryDisplayColorMode(const DisplayInfo& display, bool dxgiHdrActive, bool dxgiFp16Sdr) {
+    DlutAdvancedColorInfo2 info2 = {};
+    info2.header.type = DLUT_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+    info2.header.size = sizeof(info2);
+    info2.header.adapterId = display.adapterId;
+    info2.header.id = display.targetId;
+    bool info2Ok = (DisplayConfigGetDeviceInfo(&info2.header) == ERROR_SUCCESS);
+    bool legacyOk = false, legacyEnabled = false;
+    if (!info2Ok || info2.activeColorMode > 2u) {
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO ci = {};
+        ci.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        ci.header.size = sizeof(ci);
+        ci.header.adapterId = display.adapterId;
+        ci.header.id = display.targetId;
+        legacyOk = (DisplayConfigGetDeviceInfo(&ci.header) == ERROR_SUCCESS);
+        legacyEnabled = legacyOk && (ci.value & 0x2) != 0;   // bit 1 = advancedColorEnabled
+    }
+    return ClassifyDisplayColorMode(dxgiHdrActive, dxgiFp16Sdr, info2Ok, info2.activeColorMode, legacyOk, legacyEnabled);
+}
+
 bool SetDisplayHdrState(const DisplayInfo& display, bool enable) {
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE colorState = {};
     colorState.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;

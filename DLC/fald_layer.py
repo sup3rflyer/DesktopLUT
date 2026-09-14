@@ -14,8 +14,9 @@
   python fald_layer.py dump <dir>                next frame dumps drive/B_true/B_est/frame (input) + fald_out (output)
                                                  to <dir>; with debug 4 fald_out must equal fald_frame bit for bit
   python fald_layer.py ab <seconds> [n]          alternate off/on every <seconds>, n cycles (default 6)
-Options: --monitor N (default 0). Needs DesktopLUT running with the calibration pipe armed, in DD
-(overlay) mode with HDR on for the monitor — the layer does not run in DWM-hook mode.
+Options: --monitor N (default 0), --mode HDR|SDR (default HDR; SDR = the ACM row, builds from 2026-09-14).
+Needs DesktopLUT running with the calibration pipe armed, in DD (overlay) mode with HDR on for the
+monitor (or Windows ACM on, for --mode SDR) — the layer does not run in DWM-hook mode.
 Static desktop (paused video / test pattern): DesktopLUT builds from 2026-09-13 re-process the last
 frame after params / debug / dump / on / off, and `params` with an UNCHANGED path (or a file re-exported
 in place) rebuilds the GPU tables. Older builds show nothing until the next desktop frame — frame-step.
@@ -33,9 +34,10 @@ def main(argv=None):
     ap.add_argument("arg", nargs="?")
     ap.add_argument("n", nargs="?", type=int, default=6)
     ap.add_argument("--monitor", type=int, default=0)
+    ap.add_argument("--mode", choices=["HDR", "SDR"], default="HDR")
     a = ap.parse_args(argv)
     c = CalibrationController.connect()
-    mon, mode = a.monitor, "HDR"
+    mon, mode = a.monitor, a.mode
     if a.cmd == "status":
         st = c.state()
         key = f"{mon}:{mode}"

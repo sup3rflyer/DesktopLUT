@@ -687,23 +687,51 @@ void CreateGUILayout(HWND hwnd) {
     g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlApply);
 
 
-    // FALD compensation group (Experimental; HDR, overlay path only). The panel file comes from the
-    // DLC probe/fit (python -m dlc.fald.export). Debug views show the layer's own fields on the panel.
+    // FALD compensation group (Experimental; overlay path only). One Enable + panel-file row per mode:
+    // HDR, and SDR under Windows ACM (the FP16 scRGB desktop); the panel file comes from the DLC
+    // profiling pass (python -m dlc.stages.fald_profile / dlc.fald.export) and is mode-specific (an
+    // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
-    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental)", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 72, panel2, nullptr, nullptr, nullptr);
+    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental, overlay only)", WS_CHILD | BS_GROUPBOX,
+        innerX, innerY, groupW, 99, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
+    // Row 1: HDR
+    ctrl = CreateWindow(L"STATIC", L"HDR:", WS_CHILD, innerX + 10, innerY + 20, 62, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
     g_gui.hwndFaldEnable = CreateWindow(L"BUTTON", L"Enable",
         WS_CHILD | BS_AUTOCHECKBOX,
-        innerX + 10, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_FALD_ENABLE, nullptr, nullptr);
+        innerX + 75, innerY + 18, 60, h, panel2, (HMENU)ID_CORR_FALD_ENABLE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldEnable);
+    g_gui.hwndFaldPath = CreateWindow(L"EDIT", L"", WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        innerX + 140, innerY + 18, groupW - 140 - 55, h, panel2, (HMENU)ID_CORR_FALD_PATH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldPath);
+    g_gui.hwndFaldBrowse = CreateWindow(L"BUTTON", L"...",
+        WS_CHILD | BS_OWNERDRAW, innerX + groupW - 50, innerY + 18, 40, h, panel2, (HMENU)ID_CORR_FALD_BROWSE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldBrowse);
 
-    ctrl = CreateWindow(L"STATIC", L"View:", WS_CHILD, innerX + 80, innerY + 20, 35, h, panel2, nullptr, nullptr, nullptr);
+    // Row 2: SDR under ACM (inert on a plain 8-bit SDR desktop — the render gate checks the frame format)
+    int faldSdrY = innerY + 45;
+    ctrl = CreateWindow(L"STATIC", L"SDR (ACM):", WS_CHILD, innerX + 10, faldSdrY + 2, 62, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldSdrEnable = CreateWindow(L"BUTTON", L"Enable",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 75, faldSdrY, 60, h, panel2, (HMENU)ID_CORR_FALD_SDR_ENABLE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldSdrEnable);
+    g_gui.hwndFaldSdrPath = CreateWindow(L"EDIT", L"", WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        innerX + 140, faldSdrY, groupW - 140 - 55, h, panel2, (HMENU)ID_CORR_FALD_SDR_PATH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldSdrPath);
+    g_gui.hwndFaldSdrBrowse = CreateWindow(L"BUTTON", L"...",
+        WS_CHILD | BS_OWNERDRAW, innerX + groupW - 50, faldSdrY, 40, h, panel2, (HMENU)ID_CORR_FALD_SDR_BROWSE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldSdrBrowse);
+
+    // Row 3: debug view + pedestal mode (apply to both modes; the monitor is in one mode at a time)
+    int faldY = innerY + 72;
+    ctrl = CreateWindow(L"STATIC", L"View:", WS_CHILD, innerX + 10, faldY + 2, 35, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
     g_gui.hwndFaldDebug = CreateWindow(L"COMBOBOX", nullptr,
         WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-        innerX + 115, innerY + 18, 120, 120, panel2, (HMENU)ID_CORR_FALD_DEBUG, nullptr, nullptr);
+        innerX + 45, faldY, 150, 120, panel2, (HMENU)ID_CORR_FALD_DEBUG, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldDebug);
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Corrected image");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Gain map (red +, blue -)");
@@ -720,20 +748,10 @@ void CreateGUILayout(HWND hwnd) {
     // pedMode branch in fald_shader.h Correct().
     g_gui.hwndFaldPedMode = CreateWindow(L"BUTTON", L"Per-channel pedestal",
         WS_CHILD | BS_AUTOCHECKBOX,
-        innerX + 245, innerY + 18, 140, h, panel2, (HMENU)ID_CORR_FALD_PEDMODE, nullptr, nullptr);
+        innerX + 205, faldY, 140, h, panel2, (HMENU)ID_CORR_FALD_PEDMODE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldPedMode);
 
-    int faldY = innerY + 45;
-    ctrl = CreateWindow(L"STATIC", L"Panel file:", WS_CHILD, innerX + 10, faldY + 2, 60, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldPath = CreateWindow(L"EDIT", L"", WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-        innerX + 70, faldY, groupW - 70 - 55, h, panel2, (HMENU)ID_CORR_FALD_PATH, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldPath);
-    g_gui.hwndFaldBrowse = CreateWindow(L"BUTTON", L"...",
-        WS_CHILD | BS_OWNERDRAW, innerX + groupW - 50, faldY, 40, h, panel2, (HMENU)ID_CORR_FALD_BROWSE, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldBrowse);
-
-    g_gui.contentHeight[2] = innerY + 72 + 8;  // HDR-only: Tonemapping + MaxTML + FALD
+    g_gui.contentHeight[2] = innerY + 99 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM rows)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);

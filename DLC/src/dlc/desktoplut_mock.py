@@ -14,6 +14,36 @@ class _MockApiError(Exception):
     """Internal: a request the C++ server would reject (mirrored error text)."""
 
 
+def _fald_file_transfer(path: Path) -> str | None:
+    """C++ FaldPanelFileTransfer: 'pq' for FLD1/FLD2, FLD3 word 40 (0 pq / 1 gamma), None when unreadable."""
+    import struct
+    try:
+        head = path.read_bytes()[: 41 * 4]
+    except OSError:
+        return None
+    if len(head) < 4:
+        return None
+    magic = struct.unpack("<I", head[:4])[0]
+    if magic in (0x464C4431, 0x464C4432):
+        return "pq"
+    if magic == 0x464C4433 and len(head) == 41 * 4:
+        code = struct.unpack("<I", head[40 * 4:41 * 4])[0]
+        return {0: "pq", 1: "gamma"}.get(code)
+    return None
+
+
+def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
+    """The fald_* keys C++ HandleStateGet puts into layers[key] for every pair."""
+    entry = entry or {}
+    path = str(entry.get("params_path") or "")
+    out: dict[str, Any] = {"fald_params_path": path, "fald_debug_mode": int(entry.get("debug_mode", 0)),
+                           "fald_ped_mode": int(entry.get("ped_mode", 0)), "fald_ped_colour_in_file": False}
+    transfer = _fald_file_transfer(Path(path)) if path else None
+    if transfer is not None:
+        out["fald_file_transfer"] = transfer
+    return out
+
+
 @dataclass
 class MockDesktopLutState:
     running: bool = True
@@ -25,10 +55,18 @@ class MockDesktopLutState:
     # Live HDR-active state per monitor index (the OS advanced-color flip
     # windows.set_hdr drives). Absent ⇒ SDR. Capability is fixed (see HDR_CAPABLE).
     hdr: dict[int, bool] = field(default_factory=dict)
+    # Windows ACM ("Automatically manage color for apps") per monitor index (C++ 2026-09-14, work guide
+    # C8: query_monitors reads it through DisplayConfig — the DXGI colour space cannot see it). Absent
+    # = off. There is no pipe verb for it (a Windows Settings toggle); tests set it on the state directly.
+    acm: dict[int, bool] = field(default_factory=dict)
     # Viewing layers per "monitor:MODE" (C++ HandleStateGet "layers"): the MHC's white
-    # balance / correction grayscale / Desktop Gamma bits + the HDR tonemap shader flag.
-    # Absent key = all OFF (a fresh install).
+    # balance / correction grayscale / Desktop Gamma bits, the HDR tonemap shader flag and the
+    # per-mode FALD flag (HDR, or SDR under ACM). Absent key = all OFF (a fresh install).
     layers: dict[str, dict[str, bool]] = field(default_factory=dict)
+    # FALD layer settings per "monitor:MODE" that are NOT flags (C++ FaldSettings: paramsPath, debugMode, pedMode).
+    # Reported inside layers[key] like the C++ HandleStateGet; kept through calibration.enter / disable_all
+    # (the C++ clears only the enabled flag).
+    fald: dict[str, dict[str, Any]] = field(default_factory=dict)
     # DWM-hook LUT routing (C++ HandleStateGet "hook"): the sticky per-DWM-session
     # context->monitor assignment. ``hook_twins`` = the first two monitors are same-size/
     # same-bpc so the DLL had to ORDER-match them (the 2026-09-03 coin toss); ``hook_routing_
@@ -53,10 +91,11 @@ class MockDesktopLutState:
             "mhc": deepcopy(self.mhc),
             "runtime": deepcopy(self.runtime),
             "hdr": deepcopy(self.hdr),
-            # C++ reports every monitor:mode pair (absent = a fresh install, all OFF)
+            # C++ reports every monitor:mode pair (absent = a fresh install, all OFF), fald settings included
             "layers": {k: {"tonemap": False, "fald": False, "desktop_gamma": False, "white_balance": False,
-                           "grayscale": False, **(self.layers.get(k) or {})}
+                           "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
+            "fald": deepcopy(self.fald),
             "command_count": self.command_count,
         }
 
@@ -91,11 +130,11 @@ class MockDesktopLutServer:
             if method == "corrections.disable_all":
                 self._cleanup_active_gs_live()   # C++ CleanupActiveGsLive runs here too
                 self.state.corrections_enabled = False
+                # C++ DoDisableAll clears the shader flags of every monitor:mode (tonemap, fald in BOTH modes)
+                for cur in self.state.layers.values():
+                    cur["tonemap"] = False
+                    cur["fald"] = False
                 return self.ok({"corrections_enabled": False})
-            if method == "layers.set":
-                return self.handle_layers_set(params)
-            if method == "layers.set":
-                return self.handle_layers_set(params)
             if method == "layers.set":
                 return self.handle_layers_set(params)
             if method.startswith("calibration."):
@@ -187,8 +226,12 @@ class MockDesktopLutServer:
         ]
         for m in monitors:
             active = bool(self.state.hdr.get(m["index"], False))
+            acm = bool(self.state.acm.get(m["index"], False))
             m["hdr_active"] = active
-            m["color_space"] = "HDR" if active else "SDR"
+            # C++ 2026-09-14 (C8): ACM_SDR comes from DisplayConfig (24H2 activeColorMode WCG, older builds
+            # advancedColorEnabled && !HDR); color_mode_source names the query that decided.
+            m["color_space"] = "HDR" if active else ("ACM_SDR" if acm else "SDR")
+            m["color_mode_source"] = "dxgi" if active else "displayconfig2"
         return {"available": True, "simulated": True, "count": len(monitors), "monitors": monitors}
 
     def handle_set_hdr(self, params: dict[str, Any]) -> DesktopLutResponse:
@@ -237,7 +280,9 @@ class MockDesktopLutServer:
         self.state.mhc = deepcopy(snapshot.get("mhc", {}))
         self.state.runtime = deepcopy(snapshot.get("runtime", {}))
         self.state.hdr = {int(k): bool(v) for k, v in deepcopy(snapshot.get("hdr", {})).items()}
-        self.state.layers = deepcopy(snapshot.get("layers", {}))
+        self.state.layers = {k: {n: bool(v) for n, v in (d or {}).items() if n in self.LAYER_NAMES}
+                             for k, d in deepcopy(snapshot.get("layers", {})).items()}
+        self.state.fald = deepcopy(snapshot.get("fald", {}))
         return self.ok({"snapshot_id": snapshot_id, "restored": True})
 
     def _cleanup_active_gs_live(self) -> None:
@@ -254,15 +299,17 @@ class MockDesktopLutServer:
                     st.pop("correction_grayscale", None)
 
     LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
+    SHADER_LAYERS = ("tonemap", "fald")      # shader flags: no MHC re-bake
 
     def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
         """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
         an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
-        client saw before the toggle is gone, its source_file identity is not)."""
+        client saw before the toggle is gone, its source_file identity is not). desktop_gamma and
+        tonemap are HDR-only; fald is per mode (HDR, or SDR under ACM — 2026-09-14, work guide P7)."""
         key = self.key(params)
         is_hdr = key.endswith(":HDR")
         cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
-        before = dict(cur)
+        before = {**cur, "fald_params_path": str((self.state.fald.get(key) or {}).get("params_path") or "")}   # C++ LayersJson
         mhc_changed = False
         for name in self.LAYER_NAMES:
             if name in params:
@@ -273,7 +320,7 @@ class MockDesktopLutServer:
                     continue
                 if cur.get(name) != val:
                     cur[name] = val
-                    if name != "tonemap":
+                    if name not in self.SHADER_LAYERS:
                         mhc_changed = True
         self.state.layers[key] = cur
         entry = self.state.mhc.get(key) or {}
@@ -281,69 +328,8 @@ class MockDesktopLutServer:
         if mhc_changed and entry.get("applied") and entry.get("profile_name"):
             entry["profile_name"] = f"DesktopLUT-sim-{key.replace(':', '-')}-perm{self.state.command_count}.icm"
             regenerated = True
-        return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
-                        "regenerated": regenerated, "profile_name": entry.get("profile_name")})
-
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
-
-    def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
-        """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
-        an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
-        client saw before the toggle is gone, its source_file identity is not)."""
-        key = self.key(params)
-        is_hdr = key.endswith(":HDR")
-        cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
-        before = dict(cur)
-        mhc_changed = False
-        for name in self.LAYER_NAMES:
-            if name in params:
-                val = bool(params[name])
-                if not is_hdr and name in ("desktop_gamma", "tonemap"):
-                    if val:
-                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap are HDR-only layers")
-                    continue
-                if cur.get(name) != val:
-                    cur[name] = val
-                    if name != "tonemap":
-                        mhc_changed = True
-        self.state.layers[key] = cur
-        entry = self.state.mhc.get(key) or {}
-        regenerated = False
-        if mhc_changed and entry.get("applied") and entry.get("profile_name"):
-            entry["profile_name"] = f"DesktopLUT-sim-{key.replace(':', '-')}-perm{self.state.command_count}.icm"
-            regenerated = True
-        return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
-                        "regenerated": regenerated, "profile_name": entry.get("profile_name")})
-
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
-
-    def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
-        """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
-        an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
-        client saw before the toggle is gone, its source_file identity is not)."""
-        key = self.key(params)
-        is_hdr = key.endswith(":HDR")
-        cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
-        before = dict(cur)
-        mhc_changed = False
-        for name in self.LAYER_NAMES:
-            if name in params:
-                val = bool(params[name])
-                if not is_hdr and name in ("desktop_gamma", "tonemap"):
-                    if val:
-                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap are HDR-only layers")
-                    continue
-                if cur.get(name) != val:
-                    cur[name] = val
-                    if name != "tonemap":
-                        mhc_changed = True
-        self.state.layers[key] = cur
-        entry = self.state.mhc.get(key) or {}
-        regenerated = False
-        if mhc_changed and entry.get("applied") and entry.get("profile_name"):
-            entry["profile_name"] = f"DesktopLUT-sim-{key.replace(':', '-')}-perm{self.state.command_count}.icm"
-            regenerated = True
-        return self.ok({"monitor_mode": key, "before": before, "after": dict(cur),
+        after = {**cur, "fald_params_path": before["fald_params_path"]}
+        return self.ok({"monitor_mode": key, "before": before, "after": after,
                         "regenerated": regenerated, "profile_name": entry.get("profile_name")})
 
     # -- DWM-hook LUT routing (C++ HandleStateGet "hook" + DoHookSetRouting) ------------------
@@ -596,8 +582,53 @@ class MockDesktopLutServer:
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         return self.ok({"monitor_mode": key, "mhc": deepcopy(self.state.mhc.get(key, {}))})
 
+    def handle_fald(self, method: str, key: str, params: dict[str, Any]) -> DesktopLutResponse:
+        """C++ DoSetFaldParams / DoFaldDebug / DoFaldDump — per mode since 2026-09-14 (work guide P7)."""
+        is_hdr = key.endswith(":HDR")
+        fs = self.state.fald.setdefault(key, {})
+        if method == "runtime.set_fald_params":
+            # the file must exist and not be a directory, and a readable panel file's transfer must match the mode
+            # (FLD1/FLD2 = PQ = HDR; FLD3 word 40 1 = gamma = SDR under ACM). A file the header peek cannot classify
+            # is accepted (the C++ loader refuses it later, logged once) — the contract test hands over a .cube.
+            path = str(params.get("params_path") or "")
+            if not path:
+                return DesktopLutResponse(ok=False, error="missing parameter: params_path")
+            if not Path(path).is_file():
+                return DesktopLutResponse(ok=False, error="params_path is not a file")
+            transfer = _fald_file_transfer(Path(path))
+            if transfer is not None and transfer != ("pq" if is_hdr else "gamma"):
+                label = "gamma (SDR fit)" if transfer == "gamma" else "pq (HDR fit)"
+                return DesktopLutResponse(ok=False, error=f"panel file transfer {label} does not match mode "
+                                                          f"{'HDR' if is_hdr else 'SDR'}")
+            fs["params_path"] = path
+            return self.ok({"monitor_mode": key, "params_path": path, "transfer": transfer or "unknown"})
+        if method == "runtime.fald_debug":
+            mode = params.get("debug_mode"); ped = params.get("ped_mode")
+            if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..6) or ped_mode (0|1)")
+            if isinstance(mode, (int, float)):
+                fs["debug_mode"] = int(min(6, max(0, mode)))
+            if isinstance(ped, (int, float)):
+                fs["ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
+            return self.ok({"monitor_mode": key, "debug_mode": fs.get("debug_mode", 0), "ped_mode": fs.get("ped_mode", 0),
+                            "ped_colour_in_file": False})      # mock: no panel file is ever parsed
+        if method == "runtime.fald_dump":
+            d = str(params.get("dir") or "")
+            if not d:
+                return DesktopLutResponse(ok=False, error="missing parameter: dir")
+            if not Path(d).is_dir():
+                return DesktopLutResponse(ok=False, error="dir does not exist")
+            live_hdr = bool(self.state.hdr.get(int(params["monitor"]), False))
+            if live_hdr != is_hdr:   # C++: the dump is of the layer that runs, i.e. the live mode
+                return DesktopLutResponse(ok=False, error=f"monitor is in {'HDR' if live_hdr else 'SDR'}, "
+                                                          f"not {'HDR' if is_hdr else 'SDR'}")
+            return self.ok({"monitor_mode": key, "dir": d, "note": "mock: no render thread; nothing is written"})
+        return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
+
     def handle_runtime(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
         key = self.key(params)
+        if method.startswith("runtime.fald_") or method == "runtime.set_fald_params":
+            return self.handle_fald(method, key, params)       # C++: FaldSettings, not a runtime entry
         state = self.state.runtime.setdefault(key, {})
         if method == "runtime.set_3dlut":
             # C++ DoSet3dlut rejects a nonexistent cube_path up-front — mirror it so a
@@ -614,38 +645,6 @@ class MockDesktopLutServer:
             state["grayscale_tweak"] = deepcopy(params.get("grayscale_tweak", {}))
         elif method == "runtime.disable_grayscale_tweak":
             state.pop("grayscale_tweak", None)
-        elif method == "runtime.set_fald_params":
-            # C++ DoSetFaldParams: HDR only, the file must exist and not be a directory.
-            if params.get("mode") != "HDR":
-                return DesktopLutResponse(ok=False, error="fald is an HDR-only layer")
-            path = str(params.get("params_path") or "")
-            if not path:
-                return DesktopLutResponse(ok=False, error="missing parameter: params_path")
-            if not Path(path).is_file():
-                return DesktopLutResponse(ok=False, error="params_path is not a file")
-            state["fald_params_path"] = path
-            return self.ok({"monitor_mode": key, "params_path": path})
-        elif method == "runtime.fald_debug":
-            if params.get("mode") != "HDR":
-                return DesktopLutResponse(ok=False, error="fald is an HDR-only layer")
-            mode = params.get("debug_mode"); ped = params.get("ped_mode")
-            if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
-                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..6) or ped_mode (0|1)")
-            if isinstance(mode, (int, float)):
-                state["fald_debug_mode"] = int(min(6, max(0, mode)))
-            if isinstance(ped, (int, float)):
-                state["fald_ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
-            return self.ok({"monitor_mode": key, "debug_mode": state.get("fald_debug_mode", 0),
-                            "ped_mode": state.get("fald_ped_mode", 0),
-                            "ped_colour_in_file": False})      # mock: no panel file is ever parsed
-        elif method == "runtime.fald_dump":
-            d = str(params.get("dir") or "")
-            if not d:
-                return DesktopLutResponse(ok=False, error="missing parameter: dir")
-            if not Path(d).is_dir():
-                return DesktopLutResponse(ok=False, error="dir does not exist")
-            return self.ok({"monitor_mode": key, "dir": d,
-                            "note": "mock: no render thread; nothing is written"})
         else:
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         return self.ok({"monitor_mode": key, "runtime": deepcopy(self.state.runtime.get(key, {}))})
