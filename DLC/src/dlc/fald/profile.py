@@ -823,38 +823,40 @@ def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_dri
     _, ph, xb = best
 
     a0_fixed = ev.params.stat_area0_px2
+    # the refine's parameter vector: a frozen coordinate must be LEFT OUT, not pinned by bounds (a ±1e-6 box
+    # stalled the trust region on the HDR HW refit: phase_py / aniso never moved from their start values)
+    active = ["est_scale_mm", "drive_dim", "est_phase_px", "est_phase_py", "est_aniso"] + (["stat_area0_px2"] if fit_area0 else [])         + (["drive_k"] if fit_drive_k else [])
 
     def unpack(x):
-        kw = {"est_scale_mm": float(np.exp(x[0])), "drive_dim": float(np.exp(x[1])), "est_phase_px": float(x[2]),
-              "est_phase_py": float(x[3]), "est_aniso": float(np.exp(x[4])),
-              "stat_area0_px2": float(np.exp(x[5])) if fit_area0 else a0_fixed}
+        v = dict(zip(active, x))
+        kw = {"est_scale_mm": float(np.exp(v["est_scale_mm"])), "drive_dim": float(np.exp(v["drive_dim"])),
+              "est_phase_px": float(v["est_phase_px"]), "est_phase_py": float(v["est_phase_py"]),
+              "est_aniso": float(np.exp(v["est_aniso"])),
+              "stat_area0_px2": float(np.exp(v["stat_area0_px2"])) if fit_area0 else a0_fixed}
         if fit_drive_k:
-            kw["drive_curve"] = power_drive_curve(white, float(np.exp(x[6])))
+            kw["drive_curve"] = power_drive_curve(white, float(np.exp(v["drive_k"])))
         return kw
 
     def gfun(x):
         kw = unpack(x)
         ev.set(est_kind="exp", **kw)
         r = residuals(ev, items)
-        log(f"   B[refine]: scale={kw['est_scale_mm']:.4g} dim={kw['drive_dim']:.4g} phase=({x[2]:+.1f},{x[3]:+.1f}) "
-            f"aniso={kw['est_aniso']:.3f} A0={kw['stat_area0_px2']:.0f}" + (f" k={np.exp(x[6]):.3f}" if fit_drive_k else "")
-            + f"  rms={math.sqrt(np.mean(r * r)):.4f}")
+        log(f"   B[refine]: scale={kw['est_scale_mm']:.4g} dim={kw['drive_dim']:.4g} phase=({kw['est_phase_px']:+.1f},{kw['est_phase_py']:+.1f}) "
+            f"aniso={kw['est_aniso']:.3f} A0={kw['stat_area0_px2']:.0f}"
+            + (f" k={np.exp(dict(zip(active, x))['drive_k']):.3f}" if fit_drive_k else "") + f"  rms={math.sqrt(np.mean(r * r)):.4f}")
         return r
 
-    x0 = [xb[0], xb[1], ph, 0.0, 0.0, math.log(ev.params.stat_area0_px2)]
-    lo = [np.log(3.0), np.log(1e-3), -100.0, -60.0, np.log(0.25), np.log(200.0)]
-    hi = [np.log(120.0), np.log(0.6), 100.0, 60.0, np.log(2.0), np.log(6000.0)]
-    steps = [0.05, 0.05, 0.1, 0.2, 0.05, 0.1]
-    if not fit_area0:                                   # A0 pinned at Stage A's value: freeze the coordinate
-        lo[5], hi[5] = x0[5] - 1e-6, x0[5] + 1e-6
-    if fit_drive_k:
-        x0.append(math.log(0.55)); lo.append(math.log(0.2)); hi.append(math.log(1.5)); steps.append(0.05)
+    spec = {"est_scale_mm": (xb[0], np.log(3.0), np.log(120.0), 0.05), "drive_dim": (xb[1], np.log(1e-3), np.log(0.6), 0.05),
+            "est_phase_px": (ph, -100.0, 100.0, 0.1), "est_phase_py": (0.0, -60.0, 60.0, 0.2), "est_aniso": (0.0, np.log(0.25), np.log(2.0), 0.05),
+            "stat_area0_px2": (math.log(ev.params.stat_area0_px2), np.log(200.0), np.log(6000.0), 0.1),
+            "drive_k": (math.log(0.55), math.log(0.2), math.log(1.5), 0.05)}
+    x0 = [spec[n][0] for n in active]; lo = [spec[n][1] for n in active]; hi = [spec[n][2] for n in active]; steps = [spec[n][3] for n in active]
     res = least_squares(gfun, np.array(x0), bounds=(lo, hi), diff_step=steps, max_nfev=5 if quick else 40, xtol=1e-3, ftol=1e-3)
     kw = unpack(res.x)
     ev.set(est_kind="exp", **kw)
     out = {k: v for k, v in kw.items() if k != "drive_curve"}
     if fit_drive_k:
-        out["drive_k"] = float(np.exp(res.x[6]))
+        out["drive_k"] = float(np.exp(dict(zip(active, res.x))["drive_k"]))
     out["rms"] = float(math.sqrt(np.mean(res.fun ** 2)))
     return out
 
