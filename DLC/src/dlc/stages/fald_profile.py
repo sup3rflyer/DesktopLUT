@@ -672,12 +672,21 @@ def phase_verify(s: Session, result: StageResult) -> None:
     from ..fald.profile import params_from_dict, plan_verify, ref_means
     g = _geometry(s.st)
     mode = str(s.st["fald"].get("mode") or "HDR")
-    bin_path = s.st["fald"].get("bin_path")
+    # --bin / --fit-json: read the SAME verify patterns through another panel file (e.g. the research file) for an
+    # A/B on this unit; the model columns then come from that file's fit JSON (none given = no model columns)
+    alt_bin = getattr(s.args, "bin", None)
+    bin_path = str(Path(alt_bin).resolve()) if alt_bin else s.st["fald"].get("bin_path")
     if not bin_path:
         result.block("no_bin", "run the export phase first")
         return
-    fit = json.loads(Path(s.st["fald"]["fit_path"]).read_text(encoding="utf-8"))
+    fit_src = getattr(s.args, "fit_json", None) or (None if alt_bin else s.st["fald"].get("fit_path"))
+    if not fit_src:
+        result.block("no_fit_json", "--bin needs --fit-json (the fit result that file was exported from) for the model columns")
+        return
+    fit = json.loads(Path(fit_src).read_text(encoding="utf-8"))
     params = params_from_dict(fit["params"])
+    result.metrics["bin"] = bin_path
+    result.metrics["fit_json"] = str(fit_src)
     model = FaldModel(params)
     ctl = s.controller
     try:
@@ -735,7 +744,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
         card.append({"name": r["name"], "off_vs_flat": r["off"] / f["off"] - 1.0, "id_vs_flat": r["id"] / f["id"] - 1.0,
                      "on_vs_flat": r["on"] / f["on"] - 1.0, "model_off": r["pred_off"] / f["pred_off"] - 1.0,
                      "model_on": r["pred_on"] / f["pred_on"] - 1.0})
-    vpath = _out_dir(s.ctx) / "verify.json"
+    vpath = _out_dir(s.ctx) / ("verify.json" if not alt_bin else f"verify_{Path(bin_path).stem}.json")
     atomic_write_text(vpath, json.dumps({"rows": rows, "scorecard": card}, indent=1, default=float))
     result.add_artifact(vpath)
     result.metrics["scorecard"] = card
@@ -817,6 +826,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="fit: print every iteration")
     parser.add_argument("--name", default=None, help="export: panel short name for the file names")
     parser.add_argument("--out", default=None, help="export: output directory (default results/fald_profile_<name>_<mode>_<date>)")
+    parser.add_argument("--bin", default=None, help="verify: read through THIS panel file instead of the exported one (A/B)")
+    parser.add_argument("--fit-json", default=None, dest="fit_json", help="verify with --bin: that file's fit result JSON (model columns)")
     args = parser.parse_args(argv)
     ctx = _common.resolve_run(args, create=(args.phase == "preflight"))
     args.run = ctx.root

@@ -184,7 +184,7 @@ def test_quick_fit_recovers_the_hidden_estimate():
 # ----------------------------------------------------------------------------- the stage tool under --simulate
 _DEFAULTS = dict(monitor=1, mode="SDR", simulate=True, pipe="", zones="32x18", diagonal_in=32.0, px_mm=None, meter=None,
                  bit_depth=None, white_nits=1000.0, dogegen_server="127.0.0.1:28930", settle=0.0, profile=None,
-                 no_native=False, quick=True, knots="never", verbose=False, name="sim", out=None)
+                 no_native=False, quick=True, knots="never", verbose=False, name="sim", out=None, bin=None, fit_json=None)
 
 
 def _ns(ctx, **over):
