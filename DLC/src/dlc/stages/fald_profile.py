@@ -597,7 +597,7 @@ def phase_fit(s: Session, result: StageResult) -> None:
     summary = {k: {kk: round(vv, 3) if isinstance(vv, float) else vv for kk, vv in v.items() if kk != "rows"} for k, v in res["heldout"].items()}
     result.metrics.update({"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": {k: v for k, v in (res["knots"] or {}).items() if k != "heldout"},
                            "heldout": summary, "in_sample": {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in {**res.get("stage_a_report", {}), **res.get("stage_b_report", {})}.items()},
-                           "n_items": res["n_items"], "elapsed_s": round(time.time() - t0, 1)})
+                           "n_items": res["n_items"], "area0_source": res.get("area0_source"), "elapsed_s": round(time.time() - t0, 1)})
     s.st["fald"]["fit_path"] = str(fit_path)
     s.st["fald"]["phases"]["fit"] = {"status": "done", "at": time.time()}
     worst = max((v["mean_abs"] for v in res["heldout"].values() if v.get("mean_abs") is not None), default=None)

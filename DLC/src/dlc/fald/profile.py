@@ -800,7 +800,8 @@ def fit_stage_a(ev: Evaluator, items, *, quick: bool = False, log=print) -> dict
     return {**dict(zip(names, (float(x) for x in v))), "rms": float(math.sqrt(np.mean(res.fun ** 2)))}
 
 
-def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_drive_k: bool = False) -> dict[str, float]:
+def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_drive_k: bool = False,
+                fit_area0: bool = True) -> dict[str, float]:
     """The firmware's estimate: exponential scale, sample phase (x, y), vertical anisotropy, dim-end
     drive, plus the area constant A0 seen through the rings@area patterns and (``fit_drive_k``, when the
     absolute drive sweep was below the meter floor) the power-law drive exponent through rings@drive.
@@ -821,9 +822,12 @@ def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_dri
             best = (rms, ph, res.x)
     _, ph, xb = best
 
+    a0_fixed = ev.params.stat_area0_px2
+
     def unpack(x):
         kw = {"est_scale_mm": float(np.exp(x[0])), "drive_dim": float(np.exp(x[1])), "est_phase_px": float(x[2]),
-              "est_phase_py": float(x[3]), "est_aniso": float(np.exp(x[4])), "stat_area0_px2": float(np.exp(x[5]))}
+              "est_phase_py": float(x[3]), "est_aniso": float(np.exp(x[4])),
+              "stat_area0_px2": float(np.exp(x[5])) if fit_area0 else a0_fixed}
         if fit_drive_k:
             kw["drive_curve"] = power_drive_curve(white, float(np.exp(x[6])))
         return kw
@@ -841,6 +845,8 @@ def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_dri
     lo = [np.log(3.0), np.log(1e-3), -100.0, -60.0, np.log(0.25), np.log(200.0)]
     hi = [np.log(120.0), np.log(0.6), 100.0, 60.0, np.log(2.0), np.log(6000.0)]
     steps = [0.05, 0.05, 0.1, 0.2, 0.05, 0.1]
+    if not fit_area0:                                   # A0 pinned at Stage A's value: freeze the coordinate
+        lo[5], hi[5] = x0[5] - 1e-6, x0[5] + 1e-6
     if fit_drive_k:
         x0.append(math.log(0.55)); lo.append(math.log(0.2)); hi.append(math.log(1.5)); steps.append(0.05)
     res = least_squares(gfun, np.array(x0), bounds=(lo, hi), diff_step=steps, max_nfev=5 if quick else 40, xtol=1e-3, ftol=1e-3)
@@ -892,8 +898,14 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
         out["stage_a_report"] = group_report(ev, a_items)
     else:
         out["stage_a"] = None
+    # A0: Stage A owns it when the absolute sliver / size-ramp reads were above the meter floor (the HW-validated
+    # route); the four rings@area patterns are a weak substitute used only when Stage A had none (SDR white).
+    # (HDR 2026-09-14: Stage A 1401 / research 1150 / rings@area 518 — the ring value was wrong and cost an
+    # 8.9-pp staircase outlier; review finding #6.)
+    has_area_abs = any(d["group"] in ("sliver", "lda_size") for d in a_items)
+    out["area0_source"] = "stage_a" if has_area_abs else "rings@area"
     if b_items:
-        out["stage_b"] = fit_stage_b(ev, b_items, quick=quick, log=log, fit_drive_k=fit_drive_k)
+        out["stage_b"] = fit_stage_b(ev, b_items, quick=quick, log=log, fit_drive_k=fit_drive_k, fit_area0=not has_area_abs)
         out["stage_b_report"] = group_report(ev, b_items)
     else:
         out["stage_b"] = None
