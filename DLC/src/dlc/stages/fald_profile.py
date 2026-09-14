@@ -56,7 +56,7 @@ def _check_in(events: EventWriter, **data: Any) -> None:
 
 def _anomaly(events: EventWriter, **data: Any) -> None:
     events.write("WARN", STAGE, "anomaly", tier="digest", **data)
-PHASES = ("preflight", "register", "grid", "drive", "leak", "rings", "fit", "heldout", "export", "verify", "restore")
+PHASES = ("preflight", "aid", "register", "grid", "drive", "leak", "rings", "fit", "heldout", "export", "verify", "restore")
 MEASURE_PHASES = ("register", "grid", "drive", "leak", "rings", "heldout", "verify")
 CHECKIN_EVERY_S = 180.0                 # wall-clock check-in cadence inside a measuring phase
 CHECKIN_FRACTIONS = (0.25, 0.5, 0.75)   # plus progress check-ins (short phases never go dark)
@@ -290,8 +290,10 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         result.block("mode_mismatch", f"run mode SDR but monitor {args.monitor} is in HDR")
         return
     if mode == "SDR" and cs == "SDR" and not args.simulate:
-        result.anomaly("acm_off", "SDR without Windows ACM (auto colour management): DesktopLUT's FP16 overlay path "
-                       "needs ACM on — enable 'Automatically manage color for apps' before profiling", "high")
+        result.anomaly("acm_off", "the pipe reports SDR without Windows ACM (auto colour management): DesktopLUT's FP16 "
+                       "overlay path needs ACM on — confirm 'Automatically manage color for apps' is on. NOTE the pipe's "
+                       "detection reads the DXGI output colour space, which does not change with ACM (work guide C8): "
+                       "with ACM verified on by the user this flag is a false positive", "medium")
     # zones + physical size
     try:
         cols, rows = (int(v) for v in str(args.zones).lower().split("x"))
@@ -368,6 +370,34 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
     result.advice = {"default_policy_verdict": "proceed_to_register",
                      "reasons": ["pipe alive, geometry recorded, native state entered, no layer on — the LLM confirms the "
                                  "meter is placed at the nominal spot with the placement aid before `register`"]}
+
+
+def phase_aid(args, ctx: RunContext, st: dict[str, Any], result: StageResult) -> None:
+    """Placement aid (no meter): the i1D3 BODY footprint as a dim mid-grey rectangle centred on the nominal
+    sensor spot, on a dim field (60 on 8 nits — it can stay on screen for minutes; FALD probe hygiene:
+    no full-signal static frames). Paints via the daemon and returns; run `register` once the meter sits on it."""
+    g = _geometry(st)
+    if args.simulate:
+        result.note("simulated: nothing to paint")
+        return
+    from ..fald.shapes import ShapesPresenter
+    host, _, srv_port = str(args.dogegen_server or "127.0.0.1:28930").partition(":")
+    pres = ShapesPresenter(host or "127.0.0.1", int(srv_port or 28930), settle_seconds=0.0)
+    if not pres.ping():
+        result.block("daemon", f"dogegen daemon not reachable at {host}:{srv_port}")
+        return
+    bw, bh = g.body_px
+    nominal = tuple(st["fald"].get("meter_nominal") or g.meter)
+    pres.paint([_bg_code(g.grey(8.0)), (g.grey(60.0), g.rect(nominal[0] - bw / 2, nominal[1] - bh / 2, bw, bh))])
+    pres.close()
+    result.action(f"painted the body aid {bw:.0f}x{bh:.0f} px centred on {nominal} (60 nits on 8 nits)")
+    result.metrics.update({"aid_centre_px": list(nominal), "body_px": [round(bw), round(bh)]})
+    result.advice = {"default_policy_verdict": "place_meter_then_register",
+                     "reasons": ["centre the meter body on the dim rectangle; register then finds the sensor to ~5 px"]}
+
+
+def _bg_code(code3):
+    return (tuple(code3), (0.0, 0.0, 1.0, 1.0))
 
 
 def phase_register(s: Session, result: StageResult) -> None:
@@ -743,6 +773,9 @@ def build(args, ctx: RunContext) -> StageResult:
         return result
     if "geometry" not in st["fald"]:
         result.block("no_preflight", "run --phase preflight first (it records the panel geometry and enters the native state)")
+        return result
+    if phase == "aid":
+        phase_aid(args, ctx, st, result)
         return result
     need_meter = phase in MEASURE_PHASES
     try:
