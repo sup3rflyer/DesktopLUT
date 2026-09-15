@@ -610,7 +610,7 @@ def _collect_items(s: Session):
 
 
 def phase_fit(s: Session, result: StageResult) -> None:
-    from ..fald.profile import params_dict, params_from_dict, run_fit
+    from ..fald.profile import DRIVE_K0, fade_report, params_from_dict, run_fit
     g, pats, reads, items = _collect_items(s)
     if not any(i["group"] == "rings" for i in items):
         result.block("no_rings_data", "run the rings phase first")
@@ -622,32 +622,82 @@ def phase_fit(s: Session, result: StageResult) -> None:
                        "what is there; re-run that phase for a shippable fit", "medium")
     dc = s.st["fald"].get("drive_curve") or None
     cw = s.st["fald"].get("chan_weights")
+    k0_arg = getattr(s.args, "k0", None)
+    k0 = DRIVE_K0 if k0_arg is None else float(k0_arg)
+    if not (0.2 < k0 < 1.5):
+        result.block("k0_arg", f"--k0 {k0:g} is outside the drive exponent's fit bounds (0.2, 1.5)")
+        return
+    if dc and k0_arg is not None:
+        result.note(f"--k0 {k0:g} ignored: the absolute drive sweep gave a usable drive curve (no power-law fit)")
     base = g.base_params(**({"drive_curve": [tuple(x) for x in dc]} if dc else {}), **({"chan_weights": tuple(cw)} if cw else {}))
     quick = bool(s.args.quick)
     log = (lambda *a: print(*a, file=sys.stderr, flush=True)) if s.args.verbose else (lambda *a: None)
     t0 = time.time()
-    res = run_fit(base, items, quick=quick, knots=s.args.knots, fit_drive_k=not dc, log=log)
+    res = run_fit(base, items, quick=quick, knots=s.args.knots, fit_drive_k=not dc, k0=k0, log=log)
+    # evidence for the export seam: what each candidate pixel-luminance fade does to the measured rings (~45 s per fade
+    # on ~100 items at 4K; dim items only — brighter items reuse the no-fade correction)
+    fr = None
+    if getattr(s.args, "fade_report", True):
+        fr = fade_report(params_from_dict(res["params"]), items, log=log)
+    strip = lambda rep: {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in (rep or {}).items()}
     fit_path = _out_dir(s.ctx) / "fald_fit_result.json"
     payload = {"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": res["knots"], "params": res["params"],
-               "drive_floor": res.get("drive_floor"), "by_level": res.get("by_level"),
+               "estimate": res.get("estimate"), "params_exp": res.get("params_exp"), "params_knots": res.get("params_knots"),
+               "drive_curve_source": "measured" if dc else "power_law_fit", "k0": None if dc else k0,
+               "drive_k_consistency": res.get("drive_k_consistency"), "area0_source": res.get("area0_source"),
+               "area0_stage_a": res.get("area0_stage_a"), "area0_stage_b": res.get("area0_stage_b"),
+               "abs_report_exported": res.get("abs_report_exported"),
+               "drive_floor": res.get("drive_floor"), "by_level": res.get("by_level"), "fade_report": fr,
                "augment_regime": getattr(s.args, "augment_regime", "off"),
-               "heldout": {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in res["heldout"].items()},
+               "heldout": strip(res["heldout"]),
                "geometry": s.st["fald"]["geometry"], "mode": s.st["fald"].get("mode"), "n_items": res["n_items"],
                "elapsed_s": res["elapsed_s"], "quick": quick}
     atomic_write_text(fit_path, json.dumps(payload, indent=1, default=float))
     result.add_artifact(fit_path)
     summary = {k: {kk: round(vv, 3) if isinstance(vv, float) else vv for kk, vv in v.items() if kk != "rows"} for k, v in res["heldout"].items()}
-    result.metrics.update({"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": {k: v for k, v in (res["knots"] or {}).items() if k != "heldout"},
-                           "heldout": summary, "in_sample": {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in {**res.get("stage_a_report", {}), **res.get("stage_b_report", {})}.items()},
-                           "n_items": res["n_items"], "area0_source": res.get("area0_source"), "drive_floor": res.get("drive_floor"),
-                           "by_level": res.get("by_level"), "elapsed_s": round(time.time() - t0, 1)})
+    knots_m = {k: v for k, v in (res["knots"] or {}).items() if k not in ("heldout", "gate")}
+    if res["knots"]:
+        gate = res["knots"]["gate"]
+        knots_m["gate"] = {k: v for k, v in gate.items() if k not in ("groups", "rules")}
+        knots_m["gate"]["groups"] = {gname: {kk: (round(vv, 3) if isinstance(vv, float) else vv) for kk, vv in row.items()}
+                                     for gname, row in gate["groups"].items()}
+    result.metrics.update({"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": knots_m, "estimate": res.get("estimate"),
+                           "heldout": summary, "in_sample": strip({**res.get("stage_a_report", {}), **res.get("stage_b_report", {})}),
+                           "n_items": res["n_items"], "area0_source": res.get("area0_source"),
+                           "area0_stage_a": res.get("area0_stage_a"), "area0_stage_b": res.get("area0_stage_b"),
+                           "abs_misses_exported": strip(res.get("abs_report_exported")),
+                           "drive_k_consistency": res.get("drive_k_consistency"), "drive_floor": res.get("drive_floor"),
+                           "by_level": res.get("by_level"),
+                           "fade_report": {k: v for k, v in fr.items() if k != "items"} if fr else None,
+                           "elapsed_s": round(time.time() - t0, 1)})
+    cons = res.get("drive_k_consistency")
+    if cons and not cons.get("converged"):
+        result.anomaly("drive_k_not_converged", f"Stage A's tmin and Stage B's drive exponent did not agree: {cons.get('reason')} "
+                       f"(k rounds {cons.get('k_start')} -> {cons.get('k_final')}, tmin {cons.get('tmin_rounds')}) — refit with "
+                       "--k0 0.40 / 0.70 (multi-start) and compare", "medium")
+    sa = res.get("stage_a") or {}
+    if sa.get("frozen_reason"):
+        result.note(f"Stage A: {sa['frozen_reason']}")
+    fl = res.get("drive_floor")
+    if fl and not fl.get("identified"):
+        result.note(f"drive floor {fl['chosen_nits']:g} nits NOT identified by the data (candidates below the dimmest field "
+                    f"{fl['dimmest_field_nits']:.3g} nits are indistinguishable) — a prior, not a measurement")
+    if res.get("area0_source") == "rings@area" and res.get("area0_stage_a") and res.get("area0_stage_b"):
+        result.note(f"A0: Stage A (absolute reads) {res['area0_stage_a']:.0f} px², exported (rings@area, Stage B) "
+                    f"{res['area0_stage_b']:.0f} px² — see abs_misses_exported for what the exported model misses")
     s.st["fald"]["fit_path"] = str(fit_path)
     s.st["fald"]["phases"]["fit"] = {"status": "done", "at": time.time()}
     worst = max((v["mean_abs"] for v in res["heldout"].values() if v.get("mean_abs") is not None), default=None)
-    result.advice = {"default_policy_verdict": "judge_fit",
-                     "reasons": [f"held-out worst group mean |err| {worst:.2f} (pp / %)" if worst is not None else "no held-out groups yet",
-                                 "ProArt reference: rings ≈ 1.0–1.3 pp, comp ≈ 2 pp, orange ≈ 4 pp, diagonal 0.4 pp",
-                                 "the LLM judges whether this panel fits the model; `heldout` freezes predictions and reads new patterns"]}
+    reasons = [f"held-out worst group mean |err| {worst:.2f} (pp / %)" if worst is not None else "no held-out groups yet",
+               "ProArt reference: rings ≈ 1.0–1.3 pp, comp ≈ 2 pp, orange ≈ 4 pp, diagonal 0.4 pp",
+               f"estimate {res.get('estimate')}" + (f" (knots gate: {'keep' if res['knots']['gate_keep'] else 'exp'}"
+                                                   f"{'; ' + '; '.join(res['knots']['gate']['reasons']) if res['knots']['gate']['reasons'] else ''})"
+                                                   if res["knots"] else ""),
+               "the LLM judges whether this panel fits the model; `heldout` freezes predictions and reads new patterns"]
+    if g.transfer == "gamma":
+        reasons.append("SDR: export needs --lum-fade LO,HI (from fade_report: the fade with no worse/invented rings at the dim "
+                       "levels, LO at or above the dimmest measured grey) or --lum-fade keep")
+    result.advice = {"default_policy_verdict": "judge_fit", "reasons": reasons}
 
 
 def phase_heldout(s: Session, result: StageResult) -> None:
@@ -677,6 +727,48 @@ def phase_heldout(s: Session, result: StageResult) -> None:
                                  "the LLM decides: export (the model describes this panel), refit with the held-out data folded in, or stop"]}
 
 
+LUM_FADE_LO_TOL = 0.05     # LO may sit this far (relative) below the dimmest grey's RENDERED nits: the nominal plan level
+                           # (0.5) renders one rounded 8-bit code higher (0.518) — typing the grey's level is not "below"
+
+
+def export_estimate_params(fit: dict[str, Any], estimate: str) -> tuple[Optional[dict[str, Any]], str]:
+    """(params dict, why) of the estimate ``export`` writes: "auto" = the fit's params (the knots gate's choice),
+    "exp" / "knots" = that estimate (``params_exp`` / ``params_knots``; fit JSONs from before 2026-09-15 derive them
+    from ``params`` + ``knots.est_knot_logw``). (None, reason) when the fit has no such estimate."""
+    base = dict(fit["params"])
+    kind = base.get("est_kind")
+    if estimate == "auto":
+        gate = (fit.get("knots") or {}).get("gate") or {}
+        return base, "auto: the fit's choice" + (f" (knots gate keep={gate.get('keep')})" if gate else "")
+    if estimate == "exp":
+        if fit.get("params_exp"):
+            return dict(fit["params_exp"]), "exp: params_exp"
+        if kind == "exp":
+            return base, "exp: the fit's params"
+        if kind == "knots":
+            return {**base, "est_kind": "exp", "est_knot_logw": []}, "exp: derived from the knots params (pre-gate fit JSON)"
+        return None, f"no exponential estimate in the fit (est_kind {kind!r})"
+    if estimate == "knots":
+        if fit.get("params_knots"):
+            return dict(fit["params_knots"]), "knots: params_knots"
+        if kind == "knots":
+            return base, "knots: the fit's params"
+        logw = (fit.get("knots") or {}).get("est_knot_logw")
+        if logw:
+            return {**base, "est_kind": "knots", "est_knot_logw": list(logw)}, "knots: derived from knots.est_knot_logw (pre-gate fit JSON)"
+        return None, "the fit has no knots estimate (refit with --knots auto or always)"
+    return None, f"--estimate must be exp, knots or auto (got {estimate!r})"
+
+
+def export_dimmest_grey(fit: dict[str, Any]) -> Optional[float]:
+    """The dimmest measured grey field, in RENDERED nits, from the fit's fade_report (else its by_level rows)."""
+    fr = fit.get("fade_report") or {}
+    if fr.get("dimmest_grey_nits") is not None:
+        return float(fr["dimmest_grey_nits"])
+    lv = [r.get("rendered_nits") for r in (fit.get("by_level") or []) if r.get("rendered_nits") is not None]
+    return float(min(lv)) if lv else None
+
+
 def phase_export(s: Session, result: StageResult) -> None:
     from ..fald.export import export_panel_params
     from ..fald.model import FaldModel
@@ -686,16 +778,55 @@ def phase_export(s: Session, result: StageResult) -> None:
         result.block("no_fit", "run the fit phase first")
         return
     fit = json.loads(Path(fit_path).read_text(encoding="utf-8"))
+    estimate = str(getattr(s.args, "estimate", None) or "auto")
+    chosen, why = export_estimate_params(fit, estimate)
+    if chosen is None:
+        result.block("estimate_unavailable", why)
+        return
+    fit["params"] = chosen
+    fit["estimate_chosen"] = {"requested": estimate, "est_kind": chosen.get("est_kind"),
+                              "gate_keep": (fit.get("knots") or {}).get("gate_keep"), "by": why}
+    result.action(f"estimate: {chosen.get('est_kind')} ({why})")
     params = params_from_dict(fit["params"])
-    if getattr(s.args, "lum_fade", None):
+    lum = getattr(s.args, "lum_fade", None)
+    gamma = params.transfer == "gamma"
+    if lum is None or not str(lum).strip():
+        if gamma:
+            dim = export_dimmest_grey(fit)
+            result.block("lum_fade_required", "SDR (gamma) panel file: choose the pixel-luminance fade from the fit's fade_report "
+                         "(per rendered grey level: mean |ring| with the layer on, n_worse, harm, invented per candidate fade) — "
+                         "--lum-fade LO,HI" + (f" with LO >= the dimmest measured grey ({dim:.3g} nits)" if dim else "")
+                         + f", or --lum-fade keep (the fit's {params.lum_fade_lo:g},{params.lum_fade_hi:g})")
+            return
+    elif str(lum).strip().lower() == "keep":
+        fit["lum_fade_chosen"] = {"lo": params.lum_fade_lo, "hi": params.lum_fade_hi, "by": "--lum-fade keep (LLM seam)"}
+        result.action(f"pixel-luminance fade kept at {params.lum_fade_lo:g}..{params.lum_fade_hi:g} nits (--lum-fade keep)")
+        dim = export_dimmest_grey(fit) if gamma else None
+        if dim is not None and params.lum_fade_lo < dim * (1.0 - LUM_FADE_LO_TOL):
+            result.note(f"kept fade LO {params.lum_fade_lo:g} nits is below the dimmest measured grey ({dim:.3g} nits): the "
+                        "correction runs (weakly) on levels no read constrained")
+    else:
         from dataclasses import replace as _replace
-        lo, hi = (float(v) for v in str(s.args.lum_fade).split(","))
+        try:
+            lo, hi = (float(v) for v in str(lum).split(","))
+        except ValueError:
+            result.block("lum_fade_arg", "--lum-fade takes LO,HI (as-if-white nits) or keep")
+            return
         if not (0.0 <= lo < hi):
             result.block("lum_fade_arg", "--lum-fade LO,HI needs 0 <= LO < HI (as-if-white nits of the pixel's own level)")
             return
+        if gamma:
+            dim = export_dimmest_grey(fit)
+            if dim is None:
+                result.anomaly("lum_fade_unchecked", "the fit JSON carries no fade_report / by_level rendered levels: LO could not "
+                               "be checked against the dimmest measured grey", "medium")
+            elif lo < dim * (1.0 - LUM_FADE_LO_TOL):
+                result.block("lum_fade_below_data", f"--lum-fade LO {lo:g} nits is below the dimmest measured grey ({dim:.3g} nits "
+                             "rendered): the correction would run on levels no read constrained — LO >= that grey")
+                return
         params = _replace(params, lum_fade_lo=lo, lum_fade_hi=hi)
         fit["params"]["lum_fade_lo"], fit["params"]["lum_fade_hi"] = lo, hi
-        fit["lum_fade_chosen"] = {"lo": lo, "hi": hi, "by": "LLM seam from the fit's by_level report"}
+        fit["lum_fade_chosen"] = {"lo": lo, "hi": hi, "by": "LLM seam from the fit's fade_report / by_level report"}
         result.action(f"pixel-luminance fade set to {lo:g}..{hi:g} nits")
     short = s.args.name or "panel"
     mode = str(s.st["fald"].get("mode") or "HDR").lower()
@@ -708,7 +839,8 @@ def phase_export(s: Session, result: StageResult) -> None:
     result.add_artifact(bin_path)
     result.add_artifact(json_path)
     result.metrics.update({"bin": str(bin_path), "fit_json": str(json_path), "format": info["format"], "bytes": info["bytes"],
-                           "transfer": params.transfer, "white_nits": params.white_nits})
+                           "transfer": params.transfer, "white_nits": params.white_nits, "estimate": params.est_kind,
+                           "lum_fade": [params.lum_fade_lo, params.lum_fade_hi]})
     s.st["fald"]["bin_path"] = str(bin_path)
     s.st["fald"]["export_fit_json"] = str(Path(json_path).resolve())
     s.st["fald"]["phases"]["export"] = {"status": "done", "at": time.time()}
@@ -975,6 +1107,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-native", action="store_true", dest="no_native", help="do NOT enter calibration mode / identity MHC (measure the current state knowingly)")
     parser.add_argument("--quick", action="store_true", help="fit: few iterations (smoke)")
     parser.add_argument("--knots", default="auto", choices=("never", "auto", "always"), help="fit: free-form near-field estimate profile")
+    parser.add_argument("--k0", type=float, default=None,
+                        help="fit: start exponent of the power-law drive curve when the drive sweep is unusable (default 0.55; "
+                             "multi-start 0.40 / 0.55 / 0.70; ignored with a usable measured drive curve)")
+    from argparse import BooleanOptionalAction
+    parser.add_argument("--fade-report", action=BooleanOptionalAction, default=True, dest="fade_report",
+                        help="fit: evaluate the candidate pixel-luminance fades on the measured rings (default on; ~45 s per fade)")
+    parser.add_argument("--estimate", default="auto", choices=("exp", "knots", "auto"),
+                        help="export: which estimate to write (auto = the fit's knots-gate choice)")
     parser.add_argument("--verbose", action="store_true", help="fit: print every iteration")
     parser.add_argument("--name", default=None, help="export: panel short name for the file names")
     parser.add_argument("--out", default=None, help="export: output directory (default results/fald_profile_<name>_<mode>_<date>)")
@@ -983,7 +1123,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--augment-regime", default="off", choices=("off", "id"), dest="augment_regime",
                         help="fit: use the augment patterns read layer-OFF (default) or through the awake overlay in identity")
     parser.add_argument("--lum-fade", default=None, dest="lum_fade",
-                        help="export: pixel-luminance fade LO,HI in as-if-white nits (chosen from the fit's by_level report)")
+                        help="export: pixel-luminance fade LO,HI in as-if-white nits (chosen from the fit's fade_report) or "
+                             "'keep' (the fit's own); REQUIRED for an SDR (gamma) panel file")
     parser.add_argument("--extended", action="store_true", help="verify: add 1-nit rings, thin bars and steep ramps to the set")
     parser.add_argument("--bin", default=None, help="verify: read through THIS panel file instead of the exported one (A/B)")
     parser.add_argument("--fit-json", default=None, dest="fit_json", help="verify with --bin: that file's fit result JSON (model columns)")

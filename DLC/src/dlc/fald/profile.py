@@ -673,24 +673,164 @@ def weight_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return items
 
 
+FADE_WORSE_TOL = 0.003          # a corrected ring counts as WORSE when |r| > |m| + 0.3 pp
+INVENTED_MEAS_MAX = 0.005       # "invented": the panel shows < 0.5 pp …
+INVENTED_MODEL_MIN = 0.01       # … but the model predicts a ring > 1 pp there
+FADE_CANDIDATES = ((0.0, 0.0), (0.5, 1.2), (0.5, 2.0), (0.5, 5.0), (1.0, 3.0), (1.0, 5.0), (2.0, 5.0))
+
+
+def field_nits(params: FaldParams, item: dict[str, Any]) -> Optional[float]:
+    """The RENDERED level (as-if-white nits, brightest channel) of a ratio item's reference field under ``params`` —
+    an 8-bit SDR code for the nominal 0.5-nit grey renders 0.518 nits; the fade and the drive floor act on this."""
+    if item.get("base") is None:
+        return None
+    code = np.asarray(item["base"][0][0], dtype=np.float64)
+    return float(np.max(params.code_to_nits(code)))
+
+
+def _is_grey_field(item: dict[str, Any]) -> bool:
+    c = item["base"][0][0]
+    return c[0] == c[1] == c[2]
+
+
+def _ring_flags(m: float, p: float, q: float = 0.0) -> dict[str, Any]:
+    """The panel's predicted ring after the model's correction, r = (1+m)(1+q)/(1+p) − 1 (m measured, p the model's
+    identity ring, q the model's own ring after its correction), and the flags the fade is judged by."""
+    r = (1.0 + m) * (1.0 + q) / max(1.0 + p, 1e-9) - 1.0
+    return {"r": r, "worse": abs(r) > abs(m) + FADE_WORSE_TOL, "harm": max(0.0, abs(r) - abs(m)),
+            "invented": abs(m) < INVENTED_MEAS_MAX and abs(p) > INVENTED_MODEL_MIN}
+
+
 def level_report(ev: "Evaluator", items) -> list[dict[str, Any]]:
     """Per (group, grey level): mean |err| in pp and how often the model gets the SIGN of the ring right where the
     measured ring is > 0.5 pp — the evidence the low-luminance fade is chosen from (below the level where the sign
-    agreement breaks, the correction would push the wrong way: the 2026-09-12 dark band)."""
+    agreement breaks, the correction would push the wrong way: the 2026-09-12 dark band).
+
+    ``n_worse`` / ``harm_pp`` / ``invented`` are the fade-report flags at the IDEAL inverse with no fade (the model
+    removes exactly its own ring, q = 0 → r = (1+m)/(1+p) − 1): cheap, and an upper bound on what a fade can rescue.
+    :func:`fade_report` runs the real correction per candidate fade. ``nits`` is the nominal plan level (the row key),
+    ``rendered_nits`` the level the reference field's code renders at."""
     rows: dict[tuple, list] = {}
+    rendered: dict[tuple, float] = {}
     for it in items:
         if it.get("level") is None or it["base"] is None:
             continue
         pred = ev.predict(it)
-        rows.setdefault((it["group"], float(it["level"])), []).append((it["y"] - 1.0, pred - 1.0))
+        key = (it["group"], float(it["level"]))
+        rows.setdefault(key, []).append((it["y"] - 1.0, pred - 1.0))
+        fn = field_nits(ev.params, it)
+        rendered[key] = fn if key not in rendered else min(rendered[key], fn)
     out = []
     for (grp, lvl), rs in sorted(rows.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         errs = [100 * abs(pr - me) for me, pr in rs]
         signed = [(me, pr) for me, pr in rs if abs(me) > 0.005]
         agree = sum(1 for me, pr in signed if (me > 0) == (pr > 0))
-        out.append({"group": grp, "nits": lvl, "n": len(rs), "mean_abs_pp": float(np.mean(errs)), "max_abs_pp": float(np.max(errs)),
-                    "sign_agree": f"{agree}/{len(signed)}", "mean_meas_pp": float(np.mean([100 * me for me, _ in rs]))})
+        flags = [_ring_flags(me, pr) for me, pr in rs]
+        out.append({"group": grp, "nits": lvl, "rendered_nits": rendered[(grp, lvl)], "n": len(rs),
+                    "mean_abs_pp": float(np.mean(errs)), "max_abs_pp": float(np.max(errs)),
+                    "sign_agree": f"{agree}/{len(signed)}", "mean_meas_pp": float(np.mean([100 * me for me, _ in rs])),
+                    "n_worse": sum(1 for f in flags if f["worse"]), "harm_pp": float(np.mean([100 * f["harm"] for f in flags])),
+                    "invented": sum(1 for f in flags if f["invented"])})
     return out
+
+
+def _fade_key(fade: Sequence[float]) -> str:
+    return f"{float(fade[0]):g}-{float(fade[1]):g}"
+
+
+def fade_report(params: FaldParams, items, fades: Sequence[Sequence[float]] = FADE_CANDIDATES, *, log=None) -> dict[str, Any]:
+    """What each candidate pixel-luminance fade does to the MEASURED rings — the evidence ``--lum-fade`` is chosen from.
+
+    Per ratio item with a level: m = measured ring (y − 1), p = the model's identity ring, q = the model's ring after
+    its OWN correction with that fade (corrected pattern / corrected flat, :func:`dlc.fald.correct.correct_image`),
+    r = (1+m)(1+q)/(1+p) − 1 = the ring the panel is predicted to show with the layer on. Flags: worse = |r| > |m| +
+    0.3 pp; harm = max(0, |r| − |m|); invented = |m| < 0.5 pp and |p| > 1 pp (the model sees a ring the panel does
+    not have). Rows per (fitted | heldout, RENDERED field nits): raw mean |m|, and per fade mean |r|, n_worse, harm.
+
+    A fade whose ``hi`` is at or below every pixel of an item's image (field and window) weights the whole image 1 —
+    exactly the no-fade correction — so that result is reused (the per-fade cost is the dim items only)."""
+    from .correct import correct_image
+    t0 = time.time()
+    its = [it for it in items if it.get("level") is not None and it.get("base") is not None]
+    fades = [(float(lo), float(hi)) for lo, hi in fades]
+    ident = FaldModel(params)
+    models: dict[tuple, FaldModel] = {}
+
+    def model_for(fade):
+        if fade not in models:
+            lo, hi = fade
+            models[fade] = FaldModel(replace(params, lum_fade_lo=lo, lum_fade_hi=hi))
+        return models[fade]
+
+    img_cache: dict = {}
+    id_cache: dict = {}
+    on_cache: dict = {}
+
+    def skey(shapes):
+        return tuple((tuple(c), tuple(round(v, 6) for v in g)) for c, g in shapes)
+
+    def image(shapes):
+        k = skey(shapes)
+        if k not in img_cache:
+            img = ident.render(shapes)
+            img_cache[k] = (img, float(img.max(axis=0).min()))
+        return img_cache[k]
+
+    def y_id(shapes, meter):
+        k = (skey(shapes), tuple(meter))
+        if k not in id_cache:
+            id_cache[k] = float(ident.meter_img(image(shapes)[0], tuple(meter)).sum())
+        return id_cache[k]
+
+    def y_on(shapes, meter, fade):
+        img, darkest = image(shapes)
+        eff = fade if (fade[1] > fade[0] >= 0.0 and darkest < fade[1]) else (0.0, 0.0)
+        k = (skey(shapes), tuple(meter), eff)
+        if k not in on_cache:
+            m = model_for(eff)
+            on_cache[k] = float(m.meter_img(correct_image(m, img)["req"], tuple(meter)).sum())
+        return on_cache[k]
+
+    rows = []
+    for it in its:
+        mtr = it["meter"]
+        m = it["y"] - 1.0
+        p = y_id(it["shapes"], mtr) / max(y_id(it["base"], mtr), 1e-9) - 1.0
+        row = {"name": it["name"], "group": it["group"], "split": "heldout" if it["group"] in HELD_GROUPS else "fitted",
+               "nits": field_nits(params, it), "grey": _is_grey_field(it), "meas_pp": 100 * m, "model_id_pp": 100 * p,
+               "invented": abs(m) < INVENTED_MEAS_MAX and abs(p) > INVENTED_MODEL_MIN, "by_fade": {}}
+        for fade in fades:
+            q = y_on(it["shapes"], mtr, fade) / max(y_on(it["base"], mtr, fade), 1e-9) - 1.0
+            f = _ring_flags(m, p, q)
+            row["by_fade"][_fade_key(fade)] = {"model_on_pp": 100 * q, "panel_on_pp": 100 * f["r"], "worse": f["worse"],
+                                               "harm_pp": 100 * f["harm"]}
+        rows.append(row)
+        if log:
+            log(f"   fade report {len(rows)}/{len(its)} {it['name']}")
+
+    def summarise(sel):
+        out = {"n": len(sel), "raw_mean_abs_pp": float(np.mean([abs(r["meas_pp"]) for r in sel])),
+               "invented": sum(1 for r in sel if r["invented"]), "by_fade": {}}
+        for fade in fades:
+            fk = _fade_key(fade)
+            out["by_fade"][fk] = {"mean_abs_pp": float(np.mean([abs(r["by_fade"][fk]["panel_on_pp"]) for r in sel])),
+                                  "n_worse": sum(1 for r in sel if r["by_fade"][fk]["worse"]),
+                                  "harm_pp": float(np.mean([r["by_fade"][fk]["harm_pp"] for r in sel])),
+                                  "max_harm_pp": float(np.max([r["by_fade"][fk]["harm_pp"] for r in sel]))}
+        return out
+
+    levels = []
+    by_level: dict[tuple, list] = {}
+    for r in rows:
+        by_level.setdefault((r["split"], round(r["nits"], 4)), []).append(r)
+    for (split, nits), sel in sorted(by_level.items(), key=lambda kv: (kv[0][0] != "fitted", kv[0][1])):
+        levels.append({"split": split, "nits": nits, **summarise(sel)})
+    totals = {split: summarise([r for r in rows if r["split"] == split]) for split in ("fitted", "heldout")
+              if any(r["split"] == split for r in rows)}
+    greys = [r["nits"] for r in rows if r["grey"]]
+    return {"fades": [list(f) for f in fades], "worse_tol_pp": 100 * FADE_WORSE_TOL,
+            "dimmest_grey_nits": min(greys) if greys else None, "levels": levels, "totals": totals, "items": rows,
+            "elapsed_s": round(time.time() - t0, 1)}
 
 
 # ---------------------------------------------------------------------------- derived panel facts
@@ -894,49 +1034,118 @@ STAGE_B_GROUPS = ("rings", "rings@fine", "rings@area", "rings@drive", "rings@low
 HELD_GROUPS = ("rings@held", "rings@diag", "superpose", "comp", "orange", "rings@lowheld", "halo@held")
 NEAR_FIELD_GROUPS = ("rings@fine", "halo")
 DRIVE_FLOOR_CANDIDATES = (0.05, 0.15, 0.3, 0.5, 1.0)
+DRIVE_FLOOR_IDENT_REL = 0.01       # candidates whose dim-item rms are within 1 % of the best are indistinguishable
+
+# Stage A parameter vector (log space): start, lower and upper bound
+STAGE_A_PARAMS = ("core_mm", "tail_mm", "tail_frac", "tmin", "aperture_px", "kernel_pnorm", "stat_area0_px2")
+STAGE_A_X0 = {"core_mm": 8.0, "tail_mm": 28.0, "tail_frac": 0.35, "tmin": 1e-3, "aperture_px": 60.0, "kernel_pnorm": 1.8,
+              "stat_area0_px2": 1150.0}
+STAGE_A_LO = {"core_mm": 1.5, "tail_mm": 8.0, "tail_frac": 0.02, "tmin": 5e-5, "aperture_px": 30.0, "kernel_pnorm": 1.0,
+              "stat_area0_px2": 200.0}
+STAGE_A_HI = {"core_mm": 25.0, "tail_mm": 90.0, "tail_frac": 0.9, "tmin": 1e-2, "aperture_px": 140.0, "kernel_pnorm": 2.5,
+              "stat_area0_px2": 6000.0}
+STAGE_A_MIN_SPARE_ITEMS = 3        # fewer Stage-A items than n_params + 3: kernel_pnorm is frozen at its start
+
+# Drive-curve consistency between the stages when the absolute drive sweep was unusable (SDR): Stage A starts on a
+# power law of DRIVE_K0 (never the FaldParams default HDR-nits curve), then only tmin — the one Stage-A parameter
+# coupled to k (the pedestal at non-white drives) — is re-fitted under Stage B's k, and Stage B re-runs warm only when
+# tmin moved. NOT a full A<->B alternation: SDR Stage A is underdetermined and a full re-fit wanders along a flat
+# valley (hardening review 2026-09-15: core 8.14 -> 6.99, p-norm -> the 2.5 bound, Stage B rms worse).
+DRIVE_K0 = 0.55
+TOL_LOGK = 0.02
+TOL_LOGTMIN = 0.05
+MAX_ROUNDS = 3
+SYNTH_SDR_DRIVE_K = 0.57           # the synthetic SDR panel's hidden power-law drive exponent
+
+# Knots gate (hardening review 2026-09-15; recorded fits: HDR kept, SDR run-1 kept, SDR augmented kept, the
+# Stage-A-fixed augmented fit not kept)
+KNOTS_NEAR_MIN_GAIN_PP = 0.2       # 1. near-field total gain must exceed this …
+KNOTS_NEAR_MAX_WORSE_PP = 0.2      #    … with no near-field group worse by more than this
+KNOTS_UNFIT_FRAC = 0.5             # 2. exp error >= 0.5 x the group's measured ring: "unfit" (listed, cannot veto)
+KNOTS_VETO_FLOOR_PP = 1.0          # 3. a describable group with n >= 3 worsening > max(1.0 pp, 0.5 x its exp error)
+KNOTS_VETO_REL = 0.5
+KNOTS_VETO_MIN_N = 3
+KNOTS_NET_MAX_PP = 0.1             # 4. n-weighted mean change over the describable groups <= +0.1 pp
 
 
-def fit_stage_a(ev: Evaluator, items, *, quick: bool = False, log=print) -> dict[str, float]:
-    """K_true (core, tail, share, p-norm), tmin, A0 and the meter aperture from the absolute reads."""
+def fit_stage_a(ev: Evaluator, items, *, quick: bool = False, log=print, x0: Optional[dict[str, float]] = None,
+                active: Sequence[str] = STAGE_A_PARAMS) -> dict[str, Any]:
+    """K_true (core, tail, share, p-norm), tmin, A0 and the meter aperture from the absolute reads.
+
+    ``x0`` overrides the start values (a warm start: clipped strictly inside the bounds); parameters not in ``active``
+    are held at their start value. With fewer items than n_params + 3, kernel_pnorm is frozen at its start (SDR: 8
+    absolute reads for 7 parameters). ``frozen`` in the result lists every parameter that was not fitted."""
     from scipy.optimize import least_squares
-    names = ["core_mm", "tail_mm", "tail_frac", "tmin", "aperture_px", "kernel_pnorm", "stat_area0_px2"]
-    x0 = np.log([8.0, 28.0, 0.35, 1e-3, 60.0, 1.8, 1150.0])
-    lo = np.log([1.5, 8.0, 0.02, 5e-5, 30.0, 1.0, 200.0]); hi = np.log([25.0, 90.0, 0.9, 1e-2, 140.0, 2.5, 6000.0])
+    names = list(STAGE_A_PARAMS)
+    start = dict(STAGE_A_X0)
+    if x0:
+        start.update({k: float(v) for k, v in x0.items() if k in start})
+    act = [n for n in names if n in active]
+    reason = None
+    if "kernel_pnorm" in act and len(items) < len(act) + STAGE_A_MIN_SPARE_ITEMS:
+        act.remove("kernel_pnorm")
+        reason = f"kernel_pnorm frozen at {start['kernel_pnorm']:g}: {len(items)} Stage-A items < {len(act) + 1} params + {STAGE_A_MIN_SPARE_ITEMS}"
+    frozen = [n for n in names if n not in act]
+    lo = np.log([STAGE_A_LO[n] for n in act]); hi = np.log([STAGE_A_HI[n] for n in act])
+    xs = np.log([start[n] for n in act])
+    if x0:
+        xs = np.clip(xs, lo + 1e-6, hi - 1e-6)
+
+    def values(x) -> dict[str, float]:
+        v = {n: start[n] for n in frozen}
+        v.update(zip(act, np.exp(x)))
+        return {n: v[n] for n in names}
+
+    def apply(v):
+        ev.set(core_mm=v["core_mm"], tail_mm=v["tail_mm"], tail_frac=min(v["tail_frac"], 0.95), tmin=v["tmin"],
+               aperture_px=v["aperture_px"], kernel_pnorm=v["kernel_pnorm"], stat_area0_px2=v["stat_area0_px2"])
 
     def f(x):
-        v = np.exp(x)
-        ev.set(core_mm=v[0], tail_mm=v[1], tail_frac=min(v[2], 0.95), tmin=v[3], aperture_px=v[4], kernel_pnorm=v[5], stat_area0_px2=v[6])
+        v = values(x)
+        apply(v)
         r = residuals(ev, items)
-        log(f"   A: {' '.join(f'{n}={val:.4g}' for n, val in zip(names, v))}  rms={math.sqrt(np.mean(r * r)):.4f}")
+        log(f"   A: {' '.join(f'{n}={val:.4g}' for n, val in v.items())}  rms={math.sqrt(np.mean(r * r)):.4f}")
         return r
 
-    res = least_squares(f, x0, bounds=(lo, hi), diff_step=0.05, max_nfev=6 if quick else 40, xtol=1e-3, ftol=1e-3)
-    v = np.exp(res.x)
-    ev.set(core_mm=v[0], tail_mm=v[1], tail_frac=min(v[2], 0.95), tmin=v[3], aperture_px=v[4], kernel_pnorm=v[5], stat_area0_px2=v[6])
-    return {**dict(zip(names, (float(x) for x in v))), "rms": float(math.sqrt(np.mean(res.fun ** 2)))}
+    res = least_squares(f, xs, bounds=(lo, hi), diff_step=0.05, max_nfev=6 if quick else 40, xtol=1e-3, ftol=1e-3)
+    v = values(res.x)
+    apply(v)
+    out: dict[str, Any] = {**{n: float(val) for n, val in v.items()}, "rms": float(math.sqrt(np.mean(res.fun ** 2))),
+                           "frozen": frozen}
+    if reason:
+        out["frozen_reason"] = reason
+    return out
 
 
 def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_drive_k: bool = False,
-                fit_area0: bool = True) -> dict[str, float]:
+                fit_area0: bool = True, warm: bool = False, k_start: float = DRIVE_K0) -> dict[str, float]:
     """The firmware's estimate: exponential scale, sample phase (x, y), vertical anisotropy, dim-end
     drive, plus the area constant A0 seen through the rings@area patterns and (``fit_drive_k``, when the
     absolute drive sweep was below the meter floor) the power-law drive exponent through rings@drive.
-    A coarse phase grid first (the surface has local minima), then a continuous refine."""
+    A coarse phase grid first (the surface has local minima), then a continuous refine. ``warm`` skips the
+    grid and starts the refine from the evaluator's current estimate (clipped inside the bounds); ``k_start``
+    is the drive exponent's start."""
     from scipy.optimize import least_squares
-    best = None
     white = ev.params.white_nits
-    for ph in ([-30.0, 0.0] if quick else [-40.0, -20.0, 0.0, 20.0]):
-        def f(x, ph=ph):
-            ev.set(est_kind="exp", est_scale_mm=float(np.exp(x[0])), drive_dim=float(np.exp(x[1])), est_phase_px=ph)
-            r = residuals(ev, items)
-            log(f"   B[ph={ph:+.0f}]: scale={np.exp(x[0]):.4g} dim={np.exp(x[1]):.4g}  rms={math.sqrt(np.mean(r * r)):.4f}")
-            return r
-        res = least_squares(f, np.log([15.0, 0.1]), bounds=(np.log([3.0, 1e-3]), np.log([120.0, 0.6])),
-                            diff_step=0.05, max_nfev=4 if quick else 15, xtol=1e-3, ftol=1e-3)
-        rms = math.sqrt(np.mean(res.fun ** 2))
-        if best is None or rms < best[0]:
-            best = (rms, ph, res.x)
-    _, ph, xb = best
+    if warm:
+        cur = ev.params
+        ph, xb = float(cur.est_phase_px), np.log([max(cur.est_scale_mm, 1e-9), max(cur.drive_dim, 1e-9)])
+        py0, an0 = float(cur.est_phase_py), math.log(max(cur.est_aniso, 1e-9))
+    else:
+        best = None
+        for ph in ([-30.0, 0.0] if quick else [-40.0, -20.0, 0.0, 20.0]):
+            def f(x, ph=ph):
+                ev.set(est_kind="exp", est_scale_mm=float(np.exp(x[0])), drive_dim=float(np.exp(x[1])), est_phase_px=ph)
+                r = residuals(ev, items)
+                log(f"   B[ph={ph:+.0f}]: scale={np.exp(x[0]):.4g} dim={np.exp(x[1]):.4g}  rms={math.sqrt(np.mean(r * r)):.4f}")
+                return r
+            res = least_squares(f, np.log([15.0, 0.1]), bounds=(np.log([3.0, 1e-3]), np.log([120.0, 0.6])),
+                                diff_step=0.05, max_nfev=4 if quick else 15, xtol=1e-3, ftol=1e-3)
+            rms = math.sqrt(np.mean(res.fun ** 2))
+            if best is None or rms < best[0]:
+                best = (rms, ph, res.x)
+        _, ph, xb = best
+        py0, an0 = 0.0, 0.0
 
     a0_fixed = ev.params.stat_area0_px2
     # the refine's parameter vector: a frozen coordinate must be LEFT OUT, not pinned by bounds (a ±1e-6 box
@@ -963,11 +1172,14 @@ def fit_stage_b(ev: Evaluator, items, *, quick: bool = False, log=print, fit_dri
         return r
 
     spec = {"est_scale_mm": (xb[0], np.log(3.0), np.log(120.0), 0.05), "drive_dim": (xb[1], np.log(1e-3), np.log(0.6), 0.05),
-            "est_phase_px": (ph, -100.0, 100.0, 0.1), "est_phase_py": (0.0, -60.0, 60.0, 0.2), "est_aniso": (0.0, np.log(0.25), np.log(2.0), 0.05),
+            "est_phase_px": (ph, -100.0, 100.0, 0.1), "est_phase_py": (py0, -60.0, 60.0, 0.2), "est_aniso": (an0, np.log(0.25), np.log(2.0), 0.05),
             "stat_area0_px2": (math.log(ev.params.stat_area0_px2), np.log(200.0), np.log(6000.0), 0.1),
-            "drive_k": (math.log(0.55), math.log(0.2), math.log(1.5), 0.05)}
+            "drive_k": (math.log(k_start), math.log(0.2), math.log(1.5), 0.05)}
     x0 = [spec[n][0] for n in active]; lo = [spec[n][1] for n in active]; hi = [spec[n][2] for n in active]; steps = [spec[n][3] for n in active]
-    res = least_squares(gfun, np.array(x0), bounds=(lo, hi), diff_step=steps, max_nfev=5 if quick else 40, xtol=1e-3, ftol=1e-3)
+    x0 = np.array(x0)
+    if warm:
+        x0 = np.clip(x0, np.array(lo) + 1e-6, np.array(hi) - 1e-6)
+    res = least_squares(gfun, x0, bounds=(lo, hi), diff_step=steps, max_nfev=5 if quick else 40, xtol=1e-3, ftol=1e-3)
     kw = unpack(res.x)
     ev.set(est_kind="exp", **kw)
     out = {k: v for k, v in kw.items() if k != "drive_curve"}
@@ -999,12 +1211,128 @@ def fit_knots(ev: Evaluator, items, *, quick: bool = False, log=print) -> dict[s
     return {"est_knot_logw": list(logw), "rms": float(math.sqrt(np.mean(res.fun ** 2)))}
 
 
+def ring_magnitudes(items) -> dict[str, float]:
+    """Per group: the measured ring magnitude, mean |y − 1| in pp, over its ratio items (the knots gate's "unfit" scale)."""
+    acc: dict[str, list] = {}
+    for it in items:
+        if it.get("base") is not None:
+            acc.setdefault(it["group"], []).append(100.0 * abs(it["y"] - 1.0))
+    return {g: float(np.mean(v)) for g, v in acc.items()}
+
+
+def _mean_abs_map(report) -> dict[str, float]:
+    out = {}
+    for g, v in (report or {}).items():
+        val = v.get("mean_abs") if isinstance(v, dict) else v
+        if val is not None:
+            out[g] = float(val)
+    return out
+
+
+def knots_gate(exp_report, knots_report, ring_mag, n, *, near: Sequence[str] = NEAR_FIELD_GROUPS,
+               held: Optional[Sequence[str]] = None) -> tuple[bool, dict[str, Any]]:
+    """Whether the free-form knots estimate replaces the exponential. ``exp_report`` / ``knots_report``: group → mean
+    |err| pp (or :func:`group_report` rows) over the near-field (in-sample) and held-out groups; ``ring_mag``: group →
+    measured ring magnitude pp (:func:`ring_magnitudes`); ``n``: group → item count. Deterministic rules:
+
+    1. the near-field groups (rings@fine + halo) gain > 0.2 pp in total and none is worse by > 0.2 pp;
+    2. a held-out group the exponential cannot describe (exp error >= 0.5 x its measured ring) is "unfit": listed, no veto;
+    3. veto: a describable held-out group with n >= 3 worsening by > max(1.0 pp, 0.5 x its exp error);
+    4. net: the n-weighted mean change over the describable held-out groups <= +0.1 pp.
+    Returns (keep, table)."""
+    held = HELD_GROUPS if held is None else held
+    exp, kn = _mean_abs_map(exp_report), _mean_abs_map(knots_report)
+    counts = {g: int(v) for g, v in (n or {}).items()}
+    for rep in (exp_report or {}, knots_report or {}):
+        for g, v in rep.items():
+            if isinstance(v, dict) and v.get("n") is not None:
+                counts.setdefault(g, int(v["n"]))
+    near_g = [g for g in near if g in exp and g in kn]
+    held_g = [g for g in held if g in exp and g in kn and g not in near_g]
+    groups: dict[str, dict[str, Any]] = {}
+    for g in near_g + held_g:
+        mag = (ring_mag or {}).get(g)
+        groups[g] = {"role": "near" if g in near_g else "heldout", "n": counts.get(g, 0), "exp_pp": exp[g], "knots_pp": kn[g],
+                     "change_pp": kn[g] - exp[g], "ring_mag_pp": mag, "unfit": False, "veto": False}
+    gain = sum(exp[g] - kn[g] for g in near_g)
+    near_worse = [g for g in near_g if kn[g] > exp[g] + KNOTS_NEAR_MAX_WORSE_PP]
+    unfit = [g for g in held_g if groups[g]["ring_mag_pp"] is not None and exp[g] >= KNOTS_UNFIT_FRAC * groups[g]["ring_mag_pp"]]
+    desc = [g for g in held_g if g not in unfit]
+    veto = [g for g in desc if groups[g]["n"] >= KNOTS_VETO_MIN_N
+            and kn[g] - exp[g] > max(KNOTS_VETO_FLOOR_PP, KNOTS_VETO_REL * exp[g])]
+    for g in unfit:
+        groups[g]["unfit"] = True
+    for g in veto:
+        groups[g]["veto"] = True
+    ntot = sum(groups[g]["n"] for g in desc)
+    net = sum(groups[g]["n"] * (kn[g] - exp[g]) for g in desc) / ntot if ntot else 0.0
+    reasons = []
+    if not near_g:
+        reasons.append("no near-field group (rings@fine / halo) to show a gain")
+    elif gain <= KNOTS_NEAR_MIN_GAIN_PP:
+        reasons.append(f"near-field gain {gain:+.2f} pp <= {KNOTS_NEAR_MIN_GAIN_PP} pp")
+    if near_worse:
+        reasons.append(f"near-field group(s) worse by > {KNOTS_NEAR_MAX_WORSE_PP} pp: {near_worse}")
+    if veto:
+        reasons.append(f"veto: describable held-out group(s) degraded: {veto}")
+    if net > KNOTS_NET_MAX_PP:
+        reasons.append(f"net held-out change {net:+.2f} pp > +{KNOTS_NET_MAX_PP} pp")
+    keep = bool(near_g) and gain > KNOTS_NEAR_MIN_GAIN_PP and not near_worse and not veto and net <= KNOTS_NET_MAX_PP
+    table = {"keep": keep, "near_gain_pp": gain, "near_worse": near_worse, "unfit": unfit, "veto": veto, "net_pp": net,
+             "reasons": reasons, "groups": groups,
+             "rules": {"near_min_gain_pp": KNOTS_NEAR_MIN_GAIN_PP, "near_max_worse_pp": KNOTS_NEAR_MAX_WORSE_PP,
+                       "unfit_frac": KNOTS_UNFIT_FRAC, "veto_floor_pp": KNOTS_VETO_FLOOR_PP, "veto_rel": KNOTS_VETO_REL,
+                       "veto_min_n": KNOTS_VETO_MIN_N, "net_max_pp": KNOTS_NET_MAX_PP}}
+    return keep, table
+
+
+def drive_floor_grid(ev: "Evaluator", dim_items, *, log=print) -> dict[str, Any]:
+    """The drive floor (cells off below it) from a small grid on the dim items. Candidates lie STRICTLY below the
+    dimmest RENDERED field among them: a floor at or above a measured field switches that field's cells off and its
+    ratio explodes (SDR 2026-09-14: the 1.0-nit row, rms 3.0, over a 0.518-nit grey) — an artefact, not evidence.
+    Among the candidates the HIGHEST within 1 % of the best rms is taken (never assume LEDs light below the data; HDR:
+    LEDs off < 0.5 nit); ``identified`` is False when every candidate is within 1 % of the best (indistinguishable).
+    Sets the chosen floor on ``ev``."""
+    dimmest = min(field_nits(ev.params, d) for d in dim_items)
+    cands = [fl for fl in DRIVE_FLOOR_CANDIDATES if fl < dimmest]
+    table = []
+    for fl in cands:
+        ev.set(drive_floor_nits=fl)
+        r = residuals(ev, dim_items)
+        table.append({"floor_nits": fl, "rms": float(math.sqrt(np.mean(r * r)))})
+        log(f"   floor {fl:g} nits: dim-item rms {table[-1]['rms']:.4f}")
+    rule = (f"candidates strictly below the dimmest rendered field ({dimmest:.4g} nits); the highest within "
+            f"{100 * DRIVE_FLOOR_IDENT_REL:g} % of the best rms")
+    if table:
+        rmin = min(t["rms"] for t in table)
+        within = [t for t in table if t["rms"] <= rmin * (1.0 + DRIVE_FLOOR_IDENT_REL) + 1e-12]
+        best = max(t["floor_nits"] for t in within)
+        identified = len(within) < len(table)
+    else:
+        # no candidate below the data: keep the current floor if it leaves every field lit, else half the dimmest field
+        cur = float(ev.params.drive_floor_nits)
+        best = cur if cur < dimmest else 0.5 * dimmest
+        identified = False
+        rule += f"; none lies below it: floor {best:.4g} nits (not fitted)"
+    ev.set(drive_floor_nits=best)
+    return {"table": table, "chosen_nits": best, "identified": identified, "dimmest_field_nits": dimmest,
+            "n_dim_items": len(dim_items), "rule": rule}
+
+
 def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = False, knots: str = "auto",
-            fit_drive_k: bool = False, log=print) -> dict[str, Any]:
+            fit_drive_k: bool = False, k0: float = DRIVE_K0, log=print) -> dict[str, Any]:
     """The whole fit: Stage A on the absolute groups, Stage B on the grey-main rings, held-out report;
-    ``knots`` = "never" | "auto" (fit, keep only if no held-out group degrades > 0.3 pp and the fine
-    sweep improves) | "always". Returns params + reports; nothing here accepts anything."""
+    ``knots`` = "never" | "auto" (fit, keep by :func:`knots_gate`) | "always". Returns params + reports; nothing here
+    accepts anything.
+
+    ``fit_drive_k`` (the absolute drive sweep was below the meter floor, SDR): the drive curve is a power law of ``k0``
+    from the start — Stage A never sees the FaldParams default HDR-nits curve — and after Stage B fits k, only Stage A's
+    tmin is re-fitted under Stage B's k (with Stage A's OWN A0 swapped in for that call); Stage B re-runs warm only when
+    tmin moved >= 5 %; at most MAX_ROUNDS. ``drive_k_consistency`` records the rounds (``converged`` False: the caller
+    raises an anomaly). With a usable drive curve (HDR) ``k0`` is ignored and the path is one Stage A + one Stage B."""
     t0 = time.time()
+    if fit_drive_k:
+        base = replace(base, drive_curve=power_drive_curve(base.white_nits, k0))
     ev = Evaluator(base)
     by = lambda *gs: [d for d in items if d["group"] in gs]
     a_items = by(*STAGE_A_GROUPS)
@@ -1022,29 +1350,27 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
     # 8.9-pp staircase outlier; review finding #6.)
     has_area_abs = any(d["group"] in ("sliver", "lda_size") for d in a_items)
     out["area0_source"] = "stage_a" if has_area_abs else "rings@area"
+    out["drive_k_consistency"] = None
     if b_items:
-        out["stage_b"] = fit_stage_b(ev, b_items, quick=quick, log=log, fit_drive_k=fit_drive_k, fit_area0=not has_area_abs)
+        out["stage_b"] = fit_stage_b(ev, b_items, quick=quick, log=log, fit_drive_k=fit_drive_k, fit_area0=not has_area_abs,
+                                     k_start=k0)
+        if fit_drive_k:
+            out["drive_k_consistency"] = _drive_k_rounds(ev, out, a_items, b_items, k0=k0, has_area_abs=has_area_abs,
+                                                         quick=quick, log=log)
         out["stage_b_report"] = group_report(ev, b_items)
     else:
         out["stage_b"] = None
+    out["area0_stage_a"] = out["stage_a"]["stat_area0_px2"] if out["stage_a"] else None
+    out["area0_stage_b"] = out["stage_b"]["stat_area0_px2"] if out["stage_b"] else None
     # drive floor (cells off below it): a threshold, so a small grid on the dim items instead of the optimiser
     dim_items = [d for d in by("rings@low", "halo") if d.get("level") is not None and d["level"] <= 2.0]
     out["drive_floor"] = None
     if dim_items and b_items:
-        table = []
-        for fl in DRIVE_FLOOR_CANDIDATES:
-            ev.set(drive_floor_nits=fl)
-            r = residuals(ev, dim_items)
-            table.append({"floor_nits": fl, "rms": float(math.sqrt(np.mean(r * r)))})
-            log(f"   floor {fl:g} nits: dim-item rms {table[-1]['rms']:.4f}")
-        # a floor BELOW the dimmest measured grey is unidentifiable (identical rms): take the HIGHEST floor within 1 %
-        # of the best — never assume LEDs light below the data (HDR evidence: LEDs off < 0.5 nit)
-        rmin = min(t["rms"] for t in table)
-        best = max(t["floor_nits"] for t in table if t["rms"] <= rmin * 1.01 + 1e-12)
-        ev.set(drive_floor_nits=best)
-        out["drive_floor"] = {"table": table, "chosen_nits": best, "n_dim_items": len(dim_items)}
+        out["drive_floor"] = drive_floor_grid(ev, dim_items, log=log)
         out["stage_b_report"] = group_report(ev, b_items)
     exp_params = ev.params
+    out["params_exp"] = params_dict(exp_params)
+    out["params_knots"] = None
     held_exp = group_report(ev, held) if held else {}
     out["heldout_exp"] = held_exp
     out["knots"] = None
@@ -1053,22 +1379,71 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
         near_exp = {g: out["stage_b_report"].get(g, {}).get("mean_abs") for g in near}
         kres = fit_knots(ev, b_items, quick=quick, log=log)
         held_k = group_report(ev, held) if held else {}
-        near_k = {g: group_report(ev, by(g)).get(g, {}).get("mean_abs") for g in near}
-        degraded = [g for g in held_exp if held_k.get(g, {}).get("mean_abs", 0) > held_exp[g]["mean_abs"] + 0.3]
-        near_worse = [g for g in near if near_k[g] is not None and near_exp[g] is not None and near_k[g] > near_exp[g] + 0.2]
-        gain = sum((near_exp[g] - near_k[g]) for g in near if near_k[g] is not None and near_exp[g] is not None)
-        improved = gain > 0.2 and not near_worse
-        keep = knots == "always" or (not degraded and improved)
+        near_rep = group_report(ev, by(*near)) if near else {}
+        near_k = {g: near_rep.get(g, {}).get("mean_abs") for g in near}
+        gate_items = by(*near) + held
+        counts = {g: len(by(g)) for g in {d["group"] for d in gate_items}}
+        gate_keep, gate = knots_gate({**held_exp, **near_exp}, {**held_k, **near_k}, ring_magnitudes(gate_items), counts)
+        keep = knots == "always" or gate_keep
+        out["params_knots"] = params_dict(ev.params)
         out["knots"] = {**kres, "heldout": held_k, "near_field_exp_pp": near_exp, "near_field_knots_pp": near_k,
                         "fine_exp_pp": near_exp.get("rings@fine"), "fine_knots_pp": near_k.get("rings@fine"),
-                        "degraded_groups": degraded, "near_field_worse": near_worse, "kept": keep}
+                        "degraded_groups": gate["veto"], "near_field_worse": gate["near_worse"], "gate": gate,
+                        "gate_keep": gate_keep, "kept": keep, "forced": knots == "always"}
         if not keep:
             ev = Evaluator(exp_params)
+    out["estimate"] = ev.params.est_kind
     out["by_level"] = level_report(ev, b_items + held)
     out["heldout"] = group_report(ev, held) if held else {}
+    # the exported model on the ABSOLUTE reads: with A0 owned by rings@area (SDR) the exported A0 is Stage B's, so the
+    # peak / hole / leak reads Stage A fitted with its own A0 can be missed — reported, never hidden
+    out["abs_report_exported"] = group_report(ev, a_items) if a_items else {}
     out["params"] = params_dict(ev.params)
     out["elapsed_s"] = round(time.time() - t0, 1)
     return out
+
+
+def _drive_k_rounds(ev: "Evaluator", out: dict[str, Any], a_items, b_items, *, k0: float, has_area_abs: bool,
+                    quick: bool, log) -> dict[str, Any]:
+    """The Stage-A tmin <-> Stage-B k consistency loop of :func:`run_fit`. Updates ``out['stage_a']`` (tmin) and
+    ``out['stage_b']`` and leaves ``ev`` at Stage B's A0 and k."""
+    white = ev.params.white_nits
+    sa, sb = out["stage_a"], out["stage_b"]
+    k_a = k0
+    rounds: list[dict[str, Any]] = []
+    tmins = [sa["tmin"]] if sa else []
+    converged = abs(math.log(sb["drive_k"] / k_a)) < TOL_LOGK
+    reason = "Stage B's k is within tolerance of the start" if converged else None
+    if not converged and not a_items:
+        return {"rounds": 0, "converged": False, "k_start": k0, "k_final": sb["drive_k"], "k_stage_a": k_a,
+                "tmin_rounds": tmins, "detail": [], "reason": "no Stage-A items to re-fit tmin under Stage B's k"}
+    while not converged and len(rounds) < MAX_ROUNDS:
+        k_a = sb["drive_k"]
+        ev.set(drive_curve=power_drive_curve(white, k_a))
+        a0_b = ev.params.stat_area0_px2
+        ev.set(stat_area0_px2=sa["stat_area0_px2"])               # Stage A's OWN A0 (never frozen at Stage B's)
+        cur = {n: float(getattr(ev.params, n)) for n in STAGE_A_PARAMS}
+        t = fit_stage_a(ev, a_items, quick=quick, log=log, x0=cur, active=("tmin",))
+        ev.set(stat_area0_px2=a0_b)                                # Stage B's A0 back
+        dlog = abs(math.log(t["tmin"] / sa["tmin"]))
+        row: dict[str, Any] = {"round": len(rounds) + 1, "k_stage_a": k_a, "tmin": t["tmin"], "dlog_tmin": dlog,
+                               "stage_a_rms": t["rms"]}
+        sa = {**sa, "tmin": t["tmin"]}
+        tmins.append(t["tmin"])
+        rounds.append(row)
+        if dlog < TOL_LOGTMIN:
+            converged = True
+            reason = f"tmin moved {100 * dlog:.1f} % (< {100 * TOL_LOGTMIN:g} %) under k={k_a:.3f}: Stage B not re-run"
+            break
+        sb = fit_stage_b(ev, b_items, quick=quick, log=log, fit_drive_k=True, fit_area0=not has_area_abs, warm=True, k_start=k_a)
+        row.update({"k_stage_b": sb["drive_k"], "stage_b_rms": sb["rms"]})
+        converged = abs(math.log(sb["drive_k"] / k_a)) < TOL_LOGK
+        if converged:
+            reason = f"Stage B's k {sb['drive_k']:.3f} within {100 * TOL_LOGK:g} % of Stage A's {k_a:.3f}"
+    out["stage_a"], out["stage_b"] = sa, sb
+    return {"rounds": len(rounds), "converged": converged, "k_start": k0, "k_final": sb["drive_k"], "k_stage_a": k_a,
+            "tmin_rounds": tmins, "detail": rounds,
+            "reason": reason or f"not converged after {MAX_ROUNDS} rounds (Stage A k {k_a:.3f}, Stage B k {sb['drive_k']:.3f})"}
 
 
 def params_dict(p: FaldParams) -> dict[str, Any]:
@@ -1140,10 +1515,15 @@ class SyntheticFaldPanel:
 
     @classmethod
     def hidden(cls, g: PanelGeometry, **over) -> "SyntheticFaldPanel":
-        """Plausible-but-different-from-the-fit-start truth (so a recovered fit means something)."""
+        """Plausible-but-different-from-the-fit-start truth (so a recovered fit means something). A gamma (SDR)
+        geometry gets a power-law drive curve (k = SYNTH_SDR_DRIVE_K) at its white: with the FaldParams default
+        HDR-nits curve as the truth, the fit's own fallback start was the truth and the sim could not catch a
+        Stage A that never saw the fitted drive curve (hardening review 2026-09-15)."""
         kw = dict(core_mm=9.0, tail_mm=30.0, tail_frac=0.4, kernel_pnorm=1.8, tmin=8e-4, stat_area0_px2=1000.0,
                   aperture_px=55.0, est_kind="exp", est_scale_mm=16.0, est_phase_px=-22.0, est_phase_py=-10.0,
                   est_aniso=0.9, drive_dim=0.12, chan_weights=(0.30, 0.60, 0.10))
+        if g.transfer == "gamma":
+            kw["drive_curve"] = power_drive_curve(float(over.get("white_nits", g.white_nits)), SYNTH_SDR_DRIVE_K)
         kw.update(over)
         return cls(g.base_params(**kw))
 

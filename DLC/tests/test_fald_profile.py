@@ -257,7 +257,7 @@ def test_stage_chain_sdr_to_export_and_verify(tmp_path):
     assert fit.metrics["stage_b"]["est_scale_mm"] > 0 and "rings@held" in fit.metrics["heldout"]
     held = _run(ctx, "heldout")
     assert held.status == "ran" and (ctx.root / "fald" / "heldout_predictions.json").exists()
-    exp = _run(ctx, "export", out=str(tmp_path / "export"))
+    exp = _run(ctx, "export", out=str(tmp_path / "export"), lum_fade="keep")      # SDR export requires a fade choice
     assert exp.status == "ran" and exp.metrics["format"] == "FLD3" and (tmp_path / "export" / "sim_sdr_fald_panel.bin").exists()
     assert exp.metrics["transfer"] == "gamma" and any("FLD3" in n for n in exp.notes)
     ver = _run(ctx, "verify")                       # the mock accepts mode SDR since the 2026-09-14 port (work guide P7)
