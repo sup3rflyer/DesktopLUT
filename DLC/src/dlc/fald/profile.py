@@ -702,17 +702,21 @@ class Read:
 
 
 REF_TWIN_TOL = 0.03          # a reference and its _end twin further apart than this (relative) = one of them is an outlier
+REF_KEEP_TOL = 0.01          # … and ONE read is kept only when it sits this close to the other state's expectation
+REF_FLOOR_NITS = 0.05        # references at / below this (black) are read noise: always the mean, never flagged
 
 
 def ref_means(patterns: Sequence[Pattern], reads: dict[str, Read], *, other: Optional[dict[str, Read]] = None,
-              outliers: Optional[list] = None, tol: float = REF_TWIN_TOL) -> dict[str, float]:
+              outliers: Optional[list] = None, tol: float = REF_TWIN_TOL, keep_tol: float = REF_KEEP_TOL,
+              floor_nits: float = REF_FLOOR_NITS) -> dict[str, float]:
     """Y of each reference pattern: the mean of it and its ``_end`` drift twin.
 
-    When the two disagree by more than ``tol`` (relative) and ``other`` — the same patterns read in the interleaved
-    other state (layer OFF vs identity) — has an agreeing pair, the read consistent with it is used: the other pair's
-    mean times this state's typical ratio to the other state at the same field level (median over the phase's other
-    patterns on that field, 1 when none). Otherwise the mean. Each such case is appended to ``outliers`` (evidence for
-    the phase metrics: ``ref_outlier``)."""
+    When the two disagree by more than ``tol`` (relative, both above ``floor_nits``) and ``other`` — the same patterns
+    read in the interleaved other state (layer OFF vs identity) — has an agreeing pair (within ``tol``), the expected
+    value is that pair's mean times this state's typical ratio to the other state on the same field level (median over
+    the phase's other patterns on that field, 1 when none). ONE read is used only when it lies within ``keep_tol`` of
+    the expectation AND the discarded read is more than ``tol`` off it (a bimodal read, not drift); otherwise — e.g.
+    both states drifted — the mean. Each disagreeing pair is appended to ``outliers`` (evidence: ``ref_outlier``)."""
     out = {}
     for p in patterns:
         if p.kind != "aux" or p.name.endswith("_end"):
@@ -721,19 +725,23 @@ def ref_means(patterns: Sequence[Pattern], reads: dict[str, Read], *, other: Opt
         if not pair:
             continue
         val = float(np.mean(pair))
-        if len(pair) == 2 and min(pair) > 0 and max(pair) / min(pair) - 1.0 > tol:
-            rule, chosen = "mean", None
+        if len(pair) == 2 and min(pair) > floor_nits and max(pair) / min(pair) - 1.0 > tol:
+            rule, chosen, target = "mean", None, None
             opair = [] if other is None else [other[n].y for n in (p.name, p.name + "_end") if n in other and other[n].y is not None]
-            if len(opair) == 2 and min(opair) > 0 and max(opair) / min(opair) - 1.0 <= tol:
+            if len(opair) == 2 and min(opair) > floor_nits and max(opair) / min(opair) - 1.0 <= tol:
                 level = tuple(p.field)
                 ratios = [reads[q.name].y / other[q.name].y for q in patterns
                           if tuple(q.field) == level and q.name not in (p.name, p.name + "_end")
                           and q.name in reads and q.name in other and reads[q.name].y and other[q.name].y]
                 target = float(np.mean(opair)) * (float(np.median(ratios)) if ratios else 1.0)
-                chosen = 0 if abs(pair[0] - target) <= abs(pair[1] - target) else 1
-                val, rule = float(pair[chosen]), "consistent_with_other_state"
+                near = 0 if abs(pair[0] - target) <= abs(pair[1] - target) else 1
+                if abs(pair[near] / target - 1.0) <= keep_tol and abs(pair[1 - near] / target - 1.0) > tol:
+                    chosen = near
+                    val, rule = float(pair[near]), "consistent_with_other_state"
+                else:
+                    rule = "mean_not_a_single_outlier"
             if outliers is not None:
-                outliers.append({"ref": p.name, "start": pair[0], "end": pair[1], "used": val, "rule": rule,
+                outliers.append({"ref": p.name, "start": pair[0], "end": pair[1], "used": val, "rule": rule, "expected": target,
                                  "kept": (None if chosen is None else ("start" if chosen == 0 else "end"))})
         out[p.name] = val
     return out

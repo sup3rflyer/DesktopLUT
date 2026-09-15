@@ -161,6 +161,11 @@ def _pending_anomaly(st: dict[str, Any], code: str, detail: str, severity: str =
     st["fald"].setdefault("_pending_anomalies", []).append([code, detail, severity])
 
 
+def _pending_metric(st: dict[str, Any], key: str, value: Any) -> None:
+    """A metric computed by a helper without the StageResult; ``build`` moves it into ``result.metrics``."""
+    st["fald"].setdefault("_pending_metrics", {})[key] = value
+
+
 def _judge_on_high(phase: str, result: StageResult) -> None:
     """Any HIGH anomaly turns the phase's advisory verdict into ``judge_<phase>`` (design law: a non-trivial state is the
     LLM's to judge, never a benign default the next invocation follows)."""
@@ -407,11 +412,22 @@ def _read_anomalies(result: StageResult, phase: str, patterns: list, states: tup
     if missing:
         total = sum(len(v) for v in by_state.values())
         referenced = {p.ref for p in patterns if p.ref}
-        ref_missing = sorted({name for _, name in missing if name in referenced})
+        lost, half = set(), set()             # a reference with no usable read at all / one of its twin reads missing
+        for st in states:
+            sr = by_state[st]
+            for ref in referenced:
+                got = [n for n in (ref, ref + "_end") if n in sr and sr[n].xyz is not None]
+                gone = [n for n in (ref, ref + "_end") if n in sr and sr[n].xyz is None]
+                if gone and not got:
+                    lost.add(ref if st is None else f"{ref} [{st}]")
+                elif gone:
+                    half.update(n if st is None else f"{n} [{st}]" for n in gone)
         frac = len(missing) / max(1, total)
-        sev = "high" if (frac > NO_READ_HIGH_FRAC or ref_missing) else "medium"
+        sev = "high" if (frac > NO_READ_HIGH_FRAC or lost) else "medium"
         result.anomaly("no_read", f"{phase}: {len(missing)} of {total} reads missing ({100 * frac:.1f} %)"
-                       + (f", references among them: {ref_missing} (every ratio on them is lost)" if ref_missing else "")
+                       + (f"; references with NO read (every ratio on them is lost): {sorted(lost)}" if lost else "")
+                       + (f"; reference twins missing (the other twin carries the ratio, without drift cancellation): {sorted(half)}"
+                          if half else "")
                        + f"; e.g. {[f'{n} [{st}]' if st else n for st, n in missing[:5]]}", sev)
     if bimodal:
         reread = sum(1 for b in bimodal if b.get("reread"))
@@ -580,11 +596,14 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
     from ..fald.profile import PanelGeometry
     from ..dogegen_window import resolve_monitor_rect
     mode = _common.run_mode(args, ctx)
-    if st["fald"].get("geometry") and not getattr(args, "keep_geometry", False):
-        done = sorted(k for k in (st["fald"].get("phases") or {}) if k != "preflight")
-        result.block("geometry_exists", f"this run already records a panel geometry (phases done: {done or 'none'}); re-deriving "
-                     "it from the command line would drop what was measured (white, SDR gamma, sensor position) — pass "
-                     "--keep-geometry to re-enter this run, or start a new run")
+    # a geometry nothing has measured with yet (a preflight that blocked late, or whose anomalies said to fix --zones /
+    # move the meter) may be re-derived; once a MEASURING phase is done the CLI must not overwrite it
+    measured = sorted(k for k, v in (st["fald"].get("phases") or {}).items()
+                      if k not in ("preflight", "aid") and (v or {}).get("status") == "done")
+    if st["fald"].get("geometry") and measured and not getattr(args, "keep_geometry", False):
+        result.block("geometry_exists", f"this run already measured with its recorded panel geometry (phases done: {measured}); "
+                     "re-deriving it from the command line would drop what was measured (white, SDR gamma, sensor position) — "
+                     "pass --keep-geometry to re-enter this run, or start a new run")
         return
     controller = _common.make_controller(args, ctx)
     alive, state, err = _common.ping_controller(controller)
@@ -912,9 +931,11 @@ def _collect_items(s: Session):
     """Fit items from every measured phase file, each built at the sensor position ITS reads were taken at (a file
     stamps ``meter``; files from before the stamp use ``legacy_meter``; with neither, the geometry's sensor and a
     ``meter_unstamped`` anomaly). ``--augment-regime id`` takes the augment patterns read through the awake overlay in
-    identity instead of with the layer off; ``auto`` (default) = id when augment_id.json exists and is complete, else
-    off. The regime actually used replaces ``args.augment_regime`` (and is recorded in the run as ``augment_regime``)."""
-    from ..fald.profile import build_items, choose_scale, weight_items
+    identity instead of with the layer off; ``auto`` (default) = id when the run's CURRENT augment read identity
+    (``phases.augment.states``) and augment_id.json is complete, else off. The regime actually used replaces
+    ``args.augment_regime`` (and is recorded in the run as ``augment_regime``). With both augment state files present,
+    their reference-twin outliers (``ref_outlier``) go to the phase metrics — evidence only, the items are unchanged."""
+    from ..fald.profile import build_items, choose_scale, ref_means, weight_items
     g = _geometry(s.st)
     _, cw, ch = choose_scale(g.width, g.height, g.cols, g.rows)
     legacy = s.st["fald"].get("legacy_meter")
@@ -922,13 +943,16 @@ def _collect_items(s: Session):
     regime = requested
     fid = _phase_file(s.ctx, "augment_id")
     if requested == "auto":
+        current_id = "id" in ((s.st["fald"].get("phases") or {}).get("augment") or {}).get("states", [])
         try:
-            regime = "id" if fid.exists() and json.loads(fid.read_text(encoding="utf-8")).get("complete") else "off"
+            complete = fid.exists() and bool(json.loads(fid.read_text(encoding="utf-8")).get("complete"))
         except (OSError, ValueError):
-            regime = "off"
+            complete = False
+        regime = "id" if (current_id and complete) else "off"
         if regime == "off" and fid.exists():
-            _pending_anomaly(s.st, "augment_regime_fallback", "augment_id.json exists but is INCOMPLETE (cancelled / crashed): "
-                             "--augment-regime auto uses the layer-OFF augment reads; re-run augment for identity data", "medium")
+            why = "is INCOMPLETE (cancelled / crashed)" if current_id else "is not from the run's current augment (it read layer-OFF only)"
+            _pending_anomaly(s.st, "augment_regime_fallback", f"augment_id.json {why}: --augment-regime auto uses the layer-OFF "
+                             "augment reads; re-run augment with the panel file for identity data", "medium")
     elif requested == "id" and not fid.exists():
         _pending_anomaly(s.st, "augment_regime_unavailable", "--augment-regime id but the run has no augment_id.json (augment read "
                          "layer-OFF only, or not at all): the fit runs WITHOUT augment patterns", "medium")
@@ -959,6 +983,22 @@ def _collect_items(s: Session):
         items += build_items(fp, fr, (m[0] * cw / g.width, m[1] * ch / g.height), floor_nits=FLOOR_SNR * max(floor, 0.004), weight=False)
     s.st["fald"]["_incomplete_phases"] = incomplete
     s.st["fald"]["_item_meters"] = meters
+    # evidence only: build_items resolves a reference twin within ITS file (the mean); with both augment state files
+    # present, say which references the other state would have resolved differently
+    foff, fid_ = _phase_file(s.ctx, "augment"), _phase_file(s.ctx, "augment_id")
+    if foff.exists() and fid_.exists():
+        try:
+            ap, r_off, r_id = _patterns_from_file(foff), _reads_from_file(foff), _reads_from_file(fid_)
+            outl = {}
+            for name, rd, oth in (("augment", r_off, r_id), ("augment_id", r_id, r_off)):
+                lst: list = []
+                ref_means(ap, rd, other=oth, outliers=lst)
+                if lst:
+                    outl[name] = lst
+            if outl:
+                _pending_metric(s.st, "ref_outlier", outl)
+        except (OSError, ValueError, KeyError) as exc:
+            _pending_metric(s.st, "ref_outlier", {"error": f"{type(exc).__name__}: {exc}"})
     return g, pats, reads, weight_items(items)
 
 
@@ -1095,6 +1135,15 @@ def phase_augment(s: Session, result: StageResult) -> None:
             result.anomaly("identity_unavailable", f"runtime.set_fald_params refused ({exc}) — reading layer-OFF only", "medium")
     else:
         result.note("no exported panel file yet: identity (awake overlay) reads skipped")
+    # the run record names the states of the CURRENT augment from the start (a cancelled / failed run included): the
+    # fit's --augment-regime auto trusts augment_id.json only when this augment read identity
+    s.st["fald"]["phases"]["augment"] = {"status": "running", "at": time.time(), "states": list(states)}
+    fid = _phase_file(s.ctx, "augment_id")
+    if "id" not in states and fid.exists():
+        stale = fid.with_name("augment_id.stale.json")
+        fid.replace(stale)
+        result.anomaly("stale_identity_file", f"this augment reads layer-OFF only, so the identity reads of an EARLIER augment no longer "
+                       f"match it: augment_id.json moved to {stale.name} (the fit will not use it)", "medium")
 
     overlay = OverlayTracker(s, mon, mode)
     meta: dict[str, Any] = {}
@@ -1148,7 +1197,7 @@ def phase_augment(s: Session, result: StageResult) -> None:
                                          "off_overlay": overlay.off_overlay()}
     result.advice = {"default_policy_verdict": "judge_regime_then_fit",
                      "reasons": ["compare ring ratios OFF vs identity per group: `fit` uses the identity reads by default "
-                                 "(--augment-regime auto → id when augment_id.json is complete; the layer runs on the awake "
+                                 "(--augment-regime auto → id when this augment read identity completely; the layer runs on the awake "
                                  "overlay); --augment-regime off forces the layer-OFF reads",
                                  "then `fit` (the by_level report is the evidence for --lum-fade at export)"]}
 
@@ -1319,6 +1368,8 @@ def build(args, ctx: RunContext) -> StageResult:
         s.close()
         for code, detail, severity in st["fald"].pop("_pending_anomalies", None) or []:
             result.anomaly(code, detail, severity)
+        for key, value in (st["fald"].pop("_pending_metrics", None) or {}).items():
+            result.metrics.setdefault(key, value)
         _judge_on_high(phase, result)
         _save(ctx, st)
     return result
@@ -1346,7 +1397,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="preflight on an existing run: keep its measured geometry (white, gamma, sensor) — for augment / re-verify")
     parser.add_argument("--augment-regime", default="auto", choices=("off", "id", "auto"), dest="augment_regime",
                         help="fit: the augment patterns read layer-OFF, through the awake overlay in identity, or auto "
-                             "(default: id when augment_id.json exists and is complete, else off)")
+                             "(default: id when the run's current augment read identity and augment_id.json is complete, else off)")
     parser.add_argument("--lum-fade", default=None, dest="lum_fade",
                         help="export: pixel-luminance fade LO,HI in as-if-white nits (chosen from the fit's by_level report)")
     parser.add_argument("--extended", action="store_true", help="verify: add 1-nit rings, thin bars and steep ramps to the set")

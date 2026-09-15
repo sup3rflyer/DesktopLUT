@@ -233,7 +233,8 @@ def test_audit_flags_the_fald_layer_and_records_the_render_path():
     assert audit["gui_layers_enabled"] == ["FALD compensation layer"]
     assert audit["pipe_layers"]["fald"] is True
     assert audit["hook"] == {"active": True, "needs_check": False}
-    assert audit["overlay"] == {"awake": True, "dwm_hook_mode": False}
+    # a FALD flag without a panel file (and not on the monitor's live mode) cannot run: the overlay stays asleep
+    assert audit["overlay"] == {"awake": False, "dwm_hook_mode": False}
     assert na.neutral_violations(audit) == \
         ["FALD compensation layer is still ON for 0:HDR in DesktopLUT.ini after enter-neutral"]
 

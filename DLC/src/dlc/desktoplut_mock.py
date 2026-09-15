@@ -81,7 +81,7 @@ class MockDesktopLutState:
     hook_routing_present: bool = True
     hook_session: str = "4242-133700000000000000"
     # FP16 overlay auto-sleep (C++ render.cpp RenderAll: the overlay hides when no monitor needs processing and
-    # state.get reports overlay.awake). Awake while any shader layer (tonemap / fald) is on for any monitor:mode or a
+    # state.get reports overlay.awake). Awake while a shader layer that can run is on (``overlay_needed``) or a
     # runtime cube is loaded. Test knobs: ``overlay_keep_awake`` = something else needs the overlay (another
     # monitor's cube, analysis, an open editor) so it never sleeps; ``overlay_sleep_lag_polls`` = after its last user
     # went away the overlay still reports awake for this many state.get polls (the render thread's next pass).
@@ -92,9 +92,25 @@ class MockDesktopLutState:
     command_count: int = 0
 
     def overlay_needed(self) -> bool:
-        return bool(self.overlay_keep_awake
-                    or any(d.get("tonemap") or d.get("fald") for d in self.layers.values())
-                    or any((r or {}).get("cube_path") for r in self.runtime.values()))
+        """C++ RenderAll's anyMonitorNeedsOverlay, reduced to what the sim models: a runtime cube (not passthrough), or a
+        shader layer of the monitor's LIVE mode that can run — tonemap in HDR, FALD with a panel file set (the transfer
+        check happens at runtime.set_fald_params). A FALD flag without a file, or on the other mode's row, keeps the
+        overlay asleep (the C++ never wakes it for a layer that cannot run). ACM is not modelled (SDR FALD = on)."""
+        if self.overlay_keep_awake or any((r or {}).get("cube_path") for r in self.runtime.values()):
+            return True
+        for key, d in self.layers.items():
+            mon, _, mode = key.partition(":")
+            try:
+                live = "HDR" if self.hdr.get(int(mon), False) else "SDR"
+            except ValueError:
+                continue
+            if mode != live:
+                continue
+            if d.get("tonemap") and mode == "HDR":
+                return True
+            if d.get("fald") and (self.fald.get(key) or {}).get("params_path"):
+                return True
+        return False
 
     def overlay_tick(self, poll: bool) -> bool:
         """Advance the auto-sleep model: a needed overlay is awake now (and re-arms the lag); an unneeded one sleeps

@@ -44,7 +44,14 @@ PROART_PINNED = {
     "sdr:register": (45, "dd275e463d05a1bd"), "sdr:grid": (28, "0f2f632fb181ce8b"), "sdr:drive": (40, "26951599666cf198"),
     "sdr:leak": (24, "48d73ac235b5b6bb"), "sdr:rings": (70, "b72e7dcaa9444b6f"), "sdr:heldout": (20, "d53fcccfdadbd963"),
     "sdr:verify": (14, "71fc81e7eb86459c"), "sdr:augment": (47, "aafed2dc66c8a658"), "sdr:verify_extended": (24, "638204d59be22cfd"),
+    # the default nominal meter (x = 1890, 50 px into its cell): every plan as before EXCEPT drive, whose source cell
+    # moved from c+2 to c+3 on 2026-09-15 — c+2's full-cell sliver sat 110 px from the sensor, inside the 120-px keep-out
+    "hdr1890:register": (45, "d3cce3b70fb283b2"), "hdr1890:grid": (28, "beee8be943af8508"), "hdr1890:drive": (40, "4223e6e01ea49e75"),
+    "hdr1890:leak": (24, "c0e13d596bb75f88"), "hdr1890:rings": (70, "8075b8715dface30"), "hdr1890:heldout": (20, "85b0d4a9a153fc13"),
+    "hdr1890:verify": (14, "777a16a1ba2a9f3a"), "hdr1890:augment": (47, "9ab25fab523b30ee"),
+    "hdr1890:verify_extended": (24, "b91e710f60a1b9b4"),
 }
+PROART["hdr1890"] = {**PROART["hdr"], "meter": (1890, 1110)}
 
 
 def _all_plans():
@@ -184,10 +191,20 @@ def test_wait_overlay_old_build_fixed_wait():
     assert w["ok"] is None and "before 2026-09-13" in w["reason"] and vc.now() == FP.OVERLAY_OLD_BUILD_WAIT_S
 
 
-def test_mock_overlay_awake_follows_shader_layers_with_knobs():
+def test_mock_overlay_awake_follows_shader_layers_with_knobs(tmp_path):
     ctl = CalibrationController.mock()
     srv = ctl.client.transport.server
     assert ctl.state()["overlay"]["awake"] is False                  # nothing needs the overlay
+    ctl.set_layers(1, "SDR", fald=True)
+    assert ctl.state()["overlay"]["awake"] is False                  # a FALD flag without a panel file cannot run (C++)
+    panel = tmp_path / "panel.bin"
+    panel.write_bytes(b"\0" * 8)                                     # unclassifiable header: accepted, transfer "unknown"
+    ctl.call("runtime.set_fald_params", {"monitor": 1, "mode": "HDR", "params_path": str(panel)})
+    ctl.set_layers(1, "HDR", fald=True)
+    ctl.set_layers(1, "SDR", fald=False)
+    assert ctl.state()["overlay"]["awake"] is False                  # the HDR row of a monitor that is live in SDR
+    ctl.set_layers(1, "HDR", fald=False)
+    ctl.call("runtime.set_fald_params", {"monitor": 1, "mode": "SDR", "params_path": str(panel)})
     ctl.set_layers(1, "SDR", fald=True)
     assert ctl.state()["overlay"]["awake"] is True
     ctl.set_layers(1, "SDR", fald=False)
@@ -289,6 +306,62 @@ def test_stage_augment_overlay_that_never_sleeps_is_tagged(tmp_path):
     assert off["off_overlay"] == "awake" and off["overlay_wait"]["off"]["timeouts"] > 0
     an = {a.code: a for a in res.anomalies}
     assert an["overlay_never_slept"].severity == "medium"
+
+
+def test_off_only_augment_retires_the_old_identity_file(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    assert _run(ctx, "preflight").status == "ran"
+    _export_synthetic_panel(ctx, tmp_path)
+    assert _run(ctx, "augment").metrics["states"] == ["off", "id"]
+    st = _common.load_dlc_state(ctx)
+    st["fald"].pop("bin_path")                                        # e.g. the panel file is gone: this augment reads OFF only
+    _common.save_dlc_state(ctx, st)
+    res = _run(ctx, "augment")
+    assert res.status == "ran" and res.metrics["states"] == ["off"]
+    assert {a.code: a.severity for a in res.anomalies}.get("stale_identity_file") == "medium"
+    fald = ctx.root / "fald"
+    assert not (fald / "augment_id.json").exists() and (fald / "augment_id.stale.json").exists()
+    s = fald_profile._open_session(_ns(ctx, phase="fit"), ctx, fald_profile._state(ctx), need_meter=False)
+    fald_profile._collect_items(s)
+    assert s.args.augment_regime == "off"
+    # an identity file put back by hand is still not the CURRENT augment's
+    (fald / "augment_id.stale.json").replace(fald / "augment_id.json")
+    st2 = fald_profile._state(ctx)
+    s2 = fald_profile._open_session(_ns(ctx, phase="fit"), ctx, st2, need_meter=False)
+    fald_profile._collect_items(s2)
+    assert s2.args.augment_regime == "off" and [a[0] for a in st2["fald"]["_pending_anomalies"]] == ["augment_regime_fallback"]
+
+
+def test_stage_augment_layer_that_cannot_run_is_never_woke(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    assert _run(ctx, "preflight").status == "ran"
+    _export_synthetic_panel(ctx, tmp_path)
+    p = ctx.root / _common.SIM_STATE_FILE
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    raw["hdr"] = {"1": True}                                          # the monitor went live HDR: the SDR FALD row cannot run
+    p.write_text(json.dumps(raw), encoding="utf-8")
+    res = _run(ctx, "augment")
+    assert res.status == "ran", res.as_dict()
+    an = {a.code: a.severity for a in res.anomalies}
+    assert an.get("overlay_never_woke") == "high" and "overlay_never_slept" not in an
+    assert res.metrics["overlay_wait"]["id"]["timeouts"] == res.metrics["overlay_wait"]["id"]["n"]
+
+
+def test_fit_records_ref_outliers_of_both_augment_states(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    assert _run(ctx, "preflight").status == "ran"
+    pats = _ref_block("B", 40)
+    fald = ctx.root / "fald"
+    fald.mkdir(parents=True, exist_ok=True)
+    ys = {"augment": {"B:ref_end": 5.3}, "augment_id": {}}
+    for stem, over in ys.items():
+        reads = [{"name": q.name, "xyz": [over.get(q.name, 5.0)] * 3, "t_read_s": 0.1, "error": None} for q in pats]
+        (fald / f"{stem}.json").write_text(json.dumps({"phase": "augment", "state": "off" if stem == "augment" else "id", "complete": True,
+                                                         "meter": [1250, 750], "patterns": [q.as_dict() for q in pats],
+                                                         "reads": reads}), encoding="utf-8")
+    res = _run(ctx, "fit", augment_regime="off")
+    ro = res.metrics["ref_outlier"]
+    assert ro["augment"][0]["ref"] == "B:ref" and ro["augment"][0]["rule"] == "consistent_with_other_state" and "augment_id" not in ro
 
 
 def test_auto_regime_falls_back_to_off_without_complete_identity(tmp_path):
@@ -409,11 +482,35 @@ def test_ref_outlier_prefers_the_read_consistent_with_the_other_state():
     assert P.ref_means(pats, off)["B:ref"] == pytest.approx(5.15)             # the fit path is unchanged
 
 
+def test_ref_outlier_both_states_drifted_uses_the_mean():
+    """OFF drifted 3.5 % and identity 2.9 % over the block: that is drift, not one bimodal read — picking OFF's start
+    read would put a fake −1.7 % into OFF vs identity."""
+    pats = _ref_block("B", 40)
+    off = {p.name: P.Read(p.name, (5.0875,) * 3) for p in pats}
+    ident = {p.name: P.Read(p.name, (5.0725,) * 3) for p in pats}
+    off["B:ref"], off["B:ref_end"] = P.Read("B:ref", (5.0,) * 3), P.Read("B:ref_end", (5.175,) * 3)
+    ident["B:ref"], ident["B:ref_end"] = P.Read("B:ref", (5.0,) * 3), P.Read("B:ref_end", (5.145,) * 3)
+    lst: list = []
+    refs = P.ref_means(pats, off, other=ident, outliers=lst)
+    assert refs["B:ref"] == pytest.approx(5.0875) and lst[0]["rule"] == "mean_not_a_single_outlier" and lst[0]["kept"] is None
+
+
+def test_ref_outlier_ignores_black_references():
+    pats = [_aux("K:ref", 0), _aux("K:ref_end", 0)]
+    rd = {"K:ref": P.Read("K:ref", (0.01,) * 3), "K:ref_end": P.Read("K:ref_end", (0.02,) * 3)}   # +100 % of noise
+    lst: list = []
+    assert P.ref_means(pats, rd, other=rd, outliers=lst)["K:ref"] == pytest.approx(0.015) and lst == []
+
+
 def test_no_read_is_graded_by_share_and_references(tmp_path):
     an, _ = _drift_run(tmp_path / "a", {}, missing={"B0:r1"}, n_blocks=10)       # 1 of 60 reads, not a reference: 1.7 %
     assert an["no_read"].severity == "medium"
-    an, _ = _drift_run(tmp_path / "b", {}, missing={"B0:ref"}, n_blocks=10)      # a reference
-    assert an["no_read"].severity == "high"
+    an, _ = _drift_run(tmp_path / "b", {}, missing={"B0:ref"}, n_blocks=10)      # a reference whose _end twin read: ratios survive
+    assert an["no_read"].severity == "medium" and "B0:ref" in an["no_read"].detail and "NO read" not in an["no_read"].detail
+    an, _ = _drift_run(tmp_path / "b2", {}, missing={"B0:ref_end"}, n_blocks=10)  # a missing _end twin counts too
+    assert an["no_read"].severity == "medium" and "B0:ref_end" in an["no_read"].detail
+    an, _ = _drift_run(tmp_path / "d", {}, missing={"B0:ref", "B0:ref_end"}, n_blocks=60)   # both twins: every ratio lost (0.6 %)
+    assert an["no_read"].severity == "high" and "NO read" in an["no_read"].detail
     an, _ = _drift_run(tmp_path / "c", {}, missing={"B0:r1", "B1:r1"}, n_blocks=10)   # 3.3 %
     assert an["no_read"].severity == "high"
 
@@ -482,9 +579,13 @@ def test_unstamped_file_without_legacy_meter_raises_meter_unstamped(tmp_path):
     assert "meter_unstamped" in {a.code for a in res.anomalies}
 
 
-def test_preflight_on_an_existing_run_needs_keep_geometry(tmp_path):
+def test_preflight_on_a_measured_run_needs_keep_geometry(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
-    assert _run(ctx, "preflight").status == "ran"
+    first = _run(ctx, "preflight", zones="31x18")
+    assert first.status == "ran" and "cell_not_integer" in {a.code for a in first.anomalies}
+    fixed = _run(ctx, "preflight", zones="32x18")                     # nothing measured yet: the corrected re-run is allowed
+    assert fixed.status == "ran" and _common.load_dlc_state(ctx)["fald"]["geometry"]["cols"] == 32
+    assert _run(ctx, "register").status == "ran"
     again = _run(ctx, "preflight")
     assert again.status == "blocked" and again.anomalies[0].code == "geometry_exists"
     assert _run(ctx, "preflight", keep_geometry=True).status == "ran"
