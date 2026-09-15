@@ -56,6 +56,20 @@ MIN_HIGHLIGHT_GAP_MM = 22.0            # 120 px on the ProArt
 RING_LEVELS_NITS = (5.0, 10.0, 20.0)
 RING_MAIN_NITS = 10.0
 
+# The near-field sizes were designed on the PA32UCXR (0.1845 mm/px, 80-px cells, 120-px keep-out). On another panel
+# they follow the panel, not the pixel count (hardening 2026-09-15: a 27" 4K has a 142-px keep-out and a 32" 6K a
+# 187-px one — the fixed 120/240/480 names broke the extended verify and mislabelled the held-out bars):
+#   near gaps  = m · max(keep-out, ceil(1.5 cells)) for m in (1, 2, 4)       ProArt 120 / 240 / 480
+#   fine sweep = 1/8-cell steps across ONE cell from the first near gap     ProArt 120, 130 … 200
+#   bar / ramp = the ProArt pixel sizes expressed in mm                     ProArt 40x600 px, 320 px of 8-px strips
+PROART_PX_MM = 0.1845
+NEAR_GAP_CELLS = 1.5
+NEAR_GAP_MULTIPLES = (1, 2, 4)
+FINE_STEPS_PER_CELL = 8
+BAR_MM = (40 * PROART_PX_MM, 600 * PROART_PX_MM)
+RAMP_MM = 320 * PROART_PX_MM
+RAMP_STRIP_MM = 8 * PROART_PX_MM
+
 
 # ---------------------------------------------------------------------------- geometry
 @dataclass
@@ -174,6 +188,10 @@ class PanelGeometry:
         return self.rect(col * self.cell_w + inset[0], row * self.cell_h + inset[1],
                          self.cell_w - 2 * inset[0], self.cell_h - 2 * inset[1])
 
+    def mm_px(self, mm: float) -> int:
+        """A physical length in whole panel pixels (≥ 1)."""
+        return max(1, int(round(mm / self.px_mm)))
+
     def base_params(self, **over: Any) -> FaldParams:
         """A :class:`FaldParams` carrying this geometry (and a scale giving integer reduced cells)."""
         scale, w, h = choose_scale(self.width, self.height, self.cols, self.rows)
@@ -224,6 +242,30 @@ class Pattern:
 
 def _bg(code3):
     return (tuple(code3), FULL)
+
+
+def near_gaps(g: "PanelGeometry") -> list[int]:
+    """The three near-field window gaps (px, strictly increasing) the held-out rings, the verify rings, the low-grey
+    rings and the thin bars use: ``m · max(min_gap_h, ceil(1.5 · cell_w))`` for m = 1, 2, 4. ProArt 120/240/480,
+    27" 4K 142/284/568, 32" 6K 187/374/748, 27" 1440p 96/192/384. Patterns carry the index as ``meta.gap_rank``."""
+    base = max(g.min_gap_h, int(math.ceil(NEAR_GAP_CELLS * g.cell_w - 1e-9)))
+    out: list[int] = []
+    for m in NEAR_GAP_MULTIPLES:
+        v = int(m * base)
+        out.append(v if not out or v > out[-1] else out[-1] + 1)
+    return out
+
+
+def fine_gaps(g: "PanelGeometry") -> list[int]:
+    """The fine near-field ring sweep: 1/8-cell steps across one cell starting at the first near gap (the sample phase
+    of the estimate repeats per cell). ProArt: 120, 130 … 200 — the set the 2026-09-14 runs measured."""
+    n0 = near_gaps(g)[0]
+    out: list[int] = []
+    for k in range(FINE_STEPS_PER_CELL + 1):
+        v = int(round(n0 + k * g.cell_w / FINE_STEPS_PER_CELL))
+        if not out or v > out[-1]:
+            out.append(v)
+    return out
 
 
 def _drop_offpanel(pats: list) -> list:
@@ -308,13 +350,16 @@ FLAT_FRACTIONS = (0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0)   # of white
 
 def plan_drive(g: PanelGeometry) -> list[Pattern]:
     """White / R / G / B full fields (white_nits, chan_weights); flat-field EOTF sweep (the SDR gamma;
-    HDR: PQ tracking evidence); a 40-px window in a black cell 2 columns right of the meter at 6 levels
+    HDR: PQ tracking evidence); a 40-px window in a black cell ≥ 2 columns right of the meter at 6 levels
     (its leak at the meter ∝ the cell's drive → drive_curve); size ramp + slivers in that cell (the area
     statistic / A0); black hole in a bright field (tmin); white windows ON the meter (peak-size law)."""
     black = _bg((0, 0, 0))
     W = g.white
     c, r = g.meter_cell
-    src = (c + 2, r)                                                  # source cell just past the body
+    # source cell just past the body: the first column ≥ 2 right whose LEFT edge clears the keep-out (the full-cell
+    # sliver fills it) — c + 2 on the ProArt; a 27" 4K 48x24 at x=1940 needs c + 3 (c + 2 sits 140 px away, keep-out 142)
+    k = next((k for k in range(2, 8) if (c + k) * g.cell_w - g.meter[0] >= g.min_gap_h), 2)
+    src = (c + k, r)
     sx0 = src[0] * g.cell_w + 0.25 * g.cell_w
     sy0 = src[1] * g.cell_h + 0.1 * g.cell_h
     pats = [Pattern("DRV:white", "white", [(W, FULL)], W, "abs", note="full-field white")]
@@ -382,39 +427,39 @@ def plan_leak(g: PanelGeometry) -> list[Pattern]:
 
 RING_GAPS_H = (110, 140, 180, 240, 300, 360, 480, 700)
 RING_GAPS_V = (200, 240, 300, 360, 480, 700)
-FINE_GAPS = tuple(range(90, 201, 10))
-HELD_GAPS = (120, 240, 480)
 
 
 def plan_rings(g: PanelGeometry, main_nits: float = RING_MAIN_NITS, held_nits: Sequence[float] = (5.0, 20.0),
                fine: bool = True) -> list[Pattern]:
     """Grey rings: the panel's compensation ERROR next to a white window (ratio to the field alone).
-    Grey-``main_nits`` in four directions + the fine near-field sweep = Stage B; the other levels are
-    held out. Levels are in nits (the fit works in nits); the stage clamps them to the panel's range."""
+    Grey-``main_nits`` in four directions + the fine near-field sweep (:func:`fine_gaps`) = Stage B; the other levels
+    are held out at the :func:`near_gaps`. Levels are in nits (the fit works in nits); the stage clamps them to the
+    panel's range."""
     W = g.white
     size = 200
     pats: list[Pattern] = []
 
-    def level_block(nits: float, gaps_h, gaps_v, fine_gaps, group: str):
+    def level_block(nits: float, gaps_h, gaps_v, fine_list, group: str, ranked: bool = False):
         fc = g.grey(nits)
         bg = _bg(fc)
         ref = f"RING{nits:g}:ref"
         pats.append(Pattern(ref, group, [bg], fc, "aux", note="field alone"))
         for side, gaps, mn in (("R", gaps_h, g.min_gap_h), ("L", gaps_h, g.min_gap_h), ("D", gaps_v, g.min_gap_v), ("U", gaps_v, g.min_gap_v)):
-            for gap in gaps:
+            for rank, gap in enumerate(gaps):
                 if gap < mn:
                     continue
+                meta = {"side": side, "gap": gap, "nits": nits, **({"gap_rank": rank} if ranked else {})}
                 pats.append(Pattern(f"RING{nits:g}:{side}{gap}", group, [bg, (W, g.window(gap, size, side))], fc, "ratio", ref,
-                                    note=f"gap {gap}px {side}", meta={"side": side, "gap": gap, "nits": nits}))
+                                    note=f"gap {gap}px {side}", meta=meta))
         for side in ("R", "L"):
-            for gap in fine_gaps:
+            for gap in fine_list:
                 if gap < g.min_gap_h:
                     continue
                 pats.append(Pattern(f"RING{nits:g}:fine{side}{gap}", group + "@fine", [bg, (W, g.window(gap, size, side))], fc, "ratio", ref,
                                     note=f"fine gap {gap}px {side}", meta={"side": side, "gap": gap, "nits": nits}))
         pats.append(Pattern(ref + "_end", group, [bg], fc, "aux", note="drift"))
 
-    level_block(main_nits, RING_GAPS_H, RING_GAPS_V, FINE_GAPS if fine else (), "rings")
+    level_block(main_nits, RING_GAPS_H, RING_GAPS_V, fine_gaps(g) if fine else (), "rings")
     # area law + drive curve seen through the RING (bright reads — the SDR-safe route to A0 and the drive
     # curve): windows of growing area with a fixed near edge, and the 200-px window at fractions of white
     fc = g.grey(main_nits)
@@ -429,7 +474,7 @@ def plan_rings(g: PanelGeometry, main_nits: float = RING_MAIN_NITS, held_nits: S
         pats.append(Pattern(f"RING{main_nits:g}:drive{f:g}", "rings@drive", [bg, (code, g.window(gap, size, "R"))], fc, "ratio", ref,
                             note=f"200px window at {f:g}·white, gap {gap} R", meta={"side": "R", "gap": gap, "fraction": f, "nits": main_nits}))
     for nits in held_nits:
-        level_block(nits, HELD_GAPS, (), (), "rings@held")
+        level_block(nits, near_gaps(g), (), (), "rings@held", ranked=True)
     return pats
 
 
@@ -490,81 +535,113 @@ def plan_verify(g: PanelGeometry, levels: Sequence[float] = (5.0, 20.0)) -> list
         bg = _bg(fc)
         pats.append(Pattern(f"VER{nits:g}:flat", "verify", [bg], fc, "aux", note="flat"))
         for side in ("R", "L"):
-            for gap in HELD_GAPS:
+            for rank, gap in enumerate(near_gaps(g)):
                 if gap < g.min_gap_h:
                     continue
                 pats.append(Pattern(f"VER{nits:g}:{side}{gap}", "verify", [bg, (W, g.window(gap, size, side))], fc, "ratio", f"VER{nits:g}:flat",
-                                    note=f"ring {side} {gap}", meta={"side": side, "gap": gap, "nits": nits}))
+                                    note=f"ring {side} {gap}", meta={"side": side, "gap": gap, "nits": nits, "gap_rank": rank}))
     return pats
 
 
-def plan_verify_extended(g: PanelGeometry) -> list[Pattern]:
+# The extended-verify selection by ROLE (group + meta), never by name: the names carry the panel's real gap px.
+VERIFY_EXT_ROLES: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("rings@low", {"nits": 1.0, "side": "L", "gap_rank": 0}),
+    ("rings@low", {"nits": 1.0, "side": "R", "gap_rank": 0}),
+    ("halo", {"nits": 2.0, "side": "L", "gap_rank": 0}),
+    ("halo", {"nits": 5.0, "side": "L", "gap_rank": 0}),
+    ("ramp", {"axis": "h", "direction": "down"}),
+    ("ramp", {"axis": "v", "direction": "down"}),
+)
+
+
+def plan_verify_extended(g: PanelGeometry, missing: Optional[list] = None) -> list[Pattern]:
     """The standard verify set + the regimes the augment phase targets: 1-nit rings (dark-theme greys, inside the old
-    fade), thin white bars at 120 px on 2 / 5 nits (the text halo), and the steep downward ramps through the sensor.
-    Same OFF / identity / ON protocol; every ratio has its own flat in the set."""
+    fade), thin white bars at the first near gap on 2 / 5 nits (the text halo), and the steep downward ramps through
+    the sensor. Same OFF / identity / ON protocol; every ratio has its own flat in the set (added before its first
+    ratio). Patterns are chosen by role (:data:`VERIFY_EXT_ROLES`); a role this geometry cannot draw is appended to
+    ``missing`` (when given) instead of raising."""
     pats = plan_verify(g)
-    aug = {p.name: p for p in plan_augment.__wrapped__(g)}
-    keep = ["LOW1:ref", "LOW1:L120", "LOW1:R120", "BAR2:ref", "BAR2:L120", "BAR5:ref", "BAR5:L120", "RAMP:ref", "RAMP:hdown", "RAMP:vdown"]
-    for name in keep:
-        a = aug[name]
+    aug = plan_augment(g)
+    by_name = {p.name: p for p in aug}
+    added: set[str] = set()
+
+    def add(a: Pattern):
+        if a.name in added:
+            return
+        added.add(a.name)
         pats.append(Pattern("VX:" + a.name, "verify", a.shapes, a.field, a.kind, ("VX:" + a.ref) if a.ref else None, a.note, dict(a.meta)))
+
+    for group, want in VERIFY_EXT_ROLES:
+        hit = next((p for p in aug if p.group == group and p.kind == "ratio" and all(p.meta.get(k) == v for k, v in want.items())), None)
+        ref = by_name.get(hit.ref or "") if hit is not None else None
+        if hit is None or ref is None:
+            if missing is not None:
+                missing.append({"group": group, **want, "reason": "not drawable at this geometry / meter" if hit is None else "reference dropped"})
+            continue
+        add(ref)
+        add(hit)
     return _drop_offpanel(pats)
 
 
 LOW_GREYS = (0.5, 1.0, 2.0)          # nits: the dim end (dark-theme UI greys) — sets the drive floor + the fade
 HALO_GREYS = (2.0, 5.0, 20.0)
-HALO_GAPS = (120, 240, 480)
-RAMP_STRIP_PX = 8
 
 
 def plan_augment(g: PanelGeometry) -> list[Pattern]:
     """The near-field regime the short pass missed (HDR 2026-09-14: the short-pass model got a thin 40x600 bar at
     120 px wrong by 7 pp) and the dim end the fade has to be chosen from:
 
-    * low-grey rings at 0.5 / 1 / 2 nits (L/R 120 + 240 fitted, D/U held out) — the drive floor + dim drive curve;
-    * thin bright bars (40 x 600 px, full white) LEFT of the sensor at 120 / 240 / 480 px on 2 / 5 / 20-nit greys
-      (fitted) + a RIGHT bar at 120 px on 5 / 20 nits (held out) — the text / UI-edge halo;
-    * steep ramps through the sensor (lo 2 nits -> hi 0.45 x white over 320 px, 8-px strips), horizontal and
-      vertical, both directions, ratio to a flat at the ramp's value at the sensor — the gradient regime.
-    Every ratio's model baseline is its reference field (``meta.base_code`` for the ramps, whose background is not
-    the reference)."""
+    * low-grey rings at 0.5 / 1 / 2 nits (L/R at the first two :func:`near_gaps` fitted, D/U held out) — the drive
+      floor + dim drive curve;
+    * thin bright bars (:data:`BAR_MM`, 40 x 600 px on the ProArt, full white) LEFT of the sensor at the three near
+      gaps on 2 / 5 / 20-nit greys (fitted) + a RIGHT bar at the first near gap on 5 / 20 nits (held out) — the text /
+      UI-edge halo;
+    * steep ramps through the sensor (lo 2 nits -> hi 0.45 x white over :data:`RAMP_MM` of :data:`RAMP_STRIP_MM`
+      strips — 320 px of 8-px strips on the ProArt), horizontal and vertical, both directions, ratio to a flat at the
+      ramp's value at the sensor — the gradient regime.
+    Names carry the real gap px; ``meta.gap_rank`` is the role (0/1/2 = the near gap used). Every ratio's model
+    baseline is its reference field (``meta.base_code`` for the ramps, whose background is not the reference)."""
     W = g.white
     size = 200
     mx, my = g.meter
+    near = near_gaps(g)
+    bw, bh = g.mm_px(BAR_MM[0]), g.mm_px(BAR_MM[1])
     pats: list[Pattern] = []
     for nits in LOW_GREYS:
         fc = g.grey(nits); bg = _bg(fc); ref = f"LOW{nits:g}:ref"
         pats.append(Pattern(ref, "rings@low", [bg], fc, "aux", note="field alone", meta={"nits": nits}))
-        gv = max(240, g.min_gap_v)
-        for side, gap, grp in (("L", 120, "rings@low"), ("R", 120, "rings@low"), ("L", 240, "rings@low"),
-                               ("R", 240, "rings@low"), ("D", gv, "rings@lowheld"), ("U", gv, "rings@lowheld")):
+        gv = max(near[1], g.min_gap_v)
+        for side, rank, gap, grp in (("L", 0, near[0], "rings@low"), ("R", 0, near[0], "rings@low"), ("L", 1, near[1], "rings@low"),
+                                     ("R", 1, near[1], "rings@low"), ("D", 1, gv, "rings@lowheld"), ("U", 1, gv, "rings@lowheld")):
             if gap < (g.min_gap_h if side in "LR" else g.min_gap_v):
                 continue
             pats.append(Pattern(f"LOW{nits:g}:{side}{gap}", grp, [bg, (W, g.window(gap, size, side))], fc, "ratio", ref,
-                                note=f"{nits:g}-nit grey, window {side} {gap}", meta={"side": side, "gap": gap, "nits": nits}))
+                                note=f"{nits:g}-nit grey, window {side} {gap}",
+                                meta={"side": side, "gap": gap, "nits": nits, "gap_rank": rank}))
         pats.append(Pattern(ref + "_end", "rings@low", [bg], fc, "aux", note="drift", meta={"nits": nits}))
     for nits in HALO_GREYS:
         fc = g.grey(nits); bg = _bg(fc); ref = f"BAR{nits:g}:ref"
         pats.append(Pattern(ref, "halo", [bg], fc, "aux", note="field alone", meta={"nits": nits}))
-        for gap in HALO_GAPS:
-            if gap < g.min_gap_h:
-                continue
-            pats.append(Pattern(f"BAR{nits:g}:L{gap}", "halo", [bg, (W, g.rect(mx - gap - 40, my - 300, 40, 600))], fc, "ratio", ref,
-                                note=f"40x600 white bar, near edge {gap} px left", meta={"side": "L", "gap": gap, "nits": nits}))
+        for rank, gap in enumerate(near):
+            pats.append(Pattern(f"BAR{nits:g}:L{gap}", "halo", [bg, (W, g.rect(mx - gap - bw, my - bh / 2, bw, bh))], fc, "ratio", ref,
+                                note=f"{bw}x{bh} white bar, near edge {gap} px left",
+                                meta={"side": "L", "gap": gap, "nits": nits, "gap_rank": rank}))
         if nits >= 5.0:
-            pats.append(Pattern(f"BAR{nits:g}:R120", "halo@held", [bg, (W, g.rect(mx + max(120, g.min_gap_h), my - 300, 40, 600))], fc,
-                                "ratio", ref, note="40x600 white bar, near edge 120 px right", meta={"side": "R", "gap": 120, "nits": nits}))
+            gap = near[0]
+            pats.append(Pattern(f"BAR{nits:g}:R{gap}", "halo@held", [bg, (W, g.rect(mx + gap, my - bh / 2, bw, bh))], fc,
+                                "ratio", ref, note=f"{bw}x{bh} white bar, near edge {gap} px right",
+                                meta={"side": "R", "gap": gap, "nits": nits, "gap_rank": 0}))
         pats.append(Pattern(ref + "_end", "halo", [bg], fc, "aux", note="drift", meta={"nits": nits}))
-    lo, hi, span = 2.0, 0.45 * g.white_nits, 320
+    strip = g.mm_px(RAMP_STRIP_MM)
+    n = max(2, int(round(RAMP_MM / RAMP_STRIP_MM)))
+    lo, hi, span = 2.0, 0.45 * g.white_nits, n * strip            # the strips tile the span exactly (no background seam)
     mid = 0.5 * (lo + hi)
     mc = g.code(mid)
     ref = "RAMP:ref"
     pats.append(Pattern(ref, "ramp", [_bg((mc, mc, mc))], (mc, mc, mc), "aux", note=f"flat at the ramp's value at the sensor ({mid:.1f} nits)",
                         meta={"nits": mid}))
-    n = span // RAMP_STRIP_PX
     for axis in ("h", "v"):
         for direction in ("up", "down"):
-            lo_c, hi_c = (g.grey(lo), W if False else g.grey(hi))
             first, last = (lo, hi) if direction == "up" else (hi, lo)
             shapes = [_bg(g.grey(first))]
             if axis == "h":
@@ -574,9 +651,9 @@ def plan_augment(g: PanelGeometry) -> list[Pattern]:
             for i in range(n):
                 v = first + (last - first) * (i + 0.5) / n
                 if axis == "h":
-                    shapes.append((g.grey(v), g.rect(mx - span / 2 + i * RAMP_STRIP_PX, 0, RAMP_STRIP_PX, g.height)))
+                    shapes.append((g.grey(v), g.rect(mx - span / 2 + i * strip, 0, strip, g.height)))
                 else:
-                    shapes.append((g.grey(v), g.rect(0, my - span / 2 + i * RAMP_STRIP_PX, g.width, RAMP_STRIP_PX)))
+                    shapes.append((g.grey(v), g.rect(0, my - span / 2 + i * strip, g.width, strip)))
             pats.append(Pattern(f"RAMP:{axis}{direction}", "ramp", shapes, (mc, mc, mc), "ratio", ref,
                                 note=f"{axis} ramp {first:.0f}->{last:.0f} nits over {span} px through the sensor",
                                 meta={"axis": axis, "direction": direction, "nits": mid, "base_code": mc}))
@@ -624,15 +701,49 @@ class Read:
         return {"name": self.name, "xyz": list(self.xyz) if self.xyz else None, "t_read_s": self.t_read_s, "error": self.error}
 
 
-def ref_means(patterns: Sequence[Pattern], reads: dict[str, Read]) -> dict[str, float]:
-    """Mean Y of each reference pattern and its ``_end`` drift twin."""
+REF_TWIN_TOL = 0.03          # a reference and its _end twin further apart than this (relative) = one of them is an outlier
+REF_KEEP_TOL = 0.01          # … and ONE read is kept only when it sits this close to the other state's expectation
+REF_FLOOR_NITS = 0.05        # references at / below this (black) are read noise: always the mean, never flagged
+
+
+def ref_means(patterns: Sequence[Pattern], reads: dict[str, Read], *, other: Optional[dict[str, Read]] = None,
+              outliers: Optional[list] = None, tol: float = REF_TWIN_TOL, keep_tol: float = REF_KEEP_TOL,
+              floor_nits: float = REF_FLOOR_NITS) -> dict[str, float]:
+    """Y of each reference pattern: the mean of it and its ``_end`` drift twin.
+
+    When the two disagree by more than ``tol`` (relative, both above ``floor_nits``) and ``other`` — the same patterns
+    read in the interleaved other state (layer OFF vs identity) — has an agreeing pair (within ``tol``), the expected
+    value is that pair's mean times this state's typical ratio to the other state on the same field level (median over
+    the phase's other patterns on that field, 1 when none). ONE read is used only when it lies within ``keep_tol`` of
+    the expectation AND the discarded read is more than ``tol`` off it (a bimodal read, not drift); otherwise — e.g.
+    both states drifted — the mean. Each disagreeing pair is appended to ``outliers`` (evidence: ``ref_outlier``)."""
     out = {}
     for p in patterns:
         if p.kind != "aux" or p.name.endswith("_end"):
             continue
-        ys = [reads[n].y for n in (p.name, p.name + "_end") if n in reads and reads[n].y is not None]
-        if ys:
-            out[p.name] = float(np.mean(ys))
+        pair = [reads[n].y for n in (p.name, p.name + "_end") if n in reads and reads[n].y is not None]
+        if not pair:
+            continue
+        val = float(np.mean(pair))
+        if len(pair) == 2 and min(pair) > floor_nits and max(pair) / min(pair) - 1.0 > tol:
+            rule, chosen, target = "mean", None, None
+            opair = [] if other is None else [other[n].y for n in (p.name, p.name + "_end") if n in other and other[n].y is not None]
+            if len(opair) == 2 and min(opair) > floor_nits and max(opair) / min(opair) - 1.0 <= tol:
+                level = tuple(p.field)
+                ratios = [reads[q.name].y / other[q.name].y for q in patterns
+                          if tuple(q.field) == level and q.name not in (p.name, p.name + "_end")
+                          and q.name in reads and q.name in other and reads[q.name].y and other[q.name].y]
+                target = float(np.mean(opair)) * (float(np.median(ratios)) if ratios else 1.0)
+                near = 0 if abs(pair[0] - target) <= abs(pair[1] - target) else 1
+                if abs(pair[near] / target - 1.0) <= keep_tol and abs(pair[1 - near] / target - 1.0) > tol:
+                    chosen = near
+                    val, rule = float(pair[near]), "consistent_with_other_state"
+                else:
+                    rule = "mean_not_a_single_outlier"
+            if outliers is not None:
+                outliers.append({"ref": p.name, "start": pair[0], "end": pair[1], "used": val, "rule": rule, "expected": target,
+                                 "kept": (None if chosen is None else ("start" if chosen == 0 else "end"))})
+        out[p.name] = val
     return out
 
 

@@ -62,6 +62,26 @@ CHECKIN_EVERY_S = 180.0                 # wall-clock check-in cadence inside a m
 CHECKIN_FRACTIONS = (0.25, 0.5, 0.75)   # plus progress check-ins (short phases never go dark)
 FLOOR_SNR = 3.0
 
+# Layer-OFF reads (hardening 2026-09-15). SDR evidence: OFF − identity jumps are quantised and repeat (+2.62 % seven
+# times at 5 nits ≈ 0.71 of an 8-bit code step, +4.1…6.6 % at 0.52 nit), never on identity / ON reads, and every OFF
+# read already started ≥ 3.1 s after the toggle — a bimodal "overlay asleep" display path, not an unfinished
+# transition. So every state switch waits for state.get → overlay.awake to reach what the read needs (OFF = asleep,
+# identity / ON = awake), OFF / identity alternate their order per pattern, and an OFF/ID outlier is re-read.
+OVERLAY_TIMEOUT_S = 5.0
+OVERLAY_DWELL_S = 0.5
+OVERLAY_POLL_S = 0.1
+OVERLAY_OLD_BUILD_WAIT_S = 3.0          # a build without overlay.awake: a fixed wait after a switch
+OVERLAY_TIMEOUT_STREAK = 3              # after this many consecutive timeouts for a state …
+OVERLAY_SHORT_TIMEOUT_S = 1.0           # … its wait shortens to this
+BIMODAL_MIN_FRAC = 0.01                 # |OFF/ID − 1 − the level's running median| above max(1 %, 4·MAD) → re-read
+BIMODAL_MAD_K = 4.0
+BIMODAL_MIN_HISTORY = 3                 # reads of that level before the test applies
+REREAD_CAP_FRAC = 0.10                  # at most 10 % of the patterns are re-read
+DRIFT_WARN_FRAC = 0.03                  # a reference and its _end twin further apart: a drift warning
+DRIFT_HIGH_FRAC = 0.08                  # reference_drift is high above this, or when ≥ DRIFT_HIGH_COUNT references drift
+DRIFT_HIGH_COUNT = 3
+NO_READ_HIGH_FRAC = 0.02                # no_read is high above this share of missing reads, or when a reference is missing
+
 
 # ----------------------------------------------------------------------------- helpers
 def _state(ctx: RunContext) -> dict[str, Any]:
@@ -116,6 +136,167 @@ def _phase_file(ctx: RunContext, phase: str) -> Path:
     return _out_dir(ctx) / f"{phase}.json"
 
 
+def _unstamped_phase_files(ctx: RunContext) -> list[str]:
+    """Measured phase files (patterns + reads) that carry no ``meter`` stamp — written by a build before the stamp, so
+    the sensor position they were read at is only known from the run record (``legacy_meter``). register.json is
+    excluded: it is rewritten by every registration."""
+    d = ctx.root / "fald"
+    out = []
+    if not d.is_dir():
+        return out
+    for f in sorted(d.glob("*.json")):
+        if f.stem == "register":
+            continue
+        try:
+            raw = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict) and "patterns" in raw and "reads" in raw and not raw.get("meter"):
+            out.append(f.name)
+    return out
+
+
+def _pending_anomaly(st: dict[str, Any], code: str, detail: str, severity: str = "medium") -> None:
+    """An anomaly raised by a helper without the StageResult (``_collect_items``); ``build`` moves it onto the result."""
+    st["fald"].setdefault("_pending_anomalies", []).append([code, detail, severity])
+
+
+def _pending_metric(st: dict[str, Any], key: str, value: Any) -> None:
+    """A metric computed by a helper without the StageResult; ``build`` moves it into ``result.metrics``."""
+    st["fald"].setdefault("_pending_metrics", {})[key] = value
+
+
+def _judge_on_high(phase: str, result: StageResult) -> None:
+    """Any HIGH anomaly turns the phase's advisory verdict into ``judge_<phase>`` (design law: a non-trivial state is the
+    LLM's to judge, never a benign default the next invocation follows)."""
+    high = sorted({a.code for a in result.anomalies if a.severity == "high"})
+    verdict = (result.advice or {}).get("default_policy_verdict")
+    if not high or not verdict or str(verdict).startswith("judge_"):
+        return
+    result.advice["default_policy_verdict"] = f"judge_{phase}"
+    result.advice["overridden_verdict"] = verdict
+    result.advice.setdefault("reasons", []).insert(0, f"high-severity anomalies {high}: judge them before `{verdict}`")
+
+
+# ----------------------------------------------------------------------------- overlay path (layer OFF / identity / ON)
+class VirtualClock:
+    """``--simulate``: sleeps advance a virtual clock instead of the wall, so the overlay wait keeps its timeout
+    semantics without slowing CI."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.t += max(0.0, float(seconds))
+
+    def now(self) -> float:
+        return self.t
+
+
+def wait_overlay(ctl, want_awake: bool, timeout_s: float = OVERLAY_TIMEOUT_S, min_dwell_s: float = OVERLAY_DWELL_S,
+                 poll_s: float = OVERLAY_POLL_S, *, sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic, old_build_wait_s: float = OVERLAY_OLD_BUILD_WAIT_S) -> dict[str, Any]:
+    """Poll ``state.get`` → ``overlay.awake`` until it equals ``want_awake``, then dwell ``min_dwell_s``.
+
+    Returns ``{ok, want_awake, awake, polls, waited_s[, reason]}``: ``ok`` True = reached; False = still in the other
+    state after ``timeout_s`` (another layer / monitor / analysis keeps the overlay awake, or the layer cannot run);
+    None = the build does not report ``overlay.awake`` (before 2026-09-13) or state.get failed — a fixed
+    ``old_build_wait_s`` wait was done instead."""
+    t0 = clock()
+    polls = 0
+    while True:
+        polls += 1
+        try:
+            ov: Any = (ctl.state() or {}).get("overlay")
+        except Exception as exc:  # noqa: BLE001 - evidence, the caller decides
+            ov = exc
+        if not isinstance(ov, dict) or "awake" not in ov:
+            if old_build_wait_s > 0:
+                sleep(old_build_wait_s)
+            why = (f"state.get failed ({type(ov).__name__}: {ov})" if isinstance(ov, Exception)
+                   else "state.get reports no overlay.awake (a DesktopLUT build before 2026-09-13)")
+            return {"ok": None, "want_awake": want_awake, "awake": None, "polls": polls, "waited_s": round(clock() - t0, 2),
+                    "reason": f"{why}: fixed {old_build_wait_s:g} s wait"}
+        awake = bool(ov["awake"])
+        if awake == want_awake:
+            if min_dwell_s > 0:
+                sleep(min_dwell_s)
+            return {"ok": True, "want_awake": want_awake, "awake": awake, "polls": polls, "waited_s": round(clock() - t0, 2)}
+        if clock() - t0 >= timeout_s:
+            return {"ok": False, "want_awake": want_awake, "awake": awake, "polls": polls, "waited_s": round(clock() - t0, 2),
+                    "reason": f"overlay still {'awake' if awake else 'asleep'} after {timeout_s:g} s"}
+        sleep(poll_s)
+
+
+class OverlayTracker:
+    """The FALD layer state of a phase that reads the same pattern OFF / identity (debug 4) / ON: switches only on a
+    change, then waits for the overlay path the read needs (OFF = asleep, identity / ON = awake) — every read, so a
+    path that flips back mid-phase is caught too — and keeps the evidence for the phase file and the anomalies."""
+
+    def __init__(self, s: "Session", monitor: int, mode: str) -> None:
+        self.s, self.monitor, self.mode = s, monitor, mode
+        self.current: Optional[str] = None
+        self.waits: dict[str, dict[str, Any]] = {}
+        self.reasons: list[str] = []
+
+    def set(self, state: str) -> dict[str, Any]:
+        ctl = self.s.controller
+        changed = state != self.current
+        if changed:
+            if state == "off":
+                ctl.set_layers(self.monitor, self.mode, fald=False)
+            else:
+                ctl.call("runtime.fald_debug", {"monitor": self.monitor, "mode": self.mode, "debug_mode": 4 if state == "id" else 0})
+                ctl.set_layers(self.monitor, self.mode, fald=True)
+            self.current = state
+        rec = self.waits.setdefault(state, {"n": 0, "polls": 0, "max_waited_s": 0.0, "timeouts": 0, "unknown": 0, "_streak": 0})
+        # a path that never reaches the state (something else keeps the overlay awake) would cost the full timeout on
+        # every read: after OVERLAY_TIMEOUT_STREAK consecutive timeouts the wait shortens (the evidence is already in)
+        timeout = OVERLAY_TIMEOUT_S if rec["_streak"] < OVERLAY_TIMEOUT_STREAK else OVERLAY_SHORT_TIMEOUT_S
+        w = wait_overlay(ctl, state != "off", timeout_s=timeout, min_dwell_s=OVERLAY_DWELL_S if changed else 0.0,
+                         sleep=self.s.sleep, clock=self.s.now, old_build_wait_s=OVERLAY_OLD_BUILD_WAIT_S if changed else 0.0)
+        rec["n"] += 1
+        rec["polls"] += w["polls"]
+        rec["max_waited_s"] = max(rec["max_waited_s"], float(w["waited_s"]))
+        rec["_streak"] = rec["_streak"] + 1 if w["ok"] is False else 0
+        if w["ok"] is False:
+            rec["timeouts"] += 1
+        elif w["ok"] is None:
+            rec["unknown"] += 1
+        if w.get("reason") and w["reason"] not in self.reasons:
+            self.reasons.append(w["reason"])
+        return w
+
+    def off_overlay(self) -> Optional[str]:
+        off = self.waits.get("off")
+        if not off:
+            return None
+        return "awake" if off["timeouts"] else ("unknown" if off["unknown"] else "asleep")
+
+    def summary(self) -> dict[str, dict[str, Any]]:
+        return {st: {k: v for k, v in rec.items() if not k.startswith("_")} for st, rec in self.waits.items()}
+
+    def file_meta(self) -> dict[str, Any]:
+        return {"off_overlay": self.off_overlay(), "overlay_wait": self.summary()}
+
+    def report(self, result: StageResult, phase: str) -> None:
+        off = self.waits.get("off") or {}
+        if off.get("timeouts"):
+            result.anomaly("overlay_never_slept", f"{phase}: {off['timeouts']} of {off['n']} layer-OFF reads were taken with the overlay "
+                           f"still AWAKE after {OVERLAY_TIMEOUT_S:g} s (the file is tagged off_overlay: awake) — another layer, "
+                           "monitor, cube or the analysis view keeps it awake; those OFF reads are the awake path, not the "
+                           "native one", "medium")
+        on = [st for st in ("id", "on") if (self.waits.get(st) or {}).get("timeouts")]
+        if on:
+            result.anomaly("overlay_never_woke", f"{phase}: the overlay stayed ASLEEP with the FALD layer on ({on}) — the layer is not "
+                           "running (panel file refused for this mode/path, shaders not ready, or DWM-hook mode): those reads "
+                           "are NOT identity / ON reads", "high")
+        if any((w or {}).get("unknown") for w in self.waits.values()):
+            result.note(f"{phase}: overlay state unverifiable — {'; '.join(self.reasons)}")
+        result.metrics["overlay_wait"] = self.summary()
+        result.metrics["off_overlay"] = self.off_overlay()
+
+
 # ----------------------------------------------------------------------------- session (reader + controller)
 @dataclass
 class Session:
@@ -128,13 +309,18 @@ class Session:
     close: Callable[[], None]
     simulated: bool
     presenter: Any = None
+    sleep: Callable[[float], None] = time.sleep          # overlay waits (a VirtualClock under --simulate)
+    now: Callable[[], float] = time.monotonic
 
 
 def _open_session(args, ctx: RunContext, st: dict[str, Any], *, need_meter: bool) -> Session:
     controller = _common.make_controller(args, ctx)
     events = EventWriter(ctx.events_path)
+    vc = VirtualClock() if args.simulate else None
+    timing = {"sleep": vc.sleep, "now": vc.now} if vc else {}
     if not need_meter:
-        return Session(args, ctx, st, controller, lambda *a: (None, 0.0, "no meter in this phase"), events, lambda: None, bool(args.simulate))
+        return Session(args, ctx, st, controller, lambda *a: (None, 0.0, "no meter in this phase"), events, lambda: None,
+                       bool(args.simulate), **timing)
     if args.simulate:
         from ..fald.profile import SyntheticFaldPanel
         g = _geometry(st)
@@ -148,7 +334,7 @@ def _open_session(args, ctx: RunContext, st: dict[str, Any], *, need_meter: bool
             t0 = time.time()
             xyz = panel.read(shapes, truth_meter)
             return xyz, time.time() - t0, None
-        return Session(args, ctx, st, controller, read, events, lambda: None, True)
+        return Session(args, ctx, st, controller, read, events, lambda: None, True, **timing)
     # hardware: AUDIT-OR-REFUSE first (hard rule: any meter session on a DesktopLUT monitor checks the layers —
     # preflight's audit is hours old by the time a later phase runs), then profile → meter + presenter
     mode = str(st["fald"].get("mode") or args.mode)
@@ -192,16 +378,81 @@ def _open_session(args, ctx: RunContext, st: dict[str, Any], *, need_meter: bool
     return Session(args, ctx, st, controller, read, events, close, False, presenter)
 
 
+def _off_id_dev(pair: dict[str, Any], floor: float = 0.05) -> Optional[float]:
+    """OFF/ID − 1 of one pattern's interleaved reads (None when either is missing or at the floor)."""
+    off, idr = pair.get("off"), pair.get("id")
+    if off is None or idr is None or off.y is None or idr.y is None or off.y <= floor or idr.y <= floor:
+        return None
+    return off.y / idr.y - 1.0
+
+
+def _median_read(name: str, rds: list):
+    """Component-wise median of several reads of one pattern in one state (a missing read is ignored)."""
+    import numpy as np
+    from ..fald.profile import Read
+    ok = [r for r in rds if r.xyz is not None]
+    if not ok:
+        return rds[-1]
+    xyz = tuple(float(v) for v in np.median([list(r.xyz) for r in ok], axis=0))
+    return Read(name, xyz, round(sum(r.t_read_s for r in ok) / len(ok), 2), None)
+
+
+def _read_anomalies(result: StageResult, phase: str, patterns: list, states: tuple, by_state: dict, warnings: list,
+                    bimodal: list, reread_cap: int) -> None:
+    """ONE StageResult anomaly per kind for the whole phase (the live events stay per read)."""
+    drifts = [w for w in warnings if w["kind"] == "drift"]
+    if drifts:
+        worst = max(abs(w["frac"]) for w in drifts)
+        refs = sorted({w["ref"] for w in drifts})
+        sev = "high" if (worst > DRIFT_HIGH_FRAC or len(refs) >= DRIFT_HIGH_COUNT) else "medium"
+        result.anomaly("reference_drift", f"{phase}: {len(drifts)} reference/_end pair(s) moved > {100 * DRIFT_WARN_FRAC:.0f} % over "
+                       f"their block ({len(refs)} reference(s): {refs[:6]}), worst {100 * worst:+.1f} % — the ratios of those "
+                       "blocks carry the drift (warm-up, ABL, a moved meter?)", sev)
+    missing = [(st, name) for st in states for name, r in by_state[st].items() if r.xyz is None]
+    if missing:
+        total = sum(len(v) for v in by_state.values())
+        referenced = {p.ref for p in patterns if p.ref}
+        lost, half = set(), set()             # a reference with no usable read at all / one of its twin reads missing
+        for st in states:
+            sr = by_state[st]
+            for ref in referenced:
+                got = [n for n in (ref, ref + "_end") if n in sr and sr[n].xyz is not None]
+                gone = [n for n in (ref, ref + "_end") if n in sr and sr[n].xyz is None]
+                if gone and not got:
+                    lost.add(ref if st is None else f"{ref} [{st}]")
+                elif gone:
+                    half.update(n if st is None else f"{n} [{st}]" for n in gone)
+        frac = len(missing) / max(1, total)
+        sev = "high" if (frac > NO_READ_HIGH_FRAC or lost) else "medium"
+        result.anomaly("no_read", f"{phase}: {len(missing)} of {total} reads missing ({100 * frac:.1f} %)"
+                       + (f"; references with NO read (every ratio on them is lost): {sorted(lost)}" if lost else "")
+                       + (f"; reference twins missing (the other twin carries the ratio, without drift cancellation): {sorted(half)}"
+                          if half else "")
+                       + f"; e.g. {[f'{n} [{st}]' if st else n for st, n in missing[:5]]}", sev)
+    if bimodal:
+        reread = sum(1 for b in bimodal if b.get("reread"))
+        result.anomaly("off_read_bimodal", f"{phase}: {len(bimodal)} pattern(s) whose OFF/identity ratio left its level's running "
+                       f"median by more than max(1 %, 4·MAD) — {reread} re-read (cap {reread_cap}), all reads kept in the phase "
+                       f"files ('rereads'); e.g. {[(b['name'], b['dev_pct'], b.get('rule')) for b in bimodal[:4]]}", "medium")
+
+
 def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *, extra_per_read=None,
-                  states: tuple = (None,), set_state: Optional[Callable[[Any], None]] = None) -> dict:
+                  states: tuple = (None,), set_state: Optional[Callable[[Any], None]] = None,
+                  file_meta: Optional[dict[str, Any]] = None) -> dict:
     """Present + read every pattern; write the phase file (patterns + reads + the sensor position they were read at)
     incrementally; emit check-in evidence packets on cadence; honour cancel. Returns name → Read.
 
     ``states`` (e.g. ("off", "id")) reads every pattern once per state, INTERLEAVED (``set_state(state)`` before each
-    read, so drift cancels between them); the first state's reads go to ``<phase>.json``, the others to
-    ``<phase>_<state>.json``, and the return value is then {state: {name: Read}}."""
-    from ..fald.profile import Read
+    read) with the order ALTERNATING per pattern (off,id / id,off: drift and the switch history cancel between them);
+    the first state's reads go to ``<phase>.json``, the others to ``<phase>_<state>.json``, and the return value is
+    then {state: {name: Read}}. With both "off" and "id", a pattern whose OFF/ID − 1 leaves its field level's running
+    median by more than max(1 %, 4·MAD) is re-read in both states once (at most 10 % of the patterns): the pass
+    consistent with the median is kept, else the median of both; every read stays in the files (``rereads``).
+    ``file_meta`` (a dict the caller may keep updating) is merged into every file write."""
+    from ..fald.profile import Read, ref_means
+    import numpy as np
     by_state: dict[Any, dict[str, Read]] = {st: {} for st in states}
+    rereads: dict[Any, list] = {st: [] for st in states}
     reads = by_state[states[0]]
     paths = {st: _phase_file(s.ctx, phase if k == 0 else f"{phase}_{st}") for k, st in enumerate(states)}
     meter = list(s.st["fald"]["geometry"]["meter"])
@@ -210,55 +461,120 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
     n = len(patterns)
     fired = set()
     warnings: list[dict[str, Any]] = []
+    bimodal: list[dict[str, Any]] = []
     seq = 0
     dark_prev = False
+    paired = "off" in states and "id" in states
+    reread_cap = int(math.ceil(REREAD_CAP_FRAC * n)) if paired else 0
+    n_reread = 0
+    level_hist: dict[tuple, list[float]] = {}
 
     def flush(complete: bool = False):
         for st in states:
-            atomic_write_text(paths[st], json.dumps({"phase": phase, "state": st, "complete": complete, "meter": meter,
-                                                     "patterns": [p.as_dict() for p in patterns],
-                                                     "reads": [r.as_dict() for r in by_state[st].values()],
-                                                     "elapsed_s": round(time.time() - t0, 1)}, indent=1))
+            body = {"phase": phase, "state": st, "complete": complete, "meter": meter,
+                    "patterns": [p.as_dict() for p in patterns], "reads": [r.as_dict() for r in by_state[st].values()]}
+            body.update(file_meta or {})
+            if rereads[st]:
+                body["rereads"] = rereads[st]
+            body["elapsed_s"] = round(time.time() - t0, 1)
+            atomic_write_text(paths[st], json.dumps(body, indent=1, default=float))
 
     def checkin(trigger: str, i: int):
         nonlocal seq, last_ci
         seq += 1
-        ys = [r.y for r in reads.values() if r.y is not None]
-        _check_in(s.events, phase=phase, seq=seq, trigger=trigger, reads=len(reads), of=n,
-                          elapsed_s=round(time.time() - t0, 1), last=patterns[i].name,
-                          max_nits=max(ys) if ys else None, min_nits=min(ys) if ys else None,
-                          warnings=warnings[-10:], warning_count=len(warnings))
+        every = [r for sr in by_state.values() for r in sr.values()]           # all states, not just the first
+        ys = [r.y for r in every if r.y is not None]
+        _check_in(s.events, phase=phase, seq=seq, trigger=trigger, reads=len(every), of=n * len(states),
+                  states=[st for st in states if st is not None] or None, rereads=n_reread,
+                  elapsed_s=round(time.time() - t0, 1), last=patterns[i].name,
+                  max_nits=max(ys) if ys else None, min_nits=min(ys) if ys else None,
+                  warnings=warnings[-10:], warning_count=len(warnings))
         last_ci = time.time()
+
+    def read_one(p, st, bump: float):
+        if set_state is not None:
+            set_state(st)
+        label = p.name if st is None else f"{p.name} [{st}]"
+        xyz, dt, err = s.read(label, p.shapes, p.field, bump)
+        if xyz is None:
+            xyz, dt, err = s.read(label, p.shapes, p.field, bump)             # one retry
+        rd = Read(p.name, xyz, round(dt + bump, 2), err)
+        print(f"   {label:<30} Y={rd.y if rd.y is not None else float('nan'):10.4f} nits  [{dt:4.1f}s] {p.note}", file=sys.stderr, flush=True)
+        return rd
+
+    def finish(complete: bool):
+        flush(complete=complete)
+        result.raw["warnings"] = warnings
+        result.metrics["reads"] = sum(len(v) for v in by_state.values())
+        if paired:
+            result.metrics["rereads"] = n_reread
+            result.raw["off_read_bimodal"] = bimodal
+        outl: dict[str, list] = {}
+        for st in states:
+            lst: list = []
+            oth = next((by_state[o] for o in states if o != st), None) if len(states) == 2 else None
+            ref_means(patterns, by_state[st], other=oth, outliers=lst)
+            if lst:
+                outl["reads" if st is None else str(st)] = lst
+        if outl:
+            result.metrics["ref_outlier"] = outl
+        _read_anomalies(result, phase, patterns, states, by_state, warnings, bimodal, reread_cap)
 
     for i, p in enumerate(patterns):
         if _cancel_requested(s.ctx):
-            result.fail("cancelled", f"control.json cancel honoured after {len(reads)} reads")
-            flush()
+            result.fail("cancelled", f"control.json cancel honoured after {sum(len(v) for v in by_state.values())} reads")
+            finish(complete=False)
             return by_state if len(states) > 1 else reads
         settle_bump = 2.0 if (p.field == (0, 0, 0) and not dark_prev) else 0.0   # zone decay after bright content
         dark_prev = p.field == (0, 0, 0)
-        for k, st in enumerate(states):
-            if set_state is not None:
-                set_state(st)
-            label = p.name if st is None else f"{p.name} [{st}]"
-            bump = settle_bump if k == 0 else 0.0
-            xyz, dt, err = s.read(label, p.shapes, p.field, bump)
-            if xyz is None:
-                xyz, dt, err = s.read(label, p.shapes, p.field, bump)             # one retry
-            rd = Read(p.name, xyz, round(dt + bump, 2), err)
+        order = states if (len(states) == 1 or i % 2 == 0) else tuple(reversed(states))
+        got = {st: read_one(p, st, settle_bump if k == 0 else 0.0) for k, st in enumerate(order)}
+        if paired:
+            dev = _off_id_dev(got)
+            hist = level_hist.setdefault(tuple(p.field), [])
+            if dev is not None and len(hist) >= BIMODAL_MIN_HISTORY:
+                med = float(np.median(hist))
+                thr = max(BIMODAL_MIN_FRAC, BIMODAL_MAD_K * float(np.median(np.abs(np.array(hist) - med))))
+                if abs(dev - med) > thr:
+                    row = {"name": p.name, "field": list(p.field), "dev_pct": round(100 * dev, 3),
+                           "level_median_pct": round(100 * med, 3), "threshold_pct": round(100 * thr, 3)}
+                    if n_reread < reread_cap:
+                        n_reread += 1
+                        again = {st: read_one(p, st, 0.0) for st in order}
+                        dev2 = _off_id_dev(again)
+                        if dev2 is not None and abs(dev2 - med) <= thr:
+                            kept, rule = again, "reread_consistent"          # the first pass was the outlier
+                        elif dev2 is None:
+                            kept, rule = got, "reread_unusable"
+                        else:
+                            kept, rule = {st: _median_read(p.name, [got[st], again[st]]) for st in states}, "median_of_both"
+                        for st in states:
+                            rereads[st].append({"name": p.name, "reads": [got[st].as_dict(), again[st].as_dict()], "kept": rule})
+                        row.update({"reread": True, "dev2_pct": None if dev2 is None else round(100 * dev2, 3), "rule": rule})
+                        got = kept
+                        dev = _off_id_dev(got)
+                    else:
+                        row.update({"reread": False, "rule": "cap_reached"})
+                    bimodal.append(row)
+                    warnings.append({"kind": "off_read_bimodal", **row})
+                    _anomaly(s.events, phase=phase, kind="off_read_bimodal", **row)
+            if dev is not None:
+                hist.append(dev)
+        for st in states:
+            rd = got[st]
             sr = by_state[st]
             sr[p.name] = rd
-            if xyz is None:
-                warnings.append({"kind": "no_read", "name": label, "error": err})
-                _anomaly(s.events, phase=phase, kind="no_read", name=label, error=err)
+            label = p.name if st is None else f"{p.name} [{st}]"
+            if rd.xyz is None:
+                warnings.append({"kind": "no_read", "name": label, "error": rd.error})
+                _anomaly(s.events, phase=phase, kind="no_read", name=label, error=rd.error)
             elif p.kind == "aux" and p.name.endswith("_end") and p.name[:-4] in sr and sr[p.name[:-4]].y:
                 a, b = sr[p.name[:-4]].y, rd.y
-                if a and b and a > 0.05 and abs(b / a - 1.0) > 0.03:        # floor-level references (black) are noise
-                    warnings.append({"kind": "drift", "name": label, "start": a, "end": b, "frac": b / a - 1.0})
+                if a and b and a > 0.05 and abs(b / a - 1.0) > DRIFT_WARN_FRAC:     # floor-level references (black) are noise
+                    warnings.append({"kind": "drift", "name": label, "ref": p.name[:-4], "state": st, "start": a, "end": b, "frac": b / a - 1.0})
                     _anomaly(s.events, phase=phase, kind="reference_drift", name=label, start=a, end=b)
             if extra_per_read:
                 extra_per_read(p, rd)
-            print(f"   {label:<30} Y={rd.y if rd.y is not None else float('nan'):10.4f} nits  [{dt:4.1f}s] {p.note}", file=sys.stderr, flush=True)
         if i % 5 == 4 or i == n - 1:
             flush()
         frac = (i + 1) / n
@@ -268,9 +584,7 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
                 checkin(f"progress_{int(f * 100)}", i)
         if time.time() - last_ci >= CHECKIN_EVERY_S:
             checkin("timed", i)
-    flush(complete=True)
-    result.raw["warnings"] = warnings
-    result.metrics["reads"] = sum(len(v) for v in by_state.values())
+    finish(complete=True)
     result.metrics["elapsed_s"] = round(time.time() - t0, 1)
     for st in states:
         result.add_artifact(paths[st])
@@ -282,6 +596,15 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
     from ..fald.profile import PanelGeometry
     from ..dogegen_window import resolve_monitor_rect
     mode = _common.run_mode(args, ctx)
+    # a geometry nothing has measured with yet (a preflight that blocked late, or whose anomalies said to fix --zones /
+    # move the meter) may be re-derived; once a MEASURING phase is done the CLI must not overwrite it
+    measured = sorted(k for k, v in (st["fald"].get("phases") or {}).items()
+                      if k not in ("preflight", "aid") and (v or {}).get("status") == "done")
+    if st["fald"].get("geometry") and measured and not getattr(args, "keep_geometry", False):
+        result.block("geometry_exists", f"this run already measured with its recorded panel geometry (phases done: {measured}); "
+                     "re-deriving it from the command line would drop what was measured (white, SDR gamma, sensor position) — "
+                     "pass --keep-geometry to re-enter this run, or start a new run")
+        return
     controller = _common.make_controller(args, ctx)
     alive, state, err = _common.ping_controller(controller)
     result.preconditions["pipe_alive"] = alive
@@ -458,6 +781,30 @@ def phase_register(s: Session, result: StageResult) -> None:
         return
     sensor = [int(v) for v in reg["sensor_px"]]
     shift = math.hypot(sensor[0] - g.meter[0], sensor[1] - g.meter[1])
+    # register.json's meter stamp is the PRE-registration position its patterns were drawn at; add what it found
+    rp = _phase_file(s.ctx, "register")
+    try:
+        raw = json.loads(rp.read_text(encoding="utf-8"))
+        raw["sensor_px"] = sensor
+        atomic_write_text(rp, json.dumps(raw, indent=1))
+    except (OSError, ValueError) as exc:
+        result.note(f"could not add sensor_px to {rp.name}: {exc}")
+    # phase files from a build before the meter stamp were read at the CURRENT meter: remember it before it moves
+    unstamped = _unstamped_phase_files(s.ctx)
+    if unstamped:
+        cur = [int(v) for v in g.meter]
+        legacy = s.st["fald"].get("legacy_meter")
+        if not legacy:
+            s.st["fald"]["legacy_meter"] = cur
+            s.st["fald"]["legacy_meter_files"] = unstamped
+            result.action(f"recorded legacy_meter {cur} for the unstamped phase files {unstamped} before re-registering")
+        elif [int(v) for v in legacy] != cur and not set(unstamped) <= set(s.st["fald"].get("legacy_meter_files") or ()):
+            # (files already on the recorded list were read at legacy_meter by construction: a later re-registration
+            # moving the meter again is not ambiguous for them; a hand-set legacy_meter has no list)
+            result.anomaly("legacy_meter_ambiguous", f"unstamped phase files {unstamped} exist, the run's legacy_meter is {list(legacy)} "
+                           f"(kept, never overwritten) but the meter before this registration was {cur} — which position those "
+                           f"files were read at is ambiguous (recorded list: {s.st['fald'].get('legacy_meter_files')}); the fit "
+                           "builds them at legacy_meter", "medium")
     s.st["fald"]["geometry"]["meter"] = sensor
     s.st["fald"]["meter_nominal"] = list(g.meter)
     s.st["fald"]["floor_nits"] = floor
@@ -582,13 +929,35 @@ def phase_rings(s: Session, result: StageResult) -> None:
 
 def _collect_items(s: Session):
     """Fit items from every measured phase file, each built at the sensor position ITS reads were taken at (a file
-    stamps ``meter``; files from before the stamp use ``legacy_meter`` or the geometry's). ``--augment-regime id``
-    takes the augment patterns read through the awake overlay in identity instead of with the layer off."""
-    from ..fald.profile import build_items, choose_scale, weight_items
+    stamps ``meter``; files from before the stamp use ``legacy_meter``; with neither, the geometry's sensor and a
+    ``meter_unstamped`` anomaly). ``--augment-regime id`` takes the augment patterns read through the awake overlay in
+    identity instead of with the layer off; ``auto`` (default) = id when the run's CURRENT augment read identity
+    (``phases.augment.states``) and augment_id.json is complete, else off. The regime actually used replaces
+    ``args.augment_regime`` (and is recorded in the run as ``augment_regime``). With both augment state files present,
+    their reference-twin outliers (``ref_outlier``) go to the phase metrics — evidence only, the items are unchanged."""
+    from ..fald.profile import build_items, choose_scale, ref_means, weight_items
     g = _geometry(s.st)
     _, cw, ch = choose_scale(g.width, g.height, g.cols, g.rows)
-    legacy = tuple(s.st["fald"].get("legacy_meter") or g.meter)
-    regime = getattr(s.args, "augment_regime", "off") or "off"
+    legacy = s.st["fald"].get("legacy_meter")
+    requested = getattr(s.args, "augment_regime", "auto") or "auto"
+    regime = requested
+    fid = _phase_file(s.ctx, "augment_id")
+    if requested == "auto":
+        current_id = "id" in ((s.st["fald"].get("phases") or {}).get("augment") or {}).get("states", [])
+        try:
+            complete = fid.exists() and bool(json.loads(fid.read_text(encoding="utf-8")).get("complete"))
+        except (OSError, ValueError):
+            complete = False
+        regime = "id" if (current_id and complete) else "off"
+        if regime == "off" and fid.exists():
+            why = "is INCOMPLETE (cancelled / crashed)" if current_id else "is not from the run's current augment (it read layer-OFF only)"
+            _pending_anomaly(s.st, "augment_regime_fallback", f"augment_id.json {why}: --augment-regime auto uses the layer-OFF "
+                             "augment reads; re-run augment with the panel file for identity data", "medium")
+    elif requested == "id" and not fid.exists():
+        _pending_anomaly(s.st, "augment_regime_unavailable", "--augment-regime id but the run has no augment_id.json (augment read "
+                         "layer-OFF only, or not at all): the fit runs WITHOUT augment patterns", "medium")
+    s.args.augment_regime = regime
+    s.st["fald"]["augment_regime"] = {"requested": requested, "used": regime}
     pats, reads, items = [], {}, []
     incomplete, meters = [], {}
     floor = float(s.st["fald"].get("floor_nits") or 0.004)
@@ -599,13 +968,37 @@ def _collect_items(s: Session):
         raw = json.loads(f.read_text(encoding="utf-8"))
         if not raw.get("complete", True):
             incomplete.append(f.stem)
-        m = tuple(raw.get("meter") or legacy)
+        if raw.get("meter"):
+            m = tuple(raw["meter"])
+        elif legacy:
+            m = tuple(legacy)
+        else:
+            m = tuple(g.meter)
+            _pending_anomaly(s.st, "meter_unstamped", f"{f.name} carries no meter stamp and the run has no legacy_meter: its items are "
+                             f"built at the geometry's sensor {list(m)} — wrong by the shift if that file was read before a later "
+                             "re-registration (set fald.legacy_meter in dlc_state.json to the position it was read at)", "medium")
         meters[f.stem] = list(m)
         fp, fr = _patterns_from_file(f), _reads_from_file(f)
         pats += fp; reads.update(fr)
         items += build_items(fp, fr, (m[0] * cw / g.width, m[1] * ch / g.height), floor_nits=FLOOR_SNR * max(floor, 0.004), weight=False)
     s.st["fald"]["_incomplete_phases"] = incomplete
     s.st["fald"]["_item_meters"] = meters
+    # evidence only: build_items resolves a reference twin within ITS file (the mean); with both augment state files
+    # present, say which references the other state would have resolved differently
+    foff, fid_ = _phase_file(s.ctx, "augment"), _phase_file(s.ctx, "augment_id")
+    if foff.exists() and fid_.exists():
+        try:
+            ap, r_off, r_id = _patterns_from_file(foff), _reads_from_file(foff), _reads_from_file(fid_)
+            outl = {}
+            for name, rd, oth in (("augment", r_off, r_id), ("augment_id", r_id, r_off)):
+                lst: list = []
+                ref_means(ap, rd, other=oth, outliers=lst)
+                if lst:
+                    outl[name] = lst
+            if outl:
+                _pending_metric(s.st, "ref_outlier", outl)
+        except (OSError, ValueError, KeyError) as exc:
+            _pending_metric(s.st, "ref_outlier", {"error": f"{type(exc).__name__}: {exc}"})
     return g, pats, reads, weight_items(items)
 
 
@@ -723,7 +1116,10 @@ def phase_augment(s: Session, result: StageResult) -> None:
     """Near-field + dim-end patterns (profile.plan_augment), each read with the layer OFF and in IDENTITY (the layer on,
     debug 4 — the awake overlay without the correction), interleaved. SDR 2026-09-14: the verify data showed ring
     ratios differing between OFF and identity by up to 2.6 pp at 5 nits (HDR: none) — the regime the layer runs in
-    is identity, so the fit must be able to use it. Without an exported panel file only OFF is read."""
+    is identity, so the fit must be able to use it. Without an exported panel file only OFF is read.
+
+    Every read first waits for the overlay path it needs (:class:`OverlayTracker`: OFF = asleep, identity = awake);
+    OFF / identity alternate their order per pattern and an OFF/ID outlier is re-read (:func:`_run_patterns`)."""
     from ..fald.profile import plan_augment, ref_means
     g = _geometry(s.st)
     mode = str(s.st["fald"].get("mode") or "HDR")
@@ -739,33 +1135,41 @@ def phase_augment(s: Session, result: StageResult) -> None:
             result.anomaly("identity_unavailable", f"runtime.set_fald_params refused ({exc}) — reading layer-OFF only", "medium")
     else:
         result.note("no exported panel file yet: identity (awake overlay) reads skipped")
+    # the run record names the states of the CURRENT augment from the start (a cancelled / failed run included): the
+    # fit's --augment-regime auto trusts augment_id.json only when this augment read identity
+    s.st["fald"]["phases"]["augment"] = {"status": "running", "at": time.time(), "states": list(states)}
+    fid = _phase_file(s.ctx, "augment_id")
+    if "id" not in states and fid.exists():
+        stale = fid.with_name("augment_id.stale.json")
+        fid.replace(stale)
+        result.anomaly("stale_identity_file", f"this augment reads layer-OFF only, so the identity reads of an EARLIER augment no longer "
+                       f"match it: augment_id.json moved to {stale.name} (the fit will not use it)", "medium")
+
+    overlay = OverlayTracker(s, mon, mode)
+    meta: dict[str, Any] = {}
 
     def set_state(state):
-        if state == "id":
-            ctl.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "debug_mode": 4})
-            ctl.set_layers(mon, mode, fald=True)
-        else:
-            ctl.set_layers(mon, mode, fald=False)
-        if not s.simulated:
-            time.sleep(0.6)
+        overlay.set(state)
+        meta.update(overlay.file_meta())
 
     pats = plan_augment(g)
     try:
-        out = _run_patterns(s, "augment", pats, result, states=states, set_state=set_state if len(states) > 1 else None)
+        out = _run_patterns(s, "augment", pats, result, states=states, set_state=set_state, file_meta=meta)
     finally:
+        try:
+            ctl.set_layers(mon, mode, fald=False)
+        except Exception as exc:  # noqa: BLE001
+            result.anomaly("fald_left_on", f"layers.set fald=false failed: {exc} — switch the FALD layer off by hand", "high")
         if len(states) > 1:
-            try:
-                ctl.set_layers(mon, mode, fald=False)
-            except Exception as exc:  # noqa: BLE001
-                result.anomaly("fald_left_on", f"layers.set fald=false failed: {exc} — switch the FALD layer off by hand", "high")
             try:
                 ctl.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "debug_mode": 0})
             except Exception:  # noqa: BLE001
                 pass
+    overlay.report(result, "augment")
     if result.status != "ran":
         return
     by_state = out if len(states) > 1 else {"off": out}
-    refs = {st: ref_means(pats, rd) for st, rd in by_state.items()}
+    refs = {st: ref_means(pats, rd, other=next((o for k, o in by_state.items() if k != st), None)) for st, rd in by_state.items()}
     groups: dict[str, dict[str, list]] = {}
     for p in pats:
         if p.kind != "ratio":
@@ -789,10 +1193,12 @@ def phase_augment(s: Session, result: StageResult) -> None:
     result.metrics["groups"] = summary
     result.raw["rows"] = {grp: gd["rows"] for grp, gd in groups.items()}
     result.metrics["states"] = list(states)
-    s.st["fald"]["phases"]["augment"] = {"status": "done", "at": time.time(), "states": list(states)}
+    s.st["fald"]["phases"]["augment"] = {"status": "done", "at": time.time(), "states": list(states),
+                                         "off_overlay": overlay.off_overlay()}
     result.advice = {"default_policy_verdict": "judge_regime_then_fit",
-                     "reasons": ["compare ring ratios OFF vs identity per group: if identity differs materially, refit with "
-                                 "--augment-regime id (the layer runs on the awake overlay)",
+                     "reasons": ["compare ring ratios OFF vs identity per group: `fit` uses the identity reads by default "
+                                 "(--augment-regime auto → id when this augment read identity completely; the layer runs on the awake "
+                                 "overlay); --augment-regime off forces the layer-OFF reads",
                                  "then `fit` (the by_level report is the evidence for --lum-fade at export)"]}
 
 
@@ -846,25 +1252,27 @@ def phase_verify(s: Session, result: StageResult) -> None:
                      "SDR/ACM port, DWM hook mode, or a panel file whose transfer does not match the mode)")
         return
 
-    def set_fald(on: bool, identity: bool = False):
-        ctl.call("runtime.fald_debug", {"monitor": s.args.monitor, "mode": mode, "debug_mode": 4 if identity else 0})
-        ctl.set_layers(s.args.monitor, mode, fald=on)
-        if not s.simulated:
-            time.sleep(0.6)
-
-    pats = plan_verify_extended(g) if getattr(s.args, "extended", False) else plan_verify(g)
+    # OFF = asleep overlay, identity (debug 4) / ON = awake: every read waits for its path (OverlayTracker); the
+    # OFF / ID / ON order alternates per pattern (off,id,on / on,id,off) so drift and the switch history cancel
+    overlay = OverlayTracker(s, s.args.monitor, mode)
+    missing: list = []
+    pats = plan_verify_extended(g, missing=missing) if getattr(s.args, "extended", False) else plan_verify(g)
+    if missing:
+        result.metrics["verify_ext_missing"] = missing
+        result.anomaly("verify_roles_missing", f"the extended verify set cannot draw {len(missing)} role(s) at this geometry / meter: "
+                       f"{missing}", "medium")
     rows = []
+    order = ("off", "id", "on")
     try:
         for i, p in enumerate(pats):
             if _cancel_requested(s.ctx):
                 result.fail("cancelled", "control.json cancel honoured")
                 break
-            set_fald(False)
-            y_off = s.read(p.name + " OFF", p.shapes, p.field)[0]
-            set_fald(True, identity=True)
-            y_id = s.read(p.name + " ID", p.shapes, p.field)[0]
-            set_fald(True)
-            y_on = s.read(p.name + " ON", p.shapes, p.field)[0]
+            ys: dict[str, Any] = {}
+            for st in (order if i % 2 == 0 else order[::-1]):
+                overlay.set(st)
+                ys[st] = s.read(f"{p.name} {st.upper()}", p.shapes, p.field)[0]
+            y_off, y_id, y_on = ys["off"], ys["id"], ys["on"]
             img = model.render(p.shapes)
             cm = g.canvas_meter(params)
             pred_off = float(model.meter_img(img, cm).sum())
@@ -884,6 +1292,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
             ctl.call("runtime.fald_debug", {"monitor": s.args.monitor, "mode": mode, "debug_mode": 0})
         except Exception:  # noqa: BLE001
             pass
+    overlay.report(result, "verify")
     # scorecard: ring ratios ON/flat vs ID/flat (the layer's job is ON/flat → 1)
     flats = {r["name"]: r for r in rows if r["kind"] == "aux"}
     card = []
@@ -896,7 +1305,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
                      "model_on": r["pred_on"] / f["pred_on"] - 1.0})
     tag = ("_ext" if getattr(s.args, "extended", False) else "")
     vpath = _out_dir(s.ctx) / (f"verify{tag}.json" if not alt_bin else f"verify{tag}_{Path(bin_path).stem}.json")
-    atomic_write_text(vpath, json.dumps({"rows": rows, "scorecard": card}, indent=1, default=float))
+    atomic_write_text(vpath, json.dumps({"rows": rows, "scorecard": card, **overlay.file_meta()}, indent=1, default=float))
     result.add_artifact(vpath)
     result.metrics["scorecard"] = card
     if card:
@@ -933,6 +1342,7 @@ def build(args, ctx: RunContext) -> StageResult:
     st = _state(ctx)
     if phase == "preflight":
         phase_preflight(args, ctx, st, result)
+        _judge_on_high(phase, result)
         _save(ctx, st)
         return result
     if "geometry" not in st["fald"]:
@@ -956,6 +1366,11 @@ def build(args, ctx: RunContext) -> StageResult:
         result.fail("phase_error", f"{type(exc).__name__}: {exc}")
     finally:
         s.close()
+        for code, detail, severity in st["fald"].pop("_pending_anomalies", None) or []:
+            result.anomaly(code, detail, severity)
+        for key, value in (st["fald"].pop("_pending_metrics", None) or {}).items():
+            result.metrics.setdefault(key, value)
+        _judge_on_high(phase, result)
         _save(ctx, st)
     return result
 
@@ -980,8 +1395,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=None, help="export: output directory (default results/fald_profile_<name>_<mode>_<date>)")
     parser.add_argument("--keep-geometry", action="store_true", dest="keep_geometry",
                         help="preflight on an existing run: keep its measured geometry (white, gamma, sensor) — for augment / re-verify")
-    parser.add_argument("--augment-regime", default="off", choices=("off", "id"), dest="augment_regime",
-                        help="fit: use the augment patterns read layer-OFF (default) or through the awake overlay in identity")
+    parser.add_argument("--augment-regime", default="auto", choices=("off", "id", "auto"), dest="augment_regime",
+                        help="fit: the augment patterns read layer-OFF, through the awake overlay in identity, or auto "
+                             "(default: id when the run's current augment read identity and augment_id.json is complete, else off)")
     parser.add_argument("--lum-fade", default=None, dest="lum_fade",
                         help="export: pixel-luminance fade LO,HI in as-if-white nits (chosen from the fit's by_level report)")
     parser.add_argument("--extended", action="store_true", help="verify: add 1-nit rings, thin bars and steep ramps to the set")
