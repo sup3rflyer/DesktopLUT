@@ -114,3 +114,17 @@ def test_scrgb_to_nits_pq_is_the_dump_compare_formula():
     assert np.allclose(p.scrgb_to_nits(np.ones(3)), 80.0)               # scRGB white = 80 nits on every channel
     back = p.nits_to_scrgb(p.scrgb_to_nits(frame[1:]))                  # non-negative rows round-trip
     assert np.allclose(back, frame[1:], atol=1e-5)
+
+
+@pytest.mark.skipif(not _SHADER.exists(), reason="DesktopLUT C++ tree not next to DLC")
+def test_ceiling_rule_knee_constants_and_single_scale_match_the_hlsl_source():
+    """Work guide C10 + C11: the HLSL Correct() applies ONE scale per pixel with the same soft-knee constants as
+    correct.py; the per-channel keep rule (req.r > cap ? ...) must not come back."""
+    from dlc.fald import correct as C
+    src = _SHADER.read_text(encoding="utf-8")
+    ks = float(re.search(r"static const float FALD_KNEE_START = ([0-9.]+)f;", src).group(1))
+    kt = float(re.search(r"static const float FALD_KNEE_CAP_TRUST = ([0-9.]+)f;", src).group(1))
+    assert ks == C.KNEE_START and kt == C.KNEE_CAP_TRUST
+    body = re.search(r"float3 Correct\(float3 img, float bTrue, float bEst, float gain\) \{(.*?)\n\}", src, re.S).group(1)
+    assert "req.r > cap" not in body and "keep" not in body
+    assert "return max(u * ge, 0.0f);" in body and "FALD_KNEE_START" in body

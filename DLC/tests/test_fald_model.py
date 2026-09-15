@@ -151,10 +151,13 @@ def test_correction_removes_the_ring_in_the_model():
     m2 = FaldModel(FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3))
     after2 = m2.meter_img(correct_image(m2, img)["req"], METER).sum() / target
     assert abs(after2 - 1.0) < 0.02
-    # the highlight itself is untouched (saturated: original request kept)
+    # the highlight (saturated): its hue is preserved and the drive statistic it feeds is unchanged
+    # (one scale per pixel; the old per-channel rule kept it "untouched" but rotated hue elsewhere — C10)
     res = correct_image(m, img)
     hi = m.render(shapes)[0] > 5000
-    assert np.allclose(res["req"][0][hi], img[0][hi])
+    assert np.allclose(np.minimum(res["req"].max(axis=0)[hi], p.white_nits), np.minimum(img.max(axis=0)[hi], p.white_nits))
+    r = res["req"][:, hi] / img[:, hi]
+    assert np.allclose(r[0], r[1]) and np.allclose(r[1], r[2])
 
 
 def test_area_statistic_is_shape_independent_and_matches_winmax_on_fields():
@@ -308,3 +311,69 @@ def test_knot_decrement_parametrisation_is_monotone_and_round_trips():
     # a strongly negative z gives a (near-)plateau, never a rise
     lw = np.array(knot_logw_from_decrements([-20.0] * 7))
     assert np.all(np.diff(lw) <= 0.0) and lw[-1] > -1e-6
+
+
+# ----------------------------------------------------------------------------- ceiling rule (work guide C10 + C11)
+def _edge_frame(m, code8, x0, y0, white, gamma):
+    """A flat colour right of x0 / below y0 on black (SDR gamma codes → as-if-white nits)."""
+    img = np.zeros((3, m.h, m.w))
+    nits = white * (np.array(code8) / 255.0) ** gamma
+    img[:, y0 // m.p.scale:, x0 // m.p.scale:] = nits[:, None, None]
+    return img
+
+
+def _sdr_params(**over):
+    kw = dict(transfer="gamma", code_bits=8, white_nits=121.9, sdr_gamma=2.27, est_kind="exp", est_scale_mm=7.5,
+              est_phase_px=-26.8, est_phase_py=-21.0, est_support_cells=5, tmin=9.5e-4, core_mm=10.8, tail_mm=18.1,
+              tail_frac=0.4, stat_area0_px2=557.0, drive_curve=[(121.9 * f, f ** 0.45) for f in (0.003, 0.01, 0.03, 0.1, 0.3, 0.6, 1.0)])
+    kw.update(over)
+    return FaldParams(**kw)
+
+
+def test_ceiling_rule_never_rotates_hue_at_bright_edges_on_black():
+    # owner photo 2026-09-14: the wallpaper sky (192,160,146) turned salmon along left/top edges (per-channel keep rule)
+    # exact with the pedestal off (the only per-pixel colour change left is the white-mode pedestal term, an equal
+    # subtraction BEFORE the single scale: < 1 % here; the per-channel rule rotated R/G by 20-60 %)
+    from dlc.fald.correct import correct_image
+    # (the pedestal case is checked on the wallpaper grey only: on a saturated colour the white-mode pedestal's equal
+    #  subtraction is a known few-% change of the darkest channel, independent of the ceiling rule)
+    for tmin, tol, colours in ((0.0, 1e-9, ((192, 160, 146), (230, 60, 40), (40, 90, 230))), (9.5e-4, 1e-2, ((192, 160, 146),))):
+        m = FaldModel(_sdr_params(tmin=tmin))
+        for code8 in colours:
+            for dx, dy in ((0, 0), (20, 10), (50, 30)):
+                img = _edge_frame(m, code8, 2080 + dx, 900 + dy, m.p.white_nits, m.p.sdr_gamma)
+                res = correct_image(m, img)
+                lit = img.max(axis=0) > 0
+                ratio = res["req"][:, lit] / img[:, lit]
+                spread = (ratio.max(axis=0) - ratio.min(axis=0)) / ratio.max(axis=0)
+                assert spread.max() <= tol, (tmin, code8, dx, dy, spread.max())
+
+
+def test_ceiling_gain_is_bounded_monotone_and_continuous():
+    from dlc.fald.correct import ceiling_gain
+    white = 121.9
+    for gain in (0.6, 0.95, 1.0, 1.05, 1.3, 2.5):
+        for b in (0.05, 0.4, 1.0):
+            m = np.linspace(1e-3, 3 * white, 20001)
+            g = ceiling_gain(m, np.full_like(m, gain), np.full_like(m, b), white)
+            assert np.all(g >= min(1.0, gain) - 1e-12) and np.all(g <= max(1.0, gain) + 1e-12)
+            out = m * g
+            assert np.all(np.diff(out) >= -1e-9), (gain, b)                     # monotone in the input
+            assert np.max(np.abs(np.diff(out))) < 5 * (m[1] - m[0]) * max(gain, 1.0)   # no jumps
+            if gain > 1.0:
+                C = white * b
+                assert np.all(out <= np.maximum(m, C) + 1e-9)                     # never brightens past the ceiling
+                assert np.allclose(g[m * gain <= 0.9 * C], gain)                  # identity well below it
+    # continuity across gain = 1
+    m = np.array([50.0]); b = np.array([0.3])
+    assert abs(ceiling_gain(m, np.array([1.0 + 1e-9]), b, white)[0] - ceiling_gain(m, np.array([1.0 - 1e-9]), b, white)[0]) < 1e-6
+
+
+def test_ceiling_rule_keeps_flat_fields_and_full_white_identity():
+    from dlc.fald.correct import correct_image
+    m = FaldModel(_sdr_params())
+    for code8 in ((128, 128, 128), (255, 255, 255), (192, 160, 146)):
+        img = _edge_frame(m, code8, 0, 0, m.p.white_nits, m.p.sdr_gamma)
+        res = correct_image(m, img)
+        interior = (slice(None), slice(m.h // 4, 3 * m.h // 4), slice(m.w // 4, 3 * m.w // 4))
+        assert np.allclose(res["req"][interior], img[interior], rtol=2e-3)

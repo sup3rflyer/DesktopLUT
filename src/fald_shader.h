@@ -23,7 +23,7 @@
 //   CS conv           : drives (x) K_true, drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
 //   CS stat  (round 1): same statistic on the CORRECTED frame (the correction moves the drives)
 //   CS conv           : final backlight fields
-//   PS                : per pixel: req = (img + ped_ref - ped) * B_est/B_true, clamped, highlights kept
+//   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
 #pragma once
 
 inline const char* g_faldCommonSource = R"(
@@ -56,6 +56,10 @@ Texture2D<float>  flatTrueTex : register(t7); // the same two fields for a fully
 Texture2D<float>  flatEstTex  : register(t8);
 Texture2D<float>  gainTex     : register(t9); // smoothed gain on the fine grid (pass 2b)
 SamplerState linearClamp : register(s0);
+
+// Ceiling-rule soft knee (correct.py KNEE_START / KNEE_CAP_TRUST; DLC tests/test_fald_transfer.py pins them equal).
+static const float FALD_KNEE_START = 0.9f;
+static const float FALD_KNEE_CAP_TRUST = 1.0f;
 
 static const float3x3 BT709_TO_BT2020 = float3x3(
     0.6274040f, 0.3292820f, 0.0433136f,
@@ -183,25 +187,34 @@ float3 PedestalTerm(float3 img, float s, float bTrue, float bEst, float maxc, ui
 
 // correct.py::correct_image for one pixel. img = as-if-white nits per channel (original frame);
 // gain = the (smoothed) gain sampled at the pixel.
+// Ceiling rule (work guide C10 + C11, 2026-09-15): ONE scale for all three channels (hue cannot rotate). Darkening
+// applies the full gain; brightening goes through a soft knee on the brightest channel toward the LCD ceiling
+// C = white * B_est — identity up to FALD_KNEE_START * C, then a smooth roll-off that never ends below the original
+// and asymptotes to max(original, C): the layer never brightens INTO the ceiling (isolated highlights keep their
+// gradients) and saturated highlights keep their request. The scale always lies between 1 and the gain, so no fade
+// gate is needed (the fades already pulled the gain toward 1).
 float3 Correct(float3 img, float bTrue, float bEst, float gain) {
     float maxc = max(img.r, max(img.g, img.b));
     float s = min(maxc, white);
     bTrue = max(bTrue, 0.0f);
-    // deep-dark fade: the model is trusted only where the panel's estimate is not ~zero
-    float wfade = smoothstep(fadeLo, fadeHi, bEst);
     // pixel-luminance fade (doc S33): no baseline below ~1 nit -> the correction ramps in over lumFadeLo..lumFadeHi
     // of the pixel's own level (applied after the gain low-pass, per pixel; gainTex/debug view stay unfaded)
-    if (lumFadeHi > lumFadeLo) {
-        float wlum = smoothstep(lumFadeLo, lumFadeHi, maxc);
-        gain = 1.0f + (gain - 1.0f) * wlum;
-        wfade *= wlum;
+    if (lumFadeHi > lumFadeLo) gain = 1.0f + (gain - 1.0f) * smoothstep(lumFadeLo, lumFadeHi, maxc);
+    float3 u = img + PedestalTerm(img, s, bTrue, bEst, maxc, pedMode);   // GUI toggle: 0 white, 1 per-channel
+    float m = max(u.r, max(u.g, u.b));
+    float ge = gain;
+    if (gain > 1.0f && m > 1e-9f) {
+        float cap = white * max(bEst, 1e-9f);
+        float C = (FALD_KNEE_CAP_TRUST > 0.0f) ? min(white, cap / FALD_KNEE_CAP_TRUST) : white;
+        float a = m * gain;
+        float K = a;
+        if (a > FALD_KNEE_START * C) {
+            float t = (a / C - FALD_KNEE_START) / (1.0f - FALD_KNEE_START);
+            K = C * (FALD_KNEE_START + (1.0f - FALD_KNEE_START) * t / (1.0f + t));
+        }
+        ge = max(m, K) / m;
     }
-    float3 term = PedestalTerm(img, s, bTrue, bEst, maxc, pedMode);   // GUI toggle: 0 white, 1 per-channel
-    float3 req = max((img + term) * gain, 0.0f);
-    if (wfade < 1.0f) return req;                  // ceiling rule only where the model is trusted
-    float cap = white * max(bEst, 1e-9f);          // LCD cannot open past 100 %
-    float3 keep = max(img, cap);                   // saturated highlight: keep the original request
-    return float3(req.r > cap ? keep.r : req.r, req.g > cap ? keep.g : req.g, req.b > cap ? keep.b : req.b);
+    return max(u * ge, 0.0f);
 }
 )";
 

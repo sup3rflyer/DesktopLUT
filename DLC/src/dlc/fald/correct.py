@@ -13,11 +13,18 @@ pixel's level carries (``d_own`` = the drive curve at the pixel's own value). Th
 
     req = (img + ped_ref/w − ped/w) · B_est / B_true          (as-if-white nits, per channel)
 
-clamped to ``[0, white · B_est]`` (the LCD cannot open past 100 %). Where the request would clip we
-keep the ORIGINAL request (the pixel is a highlight the LCD saturates on anyway) so the dimming
-algorithm's input is not disturbed — this is what makes the fixed-point iteration converge in one
-step (review 2026-09-10: feeding the clipped value back dimmed the highlight's own cell drive and
-the iteration drifted for 8+ rounds).
+followed by ONE per-pixel ceiling rule (work guide C10 + C11, 2026-09-15; replaces the per-channel clamp):
+the request is ``u · g_eff`` with ``u = img + term`` and a single scalar ``g_eff`` for all three channels,
+so the correction can never rotate hue. Darkening (gain ≤ 1) applies the full gain. Brightening (gain > 1)
+goes through a soft knee on the brightest channel toward the LCD ceiling ``C = white · B_est`` (the LCD
+cannot open past 100 %): identity up to ``KNEE_START · C``, then a smooth roll-off that never ends below
+the pixel's original value and asymptotes to ``max(original, C)`` — so the layer never brightens INTO
+the ceiling (an isolated highlight keeps whatever gradient the panel leaves it) and a saturated highlight
+keeps its original request (the dimming algorithm's input is not disturbed; review 2026-09-10: feeding a
+clipped value back dimmed the highlight's own cell drive and the iteration drifted 8+ rounds).
+The old per-channel rule kept the brightest channel of an over-ceiling pixel undarkened while darkening
+the others: warm greys turned salmon along the left/top edges of bright content on black (owner photo,
+SDR, 2026-09-14).
 
 Everything here is in the model's reduced-resolution "as-if-white nits" image domain
 (see :meth:`FaldModel.render`); :func:`corrected_code` converts a corrected linear value back to
@@ -35,6 +42,28 @@ import numpy as np
 from dlc._pq import oetf_norm
 
 from .model import FaldModel, FaldParams
+
+
+# Soft-knee constants of the ceiling rule — compile-time in the shader too (FALD_KNEE_START / FALD_KNEE_CAP_TRUST in
+# src/fald_shader.h; tests/test_fald_transfer.py pins them equal). KNEE_CAP_TRUST scales how far the ceiling is
+# trusted (C = min(white, white·B_est / trust)); 0 = knee toward white only (not meter-gated: brightens isolated
+# highlights, pushing their LED drive).
+KNEE_START = 0.9
+KNEE_CAP_TRUST = 1.0
+
+
+def ceiling_gain(m: np.ndarray, gain: np.ndarray, b_est: np.ndarray, white: float,
+                 k: float = KNEE_START, trust: float = KNEE_CAP_TRUST) -> np.ndarray:
+    """The single scale a pixel gets: ``gain`` where it darkens (gain ≤ 1), else the soft knee of the brightest
+    channel ``m`` (as-if-white nits, > 0) toward the ceiling, never below 1. Continuous and monotone in m, gain and
+    B_est; always between 1 and gain."""
+    m = np.asarray(m, dtype=float); gain = np.asarray(gain, dtype=float)
+    cap = white * np.maximum(b_est, 1e-9)
+    C = np.minimum(white, cap / trust) if trust > 0 else np.full_like(cap, white)
+    a = m * gain
+    t = np.maximum(a / C - k, 0.0) / (1.0 - k)
+    knee = np.where(a <= k * C, a, C * (k + (1.0 - k) * t / (1.0 + t)))
+    return np.where(gain > 1.0, np.maximum(m, knee) / m, gain)
 
 
 def load_fitted_params(path: Path) -> FaldParams:
@@ -145,12 +174,13 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
             term = adj_w * wfade + (adj - adj_w) * p.ped_chroma_gain * wchroma[None]
         else:
             term = adj * wfade
-        req = (img + term) * gain[None]
-        floored = np.broadcast_to(floored_px[None], req.shape)
-        req = np.maximum(req, 0.0)
-        cap = p.white_nits * np.maximum(b_est, 1e-9)[None]     # T ≤ 1  ⇔  req ≤ white·B_est
-        clipped = (req > cap) & (wfade[None] >= 1.0)           # only where the model is trusted
-        req = np.where(clipped, np.maximum(img, cap), req)     # saturated highlight: keep the original
+        u = img + term
+        floored = np.broadcast_to(floored_px[None], u.shape)
+        mu = u.max(axis=0)
+        ok = mu > 1e-9
+        g_eff = np.where(ok, ceiling_gain(np.where(ok, mu, 1.0), gain, b_est, p.white_nits), gain)
+        req = np.maximum(u * g_eff[None], 0.0)                  # ONE scale per pixel: hue cannot rotate
+        clipped = np.broadcast_to((g_eff < gain - 1e-12)[None], req.shape)   # brightening limited by the knee
         cur = req
     return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored}
 
