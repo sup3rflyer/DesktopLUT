@@ -677,6 +677,9 @@ FADE_WORSE_TOL = 0.003          # a corrected ring counts as WORSE when |r| > |m
 INVENTED_MEAS_MAX = 0.005       # "invented": the panel shows < 0.5 pp …
 INVENTED_MODEL_MIN = 0.01       # … but the model predicts a ring > 1 pp there
 FADE_CANDIDATES = ((0.0, 0.0), (0.5, 1.2), (0.5, 2.0), (0.5, 5.0), (1.0, 3.0), (1.0, 5.0), (2.0, 5.0))
+FADE_R_APPROX_NOTE = ("panel_on_pp r = (1+m)(1+q)/(1+p) - 1 is an approximation (the model's correction ratio applied to the "
+                      "measured ring): 0.01-0.64 pp from a direct render where the model was 1-14 pp wrong (review "
+                      "2026-09-15) - rank fades and spot worse / invented rings with it, do not read it below ~0.5 pp")
 
 
 def field_nits(params: FaldParams, item: dict[str, Any]) -> Optional[float]:
@@ -746,6 +749,12 @@ def fade_report(params: FaldParams, items, fades: Sequence[Sequence[float]] = FA
     r = (1+m)(1+q)/(1+p) − 1 = the ring the panel is predicted to show with the layer on. Flags: worse = |r| > |m| +
     0.3 pp; harm = max(0, |r| − |m|); invented = |m| < 0.5 pp and |p| > 1 pp (the model sees a ring the panel does
     not have). Rows per (fitted | heldout, RENDERED field nits): raw mean |m|, and per fade mean |r|, n_worse, harm.
+
+    ``r`` is an APPROXIMATION: it transfers the model's own correction ratio onto the measured ring multiplicatively,
+    i.e. it assumes the panel responds to the corrected frame the way the model does up to the identity-ring error.
+    Rendering a model-corrected frame through a different "true" panel differed from r by 0.01–0.64 pp where the model
+    was 1–14 pp wrong (review 2026-09-15) — fine for ranking fades and spotting worse / invented rings, not a
+    sub-0.5-pp prediction. The report carries this as ``r_approx_note``.
 
     A fade whose ``hi`` is at or below every pixel of an item's image (field and window) weights the whole image 1 —
     exactly the no-fade correction — so that result is reused (the per-fade cost is the dim items only)."""
@@ -828,7 +837,7 @@ def fade_report(params: FaldParams, items, fades: Sequence[Sequence[float]] = FA
     totals = {split: summarise([r for r in rows if r["split"] == split]) for split in ("fitted", "heldout")
               if any(r["split"] == split for r in rows)}
     greys = [r["nits"] for r in rows if r["grey"]]
-    return {"fades": [list(f) for f in fades], "worse_tol_pp": 100 * FADE_WORSE_TOL,
+    return {"fades": [list(f) for f in fades], "worse_tol_pp": 100 * FADE_WORSE_TOL, "r_approx_note": FADE_R_APPROX_NOTE,
             "dimmest_grey_nits": min(greys) if greys else None, "levels": levels, "totals": totals, "items": rows,
             "elapsed_s": round(time.time() - t0, 1)}
 
@@ -1045,6 +1054,12 @@ STAGE_A_LO = {"core_mm": 1.5, "tail_mm": 8.0, "tail_frac": 0.02, "tmin": 5e-5, "
 STAGE_A_HI = {"core_mm": 25.0, "tail_mm": 90.0, "tail_frac": 0.9, "tmin": 1e-2, "aperture_px": 140.0, "kernel_pnorm": 2.5,
               "stat_area0_px2": 6000.0}
 STAGE_A_MIN_SPARE_ITEMS = 3        # fewer Stage-A items than n_params + 3: kernel_pnorm is frozen at its start
+# absolute reads with the meter on BLACK (the pedestal Lmax·B_true·tmin): without one above the floor tmin is set by the
+# drive curve alone (review 2026-09-15: a synthetic SDR panel with 4 peak reads refitted tmin 10x the truth, "converged")
+STAGE_A_DARK_GROUPS = ("leak0", "leak0@diag", "hole", "lda_lum", "lda_size", "sliver")
+TMIN_ROUND_MAX_DLOG = math.log(1.5)  # one consistency round moving tmin by more than a factor 1.5 either way: unstable
+TMIN_BOUND_MARGIN_DLOG = math.log(1.1)  # a tmin within 10 % of a Stage-A bound: unstable
+DRIVE_FLOOR_JUST_BELOW = 0.95      # a floor candidate "just below the data": 0.95 x the dimmest rendered field
 
 # Drive-curve consistency between the stages when the absolute drive sweep was unusable (SDR): Stage A starts on a
 # power law of DRIVE_K0 (never the FaldParams default HDR-nits curve), then only tmin — the one Stage-A parameter
@@ -1061,7 +1076,8 @@ SYNTH_SDR_DRIVE_K = 0.57           # the synthetic SDR panel's hidden power-law 
 # Stage-A-fixed augmented fit not kept)
 KNOTS_NEAR_MIN_GAIN_PP = 0.2       # 1. near-field total gain must exceed this …
 KNOTS_NEAR_MAX_WORSE_PP = 0.2      #    … with no near-field group worse by more than this
-KNOTS_UNFIT_FRAC = 0.5             # 2. exp error >= 0.5 x the group's measured ring: "unfit" (listed, cannot veto)
+KNOTS_UNFIT_FRAC = 0.5             # 2. exp error >= max(0.5 x the group's measured ring, 1.0 pp): "unfit" (listed,
+KNOTS_UNFIT_FLOOR_PP = 1.0         #    cannot veto) — the floor keeps a flat control group / a dim orange describable
 KNOTS_VETO_FLOOR_PP = 1.0          # 3. a describable group with n >= 3 worsening > max(1.0 pp, 0.5 x its exp error)
 KNOTS_VETO_REL = 0.5
 KNOTS_VETO_MIN_N = 3
@@ -1229,6 +1245,13 @@ def _mean_abs_map(report) -> dict[str, float]:
     return out
 
 
+def _finite(v) -> bool:
+    try:
+        return v is not None and math.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
 def knots_gate(exp_report, knots_report, ring_mag, n, *, near: Sequence[str] = NEAR_FIELD_GROUPS,
                held: Optional[Sequence[str]] = None) -> tuple[bool, dict[str, Any]]:
     """Whether the free-form knots estimate replaces the exponential. ``exp_report`` / ``knots_report``: group → mean
@@ -1236,37 +1259,61 @@ def knots_gate(exp_report, knots_report, ring_mag, n, *, near: Sequence[str] = N
     measured ring magnitude pp (:func:`ring_magnitudes`); ``n``: group → item count. Deterministic rules:
 
     1. the near-field groups (rings@fine + halo) gain > 0.2 pp in total and none is worse by > 0.2 pp;
-    2. a held-out group the exponential cannot describe (exp error >= 0.5 x its measured ring) is "unfit": listed, no veto;
+    2. a held-out group the exponential cannot describe (exp error >= max(0.5 x its measured ring, 1.0 pp)) is "unfit":
+       listed, no veto, not in the net;
     3. veto: a describable held-out group with n >= 3 worsening by > max(1.0 pp, 0.5 x its exp error);
     4. net: the n-weighted mean change over the describable held-out groups <= +0.1 pp.
-    Returns (keep, table)."""
+
+    Edge cases (listed in ``reasons``, never a silent verdict): a group with a non-finite exp / knots error or ring
+    magnitude is SKIPPED; a held-out group without an item count (float reports, no ``n``) has n unknown — it cannot
+    veto and is left out of the net. Returns (keep, table)."""
     held = HELD_GROUPS if held is None else held
     exp, kn = _mean_abs_map(exp_report), _mean_abs_map(knots_report)
-    counts = {g: int(v) for g, v in (n or {}).items()}
+    counts: dict[str, int] = {}
+    for g, v in (n or {}).items():
+        if _finite(v) and int(v) > 0:
+            counts[g] = int(v)
     for rep in (exp_report or {}, knots_report or {}):
         for g, v in rep.items():
-            if isinstance(v, dict) and v.get("n") is not None:
+            if isinstance(v, dict) and _finite(v.get("n")) and int(v["n"]) > 0:
                 counts.setdefault(g, int(v["n"]))
-    near_g = [g for g in near if g in exp and g in kn]
-    held_g = [g for g in held if g in exp and g in kn and g not in near_g]
+    reasons: list[str] = []
     groups: dict[str, dict[str, Any]] = {}
-    for g in near_g + held_g:
+    skipped: dict[str, str] = {}
+    present_near = [g for g in near if g in exp and g in kn]
+    present_held = [g for g in held if g in exp and g in kn and g not in present_near]
+    for g in present_near + present_held:
         mag = (ring_mag or {}).get(g)
-        groups[g] = {"role": "near" if g in near_g else "heldout", "n": counts.get(g, 0), "exp_pp": exp[g], "knots_pp": kn[g],
-                     "change_pp": kn[g] - exp[g], "ring_mag_pp": mag, "unfit": False, "veto": False}
+        bad = [lbl for lbl, v in (("exp", exp[g]), ("knots", kn[g])) if not _finite(v)]
+        if mag is not None and not _finite(mag):
+            bad.append("ring_mag")
+        role = "near" if g in present_near else "heldout"
+        if bad:
+            skipped[g] = f"non-finite {'/'.join(bad)}"
+            groups[g] = {"role": role, "n": counts.get(g), "exp_pp": exp[g], "knots_pp": kn[g], "ring_mag_pp": mag,
+                         "skipped": skipped[g], "unfit": False, "veto": False}
+            continue
+        groups[g] = {"role": role, "n": counts.get(g), "exp_pp": exp[g], "knots_pp": kn[g], "change_pp": kn[g] - exp[g],
+                     "ring_mag_pp": mag, "unfit": False, "veto": False}
+    near_g = [g for g in present_near if g not in skipped]
+    held_g = [g for g in present_held if g not in skipped]
+    if skipped:
+        reasons.append(f"skipped (non-finite values): {skipped}")
     gain = sum(exp[g] - kn[g] for g in near_g)
     near_worse = [g for g in near_g if kn[g] > exp[g] + KNOTS_NEAR_MAX_WORSE_PP]
-    unfit = [g for g in held_g if groups[g]["ring_mag_pp"] is not None and exp[g] >= KNOTS_UNFIT_FRAC * groups[g]["ring_mag_pp"]]
+    unfit = [g for g in held_g if groups[g]["ring_mag_pp"] is not None
+             and exp[g] >= max(KNOTS_UNFIT_FRAC * groups[g]["ring_mag_pp"], KNOTS_UNFIT_FLOOR_PP)]
     desc = [g for g in held_g if g not in unfit]
-    veto = [g for g in desc if groups[g]["n"] >= KNOTS_VETO_MIN_N
+    n_unknown = [g for g in desc if groups[g]["n"] is None]
+    counted = [g for g in desc if groups[g]["n"] is not None]
+    veto = [g for g in counted if groups[g]["n"] >= KNOTS_VETO_MIN_N
             and kn[g] - exp[g] > max(KNOTS_VETO_FLOOR_PP, KNOTS_VETO_REL * exp[g])]
     for g in unfit:
         groups[g]["unfit"] = True
     for g in veto:
         groups[g]["veto"] = True
-    ntot = sum(groups[g]["n"] for g in desc)
-    net = sum(groups[g]["n"] * (kn[g] - exp[g]) for g in desc) / ntot if ntot else 0.0
-    reasons = []
+    ntot = sum(groups[g]["n"] for g in counted)
+    net = sum(groups[g]["n"] * (kn[g] - exp[g]) for g in counted) / ntot if ntot else 0.0
     if not near_g:
         reasons.append("no near-field group (rings@fine / halo) to show a gain")
     elif gain <= KNOTS_NEAR_MIN_GAIN_PP:
@@ -1277,11 +1324,18 @@ def knots_gate(exp_report, knots_report, ring_mag, n, *, near: Sequence[str] = N
         reasons.append(f"veto: describable held-out group(s) degraded: {veto}")
     if net > KNOTS_NET_MAX_PP:
         reasons.append(f"net held-out change {net:+.2f} pp > +{KNOTS_NET_MAX_PP} pp")
+    if n_unknown:
+        worse = [g for g in n_unknown if kn[g] - exp[g] > max(KNOTS_VETO_FLOOR_PP, KNOTS_VETO_REL * exp[g])]
+        reasons.append(f"item count unknown for held-out group(s) {n_unknown}: they cannot veto and are not in the net"
+                       + (f" (would-be veto: {worse})" if worse else ""))
+    if held_g and not desc:
+        reasons.append(f"no describable held-out group (all unfit: {unfit}): the held-out data cannot check the knots")
     keep = bool(near_g) and gain > KNOTS_NEAR_MIN_GAIN_PP and not near_worse and not veto and net <= KNOTS_NET_MAX_PP
     table = {"keep": keep, "near_gain_pp": gain, "near_worse": near_worse, "unfit": unfit, "veto": veto, "net_pp": net,
-             "reasons": reasons, "groups": groups,
+             "skipped": sorted(skipped), "n_unknown": n_unknown, "reasons": reasons, "groups": groups,
              "rules": {"near_min_gain_pp": KNOTS_NEAR_MIN_GAIN_PP, "near_max_worse_pp": KNOTS_NEAR_MAX_WORSE_PP,
-                       "unfit_frac": KNOTS_UNFIT_FRAC, "veto_floor_pp": KNOTS_VETO_FLOOR_PP, "veto_rel": KNOTS_VETO_REL,
+                       "unfit_frac": KNOTS_UNFIT_FRAC, "unfit_floor_pp": KNOTS_UNFIT_FLOOR_PP,
+                       "veto_floor_pp": KNOTS_VETO_FLOOR_PP, "veto_rel": KNOTS_VETO_REL,
                        "veto_min_n": KNOTS_VETO_MIN_N, "net_max_pp": KNOTS_NET_MAX_PP}}
     return keep, table
 
@@ -1292,17 +1346,20 @@ def drive_floor_grid(ev: "Evaluator", dim_items, *, log=print) -> dict[str, Any]
     ratio explodes (SDR 2026-09-14: the 1.0-nit row, rms 3.0, over a 0.518-nit grey) — an artefact, not evidence.
     Among the candidates the HIGHEST within 1 % of the best rms is taken (never assume LEDs light below the data; HDR:
     LEDs off < 0.5 nit); ``identified`` is False when every candidate is within 1 % of the best (indistinguishable).
-    Sets the chosen floor on ``ev``."""
+    A candidate at 0.95 x the dimmest field makes "just below the data" expressible (PQ 10-bit renders the nominal
+    0.5-nit grey at 0.498, below the fixed 0.5 candidate). Sets the chosen floor on ``ev``."""
     dimmest = min(field_nits(ev.params, d) for d in dim_items)
     cands = [fl for fl in DRIVE_FLOOR_CANDIDATES if fl < dimmest]
+    if dimmest > 0.0:
+        cands = sorted(set(cands) | {DRIVE_FLOOR_JUST_BELOW * dimmest})
     table = []
     for fl in cands:
         ev.set(drive_floor_nits=fl)
         r = residuals(ev, dim_items)
         table.append({"floor_nits": fl, "rms": float(math.sqrt(np.mean(r * r)))})
         log(f"   floor {fl:g} nits: dim-item rms {table[-1]['rms']:.4f}")
-    rule = (f"candidates strictly below the dimmest rendered field ({dimmest:.4g} nits); the highest within "
-            f"{100 * DRIVE_FLOOR_IDENT_REL:g} % of the best rms")
+    rule = (f"candidates strictly below the dimmest rendered field ({dimmest:.4g} nits, incl. {DRIVE_FLOOR_JUST_BELOW:g} x it); "
+            f"the highest within {100 * DRIVE_FLOOR_IDENT_REL:g} % of the best rms")
     if table:
         rmin = min(t["rms"] for t in table)
         within = [t for t in table if t["rms"] <= rmin * (1.0 + DRIVE_FLOOR_IDENT_REL) + 1e-12]
@@ -1329,7 +1386,10 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
     from the start — Stage A never sees the FaldParams default HDR-nits curve — and after Stage B fits k, only Stage A's
     tmin is re-fitted under Stage B's k (with Stage A's OWN A0 swapped in for that call); Stage B re-runs warm only when
     tmin moved >= 5 %; at most MAX_ROUNDS. ``drive_k_consistency`` records the rounds (``converged`` False: the caller
-    raises an anomaly). With a usable drive curve (HDR) ``k0`` is ignored and the path is one Stage A + one Stage B."""
+    raises an anomaly; ``tmin_unstable``: a round moved tmin by more than a factor 1.5 or put it within 10 % of a bound).
+    The Stage-A rms / report are then recomputed at the FINAL k, tmin and estimate (the cold ones stay as ``*_at_k0``).
+    ``stage_a_checks`` flags an underdetermined Stage A (no dark absolute read, or fewer items than fitted params + 3).
+    With a usable drive curve (HDR) ``k0`` is ignored and the path is one Stage A + one Stage B."""
     t0 = time.time()
     if fit_drive_k:
         base = replace(base, drive_curve=power_drive_curve(base.white_nits, k0))
@@ -1339,9 +1399,11 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
     b_items = by(*STAGE_B_GROUPS)
     held = by(*HELD_GROUPS)
     out: dict[str, Any] = {"n_items": len(items), "groups": sorted({d["group"] for d in items})}
+    out["stage_a_checks"] = None
     if a_items:
         out["stage_a"] = fit_stage_a(ev, a_items, quick=quick, log=log)
         out["stage_a_report"] = group_report(ev, a_items)
+        out["stage_a_checks"] = stage_a_checks(out["stage_a"], a_items)
     else:
         out["stage_a"] = None
     # A0: Stage A owns it when the absolute sliver / size-ramp reads were above the meter floor (the HW-validated
@@ -1368,6 +1430,19 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
     if dim_items and b_items:
         out["drive_floor"] = drive_floor_grid(ev, dim_items, log=log)
         out["stage_b_report"] = group_report(ev, b_items)
+    if out["drive_k_consistency"] is not None and out["stage_a"]:
+        # the cold Stage-A rms / report were taken at k0 with the default estimate: recompute them at the final k, tmin,
+        # estimate and floor with Stage A's OWN A0 (the exported A0 is reported by abs_report_exported)
+        sa = out["stage_a"]
+        out["stage_a_report_at_k0"] = out["stage_a_report"]
+        a0_b = ev.params.stat_area0_px2
+        ev.set(stat_area0_px2=sa["stat_area0_px2"])
+        r = residuals(ev, a_items)
+        out["stage_a"] = {**sa, "rms_at_k0": sa["rms"], "rms": float(math.sqrt(np.mean(r * r)))}
+        out["stage_a_report"] = group_report(ev, a_items)
+        ev.set(stat_area0_px2=a0_b)
+    if out["stage_a_checks"] is not None:
+        out["stage_a_checks"]["tmin_bound"] = _tmin_bound_hit(out["stage_a"]["tmin"])
     exp_params = ev.params
     out["params_exp"] = params_dict(exp_params)
     out["params_knots"] = None
@@ -1403,19 +1478,52 @@ def run_fit(base: FaldParams, items: list[dict[str, Any]], *, quick: bool = Fals
     return out
 
 
+def _tmin_bound_hit(tmin: float) -> Optional[str]:
+    """A reason string when ``tmin`` lies within 10 % of a Stage-A bound (the fit ran into its box), else None."""
+    lo, hi = STAGE_A_LO["tmin"], STAGE_A_HI["tmin"]
+    if tmin <= 0 or math.log(tmin / lo) < TMIN_BOUND_MARGIN_DLOG:
+        return f"tmin {tmin:.3g} within 10 % of the lower bound {lo:g}"
+    if math.log(hi / tmin) < TMIN_BOUND_MARGIN_DLOG:
+        return f"tmin {tmin:.3g} within 10 % of the upper bound {hi:g}"
+    return None
+
+
+def stage_a_checks(sa: dict[str, Any], a_items) -> dict[str, Any]:
+    """Whether the absolute reads can pin Stage A: a dark read (meter on black: the pedestal ∝ tmin · drive) above the
+    floor, and at least fitted params + 3 items. ``underdetermined`` + reasons; the caller raises the anomaly."""
+    dark = [d["name"] for d in a_items if d["group"] in STAGE_A_DARK_GROUPS]
+    frozen = list(sa.get("frozen") or [])
+    n_active = len(STAGE_A_PARAMS) - len(frozen)
+    reasons = []
+    if not dark:
+        reasons.append("no dark absolute read (hole / leak / drive window on black) above the meter floor: tmin is set by "
+                       "the drive curve alone")
+    if len(a_items) < n_active + STAGE_A_MIN_SPARE_ITEMS:
+        reasons.append(f"{len(a_items)} Stage-A items < {n_active} fitted params + {STAGE_A_MIN_SPARE_ITEMS}"
+                       + (f" (frozen: {frozen})" if frozen else ""))
+    return {"n_items": len(a_items), "n_active": n_active, "frozen": frozen, "dark_reads": dark,
+            "underdetermined": bool(reasons), "reasons": reasons}
+
+
 def _drive_k_rounds(ev: "Evaluator", out: dict[str, Any], a_items, b_items, *, k0: float, has_area_abs: bool,
                     quick: bool, log) -> dict[str, Any]:
     """The Stage-A tmin <-> Stage-B k consistency loop of :func:`run_fit`. Updates ``out['stage_a']`` (tmin) and
-    ``out['stage_b']`` and leaves ``ev`` at Stage B's A0 and k."""
+    ``out['stage_b']`` and leaves ``ev`` at Stage B's A0 and k. ``converged`` says the stages agree on k — NOT that tmin
+    is identified: ``tmin_unstable`` (a round moved tmin by more than a factor 1.5, or a tmin within 10 % of a bound) and
+    ``last_tmin_move`` sit next to it."""
     white = ev.params.white_nits
     sa, sb = out["stage_a"], out["stage_b"]
     k_a = k0
     rounds: list[dict[str, Any]] = []
     tmins = [sa["tmin"]] if sa else []
+    unstable: list[str] = []
+    if sa and _tmin_bound_hit(sa["tmin"]):
+        unstable.append(f"cold Stage A: {_tmin_bound_hit(sa['tmin'])}")
     converged = abs(math.log(sb["drive_k"] / k_a)) < TOL_LOGK
     reason = "Stage B's k is within tolerance of the start" if converged else None
     if not converged and not a_items:
-        return {"rounds": 0, "converged": False, "k_start": k0, "k_final": sb["drive_k"], "k_stage_a": k_a,
+        return {"rounds": 0, "converged": False, "last_tmin_move": None, "last_dlog_tmin": None, "tmin_unstable": bool(unstable),
+                "tmin_unstable_reasons": unstable, "k_start": k0, "k_final": sb["drive_k"], "k_stage_a": k_a,
                 "tmin_rounds": tmins, "detail": [], "reason": "no Stage-A items to re-fit tmin under Stage B's k"}
     while not converged and len(rounds) < MAX_ROUNDS:
         k_a = sb["drive_k"]
@@ -1427,7 +1535,13 @@ def _drive_k_rounds(ev: "Evaluator", out: dict[str, Any], a_items, b_items, *, k
         ev.set(stat_area0_px2=a0_b)                                # Stage B's A0 back
         dlog = abs(math.log(t["tmin"] / sa["tmin"]))
         row: dict[str, Any] = {"round": len(rounds) + 1, "k_stage_a": k_a, "tmin": t["tmin"], "dlog_tmin": dlog,
-                               "stage_a_rms": t["rms"]}
+                               "tmin_move": t["tmin"] / sa["tmin"] - 1.0, "stage_a_rms": t["rms"]}
+        if dlog > TMIN_ROUND_MAX_DLOG:
+            unstable.append(f"round {row['round']}: tmin {sa['tmin']:.3g} -> {t['tmin']:.3g} under k={k_a:.3f} "
+                            f"(x{t['tmin'] / sa['tmin']:.2f})")
+        hit = _tmin_bound_hit(t["tmin"])
+        if hit:
+            unstable.append(f"round {row['round']}: {hit}")
         sa = {**sa, "tmin": t["tmin"]}
         tmins.append(t["tmin"])
         rounds.append(row)
@@ -1441,8 +1555,11 @@ def _drive_k_rounds(ev: "Evaluator", out: dict[str, Any], a_items, b_items, *, k
         if converged:
             reason = f"Stage B's k {sb['drive_k']:.3f} within {100 * TOL_LOGK:g} % of Stage A's {k_a:.3f}"
     out["stage_a"], out["stage_b"] = sa, sb
-    return {"rounds": len(rounds), "converged": converged, "k_start": k0, "k_final": sb["drive_k"], "k_stage_a": k_a,
-            "tmin_rounds": tmins, "detail": rounds,
+    last = rounds[-1] if rounds else None
+    return {"rounds": len(rounds), "converged": converged,
+            "last_tmin_move": last["tmin_move"] if last else None, "last_dlog_tmin": last["dlog_tmin"] if last else None,
+            "tmin_unstable": bool(unstable), "tmin_unstable_reasons": unstable,
+            "k_start": k0, "k_final": sb["drive_k"], "k_stage_a": k_a, "tmin_rounds": tmins, "detail": rounds,
             "reason": reason or f"not converged after {MAX_ROUNDS} rounds (Stage A k {k_a:.3f}, Stage B k {sb['drive_k']:.3f})"}
 
 

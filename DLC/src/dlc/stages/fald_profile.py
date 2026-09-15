@@ -609,8 +609,48 @@ def _collect_items(s: Session):
     return g, pats, reads, weight_items(items)
 
 
+def resolve_k0(k0_arg: Optional[float], *, drive_curve_usable: bool) -> tuple[float, Optional[str], Optional[str]]:
+    """(k0, block detail, note) for ``--k0``: with a usable measured drive curve no power law is fitted, so any --k0 is
+    ignored (a note, never a block); otherwise it must lie inside the drive exponent's fit bounds (0.2, 1.5)."""
+    from ..fald.profile import DRIVE_K0
+    if drive_curve_usable:
+        note = (f"--k0 {float(k0_arg):g} ignored: the absolute drive sweep gave a usable drive curve (no power-law fit)"
+                if k0_arg is not None else None)
+        return DRIVE_K0, None, note
+    k0 = DRIVE_K0 if k0_arg is None else float(k0_arg)
+    if not (0.2 < k0 < 1.5):
+        return k0, f"--k0 {k0:g} is outside the drive exponent's fit bounds (0.2, 1.5)", None
+    return k0, None, None
+
+
+def fit_anomalies(res: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """(code, detail, severity) the fit raises for the LLM from :func:`dlc.fald.profile.run_fit`'s output: the tmin <-> k
+    loop did not converge; Stage A underdetermined (no dark absolute read, or too few items for its fitted params); tmin
+    unstable (a round moved it by more than a factor 1.5, or it sits within 10 % of a bound)."""
+    out = []
+    cons = res.get("drive_k_consistency") or {}
+    if cons and not cons.get("converged"):
+        out.append(("drive_k_not_converged", f"Stage A's tmin and Stage B's drive exponent did not agree: {cons.get('reason')} "
+                    f"(k {cons.get('k_start')} -> {cons.get('k_final')}, tmin {cons.get('tmin_rounds')}) — refit with --k0 0.40 / "
+                    "0.70 (multi-start) and compare", "medium"))
+    checks = res.get("stage_a_checks") or {}
+    if checks.get("underdetermined"):
+        out.append(("stage_a_underdetermined", "Stage A cannot pin its parameters from these absolute reads: "
+                    + "; ".join(checks.get("reasons") or []) + f" — tmin {(res.get('stage_a') or {}).get('tmin')} is weakly "
+                    "constrained (compare --k0 multi-starts; the rings / held-out report is the evidence that matters)", "medium"))
+    unstable = list(cons.get("tmin_unstable_reasons") or [])
+    if checks.get("tmin_bound") and not any(checks["tmin_bound"] in u for u in unstable):
+        unstable.append(f"final: {checks['tmin_bound']}")
+    if unstable:
+        move = cons.get("last_tmin_move")
+        out.append(("tmin_unstable", "tmin is not stable across the drive-exponent rounds / sits at its bound: " + "; ".join(unstable)
+                    + f" (tmin rounds {cons.get('tmin_rounds')}" + (f", last round {100 * move:+.0f} %" if move is not None else "")
+                    + ")", "medium"))
+    return out
+
+
 def phase_fit(s: Session, result: StageResult) -> None:
-    from ..fald.profile import DRIVE_K0, fade_report, params_from_dict, run_fit
+    from ..fald.profile import fade_report, params_from_dict, run_fit
     g, pats, reads, items = _collect_items(s)
     if not any(i["group"] == "rings" for i in items):
         result.block("no_rings_data", "run the rings phase first")
@@ -622,32 +662,38 @@ def phase_fit(s: Session, result: StageResult) -> None:
                        "what is there; re-run that phase for a shippable fit", "medium")
     dc = s.st["fald"].get("drive_curve") or None
     cw = s.st["fald"].get("chan_weights")
-    k0_arg = getattr(s.args, "k0", None)
-    k0 = DRIVE_K0 if k0_arg is None else float(k0_arg)
-    if not (0.2 < k0 < 1.5):
-        result.block("k0_arg", f"--k0 {k0:g} is outside the drive exponent's fit bounds (0.2, 1.5)")
+    k0, k0_block, k0_note = resolve_k0(getattr(s.args, "k0", None), drive_curve_usable=bool(dc))
+    if k0_note:
+        result.note(k0_note)
+    if k0_block:
+        result.block("k0_arg", k0_block)
         return
-    if dc and k0_arg is not None:
-        result.note(f"--k0 {k0:g} ignored: the absolute drive sweep gave a usable drive curve (no power-law fit)")
     base = g.base_params(**({"drive_curve": [tuple(x) for x in dc]} if dc else {}), **({"chan_weights": tuple(cw)} if cw else {}))
     quick = bool(s.args.quick)
     log = (lambda *a: print(*a, file=sys.stderr, flush=True)) if s.args.verbose else (lambda *a: None)
     t0 = time.time()
     res = run_fit(base, items, quick=quick, knots=s.args.knots, fit_drive_k=not dc, k0=k0, log=log)
     # evidence for the export seam: what each candidate pixel-luminance fade does to the measured rings (~45 s per fade
-    # on ~100 items at 4K; dim items only — brighter items reuse the no-fade correction)
-    fr = None
+    # on ~100 items at 4K; dim items only — brighter items reuse the no-fade correction). With a knots estimate fitted,
+    # BOTH estimates get a report (export --estimate may override the gate); fade_report = the fit's own choice.
+    fr = fr_exp = fr_knots = None
     if getattr(s.args, "fade_report", True):
-        fr = fade_report(params_from_dict(res["params"]), items, log=log)
+        fr_exp = fade_report(params_from_dict(res["params_exp"]), items, log=log)
+        if res.get("params_knots"):
+            fr_knots = fade_report(params_from_dict(res["params_knots"]), items, log=log)
+        fr = fr_knots if res.get("estimate") == "knots" and fr_knots is not None else fr_exp
     strip = lambda rep: {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in (rep or {}).items()}
     fit_path = _out_dir(s.ctx) / "fald_fit_result.json"
     payload = {"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": res["knots"], "params": res["params"],
                "estimate": res.get("estimate"), "params_exp": res.get("params_exp"), "params_knots": res.get("params_knots"),
                "drive_curve_source": "measured" if dc else "power_law_fit", "k0": None if dc else k0,
-               "drive_k_consistency": res.get("drive_k_consistency"), "area0_source": res.get("area0_source"),
+               "drive_k_consistency": res.get("drive_k_consistency"), "stage_a_checks": res.get("stage_a_checks"),
+               "area0_source": res.get("area0_source"),
                "area0_stage_a": res.get("area0_stage_a"), "area0_stage_b": res.get("area0_stage_b"),
                "abs_report_exported": res.get("abs_report_exported"),
+               "stage_a_report": strip(res.get("stage_a_report")), "stage_a_report_at_k0": strip(res.get("stage_a_report_at_k0")),
                "drive_floor": res.get("drive_floor"), "by_level": res.get("by_level"), "fade_report": fr,
+               "fade_report_exp": fr_exp, "fade_report_knots": fr_knots,
                "augment_regime": getattr(s.args, "augment_regime", "off"),
                "heldout": strip(res["heldout"]),
                "geometry": s.st["fald"]["geometry"], "mode": s.st["fald"].get("mode"), "n_items": res["n_items"],
@@ -666,15 +712,14 @@ def phase_fit(s: Session, result: StageResult) -> None:
                            "n_items": res["n_items"], "area0_source": res.get("area0_source"),
                            "area0_stage_a": res.get("area0_stage_a"), "area0_stage_b": res.get("area0_stage_b"),
                            "abs_misses_exported": strip(res.get("abs_report_exported")),
-                           "drive_k_consistency": res.get("drive_k_consistency"), "drive_floor": res.get("drive_floor"),
-                           "by_level": res.get("by_level"),
+                           "drive_k_consistency": res.get("drive_k_consistency"), "stage_a_checks": res.get("stage_a_checks"),
+                           "drive_floor": res.get("drive_floor"), "by_level": res.get("by_level"),
                            "fade_report": {k: v for k, v in fr.items() if k != "items"} if fr else None,
+                           "fade_report_other": ({k: v for k, v in (fr_exp if fr is fr_knots else fr_knots).items() if k != "items"}
+                                                 if (fr is not None and fr_knots is not None) else None),
                            "elapsed_s": round(time.time() - t0, 1)})
-    cons = res.get("drive_k_consistency")
-    if cons and not cons.get("converged"):
-        result.anomaly("drive_k_not_converged", f"Stage A's tmin and Stage B's drive exponent did not agree: {cons.get('reason')} "
-                       f"(k rounds {cons.get('k_start')} -> {cons.get('k_final')}, tmin {cons.get('tmin_rounds')}) — refit with "
-                       "--k0 0.40 / 0.70 (multi-start) and compare", "medium")
+    for code, detail, severity in fit_anomalies(res):
+        result.anomaly(code, detail, severity)
     sa = res.get("stage_a") or {}
     if sa.get("frozen_reason"):
         result.note(f"Stage A: {sa['frozen_reason']}")
@@ -760,13 +805,62 @@ def export_estimate_params(fit: dict[str, Any], estimate: str) -> tuple[Optional
     return None, f"--estimate must be exp, knots or auto (got {estimate!r})"
 
 
-def export_dimmest_grey(fit: dict[str, Any]) -> Optional[float]:
-    """The dimmest measured grey field, in RENDERED nits, from the fit's fade_report (else its by_level rows)."""
-    fr = fit.get("fade_report") or {}
-    if fr.get("dimmest_grey_nits") is not None:
-        return float(fr["dimmest_grey_nits"])
-    lv = [r.get("rendered_nits") for r in (fit.get("by_level") or []) if r.get("rendered_nits") is not None]
-    return float(min(lv)) if lv else None
+def export_fade_report_key(fit: dict[str, Any], est_kind: Optional[str], fit_kind: Optional[str]) -> Optional[str]:
+    """The fit-JSON key of the fade report describing the estimate being exported (``est_kind``): ``fade_report_<kind>``
+    when the fit carries one, else ``fade_report`` when the fit's own estimate (``fit_kind``) is that estimate, else None
+    (the only report there describes the other estimate)."""
+    if est_kind and fit.get(f"fade_report_{est_kind}"):
+        return f"fade_report_{est_kind}"
+    if fit.get("fade_report") and (est_kind is None or fit_kind == est_kind):
+        return "fade_report"
+    return None
+
+
+def export_dimmest_grey(fit: dict[str, Any], *, est_kind: Optional[str] = None, fit_kind: Optional[str] = None,
+                        run_fald_dir: Optional[Path] = None) -> tuple[Optional[float], str]:
+    """(the dimmest measured grey field in RENDERED nits, where it came from). In order: the fade report of the exported
+    estimate; the by_level rows' rendered_nits; the by_level NOMINAL levels rendered through the fit's own transfer (fit
+    JSONs from before 2026-09-15 carry neither); the run's measured ratio patterns (their field codes). (None, "none")
+    when nothing is derivable."""
+    import numpy as np
+    from ..fald.profile import params_from_dict
+    key = export_fade_report_key(fit, est_kind, fit_kind)
+    fr = fit.get(key) if key else None
+    if fr and fr.get("dimmest_grey_nits") is not None:
+        return float(fr["dimmest_grey_nits"]), key
+    rows = fit.get("by_level") or []
+    lv = [r.get("rendered_nits") for r in rows if r.get("rendered_nits") is not None]
+    if lv:
+        return float(min(lv)), "by_level.rendered_nits"
+    prm = None
+    try:
+        prm = params_from_dict(fit["params"])
+    except Exception:  # noqa: BLE001 - an unreadable params block leaves only the phase files
+        prm = None
+    nominal = [float(r["nits"]) for r in rows if r.get("nits") is not None and float(r["nits"]) > 0]
+    if nominal and prm is not None:
+        rendered = [float(prm.code_to_nits(np.array([prm.nits_to_code(n)]))[0]) for n in nominal]
+        return float(min(rendered)), "by_level nominal levels rendered through the fit's transfer"
+    if run_fald_dir is not None and prm is not None:
+        found = []
+        for ph in ("rings", "augment", "augment_id", "heldout"):
+            f = Path(run_fald_dir) / f"{ph}.json"
+            if not f.exists():
+                continue
+            try:
+                pats, reads = _patterns_from_file(f), _reads_from_file(f)
+            except (OSError, ValueError, KeyError):
+                continue
+            for p in pats:
+                rd = reads.get(p.name)
+                if p.kind != "ratio" or rd is None or rd.y is None or p.meta.get("nits") is None:
+                    continue
+                code = (p.meta["base_code"],) * 3 if p.meta.get("base_code") is not None else tuple(p.shapes[0][0])
+                if code[0] == code[1] == code[2]:
+                    found.append(float(np.max(prm.code_to_nits(np.array(code, dtype=float)))))
+        if found:
+            return float(min(found)), "the run's measured ratio patterns"
+    return None, "none"
 
 
 def phase_export(s: Session, result: StageResult) -> None:
@@ -779,20 +873,36 @@ def phase_export(s: Session, result: StageResult) -> None:
         return
     fit = json.loads(Path(fit_path).read_text(encoding="utf-8"))
     estimate = str(getattr(s.args, "estimate", None) or "auto")
+    fit_kind = fit.get("estimate") or (fit.get("params") or {}).get("est_kind")      # the fit's own (gate) choice
     chosen, why = export_estimate_params(fit, estimate)
     if chosen is None:
         result.block("estimate_unavailable", why)
         return
+    est_kind = chosen.get("est_kind")
     fit["params"] = chosen
-    fit["estimate_chosen"] = {"requested": estimate, "est_kind": chosen.get("est_kind"),
+    fit["estimate_chosen"] = {"requested": estimate, "est_kind": est_kind,
                               "gate_keep": (fit.get("knots") or {}).get("gate_keep"), "by": why}
-    result.action(f"estimate: {chosen.get('est_kind')} ({why})")
+    report_key = export_fade_report_key(fit, est_kind, fit_kind)
     params = params_from_dict(fit["params"])
-    lum = getattr(s.args, "lum_fade", None)
     gamma = params.transfer == "gamma"
+    dim, dim_src = (export_dimmest_grey(fit, est_kind=est_kind, fit_kind=fit_kind, run_fald_dir=_out_dir(s.ctx))
+                    if gamma else (None, "none"))
+    fit["estimate_override"] = None
+    if estimate != "auto" and est_kind != fit_kind:
+        fit["estimate_override"] = {"requested": estimate, "exported": est_kind, "fit_choice": fit_kind,
+                                    "gate_keep": (fit.get("knots") or {}).get("gate_keep"), "fade_report_used": report_key}
+        result.note(f"--estimate {estimate} overrides the fit's choice ({fit_kind}); fade evidence: {report_key or 'none for this estimate'}")
+    if report_key and report_key != "fade_report":
+        fit["fade_report"] = fit[report_key]                 # the exported JSON's fade evidence describes what it exports
+    elif report_key is None and fit.get("fade_report"):
+        fit["fade_report_mismatched"] = fit.pop("fade_report")
+    result.action(f"estimate: {est_kind} ({why})")
+    lum = getattr(s.args, "lum_fade", None)
+    if gamma:
+        result.metrics["dimmest_grey_nits"] = dim
+        result.metrics["dimmest_grey_source"] = dim_src
     if lum is None or not str(lum).strip():
         if gamma:
-            dim = export_dimmest_grey(fit)
             result.block("lum_fade_required", "SDR (gamma) panel file: choose the pixel-luminance fade from the fit's fade_report "
                          "(per rendered grey level: mean |ring| with the layer on, n_worse, harm, invented per candidate fade) — "
                          "--lum-fade LO,HI" + (f" with LO >= the dimmest measured grey ({dim:.3g} nits)" if dim else "")
@@ -801,8 +911,9 @@ def phase_export(s: Session, result: StageResult) -> None:
     elif str(lum).strip().lower() == "keep":
         fit["lum_fade_chosen"] = {"lo": params.lum_fade_lo, "hi": params.lum_fade_hi, "by": "--lum-fade keep (LLM seam)"}
         result.action(f"pixel-luminance fade kept at {params.lum_fade_lo:g}..{params.lum_fade_hi:g} nits (--lum-fade keep)")
-        dim = export_dimmest_grey(fit) if gamma else None
-        if dim is not None and params.lum_fade_lo < dim * (1.0 - LUM_FADE_LO_TOL):
+        if gamma and dim is None:
+            result.note("the dimmest measured grey is not derivable from the fit / run: the kept fade's LO is unchecked")
+        elif dim is not None and params.lum_fade_lo < dim * (1.0 - LUM_FADE_LO_TOL):
             result.note(f"kept fade LO {params.lum_fade_lo:g} nits is below the dimmest measured grey ({dim:.3g} nits): the "
                         "correction runs (weakly) on levels no read constrained")
     else:
@@ -816,13 +927,14 @@ def phase_export(s: Session, result: StageResult) -> None:
             result.block("lum_fade_arg", "--lum-fade LO,HI needs 0 <= LO < HI (as-if-white nits of the pixel's own level)")
             return
         if gamma:
-            dim = export_dimmest_grey(fit)
             if dim is None:
-                result.anomaly("lum_fade_unchecked", "the fit JSON carries no fade_report / by_level rendered levels: LO could not "
-                               "be checked against the dimmest measured grey", "medium")
-            elif lo < dim * (1.0 - LUM_FADE_LO_TOL):
+                result.block("lum_fade_unverifiable", "the dimmest measured grey is not derivable (no fade_report, no by_level "
+                             "levels, no measured ratio patterns in the run): LO cannot be checked against the data — refit "
+                             "(the fit writes the fade_report) or pass --lum-fade keep")
+                return
+            if lo < dim * (1.0 - LUM_FADE_LO_TOL):
                 result.block("lum_fade_below_data", f"--lum-fade LO {lo:g} nits is below the dimmest measured grey ({dim:.3g} nits "
-                             "rendered): the correction would run on levels no read constrained — LO >= that grey")
+                             f"rendered, from {dim_src}): the correction would run on levels no read constrained — LO >= that grey")
                 return
         params = _replace(params, lum_fade_lo=lo, lum_fade_hi=hi)
         fit["params"]["lum_fade_lo"], fit["params"]["lum_fade_hi"] = lo, hi
