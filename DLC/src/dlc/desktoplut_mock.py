@@ -80,7 +80,34 @@ class MockDesktopLutState:
     hook_confirmed: bool = False
     hook_routing_present: bool = True
     hook_session: str = "4242-133700000000000000"
+    # FP16 overlay auto-sleep (C++ render.cpp RenderAll: the overlay hides when no monitor needs processing and
+    # state.get reports overlay.awake). Awake while any shader layer (tonemap / fald) is on for any monitor:mode or a
+    # runtime cube is loaded. Test knobs: ``overlay_keep_awake`` = something else needs the overlay (another
+    # monitor's cube, analysis, an open editor) so it never sleeps; ``overlay_sleep_lag_polls`` = after its last user
+    # went away the overlay still reports awake for this many state.get polls (the render thread's next pass).
+    overlay_keep_awake: bool = False
+    overlay_sleep_lag_polls: int = 0
+    overlay_awake: bool = False
+    overlay_lag_left: int = 0
     command_count: int = 0
+
+    def overlay_needed(self) -> bool:
+        return bool(self.overlay_keep_awake
+                    or any(d.get("tonemap") or d.get("fald") for d in self.layers.values())
+                    or any((r or {}).get("cube_path") for r in self.runtime.values()))
+
+    def overlay_tick(self, poll: bool) -> bool:
+        """Advance the auto-sleep model: a needed overlay is awake now (and re-arms the lag); an unneeded one sleeps
+        after ``overlay_sleep_lag_polls`` more polls. ``poll`` = a state.get observation (counts down the lag)."""
+        if self.overlay_needed():
+            self.overlay_awake = True
+            self.overlay_lag_left = int(self.overlay_sleep_lag_polls)
+        elif self.overlay_awake and poll:
+            if self.overlay_lag_left > 0:
+                self.overlay_lag_left -= 1
+            else:
+                self.overlay_awake = False
+        return self.overlay_awake
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +123,8 @@ class MockDesktopLutState:
                            "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "fald": deepcopy(self.fald),
+            "overlay_model": {"keep_awake": self.overlay_keep_awake, "sleep_lag_polls": self.overlay_sleep_lag_polls,
+                              "awake": self.overlay_awake, "lag_left": self.overlay_lag_left},
             "command_count": self.command_count,
         }
 
@@ -122,8 +151,9 @@ class MockDesktopLutServer:
                 out["contract_version"] = CONTRACT_VERSION
                 out["hook"] = self.hook_view()
                 # C++ 2026-09-13: which path renders the frame (overlay awake unless nothing needs
-                # it; the sim is never in DWM-hook mode)
-                out["overlay"] = {"awake": bool(self.state.corrections_enabled), "dwm_hook_mode": False}
+                # it — MockDesktopLutState.overlay_tick; the sim is never in DWM-hook mode)
+                out["overlay"] = {"awake": self.state.overlay_tick(poll=True), "dwm_hook_mode": False}
+                out.pop("overlay_model", None)
                 return self.ok(out)
             if method == "hook.set_routing":
                 return self.handle_hook_set_routing(params)

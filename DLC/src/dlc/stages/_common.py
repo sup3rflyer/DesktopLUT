@@ -214,6 +214,17 @@ class FileBackedMockTransport:
             hdr={int(k): bool(v) for k, v in (raw.get("hdr", {}) or {}).items()},
             command_count=int(raw.get("command_count", 0)),
         )
+        # viewing-layer flags + FALD settings + the overlay auto-sleep model survive between calls too (a phase that
+        # switches the FALD layer and then polls state.get must see its own toggle)
+        names = MockDesktopLutServer.LAYER_NAMES
+        st.layers = {k: {n: bool(v) for n, v in (d or {}).items() if n in names}
+                     for k, d in (raw.get("layers", {}) or {}).items() if any((d or {}).get(n) for n in names)}
+        st.fald = dict(raw.get("fald", {}) or {})
+        om = raw.get("overlay_model") or {}
+        st.overlay_keep_awake = bool(om.get("keep_awake", False))
+        st.overlay_sleep_lag_polls = int(om.get("sleep_lag_polls", 0))
+        st.overlay_awake = bool(om.get("awake", False))
+        st.overlay_lag_left = int(om.get("lag_left", 0))
         self.server.state = st
 
     def _save(self) -> None:
