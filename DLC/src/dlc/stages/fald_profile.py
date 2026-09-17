@@ -238,6 +238,42 @@ class OverlayTracker:
         self.current: Optional[str] = None
         self.waits: dict[str, dict[str, Any]] = {}
         self.reasons: list[str] = []
+        # the temporal drive state (runtime.fald_temporal, 2026-09-17) is a persisted setting the owner may leave on
+        # after an A/B: identity / ON reads must see the HW-validated STATELESS layer (a filter crossfades every
+        # pattern change for 5 tau, and the fit would characterise the filter). Forced off here, restored by `restore()`.
+        self.temporal_saved: Optional[dict[str, Any]] = None
+        self.temporal_note: Optional[str] = None
+        self._force_temporal_off()
+
+    def _force_temporal_off(self) -> None:
+        ctl = self.s.controller
+        try:
+            layers = (ctl.call("state.get", {}).get("layers") or {}).get(f"{self.monitor}:{self.mode}") or {}
+        except Exception as exc:  # noqa: BLE001
+            self.temporal_note = f"state.get failed ({exc}): temporal drive state unknown"
+            return
+        if "fald_temporal_mode" not in layers:
+            self.temporal_note = "build without runtime.fald_temporal (pre-2026-09-17): no temporal drive state"
+            return
+        saved = {"temporal_mode": int(layers.get("fald_temporal_mode", 0)), "tau_rise_ms": float(layers.get("fald_tau_rise_ms", 0.0)),
+                 "tau_fall_ms": float(layers.get("fald_tau_fall_ms", 0.0)), "delay_frames": int(layers.get("fald_delay_frames", 0))}
+        self.temporal_saved = saved
+        if saved["temporal_mode"] != 0:
+            try:
+                ctl.call("runtime.fald_temporal", {"monitor": self.monitor, "mode": self.mode, "temporal_mode": 0})
+                self.temporal_note = f"temporal drive state was ON ({saved}) — forced OFF for the reads, restored after"
+            except Exception as exc:  # noqa: BLE001
+                self.temporal_note = f"temporal drive state is ON ({saved}) and runtime.fald_temporal refused ({exc}): reads go through the filter"
+                self.temporal_saved = None
+
+    def restore(self) -> None:
+        """Put the owner's temporal drive state back (no-op when it was off or unknown)."""
+        if self.temporal_saved and self.temporal_saved.get("temporal_mode", 0) != 0:
+            try:
+                self.s.controller.call("runtime.fald_temporal", {"monitor": self.monitor, "mode": self.mode,
+                                                                  "temporal_mode": self.temporal_saved["temporal_mode"]})
+            except Exception as exc:  # noqa: BLE001
+                self.reasons.append(f"temporal drive state NOT restored ({exc}): re-enable it by hand")
 
     def set(self, state: str) -> dict[str, Any]:
         ctl = self.s.controller
@@ -277,7 +313,9 @@ class OverlayTracker:
         return {st: {k: v for k, v in rec.items() if not k.startswith("_")} for st, rec in self.waits.items()}
 
     def file_meta(self) -> dict[str, Any]:
-        return {"off_overlay": self.off_overlay(), "overlay_wait": self.summary()}
+        return {"off_overlay": self.off_overlay(), "overlay_wait": self.summary(),
+                "temporal_forced_off": bool(self.temporal_saved and self.temporal_saved.get("temporal_mode", 0) != 0),
+                "temporal_saved": self.temporal_saved, "temporal_note": self.temporal_note}
 
     def report(self, result: StageResult, phase: str) -> None:
         off = self.waits.get("off") or {}
@@ -293,6 +331,11 @@ class OverlayTracker:
                            "are NOT identity / ON reads", "high")
         if any((w or {}).get("unknown") for w in self.waits.values()):
             result.note(f"{phase}: overlay state unverifiable — {'; '.join(self.reasons)}")
+        if self.temporal_note:
+            if "refused" in self.temporal_note or "NOT restored" in " ".join(self.reasons):
+                result.anomaly("temporal_state", f"{phase}: {self.temporal_note}; {'; '.join(r for r in self.reasons if 'temporal' in r)}", "high")
+            else:
+                result.note(f"{phase}: {self.temporal_note}")
         result.metrics["overlay_wait"] = self.summary()
         result.metrics["off_overlay"] = self.off_overlay()
 
@@ -1409,6 +1452,7 @@ def phase_augment(s: Session, result: StageResult) -> None:
                 ctl.call("runtime.fald_debug", {"monitor": mon, "mode": mode, "debug_mode": 0})
             except Exception:  # noqa: BLE001
                 pass
+        overlay.restore()
     overlay.report(result, "augment")
     if result.status != "ran":
         return
@@ -1536,6 +1580,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
             ctl.call("runtime.fald_debug", {"monitor": s.args.monitor, "mode": mode, "debug_mode": 0})
         except Exception:  # noqa: BLE001
             pass
+        overlay.restore()
     overlay.report(result, "verify")
     # scorecard: ring ratios ON/flat vs ID/flat (the layer's job is ON/flat → 1)
     flats = {r["name"]: r for r in rows if r["kind"] == "aux"}

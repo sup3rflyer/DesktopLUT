@@ -679,6 +679,10 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_params_path", JStr(WideToUtf8(fs.paramsPath)));
                 l.set("fald_debug_mode", JNum((double)fs.debugMode));
                 l.set("fald_ped_mode", JNum((double)fs.pedMode));
+                l.set("fald_temporal_mode", JNum((double)fs.temporalMode));   // temporal drive state (runtime.fald_temporal)
+                l.set("fald_tau_rise_ms", JNum((double)fs.tauRiseMs));
+                l.set("fald_tau_fall_ms", JNum((double)fs.tauFallMs));
+                l.set("fald_delay_frames", JNum((double)fs.delayFrames));
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 uint32_t transfer = 0;
                 if (FaldPanelFileTransfer(fs.paramsPath, transfer))
@@ -1388,12 +1392,12 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* v = p.find("debug_mode");
     const JsonValue* pm = p.find("ped_mode");
-    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..6) or ped_mode (0|1)"; return; }
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..7) or ped_mode (0|1)"; return; }
     unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 6 ? 6 : v->num));
+        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 7 ? 7 : v->num));
         if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
         mode = fs.debugMode; ped = fs.pedMode;
     }
@@ -1408,6 +1412,42 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
         pathNow = (isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald).paramsPath;
     }
     result.set("ped_colour_in_file", JBool(FaldPanelFileHasPedColour(pathNow)));   // false = an FLD1 file: ped_mode 1 is a no-op
+}
+
+// runtime.fald_temporal {monitor, mode, temporal_mode?, tau_rise_ms?, tau_fall_ms?}: the shader's per-cell drive state
+// (LED-lag filter; fald.h FALD_TEMPORAL_*, DLC dlc/fald/temporal.py). Persisted per mode like ped_mode (the GUI row sets
+// both modes). Error texts are mirrored by the DLC mock word for word.
+void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    const JsonValue* tm = p.find("temporal_mode");
+    const JsonValue* tr = p.find("tau_rise_ms");
+    const JsonValue* tf = p.find("tau_fall_ms");
+    const JsonValue* df = p.find("delay_frames");
+    auto isNum = [](const JsonValue* v) { return v && v->type == JsonValue::Num; };
+    if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df)) { error = "missing parameter: temporal_mode (0|1|2), tau_rise_ms, tau_fall_ms (0..5000) or delay_frames (0..3)"; return; }
+    if (isNum(tm) && !(tm->num == 0 || tm->num == 1 || tm->num == 2)) { error = "temporal_mode must be 0 (off), 1 (both fields) or 2 (B_true only)"; return; }
+    if (isNum(tr) && !(tr->num >= 0 && tr->num <= FALD_TAU_MAX_MS)) { error = "tau_rise_ms must be 0..5000 ms"; return; }
+    if (isNum(tf) && !(tf->num >= 0 && tf->num <= FALD_TAU_MAX_MS)) { error = "tau_fall_ms must be 0..5000 ms"; return; }
+    if (isNum(df) && !(df->num == 0 || df->num == 1 || df->num == 2 || df->num == 3)) { error = "delay_frames must be 0..3"; return; }
+    unsigned int mode = 0, delay = 0; float rise = 0.0f, fall = 0.0f;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        if (isNum(tm)) fs.temporalMode = (unsigned int)tm->num;
+        if (isNum(tr)) fs.tauRiseMs = (float)tr->num;
+        if (isNum(tf)) fs.tauFallMs = (float)tf->num;
+        if (isNum(df)) fs.delayFrames = (unsigned int)df->num;
+        mode = fs.temporalMode; rise = fs.tauRiseMs; fall = fs.tauFallMs; delay = fs.delayFrames;
+    }
+    SaveSettings();
+    FaldPropagate(mon, isHDR);
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("temporal_mode", JNum((double)mode));
+    result.set("tau_rise_ms", JNum((double)rise));
+    result.set("tau_fall_ms", JNum((double)fall));
+    result.set("delay_frames", JNum((double)delay));
+    result.set("settle_frames_60hz", JNum((double)FaldSettleFrames(rise, fall, 1000.0f / 60.0f, delay)));
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -2005,6 +2045,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.set_fald_params") DoSetFaldParams(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_debug") DoFaldDebug(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_dump") DoFaldDump(*r->params, *r->result, *r->error);
+        else if (m == "runtime.fald_temporal") DoFaldTemporal(*r->params, *r->result, *r->error);
         else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);

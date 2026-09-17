@@ -366,13 +366,29 @@ void UpdateColorCorrectionControls() {
         sdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldSdrPath, sdrCC.fald.paramsPath.c_str());
     const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 6 ? shown.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 7 ? shown.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= 2 ? shown.temporalMode : 0), 0);
+    wchar_t tauBuf[32];
+    if (GetFocus() != g_gui.hwndFaldTauRise) {  // don't fight a value being typed
+        _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauRiseMs);
+        SetWindowText(g_gui.hwndFaldTauRise, tauBuf);
+    }
+    if (GetFocus() != g_gui.hwndFaldTauFall) {
+        _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauFallMs);
+        SetWindowText(g_gui.hwndFaldTauFall, tauBuf);
+    }
+    if (GetFocus() != g_gui.hwndFaldDelay)
+        SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(shown.delayFrames).c_str());
     // The layer runs in the overlay path only: in DWM hook mode the checkboxes are inert, so grey them out.
     EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldSdrEnable, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldDebug, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldPedMode, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldTemporal, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldTauRise, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldTauFall, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldDelay, !g_dwmHookMode.load());
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1313,6 +1329,69 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        // Temporal drive state ("LED lag" row): mode combo + rise/fall ms, both modes at once like View. Persisted.
+        case ID_CORR_FALD_TEMPORAL:
+            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    int sel = (int)SendMessage(g_gui.hwndFaldTemporal, CB_GETCURSEL, 0, 0);
+                    unsigned int mode = (sel >= 0 && sel <= 2) ? (unsigned int)sel : 0u;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        FaldSlot(true).temporalMode = mode;
+                        FaldSlot(false).temporalMode = mode;
+                    }
+                    ApplyFaldSharedSettingChange();
+                    if (mode != 0)
+                        SetStatus(L"FALD LED-lag filter on: the panel's LED law is unmeasured - judge slow pans by eye, off if worse");
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_TAU_RISE:
+        case ID_CORR_FALD_TAU_FALL:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    const bool rise = (LOWORD(wParam) == ID_CORR_FALD_TAU_RISE);
+                    HWND edit = rise ? g_gui.hwndFaldTauRise : g_gui.hwndFaldTauFall;
+                    wchar_t buf[32];
+                    GetWindowText(edit, buf, 32);
+                    float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                    if (!(v >= 0.0f)) v = 0.0f;
+                    if (v > FALD_TAU_MAX_MS) v = FALD_TAU_MAX_MS;
+                    bool changed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        for (bool isHDR : { true, false }) {
+                            float& t = rise ? FaldSlot(isHDR).tauRiseMs : FaldSlot(isHDR).tauFallMs;
+                            if (t != v) { t = v; changed = true; }
+                        }
+                    }
+                    wchar_t shown[32];
+                    _swprintf_s_l(shown, 32, L"%.1f", GetCLocale(), v);
+                    SetWindowText(edit, shown);
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_DELAY:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    wchar_t buf[32];
+                    GetWindowText(g_gui.hwndFaldDelay, buf, 32);
+                    int n = _wtoi(buf);
+                    unsigned int v = n < 0 ? 0u : (n > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)n);
+                    bool changed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        for (bool isHDR : { true, false }) {
+                            unsigned int& d = FaldSlot(isHDR).delayFrames;
+                            if (d != v) { d = v; changed = true; }
+                        }
+                    }
+                    SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(v).c_str());
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
         case ID_CORR_FALD_BROWSE:
         case ID_CORR_FALD_SDR_BROWSE:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {

@@ -37,7 +37,12 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     entry = entry or {}
     path = str(entry.get("params_path") or "")
     out: dict[str, Any] = {"fald_params_path": path, "fald_debug_mode": int(entry.get("debug_mode", 0)),
-                           "fald_ped_mode": int(entry.get("ped_mode", 0)), "fald_ped_colour_in_file": False}
+                           "fald_ped_mode": int(entry.get("ped_mode", 0)), "fald_ped_colour_in_file": False,
+                           # temporal drive state (2026-09-17, work guide H5 / item 4a): persisted like ped_mode
+                           "fald_temporal_mode": int(entry.get("temporal_mode", 0)),
+                           "fald_tau_rise_ms": float(entry.get("tau_rise_ms", 0.0)),
+                           "fald_tau_fall_ms": float(entry.get("tau_fall_ms", 0.0)),
+                           "fald_delay_frames": int(entry.get("delay_frames", 0))}
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -651,13 +656,39 @@ class MockDesktopLutServer:
         if method == "runtime.fald_debug":
             mode = params.get("debug_mode"); ped = params.get("ped_mode")
             if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
-                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..6) or ped_mode (0|1)")
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..7) or ped_mode (0|1)")
             if isinstance(mode, (int, float)):
-                fs["debug_mode"] = int(min(6, max(0, mode)))
+                fs["debug_mode"] = int(min(7, max(0, mode)))
             if isinstance(ped, (int, float)):
                 fs["ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
             return self.ok({"monitor_mode": key, "debug_mode": fs.get("debug_mode", 0), "ped_mode": fs.get("ped_mode", 0),
                             "ped_colour_in_file": False})      # mock: no panel file is ever parsed
+        if method == "runtime.fald_temporal":
+            # C++ DoFaldTemporal (2026-09-17): the shader's per-cell drive state (LED-lag filter), persisted per mode
+            tm = params.get("temporal_mode"); tr = params.get("tau_rise_ms"); tf = params.get("tau_fall_ms")
+            df = params.get("delay_frames")
+            num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+            if not (num(tm) or num(tr) or num(tf) or num(df)):
+                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2), tau_rise_ms, tau_fall_ms (0..5000) or delay_frames (0..3)")
+            if num(tm) and tm not in (0, 1, 2):
+                return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields) or 2 (B_true only)")
+            for name, v in (("tau_rise_ms", tr), ("tau_fall_ms", tf)):
+                if num(v) and not (0.0 <= v <= 5000.0):
+                    return DesktopLutResponse(ok=False, error=f"{name} must be 0..5000 ms")
+            if num(df) and df not in (0, 1, 2, 3):
+                return DesktopLutResponse(ok=False, error="delay_frames must be 0..3")
+            if num(tm):
+                fs["temporal_mode"] = int(tm)
+            if num(tr):
+                fs["tau_rise_ms"] = float(tr)
+            if num(tf):
+                fs["tau_fall_ms"] = float(tf)
+            if num(df):
+                fs["delay_frames"] = int(df)
+            from dlc.fald.temporal import settle_frames
+            rise = float(fs.get("tau_rise_ms", 0.0)); fall = float(fs.get("tau_fall_ms", 0.0)); delay = int(fs.get("delay_frames", 0))
+            return self.ok({"monitor_mode": key, "temporal_mode": int(fs.get("temporal_mode", 0)), "tau_rise_ms": rise,
+                            "tau_fall_ms": fall, "delay_frames": delay, "settle_frames_60hz": settle_frames(rise, fall, 1000.0 / 60.0, delay)})
         if method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

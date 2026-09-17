@@ -81,10 +81,11 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert np.array_equal(matrix("BT2020_TO_BT709"), M.BT2020_TO_BT709)
     panel = re.search(r"float3 PanelNits\(float3 scrgb\) \{(.*?)\n\}", src, re.S).group(1)
     assert "transfer == 1u" in panel and "pow(" in panel and "sdrGamma" in panel and "80.0f" in panel
-    # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43)
+    # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43); the temporal drive state fills 44-47
     cb = re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", src, re.S).group(1)
     fields = re.findall(r"(?:uint|float) (\w+);", cb)
-    assert len(fields) == 44 and fields[31] == "transfer" and fields[43] == "sdrGamma"
+    assert len(fields) == 48 and fields[31] == "transfer" and fields[43] == "sdrGamma"
+    assert fields[44:48] == ["tempAlphaRise", "tempAlphaFall", "tempMode", "tempInit"]
 
 
 def test_scrgb_to_nits_gamma_equals_code_to_nits_of_the_composed_code():

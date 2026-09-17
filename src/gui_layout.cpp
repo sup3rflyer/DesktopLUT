@@ -693,7 +693,7 @@ void CreateGUILayout(HWND hwnd) {
     // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
     ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental, overlay only)", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 99, panel2, nullptr, nullptr, nullptr);
+        innerX, innerY, groupW, 126, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
     // Row 1: HDR
@@ -740,6 +740,7 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Passthrough (identity)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Pedestal term (x100)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Per-channel vs white (x100)");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Temporal settling (red rising)");
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
 
     // Per-channel pedestal (2026-09-13, DLC work guide H2): the panel file (FLD2) carries the measured colour of the
@@ -751,12 +752,47 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 205, faldY, 140, h, panel2, (HMENU)ID_CORR_FALD_PEDMODE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldPedMode);
 
-    g_gui.contentHeight[2] = innerY + 99 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM rows)
+    // Row 4: temporal drive state ("LED lag", 2026-09-17, DLC work guide H5 / item 4a): the shader's per-cell first-order
+    // filter with rise/fall time constants, so a cell handoff during a pan crossfades instead of snapping. Off = the
+    // stateless layer. The panel's LED law is unmeasured — this row is the owner's live A/B control; a filter on an
+    // instant panel makes pans worse. Applies to both modes like View (fald.h FALD_TEMPORAL_*, dlc/fald/temporal.py).
+    int faldTY = innerY + 99;
+    ctrl = CreateWindow(L"STATIC", L"LED lag:", WS_CHILD, innerX + 10, faldTY + 2, 46, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldTemporal = CreateWindow(L"COMBOBOX", nullptr,
+        WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        innerX + 58, faldTY, 118, 100, panel2, (HMENU)ID_CORR_FALD_TEMPORAL, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldTemporal);
+    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Off (stateless)");
+    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"LEDs + estimate lag");
+    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"LEDs lag only");
+    SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, 0, 0);
+    ctrl = CreateWindow(L"STATIC", L"rise ms", WS_CHILD, innerX + 182, faldTY + 2, 44, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldTauRise = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 228, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_TAU_RISE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldTauRise);
+    ctrl = CreateWindow(L"STATIC", L"fall ms", WS_CHILD, innerX + 272, faldTY + 2, 42, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldTauFall = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 316, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_TAU_FALL, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldTauFall);
+    // pipeline delay in frames (0..3): the law a first-order filter cannot represent (design review 2026-09-17)
+    ctrl = CreateWindow(L"STATIC", L"delay", WS_CHILD, innerX + 360, faldTY + 2, 34, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldDelay = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 396, faldTY, 30, h, panel2, (HMENU)ID_CORR_FALD_DELAY, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldDelay);
+
+    g_gui.contentHeight[2] = innerY + 126 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag rows)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);
     SetNumericEdit(g_gui.hwndTonemapSource, 0);
     SetNumericEdit(g_gui.hwndMaxTmlEdit, 0);
+    SetNumericEdit(g_gui.hwndFaldTauRise, 1);
+    SetNumericEdit(g_gui.hwndFaldTauFall, 1);
+    SetNumericEdit(g_gui.hwndFaldDelay, 0);
 
     // === TAB 3: Settings (initially hidden) ===
     innerY = 8;  // Reset for scroll panel

@@ -133,6 +133,10 @@ struct MovableAtomic {
 #define ID_CORR_FALD_SDR_ENABLE  534   // SDR (ACM) row
 #define ID_CORR_FALD_SDR_PATH    535
 #define ID_CORR_FALD_SDR_BROWSE  536
+#define ID_CORR_FALD_TEMPORAL    537   // LED-lag row (temporal drive state), applies to both modes
+#define ID_CORR_FALD_TAU_RISE    538
+#define ID_CORR_FALD_TAU_FALL    539
+#define ID_CORR_FALD_DELAY       540
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -509,6 +513,13 @@ struct FaldSettings {
                                   // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.
     unsigned int reloadSeq = 0;   // runtime only (not persisted): bumped by runtime.set_fald_params so a panel file
                                   // re-exported at the SAME path rebuilds the GPU tables (fald.cpp FaldEnsureResources)
+    // Temporal drive state (persisted, GUI "LED lag" row / runtime.fald_temporal; fald.h FALD_TEMPORAL_*): the shader's
+    // per-cell first-order filter with rise/fall time constants, so a cell handoff during a pan crossfades instead of
+    // snapping. 0 = off (the stateless layer). The PA32UCXR's LED law is unmeasured: default off (work guide H5).
+    unsigned int temporalMode = 0;
+    float tauRiseMs = 0.0f;
+    float tauFallMs = 0.0f;
+    unsigned int delayFrames = 0;   // pipeline delay 0..FALD_DELAY_MAX: the filter is fed the drives of n frames ago
 };
 
 // Tonemapping settings (HDR only)
@@ -934,6 +945,10 @@ struct GUIState {
     HWND hwndFaldSdrBrowse = nullptr;
     HWND hwndFaldDebug = nullptr;
     HWND hwndFaldPedMode = nullptr;
+    HWND hwndFaldTemporal = nullptr;    // LED-lag row: mode combo + rise/fall ms
+    HWND hwndFaldTauRise = nullptr;
+    HWND hwndFaldTauFall = nullptr;
+    HWND hwndFaldDelay = nullptr;
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

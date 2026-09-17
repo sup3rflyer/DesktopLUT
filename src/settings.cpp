@@ -4,6 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
+#include "fald.h"    // FALD_TAU_MAX_MS
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -117,6 +118,11 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileBool(section, (p + L"FaldEnabled").c_str(), cc.fald.enabled, iniPath);
     WritePrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
     WritePrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), cc.fald.pedMode == 1, iniPath);
+    // temporal drive state (LED-lag filter): mode 0/1/2 + rise/fall time constants in ms (0 = instant on that edge)
+    WritePrivateProfileStringW(section, (p + L"FaldTemporalMode").c_str(), std::to_wstring(cc.fald.temporalMode).c_str(), iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), cc.fald.tauRiseMs, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), cc.fald.tauFallMs, iniPath);
+    WritePrivateProfileStringW(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
 }
 
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
@@ -142,6 +148,18 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     GetPrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), L"", faldBuf, 1024, iniPath);
     cc.fald.paramsPath = faldBuf;
     cc.fald.pedMode = GetPrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), false, iniPath) ? 1u : 0u;
+    {
+        // temporal drive state: an unknown mode is OFF, time constants are clamped to 0..FALD_TAU_MAX_MS
+        int tmode = (int)GetPrivateProfileIntW(section, (p + L"FaldTemporalMode").c_str(), 0, iniPath);
+        cc.fald.temporalMode = (tmode >= 0 && tmode <= 2) ? (unsigned int)tmode : 0u;
+        float rise = GetPrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), 0.0f, iniPath);
+        float fall = GetPrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), 0.0f, iniPath);
+        auto clampTau = [](float v) { return (v != v || v < 0.0f) ? 0.0f : (v > FALD_TAU_MAX_MS ? FALD_TAU_MAX_MS : v); };
+        cc.fald.tauRiseMs = clampTau(rise);
+        cc.fald.tauFallMs = clampTau(fall);
+        int delay = (int)GetPrivateProfileIntW(section, (p + L"FaldDelayFrames").c_str(), 0, iniPath);
+        cc.fald.delayFrames = delay < 0 ? 0u : (delay > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)delay);
+    }
 }
 
 void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,

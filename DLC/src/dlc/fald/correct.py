@@ -114,12 +114,17 @@ def pedestal_adjust(delta: np.ndarray, img: np.ndarray, ped_mode: str) -> tuple[
 
 
 def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
-                  gain_clip: tuple[float, float] = (0.25, 4.0)) -> dict:
+                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None) -> dict:
     """Return the corrected request image for ``img`` (3, h, w, as-if-white nits).
+
+    ``drive_filter``: optional ``drives -> (drives_true, drives_est)`` applied to every round's instantaneous
+    cell drives before the kernels — the temporal drive state of :mod:`dlc.fald.temporal` (the shader's
+    per-cell LED-law filter). ``None`` = the stateless layer (both fields from the frame's own drives).
 
     Result dict: ``req`` (corrected image), ``gain`` (B_est/B_true of the last iteration),
     ``pedestal`` (per channel, nits, from the last iteration's drives), ``clipped`` (LCD would
-    need > 100 %: original request kept), ``floored`` (target below the pedestal)."""
+    need > 100 %: original request kept), ``floored`` (target below the pedestal), ``drives`` (the last
+    round's INSTANTANEOUS drives — what a temporal state commits after the frame)."""
     p = model.p
     w = np.array(p.chan_weights)[:, None, None]
     lmax = p.white_nits * w
@@ -131,7 +136,8 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     gain = np.ones_like(img[0])
     for _ in range(max(1, iters)):
         drives = model.cell_drives(cur)
-        b_true, b_est = model.backlights(drives)
+        d_true, d_est = drive_filter(drives) if drive_filter is not None else (drives, drives)
+        b_true, b_est = model.backlights(d_true, d_est)
         b_true = np.maximum(b_true, 0.0)
         gain = np.clip(b_est / np.maximum(b_true, 1e-9), gain_clip[0], gain_clip[1])
         # deep-dark fade: trust the model only where the panel's estimate is not ~zero (FaldParams.fade_*)
@@ -182,7 +188,7 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         req = np.maximum(u * g_eff[None], 0.0)                  # ONE scale per pixel: hue cannot rotate
         clipped = np.broadcast_to((g_eff < gain - 1e-12)[None], req.shape)   # brightening limited by the knee
         cur = req
-    return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored}
+    return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives}
 
 
 def corrected_code(value_nits: float, bits: int = 10) -> int:

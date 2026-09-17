@@ -148,9 +148,16 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // object every frame and keeps the last desktop image in it, so the cached SRV IS the current
     // desktop. Only when a frame has been cached; otherwise the request waits for the first frame.
     bool reprocess = false;
+    // Settle frame (FALD temporal drive state, fald.h FaldSettlePending): no desktop change, but the layer's per-cell
+    // state has not settled. Re-run ONLY the FALD passes on the layer's own intermediate (the main pass output of the
+    // last frame) and present. No Desktop Duplication read (the released frame texture is not a valid source: HW
+    // 2026-09-17, re-processing it every frame flickered black), no main pass, no pacer bookkeeping.
+    bool settleOnly = false;
     if (hr == DXGI_ERROR_WAIT_TIMEOUT && ctx->captureSRV && ctx->lastCaptureTexture &&
         ctx->redrawRequested.exchange(false)) {
         reprocess = true;   // fall through to the render with the cached frame (no ReleaseFrame)
+    } else if (hr == DXGI_ERROR_WAIT_TIMEOUT && FaldSettlePending(ctx) && !g_dwmHookMode.load()) {
+        settleOnly = true;
     } else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         // Truly no new content this cycle (content static or frame rate < display rate).
         if (fp && ctx->index == 0) FramePacerNotifyTimeout(fp);
@@ -209,7 +216,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // pixels changed. No additional sync needed — next iteration starts with compositor sync.
     // (a pending re-process request renders the cursor-only frame instead: its texture is the
     // desktop, and a continuously moving cursor would otherwise starve the request of timeouts)
-    if (!reprocess && frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0
+    if (!reprocess && !settleOnly && frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0
         && !ctx->redrawRequested.load()) {
         desktopResource->Release();
         ctx->duplication->ReleaseFrame();
@@ -218,18 +225,21 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     }
 
     // Reset consecutive failures on successful frame acquisition
-    if (!reprocess) ctx->consecutiveFailures = 0;
+    if (!reprocess && !settleOnly) ctx->consecutiveFailures = 0;
 
     // Update frame pacer composition offset EMA.
     // Pass LastPresentTime as the preferred measurement point — it is the exact QPC when DWM
     // finished compositing, eliminating the variable latency between DD availability and our
     // AcquireNextFrame call. Falls back to preAcquireQpc when LastPresentTime is zero
     // (cursor-only updates with no desktop pixel change).
-    if (fp && ctx->index == 0 && !reprocess)
+    // (cursor-only updates rendered because of a pending re-process request carry no present time: they would feed
+    // the composition-offset EMA with phase-random samples, so the pacer sees only real desktop frames)
+    if (fp && ctx->index == 0 && !reprocess && !settleOnly
+        && !(frameInfo.LastPresentTime.QuadPart == 0 && frameInfo.AccumulatedFrames == 0))
         FramePacerRecordAcquisition(fp, preAcquireQpc.QuadPart, blockingFallbackUsed,
                                      frameInfo.LastPresentTime.QuadPart);
 
-    if (!reprocess) {
+    if (!reprocess && !settleOnly) {
         // Got a new frame - get the texture
         ID3D11Texture2D* frameTexture = nullptr;
         hr = desktopResource->QueryInterface(IID_PPV_ARGS(&frameTexture));
@@ -642,16 +652,21 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // would clamp scRGB at 1.0 — capture.cpp SwapchainModeChanged keeps them in step, this is the belt).
     bool faldOn = (ctx->isHDREnabled || ctx->isFP16SDR) && ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
                   cc.fald.enabled && !g_dwmHookMode.load() && FaldEnsureResources(ctx, cc.fald);
+    if (!faldOn) FaldLayerIdle(ctx);       // the layer does not run this frame: its temporal state is void (fald.h)
+    if (settleOnly && !faldOn) return;     // nothing left to settle (layer switched off / refused meanwhile)
     ID3D11RenderTargetView* renderTarget = faldOn ? ctx->fald->interRTV : finalTarget;
-
-    float clearColor[4] = { 0, 0, 0, 0 };
-    g_context->ClearRenderTargetView(renderTarget, clearColor);
 
     D3D11_VIEWPORT vp = { 0, 0, (float)ctx->width, (float)ctx->height, 0, 1 };
     g_context->RSSetViewports(1, &vp);
-    g_context->OMSetRenderTargets(1, &renderTarget, nullptr);
-
     g_context->VSSetShader(g_vs, nullptr, 0);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (settleOnly) {
+        // the intermediate still holds the last main-pass output: only the FALD passes run (they bind their own targets)
+        FaldRunPasses(ctx, finalTarget, false);
+    } else {
+    float clearColor[4] = { 0, 0, 0, 0 };
+    g_context->ClearRenderTargetView(renderTarget, clearColor);
+    g_context->OMSetRenderTargets(1, &renderTarget, nullptr);
     g_context->PSSetShader(g_ps, nullptr, 0);
     g_context->PSSetConstantBuffers(0, 1, &g_constantBuffer);
     g_context->PSSetShaderResources(0, 1, &ctx->captureSRV);
@@ -697,8 +712,12 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     g_context->Draw(3, 0);
 
     if (faldOn) {
-        FaldRunPasses(ctx, finalTarget);   // leaves finalTarget bound, PS SRVs cleared
+        // newContent: a real desktop frame (not the cached-frame re-process, not a cursor-only update): the
+        // temporal drive state re-arms its settle hold on it (fald.h FaldRunPasses)
+        const bool newContent = !reprocess && frameInfo.LastPresentTime.QuadPart != 0;
+        FaldRunPasses(ctx, finalTarget, newContent);   // leaves finalTarget bound, PS SRVs cleared
     }
+    }   // !settleOnly
 
     // Analysis overlay (primary monitor only) — always renders to backbuffer
     if (ctx->index == 0 && g_analysisEnabled.load()) {
@@ -805,7 +824,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Release DD frame after rendering — SRV references DD's texture directly (not a copy),
     // so the frame must be held until all GPU draw commands are queued. (A re-process of the
     // cached frame acquired nothing, so there is nothing to release.)
-    if (!reprocess) ctx->duplication->ReleaseFrame();
+    if (!reprocess && !settleOnly) ctx->duplication->ReleaseFrame();
 }
 
 // ============================================================================

@@ -115,6 +115,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.fald_dump", {"monitor": 0, "mode": "SDR", "dir": str(tmp_path)}),   # the live mode (set_hdr off above)
         ("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(_write_fald_panel(tmp_path / "sdr.bin", "gamma"))}),
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
+        ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
         ("layers.set", {**mm, "fald": True}),
         ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),
@@ -287,6 +288,26 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert st["layers"]["0:HDR"]["fald_params_path"] == str(pq) and st["layers"]["0:HDR"]["fald_file_transfer"] == "pq"
     assert "fald_file_transfer" not in st["layers"]["1:SDR"] and st["layers"]["1:SDR"]["fald_params_path"] == ""
     assert "0:SDR" not in st["runtime"]
+    # temporal drive state (2026-09-17): persisted per mode, reported in layers[key], refusals word for word
+    tmp = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120})
+    assert tmp.ok and tmp.result["temporal_mode"] == 1 and tmp.result["tau_rise_ms"] == 40.0 and tmp.result["tau_fall_ms"] == 120.0
+    assert tmp.result["settle_frames_60hz"] == 36                                      # ceil(5 * 120 / 16.667)
+    only_tau = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "tau_fall_ms": 0})
+    assert only_tau.ok and only_tau.result["temporal_mode"] == 1 and only_tau.result["tau_fall_ms"] == 0.0
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald_temporal_mode"] == 1 and st["layers"]["0:SDR"]["fald_tau_rise_ms"] == 40.0
+    assert st["layers"]["0:HDR"]["fald_temporal_mode"] == 0 and st["layers"]["0:HDR"]["fald_tau_rise_ms"] == 0.0   # per mode
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 3}), raise_on_error=False)
+    assert not bad.ok and bad.error == "temporal_mode must be 0 (off), 1 (both fields) or 2 (B_true only)"
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "tau_rise_ms": 9000}), raise_on_error=False)
+    assert not bad.ok and bad.error == "tau_rise_ms must be 0..5000 ms"
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR"}), raise_on_error=False)
+    assert not bad.ok and bad.error.startswith("missing parameter: temporal_mode")
+    dl = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "delay_frames": 2})
+    assert dl.ok and dl.result["delay_frames"] == 2 and dl.result["settle_frames_60hz"] == 12 + 2   # tau_fall is 0 now: 5*40/16.667 = 12, + delay
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_delay_frames"] == 2
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "delay_frames": 4}), raise_on_error=False)
+    assert not bad.ok and bad.error == "delay_frames must be 0..3"
     dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})
     assert dbg.ok and dbg.result["debug_mode"] == 4
     assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_debug_mode"] == 4

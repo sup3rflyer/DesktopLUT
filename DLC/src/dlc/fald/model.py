@@ -492,17 +492,21 @@ class FaldModel:
     def forward(self, shapes: Sequence[Shape]) -> dict:
         return self.forward_img(self.render(shapes))
 
-    def _raw_backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _raw_backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+        """``drives_est`` (default: ``drives``) feeds the panel's ESTIMATE kernel while ``drives`` feeds the real
+        spread — the two differ only under a temporal drive state where the LEDs lag the commanded drive but the
+        LCD compensation follows the command (dlc.fald.temporal MODE_TRUE_ONLY)."""
         p = self.p
+        d_est = drives if drives_est is None else drives_est
         b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm)
         phase = (p.est_phase_px, p.est_phase_py)
         if p.est_cell:
-            return b_true, self.backlight_cell(drives)
+            return b_true, self.backlight_cell(d_est)
         if p.est_kind == "mix":
-            b_est = self.backlight(drives, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase,
+            b_est = self.backlight(d_est, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase,
                                    p.est_aniso, p.est_support_cells)
         else:
-            b_est = self.backlight(drives, p.est_kind, p.est_scale_mm, phase_px=phase, aniso=p.est_aniso,
+            b_est = self.backlight(d_est, p.est_kind, p.est_scale_mm, phase_px=phase, aniso=p.est_aniso,
                                    support_cells=p.est_support_cells)
         return b_true, b_est
 
@@ -517,14 +521,15 @@ class FaldModel:
             self._flat_key = key
         return self._flat
 
-    def backlights(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map. With ``flat_norm`` (default)
+    def backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+        """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map (``drives_est``: a separate map
+        for the estimate kernel, see :meth:`_raw_backlights`). With ``flat_norm`` (default)
         both fields are divided by their flat-lattice response: the native panel shows a uniform field
         as uniform (posmatrix 2026-09-11: no sub-cell position dependence), so whatever the estimate does
         at cell sub-positions and at the frame border must cancel for uniform input. Without it the
         mean-normalised estimate kernel left a ~2 % sub-cell sawtooth and a border ramp on a flat field
         (the grid the owner saw on a white window, 2026-09-12)."""
-        b_true, b_est = self._raw_backlights(drives)
+        b_true, b_est = self._raw_backlights(drives, drives_est)
         if not self.p.flat_norm:
             return b_true, b_est
         f_true, f_est = self.flat_response()

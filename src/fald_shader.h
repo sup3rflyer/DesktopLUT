@@ -20,8 +20,10 @@
 //
 // Passes per frame (overlay path, on the processed frame, after tonemap/LUT/WB):
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)
+//   CS temporal (opt.): per cell, first-order drive STATE (rise/fall time constants) -> the drive the kernels see
 //   CS conv           : drives (x) K_true, drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
 //   CS stat  (round 1): same statistic on the CORRECTED frame (the correction moves the drives)
+//   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
 //   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
 #pragma once
@@ -44,6 +46,11 @@ cbuffer FaldCB : register(b0) {
     float chromaGain; float chromaLo; float chromaHi; float sdrGamma; // colour part of the pedestal term: strength + its own
                                                                     // pixel-luminance fade (lo = hi = 0: none); sdrGamma: the
                                                                     // panel's EOTF exponent (transfer 1 only)
+    float tempAlphaRise; float tempAlphaFall; uint tempMode; uint tempInit; // per-cell drive state (pass 1b; DLC dlc/fald/temporal.py):
+                                                                    // per-frame blend factors 1 - exp(-dt/tau) (1 = instant);
+                                                                    // tempMode 0 = off (stateless), 1 = both fields from the
+                                                                    // state, 2 = B_true from the state, B_est instantaneous;
+                                                                    // tempInit 1 = no valid state yet: copy the drive
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -55,6 +62,9 @@ Texture2D<float>  bEstTex  : register(t6);
 Texture2D<float>  flatTrueTex : register(t7); // the same two fields for a fully driven lattice (normalisation)
 Texture2D<float>  flatEstTex  : register(t8);
 Texture2D<float>  gainTex     : register(t9); // smoothed gain on the fine grid (pass 2b)
+Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless tempMode 2);
+                                               // pixel pass view 7: the filtered drive (driveTex = the instantaneous one)
+Texture2D<float>  stateTex    : register(t11); // temporal pass: the committed drive state of the previous frame
 SamplerState linearClamp : register(s0);
 
 // Ceiling-rule soft knee (correct.py KNEE_START / KNEE_CAP_TRUST; DLC tests/test_fald_transfer.py pins them equal).
@@ -286,11 +296,30 @@ void main(uint3 id : SV_DispatchThreadID) {
         int sy = cy - j2; if (sy < 0 || sy >= (int)rows) continue;
         for (int i2 = -(int)reachEstC; i2 <= (int)reachEstC; i2++) {
             int sx = cx - i2; if (sx < 0 || sx >= (int)cols) continue;
-            accE += driveTex.Load(int3(sx, sy, 0)) * kEst[(so * He + (uint)(j2 + (int)reachEstR)) * We + (uint)(i2 + (int)reachEstC)];
+            accE += driveEstTex.Load(int3(sx, sy, 0)) * kEst[(so * He + (uint)(j2 + (int)reachEstR)) * We + (uint)(i2 + (int)reachEstC)];
         }
     }
     bTrueOut[uint2(fx, fy)] = accT;
     bEstOut[uint2(fx, fy)] = accE;
+}
+)";
+
+// Pass 1b (tempMode != 0 only): per-cell first-order drive state. driveTex (t4) = this round's instantaneous
+// drive, stateTex (t11) = the state committed after the previous frame's round 1. out = s + a * (d - s) with
+// a = tempAlphaRise when the drive rises, tempAlphaFall when it falls (DLC temporal.DriveState.peek); with no
+// valid state yet (tempInit) the drive is copied. Both rounds of a frame read the SAME committed state; the
+// C++ copies round 1's output into the state texture afterwards (DriveState.commit).
+inline const char* g_faldTemporalSource = R"(
+RWTexture2D<float> driveFiltOut : register(u0);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= cols || id.y >= rows) return;
+    float d = driveTex.Load(int3(id.xy, 0));
+    if (tempInit != 0u) { driveFiltOut[id.xy] = d; return; }
+    float s = stateTex.Load(int3(id.xy, 0));
+    float a = (d > s) ? tempAlphaRise : tempAlphaFall;
+    driveFiltOut[id.xy] = s + a * (d - s);
 }
 )";
 
@@ -336,7 +365,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 // 4 = identity passthrough (the layer runs its passes but outputs the source: isolates the overlay path itself),
 // 5 = the pedestal term actually applied (|adj| * fade, per channel, x100: 1 nit of subtraction shows as 100 nits;
 //     the colour is the colour of what is subtracted or lifted), 6 = the influence of the per-channel toggle:
-//     |adj_channel - adj_white| * fade, x100 (what changes on screen when the toggle flips; black = nothing).
+//     |adj_channel - adj_white| * fade, x100 (what changes on screen when the toggle flips; black = nothing),
+//     7 = temporal settling: per cell, the instantaneous drive minus the filtered one (red = the state is still BELOW
+//     the frame's drive, i.e. the LEDs are modelled as still rising; blue = above, falling), +-25 % drive full scale.
 inline const char* g_faldPixelSource = R"(
 struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -356,6 +387,15 @@ float4 main(PS_INPUT i) : SV_Target {
     }
     if (debugMode == 2) { float v = saturate(bT) * DebugWhite(); return float4(v, v, v, 1.0f); }
     if (debugMode == 3) { float v = saturate(bE) * DebugWhite(); return float4(v, v, v, 1.0f); }
+    if (debugMode == 7) {
+        uint2 c = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);   // inside the lattice here
+        float dInst = driveTex.Load(int3((int2)c, 0));
+        float dFilt = driveEstTex.Load(int3((int2)c, 0));
+        float diff = dInst - dFilt;                         // > 0: instantaneous drive above the state (rising)
+        float t = saturate(abs(diff) * 4.0f);
+        float3 cc = (diff >= 0.0f) ? float3(1.0f, 1.0f - t, 1.0f - t) : float3(1.0f - t, 1.0f - t, 1.0f);
+        return float4(cc * DebugWhite(), 1.0f);
+    }
     if (debugMode == 5 || debugMode == 6) {
         float maxc = max(img.r, max(img.g, img.b));
         float s = min(maxc, white);

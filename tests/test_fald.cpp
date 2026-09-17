@@ -273,10 +273,51 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
     }
 }
 
-TEST_CASE("FALD constant buffer is 44 words") {
-    // FillCB writes words up to index 43 (sdrGamma; word 31 = transfer); the HLSL cbuffer FaldCB declares 11 float4 rows.
-    CHECK(FALD_CB_BYTES == 176u);
+TEST_CASE("FALD constant buffer is 48 words") {
+    // FillCB writes words up to index 47 (temporal drive state 44-47; word 31 = transfer, 43 = sdrGamma); the HLSL
+    // cbuffer FaldCB declares 12 float4 rows.
+    CHECK(FALD_CB_BYTES == 192u);
     CHECK(FALD_CB_BYTES % 16 == 0);
+}
+
+TEST_CASE("FALD temporal drive state: alpha and settle frames follow the DLC reference") {
+    // dlc/fald/temporal.py alpha_from_tau / settle_frames (tests/test_fald_temporal.py pins the same numbers)
+    CHECK(FaldTemporalAlpha(0.0f, 16.667f) == 1.0f);          // tau 0 = instant on that edge
+    CHECK(FaldTemporalAlpha(-5.0f, 16.667f) == 1.0f);
+    CHECK(FaldTemporalAlpha(100.0f, 0.0f) == 1.0f);
+    CHECK(FaldTemporalAlpha(100.0f, 16.667f) == doctest::Approx(0.153521f).epsilon(1e-4));
+    CHECK(FaldTemporalAlpha(16.667f, 16.667f) == doctest::Approx(1.0f - 0.367879f).epsilon(1e-5));
+    CHECK(FaldSettleFrames(0.0f, 0.0f, 16.667f) == 0u);       // no time constant: no redraw hold
+    CHECK(FaldSettleFrames(100.0f, 50.0f, 16.667f) == 30u);   // 5 tau_max
+    CHECK(FaldSettleFrames(50.0f, 120.0f, 1000.0f / 60.0f) == 36u);   // an exact multiple stays exact
+    CHECK(FaldSettleFrames(100.0f, 0.0f, 0.0f) == 0u);
+    CHECK(FaldSettleFrames(1.0f, 0.0f, 16.667f) == 1u);       // never 0 while a time constant exists
+    CHECK(FaldSettleFrames(0.0f, 0.0f, 16.667f, 2u) == 2u);   // a pipeline delay alone owes its frames
+    CHECK(FaldSettleFrames(100.0f, 50.0f, 16.667f, 1u) == 31u);
+    CHECK(FaldSettleFrames(100.0f, 50.0f, 16.667f, 9u) == 33u);   // depth clamped to FALD_DELAY_MAX
+}
+
+TEST_CASE("FALD temporal drive state: settle pending and layer-idle reset (no D3D needed)") {
+    MonitorContext ctx;
+    CHECK_FALSE(FaldSettlePending(&ctx));                      // no resources
+    FaldResources* r = new FaldResources();
+    ctx.fald = r;
+    r->valid = true; r->temporalMode = FALD_TEMPORAL_BOTH; r->settleLeft = 3; r->stateValid = true; r->delayCount = 2;
+    CHECK(FaldSettlePending(&ctx));
+    r->temporalMode = FALD_TEMPORAL_OFF;
+    CHECK_FALSE(FaldSettlePending(&ctx));                      // off: never a settle frame
+    r->temporalMode = FALD_TEMPORAL_TRUE_ONLY; r->valid = false;
+    CHECK_FALSE(FaldSettlePending(&ctx));                      // refused / not built
+    r->valid = true;
+    CHECK(FaldSettlePending(&ctx));
+    FaldLayerIdle(&ctx);                                       // the layer did not run: state, hold and ring are void
+    CHECK_FALSE(r->stateValid);
+    CHECK(r->settleLeft == 0u);
+    CHECK(r->delayCount == 0u);
+    CHECK_FALSE(FaldSettlePending(&ctx));
+    ctx.fald = nullptr;
+    delete r;
+    FaldLayerIdle(&ctx);                                       // tolerates a monitor without resources
 }
 
 // FLD3: the 40 FLD2 words + 8 (word 40 transfer, 41 sdr_gamma, 42-47 reserved); tables follow at byte 192.

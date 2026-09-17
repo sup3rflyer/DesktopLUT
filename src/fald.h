@@ -16,8 +16,24 @@
 struct MonitorContext;
 struct FaldSettings;
 
-// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 44 words.
-constexpr unsigned int FALD_CB_BYTES = 176;
+// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 48 words.
+constexpr unsigned int FALD_CB_BYTES = 192;
+
+// Temporal drive state (FaldSettings::temporalMode; DLC dlc/fald/temporal.py is the reference):
+// 0 = off (stateless layer, byte for byte), 1 = both fields from the filtered drive (LEDs AND the panel's estimate
+// lag), 2 = B_true from the filtered drive, B_est from the instantaneous one (LEDs lag, the LCD compensation follows
+// the command). Default OFF: the PA32UCXR's LED law is unmeasured (work guide H5).
+constexpr unsigned int FALD_TEMPORAL_OFF = 0;
+constexpr unsigned int FALD_TEMPORAL_BOTH = 1;
+constexpr unsigned int FALD_TEMPORAL_TRUE_ONLY = 2;
+constexpr float FALD_TAU_MAX_MS = 5000.0f;
+constexpr unsigned int FALD_DELAY_MAX = 3;    // pipeline delay ring depth (FaldSettings::delayFrames 0..3)
+// Per-frame blend factor 1 - exp(-dt/tau) of a first-order response; tau <= 0 (or dt <= 0) = instant (1).
+float FaldTemporalAlpha(float tauMs, float dtMs);
+// Frames the layer keeps re-rendering after the last content change so the state settles (5 tau_max, ceil, plus the
+// pipeline delay; 0 when neither edge has a time constant and there is no delay): Desktop Duplication delivers no
+// frames on a static desktop.
+unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsigned int delayFrames = 0);
 
 // Panel-file signal transfer (FLD3 header word 40; see FaldPanelParams::transfer).
 constexpr uint32_t FALD_TRANSFER_PQ = 0;      // HDR: PQ codes (FLD1/FLD2 files are implicitly PQ)
@@ -86,6 +102,20 @@ struct FaldResources {
     ID3D11Texture2D* inter = nullptr;
     ID3D11RenderTargetView* interRTV = nullptr;
     ID3D11ShaderResourceView* interSRV = nullptr;
+    // temporal drive state (pass 1b): the filtered drive of the current round and the committed state
+    ID3D11Texture2D* driveFiltTex = nullptr; ID3D11UnorderedAccessView* driveFiltUAV = nullptr; ID3D11ShaderResourceView* driveFiltSRV = nullptr;
+    ID3D11Texture2D* driveStateTex = nullptr; ID3D11UnorderedAccessView* driveStateUAV = nullptr; ID3D11ShaderResourceView* driveStateSRV = nullptr;
+    // pipeline delay ring: the round-1 instantaneous drive maps of the last FALD_DELAY_MAX frames (oldest overwritten);
+    // with delayFrames = n the temporal pass is fed ring[head - n] once the ring holds n maps, else the current drive
+    ID3D11Texture2D* delayTex[FALD_DELAY_MAX] = {}; ID3D11UnorderedAccessView* delayUAV[FALD_DELAY_MAX] = {}; ID3D11ShaderResourceView* delaySRV[FALD_DELAY_MAX] = {};
+    unsigned int delayHead = 0, delayCount = 0;
+    unsigned int delayFrames = 0;            // FaldSettings::delayFrames at the last FaldRunPasses
+    bool stateValid = false;                 // the state texture holds a committed map (else the next pass copies the drive)
+    unsigned int temporalMode = 0;           // FaldSettings::temporalMode at the last FaldRunPasses (a change resets the state)
+    float tempAlphaRise = 1.0f, tempAlphaFall = 1.0f;   // the CB words of the last frame (dump)
+    unsigned int settleLeft = 0;             // frames of redraw hold still owed after the last content change
+    float dtMs = 16.667f;                    // EMA of the interval between consecutive runs while rendering continuously
+    long long lastRunQpc = 0;
     // panel tables
     ID3D11Texture2D* curveTex = nullptr;   ID3D11ShaderResourceView* curveSRV = nullptr;
     ID3D11Buffer* kTrueBuf = nullptr;      ID3D11ShaderResourceView* kTrueSRV = nullptr;
@@ -128,6 +158,17 @@ bool FaldEnsureResources(MonitorContext* ctx, const FaldSettings& settings);
 bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // Run the compute passes on ctx->fald->inter and draw the corrected frame into finalRT.
 // Handles a pending debug dump (ctx->faldDumpRequested): the fields + input frame before the pixel
-// pass, the OUTPUT frame (fald_out.*) after it.
-void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT);
+// pass, the OUTPUT frame (fald_out.*) after it. newContent = the frame is a NEW desktop frame (not a re-process
+// of the cached one, not a cursor-only update, not a settle frame): with a temporal drive state it re-arms the
+// settle hold (FaldSettlePending), so a static desktop keeps re-running the layer for ~5 tau.
+void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true);
+// True while the temporal drive state still owes settle frames after the last content change (render thread).
+// The render loop then re-runs ONLY the FALD passes on the layer's own intermediate (the main pass output of the
+// last frame) and presents — no Desktop Duplication read (the released frame texture is not a valid source; HW
+// 2026-09-17: re-processing it every frame flickered black), no main pass.
+bool FaldSettlePending(const MonitorContext* ctx);
+// The layer did not run this frame (disabled, refused, hook mode, wrong format): forget the temporal state and the
+// settle hold. HW-relevant (design review 2026-09-17): a state kept across a layer-OFF period would blend the new
+// content with the OLD content's drives when the layer comes back on a static desktop, and nothing would settle it.
+void FaldLayerIdle(MonitorContext* ctx);
 void FaldReleaseResources(MonitorContext* ctx);

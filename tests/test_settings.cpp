@@ -2,6 +2,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
+#include "fald.h"    // FALD_TAU_MAX_MS
 #include <cstdio>
 #include <cmath>
 #include <string>
@@ -247,6 +248,10 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.paramsPath = L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin";
         original.fald.pedMode = 1;
         original.fald.debugMode = 4;    // runtime only: must NOT persist
+        original.fald.temporalMode = 2; // temporal drive state (2026-09-17): persisted
+        original.fald.tauRiseMs = 40.5f;
+        original.fald.tauFallMs = 120.0f;
+        original.fald.delayFrames = 2;
         SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
 
         ColorCorrectionSettings loaded;
@@ -255,6 +260,30 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.paramsPath == L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin");
         CHECK(loaded.fald.pedMode == 1u);
         CHECK(loaded.fald.debugMode == 0u);
+        CHECK(loaded.fald.temporalMode == 2u);
+        CHECK(loaded.fald.tauRiseMs == doctest::Approx(40.5f).epsilon(1e-4));
+        CHECK(loaded.fald.tauFallMs == doctest::Approx(120.0f).epsilon(1e-4));
+        CHECK(loaded.fald.delayFrames == 2u);
+    }
+    // a fresh INI (no keys) = the filter OFF; out-of-range values are clamped, an unknown mode is OFF
+    {
+        TempIni ini;
+        ColorCorrectionSettings fresh;
+        LoadColorCorrectionSettings(L"TestMon", L"SDR_", fresh, ini.c_str());
+        CHECK(fresh.fald.temporalMode == 0u);
+        CHECK(fresh.fald.tauRiseMs == 0.0f);
+        CHECK(fresh.fald.tauFallMs == 0.0f);
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalMode", L"7", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTauRiseMs", L"9000", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTauFallMs", L"-3", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldDelayFrames", L"9", ini.c_str());
+        ColorCorrectionSettings clamped;
+        LoadColorCorrectionSettings(L"TestMon", L"SDR_", clamped, ini.c_str());
+        CHECK(clamped.fald.temporalMode == 0u);
+        CHECK(clamped.fald.tauRiseMs == FALD_TAU_MAX_MS);
+        CHECK(clamped.fald.tauFallMs == 0.0f);
+        CHECK(clamped.fald.delayFrames == FALD_DELAY_MAX);
+        CHECK(fresh.fald.delayFrames == 0u);
     }
     // the two modes are independent keys: an SDR save never touches the HDR slot
     TempIni ini;

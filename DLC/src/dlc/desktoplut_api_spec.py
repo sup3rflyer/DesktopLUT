@@ -74,7 +74,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"
                           "; HDR adds tonemap_dynamic, tonemap_target_peak; every pair (HDR and SDR, the FALD "
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
-                          "fald_ped_mode, fald_ped_colour_in_file, and fald_file_transfer 'pq'|'gamma' when the "
+                          "fald_ped_mode, fald_ped_colour_in_file, fald_temporal_mode, fald_tau_rise_ms, "
+                          "fald_tau_fall_ms, fald_delay_frames (runtime.fald_temporal), and fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
@@ -361,16 +362,44 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "runtime.fald_debug",
             "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map white/red +/blue -, 2 real "
             "backlight, 3 panel estimate, 4 identity passthrough, 5 pedestal term x100, 6 per-channel-vs-white "
-            "influence x100; not persisted) and/or the pedestal mode "
+            "influence x100, 7 temporal settling map red rising/blue falling; not persisted) and/or the pedestal mode "
             "(ped_mode 0 = white pedestal, 1 = the FLD2 panel file's per-channel leak colour; persisted, "
             "= the GUI 'Per-channel pedestal' checkbox). At least one of the two.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "debug_mode": ApiParamSpec("number", required=False, description="0..6"),
+                "debug_mode": ApiParamSpec("number", required=False, description="0..7"),
                 "ped_mode": ApiParamSpec("number", required=False, description="0 | 1"),
             },
             {"monitor_mode": "string", "debug_mode": "number", "ped_mode": "number", "ped_colour_in_file": "boolean"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.fald_temporal",
+            "FALD compensation layer: temporal drive state — the shader's per-cell LED-law filter (DLC "
+            "dlc/fald/temporal.py is the reference; work guide H5 / item 4a, 2026-09-17). temporal_mode 0 = off (the "
+            "stateless layer, byte for byte), 1 = both backlight fields from the filtered drive (the LEDs AND the "
+            "panel's own estimate lag: self-consistent firmware), 2 = only B_true from the filtered drive (the LEDs "
+            "lag physically, the LCD compensation follows the commanded drive). tau_rise_ms / tau_fall_ms = first-order "
+            "time constants per edge (0 = instant on that edge; max 5000); delay_frames = a pipeline delay 0..3 (the "
+            "filter is fed the drives of n frames ago: LED-driver latency after the LCD data, the law a first-order "
+            "filter cannot represent). The layer keeps re-running its passes on a static desktop for 5 tau + delay "
+            "after the last content frame so the state settles. Persisted per mode (= the GUI 'LED lag' row, which "
+            "sets both modes). At least one of the four. Default off: the panel's LED law is UNMEASURED — fit it "
+            "(python -m dlc.fald.led_step_fit on a high-fps video of the test clip's toggle segment, --block-roi for "
+            "the delay) before trusting a setting; a filter on an instant panel makes pans worse, not better, and the "
+            "wrong MODE flashes at every handoff (mode 2 only if the halo step overshoots).",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "temporal_mode": ApiParamSpec("number", required=False, description="0 | 1 | 2"),
+                "tau_rise_ms": ApiParamSpec("number", required=False, description="0..5000"),
+                "tau_fall_ms": ApiParamSpec("number", required=False, description="0..5000"),
+                "delay_frames": ApiParamSpec("number", required=False, description="0..3"),
+            },
+            {"monitor_mode": "string", "temporal_mode": "number", "tau_rise_ms": "number", "tau_fall_ms": "number",
+             "delay_frames": "number", "settle_frames_60hz": "number"},
             mutates_state=True,
             gui_thread_required=True,
         ),

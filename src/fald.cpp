@@ -14,6 +14,7 @@ static ID3D11ComputeShader* g_faldStatCS = nullptr;
 static ID3D11ComputeShader* g_faldConvCS = nullptr;
 static ID3D11ComputeShader* g_faldGainCS = nullptr;
 static ID3D11ComputeShader* g_faldBlurCS = nullptr;
+static ID3D11ComputeShader* g_faldTemporalCS = nullptr;   // pass 1b: per-cell drive state (temporal mode only)
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
@@ -25,6 +26,20 @@ static size_t FaldHeaderBytes(uint32_t magic) {
     return magic == FALD_MAGIC3 ? 192 : (magic == FALD_MAGIC2 ? 160 : 128);
 }
 static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
+static const float FALD_RESUME_GAP_MS = 250.0f;          // a run this long after the previous one re-arms the settle hold
+
+// Temporal drive state helpers (DLC dlc/fald/temporal.py alpha_from_tau / settle_frames; tests/test_fald.cpp).
+float FaldTemporalAlpha(float tauMs, float dtMs) {
+    if (!(tauMs > 0.0f) || !(dtMs > 0.0f)) return 1.0f;
+    return 1.0f - std::exp(-dtMs / tauMs);
+}
+unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsigned int delayFrames) {
+    const unsigned int delay = delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : delayFrames;
+    float tau = tauRiseMs > tauFallMs ? tauRiseMs : tauFallMs;
+    if (!(tau > 0.0f) || !(dtMs > 0.0f)) return delay;
+    double n = std::ceil(5.0 * (double)tau / (double)dtMs - 1e-4);   // 5 tau; the tolerance keeps exact multiples exact (float32 dt)
+    return (n < 1.0 ? 1u : (n > 100000.0 ? 100000u : (unsigned int)n)) + delay;
+}
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
 
@@ -200,6 +215,10 @@ bool InitFaldShaders() {
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldBlurCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(blur) failed" << std::endl; return false; }
+    if (!CompileOne(common + g_faldTemporalSource, "FaldTemporalCS", "cs_5_0", &b)) return false;
+    hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldTemporalCS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(temporal) failed" << std::endl; return false; }
     if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
@@ -215,13 +234,14 @@ bool InitFaldShaders() {
 void ReleaseFaldShaders() {
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
+    if (g_faldTemporalCS) { g_faldTemporalCS->Release(); g_faldTemporalCS = nullptr; }
     if (g_faldBlurCS) { g_faldBlurCS->Release(); g_faldBlurCS = nullptr; }
     if (g_faldGainCS) { g_faldGainCS->Release(); g_faldGainCS = nullptr; }
     if (g_faldConvCS) { g_faldConvCS->Release(); g_faldConvCS = nullptr; }
     if (g_faldStatCS) { g_faldStatCS->Release(); g_faldStatCS = nullptr; }
 }
 
-bool FaldShadersReady() { return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldPS && g_faldSampler; }
+bool FaldShadersReady() { return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldPS && g_faldSampler; }
 
 // ---------------------------------------------------------------------------------------------
 // Resources
@@ -234,6 +254,11 @@ static void ReleaseAll(FaldResources* r) {
     SafeRelease(r->kTrueSRV); SafeRelease(r->kTrueBuf);
     SafeRelease(r->kEstSRV); SafeRelease(r->kEstBuf);
     SafeRelease(r->driveSRV); SafeRelease(r->driveUAV); SafeRelease(r->driveTex);
+    SafeRelease(r->driveFiltSRV); SafeRelease(r->driveFiltUAV); SafeRelease(r->driveFiltTex);
+    SafeRelease(r->driveStateSRV); SafeRelease(r->driveStateUAV); SafeRelease(r->driveStateTex);
+    for (unsigned int i = 0; i < FALD_DELAY_MAX; i++) { SafeRelease(r->delaySRV[i]); SafeRelease(r->delayUAV[i]); SafeRelease(r->delayTex[i]); }
+    r->delayHead = 0; r->delayCount = 0;
+    r->stateValid = false; r->settleLeft = 0;
     SafeRelease(r->bTrueSRV); SafeRelease(r->bTrueUAV); SafeRelease(r->bTrueTex);
     SafeRelease(r->bEstSRV); SafeRelease(r->bEstUAV); SafeRelease(r->bEstTex);
     SafeRelease(r->gainASRV); SafeRelease(r->gainAUAV); SafeRelease(r->gainATex);
@@ -329,6 +354,12 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeFloatBuffer(p.kTrue, &r->kTrueBuf, &r->kTrueSRV)) { r->lastError = "kTrue buffer"; return false; }
     if (!MakeFloatBuffer(p.kEst, &r->kEstBuf, &r->kEstSRV)) { r->lastError = "kEst buffer"; return false; }
     if (!MakeRWTexture(p.cols, p.rows, &r->driveTex, &r->driveUAV, &r->driveSRV)) { r->lastError = "drive texture"; return false; }
+    if (!MakeRWTexture(p.cols, p.rows, &r->driveFiltTex, &r->driveFiltUAV, &r->driveFiltSRV)) { r->lastError = "filtered drive texture"; return false; }
+    if (!MakeRWTexture(p.cols, p.rows, &r->driveStateTex, &r->driveStateUAV, &r->driveStateSRV)) { r->lastError = "drive state texture"; return false; }
+    for (unsigned int i = 0; i < FALD_DELAY_MAX; i++)
+        if (!MakeRWTexture(p.cols, p.rows, &r->delayTex[i], &r->delayUAV[i], &r->delaySRV[i])) { r->lastError = "delay ring texture"; return false; }
+    r->delayHead = 0; r->delayCount = 0; r->delayFrames = 0;
+    r->stateValid = false; r->settleLeft = 0; r->temporalMode = FALD_TEMPORAL_OFF;
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bTrueTex, &r->bTrueUAV, &r->bTrueSRV)) { r->lastError = "B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bEstTex, &r->bEstUAV, &r->bEstSRV)) { r->lastError = "B_est texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainATex, &r->gainAUAV, &r->gainASRV)) { r->lastError = "gain texture A"; return false; }
@@ -336,7 +367,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 44 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 48 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -433,27 +464,32 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     f[41] = (p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo;
     f[42] = (p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi;
     f[43] = p.sdrGamma;                                                             // panel EOTF exponent (transfer 1)
+    // temporal drive state (words 44-47): per-frame blend factors, mode, "no valid state yet" (copy the drive)
+    f[44] = r->tempAlphaRise; f[45] = r->tempAlphaFall;
+    u[46] = r->temporalMode; u[47] = r->stateValid ? 0u : 1u;
     g_context->Unmap(r->cb, 0);
 }
 
+static const UINT FALD_SRV_SLOTS = 12;   // t0..t11 (fald_shader.h)
+
 static void BindCommon(FaldResources* r, bool compute) {
-    ID3D11ShaderResourceView* srvs[10] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
-                                           r->flatTrueSRV, r->flatEstSRV, nullptr };
+    ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
+                                                       r->flatTrueSRV, r->flatEstSRV, nullptr, nullptr, nullptr };
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
-        g_context->CSSetShaderResources(0, 10, srvs);
+        g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_context->CSSetSamplers(0, 1, &g_faldSampler);
     } else {
         g_context->PSSetConstantBuffers(0, 1, &r->cb);
-        g_context->PSSetShaderResources(0, 10, srvs);
+        g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_context->PSSetSamplers(0, 1, &g_faldSampler);
     }
 }
 
 static void UnbindCompute() {
-    ID3D11ShaderResourceView* nullSrv[10] = {};
+    ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     ID3D11UnorderedAccessView* nullUav[2] = {};
-    g_context->CSSetShaderResources(0, 10, nullSrv);
+    g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
     g_context->CSSetUnorderedAccessViews(0, 2, nullUav, nullptr);
     g_context->CSSetShader(nullptr, nullptr, 0);
 }
@@ -473,11 +509,28 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
     UnbindCompute();
 }
 
-static void RunConv(FaldResources* r) {
+// Pass 1b (temporal mode): filtered drive = state + a * (drive - state) per cell, from the drive map the panel's
+// pipeline is fed (t4: this round's instantaneous drive, or the ring entry delayFrames frames back) and the state
+// committed after the previous frame (t11); with no valid state the drive is copied.
+static void RunTemporal(FaldResources* r, ID3D11ShaderResourceView* inDrive) {
+    const FaldPanelParams& p = r->params;
+    g_context->CSSetShader(g_faldTemporalCS, nullptr, 0);
+    BindCommon(r, true);
+    g_context->CSSetShaderResources(4, 1, &inDrive);
+    g_context->CSSetShaderResources(11, 1, &r->driveStateSRV);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->driveFiltUAV, nullptr);
+    g_context->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();
+}
+
+// trueDrive / estDrive: the drive maps the real-spread and the estimate kernels see (both the instantaneous drive
+// unless a temporal mode routes the filtered one).
+static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive) {
     const FaldPanelParams& p = r->params;
     g_context->CSSetShader(g_faldConvCS, nullptr, 0);
     BindCommon(r, true);
-    g_context->CSSetShaderResources(4, 1, &r->driveSRV);
+    g_context->CSSetShaderResources(4, 1, &trueDrive);
+    g_context->CSSetShaderResources(10, 1, &estDrive);
     ID3D11UnorderedAccessView* uavs[2] = { r->bTrueUAV, r->bEstUAV };
     g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
     g_context->Dispatch((p.cols * p.sub + 15) / 16, (p.rows * p.sub + 15) / 16, 1);
@@ -526,14 +579,14 @@ static std::string NarrowUtf8(const std::wstring& w) {
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
 // Must run after the fine textures exist; the flat textures are bound as SRVs t7/t8 from then on
 // (they are nullptr during this call, which the conv pass does not read).
-static void RunConv(FaldResources* r);
+static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive);
 static void ComputeFlatResponse(FaldResources* r) {
     const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     g_context->ClearUnorderedAccessViewFloat(r->driveUAV, one);
     ID3D11ShaderResourceView* saveT = r->flatTrueSRV; ID3D11ShaderResourceView* saveE = r->flatEstSRV;
     r->flatTrueSRV = nullptr; r->flatEstSRV = nullptr;          // not inputs of this pass
     FillCB(r, 0);
-    RunConv(r);
+    RunConv(r, r->driveSRV, r->driveSRV);
     r->flatTrueSRV = saveT; r->flatEstSRV = saveE;
     g_context->CopyResource(r->flatTrueTex, r->bTrueTex);
     g_context->CopyResource(r->flatEstTex, r->bEstTex);
@@ -571,7 +624,12 @@ static std::wstring TakeDumpRequest(MonitorContext* ctx) {
 // Fields + the INPUT frame (the main pass output the layer reads), after the compute passes.
 static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring& dir) {
     const FaldPanelParams& p = r->params;
+    const FaldSettings& fs = ctx->isHDREnabled ? ctx->hdrColorCorrection.fald : ctx->sdrColorCorrection.fald;
     DumpTexture(r->driveTex, dir + L"fald_drive.f32", p.cols, p.rows, 4);
+    if (r->temporalMode != FALD_TEMPORAL_OFF) {
+        DumpTexture(r->driveFiltTex, dir + L"fald_drive_filt.f32", p.cols, p.rows, 4);    // the drive the kernels saw (round 1)
+        DumpTexture(r->driveStateTex, dir + L"fald_drive_state.f32", p.cols, p.rows, 4);  // the state the pass READ (dumped before
+    }                                                                                    // the commit: filt = s + a (d - s) checks offline)
     DumpTexture(r->bTrueTex, dir + L"fald_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->bEstTex, dir + L"fald_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->flatTrueTex, dir + L"fald_flat_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
@@ -588,6 +646,10 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\nped_mode " << (((r->pedMode == 1) && p.hasPedColour) ? "channel" : "white")
          << "\nped_rgb " << p.pedRGB[0] << " " << p.pedRGB[1] << " " << p.pedRGB[2] << (p.hasPedColour ? " (FLD2)" : " (FLD1, white)")
          << "\nped_chroma_gain " << p.chromaGain << " fade " << ((p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo) << " " << ((p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi)
+         << "\ntemporal_mode " << r->temporalMode << " (0 off, 1 both fields, 2 B_true only)"
+         << "\ntau_rise_ms " << fs.tauRiseMs << "\ntau_fall_ms " << fs.tauFallMs << "\ndelay_frames " << r->delayFrames << " (ring " << r->delayCount << ")"
+         << "\ntemp_alpha_rise " << r->tempAlphaRise << "\ntemp_alpha_fall " << r->tempAlphaFall << "\ndt_ms " << r->dtMs
+         << "\nstate_valid " << (r->stateValid ? 1 : 0)
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -607,26 +669,69 @@ static void DumpOutput(MonitorContext* ctx, FaldResources* r, ID3D11RenderTarget
     res->Release();
 }
 
-void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
+void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent) {
     FaldResources* r = ctx ? ctx->fald : nullptr;
     if (!r || !r->valid || !finalRT) return;
     const FaldSettings& fs = ctx->isHDREnabled ? ctx->hdrColorCorrection.fald : ctx->sdrColorCorrection.fald;
     r->debugMode = fs.debugMode;
     r->pedMode = fs.pedMode;
+
+    // Temporal drive state (pass 1b; DLC dlc/fald/temporal.py). dt = the interval between consecutive runs while
+    // rendering continuously (EMA over 2..100 ms intervals; a long static gap keeps the last estimate — the response
+    // starts at the new frame, however long the desktop stood still). A mode change forgets the state.
+    bool resumed = false;                  // first run after a gap (see the settle hold below)
+    {
+        LARGE_INTEGER now, freq;
+        QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+        if (r->lastRunQpc != 0 && freq.QuadPart > 0) {
+            float iv = (float)((double)(now.QuadPart - r->lastRunQpc) * 1000.0 / (double)freq.QuadPart);
+            if (iv >= 2.0f && iv <= 100.0f) r->dtMs = 0.9f * r->dtMs + 0.1f * iv;
+            else if (iv > FALD_RESUME_GAP_MS) resumed = true;
+        }
+        r->lastRunQpc = now.QuadPart;
+    }
+    const unsigned int mode = (fs.temporalMode <= FALD_TEMPORAL_TRUE_ONLY) ? fs.temporalMode : FALD_TEMPORAL_OFF;
+    if (mode != r->temporalMode) { r->temporalMode = mode; r->stateValid = false; r->settleLeft = 0; r->delayCount = 0; }
+    const unsigned int delay = fs.delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : fs.delayFrames;
+    if (delay != r->delayFrames) { r->delayFrames = delay; r->delayCount = 0; }   // a changed depth restarts the ring
+    const bool temporal = (mode != FALD_TEMPORAL_OFF);
+    // the map the panel's pipeline is fed this frame: the ring entry `delay` frames back once the ring holds that many
+    // (DriveState.delayed), else the instantaneous drive. Both rounds are fed the same map.
+    ID3D11ShaderResourceView* inDrive = r->driveSRV;
+    if (temporal && delay > 0 && r->delayCount >= delay)
+        inDrive = r->delaySRV[(r->delayHead + FALD_DELAY_MAX - delay) % FALD_DELAY_MAX];
+    r->tempAlphaRise = FaldTemporalAlpha(fs.tauRiseMs, r->dtMs);
+    r->tempAlphaFall = FaldTemporalAlpha(fs.tauFallMs, r->dtMs);
+    ID3D11ShaderResourceView* trueDrive = r->driveSRV;   // what the real-spread kernel sees
+    ID3D11ShaderResourceView* estDrive = r->driveSRV;    // what the estimate kernel sees
+    if (mode == FALD_TEMPORAL_BOTH) { trueDrive = r->driveFiltSRV; estDrive = r->driveFiltSRV; }
+    else if (mode == FALD_TEMPORAL_TRUE_ONLY) { trueDrive = r->driveFiltSRV; }
+
     // the main pass rendered into r->inter with finalRT unbound; make sure the RTV is off before
     // the intermediate is read as an SRV
     ID3D11RenderTargetView* nullRT = nullptr;
     g_context->OMSetRenderTargets(1, &nullRT, nullptr);
 
     RunStat(r, 0);
-    RunConv(r);
+    if (temporal) RunTemporal(r, inDrive); // both rounds read the SAME committed state (DriveState.peek)
+    RunConv(r, trueDrive, estDrive);
     RunGain(r);
     RunStat(r, 1);
-    RunConv(r);
+    if (temporal) RunTemporal(r, inDrive);
+    RunConv(r, trueDrive, estDrive);
     RunGain(r);
     r->framesRun++;
     const std::wstring dumpDir = TakeDumpRequest(ctx);
-    if (!dumpDir.empty()) DumpFields(ctx, r, dumpDir);
+    if (!dumpDir.empty()) DumpFields(ctx, r, dumpDir);   // before the commit: the state file is the map the pass read
+    if (temporal) {                        // DriveState.commit: round 1's filtered map becomes the state; the ring
+        g_context->CopyResource(r->driveStateTex, r->driveFiltTex);   // takes round 1's INSTANTANEOUS map
+        r->stateValid = true;
+        if (delay > 0) {
+            g_context->CopyResource(r->delayTex[r->delayHead], r->driveTex);
+            r->delayHead = (r->delayHead + 1) % FALD_DELAY_MAX;
+            if (r->delayCount < FALD_DELAY_MAX) r->delayCount++;
+        }
+    }
 
     // pixel pass: inter + fields -> finalRT (fullscreen triangle; g_vs already bound by the caller)
     FillCB(r, 1);
@@ -636,8 +741,39 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT) {
     ID3D11ShaderResourceView* fields[2] = { r->bTrueSRV, r->bEstSRV };
     g_context->PSSetShaderResources(5, 2, fields);
     g_context->PSSetShaderResources(9, 1, &r->gainBSRV);
+    ID3D11ShaderResourceView* filt = temporal ? r->driveFiltSRV : r->driveSRV;   // debug view 7: instantaneous vs filtered
+    g_context->PSSetShaderResources(4, 1, &r->driveSRV);
+    g_context->PSSetShaderResources(10, 1, &filt);
     g_context->Draw(3, 0);
-    ID3D11ShaderResourceView* nullSrv[10] = {};
-    g_context->PSSetShaderResources(0, 10, nullSrv);
+    ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
+    g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
     if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);
+
+    // Settle hold: Desktop Duplication delivers no frames on a static desktop, so a state still settling after the last
+    // content frame would freeze mid-transition. Owe 5 tau of settle frames after new content (render.cpp asks
+    // FaldSettlePending on an acquire timeout and re-runs the layer on its own intermediate). A resume after a gap
+    // (> FALD_RESUME_GAP_MS since the last run: the desktop stood still past the hold, or the overlay was asleep) counts
+    // as new content too — the first frame after it may carry a change the pass blends from the settled state.
+    if (temporal) {
+        const unsigned int settle = FaldSettleFrames(fs.tauRiseMs, fs.tauFallMs, r->dtMs, delay);
+        if (newContent || resumed) r->settleLeft = settle;
+        else if (r->settleLeft > 0) r->settleLeft--;
+        if (r->settleLeft > settle) r->settleLeft = settle;   // tau lowered mid-hold
+    } else {
+        r->settleLeft = 0;
+    }
+}
+
+bool FaldSettlePending(const MonitorContext* ctx) {
+    const FaldResources* r = ctx ? ctx->fald : nullptr;
+    return r && r->valid && r->temporalMode != FALD_TEMPORAL_OFF && r->settleLeft > 0;
+}
+
+void FaldLayerIdle(MonitorContext* ctx) {
+    FaldResources* r = ctx ? ctx->fald : nullptr;
+    if (!r) return;
+    r->stateValid = false;
+    r->settleLeft = 0;
+    r->delayCount = 0;
+    r->lastRunQpc = 0;
 }
