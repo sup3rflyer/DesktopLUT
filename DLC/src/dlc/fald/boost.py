@@ -46,7 +46,7 @@ def build_boost_lut(points: Iterable[Sequence[float]], zones_total: int, merge_t
 def load_boost_table(path: Path | str, *, mode: str | None = None, zones_total: int | None = None,
                      merge_tol: float = MERGE_TOL) -> dict:
     """The FaldParams keywords of a ``boost_table.json`` — ``boost_lut`` plus the zone-activation statistic the table's
-    zone counts were made with (``boost_stat_gamma`` / ``boost_thr``, when the table names them). ``mode`` ("HDR" /
+    zone counts were made with (``boost_lit_*`` / ``boost_dim_*``, when the table names them). ``mode`` ("HDR" /
     "SDR") and ``zones_total`` of the run are CHECKED: the law was measured per panel AND per mode (SDR is unmeasured),
     and a fraction LUT of another lattice is meaningless. Raises ValueError on a mismatch."""
     d = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -55,7 +55,7 @@ def load_boost_table(path: Path | str, *, mode: str | None = None, zones_total: 
     if zones_total is not None and int(d.get("zones_total", zones_total)) != int(zones_total):
         raise ValueError(f"boost table {path} is for {d.get('zones_total')} zones, the run has {zones_total}")
     kw: dict = {"boost_lut": load_boost_lut(path, merge_tol)}
-    for k in ("boost_stat_gamma", "boost_thr"):
+    for k in ("boost_lit_nits", "boost_lit_frac", "boost_dim_nits", "boost_dim_frac"):
         if d.get(k) is not None:
             kw[k] = float(d[k])
     return kw

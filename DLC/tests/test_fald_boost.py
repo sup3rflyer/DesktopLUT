@@ -115,18 +115,18 @@ def test_table_file_and_params_round_trip(tmp_path):
                                                                 {"N": 1000, "boost": 1.0}]}))
     lut = load_boost_lut(path)
     assert [round(b, 3) for _, b in lut] == [1.165, 1.06, 1.0]
-    p = replace(FaldParams(), boost_lut=lut, boost_thr=0.1, boost_stat_gamma=0.6)
+    p = replace(FaldParams(), boost_lut=lut, boost_lit_nits=0.7, boost_dim_frac=0.25)
     q = params_from_dict(json.loads(json.dumps(params_dict(p))))
-    assert q.boost_lut == lut and q.boost_thr == 0.1 and q.boost_stat_gamma == 0.6
+    assert q.boost_lut == lut and q.boost_lit_nits == 0.7 and q.boost_dim_frac == 0.25
     assert params_from_dict({"boost_lut": []}).boost_lut == ()
 
 
 def test_table_loader_checks_mode_and_lattice(tmp_path):
     path = tmp_path / "boost_table.json"
-    path.write_text(json.dumps({"mode": "HDR", "zones_total": 2304, "boost_stat_gamma": 0.5, "boost_thr": 0.09,
+    path.write_text(json.dumps({"mode": "HDR", "zones_total": 2304, "boost_lit_nits": 0.6, "boost_dim_frac": 0.2,
                                 "rows": [{"N": 100, "boost": 1.165}, {"N": 1000, "boost": 1.0}]}))
     kw = load_boost_table(path, mode="HDR", zones_total=2304)
-    assert kw["boost_thr"] == 0.09 and kw["boost_stat_gamma"] == 0.5 and len(kw["boost_lut"]) == 2
+    assert kw["boost_lit_nits"] == 0.6 and kw["boost_dim_frac"] == 0.2 and len(kw["boost_lut"]) == 2
     with pytest.raises(ValueError, match="measured in HDR"):
         load_boost_table(path, mode="SDR", zones_total=2304)
     with pytest.raises(ValueError, match="zones"):
@@ -141,6 +141,9 @@ def test_activation_rule_on_the_discriminating_reads(boosted):
     count = lambda shapes: round(m.active_zone_fraction(m.render(shapes)) * n)
     dim, ten = (85,) * 3, (307,) * 3
     assert count([BLACK, (ten, rect(2400, 0, 3, 2160))]) == 48
+    assert count([BLACK, (ten, rect(2400, 0, 1, 2160))]) == 48                      # r9d: a 1-px 10-nit column
+    assert count([BLACK, ((153,) * 3, rect(2400, 0, 2, 2160))]) == 48             # r9d: 2 px at 1 nit (PQ10 153)
+    assert count([BLACK, (dim, rect(640, 0, 12, 2160))]) == 0 and count([BLACK, (dim, rect(640, 0, 24, 2160))]) == 48
     assert count([BLACK, (dim, rect(640, 0, 10, 2160))]) == 0
     assert count([BLACK, (dim, rect(0, 0, 3840, 11))]) == 48
     assert count([((16,) * 3, FULL)]) == 0 and count([((32,) * 3, FULL)]) == n

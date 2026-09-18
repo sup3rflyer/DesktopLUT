@@ -182,16 +182,21 @@ class FaldParams:
     # 10.3-11.0 %). Level-independent, instant, LED-side (the code-0 leak scales the same) and NOT part of the
     # panel's own estimate, so it multiplies B_true only. boost_lut = ((zone_fraction_lo, boost), ...) ascending, a
     # STEP function (the last entry with lo <= fraction applies); () = no boost (every fit before 2026-09-18).
-    # ZONE ACTIVATION (adversarial review 2026-09-18, 102 reads re-derived at FULL resolution): a zone is non-black when
-    # the per-zone MEAN of nits^boost_stat_gamma of the brightest channel exceeds boost_thr. The reads admit gamma
-    # 0.455..0.9 (0.5: threshold window 0.0735..0.109): a full PQ10 code-16 surround (0.0054 nits) is black, code 32 is
-    # not; an 11-px 0.2-nit band in a 45-px zone activates it, a 10-px 0.2-nit sliver of an 80-px zone and 2-px lines do
-    # not, a 3-px 10-nit column does (SUR:c:frame160 vs L100:frame160). A mean of LINEAR light (gamma 1) and a mean of
-    # PQ CODE are both ruled out at full resolution (the PQ-code rule only passed through the scale-5 raster). The exact
-    # statistic is NOT pinned: probe phase `zonerule` (thin slivers at 10 / 100 / 923 nits on the N = 234 frame).
+    # ZONE ACTIVATION (probe phase r9d, 2026-09-18 late; replaces the mean-of-nits^gamma rule of the first commit, which
+    # the same probe refuted: a 1-px 10-nit column and a 2-px 1-nit column through a zone DO activate it, while at
+    # 0.2 nits it takes 16 px of an 80-px zone (14 px does not) - no power-law mean satisfies both). Two criteria, OR:
+    #   LIT: the zone holds content above boost_lit_nits (between 0.2 and 1 nit measured; 0.5 = the LED-on level) on
+    #        more than boost_lit_frac of its pixels (smallest tested: 1.25 %, a 1-px column; 0 = any raster pixel);
+    #   DIM: more than boost_dim_frac of its pixels (17.5 % no, 20 % yes -> 0.19) are above boost_dim_nits (a PQ10
+    #        code-16 field, 0.0054 nits, is black; code 32, 0.0216 nits, is not -> 0.011).
+    # Also consistent with: 2-px 0.2-nit lines (4.4 %) and a 10-px 0.2-nit sliver (12.5 %) inactive, an 11-px band of a
+    # 45-px zone (24 %) active, a 3-px 10-nit column active. Evaluated on the scale-5 raster: widths quantise to 5 px
+    # (a 16-px dim sliver renders as 3 of 16 = 18.75 % and is missed). Untested: a single bright PIXEL (star field).
     boost_lut: tuple[tuple[float, float], ...] = ()
-    boost_stat_gamma: float = 0.5
-    boost_thr: float = 0.085
+    boost_lit_nits: float = 0.5
+    boost_lit_frac: float = 0.0
+    boost_dim_nits: float = 0.011
+    boost_dim_frac: float = 0.19
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
 
@@ -538,14 +543,13 @@ class FaldModel:
         return self._flat
 
     def active_zone_fraction(self, img: np.ndarray) -> float:
-        """Fraction of the zones the firmware counts as NON-BLACK for the black-frame boost: per-zone mean of
-        nits^boost_stat_gamma (brightest channel) above ``boost_thr`` (see the ``boost_lut`` field). Evaluated on the
-        reduced-resolution raster: a feature thinner than ``scale`` px is inflated to one reduced pixel by
-        :meth:`render` — within the rule's measured margins for the 2026-09-18 reads, not in general."""
+        """Fraction of the zones the firmware counts as NON-BLACK for the black-frame boost (the LIT-or-DIM rule of the
+        ``boost_lut`` field), on the reduced-resolution raster."""
         p = self.p
-        s = np.power(np.maximum(np.max(img, axis=0), 0.0), float(p.boost_stat_gamma))
-        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw)
-        return float((blocks.mean(axis=(1, 3)) > p.boost_thr).mean())
+        blocks = np.max(img, axis=0).reshape(p.rows, self.ch, p.cols, self.cw)
+        lit = (blocks > p.boost_lit_nits).mean(axis=(1, 3)) > p.boost_lit_frac
+        dim = (blocks > p.boost_dim_nits).mean(axis=(1, 3)) > p.boost_dim_frac
+        return float((lit | dim).mean())
 
     def boost_of_fraction(self, frac: float) -> float:
         b = 1.0
