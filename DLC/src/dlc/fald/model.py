@@ -185,15 +185,15 @@ class FaldParams:
     # ZONE ACTIVATION (probe phase r9d, 2026-09-18 late; replaces the mean-of-nits^gamma rule of the first commit, which
     # the same probe refuted: a 1-px 10-nit column and a 2-px 1-nit column through a zone DO activate it, while at
     # 0.2 nits it takes 16 px of an 80-px zone (14 px does not) - no power-law mean satisfies both). Two criteria, OR:
-    #   LIT: the zone holds content above boost_lit_nits (between 0.2 and 1 nit measured; 0.5 = the LED-on level) on
-    #        more than boost_lit_frac of its pixels (smallest tested: 1.25 %, a 1-px column; 0 = any raster pixel);
+    #   LIT: the zone holds content above boost_lit_nits (probe pixrule: 0.3 nits no, 0.4 yes) on more than
+    #        boost_lit_frac of its pixels (a single 1x1-px dot at 10 / 100 / 923 nits counts; 0 = any raster pixel);
     #   DIM: more than boost_dim_frac of its pixels (17.5 % no, 20 % yes -> 0.19) are above boost_dim_nits (a PQ10
     #        code-16 field, 0.0054 nits, is black; code 32, 0.0216 nits, is not -> 0.011).
     # Also consistent with: 2-px 0.2-nit lines (4.4 %) and a 10-px 0.2-nit sliver (12.5 %) inactive, an 11-px band of a
     # 45-px zone (24 %) active, a 3-px 10-nit column active. Evaluated on the scale-5 raster: widths quantise to 5 px
-    # (a 16-px dim sliver renders as 3 of 16 = 18.75 % and is missed). Untested: a single bright PIXEL (star field).
+    # (a 16-px dim sliver renders as 3 of 16 = 18.75 % and is missed).
     boost_lut: tuple[tuple[float, float], ...] = ()
-    boost_lit_nits: float = 0.5
+    boost_lit_nits: float = 0.35          # probe pixrule: a 2-px column at 0.3 nits does not count, at 0.4 it does
     boost_lit_frac: float = 0.0
     boost_dim_nits: float = 0.011
     boost_dim_frac: float = 0.19
