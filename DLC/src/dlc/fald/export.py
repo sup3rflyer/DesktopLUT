@@ -121,7 +121,10 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
     return {"path": str(path), "bytes": len(buf), "k_true_shape": kt.shape, "k_est_shape": ke.shape,
             "curve_n": len(curve), "header_ints": header, "header_floats": floats,
             "format": fmt, "header_bytes": {"FLD1": 128, "FLD2": 160, "FLD3": 192}[fmt],
-            "transfer": p.transfer, "sdr_gamma": float(p.sdr_gamma) if v3 else None}
+            "transfer": p.transfer, "sdr_gamma": float(p.sdr_gamma) if v3 else None,
+            # the black-frame LED boost (FaldParams.boost_lut) is NOT in the panel file yet (work guide C12): the shader
+            # runs this fit's kernels without the boost term, i.e. it over-brightens lit interiors on mostly-black frames
+            "boost_lut_steps": len(p.boost_lut), "boost_in_file": False}
 
 
 def main(argv=None):

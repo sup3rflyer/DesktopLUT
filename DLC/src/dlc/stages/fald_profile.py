@@ -1104,7 +1104,24 @@ def phase_fit(s: Session, result: StageResult) -> None:
     if k0_block:
         result.block("k0_arg", k0_block)
         return
-    base = g.base_params(**({"drive_curve": [tuple(x) for x in dc]} if dc else {}), **({"chan_weights": tuple(cw)} if cw else {}))
+    # black-frame LED boost (work guide P9, FaldParams.boost_lut): --boost-table, remembered by the run. Without one the
+    # fit treats black-background reads (leaks, slivers, peak windows) and grey-field rings as ONE regime.
+    boost_table = getattr(s.args, "boost_table", None) or s.st["fald"].get("boost_table")
+    boost_kw: dict[str, Any] = {}
+    if boost_table and str(boost_table).lower() != "none":
+        from ..fald.boost import load_boost_table
+        try:
+            boost_kw = load_boost_table(boost_table, mode=str(s.st["fald"].get("mode") or s.args.mode), zones_total=g.cols * g.rows)
+        except (OSError, ValueError) as exc:
+            result.block("boost_table", str(exc))
+            return
+        s.st["fald"]["boost_table"] = str(Path(boost_table).resolve())
+        result.action(f"black-frame LED boost: {len(boost_kw['boost_lut'])} steps from {boost_table}")
+    elif boost_table:
+        s.st["fald"].pop("boost_table", None)
+    result.metrics["boost_table"] = s.st["fald"].get("boost_table")
+    base = g.base_params(**({"drive_curve": [tuple(x) for x in dc]} if dc else {}), **({"chan_weights": tuple(cw)} if cw else {}),
+                         **boost_kw)
     quick = bool(s.args.quick)
     log = (lambda *a: print(*a, file=sys.stderr, flush=True)) if s.args.verbose else (lambda *a: None)
     t0 = time.time()
@@ -1123,6 +1140,7 @@ def phase_fit(s: Session, result: StageResult) -> None:
     payload = {"stage_a": res["stage_a"], "stage_b": res["stage_b"], "knots": res["knots"], "params": res["params"],
                "estimate": res.get("estimate"), "params_exp": res.get("params_exp"), "params_knots": res.get("params_knots"),
                "drive_curve_source": "measured" if dc else "power_law_fit", "k0": None if dc else k0,
+               "boost_table": s.st["fald"].get("boost_table"),
                "drive_k_consistency": res.get("drive_k_consistency"), "stage_a_checks": res.get("stage_a_checks"),
                "area0_source": res.get("area0_source"),
                "area0_stage_a": res.get("area0_stage_a"), "area0_stage_b": res.get("area0_stage_b"),
@@ -1382,6 +1400,10 @@ def phase_export(s: Session, result: StageResult) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_path = (out_dir / f"{short}_{mode}_fald_panel.bin").resolve()
     info = export_panel_params(FaldModel(params), bin_path)
+    if info.get("boost_lut_steps"):
+        result.anomaly("boost_not_in_file", f"the fit carries a black-frame LED boost LUT ({info['boost_lut_steps']} steps) the panel "
+                       "file cannot hold yet (work guide C12): the shader runs these kernels WITHOUT the boost term — correct on "
+                       "non-black frames, over-brightening lit interiors by up to the boost on mostly-black frames", "medium")
     json_path = out_dir / f"{short}_{mode}_fald_fit_result.json"
     atomic_write_text(json_path, json.dumps({**fit, "params": fit["params"], "exported_bin": str(bin_path), "export_info": info}, indent=1, default=str))
     result.add_artifact(bin_path)
@@ -1509,7 +1531,7 @@ def acm_off_anomaly(mode: str, mon: dict[str, Any]) -> Optional[tuple[str, str, 
 
 
 def phase_verify(s: Session, result: StageResult) -> None:
-    from ..fald.correct import correct_image
+    from ..fald.correct import correct_image, shader_model
     from ..fald.model import FaldModel
     from ..fald.profile import params_from_dict, plan_verify, plan_verify_extended, ref_means
     g = _geometry(s.st)
@@ -1531,6 +1553,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
     result.metrics["bin"] = bin_path
     result.metrics["fit_json"] = str(fit_src)
     model = FaldModel(params)
+    shader = shader_model(model)             # the GPU corrects boost-blind until the panel file carries the LUT (C12)
     ctl = s.controller
     try:
         r = ctl.call("runtime.set_fald_params", {"monitor": s.args.monitor, "mode": mode, "params_path": bin_path})
@@ -1564,7 +1587,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
             img = model.render(p.shapes)
             cm = g.canvas_meter(params)
             pred_off = float(model.meter_img(img, cm).sum())
-            pred_on = float(model.meter_img(correct_image(model, img)["req"], cm).sum())
+            pred_on = float(model.meter_img(correct_image(shader, img)["req"], cm).sum())
             rows.append({"name": p.name, "kind": p.kind, "ref": p.ref, "off": y_off[1] if y_off else None,
                          "id": y_id[1] if y_id else None, "on": y_on[1] if y_on else None,
                          "pred_off": pred_off, "pred_on": pred_on, "meta": p.meta})
@@ -1698,6 +1721,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lum-fade", default=None, dest="lum_fade",
                         help="export: pixel-luminance fade LO,HI in as-if-white nits (chosen from the fit's fade_report) or "
                              "'keep' (the fit's own); REQUIRED for an SDR (gamma) panel file")
+    parser.add_argument("--boost-table", default=None, dest="boost_table",
+                        help="fit: the panel's black-frame LED boost table (boost_table.json of the inside probe; 'none' forgets the run's). The model then scales B_true by the step LUT of the frame's non-black zone count")
     parser.add_argument("--extended", action="store_true", help="verify: add 1-nit rings, thin bars and steep ramps to the set")
     parser.add_argument("--bin", default=None, help="verify: read through THIS panel file instead of the exported one (A/B)")
     parser.add_argument("--fit-json", default=None, dest="fit_json", help="verify with --bin: that file's fit result JSON (model columns)")

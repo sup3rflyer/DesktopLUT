@@ -176,6 +176,22 @@ class FaldParams:
                                          #   its fitted domain (drive floor -> flat = 0, reference pedestal 0) and the
                                          #   dark-halo probe (doc S33, 2026-09-12) showed it wrong in sign there: the
                                          #   owner's dark band around white text on 0.5-nit grey. lo = hi = 0 -> off.
+    # Black-frame LED boost (HW 2026-09-18, work guide "HW 2026-09-18" items 2/2a, results/fald_inside_2026-09-18/
+    # boost_table.json): the firmware multiplies every LED drive by a staircase function of the NUMBER OF NON-BLACK
+    # ZONES of the frame (PA32UCXR HDR: x1.165 up to ~6 % of the zones, 1.0 from ~37 %, a dead band = 1.0 at
+    # 10.3-11.0 %). Level-independent, instant, LED-side (the code-0 leak scales the same) and NOT part of the
+    # panel's own estimate, so it multiplies B_true only. boost_lut = ((zone_fraction_lo, boost), ...) ascending, a
+    # STEP function (the last entry with lo <= fraction applies); () = no boost (every fit before 2026-09-18).
+    # ZONE ACTIVATION (adversarial review 2026-09-18, 102 reads re-derived at FULL resolution): a zone is non-black when
+    # the per-zone MEAN of nits^boost_stat_gamma of the brightest channel exceeds boost_thr. The reads admit gamma
+    # 0.455..0.9 (0.5: threshold window 0.0735..0.109): a full PQ10 code-16 surround (0.0054 nits) is black, code 32 is
+    # not; an 11-px 0.2-nit band in a 45-px zone activates it, a 10-px 0.2-nit sliver of an 80-px zone and 2-px lines do
+    # not, a 3-px 10-nit column does (SUR:c:frame160 vs L100:frame160). A mean of LINEAR light (gamma 1) and a mean of
+    # PQ CODE are both ruled out at full resolution (the PQ-code rule only passed through the scale-5 raster). The exact
+    # statistic is NOT pinned: probe phase `zonerule` (thin slivers at 10 / 100 / 923 nits on the N = 234 frame).
+    boost_lut: tuple[tuple[float, float], ...] = ()
+    boost_stat_gamma: float = 0.5
+    boost_thr: float = 0.085
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
 
@@ -521,15 +537,43 @@ class FaldModel:
             self._flat_key = key
         return self._flat
 
-    def backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+    def active_zone_fraction(self, img: np.ndarray) -> float:
+        """Fraction of the zones the firmware counts as NON-BLACK for the black-frame boost: per-zone mean of
+        nits^boost_stat_gamma (brightest channel) above ``boost_thr`` (see the ``boost_lut`` field). Evaluated on the
+        reduced-resolution raster: a feature thinner than ``scale`` px is inflated to one reduced pixel by
+        :meth:`render` — within the rule's measured margins for the 2026-09-18 reads, not in general."""
+        p = self.p
+        s = np.power(np.maximum(np.max(img, axis=0), 0.0), float(p.boost_stat_gamma))
+        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw)
+        return float((blocks.mean(axis=(1, 3)) > p.boost_thr).mean())
+
+    def boost_of_fraction(self, frac: float) -> float:
+        b = 1.0
+        for lo, val in self.p.boost_lut:
+            if frac + 1e-12 < lo:
+                break
+            b = float(val)
+        return b
+
+    def led_boost(self, img: np.ndarray) -> float:
+        """The black-frame LED boost of the frame ``img`` (1.0 without a ``boost_lut``)."""
+        if not self.p.boost_lut:
+            return 1.0
+        return self.boost_of_fraction(self.active_zone_fraction(img))
+
+    def backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None,
+                   boost: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
         """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map (``drives_est``: a separate map
-        for the estimate kernel, see :meth:`_raw_backlights`). With ``flat_norm`` (default)
+        for the estimate kernel, see :meth:`_raw_backlights`). ``boost`` = the frame's black-frame LED boost
+        (:meth:`led_boost`): it multiplies B_true only — the panel's estimate does not know it. With ``flat_norm`` (default)
         both fields are divided by their flat-lattice response: the native panel shows a uniform field
         as uniform (posmatrix 2026-09-11: no sub-cell position dependence), so whatever the estimate does
         at cell sub-positions and at the frame border must cancel for uniform input. Without it the
         mean-normalised estimate kernel left a ~2 % sub-cell sawtooth and a border ramp on a flat field
         (the grid the owner saw on a white window, 2026-09-12)."""
         b_true, b_est = self._raw_backlights(drives, drives_est)
+        if boost != 1.0:
+            b_true = b_true * float(boost)
         if not self.p.flat_norm:
             return b_true, b_est
         f_true, f_est = self.flat_response()
@@ -555,7 +599,8 @@ class FaldModel:
         """Forward model on a rendered request image ``img`` (3, h, w) of as-if-white nits."""
         p = self.p
         drives = self.cell_drives(img)
-        b_true, b_est = self.backlights(drives)
+        boost = self.led_boost(img)
+        b_true, b_est = self.backlights(drives, boost=boost)
         lmax = p.white_nits * np.array(p.chan_weights)[:, None, None]
         # per-channel target luminance: a code's PQ decode is its "as-if-white" nits, the channel
         # contributes its share of white → target_ch = w_ch · EOTF(code_ch)
@@ -564,7 +609,7 @@ class FaldModel:
         t_req = target / np.maximum(lmax * np.maximum(b_est, 1e-6)[None], 1e-9)
         t = np.clip(t_req, 0.0, 1.0)
         y = lmax * b_true[None] * t + lmax * b_true[None] * p.tmin_vec()[:, None, None]   # per-channel pedestal
-        return {"img": img, "drives": drives, "b_true": b_true, "b_est": b_est, "t": t, "y": y}
+        return {"img": img, "drives": drives, "b_true": b_true, "b_est": b_est, "t": t, "y": y, "boost": boost}
 
     def meter(self, shapes: Sequence[Shape], meter_px: tuple[float, float],
               aperture_px: Optional[float] = None) -> np.ndarray:

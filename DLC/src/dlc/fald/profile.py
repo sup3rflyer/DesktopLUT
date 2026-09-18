@@ -869,7 +869,7 @@ def fade_report(params: FaldParams, items, fades: Sequence[Sequence[float]] = FA
 
     A fade whose ``hi`` is at or below every pixel of an item's image (field and window) weights the whole image 1 —
     exactly the no-fade correction — so that result is reused (the per-fade cost is the dim items only)."""
-    from .correct import correct_image
+    from .correct import correct_image, shader_model
     t0 = time.time()
     its = [it for it in items if it.get("level") is not None and it.get("base") is not None]
     fades = [(float(lo), float(hi)) for lo, hi in fades]
@@ -908,7 +908,7 @@ def fade_report(params: FaldParams, items, fades: Sequence[Sequence[float]] = FA
         k = (skey(shapes), tuple(meter), eff)
         if k not in on_cache:
             m = model_for(eff)
-            on_cache[k] = float(m.meter_img(correct_image(m, img)["req"], tuple(meter)).sum())
+            on_cache[k] = float(m.meter_img(correct_image(shader_model(m), img)["req"], tuple(meter)).sum())
         return on_cache[k]
 
     rows = []
@@ -1685,6 +1685,10 @@ def params_from_dict(d: dict[str, Any]) -> FaldParams:
     kw = dict(d)
     if "drive_curve" in kw:
         kw["drive_curve"] = [tuple(x) for x in kw["drive_curve"]]
+    if kw.get("boost_lut"):
+        kw["boost_lut"] = tuple((float(a), float(b)) for a, b in kw["boost_lut"])
+    elif "boost_lut" in kw:
+        kw["boost_lut"] = ()
     for k in ("chan_weights", "tmin_rgb", "est_knot_cells", "est_knot_logw", "ped_chroma_lum_fade"):
         if kw.get(k) is not None:
             kw[k] = tuple(kw[k])

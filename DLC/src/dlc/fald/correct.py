@@ -72,7 +72,27 @@ def load_fitted_params(path: Path) -> FaldParams:
     kw = dict(fit["params"])
     kw["drive_curve"] = [tuple(x) for x in kw["drive_curve"]]
     kw["chan_weights"] = tuple(kw["chan_weights"])
+    kw["boost_lut"] = tuple((float(a), float(b)) for a, b in (kw.get("boost_lut") or ()))
     return FaldParams(**{k: v for k, v in kw.items() if k in FaldParams.__dataclass_fields__})
+
+
+# The panel file (dlc.fald.export) cannot carry the black-frame LED boost yet (work guide C12): the SHADER corrects
+# boost-blind whatever the fit knows. Flip when the file + HLSL carry the LUT.
+BOOST_IN_PANEL_FILE = False
+
+
+def shader_model(model: FaldModel) -> FaldModel:
+    """The model the running SHADER implements for ``model``'s fit: the same parameters without the boost LUT while
+    the panel file cannot hold it. Predict a layer-ON read as ``model.meter_img(correct_image(shader_model(model),
+    img)["req"], meter)`` — the boost-blind correction seen through the boosted panel."""
+    if BOOST_IN_PANEL_FILE or not model.p.boost_lut:
+        return model
+    cached = getattr(model, "_shader_model", None)
+    if cached is None or cached[0] != model.p.__dict__:
+        from dataclasses import replace
+        cached = (dict(model.p.__dict__), FaldModel(replace(model.p, boost_lut=())))
+        model._shader_model = cached
+    return cached[1]
 
 
 def reference_pedestal(model: FaldModel, img: np.ndarray) -> np.ndarray:
@@ -136,8 +156,12 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     gain = np.ones_like(img[0])
     for _ in range(max(1, iters)):
         drives = model.cell_drives(cur)
+        # black-frame LED boost (FaldParams.boost_lut): the panel counts the non-black zones of the frame it RECEIVES —
+        # this round's request. The pedestal term can floor dim pixels and move the count (review 2026-09-18: <= 1 zone
+        # with the shipped lum-fade, ~200 zones on a code-20 surround without it), so it is re-read every round.
+        boost = model.led_boost(cur)
         d_true, d_est = drive_filter(drives) if drive_filter is not None else (drives, drives)
-        b_true, b_est = model.backlights(d_true, d_est)
+        b_true, b_est = model.backlights(d_true, d_est, boost=boost)
         b_true = np.maximum(b_true, 0.0)
         gain = np.clip(b_est / np.maximum(b_true, 1e-9), gain_clip[0], gain_clip[1])
         # deep-dark fade: trust the model only where the panel's estimate is not ~zero (FaldParams.fade_*)
@@ -188,7 +212,8 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         req = np.maximum(u * g_eff[None], 0.0)                  # ONE scale per pixel: hue cannot rotate
         clipped = np.broadcast_to((g_eff < gain - 1e-12)[None], req.shape)   # brightening limited by the knee
         cur = req
-    return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives}
+    return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives,
+            "boost": boost}
 
 
 def corrected_code(value_nits: float, bits: int = 10) -> int:
@@ -216,7 +241,7 @@ def corrected_patch_code(model: FaldModel, shapes, meter_px: tuple[float, float]
     for _ in range(max(1, iters)):
         frame = model.render(list(shapes) + [(codes, patch_rect)])
         drives = model.cell_drives(frame)
-        b_true, b_est = model.backlights(drives)
+        b_true, b_est = model.backlights(drives, boost=model.led_boost(frame))
         g = (b_est / np.maximum(b_true, 1e-9))[mask]
         ped = (p.white_nits * np.maximum(b_true, 0.0) * p.tmin)[mask]      # as-if-white (luminance)
         mch = pedestal_multipliers(model)[:, None]                         # pedestal colour in effect
