@@ -366,7 +366,7 @@ void UpdateColorCorrectionControls() {
         sdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldSdrPath, sdrCC.fald.paramsPath.c_str());
     const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 8 ? shown.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 9 ? shown.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= 2 ? shown.temporalMode : 0), 0);
     wchar_t tauBuf[32];
@@ -380,6 +380,23 @@ void UpdateColorCorrectionControls() {
     }
     if (GetFocus() != g_gui.hwndFaldDelay)
         SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(shown.delayFrames).c_str());
+    // starfield balancing row (work guide S1)
+    SendMessage(g_gui.hwndFaldStarEnable, BM_SETCHECK, shown.star.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    {
+        const struct { HWND edit; float v; } starEdits[] = { { g_gui.hwndFaldStarEven, shown.star.even },
+            { g_gui.hwndFaldStarStrength, shown.star.strength }, { g_gui.hwndFaldStarSigma, shown.star.targetSigma } };
+        for (const auto& e : starEdits) {
+            if (GetFocus() == e.edit) continue;   // don't fight a value being typed
+            _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), e.v);
+            SetWindowText(e.edit, tauBuf);
+        }
+    }
+    if (GetFocus() != g_gui.hwndFaldStarKeep) {
+        _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.star.keepNits);
+        SetWindowText(g_gui.hwndFaldStarKeep, tauBuf);
+    }
+    if (GetFocus() != g_gui.hwndFaldStarReach)
+        SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(shown.star.evenReach).c_str());
     // The layer runs in the overlay path only: in DWM hook mode the checkboxes are inert, so grey them out.
     EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldSdrEnable, !g_dwmHookMode.load());
@@ -389,6 +406,12 @@ void UpdateColorCorrectionControls() {
     EnableWindow(g_gui.hwndFaldTauRise, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldTauFall, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldDelay, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldStarEnable, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldStarEven, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldStarKeep, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldStarStrength, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldStarReach, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldStarSigma, !g_dwmHookMode.load());
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1301,7 +1324,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= 8) ? (unsigned int)sel : 0u;   // one entry per debug view 0..8
+                    unsigned int mode = (sel >= 0 && sel <= 9) ? (unsigned int)sel : 0u;   // one entry per debug view 0..9
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads these
                         FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
@@ -1388,6 +1411,85 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                     }
                     SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(v).c_str());
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        // Starfield balancing rows (EXPERIMENT, work guide S1): enable + even / spread σ / keep nits / strength / mean reach, both modes at
+        // once like View. Persisted. The other parameters are INI / pipe only.
+        case ID_CORR_FALD_STAR_ENABLE:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    bool on = (SendMessage(g_gui.hwndFaldStarEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        FaldSlot(true).star.enabled = on;
+                        FaldSlot(false).star.enabled = on;
+                    }
+                    ApplyFaldSharedSettingChange();
+                    if (on)
+                        SetStatus(L"FALD starfield balancing on (experimental): it changes scattered highlights on purpose - judge by eye");
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_STAR_EVEN:
+        case ID_CORR_FALD_STAR_KEEP:
+        case ID_CORR_FALD_STAR_STRENGTH:
+        case ID_CORR_FALD_STAR_SIGMA:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    const int id = LOWORD(wParam);
+                    HWND edit = (id == ID_CORR_FALD_STAR_EVEN) ? g_gui.hwndFaldStarEven
+                              : (id == ID_CORR_FALD_STAR_KEEP) ? g_gui.hwndFaldStarKeep
+                              : (id == ID_CORR_FALD_STAR_SIGMA) ? g_gui.hwndFaldStarSigma : g_gui.hwndFaldStarStrength;
+                    const bool isKeep = (id == ID_CORR_FALD_STAR_KEEP);                  // keep_nits 0..10000, shown %.1f
+                    const float vMax = isKeep ? 10000.0f : (id == ID_CORR_FALD_STAR_SIGMA) ? 4.0f : 1.0f;   // target_sigma 0..4, the others 0..1
+                    const float tol = (isKeep ? 0.05f : 0.005f) + 1e-6f;                 // the display rounding
+                    wchar_t buf[32];
+                    GetWindowText(edit, buf, 32);
+                    float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                    if (!(v >= 0.0f)) v = 0.0f;
+                    if (v > vMax) v = vMax;
+                    auto field = [id](FaldStarfieldSettings& st) -> float& {
+                        return (id == ID_CORR_FALD_STAR_EVEN) ? st.even : (id == ID_CORR_FALD_STAR_KEEP) ? st.keepNits
+                             : (id == ID_CORR_FALD_STAR_SIGMA) ? st.targetSigma : st.strength;
+                    };
+                    // Losing the focus is not an edit: write only when the typed value differs from the stored one of the
+                    // mode the row shows by more than the display rounding. Tabbing through must neither quantise a
+                    // pipe-set 0.333 to 0.33 nor copy the shown mode's value into the other mode.
+                    bool changed = false;
+                    float stored = 0.0f;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        stored = field(FaldSlot(CurrentMonitorIsHDR()).star);
+                        if (fabsf(v - stored) > tol) {
+                            for (bool isHDR : { true, false }) field(FaldSlot(isHDR).star) = v;   // a real edit: the row sets both modes
+                            changed = true;
+                        }
+                    }
+                    wchar_t shownBuf[32];
+                    _swprintf_s_l(shownBuf, 32, isKeep ? L"%.1f" : L"%.2f", GetCLocale(), changed ? v : stored);
+                    SetWindowText(edit, shownBuf);
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_STAR_REACH:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    wchar_t buf[32];
+                    GetWindowText(g_gui.hwndFaldStarReach, buf, 32);
+                    int n = _wtoi(buf);
+                    unsigned int v = n < 0 ? 0u : (n > (int)FALD_STAR_EVEN_REACH_MAX ? FALD_STAR_EVEN_REACH_MAX : (unsigned int)n);
+                    bool changed = false;                      // (same rule as the three fields above: focus loss is no edit)
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        if (FaldSlot(CurrentMonitorIsHDR()).star.evenReach != v) {
+                            for (bool isHDR : { true, false }) FaldSlot(isHDR).star.evenReach = v;
+                            changed = true;
+                        }
+                    }
+                    SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(v).c_str());
                     if (changed) ApplyFaldSharedSettingChange();
                 }
             }

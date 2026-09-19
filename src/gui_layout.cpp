@@ -693,7 +693,7 @@ void CreateGUILayout(HWND hwnd) {
     // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
     ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental, overlay only)", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 126, panel2, nullptr, nullptr, nullptr);
+        innerX, innerY, groupW, 180, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
     // Row 1: HDR
@@ -742,6 +742,7 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Per-channel vs white (x100)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Temporal settling (red rising)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Boost zone map (non-black zones)");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Starfield zones (blue pulled, red lifted)");
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
 
     // Per-channel pedestal (2026-09-13, DLC work guide H2): the panel file (FLD2) carries the measured colour of the
@@ -785,7 +786,47 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 396, faldTY, 30, h, panel2, (HMENU)ID_CORR_FALD_DELAY, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldDelay);
 
-    g_gui.contentHeight[2] = innerY + 126 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag rows)
+    // Rows 5-6: starfield balancing (EXPERIMENT, 2026-09-19, DLC work guide ticket S1; rules = the module docstring of
+    // dlc/fald/starfield.py): a field of scattered specks drives its zones unevenly (zone-shaped haze patches); the option
+    // COMPRESSES the star-like peaks that stand out of their neighbourhood. even = the log-domain pull toward the target;
+    // spread \u03C3 = target_sigma: the target sits this many standard deviations of ln peak above the local mean (default 0 =
+    // the geometric mean; a tunable); keep nits = keep_nits: the target never falls below it (specks up to ~100 nits make
+    // no visible haze — this is what keeps a dim, heavy-tailed star field from being flattened); strength = the overall blend; mean reach
+    // = even_reach, the zones (each side) the local mean looks at. It changes the content on purpose. Applies to both modes
+    // like View; lift and the remaining parameters are INI / pipe only (runtime.fald_starfield).
+    int faldSY = innerY + 126;
+    g_gui.hwndFaldStarEnable = CreateWindow(L"BUTTON", L"Starfield",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 10, faldSY, 72, h, panel2, (HMENU)ID_CORR_FALD_STAR_ENABLE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldStarEnable);
+    ctrl = CreateWindow(L"STATIC", L"even", WS_CHILD, innerX + 88, faldSY + 2, 28, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldStarEven = CreateWindow(L"EDIT", L"0.80", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 118, faldSY, 38, h, panel2, (HMENU)ID_CORR_FALD_STAR_EVEN, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldStarEven);
+    ctrl = CreateWindow(L"STATIC", L"spread \u03C3", WS_CHILD, innerX + 166, faldSY + 2, 48, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldStarSigma = CreateWindow(L"EDIT", L"0.00", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 216, faldSY, 38, h, panel2, (HMENU)ID_CORR_FALD_STAR_SIGMA, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldStarSigma);
+    ctrl = CreateWindow(L"STATIC", L"keep nits", WS_CHILD, innerX + 264, faldSY + 2, 50, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldStarKeep = CreateWindow(L"EDIT", L"100", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 316, faldSY, 46, h, panel2, (HMENU)ID_CORR_FALD_STAR_KEEP, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldStarKeep);
+    int faldS2Y = innerY + 153;
+    ctrl = CreateWindow(L"STATIC", L"strength", WS_CHILD, innerX + 88, faldS2Y + 2, 48, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldStarStrength = CreateWindow(L"EDIT", L"1.00", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 138, faldS2Y, 38, h, panel2, (HMENU)ID_CORR_FALD_STAR_STRENGTH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldStarStrength);
+    ctrl = CreateWindow(L"STATIC", L"mean reach", WS_CHILD, innerX + 186, faldS2Y + 2, 62, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldStarReach = CreateWindow(L"EDIT", L"8", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 250, faldS2Y, 30, h, panel2, (HMENU)ID_CORR_FALD_STAR_REACH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldStarReach);
+
+    g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);
@@ -794,6 +835,11 @@ void CreateGUILayout(HWND hwnd) {
     SetNumericEdit(g_gui.hwndFaldTauRise, 1);
     SetNumericEdit(g_gui.hwndFaldTauFall, 1);
     SetNumericEdit(g_gui.hwndFaldDelay, 0);
+    SetNumericEdit(g_gui.hwndFaldStarEven, 2);
+    SetNumericEdit(g_gui.hwndFaldStarKeep, 1);
+    SetNumericEdit(g_gui.hwndFaldStarStrength, 2);
+    SetNumericEdit(g_gui.hwndFaldStarReach, 0);
+    SetNumericEdit(g_gui.hwndFaldStarSigma, 2);
 
     // === TAB 3: Settings (initially hidden) ===
     innerY = 8;  // Reset for scroll panel

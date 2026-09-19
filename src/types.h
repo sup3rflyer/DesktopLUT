@@ -137,6 +137,12 @@ struct MovableAtomic {
 #define ID_CORR_FALD_TAU_RISE    538
 #define ID_CORR_FALD_TAU_FALL    539
 #define ID_CORR_FALD_DELAY       540
+#define ID_CORR_FALD_STAR_ENABLE 541   // Starfield rows (starfield balancing, work guide S1), apply to both modes
+#define ID_CORR_FALD_STAR_EVEN   542
+#define ID_CORR_FALD_STAR_SIGMA  543   // spread σ = target_sigma
+#define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
+#define ID_CORR_FALD_STAR_STRENGTH 545
+#define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach   (lift is INI / pipe only)
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -504,11 +510,38 @@ inline int TonemapCurveToDropdownIndex(TonemapCurve curve) {
 // Parameter file = output of DLC `python -m dlc.fald.export` (see src/fald.h); its transfer (PQ / gamma)
 // must match the mode the settings belong to. Same struct serves the GUI settings and the runtime
 // ColorCorrectionData; lives in both sdrColorCorrection and hdrColorCorrection (INI SDR_/HDR_ prefix).
+// Starfield balancing (EXPERIMENT, default off; work guide ticket S1; reference DLC dlc/fald/starfield.py
+// StarfieldParams — the defaults here are pinned equal by DLC tests/test_fald_transfer.py). A user setting, not a
+// panel property: it never goes into the panel file. Clamped by FaldStarfieldClamp (fald.h).
+struct FaldStarfieldSettings {
+    bool enabled = false;
+    float even = 0.8f;            // 0..1: how far a star-like peak above the local target is pulled onto it (log domain;
+                                  // < 1 compresses the outliers and keeps their order)
+    float lift = 0.0f;            // 0..1: how far a peak below the target is lifted (specks only; 0 = cap-only)
+    float targetGain = 1.0f;      // 0.05..2: the target relative to exp(mean + targetSigma std) of the local ln peaks
+    float targetSigma = 0.0f;     // 0..4: the target sits this many standard deviations of ln peak above the local mean
+                                  // (0 = the geometric mean = the default; a tunable: on real clips whose specks sit at
+                                  // the clip level mean + 1 std lands near the top and the haze win is lost)
+    float keepNits = 100.0f;      // 0..10000: the target never falls below this (as-if-white nits; 0 = no floor) — specks
+                                  // up to ~100 nits make no visible haze, a field below it is left bit-identical: THIS is
+                                  // what protects a dim, heavy-tailed star field from being flattened
+    unsigned int evenReach = 8;   // 0..12 zones (each side) the local mean looks at
+    float capNits = 0.0f;         // 0..10000: absolute ceiling of qualifying content (as-if-white nits); 0 = none
+    float strength = 1.0f;        // 0..1: overall blend (the live knob)
+    float areaLo = 40.0f;         // px^2 effective lit area: fully star-like at / below this ...
+    float areaHi = 160.0f;        // ... not at all at / above this
+    float peakHi = 0.0f;          // > 0: zones whose peak exceeds this (nits) are left alone (gone by 2x); 0 = no limit
+    unsigned int reach = 2;       // 0..4 zones (each side) searched for solid content
+    float nbLo = 0.15f;           // non-sparse neighbour drive: full effect at / below this ...
+    float nbHi = 0.30f;           // ... none at / above this
+};
+
 struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
     unsigned int debugMode = 0;   // 0 = correct, 1 = gain map (white 0, red +, blue -), 2 = show B_true, 3 = show B_est, 4 = identity passthrough,
-                                  // 5/6 pedestal views, 7 temporal settling, 8 black-frame boost zone map (fald_shader.h; not persisted)
+                                  // 5/6 pedestal views, 7 temporal settling, 8 black-frame boost zone map, 9 starfield balancing
+                                  // zone map (fald_shader.h; not persisted)
     unsigned int pedMode = 0;     // pedestal colour (persisted, GUI "Per-channel pedestal"): 0 = white pedestal, hue-preserving
                                   // subtraction (pre-2026-09-13 behaviour); 1 = the panel file's per-channel pedestal colour
                                   // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.
@@ -521,6 +554,9 @@ struct FaldSettings {
     float tauRiseMs = 0.0f;
     float tauFallMs = 0.0f;
     unsigned int delayFrames = 0;   // pipeline delay 0..FALD_DELAY_MAX: the filter is fed the drives of n frames ago
+    // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
+    // resource for resource and dispatch for dispatch.
+    FaldStarfieldSettings star;
 };
 
 // Tonemapping settings (HDR only)
@@ -950,6 +986,12 @@ struct GUIState {
     HWND hwndFaldTauRise = nullptr;
     HWND hwndFaldTauFall = nullptr;
     HWND hwndFaldDelay = nullptr;
+    HWND hwndFaldStarEnable = nullptr;  // Starfield rows: enable | even | spread σ | keep nits | strength | mean reach
+    HWND hwndFaldStarEven = nullptr;
+    HWND hwndFaldStarSigma = nullptr;   // "spread σ" = target_sigma
+    HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
+    HWND hwndFaldStarStrength = nullptr;
+    HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

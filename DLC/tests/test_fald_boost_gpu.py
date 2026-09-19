@@ -274,7 +274,7 @@ def test_hlsl_boost_passes_mirror_the_reference():
     part = lambda name: re.search(name + r' = R"\((.*?)\)";', src, re.S).group(1)
     common, stat, boost, conv, pixel = (part(n) for n in ("g_faldCommonSource", "g_faldStatSource", "g_faldBoostSource",
                                                           "g_faldConvSource", "g_faldPixelSource"))
-    assert "float lumFadeLo; float lumFadeHi; uint boostN; float _pad4;" in common                # CB word 34
+    assert "float lumFadeLo; float lumFadeHi; uint boostN; uint starOn;" in common                # CB word 34 (35: S1)
     assert "float boostLitNits; float boostLitFrac; float boostDimNits; float boostDimFrac;" in common   # CB words 48-51
     assert common.index("uint tempMode; uint tempInit;") < common.index("float boostLitNits;")
     for reg in ("boostLut    : register(t12)", "activeTex   : register(t13)", "boostTex    : register(t14)"):
@@ -296,7 +296,7 @@ def test_hlsl_boost_passes_mirror_the_reference():
     # C++: the CB size, the file constants, the boost-free flat-lattice pass
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 208" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h
+    assert "FALD_CB_BYTES = 272" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 68 words since S1 (starfield)
     assert "0x464C4434u" in c and "magic == FALD_MAGIC4 ? 416" in c
     assert "FillCB(r, 0, 0, false);" in c and "RunConv(r, r->driveSRV, r->driveSRV, nullptr);" in c
     assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in c     # panelfile.boost_zone_threshold's twin

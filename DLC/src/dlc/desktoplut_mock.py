@@ -44,6 +44,35 @@ def _fald_file_transfer(path: Path) -> str | None:
     return None
 
 
+# runtime.fald_starfield (C++ DoFaldStarfield, work guide S1): pipe key -> (lo, hi, integer, refusal text). The order
+# and the texts are the C++ table's, word for word; the defaults are dlc.fald.starfield.StarfieldParams'.
+_FALD_STAR_KEYS: dict[str, tuple[float, float, bool, str]] = {
+    "even": (0.0, 1.0, False, "even must be 0..1"),
+    "lift": (0.0, 1.0, False, "lift must be 0..1"),
+    "target_gain": (0.05, 2.0, False, "target_gain must be 0.05..2"),
+    "even_reach": (0.0, 12.0, True, "even_reach must be an integer 0..12"),
+    "cap_nits": (0.0, 10000.0, False, "cap_nits must be 0..10000 (0 = none)"),
+    "strength": (0.0, 1.0, False, "strength must be 0..1"),
+    "area_lo": (0.0, 1.0e6, False, "area_lo must be 0..1000000 px^2"),
+    "area_hi": (0.0, 1.0e6, False, "area_hi must be 0..1000000 px^2"),
+    "peak_hi": (0.0, 10000.0, False, "peak_hi must be 0..10000 (0 = no limit)"),
+    "reach": (0.0, 4.0, True, "reach must be an integer 0..4"),
+    "nb_lo": (0.0, 1.0, False, "nb_lo must be 0..1"),
+    "nb_hi": (0.0, 1.0, False, "nb_hi must be 0..1"),
+    "target_sigma": (0.0, 4.0, False, "target_sigma must be 0..4"),
+    "keep_nits": (0.0, 10000.0, False, "keep_nits must be 0..10000 (0 = no floor)"),
+}
+_FALD_STAR_DEFAULTS: dict[str, Any] = {"enabled": False, "even": 0.8, "lift": 0.0, "target_gain": 1.0, "target_sigma": 0.0, "keep_nits": 100.0, "even_reach": 8,
+                                       "cap_nits": 0.0, "strength": 1.0, "area_lo": 40.0, "area_hi": 160.0, "peak_hi": 0.0,
+                                       "reach": 2, "nb_lo": 0.15, "nb_hi": 0.30}
+
+
+def _fald_star(entry: dict[str, Any] | None) -> dict[str, Any]:
+    """The pair's starfield settings (defaults where never set), ints for the two reaches."""
+    st = {**_FALD_STAR_DEFAULTS, **((entry or {}).get("star") or {})}
+    return {k: (bool(v) if k == "enabled" else int(v) if k in ("even_reach", "reach") else float(v)) for k, v in st.items()}
+
+
 def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     """The fald_* keys C++ HandleStateGet puts into layers[key] for every pair."""
     entry = entry or {}
@@ -56,6 +85,10 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
                            "fald_tau_rise_ms": float(entry.get("tau_rise_ms", 0.0)),
                            "fald_tau_fall_ms": float(entry.get("tau_fall_ms", 0.0)),
                            "fald_delay_frames": int(entry.get("delay_frames", 0))}
+    # starfield balancing (2026-09-19, work guide S1; runtime.fald_starfield): the switch + every numeric field
+    star = _fald_star(entry)
+    out["fald_starfield"] = star["enabled"]
+    out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -669,9 +702,9 @@ class MockDesktopLutServer:
         if method == "runtime.fald_debug":
             mode = params.get("debug_mode"); ped = params.get("ped_mode")
             if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
-                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..8) or ped_mode (0|1)")
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..9) or ped_mode (0|1)")
             if isinstance(mode, (int, float)):
-                fs["debug_mode"] = int(min(8, max(0, mode)))
+                fs["debug_mode"] = int(min(9, max(0, mode)))
             if isinstance(ped, (int, float)):
                 fs["ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
             return self.ok({"monitor_mode": key, "debug_mode": fs.get("debug_mode", 0), "ped_mode": fs.get("ped_mode", 0),
@@ -702,6 +735,33 @@ class MockDesktopLutServer:
             rise = float(fs.get("tau_rise_ms", 0.0)); fall = float(fs.get("tau_fall_ms", 0.0)); delay = int(fs.get("delay_frames", 0))
             return self.ok({"monitor_mode": key, "temporal_mode": int(fs.get("temporal_mode", 0)), "tau_rise_ms": rise,
                             "tau_fall_ms": fall, "delay_frames": delay, "settle_frames_60hz": settle_frames(rise, fall, 1000.0 / 60.0, delay)})
+        if method == "runtime.fald_starfield":
+            # C++ DoFaldStarfield (2026-09-19, work guide S1): starfield balancing, partial updates, persisted per mode.
+            # Everything is validated before anything is stored; refusals word for word.
+            num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+            en = params.get("enabled")
+            if "enabled" in params and not isinstance(en, bool):
+                return DesktopLutResponse(ok=False, error="enabled must be a boolean")
+            given: dict[str, Any] = {}
+            for name, (lo, hi, integer, text) in _FALD_STAR_KEYS.items():
+                v = params.get(name)
+                if not num(v):
+                    continue
+                if not (lo <= v <= hi) or (integer and v != int(v)):
+                    return DesktopLutResponse(ok=False, error=text)
+                given[name] = int(v) if integer else float(v)
+            if "enabled" not in params and not given:
+                return DesktopLutResponse(ok=False, error="missing parameter: enabled, even, lift, target_gain, target_sigma, keep_nits, even_reach, cap_nits, "
+                                                          "strength, area_lo, area_hi, peak_hi, reach, nb_lo or nb_hi")
+            st = {**_fald_star(fs), **given}
+            if "enabled" in params:
+                st["enabled"] = en
+            if st["area_hi"] < st["area_lo"]:       # the pairs stay ordered after a partial update (the stored partner counts)
+                return DesktopLutResponse(ok=False, error="area_hi must be >= area_lo")
+            if st["nb_hi"] < st["nb_lo"]:
+                return DesktopLutResponse(ok=False, error="nb_hi must be >= nb_lo")
+            fs["star"] = st
+            return self.ok({"monitor_mode": key, **_fald_star(fs)})
         if method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

@@ -15,9 +15,24 @@
 
 struct MonitorContext;
 struct FaldSettings;
+struct FaldStarfieldSettings;
 
-// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 52 words.
-constexpr unsigned int FALD_CB_BYTES = 208;
+// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 68 words.
+constexpr unsigned int FALD_CB_BYTES = 272;
+
+// Starfield balancing (EXPERIMENT, default off; work guide ticket S1). The complete rules: the header above
+// g_faldStarStatSource in fald_shader.h = the module docstring of DLC dlc/fald/starfield.py (the reference). In short:
+// a zone with star-like content (a small lit area ABOVE the zone's darkest pixel) has its peak pulled part of the way
+// (`even`, log domain) toward the local TARGET = exp(mean + targetSigma std of ln peak) of the star-like peaks around it
+// (tapered window, flank zones of a straddling star excluded), never below keepNits, optionally under an absolute
+// ceiling; peaks below the target are optionally lifted (`lift`, speck pixels only); solid content protects its neighbourhood through a tapered field (`reach` zones fully, one more at
+// half) that is interpolated per pixel; per pixel ONE hue-preserving scale, only in zones that hold a speck, the zone
+// fields bilinear between zone centres. The balanced frame is what the rest of the layer sees (statistic rounds, boost
+// flags, Correct, output). Off = no resources, no dispatches, the shaders' results bit-identical. Limits of the two reaches:
+constexpr unsigned int FALD_STAR_EVEN_REACH_MAX = 12;
+constexpr unsigned int FALD_STAR_REACH_MAX = 4;
+// Clamp every field to its documented range (NaN -> the default; area / neighbour pairs kept ordered lo <= hi).
+void FaldStarfieldClamp(FaldStarfieldSettings& s);
 
 // Black-frame LED boost (FLD4 panel files; DLC FaldParams.boost_lut, work guide C12): the panel firmware multiplies
 // every LED drive by a staircase function of the number of NON-BLACK zones of the frame it receives. At most this
@@ -160,6 +175,28 @@ struct FaldResources {
     ID3D11Texture2D* activeTex[2] = {}; ID3D11UnorderedAccessView* activeUAV[2] = {}; ID3D11ShaderResourceView* activeSRV[2] = {};
     ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
+    // starfield balancing: five zone textures (created on the first frame the option is on, released when it goes off;
+    // all cols x rows RGBA32F; channel layout = the rules header in fald_shader.h). S0 writes stat (peak, speck-zone
+    // flag, sparse, solid) and bg; S1 writes w (wt = target weight, wt * ln peak, flank flag, speck-zone flag) and plan2; S2 writes plan
+    // (w0_field, ln target, ln lift, ln peak). The statistic rounds and the pixel pass read plan (t15) and plan2 (t18).
+    ID3D11Texture2D* starStatTex = nullptr; ID3D11UnorderedAccessView* starStatUAV = nullptr; ID3D11ShaderResourceView* starStatSRV = nullptr;
+    ID3D11Texture2D* starWTex = nullptr;    ID3D11UnorderedAccessView* starWUAV = nullptr;    ID3D11ShaderResourceView* starWSRV = nullptr;
+    ID3D11Texture2D* starPlanTex = nullptr; ID3D11UnorderedAccessView* starPlanUAV = nullptr; ID3D11ShaderResourceView* starPlanSRV = nullptr;
+    // bg = (ln b, the brightest pixel's index ly * cellW + lx, lit sum, a_eff), b = the zone's darkest pixel (S0 -> S1;
+    // evidence in the dump)
+    ID3D11Texture2D* starBgTex = nullptr;   ID3D11UnorderedAccessView* starBgUAV = nullptr;   ID3D11ShaderResourceView* starBgSRV = nullptr;
+    // plan2 = the second field texture the pixels read: (ln b, tapered protection `near`, speck-zone flag, w) — .xy
+    // bilinear (a pull never goes below the background; the protection is applied per pixel), .z nearest (own-zone gate)
+    ID3D11Texture2D* starPlan2Tex = nullptr; ID3D11UnorderedAccessView* starPlan2UAV = nullptr; ID3D11ShaderResourceView* starPlan2SRV = nullptr;
+    bool starOn = false;                     // the balancing runs this frame (setting on AND the textures exist): CB word 35
+    bool starFailLogged = false;
+    unsigned int starRetryCounter = 0;       // frames since the star textures failed to create (retry every ~300, like Build)
+    struct StarCB {                          // the clamped settings of the last FaldRunPasses (CB words 52-65, dump)
+        float even = 0.8f, lift = 0.0f, targetGain = 1.0f, capNits = 0.0f;
+        float strength = 1.0f, areaLo = 40.0f, areaHi = 160.0f, peakHi = 0.0f;
+        float nbLo = 0.15f, nbHi = 0.30f; uint32_t reach = 2, evenReach = 8;
+        float targetSigma = 0.0f, keepNits = 100.0f;
+    } star;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
     uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)
@@ -191,6 +228,8 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // pass, the OUTPUT frame (fald_out.*) after it. newContent = the frame is a NEW desktop frame (not a re-process
 // of the cached one, not a cursor-only update, not a settle frame): with a temporal drive state it re-arms the
 // settle hold (FaldSettlePending), so a static desktop keeps re-running the layer for ~5 tau.
+// Starfield balancing (FaldSettings::star) recomputes its zone plan from ctx->fald->inter on EVERY call — new frame,
+// C2 re-process and settle frame alike (the plan is a stateless function of the source frame the caller left there).
 void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true);
 // True while the temporal drive state still owes settle frames after the last content change (render thread).
 // The render loop then re-runs ONLY the FALD passes on the layer's own intermediate (the main pass output of the

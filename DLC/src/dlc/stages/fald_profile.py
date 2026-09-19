@@ -244,6 +244,13 @@ class OverlayTracker:
         self.temporal_saved: Optional[dict[str, Any]] = None
         self.temporal_note: Optional[str] = None
         self._force_temporal_off()
+        # starfield balancing (runtime.fald_starfield, 2026-09-19, work guide S1) is a persisted setting too, and it
+        # CHANGES the content on purpose (it pulls sparse highlights toward their neighbourhood's level): identity / ON
+        # reads of a pattern with small bright features would measure the balanced frame, not the requested one.
+        # Forced off here, restored by `restore()`.
+        self.starfield_saved: Optional[dict[str, Any]] = None
+        self.starfield_note: Optional[str] = None
+        self._force_starfield_off()
 
     def _force_temporal_off(self) -> None:
         ctl = self.s.controller
@@ -266,8 +273,35 @@ class OverlayTracker:
                 self.temporal_note = f"temporal drive state is ON ({saved}) and runtime.fald_temporal refused ({exc}): reads go through the filter"
                 self.temporal_saved = None
 
+    def _force_starfield_off(self) -> None:
+        ctl = self.s.controller
+        try:
+            layers = (ctl.call("state.get", {}).get("layers") or {}).get(f"{self.monitor}:{self.mode}") or {}
+        except Exception as exc:  # noqa: BLE001
+            self.starfield_note = f"state.get failed ({exc}): starfield balancing unknown"
+            return
+        if "fald_starfield" not in layers:
+            self.starfield_note = "build without runtime.fald_starfield (pre-2026-09-19): no starfield balancing"
+            return
+        saved = {"enabled": bool(layers.get("fald_starfield", False))}
+        saved.update({k[len("fald_star_"):]: layers[k] for k in sorted(layers) if k.startswith("fald_star_")})
+        self.starfield_saved = saved
+        if saved["enabled"]:
+            try:
+                ctl.call("runtime.fald_starfield", {"monitor": self.monitor, "mode": self.mode, "enabled": False})
+                self.starfield_note = f"starfield balancing was ON ({saved}) — forced OFF for the reads, restored after"
+            except Exception as exc:  # noqa: BLE001
+                self.starfield_note = (f"starfield balancing is ON ({saved}) and runtime.fald_starfield refused ({exc}): "
+                                       "reads go through the balancing")
+                self.starfield_saved = None
+
     def restore(self) -> None:
-        """Put the owner's temporal drive state back (no-op when it was off or unknown)."""
+        """Put the owner's temporal drive state and starfield balancing back (no-op when off or unknown)."""
+        if self.starfield_saved and self.starfield_saved.get("enabled"):
+            try:
+                self.s.controller.call("runtime.fald_starfield", {"monitor": self.monitor, "mode": self.mode, "enabled": True})
+            except Exception as exc:  # noqa: BLE001
+                self.reasons.append(f"starfield balancing NOT restored ({exc}): re-enable it by hand")
         if self.temporal_saved and self.temporal_saved.get("temporal_mode", 0) != 0:
             try:
                 self.s.controller.call("runtime.fald_temporal", {"monitor": self.monitor, "mode": self.mode,
@@ -315,7 +349,9 @@ class OverlayTracker:
     def file_meta(self) -> dict[str, Any]:
         return {"off_overlay": self.off_overlay(), "overlay_wait": self.summary(),
                 "temporal_forced_off": bool(self.temporal_saved and self.temporal_saved.get("temporal_mode", 0) != 0),
-                "temporal_saved": self.temporal_saved, "temporal_note": self.temporal_note}
+                "temporal_saved": self.temporal_saved, "temporal_note": self.temporal_note,
+                "starfield_forced_off": bool(self.starfield_saved and self.starfield_saved.get("enabled")),
+                "starfield_saved": self.starfield_saved, "starfield_note": self.starfield_note}
 
     def report(self, result: StageResult, phase: str) -> None:
         off = self.waits.get("off") or {}
@@ -332,10 +368,15 @@ class OverlayTracker:
         if any((w or {}).get("unknown") for w in self.waits.values()):
             result.note(f"{phase}: overlay state unverifiable — {'; '.join(self.reasons)}")
         if self.temporal_note:
-            if "refused" in self.temporal_note or "NOT restored" in " ".join(self.reasons):
+            if "refused" in self.temporal_note or "temporal drive state NOT restored" in " ".join(self.reasons):
                 result.anomaly("temporal_state", f"{phase}: {self.temporal_note}; {'; '.join(r for r in self.reasons if 'temporal' in r)}", "high")
             else:
                 result.note(f"{phase}: {self.temporal_note}")
+        if self.starfield_note:
+            if "refused" in self.starfield_note or "starfield balancing NOT restored" in " ".join(self.reasons):
+                result.anomaly("starfield_state", f"{phase}: {self.starfield_note}; {'; '.join(r for r in self.reasons if 'starfield' in r)}", "high")
+            else:
+                result.note(f"{phase}: {self.starfield_note}")
         result.metrics["overlay_wait"] = self.summary()
         result.metrics["off_overlay"] = self.off_overlay()
 

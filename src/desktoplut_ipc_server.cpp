@@ -683,6 +683,22 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_tau_rise_ms", JNum((double)fs.tauRiseMs));
                 l.set("fald_tau_fall_ms", JNum((double)fs.tauFallMs));
                 l.set("fald_delay_frames", JNum((double)fs.delayFrames));
+                // starfield balancing (runtime.fald_starfield; work guide S1)
+                l.set("fald_starfield", JBool(fs.star.enabled));
+                l.set("fald_star_even", JNum((double)fs.star.even));
+                l.set("fald_star_lift", JNum((double)fs.star.lift));
+                l.set("fald_star_target_gain", JNum((double)fs.star.targetGain));
+                l.set("fald_star_target_sigma", JNum((double)fs.star.targetSigma));
+                l.set("fald_star_keep_nits", JNum((double)fs.star.keepNits));
+                l.set("fald_star_even_reach", JNum((double)fs.star.evenReach));
+                l.set("fald_star_cap_nits", JNum((double)fs.star.capNits));
+                l.set("fald_star_strength", JNum((double)fs.star.strength));
+                l.set("fald_star_area_lo", JNum((double)fs.star.areaLo));
+                l.set("fald_star_area_hi", JNum((double)fs.star.areaHi));
+                l.set("fald_star_peak_hi", JNum((double)fs.star.peakHi));
+                l.set("fald_star_reach", JNum((double)fs.star.reach));
+                l.set("fald_star_nb_lo", JNum((double)fs.star.nbLo));
+                l.set("fald_star_nb_hi", JNum((double)fs.star.nbHi));
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)
                 uint32_t transfer = 0;
@@ -1343,7 +1359,7 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // <-> SDR: refused otherwise — the render side would refuse it too). Re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
 // debug_mode 0..6}: 0 correct, 1 gain map (white 0, red brighten, blue darken, +-25 %), 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
-// x100, 6 per-channel-vs-white influence x100, 7 temporal settling, 8 the black-frame boost's non-black zone map (FLD4 files; not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
+// x100, 6 per-channel-vs-white influence x100, 7 temporal settling, 8 the black-frame boost's non-black zone map (FLD4 files), 9 the starfield balancing zone map (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
 // FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
@@ -1393,12 +1409,12 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* v = p.find("debug_mode");
     const JsonValue* pm = p.find("ped_mode");
-    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..8) or ped_mode (0|1)"; return; }
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..9) or ped_mode (0|1)"; return; }
     unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 8 ? 8 : v->num));
+        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 9 ? 9 : v->num));
         if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
         mode = fs.debugMode; ped = fs.pedMode;
     }
@@ -1449,6 +1465,88 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("tau_fall_ms", JNum((double)fall));
     result.set("delay_frames", JNum((double)delay));
     result.set("settle_frames_60hz", JNum((double)FaldSettleFrames(rise, fall, 1000.0f / 60.0f, delay)));
+}
+
+// runtime.fald_starfield {monitor, mode, enabled?, even?, lift?, target_gain?, target_sigma?, keep_nits?, even_reach?, cap_nits?, strength?,
+// area_lo?, area_hi?, peak_hi?, reach?, nb_lo?, nb_hi?}: starfield balancing (EXPERIMENT, default off; work guide S1,
+// reference DLC dlc/fald/starfield.py). Partial updates; persisted per mode (the GUI row sets both modes). Every value
+// is validated BEFORE anything is stored; error texts are mirrored by the DLC mock word for word.
+void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    struct NumKey { const char* name; double lo, hi; bool integer; const char* text; };
+    static const NumKey keys[] = {
+        { "even", 0.0, 1.0, false, "even must be 0..1" },
+        { "lift", 0.0, 1.0, false, "lift must be 0..1" },
+        { "target_gain", 0.05, 2.0, false, "target_gain must be 0.05..2" },
+        { "even_reach", 0.0, (double)FALD_STAR_EVEN_REACH_MAX, true, "even_reach must be an integer 0..12" },
+        { "cap_nits", 0.0, 10000.0, false, "cap_nits must be 0..10000 (0 = none)" },
+        { "strength", 0.0, 1.0, false, "strength must be 0..1" },
+        { "area_lo", 0.0, 1.0e6, false, "area_lo must be 0..1000000 px^2" },
+        { "area_hi", 0.0, 1.0e6, false, "area_hi must be 0..1000000 px^2" },
+        { "peak_hi", 0.0, 10000.0, false, "peak_hi must be 0..10000 (0 = no limit)" },
+        { "reach", 0.0, (double)FALD_STAR_REACH_MAX, true, "reach must be an integer 0..4" },
+        { "nb_lo", 0.0, 1.0, false, "nb_lo must be 0..1" },
+        { "nb_hi", 0.0, 1.0, false, "nb_hi must be 0..1" },
+        { "target_sigma", 0.0, 4.0, false, "target_sigma must be 0..4" },
+        { "keep_nits", 0.0, 10000.0, false, "keep_nits must be 0..10000 (0 = no floor)" },
+    };
+    const size_t nKeys = sizeof(keys) / sizeof(keys[0]);
+    const JsonValue* en = p.find("enabled");
+    if (en && en->type != JsonValue::Bool) { error = "enabled must be a boolean"; return; }
+    const JsonValue* vals[sizeof(keys) / sizeof(keys[0])] = {};
+    bool any = (en != nullptr);
+    for (size_t i = 0; i < nKeys; i++) {
+        const JsonValue* v = p.find(keys[i].name);
+        if (!v || v->type != JsonValue::Num) continue;
+        if (!(v->num >= keys[i].lo && v->num <= keys[i].hi) || (keys[i].integer && v->num != (double)(long long)v->num)) {
+            error = keys[i].text; return;
+        }
+        vals[i] = v; any = true;
+    }
+    if (!any) {
+        error = "missing parameter: enabled, even, lift, target_gain, target_sigma, keep_nits, even_reach, cap_nits, strength, area_lo, area_hi, peak_hi, reach, nb_lo or nb_hi";
+        return;
+    }
+    FaldStarfieldSettings out;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        FaldStarfieldSettings st = fs.star;
+        if (en) st.enabled = en->b;
+        float* fdst[] = { &st.even, &st.lift, &st.targetGain, nullptr, &st.capNits, &st.strength, &st.areaLo, &st.areaHi,
+                          &st.peakHi, nullptr, &st.nbLo, &st.nbHi, &st.targetSigma, &st.keepNits };
+        for (size_t i = 0; i < nKeys; i++) {
+            if (!vals[i]) continue;
+            if (fdst[i]) *fdst[i] = (float)vals[i]->num;
+            else if (i == 3) st.evenReach = (unsigned int)vals[i]->num;
+            else st.reach = (unsigned int)vals[i]->num;
+        }
+        // the pairs must stay ordered after a partial update (the stored partner counts)
+        if (st.areaHi < st.areaLo) { error = "area_hi must be >= area_lo"; return; }
+        if (st.nbHi < st.nbLo) { error = "nb_hi must be >= nb_lo"; return; }
+        FaldStarfieldClamp(st);
+        fs.star = st;
+        out = st;
+    }
+    SaveSettings();
+    FaldPropagate(mon, isHDR);
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("enabled", JBool(out.enabled));
+    result.set("even", JNum((double)out.even));
+    result.set("lift", JNum((double)out.lift));
+    result.set("target_gain", JNum((double)out.targetGain));
+    result.set("target_sigma", JNum((double)out.targetSigma));
+    result.set("keep_nits", JNum((double)out.keepNits));
+    result.set("even_reach", JNum((double)out.evenReach));
+    result.set("cap_nits", JNum((double)out.capNits));
+    result.set("strength", JNum((double)out.strength));
+    result.set("area_lo", JNum((double)out.areaLo));
+    result.set("area_hi", JNum((double)out.areaHi));
+    result.set("peak_hi", JNum((double)out.peakHi));
+    result.set("reach", JNum((double)out.reach));
+    result.set("nb_lo", JNum((double)out.nbLo));
+    result.set("nb_hi", JNum((double)out.nbHi));
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -2047,6 +2145,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_debug") DoFaldDebug(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_dump") DoFaldDump(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_temporal") DoFaldTemporal(*r->params, *r->result, *r->error);
+        else if (m == "runtime.fald_starfield") DoFaldStarfield(*r->params, *r->result, *r->error);
         else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);

@@ -121,6 +121,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(_write_fald_panel(tmp_path / "sdr.bin", "gamma"))}),
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
         ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
+        ("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.8, "even_reach": 6}),
         ("layers.set", {**mm, "fald": True}),
         ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),
@@ -330,6 +331,52 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_delay_frames"] == 2
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "delay_frames": 4}), raise_on_error=False)
     assert not bad.ok and bad.error == "delay_frames must be 0..3"
+    # starfield balancing (2026-09-19, work guide S1): partial updates, persisted per mode, reported in layers[key]
+    st0 = client.call("state.get", {}).result["layers"]["0:SDR"]
+    assert st0["fald_starfield"] is False and st0["fald_star_even"] == 0.8 and st0["fald_star_lift"] == 0.0
+    assert st0["fald_star_target_sigma"] == 0.0 and st0["fald_star_keep_nits"] == 100.0  # geometric mean + absolute floor (round 7)
+    assert st0["fald_star_even_reach"] == 8 and st0["fald_star_reach"] == 2 and st0["fald_star_strength"] == 1.0
+    assert (st0["fald_star_area_lo"], st0["fald_star_area_hi"], st0["fald_star_nb_lo"], st0["fald_star_nb_hi"]) == (40.0, 160.0, 0.15, 0.30)
+    assert st0["fald_star_target_gain"] == 1.0 and st0["fald_star_cap_nits"] == 0.0 and st0["fald_star_peak_hi"] == 0.0
+    sf = client.call("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.7, "even_reach": 6})
+    assert sf.ok and sf.result["enabled"] is True and sf.result["even"] == 0.7 and sf.result["even_reach"] == 6
+    assert sf.result["lift"] == 0.0 and sf.result["reach"] == 2 and sf.result["area_hi"] == 160.0      # untouched fields = defaults
+    one = client.call("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "lift": 0.5})             # a partial update
+    assert one.ok and one.result["enabled"] is True and one.result["even"] == 0.7 and one.result["lift"] == 0.5
+    sig = client.call("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "target_sigma": 1.5, "keep_nits": 60})
+    assert sig.ok and sig.result["target_sigma"] == 1.5 and sig.result["keep_nits"] == 60.0 and sig.result["even"] == 0.7
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_star_keep_nits"] == 60.0
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_star_target_sigma"] == 1.5
+    assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_star_target_sigma"] == 0.0   # per mode
+    st = client.call("state.get", {}).result
+    assert st["layers"]["0:SDR"]["fald_starfield"] is True and st["layers"]["0:SDR"]["fald_star_even_reach"] == 6
+    assert st["layers"]["0:SDR"]["fald_star_lift"] == 0.5
+    assert st["layers"]["0:HDR"]["fald_starfield"] is False and st["layers"]["0:HDR"]["fald_star_even_reach"] == 8   # per mode
+    for bad_params, text in (({"even": 1.5}, "even must be 0..1"), ({"lift": -0.1}, "lift must be 0..1"),
+                             ({"target_gain": 0.01}, "target_gain must be 0.05..2"),
+                             ({"target_sigma": 4.5}, "target_sigma must be 0..4"), ({"target_sigma": -1}, "target_sigma must be 0..4"),
+                             ({"keep_nits": 20000}, "keep_nits must be 0..10000 (0 = no floor)"),
+                             ({"even_reach": 13}, "even_reach must be an integer 0..12"),
+                             ({"even_reach": 2.5}, "even_reach must be an integer 0..12"),
+                             ({"cap_nits": 20000}, "cap_nits must be 0..10000 (0 = none)"),
+                             ({"strength": 2}, "strength must be 0..1"), ({"reach": 5}, "reach must be an integer 0..4"),
+                             ({"peak_hi": -1}, "peak_hi must be 0..10000 (0 = no limit)"),
+                             ({"nb_lo": 1.5}, "nb_lo must be 0..1"), ({"nb_hi": -0.2}, "nb_hi must be 0..1"),
+                             ({"area_lo": -1}, "area_lo must be 0..1000000 px^2"),
+                             ({"area_hi": 10}, "area_hi must be >= area_lo"),              # the stored area_lo is 40
+                             ({"nb_lo": 0.5}, "nb_hi must be >= nb_lo"),                   # the stored nb_hi is 0.30
+                             ({"enabled": 1}, "enabled must be a boolean")):
+        bad = client.send(DesktopLutCommand("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", **bad_params}), raise_on_error=False)
+        assert not bad.ok and bad.error == text, (bad_params, bad.error)
+    bad = client.send(DesktopLutCommand("runtime.fald_starfield", {"monitor": 0, "mode": "SDR"}), raise_on_error=False)
+    assert not bad.ok and bad.error.startswith("missing parameter: enabled, even, lift")
+    # a refused call stores NOTHING (the valid `even` next to the bad `reach` is dropped too)
+    bad = client.send(DesktopLutCommand("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "even": 0.1, "reach": 9}), raise_on_error=False)
+    assert not bad.ok and client.call("state.get", {}).result["layers"]["0:SDR"]["fald_star_even"] == 0.7
+    pair = client.call("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "area_lo": 200, "area_hi": 300, "enabled": False})
+    assert pair.ok and pair.result["area_lo"] == 200.0 and pair.result["area_hi"] == 300.0 and pair.result["enabled"] is False
+    dbg9 = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 12})
+    assert dbg9.ok and dbg9.result["debug_mode"] == 9                                    # clamped to the last view
     dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})
     assert dbg.ok and dbg.result["debug_mode"] == 4
     assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_debug_mode"] == 4

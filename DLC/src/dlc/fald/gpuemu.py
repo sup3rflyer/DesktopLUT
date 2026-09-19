@@ -13,7 +13,17 @@ Black-frame LED boost (FLD4 panel files, work guide C12): the statistic pass als
 the two agree on lattice-aligned / >= 5-px content), pass 1a turns the count into the frame's boost
 (:func:`dlc.fald.panelfile.boost_of_count`), the conv pass multiplies B_true by it — per round, on the frame the
 panel receives (round 0 the source, round 1 the corrected frame), never filtered by the temporal state. A file
-without a LUT runs none of it."""
+without a LUT runs none of it.
+
+Starfield balancing (work guide S1; the rules = the module docstring of :mod:`dlc.fald.starfield`, the reference):
+``run(..., star=StarfieldParams)`` runs the three star passes on the SOURCE frame at FULL resolution
+(:meth:`Emu.star_stat` = S0 ``g_faldStarStatSource``; :meth:`Emu.star_plan` = S1 ``g_faldStarWeightSource`` + S2
+``g_faldStarPlanSource``) and then feeds ``Balance(source)`` (:meth:`Emu.balance`, the HLSL ``Balance``: the zone
+fields sampled bilinearly between zone centres, clamped — the same sampler maths as the fine-grid fields —, the
+speck-zone flag of the pixel's OWN zone loaded nearest) to everything downstream: both statistic rounds, the boost
+flags, Correct, the output. ``star=None`` runs none of it (the previous emulator, bit for bit). The reference works on
+the model's scale-5 raster, the emulator on full-resolution pixels: they agree on raster-aligned content (>= 5-px
+features), where the centre pixel of every 5 x 5 block has exactly the raster pixel's bilinear coordinates."""
 from __future__ import annotations
 
 from typing import Optional
@@ -22,16 +32,75 @@ import numpy as np
 from scipy.signal import convolve2d
 
 from .panelfile import boost_of_count
+from .starfield import StarfieldParams
 from .temporal import MODE_BOTH, MODE_OFF, MODE_TRUE_ONLY, alpha_from_tau
 
 f32 = np.float32
 KNEE_START = 0.9          # FALD_KNEE_START / FALD_KNEE_CAP_TRUST (fald_shader.h; correct.py pins them equal)
 KNEE_CAP_TRUST = 1.0
+STAR_SPECK_LO = 0.25      # FALD_STAR_SPECK_LO / _HI (fald_shader.h Balance; starfield.balance_image's 0.25 .. 0.5 band)
+STAR_SPECK_HI = 0.5
+STAR_EVEN_REACH_MAX = 12  # FALD_STAR_EVEN_REACH_MAX / FALD_STAR_REACH_MAX (fald.h; FaldStarfieldClamp)
+STAR_REACH_MAX = 4
+STAR_FLAT_ABS = 1e-6      # FALD_STAR_FLAT_ABS / _REL (fald_shader.h star statistic; starfield.FLAT_ABS / FLAT_REL): a zone whose
+STAR_FLAT_REL = 0.02      # peak is not more than max(ABS, REL * peak) above its darkest pixel has no speck: not star-like
+STAR_PULL_EPS = 1e-5      # FALD_STAR_PULL_EPS (starfield.PULL_EPS): a pull ending this close to the pixel itself is no pull
+STAR_GATE_LO, STAR_GATE_HI = 1.0, 2.0   # FALD_STAR_GATE_LO / _HI (starfield.GATE_LO / GATE_HI): the pull threshold over target / background
+STAR_FLANK_PX, STAR_FLANK_NEAR_PX = 2, 12   # FALD_STAR_FLANK_PX / _NEAR_PX (starfield.FLANK_PX / FLANK_NEAR_PX): one feature straddling a border
 
 
 def smoothstep(a, b, x):
     t = np.clip((x - a) / (b - a), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
+
+
+def star_smooth(lo, hi, x):
+    """HLSL StarSmooth = starfield._smoothstep: the denominator floor makes lo == hi a step at lo."""
+    t = np.clip((x - lo) / max(hi - lo, 1e-12), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def clamp_star(sp: StarfieldParams) -> StarfieldParams:
+    """C++ FaldStarfieldClamp: the ranges the settings / pipe / CB enforce (the reference clips even, lift and
+    strength itself; the reaches and the ordered smoothstep pairs are the C++ side's)."""
+    from dataclasses import replace
+    c = lambda v, lo, hi: float(min(max(float(v), lo), hi))
+    area_lo = c(sp.area_lo, 0.0, 1e6); nb_lo = c(sp.nb_lo, 0.0, 1.0)
+    return replace(sp, even=c(sp.even, 0.0, 1.0), lift=c(sp.lift, 0.0, 1.0), target_gain=c(sp.target_gain, 0.05, 2.0),
+                   target_sigma=c(sp.target_sigma, 0.0, 4.0), keep_nits=c(sp.keep_nits, 0.0, 10000.0),
+                   even_reach=int(min(max(int(sp.even_reach), 0), STAR_EVEN_REACH_MAX)), cap_nits=c(sp.cap_nits, 0.0, 10000.0),
+                   strength=c(sp.strength, 0.0, 1.0), area_lo=area_lo, area_hi=max(c(sp.area_hi, 0.0, 1e6), area_lo),
+                   peak_hi=c(sp.peak_hi, 0.0, 10000.0), reach=int(min(max(int(sp.reach), 0), STAR_REACH_MAX)),
+                   nb_lo=nb_lo, nb_hi=max(c(sp.nb_hi, 0.0, 1.0), nb_lo))
+
+
+def _box32(a, r, fn):
+    """(2r+1)^2 zone neighbourhood, zero outside the lattice (the HLSL loops skip out-of-range zones), float32."""
+    a = a.astype(np.float32)
+    if r <= 0:
+        return a.copy()
+    rows, cols = a.shape
+    pad = np.pad(a, r, mode="constant")
+    out = None
+    for dy in range(-r, r + 1):                  # the shader's loop order: dy outer, dx inner
+        for dx in range(-r, r + 1):
+            v = pad[r + dy: r + dy + rows, r + dx: r + dx + cols]
+            out = v.copy() if out is None else fn(out, v)
+    return out.astype(np.float32)
+
+
+def _box32_tapered(a, r):
+    """S2's target sums: (2r+1)^2 neighbourhood, zone weight (r + 1 - d) / (r + 1) with d the chebyshev distance, zero
+    outside the lattice, accumulated in float32 in the shader's loop order."""
+    a = a.astype(np.float32)
+    rows, cols = a.shape
+    pad = np.pad(a, r, mode="constant")
+    out = np.zeros_like(a)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            k = f32(r + 1 - max(abs(dx), abs(dy))) / f32(r + 1)
+            out = (out + pad[r + dy: r + dy + rows, r + dx: r + dx + cols] * k).astype(np.float32)
+    return out
 
 
 def srgb_oetf(L):
@@ -132,6 +201,10 @@ class Emu:
         yt = (np.arange(self.H) - self.oy + 0.5) / (self.rows * self.ch) * (self.rows * S) - 0.5
         self.bx = self._axis(xt, self.cols * S)
         self.by = self._axis(yt, self.rows * S)
+        # the same sampler on a cols x rows texture (one texel per zone): texel coordinate (px - origin + 0.5) / cell - 0.5
+        # = starfield._bilinear_zones — between zone CENTRES, the border zones held outside the outermost centres
+        self.zx = self._axis((np.arange(self.W) - self.ox + 0.5) / self.cw - 0.5, self.cols)
+        self.zy = self._axis((np.arange(self.H) - self.oy + 0.5) / self.ch - 0.5, self.rows)
         xs = np.arange(self.W); ys = np.arange(self.H)
         self.in_lattice = ((ys >= self.oy) & (ys < self.oy + self.rows * self.ch))[:, None] & \
                           ((xs >= self.ox) & (xs < self.ox + self.cols * self.cw))[None, :]
@@ -145,6 +218,177 @@ class Emu:
         y0, y1, fy = self.by; x0, x1, fx = self.bx
         Ty = T[y0] * (1 - fy)[:, None] + T[y1] * fy[:, None]
         return Ty[:, x0] * (1 - fx)[None] + Ty[:, x1] * fx[None]
+
+    def sample_zone(self, Z):
+        """SampleLevel(linearClamp, FineUV(px)) on a cols x rows zone texture, for every frame pixel."""
+        y0, y1, fy = self.zy; x0, x1, fx = self.zx
+        Z = Z.astype(np.float64)
+        Zy = Z[y0] * (1 - fy)[:, None] + Z[y1] * fy[:, None]
+        return Zy[:, x0] * (1 - fx)[None] + Zy[:, x1] * fx[None]
+
+    # ---- starfield balancing (work guide S1): passes S0 / S1 / S2 + Balance
+    def star_stat(self, img, sp: StarfieldParams):
+        """S0, g_faldStarStatSource on the SOURCE frame, float32 (starfield.py docstring items 1-5): peak, lit sum,
+        sparse, solid per zone from the layer's floored statistic, and — over ALL the zone's pixels, no drive-floor
+        gate — the background b (darkest pixel), the un-gated sum and the effective lit area ABOVE the background
+        a_eff = (sum - b n) / (peak_all - b); spk = the speck-zone flag. A zone whose peak is within max(STAR_FLAT_ABS,
+        STAR_FLAT_REL x peak) of its background is flat: not star-like, never divided. (The lattice lies inside the frame
+        — FaldLatticeFits — so every zone has n = cellW x cellH pixels; the shader counts the in-frame ones.)"""
+        s = np.minimum(img.max(axis=0), self.white)
+        s = s[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw]
+        blocks = s.reshape(self.rows, self.ch, self.cols, self.cw)
+        lit = blocks > self.floor
+        peak = np.where(lit, blocks, 0.0).max(axis=(1, 3)).astype(np.float32)
+        total = np.where(lit, blocks, 0.0).astype(np.float32).sum(axis=(1, 3), dtype=np.float32)
+        peak_all = blocks.max(axis=(1, 3)).astype(np.float32)
+        b = blocks.min(axis=(1, 3)).astype(np.float32)
+        sum_all = blocks.astype(np.float32).sum(axis=(1, 3), dtype=np.float32)
+        n = f32(self.cw * self.ch)
+        has = peak > 0
+        span = (peak_all - b).astype(np.float32)
+        speck = span > np.maximum(f32(STAR_FLAT_ABS), f32(STAR_FLAT_REL) * peak_all)
+        a_eff = np.where(speck, (sum_all - b * n) / np.maximum(span, f32(1e-12)), f32(0.0)).astype(np.float32)
+        sparse = np.where(has & speck, 1.0 - star_smooth(sp.area_lo, sp.area_hi, a_eff), 0.0)
+        if sp.peak_hi > 0.0:
+            sparse = sparse * (1.0 - star_smooth(sp.peak_hi, 2.0 * sp.peak_hi, peak))
+        drive = self.drive_of(np.minimum(peak, total / f32(self.area0)))
+        solid = np.where(has, (1.0 - sparse) * drive, 0.0)
+        ln_b = np.log(np.maximum(b, f32(1e-12))).astype(np.float32)
+        # the zone-local position of the brightest pixel (float32 values as the GPU compares them; ties: nearest the
+        # zone border — largest max(|2 lx - (cw - 1)| ch, |2 ly - (ch - 1)| cw) — then the first in row-major order)
+        flat = blocks.astype(np.float32).transpose(0, 2, 1, 3).reshape(self.rows, self.cols, -1)
+        ly_, lx_ = np.divmod(np.arange(self.ch * self.cw), self.cw)
+        key = np.maximum(np.abs(2 * lx_ - (self.cw - 1)) * self.ch, np.abs(2 * ly_ - (self.ch - 1)) * self.cw).astype(np.int64)
+        order = key * (self.cw * self.ch) + (self.cw * self.ch - 1 - np.arange(self.ch * self.cw))
+        arg = np.argmax(np.where(flat >= flat.max(axis=2, keepdims=True), order[None, None, :], -1), axis=2)
+        return {"peak": peak, "total": total, "sparse": sparse.astype(np.float32), "solid": solid.astype(np.float32),
+                "b": b, "ln_b": ln_b, "sum_all": sum_all, "a_eff": a_eff, "arg": arg,       # arg = ly * cellW + lx
+                "spk": has & speck & (a_eff < f32(sp.area_hi))}     # spk: the speck-zone flag (a star-sized area above the background)
+
+    def star_plan(self, st, sp: StarfieldParams):
+        """g_faldStarWeightSource (S1) + g_faldStarPlanSource (S2), float32: the tapered protection field, the zone
+        weights, the target and the fields the pixels read (starfield.py module docstring, items 6-9)."""
+        peak = st["peak"]
+        spk = st["spk"]              # the SPECK-ZONE flag: carry / lift / peak field / own-zone gate key on it
+        near = np.zeros_like(st["solid"], dtype=np.float32)             # S1: max over d <= reach + 1 of solid x k(d)
+        for d in range(int(sp.reach) + 2):
+            k = f32(min(max((int(sp.reach) + 1 - d) * 0.5, 0.0), 1.0))
+            near = np.maximum(near, (k * _box32(st["solid"], d, np.maximum)).astype(np.float32))
+        w0 = (st["sparse"] * f32(sp.strength)).astype(np.float32)
+        w = (w0 * (1.0 - star_smooth(sp.nb_lo, sp.nb_hi, near))).astype(np.float32)
+        flank, equal = self.star_flank(peak, st["arg"])                 # S1: the spill of a brighter neighbour's star
+        # ... carries no weight in the target average; equal-peak partners (a flat-topped straddler) share one vote
+        wt = np.where(flank, f32(0.0), w / (f32(1.0) + equal.astype(np.float32))).astype(np.float32)
+        lp = np.log(np.maximum(peak, f32(1e-12))).astype(np.float32)
+        wsum = _box32_tapered(wt, int(sp.even_reach))                   # S2: tapered window (E + 1 - d) / (E + 1)
+        wlp = (wt * lp).astype(np.float32)                              # what S1 stores (starW.y)
+        wl = _box32_tapered(wlp, int(sp.even_reach))
+        mean = (wl / np.where(wsum > 0, wsum, f32(1.0))).astype(np.float32)
+        std = np.zeros_like(mean)
+        if sp.target_sigma > 0.0:                                       # the spread, summed ABOUT the mean (a second sweep)
+            std = np.sqrt(np.maximum(self._box32_centred_var(wt, wlp, mean, int(sp.even_reach)) / np.where(wsum > 0, wsum, f32(1.0)),
+                                     f32(0.0))).astype(np.float32)
+        target = (np.exp(mean + f32(sp.target_sigma) * std) * f32(sp.target_gain)).astype(np.float32)
+        target = np.maximum(target, f32(sp.keep_nits))                 # the absolute floor (before the cap / white clamp)
+        if sp.cap_nits > 0.0:
+            target = np.minimum(target, f32(sp.cap_nits))
+        target = np.minimum(target, f32(self.white))
+        target = np.where(wsum > 0, target, peak).astype(np.float32)
+        s3 = _box32(st["sparse"], 1, np.add); n3 = _box32(spk.astype(np.float32), 1, np.add)
+        # a zone without a speck carries its 3x3 speck neighbours' mean w0 x its own non-protection (sparse > 0 only in
+        # speck zones); the protection itself is NOT in this field: it is interpolated on its own (near) per pixel
+        carry = s3 * f32(sp.strength) / np.maximum(n3, f32(1.0)) * (1.0 - star_smooth(sp.nb_lo, sp.nb_hi, st["solid"]))
+        w_field = np.where(spk, w0, carry).astype(np.float32)
+        ln_t = np.log(np.maximum(np.where(target > 0, target, f32(self.white)), f32(1e-12))).astype(np.float32)
+        ln_g = np.where(spk & (peak < target), f32(sp.lift) * (ln_t - lp), f32(0.0)).astype(np.float32)
+        ln_pk = np.where(spk, lp, ln_t).astype(np.float32)
+        return {"w": w, "w0": w0, "wt": wt, "flank": flank, "near": near, "target": target, "w_field": w_field, "ln_t": ln_t, "ln_g": ln_g,
+                "ln_pk": ln_pk, "spk": spk, "ln_b": st["ln_b"]}     # plan (t15): w_field (= w0_field), ln_t, ln_g, ln_pk; plan2 (t18): ln_b, near, spk, w
+
+    @staticmethod
+    def _box32_centred_var(wt, wlp, mean, r):
+        """S2's second sweep: sum over the tapered window of wt_n k (ln peak_n - mean)^2, ln peak_n = wlp_n / wt_n as the
+        shader recovers it from starW; float32, the shader's loop order."""
+        rows, cols = wt.shape
+        lp_n = np.where(wt > 0, wlp / np.where(wt > 0, wt, f32(1.0)), f32(0.0)).astype(np.float32)
+        pw, pl = np.pad(wt, r, mode="constant"), np.pad(lp_n, r, mode="constant")
+        out = np.zeros_like(wt, dtype=np.float32)
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                k = f32(r + 1 - max(abs(dx), abs(dy))) / f32(r + 1)
+                d = (pl[r + dy: r + dy + rows, r + dx: r + dx + cols] - mean).astype(np.float32)
+                out = (out + pw[r + dy: r + dy + rows, r + dx: r + dx + cols] * k * d * d).astype(np.float32)
+        return out
+
+    def star_flank(self, peak, arg):
+        """S1's flank flag (starfield.py docstring item 7): the zone's brightest pixel within STAR_FLANK_PX of the edge /
+        corner shared with a neighbour of LARGER peak whose own brightest pixel lies within STAR_FLANK_NEAR_PX of that
+        edge (and, along the edge, within STAR_FLANK_NEAR_PX of this zone's); + the number of neighbours that fulfil the same
+        geometry with an EQUAL peak."""
+        cw, ch = self.cw, self.ch
+        ly, lx = np.divmod(arg, cw)
+        rows, cols = peak.shape
+        pad = lambda a: np.pad(a, 1, mode="constant")
+        pp, px, py = pad(peak), pad(lx), pad(ly)
+        flank = np.zeros((rows, cols), dtype=bool)
+        equal = np.zeros((rows, cols), dtype=int)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                sl = (slice(1 + dy, 1 + dy + rows), slice(1 + dx, 1 + dx + cols))
+                ok = (pp[sl] >= peak) & (pp[sl] > 0)                     # larger = flank, equal = a partner sharing the vote
+                nx, ny = px[sl], py[sl]
+                if dx == 1:
+                    ok &= (lx >= cw - STAR_FLANK_PX) & (nx < STAR_FLANK_NEAR_PX)
+                elif dx == -1:
+                    ok &= (lx < STAR_FLANK_PX) & (nx >= cw - STAR_FLANK_NEAR_PX)
+                else:
+                    ok &= np.abs(lx - nx) <= STAR_FLANK_NEAR_PX
+                if dy == 1:
+                    ok &= (ly >= ch - STAR_FLANK_PX) & (ny < STAR_FLANK_NEAR_PX)
+                elif dy == -1:
+                    ok &= (ly < STAR_FLANK_PX) & (ny >= ch - STAR_FLANK_NEAR_PX)
+                else:
+                    ok &= np.abs(ly - ny) <= STAR_FLANK_NEAR_PX
+                flank |= ok & (pp[sl] > peak)
+                equal += (ok & (pp[sl] == peak)).astype(int)
+        return flank, equal
+
+    def balance(self, img, plan, sp: StarfieldParams):
+        """HLSL Balance for every lattice pixel (the per-pixel formula of the starfield.py docstring): (balanced
+        (3, H, W), scale (H, W)); untouched pixels keep scale exactly 1 (the HLSL returns ``img`` itself there)."""
+        # the protection is interpolated on its own and applied per pixel
+        w_px = self.sample_zone(plan["w_field"]) * (1.0 - star_smooth(sp.nb_lo, sp.nb_hi, self.sample_zone(plan["near"])))
+        ln_t = self.sample_zone(plan["ln_t"])
+        m = img.max(axis=0)
+        own = np.zeros((self.H, self.W), dtype=bool)                    # the own-zone gate: a nearest-zone Load of spk
+        own[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw] = \
+            np.repeat(np.repeat(plan["spk"], self.ch, axis=0), self.cw, axis=1)
+        live = (w_px > 0.0) & (m > 0.0) & own & self.in_lattice
+        safe = np.maximum(m, 1e-12)
+        t_px = np.exp(ln_t)
+        b_px = np.exp(self.sample_zone(plan["ln_b"]))                      # >= 1e-12: a black sky gates fully open
+        span_px = np.exp(self.sample_zone(plan["ln_pk"])) - b_px
+        # speck pixels: 25 .. 50 % of the way from the interpolated background to the interpolated zone peak
+        is_speck = np.where(span_px > 0.0, star_smooth(STAR_SPECK_LO, STAR_SPECK_HI, (safe - b_px) / np.maximum(span_px, 1e-12)), 0.0)
+        g_px = np.exp(self.sample_zone(plan["ln_g"]) * w_px * is_speck)
+        # the pull threshold T': the target while it is well above the background, the bottom of the speck band as it
+        # nears / undercuts it; out(m) = m up to T', m^(1 - a) T'^a above: monotone in m, the sky is never reached
+        gate = star_smooth(STAR_GATE_LO, STAR_GATE_HI, t_px / b_px)
+        t_floor = b_px + STAR_SPECK_LO * np.maximum(span_px, 0.0)
+        ln_floor = np.log(np.maximum(t_px, t_floor))
+        ln_tp = ln_floor + gate * (ln_t - ln_floor)                      # HLSL lerp
+        above = m > np.exp(ln_tp)
+        shown = np.minimum(safe, self.white)                               # the pull starts from what the panel SHOWS
+        pulled = np.exp(np.log(shown) + w_px * float(sp.even) * (ln_tp - np.log(shown)))
+        # never below the (interpolated) zone background, never above the pixel itself
+        pulled = np.maximum(pulled, np.minimum(b_px, safe))
+        lifted = np.minimum(safe * g_px, np.maximum(t_px, safe))
+        out_m = np.where(above, pulled, np.where(m <= t_px, lifted, safe))
+        acts = live & np.where(above, out_m < safe * (1.0 - STAR_PULL_EPS), (m <= t_px) & (g_px > 1.0))
+        scale = np.where(acts, out_m / safe, 1.0)
+        return np.where(acts[None], img * scale[None], img), scale
 
     # ---- PanelNits / PanelNitsToScRGB
     def panel_nits(self, scrgb):          # (H, W, 3) -> (3, H, W)
@@ -281,10 +525,20 @@ class Emu:
         g = self.sample(gainB.astype(np.float64))
         return sT, sE, g
 
-    def run(self, frame_scrgb, fp16_out=True, temporal: Optional[GpuDriveState] = None):
+    def run(self, frame_scrgb, fp16_out=True, temporal: Optional[GpuDriveState] = None, star: Optional[StarfieldParams] = None):
         """One frame of FaldRunPasses. ``temporal``: a GpuDriveState carried across calls (pass 1b after each stat
-        round; the state commits after round 1 — the CopyResource in the C++)."""
+        round; the state commits after round 1 — the CopyResource in the C++). ``star``: starfield balancing settings
+        (None = the option off: no star pass runs and nothing below changes) — the zone fields come from the SOURCE
+        frame and every later step works on Balance(source)."""
         img = self.panel_nits(frame_scrgb)
+        star_out = None
+        if star is not None:
+            sp = clamp_star(star)
+            src = img
+            st = self.star_stat(src, sp)
+            plan = self.star_plan(st, sp)
+            img, scale = self.balance(src, plan, sp)
+            star_out = {"src": src, "stat": st, "plan": plan, "scale": scale, "params": sp}
         d0, st0 = self.stat_drive(img)
         boost0, zones0, active0 = self.frame_boost(img)               # round 0: the source frame
         dT0, dE0 = temporal.pair(d0) if temporal is not None else (d0, d0)
@@ -314,4 +568,7 @@ class Emu:
                 "px_bE": sE, "wfade": wfade,
                 # black-frame LED boost per round (fald_dump.txt boost_r0/r1, active_zones_r0/r1, fald_active[_r0].f32)
                 "boost0": 1.0 if boost0 is None else float(boost0), "boost1": 1.0 if boost1 is None else float(boost1),
-                "zones0": zones0, "zones1": zones1, "active0": active0, "active1": active1}
+                "zones0": zones0, "zones1": zones1, "active0": active0, "active1": active1,
+                # starfield balancing: None when off; else the source image ("img" above is then the BALANCED one), the
+                # star statistic / plan zone fields (fald_star_stat / _bg / _w / _plan / _plan2.f32) and the per-pixel scale
+                "star": star_out}

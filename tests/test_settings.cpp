@@ -252,6 +252,12 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.tauRiseMs = 40.5f;
         original.fald.tauFallMs = 120.0f;
         original.fald.delayFrames = 2;
+        original.fald.star.enabled = true;   // starfield balancing (2026-09-19, work guide S1): persisted
+        original.fald.star.even = 0.75f; original.fald.star.lift = 0.25f; original.fald.star.targetGain = 0.8f;
+        original.fald.star.targetSigma = 1.75f; original.fald.star.keepNits = 60.0f;
+        original.fald.star.evenReach = 5; original.fald.star.capNits = 400.0f; original.fald.star.strength = 0.5f;
+        original.fald.star.areaLo = 30.0f; original.fald.star.areaHi = 200.0f; original.fald.star.peakHi = 900.0f;
+        original.fald.star.reach = 3; original.fald.star.nbLo = 0.1f; original.fald.star.nbHi = 0.4f;
         SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
 
         ColorCorrectionSettings loaded;
@@ -264,6 +270,21 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.tauRiseMs == doctest::Approx(40.5f).epsilon(1e-4));
         CHECK(loaded.fald.tauFallMs == doctest::Approx(120.0f).epsilon(1e-4));
         CHECK(loaded.fald.delayFrames == 2u);
+        CHECK(loaded.fald.star.enabled);
+        CHECK(loaded.fald.star.even == doctest::Approx(0.75f).epsilon(1e-4));
+        CHECK(loaded.fald.star.lift == doctest::Approx(0.25f).epsilon(1e-4));
+        CHECK(loaded.fald.star.targetGain == doctest::Approx(0.8f).epsilon(1e-4));
+        CHECK(loaded.fald.star.targetSigma == doctest::Approx(1.75f).epsilon(1e-4));
+        CHECK(loaded.fald.star.keepNits == doctest::Approx(60.0f).epsilon(1e-4));
+        CHECK(loaded.fald.star.evenReach == 5u);
+        CHECK(loaded.fald.star.capNits == doctest::Approx(400.0f).epsilon(1e-4));
+        CHECK(loaded.fald.star.strength == doctest::Approx(0.5f).epsilon(1e-4));
+        CHECK(loaded.fald.star.areaLo == doctest::Approx(30.0f).epsilon(1e-4));
+        CHECK(loaded.fald.star.areaHi == doctest::Approx(200.0f).epsilon(1e-4));
+        CHECK(loaded.fald.star.peakHi == doctest::Approx(900.0f).epsilon(1e-4));
+        CHECK(loaded.fald.star.reach == 3u);
+        CHECK(loaded.fald.star.nbLo == doctest::Approx(0.1f).epsilon(1e-4));
+        CHECK(loaded.fald.star.nbHi == doctest::Approx(0.4f).epsilon(1e-4));
     }
     // a fresh INI (no keys) = the filter OFF; out-of-range values are clamped, an unknown mode is OFF
     {
@@ -284,6 +305,36 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(clamped.fald.tauFallMs == 0.0f);
         CHECK(clamped.fald.delayFrames == FALD_DELAY_MAX);
         CHECK(fresh.fald.delayFrames == 0u);
+        // starfield balancing: a fresh INI = OFF with the reference defaults; out-of-range values are clamped
+        CHECK_FALSE(fresh.fald.star.enabled);
+        CHECK(fresh.fald.star.even == doctest::Approx(0.8f));
+        CHECK(fresh.fald.star.targetSigma == 0.0f);
+        CHECK(fresh.fald.star.keepNits == 100.0f);
+        CHECK(fresh.fald.star.lift == 0.0f);
+        CHECK(fresh.fald.star.evenReach == 8u);
+        CHECK(fresh.fald.star.reach == 2u);
+        CHECK(fresh.fald.star.areaLo == 40.0f);
+        CHECK(fresh.fald.star.areaHi == 160.0f);
+        CHECK(fresh.fald.star.nbLo == doctest::Approx(0.15f));
+        CHECK(fresh.fald.star.nbHi == doctest::Approx(0.30f));
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarfield", L"1", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarEven", L"4", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarTargetGain", L"0.001", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarTargetSigma", L"7.5", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarEvenReach", L"50", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarReach", L"-2", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarAreaLo", L"300", ini.c_str());
+        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldStarAreaHi", L"100", ini.c_str());
+        ColorCorrectionSettings starClamped;
+        LoadColorCorrectionSettings(L"TestMon", L"SDR_", starClamped, ini.c_str());
+        CHECK(starClamped.fald.star.enabled);
+        CHECK(starClamped.fald.star.even == 1.0f);
+        CHECK(starClamped.fald.star.targetGain == doctest::Approx(0.05f));
+        CHECK(starClamped.fald.star.targetSigma == 4.0f);
+        CHECK(starClamped.fald.star.evenReach == FALD_STAR_EVEN_REACH_MAX);
+        CHECK(starClamped.fald.star.reach == 0u);
+        CHECK(starClamped.fald.star.areaLo == 300.0f);
+        CHECK(starClamped.fald.star.areaHi == 300.0f);
     }
     // the two modes are independent keys: an SDR save never touches the HDR slot
     TempIni ini;

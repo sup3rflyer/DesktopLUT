@@ -4,7 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
-#include "fald.h"    // FALD_TAU_MAX_MS
+#include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -123,6 +123,23 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), cc.fald.tauRiseMs, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), cc.fald.tauFallMs, iniPath);
     WritePrivateProfileStringW(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
+    // starfield balancing (experimental, default off; work guide S1): the GUI row's values + the INI/pipe-only ones
+    const FaldStarfieldSettings& st = cc.fald.star;
+    WritePrivateProfileBool(section, (p + L"FaldStarfield").c_str(), st.enabled, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarEven").c_str(), st.even, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarLift").c_str(), st.lift, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarTargetGain").c_str(), st.targetGain, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarTargetSigma").c_str(), st.targetSigma, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarKeepNits").c_str(), st.keepNits, iniPath);
+    WritePrivateProfileStringW(section, (p + L"FaldStarEvenReach").c_str(), std::to_wstring(st.evenReach).c_str(), iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarCapNits").c_str(), st.capNits, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarStrength").c_str(), st.strength, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarAreaLo").c_str(), st.areaLo, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarAreaHi").c_str(), st.areaHi, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarPeakHi").c_str(), st.peakHi, iniPath);
+    WritePrivateProfileStringW(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
 }
 
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
@@ -159,6 +176,29 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         cc.fald.tauFallMs = clampTau(fall);
         int delay = (int)GetPrivateProfileIntW(section, (p + L"FaldDelayFrames").c_str(), 0, iniPath);
         cc.fald.delayFrames = delay < 0 ? 0u : (delay > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)delay);
+    }
+    {
+        // starfield balancing: absent keys = the defaults (off); every value is clamped to its range (FaldStarfieldClamp)
+        FaldStarfieldSettings st;   // defaults = DLC StarfieldParams
+        st.enabled = GetPrivateProfileBool(section, (p + L"FaldStarfield").c_str(), false, iniPath);
+        st.even = GetPrivateProfileFloat(section, (p + L"FaldStarEven").c_str(), st.even, iniPath);
+        st.lift = GetPrivateProfileFloat(section, (p + L"FaldStarLift").c_str(), st.lift, iniPath);
+        st.targetGain = GetPrivateProfileFloat(section, (p + L"FaldStarTargetGain").c_str(), st.targetGain, iniPath);
+        st.targetSigma = GetPrivateProfileFloat(section, (p + L"FaldStarTargetSigma").c_str(), st.targetSigma, iniPath);
+        st.keepNits = GetPrivateProfileFloat(section, (p + L"FaldStarKeepNits").c_str(), st.keepNits, iniPath);
+        int er = (int)GetPrivateProfileIntW(section, (p + L"FaldStarEvenReach").c_str(), (int)st.evenReach, iniPath);
+        st.evenReach = er < 0 ? 0u : (unsigned int)er;
+        st.capNits = GetPrivateProfileFloat(section, (p + L"FaldStarCapNits").c_str(), st.capNits, iniPath);
+        st.strength = GetPrivateProfileFloat(section, (p + L"FaldStarStrength").c_str(), st.strength, iniPath);
+        st.areaLo = GetPrivateProfileFloat(section, (p + L"FaldStarAreaLo").c_str(), st.areaLo, iniPath);
+        st.areaHi = GetPrivateProfileFloat(section, (p + L"FaldStarAreaHi").c_str(), st.areaHi, iniPath);
+        st.peakHi = GetPrivateProfileFloat(section, (p + L"FaldStarPeakHi").c_str(), st.peakHi, iniPath);
+        int rc = (int)GetPrivateProfileIntW(section, (p + L"FaldStarReach").c_str(), (int)st.reach, iniPath);
+        st.reach = rc < 0 ? 0u : (unsigned int)rc;
+        st.nbLo = GetPrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
+        st.nbHi = GetPrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
+        FaldStarfieldClamp(st);
+        cc.fald.star = st;
     }
 }
 

@@ -218,6 +218,102 @@ def test_mock_overlay_awake_follows_shader_layers_with_knobs(tmp_path):
     assert all(ctl.state()["overlay"]["awake"] for _ in range(5))
 
 
+# ----------------------------------------------------------------------------- persisted layer options forced off
+class _TrackerSession:
+    """The three things OverlayTracker needs of a Session."""
+
+    def __init__(self, controller):
+        self.controller = controller
+        vc = FP.VirtualClock()
+        self.sleep, self.now = vc.sleep, vc.now
+
+
+class _RefusingCtl:
+    """A controller whose named verbs fail, state.get answered by the real mock (a build / pipe that refuses them)."""
+
+    def __init__(self, inner, refuse):
+        self.inner, self.refuse, self.calls = inner, set(refuse), []
+
+    def call(self, method, params=None):
+        self.calls.append((method, dict(params or {})))
+        if method in self.refuse:
+            raise RuntimeError(f"unknown method: {method}")
+        return self.inner.call(method, params)
+
+
+def test_overlay_tracker_forces_starfield_balancing_off_and_restores_it():
+    """Work guide S1: starfield balancing CHANGES sparse highlights on purpose — identity / ON reads of a measuring phase
+    must never go through it. It is a persisted owner setting, so the tracker switches it off and puts it back."""
+    ctl = CalibrationController.mock()
+    ctl.call("runtime.fald_starfield", {"monitor": 1, "mode": "SDR", "enabled": True, "even": 0.7, "lift": 0.2, "even_reach": 5})
+    ctl.call("runtime.fald_temporal", {"monitor": 1, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 80})
+    tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")
+    layers = ctl.state()["layers"]["1:SDR"]
+    assert layers["fald_starfield"] is False and layers["fald_temporal_mode"] == 0      # both forced off for the reads
+    assert layers["fald_star_even"] == 0.7 and layers["fald_star_even_reach"] == 5       # the numbers are not touched
+    meta = tr.file_meta()
+    assert meta["starfield_forced_off"] is True and meta["temporal_forced_off"] is True
+    assert meta["starfield_saved"]["enabled"] is True and meta["starfield_saved"]["even"] == 0.7
+    assert meta["starfield_saved"]["lift"] == 0.2 and meta["starfield_saved"]["even_reach"] == 5
+    assert "forced OFF" in meta["starfield_note"]
+    assert ctl.state()["layers"]["1:HDR"]["fald_starfield"] is False                     # the other mode was never on
+    tr.restore()
+    layers = ctl.state()["layers"]["1:SDR"]
+    assert layers["fald_starfield"] is True and layers["fald_star_even"] == 0.7 and layers["fald_temporal_mode"] == 1
+    res = StageResult("t")
+    tr.report(res, "rings")
+    assert not res.anomalies and any("starfield balancing was ON" in n for n in res.notes)
+
+
+def test_overlay_tracker_leaves_an_off_starfield_alone():
+    ctl = _RefusingCtl(CalibrationController.mock(), refuse=())
+    tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")
+    meta = tr.file_meta()
+    assert meta["starfield_forced_off"] is False and meta["starfield_note"] is None
+    assert meta["starfield_saved"]["enabled"] is False and meta["starfield_saved"]["even_reach"] == 8
+    tr.restore()
+    assert [m for m, _ in ctl.calls if m == "runtime.fald_starfield"] == []               # never switched, never restored
+    res = StageResult("t")
+    tr.report(res, "rings")
+    assert not res.anomalies and not any("starfield" in n for n in res.notes)
+
+
+def test_overlay_tracker_notes_a_build_without_the_starfield_verb():
+    class _OldBuild:
+        def call(self, method, params=None):
+            assert method == "state.get", method                                          # nothing to switch on an old build
+            return {"layers": {"1:SDR": {"fald": False, "fald_temporal_mode": 0}}, "overlay": {"awake": False}}
+    tr = FP.OverlayTracker(_TrackerSession(_OldBuild()), 1, "SDR")
+    meta = tr.file_meta()
+    assert meta["starfield_saved"] is None and meta["starfield_forced_off"] is False
+    assert "build without runtime.fald_starfield" in meta["starfield_note"]
+    res = StageResult("t")
+    tr.report(res, "rings")
+    assert not res.anomalies and any("build without runtime.fald_starfield" in n for n in res.notes)
+
+
+def test_overlay_tracker_flags_a_starfield_it_could_not_switch_off_or_restore():
+    inner = CalibrationController.mock()
+    inner.call("runtime.fald_starfield", {"monitor": 1, "mode": "SDR", "enabled": True})
+    ctl = _RefusingCtl(inner, refuse=("runtime.fald_starfield",))
+    tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")
+    meta = tr.file_meta()
+    assert meta["starfield_forced_off"] is False and meta["starfield_saved"] is None and "refused" in meta["starfield_note"]
+    res = StageResult("t")
+    tr.report(res, "verify")
+    assert [(a.code, a.severity) for a in res.anomalies] == [("starfield_state", "high")]   # reads went THROUGH the balancing
+    # switched off fine, but the restore fails: the owner must hear about it (and the temporal note stays a note)
+    ctl2 = _RefusingCtl(inner, refuse=())
+    tr2 = FP.OverlayTracker(_TrackerSession(ctl2), 1, "SDR")
+    assert tr2.file_meta()["starfield_forced_off"] is True
+    ctl2.refuse.add("runtime.fald_starfield")
+    tr2.restore()
+    res2 = StageResult("t")
+    tr2.report(res2, "verify")
+    assert [(a.code, a.severity) for a in res2.anomalies] == [("starfield_state", "high")]
+    assert "NOT restored" in res2.anomalies[0].detail
+
+
 # ----------------------------------------------------------------------------- stage helpers
 _DEFAULTS = dict(monitor=1, mode="SDR", simulate=True, pipe="", zones="32x18", diagonal_in=32.0, px_mm=None, meter=None,
                  bit_depth=None, white_nits=1000.0, dogegen_server="127.0.0.1:28930", settle=0.0, profile=None,

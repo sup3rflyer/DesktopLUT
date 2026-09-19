@@ -6,6 +6,7 @@
 #include "doctest.h"
 #include "../src/fald.h"
 #include "../src/types.h"
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -276,11 +277,50 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
     }
 }
 
-TEST_CASE("FALD constant buffer is 52 words") {
-    // FillCB writes words up to index 51 (temporal drive state 44-47; boost activation rule 48-51; word 31 = transfer,
-    // 34 = boost step count, 43 = sdrGamma); the HLSL cbuffer FaldCB declares 13 float4 rows.
-    CHECK(FALD_CB_BYTES == 208u);
+TEST_CASE("FALD constant buffer is 68 words") {
+    // FillCB writes words up to index 67 (temporal drive state 44-47; boost activation rule 48-51; starfield balancing
+    // 52-65, 66-67 pad; word 31 = transfer, 34 = boost step count, 35 = starfield on, 43 = sdrGamma); the HLSL cbuffer
+    // FaldCB declares 17 float4 rows.
+    CHECK(FALD_CB_BYTES == 272u);
     CHECK(FALD_CB_BYTES % 16 == 0);
+}
+
+TEST_CASE("FALD starfield balancing: defaults follow the DLC reference and the clamp keeps every range") {
+    // dlc/fald/starfield.py StarfieldParams (DLC tests/test_fald_transfer.py pins the same numbers against types.h)
+    FaldStarfieldSettings d;
+    CHECK_FALSE(d.enabled);                                     // experimental: default OFF
+    CHECK(d.even == 0.8f); CHECK(d.lift == 0.0f); CHECK(d.targetGain == 1.0f); CHECK(d.evenReach == 8u);
+    CHECK(d.targetSigma == 0.0f);                               // round 7: the geometric mean (the spread term is a tunable), even 0.8
+    CHECK(d.keepNits == 100.0f);                                // ... and an absolute floor: no haze to fix below ~100 nits
+    CHECK(d.capNits == 0.0f); CHECK(d.strength == 1.0f); CHECK(d.areaLo == 40.0f); CHECK(d.areaHi == 160.0f);
+    CHECK(d.peakHi == 0.0f); CHECK(d.reach == 2u); CHECK(d.nbLo == 0.15f); CHECK(d.nbHi == 0.30f);
+    FaldStarfieldSettings same = d;
+    FaldStarfieldClamp(same);                                   // the defaults are inside every range
+    CHECK(same.even == d.even); CHECK(same.targetGain == d.targetGain); CHECK(same.evenReach == d.evenReach);
+    CHECK(same.areaLo == d.areaLo); CHECK(same.areaHi == d.areaHi); CHECK(same.reach == d.reach);
+    CHECK(same.nbLo == d.nbLo); CHECK(same.nbHi == d.nbHi);
+
+    FaldStarfieldSettings s;
+    s.enabled = true;
+    s.even = 3.0f; s.lift = -1.0f; s.targetGain = 0.0f; s.evenReach = 99; s.capNits = 1.0e9f; s.strength = 7.0f;
+    s.targetSigma = 9.0f; s.keepNits = 50000.0f;
+    s.areaLo = 500.0f; s.areaHi = 100.0f; s.peakHi = -5.0f; s.reach = 40; s.nbLo = 0.8f; s.nbHi = 0.2f;
+    FaldStarfieldClamp(s);
+    CHECK(s.enabled);                                           // the clamp never touches the switch
+    CHECK(s.even == 1.0f); CHECK(s.lift == 0.0f); CHECK(s.targetGain == 0.05f); CHECK(s.targetSigma == 4.0f); CHECK(s.keepNits == 10000.0f);
+    CHECK(s.evenReach == FALD_STAR_EVEN_REACH_MAX); CHECK(FALD_STAR_EVEN_REACH_MAX == 12u);
+    CHECK(s.capNits == 10000.0f); CHECK(s.strength == 1.0f);
+    CHECK(s.areaLo == 500.0f); CHECK(s.areaHi == 500.0f);       // the pair stays ordered (hi >= lo)
+    CHECK(s.peakHi == 0.0f);
+    CHECK(s.reach == FALD_STAR_REACH_MAX); CHECK(FALD_STAR_REACH_MAX == 4u);
+    CHECK(s.nbLo == 0.8f); CHECK(s.nbHi == 0.8f);
+    s.targetGain = 5.0f; s.even = std::nanf(""); s.nbLo = std::nanf(""); s.targetSigma = -2.0f;
+    FaldStarfieldClamp(s);
+    CHECK(s.targetGain == 2.0f);
+    CHECK(s.targetSigma == 0.0f);
+    CHECK(s.even == 0.8f);                                      // NaN -> the default
+    CHECK(s.nbLo == 0.15f);
+    CHECK(s.nbHi == 0.8f);
 }
 
 TEST_CASE("FALD temporal drive state: alpha and settle frames follow the DLC reference") {

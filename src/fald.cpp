@@ -16,6 +16,9 @@ static ID3D11ComputeShader* g_faldGainCS = nullptr;
 static ID3D11ComputeShader* g_faldBlurCS = nullptr;
 static ID3D11ComputeShader* g_faldTemporalCS = nullptr;   // pass 1b: per-cell drive state (temporal mode only)
 static ID3D11ComputeShader* g_faldBoostCS = nullptr;      // pass 1a: non-black zone count -> LED boost (boost LUT only)
+static ID3D11ComputeShader* g_faldStarStatCS = nullptr;   // starfield balancing S0: star statistic of the source frame
+static ID3D11ComputeShader* g_faldStarWeightCS = nullptr; // S1: tapered protection field + zone weights
+static ID3D11ComputeShader* g_faldStarPlanCS = nullptr;   // S2: target + the plan the pixels sample
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
@@ -48,6 +51,28 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
     if (!(tau > 0.0f) || !(dtMs > 0.0f)) return delay;
     double n = std::ceil(5.0 * (double)tau / (double)dtMs - 1e-4);   // 5 tau; the tolerance keeps exact multiples exact (float32 dt)
     return (n < 1.0 ? 1u : (n > 100000.0 ? 100000u : (unsigned int)n)) + delay;
+}
+
+// Starfield balancing settings: every field into its documented range (DLC StarfieldParams; the mock's validation
+// uses the same limits). NaN -> the default. The smoothstep pairs stay ordered (hi >= lo).
+void FaldStarfieldClamp(FaldStarfieldSettings& s) {
+    auto clampF = [](float v, float lo, float hi, float dflt) { return (v != v) ? dflt : (v < lo ? lo : (v > hi ? hi : v)); };
+    s.even = clampF(s.even, 0.0f, 1.0f, 0.8f);
+    s.lift = clampF(s.lift, 0.0f, 1.0f, 0.0f);
+    s.targetGain = clampF(s.targetGain, 0.05f, 2.0f, 1.0f);
+    s.targetSigma = clampF(s.targetSigma, 0.0f, 4.0f, 0.0f);
+    s.keepNits = clampF(s.keepNits, 0.0f, 10000.0f, 100.0f);
+    if (s.evenReach > FALD_STAR_EVEN_REACH_MAX) s.evenReach = FALD_STAR_EVEN_REACH_MAX;
+    s.capNits = clampF(s.capNits, 0.0f, 10000.0f, 0.0f);
+    s.strength = clampF(s.strength, 0.0f, 1.0f, 1.0f);
+    s.areaLo = clampF(s.areaLo, 0.0f, 1.0e6f, 40.0f);
+    s.areaHi = clampF(s.areaHi, 0.0f, 1.0e6f, 160.0f);
+    if (s.areaHi < s.areaLo) s.areaHi = s.areaLo;
+    s.peakHi = clampF(s.peakHi, 0.0f, 10000.0f, 0.0f);
+    if (s.reach > FALD_STAR_REACH_MAX) s.reach = FALD_STAR_REACH_MAX;
+    s.nbLo = clampF(s.nbLo, 0.0f, 1.0f, 0.15f);
+    s.nbHi = clampF(s.nbHi, 0.0f, 1.0f, 0.30f);
+    if (s.nbHi < s.nbLo) s.nbHi = s.nbLo;
 }
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
@@ -281,6 +306,18 @@ bool InitFaldShaders() {
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldBoostCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(boost) failed" << std::endl; return false; }
+    if (!CompileOne(common + g_faldStarStatSource, "FaldStarStatCS", "cs_5_0", &b)) return false;
+    hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarStatCS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star stat) failed" << std::endl; return false; }
+    if (!CompileOne(common + g_faldStarWeightSource, "FaldStarWeightCS", "cs_5_0", &b)) return false;
+    hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarWeightCS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star weight) failed" << std::endl; return false; }
+    if (!CompileOne(common + g_faldStarPlanSource, "FaldStarPlanCS", "cs_5_0", &b)) return false;
+    hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarPlanCS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star plan) failed" << std::endl; return false; }
     if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
@@ -296,6 +333,9 @@ bool InitFaldShaders() {
 void ReleaseFaldShaders() {
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
+    if (g_faldStarPlanCS) { g_faldStarPlanCS->Release(); g_faldStarPlanCS = nullptr; }
+    if (g_faldStarWeightCS) { g_faldStarWeightCS->Release(); g_faldStarWeightCS = nullptr; }
+    if (g_faldStarStatCS) { g_faldStarStatCS->Release(); g_faldStarStatCS = nullptr; }
     if (g_faldBoostCS) { g_faldBoostCS->Release(); g_faldBoostCS = nullptr; }
     if (g_faldTemporalCS) { g_faldTemporalCS->Release(); g_faldTemporalCS = nullptr; }
     if (g_faldBlurCS) { g_faldBlurCS->Release(); g_faldBlurCS = nullptr; }
@@ -304,12 +344,26 @@ void ReleaseFaldShaders() {
     if (g_faldStatCS) { g_faldStatCS->Release(); g_faldStatCS = nullptr; }
 }
 
-bool FaldShadersReady() { return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldBoostCS && g_faldPS && g_faldSampler; }
+bool FaldShadersReady() {
+    return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldBoostCS &&
+           g_faldStarStatCS && g_faldStarWeightCS && g_faldStarPlanCS && g_faldPS && g_faldSampler;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------------------------
 template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+// Starfield balancing textures: they exist only while the option is on (EnsureStar / FaldRunPasses).
+static void ReleaseStar(FaldResources* r) {
+    SafeRelease(r->starStatSRV); SafeRelease(r->starStatUAV); SafeRelease(r->starStatTex);
+    SafeRelease(r->starWSRV); SafeRelease(r->starWUAV); SafeRelease(r->starWTex);
+    SafeRelease(r->starPlanSRV); SafeRelease(r->starPlanUAV); SafeRelease(r->starPlanTex);
+    SafeRelease(r->starBgSRV); SafeRelease(r->starBgUAV); SafeRelease(r->starBgTex);
+    SafeRelease(r->starPlan2SRV); SafeRelease(r->starPlan2UAV); SafeRelease(r->starPlan2Tex);
+    r->starOn = false;
+    r->starRetryCounter = 0;                 // option off / resources rebuilt: the next enable tries at once
+}
 
 static void ReleaseAll(FaldResources* r) {
     SafeRelease(r->interSRV); SafeRelease(r->interRTV); SafeRelease(r->inter);
@@ -333,6 +387,7 @@ static void ReleaseAll(FaldResources* r) {
         SafeRelease(r->boostSRV[i]); SafeRelease(r->boostUAV[i]); SafeRelease(r->boostTex[i]);
     }
     SafeRelease(r->boostLutSRV); SafeRelease(r->boostLutBuf);
+    ReleaseStar(r);
     SafeRelease(r->cb);
     r->valid = false;
 }
@@ -345,15 +400,41 @@ void FaldReleaseResources(MonitorContext* ctx) {
     ctx->fald = nullptr;
 }
 
-static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11UnorderedAccessView** uav, ID3D11ShaderResourceView** srv) {
+static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11UnorderedAccessView** uav, ID3D11ShaderResourceView** srv,
+                          DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT) {
     D3D11_TEXTURE2D_DESC d = {};
-    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R32_FLOAT;
+    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = format;
     d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
     d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     if (FAILED(g_device->CreateTexture2D(&d, nullptr, tex))) return false;
     if (FAILED(g_device->CreateUnorderedAccessView(*tex, nullptr, uav))) return false;
     if (FAILED(g_device->CreateShaderResourceView(*tex, nullptr, srv))) return false;
     return true;
+}
+
+// The five cols x rows RGBA32F textures of the starfield balancing (created on the first frame the option is on).
+static bool EnsureStar(FaldResources* r) {
+    if (r->starStatTex && r->starWTex && r->starPlanTex && r->starBgTex && r->starPlan2Tex) return true;
+    // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
+    if (r->starRetryCounter != 0 && (r->starRetryCounter++ % 300) != 0) return false;
+    ReleaseStar(r);
+    const FaldPanelParams& p = r->params;
+    const DXGI_FORMAT f = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    if (MakeRWTexture(p.cols, p.rows, &r->starStatTex, &r->starStatUAV, &r->starStatSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &r->starWTex, &r->starWUAV, &r->starWSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &r->starPlanTex, &r->starPlanUAV, &r->starPlanSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &r->starBgTex, &r->starBgUAV, &r->starBgSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &r->starPlan2Tex, &r->starPlan2UAV, &r->starPlan2SRV, f)) {
+        r->starFailLogged = false;
+        return true;
+    }
+    ReleaseStar(r);
+    r->starRetryCounter = 1;
+    if (!r->starFailLogged) {
+        std::cerr << "[FALD] starfield balancing textures could not be created: the option stays off" << std::endl;
+        r->starFailLogged = true;
+    }
+    return false;
 }
 
 static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) {
@@ -448,7 +529,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
         if (!MakeFloatBuffer(lut, &r->boostLutBuf, &r->boostLutSRV)) { r->lastError = "boost LUT buffer"; return false; }
     }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 52 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 68 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -538,6 +619,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
     u[34] = (boostOn && p.hasBoost) ? p.boostN : 0u;                                // black-frame LED boost steps (0 = no term)
+    u[35] = r->starOn ? 1u : 0u;                                                    // starfield balancing (fields in t15 / t18)
     // the panel file's leak colour (tmin * m_c; = tmin for FLD1) is always in the CB so the debug views can show the
     // toggle's influence; pedMode selects it in Correct() (1 only when the file has a colour, else it is a no-op)
     const bool perChannel = (r->pedMode == 1) && p.hasPedColour;
@@ -553,15 +635,25 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     u[46] = r->temporalMode; u[47] = r->stateValid ? 0u : 1u;
     // black-frame LED boost: the zone activation rule (words 48-51; read only when word 34 != 0)
     f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
+    // starfield balancing (words 52-65; read only when word 35 != 0)
+    const FaldResources::StarCB& sc = r->star;
+    f[52] = sc.even; f[53] = sc.lift; f[54] = sc.targetGain; f[55] = sc.capNits;
+    f[56] = sc.strength; f[57] = sc.areaLo; f[58] = sc.areaHi; f[59] = sc.peakHi;
+    f[60] = sc.nbLo; f[61] = sc.nbHi; u[62] = sc.reach; u[63] = sc.evenReach;
+    f[64] = sc.targetSigma; f[65] = sc.keepNits; f[66] = 0.0f; f[67] = 0.0f;        // words 64-65 + two pad words
     g_context->Unmap(r->cb, 0);
 }
 
-static const UINT FALD_SRV_SLOTS = 15;   // t0..t14 (fald_shader.h)
+static const UINT FALD_SRV_SLOTS = 20;   // t0..t19 (fald_shader.h)
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
                                                        r->flatTrueSRV, r->flatEstSRV, nullptr, nullptr, nullptr,
-                                                       r->boostLutSRV, nullptr, nullptr };   // t12: nullptr without a boost LUT
+                                                       r->boostLutSRV, nullptr, nullptr,     // t12: nullptr without a boost LUT
+                                                       r->starOn ? r->starPlanSRV : nullptr, // t15: the starfield plan (Balance)
+                                                       nullptr, nullptr,                     // t16/t17: star passes only (RunStar)
+                                                       r->starOn ? r->starPlan2SRV : nullptr, // t18: ln background, near, spk (Balance)
+                                                       nullptr };                            // t19: star pass S1 only (RunStar)
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
@@ -594,6 +686,44 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
     ID3D11UnorderedAccessView* uavs[2] = { r->driveUAV, r->activeUAV[roundIdx & 1u] };   // u1: nullptr without a boost LUT
     g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);                           // (the shader then never writes it)
     g_context->Dispatch(p.cols, p.rows, 1);
+    UnbindCompute();
+}
+
+// Starfield balancing (option on only): S0 star statistic of the SOURCE frame -> S1 tapered protection + zone weights
+// -> S2 target + plan; every later pass samples plan (t15) and plan2 (t18). Recomputed on EVERY run of the layer — new
+// frame, C2 re-process of the cached frame and temporal settle frame alike: the fields are a pure function of the
+// source frame in r->inter, which all three paths leave valid before FaldRunPasses, so there is no state to keep in
+// step with the content. The passes bind only what they read (never BindCommon: that would bind plan / plan2 as SRVs
+// while S1 / S2 write them).
+static void RunStar(FaldResources* r) {
+    const FaldPanelParams& p = r->params;
+    FillCB(r, 0);
+    ID3D11ShaderResourceView* in2[2] = { r->interSRV, r->curveSRV };
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetSamplers(0, 1, &g_faldSampler);
+    // S0: per zone stat = (peak, speck-zone flag, sparse, solid) + bg = (ln b, brightest pixel's index, lit sum, a_eff)
+    ID3D11UnorderedAccessView* out0[2] = { r->starStatUAV, r->starBgUAV };
+    g_context->CSSetShader(g_faldStarStatCS, nullptr, 0);
+    g_context->CSSetShaderResources(0, 2, in2);
+    g_context->CSSetUnorderedAccessViews(0, 2, out0, nullptr);
+    g_context->Dispatch(p.cols, p.rows, 1);
+    UnbindCompute();
+    // S1: the tapered protection field + flank test + zone weights -> (wt, wt ln peak, flank, spk) and (ln background, near, spk, w)
+    ID3D11UnorderedAccessView* out1[2] = { r->starWUAV, r->starPlan2UAV };
+    g_context->CSSetShader(g_faldStarWeightCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetShaderResources(16, 1, &r->starStatSRV);
+    g_context->CSSetShaderResources(19, 1, &r->starBgSRV);
+    g_context->CSSetUnorderedAccessViews(0, 2, out1, nullptr);
+    g_context->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();
+    // S2: (w0_field, ln target, ln lift, ln peak)
+    ID3D11ShaderResourceView* in3[2] = { r->starStatSRV, r->starWSRV };
+    g_context->CSSetShader(g_faldStarPlanCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetShaderResources(16, 2, in3);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->starPlanUAV, nullptr);
+    g_context->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
     UnbindCompute();
 }
 
@@ -768,6 +898,16 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         ReadBackFloats(r->boostTex[0], boostR[0], 2);
         ReadBackFloats(r->boostTex[1], boostR[1], 2);
     }
+    // starfield balancing: the five zone textures (cols x rows x 4 float32 each). fald_frame.* stays the SOURCE frame;
+    // the balanced frame is not dumped (it exists only inside the passes) — fald_out.* with the option on is
+    // Correct(Balance(source)), and dlc/fald/gpuemu.py reproduces Balance from fald_frame + these fields.
+    if (r->starOn) {
+        DumpTexture(r->starStatTex, dir + L"fald_star_stat.f32", p.cols, p.rows, 16);   // peak, speck-zone flag, sparse, solid
+        DumpTexture(r->starWTex, dir + L"fald_star_w.f32", p.cols, p.rows, 16);         // target weight wt, wt ln peak, flank flag, speck-zone flag
+        DumpTexture(r->starPlanTex, dir + L"fald_star_plan.f32", p.cols, p.rows, 16);   // w0_field, ln target, ln lift, ln peak
+        DumpTexture(r->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16); // ln background, near, speck-zone flag, w
+        DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * cellW + lx, lit sum, a_eff
+    }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
     std::ofstream meta(dir + L"fald_dump.txt");
@@ -789,6 +929,17 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\nactive_zones_r0 " << (int)boostR[0][1] << "\nboost_r0 " << boostR[0][0]
          << " (round 0: the source frame)\nactive_zones_r1 " << (int)boostR[1][1] << "\nboost_r1 " << boostR[1][0]
          << " (round 1: the corrected frame; this boost is in fald_btrue.f32; files fald_active_r0.f32 / fald_active.f32)"
+         << "\nstarfield " << (r->starOn ? 1 : 0) << " (setting " << (fs.star.enabled ? 1 : 0)
+         << "; 1 = every pass read Balance(fald_frame); files fald_star_stat.f32 [peak, speck-zone flag, sparse, solid], fald_star_w.f32"
+         << " [target weight wt, wt ln peak, flank flag, speck-zone flag], fald_star_plan.f32 [w0_field, ln target, ln lift, ln peak],"
+         << " fald_star_plan2.f32 [ln background, near, speck-zone flag, w], fald_star_bg.f32 [ln background, brightest pixel's"
+         << " index ly * cellW + lx, lit sum, a_eff]:"
+         << " cols x rows x 4 float32)"
+         << "\nstarfield even " << r->star.even << " lift " << r->star.lift << " target_gain " << r->star.targetGain
+         << " target_sigma " << r->star.targetSigma << " keep_nits " << r->star.keepNits
+         << " even_reach " << r->star.evenReach << " cap_nits " << r->star.capNits << " strength " << r->star.strength
+         << "\nstarfield area_lo " << r->star.areaLo << " area_hi " << r->star.areaHi << " peak_hi " << r->star.peakHi
+         << " reach " << r->star.reach << " nb_lo " << r->star.nbLo << " nb_hi " << r->star.nbHi
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -814,6 +965,19 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     const FaldSettings& fs = ctx->isHDREnabled ? ctx->hdrColorCorrection.fald : ctx->sdrColorCorrection.fald;
     r->debugMode = fs.debugMode;
     r->pedMode = fs.pedMode;
+    // Starfield balancing (work guide S1): on = the five zone textures exist; off = they are released and nothing
+    // below knows the option exists (CB word 35 = 0, t15 / t18 unbound). The clamped settings always go into the CB words
+    // 52-63 (read by the shaders only when word 35 is set) so a dump reports them either way.
+    {
+        FaldStarfieldSettings st = fs.star;
+        FaldStarfieldClamp(st);
+        r->star.even = st.even; r->star.lift = st.lift; r->star.targetGain = st.targetGain; r->star.capNits = st.capNits;
+        r->star.strength = st.strength; r->star.areaLo = st.areaLo; r->star.areaHi = st.areaHi; r->star.peakHi = st.peakHi;
+        r->star.nbLo = st.nbLo; r->star.nbHi = st.nbHi; r->star.reach = st.reach; r->star.evenReach = st.evenReach;
+        r->star.targetSigma = st.targetSigma; r->star.keepNits = st.keepNits;
+        if (st.enabled) r->starOn = EnsureStar(r);
+        else if (r->starStatTex || r->starWTex || r->starPlanTex || r->starBgTex || r->starPlan2Tex || r->starOn) ReleaseStar(r);
+    }
 
     // Temporal drive state (pass 1b; DLC dlc/fald/temporal.py). dt = the interval between consecutive runs while
     // rendering continuously (EMA over 2..100 ms intervals; a long static gap keeps the last estimate — the response
@@ -853,6 +1017,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
 
     // black-frame LED boost (panel files with a LUT): each round's boost comes from the zone flags of the frame the
     // panel receives in that round, and is NOT filtered by the temporal state (instant on the panel)
+    if (r->starOn) RunStar(r);             // the plan of THIS source frame; every pass below reads Balance(source)
     RunStat(r, 0);
     RunBoost(r, 0);
     if (temporal) RunTemporal(r, inDrive); // both rounds read the SAME committed state (DriveState.peek)

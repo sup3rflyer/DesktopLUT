@@ -76,7 +76,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
                           "fald_ped_mode, fald_ped_colour_in_file, fald_boost_in_file (the panel file is FLD4 with a "
                           "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "
-                          "fald_tau_fall_ms, fald_delay_frames (runtime.fald_temporal), and fald_file_transfer 'pq'|'gamma' when the "
+                          "fald_tau_fall_ms, fald_delay_frames (runtime.fald_temporal), fald_starfield (bool) + fald_star_even, "
+                          "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
+                          "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
+                          "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), and "
+                          "fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
@@ -363,13 +367,15 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "runtime.fald_debug",
             "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map white/red +/blue -, 2 real "
             "backlight, 3 panel estimate, 4 identity passthrough, 5 pedestal term x100, 6 per-channel-vs-white "
-            "influence x100, 7 temporal settling map red rising/blue falling; not persisted) and/or the pedestal mode "
+            "influence x100, 7 temporal settling map red rising/blue falling, 8 the black-frame boost's non-black zone "
+            "map, 9 the starfield balancing zone map — grey = zone weight, blue = peak pulled down, red = lifted; not "
+            "persisted) and/or the pedestal mode "
             "(ped_mode 0 = white pedestal, 1 = the FLD2 panel file's per-channel leak colour; persisted, "
             "= the GUI 'Per-channel pedestal' checkbox). At least one of the two.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "debug_mode": ApiParamSpec("number", required=False, description="0..8 (8 = the black-frame boost's non-black zone map)"),
+                "debug_mode": ApiParamSpec("number", required=False, description="0..9 (8 = the black-frame boost's non-black zone map, 9 = starfield balancing zones)"),
                 "ped_mode": ApiParamSpec("number", required=False, description="0 | 1"),
             },
             {"monitor_mode": "string", "debug_mode": "number", "ped_mode": "number", "ped_colour_in_file": "boolean"},
@@ -405,10 +411,61 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             gui_thread_required=True,
         ),
         ApiMethodSpec(
+            "runtime.fald_starfield",
+            "FALD compensation layer: starfield balancing (EXPERIMENT, default off; work guide ticket S1; the complete "
+            "rules = the module docstring of dlc/fald/starfield.py, GPU-order twin dlc/fald/gpuemu.py, HLSL "
+            "src/fald_shader.h). On a mini-LED panel a sparse sub-zone highlight sets its zone's LED drive by its REQUESTED "
+            "level, so a field of scattered specks drives its zones unevenly (zone-shaped haze patches). A zone with "
+            "star-like content (effective lit area ABOVE THE ZONE'S BACKGROUND — its darkest pixel, so a lit or grainy sky "
+            "does not count — between area_lo and area_hi px^2; optionally peak below peak_hi) has its peak pulled toward "
+            "a spread-aware target — exp(mean + target_sigma x std) of ln peak over the star-like peaks within `even_reach` "
+            "zones (tapered window; the spill of a bright star into a neighbour zone does not count), x target_gain, never "
+            "below keep_nits (specks up to ~100 nits make no visible haze: a field below it is left bit-identical), "
+            "optionally under cap_nits — by `even` in the log domain (defaults: target_sigma 0 = the geometric mean, even "
+            "0.8, keep_nits 100; keep_nits is what spares a dim heavy-tailed star field, target_sigma > 0 is a tunable that "
+            "compresses the outliers only, even < 1 keeps their order), dim specks optionally lifted (`lift`), all under `strength`. Solid content (drive nb_lo..nb_hi) "
+            "protects its neighbourhood through a tapered field — `reach` zones fully, one more at half — interpolated "
+            "per pixel. Per pixel one hue-preserving scale, only inside zones that hold a speck, never below the zone's "
+            "background; zone fields bilinear between zone centres; untouched content bit-identical. It CHANGES the "
+            "content on purpose; the rest of the layer (statistic, boost count, correction) works on the balanced frame. "
+            "Partial updates (any subset; at least one), persisted per mode (= the GUI 'Starfield' row, which sets both "
+            "modes). Measuring phases must run with it OFF (fald_profile forces it off and restores it).",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "enabled": ApiParamSpec("boolean", required=False, description="the switch (default false)"),
+                "even": ApiParamSpec("number", required=False, description="0..1 log-domain pull toward the target (default 0.8)"),
+                "target_sigma": ApiParamSpec("number", required=False, description="0..4 standard deviations of ln peak above the local mean (default 0 = geometric mean)"),
+                "keep_nits": ApiParamSpec("number", required=False, description="0..10000 as-if-white nits: the target never falls below it (default 100; 0 = no floor)"),
+                "lift": ApiParamSpec("number", required=False, description="0..1 (default 0 = cap-only)"),
+                "target_gain": ApiParamSpec("number", required=False, description="0.05..2 (default 1)"),
+                "even_reach": ApiParamSpec("number", required=False, description="integer 0..12 zones (default 8)"),
+                "cap_nits": ApiParamSpec("number", required=False, description="0..10000 as-if-white nits, 0 = none (default 0)"),
+                "strength": ApiParamSpec("number", required=False, description="0..1 (default 1)"),
+                "area_lo": ApiParamSpec("number", required=False, description="px^2, fully star-like at / below (default 40)"),
+                "area_hi": ApiParamSpec("number", required=False, description="px^2, not star-like at / above; >= area_lo (default 160)"),
+                "peak_hi": ApiParamSpec("number", required=False, description="0..10000 nits, 0 = no limit (default 0)"),
+                "reach": ApiParamSpec("number", required=False, description="integer 0..4 zones of full protection around solid content; the taper adds one at half (default 2)"),
+                "nb_lo": ApiParamSpec("number", required=False, description="0..1 solid neighbour drive, full effect at / below (default 0.15)"),
+                "nb_hi": ApiParamSpec("number", required=False, description="0..1, no effect at / above; >= nb_lo (default 0.30)"),
+            },
+            {"monitor_mode": "string", "enabled": "boolean", "even": "number", "lift": "number", "target_gain": "number", "target_sigma": "number", "keep_nits": "number",
+             "even_reach": "number", "cap_nits": "number", "strength": "number", "area_lo": "number", "area_hi": "number",
+             "peak_hi": "number", "reach": "number", "nb_lo": "number", "nb_hi": "number"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
             "runtime.fald_dump",
             "FALD compensation layer: on the next frame the layer runs, dump its drive map, both "
             "backlight fields and the frame it saw into `dir` (reference comparison against the Python "
-            "model, see results/.../sim/fald_compare_dump.py).",
+            "model, see results/.../sim/fald_compare_dump.py). With starfield balancing on it adds five zone textures, "
+            "cols x rows x 4 float32 each: fald_star_stat.f32 (peak, speck-zone flag, sparse, solid), fald_star_bg.f32 "
+            "(ln background of the zone's darkest pixel, the brightest pixel's index ly * cellW + lx inside the zone, lit sum, "
+            "a_eff above the background), fald_star_w.f32 (wt = the zone's weight in the target average [0 on a flank zone], "
+            "wt ln peak, flank flag, speck-zone flag), fald_star_plan.f32 (w0_field, ln target, ln lift, ln peak) and "
+            "fald_star_plan2.f32 (ln background, near = the tapered protection field, speck-zone flag, w) — and `starfield ...` lines "
+            "in fald_dump.txt; fald_frame.* stays the SOURCE frame.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
