@@ -149,9 +149,12 @@ def test_activation_rule_on_the_discriminating_reads(boosted):
     assert count([((16,) * 3, FULL)]) == 0 and count([((32,) * 3, FULL)]) == n
 
 
-def test_shader_model_is_boost_blind_until_the_file_carries_it(plain, boosted):
-    assert shader_model(plain) is plain
-    sm = shader_model(boosted)
-    assert sm.p.boost_lut == () and shader_model(boosted) is sm                  # cached
+def test_shader_model_is_boost_aware_unless_the_file_lacks_the_block(plain, boosted):
+    """C12: the panel file carries the LUT (FLD4), so the shader runs the fit's own model; only an OLD file without
+    the block (verify --bin) makes the layer boost-blind while the panel still boosts."""
+    assert shader_model(plain) is plain and shader_model(plain, boost_in_file=False) is plain
+    assert shader_model(boosted) is boosted
+    sm = shader_model(boosted, boost_in_file=False)
+    assert sm.p.boost_lut == () and shader_model(boosted, boost_in_file=False) is sm   # cached
     img = plain.render([BLACK, window()])
     assert np.array_equal(correct_image(sm, img)["req"], correct_image(plain, img)["req"])

@@ -507,7 +507,8 @@ inline int TonemapCurveToDropdownIndex(TonemapCurve curve) {
 struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
-    unsigned int debugMode = 0;   // 0 = correct, 1 = gain map (white 0, red +, blue -), 2 = show B_true, 3 = show B_est, 4 = identity passthrough (not persisted)
+    unsigned int debugMode = 0;   // 0 = correct, 1 = gain map (white 0, red +, blue -), 2 = show B_true, 3 = show B_est, 4 = identity passthrough,
+                                  // 5/6 pedestal views, 7 temporal settling, 8 black-frame boost zone map (fald_shader.h; not persisted)
     unsigned int pedMode = 0;     // pedestal colour (persisted, GUI "Per-channel pedestal"): 0 = white pedestal, hue-preserving
                                   // subtraction (pre-2026-09-13 behaviour); 1 = the panel file's per-channel pedestal colour
                                   // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.

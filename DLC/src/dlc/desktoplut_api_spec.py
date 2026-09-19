@@ -74,7 +74,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"
                           "; HDR adds tonemap_dynamic, tonemap_target_peak; every pair (HDR and SDR, the FALD "
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
-                          "fald_ped_mode, fald_ped_colour_in_file, fald_temporal_mode, fald_tau_rise_ms, "
+                          "fald_ped_mode, fald_ped_colour_in_file, fald_boost_in_file (the panel file is FLD4 with a "
+                          "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "
                           "fald_tau_fall_ms, fald_delay_frames (runtime.fald_temporal), and fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
@@ -368,7 +369,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "debug_mode": ApiParamSpec("number", required=False, description="0..7"),
+                "debug_mode": ApiParamSpec("number", required=False, description="0..8 (8 = the black-frame boost's non-black zone map)"),
                 "ped_mode": ApiParamSpec("number", required=False, description="0 | 1"),
             },
             {"monitor_mode": "string", "debug_mode": "number", "ped_mode": "number", "ped_colour_in_file": "boolean"},

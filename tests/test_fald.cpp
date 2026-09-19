@@ -1,15 +1,18 @@
 // FALD panel-parameter loader + lattice check (src/fald.cpp). The file layout is the DLC exporter's
 // (DLC/src/dlc/fald/export.py docstring): 32-word header (FLD1), 40-word (FLD2, + pedestal colour) or
-// 48-word (FLD3, + signal transfer words 40/41 for SDR/ACM gamma fits), curve[curve_n], k_true, k_est. No D3D here —
+// 48-word (FLD3, + signal transfer words 40/41 for SDR/ACM gamma fits) or 104-word (FLD4, + the black-frame LED boost
+// block, words 48-103), curve[curve_n], k_true, k_est. No D3D here —
 // the GPU passes are checked against the Python reference by DLC's fald_compare_dump on a live dump.
 #include "doctest.h"
 #include "../src/fald.h"
 #include "../src/types.h"
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -273,10 +276,10 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
     }
 }
 
-TEST_CASE("FALD constant buffer is 48 words") {
-    // FillCB writes words up to index 47 (temporal drive state 44-47; word 31 = transfer, 43 = sdrGamma); the HLSL
-    // cbuffer FaldCB declares 12 float4 rows.
-    CHECK(FALD_CB_BYTES == 192u);
+TEST_CASE("FALD constant buffer is 52 words") {
+    // FillCB writes words up to index 51 (temporal drive state 44-47; boost activation rule 48-51; word 31 = transfer,
+    // 34 = boost step count, 43 = sdrGamma); the HLSL cbuffer FaldCB declares 13 float4 rows.
+    CHECK(FALD_CB_BYTES == 208u);
     CHECK(FALD_CB_BYTES % 16 == 0);
 }
 
@@ -511,4 +514,239 @@ TEST_CASE("FALD panel file transfer peek + mode match") {
     CHECK_FALSE(FaldTransferMatchesMode(FALD_TRANSFER_PQ, false));
     CHECK(FaldTransferMatchesMode(FALD_TRANSFER_GAMMA, false));
     CHECK_FALSE(FaldTransferMatchesMode(FALD_TRANSFER_GAMMA, true));
+}
+
+// FLD4: the 48 FLD3 words + 56 (word 48 step count, 49-52 activation rule lit_nits / lit_frac / dim_nits / dim_frac,
+// 53-55 reserved, 56-103 = 24 x (zone fraction lo, boost)); tables follow at byte 416. Written for every fit with a
+// black-frame LED boost LUT (DLC export.py); words 32-39 / 40-41 as in FLD3.
+static Image Fld4Image(const std::vector<std::pair<float, float>>& steps, uint32_t transfer = 0u, float gamma = 0.0f) {
+    Image im = Image::Valid();
+    im.header[0] = 0x464C4434u;                                  // 'FLD4'
+    im.header.resize(104, 0);
+    im.header[40] = transfer;
+    im.SetF(41, gamma);
+    im.header[48] = (uint32_t)steps.size();
+    im.SetF(49, 0.35f); im.SetF(50, 0.0f); im.SetF(51, 0.011f); im.SetF(52, 0.19f);
+    for (size_t i = 0; i < steps.size() && i < 24; i++) { im.SetF(56 + 2 * (int)i, steps[i].first); im.SetF(57 + 2 * (int)i, steps[i].second); }
+    return im;
+}
+
+// The measured PA32UCXR staircase (DLC results/fald_inside_2026-09-18/boost_table.json, 15 steps of 2304 zones).
+static const std::vector<std::pair<float, float>> kBoostSteps = {
+    { 0.0f, 1.1783925f }, { 38.0f / 2304.0f, 1.1666131f }, { 145.5f / 2304.0f, 1.1458136f }, { 166.5f / 2304.0f, 1.1140031f },
+    { 192.0f / 2304.0f, 1.1027556f }, { 213.5f / 2304.0f, 1.0962563f }, { 234.5f / 2304.0f, 1.0f }, { 255.5f / 2304.0f, 1.0712100f },
+    { 276.0f / 2304.0f, 1.0631246f }, { 312.0f / 2304.0f, 1.0573641f }, { 330.0f / 2304.0f, 1.0487917f }, { 414.0f / 2304.0f, 1.0270433f },
+    { 486.0f / 2304.0f, 1.0166089f }, { 654.0f / 2304.0f, 1.0080826f }, { 801.0f / 2304.0f, 1.0f } };
+
+TEST_CASE("FALD loader: FLD4 carries the black-frame LED boost LUT; older files load without one") {
+    FaldPanelParams p; std::string err;
+    {
+        FaldTempFile tf(L"test_fald_fld4_valid.bin");
+        WriteBytes(tf.path, Fld4Image(kBoostSteps).Bytes());
+        REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(p.hasBoost);
+        CHECK(p.boostN == 15u);
+        CHECK(p.boostLo[0] == 0.0f); CHECK(p.boostVal[0] == doctest::Approx(1.1783925f));
+        CHECK(p.boostLo[6] == doctest::Approx(234.5f / 2304.0f)); CHECK(p.boostVal[6] == 1.0f);
+        CHECK(p.boostLo[14] == doctest::Approx(801.0f / 2304.0f)); CHECK(p.boostVal[14] == 1.0f);
+        CHECK(p.boostVal[15] == 0.0f);                              // unused entries stay zero
+        CHECK(p.boostLitNits == doctest::Approx(0.35f)); CHECK(p.boostLitFrac == 0.0f);
+        CHECK(p.boostDimNits == doctest::Approx(0.011f)); CHECK(p.boostDimFrac == doctest::Approx(0.19f));
+        CHECK(p.hasTransfer); CHECK(p.transfer == FALD_TRANSFER_PQ); CHECK_FALSE(p.hasPedColour);
+        CHECK(p.white == doctest::Approx(1842.0f));
+        CHECK(p.curve.size() == 16); CHECK(p.kTrue.size() == 36);
+        CHECK(p.curve[15] == doctest::Approx(1.0f)); CHECK(p.kEst[5] == doctest::Approx(0.10f));   // tables read from the 416-byte offset
+    }
+    {
+        // the maximum of 24 steps; with a pedestal colour block and a gamma transfer: every optional block at once
+        FaldTempFile tf(L"test_fald_fld4_full.bin");
+        std::vector<std::pair<float, float>> steps;
+        for (int i = 0; i < 24; i++) steps.push_back({ (float)i / 24.0f, 1.2f - 0.008f * (float)i });
+        Image im = Fld4Image(steps, 1u, 2.2f);
+        im.SetF(32, 0.756f); im.SetF(33, 1.057f); im.SetF(34, 1.366f); im.header[35] = 1u;
+        WriteBytes(tf.path, im.Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf.path, q, err));
+        CHECK(q.boostN == 24u); CHECK(q.boostLo[23] == doctest::Approx(23.0f / 24.0f));
+        CHECK(q.hasPedColour); CHECK(q.transfer == FALD_TRANSFER_GAMMA); CHECK(q.sdrGamma == doctest::Approx(2.2f));
+    }
+    {
+        // step count 0 = no boost: the block is ignored, the defaults stay
+        FaldTempFile tf(L"test_fald_fld4_empty.bin");
+        Image im = Fld4Image({});
+        im.SetF(49, -5.0f);                                          // garbage in an unused block is not read
+        WriteBytes(tf.path, im.Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf.path, q, err));
+        CHECK_FALSE(q.hasBoost); CHECK(q.boostN == 0u);
+        CHECK(q.boostLitNits == doctest::Approx(0.35f));
+        CHECK(FaldBoostOfCount(q, 100u) == 1.0f);
+    }
+    {
+        // FLD1 / FLD2 / FLD3 files: boost absent
+        FaldTempFile tf1(L"test_fald_fld4_old1.bin");
+        WriteBytes(tf1.path, Image::Valid().Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf1.path, q, err));
+        CHECK_FALSE(q.hasBoost); CHECK(q.boostN == 0u);
+        FaldTempFile tf2(L"test_fald_fld4_old2.bin");
+        Image im2 = Image::Valid(); im2.header[0] = 0x464C4432u; im2.header.resize(40, 0);
+        im2.SetF(32, 1.0f); im2.SetF(33, 1.0f); im2.SetF(34, 1.0f);
+        WriteBytes(tf2.path, im2.Bytes());
+        REQUIRE(LoadFaldPanelParams(tf2.path, q, err));
+        CHECK_FALSE(q.hasBoost); CHECK(q.boostN == 0u);
+        FaldTempFile tf3(L"test_fald_fld4_old3.bin");
+        Image im3 = Fld3Image(1u, 2.2f);
+        im3.header[42] = 7u;                                         // FLD3 reserved words are not a boost block
+        WriteBytes(tf3.path, im3.Bytes());
+        REQUIRE(LoadFaldPanelParams(tf3.path, q, err));
+        CHECK_FALSE(q.hasBoost); CHECK(q.boostN == 0u);
+    }
+    {
+        // reset-on-load: an FLD4 file followed by an FLD1 file leaves no boost behind
+        FaldTempFile tf4(L"test_fald_fld4_reset4.bin");
+        WriteBytes(tf4.path, Fld4Image(kBoostSteps).Bytes());
+        FaldTempFile tf1(L"test_fald_fld4_reset1.bin");
+        WriteBytes(tf1.path, Image::Valid().Bytes());
+        FaldPanelParams q;
+        REQUIRE(LoadFaldPanelParams(tf4.path, q, err));
+        REQUIRE(q.hasBoost);
+        REQUIRE(LoadFaldPanelParams(tf1.path, q, err));
+        CHECK_FALSE(q.hasBoost); CHECK(q.boostN == 0u); CHECK(q.boostVal[0] == 0.0f);
+        CHECK(FaldBoostOfCount(q, 10u) == 1.0f);
+    }
+}
+
+TEST_CASE("FALD loader: implausible FLD4 boost words are refused, not defaulted") {
+    FaldPanelParams p; std::string err;
+    auto refused = [&](const wchar_t* name, const Image& im, const char* needle) {
+        FaldTempFile tf(name);
+        WriteBytes(tf.path, im.Bytes());
+        err.clear();
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK_MESSAGE(err.find(needle) != std::string::npos, err);
+    };
+    { Image im = Fld4Image(kBoostSteps); im.header[48] = 25u; refused(L"test_fald_fld4_count.bin", im, "boost step count"); }
+    { Image im = Fld4Image({ { 0.0f, 1.17f }, { 0.2f, 1.1f }, { 0.1f, 1.0f } }); refused(L"test_fald_fld4_desc.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 1.17f }, { 0.2f, 1.1f }, { 0.2f, 1.0f } }); refused(L"test_fald_fld4_equal.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 1.17f }, { 1.5f, 1.0f } }); refused(L"test_fald_fld4_lo_hi.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { -0.1f, 1.17f }, { 0.5f, 1.0f } }); refused(L"test_fald_fld4_lo_neg.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 0.4f } }); refused(L"test_fald_fld4_val_lo.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 2.5f } }); refused(L"test_fald_fld4_val_hi.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 1.17f } }); im.header[57] = 0x7FC00000u; refused(L"test_fald_fld4_nan.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 1.17f } }); im.header[57] = 0u; refused(L"test_fald_fld4_zero.bin", im, "boost LUT"); }   // a missing boost is not 1.0
+    { Image im = Fld4Image(kBoostSteps); im.SetF(49, -1.0f); refused(L"test_fald_fld4_lit.bin", im, "boost activation"); }
+    { Image im = Fld4Image(kBoostSteps); im.SetF(50, 1.0f); refused(L"test_fald_fld4_litfrac.bin", im, "boost activation"); }
+    { Image im = Fld4Image(kBoostSteps); im.SetF(52, 1.5f); refused(L"test_fald_fld4_dimfrac.bin", im, "boost activation"); }
+    { Image im = Fld4Image(kBoostSteps); im.header[51] = 0x7FC00000u; refused(L"test_fald_fld4_dimnan.bin", im, "boost activation"); }
+    { Image im = Fld4Image(kBoostSteps, 2u); refused(L"test_fald_fld4_xfer.bin", im, "transfer"); }
+    { Image im = Fld4Image(kBoostSteps); im.kEst.pop_back(); refused(L"test_fald_fld4_size.bin", im, "size mismatch"); }
+    {
+        // FLD4 magic but the file ends inside the 416-byte header: refused as short, not parsed from table bytes
+        FaldTempFile tf(L"test_fald_fld4_short.bin");
+        std::vector<char> b = Fld4Image(kBoostSteps).Bytes();
+        b.resize(400);
+        WriteBytes(tf.path, b);
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+        CHECK(err.find("too short") != std::string::npos);
+    }
+    {
+        // an FLD3-sized file with the FLD4 magic (header + tables of an FLD3): short or size mismatch, never loaded
+        FaldTempFile tf(L"test_fald_fld4_as3.bin");
+        Image im = Fld3Image(0u, 0.0f); im.header[0] = 0x464C4434u;
+        WriteBytes(tf.path, im.Bytes());
+        CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
+    }
+}
+
+TEST_CASE("FALD boost lookup by zone count follows DLC FaldModel.boost_of_fraction") {
+    // the step applies from the first N with N / zones >= lo; an edge that IS a zone count (38 / 2304 went through
+    // float32) stays at that count. DLC twin: panelfile.boost_zone_threshold (tests/test_fald_boost_gpu.py).
+    CHECK(FaldBoostZoneThreshold(0.0f, 2304u) == 0u);
+    CHECK(FaldBoostZoneThreshold(38.0f / 2304.0f, 2304u) == 38u);
+    CHECK(FaldBoostZoneThreshold(145.5f / 2304.0f, 2304u) == 146u);
+    CHECK(FaldBoostZoneThreshold(234.5f / 2304.0f, 2304u) == 235u);
+    CHECK(FaldBoostZoneThreshold(255.5f / 2304.0f, 2304u) == 256u);
+    CHECK(FaldBoostZoneThreshold(801.0f / 2304.0f, 2304u) == 801u);
+    CHECK(FaldBoostZoneThreshold(1.0f, 2304u) == 2304u);
+    for (unsigned int n = 0; n <= 2304u; n++)                       // every exact edge of this lattice round-trips float32
+        CHECK(FaldBoostZoneThreshold((float)((double)n / 2304.0), 2304u) == n);
+    CHECK(FaldBoostZoneThreshold(0.5f, 512u * 512u) == 131072u);    // the loader's largest lattice
+
+    FaldTempFile tf(L"test_fald_fld4_lookup.bin");
+    Image im = Fld4Image(kBoostSteps);
+    im.header[1] = 48u; im.header[2] = 48u;                          // the PA32UCXR lattice (the lookup needs cols x rows)
+    WriteBytes(tf.path, im.Bytes());
+    FaldPanelParams p; std::string err;
+    REQUIRE(LoadFaldPanelParams(tf.path, p, err));
+    CHECK(FaldBoostOfCount(p, 0u) == doctest::Approx(1.1783925f));
+    CHECK(FaldBoostOfCount(p, 37u) == doctest::Approx(1.1783925f));
+    CHECK(FaldBoostOfCount(p, 38u) == doctest::Approx(1.1666131f));
+    CHECK(FaldBoostOfCount(p, 126u) == doctest::Approx(1.1666131f));  // the 600-px window on black (HW 2026-09-18)
+    CHECK(FaldBoostOfCount(p, 145u) == doctest::Approx(1.1666131f));
+    CHECK(FaldBoostOfCount(p, 146u) == doctest::Approx(1.1458136f));
+    CHECK(FaldBoostOfCount(p, 234u) == doctest::Approx(1.0962563f));
+    CHECK(FaldBoostOfCount(p, 235u) == 1.0f);                         // the dead band N 235..255
+    CHECK(FaldBoostOfCount(p, 255u) == 1.0f);
+    CHECK(FaldBoostOfCount(p, 256u) == doctest::Approx(1.0712100f));
+    CHECK(FaldBoostOfCount(p, 800u) == doctest::Approx(1.0080826f));
+    CHECK(FaldBoostOfCount(p, 801u) == 1.0f);
+    CHECK(FaldBoostOfCount(p, 2304u) == 1.0f);
+    // a LUT that starts above 0: below its first step the boost is 1
+    FaldTempFile tf2(L"test_fald_fld4_lookup2.bin");
+    Image im2 = Fld4Image({ { 0.25f, 1.1f } });
+    WriteBytes(tf2.path, im2.Bytes());                               // 2 x 2 lattice: the step starts at 1 zone of 4
+    REQUIRE(LoadFaldPanelParams(tf2.path, p, err));
+    CHECK(FaldBoostOfCount(p, 0u) == 1.0f);
+    CHECK(FaldBoostOfCount(p, 1u) == doctest::Approx(1.1f));
+}
+
+TEST_CASE("FALD panel file peeks understand FLD4") {
+    FaldTempFile tf(L"test_fald_peek_fld4.bin");
+    WriteBytes(tf.path, Fld4Image(kBoostSteps).Bytes());
+    uint32_t t = 99;
+    CHECK(FaldPanelFileHasBoost(tf.path));
+    CHECK(FaldPanelFileTransfer(tf.path, t)); CHECK(t == FALD_TRANSFER_PQ);
+    CHECK_FALSE(FaldPanelFileHasPedColour(tf.path));
+    FaldTempFile tfg(L"test_fald_peek_fld4g.bin");
+    Image img = Fld4Image(kBoostSteps, 1u, 2.2f);
+    img.SetF(32, 1.0f); img.SetF(33, 1.0f); img.SetF(34, 1.0f);
+    WriteBytes(tfg.path, img.Bytes());
+    t = 99; CHECK(FaldPanelFileTransfer(tfg.path, t)); CHECK(t == FALD_TRANSFER_GAMMA);
+    CHECK(FaldPanelFileHasPedColour(tfg.path));
+    FaldTempFile tf0(L"test_fald_peek_fld4_0.bin");
+    WriteBytes(tf0.path, Fld4Image({}).Bytes());
+    CHECK_FALSE(FaldPanelFileHasBoost(tf0.path));                   // FLD4 with step count 0
+    FaldTempFile tf3(L"test_fald_peek_fld4_3.bin");
+    Image im3 = Fld3Image(0u, 0.0f);
+    WriteBytes(tf3.path, im3.Bytes());
+    CHECK_FALSE(FaldPanelFileHasBoost(tf3.path));                   // FLD3
+    FaldTempFile tf1(L"test_fald_peek_fld4_1.bin");
+    WriteBytes(tf1.path, Image::Valid().Bytes());
+    CHECK_FALSE(FaldPanelFileHasBoost(tf1.path));                   // FLD1 (its curve words are not a boost block)
+    CHECK_FALSE(FaldPanelFileHasBoost(L"test_fald_peek_fld4_missing.bin"));
+}
+
+// Cross-language check on a REAL export (no file in the repo: panel files are local data). Set FALD_TEST_PANEL_FILE
+// to a file written by `python -m dlc.fald.export` and the C++ loader must accept it; FALD_TEST_PANEL_BOOST_STEPS
+// (optional) = the boost step count it must carry. Without the variable the case checks nothing.
+TEST_CASE("FALD loader: an exported panel file named by FALD_TEST_PANEL_FILE loads") {
+    char* path = nullptr; size_t len = 0;
+    if (_dupenv_s(&path, &len, "FALD_TEST_PANEL_FILE") != 0 || !path) return;
+    std::string narrow(path); free(path);
+    std::wstring wide(narrow.begin(), narrow.end());               // ASCII paths only (a test convenience)
+    FaldPanelParams p; std::string err;
+    const bool ok = LoadFaldPanelParams(wide, p, err);
+    CHECK_MESSAGE(ok, err);
+    if (!ok) return;
+    MESSAGE("panel file: " << p.cols << "x" << p.rows << " cells, white " << p.white << ", boost steps " << p.boostN
+            << ", lit " << p.boostLitNits << "/" << p.boostLitFrac << ", dim " << p.boostDimNits << "/" << p.boostDimFrac
+            << ", boost(126 zones) " << FaldBoostOfCount(p, 126u) << ", boost(240 zones) " << FaldBoostOfCount(p, 240u)
+            << ", boost(256 zones) " << FaldBoostOfCount(p, 256u));
+    CHECK(FaldPanelFileHasBoost(wide) == p.hasBoost);
+    char* steps = nullptr;
+    if (_dupenv_s(&steps, &len, "FALD_TEST_PANEL_BOOST_STEPS") == 0 && steps) {
+        CHECK(p.boostN == (uint32_t)std::atoi(steps));
+        free(steps);
+    }
 }

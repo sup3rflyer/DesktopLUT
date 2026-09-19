@@ -6,7 +6,14 @@ and a full-resolution scRGB frame (H, W, 3).
 Origin: the 2026-09-15 SDR verification (work guide: "GPU = Python is proven at 2 nits" — bit-exact vs a real
 ``fald_dump``). Kept in the tree so the temporal drive state (:class:`GpuDriveState`, pass 1b) and later
 shader changes have an offline GPU-order reference next to the model-side one (:mod:`dlc.fald.temporal`).
-White-pedestal mode only (pedMode 0)."""
+White-pedestal mode only (pedMode 0).
+
+Black-frame LED boost (FLD4 panel files, work guide C12): the statistic pass also writes each zone's NON-BLACK flag
+(full-resolution pixel counts — the model's :meth:`FaldModel.active_zone_fraction` counts scale-5 raster pixels, so
+the two agree on lattice-aligned / >= 5-px content), pass 1a turns the count into the frame's boost
+(:func:`dlc.fald.panelfile.boost_of_count`), the conv pass multiplies B_true by it — per round, on the frame the
+panel receives (round 0 the source, round 1 the corrected frame), never filtered by the temporal state. A file
+without a LUT runs none of it."""
 from __future__ import annotations
 
 from typing import Optional
@@ -14,6 +21,7 @@ from typing import Optional
 import numpy as np
 from scipy.signal import convolve2d
 
+from .panelfile import boost_of_count
 from .temporal import MODE_BOTH, MODE_OFF, MODE_TRUE_ONLY, alpha_from_tau
 
 f32 = np.float32
@@ -112,6 +120,10 @@ class Emu:
         self.sigma = float(f32(o["gainSmoothCells"]) * f32(o["sub"]))
         self.pedMode = 1 if (ped_mode == 1 and o["hasPedColour"]) else 0
         assert self.pedMode == 0, "channel pedestal mode not emulated"
+        # black-frame LED boost (CB word 34 boostN + words 48-51); 0 = no LUT in the file: the passes below are skipped
+        self.boostN = int(o.get("boostN", 0)) if o.get("hasBoost") else 0
+        self.litNits, self.litFrac = f32(o.get("boostLitNits", 0.35)), f32(o.get("boostLitFrac", 0.0))
+        self.dimNits, self.dimFrac = f32(o.get("boostDimNits", 0.011)), f32(o.get("boostDimFrac", 0.19))
         self.flatT = self.conv(np.ones((self.rows, self.cols)), o["kTrue"])
         self.flatE = self.conv(np.ones((self.rows, self.cols)), o["kEst"])
         # bilinear sample tables for pixel centres (SampleLevel, linear, clamp) — FineUV with the lattice origin removed
@@ -178,6 +190,23 @@ class Emu:
         stat = np.minimum(m, tot / f32(self.area0))
         return self.drive_of(stat), stat
 
+    # ---- CS stat, the boost part (u1): per zone, LIT-or-DIM on the pixel's brightest channel (NOT capped at white)
+    def stat_active(self, img):
+        mc = img.max(axis=0)[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw].astype(np.float32)
+        blocks = mc.reshape(self.rows, self.ch, self.cols, self.cw)
+        n = f32(self.cw * self.ch)
+        lit_f = (blocks > self.litNits).sum(axis=(1, 3)).astype(np.float32) / n
+        dim_f = (blocks > self.dimNits).sum(axis=(1, 3)).astype(np.float32) / n
+        return (lit_f > self.litFrac) | (dim_f > self.dimFrac)
+
+    # ---- CS boost (pass 1a): zone count -> staircase. (boost float32, count, flags); (None, -1, None) without a LUT
+    def frame_boost(self, img):
+        if not self.boostN:
+            return None, -1, None
+        active = self.stat_active(img)
+        count = int(active.sum())
+        return boost_of_count(self.o, count), count, active
+
     # ---- CS conv (zero outside the lattice), kernel chosen by the sub-offset
     def conv(self, d, K):
         S = self.sub
@@ -237,9 +266,14 @@ class Emu:
         ge = np.where((gain > 1.0) & (m > 1e-9), np.maximum(m, K) / np.where(m > 1e-9, m, 1.0), gain)
         return np.maximum(u * ge[None], 0.0), wfade
 
-    def fields(self, drive_true, drive_est=None):
+    def fields(self, drive_true, drive_est=None, boost=None):
+        """``boost``: the round's LED boost (float32) — multiplies B_true only, as the conv pass does when the file
+        has a LUT (``None`` = no LUT: no multiply at all; the flat-lattice fields are always built without it)."""
         d_est = drive_true if drive_est is None else drive_est
-        return self.conv(drive_true, self.o["kTrue"]), self.conv(d_est, self.o["kEst"])
+        bT = self.conv(drive_true, self.o["kTrue"])
+        if boost is not None:
+            bT = (bT * f32(boost)).astype(np.float32)
+        return bT, self.conv(d_est, self.o["kEst"])
 
     def sampled(self, bT, bE, gainB):
         sT = self.sample(bT.astype(np.float64)) / np.maximum(self.sample(self.flatT.astype(np.float64)), 1e-6)
@@ -252,14 +286,16 @@ class Emu:
         round; the state commits after round 1 — the CopyResource in the C++)."""
         img = self.panel_nits(frame_scrgb)
         d0, st0 = self.stat_drive(img)
+        boost0, zones0, active0 = self.frame_boost(img)               # round 0: the source frame
         dT0, dE0 = temporal.pair(d0) if temporal is not None else (d0, d0)
-        bT0, bE0 = self.fields(dT0, dE0)
+        bT0, bE0 = self.fields(dT0, dE0, boost0)
         _, gB0 = self.gain(bT0, bE0)
         sT, sE, g = self.sampled(bT0, bE0, gB0)
         cor0, _ = self.correct(img, sT, sE, g)
         d1, st1 = self.stat_drive(cor0)
+        boost1, zones1, active1 = self.frame_boost(cor0)              # round 1: the corrected frame the panel receives
         dT1, dE1 = temporal.pair(d1) if temporal is not None else (d1, d1)
-        bT1, bE1 = self.fields(dT1, dE1)
+        bT1, bE1 = self.fields(dT1, dE1, boost1)
         graw1, gB1 = self.gain(bT1, bE1)
         sT, sE, g = self.sampled(bT1, bE1, gB1)
         req, wfade = self.correct(img, sT, sE, g)
@@ -275,4 +311,7 @@ class Emu:
         out_nits = self.panel_nits(out.astype(np.float64))
         return {"img": img, "drive0": d0, "drive1": d1, "drive_true": dT1, "drive_est": dE1, "stat1": st1, "bT": bT1, "bE": bE1,
                 "gain_raw": graw1, "gain": gB1, "req": req, "out": out, "out_nits": out_nits, "px_gain": g, "px_bT": sT,
-                "px_bE": sE, "wfade": wfade}
+                "px_bE": sE, "wfade": wfade,
+                # black-frame LED boost per round (fald_dump.txt boost_r0/r1, active_zones_r0/r1, fald_active[_r0].f32)
+                "boost0": 1.0 if boost0 is None else float(boost0), "boost1": 1.0 if boost1 is None else float(boost1),
+                "zones0": zones0, "zones1": zones1, "active0": active0, "active1": active1}

@@ -14,8 +14,20 @@ class _MockApiError(Exception):
     """Internal: a request the C++ server would reject (mirrored error text)."""
 
 
+def _fald_file_has_boost(path: Path) -> bool:
+    """C++ FaldPanelFileHasBoost: an FLD4 header whose word 48 (boost step count) is 1..24."""
+    import struct
+    try:
+        head = path.read_bytes()[: 49 * 4]
+    except OSError:
+        return False
+    if len(head) != 49 * 4 or struct.unpack("<I", head[:4])[0] != 0x464C4434:
+        return False
+    return 1 <= struct.unpack("<I", head[48 * 4:49 * 4])[0] <= 24
+
+
 def _fald_file_transfer(path: Path) -> str | None:
-    """C++ FaldPanelFileTransfer: 'pq' for FLD1/FLD2, FLD3 word 40 (0 pq / 1 gamma), None when unreadable."""
+    """C++ FaldPanelFileTransfer: 'pq' for FLD1/FLD2, FLD3/FLD4 word 40 (0 pq / 1 gamma), None when unreadable."""
     import struct
     try:
         head = path.read_bytes()[: 41 * 4]
@@ -26,7 +38,7 @@ def _fald_file_transfer(path: Path) -> str | None:
     magic = struct.unpack("<I", head[:4])[0]
     if magic in (0x464C4431, 0x464C4432):
         return "pq"
-    if magic == 0x464C4433 and len(head) == 41 * 4:
+    if magic in (0x464C4433, 0x464C4434) and len(head) == 41 * 4:
         code = struct.unpack("<I", head[40 * 4:41 * 4])[0]
         return {0: "pq", 1: "gamma"}.get(code)
     return None
@@ -38,6 +50,7 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     path = str(entry.get("params_path") or "")
     out: dict[str, Any] = {"fald_params_path": path, "fald_debug_mode": int(entry.get("debug_mode", 0)),
                            "fald_ped_mode": int(entry.get("ped_mode", 0)), "fald_ped_colour_in_file": False,
+                           "fald_boost_in_file": _fald_file_has_boost(Path(path)) if path else False,   # FLD4 boost LUT (C12)
                            # temporal drive state (2026-09-17, work guide H5 / item 4a): persisted like ped_mode
                            "fald_temporal_mode": int(entry.get("temporal_mode", 0)),
                            "fald_tau_rise_ms": float(entry.get("tau_rise_ms", 0.0)),
@@ -656,9 +669,9 @@ class MockDesktopLutServer:
         if method == "runtime.fald_debug":
             mode = params.get("debug_mode"); ped = params.get("ped_mode")
             if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
-                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..7) or ped_mode (0|1)")
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..8) or ped_mode (0|1)")
             if isinstance(mode, (int, float)):
-                fs["debug_mode"] = int(min(7, max(0, mode)))
+                fs["debug_mode"] = int(min(8, max(0, mode)))
             if isinstance(ped, (int, float)):
                 fs["ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
             return self.ok({"monitor_mode": key, "debug_mode": fs.get("debug_mode", 0), "ped_mode": fs.get("ped_mode", 0),

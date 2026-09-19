@@ -684,6 +684,7 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_tau_fall_ms", JNum((double)fs.tauFallMs));
                 l.set("fald_delay_frames", JNum((double)fs.delayFrames));
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
+                l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)
                 uint32_t transfer = 0;
                 if (FaldPanelFileTransfer(fs.paramsPath, transfer))
                     l.set("fald_file_transfer", JStr(transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq"));
@@ -1342,7 +1343,7 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // <-> SDR: refused otherwise — the render side would refuse it too). Re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
 // debug_mode 0..6}: 0 correct, 1 gain map (white 0, red brighten, blue darken, +-25 %), 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
-// x100, 6 per-channel-vs-white influence x100 (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
+// x100, 6 per-channel-vs-white influence x100, 7 temporal settling, 8 the black-frame boost's non-black zone map (FLD4 files; not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
 // FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
@@ -1392,12 +1393,12 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* v = p.find("debug_mode");
     const JsonValue* pm = p.find("ped_mode");
-    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..7) or ped_mode (0|1)"; return; }
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..8) or ped_mode (0|1)"; return; }
     unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 7 ? 7 : v->num));
+        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 8 ? 8 : v->num));
         if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
         mode = fs.debugMode; ped = fs.pedMode;
     }

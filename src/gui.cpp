@@ -366,7 +366,7 @@ void UpdateColorCorrectionControls() {
         sdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldSdrPath, sdrCC.fald.paramsPath.c_str());
     const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 7 ? shown.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 8 ? shown.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= 2 ? shown.temporalMode : 0), 0);
     wchar_t tauBuf[32];
@@ -1301,7 +1301,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= 6) ? (unsigned int)sel : 0u;
+                    unsigned int mode = (sel >= 0 && sel <= 8) ? (unsigned int)sel : 0u;   // one entry per debug view 0..8
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads these
                         FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in

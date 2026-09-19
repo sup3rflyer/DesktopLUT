@@ -15,16 +15,25 @@ static ID3D11ComputeShader* g_faldConvCS = nullptr;
 static ID3D11ComputeShader* g_faldGainCS = nullptr;
 static ID3D11ComputeShader* g_faldBlurCS = nullptr;
 static ID3D11ComputeShader* g_faldTemporalCS = nullptr;   // pass 1b: per-cell drive state (temporal mode only)
+static ID3D11ComputeShader* g_faldBoostCS = nullptr;      // pass 1a: non-black zone count -> LED boost (boost LUT only)
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
 static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1' (32-word header)
 static const uint32_t FALD_MAGIC2 = 0x464C4432u;  // 'FLD2' (40-word header: + pedestal colour, DLC export.py)
 static const uint32_t FALD_MAGIC3 = 0x464C4433u;  // 'FLD3' (48-word header: + signal transfer words 40/41; SDR/ACM fits)
+static const uint32_t FALD_MAGIC4 = 0x464C4434u;  // 'FLD4' (104-word header: + black-frame LED boost block, words 48-103)
+static const size_t FALD_BOOST_WORD_COUNT = 48;   // FLD4 word 48: step count; 49-52: activation rule; 53-55 reserved
+static const size_t FALD_BOOST_WORD_LUT = 56;     // FLD4 words 56..103: 24 x (zone fraction lo, boost)
 
 static size_t FaldHeaderBytes(uint32_t magic) {
-    return magic == FALD_MAGIC3 ? 192 : (magic == FALD_MAGIC2 ? 160 : 128);
+    return magic == FALD_MAGIC4 ? 416 : (magic == FALD_MAGIC3 ? 192 : (magic == FALD_MAGIC2 ? 160 : 128));
 }
+static bool FaldMagicKnown(uint32_t magic) {
+    return magic == FALD_MAGIC || magic == FALD_MAGIC2 || magic == FALD_MAGIC3 || magic == FALD_MAGIC4;
+}
+// FLD3 and FLD4 carry the (optional) pedestal colour block 32-39 and the transfer words 40/41.
+static bool FaldMagicLong(uint32_t magic) { return magic == FALD_MAGIC3 || magic == FALD_MAGIC4; }
 static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
 static const float FALD_RESUME_GAP_MS = 250.0f;          // a run this long after the previous one re-arms the settle hold
 
@@ -68,7 +77,7 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     if (buf.size() < 128) { err = "params file too short"; return false; }
     const uint32_t* u = reinterpret_cast<const uint32_t*>(buf.data());
     const float* fl = reinterpret_cast<const float*>(buf.data());
-    if (u[0] != FALD_MAGIC && u[0] != FALD_MAGIC2 && u[0] != FALD_MAGIC3) { err = "bad magic (expected FLD1, FLD2 or FLD3)"; return false; }
+    if (!FaldMagicKnown(u[0])) { err = "bad magic (expected FLD1, FLD2, FLD3 or FLD4)"; return false; }
     const size_t headerBytes = FaldHeaderBytes(u[0]);
     if (buf.size() < headerBytes) { err = "params file too short"; return false; }
     out.cols = u[1]; out.rows = u[2]; out.sub = u[3]; out.cellW = u[4]; out.cellH = u[5];
@@ -85,10 +94,10 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
         if (fl[30] > fl[29] && fl[29] >= 0.0f) { out.lumFadeLo = fl[29]; out.lumFadeHi = fl[30]; }
         else { err = "implausible lum_fade words"; return false; }
     }
-    // words 32-34: pedestal colour, 35: validated mode. Always present in FLD2; in FLD3 all-zero words 32-35 mean
+    // words 32-34: pedestal colour, 35: validated mode. Always present in FLD2; in FLD3/FLD4 all-zero words 32-35 mean
     // "no pedestal colour" (an SDR fit without one still needs the transfer words, so the block is optional there).
     const bool pedBlock = (u[0] == FALD_MAGIC2) ||
-                          (u[0] == FALD_MAGIC3 && (u[32] != 0 || u[33] != 0 || u[34] != 0 || u[35] != 0));
+                          (FaldMagicLong(u[0]) && (u[32] != 0 || u[33] != 0 || u[34] != 0 || u[35] != 0));
     if (pedBlock) {
         out.pedRGB[0] = fl[32]; out.pedRGB[1] = fl[33]; out.pedRGB[2] = fl[34];
         out.pedModeFile = u[35]; out.hasPedColour = true;
@@ -106,7 +115,7 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
             err = "implausible pedestal colour words"; return false;
         }
     }
-    if (u[0] == FALD_MAGIC3) {                                                              // words 40/41: signal transfer + SDR gamma
+    if (FaldMagicLong(u[0])) {                                                              // words 40/41: signal transfer + SDR gamma
         out.hasTransfer = true;
         out.transfer = u[40];
         if (out.transfer == FALD_TRANSFER_GAMMA) {
@@ -116,6 +125,26 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
             out.sdrGamma = 0.0f;                                                            // word 41 unused for PQ
         } else {
             err = "unknown transfer word (expected 0 = PQ or 1 = gamma)"; return false;
+        }
+    }
+    if (u[0] == FALD_MAGIC4) {                                                              // words 48-103: black-frame LED boost
+        const uint32_t n = u[FALD_BOOST_WORD_COUNT];
+        if (n > FALD_BOOST_MAX_STEPS) { err = "implausible boost step count"; return false; }
+        if (n > 0) {                                                                        // 0 = no boost (the block is ignored)
+            const float litNits = fl[49], litFrac = fl[50], dimNits = fl[51], dimFrac = fl[52];
+            if (!(litNits >= 0.0f && litNits <= 10000.0f) || !(dimNits >= 0.0f && dimNits <= 10000.0f) ||
+                !(litFrac >= 0.0f && litFrac < 1.0f) || !(dimFrac >= 0.0f && dimFrac < 1.0f)) {
+                err = "implausible boost activation words"; return false;
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                const float lo = fl[FALD_BOOST_WORD_LUT + 2 * i], val = fl[FALD_BOOST_WORD_LUT + 2 * i + 1];
+                if (!(lo >= 0.0f && lo <= 1.0f) || (i > 0 && !(lo > out.boostLo[i - 1])) || !(val >= 0.5f && val <= 2.0f)) {
+                    err = "implausible boost LUT words (steps must ascend, fractions 0..1, boosts 0.5..2)"; return false;
+                }
+                out.boostLo[i] = lo; out.boostVal[i] = val;
+            }
+            out.boostN = n; out.hasBoost = true;
+            out.boostLitNits = litNits; out.boostLitFrac = litFrac; out.boostDimNits = dimNits; out.boostDimFrac = dimFrac;
         }
     }
     if (out.cols == 0 || out.rows == 0 || out.sub == 0 || out.sub > 16 || out.cellW == 0 || out.cellH == 0 ||
@@ -143,9 +172,38 @@ bool FaldPanelFileHasPedColour(const std::wstring& path) {
     f.read(reinterpret_cast<char*>(head), sizeof(head));
     if (f.gcount() < 4) return false;
     if (head[0] == FALD_MAGIC2) return true;
-    if (head[0] == FALD_MAGIC3 && f.gcount() == (std::streamsize)sizeof(head))
+    if (FaldMagicLong(head[0]) && f.gcount() == (std::streamsize)sizeof(head))
         return head[32] != 0 || head[33] != 0 || head[34] != 0 || head[35] != 0;
     return false;
+}
+
+bool FaldPanelFileHasBoost(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint32_t head[FALD_BOOST_WORD_COUNT + 1] = {};
+    f.read(reinterpret_cast<char*>(head), sizeof(head));
+    if (f.gcount() != (std::streamsize)sizeof(head) || head[0] != FALD_MAGIC4) return false;
+    return head[FALD_BOOST_WORD_COUNT] >= 1 && head[FALD_BOOST_WORD_COUNT] <= FALD_BOOST_MAX_STEPS;
+}
+
+unsigned int FaldBoostZoneThreshold(float lo, unsigned int zonesTotal) {
+    // step applies when N / Z >= lo  <=>  N >= lo * Z. lo went through float32 (relative error 6e-8): the tolerance
+    // keeps an edge that IS a zone count (e.g. 145 / 2304) at that count instead of one above. < 0.5 zone up to the
+    // loader's 512 x 512 lattice limit.
+    const double z = (double)zonesTotal;
+    const double t = std::ceil((double)lo * z - (1e-3 + 1e-6 * z));
+    return t <= 0.0 ? 0u : (t >= 4294967295.0 ? 4294967295u : (unsigned int)t);
+}
+
+float FaldBoostOfCount(const FaldPanelParams& p, unsigned int activeZones) {
+    float b = 1.0f;
+    if (!p.hasBoost) return b;
+    const unsigned int zones = p.cols * p.rows;
+    for (uint32_t i = 0; i < p.boostN && i < FALD_BOOST_MAX_STEPS; i++) {
+        if (activeZones < FaldBoostZoneThreshold(p.boostLo[i], zones)) break;
+        b = p.boostVal[i];
+    }
+    return b;
 }
 
 bool FaldPanelFileTransfer(const std::wstring& path, uint32_t& transfer) {
@@ -155,7 +213,7 @@ bool FaldPanelFileTransfer(const std::wstring& path, uint32_t& transfer) {
     f.read(reinterpret_cast<char*>(head), sizeof(head));
     if (f.gcount() < 4) return false;
     if (head[0] == FALD_MAGIC || head[0] == FALD_MAGIC2) { transfer = FALD_TRANSFER_PQ; return true; }
-    if (head[0] == FALD_MAGIC3 && f.gcount() == (std::streamsize)sizeof(head) &&
+    if (FaldMagicLong(head[0]) && f.gcount() == (std::streamsize)sizeof(head) &&
         (head[40] == FALD_TRANSFER_PQ || head[40] == FALD_TRANSFER_GAMMA)) { transfer = head[40]; return true; }
     return false;
 }
@@ -219,6 +277,10 @@ bool InitFaldShaders() {
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldTemporalCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(temporal) failed" << std::endl; return false; }
+    if (!CompileOne(common + g_faldBoostSource, "FaldBoostCS", "cs_5_0", &b)) return false;
+    hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldBoostCS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(boost) failed" << std::endl; return false; }
     if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
@@ -234,6 +296,7 @@ bool InitFaldShaders() {
 void ReleaseFaldShaders() {
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
+    if (g_faldBoostCS) { g_faldBoostCS->Release(); g_faldBoostCS = nullptr; }
     if (g_faldTemporalCS) { g_faldTemporalCS->Release(); g_faldTemporalCS = nullptr; }
     if (g_faldBlurCS) { g_faldBlurCS->Release(); g_faldBlurCS = nullptr; }
     if (g_faldGainCS) { g_faldGainCS->Release(); g_faldGainCS = nullptr; }
@@ -241,7 +304,7 @@ void ReleaseFaldShaders() {
     if (g_faldStatCS) { g_faldStatCS->Release(); g_faldStatCS = nullptr; }
 }
 
-bool FaldShadersReady() { return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldPS && g_faldSampler; }
+bool FaldShadersReady() { return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldBoostCS && g_faldPS && g_faldSampler; }
 
 // ---------------------------------------------------------------------------------------------
 // Resources
@@ -265,6 +328,11 @@ static void ReleaseAll(FaldResources* r) {
     SafeRelease(r->gainBSRV); SafeRelease(r->gainBUAV); SafeRelease(r->gainBTex);
     SafeRelease(r->flatTrueSRV); SafeRelease(r->flatTrueUAV); SafeRelease(r->flatTrueTex);
     SafeRelease(r->flatEstSRV); SafeRelease(r->flatEstUAV); SafeRelease(r->flatEstTex);
+    for (unsigned int i = 0; i < 2; i++) {
+        SafeRelease(r->activeSRV[i]); SafeRelease(r->activeUAV[i]); SafeRelease(r->activeTex[i]);
+        SafeRelease(r->boostSRV[i]); SafeRelease(r->boostUAV[i]); SafeRelease(r->boostTex[i]);
+    }
+    SafeRelease(r->boostLutSRV); SafeRelease(r->boostLutBuf);
     SafeRelease(r->cb);
     r->valid = false;
 }
@@ -366,8 +434,21 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainBTex, &r->gainBUAV, &r->gainBSRV)) { r->lastError = "gain texture B"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
+    if (p.hasBoost) {
+        // black-frame LED boost: per-round zone flags + 2x1 result, and the LUT as (first zone COUNT, boost) pairs
+        for (unsigned int i = 0; i < 2; i++) {
+            if (!MakeRWTexture(p.cols, p.rows, &r->activeTex[i], &r->activeUAV[i], &r->activeSRV[i])) { r->lastError = "active-zone texture"; return false; }
+            if (!MakeRWTexture(2, 1, &r->boostTex[i], &r->boostUAV[i], &r->boostSRV[i])) { r->lastError = "boost texture"; return false; }
+        }
+        std::vector<float> lut;
+        for (uint32_t i = 0; i < p.boostN; i++) {
+            lut.push_back((float)FaldBoostZoneThreshold(p.boostLo[i], p.cols * p.rows));
+            lut.push_back(p.boostVal[i]);
+        }
+        if (!MakeFloatBuffer(lut, &r->boostLutBuf, &r->boostLutSRV)) { r->lastError = "boost LUT buffer"; return false; }
+    }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 48 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 52 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -377,7 +458,8 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
               << p.cellW << "x" << p.cellH << " px, sub " << p.sub << ", white " << p.white << " nits, transfer "
               << (p.transfer == FALD_TRANSFER_GAMMA ? "gamma " + std::to_string(p.sdrGamma) : std::string("PQ"))
               << " (" << (ctx->isHDREnabled ? "HDR" : "ACM SDR") << "), kernels "
-              << (2 * p.reachTrueC + 1) << "x" << (2 * p.reachTrueR + 1) << " / " << (2 * p.reachEstC + 1) << "x" << (2 * p.reachEstR + 1) << std::endl;
+              << (2 * p.reachTrueC + 1) << "x" << (2 * p.reachTrueR + 1) << " / " << (2 * p.reachEstC + 1) << "x" << (2 * p.reachEstR + 1)
+              << ", black-frame boost " << (p.hasBoost ? std::to_string(p.boostN) + " steps" : std::string("none")) << std::endl;
     return true;
 }
 
@@ -438,7 +520,8 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings) {
 // ---------------------------------------------------------------------------------------------
 // Passes
 // ---------------------------------------------------------------------------------------------
-static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
+// boostOn = false: the flat-lattice normalisation pass (a boost-free conv whatever the file says).
+static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bool boostOn = true) {
     const FaldPanelParams& p = r->params;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g_context->Map(r->cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
@@ -454,6 +537,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
     u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
+    u[34] = (boostOn && p.hasBoost) ? p.boostN : 0u;                                // black-frame LED boost steps (0 = no term)
     // the panel file's leak colour (tmin * m_c; = tmin for FLD1) is always in the CB so the debug views can show the
     // toggle's influence; pedMode selects it in Correct() (1 only when the file has a colour, else it is a no-op)
     const bool perChannel = (r->pedMode == 1) && p.hasPedColour;
@@ -467,14 +551,17 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0) {
     // temporal drive state (words 44-47): per-frame blend factors, mode, "no valid state yet" (copy the drive)
     f[44] = r->tempAlphaRise; f[45] = r->tempAlphaFall;
     u[46] = r->temporalMode; u[47] = r->stateValid ? 0u : 1u;
+    // black-frame LED boost: the zone activation rule (words 48-51; read only when word 34 != 0)
+    f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
     g_context->Unmap(r->cb, 0);
 }
 
-static const UINT FALD_SRV_SLOTS = 12;   // t0..t11 (fald_shader.h)
+static const UINT FALD_SRV_SLOTS = 15;   // t0..t14 (fald_shader.h)
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
-                                                       r->flatTrueSRV, r->flatEstSRV, nullptr, nullptr, nullptr };
+                                                       r->flatTrueSRV, r->flatEstSRV, nullptr, nullptr, nullptr,
+                                                       r->boostLutSRV, nullptr, nullptr };   // t12: nullptr without a boost LUT
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
@@ -504,8 +591,23 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
         g_context->CSSetShaderResources(5, 2, fields);
         g_context->CSSetShaderResources(9, 1, &r->gainBSRV);      // smoothed gain of the previous round
     }
-    g_context->CSSetUnorderedAccessViews(0, 1, &r->driveUAV, nullptr);
+    ID3D11UnorderedAccessView* uavs[2] = { r->driveUAV, r->activeUAV[roundIdx & 1u] };   // u1: nullptr without a boost LUT
+    g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);                           // (the shader then never writes it)
     g_context->Dispatch(p.cols, p.rows, 1);
+    UnbindCompute();
+}
+
+// Pass 1a (panel files with a boost LUT only): this round's zone flags -> count -> staircase -> boostTex[round].
+// Relies on the CB the statistic pass of the same round filled. Not run (and nothing bound) without a LUT: the
+// layer is then the boost-less one, dispatch for dispatch.
+static void RunBoost(FaldResources* r, uint32_t roundIdx) {
+    if (!r->params.hasBoost) return;
+    const unsigned int k = roundIdx & 1u;
+    g_context->CSSetShader(g_faldBoostCS, nullptr, 0);
+    BindCommon(r, true);
+    g_context->CSSetShaderResources(13, 1, &r->activeSRV[k]);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->boostUAV[k], nullptr);
+    g_context->Dispatch(1, 1, 1);
     UnbindCompute();
 }
 
@@ -524,13 +626,16 @@ static void RunTemporal(FaldResources* r, ID3D11ShaderResourceView* inDrive) {
 }
 
 // trueDrive / estDrive: the drive maps the real-spread and the estimate kernels see (both the instantaneous drive
-// unless a temporal mode routes the filtered one).
-static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive) {
+// unless a temporal mode routes the filtered one). boost: this round's 2x1 boost texture (B_true only; nullptr =
+// none — no LUT in the file, or the flat-lattice pass, where the CB's boostN is 0 and the shader never reads t14).
+static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive,
+                    ID3D11ShaderResourceView* boost) {
     const FaldPanelParams& p = r->params;
     g_context->CSSetShader(g_faldConvCS, nullptr, 0);
     BindCommon(r, true);
     g_context->CSSetShaderResources(4, 1, &trueDrive);
     g_context->CSSetShaderResources(10, 1, &estDrive);
+    g_context->CSSetShaderResources(14, 1, &boost);
     ID3D11UnorderedAccessView* uavs[2] = { r->bTrueUAV, r->bEstUAV };
     g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
     g_context->Dispatch((p.cols * p.sub + 15) / 16, (p.rows * p.sub + 15) / 16, 1);
@@ -579,14 +684,13 @@ static std::string NarrowUtf8(const std::wstring& w) {
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
 // Must run after the fine textures exist; the flat textures are bound as SRVs t7/t8 from then on
 // (they are nullptr during this call, which the conv pass does not read).
-static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive);
 static void ComputeFlatResponse(FaldResources* r) {
     const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     g_context->ClearUnorderedAccessViewFloat(r->driveUAV, one);
     ID3D11ShaderResourceView* saveT = r->flatTrueSRV; ID3D11ShaderResourceView* saveE = r->flatEstSRV;
     r->flatTrueSRV = nullptr; r->flatEstSRV = nullptr;          // not inputs of this pass
-    FillCB(r, 0);
-    RunConv(r, r->driveSRV, r->driveSRV);
+    FillCB(r, 0, 0, false);                                     // boost 1: the normalisation is the un-boosted lattice
+    RunConv(r, r->driveSRV, r->driveSRV, nullptr);
     r->flatTrueSRV = saveT; r->flatEstSRV = saveE;
     g_context->CopyResource(r->flatTrueTex, r->bTrueTex);
     g_context->CopyResource(r->flatEstTex, r->bEstTex);
@@ -605,6 +709,26 @@ static void DumpTexture(ID3D11Texture2D* tex, const std::wstring& file, UINT w, 
         g_context->Unmap(st, 0);
     }
     st->Release();
+}
+
+// Read back the first n floats of a small R32F texture's top row (dump only; stalls the GPU).
+static bool ReadBackFloats(ID3D11Texture2D* tex, float* out, UINT n) {
+    if (!tex) return false;
+    D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+    if (d.Width < n) return false;
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(g_device->CreateTexture2D(&d, nullptr, &st))) return false;
+    g_context->CopyResource(st, tex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    bool ok = false;
+    if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        memcpy(out, m.pData, n * sizeof(float));
+        g_context->Unmap(st, 0);
+        ok = true;
+    }
+    st->Release();
+    return ok;
 }
 
 // Consume a pending dump request: the directory (with a trailing separator) or "" when none.
@@ -635,6 +759,15 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     DumpTexture(r->flatTrueTex, dir + L"fald_flat_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->flatEstTex, dir + L"fald_flat_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->gainBTex, dir + L"fald_gain_fine.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    // black-frame LED boost: the zone flags of both rounds (cols x rows float32, 1 = non-black; fald_active.f32 = round 1,
+    // the corrected frame the panel receives) and the reduce pass's results. -1 / 1 when the file has no LUT.
+    float boostR[2][2] = { { 1.0f, -1.0f }, { 1.0f, -1.0f } };   // [round][0 boost, 1 zone count]
+    if (p.hasBoost) {
+        DumpTexture(r->activeTex[0], dir + L"fald_active_r0.f32", p.cols, p.rows, 4);
+        DumpTexture(r->activeTex[1], dir + L"fald_active.f32", p.cols, p.rows, 4);
+        ReadBackFloats(r->boostTex[0], boostR[0], 2);
+        ReadBackFloats(r->boostTex[1], boostR[1], 2);
+    }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
     std::ofstream meta(dir + L"fald_dump.txt");
@@ -650,6 +783,12 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\ntau_rise_ms " << fs.tauRiseMs << "\ntau_fall_ms " << fs.tauFallMs << "\ndelay_frames " << r->delayFrames << " (ring " << r->delayCount << ")"
          << "\ntemp_alpha_rise " << r->tempAlphaRise << "\ntemp_alpha_fall " << r->tempAlphaFall << "\ndt_ms " << r->dtMs
          << "\nstate_valid " << (r->stateValid ? 1 : 0)
+         << "\nboost_in_file " << (p.hasBoost ? 1 : 0) << "\nboost_steps " << p.boostN << "\nzones_total " << (p.cols * p.rows)
+         << "\nboost_lit_nits " << p.boostLitNits << "\nboost_lit_frac " << p.boostLitFrac
+         << "\nboost_dim_nits " << p.boostDimNits << "\nboost_dim_frac " << p.boostDimFrac
+         << "\nactive_zones_r0 " << (int)boostR[0][1] << "\nboost_r0 " << boostR[0][0]
+         << " (round 0: the source frame)\nactive_zones_r1 " << (int)boostR[1][1] << "\nboost_r1 " << boostR[1][0]
+         << " (round 1: the corrected frame; this boost is in fald_btrue.f32; files fald_active_r0.f32 / fald_active.f32)"
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -712,13 +851,17 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     ID3D11RenderTargetView* nullRT = nullptr;
     g_context->OMSetRenderTargets(1, &nullRT, nullptr);
 
+    // black-frame LED boost (panel files with a LUT): each round's boost comes from the zone flags of the frame the
+    // panel receives in that round, and is NOT filtered by the temporal state (instant on the panel)
     RunStat(r, 0);
+    RunBoost(r, 0);
     if (temporal) RunTemporal(r, inDrive); // both rounds read the SAME committed state (DriveState.peek)
-    RunConv(r, trueDrive, estDrive);
+    RunConv(r, trueDrive, estDrive, r->boostSRV[0]);
     RunGain(r);
     RunStat(r, 1);
+    RunBoost(r, 1);
     if (temporal) RunTemporal(r, inDrive);
-    RunConv(r, trueDrive, estDrive);
+    RunConv(r, trueDrive, estDrive, r->boostSRV[1]);
     RunGain(r);
     r->framesRun++;
     const std::wstring dumpDir = TakeDumpRequest(ctx);
@@ -744,6 +887,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     ID3D11ShaderResourceView* filt = temporal ? r->driveFiltSRV : r->driveSRV;   // debug view 7: instantaneous vs filtered
     g_context->PSSetShaderResources(4, 1, &r->driveSRV);
     g_context->PSSetShaderResources(10, 1, &filt);
+    g_context->PSSetShaderResources(13, 1, &r->activeSRV[1]);                     // debug view 8 (nullptr without a boost LUT)
     g_context->Draw(3, 0);
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);

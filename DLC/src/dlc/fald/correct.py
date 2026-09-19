@@ -76,16 +76,19 @@ def load_fitted_params(path: Path) -> FaldParams:
     return FaldParams(**{k: v for k, v in kw.items() if k in FaldParams.__dataclass_fields__})
 
 
-# The panel file (dlc.fald.export) cannot carry the black-frame LED boost yet (work guide C12): the SHADER corrects
-# boost-blind whatever the fit knows. Flip when the file + HLSL carry the LUT.
-BOOST_IN_PANEL_FILE = False
+# The panel file carries the black-frame LED boost since FLD4 (work guide C12, 2026-09-18): dlc.fald.export writes
+# the LUT of every fit that has one (or raises), LoadFaldPanelParams reads it and the HLSL applies it to B_true.
+BOOST_IN_PANEL_FILE = True
 
 
-def shader_model(model: FaldModel) -> FaldModel:
-    """The model the running SHADER implements for ``model``'s fit: the same parameters without the boost LUT while
-    the panel file cannot hold it. Predict a layer-ON read as ``model.meter_img(correct_image(shader_model(model),
-    img)["req"], meter)`` — the boost-blind correction seen through the boosted panel."""
-    if BOOST_IN_PANEL_FILE or not model.p.boost_lut:
+def shader_model(model: FaldModel, boost_in_file: bool = True) -> FaldModel:
+    """The model the running SHADER implements for ``model``'s fit. With the fit's own export (FLD4 when it has a
+    boost LUT) that is ``model`` itself — the default. ``boost_in_file=False``: the layer runs a panel file WITHOUT
+    the boost block (an FLD1-3 export from before C12, e.g. ``fald_profile --phase verify --bin old.bin``) while the
+    fit knows the boost — the shader then corrects boost-blind and the prediction of a layer-ON read is
+    ``model.meter_img(correct_image(shader_model(model, False), img)["req"], meter)``: the boost-blind correction
+    seen through the boosted panel."""
+    if boost_in_file or not model.p.boost_lut:
         return model
     cached = getattr(model, "_shader_model", None)
     if cached is None or cached[0] != model.p.__dict__:

@@ -1400,15 +1400,16 @@ def phase_export(s: Session, result: StageResult) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_path = (out_dir / f"{short}_{mode}_fald_panel.bin").resolve()
     info = export_panel_params(FaldModel(params), bin_path)
-    if info.get("boost_lut_steps"):
-        result.anomaly("boost_not_in_file", f"the fit carries a black-frame LED boost LUT ({info['boost_lut_steps']} steps) the panel "
-                       "file cannot hold yet (work guide C12): the shader runs these kernels WITHOUT the boost term — correct on "
-                       "non-black frames, over-brightening lit interiors by up to the boost on mostly-black frames", "medium")
+    if info.get("boost_in_file"):
+        result.note(f"black-frame LED boost LUT ({info['boost_lut_steps']} steps) written into the panel file (FLD4, work guide "
+                    "C12): needs a DesktopLUT build from 2026-09-18 on — older builds refuse the FLD4 magic (deliberately: they "
+                    "would run these kernels without the boost term)")
     json_path = out_dir / f"{short}_{mode}_fald_fit_result.json"
     atomic_write_text(json_path, json.dumps({**fit, "params": fit["params"], "exported_bin": str(bin_path), "export_info": info}, indent=1, default=str))
     result.add_artifact(bin_path)
     result.add_artifact(json_path)
     result.metrics.update({"bin": str(bin_path), "fit_json": str(json_path), "format": info["format"], "bytes": info["bytes"],
+                           "boost_in_file": bool(info.get("boost_in_file")), "boost_lut_steps": int(info.get("boost_lut_steps") or 0),
                            "transfer": params.transfer, "white_nits": params.white_nits, "estimate": params.est_kind,
                            "lum_fade": [params.lum_fade_lo, params.lum_fade_hi]})
     s.st["fald"]["bin_path"] = str(bin_path)
@@ -1530,6 +1531,28 @@ def acm_off_anomaly(mode: str, mon: dict[str, Any]) -> Optional[tuple[str, str, 
             "positive — confirm 'Automatically manage color for apps' is on", "medium")
 
 
+def fld4_refused_reason(controller, monitor: int, mode: str, bin_path: str) -> str | None:
+    """An FLD4 panel file (black-frame LED boost, 2026-09-18) on a DesktopLUT build from before it: the pipe ACCEPTS the
+    path (its peek cannot classify the magic), the loader then refuses the file and the layer never runs — every
+    "ON" read would silently be an OFF read. After `runtime.set_fald_params`, a file that carries the boost block must
+    show up as ``layers[<mon>:<mode>].fald_boost_in_file == True``; anything else is a reason to stop (None = fine)."""
+    try:
+        magic = Path(bin_path).read_bytes()[:4]
+    except OSError as exc:
+        return f"cannot read {bin_path}: {exc}"
+    if magic != b"4DLF":                                  # little-endian 0x464C4434 'FLD4'
+        return None
+    try:
+        layers = (controller.call("state.get", {}).get("layers") or {}).get(f"{monitor}:{mode}") or {}
+    except Exception as exc:  # noqa: BLE001
+        return f"state.get failed ({exc}): cannot confirm the running build reads FLD4"
+    if layers.get("fald_boost_in_file") is True:
+        return None
+    return ("the panel file is FLD4 (it carries the black-frame boost) but the running DesktopLUT does not report "
+            "`fald_boost_in_file` — a build from before 2026-09-18 accepts the path and then refuses the file: the layer "
+            "would not run and every ON read would be an OFF read. Restart DesktopLUT on the C12 build")
+
+
 def phase_verify(s: Session, result: StageResult) -> None:
     from ..fald.correct import correct_image, shader_model
     from ..fald.model import FaldModel
@@ -1553,7 +1576,20 @@ def phase_verify(s: Session, result: StageResult) -> None:
     result.metrics["bin"] = bin_path
     result.metrics["fit_json"] = str(fit_src)
     model = FaldModel(params)
-    shader = shader_model(model)             # the GPU corrects boost-blind until the panel file carries the LUT (C12)
+    # The shader runs what the FILE carries: the fit's own export holds its boost LUT (FLD4, C12); an older / foreign
+    # --bin without the block corrects boost-blind while the panel still boosts — the ON prediction must say so.
+    boost_in_bin = True
+    if params.boost_lut:
+        try:
+            from ..fald.panelfile import read_panel_file
+            boost_in_bin = bool(read_panel_file(bin_path).get("hasBoost"))
+        except (OSError, ValueError):
+            boost_in_bin = True              # unreadable here (the layer call below reports a bad file): assume the fit's export
+        if not boost_in_bin:
+            result.note("the fit carries a black-frame LED boost LUT but the panel file does not (an export from before C12): "
+                        "the ON predictions use the boost-blind correction seen through the boosted panel")
+    result.metrics["boost_in_bin"] = bool(boost_in_bin and params.boost_lut)
+    shader = shader_model(model, boost_in_file=boost_in_bin)
     ctl = s.controller
     try:
         r = ctl.call("runtime.set_fald_params", {"monitor": s.args.monitor, "mode": mode, "params_path": bin_path})
@@ -1561,6 +1597,10 @@ def phase_verify(s: Session, result: StageResult) -> None:
     except Exception as exc:  # noqa: BLE001
         result.block("layer_unavailable", f"runtime.set_fald_params refused: {exc} (a DesktopLUT build before the 2026-09-14 "
                      "SDR/ACM port, DWM hook mode, or a panel file whose transfer does not match the mode)")
+        return
+    why = None if s.simulated else fld4_refused_reason(ctl, s.args.monitor, mode, bin_path)
+    if why:
+        result.block("layer_unavailable", why)
         return
 
     # OFF = asleep overlay, identity (debug 4) / ON = awake: every read waits for its path (OverlayTracker); the

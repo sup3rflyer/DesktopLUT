@@ -16,8 +16,13 @@
 struct MonitorContext;
 struct FaldSettings;
 
-// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 48 words.
-constexpr unsigned int FALD_CB_BYTES = 192;
+// Constant-buffer size shared by FillCB (fald.cpp) and cbuffer FaldCB (fald_shader.h): 52 words.
+constexpr unsigned int FALD_CB_BYTES = 208;
+
+// Black-frame LED boost (FLD4 panel files; DLC FaldParams.boost_lut, work guide C12): the panel firmware multiplies
+// every LED drive by a staircase function of the number of NON-BLACK zones of the frame it receives. At most this
+// many steps fit the file's fixed-size block.
+constexpr unsigned int FALD_BOOST_MAX_STEPS = 24;
 
 // Temporal drive state (FaldSettings::temporalMode; DLC dlc/fald/temporal.py is the reference):
 // 0 = off (stateless layer, byte for byte), 1 = both fields from the filtered drive (LEDs AND the panel's estimate
@@ -68,7 +73,18 @@ struct FaldPanelParams {
     // mode (Build refuses otherwise): an SDR fit decoded as PQ would be wrong by orders of magnitude.
     uint32_t transfer = FALD_TRANSFER_PQ;
     float sdrGamma = 0.0f;                   // the panel's own power-law EOTF exponent (transfer 1 only; measured by DLC)
-    bool hasTransfer = false;                // FLD3 file (the loader saw words 40/41)
+    bool hasTransfer = false;                // FLD3/FLD4 file (the loader saw words 40/41)
+    // Black-frame LED boost (FLD4 words 48-103; absent = no boost, the layer is then bit-identical to a build without
+    // the term). Step function over the non-black zone FRACTION: the last step with lo <= fraction applies (below the
+    // first step: 1.0) — DLC FaldModel.boost_of_fraction. It multiplies B_true only (the panel's own estimate does not
+    // know it). A zone counts as non-black when it is LIT (more than boostLitFrac of its pixels above boostLitNits;
+    // 0 = any pixel) or DIM (more than boostDimFrac of its pixels above boostDimNits) — as-if-white nits of the
+    // pixel's brightest channel, on the frame the panel RECEIVES (DLC FaldModel.active_zone_fraction).
+    uint32_t boostN = 0;                     // steps in use (0 = none)
+    float boostLo[FALD_BOOST_MAX_STEPS] = {};   // zone fraction where step i starts, strictly ascending, 0..1
+    float boostVal[FALD_BOOST_MAX_STEPS] = {};  // its LED boost, 0.5..2
+    float boostLitNits = 0.35f, boostLitFrac = 0.0f, boostDimNits = 0.011f, boostDimFrac = 0.19f;
+    bool hasBoost = false;                   // FLD4 file with a non-empty LUT
     std::vector<float> curve, kTrue, kEst;
 };
 // Resets `out` first: nothing of a previously loaded file (transfer, pedestal colour, optional words) survives.
@@ -78,6 +94,14 @@ bool FaldPanelFileHasPedColour(const std::wstring& path);
 // Cheap header peek: the file's signal transfer (FALD_TRANSFER_PQ / FALD_TRANSFER_GAMMA) without loading the
 // tables. false when the file is unreadable or not a FALD panel file (then `transfer` is left untouched).
 bool FaldPanelFileTransfer(const std::wstring& path, uint32_t& transfer);
+// Cheap header peek: does the file carry a black-frame LED boost LUT (FLD4 with a step count 1..24)?
+bool FaldPanelFileHasBoost(const std::wstring& path);
+// The GPU looks the boost up by the integer zone COUNT (no float division on the GPU): step i applies from the first
+// count N with N / zonesTotal >= lo (DLC FaldModel.boost_of_fraction; the tolerance absorbs the float32 rounding of
+// the file's lo so a step edge that is an exact zone count stays on its side). DLC twin: panelfile.boost_zone_threshold.
+unsigned int FaldBoostZoneThreshold(float lo, unsigned int zonesTotal);
+// CPU reference of the shader's lookup: the boost of a frame with `activeZones` non-black zones (1.0 without a LUT).
+float FaldBoostOfCount(const FaldPanelParams& p, unsigned int activeZones);
 // Does a file with this transfer belong to this monitor mode? (PQ <-> HDR, gamma <-> SDR/ACM.)
 bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr);
 // The panel lattice (origin + cols*cellW x rows*cellH) must lie inside the monitor's frame.
@@ -130,6 +154,12 @@ struct FaldResources {
     // flat-lattice response of both kernels (computed once at build): a flat field must give gain 1
     ID3D11Texture2D* flatTrueTex = nullptr; ID3D11UnorderedAccessView* flatTrueUAV = nullptr; ID3D11ShaderResourceView* flatTrueSRV = nullptr;
     ID3D11Texture2D* flatEstTex = nullptr;  ID3D11UnorderedAccessView* flatEstUAV = nullptr;  ID3D11ShaderResourceView* flatEstSRV = nullptr;
+    // black-frame LED boost, one set per statistic round (kept apart so a dump shows both): the per-zone non-black
+    // flag (cols x rows, 0/1) the statistic pass writes, and the reduce pass's 2x1 result ([0] boost, [1] zone count).
+    // The LUT buffer ((first zone count, boost) pairs) exists only when the panel file carries a LUT.
+    ID3D11Texture2D* activeTex[2] = {}; ID3D11UnorderedAccessView* activeUAV[2] = {}; ID3D11ShaderResourceView* activeSRV[2] = {};
+    ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
+    ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
     uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)

@@ -53,11 +53,16 @@ def _write_1d_cube(path: Path) -> Path:
     return path
 
 
-def _write_fald_panel(path: Path, transfer: str) -> Path:
+def _write_fald_panel(path: Path, transfer: str, boost_steps: int = 0) -> Path:
     """A header-only stand-in for a FALD panel file: the mock (like the C++ set_fald_params peek) reads only
-    the magic + FLD3 word 40. 'pq' -> FLD1, 'gamma' -> FLD3 with transfer 1 / sdr_gamma 2.27."""
+    the magic + FLD3 word 40 (+ FLD4 word 48). 'pq' -> FLD1, 'gamma' -> FLD3 with transfer 1 / sdr_gamma 2.27;
+    boost_steps > 0 -> FLD4 (the 48 FLD3 words + the boost block's step count) with that transfer."""
     import struct
-    if transfer == "pq":
+    if boost_steps:
+        code, gamma = (1, 2.27) if transfer == "gamma" else (0, 0.0)
+        path.write_bytes(struct.pack("<I", 0x464C4434) + bytes(39 * 4) + struct.pack("<If", code, gamma) + bytes(6 * 4)
+                         + struct.pack("<I", boost_steps) + bytes(55 * 4))
+    elif transfer == "pq":
         path.write_bytes(struct.pack("<I", 0x464C4431) + bytes(31 * 4))
     else:
         path.write_bytes(struct.pack("<I", 0x464C4433) + bytes(39 * 4) + struct.pack("<If", 1, 2.27) + bytes(6 * 4))
@@ -288,6 +293,23 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert st["layers"]["0:HDR"]["fald_params_path"] == str(pq) and st["layers"]["0:HDR"]["fald_file_transfer"] == "pq"
     assert "fald_file_transfer" not in st["layers"]["1:SDR"] and st["layers"]["1:SDR"]["fald_params_path"] == ""
     assert "0:SDR" not in st["runtime"]
+    # black-frame LED boost (C12): an FLD4 file is classified by its transfer word like FLD3, and state.get says
+    # whether the configured file carries a boost LUT (every pair; false without a file / for FLD1-3 / step count 0)
+    assert st["layers"]["0:HDR"]["fald_boost_in_file"] is False and st["layers"]["0:SDR"]["fald_boost_in_file"] is False
+    assert st["layers"]["1:SDR"]["fald_boost_in_file"] is False
+    pq4 = _write_fald_panel(tmp_path / "hdr_pq_boost.bin", "pq", boost_steps=15)
+    ok = client.call("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(pq4)})
+    assert ok.ok and ok.result["transfer"] == "pq"
+    bad = client.send(DesktopLutCommand("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(pq4)}),
+                      raise_on_error=False)
+    assert bad.ok is False and bad.error == "panel file transfer pq (HDR fit) does not match mode SDR"
+    st4 = client.call("state.get", {}).result
+    assert st4["layers"]["0:HDR"]["fald_boost_in_file"] is True and st4["layers"]["0:HDR"]["fald_file_transfer"] == "pq"
+    assert st4["layers"]["0:SDR"]["fald_boost_in_file"] is False
+    empty4 = _write_fald_panel(tmp_path / "hdr_pq_boost0.bin", "pq", boost_steps=25)      # out of range: not a boost file
+    client.call("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(empty4)})
+    assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_boost_in_file"] is False
+    client.call("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(pq)})
     # temporal drive state (2026-09-17): persisted per mode, reported in layers[key], refusals word for word
     tmp = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120})
     assert tmp.ok and tmp.result["temporal_mode"] == 1 and tmp.result["tau_rise_ms"] == 40.0 and tmp.result["tau_fall_ms"] == 120.0

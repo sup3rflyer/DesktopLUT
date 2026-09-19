@@ -20,9 +20,13 @@
 //
 // Passes per frame (overlay path, on the processed frame, after tonemap/LUT/WB):
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)
+//                       (+ the zone's NON-BLACK flag for the black-frame LED boost when the panel file has a boost LUT)
+//   CS boost (opt.)   : non-black zone count of the frame -> step LUT -> the frame's LED boost (2 x 1 texture)
 //   CS temporal (opt.): per cell, first-order drive STATE (rise/fall time constants) -> the drive the kernels see
-//   CS conv           : drives (x) K_true, drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
-//   CS stat  (round 1): same statistic on the CORRECTED frame (the correction moves the drives)
+//   CS conv           : drives (x) K_true [x boost], drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
+//   CS stat  (round 1): same statistic (and zone flags) on the CORRECTED frame (the correction moves the drives, and
+//                       the panel counts the zones of the frame it RECEIVES)
+//   CS boost (opt.)   : the corrected frame's boost
 //   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
 //   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
@@ -39,7 +43,11 @@ cbuffer FaldCB : register(b0) {
     uint debugMode; uint originX; uint originY; uint blurDir;      // blurDir: 0 = horizontal, 1 = vertical pass
     float fadeLo; float fadeHi; float gainSmoothFine; uint transfer; // gainSmoothFine: Gaussian sigma in fine samples (0 = off);
                                                                     // transfer: 0 = PQ codes (HDR), 1 = gamma codes (ACM SDR)
-    float lumFadeLo; float lumFadeHi; float _pad3; float _pad4;     // pixel-luminance fade, as-if-white nits (lo = hi = 0: off)
+    float lumFadeLo; float lumFadeHi; uint boostN; float _pad4;     // pixel-luminance fade, as-if-white nits (lo = hi = 0: off);
+                                                                    // boostN: steps of the black-frame LED boost LUT (t12),
+                                                                    // 0 = no boost term (no LUT in the panel file, or the
+                                                                    // flat-lattice normalisation pass): the layer is then
+                                                                    // exactly the boost-less one
     float tminR; float tminG; float tminB; uint pedMode;            // tmin * the panel file's leak colour (= tmin for FLD1);
                                                                     // pedMode 0 = white pedestal, common-factor subtraction;
                                                                     // 1 = coloured pedestal, per-channel floor (GUI toggle)
@@ -51,6 +59,11 @@ cbuffer FaldCB : register(b0) {
                                                                     // tempMode 0 = off (stateless), 1 = both fields from the
                                                                     // state, 2 = B_true from the state, B_est instantaneous;
                                                                     // tempInit 1 = no valid state yet: copy the drive
+    float boostLitNits; float boostLitFrac; float boostDimNits; float boostDimFrac; // zone activation rule of the boost count
+                                                                    // (DLC FaldModel.active_zone_fraction): a zone is non-black
+                                                                    // when more than LitFrac of its pixels exceed LitNits (0 =
+                                                                    // any pixel) OR more than DimFrac of them exceed DimNits
+                                                                    // (as-if-white nits of the pixel's brightest channel)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -65,6 +78,9 @@ Texture2D<float>  gainTex     : register(t9); // smoothed gain on the fine grid 
 Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless tempMode 2);
                                                // pixel pass view 7: the filtered drive (driveTex = the instantaneous one)
 Texture2D<float>  stateTex    : register(t11); // temporal pass: the committed drive state of the previous frame
+Buffer<float>     boostLut    : register(t12); // [boostN][2]: (first non-black zone COUNT of the step, LED boost), ascending
+Texture2D<float>  activeTex   : register(t13); // cols x rows: 1 = the zone counts as non-black (boost pass; pixel view 8)
+Texture2D<float>  boostTex    : register(t14); // 2 x 1: [0] = the frame's LED boost, [1] = its non-black zone count (conv pass)
 SamplerState linearClamp : register(s0);
 
 // Ceiling-rule soft knee (correct.py KNEE_START / KNEE_CAP_TRUST; DLC tests/test_fald_transfer.py pins them equal).
@@ -229,16 +245,23 @@ float3 Correct(float3 img, float bTrue, float bEst, float gain) {
 )";
 
 // Pass 1: per-cell area statistic -> drive. One thread group per cell, 256 threads sweep the block.
+// With a boost LUT (boostN != 0) the same sweep counts the zone's pixels above boostLitNits / boostDimNits and writes
+// the zone's NON-BLACK flag (u1) — on the frame the PANEL receives: the source in round 0, the corrected frame in
+// round 1 (DLC correct_image re-reads the boost from each round's request).
 inline const char* g_faldStatSource = R"(
 RWTexture2D<float> driveOut : register(u0);
+RWTexture2D<float> activeOut : register(u1);
 groupshared float gMax[256];
 groupshared float gSum[256];
+groupshared uint gLit[256];
+groupshared uint gDim[256];
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint cx = gid.x, cy = gid.y;
     uint n = cellW * cellH;
     float m = 0.0f, sum = 0.0f;
+    uint lit = 0, dim = 0;
     for (uint k = tid.x; k < n; k += 256) {
         uint px = originX + cx * cellW + (k % cellW);
         uint py = originY + cy * cellH + (k / cellW);
@@ -249,27 +272,70 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             float g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
             img = Correct(img, bT, bE, g);
         }
-        float s = min(max(img.r, max(img.g, img.b)), white);
+        float mc = max(img.r, max(img.g, img.b));
+        float s = min(mc, white);
         if (s > driveFloor) { m = max(m, s); sum += s; }
+        if (boostN != 0u) {
+            if (mc > boostLitNits) lit++;
+            if (mc > boostDimNits) dim++;
+        }
     }
     gMax[tid.x] = m; gSum[tid.x] = sum;
+    gLit[tid.x] = lit; gDim[tid.x] = dim;
     GroupMemoryBarrierWithGroupSync();
     for (uint stride = 128; stride > 0; stride >>= 1) {
         if (tid.x < stride) {
             gMax[tid.x] = max(gMax[tid.x], gMax[tid.x + stride]);
             gSum[tid.x] += gSum[tid.x + stride];
+            gLit[tid.x] += gLit[tid.x + stride];
+            gDim[tid.x] += gDim[tid.x + stride];
         }
         GroupMemoryBarrierWithGroupSync();
     }
     if (tid.x == 0) {
         float stat = min(gMax[0], gSum[0] / area0);   // min(brightest lit px, sum lit nits*px^2 / A0)
         driveOut[uint2(cx, cy)] = DriveOf(stat);
+        if (boostN != 0u) {
+            // LIT-or-DIM (FaldModel.active_zone_fraction): fractions of the zone's pixels (the lattice lies inside
+            // the frame — FaldLatticeFits — so every zone has cellW * cellH of them)
+            float litF = (float)gLit[0] / (float)n;
+            float dimF = (float)gDim[0] / (float)n;
+            activeOut[uint2(cx, cy)] = (litF > boostLitFrac || dimF > boostDimFrac) ? 1.0f : 0.0f;
+        }
     }
+}
+)";
+
+// Pass 1a (boost LUT only): the frame's black-frame LED boost. Counts the non-black zones of the statistic pass
+// (t13) and looks the staircase up by COUNT: the last step whose first count is <= N applies, below the first step
+// the boost is 1 (FaldModel.boost_of_fraction; the C++ turns the file's zone fractions into counts —
+// FaldBoostZoneThreshold — so no float division decides a step edge on the GPU). Instantaneous by design: the panel
+// switches within one meter read in both directions, so the temporal drive state does not filter it.
+inline const char* g_faldBoostSource = R"(
+RWTexture2D<float> boostOut : register(u0);
+
+[numthreads(1, 1, 1)]
+void main() {
+    uint count = 0;
+    [loop] for (uint y = 0; y < rows; y++) {
+        [loop] for (uint x = 0; x < cols; x++) {
+            if (activeTex.Load(int3(x, y, 0)) > 0.5f) count++;
+        }
+    }
+    float b = 1.0f;
+    [loop] for (uint i = 0; i < boostN; i++) {
+        if ((float)count < boostLut[2 * i]) break;
+        b = boostLut[2 * i + 1];
+    }
+    boostOut[uint2(0, 0)] = b;
+    boostOut[uint2(1, 0)] = (float)count;
 }
 )";
 
 // Pass 2: the two backlight fields on the sub-cell grid. out[k] = sum_i d[k - i] * kern[i]
 // (scipy fftconvolve 'same', odd kernels, zero outside the lattice), kernel chosen by sub-offset.
+// The black-frame LED boost (boostN != 0) multiplies B_true ONLY — the panel's own estimate does not know it
+// (FaldModel.backlights). The flat-lattice normalisation fields are built with boostN = 0.
 inline const char* g_faldConvSource = R"(
 RWTexture2D<float> bTrueOut : register(u0);
 RWTexture2D<float> bEstOut  : register(u1);
@@ -299,6 +365,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             accE += driveEstTex.Load(int3(sx, sy, 0)) * kEst[(so * He + (uint)(j2 + (int)reachEstR)) * We + (uint)(i2 + (int)reachEstC)];
         }
     }
+    if (boostN != 0u) accT *= boostTex.Load(int3(0, 0, 0));
     bTrueOut[uint2(fx, fy)] = accT;
     bEstOut[uint2(fx, fy)] = accE;
 }
@@ -368,6 +435,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 //     |adj_channel - adj_white| * fade, x100 (what changes on screen when the toggle flips; black = nothing),
 //     7 = temporal settling: per cell, the instantaneous drive minus the filtered one (red = the state is still BELOW
 //     the frame's drive, i.e. the LEDs are modelled as still rising; blue = above, falling), +-25 % drive full scale.
+//     8 = the black-frame boost's zone map of the corrected frame (round 1): white = the zone counts as non-black,
+//     black = it does not; passthrough when the panel file has no boost LUT.
 inline const char* g_faldPixelSource = R"(
 struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -395,6 +464,12 @@ float4 main(PS_INPUT i) : SV_Target {
         float t = saturate(abs(diff) * 4.0f);
         float3 cc = (diff >= 0.0f) ? float3(1.0f, 1.0f - t, 1.0f - t) : float3(1.0f - t, 1.0f - t, 1.0f);
         return float4(cc * DebugWhite(), 1.0f);
+    }
+    if (debugMode == 8) {
+        if (boostN == 0u) return src;
+        uint2 c8 = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);
+        float v8 = (activeTex.Load(int3((int2)c8, 0)) > 0.5f) ? DebugWhite() : 0.0f;
+        return float4(v8, v8, v8, 1.0f);
     }
     if (debugMode == 5 || debugMode == 6) {
         float maxc = max(img.r, max(img.g, img.b));
