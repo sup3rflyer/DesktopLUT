@@ -63,8 +63,18 @@ def test_warp_glow_dumps_are_the_twin():
     err = np.abs(nits(out) - nits(tw["out"]))
     assert float(err[filled].max()) <= 3e-4, float(err[filled].max())
     same = (out == tw["out"]).all(axis=-1)
-    # bit equality needs the twin's own DRIVES to be the device's: exact for stars at panel white (drive 1), not where the
-    # drive-curve LUT interpolates (the emulator's known discretisation gap, ~1e-4 of B_true — not the fill's)
+    # THE scale-free gate, and the one that holds in every regime: no channel of a filled pixel is more than ONE last bit
+    # from the twin. A real divergence in the glow path (the fill computed from another round's fields, an interpolated
+    # instead of a nearest-zone k, another reduction order) moves the fill by far more than the FP16 step and lands here.
+    ulp = np.spacing(np.abs(tw["out"][filled])).astype(np.float64)       # the FP16 step AT each value
+    off_by = np.abs(out[filled].astype(np.float64) - tw["out"][filled].astype(np.float64)) / np.maximum(ulp, 1e-30)
+    assert float(off_by.max()) <= 1.0 + 1e-9, float(off_by.max())
+    # How MANY of those channels land on the neighbouring half is not scale-free: it follows the twin's residual drive
+    # difference, and the drive comes from the curve LUT, which a device samples with 8-bit sub-texel weights while the
+    # emulator interpolates it in float64. High on the curve (a star lattice at panel white: zone statistic 34-40 nit,
+    # drive 0.14) that is 1.5e-5 of B_true = 0.02 FP16 ulp and ~1 % of the channels differ; just above the curve's low-end
+    # knee (610-nit stars: statistic 12-13 nit, drive 0.02-0.03) it is 1.8e-4 = 0.31 ulp and ~16 % do. So the bit-equality
+    # FRACTIONS are asserted only where the twin reproduces the device's drives; the ulp bound above carries the rest.
     drives_exact = float(np.max(np.abs(vz - tw["glow"]["vz"]))) <= 2e-5 * float(vz.max())
     if drives_exact:
         assert float(same[filled].mean()) > 0.97 and float(same.mean()) > 0.99, (float(same[filled].mean()), float(same.mean()))
