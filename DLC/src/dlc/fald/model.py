@@ -5,8 +5,12 @@ Pipeline (all stages parameterised by :class:`FaldParams`, nothing panel-specifi
 
 1. **LDA input** ``s(p)``: requested linear nits of the brightest channel (PQ-decoded), clipped to
    ``white_nits``. The dimming algorithm was found to key on the max channel, not luminance.
-2. **Cell drive** ``d_c = drive_curve(max over the cell of box-blur(s, blur_px))`` — a saturating
-   max over a blurred image (features smaller than the footprint count partially).
+2. **Cell drive** ``d_c = drive_curve(stat_c)``. The default and the ONLY shipped / shader statistic is
+   ``stat_kind="area"``: ``stat_c = min(brightest lit px, Σ lit nits·px² / A0)`` over the cell's pixels above the
+   drive floor (A0 = ``stat_area0_px2``: 1150 px² = the shipped HDR fit, 433 px² = the SDR refit). The original
+   "winmax" statistic (max over the cell of a box-blurred image, footprint ``blur_px``) and "area_win" are
+   OFFLINE-ONLY branches. KNOWN WRONG REGIMES of the area statistic (fitted on windows of ≥ ~100 px²; camera
+   2026-09-19/20, refit owed = work guide P10) — see the note at ``FaldParams.stat_kind``.
 3. **Backlight** ``B_true = Σ_c d_c K_true(|p − c|)`` with ``K_true`` an isotropic exponential in
    millimetres, normalised so a fully driven full field gives ``B = 1``. The monitor's own
    estimate ``B_est`` uses ``K_est`` (a different, fittable kernel) — the mismatch is the
@@ -62,7 +66,8 @@ class FaldParams:
     cols: int = 48
     rows: int = 48
     px_mm: float = 0.1845
-    # LDA — statistic = winmax: max over sliding windows (footprint blur_px) inside the cell of the
+    # LDA — the ORIGINAL statistic (stat_kind "winmax", offline-only today; the default is "area", below) =
+    # max over sliding windows (footprint blur_px) inside the cell of the
     # window mean. (2026-09-11: the coverage-law / sample-grid variants modelled DesktopLUT's dynamic
     # tonemap sampler, not the panel — removed; doc §21.)
     blur_px: float = 32.0                 # statistic footprint (box)
@@ -79,6 +84,19 @@ class FaldParams:
                                           # lattice comments. The GPU export tabulates ONLY stat "area" + est_kind
                                           # exp|mix|knots; do not select another branch from a panel file meant for
                                           # the shader without an H1-class meter gate.
+    # KNOWN WRONG REGIMES of min(peak, Σ lit nits·px² / A0) — the "best on every set" verdict above covers the
+    # 2026-09-11 meter sets only (windows / slivers of >= ~100 px²). Camera 2026-09-19/20 (work guide "IDEA BOARD
+    # 2026-09-19" findings; refit owed = ticket P10, nothing below is in the model or the shader yet):
+    #   (a) tiny features on black: the displayed star level goes ~ request^0.55 (3-8 px), the star's OWN level
+    #       grows with its size (1842 requested: 7 / 8 / 15 / 16 / 26 nit per px at 1 / 2 / 3 / 4 / 8 px) while the
+    #       haze is flat from 1 to 4 px — a 1-px star acts like >= ~34 px² (results/phone_camera_2026-09-20/stars/);
+    #   (b) specks on a LIT field: the "un-cap" prediction FAILED — the speck's LEVEL matters, its SIZE does not
+    #       (one 340-nit pixel = a 4x4 block at 340; glare-free ratios 0.28 / 0.14 / 0.27 vs the model's 0.92 /
+    #       0.54 / 0.91; results/phone_camera_2026-09-19/uncap/uncap_summary.json);
+    #   (c) zone borders: LEVEL law — ONE pixel column / row inside a zone takes it to ~full drive, both zones lit
+    #       while straddling (star flux x1.43 vertical / x1.47 horizontal border); the area-weighted hand-over this
+    #       statistic produces does not exist on the panel (results/phone_camera_2026-09-20/border/).
+    # A0: 1150 px² = the shipped HDR fit (this default); 433 px² = the SDR refit (2026-09-15).
     stat_area0_px2: float = 1150.0
     # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
     # to code 1023 = 1842 nits). The 2026-09-10 curve had the same shape but was normalised to 1000 nits
@@ -133,6 +151,8 @@ class FaldParams:
     sdr_gamma: float = 2.2
     chan_weights: tuple[float, float, float] = (0.305, 0.596, 0.099)   # R,G,B share of white
     tmin: float = 3.0e-4                  # closed-LCD transmittance (pedestal = Lmax·B·tmin), LUMINANCE-fitted
+                                          # (3.0e-4 = placeholder default, never used for the PA32UCXR: the shipped HDR
+                                          # fit has 1.017e-3, the SDR refit 1.297e-3)
     # Pedestal COLOUR (2026-09-13, work-guide H2 / owner: "channel subtractive mode"): the closed-LCD leak is bluer
     # than the panel's white (native black-field leak, doc §22 logs: xy ≈ 0.273/0.299 vs white 0.3235/0.3283).
     # tmin_rgb = per-channel multipliers m_c on tmin, normalised so Σ_c w_c·m_c = 1 (the luminance fit is kept):
@@ -178,8 +198,12 @@ class FaldParams:
                                          #   owner's dark band around white text on 0.5-nit grey. lo = hi = 0 -> off.
     # Black-frame LED boost (HW 2026-09-18, work guide "HW 2026-09-18" items 2/2a, results/fald_inside_2026-09-18/
     # boost_table.json): the firmware multiplies every LED drive by a staircase function of the NUMBER OF NON-BLACK
-    # ZONES of the frame (PA32UCXR HDR: x1.165 up to ~6 % of the zones, 1.0 from ~37 %, a dead band = 1.0 at
-    # 10.3-11.0 %). Level-independent, instant, LED-side (the code-0 leak scales the same) and NOT part of the
+    # ZONES of the frame. PA32UCXR HDR, N = non-black zones of 2304, as boost_table.json's lut stands (the first-night
+    # "x1.165 up to ~6 %, 1.0 from ~37 %, dead band 10.3-11.0 %" is superseded; 1.165 included stray light):
+    # x1.178 below N 38 (measured at N 1-16), x1.167 from N 38 to 145 (measured N 60-141), then 1.146 / 1.114 /
+    # 1.103 / 1.096 down to N 234, a DEAD BAND of exactly 1.000 at N 235-255 (edges exact at 234|235 and 255|256 in
+    # both directions: no hysteresis, no temporal filter — camera X1 2026-09-20), x1.071 at N 256 falling to 1.008
+    # by N 654, and 1.000 from N >= 801 (34.8 %; measured 1.008 at N 756, 1.000 at N 846). Level-independent, instant, LED-side (the code-0 leak scales the same) and NOT part of the
     # panel's own estimate, so it multiplies B_true only. boost_lut = ((zone_fraction_lo, boost), ...) ascending, a
     # STEP function (the last entry with lo <= fraction applies); () = no boost (every fit before 2026-09-18).
     # ZONE ACTIVATION — which zones the firmware counts as non-black. Two criteria, OR; the first is common to both rules:
@@ -205,6 +229,12 @@ class FaldParams:
     boost_dim_nits: float = 0.011         # rule "dim" only
     boost_dim_frac: float = 0.19
     boost_rule: str = "dim"               # "dim" = LIT-or-DIM (legacy) | "mean" = LIT-or-MEAN; travels with the boost table
+                                          # NOTE — THIS DEFAULT IS NOT THE MEASURED RULE. "dim" is kept only so fits /
+                                          # tables / FLD4 files written before 2026-09-20 (no key, word 53 = 0) stay
+                                          # bit-compatible. The measured rule is "mean" (LIT: any pixel > 0.35 nit, OR
+                                          # zone mean of nits^0.62 >= 0.0693); it arrives via boost_table.json's keys
+                                          # zone_rule / mean_gamma / mean_thresh (dlc.fald.boost), a fit's boost_rule /
+                                          # boost_mean_* keys, and FLD4 words 53-55 (C++ FALD_BOOST_RULE_MEAN).
     boost_mean_gamma: float = 0.62        # rule "mean" only
     boost_mean_thresh: float = 0.0693
     scale: int = 5
@@ -369,10 +399,13 @@ class FaldModel:
         return d
 
     def cell_drives(self, img: np.ndarray) -> np.ndarray:
-        """Per-cell statistic = max over sliding windows (footprint ``blur_px``) that lie INSIDE
-        the cell of the window mean — features smaller than the footprint count partially, and
+        """Per-cell drive = ``drive_of(statistic)`` of the brightest channel clipped to white. The statistic is
+        ``stat_kind``: "area" (DEFAULT, the only one shipped / in the shader) = :meth:`_area_stat`,
+        min(brightest lit px, Σ lit nits·px² / A0); "winmax" (the original, offline-only) = max over sliding
+        windows (footprint ``blur_px``) that lie INSIDE the cell of the window mean — features smaller than the
+        footprint count partially; "area_win" = the min of both. In every kind
         nothing leaks across a cell boundary (HW: a window whose edge sits exactly on a boundary
-        does not drive the next cell at all)."""
+        does not drive the next cell at all). Known-wrong regimes of "area": see :meth:`_area_stat`."""
         p = self.p
         s = np.minimum(np.max(img, axis=0), p.white_nits)      # brightest channel, requested nits
         if p.stat_kind == "area":
@@ -385,7 +418,11 @@ class FaldModel:
 
     def _area_stat(self, s: np.ndarray) -> np.ndarray:
         """min(brightest lit px, Σ lit nits·px² / A0): the native single-cell area law (monotone; a
-        uniform field gives its level)."""
+        uniform field gives its level). Fitted on meter windows / slivers of ≥ ~100 px² (2026-09-11). KNOWN WRONG
+        (camera 2026-09-19/20, refit owed = work guide P10; details at ``FaldParams.stat_kind``): (a) tiny features
+        on black (displayed level ∝ request^0.55, own level grows with size, haze flat 1–4 px), (b) specks on a lit
+        field (the level matters, the size does not — the "un-cap" prediction failed), (c) zone borders (LEVEL law:
+        one pixel column inside a zone → ~full drive, ×1.43–1.47 while straddling — no area-weighted hand-over)."""
         p = self.p
         blocks = s.reshape(p.rows, self.ch, p.cols, self.cw).transpose(0, 2, 1, 3)
         lit = blocks > p.drive_floor_nits

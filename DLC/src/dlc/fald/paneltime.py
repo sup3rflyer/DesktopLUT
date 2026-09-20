@@ -4,9 +4,14 @@ This is the PANEL side only — what the monitor does over time with the frames 
 drive filter (:mod:`dlc.fald.temporal`, a first-order per-frame filter the measurement rejected); it exists so
 temporal corrections can be designed and scored offline against the law the camera found:
 
-* the local-dimming engine updates every SECOND 60-Hz frame (30 Hz). Software cannot know which one: ``parity``;
+* the local-dimming engine updates every SECOND panel refresh — the tick is REFRESH ÷ 2 (30 Hz at 60 Hz, 24 Hz at
+  48 Hz: measured at both, results/phone_camera_2026-09-20/parity_lock/summary.json), not a fixed 30 Hz. Which
+  refresh (``parity``) the software does not know TODAY: the parity is locked to the actually PRESENTED frame index
+  (48/48 on every run, stable over 13 min) and re-rolls on display mode sets, so using it needs the presented
+  refresh index plus a one-bit calibration after every display event (stage 3, not built; default ``parity`` −1 =
+  the mean of both clocks);
 * a tick uses content that is at least ``latency_frames`` old, so the first LED step shows 1 or 2 frames after the
-  LCD data (camera: 18 or 35 ms);
+  LCD data (camera at 60 Hz: 18–21 or 34–39 ms, the two parity classes);
 * at a tick every zone closes ``closure`` of the remaining gap to its target drive, the same up and down
   (black-card control: 0.63 / 0.87 / 0.95 from LEDs-off, 0.78 / 0.92 / 1.00 in the lit regime; no overshoot);
 * the panel's own LCD compensation (its backlight estimate) follows the LED state ``est_lag_frames`` later (one
@@ -14,7 +19,8 @@ temporal corrections can be designed and scored offline against the law the came
   1–2-frame flash (rise) / dip (fall) on constant grey beside a changing object;
 * no scene-cut bypass, no dependence on step size, start level or area.
 
-The LCD itself is treated as instant (its 12–30 ms transitions are below the frame grid used here).
+The LCD itself is treated as instant (a simplification: its 12–30 ms transitions span 1–2 frames of the grid used
+here and are NOT modelled — the camera's flash spike is ~1.5 frames wide for that reason).
 
 The shader's form of the law (temporal mode 3 "panel clock", work guide C13; ``src/fald.cpp`` ``FaldPanelClockFactors``,
 ``src/fald_shader.h`` ``g_faldPanelClockSource``; GPU-order twin :class:`dlc.fald.gpuemu.GpuPanelDriveState`): a frame
@@ -52,7 +58,7 @@ LOCK_GAIN = 0.08                # steady gain of the refresh grid's phase lock, 
 
 @dataclass(frozen=True)
 class PanelTimeLaw:
-    tick_frames: int = 2        # the dimming engine runs every n-th panel frame (60 Hz panel -> 30 Hz)
+    tick_frames: int = 2        # the dimming engine runs every n-th panel frame: refresh ÷ 2 (30 Hz at 60, 24 Hz at 48)
     closure: float = 0.72       # share of the remaining drive gap closed per tick (measured 0.63–0.78)
     latency_frames: int = 1     # a tick sees content at least this many frames old
     est_lag_frames: int = 1     # the LCD compensation follows the LED state this many frames later

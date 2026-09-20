@@ -54,6 +54,10 @@ docs/v1-rebuild-plan.md
 docs/hdr-target-design.md
 docs/audit-2026-06-17/
 docs/audit-2026-06-19/
+# FALD layer docs (work guide, shader design, probe notebook, specs, audits, infosheet): local-only by
+# project rule (CLAUDE.md) — they carry PA32UCXR panel measurements. One `git add docs/` must not publish them.
+docs/fald-*.md
+docs/fald-*.html
 # Agent entrypoints + local task briefs — same local-only class as CLAUDE.md
 # (the public face is README + CHANGELOG + code; no panel/user data leaves the box).
 CLAUDE.md

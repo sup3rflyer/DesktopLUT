@@ -3,7 +3,10 @@ scattered tiny highlights. It changes the content on purpose; the question is ho
 
 Why (HW 2026-09-18, work guide "HW 2026-09-18" item 2h). On a mini-LED panel a sparse sub-zone highlight is shown with
 the LCD wide open, so its luminance AND the haze around it are both set by the LED drive of its zone — and that drive
-follows the highlight's REQUESTED level (~request^0.6), hardly its size: one white pixel drives its zone to ~12 %.
+follows the highlight's REQUESTED level (~request^0.55 — camera 2026-09-20, the stars' own flux at 3-8 px,
+results/phone_camera_2026-09-20/stars/stars_summary.json; the 2026-09-18 meter haze fit gave 0.6), hardly its size:
+one white pixel drives its zone to ~12 %. (Camera refinement: the star's OWN displayed level does grow with its size —
+7 -> 26 nit per px from 1 to 8 px at 1842 requested — while the HAZE is flat from 1 to 4 px and rises only at 8 px.)
 Real content rarely sits on a code-0 black, so the zones of such a field are lit anyway; what shows is the UNEVENNESS —
 the zone holding a brighter speck drives harder than its neighbours, a zone-shaped patch of haze that comes and goes
 as the specks move. Pixel-side compensation cannot remove it near black (nothing can go below the pedestal). The one
@@ -19,6 +22,8 @@ floored denominator; box(r) = the (2r+1)^2 zone neighbourhood, zero outside the 
 Per zone, in this order
    1. floored statistic (the layer's own): ``peak`` = max s, ``total`` = sum s over pixels ABOVE the drive floor;
       ``has`` = peak > 0 (the brightest pixel is lit); ``drive`` = DriveOf(min(peak, total / A0)).
+      (CAVEAT 2026-09-20: this is the layer's area statistic, which the camera found WRONG for exactly this content —
+      stars on black, specks on a lit field, zone borders; see ``FaldParams.stat_kind`` in model.py. Refit owed, P10.)
    2. un-gated statistic over ALL pixels (real content never sits on code 0: a lit sky must not count as lit area):
       ``peak_all`` = max s, ``b`` = min s (the zone's BACKGROUND), ``sum_all``, ``n`` = pixel count (px^2), and
       ``arg`` = the zone-local position (lx, ly) of the brightest pixel (ties: the one nearest the zone border —

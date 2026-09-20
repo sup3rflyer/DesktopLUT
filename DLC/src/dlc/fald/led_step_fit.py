@@ -20,6 +20,13 @@ frames (--panel-hz) — the LCD data changes at t0(block), the light at t0(halo)
 bump beyond the new plateau) is the discriminator between the two shader modes: a monotone step = LEDs and the
 panel's own compensation move together (mode 1); an overshoot = the LCD opening moves before the light (mode 2).
 Frame indices in the report count from --skip.
+
+STATUS 2026-09-20 — SUPERSEDED as the way to get the panel's law. The law was measured on 2026-09-19/20 with 120-fps
+Pro Video LOG (the phone's 240-fps slow-motion mode has no manual exposure control and was not used) and is NEITHER
+branch of the discriminator above: the LEDs step monotonically (no overshoot) on a refresh ÷ 2 sample-and-hold
+(≈ 0.72 of the gap per tick, first step 1–2 refreshes after the LCD data) AND constant grey beside the block flashes
+for 1–2 frames, because the panel's LCD compensation follows the LED step one refresh later. No first-order τ fits it.
+See :mod:`dlc.fald.paneltime` (temporal mode 3) and the work guide's "IDEA BOARD 2026-09-19" findings.
 """
 from __future__ import annotations
 

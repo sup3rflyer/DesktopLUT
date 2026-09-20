@@ -1,10 +1,30 @@
 """Temporal drive state of the FALD layer — the reference for the shader's per-cell LED-law filter
 (``src/fald_shader.h`` pass 1b ``g_faldTemporalSource``, ``src/fald.cpp`` ``RunTemporal``; work guide H5 / item 4a).
 
+STATUS 2026-09-20 — LEGACY MODES; THE TEXT BELOW IS THE 2026-09-15/17 DESIGN RECORD, NOT THE PANEL'S LAW.
+The PA32UCXR's LED time law was MEASURED on 2026-09-19/20 (phone camera, 120-fps Pro Video LOG, black-card control;
+work guide "IDEA BOARD 2026-09-19" findings, results/phone_camera_2026-09-19/led_law/ and
+results/phone_camera_2026-09-20/{card,parity_lock}/): the dimming engine is a sample-and-hold that ticks at
+REFRESH ÷ 2 (30 Hz at 60 Hz, 24 Hz at 48 Hz); the first LED step shows 1–2 refreshes after the LCD data
+(≈ 18–21 / 34–39 ms at 60 Hz, the two tick-parity classes); at each tick every zone closes ≈ 0.72 of the remaining
+gap (0.63–0.78 measured with the card), the same up and down, no overshoot, no scene-cut bypass; and the panel's own
+LCD compensation follows the LED state ONE refresh later — so the panel DOES flash natively at every hand-off
+(1–2 frames, +72…+115 % on unchanged grey beside a 5 → 1000-nit block). The first-order filter of this module
+(modes 1 / 2, any τ, incl. the owner's 100 / 100 ms) is REJECTED as the law: mode 1 has no compensation lag, mode 2 has
+the lag with the OPPOSITE sign (here B_est leads B_true; on the panel B_est is one refresh BEHIND). The measured law
+is temporal mode 3 "panel clock": :mod:`dlc.fald.paneltime` (``MODE_PANEL`` = 3 — NOT in ``MODE_NAMES`` below, which
+lists this module's modes only), C++ ``FALD_TEMPORAL_PANEL``. The tick parity is locked to the actually presented
+frame index and re-rolls on display mode sets; the software does not know it today (paneltime's ``parity`` −1).
+Modes 1 / 2 stay in the shader (default off) as the owner's A/B controls and are pinned by the tests; statements
+below that the measurement overtook are tagged [SUPERSEDED].
+
 The stateless layer recomputes every cell's drive from the frame it is given and switches the whole
 correction in the frame a cell's statistic crosses its threshold: a bright edge panning into a cell
 (A0 ≈ 433 px² → saturated after ~10 px of travel) moves the gain pattern a whole cell in a few frames
-(owner's phone video, 2026-09-15). This module adds the one thing the shader has no notion of: TIME.
+(owner's phone video, 2026-09-15). [SUPERSEDED: 433 px² is the SDR refit's A0 — the shipped HDR fit has 1150 px²
+(~26 px of travel) — and this area-weighted hand-over is the MODEL's statistic, not the panel: the measured border
+behaviour is the LEVEL law (one pixel column inside a zone → ~full drive, ×1.43–1.47 while straddling;
+results/phone_camera_2026-09-20/border/border_summary.json).] This module adds the one thing the shader has no notion of: TIME.
 Each cell carries a drive STATE that follows the instantaneous drive with a first-order response,
 
     s' = s + a · (d − s),   a = a_rise when d > s else a_fall,   a = 1 − exp(−dt / τ)
@@ -23,7 +43,10 @@ delay 1.1 %, and no τ helps). Two hypotheses about the panel (``mode``):
   region for the few frames the LEDs are still catching up (and darkens on a fall). Design review
   2026-09-17: physically the less likely shape (firmware that smooths its drive map has the smoothed map in
   hand when it computes the LCD opening → mode 1; a lag AFTER the compensation stage is a delay, not a
-  filter) and a panel of this kind would flash natively at every handoff. Keep it as a diagnostic, not a
+  filter) and a panel of this kind would flash natively at every handoff. [SUPERSEDED 2026-09-20: this argument is
+  REFUTED by measurement — the PA32UCXR DOES flash natively at every hand-off (its LCD compensation follows the LED
+  step one refresh later; status block above). Mode 2 is still not the law: its B_est LEADS B_true, the panel's
+  lags it.] Keep it as a diagnostic, not a
   candidate default. It also carries a rest bias: on a static frame round 0 filters the raw frame's drives
   while B_est uses them unfiltered, so the settled state is inconsistent by (1 − a)(d0 − s) (worse than the
   stateless layer, growing with τ) — mode 1's rest error shrinks with a instead.
@@ -38,7 +61,10 @@ texture). Offline evidence (results/fald_temporal_2026-09-15/pan_sim.py, "matche
 LEDs lag by τ = 3–10 frames, the stateless layer makes per-frame jumps WORSE than the native halo
 (p95 3.6–5.0 % vs 1.1–2.2 %) while a matched filter brings them to 0.2–0.4 %. Whether the PA32UCXR
 lags, and with which τ, is UNMEASURED: the control ships default-off; :func:`fit_step_response` fits τ
-from a phone video of the test clip's toggle segment.
+from a phone video of the test clip's toggle segment. [SUPERSEDED 2026-09-20: MEASURED — not a first-order lag at
+all but the refresh ÷ 2 sample-and-hold of the status block above (closure ≈ 0.72 per tick, compensation one refresh
+late); no τ fits it. The control still ships default-off; :func:`fit_step_response` is kept as a tool, its
+first-order model is not the panel's.]
 
 A static desktop delivers no frames (Desktop Duplication): the render loop must keep re-running the layer
 until the state has settled — :func:`settle_frames` = 5 τ_max in frames (e⁻⁵ = 0.7 % of a step) plus the
@@ -176,6 +202,9 @@ def correct_sequence(model, frames: Sequence[np.ndarray], state: DriveState, ite
 
 # ---------------------------------------------------------------------------------------------------
 # Measuring the panel's own LED law (the number the defaults should come from)
+# [2026-09-20: the law has been measured and is NOT first-order — see the module docstring's status block and
+#  dlc/fald/paneltime.py. The capture used 120-fps Pro Video LOG (the phone's 240-fps mode has no manual control).
+#  These first-order fit helpers are kept as tools only.]
 # ---------------------------------------------------------------------------------------------------
 def first_order_step(t: np.ndarray, tau: float, y0: float, y1: float, t0: float = 0.0) -> np.ndarray:
     """y(t) of a first-order step from y0 to y1 starting at t0 (y0 before t0)."""
