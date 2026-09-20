@@ -158,16 +158,18 @@ class DriveState:
         return settle_frames(self.tau_rise_ms, self.tau_fall_ms, self.dt_ms, self.delay_frames) if self.active else 0
 
 
-def correct_sequence(model, frames: Sequence[np.ndarray], state: DriveState, iters: int = 2) -> list[dict]:
+def correct_sequence(model, frames: Sequence[np.ndarray], state: DriveState, iters: int = 2,
+                     refreshes: Optional[Sequence[int]] = None) -> list[dict]:
     """Run :func:`dlc.fald.correct.correct_image` over consecutive frames with one drive state — exactly the
     shader's per-frame order (both rounds peek from the committed state, commit after the last round).
     Returns the per-frame result dicts (``req``, ``gain``, ``drives`` = last-round instantaneous drives, plus
-    ``drives_state`` = the state after the commit)."""
+    ``drives_state`` = the state after the commit). ``refreshes``: per frame, the panel refreshes it stays up (only
+    for a state whose ``commit`` takes it: :class:`dlc.fald.paneltime.PanelDriveState`); None = one each."""
     from .correct import correct_image
     out = []
-    for img in frames:
+    for i, img in enumerate(frames):
         res = correct_image(model, img, iters=iters, drive_filter=state.fields)
-        res["drives_state"] = state.commit(res["drives"])
+        res["drives_state"] = state.commit(res["drives"]) if refreshes is None else state.commit(res["drives"], refreshes=int(refreshes[i]))
         out.append(res)
     return out
 

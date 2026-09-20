@@ -830,7 +830,7 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert c.index("if (r->starOn) RunStar(r);") < c.index("RunStat(r, 0);")
     assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 20" in c
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 272" in h
+    assert "FALD_CB_BYTES = 288" in h                                                               # 72 words since C13 (panel clock)
     assert f"FALD_STAR_EVEN_REACH_MAX = {gpuemu.STAR_EVEN_REACH_MAX}" in h and f"FALD_STAR_REACH_MAX = {gpuemu.STAR_REACH_MAX}" in h
 
 

@@ -77,3 +77,89 @@ def test_drive_state_known_parity_equals_its_clock_and_unknown_is_the_mean():
     for d in seq:
         got = s.fields(d); s.commit(d); want = c.step(d)
         np.testing.assert_allclose(got[0], want[0]); np.testing.assert_allclose(got[1], want[1])
+
+
+# ------------------------------------------------------------------------------------------ k refreshes per frame (C13)
+@pytest.mark.parametrize("parity", [0, 1])
+def test_refreshes_k_is_k_single_steps_with_the_same_drives(parity):
+    rng = np.random.default_rng(5)
+    a, b = PanelClock(PanelTimeLaw(), parity), PanelClock(PanelTimeLaw(), parity)
+    for k in (1, 3, 2, 1, 5, 4, 1, 2):
+        d = rng.random((3, 4))
+        got = a.step(d, refreshes=k)
+        want = [b.step(d) for _ in range(k)][0]                      # the pair of the frame's FIRST refresh
+        np.testing.assert_array_equal(got[0], want[0]); np.testing.assert_array_equal(got[1], want[1])
+        assert a.n == b.n
+        np.testing.assert_array_equal(a.peek()[0], b.peek()[0]); np.testing.assert_array_equal(a.peek()[1], b.peek()[1])
+    with pytest.raises(ValueError):
+        a.step(np.zeros((3, 4)), refreshes=0)
+
+
+def test_clock_ticks_count_both_parities_for_k_1_to_5():
+    from dlc.fald.paneltime import clock_ticks
+    for p in (0, 1):
+        for n_a in range(0, 7):
+            for k in range(1, 6):
+                ts = sum(1 for n in range(n_a + 1, n_a + k + 1) if (n + p) % 2 == 0)
+                tp = sum(1 for n in range(n_a + 1, n_a + k) if (n + p) % 2 == 0)
+                assert clock_ticks(n_a, k, p) == (ts, tp), (p, n_a, k)
+    # the numbers tests/test_fald.cpp pins against FaldPanelClockTicks
+    assert clock_ticks(0, 1, 0) == (0, 0) and clock_ticks(0, 1, 1) == (1, 0)
+    assert clock_ticks(0, 2, 0) == (1, 0) and clock_ticks(0, 2, 1) == (1, 1)
+    assert clock_ticks(3, 5, 0) == (3, 2) and clock_ticks(3, 5, 1) == (2, 2)
+    # k = 1: exactly one of the two clocks ticks; an even k: both tick k / 2 times
+    for n_a in range(6):
+        assert clock_ticks(n_a, 1, 0)[0] + clock_ticks(n_a, 1, 1)[0] == 1
+        assert clock_ticks(n_a, 4, 0)[0] == clock_ticks(n_a, 4, 1)[0] == 2
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+def test_closed_form_blend_equals_k_single_steps(parity):
+    """The shader's form of the law (spec C13): between a frame first shown at n_a and the next at n_b = n_a + k every
+    tick targets the first one's drives, so S(n_b) = S + aS (d_prev − S), S(n_b − 1) = S + aP (d_prev − S)."""
+    from dlc.fald.paneltime import blend_factors
+    law = PanelTimeLaw(closure=0.72)
+    rng = np.random.default_rng(11)
+    c = PanelClock(law, parity)
+    d_prev = rng.random((4, 4)); c.step(d_prev, refreshes=1)
+    s, n_a = d_prev.copy(), 0                                        # the closed form's own state: S(n_a) and the index
+    for k in (1, 2, 3, 4, 5, 1, 1, 2, 5, 3):
+        # frame a (d_prev) has been up since n_a; it stays up k refreshes in all, then frame b arrives at n_b
+        if k > 1:
+            c.step(d_prev, refreshes=k - 1)
+        a_s, a_p = blend_factors(n_a, k, law.closure, parity)
+        want_true, want_est = s + a_s * (d_prev - s), s + a_p * (d_prev - s)
+        got_true, got_est = c.peek()
+        np.testing.assert_allclose(got_true, want_true, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(got_est, want_est, rtol=0, atol=1e-12)
+        d = rng.random((4, 4))
+        c.step(d)
+        s, d_prev, n_a = want_true, d, n_a + k
+
+
+def test_settle_refreshes_follow_the_spec_formula():
+    from dlc.fald.paneltime import PanelDriveState, settle_refreshes
+    assert settle_refreshes(0.72) == 12                              # 2 * ceil(ln 0.005 / ln 0.28) + 2 (tests/test_fald.cpp pins the same)
+    assert settle_refreshes(0.5) == 18 and settle_refreshes(1.0) == 4 and settle_refreshes(0.05) == 210
+    assert settle_refreshes(7.0) == 4 and settle_refreshes(-1.0) == 210       # clamped to 0.05 .. 1
+    assert PanelDriveState(PanelTimeLaw(closure=0.72)).settle_frames() == 12
+    # after that many refreshes of a static frame the state is within 0.5 % of the step, whatever the parity
+    for parity in (0, 1):
+        c = PanelClock(PanelTimeLaw(closure=0.72), parity)
+        c.step(np.array([[0.0]])); c.step(np.array([[1.0]]), refreshes=12)
+        true, est = c.peek()
+        assert 1.0 - float(true[0, 0]) <= 0.005 and 1.0 - float(est[0, 0]) <= 0.005
+
+
+def test_drive_state_commit_takes_refreshes():
+    from dlc.fald.paneltime import PanelDriveState
+    law = PanelTimeLaw(closure=0.72)
+    rng = np.random.default_rng(2)
+    a, b = PanelDriveState(law, None), PanelDriveState(law, None)
+    for k in [2, 3, 1, 1, 2]:
+        d = rng.random((2, 2))
+        fa, fb = a.fields(d), b.fields(d)
+        np.testing.assert_array_equal(fa[0], fb[0]); np.testing.assert_array_equal(fa[1], fb[1])
+        a.commit(d, refreshes=k)
+        for _ in range(k):
+            b.commit(d)

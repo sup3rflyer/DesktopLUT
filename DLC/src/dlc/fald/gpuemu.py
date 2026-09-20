@@ -4,7 +4,8 @@ stores textures (R32F), the output frame FP16. Inputs: a parsed panel file (:fun
 and a full-resolution scRGB frame (H, W, 3).
 
 Origin: the 2026-09-15 SDR verification (work guide: "GPU = Python is proven at 2 nits" — bit-exact vs a real
-``fald_dump``). Kept in the tree so the temporal drive state (:class:`GpuDriveState`, pass 1b) and later
+``fald_dump``). Kept in the tree so the temporal drive state (:class:`GpuDriveState`, pass 1b; the panel-clock mode
+3 :class:`GpuPanelDriveState`, pass 1c — reference :mod:`dlc.fald.paneltime`) and later
 shader changes have an offline GPU-order reference next to the model-side one (:mod:`dlc.fald.temporal`).
 White-pedestal mode only (pedMode 0).
 
@@ -172,6 +173,85 @@ class GpuDriveState:
         if self.delay > 0:
             self.ring.append(d.astype(np.float32).copy())
             del self.ring[:-self.delay]
+
+
+def clock_factors32(n_a: int, k: int, closure: float, parity: int) -> tuple:
+    """C++ ``FaldPanelClockFactors`` (float32, the same operation order): the six CB words of the panel-clock pass —
+    ``(true0, est0, true1, est1, w0, w1)``. Per parity clock p the blend toward the previous frame's drives that makes
+    its LED state OF this frame's first refresh (``true``) and of the refresh before it (``est``):
+    a = 1 − (1 − closure)^ticks, the power by repeated float32 multiplication; ticks = :func:`paneltime.clock_ticks`.
+    ``parity`` −1 (unknown) weighs both clocks ½, 0 / 1 that clock alone."""
+    from .paneltime import CLOSURE_MAX, CLOSURE_MIN, clock_ticks
+    q = f32(1.0) - f32(min(max(float(closure), CLOSURE_MIN), CLOSURE_MAX))
+
+    def a(ticks):
+        r = f32(1.0)
+        for _ in range(ticks):
+            r = f32(r * q)
+        return f32(f32(1.0) - r)
+    (ts0, tp0), (ts1, tp1) = clock_ticks(n_a, k, 0), clock_ticks(n_a, k, 1)
+    w = (f32(0.5), f32(0.5)) if parity not in (0, 1) else ((f32(1.0), f32(0.0)) if parity == 0 else (f32(0.0), f32(1.0)))
+    return a(ts0), a(tp0), a(ts1), a(tp1), w[0], w[1]
+
+
+class GpuPanelDriveState:
+    """The GPU side of :class:`dlc.fald.paneltime.PanelDriveState` — temporal mode 3 "panel clock" (work guide C13):
+    pass 1c ``g_faldPanelClockSource`` on the R32F zone textures, driven like the C++ ``FaldRunPasses``.
+
+    Per frame: :meth:`advance` (``refreshes`` = k, the panel refreshes elapsed since the previous frame was first shown)
+    runs the pass ONCE before round 0 — both parity clocks' LED states move toward ``d_prev`` (the previous frame's
+    round-1 instantaneous drives) by the CPU-side blend factors (:func:`clock_factors32`), in place, and the weighted
+    maps for B_true / B_est are written; :meth:`pair` = what RunConv binds in BOTH rounds (the state of a frame depends on
+    past frames only); :meth:`commit` = ``d_prev`` <- this frame's round-1 drives. With no valid state (first frame,
+    after a reset, k > ``MAX_REFRESHES``) the pass does not run, both rounds see their own instantaneous drives (the
+    stateless layer) and the commit seeds both clocks with the round-1 drives: the panel is taken as settled on it."""
+
+    def __init__(self, closure: float = 0.72, parity: int = -1):
+        from .paneltime import CLOSURE_MAX, CLOSURE_MIN, MODE_PANEL
+        self.mode = MODE_PANEL
+        self.closure = float(min(max(float(closure), CLOSURE_MIN), CLOSURE_MAX))
+        self.parity = int(parity) if parity in (0, 1) else -1
+        self.reset()
+
+    def reset(self) -> None:
+        self.s: Optional[list[np.ndarray]] = None     # [S_0, S_1] (C++ FaldResources::clkStateTex)
+        self.d_prev: Optional[np.ndarray] = None      # C++ clkPrevTex
+        self.n = 0                                    # refresh index of the last committed frame (parity arithmetic)
+        self.true: Optional[np.ndarray] = None        # this frame's maps (C++ driveFiltTex / clkEstTex)
+        self.est: Optional[np.ndarray] = None
+        self.factors: Optional[tuple] = None
+
+    def advance(self, refreshes: int = 1) -> None:
+        from .paneltime import MAX_REFRESHES
+        self.true = self.est = self.factors = None
+        if self.s is None:
+            return
+        k = int(refreshes)
+        if k > MAX_REFRESHES:                         # a gap the state cannot bridge: start over from this frame
+            self.reset()
+            return
+        k = max(k, 1)
+        aT0, aE0, aT1, aE1, w0, w1 = self.factors = clock_factors32(self.n, k, self.closure, self.parity)
+        d, (s0, s1) = self.d_prev, self.s
+        g0 = (d - s0).astype(np.float32); g1 = (d - s1).astype(np.float32)
+        t0 = (s0 + aT0 * g0).astype(np.float32); t1 = (s1 + aT1 * g1).astype(np.float32)
+        self.true = (w0 * t0 + w1 * t1).astype(np.float32)
+        self.est = (w0 * (s0 + aE0 * g0).astype(np.float32) + w1 * (s1 + aE1 * g1).astype(np.float32)).astype(np.float32)
+        self.s = [t0, t1]
+        self.n += k
+
+    def pair(self, d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(drive for K_true, drive for K_est) — what RunConv binds at t4 / t10 (both rounds the same maps)."""
+        if self.true is None:
+            return d.astype(np.float32), d.astype(np.float32)
+        return self.true, self.est
+
+    def commit(self, d: np.ndarray) -> None:
+        d = d.astype(np.float32).copy()
+        if self.s is None:
+            self.s = [d.copy(), d.copy()]
+            self.n = 0
+        self.d_prev = d
 
 
 class Emu:
@@ -525,9 +605,12 @@ class Emu:
         g = self.sample(gainB.astype(np.float64))
         return sT, sE, g
 
-    def run(self, frame_scrgb, fp16_out=True, temporal: Optional[GpuDriveState] = None, star: Optional[StarfieldParams] = None):
+    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1):
         """One frame of FaldRunPasses. ``temporal``: a GpuDriveState carried across calls (pass 1b after each stat
-        round; the state commits after round 1 — the CopyResource in the C++). ``star``: starfield balancing settings
+        round; the state commits after round 1 — the CopyResource in the C++), or a GpuPanelDriveState (mode 3: pass 1c
+        once before round 0 with ``refreshes`` = the panel refreshes elapsed since the previous frame was first shown;
+        both rounds read the same maps; the commit stores round 1's instantaneous drives as the next frame's target).
+        ``star``: starfield balancing settings
         (None = the option off: no star pass runs and nothing below changes) — the zone fields come from the SOURCE
         frame and every later step works on Balance(source)."""
         img = self.panel_nits(frame_scrgb)
@@ -539,6 +622,8 @@ class Emu:
             plan = self.star_plan(st, sp)
             img, scale = self.balance(src, plan, sp)
             star_out = {"src": src, "stat": st, "plan": plan, "scale": scale, "params": sp}
+        if temporal is not None and hasattr(temporal, "advance"):
+            temporal.advance(refreshes)                               # pass 1c (mode 3): needs nothing of this frame
         d0, st0 = self.stat_drive(img)
         boost0, zones0, active0 = self.frame_boost(img)               # round 0: the source frame
         dT0, dE0 = temporal.pair(d0) if temporal is not None else (d0, d0)

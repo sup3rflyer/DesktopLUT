@@ -264,6 +264,12 @@ class OverlayTracker:
             return
         saved = {"temporal_mode": int(layers.get("fald_temporal_mode", 0)), "tau_rise_ms": float(layers.get("fald_tau_rise_ms", 0.0)),
                  "tau_fall_ms": float(layers.get("fald_tau_fall_ms", 0.0)), "delay_frames": int(layers.get("fald_delay_frames", 0))}
+        # temporal mode 3 "panel clock" (2026-09-20, work guide C13) is a temporal mode like the others — any mode != 0
+        # is forced off — and carries two more persisted values (absent on older builds)
+        if "fald_temporal_closure" in layers:
+            saved["closure"] = float(layers["fald_temporal_closure"])
+        if "fald_temporal_parity" in layers:
+            saved["parity"] = int(layers["fald_temporal_parity"])
         self.temporal_saved = saved
         if saved["temporal_mode"] != 0:
             try:
@@ -304,8 +310,11 @@ class OverlayTracker:
                 self.reasons.append(f"starfield balancing NOT restored ({exc}): re-enable it by hand")
         if self.temporal_saved and self.temporal_saved.get("temporal_mode", 0) != 0:
             try:
+                # forcing off changed the mode only; the panel clock's closure / parity ride along so the restore is the
+                # owner's full state even if something re-set them meanwhile (keys a build does not report are not sent)
+                extra = {k: self.temporal_saved[k] for k in ("closure", "parity") if k in self.temporal_saved}
                 self.s.controller.call("runtime.fald_temporal", {"monitor": self.monitor, "mode": self.mode,
-                                                                  "temporal_mode": self.temporal_saved["temporal_mode"]})
+                                                                  "temporal_mode": self.temporal_saved["temporal_mode"], **extra})
             except Exception as exc:  # noqa: BLE001
                 self.reasons.append(f"temporal drive state NOT restored ({exc}): re-enable it by hand")
 

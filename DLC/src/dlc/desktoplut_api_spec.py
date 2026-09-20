@@ -76,7 +76,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
                           "fald_ped_mode, fald_ped_colour_in_file, fald_boost_in_file (the panel file is FLD4 with a "
                           "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "
-                          "fald_tau_fall_ms, fald_delay_frames (runtime.fald_temporal), fald_starfield (bool) + fald_star_even, "
+                          "fald_tau_fall_ms, fald_delay_frames, fald_temporal_closure, fald_temporal_parity (runtime.fald_temporal; the last "
+                          "two absent on builds before 2026-09-20), fald_starfield (bool) + fald_star_even, "
                           "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), and "
@@ -393,20 +394,28 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "filter is fed the drives of n frames ago: LED-driver latency after the LCD data, the law a first-order "
             "filter cannot represent). The layer keeps re-running its passes on a static desktop for 5 tau + delay "
             "after the last content frame so the state settles. Persisted per mode (= the GUI 'LED lag' row, which "
-            "sets both modes). At least one of the four. Default off: the panel's LED law is UNMEASURED — fit it "
+            "sets both modes). At least one of the six. Default off: the panel's LED law is UNMEASURED — fit it "
             "(python -m dlc.fald.led_step_fit on a high-fps video of the test clip's toggle segment, --block-roi for "
             "the delay) before trusting a setting; a filter on an instant panel makes pans worse, not better, and the "
-            "wrong MODE flashes at every handoff (mode 2 only if the halo step overshoots).",
+            "wrong MODE flashes at every handoff (mode 2 only if the halo step overshoots). temporal_mode 3 = the "
+            "MEASURED law, 'panel clock' (EXPERIMENT, work guide C13, 2026-09-20; reference dlc/fald/paneltime.py): the "
+            "dimming engine samples and holds at half the refresh rate — at a tick every zone closes `closure` (0.05..1, "
+            "default 0.72) of the gap to the drive of the frame one refresh earlier, the panel's compensation follows one "
+            "refresh later; `parity` = which refresh it ticks on: -1 unknown (default: the mean of both clocks), 0 / 1 "
+            "known (experimental — the wrong one is as bad as no time law). tau / delay are not used by mode 3; "
+            "settle_frames_60hz is then its settle hold in refreshes (closure 0.72 -> 12).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "temporal_mode": ApiParamSpec("number", required=False, description="0 | 1 | 2"),
+                "temporal_mode": ApiParamSpec("number", required=False, description="0 | 1 | 2 | 3"),
                 "tau_rise_ms": ApiParamSpec("number", required=False, description="0..5000"),
                 "tau_fall_ms": ApiParamSpec("number", required=False, description="0..5000"),
                 "delay_frames": ApiParamSpec("number", required=False, description="0..3"),
+                "closure": ApiParamSpec("number", required=False, description="0.05..1 (temporal_mode 3)"),
+                "parity": ApiParamSpec("number", required=False, description="-1 | 0 | 1 (temporal_mode 3)"),
             },
             {"monitor_mode": "string", "temporal_mode": "number", "tau_rise_ms": "number", "tau_fall_ms": "number",
-             "delay_frames": "number", "settle_frames_60hz": "number"},
+             "delay_frames": "number", "closure": "number", "parity": "number", "settle_frames_60hz": "number"},
             mutates_state=True,
             gui_thread_required=True,
         ),

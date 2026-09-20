@@ -296,7 +296,7 @@ def test_hlsl_boost_passes_mirror_the_reference():
     # C++: the CB size, the file constants, the boost-free flat-lattice pass
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 272" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 68 words since S1 (starfield)
+    assert "FALD_CB_BYTES = 288" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 72 words since C13 (panel clock)
     assert "0x464C4434u" in c and "magic == FALD_MAGIC4 ? 416" in c
     assert "FillCB(r, 0, 0, false);" in c and "RunConv(r, r->driveSRV, r->driveSRV, nullptr);" in c
     assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in c     # panelfile.boost_zone_threshold's twin

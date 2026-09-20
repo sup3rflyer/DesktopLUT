@@ -265,6 +265,40 @@ def test_overlay_tracker_forces_starfield_balancing_off_and_restores_it():
     assert not res.anomalies and any("starfield balancing was ON" in n for n in res.notes)
 
 
+def test_overlay_tracker_forces_the_panel_clock_off_and_restores_mode_closure_and_parity():
+    """Work guide C13: temporal mode 3 (panel clock) is a temporal mode like 1 / 2 — a measuring phase must read the
+    STATELESS layer — and the owner's closure / parity must come back with the mode."""
+    ctl = _RefusingCtl(CalibrationController.mock(), refuse=())
+    ctl.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 3, "closure": 0.6, "parity": 1})
+    tr = FP.OverlayTracker(_TrackerSession(ctl), 0, "HDR")
+    layers = ctl.inner.state()["layers"]["0:HDR"]
+    assert layers["fald_temporal_mode"] == 0                                              # forced off for the reads
+    assert layers["fald_temporal_closure"] == 0.6 and layers["fald_temporal_parity"] == 1  # the numbers are not touched
+    meta = tr.file_meta()
+    assert meta["temporal_forced_off"] is True and "forced OFF" in meta["temporal_note"]
+    assert meta["temporal_saved"]["temporal_mode"] == 3 and meta["temporal_saved"]["closure"] == 0.6 and meta["temporal_saved"]["parity"] == 1
+    ctl.inner.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "closure": 0.9, "parity": -1})   # something re-set them meanwhile
+    tr.restore()
+    layers = ctl.inner.state()["layers"]["0:HDR"]
+    assert layers["fald_temporal_mode"] == 3 and layers["fald_temporal_closure"] == 0.6 and layers["fald_temporal_parity"] == 1
+    sent = [p for m, p in ctl.calls if m == "runtime.fald_temporal"][-1]
+    assert sent == {"monitor": 0, "mode": "HDR", "temporal_mode": 3, "closure": 0.6, "parity": 1}
+    assert not tr.reasons
+    # a build that does not report closure / parity (pre-2026-09-20) is restored with the mode alone
+    class _OldBuild:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, params=None):
+            self.calls.append((method, dict(params or {})))
+            return {"layers": {"0:HDR": {"fald": False, "fald_temporal_mode": 1, "fald_tau_rise_ms": 40.0}}, "overlay": {"awake": False}}
+    old = _OldBuild()
+    tr2 = FP.OverlayTracker(_TrackerSession(old), 0, "HDR")
+    tr2.restore()
+    assert [p for m, p in old.calls if m == "runtime.fald_temporal"] == [{"monitor": 0, "mode": "HDR", "temporal_mode": 0},
+                                                                         {"monitor": 0, "mode": "HDR", "temporal_mode": 1}]
+
+
 def test_overlay_tracker_leaves_an_off_starfield_alone():
     ctl = _RefusingCtl(CalibrationController.mock(), refuse=())
     tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")

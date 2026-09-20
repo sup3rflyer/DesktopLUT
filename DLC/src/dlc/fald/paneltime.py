@@ -15,15 +15,30 @@ temporal corrections can be designed and scored offline against the law the came
 * no scene-cut bypass, no dependence on step size, start level or area.
 
 The LCD itself is treated as instant (its 12–30 ms transitions are below the frame grid used here).
+
+The shader's form of the law (temporal mode 3 "panel clock", work guide C13; ``src/fald.cpp`` ``FaldPanelClockFactors``,
+``src/fald_shader.h`` ``g_faldPanelClockSource``; GPU-order twin :class:`dlc.fald.gpuemu.GpuPanelDriveState`): a frame
+stays on the panel for k >= 1 REFRESHES (Desktop Duplication delivers frames on change only, 24-fps video holds a frame
+2–3 refreshes), and k refreshes with the same target collapse into one blend — :func:`clock_ticks` /
+:func:`blend_factors`; ``refreshes=k`` on :meth:`PanelClock.step` / :meth:`PanelDriveState.commit` is the same thing
+as k single steps.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
+import math
+
 import numpy as np
 
 from .model import FaldModel
+
+MODE_PANEL = 3                  # FaldSettings::temporalMode / runtime.fald_temporal temporal_mode (C++ FALD_TEMPORAL_PANEL)
+CLOSURE_DEFAULT = 0.72          # C++ FALD_CLOCK_CLOSURE_DEFAULT
+CLOSURE_MIN, CLOSURE_MAX = 0.05, 1.0   # the range the settings / pipe / CB enforce (C++ FALD_CLOCK_CLOSURE_MIN / _MAX)
+MAX_REFRESHES = 64              # more elapsed refreshes than this between two frames: the state is reset (C++ FALD_CLOCK_MAX_REFRESHES)
+SETTLE_RESIDUAL = 0.005         # the settle hold ends when this share of a step is left
 
 
 @dataclass(frozen=True)
@@ -32,6 +47,34 @@ class PanelTimeLaw:
     closure: float = 0.72       # share of the remaining drive gap closed per tick (measured 0.63–0.78)
     latency_frames: int = 1     # a tick sees content at least this many frames old
     est_lag_frames: int = 1     # the LCD compensation follows the LED state this many frames later
+
+
+def clock_ticks(n_a: int, k: int, parity: int, tick_frames: int = 2) -> tuple[int, int]:
+    """Ticks of the clock with this ``parity`` (it ticks at refresh n when ``(n + parity) % tick_frames == 0``) between
+    a frame first shown at refresh ``n_a`` and the next one at ``n_b = n_a + k``: ``(tS, tP)`` = ticks in
+    ``n_a+1 … n_b`` (they make the LED state OF refresh n_b) and in ``n_a+1 … n_b−1`` (the state one refresh earlier,
+    which the panel's compensation uses at n_b). Every one of them targets the drives of the frame shown at n_a.
+    Mirrors C++ ``FaldPanelClockTicks``."""
+    if k < 1 or n_a < 0:
+        raise ValueError("k >= 1 and n_a >= 0")
+    upto = lambda n: (n + parity) // tick_frames          # ticks at refreshes <= n (up to a constant)
+    return upto(n_a + k) - upto(n_a), upto(n_a + k - 1) - upto(n_a)
+
+
+def blend_factors(n_a: int, k: int, closure: float, parity: int, tick_frames: int = 2) -> tuple[float, float]:
+    """``(aS, aP)`` with ``a = 1 − (1 − closure)^ticks``: S(n_b) = S + aS (d_prev − S), S(n_b − 1) = S + aP (d_prev − S)
+    — t ticks toward one target are one blend."""
+    ts, tp = clock_ticks(n_a, k, parity, tick_frames)
+    return 1.0 - (1.0 - closure) ** ts, 1.0 - (1.0 - closure) ** tp
+
+
+def settle_refreshes(closure: float) -> int:
+    """Refreshes the layer keeps re-rendering after the last content change: m = ceil(ln(residual) / ln(1 − closure))
+    ticks (at least one) leave ``SETTLE_RESIDUAL`` of a step, the m-th tick is at most 2 m refreshes away, the
+    compensation follows one later: 2 m + 2 (closure 0.72 -> 12). Mirrors C++ ``FaldPanelClockSettleFrames``."""
+    c = min(max(float(closure), CLOSURE_MIN), CLOSURE_MAX)
+    m = 1 if c >= 1.0 else max(1, int(math.ceil(math.log(SETTLE_RESIDUAL) / math.log(1.0 - c) - 1e-9)))
+    return 2 * m + 2
 
 
 class PanelClock:
@@ -55,17 +98,25 @@ class PanelClock:
             s = s + law.closure * (self._targets[-law.latency_frames] - s)
         return s, (self._true + [s])[-(law.est_lag_frames + 1):][0]
 
-    def step(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def step(self, drives: np.ndarray, refreshes: int = 1) -> tuple[np.ndarray, np.ndarray]:
         """Feed the instantaneous zone drives of the frame now on the LCD; returns (LED state, the state the panel's
-        compensation uses) for this frame. The first frame finds the panel settled on it."""
+        compensation uses) for this frame. The first frame finds the panel settled on it. ``refreshes`` = k: the frame
+        stays on the panel for k refreshes (k single steps with the same drives); the returned pair is the one of its
+        FIRST refresh — what :meth:`peek` announced and a correction's fields describe."""
+        if int(refreshes) < 1:
+            raise ValueError(f"refreshes must be >= 1, got {refreshes!r}")
         law = self.law
         d = np.asarray(drives, dtype=np.float64)
-        pk = self.peek()
-        s = d.copy() if pk is None else pk[0]
-        self._targets = (self._targets + [d])[-max(law.latency_frames, 1):]
-        self._true = (self._true + [s])[-(law.est_lag_frames + 1):]
-        self.n += 1
-        return s, self._true[0]
+        first = None
+        for _ in range(int(refreshes)):
+            pk = self.peek()
+            s = d.copy() if pk is None else pk[0]
+            self._targets = (self._targets + [d])[-max(law.latency_frames, 1):]
+            self._true = (self._true + [s])[-(law.est_lag_frames + 1):]
+            self.n += 1
+            if first is None:
+                first = (s, self._true[0])
+        return first
 
 
 def simulate(model: FaldModel, frames: Sequence[np.ndarray], law: PanelTimeLaw = PanelTimeLaw(), parity: int = 0,
@@ -118,6 +169,10 @@ class PanelDriveState:
             return d, d
         return sum(p[0] for p in pk) / len(pk), sum(p[1] for p in pk) / len(pk)
 
-    def commit(self, drives: np.ndarray) -> np.ndarray:
-        """Advance by the frame that was actually sent (its instantaneous zone drives). Returns the mean LED state."""
-        return sum(c.step(drives)[0] for c in self.clocks) / len(self.clocks)
+    def commit(self, drives: np.ndarray, refreshes: int = 1) -> np.ndarray:
+        """Advance by the frame that was actually sent (its instantaneous zone drives), on the panel for ``refreshes``
+        refreshes until the next one. Returns the mean LED state (of its first refresh)."""
+        return sum(c.step(drives, refreshes)[0] for c in self.clocks) / len(self.clocks)
+
+    def settle_frames(self) -> int:
+        return settle_refreshes(self.law.closure)

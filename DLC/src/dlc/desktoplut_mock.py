@@ -84,7 +84,10 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
                            "fald_temporal_mode": int(entry.get("temporal_mode", 0)),
                            "fald_tau_rise_ms": float(entry.get("tau_rise_ms", 0.0)),
                            "fald_tau_fall_ms": float(entry.get("tau_fall_ms", 0.0)),
-                           "fald_delay_frames": int(entry.get("delay_frames", 0))}
+                           "fald_delay_frames": int(entry.get("delay_frames", 0)),
+                           # temporal mode 3 "panel clock" (2026-09-20, work guide C13): closure per tick + tick parity
+                           "fald_temporal_closure": float(entry.get("closure", 0.72)),
+                           "fald_temporal_parity": int(entry.get("parity", -1))}
     # starfield balancing (2026-09-19, work guide S1; runtime.fald_starfield): the switch + every numeric field
     star = _fald_star(entry)
     out["fald_starfield"] = star["enabled"]
@@ -712,17 +715,21 @@ class MockDesktopLutServer:
         if method == "runtime.fald_temporal":
             # C++ DoFaldTemporal (2026-09-17): the shader's per-cell drive state (LED-lag filter), persisted per mode
             tm = params.get("temporal_mode"); tr = params.get("tau_rise_ms"); tf = params.get("tau_fall_ms")
-            df = params.get("delay_frames")
+            df = params.get("delay_frames"); cl = params.get("closure"); pa = params.get("parity")
             num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-            if not (num(tm) or num(tr) or num(tf) or num(df)):
-                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2), tau_rise_ms, tau_fall_ms (0..5000) or delay_frames (0..3)")
-            if num(tm) and tm not in (0, 1, 2):
-                return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields) or 2 (B_true only)")
+            if not (num(tm) or num(tr) or num(tf) or num(df) or num(cl) or num(pa)):
+                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)")
+            if num(tm) and tm not in (0, 1, 2, 3):
+                return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)")
             for name, v in (("tau_rise_ms", tr), ("tau_fall_ms", tf)):
                 if num(v) and not (0.0 <= v <= 5000.0):
                     return DesktopLutResponse(ok=False, error=f"{name} must be 0..5000 ms")
             if num(df) and df not in (0, 1, 2, 3):
                 return DesktopLutResponse(ok=False, error="delay_frames must be 0..3")
+            if num(cl) and not (0.05 <= cl <= 1.0):
+                return DesktopLutResponse(ok=False, error="closure must be 0.05..1")
+            if num(pa) and pa not in (-1, 0, 1):
+                return DesktopLutResponse(ok=False, error="parity must be -1 (unknown), 0 or 1")
             if num(tm):
                 fs["temporal_mode"] = int(tm)
             if num(tr):
@@ -731,10 +738,18 @@ class MockDesktopLutServer:
                 fs["tau_fall_ms"] = float(tf)
             if num(df):
                 fs["delay_frames"] = int(df)
+            if num(cl):
+                fs["closure"] = float(cl)
+            if num(pa):
+                fs["parity"] = int(pa)
+            from dlc.fald.paneltime import MODE_PANEL, settle_refreshes
             from dlc.fald.temporal import settle_frames
             rise = float(fs.get("tau_rise_ms", 0.0)); fall = float(fs.get("tau_fall_ms", 0.0)); delay = int(fs.get("delay_frames", 0))
-            return self.ok({"monitor_mode": key, "temporal_mode": int(fs.get("temporal_mode", 0)), "tau_rise_ms": rise,
-                            "tau_fall_ms": fall, "delay_frames": delay, "settle_frames_60hz": settle_frames(rise, fall, 1000.0 / 60.0, delay)})
+            mode_now = int(fs.get("temporal_mode", 0)); closure = float(fs.get("closure", 0.72))
+            settle = settle_refreshes(closure) if mode_now == MODE_PANEL else settle_frames(rise, fall, 1000.0 / 60.0, delay)
+            return self.ok({"monitor_mode": key, "temporal_mode": mode_now, "tau_rise_ms": rise, "tau_fall_ms": fall,
+                            "delay_frames": delay, "closure": closure, "parity": int(fs.get("parity", -1)),
+                            "settle_frames_60hz": settle})
         if method == "runtime.fald_starfield":
             # C++ DoFaldStarfield (2026-09-19, work guide S1): starfield balancing, partial updates, persisted per mode.
             # Everything is validated before anything is stored; refusals word for word.

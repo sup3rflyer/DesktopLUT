@@ -320,8 +320,8 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     st = client.call("state.get", {}).result
     assert st["layers"]["0:SDR"]["fald_temporal_mode"] == 1 and st["layers"]["0:SDR"]["fald_tau_rise_ms"] == 40.0
     assert st["layers"]["0:HDR"]["fald_temporal_mode"] == 0 and st["layers"]["0:HDR"]["fald_tau_rise_ms"] == 0.0   # per mode
-    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 3}), raise_on_error=False)
-    assert not bad.ok and bad.error == "temporal_mode must be 0 (off), 1 (both fields) or 2 (B_true only)"
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 4}), raise_on_error=False)
+    assert not bad.ok and bad.error == "temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)"
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "tau_rise_ms": 9000}), raise_on_error=False)
     assert not bad.ok and bad.error == "tau_rise_ms must be 0..5000 ms"
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR"}), raise_on_error=False)
@@ -331,6 +331,32 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_delay_frames"] == 2
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "delay_frames": 4}), raise_on_error=False)
     assert not bad.ok and bad.error == "delay_frames must be 0..3"
+    # temporal mode 3 "panel clock" (2026-09-20, work guide C13): closure + parity, defaults 0.72 / -1 (unknown), per mode
+    st3 = client.call("state.get", {}).result["layers"]
+    assert st3["0:HDR"]["fald_temporal_closure"] == 0.72 and st3["0:HDR"]["fald_temporal_parity"] == -1
+    pc = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 3, "closure": 0.72, "parity": -1})
+    assert pc.ok and pc.result["temporal_mode"] == 3 and pc.result["closure"] == 0.72 and pc.result["parity"] == -1
+    assert pc.result["settle_frames_60hz"] == 12                                        # mode 3: 2 ceil(ln 0.005 / ln 0.28) + 2 refreshes
+    only_parity = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1})
+    assert only_parity.ok and only_parity.result["temporal_mode"] == 3 and only_parity.result["parity"] == 1
+    only_closure = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "closure": 0.5})
+    assert only_closure.ok and only_closure.result["closure"] == 0.5 and only_closure.result["settle_frames_60hz"] == 18
+    st3 = client.call("state.get", {}).result["layers"]
+    assert st3["0:HDR"]["fald_temporal_mode"] == 3 and st3["0:HDR"]["fald_temporal_closure"] == 0.5 and st3["0:HDR"]["fald_temporal_parity"] == 1
+    assert st3["0:SDR"]["fald_temporal_mode"] == 1 and st3["0:SDR"]["fald_temporal_closure"] == 0.72                # per mode
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "closure": 0.01}), raise_on_error=False)
+    assert not bad.ok and bad.error == "closure must be 0.05..1"
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 2}), raise_on_error=False)
+    assert not bad.ok and bad.error == "parity must be -1 (unknown), 0 or 1"
+    assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_temporal_closure"] == 0.5                   # a refusal stores nothing
+    client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 0, "closure": 0.72, "parity": -1})
+    # ... and the C++ handler carries the same refusals word for word
+    if CPP_SERVER.exists():
+        cpp = CPP_SERVER.read_text(encoding="utf-8", errors="replace")
+        for text in ("temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)", "closure must be 0.05..1",
+                     "parity must be -1 (unknown), 0 or 1",
+                     "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)"):
+            assert text in cpp, text
     # starfield balancing (2026-09-19, work guide S1): partial updates, persisted per mode, reported in layers[key]
     st0 = client.call("state.get", {}).result["layers"]["0:SDR"]
     assert st0["fald_starfield"] is False and st0["fald_star_even"] == 0.8 and st0["fald_star_lift"] == 0.0
