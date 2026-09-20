@@ -16,7 +16,7 @@ pytest.importorskip("scipy")
 from dlc.fald import glowfill  # noqa: E402
 from dlc.fald.correct import correct_image  # noqa: E402
 from dlc.fald.export import export_panel_params  # noqa: E402
-from dlc.fald.glowfill import GlowFillParams, deficit, envelope, round_fill, zone_pedestal  # noqa: E402
+from dlc.fald.glowfill import BAND_LO, GlowFillParams, band_scale, deficit, envelope, round_fill, zone_pedestal  # noqa: E402
 from dlc.fald.gpuemu import Emu  # noqa: E402
 from dlc.fald.model import FaldModel, FaldParams  # noqa: E402
 from dlc.fald.panelfile import read_panel_file  # noqa: E402
@@ -92,11 +92,71 @@ def test_glow_add_is_the_reference_pixel_rule(rig):
         out = emu.run(_scrgb(img), fp16_out=False, glow=gp)
         g = out["glow"]
         ref = round_fill(m, _centres(g["req_nofill"]), _centres(out["px_bT"]), _centres(out["px_bE"]),
-                         g["vz"].astype(np.float64), g["ez"].astype(np.float64), gp, gain_max=emu.gmax)
-        # (the reference forms Dz itself from vz / ez in float64; the emulator's float32 Dz differs in the last bits)
+                         g["dz"].astype(np.float64), g["ez"].astype(np.float64), gp, gain_max=emu.gmax)
         assert np.allclose(_centres(out["req"]) - _centres(g["req_nofill"]), ref["add"], rtol=2e-4, atol=1e-9)
         assert ref["add"].max() > 0.005
         assert float(_centres(g["add"]).max()) == pytest.approx(float(ref["add"].max()), rel=2e-4)   # white pedestal: add = luminance
+
+
+def test_glow_add_carries_the_trust_factor_the_cap_and_the_ceiling(rig):
+    """Twin-only mutants (review 2026-09-20: 'trust dropped in the twin' passed): scenes where each factor of the pixel
+    rule BINDS, the twin against the reference's round_fill on the same fields."""
+    m, emu = rig
+    cases = ((600.0, GlowFillParams(cap_nits=0.5), "trust"),       # dim stars: every filled pixel sits in the B_est fade band
+             (1846.0, GlowFillParams(cap_nits=0.02), "cap"),       # the cap binds
+             (1846.0, GlowFillParams(cap_nits=0.5), "ceiling"))    # the request ceiling binds
+    for nits, gp, what in cases:
+        out = emu.run(_scrgb(_lattice(m, nits=nits)), fp16_out=False, glow=gp)
+        g = out["glow"]
+        bT, bE = _centres(out["px_bT"]), _centres(out["px_bE"])
+        ref = round_fill(m, _centres(g["req_nofill"]), bT, bE, g["dz"].astype(np.float64), g["ez"].astype(np.float64), gp, gain_max=emu.gmax)
+        add = _centres(g["add"])
+        assert add.max() > 1e-3 and np.allclose(add, ref["add"][0], rtol=2e-4, atol=1e-9), what
+        filled = add > 0.0
+        if what == "trust":
+            assert np.all((ref["trust"][filled] > 0.0) & (ref["trust"][filled] < 1.0))
+            assert add.max() < 0.6 * (ref["want"] * np.minimum(bE / np.maximum(bT, 1e-9), emu.gmax))[filled].max()   # trust really cut it
+        elif what == "cap":
+            assert ref["want"].max() == pytest.approx(0.02) and (ref["want"][filled] == ref["want"].max()).mean() > 0.3
+        else:
+            assert add.max() == pytest.approx(emu.glow_ceiling(), rel=1e-6) and (ref["want"] * ref["trust"])[filled].max() > 1.02 * emu.glow_ceiling()
+
+
+def test_the_count_threshold_band_in_gpu_order(tmp_path):
+    lut = ((0.0, 1.17), (0.20, 1.10), (0.35, 1.0))
+    p = _small_params(boost_lut=lut, boost_rule="mean")
+    m = FaldModel(p)
+    export_panel_params(m, tmp_path / "panel.bin")
+    emu = Emu(read_panel_file(tmp_path / "panel.bin"), width=p.width, height=p.height)
+    assert emu.glow_band_active()
+    gp = GlowFillParams(cap_nits=0.5)
+    frame = _scrgb(_lattice(m, nits=610.0))                                  # a fill that lands right AT the threshold
+    out, free = emu.run(frame, fp16_out=False, glow=gp), emu.run(frame, fp16_out=False, glow=replace(gp, band=False))
+    b = out["glow"]["band"]                                                    # round 1's: the frame that is sent
+    assert out["glow"]["r0"]["band"] is not None and b["k"].dtype == np.float32 and b["band"].sum() >= 4 and np.all(b["k"][b["band"]] < 1.0) and np.all(b["k"][~b["band"]] == 1.0)
+    assert free["glow"]["k"] is None and free["glow"]["r0"]["band"] is None and free["glow"]["band"] is None
+
+    def parked(req):
+        z = emu.zone_pow_sum(req.max(axis=0).astype(np.float32).reshape(emu.rows, emu.ch, emu.cols, emu.cw)) / np.float32(emu.cw * emu.ch)
+        return z / emu.meanThresh
+    z_free, z_on = parked(free["req"]), parked(out["req"])
+    assert int((np.abs(z_free - 1.0) < 0.15).sum()) >= 2 and int((np.abs(z_on - 1.0) < 0.15).sum()) == 0
+    assert np.allclose(z_on[b["band"]], BAND_LO, rtol=0.03)
+    assert emu.frame_boost(out["req"])[1] <= emu.frame_boost(free["req"])[1]
+    assert np.all(out["req"] <= free["req"] + 1e-12)                          # never up
+    # k is formed per round: here round 0 (the source frame's fields) saw NO zone in the band, round 1 does
+    assert not out["glow"]["r0"]["band"]["band"].any()
+    # the reference's band_scale on the twin's own round-1 request / fields (raster = the block centres): the same zones, the same k
+    g = out["glow"]
+    ref = band_scale(m, _centres(g["req_nofill"]), _centres(out["px_bT"]), _centres(out["px_bE"]), g["dz"].astype(np.float64),
+                     g["ez"].astype(np.float64), gp, gain_max=emu.gmax)
+    assert np.array_equal(ref["band"], b["band"]) and np.allclose(ref["k"], b["k"], rtol=0.03)
+    assert np.allclose(ref["pf"], b["pf"], rtol=0.02, atol=1e-6) and np.allclose(ref["pc"], b["pc"], rtol=0.02, atol=1e-6)
+    # a file without the mean rule: no band pass, no k
+    p2 = _small_params(boost_lut=lut)
+    export_panel_params(FaldModel(p2), tmp_path / "dim.bin")
+    emu2 = Emu(read_panel_file(tmp_path / "dim.bin"), width=p2.width, height=p2.height)
+    assert not emu2.glow_band_active() and emu2.run(frame, fp16_out=False, glow=gp)["glow"]["k"] is None
 
 
 def test_end_to_end_the_emulator_fills_what_the_reference_fills(rig):
@@ -140,7 +200,8 @@ def test_round_zero_fill_feeds_the_boost_count_of_round_one(tmp_path):
     path = tmp_path / "panel.bin"
     export_panel_params(m, path)
     emu = Emu(read_panel_file(path), width=p.width, height=p.height)
-    assert emu.glow_ceiling() == pytest.approx(min(0.6 * p.drive_floor_nits, 0.85 * p.boost_lit_nits)) == pytest.approx(glowfill.req_ceiling(m))
+    assert emu.glow_ceiling() == pytest.approx(min(0.4 * p.drive_floor_nits, 0.55 * p.boost_lit_nits)) == pytest.approx(glowfill.req_ceiling(m))
+    assert emu.glow_ceiling() == pytest.approx(0.1925)
     frame = _scrgb(_lattice(m))
     off, on = emu.run(frame, fp16_out=False), emu.run(frame, fp16_out=False, glow=GlowFillParams(cap_nits=0.5))
     assert on["glow"]["r0"] is not None and on["glow"]["r0"]["dz"].max() > 0.0
@@ -163,11 +224,31 @@ def test_hlsl_glow_passes_mirror_the_reference():
     assert (const("FALD_GLOW_SIGMA_BASE"), const("FALD_GLOW_SIGMA_PER_REACH")) == (glowfill.GLOW_SIGMA_BASE, glowfill.GLOW_SIGMA_PER_REACH)
     assert (const("FALD_GLOW_DEFICIT_REL_LO"), const("FALD_GLOW_DEFICIT_REL_HI")) == (glowfill.DEFICIT_REL_LO, glowfill.DEFICIT_REL_HI)
     assert const("FALD_GLOW_WANT_EPS") == glowfill.WANT_EPS and const("FALD_GLOW_REACH_MAX") == glowfill.REACH_MAX
-    for reg in ("glowVTex   : register(t20)", "glowDilTex : register(t21)", "glowCTex   : register(t22)", "glowEnvTex : register(t23)"):
+    assert (const("FALD_GLOW_BAND_LO"), const("FALD_GLOW_BAND_HI")) == (glowfill.BAND_LO, glowfill.BAND_HI) == (0.8, 1.25)
+    for reg in ("glowVTex   : register(t20)", "glowDilTex : register(t21)", "glowCTex   : register(t22)", "glowEnvTex : register(t23)",
+                "glowKTex   : register(t24)"):
         assert reg in common
-    # GlowAdd: the reference's per-pixel rule, in its order
-    add = re.search(r"float3 GlowAdd\(float3 req, float bTrue, float bEst, float2 px\) \{(.*?)\n\}", common, re.S).group(1)
-    for line in ("min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits);",
+    # GlowAdd: the reference's per-pixel rule, in its order — EVERY factor pinned (a removed line must fail a default test:
+    # the review's "ceiling removed" mutant passed when only some of them were)
+    add = re.search(r"float3 GlowAddK\(float3 req, float bTrue, float bEst, float2 px, float k\) \{(.*?)\n\}", common, re.S).group(1)
+    assert [l.strip() for l in add.strip().splitlines()] == [
+        "float want = min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits) * k;",
+        "if (!(want > 0.0f)) return req;", "bTrue = max(bTrue, 0.0f);", "float r = max(req.r, max(req.g, req.b));",
+        "float shown = r * bTrue / max(bEst, 1e-9f);", "float fill = max(want - shown, 0.0f) * smoothstep(fadeLo, fadeHi, bEst);",
+        "float add = fill * min(bEst / max(bTrue, 1e-9f), gainMax);", "float3 m = float3(tminR, tminG, tminB) / max(tmin, 1e-30f);",
+        "float room = max(glowReqCeil - r, 0.0f);", "add *= min(1.0f, room / max(add * max(m.r, max(m.g, m.b)), 1e-30f));",
+        "if (!(add > 0.0f)) return req;", "return req + add * m;"]
+    own = re.search(r"float3 GlowAdd\(float3 req, float bTrue, float bEst, int2 px\) \{(.*?)\n\}", common, re.S).group(1)
+    assert "if (glowBand != 0u) {" in own and "k = glowKTex.Load(int3((int2)zone, 0));" in own and "return GlowAddK(req, bTrue, bEst, float2(px), k);" in own
+    band = part("g_faldGlowBandSource")
+    for line in ("float3 c3 = Correct(img, bT, bE, g);", "float3 f3 = GlowAddK(c3, bT, bE, float2((float)px, (float)py), 1.0f);",
+                 "if (c > 0.0f) powC += exp(boostMeanGamma * log(c));", "if (f > 0.0f) powF += exp(boostMeanGamma * log(f));",
+                 "if (c > boostLitNits) lit++;", "bool litZone = (float)gLitC[0] / (float)n > boostLitFrac;",
+                 "if (!litZone && pc < t && pf >= FALD_GLOW_BAND_LO * t && pf <= FALD_GLOW_BAND_HI * t) {",
+                 "float share = saturate((FALD_GLOW_BAND_LO * t - pc) / max(pf - pc, 1e-30f));",
+                 "kz = (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;", "glowKOut[uint2(cx, cy)] = kz;"):
+        assert line in band, line
+    for line in ("min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits) * k;",
                  "if (!(want > 0.0f)) return req;", "float shown = r * bTrue / max(bEst, 1e-9f);",
                  "float fill = max(want - shown, 0.0f) * smoothstep(fadeLo, fadeHi, bEst);",
                  "float add = fill * min(bEst / max(bTrue, 1e-9f), gainMax);",
@@ -176,7 +257,7 @@ def test_hlsl_glow_passes_mirror_the_reference():
         assert line in add, line
     # the statistic round 1 and the pixel pass add it AFTER Correct, behind the switch
     assert stat.index("img = Correct(img, bT, bE, g);") < stat.index("if (glowOn != 0u) img = GlowAdd(img, bT, bE,") < stat.index("float mc = max(")
-    assert pixel.index("float3 req = Correct(img, bT, bE, gain);") < pixel.index("if (glowOn != 0u) req = GlowAdd(req, bT, bE, float2(px));")
+    assert pixel.index("float3 req = Correct(img, bT, bE, gain);") < pixel.index("if (glowOn != 0u) req = GlowAdd(req, bT, bE, px);")
     assert "if (debugMode == 10)" in pixel and "if (glowOn == 0u) return src;" in pixel
     for other in ("g_faldConvSource", "g_faldBoostSource", "g_faldGainSource", "g_faldBlurSource", "g_faldTemporalSource",
                   "g_faldPanelClockSource", "g_faldStarStatSource", "g_faldStarWeightSource", "g_faldStarPlanSource"):
@@ -197,7 +278,18 @@ def test_hlsl_glow_passes_mirror_the_reference():
     assert f"FALD_GLOW_REACH_MIN = {glowfill.REACH_MIN};" in h and f"FALD_GLOW_REACH_MAX = {glowfill.REACH_MAX};" in h
     assert f"FALD_GLOW_CAP_MIN = {glowfill.CAP_MIN}f;" in h and f"FALD_GLOW_CAP_MAX = {glowfill.CAP_MAX}f;" in h
     assert f"FALD_GLOW_REQ_FLOOR_FRAC = {glowfill.REQ_FLOOR_FRAC}f;" in h and f"FALD_GLOW_REQ_LIT_FRAC = {glowfill.REQ_LIT_FRAC}f;" in h
-    assert "FALD_CB_BYTES = 320" in h
+    assert "FALD_CB_BYTES = 336" in h
+    assert "float c = FALD_GLOW_REQ_FLOOR_FRAC * p.driveFloor;" in c and "const float lit = FALD_GLOW_REQ_LIT_FRAC * p.boostLitNits; if (lit < c) c = lit;" in c
+    assert "bool FaldGlowSupported(const FaldPanelParams& p) { return p.transfer == FALD_TRANSFER_PQ; }" in c
+    assert "bool FaldGlowBandActive(const FaldPanelParams& p) { return p.hasBoost && p.boostRule == FALD_BOOST_RULE_MEAN; }" in c
+    assert "if (gs.enabled && FaldGlowSupported(r->params)) r->glowOn = EnsureGlow(r);" in c
+    assert "r->glowBand = r->glowOn && FaldGlowBandActive(r->params);" in c
+    assert re.search(r"if \(r->glowBand\) \{\s+g_context->CSSetShader\(g_faldGlowBandCS, nullptr, 0\);", c)   # EVERY round
+    assert 'if (p == L"SDR_") gl.enabled = false;' in (_SRC / "settings.cpp").read_text(encoding="utf-8")
+    ipc = (_SRC / "desktoplut_ipc_server.cpp").read_text(encoding="utf-8")
+    assert "if (en && en->b && !isHDR) { error = FALD_GLOW_SDR_NOTE; return; }" in ipc
+    from dlc.desktoplut_mock import _FALD_GLOW_SDR_NOTE
+    assert f'FALD_GLOW_SDR_NOTE = "{_FALD_GLOW_SDR_NOTE}";' in c
     body = re.search(r"struct FaldGlowSettings \{(.*?)\n\};", t, re.S).group(1)
     got = {k: v for k, v in re.findall(r"(?:bool|float|unsigned int) (\w+) = ([\w.]+?)f?;", body)}
     d = GlowFillParams()
@@ -207,8 +299,8 @@ def test_hlsl_glow_passes_mirror_the_reference():
     assert _FALD_GLOW_DEFAULTS == {"enabled": False, "strength": d.strength, "reach": d.reach, "cap_nits": d.cap_nits}
     assert _FALD_GLOW_KEYS["reach"][:2] == (glowfill.REACH_MIN, glowfill.REACH_MAX) and _FALD_GLOW_KEYS["cap_nits"][:2] == (glowfill.CAP_MIN, glowfill.CAP_MAX)
     run = c[c.index("void FaldRunPasses("):]
-    seq = [run.index("RunConv(r, trueDrive, estDrive, r->boostSRV[0]);"), run.index("if (r->glowOn) RunGlow(r);             // round 0"),
+    seq = [run.index("RunConv(r, trueDrive, estDrive, r->boostSRV[0]);"), run.index("if (r->glowOn) RunGlow(r, 0);"),
            run.index("RunStat(r, 1);"), run.index("RunConv(r, trueDrive, estDrive, r->boostSRV[1]);"),
-           run.index("if (r->glowOn) RunGlow(r);             // round 1"), run.index("r->framesRun++;")]
+           run.index("if (r->glowOn) RunGlow(r, 1);"), run.index("r->framesRun++;")]
     assert seq == sorted(seq)
-    assert "r->glowOn ? r->glowEnvSRV : nullptr" in c and "FALD_SRV_SLOTS = 24;" in c
+    assert "r->glowOn ? r->glowEnvSRV : nullptr" in c and "r->glowBand ? r->glowKSRV : nullptr" in c and "FALD_SRV_SLOTS = 25;" in c

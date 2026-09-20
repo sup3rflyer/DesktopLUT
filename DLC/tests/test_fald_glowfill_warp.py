@@ -36,8 +36,8 @@ def test_warp_glow_dumps_are_the_twin():
     m = re.search(r"^glowfill strength (\S+) reach (\S+) cap_nits (\S+) req_ceil (\S+)", t, re.M)
     gp = GlowFillParams(strength=float(m.group(1)), reach=int(m.group(2)), cap_nits=float(m.group(3)))
     rows, cols, W, H = int(g("rows")), int(g("cols")), int(g("width")), int(g("height"))
-    emu = Emu(read_panel_file(root / "panel.bin"), width=W, height=H)
-    assert float(m.group(4)) == pytest.approx(emu.glow_ceiling(), rel=1e-5)
+    emu = Emu(read_panel_file(root / "panel.bin"), width=W, height=H, subtexel_bits=8)   # a device's 8-bit bilinear weights
+    assert float(m.group(4)) == pytest.approx(emu.glow_ceiling(), rel=1e-5) and emu.glow_ceiling() <= 0.2
     frame = np.fromfile(d / "fald_frame.rgba16f", dtype=np.float16).reshape(H, W, 4)[..., :3]
     tw = emu.run(frame.astype(np.float64), fp16_out=True, glow=gp)
     vz = np.fromfile(d / "fald_glow_vz.f32", dtype=np.float32).reshape(rows, cols)
@@ -48,15 +48,25 @@ def test_warp_glow_dumps_are_the_twin():
     assert np.allclose(env[..., 2], gz["cz"], rtol=2e-6, atol=1e-12)
     assert np.allclose(env[..., 0], gz["ez"], rtol=1e-5, atol=1e-10) and np.allclose(env[..., 1], gz["dz"], rtol=1e-3, atol=1e-8)
     assert env[..., 1].max() > 0.0, "the frame holds no hole: nothing was filled (give the case a frame.rgba16f)"
-    # the output: the filled pixels agree with the twin to the FP16 step, lit pixels are not touched by the fill
+    # the count-threshold band (mean-rule files with a boost LUT): the dumped k is round 1's = the twin's
+    band = int(re.search(r"^glowfill strength .* band (\d)", t, re.M).group(1))
+    assert band == int(emu.glow_band_active()) and (d / "fald_glow_k.f32").exists() == bool(band)
+    if band:
+        k = np.fromfile(d / "fald_glow_k.f32", dtype=np.float32).reshape(rows, cols)
+        assert np.array_equal(k < 1.0, tw["glow"]["k"] < 1.0) and np.allclose(k, tw["glow"]["k"], rtol=2e-3, atol=1e-6)
+    # the output against the twin, EVERY pixel — filled or not, lit or dim (the rule is fill = max(0, want - shown): a dim
+    # content pixel below its want IS filled; an earlier form of this test asserted that no source pixel > 0 ever is)
     out = np.fromfile(d / "fald_out.rgba16f", dtype=np.float16).reshape(H, W, 4)[..., :3]
     nits = lambda o: emu.panel_nits(o.astype(np.float64)).max(axis=0)
     filled = tw["glow"]["add"] > 0.0
     assert filled.any()
-    err = np.abs(nits(out) - nits(tw["out"]))[filled]
-    assert float(err.max()) <= 2e-3 + 2e-3 * float(nits(tw["out"])[filled].max()), float(err.max())
-    # (bit equality is not expected on filled pixels: the twin forms the fill in float64, the GPU in float32 — 20-40 % of
-    # them land on the same half; the nits bound above is one FP16 step at these levels)
-    lit = frame.max(axis=-1) > 0
-    off = emu.run(frame.astype(np.float64), fp16_out=True)
-    assert np.array_equal(tw["out"][lit], off["out"][lit]) and not (filled & lit).any()
+    err = np.abs(nits(out) - nits(tw["out"]))
+    assert float(err[filled].max()) <= 3e-4, float(err[filled].max())
+    same = (out == tw["out"]).all(axis=-1)
+    # bit equality needs the twin's own DRIVES to be the device's: exact for stars at panel white (drive 1), not where the
+    # drive-curve LUT interpolates (the emulator's known discretisation gap, ~1e-4 of B_true — not the fill's)
+    drives_exact = float(np.max(np.abs(vz - tw["glow"]["vz"]))) <= 2e-5 * float(vz.max())
+    if drives_exact:
+        assert float(same[filled].mean()) > 0.97 and float(same.mean()) > 0.99, (float(same[filled].mean()), float(same.mean()))
+    else:
+        assert float(same.mean()) > 0.9, float(same.mean())

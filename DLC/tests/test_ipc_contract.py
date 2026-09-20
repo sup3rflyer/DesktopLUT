@@ -122,7 +122,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
         ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
         ("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.8, "even_reach": 6}),
-        ("runtime.fald_glowfill", {"monitor": 0, "mode": "SDR", "enabled": True, "reach": 3}),
+        ("runtime.fald_glowfill", {"monitor": 0, "mode": "HDR", "enabled": True, "reach": 3}),
         ("layers.set", {**mm, "fald": True}),
         ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),
@@ -405,15 +405,23 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     dbg9 = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 12})
     assert dbg9.ok and dbg9.result["debug_mode"] == 10                                   # clamped to the last view (10 = glow fill)
     # glow fill (2026-09-20, work guide S2): partial updates, persisted per mode, reported in layers[key]
-    g0 = client.call("state.get", {}).result["layers"]["0:SDR"]
-    assert g0["fald_glowfill"] is False and (g0["fald_glow_strength"], g0["fald_glow_reach"], g0["fald_glow_cap_nits"]) == (1.0, 2, 0.10)
-    gl = client.call("runtime.fald_glowfill", {"monitor": 0, "mode": "SDR", "enabled": True, "reach": 3})
-    assert gl.ok and gl.result == {"monitor_mode": "0:SDR", "enabled": True, "strength": 1.0, "reach": 3, "cap_nits": 0.10}
-    one = client.call("runtime.fald_glowfill", {"monitor": 0, "mode": "SDR", "cap_nits": 0.05})           # a partial update
-    assert one.ok and one.result["enabled"] is True and one.result["reach"] == 3 and one.result["cap_nits"] == 0.05
+    g0 = client.call("state.get", {}).result["layers"]["1:HDR"]
+    assert g0["fald_glowfill"] is False and (g0["fald_glow_strength"], g0["fald_glow_reach"], g0["fald_glow_cap_nits"]) == (1.0, 2, 0.05)
+    assert "fald_glow_note" not in g0
+    gl = client.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "enabled": True, "reach": 3})
+    assert gl.ok and gl.result == {"monitor_mode": "1:HDR", "enabled": True, "strength": 1.0, "reach": 3, "cap_nits": 0.05}
+    one = client.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "cap_nits": 0.02})           # a partial update
+    assert one.ok and one.result["enabled"] is True and one.result["reach"] == 3 and one.result["cap_nits"] == 0.02
     st = client.call("state.get", {}).result["layers"]
-    assert st["0:SDR"]["fald_glowfill"] is True and st["0:SDR"]["fald_glow_reach"] == 3 and st["0:SDR"]["fald_glow_cap_nits"] == 0.05
-    assert st["0:HDR"]["fald_glowfill"] is False and st["0:HDR"]["fald_glow_reach"] == 2                   # per mode
+    assert st["1:HDR"]["fald_glowfill"] is True and st["1:HDR"]["fald_glow_reach"] == 3 and st["1:HDR"]["fald_glow_cap_nits"] == 0.02
+    assert st["1:SDR"]["fald_glowfill"] is False and st["1:SDR"]["fald_glow_reach"] == 2                   # per mode
+    # HDR only: the SDR pair refuses the switch (and says why, in the refusal and in state.get), not the numbers
+    sdr_note = "glow fill is HDR only: the levels behind its request ceiling (drive floor, LIT level, count threshold) are HDR measurements"
+    bad = client.send(DesktopLutCommand("runtime.fald_glowfill", {"monitor": 0, "mode": "SDR", "enabled": True, "reach": 4}), raise_on_error=False)
+    assert not bad.ok and bad.error == sdr_note
+    assert st["0:SDR"]["fald_glow_note"] == sdr_note and client.call("state.get", {}).result["layers"]["0:SDR"]["fald_glow_reach"] == 2
+    ok_sdr = client.call("runtime.fald_glowfill", {"monitor": 0, "mode": "SDR", "enabled": False, "strength": 1.0})
+    assert ok_sdr.ok and ok_sdr.result["enabled"] is False
     for bad_params, text in (({"strength": 1.5}, "strength must be 0..1"), ({"strength": -0.1}, "strength must be 0..1"),
                              ({"reach": 0}, "reach must be an integer 1..4"), ({"reach": 5}, "reach must be an integer 1..4"),
                              ({"reach": 2.5}, "reach must be an integer 1..4"),

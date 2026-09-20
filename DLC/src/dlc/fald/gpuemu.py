@@ -31,9 +31,17 @@ Glow fill (work guide S2; the rules = the module docstring of :mod:`dlc.fald.glo
 ``run(..., glow=GlowFillParams)`` runs the four glow passes after EACH round's conv pass (:meth:`Emu.glow_zones` = G0
 ``g_faldGlowZoneSource`` zone pedestal, G1 ``g_faldGlowDilateSource`` box maximum on the lattice extended by ``reach``,
 G2 ``g_faldGlowErodeSource`` box minimum = the closing, G3 ``g_faldGlowEnvSource`` blur + min + deficit; float32, the
-shaders' loop order) and adds ``GlowAdd`` (:meth:`Emu.glow_add`) to that round's corrected request — round 0's feeds the
-round-1 statistic / boost flags, round 1's is the output. ``glow=None`` runs none of it (the previous emulator, bit for
-bit)."""
+shaders' loop order), then — files with a boost LUT and the mean zone rule only — the count-threshold band
+(:meth:`Emu.glow_band` = G4 ``g_faldGlowBandSource``: a full-resolution sweep like the statistic pass -> the zone's scale k,
+which GlowAdd loads for the pixel's OWN zone; formed in EACH round from that round's request) and adds ``GlowAdd`` (:meth:`Emu.glow_add`) to that round's
+corrected request — round 0's feeds the round-1 statistic / boost flags, round 1's is the output. ``glow=None`` runs none
+of it (the previous emulator, bit for bit). HDR (PQ files) only, like the C++.
+EXACTNESS of the fill against a real device (WARP, 2026-09-20): the zone fields agree to <= 1e-5 relative (float32 sum
+order). With the default float64 sampler weights the filled pixels agree to <= 0.0006 nit but only 20-45 % are bit-equal
+(up to ~2 % apart where the deficit is small at the foot of a ramp): the hardware's bilinear sampler weighs with 8-bit
+sub-texel fractions — a 48-texel field stretched over 3840 px shows it. ``Emu(..., subtexel_bits=8)`` rounds the sampler
+fractions (zone AND fine-grid textures) the same way: 99.4 % of the filled pixels and 99.9 % of the whole frame bit-equal,
+<= 0.00008 nit. The default stays float64 (the comparisons against the reference need the exact coordinates); it is not an order-of-operations difference."""
 from __future__ import annotations
 
 from typing import Optional
@@ -41,7 +49,7 @@ from typing import Optional
 import numpy as np
 from scipy.signal import convolve2d
 
-from .glowfill import (DEFICIT_REL_HI, DEFICIT_REL_LO, GLOW_SIGMA_BASE, GLOW_SIGMA_PER_REACH, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS,
+from .glowfill import (BAND_HI, BAND_LO, DEFICIT_REL_HI, DEFICIT_REL_LO, GLOW_SIGMA_BASE, GLOW_SIGMA_PER_REACH, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS,
                        GlowFillParams, clamp_params as clamp_glow)
 from .panelfile import boost_of_count
 from .starfield import StarfieldParams
@@ -272,8 +280,9 @@ class GpuPanelDriveState:
 
 
 class Emu:
-    def __init__(self, o, width=3840, height=2160, ped_mode=0):
+    def __init__(self, o, width=3840, height=2160, ped_mode=0, subtexel_bits: Optional[int] = None):
         self.o = o
+        self.subtexel_bits = subtexel_bits     # None = exact sampler fractions; 8 = a D3D11 device's bilinear weights
         self.W, self.H = width, height
         self.white = float(o["white"]); self.gamma = float(o["sdrGamma"]); self.transfer = o["transfer"]
         self.sub = o["sub"]; self.cols = o["cols"]; self.rows = o["rows"]; self.cw = o["cellW"]; self.ch = o["cellH"]
@@ -309,9 +318,10 @@ class Emu:
         self.in_lattice = ((ys >= self.oy) & (ys < self.oy + self.rows * self.ch))[:, None] & \
                           ((xs >= self.ox) & (xs < self.ox + self.cols * self.cw))[None, :]
 
-    @staticmethod
-    def _axis(t, n):
+    def _axis(self, t, n):
         i0 = np.floor(t).astype(int); fr = t - i0
+        if self.subtexel_bits:
+            fr = np.round(fr * (1 << int(self.subtexel_bits))) / (1 << int(self.subtexel_bits))
         return np.clip(i0, 0, n - 1), np.clip(i0 + 1, 0, n - 1), fr
 
     def sample(self, T):
@@ -530,16 +540,45 @@ class Emu:
         dz = (d * smoothstep(f32(DEFICIT_REL_LO), f32(DEFICIT_REL_HI), d / np.maximum(vz, f32(1e-12)))).astype(np.float32)
         return {"vz": vz, "dil": dil, "cz": cz, "ez": ez, "dz": dz}
 
+    def glow_band_active(self):
+        """C++ FaldGlowBandActive: the count-threshold band applies (a boost LUT AND the mean zone rule)."""
+        return bool(self.boostN) and self.boostRule == 1
+
+    def glow_band(self, req, sT, sE, dz, gp: GlowFillParams):
+        """G4 g_faldGlowBandSource (glowfill.band_scale, item 7): per zone, over every pixel in the statistic pass's thread /
+        reduction order, float32 — the sum of (brightest channel)^gamma of the round-0 request WITHOUT (pc) and WITH the
+        fill of the unscaled deficit (pf), and the LIT count of the content; k = ((BAND_LO T - pc) / (pf - pc))^(1 / gamma)
+        for a zone not counted by its content whose pf lies in [BAND_LO T, BAND_HI T], else 1."""
+        filled, _ = self.glow_add(req, sT, sE, dz, gp)                # k = 1: the unscaled rule
+        sl = (slice(self.oy, self.oy + self.rows * self.ch), slice(self.ox, self.ox + self.cols * self.cw))
+        n = f32(self.cw * self.ch)
+        rc = req.max(axis=0)[sl].astype(np.float32).reshape(self.rows, self.ch, self.cols, self.cw)
+        rf = filled.max(axis=0)[sl].astype(np.float32).reshape(self.rows, self.ch, self.cols, self.cw)
+        pc = (self.zone_pow_sum(rc) / n).astype(np.float32)
+        pf = (self.zone_pow_sum(rf) / n).astype(np.float32)
+        lit = (rc > self.litNits).sum(axis=(1, 3)).astype(np.float32) / n > self.litFrac
+        t = self.meanThresh
+        band = (~lit) & (pc < t) & (pf >= f32(BAND_LO) * t) & (pf <= f32(BAND_HI) * t)
+        share = np.clip((f32(BAND_LO) * t - pc) / np.maximum(pf - pc, f32(1e-30)), f32(0.0), f32(1.0)).astype(np.float32)
+        pos = share > 0
+        kk = np.where(pos, np.exp(np.log(np.where(pos, share, f32(1.0)), dtype=np.float32) / self.meanGamma, dtype=np.float32), f32(0.0))
+        return {"k": np.where(band, kk, f32(1.0)).astype(np.float32), "pc": pc, "pf": pf, "band": band}
+
     def glow_ceiling(self):
         """HLSL GlowReqCeil: a filled pixel's brightest channel stays at / below this (glowfill.req_ceiling)."""
         c = REQ_FLOOR_FRAC * self.floor
         return min(c, REQ_LIT_FRAC * float(self.litNits)) if self.boostN else c
 
-    def glow_add(self, req, sT, sE, dz, gp: GlowFillParams):
+    def glow_add(self, req, sT, sE, dz, gp: GlowFillParams, k=None):
         """HLSL GlowAdd for every lattice pixel: (request + fill (3, H, W), the fill's request luminance (H, W)). ``req``
         = the round's corrected request, ``sT`` / ``sE`` = the pixel fields Correct used. Untouched pixels are returned
         as they came (the HLSL returns ``req`` itself there)."""
         want = np.minimum(np.maximum(float(gp.strength) * self.sample_zone(dz) - WANT_EPS, 0.0), float(gp.cap_nits))
+        if k is not None:                                             # the band's scale of the pixel's OWN zone (a nearest Load)
+            kpx = np.ones((self.H, self.W))
+            kpx[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw] = \
+                np.repeat(np.repeat(k.astype(np.float64), self.ch, axis=0), self.cw, axis=1)
+            want = want * kpx
         bT = np.maximum(sT, 0.0)
         r = req.max(axis=0)
         shown = r * bT / np.maximum(sE, 1e-9)
@@ -718,6 +757,7 @@ class Emu:
         frame and every later step works on Balance(source). ``glow``: glow fill settings (None = the option off: no
         glow pass runs and nothing below changes)."""
         gp = clamp_glow(glow) if glow is not None else None
+        assert gp is None or self.transfer != 1, "glow fill is HDR (PQ panel files) only"
         img = self.panel_nits(frame_scrgb)
         star_out = None
         if star is not None:
@@ -739,7 +779,9 @@ class Emu:
         glow0 = None
         if gp is not None:                                            # round 0's fill: the round-1 statistic sees it
             glow0 = self.glow_zones(bT0, gp)
-            cor0, _ = self.glow_add(cor0, sT, sE, glow0["dz"], gp)
+            glow0["band"] = self.glow_band(cor0, sT, sE, glow0["dz"], gp) if (gp.band and self.glow_band_active()) else None
+            glow_k = glow0["band"]["k"] if glow0["band"] is not None else None
+            cor0, _ = self.glow_add(cor0, sT, sE, glow0["dz"], gp, glow_k)
         d1, st1 = self.stat_drive(cor0)
         boost1, zones1, active1 = self.frame_boost(cor0)              # round 1: the corrected frame the panel receives
         dT1, dE1 = temporal.pair(d1) if temporal is not None else (d1, d1)
@@ -750,9 +792,12 @@ class Emu:
         glow_out = None
         if gp is not None:                                            # round 1's fill: part of the output
             glow_out = self.glow_zones(bT1, gp)
+            glow_out["band"] = self.glow_band(req, sT, sE, glow_out["dz"], gp) if (gp.band and self.glow_band_active()) else None
+            glow_k = glow_out["band"]["k"] if glow_out["band"] is not None else None   # round 1's OWN scale (None: no band rule)
+            glow_out["k"] = glow_k
             glow_out["r0"] = glow0
             glow_out["req_nofill"] = req
-            req, glow_out["add"] = self.glow_add(req, sT, sE, glow_out["dz"], gp)
+            req, glow_out["add"] = self.glow_add(req, sT, sE, glow_out["dz"], gp, glow_k)
             glow_out["params"] = gp
         if temporal is not None:
             temporal.commit(d1)
@@ -773,6 +818,6 @@ class Emu:
                 # starfield balancing: None when off; else the source image ("img" above is then the BALANCED one), the
                 # star statistic / plan zone fields (fald_star_stat / _bg / _w / _plan / _plan2.f32) and the per-pixel scale
                 "star": star_out,
-                # glow fill: None when off; else round 1's zone fields (fald_glow_vz / _env.f32: vz, [ez, dz]), the
-                # request luminance added per pixel ("add") and round 0's zone fields ("r0")
+                # glow fill: None when off; else round 1's zone fields (fald_glow_vz / _env / _k.f32: vz, [ez, dz, cz, vz],
+                # k), the request luminance added per pixel ("add") and round 0's zone fields ("r0")
                 "glow": glow_out}

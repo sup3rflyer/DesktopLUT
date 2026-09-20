@@ -394,7 +394,7 @@ def test_hlsl_and_cpp_carry_the_zone_rule():
         return re.search(name + r' = R"\((.*?)\)";', src, re.S).group(1)
     common, stat = part("g_faldCommonSource"), part("g_faldStatSource")
     fields = re.findall(r"(?:uint|float) (\w+);", re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", common, re.S).group(1))
-    assert len(fields) == 80 and fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "glowOn"]   # 75: S2's switch
+    assert len(fields) == 84 and fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "glowOn"]   # 75: S2's switch
     # the sweep: the sum only under rule 1, only over mc > 0 (no pow(0), no negative, no NaN), exp(gamma * log) not pow()
     assert "if (boostRule == 1u && mc > 0.0f) powSum += exp(boostMeanGamma * log(mc));" in stat and "pow(" not in stat
     assert stat.index("if (mc > boostDimNits) dim++;") < stat.index("powSum += exp(") < stat.index("gPow[tid.x] = powSum;")
@@ -406,7 +406,7 @@ def test_hlsl_and_cpp_carry_the_zone_rule():
         assert "boostRule" not in part(other) and "boostMean" not in part(other)
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 320" in h and "FALD_BOOST_RULE_DIM = 0;" in h and "FALD_BOOST_RULE_MEAN = 1;" in h
+    assert "FALD_CB_BYTES = 336" in h and "FALD_BOOST_RULE_DIM = 0;" in h and "FALD_BOOST_RULE_MEAN = 1;" in h
     assert "float boostMeanGamma = 0.62f, boostMeanThresh = 0.0693f;" in h            # = FaldParams / panelfile defaults
     assert "u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;" in c
     assert "FALD_BOOST_WORD_RULE = 53;" in c and "unknown boost zone rule" in c and "implausible boost mean-rule words" in c

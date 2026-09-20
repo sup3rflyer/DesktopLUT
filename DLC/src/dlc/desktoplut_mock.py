@@ -80,7 +80,10 @@ _FALD_GLOW_KEYS: dict[str, tuple[float, float, bool, str]] = {
     "reach": (1.0, 4.0, True, "reach must be an integer 1..4"),
     "cap_nits": (0.005, 0.5, False, "cap_nits must be 0.005..0.5"),
 }
-_FALD_GLOW_DEFAULTS: dict[str, Any] = {"enabled": False, "strength": 1.0, "reach": 2, "cap_nits": 0.10}
+_FALD_GLOW_DEFAULTS: dict[str, Any] = {"enabled": False, "strength": 1.0, "reach": 2, "cap_nits": 0.05}
+# HDR only (C++ FALD_GLOW_SDR_NOTE, word for word): the pipe refuses `enabled: true` for an SDR pair and state.get says why
+_FALD_GLOW_SDR_NOTE = ("glow fill is HDR only: the levels behind its request ceiling (drive floor, LIT level, count threshold) "
+                       "are HDR measurements")
 
 
 def _fald_glow(entry: dict[str, Any] | None) -> dict[str, Any]:
@@ -89,7 +92,7 @@ def _fald_glow(entry: dict[str, Any] | None) -> dict[str, Any]:
     return {k: (bool(v) if k == "enabled" else int(v) if k == "reach" else float(v)) for k, v in gl.items()}
 
 
-def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
+def _fald_state_keys(entry: dict[str, Any] | None, is_hdr: bool = True) -> dict[str, Any]:
     """The fald_* keys C++ HandleStateGet puts into layers[key] for every pair."""
     entry = entry or {}
     path = str(entry.get("params_path") or "")
@@ -112,6 +115,8 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     glow = _fald_glow(entry)
     out["fald_glowfill"] = glow["enabled"]
     out.update({f"fald_glow_{k}": v for k, v in glow.items() if k != "enabled"})
+    if not is_hdr:
+        out["fald_glow_note"] = _FALD_GLOW_SDR_NOTE
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -210,7 +215,7 @@ class MockDesktopLutState:
             "hdr": deepcopy(self.hdr),
             # C++ reports every monitor:mode pair (absent = a fresh install, all OFF), fald settings included
             "layers": {k: {"tonemap": False, "fald": False, "desktop_gamma": False, "white_balance": False,
-                           "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
+                           "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k), k.endswith(":HDR"))}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "fald": deepcopy(self.fald),
             "overlay_model": {"keep_awake": self.overlay_keep_awake, "sleep_lag_polls": self.overlay_sleep_lag_polls,
@@ -814,6 +819,8 @@ class MockDesktopLutServer:
                 given[name] = int(v) if integer else float(v)
             if "enabled" not in params and not given:
                 return DesktopLutResponse(ok=False, error="missing parameter: enabled, strength, reach or cap_nits")
+            if en is True and not is_hdr:
+                return DesktopLutResponse(ok=False, error=_FALD_GLOW_SDR_NOTE)
             gl = {**_fald_glow(fs), **given}
             if "enabled" in params:
                 gl["enabled"] = en

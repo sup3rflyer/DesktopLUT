@@ -221,8 +221,10 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         if glow is not None:
             from . import glowfill
             zf = glowfill.zone_fields(model, d_true, boost, glow)
-            glow_out = glowfill.round_fill(model, req, b_true, b_est, zf["vz"], zf["ez"], glow, gain_max=gain_clip[1])
-            glow_out.update(zf, round_input=cur, req_nofill=req)
+            # keep the fill off the firmware's count threshold: the zone scale k, from THIS round's request and fields
+            glow_band = glowfill.band_scale(model, req, b_true, b_est, zf["dz"], zf["ez"], glow, gain_max=gain_clip[1])
+            glow_out = glowfill.round_fill(model, req, b_true, b_est, zf["dz"], zf["ez"], glow, gain_max=gain_clip[1], k=glow_band["k"])
+            glow_out.update(zf, round_input=cur, req_nofill=req, band=glow_band)
             req = np.where(glow_out["add"] > 0.0, req + glow_out["add"], req)   # untouched pixels stay bit-identical
         cur = req
     out = {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives,

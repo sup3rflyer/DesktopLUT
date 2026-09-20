@@ -9,9 +9,9 @@ import pytest
 
 pytest.importorskip("scipy")
 from dlc.fald.correct import correct_image  # noqa: E402
-from dlc.fald.glowfill import (CAP_MAX, CAP_MIN, DEFICIT_REL_HI, DEFICIT_REL_LO, REACH_MAX, REACH_MIN, WANT_EPS, GlowFillParams,  # noqa: E402
-                               clamp_params, closing, deficit, envelope, fill_image, pedestal_colour, predict, req_ceiling,
-                               zone_pedestal)
+from dlc.fald.glowfill import (BAND_HI, BAND_LO, CAP_MAX, CAP_MIN, DEFICIT_REL_HI, DEFICIT_REL_LO, REACH_MAX, REACH_MIN,  # noqa: E402
+                               REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS, GlowFillParams, band_active, clamp_params, closing,
+                               deficit, envelope, fill_image, pedestal_colour, predict, req_ceiling, zone_pedestal)
 from dlc.fald.model import FaldModel, FaldParams  # noqa: E402
 from dlc.fald.starfield import _bilinear_zones  # noqa: E402
 
@@ -229,16 +229,32 @@ def test_no_fill_where_the_panel_estimate_is_not_trusted(model):
     assert fill_image(blind, lattice(blind))["glow"]["add"].max() == 0.0
 
 
+def test_the_request_ceiling_comes_from_the_measured_levels():
+    """Probe pixrule (work guide): a 2-px column at 0.298 nit does NOT make a zone LIT, 0.4 nit does; whether a 0.3-nit
+    AREA lights LEDs is unmeasured (R4). The ceiling stays a factor ~1.5 under the measured point and <= 0.2 nit."""
+    p = FaldParams()
+    assert (REQ_FLOOR_FRAC, REQ_LIT_FRAC) == (0.4, 0.55) and (p.drive_floor_nits, p.boost_lit_nits) == (0.5, 0.35)
+    with_lut = FaldModel(replace(p, boost_lut=((0.0, 1.17), (0.35, 1.0))))
+    assert req_ceiling(with_lut) == pytest.approx(0.1925) and req_ceiling(FaldModel(p)) == pytest.approx(0.2)
+    assert req_ceiling(with_lut) * 1.5 < 0.298 and req_ceiling(with_lut) <= 0.2
+    assert GlowFillParams().cap_nits == 0.05
+
+
 def test_the_fill_request_stays_under_the_led_and_lit_thresholds(model):
-    p = replace(model.p, tmin_rgb=(0.8, 1.0, 1.6), boost_lut=((0.0, 1.17), (0.35, 1.0)))
+    # a leaky panel (tmin x 10) and the widest cap: the want reaches 0.5 nit, so the ceiling BINDS (a rule without it
+    # would request 0.5 x 1.6 = 0.8 nit on the blue channel — above the 0.5-nit drive floor)
+    p = replace(model.p, tmin=3e-3, tmin_rgb=(0.8, 1.0, 1.6), boost_lut=((0.0, 1.17), (0.35, 1.0)))
     m = FaldModel(p)
-    assert req_ceiling(m) == pytest.approx(min(0.6 * p.drive_floor_nits, 0.85 * p.boost_lit_nits))
-    assert req_ceiling(model) == pytest.approx(0.6 * model.p.drive_floor_nits)    # without a boost table: the drive floor alone
+    assert req_ceiling(m) == pytest.approx(min(REQ_FLOOR_FRAC * p.drive_floor_nits, REQ_LIT_FRAC * p.boost_lit_nits)) == pytest.approx(0.1925)
+    assert req_ceiling(model) == pytest.approx(REQ_FLOOR_FRAC * model.p.drive_floor_nits)    # without a boost table: the drive floor alone
     img = lattice(m)
     on = fill_image(m, img, GlowFillParams(cap_nits=CAP_MAX))
     black = img.max(axis=0) <= 0.0
-    assert on["glow"]["add"].max() > 0.05
-    assert on["req"][:, black].max() <= req_ceiling(m) + 1e-12
+    g = on["glow"]
+    unlimited = (g["want"] * g["trust"] * 1.6)[black].max()                       # what the blue channel would be asked without it
+    assert unlimited > 2.0 * req_ceiling(m) and unlimited > p.drive_floor_nits
+    assert on["req"][:, black].max() == pytest.approx(req_ceiling(m), rel=1e-9)  # ... and it stops exactly there
+    assert on["req"][:, black].max() < p.boost_lit_nits and on["req"][:, black].max() < p.drive_floor_nits
     assert np.array_equal(on["drives"], correct_image(m, img)["drives"])
     # a pixel whose own content is above the ceiling takes no fill
     y, x = centre(m)
@@ -279,9 +295,57 @@ def test_clamp_params():
     c = clamp_params(GlowFillParams(strength=-1.0, reach=0, cap_nits=0.0))
     assert (c.strength, c.reach, c.cap_nits) == (0.0, REACH_MIN, CAP_MIN)
     c = clamp_params(GlowFillParams(strength=float("nan"), cap_nits=float("nan")))
-    assert (c.strength, c.cap_nits) == (1.0, 0.10)
+    assert (c.strength, c.cap_nits) == (1.0, 0.05)
     d = GlowFillParams()
-    assert (d.strength, d.reach, d.cap_nits, d.envelope) == (1.0, 2, 0.10, "close")
+    assert (d.strength, d.reach, d.cap_nits, d.envelope, d.band) == (1.0, 2, 0.05, "close", True)
+
+
+# ---------------------------------------------------------------------------------------------- the count-threshold band
+MEAN_LUT = ((0.0, 1.17), (0.20, 1.10), (0.35, 1.0))
+
+
+def _zone_stat(m, req):
+    p = m.p
+    z = np.power(np.maximum(req.max(axis=0), 0.0), p.boost_mean_gamma).reshape(p.rows, m.ch, p.cols, m.cw).mean(axis=(1, 3))
+    lit = (req.max(axis=0) > p.boost_lit_nits).reshape(p.rows, m.ch, p.cols, m.cw).any(axis=(1, 3))
+    return z / p.boost_mean_thresh, lit
+
+
+def test_no_filled_zone_is_parked_at_the_firmwares_count_threshold(model):
+    m = FaldModel(replace(model.p, boost_lut=MEAN_LUT, boost_rule="mean"))
+    assert band_active(m) and not band_active(model) and not band_active(FaldModel(replace(model.p, boost_lut=MEAN_LUT)))
+    img = lattice(m, nits=220.0)                                                 # a fill that lands right AT the threshold
+    gp = GlowFillParams(cap_nits=0.5)
+    free = predict(m, img, replace(gp, band=False))
+    z0, lit0 = _zone_stat(m, free["on"]["req"])
+    assert int((~lit0 & (np.abs(z0 - 1.0) < 0.15)).sum()) >= 4                   # without the rule: zones within +-15 % of T
+    res = predict(m, img, gp)
+    b = res["on"]["glow"]["band"]
+    z1, lit1 = _zone_stat(m, res["on"]["req"])
+    assert int((~lit1 & (np.abs(z1 - 1.0) < 0.15)).sum()) == 0                   # with it: none
+    assert b["band"].sum() >= 4 and np.all(b["k"][b["band"]] < 1.0) and np.all(b["k"] <= 1.0) and np.all(b["k"][~b["band"]] == 1.0)
+    assert np.all((b["pf"][b["band"]] >= BAND_LO * m.p.boost_mean_thresh) & (b["pf"][b["band"]] <= BAND_HI * m.p.boost_mean_thresh))
+    assert np.allclose(z1[b["band"]], BAND_LO, rtol=0.03)                         # scaled DOWN to the band's lower edge
+    assert res["zones_sent"] <= free["zones_sent"]
+    # (k is formed per round: round 0's prediction is NOT the sent frame's here — the fill sits in the B_est fade band and
+    # the trust moves between the rounds — which is why round 1 forms its own)
+    assert not np.array_equal(res["on"]["glow"]["band"]["pf"], res["on"]["glow"]["band"]["pc"])
+    assert np.all(res["on"]["req"] <= free["on"]["req"] + 1e-15)                  # never up
+    # zones counted because of their CONTENT are left alone, whatever the fill adds
+    sky = lattice(m, nits=220.0, sky=0.02)
+    bs = fill_image(m, sky, gp)["glow"]["band"]
+    assert np.all(bs["pc"] >= m.p.boost_mean_thresh) and not bs["band"].any() and np.all(bs["k"] == 1.0)
+    # no mean rule / no boost table: no band, bit for bit the rule without it
+    for other in (model, FaldModel(replace(model.p, boost_lut=MEAN_LUT))):
+        a, c = fill_image(other, lattice(other, nits=220.0), gp), fill_image(other, lattice(other, nits=220.0), replace(gp, band=False))
+        assert np.array_equal(a["req"], c["req"]) and np.all(a["glow"]["band"]["k"] == 1.0)
+
+
+def test_a_gamma_transfer_fit_is_refused(model):
+    sdr = FaldModel(replace(model.p, transfer="gamma", code_bits=8))
+    with pytest.raises(ValueError, match="HDR only"):
+        fill_image(sdr, lattice(sdr))
+    assert "glow" not in correct_image(sdr, lattice(sdr))                         # the layer without it is untouched
 
 
 def test_want_is_the_interpolated_zone_deficit(model):

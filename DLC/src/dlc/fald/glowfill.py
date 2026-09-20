@@ -43,10 +43,17 @@ Per pixel
    6. the request that displays ``fill``: ``fill · min(B_est / max(B_true, 1e-9), gain_max)`` (never raised by the lower
       gain clip: a smaller request is always safe), in the PEDESTAL'S colour ``m_c`` (the panel file's multipliers, white
       without them; luminance-neutral: Σ w_c m_c = 1), and limited so the pixel's brightest channel stays at / below
-      ``REQ_CEIL`` = min(REQ_FLOOR_FRAC · drive_floor, REQ_LIT_FRAC · boost_lit_nits [with a boost table]) — the fill can
-      never light a LED or make a zone LIT for the firmware's count.
-Within the model the panel then shows ``V + shown + fill`` at the pixel: on black the LCD adds exactly ``want · trust``
-(x min(1, gain_max · B_true / B_est)), never more than ``want``; the zone mean of the glow never exceeds ``Ez``.
+      ``REQ_CEIL`` = min(REQ_FLOOR_FRAC · drive_floor, REQ_LIT_FRAC · boost_lit_nits [with a boost table]) = 0.1925 nit
+      on the PA32UCXR — the fill can never light a LED or make a zone LIT for the firmware's count. The fractions come
+      from what was MEASURED (work guide, probe pixrule): a 2-px column at 0.298 nit does not make a zone LIT, 0.4 does
+      (the rule's 0.35 is the midpoint), and whether a 0.3-nit AREA lights LEDs was never measured (risk R4; the 0.5-nit
+      floor is a fit value) — so the ceiling keeps a factor ~1.5 below the one measured "not LIT" level and 2.5 below
+      the drive floor instead of sitting on them.
+Within the model — with the round's OWN fields — the panel then shows ``V + shown + fill`` at the pixel: on black the
+LCD adds exactly ``want · trust`` (x min(1, gain_max · B_true / B_est)), never more than ``want``; the zone mean of the
+glow never exceeds ``Ez``. Against the fields of the frame that is finally SENT (one more inverse round: its drives
+differ slightly from round 1's) the bound is not exact where B_est is small and steep: real frame xmas_20, 73 of 102 277
+filled pixels showed more than want + 1 %, the worst + 25 % = + 0.013 nit (cap 0.10).
 
 WHY A CLOSING (stress tests 2026-09-20, ``results/fald_inside_2026-09-18/glowfill/``; the first form of the spec was the
 blur of the box MAXIMUM against the pixel's own pedestal, kept here as the offline switch ``envelope="dilate"``). The
@@ -66,10 +73,32 @@ N from that request (fill included), so the final fill is computed with the boos
 fill. What is left: the sent frame's N can differ from round 1's by the zones whose fill crosses the count threshold
 when the boost moves between the rounds — see ``predict`` (``zones_sent`` vs ``zones_assumed``).
 
+   7. THE COUNT-THRESHOLD BAND (review 2026-09-20; panel files with a boost table AND the mean zone rule only). A smooth
+      fill necessarily parks zones AT the firmware's count threshold T (zone mean of request^gamma; measured to +-7 %):
+      12-13 zones within +-15 % of it in a panned star lattice, where a miscount near a stair edge is a whole-frame
+      error of 1-3 % (7-9.6 % at the dead band) — an exposure the layer does not have without the fill. So in EACH
+      round, per zone, the statistic the firmware will form is PREDICTED on that round's request — ``Pf`` = zone
+      mean of (brightest channel of request + fill)^gamma, ``Pc`` = the same without the fill — and a zone that is not
+      counted because of its content (not LIT, ``Pc`` < T) and whose ``Pf`` falls inside [BAND_LO T, BAND_HI T] has the
+      ``want`` of ITS OWN pixels (nearest zone, after the cap) scaled DOWN by ``k = ((BAND_LO T − Pc) / (Pf − Pc))^(1 /
+      gamma)`` (0 .. 1), which puts the prediction at BAND_LO T: the zone stays clearly uncounted. Never up; zones counted
+      by their content are left alone; a zone filled well above the band is clearly counted. The scale is per ZONE, not
+      interpolated, on purpose: scaling the interpolated deficit's texel instead leaves the neighbours' share in the
+      zone's pixels untouched and the zone in the band (pan test: 12 -> 9 zones instead of 12 -> 0). ``k`` is formed
+      in EVERY round from that round's own request and fields — round 1's k is exact for the frame that is sent; a k
+      carried over from round 0 is not (dim-star lattice, fill in the B_est fade band: the trust factor moves between
+      the rounds, round 0 predicted 0.97 T where the sent frame had 0.63 T, and parked zones the prediction had not
+      seen). The price: inside a band zone the fill steps at the zone's edges (<= ~0.01 nit), a zone crossing BAND_HI T
+      changes its fill by x 0.49 in one frame — a local step instead of a frame-wide one —, and one more
+      full-resolution sweep per round on the GPU.
+
+HDR only: every level behind the request ceiling and the band (drive floor, LIT level, count threshold) was measured in
+HDR; a gamma-transfer (SDR / ACM) fit is refused (``ValueError``; the C++ keeps the option off and says why).
+
 Parameters (``GlowFillParams`` defaults = C++ ``FaldGlowSettings`` = the mock's): strength 1 (0..1), reach 2 (1..4 zones),
-cap_nits 0.10 (0.005..0.5).
+cap_nits 0.05 (0.005..0.5).
 Constants: GLOW_SIGMA_BASE 0.5, GLOW_SIGMA_PER_REACH 0.5, DEFICIT_REL_LO 0.05, DEFICIT_REL_HI 0.15, WANT_EPS 1e-5,
-REQ_FLOOR_FRAC 0.6, REQ_LIT_FRAC 0.85.
+REQ_FLOOR_FRAC 0.4, REQ_LIT_FRAC 0.55, BAND_LO 0.8, BAND_HI 1.25.
 """
 from __future__ import annotations
 
@@ -87,17 +116,20 @@ GLOW_SIGMA_PER_REACH = 0.5
 DEFICIT_REL_LO = 0.05                    # HLSL FALD_GLOW_DEFICIT_REL_LO / _HI: a dip this shallow (relative to the zone's own glow)
 DEFICIT_REL_HI = 0.15                    # is no hole ... from here on it is filled in full (smoothstep between)
 WANT_EPS = 1e-5                          # HLSL FALD_GLOW_WANT_EPS: a deficit below this (as-if-white nits) is no deficit
-REQ_FLOOR_FRAC = 0.6                     # HLSL FALD_GLOW_REQ_FLOOR_FRAC: a filled pixel's request stays below this x drive floor
-REQ_LIT_FRAC = 0.85                      # HLSL FALD_GLOW_REQ_LIT_FRAC: ... and below this x the boost count's LIT level
+REQ_FLOOR_FRAC = 0.4                     # C++ FALD_GLOW_REQ_FLOOR_FRAC: a filled pixel's request stays below this x drive floor
+REQ_LIT_FRAC = 0.55                      # C++ FALD_GLOW_REQ_LIT_FRAC: ... and below this x the boost count's LIT level
+                                         # (PA32UCXR: min(0.2, 0.1925) nit; the one measured "not LIT" point is 0.298 nit)
+BAND_LO, BAND_HI = 0.8, 1.25             # HLSL FALD_GLOW_BAND_LO / _HI: the count-threshold band, x the mean rule's threshold
 
 
 @dataclass(frozen=True)
 class GlowFillParams:
     strength: float = 1.0                # share of the glow deficit that is filled (0 = off, 1 = up to the envelope)
     reach: int = 2                       # zones (each side): holes / valleys up to 2·reach zones wide are filled
-    cap_nits: float = 0.10               # the fill never exceeds this (as-if-white nits)
+    cap_nits: float = 0.05               # the fill never exceeds this (as-if-white nits)
     envelope: str = "close"              # OFFLINE-ONLY switch kept for the stress tests: "close" (the rule) | "dilate" (the
                                          # 2026-09-20 spec's first form: blur of the box maximum — paints a skirt)
+    band: bool = True                    # OFFLINE-ONLY switch: False = without the count-threshold band (item 7), to cost it
 
 
 def clamp_params(gp: GlowFillParams) -> GlowFillParams:
@@ -188,20 +220,59 @@ def deficit(vz: np.ndarray, ez: np.ndarray) -> np.ndarray:
     return d * _smoothstep(DEFICIT_REL_LO, DEFICIT_REL_HI, d / np.maximum(vz, 1e-12))
 
 
+def check_supported(model: FaldModel) -> None:
+    """The fill is HDR only (module docstring): refuse a gamma-transfer (SDR / ACM) fit."""
+    if model.p.transfer != "pq":
+        raise ValueError("glow fill is HDR only: the levels behind its request ceiling (drive floor, LIT level, count "
+                         f"threshold) are HDR measurements (transfer {model.p.transfer!r})")
+
+
 def zone_fields(model: FaldModel, d_true: np.ndarray, boost: float, gp: GlowFillParams) -> dict:
-    """The zone fields of a round: ``vz``, ``ez`` and ``dz`` (the dump's fald_glow_vz.f32 / fald_glow_env.f32 [ez, dz])."""
+    """The zone fields of a round: ``vz``, ``ez`` and ``dz`` (the dump's fald_glow_vz.f32 / fald_glow_env.f32 [ez, dz, cz,
+    vz])."""
+    check_supported(model)
     gp = clamp_params(gp)
     vz = zone_pedestal(model, d_true, boost)
     ez = envelope(vz, gp)
-    return {"vz": vz, "ez": ez, "dz": deficit(vz, ez)}
+    dz = deficit(vz, ez)
+    return {"vz": vz, "ez": ez, "dz": dz}
 
 
-def round_fill(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.ndarray, vz: np.ndarray, ez: np.ndarray,
+def band_active(model: FaldModel) -> bool:
+    """Item 7 applies: the fit has a boost table AND the mean zone rule (the only rule with a threshold to park at)."""
+    return bool(model.p.boost_lut) and model.p.boost_rule == "mean"
+
+
+def band_scale(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.ndarray, dz: np.ndarray, ez: np.ndarray,
                gp: GlowFillParams, gain_max: float = 4.0) -> dict:
+    """Item 7: the per-zone scale ``k`` (rows, cols) of the zone's own pixels' want, from the request ``req`` of the round
+    (without fill) and the fill the unscaled rule would add. + ``pf`` / ``pc`` (the predicted statistic with / without the fill) and
+    ``band`` (the zones that were scaled). All ones when the fit has no mean rule / boost table."""
+    p = model.p
+    ones = np.ones((p.rows, p.cols))
+    if not (gp.band and band_active(model)):
+        return {"k": ones, "pf": None, "pc": None, "band": np.zeros((p.rows, p.cols), dtype=bool)}
+    f = round_fill(model, req, b_true, b_est, dz, ez, gp, gain_max)
+    zmean = lambda a: a.reshape(p.rows, model.ch, p.cols, model.cw).mean(axis=(1, 3))
+    rc = req.max(axis=0)
+    rf = (req + f["add"]).max(axis=0)
+    g, t = float(p.boost_mean_gamma), float(p.boost_mean_thresh)
+    pc = zmean(np.power(np.maximum(rc, 0.0), g))
+    pf = zmean(np.power(np.maximum(rf, 0.0), g))
+    lit = zmean((rc > p.boost_lit_nits).astype(float)) > p.boost_lit_frac
+    band = (~lit) & (pc < t) & (pf >= BAND_LO * t) & (pf <= BAND_HI * t)
+    share = np.clip((BAND_LO * t - pc) / np.maximum(pf - pc, 1e-30), 0.0, 1.0)
+    return {"k": np.where(band, np.power(share, 1.0 / g), 1.0), "pf": pf, "pc": pc, "band": band}
+
+
+def round_fill(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.ndarray, dz: np.ndarray, ez: np.ndarray,
+               gp: GlowFillParams, gain_max: float = 4.0, k: Optional[np.ndarray] = None) -> dict:
     """Items 4-6 for every pixel. ``req`` = the round's corrected request WITHOUT fill (3, h, w); ``b_true`` / ``b_est`` =
-    the round's pixel fields. Returns ``add`` (3, h, w; exactly 0 where nothing is filled), ``fill`` (the luminance the
-    panel is asked to add, as-if-white nits), ``want``, ``trust``, ``e_px``, ``v_px``."""
-    from .starfield import _bilinear_zones
+    the round's pixel fields; ``dz`` = the zone deficit; ``k`` = the count-threshold band's zone scale (item 7; None = 1). Returns ``add`` (3, h, w;
+    exactly 0 where nothing is filled), ``fill`` (the luminance the panel is asked to add, as-if-white nits), ``want``,
+    ``trust``, ``e_px``, ``v_px``."""
+    from .starfield import _bilinear_zones, _nearest_zones
+    check_supported(model)
     gp = clamp_params(gp)
     p = model.p
     e_px = _bilinear_zones(model, ez)
@@ -209,8 +280,10 @@ def round_fill(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.
     if gp.envelope == "dilate":                                          # the spec's first form: against the pixel's own pedestal
         d_px = np.maximum(e_px - v_px, 0.0)
     else:                                                                # the rule: the ZONE-level deficit, interpolated
-        d_px = _bilinear_zones(model, deficit(vz, ez))
+        d_px = _bilinear_zones(model, dz)
     want = np.minimum(np.maximum(gp.strength * d_px - WANT_EPS, 0.0), gp.cap_nits)
+    if k is not None:
+        want = want * _nearest_zones(model, k)                           # the pixel's OWN zone, after the cap
     r = req.max(axis=0)
     shown = r * np.maximum(b_true, 0.0) / np.maximum(b_est, 1e-9)
     trust = _smoothstep(p.fade_lo, p.fade_hi, b_est)

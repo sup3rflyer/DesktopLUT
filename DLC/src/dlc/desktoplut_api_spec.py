@@ -82,7 +82,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), fald_glowfill (bool) + "
                           "fald_glow_strength, fald_glow_reach, fald_glow_cap_nits (runtime.fald_glowfill; absent on builds "
-                          "before the S2 glow fill, 2026-09-20), and "
+                          "before the S2 glow fill, 2026-09-20; SDR pairs add fald_glow_note = why the fill is HDR only), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
@@ -477,19 +477,23 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "(no skirt around a bright window, no filled letterbox bars) —, a blur under the closing, the zone deficit (dips "
             "below 5 % ignored); per pixel the interpolated deficit x strength, at most cap_nits, minus what the pixel's own "
             "content already shows, x the correction's deep-dark trust in the panel's estimate (no fill where B_est ~ 0), "
-            "requested in the pedestal's colour and never above 0.6 x the drive floor / 0.85 x the boost count's LIT level "
-            "(no LED is lit). Lit content stays bit-identical EXCEPT through the panel's black-frame LED boost: a zone "
-            "filled at >= ~0.0135 nit counts as non-black for the firmware, so the fill can move the boost staircase (the "
-            "layer reads the count from the frame that carries the fill). Partial updates (any subset; at least one), "
-            "persisted per mode (= the GUI 'Glow fill' row, which sets both modes). Measuring phases must run with it OFF "
-            "(fald_profile forces it off and restores it).",
+            "requested in the pedestal's colour and never above 0.4 x the drive floor / 0.55 x the boost count's LIT level "
+            "(0.1925 nit on the PA32UCXR: a factor 1.5 below the one measured 'not LIT' level; no LED is lit). Lit content "
+            "stays bit-identical EXCEPT through the panel's black-frame LED boost: a zone filled at >= ~0.0135 nit counts as "
+            "non-black for the firmware, so the fill can move the boost staircase (the layer reads the count from the frame "
+            "that carries the fill). With a mean-rule panel file the count-threshold BAND keeps every filled zone clear of "
+            "the firmware's threshold T: a zone whose predicted statistic would land in [0.8 T, 1.25 T] has its own pixels' "
+            "fill scaled down to 0.8 T. HDR ONLY: `enabled: true` is refused for mode SDR (the ceiling's levels are HDR "
+            "measurements); the numbers can be set in either mode. Partial updates (any subset; at least one), persisted "
+            "per mode (= the GUI 'Glow fill' row). Measuring phases must run with it OFF (fald_profile forces it off and "
+            "restores it).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
                 "enabled": ApiParamSpec("boolean", required=False, description="the switch (default false)"),
                 "strength": ApiParamSpec("number", required=False, description="0..1 share of the glow deficit that is filled (default 1)"),
                 "reach": ApiParamSpec("number", required=False, description="integer 1..4 zones: holes / valleys up to 2 x reach zones wide are filled (default 2)"),
-                "cap_nits": ApiParamSpec("number", required=False, description="0.005..0.5 as-if-white nits: the fill's ceiling (default 0.10)"),
+                "cap_nits": ApiParamSpec("number", required=False, description="0.005..0.5 as-if-white nits: the fill's ceiling (default 0.05)"),
             },
             {"monitor_mode": "string", "enabled": "boolean", "strength": "number", "reach": "number", "cap_nits": "number"},
             mutates_state=True,
@@ -507,7 +511,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "fald_star_plan2.f32 (ln background, near = the tapered protection field, speck-zone flag, w) — and `starfield ...` lines "
             "in fald_dump.txt; fald_frame.* stays the SOURCE frame. With the glow fill on it adds fald_glow_vz.f32 (the zone "
             "pedestal Vz, cols x rows float32) and fald_glow_env.f32 (cols x rows x 4 float32: envelope Ez, deficit Dz, closing "
-            "Cz, Vz) of round 1, and `glowfill ...` lines.",
+            "Cz, Vz) of round 1, fald_glow_k.f32 (the count-threshold band's zone scale of round 0; mean-rule files only) and "
+            "`glowfill ...` lines.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

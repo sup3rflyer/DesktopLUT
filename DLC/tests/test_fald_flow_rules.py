@@ -269,19 +269,19 @@ def test_overlay_tracker_forces_the_glow_fill_off_and_restores_it():
     """Work guide S2: the glow fill ADDS light to black on purpose (and can move the panel's black-frame boost through the
     zone count) — a measuring phase must never read through it. A persisted owner setting: switched off, put back."""
     ctl = _RefusingCtl(CalibrationController.mock(), refuse=())
-    ctl.call("runtime.fald_glowfill", {"monitor": 1, "mode": "SDR", "enabled": True, "strength": 0.7, "reach": 3, "cap_nits": 0.05})
-    tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")
-    layers = ctl.inner.state()["layers"]["1:SDR"]
+    ctl.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "enabled": True, "strength": 0.7, "reach": 3, "cap_nits": 0.05})
+    tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "HDR")
+    layers = ctl.inner.state()["layers"]["1:HDR"]
     assert layers["fald_glowfill"] is False                                              # forced off for the reads
     assert (layers["fald_glow_strength"], layers["fald_glow_reach"], layers["fald_glow_cap_nits"]) == (0.7, 3, 0.05)   # untouched
     meta = tr.file_meta()
     assert meta["glowfill_forced_off"] is True and "forced OFF" in meta["glowfill_note"]
     assert meta["glowfill_saved"] == {"enabled": True, "strength": 0.7, "reach": 3, "cap_nits": 0.05}
-    assert ctl.inner.state()["layers"]["1:HDR"]["fald_glowfill"] is False                # the other mode was never on
+    assert ctl.inner.state()["layers"]["1:SDR"]["fald_glowfill"] is False                # the other mode was never on (HDR only)
     tr.restore()
-    assert ctl.inner.state()["layers"]["1:SDR"]["fald_glowfill"] is True
-    assert [p for m, p in ctl.calls if m == "runtime.fald_glowfill"][-2:] == [{"monitor": 1, "mode": "SDR", "enabled": False},
-                                                                             {"monitor": 1, "mode": "SDR", "enabled": True}]
+    assert ctl.inner.state()["layers"]["1:HDR"]["fald_glowfill"] is True
+    assert [p for m, p in ctl.calls if m == "runtime.fald_glowfill"][-2:] == [{"monitor": 1, "mode": "HDR", "enabled": False},
+                                                                             {"monitor": 1, "mode": "HDR", "enabled": True}]
     res = StageResult("t")
     tr.report(res, "rings")
     assert not res.anomalies and any("glow fill was ON" in n for n in res.notes)
@@ -297,13 +297,13 @@ def test_overlay_tracker_forces_the_glow_fill_off_and_restores_it():
             return {"layers": {"1:SDR": {"fald": False, "fald_temporal_mode": 0, "fald_starfield": False}}, "overlay": {"awake": False}}
     assert "build without runtime.fald_glowfill" in FP.OverlayTracker(_TrackerSession(_OldBuild()), 1, "SDR").file_meta()["glowfill_note"]
     inner = CalibrationController.mock()
-    inner.call("runtime.fald_glowfill", {"monitor": 1, "mode": "SDR", "enabled": True})
-    tr3 = FP.OverlayTracker(_TrackerSession(_RefusingCtl(inner, refuse=("runtime.fald_glowfill",))), 1, "SDR")
+    inner.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "enabled": True})
+    tr3 = FP.OverlayTracker(_TrackerSession(_RefusingCtl(inner, refuse=("runtime.fald_glowfill",))), 1, "HDR")
     res3 = StageResult("t")
     tr3.report(res3, "verify")
     assert tr3.file_meta()["glowfill_saved"] is None and [(a.code, a.severity) for a in res3.anomalies] == [("glowfill_state", "high")]
     ctl4 = _RefusingCtl(inner, refuse=())
-    tr4 = FP.OverlayTracker(_TrackerSession(ctl4), 1, "SDR")
+    tr4 = FP.OverlayTracker(_TrackerSession(ctl4), 1, "HDR")
     ctl4.refuse.add("runtime.fald_glowfill")
     tr4.restore()
     res4 = StageResult("t")
