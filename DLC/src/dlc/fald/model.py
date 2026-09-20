@@ -506,6 +506,18 @@ class FaldModel:
                   phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
                   support_cells: int = 0, pnorm: float = 2.0) -> np.ndarray:
         """B on the reduced-res pixel grid (h, w), from cell drives (rows, cols)."""
+        sub = self.p.sub
+        fine = self.backlight_fine(drives, kind, scale_mm, core_mm, tail_frac, phase_px, aniso, support_cells, pnorm)
+        # bilinear upsample fine (sub per cell) → pixels
+        ys = (np.arange(self.h) + 0.5) / self.ch * sub - 0.5
+        xs = (np.arange(self.w) + 0.5) / self.cw * sub - 0.5
+        return _bilinear(fine, ys, xs)
+
+    def backlight_fine(self, drives: np.ndarray, kind: str, scale_mm: float,
+                       core_mm: float = 0.0, tail_frac: float = 0.0,
+                       phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
+                       support_cells: int = 0, pnorm: float = 2.0) -> np.ndarray:
+        """B on the per-cell sub-grid (rows·sub, cols·sub) — the shader's fine textures; :meth:`backlight` upsamples it."""
         p = self.p
         kern = self._kernels(kind, scale_mm, core_mm, tail_frac,
                              (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm), aniso, support_cells, pnorm)
@@ -514,10 +526,22 @@ class FaldModel:
         for oy in range(sub):
             for ox in range(sub):
                 fine[oy::sub, ox::sub] = fftconvolve(drives, kern[oy][ox], mode="same")
-        # bilinear upsample fine (sub per cell) → pixels
-        ys = (np.arange(self.h) + 0.5) / self.ch * sub - 0.5
-        xs = (np.arange(self.w) + 0.5) / self.cw * sub - 0.5
-        return _bilinear(fine, ys, xs)
+        return fine
+
+    def true_fine(self, drives: np.ndarray, boost: float = 1.0) -> np.ndarray:
+        """B_true on the fine grid (rows·sub, cols·sub), LED boost and flat-lattice normalisation included, floored at 0 —
+        what the shader's gain pass forms per fine texel (``bTrueTex / flatTrueTex``). The glow fill's zone field
+        (:mod:`dlc.fald.glowfill`) is its per-zone mean."""
+        p = self.p
+        fine = self.backlight_fine(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm) * float(boost)
+        if p.flat_norm:
+            flat = getattr(self, "_flat_fine", None)
+            if flat is None or flat[0] != p.__dict__:
+                ones = np.ones((p.rows, p.cols))
+                flat = (dict(p.__dict__), self.backlight_fine(ones, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm))
+                self._flat_fine = flat
+            fine = fine / np.maximum(flat[1], 1e-6)
+        return np.maximum(fine, 0.0)
 
     # ------------------------------------------------------------------ full forward
     def forward(self, shapes: Sequence[Shape]) -> dict:

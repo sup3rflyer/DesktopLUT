@@ -137,8 +137,12 @@ def pedestal_adjust(delta: np.ndarray, img: np.ndarray, ped_mode: str) -> tuple[
 
 
 def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
-                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None) -> dict:
+                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None, glow=None) -> dict:
     """Return the corrected request image for ``img`` (3, h, w, as-if-white nits).
+
+    ``glow``: optional :class:`dlc.fald.glowfill.GlowFillParams` — the glow fill (work guide S2): every round adds the
+    fill of ITS fields to the request (so round 1's drives / boost count see the frame the panel receives, fill
+    included); ``None`` = the layer without it, bit for bit. Evidence of the last round under ``"glow"``.
 
     ``drive_filter``: optional ``drives -> (drives_true, drives_est)`` applied to every round's instantaneous
     cell drives before the kernels — the temporal drive state of :mod:`dlc.fald.temporal` (the shader's
@@ -214,9 +218,18 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         g_eff = np.where(ok, ceiling_gain(np.where(ok, mu, 1.0), gain, b_est, p.white_nits), gain)
         req = np.maximum(u * g_eff[None], 0.0)                  # ONE scale per pixel: hue cannot rotate
         clipped = np.broadcast_to((g_eff < gain - 1e-12)[None], req.shape)   # brightening limited by the knee
+        if glow is not None:
+            from . import glowfill
+            zf = glowfill.zone_fields(model, d_true, boost, glow)
+            glow_out = glowfill.round_fill(model, req, b_true, b_est, zf["vz"], zf["ez"], glow, gain_max=gain_clip[1])
+            glow_out.update(zf, round_input=cur, req_nofill=req)
+            req = np.where(glow_out["add"] > 0.0, req + glow_out["add"], req)   # untouched pixels stay bit-identical
         cur = req
-    return {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives,
-            "boost": boost}
+    out = {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives,
+           "boost": boost}
+    if glow is not None:
+        out["glow"] = glow_out
+    return out
 
 
 def corrected_code(value_nits: float, bits: int = 10) -> int:

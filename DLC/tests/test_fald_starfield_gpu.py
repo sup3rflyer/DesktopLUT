@@ -828,9 +828,9 @@ def test_hlsl_star_passes_mirror_the_reference():
     # C++ order: the plan of the source frame first, then the layer
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     assert c.index("if (r->starOn) RunStar(r);") < c.index("RunStat(r, 0);")
-    assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 20" in c
+    assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 24" in c   # t20-t23: the glow fill (S2)
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 304" in h                                                               # 76 words since C12b (zone rule)
+    assert "FALD_CB_BYTES = 320" in h                                                               # 80 words since S2 (glow fill)
     assert f"FALD_STAR_EVEN_REACH_MAX = {gpuemu.STAR_EVEN_REACH_MAX}" in h and f"FALD_STAR_REACH_MAX = {gpuemu.STAR_REACH_MAX}" in h
 
 

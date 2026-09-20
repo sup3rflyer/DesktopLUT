@@ -80,7 +80,9 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "two absent on builds before 2026-09-20), fald_starfield (bool) + fald_star_even, "
                           "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
-                          "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), and "
+                          "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), fald_glowfill (bool) + "
+                          "fald_glow_strength, fald_glow_reach, fald_glow_cap_nits (runtime.fald_glowfill; absent on builds "
+                          "before the S2 glow fill, 2026-09-20), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
@@ -369,14 +371,15 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map white/red +/blue -, 2 real "
             "backlight, 3 panel estimate, 4 identity passthrough, 5 pedestal term x100, 6 per-channel-vs-white "
             "influence x100, 7 temporal settling map red rising/blue falling, 8 the black-frame boost's non-black zone "
-            "map, 9 the starfield balancing zone map — grey = zone weight, blue = peak pulled down, red = lifted; not "
+            "map, 9 the starfield balancing zone map — grey = zone weight, blue = peak pulled down, red = lifted, 10 the "
+            "glow fill: the request it adds per pixel x1000, in the pedestal's colour; not "
             "persisted) and/or the pedestal mode "
             "(ped_mode 0 = white pedestal, 1 = the FLD2 panel file's per-channel leak colour; persisted, "
             "= the GUI 'Per-channel pedestal' checkbox). At least one of the two.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "debug_mode": ApiParamSpec("number", required=False, description="0..9 (8 = the black-frame boost's non-black zone map, 9 = starfield balancing zones)"),
+                "debug_mode": ApiParamSpec("number", required=False, description="0..10 (8 = the black-frame boost's non-black zone map, 9 = starfield balancing zones, 10 = glow fill x1000)"),
                 "ped_mode": ApiParamSpec("number", required=False, description="0 | 1"),
             },
             {"monitor_mode": "string", "debug_mode": "number", "ped_mode": "number", "ped_colour_in_file": "boolean"},
@@ -465,6 +468,34 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             gui_thread_required=True,
         ),
         ApiMethodSpec(
+            "runtime.fald_glowfill",
+            "FALD compensation layer: glow fill (EXPERIMENT, default off; work guide ticket S2; the complete rules = the "
+            "module docstring of dlc/fald/glowfill.py, GPU-order twin dlc/fald/gpuemu.py, HLSL src/fald_shader.h). A "
+            "CALCULATED black lift that evens the LED glow on dark content: per zone the white pedestal white x tmin x "
+            "B_true (the correction's own field: LED boost, starfield balancing and the temporal state included), its grey "
+            "CLOSING over a (2 reach + 1)^2 zone box — only holes / valleys of the glow that are enclosed by glow are filled "
+            "(no skirt around a bright window, no filled letterbox bars) —, a blur under the closing, the zone deficit (dips "
+            "below 5 % ignored); per pixel the interpolated deficit x strength, at most cap_nits, minus what the pixel's own "
+            "content already shows, x the correction's deep-dark trust in the panel's estimate (no fill where B_est ~ 0), "
+            "requested in the pedestal's colour and never above 0.6 x the drive floor / 0.85 x the boost count's LIT level "
+            "(no LED is lit). Lit content stays bit-identical EXCEPT through the panel's black-frame LED boost: a zone "
+            "filled at >= ~0.0135 nit counts as non-black for the firmware, so the fill can move the boost staircase (the "
+            "layer reads the count from the frame that carries the fill). Partial updates (any subset; at least one), "
+            "persisted per mode (= the GUI 'Glow fill' row, which sets both modes). Measuring phases must run with it OFF "
+            "(fald_profile forces it off and restores it).",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "enabled": ApiParamSpec("boolean", required=False, description="the switch (default false)"),
+                "strength": ApiParamSpec("number", required=False, description="0..1 share of the glow deficit that is filled (default 1)"),
+                "reach": ApiParamSpec("number", required=False, description="integer 1..4 zones: holes / valleys up to 2 x reach zones wide are filled (default 2)"),
+                "cap_nits": ApiParamSpec("number", required=False, description="0.005..0.5 as-if-white nits: the fill's ceiling (default 0.10)"),
+            },
+            {"monitor_mode": "string", "enabled": "boolean", "strength": "number", "reach": "number", "cap_nits": "number"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
             "runtime.fald_dump",
             "FALD compensation layer: on the next frame the layer runs, dump its drive map, both "
             "backlight fields and the frame it saw into `dir` (reference comparison against the Python "
@@ -474,7 +505,9 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "a_eff above the background), fald_star_w.f32 (wt = the zone's weight in the target average [0 on a flank zone], "
             "wt ln peak, flank flag, speck-zone flag), fald_star_plan.f32 (w0_field, ln target, ln lift, ln peak) and "
             "fald_star_plan2.f32 (ln background, near = the tapered protection field, speck-zone flag, w) — and `starfield ...` lines "
-            "in fald_dump.txt; fald_frame.* stays the SOURCE frame.",
+            "in fald_dump.txt; fald_frame.* stays the SOURCE frame. With the glow fill on it adds fald_glow_vz.f32 (the zone "
+            "pedestal Vz, cols x rows float32) and fald_glow_env.f32 (cols x rows x 4 float32: envelope Ez, deficit Dz, closing "
+            "Cz, Vz) of round 1, and `glowfill ...` lines.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

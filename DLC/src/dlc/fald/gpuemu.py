@@ -25,7 +25,15 @@ fields sampled bilinearly between zone centres, clamped — the same sampler mat
 speck-zone flag of the pixel's OWN zone loaded nearest) to everything downstream: both statistic rounds, the boost
 flags, Correct, the output. ``star=None`` runs none of it (the previous emulator, bit for bit). The reference works on
 the model's scale-5 raster, the emulator on full-resolution pixels: they agree on raster-aligned content (>= 5-px
-features), where the centre pixel of every 5 x 5 block has exactly the raster pixel's bilinear coordinates."""
+features), where the centre pixel of every 5 x 5 block has exactly the raster pixel's bilinear coordinates.
+
+Glow fill (work guide S2; the rules = the module docstring of :mod:`dlc.fald.glowfill`, the reference):
+``run(..., glow=GlowFillParams)`` runs the four glow passes after EACH round's conv pass (:meth:`Emu.glow_zones` = G0
+``g_faldGlowZoneSource`` zone pedestal, G1 ``g_faldGlowDilateSource`` box maximum on the lattice extended by ``reach``,
+G2 ``g_faldGlowErodeSource`` box minimum = the closing, G3 ``g_faldGlowEnvSource`` blur + min + deficit; float32, the
+shaders' loop order) and adds ``GlowAdd`` (:meth:`Emu.glow_add`) to that round's corrected request — round 0's feeds the
+round-1 statistic / boost flags, round 1's is the output. ``glow=None`` runs none of it (the previous emulator, bit for
+bit)."""
 from __future__ import annotations
 
 from typing import Optional
@@ -33,6 +41,8 @@ from typing import Optional
 import numpy as np
 from scipy.signal import convolve2d
 
+from .glowfill import (DEFICIT_REL_HI, DEFICIT_REL_LO, GLOW_SIGMA_BASE, GLOW_SIGMA_PER_REACH, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS,
+                       GlowFillParams, clamp_params as clamp_glow)
 from .panelfile import boost_of_count
 from .starfield import StarfieldParams
 from .temporal import MODE_BOTH, MODE_OFF, MODE_TRUE_ONLY, alpha_from_tau
@@ -480,6 +490,68 @@ class Emu:
         scale = np.where(acts, out_m / safe, 1.0)
         return np.where(acts[None], img * scale[None], img), scale
 
+    # ---- glow fill (work guide S2): passes G0-G3 + GlowAdd
+    def glow_zones(self, bT, gp: GlowFillParams):
+        """G0-G3 on this round's fine B_true texture (boost included), float32 in the shaders' loop order: ``vz`` (zone
+        mean of white * tmin * max(bT / flatT, 0) over the zone's sub x sub fine texels), ``dil`` (box maximum on the
+        lattice extended by ``reach`` on every side, the field continued by its border values), ``cz`` (box minimum of
+        ``dil`` = the grey closing), ``ez`` = min(Gaussian blur of cz, cz), ``dz`` = (ez - vz) x smoothstep(DEFICIT_REL_LO, DEFICIT_REL_HI, (ez - vz) / vz)."""
+        S, r = self.sub, int(gp.reach)
+        n = (bT.astype(np.float32) / np.maximum(self.flatT, f32(1e-6))).astype(np.float32)
+        n = np.maximum(n, f32(0.0)).reshape(self.rows, S, self.cols, S)
+        acc = np.zeros((self.rows, self.cols), dtype=np.float32)
+        for oy in range(S):                                   # the shader's order: oy outer, ox inner
+            for ox in range(S):
+                acc = (acc + n[:, oy, :, ox]).astype(np.float32)
+        vz = (acc * (f32(self.white) * f32(self.tmin) / f32(S * S))).astype(np.float32)
+        ext = np.pad(vz, 2 * r, mode="edge")                  # V(clamp(z)): the field continued by its border values
+        rows_e, cols_e = self.rows + 2 * r, self.cols + 2 * r
+        dil = None
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                v = ext[r + dy: r + dy + rows_e, r + dx: r + dx + cols_e]
+                dil = v.copy() if dil is None else np.maximum(dil, v)
+        cz = None
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                v = dil[r + dy: r + dy + self.rows, r + dx: r + dx + self.cols]
+                cz = v.copy() if cz is None else np.minimum(cz, v)
+        sigma = f32(GLOW_SIGMA_BASE) + f32(GLOW_SIGMA_PER_REACH) * f32(r)
+        R = int(np.ceil(3.0 * float(sigma)))
+        pad = np.pad(cz, R, mode="edge")
+        acc = np.zeros_like(cz); wsum = f32(0.0)
+        for dy in range(-R, R + 1):
+            for dx in range(-R, R + 1):
+                w = np.exp(f32(-0.5) * f32(dx * dx + dy * dy) / (sigma * sigma), dtype=np.float32)
+                acc = (acc + w * pad[R + dy: R + dy + self.rows, R + dx: R + dx + self.cols]).astype(np.float32)
+                wsum = f32(wsum + w)
+        ez = np.minimum((acc / wsum).astype(np.float32), cz)
+        d = np.maximum(ez - vz, f32(0.0)).astype(np.float32)
+        dz = (d * smoothstep(f32(DEFICIT_REL_LO), f32(DEFICIT_REL_HI), d / np.maximum(vz, f32(1e-12)))).astype(np.float32)
+        return {"vz": vz, "dil": dil, "cz": cz, "ez": ez, "dz": dz}
+
+    def glow_ceiling(self):
+        """HLSL GlowReqCeil: a filled pixel's brightest channel stays at / below this (glowfill.req_ceiling)."""
+        c = REQ_FLOOR_FRAC * self.floor
+        return min(c, REQ_LIT_FRAC * float(self.litNits)) if self.boostN else c
+
+    def glow_add(self, req, sT, sE, dz, gp: GlowFillParams):
+        """HLSL GlowAdd for every lattice pixel: (request + fill (3, H, W), the fill's request luminance (H, W)). ``req``
+        = the round's corrected request, ``sT`` / ``sE`` = the pixel fields Correct used. Untouched pixels are returned
+        as they came (the HLSL returns ``req`` itself there)."""
+        want = np.minimum(np.maximum(float(gp.strength) * self.sample_zone(dz) - WANT_EPS, 0.0), float(gp.cap_nits))
+        bT = np.maximum(sT, 0.0)
+        r = req.max(axis=0)
+        shown = r * bT / np.maximum(sE, 1e-9)
+        fill = np.maximum(want - shown, 0.0) * smoothstep(self.fadeLo, self.fadeHi, sE)
+        ped = self.o.get("pedRGB")
+        m = np.ones(3) if ped is None else np.asarray(ped, dtype=np.float64)
+        add = fill * np.minimum(sE / np.maximum(bT, 1e-9), self.gmax)
+        room = np.maximum(self.glow_ceiling() - r, 0.0)
+        add = add * np.minimum(1.0, room / np.maximum(add * m.max(), 1e-30))
+        acts = (want > 0.0) & (add > 0.0) & self.in_lattice
+        return np.where(acts[None], req + add[None] * m[:, None, None], req), np.where(acts, add, 0.0)
+
     # ---- PanelNits / PanelNitsToScRGB
     def panel_nits(self, scrgb):          # (H, W, 3) -> (3, H, W)
         if self.transfer == 1:
@@ -635,14 +707,17 @@ class Emu:
         g = self.sample(gainB.astype(np.float64))
         return sT, sE, g
 
-    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1):
+    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1,
+            glow: Optional[GlowFillParams] = None):
         """One frame of FaldRunPasses. ``temporal``: a GpuDriveState carried across calls (pass 1b after each stat
         round; the state commits after round 1 — the CopyResource in the C++), or a GpuPanelDriveState (mode 3: pass 1c
         once before round 0 with ``refreshes`` = the panel refreshes elapsed since the previous frame was first shown;
         both rounds read the same maps; the commit stores round 1's instantaneous drives as the next frame's target).
         ``star``: starfield balancing settings
         (None = the option off: no star pass runs and nothing below changes) — the zone fields come from the SOURCE
-        frame and every later step works on Balance(source)."""
+        frame and every later step works on Balance(source). ``glow``: glow fill settings (None = the option off: no
+        glow pass runs and nothing below changes)."""
+        gp = clamp_glow(glow) if glow is not None else None
         img = self.panel_nits(frame_scrgb)
         star_out = None
         if star is not None:
@@ -661,6 +736,10 @@ class Emu:
         _, gB0 = self.gain(bT0, bE0)
         sT, sE, g = self.sampled(bT0, bE0, gB0)
         cor0, _ = self.correct(img, sT, sE, g)
+        glow0 = None
+        if gp is not None:                                            # round 0's fill: the round-1 statistic sees it
+            glow0 = self.glow_zones(bT0, gp)
+            cor0, _ = self.glow_add(cor0, sT, sE, glow0["dz"], gp)
         d1, st1 = self.stat_drive(cor0)
         boost1, zones1, active1 = self.frame_boost(cor0)              # round 1: the corrected frame the panel receives
         dT1, dE1 = temporal.pair(d1) if temporal is not None else (d1, d1)
@@ -668,6 +747,13 @@ class Emu:
         graw1, gB1 = self.gain(bT1, bE1)
         sT, sE, g = self.sampled(bT1, bE1, gB1)
         req, wfade = self.correct(img, sT, sE, g)
+        glow_out = None
+        if gp is not None:                                            # round 1's fill: part of the output
+            glow_out = self.glow_zones(bT1, gp)
+            glow_out["r0"] = glow0
+            glow_out["req_nofill"] = req
+            req, glow_out["add"] = self.glow_add(req, sT, sE, glow_out["dz"], gp)
+            glow_out["params"] = gp
         if temporal is not None:
             temporal.commit(d1)
         if fp16_out:
@@ -686,4 +772,7 @@ class Emu:
                 "zones0": zones0, "zones1": zones1, "active0": active0, "active1": active1,
                 # starfield balancing: None when off; else the source image ("img" above is then the BALANCED one), the
                 # star statistic / plan zone fields (fald_star_stat / _bg / _w / _plan / _plan2.f32) and the per-pixel scale
-                "star": star_out}
+                "star": star_out,
+                # glow fill: None when off; else round 1's zone fields (fald_glow_vz / _env.f32: vz, [ez, dz]), the
+                # request luminance added per pixel ("add") and round 0's zone fields ("r0")
+                "glow": glow_out}
