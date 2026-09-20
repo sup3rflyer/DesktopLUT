@@ -282,7 +282,9 @@ def test_hlsl_boost_passes_mirror_the_reference():
     # stat pass: counts on the frame the panel receives (after Correct in round 1), raw max channel, strict '>'
     assert stat.index("img = Correct(img, bT, bE, g);") < stat.index("if (mc > boostLitNits) lit++;")
     assert "float mc = max(img.r, max(img.g, img.b));" in stat and "if (mc > boostDimNits) dim++;" in stat
-    assert "activeOut[uint2(cx, cy)] = (litF > boostLitFrac || dimF > boostDimFrac) ? 1.0f : 0.0f;" in stat
+    # the second criterion is the file's zone rule since C12b (tests/test_fald_zone_rule.py): rule 0 = DIM, as before
+    assert "bool second = (boostRule == 1u) ? (gPow[0] / (float)n >= boostMeanThresh) : (dimF > boostDimFrac);" in stat
+    assert "activeOut[uint2(cx, cy)] = (litF > boostLitFrac || second) ? 1.0f : 0.0f;" in stat
     assert "if (px >= frameW || py >= frameH) continue;" in stat
     assert stat.count("if (boostN != 0u)") == 2                     # no LUT: neither counted nor written
     # boost pass: count -> last step whose first count is <= N, 1 below the first
@@ -296,7 +298,7 @@ def test_hlsl_boost_passes_mirror_the_reference():
     # C++: the CB size, the file constants, the boost-free flat-lattice pass
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 288" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 72 words since C13 (panel clock)
+    assert "FALD_CB_BYTES = 304" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 76 words since C12b (zone rule)
     assert "0x464C4434u" in c and "magic == FALD_MAGIC4 ? 416" in c
     assert "FillCB(r, 0, 0, false);" in c and "RunConv(r, r->driveSRV, r->driveSRV, nullptr);" in c
     assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in c     # panelfile.boost_zone_threshold's twin

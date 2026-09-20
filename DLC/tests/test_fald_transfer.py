@@ -83,10 +83,12 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "transfer == 1u" in panel and "pow(" in panel and "sdrGamma" in panel and "80.0f" in panel
     # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43); the temporal drive state fills 44-47,
     # the black-frame LED boost word 34 (step count) and 48-51 (zone activation rule), starfield balancing word 35 (on)
-    # and 52-65 (its parameters), the panel clock (temporal mode 3, work guide C13) 66-71 — FALD_CB_BYTES 288 = 72 words
+    # and 52-65 (its parameters), the panel clock (temporal mode 3, work guide C13) 66-71, the boost's zone rule (C12b)
+    # 72-74 + one pad — FALD_CB_BYTES 304 = 76 words
     cb = re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", src, re.S).group(1)
     fields = re.findall(r"(?:uint|float) (\w+);", cb)
-    assert len(fields) == 72 and fields[31] == "transfer" and fields[43] == "sdrGamma"
+    assert len(fields) == 76 and fields[31] == "transfer" and fields[43] == "sdrGamma"
+    assert fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "_padB1"]
     assert fields[64:68] == ["starTargetSigma", "starKeepNits", "clkW0", "clkW1"]
     assert fields[68:72] == ["clkTrue0", "clkEst0", "clkTrue1", "clkEst1"]
     assert fields[44:48] == ["tempAlphaRise", "tempAlphaFall", "tempMode", "tempInit"]
@@ -255,7 +257,8 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
              "tminR": 36, "pedMode": 39, "sdrGamma": 43, "tempAlphaRise": 44, "tempInit": 47, "boostLitNits": 48,
              "boostDimFrac": 51, "starEven": 52, "starCapNits": 55, "starStrength": 56, "starPeakHi": 59, "starNbLo": 60,
              "starReach": 62, "starEvenReach": 63, "starTargetSigma": 64, "starKeepNits": 65, "clkW0": 66, "clkW1": 67,
-             "clkTrue0": 68, "clkEst0": 69, "clkTrue1": 70, "clkEst1": 71}
+             "clkTrue0": 68, "clkEst0": 69, "clkTrue1": 70, "clkEst1": 71, "boostRule": 72, "boostMeanGamma": 73,
+             "boostMeanThresh": 74}
     for shader, target in (("g_faldPixelSource", "ps_5_0"), ("g_faldStatSource", "cs_5_0"), ("g_faldStarStatSource", "cs_5_0"),
                            ("g_faldStarPlanSource", "cs_5_0"), ("g_faldConvSource", "cs_5_0"), ("g_faldPanelClockSource", "cs_5_0")):
         asm = _d3d_disassemble(part("g_faldCommonSource") + part(shader), target)

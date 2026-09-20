@@ -182,21 +182,31 @@ class FaldParams:
     # 10.3-11.0 %). Level-independent, instant, LED-side (the code-0 leak scales the same) and NOT part of the
     # panel's own estimate, so it multiplies B_true only. boost_lut = ((zone_fraction_lo, boost), ...) ascending, a
     # STEP function (the last entry with lo <= fraction applies); () = no boost (every fit before 2026-09-18).
-    # ZONE ACTIVATION (probe phase r9d, 2026-09-18 late; replaces the mean-of-nits^gamma rule of the first commit, which
-    # the same probe refuted: a 1-px 10-nit column and a 2-px 1-nit column through a zone DO activate it, while at
-    # 0.2 nits it takes 16 px of an 80-px zone (14 px does not) - no power-law mean satisfies both). Two criteria, OR:
-    #   LIT: the zone holds content above boost_lit_nits (probe pixrule: 0.3 nits no, 0.4 yes) on more than
-    #        boost_lit_frac of its pixels (a single 1x1-px dot at 10 / 100 / 923 nits counts; 0 = any raster pixel);
-    #   DIM: more than boost_dim_frac of its pixels (17.5 % no, 20 % yes -> 0.19) are above boost_dim_nits (a PQ10
-    #        code-16 field, 0.0054 nits, is black; code 32, 0.0216 nits, is not -> 0.011).
-    # Also consistent with: 2-px 0.2-nit lines (4.4 %) and a 10-px 0.2-nit sliver (12.5 %) inactive, an 11-px band of a
-    # 45-px zone (24 %) active, a 3-px 10-nit column active. Evaluated on the scale-5 raster: widths quantise to 5 px
-    # (a 16-px dim sliver renders as 3 of 16 = 18.75 % and is missed).
+    # ZONE ACTIVATION — which zones the firmware counts as non-black. Two criteria, OR; the first is common to both rules:
+    #   LIT: the zone holds content above boost_lit_nits (probe pixrule: a 2-px column at 0.3 nits no, at 0.4 yes) on more
+    #        than boost_lit_frac of its pixels (a single 1x1-px dot at 10 / 100 / 923 nits counts; 0 = any pixel);
+    #   boost_rule "dim" (legacy, C12 2026-09-18; every fit / table / FLD4 file without the key):
+    #        DIM: more than boost_dim_frac (0.19) of its pixels are above boost_dim_nits (0.011);
+    #   boost_rule "mean" (C12b 2026-09-20, LIT-or-MEAN): the zone mean of (brightest channel, as-if-white nits)
+    #        ^ boost_mean_gamma is >= boost_mean_thresh.
+    # History: a plain mean of nits^gamma (first C12 commit) was refuted by probe r9d (a 1-px 10-nit column activates a
+    # zone, a 14-px 0.2-nit one does not) -> LIT-or-DIM; the camera's seed frames (2026-09-20: a solid 57x32-px block
+    # at PQ code 37 does NOT count, a full zone at code 32 does) refuted the pixel-FRACTION form of DIM: it miscounts 4
+    # of the 64 meter + camera observations, its best refit 3. The refit (results/fald_inside_2026-09-18/
+    # zone_rule_refit/) leaves LIT-or-MEAN as the only robust form: no misfit, gamma 0.49-0.78 all fit, 0.62 has the
+    # widest margin (13 %); T is pinned +-7 % by the 14-px (no) / 16-px (yes) 0.2-nit slivers. Untested: 1-4-px features
+    # between 0.4 and 10 nits, and the channel combination (every probe was grey).
+    # Both rules are evaluated on the scale-5 raster here: widths quantise to 5 px (a 14- and a 16-px sliver both render
+    # as 15 px), so thin dim features near the threshold can land on the wrong side. The shader and its twin
+    # (gpuemu.Emu.stat_active) work at full resolution.
     boost_lut: tuple[tuple[float, float], ...] = ()
     boost_lit_nits: float = 0.35          # probe pixrule: a 2-px column at 0.3 nits does not count, at 0.4 it does
     boost_lit_frac: float = 0.0
-    boost_dim_nits: float = 0.011
+    boost_dim_nits: float = 0.011         # rule "dim" only
     boost_dim_frac: float = 0.19
+    boost_rule: str = "dim"               # "dim" = LIT-or-DIM (legacy) | "mean" = LIT-or-MEAN; travels with the boost table
+    boost_mean_gamma: float = 0.62        # rule "mean" only
+    boost_mean_thresh: float = 0.0693
     scale: int = 5
     sub: int = 8                          # per-cell backlight samples per axis (4 under-resolved the core)
 
@@ -543,13 +553,22 @@ class FaldModel:
         return self._flat
 
     def active_zone_fraction(self, img: np.ndarray) -> float:
-        """Fraction of the zones the firmware counts as NON-BLACK for the black-frame boost (the LIT-or-DIM rule of the
-        ``boost_lut`` field), on the reduced-resolution raster."""
+        """Fraction of the zones the firmware counts as NON-BLACK for the black-frame boost (``boost_rule``: LIT-or-DIM
+        or LIT-or-MEAN, see the ``boost_lut`` field), on the reduced-resolution raster."""
+        return float(self.active_zones(img).mean())
+
+    def active_zones(self, img: np.ndarray) -> np.ndarray:
+        """(rows, cols) bool: the zones :meth:`active_zone_fraction` counts."""
         p = self.p
         blocks = np.max(img, axis=0).reshape(p.rows, self.ch, p.cols, self.cw)
         lit = (blocks > p.boost_lit_nits).mean(axis=(1, 3)) > p.boost_lit_frac
-        dim = (blocks > p.boost_dim_nits).mean(axis=(1, 3)) > p.boost_dim_frac
-        return float((lit | dim).mean())
+        if p.boost_rule == "mean":
+            second = np.power(np.maximum(blocks, 0.0), p.boost_mean_gamma).mean(axis=(1, 3)) >= p.boost_mean_thresh
+        elif p.boost_rule == "dim":
+            second = (blocks > p.boost_dim_nits).mean(axis=(1, 3)) > p.boost_dim_frac
+        else:
+            raise ValueError(f"boost_rule must be 'dim' or 'mean', got {p.boost_rule!r}")
+        return lit | second
 
     def boost_of_fraction(self, frac: float) -> float:
         b = 1.0

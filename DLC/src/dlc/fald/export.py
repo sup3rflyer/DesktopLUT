@@ -47,7 +47,11 @@ fit, word 41 = sdr_gamma or 0), then 56 more (header = 104 words = 416 bytes):
   word 49  f: boost_lit_nits   word 50  f: boost_lit_frac   (a zone counts as NON-BLACK when more than lit_frac of
   word 51  f: boost_dim_nits   word 52  f: boost_dim_frac    its pixels exceed lit_nits — 0 = any pixel — OR more than
            dim_frac of them exceed dim_nits; as-if-white nits of the pixel's brightest channel)
-  words 53-55 reserved (0)
+  word 53  zone rule kind: 0 = LIT-or-DIM as above (every file before 2026-09-20: the word was reserved, zero),
+           1 = LIT-or-MEAN (work guide C12b, ``FaldParams.boost_rule`` "mean"): LIT as above OR the zone mean of
+           (brightest channel, as-if-white nits) ^ mean_gamma >= mean_thresh; words 51/52 are then unused
+  word 54  f: boost_mean_gamma   word 55  f: boost_mean_thresh   (kind 1 only, else ZERO; the loader refuses a kind
+           > 1 and, for kind 1, a gamma outside (0, 4] or a threshold that is not a finite number > 0)
   words 56-103  24 x (f: zone_fraction_lo, f: boost), the first n in use, the rest ZERO — a step function over the
            non-black zone fraction of the frame the panel receives: the last step with lo <= fraction applies, below
            the first step the boost is 1 (:meth:`FaldModel.boost_of_fraction`). The loader refuses a count > 24, lo
@@ -77,6 +81,7 @@ MAGIC = 0x464C4431
 MAGIC2 = 0x464C4432          # 'FLD2': 40-word header (pedestal colour multipliers + validated mode)
 MAGIC3 = 0x464C4433          # 'FLD3': 48-word header (+ signal transfer words 40/41; every "gamma" fit)
 MAGIC4 = 0x464C4434          # 'FLD4': 104-word header (+ the black-frame LED boost block; every fit with a boost_lut)
+BOOST_RULE_CODES = {"dim": 0, "mean": 1}   # FLD4 word 53 (FaldParams.boost_rule); src/fald.h FALD_BOOST_RULE_*
 BOOST_MAX_STEPS = 24         # src/fald.h FALD_BOOST_MAX_STEPS
 TRANSFER_CODES = {"pq": 0, "gamma": 1}
 PED_MODE_CODES = {"white": 0, "channel": 1}
@@ -114,8 +119,18 @@ def boost_block(p: FaldParams) -> bytes:
     act = [float(np.float32(x)) for x in (p.boost_lit_nits, p.boost_lit_frac, p.boost_dim_nits, p.boost_dim_frac)]
     if not (0.0 <= act[0] <= 10000.0 and 0.0 <= act[2] <= 10000.0 and 0.0 <= act[1] < 1.0 and 0.0 <= act[3] < 1.0):
         raise ValueError(f"boost activation rule {act!r} outside the loader's gate (nits 0..10000, fractions 0..<1)")
+    if p.boost_rule not in BOOST_RULE_CODES:
+        raise ValueError(f"boost_rule must be one of {tuple(BOOST_RULE_CODES)}, got {p.boost_rule!r}")
+    if p.boost_rule == "mean":
+        g, t = float(np.float32(p.boost_mean_gamma)), float(np.float32(p.boost_mean_thresh))
+        if not (0.0 < g <= 4.0) or not (t > 0.0 and np.isfinite(t)):
+            raise ValueError(f"boost mean rule (gamma {g!r}, thresh {t!r}) outside the loader's gate (gamma in (0, 4], "
+                             "thresh a finite number > 0)")
+        rule = struct.pack("<I2f", BOOST_RULE_CODES["mean"], g, t)
+    else:
+        rule = struct.pack("<3I", 0, 0, 0)               # legacy LIT-or-DIM: the file stays byte for byte what C12 wrote
     flat = [x for step in lut for x in step] + [0.0] * (2 * (BOOST_MAX_STEPS - len(lut)))
-    buf = struct.pack("<I", len(lut)) + struct.pack("<4f", *act) + struct.pack("<3I", 0, 0, 0) + struct.pack(f"<{2 * BOOST_MAX_STEPS}f", *flat)
+    buf = struct.pack("<I", len(lut)) + struct.pack("<4f", *act) + rule + struct.pack(f"<{2 * BOOST_MAX_STEPS}f", *flat)
     assert len(buf) == 56 * 4
     return buf
 
@@ -166,7 +181,7 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
             "transfer": p.transfer, "sdr_gamma": float(p.sdr_gamma) if v3 else None,
             # the black-frame LED boost (FaldParams.boost_lut) travels in the FLD4 block (work guide C12): a fit with a
             # LUT always exports it (or the export raises), so the shader runs the same boost-aware model as Python
-            "boost_lut_steps": len(p.boost_lut), "boost_in_file": v4}
+            "boost_lut_steps": len(p.boost_lut), "boost_in_file": v4, "boost_rule": p.boost_rule if v4 else None}
 
 
 def main(argv=None):

@@ -10,6 +10,7 @@ import numpy as np
 
 MAGIC1, MAGIC2, MAGIC3, MAGIC4 = 0x464C4431, 0x464C4432, 0x464C4433, 0x464C4434
 BOOST_MAX_STEPS = 24         # src/fald.h FALD_BOOST_MAX_STEPS
+BOOST_RULE_DIM, BOOST_RULE_MEAN = 0, 1   # FLD4 word 53 / CB word 72 (src/fald.h FALD_BOOST_RULE_*)
 f32 = np.float32
 
 
@@ -69,6 +70,7 @@ def read_panel_file(path) -> dict:
     o["transfer"], o["sdrGamma"], o["hasTransfer"] = 0, f32(0.0), False
     o["hasBoost"], o["boostN"], o["boostLut"] = False, 0, []
     o["boostLitNits"], o["boostLitFrac"], o["boostDimNits"], o["boostDimFrac"] = f32(0.35), f32(0.0), f32(0.011), f32(0.19)
+    o["boostRule"], o["boostMeanGamma"], o["boostMeanThresh"] = BOOST_RULE_DIM, f32(0.62), f32(0.0693)
     if fl[27] > 0 and fl[27] > fl[26]:
         o["fadeLo"], o["fadeHi"] = f32(fl[26]), f32(fl[27])
     else:
@@ -118,6 +120,13 @@ def read_panel_file(path) -> dict:
             lit_n, lit_f, dim_n, dim_f = (f32(fl[i]) for i in (49, 50, 51, 52))
             if not (0.0 <= lit_n <= 10000.0 and 0.0 <= dim_n <= 10000.0 and 0.0 <= lit_f < 1.0 and 0.0 <= dim_f < 1.0):
                 raise ValueError("implausible boost activation words")
+            rule = int(u[53])                          # 0 = LIT-or-DIM (reserved = zero before C12b), 1 = LIT-or-MEAN
+            if rule > BOOST_RULE_MEAN:
+                raise ValueError("unknown boost zone rule")
+            if rule == BOOST_RULE_MEAN:
+                mg, mt = f32(fl[54]), f32(fl[55])
+                if not (0.0 < mg <= 4.0) or not (mt > 0.0 and np.isfinite(mt)):
+                    raise ValueError("implausible boost mean-rule words")
             lut = []
             for i in range(n):
                 lo, val = f32(fl[56 + 2 * i]), f32(fl[57 + 2 * i])
@@ -126,7 +135,10 @@ def read_panel_file(path) -> dict:
                 lut.append((lo, val))
             o["hasBoost"], o["boostN"], o["boostLut"] = True, n, lut
             o["boostLitNits"], o["boostLitFrac"], o["boostDimNits"], o["boostDimFrac"] = lit_n, lit_f, dim_n, dim_f
-        o["reserved53_55"] = [int(x) for x in u[53:56]]
+            o["boostRule"] = rule
+            if rule == BOOST_RULE_MEAN:                # kind 0: words 54/55 are ignored (the defaults stay, unused)
+                o["boostMeanGamma"], o["boostMeanThresh"] = mg, mt
+        o["words53_55"] = [int(x) for x in u[53:56]]   # raw: zone rule kind, mean gamma, mean thresh (all zero = legacy)
     o["reserved31"] = int(u[31])
     if (o["cols"] == 0 or o["rows"] == 0 or o["sub"] == 0 or o["sub"] > 16 or o["cellW"] == 0 or o["cellH"] == 0
             or o["curveN"] < 16 or o["curveN"] > 16384 or o["white"] <= 0 or o["cols"] > 512 or o["rows"] > 512
@@ -160,5 +172,7 @@ def cb(o: dict, ped_mode_setting: int = 0) -> dict:
     c["chromaHiCB"] = o["lumFadeHi"] if o["chromaHi"] < 0 else o["chromaHi"]
     # black-frame LED boost: CB word 34 (step count, 0 = no term) and the t12 buffer ((first zone count, boost) pairs)
     c["boostNCB"] = o["boostN"] if o.get("hasBoost") else 0
+    # CB words 72-74 (the zone rule; read only when word 34 != 0)
+    c["boostRuleCB"], c["boostMeanGammaCB"], c["boostMeanThreshCB"] = o.get("boostRule", 0), o.get("boostMeanGamma", f32(0.62)), o.get("boostMeanThresh", f32(0.0693))
     c["boostLutCounts"] = [(f32(boost_zone_threshold(lo, o["cols"] * o["rows"])), val) for lo, val in o.get("boostLut", [])]
     return c

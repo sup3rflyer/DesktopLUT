@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 MERGE_TOL = 0.005          # boosts closer than this are the same firmware step (read repeatability ~0.1 %, drift ~0.3 %, level spread ~0.5 %)
+ZONE_RULES = ("dim", "mean")  # FaldParams.boost_rule: LIT-or-DIM (legacy) | LIT-or-MEAN (C12b); table key "zone_rule"
 UNITY_TOL = 0.003          # a step this close to 1 IS 1 (reference drift); keeps flat fields exactly boost-free
 
 
@@ -46,7 +47,9 @@ def build_boost_lut(points: Iterable[Sequence[float]], zones_total: int, merge_t
 def load_boost_table(path: Path | str, *, mode: str | None = None, zones_total: int | None = None,
                      merge_tol: float = MERGE_TOL) -> dict:
     """The FaldParams keywords of a ``boost_table.json`` — ``boost_lut`` plus the zone-activation statistic the table's
-    zone counts were made with (``boost_lit_*`` / ``boost_dim_*``, when the table names them). ``mode`` ("HDR" /
+    zone counts were made with (``boost_lit_*`` / ``boost_dim_*``, and the rule itself: ``zone_rule`` "dim" | "mean" ->
+    ``boost_rule``, ``mean_gamma`` / ``mean_thresh`` -> ``boost_mean_*`` — when the table names them; a table without
+    ``zone_rule`` is a legacy LIT-or-DIM one and leaves the FaldParams default). ``mode`` ("HDR" /
     "SDR") and ``zones_total`` of the run are CHECKED: the law was measured per panel AND per mode (SDR is unmeasured),
     and a fraction LUT of another lattice is meaningless. Raises ValueError on a mismatch."""
     d = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -58,6 +61,13 @@ def load_boost_table(path: Path | str, *, mode: str | None = None, zones_total: 
     for k in ("boost_lit_nits", "boost_lit_frac", "boost_dim_nits", "boost_dim_frac"):
         if d.get(k) is not None:
             kw[k] = float(d[k])
+    if d.get("zone_rule") is not None:
+        if d["zone_rule"] not in ZONE_RULES:
+            raise ValueError(f"boost table {path}: zone_rule {d['zone_rule']!r} is not one of {ZONE_RULES}")
+        kw["boost_rule"] = str(d["zone_rule"])
+    for src, dst in (("mean_gamma", "boost_mean_gamma"), ("mean_thresh", "boost_mean_thresh")):
+        if d.get(src) is not None:
+            kw[dst] = float(d[src])
     return kw
 
 

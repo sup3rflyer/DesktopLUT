@@ -11,7 +11,8 @@ White-pedestal mode only (pedMode 0).
 
 Black-frame LED boost (FLD4 panel files, work guide C12): the statistic pass also writes each zone's NON-BLACK flag
 (full-resolution pixel counts — the model's :meth:`FaldModel.active_zone_fraction` counts scale-5 raster pixels, so
-the two agree on lattice-aligned / >= 5-px content), pass 1a turns the count into the frame's boost
+the two agree on lattice-aligned / >= 5-px content; the file's zone rule, FLD4 word 53: LIT-or-DIM or, work guide C12b,
+LIT-or-MEAN with the zone's float32 sum of nits^gamma in the shader's thread / reduction order), pass 1a turns the count into the frame's boost
 (:func:`dlc.fald.panelfile.boost_of_count`), the conv pass multiplies B_true by it — per round, on the frame the
 panel receives (round 0 the source, round 1 the corrected frame), never filtered by the temporal state. A file
 without a LUT runs none of it.
@@ -279,6 +280,9 @@ class Emu:
         self.boostN = int(o.get("boostN", 0)) if o.get("hasBoost") else 0
         self.litNits, self.litFrac = f32(o.get("boostLitNits", 0.35)), f32(o.get("boostLitFrac", 0.0))
         self.dimNits, self.dimFrac = f32(o.get("boostDimNits", 0.011)), f32(o.get("boostDimFrac", 0.19))
+        # the zone rule (CB words 72-74, work guide C12b): 0 = LIT-or-DIM, 1 = LIT-or-MEAN
+        self.boostRule = int(o.get("boostRule", 0))
+        self.meanGamma, self.meanThresh = f32(o.get("boostMeanGamma", 0.62)), f32(o.get("boostMeanThresh", 0.0693))
         self.flatT = self.conv(np.ones((self.rows, self.cols)), o["kTrue"])
         self.flatE = self.conv(np.ones((self.rows, self.cols)), o["kEst"])
         # bilinear sample tables for pixel centres (SampleLevel, linear, clamp) — FineUV with the lattice origin removed
@@ -520,14 +524,34 @@ class Emu:
         stat = np.minimum(m, tot / f32(self.area0))
         return self.drive_of(stat), stat
 
-    # ---- CS stat, the boost part (u1): per zone, LIT-or-DIM on the pixel's brightest channel (NOT capped at white)
+    # ---- CS stat, the boost part (u1): per zone, LIT-or-DIM / LIT-or-MEAN on the pixel's brightest channel (NOT capped
+    # at white). Rule 1 sums pow(mc, gamma) over the pixels with mc > 0 in the shader's order: each of the 256 threads
+    # sweeps its pixels k = t, t + 256, ... (row-major k) into a float32 partial, then the 128 / 64 / ... / 1 reduction.
     def stat_active(self, img):
         mc = img.max(axis=0)[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw].astype(np.float32)
         blocks = mc.reshape(self.rows, self.ch, self.cols, self.cw)
         n = f32(self.cw * self.ch)
         lit_f = (blocks > self.litNits).sum(axis=(1, 3)).astype(np.float32) / n
+        if self.boostRule == 1:
+            return (lit_f > self.litFrac) | (self.zone_pow_sum(blocks) / n >= self.meanThresh)
         dim_f = (blocks > self.dimNits).sum(axis=(1, 3)).astype(np.float32) / n
         return (lit_f > self.litFrac) | (dim_f > self.dimFrac)
+
+    def zone_pow_sum(self, blocks):
+        """(rows, cols) float32: per zone the shader's sum of pow(mc, meanGamma) over its pixels with mc > 0."""
+        npx = self.cw * self.ch
+        v = blocks.transpose(0, 2, 1, 3).reshape(self.rows, self.cols, npx)
+        pos = v > 0
+        pw = np.where(pos, np.exp(self.meanGamma * np.log(np.where(pos, v, f32(1)), dtype=np.float32), dtype=np.float32), f32(0)).astype(np.float32)   # HLSL: exp(gamma * log(mc))
+        part = np.zeros((self.rows, self.cols, 256), dtype=np.float32)
+        for j in range(0, npx, 256):                       # thread t adds its pixel k = t + j, ascending j
+            seg = pw[:, :, j: j + 256]
+            part[:, :, : seg.shape[2]] += seg
+        stride = 128
+        while stride > 0:
+            part[:, :, :stride] += part[:, :, stride: 2 * stride]
+            stride >>= 1
+        return part[:, :, 0]
 
     # ---- CS boost (pass 1a): zone count -> staircase. (boost float32, count, flags); (None, -1, None) without a LUT
     def frame_boost(self, img):

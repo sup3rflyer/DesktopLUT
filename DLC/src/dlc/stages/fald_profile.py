@@ -1166,7 +1166,7 @@ def phase_fit(s: Session, result: StageResult) -> None:
             result.block("boost_table", str(exc))
             return
         s.st["fald"]["boost_table"] = str(Path(boost_table).resolve())
-        result.action(f"black-frame LED boost: {len(boost_kw['boost_lut'])} steps from {boost_table}")
+        result.action(f"black-frame LED boost: {len(boost_kw['boost_lut'])} steps (zone rule {boost_kw.get('boost_rule', 'dim')}) from {boost_table}")
     elif boost_table:
         s.st["fald"].pop("boost_table", None)
     result.metrics["boost_table"] = s.st["fald"].get("boost_table")
