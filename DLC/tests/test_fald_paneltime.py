@@ -60,3 +60,20 @@ def test_static_content_is_settled_from_the_first_frame():
         s, e = c.step(d)
         np.testing.assert_allclose(s, d)
         np.testing.assert_allclose(e, d)
+
+
+def test_drive_state_known_parity_equals_its_clock_and_unknown_is_the_mean():
+    from dlc.fald.paneltime import PanelDriveState
+    law = PanelTimeLaw(closure=0.75)
+    seq = [np.array([[0.2]])] * 3 + [np.array([[1.0]])] * 6
+    states = {p: PanelDriveState(law, p) for p in (0, 1, None)}
+    for d in seq:
+        f = {p: s.fields(d) for p, s in states.items()}
+        np.testing.assert_allclose(f[None][0], (f[0][0] + f[1][0]) / 2)
+        np.testing.assert_allclose(f[None][1], (f[0][1] + f[1][1]) / 2)
+        for s in states.values():
+            s.commit(d)
+    c = PanelClock(law, 1); s = PanelDriveState(law, 1)
+    for d in seq:
+        got = s.fields(d); s.commit(d); want = c.step(d)
+        np.testing.assert_allclose(got[0], want[0]); np.testing.assert_allclose(got[1], want[1])

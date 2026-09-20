@@ -90,3 +90,34 @@ def simulate(model: FaldModel, frames: Sequence[np.ndarray], law: PanelTimeLaw =
         y = lmax * b_true[None] * (t + p.tmin_vec()[:, None, None])
         out.append({"y": y, "b_true": b_true, "b_est": b_est, "s_true": s_true, "s_est": s_est, "t": t})
     return out
+
+
+class PanelDriveState:
+    """The correction-side twin of :class:`PanelClock` — a drop-in for :class:`dlc.fald.temporal.DriveState` in
+    :func:`dlc.fald.correct.correct_image` (``drive_filter=state.fields``) and :func:`dlc.fald.temporal.correct_sequence`.
+
+    ``parity`` 0 / 1: the tick parity is known (one clock, exact). ``None``: unknown — both clocks run and the kernels see
+    the MEAN of the two LED states and of the two compensation states. The backlight fields are linear in the drives, so
+    this costs no extra kernel pass, and the gain it yields is the arithmetic-mean stand-in for the geometric mean of the
+    two hypotheses' gains (B_est / mean(B_true) vs B_est / sqrt(B_true0 · B_true1): 6 % apart for a x2 step)."""
+
+    def __init__(self, law: PanelTimeLaw = PanelTimeLaw(), parity: Optional[int] = None):
+        self.law, self.parity = law, parity
+        self.clocks = [PanelClock(law, p) for p in ((0, 1) if parity is None else (int(parity),))]
+
+    @property
+    def active(self) -> bool:
+        return True
+
+    def fields(self, drives: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(drives for B_true, drives for B_est) of the frame being corrected. Causal: the states of this frame depend on
+        the frames already sent, never on ``drives`` — except the very first frame, which finds the panel settled on it."""
+        pk = [c.peek() for c in self.clocks]
+        if pk[0] is None:
+            d = np.asarray(drives, dtype=np.float64)
+            return d, d
+        return sum(p[0] for p in pk) / len(pk), sum(p[1] for p in pk) / len(pk)
+
+    def commit(self, drives: np.ndarray) -> np.ndarray:
+        """Advance by the frame that was actually sent (its instantaneous zone drives). Returns the mean LED state."""
+        return sum(c.step(drives)[0] for c in self.clocks) / len(self.clocks)
