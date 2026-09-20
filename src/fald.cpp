@@ -7,18 +7,26 @@
 #include <fstream>
 #include <iostream>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 
 static ID3D11ComputeShader* g_faldStatCS = nullptr;
 static ID3D11ComputeShader* g_faldConvCS = nullptr;
 static ID3D11ComputeShader* g_faldGainCS = nullptr;
 static ID3D11ComputeShader* g_faldBlurCS = nullptr;
-static ID3D11ComputeShader* g_faldTemporalCS = nullptr;   // pass 1b: per-cell drive state (temporal mode only)
+static ID3D11ComputeShader* g_faldTemporalCS = nullptr;   // pass 1b: per-cell drive state (temporal modes 1 / 2 only)
+static ID3D11ComputeShader* g_faldPanelClockCS = nullptr; // pass 1c: the two parity clocks' LED states (temporal mode 3 only)
 static ID3D11ComputeShader* g_faldBoostCS = nullptr;      // pass 1a: non-black zone count -> LED boost (boost LUT only)
 static ID3D11ComputeShader* g_faldStarStatCS = nullptr;   // starfield balancing S0: star statistic of the source frame
 static ID3D11ComputeShader* g_faldStarWeightCS = nullptr; // S1: tapered protection field + zone weights
 static ID3D11ComputeShader* g_faldStarPlanCS = nullptr;   // S2: target + the plan the pixels sample
+static ID3D11ComputeShader* g_faldGlowZoneCS = nullptr;   // glow fill G0: zone pedestal of this round's B_true
+static ID3D11ComputeShader* g_faldGlowDilateCS = nullptr; // G1: box maximum on the extended lattice
+static ID3D11ComputeShader* g_faldGlowErodeCS = nullptr;  // G2: box minimum = the closing
+static ID3D11ComputeShader* g_faldGlowEnvCS = nullptr;    // G3: blur under the closing + the zone deficit
+static ID3D11ComputeShader* g_faldGlowBandCS = nullptr;   // G4: the count-threshold band's zone scale (round 0, mean-rule files)
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
@@ -26,7 +34,9 @@ static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1' (32-word header)
 static const uint32_t FALD_MAGIC2 = 0x464C4432u;  // 'FLD2' (40-word header: + pedestal colour, DLC export.py)
 static const uint32_t FALD_MAGIC3 = 0x464C4433u;  // 'FLD3' (48-word header: + signal transfer words 40/41; SDR/ACM fits)
 static const uint32_t FALD_MAGIC4 = 0x464C4434u;  // 'FLD4' (104-word header: + black-frame LED boost block, words 48-103)
-static const size_t FALD_BOOST_WORD_COUNT = 48;   // FLD4 word 48: step count; 49-52: activation rule; 53-55 reserved
+static const size_t FALD_BOOST_WORD_COUNT = 48;   // FLD4 word 48: step count; 49-52: activation rule; 53: zone rule kind
+                                                  // (0 = LIT-or-DIM, 1 = LIT-or-MEAN); 54 / 55: mean gamma / threshold (kind 1)
+static const size_t FALD_BOOST_WORD_RULE = 53;
 static const size_t FALD_BOOST_WORD_LUT = 56;     // FLD4 words 56..103: 24 x (zone fraction lo, boost)
 
 static size_t FaldHeaderBytes(uint32_t magic) {
@@ -53,6 +63,111 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
     return (n < 1.0 ? 1u : (n > 100000.0 ? 100000u : (unsigned int)n)) + delay;
 }
 
+// Panel clock (temporal mode 3) helpers: DLC dlc/fald/paneltime.py clock_ticks / blend_factors / settle_refreshes and
+// dlc/fald/gpuemu.py clock_factors32 (the float32 twin); tests/test_fald.cpp.
+float FaldPanelClockClosure(float closure) {
+    if (closure != closure) return FALD_CLOCK_CLOSURE_DEFAULT;
+    return closure < FALD_CLOCK_CLOSURE_MIN ? FALD_CLOCK_CLOSURE_MIN : (closure > FALD_CLOCK_CLOSURE_MAX ? FALD_CLOCK_CLOSURE_MAX : closure);
+}
+int FaldPanelClockParity(int parity) { return (parity == 0 || parity == 1) ? parity : -1; }
+int FaldPanelClockParityFromText(const wchar_t* text) {
+    if (!text) return -1;
+    wchar_t* end = nullptr;
+    const long v = std::wcstol(text, &end, 10);
+    if (end == text) return -1;                                    // empty / no number: unknown, never "0"
+    while (*end == L' ' || *end == L'\t') end++;
+    if (*end != L'\0' || v < -1 || v > 1) return -1;               // trailing garbage / out of range
+    return (int)v;
+}
+void FaldPanelClockTicks(unsigned long long nA, unsigned int k, unsigned int parity, unsigned int& tTrue, unsigned int& tEst) {
+    if (k < 1u) k = 1u;
+    const unsigned long long p = parity & 1u;
+    const unsigned long long upTo = (nA + p) / 2ull;               // ticks at refreshes <= nA (up to a constant)
+    tTrue = (unsigned int)((nA + k + p) / 2ull - upTo);
+    tEst = (unsigned int)((nA + k - 1ull + p) / 2ull - upTo);
+}
+void FaldPanelClockFactors(unsigned long long nA, unsigned long long k, float closure, int parity, float factor[4], float weight[2]) {
+    const float q = 1.0f - FaldPanelClockClosure(closure);
+    auto blend = [q](unsigned int ticks) { float r = 1.0f; for (unsigned int i = 0; i < ticks; i++) r *= q; return 1.0f - r; };
+    for (unsigned int p = 0; p < 2u; p++) {
+        if (k > FALD_CLOCK_MAX_REFRESHES) { factor[2 * p] = 1.0f; factor[2 * p + 1] = 1.0f; continue; }   // a long pause: settled
+        unsigned int tTrue = 0, tEst = 0;
+        FaldPanelClockTicks(nA, (unsigned int)k, p, tTrue, tEst);
+        factor[2 * p] = blend(tTrue); factor[2 * p + 1] = blend(tEst);
+    }
+    const int par = FaldPanelClockParity(parity);
+    weight[0] = (par < 0) ? 0.5f : (par == 0 ? 1.0f : 0.0f);
+    weight[1] = (par < 0) ? 0.5f : (par == 1 ? 1.0f : 0.0f);
+}
+unsigned int FaldPanelClockSettleFrames(float closure) {
+    const double c = (double)FaldPanelClockClosure(closure);
+    double m = (c >= 1.0) ? 1.0 : std::ceil(std::log(0.0005) / std::log(1.0 - c) - 1e-9);
+    if (m < 1.0) m = 1.0;
+    const double n = 2.0 * m + 2.0;
+    return n > (double)FALD_CLOCK_SETTLE_MAX ? FALD_CLOCK_SETTLE_MAX : (unsigned int)n;
+}
+bool FaldPanelClockStep(FaldResources* r, long long nowQpc, long long qpcFreq, float closure, int parity, float refreshMs) {
+    closure = FaldPanelClockClosure(closure); parity = FaldPanelClockParity(parity);
+    if (closure != r->clkClosure || parity != r->clkParity || refreshMs != r->clkRefreshMs) r->stateValid = false;
+    r->clkClosure = closure; r->clkParity = parity; r->clkRefreshMs = refreshMs;
+    const double period = (double)refreshMs;
+    if (!(period > 0.0) || qpcFreq <= 0) r->stateValid = false;    // no usable clock: every run is a seeding run
+    if (r->stateValid && r->clkGridMs > 3.6e6) {
+        // keep the stored times small: move the origin forward by whole QPC ticks (nothing else changes)
+        const long long ticks = (long long)(std::floor(r->clkGridMs) * (double)qpcFreq / 1000.0);
+        r->clkOriginQpc += ticks;
+        r->clkGridMs -= (double)ticks * 1000.0 / (double)qpcFreq;
+    }
+    double x = 0.0;
+    if (r->stateValid) {
+        r->clkTimeMs = (double)(nowQpc - r->clkOriginQpc) * 1000.0 / (double)qpcFreq;
+        x = (r->clkTimeMs - r->clkGridMs) / period;
+        if (x < -2.0) r->stateValid = false;                       // time ran backwards: start over
+    }
+    if (!r->stateValid) {
+        r->clkOriginQpc = nowQpc; r->clkTimeMs = 0.0; r->clkGridMs = 0.0; r->clkResidual = 0.0; r->clkGain = 0.0;
+        r->clkLockRuns = 0; r->clkIndex = 0; r->clkElapsed = 0; r->clkSeeded = true;
+        r->stateValid = true;
+        FaldPanelClockFactors(0, 1, closure, parity, r->clkFactor, r->clkW);   // (weights for the dump; the pass does not run)
+        return true;
+    }
+    // the phase-locked grid (rules: fald.h above FALD_TEMPORAL_PANEL; DLC twin: dlc/fald/paneltime.py RefreshGrid)
+    double kf = std::floor(x + 0.5);
+    if (kf < 0.0) kf = 0.0;
+    const unsigned long long k = kf >= 9.0e18 ? 9000000000000000000ull : (unsigned long long)kf;
+    double res = x - kf;
+    res = res < -0.5 ? -0.5 : (res > 0.5 ? 0.5 : res);
+    if (r->clkLockRuns < 1000000u) r->clkLockRuns++;
+    double gain = 1.0 / ((double)r->clkLockRuns + 1.0);
+    if (gain < FALD_CLOCK_LOCK_GAIN) gain = FALD_CLOCK_LOCK_GAIN;
+    if (k > FALD_CLOCK_MAX_REFRESHES) r->clkLockRuns = 0;          // a long pause: the phase is stale, acquire it again
+    r->clkGridMs += (kf + gain * res) * period;
+    r->clkResidual = res; r->clkGain = gain;
+    const unsigned long long n = r->clkIndex + k;
+    if (n == 0ull) {
+        // still inside the seeding refresh: the later frame replaces the seed (the grid keeps locking meanwhile)
+        r->clkElapsed = 0; r->clkSeeded = true;
+        return true;
+    }
+    if (k > 0ull) FaldPanelClockFactors(r->clkIndex, k, closure, parity, r->clkFactor, r->clkW);   // k = 0: the previous
+    r->clkElapsed = k; r->clkIndex = n; r->clkSeeded = false;                                      // run's words stand
+    return false;
+}
+FaldClockPlan FaldPanelClockPlan(bool seeded, unsigned long long elapsed) {
+    FaldClockPlan plan;
+    plan.runPass = !seeded && elapsed >= 1ull;
+    plan.bindMaps = !seeded;
+    plan.seedStates = seeded;
+    plan.commitPrev = true;
+    return plan;
+}
+void FaldSettleAccount(FaldResources* r, bool rearm, unsigned int settle, bool perRefresh) {
+    if (rearm) r->settleLeft = settle;
+    else if (perRefresh) r->settleLeft -= (r->clkElapsed < (unsigned long long)r->settleLeft) ? (unsigned int)r->clkElapsed : r->settleLeft;
+    else if (r->settleLeft > 0) r->settleLeft--;
+    if (r->settleLeft > settle) r->settleLeft = settle;
+}
+
 // Starfield balancing settings: every field into its documented range (DLC StarfieldParams; the mock's validation
 // uses the same limits). NaN -> the default. The smoothstep pairs stay ordered (hi >= lo).
 void FaldStarfieldClamp(FaldStarfieldSettings& s) {
@@ -74,6 +189,29 @@ void FaldStarfieldClamp(FaldStarfieldSettings& s) {
     s.nbHi = clampF(s.nbHi, 0.0f, 1.0f, 0.30f);
     if (s.nbHi < s.nbLo) s.nbHi = s.nbLo;
 }
+
+// Glow fill settings: every field into its documented range (DLC GlowFillParams / glowfill.clamp_params; the mock's
+// validation uses the same limits). NaN -> the default.
+void FaldGlowClamp(FaldGlowSettings& s) {
+    auto clampF = [](float v, float lo, float hi, float dflt) { return (v != v) ? dflt : (v < lo ? lo : (v > hi ? hi : v)); };
+    s.strength = clampF(s.strength, 0.0f, 1.0f, 1.0f);
+    if (s.reach < FALD_GLOW_REACH_MIN) s.reach = FALD_GLOW_REACH_MIN;
+    if (s.reach > FALD_GLOW_REACH_MAX) s.reach = FALD_GLOW_REACH_MAX;
+    s.capNits = clampF(s.capNits, FALD_GLOW_CAP_MIN, FALD_GLOW_CAP_MAX, 0.05f);
+}
+
+// DLC glowfill.req_ceiling: the fill never lights a LED (drive floor) and never makes a zone LIT for the boost count.
+float FaldGlowReqCeil(const FaldPanelParams& p) {
+    float c = FALD_GLOW_REQ_FLOOR_FRAC * p.driveFloor;
+    if (p.hasBoost) { const float lit = FALD_GLOW_REQ_LIT_FRAC * p.boostLitNits; if (lit < c) c = lit; }
+    return c;
+}
+
+const char* const FALD_GLOW_SDR_NOTE = "glow fill is HDR only: the levels behind its request ceiling (drive floor, LIT level, count threshold) are HDR measurements";
+
+bool FaldGlowSupported(const FaldPanelParams& p) { return p.transfer == FALD_TRANSFER_PQ; }
+
+bool FaldGlowBandActive(const FaldPanelParams& p) { return p.hasBoost && p.boostRule == FALD_BOOST_RULE_MEAN; }
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
 
@@ -161,6 +299,17 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
                 !(litFrac >= 0.0f && litFrac < 1.0f) || !(dimFrac >= 0.0f && dimFrac < 1.0f)) {
                 err = "implausible boost activation words"; return false;
             }
+            // word 53: the zone rule (C12b). 0 = LIT-or-DIM — what every earlier FLD4 file says (the word was reserved,
+            // written zero): words 54 / 55 are then not read. 1 = LIT-or-MEAN with words 54 (gamma) / 55 (threshold).
+            const uint32_t rule = u[FALD_BOOST_WORD_RULE];
+            float meanGamma = out.boostMeanGamma, meanThresh = out.boostMeanThresh;        // the defaults (unused for rule 0)
+            if (rule > FALD_BOOST_RULE_MEAN) { err = "unknown boost zone rule word (expected 0 = LIT-or-DIM or 1 = LIT-or-MEAN)"; return false; }
+            if (rule == FALD_BOOST_RULE_MEAN) {
+                meanGamma = fl[FALD_BOOST_WORD_RULE + 1]; meanThresh = fl[FALD_BOOST_WORD_RULE + 2];
+                if (!(meanGamma > 0.0f && meanGamma <= 4.0f) || !(meanThresh > 0.0f && std::isfinite(meanThresh))) {
+                    err = "implausible boost mean-rule words (gamma in (0, 4], threshold a finite number > 0)"; return false;
+                }
+            }
             for (uint32_t i = 0; i < n; i++) {
                 const float lo = fl[FALD_BOOST_WORD_LUT + 2 * i], val = fl[FALD_BOOST_WORD_LUT + 2 * i + 1];
                 if (!(lo >= 0.0f && lo <= 1.0f) || (i > 0 && !(lo > out.boostLo[i - 1])) || !(val >= 0.5f && val <= 2.0f)) {
@@ -170,6 +319,7 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
             }
             out.boostN = n; out.hasBoost = true;
             out.boostLitNits = litNits; out.boostLitFrac = litFrac; out.boostDimNits = dimNits; out.boostDimFrac = dimFrac;
+            out.boostRule = rule; out.boostMeanGamma = meanGamma; out.boostMeanThresh = meanThresh;
         }
     }
     if (out.cols == 0 || out.rows == 0 || out.sub == 0 || out.sub > 16 || out.cellW == 0 || out.cellH == 0 ||
@@ -229,6 +379,21 @@ float FaldBoostOfCount(const FaldPanelParams& p, unsigned int activeZones) {
         b = p.boostVal[i];
     }
     return b;
+}
+
+bool FaldBoostZoneActive(const FaldPanelParams& p, const float* maxChannelNits, size_t n) {
+    if (!maxChannelNits || n == 0) return false;
+    size_t lit = 0, dim = 0;
+    float powSum = 0.0f;
+    for (size_t i = 0; i < n; i++) {
+        const float mc = maxChannelNits[i];
+        if (mc > p.boostLitNits) lit++;
+        if (mc > p.boostDimNits) dim++;
+        if (p.boostRule == FALD_BOOST_RULE_MEAN && mc > 0.0f) powSum += std::exp(p.boostMeanGamma * std::log(mc));   // as the HLSL
+    }
+    const float litF = (float)lit / (float)n, dimF = (float)dim / (float)n;
+    const bool second = (p.boostRule == FALD_BOOST_RULE_MEAN) ? (powSum / (float)n >= p.boostMeanThresh) : (dimF > p.boostDimFrac);
+    return litF > p.boostLitFrac || second;
 }
 
 bool FaldPanelFileTransfer(const std::wstring& path, uint32_t& transfer) {
@@ -302,6 +467,10 @@ bool InitFaldShaders() {
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldTemporalCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(temporal) failed" << std::endl; return false; }
+    if (!CompileOne(common + g_faldPanelClockSource, "FaldPanelClockCS", "cs_5_0", &b)) return false;
+    hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPanelClockCS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(panel clock) failed" << std::endl; return false; }
     if (!CompileOne(common + g_faldBoostSource, "FaldBoostCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldBoostCS);
     b->Release(); b = nullptr;
@@ -318,6 +487,18 @@ bool InitFaldShaders() {
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarPlanCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star plan) failed" << std::endl; return false; }
+    {
+        struct { const char* src; const char* name; ID3D11ComputeShader** cs; } glow[5] = {
+            { g_faldGlowZoneSource, "FaldGlowZoneCS", &g_faldGlowZoneCS }, { g_faldGlowDilateSource, "FaldGlowDilateCS", &g_faldGlowDilateCS },
+            { g_faldGlowErodeSource, "FaldGlowErodeCS", &g_faldGlowErodeCS }, { g_faldGlowEnvSource, "FaldGlowEnvCS", &g_faldGlowEnvCS },
+            { g_faldGlowBandSource, "FaldGlowBandCS", &g_faldGlowBandCS } };
+        for (auto& g : glow) {
+            if (!CompileOne(common + g.src, g.name, "cs_5_0", &b)) return false;
+            hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, g.cs);
+            b->Release(); b = nullptr;
+            if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(" << g.name << ") failed" << std::endl; return false; }
+        }
+    }
     if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
@@ -333,10 +514,16 @@ bool InitFaldShaders() {
 void ReleaseFaldShaders() {
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
+    if (g_faldGlowBandCS) { g_faldGlowBandCS->Release(); g_faldGlowBandCS = nullptr; }
+    if (g_faldGlowEnvCS) { g_faldGlowEnvCS->Release(); g_faldGlowEnvCS = nullptr; }
+    if (g_faldGlowErodeCS) { g_faldGlowErodeCS->Release(); g_faldGlowErodeCS = nullptr; }
+    if (g_faldGlowDilateCS) { g_faldGlowDilateCS->Release(); g_faldGlowDilateCS = nullptr; }
+    if (g_faldGlowZoneCS) { g_faldGlowZoneCS->Release(); g_faldGlowZoneCS = nullptr; }
     if (g_faldStarPlanCS) { g_faldStarPlanCS->Release(); g_faldStarPlanCS = nullptr; }
     if (g_faldStarWeightCS) { g_faldStarWeightCS->Release(); g_faldStarWeightCS = nullptr; }
     if (g_faldStarStatCS) { g_faldStarStatCS->Release(); g_faldStarStatCS = nullptr; }
     if (g_faldBoostCS) { g_faldBoostCS->Release(); g_faldBoostCS = nullptr; }
+    if (g_faldPanelClockCS) { g_faldPanelClockCS->Release(); g_faldPanelClockCS = nullptr; }
     if (g_faldTemporalCS) { g_faldTemporalCS->Release(); g_faldTemporalCS = nullptr; }
     if (g_faldBlurCS) { g_faldBlurCS->Release(); g_faldBlurCS = nullptr; }
     if (g_faldGainCS) { g_faldGainCS->Release(); g_faldGainCS = nullptr; }
@@ -345,8 +532,9 @@ void ReleaseFaldShaders() {
 }
 
 bool FaldShadersReady() {
-    return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldBoostCS &&
-           g_faldStarStatCS && g_faldStarWeightCS && g_faldStarPlanCS && g_faldPS && g_faldSampler;
+    return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldPanelClockCS && g_faldBoostCS &&
+           g_faldStarStatCS && g_faldStarWeightCS && g_faldStarPlanCS &&
+           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldPS && g_faldSampler;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -363,6 +551,27 @@ static void ReleaseStar(FaldResources* r) {
     SafeRelease(r->starPlan2SRV); SafeRelease(r->starPlan2UAV); SafeRelease(r->starPlan2Tex);
     r->starOn = false;
     r->starRetryCounter = 0;                 // option off / resources rebuilt: the next enable tries at once
+}
+
+// Glow fill textures: they exist only while the option is on (EnsureGlow / FaldRunPasses).
+static void ReleaseGlow(FaldResources* r) {
+    SafeRelease(r->glowVSRV); SafeRelease(r->glowVUAV); SafeRelease(r->glowVTex);
+    SafeRelease(r->glowDilSRV); SafeRelease(r->glowDilUAV); SafeRelease(r->glowDilTex);
+    SafeRelease(r->glowCSRV); SafeRelease(r->glowCUAV); SafeRelease(r->glowCTex);
+    SafeRelease(r->glowEnvSRV); SafeRelease(r->glowEnvUAV); SafeRelease(r->glowEnvTex);
+    SafeRelease(r->glowKSRV); SafeRelease(r->glowKUAV); SafeRelease(r->glowKTex);
+    r->glowOn = false;
+    r->glowBand = false;
+    r->glowRetryCounter = 0;                 // option off / resources rebuilt: the next enable tries at once
+}
+
+// Panel clock textures (temporal mode 3): they exist only while the mode is on (EnsureClock / FaldRunPasses).
+static void ReleaseClock(FaldResources* r) {
+    for (unsigned int i = 0; i < 2; i++) { SafeRelease(r->clkStateSRV[i]); SafeRelease(r->clkStateUAV[i]); SafeRelease(r->clkStateTex[i]); }
+    SafeRelease(r->clkPrevSRV); SafeRelease(r->clkPrevUAV); SafeRelease(r->clkPrevTex);
+    SafeRelease(r->clkEstSRV); SafeRelease(r->clkEstUAV); SafeRelease(r->clkEstTex);
+    r->clkRetryCounter = 0;                  // mode off / resources rebuilt: the next enable tries at once
+    r->clkElapsed = 0; r->clkIndex = 0; r->clkSeeded = false;
 }
 
 static void ReleaseAll(FaldResources* r) {
@@ -388,6 +597,8 @@ static void ReleaseAll(FaldResources* r) {
     }
     SafeRelease(r->boostLutSRV); SafeRelease(r->boostLutBuf);
     ReleaseStar(r);
+    ReleaseGlow(r);
+    ReleaseClock(r);
     SafeRelease(r->cb);
     r->valid = false;
 }
@@ -433,6 +644,55 @@ static bool EnsureStar(FaldResources* r) {
     if (!r->starFailLogged) {
         std::cerr << "[FALD] starfield balancing textures could not be created: the option stays off" << std::endl;
         r->starFailLogged = true;
+    }
+    return false;
+}
+
+// The five zone textures of the glow fill (created on the first frame the option is on): Vz, the dilation on the
+// lattice extended by FALD_GLOW_REACH_MAX on every side, the closing, (Ez, Dz, Cz, Vz) for the pixels, and the
+// count-threshold band's scale k.
+static bool EnsureGlow(FaldResources* r) {
+    if (r->glowVTex && r->glowDilTex && r->glowCTex && r->glowEnvTex && r->glowKTex) return true;
+    // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
+    if (r->glowRetryCounter != 0 && (r->glowRetryCounter++ % 300) != 0) return false;
+    ReleaseGlow(r);
+    const FaldPanelParams& p = r->params;
+    if (MakeRWTexture(p.cols, p.rows, &r->glowVTex, &r->glowVUAV, &r->glowVSRV) &&
+        MakeRWTexture(p.cols + 2 * FALD_GLOW_REACH_MAX, p.rows + 2 * FALD_GLOW_REACH_MAX, &r->glowDilTex, &r->glowDilUAV, &r->glowDilSRV) &&
+        MakeRWTexture(p.cols, p.rows, &r->glowCTex, &r->glowCUAV, &r->glowCSRV) &&
+        MakeRWTexture(p.cols, p.rows, &r->glowEnvTex, &r->glowEnvUAV, &r->glowEnvSRV, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+        MakeRWTexture(p.cols, p.rows, &r->glowKTex, &r->glowKUAV, &r->glowKSRV)) {
+        r->glowFailLogged = false;
+        return true;
+    }
+    ReleaseGlow(r);
+    r->glowRetryCounter = 1;
+    if (!r->glowFailLogged) {
+        std::cerr << "[FALD] glow fill textures could not be created: the option stays off" << std::endl;
+        r->glowFailLogged = true;
+    }
+    return false;
+}
+
+// The four cols x rows R32F textures of the panel clock (created on the first frame temporal mode 3 is on).
+static bool EnsureClock(FaldResources* r) {
+    if (r->clkStateTex[0] && r->clkStateTex[1] && r->clkPrevTex && r->clkEstTex) return true;
+    // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
+    if (r->clkRetryCounter != 0 && (r->clkRetryCounter++ % 300) != 0) return false;
+    ReleaseClock(r);
+    const FaldPanelParams& p = r->params;
+    if (MakeRWTexture(p.cols, p.rows, &r->clkStateTex[0], &r->clkStateUAV[0], &r->clkStateSRV[0]) &&
+        MakeRWTexture(p.cols, p.rows, &r->clkStateTex[1], &r->clkStateUAV[1], &r->clkStateSRV[1]) &&
+        MakeRWTexture(p.cols, p.rows, &r->clkPrevTex, &r->clkPrevUAV, &r->clkPrevSRV) &&
+        MakeRWTexture(p.cols, p.rows, &r->clkEstTex, &r->clkEstUAV, &r->clkEstSRV)) {
+        r->clkFailLogged = false;
+        return true;
+    }
+    ReleaseClock(r);
+    r->clkRetryCounter = 1;
+    if (!r->clkFailLogged) {
+        std::cerr << "[FALD] panel clock textures could not be created: temporal mode 3 runs as off" << std::endl;
+        r->clkFailLogged = true;
     }
     return false;
 }
@@ -529,7 +789,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
         if (!MakeFloatBuffer(lut, &r->boostLutBuf, &r->boostLutSRV)) { r->lastError = "boost LUT buffer"; return false; }
     }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 68 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 76 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
@@ -540,7 +800,8 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
               << (p.transfer == FALD_TRANSFER_GAMMA ? "gamma " + std::to_string(p.sdrGamma) : std::string("PQ"))
               << " (" << (ctx->isHDREnabled ? "HDR" : "ACM SDR") << "), kernels "
               << (2 * p.reachTrueC + 1) << "x" << (2 * p.reachTrueR + 1) << " / " << (2 * p.reachEstC + 1) << "x" << (2 * p.reachEstR + 1)
-              << ", black-frame boost " << (p.hasBoost ? std::to_string(p.boostN) + " steps" : std::string("none")) << std::endl;
+              << ", black-frame boost " << (p.hasBoost ? std::to_string(p.boostN) + " steps" +
+                     (p.boostRule == FALD_BOOST_RULE_MEAN ? " (zone rule LIT-or-MEAN)" : " (zone rule LIT-or-DIM)") : std::string("none")) << std::endl;
     return true;
 }
 
@@ -640,11 +901,21 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     f[52] = sc.even; f[53] = sc.lift; f[54] = sc.targetGain; f[55] = sc.capNits;
     f[56] = sc.strength; f[57] = sc.areaLo; f[58] = sc.areaHi; f[59] = sc.peakHi;
     f[60] = sc.nbLo; f[61] = sc.nbHi; u[62] = sc.reach; u[63] = sc.evenReach;
-    f[64] = sc.targetSigma; f[65] = sc.keepNits; f[66] = 0.0f; f[67] = 0.0f;        // words 64-65 + two pad words
+    f[64] = sc.targetSigma; f[65] = sc.keepNits;                                    // words 64-65
+    // panel clock (temporal mode 3; read by pass 1c only): the clocks' weights, then per clock the blends (words 66-71)
+    f[66] = r->clkW[0]; f[67] = r->clkW[1];
+    f[68] = r->clkFactor[0]; f[69] = r->clkFactor[1]; f[70] = r->clkFactor[2]; f[71] = r->clkFactor[3];
+    // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
+    u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
+    // glow fill (word 75 = on; words 76-79 read only when it is set / by the glow passes)
+    u[75] = r->glowOn ? 1u : 0u;
+    f[76] = r->glow.strength; f[77] = r->glow.capNits; u[78] = r->glow.reach; f[79] = FaldGlowReqCeil(p);
+    u[80] = r->glowBand ? 1u : 0u;                                                  // the count-threshold band (k in t24)
+    u[81] = 0u; u[82] = 0u; u[83] = 0u;
     g_context->Unmap(r->cb, 0);
 }
 
-static const UINT FALD_SRV_SLOTS = 20;   // t0..t19 (fald_shader.h)
+static const UINT FALD_SRV_SLOTS = 25;   // t0..t24 (fald_shader.h)
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
@@ -653,7 +924,10 @@ static void BindCommon(FaldResources* r, bool compute) {
                                                        r->starOn ? r->starPlanSRV : nullptr, // t15: the starfield plan (Balance)
                                                        nullptr, nullptr,                     // t16/t17: star passes only (RunStar)
                                                        r->starOn ? r->starPlan2SRV : nullptr, // t18: ln background, near, spk (Balance)
-                                                       nullptr };                            // t19: star pass S1 only (RunStar)
+                                                       nullptr,                              // t19: star pass S1 only (RunStar)
+                                                       nullptr, nullptr, nullptr,            // t20-t22: glow passes only (RunGlow)
+                                                       r->glowOn ? r->glowEnvSRV : nullptr,  // t23: the glow deficit (GlowAdd)
+                                                       r->glowBand ? r->glowKSRV : nullptr };  // t24: the band's zone scale (GlowAdd)
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
@@ -727,6 +1001,65 @@ static void RunStar(FaldResources* r) {
     UnbindCompute();
 }
 
+// Glow fill (option on only), after EACH round's conv pass: G0 zone pedestal of this round's B_true (t5, boost
+// included; t7 = the flat-lattice field) -> G1 box maximum on the extended lattice -> G2 box minimum (the closing) -> G3
+// blur + deficit. The statistic round 1 / the pixel pass then sample glowEnv (t23). Stateless: a pure function of the
+// round's fields. The passes bind only what they read (never BindCommon: that would bind glowEnv as an SRV while G3
+// writes it).
+static void RunGlow(FaldResources* r, uint32_t roundIdx) {
+    const FaldPanelParams& p = r->params;
+    FillCB(r, 0);
+    const UINT gz = (p.cols + 15) / 16, gzy = (p.rows + 15) / 16;
+    const UINT ge = (p.cols + 2 * FALD_GLOW_REACH_MAX + 15) / 16, gey = (p.rows + 2 * FALD_GLOW_REACH_MAX + 15) / 16;
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    // G0
+    g_context->CSSetShader(g_faldGlowZoneCS, nullptr, 0);
+    g_context->CSSetShaderResources(5, 1, &r->bTrueSRV);
+    g_context->CSSetShaderResources(7, 1, &r->flatTrueSRV);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->glowVUAV, nullptr);
+    g_context->Dispatch(gz, gzy, 1);
+    UnbindCompute();
+    // G1
+    g_context->CSSetShader(g_faldGlowDilateCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetShaderResources(20, 1, &r->glowVSRV);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->glowDilUAV, nullptr);
+    g_context->Dispatch(ge, gey, 1);
+    UnbindCompute();
+    // G2
+    g_context->CSSetShader(g_faldGlowErodeCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetShaderResources(21, 1, &r->glowDilSRV);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->glowCUAV, nullptr);
+    g_context->Dispatch(gz, gzy, 1);
+    UnbindCompute();
+    // G3
+    g_context->CSSetShader(g_faldGlowEnvCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetShaderResources(20, 1, &r->glowVSRV);
+    g_context->CSSetShaderResources(22, 1, &r->glowCSRV);
+    g_context->CSSetUnorderedAccessViews(0, 1, &r->glowEnvUAV, nullptr);
+    g_context->Dispatch(gz, gzy, 1);
+    UnbindCompute();
+    // G4 (band only, EVERY round): the zone scale k that keeps the fill off the firmware's count threshold — a
+    // full-resolution sweep like the statistic pass, on THIS round's corrected request (its fields + gain are what is
+    // bound). Round 1's k is exact for the frame that is sent; round 0's is not when the trust factor moves between the
+    // rounds (DLC glowfill.py item 7). k is unbound as an SRV while it is written (the pass calls GlowAddK with k = 1).
+    (void)roundIdx;
+    if (r->glowBand) {
+        g_context->CSSetShader(g_faldGlowBandCS, nullptr, 0);
+        BindCommon(r, true);
+        ID3D11ShaderResourceView* fields[2] = { r->bTrueSRV, r->bEstSRV };
+        g_context->CSSetShaderResources(5, 2, fields);
+        g_context->CSSetShaderResources(9, 1, &r->gainBSRV);
+        ID3D11ShaderResourceView* none = nullptr;
+        g_context->CSSetShaderResources(24, 1, &none);
+        g_context->CSSetUnorderedAccessViews(0, 1, &r->glowKUAV, nullptr);
+        g_context->Dispatch(p.cols, p.rows, 1);
+        UnbindCompute();
+    }
+}
+
 // Pass 1a (panel files with a boost LUT only): this round's zone flags -> count -> staircase -> boostTex[round].
 // Relies on the CB the statistic pass of the same round filled. Not run (and nothing bound) without a LUT: the
 // layer is then the boost-less one, dispatch for dispatch.
@@ -752,6 +1085,23 @@ static void RunTemporal(FaldResources* r, ID3D11ShaderResourceView* inDrive) {
     g_context->CSSetShaderResources(11, 1, &r->driveStateSRV);
     g_context->CSSetUnorderedAccessViews(0, 1, &r->driveFiltUAV, nullptr);
     g_context->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();
+}
+
+// Pass 1c (temporal mode 3, valid state only): the two parity clocks advance in place toward the previous frame's
+// round-1 drives (t4 = clkPrev) by the CB's blend factors; u0 / u1 receive the maps the kernels see in both rounds.
+// Binds only what it reads (like RunStar); the states' UAV slots are cleared here (UnbindCompute knows two).
+static void RunPanelClock(FaldResources* r) {
+    const FaldPanelParams& p = r->params;
+    FillCB(r, 0);
+    g_context->CSSetShader(g_faldPanelClockCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &r->cb);
+    g_context->CSSetShaderResources(4, 1, &r->clkPrevSRV);
+    ID3D11UnorderedAccessView* uavs[4] = { r->driveFiltUAV, r->clkEstUAV, r->clkStateUAV[0], r->clkStateUAV[1] };
+    g_context->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+    g_context->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    ID3D11UnorderedAccessView* nullUav[4] = {};
+    g_context->CSSetUnorderedAccessViews(0, 4, nullUav, nullptr);
     UnbindCompute();
 }
 
@@ -880,7 +1230,20 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     const FaldPanelParams& p = r->params;
     const FaldSettings& fs = ctx->isHDREnabled ? ctx->hdrColorCorrection.fald : ctx->sdrColorCorrection.fald;
     DumpTexture(r->driveTex, dir + L"fald_drive.f32", p.cols, p.rows, 4);
-    if (r->temporalMode != FALD_TEMPORAL_OFF) {
+    if (r->temporalMode == FALD_TEMPORAL_PANEL) {
+        // panel clock: not on a seeding run (that frame is the stateless layer and the textures hold nothing yet).
+        // filt / est = the maps both rounds' kernels saw; s0 / s1 = the parity clocks' LED states OF THIS FRAME (already
+        // advanced; k = 0: the previous run's, untouched); dprev = the target the pass read (the previous frame's round-1
+        // drives; dumped before the commit): s_p(before) is not kept, but filt = w0 s0 + w1 s1 checks offline, and
+        // consecutive dumps check a step (DLC tests/test_fald_paneltime_warp.py replays them against the reference)
+        if (!r->clkSeeded) {
+            DumpTexture(r->driveFiltTex, dir + L"fald_drive_filt.f32", p.cols, p.rows, 4);
+            DumpTexture(r->clkEstTex, dir + L"fald_clock_est.f32", p.cols, p.rows, 4);
+            DumpTexture(r->clkStateTex[0], dir + L"fald_clock_s0.f32", p.cols, p.rows, 4);
+            DumpTexture(r->clkStateTex[1], dir + L"fald_clock_s1.f32", p.cols, p.rows, 4);
+            DumpTexture(r->clkPrevTex, dir + L"fald_clock_dprev.f32", p.cols, p.rows, 4);
+        }
+    } else if (r->temporalMode != FALD_TEMPORAL_OFF) {
         DumpTexture(r->driveFiltTex, dir + L"fald_drive_filt.f32", p.cols, p.rows, 4);    // the drive the kernels saw (round 1)
         DumpTexture(r->driveStateTex, dir + L"fald_drive_state.f32", p.cols, p.rows, 4);  // the state the pass READ (dumped before
     }                                                                                    // the commit: filt = s + a (d - s) checks offline)
@@ -908,8 +1271,21 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         DumpTexture(r->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16); // ln background, near, speck-zone flag, w
         DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * cellW + lx, lit sum, a_eff
     }
+    // glow fill: round 1's zone fields (the ones the output used). vz = cols x rows float32; env = cols x rows x 4
+    // float32 [Ez, Dz, Cz, Vz]. dlc/fald/gpuemu.py Emu.glow_zones reproduces them from fald_btrue.f32.
+    if (r->glowOn) {
+        DumpTexture(r->glowVTex, dir + L"fald_glow_vz.f32", p.cols, p.rows, 4);
+        DumpTexture(r->glowEnvTex, dir + L"fald_glow_env.f32", p.cols, p.rows, 16);
+        if (r->glowBand) DumpTexture(r->glowKTex, dir + L"fald_glow_k.f32", p.cols, p.rows, 4);   // round 1's band scale
+    }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
+    char clockText[3][192];                  // full-precision clock numbers (the stream's 6 digits cannot check k offline)
+    snprintf(clockText[0], sizeof(clockText[0]), "%.4f\nclock_grid_ms %.6f\nclock_lock_residual %.6f\nclock_lock_gain %.6f",
+             r->clkTimeMs, r->clkGridMs, r->clkResidual, r->clkGain);
+    snprintf(clockText[1], sizeof(clockText[1]), "%.9g", (double)r->clkRefreshMs);
+    snprintf(clockText[2], sizeof(clockText[2]), "%.9g %.9g %.9g %.9g", (double)r->clkFactor[0], (double)r->clkFactor[1],
+             (double)r->clkFactor[2], (double)r->clkFactor[3]);
     std::ofstream meta(dir + L"fald_dump.txt");
     meta << "width " << r->width << "\nheight " << r->height << "\ncols " << p.cols << "\nrows " << p.rows
          << "\nsub " << p.sub << "\nframe_format " << (bpp == 8 ? "R16G16B16A16_FLOAT scRGB linear (1.0 = 80 nits)" : "R10G10B10A2_UNORM")
@@ -919,13 +1295,24 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\nped_mode " << (((r->pedMode == 1) && p.hasPedColour) ? "channel" : "white")
          << "\nped_rgb " << p.pedRGB[0] << " " << p.pedRGB[1] << " " << p.pedRGB[2] << (p.hasPedColour ? " (FLD2)" : " (FLD1, white)")
          << "\nped_chroma_gain " << p.chromaGain << " fade " << ((p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo) << " " << ((p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi)
-         << "\ntemporal_mode " << r->temporalMode << " (0 off, 1 both fields, 2 B_true only)"
+         << "\ntemporal_mode " << r->temporalMode << " (0 off, 1 both fields, 2 B_true only, 3 panel clock)"
          << "\ntau_rise_ms " << fs.tauRiseMs << "\ntau_fall_ms " << fs.tauFallMs << "\ndelay_frames " << r->delayFrames << " (ring " << r->delayCount << ")"
          << "\ntemp_alpha_rise " << r->tempAlphaRise << "\ntemp_alpha_fall " << r->tempAlphaFall << "\ndt_ms " << r->dtMs
          << "\nstate_valid " << (r->stateValid ? 1 : 0)
+         << "\nclock_closure " << r->clkClosure << "\nclock_parity " << r->clkParity << " (-1 unknown: the mean of both clocks)"
+         << "\nclock_seed " << (r->clkSeeded ? 1 : 0) << " (1 = this run (re-)seeded the clocks: the stateless layer, no clock files)"
+         << "\nclock_time_ms " << clockText[0] << "\nclock_refresh_ms " << clockText[1]
+         << " (time / grid: ms since the seeding run; grid = the centre of this run's refresh on the phase-locked grid AFTER the"
+         << " update, residual in periods)\nclock_refresh_index " << r->clkIndex << "\nclock_elapsed_refreshes " << r->clkElapsed
+         << " (k = round((time - the previous run's grid) / period); 0 = the same refresh: the previous run's maps were held; > " << FALD_CLOCK_MAX_REFRESHES
+         << ": factors exactly 1)\nclock_factors " << clockText[2] << " (true0 est0 true1 est1)\nclock_weights " << r->clkW[0] << " " << r->clkW[1]
+         << " (mode 3 files: fald_drive_filt.f32 / fald_clock_est.f32 = the maps the kernels saw, fald_clock_s0.f32 / _s1.f32 ="
+         << " the clocks' LED states of this frame, fald_clock_dprev.f32 = the previous frame's round-1 drives)"
          << "\nboost_in_file " << (p.hasBoost ? 1 : 0) << "\nboost_steps " << p.boostN << "\nzones_total " << (p.cols * p.rows)
          << "\nboost_lit_nits " << p.boostLitNits << "\nboost_lit_frac " << p.boostLitFrac
          << "\nboost_dim_nits " << p.boostDimNits << "\nboost_dim_frac " << p.boostDimFrac
+         << "\nboost_rule " << p.boostRule << " (0 = LIT-or-DIM, 1 = LIT-or-MEAN)\nboost_mean_gamma " << p.boostMeanGamma
+         << "\nboost_mean_thresh " << p.boostMeanThresh
          << "\nactive_zones_r0 " << (int)boostR[0][1] << "\nboost_r0 " << boostR[0][0]
          << " (round 0: the source frame)\nactive_zones_r1 " << (int)boostR[1][1] << "\nboost_r1 " << boostR[1][0]
          << " (round 1: the corrected frame; this boost is in fald_btrue.f32; files fald_active_r0.f32 / fald_active.f32)"
@@ -940,6 +1327,13 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " even_reach " << r->star.evenReach << " cap_nits " << r->star.capNits << " strength " << r->star.strength
          << "\nstarfield area_lo " << r->star.areaLo << " area_hi " << r->star.areaHi << " peak_hi " << r->star.peakHi
          << " reach " << r->star.reach << " nb_lo " << r->star.nbLo << " nb_hi " << r->star.nbHi
+         << "\nglowfill " << (r->glowOn ? 1 : 0) << " (setting " << (fs.glow.enabled ? 1 : 0)
+         << "; 1 = GlowAdd after Correct in the round-1 statistic and the pixel pass; files fald_glow_vz.f32 [Vz], fald_glow_env.f32"
+         << " [Ez, Dz, Cz, Vz]: cols x rows float32, round 1)"
+         << "\nglowfill strength " << r->glow.strength << " reach " << r->glow.reach << " cap_nits " << r->glow.capNits
+         << " req_ceil " << FaldGlowReqCeil(p) << " band " << (r->glowBand ? 1 : 0)
+         << " (band 1 = the count-threshold band: fald_glow_k.f32 = the zones' scale k of round 1; needs a boost LUT + the mean zone rule)"
+         << ((fs.glow.enabled && !FaldGlowSupported(p)) ? "\nglowfill refused: " : "") << ((fs.glow.enabled && !FaldGlowSupported(p)) ? FALD_GLOW_SDR_NOTE : "")
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -978,14 +1372,27 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
         if (st.enabled) r->starOn = EnsureStar(r);
         else if (r->starStatTex || r->starWTex || r->starPlanTex || r->starBgTex || r->starPlan2Tex || r->starOn) ReleaseStar(r);
     }
+    // Glow fill (work guide S2): on = the four zone textures exist; off = they are released and nothing below knows the
+    // option exists (CB word 75 = 0, t23 unbound). The clamped settings always go into the CB (a dump reports them).
+    {
+        FaldGlowSettings gs = fs.glow;
+        FaldGlowClamp(gs);
+        r->glow.strength = gs.strength; r->glow.capNits = gs.capNits; r->glow.reach = gs.reach;
+        // HDR (PQ panel files) only — FaldGlowSupported: a gamma-transfer file never runs the fill, whatever the switch says
+        if (gs.enabled && FaldGlowSupported(r->params)) r->glowOn = EnsureGlow(r);
+        else if (r->glowVTex || r->glowDilTex || r->glowCTex || r->glowEnvTex || r->glowKTex || r->glowOn) ReleaseGlow(r);
+        r->glowBand = r->glowOn && FaldGlowBandActive(r->params);
+    }
 
     // Temporal drive state (pass 1b; DLC dlc/fald/temporal.py). dt = the interval between consecutive runs while
     // rendering continuously (EMA over 2..100 ms intervals; a long static gap keeps the last estimate — the response
     // starts at the new frame, however long the desktop stood still). A mode change forgets the state.
     bool resumed = false;                  // first run after a gap (see the settle hold below)
+    long long runQpc = 0, runQpcFreq = 0;  // this run's time (the panel clock's absolute refresh index)
     {
         LARGE_INTEGER now, freq;
         QueryPerformanceCounter(&now); QueryPerformanceFrequency(&freq);
+        runQpc = now.QuadPart; runQpcFreq = freq.QuadPart;
         if (r->lastRunQpc != 0 && freq.QuadPart > 0) {
             float iv = (float)((double)(now.QuadPart - r->lastRunQpc) * 1000.0 / (double)freq.QuadPart);
             if (iv >= 2.0f && iv <= 100.0f) r->dtMs = 0.9f * r->dtMs + 0.1f * iv;
@@ -993,11 +1400,15 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
         }
         r->lastRunQpc = now.QuadPart;
     }
-    const unsigned int mode = (fs.temporalMode <= FALD_TEMPORAL_TRUE_ONLY) ? fs.temporalMode : FALD_TEMPORAL_OFF;
+    unsigned int mode = (fs.temporalMode <= FALD_TEMPORAL_PANEL) ? fs.temporalMode : FALD_TEMPORAL_OFF;
+    // panel clock (mode 3, work guide C13): its textures exist only while the mode is on; a failed creation runs as off
+    if (mode == FALD_TEMPORAL_PANEL) { if (!EnsureClock(r)) mode = FALD_TEMPORAL_OFF; }
+    else if (r->clkStateTex[0] || r->clkStateTex[1] || r->clkPrevTex || r->clkEstTex) ReleaseClock(r);
     if (mode != r->temporalMode) { r->temporalMode = mode; r->stateValid = false; r->settleLeft = 0; r->delayCount = 0; }
     const unsigned int delay = fs.delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : fs.delayFrames;
     if (delay != r->delayFrames) { r->delayFrames = delay; r->delayCount = 0; }   // a changed depth restarts the ring
-    const bool temporal = (mode != FALD_TEMPORAL_OFF);
+    const bool panel = (mode == FALD_TEMPORAL_PANEL);
+    const bool temporal = (mode != FALD_TEMPORAL_OFF) && !panel;   // the first-order filter (pass 1b, modes 1 / 2)
     // the map the panel's pipeline is fed this frame: the ring entry `delay` frames back once the ring holds that many
     // (DriveState.delayed), else the instantaneous drive. Both rounds are fed the same map.
     ID3D11ShaderResourceView* inDrive = r->driveSRV;
@@ -1009,6 +1420,19 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     ID3D11ShaderResourceView* estDrive = r->driveSRV;    // what the estimate kernel sees
     if (mode == FALD_TEMPORAL_BOTH) { trueDrive = r->driveFiltSRV; estDrive = r->driveFiltSRV; }
     else if (mode == FALD_TEMPORAL_TRUE_ONLY) { trueDrive = r->driveFiltSRV; }
+    // Panel clock (rules: fald.h above FALD_TEMPORAL_PANEL; bookkeeping: FaldPanelClockStep): k = the panel refreshes
+    // elapsed since the previous run, from this run's time on a refresh grid phase-locked to the runs, with the monitor's
+    // CURRENT nominal period (capture.cpp re-reads it when the duplication is re-created, i.e. on every mode change). k >= 1: the clocks advance toward
+    // the previous frame's drives and BOTH rounds read the two resulting maps. k = 0 (a second run inside one refresh of
+    // THIS monitor — a faster display elsewhere on the desktop can make the render loop run that often): the previous
+    // run's maps are read again, nothing advances. A seeding run (no state: first frame, layer was off, a setting /
+    // refresh-period change, a rebuild) is the stateless layer, and its round-1 drives become both clocks' state below.
+    FaldClockPlan plan = { false, false, false, false };
+    if (panel) {
+        const bool seeded = FaldPanelClockStep(r, runQpc, runQpcFreq, fs.clockClosure, fs.clockParity, ctx->frameTimeExactMs);
+        plan = FaldPanelClockPlan(seeded, r->clkElapsed);
+        if (plan.bindMaps) { trueDrive = r->driveFiltSRV; estDrive = r->clkEstSRV; }
+    }
 
     // the main pass rendered into r->inter with finalRT unbound; make sure the RTV is off before
     // the intermediate is read as an SRV
@@ -1018,16 +1442,19 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     // black-frame LED boost (panel files with a LUT): each round's boost comes from the zone flags of the frame the
     // panel receives in that round, and is NOT filtered by the temporal state (instant on the panel)
     if (r->starOn) RunStar(r);             // the plan of THIS source frame; every pass below reads Balance(source)
+    if (plan.runPass) RunPanelClock(r);    // mode 3: the state of this frame comes from PAST frames only (PanelDriveState.fields)
     RunStat(r, 0);
     RunBoost(r, 0);
     if (temporal) RunTemporal(r, inDrive); // both rounds read the SAME committed state (DriveState.peek)
     RunConv(r, trueDrive, estDrive, r->boostSRV[0]);
     RunGain(r);
+    if (r->glowOn) RunGlow(r, 0);          // round 0's fill: part of the frame the round-1 statistic / boost count see
     RunStat(r, 1);
     RunBoost(r, 1);
     if (temporal) RunTemporal(r, inDrive);
     RunConv(r, trueDrive, estDrive, r->boostSRV[1]);
     RunGain(r);
+    if (r->glowOn) RunGlow(r, 1);          // round 1's fill: part of the output
     r->framesRun++;
     const std::wstring dumpDir = TakeDumpRequest(ctx);
     if (!dumpDir.empty()) DumpFields(ctx, r, dumpDir);   // before the commit: the state file is the map the pass read
@@ -1040,6 +1467,13 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
             if (r->delayCount < FALD_DELAY_MAX) r->delayCount++;
         }
     }
+    if (panel) {                           // PanelDriveState.commit: round 1's INSTANTANEOUS map is the next frame's target
+        if (plan.seedStates) {             // (k = 0: it replaces the previous frame's — the later frame is the one shown);
+            g_context->CopyResource(r->clkStateTex[0], r->driveTex);   // a seeding run takes the panel as settled on this
+            g_context->CopyResource(r->clkStateTex[1], r->driveTex);   // frame (both clocks)
+        }
+        if (plan.commitPrev) g_context->CopyResource(r->clkPrevTex, r->driveTex);
+    }
 
     // pixel pass: inter + fields -> finalRT (fullscreen triangle; g_vs already bound by the caller)
     FillCB(r, 1);
@@ -1049,7 +1483,8 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     ID3D11ShaderResourceView* fields[2] = { r->bTrueSRV, r->bEstSRV };
     g_context->PSSetShaderResources(5, 2, fields);
     g_context->PSSetShaderResources(9, 1, &r->gainBSRV);
-    ID3D11ShaderResourceView* filt = temporal ? r->driveFiltSRV : r->driveSRV;   // debug view 7: instantaneous vs filtered
+    // debug view 7: instantaneous vs filtered (mode 3: vs the clocks' mean LED state of this frame)
+    ID3D11ShaderResourceView* filt = (temporal || plan.bindMaps) ? r->driveFiltSRV : r->driveSRV;
     g_context->PSSetShaderResources(4, 1, &r->driveSRV);
     g_context->PSSetShaderResources(10, 1, &filt);
     g_context->PSSetShaderResources(13, 1, &r->activeSRV[1]);                     // debug view 8 (nullptr without a boost LUT)
@@ -1063,11 +1498,12 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     // FaldSettlePending on an acquire timeout and re-runs the layer on its own intermediate). A resume after a gap
     // (> FALD_RESUME_GAP_MS since the last run: the desktop stood still past the hold, or the overlay was asleep) counts
     // as new content too — the first frame after it may carry a change the pass blends from the settled state.
-    if (temporal) {
-        const unsigned int settle = FaldSettleFrames(fs.tauRiseMs, fs.tauFallMs, r->dtMs, delay);
-        if (newContent || resumed) r->settleLeft = settle;
-        else if (r->settleLeft > 0) r->settleLeft--;
-        if (r->settleLeft > settle) r->settleLeft = settle;   // tau lowered mid-hold
+    // Mode 3 owes FaldPanelClockSettleFrames instead, counted in ELAPSED REFRESHES of this monitor (k), not in runs: the
+    // render loop may run faster than the panel refreshes (k = 0 runs pay nothing) or slower (one run pays k).
+    if (temporal || panel) {
+        const unsigned int settle = panel ? FaldPanelClockSettleFrames(r->clkClosure)
+                                          : FaldSettleFrames(fs.tauRiseMs, fs.tauFallMs, r->dtMs, delay);
+        FaldSettleAccount(r, newContent || resumed, settle, panel);   // (also: tau lowered mid-hold)
     } else {
         r->settleLeft = 0;
     }

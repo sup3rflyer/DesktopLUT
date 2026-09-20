@@ -23,6 +23,9 @@
 //                       per-zone statistics of the SOURCE frame -> tapered protection field + zone weights -> the
 //                       fields the pixels read. From here on every pass reads the BALANCED frame Balance(source)
 //                       (statistic rounds, boost flags, Correct, output); off = none of it
+//   CS panel clock (opt., temporal mode 3; rules in fald.h above FALD_TEMPORAL_PANEL): once per frame, from PAST frames
+//                       only — both parity clocks' LED states advance toward the previous frame's drives, the two maps
+//                       the kernels see in BOTH rounds are written; modes 1 / 2 run "CS temporal" below instead
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)
 //                       (+ the zone's NON-BLACK flag for the black-frame LED boost when the panel file has a boost LUT)
 //   CS boost (opt.)   : non-black zone count of the frame -> step LUT -> the frame's LED boost (2 x 1 texture)
@@ -33,7 +36,10 @@
 //   CS boost (opt.)   : the corrected frame's boost
 //   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
-//   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
+//   CS glow G0-G3 (opt., glow fill, work guide S2; rules in the header above g_faldGlowZoneSource): after EACH round's
+//                       conv pass — zone pedestal -> box maximum -> box minimum (= the closing) -> blur + deficit; the
+//                       round-1 statistic and the pixel pass add GlowAdd(...) to the corrected request; off = none of it
+//   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling) [+ fill]
 #pragma once
 
 inline const char* g_faldCommonSource = R"(
@@ -84,9 +90,33 @@ cbuffer FaldCB : register(b0) {
                                                                     // Hi; full protection within starReach zones (the taper
                                                                     // adds one); the local target looks starEvenReach zones
                                                                     // (tapered window)
-    float starTargetSigma; float starKeepNits; float _padS1; float _padS2; // the target sits starTargetSigma standard deviations
+    float starTargetSigma; float starKeepNits; float clkW0; float clkW1; // the target sits starTargetSigma standard deviations
                                                                     // of ln peak above the local mean (0 = the geometric mean;
-                                                                    // 0..4) and never below starKeepNits (as-if-white nits)
+                                                                    // 0..4) and never below starKeepNits (as-if-white nits);
+                                                                    // clkW0 / clkW1: panel clock (temporal mode 3, pass 1c
+                                                                    // only), the two parity clocks' weights (unknown parity
+                                                                    // 1/2 each, known parity 1 / 0)
+    float clkTrue0; float clkEst0; float clkTrue1; float clkEst1;   // panel clock: per parity clock the blend toward the
+                                                                    // previous frame's drives that gives its LED state of
+                                                                    // this frame's first refresh (True) and of the refresh
+                                                                    // before it, which the panel's compensation uses (Est):
+                                                                    // 1 - (1 - closure)^ticks (C++ FaldPanelClockFactors)
+    uint boostRule; float boostMeanGamma; float boostMeanThresh; uint glowOn; // the boost count's zone rule (work guide C12b; read
+                                                                    // only when boostN != 0): 0 = LIT-or-DIM as above, 1 =
+                                                                    // LIT-or-MEAN: LIT OR the zone mean of (brightest channel,
+                                                                    // as-if-white nits)^boostMeanGamma >= boostMeanThresh;
+                                                                    // glowOn: 1 = glow fill (GlowAdd after Correct, deficit
+                                                                    // in t23), 0 = the layer without it
+    float glowStrength; float glowCapNits; uint glowReach; float glowReqCeil; // glow fill (DLC dlc/fald/glowfill.py
+                                                                    // GlowFillParams; read only when glowOn != 0 / by the
+                                                                    // glow passes): share of the zone deficit that is filled,
+                                                                    // the fill's ceiling (as-if-white nits), the closing's
+                                                                    // box reach in zones (1..4), and the level a filled
+                                                                    // pixel's brightest channel never exceeds (C++
+                                                                    // FaldGlowReqCeil: below the drive floor / the LIT level)
+    uint glowBand; uint _padG1; uint _padG2; uint _padG3;           // glowBand: 1 = the count-threshold band is on (panel file
+                                                                    // with a boost LUT AND the mean zone rule): GlowAdd scales
+                                                                    // the want of a pixel by its OWN zone's k (t24)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -98,7 +128,7 @@ Texture2D<float>  bEstTex  : register(t6);
 Texture2D<float>  flatTrueTex : register(t7); // the same two fields for a fully driven lattice (normalisation)
 Texture2D<float>  flatEstTex  : register(t8);
 Texture2D<float>  gainTex     : register(t9); // smoothed gain on the fine grid (pass 2b)
-Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless tempMode 2);
+Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless tempMode 2 / 3);
                                                // pixel pass view 7: the filtered drive (driveTex = the instantaneous one)
 Texture2D<float>  stateTex    : register(t11); // temporal pass: the committed drive state of the previous frame
 Buffer<float>     boostLut    : register(t12); // [boostN][2]: (first non-black zone COUNT of the step, LED boost), ascending
@@ -114,6 +144,14 @@ Texture2D<float4> starPlan2Tex : register(t18); // S1 out: (ln background, near,
                                                 // bilinearly and loads .z of the pixel's OWN zone (nearest)
 Texture2D<float4> starBgTex    : register(t19); // S0 out: (ln background, the brightest pixel's index ly * cellW + lx inside
                                                 // the zone, lit sum, a_eff) — read by S1
+// Glow fill, R32F unless noted, texel centres = zone centres (rules: the glow-pass header below)
+Texture2D<float>  glowVTex   : register(t20); // G0 out: the zone pedestal Vz (cols x rows) — read by G1 and G3
+Texture2D<float>  glowDilTex : register(t21); // G1 out: box maximum; (cols + 2 MAX) x (rows + 2 MAX), zone z at texel z + MAX
+Texture2D<float>  glowCTex   : register(t22); // G2 out: the closing Cz (cols x rows) — read by G3
+Texture2D<float4> glowEnvTex : register(t23); // G3 out, RGBA32F: (Ez, Dz, Cz, Vz) — GlowAdd samples .y bilinearly (statistic
+                                              // round 1 + pixel pass); .zw = evidence for the dump
+Texture2D<float>  glowKTex   : register(t24); // G4 out (glowBand only, every round): the zone's count-threshold scale k —
+                                              // GlowAdd loads it for the pixel's OWN zone (nearest)
 SamplerState linearClamp : register(s0);
 )" /* MSVC caps ONE string literal at 16380 bytes (C2026); adjacent literals concatenate (limit 65535), so the common
       source is split here. Tools that read this header as text (DLC tests, the fxc checkers) drop the seam. */ R"(
@@ -353,12 +391,59 @@ float3 Correct(float3 img, float bTrue, float bEst, float gain) {
     }
     return max(u * ge, 0.0f);
 }
+)" /* the second seam of the common source (same 16380-byte cap) */ R"(
+// Glow fill (work guide S2; reference DLC dlc/fald/glowfill.py, GPU-order twin dlc/fald/gpuemu.py Emu.glow_zones /
+// glow_add; DLC tests/test_fald_transfer.py pins the constants equal). The rules: the header above g_faldGlowZoneSource.
+static const int FALD_GLOW_REACH_MAX = 4;               // fald.h FALD_GLOW_REACH_MAX: the dilation texture's margin
+static const float FALD_GLOW_SIGMA_BASE = 0.5f;         // blur sigma (zones) = BASE + PER_REACH * reach
+static const float FALD_GLOW_SIGMA_PER_REACH = 0.5f;
+static const float FALD_GLOW_DEFICIT_REL_LO = 0.05f;    // a dip this shallow (relative to the zone's own glow) is no hole ...
+static const float FALD_GLOW_DEFICIT_REL_HI = 0.15f;    // ... from here on it is filled in full
+static const float FALD_GLOW_WANT_EPS = 1e-5f;          // a wanted fill below this (as-if-white nits) touches no pixel
+static const float FALD_GLOW_VIEW_SCALE = 1000.0f;      // debug view 10: 0.1 nit of added request shows as 100 nits
+static const float FALD_GLOW_BAND_LO = 0.8f;            // the count-threshold band, x the mean rule's threshold: a zone whose
+static const float FALD_GLOW_BAND_HI = 1.25f;           // predicted statistic would land inside is scaled down to LO
+// round_fill for one pixel: req = the round's corrected request (as-if-white nits per channel), bTrue / bEst = the
+// fields Correct used, px = the frame pixel (inside the lattice). want = the zone deficit interpolated between zone
+// CENTRES (clamped hardware bilinear at FineUV, as the starfield plan) x strength, minus the dust threshold, capped.
+// shown = the LCD light the panel will show for the request itself; only what is missing is filled, x the correction's
+// own deep-dark trust in B_est (where the panel's estimate is ~0 a tiny request opens the LCD fully: NO fill there).
+// The request that displays it: x B_est / B_true (never above gainMax; never raised by the lower gain clip), in the
+// pedestal's colour (tminRGB / tmin: luminance-neutral), limited so the brightest channel stays at / below glowReqCeil.
+// A pixel nothing is added to is returned untouched (bit-identical). k = the count-threshold band's scale of the pixel's
+// own zone (pass G4; 1 = none), applied to the want AFTER the cap.
+float3 GlowAddK(float3 req, float bTrue, float bEst, float2 px, float k) {
+    float want = min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits) * k;
+    if (!(want > 0.0f)) return req;
+    bTrue = max(bTrue, 0.0f);
+    float r = max(req.r, max(req.g, req.b));
+    float shown = r * bTrue / max(bEst, 1e-9f);
+    float fill = max(want - shown, 0.0f) * smoothstep(fadeLo, fadeHi, bEst);
+    float add = fill * min(bEst / max(bTrue, 1e-9f), gainMax);
+    float3 m = float3(tminR, tminG, tminB) / max(tmin, 1e-30f);
+    float room = max(glowReqCeil - r, 0.0f);
+    add *= min(1.0f, room / max(add * max(m.r, max(m.g, m.b)), 1e-30f));
+    if (!(add > 0.0f)) return req;
+    return req + add * m;
+}
+// What the statistic round 1 and the pixel pass call: k of the pixel's OWN zone (a nearest Load — NOT interpolated: only
+// then does the zone's predicted statistic scale exactly as the band pass assumes), 1 without the band.
+float3 GlowAdd(float3 req, float bTrue, float bEst, int2 px) {
+    float k = 1.0f;
+    if (glowBand != 0u) {
+        uint2 zone = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);
+        k = glowKTex.Load(int3((int2)zone, 0));
+    }
+    return GlowAddK(req, bTrue, bEst, float2(px), k);
+}
 )";
 
 // Pass 1: per-cell area statistic -> drive. One thread group per cell, 256 threads sweep the block.
 // With a boost LUT (boostN != 0) the same sweep counts the zone's pixels above boostLitNits / boostDimNits and writes
 // the zone's NON-BLACK flag (u1) — on the frame the PANEL receives: the source in round 0, the corrected frame in
-// round 1 (DLC correct_image re-reads the boost from each round's request).
+// round 1 (DLC correct_image re-reads the boost from each round's request). boostRule 1 (LIT-or-MEAN, C12b) also sums
+// nits^boostMeanGamma over the zone's pixels (exp(gamma * log) under mc > 0: no pow(0) / negative / NaN case) and
+// replaces the DIM test by mean >= boostMeanThresh; rule 0 computes exactly what it did before the rule existed.
 inline const char* g_faldStatSource = R"(
 RWTexture2D<float> driveOut : register(u0);
 RWTexture2D<float> activeOut : register(u1);
@@ -366,6 +451,7 @@ groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared uint gLit[256];
 groupshared uint gDim[256];
+groupshared float gPow[256];
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
@@ -373,6 +459,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint n = cellW * cellH;
     float m = 0.0f, sum = 0.0f;
     uint lit = 0, dim = 0;
+    float powSum = 0.0f;
     for (uint k = tid.x; k < n; k += 256) {
         uint px = originX + cx * cellW + (k % cellW);
         uint py = originY + cy * cellH + (k / cellW);
@@ -383,6 +470,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
             float g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
             img = Correct(img, bT, bE, g);
+            if (glowOn != 0u) img = GlowAdd(img, bT, bE, int2((int)px, (int)py));   // the frame the panel receives (S2)
         }
         float mc = max(img.r, max(img.g, img.b));
         float s = min(mc, white);
@@ -390,10 +478,12 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (boostN != 0u) {
             if (mc > boostLitNits) lit++;
             if (mc > boostDimNits) dim++;
+            if (boostRule == 1u && mc > 0.0f) powSum += exp(boostMeanGamma * log(mc));
         }
     }
     gMax[tid.x] = m; gSum[tid.x] = sum;
     gLit[tid.x] = lit; gDim[tid.x] = dim;
+    gPow[tid.x] = powSum;
     GroupMemoryBarrierWithGroupSync();
     for (uint stride = 128; stride > 0; stride >>= 1) {
         if (tid.x < stride) {
@@ -401,6 +491,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             gSum[tid.x] += gSum[tid.x + stride];
             gLit[tid.x] += gLit[tid.x + stride];
             gDim[tid.x] += gDim[tid.x + stride];
+            gPow[tid.x] += gPow[tid.x + stride];
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -408,11 +499,12 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         float stat = min(gMax[0], gSum[0] / area0);   // min(brightest lit px, sum lit nits*px^2 / A0)
         driveOut[uint2(cx, cy)] = DriveOf(stat);
         if (boostN != 0u) {
-            // LIT-or-DIM (FaldModel.active_zone_fraction): fractions of the zone's pixels (the lattice lies inside
+            // LIT-or-DIM / LIT-or-MEAN (FaldModel.active_zones): fractions of the zone's pixels (the lattice lies inside
             // the frame — FaldLatticeFits — so every zone has cellW * cellH of them)
             float litF = (float)gLit[0] / (float)n;
             float dimF = (float)gDim[0] / (float)n;
-            activeOut[uint2(cx, cy)] = (litF > boostLitFrac || dimF > boostDimFrac) ? 1.0f : 0.0f;
+            bool second = (boostRule == 1u) ? (gPow[0] / (float)n >= boostMeanThresh) : (dimF > boostDimFrac);
+            activeOut[uint2(cx, cy)] = (litF > boostLitFrac || second) ? 1.0f : 0.0f;
         }
     }
 }
@@ -696,6 +788,175 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// =====================================================================================================================
+// GLOW FILL — THE RULES (2026-09-20; experimental, default off). Reference: DLC dlc/fald/glowfill.py (module docstring =
+// this text), GPU-order twin dlc/fald/gpuemu.py; tests DLC tests/test_fald_glowfill*.py. Run after EACH round's conv pass
+// on that round's B_true texture (LED boost included): round 0's fill is part of the frame the round-1 statistic / boost
+// count see, round 1's is part of the output.
+//
+// Per zone                                                                                          pass  texture
+//   Vz = white * tmin * mean over the zone's sub x sub fine texels of max(bTrue / flatTrue, 0)        G0   glowV
+//   dil(e) = max of V over the (2 reach + 1)^2 box around e, V continued beyond the lattice by its border values
+//            (clamped reads), for every e within `reach` zones of the lattice                          G1   glowDil
+//   Cz = min of dil over the (2 reach + 1)^2 box = the grey CLOSING: holes / valleys narrower than 2 reach zones are
+//        filled to the lowest level around them; a glow that only falls away from its source is kept (no skirt around a
+//        window, no filled letterbox bars; exact at the frame edge)                                   G2   glowC
+//   Ez = min(Gaussian blur of Cz, Cz); sigma = SIGMA_BASE + SIGMA_PER_REACH * reach zones, radius ceil(3 sigma), border
+//        values held, normalised                                                                       G3   glowEnv.x
+//   Dz = (Ez - Vz) * smoothstep(DEFICIT_REL_LO, DEFICIT_REL_HI, (Ez - Vz) / Vz) where Ez > Vz, else 0  G3   glowEnv.y
+// Count-threshold band (glowBand: a boost LUT AND the mean zone rule; EVERY round, from its own request) G4   glowK
+//   Pc / Pf = the zone mean of (brightest channel)^boostMeanGamma of the round's request WITHOUT / WITH the unscaled
+//   fill — the statistic the firmware will form. A zone not counted by its content (not LIT, Pc < T) whose Pf lies in
+//   [BAND_LO T, BAND_HI T] gets k = ((BAND_LO T - Pc) / (Pf - Pc))^(1 / gamma): its own pixels' want x k puts the
+//   statistic at BAND_LO T — clearly uncounted (T is known to +-7 %). Every other zone: k = 1. The statistic round 1
+//   reads round 0's k, the pixel pass round 1's (exact for the frame that is sent).
+// Per pixel: GlowAdd (common source). Settings (CB words 75-80; defaults): on 0 | strength 1 (0..1), capNits 0.05
+//   (0.005..0.5), reach 2 (1..4) | reqCeil = min(0.4 driveFloor, 0.55 boostLitNits [file with a boost LUT]) | band.
+// HDR (PQ panel files) only: the C++ keeps the option off for a gamma-transfer file.
+// Bindings: G0 reads t5 bTrue + t7 flatTrue; G1 reads t20; G2 reads t21; G3 reads t20 + t22; G4 reads what the statistic
+//   round 1 reads (t0, t1, t5-t9, t15 / t18, t23); the statistic round 1 and the pixel pass read t23 (+ t24 with the band).
+// =====================================================================================================================
+
+// Glow pass G0: the zone pedestal (glowfill.zone_pedestal). Sum order: oy outer, ox inner (the twin's).
+inline const char* g_faldGlowZoneSource = R"(
+RWTexture2D<float> glowVOut : register(u0);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= cols || id.y >= rows) return;
+    float acc = 0.0f;
+    for (uint oy = 0; oy < sub; oy++) {
+        for (uint ox = 0; ox < sub; ox++) {
+            int3 f = int3((int)(id.x * sub + ox), (int)(id.y * sub + oy), 0);
+            acc += max(bTrueTex.Load(f) / max(flatTrueTex.Load(f), 1e-6f), 0.0f);
+        }
+    }
+    glowVOut[id.xy] = acc * (white * tmin / (float)(sub * sub));
+}
+)";
+
+// Glow pass G1: box maximum on the lattice extended by glowReach on every side (texel = zone + FALD_GLOW_REACH_MAX); V
+// beyond the lattice = its border value (clamped reads). Texels further out are never read: 0.
+inline const char* g_faldGlowDilateSource = R"(
+RWTexture2D<float> glowDilOut : register(u0);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= cols + 2u * (uint)FALD_GLOW_REACH_MAX || id.y >= rows + 2u * (uint)FALD_GLOW_REACH_MAX) return;
+    int R = (int)glowReach;
+    int ex = (int)id.x - FALD_GLOW_REACH_MAX, ey = (int)id.y - FALD_GLOW_REACH_MAX;      // lattice coordinates
+    if (ex < -R || ey < -R || ex >= (int)cols + R || ey >= (int)rows + R) { glowDilOut[id.xy] = 0.0f; return; }
+    float m = 0.0f;                                                                      // V >= 0
+    for (int dy = -R; dy <= R; dy++) {
+        int y = clamp(ey + dy, 0, (int)rows - 1);
+        for (int dx = -R; dx <= R; dx++) {
+            int x = clamp(ex + dx, 0, (int)cols - 1);
+            m = max(m, glowVTex.Load(int3(x, y, 0)));
+        }
+    }
+    glowDilOut[id.xy] = m;
+}
+)";
+
+// Glow pass G2: box minimum of the dilation = the closing.
+inline const char* g_faldGlowErodeSource = R"(
+RWTexture2D<float> glowCOut : register(u0);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= cols || id.y >= rows) return;
+    int R = (int)glowReach;
+    float m = 3.0e38f;
+    for (int dy = -R; dy <= R; dy++) {
+        for (int dx = -R; dx <= R; dx++) {
+            m = min(m, glowDilTex.Load(int3((int)id.x + dx + FALD_GLOW_REACH_MAX, (int)id.y + dy + FALD_GLOW_REACH_MAX, 0)));
+        }
+    }
+    glowCOut[id.xy] = m;
+}
+)";
+
+// Glow pass G3: the envelope (blur of the closing, never above it) and the zone deficit.
+inline const char* g_faldGlowEnvSource = R"(
+RWTexture2D<float4> glowEnvOut : register(u0);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= cols || id.y >= rows) return;
+    float sigma = FALD_GLOW_SIGMA_BASE + FALD_GLOW_SIGMA_PER_REACH * (float)glowReach;
+    int R = (int)ceil(3.0f * sigma);
+    float acc = 0.0f, wsum = 0.0f;
+    for (int dy = -R; dy <= R; dy++) {
+        int y = clamp((int)id.y + dy, 0, (int)rows - 1);
+        for (int dx = -R; dx <= R; dx++) {
+            int x = clamp((int)id.x + dx, 0, (int)cols - 1);
+            float w = exp(-0.5f * (float)(dx * dx + dy * dy) / (sigma * sigma));
+            acc += w * glowCTex.Load(int3(x, y, 0)); wsum += w;
+        }
+    }
+    float c = glowCTex.Load(int3(id.xy, 0));
+    float e = min(acc / wsum, c);
+    float v = glowVTex.Load(int3(id.xy, 0));
+    float d = max(e - v, 0.0f);
+    d *= smoothstep(FALD_GLOW_DEFICIT_REL_LO, FALD_GLOW_DEFICIT_REL_HI, d / max(v, 1e-12f));
+    glowEnvOut[id.xy] = float4(e, d, c, v);
+}
+)";
+
+// Glow pass G4 (glowBand only, every round): the count-threshold band's zone scale (glowfill.band_scale). One thread group
+// per zone, 256 threads sweep its pixels exactly like the statistic pass (the same thread / reduction order: the twin's
+// Emu.zone_pow_sum); the request is the round's corrected one, the fill the UNSCALED one (k = 1).
+inline const char* g_faldGlowBandSource = R"(
+RWTexture2D<float> glowKOut : register(u0);
+groupshared float gPowC[256];
+groupshared float gPowF[256];
+groupshared uint gLitC[256];
+
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    uint cx = gid.x, cy = gid.y;
+    uint n = cellW * cellH;
+    float powC = 0.0f, powF = 0.0f;
+    uint lit = 0;
+    for (uint k = tid.x; k < n; k += 256) {
+        uint px = originX + cx * cellW + (k % cellW);
+        uint py = originY + cy * cellH + (k / cellW);
+        if (px >= frameW || py >= frameH) continue;
+        float3 img = PanelNits(frameTex.Load(int3(px, py, 0)).rgb);
+        if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));
+        float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
+        float g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
+        float3 c3 = Correct(img, bT, bE, g);
+        float3 f3 = GlowAddK(c3, bT, bE, float2((float)px, (float)py), 1.0f);
+        float c = max(c3.r, max(c3.g, c3.b)), f = max(f3.r, max(f3.g, f3.b));
+        if (c > 0.0f) powC += exp(boostMeanGamma * log(c));
+        if (f > 0.0f) powF += exp(boostMeanGamma * log(f));
+        if (c > boostLitNits) lit++;
+    }
+    gPowC[tid.x] = powC; gPowF[tid.x] = powF; gLitC[tid.x] = lit;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid.x < stride) {
+            gPowC[tid.x] += gPowC[tid.x + stride];
+            gPowF[tid.x] += gPowF[tid.x + stride];
+            gLitC[tid.x] += gLitC[tid.x + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid.x == 0) {
+        float pc = gPowC[0] / (float)n, pf = gPowF[0] / (float)n;
+        bool litZone = (float)gLitC[0] / (float)n > boostLitFrac;
+        float t = boostMeanThresh;
+        float kz = 1.0f;
+        if (!litZone && pc < t && pf >= FALD_GLOW_BAND_LO * t && pf <= FALD_GLOW_BAND_HI * t) {
+            float share = saturate((FALD_GLOW_BAND_LO * t - pc) / max(pf - pc, 1e-30f));
+            kz = (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;
+        }
+        glowKOut[uint2(cx, cy)] = kz;
+    }
+}
+)";
+
 // Pass 1a (boost LUT only): the frame's black-frame LED boost. Counts the non-black zones of the statistic pass
 // (t13) and looks the staircase up by COUNT: the last step whose first count is <= N applies, below the first step
 // the boost is 1 (FaldModel.boost_of_fraction; the C++ turns the file's zone fractions into counts —
@@ -780,6 +1041,32 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// Pass 1c (temporal mode 3 "panel clock" only; rules in fald.h above FALD_TEMPORAL_PANEL, reference DLC
+// dlc/fald/paneltime.py, GPU-order twin gpuemu.GpuPanelDriveState.advance). Runs ONCE per frame, before round 0, and
+// only with a valid state: driveTex (t4) = the PREVIOUS processed frame's round-1 instantaneous drives = the target of
+// every dimming-engine tick since that frame was first shown; clkState0 / clkState1 = the LED states of the two parity
+// clocks, advanced in place to this frame's first refresh. Out: the drive maps the real-spread kernel (u0) and the
+// estimate kernel (u1: the LED state one refresh earlier) see in BOTH rounds — the clocks' weighted mean. Nothing here
+// depends on this frame's content; the C++ stores this frame's round-1 drives as the next target afterwards.
+inline const char* g_faldPanelClockSource = R"(
+RWTexture2D<float> clkTrueOut : register(u0);
+RWTexture2D<float> clkEstOut  : register(u1);
+RWTexture2D<float> clkState0  : register(u2);
+RWTexture2D<float> clkState1  : register(u3);
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= cols || id.y >= rows) return;
+    float d = driveTex.Load(int3(id.xy, 0));
+    float s0 = clkState0[id.xy], s1 = clkState1[id.xy];
+    float g0 = d - s0, g1 = d - s1;
+    float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;
+    clkTrueOut[id.xy] = clkW0 * t0 + clkW1 * t1;
+    clkEstOut[id.xy] = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);
+    clkState0[id.xy] = t0; clkState1[id.xy] = t1;
+}
+)";
+
 // Pass 2b: gain on the fine grid (flat-normalised fields, clamp, deep-dark fade) -> u0.
 inline const char* g_faldGainSource = R"(
 RWTexture2D<float> gainOut : register(u0);
@@ -825,6 +1112,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 //     |adj_channel - adj_white| * fade, x100 (what changes on screen when the toggle flips; black = nothing),
 //     7 = temporal settling: per cell, the instantaneous drive minus the filtered one (red = the state is still BELOW
 //     the frame's drive, i.e. the LEDs are modelled as still rising; blue = above, falling), +-25 % drive full scale.
+//     In temporal mode 3 (panel clock) the "filtered" map is the clocks' mean LED state of this frame.
 //     8 = the black-frame boost's zone map of the corrected frame (round 1): white = the zone counts as non-black,
 //     black = it does not; passthrough when the panel file has no boost LUT.
 //     9 = starfield balancing at a glance, per ZONE (single pixels are invisible): grey level = the zone's weight
@@ -832,6 +1120,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 //     pixels — its own pixels are never acted on), tinted blue by how far the zone's peak is pulled down and red by
 //     how far it is lifted (ln ratio, 2 stops = full tint); passthrough when the option is off. View 4 stays a pure
 //     passthrough of the SOURCE frame.
+//     10 = glow fill: the request the fill ADDS at each pixel (as-if-white nits per channel, in the pedestal's colour),
+//     x FALD_GLOW_VIEW_SCALE (0.1 nit shows as 100 nits); black = nothing added; passthrough when the option is off.
 inline const char* g_faldPixelSource = R"(
 struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 
@@ -886,7 +1176,14 @@ float4 main(PS_INPUT i) : SV_Target {
         float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? t1 : t0) : abs(t1 - t0);
         return float4(PanelNitsToScRGB(min(shown * 100.0f, white)), 1.0f);   // x100 nits per nit
     }
+    if (debugMode == 10) {
+        if (glowOn == 0u) return src;
+        float3 r10 = Correct(img, bT, bE, gain);
+        float3 added = GlowAdd(r10, bT, bE, px) - r10;
+        return float4(PanelNitsToScRGB(min(added * FALD_GLOW_VIEW_SCALE, white)), 1.0f);
+    }
     float3 req = Correct(img, bT, bE, gain);
+    if (glowOn != 0u) req = GlowAdd(req, bT, bE, px);   // the glow fill (S2): added to the corrected request
     return float4(PanelNitsToScRGB(req), src.a);
 }
 )";

@@ -137,12 +137,18 @@ struct MovableAtomic {
 #define ID_CORR_FALD_TAU_RISE    538
 #define ID_CORR_FALD_TAU_FALL    539
 #define ID_CORR_FALD_DELAY       540
+#define ID_CORR_FALD_CLOSURE     547   // LED-lag row in "Panel clock" mode (temporal mode 3): closure edit + parity combo
+#define ID_CORR_FALD_PARITY      548
 #define ID_CORR_FALD_STAR_ENABLE 541   // Starfield rows (starfield balancing, work guide S1), apply to both modes
 #define ID_CORR_FALD_STAR_EVEN   542
 #define ID_CORR_FALD_STAR_SIGMA  543   // spread σ = target_sigma
 #define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
 #define ID_CORR_FALD_STAR_STRENGTH 545
 #define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach   (lift is INI / pipe only)
+#define ID_CORR_FALD_GLOW_ENABLE 549   // Glow fill row (work guide S2), applies to both modes
+#define ID_CORR_FALD_GLOW_STRENGTH 550
+#define ID_CORR_FALD_GLOW_REACH  554
+#define ID_CORR_FALD_GLOW_CAP    555
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -536,12 +542,23 @@ struct FaldStarfieldSettings {
     float nbHi = 0.30f;           // ... none at / above this
 };
 
+// Glow fill (EXPERIMENT, default off; work guide ticket S2; reference DLC dlc/fald/glowfill.py GlowFillParams — the
+// defaults here are pinned equal by DLC tests/test_fald_transfer.py). A calculated black lift that evens the LED glow
+// on dark content: only holes / valleys of the glow that are enclosed by glow are filled. A user setting, not a panel
+// property. Clamped by FaldGlowClamp (fald.h). HDR only (fald.h FaldGlowSupported): the SDR slot's switch stays off.
+struct FaldGlowSettings {
+    bool enabled = false;
+    float strength = 1.0f;        // 0..1: share of the glow deficit that is filled
+    unsigned int reach = 2;       // 1..4 zones (each side): holes / valleys up to 2 * reach zones wide are filled
+    float capNits = 0.05f;        // 0.005..0.5: the fill never exceeds this (as-if-white nits)
+};
+
 struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
     unsigned int debugMode = 0;   // 0 = correct, 1 = gain map (white 0, red +, blue -), 2 = show B_true, 3 = show B_est, 4 = identity passthrough,
                                   // 5/6 pedestal views, 7 temporal settling, 8 black-frame boost zone map, 9 starfield balancing
-                                  // zone map (fald_shader.h; not persisted)
+                                  // zone map, 10 glow fill (the added request x 1000) (fald_shader.h; not persisted)
     unsigned int pedMode = 0;     // pedestal colour (persisted, GUI "Per-channel pedestal"): 0 = white pedestal, hue-preserving
                                   // subtraction (pre-2026-09-13 behaviour); 1 = the panel file's per-channel pedestal colour
                                   // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.
@@ -549,14 +566,22 @@ struct FaldSettings {
                                   // re-exported at the SAME path rebuilds the GPU tables (fald.cpp FaldEnsureResources)
     // Temporal drive state (persisted, GUI "LED lag" row / runtime.fald_temporal; fald.h FALD_TEMPORAL_*): the shader's
     // per-cell first-order filter with rise/fall time constants, so a cell handoff during a pan crossfades instead of
-    // snapping. 0 = off (the stateless layer). The PA32UCXR's LED law is unmeasured: default off (work guide H5).
+    // snapping. 0 = off (the stateless layer). Default off (work guide H5). Modes 1 / 2 (this first-order filter) were
+    // REJECTED as the PA32UCXR's LED law by the 2026-09-19/20 camera measurement; the measured law is mode 3 below.
     unsigned int temporalMode = 0;
     float tauRiseMs = 0.0f;
     float tauFallMs = 0.0f;
     unsigned int delayFrames = 0;   // pipeline delay 0..FALD_DELAY_MAX: the filter is fed the drives of n frames ago
+    // temporalMode 3 = "panel clock" (EXPERIMENT, work guide C13; fald.h FALD_TEMPORAL_PANEL, reference DLC
+    // dlc/fald/paneltime.py): the measured half-refresh-rate sample-and-hold law. Persisted; used by mode 3 only.
+    float clockClosure = 0.72f;     // share of the remaining LED drive gap closed per tick, 0.05..1 (FALD_CLOCK_CLOSURE_*)
+    int clockParity = -1;           // which refresh the engine ticks on: -1 = unknown (mean of both clocks), 0 / 1 = known
     // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
     // resource for resource and dispatch for dispatch.
     FaldStarfieldSettings star;
+    // Glow fill (persisted, GUI "Glow fill" row / runtime.fald_glowfill). Off = the layer without it, resource for
+    // resource and dispatch for dispatch.
+    FaldGlowSettings glow;
 };
 
 // Tonemapping settings (HDR only)
@@ -986,12 +1011,23 @@ struct GUIState {
     HWND hwndFaldTauRise = nullptr;
     HWND hwndFaldTauFall = nullptr;
     HWND hwndFaldDelay = nullptr;
+    HWND hwndFaldTauRiseLabel = nullptr;   // the row's labels: the first-order set is hidden in "Panel clock" mode, where
+    HWND hwndFaldTauFallLabel = nullptr;   // the closure edit + parity combo take its place (gui.cpp ShowFaldTemporalRow)
+    HWND hwndFaldDelayLabel = nullptr;
+    HWND hwndFaldClosureLabel = nullptr;
+    HWND hwndFaldClosure = nullptr;
+    HWND hwndFaldParityLabel = nullptr;
+    HWND hwndFaldParity = nullptr;
     HWND hwndFaldStarEnable = nullptr;  // Starfield rows: enable | even | spread σ | keep nits | strength | mean reach
     HWND hwndFaldStarEven = nullptr;
     HWND hwndFaldStarSigma = nullptr;   // "spread σ" = target_sigma
     HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
     HWND hwndFaldStarStrength = nullptr;
     HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
+    HWND hwndFaldGlowEnable = nullptr;  // Glow fill row: enable | strength | reach | cap nits
+    HWND hwndFaldGlowStrength = nullptr;
+    HWND hwndFaldGlowReach = nullptr;
+    HWND hwndFaldGlowCap = nullptr;
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

@@ -693,7 +693,7 @@ void CreateGUILayout(HWND hwnd) {
     // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
     ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental, overlay only)", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 180, panel2, nullptr, nullptr, nullptr);
+        innerX, innerY, groupW, 207, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
     // Row 1: HDR
@@ -743,6 +743,7 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Temporal settling (red rising)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Boost zone map (non-black zones)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Starfield zones (blue pulled, red lifted)");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Glow fill (added light x1000)");
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
 
     // Per-channel pedestal (2026-09-13, DLC work guide H2): the panel file (FLD2) carries the measured colour of the
@@ -756,8 +757,13 @@ void CreateGUILayout(HWND hwnd) {
 
     // Row 4: temporal drive state ("LED lag", 2026-09-17, DLC work guide H5 / item 4a): the shader's per-cell first-order
     // filter with rise/fall time constants, so a cell handoff during a pan crossfades instead of snapping. Off = the
-    // stateless layer. The panel's LED law is unmeasured — this row is the owner's live A/B control; a filter on an
-    // instant panel makes pans worse. Applies to both modes like View (fald.h FALD_TEMPORAL_*, dlc/fald/temporal.py).
+    // stateless layer. The panel's LED law has since been MEASURED (2026-09-19/20) and is NOT this first-order filter
+    // (modes 1 / 2 rejected as the law; see "Panel clock" below) — the row stays as the owner's live A/B control; a
+    // filter that does not match the panel makes pans worse. Applies to both modes like View (fald.h FALD_TEMPORAL_*, dlc/fald/temporal.py).
+    // "Panel clock" (mode 3, EXPERIMENT, work guide C13) = the law the phone camera measured 2026-09-19/20 (LEDs sampled
+    // and held at half the refresh rate, the panel's compensation one refresh later; dlc/fald/paneltime.py): with it the
+    // row shows closure (share of the LED gap closed per tick) + parity (which refresh the engine ticks on; unknown =
+    // the mean of both) IN PLACE of rise / fall / delay — gui.cpp ShowFaldTemporalRow switches the two sets.
     int faldTY = innerY + 99;
     ctrl = CreateWindow(L"STATIC", L"LED lag:", WS_CHILD, innerX + 10, faldTY + 2, 46, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
@@ -768,23 +774,43 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Off (stateless)");
     SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"LEDs + estimate lag");
     SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"LEDs lag only");
+    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Panel clock");
     SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, 0, 0);
     ctrl = CreateWindow(L"STATIC", L"rise ms", WS_CHILD, innerX + 182, faldTY + 2, 44, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldTauRiseLabel = ctrl;
     g_gui.hwndFaldTauRise = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
         innerX + 228, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_TAU_RISE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldTauRise);
     ctrl = CreateWindow(L"STATIC", L"fall ms", WS_CHILD, innerX + 272, faldTY + 2, 42, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldTauFallLabel = ctrl;
     g_gui.hwndFaldTauFall = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
         innerX + 316, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_TAU_FALL, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldTauFall);
     // pipeline delay in frames (0..3): the law a first-order filter cannot represent (design review 2026-09-17)
     ctrl = CreateWindow(L"STATIC", L"delay", WS_CHILD, innerX + 360, faldTY + 2, 34, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldDelayLabel = ctrl;
     g_gui.hwndFaldDelay = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
         innerX + 396, faldTY, 30, h, panel2, (HMENU)ID_CORR_FALD_DELAY, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldDelay);
+    // the "Panel clock" set, on the same spot (hidden until the mode is selected)
+    g_gui.hwndFaldClosureLabel = CreateWindow(L"STATIC", L"closure", WS_CHILD, innerX + 182, faldTY + 2, 44, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldClosureLabel);
+    g_gui.hwndFaldClosure = CreateWindow(L"EDIT", L"0.72", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 228, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_CLOSURE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldClosure);
+    g_gui.hwndFaldParityLabel = CreateWindow(L"STATIC", L"parity", WS_CHILD, innerX + 272, faldTY + 2, 42, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldParityLabel);
+    g_gui.hwndFaldParity = CreateWindow(L"COMBOBOX", nullptr,
+        WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        innerX + 316, faldTY, 110, 100, panel2, (HMENU)ID_CORR_FALD_PARITY, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldParity);
+    SendMessage(g_gui.hwndFaldParity, CB_ADDSTRING, 0, (LPARAM)L"Unknown (mean)");   // index = parity + 1
+    SendMessage(g_gui.hwndFaldParity, CB_ADDSTRING, 0, (LPARAM)L"0 (experimental)");
+    SendMessage(g_gui.hwndFaldParity, CB_ADDSTRING, 0, (LPARAM)L"1 (experimental)");
+    SendMessage(g_gui.hwndFaldParity, CB_SETCURSEL, 0, 0);
 
     // Rows 5-6: starfield balancing (EXPERIMENT, 2026-09-19, DLC work guide ticket S1; rules = the module docstring of
     // dlc/fald/starfield.py): a field of scattered specks drives its zones unevenly (zone-shaped haze patches); the option
@@ -826,7 +852,36 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 250, faldS2Y, 30, h, panel2, (HMENU)ID_CORR_FALD_STAR_REACH, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldStarReach);
 
-    g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
+    // Row 7: glow fill (EXPERIMENT, 2026-09-20, DLC work guide ticket S2; rules = the module docstring of
+    // dlc/fald/glowfill.py): a CALCULATED black lift that evens the LED glow on dark content. Only holes / valleys of the
+    // glow that are enclosed by glow are filled (no skirt around a bright window, no filled letterbox bars), and only
+    // where the panel's own backlight estimate is trusted. strength = the share of the glow deficit that is filled;
+    // reach = zones (each side): holes up to 2 x reach zones wide count; cap nits = the fill's ceiling. It adds light to
+    // black on purpose, and filled zones count for the panel's black-frame LED boost. HDR only (fald.h FaldGlowSupported:
+    // the levels behind its request ceiling are HDR measurements): the checkbox is the HDR slot's switch, the numbers
+    // go to both slots.
+    int faldGY = innerY + 180;
+    g_gui.hwndFaldGlowEnable = CreateWindow(L"BUTTON", L"Glow fill",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 10, faldGY, 72, h, panel2, (HMENU)ID_CORR_FALD_GLOW_ENABLE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowEnable);
+    ctrl = CreateWindow(L"STATIC", L"strength", WS_CHILD, innerX + 88, faldGY + 2, 48, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldGlowStrength = CreateWindow(L"EDIT", L"1.00", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 138, faldGY, 38, h, panel2, (HMENU)ID_CORR_FALD_GLOW_STRENGTH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowStrength);
+    ctrl = CreateWindow(L"STATIC", L"reach", WS_CHILD, innerX + 186, faldGY + 2, 32, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldGlowReach = CreateWindow(L"EDIT", L"2", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 220, faldGY, 30, h, panel2, (HMENU)ID_CORR_FALD_GLOW_REACH, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowReach);
+    ctrl = CreateWindow(L"STATIC", L"cap nits", WS_CHILD, innerX + 260, faldGY + 2, 46, h, panel2, nullptr, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(ctrl);
+    g_gui.hwndFaldGlowCap = CreateWindow(L"EDIT", L"0.050", WS_CHILD | WS_BORDER | ES_RIGHT,
+        innerX + 308, faldGY, 46, h, panel2, (HMENU)ID_CORR_FALD_GLOW_CAP, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowCap);
+
+    g_gui.contentHeight[2] = innerY + 207 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows + Glow fill)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);
@@ -835,11 +890,15 @@ void CreateGUILayout(HWND hwnd) {
     SetNumericEdit(g_gui.hwndFaldTauRise, 1);
     SetNumericEdit(g_gui.hwndFaldTauFall, 1);
     SetNumericEdit(g_gui.hwndFaldDelay, 0);
+    SetNumericEdit(g_gui.hwndFaldClosure, 2);
     SetNumericEdit(g_gui.hwndFaldStarEven, 2);
     SetNumericEdit(g_gui.hwndFaldStarKeep, 1);
     SetNumericEdit(g_gui.hwndFaldStarStrength, 2);
     SetNumericEdit(g_gui.hwndFaldStarReach, 0);
     SetNumericEdit(g_gui.hwndFaldStarSigma, 2);
+    SetNumericEdit(g_gui.hwndFaldGlowStrength, 2);
+    SetNumericEdit(g_gui.hwndFaldGlowReach, 0);
+    SetNumericEdit(g_gui.hwndFaldGlowCap, 3);
 
     // === TAB 3: Settings (initially hidden) ===
     innerY = 8;  // Reset for scroll panel
@@ -967,6 +1026,10 @@ void CreateGUILayout(HWND hwnd) {
     for (HWND hCtrl : g_gui.tab1Controls) ShowWindow(hCtrl, SW_SHOW);
     for (HWND hCtrl : g_gui.tab2Controls) ShowWindow(hCtrl, SW_SHOW);
     for (HWND hCtrl : g_gui.tab3Controls) ShowWindow(hCtrl, SW_SHOW);
+    // FALD LED-lag row: the "Panel clock" set shares its spot with rise / fall / delay and starts hidden
+    // (gui.cpp ShowFaldTemporalRow shows the set of the selected mode)
+    for (HWND hCtrl : { g_gui.hwndFaldClosureLabel, g_gui.hwndFaldClosure, g_gui.hwndFaldParityLabel, g_gui.hwndFaldParity })
+        ShowWindow(hCtrl, SW_HIDE);
 
     // Store original Y positions for scroll support (query actual positions after creation)
     auto storeOriginalY = [](const std::vector<HWND>& controls, std::vector<int>& originalY, HWND panel) {

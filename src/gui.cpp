@@ -325,6 +325,16 @@ bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
 }
 
 
+// FALD LED-lag row: "Panel clock" (temporal mode 3) shows closure + parity where the first-order modes show
+// rise / fall / delay (gui_layout.cpp creates both sets on the same spot).
+static void ShowFaldTemporalRow(bool panelClock) {
+    for (HWND hCtrl : { g_gui.hwndFaldTauRiseLabel, g_gui.hwndFaldTauRise, g_gui.hwndFaldTauFallLabel, g_gui.hwndFaldTauFall,
+                        g_gui.hwndFaldDelayLabel, g_gui.hwndFaldDelay })
+        if (hCtrl) ShowWindow(hCtrl, panelClock ? SW_HIDE : SW_SHOW);
+    for (HWND hCtrl : { g_gui.hwndFaldClosureLabel, g_gui.hwndFaldClosure, g_gui.hwndFaldParityLabel, g_gui.hwndFaldParity })
+        if (hCtrl) ShowWindow(hCtrl, panelClock ? SW_SHOW : SW_HIDE);
+}
+
 // Update color correction controls to reflect current monitor's settings
 // Populates both SDR and HDR sections simultaneously
 void UpdateColorCorrectionControls() {
@@ -366,9 +376,10 @@ void UpdateColorCorrectionControls() {
         sdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldSdrPath, sdrCC.fald.paramsPath.c_str());
     const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 9 ? shown.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 10 ? shown.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= 2 ? shown.temporalMode : 0), 0);
+    SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= FALD_TEMPORAL_PANEL ? shown.temporalMode : 0), 0);
+    ShowFaldTemporalRow(shown.temporalMode == FALD_TEMPORAL_PANEL);
     wchar_t tauBuf[32];
     if (GetFocus() != g_gui.hwndFaldTauRise) {  // don't fight a value being typed
         _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauRiseMs);
@@ -380,6 +391,11 @@ void UpdateColorCorrectionControls() {
     }
     if (GetFocus() != g_gui.hwndFaldDelay)
         SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(shown.delayFrames).c_str());
+    if (GetFocus() != g_gui.hwndFaldClosure) {
+        _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), shown.clockClosure);
+        SetWindowText(g_gui.hwndFaldClosure, tauBuf);
+    }
+    SendMessage(g_gui.hwndFaldParity, CB_SETCURSEL, (WPARAM)(FaldPanelClockParity(shown.clockParity) + 1), 0);   // index = parity + 1
     // starfield balancing row (work guide S1)
     SendMessage(g_gui.hwndFaldStarEnable, BM_SETCHECK, shown.star.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     {
@@ -397,6 +413,18 @@ void UpdateColorCorrectionControls() {
     }
     if (GetFocus() != g_gui.hwndFaldStarReach)
         SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(shown.star.evenReach).c_str());
+    // glow fill row (work guide S2)
+    SendMessage(g_gui.hwndFaldGlowEnable, BM_SETCHECK, hdrCC.fald.glow.enabled ? BST_CHECKED : BST_UNCHECKED, 0);   // HDR only
+    if (GetFocus() != g_gui.hwndFaldGlowStrength) {  // don't fight a value being typed
+        _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), shown.glow.strength);
+        SetWindowText(g_gui.hwndFaldGlowStrength, tauBuf);
+    }
+    if (GetFocus() != g_gui.hwndFaldGlowCap) {
+        _swprintf_s_l(tauBuf, 32, L"%.3f", GetCLocale(), shown.glow.capNits);
+        SetWindowText(g_gui.hwndFaldGlowCap, tauBuf);
+    }
+    if (GetFocus() != g_gui.hwndFaldGlowReach)
+        SetWindowText(g_gui.hwndFaldGlowReach, std::to_wstring(shown.glow.reach).c_str());
     // The layer runs in the overlay path only: in DWM hook mode the checkboxes are inert, so grey them out.
     EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldSdrEnable, !g_dwmHookMode.load());
@@ -406,12 +434,18 @@ void UpdateColorCorrectionControls() {
     EnableWindow(g_gui.hwndFaldTauRise, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldTauFall, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldDelay, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldClosure, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldParity, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldStarEnable, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldStarEven, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldStarKeep, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldStarStrength, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldStarReach, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldStarSigma, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldGlowEnable, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldGlowStrength, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldGlowReach, !g_dwmHookMode.load());
+    EnableWindow(g_gui.hwndFaldGlowCap, !g_dwmHookMode.load());
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1324,7 +1358,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= 9) ? (unsigned int)sel : 0u;   // one entry per debug view 0..9
+                    unsigned int mode = (sel >= 0 && sel <= 10) ? (unsigned int)sel : 0u;   // one entry per debug view 0..10
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads these
                         FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
@@ -1357,14 +1391,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldTemporal, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= 2) ? (unsigned int)sel : 0u;
+                    unsigned int mode = (sel >= 0 && sel <= (int)FALD_TEMPORAL_PANEL) ? (unsigned int)sel : 0u;   // one entry per mode 0..3
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
                         FaldSlot(true).temporalMode = mode;
                         FaldSlot(false).temporalMode = mode;
                     }
+                    ShowFaldTemporalRow(mode == FALD_TEMPORAL_PANEL);
                     ApplyFaldSharedSettingChange();
-                    if (mode != 0)
+                    if (mode == FALD_TEMPORAL_PANEL)
+                        SetStatus(L"FALD panel clock on (experimental): the measured 30-Hz LED law - judge flashes beside moving highlights by eye");
+                    else if (mode != 0)
                         SetStatus(L"FALD LED-lag filter on: the panel's LED law is unmeasured - judge slow pans by eye, off if worse");
                 }
             }
@@ -1392,6 +1429,48 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     _swprintf_s_l(shown, 32, L"%.1f", GetCLocale(), v);
                     SetWindowText(edit, shown);
                     if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        // "Panel clock" set of the LED-lag row: closure (0.05..1) + parity (combo index = parity + 1), both modes at once.
+        case ID_CORR_FALD_CLOSURE:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    wchar_t buf[32];
+                    GetWindowText(g_gui.hwndFaldClosure, buf, 32);
+                    float v = FaldPanelClockClosure((float)_wcstod_l(buf, nullptr, GetCLocale()));
+                    // Losing the focus is not an edit (see the starfield edits below): write only when the typed value
+                    // differs from the shown mode's stored one by more than the display rounding.
+                    bool changed = false;
+                    float stored = 0.0f;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        stored = FaldSlot(CurrentMonitorIsHDR()).clockClosure;
+                        if (fabsf(v - stored) > 0.005f + 1e-6f) {
+                            for (bool isHDR : { true, false }) FaldSlot(isHDR).clockClosure = v;
+                            changed = true;
+                        }
+                    }
+                    wchar_t shownBuf[32];
+                    _swprintf_s_l(shownBuf, 32, L"%.2f", GetCLocale(), changed ? v : stored);
+                    SetWindowText(g_gui.hwndFaldClosure, shownBuf);
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_PARITY:
+            if (HIWORD(wParam) == CBN_SELCHANGE) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    int sel = (int)SendMessage(g_gui.hwndFaldParity, CB_GETCURSEL, 0, 0);
+                    int parity = (sel >= 0 && sel <= 2) ? sel - 1 : -1;   // three entries: unknown, 0, 1
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        FaldSlot(true).clockParity = parity;
+                        FaldSlot(false).clockParity = parity;
+                    }
+                    ApplyFaldSharedSettingChange();
+                    if (parity >= 0)
+                        SetStatus(L"FALD panel clock: a known parity is experimental - the WRONG one is as bad as no time law; Unknown is the safe choice");
                 }
             }
             return 0;
@@ -1490,6 +1569,76 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                     }
                     SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(v).c_str());
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        // Glow fill row (EXPERIMENT, work guide S2): enable + strength / reach / cap nits, both modes at once like View.
+        // Persisted. Same edit rule as the Starfield row: losing the focus is not an edit.
+        case ID_CORR_FALD_GLOW_ENABLE:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    bool on = (SendMessage(g_gui.hwndFaldGlowEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        FaldSlot(true).glow.enabled = on;       // HDR only (fald.h FaldGlowSupported): the SDR slot's switch
+                        FaldSlot(false).glow.enabled = false;   // stays off — the ceiling's levels are HDR measurements
+                    }
+                    ApplyFaldSharedSettingChange();
+                    if (on)
+                        SetStatus(CurrentMonitorIsHDR()
+                            ? L"FALD glow fill on (experimental): it adds light to black between glowing areas on purpose - judge by eye"
+                            : L"FALD glow fill is HDR only (its request ceiling is measured in HDR): on for this monitor's HDR mode, not in SDR");
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_GLOW_STRENGTH:
+        case ID_CORR_FALD_GLOW_CAP:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    const bool isCap = (LOWORD(wParam) == ID_CORR_FALD_GLOW_CAP);         // cap_nits 0.005..0.5, shown %.3f
+                    HWND edit = isCap ? g_gui.hwndFaldGlowCap : g_gui.hwndFaldGlowStrength;
+                    const float vMin = isCap ? FALD_GLOW_CAP_MIN : 0.0f, vMax = isCap ? FALD_GLOW_CAP_MAX : 1.0f;
+                    const float tol = (isCap ? 0.0005f : 0.005f) + 1e-6f;                 // the display rounding
+                    wchar_t buf[32];
+                    GetWindowText(edit, buf, 32);
+                    float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                    if (!(v >= vMin)) v = vMin;
+                    if (v > vMax) v = vMax;
+                    auto field = [isCap](FaldGlowSettings& gl) -> float& { return isCap ? gl.capNits : gl.strength; };
+                    bool changed = false;
+                    float stored = 0.0f;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        stored = field(FaldSlot(CurrentMonitorIsHDR()).glow);
+                        if (fabsf(v - stored) > tol) {
+                            for (bool isHDR : { true, false }) field(FaldSlot(isHDR).glow) = v;   // a real edit: the row sets both modes
+                            changed = true;
+                        }
+                    }
+                    wchar_t shownBuf[32];
+                    _swprintf_s_l(shownBuf, 32, isCap ? L"%.3f" : L"%.2f", GetCLocale(), changed ? v : stored);
+                    SetWindowText(edit, shownBuf);
+                    if (changed) ApplyFaldSharedSettingChange();
+                }
+            }
+            return 0;
+        case ID_CORR_FALD_GLOW_REACH:
+            if (HIWORD(wParam) == EN_KILLFOCUS) {
+                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                    wchar_t buf[32];
+                    GetWindowText(g_gui.hwndFaldGlowReach, buf, 32);
+                    int n = _wtoi(buf);
+                    unsigned int v = n < (int)FALD_GLOW_REACH_MIN ? FALD_GLOW_REACH_MIN : (n > (int)FALD_GLOW_REACH_MAX ? FALD_GLOW_REACH_MAX : (unsigned int)n);
+                    bool changed = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                        if (FaldSlot(CurrentMonitorIsHDR()).glow.reach != v) {
+                            for (bool isHDR : { true, false }) FaldSlot(isHDR).glow.reach = v;
+                            changed = true;
+                        }
+                    }
+                    SetWindowText(g_gui.hwndFaldGlowReach, std::to_wstring(v).c_str());
                     if (changed) ApplyFaldSharedSettingChange();
                 }
             }

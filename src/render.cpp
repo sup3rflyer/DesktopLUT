@@ -39,6 +39,11 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // If resources are missing (failed reinit), try to recover with non-blocking backoff.
     // No Sleep() — returns immediately so other monitors keep rendering at full frame rate.
     if (!ctx->duplication) {
+        // No duplication = this monitor's layer output is not reaching the panel (duplication lost to a UAC prompt / lock
+        // screen / fullscreen-exclusive app, display off or asleep, a forced reinit after a wake or an HDR toggle): the
+        // FALD temporal state describes a panel that showed OUR frames, so it is void (fald.h FaldLayerIdle). Without
+        // this a recovery that rebuilds nothing would resume from the pre-loss state.
+        FaldLayerIdle(ctx);
         if (g_displayOff.load()) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return;
@@ -179,6 +184,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         if (ctx->hwnd && IsWindowVisible(ctx->hwnd)) {
             ShowWindow(ctx->hwnd, SW_HIDE);
         }
+        FaldLayerIdle(ctx);                // the overlay is gone from the panel: the FALD temporal state is void
         if (ctx->duplication) {
             ctx->duplication->Release();
             ctx->duplication = nullptr;
@@ -272,6 +278,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Check if capture format changed (Windows HDR toggle can change format without ACCESS_LOST)
         if (texDesc.Format != ctx->captureFormat) {
             std::cout << "Monitor " << ctx->index << " capture format changed, forcing full reinit..." << std::endl;
+            FaldLayerIdle(ctx);            // a mode switch under the layer: its temporal state is void
             frameTexture->Release();
             ctx->duplication->ReleaseFrame();
             if (ctx->duplication) {
@@ -652,7 +659,11 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // would clamp scRGB at 1.0 — capture.cpp SwapchainModeChanged keeps them in step, this is the belt).
     bool faldOn = (ctx->isHDREnabled || ctx->isFP16SDR) && ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
                   cc.fald.enabled && !g_dwmHookMode.load() && FaldEnsureResources(ctx, cc.fald);
-    if (!faldOn) FaldLayerIdle(ctx);       // the layer does not run this frame: its temporal state is void (fald.h)
+    // The layer does not run this frame (disabled, refused file, hook mode, wrong format) — or it runs but its output does
+    // not reach the panel because the overlay window is hidden (VRR whitelist, auto-sleep, the frames before the first
+    // show after a (re)commit, a hide by the lost / watchdog paths): its temporal state is void (fald.h). With the
+    // window hidden every run then re-seeds, and the first VISIBLE frame starts from a settled panel.
+    if (!faldOn || !ctx->hwnd || !IsWindowVisible(ctx->hwnd)) FaldLayerIdle(ctx);
     if (settleOnly && !faldOn) return;     // nothing left to settle (layer switched off / refused meanwhile)
     ID3D11RenderTargetView* renderTarget = faldOn ? ctx->fald->interRTV : finalTarget;
 

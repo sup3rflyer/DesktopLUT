@@ -4,7 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
-#include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
+#include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp, FaldGlowClamp
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -118,11 +118,14 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileBool(section, (p + L"FaldEnabled").c_str(), cc.fald.enabled, iniPath);
     WritePrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
     WritePrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), cc.fald.pedMode == 1, iniPath);
-    // temporal drive state (LED-lag filter): mode 0/1/2 + rise/fall time constants in ms (0 = instant on that edge)
+    // temporal drive state (LED-lag filter): mode 0/1/2 + rise/fall time constants in ms (0 = instant on that edge);
+    // mode 3 = panel clock (work guide C13) with its closure per tick + tick parity (-1 unknown / 0 / 1)
     WritePrivateProfileStringW(section, (p + L"FaldTemporalMode").c_str(), std::to_wstring(cc.fald.temporalMode).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), cc.fald.tauRiseMs, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), cc.fald.tauFallMs, iniPath);
     WritePrivateProfileStringW(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldTemporalClosure").c_str(), cc.fald.clockClosure, iniPath);
+    WritePrivateProfileStringW(section, (p + L"FaldTemporalParity").c_str(), std::to_wstring(cc.fald.clockParity).c_str(), iniPath);
     // starfield balancing (experimental, default off; work guide S1): the GUI row's values + the INI/pipe-only ones
     const FaldStarfieldSettings& st = cc.fald.star;
     WritePrivateProfileBool(section, (p + L"FaldStarfield").c_str(), st.enabled, iniPath);
@@ -140,6 +143,12 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileStringW(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
+    // glow fill (experimental, default off; work guide S2)
+    const FaldGlowSettings& gl = cc.fald.glow;
+    WritePrivateProfileBool(section, (p + L"FaldGlowFill").c_str(), gl.enabled, iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldGlowStrength").c_str(), gl.strength, iniPath);
+    WritePrivateProfileStringW(section, (p + L"FaldGlowReach").c_str(), std::to_wstring(gl.reach).c_str(), iniPath);
+    WritePrivateProfileFloat(section, (p + L"FaldGlowCapNits").c_str(), gl.capNits, iniPath);
 }
 
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
@@ -168,7 +177,7 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     {
         // temporal drive state: an unknown mode is OFF, time constants are clamped to 0..FALD_TAU_MAX_MS
         int tmode = (int)GetPrivateProfileIntW(section, (p + L"FaldTemporalMode").c_str(), 0, iniPath);
-        cc.fald.temporalMode = (tmode >= 0 && tmode <= 2) ? (unsigned int)tmode : 0u;
+        cc.fald.temporalMode = (tmode >= 0 && tmode <= (int)FALD_TEMPORAL_PANEL) ? (unsigned int)tmode : 0u;
         float rise = GetPrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), 0.0f, iniPath);
         float fall = GetPrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), 0.0f, iniPath);
         auto clampTau = [](float v) { return (v != v || v < 0.0f) ? 0.0f : (v > FALD_TAU_MAX_MS ? FALD_TAU_MAX_MS : v); };
@@ -176,6 +185,13 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         cc.fald.tauFallMs = clampTau(fall);
         int delay = (int)GetPrivateProfileIntW(section, (p + L"FaldDelayFrames").c_str(), 0, iniPath);
         cc.fald.delayFrames = delay < 0 ? 0u : (delay > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)delay);
+        // panel clock (mode 3): closure clamped to 0.05..1 (NaN -> 0.72), parity -1 / 0 / 1 (anything else -> -1 = unknown).
+        // Read as text: GetPrivateProfileInt does not promise negative numbers, and an empty / garbage value must not
+        // parse to 0 (a KNOWN parity).
+        cc.fald.clockClosure = FaldPanelClockClosure(GetPrivateProfileFloat(section, (p + L"FaldTemporalClosure").c_str(), FALD_CLOCK_CLOSURE_DEFAULT, iniPath));
+        wchar_t parityBuf[16] = {};
+        GetPrivateProfileStringW(section, (p + L"FaldTemporalParity").c_str(), L"-1", parityBuf, 16, iniPath);
+        cc.fald.clockParity = FaldPanelClockParityFromText(parityBuf);
     }
     {
         // starfield balancing: absent keys = the defaults (off); every value is clamped to its range (FaldStarfieldClamp)
@@ -199,6 +215,18 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         st.nbHi = GetPrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
         FaldStarfieldClamp(st);
         cc.fald.star = st;
+    }
+    {
+        // glow fill: absent keys = the defaults (off); every value is clamped to its range (FaldGlowClamp)
+        FaldGlowSettings gl;        // defaults = DLC GlowFillParams
+        gl.enabled = GetPrivateProfileBool(section, (p + L"FaldGlowFill").c_str(), false, iniPath);
+        if (p == L"SDR_") gl.enabled = false;   // HDR only (fald.h FaldGlowSupported): the numbers persist, the SDR switch does not
+        gl.strength = GetPrivateProfileFloat(section, (p + L"FaldGlowStrength").c_str(), gl.strength, iniPath);
+        int gr = (int)GetPrivateProfileIntW(section, (p + L"FaldGlowReach").c_str(), (int)gl.reach, iniPath);
+        gl.reach = gr < 0 ? 0u : (unsigned int)gr;
+        gl.capNits = GetPrivateProfileFloat(section, (p + L"FaldGlowCapNits").c_str(), gl.capNits, iniPath);
+        FaldGlowClamp(gl);
+        cc.fald.glow = gl;
     }
 }
 
