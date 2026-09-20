@@ -62,9 +62,21 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 # Defaults baked in so every bare `python -m pytest` is fast + clean here:
 #   -p no:cacheprovider  → .pytest_cache is permission-blocked on this box.
-#   -n auto              → fan the 788 tests across cores (xdist); ~261s → ~120s.
+#   -n auto              → fan the 1523 tests across cores (xdist = the physical core count,
+#                          16 on this box). Measured 2026-09-20: -n 12 / 16 / 24 are within
+#                          noise of each other (250 / 255 / 281 s), because the run is bound by
+#                          its LONGEST TEST (~205 s), not by total CPU (~2000 s) — so more
+#                          workers buy nothing and only add memory-bandwidth contention.
+#   --dist worksteal     → an idle worker steals queued tests from a busy one instead of
+#                          waiting for its own pre-assigned chunk. With the heavy-test spread
+#                          in tests/conftest.py it is worth ~5 % (mean 247 s over 4 runs vs
+#                          260 s over 2 for the default `load`) — but it is here mainly as
+#                          insurance: it is what keeps a stale cost table in that conftest
+#                          from costing real time (880 s vs 377 s on a deliberately bad one).
+# Wall time is set by scheduling here — see the long note in tests/conftest.py before changing
+# any of this; two plausible-looking orderings measured 377 s and 880 s.
 # Debugging one test? Append `-n0` to disable parallelism (lets -s / pdb work).
-addopts = "-p no:cacheprovider -n auto"
+addopts = "-p no:cacheprovider -n auto --dist worksteal"
 markers = [
     "slow: heavy engine/optimizer CV tests (per-node SLSQP, dense cubes). Skip the inner loop with -m 'not slow'.",
 ]
