@@ -126,6 +126,14 @@ eleven times; the value is read, never mutated.
 | total test CPU | 1988 s | 2418 s (see below) |
 | longest single test | 204.8 s | 237.2 s (same test, under load) |
 | wall / longest test | 1.98 | **1.08** |
+| inner loop, `-m "not slow"` | 98.5 s (1501 passed, 5 skipped) | 96.7 s (1511 passed, 5 skipped) |
+
+**The inner loop did not improve, and that is the expected answer.** Once the four dominant
+tests are deselected, the remaining ~950 CPU-seconds over 16 workers give a ~60 s floor that is
+set by total CPU, not by any one test — so there is no idle time for scheduling to reclaim. The
+crash-matrix split still matters there (it removed the 60 s serial test that *was* the inner
+loop's own critical path) but the saving is absorbed by the CPU bound. Anything faster than
+~95 s for `-m "not slow"` has to come from doing less arithmetic, not from better packing.
 
 Total CPU *rises* by ~22 %, and that is expected, not a regression: packing the heavy numerical
 tests so they run **concurrently** costs memory bandwidth. The same test now measures 237 s
