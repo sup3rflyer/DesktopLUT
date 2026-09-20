@@ -203,7 +203,7 @@ class GpuPanelDriveState:
     pass 1c ``g_faldPanelClockSource`` on the R32F zone textures, driven like the C++ ``FaldRunPasses``.
 
     Per frame: :meth:`advance` (``refreshes`` = k, the panel refreshes elapsed since the previous frame was first shown;
-    C++ ``FaldPanelClockStep`` derives it from absolute time) runs the pass ONCE before round 0 — both parity clocks' LED
+    C++ ``FaldPanelClockStep`` / :class:`paneltime.RefreshGrid` derive it from the run times on a phase-locked grid) runs the pass ONCE before round 0 — both parity clocks' LED
     states move toward ``d_prev`` (the previous frame's round-1 instantaneous drives) by the CPU-side blend factors
     (:func:`clock_factors32`; beyond ``MAX_REFRESHES`` exactly 1: a long pause is NOT a reset), in place, and the weighted
     maps for B_true / B_est are written; :meth:`pair` = what RunConv binds in BOTH rounds (the state of a frame depends on

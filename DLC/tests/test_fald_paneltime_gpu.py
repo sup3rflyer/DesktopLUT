@@ -164,10 +164,17 @@ def test_cpp_and_hlsl_carry_the_same_law():
     assert num("FALD_CLOCK_CLOSURE_MAX") == CLOSURE_MAX and num("FALD_CLOCK_SETTLE_MAX") == SETTLE_MAX
     # the C++ order the opt-in WARP replay (test_fald_paneltime_warp.py) checks on a device: the clock pass ONCE, before
     # round 0, only for k >= 1; the next target = the drive texture AFTER round 1
+    # (FaldRunPasses executes the pure FaldPanelClockPlan literally — tests/test_fald.cpp holds the plan's rules: on k = 0
+    # no pass, the maps still bound, the target still replaced; the settle hold paid per elapsed refresh)
     run = cpp[cpp.index("void FaldRunPasses("):]
-    assert run.count("RunPanelClock(r);") == 1 and run.index("if (clockRun) RunPanelClock(r);") < run.index("RunStat(r, 0);")
-    assert "clockRun = (r->clkElapsed >= 1ull);" in run
-    assert run.index("RunStat(r, 1);") < run.index("g_context->CopyResource(r->clkPrevTex, r->driveTex);")
+    assert run.count("RunPanelClock(r);") == 1 and run.index("if (plan.runPass) RunPanelClock(r);") < run.index("RunStat(r, 0);")
+    assert "plan = FaldPanelClockPlan(seeded, r->clkElapsed);" in run
+    assert "if (plan.bindMaps) { trueDrive = r->driveFiltSRV; estDrive = r->clkEstSRV; }" in run and run.count("clkEstSRV") == 1
+    assert run.index("RunStat(r, 1);") < run.index("if (plan.commitPrev) g_context->CopyResource(r->clkPrevTex, r->driveTex);")
+    assert run.count("CopyResource(r->clkPrevTex") == 1 and run.count("plan.seedStates") == 1
+    assert "FaldSettleAccount(r, newContent || resumed, settle, panel);" in run and "settleLeft--" not in run
+    from dlc.fald.paneltime import LOCK_GAIN
+    assert num("FALD_CLOCK_LOCK_GAIN") == LOCK_GAIN
     # the pass: one blend per clock toward the previous frame's drives, the weighted maps, the states advanced in place
     body = re.search(r'g_faldPanelClockSource = R"\((.*?)\)";', sh, re.S).group(1)
     for line in ("float g0 = d - s0, g1 = d - s1;", "float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;",

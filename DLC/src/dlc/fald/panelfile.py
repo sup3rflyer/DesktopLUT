@@ -162,6 +162,49 @@ def read_panel_file(path) -> dict:
     return o
 
 
+def read_dump_meta(path) -> dict[str, str]:
+    """``fald_dump.txt`` (src/fald.cpp DumpFields) as {first word of a line: the rest of the line}. ``path`` = the file
+    or the dump directory."""
+    p = Path(path)
+    if p.is_dir():
+        p = p / "fald_dump.txt"
+    out: dict[str, str] = {}
+    for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, _, rest = line.strip().partition(" ")
+        if key and key not in out:
+            out[key] = rest.strip()
+    return out
+
+
+def dump_zone_rule_reason(panel: dict, dump_meta: dict) -> str | None:
+    """Did the exe that wrote this dump apply the panel file's boost ZONE RULE? A file whose FLD4 word 53 says rule 1
+    (LIT-or-MEAN, work guide C12b) loads fine on a DesktopLUT build from before C12b — that loader never looked at the
+    then-reserved word — and the layer silently counts zones by the LEGACY LIT-or-DIM rule: every ON frame on black gets
+    the wrong boost and nothing refuses. Such a build writes no ``boost_rule`` line. ``panel`` = :func:`read_panel_file`,
+    ``dump_meta`` = :func:`read_dump_meta`. None = consistent (or nothing to check: no boost LUT / the legacy rule)."""
+    if not panel.get("hasBoost") or int(panel.get("boostRule", BOOST_RULE_DIM)) != BOOST_RULE_MEAN:
+        return None
+    if "boost_rule" not in dump_meta:
+        return ("the panel file asks for boost zone rule 1 (LIT-or-MEAN) but the dump has no `boost_rule` line: it was written "
+                "by a DesktopLUT build from before C12b (2026-09-20), which ignores the word and silently applies the legacy "
+                "LIT-or-DIM rule — restart DesktopLUT on a C12b build before trusting any ON read / dump compare")
+    try:
+        rule = int(dump_meta["boost_rule"].split()[0])
+    except (ValueError, IndexError):
+        return f"the dump's `boost_rule` line is unreadable: {dump_meta['boost_rule']!r}"
+    if rule != BOOST_RULE_MEAN:
+        return f"the panel file asks for boost zone rule 1 (LIT-or-MEAN) but the dump reports boost_rule {rule}: the layer ran another panel file / rule"
+    for key, name in (("boost_mean_gamma", "boostMeanGamma"), ("boost_mean_thresh", "boostMeanThresh")):
+        try:
+            got = float(dump_meta[key].split()[0])
+        except (KeyError, ValueError, IndexError):
+            return f"the dump reports boost_rule 1 but no readable `{key}` line"
+        want = float(panel[name])
+        if abs(got - want) > 1e-4 * max(abs(want), 1e-6) + 1e-7:            # the dump prints 6 significant digits
+            return f"the dump's {key} {got:g} is not the panel file's {want:g}: the layer ran another panel file"
+    return None
+
+
 def cb(o: dict, ped_mode_setting: int = 0) -> dict:
     """The derived constant-buffer words (fald.cpp FillCB) the shader actually receives."""
     c = dict(o)

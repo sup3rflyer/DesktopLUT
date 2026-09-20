@@ -114,17 +114,37 @@ def test_a_frame_replaced_inside_its_refresh_never_reaches_the_panel(parity):
         np.testing.assert_array_equal(a.peek()[0], b.peek()[0]); np.testing.assert_array_equal(a.peek()[1], b.peek()[1])
 
 
-def test_refresh_index_from_absolute_time_has_no_drift_and_allows_k_0():
-    from dlc.fald.paneltime import refresh_index
-    assert [refresh_index(t, 16.667) for t in (0.0, 8.0, 8.4, 16.7, 50.0, 1100.0, -5.0)] == [0, 0, 1, 1, 3, 66, 0]
-    assert refresh_index(41.7, 20.833) == 2 and refresh_index(100.0, 0.0) == 0
-    n = [refresh_index(8.3335 * i + 1.0, 16.667) for i in range(1, 201)]        # runs every half period (tests/test_fald.cpp)
-    ks = np.diff([0] + n)
-    assert n[-1] == 100 and sorted(set(ks)) == [0, 1] and int((ks == 0).sum()) == 100
-    rng = np.random.default_rng(4)                                                # 10 000 jittered frames at 47.952 Hz
-    period = 1000.0 / 47.952
-    t = np.arange(1, 10001) * period + rng.uniform(-6.0, 6.0, 10000)
-    assert [refresh_index(v, period) for v in t] == list(range(1, 10001))
+def test_refresh_grid_locks_to_the_runs_when_the_real_period_is_off_nominal():
+    """tests/test_fald.cpp runs the same scenarios through FaldPanelClockStep: the truth uses a REAL period that differs
+    from the model's nominal one (an unlocked grid drifts onto the rounding boundary and dithers k = 0 / 2)."""
+    from dlc.fald.paneltime import LOCK_GAIN, RefreshGrid
+    assert LOCK_GAIN == 0.08
+    rng = np.random.default_rng(11)
+
+    def ks(times, period):
+        g = RefreshGrid(period)
+        return np.array([g.step(t)[1] for t in times]), g
+    for hz in (60.0, 47.952):
+        T = 1000.0 / hz
+        for ppm in (20, 1000, -1000):
+            n = int(hz * 120)
+            k, g = ks(np.arange(n) * T * (1 + ppm * 1e-6) + 3.0 + rng.uniform(-2, 2, n), T)
+            assert np.all(k[1:] == 1) and g.n == n - 1 and abs(g.residual) < 0.25, (hz, ppm)
+    T = 1000.0 / 60.0
+    t = np.arange(3600) * T + 3.0 + rng.uniform(-2, 2, 3600); t[0] += 8.0           # the seeding run half a period late
+    k, _ = ks(t, T)
+    assert np.all(k[60:] == 1) and int((k[1:60] != 1).sum()) <= 3
+    for start in (0, 1):                                                              # a loop twice as fast as the panel
+        t = np.arange(start, 7200) * (T / 2) + 1.5 + rng.uniform(-1, 1, 7200 - start)
+        k, _ = ks(t, T)
+        kk = k[240:]
+        assert kk.max() == 1 and np.all(kk[1:] + kk[:-1] == 1)                        # a stable 1 / 0 alternation, never 2
+    g = RefreshGrid(T)
+    assert g.step(100.0) == (True, 0) and g.step(105.0) == (True, 0)                  # still inside the seeding refresh
+    assert g.step(117.0) == (False, 1) and g.step(124.0) == (False, 0) and g.step(166.0) == (False, 3)
+    assert g.step(166.0 + 5000.0) == (False, 300) and g.runs == 0                     # a long pause: a large k, no reset
+    assert g.step(5166.0 + T - 5.0)[1] == 1 and g.step(5166.0 + T - 10.0) == (False, 0)   # a little backwards: k = 0
+    assert g.step(0.0) == (True, 0) and g.n == 0                                      # far backwards: start over
 
 
 def test_clock_ticks_count_both_parities_for_k_1_to_5():

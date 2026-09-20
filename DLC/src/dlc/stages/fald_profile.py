@@ -1603,6 +1603,47 @@ def fld4_refused_reason(controller, monitor: int, mode: str, bin_path: str) -> s
             "would not run and every ON read would be an OFF read. Restart DesktopLUT on the C12 build")
 
 
+def zone_rule_dump_check(controller, monitor: int, mode: str, bin_path: str, dump_dir: Path, *, sleep, now,
+                         timeout_s: float = 4.0) -> tuple[str, str | None]:
+    """A panel file with the boost zone rule 1 (LIT-or-MEAN, C12b) on a build from before C12b is NOT refused: the old
+    loader ignores the word and the layer silently applies the legacy rule (``state.get`` cannot tell either). The only
+    evidence is a dump — call this with the layer ON: it asks for a ``runtime.fald_dump`` into ``dump_dir`` and holds
+    ``fald_dump.txt`` against the file (:func:`dlc.fald.panelfile.dump_zone_rule_reason`). Returns (status, reason):
+    ``("n/a", None)`` the file has no rule 1 · ``("ok", None)`` · ``("legacy", reason)`` a deterministic mismatch ·
+    ``("unconfirmed", reason)`` no dump could be read (for the LLM to judge, not a verdict)."""
+    from ..fald.panelfile import BOOST_RULE_MEAN, dump_zone_rule_reason, read_dump_meta, read_panel_file
+    try:
+        panel = read_panel_file(bin_path)
+    except (OSError, ValueError) as exc:
+        return "unconfirmed", f"cannot read {bin_path}: {exc}"
+    if not panel.get("hasBoost") or int(panel.get("boostRule", 0)) != BOOST_RULE_MEAN:
+        return "n/a", None
+    dump_dir = Path(dump_dir)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    txt = dump_dir / "fald_dump.txt"
+    try:
+        txt.unlink()
+    except OSError:
+        pass
+    try:
+        controller.call("runtime.fald_dump", {"monitor": monitor, "mode": mode, "dir": str(dump_dir)})
+    except Exception as exc:  # noqa: BLE001
+        return "unconfirmed", f"runtime.fald_dump refused ({exc}): the zone rule the running build applies is unconfirmed"
+    t0 = now()
+    while True:
+        try:
+            if txt.exists() and "\nparams " in txt.read_text(encoding="utf-8", errors="replace"):   # the last line DumpFields writes
+                break
+        except OSError:
+            pass
+        if now() - t0 >= timeout_s:
+            return "unconfirmed", (f"no fald_dump.txt in {dump_dir} after {timeout_s:g} s (the layer did not run a frame?): the "
+                                   "zone rule the running build applies is unconfirmed")
+        sleep(0.1)
+    why = dump_zone_rule_reason(panel, read_dump_meta(txt))
+    return ("legacy", why) if why else ("ok", None)
+
+
 def phase_verify(s: Session, result: StageResult) -> None:
     from ..fald.correct import correct_image, shader_model
     from ..fald.model import FaldModel
@@ -1664,6 +1705,7 @@ def phase_verify(s: Session, result: StageResult) -> None:
                        f"{missing}", "medium")
     rows = []
     order = ("off", "id", "on")
+    zone_rule_status: str | None = None     # boost zone rule 1 (C12b) vs the running build: checked once, on the first ON read
     try:
         for i, p in enumerate(pats):
             if _cancel_requested(s.ctx):
@@ -1673,6 +1715,16 @@ def phase_verify(s: Session, result: StageResult) -> None:
             for st in (order if i % 2 == 0 else order[::-1]):
                 overlay.set(st)
                 ys[st] = s.read(f"{p.name} {st.upper()}", p.shapes, p.field)[0]
+                if st == "on" and zone_rule_status is None and not s.simulated:
+                    zone_rule_status, zr_why = zone_rule_dump_check(ctl, s.args.monitor, mode, bin_path, _out_dir(s.ctx) / "verify_zone_rule_dump",
+                                                                    sleep=s.sleep, now=s.now)
+                    result.metrics["zone_rule_check"] = zone_rule_status
+                    if zone_rule_status == "unconfirmed":
+                        result.anomaly("zone_rule_unconfirmed", str(zr_why), "medium")
+            if zone_rule_status == "legacy":
+                # deterministic: the file says rule 1, the exe's dump has no / another rule — every ON read is the wrong layer
+                result.block("layer_unavailable", str(zr_why))
+                break
             y_off, y_id, y_on = ys["off"], ys["id"], ys["on"]
             img = model.render(p.shapes)
             cm = g.canvas_meter(params)
