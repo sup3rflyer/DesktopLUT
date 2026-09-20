@@ -18,10 +18,13 @@ The LCD itself is treated as instant (its 12–30 ms transitions are below the f
 
 The shader's form of the law (temporal mode 3 "panel clock", work guide C13; ``src/fald.cpp`` ``FaldPanelClockFactors``,
 ``src/fald_shader.h`` ``g_faldPanelClockSource``; GPU-order twin :class:`dlc.fald.gpuemu.GpuPanelDriveState`): a frame
-stays on the panel for k >= 1 REFRESHES (Desktop Duplication delivers frames on change only, 24-fps video holds a frame
+stays on the panel for k REFRESHES (Desktop Duplication delivers frames on change only, 24-fps video holds a frame
 2–3 refreshes), and k refreshes with the same target collapse into one blend — :func:`clock_ticks` /
 :func:`blend_factors`; ``refreshes=k`` on :meth:`PanelClock.step` / :meth:`PanelDriveState.commit` is the same thing
-as k single steps.
+as k single steps. k comes from ABSOLUTE time (:func:`refresh_index`: no rounding drift), so k = 0 is real — the render
+loop may run more than once per refresh of this monitor (a faster display elsewhere on the desktop): a frame replaced inside its
+refresh never reached the panel (``refreshes=0`` records nothing). A long static pause is no reset: the reference simply
+steps through it; the shader's form takes the blends as exactly 1 beyond ``MAX_REFRESHES``.
 """
 from __future__ import annotations
 
@@ -37,8 +40,12 @@ from .model import FaldModel
 MODE_PANEL = 3                  # FaldSettings::temporalMode / runtime.fald_temporal temporal_mode (C++ FALD_TEMPORAL_PANEL)
 CLOSURE_DEFAULT = 0.72          # C++ FALD_CLOCK_CLOSURE_DEFAULT
 CLOSURE_MIN, CLOSURE_MAX = 0.05, 1.0   # the range the settings / pipe / CB enforce (C++ FALD_CLOCK_CLOSURE_MIN / _MAX)
-MAX_REFRESHES = 64              # more elapsed refreshes than this between two frames: the state is reset (C++ FALD_CLOCK_MAX_REFRESHES)
-SETTLE_RESIDUAL = 0.005         # the settle hold ends when this share of a step is left
+MAX_REFRESHES = 64              # more elapsed refreshes than this between two frames: the panel has settled on the earlier
+                                # one, the shader's blends are exactly 1 — NOT a reset (C++ FALD_CLOCK_MAX_REFRESHES)
+SETTLE_RESIDUAL = 0.0005        # the settle hold ends when this share of a DRIVE step is left (0.005 left the output moving
+                                # ~1.4 % per frame after a 5 -> 1842-nit step: the round-1 drives feed back through the correction)
+SETTLE_MAX = 120                # cap of the settle hold in refreshes (C++ FALD_CLOCK_SETTLE_MAX): a low closure must not
+                                # re-render a static desktop for seconds
 
 
 @dataclass(frozen=True)
@@ -47,6 +54,15 @@ class PanelTimeLaw:
     closure: float = 0.72       # share of the remaining drive gap closed per tick (measured 0.63–0.78)
     latency_frames: int = 1     # a tick sees content at least this many frames old
     est_lag_frames: int = 1     # the LCD compensation follows the LED state this many frames later
+
+
+def refresh_index(t_ms: float, period_ms: float) -> int:
+    """Absolute refresh index of a run ``t_ms`` after the run that seeded the state: floor(t / period + 0.5); 0 for a
+    negative time or an unusable period. k = the difference of two runs' indices (0 = the same refresh). Mirrors C++
+    ``FaldPanelClockIndex``."""
+    if not (period_ms > 0.0) or not (t_ms > 0.0):
+        return 0
+    return int(math.floor(t_ms / period_ms + 0.5))
 
 
 def clock_ticks(n_a: int, k: int, parity: int, tick_frames: int = 2) -> tuple[int, int]:
@@ -63,18 +79,21 @@ def clock_ticks(n_a: int, k: int, parity: int, tick_frames: int = 2) -> tuple[in
 
 def blend_factors(n_a: int, k: int, closure: float, parity: int, tick_frames: int = 2) -> tuple[float, float]:
     """``(aS, aP)`` with ``a = 1 − (1 − closure)^ticks``: S(n_b) = S + aS (d_prev − S), S(n_b − 1) = S + aP (d_prev − S)
-    — t ticks toward one target are one blend."""
+    — t ticks toward one target are one blend. Beyond ``MAX_REFRESHES`` the shader's form takes both as exactly 1."""
+    if k > MAX_REFRESHES:
+        return 1.0, 1.0
     ts, tp = clock_ticks(n_a, k, parity, tick_frames)
     return 1.0 - (1.0 - closure) ** ts, 1.0 - (1.0 - closure) ** tp
 
 
 def settle_refreshes(closure: float) -> int:
-    """Refreshes the layer keeps re-rendering after the last content change: m = ceil(ln(residual) / ln(1 − closure))
-    ticks (at least one) leave ``SETTLE_RESIDUAL`` of a step, the m-th tick is at most 2 m refreshes away, the
-    compensation follows one later: 2 m + 2 (closure 0.72 -> 12). Mirrors C++ ``FaldPanelClockSettleFrames``."""
+    """ELAPSED REFRESHES (not runs) the layer keeps re-rendering after the last content change: m =
+    ceil(ln(residual) / ln(1 − closure)) ticks (at least one) leave ``SETTLE_RESIDUAL`` of a step, the m-th tick is at
+    most 2 m refreshes away, the compensation follows one later: 2 m + 2 (closure 0.72 -> 14), capped at ``SETTLE_MAX``.
+    Mirrors C++ ``FaldPanelClockSettleFrames``."""
     c = min(max(float(closure), CLOSURE_MIN), CLOSURE_MAX)
     m = 1 if c >= 1.0 else max(1, int(math.ceil(math.log(SETTLE_RESIDUAL) / math.log(1.0 - c) - 1e-9)))
-    return 2 * m + 2
+    return min(2 * m + 2, SETTLE_MAX)
 
 
 class PanelClock:
@@ -102,12 +121,16 @@ class PanelClock:
         """Feed the instantaneous zone drives of the frame now on the LCD; returns (LED state, the state the panel's
         compensation uses) for this frame. The first frame finds the panel settled on it. ``refreshes`` = k: the frame
         stays on the panel for k refreshes (k single steps with the same drives); the returned pair is the one of its
-        FIRST refresh — what :meth:`peek` announced and a correction's fields describe."""
-        if int(refreshes) < 1:
-            raise ValueError(f"refreshes must be >= 1, got {refreshes!r}")
+        FIRST refresh — what :meth:`peek` announced and a correction's fields describe. k = 0: the frame was replaced
+        inside its refresh and never reached the panel — nothing is recorded (the pair is still the announced one)."""
+        if int(refreshes) < 0:
+            raise ValueError(f"refreshes must be >= 0, got {refreshes!r}")
         law = self.law
         d = np.asarray(drives, dtype=np.float64)
         first = None
+        if int(refreshes) == 0:
+            pk = self.peek()
+            return (d.copy(), d.copy()) if pk is None else pk
         for _ in range(int(refreshes)):
             pk = self.peek()
             s = d.copy() if pk is None else pk[0]

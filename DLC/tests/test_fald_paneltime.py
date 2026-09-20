@@ -92,7 +92,39 @@ def test_refreshes_k_is_k_single_steps_with_the_same_drives(parity):
         assert a.n == b.n
         np.testing.assert_array_equal(a.peek()[0], b.peek()[0]); np.testing.assert_array_equal(a.peek()[1], b.peek()[1])
     with pytest.raises(ValueError):
-        a.step(np.zeros((3, 4)), refreshes=0)
+        a.step(np.zeros((3, 4)), refreshes=-1)
+
+
+@pytest.mark.parametrize("parity", [0, 1])
+def test_a_frame_replaced_inside_its_refresh_never_reaches_the_panel(parity):
+    """refreshes=0 (the render loop ran twice inside one refresh of this monitor): the announced pair comes back, nothing
+    is recorded — the sequence with such frames equals the sequence without them."""
+    rng = np.random.default_rng(9)
+    a, b = PanelClock(PanelTimeLaw(), parity), PanelClock(PanelTimeLaw(), parity)
+    ghost = rng.random((2, 2))
+    got = a.step(ghost, refreshes=0)                                  # before the first frame: no state, nothing kept
+    np.testing.assert_array_equal(got[0], ghost); assert a.peek() is None and a.n == 0
+    for k in (1, 2, 1, 3):
+        d = rng.random((2, 2))
+        a.step(d, refreshes=k); b.step(d, refreshes=k)
+        pk = a.peek()
+        got = a.step(rng.random((2, 2)), refreshes=0)
+        np.testing.assert_array_equal(got[0], pk[0]); np.testing.assert_array_equal(got[1], pk[1])
+        assert a.n == b.n
+        np.testing.assert_array_equal(a.peek()[0], b.peek()[0]); np.testing.assert_array_equal(a.peek()[1], b.peek()[1])
+
+
+def test_refresh_index_from_absolute_time_has_no_drift_and_allows_k_0():
+    from dlc.fald.paneltime import refresh_index
+    assert [refresh_index(t, 16.667) for t in (0.0, 8.0, 8.4, 16.7, 50.0, 1100.0, -5.0)] == [0, 0, 1, 1, 3, 66, 0]
+    assert refresh_index(41.7, 20.833) == 2 and refresh_index(100.0, 0.0) == 0
+    n = [refresh_index(8.3335 * i + 1.0, 16.667) for i in range(1, 201)]        # runs every half period (tests/test_fald.cpp)
+    ks = np.diff([0] + n)
+    assert n[-1] == 100 and sorted(set(ks)) == [0, 1] and int((ks == 0).sum()) == 100
+    rng = np.random.default_rng(4)                                                # 10 000 jittered frames at 47.952 Hz
+    period = 1000.0 / 47.952
+    t = np.arange(1, 10001) * period + rng.uniform(-6.0, 6.0, 10000)
+    assert [refresh_index(v, period) for v in t] == list(range(1, 10001))
 
 
 def test_clock_ticks_count_both_parities_for_k_1_to_5():
@@ -137,18 +169,18 @@ def test_closed_form_blend_equals_k_single_steps(parity):
         s, d_prev, n_a = want_true, d, n_a + k
 
 
-def test_settle_refreshes_follow_the_spec_formula():
+def test_settle_refreshes_formula_and_cap():
     from dlc.fald.paneltime import PanelDriveState, settle_refreshes
-    assert settle_refreshes(0.72) == 12                              # 2 * ceil(ln 0.005 / ln 0.28) + 2 (tests/test_fald.cpp pins the same)
-    assert settle_refreshes(0.5) == 18 and settle_refreshes(1.0) == 4 and settle_refreshes(0.05) == 210
-    assert settle_refreshes(7.0) == 4 and settle_refreshes(-1.0) == 210       # clamped to 0.05 .. 1
-    assert PanelDriveState(PanelTimeLaw(closure=0.72)).settle_frames() == 12
-    # after that many refreshes of a static frame the state is within 0.5 % of the step, whatever the parity
+    assert settle_refreshes(0.72) == 14                              # 2 * ceil(ln 0.0005 / ln 0.28) + 2 (tests/test_fald.cpp pins the same)
+    assert settle_refreshes(0.5) == 24 and settle_refreshes(1.0) == 4 and settle_refreshes(0.05) == 120   # 300 uncapped
+    assert settle_refreshes(7.0) == 4 and settle_refreshes(-1.0) == 120       # clamped to 0.05 .. 1
+    assert PanelDriveState(PanelTimeLaw(closure=0.72)).settle_frames() == 14
+    # after that many refreshes of a static frame the state is within 0.05 % of the step, whatever the parity
     for parity in (0, 1):
         c = PanelClock(PanelTimeLaw(closure=0.72), parity)
-        c.step(np.array([[0.0]])); c.step(np.array([[1.0]]), refreshes=12)
+        c.step(np.array([[0.0]])); c.step(np.array([[1.0]]), refreshes=14)
         true, est = c.peek()
-        assert 1.0 - float(true[0, 0]) <= 0.005 and 1.0 - float(est[0, 0]) <= 0.005
+        assert 1.0 - float(true[0, 0]) <= 0.0005 and 1.0 - float(est[0, 0]) <= 0.0005
 
 
 def test_drive_state_commit_takes_refreshes():

@@ -336,11 +336,11 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert st3["0:HDR"]["fald_temporal_closure"] == 0.72 and st3["0:HDR"]["fald_temporal_parity"] == -1
     pc = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 3, "closure": 0.72, "parity": -1})
     assert pc.ok and pc.result["temporal_mode"] == 3 and pc.result["closure"] == 0.72 and pc.result["parity"] == -1
-    assert pc.result["settle_frames_60hz"] == 12                                        # mode 3: 2 ceil(ln 0.005 / ln 0.28) + 2 refreshes
+    assert pc.result["settle_frames_60hz"] == 14                                        # mode 3: 2 ceil(ln 0.0005 / ln 0.28) + 2 refreshes
     only_parity = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1})
     assert only_parity.ok and only_parity.result["temporal_mode"] == 3 and only_parity.result["parity"] == 1
     only_closure = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "closure": 0.5})
-    assert only_closure.ok and only_closure.result["closure"] == 0.5 and only_closure.result["settle_frames_60hz"] == 18
+    assert only_closure.ok and only_closure.result["closure"] == 0.5 and only_closure.result["settle_frames_60hz"] == 24
     st3 = client.call("state.get", {}).result["layers"]
     assert st3["0:HDR"]["fald_temporal_mode"] == 3 and st3["0:HDR"]["fald_temporal_closure"] == 0.5 and st3["0:HDR"]["fald_temporal_parity"] == 1
     assert st3["0:SDR"]["fald_temporal_mode"] == 1 and st3["0:SDR"]["fald_temporal_closure"] == 0.72                # per mode

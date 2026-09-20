@@ -403,7 +403,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "default 0.72) of the gap to the drive of the frame one refresh earlier, the panel's compensation follows one "
             "refresh later; `parity` = which refresh it ticks on: -1 unknown (default: the mean of both clocks), 0 / 1 "
             "known (experimental — the wrong one is as bad as no time law). tau / delay are not used by mode 3; "
-            "settle_frames_60hz is then its settle hold in refreshes (closure 0.72 -> 12).",
+            "settle_frames_60hz is then its settle hold in elapsed refreshes (closure 0.72 -> 14, capped at 120).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

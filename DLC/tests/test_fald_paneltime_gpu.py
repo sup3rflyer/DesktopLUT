@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from dlc.fald.gpuemu import GpuPanelDriveState, clock_factors32
-from dlc.fald.paneltime import (CLOSURE_DEFAULT, CLOSURE_MAX, CLOSURE_MIN, MAX_REFRESHES, MODE_PANEL, PanelDriveState,
+from dlc.fald.paneltime import (CLOSURE_DEFAULT, CLOSURE_MAX, CLOSURE_MIN, MAX_REFRESHES, MODE_PANEL, SETTLE_MAX, PanelDriveState,
                                 PanelTimeLaw, blend_factors, settle_refreshes)
 
 _SRC = Path(__file__).resolve().parents[2] / "src"
@@ -26,7 +26,7 @@ def test_twin_equals_the_reference_with_k_refreshes_per_frame(parity):
     same number as k = the refreshes ELAPSED when the next frame arrives."""
     g, s = _pair(parity)
     rng = np.random.default_rng(7)
-    holds = [1, 1, 2, 3, 1, 5, 2, 1, 1, 4, 3, 2]
+    holds = [1, 1, 2, 3, 0, 1, 5, 2, 0, 0, 1, 1, 4, 70, 3, 200, 2]          # 0 = replaced inside its refresh; 70 / 200 = long pauses
     k = 1
     for i, h in enumerate(holds):
         d = rng.uniform(0, 1, (12, 12)) if i % 4 else np.round(rng.uniform(0, 1, (12, 12)))   # steps and noise
@@ -36,7 +36,7 @@ def test_twin_equals_the_reference_with_k_refreshes_per_frame(parity):
         assert np.allclose(gt, st, atol=2e-6) and np.allclose(ge, se, atol=2e-6), i
         g.commit(d); s.commit(d, refreshes=h)
         k = h
-    assert g.n == sum(holds[:-1])                                    # the running refresh index: n += k
+    assert g.s is not None and g.n == sum(holds[:-1])                # the refresh index: n += k; the long pauses were no reset
 
 
 def test_first_frame_and_reset_are_the_stateless_layer():
@@ -54,10 +54,35 @@ def test_first_frame_and_reset_are_the_stateless_layer():
         t, e = g.pair(d1)
         assert np.array_equal(t, d1.astype(np.float32)) and np.array_equal(e, d1.astype(np.float32))
         g.commit(d1)
-    g.advance(MAX_REFRESHES + 1)                                     # a gap the state cannot bridge = a reset
+    g.commit(d0)                                                     # a change, then a long static pause: NOT a reset —
+    g.advance(MAX_REFRESHES + 1)                                     # the clocks have settled on it (blends exactly 1)
+    assert g.s is not None and g.n == 5 + MAX_REFRESHES + 1 and [float(v) for v in g.factors[:4]] == [1.0] * 4
+    t, e = g.pair(d1)
+    assert np.allclose(t, d0, atol=1e-7) and np.array_equal(t, e)
+    g.reset()                                                        # the C++ reset rules (layer idle, setting / period change)
     assert g.s is None and np.array_equal(g.pair(d0)[0], d0.astype(np.float32))
-    g.commit(d0); g.advance(MAX_REFRESHES)                           # 64 itself is bridged
-    assert g.s is not None and g.n == MAX_REFRESHES
+
+
+def test_k_0_holds_the_maps_replaces_the_target_and_reseeds_inside_the_seeding_refresh():
+    g = GpuPanelDriveState(0.72, -1)
+    a, b, c = np.full((3, 3), 0.2), np.full((3, 3), 1.0), np.full((3, 3), 0.6)
+    g.advance(0); g.commit(a)                                        # seed
+    g.advance(0)                                                     # a second frame inside the seeding refresh: re-seed
+    assert g.s is None and np.array_equal(g.pair(b)[0], b.astype(np.float32))
+    g.commit(b)
+    assert np.array_equal(g.s[0], b.astype(np.float32)) and g.n == 0
+    g.advance(1); t1, e1 = g.pair(c); g.commit(c)                    # refresh 1: target c from here on ...
+    s_before = [v.copy() for v in g.s]
+    g.advance(0)                                                     # ... but a frame arrives inside refresh 1 again
+    t2, e2 = g.pair(a)
+    assert t2 is t1 and e2 is e1 and g.n == 1                        # the maps are held, nothing advances
+    assert all(np.array_equal(x, y) for x, y in zip(g.s, s_before))
+    g.commit(a)                                                      # the later frame is the one the panel shows
+    g.advance(2)
+    assert np.all(g.true < 1.0) and np.all(g.true <= b.astype(np.float32))      # moving from b toward a (0.2), not c (0.6)
+    ref = GpuPanelDriveState(0.72, -1)                               # = the sequence without the replaced frame
+    ref.advance(0); ref.commit(b); ref.advance(1); ref.commit(a); ref.advance(2)
+    assert np.array_equal(g.true, ref.true) and np.array_equal(g.est, ref.est)
 
 
 def test_both_rounds_read_the_same_maps_and_the_state_ignores_this_frames_drives():
@@ -120,9 +145,9 @@ def test_emulator_sequence_with_the_panel_clock(tmp_path):
     assert float(lag["drive_true"][5, 5]) > float(lag["drive_est"][5, 5]) and np.array_equal(lag["drive_est"], first["drive1"])
     for _ in range(settle_refreshes(0.72) + 4):
         out = emu.run(bright, fp16_out=False, temporal=g, refreshes=1)
-    # at rest both maps ARE the frame's own round-1 drives: fields -> (d, d). (The OUTPUT is then the inverse iterated one
-    # round per frame, like mode 1 at rest — temporal.py's docstring: <= 0.1 % from the two-round stateless output on the
-    # fitted PA32UCXR model, far more on this unfitted toy model — so it is not compared here.)
+    # at rest both maps ARE the frame's own round-1 drives: fields -> (d, d). The OUTPUT converges to the inverse's fixed
+    # point (one round per frame): <= 0.4 % from the two-round stateless output on the fitted PA32UCXR model (main session
+    # check 2026-09-20); on this unfitted toy model the two differ far more, so it is not compared here.
     assert np.allclose(out["drive_true"], out["drive1"], atol=5e-3) and np.allclose(out["drive_est"], out["drive1"], atol=5e-3)
     assert np.allclose(out["drive_true"], out["drive_est"], atol=5e-3)
 
@@ -136,7 +161,13 @@ def test_cpp_and_hlsl_carry_the_same_law():
     num = lambda name: float(re.search(name + r" = ([-\d.]+)f?u?;", h).group(1))
     assert num("FALD_TEMPORAL_PANEL") == MODE_PANEL and num("FALD_CLOCK_MAX_REFRESHES") == MAX_REFRESHES
     assert num("FALD_CLOCK_CLOSURE_DEFAULT") == CLOSURE_DEFAULT and num("FALD_CLOCK_CLOSURE_MIN") == CLOSURE_MIN
-    assert num("FALD_CLOCK_CLOSURE_MAX") == CLOSURE_MAX
+    assert num("FALD_CLOCK_CLOSURE_MAX") == CLOSURE_MAX and num("FALD_CLOCK_SETTLE_MAX") == SETTLE_MAX
+    # the C++ order the opt-in WARP replay (test_fald_paneltime_warp.py) checks on a device: the clock pass ONCE, before
+    # round 0, only for k >= 1; the next target = the drive texture AFTER round 1
+    run = cpp[cpp.index("void FaldRunPasses("):]
+    assert run.count("RunPanelClock(r);") == 1 and run.index("if (clockRun) RunPanelClock(r);") < run.index("RunStat(r, 0);")
+    assert "clockRun = (r->clkElapsed >= 1ull);" in run
+    assert run.index("RunStat(r, 1);") < run.index("g_context->CopyResource(r->clkPrevTex, r->driveTex);")
     # the pass: one blend per clock toward the previous frame's drives, the weighted maps, the states advanced in place
     body = re.search(r'g_faldPanelClockSource = R"\((.*?)\)";', sh, re.S).group(1)
     for line in ("float g0 = d - s0, g1 = d - s1;", "float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;",
