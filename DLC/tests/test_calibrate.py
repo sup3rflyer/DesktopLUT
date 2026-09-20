@@ -3440,41 +3440,53 @@ def test_planned_stages_match_announced_phases_per_flow(tmp_path: Path):
     run_and_check("ps_gswb", "grayscale-wb", controller=full.controller)
 
 
-def test_crash_resume_matrix_replays_to_identical_outcome(tmp_path: Path):
+_CRASH_POINTS = ["preflight", "whitepoint", "enter-neutral", "brightness",
+                 "measure:raw", "build-install-mhc", "refine-mhc-grayscale",
+                 "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify"]
+
+
+@pytest.fixture(scope="module")
+def uncrashed_verify_digest(tmp_path_factory) -> object:
+    """The verify digest of an UNCRASHED full run — the reference every crash point is held to.
+
+    Module-scoped only to stop the resume matrix paying for the same baseline eleven times;
+    the value is read, never mutated, and the run dir behind it is never reopened.
+    """
+    baseline = _make(tmp_path_factory.mktemp("crash_base"), "crash_baseline")
+    assert baseline.run("full").status == "completed"
+    return baseline.calib["stages"]["verify"]["digest"]
+
+
+@pytest.mark.parametrize("key", _CRASH_POINTS)
+def test_crash_resume_matrix_replays_to_identical_outcome(tmp_path: Path, key: str,
+                                                          uncrashed_verify_digest):
     # The 7a resume matrix: crash (an unhandled exception — simulated process death) inside
     # EVERY stage of the full flow, resume the run dir fresh, and require (a) completion,
     # (b) every stage recorded before the crash replays from the memo (never re-measured),
     # (c) the final verify digest is IDENTICAL to an uncrashed baseline run's.
-    baseline = _make(tmp_path, "crash_baseline")
-    assert baseline.run("full").status == "completed"
-    base_verify = baseline.calib["stages"]["verify"]["digest"]
+    # One parameter per crash point: same matrix, one case per test so xdist spreads it.
+    name = f"crash_{key.replace(':', '_')}"
+    calib = _make(tmp_path, name)
+    orig = calib._stage
 
-    crash_points = ["preflight", "whitepoint", "enter-neutral", "brightness",
-                    "measure:raw", "build-install-mhc", "refine-mhc-grayscale",
-                    "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify"]
-    for key in crash_points:
-        name = f"crash_{key.replace(':', '_')}"
-        calib = _make(tmp_path, name)
-        orig = calib._stage
+    def boom(k, fn, _target=key, _orig=orig):
+        if k == _target:
+            raise _Boom(k)          # dies mid-stage: nothing memoised for this stage
+        return _orig(k, fn)
 
-        def boom(k, fn, _target=key, _orig=orig):
-            if k == _target:
-                raise _Boom(k)          # dies mid-stage: nothing memoised for this stage
-            return _orig(k, fn)
+    calib._stage = boom
+    with pytest.raises(_Boom):
+        calib.run("full")
+    done_before = {k for k, v in calib.calib["stages"].items()
+                   if (v or {}).get("status") == "done"}
 
-        calib._stage = boom
-        with pytest.raises(_Boom):
-            calib.run("full")
-        done_before = {k for k, v in calib.calib["stages"].items()
-                       if (v or {}).get("status") == "done"}
-
-        resumed = _make(tmp_path, name)
-        result = resumed.run("full")
-        assert result.status == "completed", key
-        replayed = {e.stage for e in read_events(resumed.ctx.events_path)
-                    if e.event == Ev.STAGE_DONE and e.data.get("replayed")}
-        assert done_before <= replayed, key
-        assert resumed.calib["stages"]["verify"]["digest"] == base_verify, key
+    resumed = _make(tmp_path, name)
+    result = resumed.run("full")
+    assert result.status == "completed", key
+    replayed = {e.stage for e in read_events(resumed.ctx.events_path)
+                if e.event == Ev.STAGE_DONE and e.data.get("replayed")}
+    assert done_before <= replayed, key
+    assert resumed.calib["stages"]["verify"]["digest"] == uncrashed_verify_digest, key
 
 
 def test_resume_after_report_crash_replays_over_existing_artifacts(tmp_path: Path):
