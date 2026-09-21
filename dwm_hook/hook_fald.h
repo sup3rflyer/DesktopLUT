@@ -92,6 +92,9 @@ void FaldMarkAllStale();
 bool FaldHasAnyPanelFile();
 ID3D11Texture2D* FaldCleanTexture(FaldMonitor* m);
 ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
+// Ask the host for one full-screen DWM recomposition (primes any dirty-rect-fed clean copy on a static desktop).
+// Throttled to once a second across all callers; false = not signalled this time, ask again later.
+bool HookRequestFullRecompose();
 
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
 // the next run. star / glow: the merged starfield feature and its glow-fill part (glow only with star,

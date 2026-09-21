@@ -7,6 +7,7 @@
 #include "noise.h"
 #include "dwm_hook_config.h"
 #include "peak_detect.h"
+#include "dirty_cover.h"
 
 #include <string>
 #include <sstream>
@@ -72,11 +73,41 @@ struct HookPeakSlot {
 	ID3D11Texture2D* rawTexture;            // 1x1 R32_UINT raw max (InterlockedMax target, reset by pass 2)
 	ID3D11UnorderedAccessView* rawUAV;
 	bool createFailed;                      // don't retry the allocation on every present
+
+	// Source: THIS monitor's composed frame, the detector's input and the LUT pass's source. The
+	// shared staging texture (texture[1]) cannot be the detector's input: it is one texture for every
+	// FP16 monitor, so outside this present's dirty rects it holds whichever monitor last covered
+	// that region — and the back buffer outside them holds last frame's corrected output. Fed from
+	// this monitor's dirty rects BEFORE the detector runs (PeakSourceUpdate); `srcCover` tracks
+	// whether every pixel has been refreshed since it went stale (shared/dirty_cover.h). Until then
+	// the not-yet-refreshed part reads as black (the peak can only undershoot, towards the floor)
+	// and the host is asked for one full-screen recomposition. Allocated on the first dynamic-peak
+	// present of the monitor, never per frame; freed after PEAK_SRC_RELEASE_AFTER presents unused.
+	ID3D11Texture2D* srcTexture;
+	ID3D11ShaderResourceView* srcSRV;
+	UINT srcWidth, srcHeight;
+	DXGI_FORMAT srcFormat;
+	bool srcCreateFailed;                   // per size/format: fall back to the shared staging texture
+	bool srcPrimeRequested;                 // asked the host for a recompose since the copy was last primed
+	unsigned int srcOffPresents;            // consecutive presents of this monitor that did not feed it
+	DirtyCover srcCover;
 };
 static const int MAX_PEAK_SLOTS = 16;
+static const unsigned int PEAK_SRC_COVER_TILE = 32u;       // priming coverage granularity (px)
+static const unsigned int PEAK_SRC_RELEASE_AFTER = 600u;   // presents unused before the source copy is freed
 static PeakSlotKey g_peakSlotKeys[MAX_PEAK_SLOTS] = {};
 static HookPeakSlot g_peakSlots[MAX_PEAK_SLOTS] = {};
 static unsigned long long g_peakSlotClock = 0;
+
+static void ReleasePeakSource(HookPeakSlot& s) {
+	RELEASE_IF_NOT_NULL(s.srcSRV)
+	RELEASE_IF_NOT_NULL(s.srcTexture)
+	s.srcWidth = s.srcHeight = 0;
+	s.srcFormat = DXGI_FORMAT_UNKNOWN;
+	s.srcPrimeRequested = false;
+	s.srcOffPresents = 0;
+	s.srcCover = DirtyCover();
+}
 
 static void ReleasePeakSlot(HookPeakSlot& s) {
 	RELEASE_IF_NOT_NULL(s.peakSRV)
@@ -84,6 +115,8 @@ static void ReleasePeakSlot(HookPeakSlot& s) {
 	RELEASE_IF_NOT_NULL(s.peakTexture)
 	RELEASE_IF_NOT_NULL(s.rawUAV)
 	RELEASE_IF_NOT_NULL(s.rawTexture)
+	ReleasePeakSource(s);
+	s.srcCreateFailed = false;
 }
 
 static void ReleasePeakSlots() {
@@ -134,6 +167,9 @@ static HookPeakSlot* GetPeakSlot(int left, int top) {
 	HookPeakSlot& s = g_peakSlots[i];
 	if (fresh) {
 		s.createFailed = false;  // a new monitor gets one attempt of its own
+		// The source copy holds another monitor's pixels: drop it, the next update allocates anew.
+		ReleasePeakSource(s);
+		s.srcCreateFailed = false;
 		if (s.peakUAV) ResetPeakState(deviceContext, s.peakUAV, s.rawUAV);
 		char msg[128];
 		snprintf(msg, sizeof(msg), "Peak state slot %d assigned to monitor (%d,%d)", i, left, top);
@@ -141,6 +177,93 @@ static HookPeakSlot* GetPeakSlot(int left, int top) {
 	}
 	if (!s.peakUAV && !s.createFailed) CreatePeakSlot(s);
 	return (s.peakUAV && s.peakSRV && s.rawUAV) ? &s : NULL;
+}
+
+// A present of this monitor did not feed the source copy (dynamic peak off, the FALD layer's own
+// clean copy in use, another mode, a present that never reached RenderLUT): its rects are missing
+// from the copy, so it must be re-primed. Frees the copy after PEAK_SRC_RELEASE_AFTER such presents.
+static void PeakSourceStale(HookPeakSlot& s) {
+	if (!s.srcTexture) return;
+	if (s.srcCover.left != s.srcCover.tiles.size()) s.srcCover.Reset();
+	// srcPrimeRequested stays set until a priming completes: a monitor that goes stale on every
+	// present (a persistent failure) asks the host for one recompose, not one a second.
+	if (++s.srcOffPresents > PEAK_SRC_RELEASE_AFTER) {
+		ReleasePeakSource(s);
+		log_to_file("Peak source copy unused for a while - GPU memory released");
+	}
+}
+
+static void PeakSourceMarkStale(int left, int top) {
+	for (int i = 0; i < MAX_PEAK_SLOTS; i++)
+		if (g_peakSlotKeys[i].used && g_peakSlotKeys[i].left == left && g_peakSlotKeys[i].top == top)
+			PeakSourceStale(g_peakSlots[i]);
+}
+
+static void PeakSourceMarkAllStale() {
+	for (int i = 0; i < MAX_PEAK_SLOTS; i++)
+		if (g_peakSlotKeys[i].used) PeakSourceStale(g_peakSlots[i]);
+}
+
+// Copy this present's dirty rects into the monitor's source copy, (re)creating it at the back
+// buffer's size and format. Returns the copy's view, or NULL when it cannot be had (the caller
+// falls back to the shared staging texture). Must run before anything reads the frame.
+static ID3D11ShaderResourceView* PeakSourceUpdate(HookPeakSlot& s, int left, int top, ID3D11Texture2D* backBuffer,
+	const D3D11_TEXTURE2D_DESC& bb, const struct tagRECT* rects, int numRects)
+{
+	if (s.srcTexture && (s.srcWidth != bb.Width || s.srcHeight != bb.Height || s.srcFormat != bb.Format)) {
+		ReleasePeakSource(s);
+		s.srcCreateFailed = false;   // a new size gets one attempt of its own
+	}
+	if (!s.srcTexture) {
+		if (s.srcCreateFailed) return NULL;
+		try {
+			D3D11_TEXTURE2D_DESC d = {};
+			d.Width = bb.Width;
+			d.Height = bb.Height;
+			d.MipLevels = 1;
+			d.ArraySize = 1;
+			d.Format = bb.Format;
+			d.SampleDesc.Count = 1;
+			d.Usage = D3D11_USAGE_DEFAULT;
+			d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			EXECUTE_WITH_LOG(device->CreateTexture2D(&d, NULL, &s.srcTexture))
+			EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)s.srcTexture, NULL, &s.srcSRV))
+		}
+		catch (...) {
+			ReleasePeakSource(s);
+			s.srcCreateFailed = true;
+			log_to_file("WARNING: peak source copy creation failed - this monitor's dynamic peak reads the shared staging texture");
+			return NULL;
+		}
+		s.srcWidth = bb.Width;
+		s.srcHeight = bb.Height;
+		s.srcFormat = bb.Format;
+		s.srcCover.Init(bb.Width, bb.Height, PEAK_SRC_COVER_TILE);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "Peak source copy for monitor (%d,%d) created %ux%u", left, top, bb.Width, bb.Height);
+		log_to_file(msg);
+	}
+	s.srcOffPresents = 0;
+	const bool wasPrimed = s.srcCover.Primed();
+	for (int i = 0; i < numRects; i++) {
+		unsigned l, t, r, b;
+		if (!s.srcCover.Clip(rects[i].left, rects[i].top, rects[i].right, rects[i].bottom, l, t, r, b)) continue;
+		D3D11_BOX box = { l, t, 0, r, b, 1 };
+		deviceContext->CopySubresourceRegion((ID3D11Resource*)s.srcTexture, 0, l, t, 0, (ID3D11Resource*)backBuffer, 0, &box);
+		if (!wasPrimed) s.srcCover.Mark(l, t, r, b);
+	}
+	if (!wasPrimed) {
+		if (s.srcCover.Primed()) {
+			s.srcPrimeRequested = false;
+			char msg[128];
+			snprintf(msg, sizeof(msg), "Peak source copy for monitor (%d,%d) primed (every pixel refreshed since it went stale)", left, top);
+			log_to_file(msg);
+		} else if (!s.srcPrimeRequested) {
+			// Nothing else recomposes a static desktop. Retried each present until the (throttled) request lands.
+			s.srcPrimeRequested = HookRequestFullRecompose();
+		}
+	}
+	return s.srcSRV;
 }
 
 // Per-monitor HDR state detected via DXGI output enumeration
@@ -483,18 +606,20 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top)
 }
 
 // A present of this overlay context went past RenderLUT (protected content, an unreadable swap chain / back buffer, the
-// diagnostic no-draw level): its dirty rects never reached the FALD layer's clean copy, so that copy is stale. Marks the
-// context's own monitor when its position is known (the 25H2 routing cache, or the pre-25H2 clip box); an unresolved
-// 25H2 context marks every monitor (a wrong guess would leave a stale copy in use — the costlier mistake).
-void FaldMarkContextStale(void* context)
+// diagnostic no-draw level, an exception before the copies): its dirty rects never reached the clean copies fed from
+// them — the FALD layer's and the dynamic-peak source — so those copies are stale. Marks the context's own monitor when
+// its position is known (the 25H2 routing cache, or the pre-25H2 clip box); an unresolved 25H2 context marks every
+// monitor (a wrong guess would leave a stale copy in use — the costlier mistake).
+void MarkContextCopiesStale(void* context)
 {
 	int left = 0, top = 0;
 	if (isWindows11_25h2) {
-		if (!LookupContextPosition(context, left, top)) { FaldMarkAllStale(); return; }
+		if (!LookupContextPosition(context, left, top)) { FaldMarkAllStale(); PeakSourceMarkAllStale(); return; }
 	} else {
 		GetMonitorPositionFromContext(context, left, top);
 	}
 	FaldMarkStale(left, top);
+	PeakSourceMarkStale(left, top);
 }
 
 // Draw `rect` of the back buffer from a source texture of texW x texH (UVs are rect / tex size).
@@ -517,45 +642,6 @@ static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
 	float texTop = rect->top / texH;
 	float texRight = rect->right / texW;
 	float texBottom = rect->bottom / texH;
-
-	float vertexData[] = {
-		left, bottom, texLeft, texBottom,
-		left, top, texLeft, texTop,
-		right, bottom, texRight, texBottom,
-		right, top, texRight, texTop
-	};
-
-	D3D11_MAPPED_SUBRESOURCE resource;
-	EXECUTE_WITH_LOG(deviceContext->Map(vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &resource))
-	memcpy(resource.pData, vertexData, stride * numVerts);
-	deviceContext->Unmap(vertexBuffer, 0);
-
-	deviceContext->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
-
-	deviceContext->Draw(numVerts, 0);
-}
-
-void DrawRectangle(struct tagRECT* rect, int index)
-{
-	float width = backBufferDesc.Width;
-	float height = backBufferDesc.Height;
-
-	float screenLeft = rect->left / width;
-	float screenTop = rect->top / height;
-	float screenRight = rect->right / width;
-	float screenBottom = rect->bottom / height;
-
-	float left = screenLeft * 2 - 1;
-	float top = screenTop * -2 + 1;
-	float right = screenRight * 2 - 1;
-	float bottom = screenBottom * -2 + 1;
-
-	width = textureDesc[index].Width;
-	height = textureDesc[index].Height;
-	float texLeft = rect->left / width;
-	float texTop = rect->top / height;
-	float texRight = rect->right / width;
-	float texBottom = rect->bottom / height;
 
 	float vertexData[] = {
 		left, bottom, texLeft, texBottom,
@@ -1038,6 +1124,14 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	}
 	const bool faldOn = (faldMon != NULL);
 
+	// Dynamic peak detection wants this monitor's whole current frame. With FALD on that is the
+	// layer's clean copy; otherwise the peak slot's own source copy (PeakSourceUpdate below). Every
+	// present of this monitor that does not feed the latter leaves it stale. (An unsupported format,
+	// index -1, resolves no position here; like the FALD layer, it marks nothing.)
+	const bool wantPeak = tmEnabled && tp->dynamicPeak && peakDetectCS && peakSmoothCS && peakCB;
+	if (index != -1 && (!wantPeak || faldOn))
+		PeakSourceMarkStale(monLeft, monTop);
+
 	// Skip if no LUT AND no tonemap AND no FALD — nothing to render
 	if (index == -1 || (!lut && !tmEnabled && !faldOn))
 	{
@@ -1089,6 +1183,43 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	  renderTargetView = NULL;
 	  ID3D11RenderTargetView* faldRTV = faldOn ? FaldIntermediateRTV(faldMon) : NULL;
 	  try {
+		// The frame source, fed with ALL of this present's dirty rects before anything reads it: the
+		// peak detector below measures the whole frame, and a rect copied after an earlier rect was
+		// drawn would read back pixels that draw already corrected wherever the two overlap.
+		//  - FALD on: the layer's clean copy (updated in FaldUpdateClean above).
+		//  - dynamic peak: this monitor's own source copy (PeakSourceUpdate), never the shared
+		//    staging texture, which outside this present's rects holds other monitors' pixels.
+		//  - otherwise: the shared staging texture; only the rects are read from it.
+		HookPeakSlot* peakSlot = NULL;
+		if (wantPeak)
+			peakSlot = GetPeakSlot(tp->left, tp->top);
+		ID3D11ShaderResourceView* srcSRV = NULL;
+		float srcW = (float)newBackBufferDesc.Width, srcH = (float)newBackBufferDesc.Height;
+		if (faldOn) {
+			srcSRV = FaldCleanSRV(faldMon);
+		} else {
+			if (peakSlot)
+				srcSRV = PeakSourceUpdate(*peakSlot, tp->left, tp->top, backBuffer, newBackBufferDesc, rects, numRects);
+			if (!srcSRV) {
+				for (int i = 0; i < numRects; i++)
+				{
+					D3D11_BOX sourceRegion;
+					sourceRegion.left = rects[i].left;
+					sourceRegion.right = rects[i].right;
+					sourceRegion.top = rects[i].top;
+					sourceRegion.bottom = rects[i].bottom;
+					sourceRegion.front = 0;
+					sourceRegion.back = 1;
+
+					deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
+					                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
+				}
+				srcSRV = textureView[index];
+				srcW = (float)textureDesc[index].Width;
+				srcH = (float)textureDesc[index].Height;
+			}
+		}
+
 		EXECUTE_WITH_LOG(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, NULL, &renderTargetView))
 		const D3D11_VIEWPORT d3d11_viewport(0, 0, backBufferDesc.Width, backBufferDesc.Height, 0.0f, 1.0f);
 		deviceContext->RSSetViewports(1, &d3d11_viewport);
@@ -1107,7 +1238,6 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 
 		// Bind shader resources. With FALD on the source is the layer's clean copy of the composed
 		// frame (the back buffer outside the dirty rects holds last frame's corrected output).
-		ID3D11ShaderResourceView* srcSRV = faldOn ? FaldCleanSRV(faldMon) : textureView[index];
 		deviceContext->PSSetShaderResources(0, 1, &srcSRV);
 		if (lut)
 			deviceContext->PSSetShaderResources(1, 1, &lut->textureView);
@@ -1121,13 +1251,11 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		if (pqEotfSRV) deviceContext->PSSetShaderResources(4, 1, &pqEotfSRV);
 		if (linearSamplerState) deviceContext->PSSetSamplers(2, 1, &linearSamplerState);
 
-		// Peak detection compute pass (before pixel shader), on THIS monitor's peak state. The
-		// shader only reads t5 when tonemapDynamic; left unbound (reads 0) it falls back to the floor.
-		HookPeakSlot* peakSlot = NULL;
-		if (tmEnabled && tp->dynamicPeak && peakDetectCS && peakSmoothCS && peakCB)
-			peakSlot = GetPeakSlot(tp->left, tp->top);
+		// Peak detection compute pass (before pixel shader), on THIS monitor's peak state and THIS
+		// monitor's current frame (srcSRV, already fed with this present's rects). The shader only
+		// reads t5 when tonemapDynamic; left unbound (reads 0) it falls back to the floor.
 		if (peakSlot) {
-			// Input: captured backbuffer. Leaves no CS state bound on DWM's context.
+			// Leaves no CS state bound on DWM's context.
 			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, srcSRV,
 				peakSlot->peakUAV, peakSlot->rawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
 			deviceContext->PSSetShaderResources(5, 1, &peakSlot->peakSRV);
@@ -1242,20 +1370,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		}
 		else
 		{
+			// The rects were copied into srcSRV's texture above, before the peak pass.
 			for (int i = 0; i < numRects; i++)
-			{
-				D3D11_BOX sourceRegion;
-				sourceRegion.left = rects[i].left;
-				sourceRegion.right = rects[i].right;
-				sourceRegion.top = rects[i].top;
-				sourceRegion.bottom = rects[i].bottom;
-				sourceRegion.front = 0;
-				sourceRegion.back = 1;
-
-				deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
-				                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
-				DrawRectangle(&rects[i], index);
-			}
+				DrawRectangleTex(&rects[i], srcW, srcH);
 		}
 
 		if (faldOn)
@@ -1405,6 +1522,7 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 	}
 	catch (std::exception& ex)
 	{
+		MarkContextCopiesStale(cOverlayContext);   // the rects may not have reached the clean copies
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << ": " << ex.what() << std::endl;
 		log_to_file(ex_message.str().c_str());
@@ -1412,6 +1530,7 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 	}
 	catch (...)
 	{
+		MarkContextCopiesStale(cOverlayContext);   // the rects may not have reached the clean copies
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << std::endl;
 		log_to_file(ex_message.str().c_str());
@@ -1975,6 +2094,7 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 	}
 	catch (std::exception& ex)
 	{
+		MarkContextCopiesStale(cOverlayContext);   // the rects may not have reached the clean copies
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << ": " << ex.what() << std::endl;
 		log_to_file(ex_message.str().c_str());
@@ -1982,6 +2102,7 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 	}
 	catch (...)
 	{
+		MarkContextCopiesStale(cOverlayContext);   // the rects may not have reached the clean copies
 		std::stringstream ex_message;
 		ex_message << "Exception caught at line " << __LINE__ << std::endl;
 		log_to_file(ex_message.str().c_str());

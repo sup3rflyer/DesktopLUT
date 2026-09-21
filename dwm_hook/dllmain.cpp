@@ -779,7 +779,7 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 	int a5, void* a6, bool a7)
 {
 	if (g_diagNoLutDraw) {
-		FaldMarkContextStale(self);
+		MarkContextCopiesStale(self);
 		return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
 	}
 
@@ -815,7 +815,7 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 			}
 			else
 			{
-				FaldMarkContextStale(self);   // this present never reached the FALD layer
+				MarkContextCopiesStale(self);   // this present never reached the clean copies
 			}
 
 			// No fallback probing — ApplyLUTDirect returning false means
@@ -833,12 +833,12 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 
 			if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
 			{
-				FaldMarkContextStale(self);
+				MarkContextCopiesStale(self);
 				UnsetLUTActive(self);
 			}
 			else if (hwProtected)
 			{
-				FaldMarkContextStale(self);
+				MarkContextCopiesStale(self);
 				LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 				UnsetLUTActive(self);
 			}
@@ -877,12 +877,12 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 
 		if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
 		{
-			FaldMarkContextStale(self);
+			MarkContextCopiesStale(self);
 			UnsetLUTActive(self);
 		}
 		else if (hwProtected)
 		{
-			FaldMarkContextStale(self);
+			MarkContextCopiesStale(self);
 			LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 			UnsetLUTActive(self);
 		}

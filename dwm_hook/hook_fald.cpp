@@ -756,16 +756,19 @@ static void CoverReset(FaldMonitor* m) {
     m->coverLeft = m->coverCols * m->coverRows;
 }
 
-// Ask the host for one full-screen recomposition (DWM_HOOK_FALD_PRIME_EVENT): an enabled monitor is waiting for its
-// clean copy. At most once a second across all monitors; the event is opened lazily.
-static void RequestPrime() {
+// Ask the host for one full-screen recomposition (DWM_HOOK_FALD_PRIME_EVENT): a monitor is waiting for a clean copy
+// (this layer's, or the dynamic-peak source in hook_render.cpp). At most once a second across all callers; the event is
+// opened lazily. False = not signalled (throttled, or the host has no event yet): ask again on a later present.
+bool HookRequestFullRecompose() {
     LARGE_INTEGER now, f;
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
-    if (g_primeLastQpc != 0 && f.QuadPart > 0 && (now.QuadPart - g_primeLastQpc) < f.QuadPart) return;
+    if (g_primeLastQpc != 0 && f.QuadPart > 0 && (now.QuadPart - g_primeLastQpc) < f.QuadPart) return false;
     g_primeLastQpc = now.QuadPart;
     if (!g_primeEvent) g_primeEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, DWM_HOOK_FALD_PRIME_EVENT);
-    if (g_primeEvent) SetEvent(g_primeEvent);
+    return g_primeEvent && SetEvent(g_primeEvent);
 }
+
+static void RequestPrime() { HookRequestFullRecompose(); }
 
 bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* rects, int numRects) {
     if (!m || !m->valid || !m->cleanTex || !backBuffer || !g_ctx) return false;

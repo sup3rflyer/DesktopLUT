@@ -11,6 +11,7 @@
 
 #include "doctest.h"
 #include "../shared/peak_detect.h"
+#include "../shared/dirty_cover.h"
 #include "color.h"
 
 #include <d3d11.h>
@@ -471,4 +472,73 @@ TEST_CASE("PeakDetect: two HDR monitors on their own peak state smooth independe
     // 50 nits/frame; after ResetPeakState the first frame initializes to that frame's max.
     ResetPeakState(gpu.dc, gpu.detectors[0].peakUAV, gpu.detectors[0].rawUAV);
     CHECK(gpu.RunFrame(dim, sp, 0) == doctest::Approx(200.0f).epsilon(0.002));
+}
+
+// ---------------------------------------------------------------------------------------------
+// DirtyCover (shared/dirty_cover.h): when a dirty-rect-fed clean copy of a monitor's frame (the
+// hook's dynamic-peak source) has had every pixel refreshed since it went stale.
+// ---------------------------------------------------------------------------------------------
+namespace {
+bool MarkRect(DirtyCover& c, long l, long t, long r, long b) {
+    unsigned cl, ct, cr, cb;
+    if (!c.Clip(l, t, r, b, cl, ct, cr, cb)) return false;
+    c.Mark(cl, ct, cr, cb);
+    return true;
+}
+}
+
+TEST_CASE("DirtyCover: a full-frame rect primes at once; a fresh or reset copy is not primed") {
+    DirtyCover c;
+    CHECK_FALSE(c.Primed());                    // never initialised
+    c.Init(3840, 2160, 32);
+    CHECK(c.cols == 120);
+    CHECK(c.rows == 68);                        // 2160/32 = 67.5: the last row is a partial tile
+    CHECK_FALSE(c.Primed());
+    CHECK(MarkRect(c, 0, 0, 3840, 2160));
+    CHECK(c.Primed());
+    c.Reset();
+    CHECK_FALSE(c.Primed());
+    CHECK(c.left == c.tiles.size());
+}
+
+TEST_CASE("DirtyCover: primes by accumulation across presents; partial tiles and split tiles do not count") {
+    DirtyCover c;
+    c.Init(128, 64, 32);                        // 4 x 2 tiles
+    REQUIRE(c.tiles.size() == 8);
+    // A rect that only partly covers tiles marks none of them
+    MarkRect(c, 10, 10, 60, 60);
+    CHECK(c.left == 8);
+    // Two rects that together cover tile (0,0) but neither alone: still not counted (conservative)
+    MarkRect(c, 0, 0, 16, 32);
+    MarkRect(c, 16, 0, 32, 32);
+    CHECK(c.left == 8);
+    // Left half, then right half over two presents: primed
+    CHECK(c.Mark(0, 0, 64, 64) == 4);
+    CHECK_FALSE(c.Primed());
+    CHECK(c.Mark(64, 0, 128, 64) == 4);
+    CHECK(c.Primed());
+    // Marking after priming is a no-op
+    CHECK(c.Mark(0, 0, 128, 64) == 0);
+}
+
+TEST_CASE("DirtyCover: tiles clipped by the frame edge count up to the edge; rects outside are clipped away") {
+    DirtyCover c;
+    c.Init(100, 50, 32);                        // 4 x 2 tiles, last column 4 px wide, last row 18 px tall
+    REQUIRE(c.cols == 4);
+    REQUIRE(c.rows == 2);
+    // Bottom-right partial tile: covered by a rect reaching the frame edge
+    CHECK(c.Mark(96, 32, 100, 50) == 1);
+    // A rect hanging off every edge is clipped to the frame and covers everything
+    unsigned l, t, r, b;
+    CHECK(c.Clip(-20, -20, 500, 500, l, t, r, b));
+    CHECK(l == 0);
+    CHECK(t == 0);
+    CHECK(r == 100);
+    CHECK(b == 50);
+    c.Mark(l, t, r, b);
+    CHECK(c.Primed());
+    // Entirely outside / empty rects are rejected (nothing to copy)
+    CHECK_FALSE(c.Clip(100, 0, 150, 50, l, t, r, b));
+    CHECK_FALSE(c.Clip(-50, 0, 0, 50, l, t, r, b));
+    CHECK_FALSE(c.Clip(10, 10, 10, 20, l, t, r, b));
 }
