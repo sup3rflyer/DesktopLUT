@@ -57,12 +57,90 @@ ID3D11SamplerState* linearSamplerState = NULL;
 // Peak detection compute shader resources (shaders + dispatch shared with the overlay: shared/peak_detect.h)
 ID3D11ComputeShader* peakDetectCS = NULL;   // pass 1: dense reduction (every 4th pixel) -> raw max
 ID3D11ComputeShader* peakSmoothCS = NULL;   // pass 2: temporal smoothing -> PQ peak
-ID3D11Texture2D* peakRawTexture = NULL;     // 1x1 R32_UINT raw max (InterlockedMax target, reset by pass 2)
-ID3D11UnorderedAccessView* peakRawUAV = NULL;
-ID3D11Texture2D* peakTexture = NULL;
-ID3D11UnorderedAccessView* peakUAV = NULL;
-ID3D11ShaderResourceView* peakSRV = NULL;
-ID3D11Buffer* peakCB = NULL;
+ID3D11Buffer* peakCB = NULL;               // shared: DispatchPeakDetection rewrites it every call
+
+// Per-monitor peak state. The smoothing pass reads the previous smoothed peak, so one shared pair
+// smoothed each HDR monitor's peak against the other monitor's frames. One slot per monitor
+// position (the key FindTonemapForMonitor / the LUT lookup route by), created lazily on the first
+// dynamic-tonemap present for that monitor, recycled LRU when a 17th position appears, released in
+// UninitializeStuff.
+struct HookPeakSlot {
+	ID3D11Texture2D* peakTexture;           // 1x1 R32_FLOAT smoothed PQ peak (u0 / PS t5)
+	ID3D11UnorderedAccessView* peakUAV;
+	ID3D11ShaderResourceView* peakSRV;
+	ID3D11Texture2D* rawTexture;            // 1x1 R32_UINT raw max (InterlockedMax target, reset by pass 2)
+	ID3D11UnorderedAccessView* rawUAV;
+	bool createFailed;                      // don't retry the allocation on every present
+};
+static const int MAX_PEAK_SLOTS = 16;
+static PeakSlotKey g_peakSlotKeys[MAX_PEAK_SLOTS] = {};
+static HookPeakSlot g_peakSlots[MAX_PEAK_SLOTS] = {};
+static unsigned long long g_peakSlotClock = 0;
+
+static void ReleasePeakSlot(HookPeakSlot& s) {
+	RELEASE_IF_NOT_NULL(s.peakSRV)
+	RELEASE_IF_NOT_NULL(s.peakUAV)
+	RELEASE_IF_NOT_NULL(s.peakTexture)
+	RELEASE_IF_NOT_NULL(s.rawUAV)
+	RELEASE_IF_NOT_NULL(s.rawTexture)
+}
+
+static void ReleasePeakSlots() {
+	for (int i = 0; i < MAX_PEAK_SLOTS; i++) {
+		ReleasePeakSlot(g_peakSlots[i]);
+		g_peakSlots[i].createFailed = false;
+		g_peakSlotKeys[i] = {};
+	}
+	g_peakSlotClock = 0;
+}
+
+// All-or-nothing: on failure the slot is left empty and flagged (never partially bound).
+static bool CreatePeakSlot(HookPeakSlot& s) {
+	try {
+		D3D11_TEXTURE2D_DESC peakDesc = {};
+		peakDesc.Width = 1;
+		peakDesc.Height = 1;
+		peakDesc.MipLevels = 1;
+		peakDesc.ArraySize = 1;
+		peakDesc.Format = DXGI_FORMAT_R32_FLOAT;
+		peakDesc.SampleDesc.Count = 1;
+		peakDesc.Usage = D3D11_USAGE_DEFAULT;
+		peakDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+		float zero = 0.0f;
+		D3D11_SUBRESOURCE_DATA peakInit = {};
+		peakInit.pSysMem = &zero;
+		peakInit.SysMemPitch = sizeof(float);
+		EXECUTE_WITH_LOG(device->CreateTexture2D(&peakDesc, &peakInit, &s.peakTexture))
+		EXECUTE_WITH_LOG(device->CreateUnorderedAccessView((ID3D11Resource*)s.peakTexture, NULL, &s.peakUAV))
+		EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)s.peakTexture, NULL, &s.peakSRV))
+		EXECUTE_WITH_LOG(CreatePeakRawTexture(device, deviceContext, &s.rawTexture, &s.rawUAV))
+		return true;
+	}
+	catch (...) {
+		ReleasePeakSlot(s);
+		s.createFailed = true;
+		log_to_file("WARNING: per-monitor peak state creation failed — dynamic peak falls back to the floor on this monitor");
+		return false;
+	}
+}
+
+// The peak state for the monitor at (left, top), created on first use; NULL if unavailable.
+// A slot reassigned from another monitor is reset so it does not inherit that monitor's history.
+static HookPeakSlot* GetPeakSlot(int left, int top) {
+	bool fresh = false;
+	int i = AcquirePeakSlot(g_peakSlotKeys, MAX_PEAK_SLOTS, left, top, ++g_peakSlotClock, &fresh);
+	if (i < 0) return NULL;
+	HookPeakSlot& s = g_peakSlots[i];
+	if (fresh) {
+		s.createFailed = false;  // a new monitor gets one attempt of its own
+		if (s.peakUAV) ResetPeakState(deviceContext, s.peakUAV, s.rawUAV);
+		char msg[128];
+		snprintf(msg, sizeof(msg), "Peak state slot %d assigned to monitor (%d,%d)", i, left, top);
+		log_to_file(msg);
+	}
+	if (!s.peakUAV && !s.createFailed) CreatePeakSlot(s);
+	return (s.peakUAV && s.peakSRV && s.rawUAV) ? &s : NULL;
+}
 
 // Per-monitor HDR state detected via DXGI output enumeration
 MonitorHdrState g_monitorHdrStates[16];
@@ -646,26 +724,9 @@ void InitializeStuff(ID3D11Device* inputDevice)
 
 			LOG_ONLY_ONCE("PQ transfer LUTs created (4096-entry OETF sqrt-domain + EOTF uniform)")
 		}
-		// Create peak detection resources (1x1 R32_FLOAT for temporal smoothing)
+		// Peak detection constant buffer (shared; the per-monitor peak state is created lazily
+		// in RenderLUT — GetPeakSlot)
 		{
-			D3D11_TEXTURE2D_DESC peakDesc = {};
-			peakDesc.Width = 1;
-			peakDesc.Height = 1;
-			peakDesc.MipLevels = 1;
-			peakDesc.ArraySize = 1;
-			peakDesc.Format = DXGI_FORMAT_R32_FLOAT;
-			peakDesc.SampleDesc.Count = 1;
-			peakDesc.Usage = D3D11_USAGE_DEFAULT;
-			peakDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-			float zero = 0.0f;
-			D3D11_SUBRESOURCE_DATA peakInit = {};
-			peakInit.pSysMem = &zero;
-			peakInit.SysMemPitch = sizeof(float);
-			EXECUTE_WITH_LOG(device->CreateTexture2D(&peakDesc, &peakInit, &peakTexture))
-			EXECUTE_WITH_LOG(device->CreateUnorderedAccessView((ID3D11Resource*)peakTexture, NULL, &peakUAV))
-			EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)peakTexture, NULL, &peakSRV))
-			EXECUTE_WITH_LOG(CreatePeakRawTexture(device, deviceContext, &peakRawTexture, &peakRawUAV))
-
 			D3D11_BUFFER_DESC peakCbDesc = {};
 			peakCbDesc.ByteWidth = 32;  // 8 floats
 			peakCbDesc.Usage = D3D11_USAGE_DYNAMIC;
@@ -746,11 +807,7 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(pqEotfSRV)
 	RELEASE_IF_NOT_NULL(peakDetectCS)
 	RELEASE_IF_NOT_NULL(peakSmoothCS)
-	RELEASE_IF_NOT_NULL(peakRawUAV)
-	RELEASE_IF_NOT_NULL(peakRawTexture)
-	RELEASE_IF_NOT_NULL(peakTexture)
-	RELEASE_IF_NOT_NULL(peakUAV)
-	RELEASE_IF_NOT_NULL(peakSRV)
+	ReleasePeakSlots();
 	RELEASE_IF_NOT_NULL(peakCB)
 	ReleaseBeaconProbes();
 	// Snapshot + clear first so a concurrent reader sees an empty list before we free.
@@ -945,14 +1002,17 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		if (pqEotfSRV) deviceContext->PSSetShaderResources(4, 1, &pqEotfSRV);
 		if (linearSamplerState) deviceContext->PSSetSamplers(2, 1, &linearSamplerState);
 
-		// Peak detection compute pass (before pixel shader)
-		if (tmEnabled && tp->dynamicPeak && peakDetectCS && peakSmoothCS && peakUAV && peakRawUAV && peakCB) {
+		// Peak detection compute pass (before pixel shader), on THIS monitor's peak state. The
+		// shader only reads t5 when tonemapDynamic; left unbound (reads 0) it falls back to the floor.
+		HookPeakSlot* peakSlot = NULL;
+		if (tmEnabled && tp->dynamicPeak && peakDetectCS && peakSmoothCS && peakCB)
+			peakSlot = GetPeakSlot(tp->left, tp->top);
+		if (peakSlot) {
 			// Input: captured backbuffer. Leaves no CS state bound on DWM's context.
 			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, textureView[index],
-				peakUAV, peakRawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
+				peakSlot->peakUAV, peakSlot->rawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
+			deviceContext->PSSetShaderResources(5, 1, &peakSlot->peakSRV);
 		}
-		// Bind peak texture for pixel shader read (even if not dynamic — shader checks tonemapDynamic)
-		if (peakSRV) deviceContext->PSSetShaderResources(5, 1, &peakSRV);
 
 		// Fill expanded constant buffer (48 bytes = 12 ints/floats)
 		int dLevels = 255;
@@ -1036,7 +1096,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				snprintf(diagMsg, sizeof(diagMsg), "TM DIAG: tmEn=%d dyn=%d curve=%d pqSrc=%.4f pqTgt=%.4f tgtNits=%.0f srcNits=%.0f csOK=%d uavOK=%d",
 					cb.tonemapEnabled, cb.tonemapDynamic, cb.tonemapCurve,
 					cb.pqSourcePeak, cb.pqTargetPeak, cb.tonemapTargetNits,
-					tp->sourcePeakNits, peakDetectCS ? 1 : 0, peakUAV ? 1 : 0);
+					tp->sourcePeakNits, peakDetectCS ? 1 : 0, peakSlot ? 1 : 0);
 				log_to_file(diagMsg);
 			}
 		}

@@ -16,6 +16,9 @@
 //
 // Bindings: t0 = frame (scRGB FP16), b0 = PeakParams, u0 = smoothed PQ peak (R32_FLOAT),
 // u1 = raw max (R32_UINT, must start at zero — CreatePeakRawTexture clears it).
+//
+// The u0/u1 pair is the detector's temporal state and must be PER MONITOR: a shared pair smooths one
+// monitor's peak against another's frames (overlay: per-MonitorContext; hook: AcquirePeakSlot).
 #pragma once
 
 #include <d3d11.h>
@@ -179,6 +182,53 @@ inline HRESULT CreatePeakRawTexture(ID3D11Device* device, ID3D11DeviceContext* d
     const UINT zero[4] = { 0, 0, 0, 0 };
     dc->ClearUnorderedAccessViewUint(*uav, zero);
     return S_OK;
+}
+
+// Forget a detector's history: the next smoothing pass initializes from that frame's max (prevPQ
+// <= 0 path) instead of slewing from a peak that belonged to another monitor.
+inline void ResetPeakState(ID3D11DeviceContext* dc, ID3D11UnorderedAccessView* peakUAV,
+                           ID3D11UnorderedAccessView* rawUAV) {
+    const float zeroF[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const UINT zeroU[4] = { 0, 0, 0, 0 };
+    if (peakUAV) dc->ClearUnorderedAccessViewFloat(peakUAV, zeroF);
+    if (rawUAV) dc->ClearUnorderedAccessViewUint(rawUAV, zeroU);
+}
+
+// Per-monitor peak-state slots (the DWM hook: one smoothed peak per monitor, keyed by the monitor's
+// desktop position like its LUT/tonemap routing). Pure bookkeeping, no D3D — unit-tested.
+struct PeakSlotKey {
+    bool used;
+    int left, top;
+    unsigned long long lastUse;
+};
+
+// Returns the slot for (left, top) and stamps lastUse = now. A position without a slot takes the
+// first unused one, else the least-recently-used (a monitor that moved or went away). *fresh is set
+// when the slot was (re)assigned: its smoothing history belongs to nobody or to another monitor and
+// must be reset before use. Returns -1 only when count <= 0.
+inline int AcquirePeakSlot(PeakSlotKey* keys, int count, int left, int top,
+                           unsigned long long now, bool* fresh) {
+    *fresh = false;
+    if (count <= 0) return -1;
+    int freeSlot = -1, lruSlot = 0;
+    for (int i = 0; i < count; i++) {
+        if (keys[i].used) {
+            if (keys[i].left == left && keys[i].top == top) {
+                keys[i].lastUse = now;
+                return i;
+            }
+            if (keys[lruSlot].used && keys[i].lastUse < keys[lruSlot].lastUse) lruSlot = i;
+        } else if (freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    int slot = freeSlot >= 0 ? freeSlot : lruSlot;
+    keys[slot].used = true;
+    keys[slot].left = left;
+    keys[slot].top = top;
+    keys[slot].lastUse = now;
+    *fresh = true;
+    return slot;
 }
 
 // Both passes for one frame. Writes the constant buffer every call (32 bytes): the buffer is

@@ -392,3 +392,83 @@ TEST_CASE("PeakDetect: two monitors of different sizes sharing one constant buff
         CHECK(gpu.RunFrame(frame4k, raw, 1) == doctest::Approx(1000.0f).epsilon(0.002));
     }
 }
+
+// =============================================================================================
+// Per-monitor peak state (DWM hook: AcquirePeakSlot + one detector pair per monitor)
+// =============================================================================================
+
+TEST_CASE("PeakDetect: AcquirePeakSlot keys by monitor position, reuses, fills free slots, recycles LRU") {
+    PeakSlotKey keys[3] = {};
+    bool fresh = false;
+    unsigned long long clock = 0;
+
+    int a = AcquirePeakSlot(keys, 3, 0, 0, ++clock, &fresh);
+    CHECK(a == 0);
+    CHECK(fresh);
+    int b = AcquirePeakSlot(keys, 3, 3840, 0, ++clock, &fresh);
+    CHECK(b == 1);
+    CHECK(fresh);
+
+    // Alternating presents (two HDR monitors) keep their own slots and never re-freshen
+    for (int i = 0; i < 4; i++) {
+        CHECK(AcquirePeakSlot(keys, 3, 0, 0, ++clock, &fresh) == a);
+        CHECK_FALSE(fresh);
+        CHECK(AcquirePeakSlot(keys, 3, 3840, 0, ++clock, &fresh) == b);
+        CHECK_FALSE(fresh);
+    }
+
+    // Negative / off-origin positions are ordinary keys; x and y both matter
+    int c = AcquirePeakSlot(keys, 3, -1920, 0, ++clock, &fresh);
+    CHECK(c == 2);
+    CHECK(fresh);
+
+    // Table full: a new position takes the least-recently-used slot (monitor 0,0 is now oldest
+    // after we touch the other two) and is reported fresh so the caller resets its history
+    AcquirePeakSlot(keys, 3, 3840, 0, ++clock, &fresh);
+    AcquirePeakSlot(keys, 3, -1920, 0, ++clock, &fresh);
+    int d = AcquirePeakSlot(keys, 3, 0, 2160, ++clock, &fresh);
+    CHECK(d == a);
+    CHECK(fresh);
+    CHECK(keys[d].left == 0);
+    CHECK(keys[d].top == 2160);
+
+    // The evicted monitor comes back: it gets a (fresh) slot again, the LRU one — (3840,0)
+    int e = AcquirePeakSlot(keys, 3, 0, 0, ++clock, &fresh);
+    CHECK(e == b);
+    CHECK(fresh);
+
+    // Degenerate table
+    CHECK(AcquirePeakSlot(keys, 0, 0, 0, ++clock, &fresh) == -1);
+    CHECK_FALSE(fresh);
+}
+
+TEST_CASE("PeakDetect: two HDR monitors on their own peak state smooth independently; reset drops history") {
+    // The hook used ONE smoothed-peak texture for every monitor: with two HDR monitors on dynamic
+    // tonemap each monitor's peak was slewed from the other monitor's last frame. Interleave
+    // presents of a 1600-nit and a 200-nit monitor with smoothing ON: each must track its own
+    // reference as if it were alone.
+    PeakGpuHarness gpu;
+    PEAK_GPU_INIT_OR_SKIP(gpu, 2);
+    PeakParams sp{};
+
+    SyntheticFrame bright{ 1920, 1080, { { 100, 100, 4, 4, 20.0f, 20.0f, 20.0f } } };   // 1600 nits
+    SyntheticFrame dim{ 3840, 2160, { { 3000, 2000, 4, 4, 2.5f, 2.5f, 2.5f } } };       // 200 nits
+    float refBright = 0.0f, refDim = 0.0f;
+    bool haveBright = false, haveDim = false;
+    for (int frame = 0; frame < 5; frame++) {
+        INFO("frame " << frame);
+        refBright = ReferenceSmoothedPeak(refBright, haveBright, ReferenceFramePeakNits(bright), sp);
+        haveBright = true;
+        refDim = ReferenceSmoothedPeak(refDim, haveDim, ReferenceFramePeakNits(dim), sp);
+        haveDim = true;
+        CHECK(gpu.RunFrame(bright, sp, 0) == doctest::Approx(refBright).epsilon(0.002));
+        CHECK(gpu.RunFrame(dim, sp, 1) == doctest::Approx(refDim).epsilon(0.002));
+    }
+    CHECK(refBright == doctest::Approx(1600.0f).epsilon(0.002));
+    CHECK(refDim == doctest::Approx(200.0f).epsilon(0.002));
+
+    // A slot recycled to another monitor: without a reset it would slew down from 1600 at
+    // 50 nits/frame; after ResetPeakState the first frame initializes to that frame's max.
+    ResetPeakState(gpu.dc, gpu.detectors[0].peakUAV, gpu.detectors[0].rawUAV);
+    CHECK(gpu.RunFrame(dim, sp, 0) == doctest::Approx(200.0f).epsilon(0.002));
+}
