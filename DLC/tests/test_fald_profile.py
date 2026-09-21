@@ -164,13 +164,18 @@ def test_predictions_freeze_and_compare():
 
 
 @pytest.mark.slow
-def test_quick_fit_recovers_the_hidden_estimate():
+def test_the_fit_recovers_the_hidden_estimate():
     g = _geo()
     panel, pats, reads = _synthetic_reads(g)
     dc = P.drive_curve_from_reads(g, pats, reads)
     base = g.base_params(white_nits=reads["DRV:white"].y, chan_weights=P.chan_weights_from_reads(reads),
                          **({"drive_curve": dc} if dc else {}))
     items = P.build_items(pats, reads, g.meter)
+    # quick=False: the THOROUGH fit (the flag only sets iteration budgets — max_nfev 40 vs 6, four phase seeds
+    # vs two — never what is fitted). The stage tool DEFAULTS to quick=True, and that path recovers this same
+    # hidden estimate too: measured 2026-09-21, scale err 0.27 mm / phase 0.86 px / held-out 1.47 against the
+    # 4.0 / 12.0 / 2.5 asserted here, in 122 s against 132 s. So this test is not the quick path's gate, and
+    # switching it would buy ~8 %, not the budget ratio: the evaluator calls dominate, not the iteration count.
     res = P.run_fit(base, items, quick=False, knots="never", fit_drive_k=not dc, log=lambda *a: None)
     t = panel.params
     b = res["stage_b"]

@@ -45,7 +45,7 @@ from __future__ import annotations
 # Only the ORDER of these numbers matters, never their absolute value.
 _HEAVY_SECONDS = {
     "test_fald_profile.py::test_stage_chain_sdr_to_export_and_verify": 205,
-    "test_fald_profile.py::test_quick_fit_recovers_the_hidden_estimate": 176,
+    "test_fald_profile.py::test_the_fit_recovers_the_hidden_estimate": 176,
     "test_fald_fit_rules.py::test_synthetic_sdr_fit_recovers_drive_k_and_flags_an_unidentified_tmin": 150,
     "test_engine_v2.py::test_constrained_rbf_caps_off_channel_lift_at_saturated_blue": 102,
     "test_fald_boost_gpu.py::test_emulator_two_round_boost_matches_correct_image_pa32ucxr_frame": 78,
