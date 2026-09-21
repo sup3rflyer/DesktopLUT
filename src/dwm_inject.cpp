@@ -1033,12 +1033,15 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
 
         // kicking: one iteration per composition
         if (waitClock) {
+            // The return value does NOT tell "stop" from "the clock ticked" reliably (a tick can come back as
+            // WAIT_OBJECT_0 = index 0 = the stop handle — HW 2026-09-21: the loop exited on its first tick and the
+            // hook ran at the content rate only). The stop event is tested on its own below.
             const DWORD w = waitClock(1, &g_faldKickStop, 100);
-            if (w == WAIT_OBJECT_0) break;                                   // stop
             if (w == (DWORD)STATUS_GRAPHICS_PRESENT_OCCLUDED) Sleep(50);     // display off: nothing to compose
-        } else if (WaitForSingleObject(g_faldKickStop, 8) == WAIT_OBJECT_0) {
-            break;
+        } else {
+            WaitForSingleObject(g_faldKickStop, 8);
         }
+        if (WaitForSingleObject(g_faldKickStop, 0) == WAIT_OBJECT_0) break;  // stop
         if (WaitForSingleObject(g_faldPrimeEvent, 0) == WAIT_OBJECT_0) handlePrime();
         const ULONGLONG t = GetTickCount64();
         alpha = (BYTE)(3 - alpha);                                           // 1 <-> 2: a change DWM has to compose

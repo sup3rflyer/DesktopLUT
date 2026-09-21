@@ -863,7 +863,7 @@ void CreateGUILayout(HWND hwnd) {
     int faldGY = innerY + 180;
     // Part of the Starfield feature: the row is live only while Starfield is on (gui.cpp), and the fill never
     // runs without starfield balancing (src/fald.cpp, dwm_hook/hook_fald.cpp).
-    g_gui.hwndFaldGlowEnable = CreateWindow(L"BUTTON", L"+ glow fill",
+    g_gui.hwndFaldGlowEnable = CreateWindow(L"BUTTON", L"+ glow",
         WS_CHILD | BS_AUTOCHECKBOX,
         innerX + 10, faldGY, 72, h, panel2, (HMENU)ID_CORR_FALD_GLOW_ENABLE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowEnable);
