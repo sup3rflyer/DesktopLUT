@@ -324,6 +324,12 @@ request, adjudicates ambiguous results on digests, and writes the report.
   (`enabled`/`point_count`/`points`/`deviations`), in the same form the setter takes, so the
   revert puts your curve back. When there is still no snapshot, DLC now says which reason it is:
   no prior correction, a DesktopLUT too old to report one, or an unreadable pipe.
+- **The DLC/DesktopLUT version handshake actually works now.** DLC has checked `state.get`'s
+  `contract_version` at preflight for a while, but no DesktopLUT build ever sent the field, so
+  every server read as the pre-versioning default and a real mismatch could only ever have
+  surfaced as "unknown method" mid-run. DesktopLUT now reports it. Also removed a dead
+  `maintenance.verify_mhc` branch that claimed the method needed the GUI thread when the pipe
+  thread has always served it.
 - **A calibration run no longer drops the OTHER mode's 3D LUT.** Entering calibration
   mode cleared both SDR and HDR runtime layers on the monitor, and accepting the new
   calibration exits without the snapshot restore — so a clean HDR run permanently

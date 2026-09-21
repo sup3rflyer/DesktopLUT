@@ -38,10 +38,9 @@ CPP_SERVER = Path(__file__).resolve().parents[1].parent / "src" / "desktoplut_ip
 
 # Spec result keys the C++ does not emit yet — each entry is a DESKTOPLUT TICKET
 # (docs/audits/fable/phase-9.md §5). Remove the entry when the C++ lands it, so this
-# test starts enforcing it.
-CPP_TICKETED_RESULT_KEYS = {
-    "state.get": {"contract_version"},
-}
+# test starts enforcing it. Empty since T1/T3 landed (2026-09-21): every advertised
+# result key is now actually emitted, and a new spec key without a C++ handler fails.
+CPP_TICKETED_RESULT_KEYS: dict[str, set[str]] = {}
 
 
 def _spec_methods() -> dict[str, dict]:
@@ -244,6 +243,24 @@ def test_cpp_state_get_exposes_correction_grayscale_on_mhc_entries():
         "cannot restore the user's curve (phase-9.md ticket T3)")
     assert "GrayscaleJson(m.correctionGrayscale)" in body, (
         "correction_grayscale must be built from MHCSettings::correctionGrayscale")
+
+
+def test_no_gui_thread_branch_for_a_method_dispatch_already_serves():
+    """`Dispatch` answers some methods on the PIPE thread before the IsMutatingMethod marshal,
+    so a branch for one of those in HandleCalibrationGuiCommand can never run. One such branch
+    existed for maintenance.verify_mhc and misled about the threading (fable Phase 9, T4); this
+    catches the next one, whichever method it is."""
+    text = _cpp_text()
+    dispatch = text[text.find("std::string Dispatch("):text.find("// Pipe server")]
+    off_thread = set(re.findall(r'method\s*==\s*"([^"]+)"',
+                                dispatch[:dispatch.find("IsMutatingMethod")]))
+    gui_start = text.find("LRESULT HandleCalibrationGuiCommand(")
+    assert gui_start != -1, "HandleCalibrationGuiCommand not found in the C++ IPC server"
+    gui_table = text[gui_start:text.find("\nLRESULT ", gui_start + 1)]
+    gui_methods = set(re.findall(r'm\s*==\s*"([^"]+)"', gui_table))
+    dead = sorted(off_thread & gui_methods)
+    assert not dead, (f"HandleCalibrationGuiCommand has unreachable branches for {dead} — "
+                      "Dispatch already serves them on the pipe thread")
 
 
 # --------------------------------------------------------------------------

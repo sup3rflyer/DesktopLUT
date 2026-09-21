@@ -39,6 +39,13 @@ namespace {
 const wchar_t* kPipeName = L"\\\\.\\pipe\\DesktopLUT.Calibration";
 constexpr size_t kMaxRequestBytes = 256 * 1024;  // DoS guard
 constexpr DWORD kGuiTimeoutMs = 60000;           // MHC install can be slow
+// The calibration wire-contract version this server speaks, reported in state.get (fable
+// audit Phase 9, T1). DLC checks it at preflight (desktoplut_client.CONTRACT_VERSION) so a
+// mismatch reads "update DLC/DesktopLUT" instead of "unknown method" mid-run. A client that
+// sees no field at all is talking to a pre-versioning build and assumes 1, so this must stay
+// in lockstep with DLC's constant. Bump ONLY for a change a tolerant client cannot absorb;
+// additive fields never require a bump.
+constexpr int kCalibrationContractVersion = 1;
 
 // ===========================================================================
 // UTF-8 <-> wide
@@ -635,6 +642,7 @@ JsonValue GrayscaleJson(const GrayscaleSettings& gs) {
 }
 
 void HandleStateGet(JsonValue& result) {
+    result.set("contract_version", JNum((double)kCalibrationContractVersion));
     result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
     // WIRE CONTRACT (consumed by DLC). Mirrors the OVERLAY-active flag, NOT the DWM-hook state:
     // reads false in hook mode even while a cube is live. Judge hook-mode liveness by cube_path
@@ -2256,7 +2264,6 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "mhc.grayscale_cancel") DoGrayscaleCancel(*r->params, *r->result, *r->error);
         else if (m == "mhc.apply") DoMhcApply(*r->params, *r->result, *r->error);
         else if (m == "mhc.remove") DoMhcRemove(*r->params, *r->result, *r->error);
-        else if (m == "maintenance.verify_mhc") DoVerifyMhc(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_3dlut") DoSet3dlut(*r->params, *r->result, *r->error);
         else if (m == "runtime.clear_3dlut") DoClear3dlut(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_fald_params") DoSetFaldParams(*r->params, *r->result, *r->error);

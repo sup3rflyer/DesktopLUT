@@ -203,10 +203,10 @@ default vs C++ GUI-marshal 60s verified correctly ordered (the server gives up f
 
 | # | Ticket | Where | Why |
 |---|---|---|---|
-| T1 | Add `contract_version` (int, `= 1`) to the `state.get` result | `HandleStateGet` | Version handshake (F9-8). DLC already checks it at preflight; `CPP_TICKETED_RESULT_KEYS` in `test_ipc_contract.py` starts enforcing the shape the moment it lands — remove the allowlist entry with the change. |
+| T1 | ~~Add `contract_version` (int, `= 1`) to the `state.get` result~~ **LANDED 2026-09-21** | `HandleStateGet` | Version handshake (F9-8). `kCalibrationContractVersion = 1`, reported first in the result. The `CPP_TICKETED_RESULT_KEYS` allowlist is now EMPTY, so the existing shape test enforces it. **Not compiled — see below.** |
 | T2 | ~~Preserve the ORIGINAL snapshot on re-enter~~ **LANDED 2026-09-21** | `DoEnterNeutral` / `DoExitCalibration` | Single snapshot slot was overwritten with the already-cleared state when a crashed run's session is still active — `restore_snapshot` then couldn't restore the user's setup (F9-9). Now a per-monitor `CalibSnapshotStore` (`src/calib_snapshot.h`): first capture of a monitor wins for the session, captures dropped at exit, restore walks every captured monitor. `calibration.enter` reports `snapshot_retained` so DLC can tell a fixed server from an old one. **Not compiled or run on hardware — needs an MSVC build + the box check below.** |
 | T3 | ~~Expose `correction_grayscale` in `state.get` mhc entries~~ **LANDED 2026-09-21** | `HandleStateGet` | Makes DLC's Design-B grayscale-wb revert (restore the user's PRIOR correction) real on hardware; it degraded to clear-to-identity (F9-10). Now `{enabled, point_count, points, deviations:{r,g,b}}` via `GrayscaleJson`, emitted on every mhc entry. **Not compiled or run on hardware — see below.** |
-| T4 | Remove the unreachable `maintenance.verify_mhc` branch in `HandleCalibrationGuiCommand` | `desktoplut_ipc_server.cpp:1483` | Hygiene: Dispatch serves it on the pipe thread first; the GUI-thread branch is dead and misleads about threading. |
+| T4 | ~~Remove the unreachable `maintenance.verify_mhc` branch~~ **LANDED 2026-09-21** | `HandleCalibrationGuiCommand` | Hygiene: Dispatch serves it on the pipe thread first, and `IsMutatingMethod` never claimed it, so the GUI-thread branch was dead and misled about threading. Removed, and a general pin now fails on ANY method Dispatch already serves off-thread appearing in the GUI table. |
 
 ## 5a. T2 follow-up (landed 2026-09-21, `claude/project-thread-djg427`)
 
@@ -313,6 +313,33 @@ Suite with all three commits on the branch: `1530 passed, 9 skipped`.
 2. A run with an existing correction grayscale: `state.get` reports it, and a grayscale touch-up
    followed by `revert` restores THAT curve rather than clearing to identity.
 3. The log line no longer says "none exists, or this build does not expose it" — it now says which.
+
+## 5c. T1 + T4 follow-up (landed 2026-09-21, `claude/project-thread-djg427`)
+
+Phase 9's C++ ticket list is now closed: T1–T4 all landed on this branch.
+
+- **T1:** `kCalibrationContractVersion = 1` next to the other pipe constants, reported as the
+  first key of the `state.get` result. It changes nothing semantically today — DLC's
+  `CONTRACT_VERSION` is also 1 and an absent field already meant 1 — but the handshake can now
+  actually fire on a future bump, which it never could while no build sent the field. The two
+  constants must move together; both say so.
+- **T4:** the dead `maintenance.verify_mhc` branch is gone from `HandleCalibrationGuiCommand`.
+  Verified unreachable two ways: `Dispatch` answers it on the pipe thread before the marshal, and
+  `IsMutatingMethod` never listed it, so the branch could not be reached even without that.
+- **Tests:** removing the `CPP_TICKETED_RESULT_KEYS` entry is T1's test — the allowlist is now
+  empty, so any advertised result key the C++ does not set fails. T4 gets a general pin
+  (`test_no_gui_thread_branch_for_a_method_dispatch_already_serves`) that intersects Dispatch's
+  off-thread set with the GUI table rather than naming verify_mhc, so it catches the next one.
+  Both verified to bite by reverting the C++ change and watching them fail.
+
+Suite with all four commits on the branch: `1531 passed, 9 skipped`; `dlc.stages.simulate`
+reaches report with every stage `ran`.
+
+### Needs checking on the Windows box (T1 + T4)
+
+1. It builds, and `maintenance.verify_mhc` still answers over the pipe (the branch removed was
+   the unreachable one, not the live one in `Dispatch`).
+2. `state.get` reports `contract_version: 1`, and preflight raises no `contract_version_mismatch`.
 
 ## 6. HW-validation queue additions
 

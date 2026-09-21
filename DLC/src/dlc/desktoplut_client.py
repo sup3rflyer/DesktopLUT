@@ -13,10 +13,10 @@ from typing import Any, Callable, Protocol
 DEFAULT_PIPE_NAME = r"\\.\pipe\DesktopLUT.Calibration"
 
 # The wire-contract version DLC speaks (the API spec's `version`). Servers advertise
-# theirs via an optional `contract_version` field in the `state.get` result; a server
-# that omits it predates versioning and is treated as v1 (today's C++ builds — the
-# server-side field is a DesktopLUT ticket, fable Phase 9). Bump ONLY for a change a
-# tolerant client cannot absorb; additive fields never require a bump.
+# theirs in the `state.get` result; a server that omits it predates the field
+# (kCalibrationContractVersion, fable Phase 9 T1) and is treated as v1. Bump ONLY for a
+# change a tolerant client cannot absorb — and in lockstep with the C++ constant;
+# additive fields never require a bump.
 CONTRACT_VERSION = 1
 
 

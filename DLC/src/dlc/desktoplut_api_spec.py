@@ -93,10 +93,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
                           "Absent on pre-2026-09-03 builds (then the ini is the only layer evidence).",
-                "contract_version": "integer (optional): the wire-contract version the server speaks. "
-                                    "Absent = pre-versioning build = 1. DLC checks this at preflight so a "
-                                    "mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
-                                    "mid-run. Server-side field is a DesktopLUT ticket (fable Phase 9).",
+                "contract_version": "integer: the wire-contract version the server speaks (1). "
+                                    "Absent = a build predating the field = 1. DLC checks this at preflight "
+                                    "so a mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
+                                    "mid-run. Mirrors kCalibrationContractVersion in the C++ and "
+                                    "CONTRACT_VERSION in desktoplut_client (fable Phase 9 T1).",
                 "hook": "object {active:bool (DWM hook DLL injected), needs_check:bool (an entry is "
                         "order/pinned/replaced-matched and unconfirmed, or provisional, or the routing "
                         "session is stale), "
@@ -722,8 +723,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "request_envelope": {"method": "string", "params": "object"},
             "response_envelope": {"ok": "boolean", "result": "object when ok", "error": "string when not ok"},
             "versioning": (
-                "state.get result SHOULD carry contract_version (integer; absent = 1, i.e. a "
-                "pre-versioning build). The client checks it at preflight (desktoplut_client."
+                "state.get result carries contract_version (integer; absent = 1, i.e. a build "
+                "predating the field). The client checks it at preflight (desktoplut_client."
                 "contract_version_mismatch) so a mismatch reads 'update DLC/DesktopLUT' instead "
                 "of 'unknown method' mid-run. Additive fields never bump the version."
             ),
