@@ -611,6 +611,29 @@ JsonValue BuildHookStateJson() {
 // ===========================================================================
 // Read-only handlers (served on the pipe thread)
 // ===========================================================================
+// The grayscale layer as DLC reads it back (fable audit Phase 9, T3). Emitted in the SAME
+// decomposition ApplyGrayscalePayload stores — `points` already carries the luminance scale,
+// `deviations` carries the per-channel BALANCE — so handing this straight back to
+// mhc.set_correction_grayscale reproduces the curve exactly. `enabled` is reported for honesty;
+// toggling it is layers.set {grayscale}, not this.
+JsonValue GrayscaleJson(const GrayscaleSettings& gs) {
+    JsonValue out = JObj();
+    out.set("enabled", JBool(gs.enabled));
+    out.set("point_count", JNum((double)gs.pointCount));
+    JsonValue pts = JArr();
+    for (float v : gs.points) pts.arr.push_back(JNum((double)v));
+    out.set("points", std::move(pts));
+    static const char* kChannels[3] = { "r", "g", "b" };
+    JsonValue devs = JObj();
+    for (int c = 0; c < 3; ++c) {
+        JsonValue chan = JArr();
+        for (float v : gs.rgbDeviations[c]) chan.arr.push_back(JNum((double)v));
+        devs.set(kChannels[c], std::move(chan));
+    }
+    out.set("deviations", std::move(devs));
+    return out;
+}
+
 void HandleStateGet(JsonValue& result) {
     result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
     // WIRE CONTRACT (consumed by DLC). Mirrors the OVERLAY-active flag, NOT the DWM-hook state:
@@ -652,6 +675,13 @@ void HandleStateGet(JsonValue& result) {
                     if (!m.sourceFilePath.empty())
                         e.set("source_file", JStr(WideToUtf8(m.sourceFilePath)));
                     e.set("active_perm", JNum(m.activePerm));
+                    // The user's CORRECTION grayscale, so DLC can snapshot it before a
+                    // grayscale touch-up and put THEIR curve back on revert (Design B).
+                    // Without it the revert degrades to clear-to-identity (fable audit
+                    // Phase 9, T3 / F9-10). Always emitted with the entry: empty `points`
+                    // means "no correction", which a client must be able to tell apart
+                    // from a build that never sends the field at all.
+                    e.set("correction_grayscale", GrayscaleJson(m.correctionGrayscale));
                     mhc.set(key, e);
                 }
                 const std::wstring& path = isHDR ? s.hdrPath : s.sdrPath;

@@ -4319,14 +4319,19 @@ class Calibration:
             self.calib["grayscale_wb_prior"] = prior_snapshot = self._snapshot_correction_grayscale()
             self._save()
             if prior_snapshot is None:
-                # Honesty tell (fable Phase 9): None means EITHER no prior correction exists OR
-                # this DesktopLUT build doesn't expose correction_grayscale in state.get (the
-                # current C++ reports only applied/profile_name — exposing it is a ticketed
-                # DesktopLUT change). Either way a later `revert` clears the touch-up to
-                # identity rather than restoring a pre-existing correction — say so up front.
-                self.ctx.log("no prior correctionGrayscale captured over the pipe (none exists, or "
-                             "this DesktopLUT build does not expose it in state.get) — a revert of "
-                             "this touch-up will clear to identity, not restore a prior correction")
+                # Honesty tell (fable Phase 9): a revert will clear the touch-up to identity
+                # rather than restore a pre-existing correction — say so up front, and say WHY,
+                # because "you had none" and "this build can't tell me" are different problems
+                # (T3 made state.get expose the curve; older builds still don't).
+                why = {
+                    "none": "no prior correction is set for this monitor/mode",
+                    "unsupported": "this DesktopLUT build does not expose correction_grayscale in "
+                                   "state.get — update DesktopLUT to make the revert restore your curve",
+                    "unreadable": "DesktopLUT reported no MHC entry for this monitor/mode, or the pipe "
+                                  "read failed",
+                }.get(self.calib.get("grayscale_wb_prior_source") or "", "reason unknown")
+                self.ctx.log(f"no prior correctionGrayscale captured over the pipe ({why}) — a revert "
+                             "of this touch-up will clear to identity, not restore a prior correction")
 
             # Engage the live grayscale editor (the "Edit Points" path): this strips any prior
             # correction-grayscale from the active MHC permutation and shows a live, measurable
@@ -4733,15 +4738,37 @@ class Calibration:
 
     def _snapshot_correction_grayscale(self) -> Optional[dict[str, Any]]:
         """The live correctionGrayscale for this monitor/mode from ``state.get`` (the user's
-        current correction), or ``None`` if absent/unreadable — the DLC-owned revert snapshot
-        for the grayscale touch-up (Design B). Best-effort: a down pipe just yields None (the
-        touch-up won't proceed far without the pipe anyway)."""
+        current correction), or ``None`` — the DLC-owned revert snapshot for the grayscale
+        touch-up (Design B). Best-effort: a down pipe just yields None (the touch-up won't
+        proceed far without the pipe anyway).
+
+        Also records WHY it is None in ``calib['grayscale_wb_prior_source']``, because the three
+        reasons need different words to the user (fable Phase 9 T3):
+
+        * ``prior`` — the user's curve was captured; a revert restores exactly it.
+        * ``none`` — the server exposes the field and it is empty: no prior correction exists.
+        * ``unsupported`` — the mhc entry carries no ``correction_grayscale`` at all, i.e. a
+          DesktopLUT predating T3. A revert can only clear to identity.
+        * ``unreadable`` — no mhc entry for this pair, or the pipe failed.
+        """
         try:
             state = self.controller.state()
             key = f"{self.monitor}:{self.mode}"
-            cg = (((state.get("mhc") or {}).get(key) or {}).get("correction_grayscale"))
-            return dict(cg) if isinstance(cg, dict) and cg.get("points") else None
+            entry = (state.get("mhc") or {}).get(key)
+            if not isinstance(entry, dict):
+                self.calib["grayscale_wb_prior_source"] = "unreadable"
+                return None
+            cg = entry.get("correction_grayscale")
+            if not isinstance(cg, dict):
+                self.calib["grayscale_wb_prior_source"] = "unsupported"
+                return None
+            if not cg.get("points"):
+                self.calib["grayscale_wb_prior_source"] = "none"
+                return None
+            self.calib["grayscale_wb_prior_source"] = "prior"
+            return dict(cg)
         except Exception:  # noqa: BLE001 - advisory snapshot; revert falls back to clearing
+            self.calib["grayscale_wb_prior_source"] = "unreadable"
             return None
 
     def _restore_correction_grayscale(self) -> bool:

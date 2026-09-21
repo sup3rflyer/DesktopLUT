@@ -249,6 +249,10 @@ class MockDesktopLutServer:
                 # it — MockDesktopLutState.overlay_tick; the sim is never in DWM-hook mode)
                 out["overlay"] = {"awake": self.state.overlay_tick(poll=True), "dwm_hook_mode": False}
                 out.pop("overlay_model", None)
+                # The C++ emits correction_grayscale on every mhc entry; the mock's entry is its
+                # own model, so project the wire block over it (fable Phase 9 T3).
+                for mhc_key, entry in (out.get("mhc") or {}).items():
+                    entry["correction_grayscale"] = self.correction_grayscale_view(mhc_key)
                 return self.ok(out)
             if method == "hook.set_routing":
                 return self.handle_hook_set_routing(params)
@@ -383,6 +387,40 @@ class MockDesktopLutServer:
                 "changed": changed,
             }
         )
+
+    def _set_correction_gs_enabled(self, key: str, value: bool) -> None:
+        """Mirror `ApplyGrayscalePayload`'s ``gs.enabled = true`` on the stored curve.
+
+        KNOWN DIVERGENCE, deliberately not mirrored here: in the C++ this is the SAME bool
+        that HandleStateGet reports as ``layers[key].grayscale``, so on hardware applying a
+        correction grayscale also turns that viewing layer ON. The mock leaves the layer
+        alone. Mirroring it makes DLC's own hardware-readiness neutral audit refuse to
+        measure ("GUI grayscale correction is still ON") on the pause/resume path, which may
+        be a real hardware hazard rather than a mock bug — raised for the owner, not guessed
+        at here (fable Phase 9 T3 follow-up).
+        """
+        cg = (self.state.mhc.setdefault(key, {})).get("correction_grayscale")
+        if isinstance(cg, dict):
+            cg["enabled"] = bool(value)
+
+    def correction_grayscale_view(self, key: str) -> dict[str, Any]:
+        """The `correction_grayscale` block C++ HandleStateGet emits on EVERY mhc entry
+        (fable Phase 9 T3): the decomposition ApplyGrayscalePayload stores, so handing it back
+        to mhc.set_correction_grayscale reproduces the curve. Empty `points` means "no
+        correction" — distinct from a build that omits the field, which is how a client tells
+        a pre-T3 DesktopLUT apart. The mock's own editor-decomposition keys (luminance, rgb,
+        editor_points) ride along as test probes; production DLC reads only these four.
+        """
+        cg = (self.state.mhc.get(key) or {}).get("correction_grayscale") or {}
+        points = list(cg.get("points") or [])
+        devs = cg.get("deviations") or {}
+        return {
+            **cg,
+            "enabled": bool(cg.get("enabled")),
+            "point_count": int(cg.get("point_count") or len(points)),
+            "points": points,
+            "deviations": {ch: list(devs.get(ch) or []) for ch in ("r", "g", "b")},
+        }
 
     def key(self, params: dict[str, Any]) -> str:
         """Validate monitor+mode exactly as the C++ ``ParseMonitorMode`` does (fable
@@ -640,6 +678,7 @@ class MockDesktopLutServer:
                 "points": deepcopy(params.get("points", [])),
                 "deviations": deepcopy(params.get("deviations", {})),
             }
+            self._set_correction_gs_enabled(key, True)   # C++ ApplyGrayscalePayload: gs.enabled = true
         elif method == "mhc.grayscale_live_begin":
             # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
             # stacks on top of MHC+3D-LUT and is measurable. No bake yet. Mirrors the C++
@@ -683,6 +722,7 @@ class MockDesktopLutServer:
             if isinstance(rgb, dict):
                 staged["rgb"] = deepcopy(rgb)
             state["correction_grayscale"] = staged
+            self._set_correction_gs_enabled(key, True)   # same ApplyGrayscalePayload path in the C++
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.
@@ -707,8 +747,10 @@ class MockDesktopLutServer:
                 saved = state.pop("gs_live_saved", None)
                 if saved is not None:
                     state["correction_grayscale"] = saved
+                    self._set_correction_gs_enabled(key, bool(saved.get("enabled")))
                 else:
                     state.pop("correction_grayscale", None)
+                    self._set_correction_gs_enabled(key, False)
             return self.ok({"monitor_mode": key, "canceled": canceled,
                             "mhc": deepcopy(self.state.mhc.get(key, {}))})
         elif method == "mhc.apply":

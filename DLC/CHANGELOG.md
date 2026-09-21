@@ -317,6 +317,13 @@ request, adjudicates ambiguous results on digests, and writes the report.
   which it never had (the flow landed after that audit); a ~40-minute profiling pass is the
   one most likely to be interrupted, and its whole restore — the panel file, pedestal mode,
   temporal, starfield and glow settings included — is the calibration snapshot.
+- **A grayscale touch-up can be reverted to the correction you already had.** DesktopLUT's
+  `state.get` never exposed the MHC correction grayscale, so DLC's revert snapshot was always
+  empty and a `revert` cleared to identity — it silently discarded whatever grayscale correction
+  you had set yourself. `state.get` mhc entries now carry `correction_grayscale`
+  (`enabled`/`point_count`/`points`/`deviations`), in the same form the setter takes, so the
+  revert puts your curve back. When there is still no snapshot, DLC now says which reason it is:
+  no prior correction, a DesktopLUT too old to report one, or an unreadable pipe.
 - **A calibration run no longer drops the OTHER mode's 3D LUT.** Entering calibration
   mode cleared both SDR and HDR runtime layers on the monitor, and accepting the new
   calibration exits without the snapshot restore — so a clean HDR run permanently

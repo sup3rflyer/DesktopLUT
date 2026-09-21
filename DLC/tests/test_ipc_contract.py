@@ -230,6 +230,22 @@ def test_spec_gui_thread_flags_match_cpp_dispatch():
             f"but the C++ Dispatch routes it {'off' if not expected else 'onto'} the GUI thread")
 
 
+def test_cpp_state_get_exposes_correction_grayscale_on_mhc_entries():
+    """The nested mhc-entry shape the top-level result-key check can't see (fable Phase 9 T3).
+    HandleStateGet must emit correction_grayscale on every mhc entry, or DLC's Design-B
+    grayscale-wb revert silently degrades to clear-to-identity on hardware while passing in
+    the simulator."""
+    text = _cpp_text()
+    start = text.find("void HandleStateGet(")
+    assert start != -1, "HandleStateGet not found in the C++ IPC server"
+    body = text[start:text.find("\nvoid ", start + 1)]
+    assert 'e.set("correction_grayscale"' in body, (
+        "HandleStateGet's mhc entries do not carry correction_grayscale — the Design-B revert "
+        "cannot restore the user's curve (phase-9.md ticket T3)")
+    assert "GrayscaleJson(m.correctionGrayscale)" in body, (
+        "correction_grayscale must be built from MHCSettings::correctionGrayscale")
+
+
 # --------------------------------------------------------------------------
 # 3. Behavioural fidelity pins (semantics sim correctness depends on)
 # --------------------------------------------------------------------------
@@ -789,3 +805,95 @@ def test_install_mhc_flags_unconfirmed_apply(tmp_path, monkeypatch):
     codes = [a.code for a in result.anomalies]
     assert "apply_unconfirmed" in codes and "verify_failed" in codes
     assert result.advice["default_policy_verdict"] == "investigate"
+
+
+# --------------------------------------------------------------------------
+# state.get correction_grayscale: the Design-B revert snapshot (Phase 9 T3)
+# --------------------------------------------------------------------------
+def _cg_probe(state_result, *, monitor=0, mode="SDR"):
+    """Drive Calibration._snapshot_correction_grayscale against a canned state.get result."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import Calibration
+
+    holder = SimpleNamespace(
+        controller=SimpleNamespace(state=lambda: state_result),
+        monitor=monitor, mode=mode, calib={},
+    )
+    snap = Calibration._snapshot_correction_grayscale(holder)
+    return snap, holder.calib.get("grayscale_wb_prior_source")
+
+
+def test_state_get_correction_grayscale_round_trips_through_the_setter():
+    """The property the Design-B revert depends on: hand what state.get reports straight back
+    to controller.set_correction_grayscale and the curve must land unchanged.
+
+    It is not obvious. state.get reports DesktopLUT's domain (SDR points on the sqrt-distributed
+    t^2 slot grid, linear-light deviations), while the controller bridges DLC's signal domain on
+    the way in — so the restore re-bridges an already-bridged curve. That is safe only because
+    the bridge is idempotent once a curve sits on the canonical grid; this pins it, because the
+    restore path was dead code until T3 exposed the field."""
+    ctrl = CalibrationController.mock()
+    n = 8
+    devs = {"r": [1.01] * n, "g": [1.0] * n, "b": [0.99] * n}
+    ctrl.set_correction_grayscale(0, "SDR", n, [i / (n - 1) for i in range(n)], devs)
+
+    cg = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert cg["point_count"] == n
+    assert cg["enabled"] is True                       # ApplyGrayscalePayload sets gs.enabled = true
+    assert cg["points"] == pytest.approx([(i / (n - 1)) ** 2 for i in range(n)])   # DesktopLUT's grid
+    assert cg["deviations"]["r"] == pytest.approx(devs["r"])
+    assert cg["deviations"]["b"] == pytest.approx(devs["b"])
+
+    # Hand it back verbatim, exactly as _restore_correction_grayscale does.
+    ctrl.set_correction_grayscale(0, "SDR", cg["point_count"], cg["points"], cg["deviations"])
+    again = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert again["points"] == pytest.approx(cg["points"])
+    for ch in ("r", "g", "b"):
+        assert again["deviations"][ch] == pytest.approx(cg["deviations"][ch])
+
+
+def test_the_sdr_grayscale_bridge_is_idempotent_on_a_non_flat_curve():
+    """The same property at the unit level, on a curve that is NOT flat — a re-bridge that
+    drifted would corrupt the user's correction a little on every revert."""
+    n = 12
+    pts = [i / (n - 1) for i in range(n)]
+    devs = {"r": [1.0 + 0.01 * i for i in range(n)],
+            "g": [1.0 - 0.004 * i for i in range(n)],
+            "b": [0.97 + 0.002 * i * i for i in range(n)]}
+    once = CalibrationController._bridge_grayscale("SDR", pts, devs, 2.2)
+    twice = CalibrationController._bridge_grayscale("SDR", once[0], once[1], 2.2)
+    assert twice[0] == pytest.approx(once[0])
+    for ch in ("r", "g", "b"):
+        assert twice[1][ch] == pytest.approx(once[1][ch])
+
+
+def test_snapshot_correction_grayscale_captures_the_users_curve():
+    """The Design-B revert snapshot: with the field exposed, the user's own curve is what a
+    later `revert` puts back — not identity."""
+    ctrl = CalibrationController.mock()
+    n = 6
+    points = [i / (n - 1) for i in range(n)]
+    ctrl.set_correction_grayscale(0, "SDR", n, points, {"r": [1.02] * n, "g": [1.0] * n, "b": [0.98] * n})
+
+    live = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    snap, source = _cg_probe(ctrl.state())
+    assert source == "prior"
+    assert snap is not None
+    assert snap["points"] == pytest.approx(live["points"])          # the curve as DesktopLUT holds it
+    assert snap["deviations"]["b"] == pytest.approx([0.98] * n)     # the user's blue trim, intact
+
+
+def test_snapshot_correction_grayscale_separates_no_curve_from_an_old_build():
+    """"You had no correction" and "this build cannot tell me" both yield None, and both make a
+    revert clear to identity — but only one of them is fixed by updating DesktopLUT, so the
+    reason is recorded rather than collapsed (fable Phase 9 T3)."""
+    exposed_but_empty = {"mhc": {"0:SDR": {"applied": True, "correction_grayscale": {
+        "enabled": False, "point_count": 32, "points": [], "deviations": {"r": [], "g": [], "b": []}}}}}
+    assert _cg_probe(exposed_but_empty) == (None, "none")
+
+    pre_t3_build = {"mhc": {"0:SDR": {"applied": True, "profile_name": "user.icm"}}}
+    assert _cg_probe(pre_t3_build) == (None, "unsupported")
+
+    no_entry = {"mhc": {}}
+    assert _cg_probe(no_entry) == (None, "unreadable")

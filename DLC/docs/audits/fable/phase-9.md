@@ -205,7 +205,7 @@ default vs C++ GUI-marshal 60s verified correctly ordered (the server gives up f
 |---|---|---|---|
 | T1 | Add `contract_version` (int, `= 1`) to the `state.get` result | `HandleStateGet` | Version handshake (F9-8). DLC already checks it at preflight; `CPP_TICKETED_RESULT_KEYS` in `test_ipc_contract.py` starts enforcing the shape the moment it lands — remove the allowlist entry with the change. |
 | T2 | ~~Preserve the ORIGINAL snapshot on re-enter~~ **LANDED 2026-09-21** | `DoEnterNeutral` / `DoExitCalibration` | Single snapshot slot was overwritten with the already-cleared state when a crashed run's session is still active — `restore_snapshot` then couldn't restore the user's setup (F9-9). Now a per-monitor `CalibSnapshotStore` (`src/calib_snapshot.h`): first capture of a monitor wins for the session, captures dropped at exit, restore walks every captured monitor. `calibration.enter` reports `snapshot_retained` so DLC can tell a fixed server from an old one. **Not compiled or run on hardware — needs an MSVC build + the box check below.** |
-| T3 | Expose `correction_grayscale` (`point_count`/`points`/`deviations`) in `state.get` mhc entries | `HandleStateGet` | Makes DLC's Design-B grayscale-wb revert (restore the user's PRIOR correction) real on hardware; today it degrades to clear-to-identity (F9-10). Spec text already documents the requirement. |
+| T3 | ~~Expose `correction_grayscale` in `state.get` mhc entries~~ **LANDED 2026-09-21** | `HandleStateGet` | Makes DLC's Design-B grayscale-wb revert (restore the user's PRIOR correction) real on hardware; it degraded to clear-to-identity (F9-10). Now `{enabled, point_count, points, deviations:{r,g,b}}` via `GrayscaleJson`, emitted on every mhc entry. **Not compiled or run on hardware — see below.** |
 | T4 | Remove the unreachable `maintenance.verify_mhc` branch in `HandleCalibrationGuiCommand` | `desktoplut_ipc_server.cpp:1483` | Hygiene: Dispatch serves it on the pipe thread first; the GUI-thread branch is dead and misleads about threading. |
 
 ## 5a. T2 follow-up (landed 2026-09-21, `claude/project-thread-djg427`)
@@ -263,6 +263,56 @@ Suite with both commits on the branch: `1525 passed, 9 skipped`.
    white balance and cube should come back. Before this change they did not.
 4. **The apply path is unchanged:** a normal run that commits (exit without restore) must still
    leave the calibrated state in place.
+
+## 5b. T3 follow-up (landed 2026-09-21, `claude/project-thread-djg427`)
+
+- **C++:** `GrayscaleJson` next to `HandleStateGet`; every mhc entry now carries
+  `correction_grayscale {enabled, point_count, points, deviations:{r,g,b}}`. It is emitted in the
+  SAME decomposition `ApplyGrayscalePayload` stores (`points` carry the luminance scale,
+  `deviations` the per-channel balance), so the block hands straight back to
+  `mhc.set_correction_grayscale`. Always present with the entry: EMPTY `points` means "no
+  correction", which a client must be able to tell apart from a build that omits the field.
+- **The restore path was dead code until now, and it re-bridges.** `_restore_correction_grayscale`
+  pushes the `state.get` snapshot back through `controller.set_correction_grayscale`, which applies
+  the SDR signal→DesktopLUT bridge — to a curve already in DesktopLUT's domain. Verified safe: the
+  bridge resamples onto the canonical t² slot grid and is idempotent once a curve sits there
+  (checked on flat and non-flat curves; both pinned).
+- **DLC:** the honesty tell now says WHY there is no snapshot. `_snapshot_correction_grayscale`
+  records `calib['grayscale_wb_prior_source']` as `prior` / `none` / `unsupported` / `unreadable`,
+  and the log distinguishes "you have no prior correction" from "update DesktopLUT" — previously
+  one sentence covered both.
+- **Mock:** `state.get` now projects the C++ `correction_grayscale` block over every mhc entry, and
+  `enabled` mirrors `ApplyGrayscalePayload`'s `gs.enabled = true` on `set_correction_grayscale` and
+  `grayscale_set_live`, with `grayscale_cancel` restoring the pre-begin value.
+- **Tests:** a static pin that `HandleStateGet` emits the field (the top-level result-key check
+  cannot see a nested shape — verified it bites by deleting the C++ line), a wire round-trip, a
+  bridge-idempotence pin, the snapshot capturing the user's curve, and the three `None` reasons
+  kept apart.
+
+### Found while doing T3 — NOT fixed, needs the owner
+
+In the C++, `MHCSettings::correctionGrayscale.enabled` is ONE bool reported two ways: as
+`layers[key].grayscale` and now as `correction_grayscale.enabled`. `ApplyGrayscalePayload` sets it
+true on every `set_correction_grayscale` and `grayscale_set_live` — so on hardware, applying a
+correction grayscale also turns that viewing layer ON. The mock has never done this.
+
+Mirroring it faithfully makes DLC's own hardware-readiness neutral audit abort:
+*"GUI grayscale correction is still ON for 0:SDR in DesktopLUT.ini after enter-neutral"* — on the
+pause/resume path, where the audit re-runs after a correction has been applied
+(`test_viewing_layers_stay_off_across_a_pause_and_restore_after_the_resume`,
+`test_decide_override_flips_full_flow_to_revert_on_resume`). That is either a real hardware hazard
+the mock has been hiding, or an audit that should exempt a DLC-applied correction. Deciding needs
+the box and probably the design notes, so the mock mirror is scoped to the curve's own `enabled`
+and the divergence is documented in `_set_correction_gs_enabled` rather than guessed at.
+
+Suite with all three commits on the branch: `1530 passed, 9 skipped`.
+
+### Needs checking on the Windows box (T3)
+
+1. It builds. `GrayscaleJson` uses only the file's own JSON helpers; no new include or project change.
+2. A run with an existing correction grayscale: `state.get` reports it, and a grayscale touch-up
+   followed by `revert` restores THAT curve rather than clearing to identity.
+3. The log line no longer says "none exists, or this build does not expose it" — it now says which.
 
 ## 6. HW-validation queue additions
 

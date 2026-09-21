@@ -65,10 +65,15 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "corrections_enabled": "boolean (the OVERLAY-draw flag, NOT 'a correction is live' — "
                                        "false in DWM-hook mode even with a cube loaded; see ../docs/NAMING.md S4)",
                 "calibration_mode": "object or null",
-                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string}. "
-                       "DLC ALSO wants correction_grayscale {point_count,points,deviations} exposed here "
-                       "(the Design-B grayscale-wb revert snapshot source) — a DesktopLUT-side ticket; "
-                       "until then the snapshot degrades to clear-to-identity on hardware (fable Phase 9)",
+                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string, "
+                       "correction_grayscale:{enabled:bool, point_count:int, points:[float], "
+                       "deviations:{r:[float],g:[float],b:[float]}}}. correction_grayscale is the "
+                       "Design-B grayscale-wb revert snapshot source, in the SAME decomposition "
+                       "mhc.set_correction_grayscale stores (points carry the luminance scale, deviations "
+                       "the per-channel balance), so handing it straight back reproduces the curve. "
+                       "EMPTY points = no correction; the field ABSENT = a build predating the change, "
+                       "where a revert degrades to clear-to-identity (fable Phase 9 T3). enabled mirrors "
+                       "layers[key].grayscale — the same C++ bool; toggle it with layers.set, not here",
                 "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
                 "layers": "object keyed by '<monitor>:<MODE>' for EVERY pair: the viewing layers a run "
                           "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"
