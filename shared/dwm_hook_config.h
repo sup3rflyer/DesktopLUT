@@ -58,10 +58,58 @@ struct DwmHookSharedConfig {
     uint32_t beaconGeneration;       // increments per beacon session
     uint32_t beaconSize;             // beacon square edge in device pixels (host default 8)
 
-    uint32_t _reserved[13];          // Future expansion
+    // FALD correction, one packed word per monitors[] entry (same index). Taken from _reserved
+    // rather than added to DwmHookMonitorConfig ON PURPOSE: that struct is 48 bytes behind a
+    // static_assert with an offset contract checked in test_displayconfig.cpp (docs/NAMING.md §1)
+    // and has no spare room, and there is no format-version field anywhere in this struct. Every
+    // existing offset therefore stays put, sizeof stays 464, and a DwmHook.dll from an older build
+    // still resident in a running dwm.exe reads what these words used to be — zero, i.e. FALD off —
+    // instead of misreading a moved layout. Pack/unpack with the helpers below.
+    // The panel parameter file itself does NOT come through here: it is staged as a file beside the
+    // .cube LUTs and read once at attach (see DWM_HOOK_FALD_SUBDIR).
+    uint32_t faldFlags[MAX_DWM_HOOK_MONITORS];
+
+    uint32_t _reserved[5];           // Future expansion
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
 #pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// FALD correction (mini-LED local dimming context-dependence) — host <-> hook
+// ---------------------------------------------------------------------------
+// Two channels, deliberately split by how often each changes:
+//
+//   * the per-panel parameter file (*.bin, `python -m dlc.fald.export`) is STAGED AS A FILE, in
+//     this subdirectory of the LUT staging dir, and read once during DllMain like the .cube files.
+//     Its own subdirectory because AddLUTs feeds every non-directory file whose name starts
+//     "<int>_<int>" to the .cube parser, and a panel file is named the same way. Changing the panel
+//     file therefore needs a re-injection — it is a rare, deliberate act (a new fit), and keeping it
+//     out of the present path means no file polling inside dwm.exe.
+//
+//   * the three live settings below travel in faldFlags[] over the seqlock, so toggling the layer
+//     or a debug view does NOT re-inject (a re-injection re-rolls twin-panel routing).
+//
+// Staged names mirror the LUTs: "<left>_<top>.bin" (SDR/ACM) and "<left>_<top>_hdr.bin" (HDR).
+#define DWM_HOOK_FALD_SUBDIR_A  "fald"
+#define DWM_HOOK_FALD_SUBDIR_W  L"fald"
+
+// faldFlags[i] layout. debugMode is the same 0..10 scale as the overlay path (shared/fald_shader.h):
+// 0 = normal output, 4 = identity passthrough (the H4 bit-for-bit check), others are debug views.
+#define DWM_HOOK_FALD_ENABLED_BIT   0x00000001u
+#define DWM_HOOK_FALD_DEBUG_SHIFT   1
+#define DWM_HOOK_FALD_DEBUG_MASK    0x0000001Eu   // bits 1-4
+#define DWM_HOOK_FALD_PEDMODE_BIT   0x00000020u   // bit 5 (per-channel pedestal)
+#define DWM_HOOK_FALD_DEBUG_MAX     15u
+
+static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode) {
+    if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
+    return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
+         | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
+         | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u);
+}
+static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
+static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
+static inline int      DwmHookFaldPedMode(uint32_t w)  { return (w & DWM_HOOK_FALD_PEDMODE_BIT) != 0; }
 
 // ---------------------------------------------------------------------------
 // Identity beacon palette — shared by the host (paints) and the DLL (classifies)

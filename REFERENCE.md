@@ -343,9 +343,10 @@ next to a highlight that reads 6–20 % off because the panel's own backlight co
 light spread. The layer predicts the panel's real backlight and the panel's own estimate from the frame and
 pre-distorts each pixel so it lands where it would in a flat field of its own level.
 
-- **Overlay path only; HDR, and SDR when Windows "Automatically manage color for apps" (ACM) is on** — the ACM
-  desktop is composed in FP16 scRGB like HDR, a plain 8-bit SDR desktop never runs the layer. Off in DWM hook
-  mode (the status line says so when you enable it there). The Corrections tab has one *Enable* + *panel file*
+- **HDR, and SDR when Windows "Automatically manage color for apps" (ACM) is on** — the ACM
+  desktop is composed in FP16 scRGB like HDR, a plain 8-bit SDR desktop never runs the layer. Runs on the
+  overlay path, and — since the phase-one hook port — on the DWM hook path too, where a reduced *stateless
+  core* of it runs (see below). The Corrections tab has one *Enable* + *panel file*
   row per mode (HDR / SDR (ACM)); a panel file belongs to the mode it was profiled in (an HDR fit is a PQ file,
   an SDR fit a gamma file) and is refused on the other row. The correction is exact for the colour state the
   panel was profiled in; with a different MHC calibration active it is approximate.
@@ -372,6 +373,34 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   show on a static desktop.
 - Cost: four small compute passes on the zone grid (48×48 × 2 sub-cells on the PA32UCXR) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
+
+### In the DWM hook (phase one)
+
+The hook runs the layer's **stateless core** — statistic → black-frame boost → convolution → gain, twice, then
+the pixel pass. Starfield balancing, glow fill, the temporal modes and the settle hold stay on the overlay path
+for now; each of those is documented as bit-identical when off, so the hook's output must equal the overlay's
+exactly for the same input frame. Both paths run the same HLSL (`shared/fald_shader.h`) and the same panel-file
+reader (`shared/fald_panel.h`) — there is no second implementation of the correction.
+
+- **The panel file is staged, not messaged.** The host copies it beside the `.cube` files
+  (`…\Temp\DesktopLUT_luts\fald\<left>_<top>[_hdr].bin`) and the DLL reads it once during `DllMain`; the
+  staging directory is deleted right afterwards. A changed panel file therefore needs a re-injection. The three
+  live switches (enable, view, per-channel pedestal) travel in `DwmHookSharedConfig::faldFlags` over the
+  seqlock instead, so toggling them does not re-inject — a re-injection re-rolls twin-panel routing.
+- **Dirty rects are given up while the layer is on.** One zone's content changes the correction of pixels far
+  outside any changed rectangle, so that context copies and redraws the whole frame every present.
+- **It refuses a coin-toss routing.** A context whose monitor position came from first-present order among
+  indistinguishable twins (`CTXPOS_ORDER`), or from a provisional replacement guess, does not get the layer:
+  a fit applied to the wrong panel pre-distorts for the other panel's LEDs. The `.cube` path still tolerates
+  that risk; the correction does not.
+- **Cost is logged, not assumed.** Each monitor logs the CPU time its passes spend in the present path every
+  ~600 frames (`DesktopLUT_dwmhook.log`). Overrunning DWM's budget stutters the whole desktop, so this is the
+  number to watch first.
+- **Field dump for the bit-for-bit check.** Write a directory path into
+  `…\Temp\DesktopLUT_hook_fald_dump.txt`; the next frame writes the same files as the overlay's
+  `runtime.fald_dump` (drive, B_true, B_est, the flat response, the gain, the input and output frames) and the
+  trigger is consumed. One frame only, probed every ~300 presents: per-frame readback in the present path is
+  the stall recorded in `HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md`.
 
 ## Analysis Overlay (Win+Shift+X)
 

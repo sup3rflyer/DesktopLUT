@@ -12,6 +12,11 @@ struct DwmHookMonitorLUT {
     int left = 0, top = 0;           // Desktop position from MONITORINFO
     std::wstring sdrLutPath;          // SDR .cube path (empty = no SDR LUT)
     std::wstring hdrLutPath;          // HDR .cube path (empty = no HDR LUT)
+    // FALD panel parameter files (*.bin). Staged beside the LUTs and read once at attach, so a
+    // changed panel file needs a re-injection; the layer's live switches travel over the shared
+    // config instead (DwmHookSharedConfig::faldFlags). Empty = no FALD file for that mode.
+    std::wstring sdrFaldPath;
+    std::wstring hdrFaldPath;
 };
 
 // Check if the DWM hook is active via named event (lightweight, no elevation needed).

@@ -1,0 +1,803 @@
+// DesktopLUT DWM Hook - hook_fald.cpp
+// The FALD correction's stateless core, inside dwm.exe. See hook_fald.h for the phase-one scope and
+// why the excluded pieces are excluded.
+//
+// This file deliberately mirrors src/fald.cpp pass for pass and constant-buffer word for word. Where
+// a word belongs to a feature this path does not run (starfield, glow fill, the temporal modes), it
+// is written with the same value src/fald.cpp writes when that feature is off, so the two paths'
+// constant buffers agree and the shader — which is literally the same HLSL, out of
+// shared/fald_shader.h — cannot tell which host dispatched it. That is what makes the bit-for-bit
+// comparison in FaldPollDumpRequest meaningful.
+#include "pch.h"
+#include "hook_fald.h"
+#include "hook_log.h"
+#include "fald_shader.h"
+
+#include <cstdarg>
+#include <cstring>
+#include <string>
+#include <vector>
+
+// ---------------------------------------------------------------------------------------------
+// Process-global shaders (compiled once per attach on DWM's device)
+// ---------------------------------------------------------------------------------------------
+static ID3D11Device* g_dev = nullptr;
+static ID3D11DeviceContext* g_ctx = nullptr;
+
+static ID3D11ComputeShader* g_statCS = nullptr;
+static ID3D11ComputeShader* g_convCS = nullptr;
+static ID3D11ComputeShader* g_gainCS = nullptr;
+static ID3D11ComputeShader* g_blurCS = nullptr;
+static ID3D11ComputeShader* g_boostCS = nullptr;
+static ID3D11PixelShader* g_faldPS = nullptr;
+static ID3D11VertexShader* g_faldVS = nullptr;
+static ID3D11SamplerState* g_faldSampler = nullptr;
+
+// t0..t24, as the HLSL declares them (HOOK_FALD_SRV_SLOTS). The pixel pass and every compute pass
+// bind the whole range so a slot left over from a previous pass cannot be read by accident.
+static const UINT FALD_SRV_SLOTS = HOOK_FALD_SRV_SLOTS;
+// The deepest UAV range any core pass binds (stat binds u0/u1).
+static const UINT FALD_UAV_SLOTS = HOOK_FALD_UAV_SLOTS;
+
+static void LogF(const char* fmt, ...) {
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    log_to_file(msg);
+}
+
+static bool CompileOne(const std::string& src, const char* name, const char* target, ID3DBlob** blob) {
+    ID3DBlob* err = nullptr;
+    HRESULT hr = D3DCompile(src.c_str(), src.size(), name, nullptr, nullptr, "main", target, 0, 0, blob, &err);
+    if (FAILED(hr)) {
+        LogF("FALD: %s compile error: %s", name, err ? (const char*)err->GetBufferPointer() : "?");
+        if (err) err->Release();
+        return false;
+    }
+    if (err) err->Release();
+    return true;
+}
+
+bool FaldShadersReady() {
+    return g_statCS && g_convCS && g_gainCS && g_blurCS && g_boostCS && g_faldPS && g_faldVS && g_faldSampler;
+}
+
+bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    if (!dev || !ctx) return false;
+    g_dev = dev;
+    g_ctx = ctx;
+    if (FaldShadersReady()) return true;
+
+    const std::string common = g_faldCommonSource;
+    ID3DBlob* b = nullptr;
+    HRESULT hr = S_OK;
+
+    struct { const char* src; const char* name; ID3D11ComputeShader** out; } cs[] = {
+        { g_faldStatSource,  "FaldStatCS",  &g_statCS  },
+        { g_faldConvSource,  "FaldConvCS",  &g_convCS  },
+        { g_faldGainSource,  "FaldGainCS",  &g_gainCS  },
+        { g_faldBlurSource,  "FaldBlurCS",  &g_blurCS  },
+        { g_faldBoostSource, "FaldBoostCS", &g_boostCS },
+    };
+    for (const auto& s : cs) {
+        if (!CompileOne(common + s.src, s.name, "cs_5_0", &b)) { FaldReleaseShaders(); return false; }
+        hr = g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.out);
+        b->Release(); b = nullptr;
+        if (FAILED(hr)) { LogF("FALD: CreateComputeShader(%s) failed hr=0x%08X", s.name, (unsigned)hr); FaldReleaseShaders(); return false; }
+    }
+
+    if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) { FaldReleaseShaders(); return false; }
+    hr = g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { LogF("FALD: CreatePixelShader failed hr=0x%08X", (unsigned)hr); FaldReleaseShaders(); return false; }
+
+    // The pixel pass is a fullscreen triangle with no vertex buffer and no input layout, so the hook
+    // cannot reuse its own LUT vertex shader (that one reads a POSITION/TEXCOORD vertex buffer).
+    if (!CompileOne(g_faldFullscreenVsSource, "FaldVS", "vs_5_0", &b)) { FaldReleaseShaders(); return false; }
+    hr = g_dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldVS);
+    b->Release(); b = nullptr;
+    if (FAILED(hr)) { LogF("FALD: CreateVertexShader failed hr=0x%08X", (unsigned)hr); FaldReleaseShaders(); return false; }
+
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    if (FAILED(g_dev->CreateSamplerState(&sd, &g_faldSampler))) {
+        log_to_file("FALD: sampler creation failed");
+        FaldReleaseShaders();
+        return false;
+    }
+    log_to_file("FALD: correction shaders compiled (stateless core)");
+    return true;
+}
+
+template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
+
+void FaldReleaseShaders() {
+    SafeRelease(g_faldSampler);
+    SafeRelease(g_faldVS);
+    SafeRelease(g_faldPS);
+    SafeRelease(g_boostCS);
+    SafeRelease(g_blurCS);
+    SafeRelease(g_gainCS);
+    SafeRelease(g_convCS);
+    SafeRelease(g_statCS);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Staged panel files (read once at attach)
+// ---------------------------------------------------------------------------------------------
+struct FaldPanelFile {
+    int left = 0, top = 0;
+    bool isHdr = false;
+    FaldPanelParams params;
+};
+// Fixed-size, like lutTargets in hook_lut.h and for the same reason: DWM may call the Present hooks
+// on more than one thread, and a container that reallocates would hand a concurrent reader a freed
+// pointer. Both arrays are filled once (panel files at attach) or appended to only from a Present
+// (monitors), and never shrink.
+static const int FALD_MAX_PANEL_FILES = 2 * MAX_DWM_HOOK_MONITORS;   // one SDR + one HDR per monitor
+static FaldPanelFile g_panelFiles[FALD_MAX_PANEL_FILES];
+static int g_numPanelFiles = 0;
+
+static const FaldPanelFile* FindPanelFile(int left, int top, bool isHdr) {
+    for (int i = 0; i < g_numPanelFiles; i++)
+        if (g_panelFiles[i].left == left && g_panelFiles[i].top == top && g_panelFiles[i].isHdr == isHdr)
+            return &g_panelFiles[i];
+    return nullptr;
+}
+
+bool FaldHasPanelFile(int left, int top, bool isHdr) { return FindPanelFile(left, top, isHdr) != nullptr; }
+
+int FaldLoadPanelFiles(const char* lutFolder) {
+    g_numPanelFiles = 0;
+    if (!lutFolder) return 0;
+
+    char dirA[MAX_PATH];
+    snprintf(dirA, sizeof(dirA), "%s\\%s", lutFolder, DWM_HOOK_FALD_SUBDIR_A);
+    char patternA[MAX_PATH];
+    snprintf(patternA, sizeof(patternA), "%s\\*.bin", dirA);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(patternA, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (g_numPanelFiles >= FALD_MAX_PANEL_FILES) { log_to_file("FALD: too many panel files staged — ignoring the rest"); break; }
+        FaldPanelFile pf;
+        if (sscanf(fd.cFileName, "%d_%d", &pf.left, &pf.top) != 2) continue;
+        pf.isHdr = strstr(fd.cFileName, "_hdr") != nullptr;
+
+        char fullA[MAX_PATH];
+        snprintf(fullA, sizeof(fullA), "%s\\%s", dirA, fd.cFileName);
+        wchar_t fullW[MAX_PATH] = {};
+        if (MultiByteToWideChar(CP_ACP, 0, fullA, -1, fullW, MAX_PATH) == 0) continue;
+
+        std::string err;
+        if (!LoadFaldPanelParams(fullW, pf.params, err)) {
+            LogF("FALD: skipping unparseable panel file %s: %s", fd.cFileName, err.c_str());
+            continue;
+        }
+        // The fit's code domain is the panel's: a PQ (HDR) file cannot serve an ACM SDR desktop and
+        // vice versa. Caught here so a mismatched file costs one log line at attach, not a wrong
+        // correction on screen.
+        if (!FaldTransferMatchesMode(pf.params.transfer, pf.isHdr)) {
+            LogF("FALD: panel file %s is a %s fit but is staged for %s — ignored", fd.cFileName,
+                 pf.params.transfer == FALD_TRANSFER_GAMMA ? "gamma (SDR)" : "PQ (HDR)",
+                 pf.isHdr ? "HDR" : "SDR (ACM)");
+            continue;
+        }
+        LogF("FALD: panel file %s loaded: pos(%d,%d) %s, %ux%u cells of %ux%u px, sub %u, white %.1f nits, boost %s",
+             fd.cFileName, pf.left, pf.top, pf.isHdr ? "HDR" : "SDR(ACM)",
+             pf.params.cols, pf.params.rows, pf.params.cellW, pf.params.cellH, pf.params.sub,
+             pf.params.white, pf.params.hasBoost ? "yes" : "none");
+        g_panelFiles[g_numPanelFiles++] = std::move(pf);
+    } while (FindNextFileA(h, &fd) != 0);
+    FindClose(h);
+
+    LogF("FALD: %d panel file(s) loaded", g_numPanelFiles);
+    return g_numPanelFiles;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-monitor resources
+// ---------------------------------------------------------------------------------------------
+struct FaldMonitor {
+    int left = 0, top = 0;
+    bool isHdr = false;
+    unsigned int width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    FaldPanelParams params;
+    bool valid = false;
+    bool failed = false;          // latched: logged once, never retried for this (pos, mode, size)
+
+    uint32_t debugMode = 0;
+    uint32_t pedMode = 0;
+    unsigned long long framesRun = 0;
+    double lastRunUs = 0.0;
+
+    // Full-size intermediate: the hook's LUT/tonemap pass renders the whole frame here, the pixel
+    // pass below reads it and writes the back buffer. Same role as FaldResources::inter in the
+    // overlay path, and the reason the layer costs one extra full-size FP16 target per monitor.
+    ID3D11Texture2D* interTex = nullptr;
+    ID3D11RenderTargetView* interRTV = nullptr;
+    ID3D11ShaderResourceView* interSRV = nullptr;
+
+    // panel tables
+    ID3D11Texture2D* curveTex = nullptr;  ID3D11ShaderResourceView* curveSRV = nullptr;
+    ID3D11Buffer* kTrueBuf = nullptr;     ID3D11ShaderResourceView* kTrueSRV = nullptr;
+    ID3D11Buffer* kEstBuf = nullptr;      ID3D11ShaderResourceView* kEstSRV = nullptr;
+    // per-frame fields
+    ID3D11Texture2D* driveTex = nullptr;  ID3D11UnorderedAccessView* driveUAV = nullptr; ID3D11ShaderResourceView* driveSRV = nullptr;
+    ID3D11Texture2D* bTrueTex = nullptr;  ID3D11UnorderedAccessView* bTrueUAV = nullptr; ID3D11ShaderResourceView* bTrueSRV = nullptr;
+    ID3D11Texture2D* bEstTex = nullptr;   ID3D11UnorderedAccessView* bEstUAV = nullptr;  ID3D11ShaderResourceView* bEstSRV = nullptr;
+    ID3D11Texture2D* gainATex = nullptr;  ID3D11UnorderedAccessView* gainAUAV = nullptr; ID3D11ShaderResourceView* gainASRV = nullptr;
+    ID3D11Texture2D* gainBTex = nullptr;  ID3D11UnorderedAccessView* gainBUAV = nullptr; ID3D11ShaderResourceView* gainBSRV = nullptr;
+    // flat-lattice response of both kernels (computed once at build): a flat field must give gain 1
+    ID3D11Texture2D* flatTrueTex = nullptr; ID3D11UnorderedAccessView* flatTrueUAV = nullptr; ID3D11ShaderResourceView* flatTrueSRV = nullptr;
+    ID3D11Texture2D* flatEstTex = nullptr;  ID3D11UnorderedAccessView* flatEstUAV = nullptr;  ID3D11ShaderResourceView* flatEstSRV = nullptr;
+    // black-frame LED boost, one set per statistic round
+    ID3D11Texture2D* activeTex[2] = {}; ID3D11UnorderedAccessView* activeUAV[2] = {}; ID3D11ShaderResourceView* activeSRV[2] = {};
+    ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
+    ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
+
+    ID3D11Buffer* cb = nullptr;
+};
+
+// One entry per (position, mode) actually seen presenting; fixed-size for the same reason as above.
+static FaldMonitor* g_monitors[FALD_MAX_PANEL_FILES] = {};
+static int g_numMonitors = 0;
+
+static void ReleaseMonitor(FaldMonitor* m) {
+    SafeRelease(m->cb);
+    SafeRelease(m->boostLutSRV); SafeRelease(m->boostLutBuf);
+    for (int i = 0; i < 2; i++) {
+        SafeRelease(m->boostSRV[i]); SafeRelease(m->boostUAV[i]); SafeRelease(m->boostTex[i]);
+        SafeRelease(m->activeSRV[i]); SafeRelease(m->activeUAV[i]); SafeRelease(m->activeTex[i]);
+    }
+    SafeRelease(m->flatEstSRV); SafeRelease(m->flatEstUAV); SafeRelease(m->flatEstTex);
+    SafeRelease(m->flatTrueSRV); SafeRelease(m->flatTrueUAV); SafeRelease(m->flatTrueTex);
+    SafeRelease(m->gainBSRV); SafeRelease(m->gainBUAV); SafeRelease(m->gainBTex);
+    SafeRelease(m->gainASRV); SafeRelease(m->gainAUAV); SafeRelease(m->gainATex);
+    SafeRelease(m->bEstSRV); SafeRelease(m->bEstUAV); SafeRelease(m->bEstTex);
+    SafeRelease(m->bTrueSRV); SafeRelease(m->bTrueUAV); SafeRelease(m->bTrueTex);
+    SafeRelease(m->driveSRV); SafeRelease(m->driveUAV); SafeRelease(m->driveTex);
+    SafeRelease(m->kEstSRV); SafeRelease(m->kEstBuf);
+    SafeRelease(m->kTrueSRV); SafeRelease(m->kTrueBuf);
+    SafeRelease(m->curveSRV); SafeRelease(m->curveTex);
+    SafeRelease(m->interSRV); SafeRelease(m->interRTV); SafeRelease(m->interTex);
+    m->valid = false;
+}
+
+void FaldReleaseAll() {
+    for (int i = 0; i < g_numMonitors; i++) {
+        if (!g_monitors[i]) continue;
+        ReleaseMonitor(g_monitors[i]);
+        delete g_monitors[i];
+        g_monitors[i] = nullptr;
+    }
+    g_numMonitors = 0;
+    g_numPanelFiles = 0;
+}
+
+static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11UnorderedAccessView** uav,
+                          ID3D11ShaderResourceView** srv, DXGI_FORMAT format = DXGI_FORMAT_R32_FLOAT) {
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = format;
+    d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, tex))) return false;
+    if (FAILED(g_dev->CreateUnorderedAccessView(*tex, nullptr, uav))) return false;
+    if (FAILED(g_dev->CreateShaderResourceView(*tex, nullptr, srv))) return false;
+    return true;
+}
+
+static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = (UINT)(data.size() * sizeof(float));
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem = data.data();
+    if (FAILED(g_dev->CreateBuffer(&bd, &init, buf))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32_FLOAT;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    sd.Buffer.FirstElement = 0;
+    sd.Buffer.NumElements = (UINT)data.size();
+    return SUCCEEDED(g_dev->CreateShaderResourceView(*buf, &sd, srv));
+}
+
+static void ComputeFlatResponse(FaldMonitor* m);
+
+static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
+    ReleaseMonitor(m);
+    m->params = params;
+    const FaldPanelParams& p = m->params;
+
+    if (!FaldLatticeFits(p, (int)m->width, (int)m->height)) {
+        LogF("FALD: panel lattice (%ux%u) does not fit monitor %ux%u at pos(%d,%d) — layer off",
+             p.cols * p.cellW, p.rows * p.cellH, m->width, m->height, m->left, m->top);
+        return false;
+    }
+    // intermediate (back-buffer format, so the LUT/tonemap pass writes it unchanged)
+    {
+        D3D11_TEXTURE2D_DESC d = {};
+        d.Width = m->width; d.Height = m->height; d.MipLevels = 1; d.ArraySize = 1;
+        d.Format = m->format; d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &m->interTex)) ||
+            FAILED(g_dev->CreateRenderTargetView(m->interTex, nullptr, &m->interRTV)) ||
+            FAILED(g_dev->CreateShaderResourceView(m->interTex, nullptr, &m->interSRV))) {
+            log_to_file("FALD: intermediate render target creation failed"); return false;
+        }
+    }
+    // curve LUT (curveN x 1, R32F)
+    {
+        D3D11_TEXTURE2D_DESC c = {};
+        c.Width = p.curveN; c.Height = 1; c.MipLevels = 1; c.ArraySize = 1; c.Format = DXGI_FORMAT_R32_FLOAT;
+        c.SampleDesc.Count = 1; c.Usage = D3D11_USAGE_IMMUTABLE; c.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = p.curve.data(); init.SysMemPitch = p.curveN * sizeof(float);
+        if (FAILED(g_dev->CreateTexture2D(&c, &init, &m->curveTex)) ||
+            FAILED(g_dev->CreateShaderResourceView(m->curveTex, nullptr, &m->curveSRV))) {
+            log_to_file("FALD: curve texture creation failed"); return false;
+        }
+    }
+    if (!MakeFloatBuffer(p.kTrue, &m->kTrueBuf, &m->kTrueSRV)) { log_to_file("FALD: kTrue buffer failed"); return false; }
+    if (!MakeFloatBuffer(p.kEst, &m->kEstBuf, &m->kEstSRV)) { log_to_file("FALD: kEst buffer failed"); return false; }
+    if (!MakeRWTexture(p.cols, p.rows, &m->driveTex, &m->driveUAV, &m->driveSRV)) { log_to_file("FALD: drive texture failed"); return false; }
+    const UINT fw = p.cols * p.sub, fh = p.rows * p.sub;
+    if (!MakeRWTexture(fw, fh, &m->bTrueTex, &m->bTrueUAV, &m->bTrueSRV)) { log_to_file("FALD: B_true texture failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->bEstTex, &m->bEstUAV, &m->bEstSRV)) { log_to_file("FALD: B_est texture failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->gainATex, &m->gainAUAV, &m->gainASRV)) { log_to_file("FALD: gain texture A failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->gainBTex, &m->gainBUAV, &m->gainBSRV)) { log_to_file("FALD: gain texture B failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->flatTrueTex, &m->flatTrueUAV, &m->flatTrueSRV)) { log_to_file("FALD: flat B_true texture failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->flatEstTex, &m->flatEstUAV, &m->flatEstSRV)) { log_to_file("FALD: flat B_est texture failed"); return false; }
+    if (p.hasBoost) {
+        for (unsigned int i = 0; i < 2; i++) {
+            if (!MakeRWTexture(p.cols, p.rows, &m->activeTex[i], &m->activeUAV[i], &m->activeSRV[i])) { log_to_file("FALD: active-zone texture failed"); return false; }
+            if (!MakeRWTexture(2, 1, &m->boostTex[i], &m->boostUAV[i], &m->boostSRV[i])) { log_to_file("FALD: boost texture failed"); return false; }
+        }
+        std::vector<float> lut;
+        for (uint32_t i = 0; i < p.boostN; i++) {
+            lut.push_back((float)FaldBoostZoneThreshold(p.boostLo[i], p.cols * p.rows));
+            lut.push_back(p.boostVal[i]);
+        }
+        if (!MakeFloatBuffer(lut, &m->boostLutBuf, &m->boostLutSRV)) { log_to_file("FALD: boost LUT buffer failed"); return false; }
+    }
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = FALD_CB_BYTES;
+    cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_dev->CreateBuffer(&cbd, nullptr, &m->cb))) { log_to_file("FALD: constant buffer failed"); return false; }
+
+    m->valid = true;
+    ComputeFlatResponse(m);
+    LogF("FALD: monitor pos(%d,%d) %s ready: %ux%u cells of %ux%u px, sub %u, white %.1f nits, transfer %s, boost %s",
+         m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", p.cols, p.rows, p.cellW, p.cellH, p.sub, p.white,
+         p.transfer == FALD_TRANSFER_GAMMA ? "gamma" : "PQ", p.hasBoost ? "yes" : "none");
+    return true;
+}
+
+FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsigned int height,
+                         DXGI_FORMAT format) {
+    if (!FaldShadersReady() || width == 0 || height == 0) return nullptr;
+
+    FaldMonitor* m = nullptr;
+    for (int i = 0; i < g_numMonitors; i++) {
+        FaldMonitor* e = g_monitors[i];
+        if (e && e->left == left && e->top == top && e->isHdr == isHdr) { m = e; break; }
+    }
+    if (m && m->width == width && m->height == height && m->format == format) {
+        if (m->failed) return nullptr;
+        return m->valid ? m : nullptr;
+    }
+
+    const FaldPanelFile* pf = FindPanelFile(left, top, isHdr);
+    if (!pf) return nullptr;
+
+    if (!m) {
+        if (g_numMonitors >= FALD_MAX_PANEL_FILES) return nullptr;
+        m = new FaldMonitor();
+        m->left = left; m->top = top; m->isHdr = isHdr;
+        // Published last: a concurrent reader either does not see the slot or sees a complete entry.
+        g_monitors[g_numMonitors] = m;
+        g_numMonitors++;
+    }
+    // A resize (or the first sight of this monitor) rebuilds and clears the latch: the lattice may
+    // fit the new frame even though it did not fit the old one.
+    m->width = width; m->height = height; m->format = format;
+    m->failed = false;
+    if (!BuildMonitor(m, pf->params)) {
+        ReleaseMonitor(m);
+        m->failed = true;     // logged once inside BuildMonitor; no per-frame retry inside DWM
+        return nullptr;
+    }
+    return m;
+}
+
+ID3D11RenderTargetView* FaldIntermediateRTV(FaldMonitor* m) { return m ? m->interRTV : nullptr; }
+ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m) { return m ? m->interTex : nullptr; }
+
+void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode) {
+    if (!m) return;
+    m->debugMode = debugMode;
+    m->pedMode = pedMode ? 1u : 0u;
+}
+
+double FaldLastRunMicros(const FaldMonitor* m) { return m ? m->lastRunUs : 0.0; }
+
+// ---------------------------------------------------------------------------------------------
+// Passes — mirror of src/fald.cpp with the stateless core only
+// ---------------------------------------------------------------------------------------------
+// boostOn = false: the flat-lattice normalisation pass (a boost-free conv whatever the file says).
+static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool boostOn = true) {
+    const FaldPanelParams& p = m->params;
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (FAILED(g_ctx->Map(m->cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return;
+    uint32_t* u = (uint32_t*)map.pData; float* f = (float*)map.pData;
+    memset(map.pData, 0, FALD_CB_BYTES);
+    u[0] = m->width; u[1] = m->height; u[2] = p.cols; u[3] = p.rows;
+    u[4] = p.sub; u[5] = p.cellW; u[6] = p.cellH; u[7] = roundIdx;
+    u[8] = p.reachTrueC; u[9] = p.reachTrueR; u[10] = p.reachEstC; u[11] = p.reachEstR;
+    u[12] = p.curveN; f[13] = p.white; f[14] = p.tmin; f[15] = p.area0;
+    f[16] = p.w[0]; f[17] = p.w[1]; f[18] = p.w[2]; f[19] = p.gainMin;
+    f[20] = p.gainMax; f[21] = p.driveFloor; f[22] = p.curveLogMin; f[23] = p.curveLogMax;
+    u[24] = m->debugMode; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
+    f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
+    u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
+    f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
+    u[34] = (boostOn && p.hasBoost) ? p.boostN : 0u;                                // black-frame LED boost steps (0 = no term)
+    u[35] = 0u;                                                                     // starfield balancing: not in the hook's core
+    const bool perChannel = (m->pedMode == 1) && p.hasPedColour;
+    f[36] = p.tmin * p.pedRGB[0]; f[37] = p.tmin * p.pedRGB[1]; f[38] = p.tmin * p.pedRGB[2];
+    u[39] = perChannel ? 1u : 0u;
+    f[40] = p.chromaGain;
+    f[41] = (p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo;
+    f[42] = (p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi;
+    f[43] = p.sdrGamma;                                                             // panel EOTF exponent (transfer 1)
+    // Temporal drive state (words 44-47). The core is stateless, so these carry what src/fald.cpp
+    // writes with the filter off and no committed state: alpha 1 (instant), mode 0, "no state yet".
+    // Word 46 = 0 is what makes the shader ignore 44/45 and 47 entirely.
+    f[44] = 1.0f; f[45] = 1.0f;
+    u[46] = 0u; u[47] = 1u;
+    // black-frame LED boost: the zone activation rule (words 48-51; read only when word 34 != 0)
+    f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
+    // Starfield words 52-65: the overlay writes the user's clamped settings here even when the
+    // option is off, and the shader reads them only when word 35 is set. The hook has no such
+    // settings, so it writes the same defaults src/fald.h gives FaldResources::StarCB — the words
+    // are inert either way, and a CB captured from the two paths then matches on a default profile.
+    f[52] = 0.8f; f[53] = 0.0f; f[54] = 1.0f; f[55] = 0.0f;
+    f[56] = 1.0f; f[57] = 40.0f; f[58] = 160.0f; f[59] = 0.0f;
+    f[60] = 0.15f; f[61] = 0.30f; u[62] = 2u; u[63] = 8u;
+    f[64] = 0.0f; f[65] = 100.0f;
+    // panel clock (temporal mode 3): unused here; the overlay's idle values are weights 1/2 and zero blends
+    f[66] = 0.5f; f[67] = 0.5f;
+    f[68] = 0.0f; f[69] = 0.0f; f[70] = 0.0f; f[71] = 0.0f;
+    // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
+    u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
+    // glow fill (word 75 = on; 76-79 inert while it is 0, written as the overlay's defaults)
+    u[75] = 0u;
+    f[76] = 1.0f; f[77] = 0.05f; u[78] = 2u; f[79] = FaldGlowReqCeil(p);
+    u[80] = 0u;
+    u[81] = 0u; u[82] = 0u; u[83] = 0u;
+    g_ctx->Unmap(m->cb, 0);
+}
+
+// t0 is the monitor's intermediate: the composed, LUT/tonemapped frame the caller left there.
+// Slots belonging to passes this path does not run stay null — binding the full range every time is
+// what keeps a previous pass's view out.
+static void BindCommon(FaldMonitor* m, bool compute) {
+    ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = {
+        m->interSRV, m->curveSRV, m->kTrueSRV, m->kEstSRV, nullptr, nullptr, nullptr,
+        m->flatTrueSRV, m->flatEstSRV, nullptr, nullptr, nullptr,
+        m->boostLutSRV, nullptr, nullptr,   // t12: null without a boost LUT
+        nullptr, nullptr, nullptr, nullptr, nullptr,   // t15-t19: starfield only
+        nullptr, nullptr, nullptr, nullptr, nullptr    // t20-t24: glow fill only
+    };
+    if (compute) {
+        g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+        g_ctx->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
+        g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
+    } else {
+        g_ctx->PSSetConstantBuffers(0, 1, &m->cb);
+        g_ctx->PSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
+        g_ctx->PSSetSamplers(0, 1, &g_faldSampler);
+    }
+}
+
+static void UnbindCompute() {
+    ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
+    ID3D11UnorderedAccessView* nullUav[FALD_UAV_SLOTS] = {};
+    g_ctx->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
+    g_ctx->CSSetUnorderedAccessViews(0, FALD_UAV_SLOTS, nullUav, nullptr);
+    g_ctx->CSSetShader(nullptr, nullptr, 0);
+}
+
+static void RunStat(FaldMonitor* m, uint32_t roundIdx) {
+    const FaldPanelParams& p = m->params;
+    FillCB(m, roundIdx);
+    g_ctx->CSSetShader(g_statCS, nullptr, 0);
+    BindCommon(m, true);
+    if (roundIdx == 1) {
+        ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
+        g_ctx->CSSetShaderResources(5, 2, fields);
+        g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);      // smoothed gain of the previous round
+    }
+    ID3D11UnorderedAccessView* uavs[2] = { m->driveUAV, m->activeUAV[roundIdx & 1u] };   // u1: null without a boost LUT
+    g_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);                               // (the shader then never writes it)
+    g_ctx->Dispatch(p.cols, p.rows, 1);
+    UnbindCompute();
+}
+
+static void RunBoost(FaldMonitor* m, uint32_t roundIdx) {
+    if (!m->params.hasBoost) return;
+    const unsigned int k = roundIdx & 1u;
+    g_ctx->CSSetShader(g_boostCS, nullptr, 0);
+    BindCommon(m, true);
+    g_ctx->CSSetShaderResources(13, 1, &m->activeSRV[k]);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->boostUAV[k], nullptr);
+    g_ctx->Dispatch(1, 1, 1);
+    UnbindCompute();
+}
+
+// boost: this round's 2x1 boost texture (B_true only; null = none — no LUT in the file, or the
+// flat-lattice pass, where the CB's boostN is 0 and the shader never reads t14).
+static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* boost) {
+    const FaldPanelParams& p = m->params;
+    g_ctx->CSSetShader(g_convCS, nullptr, 0);
+    BindCommon(m, true);
+    // Stateless: both kernels see the instantaneous drive map (the temporal modes are what would
+    // route a filtered one into t4 / t10).
+    g_ctx->CSSetShaderResources(4, 1, &m->driveSRV);
+    g_ctx->CSSetShaderResources(10, 1, &m->driveSRV);
+    g_ctx->CSSetShaderResources(14, 1, &boost);
+    ID3D11UnorderedAccessView* uavs[2] = { m->bTrueUAV, m->bEstUAV };
+    g_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    g_ctx->Dispatch((p.cols * p.sub + 15) / 16, (p.rows * p.sub + 15) / 16, 1);
+    UnbindCompute();
+}
+
+// Pass 2b/2c: gain on the fine grid, then a separable Gaussian low-pass (A -> B -> A; final in gainB).
+static void RunGain(FaldMonitor* m) {
+    const FaldPanelParams& p = m->params;
+    const UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
+    g_ctx->CSSetShader(g_gainCS, nullptr, 0);
+    BindCommon(m, true);
+    ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
+    g_ctx->CSSetShaderResources(5, 2, fields);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->gainAUAV, nullptr);
+    g_ctx->Dispatch(gx, gy, 1);
+    UnbindCompute();
+    // horizontal: A -> B
+    FillCB(m, 1, 0);
+    g_ctx->CSSetShader(g_blurCS, nullptr, 0);
+    BindCommon(m, true);
+    g_ctx->CSSetShaderResources(9, 1, &m->gainASRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->gainBUAV, nullptr);
+    g_ctx->Dispatch(gx, gy, 1);
+    UnbindCompute();
+    // vertical: B -> A
+    FillCB(m, 1, 1);
+    g_ctx->CSSetShader(g_blurCS, nullptr, 0);
+    BindCommon(m, true);
+    g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->gainAUAV, nullptr);
+    g_ctx->Dispatch(gx, gy, 1);
+    UnbindCompute();
+    // final smoothed gain lives in A; copy to B so consumers always read gainB
+    g_ctx->CopyResource(m->gainBTex, m->gainATex);
+}
+
+// Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
+// Must run after the fine textures exist; the flat textures are bound as SRVs t7/t8 from then on
+// (they are null during this call, which the conv pass does not read).
+static void ComputeFlatResponse(FaldMonitor* m) {
+    const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    g_ctx->ClearUnorderedAccessViewFloat(m->driveUAV, one);
+    ID3D11ShaderResourceView* saveT = m->flatTrueSRV; ID3D11ShaderResourceView* saveE = m->flatEstSRV;
+    m->flatTrueSRV = nullptr; m->flatEstSRV = nullptr;          // not inputs of this pass
+    FillCB(m, 0, 0, false);                                     // boost 1: the normalisation is the un-boosted lattice
+    RunConv(m, nullptr);
+    m->flatTrueSRV = saveT; m->flatEstSRV = saveE;
+    g_ctx->CopyResource(m->flatTrueTex, m->bTrueTex);
+    g_ctx->CopyResource(m->flatEstTex, m->bEstTex);
+}
+
+// ---------------------------------------------------------------------------------------------
+// One-shot dump (development instrument for the acceptance gate)
+// ---------------------------------------------------------------------------------------------
+// A dump costs a staging copy, a Map (which stalls the GPU) and a file write. Per frame in DWM's
+// present path that is the stall recorded in HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md, so it is armed
+// once by a trigger file, consumed by the next run, and disarmed immediately.
+static std::wstring g_dumpDir;        // non-empty = the next run dumps, then clears it
+
+static const char* FaldDumpTriggerPath() {
+    static char path[MAX_PATH] = {};
+    if (path[0] == '\0')
+        ExpandEnvironmentStringsA("%SYSTEMROOT%\\Temp\\DesktopLUT_hook_fald_dump.txt", path, sizeof(path));
+    return path;
+}
+
+void FaldPollDumpRequest() {
+    if (!g_dumpDir.empty()) return;                 // one already armed
+    // Throttled hard: this is a file-system probe, and doing one per Present is precisely the
+    // synchronous-IO-in-the-present-path mistake recorded in HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md.
+    // ~5 s between probes at 60 Hz, which is fast enough for a human arming a dump by hand.
+    static unsigned int tick = 0;
+    if ((tick++ % 300u) != 0u) return;
+    const char* trigger = FaldDumpTriggerPath();
+    if (GetFileAttributesA(trigger) == INVALID_FILE_ATTRIBUTES) return;
+    char line[MAX_PATH] = {};
+    FILE* f = fopen(trigger, "r");
+    if (f) {
+        if (!fgets(line, sizeof(line), f)) line[0] = '\0';
+        fclose(f);
+    }
+    DeleteFileA(trigger);                           // consume it whatever happens next
+    for (char* q = line; *q; q++) if (*q == '\r' || *q == '\n') { *q = '\0'; break; }
+    if (line[0] == '\0') return;
+    wchar_t dirW[MAX_PATH] = {};
+    if (MultiByteToWideChar(CP_ACP, 0, line, -1, dirW, MAX_PATH) == 0) return;
+    g_dumpDir = dirW;
+    if (!g_dumpDir.empty() && g_dumpDir.back() != L'\\' && g_dumpDir.back() != L'/') g_dumpDir += L'\\';
+    LogF("FALD: field dump armed for the next frame -> %s", line);
+}
+
+static void DumpTexture(ID3D11Texture2D* tex, const std::wstring& file, UINT w, UINT h, UINT bytesPerPx) {
+    if (!tex) return;
+    D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
+    g_ctx->CopyResource(st, tex);
+    D3D11_MAPPED_SUBRESOURCE map;
+    if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &map))) {
+        FILE* f = _wfopen(file.c_str(), L"wb");
+        if (f) {
+            for (UINT y = 0; y < h; y++)
+                fwrite((const char*)map.pData + (size_t)y * map.RowPitch, 1, (size_t)w * bytesPerPx, f);
+            fclose(f);
+        }
+        g_ctx->Unmap(st, 0);
+    }
+    st->Release();
+}
+
+// The stateless subset of the overlay's runtime.fald_dump, same file names and layouts so the two
+// are diffed directly (and both against dlc/fald/gpuemu.py). The temporal, starfield and glow files
+// the overlay can also write have no counterpart here — this path does not run those passes.
+static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
+    const FaldPanelParams& p = m->params;
+    DumpTexture(m->driveTex, dir + L"fald_drive.f32", p.cols, p.rows, 4);
+    DumpTexture(m->bTrueTex, dir + L"fald_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    DumpTexture(m->bEstTex, dir + L"fald_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    DumpTexture(m->flatTrueTex, dir + L"fald_flat_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    DumpTexture(m->flatEstTex, dir + L"fald_flat_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    DumpTexture(m->gainBTex, dir + L"fald_gain_fine.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    if (p.hasBoost) {
+        DumpTexture(m->activeTex[0], dir + L"fald_active_r0.f32", p.cols, p.rows, 4);
+        DumpTexture(m->activeTex[1], dir + L"fald_active_r1.f32", p.cols, p.rows, 4);
+        DumpTexture(m->boostTex[0], dir + L"fald_boost_r0.f32", 2, 1, 4);
+        DumpTexture(m->boostTex[1], dir + L"fald_boost_r1.f32", 2, 1, 4);
+    }
+}
+
+static void DumpFrame(ID3D11ShaderResourceView* srv, const std::wstring& file, UINT w, UINT h) {
+    if (!srv) return;
+    ID3D11Resource* res = nullptr;
+    srv->GetResource(&res);
+    if (!res) return;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&tex))) && tex) {
+        DumpTexture(tex, file, w, h, 8);   // FP16 scRGB only: the layer never runs on another format
+        tex->Release();
+    }
+    res->Release();
+}
+
+static void DumpOutput(ID3D11RenderTargetView* rtv, const std::wstring& file, UINT w, UINT h) {
+    if (!rtv) return;
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    if (!res) return;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&tex))) && tex) {
+        DumpTexture(tex, file, w, h, 8);
+        tex->Release();
+    }
+    res->Release();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------------------------
+// Everything this binds is cleared before returning: a stale SRV hands DWM's own shaders a wrong
+// texture and a stale UAV hands them a GPU fault, and DWM reuses this immediate context for its
+// own rendering the moment we return.
+static void FaldUnbindAll() {
+    ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
+    ID3D11UnorderedAccessView* nullUav[FALD_UAV_SLOTS] = {};
+    ID3D11SamplerState* nullSamp[1] = {};
+    ID3D11Buffer* nullCB = nullptr;
+    g_ctx->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
+    g_ctx->CSSetUnorderedAccessViews(0, FALD_UAV_SLOTS, nullUav, nullptr);
+    g_ctx->CSSetSamplers(0, 1, nullSamp);
+    g_ctx->CSSetConstantBuffers(0, 1, &nullCB);
+    g_ctx->CSSetShader(nullptr, nullptr, 0);
+    g_ctx->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
+    g_ctx->PSSetSamplers(0, 1, nullSamp);
+    g_ctx->PSSetConstantBuffers(0, 1, &nullCB);
+    g_ctx->PSSetShader(nullptr, nullptr, 0);
+    g_ctx->VSSetShader(nullptr, nullptr, 0);
+    g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+}
+
+bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
+    if (!m || !m->valid || !m->interSRV || !dstRTV) return false;
+
+    LARGE_INTEGER t0, t1, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+
+    const std::wstring dumpDir = g_dumpDir;
+    g_dumpDir.clear();                       // one frame only, whatever happens below
+
+    // No render target may be bound while the passes write their UAVs.
+    g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+
+    // Two inverse rounds. Round 0's output is what round 1's statistic and boost count see, so the
+    // panel's own response is accounted for in the frame it actually receives.
+    RunStat(m, 0);
+    RunBoost(m, 0);
+    RunConv(m, m->boostSRV[0]);
+    RunGain(m);
+    RunStat(m, 1);
+    RunBoost(m, 1);
+    RunConv(m, m->boostSRV[1]);
+    RunGain(m);
+    m->framesRun++;
+
+    if (!dumpDir.empty()) {
+        DumpFields(m, dumpDir);
+        DumpFrame(m->interSRV, dumpDir + L"fald_frame.rgba16f", m->width, m->height);
+    }
+
+    // pixel pass: source + fields -> the back buffer (fullscreen triangle, no vertex buffer)
+    FillCB(m, 1);
+    const D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)m->width, (float)m->height, 0.0f, 1.0f };
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->OMSetRenderTargets(1, &dstRTV, nullptr);
+    g_ctx->IASetInputLayout(nullptr);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(g_faldVS, nullptr, 0);
+    g_ctx->PSSetShader(g_faldPS, nullptr, 0);
+    BindCommon(m, false);
+    ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
+    g_ctx->PSSetShaderResources(5, 2, fields);
+    g_ctx->PSSetShaderResources(9, 1, &m->gainBSRV);
+    // t4 / t10 are the instantaneous and "filtered" drive maps of debug view 7; with no temporal
+    // state they are the same map, which is exactly what the overlay binds with the filter off.
+    g_ctx->PSSetShaderResources(4, 1, &m->driveSRV);
+    g_ctx->PSSetShaderResources(10, 1, &m->driveSRV);
+    g_ctx->PSSetShaderResources(13, 1, &m->activeSRV[1]);   // debug view 8 (null without a boost LUT)
+    g_ctx->Draw(3, 0);
+
+    if (!dumpDir.empty()) {
+        DumpOutput(dstRTV, dumpDir + L"fald_out.rgba16f", m->width, m->height);
+        LogF("FALD: field dump written (pos %d,%d, %s)", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)");
+    }
+
+    FaldUnbindAll();
+
+    QueryPerformanceCounter(&t1);
+    if (freq.QuadPart > 0)
+        m->lastRunUs = (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)freq.QuadPart;
+    // The CPU-side cost of the whole layer, logged rarely: the first risk on the phase-one list is
+    // that this overruns DWM's present budget, and a number beats a guess. ~every 10 s at 60 Hz.
+    if ((m->framesRun % 600ull) == 1ull)
+        LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us/frame in the present path",
+             m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs);
+    return true;
+}

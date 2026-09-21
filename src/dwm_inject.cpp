@@ -471,6 +471,17 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     ClearDACL(lutsDir);
     std::wcout << L"[DWM Hook] LUT staging dir: " << lutsDir << std::endl;
 
+    // FALD panel files live in a subdirectory of it (see the staging loop below). Wiped with the
+    // parent after injection; a failure here is not fatal — the FALD layer simply stays off.
+    std::wstring faldDir = lutsDir + DWM_HOOK_FALD_SUBDIR_W + L"\\";
+    if (!CreateDirectoryW(faldDir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        std::wcerr << L"[DWM Hook] WARNING: Failed to create FALD staging dir: " << GetLastErrorString()
+                   << L" (the FALD layer stays off)" << std::endl;
+        faldDir.clear();
+    } else if (!faldDir.empty()) {
+        ClearDACL(faldDir);
+    }
+
     // --- Copy LUT files with position-based names ---
     for (const auto& mon : monitors) {
         std::wstring posPrefix = std::to_wstring(mon.left) + L"_" + std::to_wstring(mon.top);
@@ -490,6 +501,22 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             std::wcout << L"[DWM Hook] Staging HDR LUT: pos(" << mon.left << L"," << mon.top << L") " << mon.hdrLutPath << std::endl;
             if (!CopyFileW(mon.hdrLutPath.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy HDR LUT: " << GetLastErrorString() << std::endl;
+            } else {
+                ClearDACL(dest);
+            }
+        }
+
+        // FALD panel parameter files go in their OWN subdirectory: AddLUTs hands every
+        // non-directory file named "<int>_<int>..." to the .cube parser, and these are named the
+        // same way. The DLL reads them at attach (LoadFaldPanelFiles).
+        for (int hdr = 0; hdr < 2 && !faldDir.empty(); hdr++) {
+            const std::wstring& src = hdr ? mon.hdrFaldPath : mon.sdrFaldPath;
+            if (src.empty()) continue;
+            std::wstring dest = faldDir + posPrefix + (hdr ? L"_hdr.bin" : L".bin");
+            std::wcout << L"[DWM Hook] Staging " << (hdr ? L"HDR" : L"SDR") << L" FALD panel file: pos("
+                       << mon.left << L"," << mon.top << L") " << src << std::endl;
+            if (!CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
+                std::wcerr << L"[DWM Hook] WARNING: Failed to copy FALD panel file: " << GetLastErrorString() << std::endl;
             } else {
                 ClearDACL(dest);
             }
@@ -902,6 +929,14 @@ void UpdateDwmHookSharedConfig()
                         mc.targetPeakNits = tm.targetPeakNits;
                         mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
                         mc.beaconColorId = beacon ? DwmHookBeaconColorIdForMonitor(static_cast<uint32_t>(mi)) : 0;
+                        // FALD: the settings of the mode the monitor is in RIGHT NOW — the hook holds
+                        // one correction per monitor and picked its panel file by that mode at attach.
+                        // A configured-but-pathless layer is off (the DLL has no file to read either).
+                        const auto& fs = mc.isHdr ? g_gui.monitorSettings[mi].hdrColorCorrection.fald
+                                                  : g_gui.monitorSettings[mi].sdrColorCorrection.fald;
+                        cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty(),
+                                                           static_cast<uint32_t>(fs.debugMode),
+                                                           static_cast<int>(fs.pedMode));
                         break;
                     }
                 }

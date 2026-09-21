@@ -107,6 +107,7 @@
     <ClCompile Include="src\whitelist.cpp" />
     <ClCompile Include="src\framepacer.cpp" />
     <ClCompile Include="src\dwm_inject.cpp" />
+    <ClCompile Include="shared\fald_panel.cpp" />
     <ClCompile Include="src\fald.cpp" />
   </ItemGroup>
   <!-- Test files -->

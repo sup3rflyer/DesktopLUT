@@ -1122,6 +1122,25 @@ void main(uint3 id : SV_DispatchThreadID) {
 //     passthrough of the SOURCE frame.
 //     10 = glow fill: the request the fill ADDS at each pixel (as-if-white nits per channel, in the pedestal's colour),
 //     x FALD_GLOW_VIEW_SCALE (0.1 nit shows as 100 nits); black = nothing added; passthrough when the option is off.
+// The vertex shader of the pixel pass: a fullscreen triangle with no vertex buffer and no input
+// layout (Draw(3, 0) on a triangle list). The overlay path binds its own identical g_vsSource
+// (src/shader.h) before calling FaldRunPasses, because its main pass uses the same one; the DWM
+// hook cannot — its LUT vertex shader reads a POSITION/TEXCOORD vertex buffer — so it compiles
+// this. Its output signature IS PS_INPUT below; keep the two in step.
+inline const char* g_faldFullscreenVsSource = R"(
+struct VS_OUTPUT {
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VS_OUTPUT main(uint id : SV_VertexID) {
+    VS_OUTPUT o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+)";
+
 inline const char* g_faldPixelSource = R"(
 struct PS_INPUT { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
 

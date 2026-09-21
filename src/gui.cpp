@@ -2670,7 +2670,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::vector<DwmHookMonitorLUT> dwmMonitors;
                 for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
                     const auto& ms = g_gui.monitorSettings[i];
-                    if (ms.sdrPath.empty() && ms.hdrPath.empty()) continue;
+                    // As in processing.cpp: a FALD panel file alone is reason enough to inject for
+                    // this monitor, and the file is staged whether or not the layer is switched on.
+                    const std::wstring& sdrFald = ms.sdrColorCorrection.fald.paramsPath;
+                    const std::wstring& hdrFald = ms.hdrColorCorrection.fald.paramsPath;
+                    if (ms.sdrPath.empty() && ms.hdrPath.empty() && sdrFald.empty() && hdrFald.empty()) continue;
                     if (i >= g_gui.monitors.size()) continue;
 
                     MONITORINFO mi = { sizeof(mi) };
@@ -2680,6 +2684,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         lut.top = mi.rcMonitor.top;
                         lut.sdrLutPath = ms.sdrPath;
                         lut.hdrLutPath = ms.hdrPath;
+                        lut.sdrFaldPath = sdrFald;
+                        lut.hdrFaldPath = hdrFald;
                         dwmMonitors.push_back(lut);
                     }
                 }

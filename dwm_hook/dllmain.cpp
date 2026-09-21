@@ -9,6 +9,7 @@
 #include "hook_log.h"
 #include "hook_lut.h"
 #include "hook_render.h"
+#include "hook_fald.h"
 
 #include <io.h>
 #include <string>
@@ -668,6 +669,15 @@ static void UpdateLocalTonemapFromShared() {
 			}
 			g_numLocalTonemap++;
 		}
+		// FALD live settings ride the same pass: same key, same debounce, one word per monitor.
+		g_numLocalFald = 0;
+		for (uint32_t i = 0; i < numMons && g_numLocalFald < MAX_DWM_HOOK_MONITORS; i++) {
+			auto& fp = g_localFald[g_numLocalFald];
+			fp.left = local.monitors[i].left;
+			fp.top = local.monitors[i].top;
+			fp.flags = local.faldFlags[i];
+			g_numLocalFald++;
+		}
 	}
 
 	if (local.lutReloadFlag) {
@@ -679,6 +689,17 @@ LocalTonemapParams* FindTonemapForMonitor(int left, int top) {
 	for (int i = 0; i < g_numLocalTonemap; i++) {
 		if (g_localTonemap[i].left == left && g_localTonemap[i].top == top)
 			return &g_localTonemap[i];
+	}
+	return NULL;
+}
+
+LocalFaldParams g_localFald[MAX_DWM_HOOK_MONITORS] = {};
+int g_numLocalFald = 0;
+
+LocalFaldParams* FindFaldForMonitor(int left, int top) {
+	for (int i = 0; i < g_numLocalFald; i++) {
+		if (g_localFald[i].left == left && g_localFald[i].top == top)
+			return &g_localFald[i];
 	}
 	return NULL;
 }
@@ -1354,6 +1375,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				log_to_file("AddLUTs FAILED — returning FALSE");
 				return FALSE;
 			}
+			// FALD panel parameter files, from the subdirectory beside the .cube files. Read here and
+			// only here: the host deletes the whole staging directory the moment injection returns.
+			// A missing or unreadable file is not fatal — the layer simply stays off for that monitor.
+			FaldLoadPanelFiles(lutFolderPath);
 			{
 				char msg[256];
 				snprintf(msg, sizeof(msg), "AddLUTs OK: numLuts=%d hooks=%s",
