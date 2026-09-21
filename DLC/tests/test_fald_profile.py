@@ -213,6 +213,48 @@ def test_stage_preflight_records_geometry_and_enters_native(tmp_path):
     assert "entered calibration mode" in " ".join(res.actions_taken)
 
 
+def test_stage_preflight_tells_when_a_previous_run_left_calibration_mode_on(tmp_path):
+    """The profiling flow enters calibration mode too, and a ~40-minute pass is the one most
+    likely to be interrupted — so it needs enter-neutral's stale-session tell. It had none
+    (the flow landed after the Phase 9 audit), which mattered most on a DesktopLUT build that
+    still overwrote the restore snapshot on re-enter."""
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    first = _run(ctx, "preflight")
+    assert first.metrics["stale_calibration_mode"] is False
+    assert first.metrics["snapshot_retained"] is False
+    assert "stale_calibration_mode" not in [a.code for a in first.anomalies]
+
+    second = _run(ctx, "preflight")        # the crashed-pass-then-rerun corner
+    assert second.metrics["stale_calibration_mode"] is True
+    assert second.metrics["snapshot_retained"] is True
+    stale = [a for a in second.anomalies if a.code == "stale_calibration_mode"]
+    assert len(stale) == 1 and stale[0].severity == "low"
+
+
+def test_stage_restore_does_not_claim_a_stack_it_did_not_restore(tmp_path):
+    """phase_restore reported "user stack restored" from the fact that calibration.exit
+    returned, never from its `restored` flag — so a run that had nothing to put back read as a
+    clean finish. The user's whole FALD configuration (panel file, pedestal mode, temporal,
+    starfield, glow) comes back through that snapshot and no other way, because the flow only
+    ever switches the layer off."""
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    assert _run(ctx, "preflight").status == "ran"
+
+    good = _run(ctx, "restore")
+    assert good.status == "ran"
+    assert good.metrics["stack_restored"] is True
+    assert "stack_not_restored" not in [a.code for a in good.anomalies]
+    assert good.advice["default_policy_verdict"] == "done"
+
+    # No session left to exit: the server has nothing to restore and must be believed.
+    bad = _run(ctx, "restore")
+    assert bad.metrics["stack_restored"] is False
+    lost = [a for a in bad.anomalies if a.code == "stack_not_restored"]
+    assert len(lost) == 1 and lost[0].severity == "high"
+    assert bad.advice["default_policy_verdict"] == "judge_restore"
+    assert bad.advice["overridden_verdict"] == "done"
+
+
 def test_stage_refuses_measuring_before_preflight(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
     res = _run(ctx, "rings")

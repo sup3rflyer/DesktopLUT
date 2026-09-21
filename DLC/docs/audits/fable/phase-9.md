@@ -232,6 +232,25 @@ default vs C++ GUI-marshal 60s verified correctly ordered (the server gives up f
 - **Suite:** `1523 passed, 9 skipped`; `python -m dlc.stages.simulate` reaches report with all
   stages `ran`.
 
+### Two FALD-flow gaps found while checking T2's reach (same branch)
+
+The FALD profiling flow (`stages/fald_profile.py`, landed 2026-09-14 — after this audit) also
+calls `calibration.enter` / `exit(restore_snapshot=True)`, so it inherits both the defect and the
+fix. `FaldSettings` lives inside `ColorCorrectionSettings` inside `MonitorSettings`, so the store
+captures and restores the whole FALD configuration — panel file path, pedestal mode, temporal,
+starfield, glow — and `FaldEnsureResources` rebuilds the GPU tables on any `reloadSeq` change,
+including a restore rolling it backwards. Two things were missing on the DLC side:
+
+- `phase_preflight` had no stale-calibration tell. Added, via new shared helpers
+  `_common.calibration_already_active` / `note_stale_calibration` that `enter_neutral` now uses too.
+- `phase_restore` reported "user stack restored" from the fact that `calibration.exit` returned,
+  never from its `restored` flag — the same always-true shape as F9-2's `install_ok`. It now
+  records `stack_restored`, raises `stack_not_restored` (high) when the server restored nothing,
+  and the phase verdict becomes `judge_restore`. No DLC caller reads `restored` anywhere else;
+  `fald_profile` was the only one that reported on it.
+
+Suite with both commits on the branch: `1525 passed, 9 skipped`.
+
 ### Needs checking on the Windows box
 
 1. **It builds.** The container is Linux; no MSVC ran. `DesktopLUT.sln` and

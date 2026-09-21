@@ -35,48 +35,22 @@ def build(args, ctx: RunContext) -> StageResult:
         )
 
     # 0) Stale-calibration-mode tell (fable Phase 9): a previous run never exited, so the
-    # monitor is ALREADY cleared. What that costs depends on the server: one that keeps the
-    # original pre-session snapshot (T2, reported as `snapshot_retained`) can still restore
-    # the user's setup; one that predates the fix re-snapshots the cleared state and only the
-    # durable settings backup can. Surface it as evidence either way; entering proceeds.
-    stale_calibration = False
-    try:
-        stale_calibration = bool(controller.calibration_status().get("active"))
-    except Exception:  # noqa: BLE001 - advisory probe; a dead pipe fails loudly at enter below
-        pass
-
-    def _stale_tell(snapshot_retained: bool | None) -> None:
-        if not stale_calibration:
-            return
-        if snapshot_retained:
-            result.anomaly(
-                "stale_calibration_mode",
-                "DesktopLUT was already in calibration mode (a previous run did not exit); the "
-                "server kept the ORIGINAL pre-session snapshot, so exit(restore_snapshot=True) "
-                "can still restore the user's setup",
-                "low",
-            )
-        else:
-            result.anomaly(
-                "stale_calibration_mode",
-                "DesktopLUT was already in calibration mode (a previous run did not exit) and did "
-                "not report keeping the original snapshot (a build predating the snapshot-store "
-                "fix); the pipe's restore snapshot now holds the cleared state — treat the pre-run "
-                "settings backup as the authoritative restore",
-                "medium",
-            )
+    # monitor is ALREADY cleared. Probe BEFORE entering — after the enter, calibration mode
+    # is active by definition. _common carries the tell because every flow that calls
+    # calibration.enter needs it (the FALD profiling flow does too).
+    stale_calibration = _common.calibration_already_active(controller)
 
     # 1) Clear DesktopLUT's MHC + 3D LUT + shader layers and associate the dummy.
     try:
         enter = controller.enter_neutral(args.monitor, mode, dummy_path, reason="DLC enter-neutral")
         result.action("cleared MHC/3D-LUT/shader layers via calibration.enter")
     except Exception as exc:  # noqa: BLE001
-        _stale_tell(None)
+        _common.note_stale_calibration(result, stale_calibration, None)
         result.fail("enter_failed", f"calibration.enter failed: {type(exc).__name__}: {exc}")
         return result
     result.raw["calibration_enter"] = enter
     snapshot_retained = enter.get("snapshot_retained")
-    _stale_tell(snapshot_retained)
+    _common.note_stale_calibration(result, stale_calibration, enter)
 
     # 2) Wipe any stray Windows videoLUT another tool may have loaded.
     dispwin_ran = False

@@ -253,6 +253,55 @@ def ping_controller(controller: CalibrationController) -> tuple[bool, dict[str, 
 
 
 # --------------------------------------------------------------------------
+# Stale calibration mode — shared by every flow that calls calibration.enter
+# --------------------------------------------------------------------------
+def calibration_already_active(controller: CalibrationController) -> bool:
+    """True when DesktopLUT is STILL in calibration mode from an earlier run.
+
+    Advisory only, so a dead pipe reads as "not stale" and fails loudly at the
+    enter itself instead of here.
+    """
+    try:
+        return bool(controller.calibration_status().get("active"))
+    except Exception:  # noqa: BLE001 - advisory probe; the enter call is the real gate
+        return False
+
+
+def note_stale_calibration(result: StageResult, was_active: bool, enter_result: Any) -> None:
+    """Record the stale-calibration tell on ``result`` (fable Phase 9; T2 follow-up).
+
+    ``was_active`` is :func:`calibration_already_active` from BEFORE the enter.
+    ``enter_result`` is the ``calibration.enter`` result, or None when it failed.
+
+    A previous run that never exited leaves the monitor ALREADY cleared. What that
+    costs depends on the server: one that keeps the original pre-session snapshot
+    reports ``snapshot_retained`` and can still restore the user's setup; one that
+    omits the field predates the snapshot-store fix, re-snapshots the cleared state,
+    and only the durable settings backup can put things back.
+    """
+    if not was_active:
+        return
+    retained = enter_result.get("snapshot_retained") if isinstance(enter_result, dict) else None
+    if retained:
+        result.anomaly(
+            "stale_calibration_mode",
+            "DesktopLUT was already in calibration mode (a previous run did not exit); the "
+            "server kept the ORIGINAL pre-session snapshot, so exit(restore_snapshot=True) "
+            "can still restore the user's setup",
+            "low",
+        )
+    else:
+        result.anomaly(
+            "stale_calibration_mode",
+            "DesktopLUT was already in calibration mode (a previous run did not exit) and did "
+            "not report keeping the original snapshot (a build predating the snapshot-store "
+            "fix); the pipe's restore snapshot now holds the cleared state — treat the pre-run "
+            "settings backup as the authoritative restore",
+            "medium",
+        )
+
+
+# --------------------------------------------------------------------------
 # dlc_state.json sidecar — the stage tools' shared memory
 # --------------------------------------------------------------------------
 def load_dlc_state(ctx: RunContext) -> dict[str, Any]:

@@ -308,6 +308,15 @@ request, adjudicates ambiguous results on digests, and writes the report.
   `snapshot_retained`, so DLC's stale-calibration tell now says which of the two
   behaviours the server it is talking to actually has — a build without the field is
   still treated as lose-the-snapshot, with the preflight settings backup authoritative.
+- **The FALD profiling flow no longer claims a stack it did not restore, and now warns
+  about a stale calibration session.** `phase_restore` said "user stack restored" because
+  `calibration.exit` returned, never because its `restored` flag was true — so a pass with
+  nothing to put back read as a clean finish. It now reports `stack_restored`, raises
+  `stack_not_restored` (high) when the server restored nothing, and lets the phase's verdict
+  become `judge_restore`. `phase_preflight` gained enter-neutral's stale-calibration tell,
+  which it never had (the flow landed after that audit); a ~40-minute profiling pass is the
+  one most likely to be interrupted, and its whole restore — the panel file, pedestal mode,
+  temporal, starfield and glow settings included — is the calibration snapshot.
 - **A calibration run no longer drops the OTHER mode's 3D LUT.** Entering calibration
   mode cleared both SDR and HDR runtime layers on the monitor, and accepting the new
   calibration exits without the snapshot restore — so a clean HDR run permanently

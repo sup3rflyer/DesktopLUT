@@ -816,10 +816,17 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
     # enter the native state: calibration.enter + identity MHC (the probe's FALD_NATIVE=1)
     if not args.no_native:
         dummy = default_dummy_icc(mode)
+        # A profiling pass is ~40 minutes of phases, so it is the flow most likely to be
+        # interrupted — and its whole restore is the calibration snapshot (phase_restore
+        # below). Probe for a stale session BEFORE entering, exactly as enter-neutral does.
+        stale_calibration = _common.calibration_already_active(controller)
+        result.metrics["stale_calibration_mode"] = stale_calibration
         try:
             enter = controller.enter_neutral(args.monitor, mode, str(resolve_profile_path(dummy.path)), reason="DLC fald-profile")
             result.action("entered calibration mode (layers cleared, dummy ICC associated)")
             result.raw["calibration_enter"] = enter
+            result.metrics["snapshot_retained"] = enter.get("snapshot_retained")
+            _common.note_stale_calibration(result, stale_calibration, enter)
             native = None
             if mode == "HDR":
                 try:
@@ -1822,11 +1829,34 @@ def phase_restore(s: Session, result: StageResult) -> None:
     try:
         r = ctl.exit_calibration(restore_snapshot=True)
         result.raw["calibration_exit"] = r
-        result.action("left calibration mode (user stack restored)")
+        # `restored` is the server SAYING it put the snapshot back. Believing it blindly is
+        # how a lost stack reads as a clean finish — the user's whole FALD configuration
+        # (panel file, pedestal mode, temporal, starfield, glow) comes back this way and no
+        # other, because the flow only ever switches the layer off.
+        restored = bool(r.get("restored")) if isinstance(r, dict) else False
+        result.metrics["stack_restored"] = restored
+        if restored:
+            result.action("left calibration mode (user stack restored)")
+        else:
+            result.action("left calibration mode")
+            result.anomaly(
+                "stack_not_restored",
+                "calibration.exit reported restored=false: DesktopLUT had no snapshot to put back, so "
+                "the MHC profile, white balance, 3D LUT and FALD layer are still in their cleared "
+                "state — restore them from the pre-run settings backup",
+                "high",
+            )
     except Exception as exc:  # noqa: BLE001
+        result.metrics["stack_restored"] = False
         result.anomaly("restore_failed", f"calibration.exit failed: {exc}", "high")
     s.st["fald"]["phases"]["restore"] = {"status": "done", "at": time.time()}
-    result.advice = {"default_policy_verdict": "done", "reasons": ["stack restored"]}
+    restored_ok = bool(result.metrics.get("stack_restored"))
+    result.advice = {
+        "default_policy_verdict": "done",
+        "reasons": ["stack restored"] if restored_ok
+        else ["the stack was NOT restored — tell the user before calling this done"],
+    }
+    # the dispatcher's _judge_on_high turns the high anomaly above into judge_restore
 
 
 # ----------------------------------------------------------------------------- entry
