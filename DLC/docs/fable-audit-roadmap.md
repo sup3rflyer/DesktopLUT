@@ -1177,6 +1177,48 @@ because it is fully controlled and injection-free; the hook remains the
 gamer/reach option with its own signing/AV implications. Any future packaging
 leads with the controlled paths and makes the hook opt-in.
 
+**Correction representation — parked exploration (2026-07-05, owner): a live
+parametric correction stack over baked cubes.** Surfaced while mapping the
+DesktopLUT-mac `DESIGN.md` (§4.5 correction stack) onto the Windows pipeline.
+The idea: stop treating a **baked `.cube` as the primary correction artifact**
+and instead hold a **live, layered, parametric correction stack** — base
+(shaper + 3×3 matrix + per-channel 1D), trim (WB gains + multi-point
+grayscale), tonemap — as shader-resident GPU resources evaluated per frame, the
+way the mac design does. Most of the shader math already exists on the C++ side
+as the SDR grayscale full-preview path (`../src/shader.h ApplyFullGsPreviewSDR`
++ `ComputeSdrScanoutForShader`), which reproduces the whole MHC2 SDR scanout
+analytically and is bit-verified against the bake — so "live parametric" is a
+*promotion of an existing preview path to always-on*, not new math.
+
+- **The hard boundary (why "abandon cubes" is wrong as stated):** matrix+1D is
+  separable and cannot express genuinely volumetric corrections — creative looks
+  (film/show LUTs, delivered *as* cubes) and measured panel non-additivity (the
+  grid→cube refinement DLC fits in `mhc_cube.py`/`optimize.py`). Those stay a
+  **cube layer**; `.cube`/ICC also stay **interchange exports** (Resolve
+  video-out, mpv/madVR, HW LUT boxes). The move is *demote the cube from "the
+  correction" to one layer*, not delete the format — the same matrix+1D-vs-3D
+  wall as at scanout, one layer up.
+- **Windows twist (don't over-copy the mac):** macOS runs everything in-shader
+  because Apple removed cLUT ICC + vcgt (`DESIGN.md` §2 — forced). On Windows
+  MHC2 stays the better base target, so the parametric **base commits to MHC2
+  scanout** (VRR-safe; covers exclusive-fullscreen + DRM) and the live shader
+  (DWM hook / overlay) carries only what MHC2 can't: the creative cube, tonemap,
+  and live-trim *preview* before bake. The win is smaller than the mac's but real.
+- **Why it's attractive:** dissolves two known defect classes structurally — the
+  baked-cube-not-reloaded bug (`../OVERLAY_LUT_RELOAD_BUG.md`; no opaque artifact
+  to lose) and the double-correction ordering hazard (`../REFERENCE.md`: feeding
+  corrected values into a cube authored for raw input) — and unlocks the mac
+  trim-editor workflow (live sliders + continuous instrument read + auto-trim, no
+  bake→reload roundtrip), which the IPC grayscale live-edit quartet (Phase 9)
+  already half-supports.
+- **DLC consequence:** reframes what DLC *produces* — from "bake a cube and
+  install it" toward "emit a layered parametric correction stack (base params +
+  optional refinement cube) the app evaluates live." Touches
+  `mhc_cube.py`/`optimize.py`/the 3D-LUT engine and the IPC correction-store
+  contract; a v3 architecture item, not a v2 audit fix. **Parked** — recorded so
+  Phases 10/12 (dashboard correction view, IPC/endgame) don't design against
+  "baked cube is the only artifact" as if it were permanent.
+
 **Workstreams, when the time comes:** the seam UI; the policy config surface; a
 first-run wizard (the productization of the `calibration_profile.yaml`
 skill⊥user-data boundary — meter onboarding via probe-match, monitor mapping,

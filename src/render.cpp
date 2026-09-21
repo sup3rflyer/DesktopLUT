@@ -14,6 +14,7 @@
 #include "mhc.h"
 #include "gui_mhc.h"
 #include "fald.h"
+#include "../shared/peak_detect.h"
 #include <dwmapi.h>
 #include <avrt.h>
 #include <iostream>
@@ -546,53 +547,17 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         }
 
         if (ctx->peakTexture && ctx->peakUAV && ctx->peakRawUAV && g_peakSmoothCS) {
-            // Update peak constant buffer only when dimensions change (static values stay valid)
-            if (ctx->width != ctx->lastPeakCBWidth || ctx->height != ctx->lastPeakCBHeight) {
-                D3D11_MAPPED_SUBRESOURCE mapped;
-                if (SUCCEEDED(g_context->Map(g_peakCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-                    // frameWidth/frameHeight are uint in shader, must write as uint
-                    uint32_t* udata = (uint32_t*)mapped.pData;
-                    udata[0] = (uint32_t)ctx->width;
-                    udata[1] = (uint32_t)ctx->height;
-                    float* fdata = (float*)mapped.pData;
-                    fdata[2] = 0.3f;    // riseRate - exponential rise (0.3 = 30% per frame)
-                    fdata[3] = 0.05f;   // fallRate - exponential fall (0.05 = 5% per frame)
-                    fdata[4] = 100.0f;  // maxRisePerFrame - slew limit (nits/frame)
-                    fdata[5] = 50.0f;   // maxFallPerFrame - slew limit (nits/frame)
-                    fdata[6] = 0.0f;    // padding
-                    fdata[7] = 0.0f;    // padding
-                    g_context->Unmap(g_peakCB, 0);
-                    ctx->lastPeakCBWidth = ctx->width;
-                    ctx->lastPeakCBHeight = ctx->height;
-                }
-            }
-
-            // Pass 1: dense reduction (every 4th pixel, one 16x16 group per 64x64-px tile) -> raw max;
-            // pass 2: temporal smoothing on one thread -> PQ peak. u0 = smoothed PQ peak, u1 = raw max.
-            ID3D11UnorderedAccessView* uavs[2] = { ctx->peakUAV, ctx->peakRawUAV };
-            g_context->CSSetShader(g_peakDetectCS, nullptr, 0);
-            g_context->CSSetConstantBuffers(0, 1, &g_peakCB);
-            g_context->CSSetShaderResources(0, 1, &ctx->captureSRV);
-            g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-            g_context->Dispatch((UINT)((ctx->width + 63) / 64), (UINT)((ctx->height + 63) / 64), 1);
-            g_context->CSSetShader(g_peakSmoothCS, nullptr, 0);
-            g_context->Dispatch(1, 1, 1);
-
-            // Unbind UAVs to allow SRV binding
-            ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
-            g_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
-            ID3D11ShaderResourceView* nullSRV = nullptr;
-            g_context->CSSetShaderResources(0, 1, &nullSRV);
+            // Pass 1: dense reduction (every 4th pixel) -> raw max; pass 2: temporal smoothing -> PQ peak.
+            DispatchPeakDetection(g_context, g_peakDetectCS, g_peakSmoothCS, g_peakCB, ctx->captureSRV,
+                                  ctx->peakUAV, ctx->peakRawUAV, (unsigned)ctx->width, (unsigned)ctx->height);
 
             // Double-buffered peak readback: copy to staging[N], read staging[N-1] from previous frame.
             // This avoids GPU pipeline stalls by reading data that's guaranteed to be ready.
             bool needPeakReadback = g_analysisEnabled.load() || g_logPeakDetection.load();
             if (needPeakReadback) {
-                static std::chrono::steady_clock::time_point lastReadback[8] = {};
                 auto now = std::chrono::steady_clock::now();
-                int idx = ctx->index < 8 ? ctx->index : 0;
 
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastReadback[idx]).count() >= 500) {
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - ctx->lastPeakReadbackTime).count() >= 500) {
                     // Create both staging textures on first use
                     auto createStaging = [&](ID3D11Texture2D** tex) {
                         if (*tex) return;
@@ -638,7 +603,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
                         // Alternate for next cycle
                         ctx->peakStagingReadIndex = 1 - ctx->peakStagingReadIndex;
                     }
-                    lastReadback[idx] = now;
+                    ctx->lastPeakReadbackTime = now;
                 }
             }
         }

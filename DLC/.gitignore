@@ -71,3 +71,31 @@ src/*.egg-info/
 .coverage
 .coverage.*
 coverage.json
+
+# Local scratch at the DLC root: hardware probe/experiment scripts, run logs and
+# meter captures. They name panels, run folders and local paths — keep local.
+/agent_*.py
+/agentexp_*.py
+/analysis_*.py
+/analyze_*.py
+/fald_*.py
+/rig_*.py
+/formula_explore.py
+/install_native_target_test.py
+/reapply_good_mhc.py
+/runs_*.out
+/runs_*.err
+/*.bcs
+/_now.jpg
+/vid_log.jsonl
+/vid_patterns.json
+# Dated run plans, unbuilt proposals and raw research (panel-specific; local-only)
+docs/adaptive-peak-design.md
+docs/dip-sequence-engine-plan.md
+docs/c6-hdr-run2-plan.md
+docs/next-run-improvements-2026-09-02.md
+docs/pa32ucxr-plan-2026-09-03.md
+docs/oled-community-calibration-research.md
+docs/spd-observer-metamerism-2026-09-04.md
+docs/thermal-preheat-generalization-design.md
+docs/hdr-peak-chroma-rolloff.md
