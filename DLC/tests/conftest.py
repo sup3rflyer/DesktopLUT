@@ -9,6 +9,13 @@ chain) is ~205 s, so a perfect packing finishes in ~205 s. The actual run took 4
 of workers sitting idle. Startup is not the cause: collection + worker bring-up is ~5 s, and
 the whole numpy/scipy/colour import stack is ~2.5 s per worker, paid once, in parallel.
 
+2026-09-21 changed the shape of that: the FALD model's meter path no longer forms a whole frame
+to average an aperture disc, so the stage chain fell to ~29 s and the longest test is now the
+engine's constrained-RBF case at ~120 s, with total CPU down ~40 %. The run is closer to
+CPU-bound than to critical-path-bound, which makes the ordering below matter LESS than it did
+— but the failure mode it prevents (two heavy tests inside one 23-item chunk) is unchanged, and
+it is nearly free, so it stays.
+
 The cause is xdist's dispatch granularity. ``--dist load`` (the default) hands each worker a
 CONSECUTIVE chunk of the collected list up front::
 
@@ -40,37 +47,32 @@ with ``python -m pytest -q --durations=0`` and copy the calls above ~10 s.
 """
 from __future__ import annotations
 
-# nodeid tail (file::function, without any ``[param]`` suffix) -> measured seconds, 2026-09-20.
+# nodeid tail (file::function, without any ``[param]`` suffix) -> measured seconds.
 # Parametrised entries are listed once by base name; every parameter inherits the cost.
 # Only the ORDER of these numbers matters, never their absolute value.
+#
+# REFRESHED 2026-09-21 on a 4-core container (the 2026-09-20 numbers were a 16-worker box), after the
+# FALD model's meter path stopped forming whole frames to average an aperture disc: the profiling
+# stage chain went 196 s -> 29 s and is no longer the list's head, so the order below is genuinely
+# different, not rescaled. Re-measure on the 16-worker box when convenient — a wrong order costs wall
+# time, never correctness, and --dist worksteal absorbs it.
 _HEAVY_SECONDS = {
-    "test_fald_profile.py::test_stage_chain_sdr_to_export_and_verify": 205,
-    "test_fald_profile.py::test_the_fit_recovers_the_hidden_estimate": 176,
-    "test_fald_fit_rules.py::test_synthetic_sdr_fit_recovers_drive_k_and_flags_an_unidentified_tmin": 150,
-    "test_engine_v2.py::test_constrained_rbf_caps_off_channel_lift_at_saturated_blue": 102,
-    "test_fald_boost_gpu.py::test_emulator_two_round_boost_matches_correct_image_pa32ucxr_frame": 78,
-    "test_fald_starfield_gpu.py::test_pa32ucxr_frame_star_lattice_with_outliers_matches_the_reference": 48,
+    "test_engine_v2.py::test_constrained_rbf_caps_off_channel_lift_at_saturated_blue": 121,
+    "test_fald_boost_gpu.py::test_emulator_two_round_boost_matches_correct_image_pa32ucxr_frame": 87,
+    "test_fald_starfield_gpu.py::test_pa32ucxr_frame_star_lattice_with_outliers_matches_the_reference": 69,
+    "test_fald_profile.py::test_the_fit_recovers_the_hidden_estimate": 51,
+    "test_fald_fit_rules.py::test_synthetic_sdr_fit_recovers_drive_k_and_flags_an_unidentified_tmin": 35,
     "test_engine_v2.py::test_physical_cube_reduces_model_error_and_pins_neutral": 31,
-    "test_optimize.py::test_physical_engine_is_opt_in_and_reports_info": 25,
-    "test_fald_glowfill.py::test_the_fill_fades_out_continuously_as_the_content_gets_brighter": 25,
-    "test_fald_starfield.py::test_a_star_leaving_solid_content_gains_weight_continuously": 23,
-    "test_fald_starfield_gpu.py::test_a_star_stepping_away_from_a_window_in_8_px_steps": 22,
-    "test_fald_starfield.py::test_protection_is_mirror_symmetric_and_a_mid_drive_object_protects_partially": 22,
-    "test_fald_flow_rules.py::test_off_only_augment_retires_the_old_identity_file": 22,
-    "test_fald_flow_rules.py::test_stage_augment_layer_that_cannot_run_is_never_woke": 21,
-    "test_engine_v2.py::test_build_cube_reduces_error_and_is_mostly_monotonic": 21,
-    "test_fald_paneltime_gpu.py::test_emulator_sequence_with_the_panel_clock": 18,
-    "test_calibrate.py::test_planned_stages_match_announced_phases_per_flow": 17,
-    "test_fald_flow_rules.py::test_stage_augment_overlay_that_never_sleeps_is_tagged": 14,
-    "test_calibrate.py::test_full_run_restores_the_viewing_layers_on_apply_and_on_revert": 12,
-    "test_fald_starfield_gpu.py::test_heavy_tailed_field_with_the_defaults_matches_the_reference": 12,
-    "test_fald_starfield_gpu.py::test_sky_is_bit_identical_under_lift_and_under_a_target_below_it": 12,
-    "test_fald_starfield_gpu.py::test_bright_sky_lift_and_cap_match_the_reference_and_spare_the_sky": 11,
-    "test_hook_routing.py::test_readiness_stage_swaps_a_crossed_twin_and_raises_the_anomaly": 10,
+    "test_optimize.py::test_physical_engine_is_opt_in_and_reports_info": 30,
+    "test_fald_profile.py::test_stage_chain_sdr_to_export_and_verify": 29,
+    "test_fald_glowfill.py::test_the_fill_fades_out_continuously_as_the_content_gets_brighter": 22,
+    "test_engine_v2.py::test_build_cube_reduces_error_and_is_mostly_monotonic": 13,
+    "test_fald_starfield.py::test_protection_is_mirror_symmetric_and_a_mid_drive_object_protects_partially": 12,
+    "test_engine_v2.py::test_sdr_wide_gamut_maps_inward_and_is_consistent": 10,
     "test_hook_routing.py::test_readiness_stage_refuses_when_the_hook_paints_nothing": 10,
-    "test_fald_starfield.py::test_a_heavy_tailed_field_is_compressed_not_flattened": 10,
-    "test_fald_starfield_gpu.py::test_soft_star_profile_is_monotone_in_the_emulator": 10,
-    "test_calibrate.py::test_crash_resume_matrix_replays_to_identical_outcome": 6,
+    "test_hook_routing.py::test_readiness_stage_swaps_a_crossed_twin_and_raises_the_anomaly": 10,
+    "test_fald_starfield_gpu.py::test_a_star_stepping_away_from_a_window_in_8_px_steps": 9,
+    "test_fald_starfield.py::test_a_star_leaving_solid_content_gains_weight_continuously": 6,
 }
 
 

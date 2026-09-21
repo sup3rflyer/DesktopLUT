@@ -585,13 +585,18 @@ class FaldModel:
     def backlight(self, drives: np.ndarray, kind: str, scale_mm: float,
                   core_mm: float = 0.0, tail_frac: float = 0.0,
                   phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
-                  support_cells: int = 0, pnorm: float = 2.0) -> np.ndarray:
-        """B on the reduced-res pixel grid (h, w), from cell drives (rows, cols)."""
+                  support_cells: int = 0, pnorm: float = 2.0,
+                  window: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
+        """B on the reduced-res pixel grid (h, w), from cell drives (rows, cols).
+
+        ``window`` = ``(y0, y1, x0, x1)``: return only that rectangle. The upsample is
+        per-output-pixel, so the values are the ones the full grid would carry."""
         sub = self.p.sub
         fine = self.backlight_fine(drives, kind, scale_mm, core_mm, tail_frac, phase_px, aniso, support_cells, pnorm)
         # bilinear upsample fine (sub per cell) → pixels
-        ys = (np.arange(self.h) + 0.5) / self.ch * sub - 0.5
-        xs = (np.arange(self.w) + 0.5) / self.cw * sub - 0.5
+        rows, cols = _window_indices(window, self.h, self.w)
+        ys = (rows + 0.5) / self.ch * sub - 0.5
+        xs = (cols + 0.5) / self.cw * sub - 0.5
         return _bilinear(fine, ys, xs)
 
     def backlight_fine(self, drives: np.ndarray, kind: str, scale_mm: float,
@@ -636,22 +641,24 @@ class FaldModel:
     def forward(self, shapes: Sequence[Shape]) -> dict:
         return self.forward_img(self.render(shapes))
 
-    def _raw_backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None) -> tuple[np.ndarray, np.ndarray]:
+    def _raw_backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None,
+                        window: Optional[tuple[int, int, int, int]] = None) -> tuple[np.ndarray, np.ndarray]:
         """``drives_est`` (default: ``drives``) feeds the panel's ESTIMATE kernel while ``drives`` feeds the real
         spread — the two differ only under a temporal drive state where the LEDs lag the commanded drive but the
-        LCD compensation follows the command (dlc.fald.temporal MODE_TRUE_ONLY)."""
+        LCD compensation follows the command (dlc.fald.temporal MODE_TRUE_ONLY). ``window``: see :meth:`backlight`."""
         p = self.p
         d_est = drives if drives_est is None else drives_est
-        b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm)
+        b_true = self.backlight(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm,
+                                window=window)
         phase = (p.est_phase_px, p.est_phase_py)
         if p.est_cell:
-            return b_true, self.backlight_cell(d_est)
+            return b_true, self.backlight_cell(d_est, window=window)
         if p.est_kind == "mix":
             b_est = self.backlight(d_est, "mix", p.est_tail_mm, p.est_core_mm, p.est_tail_frac, phase,
-                                   p.est_aniso, p.est_support_cells)
+                                   p.est_aniso, p.est_support_cells, window=window)
         else:
             b_est = self.backlight(d_est, p.est_kind, p.est_scale_mm, phase_px=phase, aniso=p.est_aniso,
-                                   support_cells=p.est_support_cells)
+                                   support_cells=p.est_support_cells, window=window)
         return b_true, b_est
 
     def flat_response(self) -> tuple[np.ndarray, np.ndarray]:
@@ -698,7 +705,8 @@ class FaldModel:
         return self.boost_of_fraction(self.active_zone_fraction(img))
 
     def backlights(self, drives: np.ndarray, drives_est: Optional[np.ndarray] = None,
-                   boost: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+                   boost: float = 1.0,
+                   window: Optional[tuple[int, int, int, int]] = None) -> tuple[np.ndarray, np.ndarray]:
         """(B_true, B_est) on the reduced-res pixel grid for a cell-drive map (``drives_est``: a separate map
         for the estimate kernel, see :meth:`_raw_backlights`). ``boost`` = the frame's black-frame LED boost
         (:meth:`led_boost`): it multiplies B_true only — the panel's estimate does not know it. With ``flat_norm`` (default)
@@ -706,65 +714,102 @@ class FaldModel:
         as uniform (posmatrix 2026-09-11: no sub-cell position dependence), so whatever the estimate does
         at cell sub-positions and at the frame border must cancel for uniform input. Without it the
         mean-normalised estimate kernel left a ~2 % sub-cell sawtooth and a border ramp on a flat field
-        (the grid the owner saw on a white window, 2026-09-12)."""
-        b_true, b_est = self._raw_backlights(drives, drives_est)
+        (the grid the owner saw on a white window, 2026-09-12). ``window``: see :meth:`backlight`."""
+        b_true, b_est = self._raw_backlights(drives, drives_est, window=window)
         if boost != 1.0:
             b_true = b_true * float(boost)
         if not self.p.flat_norm:
             return b_true, b_est
-        f_true, f_est = self.flat_response()
-        return b_true / np.maximum(f_true, 1e-6), b_est / np.maximum(f_est, 1e-6)
+        f_true, f_est = self.flat_response()                          # cached full-frame, cropped here
+        return (b_true / np.maximum(_crop(f_true, window), 1e-6),
+                b_est / np.maximum(_crop(f_est, window), 1e-6))
 
-    def backlight_cell(self, drives: np.ndarray) -> np.ndarray:
+    def backlight_cell(self, drives: np.ndarray,
+                       window: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
         """Cell-resolution estimate: E_c = Σ_c' d_c' k(centre_c − centre_c') (one kernel, no sub-cell
         offsets), then every pixel reads the cell map at (p + phase) — nearest cell (blocky, the native
-        staircase) or bilinear between cell centres."""
+        staircase) or bilinear between cell centres. ``window``: see :meth:`backlight`."""
         p = self.p
         kern = self._kernels(p.est_kind, p.est_scale_mm, p.est_core_mm, p.est_tail_frac, (0.0, 0.0),
                              p.est_aniso, p.est_support_cells, 2.0, sub=1)[0][0]
         E = fftconvolve(drives, kern, mode="same")                     # (rows, cols)
         # pixel centres (reduced-res) shifted by the phase, in cell units
-        xs = ((np.arange(self.w) + 0.5) * p.scale + p.est_phase_px) / p.cell_w
-        ys = ((np.arange(self.h) + 0.5) * p.scale + p.est_phase_py) / p.cell_h
+        rows, cols = _window_indices(window, self.h, self.w)
+        xs = ((cols + 0.5) * p.scale + p.est_phase_px) / p.cell_w
+        ys = ((rows + 0.5) * p.scale + p.est_phase_py) / p.cell_h
         if p.est_interp == "nearest":
             ix = np.clip(np.floor(xs).astype(int), 0, p.cols - 1); iy = np.clip(np.floor(ys).astype(int), 0, p.rows - 1)
             return E[np.ix_(iy, ix)]
         return _bilinear(E, ys - 0.5, xs - 0.5)                        # cell-centre coordinates
 
-    def forward_img(self, img: np.ndarray) -> dict:
-        """Forward model on a rendered request image ``img`` (3, h, w) of as-if-white nits."""
+    def forward_img(self, img: np.ndarray, window: Optional[tuple[int, int, int, int]] = None) -> dict:
+        """Forward model on a rendered request image ``img`` (3, h, w) of as-if-white nits.
+
+        ``window`` = ``(y0, y1, x0, x1)``: form the PER-PIXEL fields only inside that rectangle of the
+        reduced-res grid. ``img``, ``drives`` and ``boost`` in the result still describe the whole frame
+        — a cell's drive is a statistic over all of its pixels and the LED boost counts the whole
+        raster, so neither can be cropped — while ``b_true``, ``b_est``, ``t`` and ``y`` have the
+        window's shape and carry exactly the values the full-frame computation would put there (every
+        step from the backlight upsample onwards is per-pixel). ``window`` is also returned, so a
+        caller that did not ask for one cannot mistake a cropped result for a full frame.
+
+        :meth:`meter_img` is why this exists: the aperture disc is ~0.5 % of the frame, so the
+        full-frame form spent ~99 % of its per-pixel arithmetic on values it then threw away."""
         p = self.p
         drives = self.cell_drives(img)
         boost = self.led_boost(img)
-        b_true, b_est = self.backlights(drives, boost=boost)
+        b_true, b_est = self.backlights(drives, boost=boost, window=window)
         lmax = p.white_nits * np.array(p.chan_weights)[:, None, None]
         # per-channel target luminance: a code's PQ decode is its "as-if-white" nits, the channel
         # contributes its share of white → target_ch = w_ch · EOTF(code_ch)
-        target = img * np.array(p.chan_weights)[:, None, None]
+        target = _crop(img, window) * np.array(p.chan_weights)[:, None, None]
         # monitor's request: T = target / (Lmax · B_est), clamped to [0, 1]
         t_req = target / np.maximum(lmax * np.maximum(b_est, 1e-6)[None], 1e-9)
         t = np.clip(t_req, 0.0, 1.0)
         y = lmax * b_true[None] * t + lmax * b_true[None] * p.tmin_vec()[:, None, None]   # per-channel pedestal
-        return {"img": img, "drives": drives, "b_true": b_true, "b_est": b_est, "t": t, "y": y, "boost": boost}
+        return {"img": img, "drives": drives, "b_true": b_true, "b_est": b_est, "t": t, "y": y, "boost": boost,
+                "window": window}
 
     def meter(self, shapes: Sequence[Shape], meter_px: tuple[float, float],
               aperture_px: Optional[float] = None) -> np.ndarray:
         """Per-channel luminance the meter reads: mean of y over the aperture disc. Returns (3,)."""
         return self.meter_img(self.render(shapes), meter_px, aperture_px)
 
-    def aperture_mask(self, meter_px: tuple[float, float], aperture_px: Optional[float] = None) -> np.ndarray:
+    def _aperture(self, meter_px: tuple[float, float],
+                  aperture_px: Optional[float]) -> tuple[float, float, float]:
+        """(radius, centre x, centre y) of the meter disc, on the reduced-res grid."""
         r = (aperture_px if aperture_px is not None else self.p.aperture_px) / self.p.scale
-        mx, my = meter_px[0] / self.p.scale, meter_px[1] / self.p.scale
-        yy, xx = np.mgrid[0:self.h, 0:self.w]
+        return r, meter_px[0] / self.p.scale, meter_px[1] / self.p.scale
+
+    def aperture_window(self, meter_px: tuple[float, float],
+                        aperture_px: Optional[float] = None) -> tuple[int, int, int, int]:
+        """The smallest ``(y0, y1, x0, x1)`` of the reduced-res grid holding the whole meter disc.
+
+        A pixel is in the disc when its CENTRE is, so row ``yy`` is reachable only while
+        ``|yy + 0.5 − my| <= r``, i.e. ``ceil(my − r − 0.5) <= yy <= floor(my + r − 0.5)`` — the
+        bounds below, exactly. The rectangle they give is a superset of the disc (its corners are
+        not in it), so :meth:`aperture_mask` still does the selection; it is only the box outside
+        which there is provably nothing to select. Clipped to the frame, and empty (``y0 == y1``)
+        for a disc that misses it — which is what :meth:`meter_img` needs to keep returning NaN
+        there rather than a value."""
+        r, mx, my = self._aperture(meter_px, aperture_px)
+        y0 = int(np.clip(np.ceil(my - r - 0.5), 0, self.h)); y1 = int(np.clip(np.floor(my + r - 0.5) + 1, y0, self.h))
+        x0 = int(np.clip(np.ceil(mx - r - 0.5), 0, self.w)); x1 = int(np.clip(np.floor(mx + r - 0.5) + 1, x0, self.w))
+        return y0, y1, x0, x1
+
+    def aperture_mask(self, meter_px: tuple[float, float], aperture_px: Optional[float] = None,
+                      window: Optional[tuple[int, int, int, int]] = None) -> np.ndarray:
+        """The disc the meter averages, over the whole frame or over ``window``."""
+        r, mx, my = self._aperture(meter_px, aperture_px)
+        y0, y1, x0, x1 = (0, self.h, 0, self.w) if window is None else window
+        yy, xx = np.mgrid[y0:y1, x0:x1]
         return ((xx + 0.5 - mx) ** 2 + (yy + 0.5 - my) ** 2) <= r * r
 
     def meter_img(self, img: np.ndarray, meter_px: tuple[float, float],
                   aperture_px: Optional[float] = None) -> np.ndarray:
-        out = self.forward_img(img)
-        r = (aperture_px if aperture_px is not None else self.p.aperture_px) / self.p.scale
-        mx, my = meter_px[0] / self.p.scale, meter_px[1] / self.p.scale
-        yy, xx = np.mgrid[0:self.h, 0:self.w]
-        mask = ((xx + 0.5 - mx) ** 2 + (yy + 0.5 - my) ** 2) <= r * r
+        win = self.aperture_window(meter_px, aperture_px)
+        out = self.forward_img(img, window=win)
+        mask = self.aperture_mask(meter_px, aperture_px, window=win)
         return out["y"][:, mask].mean(axis=1)
 
     def meter_y(self, shapes, meter_px, aperture_px=None) -> float:
@@ -772,6 +817,22 @@ class FaldModel:
 
 
 _SPEC_CACHE_MAX = 4            # a forward pass needs two (B_true's kernel and B_est's); the rest is slack
+
+
+def _window_indices(window: Optional[tuple[int, int, int, int]], h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
+    """The (row, column) pixel indices a ``window`` = (y0, y1, x0, x1) selects; the whole grid for None."""
+    if window is None:
+        return np.arange(h), np.arange(w)
+    y0, y1, x0, x1 = window
+    return np.arange(y0, y1), np.arange(x0, x1)
+
+
+def _crop(a: np.ndarray, window: Optional[tuple[int, int, int, int]]) -> np.ndarray:
+    """``a``'s last two axes restricted to ``window``; ``a`` itself for None."""
+    if window is None:
+        return a
+    y0, y1, x0, x1 = window
+    return a[..., y0:y1, x0:x1]
 
 
 def _spectra_conv(a: np.ndarray, spec) -> np.ndarray:

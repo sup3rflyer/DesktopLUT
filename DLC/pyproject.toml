@@ -62,11 +62,13 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 # Defaults baked in so every bare `python -m pytest` is fast + clean here:
 #   -p no:cacheprovider  → .pytest_cache is permission-blocked on this box.
-#   -n auto              → fan the 1523 tests across cores (xdist = the physical core count,
-#                          16 on this box). Measured 2026-09-20: -n 12 / 16 / 24 are within
-#                          noise of each other (250 / 255 / 281 s), because the run is bound by
-#                          its LONGEST TEST (~205 s), not by total CPU (~2000 s) — so more
-#                          workers buy nothing and only add memory-bandwidth contention.
+#   -n auto              → fan the tests across cores (xdist = the physical core count, 16 on
+#                          this box). Measured 2026-09-20: -n 12 / 16 / 24 were within noise of
+#                          each other (250 / 255 / 281 s), because the run was bound by its
+#                          LONGEST TEST (~205 s), not by total CPU (~2000 s). The 2026-09-21 FALD
+#                          model change cut both (longest ~120 s, CPU ~-40 %), so the worker count
+#                          should matter MORE now than that sweep suggests — it has not been
+#                          re-swept on the 16-worker box.
 #   --dist worksteal     → an idle worker steals queued tests from a busy one instead of
 #                          waiting for its own pre-assigned chunk. With the heavy-test spread
 #                          in tests/conftest.py it is worth ~5 % (mean 247 s over 4 runs vs
