@@ -692,7 +692,7 @@ void CreateGUILayout(HWND hwnd) {
     // profiling pass (python -m dlc.stages.fald_profile / dlc.fald.export) and is mode-specific (an
     // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
-    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental, overlay only)", WS_CHILD | BS_GROUPBOX,
+    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental)", WS_CHILD | BS_GROUPBOX,
         innerX, innerY, groupW, 207, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 

@@ -308,7 +308,7 @@ static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
     SaveSettings();
     UpdateGUIState();
     if (enabledNow && g_dwmHookMode.load())
-        SetStatus(L"FALD compensation runs in overlay mode only (DWM hook mode is on)");
+        SetStatus(L"FALD in DWM hook mode: stateless core only (LED lag, starfield, glow fill are overlay-only)");
 }
 
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
@@ -425,11 +425,13 @@ void UpdateColorCorrectionControls() {
     }
     if (GetFocus() != g_gui.hwndFaldGlowReach)
         SetWindowText(g_gui.hwndFaldGlowReach, std::to_wstring(shown.glow.reach).c_str());
-    // The layer runs in the overlay path only: in DWM hook mode the checkboxes are inert, so grey them out.
-    EnableWindow(g_gui.hwndFaldEnable, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldSdrEnable, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldDebug, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldPedMode, !g_dwmHookMode.load());
+    // DWM hook mode runs the layer's stateless core (dwm_hook/hook_fald.cpp): enable, view and pedestal ride
+    // DwmHookSharedConfig::faldFlags. The temporal modes, starfield and glow fill are overlay-path only, so
+    // those controls are inert in hook mode and greyed out.
+    EnableWindow(g_gui.hwndFaldEnable, TRUE);
+    EnableWindow(g_gui.hwndFaldSdrEnable, TRUE);
+    EnableWindow(g_gui.hwndFaldDebug, TRUE);
+    EnableWindow(g_gui.hwndFaldPedMode, TRUE);
     EnableWindow(g_gui.hwndFaldTemporal, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldTauRise, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldTauFall, !g_dwmHookMode.load());
