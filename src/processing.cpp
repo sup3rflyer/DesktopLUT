@@ -1019,7 +1019,18 @@ void StartProcessing() {
             std::wstring err = InjectDwmHook(dwmMonitors);
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
-                SetStatus(err.c_str());
+                // Status bar can only show a single short line — surface the full,
+                // actionable detail (e.g. the DwmHook.dll-missing guidance) in a dialog.
+                // Unowned, on its own thread: a pipe-driven start (layers.set / runtime.*)
+                // marshals to the GUI thread via WM_CALIB_CMD, and a modal box on that
+                // thread would block the caller for the full 60s timeout and leave a dialog
+                // nobody is there to click during an unattended calibration run.
+                std::wstring firstLine = err.substr(0, err.find(L'\n'));
+                SetStatus(firstLine.c_str());
+                std::thread([msg = err]() {
+                    MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
+                                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+                }).detach();
                 return;
             }
         }
@@ -1104,6 +1115,7 @@ void StartProcessing() {
 
         // Start DWM hook watchdog timer (detects DWM restart / hook loss)
         g_dwmHookWatchdogRetries = 0;
+        g_dwmHookReinjectCount = 0;
         if (g_gui.hwndMain)
             SetTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID, DWM_HOOK_WATCHDOG_INTERVAL_MS, nullptr);
 
