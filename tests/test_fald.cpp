@@ -1509,6 +1509,11 @@ TEST_CASE("FALD temporal run plan: routing, delay ring, resets, panel clock, set
     CHECK(r.trueMap == FALD_MAP_DRIVE); CHECK(r.estMap == FALD_MAP_DRIVE); CHECK(r.debugFiltMap == FALD_MAP_DRIVE);
     FaldTemporalEndRun(&s, r, ts, true);
     CHECK(s.settleLeft == 0u); CHECK_FALSE(FaldTemporalSettlePending(&s));
+    // mode 3 with no usable refresh period runs as off (else the settle hold, paid per elapsed refresh, never ends)
+    t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 0.0f);
+    CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.panel);
+    FaldTemporalEndRun(&s, r, ts, true);
+    CHECK(s.settleLeft == 0u);
     // mode 3 with them: a seeding run, then one refresh later the clock maps
     t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 16.6667f);
     CHECK(r.panel); CHECK(r.clock.seedStates); CHECK_FALSE(r.clock.bindMaps); CHECK(r.trueMap == FALD_MAP_DRIVE);

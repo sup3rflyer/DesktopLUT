@@ -482,6 +482,21 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top)
 	}
 }
 
+// A present of this overlay context went past RenderLUT (protected content, an unreadable swap chain / back buffer, the
+// diagnostic no-draw level): its dirty rects never reached the FALD layer's clean copy, so that copy is stale. Marks the
+// context's own monitor when its position is known (the 25H2 routing cache, or the pre-25H2 clip box); an unresolved
+// 25H2 context marks every monitor (a wrong guess would leave a stale copy in use — the costlier mistake).
+void FaldMarkContextStale(void* context)
+{
+	int left = 0, top = 0;
+	if (isWindows11_25h2) {
+		if (!LookupContextPosition(context, left, top)) { FaldMarkAllStale(); return; }
+	} else {
+		GetMonitorPositionFromContext(context, left, top);
+	}
+	FaldMarkStale(left, top);
+}
+
 // Draw `rect` of the back buffer from a source texture of texW x texH (UVs are rect / tex size).
 static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
 {
@@ -1015,6 +1030,12 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		}
 		FaldPollDumpRequest();   // heavily throttled inside; arms a one-shot field dump
 	}
+	else if (index != -1 && FaldShadersReady())
+	{
+		// A non-FP16 present of this position (legacy SDR after an ACM/HDR switch): the layer never runs on it, and
+		// the FALD entries' copies / LED-lag state are void from here on.
+		FaldMarkStale(monLeft, monTop);
+	}
 	const bool faldOn = (faldMon != NULL);
 
 	// Skip if no LUT AND no tonemap AND no FALD — nothing to render
@@ -1253,12 +1274,19 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			// The passes write the back buffer themselves. If any step refuses, the intermediate
 			// still holds the frame that should have been shown, so copy it out rather than leave
 			// the back buffer with whatever it held before.
-			// New content = any dirty rect outside the top-left kick zone: the host's settle kick (a 1 px window there,
-			// dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT) must not re-arm the LED-lag hold it exists to finish.
-			bool newContent = (numRects <= 0);
-			for (int i = 0; i < numRects && !newContent; i++)
-				if (rects[i].right > DWM_HOOK_FALD_KICK_ZONE_PX || rects[i].bottom > DWM_HOOK_FALD_KICK_ZONE_PX)
-					newContent = true;
+			// New content = any dirty rect outside the four corner kick zones: the host's settle kick (a 1 px window at
+			// the monitor's top-left, dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT_FMT) must not re-arm the LED-lag hold
+			// it exists to finish. Every corner, because a rotated display's back buffer may not start at that pixel.
+			// No rects = nothing changed = no new content.
+			const LONG kz = DWM_HOOK_FALD_KICK_ZONE_PX;
+			const LONG bw = (LONG)backBufferDesc.Width, bh = (LONG)backBufferDesc.Height;
+			bool newContent = false;
+			for (int i = 0; i < numRects && !newContent; i++) {
+				const RECT& rc = rects[i];
+				const bool inLeft = rc.right <= kz, inRight = rc.left >= bw - kz;
+				const bool inTop = rc.bottom <= kz, inBottom = rc.top >= bh - kz;
+				if (!((inLeft || inRight) && (inTop || inBottom))) newContent = true;
+			}
 			if (!FaldRun(faldMon, renderTargetView, newContent))
 			{
 				deviceContext->CopyResource((ID3D11Resource*)backBuffer,

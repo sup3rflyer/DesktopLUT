@@ -130,13 +130,23 @@ static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FA
 // defaults. The tail is written inside the SAME seqlock as the head (the head's `version`), so a
 // reader copies head + tail in one consistent snapshot. `magic` + `layoutVersion` + `tuningBytes`
 // let a reader reject a tail it does not understand instead of misreading it.
-// LED-lag settle hold in hook mode. DWM presents nothing on a static desktop, but the temporal state keeps moving
-// for a few refreshes after the last content change. While a monitor still owes settle frames the DLL signals this
-// auto-reset event on every run; the host then keeps DWM composing that monitor by re-painting a 1 x 1 px,
-// click-through window at the monitor's top-left pixel each refresh, until the signals stop. The DLL does not count
-// a present whose dirty rects all lie inside the top-left KICK_ZONE box as new content (it would re-arm the hold
-// forever); the box is larger than the pixel in case DWM pads a dirty rect.
-#define DWM_HOOK_FALD_SETTLE_EVENT  L"Global\\DesktopLUT_DwmHook_FaldSettle"
+// Host <-> DLL signalling for the FALD layer in hook mode. Auto-reset events in the SESSION namespace (Local\: dwm.exe
+// and the host share the user's session; another session's dwm.exe cannot cross-signal), created by the host, opened by
+// the DLL (open retried rarely, never per frame), signalled with SetEvent only (no wait in the present path).
+//
+// LED-lag settle hold. DWM presents nothing on a static desktop, but the temporal state keeps moving for a few
+// refreshes after the last content change. Per monitor (named by its desktop left/top):
+//   SETTLE  — signalled on every run while that monitor still owes settle frames;
+//   CONTENT — signalled on every run that carried new content (content is flowing: DWM is presenting anyway).
+// The host kicks a monitor — re-paints a 1 x 1 px click-through window at its top-left pixel once per composition —
+// only while it owes settle frames AND no content arrived since the last composition, and stops once SETTLE has been
+// quiet for a while. The DLL does not count a present whose dirty rects all lie inside a KICK_ZONE box at any corner
+// as new content (the kick must not re-arm the hold it exists to finish; any corner: a rotated back buffer).
+#define DWM_HOOK_FALD_SETTLE_EVENT_FMT  L"Local\\DesktopLUT_DwmHook_FaldSettle_%d_%d"
+#define DWM_HOOK_FALD_CONTENT_EVENT_FMT L"Local\\DesktopLUT_DwmHook_FaldContent_%d_%d"
+// PRIME — the DLL asks for one full-screen recomposition: an enabled FALD monitor whose clean copy is not (or no
+// longer) primed. Throttled on both sides (at most ~1 per second).
+#define DWM_HOOK_FALD_PRIME_EVENT       L"Local\\DesktopLUT_DwmHook_FaldPrime"
 #define DWM_HOOK_FALD_KICK_PX       1
 #define DWM_HOOK_FALD_KICK_ZONE_PX  16
 

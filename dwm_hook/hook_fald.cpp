@@ -1,13 +1,10 @@
 // DesktopLUT DWM Hook - hook_fald.cpp
-// The FALD correction's stateless core, inside dwm.exe. See hook_fald.h for the phase-one scope and
-// why the excluded pieces are excluded.
+// The FALD correction inside dwm.exe: the whole layer the overlay path runs — the core, starfield with its glow-fill
+// part, and LED lag (the temporal drive state, bookkeeping shared with the overlay in shared/fald_temporal.cpp).
 //
-// This file deliberately mirrors src/fald.cpp pass for pass and constant-buffer word for word. Where
-// a word belongs to a feature this path does not run (starfield, glow fill, the temporal modes), it
-// is written with the same value src/fald.cpp writes when that feature is off, so the two paths'
-// constant buffers agree and the shader — which is literally the same HLSL, out of
-// shared/fald_shader.h — cannot tell which host dispatched it. That is what makes the bit-for-bit
-// comparison in FaldPollDumpRequest meaningful.
+// This file deliberately mirrors src/fald.cpp pass for pass and constant-buffer word for word, running the same HLSL
+// (shared/fald_shader.h), so for the same input frame the two paths must produce the same output — the acceptance
+// gate, checked with the one-shot field dump (FaldPollDumpRequest) against the overlay and dlc/fald/gpuemu.py.
 #include "pch.h"
 #include "hook_fald.h"
 #include "hook_log.h"
@@ -17,6 +14,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 // ---------------------------------------------------------------------------------------------
@@ -47,9 +45,11 @@ static ID3D11ComputeShader* g_glowBandCS = nullptr;     // G4: count-threshold b
 static ID3D11ComputeShader* g_temporalCS = nullptr;     // LED lag pass 1b: first-order drive state (modes 1 / 2)
 static ID3D11ComputeShader* g_clockCS = nullptr;        // LED lag pass 1c: the two parity clocks (mode 3)
 static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
-static HANDLE g_settleEvent = NULL;                     // DWM_HOOK_FALD_SETTLE_EVENT (the host creates it)
+// (the settle / content events are per monitor: FaldMonitor::settleEvt / contentEvt)
 static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS; }
 static void CompileFeatureShaders();   // below FaldReleaseShaders
+static void FaldUnbindAll();          // with FaldRun
+static void CoverReset(FaldMonitor* m);   // with FaldUpdateClean
 
 // GPU timing (timestamp queries, read back without flushing a few frames later — never a stall in
 // the present path). Three stamps per run: start, after the starfield passes, end of the pixel pass.
@@ -62,6 +62,11 @@ static unsigned int g_tsHead = 0;
 // src/fald.h FALD_GLOW_REACH_MAX, which is ALSO the HLSL's constant of that name (shared/fald_shader.h):
 // it sizes the glow dilation texture's margin, so the two must agree.
 static const unsigned int HOOK_GLOW_REACH_MAX = 4u;
+
+static const unsigned int HOOK_FALD_COVER_TILE = 32u;       // priming coverage granularity (px)
+static const unsigned int HOOK_FALD_RELEASE_AFTER = 600u;   // presents off before an entry frees its GPU memory
+static HANDLE g_primeEvent = NULL;                          // DWM_HOOK_FALD_PRIME_EVENT (the host creates it)
+static long long g_primeLastQpc = 0;                        // the last prime request (throttle)
 
 // t0..t24, as the HLSL declares them (HOOK_FALD_SRV_SLOTS). The pixel pass and every compute pass
 // bind the whole range so a slot left over from a previous pass cannot be read by accident.
@@ -147,7 +152,7 @@ template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p 
 
 static void ReleaseFeatureShaders() {
     SafeRelease(g_clockCS); SafeRelease(g_temporalCS);
-    if (g_settleEvent) { CloseHandle(g_settleEvent); g_settleEvent = NULL; }
+    if (g_primeEvent) { CloseHandle(g_primeEvent); g_primeEvent = NULL; }
     SafeRelease(g_glowBandCS); SafeRelease(g_glowEnvCS); SafeRelease(g_glowErodeCS);
     SafeRelease(g_glowDilateCS); SafeRelease(g_glowZoneCS);
     SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
@@ -229,6 +234,7 @@ static const FaldPanelFile* FindPanelFile(int left, int top, bool isHdr) {
 }
 
 bool FaldHasPanelFile(int left, int top, bool isHdr) { return FindPanelFile(left, top, isHdr) != nullptr; }
+bool FaldHasAnyPanelFile() { return g_numPanelFiles > 0; }
 
 int FaldLoadPanelFiles(const char* lutFolder) {
     g_numPanelFiles = 0;
@@ -314,6 +320,14 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* cleanTex = nullptr;
     ID3D11ShaderResourceView* cleanSRV = nullptr;
     bool primed = false;
+    // Priming by COVERAGE, not by one full-frame rect: the copy is valid once every pixel has been refreshed from a
+    // composed rect since it went stale, whichever presents did it. Tracked on HOOK_FALD_COVER_TILE-px tiles (a tile
+    // counts only when one rect covers it completely — conservative). Allocated at build, never per frame.
+    std::vector<uint8_t> cover;
+    unsigned int coverCols = 0, coverRows = 0, coverLeft = 0;
+    unsigned int offPresents = 0;                         // consecutive presents this entry did not run (VRAM release)
+    HANDLE settleEvt = NULL, contentEvt = NULL;           // DWM_HOOK_FALD_SETTLE / CONTENT events of this position
+    unsigned int evtOpenTick = 0;                         // open retried every ~120 runs while the host has none
 
     // panel tables
     ID3D11Texture2D* curveTex = nullptr;  ID3D11ShaderResourceView* curveSRV = nullptr;
@@ -422,6 +436,7 @@ static void ReleaseTemporal(FaldMonitor* m) {
     for (unsigned int i = 0; i < FALD_DELAY_MAX; i++) { SafeRelease(m->delaySRV[i]); SafeRelease(m->delayUAV[i]); SafeRelease(m->delayTex[i]); }
     // the textures are gone: so is the state (src/fald.cpp ReleaseResources does the same on a rebuild)
     m->stateValid = false; m->settleLeft = 0; m->temporalMode = FALD_TEMPORAL_OFF; m->delayCount = 0;
+    m->delayHead = 0; m->delayFrames = 0;   // as the overlay's rebuild (dump slots line up)
 }
 
 static void ReleaseStar(FaldMonitor* m) {
@@ -478,6 +493,8 @@ void FaldReleaseAll() {
     for (int i = 0; i < g_numMonitors; i++) {
         if (!g_monitors[i]) continue;
         ReleaseMonitor(g_monitors[i]);
+        if (g_monitors[i]->settleEvt) CloseHandle(g_monitors[i]->settleEvt);
+        if (g_monitors[i]->contentEvt) CloseHandle(g_monitors[i]->contentEvt);
         delete g_monitors[i];
         g_monitors[i] = nullptr;
     }
@@ -577,11 +594,11 @@ static bool EnsureClock(FaldMonitor* m) {
 static void ResolveFeatures(FaldMonitor* m) {
     const bool wasStar = m->starOn, wasGlow = m->glowOn;
     if (m->starWanted) m->starOn = EnsureStar(m);
-    else if (m->starStatTex || m->starOn) ReleaseStar(m);
+    else { if (m->starStatTex || m->starOn) ReleaseStar(m); m->starFailed = false; }   // off: the next enable retries
     // glow: only with starfield (the merged feature), only on PQ panel files (HDR measurements)
     const bool glowWanted = m->glowWanted && m->starOn && m->params.transfer == FALD_TRANSFER_PQ;
     if (glowWanted) m->glowOn = EnsureGlow(m);
-    else if (m->glowVTex || m->glowOn) ReleaseGlow(m);
+    else { if (m->glowVTex || m->glowOn) ReleaseGlow(m); m->glowFailed = false; }
     m->glowBand = m->glowOn && m->params.hasBoost && m->params.boostRule == FALD_BOOST_RULE_MEAN;
     if (m->starOn != wasStar || m->glowOn != wasGlow)
         LogF("FALD: pos(%d,%d) %s starfield %s, glow fill %s%s", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)",
@@ -619,7 +636,10 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
             FAILED(g_dev->CreateShaderResourceView(m->cleanTex, nullptr, &m->cleanSRV))) {
             log_to_file("FALD: clean source texture creation failed"); return false;
         }
-        m->primed = false;
+        m->coverCols = (m->width + HOOK_FALD_COVER_TILE - 1) / HOOK_FALD_COVER_TILE;
+        m->coverRows = (m->height + HOOK_FALD_COVER_TILE - 1) / HOOK_FALD_COVER_TILE;
+        m->cover.assign((size_t)m->coverCols * m->coverRows, (uint8_t)0);
+        CoverReset(m);
     }
     // curve LUT (curveN x 1, R32F)
     {
@@ -668,6 +688,7 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
 
     m->valid = true;
     ComputeFlatResponse(m);
+    FaldUnbindAll();   // the flat pass bound CS b0 / s0; a build can end the present without FaldRun (unprimed)
     LogF("FALD: monitor pos(%d,%d) %s ready: %ux%u cells of %ux%u px, sub %u, white %.1f nits, transfer %s, boost %s",
          m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", p.cols, p.rows, p.cellW, p.cellH, p.sub, p.white,
          p.transfer == FALD_TRANSFER_GAMMA ? "gamma" : "PQ", p.hasBoost ? "yes" : "none");
@@ -683,9 +704,20 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
         FaldMonitor* e = g_monitors[i];
         if (e && e->left == left && e->top == top && e->isHdr == isHdr) { m = e; break; }
     }
+    // The same position's entry for the OTHER mode never sees this mode's presents: its copy and LED-lag state are
+    // void, and holding its two full-size frame textures across an HDR <-> SDR switch only costs VRAM. Free it; a
+    // switch back rebuilds it fresh (the overlay resets its state on a mode switch too).
+    for (int i = 0; i < g_numMonitors; i++) {
+        FaldMonitor* e = g_monitors[i];
+        if (e && e != m && e->left == left && e->top == top && e->isHdr != isHdr && e->valid) {
+            ReleaseMonitor(e);
+            CoverReset(e);
+        }
+    }
     if (m && m->width == width && m->height == height && m->format == format) {
         if (m->failed) return nullptr;
-        return m->valid ? m : nullptr;
+        if (m->valid) return m;
+        // released (layer off for a while, or a mode switch): rebuild below
     }
 
     const FaldPanelFile* pf = FindPanelFile(left, top, isHdr);
@@ -717,14 +749,29 @@ ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m) { return m ? m->interTe
 ID3D11Texture2D* FaldCleanTexture(FaldMonitor* m) { return m ? m->cleanTex : nullptr; }
 ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m) { return m ? m->cleanSRV : nullptr; }
 
+// The clean copy went stale (created, or a present of this monitor the layer did not see): every tile owes a refresh.
+static void CoverReset(FaldMonitor* m) {
+    m->primed = false;
+    if (!m->cover.empty()) std::fill(m->cover.begin(), m->cover.end(), (uint8_t)0);
+    m->coverLeft = m->coverCols * m->coverRows;
+}
+
+// Ask the host for one full-screen recomposition (DWM_HOOK_FALD_PRIME_EVENT): an enabled monitor is waiting for its
+// clean copy. At most once a second across all monitors; the event is opened lazily.
+static void RequestPrime() {
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+    if (g_primeLastQpc != 0 && f.QuadPart > 0 && (now.QuadPart - g_primeLastQpc) < f.QuadPart) return;
+    g_primeLastQpc = now.QuadPart;
+    if (!g_primeEvent) g_primeEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, DWM_HOOK_FALD_PRIME_EVENT);
+    if (g_primeEvent) SetEvent(g_primeEvent);
+}
+
 bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* rects, int numRects) {
     if (!m || !m->valid || !m->cleanTex || !backBuffer || !g_ctx) return false;
-    // The same monitor's entry for the OTHER mode does not see these rects: it has to re-prime.
-    for (int i = 0; i < g_numMonitors; i++) {
-        FaldMonitor* e = g_monitors[i];
-        if (e && e != m && e->left == m->left && e->top == m->top) e->primed = false;
-    }
+    m->offPresents = 0;
     const LONG w = (LONG)m->width, h = (LONG)m->height;
+    const LONG T = (LONG)HOOK_FALD_COVER_TILE;
     for (int i = 0; i < numRects; i++) {
         const LONG l = rects[i].left > 0 ? rects[i].left : 0;
         const LONG t = rects[i].top > 0 ? rects[i].top : 0;
@@ -733,24 +780,52 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
         if (r <= l || b <= t) continue;
         D3D11_BOX box = { (UINT)l, (UINT)t, 0, (UINT)r, (UINT)b, 1 };
         g_ctx->CopySubresourceRegion(m->cleanTex, 0, (UINT)l, (UINT)t, 0, backBuffer, 0, &box);
-        if (!m->primed && l == 0 && t == 0 && r == w && b == h) {
-            m->primed = true;
-            LogF("FALD: pos(%d,%d) %s clean source primed by a full-frame composition",
-                 m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)");
-        }
+        if (m->primed || m->coverLeft == 0) continue;
+        // tiles this rect covers COMPLETELY (a tile clipped by the frame edge counts up to the edge)
+        const LONG tx0 = (l + T - 1) / T, ty0 = (t + T - 1) / T;
+        const LONG tx1 = (r == w) ? (LONG)m->coverCols : r / T;
+        const LONG ty1 = (b == h) ? (LONG)m->coverRows : b / T;
+        for (LONG ty = ty0; ty < ty1; ty++)
+            for (LONG tx = tx0; tx < tx1; tx++) {
+                uint8_t& c = m->cover[(size_t)ty * m->coverCols + (size_t)tx];
+                if (!c) { c = 1; m->coverLeft--; }
+            }
     }
-    if (!m->primed) FaldTemporalIdle(m);   // the layer does not run this present (src FaldLayerIdle)
+    if (!m->primed && m->coverLeft == 0) {
+        m->primed = true;
+        LogF("FALD: pos(%d,%d) %s clean source primed (every pixel refreshed since it went stale)",
+             m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)");
+    }
+    if (!m->primed) {
+        FaldTemporalIdle(m);   // the layer does not run this present (src FaldLayerIdle)
+        RequestPrime();        // the host recomposes the screen; nothing else would on a static desktop
+    }
     return m->primed;
+}
+
+// The layer did not run for this present of the monitor: its copy misses this present's rects, the LED-lag state is
+// void (src FaldLayerIdle). After HOOK_FALD_RELEASE_AFTER such presents in a row the entry gives its GPU memory back
+// (two full-size frame textures + fields); the next FaldAcquire rebuilds it.
+static void MarkEntryStale(FaldMonitor* e) {
+    CoverReset(e);
+    FaldTemporalIdle(e);
+    if (e->valid && ++e->offPresents > HOOK_FALD_RELEASE_AFTER) {
+        ReleaseMonitor(e);   // valid = false, failed stays false: rebuilt on demand
+        e->offPresents = 0;
+        LogF("FALD: pos(%d,%d) %s layer off for a while - GPU memory released", e->left, e->top, e->isHdr ? "HDR" : "SDR(ACM)");
+    }
 }
 
 void FaldMarkStale(int left, int top) {
     for (int i = 0; i < g_numMonitors; i++) {
         FaldMonitor* e = g_monitors[i];
-        if (e && e->left == left && e->top == top) {
-            e->primed = false;
-            FaldTemporalIdle(e);   // the layer did not run: LED-lag state, hold and ring are void (src FaldLayerIdle)
-        }
+        if (e && e->left == left && e->top == top) MarkEntryStale(e);
     }
+}
+
+void FaldMarkAllStale() {
+    for (int i = 0; i < g_numMonitors; i++)
+        if (g_monitors[i]) MarkEntryStale(g_monitors[i]);
 }
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star, bool glow,
@@ -1099,7 +1174,8 @@ void FaldPollDumpRequest() {
     // synchronous-IO-in-the-present-path mistake recorded in HANDOFF_HAGS_FLIPQUEUE_2026-09-06.md.
     // ~5 s between probes at 60 Hz, which is fast enough for a human arming a dump by hand.
     static unsigned int tick = 0;
-    if ((tick++ % 300u) != 0u) return;
+    static bool disabled = false;                   // a trigger DWM cannot consume: stop probing for this attach
+    if (disabled || (tick++ % 300u) != 0u) return;
     const char* trigger = FaldDumpTriggerPath();
     if (GetFileAttributesA(trigger) == INVALID_FILE_ATTRIBUTES) return;
     char line[MAX_PATH] = {};
@@ -1108,7 +1184,11 @@ void FaldPollDumpRequest() {
         if (!fgets(line, sizeof(line), f)) line[0] = '\0';
         fclose(f);
     }
-    DeleteFileA(trigger);                           // consume it whatever happens next
+    if (!DeleteFileA(trigger)) {                    // consume it whatever happens next — or never look again: an
+        disabled = true;                            // unreadable / undeletable file would be re-probed forever
+        LogF("FALD: dump trigger %s cannot be consumed by DWM (grant it Everyone:(F)) - dump polling off", trigger);
+        return;
+    }
     for (char* q = line; *q; q++) if (*q == '\r' || *q == '\n') { *q = '\0'; break; }
     if (line[0] == '\0') return;
     wchar_t dirW[MAX_PATH] = {};
@@ -1138,9 +1218,9 @@ static void DumpTexture(ID3D11Texture2D* tex, const std::wstring& file, UINT w, 
     st->Release();
 }
 
-// The stateless subset of the overlay's runtime.fald_dump, same file names and layouts so the two
-// are diffed directly (and both against dlc/fald/gpuemu.py). The temporal, starfield and glow files
-// the overlay can also write have no counterpart here — this path does not run those passes.
+// The overlay's runtime.fald_dump field files, same names and layouts so the two are diffed directly (and both
+// against dlc/fald/gpuemu.py). The run's LED-lag bookkeeping goes to fald_hook_temporal.txt with the overlay's key
+// names (the hook writes no fald_dump.txt: the rest of that text is host-side state).
 static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
     const FaldPanelParams& p = m->params;
     DumpTexture(m->driveTex, dir + L"fald_drive.f32", p.cols, p.rows, 4);
@@ -1151,7 +1231,7 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
     DumpTexture(m->gainBTex, dir + L"fald_gain_fine.f32", p.cols * p.sub, p.rows * p.sub, 4);
     if (p.hasBoost) {
         DumpTexture(m->activeTex[0], dir + L"fald_active_r0.f32", p.cols, p.rows, 4);
-        DumpTexture(m->activeTex[1], dir + L"fald_active_r1.f32", p.cols, p.rows, 4);
+        DumpTexture(m->activeTex[1], dir + L"fald_active.f32", p.cols, p.rows, 4);
         DumpTexture(m->boostTex[0], dir + L"fald_boost_r0.f32", 2, 1, 4);
         DumpTexture(m->boostTex[1], dir + L"fald_boost_r1.f32", 2, 1, 4);
     }
@@ -1172,14 +1252,33 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
     {
         FILE* f = _wfopen((dir + L"fald_hook_temporal.txt").c_str(), L"w");
         if (f) {
-            fprintf(f, "temporal_mode %u\nstate_valid %d\nalpha_rise %.9g\nalpha_fall %.9g\ndt_ms %.9g\ndelay_frames %u\n"
-                       "delay_count %u\nsettle_left %u\nclock_seed %d\nclock_elapsed_refreshes %llu\nclock_index %llu\n"
-                       "clock_time_ms %.9f\nclock_grid_ms %.9f\nclock_factor %.9g %.9g %.9g %.9g\nclock_weight %.9g %.9g\n"
-                       "clock_closure %.9g\nclock_parity %d\nrefresh_ms %.9g\n",
-                    m->temporalMode, m->stateValid ? 1 : 0, m->tempAlphaRise, m->tempAlphaFall, m->dtMs, m->delayFrames,
-                    m->delayCount, m->settleLeft, m->clkSeeded ? 1 : 0, m->clkElapsed, m->clkIndex, m->clkTimeMs, m->clkGridMs,
-                    m->clkFactor[0], m->clkFactor[1], m->clkFactor[2], m->clkFactor[3], m->clkW[0], m->clkW[1],
-                    m->clkClosure, m->clkParity, m->refreshMs);
+            // key names = the overlay's fald_dump.txt temporal / clock lines (DLC test_fald_paneltime_warp.py _meta)
+            fprintf(f, "temporal_mode %u\n"
+                       "state_valid %d\n"
+                       "tau_rise_ms %.9g\n"
+                       "tau_fall_ms %.9g\n"
+                       "delay_frames %u (ring %u)\n"
+                       "temp_alpha_rise %.9g\n"
+                       "temp_alpha_fall %.9g\n"
+                       "dt_ms %.9g\n"
+                       "settle_left %u (before this run's accounting)\n"
+                       "clock_seed %d\n"
+                       "clock_time_ms %.4f\n"
+                       "clock_grid_ms %.6f\n"
+                       "clock_lock_residual %.6f\n"
+                       "clock_lock_gain %.6f\n"
+                       "clock_refresh_ms %.6f\n"
+                       "clock_refresh_index %llu\n"
+                       "clock_elapsed_refreshes %llu\n"
+                       "clock_factors %.9g %.9g %.9g %.9g\n"
+                       "clock_weights %.9g %.9g\n"
+                       "clock_closure %.9g\n"
+                       "clock_parity %d\n",
+                    m->temporalMode, m->stateValid ? 1 : 0, m->tempSettings.tauRiseMs, m->tempSettings.tauFallMs,
+                    m->delayFrames, m->delayCount, m->tempAlphaRise, m->tempAlphaFall, m->dtMs, m->settleLeft,
+                    m->clkSeeded ? 1 : 0, m->clkTimeMs, m->clkGridMs, m->clkResidual, m->clkGain, m->refreshMs,
+                    m->clkIndex, m->clkElapsed, m->clkFactor[0], m->clkFactor[1], m->clkFactor[2], m->clkFactor[3],
+                    m->clkW[0], m->clkW[1], m->clkClosure, m->clkParity);
             fclose(f);
         }
     }
@@ -1404,11 +1503,24 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     // LED-lag settle hold: DWM presents nothing on a static desktop, so while this monitor still owes settle frames ask
     // the host to keep DWM composing it (dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT). One SetEvent per run while
     // pending — no wait, no I/O. The host creates the event; opening it is retried rarely, never per frame.
-    if (FaldTemporalSettlePending(m)) {
-        static unsigned int openTick = 0;
-        if (!g_settleEvent && (openTick++ % 120u) == 0u)
-            g_settleEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, DWM_HOOK_FALD_SETTLE_EVENT);
-        if (g_settleEvent) SetEvent(g_settleEvent);
+    // LED-lag settle hold (dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT_FMT): while this monitor owes settle frames
+    // ask the host to keep DWM composing it; CONTENT tells it content is flowing anyway (no kick needed then).
+    // SetEvent only — no wait, no I/O. Events are opened rarely (the host creates them), never per frame.
+    const bool pending = FaldTemporalSettlePending(m);
+    if (pending || newContent) {
+        if ((!m->settleEvt || !m->contentEvt) && (m->evtOpenTick++ % 120u) == 0u) {
+            wchar_t name[96];
+            if (!m->settleEvt) {
+                swprintf_s(name, DWM_HOOK_FALD_SETTLE_EVENT_FMT, m->left, m->top);
+                m->settleEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+            }
+            if (!m->contentEvt) {
+                swprintf_s(name, DWM_HOOK_FALD_CONTENT_EVENT_FMT, m->left, m->top);
+                m->contentEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+            }
+        }
+        if (newContent && m->contentEvt) SetEvent(m->contentEvt);
+        if (pending && m->settleEvt) SetEvent(m->settleEvt);
     }
 
     QueryPerformanceCounter(&t1);

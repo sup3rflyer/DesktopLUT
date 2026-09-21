@@ -1378,7 +1378,10 @@ static void FaldPropagate(int mon, bool isHDR) {
     FaldTrace("FaldPropagate: begin");
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(mon, isHDR);
-        if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
+        if (g_dwmHookMode.load()) {
+            UpdateDwmHookSharedConfig();
+            RequestFaldFullRecompose();   // on: prime the hook's clean copy now; off: clear the corrected pixels
+        }
         else DwmHookReevaluateOverlay();
     }
     FaldTrace("FaldPropagate: UpdateColorCorrectionControls");
@@ -1410,6 +1413,7 @@ void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) 
     }
     SaveSettings();
     FaldPropagate(mon, isHDR);
+    FaldPanelFileChangedReinject();   // hook mode: the DLL reads panel files only at injection
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("params_path", JStr(WideToUtf8(path)));
     result.set("transfer", JStr(known ? (transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq") : "unknown"));

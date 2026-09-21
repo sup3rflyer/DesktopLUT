@@ -879,23 +879,54 @@ static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
     }
 }
 
+#ifndef STATUS_GRAPHICS_PRESENT_OCCLUDED
+#define STATUS_GRAPHICS_PRESENT_OCCLUDED ((DWORD)0xC01E05A1)   // as framepacer.cpp
+#endif
 // ---------------------------------------------------------------------------
-// FALD LED-lag settle kicker (dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT)
+// FALD services for the hook (dwm_hook_config.h): the LED-lag settle kicker and priming requests
 // ---------------------------------------------------------------------------
-// The hook's LED-lag state keeps moving for a few refreshes after the last content change, but DWM presents nothing
-// on a static desktop, so the correction would freeze mid-transition. While a monitor owes settle frames the DLL signals
-// the event on every run; this thread then keeps DWM composing by re-painting a 1 x 1 px, click-through, topmost
-// layered window at every monitor's top-left pixel once per composition (alpha alternating 1/255 and 2/255 black:
-// UpdateLayeredWindow, no WM_PAINT involved), until four compositions pass without a signal. The DLL does not count a
-// present whose dirty rects sit inside that corner as new content. Topmost only while kicking; in hook mode nothing is
-// in independent flip anyway (DisableIndependentFlip), so there is no VRR path for it to disturb.
-static HANDLE g_faldSettleEvent = nullptr;
+// One thread, three jobs, all driven by auto-reset events the DLL inside dwm.exe signals (SetEvent only):
+//  * SETTLE (per monitor): the hook's LED-lag state still owes settle frames on that monitor. DWM presents nothing on a
+//    static desktop, so the thread keeps DWM composing THAT monitor: it re-paints a 1 x 1 px, click-through, topmost
+//    layered window at the monitor's top-left pixel once per composition (alpha alternating 1/255 and 2/255 black,
+//    UpdateLayeredWindow, no WM_PAINT), and hides it once SETTLE has been quiet for FALD_KICK_QUIET_MS.
+//  * CONTENT (per monitor): that monitor presented new content since the last composition — DWM is composing it
+//    anyway, so no kick that tick. (Between content frames — 24 fps video on a 144 Hz panel — the kick DOES run: the
+//    LED law advances every refresh; the overlay path re-runs its settle frames the same way.)
+//  * PRIME: an enabled FALD monitor's clean copy is not primed; the GUI thread shows the full-screen recompose window
+//    (RequestFaldFullRecompose, via WM_FALD_RECOMPOSE). Throttled here too.
+// The DLL does not count a present whose dirty rects sit in a corner kick zone as new content. Topmost only while
+// kicking; in hook mode nothing is in independent flip (DisableIndependentFlip), so no VRR path is disturbed. The
+// thread pumps its messages in every wait (hidden top-level windows still receive broadcasts). Pacing: the compositor
+// clock with the stop event in the same wait (Windows 11), else a short timed wait — never DwmFlush, which can block
+// through a DWM restart and outlive StopFaldSettleKicker's wait.
+static const ULONGLONG FALD_KICK_QUIET_MS = 100;      // SETTLE silent this long: that monitor's session is over
+static const ULONGLONG FALD_PRIME_MIN_GAP_MS = 1000;  // recompose requests at most this often
+static const ULONGLONG FALD_KICK_ENUM_MS = 2000;      // monitor list refresh (events must exist before the DLL opens them)
+
+struct FaldKickMonitor {
+    POINT origin = {};
+    HANDLE settle = nullptr, content = nullptr;
+    HWND wnd = nullptr;
+    ULONGLONG lastSettleMs = 0;
+    bool shown = false;
+};
+
+static HANDLE g_faldPrimeEvent = nullptr;
 static HANDLE g_faldKickStop = nullptr;
 static HANDLE g_faldKickThread = nullptr;
 
 static BOOL CALLBACK CollectMonitorOrigin(HMONITOR, HDC, LPRECT rc, LPARAM lp) {
     reinterpret_cast<std::vector<POINT>*>(lp)->push_back(POINT{ rc->left, rc->top });
     return TRUE;
+}
+
+static HANDLE CreateFaldEvent(const wchar_t* name) {
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);      // dwm.exe (Window Manager\DWM-n) opens it to SetEvent
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+    return CreateEventW(&sa, FALSE, FALSE, name);               // auto-reset, session namespace (Local\)
 }
 
 // bits = the 1 x 1 DIB section selected into memDC: premultiplied black at `alpha`, written before every update.
@@ -907,7 +938,17 @@ static void FaldKickPaint(HWND w, POINT at, BYTE alpha, HDC screenDC, HDC memDC,
     UpdateLayeredWindow(w, screenDC, &at, &sz, memDC, &src, 0, &bf, ULW_ALPHA);
 }
 
+static void PumpThreadMessages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+}
+
 static DWORD WINAPI FaldSettleKickThread(LPVOID) {
+    typedef DWORD (WINAPI *PFN_WaitCompClock)(UINT, const HANDLE*, DWORD);
+    PFN_WaitCompClock waitClock = nullptr;
+    if (HMODULE dcomp = LoadLibraryW(L"dcomp.dll"))
+        waitClock = (PFN_WaitCompClock)GetProcAddress(dcomp, "DCompositionWaitForCompositorClock");
+
     WNDCLASSW wc = {};
     wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -921,41 +962,104 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
     void* bits = nullptr;
     HBITMAP bmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ oldBmp = bmp ? SelectObject(memDC, bmp) : nullptr;
-    std::vector<HWND> wnds;
-    std::vector<POINT> origins;
-    HANDLE waits[2] = { g_faldKickStop, g_faldSettleEvent };
-    for (;;) {
-        const DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-        if (w != WAIT_OBJECT_0 + 1) break;                     // stop (or a failed wait)
-        // a session: one kick window per monitor, at its top-left pixel
-        origins.clear();
+
+    std::vector<FaldKickMonitor> mons;
+    ULONGLONG lastEnumMs = 0, lastPrimeMs = 0;
+    BYTE alpha = 1;
+    auto closeMon = [](FaldKickMonitor& m) {
+        if (m.wnd) DestroyWindow(m.wnd);
+        if (m.settle) CloseHandle(m.settle);
+        if (m.content) CloseHandle(m.content);
+        m = FaldKickMonitor();
+    };
+    // the monitor list: one SETTLE / CONTENT event pair + one kick window per monitor origin
+    auto refreshMonitors = [&]() {
+        std::vector<POINT> origins;
         EnumDisplayMonitors(nullptr, nullptr, CollectMonitorOrigin, reinterpret_cast<LPARAM>(&origins));
-        while (wnds.size() < origins.size()) {
-            HWND h = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                                     wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
-            if (!h) break;
-            wnds.push_back(h);
+        for (size_t i = 0; i < mons.size();) {
+            bool alive = false;
+            for (const POINT& o : origins) if (o.x == mons[i].origin.x && o.y == mons[i].origin.y) { alive = true; break; }
+            if (alive) { i++; continue; }
+            closeMon(mons[i]);
+            mons.erase(mons.begin() + (ptrdiff_t)i);
         }
-        const size_t n = origins.size() < wnds.size() ? origins.size() : wnds.size();
-        for (size_t i = 0; i < n; i++) {
-            FaldKickPaint(wnds[i], origins[i], 1, screenDC, memDC, (DWORD*)bits);
-            SetWindowPos(wnds[i], HWND_TOPMOST, origins[i].x, origins[i].y, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        for (const POINT& o : origins) {
+            bool known = false;
+            for (const FaldKickMonitor& m : mons) if (m.origin.x == o.x && m.origin.y == o.y) { known = true; break; }
+            if (known || mons.size() >= 60) continue;           // (60 + stop + prime stay inside MAXIMUM_WAIT_OBJECTS)
+            FaldKickMonitor m;
+            m.origin = o;
+            wchar_t name[96];
+            swprintf_s(name, DWM_HOOK_FALD_SETTLE_EVENT_FMT, (int)o.x, (int)o.y);
+            m.settle = CreateFaldEvent(name);
+            swprintf_s(name, DWM_HOOK_FALD_CONTENT_EVENT_FMT, (int)o.x, (int)o.y);
+            m.content = CreateFaldEvent(name);
+            m.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                    wc.lpszClassName, L"", WS_POPUP, o.x, o.y, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+            if (!m.settle || !m.content || !m.wnd) { closeMon(m); continue; }
+            mons.push_back(m);
         }
-        BYTE alpha = 1;
-        int quiet = 0;
-        const ULONGLONG deadline = GetTickCount64() + 60000;  // safety cap; the DLL's signals end a session long before
-        while (quiet < 4 && GetTickCount64() < deadline) {
-            if (WaitForSingleObject(g_faldKickStop, 0) == WAIT_OBJECT_0) break;
-            alpha = (BYTE)(3 - alpha);                          // 1 <-> 2: a change DWM has to compose
-            for (size_t i = 0; i < n; i++) FaldKickPaint(wnds[i], origins[i], alpha, screenDC, memDC, (DWORD*)bits);
-            if (FAILED(DwmFlush())) Sleep(8);                   // wait for the composition that carries it
-            if (WaitForSingleObject(g_faldSettleEvent, 0) == WAIT_OBJECT_0) quiet = 0; else quiet++;
-            MSG msg;
-            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+        lastEnumMs = GetTickCount64();
+    };
+    auto handlePrime = [&]() {
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastPrimeMs < FALD_PRIME_MIN_GAP_MS) return;
+        lastPrimeMs = now;
+        if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 0, 0);
+    };
+
+    refreshMonitors();
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastEnumMs > FALD_KICK_ENUM_MS) refreshMonitors();
+        bool active = false;
+        for (const FaldKickMonitor& m : mons) if (m.lastSettleMs && now - m.lastSettleMs < FALD_KICK_QUIET_MS) { active = true; break; }
+
+        if (!active) {
+            // idle: sleep on stop / prime / every SETTLE event, pumping messages; wake at least for the list refresh
+            HANDLE waits[MAXIMUM_WAIT_OBJECTS];
+            DWORD n = 0;
+            waits[n++] = g_faldKickStop;
+            waits[n++] = g_faldPrimeEvent;
+            for (const FaldKickMonitor& m : mons) waits[n++] = m.settle;
+            const DWORD w = MsgWaitForMultipleObjectsEx(n, waits, (DWORD)FALD_KICK_ENUM_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (w == WAIT_OBJECT_0) break;                                   // stop
+            if (w == WAIT_OBJECT_0 + 1) handlePrime();
+            else if (w >= WAIT_OBJECT_0 + 2 && w < WAIT_OBJECT_0 + n) mons[w - WAIT_OBJECT_0 - 2].lastSettleMs = GetTickCount64();
+            else if (w == WAIT_FAILED) Sleep(50);
+            PumpThreadMessages();
+            continue;
         }
-        for (size_t i = 0; i < n; i++) ShowWindow(wnds[i], SW_HIDE);
+
+        // kicking: one iteration per composition
+        if (waitClock) {
+            const DWORD w = waitClock(1, &g_faldKickStop, 100);
+            if (w == WAIT_OBJECT_0) break;                                   // stop
+            if (w == (DWORD)STATUS_GRAPHICS_PRESENT_OCCLUDED) Sleep(50);     // display off: nothing to compose
+        } else if (WaitForSingleObject(g_faldKickStop, 8) == WAIT_OBJECT_0) {
+            break;
+        }
+        if (WaitForSingleObject(g_faldPrimeEvent, 0) == WAIT_OBJECT_0) handlePrime();
+        const ULONGLONG t = GetTickCount64();
+        alpha = (BYTE)(3 - alpha);                                           // 1 <-> 2: a change DWM has to compose
+        for (FaldKickMonitor& m : mons) {
+            if (WaitForSingleObject(m.settle, 0) == WAIT_OBJECT_0) m.lastSettleMs = t;
+            const bool contentArrived = (WaitForSingleObject(m.content, 0) == WAIT_OBJECT_0);
+            const bool settling = m.lastSettleMs && (t - m.lastSettleMs < FALD_KICK_QUIET_MS);
+            if (settling && !contentArrived) {
+                FaldKickPaint(m.wnd, m.origin, alpha, screenDC, memDC, (DWORD*)bits);
+                if (!m.shown) {
+                    SetWindowPos(m.wnd, HWND_TOPMOST, m.origin.x, m.origin.y, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    m.shown = true;
+                }
+            } else if (!settling && m.shown) {
+                ShowWindow(m.wnd, SW_HIDE);
+                m.shown = false;
+            }
+        }
+        PumpThreadMessages();
     }
-    for (HWND h : wnds) DestroyWindow(h);
+    for (FaldKickMonitor& m : mons) closeMon(m);
     if (oldBmp) SelectObject(memDC, oldBmp);
     if (bmp) DeleteObject(bmp);
     DeleteDC(memDC);
@@ -965,28 +1069,37 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
 
 static void StartFaldSettleKicker() {
     if (g_faldKickThread) return;
-    SECURITY_DESCRIPTOR sd;
-    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);      // dwm.exe (DWM-n) must open it for EVENT_MODIFY_STATE
-    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
-    g_faldSettleEvent = CreateEventW(&sa, FALSE, FALSE, DWM_HOOK_FALD_SETTLE_EVENT);   // auto-reset
-    g_faldKickStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_faldSettleEvent || !g_faldKickStop) {
-        std::wcerr << L"[DWM Hook] FALD settle event could not be created: LED lag cannot settle on a static desktop" << std::endl;
+    if (!g_faldPrimeEvent) g_faldPrimeEvent = CreateFaldEvent(DWM_HOOK_FALD_PRIME_EVENT);
+    if (!g_faldKickStop) g_faldKickStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_faldPrimeEvent || !g_faldKickStop) {
+        std::wcerr << L"[DWM Hook] FALD service events could not be created: LED lag cannot settle and priming is not"
+                      L" requested on a static desktop" << std::endl;
         return;
     }
+    ResetEvent(g_faldKickStop);
     g_faldKickThread = CreateThread(nullptr, 0, FaldSettleKickThread, nullptr, 0, nullptr);
+    if (!g_faldKickThread)
+        std::wcerr << L"[DWM Hook] FALD service thread could not be started: " << GetLastError() << std::endl;
 }
 
 static void StopFaldSettleKicker() {
-    if (g_faldKickThread) {
-        SetEvent(g_faldKickStop);
-        WaitForSingleObject(g_faldKickThread, 2000);
+    if (!g_faldKickThread) return;
+    SetEvent(g_faldKickStop);
+    // The thread only waits on the stop event (compositor clock / timed / message waits), so it exits within a frame.
+    // If it somehow does not, its handles stay open (leaked on purpose): closing them under a live thread would hand
+    // it recycled handle values.
+    if (WaitForSingleObject(g_faldKickThread, 5000) != WAIT_OBJECT_0) {
+        std::wcerr << L"[DWM Hook] FALD service thread did not stop in 5 s: its handles are left open" << std::endl;
         CloseHandle(g_faldKickThread);
         g_faldKickThread = nullptr;
+        g_faldKickStop = nullptr;
+        g_faldPrimeEvent = nullptr;
+        return;
     }
-    if (g_faldKickStop) { CloseHandle(g_faldKickStop); g_faldKickStop = nullptr; }
-    if (g_faldSettleEvent) { CloseHandle(g_faldSettleEvent); g_faldSettleEvent = nullptr; }
+    CloseHandle(g_faldKickThread);
+    g_faldKickThread = nullptr;
+    CloseHandle(g_faldKickStop); g_faldKickStop = nullptr;
+    CloseHandle(g_faldPrimeEvent); g_faldPrimeEvent = nullptr;
 }
 
 bool CreateDwmHookSharedMemory()

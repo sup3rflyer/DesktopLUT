@@ -77,6 +77,7 @@ struct MovableAtomic {
 #define WM_ANALYSIS_ONLY_EXITED  (WM_USER + 104)
 #define WM_SHOW_OSD              (WM_USER + 105)
 #define WM_DWMHOOK_INJECTED      (WM_USER + 106)  // DwmHook.dll loaded into dwm.exe: run an identity-beacon session
+#define WM_FALD_RECOMPOSE        (WM_USER + 107)  // hook FALD needs one full-screen recomposition (any thread -> GUI thread)
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_APPLY       2002
 #define ID_TRAY_STOP        2003

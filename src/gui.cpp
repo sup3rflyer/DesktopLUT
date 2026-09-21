@@ -279,6 +279,16 @@ static bool WarnFaldTransferMismatch(const std::wstring& path, bool isHDR) {
 
 void RequestFaldFullRecompose();   // below: forces one full DWM composition for the hook's FALD layer
 
+// A FALD panel file was set / changed / re-set. The DWM hook reads panel files ONLY at injection (they are staged
+// beside the .cube files), so in hook mode the change takes effect through a re-injection — the same Stop + Start a
+// .cube change uses. (The overlay path rebuilds from the path / reloadSeq by itself.) GUI thread.
+void FaldPanelFileChangedReinject() {
+    if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
+    StopProcessing();
+    StartProcessing();
+    SetStatus(L"FALD panel file changed: DWM hook re-injected to load it");
+}
+
 // View / pedestal changed: they are mirrored in both modes' settings, so push both, persist once.
 static void ApplyFaldSharedSettingChange() {
     const bool anyEnabled = FaldSlot(true).enabled || FaldSlot(false).enabled;
@@ -312,6 +322,11 @@ static int g_faldRecomposeStage = 0;   // 0 = idle/armed, 1 = window shown
 
 void RequestFaldFullRecompose() {
     if (!g_dwmHookMode.load() || !g_gui.hwndMain) return;
+    // SetTimer needs the window's own thread: from anywhere else (the pipe, the hook's prime requests) post it there.
+    if (GetWindowThreadProcessId(g_gui.hwndMain, nullptr) != GetCurrentThreadId()) {
+        PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 0, 0);
+        return;
+    }
     g_faldRecomposeStage = 0;
     // Short delay: the hook reads the new flags at the top of the next present; give the shared
     // config (and a re-injection's attach) a moment to land before the composition that primes.
@@ -479,9 +494,8 @@ void UpdateColorCorrectionControls() {
     }
     if (GetFocus() != g_gui.hwndFaldGlowReach)
         SetWindowText(g_gui.hwndFaldGlowReach, std::to_wstring(shown.glow.reach).c_str());
-    // DWM hook mode runs the layer's stateless core (dwm_hook/hook_fald.cpp): enable, view and pedestal ride
-    // DwmHookSharedConfig::faldFlags. The temporal modes, starfield and glow fill are overlay-path only, so
-    // those controls are inert in hook mode and greyed out.
+    // The whole layer runs in both paths (overlay: src/fald.cpp; DWM hook: dwm_hook/hook_fald.cpp), so every FALD
+    // control is live in either mode; only the glow-fill row depends on another switch (below).
     EnableWindow(g_gui.hwndFaldEnable, TRUE);
     EnableWindow(g_gui.hwndFaldSdrEnable, TRUE);
     EnableWindow(g_gui.hwndFaldDebug, TRUE);
@@ -502,10 +516,12 @@ void UpdateColorCorrectionControls() {
     EnableWindow(g_gui.hwndFaldStarStrength, TRUE);
     EnableWindow(g_gui.hwndFaldStarReach, TRUE);
     EnableWindow(g_gui.hwndFaldStarSigma, TRUE);
-    EnableWindow(g_gui.hwndFaldGlowEnable, shown.star.enabled);
-    EnableWindow(g_gui.hwndFaldGlowStrength, shown.star.enabled);
-    EnableWindow(g_gui.hwndFaldGlowReach, shown.star.enabled);
-    EnableWindow(g_gui.hwndFaldGlowCap, shown.star.enabled);
+    // The glow checkbox is the HDR slot's switch (glow fill is HDR only), so the row follows HDR's Starfield — not the
+    // slot the monitor happens to show (the Starfield row sets both modes, but the pipe / INI can make them differ).
+    EnableWindow(g_gui.hwndFaldGlowEnable, hdrCC.fald.star.enabled);
+    EnableWindow(g_gui.hwndFaldGlowStrength, hdrCC.fald.star.enabled);
+    EnableWindow(g_gui.hwndFaldGlowReach, hdrCC.fald.star.enabled);
+    EnableWindow(g_gui.hwndFaldGlowCap, hdrCC.fald.star.enabled);
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1721,6 +1737,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     SetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path);
                     ApplyFaldSettingChange(enabledNow, isHDR);
+                    FaldPanelFileChangedReinject();   // hook mode: the DLL reads panel files only at injection
                 }
             }
             return 0;
@@ -1743,7 +1760,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (fald.paramsPath != path) { fald.paramsPath = path; changed = true; }
                         enabledNow = fald.enabled;
                     }
-                    if (changed) ApplyFaldSettingChange(enabledNow, isHDR);
+                    if (changed) { ApplyFaldSettingChange(enabledNow, isHDR); FaldPanelFileChangedReinject(); }
                 }
             }
             return 0;
@@ -2488,6 +2505,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             SetForegroundWindow(hwnd);
         }
+        return 0;
+
+    case WM_FALD_RECOMPOSE:    // the hook's FALD layer waits for a primed clean copy (or the pipe changed the layer)
+        RequestFaldFullRecompose();
         return 0;
 
     case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively

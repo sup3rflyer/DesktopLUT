@@ -86,6 +86,10 @@ ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m);
 // mode): the rects of that present never reached the copy, so it has to be re-primed.
 bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const struct tagRECT* rects, int numRects);
 void FaldMarkStale(int left, int top);
+// Every entry: a present whose monitor cannot be resolved went past the layer (the conservative fallback).
+void FaldMarkAllStale();
+// At least one panel file was staged for this injection: the hook has FALD work even with no .cube and no tonemap.
+bool FaldHasAnyPanelFile();
 ID3D11Texture2D* FaldCleanTexture(FaldMonitor* m);
 ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
 

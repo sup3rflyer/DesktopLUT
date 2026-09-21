@@ -141,6 +141,8 @@ void DrawRectangle(struct tagRECT* rect, int index);
 void InitializeStuff(ID3D11Device* inputDevice);
 void UninitializeStuff();
 bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects);
+// A present of this context skipped RenderLUT: the FALD clean copy of its monitor is stale (hook_render.cpp).
+void FaldMarkContextStale(void* context);
 bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* rects, int numRects);
 bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects);
 ID3D11Texture2D* GetBackBuffer_25H2(void* overlaySwapChain);

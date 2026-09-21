@@ -778,8 +778,10 @@ static bool ReadOverlaySwapChainInfo(void* overlaySwapChain, bool& hwProtected, 
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
-	if (g_diagNoLutDraw)
+	if (g_diagNoLutDraw) {
+		FaldMarkContextStale(self);
 		return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
+	}
 
 	// Check for shared memory updates (live tonemap param changes from host)
 	UpdateLocalTonemapFromShared();
@@ -811,6 +813,10 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 				}
 				backBuffer->Release();
 			}
+			else
+			{
+				FaldMarkContextStale(self);   // this present never reached the FALD layer
+			}
 
 			// No fallback probing — ApplyLUTDirect returning false means
 			// this monitor has no LUT configured, not a failure to try harder.
@@ -827,10 +833,12 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 
 			if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
 			{
+				FaldMarkContextStale(self);
 				UnsetLUTActive(self);
 			}
 			else if (hwProtected)
 			{
+				FaldMarkContextStale(self);
 				LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 				UnsetLUTActive(self);
 			}
@@ -869,10 +877,12 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 
 		if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
 		{
+			FaldMarkContextStale(self);
 			UnsetLUTActive(self);
 		}
 		else if (hwProtected)
 		{
+			FaldMarkContextStale(self);
 			LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 			UnsetLUTActive(self);
 		}
@@ -899,6 +909,10 @@ static bool HasActiveHookProcessing() {
 	if (numLuts > 0) return true;
 	for (int i = 0; i < g_numLocalTonemap; i++) {
 		if (g_localTonemap[i].enabled) return true;
+	}
+	// FALD needs the composed frame too: a monitor with the layer on must not direct-flip past the hook
+	for (int i = 0; i < g_numLocalFald; i++) {
+		if (DwmHookFaldEnabled(g_localFald[i].flags) && FaldHasAnyPanelFile()) return true;
 	}
 	return false;
 }
@@ -1408,7 +1422,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			for (int ti = 0; ti < g_numLocalTonemap; ti++) {
 				if (g_localTonemap[ti].enabled) { hasTonemapViaShared = true; break; }
 			}
-			bool hasActiveWork = (numLuts > 0) || hasTonemapViaShared;
+			// FALD panel files are work too: a FALD-only setup (no .cube, tonemap off) must still hook.
+			bool hasActiveWork = (numLuts > 0) || hasTonemapViaShared || FaldHasAnyPanelFile();
 
 			if (hasActiveWork && (COverlayContext_Present_orig || COverlayContext_Present_orig_24h2))
 

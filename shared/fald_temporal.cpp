@@ -139,6 +139,10 @@ FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSet
     r->lastRunQpc = nowQpc;
     unsigned int mode = (s.mode <= FALD_TEMPORAL_PANEL) ? s.mode : FALD_TEMPORAL_OFF;
     if (mode == FALD_TEMPORAL_PANEL && !clockTexturesOk) mode = FALD_TEMPORAL_OFF;   // a failed creation runs as off
+    // No usable clock (refresh period unknown, no QPC frequency): every run would re-seed with k = 0, and the settle
+    // hold — paid in elapsed refreshes — would never end (a host kicking DWM forever). The mode runs as off instead.
+    // (The overlay always has a period: capture.cpp falls back to 16.667 ms.)
+    if (mode == FALD_TEMPORAL_PANEL && (!(refreshMs > 0.0f) || qpcFreq <= 0)) mode = FALD_TEMPORAL_OFF;
     run.stateReset = false;
     if (mode != r->temporalMode) {
         r->temporalMode = mode; r->stateValid = false; r->settleLeft = 0; r->delayCount = 0;

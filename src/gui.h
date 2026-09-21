@@ -20,6 +20,10 @@ bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize);
 
 // Update color correction controls for current monitor
 void UpdateColorCorrectionControls();
+// Hook FALD: one full-screen DWM recomposition (primes the layer's clean copy / clears corrected pixels). Any thread.
+void RequestFaldFullRecompose();
+// Hook FALD: a panel file was set or changed — re-inject so the DLL loads it (hook mode, running). GUI thread.
+void FaldPanelFileChangedReinject();
 
 // Startup registry functions
 bool IsStartupEnabled();

@@ -83,7 +83,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), fald_glowfill (bool) + "
                           "fald_glow_strength, fald_glow_reach, fald_glow_cap_nits (runtime.fald_glowfill; absent on builds "
                           "before the S2 glow fill, 2026-09-20; SDR pairs add fald_glow_note = why the fill is HDR only), "
-                          "fald_glow_active (bool: the fill actually runs = switch on AND starfield on AND HDR; glow fill is part "
+                          "fald_glow_active (bool: the switches let the fill run whenever the layer runs = glow on AND starfield on AND HDR; the layer itself is fald_enabled / fald_params_path; glow fill is part "
                           "of the starfield feature since 2026-09-21 — an HDR pair switched on without starfield carries "
                           "fald_glow_note saying so; absent on earlier builds), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
@@ -489,7 +489,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "fill scaled down to 0.8 T. HDR ONLY: `enabled: true` is refused for mode SDR (the ceiling's levels are HDR "
             "measurements); the numbers can be set in either mode. PART OF THE STARFIELD FEATURE (2026-09-21): the fill runs "
             "only while starfield balancing (runtime.fald_starfield) is on — `enabled` is stored either way, the result's "
-            "`active` says whether it runs, and `note` says why not when enabled without starfield. Runs on the overlay "
+            "`active` says whether the switches let it run (whenever the layer runs), and `note` says why not when enabled without starfield. Runs on the overlay "
             "and the DWM hook path alike. Partial updates (any subset; at least one), persisted "
             "per mode (= the GUI '+ glow fill' row under Starfield). Measuring phases must run with it OFF (fald_profile forces it off and "
             "restores it).",
