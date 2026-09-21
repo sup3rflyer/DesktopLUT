@@ -179,6 +179,48 @@ TEST_CASE("DwmHookSharedConfig: size and layout") {
     CHECK((reinterpret_cast<uintptr_t>(&cfg.beaconSize) - base) == 16 + 48 * MAX_DWM_HOOK_MONITORS + 8);
 }
 
+TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464-byte head") {
+    // An older DwmHook.dll maps exactly the head; everything it reads must stay where it was.
+    DwmHookSharedConfigEx ex = {};
+    auto base = reinterpret_cast<uintptr_t>(&ex);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.head.version) - base) == 0);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.head.faldFlags[0]) - base) == 16 + 48 * MAX_DWM_HOOK_MONITORS + 12);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.tail) - base) == 464);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[0]) - base) == 464 + 16);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1]) - base) == 464 + 16 + 128);
+    CHECK(sizeof(DwmHookFaldTuning) == 128);
+    // LED-lag fields came out of _reserved: their offsets are wire contract too
+    CHECK(offsetof(DwmHookFaldTuning, glowReach) == 64);
+    CHECK(offsetof(DwmHookFaldTuning, tempMode) == 68);
+    CHECK(offsetof(DwmHookFaldTuning, tempClockParity) == 88);
+    CHECK(offsetof(DwmHookFaldTuning, refreshMs) == 92);
+    CHECK(offsetof(DwmHookFaldTuning, _reserved) == 96);
+    CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 128 * MAX_DWM_HOOK_MONITORS);
+}
+
+TEST_CASE("DwmHookFaldPack: starfield and its glow-fill part") {
+    // The pre-merge words are unchanged (a DLL that predates bits 6/7 ignores them).
+    const uint32_t base = DwmHookFaldPack(1, 4, 1);
+    CHECK(DwmHookFaldEnabled(base) == 1);
+    CHECK(DwmHookFaldDebugMode(base) == 4u);
+    CHECK(DwmHookFaldPedMode(base) == 1);
+    CHECK(DwmHookFaldStar(base) == 0);
+    CHECK(DwmHookFaldGlow(base) == 0);
+    const uint32_t star = DwmHookFaldPack(1, 0, 0, 1, 0);
+    CHECK(DwmHookFaldStar(star) == 1);
+    CHECK(DwmHookFaldGlow(star) == 0);
+    const uint32_t both = DwmHookFaldPack(1, 0, 0, 1, 1);
+    CHECK(DwmHookFaldStar(both) == 1);
+    CHECK(DwmHookFaldGlow(both) == 1);
+    // One feature: glow is never packed without starfield, and a stray glow bit alone reads off.
+    CHECK(DwmHookFaldGlow(DwmHookFaldPack(1, 0, 0, 0, 1)) == 0);
+    CHECK((DwmHookFaldPack(1, 0, 0, 0, 1) & DWM_HOOK_FALD_GLOW_BIT) == 0u);
+    CHECK(DwmHookFaldGlow(DWM_HOOK_FALD_GLOW_BIT) == 0);
+    // The new bits stay clear of the enable / debug / pedestal fields.
+    CHECK((DWM_HOOK_FALD_STAR_BIT & (DWM_HOOK_FALD_ENABLED_BIT | DWM_HOOK_FALD_DEBUG_MASK | DWM_HOOK_FALD_PEDMODE_BIT)) == 0u);
+    CHECK((DWM_HOOK_FALD_GLOW_BIT & (DWM_HOOK_FALD_ENABLED_BIT | DWM_HOOK_FALD_DEBUG_MASK | DWM_HOOK_FALD_PEDMODE_BIT)) == 0u);
+}
+
 TEST_CASE("DwmHookBeacon: palette and classifier agree across encodings") {
     // Monitor index -> colour id wraps over the six-colour palette, never 0.
     CHECK(DwmHookBeaconColorIdForMonitor(0) == 1);

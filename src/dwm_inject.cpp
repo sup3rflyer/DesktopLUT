@@ -5,11 +5,14 @@
 #include "../shared/dwm_hook_config.h"
 #include "globals.h"
 #include "gui.h"
+#include "fald.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
 #include <dxgi1_6.h>
+#include <dwmapi.h>                    // DwmFlush: the FALD settle kicker's composition pacing
+#pragma comment(lib, "dwmapi.lib")
 #include <iostream>
 #include <string>
 #include <vector>
@@ -257,9 +260,34 @@ static bool IsProcessDwm(HANDLE hProcess)
 
 // Cached DXGI monitor info — refreshed on InjectDwmHook and InvalidateDxgiMonitorCache.
 // Must be accessed under g_dwmInjectMutex.
-struct DxgiMonInfo { int left, top, w, h, bpc; bool hdr; };
+struct DxgiMonInfo { int left, top, w, h, bpc; bool hdr; float refreshMs; };
 static std::vector<DxgiMonInfo> g_cachedDxgiMons;
 static bool g_dxgiCacheValid = false;
+
+// The monitor's exact refresh period (ms) from DisplayConfig: the target's vSyncFreq, the same rational Desktop
+// Duplication's ModeDesc.RefreshRate reports to the overlay path (capture.cpp frameTimeExactMs). The hook's FALD panel
+// clock (temporal mode 3) runs its refresh grid on it. 0 = unknown (the clock then seeds every run: stateless).
+static float RefreshPeriodMsAt(int left, int top)
+{
+    UINT32 nPaths = 0, nModes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &nPaths, &nModes) != ERROR_SUCCESS) return 0.0f;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(nPaths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(nModes);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &nPaths, paths.data(), &nModes, modes.data(), nullptr) != ERROR_SUCCESS)
+        return 0.0f;
+    for (UINT32 i = 0; i < nPaths; i++) {
+        const auto& path = paths[i];
+        const UINT32 si = path.sourceInfo.modeInfoIdx, ti = path.targetInfo.modeInfoIdx;
+        if (si >= nModes || ti >= nModes) continue;
+        if (modes[si].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE || modes[ti].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) continue;
+        const POINTL pos = modes[si].sourceMode.position;
+        if (pos.x != left || pos.y != top) continue;
+        const DISPLAYCONFIG_RATIONAL v = modes[ti].targetMode.targetVideoSignalInfo.vSyncFreq;
+        if (v.Numerator == 0 || v.Denominator == 0) return 0.0f;
+        return static_cast<float>(1000.0 * v.Denominator / v.Numerator);
+    }
+    return 0.0f;
+}
 
 // One-shot DXGI enumeration — creates a fresh factory and walks adapters+outputs.
 // Separated from EnumerateDxgiMonitors so the caching layer can retry on transients.
@@ -283,6 +311,7 @@ static std::vector<DxgiMonInfo> DoDxgiEnumerateOnce()
                         mi.h = desc1.DesktopCoordinates.bottom - desc1.DesktopCoordinates.top;
                         mi.bpc = static_cast<int>(desc1.BitsPerColor);
                         mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                        mi.refreshMs = RefreshPeriodMsAt(mi.left, mi.top);
                         result.push_back(mi);
                     }
                     output6->Release();
@@ -471,6 +500,17 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     ClearDACL(lutsDir);
     std::wcout << L"[DWM Hook] LUT staging dir: " << lutsDir << std::endl;
 
+    // FALD panel files live in a subdirectory of it (see the staging loop below). Wiped with the
+    // parent after injection; a failure here is not fatal — the FALD layer simply stays off.
+    std::wstring faldDir = lutsDir + DWM_HOOK_FALD_SUBDIR_W + L"\\";
+    if (!CreateDirectoryW(faldDir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        std::wcerr << L"[DWM Hook] WARNING: Failed to create FALD staging dir: " << GetLastErrorString()
+                   << L" (the FALD layer stays off)" << std::endl;
+        faldDir.clear();
+    } else if (!faldDir.empty()) {
+        ClearDACL(faldDir);
+    }
+
     // --- Copy LUT files with position-based names ---
     for (const auto& mon : monitors) {
         std::wstring posPrefix = std::to_wstring(mon.left) + L"_" + std::to_wstring(mon.top);
@@ -490,6 +530,22 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             std::wcout << L"[DWM Hook] Staging HDR LUT: pos(" << mon.left << L"," << mon.top << L") " << mon.hdrLutPath << std::endl;
             if (!CopyFileW(mon.hdrLutPath.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy HDR LUT: " << GetLastErrorString() << std::endl;
+            } else {
+                ClearDACL(dest);
+            }
+        }
+
+        // FALD panel parameter files go in their OWN subdirectory: AddLUTs hands every
+        // non-directory file named "<int>_<int>..." to the .cube parser, and these are named the
+        // same way. The DLL reads them at attach (LoadFaldPanelFiles).
+        for (int hdr = 0; hdr < 2 && !faldDir.empty(); hdr++) {
+            const std::wstring& src = hdr ? mon.hdrFaldPath : mon.sdrFaldPath;
+            if (src.empty()) continue;
+            std::wstring dest = faldDir + posPrefix + (hdr ? L"_hdr.bin" : L".bin");
+            std::wcout << L"[DWM Hook] Staging " << (hdr ? L"HDR" : L"SDR") << L" FALD panel file: pos("
+                       << mon.left << L"," << mon.top << L") " << src << std::endl;
+            if (!CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
+                std::wcerr << L"[DWM Hook] WARNING: Failed to copy FALD panel file: " << GetLastErrorString() << std::endl;
             } else {
                 ClearDACL(dest);
             }
@@ -809,6 +865,7 @@ std::wstring UninjectDwmHook()
 
 static HANDLE g_sharedMemHandle = nullptr;
 static DwmHookSharedConfig* g_sharedMemPtr = nullptr;
+static size_t g_sharedMemBytes = 0;   // the mapped view: sizeof(DwmHookSharedConfigEx), or the head only
 static uint32_t g_sharedMemVersion = 0;
 
 static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
@@ -820,6 +877,229 @@ static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
         case 4:  return DWMHOOK_TONEMAP_HARDCLIP;
         default: return DWMHOOK_TONEMAP_BT2390;
     }
+}
+
+#ifndef STATUS_GRAPHICS_PRESENT_OCCLUDED
+#define STATUS_GRAPHICS_PRESENT_OCCLUDED ((DWORD)0xC01E05A1)   // as framepacer.cpp
+#endif
+// ---------------------------------------------------------------------------
+// FALD services for the hook (dwm_hook_config.h): the LED-lag settle kicker and priming requests
+// ---------------------------------------------------------------------------
+// One thread, three jobs, all driven by auto-reset events the DLL inside dwm.exe signals (SetEvent only):
+//  * SETTLE (per monitor): the hook's LED-lag state still owes settle frames on that monitor. DWM presents nothing on a
+//    static desktop, so the thread keeps DWM composing THAT monitor: it re-paints a 1 x 1 px, click-through, topmost
+//    layered window at the monitor's top-left pixel once per composition (alpha alternating 1/255 and 2/255 black,
+//    UpdateLayeredWindow, no WM_PAINT), and hides it once SETTLE has been quiet for FALD_KICK_QUIET_MS.
+//  * CONTENT (per monitor): that monitor presented new content since the last composition — DWM is composing it
+//    anyway, so no kick that tick. (Between content frames — 24 fps video on a 144 Hz panel — the kick DOES run: the
+//    LED law advances every refresh; the overlay path re-runs its settle frames the same way.)
+//  * PRIME: an enabled FALD monitor's clean copy is not primed; the GUI thread shows the full-screen recompose window
+//    (RequestFaldFullRecompose, via WM_FALD_RECOMPOSE). Throttled here too.
+// The DLL does not count a present whose dirty rects sit in a corner kick zone as new content. Topmost only while
+// kicking; in hook mode nothing is in independent flip (DisableIndependentFlip), so no VRR path is disturbed. The
+// thread pumps its messages in every wait (hidden top-level windows still receive broadcasts). Pacing: the compositor
+// clock with the stop event in the same wait (Windows 11), else a short timed wait — never DwmFlush, which can block
+// through a DWM restart and outlive StopFaldSettleKicker's wait.
+static const ULONGLONG FALD_KICK_QUIET_MS = 100;      // SETTLE silent this long: that monitor's session is over
+static const ULONGLONG FALD_PRIME_MIN_GAP_MS = 1000;  // recompose requests at most this often
+static const ULONGLONG FALD_KICK_ENUM_MS = 2000;      // monitor list refresh (events must exist before the DLL opens them)
+
+struct FaldKickMonitor {
+    POINT origin = {};
+    HANDLE settle = nullptr, content = nullptr;
+    HWND wnd = nullptr;
+    ULONGLONG lastSettleMs = 0;
+    bool shown = false;
+};
+
+static HANDLE g_faldPrimeEvent = nullptr;
+static HANDLE g_faldKickStop = nullptr;
+static HANDLE g_faldKickThread = nullptr;
+
+static BOOL CALLBACK CollectMonitorOrigin(HMONITOR, HDC, LPRECT rc, LPARAM lp) {
+    reinterpret_cast<std::vector<POINT>*>(lp)->push_back(POINT{ rc->left, rc->top });
+    return TRUE;
+}
+
+static HANDLE CreateFaldEvent(const wchar_t* name) {
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);      // dwm.exe (Window Manager\DWM-n) opens it to SetEvent
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+    return CreateEventW(&sa, FALSE, FALSE, name);               // auto-reset, session namespace (Local\)
+}
+
+// bits = the 1 x 1 DIB section selected into memDC: premultiplied black at `alpha`, written before every update.
+static void FaldKickPaint(HWND w, POINT at, BYTE alpha, HDC screenDC, HDC memDC, DWORD* bits) {
+    POINT src = { 0, 0 };
+    SIZE sz = { DWM_HOOK_FALD_KICK_PX, DWM_HOOK_FALD_KICK_PX };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    if (bits) { *bits = (DWORD)alpha << 24; GdiFlush(); }
+    UpdateLayeredWindow(w, screenDC, &at, &sz, memDC, &src, 0, &bf, ULW_ALPHA);
+}
+
+static void PumpThreadMessages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+}
+
+static DWORD WINAPI FaldSettleKickThread(LPVOID) {
+    typedef DWORD (WINAPI *PFN_WaitCompClock)(UINT, const HANDLE*, DWORD);
+    PFN_WaitCompClock waitClock = nullptr;
+    if (HMODULE dcomp = LoadLibraryW(L"dcomp.dll"))
+        waitClock = (PFN_WaitCompClock)GetProcAddress(dcomp, "DCompositionWaitForCompositorClock");
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"DesktopLUT_FaldSettleKick";
+    RegisterClassW(&wc);   // fails harmlessly if already registered
+    HDC screenDC = GetDC(nullptr);
+    HDC memDC = CreateCompatibleDC(screenDC);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = 1; bi.bmiHeader.biHeight = 1;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(screenDC, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldBmp = bmp ? SelectObject(memDC, bmp) : nullptr;
+
+    std::vector<FaldKickMonitor> mons;
+    ULONGLONG lastEnumMs = 0, lastPrimeMs = 0;
+    BYTE alpha = 1;
+    auto closeMon = [](FaldKickMonitor& m) {
+        if (m.wnd) DestroyWindow(m.wnd);
+        if (m.settle) CloseHandle(m.settle);
+        if (m.content) CloseHandle(m.content);
+        m = FaldKickMonitor();
+    };
+    // the monitor list: one SETTLE / CONTENT event pair + one kick window per monitor origin
+    auto refreshMonitors = [&]() {
+        std::vector<POINT> origins;
+        EnumDisplayMonitors(nullptr, nullptr, CollectMonitorOrigin, reinterpret_cast<LPARAM>(&origins));
+        for (size_t i = 0; i < mons.size();) {
+            bool alive = false;
+            for (const POINT& o : origins) if (o.x == mons[i].origin.x && o.y == mons[i].origin.y) { alive = true; break; }
+            if (alive) { i++; continue; }
+            closeMon(mons[i]);
+            mons.erase(mons.begin() + (ptrdiff_t)i);
+        }
+        for (const POINT& o : origins) {
+            bool known = false;
+            for (const FaldKickMonitor& m : mons) if (m.origin.x == o.x && m.origin.y == o.y) { known = true; break; }
+            if (known || mons.size() >= 60) continue;           // (60 + stop + prime stay inside MAXIMUM_WAIT_OBJECTS)
+            FaldKickMonitor m;
+            m.origin = o;
+            wchar_t name[96];
+            swprintf_s(name, DWM_HOOK_FALD_SETTLE_EVENT_FMT, (int)o.x, (int)o.y);
+            m.settle = CreateFaldEvent(name);
+            swprintf_s(name, DWM_HOOK_FALD_CONTENT_EVENT_FMT, (int)o.x, (int)o.y);
+            m.content = CreateFaldEvent(name);
+            m.wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                    wc.lpszClassName, L"", WS_POPUP, o.x, o.y, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+            if (!m.settle || !m.content || !m.wnd) { closeMon(m); continue; }
+            mons.push_back(m);
+        }
+        lastEnumMs = GetTickCount64();
+    };
+    auto handlePrime = [&]() {
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastPrimeMs < FALD_PRIME_MIN_GAP_MS) return;
+        lastPrimeMs = now;
+        if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 0, 0);
+    };
+
+    refreshMonitors();
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastEnumMs > FALD_KICK_ENUM_MS) refreshMonitors();
+        bool active = false;
+        for (const FaldKickMonitor& m : mons) if (m.lastSettleMs && now - m.lastSettleMs < FALD_KICK_QUIET_MS) { active = true; break; }
+
+        if (!active) {
+            // idle: sleep on stop / prime / every SETTLE event, pumping messages; wake at least for the list refresh
+            HANDLE waits[MAXIMUM_WAIT_OBJECTS];
+            DWORD n = 0;
+            waits[n++] = g_faldKickStop;
+            waits[n++] = g_faldPrimeEvent;
+            for (const FaldKickMonitor& m : mons) waits[n++] = m.settle;
+            const DWORD w = MsgWaitForMultipleObjectsEx(n, waits, (DWORD)FALD_KICK_ENUM_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (w == WAIT_OBJECT_0) break;                                   // stop
+            if (w == WAIT_OBJECT_0 + 1) handlePrime();
+            else if (w >= WAIT_OBJECT_0 + 2 && w < WAIT_OBJECT_0 + n) mons[w - WAIT_OBJECT_0 - 2].lastSettleMs = GetTickCount64();
+            else if (w == WAIT_FAILED) Sleep(50);
+            PumpThreadMessages();
+            continue;
+        }
+
+        // kicking: one iteration per composition
+        if (waitClock) {
+            const DWORD w = waitClock(1, &g_faldKickStop, 100);
+            if (w == WAIT_OBJECT_0) break;                                   // stop
+            if (w == (DWORD)STATUS_GRAPHICS_PRESENT_OCCLUDED) Sleep(50);     // display off: nothing to compose
+        } else if (WaitForSingleObject(g_faldKickStop, 8) == WAIT_OBJECT_0) {
+            break;
+        }
+        if (WaitForSingleObject(g_faldPrimeEvent, 0) == WAIT_OBJECT_0) handlePrime();
+        const ULONGLONG t = GetTickCount64();
+        alpha = (BYTE)(3 - alpha);                                           // 1 <-> 2: a change DWM has to compose
+        for (FaldKickMonitor& m : mons) {
+            if (WaitForSingleObject(m.settle, 0) == WAIT_OBJECT_0) m.lastSettleMs = t;
+            const bool contentArrived = (WaitForSingleObject(m.content, 0) == WAIT_OBJECT_0);
+            const bool settling = m.lastSettleMs && (t - m.lastSettleMs < FALD_KICK_QUIET_MS);
+            if (settling && !contentArrived) {
+                FaldKickPaint(m.wnd, m.origin, alpha, screenDC, memDC, (DWORD*)bits);
+                if (!m.shown) {
+                    SetWindowPos(m.wnd, HWND_TOPMOST, m.origin.x, m.origin.y, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                    m.shown = true;
+                }
+            } else if (!settling && m.shown) {
+                ShowWindow(m.wnd, SW_HIDE);
+                m.shown = false;
+            }
+        }
+        PumpThreadMessages();
+    }
+    for (FaldKickMonitor& m : mons) closeMon(m);
+    if (oldBmp) SelectObject(memDC, oldBmp);
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(memDC);
+    ReleaseDC(nullptr, screenDC);
+    return 0;
+}
+
+static void StartFaldSettleKicker() {
+    if (g_faldKickThread) return;
+    if (!g_faldPrimeEvent) g_faldPrimeEvent = CreateFaldEvent(DWM_HOOK_FALD_PRIME_EVENT);
+    if (!g_faldKickStop) g_faldKickStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_faldPrimeEvent || !g_faldKickStop) {
+        std::wcerr << L"[DWM Hook] FALD service events could not be created: LED lag cannot settle and priming is not"
+                      L" requested on a static desktop" << std::endl;
+        return;
+    }
+    ResetEvent(g_faldKickStop);
+    g_faldKickThread = CreateThread(nullptr, 0, FaldSettleKickThread, nullptr, 0, nullptr);
+    if (!g_faldKickThread)
+        std::wcerr << L"[DWM Hook] FALD service thread could not be started: " << GetLastError() << std::endl;
+}
+
+static void StopFaldSettleKicker() {
+    if (!g_faldKickThread) return;
+    SetEvent(g_faldKickStop);
+    // The thread only waits on the stop event (compositor clock / timed / message waits), so it exits within a frame.
+    // If it somehow does not, its handles stay open (leaked on purpose): closing them under a live thread would hand
+    // it recycled handle values.
+    if (WaitForSingleObject(g_faldKickThread, 5000) != WAIT_OBJECT_0) {
+        std::wcerr << L"[DWM Hook] FALD service thread did not stop in 5 s: its handles are left open" << std::endl;
+        CloseHandle(g_faldKickThread);
+        g_faldKickThread = nullptr;
+        g_faldKickStop = nullptr;
+        g_faldPrimeEvent = nullptr;
+        return;
+    }
+    CloseHandle(g_faldKickThread);
+    g_faldKickThread = nullptr;
+    CloseHandle(g_faldKickStop); g_faldKickStop = nullptr;
+    CloseHandle(g_faldPrimeEvent); g_faldPrimeEvent = nullptr;
 }
 
 bool CreateDwmHookSharedMemory()
@@ -834,17 +1114,31 @@ bool CreateDwmHookSharedMemory()
     SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
     SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
 
+    // Head + tuning tail (dwm_hook_config.h, DwmHookSharedConfigEx). An older DLL maps only the
+    // 464-byte head of this and is unaffected by the tail.
     g_sharedMemHandle = CreateFileMappingW(
         INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
-        sizeof(DwmHookSharedConfig), DWM_HOOK_CONFIG_NAME);
+        sizeof(DwmHookSharedConfigEx), DWM_HOOK_CONFIG_NAME);
 
     if (!g_sharedMemHandle) {
         std::wcerr << L"[DWM Hook] Failed to create shared memory: " << GetLastError() << std::endl;
         return false;
     }
 
+    // A mapping of this name that already existed (an older DLL still resident in dwm.exe keeps its
+    // handle open) keeps ITS size — the 464-byte head. Then the full view fails: fall back to the
+    // head and write no tail (that DLL could not read one anyway).
+    const bool preexisting = (GetLastError() == ERROR_ALREADY_EXISTS);
+    g_sharedMemBytes = sizeof(DwmHookSharedConfigEx);
     g_sharedMemPtr = static_cast<DwmHookSharedConfig*>(
-        MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, sizeof(DwmHookSharedConfig)));
+        MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, g_sharedMemBytes));
+    if (!g_sharedMemPtr && preexisting) {
+        g_sharedMemBytes = sizeof(DwmHookSharedConfig);
+        g_sharedMemPtr = static_cast<DwmHookSharedConfig*>(
+            MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, g_sharedMemBytes));
+        if (g_sharedMemPtr)
+            std::wcout << L"[DWM Hook] Shared memory pre-existed at the old size: FALD tuning tail not written" << std::endl;
+    }
 
     if (!g_sharedMemPtr) {
         std::wcerr << L"[DWM Hook] Failed to map shared memory: " << GetLastError() << std::endl;
@@ -853,9 +1147,10 @@ bool CreateDwmHookSharedMemory()
         return false;
     }
 
-    memset(g_sharedMemPtr, 0, sizeof(DwmHookSharedConfig));
+    memset(g_sharedMemPtr, 0, g_sharedMemBytes);
     g_sharedMemVersion = 0;
     UpdateDwmHookSharedConfig();
+    StartFaldSettleKicker();
 
     std::wcout << L"[DWM Hook] Shared memory created OK" << std::endl;
     return true;
@@ -866,7 +1161,11 @@ void UpdateDwmHookSharedConfig()
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     if (!g_sharedMemPtr) return;
 
-    DwmHookSharedConfig cfg = {};
+    DwmHookSharedConfigEx ex = {};
+    DwmHookSharedConfig& cfg = ex.head;
+    ex.tail.magic = DWM_HOOK_TAIL_MAGIC;
+    ex.tail.layoutVersion = DWM_HOOK_TAIL_LAYOUT_VERSION;
+    ex.tail.tuningBytes = sizeof(DwmHookFaldTuning);
     cfg.hostPid = GetCurrentProcessId();
     cfg.lutReloadFlag = g_sharedMemPtr->lutReloadFlag;
     const bool beacon = g_hookBeaconActive.load();
@@ -902,6 +1201,36 @@ void UpdateDwmHookSharedConfig()
                         mc.targetPeakNits = tm.targetPeakNits;
                         mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
                         mc.beaconColorId = beacon ? DwmHookBeaconColorIdForMonitor(static_cast<uint32_t>(mi)) : 0;
+                        // FALD: the settings of the mode the monitor is in RIGHT NOW — the hook holds
+                        // one correction per monitor and picked its panel file by that mode at attach.
+                        // A configured-but-pathless layer is off (the DLL has no file to read either).
+                        const auto& fs = mc.isHdr ? g_gui.monitorSettings[mi].hdrColorCorrection.fald
+                                                  : g_gui.monitorSettings[mi].sdrColorCorrection.fald;
+                        // Starfield + its glow-fill part are one feature: glow rides only with starfield
+                        // (DwmHookFaldPack drops it otherwise); the hook also refuses glow on a non-PQ file.
+                        cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty(),
+                                                           static_cast<uint32_t>(fs.debugMode),
+                                                           static_cast<int>(fs.pedMode),
+                                                           fs.star.enabled ? 1 : 0,
+                                                           fs.glow.enabled ? 1 : 0);
+                        FaldStarfieldSettings st = fs.star;
+                        FaldStarfieldClamp(st);
+                        FaldGlowSettings gl = fs.glow;
+                        FaldGlowClamp(gl);
+                        DwmHookFaldTuning& t = ex.tail.fald[i];
+                        t.starEven = st.even; t.starLift = st.lift; t.starTargetGain = st.targetGain;
+                        t.starTargetSigma = st.targetSigma; t.starKeepNits = st.keepNits; t.starCapNits = st.capNits;
+                        t.starStrength = st.strength; t.starAreaLo = st.areaLo; t.starAreaHi = st.areaHi;
+                        t.starPeakHi = st.peakHi; t.starNbLo = st.nbLo; t.starNbHi = st.nbHi;
+                        t.starReach = st.reach; t.starEvenReach = st.evenReach;
+                        t.glowStrength = gl.strength; t.glowCapNits = gl.capNits; t.glowReach = gl.reach;
+                        // LED lag (temporal drive state): clamped here, re-bounded by the DLL
+                        t.tempMode = fs.temporalMode <= FALD_TEMPORAL_PANEL ? fs.temporalMode : FALD_TEMPORAL_OFF;
+                        t.tempTauRiseMs = fs.tauRiseMs; t.tempTauFallMs = fs.tauFallMs;
+                        t.tempDelayFrames = fs.delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : fs.delayFrames;
+                        t.tempClockClosure = FaldPanelClockClosure(fs.clockClosure);
+                        t.tempClockParity = FaldPanelClockParity(fs.clockParity);
+                        t.refreshMs = mons[i].refreshMs;
                         break;
                     }
                 }
@@ -915,8 +1244,8 @@ void UpdateDwmHookSharedConfig()
     std::atomic_thread_fence(std::memory_order_release);
     cfg.version = 0;
     memcpy(reinterpret_cast<char*>(g_sharedMemPtr) + sizeof(uint32_t),
-           reinterpret_cast<const char*>(&cfg) + sizeof(uint32_t),
-           sizeof(DwmHookSharedConfig) - sizeof(uint32_t));
+           reinterpret_cast<const char*>(&ex) + sizeof(uint32_t),
+           g_sharedMemBytes - sizeof(uint32_t));   // head + tail (when mapped) inside one seqlock write
     std::atomic_thread_fence(std::memory_order_release);
     g_sharedMemPtr->version = ++g_sharedMemVersion;  // even = write complete
 }
@@ -924,6 +1253,7 @@ void UpdateDwmHookSharedConfig()
 void CloseDwmHookSharedMemory()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    StopFaldSettleKicker();   // (its thread never takes g_dwmInjectMutex)
     if (g_sharedMemPtr) {
         UnmapViewOfFile(g_sharedMemPtr);
         g_sharedMemPtr = nullptr;

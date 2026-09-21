@@ -1468,3 +1468,64 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     ic->ClearState(); ic->Flush();
     ic->Release(); dev->Release();
 }
+
+// The shared LED-lag orchestration (shared/fald_temporal.cpp FaldTemporalBeginRun / EndRun) — the overlay and the DWM
+// hook both run it, so its routing rules are pinned here without D3D.
+TEST_CASE("FALD temporal run plan: routing, delay ring, resets, panel clock, settle") {
+    const long long f = 10000000;              // 10 MHz QPC
+    const long long frame = 166667;            // 16.6667 ms
+    FaldTemporalState s;
+    FaldTemporalSettings ts;
+    ts.mode = FALD_TEMPORAL_TRUE_ONLY; ts.tauRiseMs = 50.0f; ts.tauFallMs = 25.0f; ts.delayFrames = 2;
+    long long t = 1000000000;
+    FaldTemporalRun r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
+    CHECK(r.stateReset);                       // mode 0 -> 2
+    CHECK(r.temporal); CHECK_FALSE(r.panel); CHECK(r.mode == FALD_TEMPORAL_TRUE_ONLY);
+    CHECK(r.trueMap == FALD_MAP_FILTERED); CHECK(r.estMap == FALD_MAP_DRIVE); CHECK(r.debugFiltMap == FALD_MAP_FILTERED);
+    CHECK(r.delayedSlot == -1);                // the ring holds nothing yet
+    CHECK_FALSE(r.resumed);
+    FaldTemporalEndRun(&s, r, ts, true);
+    CHECK(s.stateValid); CHECK(s.delayHead == 1u); CHECK(s.delayCount == 1u);
+    CHECK(s.settleLeft == FaldSettleFrames(50.0f, 25.0f, s.dtMs, 2));
+    CHECK(FaldTemporalSettlePending(&s));
+    t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
+    CHECK_FALSE(r.stateReset); CHECK(r.delayedSlot == -1);   // one map in the ring, two needed
+    FaldTemporalEndRun(&s, r, ts, false);
+    t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
+    CHECK(r.delayedSlot == 0);                 // head 2, two back = slot 0
+    const unsigned int before = s.settleLeft;
+    FaldTemporalEndRun(&s, r, ts, false);
+    CHECK(s.settleLeft == before - 1u);        // a settle run pays one
+    // a gap past FALD_RESUME_GAP_MS re-arms like new content
+    t += 300 * 10000; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
+    CHECK(r.resumed);
+    // mode 1: both kernels read the filtered map
+    ts.mode = FALD_TEMPORAL_BOTH; t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
+    CHECK(r.stateReset); CHECK_FALSE(s.stateValid); CHECK(s.delayCount == 0u);
+    CHECK(r.trueMap == FALD_MAP_FILTERED); CHECK(r.estMap == FALD_MAP_FILTERED);
+    // mode 3 without clock textures runs as off
+    ts.mode = FALD_TEMPORAL_PANEL; t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
+    CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.temporal); CHECK_FALSE(r.panel);
+    CHECK(r.trueMap == FALD_MAP_DRIVE); CHECK(r.estMap == FALD_MAP_DRIVE); CHECK(r.debugFiltMap == FALD_MAP_DRIVE);
+    FaldTemporalEndRun(&s, r, ts, true);
+    CHECK(s.settleLeft == 0u); CHECK_FALSE(FaldTemporalSettlePending(&s));
+    // mode 3 with no usable refresh period runs as off (else the settle hold, paid per elapsed refresh, never ends)
+    t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 0.0f);
+    CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.panel);
+    FaldTemporalEndRun(&s, r, ts, true);
+    CHECK(s.settleLeft == 0u);
+    // mode 3 with them: a seeding run, then one refresh later the clock maps
+    t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 16.6667f);
+    CHECK(r.panel); CHECK(r.clock.seedStates); CHECK_FALSE(r.clock.bindMaps); CHECK(r.trueMap == FALD_MAP_DRIVE);
+    FaldTemporalEndRun(&s, r, ts, true);
+    CHECK(s.settleLeft == FaldPanelClockSettleFrames(ts.clockClosure));
+    t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 16.6667f);
+    CHECK(r.clock.runPass); CHECK(r.clock.bindMaps); CHECK(s.clkElapsed == 1ull);
+    CHECK(r.trueMap == FALD_MAP_FILTERED); CHECK(r.estMap == FALD_MAP_CLOCK_EST); CHECK(r.debugFiltMap == FALD_MAP_FILTERED);
+    const unsigned int held = s.settleLeft;
+    FaldTemporalEndRun(&s, r, ts, false);
+    CHECK(s.settleLeft == held - 1u);          // mode 3 pays the elapsed refreshes (k = 1)
+    FaldTemporalIdle(&s);                      // the layer did not run: all void
+    CHECK_FALSE(s.stateValid); CHECK(s.settleLeft == 0u); CHECK(s.delayCount == 0u); CHECK(s.lastRunQpc == 0);
+    CHECK_FALSE(FaldTemporalSettlePending(nullptr));
+}

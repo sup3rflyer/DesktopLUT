@@ -692,7 +692,7 @@ void CreateGUILayout(HWND hwnd) {
     // profiling pass (python -m dlc.stages.fald_profile / dlc.fald.export) and is mode-specific (an
     // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
-    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental, overlay only)", WS_CHILD | BS_GROUPBOX,
+    ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental)", WS_CHILD | BS_GROUPBOX,
         innerX, innerY, groupW, 207, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
@@ -861,7 +861,9 @@ void CreateGUILayout(HWND hwnd) {
     // the levels behind its request ceiling are HDR measurements): the checkbox is the HDR slot's switch, the numbers
     // go to both slots.
     int faldGY = innerY + 180;
-    g_gui.hwndFaldGlowEnable = CreateWindow(L"BUTTON", L"Glow fill",
+    // Part of the Starfield feature: the row is live only while Starfield is on (gui.cpp), and the fill never
+    // runs without starfield balancing (src/fald.cpp, dwm_hook/hook_fald.cpp).
+    g_gui.hwndFaldGlowEnable = CreateWindow(L"BUTTON", L"+ glow fill",
         WS_CHILD | BS_AUTOCHECKBOX,
         innerX + 10, faldGY, 72, h, panel2, (HMENU)ID_CORR_FALD_GLOW_ENABLE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowEnable);

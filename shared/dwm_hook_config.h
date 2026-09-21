@@ -58,10 +58,136 @@ struct DwmHookSharedConfig {
     uint32_t beaconGeneration;       // increments per beacon session
     uint32_t beaconSize;             // beacon square edge in device pixels (host default 8)
 
-    uint32_t _reserved[13];          // Future expansion
+    // FALD correction, one packed word per monitors[] entry (same index). Taken from _reserved
+    // rather than added to DwmHookMonitorConfig ON PURPOSE: that struct is 48 bytes behind a
+    // static_assert with an offset contract checked in test_displayconfig.cpp (docs/NAMING.md §1)
+    // and has no spare room, and there is no format-version field anywhere in this struct. Every
+    // existing offset therefore stays put, sizeof stays 464, and a DwmHook.dll from an older build
+    // still resident in a running dwm.exe reads what these words used to be — zero, i.e. FALD off —
+    // instead of misreading a moved layout. Pack/unpack with the helpers below.
+    // The panel parameter file itself does NOT come through here: it is staged as a file beside the
+    // .cube LUTs and read once at attach (see DWM_HOOK_FALD_SUBDIR).
+    uint32_t faldFlags[MAX_DWM_HOOK_MONITORS];
+
+    uint32_t _reserved[5];           // Future expansion
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
 #pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// FALD correction (mini-LED local dimming context-dependence) — host <-> hook
+// ---------------------------------------------------------------------------
+// Two channels, deliberately split by how often each changes:
+//
+//   * the per-panel parameter file (*.bin, `python -m dlc.fald.export`) is STAGED AS A FILE, in
+//     this subdirectory of the LUT staging dir, and read once during DllMain like the .cube files.
+//     Its own subdirectory because AddLUTs feeds every non-directory file whose name starts
+//     "<int>_<int>" to the .cube parser, and a panel file is named the same way. Changing the panel
+//     file therefore needs a re-injection — it is a rare, deliberate act (a new fit), and keeping it
+//     out of the present path means no file polling inside dwm.exe.
+//
+//   * the three live settings below travel in faldFlags[] over the seqlock, so toggling the layer
+//     or a debug view does NOT re-inject (a re-injection re-rolls twin-panel routing).
+//
+// Staged names mirror the LUTs: "<left>_<top>.bin" (SDR/ACM) and "<left>_<top>_hdr.bin" (HDR).
+#define DWM_HOOK_FALD_SUBDIR_A  "fald"
+#define DWM_HOOK_FALD_SUBDIR_W  L"fald"
+
+// faldFlags[i] layout. debugMode is the same 0..10 scale as the overlay path (shared/fald_shader.h):
+// 0 = normal output, 4 = identity passthrough (the H4 bit-for-bit check), others are debug views.
+#define DWM_HOOK_FALD_ENABLED_BIT   0x00000001u
+#define DWM_HOOK_FALD_DEBUG_SHIFT   1
+#define DWM_HOOK_FALD_DEBUG_MASK    0x0000001Eu   // bits 1-4
+#define DWM_HOOK_FALD_PEDMODE_BIT   0x00000020u   // bit 5 (per-channel pedestal)
+#define DWM_HOOK_FALD_DEBUG_MAX     15u
+
+// Starfield (work guide S1) and its glow-fill part (S2): ONE feature. Glow fill never runs without
+// starfield — the host packs the glow bit only when both are on — and only on PQ (HDR) panel files.
+#define DWM_HOOK_FALD_STAR_BIT      0x00000040u   // bit 6: starfield balancing
+#define DWM_HOOK_FALD_GLOW_BIT      0x00000080u   // bit 7: its glow-fill part
+
+static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int glow = 0) {
+    if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
+    return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
+         | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
+         | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u)
+         | (star ? DWM_HOOK_FALD_STAR_BIT : 0u)
+         | ((star && glow) ? DWM_HOOK_FALD_GLOW_BIT : 0u);
+}
+static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
+static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
+static inline int      DwmHookFaldPedMode(uint32_t w)  { return (w & DWM_HOOK_FALD_PEDMODE_BIT) != 0; }
+static inline int      DwmHookFaldStar(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) != 0; }
+static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) && (w & DWM_HOOK_FALD_GLOW_BIT); }
+
+// ---------------------------------------------------------------------------
+// Tuning tail — the starfield / glow-fill parameters (floats), appended AFTER DwmHookSharedConfig
+// ---------------------------------------------------------------------------
+// The head struct above is frozen at 464 bytes (an older DwmHook.dll still resident in dwm.exe maps
+// exactly that much). The host creates the mapping sizeof(DwmHookSharedConfigEx) long; an old DLL
+// maps the first 464 bytes and never sees the tail, a new DLL paired with an old host (464-byte
+// mapping) fails to map the full size, falls back to the head and runs starfield / glow on their
+// defaults. The tail is written inside the SAME seqlock as the head (the head's `version`), so a
+// reader copies head + tail in one consistent snapshot. `magic` + `layoutVersion` + `tuningBytes`
+// let a reader reject a tail it does not understand instead of misreading it.
+// Host <-> DLL signalling for the FALD layer in hook mode. Auto-reset events in the SESSION namespace (Local\: dwm.exe
+// and the host share the user's session; another session's dwm.exe cannot cross-signal), created by the host, opened by
+// the DLL (open retried rarely, never per frame), signalled with SetEvent only (no wait in the present path).
+//
+// LED-lag settle hold. DWM presents nothing on a static desktop, but the temporal state keeps moving for a few
+// refreshes after the last content change. Per monitor (named by its desktop left/top):
+//   SETTLE  — signalled on every run while that monitor still owes settle frames;
+//   CONTENT — signalled on every run that carried new content (content is flowing: DWM is presenting anyway).
+// The host kicks a monitor — re-paints a 1 x 1 px click-through window at its top-left pixel once per composition —
+// only while it owes settle frames AND no content arrived since the last composition, and stops once SETTLE has been
+// quiet for a while. The DLL does not count a present whose dirty rects all lie inside a KICK_ZONE box at any corner
+// as new content (the kick must not re-arm the hold it exists to finish; any corner: a rotated back buffer).
+#define DWM_HOOK_FALD_SETTLE_EVENT_FMT  L"Local\\DesktopLUT_DwmHook_FaldSettle_%d_%d"
+#define DWM_HOOK_FALD_CONTENT_EVENT_FMT L"Local\\DesktopLUT_DwmHook_FaldContent_%d_%d"
+// PRIME — the DLL asks for one full-screen recomposition: an enabled FALD monitor whose clean copy is not (or no
+// longer) primed. Throttled on both sides (at most ~1 per second).
+#define DWM_HOOK_FALD_PRIME_EVENT       L"Local\\DesktopLUT_DwmHook_FaldPrime"
+#define DWM_HOOK_FALD_KICK_PX       1
+#define DWM_HOOK_FALD_KICK_ZONE_PX  16
+
+#define DWM_HOOK_TAIL_MAGIC          0x444C4654u   // 'TFLD'
+#define DWM_HOOK_TAIL_LAYOUT_VERSION 1u
+
+struct DwmHookFaldTuning {           // per monitors[] index: the settings of the mode it is in NOW
+    // starfield (CB words 52-65; same fields and clamps as src FaldStarfieldSettings)
+    float    starEven, starLift, starTargetGain, starTargetSigma;
+    float    starKeepNits, starCapNits, starStrength, starAreaLo;
+    float    starAreaHi, starPeakHi, starNbLo, starNbHi;
+    uint32_t starReach, starEvenReach;
+    // glow fill (CB words 76-78; same fields and clamps as src FaldGlowSettings)
+    float    glowStrength, glowCapNits;
+    uint32_t glowReach;
+    // LED lag = the temporal drive state (shared/fald_temporal.h FaldTemporalSettings) + the monitor's refresh period
+    // (mode 3's grid). Taken from _reserved: a tail from a host that predates them reads 0 = LED lag off.
+    uint32_t tempMode;               // 0 off, 1 both fields, 2 B_true only, 3 panel clock
+    float    tempTauRiseMs, tempTauFallMs;
+    uint32_t tempDelayFrames;
+    float    tempClockClosure;
+    int32_t  tempClockParity;        // -1 unknown, 0, 1
+    float    refreshMs;              // exact nominal refresh period of this monitor (DisplayConfig vSyncFreq); 0 = unknown
+    uint32_t _reserved[8];           // room for later fields without a layout bump (24 used + 8 = 32 words)
+};
+static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
+
+struct DwmHookSharedConfigTail {
+    uint32_t magic;                  // DWM_HOOK_TAIL_MAGIC
+    uint32_t layoutVersion;          // DWM_HOOK_TAIL_LAYOUT_VERSION
+    uint32_t tuningBytes;            // sizeof(DwmHookFaldTuning) as the writer knew it
+    uint32_t _pad;
+    DwmHookFaldTuning fald[MAX_DWM_HOOK_MONITORS];
+};
+
+struct DwmHookSharedConfigEx {
+    DwmHookSharedConfig     head;    // offset 0: the frozen layout, seqlock `version` first
+    DwmHookSharedConfigTail tail;    // offset 464
+};
+static_assert(sizeof(DwmHookSharedConfigTail) == 16 + 128 * MAX_DWM_HOOK_MONITORS, "tail layout");
+static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigTail), "head must stay at 464");
 
 // ---------------------------------------------------------------------------
 // Identity beacon palette — shared by the host (paints) and the DLL (classifies)

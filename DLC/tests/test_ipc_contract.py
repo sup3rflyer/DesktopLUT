@@ -409,7 +409,17 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert g0["fald_glowfill"] is False and (g0["fald_glow_strength"], g0["fald_glow_reach"], g0["fald_glow_cap_nits"]) == (1.0, 2, 0.05)
     assert "fald_glow_note" not in g0
     gl = client.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "enabled": True, "reach": 3})
-    assert gl.ok and gl.result == {"monitor_mode": "1:HDR", "enabled": True, "strength": 1.0, "reach": 3, "cap_nits": 0.05}
+    # part of the starfield feature (2026-09-21): the switch is stored, but without starfield the fill does not run
+    needs_star = "glow fill is part of the starfield feature: the switch is stored, but the fill runs only while starfield balancing is on"
+    assert gl.ok and gl.result == {"monitor_mode": "1:HDR", "enabled": True, "strength": 1.0, "reach": 3, "cap_nits": 0.05,
+                                   "active": False, "note": needs_star}
+    g1 = client.call("state.get", {}).result["layers"]["1:HDR"]
+    assert g1["fald_glow_active"] is False and g1["fald_glow_note"] == needs_star
+    assert client.call("runtime.fald_starfield", {"monitor": 1, "mode": "HDR", "enabled": True}).ok
+    g2 = client.call("state.get", {}).result["layers"]["1:HDR"]
+    assert g2["fald_glow_active"] is True and "fald_glow_note" not in g2
+    assert client.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "strength": 1.0}).result["active"] is True
+    assert client.call("runtime.fald_starfield", {"monitor": 1, "mode": "HDR", "enabled": False}).ok
     one = client.call("runtime.fald_glowfill", {"monitor": 1, "mode": "HDR", "cap_nits": 0.02})           # a partial update
     assert one.ok and one.result["enabled"] is True and one.result["reach"] == 3 and one.result["cap_nits"] == 0.02
     st = client.call("state.get", {}).result["layers"]

@@ -999,7 +999,12 @@ void StartProcessing() {
         // Build monitor LUT list for injection
         std::vector<DwmHookMonitorLUT> dwmMonitors;
         for (const auto& cfg : configs) {
-            if (cfg.sdrLutPath.empty() && cfg.hdrLutPath.empty()) continue;
+            // A monitor with only a FALD panel file and no .cube still belongs in the list: the hook
+            // runs the correction on it. The panel file is always staged when a path is set, enabled
+            // or not, so switching the layer on later rides the shared config instead of a re-inject.
+            const std::wstring& sdrFald = cfg.sdrColorCorrection.fald.paramsPath;
+            const std::wstring& hdrFald = cfg.hdrColorCorrection.fald.paramsPath;
+            if (cfg.sdrLutPath.empty() && cfg.hdrLutPath.empty() && sdrFald.empty() && hdrFald.empty()) continue;
             if (cfg.monitorIndex < 0 || cfg.monitorIndex >= (int)g_gui.monitors.size()) continue;
 
             MONITORINFO mi = { sizeof(mi) };
@@ -1009,6 +1014,8 @@ void StartProcessing() {
                 lut.top = mi.rcMonitor.top;
                 lut.sdrLutPath = cfg.sdrLutPath;
                 lut.hdrLutPath = cfg.hdrLutPath;
+                lut.sdrFaldPath = sdrFald;
+                lut.hdrFaldPath = hdrFald;
                 dwmMonitors.push_back(lut);
             }
         }

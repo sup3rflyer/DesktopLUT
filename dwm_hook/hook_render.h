@@ -118,14 +118,31 @@ void CacheContextPosition(void* context, int left, int top);                    
 void CacheContextPositionEx(void* context, int left, int top, int method);
 void GetMonitorPositionFromContext(void* context, int& left, int& top);
 
+// FALD live settings per monitor, mirrored out of DwmHookSharedConfig::faldFlags. Keyed by position
+// like the tonemap entries and refreshed in the same debounced pass, so a monitor that is briefly
+// re-brokered cannot lose its entry mid-Present. The panel parameter FILE does not come through
+// here — it is staged and read once at attach (hook_fald.h).
+struct LocalFaldParams {
+	int left, top;
+	unsigned int flags;
+	bool hasTuning;             // tuning came from the host's tail; false = run starfield / glow on defaults
+	DwmHookFaldTuning tuning;
+};
+extern LocalFaldParams g_localFald[MAX_DWM_HOOK_MONITORS];
+extern int g_numLocalFald;
+
 // Tonemap lookup (defined in dllmain.cpp)
 LocalTonemapParams* FindTonemapForMonitor(int left, int top);
+// FALD live-settings lookup (defined in dllmain.cpp); NULL when the host sent none for this position.
+LocalFaldParams* FindFaldForMonitor(int left, int top);
 
 // D3D11 rendering functions
 void DrawRectangle(struct tagRECT* rect, int index);
 void InitializeStuff(ID3D11Device* inputDevice);
 void UninitializeStuff();
 bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects);
+// A present of this context skipped RenderLUT: the FALD clean copy of its monitor is stale (hook_render.cpp).
+void FaldMarkContextStale(void* context);
 bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* rects, int numRects);
 bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects);
 ID3D11Texture2D* GetBackBuffer_25H2(void* overlaySwapChain);

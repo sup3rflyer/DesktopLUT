@@ -103,7 +103,16 @@
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="hook_lut.cpp" />
+    <ClCompile Include="hook_fald.cpp" />
     <ClCompile Include="hook_render.cpp" />
+    <ClCompile Include="..\shared\fald_panel.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\shared\fald_temporal.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="minhook\src\hook.c">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
@@ -126,6 +135,10 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="noise.h" />
     <ClInclude Include="..\shared\dwm_hook_config.h" />
+    <ClInclude Include="..\shared\fald_panel.h" />
+    <ClInclude Include="..\shared\fald_temporal.h" />
+    <ClInclude Include="..\shared\fald_shader.h" />
+    <ClInclude Include="hook_fald.h" />
     <ClInclude Include="hook_log.h" />
     <ClInclude Include="hook_lut.h" />
     <ClInclude Include="hook_render.h" />

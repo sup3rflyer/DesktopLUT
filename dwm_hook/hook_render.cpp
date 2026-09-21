@@ -3,6 +3,7 @@
 #include "hook_log.h"
 #include "hook_shader.h"
 #include "hook_lut.h"
+#include "hook_fald.h"
 #include "noise.h"
 #include "dwm_hook_config.h"
 #include "peak_detect.h"
@@ -188,6 +189,18 @@ void CacheContextPositionEx(void* context, int left, int top, int method) {
 		e.placedTick = GetTickCount64();
 		g_contextPosCache[g_numContextPosCache++] = e;
 	}
+}
+
+// A per-panel correction must not run on a position that was a coin toss. CTXPOS_ORDER is
+// first-present order among indistinguishable twins, re-rolled on every injection, and
+// CTXPOS_PROVISIONAL is explicitly a replacement guess — a FALD fit applied to the wrong panel is
+// worse than no FALD, because it pre-distorts for the other panel's LEDs. The .cube path tolerates
+// this risk today; the correction does not get to.
+static bool FaldRoutingTrusted(void* context) {
+	const int ci = FindCacheIndex(context);
+	if (ci < 0) return false;
+	const int method = g_contextPosCache[ci].method;
+	return method != CTXPOS_UNKNOWN && method != CTXPOS_ORDER && method != CTXPOS_PROVISIONAL;
 }
 
 static void EvictContext(int cacheIndex) {
@@ -467,6 +480,59 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top)
 		top = 0;
 		LOG_ONLY_ONCE("SEH exception in GetMonitorPositionFromContext — defaulting to (0,0)");
 	}
+}
+
+// A present of this overlay context went past RenderLUT (protected content, an unreadable swap chain / back buffer, the
+// diagnostic no-draw level): its dirty rects never reached the FALD layer's clean copy, so that copy is stale. Marks the
+// context's own monitor when its position is known (the 25H2 routing cache, or the pre-25H2 clip box); an unresolved
+// 25H2 context marks every monitor (a wrong guess would leave a stale copy in use — the costlier mistake).
+void FaldMarkContextStale(void* context)
+{
+	int left = 0, top = 0;
+	if (isWindows11_25h2) {
+		if (!LookupContextPosition(context, left, top)) { FaldMarkAllStale(); return; }
+	} else {
+		GetMonitorPositionFromContext(context, left, top);
+	}
+	FaldMarkStale(left, top);
+}
+
+// Draw `rect` of the back buffer from a source texture of texW x texH (UVs are rect / tex size).
+static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
+{
+	float width = backBufferDesc.Width;
+	float height = backBufferDesc.Height;
+
+	float screenLeft = rect->left / width;
+	float screenTop = rect->top / height;
+	float screenRight = rect->right / width;
+	float screenBottom = rect->bottom / height;
+
+	float left = screenLeft * 2 - 1;
+	float top = screenTop * -2 + 1;
+	float right = screenRight * 2 - 1;
+	float bottom = screenBottom * -2 + 1;
+
+	float texLeft = rect->left / texW;
+	float texTop = rect->top / texH;
+	float texRight = rect->right / texW;
+	float texBottom = rect->bottom / texH;
+
+	float vertexData[] = {
+		left, bottom, texLeft, texBottom,
+		left, top, texLeft, texTop,
+		right, bottom, texRight, texBottom,
+		right, top, texRight, texTop
+	};
+
+	D3D11_MAPPED_SUBRESOURCE resource;
+	EXECUTE_WITH_LOG(deviceContext->Map(vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &resource))
+	memcpy(resource.pData, vertexData, stride * numVerts);
+	deviceContext->Unmap(vertexBuffer, 0);
+
+	deviceContext->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+
+	deviceContext->Draw(numVerts, 0);
 }
 
 void DrawRectangle(struct tagRECT* rect, int index)
@@ -764,6 +830,11 @@ void InitializeStuff(ID3D11Device* inputDevice)
 				log_to_file("WARNING: Peak detection CS compilation failed — dynamic tonemapping disabled");
 			}
 		}
+
+		// FALD correction shaders. Non-fatal by design: a failure here costs the correction layer
+		// and nothing else, and every FALD call site checks FaldShadersReady() first.
+		if (!FaldInitShaders(device, deviceContext))
+			log_to_file("WARNING: FALD shader init failed — the correction layer stays off");
 	}
 	catch (std::exception& ex)
 	{
@@ -809,6 +880,9 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(peakSmoothCS)
 	ReleasePeakSlots();
 	RELEASE_IF_NOT_NULL(peakCB)
+	// FALD: the per-monitor resources first (they hold views onto DWM's device), then the shaders.
+	FaldReleaseAll();
+	FaldReleaseShaders();
 	ReleaseBeaconProbes();
 	// Snapshot + clear first so a concurrent reader sees an empty list before we free.
 	int oldNumLuts = numLuts;
@@ -926,8 +1000,46 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	LocalTonemapParams* tp = FindTonemapForMonitor(monLeft, monTop);
 	bool tmEnabled = (colorMode == 1 && tp && tp->enabled);
 
-	// Skip if no LUT AND no tonemap — nothing to render
-	if (index == -1 || (!lut && !tmEnabled))
+	// FALD correction (hook_fald.h). FP16 back buffers only: index 1 is colorMode 1 (HDR) and 2 (ACM
+	// SDR), the two modes that carry the scRGB domain the layer is defined in; colorMode 0 never
+	// does. The layer needs the whole frame, so switching it on also switches this context off
+	// dirty-rect rendering for as long as it is on — see the draw block below.
+	FaldMonitor* faldMon = NULL;
+	if (index == 1 && FaldShadersReady())
+	{
+		LocalFaldParams* fp = FindFaldForMonitor(monLeft, monTop);
+		if (fp && DwmHookFaldEnabled(fp->flags) && FaldRoutingTrusted(cOverlayContext))
+		{
+			faldMon = FaldAcquire(monLeft, monTop, colorMode == 1,
+				newBackBufferDesc.Width, newBackBufferDesc.Height, newBackBufferDesc.Format);
+			if (faldMon)
+				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags),
+					DwmHookFaldStar(fp->flags) != 0, DwmHookFaldGlow(fp->flags) != 0,
+					fp->hasTuning ? &fp->tuning : NULL);
+			// Feed this present's dirty rects into the layer's clean source. Until a full-frame
+			// composition has primed it, the layer stays off and this present takes the ordinary
+			// dirty-rect path below (the host forces a full recompose when the layer is switched on).
+			if (faldMon && !FaldUpdateClean(faldMon, backBuffer, rects, numRects))
+				faldMon = NULL;
+			else if (!faldMon)
+				FaldMarkStale(monLeft, monTop);
+		}
+		else
+		{
+			FaldMarkStale(monLeft, monTop);
+		}
+		FaldPollDumpRequest();   // heavily throttled inside; arms a one-shot field dump
+	}
+	else if (index != -1 && FaldShadersReady())
+	{
+		// A non-FP16 present of this position (legacy SDR after an ACM/HDR switch): the layer never runs on it, and
+		// the FALD entries' copies / LED-lag state are void from here on.
+		FaldMarkStale(monLeft, monTop);
+	}
+	const bool faldOn = (faldMon != NULL);
+
+	// Skip if no LUT AND no tonemap AND no FALD — nothing to render
+	if (index == -1 || (!lut && !tmEnabled && !faldOn))
 	{
 		return false;
 	}
@@ -973,14 +1085,19 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 
 	bool hasLutOrTonemap = (lut || tmEnabled);
 
-	if (hasLutOrTonemap) {
+	if (hasLutOrTonemap || faldOn) {
+	  renderTargetView = NULL;
+	  ID3D11RenderTargetView* faldRTV = faldOn ? FaldIntermediateRTV(faldMon) : NULL;
 	  try {
 		EXECUTE_WITH_LOG(device->CreateRenderTargetView((ID3D11Resource*)backBuffer, NULL, &renderTargetView))
 		const D3D11_VIEWPORT d3d11_viewport(0, 0, backBufferDesc.Width, backBufferDesc.Height, 0.0f, 1.0f);
 		deviceContext->RSSetViewports(1, &d3d11_viewport);
 
-		deviceContext->OMSetRenderTargets(1, &renderTargetView, NULL);
-		renderTargetView->Release();
+		// With FALD on, the LUT/tonemap pass renders into the layer's intermediate instead and the
+		// FALD pixel pass writes the back buffer at the end. The back-buffer view is therefore kept
+		// until then rather than released here.
+		deviceContext->OMSetRenderTargets(1, faldOn ? &faldRTV : &renderTargetView, NULL);
+		if (!faldOn) { renderTargetView->Release(); renderTargetView = NULL; }
 
 		deviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 		deviceContext->IASetInputLayout(inputLayout);
@@ -988,8 +1105,10 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		deviceContext->VSSetShader(vertexShader, NULL, 0);
 		deviceContext->PSSetShader(pixelShader, NULL, 0);
 
-		// Bind shader resources
-		deviceContext->PSSetShaderResources(0, 1, &textureView[index]);
+		// Bind shader resources. With FALD on the source is the layer's clean copy of the composed
+		// frame (the back buffer outside the dirty rects holds last frame's corrected output).
+		ID3D11ShaderResourceView* srcSRV = faldOn ? FaldCleanSRV(faldMon) : textureView[index];
+		deviceContext->PSSetShaderResources(0, 1, &srcSRV);
 		if (lut)
 			deviceContext->PSSetShaderResources(1, 1, &lut->textureView);
 		deviceContext->PSSetSamplers(0, 1, &samplerState);
@@ -1009,7 +1128,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			peakSlot = GetPeakSlot(tp->left, tp->top);
 		if (peakSlot) {
 			// Input: captured backbuffer. Leaves no CS state bound on DWM's context.
-			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, textureView[index],
+			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, srcSRV,
 				peakSlot->peakUAV, peakSlot->rawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
 			deviceContext->PSSetShaderResources(5, 1, &peakSlot->peakSRV);
 		}
@@ -1109,33 +1228,94 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 
 		deviceContext->PSSetConstantBuffers(0, 1, &constantBuffer);
 
-		for (int i = 0; i < numRects; i++)
+		// The FALD layer reads the whole frame: one zone's content changes the correction of pixels
+		// far outside any dirty rect. So when the layer is on, this context gives up dirty-rect
+		// rendering — the LUT/tonemap pass draws the full frame from the layer's clean source (already
+		// updated from this present's dirty rects in FaldUpdateClean), never from the back buffer.
+		if (faldOn)
 		{
-			D3D11_BOX sourceRegion;
-			sourceRegion.left = rects[i].left;
-			sourceRegion.right = rects[i].right;
-			sourceRegion.top = rects[i].top;
-			sourceRegion.bottom = rects[i].bottom;
-			sourceRegion.front = 0;
-			sourceRegion.back = 1;
+			if (hasLutOrTonemap)
+			{
+				struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
+				DrawRectangleTex(&fullFrame, (float)backBufferDesc.Width, (float)backBufferDesc.Height);
+			}
+		}
+		else
+		{
+			for (int i = 0; i < numRects; i++)
+			{
+				D3D11_BOX sourceRegion;
+				sourceRegion.left = rects[i].left;
+				sourceRegion.right = rects[i].right;
+				sourceRegion.top = rects[i].top;
+				sourceRegion.bottom = rects[i].bottom;
+				sourceRegion.front = 0;
+				sourceRegion.back = 1;
 
-			deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
-			                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
-			DrawRectangle(&rects[i], index);
+				deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
+				                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
+				DrawRectangle(&rects[i], index);
+			}
+		}
+
+		if (faldOn)
+		{
+			// The intermediate is about to be read as a shader resource, so it must not still be
+			// bound as this context's render target.
+			deviceContext->OMSetRenderTargets(0, NULL, NULL);
+			if (!hasLutOrTonemap)
+			{
+				// Nothing to colour-correct before the layer: hand it the composed frame as it is.
+				// (Running the LUT pixel shader as a passthrough would add its dither, which the
+				// overlay path does not do either when no LUT and no tonemap are configured.)
+				deviceContext->CopyResource((ID3D11Resource*)FaldIntermediateTexture(faldMon),
+				                            (ID3D11Resource*)FaldCleanTexture(faldMon));
+			}
+			// The passes write the back buffer themselves. If any step refuses, the intermediate
+			// still holds the frame that should have been shown, so copy it out rather than leave
+			// the back buffer with whatever it held before.
+			// New content = any dirty rect outside the four corner kick zones: the host's settle kick (a 1 px window at
+			// the monitor's top-left, dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT_FMT) must not re-arm the LED-lag hold
+			// it exists to finish. Every corner, because a rotated display's back buffer may not start at that pixel.
+			// No rects = nothing changed = no new content.
+			const LONG kz = DWM_HOOK_FALD_KICK_ZONE_PX;
+			const LONG bw = (LONG)backBufferDesc.Width, bh = (LONG)backBufferDesc.Height;
+			bool newContent = false;
+			for (int i = 0; i < numRects && !newContent; i++) {
+				const RECT& rc = rects[i];
+				const bool inLeft = rc.right <= kz, inRight = rc.left >= bw - kz;
+				const bool inTop = rc.bottom <= kz, inBottom = rc.top >= bh - kz;
+				if (!((inLeft || inRight) && (inTop || inBottom))) newContent = true;
+			}
+			if (!FaldRun(faldMon, renderTargetView, newContent))
+			{
+				deviceContext->CopyResource((ID3D11Resource*)backBuffer,
+				                            (ID3D11Resource*)FaldIntermediateTexture(faldMon));
+			}
+			renderTargetView->Release();
+			renderTargetView = NULL;
 		}
 	  }
 	  catch (...) {
-		// Cleanup on exception — prevent stale bindings on DWM's device context
-		ID3D11ShaderResourceView* nullSRVs[6] = {};
-		deviceContext->PSSetShaderResources(0, 6, nullSRVs);
+		// Cleanup on exception — prevent stale bindings on DWM's device context.
+		// The ranges cover the FALD passes too (t0-t24, u0-u1): a stale shader resource hands DWM's
+		// own shaders a wrong texture, and a stale unordered-access view hands them a GPU fault.
+		ID3D11ShaderResourceView* nullSRVs[HOOK_FALD_SRV_SLOTS] = {};
+		deviceContext->PSSetShaderResources(0, HOOK_FALD_SRV_SLOTS, nullSRVs);
+		deviceContext->CSSetShaderResources(0, HOOK_FALD_SRV_SLOTS, nullSRVs);
+		ID3D11UnorderedAccessView* nullUAVs[HOOK_FALD_UAV_SLOTS] = {};
+		deviceContext->CSSetUnorderedAccessViews(0, HOOK_FALD_UAV_SLOTS, nullUAVs, NULL);
 		ID3D11SamplerState* nullSamplers[3] = {};
 		deviceContext->PSSetSamplers(0, 3, nullSamplers);
+		deviceContext->CSSetSamplers(0, 1, nullSamplers);
 		ID3D11Buffer* nullCB = NULL;
 		deviceContext->PSSetConstantBuffers(0, 1, &nullCB);
 		deviceContext->CSSetConstantBuffers(0, 1, &nullCB);
+		deviceContext->CSSetShader(NULL, NULL, 0);
 		deviceContext->VSSetShader(NULL, NULL, 0);
 		deviceContext->PSSetShader(NULL, NULL, 0);
 		deviceContext->OMSetRenderTargets(0, NULL, NULL);
+		if (renderTargetView) { renderTargetView->Release(); renderTargetView = NULL; }
 		throw;
 	  }
 	}
@@ -1146,19 +1326,27 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	// but our expanded 48-byte b0 has non-zero data at offsets 16+ that DWM's shader
 	// may misinterpret if it reads from its own (larger) constant buffer at b0.
 	{
-		ID3D11ShaderResourceView* nullSRVs[6] = {};
-		deviceContext->PSSetShaderResources(0, 6, nullSRVs);  // Clear t0-t5
+		// t0-t5 and s0-s2 are the LUT/tonemap pass's own; the wider ranges cover the FALD passes,
+		// which bind t0-t24 and u0-u1. Clearing them unconditionally costs a few calls per present
+		// and removes a whole class of "DWM rendered with our resource still bound" failure.
+		ID3D11ShaderResourceView* nullSRVs[HOOK_FALD_SRV_SLOTS] = {};
+		deviceContext->PSSetShaderResources(0, HOOK_FALD_SRV_SLOTS, nullSRVs);
+		deviceContext->CSSetShaderResources(0, HOOK_FALD_SRV_SLOTS, nullSRVs);
+		ID3D11UnorderedAccessView* nullUAVs[HOOK_FALD_UAV_SLOTS] = {};
+		deviceContext->CSSetUnorderedAccessViews(0, HOOK_FALD_UAV_SLOTS, nullUAVs, NULL);
 		ID3D11SamplerState* nullSamplers[3] = {};
 		deviceContext->PSSetSamplers(0, 3, nullSamplers);      // Clear s0-s2
+		deviceContext->CSSetSamplers(0, 1, nullSamplers);      // Clear CS s0
 		ID3D11Buffer* nullCB = NULL;
 		deviceContext->PSSetConstantBuffers(0, 1, &nullCB);    // Clear b0
 		deviceContext->CSSetConstantBuffers(0, 1, &nullCB);    // Clear CS b0
+		deviceContext->CSSetShader(NULL, NULL, 0);
 		deviceContext->VSSetShader(NULL, NULL, 0);
 		deviceContext->PSSetShader(NULL, NULL, 0);
 		deviceContext->OMSetRenderTargets(0, NULL, NULL);
 	}
 
-	return hasLutOrTonemap;  // Only report active when backbuffer was actually modified
+	return hasLutOrTonemap || faldOn;  // Only report active when backbuffer was actually modified
 }
 
 bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* rects, int numRects)

@@ -9,6 +9,7 @@
 #include "hook_log.h"
 #include "hook_lut.h"
 #include "hook_render.h"
+#include "hook_fald.h"
 
 #include <io.h>
 #include <string>
@@ -406,6 +407,7 @@ static std::atomic<bool> g_hookReverted{false};  // Set when host dies, prevents
 // --- Shared memory IPC: live parameter updates from host ---
 static HANDLE g_sharedMemHandle = NULL;
 static const DwmHookSharedConfig* g_sharedConfig = NULL;
+static bool g_sharedHasTail = false;   // the view covers DwmHookSharedConfigEx (host is new enough)
 static uint32_t g_localConfigVersion = 0;
 
 // Local tonemap params per monitor (updated from shared memory)
@@ -528,12 +530,19 @@ static void UpdateLocalTonemapFromShared() {
 
 	std::atomic_thread_fence(std::memory_order_acquire);
 
-	DwmHookSharedConfig local;
-	memcpy(&local, (const void*)g_sharedConfig, sizeof(local));
+	// Head and tail are copied inside the same seqlock window (the host writes both in one pass).
+	DwmHookSharedConfigEx localEx;          // 1.5 KB on the stack; not static (callers may race)
+	memset(&localEx, 0, sizeof(localEx));
+	memcpy(&localEx, (const void*)g_sharedConfig,
+	       g_sharedHasTail ? sizeof(DwmHookSharedConfigEx) : sizeof(DwmHookSharedConfig));
+	DwmHookSharedConfig& local = localEx.head;
 
 	std::atomic_thread_fence(std::memory_order_acquire);
 	uint32_t v2 = g_sharedConfig->version;
 	if (v1 != v2) return;
+	const bool tailValid = g_sharedHasTail && localEx.tail.magic == DWM_HOOK_TAIL_MAGIC &&
+	                       localEx.tail.layoutVersion == DWM_HOOK_TAIL_LAYOUT_VERSION &&
+	                       localEx.tail.tuningBytes == sizeof(DwmHookFaldTuning);
 
 	g_localConfigVersion = local.version;
 
@@ -668,6 +677,17 @@ static void UpdateLocalTonemapFromShared() {
 			}
 			g_numLocalTonemap++;
 		}
+		// FALD live settings ride the same pass: same key, same debounce, one word per monitor.
+		g_numLocalFald = 0;
+		for (uint32_t i = 0; i < numMons && g_numLocalFald < MAX_DWM_HOOK_MONITORS; i++) {
+			auto& fp = g_localFald[g_numLocalFald];
+			fp.left = local.monitors[i].left;
+			fp.top = local.monitors[i].top;
+			fp.flags = local.faldFlags[i];
+			fp.hasTuning = tailValid;
+			if (tailValid) fp.tuning = localEx.tail.fald[i];
+			g_numLocalFald++;
+		}
 	}
 
 	if (local.lutReloadFlag) {
@@ -679,6 +699,17 @@ LocalTonemapParams* FindTonemapForMonitor(int left, int top) {
 	for (int i = 0; i < g_numLocalTonemap; i++) {
 		if (g_localTonemap[i].left == left && g_localTonemap[i].top == top)
 			return &g_localTonemap[i];
+	}
+	return NULL;
+}
+
+LocalFaldParams g_localFald[MAX_DWM_HOOK_MONITORS] = {};
+int g_numLocalFald = 0;
+
+LocalFaldParams* FindFaldForMonitor(int left, int top) {
+	for (int i = 0; i < g_numLocalFald; i++) {
+		if (g_localFald[i].left == left && g_localFald[i].top == top)
+			return &g_localFald[i];
 	}
 	return NULL;
 }
@@ -747,8 +778,10 @@ static bool ReadOverlaySwapChainInfo(void* overlaySwapChain, bool& hwProtected, 
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
-	if (g_diagNoLutDraw)
+	if (g_diagNoLutDraw) {
+		FaldMarkContextStale(self);
 		return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
+	}
 
 	// Check for shared memory updates (live tonemap param changes from host)
 	UpdateLocalTonemapFromShared();
@@ -780,6 +813,10 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 				}
 				backBuffer->Release();
 			}
+			else
+			{
+				FaldMarkContextStale(self);   // this present never reached the FALD layer
+			}
 
 			// No fallback probing — ApplyLUTDirect returning false means
 			// this monitor has no LUT configured, not a failure to try harder.
@@ -796,10 +833,12 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 
 			if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
 			{
+				FaldMarkContextStale(self);
 				UnsetLUTActive(self);
 			}
 			else if (hwProtected)
 			{
+				FaldMarkContextStale(self);
 				LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 				UnsetLUTActive(self);
 			}
@@ -838,10 +877,12 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 
 		if (!ReadOverlaySwapChainInfo(overlaySwapChain, hwProtected, swapChain))
 		{
+			FaldMarkContextStale(self);
 			UnsetLUTActive(self);
 		}
 		else if (hwProtected)
 		{
+			FaldMarkContextStale(self);
 			LOG_ONLY_ONCE("Hardware protected - unsetting LUT active")
 			UnsetLUTActive(self);
 		}
@@ -868,6 +909,10 @@ static bool HasActiveHookProcessing() {
 	if (numLuts > 0) return true;
 	for (int i = 0; i < g_numLocalTonemap; i++) {
 		if (g_localTonemap[i].enabled) return true;
+	}
+	// FALD needs the composed frame too: a monitor with the layer on must not direct-flip past the hook
+	for (int i = 0; i < g_numLocalFald; i++) {
+		if (DwmHookFaldEnabled(g_localFald[i].flags) && FaldHasAnyPanelFile()) return true;
 	}
 	return false;
 }
@@ -1084,10 +1129,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			{
 				g_sharedMemHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, DWM_HOOK_CONFIG_NAME);
 				if (g_sharedMemHandle) {
+					// Head + FALD tuning tail; an older host's mapping is the 464-byte head only, and
+					// then starfield / glow fill run on their defaults.
 					g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
-						g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
+						g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfigEx));
+					g_sharedHasTail = (g_sharedConfig != NULL);
+					if (!g_sharedConfig)
+						g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
+							g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
 					if (g_sharedConfig) {
-						log_to_file("Shared memory opened OK");
+						log_to_file(g_sharedHasTail ? "Shared memory opened OK (with FALD tuning tail)"
+						                            : "Shared memory opened OK (head only: FALD tuning at defaults)");
 						// Initial read of tonemap params
 						UpdateLocalTonemapFromShared();
 					} else {
@@ -1354,6 +1406,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				log_to_file("AddLUTs FAILED — returning FALSE");
 				return FALSE;
 			}
+			// FALD panel parameter files, from the subdirectory beside the .cube files. Read here and
+			// only here: the host deletes the whole staging directory the moment injection returns.
+			// A missing or unreadable file is not fatal — the layer simply stays off for that monitor.
+			FaldLoadPanelFiles(lutFolderPath);
 			{
 				char msg[256];
 				snprintf(msg, sizeof(msg), "AddLUTs OK: numLuts=%d hooks=%s",
@@ -1366,7 +1422,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			for (int ti = 0; ti < g_numLocalTonemap; ti++) {
 				if (g_localTonemap[ti].enabled) { hasTonemapViaShared = true; break; }
 			}
-			bool hasActiveWork = (numLuts > 0) || hasTonemapViaShared;
+			// FALD panel files are work too: a FALD-only setup (no .cube, tonemap off) must still hook.
+			bool hasActiveWork = (numLuts > 0) || hasTonemapViaShared || FaldHasAnyPanelFile();
 
 			if (hasActiveWork && (COverlayContext_Present_orig || COverlayContext_Present_orig_24h2))
 
