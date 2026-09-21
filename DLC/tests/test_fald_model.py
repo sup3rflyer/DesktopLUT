@@ -377,3 +377,76 @@ def test_ceiling_rule_keeps_flat_fields_and_full_white_identity():
         res = correct_image(m, img)
         interior = (slice(None), slice(m.h // 4, 3 * m.h // 4), slice(m.w // 4, 3 * m.w // 4))
         assert np.allclose(res["req"][interior], img[interior], rtol=2e-3)
+
+
+# ------------------------------------------------------------------ the meter's aperture window
+# forward_img(window=...) exists so meter_img does not form the whole frame to average ~0.5 % of it
+# (2026-09-21). Its contract is EXACT equality with the cropped full-frame result, so these two tests
+# are what stands between that optimisation and a silently different meter reading.
+def _window_cases(m):
+    """Meter spots + apertures that exercise the interior, every edge, a corner, and a miss."""
+    W, H = m.p.width, m.p.height
+    for meter in ((W * 0.5, H * 0.5), (0.0, 0.0), (W, H), (W * 0.5, 0.0), (0.0, H * 0.37),
+                  (W - 1.0, H * 0.5), (-4000.0, H * 0.5), (W * 0.5, 9e4)):
+        for ap in (None, 3.0, 80.0, 700.0):
+            yield meter, ap
+
+
+@pytest.mark.parametrize("params", [FaldParams(), _sdr_params(),
+                                    FaldParams(est_kind="mix", est_phase_px=-37.0, est_aniso=0.72),
+                                    FaldParams(est_cell=True, est_interp="bilinear", est_phase_px=-40.0),
+                                    FaldParams(flat_norm=False, kernel_pnorm=1.4)],
+                         ids=["hdr", "sdr", "mix", "cell", "noflat"])
+def test_a_forward_window_is_exactly_the_full_frame_cropped(params):
+    m = FaldModel(params)
+    mx = (1 << params.code_bits) - 1
+    img = m.render([((mx, mx // 2, mx // 3), rect(300, 200, 900, 700)), ((mx, mx, mx), rect(2600, 1500, 400, 300))])
+    full = m.forward_img(img)
+    assert full["window"] is None
+    for window in ((0, m.h, 0, m.w), (7, 23, 11, 40), (0, 4, 0, 4), (m.h - 3, m.h, m.w - 9, m.w), (5, 5, 5, 9)):
+        got = m.forward_img(img, window=window)
+        y0, y1, x0, x1 = window
+        assert got["window"] == window
+        for k in ("b_true", "b_est", "t", "y"):
+            want = full[k][..., y0:y1, x0:x1]
+            assert got[k].shape == want.shape, (k, window)
+            assert np.array_equal(got[k], want), (k, window)     # exact: the crop may not re-round anything
+        assert np.array_equal(got["drives"], full["drives"])     # a cell's drive is a statistic over ALL its pixels
+        assert got["boost"] == full["boost"]                     # and the LED boost counts the whole raster
+
+
+@pytest.mark.parametrize("params", [FaldParams(), _sdr_params()], ids=["hdr", "sdr"])
+def test_the_aperture_window_holds_the_whole_disc(params):
+    m = FaldModel(params)
+    for meter, ap in _window_cases(m):
+        y0, y1, x0, x1 = m.aperture_window(meter, ap)
+        assert 0 <= y0 <= y1 <= m.h and 0 <= x0 <= x1 <= m.w, (meter, ap)
+        full = m.aperture_mask(meter, ap)                        # the disc over the whole frame
+        inside = m.aperture_mask(meter, ap, window=(y0, y1, x0, x1))
+        assert np.array_equal(inside, full[y0:y1, x0:x1]), (meter, ap)
+        assert full.sum() == inside.sum(), (meter, ap)           # nothing selected outside the window
+
+
+# The GPU twins compare the emulator against THIS model, so a change to the model's own arithmetic is
+# common-mode and cancels: a deliberate 1-ppm scale error inside _spectra_conv passed every twin test
+# (checked 2026-09-21). backlight_fine's batched transform therefore needs its own gate, against the
+# per-kernel scipy call it replaced.
+@pytest.mark.parametrize("params", [FaldParams(), _sdr_params(), FaldParams(kernel_pnorm=1.4)],
+                         ids=["hdr", "sdr", "pnorm"])
+def test_the_batched_kernel_transform_matches_fftconvolve_exactly(params):
+    from scipy.signal import fftconvolve
+    p = params
+    m = FaldModel(p)
+    drives = np.random.default_rng(20260921).random((p.rows, p.cols))
+    kinds = [("mix", p.tail_mm, p.core_mm, p.tail_frac, (0.0, 0.0), 1.0, 0, p.kernel_pnorm),
+             ("exp", p.est_scale_mm, 0.0, 0.0, (-26.8, -21.0), 0.9, p.est_support_cells, 2.0),
+             ("gauss", p.est_scale_mm, 0.0, 0.0, (0.0, 0.0), 1.0, 4, 2.0),
+             ("knots", p.est_scale_mm, 0.0, 0.0, (3.0, -2.0), 1.0, 0, 2.0)]
+    for kind, scale, core, frac, phase, aniso, support, pnorm in kinds:
+        got = m.backlight_fine(drives, kind, scale, core, frac, phase, aniso, support, pnorm)
+        kern = m._kernels(kind, scale, core, frac, (phase[0] * p.px_mm, phase[1] * p.px_mm), aniso, support, pnorm)
+        want = np.zeros((p.rows * p.sub, p.cols * p.sub))
+        for oy in range(p.sub):
+            for ox in range(p.sub):
+                want[oy::p.sub, ox::p.sub] = fftconvolve(drives, kern[oy][ox], mode="same")
+        assert np.array_equal(got, want), kind          # exact: the batch may not change the arithmetic

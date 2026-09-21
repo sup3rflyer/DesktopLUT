@@ -662,8 +662,7 @@ struct MonitorContext {
     ID3D11Texture2D* peakStagingTexture = nullptr;    // Staging texture for CPU readback
     ID3D11Texture2D* peakStagingTexture2 = nullptr;  // Second staging for double-buffered readback
     int peakStagingReadIndex = 0;                     // Alternates 0/1 for deferred readback
-    int lastPeakCBWidth = 0;                          // Track last written dimensions to avoid redundant CB updates
-    int lastPeakCBHeight = 0;
+    std::chrono::steady_clock::time_point lastPeakReadbackTime{};  // Throttles the CPU peak readback (analysis/log)
     float detectedPeakNits = 0.0f;                    // Last DETECTED/measured peak (observation, for analysis
                                                       //   overlay) — NOT a target/scaling input. docs/NAMING.md §1.
 
