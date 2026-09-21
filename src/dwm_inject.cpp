@@ -879,9 +879,6 @@ static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
     }
 }
 
-#ifndef STATUS_GRAPHICS_PRESENT_OCCLUDED
-#define STATUS_GRAPHICS_PRESENT_OCCLUDED ((DWORD)0xC01E05A1)   // as framepacer.cpp
-#endif
 // ---------------------------------------------------------------------------
 // FALD services for the hook (dwm_hook_config.h): the LED-lag settle kicker and priming requests
 // ---------------------------------------------------------------------------
@@ -897,9 +894,8 @@ static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
 //    (RequestFaldFullRecompose, via WM_FALD_RECOMPOSE). Throttled here too.
 // The DLL does not count a present whose dirty rects sit in a corner kick zone as new content. Topmost only while
 // kicking; in hook mode nothing is in independent flip (DisableIndependentFlip), so no VRR path is disturbed. The
-// thread pumps its messages in every wait (hidden top-level windows still receive broadcasts). Pacing: the compositor
-// clock with the stop event in the same wait (Windows 11), else a short timed wait — never DwmFlush, which can block
-// through a DWM restart and outlive StopFaldSettleKicker's wait.
+// thread pumps its messages on every iteration (hidden top-level windows still receive broadcasts). Pacing: a high-
+// resolution timer at the fastest monitor's refresh period, with the stop event in the same wait (see the thread).
 static const ULONGLONG FALD_KICK_QUIET_MS = 100;      // SETTLE silent this long: that monitor's session is over
 static const ULONGLONG FALD_PRIME_MIN_GAP_MS = 1000;  // recompose requests at most this often
 static const ULONGLONG FALD_KICK_ENUM_MS = 2000;      // monitor list refresh (events must exist before the DLL opens them)
@@ -944,10 +940,17 @@ static void PumpThreadMessages() {
 }
 
 static DWORD WINAPI FaldSettleKickThread(LPVOID) {
-    typedef DWORD (WINAPI *PFN_WaitCompClock)(UINT, const HANDLE*, DWORD);
-    PFN_WaitCompClock waitClock = nullptr;
-    if (HMODULE dcomp = LoadLibraryW(L"dcomp.dll"))
-        waitClock = (PFN_WaitCompClock)GetProcAddress(dcomp, "DCompositionWaitForCompositorClock");
+    // Physical pixels: the kick pixel must land exactly on each monitor's top-left (a DPI-virtualised thread placed the
+    // second monitor's window at (-3072,-170) = (-3840,-212) x 0.8 on HW 2026-09-21 — rounding can miss the monitor).
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    // Pacing: a high-resolution waitable timer at the fastest monitor's refresh period. NOT the compositor clock, which
+    // only ticks while DWM has something to compose (HW 2026-09-21: during 24 fps video it woke only on content
+    // frames, saw content every time and never kicked — the hook ran at 24 runs/s), and not DwmFlush (it can outlive
+    // StopFaldSettleKicker's wait through a DWM restart). Kicking faster than a monitor refreshes is harmless: DWM
+    // composes once per refresh.
+    HANDLE paceTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!paceTimer) paceTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    double pacePeriodMs = 1000.0 / 60.0;
 
     WNDCLASSW wc = {};
     wc.lpfnWndProc = DefWindowProcW;
@@ -999,6 +1002,12 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
             if (!m.settle || !m.content || !m.wnd) { closeMon(m); continue; }
             mons.push_back(m);
         }
+        double fastest = 0.0;                                          // the pacing period follows refresh changes
+        for (const FaldKickMonitor& m : mons) {
+            const float ms = RefreshPeriodMsAt((int)m.origin.x, (int)m.origin.y);
+            if (ms > 1.0f && (fastest == 0.0 || ms < fastest)) fastest = ms;
+        }
+        pacePeriodMs = fastest > 0.0 ? fastest : 1000.0 / 60.0;
         lastEnumMs = GetTickCount64();
     };
     auto handlePrime = [&]() {
@@ -1032,14 +1041,14 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
         }
 
         // kicking: one iteration per composition
-        if (waitClock) {
-            // The return value does NOT tell "stop" from "the clock ticked" reliably (a tick can come back as
-            // WAIT_OBJECT_0 = index 0 = the stop handle — HW 2026-09-21: the loop exited on its first tick and the
-            // hook ran at the content rate only). The stop event is tested on its own below.
-            const DWORD w = waitClock(1, &g_faldKickStop, 100);
-            if (w == (DWORD)STATUS_GRAPHICS_PRESENT_OCCLUDED) Sleep(50);     // display off: nothing to compose
+        // one iteration per refresh of the fastest monitor (timer), or at once on stop
+        if (paceTimer) {
+            LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(pacePeriodMs * 10000.0);   // relative, 100 ns units
+            SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE);
+            HANDLE w2[2] = { g_faldKickStop, paceTimer };
+            WaitForMultipleObjects(2, w2, FALSE, 100);
         } else {
-            WaitForSingleObject(g_faldKickStop, 8);
+            WaitForSingleObject(g_faldKickStop, (DWORD)(pacePeriodMs + 0.5));
         }
         if (WaitForSingleObject(g_faldKickStop, 0) == WAIT_OBJECT_0) break;  // stop
         if (WaitForSingleObject(g_faldPrimeEvent, 0) == WAIT_OBJECT_0) handlePrime();
@@ -1063,6 +1072,7 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
         PumpThreadMessages();
     }
     for (FaldKickMonitor& m : mons) closeMon(m);
+    if (paceTimer) CloseHandle(paceTimer);
     if (oldBmp) SelectObject(memDC, oldBmp);
     if (bmp) DeleteObject(bmp);
     DeleteDC(memDC);
@@ -1088,7 +1098,7 @@ static void StartFaldSettleKicker() {
 static void StopFaldSettleKicker() {
     if (!g_faldKickThread) return;
     SetEvent(g_faldKickStop);
-    // The thread only waits on the stop event (compositor clock / timed / message waits), so it exits within a frame.
+    // The thread only waits on the stop event (timer / timed / message waits), so it exits within a frame.
     // If it somehow does not, its handles stay open (leaked on purpose): closing them under a live thread would hand
     // it recycled handle values.
     if (WaitForSingleObject(g_faldKickThread, 5000) != WAIT_OBJECT_0) {
