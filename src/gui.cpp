@@ -277,15 +277,18 @@ static bool WarnFaldTransferMismatch(const std::wstring& path, bool isHDR) {
     return true;
 }
 
+void RequestFaldFullRecompose();   // below: forces one full DWM composition for the hook's FALD layer
+
 // View / pedestal changed: they are mirrored in both modes' settings, so push both, persist once.
 static void ApplyFaldSharedSettingChange() {
     const bool anyEnabled = FaldSlot(true).enabled || FaldSlot(false).enabled;
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
         UpdateColorCorrectionLive(g_gui.currentMonitor, false);
-        if (g_dwmHookMode.load())
+        if (g_dwmHookMode.load()) {
             UpdateDwmHookSharedConfig();
-        else
+            RequestFaldFullRecompose();
+        } else
             DwmHookReevaluateOverlay();
     } else if (anyEnabled) {
         StartProcessing();
@@ -294,13 +297,64 @@ static void ApplyFaldSharedSettingChange() {
     UpdateGUIState();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Hook FALD: force one full-screen DWM composition.
+// DWM re-composes only its dirty rects; outside them the back buffer keeps the previous frame's
+// finished output. The hook's FALD layer therefore keeps its own clean copy of the composed frame,
+// fed from the dirty rects, and stays off until a full-frame composition has primed that copy
+// (dwm_hook/hook_fald.h, FaldUpdateClean). Switching the layer OFF likewise leaves corrected pixels
+// outside the next dirty rects. The hook cannot ask DWM for a full recompose, so the host makes one:
+// a click-through, 1/255-alpha topmost window over the whole virtual screen, shown for a few frames
+// and hidden — its appearance and its removal each re-compose everything under it.
+// ---------------------------------------------------------------------------------------------
+static HWND g_faldRecomposeWnd = nullptr;
+static int g_faldRecomposeStage = 0;   // 0 = idle/armed, 1 = window shown
+
+void RequestFaldFullRecompose() {
+    if (!g_dwmHookMode.load() || !g_gui.hwndMain) return;
+    g_faldRecomposeStage = 0;
+    // Short delay: the hook reads the new flags at the top of the next present; give the shared
+    // config (and a re-injection's attach) a moment to land before the composition that primes.
+    SetTimer(g_gui.hwndMain, FALD_RECOMPOSE_TIMER_ID, 150, nullptr);
+}
+
+static void FaldRecomposeTick(HWND hwnd) {
+    if (g_faldRecomposeStage == 0) {
+        if (!g_faldRecomposeWnd) {
+            WNDCLASSW wc = {};
+            wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+            wc.lpszClassName = L"DesktopLUT_FaldRecompose";
+            RegisterClassW(&wc);   // fails harmlessly if already registered
+            g_faldRecomposeWnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+            if (g_faldRecomposeWnd)
+                SetLayeredWindowAttributes(g_faldRecomposeWnd, 0, 1, LWA_ALPHA);
+        }
+        if (!g_faldRecomposeWnd) { KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID); return; }
+        SetWindowPos(g_faldRecomposeWnd, HWND_TOPMOST,
+                     GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+                     GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        g_faldRecomposeStage = 1;
+        SetTimer(hwnd, FALD_RECOMPOSE_TIMER_ID, 100, nullptr);   // a few frames at any refresh rate
+    } else {
+        ShowWindow(g_faldRecomposeWnd, SW_HIDE);
+        g_faldRecomposeStage = 0;
+        KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID);
+    }
+}
+
 // FALD layer setting changed for the current monitor (one mode): push to the render thread and persist.
 static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
-        if (g_dwmHookMode.load())
+        if (g_dwmHookMode.load()) {
             UpdateDwmHookSharedConfig();
-        else
+            RequestFaldFullRecompose();
+        } else
             DwmHookReevaluateOverlay();
     } else if (enabledNow) {
         StartProcessing();
@@ -2433,6 +2487,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively
         StartDwmHookBeacon(hwnd, "injection");
+        RequestFaldFullRecompose();   // prime the hook FALD layer's clean source
         return 0;
 
     case WM_SHADER_STATE_CHANGED:  // Shader active state changed (from render thread)
@@ -2745,6 +2800,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ReattachMonitorSettings(hwnd, "deferred/retry");
             return 0;
         }
+        if (wParam == FALD_RECOMPOSE_TIMER_ID) {
+            FaldRecomposeTick(hwnd);
+            return 0;
+        }
         if (wParam == DWM_HOOK_RESEND_TIMER_ID) {
             // Resend pump started by StartDwmHookConfigResends. Re-enumerate fresh
             // each tick: if the first snapshot raced the mode transition, later
@@ -2759,6 +2818,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // The mode change has settled (DWM recreates overlay contexts on a modeset /
                 // HDR flip): re-identify the twins positively rather than trust liveness alone.
                 StartDwmHookBeacon(hwnd, "display change settled");
+                RequestFaldFullRecompose();   // mode flips re-key the hook's FALD entry (HDR <-> SDR)
             }
             return 0;
         }

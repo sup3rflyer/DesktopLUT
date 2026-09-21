@@ -224,6 +224,17 @@ struct FaldMonitor {
     ID3D11RenderTargetView* interRTV = nullptr;
     ID3D11ShaderResourceView* interSRV = nullptr;
 
+    // Clean source: the composed frame as DWM drew it, BEFORE any of our passes. DWM only re-composes
+    // its dirty rects into the back buffer — everywhere else the back buffer still holds the previous
+    // frame's FINISHED output (LUT + FALD). The layer needs the whole frame, so it cannot read the
+    // back buffer wholesale (that re-corrects corrected pixels every present: stacking); it keeps
+    // this copy up to date from the dirty rects alone and reads the full frame from here.
+    // `primed` = every pixel has been written from a composed rect since the copy last went stale
+    // (creation, or a present of this monitor the layer did not see) — until then the layer is off.
+    ID3D11Texture2D* cleanTex = nullptr;
+    ID3D11ShaderResourceView* cleanSRV = nullptr;
+    bool primed = false;
+
     // panel tables
     ID3D11Texture2D* curveTex = nullptr;  ID3D11ShaderResourceView* curveSRV = nullptr;
     ID3D11Buffer* kTrueBuf = nullptr;     ID3D11ShaderResourceView* kTrueSRV = nullptr;
@@ -267,6 +278,8 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->kTrueSRV); SafeRelease(m->kTrueBuf);
     SafeRelease(m->curveSRV); SafeRelease(m->curveTex);
     SafeRelease(m->interSRV); SafeRelease(m->interRTV); SafeRelease(m->interTex);
+    SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
+    m->primed = false;
     m->valid = false;
 }
 
@@ -332,6 +345,13 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
             FAILED(g_dev->CreateShaderResourceView(m->interTex, nullptr, &m->interSRV))) {
             log_to_file("FALD: intermediate render target creation failed"); return false;
         }
+        // clean source: same format + size as the back buffer, the copy target of its dirty rects
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &m->cleanTex)) ||
+            FAILED(g_dev->CreateShaderResourceView(m->cleanTex, nullptr, &m->cleanSRV))) {
+            log_to_file("FALD: clean source texture creation failed"); return false;
+        }
+        m->primed = false;
     }
     // curve LUT (curveN x 1, R32F)
     {
@@ -419,6 +439,40 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
 
 ID3D11RenderTargetView* FaldIntermediateRTV(FaldMonitor* m) { return m ? m->interRTV : nullptr; }
 ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m) { return m ? m->interTex : nullptr; }
+ID3D11Texture2D* FaldCleanTexture(FaldMonitor* m) { return m ? m->cleanTex : nullptr; }
+ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m) { return m ? m->cleanSRV : nullptr; }
+
+bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* rects, int numRects) {
+    if (!m || !m->valid || !m->cleanTex || !backBuffer || !g_ctx) return false;
+    // The same monitor's entry for the OTHER mode does not see these rects: it has to re-prime.
+    for (int i = 0; i < g_numMonitors; i++) {
+        FaldMonitor* e = g_monitors[i];
+        if (e && e != m && e->left == m->left && e->top == m->top) e->primed = false;
+    }
+    const LONG w = (LONG)m->width, h = (LONG)m->height;
+    for (int i = 0; i < numRects; i++) {
+        const LONG l = rects[i].left > 0 ? rects[i].left : 0;
+        const LONG t = rects[i].top > 0 ? rects[i].top : 0;
+        const LONG r = rects[i].right < w ? rects[i].right : w;
+        const LONG b = rects[i].bottom < h ? rects[i].bottom : h;
+        if (r <= l || b <= t) continue;
+        D3D11_BOX box = { (UINT)l, (UINT)t, 0, (UINT)r, (UINT)b, 1 };
+        g_ctx->CopySubresourceRegion(m->cleanTex, 0, (UINT)l, (UINT)t, 0, backBuffer, 0, &box);
+        if (!m->primed && l == 0 && t == 0 && r == w && b == h) {
+            m->primed = true;
+            LogF("FALD: pos(%d,%d) %s clean source primed by a full-frame composition",
+                 m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)");
+        }
+    }
+    return m->primed;
+}
+
+void FaldMarkStale(int left, int top) {
+    for (int i = 0; i < g_numMonitors; i++) {
+        FaldMonitor* e = g_monitors[i];
+        if (e && e->left == left && e->top == top) e->primed = false;
+    }
+}
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode) {
     if (!m) return;

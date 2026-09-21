@@ -482,6 +482,44 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top)
 	}
 }
 
+// Draw `rect` of the back buffer from a source texture of texW x texH (UVs are rect / tex size).
+static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
+{
+	float width = backBufferDesc.Width;
+	float height = backBufferDesc.Height;
+
+	float screenLeft = rect->left / width;
+	float screenTop = rect->top / height;
+	float screenRight = rect->right / width;
+	float screenBottom = rect->bottom / height;
+
+	float left = screenLeft * 2 - 1;
+	float top = screenTop * -2 + 1;
+	float right = screenRight * 2 - 1;
+	float bottom = screenBottom * -2 + 1;
+
+	float texLeft = rect->left / texW;
+	float texTop = rect->top / texH;
+	float texRight = rect->right / texW;
+	float texBottom = rect->bottom / texH;
+
+	float vertexData[] = {
+		left, bottom, texLeft, texBottom,
+		left, top, texLeft, texTop,
+		right, bottom, texRight, texBottom,
+		right, top, texRight, texTop
+	};
+
+	D3D11_MAPPED_SUBRESOURCE resource;
+	EXECUTE_WITH_LOG(deviceContext->Map(vertexBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &resource))
+	memcpy(resource.pData, vertexData, stride * numVerts);
+	deviceContext->Unmap(vertexBuffer, 0);
+
+	deviceContext->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+
+	deviceContext->Draw(numVerts, 0);
+}
+
 void DrawRectangle(struct tagRECT* rect, int index)
 {
 	float width = backBufferDesc.Width;
@@ -961,6 +999,17 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				newBackBufferDesc.Width, newBackBufferDesc.Height, newBackBufferDesc.Format);
 			if (faldMon)
 				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags));
+			// Feed this present's dirty rects into the layer's clean source. Until a full-frame
+			// composition has primed it, the layer stays off and this present takes the ordinary
+			// dirty-rect path below (the host forces a full recompose when the layer is switched on).
+			if (faldMon && !FaldUpdateClean(faldMon, backBuffer, rects, numRects))
+				faldMon = NULL;
+			else if (!faldMon)
+				FaldMarkStale(monLeft, monTop);
+		}
+		else
+		{
+			FaldMarkStale(monLeft, monTop);
 		}
 		FaldPollDumpRequest();   // heavily throttled inside; arms a one-shot field dump
 	}
@@ -1033,8 +1082,10 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		deviceContext->VSSetShader(vertexShader, NULL, 0);
 		deviceContext->PSSetShader(pixelShader, NULL, 0);
 
-		// Bind shader resources
-		deviceContext->PSSetShaderResources(0, 1, &textureView[index]);
+		// Bind shader resources. With FALD on the source is the layer's clean copy of the composed
+		// frame (the back buffer outside the dirty rects holds last frame's corrected output).
+		ID3D11ShaderResourceView* srcSRV = faldOn ? FaldCleanSRV(faldMon) : textureView[index];
+		deviceContext->PSSetShaderResources(0, 1, &srcSRV);
 		if (lut)
 			deviceContext->PSSetShaderResources(1, 1, &lut->textureView);
 		deviceContext->PSSetSamplers(0, 1, &samplerState);
@@ -1054,7 +1105,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			peakSlot = GetPeakSlot(tp->left, tp->top);
 		if (peakSlot) {
 			// Input: captured backbuffer. Leaves no CS state bound on DWM's context.
-			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, textureView[index],
+			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, srcSRV,
 				peakSlot->peakUAV, peakSlot->rawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
 			deviceContext->PSSetShaderResources(5, 1, &peakSlot->peakSRV);
 		}
@@ -1155,39 +1206,32 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		deviceContext->PSSetConstantBuffers(0, 1, &constantBuffer);
 
 		// The FALD layer reads the whole frame: one zone's content changes the correction of pixels
-		// far outside any dirty rect, and the staging texture is only valid where a rect has covered
-		// it since it was created. So when the layer is on, this context gives up dirty-rect
-		// rendering — full copy, full draw — for as long as it stays on.
-		struct tagRECT fullFrame;
-		struct tagRECT* drawRects = rects;
-		int drawCount = numRects;
+		// far outside any dirty rect. So when the layer is on, this context gives up dirty-rect
+		// rendering — the LUT/tonemap pass draws the full frame from the layer's clean source (already
+		// updated from this present's dirty rects in FaldUpdateClean), never from the back buffer.
 		if (faldOn)
 		{
-			fullFrame.left = 0;
-			fullFrame.top = 0;
-			fullFrame.right = (LONG)backBufferDesc.Width;
-			fullFrame.bottom = (LONG)backBufferDesc.Height;
-			drawRects = &fullFrame;
-			drawCount = 1;
-		}
-
-		for (int i = 0; i < drawCount; i++)
-		{
-			D3D11_BOX sourceRegion;
-			sourceRegion.left = drawRects[i].left;
-			sourceRegion.right = drawRects[i].right;
-			sourceRegion.top = drawRects[i].top;
-			sourceRegion.bottom = drawRects[i].bottom;
-			sourceRegion.front = 0;
-			sourceRegion.back = 1;
-
-			// With no LUT and no tonemap there is nothing to draw from the staging copy, and the
-			// frame goes straight into the layer's intermediate below instead.
 			if (hasLutOrTonemap)
 			{
-				deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, drawRects[i].left,
-				                                     drawRects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
-				DrawRectangle(&drawRects[i], index);
+				struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
+				DrawRectangleTex(&fullFrame, (float)backBufferDesc.Width, (float)backBufferDesc.Height);
+			}
+		}
+		else
+		{
+			for (int i = 0; i < numRects; i++)
+			{
+				D3D11_BOX sourceRegion;
+				sourceRegion.left = rects[i].left;
+				sourceRegion.right = rects[i].right;
+				sourceRegion.top = rects[i].top;
+				sourceRegion.bottom = rects[i].bottom;
+				sourceRegion.front = 0;
+				sourceRegion.back = 1;
+
+				deviceContext->CopySubresourceRegion((ID3D11Resource*)texture[index], 0, rects[i].left,
+				                                     rects[i].top, 0, (ID3D11Resource*)backBuffer, 0, &sourceRegion);
+				DrawRectangle(&rects[i], index);
 			}
 		}
 
@@ -1202,7 +1246,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				// (Running the LUT pixel shader as a passthrough would add its dither, which the
 				// overlay path does not do either when no LUT and no tonemap are configured.)
 				deviceContext->CopyResource((ID3D11Resource*)FaldIntermediateTexture(faldMon),
-				                            (ID3D11Resource*)backBuffer);
+				                            (ID3D11Resource*)FaldCleanTexture(faldMon));
 			}
 			// The passes write the back buffer themselves. If any step refuses, the intermediate
 			// still holds the frame that should have been shown, so copy it out rather than leave

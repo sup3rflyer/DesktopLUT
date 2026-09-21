@@ -75,6 +75,19 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
 ID3D11RenderTargetView* FaldIntermediateRTV(FaldMonitor* m);
 ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m);
 
+// The layer's clean source (see FaldMonitor::cleanTex): the composed frame before any of our passes,
+// kept current from DWM's dirty rects only. DWM re-composes nothing outside those rects — the back
+// buffer there holds the previous frame's finished (corrected) output — so the layer must never read
+// the back buffer wholesale, or it corrects its own output again every present.
+// FaldUpdateClean copies this present's dirty rects in and returns true once the copy is PRIMED
+// (a full-frame rect has landed since it went stale); until then the caller must not run the layer.
+// FaldMarkStale is called for every present of a monitor the layer did NOT see (layer off, other
+// mode): the rects of that present never reached the copy, so it has to be re-primed.
+bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const struct tagRECT* rects, int numRects);
+void FaldMarkStale(int left, int top);
+ID3D11Texture2D* FaldCleanTexture(FaldMonitor* m);
+ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
+
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags), applied to the next run.
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode);
 

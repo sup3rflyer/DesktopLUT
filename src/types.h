@@ -269,6 +269,7 @@ const int DWM_HOOK_RESEND_INTERVAL_MS = 2000;   // Resend spacing — hook needs
                                                 // accept an HDR flip; each resend re-enumerates DXGI fresh
 const int DWM_HOOK_BEACON_TIMER_ID = 111;       // Identity-beacon session: repaints the beacon squares
 const int MONITOR_IDENTITY_TIMER_ID = 112;      // Deferred/retried settings re-attach after a display change
+const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
 const int MHC_VERIFY_TIMER_ID = 106;            // Periodic re-assertion of MHC ICC profile associations
