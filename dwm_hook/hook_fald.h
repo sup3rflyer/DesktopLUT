@@ -4,10 +4,10 @@
 // The STATELESS layer — stat -> boost -> conv -> gain, twice (two inverse rounds), then the pixel
 // pass — plus the stateless starfield feature: starfield balancing (S0-S2, before round 0) and its
 // glow-fill part (G0-G4, after each round's gain; HDR/PQ only, never without starfield). Both are
-// pure functions of the current frame. Deliberately absent, and staying in the overlay path
-// (src/fald.cpp):
-//   * the first-order temporal filter (pass 1b, modes 1/2) and its delay ring
-//   * the panel clock (pass 1c, mode 3) and the settle hold
+// pure functions of the current frame. And LED lag — the temporal drive state (pass 1b modes 1/2 with its delay ring,
+// pass 1c the panel clock, the settle hold) — whose bookkeeping is shared/fald_temporal.cpp, the SAME code the overlay
+// runs. Its one hook-specific part: DWM presents nothing on a static desktop, so while the state settles the DLL
+// signals DWM_HOOK_FALD_SETTLE_EVENT and the host keeps DWM composing (src/dwm_inject.cpp FaldSettleKickThread).
 // src/fald.h documents each of those as bit-identical when off, so leaving them out is not a
 // behaviour fork: with them off, this path must produce EXACTLY what the overlay path produces for
 // the same input frame. That is the acceptance gate, and it is why there is no "hook variant" of
@@ -39,7 +39,7 @@ struct ID3D11Texture2D;
 // (t0..t24, u0..u1). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
 #define HOOK_FALD_SRV_SLOTS 25
-#define HOOK_FALD_UAV_SLOTS 2
+#define HOOK_FALD_UAV_SLOTS 4   // u0..u3: the panel-clock pass (LED lag mode 3) binds four
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed
 // out by FaldAcquire and released wholesale by FaldReleaseAll (UninitializeStuff).
@@ -100,7 +100,9 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
 // bound on DWM's context. Does not throw: a failure inside it would leave the back buffer
 // unwritten, so every step that can fail is checked and the caller is told to fall back by the
 // return value (false = copy the intermediate to the back buffer and carry on uncorrected).
-bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV);
+// newContent: this present carries a content change (not only the host's settle kick — see
+// DWM_HOOK_FALD_SETTLE_EVENT); it re-arms the LED-lag settle hold.
+bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent);
 
 // Microseconds the last FaldRun spent on the CPU side of the present path (QPC span around the
 // dispatches; the GPU work is asynchronous). Logged periodically so the frame cost is a number

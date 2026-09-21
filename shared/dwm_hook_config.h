@@ -130,6 +130,16 @@ static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FA
 // defaults. The tail is written inside the SAME seqlock as the head (the head's `version`), so a
 // reader copies head + tail in one consistent snapshot. `magic` + `layoutVersion` + `tuningBytes`
 // let a reader reject a tail it does not understand instead of misreading it.
+// LED-lag settle hold in hook mode. DWM presents nothing on a static desktop, but the temporal state keeps moving
+// for a few refreshes after the last content change. While a monitor still owes settle frames the DLL signals this
+// auto-reset event on every run; the host then keeps DWM composing that monitor by re-painting a 1 x 1 px,
+// click-through window at the monitor's top-left pixel each refresh, until the signals stop. The DLL does not count
+// a present whose dirty rects all lie inside the top-left KICK_ZONE box as new content (it would re-arm the hold
+// forever); the box is larger than the pixel in case DWM pads a dirty rect.
+#define DWM_HOOK_FALD_SETTLE_EVENT  L"Global\\DesktopLUT_DwmHook_FaldSettle"
+#define DWM_HOOK_FALD_KICK_PX       1
+#define DWM_HOOK_FALD_KICK_ZONE_PX  16
+
 #define DWM_HOOK_TAIL_MAGIC          0x444C4654u   // 'TFLD'
 #define DWM_HOOK_TAIL_LAYOUT_VERSION 1u
 
@@ -142,7 +152,15 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     // glow fill (CB words 76-78; same fields and clamps as src FaldGlowSettings)
     float    glowStrength, glowCapNits;
     uint32_t glowReach;
-    uint32_t _reserved[15];          // room for later fields without a layout bump (17 used + 15 = 32 words)
+    // LED lag = the temporal drive state (shared/fald_temporal.h FaldTemporalSettings) + the monitor's refresh period
+    // (mode 3's grid). Taken from _reserved: a tail from a host that predates them reads 0 = LED lag off.
+    uint32_t tempMode;               // 0 off, 1 both fields, 2 B_true only, 3 panel clock
+    float    tempTauRiseMs, tempTauFallMs;
+    uint32_t tempDelayFrames;
+    float    tempClockClosure;
+    int32_t  tempClockParity;        // -1 unknown, 0, 1
+    float    refreshMs;              // exact nominal refresh period of this monitor (DisplayConfig vSyncFreq); 0 = unknown
+    uint32_t _reserved[8];           // room for later fields without a layout bump (24 used + 8 = 32 words)
 };
 static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
 

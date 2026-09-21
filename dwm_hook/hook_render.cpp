@@ -1253,7 +1253,13 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			// The passes write the back buffer themselves. If any step refuses, the intermediate
 			// still holds the frame that should have been shown, so copy it out rather than leave
 			// the back buffer with whatever it held before.
-			if (!FaldRun(faldMon, renderTargetView))
+			// New content = any dirty rect outside the top-left kick zone: the host's settle kick (a 1 px window there,
+			// dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT) must not re-arm the LED-lag hold it exists to finish.
+			bool newContent = (numRects <= 0);
+			for (int i = 0; i < numRects && !newContent; i++)
+				if (rects[i].right > DWM_HOOK_FALD_KICK_ZONE_PX || rects[i].bottom > DWM_HOOK_FALD_KICK_ZONE_PX)
+					newContent = true;
+			if (!FaldRun(faldMon, renderTargetView, newContent))
 			{
 				deviceContext->CopyResource((ID3D11Resource*)backBuffer,
 				                            (ID3D11Resource*)FaldIntermediateTexture(faldMon));

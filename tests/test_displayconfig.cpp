@@ -189,6 +189,12 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[0]) - base) == 464 + 16);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1]) - base) == 464 + 16 + 128);
     CHECK(sizeof(DwmHookFaldTuning) == 128);
+    // LED-lag fields came out of _reserved: their offsets are wire contract too
+    CHECK(offsetof(DwmHookFaldTuning, glowReach) == 64);
+    CHECK(offsetof(DwmHookFaldTuning, tempMode) == 68);
+    CHECK(offsetof(DwmHookFaldTuning, tempClockParity) == 88);
+    CHECK(offsetof(DwmHookFaldTuning, refreshMs) == 92);
+    CHECK(offsetof(DwmHookFaldTuning, _reserved) == 96);
     CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 128 * MAX_DWM_HOOK_MONITORS);
 }
 

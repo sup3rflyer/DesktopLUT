@@ -12,6 +12,7 @@
 #include "hook_fald.h"
 #include "hook_log.h"
 #include "fald_shader.h"
+#include "fald_temporal.h"
 
 #include <cstdarg>
 #include <cstring>
@@ -43,7 +44,10 @@ static ID3D11ComputeShader* g_glowDilateCS = nullptr;   // G1: box maximum
 static ID3D11ComputeShader* g_glowErodeCS = nullptr;    // G2: box minimum (the closing)
 static ID3D11ComputeShader* g_glowEnvCS = nullptr;      // G3: blur + deficit
 static ID3D11ComputeShader* g_glowBandCS = nullptr;     // G4: count-threshold band (boost + mean rule only)
+static ID3D11ComputeShader* g_temporalCS = nullptr;     // LED lag pass 1b: first-order drive state (modes 1 / 2)
+static ID3D11ComputeShader* g_clockCS = nullptr;        // LED lag pass 1c: the two parity clocks (mode 3)
 static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
+static HANDLE g_settleEvent = NULL;                     // DWM_HOOK_FALD_SETTLE_EVENT (the host creates it)
 static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS; }
 static void CompileFeatureShaders();   // below FaldReleaseShaders
 
@@ -142,6 +146,8 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
 template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 static void ReleaseFeatureShaders() {
+    SafeRelease(g_clockCS); SafeRelease(g_temporalCS);
+    if (g_settleEvent) { CloseHandle(g_settleEvent); g_settleEvent = NULL; }
     SafeRelease(g_glowBandCS); SafeRelease(g_glowEnvCS); SafeRelease(g_glowErodeCS);
     SafeRelease(g_glowDilateCS); SafeRelease(g_glowZoneCS);
     SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
@@ -163,6 +169,8 @@ static void CompileFeatureShaders() {
         { g_faldGlowErodeSource,  "FaldGlowErodeCS",  &g_glowErodeCS  },
         { g_faldGlowEnvSource,    "FaldGlowEnvCS",    &g_glowEnvCS    },
         { g_faldGlowBandSource,   "FaldGlowBandCS",   &g_glowBandCS   },
+        { g_faldTemporalSource,   "FaldTemporalCS",   &g_temporalCS   },
+        { g_faldPanelClockSource, "FaldPanelClockCS", &g_clockCS      },
     };
     for (const auto& s : cs) {
         ID3DBlob* b = nullptr;
@@ -180,8 +188,9 @@ static void CompileFeatureShaders() {
         for (int k = 0; k < 3; k++)
             if (FAILED(g_dev->CreateQuery(&qd, &g_tsStamp[i][k]))) g_tsStamp[i][k] = nullptr;
     }
-    LogF("FALD: starfield shaders %s, glow fill shaders %s",
-         StarShadersReady() ? "compiled" : "UNAVAILABLE", GlowShadersReady() ? "compiled" : "UNAVAILABLE");
+    LogF("FALD: starfield shaders %s, glow fill shaders %s, LED lag shaders %s",
+         StarShadersReady() ? "compiled" : "UNAVAILABLE", GlowShadersReady() ? "compiled" : "UNAVAILABLE",
+         (g_temporalCS && g_clockCS) ? "compiled" : "UNAVAILABLE");
 }
 
 void FaldReleaseShaders() {
@@ -274,7 +283,7 @@ int FaldLoadPanelFiles(const char* lutFolder) {
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-struct FaldMonitor {
+struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_temporal.h (the overlay's FaldResources too)
     int left = 0, top = 0;
     bool isHdr = false;
     unsigned int width = 0, height = 0;
@@ -343,6 +352,18 @@ struct FaldMonitor {
     ID3D11Texture2D* glowEnvTex = nullptr;   ID3D11UnorderedAccessView* glowEnvUAV = nullptr;   ID3D11ShaderResourceView* glowEnvSRV = nullptr;
     ID3D11Texture2D* glowKTex = nullptr;     ID3D11UnorderedAccessView* glowKUAV = nullptr;     ID3D11ShaderResourceView* glowKSRV = nullptr;
 
+    // LED lag (temporal drive state). driveFilt / driveState / the delay ring are built with the monitor (cols x rows R32F,
+    // as the overlay's Build); the four panel-clock textures only while mode 3 is on (EnsureClock).
+    FaldTemporalSettings tempSettings;                    // from the tuning tail (mode 0 until the host sends one)
+    float refreshMs = 0.0f;                               // this monitor's nominal refresh period (mode 3's grid)
+    bool clockFailed = false;                             // latched until the next rebuild
+    ID3D11Texture2D* driveFiltTex = nullptr;  ID3D11UnorderedAccessView* driveFiltUAV = nullptr;  ID3D11ShaderResourceView* driveFiltSRV = nullptr;
+    ID3D11Texture2D* driveStateTex = nullptr; ID3D11UnorderedAccessView* driveStateUAV = nullptr; ID3D11ShaderResourceView* driveStateSRV = nullptr;
+    ID3D11Texture2D* delayTex[FALD_DELAY_MAX] = {}; ID3D11UnorderedAccessView* delayUAV[FALD_DELAY_MAX] = {}; ID3D11ShaderResourceView* delaySRV[FALD_DELAY_MAX] = {};
+    ID3D11Texture2D* clkStateTex[2] = {}; ID3D11UnorderedAccessView* clkStateUAV[2] = {}; ID3D11ShaderResourceView* clkStateSRV[2] = {};
+    ID3D11Texture2D* clkPrevTex = nullptr; ID3D11UnorderedAccessView* clkPrevUAV = nullptr; ID3D11ShaderResourceView* clkPrevSRV = nullptr;
+    ID3D11Texture2D* clkEstTex = nullptr;  ID3D11UnorderedAccessView* clkEstUAV = nullptr;  ID3D11ShaderResourceView* clkEstSRV = nullptr;
+
     // GPU cost accumulated between log lines (microseconds; from the timestamp queries)
     double gpuSumUs = 0.0, gpuStarSumUs = 0.0, gpuMaxUs = 0.0;
     unsigned int gpuSamples = 0;
@@ -387,6 +408,22 @@ static DwmHookFaldTuning SanitizeTuning(const DwmHookFaldTuning& in) {
     return t;
 }
 
+static void ReleaseClock(FaldMonitor* m) {
+    for (unsigned int i = 0; i < 2; i++) { SafeRelease(m->clkStateSRV[i]); SafeRelease(m->clkStateUAV[i]); SafeRelease(m->clkStateTex[i]); }
+    SafeRelease(m->clkPrevSRV); SafeRelease(m->clkPrevUAV); SafeRelease(m->clkPrevTex);
+    SafeRelease(m->clkEstSRV); SafeRelease(m->clkEstUAV); SafeRelease(m->clkEstTex);
+    m->clkElapsed = 0; m->clkIndex = 0; m->clkSeeded = false;   // as src/fald.cpp ReleaseClock
+}
+
+static void ReleaseTemporal(FaldMonitor* m) {
+    ReleaseClock(m);
+    SafeRelease(m->driveFiltSRV); SafeRelease(m->driveFiltUAV); SafeRelease(m->driveFiltTex);
+    SafeRelease(m->driveStateSRV); SafeRelease(m->driveStateUAV); SafeRelease(m->driveStateTex);
+    for (unsigned int i = 0; i < FALD_DELAY_MAX; i++) { SafeRelease(m->delaySRV[i]); SafeRelease(m->delayUAV[i]); SafeRelease(m->delayTex[i]); }
+    // the textures are gone: so is the state (src/fald.cpp ReleaseResources does the same on a rebuild)
+    m->stateValid = false; m->settleLeft = 0; m->temporalMode = FALD_TEMPORAL_OFF; m->delayCount = 0;
+}
+
 static void ReleaseStar(FaldMonitor* m) {
     SafeRelease(m->starPlan2SRV); SafeRelease(m->starPlan2UAV); SafeRelease(m->starPlan2Tex);
     SafeRelease(m->starBgSRV);    SafeRelease(m->starBgUAV);    SafeRelease(m->starBgTex);
@@ -429,6 +466,7 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->curveSRV); SafeRelease(m->curveTex);
     SafeRelease(m->interSRV); SafeRelease(m->interRTV); SafeRelease(m->interTex);
     SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
+    ReleaseTemporal(m);
     ReleaseStar(m);
     ReleaseGlow(m);
     m->primed = false;
@@ -515,6 +553,24 @@ static bool EnsureGlow(FaldMonitor* m) {
     return false;
 }
 
+// The four cols x rows R32F panel-clock textures (LED lag mode 3; src/fald.cpp EnsureClock). Latched on failure: the
+// mode then runs as off until the next rebuild.
+static bool EnsureClock(FaldMonitor* m) {
+    if (m->clkStateTex[0] && m->clkStateTex[1] && m->clkPrevTex && m->clkEstTex) return true;
+    if (m->clockFailed || !g_clockCS) return false;
+    ReleaseClock(m);
+    const FaldPanelParams& p = m->params;
+    if (MakeRWTexture(p.cols, p.rows, &m->clkStateTex[0], &m->clkStateUAV[0], &m->clkStateSRV[0]) &&
+        MakeRWTexture(p.cols, p.rows, &m->clkStateTex[1], &m->clkStateUAV[1], &m->clkStateSRV[1]) &&
+        MakeRWTexture(p.cols, p.rows, &m->clkPrevTex, &m->clkPrevUAV, &m->clkPrevSRV) &&
+        MakeRWTexture(p.cols, p.rows, &m->clkEstTex, &m->clkEstUAV, &m->clkEstSRV))
+        return true;
+    ReleaseClock(m);
+    m->clockFailed = true;
+    LogF("FALD: pos(%d,%d) panel clock textures could not be created - LED lag mode 3 runs as off", m->left, m->top);
+    return false;
+}
+
 // Resolve this frame's starfield / glow state from the live request (FaldSetLiveSettings). Off =
 // textures released and nothing downstream knows the feature exists (CB words 35 / 75 / 80 = 0,
 // t15 / t18 / t23 / t24 unbound) — the bit-identical-when-off rule of src/fald.cpp.
@@ -580,6 +636,12 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
     if (!MakeFloatBuffer(p.kTrue, &m->kTrueBuf, &m->kTrueSRV)) { log_to_file("FALD: kTrue buffer failed"); return false; }
     if (!MakeFloatBuffer(p.kEst, &m->kEstBuf, &m->kEstSRV)) { log_to_file("FALD: kEst buffer failed"); return false; }
     if (!MakeRWTexture(p.cols, p.rows, &m->driveTex, &m->driveUAV, &m->driveSRV)) { log_to_file("FALD: drive texture failed"); return false; }
+    // LED lag (modes 1 / 2): the filtered drive, the committed state and the delay ring (as src/fald.cpp Build)
+    if (!MakeRWTexture(p.cols, p.rows, &m->driveFiltTex, &m->driveFiltUAV, &m->driveFiltSRV)) { log_to_file("FALD: filtered drive texture failed"); return false; }
+    if (!MakeRWTexture(p.cols, p.rows, &m->driveStateTex, &m->driveStateUAV, &m->driveStateSRV)) { log_to_file("FALD: drive state texture failed"); return false; }
+    for (unsigned int i = 0; i < FALD_DELAY_MAX; i++)
+        if (!MakeRWTexture(p.cols, p.rows, &m->delayTex[i], &m->delayUAV[i], &m->delaySRV[i])) { log_to_file("FALD: delay ring texture failed"); return false; }
+    m->clockFailed = false;
     const UINT fw = p.cols * p.sub, fh = p.rows * p.sub;
     if (!MakeRWTexture(fw, fh, &m->bTrueTex, &m->bTrueUAV, &m->bTrueSRV)) { log_to_file("FALD: B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bEstTex, &m->bEstUAV, &m->bEstSRV)) { log_to_file("FALD: B_est texture failed"); return false; }
@@ -677,13 +739,17 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
                  m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)");
         }
     }
+    if (!m->primed) FaldTemporalIdle(m);   // the layer does not run this present (src FaldLayerIdle)
     return m->primed;
 }
 
 void FaldMarkStale(int left, int top) {
     for (int i = 0; i < g_numMonitors; i++) {
         FaldMonitor* e = g_monitors[i];
-        if (e && e->left == left && e->top == top) e->primed = false;
+        if (e && e->left == left && e->top == top) {
+            e->primed = false;
+            FaldTemporalIdle(e);   // the layer did not run: LED-lag state, hold and ring are void (src FaldLayerIdle)
+        }
     }
 }
 
@@ -695,6 +761,20 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
     m->starWanted = star;
     m->glowWanted = star && glow;
     m->tuning = tuning ? SanitizeTuning(*tuning) : DefaultTuning();
+    // LED lag: from the tail (none = off). Bounded here too — the delay indexes a texture array.
+    FaldTemporalSettings ts;
+    if (tuning) {
+        const DwmHookFaldTuning& t = *tuning;
+        ts.mode = t.tempMode <= FALD_TEMPORAL_PANEL ? t.tempMode : FALD_TEMPORAL_OFF;
+        auto tau = [](float v) { return (v == v && v > 0.0f) ? (v > FALD_TAU_MAX_MS ? FALD_TAU_MAX_MS : v) : 0.0f; };
+        ts.tauRiseMs = tau(t.tempTauRiseMs); ts.tauFallMs = tau(t.tempTauFallMs);
+        ts.delayFrames = t.tempDelayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : t.tempDelayFrames;
+        ts.clockClosure = FaldPanelClockClosure(t.tempClockClosure);
+        ts.clockParity = FaldPanelClockParity(t.tempClockParity);
+        m->refreshMs = (t.refreshMs == t.refreshMs && t.refreshMs > 1.0f && t.refreshMs < 1000.0f) ? t.refreshMs : 0.0f;
+    }
+    if (!g_temporalCS && (ts.mode == FALD_TEMPORAL_BOTH || ts.mode == FALD_TEMPORAL_TRUE_ONLY)) ts.mode = FALD_TEMPORAL_OFF;
+    m->tempSettings = ts;
 }
 
 double FaldLastRunMicros(const FaldMonitor* m) { return m ? m->lastRunUs : 0.0; }
@@ -728,11 +808,9 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     f[41] = (p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo;
     f[42] = (p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi;
     f[43] = p.sdrGamma;                                                             // panel EOTF exponent (transfer 1)
-    // Temporal drive state (words 44-47). The core is stateless, so these carry what src/fald.cpp
-    // writes with the filter off and no committed state: alpha 1 (instant), mode 0, "no state yet".
-    // Word 46 = 0 is what makes the shader ignore 44/45 and 47 entirely.
-    f[44] = 1.0f; f[45] = 1.0f;
-    u[46] = 0u; u[47] = 1u;
+    // LED lag = the temporal drive state (words 44-47): per-frame blend factors, mode, "no valid state yet" (copy the drive)
+    f[44] = m->tempAlphaRise; f[45] = m->tempAlphaFall;
+    u[46] = m->temporalMode; u[47] = m->stateValid ? 0u : 1u;
     // black-frame LED boost: the zone activation rule (words 48-51; read only when word 34 != 0)
     f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
     // Starfield words 52-65: the clamped settings, written even while the feature is off (the shader
@@ -742,9 +820,9 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     f[56] = t.starStrength; f[57] = t.starAreaLo; f[58] = t.starAreaHi; f[59] = t.starPeakHi;
     f[60] = t.starNbLo; f[61] = t.starNbHi; u[62] = t.starReach; u[63] = t.starEvenReach;
     f[64] = t.starTargetSigma; f[65] = t.starKeepNits;
-    // panel clock (temporal mode 3): unused here; the overlay's idle values are weights 1/2 and zero blends
-    f[66] = 0.5f; f[67] = 0.5f;
-    f[68] = 0.0f; f[69] = 0.0f; f[70] = 0.0f; f[71] = 0.0f;
+    // panel clock (LED lag mode 3; read by pass 1c only): the clocks' weights, then per clock the blends (words 66-71)
+    f[66] = m->clkW[0]; f[67] = m->clkW[1];
+    f[68] = m->clkFactor[0]; f[69] = m->clkFactor[1]; f[70] = m->clkFactor[2]; f[71] = m->clkFactor[3];
     // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
     u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
     // glow fill (word 75 = on; words 76-79 read only when it is set / by the glow passes)
@@ -819,14 +897,15 @@ static void RunBoost(FaldMonitor* m, uint32_t roundIdx) {
 
 // boost: this round's 2x1 boost texture (B_true only; null = none — no LUT in the file, or the
 // flat-lattice pass, where the CB's boostN is 0 and the shader never reads t14).
-static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* boost) {
+// trueDrive / estDrive: the drive maps the real-spread and the estimate kernels see (both the instantaneous drive
+// unless LED lag routes a filtered / clock map: FaldTemporalRun::trueMap / estMap).
+static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive,
+                    ID3D11ShaderResourceView* boost) {
     const FaldPanelParams& p = m->params;
     g_ctx->CSSetShader(g_convCS, nullptr, 0);
     BindCommon(m, true);
-    // Stateless: both kernels see the instantaneous drive map (the temporal modes are what would
-    // route a filtered one into t4 / t10).
-    g_ctx->CSSetShaderResources(4, 1, &m->driveSRV);
-    g_ctx->CSSetShaderResources(10, 1, &m->driveSRV);
+    g_ctx->CSSetShaderResources(4, 1, &trueDrive);
+    g_ctx->CSSetShaderResources(10, 1, &estDrive);
     g_ctx->CSSetShaderResources(14, 1, &boost);
     ID3D11UnorderedAccessView* uavs[2] = { m->bTrueUAV, m->bEstUAV };
     g_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
@@ -863,6 +942,35 @@ static void RunGain(FaldMonitor* m) {
     UnbindCompute();
     // final smoothed gain lives in A; copy to B so consumers always read gainB
     g_ctx->CopyResource(m->gainBTex, m->gainATex);
+}
+
+// LED lag pass 1b (modes 1 / 2), mirror of src/fald.cpp RunTemporal: filtered drive = state + a * (drive - state) per
+// cell, from the map the panel's pipeline is fed (t4: this round's instantaneous drive, or a delay-ring entry) and the
+// state committed after the previous frame (t11); with no valid state the drive is copied.
+static void RunTemporal(FaldMonitor* m, ID3D11ShaderResourceView* inDrive) {
+    const FaldPanelParams& p = m->params;
+    g_ctx->CSSetShader(g_temporalCS, nullptr, 0);
+    BindCommon(m, true);
+    g_ctx->CSSetShaderResources(4, 1, &inDrive);
+    g_ctx->CSSetShaderResources(11, 1, &m->driveStateSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->driveFiltUAV, nullptr);
+    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();
+}
+
+// LED lag pass 1c (mode 3, valid state only), mirror of src/fald.cpp RunPanelClock: the two parity clocks advance in
+// place toward the previous frame's round-1 drives (t4 = clkPrev) by the CB's blend factors; u0 / u1 receive the maps
+// the kernels see in both rounds. Binds only what it reads; all four UAV slots are cleared here.
+static void RunPanelClock(FaldMonitor* m) {
+    const FaldPanelParams& p = m->params;
+    FillCB(m, 0);
+    g_ctx->CSSetShader(g_clockCS, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetShaderResources(4, 1, &m->clkPrevSRV);
+    ID3D11UnorderedAccessView* uavs[4] = { m->driveFiltUAV, m->clkEstUAV, m->clkStateUAV[0], m->clkStateUAV[1] };
+    g_ctx->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();   // clears all FALD_UAV_SLOTS (4)
 }
 
 // Starfield balancing, mirror of src/fald.cpp RunStar: S0 star statistic of the SOURCE frame -> S1
@@ -964,7 +1072,7 @@ static void ComputeFlatResponse(FaldMonitor* m) {
     ID3D11ShaderResourceView* saveT = m->flatTrueSRV; ID3D11ShaderResourceView* saveE = m->flatEstSRV;
     m->flatTrueSRV = nullptr; m->flatEstSRV = nullptr;          // not inputs of this pass
     FillCB(m, 0, 0, false);                                     // boost 1: the normalisation is the un-boosted lattice
-    RunConv(m, nullptr);
+    RunConv(m, m->driveSRV, m->driveSRV, nullptr);
     m->flatTrueSRV = saveT; m->flatEstSRV = saveE;
     g_ctx->CopyResource(m->flatTrueTex, m->bTrueTex);
     g_ctx->CopyResource(m->flatEstTex, m->bEstTex);
@@ -1046,6 +1154,34 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
         DumpTexture(m->activeTex[1], dir + L"fald_active_r1.f32", p.cols, p.rows, 4);
         DumpTexture(m->boostTex[0], dir + L"fald_boost_r0.f32", 2, 1, 4);
         DumpTexture(m->boostTex[1], dir + L"fald_boost_r1.f32", 2, 1, 4);
+    }
+    // LED lag: the same files as the overlay's dump (src/fald.cpp DumpFields), dumped before the commit
+    if (m->temporalMode == FALD_TEMPORAL_PANEL) {
+        if (!m->clkSeeded) {
+            DumpTexture(m->driveFiltTex, dir + L"fald_drive_filt.f32", p.cols, p.rows, 4);
+            DumpTexture(m->clkEstTex, dir + L"fald_clock_est.f32", p.cols, p.rows, 4);
+            DumpTexture(m->clkStateTex[0], dir + L"fald_clock_s0.f32", p.cols, p.rows, 4);
+            DumpTexture(m->clkStateTex[1], dir + L"fald_clock_s1.f32", p.cols, p.rows, 4);
+            DumpTexture(m->clkPrevTex, dir + L"fald_clock_dprev.f32", p.cols, p.rows, 4);
+        }
+    } else if (m->temporalMode != FALD_TEMPORAL_OFF) {
+        DumpTexture(m->driveFiltTex, dir + L"fald_drive_filt.f32", p.cols, p.rows, 4);
+        DumpTexture(m->driveStateTex, dir + L"fald_drive_state.f32", p.cols, p.rows, 4);
+    }
+    // the run's LED-lag bookkeeping, for replaying it offline (the overlay writes these in fald_dump.txt)
+    {
+        FILE* f = _wfopen((dir + L"fald_hook_temporal.txt").c_str(), L"w");
+        if (f) {
+            fprintf(f, "temporal_mode %u\nstate_valid %d\nalpha_rise %.9g\nalpha_fall %.9g\ndt_ms %.9g\ndelay_frames %u\n"
+                       "delay_count %u\nsettle_left %u\nclock_seed %d\nclock_elapsed_refreshes %llu\nclock_index %llu\n"
+                       "clock_time_ms %.9f\nclock_grid_ms %.9f\nclock_factor %.9g %.9g %.9g %.9g\nclock_weight %.9g %.9g\n"
+                       "clock_closure %.9g\nclock_parity %d\nrefresh_ms %.9g\n",
+                    m->temporalMode, m->stateValid ? 1 : 0, m->tempAlphaRise, m->tempAlphaFall, m->dtMs, m->delayFrames,
+                    m->delayCount, m->settleLeft, m->clkSeeded ? 1 : 0, m->clkElapsed, m->clkIndex, m->clkTimeMs, m->clkGridMs,
+                    m->clkFactor[0], m->clkFactor[1], m->clkFactor[2], m->clkFactor[3], m->clkW[0], m->clkW[1],
+                    m->clkClosure, m->clkParity, m->refreshMs);
+            fclose(f);
+        }
     }
     if (m->starOn) {   // same files as the overlay's dump (src/fald.cpp DumpFields)
         DumpTexture(m->starStatTex, dir + L"fald_star_stat.f32", p.cols, p.rows, 16);
@@ -1161,7 +1297,7 @@ static void GpuTimingEnd(int slot, FaldMonitor* m) {
     g_tsOwner[slot] = m;
 }
 
-bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
+bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     if (!m || !m->valid || !m->interSRV || !dstRTV) return false;
 
     LARGE_INTEGER t0, t1, freq;
@@ -1177,32 +1313,65 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     GpuTimingCollect(m);
     const int ts = GpuTimingBegin();
 
+    // LED lag (temporal drive state): the bookkeeping is shared/fald_temporal.cpp, the SAME code the overlay runs
+    // (FaldTemporalBeginRun / EndRun); only the D3D side is here. The panel clock's textures exist only in mode 3.
+    bool clockOk = false;
+    if (m->tempSettings.mode == FALD_TEMPORAL_PANEL) clockOk = EnsureClock(m);
+    else if (m->clkStateTex[0] || m->clkStateTex[1] || m->clkPrevTex || m->clkEstTex) ReleaseClock(m);
+    LARGE_INTEGER qpcNow;
+    QueryPerformanceCounter(&qpcNow);
+    const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk, qpcNow.QuadPart, freq.QuadPart, m->refreshMs);
+    auto mapSrv = [m](FaldDriveMap k) {
+        return k == FALD_MAP_FILTERED ? m->driveFiltSRV : (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : m->driveSRV);
+    };
+    ID3D11ShaderResourceView* inDrive = trun.delayedSlot >= 0 ? m->delaySRV[trun.delayedSlot] : m->driveSRV;
+    ID3D11ShaderResourceView* trueDrive = mapSrv(trun.trueMap);
+    ID3D11ShaderResourceView* estDrive = mapSrv(trun.estMap);
+
     // No render target may be bound while the passes write their UAVs.
     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
     // Starfield first: every pass below reads Balance(source) from its plan.
     if (m->starOn) RunStar(m);
     GpuTimingStamp(ts, 1);
+    if (trun.clock.runPass) RunPanelClock(m);   // mode 3: this frame's LED state comes from PAST frames only
 
     // Two inverse rounds. Round 0's output is what round 1's statistic and boost count see, so the
     // panel's own response is accounted for in the frame it actually receives. Glow fill runs after
     // each round's gain: round 0's fill is part of what round 1 sees, round 1's is in the output.
+    // LED lag modes 1 / 2 filter each round's drive (both rounds read the SAME committed state).
     RunStat(m, 0);
     RunBoost(m, 0);
-    RunConv(m, m->boostSRV[0]);
+    if (trun.temporal) RunTemporal(m, inDrive);
+    RunConv(m, trueDrive, estDrive, m->boostSRV[0]);
     RunGain(m);
     if (m->glowOn) RunGlow(m);
     RunStat(m, 1);
     RunBoost(m, 1);
-    RunConv(m, m->boostSRV[1]);
+    if (trun.temporal) RunTemporal(m, inDrive);
+    RunConv(m, trueDrive, estDrive, m->boostSRV[1]);
     RunGain(m);
     if (m->glowOn) RunGlow(m);
     m->framesRun++;
 
-    if (!dumpDir.empty()) {
+    if (!dumpDir.empty()) {                   // before the commit: the state files are the maps the passes read
         DumpFields(m, dumpDir);
         DumpFrame(m->interSRV, dumpDir + L"fald_frame.rgba16f", m->width, m->height);
     }
+
+    // LED lag commit (the copies; FaldTemporalEndRun below commits the indices and does the settle accounting)
+    if (trun.temporal) {                      // round 1's filtered map becomes the state; the ring takes round 1's
+        g_ctx->CopyResource(m->driveStateTex, m->driveFiltTex);   // INSTANTANEOUS map
+        if (trun.delay > 0) g_ctx->CopyResource(m->delayTex[m->delayHead], m->driveTex);
+    }
+    if (trun.panel) {                         // round 1's instantaneous map is the next frame's target; a seeding run
+        if (trun.clock.seedStates) {          // takes the panel as settled on this frame (both clocks)
+            g_ctx->CopyResource(m->clkStateTex[0], m->driveTex);
+            g_ctx->CopyResource(m->clkStateTex[1], m->driveTex);
+        }
+        if (trun.clock.commitPrev) g_ctx->CopyResource(m->clkPrevTex, m->driveTex);
+    }
+    FaldTemporalEndRun(m, trun, m->tempSettings, newContent);
 
     // pixel pass: source + fields -> the back buffer (fullscreen triangle, no vertex buffer)
     FillCB(m, 1);
@@ -1217,10 +1386,10 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
     g_ctx->PSSetShaderResources(5, 2, fields);
     g_ctx->PSSetShaderResources(9, 1, &m->gainBSRV);
-    // t4 / t10 are the instantaneous and "filtered" drive maps of debug view 7; with no temporal
-    // state they are the same map, which is exactly what the overlay binds with the filter off.
+    // t4 / t10 = debug view 7: instantaneous vs filtered (mode 3: vs the clocks' mean LED state of this frame)
+    ID3D11ShaderResourceView* filt = mapSrv(trun.debugFiltMap);
     g_ctx->PSSetShaderResources(4, 1, &m->driveSRV);
-    g_ctx->PSSetShaderResources(10, 1, &m->driveSRV);
+    g_ctx->PSSetShaderResources(10, 1, &filt);
     g_ctx->PSSetShaderResources(13, 1, &m->activeSRV[1]);   // debug view 8 (null without a boost LUT)
     g_ctx->Draw(3, 0);
     GpuTimingEnd(ts, m);
@@ -1231,6 +1400,16 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     }
 
     FaldUnbindAll();
+
+    // LED-lag settle hold: DWM presents nothing on a static desktop, so while this monitor still owes settle frames ask
+    // the host to keep DWM composing it (dwm_hook_config.h DWM_HOOK_FALD_SETTLE_EVENT). One SetEvent per run while
+    // pending — no wait, no I/O. The host creates the event; opening it is retried rarely, never per frame.
+    if (FaldTemporalSettlePending(m)) {
+        static unsigned int openTick = 0;
+        if (!g_settleEvent && (openTick++ % 120u) == 0u)
+            g_settleEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, DWM_HOOK_FALD_SETTLE_EVENT);
+        if (g_settleEvent) SetEvent(g_settleEvent);
+    }
 
     QueryPerformanceCounter(&t1);
     if (freq.QuadPart > 0)

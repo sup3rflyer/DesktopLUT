@@ -362,7 +362,7 @@ static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
     SaveSettings();
     UpdateGUIState();
     if (enabledNow && g_dwmHookMode.load())
-        SetStatus(L"FALD in DWM hook mode: correction + Starfield (glow fill included); LED lag is overlay-only");
+        SetStatus(L"FALD in DWM hook mode: correction, Starfield (glow fill included) and LED lag");
 }
 
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
@@ -486,12 +486,14 @@ void UpdateColorCorrectionControls() {
     EnableWindow(g_gui.hwndFaldSdrEnable, TRUE);
     EnableWindow(g_gui.hwndFaldDebug, TRUE);
     EnableWindow(g_gui.hwndFaldPedMode, TRUE);
-    EnableWindow(g_gui.hwndFaldTemporal, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldTauRise, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldTauFall, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldDelay, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldClosure, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldParity, !g_dwmHookMode.load());
+    // LED lag runs in both paths (the bookkeeping is shared/fald_temporal.cpp; in hook mode the host keeps DWM composing
+    // while the state settles — dwm_inject.cpp FaldSettleKickThread).
+    EnableWindow(g_gui.hwndFaldTemporal, TRUE);
+    EnableWindow(g_gui.hwndFaldTauRise, TRUE);
+    EnableWindow(g_gui.hwndFaldTauFall, TRUE);
+    EnableWindow(g_gui.hwndFaldDelay, TRUE);
+    EnableWindow(g_gui.hwndFaldClosure, TRUE);
+    EnableWindow(g_gui.hwndFaldParity, TRUE);
     // Starfield (with its glow-fill part) runs in both paths. Glow fill is part of the starfield feature:
     // its row is live only while Starfield is on (it never runs without it).
     EnableWindow(g_gui.hwndFaldStarEnable, TRUE);
