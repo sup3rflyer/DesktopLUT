@@ -3,6 +3,7 @@
 #include "globals.h"
 #include "monitor_identity.h"
 #include "fald.h"    // FALD_TAU_MAX_MS
+#include "calib_snapshot.h"
 #include <cstdio>
 #include <cmath>
 #include <string>
@@ -982,3 +983,84 @@ TEST_CASE("SaveSettings: parked displays are written, anonymous entries are not"
     g_gui.parkedSettings.clear();
 }
 
+
+// ============================================================================
+// Calibration snapshot store (fable audit Phase 9, T2)
+//
+// The regression these pin: DoEnterNeutral used to overwrite a single snapshot slot on
+// every enter. A crashed run leaves the calibration session ACTIVE with the monitor
+// already cleared, so the next enter captured the CLEARED state and
+// calibration.exit(restore_snapshot=true) handed the user back the neutral slate
+// instead of their own MHC profile / 3D LUT. See src/calib_snapshot.h.
+// ============================================================================
+
+static MonitorSettings MakeUserSettings() {
+    MonitorSettings s;
+    s.sdrPath = L"C:\\luts\\user.cube";
+    s.sdrMHC.enabled = true;
+    s.sdrMHC.profileName = L"UserProfile.icm";
+    s.sdrMHC.whiteBalanceEnabled = true;
+    return s;
+}
+
+static MonitorSettings MakeClearedSettings() {
+    return MonitorSettings{};  // what DoEnterNeutral leaves behind: the neutral slate
+}
+
+TEST_CASE("CalibSnapshot: first capture of a monitor is stored") {
+    CalibSnapshotStore store;
+    CHECK(store.Empty());
+    CHECK(store.CaptureIfAbsent(0, MakeUserSettings(), false) == true);
+    CHECK(store.Has(0));
+    CHECK(store.entries.at(0).settings.sdrMHC.enabled == true);
+    CHECK(store.entries.at(0).settings.sdrPath == L"C:\\luts\\user.cube");
+    CHECK(store.entries.at(0).wasHdr == false);
+}
+
+TEST_CASE("CalibSnapshot: re-enter does NOT overwrite the original with the cleared state") {
+    CalibSnapshotStore store;
+    store.CaptureIfAbsent(0, MakeUserSettings(), false);
+    // The crashed-run re-enter: the monitor is already neutral by now.
+    CHECK(store.CaptureIfAbsent(0, MakeClearedSettings(), false) == false);
+    CHECK(store.entries.size() == 1);
+    CHECK(store.entries.at(0).settings.sdrMHC.enabled == true);
+    CHECK(store.entries.at(0).settings.sdrMHC.profileName == L"UserProfile.icm");
+    CHECK(store.entries.at(0).settings.sdrMHC.whiteBalanceEnabled == true);
+    CHECK(store.entries.at(0).settings.sdrPath == L"C:\\luts\\user.cube");
+}
+
+TEST_CASE("CalibSnapshot: the retained capture keeps the mode it was taken in") {
+    CalibSnapshotStore store;
+    store.CaptureIfAbsent(0, MakeUserSettings(), true);   // session calibrating HDR
+    store.CaptureIfAbsent(0, MakeClearedSettings(), false);
+    CHECK(store.entries.at(0).wasHdr == true);
+}
+
+TEST_CASE("CalibSnapshot: each monitor a session enters keeps its own original") {
+    CalibSnapshotStore store;
+    MonitorSettings second;
+    second.sdrPath = L"C:\\luts\\second.cube";
+    CHECK(store.CaptureIfAbsent(0, MakeUserSettings(), false) == true);
+    CHECK(store.CaptureIfAbsent(1, second, true) == true);
+    CHECK(store.entries.size() == 2);
+    CHECK(store.entries.at(0).settings.sdrPath == L"C:\\luts\\user.cube");
+    CHECK(store.entries.at(1).settings.sdrPath == L"C:\\luts\\second.cube");
+    CHECK(store.entries.at(1).wasHdr == true);
+}
+
+TEST_CASE("CalibSnapshot: a negative monitor index is refused, not stored") {
+    CalibSnapshotStore store;
+    CHECK(store.CaptureIfAbsent(-1, MakeUserSettings(), false) == false);
+    CHECK(store.Empty());
+}
+
+TEST_CASE("CalibSnapshot: Clear ends the session so the next one captures fresh") {
+    CalibSnapshotStore store;
+    store.CaptureIfAbsent(0, MakeUserSettings(), false);
+    store.Clear();
+    CHECK(store.Empty());
+    CHECK(store.Has(0) == false);
+    // The apply path kept the calibrated state; that is now the user's setup.
+    CHECK(store.CaptureIfAbsent(0, MakeClearedSettings(), false) == true);
+    CHECK(store.entries.at(0).settings.sdrMHC.enabled == false);
+}

@@ -297,6 +297,17 @@ request, adjudicates ambiguous results on digests, and writes the report.
   with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
 
 ### Fixed
+- **A crashed calibration run no longer costs the user their setup** (fable audit
+  Phase 9 ticket T2). DesktopLUT's `calibration.enter` overwrote its single restore
+  snapshot on every call, so when a run died without calling `calibration.exit` the
+  next `enter` snapshotted the already-cleared monitor: the user's MHC profile, white
+  balance, correction grayscale and 3D LUT could no longer be restored. The server now
+  keeps one capture per monitor for the whole session, the FIRST one wins, and captures
+  are dropped only when the session ends (`src/calib_snapshot.h`); a restore puts back
+  every monitor the session touched instead of only the last. `calibration.enter` reports
+  `snapshot_retained`, so DLC's stale-calibration tell now says which of the two
+  behaviours the server it is talking to actually has — a build without the field is
+  still treated as lose-the-snapshot, with the preflight settings backup authoritative.
 - **A calibration run no longer drops the OTHER mode's 3D LUT.** Entering calibration
   mode cleared both SDR and HDR runtime layers on the monitor, and accepting the new
   calibration exits without the snapshot restore — so a clean HDR run permanently

@@ -482,23 +482,66 @@ def test_monitor_and_mode_vocabulary_matches_cpp():
     assert resp.ok is False and "monitor index out of range" in (resp.error or "")
 
 
-def test_reenter_overwrites_restore_snapshot_hazard(tmp_path):
-    """Documents (and pins the mock mirror of) a real C++ hazard: DoEnterNeutral
-    re-snapshots unconditionally, so entering calibration mode while a stale session is
-    active captures the already-CLEARED state — exit(restore_snapshot=True) then cannot
-    bring back the user's pre-run setup. DesktopLUT ticket: keep the ORIGINAL snapshot on
-    re-enter. DLC surfaces the stale session at enter-neutral and treats the preflight
-    settings backup as the authoritative restore (fable Phase 9)."""
+def test_reenter_keeps_the_original_restore_snapshot(tmp_path):
+    """The regression that made a crashed run cost the user their setup (fable Phase 9 T2,
+    C++ DoEnterNeutral / src/calib_snapshot.h; mirrored here). DoEnterNeutral used to
+    re-snapshot unconditionally, so entering while a stale session was active captured the
+    already-CLEARED state and exit(restore_snapshot=True) handed back the neutral slate.
+    The snapshot store now keeps the FIRST capture of each monitor for the whole session."""
     ctrl = CalibrationController.mock()
     user_cube = _write_3d_cube(tmp_path / "user.cube")
     ctrl.set_3dlut(0, "SDR", str(user_cube))          # the user's pre-run setup
 
-    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")   # run 1 enters... and crashes (no exit)
-    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")   # run 2 enters over the stale session
+    first = ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")   # run 1 enters... and crashes (no exit)
+    assert first["snapshot_retained"] is False               # a fresh session captures
+    second = ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")  # run 2 enters over the stale session
+    assert second["snapshot_retained"] is True               # ...and the ORIGINAL is kept
+    assert second["snapshot_id"] == first["snapshot_id"]
+    # The cleared state must not have become the restore target.
+    assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
+
     out = ctrl.exit_calibration(restore_snapshot=True)
     assert out["restored"] is True
-    # The pre-run cube is GONE: the second enter's snapshot captured the cleared state.
-    assert "cube_path" not in (ctrl.state().get("runtime", {}).get("0:SDR") or {})
+    # The user's pre-run cube is back, not the slate the second enter saw.
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(user_cube)
+
+
+def test_a_new_session_after_an_apply_exit_snapshots_the_kept_state(tmp_path):
+    """The other half of the store's rule: captures are dropped when the session ends, so a
+    run that kept its calibrated state (exit without restore) becomes the setup the NEXT
+    session protects — a stale capture from the previous session must not resurface."""
+    ctrl = CalibrationController.mock()
+    calibrated = _write_3d_cube(tmp_path / "calibrated.cube")
+
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    ctrl.set_3dlut(0, "SDR", str(calibrated))            # run 1's result
+    ctrl.exit_calibration(restore_snapshot=False)        # the apply path: keep it
+
+    second = ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    assert second["snapshot_retained"] is False          # a new session, a new capture
+    assert second["snapshot_id"] != ""
+    out = ctrl.exit_calibration(restore_snapshot=True)
+    assert out["restored"] is True
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(calibrated)
+
+
+def test_entering_a_second_monitor_in_one_session_is_a_new_capture(tmp_path):
+    """`snapshot_retained` is per MONITOR, not per session: a monitor this session has not
+    captured yet is a genuine capture, and the restore covers both. The C++ store keeps one
+    entry per monitor and DoExitCalibration walks all of them — the old single slot restored
+    only the last monitor entered."""
+    ctrl = CalibrationController.mock()
+    cube_a = _write_3d_cube(tmp_path / "a.cube")
+    cube_b = _write_3d_cube(tmp_path / "b.cube")
+    ctrl.set_3dlut(0, "SDR", str(cube_a))
+    ctrl.set_3dlut(1, "SDR", str(cube_b))
+
+    assert ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")["snapshot_retained"] is False
+    assert ctrl.enter_neutral(1, "SDR", "C:/dlc/sRGB.icm")["snapshot_retained"] is False
+    assert ctrl.exit_calibration(restore_snapshot=True)["restored"] is True
+    runtime = ctrl.state()["runtime"]
+    assert runtime["0:SDR"]["cube_path"] == str(cube_a)
+    assert runtime["1:SDR"]["cube_path"] == str(cube_b)
 
 
 def test_enter_neutral_clears_only_the_calibrated_pair(tmp_path):
@@ -640,10 +683,11 @@ def test_gamma_ramp_evidence_is_shaped_like_hardware():
 
 
 def test_enter_neutral_surfaces_stale_calibration_mode(tmp_path):
-    """A previous run that never exited leaves calibration mode active; entering again
-    silently destroys the C++ restore snapshot (see the re-enter hazard test above), so
-    the stage must SAY so — the digest reader then knows the preflight settings backup is
-    the authoritative restore."""
+    """A previous run that never exited leaves calibration mode active. The stage must SAY
+    so either way, and say the RIGHT thing: a server that keeps the original snapshot
+    (fable Phase 9 T2) still restores the user's setup, so the tell is informational; a
+    server that omits `snapshot_retained` predates the fix and the preflight settings
+    backup is the authoritative restore."""
     from dlc.runs import create_run
     from dlc.stages import enter_neutral
 
@@ -654,9 +698,16 @@ def test_enter_neutral_surfaces_stale_calibration_mode(tmp_path):
     assert first.metrics["stale_calibration_mode"] is False
     assert "stale_calibration_mode" not in [a.code for a in first.anomalies]
 
+    assert first.metrics["snapshot_retained"] is False
+
     second = enter_neutral.build(args, ctx)   # the crashed-run-then-rerun corner
     assert second.metrics["stale_calibration_mode"] is True
-    assert "stale_calibration_mode" in [a.code for a in second.anomalies]
+    assert second.metrics["snapshot_retained"] is True
+    stale = [a for a in second.anomalies if a.code == "stale_calibration_mode"]
+    assert len(stale) == 1
+    # The original snapshot survived, so this is evidence, not a lost-setup warning.
+    assert stale[0].severity == "low"
+    assert "kept the ORIGINAL" in stale[0].detail
     # The evidence branch works through real (simulated-identity) ramp data now.
     assert second.metrics["gamma_ramp_loaded"] is False
     assert second.metrics["neutral_confirmed"] is True

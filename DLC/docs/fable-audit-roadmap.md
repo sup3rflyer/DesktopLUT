@@ -121,6 +121,15 @@ fixable, and leave a written trail. Nothing is one-shotted.
   Design-B grayscale-wb revert on hardware; honesty tell landed). P10 re-verified
   against the shipped C++; F4-12 closed (HDR live-edit honoured, mode-match gated).
   HW-8 queued (`windows.set_hdr` live flip).
+- **Updated:** 2026-09-21, Phase 9 ticket **T2 landed** on `claude/project-thread-djg427`
+  (report addendum: `docs/audits/fable/phase-9.md` §5a). `DoEnterNeutral`'s unconditional
+  snapshot overwrite is replaced by a per-monitor `CalibSnapshotStore` (`../src/calib_snapshot.h`):
+  first capture of a monitor wins for the session, dropped at exit, and restore now walks every
+  monitor the session touched (the old single slot also silently dropped all but the last).
+  `calibration.enter` reports `snapshot_retained`, so DLC's `stale_calibration_mode` tell is
+  honest against both old and fixed servers. Mock mirrored, spec corrected, C++ doctest cases
+  added; suite `1523 passed, 9 skipped`. **MSVC build and hardware behaviour unverified** —
+  HW-9. T1/T3/T4 remain open.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -1142,6 +1151,7 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-5 | F4-3 (P16): compare `peak_chroma.cap_nits_nonadditive_est` against the HDR refine's actually-landed D65 peak — decides whether the Peak-Chroma cap should adopt the first-order non-additivity correction | Phase 4 |
 | HW-6 | F5-1 (gamut-aware delta fix): on the next HDR box run, compare 3D-LUT frontier-corner residuals + optimizer floor counts/classifications vs the recorded baseline — reachable-boundary corners should improve or hold, previously-reported near-boundary "floors" may partially resolve; in-gamut and SDR numbers unchanged | Phase 5 |
 | HW-7 | Practical split on hardware: record the HDR verify `practical` block (core/limits/clamped) next to the raw numbers — expect `core.avg` materially below the overall avg (the 3.26 baseline was gamut-floor-inflated) and `clamped.n` ≈ the panel's known unreachable Rec.2020 corners; then re-derive the P3 HDR thresholds from the post-P1 core numbers (folds into HW-1's capture) | Phase 6 |
+| HW-9 | Phase 9 T2 (calibration snapshot store): on the box, confirm the MSVC build + the `CalibSnapshot:` doctest cases, then verify end to end that killing a run mid-flight and re-entering still restores the original MHC profile / white balance / runtime cube on `exit(restore_snapshot=true)`, and that a normal committing run still keeps its calibrated state | Phase 9 |
 | HW-8 | `windows.set_hdr` live flip on the box: toggle monitor 0 SDR→HDR→SDR over the pipe; confirm the OS flip, DesktopLUT's MHC reapply on WM_DISPLAYCHANGE, and `query_monitors` tracking `hdr_active`/`color_space`; then one `--mode HDR` run end-to-end without touching Windows Settings | Phase 9 |
 | — | *(phases append here)* | |
 

@@ -21,6 +21,7 @@
 
 #include "types.h"
 #include "globals.h"
+#include "calib_snapshot.h"
 #include "gui_mhc.h"
 #include "gui_shared.h"
 #include "mhc.h"
@@ -331,10 +332,9 @@ struct CalibState {
     std::wstring dummyIcc;
     std::wstring reason;
     bool correctionsReset = false;
-    bool hasSnapshot = false;
-    int snapMonitor = -1;
-    bool snapWasHdr = false;
-    MonitorSettings snapshot;
+    // Per-monitor pre-session settings; first capture of a monitor wins for the whole
+    // session (see calib_snapshot.h — fable audit Phase 9, T2).
+    CalibSnapshotStore snapshots;
 };
 std::mutex g_calibMutex;
 CalibState g_calib;
@@ -953,15 +953,19 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     DisplayInfo di;
     bool haveDi = GetDisplayInfoForMonitor(mon, di);
 
+    bool snapshotRetained = false;  // true = an EARLIER capture of this monitor was kept
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
         {
             std::lock_guard<std::mutex> ck(g_calibMutex);
-            g_calib.snapshot = ms;  // snapshot BEFORE clearing
-            g_calib.hasSnapshot = true;
-            g_calib.snapMonitor = mon;
-            g_calib.snapWasHdr = isHDR;
+            // Snapshot BEFORE clearing — but only if this session hasn't captured this
+            // monitor already. A session that is STILL ACTIVE here is one whose monitors
+            // are already cleared (a crashed run that never called calibration.exit), so
+            // re-capturing would overwrite the user's real setup with the neutral slate
+            // and restore_snapshot would hand back the slate (fable audit Phase 9, T2).
+            if (!g_calib.active) g_calib.snapshots.Clear();  // a fresh session starts clean
+            snapshotRetained = !g_calib.snapshots.CaptureIfAbsent(mon, ms, isHDR);
         }
         MHCSettings& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
         if (haveDi && mhc.enabled && !mhc.profileName.empty())
@@ -1026,6 +1030,10 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("mode", JStr(isHDR ? "HDR" : "SDR"));
     result.set("dummy_icc_path", JStr(WideToUtf8(dummy)));
     result.set("corrections_reset", JBool(true));
+    // Honest re-enter tell for DLC: true means this call kept the ORIGINAL pre-session
+    // snapshot instead of capturing the cleared state. A build that predates T2 omits the
+    // field entirely, which is how DLC tells the two apart.
+    result.set("snapshot_retained", JBool(snapshotRetained));
 }
 
 void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1038,17 +1046,29 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
     bool restored = false;
     if (restore) {
         std::lock_guard<std::mutex> ck(g_calibMutex);
-        if (g_calib.hasSnapshot && g_calib.snapMonitor >= 0) {
-            {
-                std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                if (g_calib.snapMonitor < (int)g_gui.monitorSettings.size())
-                    g_gui.monitorSettings[g_calib.snapMonitor] = g_calib.snapshot;
+        // Put back EVERY monitor this session captured, each to the state it held before
+        // the session cleared it. One session can enter more than one monitor; the old
+        // single snapshot slot restored only the last one (fable audit Phase 9, T2).
+        struct Put { int monitor; bool wasHdr; bool mhcEnabled; };
+        std::vector<Put> puts;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+            for (const auto& kv : g_calib.snapshots.entries) {
+                const int mon = kv.first;
+                if (mon < 0 || mon >= (int)g_gui.monitorSettings.size()) continue;
+                const MonitorSettings& snap = kv.second.settings;
+                g_gui.monitorSettings[mon] = snap;
+                const MHCSettings& m = kv.second.wasHdr ? snap.hdrMHC : snap.sdrMHC;
+                puts.push_back(Put{mon, kv.second.wasHdr, m.enabled});
             }
+        }
+        if (!puts.empty()) {
             SaveSettings();
-            // Reinstall the original MHC for the captured mode if it was active.
-            MHCSettings& m = g_calib.snapWasHdr ? g_calib.snapshot.hdrMHC : g_calib.snapshot.sdrMHC;
-            if (m.enabled) GenerateAndInstallMhcProfile(g_calib.snapMonitor, g_calib.snapWasHdr);
-            UpdateMhcFlagsLive(g_calib.snapMonitor);
+            for (const Put& put : puts) {
+                // Reinstall the original MHC for the captured mode if it was active.
+                if (put.mhcEnabled) GenerateAndInstallMhcProfile(put.monitor, put.wasHdr);
+                UpdateMhcFlagsLive(put.monitor);
+            }
             ReapplyProcessing();
             restored = true;
         }
@@ -1057,6 +1077,10 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
         std::lock_guard<std::mutex> ck(g_calibMutex);
         g_calib.active = false;
         g_calib.correctionsReset = false;
+        // The session is over either way: on the apply path (restore_snapshot=false) the
+        // calibrated state is what the user now wants, so the pre-session captures must
+        // not survive into the next session.
+        g_calib.snapshots.Clear();
     }
     result.set("active", JBool(false));
     result.set("restored", JBool(restored));

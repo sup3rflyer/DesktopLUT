@@ -188,8 +188,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "cube on the apply path (exit without restore); the orchestrator's commit re-applies "
             "dropped pairs as a guard for those builds. The dummy ICC path is RECORDED but not "
             "associated (deferred; neutrality comes from the cleared layers plus DLC's own "
-            "dispwin -c). NOT retry-safe: re-entering while a session is active re-snapshots the "
-            "already-cleared state (see transport.timeout_and_retries).",
+            "dispwin -c). Retry/crash-safe as of the snapshot-store fix: re-entering while a session "
+            "is ALREADY active keeps the ORIGINAL pre-session snapshot rather than capturing "
+            "the cleared state, and reports snapshot_retained=true. A build that predates the "
+            "fix omits snapshot_retained entirely and still overwrites (see "
+            "transport.timeout_and_retries).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
@@ -203,6 +206,12 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "mode": "string",
                 "dummy_icc_path": "string",
                 "corrections_reset": "boolean true",
+                "snapshot_retained": (
+                    "boolean: true when this call KEPT an earlier capture of this monitor from the "
+                    "same session (a re-enter after a crashed run) instead of snapshotting the "
+                    "already-cleared state. Absent = a server predating the fix, which overwrites — "
+                    "treat the preflight settings backup as the authoritative restore."
+                ),
             },
             mutates_state=True,
             gui_thread_required=True,
@@ -719,11 +728,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "GUI thread is wedged mid-mutation. The timed-out request may still be APPLIED "
                 "server-side, and a retry fails pipe-busy until the orphaned connection drains. "
                 "Retry-safety: every mhc.set_*/mhc.apply/runtime.* call is idempotent (same "
-                "params => same state); calibration.enter is NOT retry-safe — a re-enter "
-                "overwrites the single C++ restore snapshot with the already-cleared state "
-                "(DesktopLUT ticket, fable Phase 9), so DLC surfaces a stale active calibration "
-                "mode before entering and treats the preflight settings backup as the "
-                "authoritative restore; mhc.grayscale_commit retried after a real commit "
+                "params => same state); calibration.enter is retry-safe on a server that reports "
+                "snapshot_retained — a re-enter keeps the ORIGINAL pre-session snapshot per "
+                "monitor instead of overwriting it with the already-cleared state (fable "
+                "Phase 9 T2). On a server that omits the field the old single-slot overwrite "
+                "still applies, so DLC surfaces a stale active calibration mode before "
+                "entering and treats the preflight settings backup as the authoritative "
+                "restore; mhc.grayscale_commit retried after a real commit "
                 "returns baked:false (detectable, surfaced as a seam)."
             ),
         },

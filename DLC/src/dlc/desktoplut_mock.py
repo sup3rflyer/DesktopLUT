@@ -534,15 +534,28 @@ class MockDesktopLutServer:
             return self.ok({"active": self.state.calibration_mode is not None, "state": deepcopy(self.state.calibration_mode)})
         if method == "calibration.enter":
             key = self.key(params)  # C++ ParseMonitorMode: validate monitor index + mode vocabulary
-            # NOTE (fable Phase 9): mirrors a real C++ hazard — DoEnterNeutral snapshots
-            # unconditionally, so a RE-enter while calibration is already active captures the
-            # already-cleared state; a later exit(restore_snapshot=True) then restores that
-            # cleared state, not the user's pre-run setup (single snapshot slot in C++; here the
-            # latest enter's snapshot wins the same way). The preflight settings backup is the
-            # authoritative restore. DesktopLUT-side fix ticketed (keep the ORIGINAL snapshot on
-            # re-enter); DLC surfaces stale calibration mode before entering.
-            snapshot_id = f"snapshot-{len(self.state.snapshots) + 1}"
-            self.state.snapshots[snapshot_id] = self.state.as_dict()
+            # Mirrors the C++ snapshot store (fable Phase 9 T2, src/calib_snapshot.h): the FIRST
+            # capture of a session wins. A RE-enter while calibration is already active — the
+            # crashed-run case, where the monitor is already cleared — keeps the original
+            # snapshot instead of capturing the neutral slate, so exit(restore_snapshot=True)
+            # still returns the user's pre-run setup. The C++ keeps one capture per monitor and
+            # drops them at exit; the mock's whole-state snapshot is that same contract seen from
+            # the wire (a session's first snapshot predates every monitor it goes on to clear).
+            active = self.state.calibration_mode
+            prior_id = str(active.get("snapshot_id")) if active else None
+            have_prior = bool(prior_id and prior_id in self.state.snapshots)
+            # snapshot_retained mirrors the C++ per-monitor test "did this session already
+            # capture THIS monitor". The active session records the monitor it entered, which
+            # is the same answer for every sequence DLC produces (one monitor per run). A
+            # session that entered A, then B, then A again would differ in the third call's
+            # flag only — the restore target is right either way, because the session's one
+            # whole-state snapshot predates every monitor it went on to clear.
+            snapshot_retained = have_prior and int(active.get("monitor", -1)) == int(params["monitor"])
+            if have_prior:
+                snapshot_id = str(prior_id)
+            else:
+                snapshot_id = f"snapshot-{len(self.state.snapshots) + 1}"
+                self.state.snapshots[snapshot_id] = self.state.as_dict()
             self.state.corrections_enabled = False
             # C++ DoEnterNeutral clears ONLY the calibrated mode:monitor pair's layers.
             # Other pairs are preserved — the mock used to clear everything (and old C++
@@ -562,7 +575,11 @@ class MockDesktopLutServer:
                 "reason": params.get("reason", ""),
                 "corrections_reset": True,
             }
-            return self.ok(deepcopy(self.state.calibration_mode))
+            # snapshot_retained is a RESULT-only field: the C++ calibration_mode block in
+            # state.get / calibration.status does not carry it.
+            entered = deepcopy(self.state.calibration_mode)
+            entered["snapshot_retained"] = snapshot_retained
+            return self.ok(entered)
         if method == "calibration.exit":
             # C++ DoExitCalibration runs CleanupActiveGsLive() unconditionally first — an
             # orphaned live-edit preview (client died between begin and commit) is reverted to

@@ -204,9 +204,46 @@ default vs C++ GUI-marshal 60s verified correctly ordered (the server gives up f
 | # | Ticket | Where | Why |
 |---|---|---|---|
 | T1 | Add `contract_version` (int, `= 1`) to the `state.get` result | `HandleStateGet` | Version handshake (F9-8). DLC already checks it at preflight; `CPP_TICKETED_RESULT_KEYS` in `test_ipc_contract.py` starts enforcing the shape the moment it lands — remove the allowlist entry with the change. |
-| T2 | Preserve the ORIGINAL snapshot on re-enter | `DoEnterNeutral` | Single snapshot slot is overwritten with the already-cleared state when a crashed run's session is still active — `restore_snapshot` then can't restore the user's setup (F9-9). Keep the existing snapshot when `g_calib.active`. |
+| T2 | ~~Preserve the ORIGINAL snapshot on re-enter~~ **LANDED 2026-09-21** | `DoEnterNeutral` / `DoExitCalibration` | Single snapshot slot was overwritten with the already-cleared state when a crashed run's session is still active — `restore_snapshot` then couldn't restore the user's setup (F9-9). Now a per-monitor `CalibSnapshotStore` (`src/calib_snapshot.h`): first capture of a monitor wins for the session, captures dropped at exit, restore walks every captured monitor. `calibration.enter` reports `snapshot_retained` so DLC can tell a fixed server from an old one. **Not compiled or run on hardware — needs an MSVC build + the box check below.** |
 | T3 | Expose `correction_grayscale` (`point_count`/`points`/`deviations`) in `state.get` mhc entries | `HandleStateGet` | Makes DLC's Design-B grayscale-wb revert (restore the user's PRIOR correction) real on hardware; today it degrades to clear-to-identity (F9-10). Spec text already documents the requirement. |
 | T4 | Remove the unreachable `maintenance.verify_mhc` branch in `HandleCalibrationGuiCommand` | `desktoplut_ipc_server.cpp:1483` | Hygiene: Dispatch serves it on the pipe thread first; the GUI-thread branch is dead and misleads about threading. |
+
+## 5a. T2 follow-up (landed 2026-09-21, `claude/project-thread-djg427`)
+
+- **C++:** `src/calib_snapshot.h` (new, header-only) + `DoEnterNeutral` / `DoExitCalibration`
+  in `desktoplut_ipc_server.cpp`. The single `hasSnapshot`/`snapMonitor`/`snapWasHdr`/`snapshot`
+  quartet in `CalibState` is replaced by the store. Restore now iterates every captured monitor
+  (one `SaveSettings` + one `ReapplyProcessing`, MHC reinstall per monitor), which also fixes the
+  second half of the same defect: a session that entered two monitors restored only the last.
+- **Wire:** `calibration.enter` gains `snapshot_retained` (bool). Additive, so no
+  `contract_version` bump (`desktoplut_client.CONTRACT_VERSION` stays 1); a server that omits
+  the field is by definition a pre-fix build and DLC keeps the pessimistic reading.
+- **DLC:** spec result shape + retry-safety text corrected; `desktoplut_mock` mirrors the fixed
+  behaviour (first snapshot of a session wins); `stages/enter_neutral` splits the
+  `stale_calibration_mode` tell into "original kept" (low) and "build predates the fix" (medium)
+  and records `snapshot_retained` in metrics.
+- **Tests:** `tests/test_settings.cpp` gains six `CalibSnapshot:` cases covering the store's rule
+  directly (C++, not run on this container); `tests/test_ipc_contract.py`'s
+  `test_reenter_overwrites_restore_snapshot_hazard` is replaced by
+  `test_reenter_keeps_the_original_restore_snapshot` plus
+  `test_a_new_session_after_an_apply_exit_snapshots_the_kept_state`, and the stale-tell test now
+  pins the severity and wording. The existing spec ⇄ C++ static result-shape check enforces the
+  new key (verified by removing the C++ line and watching it fail).
+- **Suite:** `1523 passed, 9 skipped`; `python -m dlc.stages.simulate` reaches report with all
+  stages `ran`.
+
+### Needs checking on the Windows box
+
+1. **It builds.** The container is Linux; no MSVC ran. `DesktopLUT.sln` and
+   `DesktopLUT.Tests.vcxproj` both compile `desktoplut_ipc_server.cpp`, and the new header is
+   included from it and from `tests/test_settings.cpp` — no project-file change was needed.
+2. **The six `CalibSnapshot:` doctest cases pass** in the test binary.
+3. **The defect is actually gone, end to end:** set up a monitor the way you use it (MHC profile
+   on, white balance on, a runtime cube), start a run, kill DLC mid-run so `calibration.exit`
+   never fires, start a second run, then exit with `restore_snapshot=true`. Your original profile,
+   white balance and cube should come back. Before this change they did not.
+4. **The apply path is unchanged:** a normal run that commits (exit without restore) must still
+   leave the calibrated state in place.
 
 ## 6. HW-validation queue additions
 
