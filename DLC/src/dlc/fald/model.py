@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import numpy as np
+from scipy import fft as sp_fft
 from scipy.signal import fftconvolve
 
 from dlc._pq import eotf_norm, oetf_norm
@@ -347,6 +348,7 @@ class FaldModel:
             "choose a scale giving integer reduced-res cells"
         self.cw, self.ch = int(round(self.cw)), int(round(self.ch))
         self._kern_cache: dict = {}
+        self._spec_cache: dict = {}
 
     def est_knots(self) -> tuple[tuple[float, ...], tuple[float, ...]]:
         """(knot radii in mm, log-weights) of the "knots" estimate profile from the params; an empty
@@ -454,6 +456,27 @@ class FaldModel:
         return stat(k0) if f < 1e-6 else (1.0 - f) * stat(k0) + f * stat(k0 + 1)
 
     # ------------------------------------------------------------------ spread
+    def _kernel_key(self, kind: str, scale_mm: float, core_mm: float, tail_frac: float,
+                    phase_mm: tuple[float, float], aniso: float, support_cells: int, pnorm: float,
+                    sub: Optional[int], support_soft: Optional[float],
+                    knots: Optional[tuple[Sequence[float], Sequence[float]]]):
+        """The cache key of :meth:`_kernels`, with the resolved ``sub`` / ``support_soft`` / knot arrays.
+
+        Split out so the kernels and their FFTs (:meth:`_kernel_spectra`) are keyed by the SAME
+        thing — a second, hand-written key would be free to drift out of step with this one."""
+        p = self.p
+        sub = p.sub if sub is None else int(sub)
+        support_soft = p.est_support_soft if support_soft is None else float(support_soft)
+        knots_key = r_knot = lw_knot = None
+        if kind == "knots":
+            r_knot, lw_knot = self.est_knots() if knots is None else knots
+            r_knot = np.asarray(r_knot, dtype=float); lw_knot = np.asarray(lw_knot, dtype=float)
+            knots_key = (tuple(np.round(r_knot, 4)), tuple(np.round(lw_knot, 6)))
+        key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
+               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub,
+               round(support_soft, 4), knots_key)
+        return key, sub, support_soft, r_knot, lw_knot
+
     def _kernels(self, kind: str, scale_mm: float, core_mm: float = 0.0, tail_frac: float = 0.0,
                  phase_mm: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0, support_cells: int = 0,
                  pnorm: float = 2.0, sub: Optional[int] = None, support_soft: Optional[float] = None,
@@ -464,16 +487,8 @@ class FaldModel:
         :meth:`est_knots`). ``phase_mm`` shifts the SAMPLE point: the field is evaluated at (p + phase)
         and attributed to p."""
         p = self.p
-        sub = p.sub if sub is None else int(sub)
-        support_soft = p.est_support_soft if support_soft is None else float(support_soft)
-        knots_key = None
-        if kind == "knots":
-            r_knot, lw_knot = self.est_knots() if knots is None else knots
-            r_knot = np.asarray(r_knot, dtype=float); lw_knot = np.asarray(lw_knot, dtype=float)
-            knots_key = (tuple(np.round(r_knot, 4)), tuple(np.round(lw_knot, 6)))
-        key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
-               round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub,
-               round(support_soft, 4), knots_key)
+        key, sub, support_soft, r_knot, lw_knot = self._kernel_key(
+            kind, scale_mm, core_mm, tail_frac, phase_mm, aniso, support_cells, pnorm, sub, support_soft, knots)
         if key in self._kern_cache:
             return self._kern_cache[key]
         cwmm, chmm = p.cell_w * p.px_mm, p.cell_h * p.px_mm
@@ -538,6 +553,35 @@ class FaldModel:
         self._kern_cache[key] = kern
         return kern
 
+    def _kernel_spectra(self, kind: str, scale_mm: float, core_mm: float, tail_frac: float,
+                        phase_mm: tuple[float, float], aniso: float, support_cells: int, pnorm: float,
+                        dshape: tuple[int, ...]):
+        """``(spectra, fshape, full, dshape)`` — the FFTs of the sub² kernels, zero-padded for a
+        convolution with a ``dshape`` drive map, at the transform lengths ``fftconvolve`` would pick.
+
+        Keyed by (:meth:`_kernel_key`, drive shape) so a different lattice size gets its own entry.
+        The cache is bounded, unlike ``_kern_cache``: an entry is several times the size of the
+        kernels it came from (1.9 MB at 24x24 cells, 3.7 MB at 48x48 — complex128 over the padded
+        transform grid), and only the parameter set currently under evaluation is ever reused. A
+        forward pass touches two of them (B_true's kernel and B_est's; the flat-lattice response
+        convolves the same kernels with the same shape, so it hits the same entries), and a fit
+        walks through thousands of parameter sets."""
+        kkey = self._kernel_key(kind, scale_mm, core_mm, tail_frac, phase_mm, aniso, support_cells,
+                                pnorm, None, None, None)[0]
+        key = (kkey, tuple(dshape))
+        ent = self._spec_cache.get(key)
+        if ent is None:
+            sub = self.p.sub
+            kern = self._kernels(kind, scale_mm, core_mm, tail_frac, phase_mm, aniso, support_cells, pnorm)
+            stack = np.stack([kern[oy][ox] for oy in range(sub) for ox in range(sub)])
+            full = tuple(int(dshape[i] + stack.shape[1 + i] - 1) for i in range(2))
+            fshape = tuple(int(sp_fft.next_fast_len(d, True)) for d in full)
+            ent = (sp_fft.rfftn(stack, fshape, axes=(1, 2)), fshape, full, tuple(int(d) for d in dshape))
+            if len(self._spec_cache) >= _SPEC_CACHE_MAX:
+                self._spec_cache.pop(next(iter(self._spec_cache)))       # oldest first
+            self._spec_cache[key] = ent
+        return ent
+
     def backlight(self, drives: np.ndarray, kind: str, scale_mm: float,
                   core_mm: float = 0.0, tail_frac: float = 0.0,
                   phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
@@ -554,15 +598,23 @@ class FaldModel:
                        core_mm: float = 0.0, tail_frac: float = 0.0,
                        phase_px: tuple[float, float] = (0.0, 0.0), aniso: float = 1.0,
                        support_cells: int = 0, pnorm: float = 2.0) -> np.ndarray:
-        """B on the per-cell sub-grid (rows·sub, cols·sub) — the shader's fine textures; :meth:`backlight` upsamples it."""
+        """B on the per-cell sub-grid (rows·sub, cols·sub) — the shader's fine textures; :meth:`backlight` upsamples it.
+
+        The sub² offsets convolve the SAME ``drives`` with sub² different kernels, so the kernels'
+        FFTs are computed once per parameter set (:meth:`_kernel_spectra`) instead of once per call.
+        Measured 2026-09-21: sub=8 → 559 616 ``fftconvolve`` calls in one fit, ~80 % of them scipy
+        per-call argument handling rather than transform work; caching the spectra and doing the
+        batch in one transform is 2.2x on this method and BIT-IDENTICAL (the transform lengths and
+        the centring crop are the ones fftconvolve itself picks — see :func:`_spectra_conv`)."""
         p = self.p
-        kern = self._kernels(kind, scale_mm, core_mm, tail_frac,
-                             (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm), aniso, support_cells, pnorm)
+        phase_mm = (phase_px[0] * p.px_mm, phase_px[1] * p.px_mm)
+        spec = self._kernel_spectra(kind, scale_mm, core_mm, tail_frac, phase_mm, aniso, support_cells,
+                                    pnorm, np.shape(drives))
         sub = p.sub
+        out = _spectra_conv(np.asarray(drives, dtype=float), spec)
         fine = np.zeros((p.rows * sub, p.cols * sub))
-        for oy in range(sub):
-            for ox in range(sub):
-                fine[oy::sub, ox::sub] = fftconvolve(drives, kern[oy][ox], mode="same")
+        for i in range(sub * sub):
+            fine[i // sub::sub, i % sub::sub] = out[i]
         return fine
 
     def true_fine(self, drives: np.ndarray, boost: float = 1.0) -> np.ndarray:
@@ -717,6 +769,22 @@ class FaldModel:
 
     def meter_y(self, shapes, meter_px, aperture_px=None) -> float:
         return float(self.meter(shapes, meter_px, aperture_px).sum())
+
+
+_SPEC_CACHE_MAX = 4            # a forward pass needs two (B_true's kernel and B_est's); the rest is slack
+
+
+def _spectra_conv(a: np.ndarray, spec) -> np.ndarray:
+    """``fftconvolve(a, k, mode="same")`` for every kernel whose FFT is in ``spec``
+    (:meth:`FaldModel._kernel_spectra`), stacked on a leading axis.
+
+    Bit-identical to calling ``fftconvolve`` once per kernel: same real transform at the same
+    ``next_fast_len`` lengths, same crop to the full linear-convolution shape, same centring."""
+    spectra, fshape, full, s1 = spec
+    out = sp_fft.irfftn(sp_fft.rfftn(a, fshape)[None] * spectra, fshape, axes=(1, 2))
+    out = out[:, :full[0], :full[1]]
+    sy, sx = (full[0] - s1[0]) // 2, (full[1] - s1[1]) // 2
+    return out[:, sy:sy + s1[0], sx:sx + s1[1]]
 
 
 def _bilinear(a: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
