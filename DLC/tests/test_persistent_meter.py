@@ -20,6 +20,7 @@ from __future__ import annotations
 import sys
 import threading
 import subprocess
+import time
 from pathlib import Path
 
 from dlc.argyll import (
@@ -235,6 +236,125 @@ def test_close_is_idempotent():
     drv.start()
     drv.close()
     drv.close()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Startup calibration handshake (spectros: ColorChecker Studio / ColorMunki / i1Studio)
+# ---------------------------------------------------------------------------
+
+_CAL_PROMPT = (
+    b" Place instrument on its reflective white reference,\n"
+    b" and set it to the calibration position,\n"
+    b" then hit any key to start calibration.\n"
+    b" Hit ESC or Q to abort: "
+)
+
+
+class CalibratingFakeSpotread:
+    """A spectro that PARKS at a calibration keypress prompt and only reaches the
+    "take a reading" prompt AFTER a keypress starts (and completes) calibration — the
+    i1Studio-family behaviour the i1 DisplayPro doesn't exhibit. Unlike
+    :class:`FakeSpotread`, no reading prompt is emitted up front, so a driver that waits
+    for "take a reading" before nudging would block until its start_timeout."""
+
+    def __init__(self, *, cal_prompt: bytes = _CAL_PROMPT, cal_delay: float = 0.0) -> None:
+        self._out = bytearray(cal_prompt)
+        self._in = bytearray()
+        self._cv = threading.Condition()
+        self._closed = False
+        self._calibrated = False
+        self._count = 0
+        self._cal_delay = cal_delay
+        self.writes: list[bytes] = []
+
+    # -- SpotreadProcess seam --
+    def write(self, data: bytes) -> None:
+        self.writes.append(bytes(data))
+        if data.strip().lower() == b"q":
+            self._emit(b"\nSpot read stopped\n")
+            self._close()
+            return
+        if not self._calibrated:
+            self._calibrated = True
+            # Echo that the keypress landed and calibration began, then — ASYNCHRONOUSLY,
+            # so write() returns at once like the real instrument — stay SILENT for
+            # cal_delay before emitting the reading prompt. That silent gap is exactly the
+            # window in which a naive driver might wrongly send a second keypress.
+            self._emit(b"\nCalibrating...\n")
+
+            def _finish_cal() -> None:
+                if self._cal_delay:
+                    time.sleep(self._cal_delay)
+                self._emit(b"Calibration complete\n"
+                           b"Place instrument on spot to be measured,\n"
+                           b"and hit any key to take a reading: ")
+
+            threading.Thread(target=_finish_cal, daemon=True).start()
+            return
+        self._count += 1
+        self._emit((" Result is XYZ: %f 100.000000 108.000000, Yxy: 100.000000 0.312700 0.329000\n"
+                    "and hit any key to take a reading: " % (95.0 + self._count)).encode("ascii"))
+
+    def read_some(self) -> bytes:
+        with self._cv:
+            while not self._out and not self._closed:
+                self._cv.wait(timeout=1.0)
+            if self._out:
+                b = bytes(self._out[:1])
+                del self._out[:1]
+                return b
+            return b""
+
+    def poll(self):
+        with self._cv:
+            return 0 if self._closed else None
+
+    def terminate(self) -> None:
+        self._close()
+
+    def kill(self) -> None:
+        self._close()
+
+    def _emit(self, data: bytes) -> None:
+        with self._cv:
+            self._out.extend(data)
+            self._cv.notify_all()
+
+    def _close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+
+def test_start_nudges_calibration_prompt_promptly_not_after_start_timeout():
+    # THE REGRESSION GUARD: a spectro parked at its cal prompt must be nudged as soon as
+    # the stream goes idle, not after the whole start_timeout elapses. start_timeout is
+    # set large on purpose — the OLD code would block ~that long before the reading prompt.
+    fake = CalibratingFakeSpotread()
+    drv = _driver(fake, start_timeout=20.0, quiesce_seconds=0.2)
+    t0 = time.monotonic()
+    drv.start()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 5.0, f"start() took {elapsed:.1f}s — it waited out start_timeout instead of nudging"
+    assert fake.writes == [b"\n"], "exactly one calibration keypress should be sent before ready"
+    # And the session is genuinely usable afterwards.
+    res = drv.measure()
+    assert res.ok and res.xyz is not None
+    assert abs(res.xyz[0] - 96.0) < 1e-6
+    drv.close()
+
+
+def test_start_tolerates_calibration_integration_silence():
+    # The keypress starts a calibration that is SILENT for a couple of seconds before the
+    # reading prompt. The grace window must ride that out with a single nudge (no spurious
+    # second keypress that would later manifest as a wasted/queued reading).
+    fake = CalibratingFakeSpotread(cal_delay=2.0)
+    drv = _driver(fake, start_timeout=20.0, quiesce_seconds=0.2)
+    drv.start()
+    assert fake.writes == [b"\n"], f"expected one nudge, got {fake.writes!r}"
+    res = drv.measure()
+    assert res.ok and abs(res.xyz[0] - 96.0) < 1e-6
+    drv.close()
 
 
 def _result_line(x, y, z, *, ylum=None, cx=0.3127, cy=0.3290, prompt=True):

@@ -454,6 +454,10 @@ class PersistentSpotread:
     _READY_RE = re.compile(r"take a reading", re.IGNORECASE)
     _CAL_RE = re.compile(r"calibrat", re.IGNORECASE)
 
+    # Startup calibration handshake bounds (see :meth:`_advance_to_ready`).
+    _MAX_CAL_NUDGES = 4          # cap the keypresses we'll send to advance a cal prompt
+    _CAL_GRACE_SECONDS = 20.0    # bound on instrument-side calibration silence after a nudge
+
     # -- reader thread + line pump ----------------------------------------
 
     def _reader_loop(self) -> None:
@@ -579,23 +583,81 @@ class PersistentSpotread:
             self._proc = proc
         self._reader = threading.Thread(target=self._reader_loop, name="spotread-reader", daemon=True)
         self._reader.start()
-        # Wait for the real measurement prompt (its wording contains "take a reading"
-        # on the i1 DisplayPro: "Hit ESC or Q to exit, any other key to take a reading:").
-        ready = self._wait_for(lambda: bool(self._READY_RE.search(self._tail())), self._start_timeout)
-        if not ready and self._saw_cal_recently():
-            # A calibration step appears to be waiting; nudge once, then re-wait.
-            self._send(self._trigger)
-            ready = self._wait_for(lambda: bool(self._READY_RE.search(self._tail())), self._start_timeout)
-        if not ready:
-            # Wording-agnostic fallback. NB: the i1d3 startup-calibration handshake
-            # (auto vs keypress) is an at-the-box unknown — validate it live.
-            self._wait_quiescent(self._quiesce_seconds, self._start_timeout)
+        self._advance_to_ready()
         # Discard anything produced during startup/calibration (including a reading the
         # nudge may have triggered) so the FIRST measure() begins from a clean slate.
         with self._lock:
             self._results.clear()
             self._pending_warning = None
         self._started = True
+
+    def _advance_to_ready(self) -> None:
+        """Drive spotread from spawn to its "take a reading" prompt.
+
+        Instrument families behave very differently at startup and we must NOT pay the
+        whole ``start_timeout`` on the slow one:
+
+        * **i1 DisplayPro (i1d3)** auto-calibrates and prints the reading prompt within a
+          second or two — the prompt is seen and we return immediately.
+        * **ColorChecker Studio / ColorMunki / i1Studio spectros** park at a
+          "set to calibration position, hit any key to start calibration" prompt and need
+          a keypress to *begin*; the instrument-side calibration then finishes in a few
+          seconds (as it does in the native i1Studio app). The previous implementation
+          blocked the ENTIRE ``start_timeout`` waiting for the reading prompt BEFORE it
+          ever sent that keypress — so a 240 s ``start_timeout`` cost ~4 min at the cal
+          tile. We instead react to the stream going IDLE at a prompt (within
+          ``quiesce_seconds``): if a calibration is pending we press a key to start it,
+          then give the instrument a bounded grace window to reach the reading prompt.
+        """
+        deadline = time.monotonic() + self._start_timeout
+        nudges = 0
+        while time.monotonic() < deadline:
+            # Promptly wait for EITHER the reading prompt or the stream going quiescent
+            # at some other prompt — the crux of the fix (the old code blocked the whole
+            # start_timeout on the reading prompt before it would nudge calibration).
+            state = self._wait_ready_or_idle(self._quiesce_seconds, deadline)
+            if state in ("ready", ""):
+                return
+            # Idle at a non-reading prompt. Nudge only when a calibration is actually
+            # pending (spotread said "calibrat…") and we still have budget — otherwise the
+            # wording is simply unfamiliar and we proceed (measure() stays bounded).
+            if not (self._saw_cal_recently() and nudges < self._MAX_CAL_NUDGES):
+                return
+            nudges += 1
+            self._send(self._trigger)
+            # Give the instrument a bounded window to calibrate and reach the reading
+            # prompt. The common case returns here in the couple of seconds a real
+            # calibration takes; only a multi-step / re-prompting cal loops back to
+            # re-detect idle and nudge again.
+            grace = min(deadline, time.monotonic() + self._CAL_GRACE_SECONDS) - time.monotonic()
+            if self._wait_for(lambda: bool(self._READY_RE.search(self._tail())), grace):
+                return
+        # start_timeout exhausted without a reading prompt (an unfamiliar instrument, or a
+        # cal that never completes): settle briefly so we don't return mid-line. measure()
+        # keeps its own bounded waits regardless.
+        self._wait_quiescent(self._quiesce_seconds, self._quiesce_seconds * 4)
+
+    def _wait_ready_or_idle(self, settle: float, deadline: float) -> str:
+        """Poll until the reading prompt appears (``"ready"``), the stream goes quiescent
+        for ``settle`` seconds at some other prompt (``"idle"``), or the absolute monotonic
+        ``deadline`` passes (``""``). A dead/EOF process returns whichever of ready/idle
+        currently holds — never a hang."""
+        last = self._bytes_seen()
+        last_change = time.monotonic()
+        while True:
+            if self._READY_RE.search(self._tail()):
+                return "ready"
+            now = time.monotonic()
+            cur = self._bytes_seen()
+            if cur != last:
+                last, last_change = cur, now
+            elif now - last_change >= settle:
+                return "idle"
+            if self._dead():
+                return "ready" if self._READY_RE.search(self._tail()) else "idle"
+            if now >= deadline:
+                return ""
+            time.sleep(self._poll_interval)
 
     def _send(self, data: bytes) -> None:
         with self._lock:
