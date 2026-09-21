@@ -101,15 +101,65 @@ static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 4
 #define DWM_HOOK_FALD_PEDMODE_BIT   0x00000020u   // bit 5 (per-channel pedestal)
 #define DWM_HOOK_FALD_DEBUG_MAX     15u
 
-static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode) {
+// Starfield (work guide S1) and its glow-fill part (S2): ONE feature. Glow fill never runs without
+// starfield — the host packs the glow bit only when both are on — and only on PQ (HDR) panel files.
+#define DWM_HOOK_FALD_STAR_BIT      0x00000040u   // bit 6: starfield balancing
+#define DWM_HOOK_FALD_GLOW_BIT      0x00000080u   // bit 7: its glow-fill part
+
+static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int glow = 0) {
     if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
     return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
          | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
-         | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u);
+         | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u)
+         | (star ? DWM_HOOK_FALD_STAR_BIT : 0u)
+         | ((star && glow) ? DWM_HOOK_FALD_GLOW_BIT : 0u);
 }
 static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
 static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
 static inline int      DwmHookFaldPedMode(uint32_t w)  { return (w & DWM_HOOK_FALD_PEDMODE_BIT) != 0; }
+static inline int      DwmHookFaldStar(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) != 0; }
+static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) && (w & DWM_HOOK_FALD_GLOW_BIT); }
+
+// ---------------------------------------------------------------------------
+// Tuning tail — the starfield / glow-fill parameters (floats), appended AFTER DwmHookSharedConfig
+// ---------------------------------------------------------------------------
+// The head struct above is frozen at 464 bytes (an older DwmHook.dll still resident in dwm.exe maps
+// exactly that much). The host creates the mapping sizeof(DwmHookSharedConfigEx) long; an old DLL
+// maps the first 464 bytes and never sees the tail, a new DLL paired with an old host (464-byte
+// mapping) fails to map the full size, falls back to the head and runs starfield / glow on their
+// defaults. The tail is written inside the SAME seqlock as the head (the head's `version`), so a
+// reader copies head + tail in one consistent snapshot. `magic` + `layoutVersion` + `tuningBytes`
+// let a reader reject a tail it does not understand instead of misreading it.
+#define DWM_HOOK_TAIL_MAGIC          0x444C4654u   // 'TFLD'
+#define DWM_HOOK_TAIL_LAYOUT_VERSION 1u
+
+struct DwmHookFaldTuning {           // per monitors[] index: the settings of the mode it is in NOW
+    // starfield (CB words 52-65; same fields and clamps as src FaldStarfieldSettings)
+    float    starEven, starLift, starTargetGain, starTargetSigma;
+    float    starKeepNits, starCapNits, starStrength, starAreaLo;
+    float    starAreaHi, starPeakHi, starNbLo, starNbHi;
+    uint32_t starReach, starEvenReach;
+    // glow fill (CB words 76-78; same fields and clamps as src FaldGlowSettings)
+    float    glowStrength, glowCapNits;
+    uint32_t glowReach;
+    uint32_t _reserved[15];          // room for later fields without a layout bump (17 used + 15 = 32 words)
+};
+static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
+
+struct DwmHookSharedConfigTail {
+    uint32_t magic;                  // DWM_HOOK_TAIL_MAGIC
+    uint32_t layoutVersion;          // DWM_HOOK_TAIL_LAYOUT_VERSION
+    uint32_t tuningBytes;            // sizeof(DwmHookFaldTuning) as the writer knew it
+    uint32_t _pad;
+    DwmHookFaldTuning fald[MAX_DWM_HOOK_MONITORS];
+};
+
+struct DwmHookSharedConfigEx {
+    DwmHookSharedConfig     head;    // offset 0: the frozen layout, seqlock `version` first
+    DwmHookSharedConfigTail tail;    // offset 464
+};
+static_assert(sizeof(DwmHookSharedConfigTail) == 16 + 128 * MAX_DWM_HOOK_MONITORS, "tail layout");
+static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigTail), "head must stay at 464");
 
 // ---------------------------------------------------------------------------
 // Identity beacon palette — shared by the host (paints) and the DLL (classifies)

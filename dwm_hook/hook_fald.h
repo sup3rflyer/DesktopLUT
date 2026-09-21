@@ -1,10 +1,11 @@
 // DesktopLUT DWM Hook - hook_fald.h
 // The FALD (mini-LED local dimming) context-dependence correction, running inside dwm.exe.
 //
-// PHASE ONE: the STATELESS CORE only — stat -> boost -> conv -> gain, twice (two inverse rounds),
-// then the pixel pass. Deliberately absent, and staying in the overlay path (src/fald.cpp) until
-// this one is proven on hardware:
-//   * starfield balancing (S0-S2) and glow fill (G0-G4)
+// The STATELESS layer — stat -> boost -> conv -> gain, twice (two inverse rounds), then the pixel
+// pass — plus the stateless starfield feature: starfield balancing (S0-S2, before round 0) and its
+// glow-fill part (G0-G4, after each round's gain; HDR/PQ only, never without starfield). Both are
+// pure functions of the current frame. Deliberately absent, and staying in the overlay path
+// (src/fald.cpp):
 //   * the first-order temporal filter (pass 1b, modes 1/2) and its delay ring
 //   * the panel clock (pass 1c, mode 3) and the settle hold
 // src/fald.h documents each of those as bit-identical when off, so leaving them out is not a
@@ -88,8 +89,11 @@ void FaldMarkStale(int left, int top);
 ID3D11Texture2D* FaldCleanTexture(FaldMonitor* m);
 ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
 
-// Live settings from the shared config (DwmHookSharedConfig::faldFlags), applied to the next run.
-void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode);
+// Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
+// the next run. star / glow: the merged starfield feature and its glow-fill part (glow only with star,
+// and only on a PQ panel file — refused here otherwise). tuning = null: their defaults (older host).
+void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star, bool glow,
+                         const DwmHookFaldTuning* tuning);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing

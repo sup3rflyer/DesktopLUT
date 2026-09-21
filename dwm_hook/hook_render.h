@@ -122,7 +122,12 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top);
 // like the tonemap entries and refreshed in the same debounced pass, so a monitor that is briefly
 // re-brokered cannot lose its entry mid-Present. The panel parameter FILE does not come through
 // here — it is staged and read once at attach (hook_fald.h).
-struct LocalFaldParams { int left, top; unsigned int flags; };
+struct LocalFaldParams {
+	int left, top;
+	unsigned int flags;
+	bool hasTuning;             // tuning came from the host's tail; false = run starfield / glow on defaults
+	DwmHookFaldTuning tuning;
+};
 extern LocalFaldParams g_localFald[MAX_DWM_HOOK_MONITORS];
 extern int g_numLocalFald;
 

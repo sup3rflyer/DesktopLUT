@@ -362,7 +362,7 @@ static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
     SaveSettings();
     UpdateGUIState();
     if (enabledNow && g_dwmHookMode.load())
-        SetStatus(L"FALD in DWM hook mode: stateless core only (LED lag, starfield, glow fill are overlay-only)");
+        SetStatus(L"FALD in DWM hook mode: correction + Starfield (glow fill included); LED lag is overlay-only");
 }
 
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
@@ -492,16 +492,18 @@ void UpdateColorCorrectionControls() {
     EnableWindow(g_gui.hwndFaldDelay, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldClosure, !g_dwmHookMode.load());
     EnableWindow(g_gui.hwndFaldParity, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldStarEnable, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldStarEven, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldStarKeep, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldStarStrength, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldStarReach, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldStarSigma, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldGlowEnable, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldGlowStrength, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldGlowReach, !g_dwmHookMode.load());
-    EnableWindow(g_gui.hwndFaldGlowCap, !g_dwmHookMode.load());
+    // Starfield (with its glow-fill part) runs in both paths. Glow fill is part of the starfield feature:
+    // its row is live only while Starfield is on (it never runs without it).
+    EnableWindow(g_gui.hwndFaldStarEnable, TRUE);
+    EnableWindow(g_gui.hwndFaldStarEven, TRUE);
+    EnableWindow(g_gui.hwndFaldStarKeep, TRUE);
+    EnableWindow(g_gui.hwndFaldStarStrength, TRUE);
+    EnableWindow(g_gui.hwndFaldStarReach, TRUE);
+    EnableWindow(g_gui.hwndFaldStarSigma, TRUE);
+    EnableWindow(g_gui.hwndFaldGlowEnable, shown.star.enabled);
+    EnableWindow(g_gui.hwndFaldGlowStrength, shown.star.enabled);
+    EnableWindow(g_gui.hwndFaldGlowReach, shown.star.enabled);
+    EnableWindow(g_gui.hwndFaldGlowCap, shown.star.enabled);
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1562,8 +1564,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         FaldSlot(false).star.enabled = on;
                     }
                     ApplyFaldSharedSettingChange();
+                    UpdateColorCorrectionControls();   // the glow-fill row follows the Starfield switch
                     if (on)
-                        SetStatus(L"FALD starfield balancing on (experimental): it changes scattered highlights on purpose - judge by eye");
+                        SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose; glow fill (HDR) rides along when ticked");
                 }
             }
             return 0;
@@ -1643,7 +1646,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ApplyFaldSharedSettingChange();
                     if (on)
                         SetStatus(CurrentMonitorIsHDR()
-                            ? L"FALD glow fill on (experimental): it adds light to black between glowing areas on purpose - judge by eye"
+                            ? L"FALD glow fill on (part of Starfield, unmeasured on HW): adds light to black between glowing areas on purpose"
                             : L"FALD glow fill is HDR only (its request ceiling is measured in HDR): on for this monitor's HDR mode, not in SDR");
                 }
             }

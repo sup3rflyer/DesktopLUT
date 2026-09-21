@@ -5,6 +5,7 @@
 #include "../shared/dwm_hook_config.h"
 #include "globals.h"
 #include "gui.h"
+#include "fald.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -836,6 +837,7 @@ std::wstring UninjectDwmHook()
 
 static HANDLE g_sharedMemHandle = nullptr;
 static DwmHookSharedConfig* g_sharedMemPtr = nullptr;
+static size_t g_sharedMemBytes = 0;   // the mapped view: sizeof(DwmHookSharedConfigEx), or the head only
 static uint32_t g_sharedMemVersion = 0;
 
 static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
@@ -861,17 +863,31 @@ bool CreateDwmHookSharedMemory()
     SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
     SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
 
+    // Head + tuning tail (dwm_hook_config.h, DwmHookSharedConfigEx). An older DLL maps only the
+    // 464-byte head of this and is unaffected by the tail.
     g_sharedMemHandle = CreateFileMappingW(
         INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
-        sizeof(DwmHookSharedConfig), DWM_HOOK_CONFIG_NAME);
+        sizeof(DwmHookSharedConfigEx), DWM_HOOK_CONFIG_NAME);
 
     if (!g_sharedMemHandle) {
         std::wcerr << L"[DWM Hook] Failed to create shared memory: " << GetLastError() << std::endl;
         return false;
     }
 
+    // A mapping of this name that already existed (an older DLL still resident in dwm.exe keeps its
+    // handle open) keeps ITS size — the 464-byte head. Then the full view fails: fall back to the
+    // head and write no tail (that DLL could not read one anyway).
+    const bool preexisting = (GetLastError() == ERROR_ALREADY_EXISTS);
+    g_sharedMemBytes = sizeof(DwmHookSharedConfigEx);
     g_sharedMemPtr = static_cast<DwmHookSharedConfig*>(
-        MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, sizeof(DwmHookSharedConfig)));
+        MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, g_sharedMemBytes));
+    if (!g_sharedMemPtr && preexisting) {
+        g_sharedMemBytes = sizeof(DwmHookSharedConfig);
+        g_sharedMemPtr = static_cast<DwmHookSharedConfig*>(
+            MapViewOfFile(g_sharedMemHandle, FILE_MAP_WRITE, 0, 0, g_sharedMemBytes));
+        if (g_sharedMemPtr)
+            std::wcout << L"[DWM Hook] Shared memory pre-existed at the old size: FALD tuning tail not written" << std::endl;
+    }
 
     if (!g_sharedMemPtr) {
         std::wcerr << L"[DWM Hook] Failed to map shared memory: " << GetLastError() << std::endl;
@@ -880,7 +896,7 @@ bool CreateDwmHookSharedMemory()
         return false;
     }
 
-    memset(g_sharedMemPtr, 0, sizeof(DwmHookSharedConfig));
+    memset(g_sharedMemPtr, 0, g_sharedMemBytes);
     g_sharedMemVersion = 0;
     UpdateDwmHookSharedConfig();
 
@@ -893,7 +909,11 @@ void UpdateDwmHookSharedConfig()
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     if (!g_sharedMemPtr) return;
 
-    DwmHookSharedConfig cfg = {};
+    DwmHookSharedConfigEx ex = {};
+    DwmHookSharedConfig& cfg = ex.head;
+    ex.tail.magic = DWM_HOOK_TAIL_MAGIC;
+    ex.tail.layoutVersion = DWM_HOOK_TAIL_LAYOUT_VERSION;
+    ex.tail.tuningBytes = sizeof(DwmHookFaldTuning);
     cfg.hostPid = GetCurrentProcessId();
     cfg.lutReloadFlag = g_sharedMemPtr->lutReloadFlag;
     const bool beacon = g_hookBeaconActive.load();
@@ -934,9 +954,24 @@ void UpdateDwmHookSharedConfig()
                         // A configured-but-pathless layer is off (the DLL has no file to read either).
                         const auto& fs = mc.isHdr ? g_gui.monitorSettings[mi].hdrColorCorrection.fald
                                                   : g_gui.monitorSettings[mi].sdrColorCorrection.fald;
+                        // Starfield + its glow-fill part are one feature: glow rides only with starfield
+                        // (DwmHookFaldPack drops it otherwise); the hook also refuses glow on a non-PQ file.
                         cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty(),
                                                            static_cast<uint32_t>(fs.debugMode),
-                                                           static_cast<int>(fs.pedMode));
+                                                           static_cast<int>(fs.pedMode),
+                                                           fs.star.enabled ? 1 : 0,
+                                                           fs.glow.enabled ? 1 : 0);
+                        FaldStarfieldSettings st = fs.star;
+                        FaldStarfieldClamp(st);
+                        FaldGlowSettings gl = fs.glow;
+                        FaldGlowClamp(gl);
+                        DwmHookFaldTuning& t = ex.tail.fald[i];
+                        t.starEven = st.even; t.starLift = st.lift; t.starTargetGain = st.targetGain;
+                        t.starTargetSigma = st.targetSigma; t.starKeepNits = st.keepNits; t.starCapNits = st.capNits;
+                        t.starStrength = st.strength; t.starAreaLo = st.areaLo; t.starAreaHi = st.areaHi;
+                        t.starPeakHi = st.peakHi; t.starNbLo = st.nbLo; t.starNbHi = st.nbHi;
+                        t.starReach = st.reach; t.starEvenReach = st.evenReach;
+                        t.glowStrength = gl.strength; t.glowCapNits = gl.capNits; t.glowReach = gl.reach;
                         break;
                     }
                 }
@@ -950,8 +985,8 @@ void UpdateDwmHookSharedConfig()
     std::atomic_thread_fence(std::memory_order_release);
     cfg.version = 0;
     memcpy(reinterpret_cast<char*>(g_sharedMemPtr) + sizeof(uint32_t),
-           reinterpret_cast<const char*>(&cfg) + sizeof(uint32_t),
-           sizeof(DwmHookSharedConfig) - sizeof(uint32_t));
+           reinterpret_cast<const char*>(&ex) + sizeof(uint32_t),
+           g_sharedMemBytes - sizeof(uint32_t));   // head + tail (when mapped) inside one seqlock write
     std::atomic_thread_fence(std::memory_order_release);
     g_sharedMemPtr->version = ++g_sharedMemVersion;  // even = write complete
 }

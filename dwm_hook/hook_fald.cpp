@@ -33,6 +33,32 @@ static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11VertexShader* g_faldVS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
+// Starfield feature (starfield balancing S0-S2 + its glow-fill part G0-G4). Compiled beside the core
+// but NOT part of FaldShadersReady: a compile failure here costs the feature, never the correction.
+static ID3D11ComputeShader* g_starStatCS = nullptr;     // S0: star statistic of the source frame
+static ID3D11ComputeShader* g_starWeightCS = nullptr;   // S1: tapered protection field + zone weights
+static ID3D11ComputeShader* g_starPlanCS = nullptr;     // S2: target + the plan the pixels sample
+static ID3D11ComputeShader* g_glowZoneCS = nullptr;     // G0: zone pedestal
+static ID3D11ComputeShader* g_glowDilateCS = nullptr;   // G1: box maximum
+static ID3D11ComputeShader* g_glowErodeCS = nullptr;    // G2: box minimum (the closing)
+static ID3D11ComputeShader* g_glowEnvCS = nullptr;      // G3: blur + deficit
+static ID3D11ComputeShader* g_glowBandCS = nullptr;     // G4: count-threshold band (boost + mean rule only)
+static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
+static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS; }
+static void CompileFeatureShaders();   // below FaldReleaseShaders
+
+// GPU timing (timestamp queries, read back without flushing a few frames later — never a stall in
+// the present path). Three stamps per run: start, after the starfield passes, end of the pixel pass.
+static ID3D11Query* g_tsDisjoint[4] = {};
+static ID3D11Query* g_tsStamp[4][3] = {};
+static bool g_tsInFlight[4] = {};
+static FaldMonitor* g_tsOwner[4] = {};   // the monitor a slot's result is credited to
+static unsigned int g_tsHead = 0;
+
+// src/fald.h FALD_GLOW_REACH_MAX, which is ALSO the HLSL's constant of that name (shared/fald_shader.h):
+// it sizes the glow dilation texture's margin, so the two must agree.
+static const unsigned int HOOK_GLOW_REACH_MAX = 4u;
+
 // t0..t24, as the HLSL declares them (HOOK_FALD_SRV_SLOTS). The pixel pass and every compute pass
 // bind the whole range so a slot left over from a previous pass cannot be read by accident.
 static const UINT FALD_SRV_SLOTS = HOOK_FALD_SRV_SLOTS;
@@ -109,12 +135,57 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         return false;
     }
     log_to_file("FALD: correction shaders compiled (stateless core)");
+    CompileFeatureShaders();
     return true;
 }
 
 template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
+static void ReleaseFeatureShaders() {
+    SafeRelease(g_glowBandCS); SafeRelease(g_glowEnvCS); SafeRelease(g_glowErodeCS);
+    SafeRelease(g_glowDilateCS); SafeRelease(g_glowZoneCS);
+    SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
+    for (int i = 0; i < 4; i++) {
+        SafeRelease(g_tsDisjoint[i]);
+        for (int k = 0; k < 3; k++) SafeRelease(g_tsStamp[i][k]);
+        g_tsInFlight[i] = false;
+    }
+}
+
+static void CompileFeatureShaders() {
+    const std::string common = g_faldCommonSource;
+    struct { const char* src; const char* name; ID3D11ComputeShader** out; } cs[] = {
+        { g_faldStarStatSource,   "FaldStarStatCS",   &g_starStatCS   },
+        { g_faldStarWeightSource, "FaldStarWeightCS", &g_starWeightCS },
+        { g_faldStarPlanSource,   "FaldStarPlanCS",   &g_starPlanCS   },
+        { g_faldGlowZoneSource,   "FaldGlowZoneCS",   &g_glowZoneCS   },
+        { g_faldGlowDilateSource, "FaldGlowDilateCS", &g_glowDilateCS },
+        { g_faldGlowErodeSource,  "FaldGlowErodeCS",  &g_glowErodeCS  },
+        { g_faldGlowEnvSource,    "FaldGlowEnvCS",    &g_glowEnvCS    },
+        { g_faldGlowBandSource,   "FaldGlowBandCS",   &g_glowBandCS   },
+    };
+    for (const auto& s : cs) {
+        ID3DBlob* b = nullptr;
+        if (!CompileOne(common + s.src, s.name, "cs_5_0", &b)) continue;   // logged; that part stays off
+        if (FAILED(g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.out)))
+            LogF("FALD: CreateComputeShader(%s) failed", s.name);
+        b->Release();
+    }
+    // GPU timestamp queries (optional: without them the cost log shows CPU time only)
+    D3D11_QUERY_DESC qd = {};
+    for (int i = 0; i < 4; i++) {
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        if (FAILED(g_dev->CreateQuery(&qd, &g_tsDisjoint[i]))) { g_tsDisjoint[i] = nullptr; continue; }
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        for (int k = 0; k < 3; k++)
+            if (FAILED(g_dev->CreateQuery(&qd, &g_tsStamp[i][k]))) g_tsStamp[i][k] = nullptr;
+    }
+    LogF("FALD: starfield shaders %s, glow fill shaders %s",
+         StarShadersReady() ? "compiled" : "UNAVAILABLE", GlowShadersReady() ? "compiled" : "UNAVAILABLE");
+}
+
 void FaldReleaseShaders() {
+    ReleaseFeatureShaders();
     SafeRelease(g_faldSampler);
     SafeRelease(g_faldVS);
     SafeRelease(g_faldPS);
@@ -254,7 +325,86 @@ struct FaldMonitor {
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
 
     ID3D11Buffer* cb = nullptr;
+
+    // Starfield feature (created on the first frame it is on, released when it goes off).
+    // Requests from the live settings; *On = requested AND the textures exist (CB words 35 / 75 / 80).
+    bool starWanted = false, glowWanted = false;
+    bool starOn = false, glowOn = false, glowBand = false;
+    bool starFailed = false, glowFailed = false;          // latched: logged once, no per-frame retry
+    DwmHookFaldTuning tuning = {};                        // clamped; defaults until the host sends some
+    ID3D11Texture2D* starStatTex = nullptr;  ID3D11UnorderedAccessView* starStatUAV = nullptr;  ID3D11ShaderResourceView* starStatSRV = nullptr;
+    ID3D11Texture2D* starWTex = nullptr;     ID3D11UnorderedAccessView* starWUAV = nullptr;     ID3D11ShaderResourceView* starWSRV = nullptr;
+    ID3D11Texture2D* starPlanTex = nullptr;  ID3D11UnorderedAccessView* starPlanUAV = nullptr;  ID3D11ShaderResourceView* starPlanSRV = nullptr;
+    ID3D11Texture2D* starBgTex = nullptr;    ID3D11UnorderedAccessView* starBgUAV = nullptr;    ID3D11ShaderResourceView* starBgSRV = nullptr;
+    ID3D11Texture2D* starPlan2Tex = nullptr; ID3D11UnorderedAccessView* starPlan2UAV = nullptr; ID3D11ShaderResourceView* starPlan2SRV = nullptr;
+    ID3D11Texture2D* glowVTex = nullptr;     ID3D11UnorderedAccessView* glowVUAV = nullptr;     ID3D11ShaderResourceView* glowVSRV = nullptr;
+    ID3D11Texture2D* glowDilTex = nullptr;   ID3D11UnorderedAccessView* glowDilUAV = nullptr;   ID3D11ShaderResourceView* glowDilSRV = nullptr;
+    ID3D11Texture2D* glowCTex = nullptr;     ID3D11UnorderedAccessView* glowCUAV = nullptr;     ID3D11ShaderResourceView* glowCSRV = nullptr;
+    ID3D11Texture2D* glowEnvTex = nullptr;   ID3D11UnorderedAccessView* glowEnvUAV = nullptr;   ID3D11ShaderResourceView* glowEnvSRV = nullptr;
+    ID3D11Texture2D* glowKTex = nullptr;     ID3D11UnorderedAccessView* glowKUAV = nullptr;     ID3D11ShaderResourceView* glowKSRV = nullptr;
+
+    // GPU cost accumulated between log lines (microseconds; from the timestamp queries)
+    double gpuSumUs = 0.0, gpuStarSumUs = 0.0, gpuMaxUs = 0.0;
+    unsigned int gpuSamples = 0;
 };
+
+// The defaults src/fald.h gives FaldStarfieldSettings / FaldGlowSettings (used until the host sends a
+// tuning tail — an older host — and for the inert CB words while the feature is off).
+static DwmHookFaldTuning DefaultTuning() {
+    DwmHookFaldTuning t = {};
+    t.starEven = 0.8f; t.starLift = 0.0f; t.starTargetGain = 1.0f; t.starTargetSigma = 0.0f;
+    t.starKeepNits = 100.0f; t.starCapNits = 0.0f; t.starStrength = 1.0f; t.starAreaLo = 40.0f;
+    t.starAreaHi = 160.0f; t.starPeakHi = 0.0f; t.starNbLo = 0.15f; t.starNbHi = 0.30f;
+    t.starReach = 2u; t.starEvenReach = 8u;
+    t.glowStrength = 1.0f; t.glowCapNits = 0.05f; t.glowReach = 2u;
+    return t;
+}
+
+// Shared memory is the host's word, but the integers here size shader loops: bound them whatever
+// arrives (the host already clamped with src FaldStarfieldClamp / FaldGlowClamp), and replace NaNs.
+static DwmHookFaldTuning SanitizeTuning(const DwmHookFaldTuning& in) {
+    const DwmHookFaldTuning d = DefaultTuning();
+    DwmHookFaldTuning t = in;
+    auto fix = [](float v, float lo, float hi, float dflt) { return (v != v) ? dflt : (v < lo ? lo : (v > hi ? hi : v)); };
+    t.starEven = fix(t.starEven, 0.0f, 1.0f, d.starEven);
+    t.starLift = fix(t.starLift, 0.0f, 1.0f, d.starLift);
+    t.starTargetGain = fix(t.starTargetGain, 0.05f, 2.0f, d.starTargetGain);
+    t.starTargetSigma = fix(t.starTargetSigma, 0.0f, 4.0f, d.starTargetSigma);
+    t.starKeepNits = fix(t.starKeepNits, 0.0f, 10000.0f, d.starKeepNits);
+    t.starCapNits = fix(t.starCapNits, 0.0f, 10000.0f, d.starCapNits);
+    t.starStrength = fix(t.starStrength, 0.0f, 1.0f, d.starStrength);
+    t.starAreaLo = fix(t.starAreaLo, 0.0f, 1.0e6f, d.starAreaLo);
+    t.starAreaHi = fix(t.starAreaHi, t.starAreaLo, 1.0e6f, d.starAreaHi);
+    t.starPeakHi = fix(t.starPeakHi, 0.0f, 10000.0f, d.starPeakHi);
+    t.starNbLo = fix(t.starNbLo, 0.0f, 1.0f, d.starNbLo);
+    t.starNbHi = fix(t.starNbHi, t.starNbLo, 1.0f, d.starNbHi);
+    if (t.starReach > 4u) t.starReach = 4u;              // FALD_STAR_REACH_MAX
+    if (t.starEvenReach > 12u) t.starEvenReach = 12u;    // FALD_STAR_EVEN_REACH_MAX
+    t.glowStrength = fix(t.glowStrength, 0.0f, 1.0f, d.glowStrength);
+    t.glowCapNits = fix(t.glowCapNits, 0.005f, 0.5f, d.glowCapNits);   // FALD_GLOW_CAP_MIN / MAX
+    if (t.glowReach < 1u) t.glowReach = 1u;              // FALD_GLOW_REACH_MIN
+    if (t.glowReach > HOOK_GLOW_REACH_MAX) t.glowReach = HOOK_GLOW_REACH_MAX;
+    return t;
+}
+
+static void ReleaseStar(FaldMonitor* m) {
+    SafeRelease(m->starPlan2SRV); SafeRelease(m->starPlan2UAV); SafeRelease(m->starPlan2Tex);
+    SafeRelease(m->starBgSRV);    SafeRelease(m->starBgUAV);    SafeRelease(m->starBgTex);
+    SafeRelease(m->starPlanSRV);  SafeRelease(m->starPlanUAV);  SafeRelease(m->starPlanTex);
+    SafeRelease(m->starWSRV);     SafeRelease(m->starWUAV);     SafeRelease(m->starWTex);
+    SafeRelease(m->starStatSRV);  SafeRelease(m->starStatUAV);  SafeRelease(m->starStatTex);
+    m->starOn = false;
+}
+
+static void ReleaseGlow(FaldMonitor* m) {
+    SafeRelease(m->glowKSRV);   SafeRelease(m->glowKUAV);   SafeRelease(m->glowKTex);
+    SafeRelease(m->glowEnvSRV); SafeRelease(m->glowEnvUAV); SafeRelease(m->glowEnvTex);
+    SafeRelease(m->glowCSRV);   SafeRelease(m->glowCUAV);   SafeRelease(m->glowCTex);
+    SafeRelease(m->glowDilSRV); SafeRelease(m->glowDilUAV); SafeRelease(m->glowDilTex);
+    SafeRelease(m->glowVSRV);   SafeRelease(m->glowVUAV);   SafeRelease(m->glowVTex);
+    m->glowOn = false;
+    m->glowBand = false;
+}
 
 // One entry per (position, mode) actually seen presenting; fixed-size for the same reason as above.
 static FaldMonitor* g_monitors[FALD_MAX_PANEL_FILES] = {};
@@ -279,11 +429,14 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->curveSRV); SafeRelease(m->curveTex);
     SafeRelease(m->interSRV); SafeRelease(m->interRTV); SafeRelease(m->interTex);
     SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
+    ReleaseStar(m);
+    ReleaseGlow(m);
     m->primed = false;
     m->valid = false;
 }
 
 void FaldReleaseAll() {
+    for (int i = 0; i < 4; i++) { g_tsInFlight[i] = false; g_tsOwner[i] = nullptr; }   // owners are about to go
     for (int i = 0; i < g_numMonitors; i++) {
         if (!g_monitors[i]) continue;
         ReleaseMonitor(g_monitors[i]);
@@ -322,11 +475,70 @@ static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, 
     return SUCCEEDED(g_dev->CreateShaderResourceView(*buf, &sd, srv));
 }
 
+// The five cols x rows RGBA32F starfield textures (src/fald.cpp EnsureStar). A failure is latched per
+// build: logged once, the feature stays off for this monitor until the next rebuild (resize / mode).
+static bool EnsureStar(FaldMonitor* m) {
+    if (m->starStatTex && m->starWTex && m->starPlanTex && m->starBgTex && m->starPlan2Tex) return true;
+    if (m->starFailed || !StarShadersReady()) return false;
+    ReleaseStar(m);
+    const FaldPanelParams& p = m->params;
+    const DXGI_FORMAT f = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    if (MakeRWTexture(p.cols, p.rows, &m->starStatTex, &m->starStatUAV, &m->starStatSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &m->starWTex, &m->starWUAV, &m->starWSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &m->starPlanTex, &m->starPlanUAV, &m->starPlanSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &m->starBgTex, &m->starBgUAV, &m->starBgSRV, f) &&
+        MakeRWTexture(p.cols, p.rows, &m->starPlan2Tex, &m->starPlan2UAV, &m->starPlan2SRV, f))
+        return true;
+    ReleaseStar(m);
+    m->starFailed = true;
+    LogF("FALD: pos(%d,%d) starfield textures could not be created - starfield stays off", m->left, m->top);
+    return false;
+}
+
+// The five glow-fill zone textures (src/fald.cpp EnsureGlow): Vz, the dilation on the lattice extended
+// by the reach maximum on every side, the closing, (Ez, Dz, Cz, Vz), and the band's scale k.
+static bool EnsureGlow(FaldMonitor* m) {
+    if (m->glowVTex && m->glowDilTex && m->glowCTex && m->glowEnvTex && m->glowKTex) return true;
+    if (m->glowFailed || !GlowShadersReady()) return false;
+    ReleaseGlow(m);
+    const FaldPanelParams& p = m->params;
+    const UINT margin = 2u * HOOK_GLOW_REACH_MAX;
+    if (MakeRWTexture(p.cols, p.rows, &m->glowVTex, &m->glowVUAV, &m->glowVSRV) &&
+        MakeRWTexture(p.cols + margin, p.rows + margin, &m->glowDilTex, &m->glowDilUAV, &m->glowDilSRV) &&
+        MakeRWTexture(p.cols, p.rows, &m->glowCTex, &m->glowCUAV, &m->glowCSRV) &&
+        MakeRWTexture(p.cols, p.rows, &m->glowEnvTex, &m->glowEnvUAV, &m->glowEnvSRV, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
+        MakeRWTexture(p.cols, p.rows, &m->glowKTex, &m->glowKUAV, &m->glowKSRV))
+        return true;
+    ReleaseGlow(m);
+    m->glowFailed = true;
+    LogF("FALD: pos(%d,%d) glow fill textures could not be created - glow fill stays off", m->left, m->top);
+    return false;
+}
+
+// Resolve this frame's starfield / glow state from the live request (FaldSetLiveSettings). Off =
+// textures released and nothing downstream knows the feature exists (CB words 35 / 75 / 80 = 0,
+// t15 / t18 / t23 / t24 unbound) — the bit-identical-when-off rule of src/fald.cpp.
+static void ResolveFeatures(FaldMonitor* m) {
+    const bool wasStar = m->starOn, wasGlow = m->glowOn;
+    if (m->starWanted) m->starOn = EnsureStar(m);
+    else if (m->starStatTex || m->starOn) ReleaseStar(m);
+    // glow: only with starfield (the merged feature), only on PQ panel files (HDR measurements)
+    const bool glowWanted = m->glowWanted && m->starOn && m->params.transfer == FALD_TRANSFER_PQ;
+    if (glowWanted) m->glowOn = EnsureGlow(m);
+    else if (m->glowVTex || m->glowOn) ReleaseGlow(m);
+    m->glowBand = m->glowOn && m->params.hasBoost && m->params.boostRule == FALD_BOOST_RULE_MEAN;
+    if (m->starOn != wasStar || m->glowOn != wasGlow)
+        LogF("FALD: pos(%d,%d) %s starfield %s, glow fill %s%s", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)",
+             m->starOn ? "ON" : "off", m->glowOn ? "ON" : "off", m->glowBand ? " (count-threshold band)" : "");
+}
+
 static void ComputeFlatResponse(FaldMonitor* m);
 
 static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
     ReleaseMonitor(m);
     m->params = params;
+    m->starFailed = false;
+    m->glowFailed = false;
     const FaldPanelParams& p = m->params;
 
     if (!FaldLatticeFits(p, (int)m->width, (int)m->height)) {
@@ -421,6 +633,7 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
         if (g_numMonitors >= FALD_MAX_PANEL_FILES) return nullptr;
         m = new FaldMonitor();
         m->left = left; m->top = top; m->isHdr = isHdr;
+        m->tuning = DefaultTuning();
         // Published last: a concurrent reader either does not see the slot or sees a complete entry.
         g_monitors[g_numMonitors] = m;
         g_numMonitors++;
@@ -474,10 +687,14 @@ void FaldMarkStale(int left, int top) {
     }
 }
 
-void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode) {
+void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star, bool glow,
+                         const DwmHookFaldTuning* tuning) {
     if (!m) return;
     m->debugMode = debugMode;
     m->pedMode = pedMode ? 1u : 0u;
+    m->starWanted = star;
+    m->glowWanted = star && glow;
+    m->tuning = tuning ? SanitizeTuning(*tuning) : DefaultTuning();
 }
 
 double FaldLastRunMicros(const FaldMonitor* m) { return m ? m->lastRunUs : 0.0; }
@@ -503,7 +720,7 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
     u[34] = (boostOn && p.hasBoost) ? p.boostN : 0u;                                // black-frame LED boost steps (0 = no term)
-    u[35] = 0u;                                                                     // starfield balancing: not in the hook's core
+    u[35] = m->starOn ? 1u : 0u;                                                    // starfield balancing (fields in t15 / t18)
     const bool perChannel = (m->pedMode == 1) && p.hasPedColour;
     f[36] = p.tmin * p.pedRGB[0]; f[37] = p.tmin * p.pedRGB[1]; f[38] = p.tmin * p.pedRGB[2];
     u[39] = perChannel ? 1u : 0u;
@@ -518,23 +735,22 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     u[46] = 0u; u[47] = 1u;
     // black-frame LED boost: the zone activation rule (words 48-51; read only when word 34 != 0)
     f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
-    // Starfield words 52-65: the overlay writes the user's clamped settings here even when the
-    // option is off, and the shader reads them only when word 35 is set. The hook has no such
-    // settings, so it writes the same defaults src/fald.h gives FaldResources::StarCB — the words
-    // are inert either way, and a CB captured from the two paths then matches on a default profile.
-    f[52] = 0.8f; f[53] = 0.0f; f[54] = 1.0f; f[55] = 0.0f;
-    f[56] = 1.0f; f[57] = 40.0f; f[58] = 160.0f; f[59] = 0.0f;
-    f[60] = 0.15f; f[61] = 0.30f; u[62] = 2u; u[63] = 8u;
-    f[64] = 0.0f; f[65] = 100.0f;
+    // Starfield words 52-65: the clamped settings, written even while the feature is off (the shader
+    // reads them only when word 35 is set) — as the overlay does, so the two paths' CBs match.
+    const DwmHookFaldTuning& t = m->tuning;
+    f[52] = t.starEven; f[53] = t.starLift; f[54] = t.starTargetGain; f[55] = t.starCapNits;
+    f[56] = t.starStrength; f[57] = t.starAreaLo; f[58] = t.starAreaHi; f[59] = t.starPeakHi;
+    f[60] = t.starNbLo; f[61] = t.starNbHi; u[62] = t.starReach; u[63] = t.starEvenReach;
+    f[64] = t.starTargetSigma; f[65] = t.starKeepNits;
     // panel clock (temporal mode 3): unused here; the overlay's idle values are weights 1/2 and zero blends
     f[66] = 0.5f; f[67] = 0.5f;
     f[68] = 0.0f; f[69] = 0.0f; f[70] = 0.0f; f[71] = 0.0f;
     // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
     u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
-    // glow fill (word 75 = on; 76-79 inert while it is 0, written as the overlay's defaults)
-    u[75] = 0u;
-    f[76] = 1.0f; f[77] = 0.05f; u[78] = 2u; f[79] = FaldGlowReqCeil(p);
-    u[80] = 0u;
+    // glow fill (word 75 = on; words 76-79 read only when it is set / by the glow passes)
+    u[75] = m->glowOn ? 1u : 0u;
+    f[76] = t.glowStrength; f[77] = t.glowCapNits; u[78] = t.glowReach; f[79] = FaldGlowReqCeil(p);
+    u[80] = m->glowBand ? 1u : 0u;                                                  // the count-threshold band (k in t24)
     u[81] = 0u; u[82] = 0u; u[83] = 0u;
     g_ctx->Unmap(m->cb, 0);
 }
@@ -547,8 +763,13 @@ static void BindCommon(FaldMonitor* m, bool compute) {
         m->interSRV, m->curveSRV, m->kTrueSRV, m->kEstSRV, nullptr, nullptr, nullptr,
         m->flatTrueSRV, m->flatEstSRV, nullptr, nullptr, nullptr,
         m->boostLutSRV, nullptr, nullptr,   // t12: null without a boost LUT
-        nullptr, nullptr, nullptr, nullptr, nullptr,   // t15-t19: starfield only
-        nullptr, nullptr, nullptr, nullptr, nullptr    // t20-t24: glow fill only
+        m->starOn ? m->starPlanSRV : nullptr,          // t15: the starfield plan (Balance)
+        nullptr, nullptr,                              // t16/t17: star passes only (RunStar)
+        m->starOn ? m->starPlan2SRV : nullptr,         // t18: ln background, near, spk (Balance)
+        nullptr,                                       // t19: star pass S1 only (RunStar)
+        nullptr, nullptr, nullptr,                     // t20-t22: glow passes only (RunGlow)
+        m->glowOn ? m->glowEnvSRV : nullptr,           // t23: the glow deficit (GlowAdd)
+        m->glowBand ? m->glowKSRV : nullptr            // t24: the band's zone scale (GlowAdd)
     };
     if (compute) {
         g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
@@ -644,6 +865,96 @@ static void RunGain(FaldMonitor* m) {
     g_ctx->CopyResource(m->gainBTex, m->gainATex);
 }
 
+// Starfield balancing, mirror of src/fald.cpp RunStar: S0 star statistic of the SOURCE frame -> S1
+// tapered protection + zone weights -> S2 target + plan; every later pass samples plan (t15) and plan2
+// (t18). A pure function of the source frame in the intermediate, recomputed every run. The passes
+// bind only what they read (never BindCommon: that would bind plan / plan2 as SRVs while S1 / S2
+// write them).
+static void RunStar(FaldMonitor* m) {
+    const FaldPanelParams& p = m->params;
+    FillCB(m, 0);
+    ID3D11ShaderResourceView* in2[2] = { m->interSRV, m->curveSRV };
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
+    // S0: per zone stat = (peak, speck-zone flag, sparse, solid) + bg = (ln b, brightest pixel's index, lit sum, a_eff)
+    ID3D11UnorderedAccessView* out0[2] = { m->starStatUAV, m->starBgUAV };
+    g_ctx->CSSetShader(g_starStatCS, nullptr, 0);
+    g_ctx->CSSetShaderResources(0, 2, in2);
+    g_ctx->CSSetUnorderedAccessViews(0, 2, out0, nullptr);
+    g_ctx->Dispatch(p.cols, p.rows, 1);
+    UnbindCompute();
+    // S1: tapered protection field + flank test + zone weights
+    ID3D11UnorderedAccessView* out1[2] = { m->starWUAV, m->starPlan2UAV };
+    g_ctx->CSSetShader(g_starWeightCS, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetShaderResources(16, 1, &m->starStatSRV);
+    g_ctx->CSSetShaderResources(19, 1, &m->starBgSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 2, out1, nullptr);
+    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();
+    // S2: (w0_field, ln target, ln lift, ln peak)
+    ID3D11ShaderResourceView* in3[2] = { m->starStatSRV, m->starWSRV };
+    g_ctx->CSSetShader(g_starPlanCS, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetShaderResources(16, 2, in3);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->starPlanUAV, nullptr);
+    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    UnbindCompute();
+}
+
+// Glow fill, mirror of src/fald.cpp RunGlow, after EACH round's gain: G0 zone pedestal of this round's
+// B_true -> G1 box maximum -> G2 box minimum (the closing) -> G3 blur + deficit; G4 (band only) the
+// zone scale k. The statistic round 1 / the pixel pass then sample glowEnv (t23) and k (t24).
+static void RunGlow(FaldMonitor* m) {
+    const FaldPanelParams& p = m->params;
+    FillCB(m, 0);
+    const UINT gz = (p.cols + 15) / 16, gzy = (p.rows + 15) / 16;
+    const UINT ge = (p.cols + 2 * HOOK_GLOW_REACH_MAX + 15) / 16, gey = (p.rows + 2 * HOOK_GLOW_REACH_MAX + 15) / 16;
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    // G0
+    g_ctx->CSSetShader(g_glowZoneCS, nullptr, 0);
+    g_ctx->CSSetShaderResources(5, 1, &m->bTrueSRV);
+    g_ctx->CSSetShaderResources(7, 1, &m->flatTrueSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->glowVUAV, nullptr);
+    g_ctx->Dispatch(gz, gzy, 1);
+    UnbindCompute();
+    // G1
+    g_ctx->CSSetShader(g_glowDilateCS, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetShaderResources(20, 1, &m->glowVSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->glowDilUAV, nullptr);
+    g_ctx->Dispatch(ge, gey, 1);
+    UnbindCompute();
+    // G2
+    g_ctx->CSSetShader(g_glowErodeCS, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetShaderResources(21, 1, &m->glowDilSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->glowCUAV, nullptr);
+    g_ctx->Dispatch(gz, gzy, 1);
+    UnbindCompute();
+    // G3
+    g_ctx->CSSetShader(g_glowEnvCS, nullptr, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetShaderResources(20, 1, &m->glowVSRV);
+    g_ctx->CSSetShaderResources(22, 1, &m->glowCSRV);
+    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->glowEnvUAV, nullptr);
+    g_ctx->Dispatch(gz, gzy, 1);
+    UnbindCompute();
+    // G4 (band only, every round): k is unbound as an SRV while it is written
+    if (m->glowBand) {
+        g_ctx->CSSetShader(g_glowBandCS, nullptr, 0);
+        BindCommon(m, true);
+        ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
+        g_ctx->CSSetShaderResources(5, 2, fields);
+        g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);
+        ID3D11ShaderResourceView* none = nullptr;
+        g_ctx->CSSetShaderResources(24, 1, &none);
+        g_ctx->CSSetUnorderedAccessViews(0, 1, &m->glowKUAV, nullptr);
+        g_ctx->Dispatch(p.cols, p.rows, 1);
+        UnbindCompute();
+    }
+}
+
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
 // Must run after the fine textures exist; the flat textures are bound as SRVs t7/t8 from then on
 // (they are null during this call, which the conv pass does not read).
@@ -736,6 +1047,18 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
         DumpTexture(m->boostTex[0], dir + L"fald_boost_r0.f32", 2, 1, 4);
         DumpTexture(m->boostTex[1], dir + L"fald_boost_r1.f32", 2, 1, 4);
     }
+    if (m->starOn) {   // same files as the overlay's dump (src/fald.cpp DumpFields)
+        DumpTexture(m->starStatTex, dir + L"fald_star_stat.f32", p.cols, p.rows, 16);
+        DumpTexture(m->starWTex, dir + L"fald_star_w.f32", p.cols, p.rows, 16);
+        DumpTexture(m->starPlanTex, dir + L"fald_star_plan.f32", p.cols, p.rows, 16);
+        DumpTexture(m->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16);
+        DumpTexture(m->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);
+    }
+    if (m->glowOn) {
+        DumpTexture(m->glowVTex, dir + L"fald_glow_vz.f32", p.cols, p.rows, 4);
+        DumpTexture(m->glowEnvTex, dir + L"fald_glow_env.f32", p.cols, p.rows, 16);
+        if (m->glowBand) DumpTexture(m->glowKTex, dir + L"fald_glow_k.f32", p.cols, p.rows, 4);
+    }
 }
 
 static void DumpFrame(ID3D11ShaderResourceView* srv, const std::wstring& file, UINT w, UINT h) {
@@ -788,6 +1111,56 @@ static void FaldUnbindAll() {
     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
 }
 
+// ---------------------------------------------------------------------------------------------
+// GPU timing — a ring of 4 query sets, read back with DONOTFLUSH only once the GPU is done with them,
+// so measuring never waits inside DWM's present path. A slot still in flight when its turn comes
+// round simply skips timing that frame.
+// ---------------------------------------------------------------------------------------------
+static void GpuTimingCollect(FaldMonitor*) {
+    for (int i = 0; i < 4; i++) {
+        if (!g_tsInFlight[i]) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+        if (g_ctx->GetData(g_tsDisjoint[i], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+        UINT64 s[3] = {};
+        bool ok = true;
+        for (int k = 0; k < 3 && ok; k++)
+            ok = (g_ctx->GetData(g_tsStamp[i][k], &s[k], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK);
+        if (!ok) continue;
+        g_tsInFlight[i] = false;
+        FaldMonitor* o = g_tsOwner[i];
+        g_tsOwner[i] = nullptr;
+        if (!o || dj.Disjoint || dj.Frequency == 0 || s[2] < s[0] || s[1] < s[0]) continue;
+        const double total = (double)(s[2] - s[0]) * 1e6 / (double)dj.Frequency;
+        const double star = (double)(s[1] - s[0]) * 1e6 / (double)dj.Frequency;
+        o->gpuSumUs += total;
+        o->gpuStarSumUs += star;
+        if (total > o->gpuMaxUs) o->gpuMaxUs = total;
+        o->gpuSamples++;
+    }
+}
+
+// Returns the slot started for this run, or -1 (no queries, or the slot is still in flight).
+static int GpuTimingBegin() {
+    const int i = (int)(g_tsHead % 4u);
+    if (!g_tsDisjoint[i] || !g_tsStamp[i][0] || !g_tsStamp[i][1] || !g_tsStamp[i][2] || g_tsInFlight[i]) return -1;
+    g_tsHead++;
+    g_ctx->Begin(g_tsDisjoint[i]);
+    g_ctx->End(g_tsStamp[i][0]);
+    return i;
+}
+
+static void GpuTimingStamp(int slot, int k) {
+    if (slot >= 0) g_ctx->End(g_tsStamp[slot][k]);
+}
+
+static void GpuTimingEnd(int slot, FaldMonitor* m) {
+    if (slot < 0) return;
+    g_ctx->End(g_tsStamp[slot][2]);
+    g_ctx->End(g_tsDisjoint[slot]);
+    g_tsInFlight[slot] = true;
+    g_tsOwner[slot] = m;
+}
+
 bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     if (!m || !m->valid || !m->interSRV || !dstRTV) return false;
 
@@ -798,19 +1171,32 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     const std::wstring dumpDir = g_dumpDir;
     g_dumpDir.clear();                       // one frame only, whatever happens below
 
+    ResolveFeatures(m);                      // starfield / glow fill on or off for THIS frame
+
+    // GPU timing: collect finished slots (no flush, no wait), then start this run's slot if it is free.
+    GpuTimingCollect(m);
+    const int ts = GpuTimingBegin();
+
     // No render target may be bound while the passes write their UAVs.
     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
+    // Starfield first: every pass below reads Balance(source) from its plan.
+    if (m->starOn) RunStar(m);
+    GpuTimingStamp(ts, 1);
+
     // Two inverse rounds. Round 0's output is what round 1's statistic and boost count see, so the
-    // panel's own response is accounted for in the frame it actually receives.
+    // panel's own response is accounted for in the frame it actually receives. Glow fill runs after
+    // each round's gain: round 0's fill is part of what round 1 sees, round 1's is in the output.
     RunStat(m, 0);
     RunBoost(m, 0);
     RunConv(m, m->boostSRV[0]);
     RunGain(m);
+    if (m->glowOn) RunGlow(m);
     RunStat(m, 1);
     RunBoost(m, 1);
     RunConv(m, m->boostSRV[1]);
     RunGain(m);
+    if (m->glowOn) RunGlow(m);
     m->framesRun++;
 
     if (!dumpDir.empty()) {
@@ -837,6 +1223,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     g_ctx->PSSetShaderResources(10, 1, &m->driveSRV);
     g_ctx->PSSetShaderResources(13, 1, &m->activeSRV[1]);   // debug view 8 (null without a boost LUT)
     g_ctx->Draw(3, 0);
+    GpuTimingEnd(ts, m);
 
     if (!dumpDir.empty()) {
         DumpOutput(dstRTV, dumpDir + L"fald_out.rgba16f", m->width, m->height);
@@ -848,10 +1235,21 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV) {
     QueryPerformanceCounter(&t1);
     if (freq.QuadPart > 0)
         m->lastRunUs = (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)freq.QuadPart;
-    // The CPU-side cost of the whole layer, logged rarely: the first risk on the phase-one list is
-    // that this overruns DWM's present budget, and a number beats a guess. ~every 10 s at 60 Hz.
-    if ((m->framesRun % 600ull) == 1ull)
-        LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us/frame in the present path",
-             m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs);
+    // The cost of the whole layer, logged rarely: overrunning DWM's present budget stutters the whole
+    // desktop, and a number beats a guess. ~every 10 s at 60 Hz. CPU = submission time in the present
+    // path; GPU = the timestamp queries' average / max over the interval, and the starfield share.
+    if ((m->framesRun % 600ull) == 1ull) {
+        if (m->gpuSamples > 0)
+            LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us | GPU avg %.0f us, max %.0f us, starfield %.0f us (%u samples) [star %s, glow %s]",
+                 m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs,
+                 m->gpuSumUs / m->gpuSamples, m->gpuMaxUs, m->gpuStarSumUs / m->gpuSamples, m->gpuSamples,
+                 m->starOn ? "on" : "off", m->glowOn ? (m->glowBand ? "on+band" : "on") : "off");
+        else
+            LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us/frame in the present path (no GPU timing yet) [star %s, glow %s]",
+                 m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs,
+                 m->starOn ? "on" : "off", m->glowOn ? "on" : "off");
+        m->gpuSumUs = m->gpuStarSumUs = m->gpuMaxUs = 0.0;
+        m->gpuSamples = 0;
+    }
     return true;
 }

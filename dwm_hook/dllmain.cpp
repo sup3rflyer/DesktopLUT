@@ -407,6 +407,7 @@ static std::atomic<bool> g_hookReverted{false};  // Set when host dies, prevents
 // --- Shared memory IPC: live parameter updates from host ---
 static HANDLE g_sharedMemHandle = NULL;
 static const DwmHookSharedConfig* g_sharedConfig = NULL;
+static bool g_sharedHasTail = false;   // the view covers DwmHookSharedConfigEx (host is new enough)
 static uint32_t g_localConfigVersion = 0;
 
 // Local tonemap params per monitor (updated from shared memory)
@@ -529,12 +530,19 @@ static void UpdateLocalTonemapFromShared() {
 
 	std::atomic_thread_fence(std::memory_order_acquire);
 
-	DwmHookSharedConfig local;
-	memcpy(&local, (const void*)g_sharedConfig, sizeof(local));
+	// Head and tail are copied inside the same seqlock window (the host writes both in one pass).
+	DwmHookSharedConfigEx localEx;          // 1.5 KB on the stack; not static (callers may race)
+	memset(&localEx, 0, sizeof(localEx));
+	memcpy(&localEx, (const void*)g_sharedConfig,
+	       g_sharedHasTail ? sizeof(DwmHookSharedConfigEx) : sizeof(DwmHookSharedConfig));
+	DwmHookSharedConfig& local = localEx.head;
 
 	std::atomic_thread_fence(std::memory_order_acquire);
 	uint32_t v2 = g_sharedConfig->version;
 	if (v1 != v2) return;
+	const bool tailValid = g_sharedHasTail && localEx.tail.magic == DWM_HOOK_TAIL_MAGIC &&
+	                       localEx.tail.layoutVersion == DWM_HOOK_TAIL_LAYOUT_VERSION &&
+	                       localEx.tail.tuningBytes == sizeof(DwmHookFaldTuning);
 
 	g_localConfigVersion = local.version;
 
@@ -676,6 +684,8 @@ static void UpdateLocalTonemapFromShared() {
 			fp.left = local.monitors[i].left;
 			fp.top = local.monitors[i].top;
 			fp.flags = local.faldFlags[i];
+			fp.hasTuning = tailValid;
+			if (tailValid) fp.tuning = localEx.tail.fald[i];
 			g_numLocalFald++;
 		}
 	}
@@ -1105,10 +1115,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			{
 				g_sharedMemHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, DWM_HOOK_CONFIG_NAME);
 				if (g_sharedMemHandle) {
+					// Head + FALD tuning tail; an older host's mapping is the 464-byte head only, and
+					// then starfield / glow fill run on their defaults.
 					g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
-						g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
+						g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfigEx));
+					g_sharedHasTail = (g_sharedConfig != NULL);
+					if (!g_sharedConfig)
+						g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
+							g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfig));
 					if (g_sharedConfig) {
-						log_to_file("Shared memory opened OK");
+						log_to_file(g_sharedHasTail ? "Shared memory opened OK (with FALD tuning tail)"
+						                            : "Shared memory opened OK (head only: FALD tuning at defaults)");
 						// Initial read of tonemap params
 						UpdateLocalTonemapFromShared();
 					} else {

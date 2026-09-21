@@ -1156,8 +1156,9 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
         FaldGlowSettings gs = fs.glow;
         FaldGlowClamp(gs);
         r->glow.strength = gs.strength; r->glow.capNits = gs.capNits; r->glow.reach = gs.reach;
-        // HDR (PQ panel files) only — FaldGlowSupported: a gamma-transfer file never runs the fill, whatever the switch says
-        if (gs.enabled && FaldGlowSupported(r->params)) r->glowOn = EnsureGlow(r);
+        // HDR (PQ panel files) only — FaldGlowSupported: a gamma-transfer file never runs the fill, whatever the switch says.
+        // Part of the starfield feature: it never runs without starfield balancing (same rule as the DWM hook path).
+        if (gs.enabled && r->starOn && FaldGlowSupported(r->params)) r->glowOn = EnsureGlow(r);
         else if (r->glowVTex || r->glowDilTex || r->glowCTex || r->glowEnvTex || r->glowKTex || r->glowOn) ReleaseGlow(r);
         r->glowBand = r->glowOn && FaldGlowBandActive(r->params);
     }

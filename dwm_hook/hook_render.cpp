@@ -998,7 +998,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			faldMon = FaldAcquire(monLeft, monTop, colorMode == 1,
 				newBackBufferDesc.Width, newBackBufferDesc.Height, newBackBufferDesc.Format);
 			if (faldMon)
-				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags));
+				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags),
+					DwmHookFaldStar(fp->flags) != 0, DwmHookFaldGlow(fp->flags) != 0,
+					fp->hasTuning ? &fp->tuning : NULL);
 			// Feed this present's dirty rects into the layer's clean source. Until a full-frame
 			// composition has primed it, the layer stays off and this present takes the ordinary
 			// dirty-rect path below (the host forces a full recompose when the layer is switched on).
