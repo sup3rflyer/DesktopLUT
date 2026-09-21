@@ -2647,6 +2647,23 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             if (!IsDwmHookActive()) {
+                // Flap detector: a re-injection that "succeeds" (the hook's named
+                // event appears) but is then lost again next tick will loop forever,
+                // flashing the screen black on every cycle. Count total cycles — not
+                // just consecutive failures — and give up once the hook proves it
+                // won't stay attached on this system (common on some Windows 10
+                // builds where the dwmcore offsets don't match). See issue #3.
+                if (g_dwmHookReinjectCount >= DWM_HOOK_WATCHDOG_MAX_REINJECTS) {
+                    KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                    SetStatus(L"DWM Hook unstable — disabled (use overlay mode)");
+                    std::cout << "[DWM Hook Watchdog] Hook keeps dropping after "
+                              << g_dwmHookReinjectCount << " re-injections — giving up to stop "
+                                 "the re-injection flash loop. DWM Hook Mode is unreliable on "
+                                 "this system (common on Windows 10); turn it off and use overlay "
+                                 "mode in Settings." << std::endl;
+                    return 0;
+                }
+
                 std::cout << "[DWM Hook Watchdog] Hook lost (DWM restart?), attempting re-injection..." << std::endl;
 
                 // Re-derive monitor LUT config from current settings + monitors
@@ -2670,7 +2687,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!dwmMonitors.empty()) {
                     std::wstring err = InjectDwmHook(dwmMonitors);
                     if (err.empty()) {
-                        std::cout << "[DWM Hook Watchdog] Re-injection successful" << std::endl;
+                        g_dwmHookReinjectCount++;
+                        std::cout << "[DWM Hook Watchdog] Re-injection successful (cycle "
+                                  << g_dwmHookReinjectCount << "/" << DWM_HOOK_WATCHDOG_MAX_REINJECTS
+                                  << ")" << std::endl;
                         g_dwmHookWatchdogRetries = 0;
                         SetStatus(L"Active (DWM Hook)");
                     } else {
@@ -2694,6 +2714,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // the 5s watchdog cadence left the hook's debounce unconverged for
                 // up to 15s of visibly wrong rendering after an HDR flip.)
                 g_dwmHookWatchdogRetries = 0;
+                // Once the hook has stayed attached for a sustained stretch, treat it as
+                // stable and clear the flap counter, so rare legitimate DWM restarts over a
+                // long session don't slowly accumulate toward the give-up cap. A true flap
+                // re-injects on every tick and never builds a healthy streak this long.
+                static int s_dwmHookHealthyStreak = 0;
+                if (g_dwmHookReinjectCount > 0 && ++s_dwmHookHealthyStreak >= 6) {
+                    g_dwmHookReinjectCount = 0;
+                    s_dwmHookHealthyStreak = 0;
+                } else if (g_dwmHookReinjectCount == 0) {
+                    s_dwmHookHealthyStreak = 0;
+                }
             }
             return 0;
         }

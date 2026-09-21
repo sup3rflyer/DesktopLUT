@@ -261,6 +261,9 @@ const int DEVICE_CHANGE_TIMER_ID = 104;    // Debounce WM_DEVICECHANGE
 const int DWM_HOOK_WATCHDOG_TIMER_ID = 105; // Periodic health check for DWM hook injection
 const int DWM_HOOK_WATCHDOG_INTERVAL_MS = 5000; // Check every 5 seconds
 const int DWM_HOOK_WATCHDOG_MAX_RETRIES = 3;    // Max consecutive re-injection failures before giving up
+const int DWM_HOOK_WATCHDOG_MAX_REINJECTS = 5;  // Max total re-injection cycles before declaring the hook unstable
+                                                // (guards against a succeed-then-lose flap loop that flashes the
+                                                // screen black — seen on some Windows 10 builds, see issue #3)
 const int DWM_HOOK_RESEND_TIMER_ID = 110;       // Drives shared-config resends after a modeset/HDR flip
 const int DWM_HOOK_RESEND_INTERVAL_MS = 2000;   // Resend spacing — hook needs 3 consecutive updates to
                                                 // accept an HDR flip; each resend re-enumerates DXGI fresh
