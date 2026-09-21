@@ -1,5 +1,5 @@
 // DesktopLUT DWM Hook - hook_shader.h
-// Shader string literals for the DWM hook: main vertex/pixel shader and peak detection compute shader.
+// Shader string literals for the DWM hook: main vertex/pixel shader (peak detection: shared/peak_detect.h).
 // Extracted from dllmain.cpp for maintainability. These are compiled at runtime via D3DCompile.
 
 #pragma once
@@ -361,79 +361,4 @@ float4 PS(VS_OUTPUT input) : SV_TARGET {
 }
 )";
 
-// Peak detection compute shader (80x45 grid, temporal smoothing)
-static const char g_peakDetectShader[] = R"(
-Texture2D<float4> inputTexture : register(t0);
-RWTexture2D<float> peakOutput : register(u0);
-
-cbuffer PeakParams : register(b0) {
-	uint frameWidth;
-	uint frameHeight;
-	float riseRate;
-	float fallRate;
-	float maxRisePerFrame;
-	float maxFallPerFrame;
-	float2 _padding;
-};
-
-groupshared float sharedMax[256];
-
-[numthreads(256, 1, 1)]
-void main(uint3 GTid : SV_GroupThreadID) {
-	float localMax = 0.0;
-	uint gridX = 80, gridY = 45;
-	uint totalSamples = gridX * gridY;
-	uint samplesPerThread = (totalSamples + 255) / 256;
-
-	for (uint i = 0; i < samplesPerThread; i++) {
-		uint sampleIdx = GTid.x * samplesPerThread + i;
-		if (sampleIdx >= totalSamples) break;
-		uint gx = sampleIdx % gridX;
-		uint gy = sampleIdx / gridX;
-		uint px = (gx * frameWidth) / gridX;
-		uint py = (gy * frameHeight) / gridY;
-		if (px < frameWidth && py < frameHeight) {
-			float4 pixel = inputTexture.Load(int3(px, py, 0));
-			float Y = dot(pixel.rgb, float3(0.2126, 0.7152, 0.0722));
-			float nits = Y * 80.0;
-			localMax = max(localMax, nits);
-		}
-	}
-
-	sharedMax[GTid.x] = localMax;
-	GroupMemoryBarrierWithGroupSync();
-
-	for (uint stride = 128; stride > 0; stride >>= 1) {
-		if (GTid.x < stride)
-			sharedMax[GTid.x] = max(sharedMax[GTid.x], sharedMax[GTid.x + stride]);
-		GroupMemoryBarrierWithGroupSync();
-	}
-
-	if (GTid.x == 0) {
-		float framePeak = sharedMax[0];
-		float prevPQ = peakOutput[uint2(0, 0)];
-		float prevPeak;
-		if (prevPQ <= 0.0) {
-			prevPeak = framePeak;
-		} else {
-			float Np = pow(prevPQ, 1.0 / 78.84375);
-			float L = pow(max(Np - 0.8359375, 0.0) / max(18.8515625 - 18.6875 * Np, 1e-10), 1.0 / 0.1593017578125);
-			prevPeak = L * 10000.0;
-		}
-		float target;
-		float maxDelta;
-		if (framePeak > prevPeak) {
-			target = lerp(prevPeak, framePeak, riseRate);
-			maxDelta = maxRisePerFrame;
-		} else {
-			target = lerp(prevPeak, framePeak, fallRate);
-			maxDelta = maxFallPerFrame;
-		}
-		float smoothedPeak = clamp(target, prevPeak - maxDelta, prevPeak + maxDelta);
-		smoothedPeak = clamp(smoothedPeak, 0.0, 10000.0);
-		float Yp = max(smoothedPeak / 10000.0, 1e-10);
-		float Ym = pow(Yp, 0.1593017578125);
-		peakOutput[uint2(0, 0)] = pow((0.8359375 + 18.8515625 * Ym) / (1.0 + 18.6875 * Ym), 78.84375);
-	}
-}
-)";
+// Peak detection compute shaders: shared/peak_detect.h (one copy for overlay + DWM hook)

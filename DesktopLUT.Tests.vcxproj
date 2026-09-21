@@ -120,6 +120,7 @@
     <ClCompile Include="tests\test_monitor_identity.cpp" />
     <ClCompile Include="tests\test_settings.cpp" />
     <ClCompile Include="tests\test_fald.cpp" />
+    <ClCompile Include="tests\test_peak_detect.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

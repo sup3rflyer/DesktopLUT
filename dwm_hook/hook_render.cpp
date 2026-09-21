@@ -5,6 +5,7 @@
 #include "hook_lut.h"
 #include "noise.h"
 #include "dwm_hook_config.h"
+#include "peak_detect.h"
 
 #include <string>
 #include <sstream>
@@ -53,8 +54,11 @@ ID3D11Texture2D* pqEotfTexture = NULL;
 ID3D11ShaderResourceView* pqEotfSRV = NULL;
 ID3D11SamplerState* linearSamplerState = NULL;
 
-// Peak detection compute shader resources
-ID3D11ComputeShader* peakDetectCS = NULL;
+// Peak detection compute shader resources (shaders + dispatch shared with the overlay: shared/peak_detect.h)
+ID3D11ComputeShader* peakDetectCS = NULL;   // pass 1: dense reduction (every 4th pixel) -> raw max
+ID3D11ComputeShader* peakSmoothCS = NULL;   // pass 2: temporal smoothing -> PQ peak
+ID3D11Texture2D* peakRawTexture = NULL;     // 1x1 R32_UINT raw max (InterlockedMax target, reset by pass 2)
+ID3D11UnorderedAccessView* peakRawUAV = NULL;
 ID3D11Texture2D* peakTexture = NULL;
 ID3D11UnorderedAccessView* peakUAV = NULL;
 ID3D11ShaderResourceView* peakSRV = NULL;
@@ -660,6 +664,7 @@ void InitializeStuff(ID3D11Device* inputDevice)
 			EXECUTE_WITH_LOG(device->CreateTexture2D(&peakDesc, &peakInit, &peakTexture))
 			EXECUTE_WITH_LOG(device->CreateUnorderedAccessView((ID3D11Resource*)peakTexture, NULL, &peakUAV))
 			EXECUTE_WITH_LOG(device->CreateShaderResourceView((ID3D11Resource*)peakTexture, NULL, &peakSRV))
+			EXECUTE_WITH_LOG(CreatePeakRawTexture(device, deviceContext, &peakRawTexture, &peakRawUAV))
 
 			D3D11_BUFFER_DESC peakCbDesc = {};
 			peakCbDesc.ByteWidth = 32;  // 8 floats
@@ -670,24 +675,31 @@ void InitializeStuff(ID3D11Device* inputDevice)
 
 			LOG_ONLY_ONCE("Peak detection resources created")
 		}
-		// Compile peak detection compute shader
+		// Compile peak detection compute shaders — both or neither: the pixel shader's dynamic-peak
+		// input is only valid when the smoothing pass runs after the reduction.
 		{
-			ID3DBlob* csBlob = NULL;
-			ID3DBlob* csError = NULL;
-			HRESULT hr = D3DCompile(g_peakDetectShader, sizeof(g_peakDetectShader), NULL, NULL, NULL,
-				"main", "cs_5_0", 0, 0, &csBlob, &csError);
-			if (SUCCEEDED(hr) && csBlob) {
-				EXECUTE_WITH_LOG(device->CreateComputeShader(csBlob->GetBufferPointer(),
-					csBlob->GetBufferSize(), NULL, &peakDetectCS))
-				csBlob->Release();
-				LOG_ONLY_ONCE("Peak detection compute shader compiled OK")
-			} else {
-				if (csError) {
-					std::stringstream ss;
-					ss << "Peak detection CS compile error: " << (char*)csError->GetBufferPointer();
-					log_to_file(ss.str().c_str());
-					csError->Release();
+			auto compileCS = [](const char* src, const char* name, ID3D11ComputeShader** out) {
+				ID3DBlob* csBlob = NULL;
+				ID3DBlob* csError = NULL;
+				HRESULT hr = D3DCompile(src, strlen(src), name, NULL, NULL, "main", "cs_5_0", 0, 0, &csBlob, &csError);
+				if (SUCCEEDED(hr) && csBlob) {
+					hr = device->CreateComputeShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), NULL, out);
+					csBlob->Release();
 				}
+				if (FAILED(hr) && csError) {
+					std::stringstream ss;
+					ss << name << " compile error: " << (char*)csError->GetBufferPointer();
+					log_to_file(ss.str().c_str());
+				}
+				if (csError) csError->Release();
+				return SUCCEEDED(hr);
+			};
+			if (compileCS(g_peakReduceCSSource, "PeakReduceCS", &peakDetectCS) &&
+				compileCS(g_peakSmoothCSSource, "PeakSmoothCS", &peakSmoothCS)) {
+				LOG_ONLY_ONCE("Peak detection compute shaders compiled OK")
+			} else {
+				RELEASE_IF_NOT_NULL(peakDetectCS)
+				RELEASE_IF_NOT_NULL(peakSmoothCS)
 				log_to_file("WARNING: Peak detection CS compilation failed — dynamic tonemapping disabled");
 			}
 		}
@@ -733,6 +745,9 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(pqEotfTexture)
 	RELEASE_IF_NOT_NULL(pqEotfSRV)
 	RELEASE_IF_NOT_NULL(peakDetectCS)
+	RELEASE_IF_NOT_NULL(peakSmoothCS)
+	RELEASE_IF_NOT_NULL(peakRawUAV)
+	RELEASE_IF_NOT_NULL(peakRawTexture)
 	RELEASE_IF_NOT_NULL(peakTexture)
 	RELEASE_IF_NOT_NULL(peakUAV)
 	RELEASE_IF_NOT_NULL(peakSRV)
@@ -931,33 +946,10 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		if (linearSamplerState) deviceContext->PSSetSamplers(2, 1, &linearSamplerState);
 
 		// Peak detection compute pass (before pixel shader)
-		if (tmEnabled && tp->dynamicPeak && peakDetectCS && peakUAV && peakCB) {
-			// Update peak CB
-			struct { UINT fw, fh; float rise, fall, maxRise, maxFall; float pad[2]; } peakParams;
-			peakParams.fw = newBackBufferDesc.Width;
-			peakParams.fh = newBackBufferDesc.Height;
-			peakParams.rise = 0.3f;   // Rise rate
-			peakParams.fall = 0.05f;  // Fall rate
-			peakParams.maxRise = 100.0f;
-			peakParams.maxFall = 50.0f;
-			peakParams.pad[0] = peakParams.pad[1] = 0.0f;
-
-			D3D11_MAPPED_SUBRESOURCE peakRes;
-			if (SUCCEEDED(deviceContext->Map((ID3D11Resource*)peakCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &peakRes))) {
-				memcpy(peakRes.pData, &peakParams, sizeof(peakParams));
-				deviceContext->Unmap((ID3D11Resource*)peakCB, 0);
-			}
-
-			deviceContext->CSSetShader(peakDetectCS, NULL, 0);
-			deviceContext->CSSetConstantBuffers(0, 1, &peakCB);
-			deviceContext->CSSetShaderResources(0, 1, &textureView[index]);  // Input: captured backbuffer
-			deviceContext->CSSetUnorderedAccessViews(0, 1, &peakUAV, NULL);
-			deviceContext->Dispatch(1, 1, 1);
-
-			// Unbind CS UAV and bind peak SRV for pixel shader
-			ID3D11UnorderedAccessView* nullUAV = NULL;
-			deviceContext->CSSetUnorderedAccessViews(0, 1, &nullUAV, NULL);
-			deviceContext->CSSetShader(NULL, NULL, 0);
+		if (tmEnabled && tp->dynamicPeak && peakDetectCS && peakSmoothCS && peakUAV && peakRawUAV && peakCB) {
+			// Input: captured backbuffer. Leaves no CS state bound on DWM's context.
+			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, textureView[index],
+				peakUAV, peakRawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
 		}
 		// Bind peak texture for pixel shader read (even if not dynamic — shader checks tonemapDynamic)
 		if (peakSRV) deviceContext->PSSetShaderResources(5, 1, &peakSRV);
