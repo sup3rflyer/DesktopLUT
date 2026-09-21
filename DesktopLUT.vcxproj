@@ -110,6 +110,7 @@
     <ClCompile Include="src\dwm_inject.cpp" />
     <ClCompile Include="src\desktoplut_ipc_server.cpp" />
     <ClCompile Include="shared\fald_panel.cpp" />
+    <ClCompile Include="shared\fald_temporal.cpp" />
     <ClCompile Include="src\fald.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -117,6 +118,7 @@
     <ClInclude Include="src\globals.h" />
     <ClInclude Include="src\shader.h" />
     <ClInclude Include="shared\fald_panel.h" />
+    <ClInclude Include="shared\fald_temporal.h" />
     <ClInclude Include="src\fald.h" />
     <ClInclude Include="shared\fald_shader.h" />
     <ClInclude Include="src\lut.h" />

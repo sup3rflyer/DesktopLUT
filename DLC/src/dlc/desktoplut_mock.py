@@ -84,6 +84,10 @@ _FALD_GLOW_DEFAULTS: dict[str, Any] = {"enabled": False, "strength": 1.0, "reach
 # HDR only (C++ FALD_GLOW_SDR_NOTE, word for word): the pipe refuses `enabled: true` for an SDR pair and state.get says why
 _FALD_GLOW_SDR_NOTE = ("glow fill is HDR only: the levels behind its request ceiling (drive floor, LIT level, count threshold) "
                        "are HDR measurements")
+# Part of the starfield feature (C++ FALD_GLOW_NEEDS_STAR_NOTE, word for word): the switch is stored, the fill runs only
+# while starfield balancing is on — state.get's fald_glow_active / runtime.fald_glowfill's `active` say whether it runs
+_FALD_GLOW_NEEDS_STAR_NOTE = ("glow fill is part of the starfield feature: the switch is stored, but the fill runs only while "
+                              "starfield balancing is on")
 
 
 def _fald_glow(entry: dict[str, Any] | None) -> dict[str, Any]:
@@ -115,8 +119,11 @@ def _fald_state_keys(entry: dict[str, Any] | None, is_hdr: bool = True) -> dict[
     glow = _fald_glow(entry)
     out["fald_glowfill"] = glow["enabled"]
     out.update({f"fald_glow_{k}": v for k, v in glow.items() if k != "enabled"})
+    out["fald_glow_active"] = bool(glow["enabled"] and star["enabled"] and is_hdr)
     if not is_hdr:
         out["fald_glow_note"] = _FALD_GLOW_SDR_NOTE
+    elif glow["enabled"] and not star["enabled"]:
+        out["fald_glow_note"] = _FALD_GLOW_NEEDS_STAR_NOTE
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -825,7 +832,12 @@ class MockDesktopLutServer:
             if "enabled" in params:
                 gl["enabled"] = en
             fs["glow"] = gl
-            return self.ok({"monitor_mode": key, **_fald_glow(fs)})
+            out = {"monitor_mode": key, **_fald_glow(fs)}
+            star_on = _fald_star(fs)["enabled"]
+            out["active"] = bool(out["enabled"] and star_on and is_hdr)
+            if out["enabled"] and not star_on:
+                out["note"] = _FALD_GLOW_NEEDS_STAR_NOTE
+            return self.ok(out)
         if method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

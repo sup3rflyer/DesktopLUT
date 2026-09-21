@@ -82,7 +82,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), fald_glowfill (bool) + "
                           "fald_glow_strength, fald_glow_reach, fald_glow_cap_nits (runtime.fald_glowfill; absent on builds "
-                          "before the S2 glow fill, 2026-09-20; SDR pairs add fald_glow_note = why the fill is HDR only), and "
+                          "before the S2 glow fill, 2026-09-20; SDR pairs add fald_glow_note = why the fill is HDR only), "
+                          "fald_glow_active (bool: the fill actually runs = switch on AND starfield on AND HDR; glow fill is part "
+                          "of the starfield feature since 2026-09-21 — an HDR pair switched on without starfield carries "
+                          "fald_glow_note saying so; absent on earlier builds), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
@@ -484,8 +487,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "that carries the fill). With a mean-rule panel file the count-threshold BAND keeps every filled zone clear of "
             "the firmware's threshold T: a zone whose predicted statistic would land in [0.8 T, 1.25 T] has its own pixels' "
             "fill scaled down to 0.8 T. HDR ONLY: `enabled: true` is refused for mode SDR (the ceiling's levels are HDR "
-            "measurements); the numbers can be set in either mode. Partial updates (any subset; at least one), persisted "
-            "per mode (= the GUI 'Glow fill' row). Measuring phases must run with it OFF (fald_profile forces it off and "
+            "measurements); the numbers can be set in either mode. PART OF THE STARFIELD FEATURE (2026-09-21): the fill runs "
+            "only while starfield balancing (runtime.fald_starfield) is on — `enabled` is stored either way, the result's "
+            "`active` says whether it runs, and `note` says why not when enabled without starfield. Runs on the overlay "
+            "and the DWM hook path alike. Partial updates (any subset; at least one), persisted "
+            "per mode (= the GUI '+ glow fill' row under Starfield). Measuring phases must run with it OFF (fald_profile forces it off and "
             "restores it).",
             {
                 "monitor": _monitor_param(),
@@ -495,7 +501,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "reach": ApiParamSpec("number", required=False, description="integer 1..4 zones: holes / valleys up to 2 x reach zones wide are filled (default 2)"),
                 "cap_nits": ApiParamSpec("number", required=False, description="0.005..0.5 as-if-white nits: the fill's ceiling (default 0.05)"),
             },
-            {"monitor_mode": "string", "enabled": "boolean", "strength": "number", "reach": "number", "cap_nits": "number"},
+            {"monitor_mode": "string", "enabled": "boolean", "strength": "number", "reach": "number", "cap_nits": "number",
+             "active": "boolean"},
             mutates_state=True,
             gui_thread_required=True,
         ),

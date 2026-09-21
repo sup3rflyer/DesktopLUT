@@ -318,7 +318,9 @@ class OverlayTracker:
             self.glowfill_note = "build without runtime.fald_glowfill (pre-S2): no glow fill"
             return
         saved = {"enabled": bool(layers.get("fald_glowfill", False))}
-        saved.update({k[len("fald_glow_"):]: layers[k] for k in sorted(layers) if k.startswith("fald_glow_")})
+        # the SETTINGS only: fald_glow_active / fald_glow_note are derived reports (2026-09-21), not something to restore
+        saved.update({k[len("fald_glow_"):]: layers[k] for k in sorted(layers)
+                      if k.startswith("fald_glow_") and k not in ("fald_glow_active", "fald_glow_note")})
         self.glowfill_saved = saved
         if saved["enabled"]:
             try:

@@ -706,7 +706,10 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_glow_strength", JNum((double)fs.glow.strength));
                 l.set("fald_glow_reach", JNum((double)fs.glow.reach));
                 l.set("fald_glow_cap_nits", JNum((double)fs.glow.capNits));
+                // glow fill is part of the starfield feature: the stored switch runs only while starfield is on (HDR only)
+                l.set("fald_glow_active", JBool(fs.glow.enabled && fs.star.enabled && isHDR));
                 if (!isHDR) l.set("fald_glow_note", JStr(FALD_GLOW_SDR_NOTE));   // why the SDR pair's switch cannot be set
+                else if (fs.glow.enabled && !fs.star.enabled) l.set("fald_glow_note", JStr(FALD_GLOW_NEEDS_STAR_NOTE));
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)
                 uint32_t transfer = 0;
@@ -1592,6 +1595,7 @@ void DoFaldGlowFill(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!en && !vs && !vr && !vc) { error = "missing parameter: enabled, strength, reach or cap_nits"; return; }
     if (en && en->b && !isHDR) { error = FALD_GLOW_SDR_NOTE; return; }   // HDR only (fald.h FaldGlowSupported)
     FaldGlowSettings out;
+    bool starOn = false;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
@@ -1603,6 +1607,7 @@ void DoFaldGlowFill(const JsonValue& p, JsonValue& result, std::string& error) {
         FaldGlowClamp(gl);
         fs.glow = gl;
         out = gl;
+        starOn = fs.star.enabled;
     }
     SaveSettings();
     FaldPropagate(mon, isHDR);
@@ -1611,6 +1616,9 @@ void DoFaldGlowFill(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("strength", JNum((double)out.strength));
     result.set("reach", JNum((double)out.reach));
     result.set("cap_nits", JNum((double)out.capNits));
+    // Part of the starfield feature: the switch is stored either way, but the fill runs only while starfield runs.
+    result.set("active", JBool(out.enabled && starOn && isHDR));
+    if (out.enabled && !starOn) result.set("note", JStr(FALD_GLOW_NEEDS_STAR_NOTE));
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
