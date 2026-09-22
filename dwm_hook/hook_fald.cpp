@@ -28,6 +28,9 @@ static ID3D11ComputeShader* g_convCS = nullptr;
 static ID3D11ComputeShader* g_gainCS = nullptr;
 static ID3D11ComputeShader* g_blurCS = nullptr;
 static ID3D11ComputeShader* g_boostCS = nullptr;
+// The statistic pass's combine variant (work guide C14; fald_shader.h above ZoneSlices): folds the slice partials of a
+// lattice whose zones hold more than FALD_ZONE_SLICE_PX pixels. Core: without it such a lattice could not run.
+static ID3D11ComputeShader* g_statCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11VertexShader* g_faldVS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
@@ -42,11 +45,13 @@ static ID3D11ComputeShader* g_glowDilateCS = nullptr;   // G1: box maximum
 static ID3D11ComputeShader* g_glowErodeCS = nullptr;    // G2: box minimum (the closing)
 static ID3D11ComputeShader* g_glowEnvCS = nullptr;      // G3: blur + deficit
 static ID3D11ComputeShader* g_glowBandCS = nullptr;     // G4: count-threshold band (boost + mean rule only)
+static ID3D11ComputeShader* g_starStatCombineCS = nullptr;   // S0 / G4 combine variants (zones > one slice, C14)
+static ID3D11ComputeShader* g_glowBandCombineCS = nullptr;
 static ID3D11ComputeShader* g_temporalCS = nullptr;     // LED lag pass 1b: first-order drive state (modes 1 / 2)
 static ID3D11ComputeShader* g_clockCS = nullptr;        // LED lag pass 1c: the two parity clocks (mode 3)
-static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
+static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS && g_starStatCombineCS; }
 // (the settle / content events are per monitor: FaldMonitor::settleEvt / contentEvt)
-static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS; }
+static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS && g_glowBandCombineCS; }
 static void CompileFeatureShaders();   // below FaldReleaseShaders
 static void FaldUnbindAll();          // with FaldRun
 static void CoverReset(FaldMonitor* m);   // with FaldUpdateClean
@@ -96,7 +101,7 @@ static bool CompileOne(const std::string& src, const char* name, const char* tar
 }
 
 bool FaldShadersReady() {
-    return g_statCS && g_convCS && g_gainCS && g_blurCS && g_boostCS && g_faldPS && g_faldVS && g_faldSampler;
+    return g_statCS && g_statCombineCS && g_convCS && g_gainCS && g_blurCS && g_boostCS && g_faldPS && g_faldVS && g_faldSampler;
 }
 
 bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
@@ -109,15 +114,17 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     ID3DBlob* b = nullptr;
     HRESULT hr = S_OK;
 
-    struct { const char* src; const char* name; ID3D11ComputeShader** out; } cs[] = {
-        { g_faldStatSource,  "FaldStatCS",  &g_statCS  },
-        { g_faldConvSource,  "FaldConvCS",  &g_convCS  },
-        { g_faldGainSource,  "FaldGainCS",  &g_gainCS  },
-        { g_faldBlurSource,  "FaldBlurCS",  &g_blurCS  },
-        { g_faldBoostSource, "FaldBoostCS", &g_boostCS },
+    const std::string combine = std::string(g_faldZoneCombineDefine) + common;   // the zone sweeps' combine variants
+    struct { const char* src; const char* name; ID3D11ComputeShader** out; bool comb; } cs[] = {
+        { g_faldStatSource,  "FaldStatCS",  &g_statCS,  false },
+        { g_faldStatSource,  "FaldStatCombineCS", &g_statCombineCS, true },
+        { g_faldConvSource,  "FaldConvCS",  &g_convCS,  false },
+        { g_faldGainSource,  "FaldGainCS",  &g_gainCS,  false },
+        { g_faldBlurSource,  "FaldBlurCS",  &g_blurCS,  false },
+        { g_faldBoostSource, "FaldBoostCS", &g_boostCS, false },
     };
     for (const auto& s : cs) {
-        if (!CompileOne(common + s.src, s.name, "cs_5_0", &b)) { FaldReleaseShaders(); return false; }
+        if (!CompileOne((s.comb ? combine : common) + s.src, s.name, "cs_5_0", &b)) { FaldReleaseShaders(); return false; }
         hr = g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.out);
         b->Release(); b = nullptr;
         if (FAILED(hr)) { LogF("FALD: CreateComputeShader(%s) failed hr=0x%08X", s.name, (unsigned)hr); FaldReleaseShaders(); return false; }
@@ -153,6 +160,7 @@ template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p 
 static void ReleaseFeatureShaders() {
     SafeRelease(g_clockCS); SafeRelease(g_temporalCS);
     if (g_primeEvent) { CloseHandle(g_primeEvent); g_primeEvent = NULL; }
+    SafeRelease(g_glowBandCombineCS); SafeRelease(g_starStatCombineCS);
     SafeRelease(g_glowBandCS); SafeRelease(g_glowEnvCS); SafeRelease(g_glowErodeCS);
     SafeRelease(g_glowDilateCS); SafeRelease(g_glowZoneCS);
     SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
@@ -165,21 +173,24 @@ static void ReleaseFeatureShaders() {
 
 static void CompileFeatureShaders() {
     const std::string common = g_faldCommonSource;
-    struct { const char* src; const char* name; ID3D11ComputeShader** out; } cs[] = {
-        { g_faldStarStatSource,   "FaldStarStatCS",   &g_starStatCS   },
-        { g_faldStarWeightSource, "FaldStarWeightCS", &g_starWeightCS },
-        { g_faldStarPlanSource,   "FaldStarPlanCS",   &g_starPlanCS   },
-        { g_faldGlowZoneSource,   "FaldGlowZoneCS",   &g_glowZoneCS   },
-        { g_faldGlowDilateSource, "FaldGlowDilateCS", &g_glowDilateCS },
-        { g_faldGlowErodeSource,  "FaldGlowErodeCS",  &g_glowErodeCS  },
-        { g_faldGlowEnvSource,    "FaldGlowEnvCS",    &g_glowEnvCS    },
-        { g_faldGlowBandSource,   "FaldGlowBandCS",   &g_glowBandCS   },
-        { g_faldTemporalSource,   "FaldTemporalCS",   &g_temporalCS   },
-        { g_faldPanelClockSource, "FaldPanelClockCS", &g_clockCS      },
+    const std::string combine = std::string(g_faldZoneCombineDefine) + common;
+    struct { const char* src; const char* name; ID3D11ComputeShader** out; bool comb; } cs[] = {
+        { g_faldStarStatSource,   "FaldStarStatCS",   &g_starStatCS,   false },
+        { g_faldStarStatSource,   "FaldStarStatCombineCS", &g_starStatCombineCS, true },
+        { g_faldStarWeightSource, "FaldStarWeightCS", &g_starWeightCS, false },
+        { g_faldStarPlanSource,   "FaldStarPlanCS",   &g_starPlanCS,   false },
+        { g_faldGlowZoneSource,   "FaldGlowZoneCS",   &g_glowZoneCS,   false },
+        { g_faldGlowDilateSource, "FaldGlowDilateCS", &g_glowDilateCS, false },
+        { g_faldGlowErodeSource,  "FaldGlowErodeCS",  &g_glowErodeCS,  false },
+        { g_faldGlowEnvSource,    "FaldGlowEnvCS",    &g_glowEnvCS,    false },
+        { g_faldGlowBandSource,   "FaldGlowBandCS",   &g_glowBandCS,   false },
+        { g_faldGlowBandSource,   "FaldGlowBandCombineCS", &g_glowBandCombineCS, true },
+        { g_faldTemporalSource,   "FaldTemporalCS",   &g_temporalCS,   false },
+        { g_faldPanelClockSource, "FaldPanelClockCS", &g_clockCS,      false },
     };
     for (const auto& s : cs) {
         ID3DBlob* b = nullptr;
-        if (!CompileOne(common + s.src, s.name, "cs_5_0", &b)) continue;   // logged; that part stays off
+        if (!CompileOne((s.comb ? combine : common) + s.src, s.name, "cs_5_0", &b)) continue;   // logged; that part stays off
         if (FAILED(g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.out)))
             LogF("FALD: CreateComputeShader(%s) failed", s.name);
         b->Release();
@@ -204,6 +215,7 @@ void FaldReleaseShaders() {
     SafeRelease(g_faldVS);
     SafeRelease(g_faldPS);
     SafeRelease(g_boostCS);
+    SafeRelease(g_statCombineCS);
     SafeRelease(g_blurCS);
     SafeRelease(g_gainCS);
     SafeRelease(g_convCS);
@@ -346,6 +358,10 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* activeTex[2] = {}; ID3D11UnorderedAccessView* activeUAV[2] = {}; ID3D11ShaderResourceView* activeSRV[2] = {};
     ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
+    // zone sweeps (work guide C14; fald_shader.h above ZoneSlices): slices per zone, and for a lattice of more than one
+    // the slice partials the statistic / S0 / G4 passes write and their combine variants fold (u2); null for one slice
+    unsigned int zoneSlices = 1;
+    ID3D11Buffer* zonePartBuf = nullptr; ID3D11UnorderedAccessView* zonePartUAV = nullptr;
 
     ID3D11Buffer* cb = nullptr;
 
@@ -465,6 +481,7 @@ static int g_numMonitors = 0;
 static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cb);
     SafeRelease(m->boostLutSRV); SafeRelease(m->boostLutBuf);
+    SafeRelease(m->zonePartUAV); SafeRelease(m->zonePartBuf); m->zoneSlices = 1;
     for (int i = 0; i < 2; i++) {
         SafeRelease(m->boostSRV[i]); SafeRelease(m->boostUAV[i]); SafeRelease(m->boostTex[i]);
         SafeRelease(m->activeSRV[i]); SafeRelease(m->activeUAV[i]); SafeRelease(m->activeTex[i]);
@@ -512,6 +529,22 @@ static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11Unordered
     if (FAILED(g_dev->CreateUnorderedAccessView(*tex, nullptr, uav))) return false;
     if (FAILED(g_dev->CreateShaderResourceView(*tex, nullptr, srv))) return false;
     return true;
+}
+
+// The zone sweeps' slice partials (fald_shader.h ZonePart): cols * rows * slices records, UAV only.
+static bool MakeZonePartBuffer(UINT count, ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav) {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = count * FALD_ZONE_PART_BYTES;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = FALD_ZONE_PART_BYTES;
+    if (FAILED(g_dev->CreateBuffer(&bd, nullptr, buf))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_UNKNOWN;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = count;
+    return SUCCEEDED(g_dev->CreateUnorderedAccessView(*buf, &ud, uav));
 }
 
 static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) {
@@ -669,6 +702,10 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
     if (!MakeRWTexture(fw, fh, &m->gainBTex, &m->gainBUAV, &m->gainBSRV)) { log_to_file("FALD: gain texture B failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatTrueTex, &m->flatTrueUAV, &m->flatTrueSRV)) { log_to_file("FALD: flat B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatEstTex, &m->flatEstUAV, &m->flatEstSRV)) { log_to_file("FALD: flat B_est texture failed"); return false; }
+    m->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
+    if (m->zoneSlices > 1 && !MakeZonePartBuffer(p.cols * p.rows * m->zoneSlices, &m->zonePartBuf, &m->zonePartUAV)) {
+        log_to_file("FALD: zone partials buffer failed"); return false;
+    }
     if (p.hasBoost) {
         for (unsigned int i = 0; i < 2; i++) {
             if (!MakeRWTexture(p.cols, p.rows, &m->activeTex[i], &m->activeUAV[i], &m->activeSRV[i])) { log_to_file("FALD: active-zone texture failed"); return false; }
@@ -956,9 +993,14 @@ static void RunStat(FaldMonitor* m, uint32_t roundIdx) {
         g_ctx->CSSetShaderResources(5, 2, fields);
         g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);      // smoothed gain of the previous round
     }
-    ID3D11UnorderedAccessView* uavs[2] = { m->driveUAV, m->activeUAV[roundIdx & 1u] };   // u1: null without a boost LUT
-    g_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);                               // (the shader then never writes it)
-    g_ctx->Dispatch(p.cols, p.rows, 1);
+    ID3D11UnorderedAccessView* uavs[3] = { m->driveUAV, m->activeUAV[roundIdx & 1u],    // u1: null without a boost LUT
+                                           m->zonePartUAV };                              // (the shader then never writes it)
+    g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);                               // u2: partials, zones > one slice
+    g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
+    if (m->zoneSlices > 1) {                                                             // fold the slices, finish the zones
+        g_ctx->CSSetShader(g_statCombineCS, nullptr, 0);
+        g_ctx->Dispatch(p.cols, p.rows, 1);
+    }
     UnbindCompute();
 }
 
@@ -1063,11 +1105,15 @@ static void RunStar(FaldMonitor* m) {
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
     // S0: per zone stat = (peak, speck-zone flag, sparse, solid) + bg = (ln b, brightest pixel's index, lit sum, a_eff)
-    ID3D11UnorderedAccessView* out0[2] = { m->starStatUAV, m->starBgUAV };
+    ID3D11UnorderedAccessView* out0[3] = { m->starStatUAV, m->starBgUAV, m->zonePartUAV };   // u2: zones > one slice
     g_ctx->CSSetShader(g_starStatCS, nullptr, 0);
     g_ctx->CSSetShaderResources(0, 2, in2);
-    g_ctx->CSSetUnorderedAccessViews(0, 2, out0, nullptr);
-    g_ctx->Dispatch(p.cols, p.rows, 1);
+    g_ctx->CSSetUnorderedAccessViews(0, 3, out0, nullptr);
+    g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
+    if (m->zoneSlices > 1) {
+        g_ctx->CSSetShader(g_starStatCombineCS, nullptr, 0);
+        g_ctx->Dispatch(p.cols, p.rows, 1);
+    }
     UnbindCompute();
     // S1: tapered protection field + flank test + zone weights
     ID3D11UnorderedAccessView* out1[2] = { m->starWUAV, m->starPlan2UAV };
@@ -1135,8 +1181,13 @@ static void RunGlow(FaldMonitor* m) {
         g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);
         ID3D11ShaderResourceView* none = nullptr;
         g_ctx->CSSetShaderResources(24, 1, &none);
-        g_ctx->CSSetUnorderedAccessViews(0, 1, &m->glowKUAV, nullptr);
-        g_ctx->Dispatch(p.cols, p.rows, 1);
+        ID3D11UnorderedAccessView* uk[3] = { m->glowKUAV, nullptr, m->zonePartUAV };     // u2: zones > one slice
+        g_ctx->CSSetUnorderedAccessViews(0, 3, uk, nullptr);
+        g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
+        if (m->zoneSlices > 1) {
+            g_ctx->CSSetShader(g_glowBandCombineCS, nullptr, 0);
+            g_ctx->Dispatch(p.cols, p.rows, 1);
+        }
         UnbindCompute();
     }
 }

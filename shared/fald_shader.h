@@ -436,6 +436,19 @@ float3 GlowAdd(float3 req, float bTrue, float bEst, int2 px) {
     }
     return GlowAddK(req, bTrue, bEst, float2(px), k);
 }
+// Zone sweeps — the statistic pass, starfield S0 and the glow band G4 (work guide C14). A zone's pixels k = 0 .. n - 1
+// (row-major inside the zone) are cut into slices of FALD_ZONE_SLICE_PX; each (zone, slice) is one 256-thread group
+// (SV_GroupID.xy = the zone, .z = the slice), so the sweep's parallelism is pixels / FALD_ZONE_SLICE_PX whatever the zone
+// count. One group per zone ran an 8 x 2 edge-lit lattice at 6 ms and a 1 x 1 at 111 ms per frame on an RTX 5090.
+// A zone of ONE slice (n <= FALD_ZONE_SLICE_PX: every mini-LED lattice at 4K down to ~2000 zones) is finished by its own
+// group exactly as before (bit-identical). With more slices each group writes its partial (ZonePart, u2) and the pass's
+// combine variant (compiled with FALD_ZONE_COMBINE, one group per zone) folds them — thread t the slices t, t + 256, ...
+// in order, then the same tree — and finishes the zone. C++: FALD_ZONE_SLICE_PX / FaldZoneSlices (below the shaders);
+// DLC gpuemu.Emu.zone_pow_sum emulates the order.
+static const uint FALD_ZONE_SLICE_PX = 4096u;
+struct ZonePart { float4 f; uint4 u; };
+uint ZoneSlices() { return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX; }
+uint ZonePartIndex(uint cx, uint cy, uint s) { return (cy * cols + cx) * ZoneSlices() + s; }
 )";
 
 // Pass 1: per-cell area statistic -> drive. One thread group per cell, 256 threads sweep the block.
@@ -444,9 +457,11 @@ float3 GlowAdd(float3 req, float bTrue, float bEst, int2 px) {
 // round 1 (DLC correct_image re-reads the boost from each round's request). boostRule 1 (LIT-or-MEAN, C12b) also sums
 // nits^boostMeanGamma over the zone's pixels (exp(gamma * log) under mc > 0: no pow(0) / negative / NaN case) and
 // replaces the DIM test by mean >= boostMeanThresh; rule 0 computes exactly what it did before the rule existed.
+// Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source).
 inline const char* g_faldStatSource = R"(
 RWTexture2D<float> driveOut : register(u0);
 RWTexture2D<float> activeOut : register(u1);
+RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared uint gLit[256];
@@ -460,7 +475,14 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     float m = 0.0f, sum = 0.0f;
     uint lit = 0, dim = 0;
     float powSum = 0.0f;
-    for (uint k = tid.x; k < n; k += 256) {
+#ifdef FALD_ZONE_COMBINE
+    for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
+        ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
+        m = max(m, q.f.x); sum += q.f.y; powSum += q.f.z; lit += q.u.x; dim += q.u.y;
+    }
+#else
+    uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
+    for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
         uint px = originX + cx * cellW + (k % cellW);
         uint py = originY + cy * cellH + (k / cellW);
         if (px >= frameW || py >= frameH) continue;
@@ -481,6 +503,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             if (boostRule == 1u && mc > 0.0f) powSum += exp(boostMeanGamma * log(mc));
         }
     }
+#endif
     gMax[tid.x] = m; gSum[tid.x] = sum;
     gLit[tid.x] = lit; gDim[tid.x] = dim;
     gPow[tid.x] = powSum;
@@ -496,6 +519,15 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         GroupMemoryBarrierWithGroupSync();
     }
     if (tid.x == 0) {
+#ifndef FALD_ZONE_COMBINE
+        if (ZoneSlices() > 1u) {                                  // one slice of a larger zone: its partial, finished later
+            ZonePart q;
+            q.f = float4(gMax[0], gSum[0], gPow[0], 0.0f);
+            q.u = uint4(gLit[0], gDim[0], 0u, 0u);
+            zonePart[ZonePartIndex(cx, cy, gid.z)] = q;
+            return;
+        }
+#endif
         float stat = min(gMax[0], gSum[0] / area0);   // min(brightest lit px, sum lit nits*px^2 / A0)
         driveOut[uint2(cx, cy)] = DriveOf(stat);
         if (boostN != 0u) {
@@ -579,9 +611,12 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 //   arg = the brightest pixel's position inside the zone, ly * cellW + lx (un-gated maximum; ties: the pixel nearest a
 //     zone border — mirror-symmetric — then the first in row-major order; StarEdgeKey / StarBetter) — S1's flank test.
 // u0 = (peak, spk, sparse, solid); u1 = (ln b, arg, lit sum, a_eff) — S1 copies ln b into the texture the pixels sample.
+// Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source); the
+// brightest pixel's position merges across slices by the same total order (StarBetter), so it is the same pixel.
 inline const char* g_faldStarStatSource = R"(
 RWTexture2D<float4> starStatOut : register(u0);
 RWTexture2D<float4> starBgOut : register(u1);
+RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared float gMaxAll[256];
@@ -610,7 +645,16 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint n = cellW * cellH;
     float m = 0.0f, sum = 0.0f, mAll = -1.0f, mn = 3.0e38f, sumAll = 0.0f;
     uint count = 0, kAll = 0;
-    for (uint k = tid.x; k < n; k += 256) {
+#ifdef FALD_ZONE_COMBINE
+    for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
+        ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
+        m = max(m, q.f.x); sum += q.f.y;
+        if (StarBetter(mAll, kAll, q.f.z, q.u.x)) { mAll = q.f.z; kAll = q.u.x; }
+        mn = min(mn, q.f.w); sumAll += asfloat(q.u.z); count += q.u.y;
+    }
+#else
+    uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
+    for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
         uint px = originX + cx * cellW + (k % cellW);
         uint py = originY + cy * cellH + (k / cellW);
         if (px >= frameW || py >= frameH) continue;          // only in-frame pixels count (n, min and sums alike)
@@ -620,6 +664,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (StarBetter(mAll, kAll, s, k)) { mAll = s; kAll = k; }
         mn = min(mn, s); sumAll += s; count++;
     }
+#endif
     gMax[tid.x] = m; gSum[tid.x] = sum;
     gMaxAll[tid.x] = mAll; gArg[tid.x] = kAll; gMin[tid.x] = mn; gSumAll[tid.x] = sumAll; gCount[tid.x] = count;
     GroupMemoryBarrierWithGroupSync();
@@ -637,6 +682,15 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         GroupMemoryBarrierWithGroupSync();
     }
     if (tid.x == 0) {
+#ifndef FALD_ZONE_COMBINE
+        if (ZoneSlices() > 1u) {                                  // one slice of a larger zone: its partial, finished later
+            ZonePart q;
+            q.f = float4(gMax[0], gSum[0], gMaxAll[0], gMin[0]);
+            q.u = uint4(gArg[0], gCount[0], asuint(gSumAll[0]), 0u);
+            zonePart[ZonePartIndex(cx, cy, gid.z)] = q;
+            return;
+        }
+#endif
         float peak = gMax[0], total = gSum[0];
         float peakAll = max(gMaxAll[0], 0.0f), sumAll0 = gSumAll[0];   // (-1 = a thread / zone without an in-frame pixel)
         float cnt = (float)gCount[0];
@@ -906,8 +960,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 // Glow pass G4 (glowBand only, every round): the count-threshold band's zone scale (glowfill.band_scale). One thread group
 // per zone, 256 threads sweep its pixels exactly like the statistic pass (the same thread / reduction order: the twin's
 // Emu.zone_pow_sum); the request is the round's corrected one, the fill the UNSCALED one (k = 1).
+// Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source).
 inline const char* g_faldGlowBandSource = R"(
 RWTexture2D<float> glowKOut : register(u0);
+RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
 groupshared float gPowC[256];
 groupshared float gPowF[256];
 groupshared uint gLitC[256];
@@ -918,7 +974,14 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint n = cellW * cellH;
     float powC = 0.0f, powF = 0.0f;
     uint lit = 0;
-    for (uint k = tid.x; k < n; k += 256) {
+#ifdef FALD_ZONE_COMBINE
+    for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
+        ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
+        powC += q.f.x; powF += q.f.y; lit += q.u.x;
+    }
+#else
+    uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
+    for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
         uint px = originX + cx * cellW + (k % cellW);
         uint py = originY + cy * cellH + (k / cellW);
         if (px >= frameW || py >= frameH) continue;
@@ -933,6 +996,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (f > 0.0f) powF += exp(boostMeanGamma * log(f));
         if (c > boostLitNits) lit++;
     }
+#endif
     gPowC[tid.x] = powC; gPowF[tid.x] = powF; gLitC[tid.x] = lit;
     GroupMemoryBarrierWithGroupSync();
     for (uint stride = 128; stride > 0; stride >>= 1) {
@@ -944,6 +1008,15 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         GroupMemoryBarrierWithGroupSync();
     }
     if (tid.x == 0) {
+#ifndef FALD_ZONE_COMBINE
+        if (ZoneSlices() > 1u) {                                  // one slice of a larger zone: its partial, finished later
+            ZonePart q;
+            q.f = float4(gPowC[0], gPowF[0], 0.0f, 0.0f);
+            q.u = uint4(gLitC[0], 0u, 0u, 0u);
+            zonePart[ZonePartIndex(cx, cy, gid.z)] = q;
+            return;
+        }
+#endif
         float pc = gPowC[0] / (float)n, pf = gPowF[0] / (float)n;
         bool litZone = (float)gLitC[0] / (float)n > boostLitFrac;
         float t = boostMeanThresh;
@@ -1046,6 +1119,19 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 static const unsigned int FALD_CONV_THREADS = 64u;
 inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
     return (cols * rows + FALD_CONV_THREADS - 1u) / FALD_CONV_THREADS;
+}
+
+// Zone sweeps (work guide C14; the rules above ZoneSlices in the common source). The statistic pass, starfield S0 and
+// the glow band G4 dispatch cols x rows x FaldZoneSlices(cellW, cellH) groups; with more than one slice per zone the
+// pass's combine variant (its source compiled after g_faldZoneCombineDefine) follows over cols x rows. The partials: one
+// structured buffer per monitor of cols * rows * slices ZonePart records, bound at u2. A 1-slice lattice has no buffer
+// and runs neither the partial write nor the combine. Slices stay far inside D3D11's 65535 groups per dimension (a
+// 7680 x 4320 frame as one zone = 8100).
+static const unsigned int FALD_ZONE_SLICE_PX = 4096u;     // = the HLSL's FALD_ZONE_SLICE_PX
+static const unsigned int FALD_ZONE_PART_BYTES = 32u;     // = the HLSL's ZonePart (float4 + uint4)
+inline const char* g_faldZoneCombineDefine = "#define FALD_ZONE_COMBINE 1\n";
+inline unsigned int FaldZoneSlices(unsigned int cellW, unsigned int cellH) {
+    return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX;
 }
 
 // Pass 1b (tempMode != 0 only): per-cell first-order drive state. driveTex (t4) = this round's instantaneous

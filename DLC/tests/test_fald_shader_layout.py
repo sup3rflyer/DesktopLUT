@@ -77,3 +77,58 @@ def test_boost_count_is_a_full_group_reduction():
     for path in (_OVERLAY, _HOOK):
         body = re.search(r"static void RunBoost\(.*?\n\}", path.read_text(encoding="utf-8"), re.S).group(0)
         assert "Dispatch(1, 1, 1);" in body                                    # one group of n threads
+
+
+# ---- zone sweeps in slices (work guide C14): the statistic pass, starfield S0 and the glow band G4 --------------------
+_SWEEPS = {   # source: (partial written by the sliced pass, the combine's fold of it)
+    "g_faldStatSource": ("q.f = float4(gMax[0], gSum[0], gPow[0], 0.0f);", "q.u = uint4(gLit[0], gDim[0], 0u, 0u);",
+                         "m = max(m, q.f.x); sum += q.f.y; powSum += q.f.z; lit += q.u.x; dim += q.u.y;"),
+    "g_faldStarStatSource": ("q.f = float4(gMax[0], gSum[0], gMaxAll[0], gMin[0]);",
+                             "q.u = uint4(gArg[0], gCount[0], asuint(gSumAll[0]), 0u);",
+                             "mn = min(mn, q.f.w); sumAll += asfloat(q.u.z); count += q.u.y;"),
+    "g_faldGlowBandSource": ("q.f = float4(gPowC[0], gPowF[0], 0.0f, 0.0f);", "q.u = uint4(gLitC[0], 0u, 0u, 0u);",
+                             "powC += q.f.x; powF += q.f.y; lit += q.u.x;"),
+}
+
+
+def test_zone_slice_size_agrees_between_hlsl_cpp_and_the_emulator():
+    from dlc.fald import gpuemu
+    src = _SHADER.read_text(encoding="utf-8")
+    common = _part(src, "g_faldCommonSource")
+    n = int(re.search(r"static const uint FALD_ZONE_SLICE_PX = (\d+)u;", common).group(1))
+    assert f"static const unsigned int FALD_ZONE_SLICE_PX = {n}u;" in src and gpuemu.ZONE_SLICE_PX == n
+    assert n % 256 == 0, "a slice must be whole passes of the 256-thread group (the emulator's order assumes it)"
+    assert "struct ZonePart { float4 f; uint4 u; };" in common and "static const unsigned int FALD_ZONE_PART_BYTES = 32u;" in src
+    assert "uint ZoneSlices() { return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX; }" in common
+    assert "return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX;" in src.split("inline unsigned int FaldZoneSlices")[1]
+
+
+@pytest.mark.parametrize("name", sorted(_SWEEPS))
+def test_zone_sweep_slices_and_its_combine_fold_the_same_record(name):
+    body = _part(_SHADER.read_text(encoding="utf-8"), name)
+    assert "RWStructuredBuffer<ZonePart> zonePart : register(u2);" in body
+    # the sliced sweep: this group's slice only, the same thread stride as the one-group sweep before C14
+    assert "uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);" in body
+    assert "for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {" in body
+    # a zone of one slice finishes in its group as before; otherwise the group leaves its partial and stops
+    guard = body.index("#ifndef FALD_ZONE_COMBINE")
+    assert body.index("if (ZoneSlices() > 1u) {", guard) < body.index("zonePart[ZonePartIndex(cx, cy, gid.z)] = q;", guard)
+    # the combine: every slice once, in order per thread, then the pass's own tree + finish; packed = unpacked
+    assert "for (uint s = tid.x; s < ZoneSlices(); s += 256) {" in body
+    assert "ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];" in body
+    for line in _SWEEPS[name]:
+        assert line in body, line
+    assert body.count("#ifdef FALD_ZONE_COMBINE") == 1 and body.count("#ifndef FALD_ZONE_COMBINE") == 1
+
+
+@pytest.mark.parametrize("path, v", [(_OVERLAY, "r"), (_HOOK, "m")], ids=["overlay", "hook"])
+def test_both_paths_dispatch_the_slices_and_run_the_combine(path, v):
+    c = path.read_text(encoding="utf-8")
+    assert f"{v}->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);" in c
+    assert c.count(f"Dispatch(p.cols, p.rows, {v}->zoneSlices);") == 3                 # stat, S0, G4
+    assert c.count(f"if ({v}->zoneSlices > 1) {{") == 3
+    assert c.count("g_faldZoneCombineDefine") >= 1
+    for src, combine in (("g_faldStatSource", "StatCombineCS"), ("g_faldStarStatSource", "StarStatCombineCS"),
+                         ("g_faldGlowBandSource", "GlowBandCombineCS")):
+        assert re.search(re.escape(src) + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from {src}"
+    assert f"SafeRelease({v}->zonePartUAV); SafeRelease({v}->zonePartBuf);" in c

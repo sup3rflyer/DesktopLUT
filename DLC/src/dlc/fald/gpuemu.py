@@ -64,6 +64,7 @@ STAR_EVEN_REACH_MAX = 12  # FALD_STAR_EVEN_REACH_MAX / FALD_STAR_REACH_MAX (fald
 STAR_REACH_MAX = 4
 STAR_FLAT_ABS = 1e-6      # FALD_STAR_FLAT_ABS / _REL (fald_shader.h star statistic; starfield.FLAT_ABS / FLAT_REL): a zone whose
 STAR_FLAT_REL = 0.02      # peak is not more than max(ABS, REL * peak) above its darkest pixel has no speck: not star-like
+ZONE_SLICE_PX = 4096      # FALD_ZONE_SLICE_PX (fald_shader.h, work guide C14): pixels per thread group of a zone sweep
 STAR_PULL_EPS = 1e-5      # FALD_STAR_PULL_EPS (starfield.PULL_EPS): a pull ending this close to the pixel itself is no pull
 STAR_GATE_LO, STAR_GATE_HI = 1.0, 2.0   # FALD_STAR_GATE_LO / _HI (starfield.GATE_LO / GATE_HI): the pull threshold over target / background
 STAR_FLANK_PX, STAR_FLANK_NEAR_PX = 2, 12   # FALD_STAR_FLANK_PX / _NEAR_PX (starfield.FLANK_PX / FLANK_NEAR_PX): one feature straddling a border
@@ -636,8 +637,7 @@ class Emu:
         return self.drive_of(stat), stat
 
     # ---- CS stat, the boost part (u1): per zone, LIT-or-DIM / LIT-or-MEAN on the pixel's brightest channel (NOT capped
-    # at white). Rule 1 sums pow(mc, gamma) over the pixels with mc > 0 in the shader's order: each of the 256 threads
-    # sweeps its pixels k = t, t + 256, ... (row-major k) into a float32 partial, then the 128 / 64 / ... / 1 reduction.
+    # at white). Rule 1 sums pow(mc, gamma) over the pixels with mc > 0 in the shader's order (zone_pow_sum).
     def stat_active(self, img):
         mc = img.max(axis=0)[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw].astype(np.float32)
         blocks = mc.reshape(self.rows, self.ch, self.cols, self.cw)
@@ -649,20 +649,34 @@ class Emu:
         return (lit_f > self.litFrac) | (dim_f > self.dimFrac)
 
     def zone_pow_sum(self, blocks):
-        """(rows, cols) float32: per zone the shader's sum of pow(mc, meanGamma) over its pixels with mc > 0."""
+        """(rows, cols) float32: per zone the shader's sum of pow(mc, meanGamma) over its pixels with mc > 0, in the
+        shader's order (fald_shader.h above ZoneSlices, work guide C14). The zone's pixels (row-major k) are cut into
+        slices of ZONE_SLICE_PX, one 256-thread group each: thread t adds k = slice start + t, + 256, ... into a float32
+        partial, then the 128 / 64 / ... / 1 tree. A zone of one slice ends there (the order before C14). With more
+        slices the combine group's thread t adds the slice partials t, t + 256, ... in order, then the same tree."""
         npx = self.cw * self.ch
         v = blocks.transpose(0, 2, 1, 3).reshape(self.rows, self.cols, npx)
         pos = v > 0
         pw = np.where(pos, np.exp(self.meanGamma * np.log(np.where(pos, v, f32(1)), dtype=np.float32), dtype=np.float32), f32(0)).astype(np.float32)   # HLSL: exp(gamma * log(mc))
-        part = np.zeros((self.rows, self.cols, 256), dtype=np.float32)
-        for j in range(0, npx, 256):                       # thread t adds its pixel k = t + j, ascending j
-            seg = pw[:, :, j: j + 256]
-            part[:, :, : seg.shape[2]] += seg
+        nsl = (npx + ZONE_SLICE_PX - 1) // ZONE_SLICE_PX
+        slices = np.zeros((self.rows, self.cols, nsl), dtype=np.float32)
+        for s in range(nsl):
+            slices[:, :, s] = self._group_sum(pw[:, :, s * ZONE_SLICE_PX: (s + 1) * ZONE_SLICE_PX])
+        return slices[:, :, 0] if nsl == 1 else self._group_sum(slices)
+
+    @staticmethod
+    def _group_sum(vals):
+        """One 256-thread group's float32 sum of vals[..., i] (i ascending): thread t adds i = t, t + 256, ..., then the
+        128 / 64 / ... / 1 tree (the zone sweeps' order in fald_shader.h)."""
+        part = np.zeros(vals.shape[:-1] + (256,), dtype=np.float32)
+        for j in range(0, vals.shape[-1], 256):              # thread t adds its element t + j, ascending j
+            seg = vals[..., j: j + 256]
+            part[..., : seg.shape[-1]] += seg
         stride = 128
         while stride > 0:
-            part[:, :, :stride] += part[:, :, stride: 2 * stride]
+            part[..., :stride] += part[..., stride: 2 * stride]
             stride >>= 1
-        return part[:, :, 0]
+        return part[..., 0]
 
     # ---- CS boost (pass 1a): zone count -> staircase. (boost float32, count, flags); (None, -1, None) without a LUT
     def frame_boost(self, img):

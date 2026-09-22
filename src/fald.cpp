@@ -27,6 +27,11 @@ static ID3D11ComputeShader* g_faldGlowDilateCS = nullptr; // G1: box maximum on 
 static ID3D11ComputeShader* g_faldGlowErodeCS = nullptr;  // G2: box minimum = the closing
 static ID3D11ComputeShader* g_faldGlowEnvCS = nullptr;    // G3: blur under the closing + the zone deficit
 static ID3D11ComputeShader* g_faldGlowBandCS = nullptr;   // G4: the count-threshold band's zone scale (round 0, mean-rule files)
+// The zone sweeps' combine variants (work guide C14; fald_shader.h above ZoneSlices): run only for a lattice whose zones
+// hold more than FALD_ZONE_SLICE_PX pixels, after the sliced pass, to fold its partials and finish each zone.
+static ID3D11ComputeShader* g_faldStatCombineCS = nullptr;
+static ID3D11ComputeShader* g_faldStarStatCombineCS = nullptr;
+static ID3D11ComputeShader* g_faldGlowBandCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
 
@@ -162,6 +167,19 @@ bool InitFaldShaders() {
             if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(" << g.name << ") failed" << std::endl; return false; }
         }
     }
+    {
+        const std::string combine = std::string(g_faldZoneCombineDefine) + common;   // the same sources, FALD_ZONE_COMBINE
+        struct { const char* src; const char* name; ID3D11ComputeShader** cs; } zc[3] = {
+            { g_faldStatSource, "FaldStatCombineCS", &g_faldStatCombineCS },
+            { g_faldStarStatSource, "FaldStarStatCombineCS", &g_faldStarStatCombineCS },
+            { g_faldGlowBandSource, "FaldGlowBandCombineCS", &g_faldGlowBandCombineCS } };
+        for (auto& z : zc) {
+            if (!CompileOne(combine + z.src, z.name, "cs_5_0", &b)) return false;
+            hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, z.cs);
+            b->Release(); b = nullptr;
+            if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(" << z.name << ") failed" << std::endl; return false; }
+        }
+    }
     if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
@@ -177,6 +195,9 @@ bool InitFaldShaders() {
 void ReleaseFaldShaders() {
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
+    if (g_faldGlowBandCombineCS) { g_faldGlowBandCombineCS->Release(); g_faldGlowBandCombineCS = nullptr; }
+    if (g_faldStarStatCombineCS) { g_faldStarStatCombineCS->Release(); g_faldStarStatCombineCS = nullptr; }
+    if (g_faldStatCombineCS) { g_faldStatCombineCS->Release(); g_faldStatCombineCS = nullptr; }
     if (g_faldGlowBandCS) { g_faldGlowBandCS->Release(); g_faldGlowBandCS = nullptr; }
     if (g_faldGlowEnvCS) { g_faldGlowEnvCS->Release(); g_faldGlowEnvCS = nullptr; }
     if (g_faldGlowErodeCS) { g_faldGlowErodeCS->Release(); g_faldGlowErodeCS = nullptr; }
@@ -197,7 +218,8 @@ void ReleaseFaldShaders() {
 bool FaldShadersReady() {
     return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldPanelClockCS && g_faldBoostCS &&
            g_faldStarStatCS && g_faldStarWeightCS && g_faldStarPlanCS &&
-           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldPS && g_faldSampler;
+           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldPS && g_faldSampler &&
+           g_faldStatCombineCS && g_faldStarStatCombineCS && g_faldGlowBandCombineCS;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -259,6 +281,7 @@ static void ReleaseAll(FaldResources* r) {
         SafeRelease(r->boostSRV[i]); SafeRelease(r->boostUAV[i]); SafeRelease(r->boostTex[i]);
     }
     SafeRelease(r->boostLutSRV); SafeRelease(r->boostLutBuf);
+    SafeRelease(r->zonePartUAV); SafeRelease(r->zonePartBuf); r->zoneSlices = 1;
     ReleaseStar(r);
     ReleaseGlow(r);
     ReleaseClock(r);
@@ -360,6 +383,22 @@ static bool EnsureClock(FaldResources* r) {
     return false;
 }
 
+// The zone sweeps' slice partials (fald_shader.h ZonePart): cols * rows * slices records, UAV only.
+static bool MakeZonePartBuffer(UINT count, ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav) {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = count * FALD_ZONE_PART_BYTES;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = FALD_ZONE_PART_BYTES;
+    if (FAILED(g_device->CreateBuffer(&bd, nullptr, buf))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_UNKNOWN;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = count;
+    return SUCCEEDED(g_device->CreateUnorderedAccessView(*buf, &ud, uav));
+}
+
 static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) {
     D3D11_BUFFER_DESC bd = {};
     bd.ByteWidth = (UINT)(data.size() * sizeof(float));
@@ -438,6 +477,10 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainBTex, &r->gainBUAV, &r->gainBSRV)) { r->lastError = "gain texture B"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
+    r->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
+    if (r->zoneSlices > 1 && !MakeZonePartBuffer(p.cols * p.rows * r->zoneSlices, &r->zonePartBuf, &r->zonePartUAV)) {
+        r->lastError = "zone partials buffer"; return false;
+    }
     if (p.hasBoost) {
         // black-frame LED boost: per-round zone flags + 2x1 result, and the LUT as (first zone COUNT, boost) pairs
         for (unsigned int i = 0; i < 2; i++) {
@@ -604,9 +647,9 @@ static void BindCommon(FaldResources* r, bool compute) {
 
 static void UnbindCompute() {
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
-    ID3D11UnorderedAccessView* nullUav[2] = {};
+    ID3D11UnorderedAccessView* nullUav[3] = {};             // u0 / u1 + u2, the zone sweeps' partials
     g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
-    g_context->CSSetUnorderedAccessViews(0, 2, nullUav, nullptr);
+    g_context->CSSetUnorderedAccessViews(0, 3, nullUav, nullptr);
     g_context->CSSetShader(nullptr, nullptr, 0);
 }
 
@@ -620,9 +663,14 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
         g_context->CSSetShaderResources(5, 2, fields);
         g_context->CSSetShaderResources(9, 1, &r->gainBSRV);      // smoothed gain of the previous round
     }
-    ID3D11UnorderedAccessView* uavs[2] = { r->driveUAV, r->activeUAV[roundIdx & 1u] };   // u1: nullptr without a boost LUT
-    g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);                           // (the shader then never writes it)
-    g_context->Dispatch(p.cols, p.rows, 1);
+    ID3D11UnorderedAccessView* uavs[3] = { r->driveUAV, r->activeUAV[roundIdx & 1u],    // u1: nullptr without a boost LUT
+                                           r->zonePartUAV };                              // (the shader then never writes it)
+    g_context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);                           // u2: partials, zones > one slice
+    g_context->Dispatch(p.cols, p.rows, r->zoneSlices);
+    if (r->zoneSlices > 1) {                                                             // fold the slices, finish the zones
+        g_context->CSSetShader(g_faldStatCombineCS, nullptr, 0);
+        g_context->Dispatch(p.cols, p.rows, 1);
+    }
     UnbindCompute();
 }
 
@@ -639,11 +687,15 @@ static void RunStar(FaldResources* r) {
     g_context->CSSetConstantBuffers(0, 1, &r->cb);
     g_context->CSSetSamplers(0, 1, &g_faldSampler);
     // S0: per zone stat = (peak, speck-zone flag, sparse, solid) + bg = (ln b, brightest pixel's index, lit sum, a_eff)
-    ID3D11UnorderedAccessView* out0[2] = { r->starStatUAV, r->starBgUAV };
+    ID3D11UnorderedAccessView* out0[3] = { r->starStatUAV, r->starBgUAV, r->zonePartUAV };   // u2: zones > one slice
     g_context->CSSetShader(g_faldStarStatCS, nullptr, 0);
     g_context->CSSetShaderResources(0, 2, in2);
-    g_context->CSSetUnorderedAccessViews(0, 2, out0, nullptr);
-    g_context->Dispatch(p.cols, p.rows, 1);
+    g_context->CSSetUnorderedAccessViews(0, 3, out0, nullptr);
+    g_context->Dispatch(p.cols, p.rows, r->zoneSlices);
+    if (r->zoneSlices > 1) {
+        g_context->CSSetShader(g_faldStarStatCombineCS, nullptr, 0);
+        g_context->Dispatch(p.cols, p.rows, 1);
+    }
     UnbindCompute();
     // S1: the tapered protection field + flank test + zone weights -> (wt, wt ln peak, flank, spk) and (ln background, near, spk, w)
     ID3D11UnorderedAccessView* out1[2] = { r->starWUAV, r->starPlan2UAV };
@@ -717,8 +769,13 @@ static void RunGlow(FaldResources* r, uint32_t roundIdx) {
         g_context->CSSetShaderResources(9, 1, &r->gainBSRV);
         ID3D11ShaderResourceView* none = nullptr;
         g_context->CSSetShaderResources(24, 1, &none);
-        g_context->CSSetUnorderedAccessViews(0, 1, &r->glowKUAV, nullptr);
-        g_context->Dispatch(p.cols, p.rows, 1);
+        ID3D11UnorderedAccessView* uk[3] = { r->glowKUAV, nullptr, r->zonePartUAV };     // u2: zones > one slice
+        g_context->CSSetUnorderedAccessViews(0, 3, uk, nullptr);
+        g_context->Dispatch(p.cols, p.rows, r->zoneSlices);
+        if (r->zoneSlices > 1) {
+            g_context->CSSetShader(g_faldGlowBandCombineCS, nullptr, 0);
+            g_context->Dispatch(p.cols, p.rows, 1);
+        }
         UnbindCompute();
     }
 }
