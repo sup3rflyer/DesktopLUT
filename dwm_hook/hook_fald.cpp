@@ -29,7 +29,8 @@ static ID3D11ComputeShader* g_gainCS = nullptr;
 static ID3D11ComputeShader* g_blurCS = nullptr;
 static ID3D11ComputeShader* g_boostCS = nullptr;
 // The statistic pass's combine variant (work guide C14; fald_shader.h above ZoneSlices): folds the slice partials of a
-// lattice whose zones hold more than FALD_ZONE_SLICE_PX pixels. Core: without it such a lattice could not run.
+// lattice whose zones hold more than FALD_ZONE_SLICE_PX pixels. Needed by such lattices only (BuildMonitor refuses one
+// without it); a lattice of one-slice zones never dispatches it, so a compile failure here costs nothing there.
 static ID3D11ComputeShader* g_statCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11VertexShader* g_faldVS = nullptr;
@@ -49,9 +50,9 @@ static ID3D11ComputeShader* g_starStatCombineCS = nullptr;   // S0 / G4 combine 
 static ID3D11ComputeShader* g_glowBandCombineCS = nullptr;
 static ID3D11ComputeShader* g_temporalCS = nullptr;     // LED lag pass 1b: first-order drive state (modes 1 / 2)
 static ID3D11ComputeShader* g_clockCS = nullptr;        // LED lag pass 1c: the two parity clocks (mode 3)
-static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS && g_starStatCombineCS; }
+static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
 // (the settle / content events are per monitor: FaldMonitor::settleEvt / contentEvt)
-static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS && g_glowBandCombineCS; }
+static bool GlowShadersReady() { return g_glowZoneCS && g_glowDilateCS && g_glowErodeCS && g_glowEnvCS && g_glowBandCS; }
 static void CompileFeatureShaders();   // below FaldReleaseShaders
 static void FaldUnbindAll();          // with FaldRun
 static void CoverReset(FaldMonitor* m);   // with FaldUpdateClean
@@ -76,7 +77,7 @@ static long long g_primeLastQpc = 0;                        // the last prime re
 // t0..t24, as the HLSL declares them (HOOK_FALD_SRV_SLOTS). The pixel pass and every compute pass
 // bind the whole range so a slot left over from a previous pass cannot be read by accident.
 static const UINT FALD_SRV_SLOTS = HOOK_FALD_SRV_SLOTS;
-// The deepest UAV range any core pass binds (stat binds u0/u1).
+// The deepest UAV range any pass binds: u0..u3 (the panel clock; the zone sweeps bind u0..u2).
 static const UINT FALD_UAV_SLOTS = HOOK_FALD_UAV_SLOTS;
 
 static void LogF(const char* fmt, ...) {
@@ -101,7 +102,7 @@ static bool CompileOne(const std::string& src, const char* name, const char* tar
 }
 
 bool FaldShadersReady() {
-    return g_statCS && g_statCombineCS && g_convCS && g_gainCS && g_blurCS && g_boostCS && g_faldPS && g_faldVS && g_faldSampler;
+    return g_statCS && g_convCS && g_gainCS && g_blurCS && g_boostCS && g_faldPS && g_faldVS && g_faldSampler;
 }
 
 bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
@@ -568,6 +569,11 @@ static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, 
 static bool EnsureStar(FaldMonitor* m) {
     if (m->starStatTex && m->starWTex && m->starPlanTex && m->starBgTex && m->starPlan2Tex) return true;
     if (m->starFailed || !StarShadersReady()) return false;
+    if (m->zoneSlices > 1 && !g_starStatCombineCS) {                  // zones of several slices: S0 needs its combine
+        m->starFailed = true;
+        LogF("FALD: pos(%d,%d) starfield combine shader unavailable - starfield stays off", m->left, m->top);
+        return false;
+    }
     ReleaseStar(m);
     const FaldPanelParams& p = m->params;
     const DXGI_FORMAT f = DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -588,6 +594,11 @@ static bool EnsureStar(FaldMonitor* m) {
 static bool EnsureGlow(FaldMonitor* m) {
     if (m->glowVTex && m->glowDilTex && m->glowCTex && m->glowEnvTex && m->glowKTex) return true;
     if (m->glowFailed || !GlowShadersReady()) return false;
+    if (m->zoneSlices > 1 && m->params.hasBoost && m->params.boostRule == FALD_BOOST_RULE_MEAN && !g_glowBandCombineCS) {
+        m->glowFailed = true;                                         // the band (G4) runs here and needs its combine
+        LogF("FALD: pos(%d,%d) glow band combine shader unavailable - glow fill stays off", m->left, m->top);
+        return false;
+    }
     ReleaseGlow(m);
     const FaldPanelParams& p = m->params;
     const UINT margin = 2u * HOOK_GLOW_REACH_MAX;
@@ -703,6 +714,11 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
     if (!MakeRWTexture(fw, fh, &m->flatTrueTex, &m->flatTrueUAV, &m->flatTrueSRV)) { log_to_file("FALD: flat B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatEstTex, &m->flatEstUAV, &m->flatEstSRV)) { log_to_file("FALD: flat B_est texture failed"); return false; }
     m->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
+    if (m->zoneSlices > FALD_ZONE_SLICES_MAX) {
+        LogF("FALD: zones of %ux%u px need %u sweep slices (max %u) - layer off", p.cellW, p.cellH, m->zoneSlices, FALD_ZONE_SLICES_MAX);
+        return false;
+    }
+    if (m->zoneSlices > 1 && !g_statCombineCS) { log_to_file("FALD: zone combine shader unavailable - layer off for this lattice"); return false; }
     if (m->zoneSlices > 1 && !MakeZonePartBuffer(p.cols * p.rows * m->zoneSlices, &m->zonePartBuf, &m->zonePartUAV)) {
         log_to_file("FALD: zone partials buffer failed"); return false;
     }

@@ -1073,12 +1073,28 @@ void main(uint3 tid : SV_GroupThreadID) {
 // Thread layout: one thread per (cell, sub-offset). A group is FALD_CONV_THREADS consecutive cells (row-major) of ONE
 // sub-offset (SV_GroupID.y), so all its threads read the SAME kernel tap at every step of the sum, and neighbouring
 // drive texels. The kernel table is sub * sub separate slices; the previous 16 x 16 block of the fine grid spanned 64
-// sub-offsets and so read 64 slices per step (2x slower on a 5090). Layout only: every output's terms, their order and
-// each operation are what they were (bit-identical, HW + WARP, 2026-09-22). A linear cell index wastes no lanes on a
-// lattice that is not a multiple of 16 (edge-lit strips, odd grids). Dispatch: FaldConvGroupsX(cols, rows) x sub * sub.
+// sub-offsets and so read 64 slices per step (2x slower on a 5090). A linear cell index wastes no lanes on a lattice
+// that is not a multiple of 16 (edge-lit strips, odd grids). Dispatch: FaldConvGroupsX(cols, rows) x sub * sub.
+// The loops run over the taps whose source cell lies on the lattice (the range is clamped once instead of testing
+// every tap) and issue four taps' loads before their four adds: the pass was bound by the latency of one load pair
+// per iteration (another 1.6x on a 5090). Layout and scheduling only: every output's terms, their ascending order
+// and each operation are what they were (bit-identical, HW + WARP, 2026-09-22).
 inline const char* g_faldConvSource = R"(
 RWTexture2D<float> bTrueOut : register(u0);
 RWTexture2D<float> bEstOut  : register(u1);
+
+// acc + the sum over i = i0 .. i1 (ascending) of dmap(cx - i, sy) * kt[kb + i]; kb = the slice row's index at i = 0.
+float ConvRow(Texture2D<float> dmap, Buffer<float> kt, int cx, int sy, uint kb, int i0, int i1, float acc) {
+    int i = i0;
+    [loop] for (; i + 3 <= i1; i += 4) {
+        float d0 = dmap.Load(int3(cx - i, sy, 0)),     d1 = dmap.Load(int3(cx - i - 1, sy, 0));
+        float d2 = dmap.Load(int3(cx - i - 2, sy, 0)), d3 = dmap.Load(int3(cx - i - 3, sy, 0));
+        float k0 = kt[kb + (uint)i], k1 = kt[kb + (uint)(i + 1)], k2 = kt[kb + (uint)(i + 2)], k3 = kt[kb + (uint)(i + 3)];
+        acc += d0 * k0; acc += d1 * k1; acc += d2 * k2; acc += d3 * k3;
+    }
+    [loop] for (; i <= i1; i++) acc += dmap.Load(int3(cx - i, sy, 0)) * kt[kb + (uint)i];
+    return acc;
+}
 
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
@@ -1088,24 +1104,21 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     int cx = (int)(cell % cols), cy = (int)(cell / cols);
     uint fx = (uint)cx * sub + so % sub, fy = (uint)cy * sub + so / sub;
 
+    // taps whose source cell sx = cx - i, sy = cy - j lies on the lattice (zero outside it: those terms are absent)
+    int RC = (int)reachTrueC, RR = (int)reachTrueR;
     uint Wt = 2 * reachTrueC + 1, Ht = 2 * reachTrueR + 1;
+    int i0 = max(-RC, cx - (int)cols + 1), i1 = min(RC, cx);
+    int j0 = max(-RR, cy - (int)rows + 1), j1 = min(RR, cy);
     float accT = 0.0f;
-    for (int j = -(int)reachTrueR; j <= (int)reachTrueR; j++) {
-        int sy = cy - j; if (sy < 0 || sy >= (int)rows) continue;
-        for (int i = -(int)reachTrueC; i <= (int)reachTrueC; i++) {
-            int sx = cx - i; if (sx < 0 || sx >= (int)cols) continue;
-            accT += driveTex.Load(int3(sx, sy, 0)) * kTrue[(so * Ht + (uint)(j + (int)reachTrueR)) * Wt + (uint)(i + (int)reachTrueC)];
-        }
-    }
+    [loop] for (int j = j0; j <= j1; j++)
+        accT = ConvRow(driveTex, kTrue, cx, cy - j, (so * Ht + (uint)(j + RR)) * Wt + (uint)RC, i0, i1, accT);
+    int EC = (int)reachEstC, ER = (int)reachEstR;
     uint We = 2 * reachEstC + 1, He = 2 * reachEstR + 1;
+    int e0 = max(-EC, cx - (int)cols + 1), e1 = min(EC, cx);
+    int f0 = max(-ER, cy - (int)rows + 1), f1 = min(ER, cy);
     float accE = 0.0f;
-    for (int j2 = -(int)reachEstR; j2 <= (int)reachEstR; j2++) {
-        int sy = cy - j2; if (sy < 0 || sy >= (int)rows) continue;
-        for (int i2 = -(int)reachEstC; i2 <= (int)reachEstC; i2++) {
-            int sx = cx - i2; if (sx < 0 || sx >= (int)cols) continue;
-            accE += driveEstTex.Load(int3(sx, sy, 0)) * kEst[(so * He + (uint)(j2 + (int)reachEstR)) * We + (uint)(i2 + (int)reachEstC)];
-        }
-    }
+    [loop] for (int j2 = f0; j2 <= f1; j2++)
+        accE = ConvRow(driveEstTex, kEst, cx, cy - j2, (so * He + (uint)(j2 + ER)) * We + (uint)EC, e0, e1, accE);
     if (boostN != 0u) accT *= boostTex.Load(int3(0, 0, 0));
     bTrueOut[uint2(fx, fy)] = accT;
     bEstOut[uint2(fx, fy)] = accE;
@@ -1125,10 +1138,11 @@ inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
 // the glow band G4 dispatch cols x rows x FaldZoneSlices(cellW, cellH) groups; with more than one slice per zone the
 // pass's combine variant (its source compiled after g_faldZoneCombineDefine) follows over cols x rows. The partials: one
 // structured buffer per monitor of cols * rows * slices ZonePart records, bound at u2. A 1-slice lattice has no buffer
-// and runs neither the partial write nor the combine. Slices stay far inside D3D11's 65535 groups per dimension (a
-// 7680 x 4320 frame as one zone = 8100).
+// and runs neither the partial write nor the combine. A lattice needing more than FALD_ZONE_SLICES_MAX (D3D11's 65535
+// groups per dimension) is refused at build; real frames stay far below (a 7680 x 4320 frame as one zone = 8100).
 static const unsigned int FALD_ZONE_SLICE_PX = 4096u;     // = the HLSL's FALD_ZONE_SLICE_PX
 static const unsigned int FALD_ZONE_PART_BYTES = 32u;     // = the HLSL's ZonePart (float4 + uint4)
+static const unsigned int FALD_ZONE_SLICES_MAX = 65535u;  // D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION
 inline const char* g_faldZoneCombineDefine = "#define FALD_ZONE_COMBINE 1\n";
 inline unsigned int FaldZoneSlices(unsigned int cellW, unsigned int cellH) {
     return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX;

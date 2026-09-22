@@ -28,7 +28,8 @@ static ID3D11ComputeShader* g_faldGlowErodeCS = nullptr;  // G2: box minimum = t
 static ID3D11ComputeShader* g_faldGlowEnvCS = nullptr;    // G3: blur under the closing + the zone deficit
 static ID3D11ComputeShader* g_faldGlowBandCS = nullptr;   // G4: the count-threshold band's zone scale (round 0, mean-rule files)
 // The zone sweeps' combine variants (work guide C14; fald_shader.h above ZoneSlices): run only for a lattice whose zones
-// hold more than FALD_ZONE_SLICE_PX pixels, after the sliced pass, to fold its partials and finish each zone.
+// hold more than FALD_ZONE_SLICE_PX pixels, after the sliced pass, to fold its partials and finish each zone. Optional:
+// a compile failure costs only the lattices that need them (Build / EnsureStar / EnsureGlow refuse those).
 static ID3D11ComputeShader* g_faldStatCombineCS = nullptr;
 static ID3D11ComputeShader* g_faldStarStatCombineCS = nullptr;
 static ID3D11ComputeShader* g_faldGlowBandCombineCS = nullptr;
@@ -174,10 +175,10 @@ bool InitFaldShaders() {
             { g_faldStarStatSource, "FaldStarStatCombineCS", &g_faldStarStatCombineCS },
             { g_faldGlowBandSource, "FaldGlowBandCombineCS", &g_faldGlowBandCombineCS } };
         for (auto& z : zc) {
-            if (!CompileOne(combine + z.src, z.name, "cs_5_0", &b)) return false;
+            if (!CompileOne(combine + z.src, z.name, "cs_5_0", &b)) continue;   // logged; lattices of one-slice zones don't need it
             hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, z.cs);
             b->Release(); b = nullptr;
-            if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(" << z.name << ") failed" << std::endl; return false; }
+            if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(" << z.name << ") failed" << std::endl; *z.cs = nullptr; }
         }
     }
     if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
@@ -218,8 +219,7 @@ void ReleaseFaldShaders() {
 bool FaldShadersReady() {
     return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldPanelClockCS && g_faldBoostCS &&
            g_faldStarStatCS && g_faldStarWeightCS && g_faldStarPlanCS &&
-           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldPS && g_faldSampler &&
-           g_faldStatCombineCS && g_faldStarStatCombineCS && g_faldGlowBandCombineCS;
+           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldPS && g_faldSampler;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -311,6 +311,7 @@ static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11Unordered
 
 // The five cols x rows RGBA32F textures of the starfield balancing (created on the first frame the option is on).
 static bool EnsureStar(FaldResources* r) {
+    if (r->zoneSlices > 1 && !g_faldStarStatCombineCS) return false;   // zones of several slices: S0 needs its combine
     if (r->starStatTex && r->starWTex && r->starPlanTex && r->starBgTex && r->starPlan2Tex) return true;
     // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
     if (r->starRetryCounter != 0 && (r->starRetryCounter++ % 300) != 0) return false;
@@ -338,6 +339,7 @@ static bool EnsureStar(FaldResources* r) {
 // lattice extended by FALD_GLOW_REACH_MAX on every side, the closing, (Ez, Dz, Cz, Vz) for the pixels, and the
 // count-threshold band's scale k.
 static bool EnsureGlow(FaldResources* r) {
+    if (r->zoneSlices > 1 && FaldGlowBandActive(r->params) && !g_faldGlowBandCombineCS) return false;   // G4 needs its combine
     if (r->glowVTex && r->glowDilTex && r->glowCTex && r->glowEnvTex && r->glowKTex) return true;
     // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
     if (r->glowRetryCounter != 0 && (r->glowRetryCounter++ % 300) != 0) return false;
@@ -478,6 +480,8 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
     r->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
+    if (r->zoneSlices > FALD_ZONE_SLICES_MAX) { r->lastError = "zones too large to sweep (slices > 65535)"; r->refusedByFile = true; return false; }
+    if (r->zoneSlices > 1 && !g_faldStatCombineCS) { r->lastError = "zone combine shader unavailable"; return false; }
     if (r->zoneSlices > 1 && !MakeZonePartBuffer(p.cols * p.rows * r->zoneSlices, &r->zonePartBuf, &r->zonePartUAV)) {
         r->lastError = "zone partials buffer"; return false;
     }
@@ -810,7 +814,7 @@ static void RunTemporal(FaldResources* r, ID3D11ShaderResourceView* inDrive) {
 
 // Pass 1c (temporal mode 3, valid state only): the two parity clocks advance in place toward the previous frame's
 // round-1 drives (t4 = clkPrev) by the CB's blend factors; u0 / u1 receive the maps the kernels see in both rounds.
-// Binds only what it reads (like RunStar); the states' UAV slots are cleared here (UnbindCompute knows two).
+// Binds only what it reads (like RunStar); the states' UAV slots are cleared here (UnbindCompute clears three).
 static void RunPanelClock(FaldResources* r) {
     const FaldPanelParams& p = r->params;
     FillCB(r, 0);

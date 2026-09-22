@@ -52,8 +52,32 @@ def test_conv_group_is_one_sub_offset_and_the_fine_texel_matches_the_kernel_slic
     assert "uint so = gid.y;" in conv
     assert "int cx = (int)(cell % cols), cy = (int)(cell / cols);" in conv
     assert "uint fx = (uint)cx * sub + so % sub, fy = (uint)cy * sub + so / sub;" in conv
-    assert "kTrue[(so * Ht + " in conv and "kEst[(so * He + " in conv
+    # the kernel row of slice `so` at tap row j: index (so * H + j + R) * W + R + i, as the table is laid out
+    assert "accT = ConvRow(driveTex, kTrue, cx, cy - j, (so * Ht + (uint)(j + RR)) * Wt + (uint)RC, i0, i1, accT);" in conv
+    assert "accE = ConvRow(driveEstTex, kEst, cx, cy - j2, (so * He + (uint)(j2 + ER)) * We + (uint)EC, e0, e1, accE);" in conv
     assert "bTrueOut[uint2(fx, fy)] = accT;" in conv and "bEstOut[uint2(fx, fy)] = accE;" in conv
+
+
+def test_conv_sums_exactly_the_on_lattice_taps_in_ascending_order():
+    """The reference (the pre-2026-09-22 loop): j, then i, ascending over -R..R, skipping taps whose source cell
+    sx = cx - i, sy = cy - j lies off the lattice. The clamped ranges must be exactly those taps, and ConvRow must add
+    them in that order (four loads in flight, the adds one after the other)."""
+    conv = _part(_SHADER.read_text(encoding="utf-8"), "g_faldConvSource")
+    for lo, hi in (("int i0 = max(-RC, cx - (int)cols + 1), i1 = min(RC, cx);", "int j0 = max(-RR, cy - (int)rows + 1), j1 = min(RR, cy);"),
+                   ("int e0 = max(-EC, cx - (int)cols + 1), e1 = min(EC, cx);", "int f0 = max(-ER, cy - (int)rows + 1), f1 = min(ER, cy);")):
+        assert lo in conv and hi in conv
+    assert "[loop] for (int j = j0; j <= j1; j++)" in conv and "[loop] for (int j2 = f0; j2 <= f1; j2++)" in conv
+    row = conv[conv.index("float ConvRow("): conv.index("[numthreads(")]
+    assert "acc += d0 * k0; acc += d1 * k1; acc += d2 * k2; acc += d3 * k3;" in row
+    assert "float d0 = dmap.Load(int3(cx - i, sy, 0)),     d1 = dmap.Load(int3(cx - i - 1, sy, 0));" in row
+    assert "float k0 = kt[kb + (uint)i], k1 = kt[kb + (uint)(i + 1)], k2 = kt[kb + (uint)(i + 2)], k3 = kt[kb + (uint)(i + 3)];" in row
+    assert "[loop] for (; i <= i1; i++) acc += dmap.Load(int3(cx - i, sy, 0)) * kt[kb + (uint)i];" in row
+    # the clamp reproduces the skipped taps exactly, for every cell of small and odd lattices
+    for cols in (1, 3, 8, 48):
+        for R in (0, 1, 6, 17, 64):
+            for cx in range(cols):
+                ref = [i for i in range(-R, R + 1) if 0 <= cx - i < cols]
+                assert ref == list(range(max(-R, cx - cols + 1), min(R, cx) + 1))
 
 
 @pytest.mark.parametrize("path", [_OVERLAY, _HOOK], ids=["overlay", "hook"])
@@ -132,3 +156,5 @@ def test_both_paths_dispatch_the_slices_and_run_the_combine(path, v):
                          ("g_faldGlowBandSource", "GlowBandCombineCS")):
         assert re.search(re.escape(src) + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from {src}"
     assert f"SafeRelease({v}->zonePartUAV); SafeRelease({v}->zonePartBuf);" in c
+    assert f"if ({v}->zoneSlices > FALD_ZONE_SLICES_MAX)" in c                            # a slice grid D3D11 cannot dispatch
+    assert "static const unsigned int FALD_ZONE_SLICES_MAX = 65535u;" in _SHADER.read_text(encoding="utf-8")

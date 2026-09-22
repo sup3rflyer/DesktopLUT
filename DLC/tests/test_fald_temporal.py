@@ -282,7 +282,8 @@ def test_hlsl_temporal_pass_mirrors_the_reference():
     assert "driveFiltOut[id.xy] = s + a * (d - s);" in body
     assert "stateTex.Load" in body and "driveTex.Load" in body
     conv = re.search(r'g_faldConvSource = R"\((.*?)\)";', src, re.S).group(1)
-    assert "driveTex.Load" in conv and "driveEstTex.Load" in conv                       # true / est kernels on their own maps
+    assert "ConvRow(driveTex, kTrue," in conv and "ConvRow(driveEstTex, kEst," in conv    # true / est kernels on their own maps
+    assert "ConvRow(driveTex, kEst" not in conv and "ConvRow(driveEstTex, kTrue" not in conv
     assert "register(t10)" in src and "register(t11)" in src
 
 

@@ -1415,7 +1415,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	  }
 	  catch (...) {
 		// Cleanup on exception — prevent stale bindings on DWM's device context.
-		// The ranges cover the FALD passes too (t0-t24, u0-u1): a stale shader resource hands DWM's
+		// The ranges cover the FALD passes too (t0-t24, u0-u3): a stale shader resource hands DWM's
 		// own shaders a wrong texture, and a stale unordered-access view hands them a GPU fault.
 		ID3D11ShaderResourceView* nullSRVs[HOOK_FALD_SRV_SLOTS] = {};
 		deviceContext->PSSetShaderResources(0, HOOK_FALD_SRV_SLOTS, nullSRVs);
@@ -1444,7 +1444,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	// may misinterpret if it reads from its own (larger) constant buffer at b0.
 	{
 		// t0-t5 and s0-s2 are the LUT/tonemap pass's own; the wider ranges cover the FALD passes,
-		// which bind t0-t24 and u0-u1. Clearing them unconditionally costs a few calls per present
+		// which bind t0-t24 and u0-u3. Clearing them unconditionally costs a few calls per present
 		// and removes a whole class of "DWM rendered with our resource still bound" failure.
 		ID3D11ShaderResourceView* nullSRVs[HOOK_FALD_SRV_SLOTS] = {};
 		deviceContext->PSSetShaderResources(0, HOOK_FALD_SRV_SLOTS, nullSRVs);
