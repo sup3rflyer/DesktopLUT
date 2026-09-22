@@ -30,7 +30,9 @@ from dlc.fald.profile import params_dict, params_from_dict  # noqa: E402
 
 _DLC = Path(__file__).resolve().parents[1]
 _SRC = _DLC.parent / "src"
-_SHADER = _SRC / "fald_shader.h"
+_SHADER = _SRC.parent / "shared" / "fald_shader.h"   # shared by the overlay and the DWM hook since e7f542f
+_SHARED = _SRC.parent / "shared"                      # fald_panel.{h,cpp}: CB size, boost-rule constants, the loader (e7f542f)
+_HOOK = _SRC.parent / "dwm_hook" / "hook_fald.cpp"    # the DWM hook's FillCB: CB-word for CB-word the overlay's
 _INSIDE = _DLC / "results" / "fald_inside_2026-09-18"
 GAMMA, THRESH = 0.62, 0.0693
 ZW, ZH = 80, 45
@@ -404,13 +406,18 @@ def test_hlsl_and_cpp_carry_the_zone_rule():
     assert stat.count("if (boostN != 0u)") == 2                     # no LUT: neither summed nor written
     for other in ("g_faldConvSource", "g_faldBoostSource", "g_faldPixelSource", "g_faldGainSource", "g_faldTemporalSource"):
         assert "boostRule" not in part(other) and "boostMean" not in part(other)
-    h = (_SRC / "fald.h").read_text(encoding="utf-8")
+    # the constants, FaldPanelParams and the loader live in shared/fald_panel.{h,cpp} since e7f542f (one parser for the
+    # overlay and the DWM hook); FillCB and the dump stay in src/fald.cpp, the hook's FillCB writes the same words
+    h = (_SHARED / "fald_panel.h").read_text(encoding="utf-8")
+    loader = (_SHARED / "fald_panel.cpp").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
+    hook = _HOOK.read_text(encoding="utf-8")
     assert "FALD_CB_BYTES = 336" in h and "FALD_BOOST_RULE_DIM = 0;" in h and "FALD_BOOST_RULE_MEAN = 1;" in h
     assert "float boostMeanGamma = 0.62f, boostMeanThresh = 0.0693f;" in h            # = FaldParams / panelfile defaults
     assert "u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;" in c
-    assert "FALD_BOOST_WORD_RULE = 53;" in c and "unknown boost zone rule" in c and "implausible boost mean-rule words" in c
-    assert "!(meanGamma > 0.0f && meanGamma <= 4.0f) || !(meanThresh > 0.0f && std::isfinite(meanThresh))" in c
+    assert "u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;" in hook
+    assert "FALD_BOOST_WORD_RULE = 53;" in loader and "unknown boost zone rule" in loader and "implausible boost mean-rule words" in loader
+    assert "!(meanGamma > 0.0f && meanGamma <= 4.0f) || !(meanThresh > 0.0f && std::isfinite(meanThresh))" in loader
     for key in ("boost_rule ", "boost_mean_gamma ", "boost_mean_thresh "):
         assert "\\n" + key in c                                     # fald_dump.txt
     t = (_SRC.parent / "tests" / "test_fald.cpp").read_text(encoding="utf-8")

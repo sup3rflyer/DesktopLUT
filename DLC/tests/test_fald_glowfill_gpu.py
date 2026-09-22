@@ -22,7 +22,9 @@ from dlc.fald.model import FaldModel, FaldParams  # noqa: E402
 from dlc.fald.panelfile import read_panel_file  # noqa: E402
 
 _SRC = Path(__file__).resolve().parents[2] / "src"
-_SHADER = _SRC / "fald_shader.h"
+_SHADER = _SRC.parent / "shared" / "fald_shader.h"   # shared by the overlay and the DWM hook since e7f542f
+_SHARED = _SRC.parent / "shared"                      # fald_panel.{h,cpp}: CB size, request ceiling (e7f542f)
+_HOOK = _SRC.parent / "dwm_hook"                      # hook_fald.{h,cpp}: the DWM hook's passes, pass for pass the overlay's
 WHITE = 1846.0
 HOLE = (5, 5)
 
@@ -271,18 +273,24 @@ def test_hlsl_glow_passes_mirror_the_reference():
     assert "float e = min(acc / wsum, c);" in g3
     assert "d *= smoothstep(FALD_GLOW_DEFICIT_REL_LO, FALD_GLOW_DEFICIT_REL_HI, d / max(v, 1e-12f));" in g3
     assert "glowEnvOut[id.xy] = float4(e, d, c, v);" in g3
-    # C++: limits, the request ceiling, the pass order (after EACH round's conv + gain), defaults
+    # C++: limits, the request ceiling, the pass order (after EACH round's conv + gain), defaults. The request ceiling
+    # (FALD_GLOW_REQ_*, FaldGlowReqCeil) and FALD_CB_BYTES live with the panel file in shared/fald_panel.{h,cpp} since
+    # e7f542f (both paths write CB word 79); the overlay's limits, switches and passes stay in src/fald.{h,cpp}.
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     t = (_SRC / "types.h").read_text(encoding="utf-8")
+    ph = (_SHARED / "fald_panel.h").read_text(encoding="utf-8")
+    pc = (_SHARED / "fald_panel.cpp").read_text(encoding="utf-8")
     assert f"FALD_GLOW_REACH_MIN = {glowfill.REACH_MIN};" in h and f"FALD_GLOW_REACH_MAX = {glowfill.REACH_MAX};" in h
     assert f"FALD_GLOW_CAP_MIN = {glowfill.CAP_MIN}f;" in h and f"FALD_GLOW_CAP_MAX = {glowfill.CAP_MAX}f;" in h
-    assert f"FALD_GLOW_REQ_FLOOR_FRAC = {glowfill.REQ_FLOOR_FRAC}f;" in h and f"FALD_GLOW_REQ_LIT_FRAC = {glowfill.REQ_LIT_FRAC}f;" in h
-    assert "FALD_CB_BYTES = 336" in h
-    assert "float c = FALD_GLOW_REQ_FLOOR_FRAC * p.driveFloor;" in c and "const float lit = FALD_GLOW_REQ_LIT_FRAC * p.boostLitNits; if (lit < c) c = lit;" in c
+    assert f"FALD_GLOW_REQ_FLOOR_FRAC = {glowfill.REQ_FLOOR_FRAC}f;" in ph and f"FALD_GLOW_REQ_LIT_FRAC = {glowfill.REQ_LIT_FRAC}f;" in ph
+    assert "FALD_CB_BYTES = 336" in ph
+    ceil = re.search(r"float FaldGlowReqCeil\(const FaldPanelParams& p\) \{(.*?)\n\}", pc, re.S).group(1)
+    assert "float c = FALD_GLOW_REQ_FLOOR_FRAC * p.driveFloor;" in ceil and "const float lit = FALD_GLOW_REQ_LIT_FRAC * p.boostLitNits; if (lit < c) c = lit;" in ceil
     assert "bool FaldGlowSupported(const FaldPanelParams& p) { return p.transfer == FALD_TRANSFER_PQ; }" in c
     assert "bool FaldGlowBandActive(const FaldPanelParams& p) { return p.hasBoost && p.boostRule == FALD_BOOST_RULE_MEAN; }" in c
-    assert "if (gs.enabled && FaldGlowSupported(r->params)) r->glowOn = EnsureGlow(r);" in c
+    # glow fill runs only while starfield balancing runs (one feature since acb94f5, overlay and hook alike)
+    assert "if (gs.enabled && r->starOn && FaldGlowSupported(r->params)) r->glowOn = EnsureGlow(r);" in c
     assert "r->glowBand = r->glowOn && FaldGlowBandActive(r->params);" in c
     assert re.search(r"if \(r->glowBand\) \{\s+g_context->CSSetShader\(g_faldGlowBandCS, nullptr, 0\);", c)   # EVERY round
     assert 'if (p == L"SDR_") gl.enabled = false;' in (_SRC / "settings.cpp").read_text(encoding="utf-8")
@@ -304,3 +312,17 @@ def test_hlsl_glow_passes_mirror_the_reference():
            run.index("if (r->glowOn) RunGlow(r, 1);"), run.index("r->framesRun++;")]
     assert seq == sorted(seq)
     assert "r->glowOn ? r->glowEnvSRV : nullptr" in c and "r->glowBand ? r->glowKSRV : nullptr" in c and "FALD_SRV_SLOTS = 25;" in c
+    # ... and the DWM hook runs the same fill (acb94f5): the band rule (FaldGlowBandActive, inlined), the band pass EVERY
+    # round, the fill after each round's conv + gain, the same t23 / t24 bindings, the same dilation margin and slot count
+    hk = (_HOOK / "hook_fald.cpp").read_text(encoding="utf-8")
+    assert "m->glowBand = m->glowOn && m->params.hasBoost && m->params.boostRule == FALD_BOOST_RULE_MEAN;" in hk
+    assert re.search(r"if \(m->glowBand\) \{\s+g_ctx->CSSetShader\(g_glowBandCS, nullptr, 0\);", hk)
+    hrun = hk[hk.index("bool FaldRun("):]
+    g0 = hrun.index("if (m->glowOn) RunGlow(m);")
+    hseq = [hrun.index("RunConv(m, trueDrive, estDrive, m->boostSRV[0]);"), g0, hrun.index("RunStat(m, 1);"),
+            hrun.index("RunConv(m, trueDrive, estDrive, m->boostSRV[1]);"), hrun.index("if (m->glowOn) RunGlow(m);", g0 + 1),
+            hrun.index("m->framesRun++;")]
+    assert hseq == sorted(hseq) and hrun.count("RunGlow(m)") == 2
+    assert "m->glowOn ? m->glowEnvSRV : nullptr" in hk and "m->glowBand ? m->glowKSRV : nullptr" in hk
+    assert f"HOOK_GLOW_REACH_MAX = {glowfill.REACH_MAX}u;" in hk
+    assert "#define HOOK_FALD_SRV_SLOTS 25" in (_HOOK / "hook_fald.h").read_text(encoding="utf-8")

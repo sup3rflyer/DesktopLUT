@@ -21,7 +21,9 @@ from dlc.fald.panelfile import read_panel_file  # noqa: E402
 from dlc.fald.starfield import StarfieldParams, _bilinear_zones, balance_image  # noqa: E402
 
 _SRC = Path(__file__).resolve().parents[2] / "src"
-_SHADER = _SRC / "fald_shader.h"
+_SHADER = _SRC.parent / "shared" / "fald_shader.h"   # shared by the overlay and the DWM hook since e7f542f
+_SHARED = _SRC.parent / "shared"                      # fald_panel.h: FALD_CB_BYTES (e7f542f)
+_HOOK = _SRC.parent / "dwm_hook" / "hook_fald.cpp"    # the DWM hook's passes, pass for pass the overlay's (src/fald.cpp)
 DIM, WHITE = 100.0, 1846.0
 
 
@@ -830,8 +832,15 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert c.index("if (r->starOn) RunStar(r);") < c.index("RunStat(r, 0);")
     assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 25" in c   # t20-t24: the glow fill (S2)
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 336" in h                                                               # 80 words since S2 (glow fill)
+    assert "FALD_CB_BYTES = 336" in (_SHARED / "fald_panel.h").read_text(encoding="utf-8")        # 84 words since S2 (glow fill)
     assert f"FALD_STAR_EVEN_REACH_MAX = {gpuemu.STAR_EVEN_REACH_MAX}" in h and f"FALD_STAR_REACH_MAX = {gpuemu.STAR_REACH_MAX}" in h
+    # ... and the DWM hook (acb94f5): the same order, the same t15 / t18 bindings, the same reach limits
+    hk = _HOOK.read_text(encoding="utf-8")
+    hrun = hk[hk.index("bool FaldRun("):]
+    assert hrun.index("if (m->starOn) RunStar(m);") < hrun.index("RunStat(m, 0);")
+    assert "m->starOn ? m->starPlanSRV : nullptr" in hk and "m->starOn ? m->starPlan2SRV : nullptr" in hk
+    assert f"if (t.starReach > {gpuemu.STAR_REACH_MAX}u) t.starReach = {gpuemu.STAR_REACH_MAX}u;" in hk
+    assert f"if (t.starEvenReach > {gpuemu.STAR_EVEN_REACH_MAX}u) t.starEvenReach = {gpuemu.STAR_EVEN_REACH_MAX}u;" in hk
 
 
 def test_every_reference_parameter_reaches_the_emulator():

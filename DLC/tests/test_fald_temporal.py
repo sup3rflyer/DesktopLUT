@@ -13,7 +13,7 @@ from dlc.fald import temporal as T
 from dlc.fald.correct import correct_image
 from dlc.fald.model import FaldModel, FaldParams
 
-_SHADER = Path(__file__).resolve().parents[2] / "src" / "fald_shader.h"
+_SHADER = Path(__file__).resolve().parents[2] / "shared" / "fald_shader.h"   # since e7f542f
 DT = 1000.0 / 60.0
 
 

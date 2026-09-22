@@ -53,7 +53,10 @@ def test_export_refuses_a_gamma_outside_the_loader_gate(tmp_path):
         export_panel_params(FaldModel(_params(transfer="nonsense")), tmp_path / "bad2.bin")
 
 
-_SHADER = Path(__file__).resolve().parents[2] / "src" / "fald_shader.h"
+_SHADER = Path(__file__).resolve().parents[2] / "shared" / "fald_shader.h"   # since e7f542f
+_SRC = _SHADER.parents[1] / "src"                      # the overlay path: fald.{h,cpp} (FillCB, StarCB), types.h
+_PANEL_H = _SHADER.parent / "fald_panel.h"             # FALD_CB_BYTES (shared with the hook since e7f542f)
+_HOOK = _SHADER.parents[1] / "dwm_hook" / "hook_fald.cpp"   # the DWM hook's FillCB: CB-word for CB-word the overlay's
 
 
 def test_srgb_transfer_round_trips():
@@ -99,8 +102,8 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert fields[35] == "starOn" and fields[52:64] == ["starEven", "starLift", "starTargetGain", "starCapNits", "starStrength",
                                                         "starAreaLo", "starAreaHi", "starPeakHi", "starNbLo", "starNbHi",
                                                         "starReach", "starEvenReach"]
-    # ... and FillCB writes them at those words, uint where the HLSL says uint
-    cpp = (_SHADER.parent / "fald.cpp").read_text(encoding="utf-8")
+    # ... and FillCB writes them at those words, uint where the HLSL says uint (the overlay's, src/fald.cpp) ...
+    cpp = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     assert "u[35] = r->starOn ? 1u : 0u;" in cpp
     assert "f[52] = sc.even; f[53] = sc.lift; f[54] = sc.targetGain; f[55] = sc.capNits;" in cpp
     assert "f[56] = sc.strength; f[57] = sc.areaLo; f[58] = sc.areaHi; f[59] = sc.peakHi;" in cpp
@@ -111,6 +114,18 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "u[75] = r->glowOn ? 1u : 0u;" in cpp
     assert "f[76] = r->glow.strength; f[77] = r->glow.capNits; u[78] = r->glow.reach; f[79] = FaldGlowReqCeil(p);" in cpp
     assert "u[80] = r->glowBand ? 1u : 0u;" in cpp
+    # ... and the DWM hook's (dwm_hook/hook_fald.cpp; its starfield / glow settings come from the tuning tail `t`)
+    hook = _HOOK.read_text(encoding="utf-8")
+    assert "u[35] = m->starOn ? 1u : 0u;" in hook
+    assert "f[52] = t.starEven; f[53] = t.starLift; f[54] = t.starTargetGain; f[55] = t.starCapNits;" in hook
+    assert "f[56] = t.starStrength; f[57] = t.starAreaLo; f[58] = t.starAreaHi; f[59] = t.starPeakHi;" in hook
+    assert "f[60] = t.starNbLo; f[61] = t.starNbHi; u[62] = t.starReach; u[63] = t.starEvenReach;" in hook
+    assert "f[64] = t.starTargetSigma; f[65] = t.starKeepNits;" in hook
+    assert "f[66] = m->clkW[0]; f[67] = m->clkW[1];" in hook
+    assert "f[68] = m->clkFactor[0]; f[69] = m->clkFactor[1]; f[70] = m->clkFactor[2]; f[71] = m->clkFactor[3];" in hook
+    assert "u[75] = m->glowOn ? 1u : 0u;" in hook
+    assert "f[76] = t.glowStrength; f[77] = t.glowCapNits; u[78] = t.glowReach; f[79] = FaldGlowReqCeil(p);" in hook
+    assert "u[80] = m->glowBand ? 1u : 0u;" in hook
     decl = re.search(r"float starNbLo; float starNbHi; (\w+) starReach; (\w+) starEvenReach;", cb)
     assert decl.groups() == ("uint", "uint")
 
@@ -124,7 +139,7 @@ def test_starfield_defaults_and_smoothstep_constants_match_the_cpp_and_hlsl_sour
     from dlc.fald.starfield import StarfieldParams
     sp = StarfieldParams()
     src = _SHADER.read_text(encoding="utf-8")
-    types_h = (_SHADER.parent / "types.h").read_text(encoding="utf-8")
+    types_h = (_SRC / "types.h").read_text(encoding="utf-8")
     body = re.search(r"struct FaldStarfieldSettings \{(.*?)\n\};", types_h, re.S).group(1)
     got = {k: v for k, v in re.findall(r"(?:bool|float|unsigned int) (\w+) = ([\w.]+?)f?;", body)}
     assert got.pop("enabled") == "false"                                            # experimental: default OFF
@@ -132,7 +147,7 @@ def test_starfield_defaults_and_smoothstep_constants_match_the_cpp_and_hlsl_sour
             "capNits": sp.cap_nits, "strength": sp.strength, "areaLo": sp.area_lo, "areaHi": sp.area_hi,
             "peakHi": sp.peak_hi, "reach": sp.reach, "nbLo": sp.nb_lo, "nbHi": sp.nb_hi}
     assert {k: float(v) for k, v in got.items()} == {k: float(v) for k, v in want.items()}
-    fald_h = (_SHADER.parent / "fald.h").read_text(encoding="utf-8")
+    fald_h = (_SRC / "fald.h").read_text(encoding="utf-8")
     star_cb = re.search(r"struct StarCB \{(.*?)\} star;", fald_h, re.S).group(1)
     got_cb = {k: float(v) for k, v in re.findall(r"(\w+) = ([\d.]+)f?[,;]", star_cb)}
     assert got_cb == {k: float(v) for k, v in want.items()}
@@ -160,7 +175,7 @@ def test_starfield_defaults_and_smoothstep_constants_match_the_cpp_and_hlsl_sour
     assert np.array_equal(gpuemu.star_smooth(1.0, 1.0, x), starfield._smoothstep(1.0, 1.0, x))   # lo == hi: a step, no NaN
     # the limits of the two reaches and the INI / pipe ranges
     assert f"FALD_STAR_EVEN_REACH_MAX = {gpuemu.STAR_EVEN_REACH_MAX}" in fald_h and f"FALD_STAR_REACH_MAX = {gpuemu.STAR_REACH_MAX}" in fald_h
-    cpp = (_SHADER.parent / "fald.cpp").read_text(encoding="utf-8")
+    cpp = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     assert (sp.even, sp.target_sigma, sp.keep_nits) == (0.8, 0.0, 100.0)             # the round-7 defaults: geometric mean + the absolute floor
     from dlc.desktoplut_mock import _FALD_STAR_DEFAULTS
     assert {k: float(v) for k, v in _FALD_STAR_DEFAULTS.items() if k != "enabled"} == \
@@ -252,11 +267,15 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
     src = _SHADER.read_text(encoding="utf-8")
     src = re.sub(r'\)"\s*/\*.*?\*/\s*R"\(', "", src, flags=re.S)           # the seam between adjacent C++ literals
     part = lambda name: re.search(name + r' = R"\((.*?)\)";', src, re.S).group(1)
-    cpp = (_SHADER.parent / "fald.cpp").read_text(encoding="utf-8")
+    cpp = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     fill = re.search(r"static void FillCB\(.*?\n\}", cpp, re.S).group(0)
     written = {int(i): k for k, i in re.findall(r"\b([uf])\[(\d+)\]\s*=", fill)}     # word index -> 'u' (uint32) / 'f' (float)
-    cb_bytes = int(re.search(r"FALD_CB_BYTES = (\d+);", (_SHADER.parent / "fald.h").read_text(encoding="utf-8")).group(1))
+    cb_bytes = int(re.search(r"FALD_CB_BYTES = (\d+);", _PANEL_H.read_text(encoding="utf-8")).group(1))
     assert sorted(written) == list(range(cb_bytes // 4))                                # FillCB writes EVERY word, none twice as another type
+    # the DWM hook's FillCB fills the same cbuffer: every word, each as the same type as the overlay's
+    hook_fill = re.search(r"static void FillCB\(.*?\n\}", _HOOK.read_text(encoding="utf-8"), re.S).group(0)
+    hook_written = {int(i): k for k, i in re.findall(r"\b([uf])\[(\d+)\]\s*=", hook_fill)}
+    assert sorted(hook_written) == list(range(cb_bytes // 4)) and hook_written == written
     # the word each HLSL name must sit at = where FillCB puts that quantity (semantic pairs, spot-checked by name)
     named = {"frameW": 0, "rows": 3, "roundIdx": 7, "curveN": 12, "white": 13, "area0": 15, "gainMin": 19, "driveFloor": 21,
              "debugMode": 24, "originX": 25, "blurDir": 27, "transfer": 31, "lumFadeLo": 32, "boostN": 34, "starOn": 35,

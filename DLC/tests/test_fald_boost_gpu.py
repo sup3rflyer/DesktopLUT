@@ -20,7 +20,9 @@ from dlc.fald.model import FaldModel, FaldParams  # noqa: E402
 from dlc.fald.panelfile import boost_of_count, boost_zone_threshold, cb, read_panel_file  # noqa: E402
 
 _SRC = Path(__file__).resolve().parents[2] / "src"
-_SHADER = _SRC / "fald_shader.h"
+_SHADER = _SRC.parent / "shared" / "fald_shader.h"   # shared by the overlay and the DWM hook since e7f542f
+_SHARED = _SRC.parent / "shared"                      # fald_panel.{h,cpp}: CB size, file constants, the loader (e7f542f)
+_HOOK = _SRC.parent / "dwm_hook" / "hook_fald.cpp"    # the DWM hook's passes, pass for pass the overlay's (src/fald.cpp)
 
 # The measured PA32UCXR staircase (results/fald_inside_2026-09-18/boost_table.json; results/ is local-only, so the
 # table is repeated here): N <= 37 -> 1.178, <= 145 -> 1.167, ..., the dead band N 235..255 -> 1.000, 256 -> 1.071 ...
@@ -295,12 +297,18 @@ def test_hlsl_boost_passes_mirror_the_reference():
     assert "if (boostN != 0u) accT *= boostTex.Load(int3(0, 0, 0));" in conv and "accE *=" not in conv
     assert conv.index("accT *= boostTex") < conv.index("bTrueOut[uint2(fx, fy)] = accT;")
     assert "if (debugMode == 8)" in pixel
-    # C++: the CB size, the file constants, the boost-free flat-lattice pass
-    h = (_SRC / "fald.h").read_text(encoding="utf-8")
+    # C++: the CB size, the file constants, the boost-free flat-lattice pass. The CB size, the file constants and the
+    # loader live in shared/fald_panel.{h,cpp} (one parser for both paths); the passes stay in src/fald.cpp (overlay)
+    # and dwm_hook/hook_fald.cpp (hook), which must agree pass for pass.
+    h = (_SHARED / "fald_panel.h").read_text(encoding="utf-8")
+    loader = (_SHARED / "fald_panel.cpp").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 336" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 80 words since S2 (glow fill)
-    assert "0x464C4434u" in c and "magic == FALD_MAGIC4 ? 416" in c
-    assert "FillCB(r, 0, 0, false);" in c and "RunConv(r, r->driveSRV, r->driveSRV, nullptr);" in c
-    assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in c     # panelfile.boost_zone_threshold's twin
-    assert c.index("RunStat(r, 0);") < c.index("RunBoost(r, 0);") < c.index("RunConv(r, trueDrive, estDrive, r->boostSRV[0]);")
-    assert c.index("RunStat(r, 1);") < c.index("RunBoost(r, 1);") < c.index("RunConv(r, trueDrive, estDrive, r->boostSRV[1]);")
+    hook = _HOOK.read_text(encoding="utf-8")
+    assert "FALD_CB_BYTES = 336" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 84 words since S2 (glow fill)
+    assert "FALD_MAGIC4 = 0x464C4434u;" in loader and "if (magic == FALD_MAGIC4) return 104 * 4;" in loader   # FLD4 = 416 B
+    assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in loader     # panelfile.boost_zone_threshold's twin
+    for cpp, v in ((c, "r"), (hook, "m")):                              # both paths read the file with the shared loader
+        assert "LoadFaldPanelParams(" in cpp
+        assert f"FillCB({v}, 0, 0, false);" in cpp and f"RunConv({v}, {v}->driveSRV, {v}->driveSRV, nullptr);" in cpp
+        assert cpp.index(f"RunStat({v}, 0);") < cpp.index(f"RunBoost({v}, 0);") < cpp.index(f"RunConv({v}, trueDrive, estDrive, {v}->boostSRV[0]);")
+        assert cpp.index(f"RunStat({v}, 1);") < cpp.index(f"RunBoost({v}, 1);") < cpp.index(f"RunConv({v}, trueDrive, estDrive, {v}->boostSRV[1]);")

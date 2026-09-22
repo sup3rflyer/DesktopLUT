@@ -14,6 +14,8 @@ from dlc.fald.paneltime import (CLOSURE_DEFAULT, CLOSURE_MAX, CLOSURE_MIN, MAX_R
                                 PanelTimeLaw, blend_factors, settle_refreshes)
 
 _SRC = Path(__file__).resolve().parents[2] / "src"
+_SHARED = _SRC.parent / "shared"                      # fald_temporal.{h,cpp}: the LED-lag constants + per-run bookkeeping
+_HOOK = _SRC.parent / "dwm_hook" / "hook_fald.cpp"    # the DWM hook's passes, pass for pass the overlay's (src/fald.cpp)
 
 
 def _pair(parity):
@@ -153,11 +155,15 @@ def test_emulator_sequence_with_the_panel_clock(tmp_path):
 
 
 # ------------------------------------------------------------------------------------------ the C++ / HLSL side
-@pytest.mark.skipif(not (_SRC / "fald_shader.h").exists(), reason="DesktopLUT C++ tree not next to DLC")
+@pytest.mark.skipif(not (_SRC.parent / "shared" / "fald_shader.h").exists(), reason="DesktopLUT C++ tree not next to DLC")
 def test_cpp_and_hlsl_carry_the_same_law():
-    h = (_SRC / "fald.h").read_text(encoding="utf-8")
+    # the constants and the per-run bookkeeping (plan, map choice, settle hold) live in shared/fald_temporal.{h,cpp} since
+    # 6a4023e — ONE implementation for the overlay (src/fald.cpp FaldRunPasses) and the DWM hook (FaldRun); each path
+    # keeps only its D3D side (the passes, the copies, which texture a FaldDriveMap is)
+    h = (_SHARED / "fald_temporal.h").read_text(encoding="utf-8")
+    tc = (_SHARED / "fald_temporal.cpp").read_text(encoding="utf-8")
     cpp = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    sh = (_SRC / "fald_shader.h").read_text(encoding="utf-8")
+    sh = (_SRC.parent / "shared" / "fald_shader.h").read_text(encoding="utf-8")
     num = lambda name: float(re.search(name + r" = ([-\d.]+)f?u?;", h).group(1))
     assert num("FALD_TEMPORAL_PANEL") == MODE_PANEL and num("FALD_CLOCK_MAX_REFRESHES") == MAX_REFRESHES
     assert num("FALD_CLOCK_CLOSURE_DEFAULT") == CLOSURE_DEFAULT and num("FALD_CLOCK_CLOSURE_MIN") == CLOSURE_MIN
@@ -166,13 +172,30 @@ def test_cpp_and_hlsl_carry_the_same_law():
     # round 0, only for k >= 1; the next target = the drive texture AFTER round 1
     # (FaldRunPasses executes the pure FaldPanelClockPlan literally — tests/test_fald.cpp holds the plan's rules: on k = 0
     # no pass, the maps still bound, the target still replaced; the settle hold paid per elapsed refresh)
+    begin = re.search(r"FaldTemporalRun FaldTemporalBeginRun\(.*?\n\}", tc, re.S).group(0)
+    end = re.search(r"void FaldTemporalEndRun\(.*?\n\}", tc, re.S).group(0)
+    assert "run.clock = FaldPanelClockPlan(seeded, r->clkElapsed);" in begin
+    # bindMaps: the real-spread kernel reads the clock's B_true map (driveFiltTex), the estimate kernel its B_est map
+    assert "if (run.clock.bindMaps) { run.trueMap = FALD_MAP_FILTERED; run.estMap = FALD_MAP_CLOCK_EST; }" in begin
+    assert "FaldSettleAccount(r, newContent || run.resumed, settle, run.panel);" in end and "settleLeft--" not in end
     run = cpp[cpp.index("void FaldRunPasses("):]
+    assert "const FaldTemporalRun trun = FaldTemporalBeginRun(r, ts, clockOk," in run and "const FaldClockPlan plan = trun.clock;" in run
     assert run.count("RunPanelClock(r);") == 1 and run.index("if (plan.runPass) RunPanelClock(r);") < run.index("RunStat(r, 0);")
-    assert "plan = FaldPanelClockPlan(seeded, r->clkElapsed);" in run
-    assert "if (plan.bindMaps) { trueDrive = r->driveFiltSRV; estDrive = r->clkEstSRV; }" in run and run.count("clkEstSRV") == 1
+    assert "return m == FALD_MAP_FILTERED ? r->driveFiltSRV : (m == FALD_MAP_CLOCK_EST ? r->clkEstSRV : r->driveSRV);" in run
+    assert "trueDrive = mapSrv(trun.trueMap);" in run and "estDrive = mapSrv(trun.estMap);" in run and run.count("clkEstSRV") == 1
     assert run.index("RunStat(r, 1);") < run.index("if (plan.commitPrev) g_context->CopyResource(r->clkPrevTex, r->driveTex);")
     assert run.count("CopyResource(r->clkPrevTex") == 1 and run.count("plan.seedStates") == 1
-    assert "FaldSettleAccount(r, newContent || resumed, settle, panel);" in run and "settleLeft--" not in run
+    assert "FaldTemporalEndRun(r, trun, ts, newContent);" in run and "settleLeft--" not in run
+    # ... and the DWM hook executes the same plan from the same shared code
+    hook = _HOOK.read_text(encoding="utf-8")
+    hrun = hook[hook.index("bool FaldRun("):]
+    assert "const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk," in hrun
+    assert hrun.count("RunPanelClock(m);") == 1 and hrun.index("if (trun.clock.runPass) RunPanelClock(m);") < hrun.index("RunStat(m, 0);")
+    assert "return k == FALD_MAP_FILTERED ? m->driveFiltSRV : (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : m->driveSRV);" in hrun
+    assert "trueDrive = mapSrv(trun.trueMap);" in hrun and "estDrive = mapSrv(trun.estMap);" in hrun and hrun.count("clkEstSRV") == 1
+    assert hrun.index("RunStat(m, 1);") < hrun.index("if (trun.clock.commitPrev) g_ctx->CopyResource(m->clkPrevTex, m->driveTex);")
+    assert hrun.count("CopyResource(m->clkPrevTex") == 1 and hrun.count("clock.seedStates") == 1
+    assert "FaldTemporalEndRun(m, trun, m->tempSettings, newContent);" in hrun and "settleLeft--" not in hrun
     from dlc.fald.paneltime import LOCK_GAIN
     assert num("FALD_CLOCK_LOCK_GAIN") == LOCK_GAIN
     # the pass: one blend per clock toward the previous frame's drives, the weighted maps, the states advanced in place
@@ -186,5 +209,6 @@ def test_cpp_and_hlsl_carry_the_same_law():
     old = re.search(r'g_faldTemporalSource = R"\((.*?)\)";', sh, re.S).group(1)
     assert "clk" not in old and "float a = (d > s) ? tempAlphaRise : tempAlphaFall;" in old
     # FillCB puts the six words where the HLSL declares them (test_fald_transfer holds the offsets against the compiler)
-    assert "f[66] = r->clkW[0]; f[67] = r->clkW[1];" in cpp
-    assert "f[68] = r->clkFactor[0]; f[69] = r->clkFactor[1]; f[70] = r->clkFactor[2]; f[71] = r->clkFactor[3];" in cpp
+    for src, v in ((cpp, "r"), (hook, "m")):
+        assert f"f[66] = {v}->clkW[0]; f[67] = {v}->clkW[1];" in src
+        assert f"f[68] = {v}->clkFactor[0]; f[69] = {v}->clkFactor[1]; f[70] = {v}->clkFactor[2]; f[71] = {v}->clkFactor[3];" in src
