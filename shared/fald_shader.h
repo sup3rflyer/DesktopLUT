@@ -962,17 +962,27 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 // the boost is 1 (FaldModel.boost_of_fraction; the C++ turns the file's zone fractions into counts —
 // FaldBoostZoneThreshold — so no float division decides a step edge on the GPU). Instantaneous by design: the panel
 // switches within one meter read in both directions, so the temporal drive state does not filter it.
+// The count is a 256-thread reduction (an integer sum: any order gives the same N), then thread 0 looks the step up.
+// (One thread walking every zone cost ~53 us per round at 2304 zones on an RTX 5090; the loader allows 512 x 512.)
 inline const char* g_faldBoostSource = R"(
 RWTexture2D<float> boostOut : register(u0);
+groupshared uint gCount[256];
 
-[numthreads(1, 1, 1)]
-void main() {
+[numthreads(256, 1, 1)]
+void main(uint3 tid : SV_GroupThreadID) {
     uint count = 0;
-    [loop] for (uint y = 0; y < rows; y++) {
-        [loop] for (uint x = 0; x < cols; x++) {
-            if (activeTex.Load(int3(x, y, 0)) > 0.5f) count++;
-        }
+    for (uint k = tid.x; k < cols * rows; k += 256) {
+        uint x = k % cols, y = k / cols;
+        if (activeTex.Load(int3(x, y, 0)) > 0.5f) count++;
     }
+    gCount[tid.x] = count;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid.x < stride) gCount[tid.x] += gCount[tid.x + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid.x != 0) return;
+    count = gCount[0];
     float b = 1.0f;
     [loop] for (uint i = 0; i < boostN; i++) {
         if ((float)count < boostLut[2 * i]) break;
@@ -987,16 +997,23 @@ void main() {
 // (scipy fftconvolve 'same', odd kernels, zero outside the lattice), kernel chosen by sub-offset.
 // The black-frame LED boost (boostN != 0) multiplies B_true ONLY — the panel's own estimate does not know it
 // (FaldModel.backlights). The flat-lattice normalisation fields are built with boostN = 0.
+// Thread layout: one thread per (cell, sub-offset). A group is FALD_CONV_THREADS consecutive cells (row-major) of ONE
+// sub-offset (SV_GroupID.y), so all its threads read the SAME kernel tap at every step of the sum, and neighbouring
+// drive texels. The kernel table is sub * sub separate slices; the previous 16 x 16 block of the fine grid spanned 64
+// sub-offsets and so read 64 slices per step (2x slower on a 5090). Layout only: every output's terms, their order and
+// each operation are what they were (bit-identical, HW + WARP, 2026-09-22). A linear cell index wastes no lanes on a
+// lattice that is not a multiple of 16 (edge-lit strips, odd grids). Dispatch: FaldConvGroupsX(cols, rows) x sub * sub.
 inline const char* g_faldConvSource = R"(
 RWTexture2D<float> bTrueOut : register(u0);
 RWTexture2D<float> bEstOut  : register(u1);
 
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint fx = id.x, fy = id.y;
-    if (fx >= cols * sub || fy >= rows * sub) return;
-    int cx = (int)(fx / sub), cy = (int)(fy / sub);
-    uint so = (fy % sub) * sub + (fx % sub);
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    uint cell = gid.x * 64u + tid.x;
+    if (cell >= cols * rows) return;
+    uint so = gid.y;                                    // sub-offset = (fy % sub) * sub + (fx % sub)
+    int cx = (int)(cell % cols), cy = (int)(cell / cols);
+    uint fx = (uint)cx * sub + so % sub, fy = (uint)cy * sub + so / sub;
 
     uint Wt = 2 * reachTrueC + 1, Ht = 2 * reachTrueR + 1;
     float accT = 0.0f;
@@ -1021,6 +1038,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     bEstOut[uint2(fx, fy)] = accE;
 }
 )";
+
+// The conv pass's group size: the literal in its [numthreads(64, 1, 1)] and `gid.x * 64u` above (DLC
+// tests/test_fald_shader_layout.py pins that all three agree). Both RunConv sites (src/fald.cpp, dwm_hook/hook_fald.cpp)
+// dispatch FaldConvGroupsX(cols, rows) x sub * sub groups; the loader's limits (cols, rows <= 512, sub <= 16) keep that
+// inside D3D11's 65535 groups per dimension (<= 4096 x 256).
+static const unsigned int FALD_CONV_THREADS = 64u;
+inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
+    return (cols * rows + FALD_CONV_THREADS - 1u) / FALD_CONV_THREADS;
+}
 
 // Pass 1b (tempMode != 0 only): per-cell first-order drive state. driveTex (t4) = this round's instantaneous
 // drive, stateTex (t11) = the state committed after the previous frame's round 1. out = s + a * (d - s) with

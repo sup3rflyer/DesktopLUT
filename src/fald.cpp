@@ -781,7 +781,7 @@ static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D1
     g_context->CSSetShaderResources(14, 1, &boost);
     ID3D11UnorderedAccessView* uavs[2] = { r->bTrueUAV, r->bEstUAV };
     g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-    g_context->Dispatch((p.cols * p.sub + 15) / 16, (p.rows * p.sub + 15) / 16, 1);
+    g_context->Dispatch(FaldConvGroupsX(p.cols, p.rows), p.sub * p.sub, 1);   // cells x sub-offsets (fald_shader.h)
     UnbindCompute();
 }
 
