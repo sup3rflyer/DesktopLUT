@@ -227,9 +227,38 @@ def test_ceiling_rule_knee_constants_and_single_scale_match_the_hlsl_source():
     ks = float(re.search(r"static const float FALD_KNEE_START = ([0-9.]+)f;", src).group(1))
     kt = float(re.search(r"static const float FALD_KNEE_CAP_TRUST = ([0-9.]+)f;", src).group(1))
     assert ks == C.KNEE_START and kt == C.KNEE_CAP_TRUST
-    body = re.search(r"float3 Correct\(float3 img, float bTrue, float bEst, float gain\) \{(.*?)\n\}", src, re.S).group(1)
+    body = re.search(r"float3 Correct\(float3 img, float bTrue, float bEst, float2 gs\) \{(.*?)\n\}", src, re.S).group(1)
     assert "req.r > cap" not in body and "keep" not in body
     assert "return max(u * ge, 0.0f);" in body and "FALD_KNEE_START" in body
+
+
+@pytest.mark.skipif(not _SHADER.exists(), reason="DesktopLUT C++ tree not next to DLC")
+def test_knee_ceiling_reads_the_low_passed_estimate_in_the_hlsl_and_both_hosts():
+    """Work guide C15 (2026-09-22): the soft knee's ceiling C = white * B_est takes B_est from gainTex .y — written by the
+    gain pass next to the gain and low-passed by the SAME blur — never from the per-pixel bEst (the fitted estimate kernel
+    peaks at every LED sample point: a per-pixel ceiling printed the zone lattice into bright shapes >= ~500 nits). Both
+    hosts create the gain ping-pong textures two-channel; correct.py and gpuemu mirror the rule."""
+    src = _SHADER.read_text(encoding="utf-8")
+    body = re.search(r"float3 Correct\(float3 img, float bTrue, float bEst, float2 gs\) \{(.*?)\n\}", src, re.S).group(1)
+    assert "float gain = gs.x;" in body
+    assert "float cap = white * max(gs.y, 1e-9f);" in body and "max(bEst, 1e-9f)" not in body
+    assert "Texture2D<float2> gainTex     : register(t9);" in src
+    gain_pass = src[src.index("g_faldGainSource"):src.index("g_faldBlurSource")]
+    assert "RWTexture2D<float2> gainOut" in gain_pass and "gainOut[uint2(fx, fy)] = float2(RawGain(bT, bE), bE);" in gain_pass
+    blur_pass = src[src.index("g_faldBlurSource"):src.index("g_faldFullscreenVsSource")]
+    assert "RWTexture2D<float2> blurOut" in blur_pass and "float2 acc" in blur_pass
+    # every Correct call site samples the two-channel texture
+    assert src.count("float2 g = gainTex.SampleLevel(") == 2 and src.count("float2 gain = gainTex.SampleLevel(") == 1
+    assert "float g = gainTex" not in src and "float gain = gainTex" not in src
+    root = _SHADER.parents[1]
+    for host in (root / "src" / "fald.cpp", root / "dwm_hook" / "hook_fald.cpp"):
+        h = host.read_text(encoding="utf-8")
+        assert h.count("gainATex, &") == 1 and h.count("gainBTex, &") == 1
+        for tex in ("gainATex", "gainBTex"):
+            line = next(ln for ln in h.splitlines() if "MakeRWTexture(" in ln and f"&{tex[:-3]}" in ln.replace("->", "&"))
+            assert "DXGI_FORMAT_R32G32_FLOAT" in line, (host.name, tex, line)
+        assert 'L"fald_gain_fine.rg32f", p.cols * p.sub, p.rows * p.sub, 8)' in h and "fald_gain_fine.f32" not in h
+
 
 
 # ------------------------------------------------------------------------------------------------ cbuffer packing
@@ -288,7 +317,8 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
     for shader, target in (("g_faldPixelSource", "ps_5_0"), ("g_faldStatSource", "cs_5_0"), ("g_faldStarStatSource", "cs_5_0"),
                            ("g_faldStarPlanSource", "cs_5_0"), ("g_faldConvSource", "cs_5_0"), ("g_faldPanelClockSource", "cs_5_0"),
                            ("g_faldGlowZoneSource", "cs_5_0"), ("g_faldGlowDilateSource", "cs_5_0"),
-                           ("g_faldGlowErodeSource", "cs_5_0"), ("g_faldGlowEnvSource", "cs_5_0"), ("g_faldGlowBandSource", "cs_5_0")):
+                           ("g_faldGlowErodeSource", "cs_5_0"), ("g_faldGlowEnvSource", "cs_5_0"), ("g_faldGlowBandSource", "cs_5_0"),
+                           ("g_faldGainSource", "cs_5_0"), ("g_faldBlurSource", "cs_5_0")):   # the two-channel gain (C15)
         asm = _d3d_disassemble(part("g_faldCommonSource") + part(shader), target)
         block = re.search(r"cbuffer FaldCB\s*//\s*\{(.*?)//\s*\}", asm, re.S).group(1)
         members = re.findall(r"//\s+(uint|float|int|float\d\w*|uint\d\w*)\s+(\w+);\s*//\s*Offset:\s*(\d+)\s+Size:\s*(\d+)", block)
@@ -299,3 +329,14 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
         by_name = {name: int(off) // 4 for _, name, off, _ in members}
         assert {k: by_name[k] for k in named} == named, shader
         assert int(members[-1][2]) + int(members[-1][3]) == cb_bytes
+
+
+@pytest.mark.skipif(not _SHADER.exists(), reason="DesktopLUT C++ tree not next to DLC")
+def test_every_raw_string_piece_of_the_shader_header_fits_msvc():
+    """MSVC caps ONE string literal at 16380 bytes (error C2026); the header splits its sources into adjacent R"(...)"
+    pieces for that reason. C15 took the Correct() piece to ~15.6 kB — this keeps the next edit from breaking the build."""
+    src = _SHADER.read_text(encoding="utf-8")
+    pieces = re.findall(r'R"\((.*?)\)"', src, re.S)
+    assert len(pieces) > 10
+    sizes = [len(p.encode("utf-8")) for p in pieces]
+    assert max(sizes) < 16380, sorted(sizes)[-3:]

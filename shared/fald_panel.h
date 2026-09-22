@@ -51,7 +51,7 @@ struct FaldPanelParams {
                                              // (work guide H2). Do not "use the weights" without that measurement.
     float curveLogMin = 0, curveLogMax = 0, estPhasePx = 0, estPhasePy = 0;
     float fadeLo = 0.004f, fadeHi = 0.03f;   // correction fades to identity where B_est < fadeHi (0 at fadeLo)
-    float gainSmoothCells = 0.35f;           // Gaussian sigma of the gain low-pass, in cells (0 = off)
+    float gainSmoothCells = 0.35f;           // Gaussian sigma of the gain low-pass, in cells (0 = off) — also the soft knee's ceiling B_est (C15; 0 = per-pixel again)
     float lumFadeLo = 0.5f, lumFadeHi = 5.0f; // pixel-luminance fade (as-if-white nits of the pixel's max channel):
                                              // the model has no baseline below ~1 nit (dark-halo probe 2026-09-12)
     float pedRGB[3] = { 1.0f, 1.0f, 1.0f };   // pedestal colour multipliers m_c on tmin (FLD2 words 32-34; sum w*m = 1).

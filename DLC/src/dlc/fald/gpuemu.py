@@ -281,8 +281,9 @@ class GpuPanelDriveState:
 
 
 class Emu:
-    def __init__(self, o, width=3840, height=2160, ped_mode=0, subtexel_bits: Optional[int] = None):
+    def __init__(self, o, width=3840, height=2160, ped_mode=0, subtexel_bits: Optional[int] = None, c15: bool = True):
         self.o = o
+        self.c15 = c15                         # C15: the knee's ceiling from the low-passed B_est (False = the pre-C15 shader)
         self.subtexel_bits = subtexel_bits     # None = exact sampler fractions; 8 = a D3D11 device's bilinear weights
         self.W, self.H = width, height
         self.white = float(o["white"]); self.gamma = float(o["sdrGamma"]); self.transfer = o["transfer"]
@@ -705,6 +706,12 @@ class Emu:
         raw = 1.0 + (g - 1.0) * w
         return raw.astype(np.float32), self.blur(raw).astype(np.float32)
 
+    def ceil_est(self, bE):
+        """C15: the gain pass's second channel (the flat-normalised B_est the soft knee's CEILING reads), low-passed by the
+        same separable blur as the gain (the shader blurs gainTex .xy together)."""
+        e = bE.astype(np.float64) / np.maximum(self.flatE, 1e-6)
+        return self.blur(e.astype(np.float32).astype(np.float64)).astype(np.float32)
+
     def blur(self, g):
         if self.sigma <= 0:
             return g
@@ -716,8 +723,11 @@ class Emu:
         return sum(k[i] * hp[i: i + g.shape[0]] for i in range(2 * R + 1))
 
     # ---- Correct (white pedestal mode; C10/C11 one-scale ceiling rule)
-    def correct(self, img, bT, bE, gain):
+    def correct(self, img, bT, bE, gain, bEc=None):
+        """HLSL Correct; ``bEc`` = the pixel's sampled ceiling estimate (gainTex .y, C15) — None = the per-pixel ``bE``
+        (the rule before C15, kept for offline A/B only)."""
         W = self.white
+        bEc = bE if bEc is None else bEc
         maxc = img.max(axis=0)
         s = np.minimum(maxc, W)
         bT = np.maximum(bT, 0.0)
@@ -737,7 +747,7 @@ class Emu:
         term = delta * f * wfade                      # PedestalTerm mode 0
         u = img + term[None]
         m = u.max(axis=0)
-        cap = W * np.maximum(bE, 1e-9)
+        cap = W * np.maximum(bEc, 1e-9)
         C = np.minimum(W, cap / KNEE_CAP_TRUST) if KNEE_CAP_TRUST > 0 else np.full_like(cap, W)
         a = m * gain
         t = np.maximum(a / C - KNEE_START, 0.0) / (1.0 - KNEE_START)
@@ -789,7 +799,8 @@ class Emu:
         bT0, bE0 = self.fields(dT0, dE0, boost0)
         _, gB0 = self.gain(bT0, bE0)
         sT, sE, g = self.sampled(bT0, bE0, gB0)
-        cor0, _ = self.correct(img, sT, sE, g)
+        gc = self.sample(self.ceil_est(bE0).astype(np.float64)) if self.c15 else None
+        cor0, _ = self.correct(img, sT, sE, g, gc)
         glow0 = None
         if gp is not None:                                            # round 0's fill: the round-1 statistic sees it
             glow0 = self.glow_zones(bT0, gp)
@@ -802,7 +813,9 @@ class Emu:
         bT1, bE1 = self.fields(dT1, dE1, boost1)
         graw1, gB1 = self.gain(bT1, bE1)
         sT, sE, g = self.sampled(bT1, bE1, gB1)
-        req, wfade = self.correct(img, sT, sE, g)
+        cB1 = self.ceil_est(bE1)
+        gc = self.sample(cB1.astype(np.float64)) if self.c15 else None
+        req, wfade = self.correct(img, sT, sE, g, gc)
         glow_out = None
         if gp is not None:                                            # round 1's fill: part of the output
             glow_out = self.glow_zones(bT1, gp)
@@ -826,6 +839,8 @@ class Emu:
         return {"img": img, "drive0": d0, "drive1": d1, "drive_true": dT1, "drive_est": dE1, "stat1": st1, "bT": bT1, "bE": bE1,
                 "gain_raw": graw1, "gain": gB1, "req": req, "out": out, "out_nits": out_nits, "px_gain": g, "px_bT": sT,
                 "px_bE": sE, "wfade": wfade,
+                # C15: the ceiling estimate on the fine grid (fald_gain_fine.rg32f .y) and as the pixel pass samples it
+                "ceil_est": cB1, "px_bEc": gc if gc is not None else sE,
                 # black-frame LED boost per round (fald_dump.txt boost_r0/r1, active_zones_r0/r1, fald_active[_r0].f32)
                 "boost0": 1.0 if boost0 is None else float(boost0), "boost1": 1.0 if boost1 is None else float(boost1),
                 "zones0": zones0, "zones1": zones1, "active0": active0, "active1": active1,

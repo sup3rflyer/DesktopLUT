@@ -127,7 +127,8 @@ Texture2D<float>  bTrueTex : register(t5);   // cols*sub x rows*sub
 Texture2D<float>  bEstTex  : register(t6);
 Texture2D<float>  flatTrueTex : register(t7); // the same two fields for a fully driven lattice (normalisation)
 Texture2D<float>  flatEstTex  : register(t8);
-Texture2D<float>  gainTex     : register(t9); // smoothed gain on the fine grid (pass 2b)
+Texture2D<float2> gainTex     : register(t9); // R32G32F, fine grid, low-passed together (passes 2b / 2c): .x = the gain,
+                                              // .y = the flat-normalised B_est the soft knee takes its CEILING from (C15)
 Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless tempMode 2 / 3);
                                                // pixel pass view 7: the filtered drive (driveTex = the instantaneous one)
 Texture2D<float>  stateTex    : register(t11); // temporal pass: the committed drive state of the previous frame
@@ -361,14 +362,19 @@ float3 PedestalTerm(float3 img, float s, float bTrue, float bEst, float maxc, ui
 }
 
 // correct.py::correct_image for one pixel. img = as-if-white nits per channel (original frame);
-// gain = the (smoothed) gain sampled at the pixel.
+// gs = gainTex sampled at the pixel: .x the (smoothed) gain, .y the smoothed B_est of the ceiling.
 // Ceiling rule (work guide C10 + C11, 2026-09-15): ONE scale for all three channels (hue cannot rotate). Darkening
 // applies the full gain; brightening goes through a soft knee on the brightest channel toward the LCD ceiling
 // C = white * B_est — identity up to FALD_KNEE_START * C, then a smooth roll-off that never ends below the original
-// and asymptotes to max(original, C): the layer never brightens INTO the ceiling (isolated highlights keep their
+// and asymptotes to max(original, C): the layer never brightens INTO the (low-passed) ceiling (isolated highlights keep their
 // gradients) and saturated highlights keep their request. The scale always lies between 1 and the gain, so no fade
 // gate is needed (the fades already pulled the gain toward 1).
-float3 Correct(float3 img, float bTrue, float bEst, float gain) {
+// C15 (2026-09-22): the ceiling's B_est is gs.y, low-passed exactly like the gain — NOT the per-pixel bEst. The fitted
+// estimate kernel peaks sharply at every LED sample point; inside a small bright shape the per-pixel ceiling therefore
+// let the knee brighten only near the LEDs, which printed the zone lattice once the knee bound (>= ~500 nits; owner
+// photos + gpuemu, results/phone_camera_2026-09-22/circles_xraw/). The pedestal term's fade keeps the per-pixel bEst.
+float3 Correct(float3 img, float bTrue, float bEst, float2 gs) {
+    float gain = gs.x;
     float maxc = max(img.r, max(img.g, img.b));
     float s = min(maxc, white);
     bTrue = max(bTrue, 0.0f);
@@ -379,7 +385,7 @@ float3 Correct(float3 img, float bTrue, float bEst, float gain) {
     float m = max(u.r, max(u.g, u.b));
     float ge = gain;
     if (gain > 1.0f && m > 1e-9f) {
-        float cap = white * max(bEst, 1e-9f);
+        float cap = white * max(gs.y, 1e-9f);
         float C = (FALD_KNEE_CAP_TRUST > 0.0f) ? min(white, cap / FALD_KNEE_CAP_TRUST) : white;
         float a = m * gain;
         float K = a;
@@ -490,7 +496,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));   // the frame the layer works on (S1)
         if (roundIdx == 1) {
             float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
-            float g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
+            float2 g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
             img = Correct(img, bT, bE, g);
             if (glowOn != 0u) img = GlowAdd(img, bT, bE, int2((int)px, (int)py));   // the frame the panel receives (S2)
         }
@@ -988,7 +994,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         float3 img = PanelNits(frameTex.Load(int3(px, py, 0)).rgb);
         if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));
         float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
-        float g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
+        float2 g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
         float3 c3 = Correct(img, bT, bE, g);
         float3 f3 = GlowAddK(c3, bT, bE, float2((float)px, (float)py), 1.0f);
         float c = max(c3.r, max(c3.g, c3.b)), f = max(f3.r, max(f3.g, f3.b));
@@ -1193,9 +1199,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-// Pass 2b: gain on the fine grid (flat-normalised fields, clamp, deep-dark fade) -> u0.
+// Pass 2b: gain on the fine grid (flat-normalised fields, clamp, deep-dark fade) and the flat-normalised B_est of the
+// knee's ceiling (C15) -> u0 (R32G32F).
 inline const char* g_faldGainSource = R"(
-RWTexture2D<float> gainOut : register(u0);
+RWTexture2D<float2> gainOut : register(u0);
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -1203,14 +1210,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (fx >= cols * sub || fy >= rows * sub) return;
     float bT = bTrueTex.Load(int3(fx, fy, 0)) / max(flatTrueTex.Load(int3(fx, fy, 0)), 1e-6f);
     float bE = bEstTex.Load(int3(fx, fy, 0))  / max(flatEstTex.Load(int3(fx, fy, 0)), 1e-6f);
-    gainOut[uint2(fx, fy)] = RawGain(bT, bE);
+    gainOut[uint2(fx, fy)] = float2(RawGain(bT, bE), bE);
 }
 )";
 
-// Pass 2c: separable Gaussian blur of the gain (t9 -> u0), sigma = gainSmoothFine fine samples, radius 3 sigma,
-// clamped at the grid edge. Run twice (blurDir 0 then 1). With gainSmoothFine == 0 it copies.
+// Pass 2c: separable Gaussian blur of BOTH channels (gain, ceiling B_est; t9 -> u0), sigma = gainSmoothFine fine
+// samples, radius 3 sigma, clamped at the grid edge. Run twice (blurDir 0 then 1). With gainSmoothFine == 0 it copies.
 inline const char* g_faldBlurSource = R"(
-RWTexture2D<float> blurOut : register(u0);
+RWTexture2D<float2> blurOut : register(u0);
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -1219,7 +1226,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (fx >= W || fy >= H) return;
     if (gainSmoothFine <= 0.0f) { blurOut[uint2(fx, fy)] = gainTex.Load(int3(fx, fy, 0)); return; }
     int R = (int)ceil(3.0f * gainSmoothFine);
-    float acc = 0.0f, wsum = 0.0f;
+    float2 acc = float2(0.0f, 0.0f);
+    float wsum = 0.0f;
     for (int k = -R; k <= R; k++) {
         int x = fx, y = fy;
         if (blurDir == 0) x = clamp(fx + k, 0, W - 1); else y = clamp(fy + k, 0, H - 1);
@@ -1277,12 +1285,12 @@ float4 main(PS_INPUT i) : SV_Target {
     float3 img = PanelNits(src.rgb);
     if (starOn != 0u) img = Balance(img, px);           // the frame the layer works on (S1); the fields below come from it
     float bT, bE; SampleFields(float2(px), bT, bE);
-    float gain = gainTex.SampleLevel(linearClamp, FineUV(float2(px)), 0);
+    float2 gain = gainTex.SampleLevel(linearClamp, FineUV(float2(px)), 0);   // .x gain, .y the ceiling's B_est (C15)
     if (debugMode == 1) {
         // diverging map, the DLC analysis convention: white = no change, red = brighten, blue = darken,
         // +-25 % full scale (saturated red/blue), on a 100-nit white
-        float t = saturate(abs(gain - 1.0f) * 4.0f);
-        float3 c = (gain >= 1.0f) ? float3(1.0f, 1.0f - t, 1.0f - t) : float3(1.0f - t, 1.0f - t, 1.0f);
+        float t = saturate(abs(gain.x - 1.0f) * 4.0f);
+        float3 c = (gain.x >= 1.0f) ? float3(1.0f, 1.0f - t, 1.0f - t) : float3(1.0f - t, 1.0f - t, 1.0f);
         return float4(c * DebugWhite(), 1.0f);
     }
     if (debugMode == 2) { float v = saturate(bT) * DebugWhite(); return float4(v, v, v, 1.0f); }

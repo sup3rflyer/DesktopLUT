@@ -185,7 +185,8 @@ class FaldParams:
     # rendering
     flat_norm: bool = True               # divide both fields by the flat-lattice response (flat in → gain 1)
     fade_lo: float = 0.004               # correction fades to identity where the panel's ESTIMATE is ~0:
-    gain_smooth_cells: float = 0.35      # Gaussian sigma (in cells) applied to the GAIN field before use: the
+    gain_smooth_cells: float = 0.35      # Gaussian sigma (in cells) applied to the GAIN field — and, since C15 (2026-09-22),
+                                         #   to the B_est the soft knee's ceiling reads (0 = both per-pixel) — before use: the
                                          #   estimate kernel is narrower than a cell, so the raw gain inherits the
                                          #   per-cell steps of the drive map — structure the meter cannot verify
                                          #   and the owner sees as a grid (2026-09-12). 0 = off.

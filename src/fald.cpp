@@ -475,8 +475,9 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     r->stateValid = false; r->settleLeft = 0; r->temporalMode = FALD_TEMPORAL_OFF;
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bTrueTex, &r->bTrueUAV, &r->bTrueSRV)) { r->lastError = "B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bEstTex, &r->bEstUAV, &r->bEstSRV)) { r->lastError = "B_est texture"; return false; }
-    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainATex, &r->gainAUAV, &r->gainASRV)) { r->lastError = "gain texture A"; return false; }
-    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainBTex, &r->gainBUAV, &r->gainBSRV)) { r->lastError = "gain texture B"; return false; }
+    // R32G32F: (gain, the flat-normalised B_est of the soft knee's ceiling), low-passed together (C15)
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainATex, &r->gainAUAV, &r->gainASRV, DXGI_FORMAT_R32G32_FLOAT)) { r->lastError = "gain texture A"; return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainBTex, &r->gainBUAV, &r->gainBSRV, DXGI_FORMAT_R32G32_FLOAT)) { r->lastError = "gain texture B"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatTrueTex, &r->flatTrueUAV, &r->flatTrueSRV)) { r->lastError = "flat B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->flatEstTex, &r->flatEstUAV, &r->flatEstSRV)) { r->lastError = "flat B_est texture"; return false; }
     r->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
@@ -665,7 +666,7 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
     if (roundIdx == 1) {
         ID3D11ShaderResourceView* fields[2] = { r->bTrueSRV, r->bEstSRV };
         g_context->CSSetShaderResources(5, 2, fields);
-        g_context->CSSetShaderResources(9, 1, &r->gainBSRV);      // smoothed gain of the previous round
+        g_context->CSSetShaderResources(9, 1, &r->gainBSRV);      // smoothed (gain, ceiling B_est) of the previous round (C15)
     }
     ID3D11UnorderedAccessView* uavs[3] = { r->driveUAV, r->activeUAV[roundIdx & 1u],    // u1: nullptr without a boost LUT
                                            r->zonePartUAV };                              // (the shader then never writes it)
@@ -846,7 +847,7 @@ static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D1
     UnbindCompute();
 }
 
-// Pass 2b/2c: gain on the fine grid, then a separable Gaussian low-pass (A -> B -> A ... final in gainB).
+// Pass 2b/2c: (gain, the knee's ceiling B_est) on the fine grid, then a separable Gaussian low-pass of both (A -> B -> A ... final in gainB).
 static void RunGain(FaldResources* r) {
     const FaldPanelParams& p = r->params;
     UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
@@ -873,7 +874,7 @@ static void RunGain(FaldResources* r) {
     g_context->CSSetUnorderedAccessViews(0, 1, &r->gainAUAV, nullptr);
     g_context->Dispatch(gx, gy, 1);
     UnbindCompute();
-    // final smoothed gain lives in A; copy to B so consumers always read gainB
+    // final smoothed (gain, ceiling B_est) lives in A; copy to B so consumers always read gainB
     g_context->CopyResource(r->gainBTex, r->gainATex);
 }
 
@@ -975,7 +976,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     DumpTexture(r->bEstTex, dir + L"fald_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->flatTrueTex, dir + L"fald_flat_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(r->flatEstTex, dir + L"fald_flat_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
-    DumpTexture(r->gainBTex, dir + L"fald_gain_fine.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    DumpTexture(r->gainBTex, dir + L"fald_gain_fine.rg32f", p.cols * p.sub, p.rows * p.sub, 8);   // (gain, ceiling B_est) pairs, C15
     // black-frame LED boost: the zone flags of both rounds (cols x rows float32, 1 = non-black; fald_active.f32 = round 1,
     // the corrected frame the panel receives) and the reduce pass's results. -1 / 1 when the file has no LUT.
     float boostR[2][2] = { { 1.0f, -1.0f }, { 1.0f, -1.0f } };   // [round][0 boost, 1 zone count]

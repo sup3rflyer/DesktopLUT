@@ -709,8 +709,9 @@ static bool BuildMonitor(FaldMonitor* m, const FaldPanelParams& params) {
     const UINT fw = p.cols * p.sub, fh = p.rows * p.sub;
     if (!MakeRWTexture(fw, fh, &m->bTrueTex, &m->bTrueUAV, &m->bTrueSRV)) { log_to_file("FALD: B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bEstTex, &m->bEstUAV, &m->bEstSRV)) { log_to_file("FALD: B_est texture failed"); return false; }
-    if (!MakeRWTexture(fw, fh, &m->gainATex, &m->gainAUAV, &m->gainASRV)) { log_to_file("FALD: gain texture A failed"); return false; }
-    if (!MakeRWTexture(fw, fh, &m->gainBTex, &m->gainBUAV, &m->gainBSRV)) { log_to_file("FALD: gain texture B failed"); return false; }
+    // R32G32F: (gain, the flat-normalised B_est of the soft knee's ceiling), low-passed together (C15)
+    if (!MakeRWTexture(fw, fh, &m->gainATex, &m->gainAUAV, &m->gainASRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture A failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->gainBTex, &m->gainBUAV, &m->gainBSRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture B failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatTrueTex, &m->flatTrueUAV, &m->flatTrueSRV)) { log_to_file("FALD: flat B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatEstTex, &m->flatEstUAV, &m->flatEstSRV)) { log_to_file("FALD: flat B_est texture failed"); return false; }
     m->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
@@ -1007,7 +1008,7 @@ static void RunStat(FaldMonitor* m, uint32_t roundIdx) {
     if (roundIdx == 1) {
         ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
         g_ctx->CSSetShaderResources(5, 2, fields);
-        g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);      // smoothed gain of the previous round
+        g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);      // smoothed (gain, ceiling B_est) of the previous round (C15)
     }
     ID3D11UnorderedAccessView* uavs[3] = { m->driveUAV, m->activeUAV[roundIdx & 1u],    // u1: null without a boost LUT
                                            m->zonePartUAV };                              // (the shader then never writes it)
@@ -1049,7 +1050,7 @@ static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11S
     UnbindCompute();
 }
 
-// Pass 2b/2c: gain on the fine grid, then a separable Gaussian low-pass (A -> B -> A; final in gainB).
+// Pass 2b/2c: (gain, the knee's ceiling B_est) on the fine grid, then a separable Gaussian low-pass of both (A -> B -> A; final in gainB).
 static void RunGain(FaldMonitor* m) {
     const FaldPanelParams& p = m->params;
     const UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
@@ -1076,7 +1077,7 @@ static void RunGain(FaldMonitor* m) {
     g_ctx->CSSetUnorderedAccessViews(0, 1, &m->gainAUAV, nullptr);
     g_ctx->Dispatch(gx, gy, 1);
     UnbindCompute();
-    // final smoothed gain lives in A; copy to B so consumers always read gainB
+    // final smoothed (gain, ceiling B_est) lives in A; copy to B so consumers always read gainB
     g_ctx->CopyResource(m->gainBTex, m->gainATex);
 }
 
@@ -1298,7 +1299,7 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
     DumpTexture(m->bEstTex, dir + L"fald_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(m->flatTrueTex, dir + L"fald_flat_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
     DumpTexture(m->flatEstTex, dir + L"fald_flat_best.f32", p.cols * p.sub, p.rows * p.sub, 4);
-    DumpTexture(m->gainBTex, dir + L"fald_gain_fine.f32", p.cols * p.sub, p.rows * p.sub, 4);
+    DumpTexture(m->gainBTex, dir + L"fald_gain_fine.rg32f", p.cols * p.sub, p.rows * p.sub, 8);   // (gain, ceiling B_est) pairs, C15
     if (p.hasBoost) {
         DumpTexture(m->activeTex[0], dir + L"fald_active_r0.f32", p.cols, p.rows, 4);
         DumpTexture(m->activeTex[1], dir + L"fald_active.f32", p.cols, p.rows, 4);

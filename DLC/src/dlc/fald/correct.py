@@ -13,15 +13,19 @@ pixel's level carries (``d_own`` = the drive curve at the pixel's own value). Th
 
     req = (img + ped_ref/w − ped/w) · B_est / B_true          (as-if-white nits, per channel)
 
-followed by ONE per-pixel ceiling rule (work guide C10 + C11, 2026-09-15; replaces the per-channel clamp):
+followed by ONE per-pixel ceiling rule (work guide C10 + C11, 2026-09-15; replaces the per-channel clamp; C15 2026-09-22:
+the ceiling's B_est is low-passed exactly like the gain):
 the request is ``u · g_eff`` with ``u = img + term`` and a single scalar ``g_eff`` for all three channels,
 so the correction can never rotate hue. Darkening (gain ≤ 1) applies the full gain. Brightening (gain > 1)
 goes through a soft knee on the brightest channel toward the LCD ceiling ``C = white · B_est`` (the LCD
 cannot open past 100 %): identity up to ``KNEE_START · C``, then a smooth roll-off that never ends below
 the pixel's original value and asymptotes to ``max(original, C)`` — so the layer never brightens INTO
-the ceiling (an isolated highlight keeps whatever gradient the panel leaves it) and a saturated highlight
+the (low-passed, C15) ceiling (an isolated highlight keeps whatever gradient the panel leaves it) and a saturated highlight
 keeps its original request (the dimming algorithm's input is not disturbed; review 2026-09-10: feeding a
 clipped value back dimmed the highlight's own cell drive and the iteration drifted 8+ rounds).
+Since C15 the ceiling is the LOW-PASSED B_est, so between LED sample points the knee may request past the model's
+per-pixel ``white · B_est`` — deliberate: that per-pixel structure is the fitted kernel's centre spike, which the panel
+does not show (owner RAW 2026-09-22; refit = work guide P11); revisit C15 after P11.
 The old per-channel rule kept the brightest channel of an over-ceiling pixel undarkened while darkening
 the others: warm greys turned salmon along the left/top edges of bright content on black (owner photo,
 SDR, 2026-09-14).
@@ -176,9 +180,16 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         wfade = t * t * (3.0 - 2.0 * t)
         wbest = wfade                                          # B_est fade alone (the colour part keeps it)
         gain = 1.0 + (gain - 1.0) * wfade
+        # C15 (2026-09-22): the knee's ceiling reads B_est low-passed by the SAME filter as the gain (the shader blurs the
+        # two together, gainTex .xy). The fitted estimate kernel peaks sharply at every LED sample point; a per-pixel
+        # ceiling let the knee brighten a small bright shape only near the LEDs and printed the zone lattice (>= ~500
+        # nits, owner photos 2026-09-22). The pedestal term's deep-dark fade keeps the per-pixel B_est.
+        b_est_ceil = b_est
         if p.gain_smooth_cells > 0:
             from scipy.ndimage import gaussian_filter
-            gain = gaussian_filter(gain, sigma=(p.gain_smooth_cells * model.ch, p.gain_smooth_cells * model.cw), mode="nearest")
+            sig = (p.gain_smooth_cells * model.ch, p.gain_smooth_cells * model.cw)
+            gain = gaussian_filter(gain, sigma=sig, mode="nearest")
+            b_est_ceil = gaussian_filter(b_est, sigma=sig, mode="nearest")
         # pixel-luminance fade (2026-09-12, doc S33): the model has no baseline below ~1 nit (drive floor), and the
         # dark-halo probe showed the correction wrong in sign on 0.5-nit grey next to a bright stroke (the owner's
         # dark band around text). Weight 0 -> 1 over lum_fade_lo -> lum_fade_hi of the pixel's own max channel,
@@ -215,7 +226,7 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         floored = np.broadcast_to(floored_px[None], u.shape)
         mu = u.max(axis=0)
         ok = mu > 1e-9
-        g_eff = np.where(ok, ceiling_gain(np.where(ok, mu, 1.0), gain, b_est, p.white_nits), gain)
+        g_eff = np.where(ok, ceiling_gain(np.where(ok, mu, 1.0), gain, b_est_ceil, p.white_nits), gain)
         req = np.maximum(u * g_eff[None], 0.0)                  # ONE scale per pixel: hue cannot rotate
         clipped = np.broadcast_to((g_eff < gain - 1e-12)[None], req.shape)   # brightening limited by the knee
         if glow is not None:

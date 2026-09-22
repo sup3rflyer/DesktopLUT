@@ -523,7 +523,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "dir": ApiParamSpec("string", description="Existing directory to write fald_*.f32 / fald_frame.rgba16f / fald_dump.txt into."),
+                "dir": ApiParamSpec("string", description="Existing directory to write fald_*.f32 / fald_gain_fine.rg32f / fald_frame.rgba16f / fald_dump.txt into."),
             },
             {"monitor_mode": "string", "dir": "string", "note": "string"},
             mutates_state=True,
