@@ -2,6 +2,9 @@
 fill ON (work guide S2) against the GPU-order twin (dlc/fald/gpuemu.py): the zone fields the glow passes wrote and the
 output frame. A real D3D device sees what the text pins cannot: a pass bound to the wrong texture, the fill computed from
 the wrong round's field, the deficit sampled at the wrong place.
+Glow fill is part of the starfield feature (it runs only while starfield balancing runs), so the case turns starfield on
+with it, at the C++ defaults; the twin runs the starfield settings the dump reports, and the dumped star zone fields are
+checked too. Flat zones hold no speck, so a frame without specks leaves Balance the identity — the dump shows it.
 
 Run (PowerShell; the directories d0 .. d6 must exist; panel.bin = a `python -m dlc.fald.export`-style PQ file; an optional
 frame.rgba16f = the frame, e.g. a star lattice with a hole — the default frames hold no hole to fill):
@@ -23,6 +26,20 @@ import pytest
 _DIR = os.environ.get("FALD_TEST_WARP_DIR", "")
 
 
+def _starfield_params(t: str):
+    """The starfield settings the case ran: fald_dump.txt's two `starfield <key> <value> ...` lines, every
+    StarfieldParams field and nothing else (a knob added on one side only fails here instead of running at a default)."""
+    from dataclasses import fields
+    from dlc.fald.starfield import StarfieldParams
+    kv = {}
+    for head in ("even", "area_lo"):
+        tok = re.search(r"^starfield " + head + r" .*$", t, re.M).group(0).split()[1:]
+        kv.update(zip(tok[0::2], tok[1::2]))
+    types = {f.name: f.type for f in fields(StarfieldParams)}
+    assert set(kv) == set(types), set(kv) ^ set(types)
+    return StarfieldParams(**{k: (int(v) if types[k] in (int, "int") else float(v)) for k, v in kv.items()})
+
+
 @pytest.mark.skipif(not _DIR or not (Path(_DIR) / "d0" / "fald_glow_env.f32").exists(), reason="FALD_TEST_WARP_DIR with glow-fill WARP dumps not given")
 def test_warp_glow_dumps_are_the_twin():
     from dlc.fald.glowfill import GlowFillParams
@@ -33,13 +50,33 @@ def test_warp_glow_dumps_are_the_twin():
     t = (d / "fald_dump.txt").read_text()
     g = lambda key: re.search(r"^" + key + r" (\S+)", t, re.M).group(1)
     assert int(g("glowfill")) == 1 and int(g("temporal_mode")) == 0
+    assert int(g("starfield")) == 1, "glow fill ran without starfield balancing (one feature: the fill runs only under it)"
+    sp = _starfield_params(t)
     m = re.search(r"^glowfill strength (\S+) reach (\S+) cap_nits (\S+) req_ceil (\S+)", t, re.M)
     gp = GlowFillParams(strength=float(m.group(1)), reach=int(m.group(2)), cap_nits=float(m.group(3)))
     rows, cols, W, H = int(g("rows")), int(g("cols")), int(g("width")), int(g("height"))
     emu = Emu(read_panel_file(root / "panel.bin"), width=W, height=H, subtexel_bits=8)   # a device's 8-bit bilinear weights
     assert float(m.group(4)) == pytest.approx(emu.glow_ceiling(), rel=1e-5) and emu.glow_ceiling() <= 0.2
     frame = np.fromfile(d / "fald_frame.rgba16f", dtype=np.float16).reshape(H, W, 4)[..., :3]
-    tw = emu.run(frame.astype(np.float64), fp16_out=True, glow=gp)
+    tw = emu.run(frame.astype(np.float64), fp16_out=True, star=sp, glow=gp)
+    # starfield: the device's zone fields (fald_frame = the SOURCE; every later pass read Balance of it) against the twin's
+    # — the flags and the brightest pixel exactly, the fields the pixels read to float32 sum order / the curve LUT's
+    # sub-texel weights (near and w carry a drive)
+    z4 = lambda n: np.fromfile(d / f"fald_star_{n}.f32", dtype=np.float32).reshape(rows, cols, 4)   # noqa: E731
+    stat, sw, plan, plan2, sbg = z4("stat"), z4("w"), z4("plan"), z4("plan2"), z4("bg")
+    st, pl = tw["star"]["stat"], tw["star"]["plan"]
+    spk = stat[..., 1] > 0.5
+    assert np.array_equal(spk, st["spk"]) and np.array_equal(sw[..., 3] > 0.5, spk) and np.array_equal(plan2[..., 2] > 0.5, spk)
+    assert np.array_equal(sw[..., 2] > 0.5, pl["flank"]) and np.array_equal(sbg[..., 1], st["arg"])
+    assert np.allclose(stat[..., 0], st["peak"], rtol=1e-6, atol=0)
+    assert np.allclose(plan[..., 0], pl["w_field"], rtol=0, atol=1e-6) and np.allclose(plan2[..., 3], pl["w"], rtol=0, atol=1e-6)
+    for i, key in ((1, "ln_t"), (2, "ln_g"), (3, "ln_pk")):                         # ln domain: absolute = relative
+        assert np.allclose(plan[..., i], pl[key], rtol=0, atol=1e-5), key
+    assert np.allclose(plan2[..., 0], pl["ln_b"], rtol=0, atol=1e-5) and np.allclose(plan2[..., 1], pl["near"], rtol=0, atol=5e-5)
+    scaled = tw["star"]["scale"] != 1.0
+    if not spk.any():   # no speck zone (flat content): every weight the DEVICE's pixels read is zero -> Balance = identity
+        assert not plan[..., 0].any() and not plan2[..., 3].any() and not scaled.any()
+    print(f"starfield: {int(spk.sum())} speck zones, {int(scaled.sum())} pixels balanced")
     vz = np.fromfile(d / "fald_glow_vz.f32", dtype=np.float32).reshape(rows, cols)
     env = np.fromfile(d / "fald_glow_env.f32", dtype=np.float32).reshape(rows, cols, 4)
     # the zone fields from the DUMPED round-1 B_true field (what the passes read), not from the twin's own
@@ -66,9 +103,12 @@ def test_warp_glow_dumps_are_the_twin():
     # THE scale-free gate, and the one that holds in every regime: no channel of a filled pixel is more than ONE last bit
     # from the twin. A real divergence in the glow path (the fill computed from another round's fields, an interpolated
     # instead of a nearest-zone k, another reduction order) moves the fill by far more than the FP16 step and lands here.
-    ulp = np.spacing(np.abs(tw["out"][filled])).astype(np.float64)       # the FP16 step AT each value
-    off_by = np.abs(out[filled].astype(np.float64) - tw["out"][filled].astype(np.float64)) / np.maximum(ulp, 1e-30)
-    assert float(off_by.max()) <= 1.0 + 1e-9, float(off_by.max())
+    def off_by(mask):                                                     # in FP16 steps AT each value
+        ulp = np.spacing(np.abs(tw["out"][mask])).astype(np.float64)
+        return float((np.abs(out[mask].astype(np.float64) - tw["out"][mask].astype(np.float64)) / np.maximum(ulp, 1e-30)).max())
+    assert off_by(filled) <= 1.0 + 1e-9, off_by(filled)
+    if scaled.any():                                                      # the balanced pixels: the same bound
+        assert off_by(scaled) <= 1.0 + 1e-9, off_by(scaled)
     # How MANY of those channels land on the neighbouring half is not scale-free: it follows the twin's residual drive
     # difference, and the drive comes from the curve LUT, which a device samples with 8-bit sub-texel weights while the
     # emulator interpolates it in float64. High on the curve (a star lattice at panel white: zone statistic 34-40 nit,

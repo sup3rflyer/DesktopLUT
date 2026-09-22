@@ -1316,7 +1316,9 @@ TEST_CASE("FALD loader: an exported panel file named by FALD_TEST_PANEL_FILE loa
 // display. Without the variable the case checks nothing. A `frame.rgba16f` next to
 // panel.bin (frame-sized RGBA half) replaces both frames (C12b: the boost's zone rule on a device).
 // FALD_TEST_WARP_GLOW = 1 turns the glow fill on (work guide S2; FALD_TEST_WARP_GLOW_REACH, default 2, and
-// FALD_TEST_WARP_GLOW_CAP_MNIT, default 100 = 0.10 nit); DLC tests/test_fald_glowfill_warp.py replays its dumps.
+// FALD_TEST_WARP_GLOW_CAP_MNIT, default 100 = 0.10 nit) AND starfield balancing at the FaldStarfieldSettings defaults:
+// glow fill is part of the starfield feature and runs only while starfield runs. The dump reports the starfield settings
+// and zone fields; DLC tests/test_fald_glowfill_warp.py replays both.
 TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_TEST_WARP_DIR)") {
     char* envDir = nullptr; size_t len = 0;
     if (_dupenv_s(&envDir, &len, "FALD_TEST_WARP_DIR") != 0 || !envDir) return;
@@ -1350,6 +1352,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
     fs.temporalMode = (unsigned int)mode; fs.clockParity = parity;
     fs.tauRiseMs = (float)tauMs; fs.tauFallMs = 0.5f * (float)tauMs; fs.delayFrames = (unsigned int)delay;
+    fs.star.enabled = glow;                                        // at its defaults: glow fill runs only under starfield
     fs.glow.enabled = glow;
     fs.glow.reach = (unsigned int)envInt("FALD_TEST_WARP_GLOW_REACH", 2);
     fs.glow.capNits = (float)envInt("FALD_TEST_WARP_GLOW_CAP_MNIT", 100) / 1000.0f;
@@ -1426,6 +1429,8 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         ic->Flush();
         CHECK_FALSE(ctx.faldDumpRequested.load());
         CHECK(ctx.fald->temporalMode == (unsigned int)mode);
+        CHECK(ctx.fald->starOn == glow);                           // starfield runs with the glow fill (one feature)
+        CHECK((ctx.fald->starPlanTex != nullptr) == glow);
         CHECK(ctx.fald->glowOn == glow);                           // the glow textures exist exactly while the option is on
         CHECK((ctx.fald->glowVTex != nullptr) == glow); CHECK((ctx.fald->glowEnvTex != nullptr) == glow);
         CHECK(ctx.fald->glowBand == (glow && FaldGlowBandActive(pp)));   // the band: mean-rule files with a boost LUT only
@@ -1459,6 +1464,13 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         CHECK_FALSE(ctx.fald->glowOn);
         CHECK(ctx.fald->glowVTex == nullptr); CHECK(ctx.fald->glowDilTex == nullptr);
         CHECK(ctx.fald->glowCTex == nullptr); CHECK(ctx.fald->glowEnvTex == nullptr); CHECK(ctx.fald->glowKTex == nullptr);
+        CHECK_FALSE(ctx.fald->glowBand);
+        CHECK(ctx.fald->starOn);                                   // ... and only its own: starfield keeps running
+        // one feature: starfield off stops the fill too, with the glow switch still on (it stays stored)
+        fs.glow.enabled = true; fs.star.enabled = false;
+        FaldRunPasses(&ctx, rtv, true);
+        CHECK_FALSE(ctx.fald->starOn); CHECK(ctx.fald->starPlanTex == nullptr);
+        CHECK_FALSE(ctx.fald->glowOn); CHECK(ctx.fald->glowVTex == nullptr); CHECK(ctx.fald->glowEnvTex == nullptr);
         CHECK_FALSE(ctx.fald->glowBand);
     }
     rtv->Release(); target->Release(); vs->Release();
