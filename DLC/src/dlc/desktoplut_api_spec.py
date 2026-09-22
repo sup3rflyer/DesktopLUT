@@ -518,8 +518,9 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "fald_star_plan2.f32 (ln background, near = the tapered protection field, speck-zone flag, w) — and `starfield ...` lines "
             "in fald_dump.txt; fald_frame.* stays the SOURCE frame. With the glow fill on it adds fald_glow_vz.f32 (the zone "
             "pedestal Vz, cols x rows float32) and fald_glow_env.f32 (cols x rows x 4 float32: envelope Ez, deficit Dz, closing "
-            "Cz, Vz) of round 1, fald_glow_k.f32 (the count-threshold band's zone scale of round 0; mean-rule files only) and "
-            "`glowfill ...` lines.",
+            "Cz, Vz) of round 1 and — mean-rule files only, the count-threshold band of round 1 — fald_glow_k.f32 (the zones' "
+            "final scale k after the neighbour guard), fald_glow_band.f32 (cols x rows x 4 float32: Pc, Pf, LIT flag, k0) and "
+            "fald_glow_bandA.f32 (cols x rows x 8 float32: the neighbour bound A_0..A_7), and `glowfill ...` lines.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

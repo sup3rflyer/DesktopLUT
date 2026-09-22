@@ -36,9 +36,10 @@
 //   CS boost (opt.)   : the corrected frame's boost
 //   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
-//   CS glow G0-G3 (opt., glow fill, work guide S2; rules in the header above g_faldGlowZoneSource): after EACH round's
-//                       conv pass — zone pedestal -> box maximum -> box minimum (= the closing) -> blur + deficit; the
-//                       round-1 statistic and the pixel pass add GlowAdd(...) to the corrected request; off = none of it
+//   CS glow G0-G5 (opt., glow fill, work guide S2; rules in the header above g_faldGlowZoneSource): after EACH round's
+//                       conv pass — zone pedestal -> box maximum -> box minimum (= the closing) -> blur + deficit [-> the
+//                       count-threshold band's sweep G4 + neighbour guard G5, mean-rule files]; the round-1 statistic and
+//                       the pixel pass add GlowAdd(...) to the corrected request; off = none of it
 //   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling) [+ fill]
 #pragma once
 
@@ -151,8 +152,11 @@ Texture2D<float>  glowDilTex : register(t21); // G1 out: box maximum; (cols + 2 
 Texture2D<float>  glowCTex   : register(t22); // G2 out: the closing Cz (cols x rows) — read by G3
 Texture2D<float4> glowEnvTex : register(t23); // G3 out, RGBA32F: (Ez, Dz, Cz, Vz) — GlowAdd samples .y bilinearly (statistic
                                               // round 1 + pixel pass); .zw = evidence for the dump
-Texture2D<float>  glowKTex   : register(t24); // G4 out (glowBand only, every round): the zone's count-threshold scale k —
-                                              // GlowAdd loads it for the pixel's OWN zone (nearest)
+Texture2D<float>  glowKTex   : register(t24); // G5 out (glowBand only, every round): the zone's count-threshold scale k —
+                                              // GlowAdd loads the pixel's 3 x 3 zones and feathers them (C16, GlowBandScale)
+Texture2D<float4> glowBandTex : register(t25); // G4 out (glowBand only): per zone (Pc, Pf, LIT flag, k0) — read by G5
+Texture2D<float4> glowATex    : register(t26); // G4 out (glowBand only), (2 cols) x rows: the neighbour bound A_0..A_3 at
+                                               // (2 cx, cy), A_4..A_7 at (2 cx + 1, cy) — read by G5
 SamplerState linearClamp : register(s0);
 )" /* MSVC caps ONE string literal at 16380 bytes (C2026); adjacent literals concatenate (limit 65535), so the common
       source is split here. Tools that read this header as text (DLC tests, the fxc checkers) drop the seam. */ R"(
@@ -409,17 +413,27 @@ static const float FALD_GLOW_WANT_EPS = 1e-5f;          // a wanted fill below t
 static const float FALD_GLOW_VIEW_SCALE = 1000.0f;      // debug view 10: 0.1 nit of added request shows as 100 nits
 static const float FALD_GLOW_BAND_LO = 0.8f;            // the count-threshold band, x the mean rule's threshold: a zone whose
 static const float FALD_GLOW_BAND_HI = 1.25f;           // predicted statistic would land inside is scaled down to LO
-// round_fill for one pixel: req = the round's corrected request (as-if-white nits per channel), bTrue / bEst = the
-// fields Correct used, px = the frame pixel (inside the lattice). want = the zone deficit interpolated between zone
+// C16 (2026-09-22): k reaches the pixels through a FEATHER (glowfill.band_pixel_scale), s = min(k_z, min over the existing
+// neighbours n of 1 - (1 - k_n) w_n), w_n = 1 - smoothstep(0, FEATHER, distance to n's rectangle in zones): C1 across every
+// zone edge, <= k_z inside a band zone, exactly 1 where no band zone lies within FEATHER. G5 (the neighbour guard) bands
+// the fill-counted zones the feather could pull below BAND_HI T.
+static const float FALD_GLOW_FEATHER = 0.35f;           // zones: the ramp width outside a band zone
+static const uint FALD_GLOW_GUARD_ITER_MAX = 16u;       // cap of the guard's (Jacobi) iterations
+// The fill's want at pixel px BEFORE the band's scale (round_fill item 4): the zone deficit interpolated between zone
 // CENTRES (clamped hardware bilinear at FineUV, as the starfield plan) x strength, minus the dust threshold, capped.
+float GlowWant(float2 px) {
+    return min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits);
+}
+// round_fill for one pixel: req = the round's corrected request (as-if-white nits per channel), bTrue / bEst = the
+// fields Correct used, px = the frame pixel (inside the lattice). want = GlowWant x k.
 // shown = the LCD light the panel will show for the request itself; only what is missing is filled, x the correction's
 // own deep-dark trust in B_est (where the panel's estimate is ~0 a tiny request opens the LCD fully: NO fill there).
 // The request that displays it: x B_est / B_true (never above gainMax; never raised by the lower gain clip), in the
 // pedestal's colour (tminRGB / tmin: luminance-neutral), limited so the brightest channel stays at / below glowReqCeil.
-// A pixel nothing is added to is returned untouched (bit-identical). k = the count-threshold band's scale of the pixel's
-// own zone (pass G4; 1 = none), applied to the want AFTER the cap.
+// A pixel nothing is added to is returned untouched (bit-identical). k = the count-threshold band's scale at the pixel
+// (GlowBandScale; 1 = none), applied to the want AFTER the cap.
 float3 GlowAddK(float3 req, float bTrue, float bEst, float2 px, float k) {
-    float want = min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits) * k;
+    float want = GlowWant(px) * k;
     if (!(want > 0.0f)) return req;
     bTrue = max(bTrue, 0.0f);
     float r = max(req.r, max(req.g, req.b));
@@ -432,14 +446,37 @@ float3 GlowAddK(float3 req, float bTrue, float bEst, float2 px, float k) {
     if (!(add > 0.0f)) return req;
     return req + add * m;
 }
-// What the statistic round 1 and the pixel pass call: k of the pixel's OWN zone (a nearest Load — NOT interpolated: only
-// then does the zone's predicted statistic scale exactly as the band pass assumes), 1 without the band.
+// C16: the pixel's zone-local position in zone z, in zones (0 .. 1 inside z; glowfill.zone_local).
+float2 GlowZoneLocal(float2 px, int2 z) {
+    return (px + 0.5f - float2((float)originX, (float)originY)) / float2((float)cellW, (float)cellH) - float2(z);
+}
+// C16: the feather weight of the neighbour at zone offset (i, j) for a pixel at zone-local uv: 1 on its rectangle, C1 down
+// to 0 at FALD_GLOW_FEATHER zones from it (glowfill.feather_weight).
+float GlowFeatherW(int i, int j, float2 uv) {
+    float dx = max(0.0f, max((float)i - uv.x, uv.x - (float)(i + 1)));
+    float dy = max(0.0f, max((float)j - uv.y, uv.y - (float)(j + 1)));
+    return 1.0f - smoothstep(0.0f, FALD_GLOW_FEATHER, sqrt(dx * dx + dy * dy));
+}
+// C16: the band's scale at pixel px (inside the lattice): s = min(k_z, min over the existing neighbours n of
+// 1 - (1 - k_n) w_n). A neighbour whose weight is 0 cannot lower s (1 - (1 - k) 0 = 1 >= s): its k is not even loaded.
+float GlowBandScale(int2 px) {
+    int2 z = int2((int)((uint)(px.x - (int)originX) / cellW), (int)((uint)(px.y - (int)originY) / cellH));
+    float s = glowKTex.Load(int3(z, 0));
+    float2 uv = GlowZoneLocal(float2(px), z);
+    [unroll] for (int j = -1; j <= 1; j++) {
+        [unroll] for (int i = -1; i <= 1; i++) {
+            int2 n = z + int2(i, j);
+            if ((i == 0 && j == 0) || n.x < 0 || n.y < 0 || n.x >= (int)cols || n.y >= (int)rows) continue;
+            float w = GlowFeatherW(i, j, uv);
+            if (w > 0.0f) s = min(s, 1.0f - (1.0f - glowKTex.Load(int3(n, 0))) * w);
+        }
+    }
+    return s;
+}
+// What the statistic round 1 and the pixel pass call: the band's feathered scale (C16), 1 without the band.
 float3 GlowAdd(float3 req, float bTrue, float bEst, int2 px) {
     float k = 1.0f;
-    if (glowBand != 0u) {
-        uint2 zone = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);
-        k = glowKTex.Load(int3((int2)zone, 0));
-    }
+    if (glowBand != 0u) k = GlowBandScale(px);
     return GlowAddK(req, bTrue, bEst, float2(px), k);
 }
 // Zone sweeps — the statistic pass, starfield S0 and the glow band G4 (work guide C14). A zone's pixels k = 0 .. n - 1
@@ -864,17 +901,26 @@ void main(uint3 id : SV_DispatchThreadID) {
 //   Ez = min(Gaussian blur of Cz, Cz); sigma = SIGMA_BASE + SIGMA_PER_REACH * reach zones, radius ceil(3 sigma), border
 //        values held, normalised                                                                       G3   glowEnv.x
 //   Dz = (Ez - Vz) * smoothstep(DEFICIT_REL_LO, DEFICIT_REL_HI, (Ez - Vz) / Vz) where Ez > Vz, else 0  G3   glowEnv.y
-// Count-threshold band (glowBand: a boost LUT AND the mean zone rule; EVERY round, from its own request) G4   glowK
+// Count-threshold band (glowBand: a boost LUT AND the mean zone rule; EVERY round, from its own request) G4 + G5  glowK
 //   Pc / Pf = the zone mean of (brightest channel)^boostMeanGamma of the round's request WITHOUT / WITH the unscaled
 //   fill — the statistic the firmware will form. A zone not counted by its content (not LIT, Pc < T) whose Pf lies in
-//   [BAND_LO T, BAND_HI T] gets k = ((BAND_LO T - Pc) / (Pf - Pc))^(1 / gamma): its own pixels' want x k puts the
-//   statistic at BAND_LO T — clearly uncounted (T is known to +-7 %). Every other zone: k = 1. The statistic round 1
-//   reads round 0's k, the pixel pass round 1's (exact for the frame that is sent).
+//   [BAND_LO T, BAND_HI T] gets k0 = ((BAND_LO T - Pc) / (Pf - Pc))^(1 / gamma): its pixels' want x k0 puts the
+//   statistic at BAND_LO T — clearly uncounted (T is known to +-7 %). Every other zone: k0 = 1.          G4   glowBand.w
+//   C16: k reaches the pixels through the FEATHER (GlowBandScale): the ramp lies OUTSIDE a band zone, in its neighbours.
+//   A_d = the zone mean of w_d (f^gamma - c^gamma) / (1 - s0), s0 = saturate(shown / want) (0 where want <= 0 or
+//   s0 >= 1; 0 toward a neighbour outside the lattice): a neighbour at scale k lowers the zone's statistic by at most
+//   (1 - k) A_d.                                                                                     G4   glowA
+//   Neighbour guard: from k0, Jacobi iterations (each reads the previous one's k) — a zone counted only by the fill
+//   (not LIT, Pc < T, Pf > BAND_HI T, not in the band) whose Pf - sum_d (1 - k_{z+d}) A_d < BAND_HI T joins the band with
+//   the same k formula; until none joins, at most FALD_GLOW_GUARD_ITER_MAX.                          G5   glowK
+//   The statistic round 1 reads round 0's k, the pixel pass round 1's (exact for the frame that is sent).
 // Per pixel: GlowAdd (common source). Settings (CB words 75-80; defaults): on 0 | strength 1 (0..1), capNits 0.05
 //   (0.005..0.5), reach 2 (1..4) | reqCeil = min(0.4 driveFloor, 0.55 boostLitNits [file with a boost LUT]) | band.
 // HDR (PQ panel files) only: the C++ keeps the option off for a gamma-transfer file.
 // Bindings: G0 reads t5 bTrue + t7 flatTrue; G1 reads t20; G2 reads t21; G3 reads t20 + t22; G4 reads what the statistic
-//   round 1 reads (t0, t1, t5-t9, t15 / t18, t23); the statistic round 1 and the pixel pass read t23 (+ t24 with the band).
+//   round 1 reads (t0, t1, t5-t9, t15 / t18, t23) and writes glowBand (u0), glowA (u1) [+ the slice partials u2 / u3];
+//   G5 reads t25 glowBand + t26 glowA and writes glowK (u0, its Jacobi state) with a scratch k (u1); the statistic round 1
+//   and the pixel pass read t23 (+ t24 with the band).
 // =====================================================================================================================
 
 // Glow pass G0: the zone pedestal (glowfill.zone_pedestal). Sum order: oy outer, ox inner (the twin's).
@@ -963,16 +1009,23 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-// Glow pass G4 (glowBand only, every round): the count-threshold band's zone scale (glowfill.band_scale). One thread group
-// per zone, 256 threads sweep its pixels exactly like the statistic pass (the same thread / reduction order: the twin's
-// Emu.zone_pow_sum); the request is the round's corrected one, the fill the UNSCALED one (k = 1).
-// Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source).
+// Glow pass G4 (glowBand only, every round): the count-threshold band's per-zone record (glowfill.band_scale). One thread
+// group per zone, 256 threads sweep its pixels exactly like the statistic pass (the same thread / reduction order: the
+// twin's Emu.zone_sweep_sum); the request is the round's corrected one, the fill the UNSCALED one (k = 1). Out: (Pc, Pf,
+// LIT flag, k0) and (C16) the neighbour bound A_0..A_7 G5 reads.
+// Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source); the
+// A sums travel in their own partial record (GlowBandPart, u3) beside the pass's ZonePart (u2).
 inline const char* g_faldGlowBandSource = R"(
-RWTexture2D<float> glowKOut : register(u0);
+RWTexture2D<float4> glowBandOut : register(u0);   // (Pc, Pf, LIT flag, k0)
+RWTexture2D<float4> glowAOut : register(u1);      // (2 cols) x rows: A_0..A_3 at (2 cx, cy), A_4..A_7 at (2 cx + 1, cy)
 RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
+struct GlowBandPart { float4 a0; float4 a1; };
+RWStructuredBuffer<GlowBandPart> glowBandPart : register(u3);   // ... their A sums
 groupshared float gPowC[256];
 groupshared float gPowF[256];
 groupshared uint gLitC[256];
+groupshared float4 gA0[256];
+groupshared float4 gA1[256];
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
@@ -980,10 +1033,13 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint n = cellW * cellH;
     float powC = 0.0f, powF = 0.0f;
     uint lit = 0;
+    float4 a0 = float4(0.0f, 0.0f, 0.0f, 0.0f), a1 = float4(0.0f, 0.0f, 0.0f, 0.0f);   // A_d sums, NEIGHBOURS order
 #ifdef FALD_ZONE_COMBINE
     for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
         ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
         powC += q.f.x; powF += q.f.y; lit += q.u.x;
+        GlowBandPart qa = glowBandPart[ZonePartIndex(cx, cy, s)];
+        a0 += qa.a0; a1 += qa.a1;
     }
 #else
     uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
@@ -998,18 +1054,34 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         float3 c3 = Correct(img, bT, bE, g);
         float3 f3 = GlowAddK(c3, bT, bE, float2((float)px, (float)py), 1.0f);
         float c = max(c3.r, max(c3.g, c3.b)), f = max(f3.r, max(f3.g, f3.b));
-        if (c > 0.0f) powC += exp(boostMeanGamma * log(c));
-        if (f > 0.0f) powF += exp(boostMeanGamma * log(f));
+        float pwC = (c > 0.0f) ? exp(boostMeanGamma * log(c)) : 0.0f;   // x^gamma = exp(gamma log x); 0 at / below 0
+        float pwF = (f > 0.0f) ? exp(boostMeanGamma * log(f)) : 0.0f;
+        powC += pwC; powF += pwF;
         if (c > boostLitNits) lit++;
+        // C16, the neighbour bound's term: (f^gamma - c^gamma) / (1 - s0), s0 = shown / want as GlowAddK forms them (the
+        // statistic is flat in the fill scale below s0, concave above), x the feather weight toward each neighbour
+        float want = GlowWant(float2((float)px, (float)py));
+        if (want > 0.0f) {
+            float s0 = saturate(c * max(bT, 0.0f) / max(bE, 1e-9f) / want);
+            if (s0 < 1.0f) {
+                float q = (pwF - pwC) / (1.0f - s0);
+                float2 uv = GlowZoneLocal(float2((float)px, (float)py), int2((int)cx, (int)cy));
+                a0 += float4(GlowFeatherW(-1, -1, uv), GlowFeatherW(0, -1, uv), GlowFeatherW(1, -1, uv), GlowFeatherW(-1, 0, uv)) * q;
+                a1 += float4(GlowFeatherW(1, 0, uv), GlowFeatherW(-1, 1, uv), GlowFeatherW(0, 1, uv), GlowFeatherW(1, 1, uv)) * q;
+            }
+        }
     }
 #endif
     gPowC[tid.x] = powC; gPowF[tid.x] = powF; gLitC[tid.x] = lit;
+    gA0[tid.x] = a0; gA1[tid.x] = a1;
     GroupMemoryBarrierWithGroupSync();
     for (uint stride = 128; stride > 0; stride >>= 1) {
         if (tid.x < stride) {
             gPowC[tid.x] += gPowC[tid.x + stride];
             gPowF[tid.x] += gPowF[tid.x + stride];
             gLitC[tid.x] += gLitC[tid.x + stride];
+            gA0[tid.x] += gA0[tid.x + stride];
+            gA1[tid.x] += gA1[tid.x + stride];
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -1020,6 +1092,9 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             q.f = float4(gPowC[0], gPowF[0], 0.0f, 0.0f);
             q.u = uint4(gLitC[0], 0u, 0u, 0u);
             zonePart[ZonePartIndex(cx, cy, gid.z)] = q;
+            GlowBandPart qa;
+            qa.a0 = gA0[0]; qa.a1 = gA1[0];
+            glowBandPart[ZonePartIndex(cx, cy, gid.z)] = qa;
             return;
         }
 #endif
@@ -1031,7 +1106,67 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             float share = saturate((FALD_GLOW_BAND_LO * t - pc) / max(pf - pc, 1e-30f));
             kz = (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;
         }
-        glowKOut[uint2(cx, cy)] = kz;
+        glowBandOut[uint2(cx, cy)] = float4(pc, pf, litZone ? 1.0f : 0.0f, kz);
+        // A_d = the zone mean; 0 toward a neighbour outside the lattice
+        float hasL = (cx > 0u) ? 1.0f : 0.0f, hasR = (cx + 1u < cols) ? 1.0f : 0.0f;
+        float hasU = (cy > 0u) ? 1.0f : 0.0f, hasD = (cy + 1u < rows) ? 1.0f : 0.0f;
+        glowAOut[uint2(2u * cx, cy)] = (gA0[0] / (float)n) * float4(hasL * hasU, hasU, hasR * hasU, hasL);
+        glowAOut[uint2(2u * cx + 1u, cy)] = (gA1[0] / (float)n) * float4(hasR, hasL * hasD, hasD, hasR * hasD);
+    }
+}
+)";
+
+// Glow pass G5 (glowBand only, after G4 every round): the neighbour guard (glowfill.guard, C16) -> the final k (u0 = t24's
+// texture). ONE thread group; thread t owns the zones t, t + 1024, ... Jacobi: every zone reads the PREVIOUS iteration's
+// k (u0) and writes this one's to the scratch (u1); after a group-wide barrier the scratch is copied back when a zone
+// joined. The iterations are a fixed-count loop so the barriers stay in uniform flow; once an iteration adds nothing
+// the rest are idle (nothing can change any more). A candidate joins only from k = 1: a zone at k0 < 1 is in the band
+// already, and the join's own k is < 1 (Pf > BAND_HI T puts the share below BAND_LO / BAND_HI).
+inline const char* g_faldGlowGuardSource = R"(
+RWTexture2D<float> glowKOut  : register(u0);    // the final k (t24 for GlowAdd); the Jacobi state between iterations
+RWTexture2D<float> glowKNext : register(u1);    // scratch: this iteration's k
+groupshared uint gJoined[2];                     // per iteration parity: a zone joined in it
+
+[numthreads(1024, 1, 1)]
+void main(uint3 tid : SV_GroupThreadID) {
+    uint nz = cols * rows;
+    for (uint z0 = tid.x; z0 < nz; z0 += 1024u) glowKOut[uint2(z0 % cols, z0 / cols)] = glowBandTex.Load(int3(z0 % cols, z0 / cols, 0)).w;
+    if (tid.x == 0u) { gJoined[0] = 0u; gJoined[1] = 0u; }
+    AllMemoryBarrierWithGroupSync();
+    float t = boostMeanThresh;
+    float hi = FALD_GLOW_BAND_HI * t;
+    [loop] for (uint it = 0u; it < FALD_GLOW_GUARD_ITER_MAX; it++) {
+        uint cur = it & 1u;
+        if (it == 0u || gJoined[cur ^ 1u] != 0u) {             // the previous iteration added a zone (else nothing can change)
+            for (uint z = tid.x; z < nz; z += 1024u) {
+                int2 zc = int2((int)(z % cols), (int)(z / cols));
+                float kz = glowKOut[zc];
+                float4 b = glowBandTex.Load(int3(zc, 0));      // (Pc, Pf, LIT flag, k0)
+                if (b.z < 0.5f && b.x < t && b.y > hi && kz >= 1.0f) {   // counted only by the fill, not in the band yet
+                    float4 a0 = glowATex.Load(int3(2 * zc.x, zc.y, 0)), a1 = glowATex.Load(int3(2 * zc.x + 1, zc.y, 0));
+                    float a[8] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w };
+                    precise float loss = 0.0f;                  // precise: mul then add, as the twin (no mad)
+                    [unroll] for (uint d = 0u; d < 8u; d++) {
+                        uint m = (d < 4u) ? d : d + 1u;         // NEIGHBOURS: the 3 x 3 zones row-major, the centre skipped
+                        int2 nb = zc + int2((int)(m % 3u) - 1, (int)(m / 3u) - 1);
+                        if (nb.x < 0 || nb.y < 0 || nb.x >= (int)cols || nb.y >= (int)rows) continue;
+                        loss += (1.0f - glowKOut[nb]) * a[d];
+                    }
+                    if (b.y - loss < hi) {                      // the feather could pull it below BAND_HI T: it joins
+                        float share = saturate((FALD_GLOW_BAND_LO * t - b.x) / max(b.y - b.x, 1e-30f));
+                        kz = (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;
+                        InterlockedOr(gJoined[cur], 1u);
+                    }
+                }
+                glowKNext[zc] = kz;
+            }
+        }
+        AllMemoryBarrierWithGroupSync();
+        if (gJoined[cur] != 0u) {
+            for (uint z1 = tid.x; z1 < nz; z1 += 1024u) glowKOut[uint2(z1 % cols, z1 / cols)] = glowKNext[uint2(z1 % cols, z1 / cols)];
+        }
+        if (tid.x == 0u) gJoined[cur ^ 1u] = 0u;                // the next iteration's flag (every read of it lies above)
+        AllMemoryBarrierWithGroupSync();
     }
 }
 )";
@@ -1143,11 +1278,13 @@ inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
 // Zone sweeps (work guide C14; the rules above ZoneSlices in the common source). The statistic pass, starfield S0 and
 // the glow band G4 dispatch cols x rows x FaldZoneSlices(cellW, cellH) groups; with more than one slice per zone the
 // pass's combine variant (its source compiled after g_faldZoneCombineDefine) follows over cols x rows. The partials: one
-// structured buffer per monitor of cols * rows * slices ZonePart records, bound at u2. A 1-slice lattice has no buffer
+// structured buffer per monitor of cols * rows * slices ZonePart records, bound at u2 (G4 adds its own buffer of
+// GlowBandPart records at u3, created with the glow textures). A 1-slice lattice has no buffer
 // and runs neither the partial write nor the combine. A lattice needing more than FALD_ZONE_SLICES_MAX (D3D11's 65535
 // groups per dimension) is refused at build; real frames stay far below (a 7680 x 4320 frame as one zone = 8100).
 static const unsigned int FALD_ZONE_SLICE_PX = 4096u;     // = the HLSL's FALD_ZONE_SLICE_PX
 static const unsigned int FALD_ZONE_PART_BYTES = 32u;     // = the HLSL's ZonePart (float4 + uint4)
+static const unsigned int FALD_GLOW_BAND_PART_BYTES = 32u; // = the HLSL's GlowBandPart (two float4): G4's slice partials of A (C16)
 static const unsigned int FALD_ZONE_SLICES_MAX = 65535u;  // D3D11_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION
 inline const char* g_faldZoneCombineDefine = "#define FALD_ZONE_COMBINE 1\n";
 inline unsigned int FaldZoneSlices(unsigned int cellW, unsigned int cellH) {

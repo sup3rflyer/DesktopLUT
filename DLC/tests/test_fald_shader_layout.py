@@ -111,7 +111,10 @@ _SWEEPS = {   # source: (partial written by the sliced pass, the combine's fold 
                              "q.u = uint4(gArg[0], gCount[0], asuint(gSumAll[0]), 0u);",
                              "mn = min(mn, q.f.w); sumAll += asfloat(q.u.z); count += q.u.y;"),
     "g_faldGlowBandSource": ("q.f = float4(gPowC[0], gPowF[0], 0.0f, 0.0f);", "q.u = uint4(gLitC[0], 0u, 0u, 0u);",
-                             "powC += q.f.x; powF += q.f.y; lit += q.u.x;"),
+                             "powC += q.f.x; powF += q.f.y; lit += q.u.x;",
+                             # C16: the neighbour bound's sums travel in G4's own record (u3), slice for slice
+                             "qa.a0 = gA0[0]; qa.a1 = gA1[0];", "glowBandPart[ZonePartIndex(cx, cy, gid.z)] = qa;",
+                             "GlowBandPart qa = glowBandPart[ZonePartIndex(cx, cy, s)];", "a0 += qa.a0; a1 += qa.a1;"),
 }
 
 
@@ -158,3 +161,38 @@ def test_both_paths_dispatch_the_slices_and_run_the_combine(path, v):
     assert f"SafeRelease({v}->zonePartUAV); SafeRelease({v}->zonePartBuf);" in c
     assert f"if ({v}->zoneSlices > FALD_ZONE_SLICES_MAX)" in c                            # a slice grid D3D11 cannot dispatch
     assert "static const unsigned int FALD_ZONE_SLICES_MAX = 65535u;" in _SHADER.read_text(encoding="utf-8")
+
+
+def test_the_band_partials_have_their_own_record_and_both_paths_size_it():
+    """C16: G4's A sums do not grow ZonePart (the statistic pass and S0 keep their record bit for bit): a GlowBandPart of
+    two float4 at u3, a buffer of FALD_GLOW_BAND_PART_BYTES records created with the glow textures (band + zones of more
+    than one slice), and the tree reduces the two float4 arrays with the pass's other sums."""
+    src = _SHADER.read_text(encoding="utf-8")
+    band = _part(src, "g_faldGlowBandSource")
+    assert "struct GlowBandPart { float4 a0; float4 a1; };" in band
+    assert "RWStructuredBuffer<GlowBandPart> glowBandPart : register(u3);" in band
+    assert "static const unsigned int FALD_GLOW_BAND_PART_BYTES = 32u;" in src
+    assert "gA0[tid.x] += gA0[tid.x + stride];" in band and "gA1[tid.x] += gA1[tid.x + stride];" in band
+    assert "groupshared float4 gA0[256];" in band and "groupshared float4 gA1[256];" in band
+    for path, v in ((_OVERLAY, "r"), (_HOOK, "m")):
+        c = path.read_text(encoding="utf-8")
+        assert f"(r->zoneSlices == 1 || MakeZonePartBuffer(p.cols * p.rows * r->zoneSlices, &r->glowBandPartBuf,".replace("r->", f"{v}->") in c
+        assert f"SafeRelease({v}->glowBandPartUAV); SafeRelease({v}->glowBandPartBuf);" in c
+        assert "bd.StructureByteStride = stride;" in c
+
+
+def test_the_neighbour_guard_is_one_group_with_barriers_in_uniform_flow():
+    """C16 G5: ONE thread group (both paths Dispatch(1, 1, 1)); every zone loop strides by the group size; the Jacobi
+    iterations are a fixed-count loop so the three barriers stay in uniform control flow; the barriers fence the
+    groupshared flag AND the UAVs (AllMemoryBarrier: DeviceMemoryBarrier alone does not fence groupshared)."""
+    g5 = _part(_SHADER.read_text(encoding="utf-8"), "g_faldGlowGuardSource")
+    n = int(re.search(r"\[numthreads\((\d+), 1, 1\)\]", g5).group(1))
+    assert n <= 1024 and g5.count(f"+= {n}u)") == 3
+    assert f"for (uint z0 = tid.x; z0 < nz; z0 += {n}u)" in g5 and f"for (uint z = tid.x; z < nz; z += {n}u)" in g5
+    assert f"for (uint z1 = tid.x; z1 < nz; z1 += {n}u)" in g5
+    assert "[loop] for (uint it = 0u; it < FALD_GLOW_GUARD_ITER_MAX; it++) {" in g5 and "break" not in g5
+    assert g5.count("AllMemoryBarrierWithGroupSync();") == 3 and "DeviceMemoryBarrierWithGroupSync" not in g5
+    assert "InterlockedOr(gJoined[cur], 1u);" in g5 and "if (tid.x == 0u) gJoined[cur ^ 1u] = 0u;" in g5
+    for path, ctx in ((_OVERLAY, "g_context"), (_HOOK, "g_ctx")):
+        body = re.search(r"static void RunGlow\(.*?\n\}", path.read_text(encoding="utf-8"), re.S).group(0)
+        assert body.count(f"{ctx}->Dispatch(1, 1, 1);") == 1

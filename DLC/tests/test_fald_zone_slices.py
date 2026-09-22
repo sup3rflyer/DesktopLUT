@@ -16,7 +16,10 @@ GAMMA = np.float32(0.62)
 
 
 def _emu(rows, cols, ch, cw):
-    return SimpleNamespace(rows=rows, cols=cols, ch=ch, cw=cw, meanGamma=GAMMA, _group_sum=Emu._group_sum)
+    ns = SimpleNamespace(rows=rows, cols=cols, ch=ch, cw=cw, meanGamma=GAMMA, _group_sum=Emu._group_sum)
+    ns._pow32 = lambda v: Emu._pow32(ns, v)                              # zone_pow_sum = zone_sweep_sum(_pow32(...)) (C16)
+    ns.zone_sweep_sum = lambda vals: Emu.zone_sweep_sum(ns, vals)
+    return ns
 
 
 def _blocks(rows, cols, ch, cw, seed):

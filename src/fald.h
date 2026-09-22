@@ -166,8 +166,15 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* glowDilTex = nullptr; ID3D11UnorderedAccessView* glowDilUAV = nullptr; ID3D11ShaderResourceView* glowDilSRV = nullptr;
     ID3D11Texture2D* glowCTex = nullptr;   ID3D11UnorderedAccessView* glowCUAV = nullptr;   ID3D11ShaderResourceView* glowCSRV = nullptr;
     ID3D11Texture2D* glowEnvTex = nullptr; ID3D11UnorderedAccessView* glowEnvUAV = nullptr; ID3D11ShaderResourceView* glowEnvSRV = nullptr;
-    // the count-threshold band's zone scale k (cols x rows R32F; pass G4 after each round's G3, read by GlowAdd; t24)
+    // the count-threshold band's zone scale k (cols x rows R32F; pass G5 after each round's G4, read by GlowAdd; t24)
     ID3D11Texture2D* glowKTex = nullptr;   ID3D11UnorderedAccessView* glowKUAV = nullptr;   ID3D11ShaderResourceView* glowKSRV = nullptr;
+    // C16, only while the band applies (FaldGlowBandActive): G4's per-zone record (Pc, Pf, LIT flag, k0) (cols x rows
+    // RGBA32F, t25) and neighbour bound A_0..A_7 ((2 cols) x rows RGBA32F, t26), G5's Jacobi scratch k (R32F), and G4's
+    // slice partials of A (GlowBandPart records at u3; zones of more than one slice only)
+    ID3D11Texture2D* glowBandTex = nullptr; ID3D11UnorderedAccessView* glowBandUAV = nullptr; ID3D11ShaderResourceView* glowBandSRV = nullptr;
+    ID3D11Texture2D* glowATex = nullptr;    ID3D11UnorderedAccessView* glowAUAV = nullptr;    ID3D11ShaderResourceView* glowASRV = nullptr;
+    ID3D11Texture2D* glowKTmpTex = nullptr; ID3D11UnorderedAccessView* glowKTmpUAV = nullptr; ID3D11ShaderResourceView* glowKTmpSRV = nullptr;
+    ID3D11Buffer* glowBandPartBuf = nullptr; ID3D11UnorderedAccessView* glowBandPartUAV = nullptr;
     bool glowBand = false;                   // the band runs this frame (glowOn AND FaldGlowBandActive): CB word 80
     bool glowOn = false;                     // the fill runs this frame (setting on AND the textures exist): CB word 75
     bool glowFailLogged = false;

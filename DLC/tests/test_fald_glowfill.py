@@ -9,9 +9,11 @@ import pytest
 
 pytest.importorskip("scipy")
 from dlc.fald.correct import correct_image  # noqa: E402
-from dlc.fald.glowfill import (BAND_HI, BAND_LO, CAP_MAX, CAP_MIN, DEFICIT_REL_HI, DEFICIT_REL_LO, REACH_MAX, REACH_MIN,  # noqa: E402
-                               REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS, GlowFillParams, band_active, clamp_params, closing,
-                               deficit, envelope, fill_image, pedestal_colour, predict, req_ceiling, zone_pedestal)
+from dlc.fald.glowfill import (BAND_HI, BAND_LO, CAP_MAX, CAP_MIN, DEFICIT_REL_HI, DEFICIT_REL_LO, FEATHER, GUARD_ITER_MAX,  # noqa: E402
+                               NEIGHBOURS, REACH_MAX, REACH_MIN, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS, GlowFillParams,
+                               band_active, band_pixel_scale, band_scale, clamp_params, closing, deficit, envelope,
+                               feather_weight, fill_image, guard, pedestal_colour, predict, req_ceiling, round_fill,
+                               zone_local, zone_pedestal)
 from dlc.fald.model import FaldModel, FaldParams  # noqa: E402
 from dlc.fald.starfield import _bilinear_zones  # noqa: E402
 
@@ -297,7 +299,7 @@ def test_clamp_params():
     c = clamp_params(GlowFillParams(strength=float("nan"), cap_nits=float("nan")))
     assert (c.strength, c.cap_nits) == (1.0, 0.05)
     d = GlowFillParams()
-    assert (d.strength, d.reach, d.cap_nits, d.envelope, d.band) == (1.0, 2, 0.05, "close", True)
+    assert (d.strength, d.reach, d.cap_nits, d.envelope, d.band, d.band_feather) == (1.0, 2, 0.05, "close", True, True)
 
 
 # ---------------------------------------------------------------------------------------------- the count-threshold band
@@ -324,8 +326,11 @@ def test_no_filled_zone_is_parked_at_the_firmwares_count_threshold(model):
     z1, lit1 = _zone_stat(m, res["on"]["req"])
     assert int((~lit1 & (np.abs(z1 - 1.0) < 0.15)).sum()) == 0                   # with it: none
     assert b["band"].sum() >= 4 and np.all(b["k"][b["band"]] < 1.0) and np.all(b["k"] <= 1.0) and np.all(b["k"][~b["band"]] == 1.0)
-    assert np.all((b["pf"][b["band"]] >= BAND_LO * m.p.boost_mean_thresh) & (b["pf"][b["band"]] <= BAND_HI * m.p.boost_mean_thresh))
-    assert np.allclose(z1[b["band"]], BAND_LO, rtol=0.03)                         # scaled DOWN to the band's lower edge
+    t = m.p.boost_mean_thresh
+    assert np.all((b["pf"][b["band0"]] >= BAND_LO * t) & (b["pf"][b["band0"]] <= BAND_HI * t))   # the prediction's band ...
+    assert np.array_equal(b["band"], b["band0"] | b["guard_added"]) and np.all(b["pf"][b["guard_added"]] > BAND_HI * t)   # + the guard's
+    # scaled DOWN to the band's lower edge (C16: the feather of a neighbouring band zone takes a little more)
+    assert np.all(z1[b["band"]] <= BAND_LO * 1.03) and np.all(z1[b["band0"]] >= 0.85 * BAND_LO)
     assert res["zones_sent"] <= free["zones_sent"]
     # (k is formed per round: round 0's prediction is NOT the sent frame's here — the fill sits in the B_est fade band and
     # the trust moves between the rounds — which is why round 1 forms its own)
@@ -357,3 +362,183 @@ def test_want_is_the_interpolated_zone_deficit(model):
     assert np.allclose(deficit(v, e), [0.0, 0.0, 0.10 * t * t * (3 - 2 * t), 0.5, 0.2])   # shallow dips are no holes
     d_px = _bilinear_zones(model, g["dz"])
     assert np.allclose(g["want"], np.maximum(d_px - WANT_EPS, 0.0), rtol=0, atol=1e-15)
+
+
+# ---------------------------------------------------------------------------------------------- C16: feather + neighbour guard
+def windows(m, bg, level=200.0, size_px=240, step=6, start=3):
+    """200-nit windows (size_px x size_px / 2 at full resolution) at every ``step``-th zone centre on a dim sky."""
+    img = np.full((3, m.h, m.w), float(bg))
+    s = size_px / m.p.scale
+    for zy in range(start, m.p.rows, step):
+        for zx in range(start, m.p.cols, step):
+            cy, cx = (zy + 0.5) * m.ch, (zx + 0.5) * m.cw
+            img[:, int(cy - s / 4): int(cy + s / 4), int(cx - s / 2): int(cx + s / 2)] = level
+    return img
+
+
+def _round_fields(m, glow):
+    """The last round's (b_true, b_est), rebuilt from its input the way correct_image forms them."""
+    cur = glow["round_input"]
+    d = m.cell_drives(cur)
+    b_true, b_est = m.backlights(d, d, boost=m.led_boost(cur))
+    return np.maximum(b_true, 0.0), b_est
+
+
+def _zone_pow_mean(m, req):
+    p = m.p
+    return np.power(np.maximum(req.max(axis=0), 0.0), p.boost_mean_gamma).reshape(p.rows, m.ch, p.cols, m.cw).mean(axis=(1, 3))
+
+
+@pytest.fixture(scope="module")
+def mean_model(model):
+    return FaldModel(replace(model.p, boost_lut=MEAN_LUT, boost_rule="mean"))
+
+
+def test_the_band_feather_geometry(model):
+    """C16 pixel rule: w = 1 on the neighbour's rectangle, C1 down to 0 at FEATHER zones; s = min(k_z, min_n 1 - (1 - k_n)
+    w_n) is exactly 1 with no band zone near, k_z inside a lone band zone, and ramps (no step) across its edges."""
+    assert (FEATHER, GUARD_ITER_MAX) == (0.35, 16)
+    assert NEIGHBOURS == tuple((c % 3 - 1, c // 3 - 1) for c in range(9) if c != 4)       # 3 x 3 row-major, centre skipped
+    u = np.linspace(0.0, 0.999, 1000)
+    w = feather_weight(-1, 0, u, np.array([0.5]))[0]                                      # the left neighbour: distance = u
+    assert w[0] == 1.0 and np.all(w[u >= FEATHER] == 0.0) and np.all(np.diff(w) <= 0.0)
+    t = u[u < FEATHER] / FEATHER
+    assert np.allclose(w[u < FEATHER], 1.0 - t * t * (3.0 - 2.0 * t), rtol=0, atol=1e-15)   # smoothstep: C1 at both ends
+    corner = feather_weight(-1, -1, np.array([0.1]), np.array([0.2]))[0, 0]               # the corner: the euclidean distance
+    tc = np.hypot(0.1, 0.2) / FEATHER
+    assert corner == pytest.approx(1.0 - tc * tc * (3.0 - 2.0 * tc), abs=1e-15)
+    p = model.p
+    k = np.ones((p.rows, p.cols))
+    assert np.array_equal(band_pixel_scale(model, k), np.ones((model.h, model.w)))       # EXACTLY 1 without a band zone
+    k[24, 24] = 0.4
+    s = band_pixel_scale(model, k)
+    ys, xs = slice(24 * model.ch, 25 * model.ch), slice(24 * model.cw, 25 * model.cw)
+    assert np.all(s[ys, xs] == 0.4) and np.all(s >= 0.4) and np.all(s <= 1.0)           # the band zone keeps its own k
+    zx, zy, u2, v2 = zone_local(model)
+    X = zx[None, :] + u2[None, :]; Y = zy[:, None] + v2[:, None]                          # pixel centres in zone units
+    dist = np.hypot(np.maximum(0.0, np.maximum(24.0 - X, X - 25.0)), np.maximum(0.0, np.maximum(24.0 - Y, Y - 25.0)))
+    assert np.all(s[dist >= FEATHER] == 1.0) and np.all(s[(dist > 0) & (dist < FEATHER)] < 1.0)
+    row = s[24 * model.ch + model.ch // 2]
+    steps = np.abs(np.diff(row))
+    edge = max(steps[25 * model.cw - 1], steps[24 * model.cw - 1])                       # across the zone's two vertical edges
+    assert edge < 0.25 * steps.max() and edge < 0.02                                      # a ramp, not a step (was 0.6)
+
+
+def _edge_steps(m, fill, k):
+    """Per zone edge where k differs across it: (the largest step of the displayed fill across that edge, the largest step
+    between adjacent pixels inside the two zones, in the same direction and rows / columns)."""
+    p, ch, cw = m.p, m.ch, m.cw
+    out = []
+    for zy in range(p.rows):
+        for zx in range(p.cols):
+            if zx + 1 < p.cols and k[zy, zx] != k[zy, zx + 1]:
+                d = np.abs(np.diff(fill[zy * ch:(zy + 1) * ch, zx * cw:(zx + 2) * cw], axis=1))
+                out.append((d[:, cw - 1].max(), np.delete(d, cw - 1, axis=1).max()))
+            if zy + 1 < p.rows and k[zy, zx] != k[zy + 1, zx]:
+                d = np.abs(np.diff(fill[zy * ch:(zy + 2) * ch, zx * cw:(zx + 1) * cw], axis=0))
+                out.append((d[ch - 1, :].max(), np.delete(d, ch - 1, axis=0).max()))
+    return np.array(out)
+
+
+def test_the_feathered_band_draws_no_zone_edge(mean_model):
+    """C16's point (spec test a): at every zone edge where the final k differs across it, the displayed fill steps across
+    the edge no more than it does between adjacent pixels inside the two zones. The rule before C16 (the pixel's own
+    zone's k) fails that on most such edges — up to a third of the local level in one pixel."""
+    m = mean_model
+    img = windows(m, 0.004)
+    gp = GlowFillParams(cap_nits=0.05)
+    g = fill_image(m, img, gp)["glow"]
+    b = g["band"]
+    assert b["band0"].sum() >= 20 and b["guard_added"].sum() >= 10 and g["fill"].max() > 0.01
+    steps = _edge_steps(m, g["fill"], b["k"])
+    assert len(steps) >= 100 and np.all(steps[:, 0] <= steps[:, 1] * (1.0 + 1e-9) + 1e-15)
+    old = fill_image(m, img, replace(gp, band_feather=False))["glow"]
+    s_old = _edge_steps(m, old["fill"], old["band"]["k"])
+    level = old["v_px"] + old["fill"]
+    assert (s_old[:, 0] > s_old[:, 1] * 1.5).sum() > 0.5 * len(s_old)                  # the seams C16 removes
+    assert float(np.max(np.abs(np.diff(old["fill"], axis=1)) / np.maximum(level[:, 1:], 1e-9))) > 0.25
+
+
+def test_the_neighbour_guard_keeps_every_zone_out_of_the_margin(mean_model):
+    """Spec test b, on the round the evidence comes from (its fields rebuilt): every zone counted only by the fill that is
+    not banded ends >= BAND_HI T, every band zone ends <= its band0 prediction (the statistic with its own zone's k on its
+    own pixels), zones below BAND_LO T stay below, zones counted by their content stay counted."""
+    m = mean_model
+    p = m.p
+    t = p.boost_mean_thresh
+    gp = GlowFillParams(cap_nits=0.05)
+    g = fill_image(m, windows(m, 0.004), gp)["glow"]
+    b_true, b_est = _round_fields(m, g)
+    b = band_scale(m, g["req_nofill"], b_true, b_est, g["dz"], g["ez"], gp)
+    assert np.array_equal(b["k"], g["band"]["k"]) and np.array_equal(b["band"], g["band"]["band"])   # the fields are the round's
+    assert 2 <= b["iterations"] <= GUARD_ITER_MAX and b["guard_added"].sum() >= 10
+    req = g["req_nofill"]
+    final = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp, k=b["k"])["add"])
+    assert np.allclose(final, _zone_pow_mean(m, np.where(g["add"] > 0.0, req + g["add"], req)), rtol=1e-12)
+    band0_pred = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], replace(gp, band_feather=False), k=b["k"])["add"])
+    free = ~b["lit"] & (b["pc"] < t)
+    counted_by_fill = free & (b["pf"] > BAND_HI * t)
+    assert (counted_by_fill & ~b["band"]).sum() >= 10
+    assert np.all(final[counted_by_fill & ~b["band"]] >= BAND_HI * t)
+    assert np.all(final[b["band"]] <= band0_pred[b["band"]] * (1.0 + 1e-12))
+    assert np.all(final[b["band0"]] <= BAND_LO * t * (1.0 + 1e-9))
+    below = free & (b["pf"] < BAND_LO * t)
+    assert np.all(final[below] < BAND_LO * t)
+    content = b["lit"] | (b["pc"] >= t)
+    assert content.sum() > 0 and np.all(b["k"][content] == 1.0) and np.all(final[content & ~b["lit"]] >= t)
+    # the rule before C16 on the same round: the pixels of the band zones' neighbours keep their full fill
+    old = band_scale(m, req, b_true, b_est, g["dz"], g["ez"], replace(gp, band_feather=False))
+    assert not old["guard_added"].any() and np.array_equal(old["band"], b["band0"]) and old["A"] is None
+
+
+def test_the_guard_is_jacobi_and_joins_only_fill_counted_zones():
+    """G5's semantics on a 1 x 5 chain: zone 0 is in the band (k0 = 0); zone 1 falls below BAND_HI T only through zone
+    0, zone 2 only once zone 1 has joined. Jacobi (every zone reads the previous iteration's k, as the GPU's one thread
+    group does) takes two iterations to band both and a third to see nothing join; a non-candidate never joins."""
+    hi = np.float32(1.25)
+    k0 = np.array([[0.0, 1.0, 1.0, 1.0, 1.0]], dtype=np.float32)
+    band0 = k0 < 1.0
+    cand = np.array([[False, True, True, False, True]])
+    pf = np.full((1, 5), np.float32(1.5), dtype=np.float32)
+    a = np.zeros((8, 1, 5), dtype=np.float32)
+    left = NEIGHBOURS.index((-1, 0))
+    a[left, 0, 1] = 0.5          # zone 1 loses 0.5 (1 - k_0) through its left neighbour
+    a[left, 0, 2] = 0.4          # zone 2 loses 0.4 (1 - k_1)
+    a[left, 0, 3] = 0.9          # zone 3 would, but is no candidate
+    kj = np.full((1, 5), np.float32(0.3), dtype=np.float32)
+    r = guard(k0, band0, cand, kj, pf, a, hi)
+    assert r["k"].dtype == np.float32 and r["iterations"] == 3
+    assert r["band"].tolist() == [[True, True, True, False, False]] and r["added"].tolist() == [[False, True, True, False, False]]
+    assert r["k"].tolist() == [[0.0, np.float32(0.3), np.float32(0.3), 1.0, 1.0]]
+    capped = guard(k0, band0, cand, kj, pf, a, hi, iter_max=1)                           # the cap: one iteration, zone 1 only
+    assert capped["added"].tolist() == [[False, True, False, False, False]] and capped["iterations"] == 1
+
+
+def test_c16_is_bit_identical_away_from_the_band(mean_model, model):
+    """Spec test c: a frame whose band stays empty gives the output of the rule without it, bit for bit; with band zones
+    (the same round fields and k) every pixel outside the 3 x 3 neighbourhood of every band zone is untouched by the
+    feather, and inside a band zone the scale never exceeds the zone's k."""
+    m = mean_model
+    gp = GlowFillParams(cap_nits=0.5)
+    img = lattice(m)                                                             # full-white stars: the fill lands far above T
+    on = fill_image(m, img, gp)
+    assert not on["glow"]["band"]["band"].any() and on["glow"]["fill"].max() > 0.02
+    for other in (replace(gp, band_feather=False), replace(gp, band=False)):
+        assert np.array_equal(on["req"], fill_image(m, img, other)["req"])
+    g = fill_image(m, windows(m, 0.004), GlowFillParams(cap_nits=0.05))["glow"]
+    b_true, b_est = _round_fields(m, g)
+    k = g["band"]["k"]
+    args = (m, g["req_nofill"], b_true, b_est, g["dz"], g["ez"])
+    new = round_fill(*args, GlowFillParams(cap_nits=0.05), k=k)
+    old = round_fill(*args, GlowFillParams(cap_nits=0.05, band_feather=False), k=k)
+    near = np.zeros_like(k, dtype=bool)
+    for zy, zx in zip(*np.nonzero(k < 1.0)):
+        near[max(zy - 1, 0): zy + 2, max(zx - 1, 0): zx + 2] = True
+    far = ~np.repeat(np.repeat(near, m.ch, axis=0), m.cw, axis=1)
+    assert far.sum() > 0.2 * far.size and (~far).sum() > 0
+    assert np.array_equal(new["add"][:, far], old["add"][:, far]) and np.all(new["s"][far] == 1.0)
+    inside = np.repeat(np.repeat(k < 1.0, m.ch, axis=0), m.cw, axis=1)
+    assert np.all(new["s"][inside] <= old["s"][inside]) and np.all(new["add"][:, inside] <= old["add"][:, inside] + 1e-15)
+    # (no band table at all: k is all ones and the pixel scale is exactly 1 everywhere)
+    plain = fill_image(model, windows(model, 0.004), GlowFillParams(cap_nits=0.05))["glow"]
+    assert np.all(plain["band"]["k"] == 1.0) and np.all(plain["s"] == 1.0)

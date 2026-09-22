@@ -36,10 +36,10 @@ struct ID3D11RenderTargetView;
 struct ID3D11Texture2D;
 
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
-// (t0..t24, u0..u1). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
+// (t0..t26, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
-#define HOOK_FALD_SRV_SLOTS 25
-#define HOOK_FALD_UAV_SLOTS 4   // u0..u3: the panel-clock pass (LED lag mode 3) binds four
+#define HOOK_FALD_SRV_SLOTS 27
+#define HOOK_FALD_UAV_SLOTS 4   // u0..u3: the panel-clock pass (LED lag mode 3) and the glow band G4 bind four
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed
 // out by FaldAcquire and released wholesale by FaldReleaseAll (UninitializeStuff).

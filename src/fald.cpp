@@ -26,7 +26,8 @@ static ID3D11ComputeShader* g_faldGlowZoneCS = nullptr;   // glow fill G0: zone 
 static ID3D11ComputeShader* g_faldGlowDilateCS = nullptr; // G1: box maximum on the extended lattice
 static ID3D11ComputeShader* g_faldGlowErodeCS = nullptr;  // G2: box minimum = the closing
 static ID3D11ComputeShader* g_faldGlowEnvCS = nullptr;    // G3: blur under the closing + the zone deficit
-static ID3D11ComputeShader* g_faldGlowBandCS = nullptr;   // G4: the count-threshold band's zone scale (round 0, mean-rule files)
+static ID3D11ComputeShader* g_faldGlowBandCS = nullptr;   // G4: the count-threshold band's per-zone record (mean-rule files)
+static ID3D11ComputeShader* g_faldGlowGuardCS = nullptr;  // G5: the band's neighbour guard -> the final zone scale k (C16)
 // The zone sweeps' combine variants (work guide C14; fald_shader.h above ZoneSlices): run only for a lattice whose zones
 // hold more than FALD_ZONE_SLICE_PX pixels, after the sliced pass, to fold its partials and finish each zone. Optional:
 // a compile failure costs only the lattices that need them (Build / EnsureStar / EnsureGlow refuse those).
@@ -157,10 +158,10 @@ bool InitFaldShaders() {
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star plan) failed" << std::endl; return false; }
     {
-        struct { const char* src; const char* name; ID3D11ComputeShader** cs; } glow[5] = {
+        struct { const char* src; const char* name; ID3D11ComputeShader** cs; } glow[6] = {
             { g_faldGlowZoneSource, "FaldGlowZoneCS", &g_faldGlowZoneCS }, { g_faldGlowDilateSource, "FaldGlowDilateCS", &g_faldGlowDilateCS },
             { g_faldGlowErodeSource, "FaldGlowErodeCS", &g_faldGlowErodeCS }, { g_faldGlowEnvSource, "FaldGlowEnvCS", &g_faldGlowEnvCS },
-            { g_faldGlowBandSource, "FaldGlowBandCS", &g_faldGlowBandCS } };
+            { g_faldGlowBandSource, "FaldGlowBandCS", &g_faldGlowBandCS }, { g_faldGlowGuardSource, "FaldGlowGuardCS", &g_faldGlowGuardCS } };
         for (auto& g : glow) {
             if (!CompileOne(common + g.src, g.name, "cs_5_0", &b)) return false;
             hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, g.cs);
@@ -199,6 +200,7 @@ void ReleaseFaldShaders() {
     if (g_faldGlowBandCombineCS) { g_faldGlowBandCombineCS->Release(); g_faldGlowBandCombineCS = nullptr; }
     if (g_faldStarStatCombineCS) { g_faldStarStatCombineCS->Release(); g_faldStarStatCombineCS = nullptr; }
     if (g_faldStatCombineCS) { g_faldStatCombineCS->Release(); g_faldStatCombineCS = nullptr; }
+    if (g_faldGlowGuardCS) { g_faldGlowGuardCS->Release(); g_faldGlowGuardCS = nullptr; }
     if (g_faldGlowBandCS) { g_faldGlowBandCS->Release(); g_faldGlowBandCS = nullptr; }
     if (g_faldGlowEnvCS) { g_faldGlowEnvCS->Release(); g_faldGlowEnvCS = nullptr; }
     if (g_faldGlowErodeCS) { g_faldGlowErodeCS->Release(); g_faldGlowErodeCS = nullptr; }
@@ -219,7 +221,8 @@ void ReleaseFaldShaders() {
 bool FaldShadersReady() {
     return g_faldStatCS && g_faldConvCS && g_faldGainCS && g_faldBlurCS && g_faldTemporalCS && g_faldPanelClockCS && g_faldBoostCS &&
            g_faldStarStatCS && g_faldStarWeightCS && g_faldStarPlanCS &&
-           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldPS && g_faldSampler;
+           g_faldGlowZoneCS && g_faldGlowDilateCS && g_faldGlowErodeCS && g_faldGlowEnvCS && g_faldGlowBandCS && g_faldGlowGuardCS &&
+           g_faldPS && g_faldSampler;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -245,6 +248,10 @@ static void ReleaseGlow(FaldResources* r) {
     SafeRelease(r->glowCSRV); SafeRelease(r->glowCUAV); SafeRelease(r->glowCTex);
     SafeRelease(r->glowEnvSRV); SafeRelease(r->glowEnvUAV); SafeRelease(r->glowEnvTex);
     SafeRelease(r->glowKSRV); SafeRelease(r->glowKUAV); SafeRelease(r->glowKTex);
+    SafeRelease(r->glowBandSRV); SafeRelease(r->glowBandUAV); SafeRelease(r->glowBandTex);
+    SafeRelease(r->glowASRV); SafeRelease(r->glowAUAV); SafeRelease(r->glowATex);
+    SafeRelease(r->glowKTmpSRV); SafeRelease(r->glowKTmpUAV); SafeRelease(r->glowKTmpTex);
+    SafeRelease(r->glowBandPartUAV); SafeRelease(r->glowBandPartBuf);
     r->glowOn = false;
     r->glowBand = false;
     r->glowRetryCounter = 0;                 // option off / resources rebuilt: the next enable tries at once
@@ -309,6 +316,22 @@ static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11Unordered
     return true;
 }
 
+// The zone sweeps' slice partials (fald_shader.h ZonePart; G4's GlowBandPart): cols * rows * slices records, UAV only.
+static bool MakeZonePartBuffer(UINT count, ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav, UINT stride = FALD_ZONE_PART_BYTES) {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = count * stride;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = stride;
+    if (FAILED(g_device->CreateBuffer(&bd, nullptr, buf))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_UNKNOWN;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = count;
+    return SUCCEEDED(g_device->CreateUnorderedAccessView(*buf, &ud, uav));
+}
+
 // The five cols x rows RGBA32F textures of the starfield balancing (created on the first frame the option is on).
 static bool EnsureStar(FaldResources* r) {
     if (r->zoneSlices > 1 && !g_faldStarStatCombineCS) return false;   // zones of several slices: S0 needs its combine
@@ -335,21 +358,30 @@ static bool EnsureStar(FaldResources* r) {
     return false;
 }
 
-// The five zone textures of the glow fill (created on the first frame the option is on): Vz, the dilation on the
-// lattice extended by FALD_GLOW_REACH_MAX on every side, the closing, (Ez, Dz, Cz, Vz) for the pixels, and the
-// count-threshold band's scale k.
+// The zone textures of the glow fill (created on the first frame the option is on): Vz, the dilation on the lattice
+// extended by FALD_GLOW_REACH_MAX on every side, the closing, (Ez, Dz, Cz, Vz) for the pixels, and the count-threshold
+// band's scale k; with the band (FaldGlowBandActive, C16) also G4's record + neighbour bound, G5's scratch k and — zones
+// of more than one slice — G4's partials of the bound.
 static bool EnsureGlow(FaldResources* r) {
-    if (r->zoneSlices > 1 && FaldGlowBandActive(r->params) && !g_faldGlowBandCombineCS) return false;   // G4 needs its combine
-    if (r->glowVTex && r->glowDilTex && r->glowCTex && r->glowEnvTex && r->glowKTex) return true;
+    const bool band = FaldGlowBandActive(r->params);
+    if (r->zoneSlices > 1 && band && !g_faldGlowBandCombineCS) return false;   // G4 needs its combine
+    if (r->glowVTex && r->glowDilTex && r->glowCTex && r->glowEnvTex && r->glowKTex &&
+        (!band || (r->glowBandTex && r->glowATex && r->glowKTmpTex && (r->zoneSlices == 1 || r->glowBandPartBuf)))) return true;
     // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
     if (r->glowRetryCounter != 0 && (r->glowRetryCounter++ % 300) != 0) return false;
     ReleaseGlow(r);
     const FaldPanelParams& p = r->params;
+    const DXGI_FORMAT f4 = DXGI_FORMAT_R32G32B32A32_FLOAT;
     if (MakeRWTexture(p.cols, p.rows, &r->glowVTex, &r->glowVUAV, &r->glowVSRV) &&
         MakeRWTexture(p.cols + 2 * FALD_GLOW_REACH_MAX, p.rows + 2 * FALD_GLOW_REACH_MAX, &r->glowDilTex, &r->glowDilUAV, &r->glowDilSRV) &&
         MakeRWTexture(p.cols, p.rows, &r->glowCTex, &r->glowCUAV, &r->glowCSRV) &&
-        MakeRWTexture(p.cols, p.rows, &r->glowEnvTex, &r->glowEnvUAV, &r->glowEnvSRV, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
-        MakeRWTexture(p.cols, p.rows, &r->glowKTex, &r->glowKUAV, &r->glowKSRV)) {
+        MakeRWTexture(p.cols, p.rows, &r->glowEnvTex, &r->glowEnvUAV, &r->glowEnvSRV, f4) &&
+        MakeRWTexture(p.cols, p.rows, &r->glowKTex, &r->glowKUAV, &r->glowKSRV) &&
+        (!band || (MakeRWTexture(p.cols, p.rows, &r->glowBandTex, &r->glowBandUAV, &r->glowBandSRV, f4) &&
+                   MakeRWTexture(2 * p.cols, p.rows, &r->glowATex, &r->glowAUAV, &r->glowASRV, f4) &&
+                   MakeRWTexture(p.cols, p.rows, &r->glowKTmpTex, &r->glowKTmpUAV, &r->glowKTmpSRV) &&
+                   (r->zoneSlices == 1 || MakeZonePartBuffer(p.cols * p.rows * r->zoneSlices, &r->glowBandPartBuf,
+                                                             &r->glowBandPartUAV, FALD_GLOW_BAND_PART_BYTES))))) {
         r->glowFailLogged = false;
         return true;
     }
@@ -383,22 +415,6 @@ static bool EnsureClock(FaldResources* r) {
         r->clkFailLogged = true;
     }
     return false;
-}
-
-// The zone sweeps' slice partials (fald_shader.h ZonePart): cols * rows * slices records, UAV only.
-static bool MakeZonePartBuffer(UINT count, ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav) {
-    D3D11_BUFFER_DESC bd = {};
-    bd.ByteWidth = count * FALD_ZONE_PART_BYTES;
-    bd.Usage = D3D11_USAGE_DEFAULT;
-    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-    bd.StructureByteStride = FALD_ZONE_PART_BYTES;
-    if (FAILED(g_device->CreateBuffer(&bd, nullptr, buf))) return false;
-    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-    ud.Format = DXGI_FORMAT_UNKNOWN;
-    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-    ud.Buffer.NumElements = count;
-    return SUCCEEDED(g_device->CreateUnorderedAccessView(*buf, &ud, uav));
 }
 
 static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) {
@@ -626,7 +642,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     g_context->Unmap(r->cb, 0);
 }
 
-static const UINT FALD_SRV_SLOTS = 25;   // t0..t24 (fald_shader.h)
+static const UINT FALD_SRV_SLOTS = 27;   // t0..t26 (fald_shader.h)
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
@@ -638,7 +654,8 @@ static void BindCommon(FaldResources* r, bool compute) {
                                                        nullptr,                              // t19: star pass S1 only (RunStar)
                                                        nullptr, nullptr, nullptr,            // t20-t22: glow passes only (RunGlow)
                                                        r->glowOn ? r->glowEnvSRV : nullptr,  // t23: the glow deficit (GlowAdd)
-                                                       r->glowBand ? r->glowKSRV : nullptr };  // t24: the band's zone scale (GlowAdd)
+                                                       r->glowBand ? r->glowKSRV : nullptr,  // t24: the band's zone scale (GlowAdd)
+                                                       nullptr, nullptr };                   // t25 / t26: glow pass G5 only (RunGlow)
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
@@ -652,9 +669,9 @@ static void BindCommon(FaldResources* r, bool compute) {
 
 static void UnbindCompute() {
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
-    ID3D11UnorderedAccessView* nullUav[3] = {};             // u0 / u1 + u2, the zone sweeps' partials
+    ID3D11UnorderedAccessView* nullUav[4] = {};             // u0 / u1 + u2, the zone sweeps' partials (+ u3: G4's bound partials)
     g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
-    g_context->CSSetUnorderedAccessViews(0, 3, nullUav, nullptr);
+    g_context->CSSetUnorderedAccessViews(0, 4, nullUav, nullptr);
     g_context->CSSetShader(nullptr, nullptr, 0);
 }
 
@@ -761,10 +778,11 @@ static void RunGlow(FaldResources* r, uint32_t roundIdx) {
     g_context->CSSetUnorderedAccessViews(0, 1, &r->glowEnvUAV, nullptr);
     g_context->Dispatch(gz, gzy, 1);
     UnbindCompute();
-    // G4 (band only, EVERY round): the zone scale k that keeps the fill off the firmware's count threshold — a
+    // G4 (band only, EVERY round): the zone record that keeps the fill off the firmware's count threshold — a
     // full-resolution sweep like the statistic pass, on THIS round's corrected request (its fields + gain are what is
-    // bound). Round 1's k is exact for the frame that is sent; round 0's is not when the trust factor moves between the
-    // rounds (DLC glowfill.py item 7). k is unbound as an SRV while it is written (the pass calls GlowAddK with k = 1).
+    // bound): (Pc, Pf, LIT flag, k0) and the neighbour bound A_d (C16). Round 1's k is exact for the frame that is sent;
+    // round 0's is not when the trust factor moves between the rounds (DLC glowfill.py item 7). G5 then runs the
+    // neighbour guard (one thread group) and writes the final k; k (t24) is not bound while the two run.
     (void)roundIdx;
     if (r->glowBand) {
         g_context->CSSetShader(g_faldGlowBandCS, nullptr, 0);
@@ -774,13 +792,23 @@ static void RunGlow(FaldResources* r, uint32_t roundIdx) {
         g_context->CSSetShaderResources(9, 1, &r->gainBSRV);
         ID3D11ShaderResourceView* none = nullptr;
         g_context->CSSetShaderResources(24, 1, &none);
-        ID3D11UnorderedAccessView* uk[3] = { r->glowKUAV, nullptr, r->zonePartUAV };     // u2: zones > one slice
-        g_context->CSSetUnorderedAccessViews(0, 3, uk, nullptr);
+        ID3D11UnorderedAccessView* ub[4] = { r->glowBandUAV, r->glowAUAV, r->zonePartUAV,   // u2 / u3: the slice partials
+                                             r->glowBandPartUAV };                            // (zones > one slice only)
+        g_context->CSSetUnorderedAccessViews(0, 4, ub, nullptr);
         g_context->Dispatch(p.cols, p.rows, r->zoneSlices);
         if (r->zoneSlices > 1) {
             g_context->CSSetShader(g_faldGlowBandCombineCS, nullptr, 0);
             g_context->Dispatch(p.cols, p.rows, 1);
         }
+        UnbindCompute();
+        // G5: the neighbour guard -> the final k (glowK = t24 of GlowAdd); its Jacobi state in u0, the scratch in u1
+        g_context->CSSetShader(g_faldGlowGuardCS, nullptr, 0);
+        g_context->CSSetConstantBuffers(0, 1, &r->cb);
+        ID3D11ShaderResourceView* in5[2] = { r->glowBandSRV, r->glowASRV };
+        g_context->CSSetShaderResources(25, 2, in5);
+        ID3D11UnorderedAccessView* u5[2] = { r->glowKUAV, r->glowKTmpUAV };
+        g_context->CSSetUnorderedAccessViews(0, 2, u5, nullptr);
+        g_context->Dispatch(1, 1, 1);
         UnbindCompute();
     }
 }
@@ -1001,7 +1029,11 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     if (r->glowOn) {
         DumpTexture(r->glowVTex, dir + L"fald_glow_vz.f32", p.cols, p.rows, 4);
         DumpTexture(r->glowEnvTex, dir + L"fald_glow_env.f32", p.cols, p.rows, 16);
-        if (r->glowBand) DumpTexture(r->glowKTex, dir + L"fald_glow_k.f32", p.cols, p.rows, 4);   // round 1's band scale
+        if (r->glowBand) {                                                                         // round 1's band (C16):
+            DumpTexture(r->glowKTex, dir + L"fald_glow_k.f32", p.cols, p.rows, 4);                 // the FINAL k (G5)
+            DumpTexture(r->glowBandTex, dir + L"fald_glow_band.f32", p.cols, p.rows, 16);          // G4: Pc, Pf, LIT flag, k0
+            DumpTexture(r->glowATex, dir + L"fald_glow_bandA.f32", 2 * p.cols, p.rows, 16);        // G4: A_0..A_7 per zone
+        }
     }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
@@ -1057,7 +1089,9 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " [Ez, Dz, Cz, Vz]: cols x rows float32, round 1)"
          << "\nglowfill strength " << r->glow.strength << " reach " << r->glow.reach << " cap_nits " << r->glow.capNits
          << " req_ceil " << FaldGlowReqCeil(p) << " band " << (r->glowBand ? 1 : 0)
-         << " (band 1 = the count-threshold band: fald_glow_k.f32 = the zones' scale k of round 1; needs a boost LUT + the mean zone rule)"
+         << " (band 1 = the count-threshold band, round 1: fald_glow_k.f32 = the zones' final scale k [G5], fald_glow_band.f32 ="
+         << " [Pc, Pf, LIT flag, k0] x 4 float32, fald_glow_bandA.f32 = the neighbour bound A_0..A_7 x 8 float32 [G4]; needs a boost"
+         << " LUT + the mean zone rule)"
          << ((fs.glow.enabled && !FaldGlowSupported(p)) ? "\nglowfill refused: " : "") << ((fs.glow.enabled && !FaldGlowSupported(p)) ? FALD_GLOW_SDR_NOTE : "")
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;

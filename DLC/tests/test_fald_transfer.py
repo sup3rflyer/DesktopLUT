@@ -318,6 +318,7 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
                            ("g_faldStarPlanSource", "cs_5_0"), ("g_faldConvSource", "cs_5_0"), ("g_faldPanelClockSource", "cs_5_0"),
                            ("g_faldGlowZoneSource", "cs_5_0"), ("g_faldGlowDilateSource", "cs_5_0"),
                            ("g_faldGlowErodeSource", "cs_5_0"), ("g_faldGlowEnvSource", "cs_5_0"), ("g_faldGlowBandSource", "cs_5_0"),
+                           ("g_faldGlowGuardSource", "cs_5_0"),                                  # C16: the neighbour guard G5
                            ("g_faldGainSource", "cs_5_0"), ("g_faldBlurSource", "cs_5_0")):   # the two-channel gain (C15)
         asm = _d3d_disassemble(part("g_faldCommonSource") + part(shader), target)
         block = re.search(r"cbuffer FaldCB\s*//\s*\{(.*?)//\s*\}", asm, re.S).group(1)

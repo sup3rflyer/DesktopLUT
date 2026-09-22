@@ -32,8 +32,9 @@ Glow fill (work guide S2; the rules = the module docstring of :mod:`dlc.fald.glo
 ``g_faldGlowZoneSource`` zone pedestal, G1 ``g_faldGlowDilateSource`` box maximum on the lattice extended by ``reach``,
 G2 ``g_faldGlowErodeSource`` box minimum = the closing, G3 ``g_faldGlowEnvSource`` blur + min + deficit; float32, the
 shaders' loop order), then — files with a boost LUT and the mean zone rule only — the count-threshold band
-(:meth:`Emu.glow_band` = G4 ``g_faldGlowBandSource``: a full-resolution sweep like the statistic pass -> the zone's scale k,
-which GlowAdd loads for the pixel's OWN zone; formed in EACH round from that round's request) and adds ``GlowAdd`` (:meth:`Emu.glow_add`) to that round's
+(:meth:`Emu.glow_band` = G4 ``g_faldGlowBandSource``: a full-resolution sweep like the statistic pass -> the zone's k0 and
+the neighbour bound A_d; + G5 ``g_faldGlowGuardSource``, the neighbour guard -> the final k, which GlowAdd reads through the
+feather of C16, :meth:`Emu.band_scale_px`; formed in EACH round from that round's request) and adds ``GlowAdd`` (:meth:`Emu.glow_add`) to that round's
 corrected request — round 0's feeds the round-1 statistic / boost flags, round 1's is the output. ``glow=None`` runs none
 of it (the previous emulator, bit for bit). HDR (PQ files) only, like the C++.
 EXACTNESS of the fill against a real device (WARP, 2026-09-20): the zone fields agree to <= 1e-5 relative (float32 sum
@@ -59,8 +60,8 @@ from typing import Optional
 import numpy as np
 from scipy.signal import convolve2d
 
-from .glowfill import (BAND_HI, BAND_LO, DEFICIT_REL_HI, DEFICIT_REL_LO, GLOW_SIGMA_BASE, GLOW_SIGMA_PER_REACH, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS,
-                       GlowFillParams, clamp_params as clamp_glow)
+from .glowfill import (BAND_HI, BAND_LO, DEFICIT_REL_HI, DEFICIT_REL_LO, FEATHER, GLOW_SIGMA_BASE, GLOW_SIGMA_PER_REACH, GUARD_ITER_MAX,
+                       NEIGHBOURS, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS, GlowFillParams, clamp_params as clamp_glow)
 from .panelfile import boost_of_count
 from .starfield import StarfieldParams
 from .temporal import MODE_BOTH, MODE_OFF, MODE_TRUE_ONLY, alpha_from_tau
@@ -592,39 +593,137 @@ class Emu:
         return bool(self.boostN) and self.boostRule == 1
 
     def glow_band(self, req, sT, sE, dz, gp: GlowFillParams):
-        """G4 g_faldGlowBandSource (glowfill.band_scale, item 7): per zone, over every pixel in the statistic pass's thread /
-        reduction order, float32 — the sum of (brightest channel)^gamma of the round-0 request WITHOUT (pc) and WITH the
-        fill of the unscaled deficit (pf), and the LIT count of the content; k = ((BAND_LO T - pc) / (pf - pc))^(1 / gamma)
-        for a zone not counted by its content whose pf lies in [BAND_LO T, BAND_HI T], else 1."""
+        """G4 g_faldGlowBandSource + G5 g_faldGlowGuardSource (glowfill.band_scale, item 7). G4: per zone, over every pixel
+        in the zone sweeps' thread / reduction order, float32 — the sum of (brightest channel)^gamma of the round's request
+        WITHOUT (pc) and WITH the fill of the unscaled deficit (pf), the LIT count of the content, k0 = ((BAND_LO T - pc) /
+        (pf - pc))^(1 / gamma) for a zone not counted by its content whose pf lies in [BAND_LO T, BAND_HI T] (else 1), and
+        (C16) the neighbour bound A_d = mean of w_d (pf_px - pc_px) / (1 - s0) (0 toward a neighbour outside the lattice).
+        G5: the neighbour guard's Jacobi iterations from k0 (:meth:`guard32`) -> the final k GlowAdd reads.
+        ``gp.band_feather`` False: the band before C16 (k = k0; no A, no guard)."""
         filled, _ = self.glow_add(req, sT, sE, dz, gp)                # k = 1: the unscaled rule
-        sl = (slice(self.oy, self.oy + self.rows * self.ch), slice(self.ox, self.ox + self.cols * self.cw))
         n = f32(self.cw * self.ch)
-        rc = req.max(axis=0)[sl].astype(np.float32).reshape(self.rows, self.ch, self.cols, self.cw)
-        rf = filled.max(axis=0)[sl].astype(np.float32).reshape(self.rows, self.ch, self.cols, self.cw)
-        pc = (self.zone_pow_sum(rc) / n).astype(np.float32)
-        pf = (self.zone_pow_sum(rf) / n).astype(np.float32)
-        lit = (rc > self.litNits).sum(axis=(1, 3)).astype(np.float32) / n > self.litFrac
+        rc = self._zone_px(req.max(axis=0).astype(np.float32))       # (rows, cols, cellW * cellH): the sweep's k order
+        rf = self._zone_px(filled.max(axis=0).astype(np.float32))
+        pwc, pwf = self._pow32(rc), self._pow32(rf)
+        pc = (self.zone_sweep_sum(pwc) / n).astype(np.float32)
+        pf = (self.zone_sweep_sum(pwf) / n).astype(np.float32)
+        lit = (rc > self.litNits).sum(axis=-1).astype(np.float32) / n > self.litFrac
         t = self.meanThresh
-        band = (~lit) & (pc < t) & (pf >= f32(BAND_LO) * t) & (pf <= f32(BAND_HI) * t)
+        band0 = (~lit) & (pc < t) & (pf >= f32(BAND_LO) * t) & (pf <= f32(BAND_HI) * t)
         share = np.clip((f32(BAND_LO) * t - pc) / np.maximum(pf - pc, f32(1e-30)), f32(0.0), f32(1.0)).astype(np.float32)
         pos = share > 0
         kk = np.where(pos, np.exp(np.log(np.where(pos, share, f32(1.0)), dtype=np.float32) / self.meanGamma, dtype=np.float32), f32(0.0))
-        return {"k": np.where(band, kk, f32(1.0)).astype(np.float32), "pc": pc, "pf": pf, "band": band}
+        k0 = np.where(band0, kk, f32(1.0)).astype(np.float32)
+        none = np.zeros_like(band0)
+        out = {"k": k0, "k0": k0, "pc": pc, "pf": pf, "lit": lit, "band": band0, "band0": band0, "guard_added": none,
+               "iterations": 0, "A": None}
+        if not gp.band_feather:
+            return out
+        # G4's neighbour bound: s0 = saturate(shown / want) with want / shown as GlowAddK forms them (unscaled want)
+        want = self._zone_px(self.glow_want(dz, gp).astype(np.float32))
+        shown = (rc * self._zone_px(np.maximum(sT, 0.0).astype(np.float32)) /
+                 np.maximum(self._zone_px(sE.astype(np.float32)), f32(1e-9))).astype(np.float32)
+        s0 = np.clip(shown / np.where(want > 0.0, want, f32(1.0)), f32(0.0), f32(1.0)).astype(np.float32)
+        live = (want > 0.0) & (s0 < f32(1.0))
+        q = np.where(live, (pwf - pwc) / np.where(live, f32(1.0) - s0, f32(1.0)), f32(0.0)).astype(np.float32)
+        u, v = self.zone_local32()
+        a = np.zeros((len(NEIGHBOURS), self.rows, self.cols), dtype=np.float32)
+        zy, zx = np.mgrid[0: self.rows, 0: self.cols]
+        for d, (i, j) in enumerate(NEIGHBOURS):
+            w = self._zone_px(self._feather32(i, j, u, v))
+            ad = (self.zone_sweep_sum((w * q).astype(np.float32)) / n).astype(np.float32)
+            exists = (zx + i >= 0) & (zx + i < self.cols) & (zy + j >= 0) & (zy + j < self.rows)
+            a[d] = np.where(exists, ad, f32(0.0))
+        # G5: the zones counted only by the fill (not LIT, pc < T, pf > BAND_HI T, not band0)
+        cand = (~lit) & (pc < t) & (pf > f32(BAND_HI) * t) & ~band0
+        k, iterations = self.guard32(k0, cand, kk, pf, a, (f32(BAND_HI) * t).astype(np.float32))
+        band = band0 | (k < f32(1.0))
+        out.update(k=k, band=band, guard_added=band & ~band0, iterations=iterations, A=a)
+        return out
+
+    def guard32(self, k0, cand, k_join, pf, a, hi):
+        """G5 g_faldGlowGuardSource, float32: Jacobi iterations — every zone reads the PREVIOUS iteration's k; a candidate
+        still at k 1 joins (k_join) when pf - loss < hi, loss = the sum over its existing neighbours d (NEIGHBOURS order) of
+        (1 - k_{z+d}) A_d. Until no zone joins, at most GUARD_ITER_MAX iterations. (k, the iterations evaluated)."""
+        rows, cols = k0.shape
+        k = k0.astype(np.float32).copy()
+        iterations = 0
+        for it in range(GUARD_ITER_MAX):
+            iterations = it + 1
+            loss = np.zeros((rows, cols), dtype=np.float32)
+            for d, (i, j) in enumerate(NEIGHBOURS):
+                ys, xs = slice(max(0, -j), rows - max(0, j)), slice(max(0, -i), cols - max(0, i))
+                kn = k[max(0, j): rows + min(0, j), max(0, i): cols + min(0, i)]
+                loss[ys, xs] = (loss[ys, xs] + ((f32(1.0) - kn) * a[d][ys, xs]).astype(np.float32)).astype(np.float32)
+            new = cand & (k >= f32(1.0)) & ((pf - loss).astype(np.float32) < hi)
+            if not new.any():
+                break
+            k = np.where(new, k_join, k).astype(np.float32)
+        return k, iterations
+
+    def _zone_px(self, a):
+        """(H, W) -> (rows, cols, cellW * cellH): each zone's pixels, row-major inside the zone (the sweeps' index k)."""
+        s = a[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw]
+        return s.reshape(self.rows, self.ch, self.cols, self.cw).transpose(0, 2, 1, 3).reshape(self.rows, self.cols, self.ch * self.cw)
+
+    def zone_local32(self):
+        """HLSL GlowZoneLocal for every frame column / row (float32; meaningful on the lattice): u = (px + 0.5 - originX) /
+        cellW - zx, v likewise, zx / zy the pixel's zone."""
+        xs, ys = np.arange(self.W), np.arange(self.H)
+        zx = np.clip((xs - self.ox) // self.cw, 0, self.cols - 1)
+        zy = np.clip((ys - self.oy) // self.ch, 0, self.rows - 1)
+        u = ((xs.astype(np.float32) + f32(0.5) - f32(self.ox)) / f32(self.cw) - zx.astype(np.float32)).astype(np.float32)
+        v = ((ys.astype(np.float32) + f32(0.5) - f32(self.oy)) / f32(self.ch) - zy.astype(np.float32)).astype(np.float32)
+        return u, v
+
+    @staticmethod
+    def _feather32(i, j, u, v):
+        """HLSL GlowFeatherW (glowfill.feather_weight) for columns u (W,) and rows v (H,): (H, W) float32."""
+        dx = np.maximum(f32(0.0), np.maximum(f32(i) - u, u - f32(i + 1))).astype(np.float32)
+        dy = np.maximum(f32(0.0), np.maximum(f32(j) - v, v - f32(j + 1))).astype(np.float32)
+        dist = np.sqrt(dy[:, None] * dy[:, None] + dx[None, :] * dx[None, :], dtype=np.float32)
+        t = np.clip(dist / f32(FEATHER), f32(0.0), f32(1.0)).astype(np.float32)
+        return (f32(1.0) - t * t * (f32(3.0) - f32(2.0) * t)).astype(np.float32)
+
+    def band_scale_px(self, k):
+        """HLSL GlowBandScale for every frame pixel (1 outside the lattice), float32: s = min(k_z, min over the existing
+        neighbours n with w_n > 0 of 1 - (1 - k_n) w_n)."""
+        k = np.asarray(k, dtype=np.float32)
+        xs, ys = np.arange(self.W), np.arange(self.H)
+        zx = np.clip((xs - self.ox) // self.cw, 0, self.cols - 1)
+        zy = np.clip((ys - self.oy) // self.ch, 0, self.rows - 1)
+        u, v = self.zone_local32()
+        s = k[np.ix_(zy, zx)].copy()
+        for i, j in NEIGHBOURS:
+            w = self._feather32(i, j, u, v)
+            ok = ((zy + j >= 0) & (zy + j < self.rows))[:, None] & ((zx + i >= 0) & (zx + i < self.cols))[None, :] & (w > 0.0)
+            kn = k[np.ix_(np.clip(zy + j, 0, self.rows - 1), np.clip(zx + i, 0, self.cols - 1))]
+            s = np.where(ok, np.minimum(s, (f32(1.0) - (f32(1.0) - kn) * w).astype(np.float32)), s)
+        return np.where(self.in_lattice, s, f32(1.0)).astype(np.float32)
 
     def glow_ceiling(self):
         """HLSL GlowReqCeil: a filled pixel's brightest channel stays at / below this (glowfill.req_ceiling)."""
         c = REQ_FLOOR_FRAC * self.floor
         return min(c, REQ_LIT_FRAC * float(self.litNits)) if self.boostN else c
 
+    def glow_want(self, dz, gp: GlowFillParams):
+        """HLSL GlowWant for every frame pixel: the unscaled want (item 4)."""
+        return np.minimum(np.maximum(float(gp.strength) * self.sample_zone(dz) - WANT_EPS, 0.0), float(gp.cap_nits))
+
     def glow_add(self, req, sT, sE, dz, gp: GlowFillParams, k=None):
         """HLSL GlowAdd for every lattice pixel: (request + fill (3, H, W), the fill's request luminance (H, W)). ``req``
-        = the round's corrected request, ``sT`` / ``sE`` = the pixel fields Correct used. Untouched pixels are returned
-        as they came (the HLSL returns ``req`` itself there)."""
-        want = np.minimum(np.maximum(float(gp.strength) * self.sample_zone(dz) - WANT_EPS, 0.0), float(gp.cap_nits))
-        if k is not None:                                             # the band's scale of the pixel's OWN zone (a nearest Load)
-            kpx = np.ones((self.H, self.W))
-            kpx[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw] = \
-                np.repeat(np.repeat(k.astype(np.float64), self.ch, axis=0), self.cw, axis=1)
+        = the round's corrected request, ``sT`` / ``sE`` = the pixel fields Correct used, ``k`` = the band's zone scale
+        (None = 1), reaching the pixels through the feather (:meth:`band_scale_px`; ``gp.band_feather`` False: the
+        pixel's OWN zone's k, the rule before C16). Untouched pixels are returned as they came (the HLSL returns ``req``
+        itself there)."""
+        want = self.glow_want(dz, gp)
+        if k is not None:
+            if gp.band_feather:
+                kpx = self.band_scale_px(k).astype(np.float64)
+            else:
+                kpx = np.ones((self.H, self.W))
+                kpx[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw] = \
+                    np.repeat(np.repeat(k.astype(np.float64), self.ch, axis=0), self.cw, axis=1)
             want = want * kpx
         bT = np.maximum(sT, 0.0)
         r = req.max(axis=0)
@@ -704,18 +803,26 @@ class Emu:
 
     def zone_pow_sum(self, blocks):
         """(rows, cols) float32: per zone the shader's sum of pow(mc, meanGamma) over its pixels with mc > 0, in the
-        shader's order (fald_shader.h above ZoneSlices, work guide C14). The zone's pixels (row-major k) are cut into
-        slices of ZONE_SLICE_PX, one 256-thread group each: thread t adds k = slice start + t, + 256, ... into a float32
-        partial, then the 128 / 64 / ... / 1 tree. A zone of one slice ends there (the order before C14). With more
-        slices the combine group's thread t adds the slice partials t, t + 256, ... in order, then the same tree."""
+        shader's order (:meth:`zone_sweep_sum`)."""
         npx = self.cw * self.ch
-        v = blocks.transpose(0, 2, 1, 3).reshape(self.rows, self.cols, npx)
+        return self.zone_sweep_sum(self._pow32(blocks.transpose(0, 2, 1, 3).reshape(self.rows, self.cols, npx)))
+
+    def _pow32(self, v):
+        """HLSL (mc > 0) ? exp(gamma * log(mc)) : 0, float32."""
         pos = v > 0
-        pw = np.where(pos, np.exp(self.meanGamma * np.log(np.where(pos, v, f32(1)), dtype=np.float32), dtype=np.float32), f32(0)).astype(np.float32)   # HLSL: exp(gamma * log(mc))
+        return np.where(pos, np.exp(self.meanGamma * np.log(np.where(pos, v, f32(1)), dtype=np.float32), dtype=np.float32), f32(0)).astype(np.float32)
+
+    def zone_sweep_sum(self, vals):
+        """(rows, cols) float32: per zone the sum of ``vals`` (rows, cols, cellW * cellH; the zone's pixels row-major k) in
+        the zone sweeps' order (fald_shader.h above ZoneSlices, work guide C14). The pixels are cut into slices of
+        ZONE_SLICE_PX, one 256-thread group each: thread t adds k = slice start + t, + 256, ... into a float32 partial,
+        then the 128 / 64 / ... / 1 tree. A zone of one slice ends there (the order before C14). With more slices the
+        combine group's thread t adds the slice partials t, t + 256, ... in order, then the same tree."""
+        npx = vals.shape[-1]
         nsl = (npx + ZONE_SLICE_PX - 1) // ZONE_SLICE_PX
         slices = np.zeros((self.rows, self.cols, nsl), dtype=np.float32)
         for s in range(nsl):
-            slices[:, :, s] = self._group_sum(pw[:, :, s * ZONE_SLICE_PX: (s + 1) * ZONE_SLICE_PX])
+            slices[:, :, s] = self._group_sum(vals[:, :, s * ZONE_SLICE_PX: (s + 1) * ZONE_SLICE_PX])
         return slices[:, :, 0] if nsl == 1 else self._group_sum(slices)
 
     @staticmethod

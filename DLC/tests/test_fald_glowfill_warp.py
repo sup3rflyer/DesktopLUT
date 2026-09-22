@@ -115,8 +115,12 @@ def test_warp_glow_dumps_are_the_twin():
     # drive 0.14) that is 1.5e-5 of B_true = 0.02 FP16 ulp and ~1 % of the channels differ; just above the curve's low-end
     # knee (610-nit stars: statistic 12-13 nit, drive 0.02-0.03) it is 1.8e-4 = 0.31 ulp and ~16 % do. So the bit-equality
     # FRACTIONS are asserted only where the twin reproduces the device's drives; the ulp bound above carries the rest.
+    # An UNFILLED non-black pixel (a dim sky, test_fald_c16_warp.py) is the scRGB -> BT.2020 -> scRGB round trip of an exact
+    # FP16 value, which the float32 matrix products of device and twin put on either side of the FP16 truncation edge: its
+    # bit-equality is a coin flip unrelated to the fill, so the fractions count the pixels that are black or filled.
+    judged = filled | (frame.max(axis=-1) <= 0.0)
     drives_exact = float(np.max(np.abs(vz - tw["glow"]["vz"]))) <= 2e-5 * float(vz.max())
     if drives_exact:
-        assert float(same[filled].mean()) > 0.97 and float(same.mean()) > 0.99, (float(same[filled].mean()), float(same.mean()))
+        assert float(same[filled].mean()) > 0.97 and float(same[judged].mean()) > 0.99, (float(same[filled].mean()), float(same[judged].mean()))
     else:
-        assert float(same.mean()) > 0.9, float(same.mean())
+        assert float(same[judged].mean()) > 0.9, float(same[judged].mean())
