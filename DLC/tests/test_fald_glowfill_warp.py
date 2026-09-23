@@ -55,7 +55,7 @@ def test_warp_glow_dumps_are_the_twin():
     m = re.search(r"^glowfill strength (\S+) reach (\S+) cap_nits (\S+) req_ceil (\S+)", t, re.M)
     gp = GlowFillParams(strength=float(m.group(1)), reach=int(m.group(2)), cap_nits=float(m.group(3)))
     rows, cols, W, H = int(g("rows")), int(g("cols")), int(g("width")), int(g("height"))
-    emu = Emu(read_panel_file(root / "panel.bin"), width=W, height=H, subtexel_bits=8)   # a device's 8-bit bilinear weights
+    emu = Emu(read_panel_file(root / "panel.bin"), width=W, height=H, subtexel_bits=8, sampler="warp")   # WARP's 8-bit bilinear weights
     assert float(m.group(4)) == pytest.approx(emu.glow_ceiling(), rel=1e-5) and emu.glow_ceiling() <= 0.2
     frame = np.fromfile(d / "fald_frame.rgba16f", dtype=np.float16).reshape(H, W, 4)[..., :3]
     tw = emu.run(frame.astype(np.float64), fp16_out=True, star=sp, glow=gp)
@@ -110,8 +110,8 @@ def test_warp_glow_dumps_are_the_twin():
     if scaled.any():                                                      # the balanced pixels: the same bound
         assert off_by(scaled) <= 1.0 + 1e-9, off_by(scaled)
     # How MANY of those channels land on the neighbouring half is not scale-free: it follows the twin's residual drive
-    # difference, and the drive comes from the curve LUT, which a device samples with 8-bit sub-texel weights while the
-    # emulator interpolates it in float64. High on the curve (a star lattice at panel white: zone statistic 34-40 nit,
+    # difference, and the drive comes from the curve LUT, which a device samples with 8-bit sub-texel weights (until
+    # 09-23 the twin used float64; now sampler="warp"). High on the curve (a star lattice at panel white: zone statistic 34-40 nit,
     # drive 0.14) that is 1.5e-5 of B_true = 0.02 FP16 ulp and ~1 % of the channels differ; just above the curve's low-end
     # knee (610-nit stars: statistic 12-13 nit, drive 0.02-0.03) it is 1.8e-4 = 0.31 ulp and ~16 % do. So the bit-equality
     # FRACTIONS are asserted only where the twin reproduces the device's drives; the ulp bound above carries the rest.

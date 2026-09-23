@@ -39,9 +39,19 @@ of it (the previous emulator, bit for bit). HDR (PQ files) only, like the C++.
 EXACTNESS of the fill against a real device (WARP, 2026-09-20): the zone fields agree to <= 1e-5 relative (float32 sum
 order). With the default float64 sampler weights the filled pixels agree to <= 0.0006 nit but only 20-45 % are bit-equal
 (up to ~2 % apart where the deficit is small at the foot of a ramp): the hardware's bilinear sampler weighs with 8-bit
-sub-texel fractions — a 48-texel field stretched over 3840 px shows it. ``Emu(..., subtexel_bits=8)`` rounds the sampler
-fractions (zone AND fine-grid textures) the same way: 99.4 % of the filled pixels and 99.9 % of the whole frame bit-equal,
-<= 0.00008 nit. The default stays float64 (the comparisons against the reference need the exact coordinates); it is not an order-of-operations difference."""
+sub-texel fractions — a 48-texel field stretched over 3840 px shows it. ``Emu(..., subtexel_bits=8)`` forms the sampler
+fractions (zone AND fine-grid textures AND the drive-curve LUT) the same way: 99.4 % of the filled pixels and 99.9 % of the
+whole frame bit-equal, <= 0.00008 nit. The default stays float64 (the comparisons against the reference need the exact
+coordinates); it is not an order-of-operations difference.
+HOW the device forms the 8-bit fraction differs (probe 2026-09-23, :func:`sampler_truncates`): a hardware GPU (RTX 5090)
+rounds it to nearest on every axis (``sampler="hw"``, the default); the WARP software device TRUNCATES it on x when the
+texture's width is a power of two and on y when both its dimensions are. A replay of WARP dumps passes ``sampler="warp"``.
+Found on a few-zone lattice (work guide C14): 8 x 6 zones at 960 x 540 = zone textures 8 wide, the fine grid 64 wide, the
+curve LUT 1024 — with the rounding model the output sat up to 106 FP16 steps off at the top zone row (a glow deficit
+stepping 0 -> 0.18 nit between a lit corner zone and its neighbour, sampled at a fraction of 0.054: half a 1/256 step is
+3.6 % of the interpolated fill), with WARP's rule every pixel is within one step, the drives equal, the band scales to a few
+float32 ulps (also 7 x 5, 16 x 8 and 4 x 4 lattices, lattice origins != 0, glow off, temporal mode 3).
+The 12 x 12 WARP lattices of the earlier gates (12 / 96 texels) round on WARP too — only their curve LUT truncates."""
 from __future__ import annotations
 
 from typing import Optional
@@ -68,6 +78,26 @@ ZONE_SLICE_PX = 4096      # FALD_ZONE_SLICE_PX (fald_shader.h, work guide C14): 
 STAR_PULL_EPS = 1e-5      # FALD_STAR_PULL_EPS (starfield.PULL_EPS): a pull ending this close to the pixel itself is no pull
 STAR_GATE_LO, STAR_GATE_HI = 1.0, 2.0   # FALD_STAR_GATE_LO / _HI (starfield.GATE_LO / GATE_HI): the pull threshold over target / background
 STAR_FLANK_PX, STAR_FLANK_NEAR_PX = 2, 12   # FALD_STAR_FLANK_PX / _NEAR_PX (starfield.FLANK_PX / FLANK_NEAR_PX): one feature straddling a border
+SAMPLER_HW, SAMPLER_WARP = "hw", "warp"     # how the device forms a bilinear sampler's sub-texel fraction (sampler_truncates)
+
+
+def _pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def sampler_truncates(sampler: str, width: int, height: int) -> tuple[bool, bool]:
+    """(x, y): whether the device TRUNCATES a width x height texture's bilinear sub-texel fraction on that axis instead of
+    rounding it to nearest. Measured 2026-09-23 (a D3D11 probe: R32F / R32G32F / R32G32B32A32F textures, SampleLevel in pixel
+    and compute shaders alike, the 26 sizes of DLC tests/test_fald_sampler_model.py; an independent re-probe, 54 sizes up to
+    8192 x 2, clamp / border / wrap, Sample too, agrees): a hardware GPU (RTX 5090) rounds on every axis; WARP truncates
+    (floor, toward -inf) x when the WIDTH is a power of two and y when BOTH dimensions are (8 x 6: x truncated, y rounded;
+    6 x 8 and 48 x 64: both rounded; 4 x 4, 16 x 16, 128 x 32: both truncated). Ties: WARP rounds half to even on its float32
+    coordinate, the 5090 half up; the twin (np.round, float64 coordinates) differs only within float32 precision of a tie."""
+    if sampler == SAMPLER_HW:
+        return False, False
+    if sampler == SAMPLER_WARP:
+        return _pow2(int(width)), _pow2(int(width)) and _pow2(int(height))
+    raise ValueError(f"sampler must be {SAMPLER_HW!r} or {SAMPLER_WARP!r}, got {sampler!r}")
 
 
 def smoothstep(a, b, x):
@@ -281,10 +311,15 @@ class GpuPanelDriveState:
 
 
 class Emu:
-    def __init__(self, o, width=3840, height=2160, ped_mode=0, subtexel_bits: Optional[int] = None, c15: bool = True):
+    def __init__(self, o, width=3840, height=2160, ped_mode=0, subtexel_bits: Optional[int] = None, c15: bool = True,
+                 sampler: str = SAMPLER_HW):
         self.o = o
         self.c15 = c15                         # C15: the knee's ceiling from the low-passed B_est (False = the pre-C15 shader)
         self.subtexel_bits = subtexel_bits     # None = exact sampler fractions; 8 = a D3D11 device's bilinear weights
+        sampler_truncates(sampler, 1, 1)       # (validates the name)
+        if sampler != SAMPLER_HW and not subtexel_bits:
+            raise ValueError(f"sampler={sampler!r} models a device's sub-texel fraction: give subtexel_bits (8)")
+        self.sampler = sampler                 # with subtexel_bits: "hw" rounds the fraction, "warp" = WARP's rule
         self.W, self.H = width, height
         self.white = float(o["white"]); self.gamma = float(o["sdrGamma"]); self.transfer = o["transfer"]
         self.sub = o["sub"]; self.cols = o["cols"]; self.rows = o["rows"]; self.cw = o["cellW"]; self.ch = o["cellH"]
@@ -310,21 +345,31 @@ class Emu:
         S = self.sub
         xt = (np.arange(self.W) - self.ox + 0.5) / (self.cols * self.cw) * (self.cols * S) - 0.5
         yt = (np.arange(self.H) - self.oy + 0.5) / (self.rows * self.ch) * (self.rows * S) - 0.5
-        self.bx = self._axis(xt, self.cols * S)
-        self.by = self._axis(yt, self.rows * S)
+        tx, ty = sampler_truncates(sampler, self.cols * S, self.rows * S)
+        self.bx = self._axis(xt, self.cols * S, tx)
+        self.by = self._axis(yt, self.rows * S, ty)
         # the same sampler on a cols x rows texture (one texel per zone): texel coordinate (px - origin + 0.5) / cell - 0.5
         # = starfield._bilinear_zones — between zone CENTRES, the border zones held outside the outermost centres
-        self.zx = self._axis((np.arange(self.W) - self.ox + 0.5) / self.cw - 0.5, self.cols)
-        self.zy = self._axis((np.arange(self.H) - self.oy + 0.5) / self.ch - 0.5, self.rows)
+        tx, ty = sampler_truncates(sampler, self.cols, self.rows)
+        self.zx = self._axis((np.arange(self.W) - self.ox + 0.5) / self.cw - 0.5, self.cols, tx)
+        self.zy = self._axis((np.arange(self.H) - self.oy + 0.5) / self.ch - 0.5, self.rows, ty)
+        self.curve_trunc = sampler_truncates(sampler, int(o["curveN"]), 1)[0]   # the drive-curve LUT: curveN x 1
         xs = np.arange(self.W); ys = np.arange(self.H)
         self.in_lattice = ((ys >= self.oy) & (ys < self.oy + self.rows * self.ch))[:, None] & \
                           ((xs >= self.ox) & (xs < self.ox + self.cols * self.cw))[None, :]
 
-    def _axis(self, t, n):
-        i0 = np.floor(t).astype(int); fr = t - i0
-        if self.subtexel_bits:
-            fr = np.round(fr * (1 << int(self.subtexel_bits))) / (1 << int(self.subtexel_bits))
-        return np.clip(i0, 0, n - 1), np.clip(i0 + 1, 0, n - 1), fr
+    def _axis(self, t, n, trunc=False):
+        i0 = np.floor(t).astype(int)
+        return np.clip(i0, 0, n - 1), np.clip(i0 + 1, 0, n - 1), self._subtexel(t - i0, trunc)
+
+    def _subtexel(self, fr, trunc):
+        """The sampler's weight of the upper texel: exact (subtexel_bits None) or the device's subtexel_bits-bit fraction,
+        rounded to nearest or truncated (``trunc``: :func:`sampler_truncates` for this texture and axis). A fraction that
+        rounds up to 1 puts the whole weight on the upper texel, as the device does."""
+        if not self.subtexel_bits:
+            return fr
+        s = float(1 << int(self.subtexel_bits))
+        return (np.floor(fr * s) if trunc else np.round(fr * s)) / s
 
     def sample(self, T):
         y0, y1, fy = self.by; x0, x1, fx = self.bx
@@ -616,13 +661,21 @@ class Emu:
             return np.where(code <= f32(0.04045), code / f32(12.92), np.power((code + f32(0.055)) / f32(1.055), f32(2.4))).astype(np.float32)
         return ((n / f32(80.0)) @ BT2020_TO_BT709.T.astype(np.float32)).astype(np.float32)
 
-    # ---- DriveOf (curve LUT, linear filtering)
+    # ---- DriveOf (curve LUT, linear filtering; the device's sub-texel fraction when subtexel_bits is set)
     def drive_of(self, stat):
         o = self.o
         N = o["curveN"]; lmin = float(o["curveLogMin"]); lmax = float(o["curveLogMax"])
         stat32 = stat.astype(np.float32)
         u = np.clip((np.log(np.maximum(stat32, f32(1e-3))) - f32(lmin)) / f32(lmax - lmin), 0, 1).astype(np.float64)
-        x = u * (N - 1); i0 = np.clip(np.floor(x).astype(int), 0, N - 1); i1 = np.minimum(i0 + 1, N - 1); fr = x - i0
+        if self.subtexel_bits:
+            # the texel coordinate as the device forms it: the HLSL's float32 uv = (u (N - 1) + 0.5) / N, then N uv - 0.5
+            # — where WARP truncates, a fraction a float64 u (N - 1) puts just below k / 256 is k / 256 on the device
+            u32 = u.astype(np.float32)
+            x = (((u32 * f32(N - 1)).astype(np.float32) + f32(0.5)) / f32(N)).astype(np.float32).astype(np.float64) * N - 0.5
+        else:
+            x = u * (N - 1)
+        i0 = np.clip(np.floor(x).astype(int), 0, N - 1); i1 = np.minimum(i0 + 1, N - 1)
+        fr = self._subtexel(x - i0, self.curve_trunc)
         d = o["curve"][i0] * (1 - fr) + o["curve"][i1] * fr
         return np.where(stat32 < f32(self.floor), 0.0, d).astype(np.float32)
 

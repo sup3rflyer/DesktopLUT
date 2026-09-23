@@ -76,7 +76,7 @@ def test_warp_knee_ceiling_is_the_twin_and_draws_no_lattice():
     root = Path(_DIR)
     d = root / "d0"
     o = read_panel_file(root / "panel.bin")
-    emu = Emu(o, width=W, height=H, subtexel_bits=8)                  # a device's 8-bit bilinear weights
+    emu = Emu(o, width=W, height=H, subtexel_bits=8, sampler="warp")  # WARP's 8-bit bilinear weights
     frame = np.fromfile(d / "fald_frame.rgba16f", dtype=np.float16).reshape(H, W, 4)[..., :3]
     tw = emu.run(frame.astype(np.float64), fp16_out=True)
     S = emu.sub
@@ -95,7 +95,7 @@ def test_warp_knee_ceiling_is_the_twin_and_draws_no_lattice():
     off = np.abs(out[lit].astype(np.float64) - tw["out"][lit].astype(np.float64)) / np.maximum(ulp, 1e-30)
     assert float(off.max()) <= 1.0 + 1e-9, float(off.max())
     # the device does NOT run the pre-C15 rule: against the per-pixel-ceiling twin the knee-bound pixels move by far more
-    old = Emu(o, width=W, height=H, subtexel_bits=8, c15=False).run(frame.astype(np.float64), fp16_out=True)["out"]
+    old = Emu(o, width=W, height=H, subtexel_bits=8, sampler="warp", c15=False).run(frame.astype(np.float64), fp16_out=True)["out"]
     nits = lambda a: emu.panel_nits(a.astype(np.float64))[1]           # noqa: E731
     assert float(np.abs(nits(out) - nits(old))[lit].max()) > 20.0
     # no lobes in what the device put out
