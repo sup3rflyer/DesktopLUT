@@ -44,6 +44,32 @@ class RunStalled(Exception):
             f"(stall threshold {threshold_s:.0f}s) during {stage}")
 
 
+class MeterDown(RunStalled):
+    """The meter is provably DOWN — no reading can be taken, so every further read would
+    fail instantly (the 2026-09-23 incident: a dead persistent spotread made the preheat
+    soak cycle patches on instant failed reads until the 180 s stall watchdog aborted).
+    Raised by the measure loop's read guard on an explicit terminal meter fault (the
+    persistent spotread's bounded self-heal is exhausted) or ``meter_down_reads``
+    consecutive meter-process faults. ``error`` carries the meter's own error text
+    (spotread's last output) so the run record says WHY.
+
+    The measure loop CATCHES it and turns it into a run-stopper escalation seam (like a
+    present-stall — the LLM adjudicates remeasure/retry/abort with the evidence). It is a
+    :class:`RunStalled` subclass on purpose: any read path that does not handle it still
+    lands in the orchestrator's existing stall → clean-abort + rollback conversion instead
+    of crashing the run."""
+
+    def __init__(self, stage: str, error: str, *, consecutive_failures: int = 0,
+                 detail: Optional[Mapping[str, Any]] = None) -> None:
+        self.stage = stage
+        self.error = error
+        self.consecutive_failures = consecutive_failures
+        self.detail = dict(detail or {})
+        self.since_progress_s = 0.0
+        self.threshold_s = 0.0
+        Exception.__init__(self, f"meter down during {stage}: {error}")
+
+
 class RunCancelled(Exception):
     """A cooperative cancel was requested (the LLM/operator wrote ``control.json``).
     Raised at the next checkpoint so the run aborts cleanly + rolls back — the

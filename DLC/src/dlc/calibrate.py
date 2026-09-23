@@ -109,7 +109,7 @@ from .dip import DipStore, DisplayInstrumentProfile
 from .engine.patches import Transfer
 from .events import Ev, EventWriter, RunLog
 from .keep_awake import keep_awake
-from .liveness import Liveness, RunCancelled, RunStalled
+from .liveness import Liveness, MeterDown, RunCancelled, RunStalled
 from .measure_loop import (
     IncrementalMeasureSession,
     MeasureFn,
@@ -693,6 +693,17 @@ class Calibration:
             return outcome
         try:
             outcome = run_fn()
+        except MeterDown as exc:
+            # The meter is provably down on a read path that has no run-stopper seam of its own
+            # (the measure loop catches MeterDown and escalates it at the measure seam instead).
+            # Abort cleanly + roll back like a stall — but the record says WHY, with the meter's
+            # own error text, instead of an anonymous "no progress" timeout.
+            self.runlog.stage_aborted(key, message=str(exc), meter_down=True,
+                                      meter_error=exc.error, meter_detail=exc.detail or None)
+            raise CalibrationAborted(StageOutcome(
+                key, "aborted", digest={"message": str(exc), "meter_down": True,
+                                        "meter_error": exc.error,
+                                        "meter_detail": exc.detail or None}))
         except RunStalled as exc:
             # The guard tripped mid-stage. The stall event is already on the spine; turn it
             # into a clean abort so the run rolls back instead of grinding silently — the
@@ -1088,8 +1099,10 @@ class Calibration:
             self._save()
             return rec
         to_clear = {name: False for name, on in before.items() if on}
+        # monitor/mode ride the record so a teardown outside this object (the --abort path, the
+        # CLI rollback guard) can re-assert the layers without trusting argparse defaults.
         rec = {"captured": True, "supported": True, "before": before, "disabled": sorted(to_clear),
-               "restored": False}
+               "restored": False, "monitor": self.monitor, "mode": self.mode}
         if to_clear:
             try:
                 res = self.controller.set_layers(self.monitor, self.mode, **to_clear)
@@ -3149,6 +3162,9 @@ class Calibration:
             preheat_compromised = bool(outcome.digest.get("preheat_compromised"))
             measurement_path_compromised = bool(outcome.digest.get("measurement_path_compromised"))
             score_anomaly = bool(outcome.digest.get("score_anomaly"))
+            # A dead meter (the loop's read guard halted the pass) is a run-stopper: never a
+            # benign auto-accept — flag it compromised so every adjudicator escalates.
+            meter_down = bool(outcome.digest.get("meter_down"))
             # A dark panel, compromised preheat, or a blown remeasure/drift budget is non-benign:
             # recommend retry (not accept), offer it, and flag compromised so SupervisedAdjudicator
             # escalates rather than rubber-stamping black/garbage data. The RECOMMENDATION (never
@@ -3167,7 +3183,7 @@ class Calibration:
                 recommendation=recommendation,
                 digest={**outcome.digest,
                         **({"recommendation_basis": basis} if basis else {}),
-                        "compromised": (panel_dark or preheat_compromised
+                        "compromised": (meter_down or panel_dark or preheat_compromised
                                         or measurement_path_compromised
                                         or score_anomaly)}))
             if decision.choice == "remeasure":
@@ -3357,6 +3373,11 @@ class Calibration:
         if role != "post-mhc" or outcome.status != "done":
             return None
         digest = outcome.digest or {}
+        if digest.get("meter_down"):
+            # A meter-down halt leaves a PARTIAL pass (its brightest read may be a dim patch):
+            # that is not a collapsed foundation, and the meter-down run-stopper seam (with the
+            # meter's error text) is the one the judge must see.
+            return None
         white = _as_float_local(digest.get("white_nits"))
         if white is None or white <= 0:
             return None
@@ -5754,6 +5775,40 @@ def _as_float_local(value: Any) -> Optional[float]:
         return None
 
 
+def _reassert_viewing_layers(controller: Any, calib_state: Optional[dict[str, Any]], *,
+                             monitor: Optional[int] = None,
+                             mode: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """Put the user's captured viewing layers back ON after a snapshot-restore teardown.
+
+    ``exit_calibration(restore_snapshot=True)`` restores the C++ snapshot taken at
+    ``calibration.enter`` — which neutral flows reach AFTER the spine switched the layers off —
+    so on the CLI rollback guard (run aborted: ``run()`` had already restored the layers, the
+    snapshot switched them off again) and the ``--abort`` path the user was left with their
+    tonemap / DG / WB / GS / FALD off (HW 2026-09-23). Monitor/mode come from the record (then
+    the neutral profile, then the caller) — never from argparse defaults alone. Best-effort:
+    returns ``None`` when nothing was captured, else a record of what was re-asserted."""
+    calib_state = calib_state or {}
+    rec = calib_state.get("viewing_layers")
+    if not isinstance(rec, dict) or not rec.get("captured"):
+        return None
+    want = {name: True for name, on in (rec.get("before") or {}).items() if on}
+    if not want:
+        return {"reasserted": [], "note": "nothing was on"}
+    neutral = calib_state.get("neutral_profile") if isinstance(calib_state.get("neutral_profile"), dict) else {}
+    mon = next((m for m in (rec.get("monitor"), neutral.get("monitor"), monitor) if m is not None), None)
+    md = next((m for m in (rec.get("mode"), neutral.get("mode"), mode) if m), None)
+    if mon is None or not md:
+        return {"reasserted": [], "error": "monitor/mode unknown — re-enable by hand",
+                "layers": sorted(want)}
+    try:
+        res = controller.set_layers(int(mon), str(md), **want)
+        return {"reasserted": sorted(want), "monitor": int(mon), "mode": str(md),
+                "profile": (res or {}).get("profile_name")}
+    except Exception as exc:  # noqa: BLE001 - surfaced to the operator, never fatal to teardown
+        return {"reasserted": [], "error": f"{type(exc).__name__}: {exc}", "layers": sorted(want),
+                "monitor": int(mon), "mode": str(md)}
+
+
 def _measure_escalation_recommendation(digest: dict[str, Any]) -> tuple[str, Optional[str]]:
     """``(recommendation, basis)`` for the measure escalation seam — a SUGGESTION to the LLM
     judge, never an auto-action (Design Law: the seam decides; ``--auto`` is sim/CI only and
@@ -5768,7 +5823,8 @@ def _measure_escalation_recommendation(digest: dict[str, Any]) -> tuple[str, Opt
     the same stimulus re-read to the same implausible value). That is stable-but-implausible =
     real panel/correction behaviour; a retry re-measures the same dim patch and re-fails
     forever, so the recommendation flips to accept — with the basis spelled out for the judge."""
-    hard = bool(digest.get("panel_dark")
+    hard = bool(digest.get("meter_down")
+                or digest.get("panel_dark")
                 or digest.get("present_stall")
                 or digest.get("preheat_compromised")
                 or digest.get("remeasure_budget_exceeded")
@@ -6406,7 +6462,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                               "run": str(ctx.root)}, indent=2))
             return 1
         bak = (state.get("calib", {}) or {}).get("backup", {})
+        layers = _reassert_viewing_layers(controller, state.get("calib"), monitor=args.monitor, mode=args.mode)
         print(json.dumps({"status": "reverted", "restored_snapshot": restored,
+                          "viewing_layers": layers,
                           "backup": bak, "run": str(ctx.root)}, indent=2))
         return 0
 
@@ -6432,7 +6490,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # whole tuple as the port makes spotread's "-c" a stringified tuple → "out of range"
         # → no reading → 0.0 nits on every read.
         if argyll:
-            port, _ = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
+            port, port_evidence = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
+            # A failed/empty enumeration silently falls back to the planned port; record it, so
+            # a spotread that later cannot open the instrument has its first clue in the run dir.
+            if not port_evidence.get("ok", True) or port_evidence.get("changed"):
+                ctx.log("meter port resolution: " + json.dumps(port_evidence, default=str))
         else:
             port = profile.meter.argyll_port
         # Per-patch presenter dwell: prefer the panel's MEASURED step-response settle (from the
@@ -6619,6 +6681,20 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                 persistent_meter.close()
             except Exception:  # noqa: BLE001
                 pass
+            # Persist any spotread deaths (with spotread's own dying output) + self-heal respawns
+            # to the run's workflow.log — the read paths outside the measure loop (characterize,
+            # probes, brightness) have no event of their own for them, and before this the error
+            # text of a dead meter was recorded nowhere (2026-09-23 incident).
+            try:
+                if getattr(persistent_meter, "deaths", 0):
+                    ctx.log("persistent meter: " + json.dumps({
+                        "deaths": persistent_meter.deaths,
+                        "restarts": persistent_meter.restarts,
+                        "restart_failures": persistent_meter.restart_failures,
+                        "death_log": persistent_meter.death_log,
+                    }, default=str))
+            except Exception:  # noqa: BLE001 - diagnostics only, never break teardown
+                pass
         # Rollback guard: a clean run reaches a 'completed' (applied), 'reverted', or
         # 'revert_unavailable' terminal state — all of which _finish already settled (commit,
         # snapshot restore, in-place cube restore, or an honest surface of the manual backup
@@ -6642,8 +6718,23 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             if not handled and entered:
                 try:
                     controller.exit_calibration(restore_snapshot=True)
+                    # The snapshot predates nothing the user cares about: it was taken after their
+                    # viewing layers were switched off, so put them back (run() already did, and
+                    # this restore undid it).
+                    layers = _reassert_viewing_layers(controller, calib.calib if calib is not None else None,
+                                                      monitor=args.monitor, mode=args.mode)
+                    if layers is not None and calib is not None:
+                        try:
+                            vl = calib.calib.get("viewing_layers")
+                            if isinstance(vl, dict):
+                                vl["reasserted_after_rollback"] = layers
+                                calib._save()
+                            ctx.log("viewing layers after rollback: " + json.dumps(layers, default=str))
+                        except Exception:  # noqa: BLE001 - bookkeeping only
+                            pass
                     print(json.dumps({"status": "rolled_back",
                                       "reason": "run did not complete; restored pre-run setup",
+                                      "viewing_layers": layers,
                                       "run": str(ctx.root)}, indent=2))
                 except Exception as exc:  # noqa: BLE001 - but a FAILED rollback must never be silent
                     # The one teardown failure that can cost the user their display setup: the

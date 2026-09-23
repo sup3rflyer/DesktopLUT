@@ -4138,6 +4138,59 @@ def test_present_stall_pauses_the_measure_seam_with_retry(tmp_path: Path):
     assert req.digest.get("patch_count") < len(patches)
 
 
+def test_meter_down_pauses_the_measure_seam_with_the_meter_error(tmp_path: Path):
+    # 2026-09-23 incident: a dead meter must halt the stage FAST and reach the LLM as a
+    # run-stopper seam carrying the meter's own error text (not a 180 s stall → rollback).
+    from dlc.calibrate import _measure_escalation_recommendation
+
+    assert _measure_escalation_recommendation({"meter_down": True})[0] == "retry"
+    calls = {"n": 0}
+    err = ("spotread process is not running; self-heal exhausted; last spotread output: "
+           "Instrument access failed with error 'Communications failure'")
+
+    def dead_meter(patch):
+        calls["n"] += 1
+        return Reading(xyz=None, yxy=None, ok=False, error=err,
+                       raw={"meter_fault": "self_heal_exhausted", "meter_down": True})
+
+    calib = _make(tmp_path, "meter_down_seam", panel=dead_meter, adjudicator=MappingAdjudicator())
+    calib.target_name = calib.display.target_name("SDR")
+    calib.calib["target"] = calib.target_name
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_measure(role="raw", patches=[(700, 0, 0), (0, 700, 0), (500, 500, 500)],
+                            ti3_name="m.ti3", ndjson_name="m.ndjson")
+    assert calls["n"] == 1                               # halted on the first dead read
+    req = exc.value.request
+    assert req.key == "measure:raw:escalation"
+    assert req.recommendation == "retry"
+    assert "remeasure" in req.options and "retry" in req.options
+    assert req.digest.get("meter_down") is True and req.digest.get("compromised") is True
+    assert "Communications failure" in req.question
+    assert "Communications failure" in req.digest["meter_down_detail"]["error"]
+
+
+def test_stage_converts_meter_down_to_a_clean_abort_with_the_meter_error(tmp_path: Path):
+    # A read path WITHOUT its own seam (MeterDown escaping a stage) still aborts cleanly and
+    # the stage record says WHY — the meter's error — instead of an anonymous stall.
+    from dlc.calibrate import CalibrationAborted
+    from dlc.liveness import MeterDown
+
+    calib = _make(tmp_path, "meterdownconv")
+
+    def boom():
+        raise MeterDown("grayscale-wb", "spotread process is not running; last spotread "
+                        "output: Instrument access failed", consecutive_failures=5)
+
+    with pytest.raises(CalibrationAborted) as ei:
+        calib._stage("grayscale-wb", boom)
+    digest = ei.value.outcome.digest
+    assert digest.get("meter_down") is True
+    assert "Instrument access failed" in digest.get("meter_error", "")
+    assert "Instrument access failed" in digest.get("message", "")
+    events = read_events(calib.ctx.events_path)
+    assert any(e.event == Ev.STAGE_ABORTED and e.data.get("meter_down") for e in events)
+
+
 # ---------------------------------------------------------------------------
 # enter-neutral: identity MHC association + the hardware-readiness neutral-state refusal
 # (HW-proven 2026-09-03: Windows keeps the last MHC2 transform after calibration.enter)
@@ -4742,3 +4795,55 @@ def test_registry_cross_check_survives_a_permutation_rebake(tmp_path: Path):
                                "source_file": "h:/runs/OTHER/generated/mhc_base_hdr.cube"}}}
     ev2 = _sr.check_against_pipe(rec, other, 0, "HDR")
     assert ev2["matches"] is False and ev2["pin_nits"] is None and "different base artifact" in ev2["reason"]
+
+
+# --- viewing layers after a snapshot-restore teardown (HW 2026-09-23) -------------------------
+
+class _LayersCtl:
+    def __init__(self, fail: bool = False):
+        self.calls: list[tuple[int, str, dict]] = []
+        self.fail = fail
+
+    def set_layers(self, monitor, mode, **layers):
+        if self.fail:
+            raise RuntimeError("pipe down")
+        self.calls.append((monitor, mode, layers))
+        return {"profile_name": "DesktopLUT_Mon0_HDR_1.icm", "after": dict(layers)}
+
+
+def test_reassert_viewing_layers_puts_captured_on_layers_back():
+    """The rollback's C++ snapshot was taken after the layers went off; the helper re-enables
+    exactly the captured-ON set on the RECORDED monitor/mode (not the caller's defaults)."""
+    from dlc.calibrate import _reassert_viewing_layers
+    ctl = _LayersCtl()
+    calib = {"viewing_layers": {"captured": True, "monitor": 0, "mode": "HDR",
+                                "before": {"tonemap": True, "desktop_gamma": True, "white_balance": False,
+                                           "grayscale": True, "fald": True}}}
+    out = _reassert_viewing_layers(ctl, calib, monitor=3, mode="SDR")
+    assert ctl.calls == [(0, "HDR", {"tonemap": True, "desktop_gamma": True, "grayscale": True, "fald": True})]
+    assert out["reasserted"] == ["desktop_gamma", "fald", "grayscale", "tonemap"]
+    assert out["monitor"] == 0 and out["mode"] == "HDR"
+
+
+def test_reassert_viewing_layers_falls_back_to_neutral_profile_for_old_records():
+    from dlc.calibrate import _reassert_viewing_layers
+    ctl = _LayersCtl()
+    calib = {"viewing_layers": {"captured": True, "before": {"tonemap": True}},
+             "neutral_profile": {"monitor": 0, "mode": "HDR"}}
+    _reassert_viewing_layers(ctl, calib, monitor=1, mode="SDR")
+    assert ctl.calls == [(0, "HDR", {"tonemap": True})]
+
+
+def test_reassert_viewing_layers_noops_and_surfaces_failures():
+    from dlc.calibrate import _reassert_viewing_layers
+    assert _reassert_viewing_layers(_LayersCtl(), {}) is None
+    assert _reassert_viewing_layers(_LayersCtl(), {"viewing_layers": {"captured": False}}) is None
+    nothing = _reassert_viewing_layers(_LayersCtl(), {"viewing_layers": {
+        "captured": True, "monitor": 0, "mode": "HDR", "before": {"tonemap": False}}})
+    assert nothing == {"reasserted": [], "note": "nothing was on"}
+    failed = _reassert_viewing_layers(_LayersCtl(fail=True), {"viewing_layers": {
+        "captured": True, "monitor": 0, "mode": "HDR", "before": {"fald": True}}})
+    assert failed["reasserted"] == [] and "pipe down" in failed["error"] and failed["layers"] == ["fald"]
+    unknown = _reassert_viewing_layers(_LayersCtl(), {"viewing_layers": {"captured": True,
+                                                                          "before": {"fald": True}}})
+    assert "unknown" in unknown["error"]

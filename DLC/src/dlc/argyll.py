@@ -6,6 +6,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Sequence
@@ -257,13 +258,28 @@ def _strip_ansi(text: str) -> str:
 @dataclass(frozen=True)
 class SpotreadResult:
     """One reading off the live interactive stream. ``raw`` is the parsed text
-    chunk (the ``Result is …`` line region) for the audit trail."""
+    chunk (the ``Result is …`` line region) for the audit trail — or, for a dead
+    process, the output spotread printed before it exited (its own error message).
+
+    ``fault`` is ``None`` for a reading or an ordinary measurement failure (timeout,
+    under-range warning, garbled line — the instrument is alive), and names a METER
+    PROCESS fault otherwise: ``"self_heal_exhausted"`` (the process is dead and the
+    bounded respawn budget could not revive it — terminal for this driver) or
+    ``"closed"`` (the owner closed the meter mid-read, e.g. the stall watchdog)."""
 
     xyz: Optional[tuple[float, float, float]]
     yxy: Optional[tuple[float, float, float]]
     ok: bool
     error: Optional[str] = None
     raw: str = ""
+    fault: Optional[str] = None
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse a multi-line output tail onto one line (``" | "``-joined) and keep its
+    LAST ``limit`` characters — spotread prints its fatal error at the end."""
+    flat = " | ".join(part.strip() for part in text.splitlines() if part.strip())
+    return flat if len(flat) <= limit else "..." + flat[-limit:]
 
 
 # spotread's own under-range / unreliable warning vocabulary. A line containing one
@@ -414,7 +430,28 @@ class PersistentSpotread:
     pseudo-console for its trigger keystroke, so :meth:`Argyll.open_persistent` defaults
     to the ConPTY transport (:class:`_ConPtySpotreadProcess`); this state machine — and
     its ANSI-tolerant line pump — is unchanged across transports.
+
+    **Bounded self-heal (2026-09-23 HDR-run incident).** A spotread that dies — most
+    often at startup, when it fails to open the USB instrument and exits — used to leave
+    the driver returning "process is not running" forever, instantly, with spotread's own
+    error text discarded by the line pump. Now: the last ``_RECENT_LINES`` output lines
+    are kept per process, a death is recorded ONCE with that output tail
+    (``last_death_tail`` / ``death_log``), and :meth:`measure` tears the dead process down
+    and respawns a fresh one (same factory, same startup handshake) before taking the
+    reading — at most ``restart_budget`` respawns per ``restart_window_s`` sliding window,
+    each after a ``restart_backoff_s`` pause, so a truly unplugged meter still FAILS
+    (``fault="self_heal_exhausted"``, the captured tail in the error) instead of spinning.
+    A meter closed by its owner (the stall watchdog's force-kill) is never respawned
+    mid-read. Counters: ``restarts`` (respawn attempts), ``restart_failures``, ``deaths``.
     """
+
+    # How many trailing output lines are kept per process for a death report, and how
+    # much of that tail (characters) is retained.
+    _RECENT_LINES = 40
+    _DEATH_TAIL_CHARS = 1200
+    _DEATH_LOG_MAX = 8
+    # How long to let the reader pump a dying process's final bytes before its tail is read.
+    _DEATH_DRAIN_SECONDS = 1.0
 
     def __init__(
         self,
@@ -426,6 +463,9 @@ class PersistentSpotread:
         read_timeout: float = 120.0,
         poll_interval: float = 0.02,
         quiesce_seconds: float = 0.75,
+        restart_budget: int = 3,
+        restart_window_s: float = 600.0,
+        restart_backoff_s: float = 3.0,
     ) -> None:
         self._factory = factory
         self._trigger = trigger
@@ -434,6 +474,16 @@ class PersistentSpotread:
         self._read_timeout = read_timeout
         self._poll_interval = poll_interval
         self._quiesce_seconds = quiesce_seconds
+        # Self-heal bounds: at most `restart_budget` respawns within any `restart_window_s`
+        # sliding window (window <= 0: the budget never refills — a lifetime cap) AND at most
+        # `restart_budget` within any single measure() call (so a slow respawn-and-die cycle
+        # can't outlive the window inside one call); each respawn is preceded by
+        # `restart_backoff_s` (lets a USB handle the dead process held — or a still-exiting
+        # predecessor holds — be released). restart_budget=0 disables the self-heal.
+        self._restart_budget = max(0, int(restart_budget))
+        self._restart_window_s = max(0.0, float(restart_window_s))
+        self._restart_backoff_s = max(0.0, float(restart_backoff_s))
+        self._restart_times: list[float] = []       # monotonic stamps of recent respawn attempts
 
         self._proc: Optional[SpotreadProcess] = None
         self._reader: Optional[threading.Thread] = None
@@ -446,9 +496,20 @@ class PersistentSpotread:
         self._total_bytes = 0                        # monotonic byte counter (quiescence)
         self._eof = False
         self._started = False
+        self._recent_lines: deque[str] = deque(maxlen=self._RECENT_LINES)  # this process's output tail
+        self._gen = 0                  # process generation: a superseded reader thread goes inert
+        self._close_gen = 0            # bumped by close(): an in-flight measure() must not respawn
+        self._closed = False           # sticky after close(): no process is spawned until start()
+        self._death_recorded_gen = -1  # a death is recorded once per process generation
         # diagnostics (read after a run; surfaced in the digest later)
         self.stale_discarded = 0
         self.extra_readings = 0
+        self.restarts = 0              # respawn attempts made by the self-heal
+        self.restart_failures = 0      # respawn attempts that did not come up alive
+        self.deaths = 0                # process deaths (or failed spawns) observed
+        self.last_death_tail: Optional[str] = None      # spotread's output before its last death
+        self.last_death_exit_code: Optional[int] = None
+        self.death_log: list[dict] = []                 # bounded: {context, exit_code, tail, t}
 
     # spotread's interactive vocabulary (tolerant of version wording drift)
     _READY_RE = re.compile(r"take a reading", re.IGNORECASE)
@@ -460,10 +521,11 @@ class PersistentSpotread:
 
     # -- reader thread + line pump ----------------------------------------
 
-    def _reader_loop(self) -> None:
-        with self._lock:
-            proc = self._proc
-        assert proc is not None
+    def _reader_loop(self, proc: SpotreadProcess, gen: int) -> None:
+        """Pump ``proc``'s output into the shared buffers. Bound to ONE process generation:
+        once a respawn supersedes it (``gen`` != the current generation) it goes inert, so
+        a lagging reader of a dead process can never mark the NEW process EOF or inject its
+        bytes into the new process's stream."""
         while True:
             try:
                 chunk = proc.read_some()
@@ -472,11 +534,14 @@ class PersistentSpotread:
             if not chunk:
                 break
             with self._lock:
+                if gen != self._gen:
+                    return
                 self._buf.extend(chunk)
                 self._total_bytes += len(chunk)
                 self._pump_locked()
         with self._lock:
-            self._eof = True
+            if gen == self._gen:
+                self._eof = True
 
     def _pump_locked(self) -> None:
         """Extract every complete (newline-terminated) line, classifying each.
@@ -487,6 +552,10 @@ class PersistentSpotread:
                 return
             line = _strip_ansi(bytes(self._buf[: idx]).decode("ascii", "ignore"))
             del self._buf[: idx + 1]
+            if line.strip():
+                # Keep a bounded tail of what this process printed: if it dies, this holds
+                # spotread's own error (e.g. an instrument-open failure) for the death report.
+                self._recent_lines.append(line.strip())
             self._classify_locked(line)
 
     def _classify_locked(self, line: str) -> None:
@@ -576,20 +645,189 @@ class PersistentSpotread:
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
-        if self._started:
-            return
-        proc = self._factory()
+        """Spawn spotread and drive it to its reading prompt. Raises whatever the factory
+        raises (an explicit start surfaces a failed spawn to its caller; :meth:`measure`
+        never raises — it folds a failed spawn into the self-heal). A process that EXITS
+        during startup (e.g. spotread could not open the instrument) is recorded as a death
+        with its output tail; the next :meth:`measure` self-heals it within budget."""
         with self._lock:
-            self._proc = proc
-        self._reader = threading.Thread(target=self._reader_loop, name="spotread-reader", daemon=True)
-        self._reader.start()
+            # An explicit start() is the ONLY way to re-open a closed meter (close() is sticky:
+            # measure() on a closed meter fails with fault="closed" instead of spawning).
+            self._closed = False
+            if self._started:
+                return
+            close_gen = self._close_gen
+        self._spawn(close_gen)
+
+    def _spawn(self, close_gen: int) -> bool:
+        """Start a FRESH process generation: new process + reader thread, clean stream
+        state, the startup handshake. Returns True when the process came up alive; False
+        when it died during startup (death recorded) or the owner closed the meter while
+        we were spawning (the new process is stopped). Raises the factory's exception."""
+        proc = self._factory()
+        reader: Optional[threading.Thread] = None
+        with self._lock:
+            stale = self._close_gen != close_gen
+            if not stale:
+                self._gen += 1
+                gen = self._gen
+                self._proc = proc
+                # A new process starts from a clean stream: nothing from a dead predecessor
+                # (partial line, queued readings, warning, cal flag, EOF, output tail) carries over.
+                self._buf.clear()
+                self._results.clear()
+                self._pending_warning = None
+                self._saw_cal = False
+                self._eof = False
+                self._recent_lines.clear()
+                reader = threading.Thread(target=self._reader_loop, args=(proc, gen),
+                                          name="spotread-reader", daemon=True)
+                # Started while publishing it under the lock, so a concurrent close() can never
+                # see (and join) an unstarted thread. Safe: the reader takes the lock only after
+                # its first blocking read, and Thread.start() does not need it.
+                reader.start()
+                self._reader = reader
+        if stale or reader is None:
+            self._stop_process(proc, polite=False)   # closed while spawning: never leave it running
+            return False
         self._advance_to_ready()
         # Discard anything produced during startup/calibration (including a reading the
         # nudge may have triggered) so the FIRST measure() begins from a clean slate.
         with self._lock:
             self._results.clear()
             self._pending_warning = None
-        self._started = True
+            if self._close_gen == close_gen:
+                self._started = True
+        if self._dead():
+            # Exited during startup — the incident signature (USB instrument open failed).
+            # _started stays True on purpose: measure() then routes through the bounded
+            # self-heal instead of re-spawning unboundedly via the lazy-start path. (A stop
+            # caused by the owner's close() is not a spotread death — don't record it as one.)
+            if not self._closed_since(close_gen):
+                self._record_death("startup")
+            return False
+        return True
+
+    def _process_down(self) -> bool:
+        """No live process to trigger: never spawned / spawn failed, EOF, or exited."""
+        with self._lock:
+            if self._proc is None:
+                return True
+        return self._dead()
+
+    def _closed_since(self, close_gen: int) -> bool:
+        with self._lock:
+            return self._close_gen != close_gen
+
+    def _record_death(self, context: str) -> None:
+        """Capture the dead process's output tail (spotread's own error text) ONCE per
+        process generation, before anything tears it down or respawns over it."""
+        with self._lock:
+            proc = self._proc
+            reader = self._reader
+            if proc is None or self._death_recorded_gen == self._gen:
+                return
+            self._death_recorded_gen = self._gen
+        # Let the reader pump the dying process's final bytes first — the error message is
+        # the LAST thing spotread prints, and poll() can report the exit before EOF drains.
+        self._join_quietly(reader, self._DEATH_DRAIN_SECONDS)
+        code: Optional[int] = None
+        try:
+            code = proc.poll()
+        except Exception:
+            code = None
+        with self._lock:
+            lines = list(self._recent_lines)
+            partial = _strip_ansi(bytes(self._buf).decode("ascii", "ignore")).strip()
+        if partial:
+            lines.append(partial)
+        tail = "\n".join(lines).strip()
+        if len(tail) > self._DEATH_TAIL_CHARS:
+            tail = "..." + tail[-self._DEATH_TAIL_CHARS:]
+        self._note_death(context, code, tail or "(spotread printed nothing before exiting)")
+
+    def _record_spawn_failure(self, exc: BaseException) -> None:
+        self._note_death("spawn", None, f"spotread spawn failed: {type(exc).__name__}: {exc}")
+
+    def _note_death(self, context: str, code: Optional[int], tail: str) -> None:
+        self.deaths += 1
+        self.last_death_tail = tail
+        self.last_death_exit_code = code
+        self.death_log.append({"context": context, "exit_code": code, "tail": tail,
+                               "t": round(time.time(), 3)})
+        del self.death_log[:-self._DEATH_LOG_MAX]
+
+    @staticmethod
+    def _join_quietly(thread: Optional[threading.Thread], timeout: float) -> None:
+        """Bounded join that never raises (an unstarted/current thread is simply skipped)."""
+        if thread is None or thread is threading.current_thread():
+            return
+        try:
+            thread.join(timeout=timeout)
+        except RuntimeError:
+            pass
+
+    def _restart_allowed(self) -> bool:
+        if self._restart_window_s > 0:
+            now = time.monotonic()
+            self._restart_times = [t for t in self._restart_times
+                                   if now - t < self._restart_window_s]
+        return len(self._restart_times) < self._restart_budget
+
+    def _self_heal(self, close_gen: int, attempts: list[int]) -> bool:
+        """Respawn a dead process within the sliding-window budget AND the per-call cap
+        (``attempts`` is the calling measure()'s running count — a mutable one-item list).
+        Returns True once a fresh process is alive at its reading prompt; False when either
+        budget is spent or the owner closed the meter (never respawn over a deliberate close)."""
+        while True:
+            if self._closed_since(close_gen) or not self._restart_allowed():
+                return False
+            if attempts[0] >= self._restart_budget:
+                return False   # one call never outlives its own budget, however slow each cycle
+            attempts[0] += 1
+            self._restart_times.append(time.monotonic())
+            self.restarts += 1
+            if self._restart_backoff_s > 0:
+                time.sleep(self._restart_backoff_s)
+            if self._closed_since(close_gen):
+                return False
+            if self._respawn(close_gen):
+                return True
+            self.restart_failures += 1
+
+    def _respawn(self, close_gen: int) -> bool:
+        """Tear the dead process down (kill it outright — a process that merely lost its
+        stream may still hold the USB instrument) and spawn a fresh generation."""
+        with self._lock:
+            old, old_reader = self._proc, self._reader
+            self._proc = None
+            self._reader = None
+        if old is not None:
+            self._stop_process(old, polite=False)
+            self._join_quietly(old_reader, 1.0)
+        try:
+            return self._spawn(close_gen)
+        except Exception as exc:   # a failed spawn is one failed attempt, never a raise
+            self._record_spawn_failure(exc)
+            return False
+
+    def _down_result(self, close_gen: int, base: str) -> SpotreadResult:
+        """The failure for a dead process the self-heal could not (or must not) revive —
+        carrying spotread's own last output so callers can log WHY."""
+        tail = self.last_death_tail
+        if self._closed_since(close_gen):
+            fault = "closed"
+            error = f"{base} (meter closed by its owner)"
+        else:
+            fault = "self_heal_exhausted"
+            error = (f"{base}; self-heal exhausted ({len(self._restart_times)} respawn "
+                     f"attempt(s) in the last {self._restart_window_s:.0f}s, budget "
+                     f"{self._restart_budget})")
+        if tail:
+            error += f"; last spotread output: {_one_line(tail, 300)}"
+        raw = (f"spotread exit code {self.last_death_exit_code}; output before exit:\n{tail}"
+               if tail else "")
+        return SpotreadResult(None, None, ok=False, error=error, raw=raw, fault=fault)
 
     def _advance_to_ready(self) -> None:
         """Drive spotread from spawn to its "take a reading" prompt.
@@ -672,9 +910,29 @@ class PersistentSpotread:
     def measure(self, *, timeout: Optional[float] = None) -> SpotreadResult:
         """Trigger one reading and return it. Never raises for a measurement failure
         — a timeout / dead process / garbled or under-range read comes back as
-        ``ok=False`` so the calling loop can decide (re-read, escalate)."""
+        ``ok=False`` so the calling loop can decide (re-read, escalate).
+
+        A DEAD process (found dead at trigger time, or dying while we wait for the
+        reading) is recorded with its output tail and respawned within the bounded
+        self-heal budget; the reading is then taken from the fresh process — the caller's
+        patch is still presented, so the read is valid for it. When the budget is spent
+        the failure carries ``fault="self_heal_exhausted"`` and spotread's last output."""
+        with self._lock:
+            close_gen = self._close_gen
+            closed = self._closed
+        if closed:
+            # The owner closed this meter (the stall watchdog's force-kill, or teardown): never
+            # spawn a process behind its back — also covers a measure() racing that close().
+            return SpotreadResult(None, None, ok=False, error="spotread meter is closed",
+                                  fault="closed")
         if not self._started:
-            self.start()
+            try:
+                self._spawn(close_gen)
+            except Exception as exc:   # never raise from measure(): a failed spawn = a dead meter
+                self._record_spawn_failure(exc)
+                # The lifecycle has begun: recovery is now the BUDGETED self-heal's job, not an
+                # unbounded lazy re-spawn on every later call (close() resets this).
+                self._started = True
         # Drain readings queued BEFORE this trigger — they predate this patch.
         with self._lock:
             stale = len(self._results)
@@ -684,14 +942,28 @@ class PersistentSpotread:
             # A warning queued before this trigger pertains to a prior reading, not this
             # patch — drop it so a stale warn-token can't demote this patch's valid reading.
             self._pending_warning = None
-        if self._dead():
-            return SpotreadResult(None, None, ok=False, error="spotread process is not running")
-        self._send(self._trigger)
-        res = self._wait_result(timeout or self._read_timeout)
-        if res is None:
-            err = "spotread exited before a reading" if self._dead() else "timed out waiting for a reading"
-            return SpotreadResult(None, None, ok=False, error=err, raw=self._tail()[:500])
-        return res
+        context = "idle"
+        base = "spotread process is not running"
+        attempts = [0]   # respawns spent by THIS call (capped at restart_budget)
+        # Bounded: every pass that does not return consumes ≥1 respawn attempt from the
+        # sliding-window budget (or returns once the budget is spent / the meter was closed).
+        while True:
+            if self._process_down():
+                if self._closed_since(close_gen):
+                    return self._down_result(close_gen, base)
+                self._record_death(context)
+                if not self._self_heal(close_gen, attempts):
+                    return self._down_result(close_gen, base)
+            self._send(self._trigger)
+            res = self._wait_result(timeout or self._read_timeout)
+            if res is not None:
+                return res
+            if not self._process_down():
+                return SpotreadResult(None, None, ok=False, error="timed out waiting for a reading",
+                                      raw=self._tail()[:500])
+            # Died while we waited for the reading → record + self-heal, then re-trigger.
+            context = "mid-read"
+            base = "spotread exited before a reading"
 
     def _wait_result(self, timeout: float) -> Optional[SpotreadResult]:
         end = time.monotonic() + timeout
@@ -717,23 +989,46 @@ class PersistentSpotread:
 
     def close(self) -> None:
         """Ask spotread to quit, escalate terminate→kill if it won't, and join the
-        reader. Best-effort and idempotent."""
+        reader. Best-effort and idempotent. Safe from another thread (the stall
+        watchdog's force-kill): it bumps the close generation first, so an in-flight
+        :meth:`measure` returns ``fault="closed"`` instead of respawning over it."""
         with self._lock:
+            self._close_gen += 1
+            self._closed = True     # sticky until an explicit start()
             proc = self._proc
+            reader = self._reader
         if proc is None:
+            with self._lock:
+                self._started = False
             return
-        self._send(self._quit_command)
-        if not self._await_exit(proc, 1.0):
-            proc.terminate()
-            if not self._await_exit(proc, 1.0):
-                proc.kill()           # escalate: terminate didn't take (zombie / USB-blocked)
-                self._await_exit(proc, 1.0)
-        if self._reader is not None:
-            self._reader.join(timeout=2.0)   # kill → read_some EOFs → reader exits
+        self._stop_process(proc, polite=True)
+        self._join_quietly(reader, 2.0)   # kill → read_some EOFs → reader exits
         with self._lock:
-            self._proc = None
-            self._reader = None
+            if self._proc is proc:
+                self._proc = None
+                self._reader = None
             self._started = False
+
+    def _stop_process(self, proc: SpotreadProcess, *, polite: bool) -> None:
+        """Stop one process: optionally ask it to quit, then terminate → kill escalation
+        (each bounded). Best-effort — a transport error never propagates."""
+        if polite:
+            try:
+                proc.write(self._quit_command)
+            except Exception:
+                pass
+            if self._await_exit(proc, 1.0):
+                return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        if not self._await_exit(proc, 1.0):
+            try:
+                proc.kill()           # escalate: terminate didn't take (zombie / USB-blocked)
+            except Exception:
+                pass
+            self._await_exit(proc, 1.0)
 
     def _await_exit(self, proc: SpotreadProcess, timeout: float) -> bool:
         end = time.monotonic() + timeout

@@ -1676,3 +1676,175 @@ def test_presenters_honor_the_per_presentation_settle_bump():
                            settle_bump_s=1.25))
     assert disp.sent[0][1] == 0.5           # no bump → the presenter's own settle only
     assert disp.sent[1][1] == 1.75          # bump rides on top for this one presentation
+
+
+# ---------------------------------------------------------------------------
+# meter-down fail-fast (2026-09-23 HDR-run incident: a dead meter made the preheat soak cycle
+# patches on instant failed reads until the 180 s stall watchdog rolled the run back)
+# ---------------------------------------------------------------------------
+
+_METER_ERR = ("spotread process is not running; last spotread output: "
+              "Instrument access failed with error 'Communications failure'")
+
+
+class _MeterDiesAfter:
+    """A warm SyntheticPanel for ``good`` reads, then every read is a meter-PROCESS fault
+    (tagged like the live meters tag a dead spotread); ``terminal`` also marks meter_down."""
+
+    def __init__(self, transfer: Transfer, good: int, *, terminal: bool = False) -> None:
+        self.panel = SyntheticPanel(transfer=transfer, start_temp=1.0)
+        self.good = good
+        self.terminal = terminal
+        self.calls = 0
+        self.failed_calls = 0
+
+    def __call__(self, patch: MeasurePatch) -> Reading:
+        self.calls += 1
+        if self.calls <= self.good:
+            return self.panel(patch)
+        self.failed_calls += 1
+        raw = {"meter_fault": "self_heal_exhausted" if self.terminal else "exited"}
+        if self.terminal:
+            raw["meter_down"] = True
+        return Reading(xyz=None, ok=False, error=_METER_ERR, raw=raw)
+
+
+def test_consecutive_meter_faults_halt_the_pass_as_a_run_stopper(tmp_path: Path):
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    meter = _MeterDiesAfter(t, good=12)
+    epath = tmp_path / "e.jsonl"
+    res = run_measure_loop(patches=_grey_ramp(t, 16), transfer=t, measure=meter,
+                           config=MeasureLoopConfig(meter_down_reads=5),
+                           runlog=RunLog(epath, phase="measure:raw"),
+                           ti3_path=tmp_path / "m.ti3", ndjson_path=tmp_path / "m.ndjson")
+    # Stopped after exactly meter_down_reads consecutive faults — not 16 reads per patch × the
+    # rest of the pass (the old per-patch "no usable read" sentinel-hole grind).
+    assert meter.failed_calls == 5
+    assert res.digest["meter_down"] is True and res.needs_adjudication
+    assert res.digest["anomaly_reasons"][0] == "meter_down"
+    detail = res.digest["meter_down_detail"]
+    assert detail["consecutive_fault_reads"] == 5 and "Communications failure" in detail["error"]
+    assert "METER DOWN" in res.question and "Communications failure" in res.question
+    assert "did not settle" not in res.question          # no misleading not-warm bit
+    # The data measured before the meter died is kept (partial .ti3) for the judge.
+    assert 0 < res.patch_count < 16 and res.ti3_path is not None
+    events = read_events(epath)
+    first_fail = [e for e in events if e.event == "meter_read_failed"]
+    assert len(first_fail) == 1 and first_fail[0].data["error"] == _METER_ERR
+    assert any(e.event == "anomaly" and e.data.get("kind") == "meter_down"
+               and e.data.get("severity") == "run_stopper" for e in events)
+
+
+def test_terminal_meter_fault_trips_immediately_even_mid_soak():
+    t = _sdr()
+    meter = _MeterDiesAfter(t, good=0, terminal=True)
+    res = run_measure_loop(patches=_grey_ramp(t, 8), transfer=t, measure=meter,
+                           config=MeasureLoopConfig(preheat="always"))
+    assert meter.calls == 1                              # the soak's first load read — and stop
+    assert res.digest["meter_down"] is True
+    assert res.digest["meter_down_detail"]["measure_phase"] == "preheat"
+    assert res.digest["preheat"] is None                 # the soak never completed
+    assert res.patch_count == 0
+
+
+def test_untagged_read_failures_never_trip_meter_down_and_are_surfaced(tmp_path: Path):
+    # A no-data failure WITHOUT a meter-process fault (a timeout, a garbled line) is the
+    # per-patch policy's / stall guard's business, not meter-down — even a long streak. It
+    # still reaches the LLM at once (WARN at the first failure; INFO when reads recover).
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, start_temp=1.0)
+    state = {"n": 0}
+
+    def flaky(patch: MeasurePatch) -> Reading:
+        state["n"] += 1
+        if 3 <= state["n"] < 11:                          # 8 consecutive untagged failures
+            return Reading(xyz=None, ok=False, error="timed out waiting for a reading")
+        return panel(patch)
+
+    epath = tmp_path / "e.jsonl"
+    res = run_measure_loop(patches=_grey_ramp(t, 6), transfer=t, measure=flaky,
+                           config=MeasureLoopConfig(meter_down_reads=5),
+                           runlog=RunLog(epath, phase="measure:raw"), checkin_interval_s=1e-9)
+    assert res.digest["meter_down"] is False
+    assert res.digest["meter_read_failures"] == 8
+    events = read_events(epath)
+    fails = [e for e in events if e.event == "meter_read_failed"]
+    assert len(fails) == 1 and fails[0].level == "WARN"
+    assert "timed out" in fails[0].data["error"]
+    recovered = [e for e in events if e.event == "meter_read_recovered"]
+    assert len(recovered) == 1 and recovered[0].data["failed_reads"] == 8
+    # the check-in evidence packet carries the NEW meter events of its window
+    carried = [e for e in events if e.event == "check_in"
+               and (e.data.get("since_last") or {}).get("meter_events")]
+    assert carried and carried[0].data["new_meter_events"][0]["event"] == "meter_read_failed"
+
+
+def test_meter_down_streak_resets_on_any_read_with_data():
+    # Faults interleaved with real reads never accumulate into a false meter-down.
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, start_temp=1.0)
+    state = {"n": 0}
+
+    def alternating(patch: MeasurePatch) -> Reading:
+        state["n"] += 1
+        if state["n"] % 2 == 0:
+            return Reading(xyz=None, ok=False, error="spotread exited with 1",
+                           raw={"meter_fault": "exited"})
+        return panel(patch)
+
+    res = run_measure_loop(patches=_grey_ramp(t, 6), transfer=t, measure=alternating,
+                           config=MeasureLoopConfig(meter_down_reads=2))
+    assert res.digest["meter_down"] is False
+
+
+def test_meter_self_heal_restart_is_surfaced_as_evidence(tmp_path: Path):
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    panel = SyntheticPanel(transfer=t, start_temp=1.0)
+    state = {"n": 0}
+
+    def heals_once(patch: MeasurePatch) -> Reading:
+        state["n"] += 1
+        r = panel(patch)
+        if state["n"] == 1:   # the meter respawned a dead spotread inside this (good) read
+            return Reading(xyz=r.xyz, yxy=r.yxy, ok=True,
+                           raw={"persistent": True, "meter_restarts": 1,
+                                "meter_death_tail": "Instrument access failed"})
+        return r
+
+    epath = tmp_path / "e.jsonl"
+    res = run_measure_loop(patches=_grey_ramp(t, 6), transfer=t, measure=heals_once,
+                           runlog=RunLog(epath, phase="measure:raw"))
+    assert res.digest["meter_restarts"] == 1 and res.digest["meter_down"] is False
+    assert "meter_down" not in res.digest["anomaly_reasons"]
+    restarted = [e for e in read_events(epath) if e.event == "meter_restarted"]
+    assert len(restarted) == 1 and restarted[0].level == "WARN"
+    assert restarted[0].data["death_tail"] == "Instrument access failed"
+
+
+def test_legacy_one_shot_meter_tags_a_no_reading_exit_as_a_meter_fault(tmp_path: Path):
+    import subprocess as _sp
+
+    class _Presenter:
+        def show(self, patch):
+            pass
+
+        def close(self):
+            pass
+
+    class _Spotread:
+        def run_spotread_once(self, request, timeout_seconds=60):
+            return _sp.CompletedProcess(args=["spotread"], returncode=1, stdout="",
+                                        stderr="Instrument access failed with error 'Comms'\n")
+
+    t = _sdr()
+    meter = make_spotread_meter(presenter=_Presenter(), spotread=_Spotread(), port=1,
+                                output_dir=tmp_path / "probe")
+    reading = meter(_patch("p0", (512, 512, 512), t, 0))
+    assert reading.ok is False and reading.raw["meter_fault"] == "exited"
+    assert "Instrument access failed" in (reading.error or "")

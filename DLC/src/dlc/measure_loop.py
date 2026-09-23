@@ -54,7 +54,7 @@ from .dip import DisplayInstrumentProfile
 from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, normalized_channels
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
-from .liveness import Liveness
+from .liveness import Liveness, MeterDown
 from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 
 __all__ = [
@@ -305,6 +305,19 @@ class MeasureLoopConfig:
     # orchestrator only uses it to pick the seam's RECOMMENDATION (accept vs retry) — the LLM
     # still judges.
     anomaly_stable_spread: float = 0.05
+
+    # Meter-down fail-fast (2026-09-23 HDR run incident) -----------------------------------
+    # A dead meter used to make every read fail INSTANTLY: the preheat soak kept presenting
+    # patches in a tight loop, emitted nothing useful, and only the 180 s stall watchdog
+    # aborted (the run rolled back at its last stage). The read guard classifies each failed
+    # read: a reading WITH data (even one demoted by an under-range warning) or a failure
+    # without a meter-process fault tag (timeout, garbled line) is NOT meter-down; a failure
+    # the meter tags as a process fault (``raw["meter_fault"]``: dead spotread, failed spawn,
+    # non-zero exit with no reading) counts toward this streak, and an explicit terminal
+    # ``raw["meter_down"]`` (the persistent meter's bounded self-heal is exhausted) trips at
+    # once. Tripping latches ``meter_down``, halts the pass, and surfaces a run-stopper seam
+    # carrying the meter's own error text. 0 disables the streak arm (the terminal arm stays).
+    meter_down_reads: int = 5
 
 
 @dataclass
@@ -689,6 +702,17 @@ class _Loop:
         # presentations carried the bump.
         self._last_presented: Optional[tuple[str, float]] = None
         self.jump_settles = 0
+        # Meter health (the read guard in _instrument): the run-stopper latch + its evidence,
+        # the current streaks, and the evidence packets (failures / self-heal restarts) the
+        # check-ins and the digest carry for the LLM.
+        self.meter_down = False
+        self.meter_down_detail: Optional[dict[str, Any]] = None
+        self.meter_read_failures = 0          # reads that returned NO data (xyz None), any cause
+        self.meter_restarts = 0               # self-heal respawns reported by the meter
+        self.meter_events: list[dict[str, Any]] = []
+        self._meter_fault_streak = 0          # consecutive meter-PROCESS-fault reads
+        self._nodata_streak = 0               # consecutive no-data reads (any cause)
+        self._checkin_meter_at_last = 0
 
     def _reference_read_guard(self) -> ContextManager[None]:
         """The caller-supplied fixed-display-state guard for reference reads (identity
@@ -698,23 +722,113 @@ class _Loop:
     # -- low-level read ----------------------------------------------------
 
     def _instrument(self, inner: MeasureFn) -> MeasureFn:
-        """Bracket every read with the stall guard: ``check`` before (abort if a prior
-        stall went unhandled / the watchdog tripped while wedged) and ``progress`` after
-        a good read (reset the clock). A failed read is activity, not progress, so a
-        failed-read storm still trips the guard. No-op when no liveness is injected."""
+        """Bracket every read — warm-up, main, drift, re-measure AND the thermal soak (whose
+        controller reads through this same fn) — with the stall guard and the meter-health
+        guard. Stall guard: ``check`` before (abort if a prior stall went unhandled / the
+        watchdog tripped while wedged) and ``progress`` after a good read (reset the clock);
+        a failed read is activity, not progress, so a failed-read storm still trips it (no-op
+        when no liveness is injected). Meter guard (:meth:`_meter_health`): puts meter
+        failures / self-heal restarts on the LLM's evidence stream immediately and raises
+        :class:`~dlc.liveness.MeterDown` when the meter is provably down."""
         live = self.liveness
-        if live is None:
-            return inner
 
         def measured(patch: MeasurePatch) -> Reading:
-            live.activity(self._live_phase)
-            live.check(self._live_phase)
+            if live is not None:
+                live.activity(self._live_phase)
+                live.check(self._live_phase)
             reading = inner(patch)
-            if reading.ok:
+            if live is not None and reading.ok:
                 live.progress(self._live_phase)
+            self._meter_health(patch, reading)
             return reading
 
         return measured
+
+    def _meter_event(self, level: str, event: str, **data: Any) -> dict[str, Any]:
+        """Record one meter-health evidence packet (check-in + digest) and emit it on the
+        spine (WARN ⇒ digest tier: the LLM sees it at once, not at the next check-in)."""
+        rec = {"event": event, "measure_phase": self._live_phase, **data}
+        self.meter_events.append(rec)
+        self._emit_event(level, event, **{k: v for k, v in rec.items()
+                                          if v is not None and k != "event"})
+        return rec
+
+    def _meter_health(self, patch: MeasurePatch, reading: Reading) -> None:
+        """The meter-down fail-fast (see ``MeasureLoopConfig.meter_down_reads``). Every
+        read passes through here. Evidence, never a decision, EXCEPT the one provably
+        mechanical fact — the meter cannot read — which halts the pass (run-stopper seam)."""
+        raw = reading.raw if isinstance(reading.raw, dict) else {}
+        restarts = raw.get("meter_restarts")
+        if restarts:
+            # The persistent meter self-healed INSIDE this read (respawned a dead spotread).
+            # Non-stopper, but the LLM must see it — with spotread's own dying words.
+            self.meter_restarts += int(restarts)
+            self._meter_event(
+                "WARN", "meter_restarted", label=patch.label, restarts=int(restarts),
+                respawn_attempts=raw.get("meter_restart_attempts"),
+                restarts_total=self.meter_restarts, read_ok=bool(reading.ok),
+                death_exit_code=raw.get("meter_death_exit_code"),
+                death_tail=raw.get("meter_death_tail"),
+                message=("spotread had died and was respawned by the meter's bounded self-heal"
+                         + ("; the reading after the respawn is valid" if reading.ok else "")))
+        if reading.xyz is not None:
+            # The instrument produced data (even a warning-demoted read) → the meter is alive.
+            if self._nodata_streak:
+                self._meter_event("INFO", "meter_read_recovered", label=patch.label,
+                                  failed_reads=self._nodata_streak)
+            self._nodata_streak = 0
+            self._meter_fault_streak = 0
+            return
+        # A read with NO data.
+        self.meter_read_failures += 1
+        self._nodata_streak += 1
+        fault = raw.get("meter_fault")
+        self._meter_fault_streak = self._meter_fault_streak + 1 if fault else 0
+        if self._nodata_streak == 1:
+            # First failure of a streak → onto the LLM's evidence stream NOW, error text included.
+            self._meter_event("WARN", "meter_read_failed", label=patch.label, role=patch.role,
+                              error=reading.error, meter_fault=fault,
+                              respawn_attempts=raw.get("meter_restart_attempts"),
+                              death_tail=raw.get("meter_death_tail"))
+        terminal = bool(raw.get("meter_down"))
+        streak_trip = (self.cfg.meter_down_reads > 0
+                       and self._meter_fault_streak >= self.cfg.meter_down_reads)
+        if not (terminal or streak_trip) or self.meter_down:
+            return
+        error = reading.error or "meter read failed (no error text)"
+        reason = ("meter self-heal exhausted (the dead spotread could not be respawned)"
+                  if terminal else
+                  f"{self._meter_fault_streak} consecutive meter-process faults")
+        self.meter_down = True
+        self.meter_down_detail = {
+            "reason": reason,
+            "error": error,
+            "meter_fault": fault,
+            "consecutive_fault_reads": self._meter_fault_streak,
+            "consecutive_failed_reads": self._nodata_streak,
+            "measure_phase": self._live_phase,
+            "label": patch.label,
+            "role": patch.role,
+            "patches_measured": len(self.accepted),
+            "patches_total": len(self.patches),
+            "meter_restarts": self.meter_restarts,
+            "death_tail": raw.get("meter_death_tail"),
+            "meter_output": (raw.get("result") if isinstance(raw.get("result"), str)
+                             and raw.get("result") else None),
+        }
+        message = (f"METER DOWN (run-stopper): {reason} during {self._live_phase} — {error}; "
+                   "the pass is halted (every further read would fail instantly)")
+        self._meter_event("WARN", "meter_down", severity="run_stopper",
+                          **{k: v for k, v in self.meter_down_detail.items()
+                             if k != "measure_phase"},
+                          message=message)
+        if self.runlog is not None:
+            self.runlog.anomaly(self._live_phase, kind="meter_down", severity="run_stopper",
+                                **{k: v for k, v in self.meter_down_detail.items() if v is not None},
+                                message=message)
+        raise MeterDown(self._live_phase, error,
+                        consecutive_failures=self._meter_fault_streak,
+                        detail=self.meter_down_detail)
 
     def _emit_event(self, level: str, event: str, **data: Any) -> None:
         # Prefer the shared spine (phase-stamped, tier-derived); fall back to the legacy
@@ -825,12 +939,18 @@ class _Loop:
         }
         if self.warm and not self._checkin_warm_at_last:
             since_last["became_warm"] = True   # the warm-up→warm transition happened this window
+        # Meter-health evidence NEW in this window (failed reads, self-heal respawns) — only
+        # present when something happened, so a clean window's packet is unchanged.
+        new_meter = self.meter_events[self._checkin_meter_at_last:]
+        if new_meter:
+            since_last["meter_events"] = len(new_meter)
         self.runlog.check_in(
             "measure", progress=round(frac, 2),
             patches_done=index, patches_total=total,
             elapsed_since_checkin_s=elapsed_since,
             since_last=since_last,
             new_anomalies=(new_anomalies_inline or None),   # the actual NEW flags, for the LLM to judge
+            new_meter_events=((new_meter[-10:]) or None),   # meter failures/restarts, error text included
             warm=self.warm,                          # current state (position, not repeated evidence)
             white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None),
             reads_total=self.seq_counter,
@@ -841,6 +961,7 @@ class _Loop:
         self._checkin_anomalies_at_last = len(self.read_anomalies)
         self._checkin_drift_at_last = self.drift_episodes
         self._checkin_warm_at_last = self.warm
+        self._checkin_meter_at_last = len(self.meter_events)
 
     def _jump_settle_bump(self, patch: MeasurePatch) -> float:
         """Extra presenter dwell for THIS presentation of ``patch`` (0.0 when none is
@@ -2178,7 +2299,8 @@ class IncrementalMeasureSession:
     def digest(self) -> dict[str, Any]:
         drift_summary = self.loop._recent_drift_summary()
         needs_adjudication = (
-            self.loop.panel_dark
+            self.loop.meter_down
+            or self.loop.panel_dark
             or self.preheat_compromised
             or self.loop.measurement_path_compromised
             or (not self.loop.warm)
@@ -2189,6 +2311,12 @@ class IncrementalMeasureSession:
         return {
             "warm": self.loop.warm,
             "preheat_compromised": self.preheat_compromised,
+            # A MeterDown raised inside this session propagates to the caller (the orchestrator
+            # turns it into a clean abort with the meter error); the latch rides here too.
+            "meter_down": self.loop.meter_down,
+            "meter_down_detail": self.loop.meter_down_detail,
+            "meter_read_failures": self.loop.meter_read_failures,
+            "meter_restarts": self.loop.meter_restarts,
             "panel_dark": self.loop.panel_dark,
             "present_stall": self.loop.present_stall,
             "dark_reference_nits": (round(self.loop.dark_reference_nits, 4)
@@ -2352,20 +2480,31 @@ def run_measure_loop(
         correction_channel_scale=correction_channel_scale,
     )
 
-    preheat_digest = loop.preheat()
+    preheat_digest: Optional[dict[str, Any]] = None
+    unresolved: list[str] = []
+    try:
+        preheat_digest = loop.preheat()
+        loop.warm_up()
+        if loop.panel_dark:
+            # The panel is emitting ~no light (asleep/off/wrong input). Skip the main pass entirely —
+            # metering it just yields black data or hangs the meter per patch (the 8-minute silent
+            # spin this guard exists to prevent). Surface it for adjudication instead.
+            pass
+        else:
+            loop.main_pass()
+            # A present-stall halts the pass mid-way; the appended queue was built against a live
+            # panel and re-measuring it through a frozen frame just multiplies garbage — skip it
+            # and let the run-stopper seam decide (retry re-measures everything anyway).
+            unresolved = loop.drain_appended() if not loop.present_stall else []
+    except MeterDown:
+        # The read guard proved the meter DOWN (self-heal exhausted / consecutive meter-process
+        # faults) — wherever it happened (preheat soak, warm-up, main pass, drift checkpoint,
+        # re-measure). Every further read would fail instantly, so the pass halts HERE and the
+        # run-stopper escalation seam adjudicates with the meter's own error text — instead of
+        # cycling patches on dead reads until the stall watchdog rolls the whole run back.
+        if not loop.meter_down:
+            raise   # not this loop's latch — never swallow someone else's abort
     preheat_compromised = bool(preheat_digest and preheat_digest.get("compromised"))
-    loop.warm_up()
-    if loop.panel_dark:
-        # The panel is emitting ~no light (asleep/off/wrong input). Skip the main pass entirely —
-        # metering it just yields black data or hangs the meter per patch (the 8-minute silent
-        # spin this guard exists to prevent). Surface it for adjudication instead.
-        unresolved: list[str] = []
-    else:
-        loop.main_pass()
-        # A present-stall halts the pass mid-way; the appended queue was built against a live
-        # panel and re-measuring it through a frozen frame just multiplies garbage — skip it
-        # and let the run-stopper seam decide (retry re-measures everything anyway).
-        unresolved = loop.drain_appended() if not loop.present_stall else []
 
     accepted = loop.ordered_accepted()
     written_ti3: Optional[str] = None
@@ -2407,7 +2546,8 @@ def run_measure_loop(
     anomaly_repeatability = _read_anomaly_repeatability(loop.read_anomalies, loop.accepted, cfg)
 
     needs_adjudication = (
-        loop.panel_dark
+        loop.meter_down
+        or loop.panel_dark
         or preheat_compromised
         or loop.measurement_path_compromised
         or (not loop.warm)
@@ -2417,6 +2557,7 @@ def run_measure_loop(
     )
     anomaly_reasons = [
         name for name, active in (
+            ("meter_down", loop.meter_down),
             ("panel_dark", loop.panel_dark),
             ("present_stall", loop.present_stall),
             ("preheat_compromised", preheat_compromised),
@@ -2431,6 +2572,17 @@ def run_measure_loop(
     question = None
     if needs_adjudication:
         bits = []
+        if loop.meter_down:
+            md = loop.meter_down_detail or {}
+            bits.append(
+                f"METER DOWN (run-stopper): {md.get('reason', 'the meter could not read')} during "
+                f"{md.get('measure_phase', '?')} — meter error: {md.get('error', 'n/a')}; the pass "
+                f"was halted at {len(accepted)}/{len(loop.patches)} patches (every further read "
+                "would have failed instantly); check the meter (USB / instrument / another "
+                "spotread holding it), then remeasure — the live seam pauses this invocation "
+                "and the resumed one opens a fresh meter (an in-process remeasure reuses this "
+                "meter, whose self-heal budget is spent)"
+            )
         if loop.present_stall:
             st = next((a for a in loop.read_anomalies if a.get("reason") == "present_stall"), {})
             bits.append(
@@ -2479,7 +2631,7 @@ def run_measure_loop(
                         "the anomalous reads are DIVERGENT across re-reads of the same stimulus — "
                         "consistent with a transient meter/display fault; a retry should clear it"
                     )
-        if not loop.warm and not loop.panel_dark:
+        if not loop.warm and not loop.panel_dark and not loop.meter_down:
             bits.append(
                 f"panel did not settle within {cfg.max_warmup_reads} warm-up reads "
                 f"(cold channel {loop.cold_channel})"
@@ -2511,6 +2663,11 @@ def run_measure_loop(
 
     digest = {
         "warm": loop.warm,
+        "meter_down": loop.meter_down,
+        "meter_down_detail": loop.meter_down_detail,
+        "meter_read_failures": loop.meter_read_failures,
+        "meter_restarts": loop.meter_restarts,
+        "meter_events": loop.meter_events[-8:],
         "panel_dark": loop.panel_dark,
         "present_stall": loop.present_stall,
         "preheat_compromised": preheat_compromised,
@@ -2791,13 +2948,26 @@ def make_spotread_meter(
         except OSError as exc:
             return Reading(xyz=None, yxy=None, ok=False,
                            error=f"spotread spawn failed: {type(exc).__name__}: {exc}",
-                           raw={"spawn_error": True})
+                           raw={"spawn_error": True, "meter_fault": "spawn_failed"})
         combined = (completed.stdout or "") + "\n" + (completed.stderr or "")
         xyz = parse_xyz(combined)
         yxy = parse_yxy(combined)
         error: Optional[str] = None
+        raw: dict[str, Any] = {
+            "returncode": completed.returncode,
+            "spectral_file": str(request.output_sp) if request.output_sp else None,
+        }
         if completed.returncode != 0:
             error = f"spotread exited with {completed.returncode}"
+            if xyz is None:
+                # A per-read spotread that exits non-zero with NO reading is a meter-PROCESS
+                # fault (typically the instrument could not be opened) — carry its own output
+                # so the loop's read guard can surface WHY, and count it toward meter-down.
+                tail = " | ".join(ln.strip() for ln in combined.splitlines() if ln.strip())
+                tail = tail if len(tail) <= 300 else "..." + tail[-300:]
+                if tail:
+                    error += f": {tail}"
+                raw["meter_fault"] = "exited"
         elif xyz is None and yxy is None:
             error = "spotread output did not contain XYZ/Yxy"
         return Reading(
@@ -2805,10 +2975,7 @@ def make_spotread_meter(
             yxy=yxy,
             ok=error is None,
             error=error,
-            raw={
-                "returncode": completed.returncode,
-                "spectral_file": str(request.output_sp) if request.output_sp else None,
-            },
+            raw=raw,
         )
 
     return measure
@@ -2839,13 +3006,33 @@ def make_persistent_spotread_meter(
         presenter.show(patch)
         if settle_seconds:
             _time.sleep(settle_seconds)
+        restarts_before = getattr(persistent, "restarts", 0)
+        failures_before = getattr(persistent, "restart_failures", 0)
         res = persistent.measure()
+        raw: dict[str, Any] = {"persistent": True, "result": res.raw}
+        # Meter-PROCESS health for the loop's read guard (distinct from a measurement-quality
+        # failure): a dead spotread the bounded self-heal could not revive is TERMINAL
+        # (meter_down) — the loop halts instead of cycling patches on instant failed reads.
+        fault = getattr(res, "fault", None)
+        if fault:
+            raw["meter_fault"] = fault
+            if fault == "self_heal_exhausted":
+                raw["meter_down"] = True
+        # A self-heal respawn happened inside this read: surface it (with the dead process's
+        # own output) so the loop can put it on the LLM's evidence stream.
+        attempts = getattr(persistent, "restarts", 0) - restarts_before
+        if attempts > 0:
+            failed = getattr(persistent, "restart_failures", 0) - failures_before
+            raw["meter_restart_attempts"] = attempts
+            raw["meter_restarts"] = max(0, attempts - failed)   # respawns that came up alive
+            raw["meter_death_tail"] = getattr(persistent, "last_death_tail", None)
+            raw["meter_death_exit_code"] = getattr(persistent, "last_death_exit_code", None)
         return Reading(
             xyz=res.xyz,
             yxy=res.yxy,
             ok=res.ok,
             error=res.error,
-            raw={"persistent": True, "result": res.raw},
+            raw=raw,
         )
 
     return measure

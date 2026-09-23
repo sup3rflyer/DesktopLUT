@@ -136,6 +136,7 @@ class FakeSpotread:
 def _driver(fake: FakeSpotread, **kw) -> PersistentSpotread:
     kw.setdefault("start_timeout", 5.0)
     kw.setdefault("read_timeout", 5.0)
+    kw.setdefault("restart_backoff_s", 0.0)   # the self-heal's real-world USB backoff, not in tests
     return PersistentSpotread(lambda: fake, **kw)
 
 
@@ -624,4 +625,319 @@ def test_persistent_meter_composer_maps_result_and_shows_patch():
 
 def test_spotread_result_defaults():
     r = SpotreadResult(xyz=None, yxy=None, ok=False)
-    assert r.error is None and r.raw == ""
+    assert r.error is None and r.raw == "" and r.fault is None
+
+
+# ---------------------------------------------------------------------------
+# Bounded self-heal (2026-09-23 HDR-run incident: a spotread that died at startup left the
+# driver answering "process is not running" instantly and forever, its error text lost)
+# ---------------------------------------------------------------------------
+
+_USB_OPEN_FAILURE = (b"Setting up the instrument\n"
+                     b"Instrument access failed with error 'Communications failure'\n")
+
+
+def _dead_on_arrival(output: bytes = _USB_OPEN_FAILURE) -> FakeSpotread:
+    """A spotread that prints its instrument-open error and exits before any prompt —
+    already exited (poll() != None) while its output is still unread, like the real one."""
+    fake = FakeSpotread(prompt=output)
+    fake._close()
+    return fake
+
+
+class _SequencedFactory:
+    """Hands out one fresh fake per spawn from ``builders`` (the last one repeats)."""
+
+    def __init__(self, *builders) -> None:
+        self._builders = list(builders)
+        self.calls = 0
+        self.spawned: list = []
+
+    def __call__(self):
+        idx = min(self.calls, len(self._builders) - 1)
+        self.calls += 1
+        proc = self._builders[idx]()
+        self.spawned.append(proc)
+        return proc
+
+
+def _healing(factory, **kw) -> PersistentSpotread:
+    kw.setdefault("start_timeout", 2.0)
+    kw.setdefault("read_timeout", 2.0)
+    kw.setdefault("quiesce_seconds", 0.1)
+    kw.setdefault("restart_backoff_s", 0.0)
+    return PersistentSpotread(factory, **kw)
+
+
+def test_dead_at_first_measure_respawns_and_returns_a_valid_reading():
+    # The incident: the process spotread spawned for the resumed stage died at startup. The
+    # first measure() must capture its dying words, respawn ONE fresh process, and read.
+    factory = _SequencedFactory(_dead_on_arrival, FakeSpotread)
+    drv = _healing(factory)
+    res = drv.measure()
+    assert res.ok and res.xyz is not None
+    assert abs(res.xyz[0] - 96.0) < 1e-6          # the respawned process's first reading
+    assert factory.calls == 2
+    assert drv.restarts == 1 and drv.restart_failures == 0 and drv.deaths == 1
+    assert "Communications failure" in (drv.last_death_tail or "")
+    assert drv.death_log[-1]["context"] == "startup"
+    # The healed process stays healthy: no further respawns, readings continue in sequence.
+    again = drv.measure()
+    assert again.ok and abs(again.xyz[0] - 97.0) < 1e-6
+    assert drv.restarts == 1 and factory.calls == 2
+    drv.close()
+    assert factory.spawned[-1].writes[-1] == b"q\n"   # close() still quits the RESPAWNED process
+
+
+def test_process_dying_mid_read_is_respawned_and_the_patch_re_read():
+    # Dies while we wait for the reading (after printing an error): record the tail, respawn,
+    # re-trigger — the caller's patch is still presented, so the fresh read is valid for it.
+    def dies_mid_read():
+        return FakeSpotread(responder=lambda n: b"Instrument read failed: USB transfer error\n",
+                            die_after=1)
+
+    factory = _SequencedFactory(dies_mid_read, FakeSpotread)
+    drv = _healing(factory)
+    drv.start()
+    res = drv.measure()
+    assert res.ok and abs(res.xyz[0] - 96.0) < 1e-6
+    assert drv.restarts == 1 and drv.deaths == 1
+    assert drv.death_log[-1]["context"] == "mid-read"
+    assert "USB transfer error" in (drv.last_death_tail or "")
+    drv.close()
+
+
+def test_self_heal_budget_exhausted_fails_with_the_captured_tail():
+    # A truly unplugged meter must still FAIL — bounded, fast, and saying why — not spin.
+    factory = _SequencedFactory(_dead_on_arrival)
+    drv = _healing(factory, restart_budget=3)
+    t0 = time.monotonic()
+    res = drv.measure()
+    assert not res.ok and res.xyz is None
+    assert res.fault == "self_heal_exhausted"
+    assert "self-heal exhausted" in (res.error or "")
+    assert "Communications failure" in (res.error or "")     # spotread's own error, in the error
+    assert "Communications failure" in res.raw                # and the full tail in raw
+    assert factory.calls == 1 + 3                            # the initial spawn + 3 respawns
+    assert drv.restarts == 3 and drv.restart_failures == 3 and drv.deaths == 4
+    # Exhausted: later calls fail IMMEDIATELY without spawning again (no unbounded retry).
+    again = drv.measure()
+    assert again.fault == "self_heal_exhausted" and factory.calls == 4
+    assert time.monotonic() - t0 < 10.0
+    drv.close()
+
+
+def test_failed_spawn_never_raises_from_measure_and_is_budgeted():
+    def boom():
+        raise OSError("spotread.exe not found")
+
+    drv = _healing(boom, restart_budget=2)
+    res = drv.measure()                    # must not raise
+    assert not res.ok and res.fault == "self_heal_exhausted"
+    assert "spawn failed" in (res.error or "") and "not found" in (res.error or "")
+    assert drv.restarts == 2 and drv.deaths == 3
+    # Later calls do not re-spawn outside the budget (no lazy re-spawn per call).
+    calls = {"n": 0}
+
+    def counting():
+        calls["n"] += 1
+        raise OSError("still missing")
+
+    drv._factory = counting
+    drv.measure()
+    assert calls["n"] == 0
+    drv.close()
+
+
+def test_self_heal_budget_is_a_sliding_window():
+    factory = _SequencedFactory(_dead_on_arrival)
+    drv = _healing(factory, restart_budget=1, restart_window_s=0.3)
+    assert drv.measure().fault == "self_heal_exhausted"
+    assert factory.calls == 2                       # initial + the one budgeted respawn
+    assert drv.measure().fault == "self_heal_exhausted"
+    assert factory.calls == 2                       # window still full → no respawn
+    time.sleep(0.35)
+    drv.measure()
+    assert factory.calls == 3                       # the window slid → one more attempt
+    drv.close()
+
+
+def test_owner_close_mid_read_is_never_respawned():
+    # The stall watchdog force-closes a wedged meter from another thread: the in-flight
+    # measure() must return (fault="closed") — NOT respawn a process over the deliberate kill.
+    factory = _SequencedFactory(lambda: FakeSpotread(ignore_triggers=True))
+    drv = _healing(factory, read_timeout=10.0)
+    drv.start()
+    out: dict = {}
+    th = threading.Thread(target=lambda: out.setdefault("res", drv.measure()))
+    th.start()
+    time.sleep(0.3)
+    drv.close()
+    th.join(timeout=5.0)
+    assert not th.is_alive()
+    res = out["res"]
+    assert not res.ok and res.fault == "closed"
+    assert factory.calls == 1 and drv.restarts == 0
+
+
+def test_close_is_sticky_until_an_explicit_start():
+    # close() means "no spotread behind my back": a measure() after (or racing) the owner's
+    # close fails with fault="closed" and spawns nothing. An explicit start() re-opens with a
+    # clean stream (a stale EOF from the closed process must not make the new one look dead).
+    factory = _SequencedFactory(FakeSpotread)
+    drv = _healing(factory)
+    assert drv.measure().ok
+    drv.close()
+    closed = drv.measure()
+    assert not closed.ok and closed.fault == "closed" and factory.calls == 1
+    drv.start()
+    res = drv.measure()
+    assert res.ok and abs(res.xyz[0] - 96.0) < 1e-6   # a FRESH process's first reading
+    assert factory.calls == 2 and drv.restarts == 0
+    drv.close()
+
+
+def test_one_measure_call_never_outlives_its_respawn_budget():
+    # Review finding: with a sliding window, a respawn→die cycle slower than window/budget
+    # refilled the budget INSIDE one measure() call, so the call never returned. The per-call
+    # cap bounds it: comes up fine, dies 0.3 s after each trigger, window far shorter.
+    def dies_after_trigger():
+        fake = FakeSpotread(ignore_triggers=True)
+        orig_write = fake.write
+
+        def write(data):
+            orig_write(data)
+            if data.strip().lower() != b"q":          # a reading trigger (b"\n"), not quit
+                threading.Timer(0.3, fake._close).start()
+
+        fake.write = write
+        return fake
+
+    factory = _SequencedFactory(dies_after_trigger)
+    drv = _healing(factory, restart_budget=2, restart_window_s=0.2, read_timeout=5.0)
+    t0 = time.monotonic()
+    res = drv.measure()
+    assert time.monotonic() - t0 < 8.0
+    assert not res.ok and res.fault == "self_heal_exhausted"
+    assert factory.calls == 1 + 2                   # initial + exactly the per-call budget
+    drv.close()
+
+
+_DIES_AT_STARTUP = '''\
+import sys
+sys.stdout.write("Setting up the instrument\\n"); sys.stdout.flush()
+sys.stderr.write("Instrument access failed with error 'Communications failure'\\n")
+sys.stderr.flush()
+sys.exit(1)
+'''
+
+
+def test_real_subprocess_death_at_startup_is_captured_and_healed(tmp_path):
+    # Real processes over the raw pipe: the first spotread prints its instrument-open error
+    # (stderr, merged) and exits 1; the self-heal captures that text and the respawned
+    # process reads normally.
+    dying = tmp_path / "dies.py"
+    dying.write_text(_DIES_AT_STARTUP, encoding="utf-8")
+    healthy = tmp_path / "fake_spotread.py"
+    healthy.write_text(_FAKE_SPOTREAD, encoding="utf-8")
+    scripts = [dying, healthy]
+
+    def factory():
+        script = scripts.pop(0) if len(scripts) > 1 else scripts[0]
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+        )
+        return _PipeSpotreadProcess(proc)
+
+    drv = PersistentSpotread(factory, start_timeout=10.0, read_timeout=10.0,
+                             quiesce_seconds=0.2, restart_backoff_s=0.0)
+    try:
+        res = drv.measure()
+        assert res.ok and abs(res.xyz[0] - 96.0) < 1e-6
+        assert drv.restarts == 1 and drv.deaths == 1
+        assert "Communications failure" in (drv.last_death_tail or "")
+        assert drv.last_death_exit_code == 1
+    finally:
+        drv.close()
+
+
+def test_composer_surfaces_restart_and_meter_down_to_the_loop():
+    from dlc.engine.patches import Transfer, to_signal
+    from dlc.measure_loop import MeasurePatch, make_persistent_spotread_meter
+
+    class _Presenter:
+        def show(self, patch):
+            pass
+
+        def close(self):
+            pass
+
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+    cv = (511, 511, 511)
+    patch = MeasurePatch(label="p0", rgb=cv, signal=to_signal([cv], t)[0])
+
+    healed = _healing(_SequencedFactory(_dead_on_arrival, FakeSpotread))
+    reading = make_persistent_spotread_meter(presenter=_Presenter(), persistent=healed)(patch)
+    assert reading.ok
+    assert reading.raw["meter_restarts"] == 1
+    assert "Communications failure" in reading.raw["meter_death_tail"]
+    assert "meter_down" not in reading.raw
+    healed.close()
+
+    dead = _healing(_SequencedFactory(_dead_on_arrival), restart_budget=1)
+    reading = make_persistent_spotread_meter(presenter=_Presenter(), persistent=dead)(patch)
+    assert not reading.ok
+    assert reading.raw["meter_fault"] == "self_heal_exhausted" and reading.raw["meter_down"] is True
+    assert "Communications failure" in (reading.error or "")
+    # attempts are reported, but no respawn is CLAIMED when none came up alive
+    assert reading.raw["meter_restart_attempts"] == 1 and reading.raw["meter_restarts"] == 0
+    dead.close()
+
+
+def test_dead_meter_stops_the_preheat_soak_fast_with_the_error_surfaced(tmp_path: Path):
+    # End-to-end incident replay (no hardware): the persistent meter can never come up, the
+    # measure stage starts with the preheat soak. The OLD behaviour cycled soak patches on
+    # instant failed reads until the stall watchdog rolled the run back; now the soak halts
+    # on the first terminal read and the run-stopper digest carries spotread's error.
+    from dlc.engine.patches import Transfer
+    from dlc.events import RunLog, read_events
+    from dlc.measure_loop import MeasureLoopConfig, make_persistent_spotread_meter, run_measure_loop
+
+    class _Presenter:
+        def __init__(self):
+            self.shown = 0
+
+        def show(self, patch):
+            self.shown += 1
+
+        def close(self):
+            pass
+
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+    presenter = _Presenter()
+    drv = _healing(_SequencedFactory(_dead_on_arrival), restart_budget=3)
+    meter = make_persistent_spotread_meter(presenter=presenter, persistent=drv)
+    epath = tmp_path / "events.jsonl"
+    greys = [(v, v, v) for v in (100, 300, 500, 700, 900, 1023)]
+    t0 = time.monotonic()
+    res = run_measure_loop(patches=greys, transfer=t, measure=meter,
+                           config=MeasureLoopConfig(preheat="always"),
+                           runlog=RunLog(epath, phase="measure:verify"),
+                           ndjson_path=tmp_path / "m.ndjson")
+    assert time.monotonic() - t0 < 10.0
+    assert presenter.shown == 1                       # halted on the FIRST read, no patch cycling
+    assert res.digest["meter_down"] is True and res.needs_adjudication
+    assert "meter_down" in res.digest["anomaly_reasons"]
+    assert res.patch_count == 0
+    assert "METER DOWN" in (res.question or "")
+    assert "Communications failure" in (res.question or "")
+    assert res.digest["meter_down_detail"]["measure_phase"] == "preheat"
+    events = read_events(epath)
+    failed = [e for e in events if e.event == "meter_read_failed"]
+    assert failed and "Communications failure" in failed[0].data["error"]
+    assert failed[0].level == "WARN"                  # digest tier: the LLM sees it at once
+    assert any(e.event == "anomaly" and e.data.get("kind") == "meter_down" for e in events)
+    assert not any(e.event == "meter_restarted" for e in events)   # no respawn ever came up
+    assert failed[0].data["respawn_attempts"] == 3
+    drv.close()
