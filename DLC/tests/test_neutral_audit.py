@@ -92,6 +92,250 @@ def test_read_ini_flags_degrades_without_raising(tmp_path: Path):
     assert flags == {} and "no [Monitor1] SDR_* keys" in note
 
 
+# ---------------------------------------------------------------------------
+# identity-keyed [Display<slot>] sections (DesktopLUT 2026-09-14, parent 04d4150)
+# ---------------------------------------------------------------------------
+
+# Modelled on the live ini: the slot is a storage id in first-seen order, NOT the monitor index.
+# Here the LG was seen first (slot 0) and the ProArt second (slot 1); the BenQ (slot 2) is parked
+# and shares the LG's connector UID. Live topology in the tests: monitor 0 = ProArt, 1 = LG.
+_PROART_PATH = r"\\?\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+_LG_PATH = r"\\?\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+_BENQ_PATH = r"\\?\DISPLAY#BNQ802E#5&14ca04b&2&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+_ID_INI = rf"""[General]
+DwmHookMode=true
+CalibrationControl=true
+
+
+[Display0]
+DevicePath={_LG_PATH}
+EdidId=GSM84CD-16843009
+DisplayName=
+LUT_SDR=
+HDR_TonemapEnabled=false
+HDR_TonemapDynamic=false
+MaxTmlEnabled=false
+HDR_MHCEnabled=true
+HDR_MHCProfilePath=C:\WINDOWS\system32\spool\drivers\color\DesktopLUT_Mon1_HDR_90442203.icm
+HDR_MHCWhiteBalanceEnabled=false
+HDR_MHCDesktopGamma=false
+HDR_MHCCorrGSEnabled=false
+HDR_FaldEnabled=false
+[Display1]
+DevicePath={_PROART_PATH}
+EdidId=AUS322A-335544320
+DisplayName=
+HDR_TonemapEnabled=true
+HDR_TonemapDynamic=true
+MaxTmlEnabled=true
+HDR_MHCEnabled=true
+HDR_MHCProfilePath=C:\WINDOWS\system32\spool\drivers\color\DesktopLUT_Mon0_HDR_127611093.icm
+HDR_MHCWhiteBalanceEnabled=true
+HDR_MHCDesktopGamma=true
+HDR_MHCCorrGSEnabled=false
+HDR_FaldEnabled=true
+HDR_FaldParamsPath=H:\results\pa32ucxr_fald_panel.bin
+SDR_MHCWhiteBalanceEnabled=true
+[Display2]
+DevicePath={_BENQ_PATH}
+EdidId=BNQ802E-16843009
+DisplayName=
+HDR_TonemapEnabled=true
+HDR_MHCDesktopGamma=false
+"""
+
+_PROART = {"settings_slot": 1, "edid_id": "AUS322A-335544320", "device_path": _PROART_PATH}
+_LG = {"settings_slot": 0, "edid_id": "GSM84CD-16843009", "device_path": _LG_PATH}
+
+
+def _qm(*entries):
+    """A windows.query_monitors payload (numbers as the C++ JNum doubles)."""
+    return {"available": True, "count": len(entries), "monitors": [
+        {"index": float(i), "friendly_name": "x", "hardware_id": ident["device_path"].split("#")[1],
+         "device_path": ident["device_path"], "edid_id": ident["edid_id"],
+         "settings_slot": float(ident["settings_slot"])} for i, ident in enumerate(entries)]}
+
+
+def test_monitor_identity_reads_the_query_monitors_entry():
+    qm = _qm(_PROART, _LG)
+    assert na.monitor_identity(qm, 0) == _PROART
+    assert na.monitor_identity(qm["monitors"], 1) == _LG          # the bare list works too
+    assert na.monitor_identity(qm, 2) is None                      # not listed
+    assert na.monitor_identity({}, 0) is None and na.monitor_identity(None, 0) is None
+    # a pre-2026-09-14 build: no settings_slot / edid_id (device path only)
+    old = na.monitor_identity({"monitors": [{"index": 0, "device_path": _PROART_PATH}]}, 0)
+    assert old == {"settings_slot": None, "edid_id": None, "device_path": _PROART_PATH}
+    unidentified = na.monitor_identity({"monitors": [{"index": 0, "settings_slot": -1.0}]}, 0)
+    assert unidentified == {"settings_slot": -1, "edid_id": None, "device_path": None}
+    junk = na.monitor_identity({"monitors": [{"index": 0, "settings_slot": True}, "junk"]}, 0)
+    assert junk["settings_slot"] is None                           # a bool is not a slot
+
+
+def test_display_sections_resolve_by_the_pipe_slot_not_the_monitor_index():
+    # monitor 0 (ProArt) lives in [Display1], monitor 1 (LG) in [Display0]
+    r0 = na.resolve_ini_section(_ID_INI, 0, _PROART)
+    assert r0["section"] == "Display1" and r0["note"] is None
+    assert "verified by device path" in r0["how"]
+    hdr0 = na.parse_ini_flags(_ID_INI, 0, "HDR", identity=_PROART)
+    assert hdr0["TonemapEnabled"] == "true" and hdr0["FaldEnabled"] == "true"
+    assert hdr0["MHCProfilePath"].endswith("DesktopLUT_Mon0_HDR_127611093.icm")
+    assert "MaxTmlEnabled" not in hdr0        # the un-prefixed per-monitor key is not a <MODE>_ flag
+    assert "DevicePath" not in hdr0 and "EdidId" not in hdr0
+    hdr1 = na.parse_ini_flags(_ID_INI, 1, "HDR", identity=_LG)
+    assert hdr1["TonemapEnabled"] == "false" and hdr1["MHCProfilePath"].endswith("Mon1_HDR_90442203.icm")
+    assert na.resolve_ini_section(_ID_INI, 1, _LG)["section"] == "Display0"
+
+
+def test_display_section_verified_by_edid_after_a_connector_move():
+    # The panel moved connector: the live device path is new and the ini (written before the
+    # move) still carries the old one — the C++ matches by EDID id and re-stamps on the next save.
+    moved = dict(_PROART, device_path=_PROART_PATH.replace("UID4353", "UID4355"))
+    r = na.resolve_ini_section(_ID_INI, 0, moved)
+    assert r["section"] == "Display1" and "verified by EDID id" in r["how"] and r["note"] is None
+
+
+def test_a_display_section_naming_another_panel_is_refused():
+    # The pipe says slot 0, but [Display0] on disk is the LG: the ini is out of sync with the
+    # running DesktopLUT — never read another display's flags into the evidence.
+    stale = dict(_PROART, settings_slot=0)
+    r = na.resolve_ini_section(_ID_INI, 0, stale)
+    assert r["section"] is None
+    assert "[Display0]" in r["note"] and "GSM84CD-16843009" in r["note"] and "out of sync" in r["note"]
+    assert na.parse_ini_flags(_ID_INI, 0, "HDR", identity=stale) == {}
+
+
+def test_no_identity_is_unresolved_never_a_slot_number_guess():
+    # [Display0] exists, but slot 0 is NOT monitor 0 — without the pipe's identity, refuse.
+    r = na.resolve_ini_section(_ID_INI, 0, None)
+    assert r["section"] is None
+    assert "slot number is not a monitor index" in r["note"]
+    assert "[Display1] AUS322A-335544320" in r["note"]              # the LLM sees what is on disk
+    assert na.parse_ini_flags(_ID_INI, 0, "HDR") == {}
+    # a leftover pre-identity [Monitor0] beside identity sections is an unclaimed section, not trusted
+    mixed = _ID_INI + "[Monitor0]\nHDR_TonemapEnabled=false\n"
+    r = na.resolve_ini_section(mixed, 0, None)
+    assert r["section"] is None and "unclaimed pre-identity section" in r["note"]
+    # ...and a verified identity section wins over it
+    assert na.resolve_ini_section(mixed, 0, _PROART)["section"] == "Display1"
+
+
+def test_without_a_slot_a_unique_device_path_or_edid_match_resolves():
+    # An identity without settings_slot: match the section's DevicePath, then EdidId (unique only).
+    by_path = {"settings_slot": None, "edid_id": None, "device_path": _PROART_PATH.lower()}
+    r = na.resolve_ini_section(_ID_INI, 0, by_path)
+    assert r["section"] == "Display1" and "device path" in r["how"]
+    by_edid = {"settings_slot": None, "edid_id": "gsm84cd-16843009", "device_path": None}
+    assert na.resolve_ini_section(_ID_INI, 1, by_edid)["section"] == "Display0"
+    # twin panels share the EDID id: without a slot that is ambiguous, not a pick
+    twins = _ID_INI + "[Display3]\nDevicePath=\\\\?\\DISPLAY#GSM84CD#other\nEdidId=GSM84CD-16843009\n"
+    r = na.resolve_ini_section(twins, 1, by_edid)
+    assert r["section"] is None and "matches 2 sections" in r["note"]
+    # no identity section matches: the C++ would adopt [Monitor<N>] by index, if there is one
+    unknown = {"settings_slot": None, "edid_id": "XYZ0001-1", "device_path": None}
+    assert na.resolve_ini_section(_ID_INI, 0, unknown)["section"] is None
+    r = na.resolve_ini_section(_ID_INI + "[Monitor0]\nHDR_TonemapEnabled=false\n", 0, unknown)
+    assert r["section"] == "Monitor0" and "adopt by index" in r["note"]
+
+
+def test_unidentified_or_unsaved_slots():
+    # settings_slot -1: the display could not be identified; settings attached by index, not persisted
+    unid = {"settings_slot": -1, "edid_id": None, "device_path": None}
+    r = na.resolve_ini_section(_ID_INI, 0, unid)
+    assert r["section"] is None and "settings_slot -1" in r["note"]
+    r = na.resolve_ini_section(_ID_INI + "[Monitor0]\nHDR_TonemapEnabled=false\n", 0, unid)
+    assert r["section"] == "Monitor0" and "not persisted" in r["note"]
+    # a slot the running DesktopLUT assigned but has not saved yet
+    fresh = dict(_PROART, settings_slot=7)
+    r = na.resolve_ini_section(_ID_INI, 0, fresh)
+    assert r["section"] is None and "[Display7]" in r["note"] and "not in the ini" in r["note"]
+    r = na.resolve_ini_section(_ID_INI + "[Monitor0]\nHDR_TonemapEnabled=false\n", 0, fresh)
+    assert r["section"] == "Monitor0" and "adopted from" in r["note"]
+    # a section without identity keys (hand-edited) is taken on the pipe's slot alone, with a caveat
+    bare = "[Display4]\nHDR_TonemapEnabled=true\n"
+    r = na.resolve_ini_section(bare, 0, dict(_PROART, settings_slot=4))
+    assert r["section"] == "Display4" and "slot alone" in r["note"]
+
+
+def test_legacy_ini_still_resolves_by_index_with_or_without_identity():
+    # A pre-identity ini: the C++ adopts [Monitor<N>] by index, so it is exact (no caveat).
+    for ident in (None, _PROART, {"settings_slot": -1, "edid_id": None, "device_path": None}):
+        r = na.resolve_ini_section(_INI, 0, ident)
+        assert r["section"] == "Monitor0" and r["note"] is None, ident
+        assert na.parse_ini_flags(_INI, 0, "HDR", identity=ident)["TonemapEnabled"] == "true"
+    assert na.resolve_ini_section(_INI, 7, None)["section"] is None
+
+
+def test_ini_sections_follow_win32_profile_semantics():
+    text = "[display0]\nEdidId=A\nHDR_TonemapEnabled=true\nHDR_TonemapEnabled=false\n" \
+           "[Display0]\nHDR_TonemapEnabled=false\n"
+    # case-insensitive section names; the FIRST section / key occurrence wins (GetPrivateProfileString)
+    assert na.parse_ini_flags(text, 0, "HDR", identity={"settings_slot": 0, "edid_id": "a", "device_path": None}) \
+        == {"TonemapEnabled": "true"}
+    # out-of-range / non-canonical section numbers are not DesktopLUT sections
+    assert na.resolve_ini_section("[Display256]\nEdidId=A\n[Monitor01]\nX=1\n", 1, None)["section"] is None
+
+
+def test_read_ini_flags_reports_the_resolved_section(tmp_path: Path):
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text(_ID_INI, encoding="utf-8")
+    r = na.load_ini_flags(ini, 0, "HDR", identity=_PROART)
+    assert r["section"] == "Display1" and r["note"] is None and r["flags"]["TonemapEnabled"] == "true"
+    flags, note = na.read_ini_flags(ini, 0, "HDR")
+    assert flags == {} and "could not be resolved" in note and "slot number is not a monitor index" in note
+    flags, note = na.read_ini_flags(ini, 1, "SDR", identity=_LG)     # [Display0] has no SDR_ keys
+    assert flags == {} and "no [Display0] SDR_* keys" in note
+
+
+def test_audit_resolves_the_display_section_through_query_monitors(tmp_path: Path):
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text(_ID_INI, encoding="utf-8")
+    ctrl = CalibrationController.mock()
+    _associate(ctrl, 0, "HDR")
+    ctrl.query_monitors = lambda: _qm(_PROART, _LG)
+    audit = na.neutral_state_audit(ctrl, 0, "HDR", ini_path=ini)
+    assert audit["ini_section"] == "Display1" and "settings_slot" in audit["ini_resolution"]
+    assert audit["monitor_identity"] == _PROART
+    assert audit["flags"]["FaldEnabled"] == "true"
+    assert audit["ini_profile"] == "DesktopLUT_Mon0_HDR_127611093.icm"
+    # the pipe reports the layers (all off on the mock) — the ini disagreement is a note, pipe wins
+    assert audit["gui_layers_source"] == "pipe" and audit["gui_layers_enabled"] == []
+    assert any("disagree with the pipe" in n for n in audit["notes"])
+
+    # a pre-layers build: the resolved ini section is the evidence (and the refusal source)
+    real_state = ctrl.state
+    ctrl.state = lambda: {k: v for k, v in real_state().items() if k != "layers"}
+    audit = na.neutral_state_audit(ctrl, 0, "HDR", ini_path=ini)
+    assert audit["gui_layers_source"] == "ini" and audit["notes"] == []
+    assert audit["gui_layers_enabled"] == ["HDR tonemap", "Desktop Gamma", "GUI white balance",
+                                           "FALD compensation layer"]
+    lg = na.neutral_state_audit(ctrl, 1, "HDR", ini_path=ini)
+    assert lg["ini_section"] == "Display0" and lg["gui_layers_enabled"] == []
+
+
+def test_audit_without_the_pipe_identity_notes_an_unresolved_section(tmp_path: Path):
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text(_ID_INI, encoding="utf-8")
+    ctrl = CalibrationController.mock()
+    _associate(ctrl, 0, "HDR")
+    real_state = ctrl.state
+    ctrl.state = lambda: {k: v for k, v in real_state().items() if k != "layers"}
+
+    def boom():
+        raise ConnectionError("pipe closed")
+
+    ctrl.query_monitors = boom
+    audit = na.neutral_state_audit(ctrl, 0, "HDR", ini_path=ini)
+    assert audit["flags"] == {} and audit["ini_section"] is None and audit["monitor_identity"] is None
+    note = next(n for n in audit["notes"] if "could not be resolved" in n)
+    assert "windows.query_monitors unavailable: ConnectionError" in note
+    # an unresolved ini is a NOTE, never a violation (the association is still confirmed)
+    assert audit["gui_layers_enabled"] == [] and na.neutral_violations(audit) == []
+
+    ctrl.query_monitors = lambda: _qm(_LG)                  # lists index 0 only
+    audit = na.neutral_state_audit(ctrl, 1, "HDR", ini_path=ini)
+    assert any("does not list monitor 1" in n for n in audit["notes"])
+
+
 def test_ini_true_vocabulary():
     assert na.ini_true("true") and na.ini_true("True ") and na.ini_true("1")
     assert not na.ini_true("false") and not na.ini_true("") and not na.ini_true(None)

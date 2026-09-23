@@ -675,7 +675,12 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                     "FP16 scRGB composition at SDR luminance — the mode the SDR FALD layer needs; read through "
                     "DisplayConfig since 2026-09-14 (work guide C8) because the DXGI colour space cannot see ACM), "
                     "color_mode_source:'dxgi'|'displayconfig2'|'displayconfig' (which query decided; ABSENT on "
-                    "builds before 2026-09-14, whose color_space never says ACM_SDR)}"
+                    "builds before 2026-09-14, whose color_space never says ACM_SDR), "
+                    "settings_slot:int (the DesktopLUT.ini [Display<slot>] section the monitor's settings are "
+                    "keyed by — a storage id, NOT the monitor index; -1 = unidentified, attached by index and not "
+                    "persisted), edid_id:string + identity_name:string (the stored identity; absent when it is "
+                    "empty) — settings_slot/edid_id/identity_name ABSENT on builds before 2026-09-14 (ini "
+                    "[Monitor<N>])}"
                 ),
             },
             mutates_state=False,

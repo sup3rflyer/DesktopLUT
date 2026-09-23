@@ -71,7 +71,9 @@ class CalibrationController:
         Returns ``{"available", "count", "monitors": [...]}`` where each monitor
         carries enough identity (``device_name`` = ``\\.\DISPLAYn``, ``rect``,
         ``primary``, ``hardware_id``, ``hdr_capable``/``hdr_active``/``color_space``)
-        to pair a DesktopLUT monitor index with an Argyll DISPLAY and the panel.
+        to pair a DesktopLUT monitor index with an Argyll DISPLAY and the panel, plus
+        (builds from 2026-09-14) ``settings_slot``/``edid_id``: the DesktopLUT.ini
+        ``[Display<slot>]`` section the monitor's settings are keyed by.
         """
         return self.call("windows.query_monitors")
 
