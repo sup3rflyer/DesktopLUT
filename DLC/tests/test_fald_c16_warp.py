@@ -104,7 +104,7 @@ def test_warp_band_record_bound_guard_and_output_are_the_twin():
     assert int(m.group(5)) == 1, "the band did not run (a mean-rule panel file with a boost LUT is needed)"
     gp = GlowFillParams(strength=float(m.group(1)), reach=int(m.group(2)), cap_nits=float(m.group(3)))
     rows, cols = int(g("rows")), int(g("cols"))
-    emu = Emu(read_panel_file(root / "panel.bin"), width=int(g("width")), height=int(g("height")), subtexel_bits=8)
+    emu = Emu(read_panel_file(root / "panel.bin"), width=int(g("width")), height=int(g("height")), subtexel_bits=8, sampler="warp")   # WARP's 8-bit bilinear weights
     assert emu.glow_band_active()
     frame = np.fromfile(d / "fald_frame.rgba16f", dtype=np.float16).reshape(emu.H, emu.W, 4)[..., :3]
     sp = _starfield_params(t)
