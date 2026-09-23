@@ -489,8 +489,8 @@ struct FramePacer {
 // Tonemapping curve types (values match shader constants)
 enum class TonemapCurve {
     BT2390 = 0,    // ITU-R BT.2390 EETF (Hermite spline)
-    SoftClip = 1,  // Simple exponential rolloff
-    Reinhard = 2,  // Shoulder-only Reinhard (hyperbolic)
+    SoftClip = 1,  // Peak-preserving exponential shoulder (shared/tonemap_curves.h)
+    Reinhard = 2,  // Peak-preserving extended-Reinhard shoulder (shared/tonemap_curves.h)
     BT2446A = 3,   // ITU-R BT.2446 Method A (logarithmic)
     HardClip = 4,  // Hard clamp at target (for colorists)
 };

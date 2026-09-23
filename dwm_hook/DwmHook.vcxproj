@@ -138,6 +138,7 @@
     <ClInclude Include="..\shared\fald_panel.h" />
     <ClInclude Include="..\shared\fald_temporal.h" />
     <ClInclude Include="..\shared\fald_shader.h" />
+    <ClInclude Include="..\shared\tonemap_curves.h" />
     <ClInclude Include="hook_fald.h" />
     <ClInclude Include="hook_log.h" />
     <ClInclude Include="hook_lut.h" />

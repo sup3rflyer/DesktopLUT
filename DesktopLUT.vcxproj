@@ -121,6 +121,7 @@
     <ClInclude Include="shared\fald_temporal.h" />
     <ClInclude Include="src\fald.h" />
     <ClInclude Include="shared\fald_shader.h" />
+    <ClInclude Include="shared\tonemap_curves.h" />
     <ClInclude Include="src\lut.h" />
     <ClInclude Include="src\color.h" />
     <ClInclude Include="src\settings.h" />

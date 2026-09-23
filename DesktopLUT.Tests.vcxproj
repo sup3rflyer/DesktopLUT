@@ -123,6 +123,7 @@
     <ClCompile Include="tests\test_settings.cpp" />
     <ClCompile Include="tests\test_fald.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
+    <ClCompile Include="tests\test_tonemap_curves.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

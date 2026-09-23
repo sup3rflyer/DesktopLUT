@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include "../shared/peak_detect.h"  // g_peakReduceCSSource / g_peakSmoothCSSource
+#include "../shared/peak_detect.h"     // g_peakReduceCSSource / g_peakSmoothCSSource
+#include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the hook)
 
 // Vertex shader: fullscreen triangle (no vertex buffer)
 inline const char* g_vsSource = R"(
@@ -406,39 +407,11 @@ float TonemapBT2390_PQ(float I, float pqSourcePeak, float pqTargetPeak) {
     return clamp(E_mapped * iw, 0.0f, ow);
 }
 
-// Soft clip - PQ native (exponential rolloff)
-float TonemapSoftClip_PQ(float I, float pqSourcePeak, float pqTargetPeak, float targetNits) {
-    // For SDR targets, apply to full range; for HDR, 80% knee
-    float pqKnee = (targetNits <= 203.0f) ? 0.0f : pqTargetPeak * 0.8f;
-
-    if (I <= pqKnee) return I;
-
-    float overshoot = I - pqKnee;
-    float headroom = pqTargetPeak - pqKnee;
-    float srcRange = pqSourcePeak - pqKnee;
-
-    // Exponential compression in PQ space, normalized by source range
-    // When source ≈ target: srcRange ≈ headroom, identical to previous behavior
-    // When source >> target: gentler decay spread over wider range
-    return pqKnee + headroom * (1.0f - exp(-overshoot / srcRange));
-}
-
-// Reinhard - PQ native (hyperbolic compression)
-float TonemapReinhard_PQ(float I, float pqSourcePeak, float pqTargetPeak, float targetNits) {
-    // For SDR targets, apply to full range; for HDR, 80% knee
-    float pqKnee = (targetNits <= 203.0f) ? 0.0f : pqTargetPeak * 0.8f;
-
-    if (I <= pqKnee) return I;
-
-    float overshoot = I - pqKnee;
-    float headroom = pqTargetPeak - pqKnee;
-    float srcRange = pqSourcePeak - pqKnee;
-
-    // Reinhard hyperbolic compression in PQ space, normalized by source range
-    // When source ≈ target: srcRange ≈ headroom, identical to previous behavior
-    // When source >> target: compression spread over wider range
-    return pqKnee + headroom * overshoot / (overshoot + srcRange);
-}
+// Soft clip + Reinhard - PQ native, peak-preserving (slope 1 at the knee, source peak -> target).
+// One copy shared with the DWM hook: shared/tonemap_curves.h (formulas + derivation there).
+)"
+DLUT_TONEMAP_CURVES_HLSL
+R"(
 
 // Hard clip - PQ native (trivial)
 float TonemapHardClip_PQ(float I, float pqTargetPeak) {
@@ -563,7 +536,9 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 
     // Crossfade between hard clip and curve when source peak barely exceeds target
     // With breathing room (BT.2390/BT.2446A): headroom is always large, blend=1, crossfade is moot
-    // Without breathing room (SoftClip/Reinhard/HardClip): smooth transition prevents flicker
+    // Without breathing room (SoftClip/Reinhard/HardClip): smooth transition prevents flicker.
+    // SoftClip/Reinhard already tend to min(I, target) as source -> target (continuous on their own);
+    // the lerp keeps their properties (slope 1 at the knee, source peak -> target, monotone, <= target).
     if (headroom < margin) {
         float blend = headroom / margin;
         I_mapped = lerp(min(I, pqTgtPeak), I_mapped, blend);

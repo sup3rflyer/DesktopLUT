@@ -101,7 +101,7 @@ Precise neutral-tone adjustment available as inline controls in the MHC tab (bak
 DesktopLUT includes built-in HDR tone mapping that applies to all desktop content. It operates in the ICtCp color space, mapping only the luminance (I) channel to preserve hue and saturation.
 
 Key features:
-- Multiple selectable curves, including BT.2390 (ITU-R standard), Soft Clip, Reinhard, BT.2446A, and Hard Clip.
+- Multiple selectable curves, including BT.2390 (ITU-R standard), Soft Clip, Reinhard, BT.2446A, and Hard Clip. Soft Clip and Reinhard are peak-preserving: the content's (or frame's) peak lands exactly on the display peak, and the roll-off joins the untouched range without a kink.
 - **Dynamic peak detection**: A compute shader measures the maximum luminance of each frame in real time. The tone mapping curve then adapts automatically, preventing over-compression in dark scenes and providing smooth highlight roll-off in bright scenes.
 - Works on any HDR content (games, videos, browser, desktop UI).
 - Option to override Windows HDR tone mapping by setting a high Display Peak value (typically 4000–10000 nits).
