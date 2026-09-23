@@ -389,6 +389,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* glowATex = nullptr;     ID3D11UnorderedAccessView* glowAUAV = nullptr;     ID3D11ShaderResourceView* glowASRV = nullptr;
     ID3D11Texture2D* glowKTmpTex = nullptr;  ID3D11UnorderedAccessView* glowKTmpUAV = nullptr;  ID3D11ShaderResourceView* glowKTmpSRV = nullptr;
     ID3D11Buffer* glowBandPartBuf = nullptr; ID3D11UnorderedAccessView* glowBandPartUAV = nullptr;
+    ID3D11Texture2D* glowGuardTex = nullptr; ID3D11UnorderedAccessView* glowGuardUAV = nullptr; ID3D11ShaderResourceView* glowGuardSRV = nullptr;
 
     // LED lag (temporal drive state). driveFilt / driveState / the delay ring are built with the monitor (cols x rows R32F,
     // as the overlay's Build); the four panel-clock textures only while mode 3 is on (EnsureClock).
@@ -473,6 +474,7 @@ static void ReleaseStar(FaldMonitor* m) {
 }
 
 static void ReleaseGlow(FaldMonitor* m) {
+    SafeRelease(m->glowGuardSRV); SafeRelease(m->glowGuardUAV); SafeRelease(m->glowGuardTex);
     SafeRelease(m->glowBandPartUAV); SafeRelease(m->glowBandPartBuf);
     SafeRelease(m->glowKTmpSRV); SafeRelease(m->glowKTmpUAV); SafeRelease(m->glowKTmpTex);
     SafeRelease(m->glowASRV);   SafeRelease(m->glowAUAV);   SafeRelease(m->glowATex);
@@ -606,7 +608,7 @@ static bool EnsureStar(FaldMonitor* m) {
 static bool EnsureGlow(FaldMonitor* m) {
     const bool band = m->params.hasBoost && m->params.boostRule == FALD_BOOST_RULE_MEAN;
     if (m->glowVTex && m->glowDilTex && m->glowCTex && m->glowEnvTex && m->glowKTex &&
-        (!band || (m->glowBandTex && m->glowATex && m->glowKTmpTex && (m->zoneSlices == 1 || m->glowBandPartBuf)))) return true;
+        (!band || (m->glowBandTex && m->glowATex && m->glowKTmpTex && m->glowGuardTex && (m->zoneSlices == 1 || m->glowBandPartBuf)))) return true;
     if (m->glowFailed || !GlowShadersReady()) return false;
     if (m->zoneSlices > 1 && band && !g_glowBandCombineCS) {
         m->glowFailed = true;                                         // the band (G4) runs here and needs its combine
@@ -624,6 +626,7 @@ static bool EnsureGlow(FaldMonitor* m) {
         (!band || (MakeRWTexture(p.cols, p.rows, &m->glowBandTex, &m->glowBandUAV, &m->glowBandSRV, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
                    MakeRWTexture(2 * p.cols, p.rows, &m->glowATex, &m->glowAUAV, &m->glowASRV, DXGI_FORMAT_R32G32B32A32_FLOAT) &&
                    MakeRWTexture(p.cols, p.rows, &m->glowKTmpTex, &m->glowKTmpUAV, &m->glowKTmpSRV) &&
+                   MakeRWTexture(4, 1, &m->glowGuardTex, &m->glowGuardUAV, &m->glowGuardSRV) &&
                    (m->zoneSlices == 1 || MakeZonePartBuffer(p.cols * p.rows * m->zoneSlices, &m->glowBandPartBuf,
                                                              &m->glowBandPartUAV, FALD_GLOW_BAND_PART_BYTES)))))
         return true;
@@ -1228,13 +1231,14 @@ static void RunGlow(FaldMonitor* m) {
             g_ctx->Dispatch(p.cols, p.rows, 1);
         }
         UnbindCompute();
-        // G5: the neighbour guard -> the final k (glowK = t24 of GlowAdd); its Jacobi state in u0, the scratch in u1
+        // G5: the neighbour guard -> the final k (glowK = t24 of GlowAdd); its Jacobi state in u0, the scratch in u1, its
+        // report (iterations, converged, worst-case pass) in u2
         g_ctx->CSSetShader(g_glowGuardCS, nullptr, 0);
         g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
         ID3D11ShaderResourceView* in5[2] = { m->glowBandSRV, m->glowASRV };
         g_ctx->CSSetShaderResources(25, 2, in5);
-        ID3D11UnorderedAccessView* u5[2] = { m->glowKUAV, m->glowKTmpUAV };
-        g_ctx->CSSetUnorderedAccessViews(0, 2, u5, nullptr);
+        ID3D11UnorderedAccessView* u5[3] = { m->glowKUAV, m->glowKTmpUAV, m->glowGuardUAV };
+        g_ctx->CSSetUnorderedAccessViews(0, 3, u5, nullptr);
         g_ctx->Dispatch(1, 1, 1);
         UnbindCompute();
     }
@@ -1398,6 +1402,7 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
             DumpTexture(m->glowKTex, dir + L"fald_glow_k.f32", p.cols, p.rows, 4);                 // the FINAL k (G5)
             DumpTexture(m->glowBandTex, dir + L"fald_glow_band.f32", p.cols, p.rows, 16);          // G4: Pc, Pf, LIT flag, k0
             DumpTexture(m->glowATex, dir + L"fald_glow_bandA.f32", 2 * p.cols, p.rows, 16);        // G4: A_0..A_7 per zone
+            DumpTexture(m->glowGuardTex, dir + L"fald_glow_guard.f32", 4, 1, 4);                   // G5's report
         }
     }
 }

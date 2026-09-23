@@ -252,6 +252,7 @@ static void ReleaseGlow(FaldResources* r) {
     SafeRelease(r->glowASRV); SafeRelease(r->glowAUAV); SafeRelease(r->glowATex);
     SafeRelease(r->glowKTmpSRV); SafeRelease(r->glowKTmpUAV); SafeRelease(r->glowKTmpTex);
     SafeRelease(r->glowBandPartUAV); SafeRelease(r->glowBandPartBuf);
+    SafeRelease(r->glowGuardSRV); SafeRelease(r->glowGuardUAV); SafeRelease(r->glowGuardTex);
     r->glowOn = false;
     r->glowBand = false;
     r->glowRetryCounter = 0;                 // option off / resources rebuilt: the next enable tries at once
@@ -366,7 +367,7 @@ static bool EnsureGlow(FaldResources* r) {
     const bool band = FaldGlowBandActive(r->params);
     if (r->zoneSlices > 1 && band && !g_faldGlowBandCombineCS) return false;   // G4 needs its combine
     if (r->glowVTex && r->glowDilTex && r->glowCTex && r->glowEnvTex && r->glowKTex &&
-        (!band || (r->glowBandTex && r->glowATex && r->glowKTmpTex && (r->zoneSlices == 1 || r->glowBandPartBuf)))) return true;
+        (!band || (r->glowBandTex && r->glowATex && r->glowKTmpTex && r->glowGuardTex && (r->zoneSlices == 1 || r->glowBandPartBuf)))) return true;
     // a failed creation is retried on the cadence the Build retry uses (every 300 frames), not every frame
     if (r->glowRetryCounter != 0 && (r->glowRetryCounter++ % 300) != 0) return false;
     ReleaseGlow(r);
@@ -380,6 +381,7 @@ static bool EnsureGlow(FaldResources* r) {
         (!band || (MakeRWTexture(p.cols, p.rows, &r->glowBandTex, &r->glowBandUAV, &r->glowBandSRV, f4) &&
                    MakeRWTexture(2 * p.cols, p.rows, &r->glowATex, &r->glowAUAV, &r->glowASRV, f4) &&
                    MakeRWTexture(p.cols, p.rows, &r->glowKTmpTex, &r->glowKTmpUAV, &r->glowKTmpSRV) &&
+                   MakeRWTexture(4, 1, &r->glowGuardTex, &r->glowGuardUAV, &r->glowGuardSRV) &&
                    (r->zoneSlices == 1 || MakeZonePartBuffer(p.cols * p.rows * r->zoneSlices, &r->glowBandPartBuf,
                                                              &r->glowBandPartUAV, FALD_GLOW_BAND_PART_BYTES))))) {
         r->glowFailLogged = false;
@@ -801,13 +803,14 @@ static void RunGlow(FaldResources* r, uint32_t roundIdx) {
             g_context->Dispatch(p.cols, p.rows, 1);
         }
         UnbindCompute();
-        // G5: the neighbour guard -> the final k (glowK = t24 of GlowAdd); its Jacobi state in u0, the scratch in u1
+        // G5: the neighbour guard -> the final k (glowK = t24 of GlowAdd); its Jacobi state in u0, the scratch in u1, its
+        // report (iterations, converged, worst-case pass) in u2
         g_context->CSSetShader(g_faldGlowGuardCS, nullptr, 0);
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         ID3D11ShaderResourceView* in5[2] = { r->glowBandSRV, r->glowASRV };
         g_context->CSSetShaderResources(25, 2, in5);
-        ID3D11UnorderedAccessView* u5[2] = { r->glowKUAV, r->glowKTmpUAV };
-        g_context->CSSetUnorderedAccessViews(0, 2, u5, nullptr);
+        ID3D11UnorderedAccessView* u5[3] = { r->glowKUAV, r->glowKTmpUAV, r->glowGuardUAV };
+        g_context->CSSetUnorderedAccessViews(0, 3, u5, nullptr);
         g_context->Dispatch(1, 1, 1);
         UnbindCompute();
     }
@@ -1008,6 +1011,8 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     // black-frame LED boost: the zone flags of both rounds (cols x rows float32, 1 = non-black; fald_active.f32 = round 1,
     // the corrected frame the panel receives) and the reduce pass's results. -1 / 1 when the file has no LUT.
     float boostR[2][2] = { { 1.0f, -1.0f }, { 1.0f, -1.0f } };   // [round][0 boost, 1 zone count]
+    float guardR[4] = { 0.0f, 1.0f, 0.0f, 0.0f };                // G5 (round 1): iterations, converged, worst-case pass, its zones
+    if (r->glowBand) ReadBackFloats(r->glowGuardTex, guardR, 4);
     if (p.hasBoost) {
         DumpTexture(r->activeTex[0], dir + L"fald_active_r0.f32", p.cols, p.rows, 4);
         DumpTexture(r->activeTex[1], dir + L"fald_active.f32", p.cols, p.rows, 4);
@@ -1033,6 +1038,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
             DumpTexture(r->glowKTex, dir + L"fald_glow_k.f32", p.cols, p.rows, 4);                 // the FINAL k (G5)
             DumpTexture(r->glowBandTex, dir + L"fald_glow_band.f32", p.cols, p.rows, 16);          // G4: Pc, Pf, LIT flag, k0
             DumpTexture(r->glowATex, dir + L"fald_glow_bandA.f32", 2 * p.cols, p.rows, 16);        // G4: A_0..A_7 per zone
+            DumpTexture(r->glowGuardTex, dir + L"fald_glow_guard.f32", 4, 1, 4);                   // G5's report
         }
     }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
@@ -1092,6 +1098,9 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " (band 1 = the count-threshold band, round 1: fald_glow_k.f32 = the zones' final scale k [G5], fald_glow_band.f32 ="
          << " [Pc, Pf, LIT flag, k0] x 4 float32, fald_glow_bandA.f32 = the neighbour bound A_0..A_7 x 8 float32 [G4]; needs a boost"
          << " LUT + the mean zone rule)"
+         << "\nglowfill_guard iterations " << (int)guardR[0] << " converged " << (int)guardR[1] << " worst_case " << (int)guardR[2]
+         << " worst_case_zones " << (int)guardR[3] << " (round 1's neighbour guard G5, fald_glow_guard.f32; max iterations "
+         << FALD_GLOW_GUARD_ITER_MAX << ": beyond them one worst-case pass bands every candidate as if all its neighbours were at k 0)"
          << ((fs.glow.enabled && !FaldGlowSupported(p)) ? "\nglowfill refused: " : "") << ((fs.glow.enabled && !FaldGlowSupported(p)) ? FALD_GLOW_SDR_NOTE : "")
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;

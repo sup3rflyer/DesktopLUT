@@ -520,7 +520,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "pedestal Vz, cols x rows float32) and fald_glow_env.f32 (cols x rows x 4 float32: envelope Ez, deficit Dz, closing "
             "Cz, Vz) of round 1 and — mean-rule files only, the count-threshold band of round 1 — fald_glow_k.f32 (the zones' "
             "final scale k after the neighbour guard), fald_glow_band.f32 (cols x rows x 4 float32: Pc, Pf, LIT flag, k0) and "
-            "fald_glow_bandA.f32 (cols x rows x 8 float32: the neighbour bound A_0..A_7), and `glowfill ...` lines.",
+            "fald_glow_bandA.f32 (cols x rows x 8 float32: the neighbour bound A_0..A_7), fald_glow_guard.f32 (4 float32: the "
+            "guard's iterations, converged, worst-case pass ran, zones it banded), and `glowfill ...` lines.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

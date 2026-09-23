@@ -597,8 +597,8 @@ class Emu:
         in the zone sweeps' thread / reduction order, float32 — the sum of (brightest channel)^gamma of the round's request
         WITHOUT (pc) and WITH the fill of the unscaled deficit (pf), the LIT count of the content, k0 = ((BAND_LO T - pc) /
         (pf - pc))^(1 / gamma) for a zone not counted by its content whose pf lies in [BAND_LO T, BAND_HI T] (else 1), and
-        (C16) the neighbour bound A_d = mean of w_d (pf_px - pc_px) / (1 - s0) (0 toward a neighbour outside the lattice).
-        G5: the neighbour guard's Jacobi iterations from k0 (:meth:`guard32`) -> the final k GlowAdd reads.
+        (C16) the neighbour bound A_d = the zone mean of w_d q (:meth:`bound_q32`; 0 toward a neighbour outside the
+        lattice). G5: the neighbour guard (:meth:`guard32`) -> the final k GlowAdd reads.
         ``gp.band_feather`` False: the band before C16 (k = k0; no A, no guard)."""
         filled, _ = self.glow_add(req, sT, sE, dz, gp)                # k = 1: the unscaled rule
         n = f32(self.cw * self.ch)
@@ -616,16 +616,10 @@ class Emu:
         k0 = np.where(band0, kk, f32(1.0)).astype(np.float32)
         none = np.zeros_like(band0)
         out = {"k": k0, "k0": k0, "pc": pc, "pf": pf, "lit": lit, "band": band0, "band0": band0, "guard_added": none,
-               "iterations": 0, "A": None}
+               "iterations": 0, "converged": True, "worst_case": False, "worst_case_added": none, "A": None}
         if not gp.band_feather:
             return out
-        # G4's neighbour bound: s0 = saturate(shown / want) with want / shown as GlowAddK forms them (unscaled want)
-        want = self._zone_px(self.glow_want(dz, gp).astype(np.float32))
-        shown = (rc * self._zone_px(np.maximum(sT, 0.0).astype(np.float32)) /
-                 np.maximum(self._zone_px(sE.astype(np.float32)), f32(1e-9))).astype(np.float32)
-        s0 = np.clip(shown / np.where(want > 0.0, want, f32(1.0)), f32(0.0), f32(1.0)).astype(np.float32)
-        live = (want > 0.0) & (s0 < f32(1.0))
-        q = np.where(live, (pwf - pwc) / np.where(live, f32(1.0) - s0, f32(1.0)), f32(0.0)).astype(np.float32)
+        q = self.bound_q32(req, sT, sE, dz, gp, rc, pwc, pwf)
         u, v = self.zone_local32()
         a = np.zeros((len(NEIGHBOURS), self.rows, self.cols), dtype=np.float32)
         zy, zx = np.mgrid[0: self.rows, 0: self.cols]
@@ -636,30 +630,82 @@ class Emu:
             a[d] = np.where(exists, ad, f32(0.0))
         # G5: the zones counted only by the fill (not LIT, pc < T, pf > BAND_HI T, not band0)
         cand = (~lit) & (pc < t) & (pf > f32(BAND_HI) * t) & ~band0
-        k, iterations = self.guard32(k0, cand, kk, pf, a, (f32(BAND_HI) * t).astype(np.float32))
-        band = band0 | (k < f32(1.0))
-        out.update(k=k, band=band, guard_added=band & ~band0, iterations=iterations, A=a)
+        gd = self.guard32(k0, cand, kk, pf, a, (f32(BAND_HI) * t).astype(np.float32))
+        band = band0 | (gd["k"] < f32(1.0))
+        out.update(k=gd["k"], band=band, guard_added=band & ~band0, iterations=gd["iterations"], converged=gd["converged"],
+                   worst_case=gd["worst_case"], worst_case_added=gd["worst_case_added"], A=a)
         return out
 
-    def guard32(self, k0, cand, k_join, pf, a, hi):
+    def ped_m32(self):
+        """HLSL GlowAddK's m = float3(tminR, tminG, tminB) / max(tmin, 1e-30), float32 (the CB carries tmin x pedRGB)."""
+        ped = self.o.get("pedRGB")
+        pr = np.ones(3) if ped is None else np.asarray(ped, dtype=np.float64)
+        t32 = f32(self.tmin)
+        return ((t32 * pr.astype(np.float32)).astype(np.float32) / np.maximum(t32, f32(1e-30))).astype(np.float32)
+
+    def bound_q32(self, req, sT, sE, dz, gp, rc, pwc, pwf):
+        """G4's per-pixel slope of the neighbour bound (glowfill.bound_slope), float32, in the zone-pixel layout: q = the
+        largest chord slope (F(1) - F(sigma)) / (1 - sigma) over the kinks — sigma = s0 = saturate(shown / want) (want /
+        shown as GlowAddK forms them, unscaled want) and the fill levels where the brightest channel changes (pairs of
+        different pedestal multipliers; none with a white pedestal: q = (pf_px - pc_px) / (1 - s0) there)."""
+        want = self._zone_px(self.glow_want(dz, gp).astype(np.float32))
+        bT = self._zone_px(np.maximum(sT, 0.0).astype(np.float32))
+        bE = self._zone_px(sE.astype(np.float32))
+        shown = (rc * bT / np.maximum(bE, f32(1e-9))).astype(np.float32)
+        s0 = np.clip(shown / np.where(want > 0.0, want, f32(1.0)), f32(0.0), f32(1.0)).astype(np.float32)
+        live = (want > 0.0) & (s0 < f32(1.0))
+        rest = np.where(live, f32(1.0) - s0, f32(1.0)).astype(np.float32)
+        q = np.where(live, (pwf - pwc) / rest, f32(0.0)).astype(np.float32)
+        m = self.ped_m32()
+        pairs = [(i, j) for i, j in ((0, 1), (0, 2), (1, 2)) if f32(m[j] - m[i]) != 0.0]
+        if not pairs:
+            return q
+        # the fill's request luminance at sigma = 1: uncapped (a_u) and after the request ceiling (a1), as GlowAddK
+        trust = smoothstep(f32(self.fadeLo), f32(self.fadeHi), bE).astype(np.float32)
+        a_u = (np.maximum(want - shown, f32(0.0)) * trust * np.minimum(bE / np.maximum(bT, f32(1e-9)), f32(self.gmax))).astype(np.float32)
+        room = np.maximum(f32(self.glow_ceiling()) - rc, f32(0.0)).astype(np.float32)
+        a1 = (a_u * np.minimum(f32(1.0), room / np.maximum(a_u * m.max(), f32(1e-30)))).astype(np.float32)
+        c3 = [self._zone_px(req[c].astype(np.float32)) for c in range(3)]
+        for i, j in pairs:
+            ak = ((c3[i] - c3[j]) / f32(m[j] - m[i])).astype(np.float32)
+            ok = live & (ak > 0.0) & (ak < a1)
+            if not ok.any():
+                continue
+            hk = np.maximum(np.maximum(c3[0] + ak * m[0], c3[1] + ak * m[1]), c3[2] + ak * m[2]).astype(np.float32)
+            chord = ((pwf - self._pow32(hk)) / (rest * (f32(1.0) - ak / np.where(ok, a_u, f32(1.0))))).astype(np.float32)
+            q = np.where(ok, np.maximum(q, chord), q).astype(np.float32)
+        return q
+
+    @staticmethod
+    def guard32(k0, cand, k_join, pf, a, hi):
         """G5 g_faldGlowGuardSource, float32: Jacobi iterations — every zone reads the PREVIOUS iteration's k; a candidate
         still at k 1 joins (k_join) when pf - loss < hi, loss = the sum over its existing neighbours d (NEIGHBOURS order) of
-        (1 - k_{z+d}) A_d. Until no zone joins, at most GUARD_ITER_MAX iterations. (k, the iterations evaluated)."""
-        rows, cols = k0.shape
+        (1 - k_{z+d}) A_d. Until no zone joins, at most GUARD_ITER_MAX iterations; if the last one still added zones, the
+        worst-case pass (every neighbour at k = 0) follows. Returns k, iterations, converged, worst_case, worst_case_added."""
         k = k0.astype(np.float32).copy()
-        iterations = 0
+        iterations, converged = 0, False
         for it in range(GUARD_ITER_MAX):
             iterations = it + 1
-            loss = np.zeros((rows, cols), dtype=np.float32)
-            for d, (i, j) in enumerate(NEIGHBOURS):
-                ys, xs = slice(max(0, -j), rows - max(0, j)), slice(max(0, -i), cols - max(0, i))
-                kn = k[max(0, j): rows + min(0, j), max(0, i): cols + min(0, i)]
-                loss[ys, xs] = (loss[ys, xs] + ((f32(1.0) - kn) * a[d][ys, xs]).astype(np.float32)).astype(np.float32)
-            new = cand & (k >= f32(1.0)) & ((pf - loss).astype(np.float32) < hi)
+            new = cand & (k >= f32(1.0)) & ((pf - Emu._loss32(k, a)).astype(np.float32) < hi)
             if not new.any():
+                converged = True
                 break
             k = np.where(new, k_join, k).astype(np.float32)
-        return k, iterations
+        worst = np.zeros_like(cand)
+        if not converged:
+            worst = cand & (k >= f32(1.0)) & ((pf - Emu._loss32(np.zeros_like(k), a)).astype(np.float32) < hi)
+            k = np.where(worst, k_join, k).astype(np.float32)
+        return {"k": k, "iterations": iterations, "converged": converged, "worst_case": not converged, "worst_case_added": worst}
+
+    @staticmethod
+    def _loss32(k, a):
+        rows, cols = k.shape
+        loss = np.zeros((rows, cols), dtype=np.float32)
+        for d, (i, j) in enumerate(NEIGHBOURS):
+            ys, xs = slice(max(0, -j), rows - max(0, j)), slice(max(0, -i), cols - max(0, i))
+            kn = k[max(0, j): rows + min(0, j), max(0, i): cols + min(0, i)]
+            loss[ys, xs] = (loss[ys, xs] + ((f32(1.0) - kn) * a[d][ys, xs]).astype(np.float32)).astype(np.float32)
+        return loss
 
     def _zone_px(self, a):
         """(H, W) -> (rows, cols, cellW * cellH): each zone's pixels, row-major inside the zone (the sweeps' index k)."""
@@ -678,26 +724,33 @@ class Emu:
 
     @staticmethod
     def _feather32(i, j, u, v):
-        """HLSL GlowFeatherW (glowfill.feather_weight) for columns u (W,) and rows v (H,): (H, W) float32."""
-        dx = np.maximum(f32(0.0), np.maximum(f32(i) - u, u - f32(i + 1))).astype(np.float32)
-        dy = np.maximum(f32(0.0), np.maximum(f32(j) - v, v - f32(j + 1))).astype(np.float32)
+        """HLSL GlowFeatherW (glowfill.feather_weight) for columns u (W,) and rows v (H,): (H, W) float32; i / j may be
+        per-column / per-row arrays."""
+        i, j = np.asarray(i), np.asarray(j)
+        dx = np.maximum(f32(0.0), np.maximum(i.astype(np.float32) - u, u - (i + 1).astype(np.float32))).astype(np.float32)
+        dy = np.maximum(f32(0.0), np.maximum(j.astype(np.float32) - v, v - (j + 1).astype(np.float32))).astype(np.float32)
         dist = np.sqrt(dy[:, None] * dy[:, None] + dx[None, :] * dx[None, :], dtype=np.float32)
         t = np.clip(dist / f32(FEATHER), f32(0.0), f32(1.0)).astype(np.float32)
         return (f32(1.0) - t * t * (f32(3.0) - f32(2.0) * t)).astype(np.float32)
 
     def band_scale_px(self, k):
         """HLSL GlowBandScale for every frame pixel (1 outside the lattice), float32: s = min(k_z, min over the existing
-        neighbours n with w_n > 0 of 1 - (1 - k_n) w_n)."""
+        neighbours n with w_n > 0 of 1 - (1 - k_n) w_n). FEATHER < 0.5: only the three neighbours on the pixel's side of
+        its zone (the horizontal one on u's side, the vertical one on v's side, their diagonal) can reach it."""
+        assert FEATHER < 0.5
         k = np.asarray(k, dtype=np.float32)
         xs, ys = np.arange(self.W), np.arange(self.H)
         zx = np.clip((xs - self.ox) // self.cw, 0, self.cols - 1)
         zy = np.clip((ys - self.oy) // self.ch, 0, self.rows - 1)
         u, v = self.zone_local32()
+        sx = np.where(u < f32(0.5), -1, 1)                               # the pixel's side of its zone
+        sy = np.where(v < f32(0.5), -1, 1)
         s = k[np.ix_(zy, zx)].copy()
-        for i, j in NEIGHBOURS:
-            w = self._feather32(i, j, u, v)
-            ok = ((zy + j >= 0) & (zy + j < self.rows))[:, None] & ((zx + i >= 0) & (zx + i < self.cols))[None, :] & (w > 0.0)
-            kn = k[np.ix_(np.clip(zy + j, 0, self.rows - 1), np.clip(zx + i, 0, self.cols - 1))]
+        for ox, oy in ((sx, np.zeros_like(sy)), (np.zeros_like(sx), sy), (sx, sy)):
+            w = self._feather32(ox, oy, u, v)
+            nx, ny = zx + ox, zy + oy
+            ok = ((ny >= 0) & (ny < self.rows))[:, None] & ((nx >= 0) & (nx < self.cols))[None, :] & (w > 0.0)
+            kn = k[np.ix_(np.clip(ny, 0, self.rows - 1), np.clip(nx, 0, self.cols - 1))]
             s = np.where(ok, np.minimum(s, (f32(1.0) - (f32(1.0) - kn) * w).astype(np.float32)), s)
         return np.where(self.in_lattice, s, f32(1.0)).astype(np.float32)
 

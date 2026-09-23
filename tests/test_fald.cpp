@@ -1437,6 +1437,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         CHECK((ctx.fald->glowBandTex != nullptr) == ctx.fald->glowBand);  // C16: G4's record / bound and G5's scratch exist
         CHECK((ctx.fald->glowATex != nullptr) == ctx.fald->glowBand);     // exactly while the band runs
         CHECK((ctx.fald->glowKTmpTex != nullptr) == ctx.fald->glowBand);
+        CHECK((ctx.fald->glowGuardTex != nullptr) == ctx.fald->glowBand);
         CHECK((ctx.fald->glowBandPartBuf != nullptr) == (ctx.fald->glowBand && ctx.fald->zoneSlices > 1));
         if (mode == (int)FALD_TEMPORAL_PANEL) {
             CHECK(ctx.fald->stateValid);
@@ -1469,6 +1470,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         CHECK(ctx.fald->glowVTex == nullptr); CHECK(ctx.fald->glowDilTex == nullptr);
         CHECK(ctx.fald->glowCTex == nullptr); CHECK(ctx.fald->glowEnvTex == nullptr); CHECK(ctx.fald->glowKTex == nullptr);
         CHECK(ctx.fald->glowBandTex == nullptr); CHECK(ctx.fald->glowATex == nullptr); CHECK(ctx.fald->glowKTmpTex == nullptr);
+        CHECK(ctx.fald->glowGuardTex == nullptr);
         CHECK(ctx.fald->glowBandPartBuf == nullptr);
         CHECK_FALSE(ctx.fald->glowBand);
         CHECK(ctx.fald->starOn);                                   // ... and only its own: starfield keeps running

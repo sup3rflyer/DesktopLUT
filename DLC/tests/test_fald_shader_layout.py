@@ -183,15 +183,19 @@ def test_the_band_partials_have_their_own_record_and_both_paths_size_it():
 
 def test_the_neighbour_guard_is_one_group_with_barriers_in_uniform_flow():
     """C16 G5: ONE thread group (both paths Dispatch(1, 1, 1)); every zone loop strides by the group size; the Jacobi
-    iterations are a fixed-count loop so the three barriers stay in uniform control flow; the barriers fence the
-    groupshared flag AND the UAVs (AllMemoryBarrier: DeviceMemoryBarrier alone does not fence groupshared)."""
+    iterations are a fixed-count loop so the barriers stay in uniform control flow (the worst-case pass after it is
+    uniform too: every thread reads the same groupshared flag after the last barrier); the barriers fence the
+    groupshared flags AND the UAVs (AllMemoryBarrier: DeviceMemoryBarrier alone does not fence groupshared)."""
     g5 = _part(_SHADER.read_text(encoding="utf-8"), "g_faldGlowGuardSource")
     n = int(re.search(r"\[numthreads\((\d+), 1, 1\)\]", g5).group(1))
-    assert n <= 1024 and g5.count(f"+= {n}u)") == 3
+    assert n <= 1024 and g5.count(f"+= {n}u)") == 4
     assert f"for (uint z0 = tid.x; z0 < nz; z0 += {n}u)" in g5 and f"for (uint z = tid.x; z < nz; z += {n}u)" in g5
-    assert f"for (uint z1 = tid.x; z1 < nz; z1 += {n}u)" in g5
+    assert f"for (uint z1 = tid.x; z1 < nz; z1 += {n}u)" in g5 and f"for (uint z2 = tid.x; z2 < nz; z2 += {n}u) {{" in g5
     assert "[loop] for (uint it = 0u; it < FALD_GLOW_GUARD_ITER_MAX; it++) {" in g5 and "break" not in g5
-    assert g5.count("AllMemoryBarrierWithGroupSync();") == 3 and "DeviceMemoryBarrierWithGroupSync" not in g5
+    assert g5.count("AllMemoryBarrierWithGroupSync();") == 4 and "DeviceMemoryBarrierWithGroupSync" not in g5
+    loop_end = g5.index("bool converged = ")
+    assert g5.count("AllMemoryBarrierWithGroupSync();", 0, loop_end) == 3                  # init + two per iteration
+    assert "InterlockedAdd(gWorst, 1u);" in g5 and g5.index("InterlockedAdd(gWorst, 1u);") < g5.rindex("AllMemoryBarrierWithGroupSync();") <         g5.index("glowGuardOut[uint2(3, 0)] = (float)gWorst;")
     assert "InterlockedOr(gJoined[cur], 1u);" in g5 and "if (tid.x == 0u) gJoined[cur ^ 1u] = 0u;" in g5
     for path, ctx in ((_OVERLAY, "g_context"), (_HOOK, "g_ctx")):
         body = re.search(r"static void RunGlow\(.*?\n\}", path.read_text(encoding="utf-8"), re.S).group(0)

@@ -90,31 +90,42 @@ when the boost moves between the rounds — see ``predict`` (``zones_sent`` vs `
       nearest lookup, the rule until C16) it printed the lattice: on 200-nit windows over a 0.004-0.012-nit sky 38-285 band
       zones, displayed steps of +15-21 % at 0.06-0.19 nit on straight zone edges. The pixel's scale is now
       ``s = min(k_z, min over the EXISTING neighbours n of 1 − (1 − k_n) w_n)``, ``w_n = 1 − smoothstep(0, FEATHER,
-      distance from the pixel to n's rectangle, in zones)``, applied where k was (want x s, after the cap): continuous and
-      C1 across every zone edge, <= k_z inside a band zone (the zone never exceeds what the band assumed), exactly 1 where
-      no band zone lies within FEATHER — there a pixel takes exactly the fill of the rule without the band. A plain blur
-      of k moves fill between zones (a neighbour pushed into the margin — 134-189 zones on dense synthetic scenes); an
+      distance from the pixel to n's rectangle, in zones)``, applied where k was (want x s, after the cap): continuous
+      across every zone edge (C1 at the edge; between two band zones of close k the min switches branch ~0.06 zone inside
+      the higher one: a kink, not a step), <= k_z inside a band zone (the zone never exceeds what the band assumed),
+      exactly 1 where no band zone lies within FEATHER — there a pixel takes exactly the fill of the rule without the band.
+      (FEATHER < 0.5: only the 3 neighbours on the pixel's side of its zone can reach it; the GPU evaluates those.) A plain
+      blur of k moves fill between zones (a neighbour pushed into the margin — 134-189 zones on dense synthetic scenes); an
       inward ramp cannot fit the zone's budget. So the ramp lies OUTSIDE the band zone, and THE NEIGHBOUR GUARD keeps
-      what it takes from the neighbours out of the margin: per zone and neighbour direction d (8, fixed order NEIGHBOURS)
-      ``A_d = mean_p [w_d(p) (f_p^gamma − c_p^gamma) / (1 − s0_p)]`` (c = the brightest channel of the request, f = with
-      the UNSCALED fill, s0 = clamp(shown / want, 0, 1); 0 where want <= 0 or s0 >= 1; 0 toward a neighbour outside the
-      lattice) bounds how far a neighbour at scale k_n can lower the zone's statistic: ``(1 − k_n) A_d`` (the pixel's
-      statistic is flat in the fill scale below s0 and concave above; the min over neighbours <= their sum). The zones
-      counted only by the fill (not LIT, Pc < T, Pf > BAND_HI T, not band0) whose ``Pf − Σ_d (1 − k_{z+d}) A_d`` drops
-      below BAND_HI T join the band with the same k formula; Jacobi iterations (every zone reads the previous iteration's
-      k) until none joins, at most GUARD_ITER_MAX. Within the model: band zones end <= their band0 prediction (≈ BAND_LO
-      T), fill-counted zones not banded stay >= BAND_HI T, zones below BAND_LO T stay below, content-counted zones are
-      unaffected. Offline (owner meanrule fit, scale-5 raster, cap 0.05; the guard converged in <= 6 iterations
-      everywhere): 200-nit windows on a 0.004 / 0.008-nit sky — the largest relative step of the displayed fill across a
-      zone edge 45.8 -> 8.7 % / 63.2 -> 3.1 % (a band zone's edge to an unbanded one: never a larger step than inside the
-      two zones; between two band zones of close k the ramp takes the k difference within one raster pixel — at 0.004, 119
-      such edges, <= 2.9 % of the local level, was 31 %), band zones 626 -> 792 / 981 ->
-      1254, zones parked inside the margin 0 / 0, fill -41 / -97 %; the six owner clips kept their margin counts (xmas_20
-      band 57 -> 71), fill -1 .. -5 %. (The 1 / (1 − s0) of A_d matters: the prototype's bound without it banded 1184 zones
-      at 0.008 and left 5 inside the margin.) The price: in dense near-threshold synthetic scenes the guard bands whole
-      fill-counted regions (fill -41 .. -100 %: safe — smooth and uncounted — but no evening there); a zone crossing
-      BAND_HI T still changes its fill by x ~0.49 in one frame (now a ramped patch, not a hard-edged one); two more passes
-      per round on the GPU (the band sweep G4 accumulates the 8 A_d; the guard G5 is one thread group on the zone lattice).
+      what it takes from the neighbours out of the margin. Per pixel, F(σ) = its statistic (brightest channel of the
+      request + the fill at scale σ)^gamma is flat below s0 = clamp(shown / want, 0, 1) (the fill starts only above what
+      the pixel already shows) and, between its kinks, concave (a linear request, one brightest channel, under the
+      concave power); the kinks are s0, the fill levels where the brightest channel changes (pedestal multipliers that
+      differ — none with a white pedestal) and the request ceiling's cap (F flat above it). So ``q = the largest chord
+      slope (F(1) − F(σ_k)) / (1 − σ_k)`` over those kinks (:func:`bound_slope`; white pedestal: (F(1) − F(0)) / (1 − s0))
+      gives F(1) − F(σ) <= (1 − σ) q for EVERY σ, and per zone and neighbour direction d (8, fixed order NEIGHBOURS)
+      ``A_d = mean_p [w_d(p) q_p]`` (0 toward a neighbour outside the lattice) bounds how far a neighbour at scale k_n can
+      lower the zone's statistic: ``(1 − k_n) A_d`` (the min over neighbours <= their sum). The zones counted only by the
+      fill (not LIT, Pc < T, Pf > BAND_HI T, not band0) whose ``Pf − Σ_d (1 − k_{z+d}) A_d`` drops below BAND_HI T join
+      the band with the same k formula; Jacobi iterations (every zone reads the previous iteration's k) until none joins.
+      A chain of joins advances one zone per iteration (stripes: 43-45, or 73 on the in-repo fit), so the cap is
+      GUARD_ITER_MAX 64, and if the cap ends it while its last iteration still added zones, ONE worst-case pass bands
+      every candidate whose ``Pf − Σ_d A_d`` (every neighbour at k = 0) is below BAND_HI T — the guarantee holds whatever
+      the cap (``converged`` / ``worst_case`` in the evidence, fald_glow_guard.f32 on the GPU). Within the model: band
+      zones end <= their band0 prediction (≈ BAND_LO T), fill-counted zones not banded stay >= BAND_HI T, zones below
+      BAND_LO T stay below, content-counted zones are unaffected. Offline (owner meanrule fit, scale-5 raster, cap 0.05;
+      the table's scenes converged in 1-6 iterations): 200-nit windows on a 0.004 / 0.008-nit sky — the largest relative
+      step of the displayed fill across a zone edge 45.8 -> 8.7 % / 63.2 -> 3.1 % (a band zone's edge to an unbanded one:
+      never a larger step than inside the two zones; between two band zones of close k the ramp takes the k difference
+      within one raster pixel — at 0.004, 119 such edges, <= 2.9 % of the local level, was 31 %), band zones 626 -> 792 /
+      981 -> 1254, zones parked inside the margin 0 / 0, fill -41 / -97 %; the six owner clips kept their margin counts
+      (xmas_20 band 57 -> 71), fill -1 .. -5 %. (The 1 / (1 − s0) of A_d matters: the prototype's bound without it banded
+      1184 zones at 0.008 and left 5 inside the margin.) The price: in dense near-threshold synthetic scenes the guard
+      bands whole fill-counted regions (fill -41 .. -100 %: safe — smooth and uncounted — but no evening there), the
+      worst-case pass more than the converged guard would; a coloured pedestal's kinks raise A up to ~3 x (more zones
+      banded); a zone crossing BAND_HI T still changes its fill by x ~0.49 in one frame (now a ramped patch, not a
+      hard-edged one); two more passes per round on the GPU (the band sweep G4 accumulates the 8 A_d; the guard G5 is one
+      thread group on the zone lattice).
 
 HDR only: every level behind the request ceiling and the band (drive floor, LIT level, count threshold) was measured in
 HDR; a gamma-transfer (SDR / ACM) fit is refused (``ValueError``; the C++ keeps the option off and says why).
@@ -145,7 +156,8 @@ REQ_LIT_FRAC = 0.55                      # C++ FALD_GLOW_REQ_LIT_FRAC: ... and b
                                          # (PA32UCXR: min(0.2, 0.1925) nit; the one measured "not LIT" point is 0.298 nit)
 BAND_LO, BAND_HI = 0.8, 1.25             # HLSL FALD_GLOW_BAND_LO / _HI: the count-threshold band, x the mean rule's threshold
 FEATHER = 0.35                           # HLSL FALD_GLOW_FEATHER (C16): zones — the band scale's ramp width outside a band zone
-GUARD_ITER_MAX = 16                      # HLSL FALD_GLOW_GUARD_ITER_MAX (C16): cap of the neighbour guard's Jacobi iterations
+GUARD_ITER_MAX = 64                      # HLSL FALD_GLOW_GUARD_ITER_MAX (C16): cap of the neighbour guard's Jacobi iterations
+                                         # (a chain of joins needs one each: stripes 43-45; beyond it the worst-case pass)
 # (i, j) = (zone column, zone row) offsets of the 8 neighbours, in the order of A_d (HLSL G4 / G5: 3 x 3 row-major, centre skipped)
 NEIGHBOURS = ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1))
 
@@ -307,8 +319,8 @@ def neighbour_weights(model: FaldModel) -> np.ndarray:
 
 def band_pixel_scale(model: FaldModel, k: np.ndarray) -> np.ndarray:
     """Item 7 (C16), the pixel side: ``s = min(k_z, min over the existing neighbours n of 1 − (1 − k_n) w_n)`` (h, w) —
-    continuous and C1 across every zone edge, <= k_z inside a band zone, EXACTLY 1 wherever no band zone (k < 1) lies
-    within FEATHER of the pixel (1 − 0 · w = 1)."""
+    continuous across every zone edge (C1 there; a kink ~0.06 zone inside the higher of two band zones of close k), <= k_z
+    inside a band zone, EXACTLY 1 wherever no band zone (k < 1) lies within FEATHER of the pixel (1 − 0 · w = 1)."""
     p = model.p
     zx, zy, _, _ = zone_local(model)
     k = np.asarray(k, dtype=float)
@@ -322,32 +334,76 @@ def band_pixel_scale(model: FaldModel, k: np.ndarray) -> np.ndarray:
     return s
 
 
+def _guard_loss(k: np.ndarray, a: np.ndarray, dtype) -> np.ndarray:
+    """``Σ_d (1 − k_{z+d}) A_d`` per zone, NEIGHBOURS order, a neighbour outside the lattice adding nothing (G5's sum)."""
+    rows, cols = k.shape
+    one = k.dtype.type(1.0)
+    kp = np.pad(k, 1, constant_values=one)
+    loss = np.zeros((rows, cols), dtype=dtype)
+    for d, (i, j) in enumerate(NEIGHBOURS):
+        ok = np.zeros((rows, cols), dtype=bool)
+        ok[max(0, -j): rows - max(0, j), max(0, -i): cols - max(0, i)] = True
+        term = ((one - kp[1 + j: 1 + j + rows, 1 + i: 1 + i + cols]) * a[d]).astype(dtype)
+        loss = np.where(ok, loss + term, loss).astype(dtype)
+    return loss
+
+
 def guard(k0: np.ndarray, band0: np.ndarray, cand: np.ndarray, k_join: np.ndarray, pf: np.ndarray, a: np.ndarray,
           hi: float, iter_max: int = GUARD_ITER_MAX) -> dict:
     """Item 7 (C16), the neighbour guard (HLSL pass G5): Jacobi iterations from ``k0`` — per zone ``loss = Σ_d (1 −
     k_{z+d}) A_d`` (order NEIGHBOURS; a neighbour outside the lattice adds nothing), every zone reading the PREVIOUS
-    iteration's k; every candidate not yet banded whose ``pf − loss < hi`` joins with ``k_join``. Until no zone joins, at
-    most ``iter_max`` iterations (the band set only grows). Returns ``k``, ``band``, ``added`` (the guard's zones) and
-    ``iterations`` (evaluated, the last one included). The dtype of ``k0`` / ``pf`` is kept: the twin runs it in float32."""
-    rows, cols = k0.shape
+    iteration's k; every candidate not yet banded whose ``pf − loss < hi`` joins with ``k_join``. Until no zone joins
+    (``converged``), at most ``iter_max`` iterations (the band set only grows). If the cap ends it while its last iteration
+    still added zones, ONE worst-case pass follows: every candidate still out of the band whose ``pf − Σ_d A_d < hi`` (every
+    neighbour taken at k = 0) joins — so the guarantee holds whatever the cap. Returns ``k``, ``band``, ``added`` (the
+    guard's zones), ``iterations`` (evaluated, the last one included), ``converged``, ``worst_case`` (the pass ran) and
+    ``worst_case_added`` (zones it banded). The dtype of ``k0`` / ``pf`` is kept: the twin runs it in float32."""
     k, band = k0.copy(), band0.copy()
-    one = k0.dtype.type(1.0)
-    iterations = 0
+    iterations, converged = 0, False
     for it in range(iter_max):
         iterations = it + 1
-        kp = np.pad(k, 1, constant_values=one)
-        loss = np.zeros_like(pf)
-        for d, (i, j) in enumerate(NEIGHBOURS):
-            ok = np.zeros((rows, cols), dtype=bool)
-            ok[max(0, -j): rows - max(0, j), max(0, -i): cols - max(0, i)] = True
-            term = ((one - kp[1 + j: 1 + j + rows, 1 + i: 1 + i + cols]) * a[d]).astype(pf.dtype)
-            loss = np.where(ok, loss + term, loss).astype(pf.dtype)
-        new = cand & ~band & ((pf - loss).astype(pf.dtype) < hi)
+        new = cand & ~band & ((pf - _guard_loss(k, a, pf.dtype)).astype(pf.dtype) < hi)
         if not new.any():
+            converged = True
             break
         band = band | new
         k = np.where(new, k_join, k).astype(k0.dtype)
-    return {"k": k, "band": band, "added": band & ~band0, "iterations": iterations}
+    worst_added = np.zeros_like(band)
+    if not converged:
+        worst_added = cand & ~band & ((pf - _guard_loss(np.zeros_like(k), a, pf.dtype)).astype(pf.dtype) < hi)
+        band = band | worst_added
+        k = np.where(worst_added, k_join, k).astype(k0.dtype)
+    return {"k": k, "band": band, "added": band & ~band0, "iterations": iterations, "converged": converged,
+            "worst_case": not converged, "worst_case_added": worst_added}
+
+
+def bound_slope(req: np.ndarray, m: np.ndarray, want: np.ndarray, shown: np.ndarray, add_lum: np.ndarray,
+                add_lum_u: np.ndarray, cpow: np.ndarray, fpow: np.ndarray, gamma: float) -> np.ndarray:
+    """Item 7 (C16): per pixel the slope ``q`` of the neighbour bound — the LARGEST chord slope ``(F(1) − F(σ)) / (1 − σ)``
+    of the pixel's statistic ``F(σ)`` = (brightest channel of ``req + a(σ) m``)^gamma over the fill scale σ in [0, 1).
+    ``a(σ)`` = the fill's request luminance at scale σ: 0 up to s0 = shown / want, then linear (``add_lum_u`` at σ = 1
+    uncapped), capped by the request ceiling (``add_lum`` = what σ = 1 really adds). Between its kinks F is concave (a
+    linear request, one brightest channel, under the concave power), so the largest chord slope to σ = 1 is taken AT a
+    kink: σ = s0 (below it F is flat), the points where the brightest channel changes (channel pairs of different
+    pedestal multipliers m_c; a white pedestal has none), and the ceiling's cap point (above it F is flat at F(1): its
+    chord is 0). With a white pedestal q = (F(1) − F(0)) / (1 − s0). 0 where want <= 0 or s0 >= 1 (nothing is filled)."""
+    s0 = np.clip(shown / np.where(want > 0.0, want, 1.0), 0.0, 1.0)
+    live = (want > 0.0) & (s0 < 1.0)
+    rest = np.where(live, 1.0 - s0, 1.0)
+    q = np.where(live, (fpow - cpow) / rest, 0.0)
+    for i, j in ((0, 1), (0, 2), (1, 2)):
+        dm = float(m[j] - m[i])
+        if dm == 0.0:
+            continue
+        ak = (req[i] - req[j]) / dm                                     # channels i and j cross at a = ak
+        ok = live & (ak > 0.0) & (ak < add_lum)
+        if not ok.any():
+            continue
+        ak = np.where(ok, ak, 0.0)
+        fk = np.power(np.maximum((req + ak[None] * m[:, None, None]).max(axis=0), 0.0), gamma)
+        chord = (fpow - fk) / (rest * (1.0 - ak / np.where(ok, add_lum_u, 1.0)))
+        q = np.where(ok, np.maximum(q, chord), q)
+    return q
 
 
 def band_scale(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.ndarray, dz: np.ndarray, ez: np.ndarray,
@@ -355,15 +411,17 @@ def band_scale(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.
     """Item 7: the per-zone scale ``k`` (rows, cols) the pixels' want is scaled by (through the feather,
     :func:`band_pixel_scale`), from the request ``req`` of the round (without fill) and the fill the unscaled rule would
     add. Returns ``k`` (final), ``k0`` / ``band0`` (the zones the prediction puts in the band), ``band`` (final), ``pf`` /
-    ``pc`` (the predicted statistic with / without the fill), ``lit``, ``guard_added`` + ``iterations`` (the neighbour
-    guard, HLSL G5) and ``A`` (8, rows, cols: the neighbour bound, HLSL G4). All ones / empty when the fit has no mean rule /
+    ``pc`` (the predicted statistic with / without the fill), ``lit``, the neighbour guard's evidence (HLSL G5:
+    ``guard_added``, ``iterations``, ``converged``, ``worst_case``, ``worst_case_added``), ``A`` (8, rows, cols: the
+    neighbour bound, HLSL G4) and ``q`` (per pixel, :func:`bound_slope`). All ones / empty when the fit has no mean rule /
     boost table. ``gp.band_feather`` False: the band before C16 (k = k0, no guard; the pixels take their own zone's k)."""
     p = model.p
     ones = np.ones((p.rows, p.cols))
     none = np.zeros((p.rows, p.cols), dtype=bool)
+    idle = {"guard_added": none, "iterations": 0, "converged": True, "worst_case": False, "worst_case_added": none,
+            "A": None, "q": None}
     if not (gp.band and band_active(model)):
-        return {"k": ones, "k0": ones, "pf": None, "pc": None, "lit": None, "band": none, "band0": none,
-                "guard_added": none, "iterations": 0, "A": None}
+        return {"k": ones, "k0": ones, "pf": None, "pc": None, "lit": None, "band": none, "band0": none, **idle}
     f = round_fill(model, req, b_true, b_est, dz, ez, gp, gain_max)
     zmean = lambda a: a.reshape(p.rows, model.ch, p.cols, model.cw).mean(axis=(1, 3))  # noqa: E731
     rc = req.max(axis=0)
@@ -376,22 +434,18 @@ def band_scale(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.
     band0 = (~lit) & (pc < t) & (pf >= BAND_LO * t) & (pf <= BAND_HI * t)
     k_join = np.power(np.clip((BAND_LO * t - pc) / np.maximum(pf - pc, 1e-30), 0.0, 1.0), 1.0 / g)
     k0 = np.where(band0, k_join, 1.0)
-    out = {"k": k0, "k0": k0, "pf": pf, "pc": pc, "lit": lit, "band": band0, "band0": band0, "guard_added": none,
-           "iterations": 0, "A": None}
+    out = {"k": k0, "k0": k0, "pf": pf, "pc": pc, "lit": lit, "band": band0, "band0": band0, **idle}
     if not gp.band_feather:
         return out
-    # the neighbour bound A_d (HLSL G4): the pixel's statistic is flat in the fill scale below s0 = shown / want (the
-    # fill starts only above what the pixel already shows) and concave above it
-    want, shown = f["want"], f["shown"]
-    s0 = np.clip(shown / np.where(want > 0.0, want, 1.0), 0.0, 1.0)
-    live = (want > 0.0) & (s0 < 1.0)
-    q = np.where(live, (fpow - cpow) / np.where(live, 1.0 - s0, 1.0), 0.0)
+    # the neighbour bound A_d (HLSL G4): a neighbour at scale k lowers the zone's statistic by at most (1 - k) A_d
+    q = bound_slope(req, pedestal_colour(model), f["want"], f["shown"], f["add_lum"], f["add_lum_u"], cpow, fpow, g)
     w = neighbour_weights(model)
     a = np.stack([zmean(w[d] * q) for d in range(len(NEIGHBOURS))])
     # the neighbour guard (HLSL G5): the zones counted only by the fill that the feather could pull below BAND_HI T
     cand = (~lit) & (pc < t) & (pf > BAND_HI * t) & ~band0
-    gd = guard(k0, band0, cand, k_join, pf, a, BAND_HI * t)
-    out.update(k=gd["k"], band=gd["band"], guard_added=gd["added"], iterations=gd["iterations"], A=a)
+    gd = guard(k0, band0, cand, k_join, pf, a, BAND_HI * t, iter_max=GUARD_ITER_MAX)
+    out.update(k=gd["k"], band=gd["band"], guard_added=gd["added"], iterations=gd["iterations"], converged=gd["converged"],
+               worst_case=gd["worst_case"], worst_case_added=gd["worst_case_added"], A=a, q=q)
     return out
 
 
@@ -401,7 +455,8 @@ def round_fill(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.
     the round's pixel fields; ``dz`` = the zone deficit; ``k`` = the count-threshold band's zone scale (item 7; None = 1),
     reaching the pixels through the feather (:func:`band_pixel_scale`). Returns ``add`` (3, h, w; exactly 0 where nothing
     is filled), ``fill`` (the luminance the panel is asked to add, as-if-white nits), ``want`` (after the band's scale),
-    ``s`` (the band's scale per pixel), ``trust``, ``e_px``, ``v_px``, ``shown``."""
+    ``s`` (the band's scale per pixel), ``trust``, ``e_px``, ``v_px``, ``shown``, ``add_lum`` (the request luminance the fill
+    adds, in the pedestal's colour: add = add_lum x m) and ``add_lum_u`` (the same before the request ceiling)."""
     from .starfield import _bilinear_zones, _nearest_zones
     check_supported(model)
     gp = clamp_params(gp)
@@ -422,13 +477,13 @@ def round_fill(model: FaldModel, req: np.ndarray, b_true: np.ndarray, b_est: np.
     trust = _smoothstep(p.fade_lo, p.fade_hi, b_est)
     fill = np.maximum(want - shown, 0.0) * trust
     m = pedestal_colour(model)
-    add_lum = fill * np.minimum(b_est / np.maximum(b_true, 1e-9), gain_max)
+    add_lum_u = fill * np.minimum(b_est / np.maximum(b_true, 1e-9), gain_max)
     room = np.maximum(req_ceiling(model) - r, 0.0)                       # what the brightest channel may still take
-    scale = np.minimum(1.0, room / np.maximum(add_lum * m.max(), 1e-30))
-    add_lum = add_lum * scale
+    scale = np.minimum(1.0, room / np.maximum(add_lum_u * m.max(), 1e-30))
+    add_lum = add_lum_u * scale
     add = add_lum[None] * m[:, None, None]
     return {"add": np.where(add_lum[None] > 0.0, add, 0.0), "fill": fill * scale, "want": want, "s": s, "trust": trust,
-            "e_px": e_px, "v_px": v_px, "shown": shown}
+            "e_px": e_px, "v_px": v_px, "shown": shown, "add_lum": add_lum, "add_lum_u": add_lum_u}
 
 
 def fill_image(model: FaldModel, img: np.ndarray, gp: Optional[GlowFillParams] = None, **kw) -> dict:

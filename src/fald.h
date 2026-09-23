@@ -175,6 +175,8 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* glowATex = nullptr;    ID3D11UnorderedAccessView* glowAUAV = nullptr;    ID3D11ShaderResourceView* glowASRV = nullptr;
     ID3D11Texture2D* glowKTmpTex = nullptr; ID3D11UnorderedAccessView* glowKTmpUAV = nullptr; ID3D11ShaderResourceView* glowKTmpSRV = nullptr;
     ID3D11Buffer* glowBandPartBuf = nullptr; ID3D11UnorderedAccessView* glowBandPartUAV = nullptr;
+    // G5's report (4 x 1 R32F, u2): iterations evaluated, converged (1 / 0), the worst-case pass ran (1 / 0), its zones
+    ID3D11Texture2D* glowGuardTex = nullptr; ID3D11UnorderedAccessView* glowGuardUAV = nullptr; ID3D11ShaderResourceView* glowGuardSRV = nullptr;
     bool glowBand = false;                   // the band runs this frame (glowOn AND FaldGlowBandActive): CB word 80
     bool glowOn = false;                     // the fill runs this frame (setting on AND the textures exist): CB word 75
     bool glowFailLogged = false;

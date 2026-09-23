@@ -397,7 +397,7 @@ def mean_model(model):
 def test_the_band_feather_geometry(model):
     """C16 pixel rule: w = 1 on the neighbour's rectangle, C1 down to 0 at FEATHER zones; s = min(k_z, min_n 1 - (1 - k_n)
     w_n) is exactly 1 with no band zone near, k_z inside a lone band zone, and ramps (no step) across its edges."""
-    assert (FEATHER, GUARD_ITER_MAX) == (0.35, 16)
+    assert (FEATHER, GUARD_ITER_MAX) == (0.35, 64) and FEATHER < 0.5   # < 0.5: only the 3 neighbours on the pixel's side reach it
     assert NEIGHBOURS == tuple((c % 3 - 1, c // 3 - 1) for c in range(9) if c != 4)       # 3 x 3 row-major, centre skipped
     u = np.linspace(0.0, 0.999, 1000)
     w = feather_weight(-1, 0, u, np.array([0.5]))[0]                                      # the left neighbour: distance = u
@@ -459,29 +459,47 @@ def test_the_feathered_band_draws_no_zone_edge(mean_model):
     assert float(np.max(np.abs(np.diff(old["fill"], axis=1)) / np.maximum(level[:, 1:], 1e-9))) > 0.25
 
 
-def test_the_neighbour_guard_keeps_every_zone_out_of_the_margin(mean_model):
+def _final_stats(m, g, gp, k=None):
+    """The round's fields rebuilt + band_scale on them + the zone statistic of the request with the fill of ``k`` (the
+    band's own k by default)."""
+    b_true, b_est = _round_fields(m, g)
+    req = g["req_nofill"]
+    b = band_scale(m, req, b_true, b_est, g["dz"], g["ez"], gp)
+    kk = b["k"] if k is None else k
+    final = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp, k=kk)["add"])
+    return b, final, (b_true, b_est)
+
+
+def _assert_margin(m, b, final):
+    """Every zone counted only by the fill that is not banded ends >= BAND_HI T (returns how many there are)."""
+    t = m.p.boost_mean_thresh
+    counted_by_fill = ~b["lit"] & (b["pc"] < t) & (b["pf"] > BAND_HI * t)
+    out = counted_by_fill & ~b["band"]
+    assert np.all(final[out] >= BAND_HI * t), (int((final[out] < BAND_HI * t).sum()), float(final[out].min() / t))
+    return int(out.sum())
+
+
+@pytest.mark.parametrize("sky", [0.004, 0.008])
+def test_the_neighbour_guard_keeps_every_zone_out_of_the_margin(mean_model, sky):
     """Spec test b, on the round the evidence comes from (its fields rebuilt): every zone counted only by the fill that is
     not banded ends >= BAND_HI T, every band zone ends <= its band0 prediction (the statistic with its own zone's k on its
-    own pixels), zones below BAND_LO T stay below, zones counted by their content stay counted."""
+    own pixels), zones below BAND_LO T stay below, zones counted by their content stay counted. (The 0.008 sky is the one
+    a bound without its 1 / (1 - s0) fails.)"""
     m = mean_model
     p = m.p
     t = p.boost_mean_thresh
     gp = GlowFillParams(cap_nits=0.05)
-    g = fill_image(m, windows(m, 0.004), gp)["glow"]
-    b_true, b_est = _round_fields(m, g)
-    b = band_scale(m, g["req_nofill"], b_true, b_est, g["dz"], g["ez"], gp)
+    g = fill_image(m, windows(m, sky), gp)["glow"]
+    b, final, (b_true, b_est) = _final_stats(m, g, gp)
     assert np.array_equal(b["k"], g["band"]["k"]) and np.array_equal(b["band"], g["band"]["band"])   # the fields are the round's
-    assert 2 <= b["iterations"] <= GUARD_ITER_MAX and b["guard_added"].sum() >= 10
+    assert 2 <= b["iterations"] <= GUARD_ITER_MAX and b["converged"] and not b["worst_case"] and b["guard_added"].sum() >= 10
     req = g["req_nofill"]
-    final = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp, k=b["k"])["add"])
     assert np.allclose(final, _zone_pow_mean(m, np.where(g["add"] > 0.0, req + g["add"], req)), rtol=1e-12)
     band0_pred = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], replace(gp, band_feather=False), k=b["k"])["add"])
-    free = ~b["lit"] & (b["pc"] < t)
-    counted_by_fill = free & (b["pf"] > BAND_HI * t)
-    assert (counted_by_fill & ~b["band"]).sum() >= 10
-    assert np.all(final[counted_by_fill & ~b["band"]] >= BAND_HI * t)
+    assert _assert_margin(m, b, final) >= 10
     assert np.all(final[b["band"]] <= band0_pred[b["band"]] * (1.0 + 1e-12))
     assert np.all(final[b["band0"]] <= BAND_LO * t * (1.0 + 1e-9))
+    free = ~b["lit"] & (b["pc"] < t)
     below = free & (b["pf"] < BAND_LO * t)
     assert np.all(final[below] < BAND_LO * t)
     content = b["lit"] | (b["pc"] >= t)
@@ -491,6 +509,168 @@ def test_the_neighbour_guard_keeps_every_zone_out_of_the_margin(mean_model):
     assert not old["guard_added"].any() and np.array_equal(old["band"], b["band0"]) and old["A"] is None
 
 
+def stripes(m, bg=0.002, level=200.0, tall=2, every=5, col0=4):
+    """200-nit horizontal stripes ``tall`` zones tall every ``every`` zone rows, from zone column ``col0`` to the right
+    edge, on a dim sky: the fill-counted rows between them join the band one zone per guard iteration (a long chain)."""
+    img = np.full((3, m.h, m.w), float(bg))
+    for zy in range(0, m.p.rows, every):
+        img[:, zy * m.ch: min(zy + tall, m.p.rows) * m.ch, col0 * m.cw:] = level
+    return img
+
+
+@pytest.mark.parametrize("every, cap, converges", [(6, 0.015, True), (5, 0.02, False)])
+def test_a_long_chain_of_joins_converges_or_ends_in_the_worst_case_pass(mean_model, every, cap, converges):
+    """Review 2026-09-23: a chain of guard joins advances one zone per iteration — stripes need 45 iterations (the cap
+    was 16, and zones joined in its last iteration lowered neighbours nobody re-checked: up to 6 fill-counted zones
+    ended inside the margin at 1.19-1.25 T on the owner fit) or more than GUARD_ITER_MAX (73). The cap is 64; beyond it
+    one worst-case pass bands every candidate that ALL its neighbours at k = 0 would pull below BAND_HI T. Either way no
+    fill-counted zone is left inside the margin, and the evidence says which way it went."""
+    m = mean_model
+    gp = GlowFillParams(cap_nits=cap)
+    g = fill_image(m, stripes(m, every=every), gp)["glow"]
+    b, final, _ = _final_stats(m, g, gp)
+    assert np.array_equal(b["k"], g["band"]["k"])
+    if converges:
+        assert b["converged"] and 16 < b["iterations"] < GUARD_ITER_MAX and not b["worst_case"] and not b["worst_case_added"].any()
+    else:
+        assert not b["converged"] and b["iterations"] == GUARD_ITER_MAX and b["worst_case"] and b["worst_case_added"].sum() >= 10
+    assert b["guard_added"].sum() >= 100
+    _assert_margin(m, b, final)
+
+
+def test_the_worst_case_pass_alone_keeps_the_margin(mean_model, monkeypatch):
+    """With a cap far below what the chain needs, the worst-case pass carries the guarantee: the margin holds, and
+    without the zones it banded (the rule of 4dedf7b) fill-counted zones would end inside it."""
+    import dlc.fald.glowfill as gf
+    m = mean_model
+    gp = GlowFillParams(cap_nits=0.02)
+    img = stripes(m, every=6)                                    # needs 43 iterations
+    monkeypatch.setattr(gf, "GUARD_ITER_MAX", 8)
+    g = fill_image(m, img, gp)["glow"]
+    b, final, _ = _final_stats(m, g, gp)
+    assert b["iterations"] == 8 and not b["converged"] and b["worst_case"] and b["worst_case_added"].sum() >= 10
+    _assert_margin(m, b, final)
+    k_no_pass = np.where(b["worst_case_added"], 1.0, b["k"])
+    _, final_no_pass, _ = _final_stats(m, g, gp, k=k_no_pass)
+    t = m.p.boost_mean_thresh
+    left_out = ~b["lit"] & (b["pc"] < t) & (b["pf"] > BAND_HI * t) & ~(b["band"] & ~b["worst_case_added"])
+    assert (final_no_pass[left_out] < BAND_HI * t).sum() >= 5                   # 13 zones at 1.17 T
+
+
+def windows_asym(m, sky, level=200.0):
+    """Windows in the LEFT part of their zones, on a 5-zone grid from column 2 and a 7-zone grid of rows from 1, the sky
+    brightening to the right: a scene no mirror maps onto itself, so a bound paired with the wrong neighbour shows."""
+    img = np.empty((3, m.h, m.w))
+    img[:] = (np.asarray(sky, dtype=float).reshape(-1, 1, 1) if np.ndim(sky) else float(sky)) * \
+        np.linspace(0.6, 1.4, m.w)[None, None, :]
+    for zy in range(1, m.p.rows, 7):
+        for zx in range(2, m.p.cols, 5):
+            y0, x0 = zy * m.ch + m.ch // 4, zx * m.cw + 1
+            img[:, y0: y0 + m.ch // 2 + 3 * (zx % 3), x0: x0 + m.cw // 3 + zy % 4] = level
+    return img
+
+
+PED_COLOUR = (0.66, 0.95, 2.37)                                 # a strongly blue, luminance-neutral pedestal (review 2026-09-23)
+RED_SKY = (0.008, 0.004, 0.002)                                 # a reddish sky: the brightest channel changes as the fill grows
+
+
+@pytest.fixture(scope="module")
+def colour_model(model):
+    return FaldModel(replace(model.p, boost_lut=MEAN_LUT, boost_rule="mean", tmin_rgb=PED_COLOUR))
+
+
+@pytest.mark.parametrize("scene", ["windows", "asym", "colour"])
+def test_the_neighbour_bound_holds_zone_by_zone(mean_model, colour_model, scene):
+    """A_d IS a bound (spec, G4): with a zone at k = 1 and its 8 neighbours at ANY scales k_n, the zone's statistic drops
+    by at most Σ_d (1 − k_{z+d}) A_d. Checked on the round's own fields for every zone, through 9 sparse lattices of
+    tested zones (every neighbour of a tested zone is free) with random neighbour scales (a third of them 0). A bound
+    without its 1 / (1 − s0), A_d paired with the mirrored neighbour, or the plain chord under a coloured pedestal (the
+    brightest channel changes as the fill grows) fail it."""
+    m = colour_model if scene == "colour" else mean_model
+    rows, cols = m.p.rows, m.p.cols
+    if scene == "windows":
+        img = windows(m, 0.008)
+    elif scene == "asym":
+        img = windows_asym(m, 0.006)
+    else:
+        img = windows(m, 0.0)
+        img[:, img.max(axis=0) <= 0.0] = np.asarray(RED_SKY)[:, None]
+    gp = GlowFillParams(cap_nits=0.05)
+    g = fill_image(m, img, gp)["glow"]
+    b, full, (b_true, b_est) = _final_stats(m, g, gp, k=np.ones((rows, cols)))
+    assert np.allclose(full, b["pf"], rtol=1e-12) and b["A"].max() > 0.0
+    req = g["req_nofill"]
+    rng = np.random.default_rng(16)
+    zy, zx = np.mgrid[0:rows, 0:cols]
+    worst, tested = -np.inf, 0
+    for oy in range(3):
+        for ox in range(3):
+            own = (zy % 3 == oy) & (zx % 3 == ox)
+            k = np.where(own, 1.0, np.where(rng.random((rows, cols)) < 1 / 3, 0.0, rng.random((rows, cols))))
+            stat = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp, k=k)["add"])
+            kp = np.pad(k, 1, constant_values=1.0)
+            bound = sum((1.0 - kp[1 + j: 1 + j + rows, 1 + i: 1 + i + cols]) * b["A"][d] for d, (i, j) in enumerate(NEIGHBOURS))
+            excess = (full - stat - bound)[own] / np.maximum(full[own], 1e-12)
+            worst, tested = max(worst, float(excess.max())), tested + int(own.sum())
+    assert tested == rows * cols and worst <= 1e-9, worst
+    # ONE neighbour at k = 0 per tested zone (its direction cycling over the lattice): no slack from "min <= sum" left —
+    # the plain chord under the coloured pedestal exceeds the bound here (review 2026-09-23: up to 1.13 x on its scene)
+    worst1 = -np.inf
+    for shift in (0, 4):
+        for oy in range(3):
+            for ox in range(3):
+                own = (zy % 3 == oy) & (zx % 3 == ox)
+                dsel = ((zy // 3) * (cols // 3 + 1) + zx // 3 + shift) % len(NEIGHBOURS)
+                k = np.ones((rows, cols))
+                for d, (i, j) in enumerate(NEIGHBOURS):
+                    k[np.roll(np.roll(own & (dsel == d), j, axis=0), i, axis=1)] = 0.0
+                k[own] = 1.0
+                stat = _zone_pow_mean(m, req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp, k=k)["add"])
+                kp = np.pad(k, 1, constant_values=1.0)
+                bound = sum((1.0 - kp[1 + j: 1 + j + rows, 1 + i: 1 + i + cols]) * b["A"][d] for d, (i, j) in enumerate(NEIGHBOURS))
+                worst1 = max(worst1, float(((full - stat - bound)[own] / np.maximum(full[own], 1e-12)).max()))
+    assert worst1 <= 1e-9, worst1
+    if scene == "colour":                                        # the kinks matter here: A above the plain chord's
+        f = round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp)
+        gam = m.p.boost_mean_gamma
+        cpow = np.power(np.maximum(req.max(axis=0), 0.0), gam)
+        fpow = np.power(np.maximum((req + f["add"]).max(axis=0), 0.0), gam)
+        s0 = np.clip(f["shown"] / np.where(f["want"] > 0, f["want"], 1.0), 0.0, 1.0)
+        live = (f["want"] > 0) & (s0 < 1)
+        q_chord = np.where(live, (fpow - cpow) / np.where(live, 1.0 - s0, 1.0), 0.0)
+        assert np.all(b["q"] >= q_chord * (1 - 1e-12)) and (b["q"] > q_chord * 1.5).sum() > 1000
+
+
+def test_the_bound_slope_is_the_largest_chord_and_the_plain_chord_with_a_white_pedestal(mean_model, colour_model):
+    """bound_slope per pixel: F(1) - F(sigma) <= (1 - sigma) q for every fill scale sigma (F = the pixel's statistic at
+    that scale, the round's fields); with a coloured pedestal the plain chord (F(1) - F(0)) / (1 - s0) is NOT such a bound
+    (the brightest channel changes: F turns convex there), and with a white pedestal q IS that chord, bit for bit."""
+    gp = GlowFillParams(cap_nits=0.05)
+    for m, sky in ((colour_model, RED_SKY), (mean_model, (0.008, 0.008, 0.008))):
+        img = windows(m, 0.0)
+        img[:, img.max(axis=0) <= 0.0] = np.asarray(sky)[:, None]
+        g = fill_image(m, img, gp)["glow"]
+        b, full_f, (b_true, b_est) = _final_stats(m, g, gp)
+        req = g["req_nofill"]
+        gam = m.p.boost_mean_gamma
+        F = lambda sig: np.power(np.maximum((req + round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp,  # noqa: E731
+                                                                k=np.full((m.p.rows, m.p.cols), sig))["add"]).max(axis=0), 0.0), gam)
+        F1 = F(1.0)
+        f = round_fill(m, req, b_true, b_est, g["dz"], g["ez"], gp)
+        cpow = np.power(np.maximum(req.max(axis=0), 0.0), gam)
+        s0 = np.clip(f["shown"] / np.where(f["want"] > 0, f["want"], 1.0), 0.0, 1.0)
+        live = (f["want"] > 0) & (s0 < 1)
+        q_chord = np.where(live, (F1 - cpow) / np.where(live, 1.0 - s0, 1.0), 0.0)
+        over_q, over_chord = -np.inf, -np.inf
+        for sig in np.linspace(0.0, 0.98, 50):
+            drop = F1 - F(sig)
+            over_q = max(over_q, float((drop - (1.0 - sig) * b["q"]).max()))
+            over_chord = max(over_chord, float((drop - (1.0 - sig) * q_chord).max()))
+        assert over_q <= 1e-12, over_q
+        if m is colour_model:
+            assert over_chord > 1e-3                                      # the plain chord is no bound here
+        else:
+            assert np.array_equal(b["q"], q_chord) and over_chord <= 1e-12   # white: the chord, bit for bit
 def test_the_guard_is_jacobi_and_joins_only_fill_counted_zones():
     """G5's semantics on a 1 x 5 chain: zone 0 is in the band (k0 = 0); zone 1 falls below BAND_HI T only through zone
     0, zone 2 only once zone 1 has joined. Jacobi (every zone reads the previous iteration's k, as the GPU's one thread
@@ -510,8 +690,11 @@ def test_the_guard_is_jacobi_and_joins_only_fill_counted_zones():
     assert r["k"].dtype == np.float32 and r["iterations"] == 3
     assert r["band"].tolist() == [[True, True, True, False, False]] and r["added"].tolist() == [[False, True, True, False, False]]
     assert r["k"].tolist() == [[0.0, np.float32(0.3), np.float32(0.3), 1.0, 1.0]]
-    capped = guard(k0, band0, cand, kj, pf, a, hi, iter_max=1)                           # the cap: one iteration, zone 1 only
-    assert capped["added"].tolist() == [[False, True, False, False, False]] and capped["iterations"] == 1
+    assert r["converged"] and not r["worst_case"] and not r["worst_case_added"].any()
+    # the cap: one iteration joins zone 1, then the worst-case pass (every neighbour at k = 0) takes zone 2 as well
+    capped = guard(k0, band0, cand, kj, pf, a, hi, iter_max=1)
+    assert capped["iterations"] == 1 and not capped["converged"] and capped["worst_case"]
+    assert capped["added"].tolist() == [[False, True, True, False, False]] and capped["worst_case_added"].tolist() == [[False, False, True, False, False]]
 
 
 def test_c16_is_bit_identical_away_from_the_band(mean_model, model):

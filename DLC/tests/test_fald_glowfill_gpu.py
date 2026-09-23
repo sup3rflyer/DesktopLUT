@@ -233,25 +233,28 @@ def test_hlsl_glow_passes_mirror_the_reference():
     assert (const("FALD_GLOW_DEFICIT_REL_LO"), const("FALD_GLOW_DEFICIT_REL_HI")) == (glowfill.DEFICIT_REL_LO, glowfill.DEFICIT_REL_HI)
     assert const("FALD_GLOW_WANT_EPS") == glowfill.WANT_EPS and const("FALD_GLOW_REACH_MAX") == glowfill.REACH_MAX
     assert (const("FALD_GLOW_BAND_LO"), const("FALD_GLOW_BAND_HI")) == (glowfill.BAND_LO, glowfill.BAND_HI) == (0.8, 1.25)
-    assert (const("FALD_GLOW_FEATHER"), const("FALD_GLOW_GUARD_ITER_MAX")) == (glowfill.FEATHER, glowfill.GUARD_ITER_MAX) == (0.35, 16)
+    assert (const("FALD_GLOW_FEATHER"), const("FALD_GLOW_GUARD_ITER_MAX")) == (glowfill.FEATHER, glowfill.GUARD_ITER_MAX) == (0.35, 64)
     for reg in ("glowVTex   : register(t20)", "glowDilTex : register(t21)", "glowCTex   : register(t22)", "glowEnvTex : register(t23)",
                 "glowKTex   : register(t24)", "glowBandTex : register(t25)", "glowATex    : register(t26)"):
         assert reg in common
     # GlowAdd: the reference's per-pixel rule, in its order — EVERY factor pinned (a removed line must fail a default test:
     # the review's "ceiling removed" mutant passed when only some of them were)
-    add = re.search(r"float3 GlowAddK\(float3 req, float bTrue, float bEst, float2 px, float k\) \{(.*?)\n\}", common, re.S).group(1)
+    add = re.search(r"float3 GlowAddW\(float3 req, float bTrue, float bEst, float want\) \{(.*?)\n\}", common, re.S).group(1)
     want = re.search(r"float GlowWant\(float2 px\) \{(.*?)\n\}", common, re.S).group(1).strip()
     assert want == "return min(max(glowStrength * glowEnvTex.SampleLevel(linearClamp, FineUV(px), 0).y - FALD_GLOW_WANT_EPS, 0.0f), glowCapNits);"
     assert [l.strip() for l in add.strip().splitlines()] == [
-        "float want = GlowWant(px) * k;",
         "if (!(want > 0.0f)) return req;", "bTrue = max(bTrue, 0.0f);", "float r = max(req.r, max(req.g, req.b));",
         "float shown = r * bTrue / max(bEst, 1e-9f);", "float fill = max(want - shown, 0.0f) * smoothstep(fadeLo, fadeHi, bEst);",
         "float add = fill * min(bEst / max(bTrue, 1e-9f), gainMax);", "float3 m = float3(tminR, tminG, tminB) / max(tmin, 1e-30f);",
         "float room = max(glowReqCeil - r, 0.0f);", "add *= min(1.0f, room / max(add * max(m.r, max(m.g, m.b)), 1e-30f));",
         "if (!(add > 0.0f)) return req;", "return req + add * m;"]
+    addk = re.search(r"float3 GlowAddK\(float3 req, float bTrue, float bEst, float2 px, float k\) \{(.*?)\n\}", common, re.S).group(1)
+    assert addk.strip() == "return GlowAddW(req, bTrue, bEst, GlowWant(px) * k);"
+    # the want first (review 2026-09-23: the band's scale only where something is filled; want x s as before, bit for bit)
     own = re.search(r"float3 GlowAdd\(float3 req, float bTrue, float bEst, int2 px\) \{(.*?)\n\}", common, re.S).group(1)
     assert [l.strip() for l in own.strip().splitlines()] == [
-        "float k = 1.0f;", "if (glowBand != 0u) k = GlowBandScale(px);", "return GlowAddK(req, bTrue, bEst, float2(px), k);"]
+        "float want = GlowWant(float2(px));", "if (!(want > 0.0f)) return req;", "if (glowBand != 0u) want *= GlowBandScale(px);",
+        "return GlowAddW(req, bTrue, bEst, want);"]
     # C16: the feather (glowfill.band_pixel_scale / feather_weight / zone_local) — k of the pixel's 3 x 3 zones, not a
     # nearest Load of its own
     loc = re.search(r"float2 GlowZoneLocal\(float2 px, int2 z\) \{(.*?)\n\}", common, re.S).group(1).strip()
@@ -263,10 +266,14 @@ def test_hlsl_glow_passes_mirror_the_reference():
     sc = re.search(r"float GlowBandScale\(int2 px\) \{(.*?)\n\}", common, re.S).group(1)
     for line in ("int2 z = int2((int)((uint)(px.x - (int)originX) / cellW), (int)((uint)(px.y - (int)originY) / cellH));",
                  "float s = glowKTex.Load(int3(z, 0));", "float2 uv = GlowZoneLocal(float2(px), z);",
-                 "if ((i == 0 && j == 0) || n.x < 0 || n.y < 0 || n.x >= (int)cols || n.y >= (int)rows) continue;",
-                 "float w = GlowFeatherW(i, j, uv);", "if (w > 0.0f) s = min(s, 1.0f - (1.0f - glowKTex.Load(int3(n, 0))) * w);",
+                 # FEATHER < 0.5: the horizontal / vertical neighbour on the pixel's side and their diagonal (review 2026-09-23)
+                 "int2 side = int2((uv.x < 0.5f) ? -1 : 1, (uv.y < 0.5f) ? -1 : 1);",
+                 "int2 o = (e == 0) ? int2(side.x, 0) : ((e == 1) ? int2(0, side.y) : side);",
+                 "if (n.x < 0 || n.y < 0 || n.x >= (int)cols || n.y >= (int)rows) continue;",
+                 "float w = GlowFeatherW(o.x, o.y, uv);", "if (w > 0.0f) s = min(s, 1.0f - (1.0f - glowKTex.Load(int3(n, 0))) * w);",
                  "return s;"):
         assert line in sc, line
+    assert glowfill.FEATHER < 0.5
     band = part("g_faldGlowBandSource")
     for line in ("float3 c3 = Correct(img, bT, bE, g);", "float3 f3 = GlowAddK(c3, bT, bE, float2((float)px, (float)py), 1.0f);",
                  "float pwC = (c > 0.0f) ? exp(boostMeanGamma * log(c)) : 0.0f;", "float pwF = (f > 0.0f) ? exp(boostMeanGamma * log(f)) : 0.0f;",
@@ -276,30 +283,46 @@ def test_hlsl_glow_passes_mirror_the_reference():
                  "float share = saturate((FALD_GLOW_BAND_LO * t - pc) / max(pf - pc, 1e-30f));",
                  "kz = (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;",
                  "glowBandOut[uint2(cx, cy)] = float4(pc, pf, litZone ? 1.0f : 0.0f, kz);",
-                 # the neighbour bound's term (glowfill.band_scale: q = (f^g - c^g) / (1 - s0), s0 = shown / want)
+                 # the neighbour bound's term (glowfill.band_scale / bound_slope), s0 = shown / want
                  "float want = GlowWant(float2((float)px, (float)py));", "if (want > 0.0f) {",
                  "float s0 = saturate(c * max(bT, 0.0f) / max(bE, 1e-9f) / want);", "if (s0 < 1.0f) {",
-                 "float q = (pwF - pwC) / (1.0f - s0);", "float2 uv = GlowZoneLocal(float2((float)px, (float)py), int2((int)cx, (int)cy));",
+                 "float q = GlowBoundSlope(c3, c, bT, bE, want, s0, pwC, pwF);",
+                 "float2 uv = GlowZoneLocal(float2((float)px, (float)py), int2((int)cx, (int)cy));",
                  "glowAOut[uint2(2u * cx, cy)] = (gA0[0] / (float)n) * float4(hasL * hasU, hasU, hasR * hasU, hasL);",
-                 "glowAOut[uint2(2u * cx + 1u, cy)] = (gA1[0] / (float)n) * float4(hasR, hasL * hasD, hasD, hasR * hasD);"):
+                 "glowAOut[uint2(2u * cx + 1u, cy)] = (gA1[0] / (float)n) * float4(hasR, hasL * hasD, hasD, hasR * hasD);",
+                 # GlowBoundSlope (glowfill.bound_slope): the plain chord at s0, then the channel-change kinks' chords
+                 "float rest = 1.0f - s0;", "float q = (pwF - pwC) / rest;", "if (m.r == m.g && m.g == m.b) return q;",
+                 "float aU = max(want - shown, 0.0f) * smoothstep(fadeLo, fadeHi, bE) * min(bE / max(bT, 1e-9f), gainMax);",
+                 "float a1 = aU * min(1.0f, max(glowReqCeil - c, 0.0f) / max(aU * max(m.r, max(m.g, m.b)), 1e-30f));",
+                 "uint i = (p == 2u) ? 1u : 0u, j = (p == 0u) ? 1u : 2u;", "float ak = (c3[i] - c3[j]) / dm;",
+                 "if (!(ak > 0.0f && ak < a1)) continue;", "float3 hk3 = c3 + ak * m;",
+                 "q = max(q, (pwF - fk) / (rest * (1.0f - ak / aU)));"):
         assert line in band, line
     order = [(int(i), int(j)) for i, j in re.findall(r"GlowFeatherW\((-?\d), (-?\d), uv\)", band)]
     assert order == list(NEIGHBOURS)                                          # A_0..A_7 in the reference's order
     g5 = part("g_faldGlowGuardSource")
     for line in ("[numthreads(1024, 1, 1)]", "[loop] for (uint it = 0u; it < FALD_GLOW_GUARD_ITER_MAX; it++) {",
-                 "if (it == 0u || gJoined[cur ^ 1u] != 0u) {", "float kz = glowKOut[zc];",
+                 "if (it == 0u || gJoined[cur ^ 1u] != 0u) {", "iters = it + 1u;", "float kz = glowKOut[zc];",
                  "if (b.z < 0.5f && b.x < t && b.y > hi && kz >= 1.0f) {", "precise float loss = 0.0f;",
                  "uint m = (d < 4u) ? d : d + 1u;", "int2 nb = zc + int2((int)(m % 3u) - 1, (int)(m / 3u) - 1);",
                  "if (nb.x < 0 || nb.y < 0 || nb.x >= (int)cols || nb.y >= (int)rows) continue;",
-                 "loss += (1.0f - glowKOut[nb]) * a[d];", "if (b.y - loss < hi) {",
+                 "loss += (1.0f - (worst ? 0.0f : glowKOut[nb])) * a[d];", "if (b.y - GuardLoss(zc, false) < hi) {",
                  "float share = saturate((FALD_GLOW_BAND_LO * t - b.x) / max(b.y - b.x, 1e-30f));",
-                 "kz = (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;", "glowKNext[zc] = kz;",
-                 "float hi = FALD_GLOW_BAND_HI * t;"):
+                 "return (share > 0.0f) ? exp(log(share) / boostMeanGamma) : 0.0f;", "kz = GuardJoinK(b, t);", "glowKNext[zc] = kz;",
+                 "float hi = FALD_GLOW_BAND_HI * t;",
+                 # the cap ended it while its last iteration still added zones: the worst-case pass (review 2026-09-23)
+                 "bool converged = gJoined[(FALD_GLOW_GUARD_ITER_MAX - 1u) & 1u] == 0u;", "if (!converged) {",
+                 "if (b2.z < 0.5f && b2.x < t && b2.y > hi && glowKOut[zc2] >= 1.0f && b2.y - GuardLoss(zc2, true) < hi) {",
+                 "glowKOut[zc2] = GuardJoinK(b2, t);", "glowGuardOut[uint2(0, 0)] = (float)iters;",
+                 "glowGuardOut[uint2(1, 0)] = converged ? 1.0f : 0.0f;", "glowGuardOut[uint2(2, 0)] = converged ? 0.0f : 1.0f;",
+                 "glowGuardOut[uint2(3, 0)] = (float)gWorst;"):
         assert line in g5, line
-    # Jacobi: this iteration's k goes to the scratch; the state (u0) is rewritten only after a group-wide barrier
+    # Jacobi: this iteration's k goes to the scratch; the state (u0) is rewritten only after a group-wide barrier; the
+    # worst-case pass only after the last iteration's barriers
     assert g5.index("glowKNext[zc] = kz;") < g5.index("AllMemoryBarrierWithGroupSync();", g5.index("glowKNext[zc] = kz;")) < \
-        g5.index("glowKOut[uint2(z1 % cols, z1 / cols)] = glowKNext[uint2(z1 % cols, z1 / cols)];")
-    assert g5.count("AllMemoryBarrierWithGroupSync();") == 3 and g5.count("1024u") == 3
+        g5.index("glowKOut[uint2(z1 % cols, z1 / cols)] = glowKNext[uint2(z1 % cols, z1 / cols)];") < \
+        g5.index("bool converged = ") < g5.index("glowGuardOut[uint2(0, 0)]")
+    assert g5.count("AllMemoryBarrierWithGroupSync();") == 4 and g5.count("1024u") == 4
     for line in ("if (!(want > 0.0f)) return req;", "float shown = r * bTrue / max(bEst, 1e-9f);",
                  "float fill = max(want - shown, 0.0f) * smoothstep(fadeLo, fadeHi, bEst);",
                  "float add = fill * min(bEst / max(bTrue, 1e-9f), gainMax);",
@@ -370,7 +393,9 @@ def test_hlsl_glow_passes_mirror_the_reference():
         assert g4 < g5 < body.index(f"{ctx}->Dispatch(1, 1, 1);", g5)
         assert f"ID3D11ShaderResourceView* in5[2] = {{ {v}->glowBandSRV, {v}->glowASRV }};" in body
         assert f"{ctx}->CSSetShaderResources(25, 2, in5);" in body
-        assert f"ID3D11UnorderedAccessView* u5[2] = {{ {v}->glowKUAV, {v}->glowKTmpUAV }};" in body
+        assert f"ID3D11UnorderedAccessView* u5[3] = {{ {v}->glowKUAV, {v}->glowKTmpUAV, {v}->glowGuardUAV }};" in body
+        assert f"MakeRWTexture(4, 1, &{v}->glowGuardTex, &{v}->glowGuardUAV, &{v}->glowGuardSRV)" in src
+        assert f'DumpTexture({v}->glowGuardTex, dir + L"fald_glow_guard.f32", 4, 1, 4);' in src
         assert f"ID3D11UnorderedAccessView* ub[4] = {{ {v}->glowBandUAV, {v}->glowAUAV, {v}->zonePartUAV," in body
         assert f'DumpTexture({v}->glowBandTex, dir + L"fald_glow_band.f32", p.cols, p.rows, 16);' in src
         assert f'DumpTexture({v}->glowATex, dir + L"fald_glow_bandA.f32", 2 * p.cols, p.rows, 16);' in src
@@ -390,7 +415,45 @@ def test_hlsl_glow_passes_mirror_the_reference():
     assert "m->glowOn ? m->glowEnvSRV : nullptr" in hk and "m->glowBand ? m->glowKSRV : nullptr" in hk
     assert f"HOOK_GLOW_REACH_MAX = {glowfill.REACH_MAX}u;" in hk
     assert "#define HOOK_FALD_SRV_SLOTS 27" in (_HOOK / "hook_fald.h").read_text(encoding="utf-8")
+    # the overlay's dump text reports G5's run (the DLC WARP replay reads it); the C++ cap = the HLSL's
+    assert '<< "\\nglowfill_guard iterations " << (int)guardR[0] << " converged " << (int)guardR[1]' in c
+    assert f"static const unsigned int FALD_GLOW_GUARD_ITER_MAX = {glowfill.GUARD_ITER_MAX}u;" in _SHADER.read_text(encoding="utf-8")
 
+
+
+def test_the_twin_bound_takes_the_channel_kinks_like_the_reference(tmp_path):
+    """C16 review 2026-09-23: with a coloured pedestal the brightest channel changes as the fill grows; G4's per-pixel
+    slope is the largest chord over those kinks (Emu.bound_q32 = glowfill.bound_slope). A reddish sky under a strongly
+    blue pedestal, raster-aligned: the twin's round-1 bound and band = the reference's on the twin's own fields."""
+    from dlc.fald.gpuemu import BT2020_TO_BT709
+    lut = ((0.0, 1.17), (0.20, 1.10), (0.35, 1.0))
+    p = _small_params(boost_lut=lut, boost_rule="mean", tmin_rgb=(0.66, 0.95, 2.37))
+    m = FaldModel(p)
+    export_panel_params(m, tmp_path / "panel.bin")
+    emu = Emu(read_panel_file(tmp_path / "panel.bin"), width=p.width, height=p.height)
+    img = np.empty((3, m.h, m.w))
+    img[:] = np.array([0.008, 0.004, 0.002])[:, None, None]                   # as-if-white BT.2020 nits per channel
+    for r in (2, 6, 10):
+        for c in (2, 6, 10):
+            img[:, r * m.ch + 2: r * m.ch + 6, c * m.cw + 4: c * m.cw + 12] = 200.0
+    frame = (_scrgb(img) @ BT2020_TO_BT709.T)                                 # so that the panel nits are img's channels
+    gp = GlowFillParams(cap_nits=0.1)
+    out = emu.run(frame, fp16_out=False, glow=gp)
+    g, b = out["glow"], out["glow"]["band"]
+    assert np.allclose(emu.panel_nits(frame)[:, 2::5, 2::5], img, rtol=1e-5, atol=1e-9)        # (the matrices: 7 digits)
+    ref = band_scale(m, _centres(g["req_nofill"]), _centres(out["px_bT"]), _centres(out["px_bE"]), g["dz"].astype(np.float64),
+                     g["ez"].astype(np.float64), gp, gain_max=emu.gmax)
+    assert b["band0"].sum() >= 4 and b["guard_added"].sum() >= 1
+    assert np.array_equal(ref["band"], b["band"]) and np.allclose(ref["k"], b["k"], rtol=0.03)
+    assert np.allclose(ref["A"], b["A"], rtol=0.05, atol=0.02 * float(b["A"].max()))
+    # ... and the kinks are what moved it: the plain chord's A (a white m in the twin) lies well below
+    saved = Emu.ped_m32
+    try:
+        Emu.ped_m32 = lambda self: np.ones(3, dtype=np.float32)
+        a_chord = emu.run(frame, fp16_out=False, glow=gp)["glow"]["band"]["A"]
+    finally:
+        Emu.ped_m32 = saved
+    assert np.all(b["A"] >= a_chord * (1 - 1e-5) - 1e-9) and (b["A"] > 1.2 * a_chord).any(axis=0).sum() >= 20
 
 def test_the_twin_feathers_k_like_the_reference(rig):
     """HLSL GlowBandScale (Emu.band_scale_px, float32, every pixel) = glowfill.band_pixel_scale at the raster-aligned
@@ -422,8 +485,21 @@ def test_the_twin_guard_is_the_reference_guard():
         a = rng.uniform(0.0, 0.5, (8, rows, cols)).astype(np.float32)
         kj = rng.uniform(0.0, 0.6, (rows, cols)).astype(np.float32)
         hi = np.float32(1.25)
-        ref = guard(k0, band0, cand, kj, pf, a, hi)
-        k, it = Emu.guard32(None, k0, cand, kj, pf, a, hi)
-        assert k.dtype == np.float32 and np.array_equal(k, ref["k"]) and it == ref["iterations"], trial
-        assert np.array_equal(band0 | (k < 1.0), ref["band"])
-    assert GUARD_ITER_MAX == 16
+        for cap in (GUARD_ITER_MAX, 2):                                    # converged / ended on the cap (worst-case pass)
+            ref = guard(k0, band0, cand, kj, pf, a, hi, iter_max=cap)
+            tw = Emu.guard32(k0, cand, kj, pf, a, hi) if cap == GUARD_ITER_MAX else _guard32_capped(k0, cand, kj, pf, a, hi, cap)
+            k = tw["k"]
+            assert k.dtype == np.float32 and np.array_equal(k, ref["k"]) and tw["iterations"] == ref["iterations"], (trial, cap)
+            assert np.array_equal(band0 | (k < 1.0), ref["band"]) and tw["converged"] == ref["converged"]
+            assert np.array_equal(tw["worst_case_added"], ref["worst_case_added"])
+    assert GUARD_ITER_MAX == 64
+
+
+def _guard32_capped(k0, cand, kj, pf, a, hi, cap):
+    import dlc.fald.gpuemu as ge
+    saved = ge.GUARD_ITER_MAX
+    ge.GUARD_ITER_MAX = cap
+    try:
+        return Emu.guard32(k0, cand, kj, pf, a, hi)
+    finally:
+        ge.GUARD_ITER_MAX = saved

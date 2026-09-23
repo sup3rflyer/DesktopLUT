@@ -120,7 +120,12 @@ def test_warp_glow_dumps_are_the_twin():
     # bit-equality is a coin flip unrelated to the fill, so the fractions count the pixels that are black or filled.
     judged = filled | (frame.max(axis=-1) <= 0.0)
     drives_exact = float(np.max(np.abs(vz - tw["glow"]["vz"]))) <= 2e-5 * float(vz.max())
-    if drives_exact:
-        assert float(same[filled].mean()) > 0.97 and float(same[judged].mean()) > 0.99, (float(same[filled].mean()), float(same[judged].mean()))
+    ped = emu.o.get("pedRGB")
+    coloured = ped is not None and not np.allclose(np.asarray(ped, dtype=float), 1.0)   # a coloured fill: the matrix mixes it
+    if drives_exact and coloured:
+        assert float(same[filled].mean()) > 0.95, float(same[filled].mean())
+    elif drives_exact:
+        black = frame.max(axis=-1) <= 0.0                                   # untouched black pixels: (nearly) all exact
+        assert float(same[filled].mean()) > 0.97 and (not black.any() or float(same[black].mean()) > 0.99),             (float(same[filled].mean()), float(same[black].mean()) if black.any() else None)
     else:
         assert float(same[judged].mean()) > 0.9, float(same[judged].mean())
