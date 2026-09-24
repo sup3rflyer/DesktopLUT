@@ -323,6 +323,15 @@ request, adjudicates ambiguous results on digests, and writes the report.
   with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
 
 ### Fixed
+- **The test suite no longer writes into the real `runs/`** (2026-09-24). Every suite run left a
+  `runs/<ts>_sdr_x/` folder behind and repointed `runs/active.json` at a pytest tmp run, which
+  pulled a live dashboard off an in-progress hardware run. The runs root is now resolved at call
+  time by `dlc.paths.runs_dir()`, which honours a new `DLC_RUNS_DIR` override (the
+  `dlc.hook_routing` probe's default `--workdir` uses it too, so that default is no longer
+  relative to the cwd). The suite sandboxes it per test, blocks and fails any in-process write to
+  the real root (an audit-hook tripwire), fails the session if the real `active.json` ends up
+  pointing into a temp dir, and reports any other change to the real root without failing, since
+  that is most likely another session's real run.
 - **A calibration run no longer drops the OTHER mode's 3D LUT.** Entering calibration
   mode cleared both SDR and HDR runtime layers on the monitor, and accepting the new
   calibration exits without the snapshot restore — so a clean HDR run permanently

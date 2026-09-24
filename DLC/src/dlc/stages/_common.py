@@ -26,7 +26,7 @@ from ..desktoplut_client import (
 )
 from ..desktoplut_mock import MockDesktopLutServer, MockDesktopLutState
 from ..mhc import D65_X, D65_Y, Ti3Sample, classify_samples, parse_ti3, xy_from_xyz
-from ..paths import RUNS_DIR, atomic_write_text
+from ..paths import atomic_write_text, runs_dir
 from ..refine import Deviations, GrayPatch, MeasuredPrimaries, RefinementTarget
 from ..runs import RunContext, create_run, open_run
 from ..stage import StageResult
@@ -120,19 +120,20 @@ def target_white_from_state(state: dict[str, Any]) -> tuple[tuple[float, float],
 
 
 def latest_run() -> Path | None:
-    if not RUNS_DIR.exists():
+    root = runs_dir()
+    if not root.exists():
         return None
-    pointer = RUNS_DIR / "active.json"
+    pointer = root / "active.json"
     try:
         raw = json.loads(pointer.read_text(encoding="utf-8"))
         active = Path(str(raw.get("run_root") or raw.get("run") or ""))
         if active and not active.is_absolute():
-            active = (RUNS_DIR / active).resolve()
+            active = (root / active).resolve()
         if active.is_dir() and (active / "manifest.json").exists():
             return active
     except (OSError, ValueError, TypeError):
         pass
-    candidates = [p for p in RUNS_DIR.iterdir() if p.is_dir() and (p / "manifest.json").exists()]
+    candidates = [p for p in root.iterdir() if p.is_dir() and (p / "manifest.json").exists()]
     if not candidates:
         return None
 

@@ -64,7 +64,7 @@ def test_biased_neutral_is_bit_depth_aware_and_biases_cold_channel():
     assert biased[2] <= t.max_cv
 
 
-def test_write_ti3_round_trips_through_parse_ti3():
+def test_write_ti3_round_trips_through_parse_ti3(tmp_path: Path):
     t = _sdr()
     acc = [
         AcceptedRead(patch=_patch("p0", (0, 0, 0), t, 0), xyz=(0.10, 0.10, 0.11)),
@@ -74,19 +74,16 @@ def test_write_ti3_round_trips_through_parse_ti3():
         # signal — the parse_ti3 scale bug that scored dark HDR patches at dE_ITP ~700.
         AcceptedRead(patch=_patch("p2", (10, 10, 10), t, 2), xyz=(0.20, 0.21, 0.23)),
     ]
-    out = Path("__ti3_tmp__.ti3")
-    try:
-        write_ti3(out, acc)
-        samples = parse_ti3(out)
-        assert len(samples) == 3
-        assert samples[1].rgb == (1.0, 1.0, 1.0)
-        assert abs(samples[1].xyz[1] - 100.0) < 1e-3
-        assert samples[0].rgb == (0.0, 0.0, 0.0)
-        dark = samples[2].rgb[0]
-        assert abs(dark - 10 / 1023) < 1e-4   # true sub-1% signal preserved
-        assert dark < 0.02                     # NOT the ~0.978 the old >1.0 heuristic produced
-    finally:
-        out.unlink(missing_ok=True)
+    out = tmp_path / "round_trip.ti3"
+    write_ti3(out, acc)
+    samples = parse_ti3(out)
+    assert len(samples) == 3
+    assert samples[1].rgb == (1.0, 1.0, 1.0)
+    assert abs(samples[1].xyz[1] - 100.0) < 1e-3
+    assert samples[0].rgb == (0.0, 0.0, 0.0)
+    dark = samples[2].rgb[0]
+    assert abs(dark - 10 / 1023) < 1e-4   # true sub-1% signal preserved
+    assert dark < 0.02                     # NOT the ~0.978 the old >1.0 heuristic produced
 
 
 def test_parse_ti3_scales_and_clamps_per_spec(tmp_path: Path):

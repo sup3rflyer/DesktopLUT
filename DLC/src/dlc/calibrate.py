@@ -145,7 +145,7 @@ from .patch_sets import (
     flow_patch_counts,
     outside_in_indices,
 )
-from .paths import RUNS_DIR, atomic_write_text
+from .paths import atomic_write_text, runs_dir
 from .runs import RunContext, create_run, open_run
 from .stages import _common, build_mhc
 
@@ -5457,7 +5457,7 @@ class Calibration:
                 "flow": self.calib.get("flow"),
                 "updated": datetime.now().isoformat(timespec="seconds"),
             }
-            atomic_write_text(RUNS_DIR / "active.json", json.dumps(pointer, indent=2))
+            atomic_write_text(runs_dir() / "active.json", json.dumps(pointer, indent=2))
         except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
             pass
 

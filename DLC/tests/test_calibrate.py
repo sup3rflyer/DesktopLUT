@@ -60,6 +60,7 @@ from dlc.engine.patches import Transfer
 from dlc.events import Ev, digest_projection, read_events
 from dlc.measure_loop import Reading, SyntheticPanel
 from dlc.optimize import OptimizeConfig, synthetic_probe
+from dlc.paths import runs_dir
 from dlc.runs import RunContext, create_run, open_run
 
 _DATE = datetime.date(2026, 6, 16)
@@ -155,6 +156,9 @@ def test_full_flow_completes_clean(tmp_path: Path):
     verify = calib.calib["stages"]["verify"]["digest"]
     assert verify["within_quality"] is True
     assert verify["max_de2000"] <= calib.profile.quality.max_de2000
+    # the dashboard pointer lands in the RESOLVED runs root (the suite's sandbox), never DLC/runs
+    pointer = json.loads((runs_dir() / "active.json").read_text(encoding="utf-8"))
+    assert Path(pointer["run"]) == calib.ctx.root
 
 
 def _perfect_hdr_panel() -> SyntheticPanel:

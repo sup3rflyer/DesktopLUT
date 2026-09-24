@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional
 
 from .controller import normalize_mode
 from .measure_loop import MeasurePatch
+from .paths import runs_dir
 
 # The probe transform: (r, g, b) -> (r, PROBE_GREEN_GAIN*g, b). Halving green at mid grey
 # moves x by ~+0.05 and drops Y by ~35 % on any additive panel.
@@ -403,7 +404,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--policy", choices=POLICIES, default="always",
                         help="auto: only when the hook report is ambiguous; always (default for the "
                              "probe): run the optical check regardless")
-    parser.add_argument("--workdir", type=Path, default=Path("runs") / "_hook_routing_probe")
+    # absolute: the probe cube's path goes over the pipe to DesktopLUT.exe (its own cwd)
+    parser.add_argument("--workdir", type=Path, default=runs_dir() / "_hook_routing_probe")
     parser.add_argument("--settle", type=float, default=2.0, help="seconds after each set/clear")
     args = parser.parse_args(argv)
 

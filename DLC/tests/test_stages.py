@@ -12,6 +12,7 @@ from pathlib import Path
 
 from dlc.controller import CalibrationController
 from dlc.decisions import MetricThresholds, write_quality_policy
+from dlc.paths import RUNS_DIR_ENV
 from dlc.runs import create_run
 from dlc.simulation import write_identity_cube, write_synthetic_ti3
 from dlc.stages import (
@@ -402,7 +403,7 @@ def test_file_backed_mock_persists_hdr_state(tmp_path):
 
 def test_latest_run_prefers_active_pointer(tmp_path, monkeypatch):
     runs = tmp_path / "runs"
-    monkeypatch.setattr(_common, "RUNS_DIR", runs)
+    monkeypatch.setenv(RUNS_DIR_ENV, str(runs))
     older = create_run("SDR", display="old", run_dir=runs / "older")
     newer = create_run("SDR", display="new", run_dir=runs / "newer")
     (runs / "active.json").write_text('{"run":"' + str(older.root).replace("\\", "\\\\") + '"}', encoding="utf-8")

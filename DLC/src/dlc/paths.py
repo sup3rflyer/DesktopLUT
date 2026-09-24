@@ -41,6 +41,22 @@ RUNS_DIR = PROJECT_DIR / "runs"
 PROFILES_DIR = PROJECT_DIR / "profiles"
 THIRD_PARTY_DIR = PROJECT_DIR / "third_party"
 
+# Overrides the runs root (new run folders + the dashboard's ``active.json`` pointer).
+# The test suite points it at a tmp dir for every test, so it never touches the real one.
+RUNS_DIR_ENV = "DLC_RUNS_DIR"
+
+
+def runs_dir() -> Path:
+    """The runs root: ``$DLC_RUNS_DIR`` when set, else the project's ``runs/`` (:data:`RUNS_DIR`).
+
+    Resolved at CALL time, never bound at import — code that needs the runs root must call
+    this, not import :data:`RUNS_DIR`, or the override silently stops applying to it (that is
+    how the suite used to write run folders and ``active.json`` into the real ``runs/``).
+    Always absolute: run paths derived from it are sent to DesktopLUT.exe over the pipe.
+    """
+    override = os.environ.get(RUNS_DIR_ENV)
+    return Path(override).resolve() if override else RUNS_DIR
+
 
 def argyll_bin_dir() -> Path:
     return THIRD_PARTY_DIR / "argyll" / "3.3.0" / "bin"

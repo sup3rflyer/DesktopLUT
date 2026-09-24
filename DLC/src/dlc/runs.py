@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .events import EventWriter
-from .paths import RUNS_DIR, atomic_write_text
+from .paths import atomic_write_text, runs_dir
 
 
 @dataclass
@@ -106,7 +106,7 @@ def create_run(mode: str, display: str | None = None, run_dir: Path | None = Non
     # The run root MUST be absolute: paths derived from it (e.g. the generated 3D-LUT cube)
     # are sent over the IPC pipe to DesktopLUT.exe, a SEPARATE process with its own working
     # directory — a relative path would resolve against DesktopLUT's cwd and not be found.
-    root = (run_dir or RUNS_DIR / name).resolve()
+    root = (run_dir or runs_dir() / name).resolve()
     ctx = RunContext(root=root, manifest=RunManifest(name=name, mode=mode, display=display))
     ctx.ensure_dirs()
     ctx.save()

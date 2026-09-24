@@ -12,18 +12,19 @@ import argparse
 import webbrowser
 from pathlib import Path
 
-from ..paths import RUNS_DIR
+from ..paths import runs_dir
 from .server import serve
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dlc-dashboard",
                                      description="Live mission-control dashboard for a DLC run.")
+    default_runs_dir = runs_dir()
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--run", type=Path, default=None,
                        help="Watch one run folder (or its events.jsonl) instead of following active.json.")
-    group.add_argument("--runs-dir", type=Path, default=RUNS_DIR,
-                       help=f"Runs root to follow via active.json (default: {RUNS_DIR}).")
+    group.add_argument("--runs-dir", type=Path, default=default_runs_dir,
+                       help=f"Runs root to follow via active.json (default: {default_runs_dir}).")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default 8765).")
     parser.add_argument("--open", action="store_true", help="Open the dashboard in a browser.")
