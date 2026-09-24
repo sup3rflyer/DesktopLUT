@@ -1380,6 +1380,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_tetrahedralInterp = (SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             SaveSettings();
             return 0;
+        case ID_HDR_DITHER_CHECK:
+            // Live: the overlay re-reads it at its next constant-buffer write; the hook via the shared config.
+            g_hdrDither = (SendMessage(g_gui.hwndHdrDitherCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SaveSettings();
+            UpdateDwmHookSharedConfig();
+            return 0;
 
         // Tonemapping controls (HDR only)
         // In hook mode, tonemap is handled by DwmHook.dll via shared memory.

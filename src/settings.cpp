@@ -843,6 +843,7 @@ void SaveSettings() {
     // Save general settings
     // DesktopGamma is now per-monitor (MHCDesktopGamma in each monitor section) — not saved globally
     WritePrivateProfileBool(L"General", L"TetrahedralInterp", g_tetrahedralInterp.load(), iniPath.c_str());
+    WritePrivateProfileBool(L"General", L"HdrDither", g_hdrDither.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"LogPeakDetection", g_logPeakDetection.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ConsoleLog", g_consoleEnabled.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"ShowFrameTiming", g_showFrameTiming.load(), iniPath.c_str());
@@ -887,6 +888,7 @@ void LoadSettings() {
     // Load general settings
     // DesktopGamma is now per-monitor (derived from MHCDesktopGamma after monitors load below)
     g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", false, iniPath.c_str()));
+    g_hdrDither.store(GetPrivateProfileBool(L"General", L"HdrDither", true, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
     g_showFrameTiming.store(GetPrivateProfileBool(L"General", L"ShowFrameTiming", false, iniPath.c_str()));

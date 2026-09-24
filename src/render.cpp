@@ -14,6 +14,7 @@
 #include "mhc.h"
 #include "gui_mhc.h"
 #include "fald.h"
+#include "../shared/hdr_dither.h"  // DlutHdrDitherLsb
 #include "../shared/peak_detect.h"
 #include <dwmapi.h>
 #include <avrt.h>
@@ -342,7 +343,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // to ensure retries on Map failure
     bool curGamma = g_desktopGammaMode.load();
     bool curTetrahedral = g_tetrahedralInterp.load();
-    if (curGamma != ctx->lastDesktopGamma || curTetrahedral != ctx->lastTetrahedralInterp) {
+    bool curHdrDither = g_hdrDither.load();
+    if (curGamma != ctx->lastDesktopGamma || curTetrahedral != ctx->lastTetrahedralInterp
+        || curHdrDither != ctx->lastHdrDither) {
         ctx->cbDirty = true;
     }
 
@@ -503,7 +506,12 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             cbData[129] = 0.0f;
         }
         cbData[130] = useICtCp ? 1.0f : 0.0f;  // grayscaleICtCp
-        cbData[131] = 0.0f;  // reserved
+        // HDR output dither after the LUT (shared/hdr_dither.h): +-1 LSB of 10-bit PQ, TPDF; 0 = off
+        // Processing = LUT, tonemap, or a shader correction (primaries / grayscale / WB / desktop gamma).
+        cbData[131] = DlutHdrDitherLsb(ctx->isHDREnabled,
+                                       cbData[6] < 0.5f || cbData[10] > 0.5f || cbData[7] > 0.5f
+                                           || cbData[9] > 0.5f || cbData[4] > 0.5f,
+                                       g_hdrDither.load());
         // Rows 33-35 (cbData[132..143]): SDR grayscale FULL-PREVIEW matrix + flags (realization A).
         // Active SDR only; when off, the flag (.w of row0) is 0 and the shader ignores this block.
         bool corrGsFullPreview = ctx->corrGsFullPreviewActive.load() && !ctx->isHDREnabled;
@@ -528,6 +536,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         ctx->cbDirty = false;
         ctx->lastDesktopGamma = curGamma;
         ctx->lastTetrahedralInterp = curTetrahedral;
+        ctx->lastHdrDither = curHdrDither;
     }
     } // end if cbDirty
 

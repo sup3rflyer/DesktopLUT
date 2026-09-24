@@ -110,6 +110,7 @@ extern int g_numBeaconColors;
 extern unsigned int g_beaconActive;      // host is showing the beacon windows
 extern unsigned int g_beaconGeneration;  // increments per beacon session
 extern unsigned int g_beaconSize;        // beacon square edge, device pixels
+extern unsigned int g_hdrDitherOff;      // 1 = host turned the HDR output dither off
 void ReleaseBeaconProbes();              // staging textures (UninitializeStuff)
 
 // Monitor state functions

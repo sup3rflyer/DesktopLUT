@@ -79,6 +79,7 @@ extern std::mutex g_monitorsMutex; // Protects g_monitors structure (push_back/c
 
 extern std::atomic<bool> g_desktopGammaMode;   // Effective gamma state (may be overridden by whitelist)
 extern std::atomic<bool> g_tetrahedralInterp;  // true = tetrahedral, false = trilinear
+extern std::atomic<bool> g_hdrDither;          // true = HDR output dither on (overlay + DWM hook)
 extern std::atomic<bool> g_running;            // Main loop control
 extern std::atomic<bool> g_forceReinit;        // Force reinit on next frame
 extern std::atomic<bool> g_forceMhcReapply;    // Force MHC profile reapply on next reinit (sleep/wake, TDR)

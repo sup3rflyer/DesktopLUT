@@ -186,6 +186,9 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK((reinterpret_cast<uintptr_t>(&ex.head.version) - base) == 0);
     CHECK((reinterpret_cast<uintptr_t>(&ex.head.faldFlags[0]) - base) == 16 + 48 * MAX_DWM_HOOK_MONITORS + 12);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail) - base) == 464);
+    // the HDR dither kill switch came out of the head's _reserved: first of the five words (0 = dither on)
+    CHECK(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * 4);
+    CHECK(offsetof(DwmHookSharedConfig, _reserved) == 464 - 4 * 4);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[0]) - base) == 464 + 16);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1]) - base) == 464 + 16 + 128);
     CHECK(sizeof(DwmHookFaldTuning) == 128);

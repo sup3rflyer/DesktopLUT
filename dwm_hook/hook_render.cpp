@@ -1277,7 +1277,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			float pqTargetPeak;
 			int tonemapDynamic;
 			int hasLut;
-			float pad1;
+			float hdrDitherLsb;
 			float pad2;
 		} cb;
 		static_assert(sizeof(cb) == 48, "Constant buffer size must match ByteWidth=48 in InitializeStuff");
@@ -1304,7 +1304,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			cb.pqSourcePeak = tmEnabled ? tp->pqSourcePeak : 0.0f;
 		}
 		cb.hasLut = lut ? 1 : 0;
-		cb.pad1 = 0.0f;
+		// HDR output dither (shared/hdr_dither.h): +-1 LSB of 10-bit PQ, TPDF, after the LUT. HDR only — the
+		// legacy SDR path keeps its OrderedDither, ACM has none yet.
+		cb.hdrDitherLsb = DlutHdrDitherLsb(colorMode == 1, lut != nullptr || tmEnabled, !g_hdrDitherOff);
 		cb.pad2 = 0.0f;
 
 		// Diagnostic: log tonemap CB state only when values change FOR THIS MONITOR.
@@ -1686,6 +1688,7 @@ static void ResolveProvisionalContexts() {
 BeaconColor g_beaconColors[16] = {};
 int g_numBeaconColors = 0;
 unsigned int g_beaconActive = 0, g_beaconGeneration = 0, g_beaconSize = 0;
+unsigned int g_hdrDitherOff = 0;  // host's HDR output dither kill switch (DwmHookSharedConfig::hdrDitherOff)
 
 struct BeaconProbe {
 	void* context;

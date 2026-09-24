@@ -124,6 +124,7 @@
     <ClCompile Include="tests\test_fald.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
+    <ClCompile Include="tests\test_hdr_dither.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

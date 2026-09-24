@@ -866,6 +866,28 @@ DisplayIdentity AsusId() {
 }
 }  // namespace
 
+TEST_CASE("LoadSettings/SaveSettings: [General] HdrDither defaults on and round-trips") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    WritePrivateProfileStringW(L"General", L"StartMinimized", L"false", ini);   // an INI without the key
+    g_hdrDither = false;
+    LoadSettings();
+    CHECK(g_hdrDither.load() == true);                  // absent -> on (the new dither is the default)
+    g_hdrDither = false;
+    SaveSettings();
+    wchar_t buf[16] = {};
+    GetPrivateProfileStringW(L"General", L"HdrDither", L"", buf, 16, ini);
+    CHECK(std::wstring(buf) == L"false");
+    g_hdrDither = true;
+    LoadSettings();
+    CHECK(g_hdrDither.load() == false);                 // the kill switch survives a restart
+    g_hdrDither = true;
+}
+
 TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sections once matched") {
     AppIniGuard guard;
     if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }

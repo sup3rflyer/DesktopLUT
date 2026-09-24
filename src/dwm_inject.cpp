@@ -1185,6 +1185,7 @@ void UpdateDwmHookSharedConfig()
     cfg.beaconActive = beacon ? 1u : 0u;
     cfg.beaconGeneration = g_hookBeaconGeneration.load();
     cfg.beaconSize = DWM_HOOK_BEACON_SIZE;
+    cfg.hdrDitherOff = g_hdrDither.load() ? 0u : 1u;
 
     // Use cached DXGI monitor info (refreshed on inject and WM_DISPLAYCHANGE)
     const auto& mons = EnumerateDxgiMonitors();
