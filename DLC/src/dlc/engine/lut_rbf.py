@@ -21,6 +21,7 @@ dependency (charts are a later renderer on the same data).
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -94,10 +95,52 @@ def _near_black_signal(model: DisplayErrorModel, nits: float = 0.1) -> float:
     return float((nits / space.peak_nits) ** (1.0 / model.target.gamma))
 
 
+def project_to_top(signals: np.ndarray, top: float, *, transfer: str = "pq") -> np.ndarray:
+    """Scale each signal in LINEAR light so its brightest channel sits exactly at ``top``.
+
+    The luminance clip of the top hold: channel RATIOS in linear light (hence the target-space
+    chromaticity) are preserved and only the level drops to the calibrated top. ``transfer`` is
+    the target's (``'pq'`` → ST 2084, ``'power'`` → pure γ, where this is a plain radial scale,
+    independent of γ).
+    Rows whose max channel is already ≤ ``top`` are returned unchanged."""
+    s = np.clip(np.asarray(signals, dtype=float).reshape(-1, 3), 0.0, 1.0)
+    mx = np.max(s, axis=1)
+    over = mx > top
+    out = s.copy()
+    if not np.any(over):
+        return out
+    if transfer == "pq":
+        import colour
+        lin = colour.models.eotf_ST2084(s[over])                  # nits
+        lin_top = float(colour.models.eotf_ST2084(np.array([top]))[0])
+        k = lin_top / np.maximum(np.max(lin, axis=1), 1e-12)
+        proj = colour.models.eotf_inverse_ST2084(lin * k[:, None])
+        proj = np.where(s[over] > 0.0, proj, 0.0)                 # PQ⁻¹(0) ≈ 7e-7: keep off channels OFF
+    else:
+        proj = s[over] * (top / mx[over])[:, None]
+    proj = np.minimum(proj, top)                                  # float dust on the brightest channel
+    out[over] = proj
+    return out
+
+
+def hold_lattice_level(top: Optional[float], grid_size: int) -> Optional[float]:
+    """The lattice level the top hold actually starts from: the first grid level at/above the
+    calibrated ``top``. The corners of the cell that STRADDLES the top keep their own corrections
+    — in-range inputs in that last partial cell interpolate toward them, so holding them would
+    compress the calibrated range's top (run 120740 CV: tube mean 0.81 → 0.90 dE_ITP from exactly
+    that) — and every node beyond takes the held value. ``None`` when there is nothing to hold."""
+    if top is None or not (0.0 < top < 1.0):
+        return None
+    level = math.ceil(top * (grid_size - 1) - 1e-9) / (grid_size - 1)
+    return level if level < 1.0 else None
+
+
 def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarray,
                *, fade_width: float = 0.05, max_correction: float = 0.05,
                n_iterations: int = 3, convergence_tol: float = 1e-6,
-               near_black_nits: float = 0.1, neutral_band: float = 0.05) -> np.ndarray:
+               near_black_nits: float = 0.1, neutral_band: float = 0.05,
+               hold_above: Optional[float] = None, best_iterate: bool = False,
+               best_iterate_margin: float = 2.0) -> np.ndarray:
     """Build a ``(grid_size, grid_size, grid_size, 3)`` corrected LUT.
 
     Indexed ``lut[b, g, r]`` (B slowest, R fastest) — the order :func:`write_cube`
@@ -105,6 +148,27 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
 
     ``signal_points`` are the measurement coordinates; their convex hull bounds
     where full correction applies (smoothstep fade to identity beyond it).
+
+    ``hold_above`` (the calibrated TOP signal, e.g. the HDR patch cap; owner policy 2026-09-23 —
+    "clamp to confirmed gamut edges" replaces "fade to identity"): every node beyond the top takes
+    the corrected output of its linear-light projection onto the top (:func:`project_to_top`)
+    instead of fading to identity outside the measured hull. A colour above the calibrated range
+    therefore renders as the confirmed colour at the top — its corrected hue held, its luminance
+    clipped (the node outputs exactly what the top surface outputs, correction included). The hold starts at
+    the first lattice level at/above the top (:func:`hold_lattice_level`): the straddling cell's
+    corners keep their own corrections, so the calibrated range's interpolation is untouched. The
+    projected points are solved by the SAME per-node model inversion as the grid. The neutral-band
+    fade still applies on the held nodes, but toward the node's luminance-clipped IDENTITY: the
+    cube adds no colour correction on the grey axis (the MHC stays its sole colour owner, 1+1+1);
+    the only thing it does there is the same luminance clip the MHC's own top hold applies.
+    ``None`` (or ≥ 1) ⇒ the legacy hull fade everywhere.
+
+    ``best_iterate``: on nodes whose target the reachable-gamut clamp moved (out-of-gamut targets),
+    replace the last inversion iterate with the MODEL-best one (identity included) when the last is
+    worse by more than ``best_iterate_margin`` dE_ITP — a divergence guard, see the loop. In-gamut
+    nodes are unaffected. Run 120740 CV: margin 0 keeps every best iterate (OOG 8.75) but doubles
+    the in-range own-axis reversals (76 -> 189); margin 2 keeps most of the gain (OOG 8.88,
+    primaries 11.6) at 94 reversals. ``False`` ⇒ the legacy last-iterate behaviour (bit-identical).
     """
     space = model.space
     signal_points = np.asarray(signal_points, dtype=float)
@@ -112,39 +176,94 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
     axis = np.linspace(0.0, 1.0, grid_size)
     B, G, R = np.meshgrid(axis, axis, axis, indexing="ij")
     grid = np.stack([R.ravel(), G.ravel(), B.ravel()], axis=1)
-    n_points = grid.shape[0]
+    n_grid = grid.shape[0]
+
+    held = np.zeros(n_grid, dtype=bool)
+    proj = np.zeros((0, 3))
+    level = hold_lattice_level(hold_above, grid_size)
+    if level is not None:
+        held = np.max(grid, axis=1) > level + 1e-9
+        proj = project_to_top(grid[held], level, transfer=model.target.transfer)
+    # Solve the grid nodes and the held nodes' projections together (per-point independent).
+    points = np.vstack([grid, proj])
+    n_points = points.shape[0]
 
     # Convex-hull fade weights (0 inside measured gamut → 1 well outside).
-    hull_dist = compute_hull_distance(grid, signal_points)
+    hull_dist = compute_hull_distance(points, signal_points)
     fade_range = 2 * fade_width
     fade_weight = np.zeros(n_points)
     outside = hull_dist > 0
     if np.any(outside) and fade_range > 0:
         fade_weight[outside] = smoothstep(hull_dist[outside] / fade_range)
 
-    target_ictcp = space.ideal_ictcp(grid)  # constant across iterations
-    corrected = grid.copy()
+    target_ictcp = space.ideal_ictcp(points)  # constant across iterations
+    corrected = points.copy()
 
+    delta = model.predict(corrected)
+    guard = np.zeros(n_points, dtype=bool)
+    if best_iterate:
+        # Best-iterate guard on OUT-OF-GAMUT-target nodes: the fixed-point step below is not
+        # monotone at a gamut corner — a later iterate can wander into a sparsely-measured region
+        # where the model's extrapolation is unphysical and be WORSE by the model's own prediction
+        # (run 120740, pure blue at 0.6875 under the vertex target: iterate 1 = blue dimmed to
+        # 0.6458, model dE_ITP 1.6; iterates 2-3 add red at the full budget, model dE 32). Each
+        # iterate's predicted dE costs nothing extra (the delta at it is needed for the next step
+        # anyway); on the nodes whose target the reachable-gamut clamp MOVED, keep the iterate the
+        # model scores best (identity included). In-gamut nodes keep the last iterate: held-out CV
+        # showed the guard there trades a little core accuracy (model-optimism on well-conditioned
+        # nodes) for nothing. Nodes below the near-black knee are excluded too — the model's dE
+        # there is extrapolation noise (the choice moved sub-0.02-nit greys in the CV), and the
+        # near-black blend returns them toward identity regardless.
+        raw_target = model.forward_ictcp(points, np.zeros_like(target_ictcp))
+        guard = (np.any(np.abs(raw_target - target_ictcp) > 1e-9, axis=1)
+                 & (np.max(points, axis=1) >= _near_black_signal(model, near_black_nits)))
+        best_corrected = corrected.copy()
+        de_last = de_itp(model.forward_ictcp(corrected, delta) - target_ictcp)
+        best_de = de_last.copy()
     for _it in range(n_iterations):
         # display produces ideal(corrected)+delta(corrected); we want that to
         # equal ideal(input) → ideal(corrected) should be target - delta.
-        delta = model.predict(corrected)
         desired_ictcp = target_ictcp - delta
         corrected_new = space.xyz_to_signal(space.ictcp_to_xyz(desired_ictcp))
         corrected_new = np.nan_to_num(corrected_new, nan=0.0)
 
-        correction = soft_clamp(corrected_new - grid, max_correction)
-        corrected_new = np.clip(grid + correction, 0.0, 1.0)
+        correction = soft_clamp(corrected_new - points, max_correction)
+        corrected_new = np.clip(points + correction, 0.0, 1.0)
 
         w = fade_weight[:, np.newaxis]
-        corrected_new = (1 - w) * corrected_new + w * grid
+        corrected_new = (1 - w) * corrected_new + w * points
 
         inside = ~outside
         convergence = (np.max(np.abs(corrected_new[inside] - corrected[inside]))
                        if np.any(inside) else 0.0)
         corrected = corrected_new
+        if best_iterate or (_it + 1 < n_iterations and convergence >= convergence_tol):
+            delta = model.predict(corrected)
+        if best_iterate:
+            de_last = de_itp(model.forward_ictcp(corrected, delta) - target_ictcp)
+            better = de_last < best_de
+            best_corrected[better] = corrected[better]
+            best_de[better] = de_last[better]
         if convergence < convergence_tol:
             break
+    if best_iterate:
+        # Swap only a genuine divergence: a guarded node whose last iterate the model scores worse
+        # than its best by more than ``best_iterate_margin`` (dE_ITP). Small oscillations keep the
+        # last iterate, so neighbouring nodes don't land on different iterates for nothing (that
+        # roughens the lattice — more own-axis reversals — without an accuracy gain).
+        swap = guard & (de_last - best_de > best_iterate_margin)
+        corrected = np.where(swap[:, None], best_corrected, corrected)
+
+    # Identity reference per grid node: the node itself, or — for a held node — its
+    # luminance-clipped projection (what "no colour correction" means above the top).
+    identity = grid.copy()
+    if np.any(held):
+        identity[held] = proj
+        corrected_grid = corrected[:n_grid].copy()
+        corrected_grid[held] = corrected[n_grid:]
+        corrected = corrected_grid
+    else:
+        corrected = corrected[:n_grid]
 
     # Black-point preservation + near-black blend toward identity.
     corrected[0] = [0.0, 0.0, 0.0]
@@ -153,7 +272,7 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
     dark = (max_channel > 0) & (max_channel < black_threshold)
     if np.any(dark):
         t = smoothstep(max_channel[dark] / black_threshold)[:, np.newaxis]
-        corrected[dark] = (1 - t) * grid[dark] + t * corrected[dark]
+        corrected[dark] = (1 - t) * identity[dark] + t * corrected[dark]
 
     # Neutral-axis preservation (1+1+1: the MHC ICC owns the grey/white axis; the cube owns colour
     # ONLY). Fade the correction to identity as the INPUT node nears the grey diagonal (R==G==B), by
@@ -162,12 +281,13 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
     # 0.99→4.56 / grayscale 1.18→1.62 regression: the model PREDICTS a neutral correction helps, but
     # it does not stack additively on the MHC's already-D65 neutral, so on the panel it hurts). Colour
     # nodes (saturation outside the band) keep their correction vectors bit-for-bit. ``0`` ⇒ off.
+    # (Held nodes fade toward their luminance-clipped identity — see ``hold_above``.)
     if neutral_band > 0:
         mx = np.max(grid, axis=1)
         mn = np.min(grid, axis=1)
         sat = np.where(mx > 1e-9, (mx - mn) / np.maximum(mx, 1e-9), 0.0)
         tn = smoothstep(sat / neutral_band)[:, np.newaxis]   # 0 on the diagonal → 1 outside the band
-        corrected = grid + tn * (corrected - grid)
+        corrected = identity + tn * (corrected - identity)
 
     return corrected.reshape(grid_size, grid_size, grid_size, 3)
 
@@ -212,12 +332,24 @@ class CubeDiagnostics:
                 "correction_max": self.correction_max}
 
 
-def cube_diagnostics(lut: np.ndarray, *, large_reversal_threshold: float = 0.008) -> CubeDiagnostics:
-    """Monotonicity + correction-smoothness stats — the integrity digest."""
+def cube_diagnostics(lut: np.ndarray, *, large_reversal_threshold: float = 0.008,
+                     in_range_level: Optional[float] = None) -> CubeDiagnostics:
+    """Monotonicity + correction-smoothness stats — the integrity digest.
+
+    ``in_range_level`` (the top hold's :func:`hold_lattice_level`): judge only the CALIBRATED
+    sub-lattice (every node with all channels ≤ that level). Above it the top hold replicates the
+    top-surface correction along each ray — its luminance clip reads as a large "correction" and
+    any roughness of the top surface is counted once per held layer — so whole-lattice numbers stop
+    describing the calibration. ``None`` ⇒ the whole lattice (unchanged)."""
     grid_size = lut.shape[0]
     axis = np.linspace(0.0, 1.0, grid_size)
     B, G, R = np.meshgrid(axis, axis, axis, indexing="ij")
     identity = np.stack([R, G, B], axis=-1)
+    if in_range_level is not None:
+        k = int(round(in_range_level * (grid_size - 1))) + 1
+        if 1 < k < grid_size:
+            lut = lut[:k, :k, :k]
+            identity = identity[:k, :k, :k]
     correction = lut - identity
 
     mags = np.concatenate([

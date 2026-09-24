@@ -93,20 +93,37 @@ class Target:
     gamma: float = 2.2
     peak_nits: float = 10000.0
     white_xy: Optional[tuple[float, float]] = None
+    # How a target OUTSIDE the panel's measured native gamut is mapped when a TargetSpace is given
+    # ``reachable_primaries`` (see :data:`OOG_MAPPINGS`). Part of the target definition so every
+    # TargetSpace built from one Target (optimizer build, model, verify) agrees. (Patch SAMPLING stays
+    # on the legacy projection by design — patch_sets._project_and_thin.)
+    oog_mapping: str = "vertex"
 
     @classmethod
-    def hdr_rec2020_pq(cls, white_xy: Optional[tuple[float, float]] = None) -> "Target":
+    def hdr_rec2020_pq(cls, white_xy: Optional[tuple[float, float]] = None,
+                       oog_mapping: str = "vertex") -> "Target":
         # The PQ container is ALWAYS 10000 nits regardless of the display's peak — the display
         # peak bounds the patch set (`_patch_max_cv`), not the encoding. (There used to be a
         # `peak_nits` parameter here; it was silently discarded — callers passing e.g. 1600 had
         # no effect — so it was removed. Don't re-add it expecting it to change the container.)
-        return cls("ITU-R BT.2020", "pq", peak_nits=10000.0, white_xy=white_xy)
+        return cls("ITU-R BT.2020", "pq", peak_nits=10000.0, white_xy=white_xy,
+                   oog_mapping=oog_mapping)
 
     @classmethod
     def sdr_srgb_power(cls, gamma: float = 2.2, white_nits: float = 120.0,
-                       white_xy: Optional[tuple[float, float]] = None) -> "Target":
+                       white_xy: Optional[tuple[float, float]] = None,
+                       oog_mapping: str = "vertex") -> "Target":
         return cls("sRGB", "power", gamma=gamma, peak_nits=white_nits,
-                   white_xy=white_xy)
+                   white_xy=white_xy, oog_mapping=oog_mapping)
+
+
+# Out-of-gamut target policies for a gamut-aware TargetSpace (``reachable_primaries`` given):
+#   "vertex"      — owner policy 2026-09-23 (DEFAULT): clamp to the CONFIRMED native gamut edges with
+#                   LUMINANCE (CIE Y) preserved, target primaries/secondaries landing on the panel's
+#                   measured native primaries/secondaries (:func:`_vertex_map_to_gamut`).
+#   "chroma-clip" — the prior #C3 constant-ICtCp-intensity, constant-ICtCp-hue chroma clip
+#                   (:func:`_chroma_clip_to_gamut`), kept bit-identical for A/B and rollback.
+OOG_MAPPINGS = ("vertex", "chroma-clip")
 
 
 def _native_colourspace(primaries: Any, white_xy: tuple[float, float]) -> "colour.RGB_Colourspace":
@@ -162,6 +179,154 @@ def _chroma_clip_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace",
     return out
 
 
+# ---------------------------------------------------------------------------
+# Vertex-correspondence OOG mapping (owner policy 2026-09-23)
+# ---------------------------------------------------------------------------
+
+def _xy_to_uv(xy: np.ndarray) -> np.ndarray:
+    """CIE 1931 xy → CIE 1976 u'v' (rows)."""
+    xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+    den = -2.0 * xy[:, 0] + 12.0 * xy[:, 1] + 3.0
+    return np.stack([4.0 * xy[:, 0] / den, 9.0 * xy[:, 1] / den], axis=1)
+
+
+def _uv_to_xy(uv: np.ndarray) -> np.ndarray:
+    uv = np.asarray(uv, dtype=float).reshape(-1, 2)
+    den = 6.0 * uv[:, 0] - 16.0 * uv[:, 1] + 12.0
+    return np.stack([9.0 * uv[:, 0] / den, 4.0 * uv[:, 1] / den], axis=1)
+
+
+def _xyz_to_uv(xyz: np.ndarray) -> np.ndarray:
+    xyz = np.asarray(xyz, dtype=float).reshape(-1, 3)
+    den = xyz[:, 0] + 15.0 * xyz[:, 1] + 3.0 * xyz[:, 2]
+    den = np.where(np.abs(den) > 1e-300, den, 1e-300)
+    return np.stack([4.0 * xyz[:, 0] / den, 9.0 * xyz[:, 1] / den], axis=1)
+
+
+def _ray_exit(origin: np.ndarray, dirs: np.ndarray, tri: np.ndarray) -> np.ndarray:
+    """Distance from ``origin`` (inside the triangle ``tri``, (3,2)) along each unit direction in
+    ``dirs`` (N,2) to the triangle boundary."""
+    t = np.full(len(dirs), np.inf)
+    for k in range(3):
+        a = tri[k]
+        e = tri[(k + 1) % 3] - a
+        rhs = a - origin
+        det = dirs[:, 1] * e[0] - dirs[:, 0] * e[1]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tk = (rhs[1] * e[0] - rhs[0] * e[1]) / det
+            sk = (dirs[:, 0] * rhs[1] - dirs[:, 1] * rhs[0]) / det
+        ok = np.isfinite(tk) & (tk > 0.0) & (sk >= -1e-9) & (sk <= 1.0 + 1e-9)
+        t = np.where(ok, np.minimum(t, tk), t)
+    return t
+
+
+class _VertexGeometry:
+    """Precomputed u'v' geometry of the target and native gamut triangles around their SHARED white:
+    both triangles, the white, and the six hue anchors (R, Y, G, C, B, M — primaries and the
+    white-balanced two-channel secondaries) of each gamut, as unwrapped angles."""
+
+    def __init__(self, native: "colour.RGB_Colourspace", target_cs: "colour.RGB_Colourspace"):
+        self.white = _xy_to_uv(np.asarray(native.whitepoint, dtype=float))[0]
+        self.tri_native = _xy_to_uv(np.asarray(native.primaries, dtype=float))
+        self.tri_target = _xy_to_uv(np.asarray(target_cs.primaries, dtype=float))
+        a_t = self._anchor_angles(target_cs)
+        a_n = self._anchor_angles(native)
+        base = a_t[0]
+        at = np.mod(a_t - base, 2.0 * np.pi)
+        an = at + (np.mod(a_n - a_t + np.pi, 2.0 * np.pi) - np.pi)
+        ordered = (np.all(np.diff(at) > 0.0) and at[-1] < 2.0 * np.pi
+                   and np.all(np.diff(an) > 0.0) and an[-1] < an[0] + 2.0 * np.pi)
+        # A degenerate / oppositely-wound gamut can't be put in vertex correspondence: fall back to
+        # the pure radial (toward-white) clip onto the native boundary (still luminance-preserving).
+        self.anchored = bool(ordered)
+        self.base = float(base)
+        self.anchor_target = np.append(at, 2.0 * np.pi)
+        self.anchor_native = np.append(an, an[0] + 2.0 * np.pi)
+
+    def _anchor_angles(self, cs: "colour.RGB_Colourspace") -> np.ndarray:
+        cols = np.asarray(cs.matrix_RGB_to_XYZ, dtype=float).T        # rows: XYZ of R, G, B
+        r, g, b = cols
+        pts = np.array([r, r + g, g, g + b, b, r + b])                # R, Y, G, C, B, M
+        d = _xyz_to_uv(pts) - self.white
+        return np.arctan2(d[:, 1], d[:, 0])
+
+    def hue_offset(self, theta: np.ndarray) -> np.ndarray:
+        """Angle offset that carries a TARGET-boundary hue to its corresponding NATIVE-boundary hue
+        (piecewise linear between the six anchors)."""
+        if not self.anchored:
+            return np.zeros_like(theta)
+        th = np.mod(theta - self.base, 2.0 * np.pi)
+        return np.interp(th, self.anchor_target, self.anchor_native) - th
+
+
+def _vertex_map_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace", scale: float,
+                         geom: _VertexGeometry, *, rel_eps: float = 1e-5) -> np.ndarray:
+    """Clamp absolute-XYZ targets onto the panel's CONFIRMED native gamut edges — the owner's
+    2026-09-23 policy (replaces the constant-ICtCp-hue chroma clip as the default).
+
+    * **In-gamut targets are returned bit-identical.** A target is out of gamut when its native-RGB
+      coordinates go negative (a chromaticity outside the measured triangle); the test is RELATIVE
+      to the colour's own magnitude, so a dim out-of-gamut target is caught as surely as a bright one.
+    * **Luminance (CIE Y) is preserved exactly** — the mapping only moves chromaticity, never trades
+      luminance for an unreachable chroma — except where the mapped colour would need more than the
+      container's full scale on a native channel (HDR: only near 10000 nits, ~0.99+ signal, never
+      at a patch-capped level), where the legacy per-channel safety clip applies and dims it. (The old ICtCp clip held ICtCp *I*, which for Rec.2020 blue
+      moved the target to xy (0.155, 0.138) at +34 % Y: a green-contaminated, brighter "blue" the
+      optimizer then chased by darkening blue and adding green at the full correction budget.)
+    * **Vertex correspondence.** Working in CIE 1976 u'v' around the shared white, an out-of-gamut
+      chromaticity at hue angle θ and radius r lands on the native triangle's boundary at angle
+      ``θ + u·Δ(θ)``, where ``u = (r - r_native(θ)) / (r_target(θ) - r_native(θ))`` is how far out it
+      sits between the native and target boundaries (0 just outside the native edge, 1 on the target
+      edge) and ``Δ`` is the piecewise-linear hue-sector map that carries the target's six anchors
+      (R, Y, G, C, B, M) onto the panel's measured ones. So a Rec.2020 primary/secondary ramp maps
+      onto the panel's native primary/secondary at the target luminance (no second channel added),
+      a target just outside a native edge is clipped straight toward white (continuous with the
+      untouched interior), and in between the landing point slides smoothly along the edge.
+
+    u'v' rather than xy: projectively equivalent (the gamuts stay triangles, rays stay straight) but
+    closer to perceptually uniform for the hue-sector interpolation. Straight rays + explicit anchors
+    avoid ICtCp's curved blue hue line entirely. ``scale`` normalizes absolute XYZ to the native
+    colour-space's [0, 1] domain (10000 for PQ, peak nits for power), as in :func:`_chroma_clip_to_gamut`.
+    """
+    xyz_abs = np.asarray(xyz_abs, dtype=float)
+    out = xyz_abs.copy()
+    rgb = colour.XYZ_to_RGB(xyz_abs / scale, native)
+    mag = np.max(np.abs(rgb), axis=1)
+    chroma_oog = (mag > 0.0) & (np.min(rgb, axis=1) < -rel_eps * mag)
+    # Inside the triangle but beyond the container's full scale (only reachable near 10000 nits):
+    # the same per-channel safety clip the legacy clamp applies.
+    over = ~chroma_oog & (np.max(rgb, axis=1) > 1.0 + 1e-4)
+    if np.any(over):
+        out[over] = colour.RGB_to_XYZ(np.clip(rgb[over], 0.0, 1.0), native) * scale
+    if not np.any(chroma_oog):
+        return out
+    src = xyz_abs[chroma_oog]
+    lum = src[:, 1]
+    d = _xyz_to_uv(src) - geom.white
+    r = np.hypot(d[:, 0], d[:, 1])
+    r_safe = np.where(r > 1e-12, r, 1e-12)
+    dirs = d / r_safe[:, None]
+    theta = np.arctan2(d[:, 1], d[:, 0])
+    r_nat = _ray_exit(geom.white, dirs, geom.tri_native)
+    r_tgt = _ray_exit(geom.white, dirs, geom.tri_target)
+    span = r_tgt - r_nat
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = np.where(span > 1e-9, np.clip((r - r_nat) / span, 0.0, 1.0), 1.0)
+    theta2 = theta + u * geom.hue_offset(theta)
+    dirs2 = np.stack([np.cos(theta2), np.sin(theta2)], axis=1)
+    uv2 = geom.white + dirs2 * _ray_exit(geom.white, dirs2, geom.tri_native)[:, None]
+    xy2 = _uv_to_xy(uv2)
+    y_safe = np.where(xy2[:, 1] > 1e-12, xy2[:, 1], 1e-12)
+    mapped = np.stack([xy2[:, 0] * lum / y_safe, lum,
+                       (1.0 - xy2[:, 0] - xy2[:, 1]) * lum / y_safe], axis=1)
+    # The landing point is ON the native boundary (one native channel ≈ 0 up to float error); the
+    # clip removes that float dust and, beyond the container's full scale, applies the same
+    # per-channel safety clip as the legacy clamp.
+    rgb2 = np.clip(colour.XYZ_to_RGB(mapped / scale, native), 0.0, 1.0)
+    out[chroma_oog] = colour.RGB_to_XYZ(rgb2, native) * scale
+    return out
+
+
 class TargetSpace:
     """Signal ↔ ideal-XYZ ↔ ICtCp conversions for a :class:`Target`.
 
@@ -170,12 +335,18 @@ class TargetSpace:
 
     ``reachable_primaries`` (optional): the panel's MEASURED native primaries
     (``{"R":[x,y],...}`` from the DIP). When given, an ideal target the panel physically
-    cannot reach is clamped onto the reachable gamut (constant-intensity hue-preserving
-    chroma clip — :func:`_chroma_clip_to_gamut`), so the cube build AND verify treat a gamut
-    clip as a clip rather than chasing it (#C3). ``None`` ⇒ no clamp (the prior behaviour).
+    cannot reach is clamped onto the reachable gamut per ``target.oog_mapping`` — by default
+    the luminance-preserving vertex-correspondence map (:func:`_vertex_map_to_gamut`), or the
+    legacy constant-ICtCp-intensity chroma clip (:func:`_chroma_clip_to_gamut`) — so the cube
+    build AND verify treat a gamut clip as a clip rather than chasing it (#C3). ``None`` ⇒ no
+    clamp (the prior behaviour).
     """
 
     def __init__(self, target: Target, *, reachable_primaries: Any = None):
+        mapping = getattr(target, "oog_mapping", "vertex")
+        if mapping not in OOG_MAPPINGS:
+            raise ValueError(f"unknown oog_mapping {mapping!r} (expected one of {OOG_MAPPINGS})")
+        self.oog_mapping = mapping
         self.target = target
         base = colour.RGB_COLOURSPACES[target.colourspace]
         if target.white_xy is not None:
@@ -193,10 +364,13 @@ class TargetSpace:
         # PQ normalizes XYZ by the 10000-nit container; power by the white luminance.
         self._reach_scale = 10000.0 if target.transfer == "pq" else self.peak_nits
         self._reachable = None
+        self._vertex_geom = None
         if reachable_primaries is not None:
             white = (target.white_xy if target.white_xy is not None
                      else tuple(float(c) for c in self.colourspace.whitepoint))
             self._reachable = _native_colourspace(reachable_primaries, white)
+            if self.oog_mapping == "vertex":
+                self._vertex_geom = _VertexGeometry(self._reachable, self.colourspace)
 
     # -- signal -> ideal absolute XYZ -------------------------------------
     def ideal_xyz(self, signal_rgb: np.ndarray) -> np.ndarray:
@@ -212,7 +386,10 @@ class TargetSpace:
         else:
             raise ValueError(f"unknown transfer: {self.target.transfer!r}")
         if self._reachable is not None:
-            xyz = _chroma_clip_to_gamut(xyz, self._reachable, self._reach_scale)
+            if self._vertex_geom is not None:
+                xyz = _vertex_map_to_gamut(xyz, self._reachable, self._reach_scale, self._vertex_geom)
+            else:
+                xyz = _chroma_clip_to_gamut(xyz, self._reachable, self._reach_scale)
         return xyz.reshape(shape)
 
     # -- absolute XYZ -> signal (inverse of ideal_xyz) --------------------
@@ -280,7 +457,8 @@ def de_itp(delta_ictcp: np.ndarray) -> np.ndarray:
 
 def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
               white_xy: Optional[tuple[float, float]] = None,
-              reachable_primaries: Any = None) -> dict[str, np.ndarray]:
+              reachable_primaries: Any = None,
+              oog_mapping: str = "vertex") -> dict[str, np.ndarray]:
     """Per-patch HDR verify error in ``dE_ITP`` (BT.2124) — the metric the cube already
     converges in, and the right one for HDR (CIEDE2000's Lab is meaningless at 1000+ nit
     absolute luminance). Scores measured absolute XYZ against the **ideal PQ/Rec.2020
@@ -295,9 +473,11 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     boolean mask marking targets the reachable-gamut clamp actually MOVED (the patch is
     scored against the panel's gamut boundary, not the raw target — an "at the gamut
     floor" residual, which summaries must report separately from in-gamut error, §0).
-    All-``False`` when ``reachable_primaries`` is ``None`` (no clamp).
+    All-``False`` when ``reachable_primaries`` is ``None`` (no clamp). ``oog_mapping`` selects the
+    out-of-gamut policy (:data:`OOG_MAPPINGS`) — pass the run's engine-target value so verify
+    scores against the same clamped target the cube was built for.
     """
-    target = Target.hdr_rec2020_pq(white_xy=white_xy)
+    target = Target.hdr_rec2020_pq(white_xy=white_xy, oog_mapping=oog_mapping)
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
     sig = np.asarray(signal_rgb, dtype=float).reshape(-1, 3)
     # Sanitize the measured XYZ BEFORE ICtCp: a dropped/saturated hardware read can be NaN or
@@ -311,14 +491,14 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     ideal_xyz = space.ideal_xyz(sig)
     if reachable_primaries is not None:
         # The clamp gap identifies the frontier patches: re-derive the raw (unclamped) ideal
-        # and mark rows the chroma clip moved. Tolerance is absolute cd/m². A true no-op can
-        # never flag because _chroma_clip_to_gamut returns in-gamut rows BIT-IDENTICAL (it
-        # only rewrites OOG rows) — the gap there is exactly 0. On the other side, its own
-        # eps=1e-4 in-gamut short-circuit makes near-boundary targets exact no-ops too, so
-        # the smallest real clamp gap is discontinuously large (measured ≥ ~0.5 nit across
-        # hue/level sweeps) — 1e-3 sits in the dead zone between 0 and any real clip.
+        # and mark rows the clamp moved. Both policies return in-gamut rows BIT-IDENTICAL (they
+        # only rewrite OOG rows), so the gap there is exactly 0. The tolerance is RELATIVE to the
+        # target's own magnitude: the vertex map catches DIM out-of-gamut targets too (a relative
+        # gamut test), whose absolute move can be far below a nit; the legacy chroma clip's smallest
+        # real gap (≥ ~0.5 nit, its absolute eps short-circuit) clears it trivially.
         raw_ideal = TargetSpace(target).ideal_xyz(sig)
-        gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > 1e-3, axis=1)
+        tol = 1e-9 + 1e-6 * np.sum(np.abs(raw_ideal), axis=1)
+        gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > tol[:, None], axis=1)
     else:
         gamut_clamped = np.zeros(len(sig), dtype=bool)
     delta = space.xyz_to_ictcp(meas) - space.xyz_to_ictcp(ideal_xyz)
@@ -535,6 +715,17 @@ class DisplayErrorModel:
         flat = signal_rgb.reshape(-1, 3)
         out = self.rbf(flat)
         return out.reshape(signal_rgb.shape)
+
+    def forward_ictcp(self, signal_rgb: np.ndarray,
+                      delta: Optional[np.ndarray] = None) -> np.ndarray:
+        """Simulated panel output in **ICtCp** for driven signals (N, 3): the raw ideal plus the
+        predicted error — :meth:`forward` without the XYZ round-trip. ``delta`` may carry an already
+        computed :meth:`predict` at the same signals (the LUT builder reuses it — no extra RBF
+        evaluation)."""
+        signal_rgb = np.asarray(signal_rgb, dtype=float)
+        if delta is None:
+            delta = self.predict(signal_rgb)
+        return self._raw_space.ideal_ictcp(signal_rgb) + delta
 
     def forward(self, signal_rgb: np.ndarray) -> np.ndarray:
         """Simulate the panel: predicted **absolute XYZ** for a driven signal.

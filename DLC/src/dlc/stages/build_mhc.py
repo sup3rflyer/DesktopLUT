@@ -200,10 +200,24 @@ def build(args, ctx: RunContext) -> StageResult:
             wrgb_nonadditive=bool(peak_chroma.get("wrgb_nonadditive")))
         if max_drive is not None:
             peak_chroma["cube_max_drive"] = round(max_drive, 6)
+        # Top hold (owner policy 2026-09-23): seed each channel to ITS OWN post-matrix cap index and
+        # hold it flat above, so the foundation keeps D65 at the cap above the calibrated top. The
+        # rowsums are those of the matrix the orchestrator INSTALLS for HDR — the native-target,
+        # white-only move (measured native primaries both sides, measured native white → D65), the
+        # SAME matrix stage_refine_mhc_cube keys its abscissa to.
+        matrix_rowsums = None
+        if getattr(args, "top_hold", True):
+            from ..mhc_cube import mhc2_matrix
+            try:
+                m = mhc2_matrix(measured_primaries, white_xy, measured_primaries, (0.3127, 0.3290))
+                matrix_rowsums = [sum(m[r]) for r in range(3)]
+            except (ValueError, ZeroDivisionError, KeyError):
+                matrix_rowsums = None
         try:
             cube_curves, cube_summary = build_hdr_cube(
                 samples, measured_primaries, white_xy, cube_peak,
-                dark_floor_nits=dark_floor_nits, level_trust=level_trust, max_drive=max_drive
+                dark_floor_nits=dark_floor_nits, level_trust=level_trust, max_drive=max_drive,
+                matrix_rowsums=matrix_rowsums,
             )
             cube_summary["dark_floor"] = dark_floor_info
             if level_trust:

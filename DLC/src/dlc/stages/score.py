@@ -21,6 +21,7 @@ from pathlib import Path
 from ..metrics import (
     practical_summary,
     reachable_primaries_from_mhc_params,
+    run_oog_mapping,
     score_samples,
     score_samples_hdr,
     write_metrics,
@@ -75,6 +76,8 @@ def build(args, ctx: RunContext) -> StageResult:
         patch_metrics, target_luminance = score_samples_hdr(
             samples, white_xy=target_white_xy, peak_nits=float(peak),
             reachable_primaries=reachable,
+            # The run's OOG target policy, memoised by the orchestrator (default "vertex").
+            oog_mapping=run_oog_mapping(dl_state.get("calib")),
         )
         metric_name = "dE_ITP"
         thresholds = hdr_metric_thresholds(

@@ -41,6 +41,7 @@ Grounding (no handwaving — matched to DesktopLUT's own C++):
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -65,6 +66,9 @@ __all__ = [
     "dark_trust_weights",
     "HDR_REFERENCE_WHITE_BAND",
     "mhc2_matrix",
+    "neutral_hold_abscissae",
+    "hold_above_cap",
+    "refine_top_pins",
     "build_hdr_cube",
     "build_sdr_cube",
     "refine_hdr_cube",
@@ -481,13 +485,170 @@ def _gray_shares(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     return sigs, shares, grey_y
 
 
+def neutral_hold_abscissae(matrix_rowsums: Sequence[float], cap_nits: float) -> list[float]:
+    """Per-channel POST-MATRIX cube index at which a WIRE neutral at the calibrated cap lands.
+
+    Windows indexes channel ``c`` of the per-channel base LUT at ``pq_oetf(rowsum_c · pq_eotf(s))``
+    (see :func:`refine_hdr_cube`), so whenever the MHC2 matrix is not identity the wire cap lands at
+    a DIFFERENT index per channel (PA32UCXR 2026-09-23, rowsums 0.915 / 1.034 / 1.028: r 0.8018,
+    g 0.8151, b 0.8145 vs the wire cap 0.8115). The installed HDR matrix is the native-target,
+    white-only move — a DIAGONAL matrix — so this index is also exactly where ANY colour's channel-c
+    wire request reaches the cap luminance."""
+    if cap_nits <= 0.0:
+        raise ValueError("cap_nits must be positive")
+    return [pq_oetf(min(max(float(r), 0.0) * cap_nits / _PQ_CONTAINER_NITS, 1.0))
+            for r in matrix_rowsums]
+
+
+def _sample_curve(curve: Sequence[float], x: float) -> float:
+    """Linear interpolation of an evenly-sampled curve (``curve[k]`` at ``k/(n-1)``) at ``x``."""
+    n = len(curve)
+    if n == 1:
+        return float(curve[0])
+    pos = min(max(x, 0.0), 1.0) * (n - 1)
+    k = min(int(pos), n - 2)
+    t = pos - k
+    return float(curve[k]) + (float(curve[k + 1]) - float(curve[k])) * t
+
+
+def hold_above_cap(curves: Mapping[str, Sequence[float]], matrix_rowsums: Sequence[float],
+                   cap_nits: float) -> tuple[dict[str, list[float]], dict]:
+    """HOLD each channel's base-LUT curve flat above its neutral-cap index (owner policy
+    2026-09-23: "clamp to confirmed gamut edges" replaces "fade to identity").
+
+    Above the calibrated top the MHC must keep the LAST CONFIRMED correction: a wire neutral above
+    the cap stays at the D65 cap white (a luminance clip, colour held), never walking back toward
+    native white. Holding at a SINGLE shared index cannot do that — the channels reach the flat top
+    at different wire levels (:func:`neutral_hold_abscissae`), so the low-rowsum channel keeps rising
+    after the others have flattened (run 120740: red rose from its D65 drive 0.796 to 0.8246 while
+    g/b sat at 0.814 → greys at 0.85-1.0 read native-warm 0.3266/0.3273 at 1771 nits). Each channel
+    is therefore held at ITS OWN index: every channel's drive for a wire neutral at the cap is then
+    reproduced for every wire level above it → exactly the cap-white drives. Because the matrix is
+    diagonal, a primary's channel is held at the same wire request (hue held, luminance clipped).
+
+    The hold starts at the first LUT node at/above each channel's index (≤ one node late, ~0.1 % of
+    the signal) and every node after it takes that node's value. The calibrated range (every index
+    ≤ the hold index) is therefore left BIT-EXACT — the refined correction at the cap is untouched —
+    the curve is exactly flat beyond that node (a node-sampled LUT cannot be flat from a
+    mid-interval point), and the operation is idempotent: a refine round re-applying it cannot creep
+    the held drive.
+
+    Returns ``(curves, info)``; ``info`` carries the per-channel ``hold_abscissae`` and the held
+    ``hold_drives`` (the digest evidence). Curves at/below each hold node are untouched."""
+    holds = neutral_hold_abscissae(matrix_rowsums, cap_nits)
+    out: dict[str, list[float]] = {}
+    info: dict = {"hold_abscissae": {}, "hold_drives": {}, "cap_nits": round(float(cap_nits), 4)}
+    for ci, ch in enumerate(_CHANNELS):
+        cur = [float(v) for v in curves[ch]]
+        n = len(cur)
+        h = holds[ci]
+        j0 = min(n - 1, max(0, math.ceil(h * (n - 1) - 1e-9)))  # first node at/above the hold index
+        v = cur[j0]
+        new: list[float] = []
+        prev = 0.0
+        for j in range(n):
+            val = cur[j] if j <= j0 else v
+            val = max(prev, val)                       # monotone (a no-op on a monotone curve)
+            prev = val
+            new.append(val)
+        out[ch] = new
+        info["hold_abscissae"][ch] = round(h, 6)
+        info["hold_drives"][ch] = round(new[-1], 6)
+    return out, info
+
+
+def refine_top_pins(curves: Mapping[str, Sequence[float]], matrix_rowsums: Sequence[float],
+                    cap_nits: float, *, existing: Sequence[float], count: int = 3,
+                    band: float = 0.10, min_sep: float = 3.0 / 1023.0,
+                    grid_step: float = 0.25 / 1023.0) -> list[float]:
+    """Data-driven EXTRA refine pins just under the cap (wire signals, ascending).
+
+    The closed-loop refine interpolates each channel's correction factor LINEARLY between its
+    measured pins, so a steep/curved segment of the base cube between two uniform pins is left
+    under-constrained (run 120740: pins 0.7605 and 0.8113 bracket the panel's near-peak roll-off; the
+    refine's top-pin factor leaked into 0.80 → +5 % luminance, y +0.011). This places ``count`` pins
+    where the cube bends most, measured the way the refine sees it: the effective per-channel drive
+    of a WIRE neutral, ``D_c(s) = LUT_c(pq_oetf(rowsum_c · pq_eotf(s)))``, over the last ``band``
+    fraction of the signal range below the cap. Greedy knot insertion: each pin goes where the
+    summed |D_c - chord| (the deviation of the curve from the linear interpolation through the pins
+    already chosen, i.e. the integrated curvature between them) is largest, at least ``min_sep`` from
+    every other pin. A curve with no measurable bend gets its pins at the midpoints of the widest
+    gaps instead (still densifying the top). Deterministic; pure stdlib.
+
+    ``existing``: the uniform neutral-ramp signals already measured each round. Returns only the
+    NEW pins (≤ ``count``), all inside ``[s_cap·(1-band), s_cap)``; the caller quantises them to code
+    values. Each pin is one extra neutral read per refine round."""
+    if count <= 0 or cap_nits <= 0.0:
+        return []
+    s_top = pq_oetf(min(cap_nits / _PQ_CONTAINER_NITS, 1.0))
+    s_lo = max(0.0, s_top * (1.0 - band))
+    if s_top - s_lo < 2.0 * min_sep:
+        return []
+    n_grid = max(3, int((s_top - s_lo) / grid_step) + 1)
+    grid = [s_lo + (s_top - s_lo) * i / (n_grid - 1) for i in range(n_grid)]
+
+    def drive(s: float) -> list[float]:
+        lin = pq_eotf(s)
+        return [_sample_curve(curves[ch], pq_oetf(min(max(float(r) * lin, 0.0), 1.0)))
+                for ch, r in zip(_CHANNELS, matrix_rowsums)]
+
+    D = [drive(s) for s in grid]
+    pins = sorted(float(p) for p in existing)
+    new: list[float] = []
+
+    def deviation(i: int, knots: list[float]) -> float:
+        s = grid[i]
+        lo = [p for p in knots if p <= s]
+        hi = [p for p in knots if p >= s]
+        if lo and hi:
+            a, b = lo[-1], hi[0]
+            if b - a <= 1e-12:
+                return 0.0
+            da, db = drive(a), drive(b)
+            t = (s - a) / (b - a)
+            return sum(abs(D[i][c] - (da[c] + (db[c] - da[c]) * t)) for c in range(3))
+        ref = drive(lo[-1] if lo else hi[0])                    # the refine holds the end factor flat
+        return sum(abs(D[i][c] - ref[c]) for c in range(3))
+
+    for _ in range(int(count)):
+        knots = sorted(pins + new)
+        best_i, best_dev = None, 0.0
+        for i, s in enumerate(grid[:-1]):                      # never AT the cap (that's the hold kink)
+            if any(abs(s - p) < min_sep for p in knots):
+                continue
+            dv = deviation(i, knots)
+            if dv > best_dev:
+                best_i, best_dev = i, dv
+        if best_i is None or best_dev < 1e-6:
+            # No measurable bend left: split the widest gap inside the band instead.
+            edges = sorted({s_lo, s_top, *[p for p in knots if s_lo < p < s_top]})
+            gaps = [(edges[k + 1] - edges[k], 0.5 * (edges[k] + edges[k + 1]))
+                    for k in range(len(edges) - 1)]
+            gaps = [g for g in gaps if g[0] >= 2.0 * min_sep]
+            if not gaps:
+                break
+            new.append(max(gaps)[1])
+            continue
+        new.append(grid[best_i])
+    return sorted(new)
+
+
 def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
                    white_xy: tuple[float, float], peak_luminance: float,
                    *, lut_size: int = 1024, dark_floor_nits: float = 0.3,
                    level_trust: Optional[Sequence[tuple[float, float]]] = None,
-                   max_drive: Optional[float] = None
+                   max_drive: Optional[float] = None,
+                   matrix_rowsums: Optional[Sequence[float]] = None
                    ) -> tuple[dict[str, list[float]], dict[str, float]]:
     """Build the per-channel HDR EOTF+WB correction cube from a raw TI3's GRAY ramp.
+
+    ``matrix_rowsums`` (optional, ``M @ (1,1,1)`` of the INSTALLED MHC2 matrix — see
+    :func:`mhc2_matrix`): when given, each channel's native-white-proportional target saturates at
+    ITS OWN post-matrix cap index (``rowsum_c × peak``) instead of one shared index, and the curve is
+    then held flat above it (:func:`hold_above_cap`). The cube is applied AFTER the matrix, so with a
+    shared ceiling the high-rowsum channels flattened below the wire cap (a kink the refine then
+    smeared into the top segment) while the low-rowsum channel kept rising above it (the warm drift
+    above the cap). ``None`` ⇒ the legacy shared ceiling (no per-channel hold).
 
     ``max_drive`` (optional, PQ signal 0..1): hard ceiling on every channel's DRIVE. Under the
     ADDITIVE cap policy the orchestrator passes the peak-code signal so the RAW full-drive headroom
@@ -536,13 +697,24 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     # Measurement-driven per-level trust (sig→w), interpolated to the grid; 1.0 everywhere when absent.
     trust_xs = [p[0] for p in level_trust] if level_trust else []
     trust_ws = [p[1] for p in level_trust] if level_trust else []
+    # Per-channel neutral ceiling in POST-MATRIX linear nits: a wire neutral at the cap drives channel
+    # c at rowsum_c × cap, so channel c's native-white-proportional target must keep rising to exactly
+    # there (and hold above). Without rowsums: the legacy single shared ceiling. A channel is only
+    # EXTENDED above the shared ceiling (rowsum > 1) when ``max_drive`` bounds its drive: unbounded,
+    # a target share past the ceiling inverts into the panel's flat near-peak plateau, where the
+    # drive is ill-defined (the 2026-09-03 cv-981 failure ``max_drive`` exists to prevent). Such a
+    # channel keeps the legacy shared ceiling (the closed-loop refine trims the residual) and is
+    # still HELD at its own index, so the above-cap hold stays exact.
+    ceiling = {}
+    for ci, ch in enumerate(_CHANNELS):
+        r = max(float(matrix_rowsums[ci]), 0.0) if matrix_rowsums is not None else 1.0
+        ceiling[ch] = peak_luminance * (r if (r <= 1.0 or max_drive is not None) else 1.0)
 
     curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     prev = {ch: 0.0 for ch in _CHANNELS}
     for j in range(lut_size):
         pq_in = j / (lut_size - 1)
-        lin_nits = min(pq_eotf(pq_in) * _PQ_CONTAINER_NITS, peak_luminance)
-        frac = lin_nits / peak_luminance              # native-white-proportional target (0..1)
+        lin_raw = pq_eotf(pq_in) * _PQ_CONTAINER_NITS
         # Luminance floor ramp: 0 in the noisy deep shadows, ramping to 1 by 2x the dark-floor signal.
         w = 0.0 if dark_sig <= 0 else min(1.0, max(0.0, (pq_in - dark_sig) / dark_sig))
         # Fold in the measured per-level trust: where the dark read is too noisy/unstable to trust
@@ -550,6 +722,7 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         if trust_xs:
             w *= _interp(pq_in, trust_xs, trust_ws)
         for ch in _CHANNELS:
+            frac = min(lin_raw, ceiling[ch]) / peak_luminance   # native-white-proportional target
             target_share = frac * peak_share[ch]
             corrected = invert_monotone(sigs, shares[ch], target_share)
             if max_drive is not None:
@@ -561,6 +734,12 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
             prev[ch] = val
             curves[ch].append(val)
 
+    hold_info = None
+    if matrix_rowsums is not None:
+        # The per-channel ceiling already flattens each curve above its own index; the explicit hold
+        # pins the node interval that straddles it and records the evidence for the digest.
+        curves, hold_info = hold_above_cap(curves, matrix_rowsums, peak_luminance)
+
     summary: dict[str, float] = {
         "white_max_nits": round(peak_luminance, 4),
         "gray_points": float(len(sigs)),
@@ -568,6 +747,7 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         "max_drive": round(max_drive, 6) if max_drive is not None else None,
         "dark_floor_nits": round(dark_floor_nits, 4),
         "basis": "gray-ramp",
+        "top_hold": hold_info,
     }
     for ch in _CHANNELS:
         summary[f"{ch}_peak_share"] = round(peak_share[ch], 4)
@@ -663,9 +843,16 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
                     matrix_rowsums: Sequence[float],
                     *, peak_cap_nits: float, target_white_xy: tuple[float, float] = _D65,
                     damping: float = 0.85, dark_floor_nits: float = 1.0,
-                    ratio_clamp: tuple[float, float] = (0.5, 2.0)
+                    ratio_clamp: tuple[float, float] = (0.5, 2.0),
+                    top_hold: bool = True
                     ) -> dict[str, list[float]]:
     """One closed-loop grayscale-refine step on the HDR base cube — PANEL-AGNOSTIC.
+
+    ``top_hold`` (default on, owner policy 2026-09-23): after the step each channel is held flat
+    above its own neutral-cap index (:func:`hold_above_cap`), so the refined foundation keeps the
+    last confirmed (D65-at-the-cap) correction above the calibrated top instead of letting the
+    low-rowsum channel run on toward native full drive. ``False`` ⇒ the legacy flat-factor
+    extrapolation above the last measured pin.
 
     Pulls the measured neutral axis toward the target white (default D65) by the proven share-ratio
     law (same as ``refine.propose_correction_grayscale``, but for the per-channel PQ cube). Uses
@@ -759,6 +946,8 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
             prev = val
             curve.append(val)
         out[ch] = curve
+    if top_hold:
+        out, _info = hold_above_cap(out, matrix_rowsums, peak_cap_nits)
     return out
 
 

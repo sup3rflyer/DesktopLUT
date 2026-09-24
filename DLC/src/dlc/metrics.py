@@ -72,6 +72,23 @@ def sanitize_reachable_primaries(prim: dict | None) -> dict | None:
     return prim if area > 1e-6 else None
 
 
+def run_oog_mapping(calib: dict | None, default: str = "vertex") -> str:
+    """The out-of-gamut target policy a run record (``dlc_state.json['calib']``) was built/scored
+    with. The orchestrator memoises it (``calib['oog_mapping']``) at the run's first HDR score or
+    cube build. A record that already holds measured stages but NO memo predates the 2026-09-23
+    vertex policy — it was built and scored with the legacy "chroma-clip" clamp, and resuming or
+    re-scoring it must keep that, not silently switch its verify to a different target. A fresh
+    record gets ``default`` (the profile's policy)."""
+    c = calib or {}
+    memo = c.get("oog_mapping")
+    if memo:
+        return str(memo)
+    stages = c.get("stages") or {}
+    if any(str(k).startswith("measure:") for k in stages):
+        return "chroma-clip"
+    return default
+
+
 def reachable_primaries_from_mhc_params(mhc_params: dict | None) -> dict | None:
     """The panel's measured native primaries from a run record's ``mhc_params`` block
     (``dlc_state.json``, persisted at build), in the ``{"R": [x, y], ...}`` shape the
@@ -306,7 +323,8 @@ def score_samples(samples: list[Ti3Sample], *, luminance: float | None = None, g
 
 
 def score_samples_hdr(samples: list[Ti3Sample], *, white_xy: tuple[float, float],
-                      peak_nits: float, reachable_primaries=None) -> tuple[list[PatchMetric], float]:
+                      peak_nits: float, reachable_primaries=None,
+                      oog_mapping: str = "vertex") -> tuple[list[PatchMetric], float]:
     """Score TI3 samples for an **HDR (PQ/Rec.2020)** run in ``dE_ITP`` (BT.2124) — the
     perceptually-uniform metric the 3D-LUT cube converges in. The heavy PQ/ICtCp math is
     lazy-imported from :mod:`dlc.engine` (numpy/colour), so importing this spine module
@@ -316,13 +334,15 @@ def score_samples_hdr(samples: list[Ti3Sample], *, white_xy: tuple[float, float]
     ΔE carrier (it holds **dE_ITP** here); the run/summary ``metric`` label disambiguates
     — callers must pass ``metric="dE_ITP"`` to :func:`summarize_metrics`. ``target_xyz``
     is the ideal absolute XYZ; ``target_luminance`` is the target ``peak_nits`` (reported,
-    not used to rescale — PQ is absolute)."""
+    not used to rescale — PQ is absolute). ``oog_mapping`` is the out-of-gamut target policy
+    (``Target.oog_mapping``; default the owner's 2026-09-23 "vertex" map) — pass the run's value so
+    the score clamps exactly as the cube build did."""
     if not samples:
         raise ValueError("no TI3 samples to score")
     from .engine.model import score_hdr
 
     res = score_hdr([s.rgb for s in samples], [s.xyz for s in samples], white_xy=white_xy,
-                    reachable_primaries=reachable_primaries)
+                    reachable_primaries=reachable_primaries, oog_mapping=oog_mapping)
     de_itp = res["de_itp"]
     ideal_xyz = res["ideal_xyz"]
     clamped = res.get("gamut_clamped")

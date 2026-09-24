@@ -691,3 +691,186 @@ def test_report_scorer_relabels_surfaced_numbers_without_changing_optimization()
     assert base.digest["optimize_metric"] == "dE_ITP"
     assert base.digest["best_max_de_report"] == base.digest["best_max_de"]
     assert base.history[0].metric == "dE_ITP"
+
+
+# ---------------------------------------------------------------------------
+# Top hold (owner policy 2026-09-23): "clamp to confirmed gamut edges" replaces "fade to identity"
+# ---------------------------------------------------------------------------
+
+def _hdr_bounded_panel(top: float = 0.75, n: int = 5):
+    """An HDR panel measured only up to ``top`` (the HDR patch cap) — the cube above it is
+    unconfirmed territory the old hull fade returned to identity."""
+    target = Target.hdr_rec2020_pq()
+    probe = synthetic_probe(target, gains=(1.0, 1.03, 0.96))
+    ax = np.linspace(0.0, top, n)
+    signals = np.array([[r, g, b] for b in ax for g in ax for r in ax], dtype=float)
+    return target, probe, signals
+
+
+def test_project_to_top_scales_in_linear_light_and_leaves_in_range_rows():
+    import colour
+    from dlc.engine.lut_rbf import project_to_top
+    s = np.array([[0.9, 0.5, 0.2], [0.6, 0.3, 0.1], [1.0, 1.0, 1.0]])
+    p = project_to_top(s, 0.75, transfer="pq")
+    assert np.allclose(p[1], s[1])                                   # already in range: untouched
+    assert np.allclose(p[[0, 2]].max(axis=1), 0.75)                  # brightest channel AT the top
+    lin_s, lin_p = colour.models.eotf_ST2084(s[0]), colour.models.eotf_ST2084(p[0])
+    assert np.allclose(lin_p / lin_p.max(), lin_s / lin_s.max(), rtol=1e-6)   # chromaticity held
+    assert np.allclose(p[2], [0.75, 0.75, 0.75])
+    q = project_to_top(s, 0.75, transfer="power")
+    assert np.allclose(q[0], s[0] * 0.75 / 0.9)                      # pure power: a radial scale
+
+
+def test_hold_lattice_level_snaps_up_to_the_first_grid_level():
+    from dlc.engine.lut_rbf import hold_lattice_level
+    assert hold_lattice_level(0.75, 17) == 0.75                      # already a lattice level
+    assert abs(hold_lattice_level(830 / 1023, 33) - 26 / 32) < 1e-12  # 0.8113 -> 0.8125
+    assert hold_lattice_level(None, 33) is None
+    assert hold_lattice_level(1.0, 33) is None
+    assert hold_lattice_level(0.99, 33) is None                      # rounds up to full scale
+
+
+def test_build_cube_top_hold_holds_the_edge_correction_above_the_top():
+    from dlc.engine.lut_rbf import build_cube
+    from dlc.engine.model import DisplayErrorModel
+    top = 0.75
+    target, probe, signals = _hdr_bounded_panel(top)
+    model = DisplayErrorModel(signals, probe(signals), target, smoothing=1e-3)
+    g = 17
+    held = build_cube(model, g, signal_points=signals, max_correction=0.25, neutral_band=0.05,
+                      hold_above=top)
+    legacy = build_cube(model, g, signal_points=signals, max_correction=0.25, neutral_band=0.05)
+    axis = np.linspace(0.0, 1.0, g)
+    k_top = int(round(top * (g - 1)))                                 # node index AT the top (12)
+    grid = identity_cube(g)
+    in_range = grid.max(axis=-1) <= top + 1e-9
+    # 1. the calibrated range is untouched by the policy
+    assert np.allclose(held[in_range], legacy[in_range], atol=1e-6)
+    # 2. above the top a pure colour takes the CONFIRMED edge correction (the node AT the top);
+    #    the legacy fade instead walked it back toward identity.
+    for k in range(k_top + 1, g):
+        assert np.allclose(held[0, 0, k], held[0, 0, k_top], atol=1e-9)     # red ray
+        assert np.allclose(held[k, 0, 0], held[k_top, 0, 0], atol=1e-9)     # blue ray
+    assert np.abs(legacy[0, 0, g - 1] - grid[0, 0, g - 1]).max() < 1e-6     # legacy: identity at 1.0
+    assert np.abs(held[0, 0, k_top] - grid[0, 0, k_top]).max() > 1e-3       # a real correction held
+    # 3. the grey axis stays colour-free (neutral band) and is luminance-clipped at the top
+    for k in range(k_top + 1, g):
+        assert np.allclose(held[k, k, k], [top] * 3, atol=1e-9)
+        assert np.allclose(legacy[k, k, k], [axis[k]] * 3, atol=1e-9)
+    # 4. nothing beyond the top lattice level leaves the cube unclipped
+    assert held[~in_range].max() <= top + 0.25 + 1e-9
+
+
+def test_build_cube_top_hold_keeps_the_straddling_cell_corners():
+    # A top between lattice levels: the straddling cell's upper corners keep their OWN correction
+    # (in-range inputs interpolate toward them), so in-range sampling is unchanged.
+    from dlc.engine.lut_rbf import build_cube
+    from dlc.engine.model import DisplayErrorModel
+    top = 0.70
+    target, probe, signals = _hdr_bounded_panel(top)
+    model = DisplayErrorModel(signals, probe(signals), target, smoothing=1e-3)
+    held = build_cube(model, 17, signal_points=signals, max_correction=0.25, hold_above=top)
+    legacy = build_cube(model, 17, signal_points=signals, max_correction=0.25)
+    pts = np.random.default_rng(1).random((400, 3)) * top
+    assert np.allclose(sample_cube(held, pts), sample_cube(legacy, pts), atol=1e-6)
+
+
+def test_optimize_cube_top_hold_digest_and_knob():
+    target, probe, signals = _hdr_bounded_panel(0.75)
+    measured = probe(signals)
+    cfg = OptimizeConfig(grid_size=9, max_outer=2, threshold=0.5)
+    on = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured, config=cfg)
+    d = on.digest
+    assert d["top_hold_signal"] == 0.75 and d["top_hold_lattice_level"] == 0.75   # data-derived top
+    assert d["top_held_nodes"] > 0 and isinstance(d["nodes_at_budget_cap"], int)
+    assert d["oog_mapping"] is None                                   # no reachable_primaries given
+    assert np.allclose(on.cube[8, 8, 8], [0.75] * 3)                  # white above the top: clipped grey
+    off = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                        config=OptimizeConfig(grid_size=9, max_outer=2, threshold=0.5, top_hold=False))
+    assert off.digest["top_hold_signal"] is None and off.digest["top_held_nodes"] == 0
+    assert np.allclose(off.cube[8, 8, 8], [1.0] * 3)                  # legacy: identity at full scale
+    # A full-range (SDR-like) dataset has nothing above it: the hold is a no-op.
+    sdr_probe = synthetic_probe(_sdr_target())
+    sdr = optimize_cube(target=_sdr_target(), probe=sdr_probe, signals=_cube_signals(5),
+                        measured_xyz=sdr_probe(_cube_signals(5)),
+                        config=OptimizeConfig(grid_size=9, max_outer=1))
+    assert sdr.digest["top_hold_signal"] is None and sdr.digest["top_held_nodes"] == 0
+
+
+def test_vertex_oog_targets_do_not_push_a_second_channel_onto_primaries():
+    # The run-120740 failure mode on a synthetic sub-gamut panel: under the legacy ICtCp clip every
+    # pure primary node gains a SECOND channel at a large fraction of the budget (red got green,
+    # green got red+blue, blue got green); under the vertex map the target is the panel's own
+    # native primary at the target luminance, so the correction just trims the lit channel.
+    from dlc.engine.lut_rbf import build_cube
+    from dlc.engine.model import DisplayErrorModel
+    prim, probe = _sub_gamut_panel()
+    signals = _cube_signals(5)
+    measured = probe(signals)
+    off_channel = {}
+    for mapping in ("vertex", "chroma-clip"):
+        t = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0, oog_mapping=mapping)
+        m = DisplayErrorModel(signals, measured, t, smoothing=1e-3, reachable_primaries=prim)
+        cube = build_cube(m, 9, signal_points=signals, max_correction=0.5, neutral_band=0.05)
+        worst = 0.0
+        for ch, idx in ((0, (0, 0, 8)), (1, (0, 8, 0)), (2, (8, 0, 0))):   # pure R, G, B nodes
+            corr = cube[idx] - identity_cube(9)[idx]
+            worst = max(worst, float(np.abs(np.delete(corr, ch)).max()))
+        off_channel[mapping] = worst
+    assert off_channel["chroma-clip"] > 0.2
+    assert off_channel["vertex"] < 0.05
+
+
+def test_build_cube_best_iterate_guard_contract():
+    # The OOG best-iterate guard: off => bit-identical legacy; no clamp (no reachable primaries) =>
+    # a no-op; in-gamut nodes untouched; on the guarded (clamped, above-knee) nodes the chosen
+    # output is never worse than the last iterate BY THE MODEL'S OWN prediction.
+    from dlc.engine.lut_rbf import build_cube
+    from dlc.engine.model import DisplayErrorModel
+    prim, probe = _sub_gamut_panel()
+    signals = _cube_signals(5)
+    measured = probe(signals)
+    target = Target.sdr_srgb_power(gamma=2.2, white_nits=120.0)
+    plain = DisplayErrorModel(signals, measured, target, smoothing=1e-3)
+    a = build_cube(plain, 9, signal_points=signals, max_correction=0.5)
+    b = build_cube(plain, 9, signal_points=signals, max_correction=0.5, best_iterate=True)
+    assert np.array_equal(a, b)                                       # no clamp => nothing guarded
+
+    model = DisplayErrorModel(signals, measured, target, smoothing=1e-3, reachable_primaries=prim)
+    last = build_cube(model, 9, signal_points=signals, max_correction=0.5, neutral_band=0.0,
+                      n_iterations=4)
+    best = build_cube(model, 9, signal_points=signals, max_correction=0.5, neutral_band=0.0,
+                      n_iterations=4, best_iterate=True)
+    grid = identity_cube(9).reshape(-1, 3)
+    clamped = np.any(np.abs(model.space.ideal_ictcp(grid) - TargetSpace(target).ideal_ictcp(grid)) > 1e-9,
+                     axis=1)
+    assert clamped.sum() > 10                                         # the guard has work to do
+    lb, bb = last.reshape(-1, 3), best.reshape(-1, 3)
+    assert np.array_equal(lb[~clamped], bb[~clamped])                 # in-gamut nodes: last iterate
+    tgt = model.space.ideal_ictcp(grid[clamped])
+    de_last = de_itp(model.forward_ictcp(lb[clamped]) - tgt)
+    de_best = de_itp(model.forward_ictcp(bb[clamped]) - tgt)
+    assert np.all(de_best <= de_last + 1e-9)
+
+
+def test_integrity_diagnostics_judge_only_the_calibrated_range_under_the_top_hold():
+    # The held region replicates the top-surface correction per ray (its luminance clip reads as a
+    # large "correction"); cube_monotonic / large_reversals / the snapshot ranking must describe the
+    # CALIBRATED sub-lattice, with the whole lattice reported separately.
+    from dlc.engine.lut_rbf import cube_diagnostics
+    target, probe, signals = _hdr_bounded_panel(0.70)
+    measured = probe(signals)
+    kw = dict(grid_size=17, max_outer=2, threshold=0.5)
+    on = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                       config=OptimizeConfig(**kw))
+    off = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=measured,
+                        config=OptimizeConfig(top_hold=False, **kw))
+    d_on, d_off = on.digest, off.digest
+    level = d_on["top_hold_lattice_level"]
+    assert level == 0.75
+    assert d_on["cube_diagnostics"]["total_steps"] < d_on["cube_diagnostics_full"]["total_steps"]
+    assert d_off["cube_diagnostics_full"] == d_off["cube_diagnostics"]
+    # The calibrated sub-lattice of the held cube matches the legacy cube's own judgement there.
+    assert d_on["cube_monotonic"] == cube_diagnostics(off.cube, in_range_level=level).monotonic
+    sub = cube_diagnostics(on.cube, in_range_level=level)
+    assert sub.large_reversal_count == d_on["large_reversals"]

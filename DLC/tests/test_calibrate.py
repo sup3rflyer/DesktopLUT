@@ -4847,3 +4847,118 @@ def test_reassert_viewing_layers_noops_and_surfaces_failures():
     unknown = _reassert_viewing_layers(_LayersCtl(), {"viewing_layers": {"captured": True,
                                                                           "before": {"fald": True}}})
     assert "unknown" in unknown["error"]
+
+
+# ---------------------------------------------------------------------------
+# Owner policy 2026-09-23 — top hold (MHC + cube), vertex OOG mapping, refine top pins
+# ---------------------------------------------------------------------------
+
+def test_build_neutral_set_unions_extra_levels_clipped_to_the_cap():
+    t = Transfer.pq(bit_depth=10)
+    base = build_neutral_set(_SMALL, t, max_cv=830)
+    extra = build_neutral_set(_SMALL, t, max_cv=830, extra_levels=[794, 817, 900, base[3][0]])
+    levels = {p[0] for p in extra}
+    assert {794, 817, 830} <= levels and 900 not in levels
+    assert len(extra) == len(base) + 2                      # dup + over-cap collapse
+    ps = PatchSizes.from_dict({"neutral_top_pins": "2", "neutral_top_band": "0.2"})
+    assert ps.neutral_top_pins == 2 and ps.neutral_top_band == 0.2
+    assert PatchSizes().neutral_top_pins == 3 and PatchSizes().neutral_top_band == 0.10
+
+
+def test_hdr_mhc_build_and_refine_hold_the_top_and_add_top_pins(tmp_path: Path):
+    from dlc.mhc_cube import neutral_hold_abscissae, read_1d_cube
+    calib = _make(tmp_path, "hdr_top_hold", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    calib.run("mhc-only")
+    build = calib.calib["stages"]["build-install-mhc"]["digest"]
+    hold = build.get("top_hold")
+    assert hold and set(hold["hold_abscissae"]) == {"r", "g", "b"}
+    params = calib._state["mhc_params"]
+    cap = params["base_lut"]["peak_nits"]
+    # The build's base cube is exactly flat above each channel's own neutral-cap index.
+    base = read_1d_cube(Path(calib.ctx.root / "generated" / "mhc_base_hdr.cube"))
+    n = len(base["r"])
+    for ch in "rgb":
+        h = hold["hold_abscissae"][ch]
+        above = [base[ch][j] for j in range(n) if j / (n - 1) > h + 1.0 / (n - 1)]
+        assert above and max(above) - min(above) < 1e-12, ch
+    refine = calib.calib["stages"]["refine-mhc-cube"]["digest"]
+    assert refine["top_hold"] is True
+    pins = refine["top_pins"]
+    assert 0 < len(pins) <= _SMALL.neutral_top_pins
+    s_cap = neutral_hold_abscissae((1.0, 1.0, 1.0), cap)[0]
+    assert all(s_cap * (1.0 - _SMALL.neutral_top_band) - 1e-3 <= p <= s_cap for p in pins)
+    assert refine["neutral_patches_per_round"] == len(calib._neutral_patches()) + len(pins)
+
+
+def test_mhc_top_hold_knob_off_restores_the_legacy_shared_ceiling(tmp_path: Path):
+    calib = _make(tmp_path, "hdr_top_hold_off", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10,
+                  patch_sizes=PatchSizes(raw_ramp_steps=9, cube_size=3, tube_size=5, tube_radius=1,
+                                         neutral_steps=9, neutral_top_pins=0))
+    calib.mhc_top_hold = False
+    calib.run("mhc-only")
+    assert "top_hold" not in calib.calib["stages"]["build-install-mhc"]["digest"]
+    refine = calib.calib["stages"]["refine-mhc-cube"]["digest"]
+    assert refine["top_hold"] is False and refine["top_pins"] == []
+    assert refine["neutral_patches_per_round"] == len(calib._neutral_patches())
+
+
+def test_cube_config_pins_the_top_hold_to_the_hdr_patch_cap_and_memoises_oog_policy(tmp_path: Path):
+    calib = _make(tmp_path, "hdr_cfg", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    calib.stage_resolve_target()
+    cfg = calib._cube_optimize_config()
+    assert cfg.top_hold is True and cfg.best_iterate_oog is True
+    assert cfg.top_hold_signal == calib._patch_max_cv() / calib._transfer().max_cv
+    assert calib._oog_mapping() == "vertex" and calib.calib["oog_mapping"] == "vertex"
+    # A memoised policy wins over the profile on resume (build / verify / projection agree).
+    calib.calib["oog_mapping"] = "chroma-clip"
+    assert calib._engine_target().oog_mapping == "chroma-clip"
+    sdr = _make(tmp_path, "sdr_cfg", mode="SDR")
+    sdr.stage_resolve_target()
+    assert sdr._cube_optimize_config().top_hold_signal is None   # SDR spans full scale: no-op
+
+
+def test_volumetric_sampling_geometry_is_independent_of_the_oog_target_policy():
+    # The vertex TARGET map must not change what gets MEASURED: projecting stimuli with it would
+    # move the dim RGBCMY-axis bulk stimuli off the axes — where the vertex targets live — so the
+    # gamut-aware sampling stays on its validated (legacy) projection.
+    from dlc.engine.model import Target
+    pa32 = {"R": [0.692647, 0.303009], "G": [0.180898, 0.751], "B": [0.152078, 0.064913]}
+    ps = PatchSizes(cube_size=7, volumetric_mode="cube", tube_size=9, tube_radius=1)
+    t = Transfer.pq(bit_depth=10)
+    sets = {m: build_volumetric_set(ps, t, max_cv=830,
+                                    target=Target.hdr_rec2020_pq(white_xy=(0.3127, 0.3290), oog_mapping=m),
+                                    reachable_primaries=pa32)
+            for m in ("chroma-clip", "vertex")}
+    assert sets["vertex"] == sets["chroma-clip"]
+    blue_axis = sorted({p[2] for p in sets["vertex"] if p[0] == 0 and p[1] == 0 and p[2] > 0})
+    assert len(blue_axis) >= 6 and min(blue_axis) < 150        # dim pure-blue reads kept
+
+
+def test_run_oog_mapping_keeps_pre_policy_runs_on_the_legacy_clamp(tmp_path: Path):
+    from dlc.metrics import run_oog_mapping
+    assert run_oog_mapping(None) == "vertex"
+    assert run_oog_mapping({"stages": {"preflight": {}}}) == "vertex"             # fresh record
+    assert run_oog_mapping({"stages": {"measure:raw": {}}}) == "chroma-clip"      # measured, no memo
+    assert run_oog_mapping({"oog_mapping": "vertex", "stages": {"measure:raw": {}}}) == "vertex"
+    # The orchestrator pins the memo at resolve-target — before anything is measured — so a NEW
+    # run is never mistaken for a pre-policy one...
+    calib = _make(tmp_path, "oog_new", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    calib.stage_resolve_target()
+    assert calib.calib["oog_mapping"] == "vertex"
+    # ...while a record resumed from before the policy (measured stages, no memo) stays legacy.
+    old = _make(tmp_path, "oog_old", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    old.calib["stages"]["measure:raw"] = {"status": "done", "digest": {}}
+    old.stage_resolve_target()
+    assert old.calib["oog_mapping"] == "chroma-clip"
+    assert old._engine_target().oog_mapping == "chroma-clip"
+
+
+def test_new_refine_pin_knobs_do_not_move_an_approved_plan_fingerprint_at_defaults(tmp_path: Path):
+    calib = _make(tmp_path, "fp_default", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    calib.stage_resolve_target()
+    rec = calib._patch_plan_record(calib.calib.get("flow"))
+    assert "neutral_top_pins" not in rec["patch_sizes"] and "neutral_top_band" not in rec["patch_sizes"]
+    from dataclasses import replace as _r
+    calib.patch_sizes = _r(calib.patch_sizes, neutral_top_pins=5)
+    rec2 = calib._patch_plan_record(calib.calib.get("flow"))
+    assert rec2["patch_sizes"]["neutral_top_pins"] == 5 and rec2["fingerprint"] != rec["fingerprint"]

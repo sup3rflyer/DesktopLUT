@@ -15,6 +15,7 @@ from typing import Any
 from ..metrics import (
     practical_summary,
     reachable_primaries_from_mhc_params,
+    run_oog_mapping,
     score_samples,
     score_samples_hdr,
     summarize_metrics,
@@ -27,7 +28,8 @@ from . import _common
 
 def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
                white_xy: tuple[float, float], *, is_hdr: bool = False,
-               peak_nits: float = 1000.0, reachable: dict | None = None) -> dict[str, Any] | None:
+               peak_nits: float = 1000.0, reachable: dict | None = None,
+               oog_mapping: str = "vertex") -> dict[str, Any] | None:
     if not ti3.exists():
         return None
     samples = parse_ti3(ti3)
@@ -37,7 +39,7 @@ def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
     # delta compares like with like (an unreachable corner is a reachability floor on either side).
     if is_hdr:
         patch_metrics, lum = score_samples_hdr(samples, white_xy=white_xy, peak_nits=peak_nits,
-                                               reachable_primaries=reachable)
+                                               reachable_primaries=reachable, oog_mapping=oog_mapping)
         metric_name = "dE_ITP"
     else:
         patch_metrics, lum = score_samples(samples, gamma=gamma, white_xy=white_xy)
@@ -80,11 +82,13 @@ def build(args, ctx: RunContext) -> StageResult:
     # Gamut-aware like the live verify + the score stage (P1): HDR targets clamp onto the
     # panel's measured native gamut from the run record; None for SDR (never clamps).
     reachable = reachable_primaries_from_mhc_params(dl.get("mhc_params")) if is_hdr else None
+    # The run's OOG target policy, memoised by the orchestrator (default "vertex").
+    oog = run_oog_mapping(dl.get("calib"))
 
     raw_ti3 = find_stage_artifact(ctx, "raw-mhc", "ti3")
     before = _score_ti3(ctx, resolve_run_path(ctx, Path(raw_ti3)), "raw-mhc",
                         args.gamma, target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits,
-                        reachable=reachable) if raw_ti3 else None
+                        reachable=reachable, oog_mapping=oog) if raw_ti3 else None
 
     after = None
     for stage in ("3dlut-verification", "mhc-verification", "verification"):
@@ -92,7 +96,7 @@ def build(args, ctx: RunContext) -> StageResult:
         if ti3:
             after = _score_ti3(ctx, resolve_run_path(ctx, Path(ti3)), stage, args.gamma,
                                target_white_xy, is_hdr=is_hdr, peak_nits=peak_nits,
-                               reachable=reachable)
+                               reachable=reachable, oog_mapping=oog)
             if after:
                 after["stage"] = stage
                 break

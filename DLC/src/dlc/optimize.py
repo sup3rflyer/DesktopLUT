@@ -59,7 +59,8 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
 from .engine.lut_constrained import build_constrained_rbf_cube
-from .engine.lut_rbf import build_cube, cube_diagnostics, identity_cube, predicted_accuracy, write_cube
+from .engine.lut_rbf import (build_cube, cube_diagnostics, hold_lattice_level, identity_cube,
+                             predicted_accuracy, write_cube)
 from .engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
 from .engine.physical import StructuredForwardModel, build_physical_cube
 
@@ -162,6 +163,24 @@ class OptimizeConfig:
     # 0.99→4.56 HW regression). ``0`` ⇒ off — correct only for a raw panel with no MHC foundation
     # (e.g. the synthetic-correction unit tests), where the cube legitimately must fix grey too.
     neutral_band: float = 0.05
+    # Top hold (owner policy 2026-09-23 — "clamp to confirmed gamut edges" replaces "fade to
+    # identity"): nodes above the CALIBRATED TOP take the corrected output of their linear-light
+    # projection onto the top (hue held, luminance clipped) instead of fading to identity outside
+    # the measured hull. ``top_hold_signal`` is the top as a signal fraction; ``None`` ⇒ the
+    # brightest channel of the initial measured stimuli (HDR: the patch cap; SDR: 1.0 ⇒ no-op).
+    # The orchestrator pins it to the HDR patch cap explicitly. ``top_hold=False`` ⇒ legacy fade.
+    # (rbf engine only; the labelled experiment engines keep their own edge handling.)
+    top_hold: bool = True
+    top_hold_signal: Optional[float] = None
+    # Best-iterate guard (build_cube ``best_iterate``): on nodes whose target the reachable-gamut
+    # clamp moved (above the near-black knee), replace the last inversion iterate with the model-best
+    # one when the last is worse by more than ``best_iterate_margin`` dE_ITP — the fixed-point step
+    # diverges at gamut corners into unmeasured regions (run 120740 blue: model dE 1.6 at iterate 1
+    # -> 32 at iterate 3, red added at the full budget). Held-out CV on run 120740 (margin 2):
+    # core/tube unchanged, OOG 9.26 -> 8.88, primaries 14.96 -> 11.6 dE_ITP, in-range reversals
+    # 76 -> 94 (margin 0: 189). No-op without reachable_primaries. rbf engine only.
+    best_iterate_oog: bool = True
+    best_iterate_margin: float = 2.0
     # Candidate engine selector. "rbf" is the shipping path. "constrained-rbf" and "physical"
     # are labelled experiments: held-out CV rejected the constrained shell and the additive
     # structured model as post-MHC/post-ICC cube replacements. Keep them opt-in for probes only.
@@ -470,6 +489,19 @@ def optimize_cube(
 
     raw_train_count = int(np.asarray(signals).reshape(-1, 3).shape[0])
     train_signals = np.asarray(signals, dtype=float).reshape(-1, 3)
+    # The calibrated top for the top hold: pinned by the caller, else the brightest channel of the
+    # initial MEASURED stimuli (never the fold-back's driven points — those are where the cube
+    # operates, not what was confirmed). None when the hold is off or the data spans full scale.
+    hold_top: Optional[float] = None
+    if cfg.top_hold and cfg.engine == "rbf" and train_signals.size:
+        hold_top = (float(cfg.top_hold_signal) if cfg.top_hold_signal is not None
+                    else float(np.max(train_signals)))
+        if not (0.0 < hold_top < 1.0 - 1e-6):
+            hold_top = None
+    # Integrity diagnostics judge the CALIBRATED sub-lattice (monotonicity drives the snapshot
+    # ranking and the digest's cube_monotonic / large_reversals); the held region above it is
+    # reported separately (cube_diagnostics_full) — it replicates the top-surface correction per ray.
+    hold_level = hold_lattice_level(hold_top, cfg.grid_size)
     train_xyz = np.maximum(np.asarray(measured_xyz, dtype=float).reshape(-1, 3), 0.0)
     train_signals, train_xyz, train_confidence = aggregate_training_samples(train_signals, train_xyz)
     if len(train_signals) < 4:
@@ -564,7 +596,8 @@ def optimize_cube(
             model, cfg.grid_size, signal_points=train_signals,
             fade_width=cfg.fade_width, max_correction=budget,
             n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
-            neutral_band=cfg.neutral_band,
+            neutral_band=cfg.neutral_band, hold_above=hold_top,
+            best_iterate=cfg.best_iterate_oog, best_iterate_margin=cfg.best_iterate_margin,
         )
         return model, cube, None, None
 
@@ -608,7 +641,7 @@ def optimize_cube(
         masks = _classify(verify_probe, driven, de, cfg.threshold, budget,
                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
                           low_light_signal=cfg.low_light_signal)
-        diag = cube_diagnostics(cube)
+        diag = cube_diagnostics(cube, in_range_level=hold_level)
         if cfg.engine == "physical":
             driven_full = sample_cube(cube, verify)
             produced_full = model.forward(driven_full)
@@ -784,10 +817,24 @@ def optimize_cube(
         "neutral": bool(neutral_mask[i]),
     } for i in floor_idx[: cfg.top_k]]
 
+    # Correction-budget usage across the LATTICE (not just the probed patches): nodes whose correction
+    # sits at the soft-clamp's binding level, counted inside the calibrated range only — a held node's
+    # offset above the top is the luminance clip of the top hold, not a colour correction.
+    lattice = identity_cube(cfg.grid_size).reshape(-1, 3)
+    corr_mag = np.max(np.abs(np.asarray(best_cube).reshape(-1, 3) - lattice), axis=1)
+    in_range = (np.max(lattice, axis=1) <= hold_level + 1e-9) if hold_level is not None \
+        else np.ones(len(lattice), dtype=bool)
+    nodes_at_cap = int(np.sum((corr_mag >= cfg.clamp_active_frac * best_budget) & in_range))
+
     digest = {
         "converged": converged,
         "iterations": len(history),
         "engine": cfg.engine,
+        "oog_mapping": space.oog_mapping if reachable_primaries is not None else None,
+        "top_hold_signal": round(hold_top, 6) if hold_top is not None else None,
+        "top_hold_lattice_level": round(hold_level, 6) if hold_level is not None else None,
+        "top_held_nodes": int(np.sum(~in_range)),
+        "nodes_at_budget_cap": nodes_at_cap,
         "grid_size": cfg.grid_size,
         "threshold": cfg.threshold,
         "max_correction": round(best_budget, 4),
@@ -819,6 +866,9 @@ def optimize_cube(
         "large_reversals": int((best.get("diagnostics") or {}).get("large_reversal_count", 0)),
         "worst_lattice_jump": (best.get("diagnostics") or {}).get("worst_lattice_jump"),
         "cube_diagnostics": best.get("diagnostics"),
+        # Whole-lattice numbers incl. the held region (== cube_diagnostics when nothing is held).
+        "cube_diagnostics_full": (cube_diagnostics(best_cube).as_dict() if hold_level is not None
+                                  else best.get("diagnostics")),
         "confidence_weighted_rbf": bool(cfg.confidence_weighted_rbf),
         "training_raw_points": raw_train_count,
         "training_unique_points": int(len(train_confidence)),

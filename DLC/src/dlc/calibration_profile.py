@@ -234,6 +234,10 @@ class TargetSpec:
     white_luminance_nits: float = 120.0
     peak_luminance_nits: Optional[float] = None
     white_xy_override: Optional[tuple[float, float]] = None
+    # Out-of-gamut target policy for the gamut-aware (HDR) clamp — profile key ``oog_mapping``:
+    # "vertex" (default, owner decision 2026-09-23: luminance-preserving, target primaries/secondaries
+    # onto the panel's measured native ones) or "chroma-clip" (the legacy constant-ICtCp clip).
+    oog_mapping: str = "vertex"
 
     @property
     def is_hdr(self) -> bool:
@@ -396,9 +400,9 @@ class Profile:
         if spec.is_hdr:
             # NB: the HDR PQ container is fixed at 10000 nits; the display peak (spec.luminance_nits)
             # bounds the patch set elsewhere, not the engine Target — so it is not passed here.
-            return Target.hdr_rec2020_pq(white_xy=wxy)
+            return Target.hdr_rec2020_pq(white_xy=wxy, oog_mapping=spec.oog_mapping)
         return Target.sdr_srgb_power(gamma=spec.gamma, white_nits=spec.luminance_nits,
-                                     white_xy=wxy)
+                                     white_xy=wxy, oog_mapping=spec.oog_mapping)
 
     def resolve_hdr_target(self, target_name: str, *, dip: Any = None,
                            white_xy: Optional[tuple[float, float]] = None,
@@ -667,7 +671,21 @@ def _target_spec(name: str, raw: dict[str, Any]) -> TargetSpec:
         white_luminance_nits=float(raw.get("white_luminance_nits", 120.0)),
         peak_luminance_nits=(float(raw["peak_luminance_nits"]) if raw.get("peak_luminance_nits") else None),
         white_xy_override=white_override,
+        oog_mapping=_oog_mapping(raw.get("oog_mapping")),
     )
+
+
+_OOG_MAPPINGS = ("vertex", "chroma-clip")   # mirrors engine.model.OOG_MAPPINGS (profile load stays engine-free)
+
+
+def _oog_mapping(raw: Any) -> str:
+    """Validate a target's ``oog_mapping`` profile key (absent => the "vertex" default)."""
+    if raw is None:
+        return "vertex"
+    val = str(raw).strip().lower()
+    if val not in _OOG_MAPPINGS:
+        raise ValueError(f"oog_mapping must be one of {_OOG_MAPPINGS}, got {raw!r}")
+    return val
 
 
 def _probe_match_spec(raw: dict[str, Any]) -> ProbeMatchSpec:

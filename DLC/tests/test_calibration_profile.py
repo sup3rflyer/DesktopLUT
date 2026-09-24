@@ -446,3 +446,23 @@ def test_acceptance_targets_excludes_iteration_control_knobs():
         assert knob not in at
     # QualityTargets (the profile's advisory bar) inherits the projection.
     assert set(cp.QualityTargets().acceptance_targets()) == set(at)
+
+
+def test_target_oog_mapping_profile_key_defaults_to_vertex_and_reaches_the_engine_target():
+    # Owner decision 2026-09-23: out-of-gamut targets clamp to the confirmed native gamut edges
+    # ("vertex"); the legacy constant-ICtCp clip stays selectable per target for A/B / rollback.
+    spec = cp._target_spec("rec2020_pq", {"colorspace": "Rec.2020", "transfer": {"type": "pq"}})
+    assert spec.oog_mapping == "vertex"
+    legacy = cp._target_spec("rec2020_pq", {"colorspace": "Rec.2020", "transfer": {"type": "pq"},
+                                            "oog_mapping": "Chroma-Clip"})
+    assert legacy.oog_mapping == "chroma-clip"
+    with pytest.raises(ValueError):
+        cp._target_spec("rec2020_pq", {"transfer": {"type": "pq"}, "oog_mapping": "perceptual"})
+    pytest.importorskip("numpy")
+    pytest.importorskip("colour")
+    from dataclasses import replace
+    p = cp.Profile.synthetic()
+    assert p.engine_target("rec2020_pq").oog_mapping == "vertex"
+    assert p.engine_target("srgb_g22").oog_mapping == "vertex"
+    p.targets["rec2020_pq"] = replace(p.targets["rec2020_pq"], oog_mapping="chroma-clip")
+    assert p.engine_target("rec2020_pq").oog_mapping == "chroma-clip"

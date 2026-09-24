@@ -117,6 +117,13 @@ class PatchSizes:
     # GS+WB tweak. This is a count of grey PATCHES to measure, independent of the MHC
     # curve's point count (which the C++ side constrains to {10,20,32}).
     neutral_steps: int = 17         # grey-axis ramp steps
+    # HDR refine only: extra neutral pins placed DATA-DRIVEN in the last ``neutral_top_band`` fraction
+    # of the range below the MHC cap, where the build's base cube bends most (the panel's near-peak
+    # roll-off; mhc_cube.refine_top_pins). The refine interpolates its factors linearly between pins,
+    # so a steep top segment spanning one uniform step is under-constrained (run 120740: +5 % / y
+    # +0.011 at 0.80). Each pin = one extra bright neutral read per refine round. 0 => off.
+    neutral_top_pins: int = 3
+    neutral_top_band: float = 0.10
 
     # additive shadow density: preserve ordinary whole-range anchors, then add extra low-light
     # samples where the eye is most sensitive and the meter/panel are most nonlinear.
@@ -144,7 +151,7 @@ class PatchSizes:
             elif f.name in ("spines", "raw_include_secondaries"):
                 kw[f.name] = bool(v)
             elif f.name in ("gamut_lum_bias", "low_light_signal", "low_light_bias",
-                            "verify_color_min_signal", "raw_color_min_nits"):
+                            "verify_color_min_signal", "raw_color_min_nits", "neutral_top_band"):
                 kw[f.name] = float(v)
             elif f.name in ("raw_spacing", "volumetric_mode", "grid_type", "order"):
                 kw[f.name] = str(v)
@@ -367,11 +374,24 @@ def _project_and_thin(patches: list[tuple[int, int, int]], *, target: Any,
     corners collapse onto a thin boundary surface, so the moved set is then thinned to a minimum
     signal-space separation — which (a) kills the "50 patches on 0.001 of blue" waste, (b) makes the
     surviving count scale with reachable gamut volume (fixed spacing × larger volume ⇒ more patches),
-    and (c) avoids the near-coincident/collinear train points that would make the RBF singular."""
+    and (c) avoids the near-coincident/collinear train points that would make the RBF singular.
+
+    The SAMPLING geometry deliberately stays on the legacy ("chroma-clip") projection whatever the
+    run's out-of-gamut TARGET policy is. The 2026-09-23 vertex target map catches dim out-of-gamut
+    stimuli too (a relative gamut test), so projecting with it would move the dim pure-primary /
+    secondary bulk stimuli OFF the RGBCMY axes (run 120740's plan: 719 -> 649 patches, cv 10-277
+    axis levels lost) — yet under the vertex policy those axes are exactly where the targets live,
+    and the installed native-target MHC renders a pure wire channel AS the native primary, so they
+    are the most informative reads, not wasted ones."""
     if not patches:
         return patches
+    from dataclasses import replace as _replace
+
     import numpy as np
     from .engine.model import TargetSpace
+
+    if getattr(target, "oog_mapping", "chroma-clip") != "chroma-clip":
+        target = _replace(target, oog_mapping="chroma-clip")
 
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
     m = float(transfer.max_cv)
@@ -434,10 +454,13 @@ def build_volumetric_set(ps: PatchSizes, transfer: Transfer, *,
 
 def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
                       warm_tau: Optional[int] = None,
-                      max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+                      max_cv: Optional[int] = None,
+                      extra_levels: Optional[list[int]] = None) -> list[tuple[int, int, int]]:
     """The grey-axis ramp measured by the MHC closed-loop D65 grayscale refine (each round
     re-measures this neutral ramp and pulls the MHC correctionGrayscale layer toward D65).
-    ``max_cv`` caps the range (HDR peak; see :func:`build_ramp_set`)."""
+    ``max_cv`` caps the range (HDR peak; see :func:`build_ramp_set`). ``extra_levels`` (code values)
+    are unioned in before ordering — the HDR refine's data-driven top pins
+    (``Calibration._refine_neutral_patches``); clipped to ``[0, max_cv]``."""
     cap = max_cv if max_cv is not None else transfer.max_cv
     n = ps.neutral_steps
     levels = uniform_levels(n, cap)
@@ -445,6 +468,8 @@ def build_neutral_set(ps: PatchSizes, transfer: Transfer, *,
         levels = sorted(set(levels) | set(shadow_levels(
             ps.low_light_steps, transfer, max_cv=cap,
             max_signal=ps.low_light_signal, bias=ps.low_light_bias)))
+    if extra_levels:
+        levels = sorted(set(levels) | {min(cap, max(0, int(v))) for v in extra_levels})
     return sort_patches([(v, v, v) for v in levels], ps.order, transfer, warm_tau=warm_tau)
 
 

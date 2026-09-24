@@ -350,6 +350,7 @@ class Calibration:
         dark_floor_max_nits: Optional[float] = None,
         thermal_align: str = "auto",
         hook_routing_policy: str = "auto",
+        mhc_top_hold: bool = True,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -387,6 +388,11 @@ class Calibration:
         # 'auto' = optical proof only when the hook's routing report is ambiguous/unconfirmed/
         # absent; 'always' = prove it every run; 'never' = operator pre-decided (evidence only).
         self.hook_routing_policy = (hook_routing_policy or "auto").lower()
+        # MHC top hold (owner policy 2026-09-23 — "clamp to confirmed gamut edges" replaces "fade to
+        # identity"): the HDR base 1D cube holds each channel at its own neutral-cap index, at build
+        # and after every refine round, so greys above the calibrated top stay D65 at the cap. The
+        # 3D-LUT twin is OptimizeConfig.top_hold. False => the legacy shared-ceiling behaviour.
+        self.mhc_top_hold = bool(mhc_top_hold)
         self.optimize_config = optimize_config or OptimizeConfig()
         self.characterize_config = characterize_config
         self.run_date = run_date or date.today()
@@ -1225,7 +1231,13 @@ class Calibration:
 
     def _engine_target(self):
         # The 3D-LUT correction targets the SAME resolved white the MHC stages do.
-        return self.profile.engine_target(self.target_name, white_xy=self._white_xy())
+        target = self.profile.engine_target(self.target_name, white_xy=self._white_xy())
+        # The OOG policy is memoised in the run record the first time it is used (_oog_mapping):
+        # a resume keeps building/scoring/projecting with the policy the run started with.
+        cached = (getattr(self, "calib", None) or {}).get("oog_mapping")
+        if cached and cached != getattr(target, "oog_mapping", cached):
+            target = replace(target, oog_mapping=str(cached))
+        return target
 
     def _reachable_primaries(self) -> Optional[dict]:
         """The panel's MEASURED native primaries — THIS run's (from the raw stage's channel model,
@@ -1261,6 +1273,24 @@ class Calibration:
                 {ch: [float(xy[0]), float(xy[1])]
                  for ch, xy in dip.native_primaries.items() if xy and len(xy) >= 2})
         return prim
+
+    def _oog_mapping(self) -> str:
+        """The run's out-of-gamut target policy (``Target.oog_mapping`` of the engine target —
+        profile key ``oog_mapping``, default the owner's 2026-09-23 "vertex" policy), so verify and
+        the stage scores clamp exactly as the cube build did."""
+        cached = self.calib.get("oog_mapping")
+        if cached:
+            return str(cached)
+        default = "vertex"
+        if self.target_name is not None:
+            default = str(getattr(self.profile.target(self.target_name), "oog_mapping", "vertex") or "vertex")
+        # A record that already measured without a memo predates the policy: keep its legacy clamp
+        # (metrics.run_oog_mapping). Memoised in the run record — pinned at resolve-target, before
+        # any measurement — so a resume and the stage CLIs (score / report) score against the same
+        # policy the cube was built for.
+        value = metrics_mod.run_oog_mapping(self.calib, default=default)
+        self.calib["oog_mapping"] = value
+        return value
 
     def _optimizer_report_scorer(self):
         """The metric the 3D-LUT optimizer's SURFACED numbers are re-scored into for the LLM/user:
@@ -2306,6 +2336,7 @@ class Calibration:
         self._reject_mode_target_mismatch("resolve-target", target, spec)
         self.target_name = target
         self.calib["target"] = target
+        self._oog_mapping()           # pin the run's OOG target policy before anything is measured
         self._save()
         # HDR (PQ): resolve the chosen target (peak off the ladder, undershoot gain + knee,
         # fixed white) from the DIP now, so the plan digest reports the real peak and the
@@ -3424,6 +3455,7 @@ class Calibration:
             reachable = self._reachable_primaries() if spec.is_hdr else None
             if spec.is_hdr:
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy),
+                                                 oog_mapping=self._oog_mapping(),
                                                  peak_nits=self._hdr_target().peak_nits,
                                                  reachable_primaries=reachable)
                 metric_name = "dE_ITP"
@@ -3517,7 +3549,7 @@ class Calibration:
             # measured primaries + native-white→target-white matrix + tone-only base 1D).
             args = Namespace(run=self.ctx.root, monitor=self.monitor, mode=self.mode,
                              simulate=False, gamma=spec.gamma, source_ti3=raw_ti3,
-                             is_hdr=spec.is_hdr)
+                             is_hdr=spec.is_hdr, top_hold=self.mhc_top_hold)
             if spec.is_hdr:
                 # ONE SOURCE OF TRUTH (Task C): hand build-mhc the SAME resolved max-sustained peak
                 # patch bounding uses (_patch_max_cv → _hdr_target().peak_nits), so the MHC cube
@@ -3624,6 +3656,12 @@ class Calibration:
                 # The σ-aware adaptive dark floor's verdict (Phase 4, F4-1/HW-4): nits + how
                 # many strayed dark reads were σ-verified REAL drift (corrected) vs smoothed.
                 digest["dark_floor"] = params["dark_floor"]
+            top_hold = ((base_lut or {}).get("summary") or {}).get("top_hold")
+            if top_hold:
+                # Per-channel neutral-cap hold (owner policy 2026-09-23): where each channel's base
+                # LUT goes flat and at what drive — the evidence that greys above the calibrated top
+                # stay at the D65 cap white instead of walking back toward native.
+                digest["top_hold"] = top_hold
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
@@ -3809,6 +3847,7 @@ class Calibration:
         folds chroma into) over patches above a 1-nit floor — None/0 if no grey / scoring failed."""
         try:
             metrics, _lum = score_samples_hdr(samples, white_xy=white_xy,
+                                              oog_mapping=self._oog_mapping(),
                                               peak_nits=self._hdr_target().peak_nits,
                                               reachable_primaries=self._reachable_primaries())
             grey = [m for m in metrics if m.grayscale]
@@ -3897,6 +3936,13 @@ class Calibration:
                 self.controller.apply_mhc(self.monitor, self.mode)
                 cube_path = str(base_cube)
 
+            # The neutral ramp every round measures: the uniform ramp + data-driven pins just under the
+            # cap where the BUILD's base cube bends most (the refine interpolates its factors linearly
+            # between pins, so the steep near-peak segment needs denser pins). Derived from the build's
+            # cube (mhc_base_<mode>.cube, stable across rounds/resume) — never a refine output.
+            refine_patches, top_pins = self._refine_neutral_patches(
+                base_cube if base_cube.exists() else Path(cube_path), rowsums, cap_nits)
+
             scores: list[float] = []
             rounds_log: list[dict[str, Any]] = []
             installed = cube_path
@@ -3907,7 +3953,7 @@ class Calibration:
             rnd = 0
             while True:
                 rnd += 1
-                res = self._measure_set(self._neutral_patches(), role=f"refine{rnd}",
+                res = self._measure_set(refine_patches, role=f"refine{rnd}",
                                         ti3_name=f"refine_{rnd}.ti3",
                                         ndjson_name=f"refine_{rnd}.ndjson")
                 samples = parse_ti3(Path(res.ti3_path)) if res.ti3_path else []
@@ -3976,7 +4022,8 @@ class Calibration:
                     measured_neutral.append(entry + (noise,) if noise is not None else entry)
                 new_curves = refine_hdr_cube(
                     read_1d_cube(Path(installed)), measured_neutral, channel_peak_xyz, rowsums,
-                    peak_cap_nits=cap_nits, target_white_xy=(wx, wy), dark_floor_nits=dark_floor)
+                    peak_cap_nits=cap_nits, target_white_xy=(wx, wy), dark_floor_nits=dark_floor,
+                    top_hold=self.mhc_top_hold)
                 new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
                 write_1d_cube(new_path, new_curves,
                               title=f"DLC HDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
@@ -4009,7 +4056,9 @@ class Calibration:
                       "grey_avg_de_itp": final_avg, "best_grey_avg_de_itp": (
                           round(best_avg, 3) if best_avg != float("inf") else None),
                       "cap_nits": cap_nits, "binding_channel": peak_chroma.get("binding_channel"),
-                      "target_de_itp": target_de, "final_cube": Path(installed).name, **flags}
+                      "target_de_itp": target_de, "final_cube": Path(installed).name,
+                      "top_hold": self.mhc_top_hold, "top_pins": top_pins,
+                      "neutral_patches_per_round": len(refine_patches), **flags}
             return StageOutcome("refine-mhc-cube", "done", digest=digest,
                                 data={"rounds": len(rounds_log), "regressed": bool(flags.get("regressed")),
                                       "safety_ceiling": bool(flags.get("safety_ceiling")),
@@ -4815,10 +4864,20 @@ class Calibration:
         # non-HDR mode to the SDR ceiling; normalize_mode guarantees mode ∈ {SDR, HDR}.
         if self.mode != "HDR" and cfg.max_correction_cap == OptimizeConfig.max_correction_cap:
             return replace(cfg, max_correction_cap=SDR_CORRECTION_CAP)
+        # Top hold (owner policy 2026-09-23): the calibrated top IS the HDR patch cap (every post-MHC
+        # patch is bounded by it), so pin it explicitly rather than trusting the data's max channel.
+        if cfg.top_hold and cfg.top_hold_signal is None and self.target_name is not None:
+            # (No resolved target yet ⇒ leave it None: optimize_cube then derives the top from the
+            # measured stimuli, which the HDR patch cap bounds anyway.)
+            cap_cv = self._patch_max_cv()
+            max_cv = self._transfer().max_cv
+            if cap_cv and max_cv and cap_cv < max_cv:
+                return replace(cfg, top_hold_signal=cap_cv / max_cv)
         return cfg
 
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
+            self._oog_mapping()       # the cube, verify and the stage CLIs share one OOG policy
             target = self._engine_target()
             report_scorer, report_metric = self._optimizer_report_scorer()
             samples = parse_ti3(Path(post_ti3))
@@ -4933,6 +4992,7 @@ class Calibration:
             if spec.is_hdr:
                 hdr = self._hdr_target()
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits,
+                                                  oog_mapping=self._oog_mapping(),
                                                   reachable_primaries=reachable)
                 metric_name = "dE_ITP"
                 # Advisory HDR defaults (dE_ITP), overlaid by the profile's optional
@@ -5387,6 +5447,42 @@ class Calibration:
         return build_neutral_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
                                  max_cv=self._patch_max_cv())
 
+    def _refine_neutral_patches(self, base_cube_path: Path, rowsums: Sequence[float],
+                                cap_nits: float) -> tuple[list[tuple[int, int, int]], list[float]]:
+        """The HDR closed-loop refine's neutral ramp: the uniform ramp (:meth:`_neutral_patches`)
+        PLUS ``patch_sizes.neutral_top_pins`` data-driven pins in the last ``neutral_top_band`` of the
+        range below the cap, placed where the BUILD's base cube bends most
+        (:func:`dlc.mhc_cube.refine_top_pins`) — the refine interpolates its correction factors
+        linearly between pins, and the panel's near-peak roll-off lives in exactly that segment
+        (run 120740: +5 % luminance / y +0.011 at 0.80 between the 0.7605 and 0.8113 pins). Each pin
+        is ONE extra (bright, fast) neutral read per refine round. Returns ``(patches, top_pins)``
+        (``top_pins`` as signals, for the digest). Any failure falls back to the uniform ramp — the
+        pins are a refinement, never a precondition."""
+        base = self._neutral_patches()
+        ps = self.patch_sizes
+        if ps.neutral_top_pins <= 0:
+            return base, []
+        try:
+            from .mhc_cube import read_1d_cube, refine_top_pins
+
+            transfer = self._transfer()
+            max_cv = transfer.max_cv
+            cap_cv = self._patch_max_cv() or max_cv
+            existing = sorted({p[0] / max_cv for p in base})
+            pins = refine_top_pins(read_1d_cube(Path(base_cube_path)), rowsums, float(cap_nits),
+                                   existing=existing, count=ps.neutral_top_pins,
+                                   band=ps.neutral_top_band)
+        except Exception as exc:  # noqa: BLE001 - a refinement, never a precondition
+            self.ctx.log(f"refine top pins skipped ({type(exc).__name__}: {exc}); uniform ramp only")
+            return base, []
+        have = {p[0] for p in base}
+        extra = sorted({min(cap_cv, max(0, int(round(s * max_cv)))) for s in pins} - have)
+        if not extra:
+            return base, []
+        patches = build_neutral_set(ps, transfer, warm_tau=self._warm_tau(), max_cv=self._patch_max_cv(),
+                                    extra_levels=extra)
+        return patches, [round(v / max_cv, 6) for v in extra]
+
     def _grayscale_wb_patches(self) -> list[tuple[int, int, int]]:
         return build_grayscale_wb_set(self.patch_sizes, self._transfer(), max_cv=self._patch_max_cv())
 
@@ -5418,7 +5514,7 @@ class Calibration:
             **plan,
             "flow": flow,
             "bit_depth": self.bit_depth,
-            "patch_sizes": asdict(self.patch_sizes),
+            "patch_sizes": self._fingerprinted_patch_sizes(),
             "transfer": {
                 "kind": transfer.kind,
                 "gamma": transfer.gamma,
@@ -5431,6 +5527,19 @@ class Calibration:
         }
         payload = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return {**record, "fingerprint": hashlib.sha256(payload).hexdigest()[:16]}
+
+    # PatchSizes knobs added after plans were already approved: left out of the plan identity while
+    # at their defaults, so an in-flight run's approved fingerprint survives the upgrade (a
+    # non-default override still invalidates the plan, as any patch-size change does).
+    _FINGERPRINT_DEFAULT_EXEMPT = ("neutral_top_pins", "neutral_top_band")
+
+    def _fingerprinted_patch_sizes(self) -> dict[str, Any]:
+        sizes = asdict(self.patch_sizes)
+        defaults = asdict(PatchSizes())
+        for key in self._FINGERPRINT_DEFAULT_EXEMPT:
+            if sizes.get(key) == defaults.get(key):
+                sizes.pop(key, None)
+        return sizes
 
     def _finish(self, *, analysis: Optional[str] = None) -> CalibrationResult:
         rep = self.stage_report(analysis=analysis)
@@ -6046,6 +6155,7 @@ def run_calibration(
     force: bool = False,
     adaptive_planning: bool = False,
     require_hardware_readiness: bool = False,
+    mhc_top_hold: bool = True,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -6058,7 +6168,8 @@ def run_calibration(
         bit_depth=bit_depth, loop_config=loop_config, optimize_config=optimize_config,
         patch_sizes=patch_sizes, run_date=run_date, force=force,
         adaptive_planning=adaptive_planning,
-        require_hardware_readiness=require_hardware_readiness)
+        require_hardware_readiness=require_hardware_readiness,
+        mhc_top_hold=mhc_top_hold)
     return calib.run(flow)
 
 
@@ -6141,6 +6252,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     patch.add_argument("--neutral-steps", type=int, default=None, dest="neutral_steps",
                        help="grey-axis ramp steps measured by the MHC D65 grayscale refine "
                             "(the correctionGrayscale closed loop; default 17).")
+    patch.add_argument("--neutral-top-pins", type=int, default=None, dest="neutral_top_pins",
+                       help="HDR refine: extra neutral pins placed data-driven where the base cube bends "
+                            "most in the last --neutral-top-band of the range below the MHC cap (default 3; "
+                            "0 = off). Each pin is one extra bright neutral read per refine round.")
+    patch.add_argument("--neutral-top-band", type=float, default=None, dest="neutral_top_band",
+                       help="HDR refine: the fraction of the signal range below the cap the top pins may "
+                            "land in (default 0.10).")
     patch.add_argument("--low-light-steps", type=int, default=None, dest="low_light_steps",
                        help="extra ramp/tube levels inside the shadow band (default 9).")
     patch.add_argument("--low-light-cube-size", type=int, default=None, dest="low_light_cube_size",
@@ -6230,6 +6348,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "a SEAM (measure:<role>:thermal-align) when the interleaved reference's drift "
                              "is significant vs its own noise; end/start/mid: pre-decided (applied without "
                              "a pause, reported); none: evidence only, never rewrite.")
+    parser.add_argument("--top-hold", choices=("on", "off"), default="on", dest="top_hold",
+                        help="above the calibrated top (HDR: the MHC cap / patch cap), HOLD the last "
+                             "confirmed correction in both layers (owner policy 2026-09-23, default on): the "
+                             "MHC base cube keeps greys at the D65 cap white, the 3D LUT keeps each colour's "
+                             "corrected hue with its luminance clipped at the top. off = the legacy "
+                             "behaviour (shared MHC ceiling; 3D LUT fades to identity above the data).")
     parser.add_argument("--hook-routing-check", choices=("auto", "always", "never"), default="auto",
                         dest="hook_routing_policy",
                         help="DWM-hook LUT routing self-check for cube flows (full / 3dlut-only). The hook "
@@ -6648,7 +6772,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             neutral_chroma_span=args.neutral_chroma_span,
                             neutral_floor_min_nits=args.neutral_floor_min_nits,
                             thermal_align=args.thermal_align,
-                            hook_routing_policy=args.hook_routing_policy)
+                            hook_routing_policy=args.hook_routing_policy,
+                            mhc_top_hold=(args.top_hold == "on"),
+                            optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on")))
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:

@@ -1,4 +1,8 @@
-"""Tests for the #C3 native-gamut target clamp (constant-luminance, hue-preserving chroma clip).
+"""Tests for the #C3 native-gamut target clamp.
+
+Two policies (``Target.oog_mapping``): the DEFAULT "vertex" map (owner decision 2026-09-23 —
+luminance-preserving, Rec.2020 primaries/secondaries onto the panel's measured native ones) and the
+legacy "chroma-clip" (constant ICtCp intensity + hue), kept for A/B and rollback.
 
 A real panel's native gamut is narrower than Rec.2020, so a saturated ideal target is physically
 unreachable; without a clamp the optimizer/verify chase it and score a gamut clip as panel error.
@@ -51,7 +55,9 @@ def test_clamp_is_noop_without_reachable_primaries():
 
 
 def test_clamp_projects_out_of_gamut_target_to_reachable_boundary():
-    tgt = Target.hdr_rec2020_pq(white_xy=D65)
+    # The LEGACY #C3 policy (oog_mapping="chroma-clip"): constant ICtCp intensity + hue. Kept
+    # bit-identical for A/B and rollback; the default is now the vertex map (tests below).
+    tgt = Target.hdr_rec2020_pq(white_xy=D65, oog_mapping="chroma-clip")
     sig = np.array([[0.6, 0.0, 0.0]])   # saturated red — outside the narrow panel gamut
     ip = TargetSpace(tgt).ideal_xyz(sig)
     ic = TargetSpace(tgt, reachable_primaries=NARROW).ideal_xyz(sig)
@@ -123,3 +129,106 @@ def test_xyz_to_ictcp_guards_nonphysical_inputs_without_touching_physical():
     target = sp.ideal_ictcp(np.array([[0.0, 0.0, 0.5]]))
     de = de_itp(guarded - target)
     assert np.all(np.isfinite(de)) and de.max() < 1e4
+
+
+# ---------------------------------------------------------------------------
+# Vertex-correspondence OOG policy (owner decision 2026-09-23) — the DEFAULT oog_mapping.
+# ---------------------------------------------------------------------------
+
+# The PA32UCXR's measured native primaries (run 120740 mhc_params) — a real sub-Rec.2020 panel.
+PA32 = {"R": [0.692647, 0.303009], "G": [0.180898, 0.751], "B": [0.152078, 0.064913]}
+
+
+def _xy(xyz):
+    xyz = np.asarray(xyz, float).reshape(-1, 3)
+    s = xyz.sum(axis=1)
+    return np.stack([xyz[:, 0] / s, xyz[:, 1] / s], axis=1)
+
+
+def _native_secondary_xy(primaries, ons):
+    cs = _native_colourspace(primaries, D65)
+    return _xy(colour.RGB_to_XYZ(np.array([ons], float), cs))[0]
+
+
+def test_vertex_is_the_default_policy():
+    assert Target.hdr_rec2020_pq().oog_mapping == "vertex"
+    assert Target.sdr_srgb_power().oog_mapping == "vertex"
+    assert TargetSpace(Target.hdr_rec2020_pq(), reachable_primaries=PA32).oog_mapping == "vertex"
+
+
+def test_unknown_oog_mapping_is_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        TargetSpace(Target.hdr_rec2020_pq(oog_mapping="nope"))
+
+
+def test_vertex_leaves_every_in_gamut_target_bit_identical():
+    tgt = Target.hdr_rec2020_pq(white_xy=D65)
+    raw, mapped = TargetSpace(tgt), TargetSpace(tgt, reachable_primaries=PA32)
+    sig = np.random.default_rng(3).random((4000, 3)) * 0.85
+    a, b = raw.ideal_xyz(sig), mapped.ideal_xyz(sig)
+    inside = _native_rgb(a, PA32).min(axis=1) >= 0.0
+    assert inside.sum() > 500
+    assert np.array_equal(a[inside], b[inside])            # bit-identical, not merely close
+
+
+def test_vertex_maps_rec2020_primaries_and_secondaries_onto_native_vertices_at_target_luminance():
+    tgt = Target.hdr_rec2020_pq(white_xy=D65)
+    raw, mapped = TargetSpace(tgt), TargetSpace(tgt, reachable_primaries=PA32)
+    anchors = {(1, 0, 0): PA32["R"], (0, 1, 0): PA32["G"], (0, 0, 1): PA32["B"],
+               (0, 1, 1): _native_secondary_xy(PA32, (0, 1, 1)),
+               (1, 0, 1): _native_secondary_xy(PA32, (1, 0, 1)),
+               (1, 1, 0): _native_secondary_xy(PA32, (1, 1, 0))}
+    for ons, want_xy in anchors.items():
+        for level in (0.2, 0.5, 0.8):                       # dim targets are mapped too (relative test)
+            sig = np.array([[level * c for c in ons]], float)
+            a, b = raw.ideal_xyz(sig)[0], mapped.ideal_xyz(sig)[0]
+            assert abs(b[1] - a[1]) <= 1e-9 * max(1.0, a[1])   # luminance (CIE Y) preserved exactly
+            assert np.allclose(_xy(b)[0], want_xy, atol=2e-4), (ons, level, _xy(b)[0], want_xy)
+
+
+def test_vertex_blue_target_contains_no_green_and_keeps_luminance_unlike_ictcp_clip():
+    # The run-120740 failure: the ICtCp clip sent Rec.2020 blue to xy ~(0.155, 0.138) at +34 % Y (a
+    # green-contaminated, brighter "blue"). The vertex target is the panel's native blue at the
+    # SAME Y: in native RGB it is pure blue (no red/green drive needed).
+    sig = np.array([[0.0, 0.0, 0.7]])
+    legacy = TargetSpace(Target.hdr_rec2020_pq(white_xy=D65, oog_mapping="chroma-clip"),
+                         reachable_primaries=PA32).ideal_xyz(sig)[0]
+    vertex = TargetSpace(Target.hdr_rec2020_pq(white_xy=D65), reachable_primaries=PA32).ideal_xyz(sig)[0]
+    raw = TargetSpace(Target.hdr_rec2020_pq(white_xy=D65)).ideal_xyz(sig)[0]
+    assert legacy[1] > 1.2 * raw[1] and _xy(legacy)[0][1] > 0.12          # the documented defect
+    rgb = _native_rgb(vertex[None], PA32)[0]
+    assert rgb[2] > 0 and abs(rgb[0]) < 1e-6 * rgb[2] and abs(rgb[1]) < 1e-6 * rgb[2]
+    assert abs(vertex[1] - raw[1]) < 1e-9 * raw[1]
+
+
+def test_vertex_mapping_is_continuous_at_the_native_boundary():
+    # A target just outside a native edge moves only a hair (the u→0 end of the blend is the
+    # straight-toward-white clip, continuous with the untouched interior).
+    tgt = Target.hdr_rec2020_pq(white_xy=D65)
+    raw, mapped = TargetSpace(tgt), TargetSpace(tgt, reachable_primaries=PA32)
+    base = np.array([0.30, 0.05, 0.60])                     # a violet inside the native gamut
+    for scale in np.linspace(1.0, 0.0, 41):                 # walk toward the R-B edge by dropping green
+        sig = base * [1.0, scale, 1.0]
+        a, b = raw.ideal_xyz(sig[None])[0], mapped.ideal_xyz(sig[None])[0]
+        rgb = _native_rgb(a, PA32)[0]
+        if rgb.min() < 0:                                    # first out-of-gamut step: tiny move
+            gap = np.hypot(*(_xy(a)[0] - _xy(b)[0]))
+            depth = -rgb.min() / np.abs(rgb).max()
+            assert gap < 0.05 * max(depth, 1e-3) + 2e-3
+            break
+
+
+def test_vertex_mapped_targets_are_reachable_and_ordered_along_a_ramp():
+    tgt = Target.hdr_rec2020_pq(white_xy=D65)
+    mapped = TargetSpace(tgt, reachable_primaries=NARROW)
+    sig = np.random.default_rng(5).random((3000, 3)) * 0.8
+    out = mapped.ideal_xyz(sig)
+    rgb = _native_rgb(out, NARROW)
+    mag = np.abs(rgb).max(axis=1)
+    assert np.all(rgb.min(axis=1) >= -1e-6 * np.maximum(mag, 1e-12))
+    # score_hdr flags exactly the rows the map moved (dim OOG rows included).
+    raw = TargetSpace(tgt).ideal_xyz(sig)
+    moved = np.any(raw != out, axis=1)
+    flags = score_hdr(sig, out, white_xy=D65, reachable_primaries=NARROW)["gamut_clamped"]
+    assert np.array_equal(flags, moved)

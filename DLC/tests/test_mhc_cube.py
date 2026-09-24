@@ -453,7 +453,16 @@ def test_refine_hdr_cube_leaves_neutral_panel_alone():
     new = mc.refine_hdr_cube(cube, meas, peaks, (1.0, 1.0, 1.0), peak_cap_nits=peak, dark_floor_nits=0.5)
     for ch in "rgb":
         for j in range(0, N, 8):
-            assert abs(new[ch][j] - cube[ch][j]) < 5e-3, (ch, j, new[ch][j], cube[ch][j])
+            if grid[j] <= smax:                    # the calibrated range: untouched
+                assert abs(new[ch][j] - cube[ch][j]) < 5e-3, (ch, j, new[ch][j], cube[ch][j])
+            else:                                  # above the cap: held at the cap drive (top hold)
+                assert abs(new[ch][j] - smax) < 5e-3, (ch, j, new[ch][j], smax)
+    # top_hold=False keeps the legacy flat-factor extrapolation (identity here) above the cap.
+    legacy = mc.refine_hdr_cube(cube, meas, peaks, (1.0, 1.0, 1.0), peak_cap_nits=peak,
+                                dark_floor_nits=0.5, top_hold=False)
+    for ch in "rgb":
+        for j in range(0, N, 8):
+            assert abs(legacy[ch][j] - cube[ch][j]) < 5e-3, (ch, j, legacy[ch][j], cube[ch][j])
 
 
 def test_write_1d_cube_roundtrips(tmp_path):
@@ -1050,3 +1059,173 @@ def test_build_hdr_cube_peak_share_unity_when_ceiling_below_full_drive():
     _curves, summary = mc.build_hdr_cube(ramp, _PRIM, _WHITE, _PEAK, lut_size=256)  # ceiling = 1000
     for ch in "rgb":
         assert abs(summary[f"{ch}_peak_share"] - 1.0) < 0.05, summary
+
+
+# --- Top hold above the calibrated cap (owner policy 2026-09-23) -------------
+# "Clamp to confirmed gamut edges" replaces "fade to identity": above the cap the MHC base cube holds
+# the last confirmed correction — a wire neutral above the cap stays at the D65 cap white — which
+# needs a PER-CHANNEL hold index because the cube is applied AFTER a non-identity matrix.
+
+_WARM = (0.336, 0.345)                      # warm native white -> diagonal native-target rowsums != 1
+
+
+def _warm_panel(native_peak=1600.0):
+    P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"],
+                          _PRIM["bx"], _PRIM["by"], _WARM[0], _WARM[1], white_Y=1.0)
+
+    def light(d):                            # perfect PQ tracking up to the native peak, then clip
+        return min(mc.pq_eotf(max(0.0, min(d, 1.0))) * 10000.0, native_peak)
+
+    def emit(drive):
+        f = [light(d) for d in drive]
+        return tuple(sum(P[r][c] * f[c] for c in range(3)) for r in range(3))
+
+    M = mc.mhc2_matrix(_PRIM, _WARM, _PRIM, (0.3127, 0.3290))
+    return emit, [sum(M[r]) for r in range(3)], P
+
+
+def _render(curves, rowsums, emit, s):
+    lin = mc.pq_eotf(s)
+    drive = [mc._sample_curve(curves[ch], mc.pq_oetf(min(max(rowsums[c] * lin, 0.0), 1.0)))
+             for c, ch in enumerate("rgb")]
+    return emit(drive), drive
+
+
+def test_neutral_hold_abscissae_follow_each_channels_rowsum():
+    cap = 1727.4304
+    h = mc.neutral_hold_abscissae((0.915, 1.034, 1.028), cap)
+    assert h[0] < mc.pq_oetf(cap / 10000.0) < h[2] < h[1]
+    assert abs(h[0] - mc.pq_oetf(0.915 * cap / 10000.0)) < 1e-12
+    assert mc.neutral_hold_abscissae((1.0, 1.0, 1.0), 10000.0) == [1.0, 1.0, 1.0]
+    with pytest.raises(ValueError):
+        mc.neutral_hold_abscissae((1.0, 1.0, 1.0), 0.0)
+
+
+def test_hold_above_cap_is_flat_above_each_index_untouched_below_and_idempotent():
+    n = 256
+    grid = [j / (n - 1) for j in range(n)]
+    curves = {ch: list(grid) for ch in "rgb"}
+    rowsums, cap = (0.9, 1.0, 1.1), 1000.0
+    held, info = mc.hold_above_cap(curves, rowsums, cap)
+    for c, ch in enumerate("rgb"):
+        h = mc.pq_oetf(rowsums[c] * cap / 10000.0)
+        assert abs(info["hold_abscissae"][ch] - round(h, 6)) < 1e-9
+        j0 = math.ceil(h * (n - 1))                         # first node at/above the hold index
+        for j in range(n):
+            if j <= j0:
+                assert held[ch][j] == curves[ch][j]         # the calibrated range stays bit-exact
+            else:
+                assert held[ch][j] == curves[ch][j0]        # exactly flat from the hold node on
+        assert 0.0 <= grid[j0] - h < 1.0 / (n - 1)          # snapped at most one node late
+    again, _ = mc.hold_above_cap(held, rowsums, cap)
+    assert again == held                                    # idempotent (no creep across rounds)
+
+
+def test_build_hdr_cube_with_rowsums_holds_d65_cap_white_above_the_cap():
+    emit, rowsums, P = _warm_panel()
+    cap = 1000.0
+    samples = []
+    for i in range(121):                                     # grey ramp to full drive (headroom greys)
+        s = i / 120
+        f = emit([s, s, s])
+        samples.append(Ti3Sample(rgb=(s, s, s), xyz=f))
+    max_drive = mc.pq_oetf(1600.0 / 10000.0)                  # the additive policy's drive bound
+    new, summary = mc.build_hdr_cube(samples, _PRIM, _WARM, cap, lut_size=1024, dark_floor_nits=0.1,
+                                     matrix_rowsums=rowsums, max_drive=max_drive)
+    legacy, _ = mc.build_hdr_cube(samples, _PRIM, _WARM, cap, lut_size=1024, dark_floor_nits=0.1,
+                                  max_drive=max_drive)
+    assert summary["top_hold"]["hold_abscissae"]["r"] < summary["top_hold"]["hold_abscissae"]["b"]
+    s_cap = mc.pq_oetf(cap / 10000.0)
+    xyz_cap, drive_cap = _render(new, rowsums, emit, s_cap)
+    x, y = _xy(xyz_cap)
+    assert abs(x - 0.3127) < 1.5e-3 and abs(y - 0.3290) < 1.5e-3, (x, y)   # D65 at the cap ...
+    assert abs(xyz_cap[1] - cap) < 0.01 * cap
+    for s in (s_cap + 0.01, 0.85, 0.9, 1.0):                                  # ... held above it
+        xyz, drive = _render(new, rowsums, emit, s)
+        assert max(abs(a - b) for a, b in zip(drive, drive_cap)) < 2e-3, (s, drive, drive_cap)
+        assert abs(_xy(xyz)[0] - x) < 1e-3 and abs(xyz[1] - xyz_cap[1]) < 0.01 * cap
+    # The legacy shared ceiling lets the low-rowsum channel keep rising above the cap: warm drift.
+    xyz_old, _ = _render(legacy, rowsums, emit, 0.95)
+    assert _xy(xyz_old)[0] > 0.3127 + 3e-3
+
+
+def test_refine_hdr_cube_top_hold_keeps_the_cap_white_above_the_cap():
+    emit, rowsums, P = _warm_panel()
+    peaks = [[P[r][c] * 1600.0 for r in range(3)] for c in range(3)]
+    cap = 1000.0
+    s_cap = mc.pq_oetf(cap / 10000.0)
+    n = 512
+    grid = [j / (n - 1) for j in range(n)]
+    held = {ch: list(grid) for ch in "rgb"}
+    legacy = {ch: list(grid) for ch in "rgb"}
+    sigs = [f * s_cap for f in (0.35, 0.5, 0.65, 0.8, 0.9, 1.0)]
+    for _ in range(6):
+        held = mc.refine_hdr_cube(held, [(s, _render(held, rowsums, emit, s)[0]) for s in sigs],
+                                  peaks, rowsums, peak_cap_nits=cap, dark_floor_nits=0.5)
+        legacy = mc.refine_hdr_cube(legacy, [(s, _render(legacy, rowsums, emit, s)[0]) for s in sigs],
+                                    peaks, rowsums, peak_cap_nits=cap, dark_floor_nits=0.5, top_hold=False)
+    xyz_cap, drive_cap = _render(held, rowsums, emit, s_cap)
+    for s in (0.85, 0.92, 1.0):
+        xyz, drive = _render(held, rowsums, emit, s)
+        assert max(abs(a - b) for a, b in zip(drive, drive_cap)) < 2e-3
+        x, y = _xy(xyz)
+        assert abs(x - 0.3127) < 2.5e-3 and abs(y - 0.3290) < 2.5e-3, (s, x, y)
+    x_old, _ = _xy(_render(legacy, rowsums, emit, 0.95)[0])
+    assert x_old > 0.3127 + 3e-3                              # legacy: warm drift above the cap
+
+
+def test_refine_top_pins_land_where_the_curve_bends_below_the_cap():
+    n = 1024
+    grid = [j / (n - 1) for j in range(n)]
+    kink = 0.78
+    bent = [x if x < kink else kink + 1.5 * (x - kink) for x in grid]
+    curves = {"r": [min(v, 1.0) for v in bent], "g": list(grid), "b": list(grid)}
+    cap = 1727.4304
+    s_cap = mc.pq_oetf(cap / 10000.0)
+    existing = [round(k * 0.0507, 6) for k in range(17)]                   # uniform ramp to ~0.811
+    one = mc.refine_top_pins(curves, (1.0, 1.0, 1.0), cap, existing=existing, count=1)
+    assert len(one) == 1 and abs(one[0] - kink) < 0.006, one
+    three = mc.refine_top_pins(curves, (1.0, 1.0, 1.0), cap, existing=existing, count=3)
+    assert len(three) == 3 and three == sorted(three)
+    lo = s_cap * 0.9
+    allpins = sorted(existing + three)
+    for p in three:
+        assert lo <= p < s_cap
+    assert min(b - a for a, b in zip(allpins, allpins[1:])) >= 3.0 / 1023.0 - 1e-12
+    assert mc.refine_top_pins(curves, (1.0, 1.0, 1.0), cap, existing=existing, count=0) == []
+
+
+def test_refine_top_pins_straight_curve_falls_back_to_widest_gaps():
+    n = 1024
+    grid = [j / (n - 1) for j in range(n)]
+    ident = {ch: list(grid) for ch in "rgb"}
+    cap = 1727.4304
+    s_cap = mc.pq_oetf(cap / 10000.0)
+    existing = [0.70, 0.76, s_cap]
+    pins = mc.refine_top_pins(ident, (1.0, 1.0, 1.0), cap, existing=existing, count=2)
+    assert len(pins) == 2
+    # Both land in the band at gap midpoints (a deterministic densification, not at random).
+    for p in pins:
+        assert s_cap * 0.9 <= p < s_cap
+    assert pins == mc.refine_top_pins(ident, (1.0, 1.0, 1.0), cap, existing=existing, count=2)
+
+
+def test_build_hdr_cube_does_not_extend_an_unbounded_channel_into_the_plateau():
+    # Without a max_drive bound, a rowsum > 1 channel keeps the legacy shared ceiling (a target share
+    # past it would invert into the flat near-peak plateau) — but it is still HELD at its own index.
+    emit, rowsums, _P = _warm_panel()
+    cap = 1000.0
+    samples = [Ti3Sample(rgb=(i / 120,) * 3, xyz=emit([i / 120] * 3)) for i in range(121)]
+    unbounded, summary = mc.build_hdr_cube(samples, _PRIM, _WARM, cap, lut_size=1024,
+                                           dark_floor_nits=0.1, matrix_rowsums=rowsums)
+    legacy, _ = mc.build_hdr_cube(samples, _PRIM, _WARM, cap, lut_size=1024, dark_floor_nits=0.1)
+    n = 1024
+    b = 2                                                      # blue: rowsum 1.19 on this panel
+    assert rowsums[b] > 1.0
+    assert abs(unbounded["b"][-1] - legacy["b"][-1]) < 1e-9    # not extended past the shared ceiling
+    h = summary["top_hold"]["hold_abscissae"]["b"]
+    above = [unbounded["b"][j] for j in range(n) if j / (n - 1) > h + 1.0 / (n - 1)]
+    assert max(above) - min(above) < 1e-12                     # still held flat above its index
+    r = 0                                                      # red: rowsum < 1 -> held early, below legacy
+    assert rowsums[r] < 1.0 and unbounded["r"][-1] < legacy["r"][-1] - 1e-3
+
