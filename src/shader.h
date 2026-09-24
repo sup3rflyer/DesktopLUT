@@ -5,6 +5,7 @@
 
 #include "../shared/peak_detect.h"     // g_peakReduceCSSource / g_peakSmoothCSSource
 #include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the hook)
+#include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF output dither, shared with the hook)
 
 // Vertex shader: fullscreen triangle (no vertex buffer)
 inline const char* g_vsSource = R"(
@@ -56,7 +57,7 @@ cbuffer LUTParams : register(b0) {
     float motionBarEnabled;
     float motionBarPosition;
     float grayscaleICtCp;          // HDR: use ICtCp offsets instead of PQ per-channel gains
-    float motionBarPad1;
+    float hdrDitherLsb;            // HDR output dither amplitude: 1/1023 (+-1 LSB 10-bit PQ, TPDF) or 0 = off
     // SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md). xyz = net
     // as-applied MHC2 RGB->RGB matrix rows; w packs flags.
     float4 corrPreviewMatRow0;     // xyz = result row 0; w = corrGsFullPreview (0/1)
@@ -537,26 +538,18 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 // before ICtCp conversion (Stage 4 in HDR pipeline). This saves 5 pow/pixel when
 // only grayscale is active (no tonemap). The CPU precomputes PQ→linear gains per channel.
 
-// ICTCP Dithering: adds perceptually uniform blue noise
-// Dithering in ICtCp space ensures noise is distributed according to human perception
-// I channel gets more dither (luminance banding is most visible in dark areas)
-// CT/CP get less dither (chroma is less sensitive)
-float3 ApplyDitherICtCp(float3 ictcp, float2 pos) {
-    float2 noiseUV = pos / 64.0f;
-
-    // Sample blue noise texture at different offsets for decorrelated I/CT/CP noise
-    float noiseI  = blueNoiseTexture.Sample(wrapSampler, noiseUV);
-    float noiseCT = blueNoiseTexture.Sample(wrapSampler, noiseUV + float2(0.5f, 0.0f));
-    float noiseCP = blueNoiseTexture.Sample(wrapSampler, noiseUV + float2(0.0f, 0.5f));
-
-    // Dither amplitude: ~1 LSB in 10-bit PQ = 1/1023 ≈ 0.001
-    // I channel: full amplitude (luminance banding most visible)
-    // CT/CP: half amplitude (chroma less sensitive, avoid color noise)
-    float ditherI  = (noiseI  - 0.5f) / 1023.0f;
-    float ditherCT = (noiseCT - 0.5f) / 2046.0f;
-    float ditherCP = (noiseCP - 0.5f) / 2046.0f;
-
-    return ictcp + float3(ditherI, ditherCT, ditherCP);
+// HDR output dither: one copy shared with the DWM hook (shared/hdr_dither.h, rationale there).
+)"
+DLUT_HDR_DITHER_HLSL
+R"(
+// Three decorrelated blue-noise samples per pixel from the static tile. R8_UNORM holds b/255; remapped to the
+// hook's texel-centre (b + 0.5) / 256 so both paths draw the same noise (u strictly inside (0, 1)).
+float3 HdrDitherNoise(float2 pos) {
+    float2 uv = pos / 64.0f;
+    float3 t = float3(blueNoiseTexture.Sample(wrapSampler, uv),
+                      blueNoiseTexture.Sample(wrapSampler, uv + float2(0.5f, 0.0f)),
+                      blueNoiseTexture.Sample(wrapSampler, uv + float2(0.0f, 0.5f)));
+    return t * (255.0f / 256.0f) + 0.5f / 256.0f;
 }
 )"
 // Part 4: LUT sampling functions
@@ -702,7 +695,6 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             // Tonemap (I-channel, preserves Ct/Cp grayscale corrections)
             if (tonemapEnabled > 0.5) {
                 ictcp = ApplyTonemappingICtCp(ictcp);
-                ictcp = ApplyDitherICtCp(ictcp, pos.xy);
             }
 
             // Back to Rec.2020
@@ -742,13 +734,23 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // STAGE 7: LUT application or passthrough -> Output
         // ═══════════════════════════════════════════════════════════════════════
 
+        // Output dither in the display quantizer's domain (PQ), AFTER the LUT (shared/hdr_dither.h).
         float3 linearRec2020;
         if (usePassthrough > 0.5) {
-            // No LUT — skip PQ round-trip
-            linearRec2020 = rec2020_out * (10000.0f / 80.0f);
+            // No LUT — skip the PQ round-trip unless dithering; then today's value plus only the dither's
+            // linear delta (colours outside Rec.2020 pass through untouched).
+            linearRec2020 = rec2020_out;
+            if (hdrDitherLsb > 0.0f) {
+                float3 pq0 = Linear_to_PQ(saturate(rec2020_out));
+                linearRec2020 += PQ_to_Linear(DlutDitherPQ(pq0, HdrDitherNoise(pos.xy), hdrDitherLsb))
+                                 - PQ_to_Linear(pq0);
+            }
+            linearRec2020 *= (10000.0f / 80.0f);
         } else {
             float3 pqRGB = Linear_to_PQ(rec2020_out);
             float3 lutResult = SampleLUT(pqRGB);
+            if (hdrDitherLsb > 0.0f)
+                lutResult = saturate(DlutDitherPQ(lutResult, HdrDitherNoise(pos.xy), hdrDitherLsb));
             linearRec2020 = PQ_to_Linear(lutResult) * (10000.0f / 80.0f);
         }
 

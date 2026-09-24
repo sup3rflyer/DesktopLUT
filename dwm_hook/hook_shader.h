@@ -7,8 +7,9 @@
 #include "hook_log.h"  // STRINGIFY, DITHER_GAMMA
 #include "noise.h"     // NOISE_SIZE
 #include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the overlay)
+#include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF dither, shared with the overlay)
 
-// Main vertex + pixel shader (VS, PS) — handles HDR/SDR/ACM color modes, ICtCp tonemapping, 3D LUT, dithering
+// Main vertex + pixel shader (VS, PS) — handles HDR/SDR/ACM color modes, ICtCp tonemapping, 3D LUT, output dither
 static char g_shaders[] = R"(
 struct VS_INPUT {
 	float2 pos : POSITION;
@@ -45,7 +46,7 @@ cbuffer Constants : register(b0) {
 
 	int tonemapDynamic;
 	int hasLut;          // 1 if 3D LUT loaded for this monitor
-	float pad1;
+	float hdrDitherLsb;  // HDR output dither amplitude: 1/1023 (+-1 LSB of 10-bit PQ, TPDF) or 0 = off
 	float pad2;
 };
 
@@ -223,15 +224,14 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 	return float3(I_mapped, ictcp.y, ictcp.z);
 }
 
-float3 ApplyDitherICtCp(float3 ictcp, float2 pos) {
-	float2 noiseUV = pos / )" STRINGIFY(NOISE_SIZE) R"(;
-	float noiseI  = noiseTex.Sample(noiseSmp, noiseUV).x;
-	float noiseCT = noiseTex.Sample(noiseSmp, noiseUV + float2(0.5, 0.0)).x;
-	float noiseCP = noiseTex.Sample(noiseSmp, noiseUV + float2(0.0, 0.5)).x;
-	float ditherI  = (noiseI  - 0.5) / 1023.0;
-	float ditherCT = (noiseCT - 0.5) / 2046.0;
-	float ditherCP = (noiseCP - 0.5) / 2046.0;
-	return ictcp + float3(ditherI, ditherCT, ditherCP);
+)" DLUT_HDR_DITHER_HLSL R"(
+// Three decorrelated blue-noise samples per pixel from the static tile (texel centres, (b + 0.5) / 256): the
+// half-tile offsets put the R/G/B samples 32 texels apart (pairwise correlation <= 0.02 on this tile).
+float3 HdrDitherNoise(float2 pos) {
+	float2 uv = pos / )" STRINGIFY(NOISE_SIZE) R"(;
+	return float3(noiseTex.Sample(noiseSmp, uv).x,
+	              noiseTex.Sample(noiseSmp, uv + float2(0.5, 0.0)).x,
+	              noiseTex.Sample(noiseSmp, uv + float2(0.0, 0.5)).x);
 }
 
 // ========== LUT sampling ==========
@@ -308,11 +308,11 @@ float4 PS(VS_OUTPUT input) : SV_TARGET {
 	float3 sample = backBufferTex.Sample(smp, input.tex).rgb;
 
 	if (colorMode == 1) {
-		// HDR: scRGB linear -> Rec.2020 -> [tonemap in ICtCp] -> PQ -> LUT -> scRGB
+		// HDR: scRGB linear -> Rec.2020 -> [tonemap in ICtCp] -> PQ -> LUT -> output dither (PQ) -> scRGB
 		float3 rec2020 = mul(scrgb_to_bt2100, sample);
 
 		if (tonemapEnabled) {
-			// Rec.2020 -> LMS -> PQ -> ICtCp -> Tonemap(I) -> Dither -> reverse
+			// Rec.2020 -> LMS -> PQ -> ICtCp -> Tonemap(I) -> reverse
 			// Note: rec2020 is already normalized (10000 nits = 1.0) via scrgb_to_bt2100 matrix,
 			// unlike the overlay shader where rec2020 is scRGB-scale (80 nits = 1.0).
 			// No 80/10000 scaling needed here.
@@ -320,19 +320,23 @@ float4 PS(VS_OUTPUT input) : SV_TARGET {
 			float3 lmsPQ = Linear_to_PQ(lms);
 			float3 ictcp = mul(LMSprime_to_ICtCp, lmsPQ);
 			ictcp = ApplyTonemappingICtCp(ictcp);
-			ictcp = ApplyDitherICtCp(ictcp, input.pos.xy);
 			float3 lmsPQ2 = mul(ICtCp_to_LMSprime, ictcp);
 			rec2020 = mul(LMS_to_Rec2020, PQ_to_Linear(lmsPQ2));
 		}
 
+		// Output dither in the display quantizer's domain (PQ), AFTER the LUT (shared/hdr_dither.h).
+		float3 u = HdrDitherNoise(input.pos.xy);
+		float3 pq = pq_inv_eotf(saturate(rec2020));
 		if (hasLut) {
-			// PQ encode -> LUT -> PQ decode -> scRGB
-			float3 pq = pq_inv_eotf(saturate(rec2020));
+			// PQ encode -> LUT -> dither -> PQ decode -> scRGB. The saturate also keeps a user cube with
+			// out-of-range entries from reaching the EOTF (the loader does not clamp).
 			float3 lut_out = LutTransformTetrahedral(pq);
-			return float4(mul(bt2100_to_scrgb, pq_eotf(lut_out)), 1);
+			return float4(mul(bt2100_to_scrgb, pq_eotf(saturate(DlutDitherPQ(lut_out, u, hdrDitherLsb)))), 1);
 		} else {
-			// No LUT — passthrough
-			return float4(mul(bt2100_to_scrgb, rec2020), 1);
+			// No LUT (tonemap only): today's unclipped value plus only the dither's linear delta, so colours
+			// outside Rec.2020 pass through untouched and hdrDitherLsb = 0 adds exactly nothing.
+			float3 delta = pq_eotf(DlutDitherPQ(pq, u, hdrDitherLsb)) - pq_eotf(pq);
+			return float4(mul(bt2100_to_scrgb, rec2020 + delta), 1);
 		}
 	}
 	else if (colorMode == 2) {

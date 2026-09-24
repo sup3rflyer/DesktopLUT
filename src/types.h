@@ -67,6 +67,7 @@ struct MovableAtomic {
 #define ID_STOP             109
 #define ID_STATUS           111
 #define ID_TETRAHEDRAL_CHECK 112
+#define ID_HDR_DITHER_CHECK  114
 #define ID_TRAY_ICON        1
 #define WM_TRAYICON              (WM_USER + 1)
 #define WM_UPDATE_ANALYSIS       (WM_USER + 2)
@@ -741,6 +742,7 @@ struct MonitorContext {
                                              //   IPC corrections_enabled. NOT the DWM-hook state. docs/NAMING.md §4.
     bool lastDesktopGamma = true;            // Cached atomic value
     bool lastTetrahedralInterp = false;      // Cached atomic value
+    bool lastHdrDither = true;               // Cached atomic value (g_hdrDither)
     bool grayscaleICtCp = false;             // true = shader uses ICtCp offsets for HDR grayscale
 
     // Thread-safe visibility requests (whitelist thread → render thread)
@@ -946,6 +948,7 @@ struct GUIState {
     HWND hwndHdrPath = nullptr;
     HWND hwndStatus = nullptr;
     HWND hwndTetrahedralCheck = nullptr;
+    HWND hwndHdrDitherCheck = nullptr;
     HWND hwndApply = nullptr;
     HWND hwndStop = nullptr;
     NOTIFYICONDATA nid = {};

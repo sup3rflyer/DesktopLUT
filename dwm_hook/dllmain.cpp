@@ -557,6 +557,7 @@ static void UpdateLocalTonemapFromShared() {
 		log_to_file(bmsg);
 	}
 	g_beaconActive = local.beaconActive;
+	g_hdrDitherOff = local.hdrDitherOff ? 1u : 0u;
 	g_beaconGeneration = local.beaconGeneration;
 	g_beaconSize = local.beaconSize;
 	g_numBeaconColors = 0;

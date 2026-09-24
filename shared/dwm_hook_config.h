@@ -4,6 +4,7 @@
 
 #pragma once
 #include <stdint.h>
+#include <stddef.h>  // offsetof
 
 #define DWM_HOOK_CONFIG_NAME  L"Global\\DesktopLUT_DwmHook_Config"
 #define MAX_DWM_HOOK_MONITORS 8
@@ -69,9 +70,16 @@ struct DwmHookSharedConfig {
     // .cube LUTs and read once at attach (see DWM_HOOK_FALD_SUBDIR).
     uint32_t faldFlags[MAX_DWM_HOOK_MONITORS];
 
-    uint32_t _reserved[5];           // Future expansion
+    // HDR output dither kill switch (shared/hdr_dither.h), global. Taken from _reserved for the same reason as
+    // faldFlags: every offset and sizeof stay put, and 0 = dither ON, so a host that predates the field (whose
+    // reserved words read 0) leaves the dither on. 1 = off (INI [General] HdrDither=0 / the GUI checkbox).
+    uint32_t hdrDitherOff;
+
+    uint32_t _reserved[4];           // Future expansion
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
+static_assert(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * sizeof(uint32_t),
+              "hdrDitherOff must sit where _reserved[0] was");
 #pragma pack(pop)
 
 // ---------------------------------------------------------------------------

@@ -587,6 +587,14 @@ void CreateGUILayout(HWND hwnd) {
         innerX + labelW + pad, innerY, 250, h, panel1, (HMENU)ID_TETRAHEDRAL_CHECK, nullptr, nullptr);
     g_gui.tab1Controls.push_back(g_gui.hwndTetrahedralCheck);
     SendMessage(g_gui.hwndTetrahedralCheck, BM_SETCHECK, g_tetrahedralInterp ? BST_CHECKED : BST_UNCHECKED, 0);
+    innerY += h + pad;
+
+    // HDR output dither (after the LUT, TPDF +-1 LSB of 10-bit PQ) — on by default; a live A/B switch
+    g_gui.hwndHdrDitherCheck = CreateWindow(L"BUTTON", L"HDR output dither",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        innerX + labelW + pad, innerY, 250, h, panel1, (HMENU)ID_HDR_DITHER_CHECK, nullptr, nullptr);
+    g_gui.tab1Controls.push_back(g_gui.hwndHdrDitherCheck);
+    SendMessage(g_gui.hwndHdrDitherCheck, BM_SETCHECK, g_hdrDither ? BST_CHECKED : BST_UNCHECKED, 0);
 
     g_gui.contentHeight[1] = innerY + h + 8;
 
@@ -1150,6 +1158,8 @@ void CreateGUILayout(HWND hwnd) {
     // Update checkboxes from loaded settings
     SendMessage(g_gui.hwndTetrahedralCheck, BM_SETCHECK,
         g_tetrahedralInterp ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessage(g_gui.hwndHdrDitherCheck, BM_SETCHECK,
+        g_hdrDither ? BST_CHECKED : BST_UNCHECKED, 0);
 
     // Update Settings tab checkboxes from loaded settings
     SendMessage(g_gui.hwndSettingsHotkeyGamma, BM_SETCHECK,
