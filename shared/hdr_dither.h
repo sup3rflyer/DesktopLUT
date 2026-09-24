@@ -43,3 +43,11 @@ float3 DlutDitherPQ(float3 pq, float3 u, float lsb) {
 	return pq + DlutTpdf(u) * amp;
 }
 )HDD"
+
+// Host side, both paths: the amplitude written into the pixel shader's constant buffer. The dither rides only on a
+// pass that actually PROCESSES the HDR image (LUT / tonemap / shader corrections) — a pure passthrough stays
+// bit-exact — and the [General] HdrDither switch (GUI "HDR output dither") can turn it off. Fixed at 1 LSB of a
+// 10-bit PQ link: the hook logs an HDR monitor whose link runs below 10 bpc (the driver usually dithers there).
+inline float DlutHdrDitherLsb(bool hdr, bool processing, bool enabled) {
+	return (hdr && processing && enabled) ? 1.0f / 1023.0f : 0.0f;
+}

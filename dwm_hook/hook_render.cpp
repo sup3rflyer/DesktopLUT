@@ -1306,7 +1306,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		cb.hasLut = lut ? 1 : 0;
 		// HDR output dither (shared/hdr_dither.h): +-1 LSB of 10-bit PQ, TPDF, after the LUT. HDR only — the
 		// legacy SDR path keeps its OrderedDither, ACM has none yet.
-		cb.hdrDitherLsb = (colorMode == 1 && !g_hdrDitherOff) ? 1.0f / 1023.0f : 0.0f;
+		cb.hdrDitherLsb = DlutHdrDitherLsb(colorMode == 1, lut != nullptr || tmEnabled, !g_hdrDitherOff);
 		cb.pad2 = 0.0f;
 
 		// Diagnostic: log tonemap CB state only when values change FOR THIS MONITOR.

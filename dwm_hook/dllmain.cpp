@@ -558,6 +558,16 @@ static void UpdateLocalTonemapFromShared() {
 	}
 	g_beaconActive = local.beaconActive;
 	g_hdrDitherOff = local.hdrDitherOff ? 1u : 0u;
+	// The HDR output dither is sized for a 10-bit PQ link (shared/hdr_dither.h): note any HDR monitor below that.
+	for (uint32_t i = 0; i < numMons; i++) {
+		const DwmHookMonitorConfig& m = local.monitors[i];
+		if (m.isHdr && m.bpc > 0 && m.bpc < 10) {
+			char dmsg[128];
+			snprintf(dmsg, sizeof(dmsg), "hdr dither: monitor at (%d,%d) is HDR on a %u-bpc link; "
+				"the dither is sized for 10-bit (driver dithering expected)", m.left, m.top, m.bpc);
+			log_to_file(dmsg);
+		}
+	}
 	g_beaconGeneration = local.beaconGeneration;
 	g_beaconSize = local.beaconSize;
 	g_numBeaconColors = 0;
