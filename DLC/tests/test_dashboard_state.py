@@ -752,6 +752,184 @@ def test_build_preview_seeded_from_settled_stage():
     assert not red.get("carried")
 
 
+# --- non-transitive, per-family underlay (2026-09-24 HDR run: sawtoothing "previous stage" line) --
+
+_PEAK = 1716.0                         # the post-MHC peak cap (HDR header luminance)
+_RAW_WHITE = 1841.0                    # the raw native white — ABOVE the cap
+
+
+def _hdr_st():
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", mode="HDR", is_hdr=True, transfer="pq",
+                  luminance=_PEAK, gamma=2.2, white={"xy": [0.3127, 0.329], "cct": 6504}))
+    return st
+
+
+def _grey(st, at, level, Y, phase, xy=(0.3127, 0.329)):
+    v = int(round(level * 1023))
+    _read(st, at, [v, v, v], list(xy), Y, signal=[level] * 3, phase=phase)
+
+
+def _colour(st, at, sig, Y, xy, phase):
+    _read(st, at, [int(round(c * 1023)) for c in sig], list(xy), Y, signal=list(sig), phase=phase)
+
+
+def _carried_origins(st, stage):
+    """{family: origins of the stage's carried entries} across all three buckets."""
+    out = {"gray": set(), "color": set()}
+    for p in st._cie_by_stage[stage].values():
+        if p.get("carried"):
+            out["gray" if p["neutral"] else "color"].add(p["origin"])
+    for g in st._gray_by_stage[stage].values():
+        if g.get("carried"):
+            out["gray"].add(g["origin"])
+    for c in st._color_by_stage[stage].values():
+        if c.get("carried"):
+            out["color"].add(c["origin"])
+    return out
+
+
+def test_underlay_is_seeded_per_family_from_the_last_stage_that_measured_it():
+    """The 2026-09-24 HDR run's stage order: raw (full ramp incl. above-peak greys + colours,
+    native white) → refine-mhc-cube (a grey SUBSET only) → post-mhc (greys up to the peak cap +
+    colours) → verify. Each stage's underlay must be ONE coherent stage per family — only that
+    stage's own fresh reads, never what it had itself inherited — so the faded line can't
+    sawtooth between raw (dE 5–9) and corrected (dE ~1) greys, and above-peak raw greys drop out
+    once a later stage measured greys."""
+    st = _hdr_st()
+    raw, ref, post, ver = "measure:raw", "refine-mhc-cube", "measure:post-mhc", "measure:verify"
+    rgb_raw = {(1.0, 0.0, 0.0): (0.69, 0.30), (0.0, 1.0, 0.0): (0.21, 0.71),
+               (0.0, 0.0, 1.0): (0.15, 0.05)}
+    t = 0
+    for lvl, Y in [(0.25, 5.0), (0.5, 95.0), (0.75, 1000.0), (0.79, 1760.0),
+                   (0.9, 1808.0), (1.0, _RAW_WHITE)]:      # 0.9 / 1.0 = above the peak cap
+        t += 1
+        _grey(st, t, lvl, Y, raw, xy=(0.300, 0.320))
+    for sig, xy in rgb_raw.items():
+        t += 1
+        _colour(st, t, sig, 400.0, xy, raw)
+    # refine: re-measures two greys, no colours
+    for lvl, Y in [(0.5, 92.0), (0.79, 1716.0)]:
+        t += 1
+        _grey(st, t, lvl, Y, ref)
+    ch = st.charts()
+    assert ch["stage"] == ref
+    assert _carried_origins(st, ref) == {"gray": {raw}, "color": {raw}}
+    carried = {g["signal"]: g for g in ch["grayscale"] if g.get("carried")}
+    assert sorted(carried) == [0.25, 0.75, 0.9, 1.0]
+    assert all(g["origin"] == raw for g in carried.values())
+    assert all(g["origin"] == ref for g in ch["grayscale"] if not g.get("carried"))
+    assert ch["continuity"]["from"] == raw
+
+    # post-mhc: a colour first — greys still all carried
+    t += 1
+    _colour(st, t, (1.0, 0.0, 0.0), 0.2627 * _PEAK, (0.68, 0.31), post)
+    ch = st.charts()
+    assert ch["stage"] == post
+    # grey underlay = refine's OWN two greys; the raw greys refine only inherited (incl. the
+    # above-peak 0.9 / 1.0) are gone. Colour underlay = raw (refine measured none).
+    assert _carried_origins(st, post) == {"gray": {ref}, "color": {raw}}
+    assert [(g["signal"], g["origin"]) for g in ch["grayscale"]] == [(0.5, ref), (0.79, ref)]
+    carried_cols = [p for p in ch["cie"]["points"] if p.get("carried") and not p["neutral"]]
+    assert len(carried_cols) == 2 and {p["origin"] for p in carried_cols} == {raw}
+    assert ch["continuity"]["from"] == f"{raw} + {ref}"            # both origins, stage order
+    assert all(p["origin"] == ref for p in ch["eotf"]["points"])   # origin rides the EOTF points too
+    for lvl, Y in [(0.25, 4.8), (0.5, 94.0), (0.75, 990.0), (0.79, 1716.0)]:
+        t += 1
+        _grey(st, t, lvl, Y, post)
+    for sig, xy in [((0.0, 1.0, 0.0), (0.22, 0.70)), ((0.0, 0.0, 1.0), (0.15, 0.06))]:
+        t += 1
+        _colour(st, t, sig, 400.0, xy, post)
+
+    # verify: the top grey + the red so far
+    t += 1
+    _grey(st, t, 0.79, _PEAK, ver)
+    t += 1
+    _colour(st, t, (1.0, 0.0, 0.0), 0.2627 * _PEAK, (0.68, 0.31), ver)
+    ch = st.charts()
+    assert ch["stage"] == ver
+    assert _carried_origins(st, ver) == {"gray": {post}, "color": {post}}
+    assert [g["signal"] for g in ch["grayscale"]] == [0.25, 0.5, 0.75, 0.79]   # no above-peak raw
+    assert all(g["origin"] == post for g in ch["grayscale"] if g.get("carried"))
+    assert ch["continuity"] == {"from": post, "carried": 5, "fresh": 2}
+    # the colour-luminance white is this stage's ~1716-nit top, not the raw 1841-nit native white
+    cl = {c["label"]: c for c in ch["color_lum"]}
+    assert abs(cl["R100"]["error"]) < 0.005
+
+
+def test_color_luminance_references_each_colour_to_its_own_origins_white():
+    """Colour luminance compares like with like. A FRESH colour uses this stage's top grey only
+    once the fresh greys reach the carried ramp's top — mid-stage, a scattered fresh MID grey must
+    not stand in for white (it'd pin every bar), so the carried top is the best estimate. A
+    CARRIED colour uses its own origin stage's white (a raw colour against the raw native white,
+    never the post-MHC peak cap)."""
+    st = _hdr_st()
+    raw, post = "measure:raw", "measure:post-mhc"
+    _grey(st, 1, 0.5, 95.0, raw, xy=(0.300, 0.320))
+    _grey(st, 2, 0.79, _RAW_WHITE, raw, xy=(0.300, 0.320))
+    # raw colours read exactly on target vs the RAW white
+    _colour(st, 3, (1.0, 0.0, 0.0), 0.2627 * _RAW_WHITE, (0.69, 0.30), raw)
+    _colour(st, 4, (0.0, 1.0, 0.0), 0.6780 * _RAW_WHITE, (0.21, 0.71), raw)
+
+    def lum():
+        return {c["label"]: c["error"] for c in st.charts()["color_lum"]}
+
+    # post-mhc: a fresh red on target vs the post-MHC peak — no fresh grey yet → the carried top
+    _colour(st, 5, (1.0, 0.0, 0.0), 0.2627 * _PEAK, (0.68, 0.31), post)
+    assert abs(lum()["R100"] - (_PEAK / _RAW_WHITE - 1.0)) < 1e-3
+    # mid-stage: a fresh MID grey only — still referenced to the carried top, not the 94-nit grey
+    _grey(st, 6, 0.5, 94.0, post)
+    cl = lum()
+    assert abs(cl["R100"] - (_PEAK / _RAW_WHITE - 1.0)) < 1e-3
+    assert abs(cl["G100"]) < 1e-3              # carried raw green vs RAW's white → on target
+    # the fresh greys reach the carried top level → this stage's own top is the white
+    _grey(st, 7, 0.79, _PEAK, post)
+    cl = lum()
+    assert abs(cl["R100"]) < 1e-3
+    assert abs(cl["G100"]) < 1e-3              # still raw's white, not the post-MHC 1716 (+7.3%)
+
+
+def test_measured_primaries_never_splice_fresh_and_carried_corners():
+    """The measured-primaries overlay is ONE stage's triangle: the previous stage's whole set
+    until all three corners are re-measured, then the current stage's — never two fresh corners
+    joined to a carried third."""
+    st = _hdr_st()
+    raw, post = "measure:raw", "measure:post-mhc"
+    wide = {(1.0, 0.0, 0.0): (0.69, 0.30), (0.0, 1.0, 0.0): (0.21, 0.71), (0.0, 0.0, 1.0): (0.15, 0.05)}
+    tight = {(1.0, 0.0, 0.0): (0.68, 0.31), (0.0, 1.0, 0.0): (0.22, 0.70), (0.0, 0.0, 1.0): (0.15, 0.06)}
+    for i, (sig, xy) in enumerate(wide.items(), start=1):
+        _colour(st, i, sig, 400.0, xy, raw)
+    for i, sig in enumerate([(1.0, 0.0, 0.0), (0.0, 1.0, 0.0)], start=4):
+        _colour(st, i, sig, 400.0, tight[sig], post)
+    meas = st.charts()["cie"]["measured"]
+    assert meas == {"r": [0.69, 0.30], "g": [0.21, 0.71], "b": [0.15, 0.05]}   # all raw
+    _colour(st, 6, (0.0, 0.0, 1.0), 400.0, tight[(0.0, 0.0, 1.0)], post)
+    meas = st.charts()["cie"]["measured"]
+    assert meas == {"r": [0.68, 0.31], "g": [0.22, 0.70], "b": [0.15, 0.06]}   # all post-MHC
+
+
+def test_build_preview_underlay_uses_the_same_per_family_seeding():
+    """The build preview seeds like a new stage after the settled ones: per family, only the
+    fresh reads of the last stage that measured it — a settled stage's own carried leftovers
+    (here a raw grey post-mhc never re-measured) don't ride into the preview."""
+    st = _hdr_st()
+    raw, post, build = "measure:raw", "measure:post-mhc", "build-install-3dlut"
+    _grey(st, 1, 0.25, 5.0, raw, xy=(0.300, 0.320))
+    _grey(st, 2, 0.5, 95.0, raw, xy=(0.300, 0.320))
+    _colour(st, 3, (1.0, 0.0, 0.0), 400.0, (0.69, 0.30), raw)
+    _grey(st, 4, 0.5, 94.0, post)                    # post-mhc re-measures ONE grey, no colours
+    st.ingest(_ev(Ev.PATCH_READ, t=T0 + timedelta(seconds=5), stage=build, phase=build,
+                  tier="stream", seq=5, role="probe", disposition="probe", rgb=[0, 1023, 0],
+                  signal=[0.0, 1.0, 0.0], Y=900.0, xy=[0.22, 0.70], ok=True))
+    bp = st.charts()["build_preview"]
+    assert bp["active"] is True
+    assert [(g["signal"], g["origin"], g.get("carried")) for g in bp["grayscale"]] == [(0.5, post, True)]
+    carried = [p for p in bp["cie"]["points"] if p.get("carried")]
+    assert {(p["neutral"], p["origin"]) for p in carried} == {(True, post), (False, raw)}
+    fresh = [p for p in bp["cie"]["points"] if not p.get("carried")]
+    assert len(fresh) == 1 and fresh[0]["origin"] == build
+
+
 def test_snapshot_carries_server_now_for_client_ticking():
     st = DashboardState()
     snap = st.snapshot(T0)

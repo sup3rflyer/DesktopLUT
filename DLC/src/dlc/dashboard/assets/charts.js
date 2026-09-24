@@ -89,6 +89,10 @@
     // point to a fresh one is exactly the mixed-stack artifact this exists to prevent.
     if (cur.length > 1) P.pathLine(cur.map(toXY), cls);
   };
+  // A carried point's provenance — the stage that actually MEASURED it (server `origin`). Named,
+  // not "awaiting re-measure": a later stage may never re-measure it (e.g. the MHC refine's grey
+  // subset leaves the raw colours standing).
+  const prevTag = (p) => "prev stage · " + (p.origin || "earlier stage");
 
   const DLCCharts = {};
   // Render options the dashboard toggles. `measured` overlays the panel's measured primaries (the
@@ -143,7 +147,7 @@
       if (p.de != null) rows.push(`ΔE\t${fmt(p.de, 2)}`);
       rows.push(`Measured\t${fmt(p.x, 4)}, ${fmt(p.y, 4)}`);
       if (hasT) rows.push(`Target\t${fmt(p.tx, 4)}, ${fmt(p.ty, 4)}`);
-      if (p.carried) rows.push(`Status\tawaiting re-measure`);
+      if (p.carried) rows.push(`Status\t${prevTag(p)}`);
       P.add(`<circle cx="${fmt(P.px(p.x), 1)}" cy="${fmt(P.py(p.y), 1)}" r="1.7" class="${p.neutral ? "ch-pt-n" : "ch-pt"}${p.carried ? " ch-carried" : ""}"${fill}${tAttr}>${hov(rows.join("\n"))}</circle>`);
     }
     if (carried) P.add(`<text x="${fmt(P.m.l + 4, 1)}" y="${fmt(P.H - P.m.b - 6, 1)}" class="ch-note">◌ ${carried} from previous stage</text>`);
@@ -177,7 +181,7 @@
       for (const r of ref) if (Math.abs(r[0] - s) < Math.abs(best[0] - s)) best = r;
       return best[1];
     };
-    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}${p.carried ? " | prev stage — awaiting re-measure" : ""}`)}</circle>`));
+    pts.forEach((p) => P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.Y / ymax), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(`signal ${fmt(p.signal, 3)} | measured ${fmt(p.Y / ymax, 4)} | target ${fmt(refAt(p.signal), 4)}${p.carried ? " | " + prevTag(p) : ""}`)}</circle>`));
     const eotfCarried = pts.filter((p) => p.carried).length;
     if (eotfCarried) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">◌ ${eotfCarried} from previous stage</text>`);
 
@@ -245,7 +249,7 @@
       const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
                     `CCT\t${Math.round(p.cct)} K`];
       if (p.n > 1) rows.push(`median of ${p.n}\t${Math.round(p.cct_lo)}–${Math.round(p.cct_hi)} K`);
-      if (p.carried) rows.push("status\tawaiting re-measure");
+      if (p.carried) rows.push(`status\t${prevTag(p)}`);
       P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.cct), 1)}" r="2.2" class="ch-dot${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
     });
     const cctCarried = bright.filter((p) => p.carried).length;
@@ -301,7 +305,7 @@
                     `Duv\t${fmt(p.duv, 5)}`,
                     `vs target\t${fmtSignedDuv(dev)} · ${dev > 0.0002 ? "greener" : dev < -0.0002 ? "more magenta" : "on target"}`];
       if (p.n > 1) rows.push(`median of\t${p.n} reads`);
-      if (p.carried) rows.push("status\tawaiting re-measure");
+      if (p.carried) rows.push(`status\t${prevTag(p)}`);
       P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p.duv), 1)}" r="2.4" class="${cls}${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
     });
     const duvCarried = bright.filter((p) => p.carried).length;
@@ -345,7 +349,7 @@
       const rows = [`signal ${fmt(p.signal, 3)}${p.carried ? " · prev stage" : ""}`,
                     `${lab}\t${(p[k] >= 0 ? "+" : "")}${fmt(p[k], 2)}% · target 0%`];
       if (p.n > 1) rows.push(`median of\t${p.n} reads`);
-      if (p.carried) rows.push("status\tawaiting re-measure");
+      if (p.carried) rows.push(`status\t${prevTag(p)}`);
       P.add(`<circle cx="${fmt(P.px(p.signal), 1)}" cy="${fmt(P.py(p[k]), 1)}" r="1.7" class="${cls}-dot${p.carried ? " ch-carried" : ""}">${hov(rows.join("\n"))}</circle>`);
     }));
     const balCarried = bright.filter((p) => p.carried).length;
@@ -432,7 +436,7 @@
     const raw = (d.points || []).filter((p) => p.Y != null && p.signal > 0).sort((a, b) => a.signal - b.signal);
     if (raw.length < 2) return empty("no grayscale reads yet");
     const ymaxY = Math.max(...raw.map((p) => p.Y)) || 1;
-    const pts = raw.map((p) => ({ s: p.signal, yr: p.Y / ymaxY, de: p.de, carried: p.carried }))
+    const pts = raw.map((p) => ({ s: p.signal, yr: p.Y / ymaxY, de: p.de, carried: p.carried, origin: p.origin }))
       .filter((p) => p.yr > 0);
     if (pts.length < 2) return empty("no above-black reads yet");
     const X0 = -3;                                     // 0.1% … 100% signal
@@ -455,7 +459,7 @@
     pts.forEach((p) => {
       const dark = p.yr * ymaxY < 1.0;                 // sub-1-nit: colour by tint visibility
       const cls = `ch-dot${dark ? " " + deCls(p.de) : ""}${p.carried ? " ch-carried" : ""}`;
-      P.add(`<circle cx="${fmt(P.px(Math.max(X0, lg(p.s))), 1)}" cy="${fmt(P.py(Math.max(Y0, lg(p.yr))), 1)}" r="2.2" class="${cls}">${hov(`signal ${pctLab(lg(p.s))} | Y ${pctLab(lg(p.yr))} of white (${fmt(p.yr * ymaxY, 3)} nit)${p.de != null ? ` | ΔE ${fmt(p.de, 2)}` : ""}${p.carried ? " | prev stage" : ""}`)}</circle>`);
+      P.add(`<circle cx="${fmt(P.px(Math.max(X0, lg(p.s))), 1)}" cy="${fmt(P.py(Math.max(Y0, lg(p.yr))), 1)}" r="2.2" class="${cls}">${hov(`signal ${pctLab(lg(p.s))} | Y ${pctLab(lg(p.yr))} of white (${fmt(p.yr * ymaxY, 3)} nit)${p.de != null ? ` | ΔE ${fmt(p.de, 2)}` : ""}${p.carried ? " | " + prevTag(p) : ""}`)}</circle>`);
     });
     const below = raw.length - pts.length;
     if (below) P.add(`<text x="${fmt(P.m.l + 5, 1)}" y="${fmt(P.m.t + 12, 1)}" class="ch-note">${below} read${below === 1 ? "" : "s"} at 0 nit (below meter floor)</text>`);

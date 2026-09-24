@@ -166,17 +166,58 @@ def _median(values: list[float]) -> Optional[float]:
     return 0.5 * (ordered[mid - 1] + ordered[mid])
 
 
-def _fold_gray_sample(gray_map: dict, level: float, sample: dict) -> None:
+def _fold_gray_sample(gray_map: dict, level: float, sample: dict,
+                      origin: Optional[str] = None) -> None:
     """Fold one neutral read into a level's SAMPLE RING (median-of-N, not latest-wins): repeat
     reads at the same level tame meter noise — the dominant term near black — and the retained
     spread becomes the chart's uncertainty whisker. A fresh read on a ``carried`` entry (seeded
     from the previous stage) starts a NEW ring: a re-measure through a new correction state is a
-    different population, never averaged with the old one."""
+    different population, never averaged with the old one. ``origin`` = the stage that measured
+    it (stamped on a new ring; a ring only ever grows within its own stage)."""
     cur = gray_map.get(level)
     if cur is None or cur.get("carried"):
-        gray_map[level] = {"signal": level, "samples": [sample]}
+        gray_map[level] = {"signal": level, "samples": [sample], "origin": origin}
     else:
         cur["samples"] = (cur.get("samples") or [])[-(_GRAY_SAMPLES - 1):] + [sample]
+
+
+# Chart-entry FAMILIES for the stage-boundary underlay: the grey axis (grayscale levels + the
+# neutral CIE points) and the colours (colour-luminance samples + the non-neutral CIE points).
+# Each family is seeded independently — a stage that re-measures only greys (the MHC refine)
+# must not decide where the colour underlay comes from.
+_FAMILIES = ("gray", "color")
+
+
+def _cie_family(p: dict) -> str:
+    return "gray" if p.get("neutral") else "color"
+
+
+def _best_corners(entries) -> Optional[dict[str, tuple[float, float, list[float]]]]:
+    """Per channel, the highest-drive pure-hue read among ``entries`` (colour-map samples) — ties
+    broken by the brightest: {"R"|"G"|"B": (drive, Y, [x, y])}. ``None`` unless all three
+    channels have one (see ``DashboardState._corner_primaries``)."""
+    best: dict[str, tuple[float, float, list[float]]] = {}
+    for c in entries:
+        sig, x, y, Y = c.get("signal"), c.get("x"), c.get("y"), c.get("Y")
+        if x is None or y is None or Y is None or not sig or len(sig) < 3:
+            continue
+        s = [float(v) for v in sig[:3]]
+        drive = max(s)
+        if drive <= 0:
+            continue
+        nr, ng, nb = (v / drive for v in s)
+        if ng < 0.05 and nb < 0.05 and nr > 0.95:
+            family = "R"
+        elif nr < 0.05 and nb < 0.05 and ng > 0.95:
+            family = "G"
+        elif nr < 0.05 and ng < 0.05 and nb > 0.95:
+            family = "B"
+        else:
+            continue
+        prev = best.get(family)
+        if prev is None or drive > prev[0] + 1e-6 or (abs(drive - prev[0]) <= 1e-6 and Y > prev[1]):
+            best[family] = (drive, float(Y), [round(x, 5), round(y, 5)])
+    return best if all(f in best for f in ("R", "G", "B")) else None
 
 
 # Wire precision per metric. One metric per mode (dE_ITP for HDR, CIEDE2000 for SDR); both ride the
@@ -290,15 +331,20 @@ class DashboardState:
     # so the dashboard shows the LATEST stage (the corrected result) instead of raw + post-MHC +
     # verify + build-probe reads overlaid into one unreadable cloud. Warm-up + 3D-LUT build-probe
     # reads are excluded entirely (panel-conditioning / transient, not a settled measurement).
-    # CONTINUITY: a new stage's buckets are SEEDED from the previous stage's points, each flagged
-    # ``carried`` — the charts never restart empty at a stage boundary; every patch visibly
-    # morphs from its old reading to its new one as it's re-measured (carried entries render
-    # faded and are overwritten latest-wins, keyed by patch identity).
+    # CONTINUITY: a new stage's buckets are SEEDED with a ``carried`` underlay — the charts never
+    # restart empty at a stage boundary; every patch visibly morphs from its old reading to its
+    # new one as it's re-measured (carried entries render faded and are overwritten latest-wins,
+    # keyed by patch identity). Every entry records its ``origin`` (the stage that MEASURED it).
+    # Seeding is per FAMILY and NON-transitive: each family (greys / colours) is seeded from the
+    # most recent stage that measured it, carrying only that stage's own fresh reads — never what
+    # it had itself inherited. Transitive seeding let raw native greys (and above-peak raw greys
+    # no later ramp re-measures) ride into verify interleaved with post-MHC ones: a sawtoothing
+    # "previous stage" underlay and a carried raw white skewing the colour-luminance reference.
     _cie_by_stage: dict = field(default_factory=dict)       # stage → {patch key: latest point}
     _gray_by_stage: dict = field(default_factory=dict)      # stage → {level: latest neutral sample}
     _color_by_stage: dict = field(default_factory=dict)     # stage → {signal: latest colour sample}
     _stage_seq: list = field(default_factory=list)          # measurement stages, first-seen order
-    _carried_from: dict = field(default_factory=dict)       # stage → the stage it was seeded from
+    _carried_from: dict = field(default_factory=dict)       # stage → {family: stage it was seeded from}
     # LIVE BUILD PREVIEW. The 3D-LUT build re-measures the panel through each candidate cube as
     # ``probe`` reads — deliberately EXCLUDED from the settled snapshot charts (transient, adaptively
     # sampled, not a deliverable). But excluding them left the main graphs frozen for the whole
@@ -663,44 +709,75 @@ class DashboardState:
             "sc": _sig_hex(sig) if sig else None, "mc": self._measured_hex(x, y, Y),
             # target chromaticity + scoring ΔE → the scatter draws the error vector and shows ΔE on hover
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
-            "de": de, "label": data.get("label")}
+            "de": de, "label": data.get("label"), "origin": stage}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             _fold_gray_sample(self._gray_by_stage[stage], round(level, 5), {
                 "Y": Y, "x": round(x, 5), "y": round(y, 5),
-                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de})
+                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de}, origin=stage)
         elif not neutral and sig and len(sig) >= 3 and Y is not None:
             # a colour patch: keep the latest measured Y per distinct signal for the
             # Colour Luminance chart (luminance error vs target is derived in charts()).
             try:
                 key = (round(float(sig[0]), 4), round(float(sig[1]), 4), round(float(sig[2]), 4))
                 self._color_by_stage[stage][key] = {"signal": list(key), "Y": Y,
-                                                    "x": round(x, 5), "y": round(y, 5)}
+                                                    "x": round(x, 5), "y": round(y, 5),
+                                                    "origin": stage}
             except (TypeError, ValueError):
                 pass
 
+    def _has_fresh(self, stage: str, family: str) -> bool:
+        """Whether ``stage`` itself MEASURED anything in ``family`` — a non-carried entry in the
+        family's own map (grey levels / colour samples) or among the family's CIE points."""
+        fam_map = (self._gray_by_stage if family == "gray" else self._color_by_stage).get(stage, {})
+        if any(not e.get("carried") for e in fam_map.values()):
+            return True
+        return any(not p.get("carried") and _cie_family(p) == family
+                   for p in self._cie_by_stage.get(stage, {}).values())
+
+    def _seed_underlay(self, stages: list[str]) -> tuple[dict, dict, dict, dict[str, str]]:
+        """The ``carried`` underlay for a stage opening after ``stages`` (settled, in order):
+        per FAMILY, the FRESH entries of the most recent stage that measured that family — never
+        entries that stage had itself inherited, so each family's underlay is one coherent stage
+        (one origin). Returns ``(cie, gray, color, src)`` with ``src`` = {family: source stage}
+        (a family no stage has measured yet is absent)."""
+        src: dict[str, str] = {}
+        for s in reversed(stages):
+            for fam in _FAMILIES:
+                if fam not in src and self._has_fresh(s, fam):
+                    src[fam] = s
+            if len(src) == len(_FAMILIES):
+                break
+        # CIE points in chronological source order — the older underlay is evicted first at the cap
+        cie: dict = {}
+        order = {s: i for i, s in enumerate(stages)}
+        for s in sorted(set(src.values()), key=order.__getitem__):
+            fams = {f for f, o in src.items() if o == s}
+            cie.update({k: {**p, "carried": True}
+                        for k, p in self._cie_by_stage.get(s, {}).items()
+                        if not p.get("carried") and _cie_family(p) in fams})
+        # sample rings are copied, not shared — a late read in the source stage must never
+        # silently mutate the carried snapshot
+        gray = ({k: {**g, "samples": list(g.get("samples") or []), "carried": True}
+                 for k, g in self._gray_by_stage.get(src["gray"], {}).items()
+                 if not g.get("carried")} if "gray" in src else {})
+        color = ({k: {**c, "carried": True}
+                  for k, c in self._color_by_stage.get(src["color"], {}).items()
+                  if not c.get("carried")} if "color" in src else {})
+        return cie, gray, color, src
+
     def _open_stage_bucket(self, stage: str) -> None:
-        """Open a new measurement stage's chart buckets, SEEDED from the previous stage's points
-        (each flagged ``carried``) — the graphs don't restart at a stage boundary; they morph.
+        """Open a new measurement stage's chart buckets, SEEDED with the per-family ``carried``
+        underlay (``_seed_underlay``) — the graphs don't restart at a stage boundary; they morph.
         A fresh read at the same patch identity / grayscale level overwrites its carried twin
         (written without the flag), so the charts visibly converge to the new stage's state and
         the ``continuity`` payload can report how much has been re-measured so far."""
-        prev = self._stage_seq[-1] if self._stage_seq else None
-        if prev is not None:
-            self._cie_by_stage[stage] = {k: {**p, "carried": True}
-                                         for k, p in self._cie_by_stage[prev].items()}
-            # sample rings are copied, not shared — a late read in the source stage must
-            # never silently mutate the carried snapshot
-            self._gray_by_stage[stage] = {k: {**g, "samples": list(g.get("samples") or []),
-                                              "carried": True}
-                                          for k, g in self._gray_by_stage[prev].items()}
-            self._color_by_stage[stage] = {k: {**c, "carried": True}
-                                           for k, c in self._color_by_stage[prev].items()}
-            self._carried_from[stage] = prev
-        else:
-            self._cie_by_stage[stage] = {}
-            self._gray_by_stage[stage] = {}
-            self._color_by_stage[stage] = {}
+        cie, gray, color, src = self._seed_underlay(self._stage_seq)
+        self._cie_by_stage[stage] = cie
+        self._gray_by_stage[stage] = gray
+        self._color_by_stage[stage] = color
+        if src:
+            self._carried_from[stage] = src
         self._stage_seq.append(stage)
 
     def _accumulate_preview(self, ev: Event, data: dict[str, Any], x: float, y: float,
@@ -709,18 +786,14 @@ class DashboardState:
         """Fold one BUILD PROBE read into the live build-preview buckets (CIE scatter + grayscale),
         so the main graphs animate the cube converging during the 3D-LUT build. Keyed by the build
         stage; latest-wins per grayscale level / per CIE point identity, mirroring the snapshot
-        accumulators so the SAME chart builders render it. Seeded from the last SETTLED stage
-        (flagged ``carried``) so the preview starts from what the cube is correcting, not blank."""
+        accumulators so the SAME chart builders render it. Seeded (flagged ``carried``) exactly as
+        a new stage after the settled ones would be — the same per-family, non-transitive
+        underlay — so the preview starts from what the cube is correcting, not blank."""
         stage = ev.phase or ev.stage or "build"
         if stage not in self._preview_cie:
-            settled = self._stage_seq[-1] if self._stage_seq else None
-            self._preview_cie[stage] = ({k: {**p, "carried": True}
-                                         for k, p in self._cie_by_stage[settled].items()}
-                                        if settled else {})
-            self._preview_gray[stage] = ({k: {**g, "samples": list(g.get("samples") or []),
-                                              "carried": True}
-                                          for k, g in self._gray_by_stage[settled].items()}
-                                         if settled else {})
+            cie, gray, _color, _src = self._seed_underlay(self._stage_seq)
+            self._preview_cie[stage] = cie
+            self._preview_gray[stage] = gray
             self._preview_seq.append(stage)
         self._last_probe_iso = ev.time
         sig = data.get("signal")
@@ -735,12 +808,12 @@ class DashboardState:
             "c": (None if neutral else _sig_hex(sig)) if sig else None,
             "sc": _sig_hex(sig) if sig else None, "mc": self._measured_hex(x, y, Y),
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
-            "de": de, "label": data.get("label")}
+            "de": de, "label": data.get("label"), "origin": stage}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             _fold_gray_sample(self._preview_gray[stage], round(level, 5), {
                 "Y": Y, "x": round(x, 5), "y": round(y, 5),
-                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de})
+                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de}, origin=stage)
 
     def _measured_hex(self, x: float, y: float, Y: Any) -> Optional[str]:
         """The patch's APPROXIMATE on-screen colour as actually measured (xyY → target-space RGB →
@@ -826,11 +899,29 @@ class DashboardState:
                    "dim": (Y is not None and Y < _GRAY_CCT_Y_FLOOR_NITS),
                    "r": round(bal[0], 2) if bal else None,
                    "g": round(bal[1], 2) if bal else None,
-                   "b": round(bal[2], 2) if bal else None}
+                   "b": round(bal[2], 2) if bal else None,
+                   "origin": e.get("origin")}     # the stage that measured it (carried hover)
             if e.get("carried"):
                 row["carried"] = True
             rows.append(row)
         return rows
+
+    def _continuity_from(self, stage: Optional[str]) -> Optional[str]:
+        """The ``continuity.from`` label: the origins of ``stage``'s currently-carried entries in
+        stage order (e.g. ``"measure:raw + refine-mhc-cube"`` when greys and colours come from
+        different stages); once everything is re-measured, the stages it was seeded from."""
+        if not stage:
+            return None
+        origins = {e.get("origin")
+                   for bucket in (self._cie_by_stage, self._gray_by_stage, self._color_by_stage)
+                   for e in bucket.get(stage, {}).values()
+                   if e.get("carried") and e.get("origin")}
+        if not origins:
+            origins = set((self._carried_from.get(stage) or {}).values())
+        if not origins:
+            return None
+        rank = {s: i for i, s in enumerate(self._stage_seq)}
+        return " + ".join(sorted(origins, key=lambda s: (rank.get(s, len(rank)), s)))
 
     def charts(self) -> dict[str, Any]:
         """Chart-ready datasets, built from the bounded accumulators. Served via
@@ -841,9 +932,9 @@ class DashboardState:
         stage = self._latest_chart_stage()
         cie_points = list(self._cie_by_stage.get(stage, {}).values()) if stage else []
         gray_map = self._gray_by_stage.get(stage, {}) if stage else {}
-        # Continuity: how much of this stage's view is still carried from the previous stage vs
-        # already re-measured — the frontend shows "N re-measured · M from <prev>" and fades the
-        # carried marks, so a stage boundary reads as the graphs UPDATING, not restarting.
+        # Continuity: how much of this stage's view is still carried from earlier stages vs
+        # already re-measured — the frontend shows "N re-measured · M from <origins>" and fades
+        # the carried marks, so a stage boundary reads as the graphs UPDATING, not restarting.
         carried_n = sum(1 for p in cie_points if p.get("carried"))
         hdr = _is_hdr_header(self.header)
         white = (self.header.get("white") or {}).get("xy")
@@ -860,7 +951,7 @@ class DashboardState:
             # must centre here, or a perfect D65 white gets flagged as a green cast.
             "target_duv": (neutral_metrics(float(white[0]), float(white[1])).get("duv")
                            if white and len(white) >= 2 else None),
-            "continuity": {"from": self._carried_from.get(stage) if stage else None,
+            "continuity": {"from": self._continuity_from(stage),
                            "carried": carried_n, "fresh": len(cie_points) - carried_n},
             "cie": {
                 "points": cie_points,
@@ -883,7 +974,7 @@ class DashboardState:
                 "luminance": luminance,
                 "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
                 "points": [{"signal": g["signal"], "Y": g["Y"], "de": g.get("de"),
-                            "carried": bool(g.get("carried"))}
+                            "carried": bool(g.get("carried")), "origin": g.get("origin")}
                            for g in gray if g.get("Y") is not None],
             },
             "color_lum": self._color_luminance(color_map, gray, gamma, hdr=hdr, luminance=luminance),
@@ -984,23 +1075,57 @@ class DashboardState:
             out.append([round(s, 5), round(max(0.0, min(1.0, y)), 6)])
         return out
 
+    @staticmethod
+    def _fresh_colour_white(gray: list[dict]) -> Optional[float]:
+        """The white a FRESH colour is referenced to, from this stage's grayscale rows: the
+        brightest fresh grey once the fresh greys have reached (≥) the carried greys' top signal
+        level (or nothing is carried); until then the brightest carried grey — the best estimate
+        at that level (the patch order is thermal-scattered, so a stage's first fresh greys are a
+        random subset and a mid grey must never stand in for white). ``None`` with no greys."""
+        fresh = [g for g in gray if g.get("Y") is not None and not g.get("carried")]
+        carried = [g for g in gray if g.get("Y") is not None and g.get("carried")]
+        if fresh and (not carried or max(g["signal"] for g in fresh)
+                      >= max(g["signal"] for g in carried) - 1e-9):
+            return max(g["Y"] for g in fresh)
+        return max((g["Y"] for g in carried), default=None)
+
+    def _stage_white_y(self, stage: Optional[str]) -> Optional[float]:
+        """``stage``'s own white: its brightest FRESH grey (median of the level's ring, as charted)
+        from its own bucket — what a colour that stage measured is referenced to."""
+        ys = [_median([s["Y"] for s in (g.get("samples") or []) if s.get("Y") is not None])
+              for g in self._gray_by_stage.get(stage, {}).values() if not g.get("carried")]
+        return max((y for y in ys if y is not None), default=None)
+
     def _color_luminance(self, color_map: dict, gray: list[dict], gamma: float, *,
                          hdr: bool = False, luminance: Any = None) -> list[dict[str, Any]]:
         """Per-colour-patch luminance error vs target, as fractions (-0.1 = 5% dim, etc.).
         Target relative luminance = Σ Kc·signal_c^γ (Rec.709 weights); measured relative =
-        measured Y / the brightest neutral Y. Computed here (not at read time) against the
-        best-known white, so it tracks even if white was measured at a different moment."""
-        white_y = max((g["Y"] for g in gray if g.get("Y") is not None), default=None)
-        if white_y is None:
-            white_y = (self.last_white or {}).get("Y")
-        if not white_y or white_y <= 0:
-            return []
+        measured Y / the white of the SAME correction state. Computed here (not at read time)
+        against the best-known white, so it tracks even if white was measured at a different moment.
+
+        Each colour is referenced to ITS OWN origin's white: a carried colour to its origin stage's
+        brightest fresh grey (a raw colour against the raw native white, never the post-MHC peak
+        cap); a fresh colour to ``_fresh_colour_white`` (this stage's top once its fresh greys reach
+        the carried ramp's top). Fallback chain: → this stage's white → the live white."""
+        stage_white = self._fresh_colour_white(gray) or (self.last_white or {}).get("Y")
+        origin_white: dict[Optional[str], Optional[float]] = {}
+
+        def white_for(c: dict) -> Optional[float]:
+            if c.get("carried"):
+                o = c.get("origin")
+                if o not in origin_white:
+                    origin_white[o] = self._stage_white_y(o)
+                if origin_white[o]:
+                    return origin_white[o]
+            return stage_white
+
         # Aggregate per (family, saturation-bucket): many patches share a label, so average
         # their luminance error into one bar (the representative colour = the brightest patch).
         groups: dict[str, dict[str, Any]] = {}
         for c in color_map.values():
             sig, Y = c.get("signal"), c.get("Y")
-            if Y is None or not sig:
+            white_y = white_for(c)
+            if Y is None or not sig or not white_y or white_y <= 0:
                 continue
             if hdr:
                 peak = _as_float(luminance)
@@ -1042,33 +1167,22 @@ class DashboardState:
         partial-drive read sits well inside the true corner; preferring max drive snaps the vertex
         to the real corner as soon as the full-saturation anchor is measured. Selecting by drive
         (not bare saturation) also avoids keeping a near-black read whose chromaticity is pure noise
-        (every pure-channel patch classifies as ~100% saturated regardless of level)."""
+        (every pure-channel patch classifies as ~100% saturated regardless of level).
+
+        Never a MIXED triangle: the stage's own (fresh) corners once all three channels have one,
+        else the carried underlay's set when complete (one origin by construction), else ``None``.
+        The underlay set is read back from its SOURCE stage (whose own fresh reads it is): a fresh
+        corner overwrites its carried twin in this stage's map, and a partly re-measured set must
+        keep showing the previous stage's whole triangle, not blink off or splice."""
         if not stage:
             return None
         color_map = self._color_by_stage.get(stage, {})
-        # family -> (drive, Y, [x, y]); prefer the highest-drive corner and, on ties, brightest.
-        best: dict[str, tuple[float, float, list[float]]] = {}
-        for c in color_map.values():
-            sig, x, y, Y = c.get("signal"), c.get("x"), c.get("y"), c.get("Y")
-            if x is None or y is None or Y is None or not sig or len(sig) < 3:
-                continue
-            s = [float(v) for v in sig[:3]]
-            drive = max(s)
-            if drive <= 0:
-                continue
-            nr, ng, nb = (v / drive for v in s)
-            if ng < 0.05 and nb < 0.05 and nr > 0.95:
-                family = "R"
-            elif nr < 0.05 and nb < 0.05 and ng > 0.95:
-                family = "G"
-            elif nr < 0.05 and ng < 0.05 and nb > 0.95:
-                family = "B"
-            else:
-                continue
-            prev = best.get(family)
-            if prev is None or drive > prev[0] + 1e-6 or (abs(drive - prev[0]) <= 1e-6 and Y > prev[1]):
-                best[family] = (drive, float(Y), [round(x, 5), round(y, 5)])
-        if not all(f in best for f in ("R", "G", "B")):
+        best = _best_corners(c for c in color_map.values() if not c.get("carried"))
+        src = (self._carried_from.get(stage) or {}).get("color")
+        if best is None and src is not None:
+            best = _best_corners(c for c in self._color_by_stage.get(src, {}).values()
+                                 if not c.get("carried"))
+        if best is None:
             return None
         # Suppress sub-noise corners: a chosen read far below the brightest corner (or below an
         # absolute floor) has unreliable chromaticity — hide the whole overlay rather than plot a
@@ -1126,7 +1240,7 @@ class DashboardState:
                 "luminance": luminance,
                 "reference": self._eotf_reference(hdr=hdr, gamma=gamma, luminance=luminance),
                 "points": [{"signal": g["signal"], "Y": g["Y"], "de": g.get("de"),
-                            "carried": bool(g.get("carried"))}
+                            "carried": bool(g.get("carried")), "origin": g.get("origin")}
                            for g in gray if g.get("Y") is not None],
             },
         }
