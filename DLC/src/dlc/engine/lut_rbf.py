@@ -135,12 +135,36 @@ def hold_lattice_level(top: Optional[float], grid_size: int) -> Optional[float]:
     return level if level < 1.0 else None
 
 
+OOG_SOLVES = ("direct", "projection")
+
+
+def _solve_at(model: DisplayErrorModel, solve: np.ndarray, signal_points: np.ndarray, *,
+              max_correction: float, n_iterations: int, fade_width: float) -> np.ndarray:
+    """The production per-node fixed point, solved AT ``solve`` toward the colour ``solve`` itself encodes
+    (its raw, unmapped target — for ``solve = reachable_signal(p)`` that is the mapped target G(p), and it stays
+    right under a mapping that is not idempotent). Hull fade, soft clamp and start are all relative to
+    ``solve``; no convergence early-out and no best-iterate (the solve point is inside the reachable gamut,
+    where the step is well conditioned)."""
+    space = model.space
+    hull_dist = compute_hull_distance(solve, signal_points)
+    fade = np.where(hull_dist > 0, smoothstep(hull_dist / (2 * fade_width)), 0.0)[:, np.newaxis]
+    target = model._raw_space.ideal_ictcp(solve)
+    current = solve.copy()
+    delta = model.predict(current)
+    for _ in range(n_iterations):
+        new = np.nan_to_num(space.xyz_to_signal(space.ictcp_to_xyz(target - delta)), nan=0.0)
+        new = np.clip(solve + soft_clamp(new - solve, max_correction), 0.0, 1.0)
+        current = (1 - fade) * new + fade * solve
+        delta = model.predict(current)
+    return current
+
+
 def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarray,
                *, fade_width: float = 0.05, max_correction: float = 0.05,
                n_iterations: int = 3, convergence_tol: float = 1e-6,
                near_black_nits: float = 0.1, neutral_band: float = 0.05,
                hold_above: Optional[float] = None, best_iterate: bool = False,
-               best_iterate_margin: float = 2.0) -> np.ndarray:
+               best_iterate_margin: float = 2.0, oog_solve: str = "direct") -> np.ndarray:
     """Build a ``(grid_size, grid_size, grid_size, 3)`` corrected LUT.
 
     Indexed ``lut[b, g, r]`` (B slowest, R fastest) — the order :func:`write_cube`
@@ -169,7 +193,29 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
     nodes are unaffected. Run 120740 CV: margin 0 keeps every best iterate (OOG 8.75) but doubles
     the in-range own-axis reversals (76 -> 189); margin 2 keeps most of the gain (OOG 8.88,
     primaries 11.6) at 94 reversals. ``False`` ⇒ the legacy last-iterate behaviour (bit-identical).
+
+    ``oog_solve`` — how a node whose target the reachable clamp MOVED (an out-of-gamut target, above the
+    near-black knee) is solved:
+
+    * ``"direct"`` (default, bit-identical to the builds before 2026-09-24): the fixed point inverts toward
+      the clamped target from the node itself. At a gamut corner that step is not a descent method — the
+      desired point lies outside the Rec.2020 container, ``xyz_to_signal`` clips it, and "more saturated"
+      turns into "add another channel"; the wedge beside a primary axis holds no data, so neighbouring nodes
+      land on different iterates (run 132412: the node one cell off the pure-blue axis, ~0.01 nit of red
+      input, output 0.27 PQ of red beside a 0-red axis node) — a rough lattice that amplifies input noise
+      (the hook's dither became a static red speckle, up to ~27 dE_ITP p95) and bands saturated ramps.
+    * ``"projection"`` (round-2 design review, 2026-09-24): solve each such node AT its gamut projection
+      p' = the reachable signal of its mapped target (re-projected onto the top when p' lies above the hold
+      level), with the ordinary in-gamut fixed point aimed at the colour p' encodes (:func:`_solve_at`), and
+      output that drive — the OOG cube becomes C∘G (G = the analytic target mapping, C = the data-driven
+      correction solved only where the target is reachable), exactly as ``hold_above`` handles luminance.
+      Every other node is bit-identical to ``"direct"``. Run 132412 offline: core / limits / tube drives
+      unchanged, clamped 3.83 → 3.50 predicted, input-noise gain OOG p99 26 → 1.8 JND, no ramp step > 1 JND,
+      held-out CV primaries 5.10 → 4.03 (120740: 11.59 → 10.38). It also keeps drives where the panel is
+      verified to decode colorimetrically (drives > 1 % outside native 56 % → 29 %).
     """
+    if oog_solve not in OOG_SOLVES:
+        raise ValueError(f"oog_solve must be one of {OOG_SOLVES}, got {oog_solve!r}")
     space = model.space
     signal_points = np.asarray(signal_points, dtype=float)
 
@@ -253,6 +299,22 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
         # roughens the lattice — more own-axis reversals — without an accuracy gain).
         swap = guard & (de_last - best_de > best_iterate_margin)
         corrected = np.where(swap[:, None], best_corrected, corrected)
+    if oog_solve == "projection":
+        # Re-solve every node whose target the reachable clamp moved at its gamut projection (the guard set,
+        # computed here regardless of ``best_iterate``); every other node keeps its direct solve untouched.
+        raw_target = model.forward_ictcp(points, np.zeros_like(target_ictcp))
+        moved = (np.any(np.abs(raw_target - target_ictcp) > 1e-9, axis=1)
+                 & (np.max(points, axis=1) >= _near_black_signal(model, near_black_nits)))
+        g = np.where(moved)[0]
+        if g.size:
+            solve = np.clip(np.nan_to_num(space.xyz_to_signal(space.ideal_xyz(points[g]))), 0.0, 1.0)
+            if level is not None:
+                over = np.max(solve, axis=1) > level + 1e-9
+                if np.any(over):
+                    solve[over] = project_to_top(solve[over], level, transfer=model.target.transfer)
+            corrected = corrected.copy()
+            corrected[g] = _solve_at(model, solve, signal_points, max_correction=max_correction,
+                                     n_iterations=n_iterations, fade_width=fade_width)
 
     # Identity reference per grid node: the node itself, or — for a held node — its
     # luminance-clipped projection (what "no colour correction" means above the top).

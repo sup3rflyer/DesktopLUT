@@ -5139,3 +5139,36 @@ def test_new_refine_pin_knobs_do_not_move_an_approved_plan_fingerprint_at_defaul
     calib.patch_sizes = _r(calib.patch_sizes, neutral_top_pins=5)
     rec2 = calib._patch_plan_record(calib.calib.get("flow"))
     assert rec2["patch_sizes"]["neutral_top_pins"] == 5 and rec2["fingerprint"] != rec["fingerprint"]
+
+
+def test_oog_projection_premise_is_checked_and_an_undecided_premise_goes_to_the_llm(tmp_path: Path):
+    # The projection solve rests on the monitor decoding Rec.2020 colorimetrically in-gamut; the build checks it
+    # on this run's post-MHC reads first. Passed -> projection; failed/undecidable -> a seam (never silently
+    # accepted or silently downgraded), the recommendation being the direct solve. Either way the mode is
+    # memoised so a resume builds the way the run started.
+    from dataclasses import replace as _replace
+    adj = _RecordingAuto()
+    calib = _make(tmp_path, "oog_premise", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10,
+                  adjudicator=adj)
+    calib.optimize_config = _replace(calib.optimize_config, oog_solve="projection")
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+    digest = calib.calib["stages"]["build-install-3dlut"]["digest"]
+    premise = digest["oog_premise"]
+    seams = [r for r in adj.requests if r.key == "build-install-3dlut:oog-premise"]
+    if premise["passed"] is True:
+        assert not seams and digest["oog_solve"] == "projection" == calib.calib["oog_solve"]
+    else:
+        assert len(seams) == 1 and seams[0].options == ("projection", "direct", "abort")
+        assert seams[0].recommendation == "direct"
+        assert digest["oog_solve"] == "direct" == calib.calib["oog_solve"]
+    assert "cube_quality" in digest
+
+
+def test_oog_solve_defaults_to_direct_and_is_memoised(tmp_path: Path):
+    calib = _make(tmp_path, "oog_default", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10)
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+    digest = calib.calib["stages"]["build-install-3dlut"]["digest"]
+    assert digest["oog_solve"] == "direct" == calib.calib["oog_solve"]
+    assert "oog_premise" not in digest

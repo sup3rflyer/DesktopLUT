@@ -61,6 +61,7 @@ from scipy.interpolate import RegularGridInterpolator
 from .engine.lut_constrained import build_constrained_rbf_cube
 from .engine.lut_rbf import (build_cube, cube_diagnostics, hold_lattice_level, identity_cube,
                              predicted_accuracy, write_cube)
+from .engine.cube_quality import cube_quality, ideal_cube
 from .engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
 from .engine.physical import StructuredForwardModel, build_physical_cube
 
@@ -181,6 +182,18 @@ class OptimizeConfig:
     # 76 -> 94 (margin 0: 189). No-op without reachable_primaries. rbf engine only.
     best_iterate_oog: bool = True
     best_iterate_margin: float = 2.0
+    # Out-of-gamut node solve (build_cube ``oog_solve``, round-2 design review 2026-09-24): "direct" (the
+    # default until a hardware verify accepts the alternative) inverts toward the clamped target from each node —
+    # at a gamut corner that diverges node by node into a rough lattice (run 132412: input-noise gain OOG p99 26
+    # JND, a static red speckle on bright Rec.2020 blue). "projection" solves each such node at its gamut
+    # projection (the reachable signal of its mapped target) with the in-gamut fixed point: in-gamut nodes
+    # bit-identical, noise gain 1.8, no ramp step > 1 JND, CV primaries 5.1 → 4.0. Projection also measures the
+    # correction/rail classification against the reachable signal (an OOG patch driven toward its mapped target
+    # is not "budget-limited"). No-op without reachable_primaries. rbf engine only.
+    oog_solve: Literal["direct", "projection"] = "direct"
+    # Lattice diagnostics in the digest (engine/cube_quality.py: noise gain, ramp excess, excess reversals, OOG
+    # drive share) — evidence for the build seam, never an auto-reject. HDR with reachable_primaries only.
+    cube_quality: bool = True
     # Candidate engine selector. "rbf" is the shipping path. "constrained-rbf" and "physical"
     # are labelled experiments: held-out CV rejected the constrained shell and the additive
     # structured model as post-MHC/post-ICC cube replacements. Keep them opt-in for probes only.
@@ -356,7 +369,8 @@ def seed_correction_budget(space: TargetSpace, signals: np.ndarray, measured_xyz
 
 def _classify(verify: np.ndarray, driven: np.ndarray, de: np.ndarray,
               threshold: float, budget: float, *, clamp_frac: float,
-              boundary_eps: float, low_light_signal: float):
+              boundary_eps: float, low_light_signal: float,
+              reference: Optional[np.ndarray] = None):
     """Bucket above-threshold points.
 
     Boundary classification is directional. A naturally saturated patch such as
@@ -364,13 +378,18 @@ def _classify(verify: np.ndarray, driven: np.ndarray, de: np.ndarray,
     unused red/green channels are already zero. It is clipped only when the cube
     actually pushes a nonzero channel down to zero, pushes a channel up to one, or
     the requested signal is already at full scale and remains above threshold.
+
+    ``reference`` (default ``verify``): the drive the correction is measured FROM. The projection solve
+    passes the reachable signal of each patch's mapped target — an out-of-gamut patch driven toward its
+    gamut projection is being mapped, not corrected, and must not read as budget-limited.
     """
+    ref = verify if reference is None else reference
     above = de > threshold
-    corr_mag = np.max(np.abs(driven - verify), axis=1)
-    low_clipped = np.any((driven <= boundary_eps) & (verify > boundary_eps), axis=1)
+    corr_mag = np.max(np.abs(driven - ref), axis=1)
+    low_clipped = np.any((driven <= boundary_eps) & (ref > boundary_eps), axis=1)
     high_clipped = np.any((driven >= 1.0 - boundary_eps)
-                          & ((verify >= 1.0 - boundary_eps)
-                             | (driven > verify + boundary_eps)), axis=1)
+                          & ((ref >= 1.0 - boundary_eps)
+                             | (driven > ref + boundary_eps)), axis=1)
     at_boundary = low_clipped | high_clipped
     clamp_active = corr_mag >= clamp_frac * budget
     near_black = above & (np.max(verify, axis=1) <= low_light_signal)
@@ -486,6 +505,8 @@ def optimize_cube(
     # reachable_primaries (the panel's measured native gamut) clamps the ideal target onto what the
     # panel can physically render, so build + verify score a gamut clip as a clip, not chase it (#C3).
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
+    projection = (cfg.oog_solve == "projection" and reachable_primaries is not None
+                  and cfg.engine == "rbf")
 
     raw_train_count = int(np.asarray(signals).reshape(-1, 3).shape[0])
     train_signals = np.asarray(signals, dtype=float).reshape(-1, 3)
@@ -598,6 +619,7 @@ def optimize_cube(
             n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
             neutral_band=cfg.neutral_band, hold_above=hold_top,
             best_iterate=cfg.best_iterate_oog, best_iterate_margin=cfg.best_iterate_margin,
+            oog_solve=cfg.oog_solve,
         )
         return model, cube, None, None
 
@@ -640,7 +662,8 @@ def optimize_cube(
 
         masks = _classify(verify_probe, driven, de, cfg.threshold, budget,
                           clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
-                          low_light_signal=cfg.low_light_signal)
+                          low_light_signal=cfg.low_light_signal,
+                          reference=(space.reachable_signal(verify_probe) if projection else None))
         diag = cube_diagnostics(cube, in_range_level=hold_level)
         if cfg.engine == "physical":
             driven_full = sample_cube(cube, verify)
@@ -749,7 +772,8 @@ def optimize_cube(
 
     masks_best = _classify(best_verify, best_driven, best_de, cfg.threshold, best_budget,
                            clamp_frac=cfg.clamp_active_frac, boundary_eps=cfg.boundary_eps,
-                           low_light_signal=cfg.low_light_signal)
+                           low_light_signal=cfg.low_light_signal,
+                           reference=(space.reachable_signal(best_verify) if projection else None))
     # Real floors = physically clipped + model residual (more budget won't help).
     real_floor = masks_best["signal_clipped"] | masks_best["residual"]
     budget_limited = masks_best["budget_limited"]
@@ -821,7 +845,11 @@ def optimize_cube(
     # sits at the soft-clamp's binding level, counted inside the calibrated range only — a held node's
     # offset above the top is the luminance clip of the top hold, not a colour correction.
     lattice = identity_cube(cfg.grid_size).reshape(-1, 3)
-    corr_mag = np.max(np.abs(np.asarray(best_cube).reshape(-1, 3) - lattice), axis=1)
+    # Projection: a correction is measured from the IDEAL cube (each node's mapped target as a signal) — the
+    # gamut mapping itself is not a colour correction and must not fill the budget-cap count.
+    ref_lattice = (ideal_cube(space, cfg.grid_size, hold_top, target.transfer).reshape(-1, 3)
+                   if projection else lattice)
+    corr_mag = np.max(np.abs(np.asarray(best_cube).reshape(-1, 3) - ref_lattice), axis=1)
     in_range = (np.max(lattice, axis=1) <= hold_level + 1e-9) if hold_level is not None \
         else np.ones(len(lattice), dtype=bool)
     nodes_at_cap = int(np.sum((corr_mag >= cfg.clamp_active_frac * best_budget) & in_range))
@@ -835,6 +863,7 @@ def optimize_cube(
         "top_hold_lattice_level": round(hold_level, 6) if hold_level is not None else None,
         "top_held_nodes": int(np.sum(~in_range)),
         "nodes_at_budget_cap": nodes_at_cap,
+        "oog_solve": cfg.oog_solve if reachable_primaries is not None else None,
         "grid_size": cfg.grid_size,
         "threshold": cfg.threshold,
         "max_correction": round(best_budget, 4),
@@ -882,6 +911,17 @@ def optimize_cube(
         "needs_adjudication": needs_adjudication,
         "history": [h.as_dict() for h in history],
     }
+    if cfg.cube_quality and reachable_primaries is not None and cfg.engine == "rbf" and model is not None:
+        # Lattice evidence for the LLM at the build seam (engine/cube_quality.py) — the final model (all the data
+        # the loop gathered) judging the returned cube against the ideal cube. Never gates anything here.
+        try:
+            digest["cube_quality"] = cube_quality(
+                model, np.asarray(best_cube), space, reachable_primaries,
+                tuple(target.white_xy) if target.white_xy else (0.3127, 0.3290),
+                hold_above=hold_top, top=(hold_top if hold_top is not None else 1.0),
+                transfer=target.transfer)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never break a multi-hour build
+            digest["cube_quality"] = {"error": f"{type(exc).__name__}: {exc}"}
 
     return OptimizeResult(
         converged=converged, iterations=len(history), cube=best_cube, grid_size=cfg.grid_size,

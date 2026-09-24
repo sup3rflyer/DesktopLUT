@@ -217,6 +217,21 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Changed
+- **3D LUT: out-of-gamut nodes can be solved at their gamut projection** (2026-09-24, `--oog-solve
+  projection`; default stays `direct` until a hardware verify accepts it). The owner's HDR test clips
+  showed banding in Rec.2020 blue and a static speckle on a bright 100 % blue ramp. Offline emulation
+  traced both to a rough lattice near the Rec.2020 blue corner. The per-node inversion toward a clamped
+  target diverges there: the node one cell off the blue axis output 0.27 PQ of red. The hook's
+  pre-LUT dither then became a static red pattern up to ~27 dE_ITP p95. Projection mode re-solves every
+  node whose target the reachable clamp moved AT its gamut projection, with the ordinary in-gamut fixed
+  point. Every other node stays bit-identical. Offline on run 132412: core, limits and tube drives are
+  unchanged; the clamped bucket is predicted 3.83 → 3.50; input-noise gain on out-of-gamut nodes falls
+  from 28 to 1.1 JND (p99); no ramp step exceeds 1 JND; held-out CV primaries improve 5.1 → 4.0.
+  Before using projection, the build checks on the run's own post-MHC reads that the monitor decodes
+  Rec.2020 colorimetrically inside its gamut (132412: 126 of 153 reads, p = 9e-17). If that check fails
+  or can't decide, the choice goes to the LLM as a seam. New `engine/cube_quality.py` adds lattice
+  evidence to every HDR build digest: noise gain, ramp excess, excess reversals and the share of drives
+  outside the native gamut. These are evidence for the build seam, never an auto-reject.
 - **The MHC grayscale refine stops on physics, not a fixed target** (2026-09-24,
   `dlc/refine_convergence.py`). The HDR and SDR refine loops used a fixed stop (2.0 dE_ITP /
   0.5 CIEDE2000); the 2026-09-24 PA32UCXR run accepted round 1 at 1.26 and left a uniform

@@ -5056,6 +5056,42 @@ class Calibration:
                 return replace(cfg, top_hold_signal=cap_cv / max_cv)
         return cfg
 
+    def _cube_oog_solve(self, cfg: OptimizeConfig, target, signals, measured
+                        ) -> tuple[OptimizeConfig, Optional[dict[str, Any]]]:
+        """The run's out-of-gamut node solve for the 3D-LUT build (``OptimizeConfig.oog_solve``), memoised in the
+        run record like the OOG mapping so a resume builds the way the run started. The projection solve rests
+        on a premise — the monitor decodes Rec.2020 colorimetrically inside its native gamut — which is checked
+        on THIS run's post-MHC reads (:func:`dlc.engine.cube_quality.premise_check`) before it is used; a failed
+        or undecidable check is a judgment for the LLM (seam), never silently accepted or silently downgraded."""
+        memo = self.calib.get("oog_solve")
+        if memo in ("direct", "projection") and memo != cfg.oog_solve:
+            cfg = replace(cfg, oog_solve=memo)
+        self.calib["oog_solve"] = cfg.oog_solve
+        reach = self._reachable_primaries()
+        if cfg.oog_solve != "projection" or reach is None:
+            return cfg, None
+        from .engine.cube_quality import premise_check
+        cap = float(self._hdr_target().peak_nits) if self.mode == "HDR" else float(self._spec().luminance_nits)
+        premise = premise_check(signals, measured, target, reach, self._white_xy(), cap)
+        if premise.get("passed") is True:
+            return cfg, premise
+        decision = self._abort_if(self.adjudicate(AdjudicationRequest(
+            key="build-install-3dlut:oog-premise", seam=SEAM_OPTIMIZE, stage="build-install-3dlut",
+            question=(
+                "the out-of-gamut projection solve assumes the monitor decodes Rec.2020 colorimetrically "
+                "inside its native gamut, but this run's post-MHC reads do not confirm it "
+                + (f"({premise['colorimetric_closer']} of {premise['n']} saturated in-gamut reads closer to "
+                   f"the colorimetric model, p = {premise['p_value']:.2g})"
+                   if premise.get("passed") is False else f"({premise.get('reason')})")
+                + " — build with projection anyway, fall back to the direct solve, or abort?"),
+            options=("projection", "direct", "abort"), recommendation="direct",
+            digest={"premise": premise})),
+            stage="build-install-3dlut", message="aborted at the out-of-gamut solve premise seam")
+        if decision.choice == "direct":
+            cfg = replace(cfg, oog_solve="direct")
+            self.calib["oog_solve"] = "direct"
+        return cfg, premise
+
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
             self._oog_mapping()       # the cube, verify and the stage CLIs share one OOG policy
@@ -5065,9 +5101,10 @@ class Calibration:
             signals = np.array([s.rgb for s in samples], dtype=float)
             measured = np.array([s.xyz for s in samples], dtype=float)
             cube_path = str(self.ctx.root / "generated" / f"final_{self.mode.lower()}.cube")
+            cfg, premise = self._cube_oog_solve(self._cube_optimize_config(), target, signals, measured)
             try:
                 result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
-                                       measured_xyz=measured, config=self._cube_optimize_config(),
+                                       measured_xyz=measured, config=cfg,
                                        on_iteration=self._on_optimize_iteration,
                                        reachable_primaries=self._reachable_primaries(),
                                        report_scorer=report_scorer, report_metric=report_metric)
@@ -5082,6 +5119,8 @@ class Calibration:
             self.controller.set_3dlut(self.monitor, self.mode, cube_path)
             self._hook_routing_evidence_after_install("build-install-3dlut")
             digest = {**result.digest, "cube_path": cube_path}
+            if premise is not None:
+                digest["oog_premise"] = premise
             return StageOutcome("build-install-3dlut", "done", digest=digest,
                                 data={"cube_path": cube_path,
                                       "needs_adjudication": result.needs_adjudication,
@@ -6535,6 +6574,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "MHC base cube keeps greys at the D65 cap white, the 3D LUT keeps each colour's "
                              "corrected hue with its luminance clipped at the top. off = the legacy "
                              "behaviour (shared MHC ceiling; 3D LUT fades to identity above the data).")
+    parser.add_argument("--oog-solve", choices=("direct", "projection"), default="direct", dest="oog_solve",
+                        help="how the 3D LUT solves nodes whose target lies outside the panel's gamut: direct "
+                             "(default until a hardware verify accepts the alternative) inverts toward the "
+                             "clamped target node by node; projection solves each at its gamut projection "
+                             "(smooth, noise-safe lattice; in-gamut nodes identical) after checking that the "
+                             "monitor decodes colorimetrically in-gamut (seam if not). A resumed run keeps the "
+                             "mode it started with.")
     parser.add_argument("--hook-routing-check", choices=("auto", "always", "never"), default="auto",
                         dest="hook_routing_policy",
                         help="DWM-hook LUT routing self-check for cube flows (full / 3dlut-only). The hook "
@@ -6955,7 +7001,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             thermal_align=args.thermal_align,
                             hook_routing_policy=args.hook_routing_policy,
                             mhc_top_hold=(args.top_hold == "on"),
-                            optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on")))
+                            optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
+                                                           oog_solve=args.oog_solve))
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:
