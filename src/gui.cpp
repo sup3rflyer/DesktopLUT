@@ -1922,14 +1922,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // (shader replaces ICC corrections during preview, restores on Cancel/Apply)
                 std::wstring otherProfileName;
                 bool otherWasEnabled = false;
+                bool identityForPreview = false;
                 if (livePreview) {
-                    // Remove ICC profile so shader preview isn't double-corrected
-                    if (hadProfile) {
-                        DisplayInfo displayInfo;
-                        if (GetDisplayInfoForMonitor(monIdx, displayInfo)) {
-                            RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-                        }
-                    }
+                    const float identityPeak = MhcIdentityPeakNits(g_gui.monitorSettings[monIdx], isHDR);
 
                     // Clear BOTH modes' MHC profile state so processing thread
                     // sees no active profiles and sets all MHC flags to false.
@@ -1945,6 +1940,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         mhc.profilePath.clear();
                         otherMhc.enabled = false;
                         otherMhc.profileName.clear();
+                    }
+
+                    // Take the ICC profile out of scanout so the shader preview isn't
+                    // double-corrected. A bare disassociation is NOT enough — Windows keeps
+                    // applying the last associated MHC2 transform (HW-proven 2026-09-03 /
+                    // 2026-09-23) — so associate the identity profile first, then remove the real
+                    // one (after the clear above, so CheckMhcProfiles can't re-assert it mid-swap).
+                    // Dropped again below once the real profile is back (Cancel/close); the OK
+                    // path's GenerateAndInstallMhcProfile drops it itself.
+                    if (hadProfile) {
+                        identityForPreview = !ReplaceMhcProfileWithIdentity(
+                            monIdx, isHDR, identityPeak, origProfileName).empty();
                     }
 
                     // Clear MHC active flags so shader applies corrections
@@ -1969,11 +1976,17 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 // Restore state after dialog closes
                 if (livePreview) {
+                    bool realBack;
                     {
                         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
                         otherMhc.enabled = otherWasEnabled;
                         otherMhc.profileName = otherProfileName;
+                        realBack = mhc.enabled && !mhc.profileName.empty();
                     }
+                    // Cancel/close re-associated the original profile: drop the preview's identity
+                    // stand-in. (If no real profile came back — e.g. the OK-path install failed —
+                    // the identity profile stays associated rather than leaving nothing.)
+                    if (identityForPreview && realBack) DisengageIdentityMhcProfile(monIdx, isHDR);
                     UpdateMhcFlagsLive(monIdx);
                     if (!startedForPreview) {
                         UpdateColorCorrectionLive(monIdx, isHDR);
@@ -2034,10 +2047,20 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
 
-                DisplayInfo displayInfo;
-                if (GetDisplayInfoForMonitor(g_gui.currentMonitor, displayInfo)) {
-                    RemoveMHC2Profile(mhc.profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+                // Associate the identity MHC2 profile FIRST, then disassociate the real one:
+                // Windows keeps applying the last associated MHC2 transform after a removal
+                // (HW-proven 2026-09-03 / 2026-09-23), so "Remove" must hand the display a
+                // neutral profile, never "nothing associated". Only the identity association
+                // survives; the real profile's file is deleted below as before.
+                // Mark the mode disabled BEFORE the swap: the whitelist thread's CheckMhcProfiles
+                // would otherwise see enabled + a non-matching default (the identity) and
+                // re-assert the old profile mid-swap.
+                const float identityPeak = MhcIdentityPeakNits(settings, isHDR);
+                {
+                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                    mhc.enabled = false;
                 }
+                ReplaceMhcProfileWithIdentity(g_gui.currentMonitor, isHDR, identityPeak, mhc.profileName);
 
                 // Delete the .icm file from system color directory
                 {

@@ -2,6 +2,7 @@
 #include "mhc.h"
 #include "mhc_internal.h"   // MatInv3, MatVecMul3 (shared inline helpers)
 #include "color.h"
+#include "gui_mhc.h"       // MhcProfileMetadataPeakNits (identity-profile metadata)
 #include <cmath>
 #include <algorithm>
 #include <fstream>
@@ -239,22 +240,147 @@ TEST_CASE("MHC2 matrix: SDR emitted as XYZ-basis adjustment, round-trips to inte
     CHECK(std::fabs(Memit[0] - intended[0]) > 1e-3f);
 }
 
-TEST_CASE("MHC2 matrix: HDR emitted directly (NOT XYZ-basis conjugated)") {
-    // The basis conjugation is SDR-only (!isHDR guard). HDR must keep emitting the direct RGB->RGB
-    // form inv(displayToXYZ)*srcToXYZ (near-diagonal white-only in production; conjugating it would
-    // inject ~0.016 white error). Pins the guard so a future "generalize to HDR" can't slip in blind.
+// As Windows applies an MHC2 tag in basis B (row-major 3x3): inv(B) * Memit * B.
+static void tAsApplied(const DisplayPrimariesData& basis, const float Memit[9], float out[9]) {
+    float B[9], Binv[9], tmp[9];
+    REQUIRE(tBuildRGBtoXYZ(basis, B));
+    REQUIRE(MatInv3(B, Binv));
+    tMatMul3(Binv, Memit, tmp);
+    tMatMul3(tmp, B, out);
+}
+// Intended RGB->RGB transform inv(displayToXYZ) * srcToXYZ.
+static void tIntended(const DisplayPrimariesData& src, const DisplayPrimariesData& disp, float out[9]) {
+    float pDisp[9], pDispInv[9], pSrc[9];
+    REQUIRE(tBuildRGBtoXYZ(disp, pDisp));
+    REQUIRE(MatInv3(pDisp, pDispInv));
+    REQUIRE(tBuildRGBtoXYZ(src, pSrc));
+    tMatMul3(pDispInv, pSrc, out);
+}
+
+// PA32UCXR HW case 2026-09-23: native primaries, measured native white 0.3257/0.3275 -> D65.
+// GenerateMHC2Profile's HDR native-src path: src = native primaries + D65, display = native + native white.
+static constexpr DisplayPrimariesData kPaNativeD65 = {0.6926f, 0.3030f, 0.1809f, 0.7510f, 0.1521f, 0.0649f, 0.3127f, 0.3290f};
+static constexpr DisplayPrimariesData kPaNative    = {0.6926f, 0.3030f, 0.1809f, 0.7510f, 0.1521f, 0.0649f, 0.3257f, 0.3275f};
+
+TEST_CASE("MHC2 matrix: HDR emitted as BT.2020 XYZ-basis adjustment, round-trips to intended RGB->RGB") {
+    // HDR MHC2 is consumed like SDR's: as-applied inv(B)*Memit*B with B = BT.2020@D65 (HW root
+    // cause 2026-09-23). The emitted tag must reconstruct the intended RGB->RGB transform once that
+    // wrap is undone — here a genuinely non-diagonal BT.2020->P3 map (legacy BT.2020-src path).
     float mhc[12];
-    ComputeMHC2Matrix(kBT2020, kP3D65, true, mhc);  // HDR, non-identity
+    float asApplied9[9];
+    ComputeMHC2Matrix(kBT2020, kP3D65, true, mhc, nullptr, asApplied9);
     float Memit[9]; tExtract3x3(mhc, Memit);
 
-    float pDisp[9], pDispInv[9], pSrc[9], intended[9];
-    REQUIRE(tBuildRGBtoXYZ(kP3D65, pDisp));
-    REQUIRE(MatInv3(pDisp, pDispInv));
-    REQUIRE(tBuildRGBtoXYZ(kBT2020, pSrc));
-    tMatMul3(pDispInv, pSrc, intended);
+    float applied[9], intended[9];
+    tAsApplied(kBT2020, Memit, applied);
+    tIntended(kBT2020, kP3D65, intended);
+    for (int i = 0; i < 9; i++) {
+        CHECK(applied[i] == doctest::Approx(intended[i]).epsilon(2e-3));
+        CHECK(asApplied9[i] == doctest::Approx(intended[i]).epsilon(1e-4));  // outAsAppliedRGB = pre-conjugation
+    }
+    // The emitted matrix is genuinely in the XYZ basis, not the raw RGB->RGB matrix.
+    CHECK(std::fabs(Memit[0] - intended[0]) > 1e-3f);
+    CHECK(mhc[3] == 0.0f);
+    CHECK(mhc[7] == 0.0f);
+    CHECK(mhc[11] == 0.0f);
+}
 
-    for (int i = 0; i < 9; i++)
-        CHECK(Memit[i] == doctest::Approx(intended[i]).epsilon(2e-3));
+TEST_CASE("MHC2 matrix: HDR native white move keeps pure red pure (PA32UCXR 2026-09-23)") {
+    float mhc[12];
+    float asApplied9[9];
+    ComputeMHC2Matrix(kPaNativeD65, kPaNative, true, mhc, nullptr, asApplied9);
+    float Memit[9]; tExtract3x3(mhc, Memit);
+
+    // Intended = same primaries, white-only move => a pure diagonal of per-channel gains.
+    float intended[9];
+    tIntended(kPaNativeD65, kPaNative, intended);
+    CHECK(intended[0] == doctest::Approx(0.9155f).epsilon(2e-3));
+    CHECK(intended[4] == doctest::Approx(1.0341f).epsilon(2e-3));
+    CHECK(intended[8] == doctest::Approx(1.0286f).epsilon(2e-3));
+    for (int i : {1, 2, 3, 5, 6, 7}) CHECK(std::fabs(intended[i]) < 1e-5f);
+
+    // As Windows applies the emitted tag: exactly the diagonal (zero crosstalk).
+    float applied[9];
+    tAsApplied(kBT2020, Memit, applied);
+    for (int i = 0; i < 9; i++) {
+        CHECK(std::fabs(applied[i] - intended[i]) < 1e-4f);
+        CHECK(std::fabs(asApplied9[i] - intended[i]) < 1e-5f);
+    }
+
+    // A pure-red drive stays pure red: no green/blue leak (the HW defect was ~5 % red->green).
+    float red[3] = {1.0f, 0.0f, 0.0f}, out[3];
+    MatVecMul3(applied, red, out);
+    CHECK(out[0] == doctest::Approx(intended[0]).epsilon(1e-3));
+    CHECK(std::fabs(out[1]) < 1e-4f);
+    CHECK(std::fabs(out[2]) < 1e-4f);
+
+    // White lands on D65 through the panel's native primaries+white (pre-refine prediction).
+    float dispToXYZ[9], white[3] = {1.0f, 1.0f, 1.0f}, drive[3], XYZ[3];
+    REQUIRE(tBuildRGBtoXYZ(kPaNative, dispToXYZ));
+    MatVecMul3(applied, white, drive);
+    MatVecMul3(dispToXYZ, drive, XYZ);
+    float sum = XYZ[0] + XYZ[1] + XYZ[2];
+    CHECK(std::fabs(XYZ[0] / sum - 0.3127f) < 2e-4f);
+    CHECK(std::fabs(XYZ[1] / sum - 0.3290f) < 2e-4f);
+
+    // Discrimination pin: the pre-fix DIRECT emission (tag = intended) reproduces the measured
+    // defect — ~5 % red->green leak and a green-shifted pre-refine white (~0.3015/0.3386; the
+    // measured refine round-1 greys were 0.298/0.340). So this test really guards the conjugation.
+    float directApplied[9];
+    tAsApplied(kBT2020, intended, directApplied);
+    CHECK(directApplied[3] > 0.04f);                       // green row picks up red drive
+    MatVecMul3(directApplied, white, drive);
+    MatVecMul3(dispToXYZ, drive, XYZ);
+    sum = XYZ[0] + XYZ[1] + XYZ[2];
+    CHECK(XYZ[0] / sum == doctest::Approx(0.3015f).epsilon(2e-3));
+    CHECK(XYZ[1] / sum == doctest::Approx(0.3386f).epsilon(2e-3));
+    // ...and the emitted (conjugated) tag is therefore NOT the diagonal itself.
+    CHECK(std::fabs(Memit[3]) > 0.04f);
+}
+
+TEST_CASE("MHC2 matrix: HDR identity inputs stay identity (native src, D65 both sides)") {
+    // DLC's enter-neutral identity association: display primaries = native, display white = D65,
+    // and the C++ HDR src = native + D65 => identity RGB->RGB, which conjugates to identity.
+    float mhc[12];
+    ComputeMHC2Matrix(kPaNativeD65, kPaNativeD65, true, mhc);
+    float id[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+    for (int i = 0; i < 12; i++) CHECK(std::fabs(mhc[i] - id[i]) < 1e-4f);
+    // SDR identity likewise survives its sRGB conjugation.
+    ComputeMHC2Matrix(kSRGB, kSRGB, false, mhc);
+    for (int i = 0; i < 12; i++) CHECK(std::fabs(mhc[i] - id[i]) < 1e-4f);
+}
+
+TEST_CASE("ICC: HDR native-src profile serializes the BT.2020-conjugated MHC2 matrix") {
+    // End to end through GenerateMHC2Profile's HDR native-src path (hdrNativeSrc = native primaries
+    // + D65; display = native + measured native white): the serialized tag, applied the way Windows
+    // applies it (inv(B2020)*M*B2020), is the diagonal white move with no crosstalk.
+    MHC2ProfileParams params;
+    params.monitorName = L"TestHDRConj";
+    params.displayPrimaries = kPaNative;
+    params.primariesEnabled = true;
+    params.isHDR = true;
+    params.peakNits = 1000.0f;
+
+    std::vector<uint8_t> data;
+    REQUIRE(GenerateMHC2Profile(params, data));
+    const uint32_t MHC2_SIG = ((uint32_t)'M' << 24) | ((uint32_t)'H' << 16) | ((uint32_t)'C' << 8) | (uint32_t)'2';
+    uint32_t tagCount = ReadBE32(data.data() + 128);
+    uint32_t mhc2Offset = 0;
+    for (uint32_t i = 0; i < tagCount; i++) {
+        const uint8_t* e = data.data() + 132 + i * 12;
+        if (ReadBE32(e) == MHC2_SIG) { mhc2Offset = ReadBE32(e + 4); break; }
+    }
+    REQUIRE(mhc2Offset != 0);
+    const uint8_t* m = data.data() + mhc2Offset + 36;
+    float tag12[12];
+    for (int i = 0; i < 12; i++) tag12[i] = ReadS15Fixed16(m + i * 4);
+    float tag9[9]; tExtract3x3(tag12, tag9);
+
+    float applied[9], intended[9];
+    tAsApplied(kBT2020, tag9, applied);
+    tIntended(kPaNativeD65, kPaNative, intended);
+    for (int i = 0; i < 9; i++) CHECK(std::fabs(applied[i] - intended[i]) < 5e-4f);
+    for (int i : {1, 2, 3, 5, 6, 7}) CHECK(std::fabs(applied[i]) < 5e-4f);
 }
 
 // ============================================================================
@@ -2103,4 +2229,162 @@ TEST_CASE("Correction grayscale + desktop gamma combined HDR") {
     bool ok = GenerateMHC2Profile(params, profileData);
     CHECK(ok);
     CHECK(profileData.size() > 128);
+}
+
+// ============================================================================
+// Identity (neutral) MHC2 profile — associated in place of a removed/disabled profile
+// ============================================================================
+
+// Locate an ICC tag (offset/size) by its 4-char signature.
+static bool tFindTag(const std::vector<uint8_t>& data, const char sig[4], uint32_t& off, uint32_t& size) {
+    if (data.size() < 132) return false;
+    const uint32_t want = ((uint32_t)(uint8_t)sig[0] << 24) | ((uint32_t)(uint8_t)sig[1] << 16) |
+                          ((uint32_t)(uint8_t)sig[2] << 8)  |  (uint32_t)(uint8_t)sig[3];
+    uint32_t tagCount = ReadBE32(data.data() + 128);
+    for (uint32_t i = 0; i < tagCount; i++) {
+        const uint8_t* e = data.data() + 132 + i * 12;
+        if (e + 12 > data.data() + data.size()) return false;
+        if (ReadBE32(e) == want) { off = ReadBE32(e + 4); size = ReadBE32(e + 8); return true; }
+    }
+    return false;
+}
+
+TEST_CASE("Identity MHC profile: stable per display/mode name") {
+    // Keyed by the persistent [Display<slot>] settings slot (stable across enumeration reorders /
+    // hot-plug, unique per physical panel); the monitor index is only the unidentified fallback.
+    CHECK(MhcIdentityProfileName(3, 0, false) == L"DesktopLUT_Display3_SDR_Identity.icm");
+    CHECK(MhcIdentityProfileName(3, 1, true)  == L"DesktopLUT_Display3_HDR_Identity.icm");
+    CHECK(MhcIdentityProfileName(0, 5, true)  == L"DesktopLUT_Display0_HDR_Identity.icm");
+    CHECK(MhcIdentityProfileName(-1, 0, false) == L"DesktopLUT_Mon0_SDR_Identity.icm");
+    CHECK(MhcIdentityProfileName(-1, 12, true) == L"DesktopLUT_Mon12_HDR_Identity.icm");
+    // The monitor index does not matter once a slot exists (a reorder must not rename/rewrite it).
+    CHECK(MhcIdentityProfileName(7, 0, true) == MhcIdentityProfileName(7, 2, true));
+    // Deterministic: same inputs -> same name (no timestamp churn in the color dir).
+    CHECK(MhcIdentityProfileName(-1, 3, false) == MhcIdentityProfileName(-1, 3, false));
+}
+
+TEST_CASE("Identity MHC profile: name recognizer") {
+    for (int slot : {-1, 0, 4, 42}) {
+        for (int mon : {0, 1, 7}) {
+            for (bool hdr : {false, true}) {
+                bool outHdr = !hdr;
+                CHECK(IsMhcIdentityProfileName(MhcIdentityProfileName(slot, mon, hdr), &outHdr));
+                CHECK(outHdr == hdr);
+            }
+        }
+    }
+    CHECK(IsMhcIdentityProfileName(L"DesktopLUT_Mon1_HDR_Identity.icm"));
+    CHECK(IsMhcIdentityProfileName(L"DesktopLUT_Display10_SDR_Identity.icm"));
+    // Real / transient DesktopLUT profiles are NOT identity profiles (sweep + cleanup rules).
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Mon0_HDR_123456789.icm"));
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Mon0_SDR_P4_123456789.icm"));
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Mon0_SDR_Passthru_123456789.icm"));
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Mon_SDR_Identity.icm"));        // no key
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Display_HDR_Identity.icm"));    // no key
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_MonX_SDR_Identity.icm"));       // non-digit key
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Mon1_P3_HDR_Identity.icm"));    // extra token
+    CHECK_FALSE(IsMhcIdentityProfileName(L"DesktopLUT_Mon1_XDR_Identity.icm"));
+    CHECK_FALSE(IsMhcIdentityProfileName(L"Other_Mon1_SDR_Identity.icm"));
+    CHECK_FALSE(IsMhcIdentityProfileName(L""));
+}
+
+TEST_CASE("Identity MHC profile: HDR peak metadata follows the monitor's MaxTML, then the removed profile") {
+    const float kDefault = MHC2ProfileParams().peakNits;
+    MonitorSettings ms;
+    // (1) Nothing configured -> the params default.
+    CHECK(MhcIdentityPeakNits(ms, true) == kDefault);
+    // (2) The removed HDR profile carried a configured peak (e.g. DLC's set_base_lut cube) -> that.
+    ms.hdrMHC.sourceFilePath = L"C:/nonexistent/base.cube";
+    ms.hdrMHC.baseGrayscale.peakNits = 1450.0f;
+    CHECK(MhcIdentityPeakNits(ms, true) == 1450.0f);
+    // (3) Display Peak Override (MaxTML) enabled -> the monitor's own peak wins.
+    ms.maxTml.enabled = true;
+    ms.maxTml.peakNits = 10000.0f;
+    CHECK(MhcIdentityPeakNits(ms, true) == 10000.0f);
+    // MaxTML disabled again -> back to the removed profile's peak.
+    ms.maxTml.enabled = false;
+    CHECK(MhcIdentityPeakNits(ms, true) == 1450.0f);
+    // Invalid MaxTML value is ignored.
+    ms.maxTml.enabled = true;
+    ms.maxTml.peakNits = 0.0f;
+    CHECK(MhcIdentityPeakNits(ms, true) == 1450.0f);
+    // SDR: MaxTML is an HDR concept; the SDR value is unused (writer pins 80) but stays the MHC's.
+    ms.maxTml.peakNits = 10000.0f;
+    CHECK(MhcIdentityPeakNits(ms, false) == MhcProfileMetadataPeakNits(ms.sdrMHC, false));
+}
+
+TEST_CASE("Identity MHC profile: identity matrix + identity LUTs + mode metadata (SDR and HDR)") {
+    for (bool hdr : {false, true}) {
+        CAPTURE(hdr);
+        MHC2ProfileParams params = BuildIdentityMHC2Params(hdr, 1600.0f, L"TestMon (identity)");
+        CHECK(params.isHDR == hdr);
+        CHECK_FALSE(params.primariesEnabled);
+        CHECK_FALSE(params.grayscale.enabled);
+        CHECK_FALSE(params.hasPerChannelTRC);
+        CHECK_FALSE(params.hasPrecomputedCorrection);
+        CHECK_FALSE(params.desktopGammaEnabled);
+        CHECK_FALSE(params.correctionGrayscaleEnabled);
+
+        std::vector<uint8_t> data;
+        REQUIRE(GenerateMHC2Profile(params, data));
+
+        uint32_t off = 0, size = 0;
+        REQUIRE(tFindTag(data, "MHC2", off, size));
+        const uint8_t* t = data.data() + off;
+        const uint32_t lutSize = ReadBE32(t + 8);
+        CHECK(lutSize == (hdr ? 4096u : 1024u));
+        // MinCLL / MaxCLL as the mode's normal profile carries them.
+        CHECK(ReadS15Fixed16(t + 12) == doctest::Approx(hdr ? 0.005f : 0.5f).epsilon(1e-3));
+        CHECK(ReadS15Fixed16(t + 16) == doctest::Approx(hdr ? 1600.0f : 80.0f).epsilon(1e-4));
+
+        // 3x4 matrix = identity (after the mode's XYZ-basis conjugation).
+        const uint32_t matOff = ReadBE32(t + 20);
+        const float id12[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};
+        for (int i = 0; i < 12; i++)
+            CHECK(std::fabs(ReadS15Fixed16(t + matOff + i * 4) - id12[i]) < 1e-4f);
+
+        // Each channel's 1D LUT = identity ramp.
+        for (int ch = 0; ch < 3; ch++) {
+            const uint32_t lutOff = ReadBE32(t + 24 + ch * 4);
+            const uint8_t* lut = t + lutOff + 8;   // skip 'sf32' + reserved
+            float maxErr = 0.0f;
+            for (uint32_t j = 0; j < lutSize; j++) {
+                float expect = (float)j / (float)(lutSize - 1);
+                maxErr = (std::max)(maxErr, std::fabs(ReadS15Fixed16(lut + j * 4) - expect));
+            }
+            CHECK(maxErr < 1e-4f);
+        }
+
+        // lumi tag Y = peak (HDR) / 80 (SDR).
+        REQUIRE(tFindTag(data, "lumi", off, size));
+        CHECK(ReadS15Fixed16(data.data() + off + 12) == doctest::Approx(hdr ? 1600.0f : 80.0f).epsilon(1e-4));
+    }
+}
+
+TEST_CASE("Identity MHC profile: invalid peak keeps the default HDR metadata") {
+    MHC2ProfileParams d;
+    CHECK(BuildIdentityMHC2Params(true, 0.0f, L"M").peakNits == d.peakNits);
+    CHECK(BuildIdentityMHC2Params(true, -5.0f, L"M").peakNits == d.peakNits);
+    CHECK(BuildIdentityMHC2Params(true, NAN, L"M").peakNits == d.peakNits);
+    CHECK(BuildIdentityMHC2Params(true, 850.0f, L"M").peakNits == 850.0f);
+}
+
+TEST_CASE("Identity MHC profile: metadata peak mirrors the normal profile's (MhcProfileMetadataPeakNits)") {
+    const float kDefault = MHC2ProfileParams().peakNits;
+    MHCSettings m;
+    m.baseGrayscale.peakNits = 1234.0f;
+    // Nothing configured -> the params default.
+    CHECK(MhcProfileMetadataPeakNits(m, true) == kDefault);
+    // Base grayscale enabled but empty -> still the default (BuildMHC2Params' safety branch).
+    m.baseGrayscale.enabled = true;
+    m.baseGrayscale.points.clear();
+    CHECK(MhcProfileMetadataPeakNits(m, true) == kDefault);
+    // Base grayscale enabled with points -> the configured peak.
+    m.baseGrayscale.points.assign(20, 0.5f);
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 1234.0f);
+    // Source file (ICC / 1D cube, e.g. DLC's set_base_lut) -> the configured peak regardless.
+    MHCSettings f;
+    f.baseGrayscale.peakNits = 777.0f;
+    f.sourceFilePath = L"C:/nonexistent/base.cube";
+    CHECK(MhcProfileMetadataPeakNits(f, true) == 777.0f);
 }

@@ -1,5 +1,14 @@
 # Bug report: SDR MHC2 matrix emitted in the wrong basis — primaries over-desaturated ~3 dE
 
+> **UPDATE 2026-09-23 — HDR is conjugated too (supersedes the "SDR-only / HDR must stay untouched"
+> scope below).** HW evidence on the PA32UCXR (native white 0.3257/0.3275 → D65): the direct HDR
+> emission's as-applied `inv(B2020)·M·B2020` leaked ~5 % of red drive into green — mid-level red
+> shifted from native 0.690/0.303 to ~0.67–0.68/0.31, over-peak full-signal red turned orange
+> (x 0.60 y 0.39) — and the wrap model's predicted pre-refine white 0.3015/0.3386 matched the measured
+> refine round-1 greys 0.298/0.340. The "~0.016 white error" argument was judged on white only.
+> `ComputeMHC2Matrix` now emits `B·M·inv(B)` in both modes (B = sRGB NPM for SDR, BT.2020 NPM for
+> HDR); the SDR arithmetic is unchanged. See the comment block in `src/mhc_icc.cpp`.
+
 **Status:** DIAGNOSED + FIX HW-VERIFIED + **APPLIED to C++ 2026-06-26** (`ComputeMHC2Matrix` SDR basis-conjugation; regression tests added — 227 cases green) · **Component:** `mhc_icc.cpp` (MHC2 profile generation) · **Severity:** colorimetric (every SDR primary off by ~3 dE; user-visible as a hue-rotated/desaturated sRGB clamp)
 
 > **Finding.** DesktopLUT computes the SDR MHC2 matrix as a direct **RGB→RGB** gamut map

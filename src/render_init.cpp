@@ -549,6 +549,20 @@ void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
                    << L"' for monitor " << ctx->index << std::endl;
         RemoveMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
         ReassociateMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    } else {
+        // No real profile for the new mode. If its Windows default is DesktopLUT's identity
+        // stand-in (left by an explicit Remove/disable), kick it the same way — otherwise Windows
+        // can keep scanning out through the previous mode's last MHC2 transform (it keeps applying
+        // the last associated transform until a profile is (re)associated; HW-proven 2026-09-03 /
+        // 2026-09-23). Only DesktopLUT's own identity name is touched; anything else is left alone.
+        std::wstring current = QueryDisplayDefaultProfile(displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        if (IsMhcIdentityProfileName(current)) {
+            std::wcout << L"Mode switch: reapplying " << (isHDR ? L"HDR" : L"SDR")
+                       << L" identity MHC profile '" << current
+                       << L"' for monitor " << ctx->index << std::endl;
+            RemoveMHC2Profile(current, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+            ReassociateMHC2Profile(current, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        }
     }
 
     // Update MHC flags to match current settings

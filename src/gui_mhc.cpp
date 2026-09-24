@@ -185,6 +185,15 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
 // SECTION: MHC Profile Generation & Installation
 // ============================================================================
 
+float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR) {
+    (void)isHDR;  // SDR profiles pin 80 nits in the writer; the value is only consumed for HDR
+    // A source file (ICC / 1D cube) or an enabled, populated base grayscale carries the user's
+    // configured peak; otherwise the profile keeps the MHC2ProfileParams default.
+    if (!mhc.sourceFilePath.empty()) return mhc.baseGrayscale.peakNits;
+    if (mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty()) return mhc.baseGrayscale.peakNits;
+    return MHC2ProfileParams().peakNits;
+}
+
 // Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate)
 static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
     params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
@@ -202,6 +211,10 @@ static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex
             params.displayPrimaries = { p.Rx, p.Ry, p.Gx, p.Gy, p.Bx, p.By, p.Wx, p.Wy };
         }
     }
+
+    // Luminance metadata (lumi tag / MHC2 MaxCLL + HDR curve scaling) — one source of truth shared
+    // with the identity profile (MhcProfileMetadataPeakNits mirrors the branches below exactly).
+    params.peakNits = MhcProfileMetadataPeakNits(mhc, isHDR);
 
     // If source file is set, re-read and use per-channel data directly
     if (!mhc.sourceFilePath.empty()) {
@@ -232,8 +245,8 @@ static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex
                 params.grayscale.use24Gamma = mhc.baseGrayscale.use24Gamma;
             }
         }
-        // Peak nits is display metadata, needed regardless of file type
-        params.peakNits = mhc.baseGrayscale.peakNits;
+        // Peak nits is display metadata, needed regardless of file type (set above via
+        // MhcProfileMetadataPeakNits = baseGrayscale.peakNits on this branch).
     } else if (mhc.baseGrayscale.enabled) {
         // Safety: if points are empty (e.g., dialog set enabled=true without init), use identity
         if (mhc.baseGrayscale.points.empty()) {
@@ -257,7 +270,7 @@ static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex
             }
             params.grayscale.use24Gamma = mhc.baseGrayscale.use24Gamma;
             params.grayscale.peakNits = mhc.baseGrayscale.peakNits;
-            params.peakNits = mhc.baseGrayscale.peakNits;
+            // params.peakNits = baseGrayscale.peakNits (set above via MhcProfileMetadataPeakNits)
         }
     }
 
@@ -581,6 +594,100 @@ void DisengageSdrPassthroughScanout(int monitorIndex, const std::wstring& passth
     std::cout << "MHC: disengaged SDR passthrough scanout for monitor " << monitorIndex << std::endl;
 }
 
+// ----------------------------------------------------------------------------
+// Identity (neutral) MHC2 profile on explicit Remove / disable (see mhc.h). Windows keeps
+// applying the LAST associated MHC2 transform after a disassociation (HW-proven 2026-09-03 /
+// 2026-09-23), so an explicit Remove/disable associates this identity profile FIRST and only
+// then disassociates the old profile. These helpers briefly take g_monitorSettingsMutex (to read
+// the display's settings slot) — call them WITHOUT it held.
+// ----------------------------------------------------------------------------
+
+float MhcIdentityPeakNits(const MonitorSettings& ms, bool isHDR) {
+    // The monitor's own peak setting first (Display Peak Override / MaxTML — what DesktopLUT tells
+    // Windows the panel peaks at), so Remove doesn't silently change what HDR apps are told.
+    if (isHDR && ms.maxTml.enabled && std::isfinite(ms.maxTml.peakNits) && ms.maxTml.peakNits > 0.0f)
+        return ms.maxTml.peakNits;
+    // ...else what the removed profile carried (its configured peak, or the params default).
+    return MhcProfileMetadataPeakNits(isHDR ? ms.hdrMHC : ms.sdrMHC, isHDR);
+}
+
+// Persistent [Display<slot>] storage slot of live monitor `monitorIndex` (-1 = unidentified).
+static int SettingsSlotForMonitor(int monitorIndex) {
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return -1;
+    return g_gui.monitorSettings[monitorIndex].slot;
+}
+
+static std::wstring EngageIdentityForDisplay(int monitorIndex, bool isHDR, float peakNits, const DisplayInfo& di) {
+    std::wstring monitorName = (monitorIndex >= 0 && monitorIndex < (int)g_gui.monitorNames.size())
+        ? g_gui.monitorNames[monitorIndex] : L"Monitor";
+    MHC2ProfileParams params = BuildIdentityMHC2Params(isHDR, peakNits, monitorName + L" (identity)");
+
+    std::vector<uint8_t> profileData;
+    if (!GenerateMHC2Profile(params, profileData)) return L"";
+
+    const std::wstring profileName =
+        MhcIdentityProfileName(SettingsSlotForMonitor(monitorIndex), monitorIndex, isHDR);
+    wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring tempPath = std::wstring(tempDir) + profileName;
+    if (!WriteMHC2Profile(profileData, tempPath)) return L"";
+
+    // Copies to the system color dir (replacing a previous identity file of the same name — only
+    // ever this display's own, the name is keyed by its settings slot) and associates it as the
+    // active default for the mode.
+    bool ok = InstallMHC2Profile(tempPath, di.adapterId, di.sourceId, isHDR);
+    DeleteFileW(tempPath.c_str());
+    if (!ok) return L"";
+    std::wcout << L"MHC: identity profile '" << profileName << L"' associated for monitor "
+               << monitorIndex << (isHDR ? L" HDR" : L" SDR") << L" (peak metadata "
+               << (isHDR ? params.peakNits : 80.0f) << L" nits)" << std::endl;
+    return profileName;
+}
+
+std::wstring EngageIdentityMhcProfile(int monitorIndex, bool isHDR, float peakNits) {
+    if (!IsMHC2ApiAvailable()) return L"";
+    DisplayInfo di;
+    if (!GetDisplayInfoForMonitor(monitorIndex, di)) return L"";
+    return EngageIdentityForDisplay(monitorIndex, isHDR, peakNits, di);
+}
+
+std::wstring ReplaceMhcProfileWithIdentity(int monitorIndex, bool isHDR, float peakNits,
+                                           const std::wstring& oldProfileName) {
+    if (!IsMHC2ApiAvailable()) return L"";
+    DisplayInfo di;
+    if (!GetDisplayInfoForMonitor(monitorIndex, di)) return L"";
+
+    // 1) identity becomes the active default while the old profile is still associated...
+    std::wstring identityName = EngageIdentityForDisplay(monitorIndex, isHDR, peakNits, di);
+    if (identityName.empty()) {
+        std::cerr << "MHC: identity profile association FAILED for monitor " << monitorIndex
+                  << (isHDR ? " HDR" : " SDR") << " — removing the old profile anyway; Windows may "
+                  << "keep applying its last MHC2 transform" << std::endl;
+    }
+    // 2) ...then the old one is disassociated — never a window with nothing associated.
+    if (!oldProfileName.empty() && !IsMhcIdentityProfileName(oldProfileName)) {
+        RemoveMHC2Profile(oldProfileName, di.adapterId, di.sourceId, isHDR);
+    }
+    return identityName;
+}
+
+static void DisengageIdentityForDisplay(int monitorIndex, bool isHDR, const DisplayInfo& di) {
+    // Quiet removals (no-ops when not associated). Both key forms: a display that was engaged as
+    // Mon<N> before it was given a settings slot still gets its stand-in dropped.
+    const int slot = SettingsSlotForMonitor(monitorIndex);
+    RemoveMHC2ProfileQuiet(MhcIdentityProfileName(slot, monitorIndex, isHDR), di.adapterId, di.sourceId, isHDR);
+    if (slot >= 0)
+        RemoveMHC2ProfileQuiet(MhcIdentityProfileName(-1, monitorIndex, isHDR), di.adapterId, di.sourceId, isHDR);
+}
+
+void DisengageIdentityMhcProfile(int monitorIndex, bool isHDR) {
+    if (!IsMHC2ApiAvailable()) return;
+    DisplayInfo di;
+    if (!GetDisplayInfoForMonitor(monitorIndex, di)) return;
+    DisengageIdentityForDisplay(monitorIndex, isHDR, di);
+}
+
 void SwapDgForAllMonitors(bool dgEnabled) {
     // First pass: auto-generate identity MHC profiles for monitors that have
     // DG enabled in settings but no MHC profile yet (DG needs MHC to carry it)
@@ -666,28 +773,41 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + profileName;
 
-    // Save old profile info for rollback if new install fails
-    std::wstring oldProfileName = (mhcCopy.enabled && !mhcCopy.profileName.empty()) ? mhcCopy.profileName : L"";
+    // Old profile to retire once the new one is in.
+    //   ACTIVE (enabled + named): still the associated default — disassociate it before the install
+    //     and re-associate it on failure (rollback), as before.
+    //   NAMED BUT DISABLED (after mhc.remove / calibration.enter, which swapped in the identity
+    //     profile): already out of scanout — only a quiet removal + file cleanup, and NO rollback
+    //     re-association (that would put a removed profile back over its identity stand-in).
+    const std::wstring oldProfileName = mhcCopy.profileName;
+    const bool oldActive = mhcCopy.enabled && !oldProfileName.empty();
 
     if (!WriteMHC2Profile(profileData, tempPath)) return false;
 
     // Remove old profile AFTER new one is written and ready to install
-    if (!oldProfileName.empty()) {
+    if (oldActive) {
         RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    } else if (!oldProfileName.empty() && !IsMhcIdentityProfileName(oldProfileName)) {
+        RemoveMHC2ProfileQuiet(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
     }
 
     if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
         DeleteFileW(tempPath.c_str());
-        // Rollback: re-associate old profile if it still exists in system color dir
-        if (!oldProfileName.empty()) {
+        // Rollback: re-associate old profile if it was the active one and still exists
+        if (oldActive) {
             ReassociateMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
         }
         return false;
     }
     DeleteFileW(tempPath.c_str());
 
+    // A real profile is the active default again: drop the identity stand-in left by an earlier
+    // Remove/disable (a lingering non-default entry could be re-brokered to during a mode switch
+    // or a later regenerate's remove→install gap).
+    DisengageIdentityForDisplay(monitorIndex, isHDR, displayInfo);
+
     // Clean up old profile file only after new profile is confirmed installed
-    if (!oldProfileName.empty()) {
+    if (!oldProfileName.empty() && !IsMhcIdentityProfileName(oldProfileName)) {
         wchar_t sysDir[MAX_PATH];
         GetSystemDirectory(sysDir, MAX_PATH);
         std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldProfileName;
@@ -757,25 +877,32 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + newProfileName;
 
-    // Save old profile info for rollback if new install fails
+    // Save old profile info for rollback if new install fails. A named-but-DISABLED old profile
+    // (mhc.remove / calibration.enter swapped in the identity profile) is already out of scanout:
+    // quiet removal only, and no rollback re-association (see GenerateAndInstallMhcProfile).
     std::wstring oldProfileName = mhcCopy.profileName;
+    const bool oldActive = mhcCopy.enabled;
 
     if (!WriteMHC2Profile(profileData, tempPath)) return;
 
     // Remove old profile AFTER new one is written and ready to install
-    RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    if (oldActive) RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    else RemoveMHC2ProfileQuiet(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
 
     if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
         std::cerr << "RegenerateMhcIfActive: InstallMHC2Profile failed for monitor "
                   << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
         DeleteFileW(tempPath.c_str());
-        // Rollback: re-associate old profile if it still exists
-        if (!oldProfileName.empty()) {
+        // Rollback: re-associate old profile if it was the active one and still exists
+        if (oldActive && !oldProfileName.empty()) {
             ReassociateMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
         }
         return;
     }
     DeleteFileW(tempPath.c_str());
+
+    // Real profile active again — drop any identity stand-in (see GenerateAndInstallMhcProfile).
+    DisengageIdentityForDisplay(monitorIndex, isHDR, displayInfo);
 
     // Clean up old profile file only after new one is confirmed installed
     if (!oldProfileName.empty()) {

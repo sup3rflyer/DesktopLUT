@@ -6,6 +6,7 @@
 
 #include "hook_log.h"  // STRINGIFY, DITHER_GAMMA
 #include "noise.h"     // NOISE_SIZE
+#include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the overlay)
 
 // Main vertex + pixel shader (VS, PS) — handles HDR/SDR/ACM color modes, ICtCp tonemapping, 3D LUT, dithering
 static char g_shaders[] = R"(
@@ -144,23 +145,8 @@ float TonemapBT2390_PQ(float I, float pqSrcPeak, float pqTgtPeak) {
 	return clamp(E_mapped * iw, 0.0, ow);
 }
 
-float TonemapSoftClip_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
-	float pqKnee = (targetNits <= 203.0) ? 0.0 : pqTgtPeak * 0.8;
-	if (I <= pqKnee) return I;
-	float overshoot = I - pqKnee;
-	float headroom = pqTgtPeak - pqKnee;
-	float srcRange = pqSrcPeak - pqKnee;
-	return pqKnee + headroom * (1.0 - exp(-overshoot / srcRange));
-}
-
-float TonemapReinhard_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
-	float pqKnee = (targetNits <= 203.0) ? 0.0 : pqTgtPeak * 0.8;
-	if (I <= pqKnee) return I;
-	float overshoot = I - pqKnee;
-	float headroom = pqTgtPeak - pqKnee;
-	float srcRange = pqSrcPeak - pqKnee;
-	return pqKnee + headroom * overshoot / (overshoot + srcRange);
-}
+// SoftClip + Reinhard (peak-preserving): one copy shared with the overlay, shared/tonemap_curves.h
+)" DLUT_TONEMAP_CURVES_HLSL R"(
 
 float TonemapHardClip_PQ(float I, float pqTgtPeak) {
 	return min(I, pqTgtPeak);
@@ -226,7 +212,10 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 	else
 		I_mapped = TonemapHardClip_PQ(I, pqTgtPeak);
 
-	if (headroom < margin) {
+	// No crossfade for SoftClip/Reinhard (1, 2): continuous into min(I, target) on their own
+	// (shared/tonemap_curves.h); the lerp would put a partial hard clip back at the target.
+	bool curveContinuousAtTarget = (tonemapCurve == 1 || tonemapCurve == 2);
+	if (headroom < margin && !curveContinuousAtTarget) {
 		float blend = headroom / margin;
 		I_mapped = lerp(min(I, pqTgtPeak), I_mapped, blend);
 	}

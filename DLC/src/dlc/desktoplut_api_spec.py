@@ -185,7 +185,9 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ApiMethodSpec(
             "calibration.enter",
             "Enter calibration mode: snapshot the monitor's settings and reset the CALIBRATED "
-            "mode's correction layers (MHC removed+disabled, runtime 3D LUT and shader layers "
+            "mode's correction layers (an active MHC is swapped for DesktopLUT's identity MHC2 "
+            "profile — associated FIRST, then the real one disassociated, since Windows keeps "
+            "applying the last associated MHC2 transform — and disabled; runtime 3D LUT and shader layers "
             "cleared). Other mode:monitor pairs are PRESERVED — builds before 2026-08-14 cleared "
             "both modes of the monitor, permanently dropping the non-calibrated mode's runtime "
             "cube on the apply path (exit without restore); the orchestrator's commit re-applies "
@@ -314,9 +316,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "mhc.remove",
-            "Remove active MHC settings for the target monitor/mode.",
+            "Remove active MHC settings for the target monitor/mode: associates DesktopLUT's identity "
+            "MHC2 profile (DesktopLUT_Display<slot>|Mon<N>_<MODE>_Identity.icm) FIRST, then disassociates "
+            "the real profile (Windows keeps applying the last associated MHC2 transform), and disables "
+            "the MHC. identity_profile = the associated identity name ('' if that association failed or "
+            "no profile was installed).",
             {"monitor": _monitor_param(), "mode": _mode_param()},
-            {"monitor_mode": "string", "removed": "boolean true"},
+            {"monitor_mode": "string", "removed": "boolean true", "identity_profile": "string"},
             mutates_state=True,
             gui_thread_required=True,
         ),

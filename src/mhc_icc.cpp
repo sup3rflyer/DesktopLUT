@@ -319,26 +319,38 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     // Native src ⇒ the matrix is a diagonal white-only move; the 3D LUT owns the BT.2020→native gamut.
     // See GenerateMHC2Profile's source-primaries note.)
     //
-    // As-applied basis (corrected 2026-06-26, SDR_MHC2_XYZ_BASIS_BUG.md): Windows consumes the MHC2
-    // matrix as a CIEXYZ "3x4 XYZ→XYZ adjustment", composing SrcRGBtoXYZ * Adjust * XYZtoTgtRGB. In
-    // the source/target RGB basis the as-applied transform is therefore inv(B) * M * B (B = that
-    // basis's RGB→XYZ NPM, M = the emitted tag matrix) — NOT a direct, wrap-free RGB→RGB apply.
-    // We still COMPUTE `result` as the intended RGB→RGB forward transform inv(displayRGBtoXYZ) *
-    // srcRGBtoXYZ (= display_XYZtoRGB ∘ source_RGBtoXYZ, matching dantmnf/MHC2Gen), then emit it so
-    // the wrap reproduces it:
-    //   * SDR: B = sRGB@D65 and the wrap is NOT harmless (it over-desaturates every primary ~3 dE),
-    //     so we conjugate below — emit S*result*inv(S) so the as-applied inv(S)*emit*S == result.
-    //     HW-confirmed on a PA32UCXR (R/G land on sRGB, white on D65 to meter noise).
-    //   * HDR: B = BT.2020 and `result` is a near-diagonal white-only move (gamut identity), which is
-    //     ~invariant under the BT.2020 wrap (~0.016 white error) — so DIRECT emission has worked and
-    //     is kept. Do NOT conjugate HDR without its own offline replay + HW probe.
+    // As-applied basis (SDR corrected 2026-06-26, SDR_MHC2_XYZ_BASIS_BUG.md; HDR corrected 2026-09-23):
+    // Windows consumes the MHC2 matrix as a CIEXYZ "3x4 XYZ→XYZ adjustment", composing
+    // SrcRGBtoXYZ * Adjust * XYZtoTgtRGB. In the source/target RGB basis the as-applied transform is
+    // therefore inv(B) * M * B (B = that basis's RGB→XYZ NPM, M = the emitted tag matrix) — NOT a
+    // direct, wrap-free RGB→RGB apply — in BOTH modes:
+    //   * SDR: B = sRGB @ D65.
+    //   * HDR: B = BT.2020 @ D65 (the Advanced-Color scanout container).
+    // We COMPUTE `result` as the intended RGB→RGB forward transform inv(displayRGBtoXYZ) * srcRGBtoXYZ
+    // (= display_XYZtoRGB ∘ source_RGBtoXYZ, matching dantmnf/MHC2Gen), then emit it CONJUGATED into
+    // the mode's basis — emit B*result*inv(B) — so the as-applied inv(B)*emit*B == result exactly.
+    //
+    // HW evidence:
+    //   * SDR (PA32UCXR, 2026-06-26): the unconjugated wrap over-desaturated every primary ~3 dE;
+    //     conjugated, R/G land on sRGB and white on D65 to meter noise.
+    //   * HDR (PA32UCXR, 2026-09-23): HDR used to be emitted DIRECTLY on the claim that its
+    //     near-diagonal white-only matrix was "~invariant under the BT.2020 wrap (~0.016 white error)"
+    //     — a claim judged on WHITE ONLY. For native white 0.3257/0.3275 → D65 on native primaries
+    //     R 0.6926/0.3030 G 0.1809/0.7510 B 0.1521/0.0649, `result` = diag(0.915, 1.034, 1.029) but the
+    //     direct emission's as-applied inv(B2020)*M*B2020 = [[0.904 −0.029 −0.033][0.050 1.046 0.013]
+    //     [−0.001 0 1.028]]: ~5 % of red drive leaked into green. Measured red shifted from native
+    //     0.690/0.303 to 0.668–0.682/0.310–0.315 at mid levels, and above the panel peak (red channel
+    //     saturated, leaked green still growing with the linear signal) full-signal red turned ORANGE
+    //     (x 0.60 y 0.39, 804 nits vs native pure red 485 nits). The wrap model predicted the pre-refine
+    //     white 0.3015/0.3386, which matched the measured refine round-1 greys 0.298/0.340 exactly (an
+    //     sRGB-basis wrap would predict 0.279/0.345 — the basis is BT.2020). Conjugated, the as-applied
+    //     transform IS the diagonal: pure red stays pure red, white lands on D65 pre-refine.
     // The earlier "no XYZ wrap" conclusion from the HDR white-correction work distinguished matrix
-    // ORDER, not wrap PRESENCE — the wrap was simply harmless for HDR's near-diagonal matrix. That
-    // order finding still stands: prior code used the REVERSED order srcRGBtoXYZ * inv(displayRGBtoXYZ)
-    // on a false "operates in XYZ space" assumption; verified 2026-06-21 to leave the panel's native
-    // white uncorrected — HDR white stayed ~native 0.323 vs D65 0.313 because the warm-channel
-    // reduction came out as an (impossible, no-headroom) cool-channel boost at peak. SDR masked it via
-    // the post-install refine loop; HDR has none.
+    // ORDER, not wrap PRESENCE. That order finding still stands: prior code used the REVERSED order
+    // srcRGBtoXYZ * inv(displayRGBtoXYZ) on a false "operates in XYZ space" assumption; verified
+    // 2026-06-21 to leave the panel's native white uncorrected — HDR white stayed ~native 0.323 vs D65
+    // 0.313 because the warm-channel reduction came out as an (impossible, no-headroom) cool-channel
+    // boost at peak. SDR masked it via the post-install refine loop; HDR has none.
     //
     // No Bradford adaptation - the matrix maps source↔native RGB linearly. The native→D65 white
     // move is encoded in displayRGBtoXYZ, which MUST be built with the panel's MEASURED native
@@ -377,28 +389,29 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
     std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
 
-    // Capture the NET as-applied RGB->RGB transform (WB baked in) BEFORE the SDR basis
-    // conjugation below overwrites `result` with the emitted tag. This pre-conjugation
-    // `result` is what the panel sees (Windows applies inv(S)*emit*S == result for SDR),
-    // and what the live grayscale full-preview shader reproduces. (mhc_icc.cpp:306 pipeline.)
+    // Capture the NET as-applied RGB->RGB transform (WB baked in) BEFORE the basis conjugation
+    // below overwrites `result` with the emitted tag. This pre-conjugation `result` is what the
+    // panel sees in BOTH modes (Windows applies inv(B)*emit*B == result), and what the live
+    // grayscale full-preview shader reproduces (SDR). (mhc_icc.cpp:306 pipeline.)
     if (outAsAppliedRGB) memcpy(outAsAppliedRGB, result, sizeof(float) * 9);
 
-    // SDR-only basis conjugation (SDR_MHC2_XYZ_BASIS_BUG.md). Windows consumes the SDR MHC2 matrix as
-    // a CIEXYZ "3x4 XYZ→XYZ adjustment", composing SrcRGBtoXYZ * Adjust * XYZtoTgtRGB; for src=tgt=sRGB
-    // the as-applied transform is inv(S)*result*S (see basis note above). `result` is a direct RGB→RGB
-    // gamut matrix, so emit it conjugated into that basis (store S*result*inv(S)) and the as-applied
-    // result is exactly `result`. S*result*inv(S) is the spec-correct XYZ→XYZ adjustment, and because
-    // it conjugates `result` it carries the white-balance gains already baked into srcToXYZ above (a
-    // simplified S*inv(native) form would drop them). HDR's near-diagonal native-src matrix is
-    // ~invariant under this conjugation (which is why direct emission works there) — the !isHDR guard
-    // is required; an unguarded conjugation would inject ~0.016 white error on HDR.
-    if (!isHDR) {
-        float srgbToXYZ[9], srgbFromXYZ[9], tmp[9], emit[9];
-        if (BuildRGBtoXYZ(g_srgbPrimaries, srgbToXYZ) && MatInv3(srgbToXYZ, srgbFromXYZ)) {
-            MatMul3(srgbToXYZ, result, tmp);   // S * result
-            MatMul3(tmp, srgbFromXYZ, emit);   // (S * result) * inv(S)
+    // Basis conjugation (SDR_MHC2_XYZ_BASIS_BUG.md; HDR 2026-09-23 — see the basis note above).
+    // Windows consumes the MHC2 matrix as a CIEXYZ "3x4 XYZ→XYZ adjustment", composing
+    // SrcRGBtoXYZ * Adjust * XYZtoTgtRGB; for src = tgt = B (sRGB for SDR, BT.2020 for HDR) the
+    // as-applied transform is inv(B)*emit*B. `result` is a direct RGB→RGB matrix, so emit it
+    // conjugated into that basis (store B*result*inv(B)) and the as-applied result is exactly
+    // `result`. B*result*inv(B) is the spec-correct XYZ→XYZ adjustment, and because it conjugates
+    // `result` it carries the white-balance gains already baked into srcToXYZ above (a simplified
+    // B*inv(native) form would drop them). The SDR arithmetic is unchanged from the 2026-06-26 fix.
+    {
+        const DisplayPrimariesData& basisPrim = isHDR ? g_bt2020Primaries : g_srgbPrimaries;
+        float basisToXYZ[9], basisFromXYZ[9], tmp[9], emit[9];
+        if (BuildRGBtoXYZ(basisPrim, basisToXYZ) && MatInv3(basisToXYZ, basisFromXYZ)) {
+            MatMul3(basisToXYZ, result, tmp);   // B * result
+            MatMul3(tmp, basisFromXYZ, emit);   // (B * result) * inv(B)
             memcpy(result, emit, sizeof(float) * 9);
-            std::cout << "MHC2 matrix (SDR XYZ-basis emit, S*M*inv(S)):" << std::endl;
+            std::cout << "MHC2 matrix (" << (isHDR ? "HDR BT.2020" : "SDR sRGB")
+                      << " XYZ-basis emit, B*M*inv(B)):" << std::endl;
             std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
             std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
             std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
@@ -527,12 +540,14 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     // carries the panel's MEASURED native white (via set_white, populated when primariesEnabled). The
     // native→D65 move is exactly that src↔display white delta — building src from the native white too
     // would make S_src == S_disp ⇒ ZERO white move (the panel's native white would pass straight
-    // through). Wire interpretation: Windows wraps the matrix in the source/target RGB↔XYZ basis
-    // (as-applied inv(B)*M*B, see ComputeMHC2Matrix), but HDR's near-diagonal white-only matrix is
-    // ~invariant under that BT.2020 wrap, so it behaves as a direct linear-RGB apply — choosing
-    // native src simply REINTERPRETS the incoming BT.2020-container linear RGB as native-gamut+D65
-    // content. The old "wire cancels since wire = src" identity no longer holds for HDR, and that is
-    // intentional (the 3D LUT, not the MHC, owns BT.2020→native).
+    // through). Wire interpretation: Windows wraps the matrix in the BT.2020 RGB↔XYZ basis (as-applied
+    // inv(B)*M*B), and ComputeMHC2Matrix emits the HDR matrix conjugated into that basis so the
+    // as-applied transform is EXACTLY the diagonal white-only move on the linear BT.2020-container RGB
+    // (per-channel gains, zero crosstalk — HW root cause 2026-09-23: the unconjugated emission leaked
+    // ~5 % red into green and turned over-peak red orange). Choosing native src simply REINTERPRETS the
+    // incoming BT.2020-container linear RGB as native-gamut+D65 content. The old "wire cancels since
+    // wire = src" identity no longer holds for HDR, and that is intentional (the 3D LUT, not the MHC,
+    // owns BT.2020→native).
     DisplayPrimariesData hdrNativeSrc{};
     const DisplayPrimariesData* srcPrimPtr;
     if (!params.isHDR) {
@@ -903,6 +918,59 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
               << numTags << " tags, LUT " << lutSize << " entries" << std::endl;
 
     return true;
+}
+
+// ============================================================================
+// SECTION: Identity (neutral) MHC2 profile — see mhc.h
+// ============================================================================
+
+static const wchar_t kIdentityPrefixSlot[] = L"DesktopLUT_Display";  // keyed by settings slot
+static const wchar_t kIdentityPrefixMon[] = L"DesktopLUT_Mon";       // fallback: monitor index
+static const wchar_t kIdentitySuffixSdr[] = L"_SDR_Identity.icm";
+static const wchar_t kIdentitySuffixHdr[] = L"_HDR_Identity.icm";
+
+std::wstring MhcIdentityProfileName(int settingsSlot, int monitorIndex, bool isHDR) {
+    const bool bySlot = settingsSlot >= 0;
+    const int key = bySlot ? settingsSlot : (monitorIndex < 0 ? 0 : monitorIndex);
+    return std::wstring(bySlot ? kIdentityPrefixSlot : kIdentityPrefixMon) + std::to_wstring(key)
+         + (isHDR ? kIdentitySuffixHdr : kIdentitySuffixSdr);
+}
+
+bool IsMhcIdentityProfileName(const std::wstring& name, bool* outIsHDR) {
+    const size_t suffixLen = wcslen(kIdentitySuffixSdr);  // both suffixes are the same length
+    size_t prefixLen = 0;
+    for (const wchar_t* prefix : { kIdentityPrefixSlot, kIdentityPrefixMon }) {
+        const size_t len = wcslen(prefix);
+        if (name.size() > len && name.compare(0, len, prefix) == 0) { prefixLen = len; break; }
+    }
+    if (prefixLen == 0) return false;
+    if (name.size() <= prefixLen + suffixLen) return false;          // needs >= 1 key digit
+    const std::wstring suffix = name.substr(name.size() - suffixLen);
+    bool isHDR;
+    if (suffix == kIdentitySuffixHdr) isHDR = true;
+    else if (suffix == kIdentitySuffixSdr) isHDR = false;
+    else return false;
+    for (size_t i = prefixLen; i < name.size() - suffixLen; i++)
+        if (name[i] < L'0' || name[i] > L'9') return false;
+    if (outIsHDR) *outIsHDR = isHDR;
+    return true;
+}
+
+MHC2ProfileParams BuildIdentityMHC2Params(bool isHDR, float peakNits, const std::wstring& monitorName) {
+    MHC2ProfileParams params;                 // defaults: every correction off
+    params.monitorName = monitorName;
+    params.isHDR = isHDR;
+    params.primariesEnabled = false;          // display := src ⇒ identity matrix (conjugates to identity)
+    params.grayscaleEnabled = false;
+    params.grayscale.enabled = false;         // identity 1D LUTs (GenerateMHC2LUT_*_Channel pass-through)
+    params.grayscale.use24Gamma = false;      // SDR TRC tag = the 2.2 power law (owner's rule)
+    params.hasPerChannelTRC = false;
+    params.hasPrecomputedCorrection = false;
+    params.desktopGammaEnabled = false;
+    params.correctionGrayscaleEnabled = false;
+    params.correctionGrayscale.enabled = false;
+    if (isHDR && peakNits > 0.0f && std::isfinite(peakNits)) params.peakNits = peakNits;
+    return params;
 }
 
 bool WriteMHC2Profile(const std::vector<uint8_t>& data, const std::wstring& filePath) {
