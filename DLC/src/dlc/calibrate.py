@@ -100,6 +100,7 @@ from .adjudication import (
 )
 from . import calibration_profile as cp
 from . import checkin
+from . import refine_convergence
 from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
 from .desktoplut_client import contract_version_mismatch
@@ -500,9 +501,16 @@ class Calibration:
                 f"{'(disabled)' if requested <= 0 else ''} exceeds the no-dark-window rule "
                 f"for an LLM-adjudicated run — clamped to {self._checkin_interval_s:g}s "
                 "(only --auto sim/CI runs may disable check-ins)")
-        self._last_checkin_monotonic: Optional[float] = None
-        self._last_checkin_tally: dict[str, int] = {}
-        self._last_checkin_pos: int = 0   # events.jsonl byte offset at the last check-in (evidence window)
+        # The ONE §12 evidence window shared by every check-in emitter (this orchestrator AND the
+        # measure loop — handed to it in _measure_set / the incremental session), so any packet
+        # resets the cadence for both and no two packets land seconds apart. The
+        # _last_checkin_* properties read/write it (clock, tally snapshot, events byte offset).
+        self._checkin_window = checkin.CheckinWindow()
+        # Evidence starts at THIS process: a resumed run appends to the previous processes'
+        # events.jsonl, and none of that history is "since the last check-in". (The clock stays
+        # unanchored — the first checkpoint anchors it, no ping at second 0.)
+        self._checkin_window.pos = checkin.events_size(self)
+        self._checkin_window.tally = dict(self.runlog.tally)
         self._run_started_monotonic: Optional[float] = None
         # Latest live metrics, snapshotted as they happen, so a check-in carries them without
         # re-deriving from artifacts: the most recent intermediate score + the last optimizer iter.
@@ -1538,7 +1546,7 @@ class Calibration:
             patches=patches, transfer=transfer, measure=self.measure, config=cfg,
             ti3_path=meas_dir / ti3_name, ndjson_path=meas_dir / ndjson_name,
             runlog=self.runlog, liveness=self.liveness, dip=dip,
-            checkin_interval_s=self._checkin_interval_s,
+            checkin_interval_s=self._checkin_interval_s, checkin_window=self._checkin_window,
             **self._plausibility_context(role, dip),
         )
 
@@ -1835,6 +1843,33 @@ class Calibration:
     # delegators keep every call site + test name stable.
     def _maybe_timed_checkin(self, trigger: str) -> None:
         checkin.maybe_timed_checkin(self, trigger)
+
+    def _emit_checkin(self, trigger: str, kind: str) -> None:
+        checkin.emit_checkin(self, trigger, kind)
+
+    @property
+    def _last_checkin_monotonic(self) -> Optional[float]:
+        return self._checkin_window.monotonic
+
+    @_last_checkin_monotonic.setter
+    def _last_checkin_monotonic(self, value: Optional[float]) -> None:
+        self._checkin_window.monotonic = value
+
+    @property
+    def _last_checkin_tally(self) -> dict[str, int]:
+        return self._checkin_window.tally
+
+    @_last_checkin_tally.setter
+    def _last_checkin_tally(self, value: dict[str, int]) -> None:
+        self._checkin_window.tally = value
+
+    @property
+    def _last_checkin_pos(self) -> int:
+        return self._checkin_window.pos or 0
+
+    @_last_checkin_pos.setter
+    def _last_checkin_pos(self, value: int) -> None:
+        self._checkin_window.pos = value
 
     def _checkin_digest(self, trigger: str, *, seq: int = 0,
                         elapsed_since_checkin_s: float = 0.0) -> dict[str, Any]:
@@ -3865,9 +3900,158 @@ class Calibration:
         except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
             return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
 
-    def stage_refine_mhc_cube(self, *, target_de: float = 2.0,
-                              min_improvement: float = 0.3, regress_tol: float = 0.5,
-                              floor_patience: int = 2, safety_max_rounds: int = 40
+    def _refine_round_analysis(self, samples, ti3_path: Optional[str],
+                               previous: Optional[dict[str, Any]], *, white_xy: tuple[float, float],
+                               dark_floor_nits: float, top_nits: float,
+                               channel_peak_xyz: Sequence[Sequence[float]],
+                               materiality: float = refine_convergence.MATERIAL_GAIN_JND
+                               ) -> dict[str, Any]:
+        """Judge one closed-loop grayscale-refine round on physics (:mod:`dlc.refine_convergence`):
+        the correctable band (dark floor → the refine's top), each level's physical floor (meter
+        repeatability from the round's noise sidecar, the panel's between-rounds wander from the
+        run's thermal-alignment track, output quantization at this bit depth through this panel's
+        measured primaries), the removable error above it, and the predicted gain of another round
+        discounted by the refine's measured efficacy. Replaces the fixed ``target_de`` stop. HDR in
+        dE_ITP (absolute PQ targets, top = the Peak-Chroma cap); SDR in CIEDE2000 (power-law
+        targets at the MHC target luminance). Tests monkeypatch this method to script a round."""
+        from ._pq import eotf_norm as _pq_eotf, oetf_norm as _pq_oetf
+        from .colormath import xy_to_XYZ
+        from .measure_loop import match_level_noise
+
+        spec = self._spec()
+        hdr = bool(spec.is_hdr)
+        # The OUTPUT precision a channel lands on — the panel's link depth, not the test-pattern
+        # depth (``self.bit_depth`` is dogegen's; SDR patterns default to 8-bit while the MHC LUT
+        # output still reaches a 10-bit panel at its own precision).
+        bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
+        code = 1.0 / float(2 ** bits - 1)
+        wx, wy = white_xy
+        noise = self._dark_noise_entries(ti3_path)
+        gamma = float(spec.gamma or 2.2)
+        dip = self._dip()
+        bands = [b for b in (dip.noise_model if dip else []) if b.sigma_rel is not None]
+
+        def lum_se(nits: float) -> Optional[float]:
+            # The meter's per-read luminance repeatability at this level (the DIP's measured noise
+            # model) — per-read, not SE: the conservative side when a level's read count is unknown.
+            if not bands:
+                return None
+            if nits <= bands[0].nits:
+                return bands[0].sigma_rel
+            for lo, hi in zip(bands, bands[1:]):
+                if lo.nits <= nits <= hi.nits and hi.nits > lo.nits:
+                    f = (nits - lo.nits) / (hi.nits - lo.nits)
+                    return lo.sigma_rel + f * (hi.sigma_rel - lo.sigma_rel)
+            return bands[-1].sigma_rel
+
+        levels: list[refine_convergence.GreyLevel] = []
+        below = above = 0
+        for smp in samples:
+            r, g, b = smp.rgb
+            if abs(r - g) > 1e-6 or abs(g - b) > 1e-6:
+                continue
+            sig = float(r)
+            if hdr:
+                t_nits = _pq_eotf(sig) * 10000.0
+                v = _pq_oetf(min(t_nits, 10000.0) / 10000.0)
+                light = _pq_eotf(v)
+                rel_step = (_pq_eotf(min(1.0, v + code)) / light - 1.0) if light > 0 else 0.0
+            else:
+                t_nits = top_nits * max(sig, 0.0) ** gamma
+                rel_step = (((sig + code) / sig) ** gamma - 1.0) if sig > 0 else 0.0
+            if t_nits < dark_floor_nits:
+                below += 1
+                continue
+            if t_nits > top_nits * (1.0 + 1e-6):
+                above += 1       # held above the refine's top by design — not correctable
+                continue
+            if not smp.xyz or smp.xyz[1] <= 0.0:
+                continue
+            target = xy_to_XYZ(wx, wy, t_nits)
+            q_xy, q_rel = refine_convergence.channel_quantization(target, channel_peak_xyz, rel_step)
+            levels.append(refine_convergence.GreyLevel(
+                signal=sig, measured_xyz=tuple(float(c) for c in smp.xyz),
+                target_xyz=tuple(target), quant_xy=q_xy, quant_rel=q_rel,
+                meter_se_xy=(match_level_noise(noise, sig) if noise else None),
+                meter_se_rel=lum_se(t_nits)))
+
+        if hdr:
+            import numpy as np
+            from .engine.model import TargetSpace, de_itp
+
+            def de_fn(m, t) -> float:
+                d = TargetSpace.xyz_to_ictcp(np.asarray([m], dtype=float)) \
+                    - TargetSpace.xyz_to_ictcp(np.asarray([t], dtype=float))
+                return float(de_itp(d)[0])
+        else:
+            ref = xy_to_XYZ(wx, wy, top_nits)
+
+            def de_fn(m, t) -> float:
+                return float(delta_e2000(xyz_to_lab(tuple(m), ref), xyz_to_lab(tuple(t), ref)))
+
+        floor = refine_convergence.panel_floor_from_thermal(self.calib.get("thermal_align"))
+        out = refine_convergence.analyse_round(levels, de_fn=de_fn, floor=floor, previous=previous,
+                                               materiality=materiality)
+        out["excluded"] = {"below_dark_floor": below, "above_top": above}
+        out["band_nits"] = [round(dark_floor_nits, 3), round(top_nits, 1)]
+        out["output_bits"] = bits
+        return out
+
+    def _refine_round_judgment(self, *args, **kwargs) -> dict[str, Any]:
+        """:meth:`_refine_round_analysis`, guarded: an analysis failure (the HDR path lazy-loads
+        the numpy/colour engine) must not abort the refine — it stops the loop as ``unjudged``
+        and the LLM decides at the seam, with the error text."""
+        try:
+            return self._refine_round_analysis(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — surfaced to the LLM via the unjudged seam
+            return {"decision": "unjudged", "band_avg": None,
+                    "reason": f"convergence analysis failed: {type(exc).__name__}: {exc}"}
+
+    def _clear_refine_seams(self, stage: str) -> None:
+        """A refine stage that actually (re-)runs starts with no recorded exit verdicts: a
+        decision about a previous execution's exit must never replay onto a new one. (A resume
+        replays the memoised stage without re-running it, so a pending verdict still lands.)"""
+        for k in ("regression", "safety-ceiling", "floored", "unjudged"):
+            self.calib["decisions"].pop(f"{stage}:{k}", None)
+
+    def _refine_exit_seam(self, outcome: StageOutcome, *, stage: str, label: str,
+                          safety_max_rounds: int) -> None:
+        """The refine loops' non-routine exits are judgments for the LLM, not code. The best
+        measured cube is already installed on every exit; the LLM accepts it or aborts (an
+        'abort' ends the flow — it is not a note)."""
+        d = outcome.data
+        reason = (outcome.digest.get("convergence") or {}).get("reason")
+        if d.get("regressed"):
+            kind, what = "regression", "regressed (a round made grey worse)"
+        elif d.get("safety_ceiling"):
+            kind, what = "safety-ceiling", (f"ran {safety_max_rounds} rounds without reaching the "
+                                            "panel's physical floor")
+        elif d.get("floored"):
+            kind, what = "floored", f"stopped removing error: {reason or 'residual above the floor'}"
+        elif d.get("unjudged"):
+            kind, what = "unjudged", f"could not judge convergence: {reason or 'no evidence'}"
+        else:
+            return
+        self._abort_if(self.adjudicate(AdjudicationRequest(
+            key=f"{stage}:{kind}", seam=SEAM_OPTIMIZE, stage=stage,
+            question=(f"the {label} closed-loop grayscale refine {what} — the best measured cube "
+                      "is installed; accept it, or recheck the panel?"),
+            options=("accept", "abort"), recommendation="accept", digest=outcome.digest)),
+            stage=stage, message=f"{stage}: aborted at the {kind} seam")
+
+    @staticmethod
+    def _refine_round_summary(conv: dict[str, Any]) -> dict[str, Any]:
+        """The compact convergence evidence that rides in the round log + the round check-in."""
+        keep = ("decision", "reason", "band_avg", "band_max", "predicted_after_avg", "raw_gain",
+                "efficacy", "predicted_gain", "cast_xy", "cast_sigma", "cast_real", "lum_gain",
+                "lum_gain_real", "band_n")
+        out = {k: conv.get(k) for k in keep if k in conv}
+        fl = conv.get("floor") or {}
+        out["floor_xy"] = fl.get("floor_xy_median")
+        return out
+
+    def stage_refine_mhc_cube(self, *, materiality: float = refine_convergence.MATERIAL_GAIN_JND,
+                              regress_tol: float = 0.5, safety_max_rounds: int = 40
                               ) -> StageOutcome:
         """Closed-loop grayscale refine of the HDR MHC base cube toward STANDALONE D65.
 
@@ -3877,15 +4061,19 @@ class Calibration:
         foundation (see [[mhc-standalone-d65-peakchroma]] / [[dlc-corrections-stack-independently]]),
         independent of the optional 3D LUT.
 
-        **No arbitrary round cap (DESIGN LAW).** Mirrors the SDR sibling
-        (:meth:`stage_refine_mhc_grayscale`): the loop runs to the panel's *physical floor* — it
-        converges to ``target_de`` OR stops improving beyond noise for ``floor_patience`` consecutive
-        rounds (a single noisy sub-``min_improvement`` step is not the floor) — or REGRESSES (revert +
-        LLM seam). ``safety_max_rounds`` is a backstop for a pathological panel: NOT a silent cap — it
-        reverts to best and raises a seam. A UNIFIED best-revert reinstalls the best measured cube on
-        EVERY terminal exit (not just regression). Each round emits a non-blocking check-in the LLM
-        consumes (and may cancel via ``control.json``); the FINAL acceptance is the verify seam. HDR
-        only; SDR / non-1D-LUT base ⇒ no-op.
+        **No fixed target, no arbitrary round cap (DESIGN LAW).** Mirrors the SDR sibling
+        (:meth:`stage_refine_mhc_grayscale`): each round is judged on physics
+        (:meth:`_refine_round_analysis` / :mod:`dlc.refine_convergence`) — it stops when another
+        round is predicted to gain less than ``materiality`` (a quarter JND) because what remains is
+        within the panel's physical floor (``converged``), or when a real, material residual remains
+        that the refine demonstrably can't remove (``floored`` → LLM seam) — or REGRESSES (revert +
+        LLM seam). (The old fixed 2.0 target accepted round 1 of the 2026-09-24 run at 1.26 and left
+        a 6σ uniform cool cast.) ``safety_max_rounds`` is a backstop for a pathological panel: NOT a
+        silent cap — it reverts to best and raises a seam. A UNIFIED best-revert reinstalls the best
+        measured cube (by the correctable-band ΔE) on EVERY terminal exit. Each round emits a
+        non-blocking check-in carrying the round's evidence + decision (the LLM may cancel via
+        ``control.json``); the FINAL acceptance is the verify seam. HDR only; SDR / non-1D-LUT base
+        ⇒ no-op.
         """
         def run() -> StageOutcome:
             spec = self._spec()
@@ -3943,12 +4131,13 @@ class Calibration:
             refine_patches, top_pins = self._refine_neutral_patches(
                 base_cube if base_cube.exists() else Path(cube_path), rowsums, cap_nits)
 
+            self._clear_refine_seams("refine-mhc-cube")
             scores: list[float] = []
             rounds_log: list[dict[str, Any]] = []
             installed = cube_path
             best_path, best_avg = cube_path, float("inf")
             flags: dict[str, bool] = {}
-            floor_streak = 0           # consecutive rounds with sub-noise improvement (→ monitor floor)
+            conv: Optional[dict[str, Any]] = None       # the previous round's physics judgment
 
             rnd = 0
             while True:
@@ -3960,49 +4149,55 @@ class Calibration:
                 grey = [s for s in samples
                         if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
                 de = self._grey_de_vs_white(samples, (wx, wy))
+                # The physics judgment of this round (correctable band, floor, removable error,
+                # predicted gain × measured efficacy) — the loop's stop rule and its score.
+                conv = self._refine_round_judgment(
+                    samples, res.ti3_path, conv, white_xy=(wx, wy), dark_floor_nits=dark_floor,
+                    top_nits=float(cap_nits), channel_peak_xyz=channel_peak_xyz,
+                    materiality=materiality)
+                score = conv.get("band_avg") if conv.get("band_avg") is not None else de["avg"]
+                summary = self._refine_round_summary(conv)
                 rounds_log.append({"round": rnd, "grey_avg_de_itp": de["avg"],
                                    "grey_max_de_itp": de["max"], "grey_n": de["n"],
-                                   "gamma_err_pct": de["gamma_err_pct"], "cube": Path(installed).name})
-                # Feed the round's grayscale quality to the timed check-in's live metrics so a
-                # multi-round refine isn't metric-blind mid-run (the optimizer path already does
-                # this via _last_optimizer). ``since_last_round`` = improvement over the previous
-                # round (prev_avg - this_avg; +ve = converging, -ve = regressing) so the LLM reads
-                # the trend, not a bare number it has to diff against the last check-in by hand.
+                                   "gamma_err_pct": de["gamma_err_pct"], "cube": Path(installed).name,
+                                   "convergence": summary})
+                # Feed the round's grayscale quality + the physics judgment to the round check-in so
+                # the LLM judges each round as it lands (not metric-blind mid-run). ``since_last_round``
+                # = improvement of the correctable-band ΔE over the previous round (+ve = converging).
                 prev_avg = scores[-1] if scores else None   # scores not yet appended this round
-                # best_avg is updated AFTER this block, so fold this round in for the snapshot.
-                cur_best = (min(best_avg, de["avg"]) if de["avg"] is not None else best_avg)
+                cur_best = (min(best_avg, score) if score is not None else best_avg)
                 self._last_refine = {
                     "round": rnd, "grey_avg_de_itp": de["avg"], "grey_max_de_itp": de["max"],
                     "gamma_err_pct": de["gamma_err_pct"], "grey_n": de["n"],
+                    "band_avg_de_itp": score,
                     "best_avg_de_itp": (round(cur_best, 3) if cur_best != float("inf") else None),
-                    "since_last_round": (round(prev_avg - de["avg"], 3)
-                                         if prev_avg is not None and de["avg"] is not None else None)}
-                self._maybe_timed_checkin("refine-mhc-cube")
-                if de["avg"] is None:
+                    "since_last_round": (round(prev_avg - score, 3)
+                                         if prev_avg is not None and score is not None else None),
+                    "convergence": summary}
+                # A round's result is itself new evidence — emitted as it lands, not on the timer.
+                self._emit_checkin("refine-mhc-cube", "refine_round")
+                if score is None:
                     flags["unscored"] = True
                     break
-                scores.append(de["avg"])
-                if de["avg"] < best_avg:
-                    best_avg, best_path = de["avg"], installed
+                if conv.get("decision") == "unjudged":
+                    flags["unjudged"] = True             # no trustworthy evidence → LLM seam
+                    break
+                scores.append(score)
+                if score < best_avg:
+                    best_avg, best_path = score, installed
 
-                # --- stop conditions. The loop runs to the PANEL'S PHYSICAL FLOOR, not an arbitrary
-                # round count (DESIGN LAW). Each just sets a flag + breaks; the UNIFIED best-revert
-                # after the loop reinstalls the best measured cube on EVERY exit. ---
+                # --- stop conditions: the PANEL'S PHYSICAL FLOOR decides, not a fixed target or an
+                # arbitrary round count (DESIGN LAW). Each just sets a flag + breaks; the UNIFIED
+                # best-revert after the loop reinstalls the best measured cube on EVERY exit. ---
                 if len(scores) >= 2 and scores[-1] > scores[-2] + regress_tol:
                     flags["regressed"] = True            # a round made grey WORSE → revert + LLM seam
                     break
-                if de["avg"] <= target_de:
-                    flags["converged"] = True            # reached the panel-limited target
+                if conv.get("decision") == "converged":
+                    flags["converged"] = True            # the rest is within the floor / immaterial
                     break
-                # Monitor floor: improvement below measurement noise for `floor_patience` consecutive
-                # rounds (a single noisy sub-threshold step is not the floor).
-                if len(scores) >= 2 and (scores[-2] - scores[-1]) < min_improvement:
-                    floor_streak += 1
-                    if floor_streak >= floor_patience:
-                        flags["floored"] = True
-                        break
-                else:
-                    floor_streak = 0
+                if conv.get("decision") == "floored":
+                    flags["floored"] = True              # real residual the refine can't remove → seam
+                    break
                 # Backstop for a pathological non-converging panel: NOT a silent cap — revert to best
                 # and raise a seam (handled after the stage) so the LLM adjudicates rather than code.
                 if rnd >= safety_max_rounds:
@@ -4051,41 +4246,27 @@ class Calibration:
                 self._state["mhc_params"] = params
                 _common.save_dlc_state(self.ctx, self._state)
 
-            final_avg = scores[-1] if scores else None
+            final_avg = rounds_log[-1]["grey_avg_de_itp"] if rounds_log else None
             digest = {"rounds": len(rounds_log), "round_log": rounds_log,
-                      "grey_avg_de_itp": final_avg, "best_grey_avg_de_itp": (
+                      "grey_avg_de_itp": final_avg,
+                      "band_avg_de_itp": scores[-1] if scores else None,
+                      "best_band_avg_de_itp": (
                           round(best_avg, 3) if best_avg != float("inf") else None),
+                      "convergence": conv, "materiality": materiality,
                       "cap_nits": cap_nits, "binding_channel": peak_chroma.get("binding_channel"),
-                      "target_de_itp": target_de, "final_cube": Path(installed).name,
+                      "final_cube": Path(installed).name,
                       "top_hold": self.mhc_top_hold, "top_pins": top_pins,
                       "neutral_patches_per_round": len(refine_patches), **flags}
             return StageOutcome("refine-mhc-cube", "done", digest=digest,
                                 data={"rounds": len(rounds_log), "regressed": bool(flags.get("regressed")),
                                       "safety_ceiling": bool(flags.get("safety_ceiling")),
+                                      "floored": bool(flags.get("floored")),
+                                      "unjudged": bool(flags.get("unjudged")),
                                       "final_avg": final_avg})
 
         outcome = self._stage("refine-mhc-cube", run)
-        if outcome.data.get("regressed"):
-            # A refine round made grayscale WORSE — the best cube is already reinstalled; the LLM
-            # judges whether to accept it, extend the loop, or recheck the panel. (Not a unilateral
-            # abort: the reverted cube is still the measured-best foundation.)
-            self.adjudicate(AdjudicationRequest(
-                key="refine-mhc-cube:regression", seam=SEAM_OPTIMIZE, stage="refine-mhc-cube",
-                question=("the closed-loop grayscale refine regressed (a round made grey worse); "
-                          "the best measured cube was restored — accept it, or recheck the panel?"),
-                options=("accept", "abort"), recommendation="accept",
-                digest=outcome.digest))
-        elif outcome.data.get("safety_ceiling"):
-            # The backstop fired: many rounds without reaching the floor or target (a pathological /
-            # unstable panel). NOT silently capped — the best measured cube is installed and the LLM
-            # decides whether that foundation is good enough or the panel needs a recheck.
-            self.adjudicate(AdjudicationRequest(
-                key="refine-mhc-cube:safety-ceiling", seam=SEAM_OPTIMIZE, stage="refine-mhc-cube",
-                question=(f"the HDR grayscale refine ran {safety_max_rounds} rounds without reaching the "
-                          "monitor floor or the target — the best measured cube is installed; accept it, "
-                          "or recheck the panel?"),
-                options=("accept", "abort"), recommendation="accept",
-                digest=outcome.digest))
+        self._refine_exit_seam(outcome, stage="refine-mhc-cube", label="HDR",
+                               safety_max_rounds=safety_max_rounds)
         return outcome
 
     def _grey_de_sdr(self, samples, white_xy: tuple[float, float]) -> dict[str, Any]:
@@ -4107,9 +4288,9 @@ class Calibration:
         except Exception:  # noqa: BLE001 — advisory metric; a scoring hiccup must not crash the loop
             return {"avg": None, "max": None, "n": 0, "gamma_err_pct": None}
 
-    def stage_refine_mhc_grayscale(self, *, target_de: float = 0.5,
-                                   min_improvement: float = 0.1, regress_tol: float = 0.3,
-                                   floor_patience: int = 2, safety_max_rounds: int = 40
+    def stage_refine_mhc_grayscale(self, *,
+                                   materiality: float = refine_convergence.MATERIAL_GAIN_JND,
+                                   regress_tol: float = 0.3, safety_max_rounds: int = 40
                                    ) -> StageOutcome:
         """Closed-loop grayscale refine of the **SDR** MHC **base 1D-LUT cube** toward STANDALONE D65.
 
@@ -4123,11 +4304,13 @@ class Calibration:
         native-white tone + the per-level non-additivity residual) — independent of the 3D LUT
         (see [[sdr-violates-1plus1plus1-hdr-upholds]] / [[dlc-corrections-stack-independently]]).
 
-        **No arbitrary round cap (DESIGN LAW).** The loop runs until it reaches the panel's *physical
-        floor* — it converges to ``target_de`` OR stops improving beyond measurement noise for
-        ``floor_patience`` consecutive rounds (a single noisy sub-``min_improvement`` step is NOT the
-        floor). A REGRESSION (a refine made grey worse than ``regress_tol``) reverts to the best measured
-        cube and raises a seam for the LLM. ``safety_max_rounds`` is a backstop for a pathological
+        **No fixed target, no arbitrary round cap (DESIGN LAW).** Each round is judged on physics
+        (:meth:`_refine_round_analysis` / :mod:`dlc.refine_convergence`, CIEDE2000 here): the loop stops
+        when another round is predicted to gain less than ``materiality`` (a quarter JND) because what
+        remains is within the panel's physical floor (``converged``), or when a real, material residual
+        remains that the refine demonstrably can't remove (``floored`` → LLM seam). A REGRESSION (a
+        refine made grey worse than ``regress_tol``) reverts to the best measured cube and raises a
+        seam for the LLM. ``safety_max_rounds`` is a backstop for a pathological
         non-converging panel: it does NOT silently cap — it reverts to best and raises a seam so the LLM
         adjudicates (accept the best foundation, or recheck the panel). Each round emits a NON-BLOCKING
         check-in the LLM consumes from the running spine (and may cancel via ``control.json``); the FINAL
@@ -4188,12 +4371,22 @@ class Calibration:
             self.controller.set_base_lut(self.monitor, self.mode, str(base_cube.resolve()), 0.0)
             self.controller.apply_mhc(self.monitor, self.mode)
 
+            self._clear_refine_seams("refine-mhc-grayscale")
             scores: list[float] = []
             rounds_log: list[dict[str, Any]] = []
             installed_path = str(base_cube)                    # currently applied base cube
             best_path, best_avg = str(base_cube), float("inf")
             flags: dict[str, bool] = {}
-            floor_streak = 0           # consecutive rounds with sub-noise improvement (→ monitor floor)
+            conv: Optional[dict[str, Any]] = None       # the previous round's physics judgment
+            channel_peak_xyz = params.get("channel_peak_xyz")
+            if not channel_peak_xyz:
+                # SDR records no per-channel peaks: the native primaries balanced to the measured
+                # native white at the target luminance give the same linear-share basis.
+                from .colormath import rgb_to_xyz_matrix
+                m = rgb_to_xyz_matrix(primaries["rx"], primaries["ry"], primaries["gx"],
+                                      primaries["gy"], primaries["bx"], primaries["by"],
+                                      nwx, nwy, white_Y=float(peak))
+                channel_peak_xyz = [[m[row][c] for row in range(3)] for c in range(3)]
 
             rnd = 0
             while True:
@@ -4205,50 +4398,54 @@ class Calibration:
                 grey = [s for s in samples
                         if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
                 de = self._grey_de_sdr(samples, (wx, wy))
+                conv = self._refine_round_judgment(
+                    samples, res.ti3_path, conv, white_xy=(wx, wy), dark_floor_nits=dark_floor,
+                    top_nits=float(peak), channel_peak_xyz=channel_peak_xyz,
+                    materiality=materiality)
+                score = conv.get("band_avg") if conv.get("band_avg") is not None else de["avg"]
+                summary = self._refine_round_summary(conv)
                 rounds_log.append({"round": rnd, "grey_avg_de2000": de["avg"],
                                    "grey_max_de2000": de["max"], "grey_n": de["n"],
-                                   "gamma_err_pct": de["gamma_err_pct"]})
-                # Feed the round's grayscale quality to the timed check-in's live metrics (non-blocking
-                # evidence) so a multi-round refine isn't metric-blind mid-run; since_last_round = the
-                # round-over-round improvement (prev - this; +ve = converging).
+                                   "gamma_err_pct": de["gamma_err_pct"], "convergence": summary})
+                # Feed the round's grayscale quality + the physics judgment to the round check-in
+                # (non-blocking evidence) so a multi-round refine isn't metric-blind mid-run;
+                # since_last_round = the correctable-band improvement (prev - this; +ve = converging).
                 prev_avg = scores[-1] if scores else None
-                cur_best = (min(best_avg, de["avg"]) if de["avg"] is not None else best_avg)
+                cur_best = (min(best_avg, score) if score is not None else best_avg)
                 self._last_refine = {
                     "round": rnd, "grey_avg_de2000": de["avg"], "grey_max_de2000": de["max"],
                     "gamma_err_pct": de["gamma_err_pct"], "grey_n": de["n"],
+                    "band_avg_de2000": score,
                     "best_avg_de2000": (round(cur_best, 3) if cur_best != float("inf") else None),
-                    "since_last_round": (round(prev_avg - de["avg"], 3)
-                                         if prev_avg is not None and de["avg"] is not None else None)}
-                self._maybe_timed_checkin("refine-mhc-grayscale")
-                if de["avg"] is None:
+                    "since_last_round": (round(prev_avg - score, 3)
+                                         if prev_avg is not None and score is not None else None),
+                    "convergence": summary}
+                self._emit_checkin("refine-mhc-grayscale", "refine_round")
+                if score is None:
                     flags["unscored"] = True
                     break
-                scores.append(de["avg"])
-                if de["avg"] < best_avg:
-                    best_avg, best_path = de["avg"], installed_path
+                if conv.get("decision") == "unjudged":
+                    flags["unjudged"] = True             # no trustworthy evidence → LLM seam
+                    break
+                scores.append(score)
+                if score < best_avg:
+                    best_avg, best_path = score, installed_path
 
-                # --- stop conditions. The loop runs to the PANEL'S PHYSICAL FLOOR, not an arbitrary
-                # round count (DESIGN LAW: adapt until the monitor can give no more). Each just sets a
-                # flag + breaks; the UNIFIED best-revert below leaves the best measured deviations
+                # --- stop conditions: the PANEL'S PHYSICAL FLOOR decides, not a fixed target or an
+                # arbitrary round count (DESIGN LAW: adapt until the monitor can give no more). Each just
+                # sets a flag + breaks; the UNIFIED best-revert below leaves the best measured cube
                 # installed on EVERY exit — so a within-tolerance uptick that doesn't trip the regression
                 # gate can't strand a worse-than-best (even worse-than-identity) correction (round 1
                 # always measures identity, so best is identity-or-better). ---
                 if len(scores) >= 2 and scores[-1] > scores[-2] + regress_tol:
                     flags["regressed"] = True            # a round made grey WORSE → revert + LLM seam
                     break
-                if de["avg"] <= target_de:
-                    flags["converged"] = True            # reached the panel-limited target
+                if conv.get("decision") == "converged":
+                    flags["converged"] = True            # the rest is within the floor / immaterial
                     break
-                # Monitor floor: improvement has fallen below measurement noise. Require it to hold for
-                # `floor_patience` consecutive rounds so a single noisy sub-threshold step (or a tiny
-                # within-tolerance uptick) doesn't end convergence prematurely.
-                if len(scores) >= 2 and (scores[-2] - scores[-1]) < min_improvement:
-                    floor_streak += 1
-                    if floor_streak >= floor_patience:
-                        flags["floored"] = True
-                        break
-                else:
-                    floor_streak = 0
+                if conv.get("decision") == "floored":
+                    flags["floored"] = True              # real residual the refine can't remove → seam
+                    break
                 # Backstop for a pathological non-converging panel: NOT a silent cap — revert to best and
                 # raise a seam (handled after the stage) so the LLM adjudicates rather than the code.
                 if rnd >= safety_max_rounds:
@@ -4296,42 +4493,25 @@ class Calibration:
                 "point_count": n_points, "points": grid, "deviations": ident}
             _common.save_dlc_state(self.ctx, self._state)
 
-            final_avg = scores[-1] if scores else None
+            final_avg = rounds_log[-1]["grey_avg_de2000"] if rounds_log else None
             digest = {"rounds": len(rounds_log), "round_log": rounds_log,
-                      "grey_avg_de2000": final_avg, "best_grey_avg_de2000": (
+                      "grey_avg_de2000": final_avg,
+                      "band_avg_de2000": scores[-1] if scores else None,
+                      "best_band_avg_de2000": (
                           round(best_avg, 3) if best_avg != float("inf") else None),
-                      "target_de2000": target_de, "rowsums": [round(v, 5) for v in rowsums],
-                      **flags}
+                      "convergence": conv, "materiality": materiality,
+                      "rowsums": [round(v, 5) for v in rowsums], **flags}
             return StageOutcome("refine-mhc-grayscale", "done", digest=digest,
                                 data={"rounds": len(rounds_log),
                                       "regressed": bool(flags.get("regressed")),
                                       "safety_ceiling": bool(flags.get("safety_ceiling")),
+                                      "floored": bool(flags.get("floored")),
+                                      "unjudged": bool(flags.get("unjudged")),
                                       "final_avg": final_avg})
 
         outcome = self._stage("refine-mhc-grayscale", run)
-        if outcome.data.get("regressed"):
-            # A refine round made grayscale WORSE — the best deviations are already reinstalled; the
-            # LLM judges whether to accept, extend, or recheck the panel. (Not a unilateral abort: the
-            # reverted deviations are still the measured-best foundation.)
-            self.adjudicate(AdjudicationRequest(
-                key="refine-mhc-grayscale:regression", seam=SEAM_OPTIMIZE, stage="refine-mhc-grayscale",
-                question=("the SDR closed-loop grayscale refine regressed (a round made grey worse); "
-                          "the best measured correctionGrayscale was restored — accept it, or recheck "
-                          "the panel?"),
-                options=("accept", "abort"), recommendation="accept",
-                digest=outcome.digest))
-        elif outcome.data.get("safety_ceiling"):
-            # The backstop fired: many rounds without reaching the floor or target (a pathological /
-            # unstable panel). NOT silently capped — the best measured deviations are installed and the
-            # LLM decides whether that foundation is good enough or the panel needs a recheck.
-            self.adjudicate(AdjudicationRequest(
-                key="refine-mhc-grayscale:safety-ceiling", seam=SEAM_OPTIMIZE,
-                stage="refine-mhc-grayscale",
-                question=(f"the SDR grayscale refine ran {safety_max_rounds} rounds without reaching the "
-                          "monitor floor or the target — the best measured correctionGrayscale is "
-                          "installed; accept it, or recheck the panel?"),
-                options=("accept", "abort"), recommendation="accept",
-                digest=outcome.digest))
+        self._refine_exit_seam(outcome, stage="refine-mhc-grayscale", label="SDR",
+                               safety_max_rounds=safety_max_rounds)
         return outcome
 
     def stage_grayscale_wb_touchup(self, *, target_de: float = 0.6,
@@ -4464,6 +4644,7 @@ class Calibration:
                 liveness=self.liveness,
                 dip=dip,
                 checkin_interval_s=self._checkin_interval_s,
+                checkin_window=self._checkin_window,
                 reference_guard=reference_identity_guard,
             )
             session_start = session.start()

@@ -50,6 +50,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Optional, Protocol, Sequence
 
+from .checkin import (MILESTONE_DEDUPE_FRAC, MILESTONE_DEDUPE_INTERVAL_FRAC, MILESTONE_STEP,
+                      CheckinWindow, window_evidence)
 from .dip import DisplayInstrumentProfile
 from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, normalized_channels
 from .engine.patches import Patch, Transfer, to_signal
@@ -596,6 +598,7 @@ class _Loop:
         liveness: Optional[Liveness] = None,
         dip: Optional[DisplayInstrumentProfile] = None,
         checkin_interval_s: float = 0.0,
+        checkin_window: Optional[CheckinWindow] = None,
         reference_guard: Optional[Callable[[], ContextManager[None]]] = None,
         channel_peak_y: Optional[tuple[float, float, float]] = None,
         white_peak_y: Optional[float] = None,
@@ -642,8 +645,22 @@ class _Loop:
         # adaptive integration) — variance-based SNR/abnormality needs a DIP to know σ.
         self.dip = dip
         # §12 wall-clock backstop for the in-measure check-in (emit-only) — see _maybe_checkin.
+        # The window is the orchestrator's (shared with its stage/optimizer/refine packets) so a
+        # packet from either side resets the cadence for both; standalone use gets its own. A
+        # fresh loop never re-anchors a shared window — the orchestrator may have emitted 200 s
+        # ago, and the loop's first backstop packet is due 100 s in, not a full interval later.
         self._checkin_interval_s = max(0.0, float(checkin_interval_s))
-        self._last_checkin_monotonic = time.monotonic()
+        self._checkin_window = checkin_window if checkin_window is not None else CheckinWindow()
+        if self._checkin_window.pos is None:
+            # Nobody has said where the evidence starts (standalone, or a bare window): here — an
+            # append-only events.jsonl may hold earlier processes' history.
+            self._checkin_window.advance(self.runlog, time.monotonic())
+        elif self._checkin_window.monotonic is None:
+            # The owner set the evidence start (its process start); only the clock needs anchoring.
+            self._checkin_window.monotonic = time.monotonic()
+        # Progress (this loop's patches_done / total) at this loop's last packet — the milestone
+        # de-dupe measures "how recently did a packet go out" in progress, not seconds.
+        self._checkin_last_frac = 0.0
 
         signals = to_signal(patches, transfer)
         width = max(4, len(str(max(0, len(patches) - 1))))
@@ -681,7 +698,7 @@ class _Loop:
         self.dark_reference_nits: Optional[float] = None
         self.measurement_path_compromised = False
         self.read_anomalies: list[dict[str, Any]] = []
-        self._checkin_quartiles: set[float] = set()   # progress-driven digest check-ins emitted
+        self._checkin_quartiles: set[float] = set()   # progress milestones already crossed
         # §12 measure check-in window high-water marks. Each check-in reports the DELTA since the
         # previous one (reads / anomalies / drift that are NEW), not the cumulative totals — a
         # check-in is "what happened since I last looked", never a restatement of old evidence.
@@ -886,20 +903,36 @@ class _Loop:
         never goes dark over a long run ("never 0 check-ins in a 3-hour run").
         EMIT-ONLY: this never gates or pauses (the §12 stage-boundary seam owns the
         mode-driven continue? decision); here we only surface status. Every emit (quartile or
-        backstop) resets the floor so a quartile crossing doesn't immediately re-trigger it."""
+        backstop) resets the shared window so a quartile crossing doesn't immediately re-trigger
+        the backstop — and a quartile is consumed silently when a packet already went out within
+        half a milestone step of progress (the timer packet at 48 % said what the 50 % one would)
+        or, from ANY emitter, within a quarter of the check-in interval (the timer still bounds
+        every gap, so thinning milestones can never open a dark window)."""
         if self.runlog is None:
             return
         total = len(self.patches)
         if total <= 0:
             return
         frac = index / total
-        for q in (0.25, 0.5, 0.75):
+        recent_s = (self._checkin_interval_s * MILESTONE_DEDUPE_INTERVAL_FRAC
+                    if self._checkin_interval_s > 0 else 0.0)
+        q = MILESTONE_STEP
+        while q < 1.0 - 1e-9:
             if q not in self._checkin_quartiles and frac >= q:
                 self._checkin_quartiles.add(q)
-                self._emit_measure_checkin(index, total, frac)
+                if (q - self._checkin_last_frac >= MILESTONE_DEDUPE_FRAC - 1e-9
+                        and time.monotonic() - self._last_checkin_monotonic >= recent_s):
+                    self._emit_measure_checkin(index, total, frac, trigger="progress")
+            q = round(q + MILESTONE_STEP, 6)
         if self._checkin_interval_s > 0 \
                 and time.monotonic() - self._last_checkin_monotonic >= self._checkin_interval_s:
-            self._emit_measure_checkin(index, total, frac)
+            self._emit_measure_checkin(index, total, frac, trigger="timer")
+
+    @property
+    def _last_checkin_monotonic(self) -> float:
+        """When the last packet from ANY emitter went out (the shared window's clock)."""
+        return self._checkin_window.monotonic if self._checkin_window.monotonic is not None \
+            else time.monotonic()
 
     def _maybe_checkin_backstop(self) -> None:
         """The wall-clock arm ALONE, callable from ANY read path — warm-up, preheat/rewarm
@@ -915,12 +948,12 @@ class _Loop:
             return
         total = max(1, len(self.patches))
         done = len(self.accepted)
-        self._emit_measure_checkin(done, total, done / total)
+        self._emit_measure_checkin(done, total, done / total, trigger="timer")
 
-    def _emit_measure_checkin(self, index: int, total: int, frac: float) -> None:
+    def _emit_measure_checkin(self, index: int, total: int, frac: float, *,
+                              trigger: str = "timer") -> None:
         now = time.monotonic()
         elapsed_since = round(now - self._last_checkin_monotonic, 1)
-        self._last_checkin_monotonic = now
         # EMIT-ONLY evidence packet for the LLM (never gates): forward motion + what's NEW since
         # the last check-in. ``since_last`` is the spine delta — reads/anomalies/drift accrued in
         # THIS window only, so a clean stretch reads as zeros instead of re-stating the running
@@ -944,11 +977,23 @@ class _Loop:
         new_meter = self.meter_events[self._checkin_meter_at_last:]
         if new_meter:
             since_last["meter_events"] = len(new_meter)
+        # The events-window evidence every packet carries (max ΔE actually read + which patch,
+        # stalls/anomalies from ANY source in this window) — the loop's read-plausibility flags
+        # are already inlined as new_anomalies, so they're not repeated here.
+        evidence = window_evidence(self.runlog.path, self._checkin_window.pos or 0,
+                                   skip_kinds=("read_plausibility_anomaly",))
+        evidence.pop("reads", None)   # == since_last.reads (the loop's own count is exact)
+        # Close the shared window BEFORE emitting, so the check_in event itself isn't counted
+        # into the next window's evidence.
+        self._checkin_window.advance(self.runlog, now)
+        self._checkin_last_frac = frac
         self.runlog.check_in(
             "measure", progress=round(frac, 2),
             patches_done=index, patches_total=total,
+            trigger=trigger,
             elapsed_since_checkin_s=elapsed_since,
             since_last=since_last,
+            evidence=evidence,
             new_anomalies=(new_anomalies_inline or None),   # the actual NEW flags, for the LLM to judge
             new_meter_events=((new_meter[-10:]) or None),   # meter failures/restarts, error text included
             warm=self.warm,                          # current state (position, not repeated evidence)
@@ -2227,6 +2272,7 @@ class IncrementalMeasureSession:
         liveness: Optional[Liveness] = None,
         dip: Optional[DisplayInstrumentProfile] = None,
         checkin_interval_s: float = 0.0,
+        checkin_window: Optional[CheckinWindow] = None,
         reference_guard: Optional[Callable[[], ContextManager[None]]] = None,
         channel_peak_y: Optional[tuple[float, float, float]] = None,
         white_peak_y: Optional[float] = None,
@@ -2246,6 +2292,7 @@ class IncrementalMeasureSession:
             liveness=liveness,
             dip=dip,
             checkin_interval_s=checkin_interval_s,
+            checkin_window=checkin_window,
             reference_guard=reference_guard,
             channel_peak_y=channel_peak_y,
             white_peak_y=white_peak_y,
@@ -2434,6 +2481,7 @@ def run_measure_loop(
     liveness: Optional[Liveness] = None,
     dip: Optional[DisplayInstrumentProfile] = None,
     checkin_interval_s: float = 0.0,
+    checkin_window: Optional[CheckinWindow] = None,
     channel_peak_y: Optional[tuple[float, float, float]] = None,
     white_peak_y: Optional[float] = None,
     correction_max_nits: Optional[float] = None,
@@ -2474,6 +2522,7 @@ def run_measure_loop(
         liveness=liveness,
         dip=dip,
         checkin_interval_s=checkin_interval_s,
+        checkin_window=checkin_window,
         channel_peak_y=channel_peak_y,
         white_peak_y=white_peak_y,
         correction_max_nits=correction_max_nits,

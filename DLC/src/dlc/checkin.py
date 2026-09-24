@@ -43,8 +43,27 @@ _WARNING_SEVERITY = {"stall": 0, "anomaly": 1, "read_plausibility_anomaly": 2}
 # instrumented reads (calibrate.py).
 NO_DARK_WINDOW_CEILING_S = 1200.0
 
+# Milestone de-dupe (2026-09-24 owner report: "48 % + 50 % and other close check-ins seem
+# unnecessary"). A progress milestone (25/50/75 %) adds nothing when ANY packet already went
+# out within half a milestone step of progress — the timer packet at 48 % already said
+# everything the 50 % one would. Progress units, not seconds, so it scales with stage length
+# and never suppresses a milestone on a short stage whose milestones are far apart in progress.
+# Likewise in time, across emitters: a milestone is redundant when any packet went out less than
+# a quarter of the check-in interval ago (75 s at the 300 s default) — the orchestrator's packet
+# just before a verify loop's 25 %, or a short refine round's milestones 48 s apart. Scaled to the
+# operator's chosen cadence, not a fixed number of seconds; the timer still bounds every gap.
+MILESTONE_STEP = 0.25
+MILESTONE_DEDUPE_FRAC = MILESTONE_STEP / 2
+MILESTONE_DEDUPE_INTERVAL_FRAC = MILESTONE_STEP
+
 __all__ = [
+    "CheckinWindow",
+    "MILESTONE_DEDUPE_FRAC",
+    "MILESTONE_DEDUPE_INTERVAL_FRAC",
+    "MILESTONE_STEP",
+    "emit_checkin",
     "maybe_timed_checkin",
+    "window_evidence",
     "checkin_digest",
     "checkin_evidence",
     "run_overview",
@@ -54,31 +73,85 @@ __all__ = [
 ]
 
 
+class CheckinWindow:
+    """The ONE §12 evidence window every check-in emitter in a run shares.
+
+    Two emitters feed the LLM: the orchestrator (stage boundaries, optimizer iterations, probe
+    reads, refine rounds) and the measure loop (progress milestones + its wall-clock backstop).
+    They used to keep separate clocks, so each fired on its own schedule and the owner saw pairs
+    seconds apart — a loop packet at 98 % and the orchestrator's stage-end packet right after it
+    (whose clock still dated from the previous stage), or a timer packet at 48 % and the 50 %
+    milestone 16 s later. With one shared window, ANY packet resets the cadence for ALL emitters,
+    and each packet's evidence covers exactly the events since the previous packet of either kind.
+    """
+
+    __slots__ = ("monotonic", "tally", "pos")
+
+    def __init__(self) -> None:
+        self.monotonic: Optional[float] = None   # when the last packet (any emitter) went out
+        self.tally: dict[str, int] = {}          # RunLog tally at that moment (the since-last delta)
+        # events.jsonl byte offset at that moment; None = nobody has said where evidence starts
+        # yet (the file is append-only across a resumed run's processes — never assume byte 0)
+        self.pos: Optional[int] = None
+
+    def age(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds since the last packet, or None before the window is anchored."""
+        if self.monotonic is None:
+            return None
+        return (time.monotonic() if now is None else now) - self.monotonic
+
+    def advance(self, runlog: Any, now: Optional[float] = None) -> None:
+        """Close the current window: the next packet's evidence starts here."""
+        self.monotonic = time.monotonic() if now is None else now
+        self.tally = dict(runlog.tally) if runlog is not None else {}
+        self.pos = _file_size(runlog.path) if runlog is not None else 0
+
+
+def _file_size(path: Any) -> int:
+    try:
+        return path.stat().st_size
+    except (OSError, AttributeError):
+        return 0
+
+
 def maybe_timed_checkin(cal: Any, trigger: str) -> None:
     """Emit a rich evidence packet for the overseeing LLM once the wall-clock floor has
-    elapsed (§12). Disabled at interval 0; the first checkpoint only anchors the clock.
-    See the module docstring's DESIGN LAW — emit-only, never a gate."""
+    elapsed since the last packet from ANY emitter (§12, the shared :class:`CheckinWindow`).
+    Disabled at interval 0; the first checkpoint only anchors the clock. See the module
+    docstring's DESIGN LAW — emit-only, never a gate."""
     if cal._checkin_interval_s <= 0 or cal.runlog is None:
         return
     now = time.monotonic()
     if cal._last_checkin_monotonic is None:
         # First checkpoint just anchors the clock — no immediate ping at second 0.
-        cal._last_checkin_monotonic = now
-        cal._last_checkin_tally = dict(cal.runlog.tally)
-        cal._last_checkin_pos = events_size(cal)
+        cal._checkin_window.advance(cal.runlog, now)
         return
     if now - cal._last_checkin_monotonic < cal._checkin_interval_s:
         return
-    elapsed_since = now - cal._last_checkin_monotonic
+    _emit(cal, trigger, "timer", now)
+
+
+def emit_checkin(cal: Any, trigger: str, kind: str) -> None:
+    """Emit a packet NOW, regardless of the timer — for an event that is itself new evidence
+    the LLM should judge as it happens (a refine round's scored result and the loop's
+    continue/stop reasoning), not a heartbeat. Still resets the shared window, so the timer
+    doesn't re-fire right behind it. Emit-only, never a gate; no-op without a run log or when
+    check-ins are disabled (sim/CI)."""
+    if cal._checkin_interval_s <= 0 or cal.runlog is None:
+        return
+    _emit(cal, trigger, kind, time.monotonic())
+
+
+def _emit(cal: Any, trigger: str, kind: str, now: float) -> None:
+    age = cal._checkin_window.age(now)
     seq = int(cal.calib.get("checkin_seq", 0)) + 1
     cal.calib["checkin_seq"] = seq
     digest = checkin_digest(cal, trigger, seq=seq,
-                            elapsed_since_checkin_s=round(elapsed_since, 1))
+                            elapsed_since_checkin_s=round(age, 1) if age is not None else 0.0)
+    digest["kind"] = kind
     # Reset the window AFTER building the digest, BEFORE emitting, so the next window starts
     # clean and the check_in event itself isn't counted into it.
-    cal._last_checkin_monotonic = now
-    cal._last_checkin_tally = dict(cal.runlog.tally)
-    cal._last_checkin_pos = events_size(cal)
+    cal._checkin_window.advance(cal.runlog, now)
     cal.runlog.check_in(trigger, **digest)   # EMIT-ONLY: evidence for the LLM, never a gate
 
 
@@ -98,25 +171,30 @@ def checkin_digest(cal: Any, trigger: str, *, seq: int = 0,
 
 def events_size(cal: Any) -> int:
     """Current byte size of events.jsonl (the check-in evidence window high-water mark)."""
-    try:
-        return cal.runlog.path.stat().st_size if cal.runlog else 0
-    except OSError:
-        return 0
+    return _file_size(cal.runlog.path) if cal.runlog else 0
 
 
 def checkin_evidence(cal: Any) -> dict[str, Any]:
-    """The REAL evidence since the last check-in, read back from the events.jsonl window:
+    """The REAL evidence since the last check-in (any emitter) — see :func:`window_evidence`."""
+    if cal.runlog is None:
+        return {"reads": 0, "max_dE": None, "max_dE_patch": None, "warnings": []}
+    return window_evidence(cal.runlog.path, cal._last_checkin_pos or 0)
+
+
+def window_evidence(path: Any, pos: int, *,
+                    skip_kinds: tuple[str, ...] = ()) -> dict[str, Any]:
+    """The REAL evidence in an events.jsonl window, read back from byte offset ``pos``:
     every warning/anomaly (with detail), the max ΔE actually read + which patch, and the
     read count. This is data for the LLM to JUDGE — deliberately NOT a verdict and NOT a
-    recommendation. The full firehose is always on disk; this is the at-a-glance packet."""
+    recommendation. The full firehose is always on disk; this is the at-a-glance packet.
+    ``skip_kinds`` drops warnings (by event name or ``kind``) a caller already carries in its
+    own packet (the measure loop inlines its read-plausibility flags as ``new_anomalies``)."""
     out: dict[str, Any] = {"reads": 0, "max_dE": None, "max_dE_patch": None, "warnings": []}
-    if cal.runlog is None:
-        return out
     try:
-        with cal.runlog.path.open("r", encoding="utf-8") as fh:
-            fh.seek(cal._last_checkin_pos or 0)
+        with path.open("r", encoding="utf-8") as fh:
+            fh.seek(pos or 0)
             lines = fh.readlines()
-    except OSError:
+    except (OSError, AttributeError):
         return out
     for ln in lines:
         ln = ln.strip()
@@ -135,6 +213,8 @@ def checkin_evidence(cal: Any) -> dict[str, Any]:
                 out["max_dE"] = round(de, 3)
                 out["max_dE_patch"] = data.get("label") or data.get("role") or data.get("signal")
         elif ev in ("anomaly", "read_plausibility_anomaly", "stall"):
+            if ev in skip_kinds or data.get("kind") in skip_kinds:
+                continue
             w = {"event": ev, "stage": e.get("stage")}
             for k in ("kind", "label", "reason", "message", "detail", "attempt"):
                 if k in data:

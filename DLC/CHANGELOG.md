@@ -217,6 +217,32 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Changed
+- **The MHC grayscale refine stops on physics, not a fixed target** (2026-09-24,
+  `dlc/refine_convergence.py`). The HDR and SDR refine loops used a fixed stop (2.0 dE_ITP /
+  0.5 CIEDE2000); the 2026-09-24 PA32UCXR run accepted round 1 at 1.26 and left a uniform
+  ~0.001 x cool cast. Each round now works out this panel's physical floor per grey level:
+  meter repeatability, thermal wander between rounds, and output quantization at the panel's bit
+  depth through its measured primaries. It then finds the error above that floor and predicts
+  what another round would gain, discounted by how much of its prediction the last step actually
+  delivered. The loop stops when the predicted gain is under a quarter of a JND. If real,
+  visible error remains that the refine can't remove, it raises a new `…:floored` seam for the
+  LLM to judge. Rounds are scored on the correctable band (dark floor → peak cap). Each round
+  emits its evidence and decision as a check-in when it finishes, not on the timer. Replaying six
+  past HDR runs: 09-23 and 09-24 would have continued, and the LG C6 run reaches its floor at
+  round 4.
+- **Check-ins no longer arrive in close pairs** (2026-09-24). The orchestrator and the measure
+  loop now share one check-in clock and evidence window, so a packet from either one resets the
+  cadence for both. A 25/50/75 % milestone is skipped when a packet went out within half a step
+  of progress, or within a quarter of the check-in interval. Loop packets also carry the
+  max-ΔE / warnings evidence and say whether a milestone or the timer triggered them. On the
+  09-24 timeline: 8 pairs under 60 s → 0, and the longest gap drops from 537 s to 306 s.
+- **Dashboard "previous stage" underlay is one coherent stage** (2026-09-24). Seeding was
+  transitive, so raw native greys (and above-peak raw greys no later ramp re-measures) rode into
+  post-MHC and verify, interleaved with newer greys. That drew sawtooth "spikes" in the faded
+  underlay. Each chart family (greys / colours) is now seeded only from the fresh reads of the
+  most recent stage that measured it. Colour-luminance errors are referenced to the white of the
+  stage that measured each colour. The measured-primaries triangle never mixes stages, and carried
+  points are labelled with the stage they came from.
 - **Fable audit Phase 9 — IPC contract and mock fidelity**
   (`docs/audits/fable/phase-9.md`): the wire contract is now pinned three ways
   (`tests/test_ipc_contract.py`): mock ⇄ spec response shapes, spec ⇄ C++ reverse

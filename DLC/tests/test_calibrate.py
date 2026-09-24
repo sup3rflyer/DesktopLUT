@@ -1131,15 +1131,14 @@ def test_sdr_refine_best_reverts_on_floored_exit(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(calib.controller, "set_base_lut",
                         lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
                                                            orig_set_base_lut(mon, mode, path, peak))[1])
-    # No arbitrary round cap: the monitor floor needs the improvement to stay below `min_improvement`
-    # for floor_patience (=2) consecutive rounds, so a single sub-threshold step doesn't end early.
-    scripted = iter([{"avg": 1.0, "max": 1.5, "n": 5, "gamma_err_pct": 1.0},    # round1 > target → refine
-                     {"avg": 1.2, "max": 1.8, "n": 5, "gamma_err_pct": 1.0},    # round2 uptick → streak 1
-                     {"avg": 1.25, "max": 1.85, "n": 5, "gamma_err_pct": 1.0}])  # round3 uptick → floored
-    monkeypatch.setattr(calib, "_grey_de_sdr", lambda samples, white: next(scripted))
+    # The physics judgment decides (refine_convergence): round 1 has removable error → refine;
+    # round 2 is a within-tolerance uptick whose step realized nothing → 'floored'.
+    scripted = iter([{"band_avg": 1.0, "decision": "continue", "reason": "removable"},
+                     {"band_avg": 1.2, "decision": "floored", "reason": "step realized 0%"}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
 
     out = calib.stage_refine_mhc_grayscale()
-    assert out.digest.get("floored") is True   # within-tolerance upticks for floor_patience rounds
+    assert out.digest.get("floored") is True   # the refine demonstrably stopped removing error
     assert out.digest.get("regressed") is not True
     # A mid-loop refine cube WAS installed (so the revert is meaningful)...
     assert any("refine1.cube" in p for p in installs), installs
@@ -2900,6 +2899,39 @@ def test_timed_checkin_anchors_then_emits_when_due(tmp_path: Path):
     assert events and events[-1].data["overview"]["stage"] == "measure:raw"
 
 
+def test_measure_loop_packet_resets_the_orchestrator_timer(tmp_path: Path):
+    # 2026-09-24: the loop's 98 % packet and the orchestrator's stage-end packet landed seconds
+    # apart because each emitter kept its own clock. They share ONE window now — a loop packet
+    # makes the orchestrator's (overdue) timer packet not due.
+    import dlc.measure_loop as ml
+    from dlc.engine.patches import Transfer
+    calib = _make(tmp_path, "ckshared", checkin_interval_s=300.0)
+    _due(calib)                                            # orchestrator packet overdue
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+    loop = ml._Loop(patches=[(0, 0, 0), (1023, 1023, 1023)], transfer=t,
+                    measure=_perfect_panel(), config=ml.MeasureLoopConfig(),
+                    ndjson=ml._NdjsonWriter(None), events=None, runlog=calib.runlog,
+                    checkin_interval_s=300.0, checkin_window=calib._checkin_window)
+    loop._emit_measure_checkin(2, 2, 1.0, trigger="progress")
+    calib._maybe_timed_checkin("measure:raw")              # stage end, seconds later
+    assert calib.runlog.tally.get("check_in", 0) == 1      # the loop's packet only
+
+
+def test_forced_checkin_emits_now_with_its_kind_and_resets_the_window(tmp_path: Path):
+    # A refine round's result is evidence the LLM judges as it happens — emitted regardless of
+    # the timer, labelled with its kind, and it resets the shared window (no timer packet
+    # right behind it). Timer packets say so too.
+    calib = _make(tmp_path, "ckforce", checkin_interval_s=300.0)
+    calib._maybe_timed_checkin("preflight")                # anchor
+    calib._emit_checkin("refine-mhc-cube", "refine_round")
+    calib._maybe_timed_checkin("refine-mhc-cube")          # not due → nothing
+    _due(calib)
+    calib._maybe_timed_checkin("refine-mhc-cube")          # due → timer packet
+    kinds = [e.data.get("kind") for e in read_events(calib.ctx.events_path)
+             if e.event == "check_in"]
+    assert kinds == ["refine_round", "timer"]
+
+
 def test_timed_checkin_never_gates_and_carries_no_recommendation(tmp_path: Path):
     # A check-in is a NON-BLOCKING evidence packet: even a fully-live MappingAdjudicator must
     # NEVER pause on it (no exit-10 seam), in ANY adjudicator mode. It just emits the digest.
@@ -2991,12 +3023,14 @@ def test_characterize_ticks_timed_checkins(tmp_path: Path):
 def test_default_interval_does_not_fire_timed_checkins_in_a_fast_run(tmp_path: Path):
     # Regression: the default 600s floor must leave fast (sim/CI) runs free of TIMED check-ins —
     # no spurious checkin seams — so the whole existing suite is unaffected. (The pre-existing
-    # measure-quartile check-ins still fire; the timed one is distinguished by its `overview`.)
+    # measure-quartile check-ins still fire, and so does each refine round's evidence packet —
+    # emitted as the round lands, `kind: refine_round`; the TIMED one is `kind: timer`.)
     calib = _make(tmp_path, "ckdefault")   # default 600s
     result = calib.run("full")
     assert result.status == "completed"
     timed = [e for e in read_events(calib.ctx.events_path)
-             if e.event == "check_in" and "overview" in e.data]
+             if e.event == "check_in" and "overview" in e.data
+             and e.data.get("kind") != "refine_round"]
     assert timed == []
     assert not any(k.startswith("checkin:") for k in calib.calib["decisions"])
 
@@ -3309,12 +3343,12 @@ def test_sdr_refine_safety_ceiling_reverts_to_best_and_raises_seam(tmp_path: Pat
                         lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
                                                            orig_set_base_lut(mon, mode, path, peak))[1])
     # r1: 10.0 (base) -> refine1; r2: 8.0 (best, improving) -> refine2; r3: 8.25 — a within-
-    # regress_tol uptick (no regression), improvement < min_improvement (streak 1 < patience 2),
-    # and rnd == safety_max_rounds -> safety ceiling with best (refine1) NOT currently installed.
-    scripted = iter([{"avg": 10.0, "max": 12.0, "n": 5, "gamma_err_pct": 1.0},
-                     {"avg": 8.0, "max": 10.0, "n": 5, "gamma_err_pct": 1.0},
-                     {"avg": 8.25, "max": 10.2, "n": 5, "gamma_err_pct": 1.0}])
-    monkeypatch.setattr(calib, "_grey_de_sdr", lambda samples, white: next(scripted))
+    # regress_tol uptick (no regression), the physics still says 'continue', and rnd ==
+    # safety_max_rounds -> safety ceiling with best (refine1) NOT currently installed.
+    scripted = iter([{"band_avg": 10.0, "decision": "continue"},
+                     {"band_avg": 8.0, "decision": "continue"},
+                     {"band_avg": 8.25, "decision": "continue"}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
 
     seen_before = len(adj.requests)
     out = calib.stage_refine_mhc_grayscale(safety_max_rounds=3)
@@ -3346,10 +3380,10 @@ def test_hdr_refine_safety_ceiling_reverts_to_best_and_raises_seam(tmp_path: Pat
     monkeypatch.setattr(calib.controller, "set_base_lut",
                         lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
                                                            orig_set_base_lut(mon, mode, path, peak))[1])
-    scripted = iter([{"avg": 10.0, "max": 12.0, "n": 5, "gamma_err_pct": 1.0},
-                     {"avg": 8.0, "max": 10.0, "n": 5, "gamma_err_pct": 1.0},
-                     {"avg": 8.4, "max": 10.4, "n": 5, "gamma_err_pct": 1.0}])
-    monkeypatch.setattr(calib, "_grey_de_vs_white", lambda samples, white: next(scripted))
+    scripted = iter([{"band_avg": 10.0, "decision": "continue"},
+                     {"band_avg": 8.0, "decision": "continue"},
+                     {"band_avg": 8.4, "decision": "continue"}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
 
     seen_before = len(adj.requests)
     out = calib.stage_refine_mhc_cube(safety_max_rounds=3)
@@ -3357,6 +3391,145 @@ def test_hdr_refine_safety_ceiling_reverts_to_best_and_raises_seam(tmp_path: Pat
     assert installs[-1].endswith("refine1.cube"), installs
     seams = [r for r in adj.requests[seen_before:] if r.key == "refine-mhc-cube:safety-ceiling"]
     assert len(seams) == 1 and seams[0].options == ("accept", "abort")
+
+
+def test_hdr_refine_continues_past_a_low_average_while_a_real_cast_remains(tmp_path: Path, monkeypatch):
+    # The 2026-09-24 failure: round 1 scored 1.26 < the old fixed 2.0 target and stopped, leaving a
+    # 6σ uniform cool cast. No fixed target now — the physics judgment says 'continue' (removable
+    # error above the panel floor), the loop refines, and stops only when round 2 says 'converged'.
+    # Each round lands a check-in carrying its decision as it happens (not on the timer).
+    calib = _make(tmp_path, "hdr_cast", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10,
+                  checkin_interval_s=600.0)
+    calib.run("mhc-only")
+    calib.calib["stages"].pop("refine-mhc-cube", None)
+    scripted = iter([{"band_avg": 0.89, "decision": "continue", "predicted_gain": 0.51,
+                      "cast_xy": [-0.00116, 0.00011], "cast_sigma": 5.9, "cast_real": True},
+                     {"band_avg": 0.40, "decision": "converged", "predicted_gain": 0.05}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
+    already = len(read_events(calib.ctx.events_path))      # the setup run's own refine packets
+    out = calib.stage_refine_mhc_cube()
+    assert out.digest["rounds"] == 2 and out.digest.get("converged") is True
+    assert out.digest["round_log"][0]["convergence"]["decision"] == "continue"
+    assert out.digest["best_band_avg_de_itp"] == 0.40
+    rounds = [e for e in read_events(calib.ctx.events_path)[already:]
+              if e.event == "check_in" and e.data.get("kind") == "refine_round"]
+    assert len(rounds) == 2                   # one per round, regardless of the timer
+    assert rounds[0].data["metrics"]["refine"]["convergence"]["cast_real"] is True
+
+
+def test_refine_abort_at_an_exit_seam_ends_the_flow(tmp_path: Path, monkeypatch):
+    # Review finding: the refine exit seams discarded the verdict — an LLM 'abort' let the flow
+    # carry on into post-MHC and the 3D LUT. It must end the flow (CalibrationAborted).
+    calib = _make(tmp_path, "hdr_abort", mode="HDR", panel=_perfect_hdr_panel(), bit_depth=10,
+                  decision_overrides={"refine-mhc-cube:floored": Decision("abort", "recheck")})
+    calib.run("mhc-only")
+    calib.calib["stages"].pop("refine-mhc-cube", None)
+    scripted = iter([{"band_avg": 1.0, "decision": "continue"},
+                     {"band_avg": 1.1, "decision": "floored", "reason": "step realized 0.02"}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
+    with pytest.raises(CalibrationAborted):
+        calib.stage_refine_mhc_cube()
+
+
+def test_refine_analysis_failure_stops_unjudged_for_the_llm(tmp_path: Path, monkeypatch):
+    # The analysis lazy-loads the engine for HDR; a failure must not crash the refine stage — it
+    # stops as 'unjudged' and raises the seam with the error text.
+    adj = _RecordingAuto()
+    calib = _make(tmp_path, "hdr_unjudged", mode="HDR", panel=_perfect_hdr_panel(),
+                  bit_depth=10, adjudicator=adj)
+    calib.run("mhc-only")
+    calib.calib["stages"].pop("refine-mhc-cube", None)
+
+    def boom(*a, **k):
+        raise RuntimeError("engine missing")
+    monkeypatch.setattr(calib, "_refine_round_analysis", boom)
+    seen = len(adj.requests)
+    out = calib.stage_refine_mhc_cube()
+    assert out.digest.get("unjudged") is True and out.digest["rounds"] == 1
+    seams = [r for r in adj.requests[seen:] if r.key == "refine-mhc-cube:unjudged"]
+    assert len(seams) == 1 and "engine missing" in seams[0].question
+
+
+def test_refine_exit_verdicts_do_not_replay_onto_a_rerun(tmp_path: Path, monkeypatch):
+    # A recorded exit verdict belongs to THAT execution: re-running the stage clears it, so a new
+    # floored exit gets a fresh judgment instead of silently replaying the old 'accept'.
+    adj = _RecordingAuto()
+    calib = _make(tmp_path, "hdr_rerun", mode="HDR", panel=_perfect_hdr_panel(),
+                  bit_depth=10, adjudicator=adj)
+    calib.run("mhc-only")
+    calib.calib["decisions"]["refine-mhc-cube:floored"] = {"choice": "accept", "note": "old run"}
+    calib.calib["stages"].pop("refine-mhc-cube", None)
+    scripted = iter([{"band_avg": 1.0, "decision": "continue"},
+                     {"band_avg": 1.1, "decision": "floored", "reason": "step realized 0.02"}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
+    seen = len(adj.requests)
+    calib.stage_refine_mhc_cube()
+    assert [r.key for r in adj.requests[seen:]] == ["refine-mhc-cube:floored"]   # asked afresh
+
+
+def test_refine_quantization_uses_the_panel_output_depth_not_the_pattern_depth(tmp_path: Path):
+    # Review finding: self.bit_depth is dogegen's TEST-PATTERN depth (SDR defaults to 8-bit); the
+    # MHC LUT output lands on the panel's link depth. An 8-bit pattern run must not quadruple the
+    # quantization floor.
+    calib = _make(tmp_path, "sdr_bits", bit_depth=8)
+    calib.run("mhc-only")
+    params = calib._state["mhc_params"]
+    from dlc.colormath import rgb_to_xyz_matrix
+    prim, nw = params["primaries"], params["measured_white"]
+    m = rgb_to_xyz_matrix(prim["rx"], prim["ry"], prim["gx"], prim["gy"], prim["bx"], prim["by"],
+                          nw["x"], nw["y"], white_Y=float(params["target_luminance"]))
+    peaks = [[m[r][c] for r in range(3)] for c in range(3)]
+    from dlc.mhc import parse_ti3
+    samples = parse_ti3(calib.ctx.root / "measurements" / "refine_1.ti3")
+    conv = calib._refine_round_analysis(samples, None, None, white_xy=(0.3127, 0.3290),
+                                        dark_floor_nits=0.5,
+                                        top_nits=float(params["target_luminance"]),
+                                        channel_peak_xyz=peaks)
+    assert calib.bit_depth == 8
+    assert conv["output_bits"] == calib.display.panel.bit_depth == 10
+
+
+def test_a_resumed_process_checkin_evidence_starts_at_this_process(tmp_path: Path):
+    # Review finding: every resume builds a new Calibration over an append-only events.jsonl; its
+    # first packet must not re-report the previous processes' history as "since the last
+    # check-in". The shared window's evidence offset starts at the file's size at construction.
+    first = _make(tmp_path, "ckresume", checkin_interval_s=300.0)
+    first.runlog.emit("INFO", "measure", "patch_read", label="old-blue", dE=24.7)
+    first.runlog.stall("measure:raw", message="old stall")
+    resumed = _make(tmp_path, "ckresume", checkin_interval_s=300.0)
+    size = resumed.ctx.events_path.stat().st_size
+    assert resumed._checkin_window.pos == size and resumed._last_checkin_monotonic is None
+    ev = resumed._checkin_evidence()
+    assert ev["max_dE"] is None and ev["warnings"] == []
+
+
+def test_hdr_refine_floored_exit_reverts_to_best_and_raises_seam(tmp_path: Path, monkeypatch):
+    # 'floored' = material, removable error remains above the physical floor but the last step
+    # realized ~none of its predicted gain — a floor the model does not see. Not the code's call:
+    # the best measured cube is reinstalled and the LLM adjudicates (accept / abort).
+    adj = _RecordingAuto()
+    calib = _make(tmp_path, "hdr_floored", mode="HDR", panel=_perfect_hdr_panel(),
+                  bit_depth=10, adjudicator=adj)
+    calib.run("mhc-only")
+    calib.calib["stages"].pop("refine-mhc-cube", None)
+    import dlc.mhc_cube as mc
+    monkeypatch.setattr(mc, "refine_hdr_cube",
+                        lambda cur, *a, **k: {ch: [0.5] * len(cur["r"]) for ch in ("r", "g", "b")})
+    installs: list[str] = []
+    orig_set_base_lut = calib.controller.set_base_lut
+    monkeypatch.setattr(calib.controller, "set_base_lut",
+                        lambda mon, mode, path, peak=0.0: (installs.append(str(path)),
+                                                           orig_set_base_lut(mon, mode, path, peak))[1])
+    scripted = iter([{"band_avg": 1.0, "decision": "continue"},
+                     {"band_avg": 1.1, "decision": "floored", "reason": "step realized 0%"}])
+    monkeypatch.setattr(calib, "_refine_round_analysis", lambda *a, **k: next(scripted))
+    seen_before = len(adj.requests)
+    out = calib.stage_refine_mhc_cube()
+    assert out.digest.get("floored") is True and out.digest.get("regressed") is not True
+    assert installs[-1].endswith("mhc_base_hdr.cube"), installs       # best = the base cube
+    seams = [r for r in adj.requests[seen_before:] if r.key == "refine-mhc-cube:floored"]
+    assert len(seams) == 1 and seams[0].options == ("accept", "abort")
+    assert "step realized 0%" in seams[0].question
 
 
 # ---------------------------------------------------------------------------

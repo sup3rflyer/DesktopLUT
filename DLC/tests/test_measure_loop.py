@@ -1272,6 +1272,112 @@ def test_measure_loop_wall_clock_backstop_emits_beyond_quartiles(tmp_path: Path,
     assert {0.25, 0.5, 0.75} <= {round(e.data["progress"], 2) for e in check_ins}  # quartiles still present
 
 
+def test_progress_milestone_right_after_a_packet_is_consumed_silently(tmp_path: Path):
+    """2026-09-24 owner report: a timer packet at 48 % and the 50 % milestone 16 s later is
+    noise. A milestone crossed within half a milestone step of progress of the last packet is
+    consumed WITHOUT emitting; one a full step on still emits (progress units, not seconds, so
+    a short stage's genuinely-spread milestones are never suppressed)."""
+    import dlc.measure_loop as ml
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    epath = tmp_path / "e.jsonl"
+    loop = ml._Loop(patches=_grey_ramp(t, 16), transfer=t,
+                    measure=SyntheticPanel(transfer=t, white_nits=120.0),
+                    config=MeasureLoopConfig(), ndjson=ml._NdjsonWriter(None), events=None,
+                    runlog=RunLog(epath, phase="measure:raw"))
+    loop._emit_measure_checkin(3, 16, 3 / 16, trigger="timer")   # the backstop at 19 %
+    loop._maybe_checkin(4)     # 25 % crossed 6 % of progress later → consumed silently
+    loop._maybe_checkin(8)     # 50 % is a full step on → emitted
+    loop._maybe_checkin(9)     # 50 % already consumed → nothing
+    got = [(e.data["trigger"], e.data["patches_done"])
+           for e in read_events(epath) if e.event == "check_in"]
+    assert got == [("timer", 3), ("progress", 8)]
+
+
+def test_milestone_right_after_another_emitters_packet_is_consumed_silently(tmp_path: Path):
+    """Cross-emitter, in time: a milestone within a quarter of the check-in interval of ANY packet
+    (the orchestrator's build packet 10 s before verify's 25 %) adds nothing — consumed silently.
+    Far enough after (100 s at a 300 s interval), the same milestone emits."""
+    import time as _time
+    import dlc.measure_loop as ml
+    from dlc.checkin import CheckinWindow
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    got = []
+    for label, age in (("near", 10.0), ("far", 100.0)):
+        epath = tmp_path / f"{label}.jsonl"
+        window = CheckinWindow()
+        window.pos = 0                                      # the owner anchored the evidence start
+        window.monotonic = _time.monotonic() - age          # the other emitter's last packet
+        loop = ml._Loop(patches=_grey_ramp(t, 16), transfer=t,
+                        measure=SyntheticPanel(transfer=t, white_nits=120.0),
+                        config=MeasureLoopConfig(), ndjson=ml._NdjsonWriter(None), events=None,
+                        runlog=RunLog(epath, phase="measure:verify"), checkin_interval_s=300.0,
+                        checkin_window=window)
+        loop._maybe_checkin(4)                                # 25 %
+        got.append(sum(1 for e in read_events(epath) if e.event == "check_in"))
+    assert got == [0, 1]
+
+
+def test_a_bare_window_never_reports_earlier_processes_history(tmp_path: Path):
+    """Review finding (resume): events.jsonl is append-only across a resumed run's processes. A
+    window nobody anchored must start its evidence at the loop, not byte 0 — else the first packet
+    re-reports a previous process's dE 24.7 read and stall as "since the last check-in"."""
+    import dlc.measure_loop as ml
+    from dlc.checkin import CheckinWindow
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    epath = tmp_path / "e.jsonl"
+    old = RunLog(epath, phase="measure:raw")
+    old.emit("INFO", "measure:raw", "patch_read", label="native-blue", dE=24.7)
+    old.stall("measure:raw", message="previous process")
+    runlog = RunLog(epath, phase="refine-mhc-cube")
+    loop = ml._Loop(patches=_grey_ramp(t, 8), transfer=t,
+                    measure=SyntheticPanel(transfer=t, white_nits=120.0),
+                    config=MeasureLoopConfig(), ndjson=ml._NdjsonWriter(None), events=None,
+                    runlog=runlog, checkin_interval_s=300.0, checkin_window=CheckinWindow())
+    runlog.emit("INFO", "refine-mhc-cube", "patch_read", label="g1", dE=0.6)
+    loop._emit_measure_checkin(2, 8, 0.25, trigger="progress")
+    ev = [e for e in read_events(epath) if e.event == "check_in"][-1].data["evidence"]
+    assert ev["max_dE"] == 0.6 and ev["max_dE_patch"] == "g1" and ev["warnings"] == []
+
+
+def test_loop_packets_advance_the_shared_checkin_window(tmp_path: Path):
+    """The loop shares the orchestrator's §12 window: a fresh loop never re-anchors it, and each
+    loop packet closes it (clock + events offset + tally) and carries the events-window evidence
+    (max ΔE actually read) the orchestrator's packets carry."""
+    import time as _time
+    import dlc.measure_loop as ml
+    from dlc.checkin import CheckinWindow
+    from dlc.events import RunLog, read_events
+
+    t = _sdr()
+    epath = tmp_path / "e.jsonl"
+    runlog = RunLog(epath, phase="measure:post-mhc")
+    window = CheckinWindow()
+    anchored = _time.monotonic() - 200.0
+    window.monotonic = anchored
+    window.pos = 0                                          # the owner set where evidence starts
+    loop = ml._Loop(patches=_grey_ramp(t, 8), transfer=t,
+                    measure=SyntheticPanel(transfer=t, white_nits=120.0),
+                    config=MeasureLoopConfig(), ndjson=ml._NdjsonWriter(None), events=None,
+                    runlog=runlog, checkin_interval_s=300.0, checkin_window=window)
+    assert window.monotonic == anchored                     # not re-anchored by a new loop
+    runlog.emit("INFO", "measure", "patch_read", label="g1", dE=0.4)
+    runlog.emit("INFO", "measure", "patch_read", label="g2", dE=2.5)
+    loop._emit_measure_checkin(2, 8, 0.25, trigger="progress")
+    ev = [e for e in read_events(epath) if e.event == "check_in"][-1]
+    assert ev.data["elapsed_since_checkin_s"] >= 199.0      # measured from the SHARED clock
+    assert ev.data["evidence"]["max_dE"] == 2.5 and ev.data["evidence"]["max_dE_patch"] == "g2"
+    assert window.monotonic > anchored
+    # the window closed just BEFORE the check_in line: the next packet's evidence starts after it
+    assert window.pos < epath.stat().st_size
+    assert window.tally.get("patch_read") == 2
+
+
 def test_wall_clock_backstop_ticks_during_warmup_too(tmp_path: Path, monkeypatch):
     """NO-DARK-WINDOW rule (fable Phase 8): the wall-clock backstop lives on the loop's
     single read funnel (_read), so warm-up — before ANY patch is accepted and before the
