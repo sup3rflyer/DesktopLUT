@@ -72,6 +72,40 @@ bool RemoveMHC2Profile(const std::wstring& profileName, LUID adapterLuid, UINT32
 // Used by Cancel to restore a disassociated profile that's still in system color dir
 bool ReassociateMHC2Profile(const std::wstring& profileName, LUID adapterLuid, UINT32 sourceId, bool isHDR = false);
 
+// Quiet removal: disassociate the profile from the mode's list (dissociateAdvancedColor = isHDR),
+// logging only on success. A profile that isn't associated fails harmlessly with no error line.
+// Always attempted (no ColorProfileGetDisplayList pre-check — that list may only report the
+// active mode's entries). Returns true if an association was removed.
+bool RemoveMHC2ProfileQuiet(const std::wstring& profileName, LUID adapterLuid, UINT32 sourceId, bool isHDR);
+
+// ============================================================================
+// Identity (neutral) MHC2 profile
+// ============================================================================
+// HW-proven 2026-09-03 and 2026-09-23: after DesktopLUT disassociates an MHC2 profile, Windows
+// keeps applying the LAST associated MHC2 transform until a NEW profile is associated (and with
+// nothing associated, Windows ACM may take over). So an explicit user Remove / disable associates
+// this identity profile FIRST (as the active default) and only then disassociates the old one — no
+// window with nothing associated. Stable per display/mode name (no color-dir churn); written by
+// GenerateMHC2Profile from BuildIdentityMHC2Params (identity matrix + identity 1D LUTs + the
+// mode's HDR/SDR luminance metadata). NOT associated on app exit: real MHC profiles are passive
+// and must keep working without DesktopLUT.
+
+// Keyed by the display's persistent settings slot ([Display<slot>] — stable across enumeration
+// reorders / hot-plug, unique per physical panel) so one display's engage never rewrites a file
+// still associated to another display:
+//   settingsSlot >= 0 : "DesktopLUT_Display<slot>_<SDR|HDR>_Identity.icm"
+//   settingsSlot <  0 : "DesktopLUT_Mon<monitorIndex>_<SDR|HDR>_Identity.icm" (unidentified display)
+std::wstring MhcIdentityProfileName(int settingsSlot, int monitorIndex, bool isHDR);
+
+// True for any name MhcIdentityProfileName can produce (either key form, any number). outIsHDR
+// (optional) receives the mode encoded in the name.
+bool IsMhcIdentityProfileName(const std::wstring& name, bool* outIsHDR = nullptr);
+
+// Identity profile parameters: primaries off (src == display ⇒ identity matrix), grayscale / TRC /
+// 1D-cube / WB / DG / correction-GS all off (identity LUTs), isHDR + peakNits carried so the lumi
+// tag and MHC2 MinCLL/MaxCLL match what the mode's normal profile carries.
+MHC2ProfileParams BuildIdentityMHC2Params(bool isHDR, float peakNits, const std::wstring& monitorName);
+
 // ============================================================================
 // MHC Profile State
 // ============================================================================
@@ -92,10 +126,14 @@ struct MHCProfileState {
 // outMHC is 12 floats: 3x4 row-major (4th column = 0)
 // whiteBalanceGains: optional diagonal RGB gains baked into matrix (von Kries)
 //   When non-null, scales each column of srcToXYZ before final multiply
+// The emitted outMHC is the intended RGB->RGB `result` conjugated into the mode's XYZ basis
+//   (B*result*inv(B); B = sRGB NPM for SDR, BT.2020 NPM for HDR), because Windows applies the
+//   tag as inv(B)*M*B — so the as-applied transform equals `result` in BOTH modes.
 // outAsAppliedRGB: optional 9 floats (row-major 3x3). When non-null, receives the NET
 //   as-applied RGB->RGB transform the panel actually sees (the PRE-conjugation `result`,
-//   NOT the emitted S*M*inv(S) SDR tag). This is what a shader must reproduce to predict
-//   the bake (used by the live grayscale full-preview). WB gains are already baked in.
+//   NOT the emitted B*M*inv(B) tag), for SDR and HDR alike. This is what a shader must
+//   reproduce to predict the bake (used by the SDR live grayscale full-preview). WB gains
+//   are already baked in.
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
                        bool isHDR, float outMHC[12],

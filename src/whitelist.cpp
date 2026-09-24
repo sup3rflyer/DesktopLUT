@@ -355,43 +355,48 @@ static void CheckMhcProfiles() {
     }
     if (!anyProfileEnabled) return;
 
-    // Enumerate displays ONCE for all monitors (instead of per-monitor GetDisplayInfoForMonitor
-    // which calls EnumerateDisplaysForMaxTml each time — N full display config enumerations → 1)
-    std::vector<DisplayInfo> displays;
-    if (!EnumerateDisplaysForMaxTml(displays)) return;
-
+    // Resolve each monitor through GetDisplayInfoForMonitor (position-correlated), NOT
+    // displays[i] from EnumerateDisplaysForMaxTml: QueryDisplayConfig path order need not match
+    // the EnumDisplayMonitors index order (displayconfig.cpp GetDisplayInfoForMonitor). A
+    // mis-indexed display used to be masked when it had nothing associated (empty default ⇒ the
+    // `!current.empty()` guard skipped it); with the identity MHC2 profile associated after a
+    // Remove/disable its default is non-empty, so a wrong index would re-associate the OTHER
+    // monitor's real profile onto it every poll. Only monitors with an enabled profile resolve.
     for (int i = 0; i < (int)snapshots.size(); i++) {
         const auto& snap = snapshots[i];
-        if (i >= (int)displays.size()) continue;
-        const auto& displayInfo = displays[i];
+        const bool checkSdr = snap.sdrEnabled && !snap.sdrProfileName.empty();
+        const bool checkHdr = snap.hdrEnabled && !snap.hdrProfileName.empty();
+        if (!checkSdr && !checkHdr) continue;
 
-        // Check SDR profile
-        if (snap.sdrEnabled && !snap.sdrProfileName.empty()) {
-            std::wstring current = QueryDisplayDefaultProfile(displayInfo.adapterId, displayInfo.sourceId, false);
-            if (!current.empty() && current != snap.sdrProfileName) {
-                std::wcout << L"MHC monitor: SDR profile displaced on monitor " << i
-                           << L" (expected '" << snap.sdrProfileName
-                           << L"', found '" << current << L"'), reapplying" << std::endl;
-                ReassociateMHC2Profile(snap.sdrProfileName, displayInfo.adapterId, displayInfo.sourceId, false);
-                if (hwndMain) {
-                    PostMessage(hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, 0);
-                }
-            }
-        }
+        DisplayInfo displayInfo;
+        if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
 
-        // Check HDR profile
-        if (snap.hdrEnabled && !snap.hdrProfileName.empty()) {
-            std::wstring current = QueryDisplayDefaultProfile(displayInfo.adapterId, displayInfo.sourceId, true);
-            if (!current.empty() && current != snap.hdrProfileName) {
-                std::wcout << L"MHC monitor: HDR profile displaced on monitor " << i
-                           << L" (expected '" << snap.hdrProfileName
-                           << L"', found '" << current << L"'), reapplying" << std::endl;
-                ReassociateMHC2Profile(snap.hdrProfileName, displayInfo.adapterId, displayInfo.sourceId, true);
-                if (hwndMain) {
-                    PostMessage(hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, 1);
-                }
+        auto checkOne = [&](bool isHDR, const std::wstring& expected) {
+            std::wstring current = QueryDisplayDefaultProfile(displayInfo.adapterId, displayInfo.sourceId, isHDR);
+            if (current.empty() || current == expected) return;
+            // Re-validate under the lock right before acting (like VerifyAndRestoreMhcProfiles): a
+            // GUI/pipe Remove, calibration.enter or permutation swap may have changed this mode
+            // since the snapshot — re-asserting the stale name would undo it (e.g. put a removed
+            // profile back over its identity stand-in).
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                if (g_mhcEditDialogOpen.load()) return;
+                if (i >= (int)g_gui.monitorSettings.size()) return;
+                const MHCSettings& mNow = isHDR ? g_gui.monitorSettings[i].hdrMHC
+                                                : g_gui.monitorSettings[i].sdrMHC;
+                if (!mNow.enabled || mNow.profileName != expected) return;
             }
-        }
+            std::wcout << L"MHC monitor: " << (isHDR ? L"HDR" : L"SDR") << L" profile displaced on monitor " << i
+                       << L" (expected '" << expected
+                       << L"', found '" << current << L"'), reapplying" << std::endl;
+            ReassociateMHC2Profile(expected, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+            if (hwndMain) {
+                PostMessage(hwndMain, WM_MHC_PROFILE_REAPPLIED, (WPARAM)i, isHDR ? 1 : 0);
+            }
+        };
+
+        if (checkSdr) checkOne(false, snap.sdrProfileName);
+        if (checkHdr) checkOne(true, snap.hdrProfileName);
     }
 }
 

@@ -953,9 +953,8 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     std::wstring dummy = Utf8ToWide(p.getStr("dummy_icc_path"));
     std::wstring reason = Utf8ToWide(p.getStr("reason"));
 
-    DisplayInfo di;
-    bool haveDi = GetDisplayInfoForMonitor(mon, di);
-
+    std::wstring removeName;       // the active real MHC profile this enter takes out of scanout
+    float identityPeak = 0.0f;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
@@ -967,8 +966,10 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
             g_calib.snapWasHdr = isHDR;
         }
         MHCSettings& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
-        if (haveDi && mhc.enabled && !mhc.profileName.empty())
-            RemoveMHC2Profile(mhc.profileName, di.adapterId, di.sourceId, isHDR);
+        if (mhc.enabled && !mhc.profileName.empty()) {
+            removeName = mhc.profileName;
+            identityPeak = MhcIdentityPeakNits(ms, isHDR);  // before the clears below
+        }
         mhc.enabled = false;
         // Clean MHC slate for a calibration build. A DLC run defines exactly what it
         // wants over the pipe (set_primaries / set_white / set_base_grayscale), so any
@@ -1004,6 +1005,17 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
             ms.sdrColorCorrection.fald.enabled = false;   // the SDR (ACM) FALD layer likewise
         }
     }
+    // Take the active MHC out of scanout: associate the identity MHC2 profile FIRST, then
+    // disassociate the real one (Windows keeps applying the last associated MHC2 transform after a
+    // bare removal — HW-proven 2026-09-03 / 2026-09-23). Outside the settings lock (file I/O +
+    // MSCMS), after mhc.enabled=false so CheckMhcProfiles can't re-assert the old profile. DLC's
+    // enter-neutral still associates ITS identity (set_primaries(P)+set_white(D65)+apply) right
+    // after; that apply's GenerateAndInstallMhcProfile drops this stand-in again.
+    std::wstring identityName;
+    if (!removeName.empty()) {
+        FaldTrace("EnterNeutral: identity MHC swap");
+        identityName = ReplaceMhcProfileWithIdentity(mon, isHDR, identityPeak, removeName);
+    }
     FaldTrace("EnterNeutral: settings cleared, SaveSettings");
     SaveSettings();
     FaldTrace("EnterNeutral: UpdateMhcFlagsLive");
@@ -1011,8 +1023,8 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     FaldTrace("EnterNeutral: ReapplyProcessing");
     ReapplyProcessing();
     FaldTrace("EnterNeutral: ReapplyProcessing done");
-    // NOTE: dummy-ICC association is deferred to live bring-up; neutrality here
-    // comes from MHC removal + cleared layers, plus DLC's own `dispwin -c`.
+    // NOTE: dummy-ICC association is deferred to live bring-up; neutrality here comes from the
+    // identity-MHC swap above (when an MHC was active) + cleared layers, plus DLC's own `dispwin -c`.
 
     {
         std::lock_guard<std::mutex> ck(g_calibMutex);
@@ -1029,6 +1041,7 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("mode", JStr(isHDR ? "HDR" : "SDR"));
     result.set("dummy_icc_path", JStr(WideToUtf8(dummy)));
     result.set("corrections_reset", JBool(true));
+    result.set("identity_profile", JStr(WideToUtf8(identityName)));
 }
 
 void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1042,15 +1055,32 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
     if (restore) {
         std::lock_guard<std::mutex> ck(g_calibMutex);
         if (g_calib.hasSnapshot && g_calib.snapMonitor >= 0) {
+            // The calibration's live MHC profile for the captured mode (e.g. DLC's identity or an
+            // interim build) — the snapshot restore below drops it from settings.
+            std::wstring liveName;
+            float livePeak = 0.0f;
             {
                 std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                if (g_calib.snapMonitor < (int)g_gui.monitorSettings.size())
-                    g_gui.monitorSettings[g_calib.snapMonitor] = g_calib.snapshot;
+                if (g_calib.snapMonitor < (int)g_gui.monitorSettings.size()) {
+                    MonitorSettings& live = g_gui.monitorSettings[g_calib.snapMonitor];
+                    const MHCSettings& lm = g_calib.snapWasHdr ? live.hdrMHC : live.sdrMHC;
+                    if (lm.enabled && !lm.profileName.empty()) {
+                        liveName = lm.profileName;
+                        livePeak = MhcIdentityPeakNits(live, g_calib.snapWasHdr);
+                    }
+                    live = g_calib.snapshot;
+                }
             }
             SaveSettings();
             // Reinstall the original MHC for the captured mode if it was active.
             MHCSettings& m = g_calib.snapWasHdr ? g_calib.snapshot.hdrMHC : g_calib.snapshot.sdrMHC;
             if (m.enabled) GenerateAndInstallMhcProfile(g_calib.snapMonitor, g_calib.snapWasHdr);
+            // No original MHC to reinstall, but the calibration left one associated: swap it for the
+            // identity profile rather than leaving it applied (it is no longer referenced by
+            // settings, so the stale-association sweep would drop it → nothing associated, while
+            // Windows keeps applying its transform — HW-proven 2026-09-03 / 2026-09-23).
+            else if (!liveName.empty())
+                ReplaceMhcProfileWithIdentity(g_calib.snapMonitor, g_calib.snapWasHdr, livePeak, liveName);
             UpdateMhcFlagsLive(g_calib.snapMonitor);
             ReapplyProcessing();
             restored = true;
@@ -1299,11 +1329,11 @@ void DoMhcSetBaseLut(const JsonValue& p, JsonValue& result, std::string& error) 
 void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    {
-        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        m.enabled = true;
-    }
+    // No `enabled = true` pre-set here: GenerateAndInstallMhcProfile sets it on success, and retires a
+    // named-but-disabled old profile (after mhc.remove / calibration.enter) by itself. Pre-setting it
+    // opened a window in which the whitelist monitor saw enabled + the REMOVED profile's name + the
+    // identity stand-in as default and re-asserted the removed profile; a failed apply also left the
+    // removed profile marked active.
     // GenerateAndInstallMhcProfile snapshots settings under the mutex internally,
     // so it MUST be called without g_monitorSettingsMutex held.
     if (!GenerateAndInstallMhcProfile(mon, isHDR)) {
@@ -1337,19 +1367,26 @@ void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
 void DoMhcRemove(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    DisplayInfo di;
-    bool haveDi = GetDisplayInfoForMonitor(mon, di);
+    std::wstring oldName;
+    float identityPeak = 0.0f;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        if (haveDi && !m.profileName.empty())
-            RemoveMHC2Profile(m.profileName, di.adapterId, di.sourceId, isHDR);
+        oldName = m.profileName;
+        identityPeak = MhcIdentityPeakNits(g_gui.monitorSettings[mon], isHDR);
         m.enabled = false;
     }
+    // Like the GUI Remove button: associate the identity MHC2 profile FIRST, then disassociate the
+    // real one — Windows keeps applying the last associated MHC2 transform after a bare removal
+    // (HW-proven 2026-09-03 / 2026-09-23). Done outside the settings lock (file I/O + MSCMS calls).
+    std::wstring identityName;
+    if (!oldName.empty())
+        identityName = ReplaceMhcProfileWithIdentity(mon, isHDR, identityPeak, oldName);
     UpdateMhcFlagsLive(mon);
     SaveSettings();
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("removed", JBool(true));
+    result.set("identity_profile", JStr(WideToUtf8(identityName)));
 }
 
 void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
