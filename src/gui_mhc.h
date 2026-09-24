@@ -104,3 +104,37 @@ bool ComputeSdrPreviewScanout(int monitorIndex, uint8_t strippedPerm,
 // Engage returns the installed passthrough profile name (empty on failure).
 std::wstring EngageSdrPassthroughScanout(int monitorIndex);
 void DisengageSdrPassthroughScanout(int monitorIndex, const std::wstring& passthroughName);
+
+// ============================================================================
+// Identity (neutral) MHC2 profile on explicit Remove / disable (see mhc.h)
+// ============================================================================
+// Windows keeps applying the LAST associated MHC2 transform after a disassociation (HW-proven
+// 2026-09-03 / 2026-09-23), so explicit Remove/disable paths associate the stable per display/mode
+// identity profile (DesktopLUT_Display<slot>_<MODE>_Identity.icm; Mon<N> for an unidentified
+// display) FIRST, then disassociate the old profile. Never on app exit. The Engage/Replace/Disengage
+// helpers briefly take g_monitorSettingsMutex (settings slot lookup) — call them WITHOUT it held.
+
+// The luminance-metadata peak (lumi tag / MHC2 MaxCLL) the mode's normal profile carries for these
+// settings — single source of truth shared by BuildMHC2Params and the identity profile.
+struct MonitorSettings;
+float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR);
+
+// Peak metadata the identity profile carries (HDR; SDR is pinned to 80 nits by the writer):
+// the monitor's Display Peak Override (MaxTML) peak when enabled, else the removed profile's
+// MhcProfileMetadataPeakNits (its configured peak, or the params default of 1000). Pure.
+float MhcIdentityPeakNits(const MonitorSettings& ms, bool isHDR);
+
+// Install + associate (as the active default) the identity profile for monitor/mode.
+// Returns the associated profile name (empty on failure).
+std::wstring EngageIdentityMhcProfile(int monitorIndex, bool isHDR, float peakNits);
+
+// Associate the identity profile, THEN disassociate oldProfileName (skipped when empty). The old
+// profile is disassociated even if the identity install fails (the caller asked for removal).
+// Returns the associated identity profile name (empty if the identity association failed).
+std::wstring ReplaceMhcProfileWithIdentity(int monitorIndex, bool isHDR, float peakNits,
+                                           const std::wstring& oldProfileName);
+
+// Drop the identity association for monitor/mode (a real profile is the active default again).
+// Quiet no-op when not associated. GenerateAndInstallMhcProfile / RegenerateMhcIfActive call this
+// after every successful real install.
+void DisengageIdentityMhcProfile(int monitorIndex, bool isHDR);

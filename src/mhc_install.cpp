@@ -184,6 +184,25 @@ bool ReassociateMHC2Profile(const std::wstring& profileName, LUID adapterLuid, U
     return true;
 }
 
+bool RemoveMHC2ProfileQuiet(const std::wstring& profileName, LUID adapterLuid, UINT32 sourceId, bool isHDR) {
+    EnsureMscmsLoaded();
+    if (!g_pfnRemoveAssociation || profileName.empty()) return false;
+
+    // No ColorProfileGetDisplayList pre-check: it may only report the ACTIVE mode's list, so an
+    // HDR entry on an SDR desktop (or vice versa) would be missed. Removing a name that isn't in
+    // the mode's list fails harmlessly (same practice as SweepStaleMhcAssociations).
+    HRESULT hr = g_pfnRemoveAssociation(
+        1,                  // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
+        profileName.c_str(), adapterLuid, sourceId,
+        isHDR ? TRUE : FALSE  // dissociateAdvancedColor
+    );
+    if (SUCCEEDED(hr)) {
+        std::wcout << L"MHC2: Profile removed: " << profileName << std::endl;
+        return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // SECTION: Profile Query & Cleanup
 // ============================================================================
@@ -255,9 +274,15 @@ void CleanupOrphanedMhcProfiles() {
     // 1) Orphaned profiles are from a previous session — likely already disassociated on clean exit
     // 2) We don't have adapter LUID / source ID for profiles that may belong to disconnected monitors
     // 3) Windows handles missing profile files gracefully (falls back to default)
+    // Identity profiles (DesktopLUT_Display<slot>|Mon<N>_<MODE>_Identity.icm) are never orphans: they are what
+    // stays associated after an explicit Remove/disable, deliberately NOT referenced by settings,
+    // and deleting an associated profile's file would hand the display back to "nothing associated"
+    // (the exact state they exist to prevent). Stable names ⇒ at most two small files per display
+    // settings slot (plus Mon<N> fallbacks for unidentified displays).
     int deleted = 0;
     do {
         std::wstring fileName = fd.cFileName;
+        if (IsMhcIdentityProfileName(fileName)) continue;
         if (activeProfiles.find(fileName) == activeProfiles.end()) {
             std::wstring fullPath = colorDir + fileName;
             if (DeleteFileW(fullPath.c_str())) {
@@ -290,12 +315,18 @@ void SweepStaleMhcAssociations() {
     EnsureMscmsLoaded();
     if (!g_pfnGetDisplayList || !g_pfnRemoveAssociation) return;
 
-    // Snapshot every profile name referenced by current settings
+    // Snapshot every profile name referenced by current settings, plus per-monitor "is a real
+    // DesktopLUT MHC profile active" flags for the identity-profile rule below.
     std::set<std::wstring> keep;
     size_t monitorCount = 0;
+    std::vector<std::pair<bool, bool>> realActive;  // [monitor] = {sdrActive, hdrActive}
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         monitorCount = g_gui.monitorSettings.size();
+        for (const auto& ms : g_gui.monitorSettings) {
+            realActive.push_back({ ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty(),
+                                   ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() });
+        }
         auto collect = [&](const MonitorSettings& ms) {
             for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
                 if (!ms.sdrMHC.permNames[k].empty()) keep.insert(ms.sdrMHC.permNames[k]);
@@ -325,6 +356,24 @@ void SweepStaleMhcAssociations() {
             std::wstring name = list[k];
             if (name.rfind(L"DesktopLUT_", 0) != 0) continue;  // not ours — never touch
             if (keep.count(name)) continue;                     // referenced by settings
+
+            // Identity profile: KEEP while this monitor's mode has no real DesktopLUT profile
+            // active (it is the deliberate stand-in after an explicit Remove/disable — sweeping it
+            // would leave nothing associated). Once a real profile is active it is only a stale
+            // entry Windows could re-broker to during a mode switch, so drop it from its own list.
+            bool idIsHDR = false;
+            if (IsMhcIdentityProfileName(name, &idIsHDR)) {
+                bool active = (i < (int)realActive.size())
+                    && (idIsHDR ? realActive[i].second : realActive[i].first);
+                if (!active) continue;
+                if (SUCCEEDED(g_pfnRemoveAssociation(1, name.c_str(), di.adapterId, di.sourceId,
+                                                     idIsHDR ? TRUE : FALSE))) {
+                    std::wcout << L"MHC sweep: removed superseded identity association '" << name
+                               << L"' from monitor " << i << std::endl;
+                    swept++;
+                }
+                continue;
+            }
 
             // Stale entry. The list API doesn't say which list (SDR vs Advanced
             // Color) the entry lives in, so remove from both — removal from the
@@ -384,6 +433,9 @@ void VerifyAndRestoreMhcProfiles() {
             std::wstring current = QueryDisplayDefaultProfile(
                 displayInfo.adapterId, displayInfo.sourceId, isHDR);
             if (current == expected) return;  // Already correct — nothing to do.
+            // (When `current` is DesktopLUT's identity stand-in the checks below still apply:
+            // it only differs from `expected` while the settings say this mode's real profile is
+            // active, and the locked re-validation rejects a Remove/disable that raced us.)
 
             // Before trying to re-associate, confirm the profile file actually
             // exists in the system color directory. If not, Windows' own cleanup
@@ -405,13 +457,14 @@ void VerifyAndRestoreMhcProfiles() {
             // whitelist DG toggle) may have changed the active profile since we
             // snapshotted. If 'expected' is no longer the active name, it is stale —
             // skip, or we'd re-assert the OLD permutation over the just-applied new one.
+            // Also re-check `enabled`: mhc.remove / calibration.enter keep profileName but clear
+            // enabled after swapping in the identity profile — re-asserting then would undo them.
             {
                 std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
                 if (i >= (int)g_gui.monitorSettings.size()) return;
-                const std::wstring& nameNow = isHDR
-                    ? g_gui.monitorSettings[i].hdrMHC.profileName
-                    : g_gui.monitorSettings[i].sdrMHC.profileName;
-                if (nameNow != expected) return;
+                const MHCSettings& mNow = isHDR ? g_gui.monitorSettings[i].hdrMHC
+                                                : g_gui.monitorSettings[i].sdrMHC;
+                if (!mNow.enabled || mNow.profileName != expected) return;
             }
 
             // Windows forgot our profile. Force re-broker: remove association,

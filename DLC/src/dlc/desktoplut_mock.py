@@ -708,8 +708,10 @@ class MockDesktopLutServer:
             state["applied"] = True
             state.setdefault("profile_name", f"DesktopLUT-sim-{key.replace(':', '-')}.icm")
         elif method == "mhc.remove":
-            self.state.mhc.pop(key, None)
-            return self.ok({"monitor_mode": key, "removed": True})
+            had_profile = bool((self.state.mhc.pop(key, None) or {}).get("profile_name"))
+            # C++ DoMhcRemove swaps in the identity MHC2 profile before disassociating the real one.
+            ident = f"DesktopLUT_Mon{key.split(':')[0]}_{key.split(':')[1]}_Identity.icm" if had_profile else ""
+            return self.ok({"monitor_mode": key, "removed": True, "identity_profile": ident})
         else:
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         return self.ok({"monitor_mode": key, "mhc": deepcopy(self.state.mhc.get(key, {}))})
