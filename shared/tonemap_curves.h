@@ -15,8 +15,13 @@
 //   f(S) = H                 the source peak lands exactly on the target (peak preserving)
 //   f' > 0, f'' < 0, f <= min(x, H)
 //   f -> x as S -> H         continuous into the identity + clip branch at headroom 0
-// Content above the source peak (x > S: a static source peak set too low, or the dynamic detector's
-// rise lag / stride-4 misses) clips at the target, as BT.2390 does.
+// Content above the source peak (x > S) clips at the target, as BT.2390 does. Causes: a static source
+// peak set too low; the dynamic detector's rise lag / stride-4 misses; and saturated highlights — the
+// detector measures PQ of BT.709 LUMINANCE (shared/peak_detect.h) while the curve maps the ICtCp I
+// channel, which sits above PQ(Y) for saturated colours (~+0.03 PQ for 709 blue, +0.01 magenta), so a
+// frame whose peak is set by a saturated highlight flattens that highlight's top (BT.2390: same).
+// ApplyTonemappingICtCp does not apply its 3 % crossfade to these two curves: they are continuous into
+// identity + clip on their own, and the crossfade would re-introduce a partial hard clip at the target.
 //
 // History. The original curves (to 2026-03) were k + H(1 - exp(-x/H)) and k + H x / (x + H): slope 1
 // at the knee and a shape independent of the source, but the peak only approached the target
@@ -46,13 +51,16 @@
 //            maximum of phi at u = -ln r;
 //     then two Newton steps on  phi(u) = d u - (u - E(u))   (= E(u) - r u, written so the d -> 0 end
 //            does not cancel), phi'(u) = d - E(u). phi is concave and u0 lies past its maximum, so
-//            Newton converges without oscillating; two steps leave < 4e-10 relative error (double),
-//            i.e. float-exact. Each step is clamped to the bracket [2d, 1/r] against float noise.
-//   E(y) uses a 7-term Taylor series below y = 1/8 (truncation < 1.3e-11 relative, so the hand-off
-//   to 1 - exp(-y) is seamless even in double), because 1 - exp(-y) cancels as y -> 0, which is
-//   exactly the S -> H end.
-//   Guard: r is floored at 1e-4 (H < 1e-4 S — a target of ~0.001 nits); there the knee slope is no
-//   longer exactly 1 but the curve still maps the peak to the target and stays monotone.
+//            Newton converges without oscillating; two steps leave < 4e-10 relative error in exact
+//            arithmetic. In float the knee slope is 1 within 1e-6 for r >= 0.05 (every reachable
+//            setting: targets are clamped to >= 10 nits, so r >= ~0.2); it degrades only for r ~ 1e-3.
+//            Each step is clamped to the bracket [2d, 1/r] against float noise.
+//   E(y) uses a 7-term Taylor series below y = 1/8 (truncation < 1.3e-11 relative, the size of the
+//   step at the hand-off), because 1 - exp(-y) cancels as y -> 0, which is exactly the S -> H end.
+//   r and d are passed separately (each computed without cancellation) and never re-derived from
+//   each other: GPU division may round H/S to exactly 1 when S is 1 ulp above H, and d > 0 must still
+//   drive the solve (u >= 2d > 0, so no 0/0). d <= 0 falls back to identity + clip.
+//   Guard: r is floored at 1e-4 (H < 1e-4 S, i.e. a target below ~1e-6 nits — unreachable, defensive).
 //
 // Cost per pixel above the knee: SoftClip 4 exp + ~50 ALU, Reinhard 1 division (below the knee both
 // return early — unless the compiler flattens the branch, which still costs only that much). With the
@@ -75,10 +83,9 @@ float TonemapOneMinusExpNeg(float y) {
 	return (y < 0.125) ? series : 1.0 - exp(-y);
 }
 
-// SoftClip rate u = a*S: the root of (1 - exp(-u)) / u = H/S, needs S > H > 0; d = (S - H) / S
-float TonemapSoftClipRate(float H, float S, float d) {
-	float r = max(H / S, 1e-4);
-	d = min(d, 1.0 - r);
+// SoftClip rate u = a*S: the root of (1 - exp(-u)) / u = r, for r = H/S and d = (S - H)/S, d > 0
+float TonemapSoftClipRate(float r, float d) {
+	r = max(r, 1e-4);
 	float u = d * (1.0 + r + r * d * (1.0 / 3.0)) / r;
 	[unroll] for (int i = 0; i < 2; i++) {
 		float e = TonemapOneMinusExpNeg(u);
@@ -93,8 +100,9 @@ float TonemapSoftClip_PQ(float I, float pqSrcPeak, float pqTgtPeak, float target
 	if (I <= pqKnee) return I;
 	float H = pqTgtPeak - pqKnee;
 	float S = pqSrcPeak - pqKnee;
-	if (S <= H || H <= 0.0) return min(I, pqTgtPeak);
-	float u = TonemapSoftClipRate(H, S, (pqSrcPeak - pqTgtPeak) / S);
+	float d = (pqSrcPeak - pqTgtPeak) / S;
+	if (S <= H || H <= 0.0 || d <= 0.0) return min(I, pqTgtPeak);
+	float u = TonemapSoftClipRate(H / S, d);
 	float t = (I - pqKnee) / S;
 	return min(pqKnee + H * TonemapOneMinusExpNeg(u * t) / TonemapOneMinusExpNeg(u), pqTgtPeak);
 }

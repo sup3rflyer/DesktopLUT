@@ -212,7 +212,10 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 	else
 		I_mapped = TonemapHardClip_PQ(I, pqTgtPeak);
 
-	if (headroom < margin) {
+	// No crossfade for SoftClip/Reinhard (1, 2): continuous into min(I, target) on their own
+	// (shared/tonemap_curves.h); the lerp would put a partial hard clip back at the target.
+	bool curveContinuousAtTarget = (tonemapCurve == 1 || tonemapCurve == 2);
+	if (headroom < margin && !curveContinuousAtTarget) {
 		float blend = headroom / margin;
 		I_mapped = lerp(min(I, pqTgtPeak), I_mapped, blend);
 	}

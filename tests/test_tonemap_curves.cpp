@@ -10,8 +10,9 @@
 //      Skips (with a message) only if no D3D11 device can be created.
 //   3. Both production pixel shaders compile with the shared text spliced in, and carry it verbatim.
 //
-// Keep TonemapCpu:: in lockstep with shared/tonemap_curves.h (and ApplyIChannel with
-// ApplyTonemappingICtCp in both shaders) — layer 2 fails if the HLSL drifts from this port.
+// Keep TonemapCpu:: in lockstep with shared/tonemap_curves.h — layer 2 fails if the HLSL drifts from
+// this port. ApplyIChannel mirrors ApplyTonemappingICtCp (duplicated in src/shader.h and
+// dwm_hook/hook_shader.h, NOT covered by layer 2) by hand: keep all three in step.
 
 #define _CRT_SECURE_NO_WARNINGS  // dwm_hook/hook_log.h (via hook_shader.h) calls fopen; /sdl makes C4996 an error
 #define NOMINMAX
@@ -59,9 +60,8 @@ template <typename R> R OneMinusExpNeg(R y) {
     return (y < R(0.125)) ? series : R(1) - std::exp(-y);
 }
 
-template <typename R> R SoftClipRate(R H, R S, R d) {
-    R r = (std::max)(H / S, R(1e-4));
-    d = (std::min)(d, R(1) - r);
+template <typename R> R SoftClipRate(R r, R d) {
+    r = (std::max)(r, R(1e-4));
     R u = d * (R(1) + r + r * d * (R(1) / R(3))) / r;
     for (int i = 0; i < 2; i++) {
         R e = OneMinusExpNeg(u);
@@ -75,8 +75,9 @@ template <typename R> R SoftClip(R I, R pqSrcPeak, R pqTgtPeak, R targetNits) {
     if (I <= pqKnee) return I;
     R H = pqTgtPeak - pqKnee;
     R S = pqSrcPeak - pqKnee;
-    if (S <= H || H <= R(0)) return (std::min)(I, pqTgtPeak);
-    R u = SoftClipRate(H, S, (pqSrcPeak - pqTgtPeak) / S);
+    R d = (pqSrcPeak - pqTgtPeak) / S;
+    if (S <= H || H <= R(0) || d <= R(0)) return (std::min)(I, pqTgtPeak);
+    R u = SoftClipRate(H / S, d);
     R t = (I - pqKnee) / S;
     return (std::min)(pqKnee + H * OneMinusExpNeg(u * t) / OneMinusExpNeg(u), pqTgtPeak);
 }
@@ -118,14 +119,16 @@ double Ef0f703Reinhard(double I, double src, double tgt, double n) {
 }
 
 // ApplyTonemappingICtCp's I-channel wrapper (identical in both shaders): source <= target -> clip,
-// then the 3 % PQ crossfade towards min(I, target) while the source barely exceeds the target.
-double ApplyIChannel(const Curve& curve, double I, double src, double tgt, double nits) {
+// then the 3 % PQ crossfade towards min(I, target) while the source barely exceeds the target — for
+// every curve except SoftClip/Reinhard (crossfade = false), which are continuous there on their own.
+// The historical curves ran with the crossfade (it predates ef0f703).
+double ApplyIChannel(const Curve& curve, bool crossfade, double I, double src, double tgt, double nits) {
     if (I <= 0.0) return I;
     double headroom = src - tgt;
     double margin = tgt * 0.03;
     if (headroom <= 0.0) return (std::min)(I, tgt);
     double m = curve(I, src, tgt, nits);
-    if (headroom < margin) {
+    if (headroom < margin && crossfade) {
         double b = headroom / margin;
         double clipped = (std::min)(I, tgt);
         m = clipped + b * (m - clipped);
@@ -285,7 +288,7 @@ TEST_CASE("Tonemap curves: SoftClip rate solve hits the exact root of (1 - exp(-
     for (double d : ds) {
         double r = 1.0 - d;
         double exact = ExactSoftClipRate(r);
-        double u = TonemapCpu::SoftClipRate<double>(r, 1.0, d);  // scale-free: only H/S matters
+        double u = TonemapCpu::SoftClipRate<double>(r, d);  // scale-free: only H/S matters
         INFO("d = " << d << "  u = " << u << "  exact = " << exact);
         CHECK(std::fabs(u - exact) <= 1e-9 * exact + 1e-15);
         CHECK(u >= 2.0 * d);        // bracket: a in (0, 1/H)
@@ -294,10 +297,26 @@ TEST_CASE("Tonemap curves: SoftClip rate solve hits the exact root of (1 - exp(-
         CHECK(std::fabs(r * u / -std::expm1(-u) - 1.0) < 1e-9);
 
         // float solve (what the GPU runs): the knee slope it implies is still 1 to ~1e-6
-        float uf = TonemapCpu::SoftClipRate<float>((float)r, 1.0f, (float)d);
+        float uf = TonemapCpu::SoftClipRate<float>((float)r, (float)d);
         CHECK(std::isfinite(uf));
         CHECK(std::fabs(r * (double)uf / -std::expm1(-(double)uf) - 1.0) < 1e-5);
     }
+}
+
+TEST_CASE("Tonemap curves: SoftClip rate survives r rounding to 1 (approximate GPU division)") {
+    // D3D11 allows 2.5 ulp division error, so H/S can come out as exactly 1.0 when S is a few ulp above
+    // H. d = (src - tgt)/S is still > 0 and must drive the solve: u >= 2d > 0, no 0/0.
+    for (float d : { 6e-8f, 1e-7f, 1e-6f, 1e-5f }) {
+        INFO("d = " << d);
+        float u = TonemapCpu::SoftClipRate<float>(1.0f, d);
+        CHECK(std::isfinite(u));
+        CHECK(u >= 2.0f * d);
+        CHECK(u <= 1.0f);
+        CHECK(TonemapCpu::OneMinusExpNeg<float>(u) > 0.0f);
+    }
+    // and d <= 0 (S <= H after rounding) falls back to identity + clip
+    CHECK(TonemapCpu::SoftClip<float>(0.7f, 0.8f, 0.8f, 1000.0f) == 0.7f);
+    CHECK(TonemapCpu::SoftClip<float>(0.9f, 0.8f, 0.8f, 1000.0f) == 0.8f);
 }
 
 TEST_CASE("Tonemap curves: slope 1 at the knee, source peak -> target, monotone, concave, <= target") {
@@ -319,8 +338,8 @@ TEST_CASE("Tonemap curves: slope 1 at the knee, source peak -> target, monotone,
             CHECK(f(src + 0.5 * (1.0 - src) + 1e-9, src, tgt, c.tgtNits) == tgt);
 
             // sweep over [knee, source peak]: monotone, concave, <= identity, <= target. Concavity by
-            // second differences, allowing 1e-11 PQ of value noise (SoftClip's series -> exp hand-off
-            // in 1 - exp(-y) leaves < 2e-12); a real convex bump would be orders of magnitude larger.
+            // second differences, allowing 1e-10 PQ of value noise (SoftClip's series -> exp hand-off
+            // in 1 - exp(-y) is a step of < 1e-11 PQ); a real convex bump would be orders larger.
             const int N = 400;
             double prev2 = 0.0, prev = k;
             bool monotone = true, concave = true, belowIdentity = true, belowTarget = true;
@@ -328,7 +347,7 @@ TEST_CASE("Tonemap curves: slope 1 at the knee, source peak -> target, monotone,
                 double I = k + (src - k) * i / N;
                 double v = f(I, src, tgt, c.tgtNits);
                 if (v < prev) monotone = false;
-                if (i >= 2 && v - 2.0 * prev + prev2 > 1e-11) concave = false;
+                if (i >= 2 && v - 2.0 * prev + prev2 > 1e-10) concave = false;
                 if (v > I + 1e-12) belowIdentity = false;
                 if (v > tgt) belowTarget = false;
                 prev2 = prev; prev = v;
@@ -356,9 +375,9 @@ TEST_CASE("Tonemap curves: continuous into identity + clip as the source peak fa
                     double I = (src + 0.02) * i / 2000.0;
                     double ref = (std::min)(I, tgt);
                     worstCurve = (std::max)(worstCurve, std::fabs(f(I, src, tgt, tgtNits) - ref));
-                    worstWrapped = (std::max)(worstWrapped, std::fabs(ApplyIChannel(f, I, src, tgt, tgtNits) - ref));
+                    worstWrapped = (std::max)(worstWrapped, std::fabs(ApplyIChannel(f, false, I, src, tgt, tgtNits) - ref));
                 }
-                // the curve itself is within O(source - target) of identity + clip (no margin blend needed)
+                // within O(source - target) of identity + clip: no crossfade needed (the wrapper skips it)
                 CHECK(worstCurve <= 2.0 * eps + 1e-12);
                 CHECK(worstWrapped <= 2.0 * eps + 1e-12);
             }
@@ -390,16 +409,16 @@ TEST_CASE("Tonemap curves: never darker than the pre-2026-03 curve, which is nev
 
 TEST_CASE("Tonemap curves: target 1700 dynamic, displayed nits pinned against an independent reference") {
     // Dynamic mode: source peak = max(detected frame peak, target) (SoftClip/Reinhard floor = target),
-    // through ApplyTonemappingICtCp's wrapper (3 % PQ crossfade included: it is active at 1800/2000).
-    // Reference values: exact SoftClip root by bracketing (Python/scipy brentq), double PQ, 2026-09-23.
+    // through ApplyTonemappingICtCp's wrapper (no crossfade for these two curves).
+    // Reference values: exact SoftClip root by bracketing (Python/scipy brentq), double PQ, 2026-09-24.
     const double tgtNits = 1700.0, tgt = PQ(tgtNits);
     const double content[] = { 400.0, 700.0, 1000.0, 1500.0, 1700.0, -1.0 /* = frame peak */ };
     struct Row { double peak; double softClip[6]; double reinhard[6]; };
     const Row rows[] = {
-        { 1800.0,  { 399.995, 698.427, 994.347, 1482.956, 1677.024, 1700.0 },
-                   { 399.995, 698.415, 994.320, 1482.932, 1677.014, 1700.0 } },
-        { 2000.0,  { 399.963, 688.619, 959.906, 1382.434, 1543.047, 1700.0 },
-                   { 399.962, 688.379, 959.371, 1381.817, 1542.590, 1700.0 } },
+        { 1800.0,  { 399.981, 693.886, 978.143, 1434.653, 1612.190, 1700.0 },
+                   { 399.980, 693.840, 978.042, 1434.562, 1612.152, 1700.0 } },
+        { 2000.0,  { 399.949, 684.440, 945.427, 1341.162, 1488.537, 1700.0 },
+                   { 399.948, 684.112, 944.703, 1340.341, 1487.932, 1700.0 } },
         { 4000.0,  { 399.834, 652.707, 844.455, 1083.528, 1160.513, 1700.0 },
                    { 399.808, 648.143, 834.221, 1067.553, 1143.569, 1700.0 } },
         { 10000.0, { 399.779, 639.088, 805.088, 994.974, 1052.381, 1700.0 },
@@ -410,18 +429,18 @@ TEST_CASE("Tonemap curves: target 1700 dynamic, displayed nits pinned against an
         for (int i = 0; i < 6; i++) {
             double cNits = content[i] < 0.0 ? row.peak : content[i];
             INFO("frame peak " << row.peak << "  content " << cNits << " nits");
-            CHECK(Nits(ApplyIChannel(NewSoftClip, PQ(cNits), src, tgt, tgtNits)) == doctest::Approx(row.softClip[i]).epsilon(2e-5));
-            CHECK(Nits(ApplyIChannel(NewReinhard, PQ(cNits), src, tgt, tgtNits)) == doctest::Approx(row.reinhard[i]).epsilon(2e-5));
+            CHECK(Nits(ApplyIChannel(NewSoftClip, false, PQ(cNits), src, tgt, tgtNits)) == doctest::Approx(row.softClip[i]).epsilon(2e-5));
+            CHECK(Nits(ApplyIChannel(NewReinhard, false, PQ(cNits), src, tgt, tgtNits)) == doctest::Approx(row.reinhard[i]).epsilon(2e-5));
         }
     }
 
     // The defect this replaces (ef0f703), and the original it restores, for the record:
     // 4000-nit frame: its peak showed at 985 (ef0f703) / 1250 (pre-March); 1000-nit content at 633 / 778
     double src4k = PQ(4000.0);
-    CHECK(Nits(ApplyIChannel(Ef0f703SoftClip, src4k, src4k, tgt, tgtNits)) == doctest::Approx(984.61).epsilon(1e-4));
-    CHECK(Nits(ApplyIChannel(PreMarchSoftClip, src4k, src4k, tgt, tgtNits)) == doctest::Approx(1249.65).epsilon(1e-4));
-    CHECK(Nits(ApplyIChannel(Ef0f703SoftClip, PQ(1000.0), src4k, tgt, tgtNits)) == doctest::Approx(632.82).epsilon(1e-4));
-    CHECK(Nits(ApplyIChannel(PreMarchSoftClip, PQ(1000.0), src4k, tgt, tgtNits)) == doctest::Approx(778.33).epsilon(1e-4));
+    CHECK(Nits(ApplyIChannel(Ef0f703SoftClip, true, src4k, src4k, tgt, tgtNits)) == doctest::Approx(984.61).epsilon(1e-4));
+    CHECK(Nits(ApplyIChannel(PreMarchSoftClip, true, src4k, src4k, tgt, tgtNits)) == doctest::Approx(1249.65).epsilon(1e-4));
+    CHECK(Nits(ApplyIChannel(Ef0f703SoftClip, true, PQ(1000.0), src4k, tgt, tgtNits)) == doctest::Approx(632.82).epsilon(1e-4));
+    CHECK(Nits(ApplyIChannel(PreMarchSoftClip, true, PQ(1000.0), src4k, tgt, tgtNits)) == doctest::Approx(778.33).epsilon(1e-4));
     // ef0f703's knee kink: slope H/S
     double k = 0.8 * tgt;
     CHECK((tgt - k) / (src4k - k) == doctest::Approx(0.6356).epsilon(1e-3));
@@ -438,7 +457,8 @@ TEST_CASE("Tonemap curves: the shared HLSL on WARP matches the CPU port") {
         FAIL("tonemap-curve GPU harness init failed: " << gpu.error);
     }
 
-    // Per case: a sweep of I over [0, 1.05 * src], then src itself, then the two knee-slope probes
+    // Per case: a sweep of I over [0, 1.05 * src] (I can exceed 1 slightly: dither), then src itself,
+    // then the two knee-slope probes
     const int kSweep = 512;
     std::vector<Case> cases = CaseGrid();
     std::vector<float> packed;
@@ -447,7 +467,7 @@ TEST_CASE("Tonemap curves: the shared HLSL on WARP matches the CPU port") {
         float k = c.tgtNits <= 203.0 ? 0.0f : tgt * 0.8f;
         float h = 1e-2f * (src - k);
         auto push = [&](float I) { packed.insert(packed.end(), { I, src, tgt, (float)c.tgtNits }); };
-        for (int i = 0; i <= kSweep; i++) push((std::min)(1.05f * src, 1.0f) * i / kSweep);
+        for (int i = 0; i <= kSweep; i++) push(1.05f * src * i / kSweep);
         push(src);
         push(k + h);
         push(k + 0.5f * h);

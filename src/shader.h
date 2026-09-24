@@ -335,24 +335,8 @@ float TonemapBT2390(float E, float Lw, float Lmax) {
     return saturate(h00 * P0 + h10 * M0 + h01 * P1 + h11 * M1);
 }
 
-float TonemapSoftClip(float x, float targetPeak, float targetNits) {
-    // Full range for SDR targets (no knee), shoulder-only for HDR
-    float knee = (targetNits <= 203.0f) ? 0.0f : targetPeak * 0.8f;
-    if (x <= knee) return x;
-    float overshoot = x - knee;
-    float headroom = targetPeak - knee;
-    return knee + headroom * (1.0f - exp(-overshoot / headroom));
-}
-
-float TonemapReinhard(float x, float targetPeak, float targetNits) {
-    // Full range for SDR targets (no knee), shoulder-only for HDR
-    float knee = (targetNits <= 203.0f) ? 0.0f : targetPeak * 0.8f;
-    if (x <= knee) return x;
-    float overshoot = x - knee;
-    float headroom = targetPeak - knee;
-    // Reinhard-style hyperbolic compression of overshoot
-    return knee + headroom * overshoot / (overshoot + headroom);
-}
+// (Linear-space SoftClip/Reinhard removed 2026-09: never called; the PQ-native pair in
+// shared/tonemap_curves.h is the only copy.)
 
 // Hard clip - simple clamp at target (for colorists to see clipping)
 float TonemapHardClip(float x, float targetPeak, float targetNits) {
@@ -536,10 +520,11 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 
     // Crossfade between hard clip and curve when source peak barely exceeds target
     // With breathing room (BT.2390/BT.2446A): headroom is always large, blend=1, crossfade is moot
-    // Without breathing room (SoftClip/Reinhard/HardClip): smooth transition prevents flicker.
-    // SoftClip/Reinhard already tend to min(I, target) as source -> target (continuous on their own);
-    // the lerp keeps their properties (slope 1 at the knee, source peak -> target, monotone, <= target).
-    if (headroom < margin) {
+    // HardClip: both ends are min(I, target), crossfade is the identity.
+    // Not for SoftClip/Reinhard (1, 2): they tend to min(I, target) as source -> target on their own
+    // (shared/tonemap_curves.h), and the lerp would put a partial hard clip back at the target.
+    bool curveContinuousAtTarget = (tonemapCurve > 0.5f && tonemapCurve < 2.5f);
+    if (headroom < margin && !curveContinuousAtTarget) {
         float blend = headroom / margin;
         I_mapped = lerp(min(I, pqTgtPeak), I_mapped, blend);
     }
