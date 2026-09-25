@@ -213,6 +213,8 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
       unchanged, clamped 3.83 → 3.50 predicted, input-noise gain OOG p99 26 → 1.8 JND, no ramp step > 1 JND,
       held-out CV primaries 5.10 → 4.03 (120740: 11.59 → 10.38). It also keeps drives where the panel is
       verified to decode colorimetrically (drives > 1 % outside native 56 % → 29 %).
+      With a level-edge target space (``model.space.level_gamut``, design D4) the solve point is re-mapped after
+      the top projection (the edge depends on luminance); nothing else changes.
     """
     if oog_solve not in OOG_SOLVES:
         raise ValueError(f"oog_solve must be one of {OOG_SOLVES}, got {oog_solve!r}")
@@ -312,6 +314,11 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
                 over = np.max(solve, axis=1) > level + 1e-9
                 if np.any(over):
                     solve[over] = project_to_top(solve[over], level, transfer=model.target.transfer)
+                    if getattr(space, "level_gamut", None) is not None:
+                        # Level edge (D4): the top projection LOWERED these points' luminance, and the confirmed
+                        # edge is narrower at lower luminance — re-map so no guard node aims outside the polygon
+                        # at its new level (the full-drive triangle does not depend on luminance: dict path as is).
+                        solve[over] = np.clip(np.nan_to_num(space.reachable_signal(solve[over])), 0.0, 1.0)
             corrected = corrected.copy()
             corrected[g] = _solve_at(model, solve, signal_points, max_correction=max_correction,
                                      n_iterations=n_iterations, fade_width=fade_width)

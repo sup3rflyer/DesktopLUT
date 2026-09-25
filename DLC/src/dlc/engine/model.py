@@ -220,12 +220,45 @@ def _ray_exit(origin: np.ndarray, dirs: np.ndarray, tri: np.ndarray) -> np.ndarr
     return t
 
 
+def _ray_exit_poly(origin: np.ndarray, dirs: np.ndarray, polys: np.ndarray) -> np.ndarray:
+    """Distance from ``origin`` (2,) along each unit direction ``dirs`` (N, 2) to ITS OWN closed polygon
+    ``polys[n]`` ((N, M, 2), containing the origin) — the first positive edge hit, ``inf`` when none. The
+    per-row-polygon analogue of :func:`_ray_exit` (the level edge's polygon depends on each row's luminance)."""
+    polys = np.asarray(polys, dtype=float)
+    n, m, _ = polys.shape
+    t = np.full(n, np.inf)
+    for k in range(m):
+        a = polys[:, k]
+        e = polys[:, (k + 1) % m] - a
+        rhs = a - origin
+        det = dirs[:, 1] * e[:, 0] - dirs[:, 0] * e[:, 1]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tk = (rhs[:, 1] * e[:, 0] - rhs[:, 0] * e[:, 1]) / det
+            sk = (dirs[:, 0] * rhs[:, 1] - dirs[:, 1] * rhs[:, 0]) / det
+        ok = np.isfinite(tk) & (tk > 0.0) & (sk >= -1e-9) & (sk <= 1.0 + 1e-9)
+        t = np.where(ok, np.minimum(t, tk), t)
+    return t
+
+
+def _is_level_gamut(obj: Any) -> bool:
+    """A luminance-dependent reachable gamut (``engine.level_gamut.ReachableGamut``, duck-typed) rather than a
+    full-drive primaries dict / array."""
+    return (obj is not None and not isinstance(obj, (dict, list, tuple, np.ndarray))
+            and hasattr(obj, "boundary_uv") and hasattr(obj, "full_primaries"))
+
+
 class _VertexGeometry:
     """Precomputed u'v' geometry of the target and native gamut triangles around their SHARED white:
     both triangles, the white, and the six hue anchors (R, Y, G, C, B, M — primaries and the
-    white-balanced two-channel secondaries) of each gamut, as unwrapped angles."""
+    white-balanced two-channel secondaries) of each gamut, as unwrapped angles.
 
-    def __init__(self, native: "colour.RGB_Colourspace", target_cs: "colour.RGB_Colourspace"):
+    ``level`` (optional): a luminance-dependent reachable gamut (``engine.level_gamut``). The triangles and the
+    target anchors above stay the full-drive ones; the level path (:func:`_level_vertex_map`) takes each row's
+    native boundary and native anchors from ``level`` at the row's own luminance instead."""
+
+    def __init__(self, native: "colour.RGB_Colourspace", target_cs: "colour.RGB_Colourspace", *,
+                 level: Any = None):
+        self.level = level
         self.white = _xy_to_uv(np.asarray(native.whitepoint, dtype=float))[0]
         self.tri_native = _xy_to_uv(np.asarray(native.primaries, dtype=float))
         self.tri_target = _xy_to_uv(np.asarray(target_cs.primaries, dtype=float))
@@ -258,6 +291,21 @@ class _VertexGeometry:
         th = np.mod(theta - self.base, 2.0 * np.pi)
         return np.interp(th, self.anchor_target, self.anchor_native) - th
 
+    def level_hue_offset(self, theta: np.ndarray, lum: np.ndarray) -> np.ndarray:
+        """:meth:`hue_offset` with PER-ROW native anchors — the level gamut's six anchors at each row's luminance,
+        unwrapped against the target's exactly as the full-drive anchors are (the level edge's gate guarantees the
+        target's R-Y-G-C-B-M order at every level, and interpolation between levels preserves it)."""
+        at6 = self.anchor_target[:6]
+        raw = np.asarray(self.level.anchor_angles(lum), dtype=float)
+        an = at6[None, :] + (np.mod(raw - self.base - at6[None, :] + np.pi, 2.0 * np.pi) - np.pi)
+        an = np.concatenate([an, an[:, :1] + 2.0 * np.pi], axis=1)
+        th = np.mod(theta - self.base, 2.0 * np.pi)
+        idx = np.clip(np.searchsorted(self.anchor_target, th, side="right") - 1, 0, 5)
+        rows = np.arange(len(th))
+        t0, t1 = self.anchor_target[idx], self.anchor_target[idx + 1]
+        n0, n1 = an[rows, idx], an[rows, idx + 1]
+        return n0 + (th - t0) / (t1 - t0) * (n1 - n0) - th
+
 
 def _vertex_map_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace", scale: float,
                          geom: _VertexGeometry, *, rel_eps: float = 1e-5) -> np.ndarray:
@@ -287,7 +335,13 @@ def _vertex_map_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace", 
     closer to perceptually uniform for the hue-sector interpolation. Straight rays + explicit anchors
     avoid ICtCp's curved blue hue line entirely. ``scale`` normalizes absolute XYZ to the native
     colour-space's [0, 1] domain (10000 for PQ, peak nits for power), as in :func:`_chroma_clip_to_gamut`.
+
+    With a luminance-dependent gamut on ``geom`` (``geom.level``) the same correspondence runs on the level
+    edge instead — :func:`_level_vertex_map`; without one (every run before D4 and every run with the edge off)
+    the code below is untouched.
     """
+    if geom.level is not None:
+        return _level_vertex_map(xyz_abs, native, scale, geom, rel_eps=rel_eps)
     xyz_abs = np.asarray(xyz_abs, dtype=float)
     out = xyz_abs.copy()
     rgb = colour.XYZ_to_RGB(xyz_abs / scale, native)
@@ -327,6 +381,90 @@ def _vertex_map_to_gamut(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace", 
     return out
 
 
+_LEVEL_CHUNK = 32768     # rows per level-map chunk: bounds the (rows, 48, 2) per-row polygons to ~25 MB
+
+
+def _level_outside(xyz_abs: np.ndarray, geom: _VertexGeometry, *,
+                   rel_eps: float = 1e-5) -> tuple[np.ndarray, Optional[dict[str, np.ndarray]]]:
+    """Which rows lie OUTSIDE the level edge at their own luminance (``r > r_edge·(1 + rel_eps)`` about the
+    white in u'v'; black rows never), plus the per-row geometry the map reuses. The ONE membership test of the
+    level path — the map moves exactly these rows and ``score_hdr`` / ``cube_quality`` call exactly these rows
+    clamped."""
+    xyz_abs = np.asarray(xyz_abs, dtype=float).reshape(-1, 3)
+    lum = xyz_abs[:, 1]
+    outside = np.zeros(len(xyz_abs), dtype=bool)
+    lit = np.where(np.isfinite(lum) & (lum > 1e-12))[0]
+    if not lit.size:
+        return outside, None
+    src = xyz_abs[lit]
+    d = _xyz_to_uv(src) - geom.white
+    r = np.hypot(d[:, 0], d[:, 1])
+    dirs = d / np.where(r > 1e-12, r, 1e-12)[:, None]
+    polys = geom.level.boundary_uv(src[:, 1])
+    r_e = _ray_exit_poly(geom.white, dirs, polys)
+    move = r > r_e * (1.0 + rel_eps)
+    outside[lit[move]] = True
+    return outside, {"idx": lit, "r": r, "dirs": dirs, "theta": np.arctan2(d[:, 1], d[:, 0]),
+                     "polys": polys, "r_e": r_e, "move": move}
+
+
+def _level_vertex_map(xyz_abs: np.ndarray, native: "colour.RGB_Colourspace", scale: float,
+                      geom: _VertexGeometry, *, rel_eps: float = 1e-5) -> np.ndarray:
+    """The vertex-correspondence map of :func:`_vertex_map_to_gamut` on the LUMINANCE-DEPENDENT confirmed edge
+    (design D4 — ``engine.level_gamut``): a dim primary is less saturated than the full-drive one on a FALD panel
+    (LED pedestal through the closed cells), so the reachable boundary and the native hue anchors are taken at
+    each row's OWN luminance.
+
+    * A row moves when its u'v' radius about the white exceeds the ray exit ``r_e`` of the level polygon at its
+      Y (relative ``rel_eps``); every other row is returned BIT-IDENTICAL (bar the container-overflow clip below).
+    * ``u = clip((r − r_e) / (r_t − r_e))`` with ``r_t`` the target (Rec.2020) triangle exit — how far out the row
+      sits between the level edge and the target edge; the landing hue is ``θ + u·Δ(θ)`` with Δ the sector map
+      from the target anchors to the level anchors at that Y; the landing point is ON the level polygon, CIE Y
+      preserved. So a Rec.2020 primary at luminance Y lands exactly on the measured pure-channel vertex at Y.
+    * ONLY the container-overflow safety clip applies (native max > 1 + 1e-4, near 10000 nits — never at a
+      patch-capped level). No negative clip: the physical polygon may sit ≤ 0.0005 u'v' outside the straight
+      full-drive edge at the secondaries (one pedestal from the larger code), where native RGB goes a hair
+      negative — the panel renders it; clipping would move it off the measured edge.
+    * Idempotent: a landed row lies on the polygon (r ≤ r_e·(1 + rel_eps)) and is left untouched by a second pass.
+    Chunked at :data:`_LEVEL_CHUNK` rows."""
+    xyz_abs = np.asarray(xyz_abs, dtype=float)
+    out = xyz_abs.copy()
+    for start in range(0, len(xyz_abs), _LEVEL_CHUNK):
+        part = xyz_abs[start:start + _LEVEL_CHUNK]
+        outside, g = _level_outside(part, geom, rel_eps=rel_eps)
+        if g is None:
+            continue
+        idx = g["idx"] + start
+        src = xyz_abs[idx]
+        move = g["move"]
+        # Inside the edge but beyond the container's full scale: the legacy per-channel safety clip.
+        rgb0 = colour.XYZ_to_RGB(src / scale, native)
+        over0 = ~move & (np.max(rgb0, axis=1) > 1.0 + 1e-4)
+        if np.any(over0):
+            out[idx[over0]] = colour.RGB_to_XYZ(np.clip(rgb0[over0], 0.0, 1.0), native) * scale
+        if not np.any(move):
+            continue
+        m = np.where(move)[0]
+        lum = src[m, 1]
+        r, r_e, theta = g["r"][m], g["r_e"][m], g["theta"][m]
+        r_t = _ray_exit(geom.white, g["dirs"][m], geom.tri_target)
+        span = r_t - r_e
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = np.where(span > 1e-9, np.clip((r - r_e) / span, 0.0, 1.0), 1.0)
+        theta2 = theta + u * geom.level_hue_offset(theta, lum)
+        dirs2 = np.stack([np.cos(theta2), np.sin(theta2)], axis=1)
+        uv2 = geom.white + dirs2 * _ray_exit_poly(geom.white, dirs2, g["polys"][m])[:, None]
+        xy2 = _uv_to_xy(uv2)
+        y_safe = np.where(xy2[:, 1] > 1e-12, xy2[:, 1], 1e-12)
+        mapped = np.stack([xy2[:, 0] * lum / y_safe, lum, (1.0 - xy2[:, 0] - xy2[:, 1]) * lum / y_safe], axis=1)
+        rgb2 = colour.XYZ_to_RGB(mapped / scale, native)
+        over = np.max(rgb2, axis=1) > 1.0 + 1e-4
+        if np.any(over):
+            mapped[over] = colour.RGB_to_XYZ(np.clip(rgb2[over], 0.0, 1.0), native) * scale
+        out[idx[m]] = mapped
+    return out
+
+
 class TargetSpace:
     """Signal ↔ ideal-XYZ ↔ ICtCp conversions for a :class:`Target`.
 
@@ -340,6 +478,13 @@ class TargetSpace:
     legacy constant-ICtCp-intensity chroma clip (:func:`_chroma_clip_to_gamut`) — so the cube
     build AND verify treat a gamut clip as a clip rather than chasing it (#C3). ``None`` ⇒ no
     clamp (the prior behaviour).
+
+    ``reachable_primaries`` may instead be a luminance-dependent reachable gamut (``engine.level_gamut`` — the
+    "level edge", design D4): the vertex map then runs on the confirmed edge AT EACH TARGET'S LUMINANCE
+    (:func:`_level_vertex_map`). It requires ``oog_mapping == "vertex"`` (``ValueError`` otherwise) and the
+    gamut's white must be the target white; ``self._reachable`` stays the gamut's FULL-DRIVE triangle
+    (``full_primaries``) for the container clip and anything that needs a triangle. A dict keeps the code path
+    of every earlier run bit-identical.
     """
 
     def __init__(self, target: Target, *, reachable_primaries: Any = None):
@@ -348,6 +493,12 @@ class TargetSpace:
             raise ValueError(f"unknown oog_mapping {mapping!r} (expected one of {OOG_MAPPINGS})")
         self.oog_mapping = mapping
         self.target = target
+        self.level_gamut = None
+        if _is_level_gamut(reachable_primaries):
+            if mapping != "vertex":
+                raise ValueError(f"a level-edge reachable gamut requires oog_mapping 'vertex', got {mapping!r}")
+            self.level_gamut = reachable_primaries
+            reachable_primaries = reachable_primaries.full_primaries
         base = colour.RGB_COLOURSPACES[target.colourspace]
         if target.white_xy is not None:
             # Rebuild the colour-space with the SPD-derived whitepoint so
@@ -369,7 +520,12 @@ class TargetSpace:
             white = (target.white_xy if target.white_xy is not None
                      else tuple(float(c) for c in self.colourspace.whitepoint))
             self._reachable = _native_colourspace(reachable_primaries, white)
-            if self.oog_mapping == "vertex":
+            if self.level_gamut is not None:
+                gw = tuple(float(c) for c in self.level_gamut.white_xy)
+                if max(abs(gw[0] - float(white[0])), abs(gw[1] - float(white[1]))) > 1e-6:
+                    raise ValueError(f"level-edge gamut white {gw} is not the target white {tuple(white)}")
+                self._vertex_geom = _VertexGeometry(self._reachable, self.colourspace, level=self.level_gamut)
+            elif self.oog_mapping == "vertex":
                 self._vertex_geom = _VertexGeometry(self._reachable, self.colourspace)
 
     # -- signal -> ideal absolute XYZ -------------------------------------
@@ -427,6 +583,15 @@ class TargetSpace:
         negatives on the PQ path) — the caller quantises and clips to the code-value range."""
         return self.xyz_to_signal(self.ideal_xyz(signal_rgb))
 
+    # -- level edge: membership --------------------------------------------
+    def level_clamped(self, raw_xyz: np.ndarray) -> np.ndarray:
+        """With a level-edge gamut: which RAW (unmapped) targets lie outside the confirmed edge at their own
+        luminance — exactly the rows the map moves (the "gamut_clamped" definition of the level path, D4).
+        ``ValueError`` without a level gamut (the full-drive paths keep their own clamp-gap definition)."""
+        if self.level_gamut is None:
+            raise ValueError("level_clamped needs a level-edge reachable gamut")
+        return _level_outside(np.asarray(raw_xyz, dtype=float).reshape(-1, 3), self._vertex_geom)[0]
+
     # -- absolute XYZ <-> ICtCp -------------------------------------------
     @staticmethod
     def xyz_to_ictcp(xyz_abs: np.ndarray) -> np.ndarray:
@@ -476,6 +641,10 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
     All-``False`` when ``reachable_primaries`` is ``None`` (no clamp). ``oog_mapping`` selects the
     out-of-gamut policy (:data:`OOG_MAPPINGS`) — pass the run's engine-target value so verify
     scores against the same clamped target the cube was built for.
+
+    ``reachable_primaries`` may be a level-edge gamut (``engine.level_gamut``, vertex policy only): the target is
+    then the level-edge map and ``gamut_clamped`` = the raw target lies outside the confirmed edge AT ITS OWN
+    luminance (:meth:`TargetSpace.level_clamped`).
     """
     target = Target.hdr_rec2020_pq(white_xy=white_xy, oog_mapping=oog_mapping)
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
@@ -497,8 +666,11 @@ def score_hdr(signal_rgb: np.ndarray, measured_xyz: np.ndarray, *,
         # gamut test), whose absolute move can be far below a nit; the legacy chroma clip's smallest
         # real gap (≥ ~0.5 nit, its absolute eps short-circuit) clears it trivially.
         raw_ideal = TargetSpace(target).ideal_xyz(sig)
-        tol = 1e-9 + 1e-6 * np.sum(np.abs(raw_ideal), axis=1)
-        gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > tol[:, None], axis=1)
+        if space.level_gamut is not None:
+            gamut_clamped = space.level_clamped(raw_ideal)
+        else:
+            tol = 1e-9 + 1e-6 * np.sum(np.abs(raw_ideal), axis=1)
+            gamut_clamped = np.any(np.abs(raw_ideal - ideal_xyz) > tol[:, None], axis=1)
     else:
         gamut_clamped = np.zeros(len(sig), dtype=bool)
     delta = space.xyz_to_ictcp(meas) - space.xyz_to_ictcp(ideal_xyz)

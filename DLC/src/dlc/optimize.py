@@ -504,6 +504,11 @@ def optimize_cube(
         return out
     # reachable_primaries (the panel's measured native gamut) clamps the ideal target onto what the
     # panel can physically render, so build + verify score a gamut clip as a clip, not chase it (#C3).
+    # ``reachable_primaries`` may be a level-edge gamut (engine.level_gamut, design D4) — the rbf engine's target
+    # space then maps onto the confirmed edge at each target's luminance. The labelled experiment engines only
+    # understand a triangle: they keep the gamut's full-drive primaries.
+    if cfg.engine != "rbf" and hasattr(reachable_primaries, "full_primaries"):
+        reachable_primaries = reachable_primaries.full_primaries
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
     projection = (cfg.oog_solve == "projection" and reachable_primaries is not None
                   and cfg.engine == "rbf")

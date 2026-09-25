@@ -345,6 +345,15 @@ def build(args, ctx: RunContext) -> StageResult:
         params["channel_peak_xyz"] = [[round(v, 6) for v in xyz] for xyz in channel_peak_xyz]
         params["peak_chroma"] = peak_chroma
         params["dark_floor"] = {"nits": round(dark_floor_nits, 4), **dark_floor_info}
+        # Luminance-dependent confirmed gamut edge (design D4): ALWAYS fitted + persisted on an HDR build (evidence
+        # in the MHC digest); whether a run USES it is decided at the first 3D-LUT build (profile key level_edge,
+        # default off — metrics.run_level_edge). Anchored on the white the ENGINE target uses (the orchestrator
+        # passes its resolved white), so the edge's anchors/gates and the verify target agree.
+        le_white = (_common.parse_target_white_xy(getattr(args, "level_edge_white_xy", None))
+                    or target_white_xy)
+        params["level_edge"] = level_edge_block(
+            samples, params["channel_peak_xyz"], white_xy=le_white, floor_nits=params["dark_floor"]["nits"],
+            wrgb_nonadditive=peak_chroma.get("wrgb_nonadditive"))   # None = verdict unavailable (refused)
     elif len(gray_patches) >= 2:
         # SDR closed-loop refine (stage_refine_mhc_grayscale) consumes the dark floor too.
         params["dark_floor"] = {"nits": round(sdr_dark_floor_nits, 4), **sdr_dark_floor_info}
@@ -374,6 +383,7 @@ def build(args, ctx: RunContext) -> StageResult:
     }
     if is_hdr:
         result.metrics["peak_chroma"] = peak_chroma
+        result.metrics["level_edge"] = level_edge_digest(params.get("level_edge"))
     result.note(
         "Matrix carries primaries + native-white->target-white; base grayscale is tone-only toward native white. "
         f"Target white is {params['white']['x']},{params['white']['y']} ({target_white_source}); "
@@ -384,6 +394,35 @@ def build(args, ctx: RunContext) -> StageResult:
         "reasons": ["candidate MHC params derived from a measured raw panel"],
     }
     return result
+
+
+def level_edge_block(samples, channel_peak_xyz, *, white_xy, floor_nits, wrgb_nonadditive) -> dict:
+    """The ``mhc_params["level_edge"]`` block (``engine.level_gamut.fit_level_edge``) from a raw (identity-MHC) TI3's
+    samples. Evidence, never a precondition: any failure becomes ``status: "unavailable"`` with the reason, so the
+    MHC build itself can never break on it. Shared with ``python -m dlc.stages.level_edge``."""
+    try:
+        import numpy as np
+
+        from ..engine.level_gamut import fit_level_edge
+        rgb = np.array([s.rgb for s in samples], dtype=float)
+        xyz = np.array([s.xyz for s in samples], dtype=float)
+        return fit_level_edge(rgb, xyz, channel_peak_xyz=channel_peak_xyz, white_xy=white_xy,
+                              floor_nits=floor_nits, wrgb_nonadditive=wrgb_nonadditive)
+    except Exception as exc:  # noqa: BLE001 - an evidence block must never break the MHC build
+        return {"schema": 1, "status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def level_edge_digest(block) -> dict | None:
+    """Compact view of a level-edge block for a digest (the full reads stay in the run record)."""
+    if not isinstance(block, dict):
+        return None
+    ped = block.get("pedestal") or {}
+    return {"status": block.get("status"), "reason": block.get("reason"), "key": block.get("key"),
+            "floor_nits": block.get("floor_nits"),
+            "pedestal": ({k: ped.get(k) for k in ("K_xy", "c", "gamma", "fit_rms_duv", "fit_max_duv", "identifiable")}
+                         if ped else None),
+            "gates": {k: bool(v.get("ok")) for k, v in (block.get("gates") or {}).items() if isinstance(v, dict)},
+            "summary": block.get("summary")}
 
 
 def _grey_reads_with_noise(source, grey_samples, xy_from_xyz):

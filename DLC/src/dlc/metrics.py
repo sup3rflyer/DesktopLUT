@@ -89,6 +89,162 @@ def run_oog_mapping(calib: dict | None, default: str = "vertex") -> str:
     return default
 
 
+# ---------------------------------------------------------------------------
+# Level edge (design D4): the luminance-dependent confirmed gamut edge
+# ---------------------------------------------------------------------------
+LEVEL_EDGE_SWITCHES = ("off", "auto")
+LEVEL_EDGE_STAGE_MODES = ("run", "off", "on")
+# Stages whose presence (without a memo) marks a record built / verified before the level edge existed.
+_LEVEL_EDGE_LEGACY_STAGES = ("build-install-3dlut", "measure:verify", "verify")
+
+
+def level_edge_block(mhc_params: dict | None) -> dict | None:
+    """The MHC build's persisted level-edge block (``mhc_params["level_edge"]``), or None."""
+    block = (mhc_params or {}).get("level_edge")
+    return block if isinstance(block, dict) else None
+
+
+def run_level_edge(calib: dict | None, mhc_params: dict | None, *, switch: str = "off",
+                   oog_mapping: str = "vertex", oog_solve: str = "direct", is_hdr: bool = True,
+                   falsify: Any = None, white_xy: Any = None) -> tuple[Any, dict[str, Any]]:
+    """Whether a run's 3D-LUT build + verify use the level edge — ``(gamut | None, memo)``; the orchestrator pins
+    ``memo`` in ``calib["oog_level_edge"]`` = ``{enabled, key, reason, falsification}`` at the FIRST 3D-LUT build,
+    so a resume and the stage CLIs score against the target the cube was built for.
+
+    * A pinned memo is honoured: disabled ⇒ None; enabled ⇒ the gamut rebuilt from ``mhc_params`` — unless the
+      block's key no longer matches (``memo["key_mismatch"] = True``, gamut None: the caller decides — a seam when a
+      cube was already built for the pinned edge).
+    * No memo but the record already built a cube / verified (a DONE stage record — an aborted attempt does not
+      count) ⇒ OFF (a legacy record keeps scoring bit-identically).
+    * Fresh record ⇒ enabled only when HDR ∧ switch "auto" ∧ oog_mapping "vertex" ∧ oog_solve "projection" ∧ the
+      block's deterministic gates passed (status "ok") ∧ ``falsify(gamut)`` passes (no measured read > 1 JND outside
+      the edge). A falsification that fails — or cannot decide — returns the gamut with ``enabled: False,
+      falsified: True``: a judgment for the LLM at the ``level_edge_falsified`` seam, never silently applied.
+
+    ``white_xy`` (the engine target's white): an edge anchored on another white is refused (fresh) or reported as a
+    mismatch (pinned) — its anchors and gates were computed around its own white, and the target space refuses it.
+
+    Every refusal carries its reason. Engine code is imported lazily (the spine stays dependency-free)."""
+    c = calib or {}
+    block = level_edge_block(mhc_params)
+    cur_key = block.get("key") if block else None
+    memo = c.get("oog_level_edge")
+    if isinstance(memo, dict):
+        rec = dict(memo)
+        if not rec.get("enabled"):
+            return None, rec
+        if block is None or block.get("status") != "ok" or cur_key != rec.get("key"):
+            rec.update(key_mismatch=True, current_key=cur_key)
+            return None, rec
+        if not _level_edge_white_matches(block, white_xy):
+            rec.update(key_mismatch=True, current_key=cur_key, white_mismatch=True)
+            return None, rec
+        try:
+            return _level_gamut(block), rec
+        except ValueError as exc:                       # a block whose stored key no longer matches its content
+            rec.update(key_mismatch=True, current_key=None, error=str(exc))
+            return None, rec
+    rec: dict[str, Any] = {"enabled": False, "key": cur_key, "reason": None, "falsification": None}
+    stages = c.get("stages") or {}
+    if any(isinstance(stages.get(k), dict) and stages[k].get("status", "done") == "done"
+           for k in _LEVEL_EDGE_LEGACY_STAGES):
+        rec["reason"] = "legacy record: a cube was built / verified before the level-edge memo existed"
+        return None, rec
+    if not is_hdr:
+        rec["reason"] = "SDR run (the level edge is an HDR construct)"
+    elif str(switch) != "auto":
+        rec["reason"] = f"profile level_edge is {switch!r}"
+    elif oog_mapping != "vertex":
+        rec["reason"] = f"oog_mapping {oog_mapping!r} (the level edge rides the vertex map)"
+    elif oog_solve != "projection":
+        rec["reason"] = f"oog_solve {oog_solve!r} (the level edge ships with the projection solve only)"
+    elif block is None:
+        rec["reason"] = "the MHC build persisted no level-edge block"
+    elif block.get("status") != "ok":
+        rec["reason"] = f"level edge {block.get('status')}: {block.get('reason')}"
+    elif not _level_edge_white_matches(block, white_xy):
+        rec["reason"] = (f"the level edge is anchored on white {block.get('white_xy')}, the engine target uses "
+                         f"{[round(float(c), 6) for c in white_xy]}")
+    if rec["reason"] is not None:
+        return None, rec
+    try:
+        gamut = _level_gamut(block)
+    except ValueError as exc:
+        rec["reason"] = f"level edge could not be built: {exc}"
+        return None, rec
+    if falsify is not None:
+        fals = falsify(gamut)
+        rec["falsification"] = fals
+        if not (isinstance(fals, dict) and fals.get("passed") is True):
+            rec.update(falsified=True, reason=("measured reads lie more than 1 JND outside the edge"
+                                               if isinstance(fals, dict) and fals.get("passed") is False
+                                               else "the falsification could not decide (no reads at the floor)"))
+            return gamut, rec
+    rec["enabled"] = True
+    return gamut, rec
+
+
+def stage_level_gamut(calib: dict | None, mhc_params: dict | None, *, mode: str = "run",
+                      oog_mapping: str = "vertex", white_xy: Any = None) -> tuple[Any, str | None]:
+    """The level gamut a stage CLI (score / report) scores with — ``(gamut | None, note)``. ``mode`` "run" (default)
+    follows the run's pinned memo (enabled and the key still matching; anything else ⇒ None, the note says why);
+    "off" never uses it; "on" forces the MHC build's block when its gates passed (vertex policy only) — an explicit
+    what-if, labelled as such. ``white_xy`` (the scoring white): an edge anchored on a different white is not used
+    (the note says so) — its hue anchors and gates were computed around its own white."""
+    gamut, note = _stage_level_gamut(calib, mhc_params, mode=mode, oog_mapping=oog_mapping)
+    if gamut is not None and white_xy is not None:
+        gw = gamut.white_xy
+        if max(abs(float(gw[0]) - float(white_xy[0])), abs(float(gw[1]) - float(white_xy[1]))) > 1e-6:
+            return None, (f"level edge not used: it is anchored on white {tuple(round(float(c), 6) for c in gw)}, "
+                          f"the score uses {tuple(round(float(c), 6) for c in white_xy)}")
+    return gamut, note
+
+
+def _stage_level_gamut(calib: dict | None, mhc_params: dict | None, *, mode: str,
+                       oog_mapping: str) -> tuple[Any, str | None]:
+    if mode not in LEVEL_EDGE_STAGE_MODES:
+        raise ValueError(f"level-edge mode must be one of {LEVEL_EDGE_STAGE_MODES}, got {mode!r}")
+    if mode == "off":
+        return None, "level edge off (--level-edge off)"
+    block = level_edge_block(mhc_params)
+    if mode == "on":
+        if oog_mapping != "vertex":
+            return None, f"level edge needs the vertex OOG policy (run uses {oog_mapping!r})"
+        if block is None or block.get("status") != "ok":
+            return None, ("no level-edge block in the run record" if block is None
+                          else f"level edge {block.get('status')}: {block.get('reason')}")
+        try:
+            return _level_gamut(block), "level edge forced on (--level-edge on)"
+        except ValueError as exc:
+            return None, f"level edge unusable: {exc}"
+    memo = (calib or {}).get("oog_level_edge")
+    if not isinstance(memo, dict):
+        return None, None
+    if not memo.get("enabled"):
+        return None, f"level edge off for this run ({memo.get('reason')})"
+    if block is None or block.get("status") != "ok" or block.get("key") != memo.get("key"):
+        return None, "the run's pinned level-edge key no longer matches mhc_params.level_edge — scored full-drive"
+    try:
+        return _level_gamut(block), "level edge (the run's pinned memo)"
+    except ValueError as exc:
+        return None, f"the run's level-edge block is unusable ({exc}) — scored full-drive"
+
+
+def _level_edge_white_matches(block: dict, white_xy: Any) -> bool:
+    if white_xy is None:
+        return True
+    bw = block.get("white_xy") or (None, None)
+    try:
+        return max(abs(float(bw[0]) - float(white_xy[0])), abs(float(bw[1]) - float(white_xy[1]))) <= 1e-6
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def _level_gamut(block: dict) -> Any:
+    from .engine.level_gamut import LevelGamut
+    return LevelGamut.from_params(block)
+
+
 def reachable_primaries_from_mhc_params(mhc_params: dict | None) -> dict | None:
     """The panel's measured native primaries from a run record's ``mhc_params`` block
     (``dlc_state.json``, persisted at build), in the ``{"R": [x, y], ...}`` shape the

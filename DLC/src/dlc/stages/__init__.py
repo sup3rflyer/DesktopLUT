@@ -30,4 +30,5 @@ __all__ = [
     "report",
     "simulate",
     "fald_profile",
+    "level_edge",
 ]

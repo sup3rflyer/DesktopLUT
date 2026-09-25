@@ -238,6 +238,11 @@ class TargetSpec:
     # "vertex" (default, owner decision 2026-09-23: luminance-preserving, target primaries/secondaries
     # onto the panel's measured native ones) or "chroma-clip" (the legacy constant-ICtCp clip).
     oog_mapping: str = "vertex"
+    # Luminance-dependent confirmed gamut edge (design D4) — profile key ``level_edge``: "off" (DEFAULT: the
+    # vertex map clamps onto the full-drive native triangle, bit-identical to every earlier run) or "auto" (an
+    # HDR vertex run built with the projection solve maps onto the edge the MHC build fitted from the raw ramps,
+    # when its gates pass and this run's post-MHC reads do not falsify it — metrics.run_level_edge).
+    level_edge: str = "off"
 
     @property
     def is_hdr(self) -> bool:
@@ -672,6 +677,7 @@ def _target_spec(name: str, raw: dict[str, Any]) -> TargetSpec:
         peak_luminance_nits=(float(raw["peak_luminance_nits"]) if raw.get("peak_luminance_nits") else None),
         white_xy_override=white_override,
         oog_mapping=_oog_mapping(raw.get("oog_mapping")),
+        level_edge=_level_edge(raw.get("level_edge")),
     )
 
 
@@ -685,6 +691,20 @@ def _oog_mapping(raw: Any) -> str:
     val = str(raw).strip().lower()
     if val not in _OOG_MAPPINGS:
         raise ValueError(f"oog_mapping must be one of {_OOG_MAPPINGS}, got {raw!r}")
+    return val
+
+
+_LEVEL_EDGE_SWITCHES = ("off", "auto")   # mirrors metrics.LEVEL_EDGE_SWITCHES
+
+
+def _level_edge(raw: Any) -> str:
+    """Validate a target's ``level_edge`` profile key (absent => "off"). YAML 1.1 reads a bare ``off`` as the
+    boolean False (and ``on`` as True, which is NOT a valid value — the switch is off|auto)."""
+    if raw is None or raw is False:
+        return "off"
+    val = str(raw).strip().lower()
+    if val not in _LEVEL_EDGE_SWITCHES:
+        raise ValueError(f"level_edge must be one of {_LEVEL_EDGE_SWITCHES}, got {raw!r}")
     return val
 
 

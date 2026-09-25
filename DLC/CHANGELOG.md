@@ -217,6 +217,21 @@ request, adjudicates ambiguous results on digests, and writes the report.
   artifacts are now strict-JSON-safe when a meter read is NaN/inf.
 
 ### Changed
+- **Luminance-dependent confirmed gamut edge ("level edge")** (2026-09-25, profile `level_edge: off|auto`,
+  default off; active only with `--oog-solve projection`). The HDR out-of-gamut mapping clamped targets
+  to the full-drive native primaries. On a FALD mini-LED panel, dim primaries are less saturated: LED
+  light leaks through closed cells, with a pedestal that follows the drive code roughly as its square root.
+  Dim saturated targets were therefore unreachable, and the shipped cube traded luminance for the chroma it
+  couldn't reach (dim blue +39 % bright). New `engine/level_gamut.py` fits that pedestal on the raw
+  pure-channel ramps and builds a 48-point confirmed edge per luminance. Every HDR MHC build now persists it
+  as `mhc_params["level_edge"]`, with deterministic gates. The vertex mapping and verify scoring then clamp
+  to the edge at each colour's own luminance. The build checks the edge against the run's own reads: a read
+  more than 1 JND outside it is an LLM seam. Runs from before D4, or with the edge off, score bit-identically.
+  Rescoring the 2026-09-24 verify: core, limits and tube are unchanged; clamped 3.91 → 1.93; the <1 nit band
+  7.66 → 4.22; the 1–10 nit band 3.33 → 1.20. A rebuilt cube is predicted to reach dim luminance within
+  ±3.5 % (the shipped cube was up to +39 %). Verify digests carry both targets side by side, the
+  reclassified patches, and whether the verdict depends on the edge. New
+  `python -m dlc.stages.level_edge --run DIR` back-fills the edge for older runs.
 - **3D LUT: out-of-gamut nodes can be solved at their gamut projection** (2026-09-24, `--oog-solve
   projection`; default stays `direct` until a hardware verify accepts it). The owner's HDR test clips
   showed banding in Rec.2020 blue and a static speckle on a bright 100 % blue ramp. Offline emulation

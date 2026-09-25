@@ -577,8 +577,12 @@ class DashboardState:
             if hdr and tri is not None:
                 metrics[m]["core"] = _stats(core, dec)
                 metrics[m]["ext"] = _stats(ext, dec)
+        # The live split is against the FULL-DRIVE native triangle. A run built on the luminance-dependent level
+        # edge (D4) scores its verify against that edge instead (per-patch gamut_clamped); moving this live split
+        # to the per-patch flag is a follow-up — until then it is labelled for what it is.
         return {"scoring": "itp" if hdr else "de2000", "n": len(vals),
-                "gamut_known": tri is not None, "metrics": metrics}
+                "gamut_known": tri is not None, "gamut_reference": "full-drive native triangle",
+                "metrics": metrics}
 
     def _patch_deltas(self, data: dict[str, Any]) -> Optional[dict[str, Any]]:
         """All applicable per-patch ΔE metrics (each with its L/C/H split) vs the patch's ideal

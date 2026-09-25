@@ -10,7 +10,10 @@ PQ/Rec.2020 target — CIEDE2000's Lab is meaningless at HDR absolute luminance,
 old unconditional-CIEDE2000 path produced ~30+ dE garbage on HDR data. Also GAMUT-AWARE
 exactly like the live verify (P1): the HDR target is clamped onto the panel's measured
 native gamut from the run record, and every summary carries the §0 practical split
-(core / limits / at-the-gamut-floor) alongside the raw numbers.
+(core / limits / at-the-gamut-floor) alongside the raw numbers. A run whose 3D LUT was built on the
+luminance-dependent confirmed gamut edge (design D4 — its memo ``calib["oog_level_edge"]``) is scored against
+that edge, rebuilt from ``mhc_params.level_edge``, exactly as its live verify was (``--level-edge run``, the
+default); ``off`` / ``on`` are explicit what-ifs.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from ..metrics import (
     run_oog_mapping,
     score_samples,
     score_samples_hdr,
+    stage_level_gamut,
     write_metrics,
 )
 from ..mhc import parse_ti3, resolve_run_path
@@ -73,17 +77,27 @@ def build(args, ctx: RunContext) -> StageResult:
         # as calibration error while the live run doesn't. No build yet ⇒ no clamp — surfaced
         # as gamut_aware=false below, never silently.
         reachable = reachable_primaries_from_mhc_params(dl_state.get("mhc_params"))
+        oog = run_oog_mapping(dl_state.get("calib"))
+        level_note = None
+        if reachable is not None:
+            # The level edge (D4): the run's pinned memo by default, rebuilt from the run record.
+            gamut, level_note = stage_level_gamut(dl_state.get("calib"), dl_state.get("mhc_params"),
+                                                  mode=getattr(args, "level_edge", "run") or "run",
+                                                  oog_mapping=oog, white_xy=target_white_xy)
+            if gamut is not None:
+                reachable = gamut
         patch_metrics, target_luminance = score_samples_hdr(
             samples, white_xy=target_white_xy, peak_nits=float(peak),
             reachable_primaries=reachable,
             # The run's OOG target policy, memoised by the orchestrator (default "vertex").
-            oog_mapping=run_oog_mapping(dl_state.get("calib")),
+            oog_mapping=oog,
         )
         metric_name = "dE_ITP"
         thresholds = hdr_metric_thresholds(
             ctx.manifest.desktoplut.get("quality_policy") if ctx else None
         )
     else:
+        level_note = None
         reachable = None   # production SDR never clamps (CV-gated worse; see score_samples)
         patch_metrics, target_luminance = score_samples(
             samples, luminance=args.luminance, gamma=args.gamma, white_xy=target_white_xy
@@ -114,6 +128,7 @@ def build(args, ctx: RunContext) -> StageResult:
         + ("PQ/Rec.2020" if is_hdr else f"gamma {args.gamma}")
         + f" / white {target_white_xy[0]:.6f},{target_white_xy[1]:.6f} ({target_white_source})"
         + (f" / gamut-aware (native primaries from the run record)" if gamut_aware else "")
+        + (f" / {level_note}" if level_note else "")
     )
 
     # Worst offenders, for the assistant to inspect. (`de2000` is the generic ΔE carrier field — it
@@ -151,6 +166,10 @@ def build(args, ctx: RunContext) -> StageResult:
         "gamut_aware": gamut_aware,
         "practical": practical,
     }
+    if hasattr(reachable, "full_primaries"):
+        metrics["level_edge"] = {"key": reachable.key(), "note": level_note}
+    elif level_note:
+        metrics["level_edge"] = {"key": None, "note": level_note}
 
     # Delta vs previous score for the same stage + history for the report.
     score_history = dl_state.setdefault("score_history", [])
@@ -183,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-ti3", default=None, dest="source_ti3")
     parser.add_argument("--gamma", type=float, default=2.2)
     parser.add_argument("--luminance", type=float, default=None, help="target white luminance (default: inferred)")
+    parser.add_argument("--level-edge", choices=("run", "off", "on"), default="run", dest="level_edge",
+                        help="HDR: score against the luminance-dependent gamut edge as the run did (run, default), "
+                             "never (off), or forced from mhc_params.level_edge (on)")
     _common.add_target_white_args(parser)
     args = parser.parse_args(argv)
     ctx = _common.resolve_run(args, create=False)

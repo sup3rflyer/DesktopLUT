@@ -3594,6 +3594,8 @@ class Calibration:
                 hdr = self._hdr_target()
                 if (hdr.provenance.get("peak") or {}).get("grounded", True):
                     args.resolved_peak_nits = hdr.peak_nits
+                # The level edge (D4) is anchored on the white the ENGINE target uses (the resolved white).
+                args.level_edge_white_xy = list(self._white_xy())
             derive = build_mhc.build(args, self.ctx)
             self.ctx.log(f"build-mhc: {derive.status}")
             if derive.status == "failed":
@@ -3691,6 +3693,10 @@ class Calibration:
                 # The σ-aware adaptive dark floor's verdict (Phase 4, F4-1/HW-4): nits + how
                 # many strayed dark reads were σ-verified REAL drift (corrected) vs smoothed.
                 digest["dark_floor"] = params["dark_floor"]
+            if spec.is_hdr and params.get("level_edge"):
+                # The luminance-dependent confirmed gamut edge (D4) fitted from this raw set — evidence here; the
+                # run only USES it if the profile enables it and it survives falsification at the 3D-LUT build.
+                digest["level_edge"] = build_mhc.level_edge_digest(params["level_edge"])
             top_hold = ((base_lut or {}).get("summary") or {}).get("top_hold")
             if top_hold:
                 # Per-channel neutral-cap hold (owner policy 2026-09-23): where each channel's base
@@ -5092,6 +5098,195 @@ class Calibration:
             self.calib["oog_solve"] = "direct"
         return cfg, premise
 
+    # -- level edge (design D4): the luminance-dependent confirmed gamut edge ------------------------------
+    def _level_edge_switch(self) -> str:
+        """The profile's ``level_edge`` switch for the resolved target ("off" default | "auto")."""
+        if self.target_name is None:
+            return "off"
+        return str(getattr(self.profile.target(self.target_name), "level_edge", "off") or "off")
+
+    def _reachable_gamut(self, *, stage: str = "verify") -> Any:
+        """The reachable target the 3D-LUT build's optimizer, the verify score and the stage CLIs clamp against: the
+        run's level-edge gamut when its memo (``calib["oog_level_edge"]``, pinned at the first 3D-LUT build) enables
+        it, else :meth:`_reachable_primaries` (the full-drive triangle). EVERYTHING ELSE — patch sets, saturation /
+        verify-ramp caps, intermediate stage scores — keeps ``_reachable_primaries`` (sampling never changes).
+
+        A pinned edge whose key no longer matches ``mhc_params.level_edge`` (re-fitted after the cube was built)
+        cannot reproduce the target the cube was built for: the ``level_edge_key_mismatch`` seam decides."""
+        prim = self._reachable_primaries()
+        memo = self.calib.get("oog_level_edge")
+        if prim is None or self.mode != "HDR" or not (isinstance(memo, dict) and memo.get("enabled")):
+            return prim
+        params = self._state.get("mhc_params") or {}
+        white = self._white_xy()
+        gamut, rec = metrics_mod.run_level_edge(self.calib, params, oog_mapping=self._oog_mapping(), white_xy=white)
+        if gamut is not None:
+            return gamut
+        block = metrics_mod.level_edge_block(params)
+        current_ok = bool(block and block.get("status") == "ok" and not rec.get("white_mismatch"))
+        options = ("use_current", "disable", "abort") if current_ok else ("disable", "abort")
+        if current_ok:
+            why = "re-fitted"
+        elif rec.get("white_mismatch"):
+            why = f"anchored on white {(block or {}).get('white_xy')}, the target now uses {list(white)}"
+        else:
+            why = f"not usable: {(block or {}).get('reason')}"
+        decision = self._abort_if(self.adjudicate(AdjudicationRequest(
+            key=f"{stage}:level_edge_key_mismatch", seam=(SEAM_VERIFY if stage == "verify" else SEAM_OPTIMIZE),
+            stage=stage,
+            question=(
+                f"the 3D LUT was built for the level edge {memo.get('key')}, but the run record's level edge is now "
+                f"{rec.get('current_key')} ({why}"
+                ") — 'disable' scores against the full-drive native triangle (the pre-level-edge target; the cube's "
+                "low-luminance out-of-gamut targets will read as misses there)"
+                + (", 'use_current' scores against the current edge (close to, but not exactly, the one the cube "
+                   "aimed at)" if current_ok else "")
+                + ", 'abort' stops the run."),
+            options=options, recommendation="disable",
+            digest={"pinned_key": memo.get("key"), "current_key": rec.get("current_key"),
+                    "white_mismatch": bool(rec.get("white_mismatch")),
+                    "current_status": (block or {}).get("status"), "current_reason": (block or {}).get("reason"),
+                    "memo": memo})),
+            stage=stage, message="aborted at the level-edge key-mismatch seam")
+        if decision.choice == "use_current" and current_ok:
+            self.calib["oog_level_edge"] = {**memo, "key": block.get("key"),
+                                            "reason": "re-pinned to the current edge at the key-mismatch seam"}
+            self._save()
+            return metrics_mod.stage_level_gamut(self.calib, params, white_xy=white)[0] or prim
+        self.calib["oog_level_edge"] = {**memo, "enabled": False,
+                                        "reason": "disabled at the level_edge_key_mismatch seam"}
+        self._save()
+        return prim
+
+    def _cube_level_edge(self, cfg: OptimizeConfig, target, signals, measured
+                         ) -> tuple[Any, Optional[dict[str, Any]]]:
+        """Decide + pin (``calib["oog_level_edge"]``) whether THIS 3D-LUT build maps out-of-gamut targets onto the
+        level edge (``metrics.run_level_edge`` — HDR ∧ vertex ∧ projection ∧ profile ``level_edge: auto`` ∧ the MHC
+        build's gates passed ∧ this run's post-MHC reads do not falsify it). A falsified (or undecidable) edge is a
+        judgment for the LLM (``level_edge_falsified`` seam: disable / enable anyway / abort), never silently applied
+        or silently dropped. Returns ``(reachable for optimize_cube, digest block | None)`` — the block only when
+        the profile asked for the edge (a run with the switch off keeps its build digest unchanged)."""
+        reach = self._reachable_primaries()
+        if reach is None or self.mode != "HDR":
+            return reach, None
+        params = self._state.get("mhc_params") or {}
+        switch = self._level_edge_switch()
+        # A memo from an earlier attempt at THIS build (interrupted, or its inputs invalidated) is re-decided on
+        # this build's data — deterministic, and a recorded seam decision replays by key. (With a memo the record
+        # is not legacy, so the build/verify stage entries must not trip the legacy rule either.)
+        view = self.calib
+        if isinstance(self.calib.get("oog_level_edge"), dict):
+            view = {k: v for k, v in self.calib.items() if k not in ("oog_level_edge", "stages")}
+        from .engine.cube_quality import level_edge_falsification
+
+        def falsify(gamut):
+            return level_edge_falsification(gamut, signals, measured, floor_nits=gamut.floor_nits)
+        gamut, rec = metrics_mod.run_level_edge(view, params, switch=switch, oog_mapping=self._oog_mapping(),
+                                                oog_solve=cfg.oog_solve, is_hdr=True, falsify=falsify,
+                                                white_xy=self._white_xy())
+        if rec.get("falsified"):
+            fals = rec.get("falsification") or {}
+            block = metrics_mod.level_edge_block(params) or {}
+            undecided = fals.get("passed") is None
+            worst = fals.get("worst") or {}
+            decision = self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="build-install-3dlut:level_edge_falsified", seam=SEAM_OPTIMIZE, stage="build-install-3dlut",
+                question=(
+                    "the luminance-dependent gamut edge (level edge) fitted from this run's raw ramps "
+                    + ("could not be checked against its post-MHC reads (none at or above the "
+                       f"{fals.get('floor_nits')}-nit floor)" if undecided else
+                       f"is contradicted by its post-MHC reads: {fals.get('over_jnd')} of {fals.get('n')} reads lie "
+                       f"more than 1 JND outside it at their own luminance (worst {fals.get('max_de')} dE_ITP at "
+                       f"{worst.get('Y')} nits, signal {worst.get('signal')})")
+                    + " — 'disable' builds and verifies against the full-drive native triangle (the pre-level-edge "
+                    "target), 'enable' maps out-of-gamut targets onto the level edge anyway (the dim ones aim at the "
+                    "fitted edge, which the panel may exceed there), 'abort' stops the run."),
+                options=("disable", "enable", "abort"), recommendation="disable",
+                digest={"falsification": fals, "key": rec.get("key"),
+                        "pedestal": {k: (block.get("pedestal") or {}).get(k)
+                                     for k in ("K_xy", "c", "gamma", "fit_rms_duv", "identifiable")},
+                        "floor_nits": block.get("floor_nits")})),
+                stage="build-install-3dlut", message="aborted at the level-edge falsification seam")
+            if decision.choice == "enable":
+                rec.update(enabled=True, reason="enabled at the level_edge_falsified seam (judgment)")
+            else:
+                rec.update(enabled=False, reason="disabled at the level_edge_falsified seam")
+                gamut = None
+        self.calib["oog_level_edge"] = {k: rec.get(k) for k in ("enabled", "key", "reason", "falsification")}
+        use = gamut if (rec.get("enabled") and gamut is not None) else reach
+        if switch != "auto":
+            return use, None
+        out: dict[str, Any] = {"enabled": bool(rec.get("enabled")), "key": rec.get("key"),
+                               "reason": rec.get("reason"), "falsification": rec.get("falsification")}
+        if rec.get("enabled") and gamut is not None:
+            out.update(self._level_edge_build_evidence(gamut, target, cfg.grid_size))
+        return use, out
+
+    def _level_edge_build_evidence(self, gamut, target, grid_size: int) -> dict[str, Any]:
+        """Build-digest evidence for an enabled level edge: how the lattice's clamp set changes vs the full-drive
+        triangle (newly clamped / un-clamped nodes) and how far the planned verify patches' targets move."""
+        try:
+            from .engine.model import TargetSpace, de_itp
+            raw = TargetSpace(target)
+            full = TargetSpace(target, reachable_primaries=gamut.full_primaries)
+            level = TargetSpace(target, reachable_primaries=gamut)
+            axis = np.linspace(0.0, 1.0, grid_size)
+            B, G, R = np.meshgrid(axis, axis, axis, indexing="ij")
+            grid = np.stack([R.ravel(), G.ravel(), B.ravel()], axis=1)
+            raw_xyz = raw.ideal_xyz(grid)
+            cl_level = level.level_clamped(raw_xyz)
+            tol = 1e-9 + 1e-6 * np.sum(np.abs(raw_xyz), axis=1)
+            cl_full = np.any(np.abs(full.ideal_xyz(grid) - raw_xyz) > tol[:, None], axis=1)
+            max_cv = self._transfer().max_cv
+            sig = np.asarray(self._verify_patches(), dtype=float) / float(max_cv)
+            d = de_itp(raw.xyz_to_ictcp(level.ideal_xyz(sig)) - raw.xyz_to_ictcp(full.ideal_xyz(sig)))
+            moved = d > 1e-6
+            return {"lattice": {"grid_size": int(grid_size), "clamped_level_edge": int(cl_level.sum()),
+                                "clamped_full_drive": int(cl_full.sum()),
+                                "newly_clamped": int(np.sum(cl_level & ~cl_full)),
+                                "un_clamped": int(np.sum(~cl_level & cl_full))},
+                    "verify_plan": {"patches": int(len(sig)), "targets_moved": int(moved.sum()),
+                                    "mean_move_de_itp": round(float(d[moved].mean()), 3) if moved.any() else 0.0,
+                                    "max_move_de_itp": round(float(d.max()), 3) if d.size else 0.0}}
+        except Exception as exc:  # noqa: BLE001 - evidence must never break the build
+            return {"evidence_error": f"{type(exc).__name__}: {exc}"}
+
+    def _level_edge_verify_evidence(self, samples, metrics, q, within, *, white_xy, peak_nits,
+                                    gamut) -> dict[str, Any]:
+        """Verify-digest evidence when the level edge is the primary target (never a new pause): the same reads
+        scored against the full-drive target, the patches whose practical bucket differs between the two
+        definitions, the edge's falsification on the verify reads, and whether the gate verdict depends on it."""
+        from .engine.cube_quality import level_edge_falsification
+        full_metrics, _ = score_samples_hdr(samples, white_xy=white_xy, peak_nits=peak_nits,
+                                            oog_mapping=self._oog_mapping(),
+                                            reachable_primaries=gamut.full_primaries)
+        full_practical = practical_summary(full_metrics, is_hdr=True, gamut_aware=True)
+        full_summary = summarize_metrics(phase="verification", iteration=0, source=Path("."),
+                                         patch_metrics=full_metrics, target_luminance=peak_nits, metric="dE_ITP")
+        within_full, _basis = self._quality_gate(full_summary, full_practical, q)
+
+        def bucket(m) -> str:
+            x, y, z = m.target_xyz
+            tot = x + y + z
+            if m.gamut_clamped:
+                return "clamped"
+            return "core" if metrics_mod.is_core_target((x / tot, y / tot) if tot > 1e-9 else None, y) else "limits"
+        moved = [{"rgb": [round(c, 4) for c in a.rgb], "level_edge": bucket(a), "full_drive": bucket(b),
+                  "de_level_edge": round(a.de2000, 3), "de_full_drive": round(b.de2000, 3)}
+                 for a, b in zip(metrics, full_metrics) if bucket(a) != bucket(b)]
+        allv = [m.de2000 for m in full_metrics]
+        full_view = {k: full_practical.get(k) for k in ("core", "limits", "clamped", "tube")}
+        full_view["all"] = {"avg": round(sum(allv) / len(allv), 3), "p95": round(percentile(allv, 95), 3),
+                            "max": round(max(allv), 3), "n": len(allv)}
+        fals = level_edge_falsification(gamut, np.array([s.rgb for s in samples]),
+                                        np.array([s.xyz for s in samples]), floor_nits=gamut.floor_nits)
+        return {"level_edge": {"key": gamut.key(), "memo": self.calib.get("oog_level_edge")},
+                "full_drive_target": full_view,
+                "reclassified": moved[:50], "reclassified_count": len(moved),
+                "level_edge_falsification": fals,
+                "verdict_depends_on_level_edge": bool(within_full) != bool(within),
+                "within_quality_full_drive": bool(within_full)}
+
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
             self._oog_mapping()       # the cube, verify and the stage CLIs share one OOG policy
@@ -5102,11 +5297,13 @@ class Calibration:
             measured = np.array([s.xyz for s in samples], dtype=float)
             cube_path = str(self.ctx.root / "generated" / f"final_{self.mode.lower()}.cube")
             cfg, premise = self._cube_oog_solve(self._cube_optimize_config(), target, signals, measured)
+            # The level edge (D4) is decided + pinned here, after the solve mode (it needs the projection solve).
+            reachable, level_edge = self._cube_level_edge(cfg, target, signals, measured)
             try:
                 result = optimize_cube(target=target, probe=self._probe_fn(), signals=signals,
                                        measured_xyz=measured, config=cfg,
                                        on_iteration=self._on_optimize_iteration,
-                                       reachable_primaries=self._reachable_primaries(),
+                                       reachable_primaries=reachable,
                                        report_scorer=report_scorer, report_metric=report_metric)
             except DegenerateMeasurements as exc:
                 # The RBF model can't be built from this patch set (degenerate/collinear) —
@@ -5121,6 +5318,8 @@ class Calibration:
             digest = {**result.digest, "cube_path": cube_path}
             if premise is not None:
                 digest["oog_premise"] = premise
+            if level_edge is not None:
+                digest["level_edge"] = level_edge
             return StageOutcome("build-install-3dlut", "done", digest=digest,
                                 data={"cube_path": cube_path,
                                       "needs_adjudication": result.needs_adjudication,
@@ -5208,7 +5407,9 @@ class Calibration:
             # scores dE_ITP against PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's
             # Lab is meaningless at HDR absolute luminance), with looser, LLM-negotiated targets.
             wx, wy = self._white_xy()
-            reachable = self._reachable_primaries() if spec.is_hdr else None
+            # The target the cube was BUILT for: the run's level edge when its memo enables it (D4), else the
+            # full-drive triangle (_reachable_gamut); every bucket below is deterministic under it.
+            reachable = self._reachable_gamut(stage="verify") if spec.is_hdr else None
             if spec.is_hdr:
                 hdr = self._hdr_target()
                 metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits,
@@ -5278,6 +5479,14 @@ class Calibration:
                       "practical": practical,
                       "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2),
                                  "gamut_clamped": m.gamut_clamped} for m in worst]}
+            if spec.is_hdr and hasattr(reachable, "full_primaries"):
+                # Level edge primary (D4): the full-drive view, the reclassified patches, the edge's falsification
+                # on these reads, and whether the verdict depends on the edge — evidence only, no new pause.
+                try:
+                    digest.update(self._level_edge_verify_evidence(
+                        samples, metrics, q, within, white_xy=(wx, wy), peak_nits=hdr.peak_nits, gamut=reachable))
+                except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
+                    digest["level_edge_evidence_error"] = f"{type(exc).__name__}: {exc}"
             return StageOutcome("verify", "done", digest=digest,
                                 data={"within_quality": within, "metrics": {
                                     "avg_de2000": summary.avg_de2000, "p95_de2000": summary.p95_de2000,

@@ -22,6 +22,14 @@ numbers make that visible in the digest:
   native gamut. A sign test on saturated in-gamut post-MHC reads: colorimetric decode vs "drive = native RGB"; the
   premise holds when colorimetric is closer on a significant majority (one-sided binomial p < 0.01). Run 132412:
   126 of 153, p = 9e-17.
+* :func:`level_edge_falsification` — with the luminance-dependent confirmed edge (design D4, ``engine.level_gamut``):
+  how many MEASURED reads lie outside the claimed edge at their own luminance, and by how much (dE_ITP, chroma moved
+  radially onto the edge, Y held). A read outside the edge falsifies it (the panel rendered it, so it is reachable).
+
+With a level-edge target space the in-gamut / out-of-gamut split (N1, the premise selection) is the space's OWN clamp
+mask (raw target outside the edge at its luminance) instead of the full-drive triangle test; the native matrices
+always use the full-drive primaries. ``ramp_excess`` also reports dim saturation ramps (levels 0.25 / 0.35 — where
+the level edge and the full-drive triangle differ most) as evidence, outside its flag.
 
 Thresholds are JNDs (dE_ITP 1 ≈ 1 JND) and one output code — principled, no tuned constants.
 """
@@ -37,7 +45,7 @@ from .lut_rbf import hold_lattice_level, project_to_top
 from .model import DisplayErrorModel, TargetSpace, de_itp
 
 __all__ = ["ideal_cube", "noise_gain", "ramp_excess", "excess_reversals", "oog_drive_share",
-           "premise_check", "cube_quality"]
+           "premise_check", "cube_quality", "level_edge_falsification"]
 
 # ±1 JND input perturbations along I, T, P (dE_ITP = 720·|(dI, dCt/2, dCp)|): the Ct step is doubled.
 _DIRS = np.array([[1, 0, 0], [-1, 0, 0], [0, 2, 0], [0, -2, 0], [0, 0, 1], [0, 0, -1]], float) / 720.0
@@ -87,9 +95,19 @@ def _is_oog(raw: TargetSpace, native_inv: np.ndarray, signals: np.ndarray) -> tu
     return (mag > 0) & (np.min(nat, axis=1) < -1e-5 * mag), xyz[:, 1]
 
 
-def _native_matrices(reachable_primaries: dict, white_xy: tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
+def _oog_mask(space: Optional[TargetSpace], raw: TargetSpace, native_inv: np.ndarray,
+              signals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Out-of-gamut samples: the space's own level-edge clamp mask when it has one (D4), else the full-drive test."""
+    if space is not None and getattr(space, "level_gamut", None) is not None:
+        xyz = raw.ideal_xyz(signals)
+        return space.level_clamped(xyz), xyz[:, 1]
+    return _is_oog(raw, native_inv, signals)
+
+
+def _native_matrices(reachable_primaries: Any, white_xy: tuple[float, float]) -> tuple[np.ndarray, np.ndarray]:
     from ..colormath import rgb_to_xyz_matrix
-    r, g, b = (reachable_primaries[k] for k in ("R", "G", "B"))
+    prim = getattr(reachable_primaries, "full_primaries", reachable_primaries)   # a level gamut: its full-drive triangle
+    r, g, b = (prim[k] for k in ("R", "G", "B"))
     m = np.array(rgb_to_xyz_matrix(r[0], r[1], g[0], g[1], b[0], b[1], white_xy[0], white_xy[1]))
     return m, np.linalg.inv(m)
 
@@ -119,9 +137,10 @@ def sample_points(top: float, n: int = 6000, seed: int = 3) -> np.ndarray:
 
 
 def noise_gain(model: DisplayErrorModel, cube: np.ndarray, ideal: np.ndarray, native_inv: np.ndarray, *,
-               top: float, n: int = 6000, min_nits: float = 0.1) -> dict[str, Any]:
+               top: float, n: int = 6000, min_nits: float = 0.1, space: Optional[TargetSpace] = None) -> dict[str, Any]:
     """N1 — see the module docstring. Returns p99/max for in-gamut and out-of-gamut samples, the flag, and the
-    worst out-of-gamut input."""
+    worst out-of-gamut input. ``space`` (the build's target space): with a level edge, its own clamp mask splits the
+    samples (default: the full-drive triangle test)."""
     raw = model._raw_space
     pts = sample_points(top, n)
     base_c, base_i = raw.xyz_to_ictcp(_render(model, cube, pts)), raw.xyz_to_ictcp(_render(model, ideal, pts))
@@ -131,7 +150,7 @@ def noise_gain(model: DisplayErrorModel, cube: np.ndarray, ideal: np.ndarray, na
         ec = de_itp(raw.xyz_to_ictcp(_render(model, cube, q)) - base_c)
         ei = de_itp(raw.xyz_to_ictcp(_render(model, ideal, q)) - base_i)
         worst = np.maximum(worst, ec - ei)
-    oog, Y = _is_oog(raw, native_inv, pts)
+    oog, Y = _oog_mask(space, raw, native_inv, pts)
     lit = Y > min_nits
     a, b = worst[~oog & lit], worst[oog & lit]
     out: dict[str, Any] = {"n": int(lit.sum())}
@@ -145,9 +164,26 @@ def noise_gain(model: DisplayErrorModel, cube: np.ndarray, ideal: np.ndarray, na
     return out
 
 
+_HUES = {"R": (1, 0, 0), "G": (0, 1, 0), "B": (0, 0, 1), "C": (0, 1, 1), "M": (1, 0, 1), "Y": (1, 1, 0)}
+# Dim saturation ramps (grey -> primary / secondary at a low level) — where a luminance-dependent gamut edge and the
+# full-drive triangle differ most (D4). Reported beside R1 as evidence, outside its flag.
+_DIM_LEVELS = (0.25, 0.35)
+
+
+def _sat_ramps(top: float, levels: tuple[float, ...]) -> dict[str, np.ndarray]:
+    ramps = {}
+    for lvl in levels:
+        L = min(int(lvl * 1023), int(top * 1023)) / 1023.0
+        steps = np.arange(0, int(L * 1023) + 1) / 1023.0
+        for k, on in _HUES.items():
+            on = np.array(on, float)
+            ramps[f"sat_{k}@{lvl}"] = on * L + (1 - on) * steps[::-1, None]
+    return ramps
+
+
 def _ramps(top: float) -> dict[str, np.ndarray]:
     codes = np.arange(0, int(top * 1023) + 1) / 1023.0
-    hues = {"R": (1, 0, 0), "G": (0, 1, 0), "B": (0, 0, 1), "C": (0, 1, 1), "M": (1, 0, 1), "Y": (1, 1, 0)}
+    hues = _HUES
     ramps = {f"bright_{k}": np.outer(codes, on) for k, on in hues.items()}
     for lvl in (0.45, 0.55, 0.65, 0.75):
         L = min(int(lvl * 1023), int(top * 1023)) / 1023.0
@@ -158,17 +194,26 @@ def _ramps(top: float) -> dict[str, np.ndarray]:
     return ramps
 
 
-def ramp_excess(model: DisplayErrorModel, cube: np.ndarray, ideal: np.ndarray, *, top: float) -> dict[str, Any]:
-    """R1 — the largest rendered 10-bit step on the ramps beyond the ideal cube's own step (JND)."""
+def _worst_ramp_step(model: DisplayErrorModel, cube: np.ndarray, ideal: np.ndarray,
+                     ramps: dict[str, np.ndarray]) -> tuple[float, Optional[str]]:
     raw = model._raw_space
     worst, where = 0.0, None
-    for name, src in _ramps(top).items():
+    for name, src in ramps.items():
         pc = raw.xyz_to_ictcp(_render(model, cube, src))
         pi = raw.xyz_to_ictcp(_render(model, ideal, src))
         ex = de_itp(pc[1:] - pc[:-1]) - de_itp(pi[1:] - pi[:-1])
         if ex.size and float(ex.max()) > worst:
             worst, where = float(ex.max()), name
-    return {"max": round(worst, 2), "ramp": where, "flag": worst > 1.0}
+    return worst, where
+
+
+def ramp_excess(model: DisplayErrorModel, cube: np.ndarray, ideal: np.ndarray, *, top: float) -> dict[str, Any]:
+    """R1 — the largest rendered 10-bit step on the ramps beyond the ideal cube's own step (JND). ``dim`` carries the
+    same statistic on the dim saturation ramps (:data:`_DIM_LEVELS`) — evidence only, not part of ``flag``."""
+    worst, where = _worst_ramp_step(model, cube, ideal, _ramps(top))
+    dim, dim_where = _worst_ramp_step(model, cube, ideal, _sat_ramps(top, _DIM_LEVELS))
+    return {"max": round(worst, 2), "ramp": where, "flag": worst > 1.0,
+            "dim": {"max": round(dim, 2), "ramp": dim_where}}
 
 
 def excess_reversals(cube: np.ndarray, ideal: np.ndarray, hold_above: Optional[float]) -> dict[str, int]:
@@ -205,19 +250,23 @@ def oog_drive_share(cube: np.ndarray, raw: TargetSpace, native_inv: np.ndarray, 
     return {"gt_1pct": round(float(np.mean(sev > 0.01)), 4), "gt_5pct": round(float(np.mean(sev > 0.05)), 4)}
 
 
-def premise_check(signals: np.ndarray, measured_xyz: np.ndarray, target: Any, reachable_primaries: dict,
+def premise_check(signals: np.ndarray, measured_xyz: np.ndarray, target: Any, reachable_primaries: Any,
                   white_xy: tuple[float, float], cap_nits: float, *, min_sat: float = 0.3,
                   min_nits: float = 0.5, alpha: float = 0.01) -> dict[str, Any]:
     """Does the monitor decode Rec.2020 COLORIMETRICALLY inside its native gamut (the projection solve's premise)?
     Sign test on saturated, lit, in-gamut post-MHC reads: which model predicts each read closer — the colorimetric
     decode (native-gamut clip, luminance roof at ``cap_nits``) or "drive = native RGB" (PQ-tracking native primaries
-    balanced to the target white, as the MHC leaves the panel). ``passed`` is None when too few reads qualify."""
+    balanced to the target white, as the MHC leaves the panel). ``passed`` is None when too few reads qualify.
+    ``reachable_primaries`` may be a level-edge gamut (D4): the in-gamut selection then uses the level space's own
+    clamp mask; both models keep the full-drive native matrices."""
     signals = np.asarray(signals, float).reshape(-1, 3)
     measured_xyz = np.maximum(np.asarray(measured_xyz, float).reshape(-1, 3), 0.0)
     raw = TargetSpace(target)
     nat_m, nat_inv = _native_matrices(reachable_primaries, white_xy)
     cap = float(cap_nits) / 1e4
-    oog, _ = _is_oog(raw, nat_inv, signals)
+    level_space = (TargetSpace(target, reachable_primaries=reachable_primaries)
+                   if getattr(reachable_primaries, "full_primaries", None) is not None else None)
+    oog, _ = _oog_mask(level_space, raw, nat_inv, signals)
     mx, mn = signals.max(axis=1), signals.min(axis=1)
     sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-12), 0.0)
     keep = ~oog & (measured_xyz[:, 1] > min_nits) & (sat > min_sat)
@@ -245,7 +294,7 @@ def premise_check(signals: np.ndarray, measured_xyz: np.ndarray, target: Any, re
     return out
 
 
-def cube_quality(model: DisplayErrorModel, cube: np.ndarray, space: TargetSpace, reachable_primaries: dict,
+def cube_quality(model: DisplayErrorModel, cube: np.ndarray, space: TargetSpace, reachable_primaries: Any,
                  white_xy: tuple[float, float], *, hold_above: Optional[float], top: float,
                  transfer: str = "pq") -> dict[str, Any]:
     """All the lattice diagnostics for one cube, as one digest block."""
@@ -253,8 +302,44 @@ def cube_quality(model: DisplayErrorModel, cube: np.ndarray, space: TargetSpace,
     ideal = ideal_cube(space, n, hold_above, transfer)
     _, nat_inv = _native_matrices(reachable_primaries, white_xy)
     return {
-        "noise_gain": noise_gain(model, cube, ideal, nat_inv, top=top),
+        "noise_gain": noise_gain(model, cube, ideal, nat_inv, top=top, space=space),
         "ramp_excess": ramp_excess(model, cube, ideal, top=top),
         "excess_reversals": excess_reversals(cube, ideal, hold_above),
         "oog_drive_share": oog_drive_share(cube, model._raw_space, nat_inv, hold_above),
     }
+
+
+def level_edge_falsification(gamut: Any, signals: Optional[np.ndarray], measured_xyz: np.ndarray, *,
+                             floor_nits: float, jnd: float = 1.0) -> dict[str, Any]:
+    """Falsify a luminance-dependent confirmed edge (D4) on MEASURED reads: every read at or above ``floor_nits`` is a
+    colour the panel produced, so one lying outside the claimed edge at its own luminance contradicts the edge. For
+    each read outside, the distance is dE_ITP between the read and the read moved radially onto the edge (Y held).
+    ``passed`` = no read more than ``jnd`` (1 JND) outside; None when no read reaches the floor. ``signals``
+    (optional) only labels the worst read."""
+    from .level_gamut import _uv_to_xyz, outside_distance
+    from .model import _xy_to_uv
+    xyz = np.maximum(np.nan_to_num(np.asarray(measured_xyz, float).reshape(-1, 3), nan=0.0,
+                                   posinf=0.0, neginf=0.0), 0.0)
+    sig = None if signals is None else np.asarray(signals, float).reshape(-1, 3)
+    keep = np.where(xyz[:, 1] >= float(floor_nits))[0]
+    out: dict[str, Any] = {"n": int(keep.size), "floor_nits": float(floor_nits), "jnd": float(jnd)}
+    if not keep.size:
+        out.update(outside=0, over_half_jnd=0, over_jnd=0, max_de=0.0, worst=None, passed=None,
+                   reason="no reads at or above the floor")
+        return out
+    x = xyz[keep]
+    r, r_e, dirs = outside_distance(gamut, x)
+    w_uv = _xy_to_uv(np.asarray(gamut.white_xy, float))[0]
+    edge = _uv_to_xyz(w_uv + dirs * np.minimum(r, r_e)[:, None], x[:, 1])
+    de = np.where(r > r_e, de_itp(TargetSpace.xyz_to_ictcp(x) - TargetSpace.xyz_to_ictcp(edge)), 0.0)
+    k = int(np.argmax(de))
+    worst = None
+    if de[k] > 0.0:
+        worst = {"Y": round(float(x[k, 1]), 4), "de_itp": round(float(de[k]), 3),
+                 "outside_duv": round(float(r[k] - r_e[k]), 5)}
+        if sig is not None:
+            worst["signal"] = [round(float(c), 4) for c in sig[keep[k]]]
+    over = int(np.sum(de > jnd))
+    out.update(outside=int(np.sum(r > r_e)), over_half_jnd=int(np.sum(de > 0.5 * jnd)), over_jnd=over,
+               max_de=round(float(de.max()), 3), worst=worst, passed=bool(over == 0))
+    return out

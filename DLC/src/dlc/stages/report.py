@@ -18,6 +18,7 @@ from ..metrics import (
     run_oog_mapping,
     score_samples,
     score_samples_hdr,
+    stage_level_gamut,
     summarize_metrics,
 )
 from ..mhc import find_stage_artifact, parse_ti3, resolve_run_path
@@ -28,7 +29,7 @@ from . import _common
 
 def _score_ti3(ctx: RunContext, ti3: Path, stage: str, gamma: float,
                white_xy: tuple[float, float], *, is_hdr: bool = False,
-               peak_nits: float = 1000.0, reachable: dict | None = None,
+               peak_nits: float = 1000.0, reachable=None,
                oog_mapping: str = "vertex") -> dict[str, Any] | None:
     if not ti3.exists():
         return None
@@ -84,6 +85,13 @@ def build(args, ctx: RunContext) -> StageResult:
     reachable = reachable_primaries_from_mhc_params(dl.get("mhc_params")) if is_hdr else None
     # The run's OOG target policy, memoised by the orchestrator (default "vertex").
     oog = run_oog_mapping(dl.get("calib"))
+    if reachable is not None:
+        # The level edge (D4) when the run's pinned memo enables it — the target its cube was built for; applied to
+        # BOTH sides so before/after compare like with like.
+        gamut, _note = stage_level_gamut(dl.get("calib"), dl.get("mhc_params"), mode="run", oog_mapping=oog,
+                                         white_xy=target_white_xy)
+        if gamut is not None:
+            reachable = gamut
 
     raw_ti3 = find_stage_artifact(ctx, "raw-mhc", "ti3")
     before = _score_ti3(ctx, resolve_run_path(ctx, Path(raw_ti3)), "raw-mhc",

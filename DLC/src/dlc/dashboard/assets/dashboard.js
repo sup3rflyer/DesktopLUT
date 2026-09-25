@@ -382,7 +382,8 @@ function renderState(s) {
     $("de-oog-lab").classList.remove("pending");
     $("de-oog-avg").textContent = num(oog.avg, 2);
     $("de-oog-max").textContent = num(oog.max, 2);
-    const ot = oog.n ? `${oog.n} unreachable patch${oog.n === 1 ? "" : "es"} — large ΔE is expected (clips), not a miss` : "no out-of-gamut patches this stage";
+    const ref = ld.gamut_reference ? ` (live split vs the ${ld.gamut_reference})` : "";
+    const ot = (oog.n ? `${oog.n} unreachable patch${oog.n === 1 ? "" : "es"} — large ΔE is expected (clips), not a miss` : "no out-of-gamut patches this stage") + ref;
     $("de-oog-avg").title = $("de-oog-max").title = ot;
   } else {
     // native gamut not measured yet → show the combined avg/max, mark the split pending
