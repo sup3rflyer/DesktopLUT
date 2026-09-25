@@ -104,7 +104,7 @@ from . import refine_convergence
 from .characterize import CharacterizeConfig, run_characterization
 from .controller import CalibrationController, normalize_mode
 from .desktoplut_client import contract_version_mismatch
-from .correction_store import CorrectionRecord, CorrectionStore
+from .correction_store import MODE_RECORDED, CorrectionRecord, CorrectionStore
 from . import gamut
 from .dip import DipStore, DisplayInstrumentProfile
 from .engine.patches import Transfer
@@ -668,10 +668,16 @@ class Calibration:
             data["white"] = white   # dict: xy, provenance, cct, duv, …
         try:
             store = self._correction_store()
-            ccmx = active_correction(self.profile, store, self.display.name)
-            if ccmx:
-                data["ccmx"] = Path(ccmx).name
-            rec = store.get(self.display.name)
+            corr = resolve_correction(self.profile, store, self.display.name, self.mode)
+            if corr.file:
+                data["ccmx"] = Path(corr.file).name
+            # Where the ccmx came from (this mode's store slot / the profile YAML / none) and
+            # any cross-mode fallback or legacy-inference warning — the header is the one place
+            # every run shows which correction the meter is wired to.
+            data["ccmx_source"] = f"store:{corr.mode}" if corr.source == "store" else corr.source
+            if corr.warning:
+                data["ccmx_warning"] = corr.warning
+            rec = store.get(self.display.name, self.mode)
             if rec and getattr(rec, "spd_file", None):
                 data["spd"] = Path(rec.spd_file).name
         except Exception:  # noqa: BLE001 - the status bar is advisory, never blocks the run
@@ -1512,7 +1518,7 @@ class Calibration:
     def _resolve_white_now(self) -> cp.WhitePointResolution:
         """Resolve the target white, preferring a white SPD captured by a probe-match
         build (item 9) recorded in the store over the profile's ``display.white_spd``."""
-        rec = self._correction_store().get(self.display.name)
+        rec = self._correction_store().get(self.display.name, self.mode)
         spd_override = rec.spd_file if rec else None
         return self.profile.resolve_white(self.monitor, self.target_name,
                                           white_fn=self._white_fn, spd_override=spd_override)
@@ -2158,15 +2164,19 @@ class Calibration:
             # date when present (a refresh recorded since the profile was written),
             # so staleness ages from when the correction was actually made (§10).
             corr_store = self._correction_store()
-            store_rec = corr_store.get(self.display.name)
-            store_made = store_rec.correction_made if store_rec else None
-            # Consult the SAME correction the meter is actually wired to (store overrides the
-            # profile YAML — active_correction), not the (possibly empty) profile YAML, so the
-            # tell can't report "no correction" while the meter is in fact corrected.
+            # Consult the SAME correction the meter is actually wired to (this mode's store slot
+            # overrides the profile YAML — resolve_correction), not the (possibly empty) profile
+            # YAML, so the tell can't report "no correction" while the meter is in fact corrected.
+            # The store's build date only applies when the store's file is the one in use.
+            corr_res = resolve_correction(self.profile, corr_store, self.display.name, self.mode)
+            store_rec = corr_store.get(self.display.name, self.mode)
+            store_made = (store_rec.correction_made
+                          if store_rec and corr_res.source == "store" else None)
+            if corr_res.warning:
+                self.ctx.log(corr_res.warning)
             self.runlog.note("preflight", "checking colorimeter correction (CCMX/SPD) freshness")
             staleness = self.profile.correction_staleness(
-                today=self.run_date, made_override=store_made,
-                file_override=active_correction(self.profile, corr_store, self.display.name))
+                today=self.run_date, made_override=store_made, file_override=corr_res.file)
             # Patch-window placement guard (M3): dogegen has NO monitor-select CLI — its window
             # opens on the Windows primary and is positioned/fullscreened by hand. If the
             # calibration target isn't the primary, patches would land on the WRONG panel and
@@ -2219,10 +2229,17 @@ class Calibration:
             dip_store = self._dip_store()
             store_health = {
                 "correction_store": {"corrupt": corr_store.corrupt,
-                                     "dropped": list(corr_store.dropped)},
+                                     "dropped": list(corr_store.dropped),
+                                     # schema-1 records whose mode slot was inferred, not recorded
+                                     "mode_inferred": corr_store.mode_inferences()},
                 "dip_store": {"corrupt": dip_store.corrupt,
                               "dropped": list(dip_store.dropped)},
             }
+            for note in store_health["correction_store"]["mode_inferred"]:
+                self.ctx.log(f"correction_store: {note['display']} {note['mode']} slot was inferred "
+                             f"from a legacy (per-display) record ({note['basis']}) — "
+                             f"{note.get('correction_file')}"
+                             + (f"; {note['spd_conflict']}" if note.get("spd_conflict") else ""))
             for store_name, health in store_health.items():
                 if health["corrupt"]:
                     self.ctx.log(f"{store_name} file is CORRUPT (unparseable) — running as if "
@@ -2244,7 +2261,8 @@ class Calibration:
                       "seen_monitors": sorted(set(seen_monitors)),
                       "monitor_map": monitor_map,
                       "correction": staleness.as_dict(),
-                      "correction_from_store": store_made is not None,
+                      "correction_from_store": corr_res.source == "store",
+                      "correction_resolution": corr_res.as_dict(),
                       "patch_window": patch_window,
                       "transport": transport,
                       "gamut": gamut_tell,
@@ -2480,17 +2498,21 @@ class Calibration:
             # Persist the white provenance WITHOUT clobbering a correction/SPD a
             # probe-match build (item 9) recorded: keep the prior store record's
             # correction_file/made/spd_file unless this run has newer data.
+            # Only THIS mode's slot is touched, and its correction is carried from the slot
+            # itself — never snapshotted from the profile-YAML fallback (that would mint a
+            # store "correction" this mode never built, and pin a later YAML edit out).
             store = self._correction_store()
-            prior = store.get(self.display.name)
-            corr = self.profile.meter.correction
+            prior = store.get(self.display.name, self.mode)
+            has_corr = bool(prior and prior.correction_file)
             store.record(CorrectionRecord(
-                display=self.display.name,
-                correction_file=active_correction(self.profile, store, self.display.name),
-                correction_made=(prior.correction_made if prior and prior.correction_made else corr.made),
+                display=self.display.name, mode=self.mode,
+                correction_file=(prior.correction_file if has_corr else None),
+                correction_made=(prior.correction_made if has_corr else None),
                 spd_file=res.spd_file or (prior.spd_file if prior else None) or self.display.white_spd,
                 white_xy=[res.xy[0], res.xy[1]], white_provenance=res.provenance,
                 observer=res.observer, anchor=res.anchor, strength=res.strength,
-                updated=self.run_date.isoformat()))
+                updated=self.run_date.isoformat(),
+                mode_source=(prior.mode_source if prior else None)))
             digest = {"white_xy": [round(res.xy[0], 5), round(res.xy[1], 5)],
                       "provenance": res.provenance, "method": res.method, "strength": res.strength,
                       "observer": res.observer, "anchor": res.anchor,
@@ -2575,10 +2597,12 @@ class Calibration:
                 spd_ok = True
             except Exception as exc:  # noqa: BLE001 - bad SPD is non-fatal; just skip it
                 self.ctx.log(f"white SPD {white_sp} present but did not parse ({exc}); ignoring")
+        # Written to THIS mode's slot only — ingesting an HDR correction must never replace
+        # the SDR one (the schema-1 leak: SDR runs measured through the HDR CCMX for months).
         store = self._correction_store()
-        prior = store.get(self.display.name)
+        prior = store.get(self.display.name, self.mode)
         store.record(CorrectionRecord(
-            display=self.display.name,
+            display=self.display.name, mode=self.mode, mode_source=MODE_RECORDED,
             correction_file=str(ccmx),
             correction_made=self.run_date.isoformat(),
             spd_file=(str(white_sp) if spd_ok else (prior.spd_file if prior else None)),
@@ -2588,7 +2612,7 @@ class Calibration:
             anchor=(prior.anchor if prior else None),
             strength=(prior.strength if prior else None),
             updated=self.run_date.isoformat()))
-        self.ctx.log(f"ingested correction {ccmx.name}"
+        self.ctx.log(f"ingested {self.mode} correction {ccmx.name}"
                      + (f" + white SPD {white_sp.name} (SPD double-duty)" if spd_ok else ""))
 
     def stage_probe_match(self) -> StageOutcome:
@@ -2837,7 +2861,8 @@ class Calibration:
                           display=self.display.name,
                           mode=self.mode,           # store keyed by display:mode (SDR/HDR coexist)
                           instrument=self.profile.meter.model,
-                          correction_file=active_correction(self.profile, store, self.display.name),
+                          correction_file=active_correction(self.profile, self._correction_store(),
+                                                            self.display.name, self.mode),
                           made=self.run_date.isoformat(),
                           updated=self.run_date.isoformat())
             # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
@@ -6101,7 +6126,7 @@ class Calibration:
         self.stage_clear_native()      # core clears DesktopLUT to native over the pipe (not the operator's job)
         self.stage_probe_match()       # launches ccxxmake in its own console; ingests the .ccmx on resume
         store = self._correction_store()
-        rec = store.get(self.display.name)
+        rec = store.get(self.display.name, self.mode)
         # Terminal marker on the spine (this flow doesn't go through _finish): without it the
         # dashboard liveness light never leaves "running" on a completed build-correction.
         self.runlog.run_done("completed", flow="build-correction",
@@ -6509,15 +6534,60 @@ def _render_cmd(argv: Sequence[Any]) -> str:
     return subprocess.list2cmdline([str(a) for a in argv])
 
 
-def active_correction(profile: cp.Profile, store: CorrectionStore, display_name: str) -> Optional[str]:
-    """The colorimeter correction the meter should actually use: the store's recorded
-    correction (e.g. a freshly probe-matched one) overrides the profile YAML; falls back
-    to ``profile.meter.correction.file``. The store is the machine-maintained record; the
-    profile is the human-authored config (the §2 skill ⊥ user-data boundary)."""
-    rec = store.get(display_name)
+@dataclass(frozen=True)
+class CorrectionResolution:
+    """Which colorimeter correction a run in ``mode`` uses, and WHY — the evidence the
+    header / preflight carry so a cross-mode fallback is never silent."""
+
+    file: Optional[str]
+    source: str                       # "store" (this mode's slot) | "profile" (YAML) | "none"
+    mode: str
+    mode_source: Optional[str] = None  # the store slot's provenance (legacy inference is flagged)
+    other_modes: tuple[str, ...] = ()  # modes whose store slot holds a correction NOT used here
+    warning: Optional[str] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"file": self.file, "source": self.source, "mode": self.mode,
+                "mode_source": self.mode_source, "other_modes": list(self.other_modes),
+                "warning": self.warning}
+
+
+def resolve_correction(profile: cp.Profile, store: CorrectionStore, display_name: str,
+                       mode: str) -> CorrectionResolution:
+    """Resolve the correction for a ``mode`` run: this mode's store slot (e.g. a freshly
+    probe-matched CCMX) overrides the profile YAML; with no slot it falls back to
+    ``profile.meter.correction.file`` — NEVER to the other mode's stored correction (a
+    CCMX is built against one mode's spectra; the PA32UCXR SDR runs 2026-06-19..09-25
+    measured through the HDR one, ~1.6 dE2000 on full red). The fallback, and a slot whose
+    mode was only inferred from a legacy schema-1 file, carry a ``warning`` for the evidence."""
+    mode = normalize_mode(mode)
+    rec = store.get(display_name, mode)
+    others = tuple(m for m, r in sorted(store.modes_for(display_name).items())
+                   if m != mode and r.correction_file)
     if rec and rec.correction_file:
-        return rec.correction_file
-    return profile.meter.correction.file
+        warning = None
+        if (rec.mode_source or "").startswith("legacy"):
+            warning = (f"{mode} correction {Path(rec.correction_file).name} was assigned to the {mode} "
+                       f"slot by legacy inference ({rec.mode_source}), not recorded for {mode} — confirm "
+                       f"it is the {mode} correction (a fresh build-correction --mode {mode} records it).")
+        return CorrectionResolution(rec.correction_file, "store", mode, rec.mode_source, others, warning)
+    fallback = profile.meter.correction.file
+    warning = None
+    if others:
+        other_files = ", ".join(f"{m}: {Path(store.get(display_name, m).correction_file).name}" for m in others)
+        warning = (f"no {mode} colorimeter correction recorded for {display_name} — falling back to the "
+                   f"profile YAML ({fallback or 'none → RAW meter readings'}); the store's other-mode "
+                   f"correction ({other_files}) is deliberately NOT used for a {mode} run. Build one with "
+                   f"`--flow build-correction --mode {mode}`.")
+    return CorrectionResolution(fallback, "profile" if fallback else "none", mode, None, others, warning)
+
+
+def active_correction(profile: cp.Profile, store: CorrectionStore, display_name: str,
+                      mode: str) -> Optional[str]:
+    """The colorimeter correction file the meter should use for a ``mode`` run — see
+    :func:`resolve_correction` (which also says why). The store is the machine-maintained
+    record; the profile is the human-authored config (the §2 skill ⊥ user-data boundary)."""
+    return resolve_correction(profile, store, display_name, mode).file
 
 
 def _render_report_html(p: dict[str, Any]) -> str:
@@ -7096,7 +7166,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # The active correction comes from the store first (a freshly probe-matched .ccmx)
         # then the profile — so a build-correction run is picked up without editing the YAML.
         store = CorrectionStore.load(correction_store_path(profile, ctx.root))
-        correction = active_correction(profile, store, profile.display_for(args.monitor).name)
+        correction = active_correction(profile, store, profile.display_for(args.monitor).name, eff_mode)
         ccmx = Path(correction) if correction else None
         # DEFAULT (persistent_meter=True): hold ONE interactive spotread open across the whole
         # pass — calibrate once, one reading per trigger. A/B-validated as a true drop-in for the

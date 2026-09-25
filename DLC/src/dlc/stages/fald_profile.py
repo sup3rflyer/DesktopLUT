@@ -489,7 +489,7 @@ def _open_session(args, ctx: RunContext, st: dict[str, Any], *, need_meter: bool
     argyll = Argyll(Path(profile.paths["argyll"]) / "spotread.exe")
     port, _info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
-    ccmx = active_correction(profile, store, profile.display_for(args.monitor).name)
+    ccmx = active_correction(profile, store, profile.display_for(args.monitor).name, mode)
     host, _, srv_port = str(args.dogegen_server or "127.0.0.1:28930").partition(":")
     presenter = ShapesPresenter(host or "127.0.0.1", int(srv_port or 28930), settle_seconds=float(args.settle))
     if not presenter.ping():

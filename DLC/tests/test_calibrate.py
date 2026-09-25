@@ -1379,7 +1379,7 @@ def test_whitepoint_stage_numeric_and_writes_store(tmp_path: Path):
     # the cross-run correction store was written for this display
     store = json.loads((calib._correction_store().path).read_text())
     assert "Synthetic mini-LED" in store["displays"]
-    assert store["displays"]["Synthetic mini-LED"]["white_provenance"] == "numeric"
+    assert store["displays"]["Synthetic mini-LED"]["SDR"]["white_provenance"] == "numeric"
 
 
 def _fake_crt_white(spd_file, *, strength, observer, anchor):
@@ -1413,7 +1413,7 @@ def test_spd_derived_white_flows_through_full_flow(tmp_path: Path):
     assert payload["whitepoint"]["provenance"] == "spd_crt_like"
     # and persisted to the per-display correction store
     store = json.loads(calib._correction_store().path.read_text())
-    rec = store["displays"]["Synthetic mini-LED"]
+    rec = store["displays"]["Synthetic mini-LED"]["SDR"]
     assert rec["white_xy"] == [0.308, 0.325] and rec["spd_file"] == str(spd)
 
 
@@ -1776,7 +1776,7 @@ def test_healthy_stores_read_clean_in_the_preflight_tell(tmp_path: Path):
     calib = _make(tmp_path, "storeok")
     calib.stage_preflight()
     health = calib.calib["stages"]["preflight"]["digest"]["store_health"]
-    assert health == {"correction_store": {"corrupt": False, "dropped": []},
+    assert health == {"correction_store": {"corrupt": False, "dropped": [], "mode_inferred": []},
                       "dip_store": {"corrupt": False, "dropped": []}}
 
 
@@ -1953,7 +1953,7 @@ def test_build_correction_ingests_and_records(tmp_path: Path):
     Path(calib._probe_match_commands()["ccmx_out"]).write_text("CCMX\n0.99 0 0\n", encoding="utf-8")
     result = calib.run("build-correction")
     assert result.status == "completed"
-    rec = calib._correction_store().get("Synthetic mini-LED")
+    rec = calib._correction_store().get("Synthetic mini-LED", "SDR")
     assert rec.correction_file.endswith(".ccmx")
     assert rec.correction_made == "2026-06-16"
 
@@ -1963,7 +1963,7 @@ def test_build_correction_skip_keeps_existing(tmp_path: Path):
                   adjudicator=MappingAdjudicator({"probe-match:build": Decision("skip")}))
     result = calib.run("build-correction")
     assert result.status == "completed"
-    assert calib._correction_store().get("Synthetic mini-LED") is None   # nothing ingested
+    assert calib._correction_store().get("Synthetic mini-LED", "SDR") is None   # nothing ingested
 
 
 def test_build_correction_white_spd_double_duty(tmp_path: Path):
@@ -1977,7 +1977,7 @@ def test_build_correction_white_spd_double_duty(tmp_path: Path):
         "BEGIN_DATA\n" % len(wl) + " ".join("0.5" for _ in wl) + "\nEND_DATA\n",
         encoding="utf-8")
     calib.run("build-correction")
-    rec = calib._correction_store().get("Synthetic mini-LED")
+    rec = calib._correction_store().get("Synthetic mini-LED", "SDR")
     assert rec.spd_file == cmds["white_sp"]        # SPD double-duty recorded
 
 
@@ -1986,9 +1986,9 @@ def test_active_correction_store_overrides_profile(tmp_path: Path):
     from dlc.correction_store import CorrectionRecord
     calib = _make(tmp_path, "active")
     store = calib._correction_store()
-    assert active_correction(calib.profile, store, "Synthetic mini-LED") == "synthetic.ccmx"
-    store.record(CorrectionRecord(display="Synthetic mini-LED", correction_file="fresh.ccmx"))
-    assert active_correction(calib.profile, calib._correction_store(), "Synthetic mini-LED") == "fresh.ccmx"
+    assert active_correction(calib.profile, store, "Synthetic mini-LED", "SDR") == "synthetic.ccmx"
+    store.record(CorrectionRecord(display="Synthetic mini-LED", mode="SDR", correction_file="fresh.ccmx"))
+    assert active_correction(calib.profile, calib._correction_store(), "Synthetic mini-LED", "SDR") == "fresh.ccmx"
 
 
 def test_whitepoint_preserves_probe_matched_correction(tmp_path: Path):
@@ -1997,11 +1997,106 @@ def test_whitepoint_preserves_probe_matched_correction(tmp_path: Path):
     build = _make(tmp_path, "preserve_build")
     Path(build._probe_match_commands()["ccmx_out"]).write_text("CCMX\n", encoding="utf-8")
     build.run("build-correction")
-    fresh = build._correction_store().get("Synthetic mini-LED").correction_file
+    fresh = build._correction_store().get("Synthetic mini-LED", "SDR").correction_file
     # a separate full run sharing the same (tmp_path-rooted) store
     full = _make(tmp_path, "preserve_full")
     full.run("full")
-    assert full._correction_store().get("Synthetic mini-LED").correction_file == fresh
+    assert full._correction_store().get("Synthetic mini-LED", "SDR").correction_file == fresh
+
+
+# -- mode-keyed correction store: an HDR ingest must never become the SDR correction
+# (schema 1 did exactly that: PA32UCXR SDR runs 2026-06-19..09-25 used the HDR CCMX).
+
+def _write_legacy_store(calib, records: dict) -> None:
+    from dlc.calibrate import correction_store_path
+    correction_store_path(calib.profile, calib.ctx.root).write_text(
+        json.dumps({"schema": 1, "displays": records}), encoding="utf-8")
+
+
+def test_hdr_ingest_writes_its_own_slot_and_keeps_sdr(tmp_path: Path):
+    from dlc.calibrate import active_correction
+    sdr = _make(tmp_path, "slot_sdr")
+    Path(sdr._probe_match_commands()["ccmx_out"]).write_text("CCMX\n", encoding="utf-8")
+    sdr.run("build-correction")
+    sdr_file = sdr._correction_store().get("Synthetic mini-LED", "SDR").correction_file
+
+    hdr = _make(tmp_path, "slot_hdr", mode="HDR")          # same (tmp_path-rooted) store
+    hdr_out = hdr._probe_match_commands()["ccmx_out"]
+    assert "_HDR-" in Path(hdr_out).name and hdr_out != sdr_file
+    Path(hdr_out).write_text("CCMX\n", encoding="utf-8")
+    assert hdr.run("build-correction").status == "completed"
+
+    store = hdr._correction_store()
+    assert store.get("Synthetic mini-LED", "SDR").correction_file == sdr_file   # untouched
+    assert store.get("Synthetic mini-LED", "HDR").correction_file == hdr_out
+    assert active_correction(hdr.profile, store, "Synthetic mini-LED", "SDR") == sdr_file
+    assert active_correction(hdr.profile, store, "Synthetic mini-LED", "HDR") == hdr_out
+
+
+def test_missing_mode_falls_back_to_profile_visibly(tmp_path: Path):
+    # Only an HDR correction on record → an SDR run uses the profile YAML, and says so in
+    # the header + preflight evidence (never silently borrows the HDR file).
+    from dlc.correction_store import CorrectionRecord
+    calib = _make(tmp_path, "fallback")
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="HDR", correction_file="panel_HDR-ColorChecker.ccmx"))
+    header = calib._header_data()
+    assert header["ccmx"] == "synthetic.ccmx" and header["ccmx_source"] == "profile"
+    assert "no SDR colorimeter correction" in header["ccmx_warning"]
+    assert "panel_HDR-ColorChecker.ccmx" in header["ccmx_warning"]
+    calib.stage_preflight()
+    digest = calib.calib["stages"]["preflight"]["digest"]
+    res = digest["correction_resolution"]
+    assert res["source"] == "profile" and res["file"] == "synthetic.ccmx"
+    assert res["other_modes"] == ["HDR"] and res["warning"]
+    assert digest["correction_from_store"] is False
+    assert digest["correction"]["file"] == "synthetic.ccmx"
+
+
+def test_header_reports_the_mode_slot_ccmx(tmp_path: Path):
+    from dlc.correction_store import CorrectionRecord
+    calib = _make(tmp_path, "hdr_header", mode="HDR")
+    store = calib._correction_store()
+    store.record(CorrectionRecord(display="Synthetic mini-LED", mode="SDR", correction_file="sdr.ccmx"))
+    store.record(CorrectionRecord(display="Synthetic mini-LED", mode="HDR", correction_file="x_HDR.ccmx"))
+    header = calib._header_data()
+    assert header["ccmx"] == "x_HDR.ccmx" and header["ccmx_source"] == "store:HDR"
+    assert "ccmx_warning" not in header
+
+
+def test_preflight_surfaces_legacy_mode_inference(tmp_path: Path):
+    calib = _make(tmp_path, "legacy")
+    _write_legacy_store(calib, {"Synthetic mini-LED": {"display": "Synthetic mini-LED",
+                                                       "correction_file": "untagged.ccmx"}})
+    calib.stage_preflight()
+    digest = calib.calib["stages"]["preflight"]["digest"]
+    [note] = digest["store_health"]["correction_store"]["mode_inferred"]
+    assert note["mode"] == "SDR" and note["basis"] == "legacy-untagged-assumed-SDR"
+    assert digest["correction_resolution"]["source"] == "store"
+    assert digest["correction"]["file"] == "untagged.ccmx"
+    assert "legacy inference" in digest["correction_resolution"]["warning"]
+
+
+def test_legacy_hdr_record_is_not_used_by_an_sdr_run(tmp_path: Path):
+    calib = _make(tmp_path, "legacy_hdr")
+    _write_legacy_store(calib, {"Synthetic mini-LED": {"display": "Synthetic mini-LED",
+                                                       "correction_file": "P_HDR-ColorChecker.ccmx"}})
+    header = calib._header_data()
+    assert header["ccmx"] == "synthetic.ccmx" and header["ccmx_source"] == "profile"
+    assert "P_HDR-ColorChecker.ccmx" in header["ccmx_warning"]
+
+
+def test_whitepoint_does_not_snapshot_the_yaml_correction(tmp_path: Path):
+    # The whitepoint record must not mint a store "correction" from the profile-YAML fallback
+    # (that would pin the YAML file into the slot as if it were built for this mode).
+    from dlc.calibrate import active_correction
+    calib = _make(tmp_path, "wp_nosnap")
+    calib.run("full")
+    rec = calib._correction_store().get("Synthetic mini-LED", "SDR")
+    assert rec is not None and rec.white_provenance == "numeric"
+    assert rec.correction_file is None and rec.correction_made is None
+    store = calib._correction_store()
+    assert active_correction(calib.profile, store, "Synthetic mini-LED", "SDR") == "synthetic.ccmx"
 
 
 def test_refresh_decision_redirects_to_build_correction(tmp_path: Path):
