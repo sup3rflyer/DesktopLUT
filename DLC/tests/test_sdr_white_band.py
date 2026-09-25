@@ -29,12 +29,15 @@ pytest.importorskip("colour")
 from dlc import calibration_profile as cp
 from dlc import refine_convergence as rc
 from dlc.calibrate import (
+    AdjudicationRequired,
     AutoAdjudicator,
     Calibration,
     CalibrationAborted,
     Decision,
     PatchSizes,
+    SupervisedAdjudicator,
     flow_patch_counts,
+    main,
 )
 from dlc.colormath import invert3x3, matvec, rgb_to_xyz_matrix, xy_to_XYZ
 from dlc.controller import CalibrationController
@@ -45,6 +48,8 @@ from dlc.mhc_cube import (
     choose_sdr_white_nits,
     mhc2_matrix,
     refine_sdr_cube,
+    retarget_sdr_white,
+    sdr_white_margin_rel,
     sdr_white_reach,
 )
 from dlc.optimize import OptimizeConfig
@@ -125,14 +130,56 @@ def test_measured_reach_matches_model_on_an_ideal_panel_and_sees_a_weak_channel(
 @pytest.mark.parametrize("reach,band,peak,nits,status", [
     (125.0, (110, 120), 126.0, 120.0, "in_band"),     # headroom: the band top
     (115.0, (110, 120), 121.0, 115.0, "in_band"),     # the minimum dimming for exact D65
-    (105.0, (110, 120), 121.0, 110.0, "below_band"),  # exact D65 is below the band -> seam
-    (95.0, (110, 120), 100.0, 100.0, "below_band"),   # even lo is above full drive: native peak
+    # exact D65 is only below the band: deliver it there (honest), the seam decides
+    (105.0, (110, 120), 121.0, 105.0, "below_band"),
+    (95.0, (110, 120), 100.0, 95.0, "below_band"),    # even lo is above full drive
+    (125.0, (110, 130), 121.0, 121.0, "in_band"),     # hi capped at the achievable (native) peak
     (None, (110, 120), 121.0, 120.0, "unknown_reach"),
 ])
 def test_choose_sdr_white_nits(reach, band, peak, nits, status):
     c = choose_sdr_white_nits(reach, band, peak)
     assert c["white_nits"] == pytest.approx(nits)
     assert c["status"] == status
+    if reach is not None:
+        # never asks the limiting channel for more than the reach
+        assert c["white_nits"] <= reach + 1e-9
+
+
+def test_white_target_keeps_a_physical_margin_below_the_reach():
+    code = 2.2 / 1023
+    m = sdr_white_margin_rel(meter_rel=0.002, drift_rel=0.0016, code_rel=code)
+    assert m == pytest.approx(math.sqrt(0.002 ** 2 + 0.0016 ** 2 + code ** 2))
+    assert sdr_white_margin_rel(meter_rel=None, drift_rel=None, code_rel=code) == pytest.approx(code)
+    c = choose_sdr_white_nits(115.0, (110, 120), 121.0, margin_rel=m)
+    assert c["white_nits"] == pytest.approx(115.0 * (1 - m))       # strictly below the reach
+    assert c["white_nits"] < 115.0
+
+
+def test_retarget_ignores_read_noise_but_follows_a_real_shift():
+    code = 2.2 / 1023
+    kw = dict(meter_rel=0.002, drift_rel=0.001, code_rel=code)
+    band, peak = (110.0, 120.0), 121.0
+    # Round 1 adopts its (single) read.
+    first = retarget_sdr_white([115.0], 999.0, band, peak, first=True, **kw)
+    assert first["retarget"] is True
+    target = first["white_nits"]
+    # Noisy reads around the same reach (±0.2 %): the target never moves, in either direction.
+    reads = [115.0]
+    for r in (114.8, 115.2, 114.75, 115.1, 114.9, 115.25):
+        reads.append(r)
+        rt = retarget_sdr_white(reads, target, band, peak, **kw)
+        assert rt["retarget"] is False, (reads, rt)
+    # A single deep dip is not a ratchet either (it moves the MEAN by dip/n).
+    rt = retarget_sdr_white(reads + [113.9], target, band, peak, **kw)
+    assert rt["retarget"] is False
+    # A real, sustained shift is significant -> retarget down.
+    shifted = [115.0, 112.0, 111.9, 112.1, 112.0]
+    rt = retarget_sdr_white(shifted, target, band, peak, **kw)
+    assert rt["retarget"] is True and rt["white_nits"] < target
+    # A LOW first read does not cap the run: later reads pull the mean up -> retarget up.
+    low = retarget_sdr_white([112.0], 999.0, band, peak, first=True, **kw)["white_nits"]
+    rt = retarget_sdr_white([112.0, 115.0, 115.1, 114.9, 115.0], low, band, peak, **kw)
+    assert rt["retarget"] is True and rt["white_nits"] > low
 
 
 def test_band_is_a_target_property_with_a_proportional_default():
@@ -320,11 +367,14 @@ def test_exact_white_below_the_band_raises_the_white_band_seam(tmp_path, monkeyp
     out = calib.stage_refine_mhc_grayscale()
     wb = out.digest["white_band"]
     assert wb["status"] == "below_band"
-    assert wb["white_nits"] == pytest.approx(wb["native_peak_nits"])   # lo is above full drive
+    # Honest: exact white is delivered at the (margined) reach, below the band and the peak.
+    assert wb["white_nits"] < wb["native_peak_nits"] < 125.0
+    assert wb["white_nits"] == pytest.approx(wb["reach_nits"] * (1 - wb["margin"]["rel"]), rel=1e-3)
     assert out.digest.get("white_band_below") is True
     seams = [r for r in adj.requests[before:] if r.key == "refine-mhc-grayscale:white-band"]
-    assert len(seams) == 1 and seams[0].options == ("accept", "abort")
+    assert len(seams) == 1 and seams[0].options == ("accept_below_band", "abort")
     assert "BELOW the SDR white band" in seams[0].question
+    assert "closest in-band" not in seams[0].question
 
     # An 'abort' verdict ends the flow (a judgment, not a note).
     adj2 = _Recording({"refine-mhc-grayscale:white-band": "abort"})
@@ -334,6 +384,17 @@ def test_exact_white_below_the_band_raises_the_white_band_seam(tmp_path, monkeyp
     monkeypatch.setattr(calib2, "_sdr_white_band", lambda: ((125.0, 130.0), "test"))
     with pytest.raises(CalibrationAborted):
         calib2.stage_refine_mhc_grayscale()
+
+
+def test_white_band_seam_is_never_auto_accepted_under_supervised(tmp_path, monkeypatch):
+    calib = _make(tmp_path, "band_supervised")
+    calib.run("mhc-only")
+    calib.calib["stages"].pop("refine-mhc-grayscale", None)
+    calib.adjudicator = SupervisedAdjudicator()
+    monkeypatch.setattr(calib, "_sdr_white_band", lambda: ((125.0, 130.0), "test"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_refine_mhc_grayscale()
+    assert exc.value.request.key == "refine-mhc-grayscale:white-band"
 
 
 def test_hdr_refine_judge_keeps_the_mean_only_judgment(tmp_path, monkeypatch):
@@ -363,7 +424,10 @@ def _announced_phases(ctx) -> list[str]:
 
 def test_refine_mhc_flow_rerefines_and_keeps_the_source_cube(tmp_path, monkeypatch):
     src = _make(tmp_path, "src_full")
-    assert src.run("full").status == "completed"
+    src_result = src.run("full")
+    assert src_result.status == "completed"
+    src_result_dir = src_result.results_dir
+    src_report_json = (Path(src_result_dir) / "report.json").read_text(encoding="utf-8")
     src_state_before = (src.ctx.root / "dlc_state.json").read_text(encoding="utf-8")
     controller = src.controller
     installs: list[str] = []
@@ -401,6 +465,14 @@ def test_refine_mhc_flow_rerefines_and_keeps_the_source_cube(tmp_path, monkeypat
     assert (src.ctx.root / "dlc_state.json").read_text(encoding="utf-8") == src_state_before
     report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
     assert report["flow"] == "refine-mhc" and report["mhc_refine"]
+    # Its own results folder: the same-day source report + deliverable are untouched, and the
+    # kept cube's build record rides in this report.
+    assert Path(result.results_dir) != Path(src_result_dir)
+    assert "_refine-mhc_" in Path(result.results_dir).name
+    assert (Path(src_result_dir) / "report.json").read_text(encoding="utf-8") == src_report_json
+    assert report["lut3d"]["kept_from_run"] == str(src.ctx.root.resolve())
+    assert report["lut3d"]["kept_cube_path"] == kept
+    assert report["deliverables"]["cube"] and Path(report["deliverables"]["cube"]).exists()
 
 
 def test_refine_mhc_refuses_without_a_matching_source(tmp_path):
@@ -427,3 +499,93 @@ def test_refine_mhc_is_sdr_only(tmp_path):
                   source_run=tmp_path)
     res = calib.run("refine-mhc")
     assert res.status == "aborted" and "SDR-only" in res.digest["message"]
+
+
+def _full_source(tmp_path, name="src"):
+    src = _make(tmp_path, name)
+    assert src.run("full").status == "completed"
+    return src
+
+
+def _tamper(src, mutate):
+    path = src.ctx.root / "dlc_state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    mutate(state)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_refine_mhc_refuses_a_different_physical_display(tmp_path):
+    src = _full_source(tmp_path)
+    _tamper(src, lambda st: st["calib"]["stages"]["preflight"]["digest"]["monitor_map"]
+            .__setitem__("hardware_id", "OTHER99"))
+    calib = _make(tmp_path, "edid_mismatch", controller=src.controller, source_run=src.ctx.root)
+    res = calib.run("refine-mhc")
+    assert res.status == "aborted" and res.digest["aborted_at"] == "seed-from-run"
+    assert "EDID" in res.digest["message"]
+    assert "enter-neutral" not in calib.calib["stages"]
+
+    src2 = _full_source(tmp_path, "src2")
+    _tamper(src2, lambda st: st["calib"]["stages"]["preflight"]["digest"]
+            .__setitem__("display", "Some Other Monitor"))
+    calib2 = _make(tmp_path, "name_mismatch", controller=src2.controller, source_run=src2.ctx.root)
+    res2 = calib2.run("refine-mhc")
+    assert res2.status == "aborted" and "source display" in res2.digest["message"]
+
+
+def test_refine_mhc_surfaces_a_different_colorimeter_correction(tmp_path):
+    src = _full_source(tmp_path)
+    _tamper(src, lambda st: st["calib"]["stages"]["preflight"]["digest"]["correction"]
+            .__setitem__("file", "some/other.ccmx"))
+    adj = _Recording()
+    calib = _make(tmp_path, "ccmx_diff", controller=src.controller, source_run=src.ctx.root,
+                  adjudicator=adj)
+    res = calib.run("refine-mhc")
+    seams = [r for r in adj.requests if r.key == "seed-from-run:mismatch"]
+    assert len(seams) == 1 and seams[0].recommendation == "abort"
+    assert "colorimeter correction" in seams[0].question
+    assert res.status == "aborted"            # AutoAdjudicator takes the recommended abort
+    # ...and it is never a silent auto-accept under --supervised.
+    calib2 = _make(tmp_path, "ccmx_diff_sup", controller=src.controller, source_run=src.ctx.root,
+                   adjudicator=SupervisedAdjudicator())
+    with pytest.raises(AdjudicationRequired):
+        calib2.run("refine-mhc")
+
+
+def test_refine_mhc_refuses_a_source_run_that_has_not_finished(tmp_path):
+    src = _full_source(tmp_path)
+    _tamper(src, lambda st: st["calib"]["decisions"].pop("verify:accept", None))
+    calib = _make(tmp_path, "src_live", controller=src.controller, source_run=src.ctx.root)
+    res = calib.run("refine-mhc")
+    assert res.status == "aborted" and "verify/apply gate" in res.digest["message"]
+
+    src2 = _full_source(tmp_path, "src_mhc_only")
+    _tamper(src2, lambda st: st["calib"]["stages"].pop("build-install-3dlut", None))
+    calib2 = _make(tmp_path, "src_no_cube", controller=src2.controller, source_run=src2.ctx.root)
+    res2 = calib2.run("refine-mhc")
+    assert res2.status == "aborted" and "build-install-3dlut" in res2.digest["message"]
+
+
+def test_resume_with_a_different_source_or_band_refuses(tmp_path):
+    src = _full_source(tmp_path)
+    other = _full_source(tmp_path, "other_src")
+    calib = _make(tmp_path, "resume_conflict", controller=src.controller, source_run=src.ctx.root,
+                  white_band=(110.0, 120.0))
+    assert calib.run("refine-mhc").status == "completed"
+    resumed = _make(tmp_path, "resume_conflict", controller=src.controller,
+                    source_run=other.ctx.root)
+    res = resumed.run("refine-mhc")
+    assert res.status == "aborted" and res.digest["aborted_at"] == "resume-args"
+    assert resumed.calib["source_run"] == str(src.ctx.root.resolve())   # the record is untouched
+    resumed2 = _make(tmp_path, "resume_conflict", controller=src.controller,
+                     white_band=(100.0, 110.0))
+    assert resumed2.run("refine-mhc").digest["aborted_at"] == "resume-args"
+    # Same values (or none) resume cleanly.
+    same = _make(tmp_path, "resume_conflict", controller=src.controller, source_run=src.ctx.root)
+    assert same.run("refine-mhc").status == "completed"
+
+
+def test_malformed_white_band_is_a_clean_cli_error(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--flow", "refine-mhc", "--white-band", "abc"])
+    assert exc.value.code == 2
+    assert "white_nits_band" in capsys.readouterr().err

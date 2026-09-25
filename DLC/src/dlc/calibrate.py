@@ -451,11 +451,23 @@ class Calibration:
         self.calib.setdefault("stages", {})
         self.calib.setdefault("decisions", {})
         # Run-level SDR white-band override (--white-band) and the refine-mhc flow's source run
-        # (--source-run): persisted in the run record so a flagless resume keeps them.
-        if white_band is not None:
-            self.calib["white_band_override"] = list(cp.parse_white_nits_band(white_band))
-        if source_run is not None:
-            self.calib["source_run"] = str(Path(source_run).resolve())
+        # (--source-run): persisted in the run record so a flagless resume keeps them. A resume
+        # that asks for a DIFFERENT value than the memoised stages were run with is refused in
+        # run() (never silently re-targeted under already-recorded stages).
+        self._arg_conflicts: list[dict[str, Any]] = []
+        has_memo = bool(self.calib.get("stages"))
+        requested = (
+            ("white_band_override",
+             list(cp.parse_white_nits_band(white_band)) if white_band is not None else None),
+            ("source_run", str(Path(source_run).resolve()) if source_run is not None else None))
+        for key, val in requested:
+            if val is None:
+                continue
+            stored = self.calib.get(key)
+            if has_memo and stored != val:
+                self._arg_conflicts.append({"field": key, "requested": val, "persisted": stored})
+            else:
+                self.calib[key] = val
         self.target_name: Optional[str] = self.calib.get("target")
         # Reconcile mode + bit depth against the persisted run record: a resume's CLI args
         # default to SDR/8-bit and must NOT override the run's fixed spec (which both
@@ -3991,21 +4003,7 @@ class Calibration:
         wx, wy = white_xy
         noise = self._dark_noise_entries(ti3_path)
         gamma = float(spec.gamma or 2.2)
-        dip = self._dip()
-        bands = [b for b in (dip.noise_model if dip else []) if b.sigma_rel is not None]
-
-        def lum_se(nits: float) -> Optional[float]:
-            # The meter's per-read luminance repeatability at this level (the DIP's measured noise
-            # model) — per-read, not SE: the conservative side when a level's read count is unknown.
-            if not bands:
-                return None
-            if nits <= bands[0].nits:
-                return bands[0].sigma_rel
-            for lo, hi in zip(bands, bands[1:]):
-                if lo.nits <= nits <= hi.nits and hi.nits > lo.nits:
-                    f = (nits - lo.nits) / (hi.nits - lo.nits)
-                    return lo.sigma_rel + f * (hi.sigma_rel - lo.sigma_rel)
-            return bands[-1].sigma_rel
+        lum_se = self._meter_lum_sigma_rel
 
         levels: list[refine_convergence.GreyLevel] = []
         below = above = 0
@@ -4059,6 +4057,22 @@ class Calibration:
         out["band_nits"] = [round(dark_floor_nits, 3), round(top_nits, 1)]
         out["output_bits"] = bits
         return out
+
+    def _meter_lum_sigma_rel(self, nits: float) -> Optional[float]:
+        """The meter's per-read luminance repeatability (relative) at ``nits`` — the DIP's
+        measured noise model, interpolated; per-read, not SE (the conservative side when a
+        level's read count is unknown). ``None`` without a DIP noise model."""
+        dip = self._dip()
+        bands = [b for b in (dip.noise_model if dip else []) if b.sigma_rel is not None]
+        if not bands:
+            return None
+        if nits <= bands[0].nits:
+            return bands[0].sigma_rel
+        for lo, hi in zip(bands, bands[1:]):
+            if lo.nits <= nits <= hi.nits and hi.nits > lo.nits:
+                f = (nits - lo.nits) / (hi.nits - lo.nits)
+                return lo.sigma_rel + f * (hi.sigma_rel - lo.sigma_rel)
+        return bands[-1].sigma_rel
 
     def _refine_round_judgment(self, *args, **kwargs) -> dict[str, Any]:
         """:meth:`_refine_round_analysis`, guarded: an analysis failure (the HDR path lazy-loads
@@ -4400,7 +4414,8 @@ class Calibration:
 
             from .measure_loop import match_level_noise
             from .mhc_cube import (choose_sdr_white_nits, mhc2_matrix, read_1d_cube, refine_sdr_cube,
-                                   sdr_white_reach, write_1d_cube)
+                                   retarget_sdr_white, sdr_white_margin_rel, sdr_white_reach,
+                                   write_1d_cube)
 
             # Installed SDR MHC2 matrix: src = sRGB (the C++ SDR srcPrim), display = native primaries +
             # MEASURED native white (set_white sends native white) → M performs native→D65. rowsums
@@ -4460,24 +4475,39 @@ class Calibration:
             # white was the native full-drive luminance (target_luminance), which is unreachable at
             # D65 whenever a rowsum exceeds 1 (a channel asked for more than full drive — the
             # PA32UCXR 2026-09-25 green 1.0065): white stayed ~1 dE off while the greys converged.
-            # The model reach (rowsums) seeds it; each round's MEASURED white refines it (lowered
-            # only, by more than one output code, so read noise can't ratchet it). Exact target
-            # white below the band is not code's call: ``below_band`` -> the white-band seam. ---
+            # The target sits a PHYSICAL margin below the reach (white-read σ ⊕ settled thermal
+            # wander ⊕ one output code), so the limiting channel never sits at exactly full drive.
+            # The model reach (rowsums) seeds it; the MEASURED reach (every round's white) refines
+            # it through a noise-robust estimate (retarget_sdr_white: the mean of the reads, moved
+            # only on a > 3σ change), so one noisy read neither ratchets white down nor resets the
+            # judge. Exact target white below the band is not code's call: ``below_band`` -> the
+            # white-band seam (never auto-accepted). ---
             band, band_source = self._sdr_white_band()
             out_bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
             code_rel = gamma / float(2 ** out_bits - 1)    # one output code's light step at white
+            meter_rel = self._meter_lum_sigma_rel(float(peak))
+            drift_rel = refine_convergence.panel_floor_from_thermal(
+                self.calib.get("thermal_align")).drift_rel
+            margin_rel = sdr_white_margin_rel(meter_rel=meter_rel, drift_rel=drift_rel,
+                                              code_rel=code_rel)
             model_reach = sdr_white_reach(primaries, (nwx, nwy), float(peak), rowsums,
                                           gamma=gamma, target_white_xy=(wx, wy))
-            wb_choice = choose_sdr_white_nits(model_reach["reach_nits"], band, float(peak))
+            wb_choice = choose_sdr_white_nits(model_reach["reach_nits"], band, float(peak),
+                                              margin_rel=margin_rel)
             white_nits = float(wb_choice["white_nits"])
             white_band: dict[str, Any] = {
                 "band": [band[0], band[1]], "band_source": band_source,
+                "hi_effective": wb_choice.get("hi_effective"),
                 "native_peak_nits": round(float(peak), 4), "model_reach": model_reach,
                 "reach_nits": wb_choice.get("reach_nits"), "reach_basis": model_reach.get("basis"),
                 "limiting_channel": model_reach.get("limiting_channel"),
                 "white_nits": round(white_nits, 4), "status": wb_choice["status"],
                 "dim_pct_vs_native": wb_choice.get("dim_pct_vs_native"),
-                "code_rel": round(code_rel, 6), "retargets": 0, "reach_log": []}
+                "margin": {"rel": round(margin_rel, 6),
+                           "meter_rel": (round(meter_rel, 6) if meter_rel is not None else None),
+                           "drift_rel": round(drift_rel, 6), "code_rel": round(code_rel, 6)},
+                "retargets": 0, "reach_log": []}
+            measured_reaches: list[float] = []
 
             rnd = 0
             while True:
@@ -4502,26 +4532,35 @@ class Calibration:
                     except Exception as exc:  # noqa: BLE001 - evidence; the model reach stands
                         mreach = {"reach_nits": None, "basis": "error",
                                   "error": f"{type(exc).__name__}: {exc}"}
-                    white_band["reach_log"].append({"round": rnd, "white_Y": round(top_s.xyz[1], 4),
-                                                    **mreach})
+                    log = {"round": rnd, "white_Y": round(top_s.xyz[1], 4), **mreach}
                     if mreach.get("basis") == "measured" and mreach.get("reach_nits"):
-                        choice = choose_sdr_white_nits(mreach["reach_nits"], band, float(peak))
-                        new_nits = float(choice["white_nits"])
+                        measured_reaches.append(float(mreach["reach_nits"]))
                         first = not white_band.get("measured")
-                        if first or new_nits < white_nits * (1.0 - code_rel):
+                        rt = retarget_sdr_white(measured_reaches, white_nits, band, float(peak),
+                                                meter_rel=meter_rel, drift_rel=drift_rel,
+                                                code_rel=code_rel, first=first)
+                        log["retarget"] = {k: rt.get(k) for k in
+                                           ("retarget", "estimate_nits", "n", "sigma_nits",
+                                            "delta_nits", "threshold_nits", "white_nits", "status")}
+                        if rt["retarget"]:
+                            new_nits = float(rt["white_nits"])
                             if not first and new_nits != white_nits:
-                                # Lowered mid-loop: earlier rounds were judged against a white the
-                                # panel can't reach — restart the judgment + best tracking from here.
+                                # A SIGNIFICANT change of the reach estimate: earlier rounds were
+                                # judged against a different white — restart the judgment + best
+                                # tracking from here.
                                 white_band["retargets"] += 1
                                 conv, scores = None, []
                                 best_path, best_avg = installed_path, float("inf")
                             white_nits = new_nits
                             white_band.update(
                                 measured=True, white_nits=round(white_nits, 4),
-                                status=choice["status"], reach_nits=choice.get("reach_nits"),
-                                reach_basis="measured",
+                                status=rt["status"], reach_nits=rt.get("reach_nits"),
+                                reach_basis="measured", reach_n=rt.get("n"),
+                                reach_sigma_nits=rt.get("sigma_nits"),
+                                usable_nits=rt.get("usable_nits"),
                                 limiting_channel=mreach.get("limiting_channel"),
-                                dim_pct_vs_native=choice.get("dim_pct_vs_native"))
+                                dim_pct_vs_native=rt.get("dim_pct_vs_native"))
+                    white_band["reach_log"].append(log)
                 conv = self._refine_round_judgment(
                     samples, res.ti3_path, conv, white_xy=(wx, wy), dark_floor_nits=dark_floor,
                     top_nits=float(white_nits), channel_peak_xyz=channel_peak_xyz,
@@ -4664,26 +4703,31 @@ class Calibration:
         return spec.sdr_white_band, spec.sdr_white_band_source
 
     def _white_band_seam(self, outcome: StageOutcome) -> None:
-        """Exact target white needs a luminance BELOW the SDR white band: the refine held white at
-        the closest in-band luminance (the limiting channel at full drive, white off target by what
-        remains). Trading more luminance than the band authorizes — or accepting the in-band white
-        — is a judgment, so it is a seam, never a silent accept (DESIGN LAW)."""
+        """Exact target white exists only BELOW the SDR white band: the refine delivered it there
+        (the margined reach) because no in-band luminance can give it. Keeping that below-band
+        white — trading more luminance than the owner's band authorizes — is the owner's call, so
+        the recommendation is deliberately NON-benign (``accept_below_band``): the seam always
+        pauses for the LLM, even under ``--supervised`` (never an auto-accept). ``abort`` ends the
+        flow; a different band is a re-run with ``--white-band LO,HI``."""
         wb = (outcome.digest or {}).get("white_band") or {}
         if wb.get("status") != "below_band":
             return
         top = ((outcome.digest.get("convergence") or {}).get("top") or {})
         lo, hi = (wb.get("band") or [None, None])[:2]
         question = (
-            f"exact target white needs {wb.get('reach_nits')} nits ({wb.get('limiting_channel')} "
-            f"channel at full drive, {wb.get('reach_basis')} reach) — BELOW the SDR white band "
-            f"[{lo}, {hi}] nits. The refine held white at {wb.get('white_nits')} nits (the closest "
-            f"in-band luminance), leaving white {top.get('de')} dE2000 off target. Accept this "
-            "in-band white, or abort (re-run with --white-band LO,HI to trade more luminance for an "
-            "exact white)?")
+            f"an exact target white is only reachable at {wb.get('reach_nits')} nits "
+            f"({wb.get('limiting_channel')} channel at full drive, {wb.get('reach_basis')} reach) — "
+            f"BELOW the SDR white band [{lo}, {hi}] nits (native peak {wb.get('native_peak_nits')}). "
+            f"The refine delivered white at {wb.get('white_nits')} nits (the reach less a "
+            f"{(wb.get('margin') or {}).get('rel')} relative physical margin; white now "
+            f"{top.get('de')} dE2000 off target). 'accept_below_band' keeps this dimmer, exact "
+            "white (the verify/apply gate still follows); 'abort' ends the run with nothing applied "
+            "— re-run with --white-band LO,HI to choose a different band.")
         self._abort_if(self.adjudicate(AdjudicationRequest(
             key="refine-mhc-grayscale:white-band", seam=SEAM_OPTIMIZE, stage="refine-mhc-grayscale",
-            question=question, options=("accept", "abort"), recommendation="accept",
-            digest=outcome.digest)),
+            question=question, options=("accept_below_band", "abort"),
+            recommendation="accept_below_band",
+            digest={**outcome.digest, "owner_band_exceeded": True})),
             stage="refine-mhc-grayscale",
             message="refine-mhc-grayscale: aborted at the white-band seam (exact white is below the band)")
 
@@ -5786,7 +5830,14 @@ class Calibration:
             root = Path(self.profile.source_path).resolve().parent if self.profile.source_path else self.ctx.root.parents[1]
             out = root / out
         safe_display = self.display.name.replace(" ", "_").replace("/", "_")
-        folder = out / f"{safe_display}_{self.run_date.isoformat()}_{self.mode}"
+        name = f"{safe_display}_{self.run_date.isoformat()}_{self.mode}"
+        if self.calib.get("flow") == "refine-mhc":
+            # Its own folder, stamped with THIS run's id (stable across resume): a same-day
+            # refine-mhc must never overwrite the source run's report/deliverable (its 3D-LUT build
+            # record would be lost — even on a revert).
+            stamp = "_".join(self.ctx.root.name.split("_")[:2])
+            name += f"_refine-mhc_{stamp}"
+        folder = out / name
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
@@ -5840,10 +5891,15 @@ class Calibration:
             "mhc": sd("build-install-mhc") or sd("install-mhc") or None,
             "mhc_refine": sd("refine-mhc-grayscale") or sd("refine-mhc-cube") or None,
             "source_run": self.calib.get("source_run"),
-            "lut3d": {k: sd("build-install-3dlut").get(k) for k in
-                      ("converged", "best_max_de", "best_mean_de", "best_max_de_report",
-                       "best_mean_de_report", "metric", "optimize_metric", "above_threshold",
-                       "physical_floor", "cube_path")} if sd("build-install-3dlut") else None,
+            "lut3d": ({k: sd("build-install-3dlut").get(k) for k in
+                       ("converged", "best_max_de", "best_mean_de", "best_max_de_report",
+                        "best_mean_de_report", "metric", "optimize_metric", "above_threshold",
+                        "physical_floor", "cube_path")} if sd("build-install-3dlut")
+                      # refine-mhc KEEPS the source run's cube: carry that cube's build record.
+                      else (dict(sd("seed-from-run").get("source_lut3d") or {},
+                                 kept_from_run=sd("seed-from-run").get("source_run"),
+                                 kept_cube_path=sd("reapply-3dlut").get("cube_path"))
+                            if sd("seed-from-run") else None)),
             "verification": sd("verify") or None,
             "decisions": self.calib.get("decisions", {}),
             "deliverables": {"cube": str(cube_out) if cube_out else None,
@@ -5903,6 +5959,21 @@ class Calibration:
                     " but the persisted run spec is " + ", ".join(
                     f"{c['field']}={c['persisted']}" for c in conflicts) +
                     " — kept the persisted spec (the run's mode/flow/bit_depth are fixed at creation)."))
+        if self._arg_conflicts:
+            msg = ("resume requested " + ", ".join(
+                f"{c['field']}={c['requested']}" for c in self._arg_conflicts)
+                + " but this run's memoised stages were made with " + ", ".join(
+                f"{c['field']}={c['persisted']}" for c in self._arg_conflicts)
+                + " — refusing to diverge from them: resume without the flag (or with the recorded "
+                "value), or start a NEW run for the new value.")
+            self.runlog.anomaly("run", run_arg_conflict=True, conflicts=self._arg_conflicts,
+                                message=msg)
+            self.runlog.run_done("aborted", aborted_at="resume-args", message=msg)
+            return CalibrationResult(
+                flow=flow, monitor=self.monitor, mode=self.mode, target=self.target_name,
+                status="aborted", stages=list(self.calib["stages"].keys()), results_dir=None,
+                report_path=None, digest={"aborted_at": "resume-args", "message": msg,
+                                          "conflicts": self._arg_conflicts})
         self._publish_active_pointer()   # let the dashboard find this run (and the next)
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
         if self._enable_watchdog:
@@ -6357,8 +6428,30 @@ class Calibration:
                 problems.append(f"source monitor {src_state.get('monitor')} != {self.monitor}")
             if src_calib.get("target") and src_calib.get("target") != self.target_name:
                 problems.append(f"source target {src_calib.get('target')!r} != {self.target_name!r}")
-            if (stages.get("build-install-mhc") or {}).get("status") != "done":
-                problems.append("the source run never completed build-install-mhc")
+            for need in ("build-install-mhc", "build-install-3dlut", "verify"):
+                if (stages.get(need) or {}).get("status") != "done":
+                    problems.append(f"the source run has not completed {need} (still running, "
+                                    "aborted, or not a full run)")
+            if not (src_calib.get("decisions") or {}).get("verify:accept"):
+                problems.append("the source run never passed its verify/apply gate (still live?)")
+            # DISPLAY identity, not just the monitor index (indices were remapped 2026-09): the
+            # display name + the EDID hardware id this run's preflight read vs the source's.
+            here = ((self.calib["stages"].get("preflight") or {}).get("digest") or {})
+            there = ((stages.get("preflight") or {}).get("digest") or {})
+            here_name = here.get("display") or self.display.name
+            there_name = there.get("display")
+            try:
+                there_name = there_name or json.loads(
+                    (src_root / "manifest.json").read_text(encoding="utf-8")).get("display")
+            except (OSError, ValueError):
+                pass
+            if there_name != here_name:
+                problems.append(f"source display {there_name!r} != this run's {here_name!r}")
+            here_hw = (here.get("monitor_map") or {}).get("hardware_id")
+            there_hw = (there.get("monitor_map") or {}).get("hardware_id")
+            if here_hw and there_hw and here_hw != there_hw:
+                problems.append(f"source panel EDID {there_hw} != the panel now at monitor "
+                                f"{self.monitor} ({here_hw}) — a different physical display")
             nw = params.get("measured_white") or {}
             if not (params.get("primaries") and nw.get("x") is not None and nw.get("y") is not None
                     and params.get("target_luminance") and params.get("base_grayscale")):
@@ -6398,6 +6491,19 @@ class Calibration:
             _common.save_dlc_state(self.ctx, self._state)
             src_refine = (stages.get("refine-mhc-grayscale") or {}).get("digest") or {}
             src_verify = (stages.get("verify") or {}).get("digest") or {}
+            src_3d = (stages.get("build-install-3dlut") or {}).get("digest") or {}
+            here_ccmx = (here.get("correction") or {}).get("file")
+            there_ccmx = (there.get("correction") or {}).get("file")
+
+            def _norm(f: Any) -> Optional[str]:
+                return os.path.normcase(os.path.normpath(str(f))) if f else None
+
+            judge: dict[str, Any] = {}
+            if _norm(here_ccmx) != _norm(there_ccmx):
+                judge["correction_differs"] = {"source": there_ccmx, "now": here_ccmx}
+            if not (here_hw and there_hw):
+                judge["identity_unverified"] = {"source_hardware_id": there_hw,
+                                                "now_hardware_id": here_hw}
             digest = {"source_run": str(src_root), "source_flow": src_calib.get("flow"),
                       "base_cube": str(base_dst), "base_note": base_note,
                       "cube_path": cube.get("path"), "cube_source": cube.get("source"),
@@ -6409,13 +6515,42 @@ class Calibration:
                       "source_verify": {k: src_verify.get(k) for k in
                                         ("white_de2000", "grayscale_avg_de2000", "avg_de2000",
                                          "max_de2000")} if src_verify else None,
-                      "thermal_prior": bool(ta)}
+                      "thermal_prior": bool(ta),
+                      "identity": {"display": here_name, "hardware_id": here_hw,
+                                   "source_hardware_id": there_hw},
+                      "correction": {"now": here_ccmx, "source": there_ccmx},
+                      "source_lut3d": {k: src_3d.get(k) for k in
+                                       ("converged", "best_max_de", "best_mean_de", "metric",
+                                        "optimize_metric", "physical_floor", "cube_path")},
+                      "needs_judgment": judge or None}
             if not cube.get("path"):
                 digest["note"] = "the source run left no 3D LUT — the MHC is re-refined alone"
             return StageOutcome("seed-from-run", "done", digest=digest,
                                 data={"cube_path": cube.get("path"), "base_cube": str(base_dst),
                                       "source_run": str(src_root)})
-        return self._stage("seed-from-run", run)
+        outcome = self._stage("seed-from-run", run)
+        judge = (outcome.digest or {}).get("needs_judgment") or {}
+        if judge:
+            # Not provably the same measurement chain: a different colorimeter correction (the
+            # re-refine would read the panel through another ccmx than the kept cube was built
+            # under), or a panel identity that can't be confirmed. A judgment, recommended abort
+            # (non-benign: always pauses, even under --supervised).
+            what = []
+            if "correction_differs" in judge:
+                cd = judge["correction_differs"]
+                what.append(f"the active colorimeter correction differs from the source run's "
+                            f"({cd.get('now')!r} vs {cd.get('source')!r})")
+            if "identity_unverified" in judge:
+                what.append("the panel's EDID identity could not be compared (a hardware id is "
+                            "missing on one side)")
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="seed-from-run:mismatch", seam=SEAM_STACK, stage="seed-from-run",
+                question=("refine-mhc: " + "; ".join(what) + ". Proceed anyway (the re-refined MHC "
+                          "and the kept 3D LUT may disagree), or abort?"),
+                options=("abort", "proceed_anyway"), recommendation="abort",
+                digest=outcome.digest)),
+                stage="seed-from-run", message="refine-mhc: aborted at the source-run mismatch seam")
+        return outcome
 
     def stage_install_mhc(self) -> StageOutcome:
         """Reinstall the seeded MHC (no derivation — ``seed-from-run`` supplied ``mhc_params``)
@@ -7071,7 +7206,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--source-run", type=Path, default=None, dest="source_run",
                         help="refine-mhc flow: the COMPLETED run whose MHC is re-refined and whose "
                              "3D LUT is kept (read-only; the refine runs in a new run dir)")
-    parser.add_argument("--white-band", type=str, default=None, dest="white_band", metavar="LO,HI",
+    def _white_band_arg(text: str) -> tuple[float, float]:
+        try:
+            return cp.parse_white_nits_band(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    parser.add_argument("--white-band", type=_white_band_arg, default=None, dest="white_band",
+                        metavar="LO,HI",
                         help="SDR white-luminance band in nits for the MHC grayscale refine (overrides "
                              "the target's white_nits_band; default 11/12..1 x the nominal white): the "
                              "refine dims white inside it just enough for an exact target white")
@@ -7652,8 +7794,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             thermal_align=args.thermal_align,
                             hook_routing_policy=args.hook_routing_policy,
                             mhc_top_hold=(args.top_hold == "on"),
-                            white_band=(cp.parse_white_nits_band(args.white_band)
-                                        if args.white_band else None),
+                            white_band=args.white_band,
                             source_run=args.source_run,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))

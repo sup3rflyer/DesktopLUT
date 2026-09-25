@@ -75,6 +75,8 @@ __all__ = [
     "refine_sdr_cube",
     "sdr_white_reach",
     "choose_sdr_white_nits",
+    "sdr_white_margin_rel",
+    "retarget_sdr_white",
     "refine_sdr_grayscale_legacy",
     "write_1d_cube",
     "read_1d_cube",
@@ -1114,38 +1116,92 @@ def sdr_white_reach(primaries: Mapping[str, float], native_white_xy: tuple[float
             "basis": basis}
 
 
+def sdr_white_margin_rel(*, meter_rel: Optional[float], drift_rel: Optional[float],
+                         code_rel: float) -> float:
+    """The relative luminance margin kept BELOW the measured reach, so the limiting channel is
+    never asked for exactly full drive: the white read's luminance repeatability (the meter's
+    per-read σ at white, from the DIP noise model) ⊕ the panel's settled between-rounds wander
+    (the thermal-alignment floor) ⊕ one output code at white. Quadrature sum of measured floors —
+    no magic percentage; a missing term contributes 0."""
+    terms = [float(v) for v in (meter_rel, drift_rel, code_rel)
+             if v is not None and math.isfinite(float(v)) and float(v) > 0.0]
+    return math.sqrt(sum(t * t for t in terms))
+
+
 def choose_sdr_white_nits(reach_nits: Optional[float], band: tuple[float, float],
-                          native_peak_nits: float) -> dict:
+                          native_peak_nits: float, *, margin_rel: float = 0.0) -> dict:
     """Pick the SDR refine's white luminance from the band ``(lo, hi)`` (a TARGET property —
-    ``TargetSpec.sdr_white_band``) and the panel's target-white reach (:func:`sdr_white_reach`).
+    ``TargetSpec.sdr_white_band``) and the panel's target-white reach (:func:`sdr_white_reach`),
+    backed off by ``margin_rel`` (:func:`sdr_white_margin_rel`) so the limiting channel keeps a
+    physically-sized headroom instead of sitting at exactly full drive.
 
     Owner rule (2026-09-25): white may sit anywhere in ``[lo, hi]``; trade the fewest nits needed
-    for an exact target white. The band is pre-authorized, so choosing inside it is mechanical:
+    for an exact target white. ``hi`` is capped at the native peak (nothing brighter exists). With
+    ``usable = reach * (1 - margin_rel)``:
 
-    * ``reach >= hi``       -> ``hi`` (``in_band``: the band top; the target white has headroom);
-    * ``lo <= reach < hi``  -> ``reach`` (``in_band``: the MINIMUM dimming that gives every channel
-      the headroom to hit the target white);
-    * ``reach < lo``        -> the closest in-band luminance, ``lo`` (or the native peak if even
-      ``lo`` is above full drive): exact target white would need going BELOW the band —
-      ``below_band``, which the orchestrator raises as a seam (that trade is the LLM's/owner's
-      call, never code's).
+    * ``usable >= hi``       -> ``hi`` (``in_band``: the band top; the target white has headroom);
+    * ``lo <= usable < hi``  -> ``usable`` (``in_band``: the minimum dimming, with margin);
+    * ``usable < lo``        -> ``usable`` (``below_band``): an exact target white exists only BELOW
+      the band. No in-band luminance can give it, and holding white in-band would leave it off
+      target — which of the two the owner wants is the white-band SEAM's question, never code's.
+      (Even ``lo`` may exceed the panel's native peak here.)
 
     ``reach`` unknown => the band top capped at the native peak (``unknown_reach``)."""
     lo, hi = float(band[0]), float(band[1])
     peak = float(native_peak_nits)
+    hi_eff = min(hi, peak) if peak > 0 else hi
+    base = {"band": [lo, hi], "hi_effective": round(hi_eff, 4),
+            "margin_rel": round(float(margin_rel), 6)}
     if reach_nits is None or not math.isfinite(reach_nits):
-        return {"white_nits": round(min(hi, peak), 4), "status": "unknown_reach",
-                "band": [lo, hi], "reach_nits": None}
+        return {**base, "white_nits": round(hi_eff, 4), "status": "unknown_reach",
+                "reach_nits": None, "usable_nits": None}
     reach = float(reach_nits)
-    if reach >= hi:
-        nits, status = hi, "in_band"
-    elif reach >= lo:
-        nits, status = reach, "in_band"
+    usable = reach * (1.0 - max(0.0, float(margin_rel)))
+    if usable >= hi_eff:
+        nits, status = hi_eff, "in_band"
+    elif usable >= lo:
+        nits, status = usable, "in_band"
     else:
-        nits, status = min(lo, peak), "below_band"
-    return {"white_nits": round(nits, 4), "status": status, "band": [lo, hi],
-            "reach_nits": round(reach, 4),
+        nits, status = usable, "below_band"
+    return {**base, "white_nits": round(nits, 4), "status": status,
+            "reach_nits": round(reach, 4), "usable_nits": round(usable, 4),
             "dim_pct_vs_native": round(100.0 * (1.0 - nits / peak), 3) if peak > 0 else None}
+
+
+def retarget_sdr_white(reaches: Sequence[float], current_nits: float,
+                       band: tuple[float, float], native_peak_nits: float, *,
+                       meter_rel: Optional[float], drift_rel: Optional[float], code_rel: float,
+                       first: bool = False, k_sigma: float = 3.0) -> dict:
+    """Should the refine move its white target, given every MEASURED reach so far?
+
+    The reach is a panel property (the measured gain already divides out whatever drive the cube
+    spends), so each round's measurement is another read of the SAME quantity: the estimate is
+    their MEAN, and its uncertainty is ``mean * sqrt(meter_rel**2 / n + drift_rel**2)`` (read noise
+    averages down, thermal wander does not), or the empirical standard error of the reads if that
+    is larger. The target moves — up OR down — only when the band choice from the mean differs from
+    the current target by more than ``k_sigma`` of that uncertainty and more than one output code;
+    a single noisy read therefore can't ratchet white down (nor reset the judge), and a low FIRST
+    read doesn't cap the run (later reads pull the mean back and a significant rise retargets up).
+    ``first`` (the first measured reach replacing the model seed) always adopts."""
+    vals = [float(r) for r in reaches if r is not None and math.isfinite(float(r)) and float(r) > 0]
+    margin = sdr_white_margin_rel(meter_rel=meter_rel, drift_rel=drift_rel, code_rel=code_rel)
+    if not vals:
+        return {"retarget": False, "reason": "no measured reach", "n": 0, "margin_rel": margin}
+    n = len(vals)
+    mean = sum(vals) / n
+    m_rel = float(meter_rel) if meter_rel is not None and math.isfinite(float(meter_rel)) else 0.0
+    d_rel = float(drift_rel) if drift_rel is not None and math.isfinite(float(drift_rel)) else 0.0
+    sigma = mean * math.sqrt(m_rel * m_rel / n + d_rel * d_rel)
+    if n > 1:
+        var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+        sigma = max(sigma, math.sqrt(var / n))
+    choice = choose_sdr_white_nits(mean, band, native_peak_nits, margin_rel=margin)
+    delta = float(choice["white_nits"]) - float(current_nits)
+    threshold = max(k_sigma * sigma, abs(float(current_nits)) * float(code_rel))
+    retarget = bool(first) or abs(delta) > threshold
+    return {**choice, "retarget": retarget, "estimate_nits": round(mean, 4), "n": n,
+            "sigma_nits": round(sigma, 5), "delta_nits": round(delta, 5),
+            "threshold_nits": round(threshold, 5), "first": bool(first)}
 
 
 def refine_sdr_grayscale_legacy(current_deviations: Optional[Mapping[str, Sequence[float]]],
