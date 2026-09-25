@@ -140,6 +140,7 @@ from .patch_sets import (
     build_grayscale_wb_set,
     build_neutral_set,
     build_ramp_set,
+    build_refine_verify_set,
     build_verify_set,
     build_volumetric_set,
     flow_patch_counts,
@@ -352,6 +353,8 @@ class Calibration:
         thermal_align: str = "auto",
         hook_routing_policy: str = "auto",
         mhc_top_hold: bool = True,
+        white_band: Optional[tuple[float, float]] = None,
+        source_run: Optional[Path] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -447,6 +450,12 @@ class Calibration:
         self.calib: dict[str, Any] = self._state.setdefault("calib", {})
         self.calib.setdefault("stages", {})
         self.calib.setdefault("decisions", {})
+        # Run-level SDR white-band override (--white-band) and the refine-mhc flow's source run
+        # (--source-run): persisted in the run record so a flagless resume keeps them.
+        if white_band is not None:
+            self.calib["white_band_override"] = list(cp.parse_white_nits_band(white_band))
+        if source_run is not None:
+            self.calib["source_run"] = str(Path(source_run).resolve())
         self.target_name: Optional[str] = self.calib.get("target")
         # Reconcile mode + bit depth against the persisted run record: a resume's CLI args
         # default to SDR/8-bit and must NOT override the run's fixed spec (which both
@@ -604,6 +613,9 @@ class Calibration:
         "build-install-mhc": ("Build + install MHC", False),
         "refine-mhc-cube": ("Refine MHC (HDR cube)", True),
         "refine-mhc-grayscale": ("Refine MHC grayscale", True),
+        "seed-from-run": ("Seed from source run", False),
+        "install-mhc": ("Reinstall MHC", False),
+        "reapply-3dlut": ("Re-apply 3D LUT", False),
         "adaptive-planning": ("Adaptive planning", False),
         "measure:post-mhc": ("Measure · post-MHC", True),
         "build-install-3dlut": ("Build + install 3D LUT", True),
@@ -1193,9 +1205,10 @@ class Calibration:
             except Exception:  # noqa: BLE001
                 pipe_profile = None
             cube = deliverable_cube or (
-                (self.calib["stages"].get("build-install-3dlut") or {}).get("digest") or {}).get("cube_path")
+                (self.calib["stages"].get("build-install-3dlut") or {}).get("digest") or {}).get("cube_path") \
+                or ((self.calib["stages"].get("reapply-3dlut") or {}).get("data") or {}).get("cube_path")
             params = self._state.get("mhc_params") or {}
-            if flow in ("full", "mhc-only") and params:
+            if flow in ("full", "mhc-only", "refine-mhc") and params:
                 rec = stack_registry.record_from_mhc_params(
                     display=self.display.name, mode=self.mode, monitor=self.monitor,
                     run_id=self.ctx.root.name, profile_name=pipe_profile, mhc_params=params,
@@ -2974,7 +2987,7 @@ class Calibration:
         audit["neutral_profile"] = self.calib.get("neutral_profile")
         return _jsonable(audit)
 
-    _CUBE_FLOWS = ("full", "3dlut-only")
+    _CUBE_FLOWS = ("full", "3dlut-only", "refine-mhc")
 
     def _hook_routing_pending(self) -> dict[str, Any]:
         """Pre-read evidence for the readiness seam: what the hook reports now and whether the
@@ -3631,71 +3644,10 @@ class Calibration:
             self._state = _common.load_dlc_state(self.ctx)
             self.calib = self._state.setdefault("calib", self.calib)
             params = self._state.get("mhc_params") or {}
-            base = params["base_grayscale"]
             base_lut = params.get("base_lut")
             # Install through the controller (set primaries/white → base correction → apply → verify).
-            install_primaries = params["primaries"]
-            # OBSOLETE — native targeting is now the C++ DEFAULT for HDR. As of 2026-06-23,
-            # GenerateMHC2Profile (mhc_icc.cpp) sets srcPrim=native (panel's MEASURED primaries) for
-            # HDR, so MHC2 = inv(displayToXYZ)·srcToXYZ is already a pure diagonal white-only move
-            # (native white → D65, gamut identity) computed in the *native* basis — strictly better
-            # than this hook's BT.2020-basis approximation. So the normal path (pushing the measured
-            # native primaries below) now produces the native target directly. The DLC_SRC_NATIVE=1
-            # validation hook (which pushed BT.2020 as the *display* primaries on the old hardcoded-
-            # Rec.2020-src C++) is RETIRED: it would shadow and degrade the now-correct C++ default.
-            # Kept only as a logged tripwire so a stale env var can't silently change behavior.
-            # See the mhc-blue-red-channel-collapse memo + GenerateMHC2Profile's source-primaries note.
-            if spec.is_hdr and os.environ.get("DLC_SRC_NATIVE") == "1":
-                self.ctx.log("DLC_SRC_NATIVE=1 is OBSOLETE and now a NO-OP: native targeting is the "
-                             "C++ default (mhc_icc.cpp GenerateMHC2Profile). Ignoring; installing the "
-                             "measured native primaries (the correct native-basis target). Unset the var.")
-            self.controller.set_primaries(self.monitor, self.mode, install_primaries)
-            white = self._resolved_white()
+            applied, verified, white = self._install_mhc_params(params, spec)
             wx, wy = white.xy
-            # set_white populates DesktopLUT's customPrimaries.W — the MEASURED *display*
-            # characterization white, NOT the target. The MHC matrix is
-            # srcToXYZ(standard @ D65) · inv(displayToXYZ(measured primaries, displayPrim.W)),
-            # so white adaptation is the normalization difference between the fixed src white
-            # (D65, baked into g_bt2020/g_srgb srcPrim) and displayPrim.W. Sending the TARGET
-            # (D65) here makes displayPrim.W == src white ⇒ ZERO white adaptation ⇒ the panel's
-            # native white passes straight through (HW evidence 2026-06-20: peak white stayed at
-            # native ~0.324 in both HDR runs). The matrix can only correct native→D65 if it knows
-            # the panel's measured white — so BOTH modes now send it (aligning with the standalone
-            # install_mhc.py). The 1+1+1 standalone-D65 design (Task B / #C1): the MATRIX owns the
-            # bulk native→D65 move (robust 3×3, no full-input channel clamp), the native-white base
-            # 1D LUT/grayscale owns per-channel tone, and the closed-loop refine (stage_refine_mhc_*)
-            # corrects the per-level non-additivity RESIDUAL toward D65. (SDR previously sent the
-            # target white here, leaving the whole white move on the grayscale — the open-loop limp
-            # the closed-loop refine now replaces.) See mhc_icc.cpp ComputeMHC2Matrix.
-            mw = (params.get("measured_white") or {})
-            if mw.get("x") is not None and mw.get("y") is not None:
-                self.controller.set_white(self.monitor, self.mode, mw["x"], mw["y"])
-            else:
-                self.controller.set_white(self.monitor, self.mode, wx, wy)
-            # Base EOTF/tone rides a full-resolution per-channel 1D .cube (set_base_lut → 4096-entry HDR /
-            # 1024-entry SDR MHC2 LUT). BOTH modes now use it (2026-06-24): the cube is a DLC-owned base
-            # artifact that locks DesktopLUT's grayscale editor + Reset button, so the closed-loop refine
-            # never squats in the user-editable correctionGrayscale slot ([[dlc-must-not-own-mhc-user-layers]]).
-            # The 32-point set_base_grayscale table survives only as the fallback when no cube was built
-            # (e.g. <2 neutral patches).
-            if base_lut and base_lut.get("cube_path"):
-                # HDR peak_nits = the cube's post-cap NEUTRAL ceiling (achievable-D65 Peak-Chroma cap),
-                # the number a future DesktopLUT `tonemapTargetPeak` IPC (Task E4) tracks. SDR's 1024-entry
-                # LUT carries no HDR luminance metadata, so peak_nits is 0.0 there.
-                self.controller.set_base_lut(self.monitor, self.mode, base_lut["cube_path"],
-                                             base_lut.get("peak_nits", 0.0))
-                # Clear any legacy non-identity correctionGrayscale (a prior SDR run's refine slot): the
-                # bake stacks it INDEPENDENTLY of the cube, and the cube now owns the whole neutral correction.
-                ncg = 32
-                gridcg = [j / (ncg - 1) for j in range(ncg)]
-                self.controller.set_correction_grayscale(
-                    self.monitor, self.mode, ncg, gridcg,
-                    {ch: [1.0] * ncg for ch in ("r", "g", "b")}, gamma=spec.gamma)
-            else:
-                self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
-                                                   base["points"], base["deviations"], gamma=spec.gamma)
-            applied = self.controller.apply_mhc(self.monitor, self.mode)
-            verified = self.controller.verify_mhc(self.monitor, self.mode)
             params["white"] = {"x": round(wx, 6), "y": round(wy, 6)}
             params["white_source"] = white.provenance
             self._state["mhc_params"] = params
@@ -3735,6 +3687,86 @@ class Calibration:
                                 data={"profile_name": profile_name, "verified": verify_ok})
 
         outcome = self._stage("build-install-mhc", run)
+        self._foundation_seam(outcome, stage="build-install-mhc")
+        if outcome.status == "done" and self._spec().is_hdr:
+            self._pin_hdr_peak_to_cap(outcome)
+        return outcome
+
+    def _install_mhc_params(self, params: dict[str, Any], spec: cp.TargetSpec
+                            ) -> tuple[Any, Any, Any]:
+        """Install a derived MHC (``mhc_params``) through the controller: set primaries + the
+        MEASURED native white -> base 1D-LUT cube (or the 32-point base table) -> apply -> verify.
+        Shared by ``build-install-mhc`` and the refine-only flow's ``install-mhc`` (which reinstalls
+        a completed run's MHC). Returns ``(applied, verified, resolved_white)``."""
+        base = params["base_grayscale"]
+        base_lut = params.get("base_lut")
+        install_primaries = params["primaries"]
+        # OBSOLETE — native targeting is now the C++ DEFAULT for HDR. As of 2026-06-23,
+        # GenerateMHC2Profile (mhc_icc.cpp) sets srcPrim=native (panel's MEASURED primaries) for
+        # HDR, so MHC2 = inv(displayToXYZ)·srcToXYZ is already a pure diagonal white-only move
+        # (native white → D65, gamut identity) computed in the *native* basis — strictly better
+        # than this hook's BT.2020-basis approximation. So the normal path (pushing the measured
+        # native primaries below) now produces the native target directly. The DLC_SRC_NATIVE=1
+        # validation hook (which pushed BT.2020 as the *display* primaries on the old hardcoded-
+        # Rec.2020-src C++) is RETIRED: it would shadow and degrade the now-correct C++ default.
+        # Kept only as a logged tripwire so a stale env var can't silently change behavior.
+        # See the mhc-blue-red-channel-collapse memo + GenerateMHC2Profile's source-primaries note.
+        if spec.is_hdr and os.environ.get("DLC_SRC_NATIVE") == "1":
+            self.ctx.log("DLC_SRC_NATIVE=1 is OBSOLETE and now a NO-OP: native targeting is the "
+                         "C++ default (mhc_icc.cpp GenerateMHC2Profile). Ignoring; installing the "
+                         "measured native primaries (the correct native-basis target). Unset the var.")
+        self.controller.set_primaries(self.monitor, self.mode, install_primaries)
+        white = self._resolved_white()
+        wx, wy = white.xy
+        # set_white populates DesktopLUT's customPrimaries.W — the MEASURED *display*
+        # characterization white, NOT the target. The MHC matrix is
+        # srcToXYZ(standard @ D65) · inv(displayToXYZ(measured primaries, displayPrim.W)),
+        # so white adaptation is the normalization difference between the fixed src white
+        # (D65, baked into g_bt2020/g_srgb srcPrim) and displayPrim.W. Sending the TARGET
+        # (D65) here makes displayPrim.W == src white ⇒ ZERO white adaptation ⇒ the panel's
+        # native white passes straight through (HW evidence 2026-06-20: peak white stayed at
+        # native ~0.324 in both HDR runs). The matrix can only correct native→D65 if it knows
+        # the panel's measured white — so BOTH modes now send it (aligning with the standalone
+        # install_mhc.py). The 1+1+1 standalone-D65 design (Task B / #C1): the MATRIX owns the
+        # bulk native→D65 move (robust 3×3, no full-input channel clamp), the native-white base
+        # 1D LUT/grayscale owns per-channel tone, and the closed-loop refine (stage_refine_mhc_*)
+        # corrects the per-level non-additivity RESIDUAL toward D65. (SDR previously sent the
+        # target white here, leaving the whole white move on the grayscale — the open-loop limp
+        # the closed-loop refine now replaces.) See mhc_icc.cpp ComputeMHC2Matrix.
+        mw = (params.get("measured_white") or {})
+        if mw.get("x") is not None and mw.get("y") is not None:
+            self.controller.set_white(self.monitor, self.mode, mw["x"], mw["y"])
+        else:
+            self.controller.set_white(self.monitor, self.mode, wx, wy)
+        # Base EOTF/tone rides a full-resolution per-channel 1D .cube (set_base_lut → 4096-entry HDR /
+        # 1024-entry SDR MHC2 LUT). BOTH modes now use it (2026-06-24): the cube is a DLC-owned base
+        # artifact that locks DesktopLUT's grayscale editor + Reset button, so the closed-loop refine
+        # never squats in the user-editable correctionGrayscale slot ([[dlc-must-not-own-mhc-user-layers]]).
+        # The 32-point set_base_grayscale table survives only as the fallback when no cube was built
+        # (e.g. <2 neutral patches).
+        if base_lut and base_lut.get("cube_path"):
+            # HDR peak_nits = the cube's post-cap NEUTRAL ceiling (achievable-D65 Peak-Chroma cap),
+            # the number a future DesktopLUT `tonemapTargetPeak` IPC (Task E4) tracks. SDR's 1024-entry
+            # LUT carries no HDR luminance metadata, so peak_nits is 0.0 there.
+            self.controller.set_base_lut(self.monitor, self.mode, base_lut["cube_path"],
+                                         base_lut.get("peak_nits", 0.0))
+            # Clear any legacy non-identity correctionGrayscale (a prior SDR run's refine slot): the
+            # bake stacks it INDEPENDENTLY of the cube, and the cube now owns the whole neutral correction.
+            ncg = 32
+            gridcg = [j / (ncg - 1) for j in range(ncg)]
+            self.controller.set_correction_grayscale(
+                self.monitor, self.mode, ncg, gridcg,
+                {ch: [1.0] * ncg for ch in ("r", "g", "b")}, gamma=spec.gamma)
+        else:
+            self.controller.set_base_grayscale(self.monitor, self.mode, base["point_count"],
+                                               base["points"], base["deviations"], gamma=spec.gamma)
+        applied = self.controller.apply_mhc(self.monitor, self.mode)
+        verified = self.controller.verify_mhc(self.monitor, self.mode)
+        return applied, verified, white
+
+    def _foundation_seam(self, outcome: StageOutcome, *, stage: str) -> None:
+        """The MHC install's immediate bright-neutral sanity read collapsed: DETECT in the stage,
+        DECIDE here at a seam (``<stage>:foundation``)."""
         sanity = (outcome.digest or {}).get("sanity") or {}
         if sanity.get("critical"):
             # The MHC install succeeded (memoised done) but its immediate bright-neutral read
@@ -3742,22 +3774,19 @@ class Calibration:
             # stop before the cube build; a live judge can accept if it knows the read was a
             # transient (e.g. the scanout reconfigured mid-read).
             decision = self.adjudicate(AdjudicationRequest(
-                key="build-install-mhc:foundation", seam=SEAM_FOUNDATION, stage="build-install-mhc",
+                key=f"{stage}:foundation", seam=SEAM_FOUNDATION, stage=stage,
                 question=((sanity.get("message") or "the MHC foundation read collapsed bright-neutral luminance")
                           + " — abort and recheck the MHC, or accept and continue?"),
                 options=("abort", "accept"), recommendation="abort",
                 digest={**{k: outcome.digest.get(k) for k in ("profile_name", "white_xy", "verified")},
                         "sanity": sanity, "foundation_critical": True}))
             if decision.choice == "abort":
-                self.runlog.stage_aborted("build-install-mhc", message=sanity.get("message"))
+                self.runlog.stage_aborted(stage, message=sanity.get("message"))
                 raise CalibrationAborted(StageOutcome(
-                    "build-install-mhc", "aborted",
+                    stage, "aborted",
                     digest={**outcome.digest, "message": sanity.get("message"),
                             "recommendation": "abort_and_recheck_mhc", "decision_note": decision.note}))
             self.ctx.log(f"MHC foundation sanity critical but ACCEPTED at the seam: {decision.note}")
-        if outcome.status == "done" and self._spec().is_hdr:
-            self._pin_hdr_peak_to_cap(outcome)
-        return outcome
 
     def _mhc_foundation_sanity_check(self) -> dict[str, Any]:
         """Immediately read a bright neutral after MHC apply.
@@ -3935,7 +3964,8 @@ class Calibration:
                                previous: Optional[dict[str, Any]], *, white_xy: tuple[float, float],
                                dark_floor_nits: float, top_nits: float,
                                channel_peak_xyz: Sequence[Sequence[float]],
-                               materiality: float = refine_convergence.MATERIAL_GAIN_JND
+                               materiality: float = refine_convergence.MATERIAL_GAIN_JND,
+                               top_anchor: bool = False
                                ) -> dict[str, Any]:
         """Judge one closed-loop grayscale-refine round on physics (:mod:`dlc.refine_convergence`):
         the correctable band (dark floor → the refine's top), each level's physical floor (meter
@@ -3944,7 +3974,9 @@ class Calibration:
         measured primaries), the removable error above it, and the predicted gain of another round
         discounted by the refine's measured efficacy. Replaces the fixed ``target_de`` stop. HDR in
         dE_ITP (absolute PQ targets, top = the Peak-Chroma cap); SDR in CIEDE2000 (power-law
-        targets at the MHC target luminance). Tests monkeypatch this method to script a round."""
+        targets at the SDR white-band luminance ``top_nits``; ``top_anchor`` also judges the white
+        level on its own — see :func:`dlc.refine_convergence.analyse_round`). Tests monkeypatch this
+        method to script a round."""
         from ._pq import eotf_norm as _pq_eotf, oetf_norm as _pq_oetf
         from .colormath import xy_to_XYZ
         from .measure_loop import match_level_noise
@@ -4022,7 +4054,7 @@ class Calibration:
 
         floor = refine_convergence.panel_floor_from_thermal(self.calib.get("thermal_align"))
         out = refine_convergence.analyse_round(levels, de_fn=de_fn, floor=floor, previous=previous,
-                                               materiality=materiality)
+                                               materiality=materiality, top_anchor=top_anchor)
         out["excluded"] = {"below_dark_floor": below, "above_top": above}
         out["band_nits"] = [round(dark_floor_nits, 3), round(top_nits, 1)]
         out["output_bits"] = bits
@@ -4042,7 +4074,7 @@ class Calibration:
         """A refine stage that actually (re-)runs starts with no recorded exit verdicts: a
         decision about a previous execution's exit must never replay onto a new one. (A resume
         replays the memoised stage without re-running it, so a pending verdict still lands.)"""
-        for k in ("regression", "safety-ceiling", "floored", "unjudged"):
+        for k in ("regression", "safety-ceiling", "floored", "unjudged", "white-band"):
             self.calib["decisions"].pop(f"{stage}:{k}", None)
 
     def _refine_exit_seam(self, outcome: StageOutcome, *, stage: str, label: str,
@@ -4079,6 +4111,8 @@ class Calibration:
         out = {k: conv.get(k) for k in keep if k in conv}
         fl = conv.get("floor") or {}
         out["floor_xy"] = fl.get("floor_xy_median")
+        if conv.get("top") is not None:
+            out["top"] = conv.get("top")       # the white anchor (SDR): its own de / gain / floor
         return out
 
     def stage_refine_mhc_cube(self, *, materiality: float = refine_convergence.MATERIAL_GAIN_JND,
@@ -4365,7 +4399,8 @@ class Calibration:
                     data={"rounds": 0})
 
             from .measure_loop import match_level_noise
-            from .mhc_cube import mhc2_matrix, read_1d_cube, refine_sdr_cube, write_1d_cube
+            from .mhc_cube import (choose_sdr_white_nits, mhc2_matrix, read_1d_cube, refine_sdr_cube,
+                                   sdr_white_reach, write_1d_cube)
 
             # Installed SDR MHC2 matrix: src = sRGB (the C++ SDR srcPrim), display = native primaries +
             # MEASURED native white (set_white sends native white) → M performs native→D65. rowsums
@@ -4419,6 +4454,31 @@ class Calibration:
                                       nwx, nwy, white_Y=float(peak))
                 channel_peak_xyz = [[m[row][c] for row in range(3)] for c in range(3)]
 
+            # --- SDR WHITE BAND (owner rule 2026-09-25): white may sit anywhere in [lo, hi] nits;
+            # the refine targets the brightest white at which EVERY channel has the headroom to hit
+            # the target white (the minimum dimming), clamped into the band. Without it the target
+            # white was the native full-drive luminance (target_luminance), which is unreachable at
+            # D65 whenever a rowsum exceeds 1 (a channel asked for more than full drive — the
+            # PA32UCXR 2026-09-25 green 1.0065): white stayed ~1 dE off while the greys converged.
+            # The model reach (rowsums) seeds it; each round's MEASURED white refines it (lowered
+            # only, by more than one output code, so read noise can't ratchet it). Exact target
+            # white below the band is not code's call: ``below_band`` -> the white-band seam. ---
+            band, band_source = self._sdr_white_band()
+            out_bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
+            code_rel = gamma / float(2 ** out_bits - 1)    # one output code's light step at white
+            model_reach = sdr_white_reach(primaries, (nwx, nwy), float(peak), rowsums,
+                                          gamma=gamma, target_white_xy=(wx, wy))
+            wb_choice = choose_sdr_white_nits(model_reach["reach_nits"], band, float(peak))
+            white_nits = float(wb_choice["white_nits"])
+            white_band: dict[str, Any] = {
+                "band": [band[0], band[1]], "band_source": band_source,
+                "native_peak_nits": round(float(peak), 4), "model_reach": model_reach,
+                "reach_nits": wb_choice.get("reach_nits"), "reach_basis": model_reach.get("basis"),
+                "limiting_channel": model_reach.get("limiting_channel"),
+                "white_nits": round(white_nits, 4), "status": wb_choice["status"],
+                "dim_pct_vs_native": wb_choice.get("dim_pct_vs_native"),
+                "code_rel": round(code_rel, 6), "retargets": 0, "reach_log": []}
+
             rnd = 0
             while True:
                 rnd += 1
@@ -4429,10 +4489,43 @@ class Calibration:
                 grey = [s for s in samples
                         if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6]
                 de = self._grey_de_sdr(samples, (wx, wy))
+                # The measured white refines the reach (see the white-band block above).
+                top_s = max(grey, key=lambda smp: smp.rgb[0]) if grey else None
+                if (top_s is not None and top_s.rgb[0] >= 1.0 - 1e-6 and top_s.xyz
+                        and top_s.xyz[1] > 0.0):
+                    try:
+                        mreach = sdr_white_reach(
+                            primaries, (nwx, nwy), float(peak), rowsums, gamma=gamma,
+                            target_white_xy=(wx, wy), measured_top_xyz=tuple(top_s.xyz),
+                            top_signal=float(top_s.rgb[0]),
+                            current_curves=read_1d_cube(Path(installed_path)))
+                    except Exception as exc:  # noqa: BLE001 - evidence; the model reach stands
+                        mreach = {"reach_nits": None, "basis": "error",
+                                  "error": f"{type(exc).__name__}: {exc}"}
+                    white_band["reach_log"].append({"round": rnd, "white_Y": round(top_s.xyz[1], 4),
+                                                    **mreach})
+                    if mreach.get("basis") == "measured" and mreach.get("reach_nits"):
+                        choice = choose_sdr_white_nits(mreach["reach_nits"], band, float(peak))
+                        new_nits = float(choice["white_nits"])
+                        first = not white_band.get("measured")
+                        if first or new_nits < white_nits * (1.0 - code_rel):
+                            if not first and new_nits != white_nits:
+                                # Lowered mid-loop: earlier rounds were judged against a white the
+                                # panel can't reach — restart the judgment + best tracking from here.
+                                white_band["retargets"] += 1
+                                conv, scores = None, []
+                                best_path, best_avg = installed_path, float("inf")
+                            white_nits = new_nits
+                            white_band.update(
+                                measured=True, white_nits=round(white_nits, 4),
+                                status=choice["status"], reach_nits=choice.get("reach_nits"),
+                                reach_basis="measured",
+                                limiting_channel=mreach.get("limiting_channel"),
+                                dim_pct_vs_native=choice.get("dim_pct_vs_native"))
                 conv = self._refine_round_judgment(
                     samples, res.ti3_path, conv, white_xy=(wx, wy), dark_floor_nits=dark_floor,
-                    top_nits=float(peak), channel_peak_xyz=channel_peak_xyz,
-                    materiality=materiality)
+                    top_nits=float(white_nits), channel_peak_xyz=channel_peak_xyz,
+                    materiality=materiality, top_anchor=True)
                 score = conv.get("band_avg") if conv.get("band_avg") is not None else de["avg"]
                 summary = self._refine_round_summary(conv)
                 rounds_log.append({"round": rnd, "grey_avg_de2000": de["avg"],
@@ -4450,7 +4543,8 @@ class Calibration:
                     "best_avg_de2000": (round(cur_best, 3) if cur_best != float("inf") else None),
                     "since_last_round": (round(prev_avg - score, 3)
                                          if prev_avg is not None and score is not None else None),
-                    "convergence": summary}
+                    "convergence": summary,
+                    "white_nits": round(white_nits, 3), "white_band_status": white_band["status"]}
                 self._emit_checkin("refine-mhc-grayscale", "refine_round")
                 if score is None:
                     flags["unscored"] = True
@@ -4495,7 +4589,8 @@ class Calibration:
                     measured_neutral.append(entry + (noise,) if noise is not None else entry)
                 new_curves = refine_sdr_cube(
                     read_1d_cube(Path(installed_path)), measured_neutral, primaries, (nwx, nwy),
-                    peak, rowsums, gamma=gamma, target_white_xy=(wx, wy), dark_floor_nits=dark_floor)
+                    peak, rowsums, gamma=gamma, target_white_xy=(wx, wy), dark_floor_nits=dark_floor,
+                    target_white_nits=white_nits)
                 new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
                 write_1d_cube(new_path, new_curves,
                               title=f"DLC SDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
@@ -4531,19 +4626,66 @@ class Calibration:
                       "best_band_avg_de2000": (
                           round(best_avg, 3) if best_avg != float("inf") else None),
                       "convergence": conv, "materiality": materiality,
-                      "rowsums": [round(v, 5) for v in rowsums], **flags}
+                      "rowsums": [round(v, 5) for v in rowsums],
+                      "white_band": white_band, **flags}
+            if white_band["status"] == "below_band":
+                digest["white_band_below"] = True
+            # The white the refine delivered (what the 3D LUT / verify now sit on): recorded on the
+            # MHC params so a later flow (and the applied-stack registry) sees the chosen luminance.
+            params["sdr_white"] = {"white_nits": white_band["white_nits"],
+                                   "status": white_band["status"], "band": white_band["band"],
+                                   "reach_nits": white_band.get("reach_nits")}
+            self._state["mhc_params"] = params
+            _common.save_dlc_state(self.ctx, self._state)
             return StageOutcome("refine-mhc-grayscale", "done", digest=digest,
                                 data={"rounds": len(rounds_log),
                                       "regressed": bool(flags.get("regressed")),
                                       "safety_ceiling": bool(flags.get("safety_ceiling")),
                                       "floored": bool(flags.get("floored")),
                                       "unjudged": bool(flags.get("unjudged")),
+                                      "white_band_below": white_band["status"] == "below_band",
+                                      "white_nits": white_band["white_nits"],
                                       "final_avg": final_avg})
 
         outcome = self._stage("refine-mhc-grayscale", run)
         self._refine_exit_seam(outcome, stage="refine-mhc-grayscale", label="SDR",
                                safety_max_rounds=safety_max_rounds)
+        self._white_band_seam(outcome)
         return outcome
+
+    def _sdr_white_band(self) -> tuple[tuple[float, float], str]:
+        """The SDR white-luminance band ``(lo, hi)`` + its source: a run-level override
+        (``--white-band``, persisted in the run record so a resume keeps it) beats the target's
+        ``white_nits_band`` profile key, which beats the default fraction of the nominal white."""
+        override = self.calib.get("white_band_override")
+        if override:
+            return (float(override[0]), float(override[1])), "run_override"
+        spec = self._spec()
+        return spec.sdr_white_band, spec.sdr_white_band_source
+
+    def _white_band_seam(self, outcome: StageOutcome) -> None:
+        """Exact target white needs a luminance BELOW the SDR white band: the refine held white at
+        the closest in-band luminance (the limiting channel at full drive, white off target by what
+        remains). Trading more luminance than the band authorizes — or accepting the in-band white
+        — is a judgment, so it is a seam, never a silent accept (DESIGN LAW)."""
+        wb = (outcome.digest or {}).get("white_band") or {}
+        if wb.get("status") != "below_band":
+            return
+        top = ((outcome.digest.get("convergence") or {}).get("top") or {})
+        lo, hi = (wb.get("band") or [None, None])[:2]
+        question = (
+            f"exact target white needs {wb.get('reach_nits')} nits ({wb.get('limiting_channel')} "
+            f"channel at full drive, {wb.get('reach_basis')} reach) — BELOW the SDR white band "
+            f"[{lo}, {hi}] nits. The refine held white at {wb.get('white_nits')} nits (the closest "
+            f"in-band luminance), leaving white {top.get('de')} dE2000 off target. Accept this "
+            "in-band white, or abort (re-run with --white-band LO,HI to trade more luminance for an "
+            "exact white)?")
+        self._abort_if(self.adjudicate(AdjudicationRequest(
+            key="refine-mhc-grayscale:white-band", seam=SEAM_OPTIMIZE, stage="refine-mhc-grayscale",
+            question=question, options=("accept", "abort"), recommendation="accept",
+            digest=outcome.digest)),
+            stage="refine-mhc-grayscale",
+            message="refine-mhc-grayscale: aborted at the white-band seam (exact white is below the band)")
 
     def stage_grayscale_wb_touchup(self, *, target_de: float = 0.6,
                                    max_rounds_per_point: int = 6) -> StageOutcome:
@@ -5666,7 +5808,8 @@ class Calibration:
         # (<date>_DLC_<display>_<mode>_<gamut>_<transfer>_<lum>n.cube) — the durable cube the user
         # keeps and that _finish re-points DesktopLUT at, so the name is self-describing in
         # DesktopLUT's UI (which shows the filename, not the folder).
-        cube_src = sdat("build-install-3dlut").get("cube_path")
+        # refine-mhc keeps the source run's cube (re-applied, not rebuilt) — it is the deliverable too.
+        cube_src = sdat("build-install-3dlut").get("cube_path") or sdat("reapply-3dlut").get("cube_path")
         cube_out = None
         if cube_src and Path(cube_src).exists():
             spec = self._spec()
@@ -5679,7 +5822,10 @@ class Calibration:
                 colorspace=_gamut_label(spec.colorspace, is_hdr=spec.is_hdr, gamma=spec.gamma),
                 transfer=_transfer_token(is_hdr=spec.is_hdr, gamma=spec.gamma),
                 luminance_nits=label_nits)
-            shutil.copy2(cube_src, cube_out)
+            # A kept cube may already BE this deliverable (same display/date/label) — never copy a
+            # file onto itself (shutil.SameFileError).
+            if Path(cube_src).resolve() != cube_out.resolve():
+                shutil.copy2(cube_src, cube_out)
         # Copy the verification TI3.
         verify_ti3 = sdat("measure:verify").get("ti3")
         ti3_out = None
@@ -5691,7 +5837,9 @@ class Calibration:
             "flow": self.calib.get("flow"), "monitor": self.monitor, "mode": self.mode,
             "display": self.display.name, "target": self.target_name, "date": self.run_date.isoformat(),
             "whitepoint": sd("whitepoint") or None,
-            "mhc": sd("build-install-mhc") or None,
+            "mhc": sd("build-install-mhc") or sd("install-mhc") or None,
+            "mhc_refine": sd("refine-mhc-grayscale") or sd("refine-mhc-cube") or None,
+            "source_run": self.calib.get("source_run"),
             "lut3d": {k: sd("build-install-3dlut").get(k) for k in
                       ("converged", "best_max_de", "best_mean_de", "best_max_de_report",
                        "best_mean_de_report", "metric", "optimize_metric", "above_threshold",
@@ -5699,7 +5847,8 @@ class Calibration:
             "verification": sd("verify") or None,
             "decisions": self.calib.get("decisions", {}),
             "deliverables": {"cube": str(cube_out) if cube_out else None,
-                             "profile_name": sdat("build-install-mhc").get("profile_name"),
+                             "profile_name": (sdat("build-install-mhc").get("profile_name")
+                                              or sdat("install-mhc").get("profile_name")),
                              "measurements_ti3": str(ti3_out) if ti3_out else None},
             "display_analysis": analysis,   # the LLM fills this at report time
         }
@@ -5789,6 +5938,8 @@ class Calibration:
                 return self._flow_3dlut_only()
             if flow == "grayscale-wb":
                 return self._flow_grayscale_wb()
+            if flow == "refine-mhc":
+                return self._flow_refine_mhc()
             if flow == "build-correction":
                 return self._flow_build_correction()
             if flow == "characterize":
@@ -6117,6 +6268,213 @@ class Calibration:
         self.stage_verify(ver.data["ti3"])
         return self._finish()
 
+    def _flow_refine_mhc(self) -> CalibrationResult:
+        """Re-run ONLY the SDR MHC grayscale refine on a completed run's MHC, keeping its 3D LUT.
+
+        The cheap fix for a foundation whose refine left something the band/judge now corrects
+        (the 2026-09-25 PA32UCXR white ~1 dE off D65) without re-measuring the raw ramp or rebuilding
+        the cube: seed the source run's derived MHC (``mhc_params`` + the BUILD's base cube) ->
+        enter neutral (calibration mode, exactly like full/mhc-only, so revert restores the user's
+        setup) -> reinstall that MHC -> re-refine the grayscale (with the SDR white band) -> re-apply
+        the source run's cube -> a SHORT verify (the refine's greys + an RGBCMY sanity subset:
+        :func:`build_refine_verify_set`) -> the normal verify/apply gate. SDR only: the HDR base-cube
+        refine is untouched (``refine-mhc`` aborts cleanly on an HDR run)."""
+        self.stage_preflight()
+        self.stage_resolve_target()
+        self.stage_whitepoint()
+        self.stage_seed_from_run()
+        self.stage_enter_neutral()
+        self.stage_hardware_readiness()
+        self.stage_install_mhc()
+        self.stage_refine_mhc_grayscale()
+        self.stage_reapply_3dlut()
+        ver = self.stage_measure(role="verify", patches=self._refine_verify_patches(),
+                                 ti3_name="verify.ti3", ndjson_name="verify.ndjson")
+        self.stage_verify(ver.data["ti3"])
+        return self._finish()
+
+    def _refine_verify_patches(self) -> list[tuple[int, int, int]]:
+        return build_refine_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
+                                       max_cv=self._patch_max_cv())
+
+    def _source_run_cube(self, src_root: Path, src_calib: Mapping[str, Any]) -> dict[str, Any]:
+        """The 3D LUT the source run left applied: the applied-stack registry's DURABLE deliverable
+        when the registry says that run applied it, else the run's own build artifact. ``path`` is
+        None when the source run built no cube (an mhc-only run); ``missing`` names a cube the
+        source DID build that is gone from disk."""
+        run_id = src_root.name
+        try:
+            reg = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root))
+            rec = reg.get(self.display.name, self.mode)
+            cube = (rec.cube or {}) if rec is not None else {}
+            if cube.get("run_id") == run_id and cube.get("cube_path") and Path(cube["cube_path"]).exists():
+                return {"path": str(cube["cube_path"]), "source": "stack_registry"}
+        except Exception:  # noqa: BLE001 - the registry is a convenience; the run record decides
+            pass
+        rec3d = (src_calib.get("stages") or {}).get("build-install-3dlut") or {}
+        built = (rec3d.get("data") or {}).get("cube_path") or (rec3d.get("digest") or {}).get("cube_path")
+        if built and Path(built).exists():
+            return {"path": str(built), "source": "source_run_build"}
+        if built:
+            return {"path": None, "source": "source_run_build", "missing": str(built)}
+        return {"path": None, "source": "none"}
+
+    def stage_seed_from_run(self) -> StageOutcome:
+        """Seed THIS run with a completed run's derived SDR MHC (mechanics only; any mismatch is a
+        clean refusal): its ``mhc_params`` (measured primaries + native white + native peak + the
+        adaptive dark floor), the BUILD's base 1D cube copied into this run (the refine always
+        restarts from the build base — never compounds a previous refine), the source's 3D LUT to
+        re-apply, and its thermal-alignment evidence as the refine judge's between-rounds floor
+        prior (labelled ``source:``). The source run dir is only READ."""
+        def run() -> StageOutcome:
+            spec = self._spec()
+
+            def refuse(msg: str, **extra: Any) -> None:
+                raise CalibrationAborted(StageOutcome(
+                    "seed-from-run", "aborted", digest={"message": msg, **extra}))
+
+            if spec.is_hdr:
+                refuse("refine-mhc is SDR-only (the HDR base-cube refine is not re-runnable in "
+                       "isolation) — use --flow mhc-only or full for HDR")
+            src = self.calib.get("source_run")
+            if not src:
+                refuse("refine-mhc needs --source-run <completed run dir> (the run whose MHC + 3D LUT "
+                       "to keep)")
+            src_root = Path(src)
+            try:
+                src_state = json.loads((src_root / "dlc_state.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                refuse(f"cannot read the source run's dlc_state.json ({type(exc).__name__}: {exc})",
+                       source_run=str(src_root))
+            src_calib = src_state.get("calib") or {}
+            params = src_state.get("mhc_params") or {}
+            stages = src_calib.get("stages") or {}
+            problems: list[str] = []
+            if str(src_state.get("mode") or "").upper() != self.mode:
+                problems.append(f"source mode {src_state.get('mode')!r} != this run's {self.mode}")
+            if src_state.get("monitor") is not None and int(src_state["monitor"]) != self.monitor:
+                problems.append(f"source monitor {src_state.get('monitor')} != {self.monitor}")
+            if src_calib.get("target") and src_calib.get("target") != self.target_name:
+                problems.append(f"source target {src_calib.get('target')!r} != {self.target_name!r}")
+            if (stages.get("build-install-mhc") or {}).get("status") != "done":
+                problems.append("the source run never completed build-install-mhc")
+            nw = params.get("measured_white") or {}
+            if not (params.get("primaries") and nw.get("x") is not None and nw.get("y") is not None
+                    and params.get("target_luminance") and params.get("base_grayscale")):
+                problems.append("the source mhc_params lack primaries / measured white / "
+                                "target_luminance / base_grayscale")
+            base_src = src_root / "generated" / f"mhc_base_{self.mode.lower()}.cube"
+            base_note = "build base cube"
+            if not base_src.exists():
+                alt = ((params.get("base_lut") or {}).get("cube_path"))
+                if alt and Path(alt).exists():
+                    base_src, base_note = Path(alt), "the source's FINAL (refined) cube — build base missing"
+                else:
+                    problems.append("no SDR base 1D cube in the source run")
+            cube = self._source_run_cube(src_root, src_calib)
+            if cube.get("missing"):
+                problems.append(f"the source run's 3D LUT is gone from disk: {cube['missing']}")
+            if problems:
+                refuse("cannot seed refine-mhc from the source run: " + "; ".join(problems),
+                       source_run=str(src_root), problems=problems)
+
+            gen = self.ctx.root / "generated"
+            gen.mkdir(parents=True, exist_ok=True)
+            base_dst = gen / f"mhc_base_{self.mode.lower()}.cube"
+            shutil.copy2(base_src, base_dst)
+            seeded = json.loads(json.dumps(params))           # deep copy; the source stays untouched
+            base_lut = dict(seeded.get("base_lut") or {})
+            base_lut["cube_path"] = str(base_dst)
+            seeded["base_lut"] = base_lut
+            seeded.pop("sdr_white", None)                     # this run's refine decides its own white
+            seeded["seeded_from"] = {"run": str(src_root), "base_cube": str(base_src),
+                                     "base_note": base_note,
+                                     "source_final_cube": (params.get("base_lut") or {}).get("cube_path")}
+            self._state["mhc_params"] = seeded
+            ta = src_calib.get("thermal_align") or {}
+            if ta and not self.calib.get("thermal_align"):
+                self.calib["thermal_align"] = {f"source:{k}": v for k, v in ta.items()}
+            _common.save_dlc_state(self.ctx, self._state)
+            src_refine = (stages.get("refine-mhc-grayscale") or {}).get("digest") or {}
+            src_verify = (stages.get("verify") or {}).get("digest") or {}
+            digest = {"source_run": str(src_root), "source_flow": src_calib.get("flow"),
+                      "base_cube": str(base_dst), "base_note": base_note,
+                      "cube_path": cube.get("path"), "cube_source": cube.get("source"),
+                      "native_peak_nits": params.get("target_luminance"),
+                      "measured_white": nw,
+                      "source_refine": {k: src_refine.get(k) for k in
+                                        ("rounds", "band_avg_de2000", "rowsums", "white_band",
+                                         "converged", "floored")},
+                      "source_verify": {k: src_verify.get(k) for k in
+                                        ("white_de2000", "grayscale_avg_de2000", "avg_de2000",
+                                         "max_de2000")} if src_verify else None,
+                      "thermal_prior": bool(ta)}
+            if not cube.get("path"):
+                digest["note"] = "the source run left no 3D LUT — the MHC is re-refined alone"
+            return StageOutcome("seed-from-run", "done", digest=digest,
+                                data={"cube_path": cube.get("path"), "base_cube": str(base_dst),
+                                      "source_run": str(src_root)})
+        return self._stage("seed-from-run", run)
+
+    def stage_install_mhc(self) -> StageOutcome:
+        """Reinstall the seeded MHC (no derivation — ``seed-from-run`` supplied ``mhc_params``)
+        through the SAME install path as ``build-install-mhc`` (:meth:`_install_mhc_params`), then
+        the same immediate bright-neutral sanity read + foundation seam."""
+        def run() -> StageOutcome:
+            spec = self._spec()
+            params = self._state.get("mhc_params") or {}
+            if not params.get("primaries"):
+                raise CalibrationAborted(StageOutcome(
+                    "install-mhc", "aborted",
+                    digest={"message": "no seeded mhc_params to install (seed-from-run did not run?)"}))
+            applied, verified, white = self._install_mhc_params(params, spec)
+            wx, wy = white.xy
+            params["white"] = {"x": round(wx, 6), "y": round(wy, 6)}
+            params["white_source"] = white.provenance
+            self._state["mhc_params"] = params
+            _common.save_dlc_state(self.ctx, self._state)
+            profile_name = applied.get("profile_name") if isinstance(applied, dict) else None
+            verify_ok = bool(verified.get("verified")) if isinstance(verified, dict) else False
+            digest = {"primaries": params["primaries"], "white_xy": [wx, wy],
+                      "white_provenance": white.provenance,
+                      "measured_white": params.get("measured_white"),
+                      "base_cube": (params.get("base_lut") or {}).get("cube_path"),
+                      "profile_name": profile_name, "verified": verify_ok,
+                      "seeded_from": params.get("seeded_from")}
+            if params.get("dark_floor"):
+                digest["dark_floor"] = params["dark_floor"]
+            sanity = self._mhc_foundation_sanity_check()
+            if sanity:
+                digest["sanity"] = sanity
+            return StageOutcome("install-mhc", "done", digest=digest,
+                                data={"profile_name": profile_name, "verified": verify_ok})
+
+        outcome = self._stage("install-mhc", run)
+        self._foundation_seam(outcome, stage="install-mhc")
+        return outcome
+
+    def stage_reapply_3dlut(self) -> StageOutcome:
+        """Put the source run's 3D LUT back over the re-refined MHC (``enter-neutral`` cleared the
+        calibrated pair's runtime layers). Mechanics only — whether that cube is still valid over
+        the new foundation is what the verify that follows measures (and the verify seam judges)."""
+        def run() -> StageOutcome:
+            seed = (self.calib["stages"].get("seed-from-run") or {}).get("data") or {}
+            cube = seed.get("cube_path")
+            if not cube:
+                return StageOutcome("reapply-3dlut", "done",
+                                    digest={"skipped": True, "reason": "the source run left no 3D LUT"},
+                                    data={"cube_path": None})
+            if not Path(cube).exists():
+                raise CalibrationAborted(StageOutcome(
+                    "reapply-3dlut", "aborted",
+                    digest={"message": f"the source run's 3D LUT vanished: {cube}"}))
+            self.controller.set_3dlut(self.monitor, self.mode, str(cube))
+            self._hook_routing_evidence_after_install("reapply-3dlut")
+            return StageOutcome("reapply-3dlut", "done", digest={"cube_path": str(cube)},
+                                data={"cube_path": str(cube)})
+        return self._stage("reapply-3dlut", run)
+
     def _flow_build_correction(self) -> CalibrationResult:
         """Mint (refresh) the colorimeter correction via ccxxmake, standalone — run this
         BEFORE a calibration when the correction is stale/missing (the calibration's meter
@@ -6264,6 +6622,9 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
                    "measure:verify", "verify"),
     "grayscale-wb": ("preflight", "resolve-target", "whitepoint", "hardware-readiness",
                      "grayscale-wb", "measure:verify", "verify"),
+    "refine-mhc": ("preflight", "resolve-target", "whitepoint", "seed-from-run", "enter-neutral",
+                   "hardware-readiness", "install-mhc", "refine-mhc-grayscale", "reapply-3dlut",
+                   "measure:verify", "verify"),
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
 }
@@ -6275,6 +6636,8 @@ FLOWS: dict[str, str] = {
     "mhc-only": "raw → MHC (matrix + 1D + D65 grayscale refine) → verify → report (ICC only; no 3D LUT — shakedown)",
     "3dlut-only": "verify MHC present → measure → 3D LUT → verify → report",
     "grayscale-wb": "verify MHC present -> patch-by-patch user Grayscale correction -> grey-ramp verify",
+    "refine-mhc": ("SDR: seed a completed run's MHC (--source-run) → neutral → reinstall MHC → re-refine "
+                   "grayscale (white band) → re-apply its 3D LUT → short verify → apply gate"),
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
     "hdr": "(not a flow — signpost) HDR is a MODE: use --mode HDR with full / mhc-only / 3dlut-only",
@@ -6655,6 +7018,8 @@ def run_calibration(
     adaptive_planning: bool = False,
     require_hardware_readiness: bool = False,
     mhc_top_hold: bool = True,
+    white_band: Optional[tuple[float, float]] = None,
+    source_run: Optional[Path] = None,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -6668,7 +7033,7 @@ def run_calibration(
         patch_sizes=patch_sizes, run_date=run_date, force=force,
         adaptive_planning=adaptive_planning,
         require_hardware_readiness=require_hardware_readiness,
-        mhc_top_hold=mhc_top_hold)
+        mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run)
     return calib.run(flow)
 
 
@@ -6703,6 +7068,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--monitor", type=int, default=0)
     parser.add_argument("--mode", default="SDR")
     parser.add_argument("--run", type=Path, default=None, help="run dir (resume an existing run)")
+    parser.add_argument("--source-run", type=Path, default=None, dest="source_run",
+                        help="refine-mhc flow: the COMPLETED run whose MHC is re-refined and whose "
+                             "3D LUT is kept (read-only; the refine runs in a new run dir)")
+    parser.add_argument("--white-band", type=str, default=None, dest="white_band", metavar="LO,HI",
+                        help="SDR white-luminance band in nits for the MHC grayscale refine (overrides "
+                             "the target's white_nits_band; default 11/12..1 x the nominal white): the "
+                             "refine dims white inside it just enough for an exact target white")
     parser.add_argument("--profile", type=Path, default=None)
     parser.add_argument("--bit-depth", type=int, default=None, dest="bit_depth")
 
@@ -7280,6 +7652,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             thermal_align=args.thermal_align,
                             hook_routing_policy=args.hook_routing_policy,
                             mhc_top_hold=(args.top_hold == "on"),
+                            white_band=(cp.parse_white_nits_band(args.white_band)
+                                        if args.white_band else None),
+                            source_run=args.source_run,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
         try:

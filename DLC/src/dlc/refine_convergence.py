@@ -32,6 +32,16 @@ orchestrator hands to the LLM as seams. The band's common-mode cast (the exact f
 is reported with its own significance so the LLM sees WHY. Everything the decision used rides
 in the returned dict.
 
+**Top anchor** (``top_anchor=True``, SDR). The band MEAN dilutes a single level: on the
+2026-09-25 PA32UCXR SDR run full white sat 0.99 dE2000 off D65 while 20 other greys were near
+zero, so the mean-based gain (0.08) called it converged after one round and white was never
+corrected. White is the one level every other judgement is anchored to, so with ``top_anchor``
+the band's TOP level is also judged on its own: its predicted gain (its removable error above its
+own floor, discounted by the refine's realized efficacy AT that level) must also fall below the
+materiality for ``converged``, and a material top residual whose last step realized an
+imperceptible gain is ``floored``. HDR keeps the mean-only judgment (its top is the Peak-Chroma
+cap, held by design).
+
 Spine-tier: stdlib only. The ΔE function is injected (dE_ITP for HDR, CIEDE2000 for SDR).
 """
 
@@ -191,7 +201,8 @@ def panel_floor_from_thermal(thermal_align: Optional[Mapping[str, Any]]) -> Pane
 def analyse_round(levels: Sequence[GreyLevel], *, de_fn: DeFn, floor: PanelFloor,
                   previous: Optional[Mapping[str, Any]] = None,
                   materiality: float = MATERIAL_GAIN_JND,
-                  k_sigma: float = SIGNIFICANCE_K) -> dict[str, Any]:
+                  k_sigma: float = SIGNIFICANCE_K,
+                  top_anchor: bool = False) -> dict[str, Any]:
     """Judge one refine round on its correctable band (see the module docstring).
 
     ``levels`` are the round's greys ALREADY restricted to the correctable band. ``previous`` is
@@ -283,6 +294,25 @@ def analyse_round(levels: Sequence[GreyLevel], *, de_fn: DeFn, floor: PanelFloor
         efficacy = min(1.0, max(0.0, realized / float(previous["raw_gain"])))
     predicted_gain = raw_gain * efficacy
 
+    # -- the top (white) anchor: the brightest band level judged on its own (see module doc) --
+    top: Optional[dict[str, Any]] = None
+    if top_anchor:
+        ti = max(range(len(rows)), key=lambda i: rows[i]["lv"].signal)
+        t_raw = max(0.0, rows[ti]["de"] - after[ti])
+        t_eff, t_real = 1.0, None
+        ptop = (previous or {}).get("top") if previous else None
+        if (isinstance(ptop, Mapping) and ptop.get("de") is not None and ptop.get("raw_gain")
+                and abs(float(ptop.get("signal", -1.0)) - rows[ti]["lv"].signal) < 1e-6):
+            t_real = float(ptop["de"]) - rows[ti]["de"]
+            t_eff = min(1.0, max(0.0, t_real / float(ptop["raw_gain"])))
+        top = {"signal": round(rows[ti]["lv"].signal, 6), "de": round(rows[ti]["de"], 3),
+               "raw_gain": round(t_raw, 3), "efficacy": round(t_eff, 3),
+               "realized_gain": _r(t_real, 3), "predicted_gain": round(t_raw * t_eff, 3),
+               "floor_xy": _r(rows[ti]["floor_xy"], 6), "lum_err": _r(rows[ti]["el"], 5)}
+    top_material = bool(top is not None and top["predicted_gain"] >= materiality)
+    top_floored = bool(top is not None and top["raw_gain"] >= materiality
+                       and top["realized_gain"] is not None and top["realized_gain"] < materiality)
+
     if not fin:
         # Every level was flagged unstable: nothing is judgeable, so nothing is "converged".
         decision = "unjudged"
@@ -293,6 +323,17 @@ def analyse_round(levels: Sequence[GreyLevel], *, de_fn: DeFn, floor: PanelFloor
                   f"(≥ {materiality:g}): removable error above the panel floor"
                   + (f", common-mode cast {cast:.4f} xy at {cast / cast_se:.0f}σ"
                      if cast_real and cast_se else ""))
+    elif top_material and not top_floored:
+        decision = "continue"
+        reason = (f"the top level (signal {top['signal']:g}, white) is {top['de']:.2f} off target; "
+                  f"another round is predicted to gain {top['predicted_gain']:.2f} there "
+                  f"(≥ {materiality:g}) — the band mean ({predicted_gain:.2f}) dilutes it")
+    elif top_floored:
+        decision = "floored"
+        reason = (f"the top level (signal {top['signal']:g}, white) keeps {top['raw_gain']:.2f} of "
+                  f"removable error above its floor, but the last step realized only "
+                  f"{top['realized_gain']:.2f} there — the refine cannot take white further "
+                  "(a channel at full drive? see the white band)")
     elif raw_gain >= materiality and realized is not None and realized < materiality:
         # The damped refine's efficacy is < 1 by design, so a low PREDICTION alone is not a
         # floor — only a step whose own realized gain was imperceptible while material,
@@ -333,6 +374,7 @@ def analyse_round(levels: Sequence[GreyLevel], *, de_fn: DeFn, floor: PanelFloor
             "source": floor.source,
         },
         "unstable_levels": unstable,
+        "top": top,
         "decision": decision,
         "reason": reason,
     })

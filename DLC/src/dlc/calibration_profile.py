@@ -50,6 +50,8 @@ __all__ = [
     "load_profile",
     "DEFAULT_PROFILE_PATH",
     "D65_XY",
+    "DEFAULT_SDR_WHITE_BAND_FRACTION",
+    "parse_white_nits_band",
 ]
 
 # A white-point resolver seam: ``(spd_file, *, strength, observer, anchor) -> dict``
@@ -217,6 +219,14 @@ class WhiteSpec:
     anchor: str = "reference"          # 'reference' | 'legacy' anchor for the correction
 
 
+# Default SDR white band when a target sets no ``white_nits_band``: the owner's 2026-09-25 latitude
+# (110–120 nits on the 120-nit sRGB target — "trade a few nits for an exact D65 white") expressed
+# RELATIVE to the nominal white so every SDR target inherits the same proportional latitude: never
+# brighter than the nominal, at most 1/12 (~8 %, ~0.35 stop — a luminance shift the adapted eye
+# discounts, unlike a white-point cast) dimmer.
+DEFAULT_SDR_WHITE_BAND_FRACTION: tuple[float, float] = (11.0 / 12.0, 1.0)
+
+
 @dataclass(frozen=True)
 class TargetSpec:
     """A named calibration target (primaries + transfer + white + luminance).
@@ -243,10 +253,30 @@ class TargetSpec:
     # HDR vertex run built with the projection solve maps onto the edge the MHC build fitted from the raw ramps,
     # when its gates pass and this run's post-MHC reads do not falsify it — metrics.run_level_edge).
     level_edge: str = "off"
+    # SDR white-luminance band (owner rule 2026-09-25) — profile key ``white_nits_band: [lo, hi]``:
+    # the SDR white may sit ANYWHERE in [lo, hi] nits, and the MHC grayscale refine trades the
+    # fewest nits needed inside it for an exact target white (a panel whose native white needs a
+    # channel above full drive at D65 cannot hold D65 AND its native luminance). ``None`` =>
+    # :data:`DEFAULT_SDR_WHITE_BAND_FRACTION` of ``white_luminance_nits``. Ignored for HDR.
+    white_nits_band: Optional[tuple[float, float]] = None
 
     @property
     def is_hdr(self) -> bool:
         return self.transfer_type == "pq"
+
+    @property
+    def sdr_white_band(self) -> tuple[float, float]:
+        """The SDR white-luminance band ``(lo, hi)`` in nits: the profile's ``white_nits_band`` when
+        set, else :data:`DEFAULT_SDR_WHITE_BAND_FRACTION` × ``white_luminance_nits``."""
+        if self.white_nits_band is not None:
+            return (float(self.white_nits_band[0]), float(self.white_nits_band[1]))
+        lo_f, hi_f = DEFAULT_SDR_WHITE_BAND_FRACTION
+        w = float(self.white_luminance_nits)
+        return (round(w * lo_f, 4), round(w * hi_f, 4))
+
+    @property
+    def sdr_white_band_source(self) -> str:
+        return "profile" if self.white_nits_band is not None else "default_fraction"
 
     @property
     def luminance_nits(self) -> float:
@@ -678,7 +708,27 @@ def _target_spec(name: str, raw: dict[str, Any]) -> TargetSpec:
         white_xy_override=white_override,
         oog_mapping=_oog_mapping(raw.get("oog_mapping")),
         level_edge=_level_edge(raw.get("level_edge")),
+        white_nits_band=_white_nits_band(raw.get("white_nits_band")),
     )
+
+
+def parse_white_nits_band(raw: Any) -> Optional[tuple[float, float]]:
+    """Validate a white-luminance band — the profile key ``white_nits_band: [lo, hi]`` or the CLI's
+    ``--white-band LO,HI`` (absent => None). Must be two positive numbers with ``lo <= hi``."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [v for v in raw.replace(",", " ").split() if v]
+    try:
+        lo, hi = (float(v) for v in raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"white_nits_band must be [lo, hi] nits, got {raw!r}") from exc
+    if not (lo > 0.0 and hi >= lo):
+        raise ValueError(f"white_nits_band must satisfy 0 < lo <= hi, got [{lo}, {hi}]")
+    return (lo, hi)
+
+
+_white_nits_band = parse_white_nits_band
 
 
 _OOG_MAPPINGS = ("vertex", "chroma-clip")   # mirrors engine.model.OOG_MAPPINGS (profile load stays engine-free)

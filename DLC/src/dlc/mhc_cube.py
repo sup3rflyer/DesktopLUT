@@ -73,6 +73,8 @@ __all__ = [
     "build_sdr_cube",
     "refine_hdr_cube",
     "refine_sdr_cube",
+    "sdr_white_reach",
+    "choose_sdr_white_nits",
     "refine_sdr_grayscale_legacy",
     "write_1d_cube",
     "read_1d_cube",
@@ -957,7 +959,8 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
                     peak_luminance: float, matrix_rowsums: Sequence[float],
                     *, gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
                     damping: float = 0.85, dark_floor_nits: float = 0.5,
-                    ratio_clamp: tuple[float, float] = (0.5, 2.0)
+                    ratio_clamp: tuple[float, float] = (0.5, 2.0),
+                    target_white_nits: Optional[float] = None
                     ) -> dict[str, list[float]]:
     """One closed-loop grayscale-refine step on the **SDR base cube** — PANEL-AGNOSTIC.
 
@@ -979,6 +982,13 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
                             RATIO, the same shares math as :func:`refine_sdr_grayscale_legacy`).
     ``matrix_rowsums``    : ``v_c = (M @ (1,1,1))_c`` of the INSTALLED SDR MHC2 matrix
                             (``mhc2_matrix(primaries, native_white, sRGB, D65)``).
+    ``target_white_nits`` : the luminance the refine drives WHITE (wire 1.0) to — every level's
+                            target is ``target_white_nits * s**gamma``. ``None`` => ``peak_luminance``
+                            (the legacy behaviour: target white = the native full-drive white, which
+                            is UNREACHABLE at D65 whenever a channel's rowsum exceeds 1 — see
+                            :func:`sdr_white_reach` / :func:`choose_sdr_white_nits`, the SDR white
+                            band). The linear-share basis stays at ``peak_luminance`` (native full
+                            drive of each channel = share 1).
 
     **Abscissa convention.** Windows applies the per-channel LUT AFTER the matrix, so for a wire
     neutral of signal ``s`` channel ``c`` is driven at the post-matrix index ``v_c**(1/γ)·s`` (the
@@ -1007,6 +1017,7 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
         white_Y=peak_luminance)
     disp_inv = invert3x3(disp)
     wx, wy = target_white_xy
+    white_nits = float(target_white_nits) if target_white_nits else float(peak_luminance)
 
     # gather (post-matrix signal, linear-light correction factor) per channel from the measurement
     pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
@@ -1014,7 +1025,7 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
         sig, xyz = float(entry[0]), entry[1]
         chroma_sigma = entry[2] if len(entry) > 2 else None
         lin = sig ** gamma
-        tY = peak_luminance * lin
+        tY = white_nits * lin
         if tY < dark_floor_nits:
             continue
         total = sum(xyz) or 1.0
@@ -1046,6 +1057,95 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
             curve.append(val)
         out[ch] = curve
     return out
+
+
+def sdr_white_reach(primaries: Mapping[str, float], native_white_xy: tuple[float, float],
+                    peak_luminance: float, matrix_rowsums: Sequence[float], *,
+                    gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
+                    measured_top_xyz: Optional[Sequence[float]] = None,
+                    top_signal: float = 1.0,
+                    current_curves: Optional[Mapping[str, Sequence[float]]] = None) -> dict:
+    """The brightest SDR white the panel can render AT the target chromaticity — every channel
+    within full drive. The physics behind the SDR white band (owner rule 2026-09-25).
+
+    In the refine's linear-share basis (native primaries balanced to the measured native white at
+    ``peak_luminance`` — native full drive of every channel = share 1), the target white at
+    luminance ``L`` needs shares ``u*L`` with ``u = inv(disp) @ XYZ(target_xy, 1 nit)``. A
+    channel's reachable light is its full drive, so white is reachable up to ``L_c = g_c / u_c``
+    per channel and ``reach = min_c L_c`` (the limiting channel hits full drive first).
+
+    ``g_c`` is the channel's light per unit linear drive. With a MEASURED top grey
+    (``measured_top_xyz`` at wire ``top_signal`` through the installed ``current_curves``) it is
+    measured: ``g_c = (inv(disp) @ XYZ)_c / cube_c(idx_c)**gamma`` at the channel's post-matrix
+    index ``idx_c = min(1, rowsum_c**(1/gamma) * top_signal)`` — absorbing non-additivity, the
+    matrix's clip of a >1 rowsum, and whatever drive the cube currently spends. Without a
+    measurement it is the additive model ``g_c = 1`` (then ``reach = peak / max(rowsums)``: the
+    MHC2 matrix maps target white to native shares ``rowsums``, so a rowsum above 1 is a channel
+    asked for more than full drive). Returns ``{reach_nits, limiting_channel, per_channel_nits,
+    basis}``; ``reach_nits`` is ``None`` if the inputs are degenerate."""
+    disp = rgb_to_xyz_matrix(
+        primaries["rx"], primaries["ry"], primaries["gx"], primaries["gy"],
+        primaries["bx"], primaries["by"], native_white_xy[0], native_white_xy[1],
+        white_Y=peak_luminance)
+    disp_inv = invert3x3(disp)
+    unit = matvec(disp_inv, xy_to_XYZ(target_white_xy[0], target_white_xy[1], 1.0))
+    basis = "model"
+    gains = [1.0, 1.0, 1.0]
+    if measured_top_xyz is not None and current_curves is not None and top_signal > 0.0:
+        ms = matvec(disp_inv, [float(v) for v in measured_top_xyz])
+        measured: list[float] = []
+        for c, ch in enumerate(_CHANNELS):
+            idx = min(1.0, max(float(matrix_rowsums[c]), 0.0) ** (1.0 / gamma) * float(top_signal))
+            drive_lin = max(_sample_curve(current_curves[ch], idx), 0.0) ** gamma
+            measured.append(ms[c] / drive_lin if drive_lin > 1e-6 and ms[c] > 0.0 else float("nan"))
+        if all(math.isfinite(g) and g > 0.0 for g in measured):
+            gains, basis = measured, "measured"
+    per: dict[str, Optional[float]] = {}
+    for c, ch in enumerate(_CHANNELS):
+        per[ch] = (gains[c] / unit[c]) if unit[c] > 1e-12 else None
+    finite = {ch: v for ch, v in per.items() if v is not None and math.isfinite(v) and v > 0.0}
+    if not finite:
+        return {"reach_nits": None, "limiting_channel": None, "per_channel_nits": per,
+                "basis": basis}
+    lim = min(finite, key=finite.get)
+    return {"reach_nits": round(finite[lim], 4), "limiting_channel": lim,
+            "per_channel_nits": {ch: (round(v, 4) if v is not None else None)
+                                 for ch, v in per.items()},
+            "basis": basis}
+
+
+def choose_sdr_white_nits(reach_nits: Optional[float], band: tuple[float, float],
+                          native_peak_nits: float) -> dict:
+    """Pick the SDR refine's white luminance from the band ``(lo, hi)`` (a TARGET property —
+    ``TargetSpec.sdr_white_band``) and the panel's target-white reach (:func:`sdr_white_reach`).
+
+    Owner rule (2026-09-25): white may sit anywhere in ``[lo, hi]``; trade the fewest nits needed
+    for an exact target white. The band is pre-authorized, so choosing inside it is mechanical:
+
+    * ``reach >= hi``       -> ``hi`` (``in_band``: the band top; the target white has headroom);
+    * ``lo <= reach < hi``  -> ``reach`` (``in_band``: the MINIMUM dimming that gives every channel
+      the headroom to hit the target white);
+    * ``reach < lo``        -> the closest in-band luminance, ``lo`` (or the native peak if even
+      ``lo`` is above full drive): exact target white would need going BELOW the band —
+      ``below_band``, which the orchestrator raises as a seam (that trade is the LLM's/owner's
+      call, never code's).
+
+    ``reach`` unknown => the band top capped at the native peak (``unknown_reach``)."""
+    lo, hi = float(band[0]), float(band[1])
+    peak = float(native_peak_nits)
+    if reach_nits is None or not math.isfinite(reach_nits):
+        return {"white_nits": round(min(hi, peak), 4), "status": "unknown_reach",
+                "band": [lo, hi], "reach_nits": None}
+    reach = float(reach_nits)
+    if reach >= hi:
+        nits, status = hi, "in_band"
+    elif reach >= lo:
+        nits, status = reach, "in_band"
+    else:
+        nits, status = min(lo, peak), "below_band"
+    return {"white_nits": round(nits, 4), "status": status, "band": [lo, hi],
+            "reach_nits": round(reach, 4),
+            "dim_pct_vs_native": round(100.0 * (1.0 - nits / peak), 3) if peak > 0 else None}
 
 
 def refine_sdr_grayscale_legacy(current_deviations: Optional[Mapping[str, Sequence[float]]],

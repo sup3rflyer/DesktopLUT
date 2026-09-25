@@ -38,6 +38,7 @@ __all__ = [
     "build_neutral_set",
     "build_grayscale_wb_set",
     "build_verify_set",
+    "build_refine_verify_set",
     "flow_patch_counts",
     "outside_in_indices",
 ]
@@ -558,6 +559,36 @@ def build_verify_set(ps: PatchSizes, transfer: Transfer, *,
     return _with_saturation_sweep_bookends(core, ps, transfer, max_cv=max_cv)
 
 
+# The colour-sanity subset of the refine-only verify: RGBCMY at these signal levels (full
+# saturation) plus one half-saturation tint per hue at the middle level — enough to see whether a
+# re-refined MHC under an UNCHANGED 3D LUT still lands every hue, far short of the full QC sweep.
+_REFINE_VERIFY_LEVELS = (0.5, 0.75, 1.0)
+_REFINE_VERIFY_TINT = 0.5
+_HUES = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0))
+
+
+def build_refine_verify_set(ps: PatchSizes, transfer: Transfer, *,
+                            warm_tau: Optional[int] = None,
+                            max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The SHORT verify of the ``refine-mhc`` flow (re-refine a completed run's MHC grayscale and
+    keep its 3D LUT): the refine's own grey ramp (:func:`build_neutral_set` — what changed) plus a
+    colour-sanity subset (RGBCMY at :data:`_REFINE_VERIFY_LEVELS`, one half-saturation tint per hue)
+    to confirm the kept cube is still valid over the re-refined foundation. Not the full QC set —
+    the colour volume was verified by the run that built the cube; this checks it survived."""
+    cap = max_cv if max_cv is not None else transfer.max_cv
+    greys = build_neutral_set(ps, transfer, warm_tau=warm_tau, max_cv=cap)
+    colour: list[tuple[int, int, int]] = []
+    for hue in _HUES:
+        for level in _REFINE_VERIFY_LEVELS:
+            v = int(round(level * cap))
+            colour.append(tuple(v if h else 0 for h in hue))
+        mid = int(round(_REFINE_VERIFY_LEVELS[1] * cap))
+        low = int(round(mid * (1.0 - _REFINE_VERIFY_TINT)))
+        colour.append(tuple(mid if h else low for h in hue))
+    union = _dedup_keep_order(list(greys) + colour)
+    return sort_patches(union, ps.order, transfer, warm_tau=warm_tau)
+
+
 # The patch sets each flow MEASURES, keyed by measure-stage role (so a plan/preview can show
 # the run's size before any measurement). build-correction measures nothing through spotread.
 _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
@@ -565,10 +596,14 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
     "mhc-only": ("raw", "verify"),
     "3dlut-only": ("post-mhc", "verify"),
     "grayscale-wb": ("grayscale-wb", "grayscale-wb-verify"),
+    # refine rounds (the neutral ramp, repeated until the physics judge stops) are not counted —
+    # as for the full/mhc-only refine; the fixed cost is the short verify.
+    "refine-mhc": ("refine-verify",),
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
                    "post-mhc": build_volumetric_set, "grayscale-wb": build_grayscale_wb_set,
-                   "grayscale-wb-verify": build_grayscale_wb_set, "verify": build_verify_set}
+                   "grayscale-wb-verify": build_grayscale_wb_set, "verify": build_verify_set,
+                   "refine-verify": build_refine_verify_set}
 
 
 def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
