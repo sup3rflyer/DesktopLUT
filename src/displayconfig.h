@@ -61,6 +61,24 @@ DisplayColorModeResult ClassifyDisplayColorMode(bool dxgiHdrActive, bool dxgiFp1
                                                 bool legacyOk, bool legacyAdvancedColorEnabled);
 const char* DisplayColorModeName(DisplayColorMode mode);   // "SDR" | "ACM_SDR" | "HDR" | "UNKNOWN"
 
+// Live LINK format of a display target (DLC 2026-09-26): the bits per colour channel + colour encoding
+// the GPU drives on the cable (DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 on 24H2+, the legacy
+// GET_ADVANCED_COLOR_INFO otherwise) and the connector (GET_TARGET_NAME outputTechnology). NOT the
+// panel's native depth: a 10-bit panel on a bandwidth-limited HDMI link runs 8 bpc. Reported by
+// windows.query_monitors as link_bpc / link_color_encoding / link_connector / link_format_source.
+struct DisplayLinkFormat {
+    bool ok = false;                       // a colour-info query answered
+    unsigned int bitsPerColorChannel = 0;  // 0 = the driver did not say
+    unsigned int colorEncoding = 0;        // DISPLAYCONFIG_COLOR_ENCODING
+    bool haveOutputTechnology = false;
+    unsigned int outputTechnology = 0;     // DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY
+    const char* source = "none";           // "displayconfig2" | "displayconfig" | "none"
+};
+DisplayLinkFormat QueryDisplayLinkFormat(const DisplayInfo& display);
+// Pure name maps (exposed for tests).
+const char* DisplayColorEncodingName(unsigned int encoding);      // "RGB" | "YCBCR444" | ... | "UNKNOWN"
+const char* DisplayOutputTechnologyName(unsigned int technology); // "HDMI" | "DISPLAYPORT_EXTERNAL" | ... | "UNKNOWN"
+
 // Toggle HDR on the monitor containing the focused window
 // Returns true if toggled, false if failed (e.g., monitor not HDR-capable)
 bool ToggleHdrOnFocusedMonitor();
