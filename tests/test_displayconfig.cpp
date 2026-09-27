@@ -303,6 +303,16 @@ TEST_CASE("DisplayColorMode: 24H2 activeColorMode classifies SDR vs ACM (the DXG
     CHECK(hdr.mode == DisplayColorMode::HDR);
 }
 
+TEST_CASE("DisplayLinkFormat: encoding + connector names (query_monitors link_* fields)") {
+    CHECK(std::string(DisplayColorEncodingName(0)) == "RGB");
+    CHECK(std::string(DisplayColorEncodingName(3)) == "YCBCR420");
+    CHECK(std::string(DisplayColorEncodingName(99)) == "UNKNOWN");
+    CHECK(std::string(DisplayOutputTechnologyName(5)) == "HDMI");
+    CHECK(std::string(DisplayOutputTechnologyName(10)) == "DISPLAYPORT_EXTERNAL");
+    CHECK(std::string(DisplayOutputTechnologyName(0x80000000u)) == "INTERNAL");
+    CHECK(std::string(DisplayOutputTechnologyName(7)) == "UNKNOWN");
+}
+
 TEST_CASE("DisplayColorMode: an activeColorMode value this build does not know falls back to the legacy query") {
     auto r = ClassifyDisplayColorMode(false, false, true, 7u, true, true);
     CHECK(r.mode == DisplayColorMode::AcmSdr);

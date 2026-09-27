@@ -83,6 +83,7 @@ from .adjudication import (
     SEAM_FOUNDATION,
     SEAM_HARDWARE_READY,
     SEAM_MEASURE,
+    SEAM_LINK_DEPTH,
     SEAM_MONITOR_MAP,
     SEAM_OPTIMIZE,
     SEAM_PIPE,
@@ -357,10 +358,15 @@ class Calibration:
         mhc_top_hold: bool = True,
         white_band: Optional[tuple[float, float]] = None,
         source_run: Optional[Path] = None,
+        link_probe: Optional[Callable[[], dict[str, Any]]] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
         self.monitor = monitor
+        # Local DisplayConfig link-format probe (dlc.link_format.probe_link_formats) — the fallback
+        # when the DesktopLUT build's query_monitors predates link_bpc. The live CLI wires it; the
+        # default None keeps sim/tests off the host's real displays.
+        self.link_probe = link_probe
         # Provisional — reconciled against the persisted run record once _state is loaded
         # below (a resume must not let the CLI default override the run's fixed mode).
         self.mode = normalize_mode(mode)
@@ -2134,22 +2140,26 @@ class Calibration:
                 f"wrong panel and all readings are silently wrong.")
         return guard
 
-    def _transport_tell(self) -> dict[str, Any]:
+    def _transport_tell(self, link_bpc: Optional[int] = None) -> dict[str, Any]:
         """Advisory (never a gate): a 3D-LUT flow measured below the panel's bit depth, or on a
         local-dimming panel without a fullscreen patch, risks contaminated VOLUMETRIC reads —
         the very data the 3D LUT is built from. The orchestrator can't see the presenter
         transport (wired in the CLI) but it knows the run's bit depth + the panel, so it surfaces
         the risk + the fix: an ACM/FP16 SDR scanout is 10-bit-live (an 8-bit windowed read
-        under-samples it), and mini-LED local dimming contaminates a non-fullscreen patch."""
+        under-samples it), and mini-LED local dimming contaminates a non-fullscreen patch.
+        ``link_bpc`` (the MEASURED live link depth, when known) replaces the profile's
+        ``panel.bit_depth`` — an 8 bpc link is not under-sampled by 8-bit patterns."""
         flow = self.calib.get("flow")
         if flow not in ("full", "3dlut-only") or self.mode != "SDR":
             return {"checked": False, "reason": "not an SDR 3D-LUT flow"}
         panel = self.display.panel
-        panel_bits = panel.bit_depth or 8
+        panel_bits = int(link_bpc) if link_bpc else (panel.bit_depth or 8)
         tech = (panel.tech or "").lower()
         local_dimming = bool(panel.backlight_zones) or any(t in tech for t in ("mini", "fald", "local"))
         guard: dict[str, Any] = {"checked": True, "bit_depth": self.bit_depth,
-                                 "panel_bit_depth": panel_bits, "local_dimming": local_dimming}
+                                 "panel_bit_depth": panel_bits,
+                                 "panel_bit_depth_source": "link" if link_bpc else "profile",
+                                 "local_dimming": local_dimming}
         if self.bit_depth < 10 and (panel_bits >= 10 or local_dimming):
             guard["warning"] = (
                 f"3D-LUT flow measuring at {self.bit_depth}-bit on a {panel_bits}-bit"
@@ -2160,6 +2170,53 @@ class Calibration:
                 f"(`--dogegen-server HOST:PORT`), DesktopLUT hook ON — or the volumetric reads "
                 f"feeding the 3D LUT may be silently wrong.")
         return guard
+
+    def _link_depth_check(self) -> dict[str, Any]:
+        """Measure the LIVE link format (bpc + encoding) of this run's monitor and list where it
+        disagrees with ``--bit-depth`` (the patterns / dogegen daemon) and the profile's
+        ``panel.bit_depth``. Mechanical detection only (:mod:`dlc.link_format`); a disagreement is
+        the ``preflight:link-depth`` seam, never an auto-fix. Unmeasurable (pipe down, old build
+        with no local probe, no matching path) ⇒ ``checked=False`` — a tell, never a false seam."""
+        from .link_format import assess_link_depth, link_format_for_monitor
+
+        profile_bits = getattr(self.display.panel, "bit_depth", None)
+        try:
+            monitors = (self.controller.query_monitors() or {}).get("monitors") or []
+            entry = next((m for m in monitors if m.get("index") == self.monitor), None)
+            link = link_format_for_monitor(entry, self.link_probe)
+        except Exception as exc:  # noqa: BLE001 - unmeasured ⇒ tell, never a false seam
+            link = {"bpc": None, "encoding": None, "source": None,
+                    "reason": f"{type(exc).__name__}: {exc}"}
+        return assess_link_depth(link, run_bits=int(self.bit_depth),
+                                 profile_bits=(int(profile_bits) if profile_bits else None),
+                                 mode=self.mode)
+
+    def _resolve_output_depth(self, link_depth: Mapping[str, Any],
+                              decision: Optional[str]) -> dict[str, Any]:
+        """The OUTPUT precision a channel lands on (the refine's per-level quantization floor and
+        the SDR white-band code margin): the measured link depth when known — unless the
+        ``preflight:link-depth`` seam chose ``use-profile`` — else the profile's
+        ``panel.bit_depth``. Persisted in ``calib['output_depth']`` with its provenance."""
+        profile_bits = getattr(self.display.panel, "bit_depth", None)
+        link_bpc = link_depth.get("link_bpc")
+        if link_bpc and decision != "use-profile":
+            if profile_bits and int(profile_bits) < int(link_bpc):
+                # a wider wire cannot add precision the panel lacks: min(link, panel)
+                return {"bits": int(profile_bits), "source": "profile (narrower than the link)",
+                        "link_bpc": link_bpc, "profile_bit_depth": profile_bits, "decision": decision}
+            return {"bits": int(link_bpc), "source": "link", "link_bpc": link_bpc,
+                    "profile_bit_depth": profile_bits, "decision": decision}
+        return {"bits": int(profile_bits or 10),
+                "source": "profile" if decision == "use-profile" else "profile (link unmeasured)",
+                "link_bpc": link_bpc, "profile_bit_depth": profile_bits, "decision": decision}
+
+    def _output_bits(self) -> int:
+        """The output bit depth resolved at preflight (``calib['output_depth']``); a Calibration
+        that never ran preflight falls back to the profile's ``panel.bit_depth`` (else 10)."""
+        rec = self.calib.get("output_depth") or {}
+        if rec.get("bits"):
+            return int(rec["bits"])
+        return int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
 
     def _target_colorspace(self) -> Optional[str]:
         """The target colour space for this run, resilient to preflight running BEFORE
@@ -2327,8 +2384,18 @@ class Calibration:
                 self.ctx.log(patch_window["warning"])
             if patch_window.get("mode_warning"):
                 self.ctx.log(patch_window["mode_warning"])
+            # LIVE link format (bpc + encoding) vs --bit-depth and the profile's panel.bit_depth —
+            # measured, never assumed; a disagreement is the preflight:link-depth seam below.
+            self.runlog.note("preflight", "reading the live display-link bit depth + encoding")
+            link_depth = self._link_depth_check()
+            if link_depth.get("mismatch"):
+                self.ctx.log("link depth mismatch: "
+                             + "; ".join(r["detail"] for r in link_depth.get("reasons", [])))
+            elif not link_depth.get("checked"):
+                self.ctx.log(f"live link depth unmeasured ({link_depth.get('reason')}) — the output "
+                             f"quantization floor falls back to the profile's panel.bit_depth")
             # Measurement-transport adequacy for 3D-LUT flows (advisory): bit depth + panel.
-            transport = self._transport_tell()
+            transport = self._transport_tell(link_depth.get("link_bpc"))
             if transport.get("warning"):
                 self.ctx.log(transport["warning"])
             # Panel-capability tells from the DIP (advisory, never gates): does the measured
@@ -2399,6 +2466,7 @@ class Calibration:
                       "correction_from_store": corr_res.source == "store",
                       "correction_resolution": corr_res.as_dict(),
                       "patch_window": patch_window,
+                      "link_depth": link_depth,
                       "transport": transport,
                       "gamut": gamut_tell,
                       "panel_limits": panel_limits,
@@ -2456,6 +2524,37 @@ class Calibration:
                          "disagrees with the live displays — abort and fix the profile, or proceed?"),
                 options=("abort", "proceed"), recommendation="abort", digest=monitor_map)),
                 stage="preflight", message="aborted on a monitor↔Argyll↔panel map mismatch")
+        # Live link depth vs --bit-depth / profile (2026-09-26: a BenQ profiled 10-bit ran an 8 bpc
+        # HDMI link and nothing caught it). Which depth is right — relaunch at the link's depth, trust
+        # the link for the output floor, or trust the profile — is a judgment, never an auto-fix.
+        # build-correction is exempt: a spectral correction build is bit-depth-agnostic.
+        link_depth = outcome.digest.get("link_depth") or {}
+        link_choice: Optional[str] = None
+        if link_depth.get("mismatch") and self.calib.get("flow") != "build-correction":
+            bpc = link_depth.get("link_bpc")
+            prof = link_depth.get("profile_bit_depth")
+            fix = ((f"relaunch the run AND the dogegen daemon at --bit-depth {min(int(bpc), 10)} "
+                    f"(dogegen takes 8 or 10) and/or " if link_depth.get("relaunch_needed") else "")
+                   + "fix the link (cable / bandwidth / refresh / GPU colour format) or correct "
+                     "panel.bit_depth")
+            link_choice = self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="preflight:link-depth", seam=SEAM_LINK_DEPTH, stage="preflight",
+                question=(
+                    f"monitor {self.monitor}'s live link is {bpc} bpc {link_depth.get('link_encoding')}"
+                    f" ({link_depth.get('link_connector') or 'connector unknown'}; read via "
+                    f"{link_depth.get('link_source')}), but "
+                    + "; ".join(r["detail"] for r in link_depth.get("reasons", []))
+                    + f". abort = stop now (nothing measured) and {fix}; use-link = proceed with the "
+                    f"output-quantization floor at the measured {bpc} bits; use-profile = proceed "
+                    f"with it at the profile's {prof} bits (the link reading is wrong or irrelevant). "
+                    f"Neither proceed option changes the pattern depth (--bit-depth "
+                    f"{link_depth.get('run_bit_depth')}) — it is fixed for the run."),
+                options=("abort", "use-link", "use-profile"),
+                recommendation=link_depth.get("suggested", "abort"),
+                digest=dict(link_depth))),
+                stage="preflight", message="aborted on a live link-depth mismatch").choice
+        self.calib["output_depth"] = self._resolve_output_depth(link_depth, link_choice)
+        self._save()
         # A failed pre-run backup means a failed/cancelled run may have NO durable rollback
         # (the in-memory C++ snapshot is the live net, but it dies with DesktopLUT). That is a
         # judgment call, not a log line (fable Phase 7a, from the BLE001 sweep): recommend
@@ -3245,11 +3344,11 @@ class Calibration:
         """The SDR white's physical margin below the reach — ONE definition for the refine and the
         brightness forecast: the white read's repeatability (DIP noise model) ⊕ the settled thermal
         wander (the run's thermal-alignment evidence; none yet at brightness time — flagged) ⊕ one
-        output code at white (the panel's bit depth)."""
+        output code at white (the output depth preflight resolved from the live link)."""
         from .mhc_cube import sdr_white_margin_rel
 
         gamma = float(self._spec().gamma)
-        out_bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
+        out_bits = self._output_bits()      # the MEASURED link depth resolved at preflight
         code_rel = gamma / float(2 ** out_bits - 1)
         meter_rel = self._meter_lum_sigma_rel(float(nits))
         thermal = self.calib.get("thermal_align")
@@ -4444,10 +4543,11 @@ class Calibration:
 
         spec = self._spec()
         hdr = bool(spec.is_hdr)
-        # The OUTPUT precision a channel lands on — the panel's link depth, not the test-pattern
-        # depth (``self.bit_depth`` is dogegen's; SDR patterns default to 8-bit while the MHC LUT
-        # output still reaches a 10-bit panel at its own precision).
-        bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
+        # The OUTPUT precision a channel lands on — the MEASURED live link depth (preflight,
+        # ``calib['output_depth']``), not the test-pattern depth (``self.bit_depth`` is dogegen's;
+        # SDR patterns default to 8-bit while the MHC LUT output still reaches a 10-bit link at its
+        # own precision) and not the profile's claim (a 10-bit-profiled panel on an 8 bpc HDMI link).
+        bits = self._output_bits()
         code = 1.0 / float(2 ** bits - 1)
         wx, wy = white_xy
         noise = self._dark_noise_entries(ti3_path)
@@ -8395,6 +8495,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     from .argyll import Argyll, SpotreadRequest
     from .dogegen import DogegenPatchDisplay
     from .measure_rgbw import resolve_spotread_instrument_port
+    from .link_format import probe_link_formats
 
     controller = CalibrationController.connect()
 
@@ -8599,6 +8700,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             mhc_top_hold=(args.top_hold == "on"),
                             white_band=args.white_band,
                             source_run=args.source_run,
+                            link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
         try:

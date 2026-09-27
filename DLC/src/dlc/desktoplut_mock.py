@@ -341,6 +341,11 @@ class MockDesktopLutServer:
                 "target_id": 0,
                 "adapter_id": {"low": 0, "high": 0},
                 "hdr_capable": True,
+                # Live link format (C++ 2026-09-26, DisplayConfig bitsPerColorChannel/colorEncoding).
+                "link_bpc": 10,
+                "link_color_encoding": "RGB",
+                "link_connector": "DISPLAYPORT_EXTERNAL",
+                "link_format_source": "displayconfig2",
             },
             {
                 "index": 1,
@@ -354,6 +359,10 @@ class MockDesktopLutServer:
                 "target_id": 1,
                 "adapter_id": {"low": 0, "high": 0},
                 "hdr_capable": False,
+                "link_bpc": 8,
+                "link_color_encoding": "RGB",
+                "link_connector": "HDMI",
+                "link_format_source": "displayconfig2",
             },
         ]
         for m in monitors:

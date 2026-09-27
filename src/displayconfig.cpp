@@ -331,6 +331,80 @@ DisplayColorModeResult ClassifyDisplayColorMode(bool dxgiHdrActive, bool dxgiFp1
     return r;
 }
 
+const char* DisplayColorEncodingName(unsigned int encoding) {
+    switch (encoding) {
+        case 0: return "RGB";
+        case 1: return "YCBCR444";
+        case 2: return "YCBCR422";
+        case 3: return "YCBCR420";
+        case 4: return "INTENSITY";
+        default: return "UNKNOWN";
+    }
+}
+
+const char* DisplayOutputTechnologyName(unsigned int technology) {
+    switch (technology) {
+        case 0xFFFFFFFFu: return "OTHER";
+        case 0: return "HD15";
+        case 1: return "SVIDEO";
+        case 2: return "COMPOSITE_VIDEO";
+        case 3: return "COMPONENT_VIDEO";
+        case 4: return "DVI";
+        case 5: return "HDMI";
+        case 6: return "LVDS";
+        case 8: return "D_JPN";
+        case 9: return "SDI";
+        case 10: return "DISPLAYPORT_EXTERNAL";
+        case 11: return "DISPLAYPORT_EMBEDDED";
+        case 12: return "UDI_EXTERNAL";
+        case 13: return "UDI_EMBEDDED";
+        case 14: return "SDTVDONGLE";
+        case 15: return "MIRACAST";
+        case 16: return "INDIRECT_WIRED";
+        case 17: return "INDIRECT_VIRTUAL";
+        case 18: return "DISPLAYPORT_USB_TUNNEL";
+        case 0x80000000u: return "INTERNAL";
+        default: return "UNKNOWN";
+    }
+}
+
+DisplayLinkFormat QueryDisplayLinkFormat(const DisplayInfo& display) {
+    DisplayLinkFormat f;
+    DlutAdvancedColorInfo2 info2 = {};
+    info2.header.type = DLUT_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;
+    info2.header.size = sizeof(info2);
+    info2.header.adapterId = display.adapterId;
+    info2.header.id = display.targetId;
+    if (DisplayConfigGetDeviceInfo(&info2.header) == ERROR_SUCCESS) {
+        f.ok = true;
+        f.bitsPerColorChannel = info2.bitsPerColorChannel;
+        f.colorEncoding = (unsigned int)info2.colorEncoding;
+        f.source = "displayconfig2";
+    } else {
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO ci = {};
+        ci.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        ci.header.size = sizeof(ci);
+        ci.header.adapterId = display.adapterId;
+        ci.header.id = display.targetId;
+        if (DisplayConfigGetDeviceInfo(&ci.header) == ERROR_SUCCESS) {
+            f.ok = true;
+            f.bitsPerColorChannel = ci.bitsPerColorChannel;
+            f.colorEncoding = (unsigned int)ci.colorEncoding;
+            f.source = "displayconfig";
+        }
+    }
+    DISPLAYCONFIG_TARGET_DEVICE_NAME tn = {};
+    tn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    tn.header.size = sizeof(tn);
+    tn.header.adapterId = display.adapterId;
+    tn.header.id = display.targetId;
+    if (DisplayConfigGetDeviceInfo(&tn.header) == ERROR_SUCCESS) {
+        f.haveOutputTechnology = true;
+        f.outputTechnology = (unsigned int)tn.outputTechnology;
+    }
+    return f;
+}
+
 DisplayColorModeResult QueryDisplayColorMode(const DisplayInfo& display, bool dxgiHdrActive, bool dxgiFp16Sdr) {
     DlutAdvancedColorInfo2 info2 = {};
     info2.header.type = DLUT_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2;

@@ -861,6 +861,17 @@ void HandleQueryMonitors(const JsonValue& /*p*/, JsonValue& result) {
             adapter.set("low", JNum((double)di.adapterId.LowPart));
             adapter.set("high", JNum((double)di.adapterId.HighPart));
             e.set("adapter_id", adapter);
+            // Live LINK format (DLC 2026-09-26): the bpc/encoding on the cable, which DLC compares
+            // against its --bit-depth and the profile's panel.bit_depth. Absent when the query fails
+            // or the driver reports 0 bpc (DLC treats absent as "unmeasured", never as a mismatch).
+            DisplayLinkFormat lf = QueryDisplayLinkFormat(di);
+            if (lf.ok && lf.bitsPerColorChannel > 0) {
+                e.set("link_bpc", JNum((double)lf.bitsPerColorChannel));
+                e.set("link_color_encoding", JStr(DisplayColorEncodingName(lf.colorEncoding)));
+                e.set("link_format_source", JStr(lf.source));
+            }
+            if (lf.haveOutputTechnology)
+                e.set("link_connector", JStr(DisplayOutputTechnologyName(lf.outputTechnology)));
         }
 
         // Live color space via a fresh DXGI query (the same check the capture
