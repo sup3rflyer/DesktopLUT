@@ -38,10 +38,9 @@ CPP_SERVER = Path(__file__).resolve().parents[1].parent / "src" / "desktoplut_ip
 
 # Spec result keys the C++ does not emit yet — each entry is a DESKTOPLUT TICKET
 # (docs/audits/fable/phase-9.md §5). Remove the entry when the C++ lands it, so this
-# test starts enforcing it.
-CPP_TICKETED_RESULT_KEYS = {
-    "state.get": {"contract_version"},
-}
+# test starts enforcing it. Empty since T1 landed (contract_version): every advertised
+# result key is now actually emitted, and a new spec key without a C++ handler fails.
+CPP_TICKETED_RESULT_KEYS: dict[str, set[str]] = {}
 
 
 def _spec_methods() -> dict[str, dict]:
@@ -228,6 +227,24 @@ def test_spec_gui_thread_flags_match_cpp_dispatch():
         assert entry["gui_thread_required"] is expected, (
             f"{method}: spec says gui_thread_required={entry['gui_thread_required']} "
             f"but the C++ Dispatch routes it {'off' if not expected else 'onto'} the GUI thread")
+
+
+def test_no_gui_thread_branch_for_a_method_dispatch_already_serves():
+    """`Dispatch` answers some methods on the PIPE thread before the IsMutatingMethod marshal,
+    so a branch for one of those in HandleCalibrationGuiCommand can never run. One such branch
+    existed for maintenance.verify_mhc and misled about the threading (fable Phase 9, T4); this
+    catches the next one, whichever method it is."""
+    text = _cpp_text()
+    dispatch = text[text.find("std::string Dispatch("):text.find("// Pipe server")]
+    off_thread = set(re.findall(r'method\s*==\s*"([^"]+)"',
+                                dispatch[:dispatch.find("IsMutatingMethod")]))
+    gui_start = text.find("LRESULT HandleCalibrationGuiCommand(")
+    assert gui_start != -1, "HandleCalibrationGuiCommand not found in the C++ IPC server"
+    gui_table = text[gui_start:text.find("\nLRESULT ", gui_start + 1)]
+    gui_methods = set(re.findall(r'm\s*==\s*"([^"]+)"', gui_table))
+    dead = sorted(off_thread & gui_methods)
+    assert not dead, (f"HandleCalibrationGuiCommand has unreachable branches for {dead} — "
+                      "Dispatch already serves them on the pipe thread")
 
 
 # --------------------------------------------------------------------------
