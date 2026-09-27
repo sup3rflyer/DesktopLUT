@@ -329,11 +329,17 @@ def check_against_pipe(rec: Optional[StackRecord], pipe_state: Optional[dict[str
 # CLI: inspect / backfill from a run record
 # ---------------------------------------------------------------------------
 
+# The stages whose ``done`` record means "this run left an MHC installed": the full / mhc-only
+# build, and the refine-mhc flow's re-install of the refined MHC.
+_MHC_APPLY_STAGES = ("build-install-mhc", "install-mhc")
+
+
 def import_run(run_dir: Path, registry: StackRegistry, *, cube_path: Optional[str] = None,
                profile_name: Optional[str] = None, display_name: Optional[str] = None,
                save: bool = True) -> StackRecord:
     """Backfill a record from a run's ``dlc_state.json`` + ``manifest.json`` (the run must have
-    built and applied an MHC: ``build-install-mhc`` done + ``mhc_params`` present)."""
+    applied an MHC: ``build-install-mhc`` done — or ``install-mhc``, the stage a ``refine-mhc`` run
+    re-installs its refined MHC under — plus ``mhc_params`` present)."""
     state = json.loads((run_dir / "dlc_state.json").read_text(encoding="utf-8"))
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")) \
         if (run_dir / "manifest.json").exists() else {}
@@ -341,24 +347,36 @@ def import_run(run_dir: Path, registry: StackRegistry, *, cube_path: Optional[st
     params = state.get("mhc_params") or {}
     if not params:
         raise ValueError(f"{run_dir}: no mhc_params in dlc_state.json (no MHC built here)")
-    build = ((calib.get("stages") or {}).get("build-install-mhc") or {})
-    if build.get("status") != "done":
-        raise ValueError(f"{run_dir}: build-install-mhc is not done")
+    stages = calib.get("stages") or {}
+    build = next((stages[k] for k in _MHC_APPLY_STAGES
+                  if (stages.get(k) or {}).get("status") == "done"), None)
+    if build is None:
+        raise ValueError(f"{run_dir}: no MHC-applying stage is done ({' / '.join(_MHC_APPLY_STAGES)})")
     digest = build.get("digest") or {}
     display = display_name or manifest.get("display") or calib.get("display") or "unknown"
     mode = str(state.get("mode") or params.get("mode") or manifest.get("mode") or "HDR").upper()
     monitor = int(state.get("monitor") if state.get("monitor") is not None else params.get("monitor", 0))
     white = digest.get("white_xy")
+    # Re-importing the run the registry already records (a backfill of a field the live apply
+    # predates, e.g. ``sdr_white``) fills gaps only: the pipe-read profile name, the apply time,
+    # the cube and the notes the live apply captured are evidence the run record lacks.
+    prior = registry.get(display, mode)
+    prior = prior if prior is not None and prior.run_id == run_dir.name else None
     rec = record_from_mhc_params(
         display=display, mode=mode, monitor=monitor, run_id=run_dir.name,
-        profile_name=profile_name or digest.get("profile_name"),
+        profile_name=profile_name or digest.get("profile_name") or (prior.profile_name if prior else None),
         mhc_params=params, target_white_xy=tuple(white) if white else None,
-        applied_at=manifest.get("created") or datetime.now().isoformat(timespec="seconds"))
+        applied_at=((prior.applied_at if prior else None) or manifest.get("created")
+                    or datetime.now().isoformat(timespec="seconds")))
+    if prior is not None:
+        rec.notes = list(prior.notes)
+        rec.cube = dict(prior.cube) if prior.cube else None
     rec.notes.append(f"imported from {run_dir.name} by stack_registry import-run"
                      + (" (profile name supplied by the operator)" if profile_name else ""))
     if cube_path:
-        rec.cube = {"cube_path": cube_path, "run_id": run_dir.name,
-                    "applied_at": rec.applied_at}
+        same = rec.cube if rec.cube and rec.cube.get("cube_path") == cube_path else {}
+        rec.cube = {**same, "cube_path": cube_path, "run_id": run_dir.name,
+                    "applied_at": same.get("applied_at") or rec.applied_at}
     return registry.record(rec, save=save)
 
 

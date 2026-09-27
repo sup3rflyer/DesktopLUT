@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from dlc import stack_registry as sr
 
 MHC_PARAMS = {
@@ -117,6 +119,49 @@ def test_import_run_backfills_from_a_run_record(tmp_path: Path):
     # the CLI form
     rc = sr._main(["--registry", str(tmp_path / "stack_registry.json"), "show"])
     assert rc == 0
+
+
+def test_import_run_accepts_a_refine_mhc_run(tmp_path: Path):
+    # A refine-mhc run re-installs its refined MHC under ``install-mhc`` (no build stage) — the
+    # PA32UCXR SDR stack applied 2026-09-25 is one, and the documented backfill must reach it.
+    run = tmp_path / "20260925_160838_sdr_panel"
+    run.mkdir()
+    (run / "manifest.json").write_text(json.dumps({"name": run.name, "mode": "SDR", "display": "Asus Panel",
+                                                   "created": "2026-09-25T16:08:38"}), encoding="utf-8")
+    (run / "dlc_state.json").write_text(json.dumps({
+        "monitor": 0, "mode": "SDR", "mhc_params": SDR_PARAMS,
+        "calib": {"flow": "refine-mhc", "stages": {"install-mhc": {
+            "status": "done", "digest": {"profile_name": "DesktopLUT_Mon0_SDR_1.icm",
+                                         "white_xy": [0.3127, 0.329]}}}}}), encoding="utf-8")
+    reg = sr.StackRegistry.load(tmp_path / "stack_registry.json")
+    rec = sr.import_run(run, reg, cube_path="results/pa_sdr.cube")
+    assert rec.key == "Asus Panel:SDR" and rec.profile_name == "DesktopLUT_Mon0_SDR_1.icm"
+    assert rec.sdr_white_nits == 107.2343 and rec.cube["cube_path"] == "results/pa_sdr.cube"
+    # re-importing the SAME run fills gaps only: what the live apply captured (the pipe's profile
+    # name, the apply time, the cube's built-for white, the notes) survives a record lacking it
+    live = sr.StackRecord.from_dict({**rec.as_dict(), "profile_name": "DesktopLUT_Mon0_SDR_LIVE.icm",
+                                     "applied_at": "2026-09-25T16:25:16", "sdr_white": None,
+                                     "notes": ["live apply"],
+                                     "cube": {"cube_path": "results/pa_sdr.cube", "run_id": run.name,
+                                              "applied_at": "2026-09-25T16:25:16",
+                                              "target_white_nits": 120.0}})
+    reg.record(live)
+    (run / "dlc_state.json").write_text(json.dumps({
+        "monitor": 0, "mode": "SDR", "mhc_params": SDR_PARAMS,
+        "calib": {"flow": "refine-mhc", "stages": {"install-mhc": {
+            "status": "done", "digest": {"profile_name": None, "white_xy": [0.3127, 0.329]}}}}}),
+        encoding="utf-8")
+    again = sr.import_run(run, reg, cube_path="results/pa_sdr.cube")
+    assert again.profile_name == "DesktopLUT_Mon0_SDR_LIVE.icm"
+    assert again.applied_at == "2026-09-25T16:25:16" and again.sdr_white_nits == 107.2343
+    assert again.cube["target_white_nits"] == 120.0 and again.cube["applied_at"] == "2026-09-25T16:25:16"
+    assert again.notes[0] == "live apply" and "import-run" in again.notes[-1]
+    # a run that never applied an MHC is still refused
+    (run / "dlc_state.json").write_text(json.dumps({
+        "monitor": 0, "mode": "SDR", "mhc_params": SDR_PARAMS,
+        "calib": {"stages": {"install-mhc": {"status": "aborted"}}}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="no MHC-applying stage"):
+        sr.import_run(run, reg)
 
 
 SDR_PARAMS = {
