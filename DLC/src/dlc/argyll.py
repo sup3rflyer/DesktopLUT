@@ -730,12 +730,16 @@ class PersistentSpotread:
             self._death_recorded_gen = self._gen
         # Let the reader pump the dying process's final bytes first — the error message is
         # the LAST thing spotread prints, and poll() can report the exit before EOF drains.
+        deadline = time.monotonic() + self._DEATH_DRAIN_SECONDS
         self._join_quietly(reader, self._DEATH_DRAIN_SECONDS)
-        code: Optional[int] = None
-        try:
-            code = proc.poll()
-        except Exception:
-            code = None
+        # The converse ordering holds too: EOF on the output stream can PRECEDE the exit
+        # becoming observable. On Windows the pipe's write end is closed during the exiting
+        # process's handle rundown, before its process object is signalled, so poll() straight
+        # after the reader's EOF reads None (measured 2026-09-27 on a dying fake spotread:
+        # EOF→reapable lag p50 ~4 ms, max ~75 ms under CPU load) and the death was recorded
+        # with exit code None. Wait for the exit within the same drain budget — a process
+        # whose stream ended but that is truly still running just costs the rest of it.
+        code = self._exit_code_within(proc, max(0.0, deadline - time.monotonic()))
         with self._lock:
             lines = list(self._recent_lines)
             partial = _strip_ansi(bytes(self._buf).decode("ascii", "ignore")).strip()
@@ -1037,6 +1041,15 @@ class PersistentSpotread:
                 return True
             time.sleep(self._poll_interval)
         return proc.poll() is not None
+
+    def _exit_code_within(self, proc: SpotreadProcess, timeout: float) -> Optional[int]:
+        """``proc``'s exit code once its exit is observable (bounded by ``timeout``), else
+        ``None``. Never raises — a transport error just means "unknown"."""
+        try:
+            self._await_exit(proc, timeout)
+            return proc.poll()
+        except Exception:
+            return None
 
     def __enter__(self) -> "PersistentSpotread":
         self.start()
