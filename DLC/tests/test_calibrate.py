@@ -1491,6 +1491,241 @@ def test_3dlut_only_revert_clears_cube_when_none_existed(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# MHC-only reads share ONE provable path: the post-MHC set and the cube build's probes present
+# DRIVEN codes, and the probe reuse answers a probe from the post-MHC read of the same code.
+# BenQ 2026-09-27: attempt A's build installed its cube, attempts B/C re-ran the stage and probed
+# THROUGH it (mixing MHC-only seeds with through-cube reads). The path is empty — except
+# 3dlut-only's own installed cube, kept (its existing semantics) and flagged as evidence.
+# ---------------------------------------------------------------------------
+
+def _slot_recorder(ctrl: CalibrationController, holder: dict):
+    """A measure fn over the perfect panel that records (phase, label, 0:SDR runtime cube) per read."""
+    panel = _perfect_panel()
+    reads: list[tuple[str, str, object]] = []
+
+    def measure(patch):
+        cube = ((ctrl.state().get("runtime") or {}).get("0:SDR") or {}).get("cube_path")
+        reads.append((holder["calib"].runlog.phase, patch.label, cube))
+        return panel(patch)
+    return measure, reads
+
+
+def _rerun_build(calib: Calibration, reads: list) -> StageOutcome:
+    """Attempt B: pop the build (+ its verify) and re-run the stage — enter-neutral is NOT redone."""
+    for key in ("build-install-3dlut", "measure:verify", "verify"):
+        calib.calib["stages"].pop(key, None)
+    reads.clear()
+    return calib.stage_build_install_3dlut(calib.calib["stages"]["measure:post-mhc"]["data"]["ti3"])
+
+
+def _anomalies(calib: Calibration, kind: str) -> list:
+    return [e for e in read_events(calib.ctx.events_path)
+            if e.event == Ev.ANOMALY and e.data.get("kind") == kind]
+
+
+def test_build_rerun_after_an_earlier_set_3dlut_probes_with_no_cube(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    holder: dict = {}
+    measure, reads = _slot_recorder(ctrl, holder)
+    calib = holder["calib"] = _make(tmp_path, "stale_cube_rerun", controller=ctrl, panel=measure)
+    assert calib.run("full").status == "completed"
+    first = [c for ph, lbl, c in reads if lbl.startswith("probe")]
+    assert first and all(c is None for c in first)          # attempt A probed the MHC alone
+    assert calib.calib["stages"]["measure:post-mhc"]["digest"]["probe_path"] == {
+        "verified": True, "path_cube": None, "corrected": None}
+    stale = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
+    assert stale                                              # ...and left its cube installed
+
+    out = _rerun_build(calib, reads)
+
+    probes = [c for ph, lbl, c in reads if lbl.startswith("probe")]
+    assert probes, "the re-run must actually probe (else this test proves nothing)"
+    assert all(c is None for c in probes)                    # no probe read through the stale cube
+    fix = {"stage": "build-install-3dlut", "from": stale, "to": None}
+    assert out.digest["probe_path"]["corrected"] == fix
+    assert out.digest["probe_path"]["post_mhc_probe_path"]["verified"] is True
+    assert out.digest["probe_reuse_seeded"] is True          # post-MHC proven on the probes' path
+    assert calib.calib["probe_path_corrections"] == [fix]    # outlives a pause
+    anomalies = _anomalies(calib, "stale_runtime_cube")
+    assert anomalies and anomalies[-1].data["cube_path"] == stale
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == out.data["cube_path"]   # rebuilt cube installed
+
+
+def test_build_rerun_on_an_unrecorded_post_mhc_path_turns_probe_seeding_off(tmp_path: Path):
+    # A post-MHC set measured before the probe-path check existed carries no record: after a
+    # stale-cube correction its reads may have gone through that cube — never seed probes from them.
+    ctrl = CalibrationController.mock()
+    holder: dict = {}
+    measure, reads = _slot_recorder(ctrl, holder)
+    calib = holder["calib"] = _make(tmp_path, "stale_cube_legacy", controller=ctrl, panel=measure)
+    assert calib.run("full").status == "completed"
+    del calib.calib["stages"]["measure:post-mhc"]["digest"]["probe_path"]
+
+    out = _rerun_build(calib, reads)
+
+    assert out.digest["probe_path"]["corrected"]["from"]
+    assert out.digest["probe_path"]["post_mhc_probe_path"] is None
+    assert out.digest["probe_reuse_seeded"] is False
+    assert "probe reuse is off" in _anomalies(calib, "stale_runtime_cube")[-1].data["message"]
+
+
+@pytest.mark.parametrize("sabotage", ["clear_is_noop", "clear_raises"])
+def test_build_refuses_when_the_stale_cube_cannot_be_cleared(tmp_path: Path, sabotage: str):
+    from dlc.calibrate import StageError
+
+    ctrl = CalibrationController.mock()
+    cube = tmp_path / "earlier_attempt.cube"
+    cube.write_text('TITLE "x"\n', encoding="utf-8")
+    ctrl.set_3dlut(0, "SDR", str(cube))
+    if sabotage == "clear_is_noop":
+        ctrl.clear_3dlut = lambda monitor, mode: {}
+    else:
+        def boom(monitor, mode):
+            raise RuntimeError("pipe down")
+        ctrl.clear_3dlut = boom
+    probe_reads: list = []
+    calib = _make(tmp_path, f"stale_refuse_{sabotage}", controller=ctrl,
+                  panel=lambda p: probe_reads.append(p) or _perfect_panel()(p))
+    with pytest.raises(StageError) as ei:
+        calib.stage_build_install_3dlut(str(tmp_path / "never_parsed.ti3"))
+    assert ei.value.outcome.stage == "build-install-3dlut"
+    assert "refusing the build probes" in ei.value.outcome.digest["message"]
+    assert probe_reads == []                                  # refused before the first probe
+
+
+def test_unreadable_state_before_the_probes_is_a_seam_not_a_refusal(tmp_path: Path):
+    # One transient state.get must not throw away hours of work (short retry), and a pipe that stays
+    # unreadable cannot prove the path either way — the LLM decides (continue unverified / abort).
+    calls = {"n": 0}
+    ctrl = CalibrationController.mock()
+
+    def dead():
+        calls["n"] += 1
+        raise RuntimeError("pipe busy")
+    ctrl.state = dead
+    probe_reads: list = []
+    paused = _make(tmp_path, "unverified_pause", controller=ctrl, adjudicator=MappingAdjudicator({}),
+                   panel=lambda p: probe_reads.append(p) or _perfect_panel()(p))
+    paused._PROBE_PATH_STATE_RETRY_S = (0.0, 0.0)             # retried, without slowing the test
+    with pytest.raises(AdjudicationRequired) as ei:
+        paused.stage_build_install_3dlut(str(tmp_path / "never_parsed.ti3"))
+    assert ei.value.request.key == "build-install-3dlut:probe-path-unverified"
+    assert set(ei.value.request.options) == {"continue", "abort"}
+    assert calls["n"] == 3 and probe_reads == []              # 1 read + 2 retries, then the seam
+
+    aborted = _make(tmp_path, "unverified_abort", controller=ctrl, adjudicator=MappingAdjudicator(
+        {"build-install-3dlut:probe-path-unverified": Decision("abort")}))
+    aborted._PROBE_PATH_STATE_RETRY_S = ()
+    with pytest.raises(CalibrationAborted):
+        aborted.stage_build_install_3dlut(str(tmp_path / "never_parsed.ti3"))
+
+    cont = _make(tmp_path, "unverified_continue", controller=ctrl, adjudicator=MappingAdjudicator(
+        {"build-install-3dlut:probe-path-unverified": Decision("continue")}))
+    cont._PROBE_PATH_STATE_RETRY_S = ()
+    block = cont._ensure_probe_path("build-install-3dlut", reads="build probes")
+    assert block["verified"] is False
+    assert cont._probe_seeding_proven(block) is False         # unverified => every probe re-read
+
+
+def test_seam_pause_after_a_correction_keeps_probe_seeding_off_on_resume(tmp_path: Path):
+    # The correction happens at the top of the build's run(); a seam later in run() (OOG premise,
+    # level edge) pauses, and the resume finds the slot already clean — the earlier correction must
+    # still count, or an unrecorded post-MHC set would seed the clean-path probes.
+    ctrl = CalibrationController.mock()
+    holder: dict = {}
+    measure, reads = _slot_recorder(ctrl, holder)
+    calib = holder["calib"] = _make(tmp_path, "stale_cube_pause", controller=ctrl, panel=measure)
+    assert calib.run("full").status == "completed"
+    del calib.calib["stages"]["measure:post-mhc"]["digest"]["probe_path"]   # legacy: no record
+    real = calib._cube_oog_solve
+    fired = {"n": 0}
+
+    def pausing_oog_solve(*a, **k):
+        if not fired["n"]:
+            fired["n"] += 1
+            raise AdjudicationRequired(AdjudicationRequest(
+                key="build-install-3dlut:oog-premise", seam="optimize_floor", stage="build-install-3dlut",
+                question="test pause", options=("projection", "direct", "abort"), recommendation="direct"))
+        return real(*a, **k)
+    calib._cube_oog_solve = pausing_oog_solve
+    with pytest.raises(AdjudicationRequired):
+        _rerun_build(calib, reads)
+    assert "cube_path" not in (ctrl.state()["runtime"].get("0:SDR") or {})   # corrected before the pause
+
+    out = calib.stage_build_install_3dlut(calib.calib["stages"]["measure:post-mhc"]["data"]["ti3"])
+    assert out.digest["probe_path"]["corrected"] is None                  # nothing left to correct...
+    assert out.digest["probe_path"]["earlier_corrections"]                # ...but the correction is kept
+    assert out.digest["probe_reuse_seeded"] is False
+
+
+def test_3dlut_only_keeps_its_installed_cube_in_both_paths_and_flags_it(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    prev_cube = tmp_path / "previous.cube"
+    prev_cube.write_text('TITLE "x"\n', encoding="utf-8")
+    _seed_stack(ctrl, cube=str(prev_cube))
+    holder: dict = {}
+    measure, reads = _slot_recorder(ctrl, holder)
+    calib = holder["calib"] = _make(tmp_path, "lut_inplace_path", controller=ctrl, panel=measure)
+    assert calib.run("3dlut-only").status == "completed"
+
+    post = [c for ph, lbl, c in reads if ph == "measure:post-mhc"]
+    probes = [c for ph, lbl, c in reads if lbl.startswith("probe")]
+    verify = [c for ph, lbl, c in reads if ph == "measure:verify"]
+    assert post and all(c == str(prev_cube) for c in post)     # existing semantics: one shared path
+    assert probes and all(c == str(prev_cube) for c in probes)
+    built = calib.calib["stages"]["build-install-3dlut"]["data"]["cube_path"]
+    assert verify and all(c == built for c in verify)          # verify reads THROUGH the new cube
+    assert calib.calib["stages"]["measure:post-mhc"]["digest"]["probe_path"] == {
+        "verified": True, "path_cube": str(prev_cube), "corrected": None}
+    # the premise conflict (the build replaces the cube its reads went through) is evidence, per boundary
+    assert len(_anomalies(calib, "inplace_cube_in_probe_path")) == 2
+    assert not _anomalies(calib, "stale_runtime_cube")
+
+
+def test_3dlut_only_build_rerun_reinstalls_the_baseline_not_the_earlier_attempt(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    prev_cube = tmp_path / "previous.cube"
+    prev_cube.write_text('TITLE "x"\n', encoding="utf-8")
+    _seed_stack(ctrl, cube=str(prev_cube))
+    holder: dict = {}
+    measure, reads = _slot_recorder(ctrl, holder)
+    calib = holder["calib"] = _make(tmp_path, "lut_inplace_rerun", controller=ctrl, panel=measure)
+    assert calib.run("3dlut-only").status == "completed"
+    stale = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
+    assert stale != str(prev_cube)                             # attempt A's cube is live
+
+    out = _rerun_build(calib, reads)
+
+    probes = [c for ph, lbl, c in reads if lbl.startswith("probe")]
+    assert probes and all(c == str(prev_cube) for c in probes)  # back on the post-MHC set's path
+    assert out.digest["probe_path"]["corrected"] == {
+        "stage": "build-install-3dlut", "from": stale, "to": str(prev_cube)}
+    assert out.digest["probe_reuse_seeded"] is True
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == out.data["cube_path"]
+
+
+def test_3dlut_only_build_abort_leaves_the_users_cube_installed(tmp_path: Path):
+    # The in-place flow has no C++ snapshot to roll back to: the probe-path check must never take the
+    # user's cube away (a probe-failure abort mid-build leaves it exactly as it was).
+    from dlc.measure_loop import Reading
+
+    ctrl = CalibrationController.mock()
+    prev_cube = tmp_path / "previous.cube"
+    prev_cube.write_text('TITLE "x"\n', encoding="utf-8")
+    _seed_stack(ctrl, cube=str(prev_cube))
+    panel = _perfect_panel()
+
+    def measure(patch):   # every build probe fails -> the build aborts
+        if patch.label.startswith("probe"):
+            return Reading(xyz=None, yxy=None, ok=False, error="probe fail")
+        return panel(patch)
+    calib = _make(tmp_path, "lut_abort_keeps", controller=ctrl, panel=measure)
+    result = calib.run("3dlut-only")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "build-install-3dlut"
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(prev_cube)
+
+
+# ---------------------------------------------------------------------------
 # 'hdr' is not a flow — HDR is a MODE (P13)
 # ---------------------------------------------------------------------------
 

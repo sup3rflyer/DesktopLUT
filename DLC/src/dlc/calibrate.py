@@ -3449,8 +3449,9 @@ class Calibration:
             self.runlog.note(key, f"hook routing: {note}")
         return digest
 
-    def _hook_routing_evidence_after_install(self, stage: str) -> None:
-        """Evidence only, right after a ``set_3dlut``: every install re-injects the hook DLL, and
+    def _hook_routing_evidence_after_install(self, stage: str, *, action: str = "install") -> None:
+        """Evidence only, right after a ``set_3dlut`` (or a ``clear_3dlut``, ``action="clear"``):
+        every install/clear re-injects the hook DLL, and
         if the DWM session changed underneath (a dwm.exe restart re-rolls the twin order-match)
         the report flips back to ambiguous — the cube may now render on the other panel. Never
         blocks; the LLM judges it from the check-in stream. Degrades to a log line on a build
@@ -3458,15 +3459,15 @@ class Calibration:
         try:
             hook = self.controller.hook_state()
         except Exception as exc:  # noqa: BLE001
-            self.ctx.log(f"{stage}: hook state unavailable after the cube install ({type(exc).__name__}: {exc})")
+            self.ctx.log(f"{stage}: hook state unavailable after the cube {action} ({type(exc).__name__}: {exc})")
             return
         if hook is None:
-            self.ctx.log(f"{stage}: no hook routing report after the cube install (old DesktopLUT build?)")
+            self.ctx.log(f"{stage}: no hook routing report after the cube {action} (old DesktopLUT build?)")
             return
         if hook.get("needs_check"):
             self.runlog.anomaly(
                 stage, kind="hook_routing", hook=hook,
-                message="hook routing became ambiguous/unconfirmed after a cube install (DWM session "
+                message=f"hook routing became ambiguous/unconfirmed after a cube {action} (DWM session "
                         "changed?) — the cube may be rendering on another panel")
 
     def stage_hardware_readiness(self) -> StageOutcome:
@@ -3575,9 +3576,14 @@ class Calibration:
         key = f"measure:{role}"
 
         def run() -> StageOutcome:
+            # post-MHC = the cube build's training set and the seeds its probe reuse answers from: it must
+            # read through the probes' path (no runtime cube — an earlier build's included).
+            probe_path = self._ensure_probe_path(key, reads="post-MHC reads") if role == "post-mhc" else None
             res = self._measure_set(patches, role=role, ti3_name=ti3_name, ndjson_name=ndjson_name)
             bookend_drift = self._bookend_drift_qc(role, res.ti3_path, patches, res.ndjson_path)
             digest = dict(res.digest)
+            if probe_path is not None:
+                digest["probe_path"] = probe_path
             if bookend_drift is not None:
                 digest["bookend_drift_qc"] = bookend_drift
             return StageOutcome(key, "done", digest=digest,
@@ -5624,6 +5630,144 @@ class Calibration:
         except Exception:  # noqa: BLE001 - advisory, never block a touch-up
             return None
 
+    def _probe_path_cube(self) -> Optional[str]:
+        """The runtime cube the MHC-only reads (the post-MHC set + the cube build's probes) are taken
+        through: NONE — except a ``3dlut-only`` run that started with a cube installed (its in-place
+        baseline), which keeps that cube live for both. That is the flow's existing semantics (it never
+        enters calibration mode, its post-MHC scores are the apply gate's 'revert' evidence, and nothing
+        restores a cleared cube on ``--abort``); changing it is the owner's call, so it is surfaced as
+        evidence (:meth:`_ensure_probe_path`), not changed here."""
+        baseline = self.calib.get("inplace_baseline") or {}
+        if self.calib.get("flow") == "3dlut-only" and baseline.get("captured") and baseline.get("cube_path"):
+            return str(baseline["cube_path"])
+        return None
+
+    # Backoff before the unverified seam: the calibration pipe is single-instance, so one state.get can
+    # collide with another client (an operator's orientation `state()` from a second shell).
+    _PROBE_PATH_STATE_RETRY_S: tuple[float, ...] = (0.25, 0.75)
+
+    def _ensure_probe_path(self, stage: str, *, reads: str) -> dict[str, Any]:
+        """Make this monitor+mode's runtime 3D-LUT slot provably hold :meth:`_probe_path_cube` before
+        the MHC-only reads: EMPTY — except 3dlut-only's own installed cube.
+
+        The post-MHC set and the build probes present DRIVEN codes, and the build's exact-code probe
+        reuse (``OptimizeConfig.probe_code_levels``) answers a probe from the post-MHC read of the same
+        code — both must read through ONE path. A different cube sits there when an earlier attempt of
+        this run installed its build and the stage was re-run (BenQ 2026-09-27: attempt A installed its
+        cube, B/C re-ran the build and probed through it) or an adaptive-planning change re-measures
+        post-MHC after a build. Mechanics: read the slot, clear it (or re-install the 3dlut-only
+        baseline), read it back; a failed call or a slot still wrong afterwards is a :class:`StageError`.
+        A correction is an ANOMALY (anything this run measured under the stale cube is suspect), kept in
+        ``calib['probe_path_corrections']`` so it outlives a seam pause (``earlier_corrections``).
+
+        A state that stays unreadable after a short retry cannot prove the path either way — a
+        judgment, so a seam (``<stage>:probe-path-unverified``: continue unverified / abort); resuming
+        once the pipe is back simply re-reads it. 3dlut-only with the user's cube in the path is an
+        anomaly once per boundary: the build REPLACES the cube its reads went through, so it is
+        modelled on MHC + that cube — evidence for the LLM."""
+        import time
+
+        key = f"{self.monitor}:{self.mode}"
+        want = self._probe_path_cube()
+        wanted = want or "empty"
+
+        def read_slot() -> tuple[bool, Optional[str], Optional[str]]:
+            error = None
+            for delay in (0.0, *self._PROBE_PATH_STATE_RETRY_S):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    state = self.controller.state() or {}
+                except Exception as exc:  # noqa: BLE001 - retried, then judged
+                    error = f"{type(exc).__name__}: {exc}"
+                    continue
+                cube = ((state.get("runtime") or {}).get(key) or {}).get("cube_path")
+                return True, (str(cube) if cube else None), None
+            return False, None, error
+
+        earlier = [c for c in self.calib.get("probe_path_corrections") or [] if c.get("stage") == stage]
+        block: dict[str, Any] = {"verified": True, "path_cube": want, "corrected": None}
+        if earlier:
+            block["earlier_corrections"] = earlier
+        if stage != "measure:post-mhc":
+            block["post_mhc_probe_path"] = (
+                (self.calib["stages"].get("measure:post-mhc") or {}).get("digest") or {}).get("probe_path")
+        ok, found, error = read_slot()
+        if not ok:
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key=f"{stage}:probe-path-unverified", seam=SEAM_PIPE, stage=stage,
+                question=(f"cannot read DesktopLUT state ({error}) to prove {key}'s runtime 3D LUT is {wanted} "
+                          f"before the {reads} — a cube left there by an earlier attempt of this run would sit "
+                          "in their path. 'continue' takes them unverified (the build then re-reads every probe: "
+                          "no reuse of post-MHC reads); 'abort' stops the run. Resuming after the pipe is back "
+                          "re-reads the slot, and no decision is needed then."),
+                options=("continue", "abort"), recommendation="continue",
+                digest={"error": error, "reads": reads, "path_cube": want,
+                        "earlier_corrections": earlier})),
+                stage=stage, message=f"aborted: {key}'s runtime 3D LUT could not be verified before the {reads}")
+            block.update(verified=False, error=error)
+            self.runlog.anomaly(stage, kind="probe_path_unverified", error=error, path_cube=want,
+                                message=f"the {reads} proceed with {key}'s runtime 3D LUT UNVERIFIED ({error})")
+            return block
+        if found != want:
+            verb = "runtime.clear_3dlut" if want is None else "runtime.set_3dlut (the 3dlut-only baseline)"
+            try:
+                if want is None:
+                    self.controller.clear_3dlut(self.monitor, self.mode)
+                else:
+                    self.controller.set_3dlut(self.monitor, self.mode, want)
+            except Exception as exc:  # noqa: BLE001 - refused with the cause
+                raise StageError(
+                    stage, f"{key}'s runtime 3D LUT is {found or 'empty'}, not {wanted}, and {verb} failed "
+                    f"({type(exc).__name__}: {exc}) — refusing the {reads}", stale_cube=found) from exc
+            ok, left, error = read_slot()
+            if not ok or left != want:
+                raise StageError(
+                    stage, f"{verb} did not leave {key}'s runtime 3D LUT {wanted} "
+                    f"(it is {'unreadable: ' + str(error) if not ok else left or 'empty'}) — refusing the {reads}",
+                    stale_cube=found, installed=left, error=error)
+            self._hook_routing_evidence_after_install(stage, action="clear" if want is None else "install")
+            fix = {"stage": stage, "from": found, "to": want}
+            block["corrected"] = fix
+            self.calib.setdefault("probe_path_corrections", []).append(dict(fix))
+            self._save()
+            tail = ""
+            if stage != "measure:post-mhc":
+                tail = (" (the post-MHC set was verified on this path when measured)"
+                        if (block["post_mhc_probe_path"] or {}).get("verified") else
+                        " (the post-MHC set is not verified on this path — judge whether it was measured "
+                        "through the stale cube; probe reuse is off for this build)")
+            self.runlog.anomaly(
+                stage, kind="stale_runtime_cube", cube_path=found, **block,
+                message=(f"{key}'s runtime 3D LUT was {found or 'empty'} before the {reads}, not {wanted} (an "
+                         "earlier attempt's build left by a stage re-run?); corrected so they read the path the "
+                         f"post-MHC set is measured on. Anything this run measured under it is suspect{tail}"))
+        flagged = self.calib.setdefault("inplace_cube_in_probe_path", [])
+        if want is not None and stage not in flagged:
+            flagged.append(stage)
+            self._save()
+            self.runlog.anomaly(
+                stage, kind="inplace_cube_in_probe_path", cube_path=want,
+                message=(f"3dlut-only takes the {reads} through the 3D LUT already installed on {key} ({want}): "
+                         "the post-MHC set and the probes agree, but the new build REPLACES that cube, so it is "
+                         "modelled on MHC + the installed cube — unless that cube is near-identity the applied "
+                         "result is off by its effect (clear it before a 3dlut-only run, or run the full flow)"))
+        return block
+
+    @staticmethod
+    def _probe_seeding_proven(probe_path: Mapping[str, Any]) -> bool:
+        """May the build's probe reuse answer probes from post-MHC reads? Only when both sides are on
+        ONE path: the build's own check verified; a post-MHC record, if any, verified; and after ANY
+        correction for this build (this invocation or one before a seam pause) the post-MHC set proven
+        on the corrected path. A legacy post-MHC set (no record) with no correction keeps seeding."""
+        post = probe_path.get("post_mhc_probe_path")
+        corrected = probe_path.get("corrected") or probe_path.get("earlier_corrections")
+        if not probe_path.get("verified"):
+            return False
+        if post is not None and not post.get("verified"):
+            return False
+        return not corrected or bool((post or {}).get("verified"))
+
     def _cube_optimize_config(self) -> OptimizeConfig:
         """The 3D-LUT correction config, with a MODE-AWARE correction-budget ceiling.
 
@@ -5880,6 +6024,9 @@ class Calibration:
 
     def stage_build_install_3dlut(self, post_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
+            # The probes read DRIVEN codes through the post-MHC set's path: an earlier attempt's installed
+            # cube (a re-run of this stage) must not sit in it — corrected, provably, before the first probe.
+            probe_path = self._ensure_probe_path("build-install-3dlut", reads="build probes")
             self._oog_mapping()       # the cube, verify and the stage CLIs share one OOG policy
             target = self._engine_target()
             report_scorer, report_metric = self._optimizer_report_scorer()
@@ -5893,10 +6040,12 @@ class Calibration:
                 # MHC-only path the post-MHC set was measured on: an identical code triple is an identical
                 # stimulus, answered from the earlier read (OptimizeConfig.probe_code_levels) — while the
                 # per-pass sentinels prove the display is still in that state. A post-MHC set thermally
-                # re-aligned to its start/middle no longer holds reads of the CURRENT state: no seeding.
+                # re-aligned to its start/middle no longer holds reads of the CURRENT state: no seeding. Nor
+                # when the two reads are not proven on one path (_probe_seeding_proven).
                 align = ((self.calib.get("thermal_align") or {}).get("measure:post-mhc") or {}).get("choice")
                 cfg = replace(cfg, probe_code_levels=int(self._transfer().max_cv),
-                              probe_reuse_seed=align not in ("start", "mid"))
+                              probe_reuse_seed=(align not in ("start", "mid")
+                                                and self._probe_seeding_proven(probe_path)))
             # The level edge (D4) is decided + pinned here, after the solve mode (it needs the projection solve).
             reachable, level_edge = self._cube_level_edge(cfg, target, signals, measured)
             try:
@@ -5915,7 +6064,7 @@ class Calibration:
             result.write(cube_path, title=f"DLC {self.mode} 3D LUT")
             self.controller.set_3dlut(self.monitor, self.mode, cube_path)
             self._hook_routing_evidence_after_install("build-install-3dlut")
-            digest = {**result.digest, "cube_path": cube_path}
+            digest = {**result.digest, "cube_path": cube_path, "probe_path": probe_path}
             if getattr(target, "transfer", None) != "pq":
                 # The white this cube's tone curve was built for — the evidence a later flow that
                 # KEEPS this cube (refine-mhc) compares its own refined white against.
