@@ -34,32 +34,22 @@ def build(args, ctx: RunContext) -> StageResult:
             "medium",
         )
 
-    # 0) Stale-calibration-mode tell (fable Phase 9): if a previous run never exited,
-    # the C++ DoEnterNeutral will re-snapshot the already-CLEARED state — after this
-    # call, exit(restore_snapshot=True) can no longer restore the user's pre-run setup;
-    # only the durable settings backup can. Surface it as evidence; entering proceeds.
-    stale_calibration = False
-    try:
-        stale_calibration = bool(controller.calibration_status().get("active"))
-    except Exception:  # noqa: BLE001 - advisory probe; a dead pipe fails loudly at enter below
-        pass
-    if stale_calibration:
-        result.anomaly(
-            "stale_calibration_mode",
-            "DesktopLUT was already in calibration mode (a previous run did not exit); the pipe's "
-            "restore snapshot will now capture the cleared state — treat the pre-run settings "
-            "backup as the authoritative restore",
-            "medium",
-        )
+    # 0) Stale-calibration tell (fable Phase 9): a previous run never exited, so its display is
+    # ALREADY cleared. Probe BEFORE entering (afterwards the session is open by definition); what
+    # it costs depends on the server (snapshot_retained) and on whether the earlier session was on
+    # this monitor/mode — _common owns the words, shared with the orchestrator and fald-profile.
+    stale = _common.stale_calibration_session(controller)
 
     # 1) Clear DesktopLUT's MHC + 3D LUT + shader layers and associate the dummy.
     try:
         enter = controller.enter_neutral(args.monitor, mode, dummy_path, reason="DLC enter-neutral")
         result.action("cleared MHC/3D-LUT/shader layers via calibration.enter")
     except Exception as exc:  # noqa: BLE001
+        _common.note_stale_calibration(result, stale, None, monitor=args.monitor, mode=mode)
         result.fail("enter_failed", f"calibration.enter failed: {type(exc).__name__}: {exc}")
         return result
     result.raw["calibration_enter"] = enter
+    stale_tell = _common.note_stale_calibration(result, stale, enter, monitor=args.monitor, mode=mode)
 
     # 2) Wipe any stray Windows videoLUT another tool may have loaded.
     dispwin_ran = False
@@ -116,7 +106,10 @@ def build(args, ctx: RunContext) -> StageResult:
         "simulated": simulated,
         "neutral_confirmed": neutral_confirmed,
         "gamma_ramp_loaded": ramp_identity,
-        "stale_calibration_mode": stale_calibration,
+        "stale_calibration_mode": stale is not None,
+        # None = the server does not report it (a build predating the snapshot store).
+        "snapshot_retained": enter.get("snapshot_retained"),
+        "stale_session_mismatch": (stale_tell or {}).get("mismatch") or [],
     }
     if simulated:
         result.note(

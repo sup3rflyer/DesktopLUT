@@ -194,8 +194,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "cube on the apply path (exit without restore); the orchestrator's commit re-applies "
             "dropped pairs as a guard for those builds. The dummy ICC path is RECORDED but not "
             "associated (deferred; neutrality comes from the cleared layers plus DLC's own "
-            "dispwin -c). NOT retry-safe: re-entering while a session is active re-snapshots the "
-            "already-cleared state (see transport.timeout_and_retries).",
+            "dispwin -c). Retry/crash-safe on a server that reports snapshot_retained: the "
+            "snapshot is a per-DISPLAY store (identity-keyed, with the set of modes entered) whose "
+            "FIRST capture of a display wins for the whole session — a re-enter (a crashed run, or "
+            "an enter that threw) keeps the ORIGINAL instead of capturing the already-cleared state, "
+            "and re-entering the display in the other mode adds that mode to the restore. Only "
+            "calibration.exit drops the captures. A build that omits snapshot_retained predates the "
+            "store and overwrites a single slot on every enter (see transport.timeout_and_retries).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
@@ -209,23 +214,48 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "mode": "string",
                 "dummy_icc_path": "string",
                 "corrections_reset": "boolean true",
+                "snapshot_retained": (
+                    "boolean: true when this call KEPT the session's earlier capture of this display "
+                    "(a re-enter after a crashed run or a thrown enter) instead of snapshotting the "
+                    "already-cleared state. Absent = a server predating the snapshot store, which "
+                    "overwrites — treat the preflight settings backup as the authoritative restore."
+                ),
             },
             mutates_state=True,
             gui_thread_required=True,
         ),
         ApiMethodSpec(
             "calibration.status",
-            "Return current calibration-mode bookkeeping.",
+            "Return current calibration-mode bookkeeping, plus what a restore would put back.",
             {},
-            {"active": "boolean", "state": "object or null"},
+            {"active": "boolean", "state": "object or null",
+             "captures": (
+                 "array (additive; absent on builds predating the snapshot store): one entry per "
+                 "display the session captured — {monitor: its CURRENT index or null when it cannot "
+                 "be resolved (disconnected / ambiguous EDID twins), resolved_by: the matching rule "
+                 "or the reason it is unresolved, display: friendly name, edid_id, captured_monitor: "
+                 "its index at capture, modes: ['SDR'|'HDR'] entered, age_s: seconds since capture}. "
+                 "Can be non-empty while active=false (an enter that threw keeps its capture).")},
             mutates_state=False,
             gui_thread_required=False,
         ),
         ApiMethodSpec(
             "calibration.exit",
-            "Exit calibration mode, optionally restoring the calibration snapshot.",
+            "Exit calibration mode, optionally restoring the calibration snapshot. The captures are "
+            "dropped on EVERY exit (restore or not), so an exit(restore_snapshot=true) with no "
+            "session behind it restores nothing and says restored:false — builds before the "
+            "snapshot store kept a stale slot and could restore a PREVIOUS run's pre-run setup.",
             {"restore_snapshot": ApiParamSpec("boolean", required=False, description="Restore the snapshot captured by calibration.enter.")},
-            {"active": "boolean false", "restored": "boolean"},
+            {"active": "boolean false",
+             "restored": "boolean: true when at least one captured display was put back",
+             "restored_monitors": (
+                 "array (additive): the displays put back — {monitor (current index), resolved_by, "
+                 "display, edid_id, captured_monitor, modes}; each entered mode's MHC was reinstalled, "
+                 "or swapped for the identity profile when the capture had none."),
+             "unrestored": (
+                 "array (additive): displays the session captured but could NOT put back — "
+                 "{reason, display, edid_id, captured_monitor, modes}. Non-empty = restore those "
+                 "from the preflight settings backup.")},
             mutates_state=True,
             gui_thread_required=True,
         ),
@@ -746,11 +776,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "GUI thread is wedged mid-mutation. The timed-out request may still be APPLIED "
                 "server-side, and a retry fails pipe-busy until the orphaned connection drains. "
                 "Retry-safety: every mhc.set_*/mhc.apply/runtime.* call is idempotent (same "
-                "params => same state); calibration.enter is NOT retry-safe — a re-enter "
-                "overwrites the single C++ restore snapshot with the already-cleared state "
-                "(DesktopLUT ticket, fable Phase 9), so DLC surfaces a stale active calibration "
-                "mode before entering and treats the preflight settings backup as the "
-                "authoritative restore; mhc.grayscale_commit retried after a real commit "
+                "params => same state); calibration.enter is retry-safe on a server that reports "
+                "snapshot_retained — a re-enter keeps the ORIGINAL pre-session capture per display "
+                "instead of overwriting it with the already-cleared state (fable Phase 9 T2). On a "
+                "server that omits the field the old single-slot overwrite still applies. Either "
+                "way DLC surfaces a stale active calibration mode before entering and keeps the "
+                "preflight settings backup as the durable fallback (the captures are in-memory: a "
+                "DesktopLUT restart mid-run loses them); mhc.grayscale_commit retried after a real commit "
                 "returns baked:false (detectable, surfaced as a seam)."
             ),
         },

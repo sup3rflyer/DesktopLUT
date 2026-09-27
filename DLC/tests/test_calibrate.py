@@ -1362,6 +1362,129 @@ def test_revert_rolls_back_to_previous_setup(tmp_path: Path):
     # reverted: calibration mode exited AND the built MHC rolled back to the pre-run snapshot
     assert ctrl.calibration_status().get("active") is False
     assert not ctrl.state().get("mhc")
+    # ...and the record says so from the SERVER's restored flag, not from the call returning
+    rec = calib.calib["snapshot_restore"]
+    assert rec["restored"] is True and rec["complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# Restores report what the SERVER says it restored (fable Phase 9 T2 + the 2026-09-27 bug):
+# `calibration.exit(restore_snapshot=True)` returning proves nothing — a DesktopLUT restarted
+# mid-run, or a flow that never entered calibration mode, restores NOTHING (restored:false).
+# ---------------------------------------------------------------------------
+
+def test_enter_neutral_digest_carries_the_stale_session_evidence(tmp_path: Path):
+    """The orchestrator's enter-neutral digest routes through the shared stale tell: it carries
+    `snapshot_retained` on every run, and — when an earlier session never exited — the tell with
+    any monitor/mode mismatch against THIS run (evidence for the LLM, no verdict)."""
+    clean = _make(tmp_path, "clean_digest")
+    clean.run("mhc-only")
+    digest = clean.calib["stages"]["enter-neutral"]["digest"]
+    assert digest["snapshot_retained"] is False and "stale_calibration" not in digest
+
+    ctrl = CalibrationController.mock()
+    ctrl.enter_neutral(1, "SDR", "C:/dlc/sRGB.icm")      # an earlier run on monitor 1 died without exiting
+    calib = _make(tmp_path, "stale_digest", controller=ctrl)
+    calib.run("mhc-only")
+    digest = calib.calib["stages"]["enter-neutral"]["digest"]
+    assert digest["snapshot_retained"] is False            # monitor 0 was not captured by the earlier session
+    assert digest["stale_calibration_mode"] is True
+    tell = digest["stale_calibration"]
+    assert tell["session_mismatch"] is True and tell["severity"] == "medium"
+    assert "monitor(s) [1]" in tell["mismatch"][0]
+    assert tell["stale_pairs"] == [{"monitor": 1, "mode": "SDR", "resolvable": True}]
+
+
+def test_restore_user_setup_is_honest_when_the_server_restored_nothing(tmp_path: Path):
+    ctrl = CalibrationController.mock()       # a DesktopLUT with no capture: e.g. restarted mid-run
+    calib = _make(tmp_path, "restart", controller=ctrl)
+    assert calib._restore_user_setup(why="test") is False
+    rec = calib.calib["snapshot_restore"]
+    assert rec["restored"] is False and rec["complete"] is False and rec["why"] == "test"
+    assert "restored NOTHING" in rec["summary"]
+
+
+def test_abort_after_an_applied_run_restores_nothing_and_says_so(tmp_path: Path):
+    """`3dlut-only --abort` after an applied full run in the SAME DesktopLUT process: the abort
+    must not hand back the full run's PRE-RUN setup (the C++ `hasSnapshot` was never cleared),
+    and must not print "reverted" when nothing came back."""
+    from dlc.calibrate import _abort_restore
+
+    ctrl = CalibrationController.mock()
+    full = _make(tmp_path, "applied_full", controller=ctrl)
+    assert full.run("full").status == "completed"
+    applied = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
+
+    lut_state = {"inplace_baseline": {"captured": True, "cube_path": applied},
+                 "backup": {"path": str(tmp_path / "lut" / "desktoplut_backup.json")}}
+    code, payload = _abort_restore(ctrl, lut_state, monitor=0, mode="SDR", run_root=tmp_path / "lut")
+    assert code == 0
+    assert payload["status"] == "nothing_restored"
+    assert payload["restored_snapshot"] is False
+    assert "restored NOTHING" in payload["snapshot_restore"]["summary"]
+    assert applied in payload["hint"] and "desktoplut_backup.json" in payload["hint"]
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == applied   # the accepted calibration stays
+
+
+def test_abort_restores_an_entered_run(tmp_path: Path):
+    from dlc.calibrate import _abort_restore
+
+    ctrl = CalibrationController.mock()
+    cube = tmp_path / "user.cube"
+    cube.write_text('TITLE "x"\n', encoding="utf-8")
+    ctrl.set_3dlut(0, "SDR", str(cube))
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    code, payload = _abort_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert code == 0 and payload["status"] == "reverted" and payload["restored_snapshot"] is True
+    assert "hint" not in payload
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(cube)
+
+
+def test_rollback_guard_is_honest_without_a_session(tmp_path: Path):
+    """The CLI rollback guard used to print "rolled_back … restored pre-run setup" whenever the
+    exit call returned — including for an in-place run that never entered calibration mode."""
+    from dlc.calibrate import _rollback_restore
+
+    ctrl = CalibrationController.mock()
+    nothing = _rollback_restore(ctrl, {"inplace_baseline": {"captured": True, "cube_path": None}},
+                                monitor=0, mode="SDR", run_root=tmp_path)
+    assert nothing["status"] == "rollback_restored_nothing"
+    assert "restored pre-run setup" not in nothing["reason"]
+    assert "empty before the run" in nothing["hint"]
+
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    done = _rollback_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert done["status"] == "rolled_back" and done["snapshot_restore"]["complete"] is True
+
+
+def test_abort_and_rollback_report_a_partial_restore(tmp_path: Path):
+    """A display the session captured but the server could not put back (disconnected / EDID
+    twins) is `unrestored`: the restore is reported as partial, with the backup to finish it."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import _abort_restore, _rollback_restore
+
+    reply = {"active": False, "restored": True, "restored_monitors": [{"monitor": 0, "modes": ["SDR"]}],
+             "unrestored": [{"reason": "display not connected", "display": "Panel B", "edid_id": "BBB",
+                             "captured_monitor": 1, "modes": ["HDR"]}]}
+    ctrl = SimpleNamespace(exit_calibration=lambda restore_snapshot=False: dict(reply),
+                           set_layers=lambda *a, **k: {})
+    code, payload = _abort_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert code == 0 and payload["status"] == "partially_reverted"
+    assert "Panel B" in payload["snapshot_restore"]["summary"] and "hint" in payload
+    rolled = _rollback_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert rolled["status"] == "rolled_back_partially"
+
+
+def test_snapshot_restore_report_reads_old_and_unclear_replies():
+    from dlc.calibrate import snapshot_restore_report
+
+    old = snapshot_restore_report({"active": False, "restored": True})    # pre-store server shape
+    assert old["complete"] is True and old["unrestored"] == []
+    unclear = snapshot_restore_report({"active": False})
+    assert unclear["restored"] is None and unclear["complete"] is False
+    assert "did not say" in unclear["summary"]
+    assert snapshot_restore_report(None)["restored"] is None
 
 
 # ---------------------------------------------------------------------------

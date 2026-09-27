@@ -256,6 +256,187 @@ def ping_controller(controller: CalibrationController) -> tuple[bool, dict[str, 
 # --------------------------------------------------------------------------
 # dlc_state.json sidecar — the stage tools' shared memory
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Stale calibration session — shared by every flow that calls calibration.enter
+# --------------------------------------------------------------------------
+def stale_calibration_session(controller: CalibrationController) -> dict[str, Any] | None:
+    """The ``calibration.status`` reply when an EARLIER session is still open — calibration
+    mode active, or (a server with the snapshot store) captures still held after an enter that
+    threw — else ``None``. Call it BEFORE ``calibration.enter``: afterwards the session is open
+    by definition.
+
+    Advisory only: a dead pipe reads as "not stale" and fails loudly at the enter itself.
+    """
+    try:
+        status = controller.calibration_status()
+    except Exception:  # noqa: BLE001 - advisory probe; the enter call is the real gate
+        return None
+    if not isinstance(status, dict):
+        return None
+    captures = status.get("captures")
+    if status.get("active") or (isinstance(captures, list) and captures):
+        return status
+    return None
+
+
+def _stale_pairs(stale: dict[str, Any]) -> list[tuple[Any, str, bool]]:
+    """(monitor, mode, resolvable) the stale session holds: from ``captures`` when the server
+    reports them (its restore target), else the single ``state`` block of an older server."""
+    captures = stale.get("captures")
+    pairs: list[tuple[Any, str, bool]] = []
+    if isinstance(captures, list) and captures:
+        for cap in captures:
+            if not isinstance(cap, dict):
+                continue
+            mon = cap.get("monitor")
+            resolvable = mon is not None
+            if mon is None:
+                mon = cap.get("captured_monitor")
+            for md in cap.get("modes") or []:
+                pairs.append((mon, str(md).upper(), resolvable))
+        return pairs
+    state = stale.get("state")
+    if isinstance(state, dict) and state.get("monitor") is not None:
+        pairs.append((state.get("monitor"), str(state.get("mode") or "").upper(), True))
+    return pairs
+
+
+def assess_stale_calibration(stale: dict[str, Any] | None, enter_result: Any, *,
+                             monitor: int, mode: str) -> dict[str, Any] | None:
+    """What an earlier, never-exited session means for THIS run's restore (pure; fable Phase 9 T2).
+
+    ``stale`` is :func:`stale_calibration_session` from BEFORE the enter; ``enter_result`` is the
+    ``calibration.enter`` reply, or ``None`` when the enter failed. Returns ``None`` when there was
+    no stale session, else the evidence the LLM judges: ``snapshot_retained`` (True = the server
+    kept its original capture of this display; False = it captured afresh; None = a server that
+    predates the snapshot store, or a failed enter), the stale session's monitor/mode pairs, any
+    MISMATCH with this run's monitor/mode, and a ``severity`` + ``detail`` sentence. The words
+    carry no verdict — whether to proceed is the reader's call.
+    """
+    if stale is None:
+        return None
+    mode = str(mode).upper()
+    pairs = _stale_pairs(stale)
+    other_monitors = sorted({m for m, _, _ in pairs if m is not None and int(m) != int(monitor)})
+    other_modes = sorted({md for m, md, _ in pairs
+                          if m is not None and int(m) == int(monitor) and md and md != mode})
+    unresolvable = sorted({m for m, _, ok in pairs if not ok and m is not None})
+    retained = enter_result.get("snapshot_retained") if isinstance(enter_result, dict) else None
+    reports_store = isinstance(stale.get("captures"), list)
+    mismatch: list[str] = []
+    if other_monitors:
+        mismatch.append(f"the earlier session was on monitor(s) {other_monitors}, this run is on {monitor}")
+    if other_modes:
+        mismatch.append(f"the earlier session entered {other_modes} on this monitor, this run is {mode}")
+
+    lead = "DesktopLUT was already in calibration mode (a previous run did not exit)"
+    if not stale.get("active"):
+        lead = ("DesktopLUT still held a calibration capture from an earlier calibration.enter that "
+                "did not complete")
+    parts: list[str] = []
+    severity = "low"
+    if not isinstance(enter_result, dict):
+        severity = "medium"
+        parts.append(
+            "and this calibration.enter FAILED, so nothing new was captured — the earlier session is "
+            "still open with whatever it captured before; exit(restore_snapshot=True) would restore "
+            "THAT, so check it against the pre-run settings backup before trusting it")
+    elif retained is True:
+        parts.append(
+            "the server kept its ORIGINAL pre-session capture of this display, so "
+            "exit(restore_snapshot=True) can still restore the user's setup")
+        if other_modes:
+            parts.append(f"that capture now covers {sorted(set(other_modes) | {mode})}, and a restore "
+                         "reinstalls each entered mode's MHC")
+    elif retained is False:
+        parts.append("the server captured this display afresh (the earlier session had not captured it)")
+        if not other_monitors:
+            severity = "medium"
+            parts.append(
+                "although the session was open on this monitor — the display may have been "
+                "re-identified; treat the pre-run settings backup as the authoritative restore")
+    else:
+        severity = "medium"
+        parts.append(
+            "and the server did not report keeping the original snapshot (a build predating the "
+            "snapshot store): the pipe's restore snapshot now holds the cleared state — treat the "
+            "pre-run settings backup as the authoritative restore")
+    if other_monitors and isinstance(enter_result, dict):
+        severity = "medium"
+        if retained is None:
+            parts.append(f"monitor(s) {other_monitors} lost their pipe snapshot to this enter and stay "
+                         "cleared — restore them from their settings backup")
+        else:
+            parts.append(f"monitor(s) {other_monitors} are still cleared from the earlier session: a "
+                         "restore (revert / --abort) puts them back too, but a COMMITTING exit drops "
+                         "their capture and leaves them cleared")
+    if unresolvable:
+        severity = "medium"
+        parts.append(f"captured monitor(s) {unresolvable} cannot be resolved to a connected display "
+                     "and would not be restored")
+    detail = lead + "; " + "; ".join(parts)
+    return {
+        "active": bool(stale.get("active")),
+        "stale_pairs": [{"monitor": m, "mode": md, "resolvable": ok} for m, md, ok in pairs],
+        "snapshot_retained": retained,
+        "server_reports_captures": reports_store,
+        "session_mismatch": bool(mismatch),
+        "mismatch": mismatch,
+        "severity": severity,
+        "detail": detail,
+    }
+
+
+def note_stale_calibration(result: StageResult | None, stale: dict[str, Any] | None, enter_result: Any, *,
+                           monitor: int, mode: str) -> dict[str, Any] | None:
+    """Record the stale-session tell (see :func:`assess_stale_calibration`) as a
+    ``stale_calibration_mode`` anomaly on ``result`` and return it for the caller's digest.
+    ``result=None`` only assesses (the orchestrator folds the tell into its stage digest)."""
+    tell = assess_stale_calibration(stale, enter_result, monitor=monitor, mode=mode)
+    if tell is not None and result is not None:
+        result.anomaly("stale_calibration_mode", tell["detail"], tell["severity"])
+    return tell
+
+
+def snapshot_restore_report(out: Any) -> dict[str, Any]:
+    """What ``calibration.exit(restore_snapshot=True)`` ACTUALLY did, read from the server's
+    reply — never inferred from the call having returned (fable Phase 9 T2).
+
+    ``restored`` is the server's own flag: ``False`` means it held no capture for this run and put
+    NOTHING back — the run never entered calibration mode (``3dlut-only``), DesktopLUT restarted
+    mid-run (the captures live in memory), or the session was already exited. Before the snapshot
+    store a server kept a stale slot and could "restore" a PREVIOUS run's pre-run setup here; a
+    fixed server says restored:false instead, and this report says so in words. ``unrestored``
+    (additive) lists displays the session captured but could not put back. ``complete`` = the
+    whole captured setup is back; ``summary`` is the plain-words line for the operator.
+    """
+    reply = out if isinstance(out, dict) else {}
+    raw = reply.get("restored")
+    restored = raw if isinstance(raw, bool) else None
+    unrestored = [u for u in (reply.get("unrestored") or []) if isinstance(u, dict)]
+    report: dict[str, Any] = {"restored": restored, "unrestored": unrestored,
+                              "complete": restored is True and not unrestored}
+    if isinstance(reply.get("restored_monitors"), list):
+        report["restored_monitors"] = reply["restored_monitors"]
+    if report["complete"]:
+        report["summary"] = "DesktopLUT restored the pre-run setup"
+    elif restored is True:
+        names = ", ".join(str(u.get("display") or f"monitor {u.get('captured_monitor')}") for u in unrestored)
+        report["summary"] = (f"DesktopLUT restored only part of the pre-run setup: {len(unrestored)} captured "
+                             f"display(s) could not be put back ({names}) — restore those from the "
+                             "pre-run settings backup")
+    elif restored is False:
+        report["summary"] = (
+            "DesktopLUT restored NOTHING — it held no calibration capture for this run (the run never "
+            "entered calibration mode, DesktopLUT restarted mid-run, or the session was already "
+            "exited), so the display is NOT back to its pre-run setup; restore it from the pre-run "
+            "settings backup")
+    else:
+        report["summary"] = ("DesktopLUT's calibration.exit reply did not say whether it restored "
+                             "anything — verify the display against the pre-run settings backup")
+    return report
+
+
 def load_dlc_state(ctx: RunContext) -> dict[str, Any]:
     path = ctx.root / DLC_STATE_FILE
     if path.exists():

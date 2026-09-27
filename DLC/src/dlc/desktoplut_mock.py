@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,6 +136,10 @@ class MockDesktopLutState:
     running: bool = True
     corrections_enabled: bool = True
     calibration_mode: dict[str, Any] | None = None
+    # The C++ calibration snapshot store (src/calib_snapshot.h), keyed by str(monitor) — the
+    # mock's monitors never re-enumerate, so the index IS the display identity here. Each entry
+    # is that monitor's pre-session pairs (mhc/runtime/layers/fald for both modes) plus the set of
+    # modes the session entered; only calibration.exit drops them.
     snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     mhc: dict[str, Any] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
@@ -412,19 +417,53 @@ class MockDesktopLutServer:
             raise _MockApiError("monitor index out of range")
         return f"{mon}:{mode}"
 
-    def restore(self, snapshot_id: str) -> DesktopLutResponse:
-        if snapshot_id not in self.state.snapshots:
-            return DesktopLutResponse(ok=False, error=f"unknown snapshot: {snapshot_id}")
-        snapshot = deepcopy(self.state.snapshots[snapshot_id])
-        self.state.corrections_enabled = bool(snapshot.get("corrections_enabled", True))
-        self.state.calibration_mode = deepcopy(snapshot.get("calibration_mode"))
-        self.state.mhc = deepcopy(snapshot.get("mhc", {}))
-        self.state.runtime = deepcopy(snapshot.get("runtime", {}))
-        self.state.hdr = {int(k): bool(v) for k, v in deepcopy(snapshot.get("hdr", {})).items()}
-        self.state.layers = {k: {n: bool(v) for n, v in (d or {}).items() if n in self.LAYER_NAMES}
-                             for k, d in deepcopy(snapshot.get("layers", {})).items()}
-        self.state.fald = deepcopy(snapshot.get("fald", {}))
-        return self.ok({"snapshot_id": snapshot_id, "restored": True})
+    def _capture_monitor(self, mon: int, mode: str, session_id: str) -> dict[str, Any]:
+        """One C++ ``CalibCapture``: the monitor's settings (both modes — MonitorSettings is per
+        display) BEFORE the enter clears anything, plus the entered mode."""
+        pairs = {}
+        for md in ("SDR", "HDR"):
+            k = f"{mon}:{md}"
+            pairs[k] = {
+                "mhc": deepcopy(self.state.mhc.get(k)),
+                "runtime": deepcopy(self.state.runtime.get(k)),
+                "layers": deepcopy(self.state.layers.get(k)),
+                "fald": deepcopy(self.state.fald.get(k)),
+            }
+        return {
+            "session_id": session_id,
+            "modes": [mode],
+            "captured_at": time.time(),
+            "pairs": pairs,
+            # the overlay flag is global, not per display; the session's first capture carries it
+            "corrections_enabled": bool(self.state.corrections_enabled),
+            "display": f"Simulated Display {mon}",
+            "edid_id": f"SIM000{mon}",
+        }
+
+    def _restore_monitor(self, cap: dict[str, Any]) -> None:
+        """C++ RestoreCapturedSettings: the captured pairs go back (never the OS HDR state — that
+        is not part of MonitorSettings)."""
+        for k, pair in (cap.get("pairs") or {}).items():
+            for name, store in (("mhc", self.state.mhc), ("runtime", self.state.runtime),
+                                ("layers", self.state.layers), ("fald", self.state.fald)):
+                val = deepcopy(pair.get(name))
+                if val is None:
+                    store.pop(k, None)
+                elif name == "layers":
+                    store[k] = {n: bool(v) for n, v in val.items() if n in self.LAYER_NAMES}
+                else:
+                    store[k] = val
+
+    def _capture_view(self, mon_s: str, cap: dict[str, Any]) -> dict[str, Any]:
+        """A capture as calibration.status / calibration.exit report it."""
+        return {
+            "monitor": int(mon_s),
+            "resolved_by": "device path",
+            "display": cap.get("display", ""),
+            "edid_id": cap.get("edid_id", ""),
+            "captured_monitor": int(mon_s),
+            "modes": [m for m in ("SDR", "HDR") if m in (cap.get("modes") or [])],
+        }
 
     def _cleanup_active_gs_live(self) -> None:
         """Mirror the C++ ``CleanupActiveGsLive``: any monitor/mode with an active live-edit
@@ -547,18 +586,35 @@ class MockDesktopLutServer:
 
     def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
         if method == "calibration.status":
-            return self.ok({"active": self.state.calibration_mode is not None, "state": deepcopy(self.state.calibration_mode)})
+            now = time.time()
+            captures = []
+            for mon_s, cap in sorted(self.state.snapshots.items()):
+                view = self._capture_view(mon_s, cap)
+                view["age_s"] = max(0.0, now - float(cap.get("captured_at") or now))
+                captures.append(view)
+            return self.ok({"active": self.state.calibration_mode is not None,
+                            "state": deepcopy(self.state.calibration_mode),
+                            "captures": captures})
         if method == "calibration.enter":
             key = self.key(params)  # C++ ParseMonitorMode: validate monitor index + mode vocabulary
-            # NOTE (fable Phase 9): mirrors a real C++ hazard — DoEnterNeutral snapshots
-            # unconditionally, so a RE-enter while calibration is already active captures the
-            # already-cleared state; a later exit(restore_snapshot=True) then restores that
-            # cleared state, not the user's pre-run setup (single snapshot slot in C++; here the
-            # latest enter's snapshot wins the same way). The preflight settings backup is the
-            # authoritative restore. DesktopLUT-side fix ticketed (keep the ORIGINAL snapshot on
-            # re-enter); DLC surfaces stale calibration mode before entering.
-            snapshot_id = f"snapshot-{len(self.state.snapshots) + 1}"
-            self.state.snapshots[snapshot_id] = self.state.as_dict()
+            mon = int(params["monitor"])
+            mode = str(params["mode"]).upper()
+            # Mirrors the C++ snapshot store (src/calib_snapshot.h): the FIRST capture of a display
+            # wins for the whole session. A RE-enter while the store still holds this monitor — the
+            # crashed-run case, where it is already cleared — keeps the original and only adds the
+            # mode, so exit(restore_snapshot=True) still returns the user's pre-run setup. The store
+            # is NOT dropped on a "fresh" enter (a thrown enter keeps its capture); only exit drops it.
+            cap = self.state.snapshots.get(str(mon))
+            snapshot_retained = cap is not None
+            if cap is not None:
+                if mode not in cap["modes"]:
+                    cap["modes"].append(mode)
+                snapshot_id = str(cap.get("session_id"))
+            else:
+                others = list(self.state.snapshots.values())
+                snapshot_id = (str(others[0].get("session_id")) if others
+                               else f"snapshot-{self.state.command_count}")
+                self.state.snapshots[str(mon)] = self._capture_monitor(mon, mode, snapshot_id)
             self.state.corrections_enabled = False
             # C++ DoEnterNeutral clears ONLY the calibrated mode:monitor pair's layers.
             # Other pairs are preserved — the mock used to clear everything (and old C++
@@ -567,35 +623,52 @@ class MockDesktopLutServer:
             # the 2026-08-14 HDR run lost the user's SDR cube exactly this way.
             self.state.mhc.pop(key, None)
             self.state.runtime.pop(key, None)
-            # C++ clears WB/GS/DG + tonemap for the pair (the snapshot above keeps the user's)
+            # C++ clears WB/GS/DG + tonemap for the pair (the capture above keeps the user's)
             self.state.layers[key] = {n: False for n in self.LAYER_NAMES}
             self.state.calibration_mode = {
                 "active": True,
                 "snapshot_id": snapshot_id,
                 "monitor": params["monitor"],
-                "mode": str(params["mode"]).upper(),
+                "mode": mode,
                 "dummy_icc_path": params["dummy_icc_path"],
                 "reason": params.get("reason", ""),
                 "corrections_reset": True,
             }
-            return self.ok(deepcopy(self.state.calibration_mode))
+            # snapshot_retained / identity_profile are RESULT-only fields: the C++
+            # calibration_mode block in state.get / calibration.status does not carry them.
+            entered = deepcopy(self.state.calibration_mode)
+            entered["snapshot_retained"] = snapshot_retained
+            entered["identity_profile"] = ""
+            return self.ok(entered)
         if method == "calibration.exit":
             # C++ DoExitCalibration runs CleanupActiveGsLive() unconditionally first — an
             # orphaned live-edit preview (client died between begin and commit) is reverted to
             # its pre-begin correction so it can't leak past the run (fable Phase 7a fidelity).
             self._cleanup_active_gs_live()
-            current = deepcopy(self.state.calibration_mode)
             restore = bool(params.get("restore_snapshot", False))
-            if restore and current and current.get("snapshot_id") in self.state.snapshots:
-                snapshot_id = str(current["snapshot_id"])
-                restored = self.restore(snapshot_id)
-                if not restored.ok:
-                    return restored
-                self.state.calibration_mode = None
-                # C++ DoExitCalibration result shape: always {active, restored}.
-                return self.ok({"active": False, "restored": True, "snapshot_id": snapshot_id})
+            restored_monitors: list[dict[str, Any]] = []
+            session_id = None
+            if restore and self.state.snapshots:
+                first = True
+                for mon_s, cap in sorted(self.state.snapshots.items()):
+                    self._restore_monitor(cap)
+                    if first:
+                        self.state.corrections_enabled = bool(cap.get("corrections_enabled", True))
+                        session_id = cap.get("session_id")
+                        first = False
+                    restored_monitors.append(self._capture_view(mon_s, cap))
+            # The session is over either way — the captures go with it (the C++ always clears the
+            # store), so a later exit(restore) with no session behind it restores NOTHING rather
+            # than a previous run's pre-run state (the 2026-09-27 `3dlut-only --abort` bug).
+            self.state.snapshots = {}
             self.state.calibration_mode = None
-            return self.ok({"active": False, "restored": False})
+            # C++ DoExitCalibration result shape: {active, restored, restored_monitors, unrestored}.
+            # The mock's displays never disconnect, so nothing is ever unrestored here.
+            out: dict[str, Any] = {"active": False, "restored": bool(restored_monitors),
+                                   "restored_monitors": restored_monitors, "unrestored": []}
+            if session_id:
+                out["snapshot_id"] = session_id
+            return self.ok(out)
         return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
 
     def handle_mhc(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
