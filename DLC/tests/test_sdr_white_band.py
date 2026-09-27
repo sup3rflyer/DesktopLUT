@@ -613,3 +613,207 @@ def test_hdr_engine_target_ignores_an_sdr_white(tmp_path):
     calib.stage_resolve_target()
     calib._state.setdefault("mhc_params", {})["sdr_white"] = {"white_nits": 107.2}
     assert calib._engine_target().peak_nits == pytest.approx(10000.0)
+
+
+# ---------------------------------------------------------------------------
+# the refined white across flows: 3dlut-only over an installed MHC, refine-mhc's kept cube
+# ---------------------------------------------------------------------------
+from dlc import stack_registry as _sr
+
+
+def _registry(calib) -> _sr.StackRegistry:
+    return _sr.StackRegistry.load(_sr.registry_path(calib.profile, calib.ctx.root))
+
+
+def _below_band_mhc(tmp_path, monkeypatch, name="mhc_below"):
+    """An applied SDR MHC whose refine delivered exact D65 BELOW the band (the BenQ case: the
+    perfect 120-nit panel cannot make a 125-130 nit white)."""
+    src = _make(tmp_path, name)
+    monkeypatch.setattr(src, "_sdr_white_band", lambda: ((125.0, 130.0), "test"))
+    assert src.run("mhc-only").status == "completed"
+    white = src._state["mhc_params"]["sdr_white"]
+    assert white["status"] == "below_band" and white["white_nits"] < 120.0
+    return src, float(white["white_nits"])
+
+
+def test_3dlut_only_targets_the_installed_mhcs_refined_white(tmp_path, monkeypatch):
+    src, white = _below_band_mhc(tmp_path, monkeypatch)
+    rec = _registry(src).get(src.display.name, "SDR")
+    assert rec.sdr_white_nits == pytest.approx(white) and rec.sdr_white["status"] == "below_band"
+
+    adj = _Recording()
+    calib = _make(tmp_path, "cube_over_refined", controller=src.controller, adjudicator=adj)
+    result = calib.run("3dlut-only")
+    assert result.status == "completed", result.digest
+    stack = calib.calib["installed_stack"]
+    assert stack["matches"] is True and stack["sdr_white_nits"] == pytest.approx(white)
+    plan = next(r for r in adj.requests if r.key == "resolve-target:plan")
+    assert plan.digest["sdr_white"] == {"white_nits": pytest.approx(white), "source": "installed_stack",
+                                        "nominal_nits": 120.0}
+    assert plan.digest["white_nits"] == pytest.approx(white)
+    assert "sdr_white_warnings" not in plan.digest and "UNKNOWN" not in plan.question
+    assert f"{white:g} nits white" in plan.question
+    # the cube is built for, and scored at, the installed white — not the nominal 120
+    assert calib._engine_target().peak_nits == pytest.approx(white)
+    build = calib.calib["stages"]["build-install-3dlut"]["digest"]
+    assert build["target_white_nits"] == pytest.approx(white, abs=1e-3)
+    assert build["target_white_source"] == "installed_stack"
+    ver = calib.calib["stages"]["verify"]["digest"]["sdr_white"]
+    assert ver["calibrated_white_nits"] == pytest.approx(white) and ver["source"] == "installed_stack"
+    # the apply keeps the MHC's white on the record and notes the cube's build white
+    after = _registry(calib).get(calib.display.name, "SDR")
+    assert after.sdr_white_nits == pytest.approx(white)
+    assert after.cube["run_id"] == calib.ctx.root.name
+    assert after.cube["target_white_nits"] == pytest.approx(white, abs=1e-3)
+    # the deliverable is labelled with the white the cube was built for
+    report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    assert Path(report["deliverables"]["cube"]).name.endswith(f"_{round(white)}n.cube")
+
+
+def test_3dlut_only_surfaces_an_unknown_installed_white_at_the_plan_seam(tmp_path, monkeypatch):
+    src, _white = _below_band_mhc(tmp_path, monkeypatch, name="mhc_below_legacy")
+    # a record written before the white was recorded: no silent nominal fallback
+    reg = _registry(src)
+    rec = reg.get(src.display.name, "SDR")
+    rec.sdr_white = None
+    reg.record(rec)
+    adj = _Recording()
+    calib = _make(tmp_path, "cube_unknown_white", controller=src.controller, adjudicator=adj)
+    calib.calib["flow"] = "3dlut-only"
+    calib.stage_preflight()
+    outcome = calib.stage_resolve_target()
+    assert outcome.digest["sdr_white"]["white_nits"] is None
+    assert outcome.digest["white_nits"] == 120.0 and outcome.digest["nominal_white_nits"] == 120.0
+    warnings = outcome.digest["sdr_white_warnings"]
+    assert any("UNKNOWN" in w and "no refined SDR white" in w for w in warnings), warnings
+    plan = next(r for r in adj.requests if r.key == "resolve-target:plan")
+    assert "UNKNOWN" in plan.question and "120 nits nominal" in plan.question
+    assert calib._engine_target().peak_nits == pytest.approx(120.0)
+
+    # the stack changed outside DLC: the recorded white is not trusted, and the seam says why
+    reg = _registry(src)
+    rec = reg.get(src.display.name, "SDR")
+    rec.sdr_white = {"white_nits": 107.2, "status": "below_band"}
+    rec.profile_name = "DesktopLUT_Mon0_SDR_stale.icm"
+    rec.mhc["base_lut"] = "elsewhere/other_base.cube"
+    reg.record(rec)
+    calib2 = _make(tmp_path, "cube_stale_white", controller=src.controller)
+    calib2.calib["flow"] = "3dlut-only"
+    calib2.stage_preflight()
+    out2 = calib2.stage_resolve_target()
+    assert calib2.calib["installed_stack"]["matches"] is False
+    assert any("UNKNOWN" in w and "outside DLC" in w for w in out2.digest["sdr_white_warnings"])
+    assert calib2._engine_target().peak_nits == pytest.approx(120.0)
+
+
+def test_refine_mhc_flags_a_kept_cube_built_for_another_white(tmp_path):
+    src = _full_source(tmp_path, "src_white")
+    src_white = src._state["mhc_params"]["sdr_white"]["white_nits"]
+    src_build = src.calib["stages"]["build-install-3dlut"]["digest"]
+    assert src_build["target_white_nits"] == pytest.approx(src_white, abs=1e-3)
+
+    # Same band: the refine re-delivers the same white — evidence recorded, no seam.
+    adj = _Recording()
+    same = _make(tmp_path, "refine_same_white", controller=src.controller, source_run=src.ctx.root,
+                 adjudicator=adj)
+    assert same.run("refine-mhc").status == "completed"
+    cw = same.calib["stages"]["reapply-3dlut"]["digest"]["cube_white"]
+    assert cw["source_cube_white_provenance"] == "source_build"
+    assert cw["source_cube_white_nits"] == pytest.approx(src_white, abs=1e-3)
+    assert cw["material"] is False
+    assert not [r for r in adj.requests if r.key == "reapply-3dlut:white-mismatch"]
+    assert same.calib["stages"]["verify"]["digest"]["cube_white"] == cw
+
+    # A dimmer band: the refine delivers 110 nits under a cube built for ~120 -> a seam, not a note.
+    adj2 = _Recording()
+    dim = _make(tmp_path, "refine_dim_white", controller=src.controller, source_run=src.ctx.root,
+                adjudicator=adj2, white_band=(100.0, 110.0))
+    assert dim.run("refine-mhc").status == "completed"
+    cw2 = dim.calib["stages"]["reapply-3dlut"]["digest"]["cube_white"]
+    assert cw2["refined_white_nits"] == pytest.approx(110.0)
+    assert cw2["material"] is True and cw2["white_de2000"]["source_build"] > 1.0
+    seams = [r for r in adj2.requests if r.key == "reapply-3dlut:white-mismatch"]
+    assert len(seams) == 1 and seams[0].options == ("keep_cube", "abort")
+    assert "110 nits" in seams[0].question
+    assert dim.calib["stages"]["verify"]["digest"]["cube_white"]["material"] is True
+    # the registry now records the new white AND that the kept cube was built for another
+    rec = _registry(dim).get(dim.display.name, "SDR")
+    assert rec.sdr_white_nits == pytest.approx(110.0)
+    assert rec.cube["target_white_nits"] == pytest.approx(src_white, abs=1e-3)
+
+    # never auto-accepted under --supervised; an abort ends the flow
+    sup = _make(tmp_path, "refine_dim_sup", controller=src.controller, source_run=src.ctx.root,
+                adjudicator=SupervisedAdjudicator(), white_band=(100.0, 110.0))
+    with pytest.raises(AdjudicationRequired) as exc:
+        sup.run("refine-mhc")
+    assert exc.value.request.key == "reapply-3dlut:white-mismatch"
+    ab = _make(tmp_path, "refine_dim_abort", controller=src.controller, source_run=src.ctx.root,
+               adjudicator=_Recording({"reapply-3dlut:white-mismatch": "abort"}),
+               white_band=(100.0, 110.0))
+    res = ab.run("refine-mhc")
+    assert res.status == "aborted" and res.digest["aborted_at"] == "reapply-3dlut"
+
+
+def test_refine_mhc_lists_candidates_for_a_cube_with_an_unrecorded_white(tmp_path):
+    src = _full_source(tmp_path, "src_legacy_cube")
+    src_white = src._state["mhc_params"]["sdr_white"]["white_nits"]
+    _tamper(src, lambda st: st["calib"]["stages"]["build-install-3dlut"]["digest"]
+            .pop("target_white_nits"))
+    reg = _registry(src)                      # ...and a registry cube entry from before the field
+    rec = reg.get(src.display.name, "SDR")
+    rec.cube.pop("target_white_nits", None)
+    reg.record(rec)
+    adj = _Recording()
+    calib = _make(tmp_path, "refine_legacy", controller=src.controller, source_run=src.ctx.root,
+                  adjudicator=adj, white_band=(100.0, 110.0))
+    assert calib.run("refine-mhc").status == "completed"
+    seeded = calib.calib["stages"]["seed-from-run"]["digest"]["source_cube_white"]
+    assert seeded["nits"] is None and seeded["provenance"] == "unrecorded"
+    assert seeded["candidates"] == {"nominal": 120.0,
+                                    "source_refined_white": pytest.approx(src_white)}
+    cw = calib.calib["stages"]["reapply-3dlut"]["digest"]["cube_white"]
+    assert set(cw["white_de2000"]) == {"nominal", "source_refined_white"} and cw["material"] is True
+    seam = next(r for r in adj.requests if r.key == "reapply-3dlut:white-mismatch")
+    assert "unrecorded white" in seam.question
+
+
+def _kept_cube_calib(tmp_path, name, *, cube_white, cube_margin, refined, refined_margin, adj=None):
+    calib = _make(tmp_path, name, adjudicator=adj or _Recording())
+    calib.calib["flow"] = "refine-mhc"
+    calib.stage_preflight()
+    calib.stage_resolve_target()
+    cube = tmp_path / f"{name}_kept.cube"
+    cube.write_text("LUT_3D_SIZE 2\n" + "0 0 0\n" * 8, encoding="utf-8")
+    calib.calib["stages"]["seed-from-run"] = {"status": "done", "digest": {}, "data": {
+        "cube_path": str(cube), "source_cube_white": {"nits": cube_white, "provenance": "source_build",
+                                                      "margin_rel": cube_margin}}}
+    calib.calib["stages"]["refine-mhc-grayscale"] = {"status": "done", "data": {}, "digest": {
+        "white_band": {"margin": {"rel": refined_margin}}}}
+    if refined is not None:
+        calib._state.setdefault("mhc_params", {})["sdr_white"] = {"white_nits": refined}
+    return calib
+
+
+def test_kept_cube_white_within_the_refines_noise_margin_is_not_material(tmp_path):
+    """0.25 dE2000 of white lightness is only ~1.1 % of luminance — two refines of one panel differ
+    by their read noise more than that; only a difference beyond the combined margin is real."""
+    noisy = _kept_cube_calib(tmp_path, "kc_noise", cube_white=120.0, cube_margin=0.01,
+                             refined=118.6, refined_margin=0.01)
+    ev = noisy._kept_cube_white_evidence()
+    assert ev["white_de2000"]["source_build"] >= noisy._CUBE_WHITE_MATERIAL_DE   # visible...
+    assert ev["noise_rel"] == pytest.approx(math.sqrt(2) * 0.01, rel=1e-4)
+    assert ev["material"] is False                                             # ...but within noise
+    real = _kept_cube_calib(tmp_path, "kc_real", cube_white=120.0, cube_margin=0.01,
+                            refined=116.0, refined_margin=0.01)
+    assert real._kept_cube_white_evidence()["material"] is True
+
+
+def test_kept_cube_with_an_unknown_refined_white_raises_its_own_seam(tmp_path):
+    adj = _Recording()
+    calib = _kept_cube_calib(tmp_path, "kc_unknown", cube_white=120.0, cube_margin=0.01,
+                             refined=None, refined_margin=None, adj=adj)
+    out = calib.stage_reapply_3dlut()
+    assert out.digest["cube_white"]["material"] is None
+    seams = [r for r in adj.requests if r.key.startswith("reapply-3dlut:")]
+    assert [r.key for r in seams] == ["reapply-3dlut:white-unknown"]
+    assert seams[0].options == ("keep_cube", "abort")

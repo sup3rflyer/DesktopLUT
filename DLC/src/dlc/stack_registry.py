@@ -17,8 +17,16 @@ Peak-Chroma / max-drive cap) and the durable cube path. Flows that KEEP the inst
 the pipe's current profile name cross-checked against the record, so a stack changed outside
 DLC is surfaced as evidence (unpinned + warned), never silently trusted.
 
+SDR twin (2026-09-27): the SDR white-band grayscale refine chooses the white LUMINANCE the MHC
+delivers (``mhc_params['sdr_white']`` — e.g. 107.2 nits on the BenQ PD2700U where the nominal is
+120, exact D65 being blue-limited below the band). A ``3dlut-only`` cube over that MHC must target
+THAT white, not the nominal (an unreachable brighter tone curve clips the top and lifts the refined
+greys), so the record carries ``sdr_white`` and the same pipe cross-check gates trusting it
+(``sdr_white_nits`` in the evidence).
+
 Priors, never a gate: a missing/corrupt file yields an empty registry and the flows fall back
-to the DIP-resolved peak (flagged at the plan seam so the LLM sees the stack's cap is unknown).
+to the DIP-resolved peak / the nominal SDR white (flagged at the plan seam so the LLM sees the
+stack's cap / white is unknown).
 
 CLI (backfill / inspection)::
 
@@ -55,6 +63,11 @@ class StackRecord:
     ``cube_peak_nits`` is the luminance the base cube holds the target white at (the
     Peak-Chroma cap when capped, else the resolved peak); ``cube_max_drive`` the drive code
     the base cube's top is pinned to; ``resolved_peak_nits`` the run's pre-cap target.
+
+    ``sdr_white`` (SDR only) carries the white the SDR grayscale refine delivered:
+    ``white_nits`` (what a later cube must target), ``status`` (``in_band`` / ``below_band`` /
+    ``unknown_reach``), ``band`` and ``reach_nits``. ``cube.target_white_nits`` is the white the
+    recorded 3D LUT was BUILT for (a kept cube may predate the current refine).
     """
 
     display: str
@@ -67,6 +80,7 @@ class StackRecord:
     hdr_peak: Optional[dict[str, Any]] = None
     cube: Optional[dict[str, Any]] = None
     notes: list[str] = field(default_factory=list)
+    sdr_white: Optional[dict[str, Any]] = None
 
     @property
     def key(self) -> str:
@@ -78,6 +92,13 @@ class StackRecord:
         flows); ``None`` for SDR records or an MHC applied before the cap was recorded."""
         return _opt_float((self.hdr_peak or {}).get("cube_peak_nits"))
 
+    @property
+    def sdr_white_nits(self) -> Optional[float]:
+        """The white luminance the installed SDR MHC's refine delivered; ``None`` for HDR records,
+        an MHC applied before the white was recorded, or a refine that chose none."""
+        v = _opt_float((self.sdr_white or {}).get("white_nits"))
+        return v if v is not None and v > 0 else None
+
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -88,7 +109,8 @@ class StackRecord:
                    profile_name=d.get("profile_name"), mhc=dict(d.get("mhc") or {}),
                    hdr_peak=(dict(d["hdr_peak"]) if d.get("hdr_peak") else None),
                    cube=(dict(d["cube"]) if d.get("cube") else None),
-                   notes=list(d.get("notes") or []))
+                   notes=list(d.get("notes") or []),
+                   sdr_white=(dict(d["sdr_white"]) if d.get("sdr_white") else None))
 
 
 def record_from_mhc_params(*, display: str, mode: str, monitor: int, run_id: str,
@@ -96,7 +118,8 @@ def record_from_mhc_params(*, display: str, mode: str, monitor: int, run_id: str
                            target_white_xy: Optional[tuple[float, float]] = None,
                            applied_at: Optional[str] = None) -> StackRecord:
     """Build the record for an MHC the run built + applied, from the run's ``mhc_params``
-    (the build stage's persisted derivation: primaries, measured white, peak_chroma, base)."""
+    (the build stage's persisted derivation: primaries, measured white, peak_chroma, base, and
+    the SDR refine's delivered white ``sdr_white``)."""
     pc = dict(mhc_params.get("peak_chroma") or {})
     base_lut = mhc_params.get("base_lut") if isinstance(mhc_params.get("base_lut"), dict) else {}
     summary = dict(base_lut.get("summary") or {})
@@ -124,9 +147,15 @@ def record_from_mhc_params(*, display: str, mode: str, monitor: int, run_id: str
         "dark_floor": dict(mhc_params.get("dark_floor") or {}) or None,
         "base_lut": base_lut.get("cube_path"),
     }
+    sw = mhc_params.get("sdr_white") if isinstance(mhc_params.get("sdr_white"), dict) else {}
+    sdr_white: Optional[dict[str, Any]] = None
+    if _opt_float(sw.get("white_nits")):
+        sdr_white = {"white_nits": _opt_float(sw.get("white_nits")), "status": sw.get("status"),
+                     "band": list(sw["band"]) if sw.get("band") else None,
+                     "reach_nits": _opt_float(sw.get("reach_nits"))}
     return StackRecord(display=display, mode=mode, monitor=int(monitor), run_id=run_id,
                        applied_at=applied_at or datetime.now().isoformat(timespec="seconds"),
-                       profile_name=profile_name, mhc=mhc, hdr_peak=hdr_peak)
+                       profile_name=profile_name, mhc=mhc, hdr_peak=hdr_peak, sdr_white=sdr_white)
 
 
 class StackRegistry:
@@ -171,10 +200,11 @@ class StackRegistry:
 
     def record_cube(self, *, display: str, mode: str, monitor: int, run_id: str,
                     cube_path: Optional[str], profile_name: Optional[str] = None,
-                    save: bool = True) -> StackRecord:
+                    target_white_nits: Optional[float] = None, save: bool = True) -> StackRecord:
         """Upsert the 3D-LUT entry on the display's record (an in-place ``3dlut-only`` apply).
         Without a prior MHC record one is created with an UNKNOWN MHC (noted) so the cube is
-        still tracked — the next MHC build overwrites it."""
+        still tracked — the next MHC build overwrites it. ``target_white_nits`` is the SDR white the
+        cube was built for (``None`` for HDR / unknown)."""
         rec = self.get(display, mode)
         stamp = datetime.now().isoformat(timespec="seconds")
         if rec is None:
@@ -186,6 +216,8 @@ class StackRegistry:
             rec.notes.append(f"{stamp}: pipe profile {profile_name} != recorded MHC "
                              f"{rec.profile_name} at the cube apply (stack changed outside DLC?)")
         rec.cube = {"cube_path": cube_path, "run_id": run_id, "applied_at": stamp}
+        if target_white_nits is not None:
+            rec.cube["target_white_nits"] = _opt_float(target_white_nits)
         return self.record(rec, save=save)
 
     def save(self) -> None:
@@ -215,20 +247,24 @@ def check_against_pipe(rec: Optional[StackRecord], pipe_state: Optional[dict[str
                        monitor: int, mode: str) -> dict[str, Any]:
     """Evidence packet: does the pipe's current profile match the registry's record?
 
-    Returns ``{recorded, pipe_profile, recorded_profile, matches, pin_nits, reason}``.
-    ``pin_nits`` is set only when the record is trustworthy for this stack: a record exists,
-    it carries a cap, and either the pipe reports the same profile name or the pipe reports no
-    name at all (older servers / mock) — a DIFFERENT name means the stack changed outside DLC,
-    so the cap is not pinned and the reason says why.
+    Returns ``{recorded, pipe_profile, recorded_profile, matches, pin_nits, reason,
+    sdr_white_nits, sdr_white_reason}``. ``pin_nits`` is set only when the record is trustworthy
+    for this stack: a record exists, it carries a cap, and either the pipe reports the same
+    profile name or the pipe reports no name at all (older servers / mock) — a DIFFERENT name
+    means the stack changed outside DLC, so the cap is not pinned and the reason says why.
+    ``sdr_white_nits`` (the SDR refine's delivered white) follows exactly the same trust rule,
+    with its own ``sdr_white_reason``.
     """
     out: dict[str, Any] = {"recorded": rec is not None, "pipe_profile": None,
                            "recorded_profile": rec.profile_name if rec else None,
-                           "matches": None, "pin_nits": None, "reason": None}
+                           "matches": None, "pin_nits": None, "reason": None,
+                           "sdr_white_nits": None, "sdr_white_reason": None}
     if rec is not None:
         out["run_id"] = rec.run_id
         out["applied_at"] = rec.applied_at
         out["hdr_peak"] = rec.hdr_peak
         out["cube"] = rec.cube
+        out["sdr_white"] = rec.sdr_white
     pipe_profile = None
     pipe_source = None
     if isinstance(pipe_state, dict):
@@ -240,6 +276,8 @@ def check_against_pipe(rec: Optional[StackRecord], pipe_state: Optional[dict[str
     if rec is None:
         out["reason"] = "no applied-stack record for this display/mode (MHC applied before the " \
                         "registry existed, or by another tool) — its cap is unknown"
+        out["sdr_white_reason"] = ("no applied-stack record for this display/mode — the installed "
+                                   "MHC's refined SDR white is unknown")
         return out
     if pipe_profile and rec.profile_name and pipe_profile != rec.profile_name:
         # The profile NAME churns with every WB/DG/GS permutation re-bake; the DLC base
@@ -259,11 +297,22 @@ def check_against_pipe(rec: Optional[StackRecord], pipe_state: Optional[dict[str
                              + (f" from a different base artifact ({pipe_source})" if pipe_source else
                                 " and the server reports no source_file to identify it by")
                              + " — the stack changed outside DLC; not pinning to a possibly stale cap")
+            out["sdr_white_reason"] = out["reason"].replace("a possibly stale cap",
+                                                            "a possibly stale refined white")
             return out
     if out.get("matches") is None:
         out["matches"] = True if (pipe_profile and rec.profile_name) else None
         if out["matches"]:
             out["matched_by"] = "profile_name"
+    sdr_nits = rec.sdr_white_nits
+    if sdr_nits is None:
+        out["sdr_white_reason"] = ("record carries no refined SDR white (HDR stack, an MHC applied "
+                                   "before the white was recorded, or a refine that chose none)")
+    else:
+        out["sdr_white_nits"] = sdr_nits
+        out["sdr_white_reason"] = (f"the installed MHC's refine delivered white at {sdr_nits:g} nits "
+                                   f"(run {rec.run_id}, "
+                                   f"{(rec.sdr_white or {}).get('status') or 'status unknown'})")
     cap = rec.cube_peak_nits
     if cap is None:
         out["reason"] = "record carries no HDR cap (SDR stack, or an MHC applied before the cap was recorded)"
@@ -333,8 +382,10 @@ def _main(argv: Optional[list[str]] = None) -> int:
         print(f"registry: {path}  (corrupt={reg.corrupt}, dropped={reg.dropped})")
         for key, rec in sorted(reg.records().items()):
             peak = rec.cube_peak_nits
+            sdr = rec.sdr_white_nits
             print(f"  {key}: profile={rec.profile_name} run={rec.run_id} applied={rec.applied_at} "
-                  f"cap={'%.1f' % peak if peak else '-'} cube={(rec.cube or {}).get('cube_path')}")
+                  f"cap={'%.1f' % peak if peak else '-'} sdr_white={'%.1f' % sdr if sdr else '-'} "
+                  f"cube={(rec.cube or {}).get('cube_path')}")
         return 0
     run_dir = Path(a.run)
     rec = import_run(run_dir, reg, cube_path=a.cube, profile_name=a.profile_name,

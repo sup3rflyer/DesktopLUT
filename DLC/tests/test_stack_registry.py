@@ -117,3 +117,46 @@ def test_import_run_backfills_from_a_run_record(tmp_path: Path):
     # the CLI form
     rc = sr._main(["--registry", str(tmp_path / "stack_registry.json"), "show"])
     assert rc == 0
+
+
+SDR_PARAMS = {
+    "monitor": 0, "mode": "SDR",
+    "primaries": {"rx": 0.68, "ry": 0.31, "gx": 0.26, "gy": 0.69, "bx": 0.15, "by": 0.06},
+    "measured_white": {"x": 0.309, "y": 0.325},
+    "base_lut": {"cube_path": "gen/mhc_base_sdr.cube"},
+    "sdr_white": {"white_nits": 107.2343, "status": "below_band", "band": [110.0, 120.0],
+                  "reach_nits": 108.1},
+}
+
+
+def test_sdr_refined_white_is_recorded_kept_by_a_cube_apply_and_pipe_gated(tmp_path: Path):
+    """The SDR refine's delivered white (BenQ PD2700U: 107.2 nits, exact D65 below the 110-120
+    band) rides the record so a later 3dlut-only cube targets it — trusted under the same pipe
+    cross-check as the HDR cap."""
+    rec = sr.record_from_mhc_params(display="BenQ", mode="SDR", monitor=1, run_id="run_sdr",
+                                    profile_name="DesktopLUT_Mon1_SDR_1.icm", mhc_params=SDR_PARAMS)
+    assert rec.sdr_white_nits == 107.2343
+    assert rec.sdr_white["status"] == "below_band" and rec.sdr_white["band"] == [110.0, 120.0]
+    reg = sr.StackRegistry.load(tmp_path / "stack_registry.json")
+    reg.record(rec)
+    # an in-place 3dlut-only apply keeps the MHC's white and records the cube's build white
+    reg.record_cube(display="BenQ", mode="SDR", monitor=1, run_id="run_cube", cube_path="c.cube",
+                    profile_name="DesktopLUT_Mon1_SDR_1.icm", target_white_nits=107.2343)
+    again = sr.StackRegistry.load(tmp_path / "stack_registry.json").get("BenQ", "SDR")
+    assert again.sdr_white_nits == 107.2343
+    assert again.cube["target_white_nits"] == 107.2343
+
+    pipe = {"mhc": {"1:SDR": {"profile_name": "DesktopLUT_Mon1_SDR_1.icm"}}}
+    ok = sr.check_against_pipe(again, pipe, 1, "SDR")
+    assert ok["matches"] is True and ok["sdr_white_nits"] == 107.2343
+    assert "107.234" in ok["sdr_white_reason"] and ok["pin_nits"] is None
+    # the stack changed outside DLC: the white is NOT trusted, and the reason says why
+    moved = sr.check_against_pipe(again, {"mhc": {"1:SDR": {"profile_name": "Other.icm"}}}, 1, "SDR")
+    assert moved["matches"] is False and moved["sdr_white_nits"] is None
+    assert "outside DLC" in moved["sdr_white_reason"]
+    # no record / a record without a white: unknown, with a reason
+    none = sr.check_against_pipe(None, pipe, 1, "SDR")
+    assert none["sdr_white_nits"] is None and "unknown" in none["sdr_white_reason"]
+    legacy = sr.StackRecord.from_dict({k: v for k, v in again.as_dict().items() if k != "sdr_white"})
+    old = sr.check_against_pipe(legacy, pipe, 1, "SDR")
+    assert old["sdr_white_nits"] is None and "no refined SDR white" in old["sdr_white_reason"]

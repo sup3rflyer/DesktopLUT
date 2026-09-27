@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -681,7 +682,13 @@ class Calibration:
                 # curve from these. Defensive: the spec may not resolve yet at first emit.
                 spec = self._spec()
                 data["gamma"] = spec.gamma
-                data["luminance"] = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
+                # SDR: the calibrated white once known (the refine's / the installed MHC's), with
+                # the nominal alongside — the EOTF reference must be the curve the stack targets.
+                data["luminance"] = (self._hdr_target().peak_nits if spec.is_hdr
+                                     else (self._sdr_refined_white_nits(capture=False)
+                                           or spec.luminance_nits))
+                if not spec.is_hdr:
+                    data["luminance_nominal"] = spec.luminance_nits
                 data["is_hdr"] = spec.is_hdr
                 data["colorspace"] = spec.colorspace
                 data["transfer"] = "pq" if spec.is_hdr else "power"
@@ -1220,6 +1227,7 @@ class Calibration:
                 (self.calib["stages"].get("build-install-3dlut") or {}).get("digest") or {}).get("cube_path") \
                 or ((self.calib["stages"].get("reapply-3dlut") or {}).get("data") or {}).get("cube_path")
             params = self._state.get("mhc_params") or {}
+            cube_white = self._cube_target_white_nits()
             if flow in ("full", "mhc-only", "refine-mhc") and params:
                 rec = stack_registry.record_from_mhc_params(
                     display=self.display.name, mode=self.mode, monitor=self.monitor,
@@ -1228,12 +1236,16 @@ class Calibration:
                 if cube:
                     rec.cube = {"cube_path": cube, "run_id": self.ctx.root.name,
                                 "applied_at": rec.applied_at}
+                    if cube_white is not None:
+                        rec.cube["target_white_nits"] = cube_white
                 reg.record(rec)
                 self.ctx.log(f"applied-stack registry: {rec.key} <- run {rec.run_id} "
-                             f"(profile {pipe_profile}, top {rec.cube_peak_nits})")
+                             f"(profile {pipe_profile}, top {rec.cube_peak_nits}, "
+                             f"sdr white {rec.sdr_white_nits})")
             elif flow == "3dlut-only":
                 rec = reg.record_cube(display=self.display.name, mode=self.mode, monitor=self.monitor,
-                                      run_id=self.ctx.root.name, cube_path=cube, profile_name=pipe_profile)
+                                      run_id=self.ctx.root.name, cube_path=cube, profile_name=pipe_profile,
+                                      target_white_nits=cube_white)
                 self.ctx.log(f"applied-stack registry: {rec.key} cube <- run {self.ctx.root.name}")
         except Exception as exc:  # noqa: BLE001 - registry is priors for the next run, never a gate
             self.ctx.log(f"applied-stack registry not updated ({type(exc).__name__}: {exc})")
@@ -1287,17 +1299,46 @@ class Calibration:
             target = replace(target, oog_mapping=str(cached))
         return target
 
-    def _sdr_refined_white_nits(self) -> Optional[float]:
-        """The white luminance THIS run's SDR MHC refine delivered (``mhc_params['sdr_white']``,
-        written by the white-band refine), or ``None`` when no refine chose one (the target's
-        nominal nits then stand)."""
+    def _sdr_refined_white_nits(self, *, capture: bool = True) -> Optional[float]:
+        """The white luminance the SDR MHC under the cube delivers, or ``None`` when unknown (the
+        target's nominal nits then stand). See :meth:`_sdr_calibrated_white` for the sources."""
+        return self._sdr_calibrated_white(capture=capture)[0]
+
+    def _sdr_calibrated_white(self, *, capture: bool = True) -> tuple[Optional[float], str]:
+        """``(white_nits, source)`` of the SDR white the cube sits on:
+
+        * ``refined_this_run`` — THIS run's white-band refine (``mhc_params['sdr_white']``);
+        * ``installed_stack`` — ``3dlut-only`` keeps the installed MHC and has no refine of its
+          own: the applied-stack registry's recorded white, trusted only when the pipe's profile
+          cross-checks (``_installed_stack_evidence``, the HDR cap pin's twin);
+        * ``(None, "nominal")`` — neither (the plan seam flags it for 3dlut-only).
+
+        ``capture=False`` only PEEKS at an already-memoised installed-stack record (the dashboard
+        header, emitted before preflight, must not snapshot the pipe for the plan seam)."""
         params = (getattr(self, "_state", None) or {}).get("mhc_params") or {}
-        white = (params.get("sdr_white") or {}).get("white_nits")
-        try:
-            white = float(white)
-        except (TypeError, ValueError):
+        white = _as_float_local((params.get("sdr_white") or {}).get("white_nits"))
+        if white is not None and white > 0:
+            return white, "refined_this_run"
+        calib = getattr(self, "calib", None) or {}
+        if calib.get("flow") == "3dlut-only" and self.mode != "HDR":
+            stack = (self._installed_stack_evidence() if capture else calib.get("installed_stack")) or {}
+            white = _as_float_local(stack.get("sdr_white_nits"))
+            if white is not None and white > 0:
+                return white, "installed_stack"
+        return None, "nominal"
+
+    def _cube_target_white_nits(self) -> Optional[float]:
+        """The SDR white the 3D LUT this run leaves installed was BUILT for: this run's build
+        (``build-install-3dlut`` digest ``target_white_nits``), else the kept source cube's when
+        its build recorded one (``reapply-3dlut`` ``cube_white``). ``None`` for HDR / unknown."""
+        if self.mode == "HDR":
             return None
-        return white if white > 0 else None
+        stages = self.calib.get("stages") or {}
+        built = ((stages.get("build-install-3dlut") or {}).get("digest") or {}).get("target_white_nits")
+        if built is not None:
+            return _as_float_local(built)
+        kept = (((stages.get("reapply-3dlut") or {}).get("digest") or {}).get("cube_white") or {})
+        return _as_float_local(kept.get("source_cube_white_nits"))
 
     def _reachable_primaries(self) -> Optional[dict]:
         """The panel's MEASURED native primaries — THIS run's (from the raw stage's channel model,
@@ -2474,12 +2515,39 @@ class Calibration:
         self._save()
         transfer_label = "PQ (ST.2084)" if spec.is_hdr else f"power γ{spec.gamma}"
         target_nits = hdr.peak_nits if hdr else spec.luminance_nits
-        nits_label = f"{target_nits:g} nit peak" if spec.is_hdr else f"{target_nits:g} nits"
+        nits_label = f"{target_nits:g} nit peak" if spec.is_hdr else f"{target_nits:g} nits nominal"
+        sdr_white_evidence: Optional[dict[str, Any]] = None
+        if not spec.is_hdr and flow == "3dlut-only":
+            # The cube's white is the INSTALLED MHC's refined white (registry, pipe-cross-checked)
+            # — the SDR twin of the HDR cap pin below; its absence is a judgment, not a fallback.
+            self._installed_stack_evidence()
+            white_nits, white_source = self._sdr_calibrated_white()
+            sdr_white_evidence = {"white_nits": white_nits, "source": white_source,
+                                  "nominal_nits": spec.luminance_nits}
+            if white_nits is not None:
+                target_nits = white_nits
+                nits_label = (f"{white_nits:g} nits white (the installed MHC's refined white; "
+                              f"nominal {spec.luminance_nits:g})")
         digest = {"flow": flow, "target": target,
                   "colorspace": spec.colorspace, "transfer": transfer_label,
                   "white": f"{spec.white.intent} ({spec.white.method})",
                   "white_nits": target_nits, "patch_plan": self.calib["patch_plan"]}
+        if not spec.is_hdr:
+            digest["nominal_white_nits"] = spec.luminance_nits
         plan_warnings: list[str] = []
+        if sdr_white_evidence is not None:
+            stack = self.calib.get("installed_stack") or {}
+            digest["installed_stack"] = stack
+            digest["sdr_white"] = sdr_white_evidence
+            if sdr_white_evidence["white_nits"] is None:
+                plan_warnings.append(
+                    "the installed MHC's refined SDR white is UNKNOWN ("
+                    + str(stack.get("sdr_white_reason") or "no registry evidence")
+                    + f") — the cube falls back to the nominal {spec.luminance_nits:g} nits; if the "
+                    "installed refine delivered a dimmer white (e.g. an exact-D65 white accepted "
+                    "below the band), every signal above it clips at the top and the refined greys "
+                    "are lifted off the MHC. Backfill with `python -m dlc.stack_registry import-run "
+                    "--run <applying run> --profile-name <pipe profile>` and restart, or approve knowingly")
         if hdr:
             digest["hdr_target"] = hdr.as_dict()
             # Surface the HdrTarget provenance FLAGS in the seam question itself, not three
@@ -2509,7 +2577,7 @@ class Calibration:
                         "Backfill with `python -m dlc.stack_registry import-run --run <applying "
                         "run> --profile-name <pipe profile>` and restart, or approve knowingly")
         if plan_warnings:
-            digest["hdr_target_warnings"] = plan_warnings
+            digest["hdr_target_warnings" if hdr else "sdr_white_warnings"] = plan_warnings
         self._abort_if(self.adjudicate(AdjudicationRequest(
             key="resolve-target:plan", seam=SEAM_PLAN, stage="resolve-target",
             question=(f"Plan: {flow} calibration of monitor {self.monitor} "
@@ -5548,6 +5616,13 @@ class Calibration:
             self.controller.set_3dlut(self.monitor, self.mode, cube_path)
             self._hook_routing_evidence_after_install("build-install-3dlut")
             digest = {**result.digest, "cube_path": cube_path}
+            if getattr(target, "transfer", None) != "pq":
+                # The white this cube's tone curve was built for — the evidence a later flow that
+                # KEEPS this cube (refine-mhc) compares its own refined white against.
+                white_nits, white_source = self._sdr_calibrated_white()
+                digest["target_white_nits"] = round(float(target.peak_nits), 4)
+                digest["target_white_source"] = white_source if white_nits is not None else "nominal"
+                digest["nominal_white_nits"] = self._spec().luminance_nits
             if premise is not None:
                 digest["oog_premise"] = premise
             if level_edge is not None:
@@ -5711,6 +5786,17 @@ class Calibration:
                       "practical": practical,
                       "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2),
                                  "gamut_clamped": m.gamut_clamped} for m in worst]}
+            if not spec.is_hdr:
+                # The white luminance the stack was calibrated to (the refine's / the installed
+                # MHC's), the cube's build white, and the nominal — so the verify seam can tell a
+                # tone mismatch at the top from a calibration error.
+                white_nits, white_source = self._sdr_calibrated_white()
+                digest["sdr_white"] = {"calibrated_white_nits": white_nits, "source": white_source,
+                                       "cube_target_white_nits": self._cube_target_white_nits(),
+                                       "nominal_white_nits": spec.luminance_nits}
+                kept = ((self.calib["stages"].get("reapply-3dlut") or {}).get("digest") or {}).get("cube_white")
+                if kept:
+                    digest["cube_white"] = kept
             if spec.is_hdr and hasattr(reachable, "full_primaries"):
                 # Level edge primary (D4): the full-drive view, the reclassified patches, the edge's falsification
                 # on these reads, and whether the verdict depends on the edge — evidence only, no new pause.
@@ -5887,8 +5973,10 @@ class Calibration:
             spec = self._spec()
             # The HDR deliverable is labelled with the CALIBRATED peak (the resolved max-sustained
             # ceiling), not the profile's 1600 viewing peak — the cube IS the calibration to that
-            # peak (Task C / one source of truth). SDR uses its OSD-set white luminance.
-            label_nits = self._hdr_target().peak_nits if spec.is_hdr else spec.luminance_nits
+            # peak (Task C / one source of truth). SDR uses the white the cube was BUILT for (the
+            # refined / installed white; a kept cube with an unrecorded white, the nominal).
+            label_nits = (self._hdr_target().peak_nits if spec.is_hdr
+                          else (self._cube_target_white_nits() or spec.luminance_nits))
             cube_out = results_dir / descriptive_cube_name(
                 date=self.run_date.isoformat(), display=self.display.short_name, mode=self.mode,
                 colorspace=_gamut_label(spec.colorspace, is_hdr=spec.is_hdr, gamma=spec.gamma),
@@ -6401,7 +6489,8 @@ class Calibration:
             rec = reg.get(self.display.name, self.mode)
             cube = (rec.cube or {}) if rec is not None else {}
             if cube.get("run_id") == run_id and cube.get("cube_path") and Path(cube["cube_path"]).exists():
-                return {"path": str(cube["cube_path"]), "source": "stack_registry"}
+                return {"path": str(cube["cube_path"]), "source": "stack_registry",
+                        "target_white_nits": _as_float_local(cube.get("target_white_nits"))}
         except Exception:  # noqa: BLE001 - the registry is a convenience; the run record decides
             pass
         rec3d = (src_calib.get("stages") or {}).get("build-install-3dlut") or {}
@@ -6411,6 +6500,84 @@ class Calibration:
         if built:
             return {"path": None, "source": "source_run_build", "missing": str(built)}
         return {"path": None, "source": "none"}
+
+    @staticmethod
+    def _source_cube_white(cube: Mapping[str, Any], src_3d: Mapping[str, Any],
+                           src_params: Mapping[str, Any], spec: "cp.TargetSpec",
+                           src_refine: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        """The SDR white the source run's kept 3D LUT was BUILT for. Its build digest records it
+        (``target_white_nits``, since 2026-09-27), else the registry's cube entry. A cube built
+        before that is ``unrecorded``: depending on the build's code it targeted the nominal white
+        or the source's refined white — both are listed as ``candidates`` (never guessed).
+        ``margin_rel`` is the source refine's white-luminance noise margin (meter ⊕ drift ⊕ code)."""
+        margin = _as_float_local((((src_refine or {}).get("white_band") or {}).get("margin") or {}).get("rel"))
+        recorded = _as_float_local(src_3d.get("target_white_nits"))
+        source = "source_build"
+        if recorded is None:
+            recorded, source = _as_float_local(cube.get("target_white_nits")), "stack_registry"
+        if recorded is not None and recorded > 0:
+            return {"nits": recorded, "provenance": source, "margin_rel": margin,
+                    "source_run_target_source": src_3d.get("target_white_source")}
+        candidates = {"nominal": float(spec.luminance_nits)}
+        refined = _as_float_local((src_params.get("sdr_white") or {}).get("white_nits"))
+        if refined is not None and refined > 0:
+            candidates["source_refined_white"] = refined
+        return {"nits": None, "provenance": "unrecorded", "candidates": candidates,
+                "margin_rel": margin,
+                "note": "the source cube's build predates target_white_nits recording — it targeted "
+                        "one of the candidates (the nominal before 1011c28, the source refine's "
+                        "white after)"}
+
+    # The kept cube's white vs the new refine's white is material when it is BOTH visible — a
+    # quarter JND of WHITE lightness (CIEDE2000, the SDR report metric; the refine judge's
+    # materiality) — AND real: outside the two refines' combined white-luminance noise margin
+    # (each the quadrature of meter σ, settled drift and one code at white), so two refines of
+    # the same panel that differ only by read noise never raise the seam.
+    _CUBE_WHITE_MATERIAL_DE = refine_convergence.MATERIAL_GAIN_JND
+
+    @staticmethod
+    def _white_lightness_de(cube_white: float, delivered_white: float) -> float:
+        """CIEDE2000 between the delivered white (L*=100) and the cube's white target expressed
+        relative to it — the tone-curve disagreement at the top of a cube built for another white."""
+        r = max(float(cube_white), 1e-9) / max(float(delivered_white), 1e-9)
+        return float(delta_e2000((100.0, 0.0, 0.0), (116.0 * r ** (1.0 / 3.0) - 16.0, 0.0, 0.0)))
+
+    def _kept_cube_white_evidence(self) -> Optional[dict[str, Any]]:
+        """refine-mhc: the kept (source) cube's build white vs the white THIS run's refine
+        delivered, with a deterministic materiality flag. ``None`` when no cube is kept."""
+        seed = (self.calib["stages"].get("seed-from-run") or {}).get("data") or {}
+        src = seed.get("source_cube_white")
+        if not isinstance(src, dict):
+            return None
+        refined = self._sdr_refined_white_nits()
+        here = _as_float_local(((((self.calib["stages"].get("refine-mhc-grayscale") or {})
+                                  .get("digest") or {}).get("white_band") or {}).get("margin") or {})
+                               .get("rel"))
+        there = _as_float_local(src.get("margin_rel"))
+        known = [m for m in (here, there) if m is not None and m >= 0]
+        # One side unknown: assume it matches the known side (the same panel + meter chain).
+        noise_rel = (math.sqrt(sum(m * m for m in known) * (2.0 / len(known))) if known else 0.0)
+        ev: dict[str, Any] = {"source_cube_white_nits": src.get("nits"),
+                              "source_cube_white_provenance": src.get("provenance"),
+                              "refined_white_nits": refined,
+                              "nominal_white_nits": self._spec().luminance_nits,
+                              "material_de2000": self._CUBE_WHITE_MATERIAL_DE,
+                              "noise_rel": round(noise_rel, 6)}
+        if refined is None:
+            ev["material"] = None
+            ev["note"] = "this run's refine recorded no delivered white — cannot compare"
+            return ev
+        cands = ({"source_build": src["nits"]} if src.get("nits") is not None
+                 else dict(src.get("candidates") or {}))
+        des = {k: round(self._white_lightness_de(v, refined), 3) for k, v in cands.items()}
+        rels = {k: round(float(v) / refined - 1.0, 5) for k, v in cands.items()}
+        ev["white_de2000"] = des
+        ev["white_rel_diff"] = rels
+        ev["material"] = any(des[k] >= self._CUBE_WHITE_MATERIAL_DE and abs(rels[k]) > noise_rel
+                             for k in cands)
+        if src.get("nits") is None:
+            ev["candidates"] = cands
+        return ev
 
     def stage_seed_from_run(self) -> StageOutcome:
         """Seed THIS run with a completed run's derived SDR MHC (mechanics only; any mismatch is a
@@ -6513,6 +6680,8 @@ class Calibration:
             src_refine = (stages.get("refine-mhc-grayscale") or {}).get("digest") or {}
             src_verify = (stages.get("verify") or {}).get("digest") or {}
             src_3d = (stages.get("build-install-3dlut") or {}).get("digest") or {}
+            cube_white = (self._source_cube_white(cube, src_3d, params, spec, src_refine)
+                          if cube.get("path") else None)
             here_ccmx = (here.get("correction") or {}).get("file")
             there_ccmx = (there.get("correction") or {}).get("file")
 
@@ -6543,12 +6712,13 @@ class Calibration:
                       "source_lut3d": {k: src_3d.get(k) for k in
                                        ("converged", "best_max_de", "best_mean_de", "metric",
                                         "optimize_metric", "physical_floor", "cube_path")},
+                      "source_cube_white": cube_white,
                       "needs_judgment": judge or None}
             if not cube.get("path"):
                 digest["note"] = "the source run left no 3D LUT — the MHC is re-refined alone"
             return StageOutcome("seed-from-run", "done", digest=digest,
                                 data={"cube_path": cube.get("path"), "base_cube": str(base_dst),
-                                      "source_run": str(src_root)})
+                                      "source_run": str(src_root), "source_cube_white": cube_white})
         outcome = self._stage("seed-from-run", run)
         judge = (outcome.digest or {}).get("needs_judgment") or {}
         if judge:
@@ -6627,9 +6797,49 @@ class Calibration:
                     digest={"message": f"the source run's 3D LUT vanished: {cube}"}))
             self.controller.set_3dlut(self.monitor, self.mode, str(cube))
             self._hook_routing_evidence_after_install("reapply-3dlut")
-            return StageOutcome("reapply-3dlut", "done", digest={"cube_path": str(cube)},
+            digest: dict[str, Any] = {"cube_path": str(cube)}
+            white = self._kept_cube_white_evidence()
+            if white is not None:
+                digest["cube_white"] = white
+            return StageOutcome("reapply-3dlut", "done", digest=digest,
                                 data={"cube_path": str(cube)})
-        return self._stage("reapply-3dlut", run)
+        outcome = self._stage("reapply-3dlut", run)
+        white = (outcome.digest or {}).get("cube_white") or {}
+        if white and white.get("material") is None:
+            # A cube is kept but this refine recorded no delivered white: whether the kept cube
+            # fits is unknowable from the record — the LLM decides, never a silent keep.
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="reapply-3dlut:white-unknown", seam=SEAM_STACK, stage="reapply-3dlut",
+                question=("refine-mhc: the kept 3D LUT's white cannot be compared with this refine's "
+                          "(the refine recorded no delivered white). Keep the cube (the verify "
+                          "measures it), or abort?"),
+                options=("keep_cube", "abort"), recommendation="keep_cube",
+                digest=dict(outcome.digest or {}))),
+                stage="reapply-3dlut", message="refine-mhc: aborted — kept-cube white unknown")
+        elif white.get("material"):
+            # The kept cube's tone curve was built for a different white than this refine chose:
+            # brighter ⇒ the top clips and the greys lift off the MHC; dimmer ⇒ the top is
+            # compressed. Whether to keep it (verify measures it; a 3dlut-only after apply
+            # retargets the cube to the new white, carried by the registry) is a judgment.
+            src_nits = white.get("source_cube_white_nits")
+            src_label = (f"{src_nits:g} nits" if src_nits is not None else
+                         "an unrecorded white (candidates "
+                         + ", ".join(f"{k} {v:g}" for k, v in (white.get("candidates") or {}).items())
+                         + ")")
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="reapply-3dlut:white-mismatch", seam=SEAM_STACK, stage="reapply-3dlut",
+                question=(f"refine-mhc: the kept 3D LUT was built for {src_label} but this refine "
+                          f"delivers white at {white.get('refined_white_nits'):g} nits "
+                          f"(white ΔE2000 {white.get('white_de2000')}, material ≥ "
+                          f"{self._CUBE_WHITE_MATERIAL_DE:g} and beyond the ±{white.get('noise_rel'):.2%} "
+                          "white noise margin). Keep the cube (the verify measures the "
+                          "mismatch; run 3dlut-only after apply to retarget it), or abort?"),
+                options=("keep_cube", "abort"), recommendation="keep_cube",
+                digest={**(outcome.digest or {}),
+                        "seeded_cube_white": ((self.calib["stages"].get("seed-from-run") or {})
+                                              .get("digest") or {}).get("source_cube_white")})),
+                stage="reapply-3dlut", message="refine-mhc: aborted at the kept-cube white mismatch")
+        return outcome
 
     def _flow_build_correction(self) -> CalibrationResult:
         """Mint (refresh) the colorimeter correction via ccxxmake, standalone — run this
